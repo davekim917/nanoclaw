@@ -1,4 +1,4 @@
-export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/support-illysium.json
+export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/support-example-labs.json
 python3 <<'PY'
 import json, subprocess, sys, re
 

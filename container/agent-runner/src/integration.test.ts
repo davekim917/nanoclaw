@@ -181,13 +181,13 @@ describe('poll loop integration', () => {
     const prevPeers = process.env.NANOCLAW_PEERS;
     process.env.NANOCLAW_PEERS = JSON.stringify({
       self: { userId: 'SELF' },
-      peers: [{ name: 'Axie-Codex', userId: 'PEER1' }],
+      peers: [{ name: 'Example Agent-Codex', userId: 'PEER1' }],
     });
     try {
       insertMessage('m1', { sender: 'Alice', text: 'hi' }, { platformId: 'chan-1', channelType: 'discord' });
 
       // The opencode failure mode: addresses the sibling as a destination.
-      const provider = new MockProvider({}, () => '<message to="Axie-Codex">Good catch — fixing the query.</message>');
+      const provider = new MockProvider({}, () => '<message to="Example Agent-Codex">Good catch — fixing the query.</message>');
       const controller = new AbortController();
       const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
@@ -200,7 +200,7 @@ describe('poll loop integration', () => {
       expect(out[0].platform_id).toBe('chan-1');
       expect(out[0].channel_type).toBe('discord');
       const text = JSON.parse(out[0].content).text as string;
-      expect(text).toContain('@Axie-Codex');
+      expect(text).toContain('@Example Agent-Codex');
       expect(text).toContain('Good catch');
       expect(text).not.toContain('dropped');
 

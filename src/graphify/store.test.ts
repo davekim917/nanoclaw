@@ -15,7 +15,7 @@ afterEach(() => {
   }
 });
 
-function makeStore(workgroupId = 'madison-reed'): WorkgroupGraphStore {
+function makeStore(workgroupId = 'example-retail'): WorkgroupGraphStore {
   const root = mkdtempSync(join(tmpdir(), 'graphify-store-'));
   roots.push(root);
   return new WorkgroupGraphStore(join(root, 'index.db'), workgroupId);
@@ -24,7 +24,7 @@ function makeStore(workgroupId = 'madison-reed'): WorkgroupGraphStore {
 function source(id: string, relativePath: string, contentHash = `hash-${id}`): SourceInput {
   return {
     id,
-    workgroupId: 'madison-reed',
+    workgroupId: 'example-retail',
     kind: 'document',
     relativePath,
     contentHash,
@@ -52,7 +52,7 @@ describe('WorkgroupGraphStore', () => {
     const root = mkdtempSync(join(tmpdir(), 'graphify-store-indexes-'));
     roots.push(root);
     const path = join(root, 'index.db');
-    new WorkgroupGraphStore(path, 'madison-reed').close();
+    new WorkgroupGraphStore(path, 'example-retail').close();
 
     const db = new Database(path, { readonly: true });
     const indexes = db
@@ -71,14 +71,14 @@ describe('WorkgroupGraphStore', () => {
     const root = mkdtempSync(join(tmpdir(), 'graphify-store-readonly-'));
     roots.push(root);
     const path = join(root, 'index.db');
-    const writer = new WorkgroupGraphStore(path, 'madison-reed');
+    const writer = new WorkgroupGraphStore(path, 'example-retail');
     const generation = writer.beginGeneration('seed');
     const input = source('source-readonly', 'notes/readonly.md');
     writer.upsertSource(input, bundleFor(input.id, input.relativePath, 'readonly-node', 'Read Only'), generation);
     writer.completeGeneration(generation);
     writer.close();
 
-    const reader = new WorkgroupGraphStore(path, 'madison-reed', { readonly: true });
+    const reader = new WorkgroupGraphStore(path, 'example-retail', { readonly: true });
     expect(reader.query('Read Only').nodes.map((node) => node.id)).toEqual(['readonly-node']);
     expect(() => reader.beginGeneration('forbidden')).toThrow(/readonly/i);
     reader.close();

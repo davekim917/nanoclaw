@@ -338,8 +338,8 @@ class GatewayTest(unittest.TestCase):
 
     def test_public_cli_rejects_workgroup_and_path_overrides(self):
         cases = (
-            ["query", "needle", "--workgroup", "madison-reed"],
-            ["query", "needle", "--workgroup=madison-reed"],
+            ["query", "needle", "--workgroup", "example-retail"],
+            ["query", "needle", "--workgroup=example-retail"],
             ["query", "needle", "--path", "/workspace/group"],
             ["query", "needle", "--path=/workspace/group"],
         )

@@ -170,19 +170,19 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
   it('prepends the anchor messages returned by fetchThreadAnchor (M0 + M1, in chronological order)', async () => {
     const bridge = createChatSdkBridge({
       adapter: adapterWithFetchMessages([
-        { id: 'in-1', text: 'reply inside thread', sender: 'Dave', iso: '2026-05-03T13:00:00Z' },
+        { id: 'in-1', text: 'reply inside thread', sender: 'Operator', iso: '2026-05-03T13:00:00Z' },
       ]),
       supportsThreads: true,
       fetchThreadAnchor: async () => [
         {
-          sender: 'Axie',
+          sender: 'Example Agent',
           text: 'wiki lint findings — 3 categories',
           timestamp: '2026-05-03T10:00:00Z',
           isAnchor: true,
         },
         {
-          sender: 'Dave',
-          text: '@Axie fix stale claims',
+          sender: 'Operator',
+          text: '@Example Agent fix stale claims',
           timestamp: '2026-05-03T10:30:00Z',
           isAnchor: true,
         },
@@ -192,23 +192,23 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
     expect(history).toHaveLength(3);
     expect(history[0].text).toBe('wiki lint findings — 3 categories');
     expect(history[0].isAnchor).toBe(true);
-    expect(history[1].text).toBe('@Axie fix stale claims');
+    expect(history[1].text).toBe('@Example Agent fix stale claims');
     expect(history[1].isAnchor).toBe(true);
-    expect(history[2].sender).toBe('Dave');
+    expect(history[2].sender).toBe('Operator');
     expect(history[2].isAnchor).toBeUndefined();
   });
 
   it('skips the anchor when fetchThreadAnchor returns null (forum threads, channel root, errors)', async () => {
     const bridge = createChatSdkBridge({
       adapter: adapterWithFetchMessages([
-        { id: 'in-1', text: 'reply inside thread', sender: 'Dave', iso: '2026-05-03T12:00:00Z' },
+        { id: 'in-1', text: 'reply inside thread', sender: 'Operator', iso: '2026-05-03T12:00:00Z' },
       ]),
       supportsThreads: true,
       fetchThreadAnchor: async () => null,
     });
     const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
     expect(history).toHaveLength(1);
-    expect(history[0].sender).toBe('Dave');
+    expect(history[0].sender).toBe('Operator');
   });
 
   it('does not duplicate when the anchor is already in the in-thread results (forum threads)', async () => {
@@ -216,11 +216,13 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
     const sharedText = 'forum starter post';
     const bridge = createChatSdkBridge({
       adapter: adapterWithFetchMessages([
-        { id: 'starter', text: sharedText, sender: 'Axie', iso: sharedIso },
-        { id: 'in-1', text: 'reply', sender: 'Dave', iso: '2026-05-03T12:00:00Z' },
+        { id: 'starter', text: sharedText, sender: 'Example Agent', iso: sharedIso },
+        { id: 'in-1', text: 'reply', sender: 'Operator', iso: '2026-05-03T12:00:00Z' },
       ]),
       supportsThreads: true,
-      fetchThreadAnchor: async () => [{ sender: 'Axie', text: sharedText, timestamp: sharedIso, isAnchor: true }],
+      fetchThreadAnchor: async () => [
+        { sender: 'Example Agent', text: sharedText, timestamp: sharedIso, isAnchor: true },
+      ],
     });
     const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
     expect(history.filter((m) => m.text === sharedText)).toHaveLength(1);
@@ -228,7 +230,9 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
 
   it('still returns in-thread history when fetchThreadAnchor throws', async () => {
     const bridge = createChatSdkBridge({
-      adapter: adapterWithFetchMessages([{ id: 'in-1', text: 'reply', sender: 'Dave', iso: '2026-05-03T12:00:00Z' }]),
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'reply', sender: 'Operator', iso: '2026-05-03T12:00:00Z' },
+      ]),
       supportsThreads: true,
       fetchThreadAnchor: async () => {
         throw new Error('network down');
@@ -236,7 +240,7 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
     });
     const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
     expect(history).toHaveLength(1);
-    expect(history[0].sender).toBe('Dave');
+    expect(history[0].sender).toBe('Operator');
   });
 
   it('forwards excludeMessageId to fetchThreadAnchor (so adapters can skip when anchor == trigger)', async () => {
@@ -260,14 +264,14 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
     // after live messages stopped leaking them.
     const bridge = createChatSdkBridge({
       adapter: adapterWithFetchMessages([
-        { id: 'in-1', text: 'hey <@123> can you check', sender: 'Dave', iso: '2026-05-03T12:00:00Z' },
-        { id: 'in-2', text: 'sure thing', sender: 'Axie', iso: '2026-05-03T12:01:00Z' },
+        { id: 'in-1', text: 'hey <@123> can you check', sender: 'Operator', iso: '2026-05-03T12:00:00Z' },
+        { id: 'in-2', text: 'sure thing', sender: 'Example Agent', iso: '2026-05-03T12:01:00Z' },
       ]),
       supportsThreads: true,
-      transformInboundText: (t) => t.replace(/<@123>/g, '@Axie-Codex'),
+      transformInboundText: (t) => t.replace(/<@123>/g, '@Example Agent-Codex'),
     });
     const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
-    expect(history.map((m) => m.text)).toEqual(['hey @Axie-Codex can you check', 'sure thing']);
+    expect(history.map((m) => m.text)).toEqual(['hey @Example Agent-Codex can you check', 'sure thing']);
   });
 
   it('applies transformInboundText to anchor messages too', async () => {
@@ -276,20 +280,22 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
     // transform there, the very first wake on a thread can still surface
     // raw `<@id>` to the agent.
     const bridge = createChatSdkBridge({
-      adapter: adapterWithFetchMessages([{ id: 'in-1', text: 'on it', sender: 'Axie', iso: '2026-05-03T13:00:00Z' }]),
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'on it', sender: 'Example Agent', iso: '2026-05-03T13:00:00Z' },
+      ]),
       supportsThreads: true,
       fetchThreadAnchor: async () => [
         {
-          sender: 'Dave',
+          sender: 'Operator',
           text: 'hey <@123> have <@456> handle this',
           timestamp: '2026-05-03T10:00:00Z',
           isAnchor: true,
         },
       ],
-      transformInboundText: (t) => t.replace(/<@123>/g, '@Axie').replace(/<@456>/g, '@Axie-Codex'),
+      transformInboundText: (t) => t.replace(/<@123>/g, '@Example Agent').replace(/<@456>/g, '@Example Agent-Codex'),
     });
     const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
-    expect(history[0].text).toBe('hey @Axie have @Axie-Codex handle this');
+    expect(history[0].text).toBe('hey @Example Agent have @Example Agent-Codex handle this');
     expect(history[0].isAnchor).toBe(true);
   });
 
@@ -299,16 +305,16 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
     // would survive twice. Comparison must be on normalized text on both
     // sides.
     const rawText = 'starter <@123> hi';
-    const transformedText = 'starter @Axie hi';
+    const transformedText = 'starter @Example Agent hi';
     const bridge = createChatSdkBridge({
       adapter: adapterWithFetchMessages([
-        { id: 'starter', text: rawText, sender: 'Axie', iso: '2026-05-03T10:00:00Z' },
+        { id: 'starter', text: rawText, sender: 'Example Agent', iso: '2026-05-03T10:00:00Z' },
       ]),
       supportsThreads: true,
       fetchThreadAnchor: async () => [
-        { sender: 'Axie', text: rawText, timestamp: '2026-05-03T10:00:00Z', isAnchor: true },
+        { sender: 'Example Agent', text: rawText, timestamp: '2026-05-03T10:00:00Z', isAnchor: true },
       ],
-      transformInboundText: (t) => t.replace(/<@123>/g, '@Axie'),
+      transformInboundText: (t) => t.replace(/<@123>/g, '@Example Agent'),
     });
     const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
     expect(history.filter((m) => m.text === transformedText)).toHaveLength(1);
@@ -776,7 +782,7 @@ describe('createChatSdkBridge.deliver — post path 429 retry', () => {
     // Bug A regression guard. A 5400-char chat reply splits into multiple
     // chunks; if Discord 429s on chunk 2 with retry_after=0.3, the prior
     // code dropped chunks 2+ silently. The user saw their chat reply
-    // truncated mid-stream — exactly the symptom Axie kept reporting.
+    // truncated mid-stream — exactly the symptom Example Agent kept reporting.
     const calls: Array<{ chunkText: string }> = [];
     let rateLimitCount = 0;
     const adapter = stubAdapter({
@@ -881,9 +887,9 @@ describe('resolveQuotedReply', () => {
   it('resolves the first link exposing a fetchMessage into reply context', async () => {
     const m = msg([
       { url: 'https://x' }, // no fetchMessage — skipped
-      { fetchMessage: async () => ({ id: 'm1', text: 'the quoted text', author: { fullName: 'Dave' } }) },
+      { fetchMessage: async () => ({ id: 'm1', text: 'the quoted text', author: { fullName: 'Operator' } }) },
     ]);
-    expect(await resolveQuotedReply(m)).toEqual({ id: 'm1', sender: 'Dave', text: 'the quoted text' });
+    expect(await resolveQuotedReply(m)).toEqual({ id: 'm1', sender: 'Operator', text: 'the quoted text' });
   });
 
   it('falls back to userName when fullName is absent', async () => {
@@ -909,7 +915,7 @@ describe('resolveQuotedReply', () => {
   });
 
   it('returns null when the resolved message has no usable text', async () => {
-    const m = msg([{ fetchMessage: async () => ({ text: '   ', author: { fullName: 'Dave' } }) }]);
+    const m = msg([{ fetchMessage: async () => ({ text: '   ', author: { fullName: 'Operator' } }) }]);
     expect(await resolveQuotedReply(m)).toBeNull();
   });
 
@@ -964,7 +970,7 @@ describe('reconstructInboundText', () => {
   });
 
   it('end-to-end: rebuilt text lets the flag parser extract -e xhigh cleanly', () => {
-    const md = '@illie -e xhigh\n1. Approved\n2. Approved\n3. Catch up on SOURCE_DATA';
+    const md = '@helper -e xhigh\n1. Approved\n2. Approved\n3. Catch up on SOURCE_DATA';
     const rebuilt = reconstructInboundText(ast(md))!;
     const parsed = parseMessageFlags(rebuilt);
     expect(parsed.errors).toEqual([]);
@@ -976,7 +982,7 @@ describe('reconstructInboundText', () => {
     // Documents the regression guard: mdastToString-style flattening (what the
     // SDK's .text does) concatenates list items with no separator, so -e's \S*
     // swallows the run-on. This is the behavior reconstructInboundText replaces.
-    const flattened = '@illie -e xhighApprovedApprovedCatch up on SOURCE_DATA';
+    const flattened = '@helper -e xhighApprovedApprovedCatch up on SOURCE_DATA';
     const parsed = parseMessageFlags(flattened);
     expect(parsed.errors[0]).toMatch(/unknown effort level: xhighApprovedApprovedCatch/);
   });

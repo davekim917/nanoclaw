@@ -8,7 +8,7 @@
 # session DBs at /workspace/{inbound,outbound}.db — no stdin pipe during
 # the poll loop.
 #
-# Illysium additions on top of upstream/v2:
+# Example Labs additions on top of upstream/v2:
 # - Chromium XDG workaround (long-running sessions crash without it)
 # - gws (Google Workspace CLI) wrapper that unsets ADC to avoid
 #   service-account override of user-OAuth

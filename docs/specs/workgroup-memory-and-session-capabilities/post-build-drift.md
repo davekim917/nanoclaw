@@ -195,7 +195,7 @@ composed parity pass. The frozen provider tree is
 
 - Added one mechanical spec-status rule: only a spec directory containing
   `.team-auto-active` is active; all other spec artifacts are historical.
-  `.context/specs/` is unconditionally archived.
+  transient planning artifacts are not tracked in the public repository.
 - Added explicit archive/supersession banners to every Markdown artifact in
   the four retired memory spec families and the two legacy root plans
   identified by Gate 10.
@@ -387,7 +387,7 @@ MISSING 0, DIVERGED 0, and PARTIAL 0 on this repaired final tree.
 ## Gate 17
 
 - Reviewer A: MISSING 0, DIVERGED 2, PARTIAL 0. It proved three relative
-  Markdown links changed target across Illysium and Madison Reed and that the
+  Markdown links changed target across Example Labs and Example Retail and that the
   runtime verifier accepted the unsafe topology.
 - Reviewer B: MISSING 0, DIVERGED 3, PARTIAL 1, CONFIRMED 111. It found latent
   agent-shared route-scope loss, false capability claims for excluded universal

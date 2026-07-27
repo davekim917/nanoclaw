@@ -136,7 +136,7 @@ export async function runPluginUpdates(): Promise<UpdateResult[]> {
  * (never baked into the image) — so no rebuild is needed for this to take
  * effect. This writes directly into the fork's git-tracked tree, so unlike
  * the codex/opencode mirrors above (untracked runtime caches) it does NOT
- * commit — Dave commits + pushes the result when he next reviews it.
+ * commit — Operator commits + pushes the result when he next reviews it.
  */
 function vendorDesignArtifactLoopIfPresent(): void {
   try {

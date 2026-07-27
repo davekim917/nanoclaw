@@ -61,12 +61,12 @@ bots, sessions, worktrees, routing identity, permissions, or credentials.
 
 ## Identifier model
 
-Workgroups are identified by a **folder slug** (lowercase letters, digits, hyphens — e.g., `"illysium"`, `"axie-dev"`, `"madison-reed"`).
+Workgroups are identified by a **folder slug** (lowercase letters, digits, hyphens — e.g., `"example-labs"`, `"example-dev"`, `"example-retail"`).
 
 - `workgroups.id` IS the slug.
 - `agent_groups.workgroup_id` references it.
 
-For an agent group whose own folder is `<x>` (e.g., `illysium`), the workgroup id is `<x>`. For a codex twin whose folder is `<x>-codex` (e.g., `illysium-codex`), the workgroup id is the base slug `<x>` (`illysium`) — the same workgroup the Claude twin belongs to. They are siblings sharing one workgroup, not parent/child.
+For an agent group whose own folder is `<x>` (e.g., `example-labs`), the workgroup id is `<x>`. For a codex twin whose folder is `<x>-codex` (e.g., `example-labs-codex`), the workgroup id is the base slug `<x>` (`example-labs`) — the same workgroup the Claude twin belongs to. They are siblings sharing one workgroup, not parent/child.
 
 A `CHECK` constraint on `workgroups.id` rejects values matching the opaque `agent_groups.id` shape (`ag-<ts>-<rand>`) — this prevents future code from accidentally conflating the two ID namespaces.
 
@@ -151,7 +151,7 @@ Workgroup-level `onecli_secrets` (stored as a JSON array on the `workgroups` row
 finalSecrets = workgroup.onecli_secrets ∪ container.json.onecliSecrets
 ```
 
-Per-group declarations can ADD to the workgroup baseline (e.g., a single sibling needs `Datafold-MR`). Per-group declarations cannot SUBTRACT from the baseline — this guards against a sibling silently weakening the shared security posture.
+Per-group declarations can ADD to the workgroup baseline (e.g., a single sibling needs `Datafold-Example-Retail`). Per-group declarations cannot SUBTRACT from the baseline — this guards against a sibling silently weakening the shared security posture.
 
 ### Populating workgroup-level secrets
 
@@ -164,7 +164,7 @@ pnpm exec tsx scripts/set-workgroup-secrets.ts <workgroup-id> --secrets <name1,n
 Example:
 
 ```bash
-pnpm exec tsx scripts/set-workgroup-secrets.ts illysium --secrets "Anthropic,Exa,Datafold-Illysium"
+pnpm exec tsx scripts/set-workgroup-secrets.ts example-labs --secrets "Anthropic,Exa,Datafold-Example Labs"
 ```
 
 The CLI validates every name against the OneCLI vault BEFORE writing. Any unresolvable name causes exit 1 with no DB write — this prevents one bad name from breaking every member's spawn.
@@ -198,7 +198,7 @@ For an install with a fixed set of workgroups (no rename activity), slug-as-PK i
 The slug-as-PK choice should be revisited if either of these happens:
 
 1. **First workgroup rename** — at that point, the cost of operating slug-as-PK starts to exceed the benefit. Migrate to opaque PK with `slug` as a `UNIQUE` column.
-2. **First cross-install share** — if workgroup definitions are ever shared across NanoClaw installs (e.g., the same `madison-reed` workgroup on multiple machines with potentially conflicting slugs), opaque PK becomes mandatory.
+2. **First cross-install share** — if workgroup definitions are ever shared across NanoClaw installs (e.g., the same `example-retail` workgroup on multiple machines with potentially conflicting slugs), opaque PK becomes mandatory.
 
 The migration path is well-understood (table rebuild with a new column for the opaque PK + foreign-key cascade update). Not blocked by anything; just deferred until the trade-off changes.
 

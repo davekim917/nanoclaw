@@ -1,7 +1,7 @@
 #!/bin/bash
 # Pre-task script for the monthly design-artifact-loop drift check.
 #
-# Runs IN the axie container as the scheduling pre-check (see
+# Runs IN the example-agent container as the scheduling pre-check (see
 # container/agent-runner/src/scheduling/task-script.ts). It does the deterministic
 # MECHANICAL layer only — the technique judgment is the agent's job (the prompt). It
 # prints exactly one JSON line as its LAST stdout line:

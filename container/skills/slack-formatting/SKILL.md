@@ -64,7 +64,7 @@ Use standard shortcodes: `:white_check_mark:`, `:x:`, `:rocket:`, `:tada:`. Unic
 
 - **`---` horizontal rules** — adapter emits literal `---`. Use a blank line for separation.
 - **Pre-rendering to mrkdwn** (e.g. writing `*bold*` for bold). The adapter expects standard Markdown; mrkdwn input gets re-parsed and may break links and bold.
-- **Raw user-id mentions** (`<@U1234567890>`). Write `@username` and let the adapter resolve.
+- **Raw user-id mentions** (`<@UTEST00005>`). Write `@username` and let the adapter resolve.
 
 ## Example
 

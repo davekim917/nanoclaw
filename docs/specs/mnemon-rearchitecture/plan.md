@@ -25,7 +25,7 @@
 - **[K1]** S3 cycle-2: Daemon watcher leak on disable (mitigation: F3 daemon index reconciles disabled groups each sweep — closes inotify handles for groups whose `memory.enabled === false`)
 - **[K2]** S5 cycle-2: Typing-indicator placement (mitigated by D4: move `startTypingRefresh` ahead of `writeSessionMessage` for chat-kind paths in router)
 - **[K3]** S2 cycle-3: maybeInjectRecall couples every writeSessionMessage caller to memory module — mitigation: D2 caches `memoryEnabledForGroup` in-process with 60s TTL
-- **[K4]** S3 cycle-3: enable-memory.ts dirs vs existing illysium dirs naming mismatch — mitigation: G1 reuses existing dirs (articles, docs, threads) and adds new dirs (inbox, transcripts, clips, media, processed) without removing old ones
+- **[K4]** S3 cycle-3: enable-memory.ts dirs vs existing example-labs dirs naming mismatch — mitigation: G1 reuses existing dirs (articles, docs, threads) and adds new dirs (inbox, transcripts, clips, media, processed) without removing old ones
 - **[K5]** S4 cycle-3: No semantic retrieval evaluation harness — Phase-2 deferral, documented as A8 in design Assumptions Log
 - **[K6]** S5 cycle-3: No decay/TTL model — Phase-2 deferral
 - **[K7]** S6 cycle-3: Conflict resolution / supersession is interface-only in v1 — mitigation: A5 documents which fields v1 mnemon-impl persists vs ignores
@@ -93,13 +93,13 @@
 | `container/skills/mnemon-companion/` (directory) | B | B5 | DELETE |
 | `container/CLAUDE.md` | C | C1 | MODIFY |
 | `container/skills/wiki/SKILL.md` | C | C2 | MODIFY |
-| `groups/illysium/CLAUDE.local.md` | C | C3 | MODIFY |
-| `groups/madison-reed/CLAUDE.local.md` | C | C3 | MODIFY |
+| `groups/example-labs/CLAUDE.local.md` | C | C3 | MODIFY |
+| `groups/example-retail/CLAUDE.local.md` | C | C3 | MODIFY |
 | `groups/main/CLAUDE.local.md` | C | C3 | MODIFY |
-| `groups/number-drinks/CLAUDE.local.md` | C | C3 | MODIFY |
-| `groups/axie-dev/CLAUDE.local.md` | C | C3 | MODIFY |
-| `groups/axis-labs/CLAUDE.local.md` | C | C3 | MODIFY |
-| `groups/dirt-market/CLAUDE.local.md` | C | C3 | MODIFY |
+| `groups/example-beverage/CLAUDE.local.md` | C | C3 | MODIFY |
+| `groups/example-dev/CLAUDE.local.md` | C | C3 | MODIFY |
+| `groups/example-research/CLAUDE.local.md` | C | C3 | MODIFY |
+| `groups/example-market/CLAUDE.local.md` | C | C3 | MODIFY |
 | `src/container-runner.ts` | D | D1 | MODIFY |
 | `src/modules/memory/recall-injection.ts` | D | D2 | CREATE |
 | `src/modules/memory/recall-injection.test.ts` | D | D2 | CREATE |
@@ -198,7 +198,7 @@ Design contained no `[RENDER-CHECK NEEDED]` flags (memory-layer rebuild is backe
 | C20 (per-group local stores, cross-tenant isolation) | HARD | A, D | A6 ASSERT: mnemon-impl pins --store via MNEMON_STORE env; D1 ASSERT: container-runner mount narrowed to `~/.mnemon/data/<agentGroupId>/` only |
 | C21 (no global store this build) | HARD | A | A5 negative ASSERT: MemoryStore interface accommodates future global tier without breaking — recall() can take an optional store-list param later |
 | C22 (single PR end-to-end) | HARD | All | Plan-level invariant; build acceptance |
-| C23 (pre-merge smoke) | HARD | G | G3 ASSERT: prereqs verified; manual smoke verifies fact-write-recall round trip on illysium |
+| C23 (pre-merge smoke) | HARD | G | G3 ASSERT: prereqs verified; manual smoke verifies fact-write-recall round trip on example-labs |
 | C24 (host-prereq verification at build start) | HARD | G | G3 IS the script; F3 ASSERT: daemon startup invokes G3 |
 | C25 (daemon real-time observable) | SOFT | E, F | E4 ASSERT: health.ts writes JSON within 1s of state change |
 | C26 (no minimumReleaseAgeExclude addition) | HARD | E | E2 ASSERT: no new npm dependency added; uses native fetch |
@@ -473,7 +473,7 @@ test_redactor_blocks_anthropic_key:
   Assert:   shouldStore === false
 
 test_redactor_passes_normal_prose:
-  Setup:    fact.content = "Apollo uses Snowflake for the data warehouse"
+  Setup:    fact.content = "Example Data uses Snowflake for the data warehouse"
   Action:   redactSecrets(fact)
   Assert:   shouldStore === true
 
@@ -605,7 +605,7 @@ function formatSystemMessage(msg: MessageInRow): string {
 **Test cases:**
 ```
 test_formatSystemMessage_recall_context_subtype:
-  Setup:    msg.content = JSON.stringify({ subtype: 'recall_context', text: 'Apollo uses Snowflake' })
+  Setup:    msg.content = JSON.stringify({ subtype: 'recall_context', text: 'Example Data uses Snowflake' })
   Action:   formatSystemMessage(msg)
   Assert:   returns "[Recalled context]\nApollo uses Snowflake"
 
@@ -788,11 +788,11 @@ When the user shares substantive information you'd want to remember, you don't n
 
 ### Task C3: Update 7 groups' CLAUDE.local.md
 
-**Files:** `groups/illysium/CLAUDE.local.md`, `groups/madison-reed/CLAUDE.local.md`, `groups/main/CLAUDE.local.md`, `groups/number-drinks/CLAUDE.local.md`, `groups/axie-dev/CLAUDE.local.md`, `groups/axis-labs/CLAUDE.local.md`, `groups/dirt-market/CLAUDE.local.md`
+**Files:** `groups/example-labs/CLAUDE.local.md`, `groups/example-retail/CLAUDE.local.md`, `groups/main/CLAUDE.local.md`, `groups/example-beverage/CLAUDE.local.md`, `groups/example-dev/CLAUDE.local.md`, `groups/example-research/CLAUDE.local.md`, `groups/example-market/CLAUDE.local.md`
 **Operation:** MODIFY
 **Test file:** none — reason: docs-only (7 files, identical edit)
 
-**Approach:** Per design §Cleanup Inventory. For each file, REMOVE the existing "Wiki + mnemon — persistent memory layer" section (anchored on its `## Wiki + mnemon — persistent memory layer` heading through next `##` heading or EOF). REPLACE with a 3-line stub. The illysium file (modified earliest, never had the appended section) gets the same stub appended.
+**Approach:** Per design §Cleanup Inventory. For each file, REMOVE the existing "Wiki + mnemon — persistent memory layer" section (anchored on its `## Wiki + mnemon — persistent memory layer` heading through next `##` heading or EOF). REPLACE with a 3-line stub. The example-labs file (modified earliest, never had the appended section) gets the same stub appended.
 
 **Replacement content** (identical for all 7):
 ```markdown
@@ -875,7 +875,7 @@ export function extractRecallQueryText(inboundMessage: SessionMessageInput, sess
 **ASSERT:** `shouldRecallForKind('webhook', anything)` returns `true`.
 **ASSERT:** `shouldRecallForKind('chat-sdk', anything)` returns `true`.
 **ASSERT:** `shouldRecall("ok")` returns `false`. `shouldRecall("👍")` returns `false`. `shouldRecall("yes thanks")` returns `false`.
-**ASSERT:** `shouldRecall("What's the current architecture for Apollo's data pipeline?")` returns `true`.
+**ASSERT:** `shouldRecall("What's the current architecture for Example Data's data pipeline?")` returns `true`.
 **ASSERT:** Memory-enabled cache TTL is 60s; reads `groups/<g>/container.json` only on cache miss or expiry.
 **ASSERT:** When `MemoryStore.recall` rejects or times out, function logs warning + emits health metric `recallFailOpen24h++` and returns without writing the system message.
 **ASSERT:** Recall message id format: `recall-${inboundMessage.id}` (already namespaced via `messageIdForAgent` upstream in router; router is the only writer that produces the recall-eligible message ids).
@@ -1491,7 +1491,7 @@ pnpm exec tsx scripts/enable-memory.ts <group-folder>
 **ASSERT:** Negative — does NOT create a per-group sources GitHub repo (D1 cycle-1 rejected option).
 
 **Acceptance criteria:**
-- [ ] Manual smoke: `pnpm exec tsx scripts/enable-memory.ts illysium` succeeds; verify container.json mutation, dir creation, scheduled task in inbound.db
+- [ ] Manual smoke: `pnpm exec tsx scripts/enable-memory.ts example-labs` succeeds; verify container.json mutation, dir creation, scheduled task in inbound.db
 - [ ] All 5 ASSERTs pass
 - [ ] Idempotent: running twice doesn't duplicate the synthesise task
 
@@ -1519,7 +1519,7 @@ pnpm exec tsx scripts/disable-memory.ts <group-folder>
 **ASSERT:** Output includes the "no service restart needed" message.
 
 **Acceptance criteria:**
-- [ ] Manual smoke: `pnpm exec tsx scripts/disable-memory.ts illysium` succeeds; verify container.json + scheduled task + watermarks
+- [ ] Manual smoke: `pnpm exec tsx scripts/disable-memory.ts example-labs` succeeds; verify container.json + scheduled task + watermarks
 - [ ] All 5 ASSERTs pass
 - [ ] Idempotent: running twice on already-disabled group exits cleanly
 
@@ -1644,22 +1644,22 @@ After all groups complete, verify the integrated system end-to-end:
    - `cd container/agent-runner && bun install && bun run typecheck && bun test` — container typechecks + tests pass
    - `./container/build.sh` — container image rebuilds (note: existing `mnemon` binary install in Dockerfile is unchanged)
 
-4. **Smoke test on illysium (per C23):**
-   - Run `pnpm exec tsx scripts/enable-memory.ts illysium`
+4. **Smoke test on example-labs (per C23):**
+   - Run `pnpm exec tsx scripts/enable-memory.ts example-labs`
    - `sudo systemctl daemon-reload && sudo systemctl enable --now nanoclaw-memory-daemon`
-   - Send a substantive message to illysium Slack (e.g. "@illie what's the current architecture for Apollo's data pipeline?")
-   - Within 60s, verify in `data/memory-health.json` that lastSweepAt updated, factsLast24h incremented for the illysium store
+   - Send a substantive message to example-labs Slack (e.g. "@helper what's the current architecture for Example Data's data pipeline?")
+   - Within 60s, verify in `data/memory-health.json` that lastSweepAt updated, factsLast24h incremented for the example-labs store
    - Send a follow-up message that semantically references the prior turn — verify in agent's response (or in inbound.db log) that a `[Recalled context]` system message was written
 
 5. **Disable smoke:**
-   - `pnpm exec tsx scripts/disable-memory.ts illysium`
-   - Daemon's next sweep removes inotify handle for illysium
-   - No further auto-recall on illysium messages
+   - `pnpm exec tsx scripts/disable-memory.ts example-labs`
+   - Daemon's next sweep removes inotify handle for example-labs
+   - No further auto-recall on example-labs messages
    - Re-enable to verify reload semantics work without service restart
 
 6. **Wiki autopush untouched (C10):**
    - `crontab -l | grep wiki-autopush` returns the unchanged entry
-   - `ls groups/illysium/wiki/.git` exists; recent autopush log entries continue normally
+   - `ls groups/example-labs/wiki/.git` exists; recent autopush log entries continue normally
 
 7. **Ollama untouched (C11):**
    - `systemctl is-active ollama` returns active (no changes from baseline)

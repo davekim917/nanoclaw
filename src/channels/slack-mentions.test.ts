@@ -8,153 +8,155 @@ import {
   type SlackBotIdentity,
 } from './slack-mentions.js';
 
-const ILLY_TEAM = 'T-ILLYSIUM';
-const MR_TEAM = 'T-MADISONREED';
+const LABS_TEAM = 'T-EXAMPLE_LABS';
+const RETAIL_TEAM = 'T-example-retail';
 
 function makeBots(): Map<string, SlackBotIdentity> {
   const bots = new Map<string, SlackBotIdentity>();
-  bots.set('slack-illysium', { userId: 'U-ILLIE', username: 'illie', teamId: ILLY_TEAM });
-  bots.set('slack-illysium-codex', { userId: 'U-CODEX', username: 'illie-codex', teamId: ILLY_TEAM });
-  bots.set('slack-madisonreed', { userId: 'U-BO', username: 'bo', teamId: MR_TEAM });
+  bots.set('slack-example-labs', { userId: 'U-HELPER', username: 'helper', teamId: LABS_TEAM });
+  bots.set('slack-example-labs-codex', { userId: 'U-CODEX', username: 'helper-codex', teamId: LABS_TEAM });
+  bots.set('slack-exampleretail', { userId: 'U-BEACON', username: 'beacon', teamId: RETAIL_TEAM });
   return bots;
 }
 
 describe('resolveSlackMentions', () => {
   it('returns text unchanged when no bots are registered', () => {
-    expect(resolveSlackMentions('@illie-codex hello', 'slack-illysium', new Map())).toBe('@illie-codex hello');
+    expect(resolveSlackMentions('@helper-codex hello', 'slack-example-labs', new Map())).toBe('@helper-codex hello');
   });
 
   it('returns text unchanged when current channel has no registered bot identity', () => {
-    expect(resolveSlackMentions('@illie-codex hello', 'slack-unknown', makeBots())).toBe('@illie-codex hello');
+    expect(resolveSlackMentions('@helper-codex hello', 'slack-unknown', makeBots())).toBe('@helper-codex hello');
   });
 
   it('rewrites @sibling → <@USER_ID> within the same workspace', () => {
-    expect(resolveSlackMentions('@illie-codex take this', 'slack-illysium', makeBots())).toBe('<@U-CODEX> take this');
+    expect(resolveSlackMentions('@helper-codex take this', 'slack-example-labs', makeBots())).toBe(
+      '<@U-CODEX> take this',
+    );
   });
 
   it('rewrites case-insensitively', () => {
-    expect(resolveSlackMentions('@Illie-Codex hi', 'slack-illysium', makeBots())).toBe('<@U-CODEX> hi');
-    expect(resolveSlackMentions('@ILLIE-CODEX hi', 'slack-illysium', makeBots())).toBe('<@U-CODEX> hi');
+    expect(resolveSlackMentions('@Helper-Codex hi', 'slack-example-labs', makeBots())).toBe('<@U-CODEX> hi');
+    expect(resolveSlackMentions('@HELPER-CODEX hi', 'slack-example-labs', makeBots())).toBe('<@U-CODEX> hi');
   });
 
   it('rewrites bracketed `<@name>` (agent emits Slack-style wrapper but with username)', () => {
-    expect(resolveSlackMentions('<@illie-codex> picking up', 'slack-illysium', makeBots())).toBe(
+    expect(resolveSlackMentions('<@helper-codex> picking up', 'slack-example-labs', makeBots())).toBe(
       '<@U-CODEX> picking up',
     );
   });
 
-  it('does NOT cross workspaces — illie can not @-mention bo (different teamId)', () => {
-    // illie (Illysium workspace) writes about MR's bot. Slack tenants are
+  it('does NOT cross workspaces — helper can not @-mention beacon (different teamId)', () => {
+    // helper (Example Labs workspace) writes about Example Retail's bot. Slack tenants are
     // disjoint, so the rewrite must NOT happen — Slack would reject the
     // user ID at post time and the message would 400.
-    expect(resolveSlackMentions('@bo is in another workspace', 'slack-illysium', makeBots())).toBe(
-      '@bo is in another workspace',
+    expect(resolveSlackMentions('@beacon is in another workspace', 'slack-example-labs', makeBots())).toBe(
+      '@beacon is in another workspace',
     );
   });
 
   it('leaves existing `<@USER_ID>` alone — already canonical', () => {
-    expect(resolveSlackMentions('<@U0AKALV5HRP> hi', 'slack-illysium', makeBots())).toBe('<@U0AKALV5HRP> hi');
+    expect(resolveSlackMentions('<@UTEST00021> hi', 'slack-example-labs', makeBots())).toBe('<@UTEST00021> hi');
   });
 
   it('leaves channel mentions `<#C…>` alone', () => {
-    expect(resolveSlackMentions('see <#C0AJA89MN2E>', 'slack-illysium', makeBots())).toBe('see <#C0AJA89MN2E>');
+    expect(resolveSlackMentions('see <#CTEST00004>', 'slack-example-labs', makeBots())).toBe('see <#CTEST00004>');
   });
 
-  it('does not parse `email@domain.com` as a mention', () => {
-    expect(resolveSlackMentions('write to ops@illie-codex.example.com', 'slack-illysium', makeBots())).toBe(
-      'write to ops@illie-codex.example.com',
+  it('does not parse `person14@fixture3.example.com` as a mention', () => {
+    expect(resolveSlackMentions('write to person20@fixture9.example.com', 'slack-example-labs', makeBots())).toBe(
+      'write to person20@fixture9.example.com',
     );
   });
 
   it('skips fenced code blocks', () => {
-    const input = 'before\n```\n@illie-codex inside code\n```\nafter';
-    expect(resolveSlackMentions(input, 'slack-illysium', makeBots())).toBe(input);
+    const input = 'before\n```\n@helper-codex inside code\n```\nafter';
+    expect(resolveSlackMentions(input, 'slack-example-labs', makeBots())).toBe(input);
   });
 
   it('skips inline code', () => {
-    expect(resolveSlackMentions('inline `@illie-codex` literal', 'slack-illysium', makeBots())).toBe(
-      'inline `@illie-codex` literal',
+    expect(resolveSlackMentions('inline `@helper-codex` literal', 'slack-example-labs', makeBots())).toBe(
+      'inline `@helper-codex` literal',
     );
   });
 
   it('rewrites multiple mentions in one message', () => {
-    expect(resolveSlackMentions('over to @illie-codex and back to @illie', 'slack-illysium', makeBots())).toBe(
-      'over to <@U-CODEX> and back to <@U-ILLIE>',
+    expect(resolveSlackMentions('over to @helper-codex and back to @helper', 'slack-example-labs', makeBots())).toBe(
+      'over to <@U-CODEX> and back to <@U-HELPER>',
     );
   });
 
   it('handles trailing punctuation correctly (no greedy capture)', () => {
-    expect(resolveSlackMentions('your turn, @illie-codex.', 'slack-illysium', makeBots())).toBe(
+    expect(resolveSlackMentions('your turn, @helper-codex.', 'slack-example-labs', makeBots())).toBe(
       'your turn, <@U-CODEX>.',
     );
-    expect(resolveSlackMentions('hey @illie-codex, ready?', 'slack-illysium', makeBots())).toBe(
+    expect(resolveSlackMentions('hey @helper-codex, ready?', 'slack-example-labs', makeBots())).toBe(
       'hey <@U-CODEX>, ready?',
     );
-    expect(resolveSlackMentions('@illie-codex!', 'slack-illysium', makeBots())).toBe('<@U-CODEX>!');
+    expect(resolveSlackMentions('@helper-codex!', 'slack-example-labs', makeBots())).toBe('<@U-CODEX>!');
   });
 
   it('leaves unknown @-names alone (fail-soft)', () => {
-    expect(resolveSlackMentions('@randomuser hi', 'slack-illysium', makeBots())).toBe('@randomuser hi');
+    expect(resolveSlackMentions('@randomuser hi', 'slack-example-labs', makeBots())).toBe('@randomuser hi');
   });
 
   // Operator-typed Slack handles often drop hyphens/underscores even though
   // the agent's logical name keeps them. Production case: agent_group
-  // `madison-reed-codex` registered as Slack username `bocodex`. The agent
-  // (per CLAUDE.md "Working with peer agents") writes `@Bo-codex`; without
+  // `example-retail-codex` registered as Slack username `beaconcodex`. The agent
+  // (per CLAUDE.md "Working with peer agents") writes `@Beacon-Codex`; without
   // separator-normalized fallback the lookup misses and the @-mention ships
   // as plain text — Slack fires no mention event, the peer never wakes.
   describe('separator-normalized fallback (operator-handle mismatch)', () => {
     function makeBotsWithMismatch(): Map<string, SlackBotIdentity> {
       const bots = new Map<string, SlackBotIdentity>();
-      bots.set('slack-madisonreed', { userId: 'U-BO', username: 'beau', teamId: MR_TEAM });
-      bots.set('slack-madisonreed-codex', { userId: 'U-BO-CODEX', username: 'bocodex', teamId: MR_TEAM });
+      bots.set('slack-exampleretail', { userId: 'U-BEACON', username: 'legacybot', teamId: RETAIL_TEAM });
+      bots.set('slack-exampleretail-codex', { userId: 'U-BEACON-CODEX', username: 'beaconcodex', teamId: RETAIL_TEAM });
       return bots;
     }
 
-    it('rewrites `@bo-codex` when Slack handle is `bocodex` (separators stripped)', () => {
-      expect(resolveSlackMentions('@bo-codex pick this up', 'slack-madisonreed', makeBotsWithMismatch())).toBe(
-        '<@U-BO-CODEX> pick this up',
+    it('rewrites `@beacon-codex` when Slack handle is `beaconcodex` (separators stripped)', () => {
+      expect(resolveSlackMentions('@beacon-codex pick this up', 'slack-exampleretail', makeBotsWithMismatch())).toBe(
+        '<@U-BEACON-CODEX> pick this up',
       );
     });
 
-    it('rewrites `@Bo-Codex` case-insensitively against `bocodex`', () => {
-      expect(resolveSlackMentions('@Bo-Codex pick this up', 'slack-madisonreed', makeBotsWithMismatch())).toBe(
-        '<@U-BO-CODEX> pick this up',
+    it('rewrites `@Beacon-Codex` case-insensitively against `beaconcodex`', () => {
+      expect(resolveSlackMentions('@Beacon-Codex pick this up', 'slack-exampleretail', makeBotsWithMismatch())).toBe(
+        '<@U-BEACON-CODEX> pick this up',
       );
     });
 
-    it('rewrites `@bo_codex` (underscore variant) against `bocodex`', () => {
-      expect(resolveSlackMentions('@bo_codex pick this up', 'slack-madisonreed', makeBotsWithMismatch())).toBe(
-        '<@U-BO-CODEX> pick this up',
+    it('rewrites `@beacon_codex` (underscore variant) against `beaconcodex`', () => {
+      expect(resolveSlackMentions('@beacon_codex pick this up', 'slack-exampleretail', makeBotsWithMismatch())).toBe(
+        '<@U-BEACON-CODEX> pick this up',
       );
     });
 
-    it('still rewrites the literal `@bocodex` form', () => {
-      expect(resolveSlackMentions('@bocodex pick this up', 'slack-madisonreed', makeBotsWithMismatch())).toBe(
-        '<@U-BO-CODEX> pick this up',
+    it('still rewrites the literal `@beaconcodex` form', () => {
+      expect(resolveSlackMentions('@beaconcodex pick this up', 'slack-exampleretail', makeBotsWithMismatch())).toBe(
+        '<@U-BEACON-CODEX> pick this up',
       );
     });
 
-    it('preserves literal-first priority — `bo-codex` literal beats `bocodex`-normalized collision', () => {
-      // Both bots registered: one literal `bo-codex`, one literal `bocodex`.
-      // The normalized form of both is `bocodex`. The literal `bocodex`
-      // owns the `bocodex` slot in byName (literal-first). `@bo-codex`
-      // hits its own literal; `@bocodex` hits the other literal — both
+    it('preserves literal-first priority — `beacon-codex` literal beats `beaconcodex`-normalized collision', () => {
+      // Both bots registered: one literal `beacon-codex`, one literal `beaconcodex`.
+      // The normalized form of both is `beaconcodex`. The literal `beaconcodex`
+      // owns the `beaconcodex` slot in byName (literal-first). `@beacon-codex`
+      // hits its own literal; `@beaconcodex` hits the other literal — both
       // bots remain individually mentionable.
       const bots = new Map<string, SlackBotIdentity>();
-      bots.set('slack-mr', { userId: 'U-A', username: 'bo-codex', teamId: MR_TEAM });
-      bots.set('slack-mr-codex', { userId: 'U-B', username: 'bocodex', teamId: MR_TEAM });
-      bots.set('slack-mr-self', { userId: 'U-SELF', username: 'beau', teamId: MR_TEAM });
-      expect(resolveSlackMentions('@bo-codex hi', 'slack-mr-self', bots)).toBe('<@U-A> hi');
-      expect(resolveSlackMentions('@bocodex hi', 'slack-mr-self', bots)).toBe('<@U-B> hi');
+      bots.set('slack-retail', { userId: 'U-A', username: 'beacon-codex', teamId: RETAIL_TEAM });
+      bots.set('slack-retail-codex', { userId: 'U-B', username: 'beaconcodex', teamId: RETAIL_TEAM });
+      bots.set('slack-retail-self', { userId: 'U-SELF', username: 'legacybot', teamId: RETAIL_TEAM });
+      expect(resolveSlackMentions('@beacon-codex hi', 'slack-retail-self', bots)).toBe('<@U-A> hi');
+      expect(resolveSlackMentions('@beaconcodex hi', 'slack-retail-self', bots)).toBe('<@U-B> hi');
     });
 
     it('does not cross workspaces via normalized form either', () => {
-      // illie-codex is in Illysium; an MR agent writing `@illiecodex` (a
+      // helper-codex is in Example Labs; an Example Retail agent writing `@helpercodex` (a
       // separator-collapsed normalized form) must NOT resolve to the
-      // Illysium bot because they're in different teamIds.
-      const bots = makeBots(); // illie-codex is ILLY_TEAM, bo is MR_TEAM
-      expect(resolveSlackMentions('@illiecodex hi', 'slack-madisonreed', bots)).toBe('@illiecodex hi');
+      // Example Labs bot because they're in different teamIds.
+      const bots = makeBots(); // helper-codex is LABS_TEAM, beacon is RETAIL_TEAM
+      expect(resolveSlackMentions('@helpercodex hi', 'slack-exampleretail', bots)).toBe('@helpercodex hi');
     });
   });
 
@@ -162,98 +164,103 @@ describe('resolveSlackMentions', () => {
   // that have been renamed via the App config (or whose `real_name` diverges
   // from `name`), operators @-mention them by the display name shown in
   // Slack's UI, which comes from `profile.real_name` (or `display_name` when
-  // set). Concrete production case: Bo's `auth.test.user = "beau"` but
-  // `profile.real_name = "Bo"` — operators write `@bo`.
+  // set). Concrete production case: Beacon's `auth.test.user = "legacybot"` but
+  // `profile.real_name = "Beacon"` — operators write `@beacon`.
   describe('displayName/realName aliases (auth.test name diverges from UI name)', () => {
     function makeMrBots(): Map<string, SlackBotIdentity> {
       const bots = new Map<string, SlackBotIdentity>();
-      bots.set('slack-madisonreed', {
-        userId: 'U-BO',
-        username: 'beau',
-        realName: 'Bo',
-        teamId: MR_TEAM,
+      bots.set('slack-exampleretail', {
+        userId: 'U-BEACON',
+        username: 'legacybot',
+        realName: 'Beacon',
+        teamId: RETAIL_TEAM,
       });
-      bots.set('slack-madisonreed-codex', {
-        userId: 'U-BO-CODEX',
-        username: 'bocodex',
-        realName: 'Bo-codex',
-        teamId: MR_TEAM,
+      bots.set('slack-exampleretail-codex', {
+        userId: 'U-BEACON-CODEX',
+        username: 'beaconcodex',
+        realName: 'Beacon-Codex',
+        teamId: RETAIL_TEAM,
       });
       return bots;
     }
 
-    it('rewrites `@bo` against realName when username is legacy `beau`', () => {
-      expect(resolveSlackMentions('@bo over to you', 'slack-madisonreed-codex', makeMrBots())).toBe(
-        '<@U-BO> over to you',
+    it('rewrites `@beacon` against realName when username is legacy `legacybot`', () => {
+      expect(resolveSlackMentions('@beacon over to you', 'slack-exampleretail-codex', makeMrBots())).toBe(
+        '<@U-BEACON> over to you',
       );
     });
 
-    it('rewrites `@beau` against legacy username — both names work', () => {
-      expect(resolveSlackMentions('@beau over to you', 'slack-madisonreed-codex', makeMrBots())).toBe(
-        '<@U-BO> over to you',
+    it('rewrites `@legacybot` against legacy username — both names work', () => {
+      expect(resolveSlackMentions('@legacybot over to you', 'slack-exampleretail-codex', makeMrBots())).toBe(
+        '<@U-BEACON> over to you',
       );
     });
 
-    it('rewrites `@Bo-codex` against realName when username is `bocodex`', () => {
-      expect(resolveSlackMentions('@Bo-codex pick this up', 'slack-madisonreed', makeMrBots())).toBe(
-        '<@U-BO-CODEX> pick this up',
+    it('rewrites `@Beacon-Codex` against realName when username is `beaconcodex`', () => {
+      expect(resolveSlackMentions('@Beacon-Codex pick this up', 'slack-exampleretail', makeMrBots())).toBe(
+        '<@U-BEACON-CODEX> pick this up',
       );
     });
 
-    it('rewrites `@bocodex` against literal username — still works', () => {
-      expect(resolveSlackMentions('@bocodex pick this up', 'slack-madisonreed', makeMrBots())).toBe(
-        '<@U-BO-CODEX> pick this up',
+    it('rewrites `@beaconcodex` against literal username — still works', () => {
+      expect(resolveSlackMentions('@beaconcodex pick this up', 'slack-exampleretail', makeMrBots())).toBe(
+        '<@U-BEACON-CODEX> pick this up',
       );
     });
 
     it('prefers displayName over realName when both are set', () => {
       const bots = new Map<string, SlackBotIdentity>();
-      bots.set('slack-mr', {
+      bots.set('slack-retail', {
         userId: 'U-SELF',
         username: 'self',
-        teamId: MR_TEAM,
+        teamId: RETAIL_TEAM,
       });
-      bots.set('slack-mr-bot', {
-        userId: 'U-BOT',
+      bots.set('slack-retail-bot', {
+        userId: 'U-FRIENDLY',
         username: 'legacy',
         displayName: 'Friendly',
         realName: 'Real',
-        teamId: MR_TEAM,
+        teamId: RETAIL_TEAM,
       });
       // Both display ("friendly") and real ("real") map to the same user.
-      expect(resolveSlackMentions('@friendly hi', 'slack-mr', bots)).toBe('<@U-BOT> hi');
-      expect(resolveSlackMentions('@real hi', 'slack-mr', bots)).toBe('<@U-BOT> hi');
-      expect(resolveSlackMentions('@legacy hi', 'slack-mr', bots)).toBe('<@U-BOT> hi');
+      expect(resolveSlackMentions('@friendly hi', 'slack-retail', bots)).toBe('<@U-FRIENDLY> hi');
+      expect(resolveSlackMentions('@real hi', 'slack-retail', bots)).toBe('<@U-FRIENDLY> hi');
+      expect(resolveSlackMentions('@legacy hi', 'slack-retail', bots)).toBe('<@U-FRIENDLY> hi');
     });
 
     it('literal username still wins on collision with another bot realName', () => {
-      // Bot A's username is `bo`. Bot B's realName lowercased is also `bo`.
+      // Bot A's username is `beacon`. Bot B's realName lowercased is also `beacon`.
       // The literal username owns the slot — bot B's realName collision
       // does not overwrite it.
       const bots = new Map<string, SlackBotIdentity>();
-      bots.set('slack-mr-self', { userId: 'U-SELF', username: 'self', teamId: MR_TEAM });
-      bots.set('slack-mr-a', { userId: 'U-A', username: 'bo', teamId: MR_TEAM });
-      bots.set('slack-mr-b', { userId: 'U-B', username: 'other', realName: 'Bo', teamId: MR_TEAM });
-      expect(resolveSlackMentions('@bo hi', 'slack-mr-self', bots)).toBe('<@U-A> hi');
-      expect(resolveSlackMentions('@other hi', 'slack-mr-self', bots)).toBe('<@U-B> hi');
+      bots.set('slack-retail-self', { userId: 'U-SELF', username: 'self', teamId: RETAIL_TEAM });
+      bots.set('slack-retail-a', { userId: 'U-A', username: 'beacon', teamId: RETAIL_TEAM });
+      bots.set('slack-retail-b', { userId: 'U-B', username: 'other', realName: 'Beacon', teamId: RETAIL_TEAM });
+      expect(resolveSlackMentions('@beacon hi', 'slack-retail-self', bots)).toBe('<@U-A> hi');
+      expect(resolveSlackMentions('@other hi', 'slack-retail-self', bots)).toBe('<@U-B> hi');
     });
 
     it('does not cross workspaces via realName alias', () => {
-      // An Illysium bot's realName lowercased could collide with an MR
+      // An Example Labs bot's realName lowercased could collide with an Example Retail
       // session's expected handle, but teamId scoping must block it.
       const bots = new Map<string, SlackBotIdentity>();
-      bots.set('slack-madisonreed', { userId: 'U-BO', username: 'beau', realName: 'Bo', teamId: MR_TEAM });
-      bots.set('slack-illysium-impostor', {
+      bots.set('slack-exampleretail', {
+        userId: 'U-BEACON',
+        username: 'legacybot',
+        realName: 'Beacon',
+        teamId: RETAIL_TEAM,
+      });
+      bots.set('slack-example-labs-impostor', {
         userId: 'U-IMPOSTOR',
         username: 'impostor',
-        realName: 'Bo', // collides on realName with MR's bot
-        teamId: ILLY_TEAM,
+        realName: 'Beacon', // collides on realName with Example Retail's bot
+        teamId: LABS_TEAM,
       });
-      // From MR session, @bo resolves to MR's bot, not Illysium's.
-      expect(resolveSlackMentions('@bo hi', 'slack-madisonreed', bots)).toBe('<@U-BO> hi');
-      // From Illysium session, @bo resolves to Illysium's bot only — MR's
+      // From Example Retail session, @beacon resolves to Example Retail's bot, not Example Labs's.
+      expect(resolveSlackMentions('@beacon hi', 'slack-exampleretail', bots)).toBe('<@U-BEACON> hi');
+      // From Example Labs session, @beacon resolves to Example Labs's bot only — Example Retail's
       // is filtered out by teamId.
-      expect(resolveSlackMentions('@bo hi', 'slack-illysium-impostor', bots)).toBe('<@U-IMPOSTOR> hi');
+      expect(resolveSlackMentions('@beacon hi', 'slack-example-labs-impostor', bots)).toBe('<@U-IMPOSTOR> hi');
     });
   });
 
@@ -264,26 +271,26 @@ describe('resolveSlackMentions', () => {
   describe('URL safety', () => {
     it('does not rewrite inside a https URL path', () => {
       expect(
-        resolveSlackMentions('Check https://example.com/@illie-codex for the diff', 'slack-illysium', makeBots()),
-      ).toBe('Check https://example.com/@illie-codex for the diff');
+        resolveSlackMentions('Check https://example.com/@helper-codex for the diff', 'slack-example-labs', makeBots()),
+      ).toBe('Check https://example.com/@helper-codex for the diff');
     });
 
     it('does not rewrite inside a generic path (slash before @)', () => {
-      expect(resolveSlackMentions('see notes/users/@illie-codex.md', 'slack-illysium', makeBots())).toBe(
-        'see notes/users/@illie-codex.md',
+      expect(resolveSlackMentions('see notes/users/@helper-codex.md', 'slack-example-labs', makeBots())).toBe(
+        'see notes/users/@helper-codex.md',
       );
     });
 
     it('does not rewrite after `:` (user:pass@host URL form)', () => {
-      expect(resolveSlackMentions('jdbc:postgres://user:@illie-codex.example.com', 'slack-illysium', makeBots())).toBe(
-        'jdbc:postgres://user:@illie-codex.example.com',
-      );
+      expect(
+        resolveSlackMentions('jdbc:postgres://user:@helper-codex.example.com', 'slack-example-labs', makeBots()),
+      ).toBe('jdbc:postgres://user:@helper-codex.example.com');
     });
 
     it('still rewrites a real mention right after a URL on the same line', () => {
-      expect(resolveSlackMentions('https://example.com — over to @illie-codex', 'slack-illysium', makeBots())).toBe(
-        'https://example.com — over to <@U-CODEX>',
-      );
+      expect(
+        resolveSlackMentions('https://example.com — over to @helper-codex', 'slack-example-labs', makeBots()),
+      ).toBe('https://example.com — over to <@U-CODEX>');
     });
   });
 });
@@ -312,7 +319,7 @@ describe('getSlackBotDisplayName', () => {
     const { getSlackBotDisplayName } = await import('./slack-mentions.js');
     withRegistered(
       'slack-disp',
-      { userId: 'U-1', username: 'legacy', displayName: 'Friendly', realName: 'Real', teamId: MR_TEAM },
+      { userId: 'U-1', username: 'legacy', displayName: 'Friendly', realName: 'Real', teamId: RETAIL_TEAM },
       () => {
         expect(getSlackBotDisplayName('slack-disp')).toBe('Friendly');
       },
@@ -321,15 +328,19 @@ describe('getSlackBotDisplayName', () => {
 
   it('falls back to profile.real_name when display_name is empty', async () => {
     const { getSlackBotDisplayName } = await import('./slack-mentions.js');
-    withRegistered('slack-real', { userId: 'U-2', username: 'beau', realName: 'Bo', teamId: MR_TEAM }, () => {
-      expect(getSlackBotDisplayName('slack-real')).toBe('Bo');
-    });
+    withRegistered(
+      'slack-real',
+      { userId: 'U-2', username: 'legacybot', realName: 'Beacon', teamId: RETAIL_TEAM },
+      () => {
+        expect(getSlackBotDisplayName('slack-real')).toBe('Beacon');
+      },
+    );
   });
 
   it('falls back to legacy auth.test.user when neither profile field is set', async () => {
     const { getSlackBotDisplayName } = await import('./slack-mentions.js');
-    withRegistered('slack-user', { userId: 'U-3', username: 'beau', teamId: MR_TEAM }, () => {
-      expect(getSlackBotDisplayName('slack-user')).toBe('beau');
+    withRegistered('slack-user', { userId: 'U-3', username: 'legacybot', teamId: RETAIL_TEAM }, () => {
+      expect(getSlackBotDisplayName('slack-user')).toBe('legacybot');
     });
   });
 });
@@ -346,15 +357,15 @@ describe('fetchSlackBotIdentity', () => {
       auth: {
         test: vi.fn().mockResolvedValue({
           ok: true,
-          user_id: 'U-BO',
-          user: 'beau',
-          team_id: MR_TEAM,
+          user_id: 'U-BEACON',
+          user: 'legacybot',
+          team_id: RETAIL_TEAM,
         }),
       },
       users: { info: usersInfo },
     };
     const id = await fetchSlackBotIdentity(client);
-    expect(id).toEqual({ userId: 'U-BO', username: 'beau', teamId: MR_TEAM });
+    expect(id).toEqual({ userId: 'U-BEACON', username: 'legacybot', teamId: RETAIL_TEAM });
     expect(usersInfo).not.toHaveBeenCalled();
   });
 
@@ -391,21 +402,25 @@ describe('upgradeSlackBotProfile (fire-and-forget profile enrichment)', () => {
       users: {
         info: vi.fn().mockResolvedValue({
           ok: true,
-          user: { profile: { display_name: '', real_name: 'Bo' } },
+          user: { profile: { display_name: '', real_name: 'Beacon' } },
         }),
       },
     };
-    await withRegistered('slack-test-mr', { userId: 'U-BO', username: 'beau', teamId: MR_TEAM }, async () => {
-      await upgradeSlackBotProfile(client, 'slack-test-mr');
-      const bots = new Map<string, SlackBotIdentity>();
-      bots.set('slack-test-self', { userId: 'U-SELF', username: 'self', teamId: MR_TEAM });
-      // Pull the upgraded entry from the live registry into a snapshot
-      // map and verify @bo now resolves through it.
-      const { getKnownSlackBots } = await import('./slack-mentions.js');
-      for (const [ch, ident] of getKnownSlackBots()) bots.set(ch, ident);
-      expect(resolveSlackMentions('@bo over to you', 'slack-test-self', bots)).toBe('<@U-BO> over to you');
-      expect(resolveSlackMentions('@beau over to you', 'slack-test-self', bots)).toBe('<@U-BO> over to you');
-    });
+    await withRegistered(
+      'slack-test-retail',
+      { userId: 'U-BEACON', username: 'legacybot', teamId: RETAIL_TEAM },
+      async () => {
+        await upgradeSlackBotProfile(client, 'slack-test-retail');
+        const bots = new Map<string, SlackBotIdentity>();
+        bots.set('slack-test-self', { userId: 'U-SELF', username: 'self', teamId: RETAIL_TEAM });
+        // Pull the upgraded entry from the live registry into a snapshot
+        // map and verify @beacon now resolves through it.
+        const { getKnownSlackBots } = await import('./slack-mentions.js');
+        for (const [ch, ident] of getKnownSlackBots()) bots.set(ch, ident);
+        expect(resolveSlackMentions('@beacon over to you', 'slack-test-self', bots)).toBe('<@U-BEACON> over to you');
+        expect(resolveSlackMentions('@legacybot over to you', 'slack-test-self', bots)).toBe('<@U-BEACON> over to you');
+      },
+    );
   });
 
   it('is a no-op when the channelType is not registered (defensive)', async () => {

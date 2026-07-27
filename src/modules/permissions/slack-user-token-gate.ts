@@ -27,8 +27,8 @@ import type { SlackUserTokenConfig } from '../../container-config.js';
  *
  *   Codex twins (and any future sibling agent with its own bot user) get
  *   their own channel adapter, so the same human appears as TWO distinct
- *   `users` rows — `slack-madisonreed:U0…` for the bo DM and
- *   `slack-madisonreed-codex:U0…` for the bo-codex DM. A naive exact-match
+ *   `users` rows — `slack-retail:U0…` for the primary DM and
+ *   `slack-retail-codex:U0…` for the example-assistant-codex DM. A naive exact-match
  *   gate only sees owner on the adapter the operator originally talked to.
  *
  *   Earlier iterations of this fix tried to fold sibling identities by
@@ -54,12 +54,12 @@ import type { SlackUserTokenConfig } from '../../container-config.js';
  *         authorize — even if a different human in a different workspace
  *         happens to have the same Slack user-id handle.
  *
- *   For Dave's install (the production bug that motivated this PR):
- *     - bo-codex session DM user: `slack-mr-codex:UDAVE` (handle UDAVE,
- *       workgroup `mr`).
- *     - Global owner: `slack-mr:UDAVE` (handle UDAVE) with user_dms
- *       wired to ag-bo (workgroup `mr`).
- *     - Handle match (UDAVE) ✓ + workgroup match (`mr`) ✓ → ALLOW.
+ *   For Operator's install (the production bug that motivated this PR):
+ *     - example-assistant-codex session DM user: `slack-retail-codex:UOWNER` (handle UOWNER,
+ *       workgroup `retail`).
+ *     - Global owner: `slack-retail:UOWNER` (handle UOWNER) with user_dms
+ *       wired to ag-primary (workgroup `retail`).
+ *     - Handle match (UOWNER) ✓ + workgroup match (`retail`) ✓ → ALLOW.
  *
  *   For the hypothetical workspace-literally-named-codex bypass attempt:
  *     - `acme-codex-ws` is a Slack workspace named `acme-codex` (legitimate).
@@ -144,7 +144,7 @@ export function isOwnerSafeSlackSession(
   //      (channel_type segment before first '-' — `slack`, `discord`,
   //      `telegram`, etc.). Platform-prefix equality on top of handle
   //      equality prevents cross-platform handle collision from authorizing
-  //      (Codex P1 on PR #110: `telegram:123` owner ≠ `slack-mr:123` session
+  //      (Codex P1 on PR #110: `telegram:123` owner ≠ `slack-retail:123` session
   //      user even if handles collide). Workgroup equality on top of
   //      handle equality prevents cross-workspace collision (different
   //      Slack workspaces have different workgroups). All three must hold.
@@ -218,10 +218,10 @@ function handleOf(userId: string): string | null {
 /**
  * Extract the platform prefix from a user_id. The platform is the channel_type
  * segment before the first `-`, or the whole channel_type if there is no `-`.
- *   slack-mr:UDAVE       → "slack"
- *   slack-mr-codex:UDAVE → "slack"
+ *   slack-retail:UOWNER       → "slack"
+ *   slack-retail-codex:UOWNER → "slack"
  *   discord:608…         → "discord"
- *   discord-axie-codex:6 → "discord"
+ *   discord-example-agent-codex:6 → "discord"
  *   telegram:6037840640  → "telegram"
  *
  * Same human across SIBLING adapters of the same platform satisfies — but

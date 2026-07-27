@@ -99,7 +99,7 @@ simple existing-seam architecture. Remaining choices are implementation details.
   same-thread fact that DNS is managed in Wix before answering.
 - A pasted Slack or Discord URL does not produce a false blanket denial when
   the session has an available archive or API access path.
-- A Madison Reed sibling receives the known Snowflake-backed GSC access path and
+- A Example Retail sibling receives the known Snowflake-backed GSC access path and
   does not default to an unavailable Workspace API.
 - A memory edit by one sibling is visible to another sibling in the same
   workgroup on its next turn, while a different workgroup cannot retrieve it.

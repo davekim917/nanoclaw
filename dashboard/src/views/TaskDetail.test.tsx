@@ -44,7 +44,7 @@ const mockAuthMe = {
 const baseTask = {
   task_id: 'spawn-99-abcd-1234-efgh',
   parent_session_id: 'sess-1',
-  task_content: '## Goal\nResolve **XZO-99** — fix the thing.\n\n## Inputs\n- Repo: foo',
+  task_content: '## Goal\nResolve **EXAMPLE-99** — fix the thing.\n\n## Inputs\n- Repo: foo',
   status: 'running' as const,
   admitted_at: '2026-05-01T10:00:00Z',
   started_at: '2026-05-01T10:00:01Z',
@@ -69,7 +69,7 @@ describe('TaskDetail', () => {
     render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />);
     expect(screen.getByText(/spawn-99-abcd-1234/)).toBeInTheDocument();
     expect(screen.getByText(/fix the thing/i)).toBeInTheDocument();
-    expect(screen.getByText('XZO-99')).toBeInTheDocument();
+    expect(screen.getByText('EXAMPLE-99')).toBeInTheDocument();
   });
 
   it('expands transcript section and shows messages when toggled', async () => {

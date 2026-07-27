@@ -60,7 +60,7 @@ export const migration037: Migration = {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    // OpenCode (Go subscription + free tier — what Dave actually holds).
+    // OpenCode (Go subscription + free tier — what Operator actually holds).
     // Conservative set; operators extend via ncl. Not exhaustive on purpose.
     const opencodeSeed: Array<[string, string, string, 'low' | 'medium' | 'high' | null, 0 | 1, 0 | 1]> = [
       // [slug, display_name, notes, default_effort, supports_effort, is_default]

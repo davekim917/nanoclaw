@@ -43,7 +43,7 @@ describe('reconcileWorkgroupSharedDirs', () => {
     fs.mkdirSync(path.join(seed, 'dbt', '.git'), { recursive: true }); // git repo → shared
     fs.mkdirSync(path.join(seed, 'sources', 'inbox'), { recursive: true }); // → shared
     fs.mkdirSync(path.join(seed, 'conversations'), { recursive: true }); // → shared
-    fs.mkdirSync(path.join(seed, 'dave_ops'), { recursive: true }); // plain dir → candidate
+    fs.mkdirSync(path.join(seed, 'operator_ops'), { recursive: true }); // plain dir → candidate
     fs.writeFileSync(path.join(seed, 'sources', 'inbox', 'f.json'), '{}');
     fs.writeFileSync(path.join(seed, 'scratch.json'), '{}'); // loose file → stays in bedroom
 
@@ -80,13 +80,13 @@ describe('reconcileWorkgroupSharedDirs', () => {
     expect(fs.readlinkSync(path.join(groupsDir, 'wgx-codex', 'dbt'))).toBe('/workspace/workgroup/dbt');
 
     // Ambiguous dir + loose file stay in the bedroom (never mis-moved).
-    expect(fs.lstatSync(path.join(groupsDir, 'wgx', 'dave_ops')).isDirectory()).toBe(true);
+    expect(fs.lstatSync(path.join(groupsDir, 'wgx', 'operator_ops')).isDirectory()).toBe(true);
     expect(fs.existsSync(path.join(groupsDir, 'wgx', 'scratch.json'))).toBe(true);
 
     // Reversible report.
     const marker = JSON.parse(fs.readFileSync(path.join(wgDir, '.migrated'), 'utf-8'));
     expect(marker.moved.sort()).toEqual(['conversations', 'dbt', 'sources']);
-    expect(marker.candidates).toContain('dave_ops');
+    expect(marker.candidates).toContain('operator_ops');
   });
 
   it('is idempotent — a second run is a no-op', () => {

@@ -44,14 +44,14 @@ const AGENT_FIXTURE = {
   data: [
     {
       id: '11111111-1111-1111-1111-111111111111',
-      name: 'madison-reed',
-      identifier: 'madison-reed',
+      name: 'example-retail',
+      identifier: 'example-retail',
       secretMode: 'selective',
     },
     {
       id: '22222222-2222-2222-2222-222222222222',
-      name: 'illie-codex',
-      identifier: 'illysium-codex',
+      name: 'helper-codex',
+      identifier: 'example-labs-codex',
       secretMode: 'all',
     },
   ],
@@ -59,8 +59,8 @@ const AGENT_FIXTURE = {
 
 const SECRET_FIXTURE = {
   data: [
-    { id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', name: 'Datafold-MadisonReed' },
-    { id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', name: 'Fivetran-MadisonReed' },
+    { id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', name: 'Datafold-ExampleRetail' },
+    { id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', name: 'Fivetran-ExampleRetail' },
     { id: 'cccccccc-cccc-cccc-cccc-cccccccccccc', name: 'Hex' },
     { id: 'dddddddd-dddd-dddd-dddd-dddddddddddd', name: 'Anthropic' },
   ],
@@ -90,7 +90,7 @@ describe('isUuid', () => {
   });
 
   test('rejects non-UUID strings (secret names)', () => {
-    expect(__test.isUuid('Datafold-MadisonReed')).toBe(false);
+    expect(__test.isUuid('Datafold-ExampleRetail')).toBe(false);
     expect(__test.isUuid('Anthropic')).toBe(false);
     expect(__test.isUuid('')).toBe(false);
   });
@@ -103,12 +103,12 @@ describe('isUuid', () => {
 
 describe('applyOnecliSecrets — no-op paths', () => {
   test('does nothing when declarations is undefined', () => {
-    applyOnecliSecrets('madison-reed', undefined);
+    applyOnecliSecrets('example-retail', undefined);
     expect(mockedExec).not.toHaveBeenCalled();
   });
 
   test('does nothing when declarations is empty', () => {
-    applyOnecliSecrets('madison-reed', []);
+    applyOnecliSecrets('example-retail', []);
     expect(mockedExec).not.toHaveBeenCalled();
   });
 });
@@ -117,7 +117,7 @@ describe('applyOnecliSecrets — happy path', () => {
   test('resolves names to UUIDs and calls set-secret-mode + set-secrets', () => {
     setupCliResponses();
 
-    applyOnecliSecrets('madison-reed', ['Datafold-MadisonReed', 'Hex', 'Anthropic']);
+    applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Hex', 'Anthropic']);
 
     const rawCalls = mockedExec.mock.calls;
 
@@ -152,7 +152,7 @@ describe('applyOnecliSecrets — happy path', () => {
   test('accepts UUIDs passed directly in declarations', () => {
     setupCliResponses();
 
-    applyOnecliSecrets('madison-reed', ['aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa']);
+    applyOnecliSecrets('example-retail', ['aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa']);
 
     const setSecretsCall = mockedExec.mock.calls.find(
       (c) => (c[1] as string[])[0] === 'agents' && (c[1] as string[])[1] === 'set-secrets',
@@ -165,7 +165,7 @@ describe('applyOnecliSecrets — happy path', () => {
   test('mixes names and UUIDs in a single call', () => {
     setupCliResponses();
 
-    applyOnecliSecrets('madison-reed', ['Datafold-MadisonReed', 'cccccccc-cccc-cccc-cccc-cccccccccccc']);
+    applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'cccccccc-cccc-cccc-cccc-cccccccccccc']);
 
     const setSecretsCall = mockedExec.mock.calls.find(
       (c) => (c[1] as string[])[0] === 'agents' && (c[1] as string[])[1] === 'set-secrets',
@@ -178,10 +178,10 @@ describe('applyOnecliSecrets — happy path', () => {
   test('always forces mode to selective regardless of current mode', () => {
     setupCliResponses();
 
-    // illie-codex is currently in mode `all` per fixture. After apply,
+    // helper-codex is currently in mode `all` per fixture. After apply,
     // we still set-secret-mode selective. The mode-flip is unconditional
     // when onecliSecrets is set — that's the declarative posture.
-    applyOnecliSecrets('illysium-codex', ['Hex']);
+    applyOnecliSecrets('example-labs-codex', ['Hex']);
 
     const modeCall = mockedExec.mock.calls.find((c) => (c[1] as string[])[1] === 'set-secret-mode');
     expect(modeCall).toBeDefined();
@@ -206,7 +206,7 @@ describe('applyOnecliSecrets — fail-closed paths', () => {
   test("throws when a declared secret NAME doesn't resolve", () => {
     setupCliResponses();
 
-    expect(() => applyOnecliSecrets('madison-reed', ['Datafold-MadisonReed', 'Mistyped-Name'])).toThrow(
+    expect(() => applyOnecliSecrets('example-retail', ['Datafold-ExampleRetail', 'Mistyped-Name'])).toThrow(
       /secret\(s\) not found in vault: Mistyped-Name/,
     );
     // No set-secrets should have been issued — fail-closed before apply
@@ -220,7 +220,7 @@ describe('applyOnecliSecrets — fail-closed paths', () => {
     setupCliResponses();
     const phantomUuid = '99999999-9999-9999-9999-999999999999';
 
-    expect(() => applyOnecliSecrets('madison-reed', [phantomUuid])).toThrow(
+    expect(() => applyOnecliSecrets('example-retail', [phantomUuid])).toThrow(
       new RegExp(`secret\\(s\\) not found in vault: ${phantomUuid}`),
     );
   });
@@ -228,7 +228,7 @@ describe('applyOnecliSecrets — fail-closed paths', () => {
   test('reports ALL unresolvable names in one error', () => {
     setupCliResponses();
 
-    expect(() => applyOnecliSecrets('madison-reed', ['Bad-One', 'Anthropic', 'Bad-Two'])).toThrow(/Bad-One, Bad-Two/);
+    expect(() => applyOnecliSecrets('example-retail', ['Bad-One', 'Anthropic', 'Bad-Two'])).toThrow(/Bad-One, Bad-Two/);
   });
 });
 
@@ -236,10 +236,10 @@ describe('applyOnecliSecrets — caching', () => {
   test('reuses cached identifier→UUID after first lookup', () => {
     setupCliResponses();
 
-    applyOnecliSecrets('madison-reed', ['Anthropic']);
+    applyOnecliSecrets('example-retail', ['Anthropic']);
     const firstCallCount = mockedExec.mock.calls.filter(isAgentsListCall).length;
 
-    applyOnecliSecrets('madison-reed', ['Hex']);
+    applyOnecliSecrets('example-retail', ['Hex']);
     const secondCallCount = mockedExec.mock.calls.filter(isAgentsListCall).length;
 
     // First call populated the cache; second call should NOT re-list agents.
@@ -247,7 +247,7 @@ describe('applyOnecliSecrets — caching', () => {
   });
 
   test('cache miss triggers refresh of agents list', () => {
-    // First call resolves 'madison-reed'. Then we add a NEW agent fixture
+    // First call resolves 'example-retail'. Then we add a NEW agent fixture
     // that contains an identifier we'll ask for — the cache miss should
     // re-issue `agents list` and discover it.
     let callsToAgentsList = 0;
@@ -277,7 +277,7 @@ describe('applyOnecliSecrets — caching', () => {
       return '';
     });
 
-    applyOnecliSecrets('madison-reed', ['Anthropic']);
+    applyOnecliSecrets('example-retail', ['Anthropic']);
     expect(callsToAgentsList).toBe(1);
 
     applyOnecliSecrets('newly-created-identifier', ['Anthropic']);
@@ -287,19 +287,19 @@ describe('applyOnecliSecrets — caching', () => {
 
 describe('mergeWorkgroupAndGroupSecrets — C3', () => {
   test('test_merge_workgroup_baseline_plus_group_additive', () => {
-    const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Datafold-Illysium']);
-    expect(result).toEqual(['Anthropic', 'Exa', 'Datafold-Illysium']);
+    const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Datafold-Example Labs']);
+    expect(result).toEqual(['Anthropic', 'Exa', 'Datafold-Example Labs']);
   });
 
   test('test_merge_dedup_when_group_repeats_workgroup_secret', () => {
-    const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Anthropic', 'Datafold-Illysium']);
+    const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Anthropic', 'Datafold-Example Labs']);
     // Anthropic appears in both — only one copy in output, workgroup order preserved
-    expect(result).toEqual(['Anthropic', 'Exa', 'Datafold-Illysium']);
+    expect(result).toEqual(['Anthropic', 'Exa', 'Datafold-Example Labs']);
   });
 
   test('test_merge_empty_workgroup_passes_through', () => {
-    const result = mergeWorkgroupAndGroupSecrets([], ['Datafold-Illysium']);
-    expect(result).toEqual(['Datafold-Illysium']);
+    const result = mergeWorkgroupAndGroupSecrets([], ['Datafold-Example Labs']);
+    expect(result).toEqual(['Datafold-Example Labs']);
   });
 
   test('test_merge_empty_group_passes_through', () => {
@@ -309,16 +309,16 @@ describe('mergeWorkgroupAndGroupSecrets — C3', () => {
 
   test('test_merge_per_group_cannot_subtract', () => {
     // Per-group list is additive only — cannot remove workgroup secrets
-    const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Datafold-Illysium']);
+    const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Datafold-Example Labs']);
     // Anthropic + Exa from workgroup MUST be present
     expect(result).toContain('Anthropic');
     expect(result).toContain('Exa');
-    expect(result).toContain('Datafold-Illysium');
+    expect(result).toContain('Datafold-Example Labs');
   });
 
   test('handles undefined workgroup secrets', () => {
-    const result = mergeWorkgroupAndGroupSecrets(undefined, ['Datafold-Illysium']);
-    expect(result).toEqual(['Datafold-Illysium']);
+    const result = mergeWorkgroupAndGroupSecrets(undefined, ['Datafold-Example Labs']);
+    expect(result).toEqual(['Datafold-Example Labs']);
   });
 
   test('handles undefined group secrets', () => {
@@ -333,10 +333,10 @@ describe('mergeWorkgroupAndGroupSecrets — C3', () => {
 });
 
 describe('slackUserTokenSecrets', () => {
-  const merged = ['Anthropic', 'Slack-User-Token-Madison-Reed', 'Slack-Bot-Token-MR', 'GranolaAPI'];
+  const merged = ['Anthropic', 'Slack-User-Token-example-retail', 'Slack-Bot-Token-Example-Retail', 'GranolaAPI'];
 
   test('convention match selects the user-token secret, not the bot token', () => {
-    expect(slackUserTokenSecrets(merged)).toEqual(['Slack-User-Token-Madison-Reed']);
+    expect(slackUserTokenSecrets(merged)).toEqual(['Slack-User-Token-example-retail']);
   });
 
   test('convention is case-insensitive', () => {
@@ -346,11 +346,13 @@ describe('slackUserTokenSecrets', () => {
   test('explicit names take precedence over the convention', () => {
     // An explicitly-named secret that does NOT match the convention is still
     // selected; a convention-matching secret NOT in the explicit list is not.
-    expect(slackUserTokenSecrets(['Slack-MR', 'Slack-User-Token-Madison-Reed'], ['Slack-MR'])).toEqual(['Slack-MR']);
+    expect(
+      slackUserTokenSecrets(['Slack-Example-Retail', 'Slack-User-Token-example-retail'], ['Slack-Example-Retail']),
+    ).toEqual(['Slack-Example-Retail']);
   });
 
   test('explicit match is case-insensitive and returns names as they appear', () => {
-    expect(slackUserTokenSecrets(['Slack-MR'], ['slack-mr'])).toEqual(['Slack-MR']);
+    expect(slackUserTokenSecrets(['Slack-Example-Retail'], ['slack-example-retail'])).toEqual(['Slack-Example-Retail']);
   });
 
   test('no match returns empty', () => {
@@ -359,6 +361,6 @@ describe('slackUserTokenSecrets', () => {
   });
 
   test('empty explicit list falls back to convention', () => {
-    expect(slackUserTokenSecrets(merged, [])).toEqual(['Slack-User-Token-Madison-Reed']);
+    expect(slackUserTokenSecrets(merged, [])).toEqual(['Slack-User-Token-example-retail']);
   });
 });

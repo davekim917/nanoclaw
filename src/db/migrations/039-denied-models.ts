@@ -8,7 +8,7 @@ import type { Migration } from './index.js';
  * and replaces it with a much smaller `denied_models` blocklist.
  *
  * Why the flip:
- *   - The allowlist was over-engineered. Empirically (talking with Dave),
+ *   - The allowlist was over-engineered. Empirically (talking with Operator),
  *     OpenCode itself already knows the set of reachable models given its
  *     auth.json + env-configured providers — `opencode models` enumerates
  *     them grouped by provider prefix (opencode-go/*, opencode/*, nvidia/*,

@@ -75,7 +75,7 @@ describe('discoverWorkgroup', () => {
     put(root, 'repos/analytics/ignored.sql', 'select 2');
     put(root, 'repos/analytics/notes/untracked.md', '# Finding');
 
-    const sources = await discoverWorkgroup({ workgroupId: 'madison-reed', root });
+    const sources = await discoverWorkgroup({ workgroupId: 'example-retail', root });
     const paths = sources.map((source) => source.relativePath);
 
     expect(paths).toContain('repos/analytics/models/tracked.sql');

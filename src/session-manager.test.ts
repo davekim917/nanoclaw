@@ -91,37 +91,37 @@ async function deferMessageForFreshContextRetry(
 
 describe('threadWorktreeDir', () => {
   it('uses thread_id directly as the key when present', () => {
-    const got = threadWorktreeDir('slack:C0AJA89MN2E', 'slack:C0AJA89MN2E:1778800261.935259');
-    expect(got).toBe(path.join(threadsBaseDir(), 'slack_C0AJA89MN2E_1778800261.935259', 'worktrees'));
+    const got = threadWorktreeDir('slack:CTEST00004', 'slack:CTEST00004:1778800261.935259');
+    expect(got).toBe(path.join(threadsBaseDir(), 'slack_CTEST00004_1778800261.935259', 'worktrees'));
   });
 
   it('produces NO colons in the path (Docker -v safety)', () => {
     // Docker's -v flag treats `:` as source:target:options separator.
     // A colon anywhere in the host path causes Docker to reject with exit 125.
-    const got = threadWorktreeDir('slack:C0AJA89MN2E', 'slack:C0AJA89MN2E:1778800261.935259');
+    const got = threadWorktreeDir('slack:CTEST00004', 'slack:CTEST00004:1778800261.935259');
     expect(got).not.toContain(':');
   });
 
   it('two siblings on different channelTypes but same platform_id resolve to same path', () => {
-    // This is the cross-bot share invariant: illie (slack-illysium) and
-    // illie-codex (slack-illiecodex) both see the same Slack channel, so they
+    // This is the cross-bot share invariant: helper (slack-example-labs) and
+    // helper-codex (slack-helpercodex) both see the same Slack channel, so they
     // get the same platform_id and the same thread_id from chat-sdk-bridge.
     // The mg ids differ (one per channelType), but the worktree path must
     // match for shared collaboration.
-    const tid = 'slack:C0AJA89MN2E:1778800261.935259';
-    const fromIllie = threadWorktreeDir('slack:C0AJA89MN2E', tid);
-    const fromCodex = threadWorktreeDir('slack:C0AJA89MN2E', tid);
-    expect(fromIllie).toBe(fromCodex);
+    const tid = 'slack:CTEST00004:1778800261.935259';
+    const fromHelper = threadWorktreeDir('slack:CTEST00004', tid);
+    const fromCodex = threadWorktreeDir('slack:CTEST00004', tid);
+    expect(fromHelper).toBe(fromCodex);
   });
 
   it('falls back to dm-<platform_id> when threadId is null', () => {
-    const got = threadWorktreeDir('slack:D0AK1BR5J92', null);
-    expect(got).toBe(path.join(threadsBaseDir(), 'dm-slack_D0AK1BR5J92', 'worktrees'));
+    const got = threadWorktreeDir('slack:DTEST00009', null);
+    expect(got).toBe(path.join(threadsBaseDir(), 'dm-slack_DTEST00009', 'worktrees'));
   });
 
   it('two siblings in the same DM (different mgs, same platform_id) share path', () => {
-    const a = threadWorktreeDir('slack:D0AK1BR5J92', null);
-    const b = threadWorktreeDir('slack:D0AK1BR5J92', null);
+    const a = threadWorktreeDir('slack:DTEST00009', null);
+    const b = threadWorktreeDir('slack:DTEST00009', null);
     expect(a).toBe(b);
   });
 
@@ -136,15 +136,15 @@ describe('threadWorktreeDir', () => {
 
 describe('Graphify cache paths', () => {
   it('test_graphify_thread_cache_is_sibling_shared', () => {
-    const threadId = 'slack:C0AJA89MN2E:1778800261.935259';
-    const fromClaude = threadGraphifyCacheDir('slack:C0AJA89MN2E', threadId);
-    const fromCodex = threadGraphifyCacheDir('slack:C0AJA89MN2E', threadId);
+    const threadId = 'slack:CTEST00004:1778800261.935259';
+    const fromClaude = threadGraphifyCacheDir('slack:CTEST00004', threadId);
+    const fromCodex = threadGraphifyCacheDir('slack:CTEST00004', threadId);
 
     expect(fromClaude).toBe(fromCodex);
-    expect(fromClaude).toBe(path.join(threadsBaseDir(), 'slack_C0AJA89MN2E_1778800261.935259', 'graphify-cache'));
+    expect(fromClaude).toBe(path.join(threadsBaseDir(), 'slack_CTEST00004_1778800261.935259', 'graphify-cache'));
     expect(fromClaude).not.toContain(':');
-    expect(threadGraphifyCacheDir('slack:C0AJA89MN2E', 'thread-a')).not.toBe(
-      threadGraphifyCacheDir('slack:C0AJA89MN2E', 'thread-b'),
+    expect(threadGraphifyCacheDir('slack:CTEST00004', 'thread-a')).not.toBe(
+      threadGraphifyCacheDir('slack:CTEST00004', 'thread-b'),
     );
   });
 
@@ -341,7 +341,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       platformId: 'discord:g:c',
       channelType: 'discord',
       threadId: 'discord:g:c:t',
-      content: JSON.stringify({ text: '@Axie recover this' }),
+      content: JSON.stringify({ text: '@Example Agent recover this' }),
     };
     await expect(writeSessionMessageIfNew(AG, SESS, input)).resolves.toBe(true);
     await expect(writeSessionMessageIfNew(AG, SESS, input)).resolves.toBe(false);

@@ -85,12 +85,12 @@ describe('send_message MCP tool — default replies in the current conversation'
       'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY, channel_type TEXT, platform_id TEXT, thread_id TEXT)',
     );
     db.prepare(
-      "INSERT INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, 'slack', 'slack:C0AJA89MN2E', 'slack:C0AJA89MN2E:1780316121.601669')",
+      "INSERT INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, 'slack', 'slack:CTEST00004', 'slack:CTEST00004:1780316121.601669')",
     ).run();
     // An owner-DM destination the agent could (wrongly) redirect to.
     db.prepare(
       `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-       VALUES ('dave', 'Dave', 'channel', 'slack', 'slack:D0AK1BR5J92', NULL)`,
+       VALUES ('operator', 'Operator', 'channel', 'slack', 'slack:DTEST00009', NULL)`,
     ).run();
   });
 
@@ -99,16 +99,16 @@ describe('send_message MCP tool — default replies in the current conversation'
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(out[0].platform_id).toBe('slack:C0AJA89MN2E');
-    expect(out[0].thread_id).toBe('slack:C0AJA89MN2E:1780316121.601669');
+    expect(out[0].platform_id).toBe('slack:CTEST00004');
+    expect(out[0].thread_id).toBe('slack:CTEST00004:1780316121.601669');
   });
 
   it('explicit `to` still redirects to the DM (channel-root, no thread)', async () => {
-    await sendMessage.handler({ to: 'dave', text: 'explicitly DM you' });
+    await sendMessage.handler({ to: 'operator', text: 'explicitly DM you' });
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(out[0].platform_id).toBe('slack:D0AK1BR5J92');
+    expect(out[0].platform_id).toBe('slack:DTEST00009');
     expect(out[0].thread_id).toBeNull();
   });
 });

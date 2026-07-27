@@ -15,6 +15,7 @@ import {
   resolveCodexAuthFallbacks,
   materializeCodexFallbackRuntime,
   resolveProviderName,
+  resolveAtlassianMcpServer,
   resolveWorkgroupMemoryLockMount,
   resolveWorkgroupMemoryMount,
   WORKGROUP_MEMORY_LOCK_CONTAINER_PATH,
@@ -46,6 +47,34 @@ describe('resolveProviderName', () => {
   it('treats empty string as unset (falls through)', () => {
     expect(resolveProviderName('', 'opencode')).toBe('opencode');
     expect(resolveProviderName(null, '')).toBe('claude');
+  });
+});
+
+describe('resolveAtlassianMcpServer', () => {
+  it('builds the Jira and Confluence stdio config from a valid tenant root', () => {
+    expect(resolveAtlassianMcpServer('https://example.atlassian.net/')).toEqual({
+      type: 'stdio',
+      command: 'mcp-atlassian',
+      args: [],
+      env: {
+        JIRA_URL: 'https://example.atlassian.net',
+        JIRA_USERNAME: 'onecli-managed',
+        JIRA_API_TOKEN: 'onecli-managed',
+        CONFLUENCE_URL: 'https://example.atlassian.net/wiki',
+        CONFLUENCE_USERNAME: 'onecli-managed',
+        CONFLUENCE_API_TOKEN: 'onecli-managed',
+      },
+    });
+  });
+
+  it.each([
+    undefined,
+    'not a url',
+    'http://example.atlassian.net',
+    'https://example.com',
+    'https://example.atlassian.net/jira',
+  ])('fails closed for missing or invalid tenant roots: %s', (value) => {
+    expect(resolveAtlassianMcpServer(value)).toBeNull();
   });
 });
 
@@ -301,7 +330,7 @@ describe('resolveAnthropicAuth', () => {
   });
 
   it('returns nothing when neither global nor per-group is set', () => {
-    expect(resolveAnthropicAuth('madison-reed', {})).toEqual({
+    expect(resolveAnthropicAuth('example-retail', {})).toEqual({
       oauthPrimary: undefined,
       oauthFallbacks: [],
       apiKeyPrimary: undefined,
@@ -313,16 +342,16 @@ describe('resolveAnthropicAuth', () => {
     const env = {
       CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',
       CLAUDE_CODE_OAUTH_TOKEN_2: 'global-oauth-2',
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'mr-oauth',
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_2: 'mr-oauth-2',
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_3: 'mr-oauth-3',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL: 'retail-oauth',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL_2: 'retail-oauth-2',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL_3: 'retail-oauth-3',
     };
-    const auth = resolveAnthropicAuth('madison-reed', env);
-    expect(auth.oauthPrimary).toBe('mr-oauth');
+    const auth = resolveAnthropicAuth('example-retail', env);
+    expect(auth.oauthPrimary).toBe('retail-oauth');
     // critical: no leakage from global rotation siblings into the workplace set
     expect(auth.oauthFallbacks).toEqual([
-      { index: 2, value: 'mr-oauth-2' },
-      { index: 3, value: 'mr-oauth-3' },
+      { index: 2, value: 'retail-oauth-2' },
+      { index: 3, value: 'retail-oauth-3' },
     ]);
   });
 
@@ -356,7 +385,7 @@ describe('resolveAnthropicAuth', () => {
       CLAUDE_CODE_OAUTH_TOKEN_2: 'real-rotation-2',
       CLAUDE_CODE_OAUTH_TOKEN_3: 'real-rotation-3',
     };
-    const auth = resolveAnthropicAuth('illysium', env);
+    const auth = resolveAnthropicAuth('example-labs', env);
     expect(auth.oauthPrimary).toBe('real-rotation-2');
     expect(auth.oauthFallbacks).toEqual([{ index: 3, value: 'real-rotation-3' }]);
   });
@@ -373,7 +402,7 @@ describe('resolveAnthropicAuth', () => {
       CLAUDE_CODE_OAUTH_TOKEN_3: 'fallback-3',
     };
     const envFile = { CLAUDE_CODE_OAUTH_TOKEN: 'real-working-primary' };
-    const auth = resolveAnthropicAuth('illysium', env, envFile);
+    const auth = resolveAnthropicAuth('example-labs', env, envFile);
     expect(auth.oauthPrimary).toBe('real-working-primary');
     // Numbered fallbacks stay as fallbacks — NOT promoted.
     expect(auth.oauthFallbacks).toEqual([
@@ -391,7 +420,7 @@ describe('resolveAnthropicAuth', () => {
       CLAUDE_CODE_OAUTH_TOKEN_2: 'real-rotation-2',
       CLAUDE_CODE_OAUTH_TOKEN_3: 'real-rotation-3',
     };
-    const auth = resolveAnthropicAuth('illysium', env, { CLAUDE_CODE_OAUTH_TOKEN: 'placeholder' });
+    const auth = resolveAnthropicAuth('example-labs', env, { CLAUDE_CODE_OAUTH_TOKEN: 'placeholder' });
     expect(auth.oauthPrimary).toBe('real-rotation-2');
     expect(auth.oauthFallbacks).toEqual([{ index: 3, value: 'real-rotation-3' }]);
   });
@@ -399,9 +428,9 @@ describe('resolveAnthropicAuth', () => {
   it('placeholder in a scoped slot is also filtered', () => {
     const env = {
       CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',
-      CLAUDE_CODE_OAUTH_TOKEN_AXIE_DEV: 'placeholder',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_DEV: 'placeholder',
     };
-    const auth = resolveAnthropicAuth('axie-dev', env);
+    const auth = resolveAnthropicAuth('example-dev', env);
     // Scoped primary is sentinel → falls back to the global, which is real.
     expect(auth.oauthPrimary).toBe('global-oauth');
   });
@@ -409,31 +438,31 @@ describe('resolveAnthropicAuth', () => {
   it('per-group token does not leak to other groups', () => {
     const env = {
       CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'mr-oauth',
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_2: 'mr-oauth-2',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL: 'retail-oauth',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL_2: 'retail-oauth-2',
     };
-    const auth = resolveAnthropicAuth('illysium', env);
+    const auth = resolveAnthropicAuth('example-labs', env);
     expect(auth.oauthPrimary).toBe('global-oauth');
-    // illysium must not see madison-reed siblings
+    // example-labs must not see example-retail siblings
     expect(auth.oauthFallbacks).toEqual([]);
   });
 
   it('orphan per-group fallbacks (no per-group primary) fall through to global', () => {
     const env = {
       CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_2: 'mr-fallback-only',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL_2: 'retail-fallback-only',
     };
-    const auth = resolveAnthropicAuth('madison-reed', env);
+    const auth = resolveAnthropicAuth('example-retail', env);
     expect(auth.oauthPrimary).toBe('global-oauth');
     expect(auth.oauthFallbacks).toEqual([]);
   });
 
   it('hyphens in folder name normalise to underscores', () => {
     const env = {
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'mr-oauth',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL: 'retail-oauth',
     };
-    expect(resolveAnthropicAuth('madison-reed', env).oauthPrimary).toBe('mr-oauth');
-    expect(resolveAnthropicAuth('Madison-Reed', env).oauthPrimary).toBe('mr-oauth');
+    expect(resolveAnthropicAuth('example-retail', env).oauthPrimary).toBe('retail-oauth');
+    expect(resolveAnthropicAuth('example-retail', env).oauthPrimary).toBe('retail-oauth');
   });
 
   it('digit-only folder name skips per-group resolution to avoid rotation collision', () => {
@@ -450,21 +479,21 @@ describe('resolveAnthropicAuth', () => {
   it('OAuth and API key scope independently', () => {
     const env = {
       CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',
-      ANTHROPIC_API_KEY_MADISON_REED: 'mr-key',
+      ANTHROPIC_API_KEY_EXAMPLE_RETAIL: 'retail-key',
     };
-    const auth = resolveAnthropicAuth('madison-reed', env);
+    const auth = resolveAnthropicAuth('example-retail', env);
     expect(auth.oauthPrimary).toBe('global-oauth');
-    expect(auth.apiKeyPrimary).toBe('mr-key');
+    expect(auth.apiKeyPrimary).toBe('retail-key');
   });
 
   it('skips empty-string env values', () => {
     const env = {
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: '',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL: '',
       CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',
       CLAUDE_CODE_OAUTH_TOKEN_2: '',
       CLAUDE_CODE_OAUTH_TOKEN_3: 'global-oauth-3',
     };
-    const auth = resolveAnthropicAuth('madison-reed', env);
+    const auth = resolveAnthropicAuth('example-retail', env);
     // empty per-group falls through to global
     expect(auth.oauthPrimary).toBe('global-oauth');
     expect(auth.oauthFallbacks).toEqual([{ index: 3, value: 'global-oauth-3' }]);
@@ -484,7 +513,7 @@ describe('resolveAnthropicAuth', () => {
   // Disk (.env read fresh at spawn) supplements/overrides the host's stale
   // startup process.env snapshot. The host loads .env once at startup, so a
   // per-group token ADDED after that is absent from process.env — the
-  // 2026-06-27 incident: madison-reed ran on the global pool for ~15h while
+  // 2026-06-27 incident: example-retail ran on the global pool for ~15h while
   // its scoped 3-account set sat in .env, unseen, and rotation had no healthy
   // fallback to reach.
   it('resolves a scoped set present only on disk, not yet in process.env (2026-06-27 incident)', () => {
@@ -493,38 +522,38 @@ describe('resolveAnthropicAuth', () => {
     const env = { CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth' };
     const envFile = {
       CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'mr-oauth',
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_2: 'mr-oauth-2',
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_3: 'mr-oauth-3',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL: 'retail-oauth',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL_2: 'retail-oauth-2',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL_3: 'retail-oauth-3',
     };
-    const auth = resolveAnthropicAuth('madison-reed', env, envFile);
-    expect(auth.oauthPrimary).toBe('mr-oauth');
+    const auth = resolveAnthropicAuth('example-retail', env, envFile);
+    expect(auth.oauthPrimary).toBe('retail-oauth');
     expect(auth.oauthFallbacks).toEqual([
-      { index: 2, value: 'mr-oauth-2' },
-      { index: 3, value: 'mr-oauth-3' },
+      { index: 2, value: 'retail-oauth-2' },
+      { index: 3, value: 'retail-oauth-3' },
     ]);
   });
 
   it('includes a scoped numbered sibling that exists only on disk', () => {
     const env = {
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'mr-oauth',
-      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_2: 'mr-oauth-2',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL: 'retail-oauth',
+      CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL_2: 'retail-oauth-2',
     };
     // operator appended _3 to .env but hasn't restarted the host
-    const envFile = { CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_3: 'mr-oauth-3' };
-    const auth = resolveAnthropicAuth('madison-reed', env, envFile);
+    const envFile = { CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL_3: 'retail-oauth-3' };
+    const auth = resolveAnthropicAuth('example-retail', env, envFile);
     expect(auth.oauthFallbacks).toEqual([
-      { index: 2, value: 'mr-oauth-2' },
-      { index: 3, value: 'mr-oauth-3' },
+      { index: 2, value: 'retail-oauth-2' },
+      { index: 3, value: 'retail-oauth-3' },
     ]);
   });
 
   it('disk value wins over a stale process.env value (token rotated in .env)', () => {
     // operator replaced a capped token in .env; process.env still holds the old
     // value from host startup. The container should spawn on the NEW token.
-    const env = { CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'stale-old-token' };
-    const envFile = { CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'fresh-new-token' };
-    expect(resolveAnthropicAuth('madison-reed', env, envFile).oauthPrimary).toBe('fresh-new-token');
+    const env = { CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL: 'stale-old-token' };
+    const envFile = { CLAUDE_CODE_OAUTH_TOKEN_EXAMPLE_RETAIL: 'fresh-new-token' };
+    expect(resolveAnthropicAuth('example-retail', env, envFile).oauthPrimary).toBe('fresh-new-token');
   });
 
   it('includes a global numbered fallback present only on disk', () => {
@@ -558,20 +587,20 @@ describe('codex provider host auth', () => {
     const home = makeHome();
     const sessionDir = makeSessionDir();
     writeAuth(path.join(home, '.codex'), 'global');
-    writeAuth(path.join(home, '.codex-madison-reed-codex'), 'madison-reed');
+    writeAuth(path.join(home, '.codex-example-retail-codex'), 'example-retail');
 
     const fn = getProviderContainerConfig('codex');
     expect(fn).toBeDefined();
     const contribution = fn!({
       sessionDir,
       agentGroupId: 'ag-does-not-match-folder',
-      agentGroupFolder: 'madison-reed-codex',
+      agentGroupFolder: 'example-retail-codex',
       groupDir: sessionDir,
       selectedSkills: [],
       hostEnv: { HOME: home } as NodeJS.ProcessEnv,
     });
 
-    expect(copiedAuth(sessionDir)).toEqual({ account: 'madison-reed' });
+    expect(copiedAuth(sessionDir)).toEqual({ account: 'example-retail' });
     expect(contribution.mounts?.[0]).toMatchObject({
       hostPath: path.join(sessionDir, 'codex'),
       containerPath: '/home/node/.codex',
@@ -588,8 +617,8 @@ describe('codex provider host auth', () => {
     expect(fn).toBeDefined();
     fn!({
       sessionDir,
-      agentGroupId: 'madison-reed-codex',
-      agentGroupFolder: 'madison-reed-codex',
+      agentGroupId: 'example-retail-codex',
+      agentGroupFolder: 'example-retail-codex',
       groupDir: sessionDir,
       selectedSkills: [],
       hostEnv: { HOME: home } as NodeJS.ProcessEnv,
@@ -619,7 +648,7 @@ describe('resolveCodexAuthFallbacks', () => {
     const home = makeHome();
     writeAuth(path.join(home, '.codex'));
     // Primary is some scoped dir; fallback is the global ~/.codex
-    const out = resolveCodexAuthFallbacks(['~/.codex'], path.join(home, '.codex-mr'), home);
+    const out = resolveCodexAuthFallbacks(['~/.codex'], path.join(home, '.codex-retail'), home);
     expect(out).toEqual([{ hostPath: path.join(home, '.codex'), containerPath: '/home/node/.codex-fallback-1' }]);
   });
 
@@ -627,7 +656,7 @@ describe('resolveCodexAuthFallbacks', () => {
     const home = makeHome();
     writeAuth(path.join(home, '.codex'));
     // ~/.codex-missing has no auth.json — must be silently dropped
-    const out = resolveCodexAuthFallbacks(['~/.codex-missing', '~/.codex'], path.join(home, '.codex-mr'), home);
+    const out = resolveCodexAuthFallbacks(['~/.codex-missing', '~/.codex'], path.join(home, '.codex-retail'), home);
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({
       hostPath: path.join(home, '.codex'),
@@ -646,7 +675,7 @@ describe('resolveCodexAuthFallbacks', () => {
   it('dedupes within the declaration list (same path declared twice)', () => {
     const home = makeHome();
     writeAuth(path.join(home, '.codex'));
-    const out = resolveCodexAuthFallbacks(['~/.codex', '~/.codex'], path.join(home, '.codex-mr'), home);
+    const out = resolveCodexAuthFallbacks(['~/.codex', '~/.codex'], path.join(home, '.codex-retail'), home);
     expect(out).toHaveLength(1);
     expect(out[0].containerPath).toBe('/home/node/.codex-fallback-1');
   });
@@ -658,7 +687,7 @@ describe('resolveCodexAuthFallbacks', () => {
     writeAuth(path.join(home, '.codex-c'));
     const out = resolveCodexAuthFallbacks(
       ['~/.codex-b', '~/.codex-a', '~/.codex-c'],
-      path.join(home, '.codex-mr'),
+      path.join(home, '.codex-retail'),
       home,
     );
     expect(out.map((e) => e.hostPath)).toEqual([
@@ -677,7 +706,7 @@ describe('resolveCodexAuthFallbacks', () => {
     const home = makeHome();
     writeAuth(path.join(home, '.codex'));
     const messy = [null, '', '   ', '~/.codex'] as unknown as string[];
-    const out = resolveCodexAuthFallbacks(messy, path.join(home, '.codex-mr'), home);
+    const out = resolveCodexAuthFallbacks(messy, path.join(home, '.codex-retail'), home);
     expect(out).toHaveLength(1);
     expect(out[0].hostPath).toBe(path.join(home, '.codex'));
   });
@@ -922,39 +951,39 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
   });
 
   it('test_reconciler_creates_workgroup_and_updates_membership', () => {
-    // Seed illie (parent) and illie-codex (sibling)
-    insertGroup(db, 'ag-illie', 'illysium');
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex');
+    // Seed helper (parent) and helper-codex (sibling)
+    insertGroup(db, 'ag-helper', 'example-labs');
+    insertGroup(db, 'ag-helper-codex', 'example-labs-codex');
 
-    // Spawn illie-codex with workgroup_id pointing to the parent folder
-    const agentGroup = { id: 'ag-illie-codex', folder: 'illysium-codex' };
-    const containerConfig = { workgroup_id: 'illysium' };
+    // Spawn helper-codex with workgroup_id pointing to the parent folder
+    const agentGroup = { id: 'ag-helper-codex', folder: 'example-labs-codex' };
+    const containerConfig = { workgroup_id: 'example-labs' };
 
     reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
 
-    const wg = db.prepare('SELECT id FROM workgroups WHERE id = ?').get('illysium') as { id: string };
+    const wg = db.prepare('SELECT id FROM workgroups WHERE id = ?').get('example-labs') as { id: string };
     expect(wg).toBeDefined();
-    expect(wg.id).toBe('illysium');
+    expect(wg.id).toBe('example-labs');
 
     // agent_groups.workgroup_id should be updated
-    const ag = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-illie-codex') as {
+    const ag = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-helper-codex') as {
       workgroup_id: string;
     };
-    expect(ag.workgroup_id).toBe('illysium');
+    expect(ag.workgroup_id).toBe('example-labs');
   });
 
   it('test_reconciler_preserves_existing_workgroup_row', () => {
     // Pre-seed workgroup with operator-owned secret configuration.
-    insertGroup(db, 'ag-illie', 'illysium');
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex');
-    insertWorkgroup(db, 'illysium', '["Shared-Secret"]');
+    insertGroup(db, 'ag-helper', 'example-labs');
+    insertGroup(db, 'ag-helper-codex', 'example-labs-codex');
+    insertWorkgroup(db, 'example-labs', '["Shared-Secret"]');
 
-    const agentGroup = { id: 'ag-illie-codex', folder: 'illysium-codex' };
-    const containerConfig = { workgroup_id: 'illysium' };
+    const agentGroup = { id: 'ag-helper-codex', folder: 'example-labs-codex' };
+    const containerConfig = { workgroup_id: 'example-labs' };
 
     reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
 
-    const wg = db.prepare('SELECT onecli_secrets FROM workgroups WHERE id = ?').get('illysium') as {
+    const wg = db.prepare('SELECT onecli_secrets FROM workgroups WHERE id = ?').get('example-labs') as {
       onecli_secrets: string;
     };
     expect(wg.onecli_secrets).toBe('["Shared-Secret"]');
@@ -995,13 +1024,13 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     // Contract: spawnContainer threads the resolved wgId from reconcile
     // through to buildMounts / buildArchiveProjection so they don't re-derive
     // (race-fix). The reconciler must return what it settled on.
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex');
+    insertGroup(db, 'ag-helper-codex', 'example-labs-codex');
     const result = reconcileWorkgroupAtSpawn(
       db,
-      { id: 'ag-illie-codex', folder: 'illysium-codex' },
-      { workgroup_id: 'illysium' },
+      { id: 'ag-helper-codex', folder: 'example-labs-codex' },
+      { workgroup_id: 'example-labs' },
     );
-    expect(result.workgroupId).toBe('illysium');
+    expect(result.workgroupId).toBe('example-labs');
   });
 
   it('test_reconciler_noop_when_unchanged', () => {
@@ -1039,24 +1068,24 @@ describe('reconcileWorkgroupAtSpawn — workgroup_id preservation', () => {
   });
 
   it('test_preserves_migrated_workgroup_id_when_container_config_silent', () => {
-    // Simulate post-migration-036 state for illie + illie-codex pair:
-    // both agent_groups rows have workgroup_id='illysium' set by migration,
+    // Simulate post-migration-036 state for helper + helper-codex pair:
+    // both agent_groups rows have workgroup_id='example-labs' set by migration,
     // while existing container.json files did not declare workgroup_id.
-    insertGroup(db, 'ag-illie', 'illysium', 'illysium');
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
-    insertWorkgroup(db, 'illysium');
+    insertGroup(db, 'ag-helper', 'example-labs', 'example-labs');
+    insertGroup(db, 'ag-helper-codex', 'example-labs-codex', 'example-labs');
+    insertWorkgroup(db, 'example-labs');
 
-    // Spawn illie-codex with no workgroup_id in containerConfig — must preserve
-    // the migrated pairing rather than overwriting to 'illysium-codex'.
-    reconcileWorkgroupAtSpawn(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, {});
+    // Spawn helper-codex with no workgroup_id in containerConfig — must preserve
+    // the migrated pairing rather than overwriting to 'example-labs-codex'.
+    reconcileWorkgroupAtSpawn(db, { id: 'ag-helper-codex', folder: 'example-labs-codex' }, {});
 
-    const after = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-illie-codex') as {
+    const after = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-helper-codex') as {
       workgroup_id: string;
     };
-    expect(after.workgroup_id).toBe('illysium'); // preserved, NOT overwritten to 'illysium-codex'
+    expect(after.workgroup_id).toBe('example-labs'); // preserved, NOT overwritten to 'example-labs-codex'
 
-    const wg = db.prepare('SELECT id FROM workgroups WHERE id = ?').get('illysium') as { id: string };
-    expect(wg.id).toBe('illysium');
+    const wg = db.prepare('SELECT id FROM workgroups WHERE id = ?').get('example-labs') as { id: string };
+    expect(wg.id).toBe('example-labs');
   });
 
   it('test_explicit_config_workgroup_id_overrides_db_value', () => {
@@ -1097,10 +1126,10 @@ describe('workgroup secrets merge at spawn (C3 contract verification)', () => {
     // Directly verify the merge that buildContainerArgs performs:
     // workgroups.onecli_secrets ∪ containerConfig.onecliSecrets (additive, dedup)
     const workgroupSecrets = ['Anthropic', 'Exa'];
-    const groupSecrets = ['Datafold-Illysium'];
+    const groupSecrets = ['Datafold-Example Labs'];
     const merged = mergeWorkgroupAndGroupSecrets(workgroupSecrets, groupSecrets);
 
-    expect(merged).toEqual(['Anthropic', 'Exa', 'Datafold-Illysium']);
+    expect(merged).toEqual(['Anthropic', 'Exa', 'Datafold-Example Labs']);
   });
 
   it('dedup when group repeats workgroup secret', () => {
@@ -1109,8 +1138,8 @@ describe('workgroup secrets merge at spawn (C3 contract verification)', () => {
   });
 
   it('empty workgroup secrets passes through group secrets only', () => {
-    const merged = mergeWorkgroupAndGroupSecrets([], ['Datafold-Illysium']);
-    expect(merged).toEqual(['Datafold-Illysium']);
+    const merged = mergeWorkgroupAndGroupSecrets([], ['Datafold-Example Labs']);
+    expect(merged).toEqual(['Datafold-Example Labs']);
   });
 });
 

@@ -37,7 +37,7 @@ function row(overrides: Partial<ScheduledRow> = {}): ScheduledRow {
     key: 'KEY',
     series_id: 'task-morning-briefing',
     agent_group_id: 'ag-1',
-    agent_group_name: 'Axie',
+    agent_group_name: 'Example Agent',
     provider: 'claude',
     channel_name: '#general',
     channel_type: 'discord',
@@ -160,7 +160,7 @@ describe('ScheduledDrawer', () => {
   it('test_move_confirm_shows_delta: move preview shows gains/losses + unattended caveat; execute echoes deltaHash', async () => {
     vi.mocked(api.moveScheduledPreview).mockResolvedValue({
       wiringOk: true,
-      gains: ['Datafold-MadisonReed'],
+      gains: ['Datafold-ExampleRetail'],
       losses: ['Linear'],
       crossWorkgroup: true,
       scriptPresent: true,
@@ -176,7 +176,7 @@ describe('ScheduledDrawer', () => {
     await userEvent.click(screen.getByRole('button', { name: /preview/i }));
 
     const confirm = await screen.findByTestId('move-confirm');
-    expect(confirm.textContent).toContain('Datafold-MadisonReed'); // gains NAME
+    expect(confirm.textContent).toContain('Datafold-ExampleRetail'); // gains NAME
     expect(confirm.textContent).toContain('Linear'); // losses NAME
     // unattended-script caveat (D8)
     expect(confirm.textContent).toMatch(/unattended/i);

@@ -388,11 +388,11 @@ describe('nc:run capture', () => {
     // exec returns stdout for the resolve command (simulating `… | jq -r .channel.id`).
     const exec = (c: string): string | void => {
       cmds.push(c);
-      if (c.startsWith('resolve-dm')) return 'D0SLACK123\n';
+      if (c.startsWith('resolve-dm')) return 'DTEST00002\n';
     };
     await applySkill(cskill, croot, { resolveInput: headless({ user_id: 'U999' }), exec });
     expect(cmds).toContain('resolve-dm U999'); // resolved with the prompted id
-    expect(cmds).toContain('ncl messaging-groups create --channel-type slack --platform-id slack:D0SLACK123'); // captured value flowed downstream
+    expect(cmds).toContain('ncl messaging-groups create --channel-type slack --platform-id slack:DTEST00002'); // captured value flowed downstream
   });
 
   it('lint accepts {{dm_channel}} as defined by the earlier capture', () => {
@@ -1471,10 +1471,10 @@ describe('validate-at-bind (inputs + resolveInput answers)', () => {
   });
 
   it('a valid inputs value binds exactly as before', async () => {
-    const res = await applySkill(vskill, vroot, { inputs: { owner_handle: 'U12345678' }, exec: () => {} });
+    const res = await applySkill(vskill, vroot, { inputs: { owner_handle: 'UTEST00004' }, exec: () => {} });
     expect(fullyApplied(res)).toBe(true);
-    expect(res.vars.owner_handle).toBe('U12345678');
-    expect(readFileSync(join(vroot, '.env'), 'utf8')).toContain('OWNER=U12345678');
+    expect(res.vars.owner_handle).toBe('UTEST00004');
+    expect(readFileSync(join(vroot, '.env'), 'utf8')).toContain('OWNER=UTEST00004');
   });
 
   it('rejects an invalid resolveInput answer the same way (the programmatic backstop)', async () => {
@@ -1503,7 +1503,7 @@ describe('validate-at-bind (inputs + resolveInput answers)', () => {
       exec: () => {},
       resolveInput: async (n) => {
         resolved.push(n);
-        return 'U12345678';
+        return 'UTEST00004';
       },
     });
     expect(resolved).toEqual([]); // never a surprise second acquisition path
@@ -1523,9 +1523,9 @@ describe('validate-at-bind (inputs + resolveInput answers)', () => {
 
   it('honors flags: at bind (case-insensitive match passes)', async () => {
     writeFileSync(join(vskill, 'SKILL.md'), '# f\n\n```nc:prompt h validate:^u[a-z0-9]{8,}$ flags:i\nHandle?\n```\n');
-    const res = await applySkill(vskill, vroot, { inputs: { h: 'U12345678' }, exec: () => {} });
+    const res = await applySkill(vskill, vroot, { inputs: { h: 'UTEST00004' }, exec: () => {} });
     expect(res.deferred).toEqual([]);
-    expect(res.vars.h).toBe('U12345678');
+    expect(res.vars.h).toBe('UTEST00004');
   });
 });
 

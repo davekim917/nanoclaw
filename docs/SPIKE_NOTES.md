@@ -30,7 +30,7 @@ Findings from pre-flight uncertainty-reduction spikes. Logged before Phase 2 for
 
 ## Spike 2.5: Memory Extraction Foundations
 
-**Status:** Code authored on `dave/migration`, pending `npm install` verification.
+**Status:** Code authored on `operator/migration`, pending `npm install` verification.
 
 **Files created:**
 - `src/db/migrations/009-memories.ts` — schema migration

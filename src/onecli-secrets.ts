@@ -13,8 +13,8 @@
  * `ensureAgent` left every new agent in `selective` mode with NOTHING
  * assigned (401 on credentialed calls), and a few operator-flipped
  * `mode all` agents could cross-tenant grab any secret whose host
- * pattern matched the URL — e.g. `illie-codex` hitting Madison-Reed's
- * Atlassian endpoint would attach Madison-Reed's Atlassian secret.
+ * pattern matched the URL — e.g. `helper-codex` hitting example-retail's
+ * Atlassian endpoint would attach example-retail's Atlassian secret.
  *
  * Fail-closed: any declared name that doesn't resolve to a vault
  * secret throws — sweep retries and the operator gets a loud signal,

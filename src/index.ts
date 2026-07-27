@@ -355,7 +355,7 @@ export async function main(): Promise<void> {
   });
   // Wire the access gate's sibling-bot allow-list now that channel adapters are
   // up and their known-bot registries are populated. A message authored by one
-  // of our own bots (Axie, Axie-Codex, Axie-OpenCode, …) is then allowed to
+  // of our own bots (Example Agent, Example Agent-Codex, Example Agent-OpenCode, …) is then allowed to
   // engage siblings even under a `strict` messaging group — without this, a
   // strict mg drops sibling @-mentions as `not_member` and cross-agent handoff
   // silently fails (only owner/admins/members get through). Dynamic imports so

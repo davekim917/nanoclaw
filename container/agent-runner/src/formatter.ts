@@ -418,7 +418,7 @@ function formatSingleChat(msg: MessageInRow): string {
   // canonical `<@USER_ID>` mentions when replying to the sender (humans
   // OR bots). Slack `auth.test` returns the user_id without the channel-
   // type prefix; Discord uses bare snowflakes. This sidesteps the
-  // "@Dave" vs "@Dave.kim" prose-name ambiguity by giving the model the
+  // "@Operator" vs "@Operator.kim" prose-name ambiguity by giving the model the
   // authoritative id to wrap. Omitted when the inbound envelope has no
   // senderId (e.g. system/CLI messages).
   const senderId = content.senderId || content.author?.userId;

@@ -186,7 +186,7 @@ async function main(): Promise<void> {
   const instructions = baseInstructions;
 
   // Skills parity: populate `/home/node/.agents/skills/` unconditionally so
-  // BOTH codex-primary (illie-codex) AND codex-as-peer (illie running the
+  // BOTH codex-primary (helper-codex) AND codex-as-peer (helper running the
   // codex companion) see the same plugin skills (humanizer, impeccable,
   // etc.). Pass runtime so runtime-specific denylists apply
   // correctly — e.g., opencode runtime surfaces workflow-agents skills as

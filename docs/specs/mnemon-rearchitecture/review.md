@@ -137,7 +137,7 @@ The architecture is **defensible** per Reviewer B's external pattern check. The 
 - **Suggested resolution:** Cache per-group memory-enabled boolean in-process with 60s TTL. Document the cache invariant.
 - **Status:** Open
 
-### [S3] enable-memory.ts dirs vs existing illysium dirs naming mismatch + no backfill
+### [S3] enable-memory.ts dirs vs existing example-labs dirs naming mismatch + no backfill
 
 - **Raised by:** Reviewer A (F14)
 - **Finding:** New layout `inbox,articles,docs,transcripts,clips,media,processed/` vs existing `articles,docs,threads/`. `transcripts` ≠ `threads`. No backfill mechanism for existing files.
@@ -182,7 +182,7 @@ The architecture is **defensible** per Reviewer B's external pattern check. The 
 | W2 | Cross-provider tool-output asymmetry (Surfaces b/c are Claude-specific) | A (F12), C (#5 partial) | Already documented as M9 known gap; new providers can add their own hooks |
 | W3 | `insertRecurrence`/`insertTask` bypass `writeSessionMessage` | A (F16) | No real impact (kind=task isn't recall-eligible per M1 scope) |
 | W4 | Recall query strategy doesn't do semantic-only embedding query | B (LOW) | mnemon's hybrid recall handles fusion internally |
-| W5 | No shadow mode | B (LOW) | Deliberate trade-off per HARD constraint C6 (Dave's call) |
+| W5 | No shadow mode | B (LOW) | Deliberate trade-off per HARD constraint C6 (Operator's call) |
 
 ---
 

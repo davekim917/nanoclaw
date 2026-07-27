@@ -207,10 +207,10 @@ describe('E3 createEmailGateHook', () => {
     process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
-    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to a@b.com');
+    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
     // Approved → hook allows. The staged card carries the CORE's label/summary,
     // proving the verdict came from the core (not the inline fallback, which
-    // would render a real "*To:* a@b.com" envelope rather than the stub text).
+    // would render a real "*To:* person8@fixture1.example.com" envelope rather than the stub text).
     expect(r.permissionDecision).toBeUndefined();
     const card = gateCard();
     expect(card).toBeDefined();
@@ -223,7 +223,7 @@ describe('E3 createEmailGateHook', () => {
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     // Admin DECLINES → the async round-trip resolves to failed → hook denies.
     ackToReturn = { status: 'failed', error: 'admin declined' };
-    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to a@b.com');
+    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
     // Round-trip preserved: staged a request_bash_gate AND awaited its ack keyed
     // on the same requestId (proving writeMessageOut → awaitDeliveryAck plumbing).
     const card = gateCard();
@@ -238,7 +238,7 @@ describe('E3 createEmailGateHook', () => {
     process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
-    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to a@b.com');
+    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -247,7 +247,7 @@ describe('E3 createEmailGateHook', () => {
     process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = null; // awaitDeliveryAck timed out
-    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to a@b.com');
+    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
     expect(r.permissionDecision).toBe('deny');
     expect(r.permissionDecisionReason).toContain('timed out');
   });
@@ -255,7 +255,7 @@ describe('E3 createEmailGateHook', () => {
   it('scheduled tasks bypass the gate (verdict allow, no staging)', async () => {
     process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
     process.env.NANOCLAW_IS_SCHEDULED_TASK = '1';
-    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to a@b.com');
+    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
     expect(r.permissionDecision).toBeUndefined();
     expect(gateCard()).toBeUndefined(); // nothing staged
     expect(ackedRequestId).toBeNull(); // and no ack round-trip
@@ -302,11 +302,11 @@ describe('E3 createEmailGateHook', () => {
     // refuse the bypass and gate (parity with the SoT redirection regression).
     const r = await runBashHook(
       createEmailGateHook(),
-      'gws gmail +send --to victim@evil.com --subject hi --body x <<< --dry-run',
+      'gws gmail +send --to person25@fixture4.example.com --subject hi --body x <<< --dry-run',
     );
     const card = gateCard();
     expect(card).toBeDefined(); // gated, not bypassed
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined(); // delivered ack → allow after gate
   });
@@ -319,11 +319,11 @@ describe('E3 createEmailGateHook', () => {
     // metacharacter must fail closed in the inline fallback too.
     const r = await runBashHook(
       createEmailGateHook(),
-      'gws gmail +send --to victim@evil.com --subject hi --body x # --dry-run',
+      'gws gmail +send --to person25@fixture4.example.com --subject hi --body x # --dry-run',
     );
     const card = gateCard();
     expect(card).toBeDefined();
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -337,11 +337,11 @@ describe('E3 createEmailGateHook', () => {
     // doesn't, so it gates, and the card surfaces the real recipient.
     const r = await runBashHook(
       createEmailGateHook(),
-      ': gws gmail +send --dry-run; gws gmail +send --to victim@evil.com --subject hi --body x',
+      ': gws gmail +send --dry-run; gws gmail +send --to person25@fixture4.example.com --subject hi --body x',
     );
     const card = gateCard();
     expect(card).toBeDefined();
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -354,11 +354,11 @@ describe('E3 createEmailGateHook', () => {
     // gws sends. The inline fallback must require a DIRECT gws invocation.
     const r = await runBashHook(
       createEmailGateHook(),
-      'exec -a --dry-run gws gmail +send --to victim@evil.com --subject hi --body x',
+      'exec -a --dry-run gws gmail +send --to person25@fixture4.example.com --subject hi --body x',
     );
     const card = gateCard();
     expect(card).toBeDefined();
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -370,11 +370,11 @@ describe('E3 createEmailGateHook', () => {
     // `--subject --dry-run` feeds --dry-run to --subject; gws sends.
     const r = await runBashHook(
       createEmailGateHook(),
-      'gws gmail +send --subject --dry-run --to victim@evil.com --body x',
+      'gws gmail +send --subject --dry-run --to person25@fixture4.example.com --body x',
     );
     const card = gateCard();
     expect(card).toBeDefined();
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -384,7 +384,7 @@ describe('E3 createEmailGateHook', () => {
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     const r = await runBashHook(
       createEmailGateHook(),
-      'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/x.json gws gmail +send --to a@b.com --body z --dry-run',
+      'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/x.json gws gmail +send --to person8@fixture1.example.com --body z --dry-run',
     );
     expect(r.permissionDecision).toBeUndefined();
     expect(gateCard()).toBeUndefined(); // bypassed → nothing staged
@@ -400,11 +400,11 @@ describe('E3 createEmailGateHook', () => {
     // token so the gate fires.
     const r = await runBashHook(
       createEmailGateHook(),
-      `gws gmail +send --to victim@evil.com --subject hi --body 'x'--dry-run`,
+      `gws gmail +send --to person25@fixture4.example.com --subject hi --body 'x'--dry-run`,
     );
     const card = gateCard();
     expect(card).toBeDefined();
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -418,11 +418,11 @@ describe('E3 createEmailGateHook', () => {
     // closed on the unquoted backslash.
     const r = await runBashHook(
       createEmailGateHook(),
-      'gws gmail +send --to victim@evil.com --subject hi --body \\ --dry-run',
+      'gws gmail +send --to person25@fixture4.example.com --subject hi --body \\ --dry-run',
     );
     const card = gateCard();
     expect(card).toBeDefined();
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -435,11 +435,11 @@ describe('E3 createEmailGateHook', () => {
     // tokens on bash IFS only, so it stays one token ≠ --dry-run → gate.
     const r = await runBashHook(
       createEmailGateHook(),
-      'gws gmail +send --to victim@evil.com --body x\f--dry-run',
+      'gws gmail +send --to person25@fixture4.example.com --body x\f--dry-run',
     );
     const card = gateCard();
     expect(card).toBeDefined();
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -453,11 +453,11 @@ describe('E3 createEmailGateHook', () => {
     // whole-command bypass fails closed and the real send gates.
     const r = await runBashHook(
       createEmailGateHook(),
-      'gws gmail +send --dry-run\ngws gmail +send --to victim@evil.com --subject hi --body x',
+      'gws gmail +send --dry-run\ngws gmail +send --to person25@fixture4.example.com --subject hi --body x',
     );
     const card = gateCard();
     expect(card).toBeDefined();
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -467,7 +467,7 @@ describe('E3 createEmailGateHook', () => {
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     const r = await runBashHook(
       createEmailGateHook(),
-      `gws gmail +send --to a@b.com --body $'cost is $5' --dry-run`,
+      `gws gmail +send --to person8@fixture1.example.com --body $'cost is $5' --dry-run`,
     );
     expect(r.permissionDecision).toBeUndefined();
     expect(gateCard()).toBeUndefined(); // bypassed → nothing staged
@@ -481,11 +481,11 @@ describe('E3 createEmailGateHook', () => {
     // --dry-run lives only inside the quoted --body; it is NOT a real argv flag.
     const r = await runBashHook(
       createEmailGateHook(),
-      `gws gmail +send --to victim@evil.com --subject hi --body "please --dry-run this"`,
+      `gws gmail +send --to person25@fixture4.example.com --subject hi --body "please --dry-run this"`,
     );
     const card = gateCard();
     expect(card).toBeDefined(); // gated, not bypassed
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -499,11 +499,11 @@ describe('E3 createEmailGateHook', () => {
     // gates an interactive real send (card carries the real recipient).
     const r = await runBashHook(
       createEmailGateHook(),
-      'gws gmail +send --to victim@evil.com --subject hi --body x',
+      'gws gmail +send --to person25@fixture4.example.com --subject hi --body x',
     );
     const card = gateCard();
     expect(card).toBeDefined(); // gated via inline fallback, NOT allowed
-    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(card!.summary as string).toContain('person25@fixture4.example.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined(); // delivered ack → allow after gate
   });
@@ -521,7 +521,7 @@ describe('E3 createEmailGateHook', () => {
       // dry-run → bypass (allow, no staging) despite the sanitizer prefix
       const dry = await runBashHook(
         createEmailGateHook(),
-        `${prefix}gws gmail +send --to a@b.com --subject hi --body x --dry-run`,
+        `${prefix}gws gmail +send --to person8@fixture1.example.com --subject hi --body x --dry-run`,
       );
       expect(dry.permissionDecision).toBeUndefined();
       expect(gateCard()).toBeUndefined();
@@ -533,11 +533,11 @@ describe('E3 createEmailGateHook', () => {
       ackToReturn = { status: 'delivered' };
       const real = await runBashHook(
         createEmailGateHook(),
-        `${prefix}gws gmail +send --to victim@evil.com --subject hi --body x`,
+        `${prefix}gws gmail +send --to person25@fixture4.example.com --subject hi --body x`,
       );
       const card = gateCard();
       expect(card).toBeDefined();
-      expect(card!.summary as string).toContain('victim@evil.com');
+      expect(card!.summary as string).toContain('person25@fixture4.example.com');
       expect(real.permissionDecision).toBeUndefined();
     } finally {
       if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;

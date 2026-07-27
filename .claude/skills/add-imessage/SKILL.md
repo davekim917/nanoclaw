@@ -175,7 +175,7 @@ Apple ID email you message from — that handle is both your identity and the
 conversation address. Resolve it so the owner-wiring step can target it.
 
 ```nc:prompt owner_handle validate:^(\+\d{8,15}|[^\s@]+@[^\s@]+\.[^\s@]+)$
-The phone number or email you iMessage from — a +E.164 number (e.g. +14155551234) or an email / Apple ID (e.g. you@icloud.com).
+The phone number or email you iMessage from — a +E.164 number (e.g. +14155551234) or an email / Apple ID (e.g. person27@fixture11.example.com).
 ```
 
 iMessage is a native adapter: it sends the raw handle as the conversation

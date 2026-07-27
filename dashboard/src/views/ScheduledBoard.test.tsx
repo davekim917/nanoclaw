@@ -66,7 +66,7 @@ function row(overrides: Partial<ScheduledRow> = {}): ScheduledRow {
     key: 'K-' + (overrides.series_id ?? 'S'),
     series_id: 'S',
     agent_group_id: 'ag-1',
-    agent_group_name: 'Axie',
+    agent_group_name: 'Example Agent',
     provider: 'claude',
     channel_name: '#general',
     channel_type: 'discord',
@@ -225,8 +225,8 @@ describe('ScheduledBoard', () => {
   it('groups rows under collapsible agent-group sections', () => {
     mockData(
       snapshot([
-        row({ series_id: 'a1', agent_group_id: 'ag-1', agent_group_name: 'Axie' }),
-        row({ series_id: 'b1', agent_group_id: 'ag-2', agent_group_name: 'Bo' }),
+        row({ series_id: 'a1', agent_group_id: 'ag-1', agent_group_name: 'Example Agent' }),
+        row({ series_id: 'b1', agent_group_id: 'ag-2', agent_group_name: 'Example Assistant' }),
       ]),
     );
     const { container } = render(<ScheduledBoard authMe={mockAuthMe} route="scheduled" onRouteChange={noop} />);
@@ -269,8 +269,8 @@ describe('ScheduledBoard', () => {
     // zero-latency on-row match that needs no round-trip.
     mockData(
       snapshot([
-        row({ series_id: 'morning-briefing', agent_group_name: 'Axie' }),
-        row({ series_id: 'nightly-synth', agent_group_name: 'Axie' }),
+        row({ series_id: 'morning-briefing', agent_group_name: 'Example Agent' }),
+        row({ series_id: 'nightly-synth', agent_group_name: 'Example Agent' }),
       ]),
     );
     const { container } = render(<ScheduledBoard authMe={mockAuthMe} route="scheduled" onRouteChange={noop} />);
@@ -301,8 +301,8 @@ describe('ScheduledBoard', () => {
 describe('filterRows — prompt/title search', () => {
   it('test_filterrows_includes_prompt_match_key_when_on_row_haystack_misses', () => {
     const rows = [
-      row({ series_id: 'morning-brief', key: 'K1', agent_group_name: 'Axie', channel_name: '#ops', cron: '0 9 * * *' }),
-      row({ series_id: 'nightly-synth', key: 'K2', agent_group_name: 'Axie', channel_name: '#ops', cron: '0 22 * * *' }),
+      row({ series_id: 'morning-brief', key: 'K1', agent_group_name: 'Example Agent', channel_name: '#ops', cron: '0 9 * * *' }),
+      row({ series_id: 'nightly-synth', key: 'K2', agent_group_name: 'Example Agent', channel_name: '#ops', cron: '0 22 * * *' }),
     ];
     // 'zebra' matches NEITHER row's on-row fields; the server reports K1 matches
     // (its prompt body contains zebra). K1 is included via promptMatchKeys; K2 not.

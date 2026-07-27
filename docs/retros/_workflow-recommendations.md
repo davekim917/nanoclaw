@@ -12,7 +12,7 @@
 
 > **Apply at minimum-viable scope. Do not over-engineer the workflow updates themselves.**
 >
-> Dave's stated preference across both features (most explicit during instrumented-memory-recall E9 disposition): *"I just want a working product, not every edge case squashed. We are not over-engineering here."* That preference applies recursively to skill edits.
+> Operator's stated preference across both features (most explicit during instrumented-memory-recall E9 disposition): *"I just want a working product, not every edge case squashed. We are not over-engineering here."* That preference applies recursively to skill edits.
 >
 > Concrete guidance:
 > - Prefer one-paragraph additions to existing skill text over skill restructuring.
@@ -158,7 +158,7 @@ team-ship/SKILL.md
 ### S1 — Live verification of headline path post-deploy [MR-R8]
 
 - **Add:** *"For features with an observable user-facing behavior (UI, API, deployable service, scheduled job, integration), exercise the headline path once after deploy and capture the actual user-facing output (screenshot, API response, log line showing the feature firing) before declaring done. Tests pass ≠ feature works."*
-- **Why:** mnemon-rearchitecture recall injection was 0% functional in production despite all 423 tests passing — every gate cleared but the headline UX silently never fired. Surfaced only when Dave manually tested via Discord @mention.
+- **Why:** mnemon-rearchitecture recall injection was 0% functional in production despite all 423 tests passing — every gate cleared but the headline UX silently never fired. Surfaced only when Operator manually tested via Discord @mention.
 - **Note:** Could land in `team-ship` as a new step or in a new `team-go-live` skill. Minimum-viable: add to `team-ship` as a final post-merge step. Don't create a new skill unless there's clear demand for separate go-live tracking.
 
 ---

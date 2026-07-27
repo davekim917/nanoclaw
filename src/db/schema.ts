@@ -71,7 +71,7 @@ CREATE TABLE messaging_group_agents (
 );
 
 -- Users are messaging-platform identifiers, namespaced: "phone:+1555...",
--- "tg:123", "discord:456", "email:a@x.com". A single human can own multiple
+-- "tg:123", "discord:456", "email:person9@fixture16.example.com". A single human can own multiple
 -- user rows if they have identifiers on unrelated channels (no linking yet).
 CREATE TABLE users (
   id           TEXT PRIMARY KEY,

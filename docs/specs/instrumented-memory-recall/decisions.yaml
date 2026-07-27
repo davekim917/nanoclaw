@@ -480,7 +480,7 @@ decisions:
     chosen: "Daemon writes recall_quality.scope_quality_regression entry to memory-health.json on rank-distribution regression vs self baseline. Operator manually flips recall_scope back to self if they care. No daemon-mutates-config flow. No daemonRequestApproval wrapper. No DM-approval gate. Brief R3.3 'circuit-breaker' becomes 'regression alert + manual flip.'"
     rejected:
       - option: "Keep DM-approval-gated revert (D20)"
-        reason: "Single operator (Dave); manual flip on health.json signal is cheaper than daemonRequestApproval + payload injection + idempotency keys + supersession across nightly triggers infrastructure (M3-1, M3-3 evaporated by this cut)"
+        reason: "Single operator (Operator); manual flip on health.json signal is cheaper than daemonRequestApproval + payload injection + idempotency keys + supersession across nightly triggers infrastructure (M3-1, M3-3 evaporated by this cut)"
     constraint_refs: [C3]
     affects_groups: []
   - id: D36
@@ -541,7 +541,7 @@ assumptions:
   - id: A2
     stage: design
     text: "RRF (k=60) + linear recency multiplier produces better cross-group recall than per-store top-N (revised cycle 1 / D24, cycle 2 / D33)"
-    validation: "When axis-labs flips to all-groups, monitor recall_quality.useful_fact_rate_7d. If it drops vs self baseline by >5pp: first try MEMORY_RECALL_RRF_RECENCY_BOOST=0 to test pure RRF; if still degraded, RRF itself is suspect."
+    validation: "When example-research flips to all-groups, monitor recall_quality.useful_fact_rate_7d. If it drops vs self baseline by >5pp: first try MEMORY_RECALL_RRF_RECENCY_BOOST=0 to test pure RRF; if still degraded, RRF itself is suspect."
     validated: false
     invalidated_at: null
   - id: A3

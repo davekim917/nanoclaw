@@ -21,14 +21,14 @@ describe('getWorkgroupOnecliSecrets', () => {
       );
     `);
     db.prepare(`INSERT INTO workgroups (id, onecli_secrets) VALUES (?, ?)`).run(
-      'wg-mr',
-      JSON.stringify(['Slack-User-Token-Madison-Reed', 'Anthropic']),
+      'wg-retail',
+      JSON.stringify(['Slack-User-Token-example-retail', 'Anthropic']),
     );
     db.prepare(`INSERT INTO workgroups (id, onecli_secrets) VALUES (?, ?)`).run('wg-empty', '[]');
     const insertAg = db.prepare(
       `INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, ?, ?)`,
     );
-    insertAg.run('ag-mr', 'mr', 'mr', 'wg-mr', '2026-01-01');
+    insertAg.run('ag-retail', 'retail', 'retail', 'wg-retail', '2026-01-01');
     insertAg.run('ag-empty', 'e', 'e', 'wg-empty', '2026-01-01');
     insertAg.run('ag-no-wg', 'n', 'n', null, '2026-01-01');
   });
@@ -36,7 +36,7 @@ describe('getWorkgroupOnecliSecrets', () => {
   afterEach(() => closeDb());
 
   it('returns the workgroup secret declarations for a member group', () => {
-    expect(getWorkgroupOnecliSecrets('ag-mr')).toEqual(['Slack-User-Token-Madison-Reed', 'Anthropic']);
+    expect(getWorkgroupOnecliSecrets('ag-retail')).toEqual(['Slack-User-Token-example-retail', 'Anthropic']);
   });
 
   it('returns [] when the workgroup declares none', () => {
@@ -52,7 +52,7 @@ describe('getWorkgroupOnecliSecrets', () => {
   });
 
   it('returns [] (not a throw) when onecli_secrets holds malformed JSON', () => {
-    getDb().prepare(`UPDATE workgroups SET onecli_secrets = ? WHERE id = ?`).run('{not json', 'wg-mr');
-    expect(getWorkgroupOnecliSecrets('ag-mr')).toEqual([]);
+    getDb().prepare(`UPDATE workgroups SET onecli_secrets = ? WHERE id = ?`).run('{not json', 'wg-retail');
+    expect(getWorkgroupOnecliSecrets('ag-retail')).toEqual([]);
   });
 });

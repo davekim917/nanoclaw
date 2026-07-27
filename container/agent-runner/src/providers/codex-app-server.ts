@@ -642,9 +642,9 @@ export function createCodexConfigOverrides(
   // `steerCodexTurn` (an RPC the app-server then rejects), the catch path
   // re-queues the message via `pending.push`, and the operator's
   // mid-stream "steer left" effectively waits for the current turn to
-  // finish — observed during Bo-codex's 5.5-min response to a mid-turn
-  // @-mention from Dave (session sess-1779235256589, May 2026). The Codex
-  // CLI defaults this off; Dave's local Codex CLI sets it in
+  // finish — observed during Example Assistant Codex's 5.5-min response to a mid-turn
+  // @-mention from Operator (session sess-1779235256589, May 2026). The Codex
+  // CLI defaults this off; Operator's local Codex CLI sets it in
   // `[features] steer = true`. Containerized installs need the same toggle.
   //
   // Using the `-c` CLI override (rather than persisting in config.toml)

@@ -46,7 +46,7 @@
 
 ## Non-Goals (Explicitly Out of Scope)
 
-- **Per-task git worktree isolation.** Code-touching tasks (e.g., 22 XZO items editing the same repo in parallel) require worktree-per-task to avoid git corruption. This is a separate, larger problem. Phase 1 assumes orchestrators sequence code-touching tasks (no parallel writes to the same repo). A worktree manager is a future feature, not part of this brief.
+- **Per-task git worktree isolation.** Code-touching tasks (e.g., 22 EXAMPLE items editing the same repo in parallel) require worktree-per-task to avoid git corruption. This is a separate, larger problem. Phase 1 assumes orchestrators sequence code-touching tasks (no parallel writes to the same repo). A worktree manager is a future feature, not part of this brief.
 - **Refactoring `agent-to-agent`.** The existing module continues to serve the hierarchical-subagent pattern for `create_agent`. No changes to `agent-route.ts` or `create-agent.ts` beyond what's strictly needed (e.g., destination projection adjustments) to avoid breakage.
 - **Multi-host orchestration.** All dispatch is on a single NanoClaw host. Cross-host federation is not in scope.
 - **Chat-from-dashboard.** The Phase 2 dashboard is read-only. Posting messages from the dashboard into child sessions is deferred to a future Phase 2B. Steering happens via native Slack/Discord threads.
@@ -94,7 +94,7 @@
 
 ## Success Criteria
 
-1. **Orchestrator can dispatch a 22-item task list** like the XZO example pasted in conversation. Each item becomes its own session in its target agent group. The orchestrator's own thread receives a structured launch summary (task IDs and their target groups).
+1. **Orchestrator can dispatch a 22-item task list** like the EXAMPLE example pasted in conversation. Each item becomes its own session in its target agent group. The orchestrator's own thread receives a structured launch summary (task IDs and their target groups).
 2. **Owner can click into any child task's Slack/Discord thread** and converse with the child agent natively. Replies in the child thread are read by the child session, not the orchestrator's session.
 3. **Child task completion is reflected in the orchestrator's session within ~60 seconds** of the child emitting `task_complete`. The orchestrator's session sees a structured system message with the child's summary and result.
 4. **The watchdog correctly fails a hung task** within `no_progress_timeout` after the child stops reporting (verified by killing a child container manually and observing the parent's notification).

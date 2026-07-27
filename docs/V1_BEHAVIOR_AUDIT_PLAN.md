@@ -12,9 +12,9 @@ During the v1 → v2 migration we shipped:
 
 In that work I audited **what v1 exposes** (MCP tools, IPC handlers, channel adapters, setup commands, config surfaces). I did not systematically audit **what v1 guarantees** (host-side lifecycle behaviors, recovery paths, signal handling, hooks, implicit invariants the agent relies on without knowing).
 
-The worktree auto-commit miss (v1's `cleanupThreadWorkspace` in `src/container-runner.ts`, commits dirty worktrees after every turn with `-m "auto-save: session exit"`) was a direct consequence of that classification error. It was a safety *behavior* that fires after every successful runAgent(), not an MCP tool or IPC handler — so it wasn't on any surface the prior audits enumerated. Dave noticed v2 was missing it because he remembered operating v1 and seeing it save him from compaction-induced context loss.
+The worktree auto-commit miss (v1's `cleanupThreadWorkspace` in `src/container-runner.ts`, commits dirty worktrees after every turn with `-m "auto-save: session exit"`) was a direct consequence of that classification error. It was a safety *behavior* that fires after every successful runAgent(), not an MCP tool or IPC handler — so it wasn't on any surface the prior audits enumerated. Operator noticed v2 was missing it because he remembered operating v1 and seeing it save him from compaction-induced context loss.
 
-This is the same class of error as the "infra gaps are feature gaps" correction Dave made earlier (saved to memory as `feedback_infra_gaps_are_feature_gaps.md`). That correction was about *container surface-area* — mounts, env, network — which I then audited line-by-line. I did not re-apply the lens to *host-side lifecycle behaviors*, which is where this second class of miss lives.
+This is the same class of error as the "infra gaps are feature gaps" correction Operator made earlier (saved to memory as `feedback_infra_gaps_are_feature_gaps.md`). That correction was about *container surface-area* — mounts, env, network — which I then audited line-by-line. I did not re-apply the lens to *host-side lifecycle behaviors*, which is where this second class of miss lives.
 
 **The ask:** a full behavioral audit that surfaces every v1 invariant still load-bearing in operation, with each one classified as present / partial / missing / regressed in v2. Deliverable is `docs/V1_BEHAVIOR_AUDIT.md` (a table, not a prose doc).
 
@@ -30,7 +30,7 @@ This is the same class of error as the "infra gaps are feature gaps" correction 
 
 5. **Upstream/v2 is not ground truth.** Upstream doesn't carry our fork's bug-fix history. A behavior present in v1 but not upstream is still load-bearing for our fork.
 
-6. **Operator memory supplements reading.** Some invariants are only visible from having operated v1 long enough to depend on them. After the reading-based audit produces its table, Dave reviews and supplements with behaviors I couldn't find in code (things that "worked magically" in v1 that he notices were specific guarantees).
+6. **Operator memory supplements reading.** Some invariants are only visible from having operated v1 long enough to depend on them. After the reading-based audit produces its table, Operator reviews and supplements with behaviors I couldn't find in code (things that "worked magically" in v1 that he notices were specific guarantees).
 
 ## Scope — all six categories
 
@@ -100,7 +100,7 @@ Expected volume: likely 100–300 matching commits. Most will be trivial (typo, 
 
 ### 6. Chat transcript self-check
 
-Scan the current conversation's transcripts at `/home/ubuntu/.claude/projects/-home-ubuntu-nanoclaw/*.jsonl` for specific capability names Dave mentioned to me. For each: did I claim to port it? If so, verify against v2 code. This catches the class of miss where I said "done" but was actually shallow.
+Scan the current conversation's transcripts at `/home/ubuntu/.claude/projects/-home-ubuntu-nanoclaw/*.jsonl` for specific capability names Operator mentioned to me. For each: did I claim to port it? If so, verify against v2 code. This catches the class of miss where I said "done" but was actually shallow.
 
 ## Methodology (per-behavior loop)
 
@@ -131,10 +131,10 @@ Sorted by severity descending. Every row has a file:line v1 anchor so the audit 
 ## Execution notes for the post-compact session
 
 - Start by re-reading THIS plan file in full.
-- Confirm scope with Dave before executing (he may add categories based on operational memory).
+- Confirm scope with Operator before executing (he may add categories based on operational memory).
 - Track progress with TaskCreate entries per scope category — one in_progress at a time, not parallel.
 - Append findings to `docs/V1_BEHAVIOR_AUDIT.md` incrementally as each category completes, so a mid-session compact doesn't lose all output.
-- No code changes during the audit — deliverable is the document. Port work is a separate follow-up after Dave reviews and prioritizes.
+- No code changes during the audit — deliverable is the document. Port work is a separate follow-up after Operator reviews and prioritizes.
 
 ## What this audit is NOT
 

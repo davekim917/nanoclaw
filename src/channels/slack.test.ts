@@ -180,12 +180,12 @@ describe('parseSlackWorkspaces', () => {
 
   it('registers suffixed workspaces as channelType "slack-<suffix>" (lowercased)', () => {
     const ws = parseSlackWorkspaces({
-      SLACK_BOT_TOKEN_ILLYSIUM: 'xoxb-ill',
-      SLACK_SIGNING_SECRET_ILLYSIUM: 'sig-ill',
+      SLACK_BOT_TOKEN_EXAMPLE_LABS: 'xoxb-ill',
+      SLACK_SIGNING_SECRET_EXAMPLE_LABS: 'sig-ill',
       SLACK_BOT_TOKEN_NEWJOB: 'xoxb-new',
       SLACK_SIGNING_SECRET_NEWJOB: 'sig-new',
     });
-    expect(ws.map((w) => w.channelType).sort()).toEqual(['slack-illysium', 'slack-newjob']);
+    expect(ws.map((w) => w.channelType).sort()).toEqual(['slack-example-labs', 'slack-newjob']);
   });
 
   it('registers primary and suffixed workspaces together', () => {
@@ -216,28 +216,30 @@ describe('parseSlackWorkspaces', () => {
 
   it('accepts underscores in the suffix and maps them to dashes in channelType', () => {
     // Convention match in two directions:
-    //   - Env-var name: `SLACK_BOT_TOKEN_ILLYSIUM_CODEX` mirrors how other
-    //     fork-scoped env vars look (GITHUB_TOKEN_MADISON_REED).
-    //   - channelType: `slack-illysium-codex` mirrors the dash-separated
-    //     existing channelType convention (`slack-illysium`,
-    //     `slack-madisonreed`).
+    //   - Env-var name: `SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX` mirrors how other
+    //     fork-scoped env vars look (GITHUB_TOKEN_EXAMPLE_RETAIL).
+    //   - channelType: `slack-example-labs-codex` mirrors the dash-separated
+    //     existing channelType convention (`slack-example-labs`,
+    //     `slack-exampleretail`).
     // channel-auto-wire/index.ts:67 inverse-maps `-` → `_` when building
     // env-var lookups, so the round-trip is symmetric.
     const ws = parseSlackWorkspaces({
-      SLACK_BOT_TOKEN_ILLYSIUM_CODEX: 'xoxb-codex',
-      SLACK_SIGNING_SECRET_ILLYSIUM_CODEX: 'sig-codex',
+      SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX: 'xoxb-codex',
+      SLACK_SIGNING_SECRET_EXAMPLE_LABS_CODEX: 'sig-codex',
     });
-    expect(ws).toEqual([{ channelType: 'slack-illysium-codex', botToken: 'xoxb-codex', signingSecret: 'sig-codex' }]);
+    expect(ws).toEqual([
+      { channelType: 'slack-example-labs-codex', botToken: 'xoxb-codex', signingSecret: 'sig-codex' },
+    ]);
   });
 });
 
 describe('extractSlackChannelId', () => {
   it('test_strip_slack_prefix_from_canonical_platform_id', () => {
-    expect(extractSlackChannelId('slack:C0AJA89MN2E')).toBe('C0AJA89MN2E');
+    expect(extractSlackChannelId('slack:CTEST00004')).toBe('CTEST00004');
   });
 
   it('test_returns_raw_id_when_no_prefix', () => {
-    expect(extractSlackChannelId('C0AJA89MN2E')).toBe('C0AJA89MN2E');
+    expect(extractSlackChannelId('CTEST00004')).toBe('CTEST00004');
   });
 });
 
@@ -260,8 +262,8 @@ describe('slackPostParent', () => {
     // when first attempting to spawn into Slack.
     const postMessage = vi.fn().mockResolvedValue({ ts: 'parent-ts', ok: true });
     const mockClient: SlackPostMessageClient = { chat: { postMessage } };
-    await slackPostParent(mockClient, 'slack:C0AJA89MN2E', 'spawned task');
-    expect(postMessage).toHaveBeenCalledWith({ channel: 'C0AJA89MN2E', text: 'spawned task' });
+    await slackPostParent(mockClient, 'slack:CTEST00004', 'spawned task');
+    expect(postMessage).toHaveBeenCalledWith({ channel: 'CTEST00004', text: 'spawned task' });
   });
 });
 
@@ -290,9 +292,9 @@ describe('slackCreateThread', () => {
   it('test_create_thread_strips_slack_prefix_before_api_call', async () => {
     const postMessage = vi.fn().mockResolvedValue({ ts: 'reply-ts', ok: true });
     const mockClient: SlackPostMessageClient = { chat: { postMessage } };
-    await slackCreateThread(mockClient, 'slack:C0AJA89MN2E', 'parent-ts', 'Task', 'first');
+    await slackCreateThread(mockClient, 'slack:CTEST00004', 'parent-ts', 'Task', 'first');
     expect(postMessage).toHaveBeenCalledWith({
-      channel: 'C0AJA89MN2E',
+      channel: 'CTEST00004',
       thread_ts: 'parent-ts',
       text: 'first',
     });

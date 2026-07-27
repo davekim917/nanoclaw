@@ -3,7 +3,7 @@
  *
  * The designer's mockup assumed a few fields the server doesn't emit yet:
  *   - goal           — one-line summary of what the worker is doing
- *   - linear_id      — Linear ticket identifier (XZO-54, etc.)
+ *   - linear_id      — Linear ticket identifier (EXAMPLE-54, etc.)
  *   - phase          — integer 1..5 representing worker phase
  *   - needs_input    — boolean: worker stopped to ask the operator something
  *

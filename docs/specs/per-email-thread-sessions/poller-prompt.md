@@ -1,6 +1,6 @@
 # Support-inbox poller prompt (purest design — zero poller-side state)
 
-The prompt for the `support@illysium.ai` poller task (paired with
+The prompt for the `person24@fixture5.example.com` poller task (paired with
 `poller-prescript.sh` as the task's `script`). The poller is a **thin triager**:
 fetch body → human-judgment noise check → `dispatch_support_issue` → label.
 
@@ -16,15 +16,15 @@ the full state from the host — nothing lives in any agent's workspace.
 ## Prompt
 
 ```
-The support@illysium.ai inbox poller flagged new email(s). The pre-script payload contains `newMessages` — a list of `{id, threadId, from, subject, date, messageIdHeader, snippet}`. The script already filtered promotions, mailing lists, and obvious automated senders; apply a final human-judgment check before dispatching.
+The person24@fixture5.example.com inbox poller flagged new email(s). The pre-script payload contains `newMessages` — a list of `{id, threadId, from, subject, date, messageIdHeader, snippet}`. The script already filtered promotions, mailing lists, and obvious automated senders; apply a final human-judgment check before dispatching.
 
 For EACH message:
 
 1) Fetch the full body:
-   `export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/support-illysium.json && gws gmail users messages get --params '{"userId":"me","id":"<ID>","format":"full"}'`
+   `export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/support-example-labs.json && gws gmail users messages get --params '{"userId":"me","id":"<ID>","format":"full"}'`
    Walk `payload.parts`/`payload.body`; bodies are base64url (decode with python3). Prefer text/plain; strip the quoted prior-message section so only the new content remains.
 
-2) Pre-flight — is this a real person asking for help with XZO/Apollo (bug, question, access request, follow-up)? If it's vendor marketing, a newsletter, a receipt, a security/login alert, cold sales, a calendar/recruiting notice, or any notification system → SKIP: just label it `bot-ticketed` and move on (no dispatch). When in doubt, look at the From domain.
+2) Pre-flight — is this a real person asking for help with EXAMPLE/Example Data (bug, question, access request, follow-up)? If it's vendor marketing, a newsletter, a receipt, a security/login alert, cold sales, a calendar/recruiting notice, or any notification system → SKIP: just label it `bot-ticketed` and move on (no dispatch). When in doubt, look at the From domain.
 
 3) Dispatch — one call per email, new threads AND replies alike:
    `dispatch_support_issue({ gmailThreadId: "<threadId>", subject: "<subject>", sender: "<from>", date: "<date>", bodyText: "<stripped body>", lastMessageId: "<messageIdHeader>" })`
@@ -44,7 +44,7 @@ Engineering tone — terse.
 ## Notes
 
 - The per-issue session's seed instructs it to create the Linear issue (team:
-  Apollo if clearly Apollo, else XZO failover; priority rules included), call
+  Example Data if clearly Example Data, else EXAMPLE failover; priority rules included), call
   `update_support_ticket`, then work the issue in-thread. Follow-ups instruct a
   Linear comment instead. The channel announcement is auto-updated with the
   ticket id once recorded.

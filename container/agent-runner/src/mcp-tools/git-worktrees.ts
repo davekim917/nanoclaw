@@ -530,7 +530,7 @@ export const createWorktreeTool: McpToolDefinition = {
     // tip — the worktree-cleanup cron explicitly skips unpushed/unmerged
     // branches, so this is the only path that closes that gap.
     //
-    // Branch-mismatch guard (the XZO-40 / XZO-42 fix): the prior turn could
+    // Branch-mismatch guard (the EXAMPLE-40 / EXAMPLE-42 fix): the prior turn could
     // have `git checkout`-ed onto an arbitrary branch (e.g., bisecting,
     // inspecting an existing PR, or rebasing). On the NEXT call, blindly
     // rebasing whatever's currently checked out would silently land the new

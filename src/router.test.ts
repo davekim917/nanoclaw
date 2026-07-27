@@ -324,12 +324,12 @@ describe('C2: pre-fanout intercept dispatch', () => {
   });
 });
 
-// Issue 1 from the @Bo -e max thread: Bo-codex's accumulate-mode wiring on
-// the shared MR channel ran the flag dispatcher even though @Bo was the
+// Issue 1 from the @Example Assistant -e max thread: Example Assistant Codex's accumulate-mode wiring on
+// the shared Example Retail channel ran the flag dispatcher even though @Example Assistant was the
 // addressed agent. Two side effects to prevent:
-//   (a) Bo-codex's bot user emits a duplicate "effort → X" notice — visible
+//   (a) Example Assistant Codex's bot user emits a duplicate "effort → X" notice — visible
 //       channel noise from an agent the operator wasn't talking to.
-//   (b) Bo-codex's session_state gets `max` stored as effort even though
+//   (b) Example Assistant Codex's session_state gets `max` stored as effort even though
 //       Codex's reasoning_effort schema doesn't accept it; the value is
 //       silently invalid and the next spawn either throws or falls back.
 // Fix: deliverToAgent now gates the flag dispatcher on `wake === true`.
@@ -339,8 +339,8 @@ describe('flag dispatcher wake gate', () => {
     const { getAgentGroup } = await import('./db/agent-groups.js');
     const mg = makeMg({ id: 'mg-shared', is_group: 1 });
     const accumulateAgent = makeAgent({
-      id: 'mga-bocodex',
-      agent_group_id: 'ag-bocodex',
+      id: 'mga-example-assistant-codex',
+      agent_group_id: 'ag-example-assistant-codex',
       // Mention-mode but accumulate policy: NOT addressed by this message
       // (isMention=true is for the OTHER agent in the channel), still
       // gets the message delivered as silent context.
@@ -350,16 +350,16 @@ describe('flag dispatcher wake gate', () => {
     vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
     vi.mocked(getMessagingGroupAgents).mockReturnValue([accumulateAgent]);
     vi.mocked(getAgentGroup).mockReturnValue({
-      id: 'ag-bocodex',
-      name: 'Bo-codex',
-      folder: 'madison-reed-codex',
+      id: 'ag-example-assistant-codex',
+      name: 'Example Assistant Codex',
+      folder: 'example-retail-codex',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
     vi.mocked(resolveSession).mockReturnValue({
       session: {
-        id: 's-bocodex',
-        agent_group_id: 'ag-bocodex',
+        id: 's-example-assistant-codex',
+        agent_group_id: 'ag-example-assistant-codex',
         messaging_group_id: 'mg-shared',
         thread_id: null,
         agent_provider: null,
@@ -374,8 +374,8 @@ describe('flag dispatcher wake gate', () => {
     // The message is NOT a mention for this agent (engages=false) but the
     // accumulate policy still delivers it. The text carries a `-e` flag
     // meant for the OTHER bot.
-    const event = makeChatEvent('@Bo -e max', {
-      message: { ...makeChatEvent('@Bo -e max').message, isMention: false },
+    const event = makeChatEvent('@Example Assistant -e max', {
+      message: { ...makeChatEvent('@Example Assistant -e max').message, isMention: false },
     });
     await routeInbound(event);
 
@@ -394,8 +394,8 @@ describe('flag dispatcher wake gate', () => {
     vi.mocked(getMessagingGroupAgents).mockReturnValue([agent]);
     vi.mocked(getAgentGroup).mockReturnValue({
       id: 'ag-1',
-      name: 'Bo',
-      folder: 'madison-reed',
+      name: 'Example Assistant',
+      folder: 'example-retail',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
@@ -469,8 +469,8 @@ describe('thread context fetch', () => {
     const { getChannelAdapter } = await import('./channels/channel-registry.js');
     const fetchThreadHistory = vi.fn().mockResolvedValue([
       {
-        sender: 'Dave',
-        text: '@Axie do you have access to my Pocket meetings?',
+        sender: 'Operator',
+        text: '@Example Agent do you have access to my Pocket meetings?',
         timestamp: '2026-06-28T22:00:00.000Z',
         isAnchor: true,
       },
@@ -480,7 +480,7 @@ describe('thread context fetch', () => {
         timestamp: '2026-06-28T22:39:40.000Z',
       },
       {
-        sender: 'Dave',
+        sender: 'Operator',
         text: 'old user follow-up before the prior response finished',
         timestamp: '2026-06-28T22:38:00.000Z',
       },
@@ -504,7 +504,7 @@ describe('thread context fetch', () => {
     vi.mocked(getChannelAdapter).mockReturnValue(adapter);
     vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({
       mg: makeMg({
-        id: 'mg-discord-number',
+        id: 'mg-discord-example',
         channel_type: 'discord',
         platform_id: 'discord:g:c',
         is_group: 1,
@@ -514,8 +514,8 @@ describe('thread context fetch', () => {
     vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent({ agent_group_id: 'ag-number' })]);
     vi.mocked(getAgentGroup).mockReturnValue({
       id: 'ag-number',
-      name: 'number-drinks',
-      folder: 'number-drinks',
+      name: 'example-beverage',
+      folder: 'example-beverage',
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
@@ -523,7 +523,7 @@ describe('thread context fetch', () => {
       session: {
         id: 'sess-thread',
         agent_group_id: 'ag-number',
-        messaging_group_id: 'mg-discord-number',
+        messaging_group_id: 'mg-discord-example',
         thread_id: 'discord:g:c:t',
         agent_provider: null,
         status: 'active',
@@ -536,7 +536,7 @@ describe('thread context fetch', () => {
     });
 
     await routeInbound(
-      makeChatEvent('@Axie great, I created staging', {
+      makeChatEvent('@Example Agent great, I created staging', {
         channelType: 'discord',
         platformId: 'discord:g:c',
         threadId: 'discord:g:c:t',
@@ -544,7 +544,7 @@ describe('thread context fetch', () => {
         message: {
           id: 'latest-msg',
           kind: 'chat-sdk',
-          content: JSON.stringify({ sender: 'Dave', text: '@Axie great, I created staging' }),
+          content: JSON.stringify({ sender: 'Operator', text: '@Example Agent great, I created staging' }),
           timestamp: '2026-06-28T23:32:27.486Z',
           isMention: true,
           isGroup: true,
@@ -561,7 +561,7 @@ describe('thread context fetch', () => {
     const text = JSON.parse(written.content).text as string;
     expect(text).toContain('[New in thread since last response]');
     expect(text).toContain('Mike: fresh context after the prior response');
-    expect(text).toContain('[Latest message]\n@Axie great, I created staging');
+    expect(text).toContain('[Latest message]\n@Example Agent great, I created staging');
     expect(text).not.toContain('Pocket meetings');
     expect(text).not.toContain('Pocket yes');
     expect(text).not.toContain('old user follow-up');
@@ -576,7 +576,7 @@ describe('thread context fetch', () => {
 describe('channel-type predicates accept bare base and variants', () => {
   it('isSlackChannelType: bare + variant pass, others fail', () => {
     expect(isSlackChannelType('slack')).toBe(true);
-    expect(isSlackChannelType('slack-illysium')).toBe(true);
+    expect(isSlackChannelType('slack-example-labs')).toBe(true);
     expect(isSlackChannelType('discord')).toBe(false);
     expect(isSlackChannelType('slackish')).toBe(false);
   });

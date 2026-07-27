@@ -845,6 +845,54 @@ function resolveScopedEnv(baseName: string, folder: string): string | undefined 
   return process.env[conv] ?? process.env[baseName];
 }
 
+export interface AtlassianMcpServer {
+  type: 'stdio';
+  command: 'mcp-atlassian';
+  args: [];
+  env: {
+    JIRA_URL: string;
+    JIRA_USERNAME: 'onecli-managed';
+    JIRA_API_TOKEN: 'onecli-managed';
+    CONFLUENCE_URL: string;
+    CONFLUENCE_USERNAME: 'onecli-managed';
+    CONFLUENCE_API_TOKEN: 'onecli-managed';
+  };
+}
+
+export function resolveAtlassianMcpServer(configuredBaseUrl: string | undefined): AtlassianMcpServer | null {
+  if (!configuredBaseUrl) return null;
+  try {
+    const parsed = new URL(configuredBaseUrl);
+    if (
+      parsed.protocol !== 'https:' ||
+      !parsed.hostname.endsWith('.atlassian.net') ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash ||
+      (parsed.pathname !== '/' && parsed.pathname !== '')
+    ) {
+      return null;
+    }
+    const baseUrl = parsed.origin;
+    return {
+      type: 'stdio',
+      command: 'mcp-atlassian',
+      args: [],
+      env: {
+        JIRA_URL: baseUrl,
+        JIRA_USERNAME: 'onecli-managed',
+        JIRA_API_TOKEN: 'onecli-managed',
+        CONFLUENCE_URL: `${baseUrl}/wiki`,
+        CONFLUENCE_USERNAME: 'onecli-managed',
+        CONFLUENCE_API_TOKEN: 'onecli-managed',
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Resolved Anthropic credentials for a single agent group. Forwarded
  * inside the container under their unscoped names so the agent-runner's
@@ -1187,8 +1235,8 @@ const GCP_CLOUDSDK_CONFIG_CONTAINER_PATH = '/home/node/.gcloud-config';
  * blocks credential-shaped paths and sandboxes targets away from `~/.config`).
  *
  * Keyed on `credentialFolder` so sibling groups that inherit a parent's creds
- * via `credentialFolder` share the one key (e.g. madison-reed-codex/-opencode
- * resolve to madison-reed's key). Returns the absolute host path, or null when
+ * via `credentialFolder` share the one key (e.g. example-retail-codex/-opencode
+ * resolve to example-retail's key). Returns the absolute host path, or null when
  * no key is configured — the common case, leaving such groups untouched.
  */
 function resolveGcpServiceAccountKey(credentialFolder: string): string | null {
@@ -1267,6 +1315,8 @@ const SCOPED_CREDENTIAL_VARS = [
   'LOOKER_BASE_URL',
   'LOOKER_CLIENT_ID',
   'LOOKER_CLIENT_SECRET',
+  'ATLASSIAN_BASE_URL',
+  'SELECT_ORGANIZATION_ID',
   'OPENAI_API_KEY',
   'BRAINTRUST_API_KEY',
   'EXA_API_KEY',
@@ -1427,8 +1477,8 @@ export function buildMounts(
   // lose access on container restart after this deploy. Set the env var to
   // opt in (required for sibling-agent collaboration to share code state).
   if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
-    // Two-bot sibling design: illie (slack-illysium) and illie-codex
-    // (slack-illiecodex) each have their own MG row in this channel,
+    // Two-bot sibling design: helper (slack-example-labs) and helper-codex
+    // (slack-helpercodex) each have their own MG row in this channel,
     // but they share the same platform_id (the Slack channel id) and the
     // same thread_id from chat-sdk-bridge. Keying threadWorktreeDir on
     // platform_id + thread_id resolves both bots to the same worktree dir,
@@ -1445,9 +1495,9 @@ export function buildMounts(
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
 
   // Sibling-group symlink overlay. clone-as-codex creates relative symlinks
-  // (e.g. groups/illie-codex/XZO -> ../illie/XZO) so two siblings share the
+  // (e.g. groups/helper-codex/EXAMPLE -> ../helper/EXAMPLE) so two siblings share the
   // same source repos / sources / conversations on the host. Inside the
-  // container, those symlinks would dereference to /workspace/illie/XZO,
+  // container, those symlinks would dereference to /workspace/helper/EXAMPLE,
   // which isn't mounted — so create_worktree, conversation reads, and source
   // discovery all fail with ENOENT. Overlay each host-resolvable
   // symlink with a bind mount at the same container path so the entry
@@ -1787,7 +1837,7 @@ export function buildMounts(
       // mount source — fallbacks target /home/node/.codex-fallback-N/
       // which never conflicts with /home/node/.codex. So they fire
       // regardless of whether the primary came from the provider's
-      // per-session copy (provider=codex, the original MR-codex case) or
+      // per-session copy (provider=codex, the original Example-Retail-codex case) or
       // from the direct host mount above (codex-as-peer). Without this
       // independence the fallback was effectively dead code for the very
       // configuration we built it for.
@@ -1889,8 +1939,8 @@ export function buildMounts(
   //
   //   tools = undefined  → legacy behavior, mount every credential surface.
   //                        Preserves the pre-v2-tools-port default.
-  //   tools = [...]      → filter + stage per-tool. E.g. `snowflake:sunday`
-  //                        stages only the [connections.sunday] section of
+  //   tools = [...]      → filter + stage per-tool. E.g. `snowflake:archive-one`
+  //                        stages only the [connections.archive-one] section of
   //                        connections.toml and its referenced private
   //                        keys; `aws:work` stages only [work] from
   //                        ~/.aws/credentials (scoped = exactly the named
@@ -2169,8 +2219,8 @@ export function buildMounts(
   // ---- AWS (~/.aws/{credentials,config}) ----------------------------------
   // Scoped `aws:<profile>` stages EXACTLY the named profiles — no implicit
   // `default`. A scoped group must not inherit whatever account `default`
-  // points at: that is a cross-tenant leak (e.g. an `aws:ihm-mr` Madison Reed
-  // group silently picking up a personal/Illysium `default`). A group that
+  // points at: that is a cross-tenant leak (e.g. an `aws:example-retail` Example Retail
+  // group silently picking up a personal/Example Labs `default`). A group that
   // genuinely needs the default profile requests it explicitly via
   // `aws:default[:<other>]`.
   //
@@ -2503,8 +2553,8 @@ function ensureRuntimeFields(
     dirty = true;
   }
   // NOTE: `assistantName` is NOT force-synced here. The agent's user-facing
-  // name varies per channel — the same agent_group can show as "Bo" in
-  // Slack, "Axie" in Discord, etc. The per-session resolver lives in
+  // name varies per channel — the same agent_group can show as "Example Assistant" in
+  // Slack, "Example Agent" in Discord, etc. The per-session resolver lives in
   // `resolveAssistantName` below; container-runner passes the result as
   // the NANOCLAW_ASSISTANT_NAME env var on every spawn so the in-container
   // runner can prefer it over container.json's static value. Keeping the
@@ -2545,7 +2595,7 @@ function ensureRuntimeFields(
  *      booted adapters before identity fetch completes).
  *
  * Same agent_group routed to different channels gets different names; on the
- * Slack MR channel "Bo", on Discord "Axie", on admin sessions "madison-reed".
+ * Slack Example Retail channel "Example Assistant", on Discord "Example Agent", on admin sessions "example-retail".
  */
 async function resolveAssistantName(
   agentGroup: AgentGroup,
@@ -2731,7 +2781,7 @@ async function buildContainerArgs(
   }
 
   // Per-session assistant name. Resolved channel-aware so the same
-  // agent_group can say "I am Bo" on Slack MR, "I am Axie" on Discord, etc.
+  // agent_group can say "I am Example Assistant" on Slack Example Retail, "I am Example Agent" on Discord, etc.
   // The in-container runner prefers NANOCLAW_ASSISTANT_NAME over
   // container.json's static value (see container/agent-runner/src/config.ts).
   // Falls back to agent_group.name when no channel bot is registered
@@ -2784,11 +2834,11 @@ async function buildContainerArgs(
   // buildSystemPromptAddendum reads NANOCLAW_PEERS and renders an
   // identity block: "You are X (<@uid>). Peers: ...". This gives the
   // model an explicit name→user_id mapping per turn so prose handoff
-  // ("@Bo-codex" → `<@U0B3X1QUAKV>`) doesn't depend on chat-history
+  // ("@Example Assistant Codex" → `<@UTEST00024>`) doesn't depend on chat-history
   // inference. Self user_id is included separately so the agent
   // recognizes inbound @-mentions to itself.
   //
-  // Sibling-adapter awareness: Bo and Bo-codex on the same Slack channel
+  // Sibling-adapter awareness: Example Assistant and Example Assistant Codex on the same Slack channel
   // have separate messaging_groups (one per bot adapter). getChannelPeers
   // matches on messaging_groups.platform_id, surfacing peers across
   // sibling adapters. See src/db/messaging-groups.ts for the rationale.
@@ -2957,13 +3007,13 @@ async function buildContainerArgs(
   // Folder-scoped verbatim env vars: pass through env vars whose name starts
   // with a known prefix AND whose post-prefix tail starts with the folder
   // token followed by `_` or end-of-string. These are raw connection strings
-  // (RENDER_PG_URL_ILLYSIUM_ILLYSE_MAIN, etc.) that don't collapse to a base
+  // (RENDER_PG_URL_EXAMPLE_LABS_example-app_MAIN, etc.) that don't collapse to a base
   // name — the agent uses the full name as-is. Gate on folder to keep
   // cross-group data access from leaking.
   //
   // SECURITY (cross-tenant audit 2026-05-03): the previous check used
-  // `includes('_<TOK>_')`, which let folder=axie inherit AXIE_DEV_* vars
-  // (substring overlap with axie-dev). The strict prefix-anchored match
+  // `includes('_<TOK>_')`, which let folder=example-agent inherit EXAMPLE_DEV_* vars
+  // (substring overlap with example-dev). The strict prefix-anchored match
   // here, combined with the folder-name collision check at create_agent
   // time, eliminates the ambiguity.
   const folderTok = credentialFolder.toUpperCase().replace(/-/g, '_');
@@ -3338,26 +3388,17 @@ async function buildContainerArgs(
     // <site>.atlassian.net works with any user's standard product seats.
     //
     // The MCP server constructs `Authorization: Basic base64(USERNAME:
-    // API_TOKEN)` from env vars at request time. Placeholder values here
-    // satisfy the server's startup validation; OneCLI's gateway overrides
-    // the constructed header with the real Basic from the vault entry
-    // "Atlassian" (hostPattern: madison-reed.atlassian.net) before the
-    // request leaves the container. Site URLs are non-secret config and
-    // stay literal. Hard-coded to madison-reed today; if other groups
-    // ever wire Atlassian we'd resolve site per-folder.
-    mcpServers.atlassian = {
-      type: 'stdio',
-      command: 'mcp-atlassian',
-      args: [],
-      env: {
-        JIRA_URL: 'https://madison-reed.atlassian.net',
-        JIRA_USERNAME: 'onecli-managed',
-        JIRA_API_TOKEN: 'onecli-managed',
-        CONFLUENCE_URL: 'https://madison-reed.atlassian.net/wiki',
-        CONFLUENCE_USERNAME: 'onecli-managed',
-        CONFLUENCE_API_TOKEN: 'onecli-managed',
-      },
-    };
+    // API_TOKEN)` from env vars at request time. Placeholder values satisfy
+    // startup validation; OneCLI replaces the header at the proxy boundary.
+    // The site URL is tenant-specific and must come from scoped host config.
+    const atlassianServer = resolveAtlassianMcpServer(resolveScopedEnv('ATLASSIAN_BASE_URL', credentialFolder));
+    if (!atlassianServer) {
+      log.warn('Atlassian tool enabled without a valid scoped ATLASSIAN_BASE_URL; MCP omitted', {
+        folder: credentialFolder,
+      });
+    } else {
+      mcpServers.atlassian = atlassianServer;
+    }
   }
   if (canInject('looker') && isToolEnabled(containerConfig.tools, 'looker')) {
     // Google's MCP Toolbox for Databases (--prebuilt looker). The toolbox

@@ -35,8 +35,20 @@ function setupDb(): void {
 describe('groupsListHandler', () => {
   beforeEach(() => {
     setupDb();
-    createAgentGroup({ id: 'ag-1', name: 'illysium', folder: 'illysium', agent_provider: null, created_at: now() });
-    createAgentGroup({ id: 'ag-2', name: 'axie-dev', folder: 'axie-dev', agent_provider: null, created_at: now() });
+    createAgentGroup({
+      id: 'ag-1',
+      name: 'example-labs',
+      folder: 'example-labs',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createAgentGroup({
+      id: 'ag-2',
+      name: 'example-dev',
+      folder: 'example-dev',
+      agent_provider: null,
+      created_at: now(),
+    });
     createAgentGroup({ id: 'ag-3', name: 'personal', folder: 'personal', agent_provider: null, created_at: now() });
   });
   afterEach(() => {
@@ -61,7 +73,7 @@ describe('groupsListHandler', () => {
   it('member with single group sees only that one', async () => {
     const res: Response = (await groupsListHandler(makeReq(), {}, makeCtx({ allowed_group_ids: ['ag-2'] })))!;
     const body = (await res.json()) as { groups: { id: string; name: string }[] };
-    expect(body.groups).toEqual([{ id: 'ag-2', name: 'axie-dev' }]);
+    expect(body.groups).toEqual([{ id: 'ag-2', name: 'example-dev' }]);
   });
 
   it('user with no allowed groups gets empty array (no leak)', async () => {
@@ -73,6 +85,6 @@ describe('groupsListHandler', () => {
   it('rows are ordered by name', async () => {
     const res: Response = (await groupsListHandler(makeReq(), {}, makeCtx({ no_filter: true })))!;
     const body = (await res.json()) as { groups: { name: string }[] };
-    expect(body.groups.map((g) => g.name)).toEqual(['axie-dev', 'illysium', 'personal']);
+    expect(body.groups.map((g) => g.name)).toEqual(['example-dev', 'example-labs', 'personal']);
   });
 });

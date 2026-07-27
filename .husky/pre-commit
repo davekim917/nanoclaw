@@ -3,3 +3,4 @@ pnpm run format:fix
 if [ -n "$staged" ]; then
   echo "$staged" | xargs git add
 fi
+pnpm run check:public-boundary -- --staged

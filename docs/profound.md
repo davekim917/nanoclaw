@@ -1,6 +1,6 @@
-# Profound Access For Madison Reed Agents
+# Profound Access For Example Retail Agents
 
-Profound is scoped to the Madison Reed workgroup only. NanoClaw should expose Profound through OneCLI, not raw environment variables. Madison Reed container agents make normal HTTPS requests; the OneCLI gateway injects credentials at the proxy boundary.
+Profound is scoped to the Example Retail workgroup only. NanoClaw should expose Profound through OneCLI, not raw environment variables. Example Retail container agents make normal HTTPS requests; the OneCLI gateway injects credentials at the proxy boundary.
 
 ## Secrets
 
@@ -18,19 +18,25 @@ onecli secrets create --name Profound-Log-Ingestion --type generic --value '<PRO
 
 ## Workgroup Access
 
-Add Profound to the Madison Reed workgroup baseline:
+First inspect the workgroup's existing baseline:
 
 ```bash
-pnpm exec tsx scripts/enable-profound-access.ts
+pnpm exec tsx scripts/q.ts data/v2.db \
+  "SELECT onecli_secrets FROM workgroups WHERE id = '<workgroup-id>'"
 ```
 
-Include the custom log ingestion token only if Madison Reed agents should send logs:
+Then set the complete desired baseline, preserving every existing entry and
+adding `Profound`:
 
 ```bash
-pnpm exec tsx scripts/enable-profound-access.ts --include-log-ingestion
+pnpm exec tsx scripts/set-workgroup-secrets.ts <workgroup-id> \
+  --secrets <existing-secret-1,existing-secret-2,Profound>
 ```
 
-The script validates that the named OneCLI secrets exist before writing. It appends missing names to `workgroups.onecli_secrets` for `madison-reed` and preserves existing declarations. The script rejects non-Madison-Reed workgroups.
+Include `Profound-Log-Ingestion` in that same complete list only when the
+workgroup should send logs. `set-workgroup-secrets.ts` validates every name
+before writing, but it replaces the baseline rather than appending to it; an
+omitted existing name is intentionally removed.
 
 Restart or respawn containers after updating workgroup secrets. Secret assignments are applied at spawn time.
 

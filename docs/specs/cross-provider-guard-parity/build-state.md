@@ -2,7 +2,7 @@
 
 > /team-build under /team-auto. Lead orchestrates; builders write code. Updated per group completion.
 >
-> **STATUS: ALL STAGES COMPLETE → ship gate.** A(review 5/5, MUST-FIX 0) · B(plan 8 groups) · C(build 8/8, post-build drift CONFIRMED) · D(qa: 1 MUST-FIX M-QA1 FIXED+tested, MUST-FIX 0). 1 HIGH pre-existing escalated (codex #2 email bypass), 2 SHOULD-FIX for ship review. Stopped at Stage E — awaiting Dave's /team-ship.
+> **STATUS: ALL STAGES COMPLETE → ship gate.** A(review 5/5, MUST-FIX 0) · B(plan 8 groups) · C(build 8/8, post-build drift CONFIRMED) · D(qa: 1 MUST-FIX M-QA1 FIXED+tested, MUST-FIX 0). 1 HIGH pre-existing escalated (codex #2 email bypass), 2 SHOULD-FIX for ship review. Stopped at Stage E — awaiting Operator's /team-ship.
 
 ## Repos / branches
 - nanoclaw-v2: `/home/ubuntu/nanoclaw-v2`, branch `feat/clone-repos-namespace-git-clone-parity` (Groups E, F, G + H docs). Container tests: `cd /home/ubuntu/nanoclaw-v2/container/agent-runner && bun test <file>`. Typecheck: `cd /home/ubuntu/nanoclaw-v2 && pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit`.

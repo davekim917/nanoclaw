@@ -448,7 +448,7 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
     }
   }
   // Union in any dir a sibling already symlinks (the established shared set,
-  // e.g. dbt/mr/wiki) as long as the seed has a real dir of that name.
+  // e.g. dbt/retail/wiki) as long as the seed has a real dir of that name.
   for (const sf of siblingFolders) {
     const sdir = path.join(groupsDir, sf);
     let entries: fs.Dirent[];

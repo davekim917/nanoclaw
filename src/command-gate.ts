@@ -67,7 +67,7 @@ function extractUserMessage(text: string): string {
  * is the second token, not the first. Without stripping, both gates' first-char
  * check would mis-classify these as plain prose and route them to the agent.
  *
- * Strips both formal (`<@123>`, `<@!123>`, `<@U08H7SULNER|name>`) and bare
+ * Strips both formal (`<@123>`, `<@!123>`, `<@UTEST00013|name>`) and bare
  * (`@bot ` followed by whitespace) mention prefixes. Iterates so that multi-
  * mention prefixes (`@bot1 @bot2 /command`) all get stripped.
  */

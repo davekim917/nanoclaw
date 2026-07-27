@@ -88,7 +88,7 @@ function resolveTargetUserId(rawUser: string, session: Session): string | null {
     handle = handle.slice(2, -1);
     // Discord role mentions look like <@&snowflake>; reject — not a user.
     if (handle.startsWith('&')) return null;
-    // Slack user mentions can include a display alias after `|`: <@U12|dave>.
+    // Slack user mentions can include a display alias after `|`: <@U12|operator>.
     const pipe = handle.indexOf('|');
     if (pipe >= 0) handle = handle.slice(0, pipe);
   }

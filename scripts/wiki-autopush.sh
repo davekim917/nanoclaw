@@ -5,13 +5,15 @@
 
 set -euo pipefail
 
-GROUPS_DIR="/home/ubuntu/nanoclaw-v2/groups"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NANOCLAW_DIR="${NANOCLAW_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+GROUPS_DIR="${NANOCLAW_DIR}/groups"
 # Workgroup shared-FS (NANOCLAW_WORKGROUP_SHARED_FS): a migrated workgroup's wiki
 # repo lives at data/workgroups/<wg>/wiki, and groups/<wg>/wiki is a container-
 # absolute symlink that DANGLES on the host. Iterate both roots so the shared
 # wikis AND any non-workgroup group wikis are pushed; dangling seed symlinks are
 # skipped by the `-d "$wiki_dir/.git"` test below (resolves false off-host).
-WORKGROUPS_DIR="/home/ubuntu/nanoclaw-v2/data/workgroups"
+WORKGROUPS_DIR="${NANOCLAW_DIR}/data/workgroups"
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 shopt -s nullglob
@@ -30,7 +32,7 @@ for wiki_dir in "$GROUPS_DIR"/*/wiki "$WORKGROUPS_DIR"/*/wiki; do
   # Stage and commit only if there are local changes.
   if [[ -n "$(git status --porcelain)" ]]; then
     git add -A
-    git -c user.email='nanoclaw-host@illysium.ai' -c user.name='nanoclaw-host' \
+    git -c user.email='nanoclaw-host@users.noreply.github.com' -c user.name='nanoclaw-host' \
       commit -m "auto: wiki sync ${TS}"
     if git push origin main 2>&1; then
       echo "[wiki-autopush ${TS}] ${group_name}: pushed"

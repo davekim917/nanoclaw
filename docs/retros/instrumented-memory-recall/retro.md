@@ -45,7 +45,7 @@
 
 ## Recommended Updates
 
-> **Constraint when implementing these recommendations:** Apply at minimum-viable scope. Dave's stated preference during this feature was "not over-engineering — I just want a working product, not every edge case squashed." That preference applies recursively to the workflow updates themselves: pick the smallest skill-text edit that closes the gap, not the most thorough refactor of the skill. If a recommendation could be met with a one-paragraph addition to existing skill text, prefer that over restructuring the skill. Defer "while we're here" cleanups to a separate pass.
+> **Constraint when implementing these recommendations:** Apply at minimum-viable scope. Operator's stated preference during this feature was "not over-engineering — I just want a working product, not every edge case squashed." That preference applies recursively to the workflow updates themselves: pick the smallest skill-text edit that closes the gap, not the most thorough refactor of the skill. If a recommendation could be met with a one-paragraph addition to existing skill text, prefer that over restructuring the skill. Defer "while we're here" cleanups to a separate pass.
 
 ### CLAUDE.md
 - **Section:** Supply Chain Security (pnpm) or new "Module System" subsection

@@ -47,13 +47,13 @@ describe('inputsFromEnv (docs/skill-engine-seam.md §6)', () => {
       NC_INPUT_CONNECTION: 'webhook',
       NC_INPUT_BOT_TOKEN: 'xoxb-fake-token',
       NC_INPUT_SIGNING_SECRET: '0123456789abcdef',
-      NC_INPUT_OWNER_HANDLE: 'U12345678',
+      NC_INPUT_OWNER_HANDLE: 'UTEST00004',
     });
     expect(inputs).toEqual({
       connection: 'webhook',
       bot_token: 'xoxb-fake-token',
       signing_secret: '0123456789abcdef',
-      owner_handle: 'U12345678',
+      owner_handle: 'UTEST00004',
     });
 
     const root = mkdtempSync(join(tmpdir(), 'skill-inputs-'));

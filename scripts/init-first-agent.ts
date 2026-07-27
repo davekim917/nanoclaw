@@ -20,8 +20,8 @@
  * Usage:
  *   pnpm exec tsx scripts/init-first-agent.ts \
  *     --channel discord \
- *     --user-id discord:1470183333427675709 \
- *     --platform-id discord:@me:1491573333382523708 \
+ *     --user-id discord:123456789000000003 \
+ *     --platform-id discord:@me:123456789000000006 \
  *     --display-name "Gavriel" \
  *     [--agent-name "Andy"] \
  *     [--welcome "System instruction: ..."] \

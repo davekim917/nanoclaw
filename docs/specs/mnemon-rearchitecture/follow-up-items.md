@@ -10,12 +10,12 @@
 
 - Latest commit: `8ae875f feat(memory): mnemon-rearchitecture` pushed to `davekim917/nanoclaw:main`
 - Memory daemon: active (`systemctl is-active nanoclaw-memory-daemon`)
-- Insights: 415+ across 11 groups (illysium has the bulk; others accumulating)
+- Insights: 415+ across 11 groups (example-labs has the bulk; others accumulating)
 - Dead-letters: ~43 and draining (was 123 peak); zero poisoned
 - processed_pairs: 199+; idempotency_keys: 1122+
 - All 11 groups: `memory.enabled=true`, agentGroupId in container.json, mnemon store created, pending synth task scheduled
 - Wiki synth first-fires already executed today for most groups (first staggered run); next daily cycle 03:03–03:53 local with per-group offsets
-- Two groups (video-agent, xerus) reverted to default `0 3 * * *` cron when individually re-enabled — minor; can re-run `bulk-enable-memory.ts` to restore stagger
+- Two groups (archive-media, archive-two) reverted to default `0 3 * * *` cron when individually re-enabled — minor; can re-run `bulk-enable-memory.ts` to restore stagger
 
 ## Live test recipe
 
@@ -128,7 +128,7 @@
 
 **Problem**: `runSweep` in `src/memory-daemon/index.ts` iterates `enabledGroups` sequentially. Each group's `runChatStreamSweep([group], store, health)` blocks on Haiku API calls (~1-2s each). High-volume groups starve other groups during the same sweep window.
 
-**Observed during bulk-enable**: illysium had ~80 historical pairs to classify on first sweep; took ~10 minutes (multiple sweep cycles) to drain. During that drain, the OTHER 10 groups got proportionally less daemon attention.
+**Observed during bulk-enable**: example-labs had ~80 historical pairs to classify on first sweep; took ~10 minutes (multiple sweep cycles) to drain. During that drain, the OTHER 10 groups got proportionally less daemon attention.
 
 **Fix**: Parallelize the per-group iteration with a concurrency cap.
 
@@ -203,7 +203,7 @@ Both routinely cross 1500ms under load (live test: 28-char Discord query took 16
 
 **Spec deviation:** Spec C5 says "hard 1500ms" — that constraint is now violated. Update C5 in `design.md` and `plan.md` to "hard 3000ms" with the empirical rationale, OR ship a follow-up that brings real latency back under 1500ms (mnemon-as-daemon — eliminates CLI spawn cost; ~700ms savings would put short queries comfortably under budget). Daemon-mode is the right long-term fix; the timeout bump is the right short-term fix.
 
-**Verification:** After 21:13:54 UTC restart, look for `recall-injection: row inserted` log lines with `factCount > 0` for chat-sdk inbound messages. **VERIFIED at 21:52:00 UTC** — Discord test thread `1499528766513352724` returned 10 facts in 1666ms; row inserted at seq=2, user message at seq=4, both completed in agent reply.
+**Verification:** After 21:13:54 UTC restart, look for `recall-injection: row inserted` log lines with `factCount > 0` for chat-sdk inbound messages. **VERIFIED at 21:52:00 UTC** — Discord test thread `123456789000000008` returned 10 facts in 1666ms; row inserted at seq=2, user message at seq=4, both completed in agent reply.
 
 ## Item 5 (live-discovered): Ollama embedding model unloads after 5 min idle (FIXED 2026-04-30)
 
@@ -234,7 +234,7 @@ After `systemctl daemon-reload && systemctl restart ollama`, an explicit warmup 
 
 ## Other latent items observed but NOT blocking
 
-- video-agent + xerus have synth cron `0 3 * * *` instead of staggered values (43 / 48 minute) — re-run `pnpm exec tsx scripts/bulk-enable-memory.ts` to reconcile (script is idempotent and applies the staggered cron via `synthCronForIndex(i)`)
+- archive-media + archive-two have synth cron `0 3 * * *` instead of staggered values (43 / 48 minute) — re-run `pnpm exec tsx scripts/bulk-enable-memory.ts` to reconcile (script is idempotent and applies the staggered cron via `synthCronForIndex(i)`)
 - 17+ orphan mnemon stores from dev/test runs (timestamps 1777570*) take up disk; manual cleanup with `mnemon store delete <id>` if the operator cares
 - The earlier installed system cron at `23 9 7 5 *` (May 7 9:23am) for `scripts/memory-soak-check.sh` is still scheduled — runs as a 1-week post-deploy soak check; outputs to `logs/memory-soak.log` and can DM via `MEMORY_SOAK_DISCORD_WEBHOOK` env var if anomalies. No action needed; will fire automatically.
 

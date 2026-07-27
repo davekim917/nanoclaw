@@ -43,7 +43,7 @@ chmod +x ~/.local/bin/rtk   # if needed
 ncl groups list
 ```
 
-Note the group ID (e.g. `ag-1776342942165-ptgddd`). Repeat Steps 3–5 for each group.
+Note the group ID (e.g. `ag-1700000000000-example01`). Repeat Steps 3–5 for each group.
 
 ## Step 3 — Mount rtk into the container config
 

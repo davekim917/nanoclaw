@@ -106,8 +106,8 @@ export interface SubagentsSyncResult {
  * Walk every plugin agents/ dir and `~/.claude/agents/` (Claude personal scope)
  * and emit a Codex TOML for each `<name>.md`. Output written to BOTH
  * `~/.codex/agents/` (global default) AND every `~/.codex-<folder>/agents/`
- * that has an `auth.json` (per-group sibling codex accounts, e.g. illysium-codex,
- * madison-reed-codex). Per-group siblings mount their own `~/.codex-<folder>/`
+ * that has an `auth.json` (per-group sibling codex accounts, e.g. example-labs-codex,
+ * example-retail-codex). Per-group siblings mount their own `~/.codex-<folder>/`
  * into the container instead of the global `~/.codex/`, so the global write
  * alone wouldn't reach them.
  *

@@ -58,9 +58,9 @@ function seedSession(): void {
   createAgentGroup({ id: 'ag-1', name: 'Agent', folder: 'agent', agent_provider: null, created_at: now() });
   createMessagingGroup({
     id: 'mg-1',
-    channel_type: 'slack-illysium',
+    channel_type: 'slack-example-labs',
     platform_id: 'slack:C123',
-    instance: 'slack-illysium',
+    instance: 'slack-example-labs',
     name: '#support',
     is_group: 1,
     unknown_sender_policy: 'public',

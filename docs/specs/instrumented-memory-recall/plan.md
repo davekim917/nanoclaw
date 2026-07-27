@@ -338,9 +338,9 @@ test_getQueryStrategy_llm:
   Assert:   returns 'llm'
 
 test_getRecallScope_array:
-  Setup:    cfg = { enabled: true, recall_scope: ['axie-dev', 'madison-reed'] }
+  Setup:    cfg = { enabled: true, recall_scope: ['example-dev', 'example-retail'] }
   Action:   getRecallScope(cfg)
-  Assert:   returns ['axie-dev', 'madison-reed']
+  Assert:   returns ['example-dev', 'example-retail']
 ```
 
 **Acceptance criteria:**
@@ -1398,9 +1398,9 @@ test_all_groups_enumerates:
   Assert:   ['g1', 'g2'] (in some order; calling group present; g3 filtered out)
 
 test_array_resolves_folder_names:
-  Setup:    groups/axie-dev/container.json with agentGroupId='ag-axie-dev-...'
-  Action:   resolveRecallScope('g1', ['axie-dev'])
-  Assert:   ['g1', 'ag-axie-dev-...'] (calling group + resolved)
+  Setup:    groups/example-dev/container.json with agentGroupId='ag-example-dev-...'
+  Action:   resolveRecallScope('g1', ['example-dev'])
+  Assert:   ['g1', 'ag-example-dev-...'] (calling group + resolved)
 
 test_array_drops_missing_folder:
   Setup:    no folder 'nonexistent'
@@ -1698,7 +1698,7 @@ test_writes_results_to_gitignored_path:
 Add new operator runbook sections covering the cycle-3 simplified MVP surface. Append-only: do NOT modify existing operator runbook entries unless they're factually contradicted by the new feature. Sections to add:
 1. **Recall feedback loop** — what `recall_quality` fields in `memory-health.json` mean; how to interpret coverage_24h, useful_fact_rate_7d, rank_distribution_7d; how to query `recall_outcomes` directly via `sqlite3 data/mnemon-ingest.db`
 2. **Strategy C (LLM query extraction)** — when to flip a group's `query_strategy` from `'raw'` to `'llm'`; how to run the eval harness first
-3. **Cross-group recall scope** — flipping `recall_scope` to `'all-groups'` for axis-labs; reading `scope_quality_regression` health.json signal; manual revert procedure (no auto-revert per D35)
+3. **Cross-group recall scope** — flipping `recall_scope` to `'all-groups'` for example-research; reading `scope_quality_regression` health.json signal; manual revert procedure (no auto-revert per D35)
 4. **Env vars** — `MEMORY_RECALL_JUDGE_BACKEND`, `MEMORY_RECALL_QUERY_EXTRACTOR_BACKEND`, `MEMORY_RECALL_EVAL_SYNTHESIZER_BACKEND`, `HOST_OLLAMA_ENDPOINT`, `MEMORY_RECALL_RRF_RECENCY_BOOST`
 5. **Eval workflow** — `pnpm exec tsx scripts/regenerate-recall-eval.ts` → operator review → `pnpm exec tsx scripts/run-recall-eval.ts --strategy all` → flip per-group `query_strategy` if Strategy C wins by ≥10pp
 6. **Quarterly judge spot-check (S2-7 docs)** — manually sample 20 already-judged turns from `recall_outcomes`; eyeball judge_score against your own assessment; if drift detected, raise `JUDGE_PROMPT_VERSION` in code and re-judge

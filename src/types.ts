@@ -67,7 +67,7 @@ export interface MessagingGroup {
 /**
  * User = a messaging-platform identifier. Namespaced so distinct channels
  * with numeric IDs don't collide: "phone:+1555...", "tg:123", "discord:456",
- * "email:a@x.com". A single human with a phone AND a telegram handle has
+ * "email:person9@fixture16.example.com". A single human with a phone AND a telegram handle has
  * two separate users — no cross-channel linking (yet).
  */
 export interface User {

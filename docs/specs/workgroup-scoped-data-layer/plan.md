@@ -215,11 +215,11 @@ All HARD constraints traced ✓
 - **Interface / signature:** internal — no exported functions. Backfill state visible via the `_migration036_report (report TEXT)` temp table written at the end of `up()`.
   ASSERT: backfill uses suffix-strip heuristic only — NOT longest-prefix-match (D6 rejected option).
   ASSERT: orphan `<x>-codex` rows whose parent doesn't exist are categorized into `suffix_strip_unmatched`, NOT silently as `standalone` (cycle-2 M5 fix).
-  ASSERT: `workgroups.mnemon_store_id` for every paired workgroup equals the parent agent_groups.id (cycle-2 M1; preserves illie's 43MB recall — no data loss per C3).
+  ASSERT: `workgroups.mnemon_store_id` for every paired workgroup equals the parent agent_groups.id (cycle-2 M1; preserves helper's 43MB recall — no data loss per C3).
   ASSERT: every `agent_groups` row has a non-null `workgroup_id` after backfill (W1; validated in A3).
 - **Acceptance criteria:**
-  - [ ] All 10 known sibling pairs from Dave's install backfill correctly per A4 enumeration (C7)
-  - [ ] `workgroups.mnemon_store_id` for workgroup `illysium` equals illie's existing agent_groups.id (ag-1776377699463-2axxhg) — verified pre-migration empirically
+  - [ ] All 10 known sibling pairs from Operator's install backfill correctly per A4 enumeration (C7)
+  - [ ] `workgroups.mnemon_store_id` for workgroup `example-labs` equals helper's existing agent_groups.id (ag-1700000000000-example01) — verified pre-migration empirically
   - [ ] Orphan codex twin (synthetic test case: `lone-codex` with no `lone` parent) lands in `suffix_strip_unmatched`, not `standalone`
   - [ ] Backfill report written into `_migration036_report` temp table for E1 consumption
 - **Pre-conditions:** A1 schema complete
@@ -247,7 +247,7 @@ All HARD constraints traced ✓
 - **File:** `src/db/migrations/036-workgroup-id.test.ts` (CREATE)
 - **Operation:** CREATE
 - **Test file:** `src/db/migrations/036-workgroup-id.test.ts` (this is it)
-- **Implementation approach:** Vitest. Use `better-sqlite3` in-memory DB. For each test: seed `agent_groups` (and related tables for FK tests) with synthetic data matching Dave's install topology + edge cases, then run `migration036.up(db)` inside a transaction (matching barrel pattern), then assert post-state. For idempotency, run twice and verify second is no-op (schema_version gate makes the barrel skip re-application; in this test we simulate by checking that re-running the up directly does not error and produces identical state when re-invoked through the barrel pattern).
+- **Implementation approach:** Vitest. Use `better-sqlite3` in-memory DB. For each test: seed `agent_groups` (and related tables for FK tests) with synthetic data matching Operator's install topology + edge cases, then run `migration036.up(db)` inside a transaction (matching barrel pattern), then assert post-state. For idempotency, run twice and verify second is no-op (schema_version gate makes the barrel skip re-application; in this test we simulate by checking that re-running the up directly does not error and produces identical state when re-invoked through the barrel pattern).
 - **Interface / signature:** Vitest test file with `describe('migration 036', () => { it('...') })` blocks.
 - **Named test cases:**
   ```
@@ -260,24 +260,24 @@ All HARD constraints traced ✓
     Teardown: none
 
   test_backfill_all_10_known_pairs:
-    Setup:    Seed agent_groups with the 10 known sibling pairs from Dave's install:
-              axie-dev / axie-dev-codex (parent agent_groups.id = ag-1776735605480-ymhokes)
-              axis-labs / axis-labs-codex (parent ag-1776735605480-gg0aix7)
-              dirt-market / dirt-market-codex (parent ag-1776735605480-6q2c9zu)
-              illysium / illysium-codex (parent ag-1776377699463-2axxhg)
-              madison-reed / madison-reed-codex (parent ag-1776735605480-vosgej2)
-              main / main-codex (parent ag-1776402507183-cf39lq)
-              number-drinks / number-drinks-codex (parent ag-1776735605479-6p0461m)
-              sunday / sunday-codex (parent ag-1776735605480-sunday)
-              video-agent / video-agent-codex (parent ag-1776735605480-5htprgz)
-              xerus / xerus-codex (parent ag-1776735605480-y23k2jv)
+    Setup:    Seed agent_groups with the 10 known sibling pairs from Operator's install:
+              example-dev / example-dev-codex (parent agent_groups.id = ag-1700000000000-example07)
+              example-research / example-research-codex (parent ag-1700000000000-example05)
+              example-market / example-market-codex (parent ag-1700000000000-example04)
+              example-labs / example-labs-codex (parent ag-1700000000000-example01)
+              example-retail / example-retail-codex (parent ag-1700000000000-example06)
+              main / main-codex (parent ag-1700000000000-example02)
+              example-beverage / example-beverage-codex (parent ag-1700000000000-example03)
+              archive-one / archive-one-codex (parent ag-1700000000000-example03-one)
+              archive-media / archive-media-codex (parent ag-1700000000000-example02)
+              archive-two / archive-two-codex (parent ag-1700000000000-example04)
               Plus 2 synthetic standalone groups (no -codex pair)
               Plus 1 synthetic orphan codex (lone-codex with no lone parent)
     Action:   Run migration036.up(db)
     Assert:   All 10 paired non-codex groups have workgroup_id = own folder
               All 10 paired -codex groups have workgroup_id = parent folder
               workgroups table has 10 + 2 + 1 = 13 rows
-              workgroups.mnemon_store_id for illysium = "ag-1776377699463-2axxhg"
+              workgroups.mnemon_store_id for example-labs = "ag-1700000000000-example01"
               All other paired workgroups have mnemon_store_id = their parent's agent_groups.id
               Orphan lone-codex is in workgroups with mnemon_store_id = its own agent_groups.id
               _migration036_report contains pairings=10, standalone=2, suffix_strip_unmatched=[lone-codex]
@@ -321,7 +321,7 @@ All HARD constraints traced ✓
     Teardown: none
 
   test_no_row_collapse:
-    Setup:    Seed agent_groups with axie-dev + axie-dev-codex
+    Setup:    Seed agent_groups with example-dev + example-dev-codex
     Action:   Run migration036.up(db)
     Assert:   agent_groups count is exactly 2 post-migration (no collapse — C2)
     Teardown: none
@@ -383,9 +383,9 @@ All HARD constraints traced ✓
     Teardown: none
 
   test_workgroup_id_round_trip:
-    Setup:    Write container.json with workgroup_id: "illysium"
-    Action:   readContainerConfig('illysium-codex')
-    Assert:   returned config.workgroup_id === "illysium"
+    Setup:    Write container.json with workgroup_id: "example-labs"
+    Action:   readContainerConfig('example-labs-codex')
+    Assert:   returned config.workgroup_id === "example-labs"
               writeContainerConfig + readContainerConfig round-trip preserves the field
     Teardown: cleanup tmp folder
   ```
@@ -424,10 +424,10 @@ All HARD constraints traced ✓
 - **Named test cases:**
   ```
   test_workgroup_mode_returns_single_store_id:
-    Setup:    DB seeded with workgroup 'illysium', mnemon_store_id 'ag-1776377699463-2axxhg';
-              agent_groups row for illie with workgroup_id='illysium'
-    Action:   resolveRecallScope(illie.id, 'workgroup')
-    Assert:   returns ['ag-1776377699463-2axxhg'] (single element)
+    Setup:    DB seeded with workgroup 'example-labs', mnemon_store_id 'ag-1700000000000-example01';
+              agent_groups row for helper with workgroup_id='example-labs'
+    Action:   resolveRecallScope(helper.id, 'workgroup')
+    Assert:   returns ['ag-1700000000000-example01'] (single element)
     Teardown: none
 
   test_workgroup_of_1_equivalent_to_self:
@@ -453,15 +453,15 @@ All HARD constraints traced ✓
 
   test_folder_list_mode_unchanged:
     Setup:    Folder list provided as scope
-    Action:   resolveRecallScope(callingGroupId, ['axie-dev', 'illysium'])
+    Action:   resolveRecallScope(callingGroupId, ['example-dev', 'example-labs'])
     Assert:   returns [callingGroupId, ...resolved folder ids] — unchanged
     Teardown: none
 
   test_resolveWorkgroupMembers_preserves_calling_group_first:
-    Setup:    DB with workgroup 'illysium' having members illie + illysium-codex
-    Action:   resolveWorkgroupMembers(illie.id)
-    Assert:   returned[0] === illie.id (calling-group-first)
-              returned contains illysium-codex.id
+    Setup:    DB with workgroup 'example-labs' having members helper + example-labs-codex
+    Action:   resolveWorkgroupMembers(helper.id)
+    Assert:   returned[0] === helper.id (calling-group-first)
+              returned contains example-labs-codex.id
     Teardown: none
 
   test_assertNever_catches_future_scope:
@@ -505,30 +505,30 @@ All HARD constraints traced ✓
   ```
   test_archive_pooled_with_dedup_for_paired_workgroup:
     Setup:    Source archive.db with:
-              - 2 user-message rows (same text/sent_at/sender_id/thread_id) — one from illie's agent_group_id, one from illie-codex's
-              - 1 assistant-message row from illie (text="Hi from Claude")
-              - 1 assistant-message row from illie-codex (text="Hi from Codex")
-              agent_groups: illie (workgroup_id="illysium") + illie-codex (workgroup_id="illysium")
-              workgroups: illysium
-    Action:   buildArchiveProjection(archivePath, dstPath, illie.id)
+              - 2 user-message rows (same text/sent_at/sender_id/thread_id) — one from helper's agent_group_id, one from helper-codex's
+              - 1 assistant-message row from helper (text="Hi from Claude")
+              - 1 assistant-message row from helper-codex (text="Hi from Codex")
+              agent_groups: helper (workgroup_id="example-labs") + helper-codex (workgroup_id="example-labs")
+              workgroups: example-labs
+    Action:   buildArchiveProjection(archivePath, dstPath, helper.id)
     Assert:   Destination messages_archive contains exactly 3 rows:
               - 1 user message (deduplicated; id = MIN(id) of the two source rows)
-              - 1 assistant message from illie (sender_id = illie.id; survived)
-              - 1 assistant message from illie-codex (sender_id = illie-codex.id; survived)
+              - 1 assistant message from helper (sender_id = helper.id; survived)
+              - 1 assistant message from helper-codex (sender_id = helper-codex.id; survived)
               FTS index correctly populated via triggers
     Teardown: none
 
   test_archive_standalone_workgroup_no_dedup_needed:
-    Setup:    agent_groups row for standalone group "axie-dev" (workgroup_id = "axie-dev");
+    Setup:    agent_groups row for standalone group "example-dev" (workgroup_id = "example-dev");
               archive has 1 user message and 1 assistant message
     Action:   buildArchiveProjection
     Assert:   Destination contains exactly 2 rows (no change from pre-modification behavior)
     Teardown: none
 
   test_archive_isolation_across_workgroups:
-    Setup:    Source archive with rows for illysium workgroup AND madison-reed workgroup
-    Action:   buildArchiveProjection(archivePath, dstPath, illie.id)
-    Assert:   Destination contains ONLY illysium-workgroup rows; zero rows belonging to madison-reed
+    Setup:    Source archive with rows for example-labs workgroup AND example-retail workgroup
+    Action:   buildArchiveProjection(archivePath, dstPath, helper.id)
+    Assert:   Destination contains ONLY example-labs-workgroup rows; zero rows belonging to example-retail
               (C1 — projection-time enforcement; no cross-workgroup leak)
     Teardown: none
 
@@ -568,29 +568,29 @@ All HARD constraints traced ✓
 - **Named test cases:**
   ```
   test_backlog_items_isolated_per_agent:
-    Setup:    Central DB with backlog_items for illie (workgroup illysium) + for illie-codex (workgroup illysium)
-    Action:   buildCentralProjection(srcPath, dstPath, illie.id)
-    Assert:   Destination backlog_items contains ONLY illie's rows; illie-codex's rows excluded
+    Setup:    Central DB with backlog_items for helper (workgroup example-labs) + for helper-codex (workgroup example-labs)
+    Action:   buildCentralProjection(srcPath, dstPath, helper.id)
+    Assert:   Destination backlog_items contains ONLY helper's rows; helper-codex's rows excluded
               (even though they share a workgroup; backlog is agent-scoped per M5)
     Teardown: none
 
   test_ship_log_isolated_per_agent:
-    Setup:    ship_log rows for illie + illie-codex
-    Action:   buildCentralProjection(srcPath, dstPath, illie.id)
-    Assert:   Destination ship_log contains ONLY illie's rows
+    Setup:    ship_log rows for helper + helper-codex
+    Action:   buildCentralProjection(srcPath, dstPath, helper.id)
+    Assert:   Destination ship_log contains ONLY helper's rows
     Teardown: none
 
   test_agent_group_capabilities_per_agent:
-    Setup:    agent_group_capabilities: illie has orchestrator role; illie-codex does NOT
-    Action:   buildCentralProjection(srcPath, dstPath, illie-codex.id)
-    Assert:   Destination agent_group_capabilities for illie-codex does NOT include illie's orchestrator row
+    Setup:    agent_group_capabilities: helper has orchestrator role; helper-codex does NOT
+    Action:   buildCentralProjection(srcPath, dstPath, helper-codex.id)
+    Assert:   Destination agent_group_capabilities for helper-codex does NOT include helper's orchestrator row
               (cycle-1 D5-rejected: "Pool all central tables" — orchestrator MUST stay per-agent)
     Teardown: none
 
   test_tasks_isolated_per_parent:
-    Setup:    tasks with parent_agent_group_id = illie's id, and others with illie-codex's id
-    Action:   buildCentralProjection(srcPath, dstPath, illie.id)
-    Assert:   Destination tasks contains ONLY rows where parent_agent_group_id = illie.id
+    Setup:    tasks with parent_agent_group_id = helper's id, and others with helper-codex's id
+    Action:   buildCentralProjection(srcPath, dstPath, helper.id)
+    Assert:   Destination tasks contains ONLY rows where parent_agent_group_id = helper.id
     Teardown: none
   ```
 - **Acceptance criteria:**
@@ -641,25 +641,25 @@ All HARD constraints traced ✓
 - **Named test cases:**
   ```
   test_reconciler_uses_parent_folder_for_mnemon_store_id:
-    Setup:    DB has illie agent_group with folder='illysium', id='ag-illie-uuid';
-              illie-codex agent_group with folder='illysium-codex', id='illysium-codex';
+    Setup:    DB has helper agent_group with folder='example-labs', id='ag-helper-uuid';
+              helper-codex agent_group with folder='example-labs-codex', id='example-labs-codex';
               workgroups table empty
-    Action:   Trigger spawn for illie-codex (simulate by invoking buildContainerArgs for illie-codex)
-    Assert:   workgroups now contains a row with id='illysium', mnemon_store_id='ag-illie-uuid' (parent's id, NOT the spawning agent's id)
-              agent_groups.workgroup_id for illie-codex = 'illysium'
+    Action:   Trigger spawn for helper-codex (simulate by invoking buildContainerArgs for helper-codex)
+    Assert:   workgroups now contains a row with id='example-labs', mnemon_store_id='ag-helper-uuid' (parent's id, NOT the spawning agent's id)
+              agent_groups.workgroup_id for helper-codex = 'example-labs'
               cycle-3 M3: spawn-order race resolved
     Teardown: none
 
   test_reconciler_preserves_existing_workgroup_row:
-    Setup:    workgroups row exists with mnemon_store_id='ag-illie-historical-uuid' (migration-backfilled)
-    Action:   Spawn for illie-codex
-    Assert:   workgroups.mnemon_store_id remains 'ag-illie-historical-uuid' (ON CONFLICT DO NOTHING preserved it)
+    Setup:    workgroups row exists with mnemon_store_id='ag-helper-historical-uuid' (migration-backfilled)
+    Action:   Spawn for helper-codex
+    Assert:   workgroups.mnemon_store_id remains 'ag-helper-historical-uuid' (ON CONFLICT DO NOTHING preserved it)
     Teardown: none
 
   test_reconciler_standalone_fallback_to_self:
-    Setup:    Standalone agent_group with folder='axie-dev' and no -codex sibling; workgroups empty
-    Action:   Spawn for axie-dev
-    Assert:   workgroups row created with mnemon_store_id = axie-dev's own agent_groups.id
+    Setup:    Standalone agent_group with folder='example-dev' and no -codex sibling; workgroups empty
+    Action:   Spawn for example-dev
+    Assert:   workgroups row created with mnemon_store_id = example-dev's own agent_groups.id
               (no parent row exists; reconciler falls back to self)
     Teardown: none
 
@@ -701,24 +701,24 @@ All HARD constraints traced ✓
 - **Named test cases:**
   ```
   test_mnemon_store_from_workgroups_when_no_env_override:
-    Setup:    workgroups row with mnemon_store_id='ag-illie-uuid' for workgroup 'illysium';
-              illie-codex agent with workgroup_id='illysium';
-              env: no MNEMON_STORE_illysium_codex set
-    Action:   buildContainerArgs for illie-codex
-    Assert:   args contain '-e' 'MNEMON_STORE=ag-illie-uuid'
+    Setup:    workgroups row with mnemon_store_id='ag-helper-uuid' for workgroup 'example-labs';
+              helper-codex agent with workgroup_id='example-labs';
+              env: no MNEMON_STORE_example-labs_codex set
+    Action:   buildContainerArgs for helper-codex
+    Assert:   args contain '-e' 'MNEMON_STORE=ag-helper-uuid'
     Teardown: none
 
   test_pr_105_env_override_takes_precedence:
     Setup:    Same DB state as above;
-              env: MNEMON_STORE_illysium_codex='custom-store-id'
-    Action:   buildContainerArgs for illie-codex
+              env: MNEMON_STORE_example-labs_codex='custom-store-id'
+    Action:   buildContainerArgs for helper-codex
     Assert:   args contain '-e' 'MNEMON_STORE=custom-store-id' (env wins)
               workgroups.mnemon_store_id is NOT consulted (C6 preserves PR #105)
     Teardown: none
 
   test_uppercase_env_override_fallback_preserved:
-    Setup:    env: MNEMON_STORE_ILLYSIUM_CODEX='upper-custom' (uppercase variant per PR #105)
-    Action:   buildContainerArgs for illie-codex
+    Setup:    env: MNEMON_STORE_EXAMPLE_LABS_CODEX='upper-custom' (uppercase variant per PR #105)
+    Action:   buildContainerArgs for helper-codex
     Assert:   args contain '-e' 'MNEMON_STORE=upper-custom' (uppercase fallback per PR #105)
     Teardown: none
 
@@ -758,16 +758,16 @@ All HARD constraints traced ✓
   ```
   test_merge_workgroup_baseline_plus_group_additive:
     Setup:    workgroupSecrets = ['Anthropic', 'Exa']
-              groupSecrets = ['Datafold-MR']
+              groupSecrets = ['Datafold-Example-Retail']
     Action:   mergeWorkgroupAndGroupSecrets(workgroupSecrets, groupSecrets)
-    Assert:   returns ['Anthropic', 'Exa', 'Datafold-MR'] (workgroup first, group additions after)
+    Assert:   returns ['Anthropic', 'Exa', 'Datafold-Example-Retail'] (workgroup first, group additions after)
     Teardown: none
 
   test_merge_dedup_when_group_repeats_workgroup_secret:
     Setup:    workgroupSecrets = ['Anthropic', 'Exa']
-              groupSecrets = ['Anthropic', 'Datafold-MR']
+              groupSecrets = ['Anthropic', 'Datafold-Example-Retail']
     Action:   mergeWorkgroupAndGroupSecrets
-    Assert:   returns ['Anthropic', 'Exa', 'Datafold-MR'] (no duplicate Anthropic)
+    Assert:   returns ['Anthropic', 'Exa', 'Datafold-Example-Retail'] (no duplicate Anthropic)
               length === 3
     Teardown: none
 
@@ -787,17 +787,17 @@ All HARD constraints traced ✓
 
   test_merge_per_group_cannot_subtract:
     Setup:    workgroupSecrets = ['Anthropic', 'Exa']
-              groupSecrets = ['Datafold-MR'] (does not list Anthropic or Exa)
+              groupSecrets = ['Datafold-Example-Retail'] (does not list Anthropic or Exa)
     Action:   mergeWorkgroupAndGroupSecrets
-    Assert:   returns ['Anthropic', 'Exa', 'Datafold-MR']
+    Assert:   returns ['Anthropic', 'Exa', 'Datafold-Example-Retail']
               Workgroup secrets are present in result; no subtraction (D8 rejected option)
     Teardown: none
 
   test_spawn_applies_merged_secrets:
-    Setup:    DB: workgroups.onecli_secrets='["Anthropic","Exa"]' for illysium;
-              container.json for illie has onecliSecrets=["Datafold-Illysium"]
-    Action:   spawn illie (simulate buildContainerArgs + applyOnecliSecrets call)
-    Assert:   applyOnecliSecrets is called with declarations=['Anthropic','Exa','Datafold-Illysium']
+    Setup:    DB: workgroups.onecli_secrets='["Anthropic","Exa"]' for example-labs;
+              container.json for helper has onecliSecrets=["Datafold-Example Labs"]
+    Action:   spawn helper (simulate buildContainerArgs + applyOnecliSecrets call)
+    Assert:   applyOnecliSecrets is called with declarations=['Anthropic','Exa','Datafold-Example Labs']
     Teardown: none
   ```
 - **Acceptance criteria:**
@@ -817,7 +817,7 @@ All HARD constraints traced ✓
   ```
   Usage: pnpm exec tsx scripts/set-workgroup-secrets.ts <workgroup-id> --secrets <name1,name2,...>
 
-  Example: pnpm exec tsx scripts/set-workgroup-secrets.ts illysium --secrets "Anthropic,Exa,Datafold-Illysium"
+  Example: pnpm exec tsx scripts/set-workgroup-secrets.ts example-labs --secrets "Anthropic,Exa,Datafold-Example Labs"
 
   Exit codes:
     0 — success
@@ -831,16 +831,16 @@ All HARD constraints traced ✓
 - **Named test cases:**
   ```
   test_writes_valid_secrets_to_db:
-    Setup:    DB: workgroups row 'illysium' exists; OneCLI vault has secrets "Anthropic", "Exa"
-    Action:   Run CLI with args ['illysium', '--secrets', 'Anthropic,Exa']
+    Setup:    DB: workgroups row 'example-labs' exists; OneCLI vault has secrets "Anthropic", "Exa"
+    Action:   Run CLI with args ['example-labs', '--secrets', 'Anthropic,Exa']
     Assert:   exit code 0
-              workgroups.onecli_secrets for 'illysium' parses as ["Anthropic","Exa"]
+              workgroups.onecli_secrets for 'example-labs' parses as ["Anthropic","Exa"]
               workgroups.updated_at is set to current ISO timestamp
     Teardown: none
 
   test_rejects_unresolvable_secret:
     Setup:    OneCLI vault has only "Anthropic" (NOT "Exa")
-    Action:   Run CLI with args ['illysium', '--secrets', 'Anthropic,Exa']
+    Action:   Run CLI with args ['example-labs', '--secrets', 'Anthropic,Exa']
     Assert:   exit code 1
               stderr contains "Exa" (the unresolvable name)
               workgroups.onecli_secrets is unchanged from pre-call state (no partial write)
@@ -855,7 +855,7 @@ All HARD constraints traced ✓
     Teardown: none
 
   test_idempotent_rerun:
-    Setup:    Run once successfully with ['illysium', '--secrets', 'Anthropic,Exa']
+    Setup:    Run once successfully with ['example-labs', '--secrets', 'Anthropic,Exa']
     Action:   Run identical command again
     Assert:   exit code 0
               workgroups.onecli_secrets unchanged
@@ -895,15 +895,15 @@ All HARD constraints traced ✓
   ```
   test_resolve_thread_link_finds_sibling_archive:
     Setup:    Mock projection DB (workgroup-widened) containing thread messages where some rows
-              have agent_group_id = "illysium" and others have "illysium-codex"
+              have agent_group_id = "example-labs" and others have "example-labs-codex"
     Action:   resolveThreadLinkTool.handler({ url: '<slack-thread-link>' })
-              with currentAgentGroupId returning "illysium-codex"
+              with currentAgentGroupId returning "example-labs-codex"
     Assert:   Returned transcript contains ALL messages from the thread (both siblings' rows)
               NOT just messages where agent_group_id matches the calling agent
     Teardown: none
 
   test_search_threads_returns_workgroup_pooled:
-    Setup:    Projection DB contains FTS-indexed messages from illie + illie-codex
+    Setup:    Projection DB contains FTS-indexed messages from helper + helper-codex
     Action:   searchThreadsTool.handler({ query: 'shared term', limit: 10 })
     Assert:   Returned hits include rows from both siblings
               No in-tool agent_group_id filter narrows results
@@ -935,7 +935,7 @@ All HARD constraints traced ✓
 - **File:** `container/agent-runner/src/mcp-tools/thread-search.test.ts` (continues from D1)
 - **Operation:** CREATE (extends D1's test file with integration cases)
 - **Test file:** same as D1
-- **Implementation approach:** Add `bun:test` cases that simulate the full container-side read path against a workgroup-widened projection. Verify that when the host has projected illie + illie-codex into a single `messages_archive`, the in-container tools see all rows without an in-tool filter.
+- **Implementation approach:** Add `bun:test` cases that simulate the full container-side read path against a workgroup-widened projection. Verify that when the host has projected helper + helper-codex into a single `messages_archive`, the in-container tools see all rows without an in-tool filter.
 - **Interface / signature:** test cases inside the file from D1.
   ASSERT: integration coverage exists for the projection → tool consumption flow.
 - **Named test cases:**
@@ -1047,7 +1047,7 @@ All HARD constraints traced ✓
   ```
   test_writes_logs_when_migration_report_present:
     Setup:    In-memory DB; create _migration036_report with JSON content
-              { pairings: [{child:'illysium-codex',parent:'illysium'}], standalone:[], suffix_strip_unmatched:[] }
+              { pairings: [{child:'example-labs-codex',parent:'example-labs'}], standalone:[], suffix_strip_unmatched:[] }
               Create tmp dir for logs/
     Action:   reconcileWorkgroupFsState(db)
     Assert:   logs/migration-036.log exists and contains parseable JSON matching the report
@@ -1056,16 +1056,16 @@ All HARD constraints traced ✓
     Teardown: rm tmp dir
 
   test_writes_recall_scope_for_paired_groups_only:
-    Setup:    agent_groups: illysium (workgroup_id='illysium', folder='illysium'),
-              illysium-codex (workgroup_id='illysium', folder='illysium-codex'),
+    Setup:    agent_groups: example-labs (workgroup_id='example-labs', folder='example-labs'),
+              example-labs-codex (workgroup_id='example-labs', folder='example-labs-codex'),
               standalone-x (workgroup_id='standalone-x', folder='standalone-x')
               Container.json files exist for all three with no recall_scope set
     Action:   reconcileWorkgroupFsState(db)
-    Assert:   container.json for illysium-codex now has memory.recall_scope='workgroup' (paired: workgroup_id !== folder)
+    Assert:   container.json for example-labs-codex now has memory.recall_scope='workgroup' (paired: workgroup_id !== folder)
               container.json for standalone-x is UNCHANGED (workgroup_id === folder)
-              Wait — illysium itself ALSO has workgroup_id='illysium' === folder='illysium'.
-              So illysium (parent) is NOT modified.
-              Only illysium-codex (child, workgroup_id='illysium' !== folder='illysium-codex') gets the write.
+              Wait — example-labs itself ALSO has workgroup_id='example-labs' === folder='example-labs'.
+              So example-labs (parent) is NOT modified.
+              Only example-labs-codex (child, workgroup_id='example-labs' !== folder='example-labs-codex') gets the write.
     Teardown: cleanup tmp container.json files
 
   test_idempotent:
@@ -1159,7 +1159,7 @@ After all groups complete, verify (`/team-qa` runs these):
 - [ ] Migration 036 applies cleanly on a copy of live `data/v2.db` — all 10 codex twins pair correctly per backfill report
 - [ ] `pnpm exec tsx scripts/set-workgroup-secrets.ts <workgroup> --secrets <list>` resolves and writes JSON successfully
 - [ ] Host startup runs `reconcileWorkgroupFsState` once; container.json files for paired groups contain `recall_scope: 'workgroup'`; idempotent on second startup
-- [ ] Manual smoke test: send a message to illie; verify mnemon recall returns facts from illie's existing store (i.e., `mnemon_store_id` correctly preserved)
+- [ ] Manual smoke test: send a message to helper; verify mnemon recall returns facts from helper's existing store (i.e., `mnemon_store_id` correctly preserved)
 - [ ] Manual smoke test: pooled archive returns sibling chat history without duplicate user messages
 
 ---

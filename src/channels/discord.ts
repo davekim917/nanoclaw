@@ -295,7 +295,7 @@ export function rewriteDiscordLinks(text: string): string {
 //
 // Discord requires real `<@USER_SNOWFLAKE>` syntax for an @-mention to fire
 // the receiving bot's `engage_mode='mention'` wiring. Plain text like
-// `@Axie-codex` ships as literal characters — no Discord mention event
+// `@Example Agent-codex` ships as literal characters — no Discord mention event
 // fires, no peer wake. Slack's chat-adapter rewrites bare `@username` to
 // `<@U…>` server-side via a cached lookup; the Discord adapter doesn't.
 //
@@ -409,7 +409,7 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
   if (bots.size === 0) return text;
 
   // Username → id, lowercased for case-insensitive matching. Each bot also
-  // contributes a separator-stripped alias (`axie-codex` ↔ `axiecodex`) so
+  // contributes a separator-stripped alias (`example-agent-codex` ↔ `example-agent-codex`) so
   // operator-typed Discord handles that diverge from the agent's logical
   // name still resolve. Literal-first conflict resolution: an exact literal
   // owns its slot in byName; normalized aliases fill only unowned slots.
@@ -431,7 +431,7 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
   }
 
   // Discord usernames allow `[a-z0-9_.]` post-2023; we additionally accept
-  // `-` so legacy usernames like "Axie-Codex" still resolve.
+  // `-` so legacy usernames like "Example Agent-Codex" still resolve.
   //
   // The `(?<!\w)` lookbehind anchors the `@` to a word boundary — without
   // it, `user@domain.com` would parse as `@domain.com` and look up a bot
@@ -441,11 +441,11 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
   //
   // Username body: word chars and dashes, with OPTIONAL `.suffix` segments
   // so `user.name` still resolves but a trailing sentence-ending period
-  // ("Your turn, @Axie-Codex.") doesn't gobble into the capture and miss
+  // ("Your turn, @Example Agent-Codex.") doesn't gobble into the capture and miss
   // the lookup. A naïve `[\w.-]+` swallows the trailing period, which then
-  // misses `byName.get("axie-codex.")` and falls through to the
-  // chat-sdk-adapter's own `/@(\w+)/g` pass — which captures only `@Axie`
-  // (no dash support) and brackets it to `<@Axie>`, leaving `-Codex.` as
+  // misses `byName.get("example-agent-codex.")` and falls through to the
+  // chat-sdk-adapter's own `/@(\w+)/g` pass — which captures only `@Example Agent`
+  // (no dash support) and brackets it to `<@Example Agent>`, leaving `-Codex.` as
   // dangling text. That double-failure was the live Discord bug.
   //
   // Two passes by design, agent-mistake-tolerant:
@@ -485,8 +485,8 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
 }
 
 /**
- * Strip Discord-handle separators (`-`, `_`, `.`) so `axie-codex` ≡
- * `axiecodex` ≡ `axie_codex` for fuzzy matching. Used only as a fallback
+ * Strip Discord-handle separators (`-`, `_`, `.`) so `example-agent-codex` ≡
+ * `example-agent-codex` ≡ `example-agent-codex` for fuzzy matching. Used only as a fallback
  * after literal lookup misses — never replaces literal equality. Mirrors
  * the same helper in `slack-mentions.ts`.
  */
@@ -502,7 +502,7 @@ function normalizeHandle(handle: string): string {
  * the raw form for debugging.
  *
  * Why bots only: this exists to fix sibling handoff. The agent needs to
- * know its peer is called `Axie-Codex` (not just snowflake 1505...). It
+ * know its peer is called `Example Agent-Codex` (not just snowflake 1505...). It
  * doesn't need human display names — the chat-sdk Message envelope
  * already carries `author.fullName` for the sender, and humans aren't
  * routing targets.
@@ -640,7 +640,7 @@ export function parseDiscordWorkspaces(env: Record<string, string>): DiscordWork
 }
 
 // Pre-filter regex must allow `_` in the suffix so env vars like
-// DISCORD_BOT_TOKEN_AXIE_CODEX reach the parser intact.
+// DISCORD_BOT_TOKEN_example-agent-codex reach the parser intact.
 const workspaces = parseDiscordWorkspaces(
   readEnvFileMatching(/^DISCORD_(BOT_TOKEN|PUBLIC_KEY|APPLICATION_ID)(_[A-Za-z0-9_]+)?$/),
 );
@@ -673,7 +673,7 @@ for (const ws of workspaces) {
       // adapter, two Discord adapters processing the same Discord message
       // (same id) would collide on the dedup key and the second silently
       // drops the message. This bites the two-bots-in-same-guild case (e.g.
-      // axie + axie-codex both observing user messages in #chat).
+      // example-agent + example-agent-codex both observing user messages in #chat).
       //
       // Override adapter.name to the channelType so each workspace has its
       // own dedup keyspace. The name also keys `chat.webhooks[...]` — but

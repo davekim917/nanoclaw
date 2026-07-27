@@ -43,7 +43,7 @@ function seedGroups(): void {
   getDb()
     .prepare(
       `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
-       VALUES ('mg-child', 'slack', 'W-illysium', 'slack', 'illysium-channel', 1, 'strict', ?)`,
+       VALUES ('mg-child', 'slack', 'W-example-labs', 'slack', 'example-labs-channel', 1, 'strict', ?)`,
     )
     .run(now());
   getDb()
@@ -90,8 +90,8 @@ function makeTask(overrides: Partial<Parameters<typeof insertTaskAtomic>[0]> = {
 const mockChildMg = {
   id: 'mg-child',
   channel_type: 'slack',
-  platform_id: 'W-illysium',
-  name: 'illysium-channel',
+  platform_id: 'W-example-labs',
+  name: 'example-labs-channel',
   is_group: 1 as const,
   unknown_sender_policy: 'strict' as const,
   created_at: '2026-05-12T00:00:00.000Z',
@@ -214,7 +214,7 @@ describe('applySpawnNeedsInput', () => {
 
     expect(deliverMock).toHaveBeenCalledTimes(1);
     const [platformId, threadId, msg] = deliverMock.mock.calls[0];
-    expect(platformId).toBe('W-illysium');
+    expect(platformId).toBe('W-example-labs');
     expect(threadId).toBe('thread-task-1');
     expect((msg as { content: { text: string } }).content.text).toContain('Repo path A or B?');
     expect((msg as { content: { text: string } }).content.text).toContain('Needs your input');

@@ -39,7 +39,7 @@ export function registerSecrets(secrets: Record<string, string>): void {
  * everything except a few hand-picked non-secrets) but that caused
  * over-redaction as new NANOCLAW_DEFAULT_* config knobs and per-workspace
  * identifier keys were added — e.g. NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_*
- * values are short config strings like "illysium" that the scrubber then
+ * values are short config strings like "example-labs" that the scrubber then
  * wiped out of every message. Allowlist is safer here: defense-in-depth
  * only (OneCLI is the primary isolation), and every real credential in
  * the canonical .env template follows one of these naming patterns.

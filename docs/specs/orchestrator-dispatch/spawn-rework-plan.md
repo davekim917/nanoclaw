@@ -9,7 +9,7 @@
 Phase 1 of orchestrator-dispatch shipped via PR #80 (merge commit `3bcf601` on `davekim917/nanoclaw/main`). It works, all tests pass, but the **framing was wrong** for the user's actual use case.
 
 ### What the user actually wants
-- **Self-orchestration**: one agent (e.g. Illie / Illysium group) gets a list of work, spawns N parallel sessions of itself — all in the same group, all sharing workspace, the canonical workgroup memory tree, channels, CLAUDE.md, and container config.
+- **Self-orchestration**: one agent (e.g. Helper / Example Labs group) gets a list of work, spawns N parallel sessions of itself — all in the same group, all sharing workspace, the canonical workgroup memory tree, channels, CLAUDE.md, and container config.
 - Each spawn is a parallel work-stream of the same agent, isolated only at the conversation/thread level (so you can chat with each in its own thread).
 - Sibling spawns coordinate via shared workspace files, the canonical workgroup memory tree, and shared backlog/ship_log — NOT via direct sibling messaging APIs (parent-coordinated for explicit deps; future MCP tool only if real-time sibling comms become a felt pain).
 - Plus a **board UI** (Multica-style: kanban + per-task drill-down + steer-from-one-place) — Phase 2 of the spec, deferred during build, now elevated to "headline feature, build next."

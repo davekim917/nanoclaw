@@ -10,22 +10,22 @@
 
 **Remaining follow-on (does NOT block enabling for the existing 10 workgroups):** update `/clone-as-codex` + `/clone-as-opencode` step 4 to stop creating per-dir relative symlinks and rely on the `/workspace/workgroup` mount. Relevant only for NEW siblings created *after* the flag is enabled (the existing workgroups are handled by the startup migration). The relative symlinks a clone currently creates would, post-migration, resolve to the seed's container-absolute compat symlink — messy but mount-saved; best fixed when the flag is actually enabled, with flag-aware symlink logic. Tracked here.
 
-**Enable sequence (owner-gated):** (1) `sudo systemctl stop nanoclaw-v2`; confirm no `nanoclaw-v2-*` containers running. (2) set `NANOCLAW_WORKGROUP_SHARED_FS=1` in `.env`. (3) `sudo systemctl start nanoclaw-v2` (migration runs against the quiesced FS) **and** `sudo systemctl restart nanoclaw-memory-daemon` (daemon picks up the data/workgroups discovery root). (4) smoke-test per the Verification plan below from a respawned `madison-reed-codex` session.
+**Enable sequence (owner-gated):** (1) `sudo systemctl stop nanoclaw-v2`; confirm no `nanoclaw-v2-*` containers running. (2) set `NANOCLAW_WORKGROUP_SHARED_FS=1` in `.env`. (3) `sudo systemctl start nanoclaw-v2` (migration runs against the quiesced FS) **and** `sudo systemctl restart nanoclaw-memory-daemon` (daemon picks up the data/workgroups discovery root). (4) smoke-test per the Verification plan below from a respawned `example-retail-codex` session.
 
 ## Goal (owner's words)
 "Everything within a workgroup should be able to be ACCESSED across agents… They all live in the same house but have their own bedrooms for their specific needs." Every member of a workgroup can access everything shared in that workgroup; each keeps a private space.
 
 ## Locked decisions (owner)
-1. **All members of a workgroup are SIBLINGS — no "primary"/parent.** The shared store must NOT be any one sibling's folder. (`madison-reed` holds the data today only because it was the first sibling created — historical accident.)
+1. **All members of a workgroup are SIBLINGS — no "primary"/parent.** The shared store must NOT be any one sibling's folder. (`example-retail` holds the data today only because it was the first sibling created — historical accident.)
 2. **Dedicated shared directory per workgroup**, bind-mounted into every member's container at `/workspace/workgroup` (RW). `/workspace/agent` stays private (the bedroom).
 3. **Location:** `data/workgroups/<workgroup_id>/` (sibling to `data/v2-sessions/`, `data/v2-threads/`; inherits the `data/*` gitignore so shared work product is never committed).
-4. **Shared-vs-private = "substantive set":** migrate every top-level git repo + `sources` + `conversations` + the bug-victim dirs (`dave_ops`, `mr-state-of-data`) into the shared house; new collaborative work defaults there. Loose scratch/secret files (`_tmp_*.json`, `*.ppk`, `*-auth.json`) stay in the bedroom. The per-workgroup set is COMPUTED (every top-level git repo ∪ sources ∪ conversations ∪ the union of dirs any sibling currently symlinks ∪ operator-named extras) — NOT hardcoded to MR's set.
+4. **Shared-vs-private = "substantive set":** migrate every top-level git repo + `sources` + `conversations` + the bug-victim dirs (`operator_ops`, `retail-state-of-data`) into the shared house; new collaborative work defaults there. Loose scratch/secret files (`_tmp_*.json`, `*.ppk`, `*-auth.json`) stay in the bedroom. The per-workgroup set is COMPUTED (every top-level git repo ∪ sources ∪ conversations ∪ the union of dirs any sibling currently symlinks ∪ operator-named extras) — NOT hardcoded to one workgroup's set.
 5. **`CLAUDE.local.md`** stays a per-bedroom file (keep current sibling-symlink behavior; lowest risk).
 6. **Rollout:** stop containers → restart host (migration runs against quiesced FS) → respawn. Owner-gated, behind the flag.
 
 ## Current mechanism (verified, file:line)
 - `src/container-runner.ts:1039` — mounts the group's own folder at `/workspace/agent` RW (private today).
-- `src/container-runner.ts:1055-1065` — the ONLY cross-sibling sharing today: iterates top-level SYMLINKS in the group folder, `realpathSync` on host, bind-mounts each resolved target at `/workspace/agent/<name>`. Static + curated + inconsistent across siblings = the root bug (a dir created later, like `dave_ops`, is never shared).
+- `src/container-runner.ts:1055-1065` — the ONLY cross-sibling sharing today: iterates top-level SYMLINKS in the group folder, `realpathSync` on host, bind-mounts each resolved target at `/workspace/agent/<name>`. Static + curated + inconsistent across siblings = the root bug (a dir created later, like `operator_ops`, is never shared).
 - Sibling symlinks created statically by `.claude/skills/clone-as-codex` + `clone-as-opencode` (step 4).
 - Startup ordering (`src/index.ts`): `initDb`(154) → `runMigrations`(155) → `reconcileWorkgroupFsState`(162) → `backfillContainerConfigs`(181) → `migrateGroupsToClaudeLocal`(184) → `ensureContainerRuntimeRunning`(187). The new migration hooks **right after 162**, before any container can spawn.
 - Migration-home pattern: `src/modules/workgroup/fs-reconcile.ts` `reconcileWorkgroupFsState(db)` — startup-after-migrations, per-workgroup iteration, idempotent, throws→`process.exit(1)` on FS failure. The new `reconcileWorkgroupSharedDirs(db)` mirrors it.
@@ -48,7 +48,7 @@ If `sources/` moves out of `groups/<seed>/` to `data/workgroups/<wg>/sources/`, 
 Per workgroup_id:
 1. Resolve seed = `agent_groups` row where `folder == workgroup_id` (where data lives today). `wgDir = data/workgroups/<workgroup_id>/`.
 2. Idempotency: if `wgDir/.migrated` exists, skip the workgroup.
-3. Compute shared set = (every top-level dir in seed containing `.git/`) ∪ (`sources`,`conversations` if present) ∪ (union of dirs any sibling currently symlinks) ∪ operator extras (`dave_ops`,`mr-state-of-data` for MR). Dedupe.
+3. Compute shared set = (every top-level dir in seed containing `.git/`) ∪ (`sources`,`conversations` if present) ∪ (union of dirs any sibling currently symlinks) ∪ operator extras (`operator_ops`,`retail-state-of-data` for example workgroup). Dedupe.
 4. `mkdir -p wgDir`. For each entry: skip if `wgDir/<name>` exists (idempotent/partial-run safe); else `fs.renameSync(groups/<seed>/<name>, wgDir/<name>)` — **detect EXDEV** (different filesystem) and fall back to copy→verify→remove; never half-move. Then drop a container-absolute compat symlink at `groups/<seed>/<name>`.
 5. For each non-seed sibling: replace its relative `<name> -> ../<seed>/<name>` symlinks with container-absolute `<name> -> /workspace/workgroup/<name>`; remove now-broken relative symlinks for moved dirs.
 6. Write `wgDir/.migrated` (JSON: timestamp, moved entries, seed id) + append `logs/migration-shared-dirs.log`.
@@ -72,7 +72,7 @@ Replace the symlink-overlay loop (1055-1065). When the flag is set: resolve `wor
 - **Phase 3 (~100 LOC + docs):** clone-skill rewrites + `container/CLAUDE.md` "Shared workspace" section + `docs/workgroups.md`. Remove flag (make default) only after a green controlled test.
 
 ## Verification plan (before flipping the flag default)
-Stop containers → enable flag → restart host → migration runs against quiesced FS → smoke-test from a respawned `madison-reed-codex` session: `/workspace/workgroup/sources` and a repo readable; `create_worktree({repo})` works; a memory-capture lands in the inbox AND the daemon ingests it (the critical mnemon check); a sibling sees a file another sibling wrote under `/workspace/workgroup`.
+Stop containers → enable flag → restart host → migration runs against quiesced FS → smoke-test from a respawned `example-retail-codex` session: `/workspace/workgroup/sources` and a repo readable; `create_worktree({repo})` works; a memory-capture lands in the inbox AND the daemon ingests it (the critical mnemon check); a sibling sees a file another sibling wrote under `/workspace/workgroup`.
 
 ## Rollback
 Flag OFF + a reverse script reading `.migrated` reports (move dirs back to seed, restore relative sibling symlinks). Migration only renames (never deletes source until verified on EXDEV-copy), so data is recoverable at every step.

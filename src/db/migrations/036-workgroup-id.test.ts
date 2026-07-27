@@ -44,18 +44,18 @@ function insertGroup(db: Database.Database, id: string, folder: string) {
   ).run(id, folder, folder, new Date().toISOString());
 }
 
-/** The 10 known sibling pairs from Dave's install. */
+/** The 10 known sibling pairs from Operator's install. */
 const KNOWN_PAIRS: Array<{ folder: string; id: string; codexId: string }> = [
-  { folder: 'axie-dev', id: 'ag-1776735605480-ymhokes', codexId: 'axie-dev-codex' },
-  { folder: 'axis-labs', id: 'ag-1776735605480-gg0aix7', codexId: 'axis-labs-codex' },
-  { folder: 'dirt-market', id: 'ag-1776735605480-6q2c9zu', codexId: 'dirt-market-codex' },
-  { folder: 'illysium', id: 'ag-1776377699463-2axxhg', codexId: 'illysium-codex' },
-  { folder: 'madison-reed', id: 'ag-1776735605480-vosgej2', codexId: 'madison-reed-codex' },
-  { folder: 'main', id: 'ag-1776402507183-cf39lq', codexId: 'main-codex' },
-  { folder: 'number-drinks', id: 'ag-1776735605479-6p0461m', codexId: 'number-drinks-codex' },
-  { folder: 'sunday', id: 'ag-1776735605480-sunday', codexId: 'sunday-codex' },
-  { folder: 'video-agent', id: 'ag-1776735605480-5htprgz', codexId: 'video-agent-codex' },
-  { folder: 'xerus', id: 'ag-1776735605480-y23k2jv', codexId: 'xerus-codex' },
+  { folder: 'example-dev', id: 'ag-1700000000000-example01', codexId: 'example-dev-codex' },
+  { folder: 'example-research', id: 'ag-1700000000000-example02', codexId: 'example-research-codex' },
+  { folder: 'example-market', id: 'ag-1700000000000-example03', codexId: 'example-market-codex' },
+  { folder: 'example-labs', id: 'ag-1700000000000-example04', codexId: 'example-labs-codex' },
+  { folder: 'example-retail', id: 'ag-1700000000000-example05', codexId: 'example-retail-codex' },
+  { folder: 'main', id: 'ag-1700000000000-example06', codexId: 'main-codex' },
+  { folder: 'example-beverage', id: 'ag-1700000000000-example07', codexId: 'example-beverage-codex' },
+  { folder: 'archive-one', id: 'ag-1700000000000-example08', codexId: 'archive-one-codex' },
+  { folder: 'archive-media', id: 'ag-1700000000000-example09', codexId: 'archive-media-codex' },
+  { folder: 'archive-two', id: 'ag-1700000000000-example10', codexId: 'archive-two-codex' },
 ];
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -131,11 +131,11 @@ describe('migration036 — workgroup-id', () => {
       expect(ag?.workgroup_id, `${p.codexId} workgroup_id should equal parent folder`).toBe(p.folder);
     }
 
-    // illysium workgroup mnemon_store_id = parent agent_groups.id
-    const illysiumWg = db.prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = 'illysium'`).get() as
+    // example-labs workgroup mnemon_store_id = parent agent_groups.id
+    const exampleLabsWg = db.prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = 'example-labs'`).get() as
       | { mnemon_store_id: string }
       | undefined;
-    expect(illysiumWg?.mnemon_store_id).toBe('ag-1776377699463-2axxhg');
+    expect(exampleLabsWg?.mnemon_store_id).toBe('ag-1700000000000-example04');
 
     // Standalones are their own workgroup
     const saA = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE folder = 'standalone-a'`).get() as

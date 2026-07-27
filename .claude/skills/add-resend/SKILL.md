@@ -93,7 +93,7 @@ Paste the Resend API key — API Keys, starts with `re_`.
 Paste the webhook signing secret — Webhooks, the value you copied above.
 ```
 ```nc:prompt from_address
-The bot's sending email address on your verified domain (e.g. `bot@yourdomain.com`).
+The bot's sending email address on your verified domain (e.g. `person12@fixture17.example.com`).
 ```
 ```nc:prompt from_name
 The display name to send as (e.g. `NanoClaw`).
@@ -142,7 +142,7 @@ explicitly.)
 ## Channel Info
 
 - **type**: `resend`
-- **terminology**: Resend handles email. The bot has one fixed sending identity (`RESEND_FROM_ADDRESS`, e.g. `bot@yourdomain.com`); every *external correspondent* the bot emails with is a separate conversation, keyed by *their* address.
+- **terminology**: Resend handles email. The bot has one fixed sending identity (`RESEND_FROM_ADDRESS`, e.g. `person12@fixture17.example.com`); every *external correspondent* the bot emails with is a separate conversation, keyed by *their* address.
 - **how-to-find-id**: The platform ID is the **correspondent's** email address, prefixed — `resend:<their-address>` (e.g. `resend:you@example.com`) — **not** the bot's from-address. The adapter derives it from the reply-to party (`channelIdFromThreadId` returns `resend:<address>`); each distinct email thread from that person (by root `Message-ID`) is a sub-conversation under it.
 - **supports-threads**: no (the adapter sets `supportsThreads: false`; replies still thread via email headers, but the router does not treat threads as the primary conversation unit)
 - **typical-use**: Async communication -- email conversations with longer response expectations

@@ -42,7 +42,7 @@ After three review cycles surfaced cascading complexity around operational scaff
 - Per-group `memory.recall_scope: 'self' | 'all-groups' | string[]` config; default `'self'`
 - Daemon-side fan-out (`FAN_OUT_CONCURRENCY=4`, `AbortController` per store, 1500ms per-store timeout)
 - RRF rerank (k=60) + recency multiplier as post-RRF tweak; `MEMORY_RECALL_RRF_RECENCY_BOOST` env var (default 0.1, 0 disables)
-- Operator manually flips axis-labs to `'all-groups'` after R1 ships and they want cross-pollination
+- Operator manually flips example-research to `'all-groups'` after R1 ships and they want cross-pollination
 - **No automatic circuit breaker.** Daemon writes `recall_quality.scope_quality_regression` to health.json if a group's cross-group recall regresses below its `self` baseline; operator sees this and flips the config manually.
 
 **Cross-cutting:**
@@ -67,7 +67,7 @@ After three review cycles surfaced cascading complexity around operational scaff
 
 | Cut | Why |
 |-----|-----|
-| Auto-revert + daemonRequestApproval | Single operator (Dave); manual flip on health.json signal is cheaper than infrastructure |
+| Auto-revert + daemonRequestApproval | Single operator (Operator); manual flip on health.json signal is cheaper than infrastructure |
 | Queue caps / daily limits / fairness | 100-500 events/day total; cost is $3-15/month; not a real budget pressure |
 | feedback_enabled=false complexity | Defaulting true at this scale is simpler than the disabled-row-semantics design that surfaced M3-6 |
 | Adversarial fixtures | Redactor already strips creds; one untrusted-data line in prompt is enough |
@@ -598,12 +598,12 @@ The strategy used (after fallback resolution) is what gets written to `recall_ou
 `MemoryConfig.recallScope?: 'self' | 'all-groups' | string[]`:
 - `'self'` (default): current behavior, single-store recall.
 - `'all-groups'`: fan out across all memory-enabled groups.
-- `string[]`: explicit allowlist of group folders (e.g., `['axie-dev', 'madison-reed']`).
+- `string[]`: explicit allowlist of group folders (e.g., `['example-dev', 'example-retail']`).
 
 `container.json` example:
 ```json
 {
-  "agentGroupId": "ag-axis-labs-...",
+  "agentGroupId": "ag-example-research-...",
   "memory": {
     "enabled": true,
     "recall_scope": "all-groups"
@@ -618,7 +618,7 @@ Modify `src/modules/memory/mnemon-impl.ts:MnemonStore.recall`:
 ```typescript
 async recall(agentGroupId, query, opts) {
   const scope = await resolveRecallScope(agentGroupId);
-  const targetStores = expandScope(scope);  // ['ag-axis-labs', ...]
+  const targetStores = expandScope(scope);  // ['ag-example-research', ...]
 
   // Concurrency cap (S2): with shared host Ollama serving embed sequentially
   // per-model, parallelizing 11+ stores doesn't help past ~4 concurrent calls.
@@ -694,7 +694,7 @@ function mergeAndRerank(perStoreResults, limit) {
 }
 ```
 
-**[ASSUMPTION A2] (revised):** RRF + recency multiplier produces better cross-group recall than z-score. Validation: when axis-labs flips to `all-groups`, monitor `recall_quality.useful_fact_rate_7d`. If it drops vs `self` baseline by >5pp, the algorithm is the suspect — alternatives: drop recency multiplier, tune k constant, learned reranker.
+**[ASSUMPTION A2] (revised):** RRF + recency multiplier produces better cross-group recall than z-score. Validation: when example-research flips to `all-groups`, monitor `recall_quality.useful_fact_rate_7d`. If it drops vs `self` baseline by >5pp, the algorithm is the suspect — alternatives: drop recency multiplier, tune k constant, learned reranker.
 
 #### 3.4 Circuit breaker — DM-approval-gated revert (M4 path 2)
 
@@ -838,11 +838,11 @@ No visual decisions in this design (server-side feature, no UI). Skipping.
 | # | Assumption | Impact if Wrong | How to Validate |
 |---|-----------|----------------|-----------------|
 | A1 | Judge prompt produces low grade-inflation AND is injection-resistant (revised cycle 1) | High — would invalidate the entire feedback signal | Within 30 days post-deploy: (a) sample 20 already-judged turns (5 per score bucket); require human-LLM Spearman ρ ≥ 0.7. (b) Run adversarial fact fixtures from eval-set; require 100% scored as 0. No phased rollout — judge is always-on from day 1 (M3 path 1). If either fails: prompt revision before any other deliverable ships. |
-| A2 | RRF (k=60) + linear recency multiplier produces better cross-group recall than per-store top-N (revised cycle 1, S1) | Medium — would degrade axis-labs cross-group recall quality | When axis-labs flips to `all-groups`, monitor `recall_quality.useful_fact_rate_7d`. If it drops vs `self` baseline by >5pp: first try `MEMORY_RECALL_RRF_RECENCY_BOOST=0` (S2-3) to test pure RRF; if still degraded, RRF itself is suspect. |
+| A2 | RRF (k=60) + linear recency multiplier produces better cross-group recall than per-store top-N (revised cycle 1, S1) | Medium — would degrade example-research cross-group recall quality | When example-research flips to `all-groups`, monitor `recall_quality.useful_fact_rate_7d`. If it drops vs `self` baseline by >5pp: first try `MEMORY_RECALL_RRF_RECENCY_BOOST=0` (S2-3) to test pure RRF; if still degraded, RRF itself is suspect. |
 | A3 | Cross-PROVIDER eval split (Codex GPT-5.5 synth, Anthropic Haiku 4.5 judge) is sufficient to prevent prior leakage (revised cycle 1, M5) | Medium — could inflate eval-set hit rates | Compare Strategy A absolute scores between synth-eval and hand-curated 20-entry set. Uniform offset (not just delta) is the leakage signal. If offset > 10pp, prior leakage exists despite cross-provider split — investigate. |
 | A4 | 60s daemon grace is enough for agent response to land in archive.db | Low — judge fires too early, no response found, retry logic handles it | Instrument `judgeRetryCount` per group via `recall_quality.judge_retry_p50_24h` field; if >0, consider increasing grace to 120s. |
 | A5 | 11-group volume produces enough events for stable per-group rank-distribution baselines (S2-1 default-false makes this slower) | Low-Medium — quiet groups have noisy baselines for the circuit breaker | Track `judged_count_total` per group; flag groups with <100 judged events when running scope-baseline computation; surface `baseline_n` in health.json so operator knows when baseline is statistically thin. |
-| A6 | Daemon-resolved session for `daemonRequestApproval` is acceptable for cross-group scope-revert approvals (cycle 2, M2-1) | Medium — operator might receive DM via a session that doesn't feel like the right context for "approve recall scope revert" | After axis-labs is flipped to `all-groups` and circuit breaker triggers, observe whether the resolved session DM lands in a usable place. If not, fallback option: route all daemon-originated approvals through a single dedicated "operator" session per agent group. |
+| A6 | Daemon-resolved session for `daemonRequestApproval` is acceptable for cross-group scope-revert approvals (cycle 2, M2-1) | Medium — operator might receive DM via a session that doesn't feel like the right context for "approve recall scope revert" | After example-research is flipped to `all-groups` and circuit breaker triggers, observe whether the resolved session DM lands in a usable place. If not, fallback option: route all daemon-originated approvals through a single dedicated "operator" session per agent group. |
 
 ---
 
@@ -868,7 +868,7 @@ No visual decisions in this design (server-side feature, no UI). Skipping.
 
 **Assumptions added:**
 - **A1:** Judge prompt produces low grade-inflation. Validation: human-LLM Spearman ρ ≥ 0.7 on 20-turn manual review during calibration.
-- **A2:** Z-score + linear recency rerank is reasonable. Validation: useful_fact_rate_7d on axis-labs after scope flip vs self-baseline.
+- **A2:** Z-score + linear recency rerank is reasonable. Validation: useful_fact_rate_7d on example-research after scope flip vs self-baseline.
 - **A3:** Sonnet synth + Haiku judge model split prevents prior leakage. Validation: Strategy A delta between synth-eval and hand-eval ≤ 10pp.
 - **A4:** 60s daemon grace is sufficient for response landing. Validation: median judgeRetryCount = 0.
 - **A5:** Per-group volume reaches 200 events for calibration in reasonable time. Validation: track judged_count_total; flag groups <200 after 30 days.

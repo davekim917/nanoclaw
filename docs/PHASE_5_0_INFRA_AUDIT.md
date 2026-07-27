@@ -1,6 +1,6 @@
 # Phase 5.0 — Container Surface-Area Audit (v1 → v2)
 
-**Status:** findings, 2026-04-18. Mandatory pre-cutover per Dave.
+**Status:** findings, 2026-04-18. Mandatory pre-cutover per Operator.
 
 ## Why this phase exists
 
@@ -91,7 +91,7 @@ index.js'`. v1 has a 142-line `entrypoint.sh` that does:
 
 | Feature | v1 | v2 |
 |---|---|---|
-| Per-group `tools` array → activates scoped env for matching CLIs (e.g. `"tools":["github:illysium","render:sunday","snowflake:apollo"]`) | `ContainerConfig.tools` + `readSecrets()` resolves scoped env keys | Missing. `githubTokenEnv` covers GitHub only. |
+| Per-group `tools` array → activates scoped env for matching CLIs (e.g. `"tools":["github:example-labs","render:archive-one","snowflake:example-data"]`) | `ContainerConfig.tools` + `readSecrets()` resolves scoped env keys | Missing. `githubTokenEnv` covers GitHub only. |
 | Per-group `excludePlugins` deny list | Yes | Missing |
 | `gitnexusInjectAgentsMd` flag on group config | Yes (drives entrypoint env) | Missing |
 
@@ -107,7 +107,7 @@ Ordered by dependency and priority:
 6. **5.0-F: per-tool scoped env helper** — generalize `resolveGitHubToken()` into `resolveScopedEnv(var, folder, toolsArray)` handling GitHub + Render + Snowflake + dbt + AWS + gcloud. Honor `tools` field on container.json.
 7. **5.0-G: env forwarding** — `RESIDENTIAL_PROXY_URL`, `CLAUDE_PLUGINS_ROOT`, `OLLAMA_ADMIN_TOOLS`, `GITNEXUS_INJECT_AGENTS_MD` based on flags in container.json (or the existing env).
 
-Each can ship as its own commit. Validate by spawning an illie-v2
+Each can ship as its own commit. Validate by spawning an helper-v2
 container and confirming the agent can:
 - Call `gws accounts list` (proves gws creds + wrapper)
 - Call `snow sql -q "select 1"` (proves Snowflake mount)
@@ -130,8 +130,8 @@ separately.
 
 ## Acceptance criteria
 
-Phase 5.0 is done when an illie-v2 container, at spawn, has
-**everything the equivalent v1 illysium container has in terms of:**
+Phase 5.0 is done when an helper-v2 container, at spawn, has
+**everything the equivalent v1 example-labs container has in terms of:**
 mounted paths, env vars, entrypoint-side initialization. Verified by a
 side-by-side diff of `docker inspect <ct>` (env + mounts) for a v1 and
 v2 container wired identically.

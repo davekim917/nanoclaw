@@ -80,7 +80,7 @@ v2 auto-creates a `users` row for every sender it sees (via `extractAndUpsertUse
 - **Telegram**: `telegram:<numeric_user_id>` (e.g. `telegram:6037840640`)
 - **Discord**: `discord:<snowflake_user_id>` (e.g. `discord:123456789012345678`)
 - **WhatsApp**: `whatsapp:<phone>@s.whatsapp.net` (e.g. `whatsapp:14155551234@s.whatsapp.net`)
-- **Slack**: `slack:<user_id>` (e.g. `slack:U04ABCDEF`)
+- **Slack**: `slack:<user_id>` (e.g. `slack:UTEST00003`)
 - **Others**: `<channel_type>:<platform_id>`
 
 **Steps:**

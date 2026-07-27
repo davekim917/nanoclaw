@@ -12,11 +12,11 @@ current worktree changes. On the host, select an agent group; the service maps
 it to the trusted workgroup boundary:
 
 ```bash
-ncl graphify query --query "What decisions shaped retention?" --group madison-reed
-ncl graphify path --from "retention requirements" --to "customer_ltv.sql" --group madison-reed
-ncl graphify explain --node "customer_ltv" --group madison-reed
-ncl graphify affected --node "authorizeRequest" --group axie-dev
-ncl graphify status --group madison-reed
+ncl graphify query --query "What decisions shaped retention?" --group example-retail
+ncl graphify path --from "retention requirements" --to "customer_ltv.sql" --group example-retail
+ncl graphify explain --node "customer_ltv" --group example-retail
+ncl graphify affected --node "authorizeRequest" --group example-dev
+ncl graphify status --group example-retail
 ```
 
 Use the smallest useful read, then open the cited file or conversation

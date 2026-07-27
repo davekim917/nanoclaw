@@ -83,26 +83,26 @@ describe('Discord recovery target discovery', () => {
 
 describe('resolveDiscordMentions', () => {
   const bots = new Map<string, DiscordBotIdentity>([
-    ['discord', { userId: '1111111111', username: 'Axie' }],
-    ['discord-axie-codex', { userId: '2222222222', username: 'Axie-Codex' }],
+    ['discord', { userId: '1111111111', username: 'Atlas' }],
+    ['discord-atlas-codex', { userId: '2222222222', username: 'Atlas-Codex' }],
   ]);
 
   it('returns text unchanged when no bots are registered', () => {
-    expect(resolveDiscordMentions('@Axie hello', new Map())).toBe('@Axie hello');
+    expect(resolveDiscordMentions('@Atlas hello', new Map())).toBe('@Atlas hello');
   });
 
   it('rewrites a known username to a real mention', () => {
-    expect(resolveDiscordMentions('@Axie hello', bots)).toBe('<@1111111111> hello');
+    expect(resolveDiscordMentions('@Atlas hello', bots)).toBe('<@1111111111> hello');
   });
 
   it('rewrites case-insensitively', () => {
-    expect(resolveDiscordMentions('@AXIE hello', bots)).toBe('<@1111111111> hello');
-    expect(resolveDiscordMentions('@axie hello', bots)).toBe('<@1111111111> hello');
+    expect(resolveDiscordMentions('@ATLAS hello', bots)).toBe('<@1111111111> hello');
+    expect(resolveDiscordMentions('@atlas hello', bots)).toBe('<@1111111111> hello');
   });
 
   it('handles usernames with dashes', () => {
-    // The bug we are fixing — Axie-Codex would not resolve in the screenshot.
-    expect(resolveDiscordMentions('@Axie-Codex take the next verse', bots)).toBe('<@2222222222> take the next verse');
+    // The bug we are fixing — Atlas-Codex would not resolve in the screenshot.
+    expect(resolveDiscordMentions('@Atlas-Codex take the next verse', bots)).toBe('<@2222222222> take the next verse');
   });
 
   it('leaves unknown usernames as plain text', () => {
@@ -116,28 +116,28 @@ describe('resolveDiscordMentions', () => {
   // peer-handoff behavior.
   describe('separator-normalized fallback', () => {
     const mismatchBots = new Map<string, DiscordBotIdentity>([
-      ['discord', { userId: '1111', username: 'axie' }],
-      ['discord-axie-codex', { userId: '2222', username: 'axiecodex' }],
+      ['discord', { userId: '1111', username: 'atlas' }],
+      ['discord-atlas-codex', { userId: '2222', username: 'atlascodex' }],
     ]);
 
-    it('rewrites `@Axie-Codex` when Discord handle is `axiecodex` (separators stripped)', () => {
-      expect(resolveDiscordMentions('@Axie-Codex hello', mismatchBots)).toBe('<@2222> hello');
+    it('rewrites `@Atlas-Codex` when Discord handle is `atlascodex` (separators stripped)', () => {
+      expect(resolveDiscordMentions('@Atlas-Codex hello', mismatchBots)).toBe('<@2222> hello');
     });
 
-    it('rewrites `@axie_codex` (underscore variant) against `axiecodex`', () => {
-      expect(resolveDiscordMentions('@axie_codex hello', mismatchBots)).toBe('<@2222> hello');
+    it('rewrites `@atlas_codex` (underscore variant) against `atlascodex`', () => {
+      expect(resolveDiscordMentions('@atlas_codex hello', mismatchBots)).toBe('<@2222> hello');
     });
 
     it('preserves literal-first priority on normalized collision', () => {
-      // `axie-codex` and `axiecodex` both registered — literal owns its
-      // own slot; the normalized form of `axie-codex` (= `axiecodex`)
-      // does NOT clobber `axiecodex`'s literal entry.
+      // `atlas-codex` and `atlascodex` both registered — literal owns its
+      // own slot; the normalized form of `atlas-codex` (= `atlascodex`)
+      // does NOT clobber `atlascodex`'s literal entry.
       const collisionBots = new Map<string, DiscordBotIdentity>([
-        ['discord-a', { userId: '1', username: 'axie-codex' }],
-        ['discord-b', { userId: '2', username: 'axiecodex' }],
+        ['discord-a', { userId: '1', username: 'atlas-codex' }],
+        ['discord-b', { userId: '2', username: 'atlascodex' }],
       ]);
-      expect(resolveDiscordMentions('@axie-codex hi', collisionBots)).toBe('<@1> hi');
-      expect(resolveDiscordMentions('@axiecodex hi', collisionBots)).toBe('<@2> hi');
+      expect(resolveDiscordMentions('@atlas-codex hi', collisionBots)).toBe('<@1> hi');
+      expect(resolveDiscordMentions('@atlascodex hi', collisionBots)).toBe('<@2> hi');
     });
   });
 
@@ -151,53 +151,55 @@ describe('resolveDiscordMentions', () => {
 
   it('preserves code regions verbatim', () => {
     // Mentions inside fenced or inline code must not be rewritten — a
-    // documentation example like "use `@Axie hello`" would otherwise rewrite
+    // documentation example like "use `@Atlas hello`" would otherwise rewrite
     // mid-code.
-    expect(resolveDiscordMentions('Inline: `@Axie hello`', bots)).toBe('Inline: `@Axie hello`');
-    expect(resolveDiscordMentions('```\n@Axie hello\n```', bots)).toBe('```\n@Axie hello\n```');
+    expect(resolveDiscordMentions('Inline: `@Atlas hello`', bots)).toBe('Inline: `@Atlas hello`');
+    expect(resolveDiscordMentions('```\n@Atlas hello\n```', bots)).toBe('```\n@Atlas hello\n```');
   });
 
   it('rewrites multiple distinct mentions in one message', () => {
-    expect(resolveDiscordMentions('@Axie and @Axie-Codex collab', bots)).toBe('<@1111111111> and <@2222222222> collab');
+    expect(resolveDiscordMentions('@Atlas and @Atlas-Codex collab', bots)).toBe(
+      '<@1111111111> and <@2222222222> collab',
+    );
   });
 
   it('handles `@username` at end-of-string with no trailing whitespace', () => {
-    expect(resolveDiscordMentions('over to @Axie-Codex', bots)).toBe('over to <@2222222222>');
+    expect(resolveDiscordMentions('over to @Atlas-Codex', bots)).toBe('over to <@2222222222>');
   });
 
   it('handles trailing sentence punctuation without gobbling it into the capture', () => {
     // This was the bug from the 5/17 roasting thread: the original `[\w.-]+`
-    // greedily included the trailing period, so `@Axie-Codex.` looked up
-    // `axie-codex.` and missed. The downstream chat-sdk adapter then split
-    // on the dash via its `/@(\w+)/g` pass and rendered `<@Axie>-Codex.`.
+    // greedily included the trailing period, so `@Atlas-Codex.` looked up
+    // `atlas-codex.` and missed. The downstream chat-sdk adapter then split
+    // on the dash via its `/@(\w+)/g` pass and rendered `<@Atlas>-Codex.`.
     // The new `[\w-]+(?:\.[\w-]+)*` pattern stops at sentence punctuation.
-    expect(resolveDiscordMentions('Your turn, @Axie-Codex.', bots)).toBe('Your turn, <@2222222222>.');
-    expect(resolveDiscordMentions('hey @Axie-Codex, ready?', bots)).toBe('hey <@2222222222>, ready?');
-    expect(resolveDiscordMentions('@Axie-Codex!', bots)).toBe('<@2222222222>!');
-    expect(resolveDiscordMentions('@Axie-Codex?', bots)).toBe('<@2222222222>?');
-    expect(resolveDiscordMentions('(over to @Axie-Codex)', bots)).toBe('(over to <@2222222222>)');
-    expect(resolveDiscordMentions('@Axie-Codex: take it', bots)).toBe('<@2222222222>: take it');
-    expect(resolveDiscordMentions('@Axie-Codex; next', bots)).toBe('<@2222222222>; next');
+    expect(resolveDiscordMentions('Your turn, @Atlas-Codex.', bots)).toBe('Your turn, <@2222222222>.');
+    expect(resolveDiscordMentions('hey @Atlas-Codex, ready?', bots)).toBe('hey <@2222222222>, ready?');
+    expect(resolveDiscordMentions('@Atlas-Codex!', bots)).toBe('<@2222222222>!');
+    expect(resolveDiscordMentions('@Atlas-Codex?', bots)).toBe('<@2222222222>?');
+    expect(resolveDiscordMentions('(over to @Atlas-Codex)', bots)).toBe('(over to <@2222222222>)');
+    expect(resolveDiscordMentions('@Atlas-Codex: take it', bots)).toBe('<@2222222222>: take it');
+    expect(resolveDiscordMentions('@Atlas-Codex; next', bots)).toBe('<@2222222222>; next');
   });
 
   it('still resolves dotted usernames (Discord post-2023 `user.name` form)', () => {
     // The new regex permits `.suffix` segments so `@user.name` still resolves.
     // Verifies the trailing-punctuation fix didn't regress legal dot-in-username.
-    const dotBots = new Map<string, DiscordBotIdentity>([['discord', { userId: '3333333333', username: 'axie.bot' }]]);
-    expect(resolveDiscordMentions('@axie.bot hi', dotBots)).toBe('<@3333333333> hi');
-    expect(resolveDiscordMentions('@axie.bot.', dotBots)).toBe('<@3333333333>.');
-    expect(resolveDiscordMentions('hi @axie.bot, ready?', dotBots)).toBe('hi <@3333333333>, ready?');
+    const dotBots = new Map<string, DiscordBotIdentity>([['discord', { userId: '3333333333', username: 'atlas.bot' }]]);
+    expect(resolveDiscordMentions('@atlas.bot hi', dotBots)).toBe('<@3333333333> hi');
+    expect(resolveDiscordMentions('@atlas.bot.', dotBots)).toBe('<@3333333333>.');
+    expect(resolveDiscordMentions('hi @atlas.bot, ready?', dotBots)).toBe('hi <@3333333333>, ready?');
   });
 
   it('rewrites the bracketed-by-name form `<@Name>` agents sometimes emit', () => {
-    // Field-observed bug: agents wrote `<@Axie-Codex>` literally (they
+    // Field-observed bug: agents wrote `<@Atlas-Codex>` literally (they
     // generalize the Slack `<@U123>` template but substitute the username
     // instead of the snowflake). Discord renders this as text since the
     // body isn't a valid id. The rewriter has to be tolerant of this form
     // or sibling handoffs silently break in chat even with the bot filter
     // and outbound rewriter both shipping.
-    expect(resolveDiscordMentions('<@Axie-Codex> your turn.', bots)).toBe('<@2222222222> your turn.');
-    expect(resolveDiscordMentions('Your turn, <@Axie-Codex> — take it.', bots)).toBe(
+    expect(resolveDiscordMentions('<@Atlas-Codex> your turn.', bots)).toBe('<@2222222222> your turn.');
+    expect(resolveDiscordMentions('Your turn, <@Atlas-Codex> — take it.', bots)).toBe(
       'Your turn, <@2222222222> — take it.',
     );
   });
@@ -225,16 +227,16 @@ describe('resolveDiscordMentions', () => {
 
   it('does not corrupt URLs containing a sibling bot name in the path', () => {
     // Lookbehind tightening: `(?<![\w/:])`. The bare-mention pass used to
-    // see `@Axie-Codex` after a path `/` and rewrite the URL into
+    // see `@Atlas-Codex` after a path `/` and rewrite the URL into
     // `https://example.com/<@SNOWFLAKE>`, breaking link rendering. The
     // tightened lookbehind keeps URL paths intact.
-    const bots = new Map<string, DiscordBotIdentity>([['discord', { userId: '2222222222', username: 'Axie-Codex' }]]);
-    expect(resolveDiscordMentions('https://example.com/@Axie-Codex/diff', bots)).toBe(
-      'https://example.com/@Axie-Codex/diff',
+    const bots = new Map<string, DiscordBotIdentity>([['discord', { userId: '2222222222', username: 'Atlas-Codex' }]]);
+    expect(resolveDiscordMentions('https://example.com/@Atlas-Codex/diff', bots)).toBe(
+      'https://example.com/@Atlas-Codex/diff',
     );
-    expect(resolveDiscordMentions('see notes/users/@Axie-Codex.md', bots)).toBe('see notes/users/@Axie-Codex.md');
+    expect(resolveDiscordMentions('see notes/users/@Atlas-Codex.md', bots)).toBe('see notes/users/@Atlas-Codex.md');
     // Real mention right after a URL still works.
-    expect(resolveDiscordMentions('https://example.com — over to @Axie-Codex', bots)).toBe(
+    expect(resolveDiscordMentions('https://example.com — over to @Atlas-Codex', bots)).toBe(
       'https://example.com — over to <@2222222222>',
     );
   });
@@ -257,13 +259,13 @@ describe('end-to-end: resolveDiscordMentions → installed chat-sdk adapter rend
   //
   // Both halves of the fix are exercised:
   //   (a) the new `[\w-]+(?:\.[\w-]+)*` regex stops at trailing punctuation,
-  //       so `@Axie-Codex.` is resolved instead of slipping through.
+  //       so `@Atlas-Codex.` is resolved instead of slipping through.
   //   (b) the patched `convertMentionsToDiscord` / `nodeToDiscordMarkdown`
   //       use `(?<!<)@(\w+)` so the already-resolved `<@SNOWFLAKE>` is not
   //       double-wrapped.
   const bots = new Map<string, DiscordBotIdentity>([
-    ['discord', { userId: '1478986205319135302', username: 'Axie' }],
-    ['discord-axie-codex', { userId: '1505246118940770375', username: 'Axie-Codex' }],
+    ['discord', { userId: '123456789000000001', username: 'Atlas' }],
+    ['discord-atlas-codex', { userId: '123456789000000015', username: 'Atlas-Codex' }],
   ]);
 
   function deliver(agentRawText: string): string {
@@ -274,26 +276,26 @@ describe('end-to-end: resolveDiscordMentions → installed chat-sdk adapter rend
 
   it('produces a clean `<@SNOWFLAKE>` on the wire for `@bot-name.` (sentence-ending)', () => {
     // The exact text from the failed 5/17 thread.
-    expect(deliver('Your turn, @Axie-Codex. Try to keep up.')).toBe(
-      'Your turn, <@1505246118940770375>. Try to keep up.',
+    expect(deliver('Your turn, @Atlas-Codex. Try to keep up.')).toBe(
+      'Your turn, <@123456789000000015>. Try to keep up.',
     );
   });
 
   it('produces a clean `<@SNOWFLAKE>` for `@bot-name` followed by space', () => {
-    expect(deliver('I’ll hold my fire. @Axie has first swing.')).toBe(
-      'I’ll hold my fire. <@1478986205319135302> has first swing.',
+    expect(deliver('I’ll hold my fire. @Atlas has first swing.')).toBe(
+      'I’ll hold my fire. <@123456789000000001> has first swing.',
     );
   });
 
   it('handles the bracketed-by-name form agents sometimes emit (`<@Name>`)', () => {
-    expect(deliver('<@Axie-Codex> your turn.')).toBe('<@1505246118940770375> your turn.');
+    expect(deliver('<@Atlas-Codex> your turn.')).toBe('<@123456789000000015> your turn.');
   });
 
   it('does NOT double-wrap a pre-resolved `<@SNOWFLAKE>` (the bug the patch fixes)', () => {
     // Sanity: even if our rewriter produces `<@id>` on its first pass, the
     // installed adapter must not re-wrap to `<<@id>>` on its way to Discord.
     // Without the lookbehind patch, this assertion fails.
-    expect(deliver('hey <@1478986205319135302>')).toBe('hey <@1478986205319135302>');
+    expect(deliver('hey <@123456789000000001>')).toBe('hey <@123456789000000001>');
   });
 
   it('passes through messages with no mention untouched', () => {
@@ -301,8 +303,8 @@ describe('end-to-end: resolveDiscordMentions → installed chat-sdk adapter rend
   });
 
   it('handles multiple mentions in one message with mixed punctuation', () => {
-    expect(deliver('OK @Axie, you go first; @Axie-Codex, you follow.')).toBe(
-      'OK <@1478986205319135302>, you go first; <@1505246118940770375>, you follow.',
+    expect(deliver('OK @Atlas, you go first; @Atlas-Codex, you follow.')).toBe(
+      'OK <@123456789000000001>, you go first; <@123456789000000015>, you follow.',
     );
   });
 });
@@ -325,44 +327,46 @@ describe('getDiscordBotDisplayName', () => {
 
 describe('resolveIncomingDiscordMentions', () => {
   const bots = new Map<string, DiscordBotIdentity>([
-    ['discord', { userId: '1478986205319135302', username: 'Axie' }],
-    ['discord-axie-codex', { userId: '1505246118940770375', username: 'Axie-Codex' }],
+    ['discord', { userId: '123456789000000001', username: 'Atlas' }],
+    ['discord-atlas-codex', { userId: '123456789000000015', username: 'Atlas-Codex' }],
   ]);
 
   it('returns text unchanged when no bots are registered', () => {
     // Without a bot registry the resolver has nothing to look up. Don't
     // mangle the message — the agent will see raw IDs which is no worse
     // than today.
-    expect(resolveIncomingDiscordMentions('<@1478986205319135302> hi', new Map())).toBe('<@1478986205319135302> hi');
+    expect(resolveIncomingDiscordMentions('<@123456789000000001> hi', new Map())).toBe('<@123456789000000001> hi');
   });
 
   it('rewrites a known bot snowflake to `@username`', () => {
-    expect(resolveIncomingDiscordMentions('<@1478986205319135302> take this', bots)).toBe('@Axie take this');
+    expect(resolveIncomingDiscordMentions('<@123456789000000001> take this', bots)).toBe('@Atlas take this');
   });
 
   it('rewrites the nickname-mention form `<@!id>`', () => {
     // Some Discord clients still emit the legacy nickname-mention form when
     // the mentioned user has a server-specific nickname. Same target user,
     // same resolution.
-    expect(resolveIncomingDiscordMentions('<@!1478986205319135302> take this', bots)).toBe('@Axie take this');
+    expect(resolveIncomingDiscordMentions('<@!123456789000000001> take this', bots)).toBe('@Atlas take this');
   });
 
   it('rewrites multiple bot mentions in one message', () => {
-    // The exact wire form from the field bug: Dave wrote
-    // `@Axie-Codex @Axie take turns roasting me. @Axie go first`
+    // The exact wire form from the field bug: Operator wrote
+    // `@Atlas-Codex @Atlas take turns roasting me. @Atlas go first`
     // which Discord delivered as raw snowflakes. Without this resolver
-    // Axie had no way to know its peer was called "Axie-Codex" and
+    // Atlas had no way to know its peer was called "Atlas-Codex" and
     // resorted to `<@sibling>`.
-    const raw = '<@1505246118940770375> <@1478986205319135302> take turns roasting me. <@1478986205319135302> go first';
-    expect(resolveIncomingDiscordMentions(raw, bots)).toBe('@Axie-Codex @Axie take turns roasting me. @Axie go first');
+    const raw = '<@123456789000000015> <@123456789000000001> take turns roasting me. <@123456789000000001> go first';
+    expect(resolveIncomingDiscordMentions(raw, bots)).toBe(
+      '@Atlas-Codex @Atlas take turns roasting me. @Atlas go first',
+    );
   });
 
   it('leaves unknown snowflakes unchanged', () => {
     // Human users and out-of-process bots aren't in the registry. Fail
     // soft — the agent reads sender info from author metadata, not from
     // inline mentions of humans.
-    expect(resolveIncomingDiscordMentions('<@608746260706361344> hello bots', bots)).toBe(
-      '<@608746260706361344> hello bots',
+    expect(resolveIncomingDiscordMentions('<@123456789000000019> hello bots', bots)).toBe(
+      '<@123456789000000019> hello bots',
     );
   });
 
@@ -377,11 +381,11 @@ describe('resolveIncomingDiscordMentions', () => {
     // The whole point: inbound `<@id>` → `@username`, agent writes
     // `@username`, outbound `@username` → `<@id>`. End-to-end the wire
     // form is preserved while the agent only ever handles names.
-    const inboundRaw = '<@1505246118940770375> please review';
+    const inboundRaw = '<@123456789000000015> please review';
     const agentSees = resolveIncomingDiscordMentions(inboundRaw, bots);
-    expect(agentSees).toBe('@Axie-Codex please review');
+    expect(agentSees).toBe('@Atlas-Codex please review');
     const agentReplies = `Sure, ${agentSees.split(' ').slice(0, 1)[0]} — on it`;
-    expect(resolveDiscordMentions(agentReplies, bots)).toBe('Sure, <@1505246118940770375> — on it');
+    expect(resolveDiscordMentions(agentReplies, bots)).toBe('Sure, <@123456789000000015> — on it');
   });
 
   it('preserves code regions verbatim (mirrors outbound)', () => {
@@ -389,11 +393,11 @@ describe('resolveIncomingDiscordMentions', () => {
     // fence or inline code, the resolver must not "helpfully" rewrite
     // the snowflake — the user put it in code on purpose. The exact
     // string they typed is what the agent should see.
-    expect(resolveIncomingDiscordMentions('Inline: `payload: <@1478986205319135302>`', bots)).toBe(
-      'Inline: `payload: <@1478986205319135302>`',
+    expect(resolveIncomingDiscordMentions('Inline: `payload: <@123456789000000001>`', bots)).toBe(
+      'Inline: `payload: <@123456789000000001>`',
     );
-    expect(resolveIncomingDiscordMentions('```\nlog: <@1478986205319135302> arrived\n```', bots)).toBe(
-      '```\nlog: <@1478986205319135302> arrived\n```',
+    expect(resolveIncomingDiscordMentions('```\nlog: <@123456789000000001> arrived\n```', bots)).toBe(
+      '```\nlog: <@123456789000000001> arrived\n```',
     );
   });
 
@@ -402,9 +406,9 @@ describe('resolveIncomingDiscordMentions', () => {
     // should not. Confirms code-region protection is scoped to the protected
     // regions and not a blanket pass-through.
     const input =
-      'Hey <@1505246118940770375>, here is the raw event:\n```\nevent: { user: "<@1478986205319135302>" }\n```';
+      'Hey <@123456789000000015>, here is the raw event:\n```\nevent: { user: "<@123456789000000001>" }\n```';
     expect(resolveIncomingDiscordMentions(input, bots)).toBe(
-      'Hey @Axie-Codex, here is the raw event:\n```\nevent: { user: "<@1478986205319135302>" }\n```',
+      'Hey @Atlas-Codex, here is the raw event:\n```\nevent: { user: "<@123456789000000001>" }\n```',
     );
   });
 });
@@ -442,10 +446,10 @@ describe('parseDiscordWorkspaces', () => {
 
   it('registers suffixed workspaces as channelType "discord-<suffix>" (lowercased)', () => {
     const ws = parseDiscordWorkspaces({
-      DISCORD_BOT_TOKEN_AXIE: 'tok-axie',
+      DISCORD_BOT_TOKEN_ATLAS: 'tok-atlas',
       DISCORD_BOT_TOKEN_CODEX: 'tok-codex',
     });
-    expect(ws.map((w) => w.channelType).sort()).toEqual(['discord-axie', 'discord-codex']);
+    expect(ws.map((w) => w.channelType).sort()).toEqual(['discord-atlas', 'discord-codex']);
   });
 
   it('registers primary and suffixed workspaces together', () => {
@@ -472,13 +476,13 @@ describe('parseDiscordWorkspaces', () => {
     // channelType uses `-` to match the existing dash-separated convention.
     // channel-auto-wire's `-` → `_` reverse mapping makes this round-trip safe.
     const ws = parseDiscordWorkspaces({
-      DISCORD_BOT_TOKEN_AXIE_CODEX: 'tok-codex',
-      DISCORD_PUBLIC_KEY_AXIE_CODEX: 'pk-codex',
-      DISCORD_APPLICATION_ID_AXIE_CODEX: 'app-codex',
+      DISCORD_BOT_TOKEN_ATLAS_CODEX: 'tok-codex',
+      DISCORD_PUBLIC_KEY_ATLAS_CODEX: 'pk-codex',
+      DISCORD_APPLICATION_ID_ATLAS_CODEX: 'app-codex',
     });
     expect(ws).toEqual([
       {
-        channelType: 'discord-axie-codex',
+        channelType: 'discord-atlas-codex',
         botToken: 'tok-codex',
         publicKey: 'pk-codex',
         applicationId: 'app-codex',
@@ -575,7 +579,7 @@ describe('isUserMessage (Discord inbound filter)', () => {
 
 describe('extractDiscordChannelId', () => {
   it('test_extract_channel_id_from_canonical_platform_id', () => {
-    expect(extractDiscordChannelId('discord:1148697867268497441:1149005423567294624')).toBe('1149005423567294624');
+    expect(extractDiscordChannelId('discord:123456789000000001:123456789000000002')).toBe('123456789000000002');
   });
 
   it('test_extract_channel_id_when_thread_segment_present', () => {
@@ -603,9 +607,9 @@ describe('discordPostParent', () => {
     // REST API needs the bare channel id or it 404s.
     const post = vi.fn().mockResolvedValue({ id: 'msg-1' });
     const mockRest: DiscordRestClient = { post };
-    await discordPostParent(mockRest, 'discord:guildA:1149005423567294624', 'spawned');
+    await discordPostParent(mockRest, 'discord:guildA:123456789000000002', 'spawned');
     const route = post.mock.calls[0][0] as string;
-    expect(route).toContain('/channels/1149005423567294624/messages');
+    expect(route).toContain('/channels/123456789000000002/messages');
     expect(route).not.toContain('discord:');
   });
 });
@@ -631,9 +635,9 @@ describe('discordCreateThread', () => {
   it('test_create_thread_strips_discord_prefix_before_routes_call', async () => {
     const postSpy = vi.fn().mockResolvedValueOnce({ id: 'thread-id' }).mockResolvedValueOnce({ id: 'first-msg' });
     const mockRest: DiscordRestClient = { post: postSpy };
-    await discordCreateThread(mockRest, 'discord:guildA:1149005423567294624', 'parent-msg', 'T', 'first');
+    await discordCreateThread(mockRest, 'discord:guildA:123456789000000002', 'parent-msg', 'T', 'first');
     const route = postSpy.mock.calls[0][0] as string;
-    expect(route).toContain('/channels/1149005423567294624/messages/parent-msg/threads');
+    expect(route).toContain('/channels/123456789000000002/messages/parent-msg/threads');
     expect(route).not.toContain('discord:');
   });
 });

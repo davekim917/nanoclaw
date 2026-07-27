@@ -318,7 +318,7 @@ export function verifyFixtureInImage(image: string, fixtureRootInput: URL | stri
     materializeGeneration(fixtureRoot, repositoryRoot, groundTruth.generations[0]);
     for (const args of [
       ['init', '-q'],
-      ['config', 'user.email', 'graphify-fixture@nanoclaw.invalid'],
+      ['config', 'user.email', 'person16@fixture13.example.com'],
       ['config', 'user.name', 'NanoClaw Graphify Fixture'],
       ['add', 'src', 'dataset.json'],
       ['commit', '-qm', 'graphify evaluation fixture'],

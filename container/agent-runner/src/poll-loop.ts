@@ -1679,7 +1679,7 @@ export function dispatchResultText(
     const dest = findByName(toName);
     if (!dest) {
       // Recovery: the agent addressed a PEER (sibling) as a destination — a
-      // common mistake, esp. opencode (observed: `<message to="Axie-Codex">`
+      // common mistake, esp. opencode (observed: `<message to="Example Agent-Codex">`
       // dropped). Peers aren't destinations; you reach them by @-mentioning in
       // the body of a channel message. Convert it: route the body to the
       // conversation's ORIGIN channel with `@<peer>` ensured in the body, so the

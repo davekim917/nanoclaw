@@ -847,7 +847,7 @@ export function registerContainerCodexPlugins(
  * `humanizer`, `impeccable`, etc. visible to Codex sessions.
  *
  * Called unconditionally from agent-runner startup — needed for BOTH
- * codex-primary (illie-codex) and codex-as-peer (illie running the codex
+ * codex-primary (helper-codex) and codex-as-peer (helper running the codex
  * companion script). Idempotent: `syncDiscoveredSkillSymlinks` reconciles
  * existing entries (creates/removes/leaves as appropriate).
  */

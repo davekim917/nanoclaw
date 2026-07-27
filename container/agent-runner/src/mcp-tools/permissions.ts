@@ -10,7 +10,7 @@
  * `src/modules/permissions/grant.ts` for the host half.
  *
  * Target resolution. `user` accepts three shapes:
- *   - Already-namespaced id: `slack-illysium:U12345`, `discord:602…`
+ *   - Already-namespaced id: `slack-example-labs:U12345`, `discord:602…`
  *   - Platform mention as it appears in chat: `<@U12345>` (Slack),
  *     `<@602…>` (Discord) — the leading `<@` and trailing `>` are
  *     stripped and the current session's channel_type is prepended.
@@ -58,7 +58,7 @@ export const grantAccessTool: McpToolDefinition = {
         user: {
           type: 'string',
           description:
-            'Target user. Accepts a namespaced id (`slack-illysium:U123`), a platform mention (`<@U123>`), or a bare platform id. Mentions and bare ids are resolved against the current session\'s channel_type.',
+            'Target user. Accepts a namespaced id (`slack-example-labs:U123`), a platform mention (`<@U123>`), or a bare platform id. Mentions and bare ids are resolved against the current session\'s channel_type.',
         },
         role: {
           type: 'string',

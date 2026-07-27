@@ -107,7 +107,7 @@ export interface SessionServicesSnapshot {
     mcpNamespace?: string;
     /** Tool names in container.json.tools that imply this service. */
     declaredTools: string[];
-    /** Scope names parsed from tool entries (e.g. ['illysium','support-illysium']). */
+    /** Scope names parsed from tool entries (e.g. ['example-labs','support-example-labs']). */
     scopes: string[];
     /** What files / paths the container sees. Container path, not host path. */
     credentialPaths: string[];
@@ -178,6 +178,8 @@ const SCOPED_ENV_NAMES = [
   'LOOKER_BASE_URL',
   'LOOKER_CLIENT_ID',
   'LOOKER_CLIENT_SECRET',
+  'ATLASSIAN_BASE_URL',
+  'SELECT_ORGANIZATION_ID',
 ];
 
 function listHostPlugins(): string[] {
@@ -250,12 +252,12 @@ export function buildSessionServicesSnapshot(
   const cfg = ag ? readContainerConfig(ag.folder) : undefined;
   // Env-scoped services (Looker, dbt-mcp, dbt Cloud, GitHub, Render) resolve
   // their host creds by FOLDER via resolveScopedEnvVar. Sibling groups (e.g.
-  // madison-reed-codex) set `credentialFolder` to the seed folder so they
+  // example-retail-codex) set `credentialFolder` to the seed folder so they
   // share the seed's scoped creds, and the real MCP wiring keys on
   // credentialFolder too (container-runner resolveScopedEnv). The snapshot
-  // MUST use the same folder, or it looks for LOOKER_*_MADISON_REED_CODEX
+  // MUST use the same folder, or it looks for LOOKER_*_EXAMPLE_RETAIL_CODEX
   // (which never exists), falls through to unscoped, and falsely reports
-  // "credentials missing — Ask Dave" for every sibling.
+  // "credentials missing — Ask Operator" for every sibling.
   const folder = cfg?.credentialFolder ?? ag?.folder ?? '';
   const tools = cfg?.tools;
   const excludedMcpServers = new Set(cfg?.excludeMcpServers ?? []);
@@ -421,7 +423,7 @@ export function buildSessionServicesSnapshot(
           ? `\`gh\` and \`git\` both pre-authenticated via \`GITHUB_TOKEN\` (resolved from host env \`${resolved.name}\`)${
               allowedOrgs.set ? `, restricted to orgs: \`${process.env[allowedOrgs.name]}\`` : ''
             }. \`gh repo view\`, \`gh pr create\`, \`git push\` all work directly. DO NOT run \`gh auth login\`. DO NOT ask the user for a token — it's already in your env.`
-          : `GitHub tool declared but no token set at host env ${tokenEnvName ?? 'GITHUB_TOKEN_<folder>'} or fallback GITHUB_TOKEN — ask Dave.`,
+          : `GitHub tool declared but no token set at host env ${tokenEnvName ?? 'GITHUB_TOKEN_<folder>'} or fallback GITHUB_TOKEN — ask Operator.`,
       });
     }
   }
@@ -449,7 +451,7 @@ export function buildSessionServicesSnapshot(
         credentialPaths: [],
         activation: apiKey.set
           ? `\`render\` CLI authenticated via \`RENDER_API_KEY\` (from host env \`${apiKey.name}\`${workspace.set ? `, workspace via \`${workspace.name}\`` : ''}). Common: \`render services -o json\`, \`render logs --service-id <id>\`, \`render psql --service-id <pg-id>\`.${scopedDbEnv.length > 0 ? ` Scoped DB URLs also injected as env vars: ${scopedDbEnv.join(', ')}.` : ''} DO NOT ask the user for the API key — it's already in your env.`
-          : `render tool declared but RENDER_API_KEY not set at host — ask Dave.`,
+          : `render tool declared but RENDER_API_KEY not set at host — ask Operator.`,
       });
     }
   }
@@ -555,24 +557,20 @@ export function buildSessionServicesSnapshot(
   }
 
   // Atlassian via sooperset/mcp-atlassian (stdio Python MCP, ~72 tools).
-  // Gated by tool entry. Hits the direct Atlassian REST API at
-  // <site>.atlassian.net — NOT Rovo MCP, which requires an org admin to
-  // grant per-user API token access. OneCLI gateway injects
-  // `Authorization: Basic base64(email:api-token)` at request time (vault
-  // entry "Atlassian" → madison-reed.atlassian.net). Covers Jira (issues,
-  // projects, sprints, JQL search, transitions, comments, attachments,
-  // bulk ops) and Confluence (pages, spaces, search, comments, content
-  // creation/editing). Compass and Teamwork Graph are NOT available via
-  // this surface — they're Rovo-only.
+  // Gated by tool entry. Hits the tenant's direct Atlassian REST API rather
+  // than Rovo MCP. OneCLI injects the Basic credential at request time; the
+  // non-secret tenant URL is resolved from scoped host configuration.
   if (declared(['atlassian'])) {
+    const baseUrl = resolveScopedEnvVar('ATLASSIAN_BASE_URL', folder);
     services.push({
       name: 'Atlassian (Jira + Confluence)',
       mcpNamespace: 'mcp__atlassian__*',
       declaredTools: declaredMatchingTools(['atlassian']),
       scopes: [],
       credentialPaths: [],
-      useFor:
-        'Jira + Confluence via sooperset/mcp-atlassian (direct REST against madison-reed.atlassian.net). Auth pre-injected (Authorization: Basic). ~72 typed tools — Jira: `mcp__atlassian__jira_search`, `jira_get_issue`, `jira_create_issue`, `jira_update_issue`, `jira_add_comment`, `jira_get_transitions`, `jira_transition_issue`, project/sprint/board ops, attachments. Confluence: `mcp__atlassian__confluence_search`, `confluence_get_page`, `confluence_create_page`, `confluence_update_page`, `confluence_get_comments`. Use JQL for Jira search (`assignee = currentUser() AND status != Done` etc.) and CQL for Confluence search. NOT available via this surface: Compass, Teamwork Graph (those are Rovo MCP only).',
+      useFor: baseUrl.set
+        ? `Jira + Confluence via sooperset/mcp-atlassian (direct REST against ${process.env[baseUrl.name]}). Auth pre-injected (Authorization: Basic). ~72 typed tools — Jira: \`mcp__atlassian__jira_search\`, \`jira_get_issue\`, \`jira_create_issue\`, \`jira_update_issue\`, \`jira_add_comment\`, \`jira_get_transitions\`, \`jira_transition_issue\`, project/sprint/board ops, attachments. Confluence: \`mcp__atlassian__confluence_search\`, \`confluence_get_page\`, \`confluence_create_page\`, \`confluence_update_page\`, \`confluence_get_comments\`. Use JQL for Jira search and CQL for Confluence search. NOT available via this surface: Compass and Teamwork Graph.`
+        : `Atlassian tool declared but ATLASSIAN_BASE_URL is not configured for this agent group. Ask the operator to set the scoped host value before using Jira or Confluence.`,
     });
   }
 
@@ -596,7 +594,7 @@ export function buildSessionServicesSnapshot(
       credentialPaths: [],
       useFor: credsReady
         ? `dbt Cloud via dbt-labs/dbt-mcp on \`${process.env[host.name]}\` (prod env \`${process.env[prodEnvId.name]}\`). Discovery API (project intelligence): \`mcp__dbt-mcp__get_all_models\`, \`get_mart_models\`, \`get_model_details\`, \`get_model_parents\`, \`get_model_children\`, \`get_lineage\`, \`get_model_health\`, \`get_model_performance\`, \`get_related_models\`, \`get_exposures\`, \`get_all_macros\`, \`get_all_sources\`, \`search\`. Semantic Layer: \`list_metrics\`, \`query_metrics\`, \`list_saved_queries\`, \`get_dimensions\`, \`get_entities\`, \`get_metrics_compiled_sql\`. SQL on dbt Platform: \`execute_sql\`, \`text_to_sql\`. Admin API (read-only by default — \`trigger_job_run\`, \`cancel_job_run\`, \`retry_job_run\` are disabled): \`list_projects\`, \`list_jobs\`, \`get_job_details\`, \`list_jobs_runs\`, \`get_job_run_details\`, \`get_job_run_error\`, \`list_job_run_artifacts\`. dbt CLI and LSP toolsets are disabled (no local project mounted). For ad-hoc Cloud REST not exposed here, fall back to \`curl -H "Authorization: Token $DBT_CLOUD_API_TOKEN_${folder.toUpperCase().replace(/-/g, '_')}"\`.`
-        : `dbt-mcp tool declared but credentials missing: ${[!host.set && 'DBT_HOST', !token.set && 'DBT_CLOUD_API_TOKEN', !prodEnvId.set && 'DBT_PROD_ENV_ID'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask Dave.`,
+        : `dbt-mcp tool declared but credentials missing: ${[!host.set && 'DBT_HOST', !token.set && 'DBT_CLOUD_API_TOKEN', !prodEnvId.set && 'DBT_PROD_ENV_ID'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask the operator.`,
     });
   }
 
@@ -618,7 +616,7 @@ export function buildSessionServicesSnapshot(
       credentialPaths: [],
       useFor: credsReady
         ? `Looker via Google's MCP Toolbox (--prebuilt looker), instance \`${process.env[baseUrl.name]}\`. Auth via API3 client_id/client_secret (resolved from host env \`${clientId.name}\`). Use for: LookML inspection (\`mcp__looker__get_projects\`, \`get_project_files\`, \`get_project_file\`), inline queries against explores (\`mcp__looker__query\`), raw SQL (\`mcp__looker__query_sql\`), rerunning a UI URL (\`mcp__looker__query_url\`), browsing models/explores/dimensions/measures, listing/running saved Looks and dashboards, warehouse schema introspection (\`get_connection_*\`). Gaps: scheduled plans, alerts, user/role admin, PDT controls — fall back to direct Looker REST API via \`curl\` if needed.`
-        : `Looker tool declared but credentials missing: ${[!baseUrl.set && 'LOOKER_BASE_URL', !clientId.set && 'LOOKER_CLIENT_ID', !clientSecret.set && 'LOOKER_CLIENT_SECRET'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask Dave.`,
+        : `Looker tool declared but credentials missing: ${[!baseUrl.set && 'LOOKER_BASE_URL', !clientId.set && 'LOOKER_CLIENT_ID', !clientSecret.set && 'LOOKER_CLIENT_SECRET'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask the operator.`,
     });
   }
 
@@ -642,7 +640,7 @@ export function buildSessionServicesSnapshot(
       credentialPaths: ['/workspace/extra/.local/share/hex/default-credentials.json'],
       activation: credsExist
         ? `\`hex\` CLI ready. Skill at \`/app/skills/hex/SKILL.md\` documents the full command surface. Common verbs: \`hex projects list --json\`, \`hex project get <id> --json\`, \`hex cell list --project-id <id> --json\`, \`hex cell run <cell-id>\`, \`hex project run <id> --watch\`, \`hex suggestion list --json\` (Context Studio), \`hex guide preview\` then \`hex guide publish <preview-id>\`, \`hex project export <id> > project.yaml\`. Always pass \`--json\` when parsing programmatically. If \`hex auth status\` reports not authenticated, the host operator needs to re-run \`hex auth login\` — do NOT attempt OAuth from inside the container.`
-        : `Hex tool declared but \`~/.local/share/hex/\` is empty on the host. Ask Dave to run \`hex auth login\` on the host once. Mount allowlist: \`/home/ubuntu\` is already covered (no /manage-mounts call needed).`,
+        : `Hex tool declared but \`~/.local/share/hex/\` is empty on the host. Ask the operator to run \`hex auth login\` on the host once. Mount allowlist: \`/home/ubuntu\` is already covered (no /manage-mounts call needed).`,
     });
   }
 
@@ -775,23 +773,18 @@ export function buildSessionServicesSnapshot(
   }
 
   // SELECT (select.dev) — REST-only via the OneCLI gateway, gated on a
-  // `Select-*` OneCLI secret. No MCP/CLI surface: the agent `curl`s the host
-  // directly and the gateway injects `Authorization: Bearer <key>` at the
-  // boundary (e.g. vault entry "Select-MadisonReed" → api.select.dev). The
-  // organization_id rides in the URL path and is NOT a secret; it's embedded
-  // only for the MadisonReed tenant (the install's only SELECT org), mirroring
-  // how the Atlassian entry above embeds the madison-reed site.
+  // `Select-*` OneCLI secret. The organization id is non-secret, but still
+  // tenant-specific, so it is resolved from scoped host configuration.
   if (mergedSecrets.some((s) => /^select(-|$)/i.test(s))) {
-    const selectOrg = mergedSecrets.some((s) => /madison.?reed/i.test(s))
-      ? 'org_DceCh2f5ybKfzIlh'
-      : '<organization_id — ask the owner>';
+    const selectOrg = resolveScopedEnvVar('SELECT_ORGANIZATION_ID', folder);
+    const organizationPath = selectOrg.set ? process.env[selectOrg.name] : '<organization_id>';
     services.push({
       name: 'SELECT (select.dev)',
       cli: 'curl',
       declaredTools: [],
-      scopes: [],
+      scopes: folder ? [folder] : [],
       credentialPaths: [],
-      useFor: `Snowflake cost & usage analytics REST API at https://api.select.dev — auth pre-injected as \`Authorization: Bearer\` (send NO auth header; the OneCLI gateway adds it at the boundary). Routes are ORG-SCOPED: \`GET /api/${selectOrg}/...\` (e.g. \`/users\`, \`/usage-group-sets\`); the org id goes in the path and is not secret. GOTCHA: SELECT validates the key against the org in the path, so a wrong or missing org returns \`401 {"detail":"Invalid API key"}\` even when the key is valid — do NOT read that as a bad key. Docs: https://api-docs.select.dev/ (route index at /llms.txt).`,
+      useFor: `Snowflake cost & usage analytics REST API at https://api.select.dev — auth pre-injected as \`Authorization: Bearer\` (send NO auth header; the OneCLI gateway adds it at the boundary). Routes are organization-scoped: \`GET /api/${organizationPath}/...\` (for example \`/users\` and \`/usage-group-sets\`). ${selectOrg.set ? 'The organization id is configured for this agent group.' : 'SELECT_ORGANIZATION_ID is not configured for this agent group; ask the operator to set the scoped host value before calling the API.'} SELECT validates the key against the organization in the path, so a wrong or missing organization can return 401 even when the key is valid. Docs: https://api-docs.select.dev/ (route index at /llms.txt).`,
     });
   }
 
@@ -803,16 +796,16 @@ export function buildSessionServicesSnapshot(
       name: 'Profound',
       cli: 'curl',
       declaredTools: [],
-      scopes: ['madison-reed'],
+      scopes: folder ? [folder] : [],
       credentialPaths: [],
       useFor:
-        'Madison Reed Profound REST/reporting API at https://api.tryprofound.com — auth pre-injected as `X-API-Key` (send NO auth header; the OneCLI gateway adds it at the boundary). Use for Profound organization discovery and reports: `GET /v1/org/categories`, `/v1/org/domains`, `/v1/org/models`, `/v1/org/regions`; report pulls such as `POST /v1/reports/visibility`, `/citations`, `/sentiment`, `/query-fanouts`, `/v1/prompts/answers`, `/v2/reports/referrals`, and `/v2/reports/bots`.',
+        'Profound REST/reporting API at https://api.tryprofound.com — auth pre-injected as `X-API-Key` (send NO auth header; the OneCLI gateway adds it at the boundary). Use for Profound organization discovery and reports: `GET /v1/org/categories`, `/v1/org/domains`, `/v1/org/models`, `/v1/org/regions`; report pulls such as `POST /v1/reports/visibility`, `/citations`, `/sentiment`, `/query-fanouts`, `/v1/prompts/answers`, `/v2/reports/referrals`, and `/v2/reports/bots`.',
     });
   }
 
   // Fivetran — REST-only via the OneCLI gateway, gated on a `Fivetran-*` OneCLI
   // secret. The gateway injects `Authorization: Basic <base64(apiKey:apiSecret)>`
-  // at the boundary (e.g. vault entry "Fivetran-MadisonReed" → api.fivetran.com).
+  // at the boundary (e.g. vault entry "Fivetran-ExampleRetail" → api.fivetran.com).
   if (mergedSecrets.some((s) => /^fivetran(-|$)/i.test(s))) {
     services.push({
       name: 'Fivetran',

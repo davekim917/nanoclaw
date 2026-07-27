@@ -425,8 +425,8 @@ interface GroupInfo {
  * applies the same normalization to whatever you pass as --platform-id, so the
  * value emitted here is what to feed register.
  *
- *   OpenClaw keys: "whatsapp:group:120...@g.us", "telegram:group:-10012345"
- *   v2 platform_id: "120...@g.us", "telegram:-10012345", "discord:12345"
+ *   OpenClaw keys: "whatsapp:group:14155551234@g.us", "telegram:group:-10012345"
+ *   v2 platform_id: "14155551234@g.us", "telegram:-10012345", "discord:12345"
  */
 function toV2PlatformId(channel: string, id: string): string {
   if (id.startsWith(`${channel}:`)) return id;
@@ -467,9 +467,9 @@ function detectGroups(
         data;
 
       for (const [key, value] of Object.entries(entries)) {
-        // Match session keys like "whatsapp:group:120...@g.us"
-        // or prefixed "agent:main:whatsapp:group:120...@g.us"
-        // Also match DM sessions: "whatsapp:dm:number@s.whatsapp.net"
+        // Match session keys like "whatsapp:group:14155551234@g.us"
+        // or prefixed "agent:main:whatsapp:group:14155551234@g.us"
+        // Also match DM sessions: "whatsapp:dm:14155551234@s.whatsapp.net"
         const match = key.match(/(\w+):(group|dm|channel):(.+)$/i);
         if (!match) continue;
 

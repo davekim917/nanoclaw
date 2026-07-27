@@ -377,7 +377,7 @@ async function drainSession(session: Session): Promise<void> {
     // today, so an agent that's actively thinking, posting status, and
     // running tool calls but hasn't explicitly pinged `spawn_progress`
     // within 30 minutes gets reaped by the no-progress watchdog as if it
-    // were stuck. Observed against spawn-9048e8cfbcc024c2 (XZO-61) at
+    // were stuck. Observed against spawn-9048e8cfbcc024c2 (EXAMPLE-61) at
     // 20:11:05 UTC on 2026-05-11: the watchdog reaped exactly 33 seconds
     // before the child called spawn_complete — the agent was delivering
     // status messages within the same second. Counting any outbound row as
@@ -867,8 +867,8 @@ async function deliverMessage(
       // slack's requires parts[0] === 'slack'. So every message after a turn's
       // first threw ValidationError, burned 3 retries, and was dropped — silently
       // truncating every multi-message scheduled task on both platforms. Observed
-      // 2026-07-25: the madison-reed meeting digest posted its first 1.7KB chunk
-      // and lost the next three ("Invalid Discord thread ID: 1530412025665159280"
+      // 2026-07-25: the example-retail meeting digest posted its first 1.7KB chunk
+      // and lost the next three ("Invalid Discord thread ID: 123456789000000009"
       // — that snowflake is a *message* id, never a thread id).
       effectiveThreadId = `${anchor.platformId}:${anchor.messageId}`;
       usedAnchor = true;

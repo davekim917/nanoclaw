@@ -10,7 +10,7 @@
 # bind mount at runtime (see src/container-runner.ts). Source-only changes
 # never require an image rebuild.
 #
-# Illysium additions on top of upstream/v2:
+# Example Labs additions on top of upstream/v2:
 #   - GitHub CLI (gh) — used by git-worktree MCP tools for `gh pr create`
 #   - PostgreSQL + Redis clients, Python + dbt + snowflake-cli — data-team tooling
 
@@ -333,7 +333,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@wix/cli@${WIX_CLI_VERSION}"
 
-# Illysium additions: code-intelligence + diagram + Google Workspace CLIs.
+# Example Labs additions: code-intelligence + diagram + Google Workspace CLIs.
 # Codex CLI (@openai/codex) is invoked by /team-qa Validator E for
 # cross-model adversarial review; authenticated via the host's ~/.codex
 # mount (see src/container-runner.ts:581).

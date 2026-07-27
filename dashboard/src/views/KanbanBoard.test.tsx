@@ -240,7 +240,7 @@ describe('KanbanBoard', () => {
       const tag = Array.isArray(key) ? key[0] : key;
       if (tag === '/dashboard/api/groups') {
         return {
-          data: { groups: [{ id: 'ag-1', name: 'illysium' }, { id: 'ag-2', name: 'axie-dev' }] },
+          data: { groups: [{ id: 'ag-1', name: 'example-labs' }, { id: 'ag-2', name: 'example-dev' }] },
           mutate: vi.fn(),
         } as unknown as ReturnType<typeof useSWR>;
       }
@@ -254,13 +254,13 @@ describe('KanbanBoard', () => {
     // Default: brand label reads the fallback
     expect(screen.getByText('Agent Board')).toBeInTheDocument();
 
-    // Open menu, pick illysium
+    // Open menu, pick example-labs
     await userEvent.click(screen.getByRole('button', { name: /Agent Board/i }));
-    await userEvent.click(screen.getByRole('option', { name: /^illysium$/i }));
+    await userEvent.click(screen.getByRole('option', { name: /^example-labs$/i }));
 
     // Header morphs to the group name, fallback no longer in the doc (or only
     // in the menu, which is now closed)
-    expect(screen.getByRole('button', { name: /illysium/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /example-labs/i })).toBeInTheDocument();
 
     // localStorage was written
     expect(localStorage.getItem('nc:dash:group_filter:u1')).toBe('ag-1');

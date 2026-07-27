@@ -153,13 +153,13 @@ describe('buildCodexHooksJson', () => {
 
 describe('createCodexConfigOverrides', () => {
   it('always sets features.steer=true so turn/steer RPC injects mid-turn input', () => {
-    // Issue 2 from the Bo / Bo-codex parity report: Dave's mid-turn
-    // @-mentions weren't steering Bo-codex's reasoning, only landing as
+    // Issue 2 from the Example Assistant / Example Assistant Codex parity report: Operator's mid-turn
+    // @-mentions weren't steering Example Assistant Codex's reasoning, only landing as
     // the next turn's input. Root cause: Codex's CLI defaults
     // `features.steer = false`, in which state the app-server rejects
     // turn/steer RPCs and our provider's catch path re-queues the
     // message. Forcing `features.steer=true` at every spawn matches
-    // Dave's local Codex CLI setting.
+    // Operator's local Codex CLI setting.
     const overrides = createCodexConfigOverrides();
     expect(overrides).toContain('features.steer=true');
   });

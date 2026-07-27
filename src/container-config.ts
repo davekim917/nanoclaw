@@ -98,7 +98,7 @@ export interface ContainerConfig {
 
   /**
    * Per-group OneCLI secret declaration. Each entry is either a secret
-   * NAME (e.g. "Datafold-MadisonReed") or a UUID. Names resolve via
+   * NAME (e.g. "Datafold-ExampleRetail") or a UUID. Names resolve via
    * `onecli secrets list` at apply time. When non-empty, the host
    * forces the agent's secret mode to `selective` and assigns exactly
    * these secrets (declarative — replaces any prior assignment).
@@ -106,7 +106,7 @@ export interface ContainerConfig {
    * Missing/empty/absent = no-op: agent keeps whatever assignment and
    * mode the operator set via the UI or CLI. Use this when you want a
    * group to have access to only a specific subset of vault secrets
-   * (e.g. `madison-reed` should not see `Illysium-*` keys).
+   * (e.g. `example-retail` should not see `Example Labs-*` keys).
    *
    * Hard-fails the container spawn if any declared name doesn't resolve
    * to a vault secret — matches the codebase's fail-closed posture so
@@ -194,10 +194,10 @@ export interface ContainerConfig {
    *
    * Set when a sibling agent group should inherit another group's credentials
    * — most commonly a Codex sibling cloned from a Claude source. Example:
-   * `groups/madison-reed-codex/container.json` sets
-   * `"credentialFolder": "madison-reed"` so bo-codex picks up
-   * `LOOKER_BASE_URL_MADISON_REED` instead of looking for the non-existent
-   * `LOOKER_BASE_URL_MADISON_REED_CODEX`.
+   * `groups/example-retail-codex/container.json` sets
+   * `"credentialFolder": "example-retail"` so example-assistant-codex picks up
+   * `LOOKER_BASE_URL_EXAMPLE_RETAIL` instead of looking for the non-existent
+   * `LOOKER_BASE_URL_EXAMPLE_RETAIL_CODEX`.
    *
    * Does NOT affect identity-bound paths such as container name, group dir
    * mount, and log fields; those stay on `agent_groups.folder`.
@@ -237,7 +237,7 @@ export interface ContainerConfig {
 
   /**
    * Per-agent credential/tool allowlist. Each entry is either a bare tool
-   * name (`snowflake`) or scoped (`snowflake:sunday`, `aws:apollo`).
+   * name (`snowflake`) or scoped (`snowflake:archive-one`, `aws:example-data`).
    * Omit to grant every credential surface; include to filter per-tool
    * before mount. Supported tool names: gmail, gmail-readonly, calendar,
    * google-workspace, snowflake, aws, gcloud, dbt, github, render,
@@ -260,7 +260,8 @@ export interface ContainerConfig {
    *                   max_concurrent_threads_per_session?: positive integer }
    *     - Others (e.g. opencode, mock): no configSchema — must be empty {}.
    *
-   * See decision D4 / D11 in .context/specs/create-agent-provider/decisions.yaml.
+   * Provider schemas are the durable source of truth; historical planning
+   * artifacts are intentionally not tracked in the public repository.
    */
   providerConfig?: Record<string, unknown>;
 
@@ -268,8 +269,8 @@ export interface ContainerConfig {
    * Per-group daily summary digest config. The host-side daily-summary timer
    * (src/daily-summary.ts) posts a per-group activity digest once a day; by
    * default it targets the primary wired channel (highest mga.priority,
-   * oldest-wired tiebreak). Set `messagingGroupId` to override — e.g. send
-   * illysium's digest to a Slack channel even though Discord is the primary.
+   * oldest-wired tiebreak). Set `messagingGroupId` to override the selected
+   * destination for a particular installation.
    */
   dailySummary?: {
     messagingGroupId?: string;
@@ -279,8 +280,8 @@ export interface ContainerConfig {
    * The workgroup this agent belongs to. Set by migration 036 and written
    * into container.json for workgroup-scoped Graphify indexing and retrieval.
    *
-   * Value matches workgroups.id (e.g. "madison-reed" for both madison-reed
-   * and madison-reed-codex agents).
+   * Value matches workgroups.id (e.g. "example-retail" for both example-retail
+   * and example-retail-codex agents).
    */
   workgroup_id?: string;
 
@@ -296,7 +297,7 @@ export interface ContainerConfig {
    * channel's messaging_group_id.
    *
    * The OneCLI vault must have a token entry for the agent's workspace
-   * (e.g., `Slack-User-Token-Illysium`) assigned via the workgroup's
+   * (e.g., `Slack-User-Token-Example Labs`) assigned via the workgroup's
    * `onecli_secrets`. Without the token, the MCP refuses to register
    * even when `enabled: true` and the gate would allow.
    */

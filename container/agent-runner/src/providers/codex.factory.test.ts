@@ -170,7 +170,7 @@ describe('createProvider (codex)', () => {
     }
   });
 
-  // Issue 3 from the Bo / Bo-codex parity report: Codex's app-server writes
+  // Issue 3 from the Example Assistant / Example Assistant Codex parity report: Codex's app-server writes
   // stdio MCP env blocks to ~/.codex/config.toml and passes ONLY that block to
   // spawned subprocesses; host env doesn't propagate the way it does for
   // Claude's SDK-spawned stdio MCPs. Stdio MCPs and the explicit HTTP bridge
@@ -681,7 +681,7 @@ describe('codex turn watchdog is health-based, not wall-clock', () => {
 });
 
 describe('codex turn-failure classification (systemError + turn/completed:failed)', () => {
-  // Background (2026-05-21): a Madison Reed codex session hit its ChatGPT
+  // Background (2026-05-21): a Example Retail codex session hit its ChatGPT
   // weekly usage cap mid-turn. The codex app-server emitted a
   // `thread/status/changed` with status `systemError`, then no follow-up
   // `turn/completed` arrived (codex-cli 0.130.0). The container sat for
@@ -1125,7 +1125,7 @@ describe('codex OAuth fallback — rotation primitives', () => {
 describe('per-query model/effort overrides (-m/-e flags)', () => {
   // The poll-loop delivers host-parsed flag values via QueryInput.model and
   // QueryInput.effort. Before 2026-06, the codex provider ignored both —
-  // observed live (dirt-market-codex): `-m fable` was acked by the host and
+  // observed live (example-market-codex): `-m fable` was acked by the host and
   // stored as sticky_model=claude-fable-5[1m], while the session silently
   // kept running gpt-5.5. These resolvers are the validation boundary.
 

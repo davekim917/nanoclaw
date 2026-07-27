@@ -144,13 +144,13 @@ describe('canAccessAgentGroup', () => {
 describe('isSiblingBotSender', () => {
   // Our own bots, keyed by their bare platform user-id (what the adapter
   // known-bot registries expose). The sender id is namespaced by channelType.
-  const ourBots = new Set(['1478986205319135302', '1505246118940770375', '1508565750875426996']);
+  const ourBots = new Set(['123456789000000001', '123456789000000015', '123456789000000016']);
 
   it('matches a sibling bot regardless of the channelType prefix', () => {
-    // Axie (1478…302) seen by the opencode adapter is still our bot.
-    expect(isSiblingBotSender('discord-opencode:1478986205319135302', ourBots)).toBe(true);
-    expect(isSiblingBotSender('discord:1478986205319135302', ourBots)).toBe(true);
-    expect(isSiblingBotSender('discord-codex:1505246118940770375', ourBots)).toBe(true);
+    // Example Agent (1478…302) seen by the opencode adapter is still our bot.
+    expect(isSiblingBotSender('discord-opencode:123456789000000001', ourBots)).toBe(true);
+    expect(isSiblingBotSender('discord:123456789000000001', ourBots)).toBe(true);
+    expect(isSiblingBotSender('discord-codex:123456789000000015', ourBots)).toBe(true);
   });
 
   it('matches a slack-style namespaced sender', () => {
@@ -162,17 +162,17 @@ describe('isSiblingBotSender', () => {
   });
 
   it('fails closed on an empty registry (before the host wires the provider)', () => {
-    expect(isSiblingBotSender('discord:1478986205319135302', new Set())).toBe(false);
+    expect(isSiblingBotSender('discord:123456789000000001', new Set())).toBe(false);
   });
 
   it('rejects malformed sender ids (no separator / empty platform id)', () => {
-    expect(isSiblingBotSender('1478986205319135302', ourBots)).toBe(false);
+    expect(isSiblingBotSender('123456789000000001', ourBots)).toBe(false);
     expect(isSiblingBotSender('discord:', ourBots)).toBe(false);
   });
 
   it('matches only the full platform id, not a prefix of it', () => {
     // Guard against substring/loose matching: a partial id must not pass.
-    expect(isSiblingBotSender('discord:147898620531913530', ourBots)).toBe(false);
+    expect(isSiblingBotSender('discord:123456789000000004', ourBots)).toBe(false);
   });
 });
 

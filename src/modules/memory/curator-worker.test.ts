@@ -30,7 +30,7 @@ function message(rowid: number, id: string, text: string): MemoryCurationArchive
     threadId: 'thread-a',
     role: rowid % 2 ? 'user' : 'assistant',
     senderId: rowid % 2 ? 'discord:u' : 'ag-a',
-    senderName: rowid % 2 ? 'Dave' : 'assistant',
+    senderName: rowid % 2 ? 'Operator' : 'assistant',
     text,
     sentAt: `2026-07-26T00:00:0${rowid}.000Z`,
     rank: 'current-thread',

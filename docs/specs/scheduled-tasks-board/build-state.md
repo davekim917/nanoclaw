@@ -85,7 +85,7 @@ list `{rows, counts, degraded, assembled_at}`; ScheduledRow fields: key, series_
 - **Authoritative gates (lead):** host tsc CLEAN; full host suite **1792 pass / 0 fail** single-threaded (parallel-run failures = /tmp SQLite contention, proven green in isolation 67/67); dashboard tsc CLEAN; prettier-clean; tree clean.
 - **Render-check §3c** PASS (computed WCAG; styles.css comment flipped to verified). builder-A also fixed a real D2 restoreTaskRow PK-collision bug.
 - **Post-build drift: PASS** (`post-build-drift.md`) — Claude+Codex independent, **122 CONFIRMED / 3 PARTIAL / 0 DIVERGED / 0 MISSING**; both models converged on the same 3 PARTIALs (none blocking). Every load-bearing ASSERT traced to enforcing code; rejected options (D10 materialized table, D14 insert-first) confirmed absent.
-  - P1 (move 503-on-unreadable: code correct, no dedicated test) → directed builder-A to add `test_move_unreadable_source_503` (only actionable item). P2 (mnemon-static-map test) ACCEPT correct-as-built. P3 (E3 search list-fields-not-prompt) ACCEPT — plan-vs-design tension, impl follows design; flag to Dave at ship gate.
+  - P1 (move 503-on-unreadable: code correct, no dedicated test) → directed builder-A to add `test_move_unreadable_source_503` (only actionable item). P2 (mnemon-static-map test) ACCEPT correct-as-built. P3 (E3 search list-fields-not-prompt) ACCEPT — plan-vs-design tension, impl follows design; flag to Operator at ship gate.
 - P1 test added + committed (`bcbbe408`).
 
 ## ⚠️ Stage D QA — COMPLETE, found 6 MUST-FIX → fix pass IN PROGRESS (operator approved "go")
@@ -101,4 +101,4 @@ list `{rows, counts, degraded, assembled_at}`; ScheduledRow fields: key, series_
   - Security SUGGESTION applied: preview `readSourceLiveRow` routed through `sessionInboundPathFor` (containment backstop on the preview read path).
 - **Residual fixes COMMITTED** (this commit): cron fix+test, preview chokepoint, recovery `>1` log. Gates: host tsc clean, dashboard tsc clean, full host suite **1828 pass / 0 fail** (single-thread).
 - **Deferred follow-up (non-blocking):** `scheduled-move.test.ts` + `host-sweep.test.ts` still hardcode fixed `/tmp` dirs → flake under parallel CI; switch to `mkdtempSync` like the other test files (concurrency-reviewer note).
-- **NEXT: SHIP GATE** — present to Dave. Nothing merges/pushes/deploys without him.
+- **NEXT: SHIP GATE** — present to Operator. Nothing merges/pushes/deploys without him.

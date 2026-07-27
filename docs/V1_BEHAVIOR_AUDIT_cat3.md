@@ -191,7 +191,7 @@ Two differences:
 
 v2's approval round-trip is **architecturally different but functionally equivalent or stronger**. Key concerns:
 
-1. **Synthetic-message persistence to thread history:** v1 called `storeMessage` at `src/ipc.ts:1834-1843` so the gate prompt appeared in thread history. v2 does not persist the approval card to `message-archive`, so thread search / post-hoc review won't show that an approval was requested. **Severity: LOW-MEDIUM** depending on how much value Dave placed on gate audit trails in chat history.
+1. **Synthetic-message persistence to thread history:** v1 called `storeMessage` at `src/ipc.ts:1834-1843` so the gate prompt appeared in thread history. v2 does not persist the approval card to `message-archive`, so thread search / post-hoc review won't show that an approval was requested. **Severity: LOW-MEDIUM** depending on how much value Operator placed on gate audit trails in chat history.
 2. **Request-API coupling:** v1's gate was a generic "ask any question", used for any destructive-command confirmation. v2's `requestApproval` is module-registered — callers must `registerApprovalHandler(action, handler)` at module import. Agents can't trigger an ad-hoc gate; it needs a module that wraps it. **Severity: LOW** (v2's self-mod module covers the real use cases) but it's an architectural narrowing vs. v1's more open primitive.
 3. **Pending-approval durability:** v1 `pendingGates` was a process-local Map — host restart meant gate was lost, container hung until IPC response timeout. v2 `pending_approvals` is DB-backed — survives host restart. **Strict improvement.**
 

@@ -166,7 +166,7 @@ Secrets live in the OneCLI gateway, injected into per-agent containers at reques
 
 ### Per-group secret scoping (declarative)
 
-Each group's `container.json` may carry `onecliSecrets: ["Datafold-MadisonReed", "Anthropic", ...]` (NAMES or UUIDs). On every spawn, `applyOnecliSecrets()` resolves names → UUIDs, forces the agent's secret mode to `selective`, and assigns exactly the declared set. Fail-closed: unresolvable names throw, spawn aborts, sweep retries. No declaration = no-op (preserves operator-set assignments). See `src/onecli-secrets.ts`.
+Each group's `container.json` may carry `onecliSecrets: ["Datafold-ExampleRetail", "Anthropic", ...]` (NAMES or UUIDs). On every spawn, `applyOnecliSecrets()` resolves names → UUIDs, forces the agent's secret mode to `selective`, and assigns exactly the declared set. Fail-closed: unresolvable names throw, spawn aborts, sweep retries. No declaration = no-op (preserves operator-set assignments). See `src/onecli-secrets.ts`.
 
 ### Workgroup-level secret inheritance
 

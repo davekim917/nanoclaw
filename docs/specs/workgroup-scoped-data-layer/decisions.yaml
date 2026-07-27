@@ -60,7 +60,7 @@ decisions:
       - option: "Collapse sibling agent_groups into a single row with multi-provider config"
         reason: "Breaks per-agent bot identity required for native @-mention plumbing on Slack/Discord; documented in clone-as-codex skill rationale"
       - option: "Owner-gated cross-group access (any group an owner controls can see any other group's data)"
-        reason: "Gives Axie access to MR data because Dave owns both — exact opposite of the tenant boundary Dave wants"
+        reason: "Gives Example Agent access to Example Retail data because Operator owns both — exact opposite of the tenant boundary Operator wants"
       - option: "Spawn-task primitive (ask the sibling to read its own data and return)"
         reason: "Already works as a fallback but is slow (cold-spawn latency), depends on sibling availability, and degrades summary quality. Not the durable answer."
     constraint_refs: [C1, C2]
@@ -71,7 +71,7 @@ decisions:
     chosen: "Workgroup is the tenant unit — future agents like <x>-research, <x>-data-analyst join the same workgroup automatically when declared"
     rejected:
       - option: "Hard-code workgroup to exactly two members (parent + codex twin)"
-        reason: "Dave explicitly confirmed wanting to grow membership over time; locking to two would force re-architecture later"
+        reason: "Operator explicitly confirmed wanting to grow membership over time; locking to two would force re-architecture later"
     constraint_refs: []
 
   - id: D3
@@ -80,7 +80,7 @@ decisions:
     chosen: "Workgroup-level onecliSecrets declarations are inherited by all member agent_groups at container spawn"
     rejected:
       - option: "Keep secrets strictly per-group, defer workgroup inheritance to a follow-on"
-        reason: "Dave explicitly approved workgroup-level inheritance in this brief; deferring would force a near-term schema re-cut"
+        reason: "Operator explicitly approved workgroup-level inheritance in this brief; deferring would force a near-term schema re-cut"
     constraint_refs: []
 
   - id: D4
@@ -125,7 +125,7 @@ assumptions:
 
   - id: A6
     stage: design
-    text: "Suffix-strip + parent-existence pairs all 10 of Dave's current sibling folders without operator action"
+    text: "Suffix-strip + parent-existence pairs all 10 of Operator's current sibling folders without operator action"
     validation: "Pre-migration enumeration of folder LIKE '%-codex' rows verifies each has matching non-codex folder; backfill reports mismatches"
     validated: false
 
@@ -161,7 +161,7 @@ assumptions:
 
   - id: A12
     stage: design
-    text: "agent_groups.folder column matches groups/ filesystem listing on Dave's install at migration time"
+    text: "agent_groups.folder column matches groups/ filesystem listing on Operator's install at migration time"
     validation: "SELECT folder FROM agent_groups vs ls groups/ comparison before migration runs"
     validated: false
 
@@ -196,7 +196,7 @@ decisions_design:
       - option: "Flip default at container-config.ts:74 to 'workgroup' (original D7 choice)"
         reason: "Cycle-1 review surfaced behavior-change risk for implicit-self consumers. Replaced by migration-time explicit declaration (matches PlanetScale expand-and-contract guidance)."
       - option: "Keep 'self' default; require explicit recall_scope: 'workgroup' per group with no migration assist"
-        reason: "Defeats R6 auto-pairing benefit on Dave's install. Migration writes deliver the auto-pairing without changing the default."
+        reason: "Defeats R6 auto-pairing benefit on Operator's install. Migration writes deliver the auto-pairing without changing the default."
     constraint_refs: [C4]
 
   - id: D8
@@ -282,7 +282,7 @@ auto_judgments:
     grounding:
       - "Reviewer B citation: PlanetScale 'Backward compatible database changes' — default-value flip is application-visible semantic shift, not a backward-compat schema change"
       - "Reviewer C #4: widening recall is the risky direction for prompt contamination"
-      - "Brief R6 requires auto-pairing for Dave's 10 existing pairs — achieved by writing explicit recall_scope to those pairs' container.json during migration; standalone groups stay on 'self' default"
+      - "Brief R6 requires auto-pairing for Operator's 10 existing pairs — achieved by writing explicit recall_scope to those pairs' container.json during migration; standalone groups stay on 'self' default"
     scope_check:
       adds_user_facing_capability: false
       changes_external_behavior: false

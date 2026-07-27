@@ -19,7 +19,7 @@ Cycle 3 found 4 NEW MUST-FIX, all introduced by the cycle-2 revisions:
 
 - **M1 (HIGH):** SQLite table-rebuild for `workgroup_id NOT NULL` is incompatible with `PRAGMA foreign_keys=ON` inside a transaction. Cited Rails CVE-class issue #55866 (Oct 2025) demonstrating production data loss from this exact pattern.
 - **M2 (HIGH):** Post-transaction FS-writes-with-recovery is unreachable under the migration barrel's outer transaction wrapping.
-- **M3 (HIGH):** Spawn-time reconciler locks `mnemon_store_id` to the spawning agent's id, not the parent's — order-dependent race that silently disconnects 43MB of accumulated recall on Dave's install.
+- **M3 (HIGH):** Spawn-time reconciler locks `mnemon_store_id` to the spawning agent's id, not the parent's — order-dependent race that silently disconnects 43MB of accumulated recall on Operator's install.
 - **M4 (MEDIUM):** Cycle-2 structural test asserts a substring (`WHERE agent_group_id = ?`) that doesn't match the existing `tasks` query (filtered by `parent_session_id`).
 
 Per /team-auto's cycle-3 "Simplify the design" option, I revised inline rather than adding more fix-on-fix layers. Cycle-3 commit (`ecd2812c`) makes these changes:
@@ -44,7 +44,7 @@ Per /team-auto Stage A rules: when MUST-FIX have been addressed via inline revis
 
 ## What I would do next if I had answers
 
-The user (Dave) needs to make one of these calls:
+The user (Operator) needs to make one of these calls:
 
 1. **Approve the cycle-3 revisions** — say "approved" and the workflow advances to `/team-plan`. This treats the inline revisions as resolving the cycle-3 MUST-FIX without an additional review cycle. Justified because:
    - All 4 MUST-FIX have concrete resolution patches in design.md

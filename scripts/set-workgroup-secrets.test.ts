@@ -32,7 +32,7 @@ const SECRET_FIXTURE = {
   data: [
     { id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', name: 'Anthropic' },
     { id: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', name: 'Exa' },
-    { id: 'cccccccc-cccc-cccc-cccc-cccccccccccc', name: 'Datafold-Illysium' },
+    { id: 'cccccccc-cccc-cccc-cccc-cccccccccccc', name: 'Datafold-Example Labs' },
   ],
 };
 
@@ -119,36 +119,36 @@ describe('set-workgroup-secrets CLI', () => {
 
   it('test_writes_valid_secrets_to_db', () => {
     setupOnecliMock();
-    insertWorkgroup(db, 'illysium');
+    insertWorkgroup(db, 'example-labs');
 
     const code = setWorkgroupSecrets({
-      workgroupId: 'illysium',
+      workgroupId: 'example-labs',
       secrets: ['Anthropic', 'Exa'],
       dbPath,
     });
 
     expect(code).toBe(0);
-    const stored = getWorkgroupSecrets(db, 'illysium');
+    const stored = getWorkgroupSecrets(db, 'example-labs');
     expect(stored).toEqual(['Anthropic', 'Exa']);
     // updated_at should be set
-    expect(getUpdatedAt(db, 'illysium')).not.toBeNull();
+    expect(getUpdatedAt(db, 'example-labs')).not.toBeNull();
   });
 
   // ── test_rejects_unresolvable_secret ────────────────────────────────────────
 
   it('test_rejects_unresolvable_secret', () => {
     setupOnecliMock();
-    insertWorkgroup(db, 'illysium', '[]');
+    insertWorkgroup(db, 'example-labs', '[]');
 
     const code = setWorkgroupSecrets({
-      workgroupId: 'illysium',
+      workgroupId: 'example-labs',
       secrets: ['Anthropic', 'NotInVault'],
       dbPath,
     });
 
     expect(code).toBe(1);
     // DB should NOT have been written (fail before write)
-    const stored = getWorkgroupSecrets(db, 'illysium');
+    const stored = getWorkgroupSecrets(db, 'example-labs');
     expect(stored).toEqual([]);
   });
 
@@ -171,11 +171,11 @@ describe('set-workgroup-secrets CLI', () => {
 
   it('test_idempotent_rerun', () => {
     setupOnecliMock();
-    insertWorkgroup(db, 'illysium');
+    insertWorkgroup(db, 'example-labs');
 
     // First run
     const code1 = setWorkgroupSecrets({
-      workgroupId: 'illysium',
+      workgroupId: 'example-labs',
       secrets: ['Anthropic', 'Exa'],
       dbPath,
     });
@@ -183,13 +183,13 @@ describe('set-workgroup-secrets CLI', () => {
 
     // Second identical run — should succeed, same secrets stored
     const code2 = setWorkgroupSecrets({
-      workgroupId: 'illysium',
+      workgroupId: 'example-labs',
       secrets: ['Anthropic', 'Exa'],
       dbPath,
     });
     expect(code2).toBe(0);
 
-    const stored = getWorkgroupSecrets(db, 'illysium');
+    const stored = getWorkgroupSecrets(db, 'example-labs');
     expect(stored).toEqual(['Anthropic', 'Exa']);
   });
 
@@ -197,16 +197,16 @@ describe('set-workgroup-secrets CLI', () => {
 
   it('allows clearing secrets with empty list', () => {
     setupOnecliMock();
-    insertWorkgroup(db, 'illysium', JSON.stringify(['Anthropic']));
+    insertWorkgroup(db, 'example-labs', JSON.stringify(['Anthropic']));
 
     const code = setWorkgroupSecrets({
-      workgroupId: 'illysium',
+      workgroupId: 'example-labs',
       secrets: [],
       dbPath,
     });
 
     expect(code).toBe(0);
-    const stored = getWorkgroupSecrets(db, 'illysium');
+    const stored = getWorkgroupSecrets(db, 'example-labs');
     expect(stored).toEqual([]);
   });
 
@@ -214,17 +214,17 @@ describe('set-workgroup-secrets CLI', () => {
 
   it('validates ALL secrets before writing — partial failure writes nothing', () => {
     setupOnecliMock();
-    insertWorkgroup(db, 'illysium', JSON.stringify(['OldSecret']));
+    insertWorkgroup(db, 'example-labs', JSON.stringify(['OldSecret']));
 
     const code = setWorkgroupSecrets({
-      workgroupId: 'illysium',
+      workgroupId: 'example-labs',
       secrets: ['Anthropic', 'DefinitelyNotReal'],
       dbPath,
     });
 
     expect(code).toBe(1);
     // DB must still have the original value
-    const stored = getWorkgroupSecrets(db, 'illysium');
+    const stored = getWorkgroupSecrets(db, 'example-labs');
     expect(stored).toEqual(['OldSecret']);
   });
 
@@ -238,9 +238,9 @@ describe('set-workgroup-secrets CLI', () => {
   it('test_invalid_args — onecli call count: zero secrets skips vault check', () => {
     // Empty secrets list: no onecli call needed (nothing to validate)
     setupOnecliMock();
-    insertWorkgroup(db, 'illysium');
+    insertWorkgroup(db, 'example-labs');
 
-    setWorkgroupSecrets({ workgroupId: 'illysium', secrets: [], dbPath });
+    setWorkgroupSecrets({ workgroupId: 'example-labs', secrets: [], dbPath });
 
     // secrets list is empty → no `onecli secrets list` call
     const secretsListCalls = mockedExec.mock.calls.filter(

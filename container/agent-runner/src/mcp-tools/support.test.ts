@@ -21,13 +21,13 @@ describe('dispatch_support_issue tool', () => {
   it('emits a dispatch_support_issue system action with the ticket payload', async () => {
     await dispatchSupportIssue.handler({
       gmailThreadId: 'gt-1',
-      linearIssue: 'XZO-9',
-      linearTeam: 'XZO',
+      linearIssue: 'EXAMPLE-9',
+      linearTeam: 'EXAMPLE',
       subject: 'help',
-      sender: 'a@b.com',
+      sender: 'person8@fixture1.example.com',
       date: 'Fri, 17 Jul 2026 16:40:55 -0400',
       bodyText: 'something is broken',
-      lastMessageId: '<m1@b.com>',
+      lastMessageId: '<person18@fixture1.example.com>',
     });
 
     const out = getUndeliveredMessages();
@@ -36,9 +36,9 @@ describe('dispatch_support_issue tool', () => {
     const c = JSON.parse(out[0].content) as Record<string, unknown>;
     expect(c.action).toBe('dispatch_support_issue');
     expect(c.gmailThreadId).toBe('gt-1');
-    expect(c.linearIssue).toBe('XZO-9');
+    expect(c.linearIssue).toBe('EXAMPLE-9');
     expect(c.date).toBe('Fri, 17 Jul 2026 16:40:55 -0400');
-    expect(c.lastMessageId).toBe('<m1@b.com>');
+    expect(c.lastMessageId).toBe('<person18@fixture1.example.com>');
   });
 
   it('rejects a call without gmailThreadId', async () => {
@@ -51,7 +51,7 @@ describe('dispatch_support_issue tool', () => {
     const res = await dispatchSupportIssue.handler({
       gmailThreadId: 'gt-1',
       subject: 'help',
-      sender: 'a@b.com',
+      sender: 'person8@fixture1.example.com',
       bodyText: 'something is broken',
     });
 
@@ -125,15 +125,15 @@ describe('dispatch_support_issue tool', () => {
 
 describe('update_support_ticket tool', () => {
   it('emits an update_support_ticket system action with the ticket fields', async () => {
-    await updateSupportTicket.handler({ linearIssue: 'XZO-200', linearTeam: 'XZO' });
+    await updateSupportTicket.handler({ linearIssue: 'EXAMPLE-200', linearTeam: 'EXAMPLE' });
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     expect(out[0].kind).toBe('system');
     const c = JSON.parse(out[0].content) as Record<string, unknown>;
     expect(c.action).toBe('update_support_ticket');
-    expect(c.linearIssue).toBe('XZO-200');
-    expect(c.linearTeam).toBe('XZO');
+    expect(c.linearIssue).toBe('EXAMPLE-200');
+    expect(c.linearTeam).toBe('EXAMPLE');
   });
 
   it('rejects a call without linearIssue', async () => {

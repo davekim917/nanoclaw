@@ -523,7 +523,7 @@ escalations:
     category: operational-risk
     finding: The final live-topology audit found a pre-existing partial Graphify exposure despite no service restart during remediation.
     evidence:
-      - The running Madison Reed container uses latest image sha256:d23404afc6a6fc459687227b6520b1f538fc04511adeab261174672974acb968, created 2026-07-18T19:19:41Z, and exposes /usr/local/bin/graphify plus the bind-mounted Graphify skill.
+      - The running Example Retail container uses latest image sha256:d23404afc6a6fc459687227b6520b1f538fc04511adeab261174672974acb968, created 2026-07-18T19:19:41Z, and exposes /usr/local/bin/graphify plus the bind-mounted Graphify skill.
       - Docker mount inspection shows no /workspace/.cache/graphify or /run/nanoclaw-graphify bind mount, and HostConfig.Tmpfs is null, so the intended shared cache, install-wide worker lock, and 192 MiB staging quota are absent.
       - The old host process still mounts /home/ubuntu/plugins/gitnexus into the container even though command -v gitnexus is empty; the validated host source excludes that plugin mount after activation.
       - Container logs contain no Graphify execution, and nanoclaw-v2.service reports NRestarts=0 with active start 2026-07-18T02:54:31Z.

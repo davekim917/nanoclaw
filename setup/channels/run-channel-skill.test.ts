@@ -51,7 +51,7 @@ describe('runChannelSkill adapter (Option A)', () => {
       // the secrets + handle a human would supply; the skill resolves platform_id.
       // Values are valid-shaped for the prompts' validate: regexes — validate-at-bind
       // now enforces them on `inputs` too (they used to bypass validation).
-      inputs: { connection: 'webhook', bot_token: 'xoxb-x', signing_secret: '0123456789abcdef', owner_handle: 'U12345678' },
+      inputs: { connection: 'webhook', bot_token: 'xoxb-x', signing_secret: '0123456789abcdef', owner_handle: 'UTEST00004' },
       wire: (a) => {
         wired.push(a);
         return true;
@@ -65,7 +65,7 @@ describe('runChannelSkill adapter (Option A)', () => {
     expect(wired).toHaveLength(1);
     expect(wired[0]).toMatchObject({
       channel: 'slack',
-      userId: 'slack:U12345678', // channel + owner_handle
+      userId: 'slack:UTEST00004', // channel + owner_handle
       platformId: 'slack:D0SLACK', // captured from conversations.open
       displayName: 'Bob Smith',
       agentName: 'Nano',
@@ -550,7 +550,7 @@ describe('backGate (first-prompt back-to-channel-selection)', () => {
       resolveRemote: () => 'origin',
       agentName: 'Nano',
       role: 'owner',
-      inputs: { connection: 'webhook', bot_token: 'xoxb-x', signing_secret: '0123456789abcdef', owner_handle: 'U12345678' },
+      inputs: { connection: 'webhook', bot_token: 'xoxb-x', signing_secret: '0123456789abcdef', owner_handle: 'UTEST00004' },
       wire: (a) => {
         wired.push(a);
         return true;

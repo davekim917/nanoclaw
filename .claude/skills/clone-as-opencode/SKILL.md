@@ -71,7 +71,7 @@ pnpm exec tsx scripts/q.ts data/v2.db "select id, folder, name from agent_groups
 Capture the `id` value — it's an `ag-...` string (or the folder name itself for host-default groups). Every later SQL statement that touches `messaging_group_agents.agent_group_id` uses this id, not the folder name.
 
 ```bash
-SOURCE_FOLDER=<source-folder>             # e.g. illysium
+SOURCE_FOLDER=<source-folder>             # e.g. example-labs
 SOURCE_ID=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
 test -n "${SOURCE_ID}" || { echo "ERROR: source group '${SOURCE_FOLDER}' not found"; exit 1; }
 # Workgroup the sibling must JOIN — the SOURCE's workgroup, not the sibling's
@@ -89,7 +89,7 @@ echo "Source workgroup: ${SOURCE_WORKGROUP}"
 
 #### Slack path
 
-Follow `.claude/skills/add-slack/SKILL.md` to install a new app in the same workspace where the source agent's bot lives. **Name the bot user something distinct but discoverable** — using the source name with a suffix (e.g. `illie-opencode` when source is `illie`) makes Slack's `@`-autocomplete group them together for the user.
+Follow `.claude/skills/add-slack/SKILL.md` to install a new app in the same workspace where the source agent's bot lives. **Name the bot user something distinct but discoverable** — using the source name with a suffix (e.g. `helper-opencode` when source is `helper`) makes Slack's `@`-autocomplete group them together for the user.
 
 Required bot scopes (per add-slack skill step 6): `app_mentions:read`, `channels:history`, `channels:read`, `chat:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `users:read`.
 
@@ -101,7 +101,7 @@ After installing the new app to the workspace, capture the **bot token** (`xoxb-
 
 #### Discord path
 
-Create a new Discord application at [discord.com/developers/applications](https://discord.com/developers/applications) — separate from the primary bot's app. Name the bot user something distinct but discoverable (e.g. `Axie-OpenCode`).
+Create a new Discord application at [discord.com/developers/applications](https://discord.com/developers/applications) — separate from the primary bot's app. Name the bot user something distinct but discoverable (e.g. `Example Agent-OpenCode`).
 
 1. From the **General Information** tab, copy the **Application ID** and **Public Key**.
 2. Go to the **Bot** tab and click **Add Bot** if needed; copy the **Bot Token** (click **Reset Token** if needed — visible only once).
@@ -115,10 +115,10 @@ Create a new Discord application at [discord.com/developers/applications](https:
 
 ### 3. Add the sibling's env vars
 
-Pick an `ENV_SUFFIX` that mirrors the source's suffix with `_OPENCODE` appended (e.g. existing `ILLYSIUM` → new `ILLYSIUM_OPENCODE`). Uppercase alphanumeric + underscores. The host's adapter discovers it on next restart.
+Pick an `ENV_SUFFIX` that mirrors the source's suffix with `_OPENCODE` appended (e.g. existing `EXAMPLE_LABS` → new `EXAMPLE_LABS_OPENCODE`). Uppercase alphanumeric + underscores. The host's adapter discovers it on next restart.
 
 ```bash
-ENV_SUFFIX=ILLYSIUM_OPENCODE              # uppercase, underscores OK
+ENV_SUFFIX=EXAMPLE_LABS_OPENCODE              # uppercase, underscores OK
 ```
 
 #### Slack path
@@ -157,7 +157,7 @@ grep "_${ENV_SUFFIX}=" .env
 
 ```bash
 SIBLING_FOLDER=${SOURCE_FOLDER}-opencode
-SIBLING_ID=${SIBLING_FOLDER}                # use folder name as ag-id, matching host-default groups (main, axie-dev)
+SIBLING_ID=${SIBLING_FOLDER}                # use folder name as ag-id, matching host-default groups (main, example-dev)
 
 # Has the source's workgroup been consolidated by the shared-FS migration
 # (reconcileWorkgroupSharedDirs)? The `.migrated` marker is the same signal
@@ -251,7 +251,7 @@ diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
      <(jq -S "$DEL" groups/${SIBLING_FOLDER}/container.json) && echo "  ✅ parity clean" || true
 ```
 
-**Why `credentialFolder`**: container-runner's per-group credential lookups (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a sibling folder like `madison-reed-opencode` would look for `LOOKER_BASE_URL_MADISON_REED_OPENCODE`, which doesn't exist. `credentialFolder` redirects credential lookups to the source folder; identity-bound paths (container name, group dir mount, OpenCode auth dir) stay on the sibling's own folder.
+**Why `credentialFolder`**: container-runner's per-group credential lookups (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a sibling folder like `example-retail-opencode` would look for `LOOKER_BASE_URL_EXAMPLE_RETAIL_OPENCODE`, which doesn't exist. `credentialFolder` redirects credential lookups to the source folder; identity-bound paths (container name, group dir mount, OpenCode auth dir) stay on the sibling's own folder.
 
 **Note: no `opencodeHostAuth` field** — the host-side opencode provider (`src/providers/opencode.ts`) always copies the per-group `auth.json` into the per-session XDG dir; there's no opt-in gate like `codexHostAuth`.
 
@@ -337,7 +337,7 @@ it updates dynamically. Examples: `opencode-go/kimi-k2.7-code`,
 
 `agent_groups.created_at` is `NOT NULL` with no default.
 
-**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source + codex sibling, which grants the same memory canon, shared chat-archive and Graphify visibility plus workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (matching how migration 036 set up the codex siblings; `reconcileWorkgroupAtSpawn` reads the DB value, and putting it in container.json instead would trip the parity-check since `workgroup_id` is not a sibling-bound field). Omitting it here is the bug that isolated the first opencode sibling (`illysium-opencode`) into its own workgroup-of-one: migration 036 only auto-pairs the `-codex` suffix, never `-opencode`.
+**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source + codex sibling, which grants the same memory canon, shared chat-archive and Graphify visibility plus workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (matching how migration 036 set up the codex siblings; `reconcileWorkgroupAtSpawn` reads the DB value, and putting it in container.json instead would trip the parity-check since `workgroup_id` is not a sibling-bound field). Omitting it here is the bug that isolated the first opencode sibling (`example-labs-opencode`) into its own workgroup-of-one: migration 036 only auto-pairs the `-codex` suffix, never `-opencode`.
 
 `agent_groups.name` should match `id` and `folder` — the workspace convention (`<source>-opencode`), NOT the Slack/Discord bot display name. The bot display name is platform-side (configured at api.slack.com/apps or the Discord dev portal) and is purely how chat users see the avatar; mixing the two leaves the dashboard with inconsistent groupings.
 
@@ -365,11 +365,11 @@ The `register` step in `setup/index.ts` is channel-agnostic. Use it for both pla
 
 #### Slack path
 
-Invite the new bot user (e.g. `@illie-opencode`) to each Slack channel you want it to operate in (Slack-side, before wiring).
+Invite the new bot user (e.g. `@helper-opencode`) to each Slack channel you want it to operate in (Slack-side, before wiring).
 
 ```bash
-SLACK_CHANNEL_ID=C0AJA89MN2E                  # Slack channel id
-SLACK_CHANNEL_NAME=agents-xzo
+SLACK_CHANNEL_ID=CTEST00004                  # Slack channel id
+SLACK_CHANNEL_NAME=agents-example
 
 pnpm exec tsx setup/index.ts --step register -- \
   --platform-id "slack:${SLACK_CHANNEL_ID}" \
@@ -414,9 +414,9 @@ where mg.channel_type = '${CHANNEL_TYPE}'
 #### Discord path
 
 ```bash
-DISCORD_GUILD_ID=1479489865702703155          # right-click server → Copy Server ID
-DISCORD_CHANNEL_ID=1479516831168593974        # right-click channel → Copy Channel ID
-DISCORD_CHANNEL_NAME=illysium                 # for the agent_destinations.local_name
+DISCORD_GUILD_ID=123456789000000002          # right-click server → Copy Server ID
+DISCORD_CHANNEL_ID=123456789000000004        # right-click channel → Copy Channel ID
+DISCORD_CHANNEL_NAME=example-labs                 # for the agent_destinations.local_name
 
 pnpm exec tsx setup/index.ts --step register -- \
   --platform-id "discord:${DISCORD_GUILD_ID}:${DISCORD_CHANNEL_ID}" \
@@ -429,7 +429,7 @@ pnpm exec tsx setup/index.ts --step register -- \
 
 The `register` step defaults `engage_mode='mention'` — sibling-safe (only fires on explicit `@`-mention).
 
-> **Important — owner role under the new channelType namespace.** When the host receives an inbound from the sibling bot, the sender's user-id is namespaced by the new channel_type (e.g. `discord-axie-opencode:608746260706361344`). Existing `user_roles` rows are scoped to the OLD namespace, so the new bot sees the sender as unknown.
+> **Important — owner role under the new channelType namespace.** When the host receives an inbound from the sibling bot, the sender's user-id is namespaced by the new channel_type (e.g. `discord-example-agent-opencode:123456789000000019`). Existing `user_roles` rows are scoped to the OLD namespace, so the new bot sees the sender as unknown.
 >
 > Mirror your existing global owner roles under the new namespace:
 

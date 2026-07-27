@@ -7,7 +7,7 @@
 
 > This is a scoping doc, not an approved design. It maps the current system,
 > states the real goal, lays out options with trade-offs, names the open
-> decisions only Dave can make, and sketches a phased plan. Nothing here is
+> decisions only Operator can make, and sketches a phased plan. Nothing here is
 > built. Run `/team-brief` → `/team-design` if we want the full workflow once
 > the open decisions are settled.
 
@@ -19,14 +19,14 @@
 chat adapter and NOT routing conversation through email. The flow is:
 
 ```
-support@illysium.ai inbox  →  triage + create Linear ticket  →  work the issue
+person24@fixture5.example.com inbox  →  triage + create Linear ticket  →  work the issue
                                                                   in Slack with
-                                                                  Illysium engineers
+                                                                  Example Labs engineers
 ```
 
 What we want: **each distinct support issue gets its own Slack thread and its
 own agent session**, instead of every support email collapsing into the single
-long-lived poller session (`sess-1778203069713-ukvol3`) that all `*/15` fires
+long-lived poller session (`sess-1700000000000-example05`) that all `*/15` fires
 share today.
 
 The natural unit is the **support issue**, identified by **Gmail `threadId`**
@@ -63,7 +63,7 @@ The poller is a **recurring scheduled task** (`task-1780158666153-whlle2`, cron
 - `container/agent-runner/src/scheduling/task-script.ts:79-121`
   (`applyPreTaskScripts`) executes the script via `runScript` (`:19-65`).
 - The script queries Gmail with the `gws` CLI
-  (`GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=.../support-illysium.json`), filters
+  (`GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=.../support-example-labs.json`), filters
   promotions/automated senders, and emits a single JSON line:
   `{"wakeAgent": true|false, "data": {"newMessages": [...]}}`.
 - `wakeAgent:false` (no new mail) → task skipped, **agent never invoked** (this
@@ -86,7 +86,7 @@ payload. No new extraction work.**
 The agent loops over `newMessages`, writes Linear tickets/comments
 (`mcp__linear__save_issue` / `save_comment`), labels the Gmail message
 `bot-ticketed`, appends to `support_ticketed_threads.json`, and posts **one
-summary** to the `slack_illysium_agents_xzo` channel. As of `2a7e80e9` those
+summary** to the `slack_example-labs_agents-example` channel. As of `2a7e80e9` those
 summary messages thread under the fire's first post (per-turn anchor) — but
 they're still all in the **one shared poller session**, with no per-issue
 working space.
@@ -214,12 +214,12 @@ customer. The flow:
 3. On approval, the agent sends via Gmail on the **same thread**:
    `gws gmail users messages send` with `threadId = <gmailThreadId>` and headers
    `In-Reply-To: <lastGmailMessageId>` + `References: <...>`, `From:
-   support@illysium.ai`. Then it appends its own sent message back into the Slack
+   person24@fixture5.example.com`. Then it appends its own sent message back into the Slack
    thread for the record and refreshes `lastGmailMessageId`.
 
 This needs: (a) the Gmail thread identity + last Message-ID retained in the
 mapping store (§3.2); (b) `gws` send capability in the per-issue session's
-container (same `support-illysium.json` creds the poller already uses); (c) an
+container (same `support-example-labs.json` creds the poller already uses); (c) an
 **approval gate** so the agent never sends customer-facing email without a human
 OK (open decision §5). Reuse the existing approval primitive
 (`src/modules/approvals/`) or a lightweight "reply with 👍 to send" convention in
@@ -239,20 +239,20 @@ the thread.
 | Gmail-thread → Slack-thread/session map | `support_ticketed_threads.json` (Linear only) | extend value / DB table |
 | Route follow-up into existing session | — | host-side lookup + wake |
 | Draft email reply in Slack | container prose pipeline / humanizer | — |
-| Send reply on the Gmail thread | `gws gmail messages send` + `support-illysium.json` creds | threading headers + send in per-issue session |
+| Send reply on the Gmail thread | `gws gmail messages send` + `support-example-labs.json` creds | threading headers + send in per-issue session |
 | Approval before sending email | `src/modules/approvals/` primitive | wire for outbound email |
 | Lifecycle (close/reopen on resolve/reply) | — | new policy |
 
 ---
 
-## 5. Open decisions (need Dave)
+## 5. Open decisions (need Operator)
 
 1. **Does every new ticket get a Slack working thread, or only "needs-human"
    ones?** A thread per ticket could be noisy if most are auto-resolved. Option:
    only open a working thread when triage decides an engineer is needed;
    auto-handled tickets just get the existing summary line.
-2. **Whose session works the issue?** The same `illysium` agent group (illie
-   working each issue in its own thread), or a dedicated `illysium-support`
+2. **Whose session works the issue?** The same `example-labs` agent group (helper
+   working each issue in its own thread), or a dedicated `example-labs-support`
    sibling/worker group? (Prior note: "one general-purpose worker group, each
    item its own session/thread.")
 3. **Dispatch mechanism:** Option A (agent-driven, reuse orchestrator-dispatch)
@@ -273,11 +273,11 @@ the thread.
 
 ## 5a. Decisions locked + v1 BUILT (2026-06-05)
 
-Dave's calls on §5:
+Operator's calls on §5:
 1. **Every real support ticket** gets a channel announcement + working thread
    (the pre-script already filters noise, so each remaining ticket is genuine).
-2. **illie (same Illysium group)** works each issue as a per-thread session —
-   reuses illie's Linear/gws creds, CLAUDE.md, identity. No new bot/secrets.
+2. **helper (same Example Labs group)** works each issue as a per-thread session —
+   reuses helper's Linear/gws creds, CLAUDE.md, identity. No new bot/secrets.
 3. **Agent-driven dispatch via a new MCP tool** (`dispatch_support_issue`) with a
    **thin host handler** — reuses the `postParent→createThread→resolveSession→seed
    →wake` primitives but NOT the orchestrator-dispatch tasks/watchdog (support
@@ -285,9 +285,9 @@ Dave's calls on §5:
    handles new tickets AND follow-ups, keyed on Gmail `threadId`.
 4. **Mapping store = central-DB `support_threads` table** (host-readable for
    follow-up routing) — host-owned, agent-agnostic. **State must not live in any
-   agent's private bedroom** (Dave's principle, 2026-06-09).
+   agent's private bedroom** (Operator's principle, 2026-06-09).
 
-   **PUREST VERSION BUILT (2026-06-09, same day, per Dave):** zero agent-side
+   **PUREST VERSION BUILT (2026-06-09, same day, per Operator):** zero agent-side
    state of any kind — no bedroom file, no workgroup file. The poller is a thin
    triager (noise pre-flight → `dispatch_support_issue` → Gmail label); it does
    NO Linear work and tracks nothing. The host decides new-vs-existing from
@@ -304,14 +304,14 @@ Dave's calls on §5:
 5. **Channel surface = per-ticket announcement + thread** (replaces the bundled
    digest; only failures/`filtered N` lines remain at channel root).
 6. **Outbound email send deferred to v2** — v1 is read → ticket → work-in-Slack;
-   illie may draft in-thread but not send. `last_gmail_message_id` retained for v2.
+   helper may draft in-thread but not send. `last_gmail_message_id` retained for v2.
 7. **Lifecycle:** sessions are normal per-thread sessions woken by engineer
    replies / follow-up emails; `status='open'`, reopened on any follow-up; a
    `closeSupportThread` helper exists for when an issue resolves (not yet wired to
    Linear-resolved — a v1.1 follow-up). Archived sessions auto-reopen on the next
    follow-up email.
 
-**BUILT this branch (code is LIVE-but-dormant until illie's poller prompt adopts
+**BUILT this branch (code is LIVE-but-dormant until helper's poller prompt adopts
 the tool — see `poller-prompt-v1.md`):**
 - `src/db/migrations/041-support-threads.ts` + `src/db/support-threads.ts` — table
   + CRUD (get/insert(OR IGNORE)/touch/close).
@@ -354,26 +354,26 @@ close-on-Linear-resolved wiring; optional dashboard surfacing of support threads
 
 ## 6a. Related (folded in): thread-scoped "loops" vs channel-root scheduled tasks
 
-Surfaced 2026-06-02 from a real incident: Dave told illie (in a Slack thread)
+Surfaced 2026-06-02 from a real incident: Operator told helper (in a Slack thread)
 "run a loop to check the PR for new codex reviews"; the loop's `*/10` iterations
-posted to the parent #agents-xzo channel, not the thread.
+posted to the parent #agents-example channel, not the thread.
 
 **Root cause (verified, not theorized):**
-- Container agents have **no Claude Code `/loop`**. illie's recurrence surface is
+- Container agents have **no Claude Code `/loop`**. helper's recurrence surface is
   only `schedule_task` / `list|read|cancel|pause|resume|update_task`
   (`container/agent-runner/src/mcp-tools/scheduling.ts`). The host-side `/loop`
   skill (thread-local, "session = thread") exists only in a *host* Claude Code
   session, not inside the container.
 - So "run a loop" was implemented as a recurring `schedule_task`. The actual row:
   `task-1780413607328-7wfpjh`, `*/10 * * * *`, `thread_id=null`, in the
-  **channel-root** session `sess-1778203069713-ukvol3` (same session as the email
+  **channel-root** session `sess-1700000000000-example05` (same session as the email
   poller). Channel-root + `thread_id=null` is enforced for *every* scheduled task
   by `src/modules/scheduling/actions.ts:10-29` for lifetime (a task in a thread
   session dies when the thread is archived) AND security (post-2026-05-02
   cross-tenant leak: host never trusts agent-supplied routing). Working as
   designed → it posts at channel root.
 
-**Decision (Dave, 2026-06-02):** do NOT make scheduled tasks report into threads —
+**Decision (Operator, 2026-06-02):** do NOT make scheduled tasks report into threads —
 they stay channel-root; follow-ups on a scheduled-task output happen in a fresh
 thread like any other session. The loop/scheduled-task conflation is the bug, not
 the channel-root routing.
@@ -450,7 +450,7 @@ Surfaced 2026-06-03: a `/team-auto` run launched in a Slack thread sent all 7 of
 its stage-progress + completion reports to the owner's **DM**, while normal
 working chatter correctly stayed in the thread.
 
-**Root cause (verified against `sess-1780316123279-1cmw43` outbound):** NOT a
+**Root cause (verified against `sess-1700000000000-example06` outbound):** NOT a
 routing bug. The agent's turn-final replies and `send_message` with no `to`
 already default to the session's own conversation (`resolveRouting`,
 `mcp-tools/core.ts:78-88` → `getSessionRouting()` returns the thread). The agent
@@ -459,7 +459,7 @@ report. The in-prompt guidance (`destinations.ts`) only told it to "address the
 destination it came `from`" *when replying to an incoming message* — it said
 nothing about mid-run proactive output — and the `send_message` description
 ("if you have only one destination, you can omit `to`") implied that with
-multiple destinations you must name one, nudging it toward the salient "Dave" DM.
+multiple destinations you must name one, nudging it toward the salient "Operator" DM.
 
 **Fix (BUILT 2026-06-04, this branch) — guidance + tool descriptions, no routing
 logic change:**

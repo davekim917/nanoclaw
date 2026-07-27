@@ -11,7 +11,7 @@
  *
  * Multi-bot note: slash commands are bound to the PRIMARY DISCORD_BOT_TOKEN
  * only — these are operator/admin commands and shouldn't be duplicated
- * across secondary bots (e.g. an "axie-codex" bot). Secondary bots
+ * across secondary bots (e.g. an "example-agent-codex" bot). Secondary bots
  * registered via DISCORD_BOT_TOKEN_<SUFFIX> still receive @mentions through
  * the chat adapter but don't expose /deploy etc.
  *

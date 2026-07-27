@@ -74,7 +74,7 @@ function fsSlug(s: string): string {
 
 /**
  * Thread-scoped worktree directory. All sibling agents in the same thread
- * (e.g. illie + illie-codex) bind-mount this same host path at
+ * (e.g. helper + helper-codex) bind-mount this same host path at
  * `/workspace/worktrees` inside their containers so they collaborate on
  * the same checkout.
  *
@@ -85,8 +85,8 @@ function fsSlug(s: string): string {
  *
  * For DM / non-threaded channels (thread_id=null), `dm-<platform_id>` keeps
  * the dir stable per conversation. Critically, when TWO sibling agents are
- * wired to the same channel via TWO Slack apps (`slack-illysium` +
- * `slack-illiecodex` both seeing `slack:C0AJA89MN2E`), they share the same
+ * wired to the same channel via TWO Slack apps (`slack-example-labs` +
+ * `slack-helpercodex` both seeing `slack:CTEST00004`), they share the same
  * platform_id and therefore the same worktree path — that's what makes
  * cross-bot collaboration work.
  *

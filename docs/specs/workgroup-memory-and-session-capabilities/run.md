@@ -63,7 +63,7 @@
 - Live read-only runtime verifier:
   8 workgroups, 21 members, 2,557 sessions, 0 failures at
   `2026-07-26T15:59:48.439Z`. The two warnings are a historical missing inbound
-  DB in `illysium` and the intentionally empty `xzo-demo-builder` workgroup;
+  DB in `example-labs` and the intentionally empty `example-demo-builder` workgroup;
   neither blocks activation.
 - Container image build: PASS. Expected image
   `nanoclaw-agent-v2-2a38bd3e:latest` exists. Agent-runner source is mounted

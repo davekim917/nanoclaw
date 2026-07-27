@@ -855,7 +855,7 @@ describe('WorkgroupGraphDaemon', () => {
     writer
       .prepare(
         `INSERT INTO messages_archive
-      VALUES ('m1','ag-a','mg','discord','Strategy','thread','t1','user','u','Dave','new archive knowledge','2026-01-01T00:00:00.000Z')`,
+      VALUES ('m1','ag-a','mg','discord','Strategy','thread','t1','user','u','Operator','new archive knowledge','2026-01-01T00:00:00.000Z')`,
       )
       .run();
     writer.close();
@@ -932,7 +932,7 @@ describe('WorkgroupGraphDaemon', () => {
     writer
       .prepare(
         `INSERT INTO messages_archive
-      VALUES ('m1','ag-a','mg','discord','Strategy','thread','t1','user','u','Dave','retry me','2026-01-01T00:00:00.000Z')`,
+      VALUES ('m1','ag-a','mg','discord','Strategy','thread','t1','user','u','Operator','retry me','2026-01-01T00:00:00.000Z')`,
       )
       .run();
     writer.close();

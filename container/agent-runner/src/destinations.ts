@@ -114,7 +114,7 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
     // per spawn with the in-channel peer agents (auto-derived from
     // messaging_group platform_id). Surfacing explicit name → user_id
     // mapping in the runtime prompt prevents the prose-handoff failure
-    // mode where Bo wrote "@Bo" instead of "@Bo-codex" because the model
+    // mode where Example Assistant wrote "@Example Assistant" instead of "@Example Assistant Codex" because the model
     // collapsed the shared display-name prefix to self-reference.
     const peerSpec = readPeersFromEnv();
     const selfUserId = peerSpec?.self?.userId;

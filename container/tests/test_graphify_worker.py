@@ -135,7 +135,7 @@ class WorkerTest(unittest.TestCase):
         docx.Document = lambda _path: types.SimpleNamespace(
             paragraphs=[types.SimpleNamespace(text="Decision log")],
             tables=[types.SimpleNamespace(rows=[types.SimpleNamespace(cells=[
-                types.SimpleNamespace(text="Owner"), types.SimpleNamespace(text="Dave")
+                types.SimpleNamespace(text="Owner"), types.SimpleNamespace(text="Operator")
             ])])],
         )
 

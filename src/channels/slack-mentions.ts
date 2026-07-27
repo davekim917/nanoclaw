@@ -1,33 +1,33 @@
 /**
  * Slack outbound mention rewriter — sibling to `resolveDiscordMentions`
  * in discord.ts. Discord's adapter has had this since the sibling-handoff
- * work; Slack didn't, which meant agent-emitted `@illie-codex` rendered
+ * work; Slack didn't, which meant agent-emitted `@helper-codex` rendered
  * as plain text on Slack (no chip, no notification, peer doesn't get a
  * mention-engage wake — it only wakes because the channel's full feed
  * reaches it anyway).
  *
- * Slack requires `<@USER_ID>` (a real Slack user ID like `U0AKALV5HRP`)
+ * Slack requires `<@USER_ID>` (a real Slack user ID like `UTEST00021`)
  * to render a mention. The bot user IDs are discovered via `auth.test`
  * at factory time and cached in `knownSlackBots`.
  *
  * Cross-workspace isolation: bots in workspace A can't @-mention bots in
  * workspace B (different Slack tenants). Lookup is scoped to bots that
  * share the current workspace's `teamId`. Without this scoping, an agent
- * in MR's Slack writing `@illie-codex` (an Illysium bot) could resolve
+ * in Example Retail's Slack writing `@helper-codex` (an Example Labs bot) could resolve
  * to a stale or wrong user ID.
  */
 import { log } from '../log.js';
 import { transformOutsideProtectedRegions } from '../text-styles.js';
 
 export interface SlackBotIdentity {
-  /** Slack user_id, e.g. "U0AKALV5HRP" — the value to substitute into `<@…>`. */
+  /** Slack user_id, e.g. "UTEST00021" — the value to substitute into `<@…>`. */
   userId: string;
   /**
    * Slack `user.name` field as returned by `auth.test` — the legacy username
    * fixed at app install time. Slack's UI autocomplete does NOT prefer this
    * field when `displayName` or `realName` are present, so it's necessary
-   * but not sufficient for the rewriter on its own (e.g. Bo has `name=beau`
-   * but operators @-mention it as `@bo`).
+   * but not sufficient for the rewriter on its own (e.g. Example Assistant has `name=beau`
+   * but operators @-mention it as `@beacon`).
    */
   username: string;
   /**
@@ -37,9 +37,9 @@ export interface SlackBotIdentity {
    */
   displayName?: string;
   /**
-   * Profile `real_name`, e.g. "Bo" or "Bo-codex". Slack falls back to this
+   * Profile `real_name`, e.g. "Example Assistant" or "Example Assistant Codex". Slack falls back to this
    * for autocomplete when `display_name` is empty. The user-facing handle
-   * Dave actually types in Slack typically matches this lowercased.
+   * Operator actually types in Slack typically matches this lowercased.
    * Registered as a rewriter alias.
    */
   realName?: string;
@@ -77,12 +77,12 @@ export function getSlackBotDisplayName(channelType: string): string | null {
 }
 
 /**
- * Rewrite `@bot-username` and `<@bot-username>` to Slack's canonical
+ * Rewrite `@beacont-username` and `<@beacont-username>` to Slack's canonical
  * `<@USER_ID>` mention syntax for every sibling bot that lives in the
  * same Slack workspace as `currentChannelType`.
  *
  * Pass-through cases (intentional):
- *   - `<@U0AKALV5HRP>` (already canonical) — left alone; the user-id
+ *   - `<@UTEST00021>` (already canonical) — left alone; the user-id
  *     character class doesn't match a username, so the lookup misses
  *     and the original text is preserved.
  *   - Mentions inside code/links — `transformOutsideProtectedRegions`
@@ -115,18 +115,18 @@ export function resolveSlackMentions(
   //
   //   1. `username` (`user.name` from auth.test) — legacy install-time
   //      handle. Stays even if the operator renames the App's Default Name
-  //      in the App config. e.g. Bo's `name` is `beau` because that was the
-  //      original install name; renaming the App to "Bo" doesn't propagate
+  //      in the App config. e.g. Example Assistant's `name` is `beau` because that was the
+  //      original install name; renaming the App to "Example Assistant" doesn't propagate
   //      to existing bot user records.
   //   2. `displayName` — per-workspace customizable. When set, Slack's UI
   //      autocomplete prefers this over `name` and `realName`.
   //   3. `realName` — Slack's autocomplete fallback when `displayName` is
-  //      empty. The user-facing handle Dave actually sees in Slack
-  //      typically matches this (lowercased). e.g. Bo's `real_name` is "Bo"
-  //      and that's what `@bo` autocompletes against in MR Slack.
+  //      empty. The user-facing handle Operator actually sees in Slack
+  //      typically matches this (lowercased). e.g. Example Assistant's `real_name` is "Example Assistant"
+  //      and that's what `@beacon` autocompletes against in Example Retail Slack.
   //
-  // Plus separator-normalized aliases of each (`bo-codex` ↔ `bocodex` ↔
-  // `bo_codex`) for operator-typed handles that drop hyphens/underscores.
+  // Plus separator-normalized aliases of each (`example-assistant-codex` ↔ `example-assistant-codex` ↔
+  // `example-assistant-codex`) for operator-typed handles that drop hyphens/underscores.
   //
   // Conflict resolution: literal `username` keys win (they match the
   // canonical Slack handle exactly). `displayName`/`realName` literals
@@ -170,12 +170,12 @@ export function resolveSlackMentions(
 
   // Slack usernames allow `[a-z0-9._-]` per Slack's user-handle rules.
   // Composed as a base + optional `.SUFFIX` segments so a trailing
-  // sentence-ending period ("Your turn, @illie-codex.") doesn't get
+  // sentence-ending period ("Your turn, @helper-codex.") doesn't get
   // gobbled into the capture — matches Discord's pattern in discord.ts:328.
   //
   // Boundary: `(?<![\w/:])` keeps `user@domain.com` from parsing as
   // `@domain.com` AND skips `@`-after-URL-path/scheme cases like
-  // `https://example.com/@illie-codex` or `path/@illie-codex/sub`. Without
+  // `https://example.com/@helper-codex` or `path/@helper-codex/sub`. Without
   // the `/` and `:` in the exclude class, the bare-mention pass corrupts
   // URLs (path char `/` is not `\w`, so `(?<!\w)` alone would let it
   // through). `transformOutsideProtectedRegions` only shields code spans,
@@ -208,8 +208,8 @@ export function resolveSlackMentions(
 }
 
 /**
- * Strip Slack-handle separators (`-`, `_`, `.`) so `bo-codex` ≡ `bocodex` ≡
- * `bo_codex` for fuzzy matching. Used only as a fallback after literal
+ * Strip Slack-handle separators (`-`, `_`, `.`) so `example-assistant-codex` ≡ `example-assistant-codex` ≡
+ * `example-assistant-codex` for fuzzy matching. Used only as a fallback after literal
  * lookup misses — never replaces literal equality.
  */
 function normalizeHandle(handle: string): string {
@@ -294,10 +294,10 @@ export async function fetchSlackBotIdentity(client: SlackAuthTestClient): Promis
  *
  * Why the profile fields matter: Slack's UI autocomplete resolves
  * @-mentions against `profile.display_name` (preferred when set) or
- * `profile.real_name` (fallback), NOT `auth.test.user`. Bo's
- * `auth.test.user` is the legacy `beau` but operators type `@bo` in Slack
- * because `profile.real_name` is "Bo". Without the alias, an outbound
- * `@bo` ships as plain text.
+ * `profile.real_name` (fallback), NOT `auth.test.user`. Example Assistant's
+ * `auth.test.user` is the legacy `legacybot` but operators type `@beacon` in Slack
+ * because `profile.real_name` is "Example Assistant". Without the alias, an outbound
+ * `@beacon` ships as plain text.
  */
 export async function upgradeSlackBotProfile(
   client: Pick<SlackAuthTestClient, 'users'>,

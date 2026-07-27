@@ -31,7 +31,7 @@ export function canAccessAgentGroup(userId: string, agentGroupId: string): Acces
  * Is this sender one of NanoClaw's OWN bots (a sibling agent)?
  *
  * Sender ids are namespaced `<channelType>:<platformUserId>` (e.g.
- * `discord-opencode:1478986205319135302`). `botIds` is the set of platform
+ * `discord-opencode:123456789000000001`). `botIds` is the set of platform
  * user-ids belonging to our own bots in this process — collected from the
  * channel adapters' known-bot registries and injected into the access gate
  * (see `setSiblingBotIdsProvider` in `index.ts`).

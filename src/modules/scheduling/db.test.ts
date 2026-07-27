@@ -78,13 +78,13 @@ describe('insertTaskRow', () => {
       seriesId: 'task-thr',
       processAfter: new Date().toISOString(),
       recurrence: '*/10 * * * *',
-      platformId: 'C0AJA89MN2E',
+      platformId: 'CTEST00004',
       channelType: 'slack',
-      threadId: 'C0AJA89MN2E:1779996680.937799',
+      threadId: 'CTEST00004:1779996680.937799',
       content: JSON.stringify({ prompt: 'loop' }),
     });
     const row = db.prepare('SELECT thread_id FROM messages_in WHERE id = ?').get('task-thr') as { thread_id: string };
-    expect(row.thread_id).toBe('C0AJA89MN2E:1779996680.937799');
+    expect(row.thread_id).toBe('CTEST00004:1779996680.937799');
     db.close();
   });
 
@@ -95,7 +95,7 @@ describe('insertTaskRow', () => {
       seriesId: 'task-thr',
       processAfter: new Date().toISOString(),
       recurrence: '*/10 * * * *',
-      platformId: 'C0AJA89MN2E',
+      platformId: 'CTEST00004',
       channelType: 'slack',
       threadId: 'thr-xyz',
       content: JSON.stringify({ prompt: 'loop' }),

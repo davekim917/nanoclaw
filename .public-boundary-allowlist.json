@@ -1,0 +1,29 @@
+{
+  "entries": [
+    {
+      "path": "CODE_OF_CONDUCT.md",
+      "value": "community@nanoclaw.dev",
+      "reason": "Published project code of conduct contact"
+    },
+    {
+      "path": "README.md",
+      "value": "1470188214710046894",
+      "reason": "Published NanoClaw community Discord server identifier"
+    },
+    {
+      "path": "README_ja.md",
+      "value": "1470188214710046894",
+      "reason": "Published NanoClaw community Discord server identifier"
+    },
+    {
+      "path": "README_ko.md",
+      "value": "1470188214710046894",
+      "reason": "Published NanoClaw community Discord server identifier"
+    },
+    {
+      "path": "README_zh.md",
+      "value": "1470188214710046894",
+      "reason": "Published NanoClaw community Discord server identifier"
+    }
+  ]
+}

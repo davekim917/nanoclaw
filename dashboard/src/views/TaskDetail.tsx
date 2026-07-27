@@ -173,7 +173,7 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
             <a
               className="meta-link"
               style={{ color: 'var(--fg-2)', borderBottom: '1px dashed var(--line-2)' }}
-              href={`https://linear.app/illysium/issue/${linearId}`}
+              href={`https://linear.app/issue/${linearId}`}
               target="_blank"
               rel="noreferrer noopener"
             >
@@ -329,4 +329,3 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
     </div>
   );
 };
-

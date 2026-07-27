@@ -6,7 +6,7 @@ Lets an agent read your Slack from **your lens** — DMs, group DMs, channels yo
 
 | Where the agent runs | Default behavior | Override |
 |---|---|---|
-| Your 1:1 DM with the agent (bo↔you, illie↔you) | Slack MCP active — agent can search/read your Slack | n/a (already the safe path) |
+| Your 1:1 DM with the agent (primary↔you, helper↔you) | Slack MCP active — agent can search/read your Slack | n/a (already the safe path) |
 | A shared channel the agent is invited to (`#engineering`, etc.) | Slack MCP **NOT** registered for that spawn | Add the channel's `messaging_groups.id` to `container.json` → `slack_user_token.also_allowed_in` |
 
 The gate runs at spawn time, not per-tool-call. If denied, the MCP server is **never started** for that session — so the in-container LLM can't invoke its tools at all, regardless of prompt. Fail-closed by construction.
@@ -18,7 +18,7 @@ The gate runs at spawn time, not per-tool-call. If denied, the MCP server is **n
 Slack doesn't let you generate arbitrary `xoxp-` tokens — you need a Slack App with user-token scopes installed to your workspace.
 
 1. Go to <https://api.slack.com/apps> → **Create New App** → **From scratch**.
-2. App name: `<your-handle>-mcp` (e.g., `dave-mcp`). Workspace: pick the workspace.
+2. App name: `<your-handle>-mcp` (e.g., `operator-mcp`). Workspace: pick the workspace.
 3. **OAuth & Permissions** → **User Token Scopes** → add:
    - `search:read` — workspace search (most useful)
    - `channels:history`, `channels:read` — public channels you're in
@@ -37,8 +37,8 @@ The app is for your personal use; no need to publish to the directory.
 Use the OneCLI UI at <http://127.0.0.1:10254> or the CLI:
 
 ```bash
-onecli secrets create --name "Slack-User-Token-Illysium" --value "xoxp-…"
-onecli secrets create --name "Slack-User-Token-MadisonReed" --value "xoxp-…"
+onecli secrets create --name "Slack-User-Token-Example Labs" --value "xoxp-…"
+onecli secrets create --name "Slack-User-Token-ExampleRetail" --value "xoxp-…"
 # (one per workspace)
 ```
 
@@ -50,9 +50,9 @@ The container ships with `SLACK_MCP_XOXP_TOKEN=xoxp-onecli-managed-placeholder`.
 
 In the OneCLI UI:
 
-1. **Vault → Secrets → Slack-User-Token-Illysium → Host patterns**: add `slack.com` and `*.slack.com`.
+1. **Vault → Secrets → Slack-User-Token-Example Labs → Host patterns**: add `slack.com` and `*.slack.com`.
 2. **Auth method**: `Bearer` header replacement.
-3. Same for `Slack-User-Token-MadisonReed`.
+3. Same for `Slack-User-Token-ExampleRetail`.
 
 Once a workspace's secret is assigned to an agent (next step), every outbound HTTPS to `slack.com` from that agent's container gets its Authorization header replaced.
 
@@ -61,13 +61,13 @@ Once a workspace's secret is assigned to an agent (next step), every outbound HT
 Each workspace's secret is shared across all sibling agents in that workgroup. Use the workgroup-level OneCLI secret declaration (shipped in the workgroups feature):
 
 ```bash
-# Illysium workgroup gets the Illysium Slack token
-pnpm exec tsx scripts/set-workgroup-secrets.ts illysium \
-  --secrets "Anthropic,Exa,...,Slack-User-Token-Illysium"
+# Example Labs workgroup gets the Example Labs Slack token
+pnpm exec tsx scripts/set-workgroup-secrets.ts example-labs \
+  --secrets "Anthropic,Exa,...,Slack-User-Token-Example Labs"
 
-# MR workgroup gets the MR Slack token
-pnpm exec tsx scripts/set-workgroup-secrets.ts madison-reed \
-  --secrets "Anthropic,...,Datafold-MadisonReed,Slack-User-Token-MadisonReed"
+# Example Retail workgroup gets the Example Retail Slack token
+pnpm exec tsx scripts/set-workgroup-secrets.ts example-retail \
+  --secrets "Anthropic,...,Datafold-ExampleRetail,Slack-User-Token-ExampleRetail"
 ```
 
 The script validates the name against OneCLI vault before writing, fail-closed on typos.
@@ -88,12 +88,12 @@ Edit each agent's `groups/<folder>/container.json`:
 
 Wire to the agents you want to grant this capability:
 
-- `groups/illysium/container.json`
-- `groups/illysium-codex/container.json`
-- `groups/madison-reed/container.json`
-- `groups/madison-reed-codex/container.json`
+- `groups/example-labs/container.json`
+- `groups/example-labs-codex/container.json`
+- `groups/example-retail/container.json`
+- `groups/example-retail-codex/container.json`
 
-Sibling pairs share the workgroup's assigned token via the workgroup-level secret declaration — both `illie` and `illie-codex` route through `Slack-User-Token-Illysium`.
+Sibling pairs share the workgroup's assigned token via the workgroup-level secret declaration — both `helper` and `helper-codex` route through `Slack-User-Token-Example Labs`.
 
 ### Adding a trusted channel to the override list
 

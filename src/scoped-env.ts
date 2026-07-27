@@ -2,10 +2,10 @@
  * Scoped tool + credential env helpers (ported from v1).
  *
  * Container-runner reads a per-agent-group `tools` array from container.json.
- * Each entry is either bare (`snowflake`) or scoped (`snowflake:sunday`).
+ * Each entry is either bare (`snowflake`) or scoped (`snowflake:archive-one`).
  * Scoping gates which credentials the agent's mounts expose — e.g.
- * `snowflake:sunday` stages a filtered `connections.toml` containing only
- * the `[connections.sunday]` section and its referenced private keys.
+ * `snowflake:archive-one` stages a filtered `connections.toml` containing only
+ * the `[connections.archive-one]` section and its referenced private keys.
  *
  * Fallback modes for `scopedEnvKey`:
  *   - 'bare':  unscoped → `${PREFIX}`,           scoped → `${PREFIX}_${SCOPE}`
@@ -39,7 +39,7 @@ export function isToolEnabled(tools: string[] | undefined, name: string): boolea
 
 /**
  * Pull scope values for a tool out of a `tools` array. A tools entry like
- * `gmail:illysium` contributes the scope `illysium`. Scopes failing
+ * `gmail:example-labs` contributes the scope `example-labs`. Scopes failing
  * SAFE_SCOPE_RE are dropped (logged). `isScoped` is true when the caller
  * listed ONLY scoped forms (no bare entry) — i.e. the agent does not have
  * access to every scope.

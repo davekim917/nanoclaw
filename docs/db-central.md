@@ -77,7 +77,7 @@ CREATE TABLE messaging_group_agents (
 
 ### 1.4 `users`
 
-Platform user identities. ID is namespaced: `tg:123456`, `discord:abc`, `phone:+1555...`, `email:a@x.com`. One human may own several rows — no cross-channel linking yet.
+Platform user identities. ID is namespaced: `tg:123456`, `discord:abc`, `phone:+1555...`, `email:person9@fixture16.example.com`. One human may own several rows — no cross-channel linking yet.
 
 ```sql
 CREATE TABLE users (

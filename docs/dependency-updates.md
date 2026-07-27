@@ -1,6 +1,6 @@
 # Dependency Updates
 
-NanoClaw uses one deterministic release adapter for the weekly `#axie-dev` advisory and the `/update-container` workflow:
+NanoClaw uses one deterministic release adapter for the weekly `#example-dev` advisory and the `/update-container` workflow:
 
 ```bash
 bun scripts/container-updates.ts audit --format json

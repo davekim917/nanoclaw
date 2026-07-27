@@ -16,10 +16,10 @@ import type { Migration } from './index.js';
  *
  * Columns:
  *   gmail_thread_id       — Gmail thread id; the stable 1:1 key (PRIMARY KEY).
- *   agent_group_id        — the agent group whose session works the issue (illie).
+ *   agent_group_id        — the agent group whose session works the issue (helper).
  *   messaging_group_id    — the channel the announcement + thread live in.
- *   linear_team           — routed Linear team (e.g. "XZO" / "Apollo"), nullable.
- *   linear_issue          — Linear issue identifier (e.g. "XZO-123"), nullable.
+ *   linear_team           — routed Linear team (e.g. "EXAMPLE" / "Example Data"), nullable.
+ *   linear_issue          — Linear issue identifier (e.g. "EXAMPLE-123"), nullable.
  *   slack_parent_msg_id   — the channel announcement message id (thread parent).
  *   slack_thread_id       — chat-sdk *encoded* thread id used for session routing.
  *   session_id            — the per-issue per-thread session id.

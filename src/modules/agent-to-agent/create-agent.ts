@@ -177,8 +177,8 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   }
 
   // SECURITY (cross-tenant audit 2026-05-03): folder-name prefix collision
-  // would let scoped-env env-var matching cross-leak (e.g. folder=axie
-  // inheriting AXIE_DEV_* vars from folder=axie-dev). Normalize tokens and
+  // would let scoped-env env-var matching cross-leak (e.g. folder=example-agent
+  // inheriting EXAMPLE_DEV_* vars from folder=example-dev). Normalize tokens and
   // refuse if any existing folder's token is a prefix of this one or vice
   // versa.
   const newTok = folder.toUpperCase().replace(/-/g, '_');

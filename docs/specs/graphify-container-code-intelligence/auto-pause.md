@@ -32,7 +32,7 @@ This deterministic remediation evidence did not change the v4 result. The subseq
 
 ## Live-topology correction
 
-The final audit found that the current system is not a clean pre-feature baseline. A Madison Reed container observed during the audit used the July 18 `latest` image, which already contains `/usr/local/bin/graphify`, and exposed the current Graphify skill through a live bind mount. Its host-created topology predated the Graphify host changes: there was no `/workspace/.cache/graphify` or `/run/nanoclaw-graphify` bind mount and no `/workspace/.graphify-stage` tmpfs. The old host also still mounted the host GitNexus plugin directory, although the GitNexus executable was absent. No Graphify execution appeared in the retained container logs.
+The final audit found that the current system is not a clean pre-feature baseline. A Example Retail container observed during the audit used the July 18 `latest` image, which already contains `/usr/local/bin/graphify`, and exposed the current Graphify skill through a live bind mount. Its host-created topology predated the Graphify host changes: there was no `/workspace/.cache/graphify` or `/run/nanoclaw-graphify` bind mount and no `/workspace/.graphify-stage` tmpfs. The old host also still mounted the host GitNexus plugin directory, although the GitNexus executable was absent. No Graphify execution appeared in the retained container logs.
 
 At that checkpoint the ephemeral agent container had exited and no agent containers were running at 2026-07-19T05:02:22Z. It was only a quiet window: the unchanged old host and `latest` image could recreate the partial topology on the next wake, and the protected candidate's topology guard was not yet active in `latest`.
 

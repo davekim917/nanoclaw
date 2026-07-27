@@ -126,7 +126,7 @@ describe('stripLeadingMentions integration via preFanoutGate', () => {
     const owner = 'discord:owner-1';
     insertUser(owner);
     insertRole(owner, 'owner', null);
-    const result = preFanoutGate(JSON.stringify({ text: '<@1496115500214911006> /dashboard-token' }), owner);
+    const result = preFanoutGate(JSON.stringify({ text: '<@123456789000000014> /dashboard-token' }), owner);
     expect(result).toEqual({
       action: 'intercept',
       handlerName: 'dashboard_token_issue',
@@ -137,10 +137,10 @@ describe('stripLeadingMentions integration via preFanoutGate', () => {
 
   it('test_preFanoutGate_intercept_with_slack_mention_prefix_with_alias', () => {
     // Slack mention with display-name alias `<@U_ID|name>` must still intercept.
-    const owner = 'slack-illysium:owner-2';
+    const owner = 'slack-example-labs:owner-2';
     insertUser(owner);
     insertRole(owner, 'owner', null);
-    const result = preFanoutGate(JSON.stringify({ text: '<@U08H7SULNER|illie> /dashboard-token' }), owner);
+    const result = preFanoutGate(JSON.stringify({ text: '<@UTEST00013|helper> /dashboard-token' }), owner);
     expect(result).toEqual({
       action: 'intercept',
       handlerName: 'dashboard_token_issue',
@@ -154,7 +154,7 @@ describe('stripLeadingMentions integration via preFanoutGate', () => {
     const owner = 'discord:owner-3';
     insertUser(owner);
     insertRole(owner, 'owner', null);
-    const result = preFanoutGate(JSON.stringify({ text: '@axie /dashboard-token' }), owner);
+    const result = preFanoutGate(JSON.stringify({ text: '@example-agent /dashboard-token' }), owner);
     expect(result).toEqual({
       action: 'intercept',
       handlerName: 'dashboard_token_issue',
@@ -168,10 +168,10 @@ describe('threaded inbound — extractUserMessage', () => {
   it('test_preFanoutGate_intercept_when_wrapped_in_thread_context', () => {
     // chat-sdk wraps Slack DM thread replies with "[Thread context]\n...\n[Latest message]\n<user>".
     // preFanoutGate must classify the user's last message, not the prior assistant context.
-    const owner = 'slack-illysium:U08H7SULNER';
+    const owner = 'slack-example-labs:UTEST00013';
     insertUser(owner);
     insertRole(owner, 'owner', null);
-    const wrapped = `[Thread context]\nassistant: prior message about something\n[Latest message]\n@U0AKALV5HRP /dashboard-token`;
+    const wrapped = `[Thread context]\nassistant: prior message about something\n[Latest message]\n@UTEST00021 /dashboard-token`;
     const result = preFanoutGate(JSON.stringify({ text: wrapped }), owner);
     expect(result).toEqual({
       action: 'intercept',

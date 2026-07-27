@@ -134,26 +134,26 @@ describe('formatter', () => {
 
 describe('fast-mode flag application', () => {
   it('persists sticky Codex on/off and honors one-turn precedence', () => {
-    insertMessage('m1', 'chat', { sender: 'Dave', text: 'hi', flagIntent: { stickyFast: true } });
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi', flagIntent: { stickyFast: true } });
     const messages = getPendingMessages();
     const routing = extractRouting(messages);
 
     expect(applyFlagBatch(messages, routing, 'codex').fast).toBe(true);
     expect(applyFlagBatch([], routing, 'codex').fast).toBe(true);
 
-    insertMessage('m2', 'chat', { sender: 'Dave', text: 'standard once', flagIntent: { turnFast: false } });
+    insertMessage('m2', 'chat', { sender: 'Operator', text: 'standard once', flagIntent: { turnFast: false } });
     const oneTurn = getPendingMessages().filter((m) => m.id === 'm2');
     expect(applyFlagBatch(oneTurn, routing, 'codex').fast).toBe(false);
     expect(applyFlagBatch([], routing, 'codex').fast).toBe(true);
 
-    insertMessage('m3', 'chat', { sender: 'Dave', text: 'standard', flagIntent: { stickyFast: false } });
+    insertMessage('m3', 'chat', { sender: 'Operator', text: 'standard', flagIntent: { stickyFast: false } });
     const stickyOff = getPendingMessages().filter((m) => m.id === 'm3');
     expect(applyFlagBatch(stickyOff, routing, 'codex').fast).toBe(false);
     expect(applyFlagBatch([], routing, 'codex').fast).toBe(false);
   });
 
   it('does not apply a preserved Codex sticky to another provider', () => {
-    insertMessage('m1', 'chat', { sender: 'Dave', text: 'hi', flagIntent: { stickyFast: true } });
+    insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi', flagIntent: { stickyFast: true } });
     const messages = getPendingMessages();
     const routing = extractRouting(messages);
     expect(applyFlagBatch(messages, routing, 'codex').fast).toBe(true);
@@ -773,7 +773,7 @@ describe('routing', () => {
     // posts to the channel root. A wake triggered by a thread chat earlier
     // populates session_routing with that thread, but the task's explicit
     // null thread_id MUST NOT be overridden by the session's thread.
-    // (Real-world manifestation: madison-reed synth on 2026-05-01 scheduled
+    // (Real-world manifestation: example-retail synth on 2026-05-01 scheduled
     // for discord channel root, landed in a stale session thread because
     // the prior `??` fallback treated null as "missing".)
     const db = getInboundDb();
@@ -837,24 +837,24 @@ describe('routing', () => {
   });
 
   it('keeps the Discord session origin for an internal self-agent notification', () => {
-    seedSessionRouting('discord', 'discord:1479489865702703155:1496304577081770106', '1496304577081770106');
-    insertInternalAgentNotification('appr-note-discord', 'number-drinks-codex');
+    seedSessionRouting('discord', 'discord:123456789000000002:123456789000000007', '123456789000000007');
+    insertInternalAgentNotification('appr-note-discord', 'example-beverage-codex');
 
     const routing = extractRouting(getPendingMessages());
-    expect(routing.platformId).toBe('discord:1479489865702703155:1496304577081770106');
+    expect(routing.platformId).toBe('discord:123456789000000002:123456789000000007');
     expect(routing.channelType).toBe('discord');
-    expect(routing.threadId).toBe('1496304577081770106');
+    expect(routing.threadId).toBe('123456789000000007');
     expect(routing.inReplyTo).toBe('appr-note-discord');
   });
 
   it('keeps the Slack session origin for an internal self-agent notification', () => {
-    seedSessionRouting('slack', 'slack:C0AJA89MN2E', 'slack:C0AJA89MN2E:1784808844.188429');
-    insertInternalAgentNotification('appr-note-slack', 'number-drinks-codex');
+    seedSessionRouting('slack', 'slack:CTEST00004', 'slack:CTEST00004:1784808844.188429');
+    insertInternalAgentNotification('appr-note-slack', 'example-beverage-codex');
 
     const routing = extractRouting(getPendingMessages());
-    expect(routing.platformId).toBe('slack:C0AJA89MN2E');
+    expect(routing.platformId).toBe('slack:CTEST00004');
     expect(routing.channelType).toBe('slack');
-    expect(routing.threadId).toBe('slack:C0AJA89MN2E:1784808844.188429');
+    expect(routing.threadId).toBe('slack:CTEST00004:1784808844.188429');
     expect(routing.inReplyTo).toBe('appr-note-slack');
   });
 
@@ -867,20 +867,20 @@ describe('routing', () => {
     // older chat row as `first` and the task's reply lands in that thread
     // instead of the channel root.
     //
-    // Real-world manifestation: 2026-05-07, illyse Slack agent — every */15
-    // task fired into the originating thread instead of #agents-xzo root.
+    // Real-world manifestation: 2026-05-07, example-app Slack agent — every */15
+    // task fired into the originating thread instead of #agents-example root.
     const db = getInboundDb();
     db.prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content)
        VALUES ('chat-old', 2, 'chat-sdk', datetime('now', '-1 hour'), 'pending',
-               'slack:C0AJA89MN2E', 'slack-illysium',
-               'slack:C0AJA89MN2E:1778100372.246009',
+               'slack:CTEST00004', 'slack-example-labs',
+               'slack:CTEST00004:1778100372.246009',
                '{"text":"original user request that opened the thread"}')`,
     ).run();
     db.prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content)
        VALUES ('task-new', 4, 'task', datetime('now'), 'pending',
-               'slack:C0AJA89MN2E', 'slack-illysium', NULL,
+               'slack:CTEST00004', 'slack-example-labs', NULL,
                '{"prompt":"poll inbox"}')`,
     ).run();
 
@@ -888,7 +888,7 @@ describe('routing', () => {
     const routing = extractRouting(messages);
     expect(routing.inReplyTo).toBe('task-new');
     expect(routing.threadId).toBeNull();
-    expect(routing.platformId).toBe('slack:C0AJA89MN2E');
+    expect(routing.platformId).toBe('slack:CTEST00004');
   });
 });
 
@@ -1287,8 +1287,8 @@ describe('task-fire routing — a stamped `ncl tasks` row routes end-to-end', ()
 });
 
 describe('dispatchResultText — unclosed-wrapper tolerance', () => {
-  // Production repro (illie-codex, 2026-05-17 Slack thread C0AJA89MN2E):
-  // the agent emitted two `<message to="slack_illysium_agents_xzo">`
+  // Production repro (helper-codex, 2026-05-17 Slack thread CTEST00004):
+  // the agent emitted two `<message to="slack_example-labs_agents-example">`
   // openers in one final response with NO closing `</message>` tag for
   // either. The old regex required a close → zero matches → the entire
   // text fell through to the unwrapped-fallback path and Slack saw the
@@ -1317,7 +1317,7 @@ describe('dispatchResultText — unclosed-wrapper tolerance', () => {
   });
 
   it('two consecutive unclosed openers (same dest) → two sends, no markup leak', () => {
-    // Mirrors the illie-codex production repro: two `<message to="…">`
+    // Mirrors the helper-codex production repro: two `<message to="…">`
     // openers, no closes. Each becomes its own outbound row.
     seedDestination('slack-main', 'slack', 'C-MAIN');
     dispatchResultText(
@@ -1566,7 +1566,7 @@ const ERR_ROUTING = {
 describe('mid-turn fast-mode changes', () => {
   it('ends the active query and leaves the flag row pending for a fast-tier respawn', async () => {
     insertMessage('m-fast', 'chat', {
-      sender: 'Dave',
+      sender: 'Operator',
       text: 'use fast mode',
       flagIntent: { turnFast: true },
     });

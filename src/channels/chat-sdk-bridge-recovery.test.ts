@@ -20,8 +20,8 @@ function message(options: {
   const formatted = parseMarkdown(options.text);
   const author = {
     userId: options.isMe ? 'bot-self' : `user-${options.id}`,
-    userName: options.isMe ? 'Axie' : 'Dave',
-    fullName: options.isMe ? 'Axie' : 'Dave',
+    userName: options.isMe ? 'Example Agent' : 'Operator',
+    fullName: options.isMe ? 'Example Agent' : 'Operator',
     isBot: options.isBot ?? false,
     isMe: options.isMe ?? false,
   };
@@ -177,7 +177,7 @@ describe('Chat SDK bridge missed-message recovery', () => {
       message({ id: 'new-2', timestamp: '2026-07-21T18:20:00Z', text: 'second' }),
       message({ id: 'old', timestamp: '2026-07-21T18:15:00Z', text: 'before gap' }),
       message({ id: 'self', timestamp: '2026-07-21T18:19:00Z', text: 'bot reply', isBot: true, isMe: true }),
-      message({ id: 'new-1', timestamp: '2026-07-21T18:18:00Z', text: '@Axie first', raw: { mention: true } }),
+      message({ id: 'new-1', timestamp: '2026-07-21T18:18:00Z', text: '@Example Agent first', raw: { mention: true } }),
     ];
     const adapter = {
       name: 'stub',
@@ -313,7 +313,7 @@ describe('Chat SDK bridge missed-message recovery', () => {
   });
 
   it('keeps the original gap floor after failure even when the next trigger is newer', async () => {
-    const missed = message({ id: 'missed', timestamp: '2026-07-21T18:17:00Z', text: '@Axie missed' });
+    const missed = message({ id: 'missed', timestamp: '2026-07-21T18:17:00Z', text: '@Example Agent missed' });
     const fetchMessages = vi
       .fn()
       .mockRejectedValueOnce(new Error('temporary history failure'))

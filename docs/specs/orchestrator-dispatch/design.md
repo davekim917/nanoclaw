@@ -792,7 +792,7 @@ If no decisions meet the threshold during the build phase (i.e., `jony-ive` prod
 
 ## Questions for User *(any remaining)*
 
-- **Channel selection for Phase 1 createThread support:** Defaulting to Slack + Discord. The user's example workflow (XZO 22-item dispatch) implied Slack as the orchestrator surface. If the orchestrator agent will be wired to Discord instead (or both), Phase 1 still ships both adapters' createThread, but the test plan should target the actual orchestrator's channel. — **Flag if not Slack as primary.**
+- **Channel selection for Phase 1 createThread support:** Defaulting to Slack + Discord. The user's example workflow (EXAMPLE 22-item dispatch) implied Slack as the orchestrator surface. If the orchestrator agent will be wired to Discord instead (or both), Phase 1 still ships both adapters' createThread, but the test plan should target the actual orchestrator's channel. — **Flag if not Slack as primary.**
 - **Dashboard token UX:** Defaulting to "owner DM with `/dashboard-token` triggers a one-time token via DM." Alternative would be a setup-flow CLI that prints the token to the host terminal. The DM path is more secure (doesn't require host shell access) but assumes the orchestrator's DM is reachable. — **Flag if you'd prefer a host-shell-based token emission for /team-build.**
 
 ---

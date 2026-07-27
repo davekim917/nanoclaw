@@ -143,9 +143,9 @@ Formalize **workgroup** as a first-class layer above `agent_groups`. A workgroup
 
 #### Identifier semantics (M2 + cycle-2 S1)
 
-`workgroup_id` and `workgroups.id` are both the **folder slug** (e.g., `"axie-dev"`, `"madison-reed"`).
+`workgroup_id` and `workgroups.id` are both the **folder slug** (e.g., `"example-dev"`, `"example-retail"`).
 
-**Asymmetry note** (cycle-2 S1): on Dave's install, parent agent_groups carry opaque `ag-<ts>-<rand>` ids while codex twin agent_groups carry slug-equal-id (e.g., `agent_groups.id = "madison-reed-codex"`). So `workgroup_id = folder_slug` is:
+**Asymmetry note** (cycle-2 S1): on Operator's install, parent agent_groups carry opaque `ag-<ts>-<rand>` ids while codex twin agent_groups carry slug-equal-id (e.g., `agent_groups.id = "example-retail-codex"`). So `workgroup_id = folder_slug` is:
 - For parents: `workgroup_id (= folder) ≠ agent_groups.id`
 - For codex twins: `workgroup_id (= folder) = agent_groups.id` (incidentally — clone-as-codex stamps id as folder slug)
 
@@ -153,7 +153,7 @@ Rationale for picking slug: operator-facing handle, matches `container.json` dec
 
 **CHECK constraint** (cycle-2 S1): `workgroups.id` must match the slug pattern (`^[a-z][a-z0-9-]*$`, not matching `^ag-`) to prevent future opaque-id contamination.
 
-**Trade-off acknowledgment** (cycle-2 S8): slug-as-PK has known mainstream drift (GitHub 2024 moved client_id to opaque). For Dave's install (10 stable pairs, no rename activity), slug-as-PK is acceptable. Future-proofing path: if rename activity emerges, a follow-on migration adds an opaque PK with slug as UNIQUE column.
+**Trade-off acknowledgment** (cycle-2 S8): slug-as-PK has known mainstream drift (GitHub 2024 moved client_id to opaque). For Operator's install (10 stable pairs, no rename activity), slug-as-PK is acceptable. Future-proofing path: if rename activity emerges, a follow-on migration adds an opaque PK with slug as UNIQUE column.
 
 #### Declaration model & membership SoT (M1)
 
@@ -252,7 +252,7 @@ SELECT MIN(id) AS id,
 
 Single store per workgroup. `workgroups.mnemon_store_id` is the canonical store identifier. All workgroup members read/write the same store via `MNEMON_STORE=<workgroups.mnemon_store_id>` at spawn.
 
-**CRITICAL: backfill mnemon_store_id to preserve existing recall history** (cycle-2 M1). Existing mnemon stores on Dave's install are keyed on `agent_groups.id` (verified: illie's store is at `~/.mnemon/data/ag-1776377699463-2axxhg/mnemon.db` with 43MB of accumulated facts). The backfill MUST preserve these paths:
+**CRITICAL: backfill mnemon_store_id to preserve existing recall history** (cycle-2 M1). Existing mnemon stores on Operator's install are keyed on `agent_groups.id` (verified: helper's store is at `~/.mnemon/data/ag-1700000000000-example01/mnemon.db` with 43MB of accumulated facts). The backfill MUST preserve these paths:
 
 For each backfilled workgroup, the migration sets `mnemon_store_id` to the **parent member's existing `agent_groups.id`**:
 
@@ -271,7 +271,7 @@ for (const workgroup of backfilledWorkgroups) {
 }
 ```
 
-Net effect: workgroup `illysium` → `mnemon_store_id = 'ag-1776377699463-2axxhg'` (illie's existing store path). Container's `MNEMON_STORE=ag-1776377699463-2axxhg` matches today's value. Zero data loss; 43MB recall history preserved.
+Net effect: workgroup `example-labs` → `mnemon_store_id = 'ag-1700000000000-example01'` (helper's existing store path). Container's `MNEMON_STORE=ag-1700000000000-example01` matches today's value. Zero data loss; 43MB recall history preserved.
 
 **Read path:**
 - `container-runner.ts:1775` reads `workgroups.mnemon_store_id` for the spawning agent's workgroup; sets `MNEMON_STORE=<that_id>`.
@@ -534,7 +534,7 @@ If `reconcileWorkgroupFsState` throws partway through, the SQL migration is unaf
 
 #### Transition state note (S2)
 
-For Dave's existing install:
+For Operator's existing install:
 - Migration 036 runs → backfill pairs the 10 codex twins with their parents.
 - Container.json `recall_scope: 'workgroup'` written into both members of each pair.
 - New mnemon writes go to `workgroups.id` (parent's folder name) — the codex twin's old empty store stops accumulating.
@@ -543,7 +543,7 @@ For Dave's existing install:
 
 **Confidence note (revised after cycle-1 review):** High overall.
 
-1. **Suffix-strip heuristic** correctly handles all 10 of Dave's current pairs but is not future-proof for siblings like `<x>-research`. Acceptable trade-off — brief says explicit `workgroup_id` declaration is the long-term path; the heuristic is a one-time migration convenience. Backfill report (S7) makes pairings auditable.
+1. **Suffix-strip heuristic** correctly handles all 10 of Operator's current pairs but is not future-proof for siblings like `<x>-research`. Acceptable trade-off — brief says explicit `workgroup_id` declaration is the long-term path; the heuristic is a one-time migration convenience. Backfill report (S7) makes pairings auditable.
 2. **No default-flip risk** — cycle-1 review surfaced the surprise potential of changing `getRecallScope` default. Revised approach writes explicit `recall_scope: 'workgroup'` into container.json for auto-paired groups during migration; standalone groups untouched. No implicit-self behavior change.
 3. **Invariants W1–W3** are enforced at migration validation, FK constraint, and projection build — fail-closed rather than silent.
 
@@ -558,7 +558,7 @@ For Dave's existing install:
   - `ALTER TABLE agent_groups ADD COLUMN workgroup_id TEXT REFERENCES workgroups(id)` — **nullable at schema layer; W1 enforced by migration validation + W3 runtime** (cycle-3 M1)
   - `CREATE INDEX idx_agent_groups_workgroup_id ON agent_groups(workgroup_id)` (M7)
   - Backfill: suffix-strip `<x>-codex` + parent-existence (M2: folder slug as identifier; cycle-2 M5 fix for orphan classification)
-  - **CRITICAL: `workgroups.mnemon_store_id` backfilled to parent's existing `agent_groups.id`** (cycle-2 M1) — preserves illie's 43MB of accumulated recall facts
+  - **CRITICAL: `workgroups.mnemon_store_id` backfilled to parent's existing `agent_groups.id`** (cycle-2 M1) — preserves helper's 43MB of accumulated recall facts
   - Backfill validation: W1 + W2 invariants asserted before schema_version bump
   - **`PRAGMA foreign_key_check`** after backfill, before schema_version bump (cycle-3 S1 defense-in-depth)
   - **NO FS writes inside migration** — moves to `reconcileWorkgroupFsState()` startup phase per cycle-3 M2
@@ -579,7 +579,7 @@ For Dave's existing install:
 - **`src/modules/memory/recall-injection.ts`:** type-union widening for `'workgroup'`.
 - **`container/agent-runner/src/mcp-tools/thread-search.ts`:** drop `agent_group_id = ?` filters at `:225, :359-366, :515-531` (per M5 table).
 - **`container/agent-runner/src/mcp-tools/backlog.ts`, `server.ts`:** in-container `agent_group_id = ?` filters KEEP (per M5 table — agent-scoped tables).
-- **`docs/workgroups.md` includes a "Staleness window" section** (cycle-2 S9): documents that long-running containers hold workgroup_id at spawn time; operator-edited container.json doesn't propagate to running containers until restart. For Dave's install this is acceptable (he restarts to apply env changes); future `/reconcile-workgroups` admin command is a deferred enhancement.
+- **`docs/workgroups.md` includes a "Staleness window" section** (cycle-2 S9): documents that long-running containers hold workgroup_id at spawn time; operator-edited container.json doesn't propagate to running containers until restart. For Operator's install this is acceptable (he restarts to apply env changes); future `/reconcile-workgroups` admin command is a deferred enhancement.
 - **Tests:**
   - Projection workgroup-scoping (positive + dedup)
   - Per-table strategy assertions (backlog stays agent-scoped, etc.)
@@ -589,7 +589,7 @@ For Dave's existing install:
   - Backfill heuristic across all 10 known sibling-pair shapes
   - Reconciler idempotency across partial-failure simulation (S9)
   - Structural test (bidirectional, cycle-2 S4 + cycle-3 M4 scoping fix): (a) no orphan `messages_archive` queries outside projection chokepoint; (b) `backlog_items` / `ship_log` queries in container MUST contain `WHERE ... agent_group_id = ?` substring (NOT `tasks` — bounded by projection's `parent_agent_group_id` column filter, not in-container `agent_group_id`); (c) `server.ts` orchestrator query MUST contain `WHERE agent_group_id = ?`
-  - mnemon_store_id backfill correctness: post-migration `workgroups.mnemon_store_id` for `illysium` workgroup equals illie's existing `agent_groups.id`; mnemon recall still finds pre-migration facts (cycle-2 M1)
+  - mnemon_store_id backfill correctness: post-migration `workgroups.mnemon_store_id` for `example-labs` workgroup equals helper's existing `agent_groups.id`; mnemon recall still finds pre-migration facts (cycle-2 M1)
   - Migration 036 idempotency (re-run is no-op)
 - **Docs:** new `docs/workgroups.md` documenting the model; update `CLAUDE.md` § "Entity Model" and § "Secrets / Credentials / OneCLI" to reference workgroups.
 
@@ -610,13 +610,13 @@ For Dave's existing install:
 
 | # | Assumption | Impact if Wrong | How to Validate |
 |---|-----------|----------------|-----------------|
-| A1 | Suffix-strip + parent-existence pairs all 10 of Dave's current sibling folders | Medium — operator manual override required for missed pairs | Enumerate `agent_groups` rows with `folder LIKE '%-codex'` pre-migration; verify each has a matching non-codex `folder` row; report any mismatch from backfill |
-| A2 | Workgroup-of-1 mnemon recall (standalone groups) is functionally equivalent to today's `'self'` | High — changes isolation semantics for existing standalone groups if false | Test: with `'workgroup'` mode resolving `axie-dev` (workgroup-of-1), the returned group-id set equals `['axie-dev's agent_group_id']` (same as `'self'`) |
+| A1 | Suffix-strip + parent-existence pairs all 10 of Operator's current sibling folders | Medium — operator manual override required for missed pairs | Enumerate `agent_groups` rows with `folder LIKE '%-codex'` pre-migration; verify each has a matching non-codex `folder` row; report any mismatch from backfill |
+| A2 | Workgroup-of-1 mnemon recall (standalone groups) is functionally equivalent to today's `'self'` | High — changes isolation semantics for existing standalone groups if false | Test: with `'workgroup'` mode resolving `example-dev` (workgroup-of-1), the returned group-id set equals `['example-dev's agent_group_id']` (same as `'self'`) |
 | A3 | `applyOnecliSecrets` correctly handles a unioned list (workgroup ∪ per-group); host-side dedup not required by OneCLI | Low — host can dedup with a `Set` before the call if needed | Pass duplicates in `declarations`; verify `runOnecli(['agents','set-secrets','--id',uuid,'--secret-ids',ids.join(','])` succeeds and resolves to deduplicated UUIDs |
 | A4 | Dropping in-container `agent_group_id = ?` filter doesn't break any other tool path | Medium — shape changes if a caller depends on the filter | `grep -rn "agent_group_id" container/agent-runner/src/mcp-tools/` to enumerate all usages; run container tests against the modified projection |
 | A5 | ~~Flipping default to `'workgroup'`~~ Migration writes explicit `recall_scope: 'workgroup'` for paired groups; default stays `'self'` | N/A — no implicit-self consumer affected | Test: container.json post-migration has explicit `recall_scope: 'workgroup'` for all paired members |
 | A6 | Migration 036 idempotency holds across partial failure (schema applied, backfill crashed mid-way) | Low — wrapped in single SQLite transaction (S9); partial failure rolls back schema + backfill atomically | Test: simulate failure mid-backfill (kill process), verify schema_version unbumped + tables unchanged + re-run succeeds |
-| A7 | The `groups/` filesystem (folder names) and `agent_groups.folder` are kept in sync today by host code | **Medium** (revised per A12) — drift produces silent backfill misses; mitigated by backfill report (S7) listing every decision | `SELECT folder FROM agent_groups` matches `ls groups/` output minus dotfiles; verified on Dave's install before migration runs; backfill report flags unmatched rows |
+| A7 | The `groups/` filesystem (folder names) and `agent_groups.folder` are kept in sync today by host code | **Medium** (revised per A12) — drift produces silent backfill misses; mitigated by backfill report (S7) listing every decision | `SELECT folder FROM agent_groups` matches `ls groups/` output minus dotfiles; verified on Operator's install before migration runs; backfill report flags unmatched rows |
 
 ---
 
@@ -626,7 +626,7 @@ For Dave's existing install:
 
 - **D5:** Chose Option A (workgroups table + workgroup_id column on agent_groups). Rejected: Option B (tag-only — duplicates workgroup-level config across N container.json files, drift trap) and Option C (filesystem-driven workgroup.json — new topology layer not present elsewhere, slower lookup). Constraint refs: [C1, C2, C3]. Affects groups: [TBD — populated by /team-plan].
 - **D6:** Backfill heuristic = suffix-strip `<x>-codex` + bidirectional parent-existence check. Rejected: prefix-match (ambiguous on `<x>-bot-codex` style names); explicit-only (violates R6's "auto-pair without operator action"). Constraint refs: [C7].
-- **D7:** Mnemon default scope flips from `'self'` to `'workgroup'` at `getRecallScope` default in `container-config.ts:74`. Rejected: keep `'self'` default and require explicit `recall_scope: 'workgroup'` per group (more conservative but requires 10+ container.json edits on Dave's install and defeats the auto-pairing benefit of R6). Constraint refs: [C4].
+- **D7:** Mnemon default scope flips from `'self'` to `'workgroup'` at `getRecallScope` default in `container-config.ts:74`. Rejected: keep `'self'` default and require explicit `recall_scope: 'workgroup'` per group (more conservative but requires 10+ container.json edits on Operator's install and defeats the auto-pairing benefit of R6). Constraint refs: [C4].
 - **D8:** OneCLI secret merge semantics = workgroup baseline ∪ per-group additive (UNION, additive-only). Rejected: per-group replaces workgroup (a sibling could silently weaken the shared baseline); strict workgroup-only (defeats per-group tool-specific secrets like a single group needing Datafold). Constraint refs: [].
 - **D9:** Drop in-container `WHERE agent_group_id = ?` from thread tools. Rejected: keep filter but add workgroup-aware variant (defeats pooling intent — projection already bounds visibility, in-tool filter would only narrow). Constraint refs: [C1].
 

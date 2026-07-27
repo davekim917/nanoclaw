@@ -2,9 +2,9 @@
 
 **Status:** spec only, 2026-04-17. Promoted from T3.6 ("evaluate after
 running v2") because it's a daily-use showstopper, not a
-nice-to-have. Container runs; bot replies in Slack/Discord. But Axie-2
+nice-to-have. Container runs; bot replies in Slack/Discord. But Example Agent-2
 can't do real engineering work yet — it can't clone, work on, or PR
-against Illysium repos the way Axie v1 does.
+against Example Labs repos the way Example Agent v1 does.
 
 ## Problem
 
@@ -12,7 +12,7 @@ v2 currently has no story for repo work. If an agent runs `git clone`
 inline in a session, it clones into `/workspace/agent/<repo>` which IS
 mounted and IS writable — but every session gets its own clone, no
 sharing, no fetch-before-work, no parallel per-thread workspaces, no
-commit/push/PR flow, no GC. v1 had all of this and Dave uses it every
+commit/push/PR flow, no GC. v1 had all of this and Operator uses it every
 day.
 
 ## v1 architecture (reference — verified from code read)
@@ -184,13 +184,13 @@ container env.
 Verified facts:
 
 - OneCLI 1.1.0 vault already had `GitHub` (personal) and
-  `GitHub-Illysium` secrets with `hostPattern=api.github.com` and
+  `GitHub-Example Labs` secrets with `hostPattern=api.github.com` and
   `injectionConfig: { headerName: "Authorization", valueFormat:
   "token {value}" }`.
 - `GET /api/container-config?agent=<identifier>` returns a per-agent
   `HTTPS_PROXY` URL (the proxy-side auth uses the agent's own token,
   not the default agent's). Confirmed by diffing responses for
-  `ag-1776402507183-cf39lq` (Axie-2) vs the no-agent default call.
+  `ag-1700000000000-example02` (Example Agent-2) vs the no-agent default call.
 - `applyContainerConfig` in the SDK also mounts the gateway CA at
   `/tmp/onecli-gateway-ca.pem` and sets `NODE_EXTRA_CA_CERTS` — so
   any TLS client that honors `SSL_CERT_FILE` or that env var
@@ -204,9 +204,9 @@ Verified facts:
   container env. `gh` then sends a request (with the placeholder in
   its `Authorization` header), the OneCLI proxy rewrites the header
   using the vault secret, and GitHub sees the real token. Confirmed:
-  `gh api user` returned `davekim917` for Axie-2 (assigned to
-  `GitHub`) and the expected Illysium-scoped identity for illie-v2
-  (assigned to `GitHub-Illysium`).
+  `gh api user` returned `davekim917` for Example Agent-2 (assigned to
+  `GitHub`) and the expected Example Labs-scoped identity for helper-v2
+  (assigned to `GitHub-Example Labs`).
 - Same mechanic OneCLI already uses for `CLAUDE_CODE_OAUTH_TOKEN=placeholder`.
 
 Per-group tokens in v2: each agent_group's OneCLI agent is assigned
@@ -214,18 +214,18 @@ the right GitHub secret. Already done for the first two:
 
 | Agent group | OneCLI agent ID | Assigned GitHub secret |
 |---|---|---|
-| main (Axie-2) | `7c6390f4-78ac-4800-8cb8-fa7c0619a4d1` | `GitHub` (personal) |
-| illie-v2 | `a05be189-187e-48eb-bb79-b40a034eddfb` | `GitHub-Illysium` |
+| main (Example Agent-2) | `7c6390f4-78ac-4800-8cb8-fa7c0619a4d1` | `GitHub` (personal) |
+| helper-v2 | `a05be189-187e-48eb-bb79-b40a034eddfb` | `GitHub-Example Labs` |
 
 `container-runner.ts` change: add one line —
 `args.push('-e', 'GH_TOKEN=placeholder-for-proxy-injection')`.
 Do **not** add any path to read the real token out of OneCLI and
 into the env.
 
-Open follow-ups (not blockers): the Illysium token returned no orgs
+Open follow-ups (not blockers): the Example Labs token returned no orgs
 — likely a user-scoped PAT without `read:org` scope. Fine for cloning
-and PR-opening against specific repos that Dave owns or has been
-added to. Flag for Dave to rotate if we need org listing later.
+and PR-opening against specific repos that Operator owns or has been
+added to. Flag for Operator to rotate if we need org listing later.
 
 ### Blocked `git clone` error messaging
 
@@ -260,11 +260,11 @@ group.
    lines. One-liner.
 3. **Build MCP tools** in `container/agent-runner/src/mcp-tools/git-worktrees.ts`.
 3. **Register** in `mcp-tools/index.ts`.
-4. **Sync into illysium-v2 group's `agent-runner-src/` mount** (same
+4. **Sync into example-labs-v2 group's `agent-runner-src/` mount** (same
    pattern as earlier tool pushes during this migration).
 5. **Rebuild container image** if the base image needs a tweak. Likely
    it doesn't — `git` and `gh` are already there from Phase 1.5.
-6. **Smoke test:** `@illie-v2` → `clone_repo` → `create_worktree` →
+6. **Smoke test:** `@helper-v2` → `clone_repo` → `create_worktree` →
    edit a file via bash → `git_commit` → `git_push` → `open_pr`.
    Verify on GitHub that the PR actually exists.
 7. **Port cleanup cron.** Add to `host-sweep.ts` or dedicated module.
@@ -277,7 +277,7 @@ group.
 ## Testing plan
 
 **Smoke (minimum to close):**
-- Clone a small Illysium repo via `clone_repo`.
+- Clone a small Example Labs repo via `clone_repo`.
 - Create a worktree via `create_worktree`, verify it's at
   `/workspace/worktrees/<repo>/`.
 - Edit a README line via bash inside the worktree.
@@ -287,12 +287,12 @@ group.
 - After merging the PR on GitHub, trigger cleanup; verify worktree dir is removed.
 
 **Parity (v1 vs v2 against same repo):**
-- On a test Illysium repo, have Axie v1 run its normal flow and Axie-2
+- On a test Example Labs repo, have Example Agent v1 run its normal flow and Example Agent-2
   v2 run the same steps. Compare: branch names, commit authors, PR
   shape, cleanup timing. No regressions on shape.
 
 **Concurrency:**
-- Two threads simultaneously @-mention Axie-2 asking it to work on the
+- Two threads simultaneously @-mention Example Agent-2 asking it to work on the
   same repo. Verify both get their own worktrees (different branch
   names), no index.lock collisions, both commits succeed.
 
@@ -302,8 +302,8 @@ group.
    above. Proxy works for `curl`/raw HTTPS natively; `gh` needs a
    placeholder `GH_TOKEN` to not short-circuit locally.
 2. ~~**Per-group GitHub tokens.**~~ Resolved — each agent_group's
-   OneCLI agent gets the right secret assigned. Done for Axie-2 and
-   illie-v2.
+   OneCLI agent gets the right secret assigned. Done for Example Agent-2 and
+   helper-v2.
 3. **`git worktree` inside the container — does it actually resolve
    the `.git` pointer correctly?** Should work because everything's in
    container paths. But verify early — this is the assumption that
@@ -334,7 +334,7 @@ group.
 
 ## Success criteria
 
-Dave can say `@illie-v2 clone https://github.com/illysium/<repo>, make
+Operator can say `@helper-v2 clone https://github.com/example-labs/<repo>, make
 a one-line change to README, commit as "test", push, and open a PR`
 and see a real PR on GitHub. Worktree persists across container
 restart in the same thread. PR merge on GitHub results in worktree GC

@@ -3,25 +3,30 @@
 #
 # Run by systemd timer (.config/systemd/user/onecli-drift-check.timer).
 # Logs to journalctl. If a newer gateway version is available, sends a one-line
-# DM to the admin via NanoClaw's CLI socket — the wired admin agent surfaces
-# the notification through Dave's preferred chat (Discord/Slack/etc.).
+# DM to an owner via NanoClaw's CLI socket.
 #
 # Manual run:  bash scripts/check-onecli-drift.sh
 
 set -euo pipefail
 
-NANOCLAW_DIR="/home/ubuntu/nanoclaw-v2"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NANOCLAW_DIR="${NANOCLAW_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 cd "$NANOCLAW_DIR"
 
 CLI_SOCK="$NANOCLAW_DIR/data/cli.sock"
-ADMIN_USER_ID="discord:608746260706361344"
-ADMIN_DM_PLATFORM_ID="$(sqlite3 "$NANOCLAW_DIR/data/v2.db" "
-  SELECT platform_id FROM messaging_groups
-  WHERE id = (SELECT messaging_group_id FROM user_dms WHERE user_id = '$ADMIN_USER_ID' AND channel_type = 'discord' LIMIT 1)
+ADMIN_DM_ROW="$(pnpm exec tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db" "
+  SELECT mg.platform_id, ud.channel_type
+    FROM user_roles ur
+    JOIN user_dms ud ON ud.user_id = ur.user_id
+    JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
+   WHERE ur.role = 'owner'
+   ORDER BY ud.resolved_at DESC
+   LIMIT 1
 ")"
+IFS='|' read -r ADMIN_DM_PLATFORM_ID ADMIN_DM_CHANNEL_TYPE <<< "$ADMIN_DM_ROW"
 
-if [ -z "$ADMIN_DM_PLATFORM_ID" ]; then
-  echo "drift-check: cannot resolve admin DM (user_dms row missing for $ADMIN_USER_ID)" >&2
+if [ -z "${ADMIN_DM_PLATFORM_ID:-}" ] || [ -z "${ADMIN_DM_CHANNEL_TYPE:-}" ]; then
+  echo "drift-check: cannot resolve an owner DM from user_roles + user_dms" >&2
   exit 1
 fi
 
@@ -54,7 +59,7 @@ payload = json.dumps({
     "senderId": "system:drift-check",
     "sender": "OneCLI Drift Check",
     "to": {
-        "channelType": "discord",
+        "channelType": "$ADMIN_DM_CHANNEL_TYPE",
         "platformId": "$ADMIN_DM_PLATFORM_ID",
         "threadId": "$ADMIN_DM_PLATFORM_ID",
     },

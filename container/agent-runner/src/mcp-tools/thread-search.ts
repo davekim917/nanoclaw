@@ -384,7 +384,7 @@ export const resolveThreadLinkTool: McpToolDefinition = {
  * when the agent is already mid-conversation inside a specific thread: the
  * "most recent" row may well be a different thread that happened to get a
  * message 30 seconds ago. This led to hallucinated cross-thread answers
- * (see the apollo/xzo incident). Now: if the resolved channel is the same
+ * (see the example-data/example incident). Now: if the resolved channel is the same
  * channel as the current session, the session's own thread_id is returned
  * as the default. Callers that want a different thread must pass
  * `thread_id` explicitly.
@@ -478,7 +478,7 @@ export const readThreadTool: McpToolDefinition = {
     const db = getDb();
     if (!db) return err('archive database not mounted');
 
-    // Apollo/xzo guard: refuse the current channel's "most recent thread"
+    // Example Data/example guard: refuse the current channel's "most recent thread"
     // fallback. The bug it prevents is silently picking a sibling thread
     // when the channel has many concurrent ones. Passing `thread_id`
     // explicitly is allowed — including for the current session — so the

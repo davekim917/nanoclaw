@@ -222,19 +222,19 @@ describe('XML escaping', () => {
 
 describe('sender_id attribute (canonical @-mention target)', () => {
   it('emits sender_id from top-level senderId field', () => {
-    insertMessage('m1', 'chat', { sender: 'Dave', senderId: 'U0B4AQ2UHPS', text: 'hi' });
+    insertMessage('m1', 'chat', { sender: 'Operator', senderId: 'UTEST00025', text: 'hi' });
     const result = formatMessages(getPendingMessages());
-    expect(result).toContain('sender_id="U0B4AQ2UHPS"');
+    expect(result).toContain('sender_id="UTEST00025"');
   });
 
   it('falls back to author.userId when senderId is absent', () => {
     insertMessage('m1', 'chat', {
-      sender: 'Dave',
-      author: { userId: 'U0B4AQ2UHPS', fullName: 'Dave Kim' },
+      sender: 'Operator',
+      author: { userId: 'UTEST00025', fullName: 'Operator' },
       text: 'hi',
     });
     const result = formatMessages(getPendingMessages());
-    expect(result).toContain('sender_id="U0B4AQ2UHPS"');
+    expect(result).toContain('sender_id="UTEST00025"');
   });
 
   it('omits sender_id when neither field is present', () => {
@@ -275,8 +275,8 @@ describe('trigger-flag split', () => {
   });
 
   it('mixed batch wraps trigger=0 in <thread_context> and trigger=1 in <addressed_to_you>', () => {
-    insertMessage('ctx', 'chat', { sender: 'James', text: '@dae' }, { trigger: 0 });
-    insertMessage('ask', 'chat', { sender: 'Dave', text: 'where are we?' }, { trigger: 1 });
+    insertMessage('ctx', 'chat', { sender: 'Example User Two', text: '@dae' }, { trigger: 0 });
+    insertMessage('ask', 'chat', { sender: 'Operator', text: 'where are we?' }, { trigger: 1 });
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('<thread_context');
     expect(result).toContain('</thread_context>');
@@ -350,10 +350,10 @@ describe('trigger-flag split', () => {
 
 describe('formatSystemMessage', () => {
   it('test_formatSystemMessage_recall_context_subtype', () => {
-    insertMessage('sys1', 'system', { subtype: 'recall_context', text: 'Apollo uses Snowflake' });
+    insertMessage('sys1', 'system', { subtype: 'recall_context', text: 'Example Data uses Snowflake' });
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('[Untrusted recalled evidence - legacy read-only fallback]');
-    expect(result).toContain('"legacyText":"Apollo uses Snowflake"');
+    expect(result).toContain('"legacyText":"Example Data uses Snowflake"');
     expect(result).not.toContain('[Trusted runtime capability state]');
   });
 
@@ -549,19 +549,19 @@ describe('categorizeMessage — thread-context + leading mentions', () => {
   });
 
   it('strips leading Discord/Slack <@id> mention before classifying', () => {
-    const info = categorizeMessage(chatRow('<@U0AKALV5HRP> /compact'));
+    const info = categorizeMessage(chatRow('<@UTEST00021> /compact'));
     expect(info.category).toBe('admin');
     expect(info.text).toBe('/compact');
   });
 
   it('strips a bare @name mention before classifying', () => {
-    const info = categorizeMessage(chatRow('@axie /compact'));
+    const info = categorizeMessage(chatRow('@example-agent /compact'));
     expect(info.category).toBe('admin');
     expect(info.text).toBe('/compact');
   });
 
   it('handles thread-context wrapping AND a leading mention together', () => {
-    const wrapped = '[Thread context]\nalice: hi\n[Latest message]\n<@U0AKALV5HRP> /compact';
+    const wrapped = '[Thread context]\nalice: hi\n[Latest message]\n<@UTEST00021> /compact';
     const info = categorizeMessage(chatRow(wrapped));
     expect(info.category).toBe('admin');
     expect(info.text).toBe('/compact');
@@ -608,7 +608,7 @@ describe('isClearCommand — thread-context + leading mentions', () => {
   });
 
   it('recognizes /clear with a leading <@id> mention', () => {
-    expect(isClearCommand(chatRow('<@U0AKALV5HRP> /clear'))).toBe(true);
+    expect(isClearCommand(chatRow('<@UTEST00021> /clear'))).toBe(true);
   });
 
   it('still recognizes plain /clear', () => {
@@ -650,7 +650,7 @@ describe('stripInternalTags', () => {
 describe('hasFlagIntent', () => {
   it('detects flagIntent on chat messages (-m fable mid-turn must end the stream)', () => {
     insertMessage('f1', 'chat', {
-      sender: 'Dave',
+      sender: 'Operator',
       text: 'What model are you now?',
       flagIntent: { stickyModel: 'claude-fable-5[1m]' },
     });
@@ -668,7 +668,7 @@ describe('hasFlagIntent', () => {
   });
 
   it('false for plain chat without flags', () => {
-    insertMessage('f3', 'chat', { sender: 'Dave', text: 'hello there' });
+    insertMessage('f3', 'chat', { sender: 'Operator', text: 'hello there' });
     const [msg] = getPendingMessages();
     expect(hasFlagIntent(msg)).toBe(false);
   });

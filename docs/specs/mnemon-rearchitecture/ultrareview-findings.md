@@ -55,7 +55,7 @@ The `processed_pairs` PK is `(agent_group_id, user_run_first_id, classifier_vers
 
 But the daemon's `scan_cursor` watermark advances past `lastSentAt` on every successful classification (line 410: `upsertWatermarks(db, agentGroupId, lastSentAt, lastSentAt)`). After a v1 sweep classifies a pair, the watermark moves past that timestamp. On the next sweep — even with a bumped PROMPT_VERSION — the daemon reads only rows AFTER `scan_cursor` from archive.db. The already-processed pairs are never re-read, so they never get a chance to re-classify under v2.
 
-**Real implication for today's work:** We bumped PROMPT_VERSION v1→v2 yesterday for the GROUNDING DISCIPLINE prompt change. **Existing illysium facts extracted under v1 (including the WG → Whisky Gauge confabulation) won't be re-extracted under v2.** Only NEW chat-pairs from May 1 onward run under v2.
+**Real implication for today's work:** We bumped PROMPT_VERSION v1→v2 yesterday for the GROUNDING DISCIPLINE prompt change. **Existing example-labs facts extracted under v1 (including the WG → Whisky Gauge confabulation) won't be re-extracted under v2.** Only NEW chat-pairs from May 1 onward run under v2.
 
 **Fix:** when version constants change, the watermark for affected groups must also be reset (back to oldest archive timestamp). Could be:
 - A one-shot script `scripts/reset-classifier-watermarks.ts` to run after a version bump
@@ -344,7 +344,7 @@ Possible misread: the finding might be about `writeOutboundDirect` or similar, n
 
 ## Re-running the review
 
-If you re-run `/ultrareview 69` (free run #2 of 3, expires May 5), the screenshot above suggests roughly the same 17 findings should surface. Worth doing IF the rate-limit issue clears AND the "Anthropic temporarily limiting" error (per Dave's CLI screenshot) doesn't recur. Better: report the failed run for credit refund first, then re-run.
+If you re-run `/ultrareview 69` (free run #2 of 3, expires May 5), the screenshot above suggests roughly the same 17 findings should surface. Worth doing IF the rate-limit issue clears AND the "Anthropic temporarily limiting" error (per Operator's CLI screenshot) doesn't recur. Better: report the failed run for credit refund first, then re-run.
 
 ## File locations referenced (all in repo)
 

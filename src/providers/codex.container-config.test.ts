@@ -28,7 +28,7 @@ function makeCtx(overrides: Partial<ProviderContainerContext> = {}): ProviderCon
   return {
     sessionDir: SESSION_DIR,
     agentGroupId: 'grp-1',
-    agentGroupFolder: 'madison-reed-codex',
+    agentGroupFolder: 'example-retail-codex',
     groupDir: path.join(TEST_HOME, 'group'),
     selectedSkills: [],
     hostEnv: { HOME: TEST_HOME } as NodeJS.ProcessEnv,

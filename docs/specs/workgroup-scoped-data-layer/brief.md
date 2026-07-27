@@ -22,8 +22,8 @@ This work formalizes **workgroup** as a first-class concept above `agent_groups`
 - R3. Mnemon recall supports a `'workgroup'` scope mode (in `src/modules/memory/scope-resolver.ts`) that enumerates all member agent_groups by `workgroup_id`
 - R4. OneCLI secret declarations can live at workgroup level and are inherited by all member agent_groups when their containers spawn
 - R5. The per-agent archive.db projection mounted at `/workspace/archive.db` contains rows from the entire workgroup of the spawning agent — not just `agent_group_id = self`
-- R6. Migration of existing installs auto-pairs current `<x>` + `<x>-codex` sibling groups into the same workgroup with zero manual config — illysium, madison-reed, axie-dev, and the other 7 codex pairs on Dave's install work without operator intervention
-- R7. Non-sibling agent_groups (Axie, Illysium, MR, Sunday, etc.) remain isolated from each other after migration — workgroup boundary is enforced at projection time
+- R6. Migration of existing installs auto-pairs current `<x>` + `<x>-codex` sibling groups into the same workgroup with zero manual config — example-labs, example-retail, example-dev, and the other 7 codex pairs on Operator's install work without operator intervention
+- R7. Non-sibling agent_groups (Example Agent, Example Labs, Example Retail, Archive One, etc.) remain isolated from each other after migration — workgroup boundary is enforced at projection time
 - R8. The existing `MNEMON_STORE_<folder>` env-override path continues to work (including the case-insensitive fallback shipped in PR #105) for the duration of the transition — workgroup is additive, not replacement
 - R9. Documentation in `CLAUDE.md` and `docs/` explains the workgroup model, declaration mechanism, and migration semantics so future operators understand the boundary
 
@@ -40,7 +40,7 @@ This work formalizes **workgroup** as a first-class concept above `agent_groups`
 
 ## Non-Goals (Explicitly Out of Scope)
 
-- **Cross-workgroup data sharing** — Axie reading MR's archive stays out of scope; the boundary is the workgroup
+- **Cross-workgroup data sharing** — Example Agent reading Example Retail's archive stays out of scope; the boundary is the workgroup
 - **`conversations/` folder cross-access** — agents continue using existing symlinks for now; a `read_peer_conversations` MCP tool is a future ask
 - **Slack user-token via OneCLI (Q1)** — separate follow-on. It benefits from workgroup-level secret inheritance but does not block this work, and does not gate it
 - **Deprecating the `MNEMON_STORE_<folder>` env-override mechanism** — workgroup will subsume it eventually; cleanup pass is a future PR
@@ -70,19 +70,19 @@ This work formalizes **workgroup** as a first-class concept above `agent_groups`
 ## Open Questions (for /team-design)
 
 - **Declaration model for `workgroup_id`** — per-group `container.json` field (each member declares membership), top-level `groups/<workgroup>/workgroup.json` file (workgroup is its own artifact), or auto-derive from naming pattern with explicit override. **Defaulting to:** auto-derive from naming (`<x>` + `<x>-codex` → workgroup `<x>`) with an explicit `workgroup_id` field in `container.json` as override. Matches the existing `agentGroupId` declaration pattern and minimizes new config surface.
-- **Default scope for new agent_groups** — workgroup-scoped (matches Dave's framing that "siblings should feel like one workgroup") vs self-scoped opt-in (conservative). **Defaulting to:** workgroup-scoped. Standalone agents end up with `workgroup_id = own id` (functionally equivalent to today's self-only); sibling agents get the shared workgroup_id automatically (pooled).
+- **Default scope for new agent_groups** — workgroup-scoped (matches Operator's framing that "siblings should feel like one workgroup") vs self-scoped opt-in (conservative). **Defaulting to:** workgroup-scoped. Standalone agents end up with `workgroup_id = own id` (functionally equivalent to today's self-only); sibling agents get the shared workgroup_id automatically (pooled).
 - **Mnemon default scope** — leave at `'self'` and require explicit `recall_scope: 'workgroup'` per group, OR change default to `'workgroup'` once the migration runs. **Defaulting to:** change default to `'workgroup'`. Matches the "siblings see each other's memories" expectation without per-group ceremony.
 - **OneCLI secret merge semantics** — when both workgroup-level and per-group `onecliSecrets` exist, do they (a) merge as union, (b) per-group replaces workgroup, or (c) workgroup is baseline that per-group can add to but not remove. **Defaulting to (c).** Workgroup is the baseline contract; per-group can extend for agent-specific tooling; per-group cannot silently subtract from the shared baseline.
-- **Backfill heuristic** — how does the migration decide `madison-reed-codex` belongs in the same workgroup as `madison-reed`? **Defaulting to:** strip `-codex` suffix from folder name and check that the resulting folder both exists and has a populated `agent_groups` row. Two-way verification (suffix match + parent existence) before pairing. Standalone groups (no matching parent) get `workgroup_id = own id`.
+- **Backfill heuristic** — how does the migration decide `example-retail-codex` belongs in the same workgroup as `example-retail`? **Defaulting to:** strip `-codex` suffix from folder name and check that the resulting folder both exists and has a populated `agent_groups` row. Two-way verification (suffix match + parent existence) before pairing. Standalone groups (no matching parent) get `workgroup_id = own id`.
 - **Workgroups table** — do we add a dedicated `workgroups` table (rows describe each workgroup, carry `onecliSecrets`, display name, etc.) or is `workgroup_id` as a tag on `agent_groups` sufficient? **Defaulting to:** add a `workgroups` table. Workgroup-level OneCLI secret inheritance needs somewhere to live, and "just a tag" can't carry that payload. Schema: `workgroups(id TEXT PRIMARY KEY, display_name TEXT, onecli_secrets TEXT JSON, created_at TEXT)`.
 - **Conversations/ folder cross-access** — explicitly deferred per non-goals, but design should note where the future `read_peer_conversations` tool would plug into the workgroup boundary so we don't paint ourselves into a corner.
 
 ## Success Criteria
 
-- **Functional:** After migration, axie-dev's container can resolve a Slack thread URL whose messages originated in axie-dev-codex's session (and vice versa) via the existing `resolve_thread_link` MCP tool — without code change to the tool itself
-- **Functional:** mnemon recall from axie-dev-codex returns facts ingested by axie-dev's daemon (and vice versa)
-- **Functional:** axie-dev and madison-reed remain mutually invisible — Axie's container's archive projection contains zero rows belonging to any MR member; `SELECT COUNT(*) WHERE workgroup_id != 'axie-dev'` returns zero
-- **Migration:** Running the migration on Dave's live install pairs all 10 current codex twins (axie-dev, axis-labs, dirt-market, illysium, madison-reed, main, number-drinks, sunday, video-agent, xerus) with their parents without operator action
+- **Functional:** After migration, example-dev's container can resolve a Slack thread URL whose messages originated in example-dev-codex's session (and vice versa) via the existing `resolve_thread_link` MCP tool — without code change to the tool itself
+- **Functional:** mnemon recall from example-dev-codex returns facts ingested by example-dev's daemon (and vice versa)
+- **Functional:** example-dev and example-retail remain mutually invisible — Example Agent's container's archive projection contains zero rows belonging to any Example Retail member; `SELECT COUNT(*) WHERE workgroup_id != 'example-dev'` returns zero
+- **Migration:** Running the migration on Operator's live install pairs all 10 current codex twins (example-dev, example-research, example-market, example-labs, example-retail, main, example-beverage, archive-one, archive-media, archive-two) with their parents without operator action
 - **Migration:** No existing chat archive row, mnemon fact, or OneCLI secret assignment is destroyed by the migration; assertion: pre-migration row counts match post-migration row counts on every affected table
 - **Idempotent:** Running migration twice is a no-op the second time (schema-version check)
 - **Backwards-compat:** PR #105's case-insensitive `MNEMON_STORE_<folder>` env override continues to function for the duration of the transition

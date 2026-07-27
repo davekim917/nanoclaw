@@ -2454,7 +2454,7 @@ Groups C + D run in parallel (Phase 3) — independent file ownership (C's auth 
 | 2 | Card density (compact/comfortable/sparse) | E4 KanbanBoard | Acceptance criterion added |
 | 3 | Steer-composer keyboard semantics (Enter vs Cmd-Enter) | E5 TaskDetail | Acceptance criterion added |
 | 4 | TaskDetail split-pane proportions (35/65 initial) | E5 TaskDetail | Acceptance criterion added |
-| 5 | Echo prefix exact rendering in Slack (`[via dashboard] <text> — Dave` baseline) | D5 steer | Acceptance criterion added |
+| 5 | Echo prefix exact rendering in Slack (`[via dashboard] <text> — Operator` baseline) | D5 steer | Acceptance criterion added |
 
 **All 5 [RENDER-CHECK NEEDED] flags from the design are assigned to a task.**
 

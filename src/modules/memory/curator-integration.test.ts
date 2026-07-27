@@ -28,8 +28,8 @@ describe('memory curator user-path isolation', () => {
 
   it('starts model work only from the non-overlapping fire-and-forget host sweep pump', () => {
     const sweep = source('src/host-sweep.ts');
-    expect(sweep).toContain(
-      "import {\n  runMemoryCurationInBackground,\n  stopMemoryCurationInBackground,\n} from './modules/memory/curator-worker.js'",
+    expect(sweep).toMatch(
+      /import\s*\{[^}]*runMemoryCurationInBackground[^}]*stopMemoryCurationInBackground[^}]*\}\s*from '\.\/modules\/memory\/curator-worker\.js'/,
     );
     expect(sweep).toMatch(/void runMemoryCurationInBackground\(\)\.catch/);
     expect(sweep).not.toMatch(/await\s+runMemoryCurationInBackground\(\)/);

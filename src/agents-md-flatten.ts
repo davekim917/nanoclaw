@@ -3,7 +3,7 @@
  *
  * Codex doesn't resolve `@path` includes in AGENTS.md (verified empirically
  * via `codex debug prompt-input` 2026-05-13: `@/tmp/.../included.md` was
- * passed to the model as literal text). So to keep Dave's CLAUDE.md as the
+ * passed to the model as literal text). So to keep Operator's CLAUDE.md as the
  * canonical source of behavioral rules, we flatten it: every `@<path>`
  * line is replaced inline with the referenced file's content. Recursive,
  * cycle-safe, symlink-aware.

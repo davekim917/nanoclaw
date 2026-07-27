@@ -52,7 +52,7 @@ function insertPair(id: string, includeBootstrap: boolean): void {
   db.prepare(
     `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
      VALUES (?, ?, 'chat', ?, 'pending', 1, ?)`,
-  ).run(id, nextSeq++, new Date().toISOString(), JSON.stringify({ sender: 'Dave', text: `trigger-${id}` }));
+  ).run(id, nextSeq++, new Date().toISOString(), JSON.stringify({ sender: 'Operator', text: `trigger-${id}` }));
 }
 
 function occurrences(text: string, marker: string): number {

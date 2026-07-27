@@ -11,13 +11,15 @@
 
 Implements the architecture described in `docs/specs/mnemon-rearchitecture/brief.md` — replicating Vivian Balakrishnan's NanoClaw v1 gist ([gist a7d4eec](https://gist.github.com/VivianBalakrishnan/a7d4eec3833baee4971a0ee54b08f322)). Three layers (raw sources → mnemon graph → wiki pages), three operations (extract, synthesise, recall), with auto-recall as system-reminder push and chat-stream + tool-output + manual-drop as the three ingestion sources. 31 HARD + 1 SOFT constraints, 11 Q&A decisions resolved.
 
-This design replaces the failed PR #68 integration (`feat/mnemon-integration`, merged `681b143`, see `.context/retros/mnemon-integration/retro.md`).
+This design replaces the failed PR #68 integration
+(`feat/mnemon-integration`, merged `681b143`). The superseded transient
+planning artifacts remain recoverable from Git history.
 
 ---
 
 ## Constraint Analysis
 
-All 32 constraints from the brief are pre-classified by Dave-stated decisions or by Codex collaboration outputs. None require reclassification. Validated each against the codebase to confirm feasibility.
+All 32 constraints from the brief are pre-classified by Operator-stated decisions or by Codex collaboration outputs. None require reclassification. Validated each against the codebase to confirm feasibility.
 
 | # | Constraint | Type | Source | Status |
 |---|-----------|------|--------|--------|
@@ -49,9 +51,9 @@ All 32 constraints from the brief are pre-classified by Dave-stated decisions or
 | C26 | No additions to pnpm-workspace.yaml minimumReleaseAgeExclude w/o approval | HARD | CLAUDE.md | Validated — operational |
 | C27 | Anthropic SDK pinning; Haiku version pinned | HARD | Brief | Validated — operational |
 | C28 | Turn pair = consecutive user msgs + immediately-following consecutive assistant msgs; can span poll windows; single-msg forbidden | HARD | Brief (refined Q7 follow-up) | Validated — implementation in daemon's batching logic |
-| C29 | Turn-pair stability threshold: 120s | HARD | Brief | Validated — Dave-confirmed |
-| C30 | Turn-pair orphan threshold: 10min; user-only run with `is_orphan: true` provenance | HARD | Brief | Validated — Dave-confirmed |
-| C31 | Classification fires on next 60s sweep after stability (poll-driven only, no event-driven) | HARD | Brief | Validated — Dave-confirmed |
+| C29 | Turn-pair stability threshold: 120s | HARD | Brief | Validated — Operator-confirmed |
+| C30 | Turn-pair orphan threshold: 10min; user-only run with `is_orphan: true` provenance | HARD | Brief | Validated — Operator-confirmed |
+| C31 | Classification fires on next 60s sweep after stability (poll-driven only, no event-driven) | HARD | Brief | Validated — Operator-confirmed |
 | C32 | Anthropic SDK + Haiku model pinning | HARD | Brief | Validated — operational |
 
 ### Flagged Constraints
@@ -98,7 +100,7 @@ No constraints flagged — all 32 validated as stated. Brief's HARD/SOFT classif
 - `src/container-runner.ts:32, 603, 1370` — current mnemon mount + env wiring. Lines 603 and 1370 add per-group mnemon RW mount + MNEMON_STORE env. To be replaced with a simpler "memory enabled" path that only mounts mnemon binary access for synthesise.
 - `src/container-config.ts:57-60, 175-176` — `MnemonConfig` interface (`{ enabled, embeddings }`). Replace with `MemoryConfig` (`{ enabled }`); `embeddings` is implicitly true (Ollama always available).
 - `container/mnemon-wrapper.sh:1-127` — current wrapper has phase gating, store-arg validation, flock, metrics. Phase gating + metrics emission to delete (C9). STORE regex + --store argument matching + flock are KEEPERS (security defenses, retro learning).
-- `groups/illysium/sources/{articles,docs,threads}/` — already exist from PR #68 wiki scaffold; daemon can watch directly.
+- `groups/example-labs/sources/{articles,docs,threads}/` — already exist from PR #68 wiki scaffold; daemon can watch directly.
 - `scripts/` — 8 mnemon-related files to delete (`disable-mnemon.ts`, `enable-mnemon.ts`, `mnemon-backup.sh`, `mnemon-metrics-collector.ts`, `mnemon-metrics.ts`, `mnemon-phase2.ts`, `import-v1-claude-memory.ts`, `import-v1-memories.ts`). Of these, `disable-mnemon.ts` and `enable-mnemon.ts` will be reborn under the new memory-config shape with a different scope (no scheduled tasks, no rollout JSON).
 - `src/modules/scheduling/actions.ts` — existing `handleScheduleTask` is the entry point for synthesise tasks; reusable as-is.
 
@@ -146,7 +148,7 @@ The architecturally meaningful choice is **where the recall injection runs**: co
 - Reuses an existing message kind (`system`) that the agent-runner formatter (`container/agent-runner/src/formatter.ts`) already handles
 
 **Cons:**
-- Recall happens in the router's hot path. Adds 100-750ms (typical) before the user message lands in inbound.db. For warm containers (most of Dave's groups), this adds perceptible latency to "first agent response."
+- Recall happens in the router's hot path. Adds 100-750ms (typical) before the user message lands in inbound.db. For warm containers (most of Operator's groups), this adds perceptible latency to "first agent response."
 - The synchronous recall in the router blocks subsequent message-handling for that platform event. Not a thread blocking concern (Node single-threaded), but the router is sequential per platform event — slow recall slows that path.
 - System message in inbound.db pollutes message history slightly (visible to the agent's archive search if not filtered out)
 - New `system` message subtype/content shape needs a small contract: `{ subtype: 'recall_context', facts: [...] }` — formatter needs to know to format this differently than action-result system messages
@@ -211,7 +213,7 @@ The "system message pollutes archive" concern is mitigated by skipping `kind: 's
 
 ## Cycle-2 Review Resolutions
 
-After cycle-2 review (13 MUST-FIX, 7 SHOULD-FIX), three user-decision items were resolved by Dave (see `auto-pause.md`):
+After cycle-2 review (13 MUST-FIX, 7 SHOULD-FIX), three user-decision items were resolved by Operator (see `auto-pause.md`):
 - **Q1 = (b):** Recall scope narrowed to chat-kind + agent-to-agent + webhook only. Scheduled tasks do NOT trigger auto-recall. Brief R1 updated to reflect this.
 - **Q2 = (b):** Recall lands at transcript-level (current design), NOT system-prompt-level. Brief R1 updated. The fictional `skipRecall` flag is dropped.
 - **Q3 = (b):** Container mounts mnemon store RW. Wrapper enforces `MNEMON_READ_ONLY=1` (rejects write subcommands). `block-mnemon-real-hook.ts` retained as Bash PreToolUse hook denying direct `mnemon-real` invocation.
@@ -818,7 +820,7 @@ for each (group, thread) with new messages since scan_cursor:
   "daemonStartedAt": "2026-04-30T18:00:00Z",
   "prereqVerification": { "ok": true, "lastChecked": "2026-04-30T18:00:00Z", "checks": { "ollama": true, "nomic_embed_text": true, "mnemon_binary": "v0.1.2", "disk_free_gb": 47.2 } },
   "groups": {
-    "ag-1776377699463-2axxhg": {
+    "ag-1700000000000-example01": {
       "enabled": true,
       "lagSec": 12,
       "factsLast24h": 47,
@@ -1057,7 +1059,7 @@ The existing scheduled-task system handles the rest. `wiki-autopush.sh` cron pus
 - `data/mnemon-rollout.json`
 - `data/mnemon-health.json`
 - `groups/*/.mnemon-metrics.jsonl` (7 files, already orphaned post-disable)
-- `~/.mnemon/data/<groupId>/` for the 2 illysium insights (operator-side; backed up)
+- `~/.mnemon/data/<groupId>/` for the 2 example-labs insights (operator-side; backed up)
 
 **Files to surgically edit (M6 — anchored patterns, not line numbers):**
 
@@ -1245,7 +1247,7 @@ Failure modes:
 - `tests/memory-e2e.test.ts` — end-to-end smoke: send substantive message → 60s sweep → fact in mnemon store → next user message → recall context injected → agent prompt includes it
 
 **Smoke test (operational, pre-merge):**
-- Enable memory on illysium → restart → send substantive turn → wait 60s → confirm:
+- Enable memory on example-labs → restart → send substantive turn → wait 60s → confirm:
   1. `mnemon recall "" --store ag-...` returns ≥ 1 fact
   2. Next user message gets a system-message recall context written to inbound.db
   3. `data/memory-health.json` shows healthy state
@@ -1259,7 +1261,7 @@ Failure modes:
 | A1 | Router hot-path latency budget tolerates 100-750ms recall typical (1500ms hard timeout) | Medium — perceived chat sluggishness; can be mitigated by async-deferred recall as fallback | Build smoke test, send 20 substantive messages, measure `latency = recall_complete - recall_start` and full pipeline `platform_msg_arrival → first_agent_response` |
 | A2 | `kind: 'system'` with `subtype: 'recall_context'` doesn't conflict with existing system action result handling | Low — formatter has explicit subtype check; if collision, rename subtype | Read formatter.ts, add explicit branch test |
 | A3 | mnemon CLI is stable enough to be the implementation behind MemoryStore (project sustainability) | Medium — if mnemon fork goes stale, swap to sqlite-vec | Periodic dep-durability check (per retro learning #4); MemoryStore interface preserves swap path |
-| A4 | Tool-output capture for the named tools list covers most curation actually wanted | Low — initial list is configurable; new tools can be added | Operator review during build smoke; revise list per Dave's actual usage |
+| A4 | Tool-output capture for the named tools list covers most curation actually wanted | Low — initial list is configurable; new tools can be added | Operator review during build smoke; revise list per Operator's actual usage |
 | A5 | Two writers (host daemon + synthesise task in container) on same mnemon store via flock are non-contending | Low — synthesise reads only via `mnemon recall`; daemon writes via `mnemon remember` | Mock concurrent-write test in unit suite; verify flock holds |
 | A6 | systemd unit + Type=simple + Restart=on-failure handles daemon crashes adequately | Low — standard pattern; if not, add watchdog | Operational; if daemon crashes repeatedly, escalate to per-component process split |
 | A7 | Haiku 4.5 classifier output (JSON with worth_storing) is reliably parseable | Medium — bad classifier output → silent ingest failures | Schema-validated parsing with retry; structured-output prompt + low temperature |

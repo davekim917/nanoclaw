@@ -238,8 +238,8 @@ export interface ChatSdkBridgeConfig {
    * wire format leaks non-human-readable user references (Discord's
    * `<@123456789>` snowflake mentions are the canonical case): the agent
    * reads `content.text` and has no way to tell which snowflake is
-   * "@Axie-Codex" vs a stranger. Resolving here keeps the round-trip
-   * symmetric — the outbound rewriter already turns `@Axie-Codex` back
+   * "@Example Agent-Codex" vs a stranger. Resolving here keeps the round-trip
+   * symmetric — the outbound rewriter already turns `@Example Agent-Codex` back
    * into `<@id>` on the way out.
    *
    * Applied to both `serialized.text` (the message body) and
@@ -710,7 +710,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // One-shot channel metadata discovery: on first inbound we've seen for
       // a given channel, fetch its name via the Chat SDK and forward via
       // onMetadata so the host can populate messaging_groups.name. Without
-      // this, auto-created mgs stay nameless forever (Slack xzo-ops etc.).
+      // this, auto-created mgs stay nameless forever (Slack example-ops etc.).
       const reportedChannels = new Set<string>();
       const reportChannelMetadata = (channelId: string): void => {
         if (reportedChannels.has(channelId)) return;
@@ -786,7 +786,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // toggle. Scoped to Slack DMs to avoid affecting other adapters.
         let normalizedThreadId = thread.id;
         // Match any Slack adapter — bare `slack` AND multi-workspace variants
-        // (`slack-illysium`, `slack-madisonreed`, `slack-madisonreed-codex`,
+        // (`slack-example-labs`, `slack-exampleretail`, `slack-exampleretail-codex`,
         // etc.). The strict `=== 'slack'` check that lived here previously
         // silently broke DM auto-threading when slack.ts started overriding
         // adapter.name to the channelType for dedup isolation across

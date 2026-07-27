@@ -20,7 +20,7 @@
  * - Canonical repo lives at groups/<folder>/<repo>/ (same as v1).
  *   Looked up via the session's agent_group_id.
  * - `gh pr list --head <branch>` runs on the host — uses whatever
- *   gh auth the host has (Dave's shell gh config). If the host has
+ *   gh auth the host has (Operator's shell gh config). If the host has
  *   no gh auth, the merged-check returns false and we fall back to
  *   the "branch gone on origin" heuristic.
  */

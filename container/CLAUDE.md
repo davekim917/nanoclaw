@@ -93,7 +93,7 @@ including each other's replies — so collaboration is just standard
 chat:
 
 - To hand off to the sibling, end your reply by `@`-mentioning their
-  bot username (e.g. `@illie-codex` on Slack, `@Axie-codex` on Discord). The
+  bot username (e.g. `@helper-codex` on Slack, `@Example Agent-codex` on Discord). The
   platform mention fires the peer's `engage_mode='mention'` rule and
   wakes it for the next turn. No special trailer needed; the @-mention
   itself is the signal.

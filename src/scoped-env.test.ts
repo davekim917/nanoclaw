@@ -19,7 +19,7 @@ describe('isToolEnabled', () => {
   });
 
   it('matches scoped tool entries against the bare name', () => {
-    expect(isToolEnabled(['snowflake:sunday'], 'snowflake')).toBe(true);
+    expect(isToolEnabled(['snowflake:archive-one'], 'snowflake')).toBe(true);
   });
 
   it('empty array disables everything', () => {
@@ -58,8 +58,8 @@ describe('scopedEnvKey', () => {
   });
 
   it('bare fallback: scoped appends the upper-cased scope', () => {
-    expect(scopedEnvKey('GITHUB_TOKEN', { scopes: ['sunday'], isScoped: true, fallback: 'bare' })).toBe(
-      'GITHUB_TOKEN_SUNDAY',
+    expect(scopedEnvKey('GITHUB_TOKEN', { scopes: ['archiveone'], isScoped: true, fallback: 'bare' })).toBe(
+      'GITHUB_TOKEN_ARCHIVEONE',
     );
   });
 
@@ -69,9 +69,9 @@ describe('scopedEnvKey', () => {
         scopes: [],
         isScoped: false,
         fallback: 'group',
-        groupScope: 'illysium',
+        groupScope: 'examplelabs',
       }),
-    ).toBe('RENDER_API_KEY_ILLYSIUM');
+    ).toBe('RENDER_API_KEY_EXAMPLELABS');
   });
 
   it('group fallback: throws when groupScope missing', () => {
@@ -83,8 +83,8 @@ describe('scopedEnvKey', () => {
 
 describe('normalizeScopedSecret', () => {
   it('renames the scoped key to the generic key', () => {
-    const secrets: Record<string, string> = { GITHUB_TOKEN_SUNDAY: 'ghp_xxx' };
-    normalizeScopedSecret(secrets, 'GITHUB_TOKEN_SUNDAY', 'GITHUB_TOKEN');
+    const secrets: Record<string, string> = { GITHUB_TOKEN_ARCHIVE_ONE: 'ghp_xxx' };
+    normalizeScopedSecret(secrets, 'GITHUB_TOKEN_ARCHIVE_ONE', 'GITHUB_TOKEN');
     expect(secrets).toEqual({ GITHUB_TOKEN: 'ghp_xxx' });
   });
 
@@ -96,7 +96,7 @@ describe('normalizeScopedSecret', () => {
 
   it('no-ops when scoped key is missing', () => {
     const secrets: Record<string, string> = {};
-    normalizeScopedSecret(secrets, 'GITHUB_TOKEN_SUNDAY', 'GITHUB_TOKEN');
+    normalizeScopedSecret(secrets, 'GITHUB_TOKEN_ARCHIVE_ONE', 'GITHUB_TOKEN');
     expect(secrets).toEqual({});
   });
 });
@@ -155,18 +155,18 @@ region = eu-west-1
   });
 
   it('filters TOML connection sections and their referenced key paths', () => {
-    const input = `[connections.sunday]
+    const input = `[connections.archive-one]
 account = "abc"
-private_key_path = "/home/x/.snowflake/keys/sunday.pem"
+private_key_path = "/home/x/.snowflake/keys/archive-one.pem"
 
-[connections.apollo]
+[connections.example-data]
 account = "def"
-private_key_path = "/home/x/.snowflake/keys/apollo.pem"
+private_key_path = "/home/x/.snowflake/keys/example-data.pem"
 `;
-    const out = filterConfigSections(input, ['connections.sunday']);
-    expect(out).toContain('[connections.sunday]');
-    expect(out).toContain('sunday.pem');
-    expect(out).not.toContain('[connections.apollo]');
-    expect(out).not.toContain('apollo.pem');
+    const out = filterConfigSections(input, ['connections.archive-one']);
+    expect(out).toContain('[connections.archive-one]');
+    expect(out).toContain('archive-one.pem');
+    expect(out).not.toContain('[connections.example-data]');
+    expect(out).not.toContain('example-data.pem');
   });
 });

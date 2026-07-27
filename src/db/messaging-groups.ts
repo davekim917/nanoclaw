@@ -291,14 +291,14 @@ export function getMessagingGroupAgentByPair(
  * spawn time to inject the in-channel peer roster into the runtime system
  * prompt.
  *
- * Sibling adapter awareness: Bo and Bo-codex on the SAME Slack channel
+ * Sibling adapter awareness: Example Assistant and Example Assistant Codex on the SAME Slack channel
  * have SEPARATE NanoClaw messaging_groups (one per bot adapter:
- * `slack-madisonreed` for Bo, `slack-madisonreed-codex` for Bo-codex)
+ * `slack-exampleretail` for Example Assistant, `slack-exampleretail-codex` for Example Assistant Codex)
  * even though Slack-side they're in the same channel. The shared identity
  * is `messaging_groups.platform_id` (the Slack channel id / Discord
  * snowflake). Matching on platform_id rather than messaging_group_id
  * surfaces siblings across adapters; matching on messaging_group_id alone
- * would miss Bo-codex when querying from Bo's session.
+ * would miss Example Assistant Codex when querying from Example Assistant's session.
  *
  * Tenant scoping: peers are additionally constrained to share `workgroup_id`
  * with self. Slack channel IDs are workspace-scoped (only unique per

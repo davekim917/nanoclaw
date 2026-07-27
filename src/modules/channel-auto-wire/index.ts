@@ -7,10 +7,10 @@
  * rows. Zero effect on already-wired channels.
  *
  * Use case. Upstream's model is "invite the bot, then run
- * `/manage-channels` to wire it." For our Slack (Illysium workspace),
+ * `/manage-channels` to wire it." For our Slack (Example Labs workspace),
  * the wiring decision is always the same — point the new channel at
- * `illysium-v2` with `per-thread` isolation — so the manual step is
- * pure friction. This module lets Dave declare the rule once in `.env`
+ * `example-labs-v2` with `per-thread` isolation — so the manual step is
+ * pure friction. This module lets Operator declare the rule once in `.env`
  * and have new invites route immediately, no repeat-invocation of the
  * skill.
  *
@@ -30,16 +30,16 @@
  * groups with `unknown_sender_policy='strict'`, which is the right safe
  * default when wiring is manual (you explicitly grant access per user).
  * For channel-types where the platform's own membership is the gate —
- * Slack workspace membership for the Illysium bot — v1 behavior is
+ * Slack workspace membership for the Example Labs bot — v1 behavior is
  * effectively `public` (anyone in the workspace can invoke). Setting
  * this env matches that behavior per channel_type without widening it
  * for channel_types where you do want strict.
  *
  * Example:
- *   NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_ILLYSIUM=illysium-v2
- *   NANOCLAW_DEFAULT_SESSION_MODE_SLACK_ILLYSIUM=per-thread
- *   NANOCLAW_DEFAULT_SENDER_POLICY_SLACK_ILLYSIUM=public
- *   NANOCLAW_DEFAULT_IGNORED_POLICY_SLACK_ILLYSIUM=accumulate
+ *   NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_EXAMPLE_LABS=example-labs-v2
+ *   NANOCLAW_DEFAULT_SESSION_MODE_SLACK_EXAMPLE_LABS=per-thread
+ *   NANOCLAW_DEFAULT_SENDER_POLICY_SLACK_EXAMPLE_LABS=public
+ *   NANOCLAW_DEFAULT_IGNORED_POLICY_SLACK_EXAMPLE_LABS=accumulate
  *
  * Architectural default policy. getMessagingGroupAgents() COALESCEs NULL
  * ignored_message_policy values to 'accumulate' for legacy/manual rows, but
@@ -47,9 +47,9 @@
  * inspection, exports, audit queries, and future raw-column filters honest
  * while the COALESCE remains belt-and-suspenders for rows not created here.
  *
- * When a Slack message arrives from a channel in the Illysium workspace
+ * When a Slack message arrives from a channel in the Example Labs workspace
  * that's not yet wired, this module creates a `messaging_group_agents`
- * row pointing at the `illysium-v2` agent group and the message routes
+ * row pointing at the `example-labs-v2` agent group and the message routes
  * through the normal path in the same tick — no dropped first message.
  *
  * Unset env var for a channel_type ⇒ no auto-wire ⇒ upstream drop behavior.

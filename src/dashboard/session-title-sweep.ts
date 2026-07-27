@@ -2,7 +2,7 @@
  * Haiku-generated session titles for the inbox board.
  *
  * Why: a bare session id is meaningless on the inbox board. A short
- * Haiku-generated label ("XZO-71 — rollout fix", "Slack auto-wire") makes
+ * Haiku-generated label ("EXAMPLE-71 — rollout fix", "Slack auto-wire") makes
  * the card scannable without opening the thread.
  *
  * What the sweep does, once per host-sweep tick (60s by default):
@@ -46,7 +46,7 @@ const DEFAULT_MODEL = 'claude-haiku-4-5-20251001';
 
 const SYSTEM_PROMPT = `Generate a short (≤60 char) plain-text label that captures the topic of the conversation. No quotes, no prefix, no markdown — just the topic.
 
-Good labels: "XZO-71 rollout fix", "Slack auto-wire debug", "Snowflake credential audit".
+Good labels: "EXAMPLE-71 rollout fix", "Slack auto-wire debug", "Snowflake credential audit".
 Bad labels: "Conversation about X" (filler), "Here's a label: ..." (preamble), "**bold**" (markdown).`;
 
 interface CandidateRow {

@@ -228,7 +228,7 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
   it('refuses to delete a paired sibling — leaves twin intact and surfaces the error', async () => {
     const SEED = 'ag-seed';
     const TWIN = 'ag-seed-codex';
-    const WG = 'mr';
+    const WG = 'example-retail';
     const db = getDb();
     createAgentGroup({ id: SEED, name: 'seed', folder: 'seed', agent_provider: null, created_at: now() });
     createAgentGroup({ id: TWIN, name: 'seed-codex', folder: 'seed-codex', agent_provider: null, created_at: now() });
@@ -354,10 +354,13 @@ describe('groups CLI resource config', () => {
   });
 
   it('test_current_config_generators_do_not_emit_gitnexus_fields', () => {
-    const wireSource = fs.readFileSync(new URL('../../../scripts/wire-v1-channels.ts', import.meta.url), 'utf8');
-    const migrationSource = fs.readFileSync(new URL('../../../scripts/migrate-groups.ts', import.meta.url), 'utf8');
-    expect(wireSource).not.toMatch(/gitnexusInjectAgentsMd|GITNEXUS_INJECT_AGENTS_MD/);
-    expect(migrationSource).not.toMatch(/gitnexusInjectAgentsMd|GITNEXUS_INJECT_AGENTS_MD/);
+    const generatorSources = [
+      fs.readFileSync(new URL('../../../scripts/init-first-agent.ts', import.meta.url), 'utf8'),
+      fs.readFileSync(new URL('../../../setup/migrate-v2/groups.ts', import.meta.url), 'utf8'),
+    ];
+    for (const source of generatorSources) {
+      expect(source).not.toMatch(/gitnexusInjectAgentsMd|GITNEXUS_INJECT_AGENTS_MD/);
+    }
   });
 });
 

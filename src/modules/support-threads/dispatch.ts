@@ -20,7 +20,7 @@
  * key), records the ticket on the row, and best-effort edits the channel
  * announcement to show the ticket id.
  *
- * State design (Dave, 2026-06-09): ALL workflow state lives host-side in the
+ * State design: ALL workflow state lives host-side in the
  * central `support_threads` table. No bedroom or workgroup files — any agent
  * assigned to the workflow inherits protocol (repo) + state (host) wholesale.
  *
@@ -40,7 +40,9 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
+import { readContainerConfig } from '../../container-config.js';
 import { wakeContainer } from '../../container-runner.js';
+import { getAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
 import {
@@ -73,6 +75,20 @@ function clip(s: unknown, n = MAX_BODY): string {
 
 function str(v: unknown): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
+function supportTicketPolicy(agentGroupId: string): string | null {
+  const agentGroup = getAgentGroup(agentGroupId);
+  if (!agentGroup) return null;
+  const credentialFolder = readContainerConfig(agentGroup.folder).credentialFolder ?? agentGroup.folder;
+  const scopedName = `NANOCLAW_SUPPORT_TICKET_POLICY_${credentialFolder.toUpperCase().replace(/-/g, '_')}`;
+  return str(process.env[scopedName]) ?? str(process.env.NANOCLAW_SUPPORT_TICKET_POLICY);
+}
+
+function ticketCreationStep(policy: string | null): string {
+  return policy
+    ? `Create the Linear issue using this operator-configured policy: ${policy} `
+    : `Create the Linear issue in the appropriate team using the email subject as the title, include the complete email context in the description, choose priority from the reported impact, then immediately call update_support_ticket with the created issue identifier and team. `;
 }
 
 /**
@@ -164,6 +180,7 @@ function seedPrompt(
   sender: string,
   date: string,
   bodyText: unknown,
+  ticketPolicy: string | null,
 ): string {
   const common = [
     `Then assess the issue and respond in this thread — this thread is the working space for this support issue.`,
@@ -179,10 +196,7 @@ function seedPrompt(
   }
   const protocol =
     `New support issue routed to this thread (no Linear ticket yet — creating it is YOUR first step). ` +
-    `1) Create the Linear issue with your Linear tools: team "Apollo" if the email clearly references Apollo, otherwise "XZO" (XZO is the failover default); ` +
-    `title = the email subject; description = sender/date/subject header + the full email body + a "Source: support@illysium.ai" footer; ` +
-    `priority 2 (High) if it mentions urgent/down/outage/broken/can't login, else 3 (Medium). ` +
-    `2) Immediately call update_support_ticket({ linearIssue: "<IDENT>", linearTeam: "<team>" }) so the host records the ticket for this thread. ` +
+    ticketCreationStep(ticketPolicy) +
     common;
   return `${protocol}\n\n${emailContext(subject, sender, date, bodyText)}`;
 }
@@ -194,10 +208,11 @@ function followupText(
   date: string,
   bodyText: unknown,
   linearIssue: string | null,
+  ticketPolicy: string | null,
 ): string {
   const ticketStep = linearIssue
     ? `Post a Linear comment on ${linearIssue} capturing this reply (blockquote, attribute the sender). `
-    : `No Linear ticket is recorded for this thread yet — create one first (team: Apollo if clearly Apollo, else XZO; then call update_support_ticket). `;
+    : `No Linear ticket is recorded for this thread yet — ${ticketCreationStep(ticketPolicy)}`;
   return (
     `📧 *Follow-up email*\n\n${emailContext(subject, sender, date, bodyText)}\n\n` +
     ticketStep +
@@ -242,6 +257,7 @@ export async function handleDispatchSupportIssue(
   // the dispatcher passed (it may know from a legacy flow).
   const linearIssue = existing?.linear_issue ?? str(content.linearIssue);
   const linearTeam = existing?.linear_team ?? str(content.linearTeam);
+  const ticketPolicy = supportTicketPolicy(session.agent_group_id);
 
   // ── Follow-up: an open issue with a live session already exists ──
   if (existing && existing.session_id && existing.slack_thread_id) {
@@ -255,7 +271,7 @@ export async function handleDispatchSupportIssue(
         platformId: mg.platform_id,
         threadId: existing.slack_thread_id,
         content: JSON.stringify({
-          text: followupText(subject, sender, date, content.bodyText, linearIssue),
+          text: followupText(subject, sender, date, content.bodyText, linearIssue, ticketPolicy),
           sender: 'system',
           senderId: 'system',
           ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
@@ -306,7 +322,7 @@ export async function handleDispatchSupportIssue(
     platformId: mg.platform_id,
     threadId: encodedThreadId,
     content: JSON.stringify({
-      text: seedPrompt(linearIssue, subject, sender, date, content.bodyText),
+      text: seedPrompt(linearIssue, subject, sender, date, content.bodyText, ticketPolicy),
       sender: 'system',
       senderId: 'system',
       ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),

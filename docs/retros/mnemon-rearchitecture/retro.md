@@ -4,7 +4,7 @@
 **Feature:** mnemon-rearchitecture (per-group fact store + automatic recall + multi-source capture; rebuild after PR #68 failure)
 **Branch:** `main` (linear history; commits `8ae875f` feature + `81ed5a6` post-soak hardening)
 **Artifacts location:** `docs/specs/mnemon-rearchitecture/`
-**Prior retro referenced:** `.context/retros/mnemon-integration/retro.md` (PR #68)
+**Prior retro referenced:** the PR #68 transient retro, retained in Git history
 
 ## Stage-by-Stage Findings
 
@@ -36,7 +36,7 @@ All three documented in `docs/specs/mnemon-rearchitecture/follow-up-items.md` (I
 
 3. **Reviewer "recommendations" must be upgraded to spec edits before /team-plan.** M7 said "recommend native fetch via OneCLI proxy" — that recommendation propagated as design text but never became a concrete spec for the daemon endpoint, auth path, or proxy dispatcher. The actual implementation needed 4 corrections (port 10254→10255, ExecStart `onecli run` wrapper, Node 20 HTTPS_PROXY ignored, OAuth Bearer auth) caught only at QA round 3. Next time: cycle-3 review's "recommended" findings either get promoted to spec text in the same cycle, or get explicit `[NEEDS SPEC]` tags carried into `/team-plan` Step 4 as task-level decisions.
 
-4. **`/team-ship`'s "tests pass" gate doesn't validate end-to-end live behavior.** All 423 tests passed; build clean; deployed across 11 groups. Yet recall injection was 0% functional in production for hours — the headline UX silently never fired. Surfaced only when Dave manually tested. Next time: features with an observable user-facing behavior need a manual-smoke gate AFTER deploy and BEFORE declaring done — exercise the headline path once and visually verify. This is `/team-go-live`'s territory, not `/team-ship`'s, but it's currently nobody's territory.
+4. **`/team-ship`'s "tests pass" gate doesn't validate end-to-end live behavior.** All 423 tests passed; build clean; deployed across 11 groups. Yet recall injection was 0% functional in production for hours — the headline UX silently never fired. Surfaced only when Operator manually tested. Next time: features with an observable user-facing behavior need a manual-smoke gate AFTER deploy and BEFORE declaring done — exercise the headline path once and visually verify. This is `/team-go-live`'s territory, not `/team-ship`'s, but it's currently nobody's territory.
 
 5. **"Out of scope, defer" on a finding that blocks the feature working should be a hard re-evaluate, not soft defer.** Codex round 3 tagged F3 (daemon endpoint URL) as "REAL bug, OUT OF SCOPE for cleanup PR." Honest classification by Codex's scoping discipline. But the daemon literally couldn't make an Anthropic call as configured — the feature didn't work. User pushback fixed it in the same session. Next time: the lead applies a stricter rule than Codex's scoping — if a flagged "out-of-scope" finding blocks the headline feature path from working, override the scoping and fix it inline.
 
@@ -94,7 +94,8 @@ No project-specific skill changes — all updates are to bootstrap-workflow skil
 
 ## Comparison to PR #68 retro
 
-The prior `mnemon-integration` retro (`.context/retros/mnemon-integration/retro.md`) flagged 5 learnings. Three apply to this rebuild:
+The prior `mnemon-integration` retro from PR #68 flagged 5 learnings. Three
+apply to this rebuild:
 
 | Prior learning | This feature |
 |---|---|

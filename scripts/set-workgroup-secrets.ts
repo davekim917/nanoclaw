@@ -25,7 +25,7 @@
  * subtract from the workgroup floor.
  *
  * Example:
- *   pnpm exec tsx scripts/set-workgroup-secrets.ts illysium --secrets Anthropic,Exa
+ *   pnpm exec tsx scripts/set-workgroup-secrets.ts example-labs --secrets Anthropic,Exa
  */
 import Database from 'better-sqlite3';
 import path from 'path';

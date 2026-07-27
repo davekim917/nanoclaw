@@ -66,7 +66,7 @@ import type { InboundEvent } from './channels/adapter.js';
  * workspace/guild has no prior wiring — those stay on the approval-gate path.
  *
  * Scope key:
- *   Slack: channel_type (e.g. "slack-illysium") — already includes the workspace.
+ *   Slack: channel_type (e.g. "slack-example-labs") — already includes the workspace.
  *   Discord: guild id (first segment of "discord:<guildId>:<channelId>") — channel_type
  *     is just "discord" and doesn't differentiate guilds.
  *   Other: channel_type.
@@ -104,7 +104,7 @@ function inheritedAgentGroupFor(mg: MessagingGroup): { id: string; sourceMessagi
     const guildId = mg.platform_id.split(':')[1];
     if (!guildId) return null;
     // Scope the lookup to the same channel_type (same bot identity). With
-    // multi-bot forks, axie + axie-codex can both have wirings in the same
+    // multi-bot forks, example-agent + example-agent-codex can both have wirings in the same
     // guild — they're separate bots, so a fresh channel under one bot should
     // inherit only that bot's wirings, not the other's.
     rows = db
@@ -865,7 +865,7 @@ function evaluateEngage(
       return isMention;
     case 'mention-pattern': {
       // Hybrid: requires both a platform @-mention AND a text-pattern match.
-      // Use when two sibling agents share one bot user (e.g. illie + illie-codex
+      // Use when two sibling agents share one bot user (e.g. helper + helper-codex
       // on the same Slack app) and a keyword in the message text decides
       // which sibling fires. Without isMention, random chatter mentioning
       // the keyword would wake the bot; without the pattern, both siblings
@@ -1027,8 +1027,8 @@ async function deliverToAgent(
   // that was for a sibling would (a) post a duplicate "effort → X" reply
   // from this agent's bot user — visible noise in the channel — and (b)
   // store the flag in this session's sticky config when the operator
-  // never intended it. Observed: `@Bo -e max` triggered Bo-codex's
-  // accumulate path on the shared MR channel; Bo-codex emitted its own
+  // never intended it. Observed: `@Example Assistant -e max` triggered Example Assistant Codex's
+  // accumulate path on the shared Example Retail channel; Example Assistant Codex emitted its own
   // "effort → max" message and stored the sibling-targeted value in its own
   // session_state even though the operator never addressed that agent.
   let flagIntent: FlagIntent | undefined;

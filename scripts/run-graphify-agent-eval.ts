@@ -268,8 +268,7 @@ export function isEvaluationSourcePath(file: string): boolean {
   if (normalized.startsWith('.claude/') || normalized.startsWith('.codex/')) return false;
   if (normalized.endsWith('.pyc')) return false;
   if (normalized.startsWith('docs/specs/graphify-container-code-intelligence/eval/')) return false;
-  if (/^docs\/specs\/graphify-container-code-intelligence\/qa-evidence\/(?:v\d+\/)?agent-eval/.test(normalized))
-    return false;
+  if (normalized.startsWith('.claude/tmp/graphify-agent-eval/')) return false;
   if (normalized === 'scripts/run-graphify-agent-eval.ts' || normalized === 'scripts/run-graphify-agent-eval.test.ts') {
     return false;
   }
@@ -1552,7 +1551,7 @@ function main(): void {
   const protocolRoot = path.join(evalRoot, EVAL_PROTOCOL.version);
   const outputDirectory = path.join(
     root,
-    'docs/specs/graphify-container-code-intelligence/qa-evidence',
+    '.claude/tmp/graphify-agent-eval',
     EVAL_PROTOCOL.version,
   );
   const mode = process.argv[2];

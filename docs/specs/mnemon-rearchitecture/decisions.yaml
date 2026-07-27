@@ -203,11 +203,11 @@ decisions:
     chosen: "Tool-output capture (primary) + chat-stream classifier (primary, equal weight) + manual drops to groups/<g>/sources/inbox/ (tertiary)"
     rejected:
       - option: "iCloud → Mac Mini → rsync → Linux host (Vivian's reference setup)"
-        reason: "Platform-specific to Pi 5 + Mac Mini bridge; Dave's Linux server has different curation surfaces (Slack, Granola, Pocket, gws integrations)"
+        reason: "Platform-specific to Pi 5 + Mac Mini bridge; Operator's Linux server has different curation surfaces (Slack, Granola, Pocket, gws integrations)"
       - option: "Slack-direct upload only (operator drags files into chat)"
-        reason: "Chat is primary memory source per Dave; tool-output captures the same content more naturally without manual curation step"
+        reason: "Chat is primary memory source per Operator; tool-output captures the same content more naturally without manual curation step"
       - option: "Per-group source GitHub repos with cron pull"
-        reason: "Adds 7+ new repos and ~5min ingest latency; tool-output capture is more aligned with Dave's actual workflow"
+        reason: "Adds 7+ new repos and ~5min ingest latency; tool-output capture is more aligned with Operator's actual workflow"
     constraint_refs: [C12, C13, C14]
   - id: D2
     stage: brief
@@ -219,11 +219,11 @@ decisions:
     constraint_refs: [C7, C20, C21]
   - id: D3
     stage: brief
-    description: "Migration of 2 existing illysium store insights from PR #68 sanity tests"
+    description: "Migration of 2 existing example-labs store insights from PR #68 sanity tests"
     chosen: "Discard. Clean slate."
     rejected:
       - option: "Migrate to new local store"
-        reason: "Both are debris (smoke-test fact + trivial client fact). Will be re-extracted from any chat about Illysium clients. Clean slate is cleaner."
+        reason: "Both are debris (smoke-test fact + trivial client fact). Will be re-extracted from any chat about Example Labs clients. Clean slate is cleaner."
     constraint_refs: []
   - id: D4
     stage: brief
@@ -246,10 +246,10 @@ decisions:
   - id: D6
     stage: brief
     description: "Per-group rollout strategy"
-    chosen: "All 7 groups enabled at ship time; smoke-test on illysium pre-merge"
+    chosen: "All 7 groups enabled at ship time; smoke-test on example-labs pre-merge"
     rejected:
       - option: "Enable one group first, observe for N days, then enable rest"
-        reason: "Dave-stated no-phasing constraint; previous attempt's shadow phase failure was the catalyst for this rebuild. End-to-end working build demonstrated in production at merge."
+        reason: "Operator-stated no-phasing constraint; previous attempt's shadow phase failure was the catalyst for this rebuild. End-to-end working build demonstrated in production at merge."
     constraint_refs: [C6, C22]
   - id: D7
     stage: brief
@@ -281,7 +281,7 @@ decisions:
       - option: "Replace mnemon with sqlite-vec now"
         reason: "mnemon's graph layer (entity/temporal/causal/semantic edges) plus dedup and decay are useful primitives; replaceability via interface is sufficient. Swap is a separate decision once we see how the graph layer earns its keep."
       - option: "Couple recall + ingestion directly to mnemon CLI"
-        reason: "Dave constraint: must be replaceable without touching the recall injector or daemon."
+        reason: "Operator constraint: must be replaceable without touching the recall injector or daemon."
     constraint_refs: [C7]
   - id: D9
     stage: brief
@@ -301,7 +301,7 @@ decisions:
       - option: "File-watch + pub/sub mechanism"
         reason: "Doesn't exist in NanoClaw today; archive.db is the already-deduplicated, already-delivered view of conversation"
       - option: "Real-time event stream"
-        reason: "Adds infrastructure (eventbus/MQ) for marginal latency benefit; 60s poll matches Dave's v1 pattern and is fine for this use case"
+        reason: "Adds infrastructure (eventbus/MQ) for marginal latency benefit; 60s poll matches Operator's v1 pattern and is fine for this use case"
     constraint_refs: [C18, C19]
 
   # Design-stage decisions (added 2026-04-30)
@@ -369,7 +369,7 @@ assumptions:
   - id: A4
     stage: design
     text: "Tool-output capture for the named tools list covers most curation actually wanted"
-    validation: "Operator review during build smoke; revise list per Dave's actual usage"
+    validation: "Operator review during build smoke; revise list per Operator's actual usage"
     validated: false
   - id: A5
     stage: design

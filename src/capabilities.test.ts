@@ -57,10 +57,69 @@ afterEach(() => {
 });
 
 describe('buildSessionServicesSnapshot', () => {
+  it('resolves Atlassian and SELECT configuration per folder without cross-folder leakage', () => {
+    const envNames = [
+      'ATLASSIAN_BASE_URL',
+      'ATLASSIAN_BASE_URL_TENANT_ALPHA',
+      'ATLASSIAN_BASE_URL_TENANT_BETA',
+      'SELECT_ORGANIZATION_ID',
+      'SELECT_ORGANIZATION_ID_TENANT_ALPHA',
+      'SELECT_ORGANIZATION_ID_TENANT_BETA',
+    ];
+    const original = new Map(envNames.map((name) => [name, process.env[name]]));
+    for (const name of envNames) delete process.env[name];
+    process.env.ATLASSIAN_BASE_URL_TENANT_ALPHA = 'https://example.atlassian.net';
+    process.env.SELECT_ORGANIZATION_ID_TENANT_ALPHA = 'example-organization';
+
+    try {
+      insertWorkgroup('tenant-alpha', ['Select-Example']);
+      const alpha = group('ag-tenant-alpha', 'tenant-alpha');
+      createGroupInWorkgroup(alpha, 'tenant-alpha');
+      writeContainerConfig(alpha.folder, {
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        tools: ['atlassian'],
+      });
+
+      insertWorkgroup('tenant-beta', ['Select-Example']);
+      const beta = group('ag-tenant-beta', 'tenant-beta');
+      createGroupInWorkgroup(beta, 'tenant-beta');
+      writeContainerConfig(beta.folder, {
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        tools: ['atlassian'],
+      });
+
+      const alphaSnapshot = buildSessionServicesSnapshot(alpha.id);
+      const alphaAtlassian = alphaSnapshot.services.find((service) => service.name.startsWith('Atlassian'));
+      const alphaSelect = alphaSnapshot.services.find((service) => service.name.startsWith('SELECT'));
+      expect(alphaAtlassian?.useFor).toContain('https://example.atlassian.net');
+      expect(alphaSelect?.useFor).toContain('/api/example-organization/');
+
+      const betaSnapshot = buildSessionServicesSnapshot(beta.id);
+      const betaAtlassian = betaSnapshot.services.find((service) => service.name.startsWith('Atlassian'));
+      const betaSelect = betaSnapshot.services.find((service) => service.name.startsWith('SELECT'));
+      expect(betaAtlassian?.useFor).toContain('ATLASSIAN_BASE_URL is not configured');
+      expect(betaAtlassian?.useFor).not.toContain('https://example.atlassian.net');
+      expect(betaSelect?.useFor).toContain('/api/<organization_id>/');
+      expect(betaSelect?.useFor).toContain('SELECT_ORGANIZATION_ID is not configured');
+      expect(betaSelect?.useFor).not.toContain('example-organization');
+    } finally {
+      for (const [name, value] of original) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   it('surfaces Cloudflare when the workgroup secret and MCP server are both wired', () => {
-    insertWorkgroup('number-drinks', ['Cloudflare-NumberDrinks']);
-    const ag = group('ag-number-drinks', 'number-drinks');
-    createGroupInWorkgroup(ag, 'number-drinks');
+    insertWorkgroup('example-beverage', ['Cloudflare-ExampleBeverage']);
+    const ag = group('ag-example-beverage', 'example-beverage');
+    createGroupInWorkgroup(ag, 'example-beverage');
     writeContainerConfig(ag.folder, {
       mcpServers: {
         'cloudflare-api': {
@@ -83,7 +142,7 @@ describe('buildSessionServicesSnapshot', () => {
     const service = snapshot.services.find((s) => s.name === 'Cloudflare');
     expect(service).toBeDefined();
     expect(service?.mcpNamespace).toBe('mcp__cloudflare-api__*');
-    expect(service?.scopes).toEqual(['number-drinks']);
+    expect(service?.scopes).toEqual(['example-beverage']);
     expect(service?.useFor).toContain('mcp.cloudflare.com/mcp');
     expect(service?.useFor).toContain('mcp__cloudflare-api__search');
     expect(service?.useFor).toContain('mcp__cloudflare-api__execute');
@@ -95,13 +154,13 @@ describe('buildSessionServicesSnapshot', () => {
   });
 
   it('does not surface Cloudflare unless both its secret and MCP server are wired', () => {
-    insertWorkgroup('number-drinks', ['Cloudflare-NumberDrinks']);
-    const secretOnly = group('ag-secret-only', 'number-drinks-secret-only');
-    createGroupInWorkgroup(secretOnly, 'number-drinks');
+    insertWorkgroup('example-beverage', ['Cloudflare-ExampleBeverage']);
+    const secretOnly = group('ag-secret-only', 'example-beverage-secret-only');
+    createGroupInWorkgroup(secretOnly, 'example-beverage');
 
-    const noSecretWorkgroup = 'number-drinks-no-secret';
+    const noSecretWorkgroup = 'example-beverage-no-secret';
     insertWorkgroup(noSecretWorkgroup, []);
-    const mcpOnly = group('ag-mcp-only', 'number-drinks-mcp-only');
+    const mcpOnly = group('ag-mcp-only', 'example-beverage-mcp-only');
     createGroupInWorkgroup(mcpOnly, noSecretWorkgroup);
     writeContainerConfig(mcpOnly.folder, {
       mcpServers: {
@@ -121,29 +180,29 @@ describe('buildSessionServicesSnapshot', () => {
   });
 
   it('surfaces Profound when the workgroup declares the Profound OneCLI secret', () => {
-    insertWorkgroup('madison-reed', ['Profound']);
-    const ag = group('ag-mr', 'madison-reed');
-    createGroupInWorkgroup(ag, 'madison-reed');
+    insertWorkgroup('example-retail', ['Profound']);
+    const ag = group('ag-retail', 'example-retail');
+    createGroupInWorkgroup(ag, 'example-retail');
 
     const snapshot = buildSessionServicesSnapshot(ag.id);
 
     const service = snapshot.services.find((s) => s.name === 'Profound');
     expect(service).toBeDefined();
     expect(service?.cli).toBe('curl');
-    expect(service?.scopes).toEqual(['madison-reed']);
+    expect(service?.scopes).toEqual(['example-retail']);
     expect(service?.useFor).toContain('api.tryprofound.com');
     expect(service?.useFor).toContain('X-API-Key');
     expect(service?.useFor).not.toContain('/app/skills/profound/SKILL.md');
 
     const rendered = renderSessionCapabilities(snapshot);
     expect(rendered).toContain('**Profound**');
-    expect(rendered).toContain('Madison Reed Profound REST/reporting API');
+    expect(rendered).toContain('Profound REST/reporting API');
   });
 
   it('does not surface Profound without the Profound OneCLI secret', () => {
-    insertWorkgroup('illysium', []);
-    const ag = group('ag-illysium', 'illysium');
-    createGroupInWorkgroup(ag, 'illysium');
+    insertWorkgroup('example-labs', []);
+    const ag = group('ag-example-labs', 'example-labs');
+    createGroupInWorkgroup(ag, 'example-labs');
 
     const snapshot = buildSessionServicesSnapshot(ag.id);
 

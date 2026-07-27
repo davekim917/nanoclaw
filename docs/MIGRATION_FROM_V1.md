@@ -455,7 +455,7 @@ These features are native in v2 and should work without porting. Verify they do.
 > context described in [memory.md](memory.md) are authoritative. Do not
 > implement or activate the provider-native design below.
 
-**Why:** Empirical test on illysium-v2 showed native auto-memory already extracts structured facts correctly after a single chat turn (produced `MEMORY.md` + `user_dave_kim.md` with name, role, preferences — matching the v1 Haiku extractor's output shape). v2's native auto-memory is more reliable than v1's was because autoDreamEnabled (2.8) adds background grooming + the shared `.claude-shared` mount gives cross-thread persistence for free.
+**Why:** Empirical test on example-labs-v2 showed native auto-memory already extracts structured facts correctly after a single chat turn (produced `MEMORY.md` + `user_operator.md` with name, role, preferences — matching the v1 Haiku extractor's output shape). v2's native auto-memory is more reliable than v1's was because autoDreamEnabled (2.8) adds background grooming + the shared `.claude-shared` mount gives cross-thread persistence for free.
 
 The Haiku-based layer was originally planned as a _complement_ to weaker native support. With native now strong, Haiku extraction became redundant — and it hit a hard blocker anyway: the Anthropic API rejects `CLAUDE_CODE_OAUTH_TOKEN` for direct SDK calls (`OAuth authentication is currently not supported`). Getting it working would require either `ANTHROPIC_API_KEY` in `.env` or routing host-side Haiku through OneCLI's proxy — neither of which was worth the cost once native was proven sufficient.
 
@@ -602,7 +602,7 @@ The Haiku-based layer was originally planned as a _complement_ to weaker native 
 **v1 source:** `~/nanoclaw/src/thread-search.ts` (FTS5 + Haiku rerank + raw LIKE fallback), `~/nanoclaw/src/db.ts` (`searchThreadsFTS`, `searchMessagesRaw`, `thread_index`, `messages` FTS virtual table)
 **v2 target:** new `src/message-archive.ts` (host) + new migration + container-side MCP tool
 
-**Why this is Tier 1 (not 3):** Distinct from memory extraction. Memories store curated _facts_ ("Dave prefers X"); thread search stores raw _conversations_ so "find the thread where we discussed XYZ, summarize where we left off" works. Dave's daily use pattern depends on this.
+**Why this is Tier 1 (not 3):** Distinct from memory extraction. Memories store curated _facts_ ("Operator prefers X"); thread search stores raw _conversations_ so "find the thread where we discussed XYZ, summarize where we left off" works. Operator's daily use pattern depends on this.
 
 **Architecture problem:** v1 has a central `messages` table across all channels. v2 fragments history into per-session `inbound.db`/`outbound.db`. FTS5 can't index across files.
 
@@ -675,7 +675,7 @@ Run both instances simultaneously. Route test channels to v2, production stays o
 
 **Git + repo workflow (2.11):**
 
-- [x] Repo work: agent can clone a GitHub repo, make a branch via worktree, commit, push, and open a PR end-to-end — verified via PR #130 on Illysium-ai/apollo-analytics (2026-04-17)
+- [x] Repo work: agent can clone a GitHub repo, make a branch via worktree, commit, push, and open a PR end-to-end — verified via PR #130 on Example Labs-ai/example-data-analytics (2026-04-17)
 - [ ] Concurrent repo work: two threads can work on the same repo simultaneously without index-lock collisions
 - [ ] PR-merge GC: after merging a PR on GitHub, the agent's worktree is reaped within one cron cycle
 
@@ -685,7 +685,7 @@ Run both instances simultaneously. Route test channels to v2, production stays o
 - [ ] Plugin auto-discovery works — spawn a container, verify `ls /workspace/plugins/` shows all of ~/plugins/\* plus nanoclaw-hooks
 - [ ] Credential mounts present where expected — `gws accounts list`, `snow --version`, `dbt debug`, `aws sts get-caller-identity` all respond (per-group based on installed tools)
 - [ ] `GH_TOKEN` + `gh auth setup-git` wired correctly — `git clone`, `git push`, `gh pr create` all work inside container
-- [ ] Per-group scoped env: illysium-v2 agents see `SNOWFLAKE_PASSWORD` populated from `SNOWFLAKE_PASSWORD_ILLYSIUM` (same for render / dbt / openai / etc.)
+- [ ] Per-group scoped env: example-labs-v2 agents see `SNOWFLAKE_PASSWORD` populated from `SNOWFLAKE_PASSWORD_EXAMPLE_LABS` (same for render / dbt / openai / etc.)
 - [ ] Entrypoint.sh tool setup: XDG dirs for Chromium exist, gws wrapper in $PATH and strips ADC, GitNexus registry populated with mounted repos
 
 **Tone + formatting (5.1 + 5.9):**
@@ -742,7 +742,7 @@ Run both instances simultaneously. Route test channels to v2, production stays o
 - [ ] Kill a container mid-session → verify host detects stale heartbeat and retries
 - [ ] Send concurrent messages in different threads → verify isolation
 - [ ] Session with a tone-profile directive — confirm the agent actually loads the profile and writes in that voice
-- [ ] `@illie-v2 what can you do?` — agent calls `get_capabilities` and describes the install accurately (no hallucinated features, no missed mounted creds)
+- [ ] `@helper-v2 what can you do?` — agent calls `get_capabilities` and describes the install accurately (no hallucinated features, no missed mounted creds)
 
 ---
 
@@ -865,7 +865,7 @@ Bundled under 5.10 Web UI, but if porting the Web UI, you must also port:
 
 ### 5.16 Scoped Env / Tool Scopes (NEW — added in fourth-pass audit)
 
-**v1 source:** `~/nanoclaw/src/scoped-env.ts` — `tool:scope` credential isolation (gmail:illysium, render:scope, browser-auth).
+**v1 source:** `~/nanoclaw/src/scoped-env.ts` — `tool:scope` credential isolation (gmail:example-labs, render:scope, browser-auth).
 **v2 target:** Evaluate whether OneCLI's per-agent policies cover this. If not, port the scoping model — needed for multi-tenant credential isolation.
 
 - [ ] Evaluated
@@ -888,7 +888,7 @@ These features exist in the v1 fork but may not be needed. Evaluate after runnin
 | T3.3     | **Complexity classifier**        | `src/complexity-classifier.ts`                                                                          | Was this actually useful in v1? Did it change routing decisions?                                                                                                                                                                          | Low        |
 | T3.4     | **Commit digest / attribution**  | `src/commit-digest.ts`                                                                                  | Nice for tracking but not essential. Worth the maintenance?                                                                                                                                                                               | Low        |
 | ~~T3.5~~ | ~~Thread search (FTS5 + Haiku)~~ | ~~`src/thread-search.ts`~~                                                                              | **Promoted to Tier 1 as Phase 2.9 (2026-04-16). Daily-use feature for "find thread where we discussed X".**                                                                                                                               | ~~Medium~~ |
-| ~~T3.6~~ | ~~Worktree management~~          | ~~`src/ipc.ts`, `src/worktree-cleanup.ts`~~                                                             | **Promoted to Tier 1 as Phase 2.11 (2026-04-17). Per-thread worktrees off group-level canonical clones. Daily-use — Axie-2 can't do real engineering work without this. See [PHASE_2_11_GIT_WORKTREES.md](PHASE_2_11_GIT_WORKTREES.md).** | ~~High~~   |
+| ~~T3.6~~ | ~~Worktree management~~          | ~~`src/ipc.ts`, `src/worktree-cleanup.ts`~~                                                             | **Promoted to Tier 1 as Phase 2.11 (2026-04-17). Per-thread worktrees off group-level canonical clones. Daily-use — Example Agent-2 can't do real engineering work without this. See [PHASE_2_11_GIT_WORKTREES.md](PHASE_2_11_GIT_WORKTREES.md).** | ~~High~~   |
 | T3.6     | **Worktree management**          | `src/ipc.ts`, `src/worktree-cleanup.ts`                                                                 | v2's per-session container isolation may replace the need. Do agents still need host-side worktrees?                                                                                                                                      | High       |
 | T3.7     | **Blueprint workshop**           | Multiple files                                                                                          | Was this completed in v1? Is it still relevant?                                                                                                                                                                                           | Medium     |
 | T3.8     | **Mermaid rendering**            | `container/Dockerfile`                                                                                  | v2 has Chromium in base. Add mermaid-cli to container.json if needed.                                                                                                                                                                     | Low        |
@@ -913,7 +913,7 @@ Track these during the migration. Answers inform decisions marked with ⚠️ in
 7. **Does Chat SDK handle channel reconnection gracefully?** → v1's custom implementations had retry logic. Monitor during Phase 3.
 8. **Should progress updates be host-driven or agent-driven?** → v2 gives agents `edit_message` MCP tool — agent could manage its own status messages. Host-driven (Phase 2.4) is more reliable but less flexible. Could evolve to agent-driven later.
 9. **Do task_notification events fire often enough?** → Phase 2.4 relies on native SDK progress events. If they're too sparse in practice, add tool-call heuristics as fallback. Monitor during Phase 3.
-10. **Does OneCLI's per-agent policy cover tool-scope credential isolation?** → Fork's `scoped-env.ts` uses `tool:scope` patterns (gmail:illysium, render:prod). If OneCLI natively supports this, skip 5.17. If not, port the scoping model.
+10. **Does OneCLI's per-agent policy cover tool-scope credential isolation?** → Fork's `scoped-env.ts` uses `tool:scope` patterns (gmail:example-labs, render:prod). If OneCLI natively supports this, skip 5.17. If not, port the scoping model.
 11. **Is the `claude` CLI required on v2's host?** → v1's `callHaiku` shells out to `claude` CLI. Phase 2.5 recommends switching to direct Anthropic SDK call. Confirm before implementing.
 12. **How does the upstream dropped-messages feature interact with unknown sender policies?** → v2 upstream added `unregistered_senders` table (migration 008). Understand the interplay with messaging_groups.unknown_sender_policy (strict/request_approval/public) before relying on it.
 
@@ -941,7 +941,7 @@ When upstream officially launches v2 (merges v2 → main, tags a release, or oth
 
 ### Scenario A: You cut over BEFORE upstream launches v2
 
-You've completed Phases 1-4 and `dave/migration` is running in production, but upstream's v2 is still a branch. When upstream finally launches v2 (merges to main):
+You've completed Phases 1-4 and `operator/migration` is running in production, but upstream's v2 is still a branch. When upstream finally launches v2 (merges to main):
 
 1. **Sync upstream refs:**
 
@@ -954,13 +954,13 @@ You've completed Phases 1-4 and `dave/migration` is running in production, but u
 
    ```bash
    # Rebase your migration branch onto upstream's new main (which is now v2-based)
-   git checkout dave/migration
+   git checkout operator/migration
    git rebase upstream/main
    # Resolve any conflicts — likely minimal if you've been syncing regularly
 
    # Fast-forward your fork's main to match
    git checkout main
-   git reset --hard dave/migration
+   git reset --hard operator/migration
    git push --force-with-lease origin main
    ```
 
@@ -968,7 +968,7 @@ You've completed Phases 1-4 and `dave/migration` is running in production, but u
 
 ### Scenario B: Upstream launches v2 BEFORE you cut over
 
-You're mid-migration on `dave/migration`. Upstream releases v2:
+You're mid-migration on `operator/migration`. Upstream releases v2:
 
 1. **Sync upstream refs:**
 
@@ -976,31 +976,31 @@ You're mid-migration on `dave/migration`. Upstream releases v2:
    git fetch upstream
    ```
 
-2. **Rebase `dave/migration` onto upstream's new main:**
+2. **Rebase `operator/migration` onto upstream's new main:**
 
    ```bash
-   git checkout dave/migration
+   git checkout operator/migration
    git rebase upstream/main
    # Resolve any conflicts in port work that intersects with upstream changes
-   git push --force-with-lease origin dave/migration
+   git push --force-with-lease origin operator/migration
    ```
 
-3. **Continue port work** on `dave/migration` tracking the stable upstream/main instead of the volatile upstream/v2 branch.
+3. **Continue port work** on `operator/migration` tracking the stable upstream/main instead of the volatile upstream/v2 branch.
 
-4. **When you're ready to cut over (Phase 4):** promote `dave/migration` to `main` on your fork:
+4. **When you're ready to cut over (Phase 4):** promote `operator/migration` to `main` on your fork:
    ```bash
    git checkout main
-   git reset --hard dave/migration
+   git reset --hard operator/migration
    git push --force-with-lease origin main
    ```
 
 ### Safer Alternative: Merge Instead of Rebase
 
-If you prefer not to rewrite history (especially once `dave/migration` is pushed and others may have pulled), use merge instead:
+If you prefer not to rewrite history (especially once `operator/migration` is pushed and others may have pulled), use merge instead:
 
 ```bash
 git checkout main
-git merge dave/migration
+git merge operator/migration
 git push origin main
 ```
 
@@ -1008,7 +1008,7 @@ Rebase gives a cleaner history; merge preserves the full timeline. For a single-
 
 ### Keeping Your Fork's `main` for v1 Rollback
 
-During Phase 4 cutover and for ~2 weeks after (per the rollback window), keep your existing `main` (v1 customizations) untouched. Only promote `dave/migration` → `main` once you're confident v2 is stable.
+During Phase 4 cutover and for ~2 weeks after (per the rollback window), keep your existing `main` (v1 customizations) untouched. Only promote `operator/migration` → `main` once you're confident v2 is stable.
 
 Option: rename your current `main` to `v1-main` as an archive before overwriting:
 
@@ -1016,7 +1016,7 @@ Option: rename your current `main` to `v1-main` as an archive before overwriting
 git push origin main:v1-main     # Archive v1 customizations as v1-main branch
 # ... then later ...
 git checkout main
-git reset --hard dave/migration
+git reset --hard operator/migration
 git push --force-with-lease origin main
 ```
 

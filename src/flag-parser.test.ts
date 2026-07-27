@@ -91,7 +91,7 @@ describe('parseMessageFlags', () => {
 
     it('strips a mention even when no flags follow', () => {
       expect(parseMessageFlags('<@BOTID123> hi').cleanedText).toBe('hi');
-      expect(parseMessageFlags('@U0AKALV5HRP hi').cleanedText).toBe('hi');
+      expect(parseMessageFlags('@UTEST00021 hi').cleanedText).toBe('hi');
       expect(parseMessageFlags('<@!nicknameBot> hi').cleanedText).toBe('hi');
     });
   });
@@ -195,18 +195,18 @@ describe('parseMessageFlags', () => {
 
   describe('mention prefix before flags', () => {
     it('strips Discord <@BOTID>', () => {
-      const r = parseMessageFlags('<@1478986205319135302> -m haiku write about autumn');
+      const r = parseMessageFlags('<@123456789000000001> -m haiku write about autumn');
       expect(r.intent).toEqual({ stickyModel: 'haiku' });
       expect(r.cleanedText).toBe('write about autumn');
     });
 
     it('strips Discord nickname <@!BOTID>', () => {
-      const r = parseMessageFlags('<@!1478986205319135302> -m haiku hi');
+      const r = parseMessageFlags('<@!123456789000000001> -m haiku hi');
       expect(r.intent).toEqual({ stickyModel: 'haiku' });
     });
 
     it('strips chat-sdk-stripped Slack @UID', () => {
-      const r = parseMessageFlags('@U0AKALV5HRP -m sonnet -e low explain');
+      const r = parseMessageFlags('@UTEST00021 -m sonnet -e low explain');
       expect(r.intent).toEqual({ stickyModel: 'sonnet', stickyEffort: 'low' });
       expect(r.cleanedText).toBe('explain');
     });
@@ -233,7 +233,7 @@ describe('parseMessageFlags', () => {
     });
 
     it('handles /switch combined with mention prefix', () => {
-      const r = parseMessageFlags('@U0AKALV5HRP /switch -m opus -e high');
+      const r = parseMessageFlags('@UTEST00021 /switch -m opus -e high');
       expect(r.intent).toEqual({ stickyModel: 'opus', stickyEffort: 'high' });
       expect(r.cleanedText).toBe('');
     });
@@ -367,7 +367,7 @@ describe('formatFlagConfirmation', () => {
 });
 
 describe('provider-aware vocabulary (codex)', () => {
-  // Observed live 2026-06-10 on dirt-market-codex: `-m fable` was acked and
+  // Observed live 2026-06-10 on example-market-codex: `-m fable` was acked and
   // stored on a codex session (then silently ignored by the provider), while
   // `-m gpt-5.5` — the model actually running — was rejected as unknown.
   // The parser now selects vocabulary by the target group's provider.

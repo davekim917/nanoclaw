@@ -40,8 +40,8 @@ function emptySummary() {
 
 describe('extractRepo', () => {
   it('parses owner/repo from a github PR url', () => {
-    expect(extractRepo(shipEntry({ pr_url: 'https://github.com/Illysium-ai/ILLYSE/pull/1234' }))).toBe(
-      'Illysium-ai/ILLYSE',
+    expect(extractRepo(shipEntry({ pr_url: 'https://github.com/Example Labs-ai/example-app/pull/1234' }))).toBe(
+      'Example Labs-ai/example-app',
     );
   });
 
@@ -56,7 +56,7 @@ describe('extractRepo', () => {
   });
 
   it('uses JSON-array tag fallback (legacy v1 format)', () => {
-    expect(extractRepo(shipEntry({ tags: '["commit-digest","ILLYSE"]' }))).toBe('ILLYSE');
+    expect(extractRepo(shipEntry({ tags: '["commit-digest","example-app"]' }))).toBe('example-app');
   });
 
   it('uses title prefix when colon appears in first 40 chars', () => {
@@ -95,7 +95,7 @@ describe('isCommitScanEntry', () => {
   });
 
   it('detects the legacy JSON-array commit-digest tag', () => {
-    expect(isCommitScanEntry(shipEntry({ tags: '["commit-digest","ILLYSE"]' }))).toBe(true);
+    expect(isCommitScanEntry(shipEntry({ tags: '["commit-digest","example-app"]' }))).toBe(true);
   });
 
   it('is false for agent-recorded entries (non commit-digest tags)', () => {
@@ -105,16 +105,16 @@ describe('isCommitScanEntry', () => {
 });
 
 describe('formatDigest', () => {
-  const WG = 'madison-reed';
+  const WG = 'example-retail';
 
   it('emits only the header when all sources are empty', () => {
     const out = formatDigest(WG, emptySummary());
     // Header line only — caller is expected to skip-empty before formatting.
-    expect(out).toBe('📋 **Daily Summary** — madison-reed');
+    expect(out).toBe('📋 **Daily Summary** — example-retail');
   });
 
   it('uses the provided workgroup label in the header', () => {
-    expect(formatDigest('illysium', emptySummary())).toContain('— illysium');
+    expect(formatDigest('example-labs', emptySummary())).toContain('— example-labs');
   });
 
   it('renders Agent Shipped without per-repo header when only one repo', () => {

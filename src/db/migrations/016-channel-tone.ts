@@ -6,7 +6,7 @@ import type { Migration } from './index.js';
  *
  * Ports v1's "always-on, system-prompt-injected default tone" feature, but at
  * the channel-wiring grain instead of v1's group grain. v1 used one tone per
- * agent_group; v2 needs variation within a group (e.g. illysium agent runs in
+ * agent_group; v2 needs variation within a group (e.g. example-labs agent runs in
  * both Slack and Discord: Slack→engineering, Discord→assistant).
  *
  * Null falls through to container.json group-level `tone` (if set), then to

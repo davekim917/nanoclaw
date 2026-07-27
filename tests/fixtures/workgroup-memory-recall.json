@@ -16,13 +16,13 @@
     {
       "id": "gsc-snowflake",
       "source": "memory",
-      "thread": "madison-reed",
+      "thread": "example-retail",
       "text": "Google Search Console data is already ingested into Snowflake. Do not try Google Workspace for GSC analysis."
     },
     {
       "id": "looker-rest",
       "source": "memory",
-      "thread": "madison-reed",
+      "thread": "example-retail",
       "text": "Use the Looker REST API for source-faithful dashboard and explore inspection."
     },
     {
@@ -72,26 +72,26 @@
     {
       "id": "snowflake-ordinal",
       "source": "memory",
-      "thread": "illysium",
+      "thread": "example-labs",
       "text": "Snowflake ordinal gaps require explicit column ordering during additive schema changes."
     },
     {
       "id": "fivetran-connector",
       "source": "memory",
-      "thread": "madison-reed",
-      "text": "Fivetran connector state is available from the REST API through the Madison Reed credential scope."
+      "thread": "example-retail",
+      "text": "Fivetran connector state is available from the REST API through the Example Retail credential scope."
     },
     {
       "id": "hex-context",
       "source": "memory",
-      "thread": "madison-reed",
+      "thread": "example-retail",
       "text": "Hex Context Studio suggestions are inspected with hex suggestion list."
     },
     {
       "id": "irrelevant-recipes",
       "source": "archive",
       "thread": "social",
-      "text": "Sunday dinner was tomato soup and grilled cheese."
+      "text": "Archive One dinner was tomato soup and grilled cheese."
     },
     {
       "id": "irrelevant-running",

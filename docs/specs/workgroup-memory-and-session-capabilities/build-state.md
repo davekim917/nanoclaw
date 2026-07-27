@@ -604,7 +604,7 @@ Last updated: 2026-07-26T11:39:19Z
 
 - Group A spec-fix RED test initially called the production strict-quiescence
   path because `runCli` ignored its injected hook. It stopped three live
-  `illysium` containers. The builder was interrupted immediately. The host
+  `example-labs` containers. The builder was interrupted immediately. The host
   service remained active; two sessions had already completed replies, and the
   active Codex session automatically respawned and resumed the same provider
   session. No live memory/content data changed; normal lifecycle-status rows

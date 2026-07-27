@@ -16,7 +16,7 @@ import { migration009 } from './009-drop-pending-credentials.js';
 import { migration010 } from './010-engage-modes.js';
 import { migration011 } from './011-pending-sender-approvals.js';
 import { migration012 } from './012-channel-registration.js';
-// Dave's migrations (custom) and upstream's 013 live side-by-side; both files
+// Operator's migrations (custom) and upstream's 013 live side-by-side; both files
 // happen to be numbered 013 but carry distinct `name` fields (names are the
 // uniqueness key for schema_version). Import-alias upstream's to dodge the
 // JS identifier collision with `013-memories.js`.

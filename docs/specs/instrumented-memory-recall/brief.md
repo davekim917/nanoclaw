@@ -36,7 +36,7 @@ This feature instruments recall first, then improves it on the basis of measured
 - **R3.1** Per-group config field `memory.recall_scope: "self" | "all-groups" | string[]` in `groups/<g>/container.json`. Default `"self"` preserves current isolation.
 - **R3.2** Daemon-side fan-out: when `recall_scope` includes other groups, daemon issues parallel `mnemon recall` calls across the relevant stores, merges results, deduplicates by fact id, and re-ranks before injection.
 - **R3.3** Failure path: if cross-group fan-out's mean judge score drops below per-group `self`-scope baseline by ≥0.2 (0-2 scale) for 7 consecutive days, daemon **auto-reverts** that group to `self` AND writes `recall_scope_reverted: { group, from, to, reason, at }` to `data/memory-health.json`. Circuit breaker does not auto-flip back; operator re-enables manually.
-- **R3.4** This feature ships only the mechanism. No group's `recall_scope` is changed by the feature itself. Operator flips axis-labs to `"all-groups"` separately when ready.
+- **R3.4** This feature ships only the mechanism. No group's `recall_scope` is changed by the feature itself. Operator flips example-research to `"all-groups"` separately when ready.
 
 ## Constraints
 
@@ -92,7 +92,7 @@ This feature instruments recall first, then improves it on the basis of measured
 
 ### Cross-group scope (R3) ships when:
 - Mechanism is shipped behind `recall_scope` defaulting to `"self"`. No group's scope is auto-changed.
-- For axis-labs (designated trial group): when manually flipped to `"all-groups"`, mean LLM-judge score over 100 events beats its `self` baseline by ≥0.2 (0-2 scale). Tie or regression = flip reverts via circuit breaker; mechanism stays shipped for other groups.
+- For example-research (designated trial group): when manually flipped to `"all-groups"`, mean LLM-judge score over 100 events beats its `self` baseline by ≥0.2 (0-2 scale). Tie or regression = flip reverts via circuit breaker; mechanism stays shipped for other groups.
 
 ### Whole-feature ships when:
 - All three deliverables meet their respective gates.

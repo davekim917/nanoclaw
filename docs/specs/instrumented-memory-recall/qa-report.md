@@ -51,7 +51,7 @@
 
 - **File:** `src/modules/memory/mnemon-impl.ts:215-216` (`MnemonStore.recall`); production wiring is in `src/modules/memory/recall-injection.ts:15` (`let store: MnemonStore = new MnemonStore();`)
 - **Body:** `MnemonStore.recall` resolves scope from `this.memoryConfig`. Production creates `MnemonStore` with no `memoryConfig`. `maybeInjectRecall` never passes the group's resolved `recall_scope` into `store.recall`. So `getRecallScope(undefined)` defaults to `'self'` always; setting `memory.recall_scope: 'all-groups'` in `container.json` has no effect outside tests.
-- **Impact:** R3 (cross-group recall) is dead in production. The eval workflow (E3) tells operators to flip `recall_scope` for axis-labs but the flip won't take effect.
+- **Impact:** R3 (cross-group recall) is dead in production. The eval workflow (E3) tells operators to flip `recall_scope` for example-research but the flip won't take effect.
 - **Recommendation:** Either resolve `recall_scope` inside `MnemonStore.recall` from the `agentGroupId` (lookup container.json), OR pass the cached group `MemoryConfig` / scope through `recall(opts)` from `maybeInjectRecall`. Add a production-path test using container.json config rather than constructor injection.
 - **Classification:** Mechanical fix, ~20 LOC, ~15 min including tests. Two implementation paths (constructor-injection vs per-call opts) — slight design call but well-bounded.
 

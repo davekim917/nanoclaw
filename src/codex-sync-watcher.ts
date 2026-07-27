@@ -9,7 +9,7 @@
  * What changes the daemon catches:
  *   - `~/.claude/CLAUDE.md`                        — top-level behavioral rules
  *   - `~/.claude/` glob `*.md`                     — any `@`-included file (RTK.md today,
- *                                                    anything else Dave adds tomorrow)
+ *                                                    anything else Operator adds tomorrow)
  *   - `~/.claude/agents/*.md`                      — Claude personal-scope subagents
  *   - `~/.codex/config.toml`                       — local marketplace installs/enabled state
  *   - `~/plugins/` recursive `SKILL.md` files      — every plugin-bundled skill
@@ -71,7 +71,7 @@ function isRelevantPath(eventPath: string): boolean {
     return true;
   }
   // ~/.claude/agents/<name>.md — personal-scope subagents (currently empty
-  // for Dave but supported for completeness so future overrides trigger sync).
+  // for Operator but supported for completeness so future overrides trigger sync).
   if (path.dirname(eventPath) === path.join(CLAUDE_DIR, 'agents') && eventPath.endsWith('.md')) {
     return true;
   }

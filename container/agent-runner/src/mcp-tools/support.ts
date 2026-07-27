@@ -133,8 +133,8 @@ export const updateSupportTicket: McpToolDefinition = {
     inputSchema: {
       type: 'object' as const,
       properties: {
-        linearIssue: { type: 'string', description: 'Linear issue identifier you created (e.g. "XZO-123").' },
-        linearTeam: { type: 'string', description: 'Linear team the issue is on ("XZO" or "Apollo"). Optional.' },
+        linearIssue: { type: 'string', description: 'Linear issue identifier you created (e.g. "EXAMPLE-123").' },
+        linearTeam: { type: 'string', description: 'Linear team the issue is on ("EXAMPLE" or "Example Data"). Optional.' },
       },
       required: ['linearIssue'],
     },

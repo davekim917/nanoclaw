@@ -90,10 +90,10 @@ describe('registerSecretsFromEnv', () => {
     const file = writeEnv(
       [
         'ANTHROPIC_API_KEY=sk-ant-1234567890abcdef',
-        'SLACK_BOT_TOKEN_ILLYSIUM=xoxb-realtokenvalue123',
+        'SLACK_BOT_TOKEN_EXAMPLE_LABS=xoxb-realtokenvalue123',
         'GOOGLE_OAUTH_CLIENT_SECRET=oauthsecretxyz1234',
-        'RENDER_PG_URL_ILLYSIUM_MAIN=postgres://userpass@host/db',
-        'RENDER_PG_ILLYSIUM_XZO_TENANTS=postgres://anotheruser@host/db2',
+        'RENDER_PG_URL_EXAMPLE_LABS_MAIN=postgres://userpass@host/db',
+        'RENDER_PG_EXAMPLE_LABS_XZO_TENANTS=postgres://anotheruser@host/db2',
       ].join('\n'),
     );
     const count = registerSecretsFromEnv(file);
@@ -105,21 +105,21 @@ describe('registerSecretsFromEnv', () => {
   });
 
   it('does NOT register config-shaped keys (the v1→v2 regression)', () => {
-    // These are the actual kinds of keys that over-redacted on Dave's install:
+    // These are the actual kinds of keys that over-redacted on Operator's install:
     // short config values whose keys did not match the old NON_SECRET blacklist,
     // so they got scrubbed out of every outbound message.
     const file = writeEnv(
       [
-        'NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_ILLYSIUM=illysium',
-        'NANOCLAW_DEFAULT_SESSION_MODE_SLACK_ILLYSIUM=per-sender',
+        'NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_EXAMPLE_LABS=example-labs',
+        'NANOCLAW_DEFAULT_SESSION_MODE_SLACK_EXAMPLE_LABS=per-sender',
         'ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7',
         'DISCORD_SLASH_CHANNEL_IDS=1234567890,0987654321',
-        'RENDER_WORKSPACE_ID_ILLYSIUM=tea-abcdefghijklmnopqr12',
+        'RENDER_WORKSPACE_ID_EXAMPLE_LABS=tea-abcdefghijklmnopqr12',
       ].join('\n'),
     );
     const count = registerSecretsFromEnv(file);
     expect(count).toBe(0);
-    expect(scrubSecrets('Hey Dave — illysium here.')).toBe('Hey Dave — illysium here.');
+    expect(scrubSecrets('Hey Operator — example-labs here.')).toBe('Hey Operator — example-labs here.');
     expect(scrubSecrets('Running on claude-opus-4-7.')).toBe('Running on claude-opus-4-7.');
     fs.unlinkSync(file);
   });

@@ -23,7 +23,7 @@ describe('QUOTA_RESULT_RE', () => {
   });
 
   it('matches the org/credit monthly-spend cap wording (2026-06-11 incident)', () => {
-    // Exact text captured from illysium + dirt-market outbound DBs,
+    // Exact text captured from example-labs + example-market outbound DBs,
     // 2026-06-11 ~21:49–22:01 UTC.
     expect(
       QUOTA_RESULT_RE.test(
@@ -52,7 +52,7 @@ describe('QUOTA_RESULT_RE', () => {
 // quota exhaustion). Surfaced 2026-06-11 on a fallback token mid-rotation.
 describe('SUBSCRIPTION_BLOCKED_RE', () => {
   it('matches the org access-disabled wording (2026-06-11 incident)', () => {
-    // Exact text captured from the illysium outbound DB, 2026-06-11 22:22 UTC.
+    // Exact text captured from the example-labs outbound DB, 2026-06-11 22:22 UTC.
     expect(
       SUBSCRIPTION_BLOCKED_RE.test(
         'Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access',

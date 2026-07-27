@@ -488,7 +488,7 @@ export const POISONED_CONTINUATION_RE = /invalid `?signature`? in `?thinking`? b
 //   "API Error: Request rejected (429) · …"
 // Without interception the poll-loop dispatches this 88-char string to the
 // user's channel as the agent's answer and ends the turn silently — the user
-// then has to re-prompt (Dave, 2026-06-26: "extremely disrupting" on long
+// then has to re-prompt (Operator, 2026-06-26: "extremely disrupting" on long
 // tasks). Throw with a distinct `transient_overload:` marker so poll-loop's
 // catch retries the SAME prompt+continuation with backoff. Rotation is the
 // WRONG cure here — "not your usage limit" means the credential is fine, the

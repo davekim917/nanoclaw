@@ -52,7 +52,13 @@ function now(): string {
 }
 
 function seed(): void {
-  createAgentGroup({ id: 'ag-1', name: 'Illie', folder: 'illie', agent_provider: null, created_at: now() });
+  createAgentGroup({
+    id: 'ag-1',
+    name: 'Support Agent',
+    folder: 'support-agent',
+    agent_provider: null,
+    created_at: now(),
+  });
   createMessagingGroup({
     id: 'mg-1',
     channel_type: 'slack',
@@ -103,9 +109,12 @@ beforeEach(() => {
   createThread.mockReset().mockResolvedValue({ threadId: 'thread-ts-1' });
   adapterDeliver.mockReset().mockResolvedValue(undefined);
   vi.mocked(wakeContainer).mockClear();
+  process.env.NANOCLAW_SUPPORT_TICKET_POLICY_SUPPORT_AGENT =
+    'Use team EXAMPLE for product incidents and team HELP for all other requests, then call update_support_ticket.';
 });
 
 afterEach(() => {
+  delete process.env.NANOCLAW_SUPPORT_TICKET_POLICY_SUPPORT_AGENT;
   closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
@@ -135,6 +144,8 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     expect(seeded).toHaveLength(1);
     expect(seeded[0].thread_id).toBe('slack:C1:thread-ts-1');
     expect(seeded[0].content).toContain('no Linear ticket yet');
+    expect(seeded[0].content).toContain('operator-configured policy');
+    expect(seeded[0].content).toContain('team EXAMPLE');
     expect(seeded[0].content).toContain('update_support_ticket');
     expect(seeded[0].content).toContain('Subject: Depletions look wrong');
     expect(seeded[0].content).toContain('From: Jane <jane@acme.com>');
@@ -181,17 +192,20 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
 
     await handleDispatchSupportIssue(
-      dispatchContent('gthread-B', 'first email', { issue: 'XZO-123', team: 'XZO' }),
+      dispatchContent('gthread-B', 'first email', { issue: 'EXAMPLE-123', team: 'EXAMPLE' }),
       poller,
       {} as never,
     );
 
-    expect(postParent).toHaveBeenCalledWith('slack:C1', '🎫 XZO XZO-123: Depletions look wrong — Jane <jane@acme.com>');
+    expect(postParent).toHaveBeenCalledWith(
+      'slack:C1',
+      '🎫 EXAMPLE EXAMPLE-123: Depletions look wrong — Jane <jane@acme.com>',
+    );
     const row = getSupportThread('gthread-B');
-    expect(row!.linear_issue).toBe('XZO-123');
+    expect(row!.linear_issue).toBe('EXAMPLE-123');
     const seeded = inboundOf(row!.session_id!);
     expect(seeded[0].content).toContain('already exists');
-    expect(seeded[0].content).toContain('XZO-123');
+    expect(seeded[0].content).toContain('EXAMPLE-123');
   });
 });
 
@@ -225,7 +239,7 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
     getDb()
       .prepare(
         `INSERT INTO support_threads (gmail_thread_id, agent_group_id, messaging_group_id, linear_team, linear_issue, status, created_at, last_activity_at)
-         VALUES ('gthread-L', 'ag-1', 'mg-1', 'XZO', 'XZO-86', 'open', ?, ?)`,
+         VALUES ('gthread-L', 'ag-1', 'mg-1', 'EXAMPLE', 'EXAMPLE-86', 'open', ?, ?)`,
       )
       .run(now(), now());
 
@@ -234,15 +248,18 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
     // Opens a thread (no live session existed)…
     expect(postParent).toHaveBeenCalledTimes(1);
     // …announcement carries the known ticket…
-    expect(postParent).toHaveBeenCalledWith('slack:C1', '🎫 XZO XZO-86: Depletions look wrong — Jane <jane@acme.com>');
+    expect(postParent).toHaveBeenCalledWith(
+      'slack:C1',
+      '🎫 EXAMPLE EXAMPLE-86: Depletions look wrong — Jane <jane@acme.com>',
+    );
     const row = getSupportThread('gthread-L')!;
     // …and the upsert records the new session/thread (regression: INSERT OR
     // IGNORE silently dropped this, stranding every future follow-up).
     expect(row.session_id).toBeTruthy();
     expect(row.slack_thread_id).toBe('slack:C1:thread-ts-1');
-    expect(row.linear_issue).toBe('XZO-86'); // preserved, not clobbered
+    expect(row.linear_issue).toBe('EXAMPLE-86'); // preserved, not clobbered
     // Seed says comment-don't-duplicate.
-    expect(inboundOf(row.session_id!)[0].content).toContain('XZO-86');
+    expect(inboundOf(row.session_id!)[0].content).toContain('EXAMPLE-86');
   });
 });
 
@@ -255,14 +272,14 @@ describe('handleUpdateSupportTicket', () => {
     const issueSession = getSession(row.session_id!)!;
 
     await handleUpdateSupportTicket(
-      { action: 'update_support_ticket', linearIssue: 'XZO-200', linearTeam: 'XZO' },
+      { action: 'update_support_ticket', linearIssue: 'EXAMPLE-200', linearTeam: 'EXAMPLE' },
       issueSession,
       {} as never,
     );
 
     const updated = getSupportThread('gthread-A')!;
-    expect(updated.linear_issue).toBe('XZO-200');
-    expect(updated.linear_team).toBe('XZO');
+    expect(updated.linear_issue).toBe('EXAMPLE-200');
+    expect(updated.linear_team).toBe('EXAMPLE');
 
     // Announcement re-edited with full context: ticket + subject + sender.
     expect(adapterDeliver).toHaveBeenCalledTimes(1);
@@ -272,7 +289,7 @@ describe('handleUpdateSupportTicket', () => {
     expect(msg.content).toMatchObject({
       operation: 'edit',
       messageId: 'parent-ts-1',
-      text: '🎫 XZO XZO-200: Depletions look wrong — Jane <jane@acme.com>',
+      text: '🎫 EXAMPLE EXAMPLE-200: Depletions look wrong — Jane <jane@acme.com>',
     });
   });
 
@@ -280,7 +297,11 @@ describe('handleUpdateSupportTicket', () => {
     seed();
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
 
-    await handleUpdateSupportTicket({ action: 'update_support_ticket', linearIssue: 'XZO-999' }, poller, {} as never);
+    await handleUpdateSupportTicket(
+      { action: 'update_support_ticket', linearIssue: 'EXAMPLE-999' },
+      poller,
+      {} as never,
+    );
 
     expect(adapterDeliver).not.toHaveBeenCalled();
   });

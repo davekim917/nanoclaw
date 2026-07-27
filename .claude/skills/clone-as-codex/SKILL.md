@@ -72,7 +72,7 @@ pnpm exec tsx scripts/q.ts data/v2.db "select id, folder, name from agent_groups
 Capture the `id` value — it's an `ag-...` string. Every later SQL statement that touches `messaging_group_agents.agent_group_id` uses this id, not the folder name.
 
 ```bash
-SOURCE_FOLDER=<source-folder>             # e.g. illysium
+SOURCE_FOLDER=<source-folder>             # e.g. example-labs
 SOURCE_ID=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
 test -n "${SOURCE_ID}" || { echo "ERROR: source group '${SOURCE_FOLDER}' not found"; exit 1; }
 # Workgroup the sibling must JOIN — the SOURCE's workgroup, not the sibling's
@@ -90,7 +90,7 @@ echo "Source workgroup: ${SOURCE_WORKGROUP}"
 
 #### Slack path
 
-Follow `.claude/skills/add-slack/SKILL.md` to install a new app in the same workspace where the source agent's bot lives. **Name the bot user something distinct but discoverable** — using the source name with a suffix (e.g. `illie-codex` when source is `illie`) makes Slack's `@`-autocomplete group them together for the user.
+Follow `.claude/skills/add-slack/SKILL.md` to install a new app in the same workspace where the source agent's bot lives. **Name the bot user something distinct but discoverable** — using the source name with a suffix (e.g. `helper-codex` when source is `helper`) makes Slack's `@`-autocomplete group them together for the user.
 
 Required bot scopes (per add-slack skill step 6): `app_mentions:read`, `channels:history`, `channels:read`, `chat:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `users:read`.
 
@@ -100,11 +100,11 @@ Set the Request URL to the same `https://<your-domain>/webhook/slack` as the exi
 
 After installing the new app to the workspace, capture the **bot token** (`xoxb-...`) and **signing secret** from the Slack app settings.
 
-> **Note on naming**: the Slack-side bot display name (`illie-codex`), the env-var suffix (`ILLYSIUM_CODEX`), and the resulting channelType (`slack-illysium-codex`) are independent but conventionally aligned. The adapter accepts uppercase + underscores in the suffix and maps `_` → `-` when deriving the channelType, so `SLACK_BOT_TOKEN_ILLYSIUM_CODEX` becomes `slack-illysium-codex` — symmetric with the existing `SLACK_BOT_TOKEN_ILLYSIUM` → `slack-illysium`.
+> **Note on naming**: the Slack-side bot display name (`helper-codex`), the env-var suffix (`EXAMPLE_LABS_CODEX`), and the resulting channelType (`slack-example-labs-codex`) are independent but conventionally aligned. The adapter accepts uppercase + underscores in the suffix and maps `_` → `-` when deriving the channelType, so `SLACK_BOT_TOKEN_EXAMPLE_LABS_CODEX` becomes `slack-example-labs-codex` — symmetric with the existing `SLACK_BOT_TOKEN_EXAMPLE_LABS` → `slack-example-labs`.
 
 #### Discord path
 
-Create a new Discord application at [discord.com/developers/applications](https://discord.com/developers/applications) — separate from the primary bot's app. **Name the bot user something distinct but discoverable** — e.g. `Axie-Codex` when the primary is `Axie`. Discord shows the bot user name with every message, so this is what the user sees in chat.
+Create a new Discord application at [discord.com/developers/applications](https://discord.com/developers/applications) — separate from the primary bot's app. **Name the bot user something distinct but discoverable** — e.g. `Example Agent-Codex` when the primary is `Example Agent`. Discord shows the bot user name with every message, so this is what the user sees in chat.
 
 1. From the **General Information** tab, copy the **Application ID** and **Public Key**.
 2. Go to the **Bot** tab and click **Add Bot** if needed; copy the **Bot Token** (click **Reset Token** if needed — visible only once).
@@ -120,10 +120,10 @@ The Discord adapter in trunk supports multiple bots in one host process via the 
 
 ### 3. Add the sibling's env vars
 
-Pick an `ENV_SUFFIX` that mirrors the source's suffix with `_CODEX` appended (e.g. existing `ILLYSIUM` → new `ILLYSIUM_CODEX`). Uppercase alphanumeric + underscores. The host's adapter discovers it on next restart.
+Pick an `ENV_SUFFIX` that mirrors the source's suffix with `_CODEX` appended (e.g. existing `EXAMPLE_LABS` → new `EXAMPLE_LABS_CODEX`). Uppercase alphanumeric + underscores. The host's adapter discovers it on next restart.
 
 ```bash
-ENV_SUFFIX=ILLYSIUM_CODEX                 # uppercase, underscores OK
+ENV_SUFFIX=EXAMPLE_LABS_CODEX                 # uppercase, underscores OK
 ```
 
 #### Slack path
@@ -166,7 +166,7 @@ grep "_${ENV_SUFFIX}=" .env
 
 ```bash
 SIBLING_FOLDER=${SOURCE_FOLDER}-codex
-SIBLING_ID=${SIBLING_FOLDER}                # use folder name as ag-id, matching host-default groups (main, axie-dev)
+SIBLING_ID=${SIBLING_FOLDER}                # use folder name as ag-id, matching host-default groups (main, example-dev)
 
 # Has the source's workgroup been consolidated by the shared-FS migration
 # (reconcileWorkgroupSharedDirs)? The `.migrated` marker is the same signal
@@ -265,8 +265,8 @@ diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
 **Why `credentialFolder`**: container-runner's per-group credential lookups
 (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Claude OAuth,
 Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a
-sibling folder like `madison-reed-codex` would look for
-`LOOKER_BASE_URL_MADISON_REED_CODEX`, which doesn't exist — leaving the
+sibling folder like `example-retail-codex` would look for
+`LOOKER_BASE_URL_EXAMPLE_RETAIL_CODEX`, which doesn't exist — leaving the
 codex sibling stripped of every per-group credential. `credentialFolder`
 redirects ONLY the credential lookups to the source folder; identity-bound
 paths (container name and group dir mount) stay on
@@ -303,7 +303,7 @@ convention (`<source>-codex`), NOT the Slack/Discord bot display name.
 The bot display name is platform-side (configured at api.slack.com/apps
 or the Discord dev portal) and is purely how chat users see the avatar;
 mixing the two leaves the dashboard with inconsistent groupings (e.g.
-`illie-codex` next to `axie-dev-codex` instead of `illysium-codex`). The
+`helper-codex` next to `example-dev-codex` instead of `example-labs-codex`). The
 host-side container-config sync at `container-runner.ts:1519-1525` reads
 `agent_groups.name` into `containerConfig.assistantName`, so this is also
 the string the agent sees as its own self-reference in the system prompt.
@@ -334,15 +334,15 @@ in the right shape. Use it for both platforms — don't hand-insert.
 
 #### Slack path
 
-The sibling needs to be added to the relevant Slack channels FROM SLACK first — invite the new bot user (e.g. `@illie-codex`) to `#agents-xzo` and any other channels you want it to operate in.
+The sibling needs to be added to the relevant Slack channels FROM SLACK first — invite the new bot user (e.g. `@helper-codex`) to `#agents-example` and any other channels you want it to operate in.
 
 The source bot keeps its own `messaging_group_agents` row in the existing `slack-<source>` channelType — untouched by this skill. Both bots share the channel physically; their NanoClaw routing is separate.
 
 Wire each desired physical Slack channel through the host `register` step, not by raw-inserting `messaging_group_agents`. The register path calls `createMessagingGroupAgent()`, which also creates the companion `agent_destinations` row the container needs for `<message to="...">` routing and origin-fallback.
 
 ```bash
-SLACK_CHANNEL_ID=C0AJA89MN2E                  # Slack channel id for #agents-xzo
-SLACK_CHANNEL_NAME=agents-xzo
+SLACK_CHANNEL_ID=CTEST00004                  # Slack channel id for #agents-example
+SLACK_CHANNEL_NAME=agents-example
 
 pnpm exec tsx setup/index.ts --step register -- \
   --platform-id "slack:${SLACK_CHANNEL_ID}" \
@@ -393,9 +393,9 @@ The sibling bot must already be in the guild (you invited it in Step 2). Discord
 Wire each Discord channel where you want the codex twin to fire. Discord's `platform_id` format is `discord:{guildId}:{channelId}` — both ids are required. Enable Developer Mode in Discord client to copy them via right-click.
 
 ```bash
-DISCORD_GUILD_ID=1479489865702703155          # right-click server → Copy Server ID
-DISCORD_CHANNEL_ID=1479516831168593974        # right-click channel → Copy Channel ID
-DISCORD_CHANNEL_NAME=illysium                 # for the agent_destinations.local_name
+DISCORD_GUILD_ID=123456789000000002          # right-click server → Copy Server ID
+DISCORD_CHANNEL_ID=123456789000000004        # right-click channel → Copy Channel ID
+DISCORD_CHANNEL_NAME=example-labs                 # for the agent_destinations.local_name
 
 pnpm exec tsx setup/index.ts --step register -- \
   --platform-id "discord:${DISCORD_GUILD_ID}:${DISCORD_CHANNEL_ID}" \
@@ -408,7 +408,7 @@ pnpm exec tsx setup/index.ts --step register -- \
 
 The `register` step defaults `engage_mode='mention'` for group channels — sibling-safe (only fires on explicit `@`-mention, no sticky lurking). This is what you want for siblings; sticky combined with two bots in the same thread risks runaway loops where each bot wakes on the other's reply via session existence.
 
-> **Important — owner role under the new channelType namespace.** When the host receives an inbound from the sibling bot, the sender's user-id is namespaced by the new channel_type (e.g. `discord-axie-codex:608746260706361344` instead of `discord:608746260706361344`). Existing `user_roles` rows are scoped to the OLD namespace, so the new bot sees the sender as an unknown user. For channels with `unknown_sender_policy='strict'` (channel-root DMs, denied channels), this drops the message silently with no agent reply.
+> **Important — owner role under the new channelType namespace.** When the host receives an inbound from the sibling bot, the sender's user-id is namespaced by the new channel_type (e.g. `discord-example-agent-codex:123456789000000019` instead of `discord:123456789000000019`). Existing `user_roles` rows are scoped to the OLD namespace, so the new bot sees the sender as an unknown user. For channels with `unknown_sender_policy='strict'` (channel-root DMs, denied channels), this drops the message silently with no agent reply.
 >
 > Mirror your existing global owner roles under the new namespace as a one-shot SQL:
 
@@ -511,7 +511,7 @@ an isolated workgroup id is a failed clone even when chat delivery works.
 
 In a Slack channel where both bots have been invited, post a message:
 
-- `@<source> hello` → source agent fires (the existing illie bot).
+- `@<source> hello` → source agent fires (the existing helper bot).
 - `@<sibling-slack-name> hello` → sibling agent fires (the new codex bot).
 - `@<source> can you @<sibling-slack-name> help with this?` → both fire (each on its own real mention).
 
@@ -533,7 +533,7 @@ If the sibling responds but the back-and-forth handoff doesn't continue, check:
 - The bot was given `Message Content Intent` in the Discord developer portal.
 - `groups/${SIBLING_FOLDER}/AGENTS.md` was composed cleanly (no `agents-md-flatten: failed` markers). If it was, the sibling-handoff guidance may be truncated; redeploy and respawn the container.
 
-> **Mention syntax**: agents write bare `@<bot-username>` in their reply. The Discord adapter's outbound rewriter (`resolveDiscordMentions` in `src/channels/discord.ts`) converts that to a real `<@SNOWFLAKE_ID>` mention before posting. Agents do not need to know the snowflake. The rewriter also tolerates the bracketed-by-name form `<@<bot-username>>` as a safety net, so both `@Axie-codex` and `<@Axie-codex>` resolve correctly.
+> **Mention syntax**: agents write bare `@<bot-username>` in their reply. The Discord adapter's outbound rewriter (`resolveDiscordMentions` in `src/channels/discord.ts`) converts that to a real `<@SNOWFLAKE_ID>` mention before posting. Agents do not need to know the snowflake. The rewriter also tolerates the bracketed-by-name form `<@<bot-username>>` as a safety net, so both `@Example Agent-codex` and `<@Example Agent-codex>` resolve correctly.
 
 ### 11. Parity audit
 
@@ -636,8 +636,8 @@ Optionally, uninstall the sibling's bot app from the platform — `api.slack.com
 - `composeGroupClaudeMd` (host-side, runs every container spawn) regenerates `groups/${SIBLING_FOLDER}/AGENTS.md` from the same CLAUDE.md the source group uses, with `@-includes` resolved inline for Codex. No manual AGENTS.md authoring.
 - The codex container reads MCP server config from `~/.codex/config.toml` (regenerated each session by `writeCodexMcpConfigToml`) and hook config from `~/.codex/hooks.json` (regenerated each session by `writeCodexHooksJson`).
 - Worktrees are thread-scoped when `NANOCLAW_THREAD_WORKTREES=1` is in `.env`. The mount key is platform-derived (`<base>/<thread-id-or-dm-platform>/worktrees/`), so both bots' MGs in the same platform thread resolve to the same path. Uncommitted edits from one sibling are visible to the other via `git status`.
-- Concurrent git operations across siblings: the shared worktree has standard git internal locks (`.git/index.lock`). Turn-taking via the `@`-mention pattern mitigates by design — only one sibling is active per turn after a hand-off. If both fire on the same user message (`@illie @illie-codex collab`), git ops can race; failures are loud (`fatal: Unable to create '.git/index.lock'`) and the agent retries.
-- **Joint mentions and race conditions**: when a user `@`-mentions both siblings in one message, both wake in parallel. Whichever finishes generating first posts first; the second-to-finish sees the first's reply via session inbound and (per CLAUDE.md guidance) accommodates by picking a different slice. This accommodation depends on the second container being slower than the first's complete reply — typically true since Codex's reasoning phase adds latency vs Claude's faster time-to-first-token. If both happen to finish near-simultaneously, you can see both claim the same slice. The mitigation is in the prompt — explicit framing like "illie you start" forces ordering — not in the router.
+- Concurrent git operations across siblings: the shared worktree has standard git internal locks (`.git/index.lock`). Turn-taking via the `@`-mention pattern mitigates by design — only one sibling is active per turn after a hand-off. If both fire on the same user message (`@helper @helper-codex collab`), git ops can race; failures are loud (`fatal: Unable to create '.git/index.lock'`) and the agent retries.
+- **Joint mentions and race conditions**: when a user `@`-mentions both siblings in one message, both wake in parallel. Whichever finishes generating first posts first; the second-to-finish sees the first's reply via session inbound and (per CLAUDE.md guidance) accommodates by picking a different slice. This accommodation depends on the second container being slower than the first's complete reply — typically true since Codex's reasoning phase adds latency vs Claude's faster time-to-first-token. If both happen to finish near-simultaneously, you can see both claim the same slice. The mitigation is in the prompt — explicit framing like "helper you start" forces ordering — not in the router.
 
 ### Known limitation: Codex Bash secret sanitization is a no-op
 
@@ -693,8 +693,8 @@ Decision criteria for picking the right path when the time comes: cost trajector
 Today `/clone-as-codex` hardcodes `provider: "codex"`. A generalized version would take the provider as an argument:
 
 ```
-/clone-agent-as-provider illie opencode    # creates illie-opencode
-/clone-agent-as-provider illie claude      # for codex-canonical → claude sibling
+/clone-agent-as-provider helper opencode    # creates helper-opencode
+/clone-agent-as-provider helper claude      # for codex-canonical → claude sibling
 ```
 
 Implementation when it's worth doing:

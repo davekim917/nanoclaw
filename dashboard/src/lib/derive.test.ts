@@ -4,7 +4,7 @@ import type { TaskSummary } from './api.js';
 
 describe('extractGoal', () => {
   it('pulls the line under "## Goal"', () => {
-    const md = '## Goal\nResolve **XZO-54** — redeploy UDTF.\nLinear: https://x\n\n## Inputs\n- Repo: foo';
+    const md = '## Goal\nResolve **EXAMPLE-54** — redeploy UDTF.\nLinear: https://x\n\n## Inputs\n- Repo: foo';
     expect(extractGoal(md)).toBe('redeploy UDTF.');
   });
 
@@ -19,8 +19,8 @@ describe('extractGoal', () => {
 });
 
 describe('extractLinearId', () => {
-  it('matches XZO-54', () => {
-    expect(extractLinearId('## Goal\nResolve **XZO-54** — do it.')).toBe('XZO-54');
+  it('matches EXAMPLE-54', () => {
+    expect(extractLinearId('## Goal\nResolve **EXAMPLE-54** — do it.')).toBe('EXAMPLE-54');
   });
   it('matches lowercase-prefixed (no)', () => {
     expect(extractLinearId('## Goal\nfoo-12 bar')).toBeNull();

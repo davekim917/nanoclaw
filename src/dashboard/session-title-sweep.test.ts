@@ -114,7 +114,7 @@ afterEach(() => {
 
 describe('postProcessTitle', () => {
   it('strips quotes, preamble, trailing periods, and caps length', () => {
-    expect(postProcessTitle('"XZO-71 rollout fix"')).toBe('XZO-71 rollout fix');
+    expect(postProcessTitle('"EXAMPLE-71 rollout fix"')).toBe('EXAMPLE-71 rollout fix');
     expect(postProcessTitle('Title: Slack auto-wire debug')).toBe('Slack auto-wire debug');
     expect(postProcessTitle('Done.')).toBe('Done');
     expect(postProcessTitle('a'.repeat(120)).length).toBe(60);
@@ -126,9 +126,9 @@ describe('runSessionTitleSweep', () => {
   it('generates a title for a session that has none', async () => {
     seedSession('sess-fresh', 'ag-1');
     writeInboundMessages('ag-1', 'sess-fresh', [
-      { kind: 'chat', content: JSON.stringify({ text: 'fix the rollout for XZO-71' }) },
+      { kind: 'chat', content: JSON.stringify({ text: 'fix the rollout for EXAMPLE-71' }) },
     ]);
-    setTitleBackendForTest(async () => 'XZO-71 rollout fix');
+    setTitleBackendForTest(async () => 'EXAMPLE-71 rollout fix');
 
     const result = await runSessionTitleSweep();
     expect(result.generated).toBe(1);
@@ -136,7 +136,7 @@ describe('runSessionTitleSweep', () => {
     const row = getDb()
       .prepare('SELECT title, title_basis_seq, title_generated_at FROM sessions WHERE id = ?')
       .get('sess-fresh') as { title: string; title_basis_seq: number; title_generated_at: string };
-    expect(row.title).toBe('XZO-71 rollout fix');
+    expect(row.title).toBe('EXAMPLE-71 rollout fix');
     expect(row.title_basis_seq).toBeGreaterThan(0);
     expect(row.title_generated_at).toBeTruthy();
   });
@@ -377,17 +377,17 @@ describe('runSessionTitleSweep', () => {
     }
     seedSession('sess-real', 'ag-1');
     writeInboundMessages('ag-1', 'sess-real', [
-      { kind: 'chat', content: JSON.stringify({ text: 'deploy the XZO-99 hotfix' }) },
+      { kind: 'chat', content: JSON.stringify({ text: 'deploy the EXAMPLE-99 hotfix' }) },
     ]);
     getDb().prepare('UPDATE sessions SET last_active = ? WHERE id = ?').run(now(), 'sess-real');
 
-    setTitleBackendForTest(async () => 'XZO-99 hotfix deploy');
+    setTitleBackendForTest(async () => 'EXAMPLE-99 hotfix deploy');
     const result = await runSessionTitleSweep();
 
     const real = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-real') as {
       title: string | null;
     };
-    expect(real.title).toBe('XZO-99 hotfix deploy'); // not starved
+    expect(real.title).toBe('EXAMPLE-99 hotfix deploy'); // not starved
     expect(result.generated).toBeGreaterThanOrEqual(1);
   });
 });

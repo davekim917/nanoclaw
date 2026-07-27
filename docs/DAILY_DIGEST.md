@@ -48,7 +48,7 @@ tiebreak). To target a different wired channel, set
 
 ```json
 "dailySummary": {
-  "messagingGroupId": "mg-1776735605486-p87hha2"
+  "messagingGroupId": "mg-1700000000000-example11"
 }
 ```
 
@@ -59,8 +59,8 @@ SELECT id, channel_type, platform_id, name FROM messaging_groups
 WHERE name LIKE '%channel-name%';
 ```
 
-Example: illysium's `container.json` routes the digest to Slack
-`#agents-xzo` even though Discord is the primary wiring.
+Example: example-labs's `container.json` routes the digest to Slack
+`#agents-example` even though Discord is the primary wiring.
 
 **State:** `data/daily-summary-state.json` tracks the
 `lastFiredDateKey` (YYYY-MM-DD in TZ) so a host restart on the same day

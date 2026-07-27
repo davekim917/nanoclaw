@@ -388,7 +388,7 @@ describe('sessionsHandler — D4', () => {
   it('includes title, last_outbound_at, last_outbound_kind in response', async () => {
     insertSession('sess-t', 'ag-1');
     setSessionFields('sess-t', {
-      title: 'XZO-71 — rollout fix',
+      title: 'EXAMPLE-71 — rollout fix',
       last_outbound_at: '2026-05-13T12:00:00Z',
       last_outbound_kind: 'chat-sdk:chat_message',
     });
@@ -403,7 +403,7 @@ describe('sessionsHandler — D4', () => {
       }>;
     };
     const row = body.sessions[0]!;
-    expect(row.title).toBe('XZO-71 — rollout fix');
+    expect(row.title).toBe('EXAMPLE-71 — rollout fix');
     expect(row.last_outbound_at).toBe('2026-05-13T12:00:00Z');
     expect(row.last_outbound_kind).toBe('chat-sdk:chat_message');
   });

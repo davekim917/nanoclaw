@@ -990,7 +990,7 @@ plan_revisions:
       - "Resolve via id → folder → name (chosen — agents typically pass folder name, not opaque ag_* id)"
       - "Document id-only requirement in MCP tool schema (rejected — would break orchestrator UX in practice)"
     grounding:
-      - "Codex Validator E finding 4 (MEDIUM, conf 0.86): existing code generates opaque ag_* IDs while storing folder separately; orchestrator likely passes 'illysium' which gets rejected"
+      - "Codex Validator E finding 4 (MEDIUM, conf 0.86): existing code generates opaque ag_* IDs while storing folder separately; orchestrator likely passes 'example-labs' which gets rejected"
     scope_check:
       adds_user_facing_capability: true   # broadens what target_group accepts; observable to orchestrator agents
       changes_external_behavior: true
@@ -1086,7 +1086,7 @@ spawn_rework:
       - "Add wait_for_sibling(task_id) MCP tool"
       - "Add read_sibling_progress(task_id) MCP tool"
     grounding:
-      - "User: 'each instance of illie would need to talk to each other' — but acknowledged shared workspace satisfies the dependency case for now"
+      - "User: 'each instance of helper would need to talk to each other' — but acknowledged shared workspace satisfies the dependency case for now"
     scope_check:
       adds_user_facing_capability: false  # explicit defer
       changes_external_behavior: false

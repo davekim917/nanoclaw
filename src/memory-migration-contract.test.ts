@@ -41,7 +41,6 @@ const preTurnContextSource = fs.readFileSync(
 );
 const migrationSource = fs.readFileSync(path.join(root, 'scripts', 'migrate-workgroup-memory.ts'), 'utf8');
 const retiredMemorySpecFamilies = [
-  path.join(root, '.context', 'specs', 'mnemon-integration'),
   path.join(root, 'docs', 'specs', 'mnemon-rearchitecture'),
   path.join(root, 'docs', 'specs', 'instrumented-memory-recall'),
   path.join(root, 'docs', 'specs', 'workgroup-scoped-data-layer'),
@@ -51,7 +50,6 @@ const retiredMemoryRootDocs = [
   path.join(root, 'docs', 'specs', 'workgroup-shared-fs.md'),
 ];
 const specificationStatusPolicy = fs.readFileSync(path.join(root, 'docs', 'specs', 'README.md'), 'utf8');
-const legacySpecificationStatusPolicy = fs.readFileSync(path.join(root, '.context', 'specs', 'README.md'), 'utf8');
 
 function position(haystack: string, needle: string): number {
   const found = haystack.indexOf(needle);
@@ -159,7 +157,8 @@ describe('retired memory surfaces', () => {
     expect(specificationStatusPolicy).toContain('.team-auto-active');
     expect(specificationStatusPolicy).toMatch(/active only while/i);
     expect(specificationStatusPolicy).toMatch(/sentinel is removed[\s\S]{0,180}historical evidence/i);
-    expect(legacySpecificationStatusPolicy).toMatch(/Everything under `\.context\/specs\/` is archived/i);
+    expect(fs.existsSync(path.join(root, '.context/specs/README.md'))).toBe(false);
+    expect(fs.existsSync(path.join(root, '.context/specs/mnemon-integration/plan.md'))).toBe(false);
   });
 
   it('marks every retired memory spec artifact as archived and superseded', () => {

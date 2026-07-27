@@ -51,7 +51,7 @@ function add(
     threadId,
     role: 'user',
     senderId: 'discord:u',
-    senderName: 'Dave',
+    senderName: 'Operator',
     text,
     sentAt: `2026-07-25T00:00:0${id.length}.000Z`,
   });
@@ -123,7 +123,7 @@ describe('archive retrieval helpers', () => {
       threadId: 'slack:C123ABC:1770000000.123456',
       role: 'user',
       senderId: 'slack:U1',
-      senderName: 'Dave',
+      senderName: 'Operator',
       text: 'Slack exact evidence',
       sentAt: '2026-07-25T00:00:00.000Z',
     });
@@ -137,7 +137,7 @@ describe('archive retrieval helpers', () => {
       threadId: 'discord:111111111111111111:222222222222222222:444444444444444444',
       role: 'user',
       senderId: 'discord:U1',
-      senderName: 'Dave',
+      senderName: 'Operator',
       text: 'Discord exact evidence',
       sentAt: '2026-07-25T00:00:01.000Z',
     });
@@ -197,7 +197,7 @@ describe('archive retrieval helpers', () => {
       threadId: null,
       role: 'user',
       senderId: 'discord:U1',
-      senderName: 'Dave',
+      senderName: 'Operator',
       text: 'Unrelated channel-root evidence',
       sentAt: '2026-07-25T00:00:03.000Z',
     });
@@ -221,7 +221,7 @@ describe('memory curation episode queue', () => {
       threadId: 'discord:g:c:t',
       role,
       senderId: role === 'user' ? 'discord:u' : 'ag-a',
-      senderName: role === 'user' ? 'Dave' : 'assistant',
+      senderName: role === 'user' ? 'Operator' : 'assistant',
       text: `${role} durable text ${id}`,
       sentAt,
     } as const;
@@ -303,7 +303,7 @@ describe('memory curation episode queue', () => {
           threadId: 'thread-a',
           role: 'user',
           senderId: 'discord:u',
-          senderName: 'Dave',
+          senderName: 'Operator',
           text: 'This input must survive both OAuth keys being unavailable.',
           sentAt: new Date(start).toISOString()
         }, 'wg-a', { nowMs: start, debounceMs: 0 });

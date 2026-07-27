@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "corpusSha256": "9443641dc1ba547e496d9dac6c27f287f2918ca51a468660d8b4676618ac950b",
+  "corpusSha256": "9cdb8a639054776e9a6019ba1d38f8ce3d9bcaa9d215f4e68ce170d467fc5134",
   "scoring": {
     "falsePositive": 5,
     "falseNegative": 1,
@@ -70,10 +70,10 @@
     {
       "id": "retired-workgroups",
       "corpus": "baseline",
-      "transcript": "User: Sunday, video-agent, Xerus, and ag-1 are no longer valid workgroups. Remove their Claude, Codex, and OpenCode siblings too.",
+      "transcript": "User: Archive One, archive-media, Archive Two, and ag-1 are no longer valid workgroups. Remove their Claude, Codex, and OpenCode siblings too.",
       "expectedAction": "capture",
       "acceptedReasons": ["correction", "explicit_decision"],
-      "mustInclude": ["Sunday", "video-agent", "Xerus", "ag-1", "Claude", "Codex", "OpenCode"]
+      "mustInclude": ["Archive One", "archive-media", "Archive Two", "ag-1", "Claude", "Codex", "OpenCode"]
     },
     {
       "id": "full-merge-audit",
@@ -118,10 +118,10 @@
     {
       "id": "latest-correction-wins",
       "corpus": "hard",
-      "transcript": "User: Our analytics warehouse is BigQuery. User later: Correction, that old note is wrong; Madison Reed analytics is in Snowflake now.",
+      "transcript": "User: Our analytics warehouse is BigQuery. User later: Correction, that old note is wrong; Example Retail analytics is in Snowflake now.",
       "expectedAction": "capture",
       "acceptedReasons": ["correction"],
-      "mustInclude": ["Madison Reed", "Snowflake"],
+      "mustInclude": ["Example Retail", "Snowflake"],
       "mustExclude": ["BigQuery"]
     },
     {
@@ -167,7 +167,7 @@
     }
   ],
   "recordedSelection": {
-    "corpusSha256": "9443641dc1ba547e496d9dac6c27f287f2918ca51a468660d8b4676618ac950b",
+    "corpusSha256": "9cdb8a639054776e9a6019ba1d38f8ce3d9bcaa9d215f4e68ce170d467fc5134",
     "selectedCandidateId": "sonnet-5-medium",
     "trialsPerCorpus": 3,
     "recordedAt": "2026-07-26T18:20:00.000Z",

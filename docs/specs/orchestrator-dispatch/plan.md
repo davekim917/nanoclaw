@@ -1327,10 +1327,10 @@ Group A: Schema + DB layer
 - **Operation:** CREATE
 - **Test file:** is itself.
 - **Implementation approach:** vitest test that exercises the full Phase 1 happy path:
-  1. Setup: temp DB; migrate to 026; insert agent_groups for `main` (orchestrator) and `xzo` (target); grant orchestrator capability; wire main's mg to xzo via messaging_group_agents; mock channel adapter with `createThread`; mock containers (no real Docker — `wakeContainer` and `killContainer` stubbed).
-  2. Action: invoke `applyDispatchTask` with `{target_group: 'xzo', content: 'Do thing', idempotency_key: 'k1'}` from `main`'s session.
+  1. Setup: temp DB; migrate to 026; insert agent_groups for `main` (orchestrator) and `example` (target); grant orchestrator capability; wire main's mg to example via messaging_group_agents; mock channel adapter with `createThread`; mock containers (no real Docker — `wakeContainer` and `killContainer` stubbed).
+  2. Action: invoke `applyDispatchTask` with `{target_group: 'example', content: 'Do thing', idempotency_key: 'k1'}` from `main`'s session.
   3. Drain `setImmediate` queue (await `setTimeout(0)` or similar).
-  4. Assert: tasks row has status='running', child_session_id non-null, parent_platform_message_id non-null, child_platform_thread_id non-null; main's session has admit notification; xzo child session created with first inbound containing `_dispatch.task_id`.
+  4. Assert: tasks row has status='running', child_session_id non-null, parent_platform_message_id non-null, child_platform_thread_id non-null; main's session has admit notification; example child session created with first inbound containing `_dispatch.task_id`.
   5. Action: simulate child calling `applyDispatchComplete` with `{task_id, summary: 'Done'}`; child's session id is `tasks.child_session_id`.
   6. Assert: tasks.status='completed'; main's session has terminal task-update notification.
 - **Interface:** vitest test only.

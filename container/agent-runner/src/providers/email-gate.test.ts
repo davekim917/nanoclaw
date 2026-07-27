@@ -3,7 +3,7 @@ import { GWS_EMAIL_SEND_RE, envelopeFromJsonRaw } from './claude.js';
 
 describe('GWS_EMAIL_SEND_RE', () => {
   test('matches helper verbs', () => {
-    expect(GWS_EMAIL_SEND_RE.test('gws gmail +send --to a@b.com')).toBe(true);
+    expect(GWS_EMAIL_SEND_RE.test('gws gmail +send --to person8@fixture1.example.com')).toBe(true);
     expect(GWS_EMAIL_SEND_RE.test('gws gmail +reply --message-id x')).toBe(true);
     expect(GWS_EMAIL_SEND_RE.test('gws gmail +reply-all --message-id x')).toBe(true);
     expect(GWS_EMAIL_SEND_RE.test('gws gmail +forward --message-id x')).toBe(true);
@@ -49,14 +49,14 @@ describe('envelopeFromJsonRaw', () => {
 
   test('extracts To/From/Subject/Cc/Bcc from base64url RFC 822', () => {
     const seg = `gws gmail users messages send --params '{"userId":"me"}' ${buildRawJsonArg({
-      From: 'Dave <dave@example.com>',
+      From: 'Operator <operator@example.com>',
       To: 'mike@example.com',
       Cc: 'sam@example.com',
       Bcc: 'audit@example.com',
       Subject: 'Handoff doc',
     })}`;
     expect(envelopeFromJsonRaw(seg)).toEqual({
-      from: 'Dave <dave@example.com>',
+      from: 'Operator <operator@example.com>',
       to: 'mike@example.com',
       cc: 'sam@example.com',
       bcc: 'audit@example.com',
@@ -65,14 +65,14 @@ describe('envelopeFromJsonRaw', () => {
   });
 
   test('handles {message:{raw:…}} envelope shape', () => {
-    const rfc822 = 'To: a@b.com\r\nSubject: hi\r\n\r\nbody';
+    const rfc822 = 'To: person8@fixture1.example.com\r\nSubject: hi\r\n\r\nbody';
     const b64url = Buffer.from(rfc822, 'utf-8')
       .toString('base64')
       .replace(/\+/g, '-')
       .replace(/\//g, '_')
       .replace(/=+$/, '');
     const seg = `--json '${JSON.stringify({ message: { raw: b64url } })}'`;
-    expect(envelopeFromJsonRaw(seg)).toEqual({ to: 'a@b.com', subject: 'hi' });
+    expect(envelopeFromJsonRaw(seg)).toEqual({ to: 'person8@fixture1.example.com', subject: 'hi' });
   });
 
   test('returns {} on missing --json, malformed JSON, missing raw, or undecodable base64', () => {
@@ -83,7 +83,7 @@ describe('envelopeFromJsonRaw', () => {
   });
 
   test('unfolds RFC 822 continuation lines', () => {
-    const rfc822 = 'Subject: a really long subject\r\n that wraps across lines\r\nTo: a@b.com\r\n\r\nbody';
+    const rfc822 = 'Subject: a really long subject\r\n that wraps across lines\r\nTo: person8@fixture1.example.com\r\n\r\nbody';
     const b64url = Buffer.from(rfc822, 'utf-8')
       .toString('base64')
       .replace(/\+/g, '-')
@@ -92,7 +92,7 @@ describe('envelopeFromJsonRaw', () => {
     const seg = `--json '${JSON.stringify({ raw: b64url })}'`;
     expect(envelopeFromJsonRaw(seg)).toEqual({
       subject: 'a really long subject that wraps across lines',
-      to: 'a@b.com',
+      to: 'person8@fixture1.example.com',
     });
   });
 });

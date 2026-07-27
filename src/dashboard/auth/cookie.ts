@@ -12,7 +12,7 @@ export interface CookiePayload {
  * Shared TTL used by both the dashboard-token issuer and the cookie's
  * Max-Age. Env-overridable via NANOCLAW_DASHBOARD_SESSION_TTL_HOURS so an
  * operator can shorten it on a shared host. Default 30 days (720h) — the
- * SPA forced a re-token every 12h before this, which Dave (sole user on
+ * SPA forced a re-token every 12h before this, which Operator (sole user on
  * his deployment) found needlessly annoying.
  */
 export function dashboardSessionTtlHours(): number {

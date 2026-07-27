@@ -178,7 +178,7 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
 // `-m`/`-e` values are provider-specific: a codex group must accept gpt-5.5
 // and reject claude-fable-5, and vice versa. Before this table existed the
 // parser was Claude-only, which produced two bugs on codex groups (observed
-// live 2026-06-10, dirt-market-codex): `-m fable` was acked and stored as
+// live 2026-06-10, example-market-codex): `-m fable` was acked and stored as
 // sticky_model — then silently ignored by the codex provider — while
 // `-m gpt-5.5` (the model actually running) was rejected as unknown.
 

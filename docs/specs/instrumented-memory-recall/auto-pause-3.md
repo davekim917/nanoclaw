@@ -62,7 +62,7 @@ Codex finds real issues each round. They're getting narrower in blast radius and
 
 ## My recommendation
 
-**Path A** if the chained-overlap pattern is plausible in your traffic profile (multiple recalls per thread within 110s — does happen for active conversations in axis-labs / similar with recall_scope='all-groups').
+**Path A** if the chained-overlap pattern is plausible in your traffic profile (multiple recalls per thread within 110s — does happen for active conversations in example-research / similar with recall_scope='all-groups').
 
 **Path B** if your traffic is mostly DM/short-thread and chained overlap is exotic. The known-issue doc is honest and the warning gives operators a signal.
 

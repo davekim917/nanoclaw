@@ -950,7 +950,7 @@ describe('per-turn channel-root threading', () => {
     // <thread>` / `slack:<channel>:<ts>` and throw ValidationError on anything
     // else, so in production every follow-up was retried 3x and dropped. The fake
     // adapter here accepts any string, which is precisely why it never surfaced.
-    // Fixed 2026-07-25 after the madison-reed meeting digest lost 3 of 4 chunks.
+    // Fixed 2026-07-25 after the example-retail meeting digest lost 3 of 4 chunks.
     expect(calls[1]).toEqual({ id: 'out-2', threadId: 'telegram:123:plat-1' });
   });
 

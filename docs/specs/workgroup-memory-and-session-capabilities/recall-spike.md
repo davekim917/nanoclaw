@@ -42,13 +42,13 @@ order; recency does not win a relevance tie.
 
 The largest live Markdown file fits under the selected 65,536-byte per-file
 limit, and the entire substantive legacy corpus fits under the 1,048,576-byte
-per-turn scan ceiling. The number-drinks incident workgroup currently has three
+per-turn scan ceiling. The example-beverage incident workgroup currently has three
 Markdown files totaling 5,682 bytes; its legacy tree is the projected canonical
 source until migration performs the path cutover.
 
 ## Incident-turn benchmark
 
-The read-only benchmark used the real SipTrue thread, trusted number-drinks
+The read-only benchmark used the real SipTrue thread, trusted example-beverage
 workgroup member IDs from `v2.db`, the bounded archive FTS query, and the same
 deterministic lexical/proximity ranking as the producer.
 

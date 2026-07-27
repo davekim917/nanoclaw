@@ -33,7 +33,9 @@ describe('namespacedPlatformId', () => {
   });
 
   it('leaves native-adapter id formats untouched (@, +, group:, deltachat)', () => {
-    expect(namespacedPlatformId('whatsapp-cloud', '123@s.whatsapp.net')).toBe('123@s.whatsapp.net');
+    expect(namespacedPlatformId('whatsapp-cloud', 'person3@fixture15.example.com')).toBe(
+      'person3@fixture15.example.com',
+    );
     expect(namespacedPlatformId('signal', '+15551234567')).toBe('+15551234567');
     expect(namespacedPlatformId('signal', 'group:abc')).toBe('group:abc');
     expect(namespacedPlatformId('deltachat', '12')).toBe('12');

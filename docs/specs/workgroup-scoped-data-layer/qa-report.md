@@ -47,7 +47,7 @@ The function checked for `agent_groups` table inside `archive.db` (the source); 
 
 **[CD-2] Mnemon classifier writes went to per-agent stores, not workgroup canonical — FIXED in ac41dae**
 
-`MnemonStore.remember` used the raw `agentGroupId` as `--store`, so daemon-extracted facts from `illie-codex` landed in its own (empty) store rather than the workgroup canonical (`workgroups.mnemon_store_id`). Read-write asymmetry — container reads from canonical, daemon writes elsewhere.
+`MnemonStore.remember` used the raw `agentGroupId` as `--store`, so daemon-extracted facts from `helper-codex` landed in its own (empty) store rather than the workgroup canonical (`workgroups.mnemon_store_id`). Read-write asymmetry — container reads from canonical, daemon writes elsewhere.
 
 **Fix:** `MnemonStore.remember` now calls `resolveWorkgroupStoreId(agentGroupId)` before the mnemon CLI invocation; falls back to `agentGroupId` on error (test contexts without workgroups schema).
 
@@ -61,7 +61,7 @@ The catch block in `buildArchiveProjection` re-threw only when the error message
 
 If a codex twin spawns BEFORE its parent's `agent_groups` row exists (e.g., a future provisioning workflow that creates a sibling without a pre-existing parent), the reconciler's `INSERT ... ON CONFLICT DO NOTHING` locks `workgroups.mnemon_store_id` to the codex twin's own id. Subsequent parent spawn no-ops on the conflict; the workgroup is permanently pointed at the wrong store.
 
-**Mitigation today:** The `clone-as-codex` skill (per its SKILL.md) enforces a parent-first invariant — the parent's `agent_groups` row always exists before the codex sibling is created. Practical exposure on Dave's install is zero.
+**Mitigation today:** The `clone-as-codex` skill (per its SKILL.md) enforces a parent-first invariant — the parent's `agent_groups` row always exists before the codex sibling is created. Practical exposure on Operator's install is zero.
 
 **Status:** ACCEPTED as known limitation. Documented in `docs/workgroups.md` § Staleness window. If a future provisioning flow violates parent-first, the operator can manually `pnpm exec tsx scripts/q.ts data/v2.db "UPDATE workgroups SET mnemon_store_id = ? WHERE id = ?"` to fix. Long-term fix (deferred follow-up): change reconciler to detect mis-pinned `mnemon_store_id` and self-heal on subsequent spawn.
 
@@ -77,7 +77,7 @@ Two `require()` calls with eslint-disable comments in `openCentralDb`. CLAUDE.md
 
 The 60s `scopeCache` is only used for `'all-groups'` and `string[]` modes. Workgroup mode does two DB queries per call without caching. At recall frequency (~1 per chat turn) the overhead is real.
 
-**Status:** Deferred to follow-up. Practical impact at Dave's scale (~30 agent_groups, ~10 workgroups) is microseconds per call. A future optimization can add `'workgroup'` caching with the same TTL.
+**Status:** Deferred to follow-up. Practical impact at Operator's scale (~30 agent_groups, ~10 workgroups) is microseconds per call. A future optimization can add `'workgroup'` caching with the same TTL.
 
 **[CD-7] Cross-table subquery in projection — DEFERRED**
 

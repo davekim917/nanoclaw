@@ -20,7 +20,7 @@ runMigrations(db);
 
 const AGENT_GROUP_ID = 'ag-main';
 const MESSAGING_GROUP_ID = 'mg-discord';
-const CHANNEL_ID = 'discord:1470188214710046894:1491569326447132673';
+const CHANNEL_ID = 'discord:123456789000000001:123456789000000005';
 
 // Agent group
 if (!getAgentGroup(AGENT_GROUP_ID)) {

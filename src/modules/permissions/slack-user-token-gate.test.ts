@@ -62,51 +62,51 @@ function makeDb(): Database.Database {
 }
 
 /**
- * Default scaffolding: workgroup "mr" with sibling agents bo (Claude) and
- * bo-codex (Codex). Each has its own DM messaging_group with the owner
- * (Dave). One team channel and one private leads channel are wired to both
+ * Default scaffolding: workgroup "retail" with sibling agents primary (Claude) and
+ * example-assistant-codex (Codex). Each has its own DM messaging_group with the owner
+ * (Operator). One team channel and one private leads channel are wired to both
  * agents (used by the override tests).
  *
- *   agent_groups: ag-bo (wg mr), ag-bo-codex (wg mr)
- *   users:        slack-mr:UDAVE, slack-mr-codex:UDAVE (same human, different adapters)
- *   user_roles:   slack-mr:UDAVE is global owner (one record only)
+ *   agent_groups: ag-primary (wg retail), ag-example-assistant-codex (wg retail)
+ *   users:        slack-retail:UOWNER, slack-retail-codex:UOWNER (same human, different adapters)
+ *   user_roles:   slack-retail:UOWNER is global owner (one record only)
  *   messaging_groups:
- *     mg-bo-dm (1:1, wired to ag-bo)
- *     mg-bo-codex-dm (1:1, wired to ag-bo-codex)
+ *     mg-primary-dm (1:1, wired to ag-primary)
+ *     mg-example-assistant-codex-dm (1:1, wired to ag-example-assistant-codex)
  *     mg-team-eng (channel, wired to both)
  *     mg-eng-leads-private (channel, wired to both — override test)
- *   user_dms: each adapter's UDAVE user → its respective DM mg
+ *   user_dms: each adapter's UOWNER user → its respective DM mg
  */
-function seedMrWorkgroup(db: Database.Database) {
+function seedRetailWorkgroup(db: Database.Database) {
   db.exec(`
     INSERT INTO users (id, kind, display_name, created_at)
       VALUES
-        ('slack-mr:UDAVE', 'human', 'Dave', '2026-01-01'),
-        ('slack-mr-codex:UDAVE', 'human', 'Dave', '2026-01-01');
+        ('slack-retail:UOWNER', 'human', 'Operator', '2026-01-01'),
+        ('slack-retail-codex:UOWNER', 'human', 'Operator', '2026-01-01');
     INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
-      VALUES ('slack-mr:UDAVE', 'owner', NULL, '2026-01-01');
+      VALUES ('slack-retail:UOWNER', 'owner', NULL, '2026-01-01');
     INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
       VALUES
-        ('ag-bo', 'bo', 'bo', 'mr', '2026-01-01'),
-        ('ag-bo-codex', 'bo-codex', 'bo-codex', 'mr', '2026-01-01');
+        ('ag-primary', 'primary', 'primary', 'retail', '2026-01-01'),
+        ('ag-example-assistant-codex', 'example-assistant-codex', 'example-assistant-codex', 'retail', '2026-01-01');
     INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, created_at)
       VALUES
-        ('mg-bo-dm', 'slack-mr', 'slack:D-BO', 'dave-bo-dm', 0, '2026-01-01'),
-        ('mg-bo-codex-dm', 'slack-mr-codex', 'slack:D-BO-CODEX', 'dave-bo-codex-dm', 0, '2026-01-01'),
-        ('mg-team-eng', 'slack-mr', 'slack:C-TEAM-ENG', '#engineering', 1, '2026-01-01'),
-        ('mg-eng-leads-private', 'slack-mr', 'slack:C-ENG-LEADS', '#eng-leads-private', 1, '2026-01-01');
+        ('mg-primary-dm', 'slack-retail', 'slack:D-PRIMARY', 'operator-primary-dm', 0, '2026-01-01'),
+        ('mg-example-assistant-codex-dm', 'slack-retail-codex', 'slack:D-example-assistant-codex', 'operator-example-assistant-codex-dm', 0, '2026-01-01'),
+        ('mg-team-eng', 'slack-retail', 'slack:C-TEAM-ENG', '#engineering', 1, '2026-01-01'),
+        ('mg-eng-leads-private', 'slack-retail', 'slack:C-ENG-LEADS', '#eng-leads-private', 1, '2026-01-01');
     INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
       VALUES
-        ('mga-bo-dm', 'mg-bo-dm', 'ag-bo', '2026-01-01'),
-        ('mga-bo-codex-dm', 'mg-bo-codex-dm', 'ag-bo-codex', '2026-01-01'),
-        ('mga-team-bo', 'mg-team-eng', 'ag-bo', '2026-01-01'),
-        ('mga-team-bo-codex', 'mg-team-eng', 'ag-bo-codex', '2026-01-01'),
-        ('mga-leads-bo', 'mg-eng-leads-private', 'ag-bo', '2026-01-01'),
-        ('mga-leads-bo-codex', 'mg-eng-leads-private', 'ag-bo-codex', '2026-01-01');
+        ('mga-primary-dm', 'mg-primary-dm', 'ag-primary', '2026-01-01'),
+        ('mga-example-assistant-codex-dm', 'mg-example-assistant-codex-dm', 'ag-example-assistant-codex', '2026-01-01'),
+        ('mga-team-primary', 'mg-team-eng', 'ag-primary', '2026-01-01'),
+        ('mga-team-example-assistant-codex', 'mg-team-eng', 'ag-example-assistant-codex', '2026-01-01'),
+        ('mga-leads-primary', 'mg-eng-leads-private', 'ag-primary', '2026-01-01'),
+        ('mga-leads-example-assistant-codex', 'mg-eng-leads-private', 'ag-example-assistant-codex', '2026-01-01');
     INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
       VALUES
-        ('slack-mr:UDAVE', 'slack-mr', 'mg-bo-dm', '2026-01-01'),
-        ('slack-mr-codex:UDAVE', 'slack-mr-codex', 'mg-bo-codex-dm', '2026-01-01');
+        ('slack-retail:UOWNER', 'slack-retail', 'mg-primary-dm', '2026-01-01'),
+        ('slack-retail-codex:UOWNER', 'slack-retail-codex', 'mg-example-assistant-codex-dm', '2026-01-01');
   `);
 }
 
@@ -115,51 +115,53 @@ describe('canUseSlackUserToken — permission gate', () => {
 
   beforeEach(() => {
     db = makeDb();
-    seedMrWorkgroup(db);
+    seedRetailWorkgroup(db);
   });
 
   // ── Capability / structural denies ─────────────────────────────────────────
 
   it('test_capability_disabled_returns_false', () => {
-    expect(canUseSlackUserToken(db, 'ag-bo', 'mg-bo-dm', { enabled: false })).toBe(false);
-    expect(canUseSlackUserToken(db, 'ag-bo', 'mg-bo-dm', undefined)).toBe(false);
+    expect(canUseSlackUserToken(db, 'ag-primary', 'mg-primary-dm', { enabled: false })).toBe(false);
+    expect(canUseSlackUserToken(db, 'ag-primary', 'mg-primary-dm', undefined)).toBe(false);
   });
 
   it('test_no_messaging_group_returns_false', () => {
     // Spawning without a session messaging_group (e.g., admin shell) — deny.
-    expect(canUseSlackUserToken(db, 'ag-bo', null, { enabled: true })).toBe(false);
+    expect(canUseSlackUserToken(db, 'ag-primary', null, { enabled: true })).toBe(false);
   });
 
   // ── Default safe path: owner DMs ───────────────────────────────────────────
 
   it('test_bo_dm_allowed_by_default', () => {
-    // Session is the owner's 1:1 DM with bo (the agent on which the owner
+    // Session is the owner's 1:1 DM with primary (the agent on which the owner
     // role was directly granted). Allow.
-    expect(canUseSlackUserToken(db, 'ag-bo', 'mg-bo-dm', { enabled: true })).toBe(true);
+    expect(canUseSlackUserToken(db, 'ag-primary', 'mg-primary-dm', { enabled: true })).toBe(true);
   });
 
-  it('test_bo_codex_dm_allowed_via_sibling_workgroup', () => {
+  it('test_example-assistant-codex_dm_allowed_via_sibling_workgroup', () => {
     // CRITICAL regression test — the production bug that motivated this PR.
     //
-    // bo-codex has its own Slack adapter (`slack-mr-codex`) so the same
-    // human appears as a different user_id (`slack-mr-codex:UDAVE`). The
-    // operator only has owner role on `slack-mr:UDAVE`. The gate must
+    // example-assistant-codex has its own Slack adapter (`slack-retail-codex`) so the same
+    // human appears as a different user_id (`slack-retail-codex:UOWNER`). The
+    // operator only has owner role on `slack-retail:UOWNER`. The gate must
     // still allow because both DMs are wired to agents in the SAME
-    // workgroup (mr) — sibling adapters of the same human operator.
-    expect(canUseSlackUserToken(db, 'ag-bo-codex', 'mg-bo-codex-dm', { enabled: true })).toBe(true);
+    // workgroup (retail) — sibling adapters of the same human operator.
+    expect(
+      canUseSlackUserToken(db, 'ag-example-assistant-codex', 'mg-example-assistant-codex-dm', { enabled: true }),
+    ).toBe(true);
   });
 
   // ── Team channels ─────────────────────────────────────────────────────────
 
   it('test_team_channel_denied_by_default', () => {
     // Session is in #engineering (is_group=1) → deny.
-    expect(canUseSlackUserToken(db, 'ag-bo', 'mg-team-eng', { enabled: true })).toBe(false);
+    expect(canUseSlackUserToken(db, 'ag-primary', 'mg-team-eng', { enabled: true })).toBe(false);
   });
 
   it('test_team_channel_allowed_via_override', () => {
     // Operator explicitly trusts #eng-leads-private — added to also_allowed_in.
     expect(
-      canUseSlackUserToken(db, 'ag-bo', 'mg-eng-leads-private', {
+      canUseSlackUserToken(db, 'ag-primary', 'mg-eng-leads-private', {
         enabled: true,
         also_allowed_in: ['mg-eng-leads-private'],
       }),
@@ -169,7 +171,7 @@ describe('canUseSlackUserToken — permission gate', () => {
   it('test_override_does_not_leak_to_unlisted_channels', () => {
     // Override is exact-match, not regex/glob. A different channel id stays denied.
     expect(
-      canUseSlackUserToken(db, 'ag-bo', 'mg-team-eng', {
+      canUseSlackUserToken(db, 'ag-primary', 'mg-team-eng', {
         enabled: true,
         also_allowed_in: ['mg-eng-leads-private'],
       }),
@@ -197,17 +199,17 @@ describe('canUseSlackUserToken — permission gate', () => {
     // user_dms entry exists for an admin (not owner) in this workgroup.
     // Default gate requires role='owner', so an admin's DM cannot satisfy.
     db.exec(`
-      INSERT INTO users (id, kind, created_at) VALUES ('slack-mr:UADMIN', 'human', '2026-01-01');
+      INSERT INTO users (id, kind, created_at) VALUES ('slack-retail:UADMIN', 'human', '2026-01-01');
       INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
-        VALUES ('slack-mr:UADMIN', 'admin', NULL, '2026-01-01');
+        VALUES ('slack-retail:UADMIN', 'admin', NULL, '2026-01-01');
       INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
-        VALUES ('mg-admin-dm', 'slack-mr', 'slack:D-ADMIN', 0, '2026-01-01');
+        VALUES ('mg-admin-dm', 'slack-retail', 'slack:D-ADMIN', 0, '2026-01-01');
       INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
-        VALUES ('mga-admin', 'mg-admin-dm', 'ag-bo', '2026-01-01');
+        VALUES ('mga-admin', 'mg-admin-dm', 'ag-primary', '2026-01-01');
       INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
-        VALUES ('slack-mr:UADMIN', 'slack-mr', 'mg-admin-dm', '2026-01-01');
+        VALUES ('slack-retail:UADMIN', 'slack-retail', 'mg-admin-dm', '2026-01-01');
     `);
-    expect(canUseSlackUserToken(db, 'ag-bo', 'mg-admin-dm', { enabled: true })).toBe(false);
+    expect(canUseSlackUserToken(db, 'ag-primary', 'mg-admin-dm', { enabled: true })).toBe(false);
   });
 
   it('test_scoped_owner_does_not_satisfy_default', () => {
@@ -215,106 +217,108 @@ describe('canUseSlackUserToken — permission gate', () => {
     // (agent_group_id NOT NULL). The default gate filters
     // `agent_group_id IS NULL` so scoped owners never satisfy it.
     db.exec(`
-      INSERT INTO users (id, kind, created_at) VALUES ('slack-mr:USCOPED', 'human', '2026-01-01');
+      INSERT INTO users (id, kind, created_at) VALUES ('slack-retail:USCOPED', 'human', '2026-01-01');
       INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
-        VALUES ('slack-mr:USCOPED', 'owner', 'ag-bo', '2026-01-01');
+        VALUES ('slack-retail:USCOPED', 'owner', 'ag-primary', '2026-01-01');
       INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
-        VALUES ('mg-scoped-dm', 'slack-mr', 'slack:D-SCOPED', 0, '2026-01-01');
+        VALUES ('mg-scoped-dm', 'slack-retail', 'slack:D-SCOPED', 0, '2026-01-01');
       INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
-        VALUES ('mga-scoped', 'mg-scoped-dm', 'ag-bo', '2026-01-01');
+        VALUES ('mga-scoped', 'mg-scoped-dm', 'ag-primary', '2026-01-01');
       INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
-        VALUES ('slack-mr:USCOPED', 'slack-mr', 'mg-scoped-dm', '2026-01-01');
+        VALUES ('slack-retail:USCOPED', 'slack-retail', 'mg-scoped-dm', '2026-01-01');
     `);
-    expect(canUseSlackUserToken(db, 'ag-bo', 'mg-scoped-dm', { enabled: true })).toBe(false);
+    expect(canUseSlackUserToken(db, 'ag-primary', 'mg-scoped-dm', { enabled: true })).toBe(false);
   });
 
   // ── Cross-workgroup defense ────────────────────────────────────────────────
 
   it('test_cross_workgroup_owner_does_not_authorize_other_workgroup_dm', () => {
     // CRITICAL: Codex P1 catch on PR #110. If a deployment hosts multiple
-    // workgroups (e.g., madison-reed AND illysium), an owner in one
+    // workgroups (e.g., example-retail AND example-labs), an owner in one
     // workgroup must NOT authorize the slack-user-token MCP in a DM
     // belonging to a different workgroup — even if user_id handles collide.
     //
-    // Setup: workgroup `illy` exists with its own agent and DM. The session
-    // is in illy's DM, but the only owner record is `slack-mr:UDAVE` from
-    // the mr workgroup. Gate must deny.
+    // Setup: workgroup `labs` exists with its own agent and DM. The session
+    // is in labs's DM, but the only owner record is `slack-retail:UOWNER` from
+    // the retail workgroup. Gate must deny.
     db.exec(`
       INSERT INTO users (id, kind, created_at)
-        VALUES ('slack-illy:UCOLLIDE', 'human', '2026-01-01');
+        VALUES ('slack-labs:UCOLLIDE', 'human', '2026-01-01');
       INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
-        VALUES ('ag-illie', 'illie', 'illie', 'illy', '2026-01-01');
+        VALUES ('ag-helper', 'helper', 'helper', 'labs', '2026-01-01');
       INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
-        VALUES ('mg-illie-dm', 'slack-illy', 'slack:D-ILLIE', 0, '2026-01-01');
+        VALUES ('mg-helper-dm', 'slack-labs', 'slack:D-HELPER', 0, '2026-01-01');
       INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
-        VALUES ('mga-illie-dm', 'mg-illie-dm', 'ag-illie', '2026-01-01');
+        VALUES ('mga-helper-dm', 'mg-helper-dm', 'ag-helper', '2026-01-01');
       INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
-        VALUES ('slack-illy:UCOLLIDE', 'slack-illy', 'mg-illie-dm', '2026-01-01');
+        VALUES ('slack-labs:UCOLLIDE', 'slack-labs', 'mg-helper-dm', '2026-01-01');
     `);
-    // No owner record for illy workgroup → gate denies even though mr has
+    // No owner record for labs workgroup → gate denies even though retail has
     // a global owner.
-    expect(canUseSlackUserToken(db, 'ag-illie', 'mg-illie-dm', { enabled: true })).toBe(false);
+    expect(canUseSlackUserToken(db, 'ag-helper', 'mg-helper-dm', { enabled: true })).toBe(false);
   });
 
   it('test_owner_dm_outside_session_workgroup_does_not_authorize', () => {
     // The handle-collision attack the workgroup model defeats:
     //
-    // - Workgroup illy exists with agent ag-illie and user-dm for slack-illy:UDAVE.
-    // - The MR owner (slack-mr:UDAVE) has the global owner role.
-    // - The session is in mg-illie-dm (illy workgroup).
+    // - Workgroup labs exists with agent ag-helper and user-dm for slack-labs:UOWNER.
+    // - The Retail owner (slack-retail:UOWNER) has the global owner role.
+    // - The session is in mg-helper-dm (labs workgroup).
     //
-    // A handle-parsing gate would have matched the MR owner via its handle
-    // to the illy DM and allowed. The workgroup gate requires the owner's
+    // A handle-parsing gate would have matched the Retail owner via its handle
+    // to the labs DM and allowed. The workgroup gate requires the owner's
     // OWN user_dms to be in the session's workgroup — not just a handle
     // match. Deny.
     db.exec(`
       INSERT INTO users (id, kind, created_at)
-        VALUES ('slack-illy:UDAVE', 'human', '2026-01-01');
+        VALUES ('slack-labs:UOWNER', 'human', '2026-01-01');
       INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
-        VALUES ('ag-illie', 'illie', 'illie', 'illy', '2026-01-01');
+        VALUES ('ag-helper', 'helper', 'helper', 'labs', '2026-01-01');
       INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
-        VALUES ('mg-illie-dm', 'slack-illy', 'slack:D-ILLIE', 0, '2026-01-01');
+        VALUES ('mg-helper-dm', 'slack-labs', 'slack:D-HELPER', 0, '2026-01-01');
       INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
-        VALUES ('mga-illie', 'mg-illie-dm', 'ag-illie', '2026-01-01');
+        VALUES ('mga-helper', 'mg-helper-dm', 'ag-helper', '2026-01-01');
       INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
-        VALUES ('slack-illy:UDAVE', 'slack-illy', 'mg-illie-dm', '2026-01-01');
+        VALUES ('slack-labs:UOWNER', 'slack-labs', 'mg-helper-dm', '2026-01-01');
     `);
-    expect(canUseSlackUserToken(db, 'ag-illie', 'mg-illie-dm', { enabled: true })).toBe(false);
+    expect(canUseSlackUserToken(db, 'ag-helper', 'mg-helper-dm', { enabled: true })).toBe(false);
   });
 
   it('test_owner_in_both_workgroups_authorizes_only_their_own', () => {
-    // The dual-workgroup operator: Dave is owner of BOTH mr and illy.
+    // The dual-workgroup operator: Operator is owner of BOTH retail and labs.
     // Each workgroup's DM independently authorizes only itself. The
     // workgroups don't bleed into each other.
     db.exec(`
       INSERT INTO users (id, kind, created_at)
         VALUES
-          ('slack-illy:UDAVE', 'human', '2026-01-01'),
-          ('slack-illy-codex:UDAVE', 'human', '2026-01-01');
+          ('slack-labs:UOWNER', 'human', '2026-01-01'),
+          ('slack-labs-codex:UOWNER', 'human', '2026-01-01');
       INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
-        VALUES ('slack-illy:UDAVE', 'owner', NULL, '2026-01-01');
+        VALUES ('slack-labs:UOWNER', 'owner', NULL, '2026-01-01');
       INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
         VALUES
-          ('ag-illie', 'illie', 'illie', 'illy', '2026-01-01'),
-          ('ag-illie-codex', 'illie-codex', 'illie-codex', 'illy', '2026-01-01');
+          ('ag-helper', 'helper', 'helper', 'labs', '2026-01-01'),
+          ('ag-helper-codex', 'helper-codex', 'helper-codex', 'labs', '2026-01-01');
       INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
         VALUES
-          ('mg-illie-dm', 'slack-illy', 'slack:D-ILLIE', 0, '2026-01-01'),
-          ('mg-illie-codex-dm', 'slack-illy-codex', 'slack:D-ILLIE-CODEX', 0, '2026-01-01');
+          ('mg-helper-dm', 'slack-labs', 'slack:D-HELPER', 0, '2026-01-01'),
+          ('mg-helper-codex-dm', 'slack-labs-codex', 'slack:D-HELPER-CODEX', 0, '2026-01-01');
       INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
         VALUES
-          ('mga-illie', 'mg-illie-dm', 'ag-illie', '2026-01-01'),
-          ('mga-illie-codex', 'mg-illie-codex-dm', 'ag-illie-codex', '2026-01-01');
+          ('mga-helper', 'mg-helper-dm', 'ag-helper', '2026-01-01'),
+          ('mga-helper-codex', 'mg-helper-codex-dm', 'ag-helper-codex', '2026-01-01');
       INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
         VALUES
-          ('slack-illy:UDAVE', 'slack-illy', 'mg-illie-dm', '2026-01-01'),
-          ('slack-illy-codex:UDAVE', 'slack-illy-codex', 'mg-illie-codex-dm', '2026-01-01');
+          ('slack-labs:UOWNER', 'slack-labs', 'mg-helper-dm', '2026-01-01'),
+          ('slack-labs-codex:UOWNER', 'slack-labs-codex', 'mg-helper-codex-dm', '2026-01-01');
     `);
     // Both workgroups' DMs allow now (each has its own owner record + DM)
-    expect(canUseSlackUserToken(db, 'ag-bo', 'mg-bo-dm', { enabled: true })).toBe(true);
-    expect(canUseSlackUserToken(db, 'ag-bo-codex', 'mg-bo-codex-dm', { enabled: true })).toBe(true);
-    expect(canUseSlackUserToken(db, 'ag-illie', 'mg-illie-dm', { enabled: true })).toBe(true);
-    expect(canUseSlackUserToken(db, 'ag-illie-codex', 'mg-illie-codex-dm', { enabled: true })).toBe(true);
+    expect(canUseSlackUserToken(db, 'ag-primary', 'mg-primary-dm', { enabled: true })).toBe(true);
+    expect(
+      canUseSlackUserToken(db, 'ag-example-assistant-codex', 'mg-example-assistant-codex-dm', { enabled: true }),
+    ).toBe(true);
+    expect(canUseSlackUserToken(db, 'ag-helper', 'mg-helper-dm', { enabled: true })).toBe(true);
+    expect(canUseSlackUserToken(db, 'ag-helper-codex', 'mg-helper-codex-dm', { enabled: true })).toBe(true);
   });
 
   it('test_workspace_literally_named_with_codex_suffix_isolated', () => {
@@ -327,10 +331,10 @@ describe('canUseSlackUserToken — permission gate', () => {
     db.exec(`
       INSERT INTO users (id, kind, created_at)
         VALUES
-          ('slack-acme:UDAVE', 'human', '2026-01-01'),
-          ('slack-acme-codex:UDAVE', 'human', '2026-01-01');
+          ('slack-acme:UOWNER', 'human', '2026-01-01'),
+          ('slack-acme-codex:UOWNER', 'human', '2026-01-01');
       INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
-        VALUES ('slack-acme:UDAVE', 'owner', NULL, '2026-01-01');
+        VALUES ('slack-acme:UOWNER', 'owner', NULL, '2026-01-01');
       INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
         VALUES
           ('ag-acme', 'acme', 'acme', 'acme', '2026-01-01'),
@@ -345,8 +349,8 @@ describe('canUseSlackUserToken — permission gate', () => {
           ('mga-acme-codex-ws', 'mg-acme-codex-ws-dm', 'ag-acme-codex-ws', '2026-01-01');
       INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
         VALUES
-          ('slack-acme:UDAVE', 'slack-acme', 'mg-acme-dm', '2026-01-01'),
-          ('slack-acme-codex:UDAVE', 'slack-acme-codex', 'mg-acme-codex-ws-dm', '2026-01-01');
+          ('slack-acme:UOWNER', 'slack-acme', 'mg-acme-dm', '2026-01-01'),
+          ('slack-acme-codex:UOWNER', 'slack-acme-codex', 'mg-acme-codex-ws-dm', '2026-01-01');
     `);
     // The DM in the "acme-codex-ws" workspace must NOT inherit acme's owner
     // (and vice versa). String-parsing approaches collapsed these; the
@@ -360,8 +364,8 @@ describe('canUseSlackUserToken — permission gate', () => {
   it('test_is_group_one_denies_even_with_workgroup_match', () => {
     // The override path is the only way for a channel (is_group=1) to
     // satisfy the gate. The default path requires is_group=0.
-    db.exec(`UPDATE messaging_groups SET is_group = 1 WHERE id = 'mg-bo-dm';`);
-    expect(canUseSlackUserToken(db, 'ag-bo', 'mg-bo-dm', { enabled: true })).toBe(false);
+    db.exec(`UPDATE messaging_groups SET is_group = 1 WHERE id = 'mg-primary-dm';`);
+    expect(canUseSlackUserToken(db, 'ag-primary', 'mg-primary-dm', { enabled: true })).toBe(false);
   });
 
   it('test_standalone_workgroup_works_with_own_owner', () => {
@@ -369,9 +373,9 @@ describe('canUseSlackUserToken — permission gate', () => {
     // equals the agent's own slug.
     const sd = makeDb();
     sd.exec(`
-      INSERT INTO users (id, kind, created_at) VALUES ('slack-solo:UDAVE', 'human', '2026-01-01');
+      INSERT INTO users (id, kind, created_at) VALUES ('slack-solo:UOWNER', 'human', '2026-01-01');
       INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
-        VALUES ('slack-solo:UDAVE', 'owner', NULL, '2026-01-01');
+        VALUES ('slack-solo:UOWNER', 'owner', NULL, '2026-01-01');
       INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
         VALUES ('ag-solo', 'solo', 'solo', 'solo', '2026-01-01');
       INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
@@ -379,7 +383,7 @@ describe('canUseSlackUserToken — permission gate', () => {
       INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
         VALUES ('mga-solo', 'mg-solo-dm', 'ag-solo', '2026-01-01');
       INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
-        VALUES ('slack-solo:UDAVE', 'slack-solo', 'mg-solo-dm', '2026-01-01');
+        VALUES ('slack-solo:UOWNER', 'slack-solo', 'mg-solo-dm', '2026-01-01');
     `);
     expect(canUseSlackUserToken(sd, 'ag-solo', 'mg-solo-dm', { enabled: true })).toBe(true);
   });
@@ -390,9 +394,9 @@ describe('canUseSlackUserToken — permission gate', () => {
     // The override path still works for explicit operator authorization.
     const pre = makeDb();
     pre.exec(`
-      INSERT INTO users (id, kind, created_at) VALUES ('slack-pre:UDAVE', 'human', '2026-01-01');
+      INSERT INTO users (id, kind, created_at) VALUES ('slack-pre:UOWNER', 'human', '2026-01-01');
       INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
-        VALUES ('slack-pre:UDAVE', 'owner', NULL, '2026-01-01');
+        VALUES ('slack-pre:UOWNER', 'owner', NULL, '2026-01-01');
       INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
         VALUES ('ag-pre', 'pre', 'pre', NULL, '2026-01-01');
       INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
@@ -400,7 +404,7 @@ describe('canUseSlackUserToken — permission gate', () => {
       INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
         VALUES ('mga-pre', 'mg-pre-dm', 'ag-pre', '2026-01-01');
       INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
-        VALUES ('slack-pre:UDAVE', 'slack-pre', 'mg-pre-dm', '2026-01-01');
+        VALUES ('slack-pre:UOWNER', 'slack-pre', 'mg-pre-dm', '2026-01-01');
     `);
     expect(canUseSlackUserToken(pre, 'ag-pre', 'mg-pre-dm', { enabled: true })).toBe(false);
   });
@@ -429,34 +433,36 @@ describe('isOwnerSafeSlackSession — credential-layer predicate', () => {
 
   beforeEach(() => {
     db = makeDb();
-    seedMrWorkgroup(db);
+    seedRetailWorkgroup(db);
   });
 
   it('is independent of slack_user_token.enabled (no config arg at all)', () => {
     // The credential layer reuses this WITHOUT the enabled flag — a group can
     // carry the Slack secret for curl without registering the MCP.
-    expect(isOwnerSafeSlackSession(db, 'ag-bo', 'mg-bo-dm', undefined)).toBe(true);
+    expect(isOwnerSafeSlackSession(db, 'ag-primary', 'mg-primary-dm', undefined)).toBe(true);
   });
 
   it('owner 1:1 DM is owner-safe', () => {
-    expect(isOwnerSafeSlackSession(db, 'ag-bo', 'mg-bo-dm', undefined)).toBe(true);
+    expect(isOwnerSafeSlackSession(db, 'ag-primary', 'mg-primary-dm', undefined)).toBe(true);
   });
 
   it('sibling Codex DM is owner-safe via workgroup match', () => {
-    expect(isOwnerSafeSlackSession(db, 'ag-bo-codex', 'mg-bo-codex-dm', undefined)).toBe(true);
+    expect(isOwnerSafeSlackSession(db, 'ag-example-assistant-codex', 'mg-example-assistant-codex-dm', undefined)).toBe(
+      true,
+    );
   });
 
   it('group channel is NOT owner-safe by default (→ non-owner-safe → Slack withheld)', () => {
-    expect(isOwnerSafeSlackSession(db, 'ag-bo', 'mg-team-eng', undefined)).toBe(false);
+    expect(isOwnerSafeSlackSession(db, 'ag-primary', 'mg-team-eng', undefined)).toBe(false);
   });
 
   it('group channel becomes owner-safe when listed in also_allowed_in', () => {
-    // This is exactly how Dave's personal Discord channel (is_group=1) is
+    // This is exactly how Operator's personal Discord channel (is_group=1) is
     // marked owner-safe so siblings keep full Slack there.
-    expect(isOwnerSafeSlackSession(db, 'ag-bo', 'mg-team-eng', ['mg-team-eng'])).toBe(true);
+    expect(isOwnerSafeSlackSession(db, 'ag-primary', 'mg-team-eng', ['mg-team-eng'])).toBe(true);
   });
 
   it('no messaging group (admin shell) is NOT owner-safe — fail-closed', () => {
-    expect(isOwnerSafeSlackSession(db, 'ag-bo', null, ['mg-team-eng'])).toBe(false);
+    expect(isOwnerSafeSlackSession(db, 'ag-primary', null, ['mg-team-eng'])).toBe(false);
   });
 });

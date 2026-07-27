@@ -138,7 +138,7 @@ function archive(
     threadId,
     role: 'user',
     senderId: 'discord:user',
-    senderName: 'Dave',
+    senderName: 'Operator',
     text,
     sentAt,
   });
@@ -326,7 +326,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
         threadId: 'discord:123:456:789',
         role: 'user',
         senderId: 'discord:user',
-        senderName: 'Dave',
+        senderName: 'Operator',
         text: `Exact linked deployment owner evidence ${index}.`,
         sentAt: `2026-06-0${index + 1}T00:00:00.000Z`,
       });
@@ -805,16 +805,16 @@ describe('bounded authoritative pre-turn retrieval', () => {
 
   it('does not suppress exact-link or correction evidence already seen in the context epoch', () => {
     upsertArchiveMessage({
-      id: '1496304577081770106:ag-a',
+      id: '123456789000000007:ag-a',
       agentGroupId: 'ag-a',
       messagingGroupId: 'mg-a',
       channelType: 'discord',
       channelName: 'room',
-      platformId: 'discord:1479489865702703155:1496304577081770106',
-      threadId: 'discord:1479489865702703155:1496304577081770106',
+      platformId: 'discord:123456789000000002:123456789000000007',
+      threadId: 'discord:123456789000000002:123456789000000007',
       role: 'user',
       senderId: 'discord:user',
-      senderName: 'Dave',
+      senderName: 'Operator',
       text: 'SipTrue DNS is managed in Wix.',
       sentAt: '2026-07-20T00:00:00.000Z',
     });
@@ -826,7 +826,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
       includeBootstrap: false,
       provider: 'claude',
       contextEpoch: 9,
-      normalizedContent: '{"text":"https://discord.com/channels/1479489865702703155/1496304577081770106"}',
+      normalizedContent: '{"text":"https://discord.com/channels/123456789000000002/123456789000000007"}',
     };
     const firstLink = buildPreTurnContext(linkInput);
     const linkedFingerprint = firstLink.conversationEvidence.excerpts[0]!.fingerprint;

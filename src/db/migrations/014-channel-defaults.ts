@@ -7,8 +7,8 @@ import type { Migration } from './index.js';
  * v1 stored model/effort per chat-JID (per-channel in v2 terms). My
  * initial v2 port put them on container.json which is per-agent-group
  * — wrong granularity. This migration moves to the right layer: the
- * messaging_group_agents wiring row, so `illysium/agents-xzo` can pin
- * opus-4-7 while `illysium/agents-sunday` uses opus-4-6.
+ * messaging_group_agents wiring row, so `example-labs/agents-example` can pin
+ * opus-4-7 while `example-labs/agents-archive-one` uses opus-4-6.
  *
  * Both nullable — absence falls through to per-agent-group
  * (container.json) → host env → hardcoded default.

@@ -6,7 +6,7 @@
       "inputs": {
         "api_key": "re_fake_api_key",
         "webhook_secret": "whsec_fake",
-        "from_address": "assistant@mail.example.com",
+        "from_address": "person11@fixture12.example.com",
         "from_name": "NanoClaw",
         "owner_email": "owner@example.com",
         "agent_folder": "main"

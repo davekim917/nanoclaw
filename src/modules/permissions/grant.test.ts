@@ -45,7 +45,7 @@ function now(): string {
 function makeSession(overrides: Partial<Session> = {}): Session {
   return {
     id: 'sess-test',
-    agent_group_id: 'ag-illie',
+    agent_group_id: 'ag-helper',
     messaging_group_id: 'mg-test',
     thread_id: null,
     agent_provider: null,
@@ -103,7 +103,7 @@ function insertChatInbound(
   db.prepare(`INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, 'chat', ?, ?, ?)`).run(
     `in-${Math.random().toString(36).slice(2, 8)}`,
     opts.timestamp ?? now(),
-    opts.channelType ?? 'slack-illysium',
+    opts.channelType ?? 'slack-example-labs',
     JSON.stringify(content),
   );
 }
@@ -113,37 +113,52 @@ beforeEach(() => {
   runMigrations(db);
   notifyCalls.length = 0;
 
-  createMessagingGroup(makeMg('mg-test', 'slack-illysium', 'slack:C1'));
-  createAgentGroup(makeAg('ag-illie', 'illysium-v2', 'illie'));
+  createMessagingGroup(makeMg('mg-test', 'slack-example-labs', 'slack:C1'));
+  createAgentGroup(makeAg('ag-helper', 'example-labs-v2', 'helper'));
   createAgentGroup(makeAg('ag-other', 'other', 'other'));
 
-  createUser({ id: 'slack-illysium:OWNER', kind: 'slack-illysium', display_name: 'Owner', created_at: now() });
-  createUser({ id: 'slack-illysium:GADMIN', kind: 'slack-illysium', display_name: 'GlobalAdmin', created_at: now() });
-  createUser({ id: 'slack-illysium:SADMIN', kind: 'slack-illysium', display_name: 'ScopedAdmin', created_at: now() });
-  createUser({ id: 'slack-illysium:STRANGER', kind: 'slack-illysium', display_name: 'Stranger', created_at: now() });
+  createUser({ id: 'slack-example-labs:OWNER', kind: 'slack-example-labs', display_name: 'Owner', created_at: now() });
+  createUser({
+    id: 'slack-example-labs:GADMIN',
+    kind: 'slack-example-labs',
+    display_name: 'GlobalAdmin',
+    created_at: now(),
+  });
+  createUser({
+    id: 'slack-example-labs:SADMIN',
+    kind: 'slack-example-labs',
+    display_name: 'ScopedAdmin',
+    created_at: now(),
+  });
+  createUser({
+    id: 'slack-example-labs:STRANGER',
+    kind: 'slack-example-labs',
+    display_name: 'Stranger',
+    created_at: now(),
+  });
   // Target users that test-local addMember/grantRole calls reference before
   // the handler's own ensureUserExists has a chance to create them.
-  createUser({ id: 'slack-illysium:BOB', kind: 'slack-illysium', display_name: 'Bob', created_at: now() });
-  createUser({ id: 'slack-illysium:CAROL', kind: 'slack-illysium', display_name: 'Carol', created_at: now() });
+  createUser({ id: 'slack-example-labs:BOB', kind: 'slack-example-labs', display_name: 'Bob', created_at: now() });
+  createUser({ id: 'slack-example-labs:CAROL', kind: 'slack-example-labs', display_name: 'Carol', created_at: now() });
 
   grantRole({
-    user_id: 'slack-illysium:OWNER',
+    user_id: 'slack-example-labs:OWNER',
     role: 'owner',
     agent_group_id: null,
     granted_by: null,
     granted_at: now(),
   });
   grantRole({
-    user_id: 'slack-illysium:GADMIN',
+    user_id: 'slack-example-labs:GADMIN',
     role: 'admin',
     agent_group_id: null,
     granted_by: null,
     granted_at: now(),
   });
   grantRole({
-    user_id: 'slack-illysium:SADMIN',
+    user_id: 'slack-example-labs:SADMIN',
     role: 'admin',
-    agent_group_id: 'ag-illie',
+    agent_group_id: 'ag-helper',
     granted_by: null,
     granted_at: now(),
   });
@@ -155,15 +170,15 @@ afterEach(() => {
 
 describe('_resolveTargetUserId', () => {
   it('returns a namespaced id as-is', () => {
-    expect(_resolveTargetUserId('slack-illysium:U1', makeSession())).toBe('slack-illysium:U1');
+    expect(_resolveTargetUserId('slack-example-labs:U1', makeSession())).toBe('slack-example-labs:U1');
   });
 
   it('unwraps <@Uxxx> mentions and prepends channel_type', () => {
-    expect(_resolveTargetUserId('<@U12345>', makeSession())).toBe('slack-illysium:U12345');
+    expect(_resolveTargetUserId('<@U12345>', makeSession())).toBe('slack-example-labs:U12345');
   });
 
   it('strips a Slack display-alias pipe in the mention', () => {
-    expect(_resolveTargetUserId('<@U12345|dave>', makeSession())).toBe('slack-illysium:U12345');
+    expect(_resolveTargetUserId('<@U12345|operator>', makeSession())).toBe('slack-example-labs:U12345');
   });
 
   it('rejects Discord role mentions (<@&snowflake>)', () => {
@@ -171,7 +186,7 @@ describe('_resolveTargetUserId', () => {
   });
 
   it('accepts bare handles and prepends channel_type', () => {
-    expect(_resolveTargetUserId('U12345', makeSession())).toBe('slack-illysium:U12345');
+    expect(_resolveTargetUserId('U12345', makeSession())).toBe('slack-example-labs:U12345');
   });
 
   it('returns null when the session has no messaging group', () => {
@@ -182,20 +197,20 @@ describe('_resolveTargetUserId', () => {
 describe('_deriveCallerId', () => {
   it('reads senderId from the latest chat inbound', () => {
     const db = inboundDb();
-    insertChatInbound(db, { senderId: 'slack-illysium:OWNER', text: 'hi' });
-    expect(_deriveCallerId(makeSession(), db)).toBe('slack-illysium:OWNER');
+    insertChatInbound(db, { senderId: 'slack-example-labs:OWNER', text: 'hi' });
+    expect(_deriveCallerId(makeSession(), db)).toBe('slack-example-labs:OWNER');
   });
 
   it('falls back to author.userId when senderId is absent', () => {
     const db = inboundDb();
-    insertChatInbound(db, { author: { userId: 'slack-illysium:OWNER' }, text: 'hi' });
-    expect(_deriveCallerId(makeSession(), db)).toBe('slack-illysium:OWNER');
+    insertChatInbound(db, { author: { userId: 'slack-example-labs:OWNER' }, text: 'hi' });
+    expect(_deriveCallerId(makeSession(), db)).toBe('slack-example-labs:OWNER');
   });
 
   it('prepends channel_type when the raw id is bare', () => {
     const db = inboundDb();
     insertChatInbound(db, { senderId: 'OWNER', text: 'hi' });
-    expect(_deriveCallerId(makeSession(), db)).toBe('slack-illysium:OWNER');
+    expect(_deriveCallerId(makeSession(), db)).toBe('slack-example-labs:OWNER');
   });
 
   it('returns null when there are no chat messages', () => {
@@ -205,7 +220,7 @@ describe('_deriveCallerId', () => {
   it('returns null on malformed content JSON', () => {
     const db = inboundDb();
     db.prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, 'chat', ?, 'slack-illysium', ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, 'chat', ?, 'slack-example-labs', ?)`,
     ).run('bad', now(), 'not json');
     expect(_deriveCallerId(makeSession(), db)).toBeNull();
   });
@@ -216,7 +231,7 @@ describe('handleGrantAccess', () => {
     const db = inboundDb();
     insertChatInbound(db, { senderId: 'OWNER' });
     await handleGrantAccess({ user: '<@BOB>' }, makeSession(), db);
-    expect(isMember('slack-illysium:BOB', 'ag-illie')).toBe(true);
+    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(true);
     expect(notifyCalls.at(-1)?.text).toMatch(/Granted member access/);
   });
 
@@ -224,18 +239,18 @@ describe('handleGrantAccess', () => {
     const db = inboundDb();
     insertChatInbound(db, { senderId: 'OWNER' });
     await handleGrantAccess({ user: '<@BOB>', role: 'admin' }, makeSession(), db);
-    expect(isAdminOfAgentGroup('slack-illysium:BOB', 'ag-illie')).toBe(true);
+    expect(isAdminOfAgentGroup('slack-example-labs:BOB', 'ag-helper')).toBe(true);
   });
 
   it('scoped admin can grant member but NOT admin', async () => {
     const db = inboundDb();
     insertChatInbound(db, { senderId: 'SADMIN' });
     await handleGrantAccess({ user: '<@BOB>' }, makeSession(), db);
-    expect(isMember('slack-illysium:BOB', 'ag-illie')).toBe(true);
+    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(true);
 
     insertChatInbound(db, { senderId: 'SADMIN' });
     await handleGrantAccess({ user: '<@CAROL>', role: 'admin' }, makeSession(), db);
-    expect(isAdminOfAgentGroup('slack-illysium:CAROL', 'ag-illie')).toBe(false);
+    expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(false);
     expect(notifyCalls.at(-1)?.text).toMatch(/only owner \/ global admin can grant `admin`/);
   });
 
@@ -243,7 +258,7 @@ describe('handleGrantAccess', () => {
     const db = inboundDb();
     insertChatInbound(db, { senderId: 'STRANGER' });
     await handleGrantAccess({ user: '<@BOB>' }, makeSession(), db);
-    expect(isMember('slack-illysium:BOB', 'ag-illie')).toBe(false);
+    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(false);
     expect(notifyCalls.at(-1)?.text).toMatch(/denied: you don't have authority/);
   });
 
@@ -251,7 +266,7 @@ describe('handleGrantAccess', () => {
     const db = inboundDb();
     insertChatInbound(db, { senderId: 'SADMIN' });
     await handleGrantAccess({ user: '<@BOB>', agentGroupId: 'ag-other' }, makeSession(), db);
-    expect(isMember('slack-illysium:BOB', 'ag-other')).toBe(false);
+    expect(isMember('slack-example-labs:BOB', 'ag-other')).toBe(false);
   });
 
   it('rejects unknown agent groups', async () => {
@@ -273,25 +288,25 @@ describe('handleGrantAccess', () => {
 
 describe('handleRevokeAccess', () => {
   it('owner can revoke a member', async () => {
-    addMember({ user_id: 'slack-illysium:BOB', agent_group_id: 'ag-illie', added_by: null, added_at: now() });
+    addMember({ user_id: 'slack-example-labs:BOB', agent_group_id: 'ag-helper', added_by: null, added_at: now() });
     const db = inboundDb();
     insertChatInbound(db, { senderId: 'OWNER' });
     await handleRevokeAccess({ user: '<@BOB>' }, makeSession(), db);
-    expect(isMember('slack-illysium:BOB', 'ag-illie')).toBe(false);
+    expect(isMember('slack-example-labs:BOB', 'ag-helper')).toBe(false);
   });
 
   it('scoped admin cannot revoke another admin', async () => {
     grantRole({
-      user_id: 'slack-illysium:CAROL',
+      user_id: 'slack-example-labs:CAROL',
       role: 'admin',
-      agent_group_id: 'ag-illie',
+      agent_group_id: 'ag-helper',
       granted_by: null,
       granted_at: now(),
     });
     const db = inboundDb();
     insertChatInbound(db, { senderId: 'SADMIN' });
     await handleRevokeAccess({ user: '<@CAROL>' }, makeSession(), db);
-    expect(isAdminOfAgentGroup('slack-illysium:CAROL', 'ag-illie')).toBe(true);
+    expect(isAdminOfAgentGroup('slack-example-labs:CAROL', 'ag-helper')).toBe(true);
     expect(notifyCalls.at(-1)?.text).toMatch(/only a global admin can revoke another admin/);
   });
 
@@ -299,20 +314,20 @@ describe('handleRevokeAccess', () => {
     const db = inboundDb();
     insertChatInbound(db, { senderId: 'GADMIN' });
     await handleRevokeAccess({ user: '<@OWNER>' }, makeSession(), db);
-    expect(isOwner('slack-illysium:OWNER')).toBe(true);
+    expect(isOwner('slack-example-labs:OWNER')).toBe(true);
     expect(notifyCalls.at(-1)?.text).toMatch(/owner revocation must be done by direct edit/);
   });
 });
 
 describe('handleListAccess', () => {
   it('lists owners, global admins, scoped admins, members', async () => {
-    addMember({ user_id: 'slack-illysium:BOB', agent_group_id: 'ag-illie', added_by: null, added_at: now() });
+    addMember({ user_id: 'slack-example-labs:BOB', agent_group_id: 'ag-helper', added_by: null, added_at: now() });
     await handleListAccess({}, makeSession(), inboundDb());
     const text = notifyCalls.at(-1)?.text ?? '';
-    expect(text).toMatch(/Access for `ag-illie`/);
-    expect(text).toMatch(/slack-illysium:OWNER/);
-    expect(text).toMatch(/slack-illysium:GADMIN/);
-    expect(text).toMatch(/slack-illysium:SADMIN/);
-    expect(text).toMatch(/slack-illysium:BOB/);
+    expect(text).toMatch(/Access for `ag-helper`/);
+    expect(text).toMatch(/slack-example-labs:OWNER/);
+    expect(text).toMatch(/slack-example-labs:GADMIN/);
+    expect(text).toMatch(/slack-example-labs:SADMIN/);
+    expect(text).toMatch(/slack-example-labs:BOB/);
   });
 });

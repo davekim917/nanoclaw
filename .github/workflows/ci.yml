@@ -3,6 +3,8 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
 
 jobs:
   ci:
@@ -27,6 +29,9 @@ jobs:
 
       - name: Format check
         run: pnpm run format:check
+
+      - name: Public repository boundary
+        run: pnpm run check:public-boundary -- --portable
 
       - name: Typecheck host
         run: pnpm exec tsc --noEmit
