@@ -120,13 +120,44 @@ function resolveStructuredCredential(
 export class ClaudeStructuredHttpError extends Error {
   readonly status: number;
   readonly retryAfterMs: number | null;
+  readonly providerErrorType: string | null;
+  readonly requestId: string | null;
 
-  constructor(status: number, retryAfterMs: number | null) {
-    super(`structured Claude call returned ${status}`);
+  constructor(
+    status: number,
+    retryAfterMs: number | null,
+    options: { providerErrorType?: string | null; providerMessage?: string | null; requestId?: string | null } = {},
+  ) {
+    const providerErrorType = options.providerErrorType?.trim() || null;
+    const providerMessage = options.providerMessage?.replace(/\s+/g, ' ').trim().slice(0, 500) || null;
+    const detail = [providerErrorType, providerMessage].filter(Boolean).join(': ');
+    super(`structured Claude call returned ${status}${detail ? ` (${detail})` : ''}`);
     this.name = 'ClaudeStructuredHttpError';
     this.status = status;
     this.retryAfterMs = retryAfterMs;
+    this.providerErrorType = providerErrorType;
+    this.requestId = options.requestId?.trim() || null;
   }
+}
+
+async function claudeHttpError(response: Response): Promise<ClaudeStructuredHttpError> {
+  let providerErrorType: string | null = null;
+  let providerMessage: string | null = null;
+  try {
+    const body = (await response.json()) as {
+      error?: { type?: unknown; message?: unknown };
+    };
+    providerErrorType = typeof body.error?.type === 'string' ? body.error.type : null;
+    providerMessage = typeof body.error?.message === 'string' ? body.error.message : null;
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    // Status, retry timing, and request id still make a non-JSON failure actionable.
+  }
+  return new ClaudeStructuredHttpError(response.status, parseRetryAfterMs(response.headers.get('retry-after')), {
+    providerErrorType,
+    providerMessage,
+    requestId: response.headers.get('request-id') ?? response.headers.get('x-request-id'),
+  });
 }
 
 function parseRetryAfterMs(value: string | null, nowMs = Date.now()): number | null {
@@ -189,7 +220,7 @@ export async function callClaudeStructured<T>(
       signal: controller.signal,
     });
     if (!response.ok) {
-      throw new ClaudeStructuredHttpError(response.status, parseRetryAfterMs(response.headers.get('retry-after')));
+      throw await claudeHttpError(response);
     }
     const data = (await response.json()) as {
       model?: string;

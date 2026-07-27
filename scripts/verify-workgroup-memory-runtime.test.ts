@@ -162,7 +162,7 @@ function writeInbound(
   agentGroupId: string,
   sessionId: string,
   messagingGroupId: string,
-  options: { omitRecall?: boolean; malformedRecall?: boolean } = {},
+  options: { omitRecall?: boolean; malformedRecall?: boolean; omitTrustedCapabilities?: boolean } = {},
 ): void {
   const dir = path.join(root, 'data', 'v2-sessions', agentGroupId, sessionId);
   fs.mkdirSync(dir, { recursive: true });
@@ -202,7 +202,9 @@ function writeInbound(
       ? { subtype: 'recall_context', trustedCapabilities: { agentGroupId: 'foreign', services: [] } }
       : {
           subtype: 'recall_context',
-          trustedCapabilities: { agentGroupId, services: [{ name: `safe-for:${messagingGroupId}` }] },
+          ...(options.omitTrustedCapabilities
+            ? {}
+            : { trustedCapabilities: { agentGroupId, services: [{ name: `safe-for:${messagingGroupId}` }] } }),
           memoryEvidence: { core: [], excerpts: [] },
           conversationEvidence: { excerpts: [] },
           notices: [],
@@ -263,7 +265,7 @@ function seedAppliedWorkgroup(
   root: string,
   db: Database.Database,
   workgroupId = 'house',
-  options: { omitRecall?: boolean; malformedRecall?: boolean } = {},
+  options: { omitRecall?: boolean; malformedRecall?: boolean; omitTrustedCapabilities?: boolean } = {},
 ): void {
   const dataDir = path.join(root, 'data');
   const groupsDir = path.join(root, 'groups');
@@ -482,6 +484,25 @@ describe('verify-workgroup-memory-runtime', () => {
     expect(result.stdout).not.toContain('SipTrue DNS is managed in Wix');
     expect(result.stdout).not.toContain('GSC data is queried in Snowflake');
     expect(filesystemFingerprint(root)).toBe(before);
+  }, 15_000);
+
+  it('accepts a complete warm-turn recall payload without repeated capabilities', () => {
+    const root = mkRoot();
+    const db = centralDb(root);
+    seedAppliedWorkgroup(root, db, 'house', { omitTrustedCapabilities: true });
+    db.close();
+
+    const result = run(root, ['--all', '--json', '--require-applied-migration']);
+
+    expect(result.status).toBe(0);
+    expect(result.json.status).toBe('clean');
+    expect(result.json.workgroups[0]!.sessions).toContainEqual(
+      expect.objectContaining({
+        id: 'session-1',
+        status: 'clean',
+        pairs: expect.objectContaining({ applicableTriggers: 1, complete: 1 }),
+      }),
+    );
   }, 15_000);
 
   it('makes curator queue readiness an explicit activation gate without requiring a generated file', () => {

@@ -36,7 +36,7 @@ type Severity = 'warning' | 'failure';
 const MAX_JSON_BYTES = 64 * 1024 * 1024;
 const MAX_SESSION_ROWS = 100_000;
 const MAX_NATIVE_PROJECT_DIRS = 512;
-const STRUCTURED_RECALL_KEYS = ['trustedCapabilities', 'memoryEvidence', 'conversationEvidence', 'notices'] as const;
+const REQUIRED_RECALL_KEYS = ['memoryEvidence', 'conversationEvidence', 'notices'] as const;
 
 export interface VerificationIssue {
   code: string;
@@ -456,7 +456,8 @@ function markdownRelativeTargets(content: string): string[] {
       if (!withoutSuffix) continue;
       try {
         targets.push(decodeURIComponent(withoutSuffix));
-      } catch {
+      } catch (error) {
+        if (!(error instanceof URIError)) throw error;
         targets.push(withoutSuffix);
       }
     }
@@ -873,14 +874,9 @@ function parseRecall(row: InboundRow): Record<string, unknown> | null {
 
 function isStructuredRecallRow(row: InboundRow): boolean {
   const payload = parseRecall(row);
-  const trusted =
-    payload?.trustedCapabilities !== null &&
-    typeof payload?.trustedCapabilities === 'object' &&
-    !Array.isArray(payload?.trustedCapabilities);
   return (
     payload?.subtype === 'recall_context' &&
-    STRUCTURED_RECALL_KEYS.every((key) => Object.prototype.hasOwnProperty.call(payload, key)) &&
-    trusted
+    REQUIRED_RECALL_KEYS.every((key) => Object.prototype.hasOwnProperty.call(payload, key))
   );
 }
 
@@ -932,8 +928,9 @@ function verifyRecallPair(
   if (
     !payload ||
     payload.subtype !== 'recall_context' ||
-    STRUCTURED_RECALL_KEYS.some((key) => !Object.prototype.hasOwnProperty.call(payload, key)) ||
-    trusted?.agentGroupId !== session.agent_group_id
+    REQUIRED_RECALL_KEYS.some((key) => !Object.prototype.hasOwnProperty.call(payload, key)) ||
+    (Object.prototype.hasOwnProperty.call(payload, 'trustedCapabilities') &&
+      trusted?.agentGroupId !== session.agent_group_id)
   ) {
     reject('recall-payload-incomplete');
   }

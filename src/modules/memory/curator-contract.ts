@@ -57,6 +57,8 @@ const MEMORY_MARKER =
   /<!--\s*nanoclaw-memory:id=(mem_[a-f0-9]{16});evidence=([A-Za-z0-9_.:@/-]+(?:,[A-Za-z0-9_.:@/-]+)*);captured=([^;\s]+)\s*-->/g;
 
 export const CURATOR_OUTPUT_SCHEMA = {
+  // Keep provider-facing JSON Schema to Anthropic's supported constrained-decoding
+  // subset. Collection limits are enforced below against the parsed response.
   type: 'object',
   additionalProperties: false,
   required: ['action', 'evidenceIds', 'reasonCode'],
@@ -64,13 +66,11 @@ export const CURATOR_OUTPUT_SCHEMA = {
     action: { type: 'string', enum: ['noop', 'replace_generated_memory'] },
     evidenceIds: {
       type: 'array',
-      maxItems: CURATOR_MAX_EVIDENCE_IDS,
       items: { type: 'string' },
     },
     reasonCode: { type: 'string', enum: CURATOR_REASON_CODES },
     supersedesMemoryIds: {
       type: 'array',
-      maxItems: CURATOR_MAX_SUPERSESSIONS,
       items: { type: 'string' },
     },
     content: { type: 'string' },

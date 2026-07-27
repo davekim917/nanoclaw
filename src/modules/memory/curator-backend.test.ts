@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { callClaudeStructured, listClaudeStructuredCredentialSlots } from '../../llm.js';
+import { CURATOR_OUTPUT_SCHEMA } from './curator-contract.js';
 import {
   type CuratorModelCall,
   MEMORY_CURATOR_EFFORT,
@@ -85,6 +86,10 @@ describe('memory curator backend', () => {
     expect(result.value).toEqual({ action: 'noop' });
   });
 
+  it('keeps unsupported collection limits out of the raw structured-output schema', () => {
+    expect(JSON.stringify(CURATOR_OUTPUT_SCHEMA)).not.toContain('maxItems');
+  });
+
   it('fails closed on model drift, refusal, and HTTP errors', async () => {
     const request = {
       model: 'claude-sonnet-5',
@@ -125,8 +130,20 @@ describe('memory curator backend', () => {
     await expect(
       callClaudeStructured(request, {
         env: { CLAUDE_CODE_OAUTH_TOKEN: 'primary-secret' },
-        fetch: async () => new Response('', { status: 429 }),
+        fetch: async () =>
+          new Response(
+            JSON.stringify({
+              type: 'error',
+              error: { type: 'rate_limit_error', message: 'Please retry later' },
+            }),
+            { status: 429, headers: { 'request-id': 'req_test' } },
+          ),
       }),
-    ).rejects.toThrow(/429/);
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/429.*rate_limit_error.*Please retry later/),
+      status: 429,
+      providerErrorType: 'rate_limit_error',
+      requestId: 'req_test',
+    });
   });
 });
