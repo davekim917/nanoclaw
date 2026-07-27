@@ -21,6 +21,30 @@ export interface CuratorWriteResult {
   error?: string;
 }
 
+export function resolveBunBinary(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = env.BUN_BIN?.trim();
+  const candidates = [
+    explicit || null,
+    env.HOME ? path.join(env.HOME, '.bun', 'bin', 'bun') : null,
+    ...(env.PATH ?? '')
+      .split(path.delimiter)
+      .filter(Boolean)
+      .map((directory) => path.join(directory, 'bun')),
+  ].filter((candidate): candidate is string => candidate !== null);
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EACCES' || (error as NodeJS.ErrnoException).code === 'ENOENT') {
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error('memory writer requires an executable Bun runtime');
+}
+
 function generatedPath(workgroupId: string): string {
   return path.join(workgroupMemoryDir(workgroupId), GENERATED_MEMORY_RELATIVE_PATH);
 }
@@ -137,8 +161,9 @@ function snapshotCurrent(
 async function invokeHelper(request: Record<string, unknown>): Promise<CuratorWriteResult> {
   const body = JSON.stringify(request);
   if (Buffer.byteLength(body) > 80 * 1024) throw new Error('curator write request exceeds 80 KiB');
+  const bunBinary = resolveBunBinary();
   return await new Promise((resolve, reject) => {
-    const child = spawn('bun', [HELPER_PATH], {
+    const child = spawn(bunBinary, [HELPER_PATH], {
       cwd: path.dirname(HELPER_PATH),
       env: { PATH: process.env.PATH ?? '' },
       stdio: ['pipe', 'pipe', 'pipe'],

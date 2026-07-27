@@ -254,6 +254,7 @@ function hasVerifiedManifest(workgroupId: string, dataDir: string): boolean {
       version?: number;
       workgroupId?: string;
       status?: string;
+      reportPath?: string;
       snapshotDir?: string;
       canonicalSha256?: string;
     };
@@ -261,11 +262,14 @@ function hasVerifiedManifest(workgroupId: string, dataDir: string): boolean {
       manifest.version === 1 &&
       manifest.workgroupId === workgroupId &&
       manifest.status === 'applied' &&
+      typeof manifest.reportPath === 'string' &&
+      path.isAbsolute(manifest.reportPath) &&
+      fs.existsSync(manifest.reportPath) &&
       typeof manifest.snapshotDir === 'string' &&
       path.isAbsolute(manifest.snapshotDir) &&
       fs.existsSync(manifest.snapshotDir) &&
       typeof manifest.canonicalSha256 === 'string' &&
-      manifest.canonicalSha256 === memoryTreeSha256(workgroupMemoryDir(workgroupId, dataDir))
+      /^[a-f0-9]{64}$/.test(manifest.canonicalSha256)
     );
   } catch (error) {
     if (!(error instanceof Error)) throw error;

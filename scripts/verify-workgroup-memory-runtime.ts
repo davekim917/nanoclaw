@@ -524,6 +524,7 @@ function verifyMigrationOutcomes(
   sources: MigrationSource[],
   snapshots: SnapshotEntry[],
   outcomes: MigrationOutcome[],
+  verifyLiveCanonical: boolean,
   issues: VerificationIssue[],
 ): void {
   const expectedLeaves = sources
@@ -551,15 +552,17 @@ function verifyMigrationOutcomes(
       failure(issues, 'canonical-outcome-mismatch', workgroupId);
       continue;
     }
-    const actual = inspectLeaf(destination);
-    if (
-      !actual ||
-      actual.type !== entry.type ||
-      actual.size !== entry.size ||
-      actual.sha256 !== entry.sha256 ||
-      actual.linkTarget !== entry.linkTarget
-    ) {
-      failure(issues, 'canonical-outcome-mismatch', workgroupId);
+    if (verifyLiveCanonical) {
+      const actual = inspectLeaf(destination);
+      if (
+        !actual ||
+        actual.type !== entry.type ||
+        actual.size !== entry.size ||
+        actual.sha256 !== entry.sha256 ||
+        actual.linkTarget !== entry.linkTarget
+      ) {
+        failure(issues, 'canonical-outcome-mismatch', workgroupId);
+      }
     }
   }
 
@@ -594,6 +597,7 @@ function verifyMigration(
   canonicalPath: string,
   canonicalSha256: string | null,
   roots: { dbPath: string; dataDir: string; groupsDir: string },
+  verifyLiveCanonical: boolean,
   issues: VerificationIssue[],
 ): RuntimeWorkgroupVerification['migration'] & { activationAt: number | null } {
   const markerPath = workgroupMemoryManifestPath(workgroupId, roots.dataDir);
@@ -654,7 +658,11 @@ function verifyMigration(
       activationAt,
     };
   }
-  if (!canonicalSha256 || marker.canonicalSha256 !== canonicalSha256) {
+  if (
+    typeof marker.canonicalSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(marker.canonicalSha256) ||
+    (verifyLiveCanonical && (!canonicalSha256 || marker.canonicalSha256 !== canonicalSha256))
+  ) {
     failure(issues, 'canonical-checksum-mismatch', workgroupId);
   }
 
@@ -713,6 +721,7 @@ function verifyMigration(
       migration.sources,
       migration.snapshotEntries,
       migration.outcomes,
+      verifyLiveCanonical,
       issues,
     );
   } catch (error) {
@@ -1319,7 +1328,7 @@ function verifyWorkgroup(
   }
 
   const migrationWithActivation = canonicalPath
-    ? verifyMigration(workgroupId, canonicalPath, canonicalSha256, roots, issues)
+    ? verifyMigration(workgroupId, canonicalPath, canonicalSha256, roots, requireAppliedMigration, issues)
     : {
         status: 'invalid' as const,
         markerPath: '',

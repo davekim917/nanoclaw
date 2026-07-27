@@ -98,6 +98,9 @@ Provider-namespaced archive IDs may be cited by their raw platform ID only when
 that shorthand resolves to exactly one allowed row; ambiguous or invented IDs
 still fail closed.
 Failures leave both the pending episode and existing memory intact.
+The host resolves the shared Bun compare-and-swap helper from an explicit
+`BUN_BIN`, the service account's standard `~/.bun/bin/bun` install, or `PATH`;
+a minimal systemd `PATH` therefore cannot strand an accepted capture.
 
 The host discovers every distinct configured Claude OAuth slot and selects
 among them with a persisted round-robin cursor. A 401, 403, or 429 marks only
@@ -220,4 +223,10 @@ source path types and checksums before restart.
 The verifier is activation-oriented: `activationBlocking: false` and zero
 failures are required. It may separately report explicit non-blocking warnings
 for historical state outside the memory cutover, such as an already-missing
-session DB or a workgroup with no current members.
+session DB or a workgroup with no current members. The migration marker's
+canonical checksum is a point-in-time cutover attestation, not a lock on the
+living memory tree. Ordinary runtime verification validates the marker,
+permanent snapshot, report, shared views, current generated document, and
+queue without treating later authorized memory writes as migration corruption.
+Use `--require-applied-migration` only at the cutover boundary when the live
+canonical tree must still match the just-applied migration byte for byte.

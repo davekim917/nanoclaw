@@ -19,6 +19,7 @@ vi.mock('../../config.js', async (importOriginal) => ({
 import {
   listGeneratedMemorySnapshots,
   readGeneratedMemory,
+  resolveBunBinary,
   restoreGeneratedMemorySnapshot,
   writeGeneratedMemory,
 } from './curator-write.js';
@@ -66,6 +67,19 @@ afterEach(() => {
 });
 
 describe('host generated-memory writer', () => {
+  it('resolves Bun from the service HOME even when systemd PATH omits it', () => {
+    const serviceHome = path.join('/tmp', `${TEST_WORKGROUP}-service-home`);
+    const bun = path.join(serviceHome, '.bun', 'bin', 'bun');
+    fs.mkdirSync(path.dirname(bun), { recursive: true });
+    fs.writeFileSync(bun, '#!/bin/sh\n');
+    fs.chmodSync(bun, 0o700);
+    try {
+      expect(resolveBunBinary({ HOME: serviceHome, PATH: '/usr/local/bin:/usr/bin:/bin' })).toBe(bun);
+    } finally {
+      fs.rmSync(serviceHome, { recursive: true, force: true });
+    }
+  });
+
   it('safely creates the generated directory on the first accepted capture', async () => {
     fs.rmSync(path.join(TEST_ROOT, 'workgroups', TEST_WORKGROUP, 'memory', 'generated'), {
       recursive: true,

@@ -571,6 +571,51 @@ describe('verify-workgroup-memory-runtime', () => {
     });
   }, 15_000);
 
+  it('allows authorized post-cutover memory writes without weakening the explicit cutover gate', () => {
+    const root = mkRoot();
+    const db = centralDb(root);
+    seedAppliedWorkgroup(root, db);
+    db.close();
+    seedCuratorArchive(root);
+
+    const canon = path.join(root, 'data', 'workgroups', 'house', 'memory');
+    fs.appendFileSync(path.join(canon, 'index.md'), '\nAuthorized foreground memory.\n');
+    const generated = path.join(canon, 'generated');
+    fs.mkdirSync(generated);
+    fs.writeFileSync(
+      path.join(generated, 'memory.md'),
+      [
+        '# Generated workgroup memory',
+        '',
+        '- Authorized background memory. <!-- nanoclaw-memory:id=mem_0123456789abcdef;evidence=platform:message-1;captured=2026-07-26T02:00:00.000Z -->',
+        '',
+      ].join('\n'),
+    );
+
+    const runtime = run(root, ['--workgroup', 'house', '--json', '--require-curator-ready']);
+    expect(runtime.status, runtime.stdout).toBe(0);
+    expect(runtime.json.workgroups[0]).toMatchObject({
+      status: 'clean',
+      migration: { status: 'verified-applied' },
+      curator: { generated: { status: 'verified', activeMemoryIds: 1 } },
+    });
+    expect(runtime.json.workgroups[0]!.issues).not.toContainEqual(
+      expect.objectContaining({ code: 'canonical-checksum-mismatch' }),
+    );
+    expect(runtime.json.workgroups[0]!.issues).not.toContainEqual(
+      expect.objectContaining({ code: 'canonical-outcome-mismatch' }),
+    );
+
+    const cutover = run(root, ['--workgroup', 'house', '--json', '--require-applied-migration']);
+    expect(cutover.status).toBe(1);
+    expect(cutover.json.workgroups[0]!.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: 'canonical-checksum-mismatch', severity: 'failure' }),
+        expect.objectContaining({ code: 'canonical-outcome-mismatch', severity: 'failure' }),
+      ]),
+    );
+  }, 15_000);
+
   it('fails closed on malformed or secret-bearing generated memory', () => {
     const root = mkRoot();
     const db = centralDb(root);
@@ -906,7 +951,7 @@ describe('verify-workgroup-memory-runtime', () => {
       'tampered\n',
     );
 
-    const result = run(root, ['--workgroup', 'house', '--json']);
+    const result = run(root, ['--workgroup', 'house', '--json', '--require-applied-migration']);
     const codes = result.json.workgroups[0]!.issues.map((issue) => issue.code);
 
     expect(result.status).toBe(1);

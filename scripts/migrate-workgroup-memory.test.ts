@@ -868,7 +868,7 @@ describe('migrate-workgroup-memory', () => {
     expect(fs.readFileSync(path.join(outside, 'sentinel.txt'), 'utf8')).toBe('untouched\n');
   });
 
-  it('treats an applied manifest as verified only while the canonical checksum still matches', () => {
+  it('treats an applied manifest as historical cutover proof after authorized runtime writes', () => {
     const source = path.join(groupsDir, 'alpha', 'memory');
     fs.mkdirSync(source);
     fs.writeFileSync(path.join(source, 'fact.md'), 'snapshotted\n');
@@ -882,7 +882,7 @@ describe('migrate-workgroup-memory', () => {
     fs.appendFileSync(path.join(dataDir, 'workgroups', 'alpha', 'memory', 'fact.md'), 'later\n');
     expect(inspectWorkgroupMemoryState(db, 'alpha', { groupsDir, dataDir })).toEqual({
       status: 'canonical',
-      basis: 'exact-links-and-canon',
+      basis: 'verified-manifest',
     });
   });
 
