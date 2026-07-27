@@ -127,7 +127,7 @@ describe('container instruction contracts', () => {
   it('keeps nested-container Codex delegation on the supported foreground transport', () => {
     const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
     expect(instructions).toContain('codex exec --yolo');
-    expect(instructions).toContain("`timeout` to `3600000`");
+    expect(instructions).toContain('`timeout` to `3600000`');
     expect(instructions).not.toContain('`timeout` to `600000`');
     expect(instructions).not.toContain('team-qa/team-review');
   });
