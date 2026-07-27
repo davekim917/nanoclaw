@@ -128,6 +128,63 @@ describe('memory curator worker', () => {
     expect(d.finishCall).toHaveBeenCalledWith(expect.any(String), 'memory_written');
   });
 
+  it('repairs one overlong semantic candidate before advancing the cursor', async () => {
+    const curate = vi
+      .fn()
+      .mockResolvedValueOnce({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'x'.repeat(1_001), evidenceIds: ['msg-1'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 400, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      } satisfies CuratorBackendResult)
+      .mockResolvedValueOnce({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'GSC data is in Snowflake.', evidenceIds: ['msg-1'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      } satisfies CuratorBackendResult);
+    const d = deps({ curate });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report?.action).toBe('replace_generated_memory');
+    expect(curate).toHaveBeenCalledTimes(2);
+    expect(curate.mock.calls[1]?.[0]).toContain('at most 1000 characters');
+    expect(d.finishCall).toHaveBeenNthCalledWith(1, expect.any(String), 'validation_retry');
+    expect(d.finishCall).toHaveBeenNthCalledWith(2, expect.any(String), 'memory_written');
+    expect(d.complete).toHaveBeenCalledOnce();
+    expect(d.fail).not.toHaveBeenCalled();
+  });
+
+  it('retains the episode when the single length-repair attempt is still invalid', async () => {
+    const curate = vi.fn(
+      async (): Promise<CuratorBackendResult> => ({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'x'.repeat(1_001), evidenceIds: ['msg-1'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 400, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      }),
+    );
+    const d = deps({ curate });
+    expect(await new MemoryCuratorWorker(d).runOne(1000)).toBeNull();
+    expect(curate).toHaveBeenCalledTimes(2);
+    expect(d.complete).not.toHaveBeenCalled();
+    expect(d.fail).toHaveBeenCalledOnce();
+  });
+
   it('does not advance on provider, validation, or write conflict failures', async () => {
     const failureCases: Array<Partial<MemoryCuratorWorkerDependencies>> = [
       { curate: vi.fn(async () => Promise.reject(new Error('structured Claude call returned 429'))) },

@@ -94,6 +94,9 @@ rendered document, scrubs secrets, and promotes through the same workgroup lock
 and SHA compare-and-swap writer used by sibling agents. A model's heading,
 bullet, marker, ID, or timestamp spelling therefore cannot block a valid
 capture because those fields are not part of the model contract.
+If a semantic candidate exceeds the 1,000-character limit, the curator gets
+one bounded repair attempt before the durable episode is retained for retry;
+content is never silently truncated or discarded.
 Provider-namespaced archive IDs may be cited by their raw platform ID only when
 that shorthand resolves to exactly one allowed row; ambiguous or invented IDs
 still fail closed.

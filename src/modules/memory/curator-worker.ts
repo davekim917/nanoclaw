@@ -30,6 +30,7 @@ import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 import { MemoryCuratorBackend, MEMORY_CURATOR_EFFORT, type CuratorBackendResult } from './curator-backend.js';
 import {
   buildCuratorPrompt,
+  CURATOR_MAX_MEMORY_TEXT_CHARS,
   parseGeneratedMemoryFacts,
   validateCuratorDecision,
   type CuratorDecision,
@@ -296,6 +297,10 @@ interface SuccessfulModelAttempt<T> {
   callId: string;
 }
 
+function isRepairableLengthViolation(error: unknown): boolean {
+  return error instanceof Error && error.message === 'curator memory text exceeds the maximum';
+}
+
 export class MemoryCuratorWorker {
   constructor(private readonly deps: MemoryCuratorWorkerDependencies = actualDependencies()) {}
 
@@ -349,22 +354,41 @@ export class MemoryCuratorWorker {
         relevantManualMemory: manual,
         boundary: this.deps.uuid().replaceAll('-', ''),
       });
-      const attempt = await this.runModelWithFailover(
-        'memory-curator',
-        episode.workgroupId,
-        credentials,
-        nowMs,
-        (slot) => this.deps.curate(prompt.system, prompt.user, slot, signal),
+      let attempt = await this.runModelWithFailover('memory-curator', episode.workgroupId, credentials, nowMs, (slot) =>
+        this.deps.curate(prompt.system, prompt.user, slot, signal),
       );
       callId = attempt.callId;
-      const backend = attempt.result;
+      let backend = attempt.result;
       const priorEvidence = parseGeneratedMemoryFacts(generated.content).flatMap((fact) => fact.evidenceIds);
       const allowedEvidenceIds = new Set([...priorEvidence, ...bounded.messages.map((message) => message.id)]);
-      const decision = validateCuratorDecision(backend.decision, {
+      const validationContext = {
         currentContent: generated.content,
         allowedEvidenceIds,
         currentEpisodeEvidence: new Map(bounded.messages.map((message) => [message.id, message.sentAt])),
-      });
+      };
+      let decision: CuratorDecision;
+      try {
+        decision = validateCuratorDecision(backend.decision, validationContext);
+      } catch (error) {
+        if (!isRepairableLengthViolation(error)) throw error;
+        this.deps.finishCall(callId, 'validation_retry');
+        callId = null;
+        const repairSystem = [
+          prompt.system,
+          'Your previous structured response was rejected because a memory candidate was too long.',
+          `Retry once. Every memory candidate text must be at most ${CURATOR_MAX_MEMORY_TEXT_CHARS} characters while remaining self-contained. Do not omit a durable fact merely to satisfy this correction.`,
+        ].join('\n');
+        attempt = await this.runModelWithFailover(
+          'memory-curator-repair',
+          episode.workgroupId,
+          credentials,
+          nowMs,
+          (slot) => this.deps.curate(repairSystem, prompt.user, slot, signal),
+        );
+        callId = attempt.callId;
+        backend = attempt.result;
+        decision = validateCuratorDecision(backend.decision, validationContext);
+      }
       if (decision.action === 'replace_generated_memory') {
         const write = await this.deps.writeGenerated(episode.workgroupId, decision.content, generated.sha256, nowMs);
         if (write.status !== 'success') throw new Error(`memory write ${write.status}: ${write.error ?? 'unknown'}`);
