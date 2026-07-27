@@ -69,10 +69,17 @@ conversation episodes after five minutes of inactivity. This work is
 fire-and-forget from the 60-second host sweep: routing and delivery perform only
 the archive/queue transaction and never wait for a model call.
 
-The curator uses only `claude-sonnet-5` at medium effort, without tools,
-provider continuation, or fallback. Each job is bounded to 20 de-duplicated
-messages and 24,000 transcript characters, the current generated file, and up
-to three relevant manual-memory excerpts. Its default decision is `noop`.
+The curator uses only `claude-sonnet-5` at medium effort through Claude Code's
+subscription-aware, non-interactive runtime, without tools, provider
+continuation, prompt suggestions, or fallback. The selected OAuth slot is the
+child process's only Anthropic credential; the untrusted episode payload is
+sent over stdin, safe mode excludes project and user customizations, and the
+Anthropic model endpoint bypasses the OneCLI credential proxy so the gateway
+cannot replace the selected identity. The host also recovers the real primary
+from `.env` when the OneCLI service wrapper has shadowed it with its
+`placeholder` sentinel. Each job is bounded to 20 de-duplicated messages and
+24,000 transcript characters, the current generated file, and up to three
+relevant manual-memory excerpts. Its default decision is `noop`.
 It captures only durable decisions, corrections, stable cross-task
 preferences, verified outcomes, and durable workflows. It rejects secrets,
 capability state, transient work, speculation, third-party uncertainty, and

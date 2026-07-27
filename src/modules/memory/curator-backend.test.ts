@@ -1,6 +1,15 @@
+import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
+import type { ChildProcess, ExecFileException } from 'child_process';
+
 import { describe, expect, it, vi } from 'vitest';
 
-import { callClaudeStructured, listClaudeStructuredCredentialSlots } from '../../llm.js';
+import {
+  callClaudeCliStructured,
+  callClaudeStructured,
+  listClaudeStructuredCredentialSlots,
+  type ClaudeCliExecFile,
+} from '../../llm.js';
 import { CURATOR_OUTPUT_SCHEMA } from './curator-contract.js';
 import {
   type CuratorModelCall,
@@ -43,6 +52,154 @@ describe('memory curator backend', () => {
       }),
     ).toEqual(['oauth:primary', 'oauth:2']);
     expect(listClaudeStructuredCredentialSlots({ ANTHROPIC_API_KEY: 'api-key' })).toEqual(['api-key:primary']);
+    expect(
+      listClaudeStructuredCredentialSlots(
+        {
+          CLAUDE_CODE_OAUTH_TOKEN: 'placeholder',
+          CLAUDE_CODE_OAUTH_TOKEN_2: 'secondary',
+        },
+        { CLAUDE_CODE_OAUTH_TOKEN: 'recovered-primary' },
+      ),
+    ).toEqual(['oauth:primary', 'oauth:2']);
+  });
+
+  it('runs the curator through Claude Code with one isolated OAuth slot and stdin payload', async () => {
+    let stdin = '';
+    const execFile = vi.fn(((_command: string, _args: string[], _options, callback) => {
+      const child = new EventEmitter() as ChildProcess;
+      child.stdin = new PassThrough();
+      child.kill = vi.fn(() => true);
+      child.stdin.on('data', (chunk) => {
+        stdin += chunk.toString();
+      });
+      queueMicrotask(() => {
+        callback(
+          null,
+          JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            structured_output: { action: 'noop' },
+            usage: {
+              input_tokens: 7,
+              output_tokens: 3,
+              cache_read_input_tokens: 2,
+              cache_creation_input_tokens: 1,
+            },
+            modelUsage: { 'claude-sonnet-5': { inputTokens: 7, outputTokens: 3 } },
+          }),
+          '',
+        );
+      });
+      return child;
+    }) satisfies ClaudeCliExecFile);
+    const result = await callClaudeCliStructured<{ action: string }>(
+      {
+        model: 'claude-sonnet-5',
+        effort: 'medium',
+        system: 'fixed curator rules',
+        user: 'secret episode payload that must not enter argv',
+        schema: { type: 'object' },
+        maxTokens: 8192,
+        timeoutMs: 1000,
+      },
+      {
+        env: {
+          PATH: process.env.PATH,
+          NO_PROXY: 'localhost,127.0.0.1',
+          CLAUDE_BIN: '/opt/claude',
+          CLAUDE_CODE_OAUTH_TOKEN: 'primary-secret',
+          CLAUDE_CODE_OAUTH_TOKEN_2: 'secondary-secret',
+          CLAUDE_CODE_OAUTH_TOKEN_3: 'tertiary-secret',
+          ANTHROPIC_API_KEY: 'api-secret',
+        },
+        envFile: { CLAUDE_CODE_OAUTH_TOKEN: 'recovered-primary' },
+        credentialSlot: 'oauth:2',
+        execFile,
+      },
+    );
+    expect(result).toMatchObject({
+      value: { action: 'noop' },
+      model: 'claude-sonnet-5',
+      credentialSlot: 'oauth:2',
+      usage: {
+        inputTokens: 7,
+        outputTokens: 3,
+        cacheReadInputTokens: 2,
+        cacheCreationInputTokens: 1,
+      },
+    });
+    expect(stdin).toBe('secret episode payload that must not enter argv');
+    const [command, args, options] = execFile.mock.calls[0]!;
+    expect(command).toBe('/opt/claude');
+    expect(args).toEqual(
+      expect.arrayContaining([
+        '-p',
+        '--model',
+        'claude-sonnet-5',
+        '--effort',
+        'medium',
+        '--tools',
+        '',
+        '--safe-mode',
+        '--no-session-persistence',
+        '--prompt-suggestions',
+        'false',
+      ]),
+    );
+    expect(args).not.toContain('secret episode payload that must not enter argv');
+    expect(options.env).toMatchObject({
+      CLAUDE_CODE_OAUTH_TOKEN: 'secondary-secret',
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '8192',
+      NO_PROXY: 'localhost,127.0.0.1,api.anthropic.com',
+      no_proxy: 'localhost,127.0.0.1,api.anthropic.com',
+    });
+    expect(options.env).not.toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN_2');
+    expect(options.env).not.toHaveProperty('CLAUDE_CODE_OAUTH_TOKEN_3');
+    expect(options.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+  });
+
+  it('preserves Claude Code quota status so the worker can fail over slots', async () => {
+    const execFile = vi.fn(((_command: string, _args: string[], _options, callback) => {
+      const child = new EventEmitter() as ChildProcess;
+      child.stdin = new PassThrough();
+      child.kill = vi.fn(() => true);
+      queueMicrotask(() => {
+        callback(
+          Object.assign(new Error('exit 1'), { code: 1 }) as ExecFileException,
+          JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            is_error: true,
+            api_error_status: 429,
+            result: 'This request would exceed your account rate limit.',
+          }),
+          '',
+        );
+      });
+      return child;
+    }) satisfies ClaudeCliExecFile);
+    await expect(
+      callClaudeCliStructured(
+        {
+          model: 'claude-sonnet-5',
+          effort: 'medium',
+          system: 'system',
+          user: 'user',
+          schema: { type: 'object' },
+          maxTokens: 100,
+          timeoutMs: 1000,
+        },
+        {
+          env: { CLAUDE_CODE_OAUTH_TOKEN: 'primary-secret' },
+          credentialSlot: 'oauth:primary',
+          execFile,
+        },
+      ),
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/Claude CLI call failed/),
+      status: 429,
+    });
   });
 
   it('sends adaptive thinking plus schema and verifies the returned model', async () => {

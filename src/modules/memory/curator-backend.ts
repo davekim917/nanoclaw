@@ -1,4 +1,4 @@
-import { callClaudeStructured, type ClaudeCredentialSlot, type ClaudeStructuredResult } from '../../llm.js';
+import { callClaudeCliStructured, type ClaudeCredentialSlot, type ClaudeStructuredResult } from '../../llm.js';
 import {
   CURATOR_OUTPUT_SCHEMA,
   MEMORY_MAINTENANCE_OUTPUT_SCHEMA,
@@ -42,7 +42,7 @@ export interface MaintenanceBackendResult {
 }
 
 export class MemoryCuratorBackend {
-  constructor(private readonly call: CuratorModelCall = callClaudeStructured) {}
+  constructor(private readonly call: CuratorModelCall = callClaudeCliStructured) {}
 
   async curate(
     system: string,

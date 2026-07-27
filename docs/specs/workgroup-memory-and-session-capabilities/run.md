@@ -228,11 +228,10 @@
   archive and advance the episode cursor in one SQLite transaction. Router and
   delivery import only this synchronous scheduler; model work starts only from
   the fire-and-forget host-sweep pump.
-- Added the stateless Anthropic structured-output backend with exact returned
-  model enforcement, persisted OAuth round robin, one credential per HTTP
-  request, immediate sibling-key failover on 401/403/429, no tools, no model
-  fallback, adaptive thinking, medium effort, timeout, refusal handling, and
-  secret-scrubbed untrusted prompt boundaries.
+- Added the stateless structured-output backend with exact returned-model
+  enforcement, persisted OAuth round robin, immediate sibling-key failover on
+  401/403/429, no tools, no model fallback, medium effort, timeout, refusal
+  handling, and secret-scrubbed untrusted prompt boundaries.
 - Added evidence-bound decision validation, stable generated-memory IDs,
   correction-only supersession, active-ID preservation, secret and size
   rejection, and deterministic no-op normalization.
@@ -343,3 +342,33 @@
   members, 2,558 sessions, zero failures, and two existing warnings. The
   current service was not restarted, the curator flag remains absent, and the
   live queue schema is intentionally not initialized yet.
+
+## 2026-07-27 — subscription-aware curator transport correction
+
+- Live probes proved the second OAuth identity was distinct and healthy:
+  `claude-sonnet-5` / medium succeeded through Claude Code while the same
+  identity received HTTP 429 from a direct `/v1/messages` request. The raw API
+  and Claude subscription quota surfaces are therefore not interchangeable.
+- Replaced the curator's direct HTTP backend with the installed Claude Code
+  non-interactive structured-output runtime. Each child receives exactly one
+  selected OAuth identity, disables tools, customizations, persistence, and
+  prompt suggestions, and receives the untrusted episode payload over stdin.
+- Returned model usage must include the exact selected model, preserving the
+  no-fallback contract. CLI 401/403/429 status remains available to the durable
+  sibling-key failover logic.
+- A live service probe exposed a second transport boundary: the service-wide
+  OneCLI proxy replaced the child's selected OAuth identity with the host's
+  primary Anthropic credential. The curator child now adds the configured
+  Anthropic model host to both `NO_PROXY` forms. This matches the OneCLI
+  contract that model traffic uses its own login while third-party tool traffic
+  remains credential-gateway routed.
+- Credential discovery overlays the matching `.env` values on the live process
+  view and filters OneCLI's literal `placeholder` sentinel, using the same
+  recovery rule already required by container-agent OAuth rotation. Both real
+  operator OAuth identities therefore remain selectable inside the wrapped
+  host service.
+- Live activation then completed a queued episode through `oauth:2` with
+  outcome `noop`, cleared that slot's failure state, and advanced the durable
+  episode cursor from zero to archive row 6,094. The primary remained in its
+  genuine quota cooldown, no failed attempt advanced a cursor, and newly
+  arriving episodes remained queued.

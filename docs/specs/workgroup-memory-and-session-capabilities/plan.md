@@ -52,7 +52,7 @@ Default and only production curator:
 model:  claude-sonnet-5
 effort: medium
 tools:  none
-mode:   stateless structured-output request
+mode:   stateless Claude Code structured-output request
 fallback model: none
 ```
 
@@ -73,12 +73,14 @@ preferences, durable publish preferences, and unverified third-party claims.
 False-positive captures carried the largest penalty.
 
 Sonnet/medium and Terra/high tied on semantic correctness. Sonnet/medium wins
-the operational tie-break because NanoClaw already has a direct, proxy-aware
-Anthropic Messages path. Terra would require a persistent CLI subprocess and
-Codex auth sandbox for no measured quality or latency advantage. The selected
-model and effort are constants guarded by tests; changing either requires
-rerunning the versioned corpus. Runtime failures retry the same model and never
-silently fall back.
+the operational tie-break because NanoClaw already carries Claude Code and the
+operator's subscription OAuth identities. The curator must use that
+subscription-aware runtime rather than treating the raw Anthropic Messages API
+as equivalent: their quota surfaces are not interchangeable. Terra would
+require a separate Codex auth sandbox for no measured quality or latency
+advantage. The selected model and effort are constants guarded by tests;
+changing either requires rerunning the versioned corpus. Runtime failures retry
+the same model and never silently fall back.
 
 Automatic curation is guarded by `NANOCLAW_MEMORY_CURATOR_ENABLED` and defaults
 off. Service activation explicitly enables it after the preflight; this keeps
@@ -319,10 +321,12 @@ Acceptance:
 
 1. Add schema, prompt boundary, secret scrub, evidence validation, active-ID
    preservation, bounds, and deterministic no-op detection.
-2. Add the direct Anthropic structured-output call with explicit
-   `claude-sonnet-5`, `output_config.effort=medium`, no tools, timeout, returned
-   model check, persistent OAuth round robin, per-request credential pinning,
-   and immediate quota/auth failover.
+2. Add the Claude Code structured-output call with explicit
+   `claude-sonnet-5`, medium effort, no tools, safe mode, no session
+   persistence or prompt suggestions, timeout, returned-model usage check,
+   persistent OAuth round robin, per-process credential isolation, direct
+   model-endpoint routing outside the OneCLI credential proxy, and immediate
+   quota/auth failover.
 3. Add refusal, quota, timeout, malformed output, unknown evidence,
    prompt-injection, secret, and oversize tests.
 
