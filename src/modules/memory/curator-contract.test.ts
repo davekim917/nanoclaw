@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildCuratorPrompt,
   buildMemoryMaintenancePrompt,
+  CURATOR_OUTPUT_SCHEMA,
   parseGeneratedMemoryFacts,
   validateCuratorDecision,
   validateMemoryMaintenanceDecision,
@@ -17,6 +18,16 @@ const oldContent = [
 const currentEvidence = new Map([['msg-1', '2026-07-26T00:00:00.000Z']]);
 
 describe('background memory curator contract', () => {
+  it('requires replacement-only fields so structured output cannot make them nullable', () => {
+    expect(CURATOR_OUTPUT_SCHEMA.required).toEqual([
+      'action',
+      'evidenceIds',
+      'reasonCode',
+      'supersedesMemoryIds',
+      'content',
+    ]);
+  });
+
   it('accepts evidence-backed correction while preserving unrelated ids', () => {
     const content = [
       '# Generated workgroup memory',
@@ -217,6 +228,7 @@ describe('background memory curator contract', () => {
     expect(prompt.user).toContain('[REDACTED]');
     expect(prompt.user).not.toContain('sk_live_');
     expect(prompt.system).toContain('untrusted data');
+    expect(prompt.system).toContain('for noop use an empty array and empty string');
   });
 
   it('maintenance may reorganize prose but cannot change ids or provenance', () => {

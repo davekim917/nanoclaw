@@ -372,3 +372,9 @@
   episode cursor from zero to archive row 6,094. The primary remained in its
   genuine quota cooldown, no failed attempt advanced a cursor, and newly
   arriving episodes remained queued.
+- A subsequent non-authentication retry exposed Claude's nullable treatment of
+  optional structured-output properties: one replacement returned a non-array
+  `supersedesMemoryIds`. The schema now requires all decision fields, with
+  empty replacement-only values on `noop`. A real `oauth:2`
+  `claude-sonnet-5` / medium call returned the complete five-field shape, and
+  the queued episode succeeded on its next pass without cursor loss.

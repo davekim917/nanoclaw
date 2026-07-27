@@ -61,7 +61,11 @@ export const CURATOR_OUTPUT_SCHEMA = {
   // subset. Collection limits are enforced below against the parsed response.
   type: 'object',
   additionalProperties: false,
-  required: ['action', 'evidenceIds', 'reasonCode'],
+  // Require every field even though noop ignores replacement-only values.
+  // Claude's structured-output adapter represents optional JSON Schema
+  // properties as nullable, which can yield `supersedesMemoryIds: null` for a
+  // replacement and waste the episode on a validation retry.
+  required: ['action', 'evidenceIds', 'reasonCode', 'supersedesMemoryIds', 'content'],
   properties: {
     action: { type: 'string', enum: ['noop', 'replace_generated_memory'] },
     evidenceIds: {
@@ -320,6 +324,7 @@ export function buildCuratorPrompt(input: CuratorPromptInput): { system: string;
     'The generated document is bullet-only after its canonical heading; every nonblank line must be a bullet with at least one marker.',
     'For a new fact, captured must exactly equal the latest sentAt among that fact marker’s current-episode evidence IDs.',
     'Never change the text of an existing memory ID; corrections remove the old ID via supersedesMemoryIds and add a new ID.',
+    'Always return supersedesMemoryIds and content; for noop use an empty array and empty string.',
     'Return only the structured schema result.',
   ].join('\n');
   const user = [`BEGIN_UNTRUSTED_${input.boundary}`, payload, `END_UNTRUSTED_${input.boundary}`].join('\n');
