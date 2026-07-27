@@ -164,31 +164,29 @@ One job receives:
 - trusted timestamps, roles, archive IDs, and workgroup scope;
 - no tools, mounts, capability credentials, or arbitrary filesystem access.
 
-The model returns structured JSON:
+The model returns semantic structured JSON:
 
 ```typescript
-type CuratorDecision =
-  | { action: 'noop'; evidenceIds: string[]; reasonCode: string }
-  | {
-      action: 'replace_generated_memory';
-      evidenceIds: string[];
-      reasonCode: string;
-      supersedesMemoryIds: string[];
-      content: string;
-    };
+type CuratorModelDecision = {
+  action: 'noop' | 'replace_generated_memory';
+  reasonCode: string;
+  supersedesMemoryIds: string[];
+  memories: Array<{ text: string; evidenceIds: string[] }>;
+};
 ```
 
-The replacement is the complete new `generated/memory.md`. Every generated
-fact carries a stable memory ID, evidence IDs, and capture timestamp in a
-machine-readable HTML comment. After the canonical heading, every nonblank line
-is one bullet with exactly one provenance marker. A new fact must cite at least
-one current-episode archive row, and its capture timestamp must exactly equal
-the latest cited current-row timestamp. Existing active fact lines remain
-byte-identical unless the decision explicitly supersedes their IDs using
-current-episode evidence. The validator rejects malformed or duplicate IDs,
-unknown or prior-only evidence, invented timestamps, unmarked prose,
-secret-like content, oversized output, missing prior IDs, silent active-text
-rewrites, or no-op-equivalent replacements.
+The model never authors `generated/memory.md` or any part of its presentation.
+Each candidate is concise plain text backed by at least one current-episode
+archive row. The host normalizes candidate text, validates evidence, derives a
+stable content-addressed memory ID and trusted latest-evidence timestamp,
+preserves all existing active fact lines except explicitly superseded
+corrections, and renders the canonical heading, bullets, and one provenance
+marker per fact. The host then validates its own rendered document. It rejects
+unknown or prior-only evidence, presentation-marker injection, secret-like
+content, oversized output, unknown supersessions, non-correction supersession,
+and no-op-equivalent duplicates. Presentation wording cannot strand an episode
+because headings, bullets, IDs, timestamps, and markers are absent from the
+model output schema.
 
 ### Write isolation and rollback
 
@@ -220,19 +218,17 @@ curator stops new jobs but leaves recall and foreground writes intact.
 
 ### Periodic maintenance
 
-The same selected model performs dream-style maintenance when either:
+The host records a maintenance threshold when either:
 
 - 50 accepted generated updates have accumulated; or
 - `generated/memory.md` exceeds 48 KiB.
 
-Maintenance sees generated memory only. It may reorder or clarify fact prose
-but must retain one evidence-marked bullet per active ID and preserve the exact
-ID, evidence, and capture-timestamp sets. It writes a shadow candidate, runs
-structural and provenance-preservation validation, snapshots the current
-version, and promotes through the same compare-and-swap writer. A failed
-validation is discarded and retried later. Maintenance never touches
-manual/imported memory and never runs merely because time passed on an empty or
-unchanged store.
+The worker retires that threshold deterministically without a model call or
+write. The host renderer already emits the only supported flat canonical
+representation; asking a model to reorganize it would reintroduce a
+presentation-only failure path and cannot add facts. History and rollback still
+apply to every real generated-memory replacement. Maintenance never touches
+manual/imported memory.
 
 ## Failure semantics
 

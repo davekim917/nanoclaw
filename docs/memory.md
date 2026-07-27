@@ -85,12 +85,15 @@ preferences, verified outcomes, and durable workflows. It rejects secrets,
 capability state, transient work, speculation, third-party uncertainty, and
 facts recoverable from code or Graphify.
 
-Accepted output may replace only `generated/memory.md`. Every fact carries a
-stable memory ID plus archive evidence IDs and a capture timestamp. The host
-validates those IDs, preserves every active fact unless current evidence
-explicitly supersedes it, rejects unmarked prose, requires one provenance
-marker per bullet, scrubs secrets, and promotes through the same workgroup lock
-and SHA compare-and-swap writer used by sibling agents.
+The model returns semantic facts plus archive evidence IDs, never Markdown.
+The host owns the complete representation: it normalizes fact text, derives
+stable IDs and capture timestamps from trusted evidence, preserves every active
+fact unless current evidence explicitly supersedes it, and renders the
+canonical heading, bullets, and provenance markers. It then validates its own
+rendered document, scrubs secrets, and promotes through the same workgroup lock
+and SHA compare-and-swap writer used by sibling agents. A model's heading,
+bullet, marker, ID, or timestamp spelling therefore cannot block a valid
+capture because those fields are not part of the model contract.
 Failures leave both the pending episode and existing memory intact.
 
 The host discovers every distinct configured Claude OAuth slot and selects
@@ -108,10 +111,12 @@ due episodes, oldest due time, retry count, and per-slot cooldown state are
 reported by the runtime verifier, and admission delay or total credential
 unavailability emits a throttled warning without deleting work.
 
-After 50 accepted updates or when generated memory exceeds 48 KiB, the same
-model may reorganize generated prose, but validation requires the exact active
-ID and provenance set to survive. Before replacement, the previous generated
-file is snapshotted under the host-only
+After 50 accepted updates or when generated memory exceeds 48 KiB, the host
+retires the maintenance threshold without asking a model to rewrite the
+document. The deterministic renderer already maintains the one canonical flat
+representation, so a second model-authored presentation pass would add failure
+surface without adding facts. Before every actual replacement, the previous
+generated file is snapshotted under the host-only
 `data/memory-curator-history/<workgroup-id>/` tree, outside container mounts and
 recall, with the latest 20 versions retained. Operator rollback restores one of
 those bounded snapshots through the same compare-and-swap writer, so it cannot

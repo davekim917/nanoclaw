@@ -27,18 +27,11 @@ import {
 } from '../../message-archive.js';
 import { tokenizeForRecall } from './pre-turn-context.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
-import {
-  MemoryCuratorBackend,
-  MEMORY_CURATOR_EFFORT,
-  type CuratorBackendResult,
-  type MaintenanceBackendResult,
-} from './curator-backend.js';
+import { MemoryCuratorBackend, MEMORY_CURATOR_EFFORT, type CuratorBackendResult } from './curator-backend.js';
 import {
   buildCuratorPrompt,
-  buildMemoryMaintenancePrompt,
   parseGeneratedMemoryFacts,
   validateCuratorDecision,
-  validateMemoryMaintenanceDecision,
   type CuratorDecision,
 } from './curator-contract.js';
 import { readGeneratedMemory, writeGeneratedMemory, type CuratorWriteResult } from './curator-write.js';
@@ -107,12 +100,6 @@ export interface MemoryCuratorWorkerDependencies {
     credentialSlot: ClaudeCredentialSlot,
     signal?: AbortSignal,
   ) => Promise<CuratorBackendResult>;
-  maintain: (
-    system: string,
-    user: string,
-    credentialSlot: ClaudeCredentialSlot,
-    signal?: AbortSignal,
-  ) => Promise<MaintenanceBackendResult>;
   uuid: () => string;
 }
 
@@ -143,7 +130,6 @@ function actualDependencies(): MemoryCuratorWorkerDependencies {
       recordAcceptedGeneratedMemory(workgroupId, contentBytes, { nowMs }),
     manualMemory: readRelevantManualMemory,
     curate: (system, user, credentialSlot, signal) => backend.curate(system, user, credentialSlot, signal),
-    maintain: (system, user, credentialSlot, signal) => backend.maintain(system, user, credentialSlot, signal),
     uuid: randomUUID,
   };
 }
@@ -291,7 +277,9 @@ function classifyError(error: unknown): string {
   if (/\b(?:401|403)\b/.test(message)) return 'auth';
   if (/\b5\d\d\b/.test(message)) return 'provider_5xx';
   if (/conflict/i.test(message)) return 'write_conflict';
-  if (/secret|evidence|memory id|curator|JSON|model mismatch|refused/i.test(message)) return 'validation';
+  if (/secret|evidence|memory id|generated memory|curator|JSON|model mismatch|refused/i.test(message)) {
+    return 'validation';
+  }
   return 'unexpected';
 }
 
@@ -309,6 +297,9 @@ export class MemoryCuratorWorker {
   constructor(private readonly deps: MemoryCuratorWorkerDependencies = actualDependencies()) {}
 
   async runOne(nowMs = Date.now(), signal?: AbortSignal): Promise<MemoryCuratorRunReport | null> {
+    const owner = `memory-curator-${this.deps.uuid()}`;
+    const maintenance = await this.runMaintenance(owner, nowMs);
+    if (maintenance !== undefined) return maintenance;
     const admission = this.deps.admission(nowMs);
     if (!admission.allowed) {
       logAdmissionExhausted(nowMs, admission);
@@ -324,9 +315,6 @@ export class MemoryCuratorWorker {
       });
       return null;
     }
-    const owner = `memory-curator-${this.deps.uuid()}`;
-    const maintenance = await this.runMaintenance(owner, credentials, nowMs, signal);
-    if (maintenance !== undefined) return maintenance;
     const episode = this.deps.claim(owner, nowMs);
     if (!episode) return null;
     const started = Date.now();
@@ -408,61 +396,19 @@ export class MemoryCuratorWorker {
     }
   }
 
-  private async runMaintenance(
-    owner: string,
-    credentials: ClaudeCredentialSlot[],
-    nowMs: number,
-    signal?: AbortSignal,
-  ): Promise<MemoryCuratorRunReport | null | undefined> {
+  private async runMaintenance(owner: string, nowMs: number): Promise<MemoryCuratorRunReport | null | undefined> {
     const job = this.deps.claimMaintenance(owner, nowMs);
     if (!job) return undefined;
     const started = Date.now();
-    let callId: string | null = null;
-    let outcome = 'maintenance_failed';
     try {
       const generated = this.deps.readGenerated(job.workgroupId);
-      if (!generated.content || parseGeneratedMemoryFacts(generated.content).length === 0) {
-        if (!this.deps.completeMaintenance(job, nowMs)) throw new Error('memory maintenance lost its empty lease');
-        return {
-          workgroupId: job.workgroupId,
-          episodeKey: 'maintenance',
-          action: 'maintenance_noop',
-          messageCount: 0,
-          transcriptChars: 0,
-          elapsedMs: Date.now() - started,
-        };
-      }
-      const prompt = buildMemoryMaintenancePrompt(generated.content, this.deps.uuid().replaceAll('-', ''));
-      const attempt = await this.runModelWithFailover(
-        'memory-maintenance',
-        job.workgroupId,
-        credentials,
-        nowMs,
-        (slot) => this.deps.maintain(prompt.system, prompt.user, slot, signal),
-      );
-      callId = attempt.callId;
-      const backend = attempt.result;
-      const decision = validateMemoryMaintenanceDecision(backend.decision, generated.content);
-      if (decision.action === 'replace_generated_memory') {
-        const write = await this.deps.writeGenerated(job.workgroupId, decision.content, generated.sha256, nowMs);
-        if (write.status !== 'success') {
-          throw new Error(`memory maintenance write ${write.status}: ${write.error ?? 'unknown'}`);
-        }
-      }
       if (!this.deps.completeMaintenance(job, nowMs)) throw new Error('memory maintenance lost its lease');
-      const maintenanceAction =
-        decision.action === 'noop' ? ('maintenance_noop' as const) : ('maintenance_written' as const);
-      outcome = maintenanceAction;
       return {
         workgroupId: job.workgroupId,
         episodeKey: 'maintenance',
-        action: maintenanceAction,
+        action: 'maintenance_noop',
         messageCount: 0,
         transcriptChars: generated.content.length,
-        model: backend.model,
-        effort: MEMORY_CURATOR_EFFORT,
-        credentialSlot: backend.credentialSlot,
-        usage: backend.usage,
         elapsedMs: Date.now() - started,
       };
     } catch (error) {
@@ -473,8 +419,6 @@ export class MemoryCuratorWorker {
         error: error instanceof Error ? error.message : String(error),
       });
       return null;
-    } finally {
-      if (callId) this.deps.finishCall(callId, outcome);
     }
   }
 

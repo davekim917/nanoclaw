@@ -232,17 +232,17 @@
   enforcement, persisted OAuth round robin, immediate sibling-key failover on
   401/403/429, no tools, no model fallback, medium effort, timeout, refusal
   handling, and secret-scrubbed untrusted prompt boundaries.
-- Added evidence-bound decision validation, stable generated-memory IDs,
-  correction-only supersession, active-ID preservation, secret and size
-  rejection, and deterministic no-op normalization.
+- Added evidence-bound semantic decision validation, host-derived stable
+  generated-memory IDs/timestamps, correction-only supersession, automatic
+  active-ID preservation, secret and size rejection, and deterministic no-op
+  normalization.
 - Reserved `generated/memory.md` at the writer boundary. The fixed host helper
   alone can opt into that path, and only beneath a canonical
   `data/workgroups/<id>/memory` root. Host and sibling writes share the same
   kernel lock, SHA compare-and-swap, inode/path checks, fsync, and atomic
   rename.
-- Added bounded history (20 versions), thresholded maintenance, exact
-  ID/provenance preservation, and maintenance-first claiming so sustained
-  episode traffic cannot starve a due compaction.
+- Added bounded history (20 versions) and maintenance-first threshold
+  retirement so sustained episode traffic cannot starve ordinary curation.
 - Promoted both bake-off corpora, scoring weights, exact candidates, and
   recorded selection into a hash-checked fixture. The rerunnable evaluator
   requires at least three fresh stateless trials, rejects tool use, records
@@ -378,3 +378,11 @@
   empty replacement-only values on `noop`. A real `oauth:2`
   `claude-sonnet-5` / medium call returned the complete five-field shape, and
   the queued episode succeeded on its next pass without cursor loss.
+- Live queue verification then exposed two representation-only write blockers:
+  Claude first used the heading `# Generated Memory`, then emitted multiple
+  provenance markers in one bullet after heading normalization. The contract
+  now asks Claude only for semantic fact text and evidence IDs. NanoClaw
+  deterministically owns preservation, headings, bullets, content-addressed
+  IDs, trusted timestamps, and provenance markers, then validates its own
+  rendered document. The old model-authored maintenance rewrite is retired for
+  the same reason.

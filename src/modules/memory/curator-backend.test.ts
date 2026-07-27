@@ -21,7 +21,12 @@ import {
 describe('memory curator backend', () => {
   it('locks the selected model and effort with no fallback surface', async () => {
     const call = vi.fn(async (request, _options?: { credentialSlot?: string }) => ({
-      value: { action: 'noop', evidenceIds: [], reasonCode: 'transient' } as const,
+      value: {
+        action: 'noop',
+        reasonCode: 'transient',
+        supersedesMemoryIds: [],
+        memories: [],
+      } as const,
       model: request.model,
       credentialSlot: 'oauth:2' as const,
       usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },

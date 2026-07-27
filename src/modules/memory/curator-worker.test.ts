@@ -70,18 +70,17 @@ function deps(overrides: Partial<MemoryCuratorWorkerDependencies> = {}): MemoryC
     manualMemory: () => [],
     curate: vi.fn(
       async (_system, _user, credentialSlot): Promise<CuratorBackendResult> => ({
-        decision: { action: 'noop', evidenceIds: ['msg-1'], reasonCode: 'transient' },
+        decision: {
+          action: 'noop',
+          reasonCode: 'transient',
+          supersedesMemoryIds: [],
+          memories: [],
+        },
         model: 'claude-sonnet-5',
         credentialSlot,
         usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
       }),
     ),
-    maintain: vi.fn(async (_system, _user, credentialSlot) => ({
-      decision: { action: 'noop' as const },
-      model: 'claude-sonnet-5',
-      credentialSlot,
-      usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
-    })),
     uuid: vi.fn(() => '00000000-0000-0000-0000-000000000001'),
     ...overrides,
   };
@@ -105,21 +104,14 @@ describe('memory curator worker', () => {
   });
 
   it('writes a validated replacement before advancing the cursor', async () => {
-    const content = [
-      '# Generated workgroup memory',
-      '',
-      '- GSC data is in Snowflake. <!-- nanoclaw-memory:id=mem_aaaaaaaaaaaaaaaa;evidence=msg-1;captured=2026-07-26T00:00:01.000Z -->',
-      '',
-    ].join('\n');
     const d = deps({
       curate: vi.fn(
         async (): Promise<CuratorBackendResult> => ({
           decision: {
             action: 'replace_generated_memory',
-            evidenceIds: ['msg-1'],
             reasonCode: 'durable_fact',
             supersedesMemoryIds: [],
-            content,
+            memories: [{ text: 'GSC data is in Snowflake.', evidenceIds: ['msg-1'] }],
           },
           model: 'claude-sonnet-5',
           credentialSlot: 'oauth:2',
@@ -130,6 +122,8 @@ describe('memory curator worker', () => {
     const report = await new MemoryCuratorWorker(d).runOne(1000);
     expect(report?.action).toBe('replace_generated_memory');
     expect(d.writeGenerated).toHaveBeenCalledBefore(d.complete as ReturnType<typeof vi.fn>);
+    const content = (d.writeGenerated as ReturnType<typeof vi.fn>).mock.calls[0]![1] as string;
+    expect(content).toMatch(/^# Generated workgroup memory\n\n- GSC data is in Snowflake\./);
     expect(d.recordAccepted).toHaveBeenCalledWith('wg-a', Buffer.byteLength(content), 1000);
     expect(d.finishCall).toHaveBeenCalledWith(expect.any(String), 'memory_written');
   });
@@ -140,7 +134,12 @@ describe('memory curator worker', () => {
       {
         curate: vi.fn(
           async (): Promise<CuratorBackendResult> => ({
-            decision: { action: 'noop', evidenceIds: ['unknown'], reasonCode: 'transient' },
+            decision: {
+              action: 'replace_generated_memory',
+              reasonCode: 'durable_fact',
+              supersedesMemoryIds: [],
+              memories: [{ text: 'Fact.', evidenceIds: ['unknown'] }],
+            },
             model: 'claude-sonnet-5',
             credentialSlot: 'oauth:2',
             usage: { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
@@ -152,11 +151,9 @@ describe('memory curator worker', () => {
           async (): Promise<CuratorBackendResult> => ({
             decision: {
               action: 'replace_generated_memory',
-              evidenceIds: ['msg-1'],
               reasonCode: 'durable_fact',
               supersedesMemoryIds: [],
-              content:
-                '# Generated workgroup memory\n\n- Fact. <!-- nanoclaw-memory:id=mem_aaaaaaaaaaaaaaaa;evidence=msg-1;captured=2026-07-26T00:00:01.000Z -->\n',
+              memories: [{ text: 'Fact.', evidenceIds: ['msg-1'] }],
             },
             model: 'claude-sonnet-5',
             credentialSlot: 'oauth:2',
@@ -202,7 +199,12 @@ describe('memory curator worker', () => {
         throw error;
       }
       return {
-        decision: { action: 'noop', evidenceIds: ['msg-1'], reasonCode: 'transient' },
+        decision: {
+          action: 'noop',
+          reasonCode: 'transient',
+          supersedesMemoryIds: [],
+          memories: [],
+        },
         model: 'claude-sonnet-5',
         credentialSlot,
         usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
@@ -260,28 +262,28 @@ describe('memory curator worker', () => {
     expect(result.handledThroughRowid).toBe(3);
   });
 
-  it('prioritizes thresholded shadow-validated maintenance so it cannot starve behind episodes', async () => {
+  it('retires thresholded maintenance deterministically without another model-authored document', async () => {
     const current = [
       '# Generated workgroup memory',
       '',
       '- Fact. <!-- nanoclaw-memory:id=mem_aaaaaaaaaaaaaaaa;evidence=msg-1;captured=2026-07-26T00:00:00.000Z -->',
       '',
     ].join('\n');
-    const reorganized = current.replace('- Fact.', '- Reorganized fact.');
     const d = deps({
+      admission: () => ({ allowed: false, hourly: 120, daily: 120, hourlyLimit: 120, dailyLimit: 3000 }),
+      selectCredential: () => ({
+        slot: null,
+        retryAt: '2026-07-26T00:15:00.000Z',
+        unavailableSlots: ['oauth:primary', 'oauth:2'],
+      }),
       claim: vi.fn(() => null),
       claimMaintenance: () => ({ workgroupId: 'wg-a', acceptedUpdates: 50, leaseOwner: 'worker' }),
       readGenerated: () => ({ content: current, sha256: 'a'.repeat(64) }),
-      maintain: vi.fn(async () => ({
-        decision: { action: 'replace_generated_memory' as const, content: reorganized },
-        model: 'claude-sonnet-5',
-        credentialSlot: 'oauth:2' as const,
-        usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
-      })),
     });
-    expect(await new MemoryCuratorWorker(d).runOne(1000)).toMatchObject({ action: 'maintenance_written' });
+    expect(await new MemoryCuratorWorker(d).runOne(1000)).toMatchObject({ action: 'maintenance_noop' });
     expect(d.claim).not.toHaveBeenCalled();
-    expect(d.writeGenerated).toHaveBeenCalledWith('wg-a', reorganized, 'a'.repeat(64), 1000);
+    expect(d.writeGenerated).not.toHaveBeenCalled();
+    expect(d.recordCall).not.toHaveBeenCalled();
     expect(d.completeMaintenance).toHaveBeenCalledOnce();
   });
 });

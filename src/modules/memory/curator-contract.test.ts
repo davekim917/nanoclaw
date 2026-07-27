@@ -2,11 +2,9 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildCuratorPrompt,
-  buildMemoryMaintenancePrompt,
   CURATOR_OUTPUT_SCHEMA,
   parseGeneratedMemoryFacts,
   validateCuratorDecision,
-  validateMemoryMaintenanceDecision,
 } from './curator-contract.js';
 
 const oldContent = [
@@ -15,90 +13,161 @@ const oldContent = [
   '- GSC access is unknown. <!-- nanoclaw-memory:id=mem_aaaaaaaaaaaaaaaa;evidence=old-1;captured=2026-07-20T00:00:00.000Z -->',
   '',
 ].join('\n');
-const currentEvidence = new Map([['msg-1', '2026-07-26T00:00:00.000Z']]);
+const currentEvidence = new Map([
+  ['msg-1', '2026-07-26T00:00:00.000Z'],
+  ['msg-2', '2026-07-26T00:01:00.000Z'],
+]);
+
+function context(currentContent = '') {
+  return {
+    currentContent,
+    allowedEvidenceIds: new Set(['old-1', 'msg-1', 'msg-2']),
+    currentEpisodeEvidence: currentEvidence,
+  };
+}
 
 describe('background memory curator contract', () => {
-  it('requires replacement-only fields so structured output cannot make them nullable', () => {
-    expect(CURATOR_OUTPUT_SCHEMA.required).toEqual([
-      'action',
-      'evidenceIds',
-      'reasonCode',
-      'supersedesMemoryIds',
-      'content',
-    ]);
+  it('asks the model only for semantic candidates and requires empty mutation arrays on noop', () => {
+    expect(CURATOR_OUTPUT_SCHEMA.required).toEqual(['action', 'reasonCode', 'supersedesMemoryIds', 'memories']);
+    expect(CURATOR_OUTPUT_SCHEMA.properties).not.toHaveProperty('content');
+    expect(CURATOR_OUTPUT_SCHEMA.properties).not.toHaveProperty('evidenceIds');
+    expect(CURATOR_OUTPUT_SCHEMA.properties.memories.items.properties).toHaveProperty('text');
   });
 
-  it('accepts evidence-backed correction while preserving unrelated ids', () => {
-    const content = [
-      '# Generated workgroup memory',
-      '',
-      '- Query GSC data in Snowflake, not Workspace API. <!-- nanoclaw-memory:id=mem_bbbbbbbbbbbbbbbb;evidence=msg-1;captured=2026-07-26T00:00:00.000Z -->',
-      '',
-    ].join('\n');
+  it('renders headings, bullets, ids, timestamps, and markers deterministically from semantic facts', () => {
+    const decision = validateCuratorDecision(
+      {
+        action: 'replace_generated_memory',
+        reasonCode: 'durable_fact',
+        supersedesMemoryIds: [],
+        memories: [{ text: '  - GSC data is in   Snowflake.  ', evidenceIds: ['msg-1', 'msg-2'] }],
+      },
+      context(),
+    );
+    expect(decision).toMatchObject({
+      action: 'replace_generated_memory',
+      reasonCode: 'durable_fact',
+      evidenceIds: ['msg-1', 'msg-2'],
+      supersedesMemoryIds: [],
+    });
+    if (decision.action !== 'replace_generated_memory') throw new Error('expected replacement');
+    expect(decision.content).toMatch(
+      /^# Generated workgroup memory\n\n- GSC data is in Snowflake\. <!-- nanoclaw-memory:id=mem_[a-f0-9]{16};evidence=msg-1,msg-2;captured=2026-07-26T00:01:00\.000Z -->\n$/,
+    );
+    expect(parseGeneratedMemoryFacts(decision.content)).toHaveLength(1);
+  });
+
+  it('preserves every active fact automatically while appending a new one', () => {
+    const decision = validateCuratorDecision(
+      {
+        action: 'replace_generated_memory',
+        reasonCode: 'durable_fact',
+        supersedesMemoryIds: [],
+        memories: [{ text: 'GSC data is in Snowflake.', evidenceIds: ['msg-1'] }],
+      },
+      context(oldContent),
+    );
+    if (decision.action !== 'replace_generated_memory') throw new Error('expected replacement');
+    expect(decision.content).toContain(oldContent.split('\n')[2]);
+    expect(decision.content).toContain('- GSC data is in Snowflake.');
+    expect(parseGeneratedMemoryFacts(decision.content)).toHaveLength(2);
+  });
+
+  it('accepts an evidence-backed correction and removes only the named id', () => {
+    const decision = validateCuratorDecision(
+      {
+        action: 'replace_generated_memory',
+        reasonCode: 'correction',
+        supersedesMemoryIds: ['mem_aaaaaaaaaaaaaaaa'],
+        memories: [{ text: 'Query GSC data in Snowflake, not Workspace API.', evidenceIds: ['msg-1'] }],
+      },
+      context(oldContent),
+    );
+    if (decision.action !== 'replace_generated_memory') throw new Error('expected replacement');
+    expect(decision.content).not.toContain('mem_aaaaaaaaaaaaaaaa');
+    expect(decision.content).toContain('Query GSC data in Snowflake, not Workspace API.');
+    expect(parseGeneratedMemoryFacts(decision.content)).toHaveLength(1);
+  });
+
+  it('normalizes a same-text correction to noop instead of rewriting provenance', () => {
     expect(
       validateCuratorDecision(
         {
           action: 'replace_generated_memory',
-          evidenceIds: ['msg-1'],
           reasonCode: 'correction',
           supersedesMemoryIds: ['mem_aaaaaaaaaaaaaaaa'],
-          content,
+          memories: [{ text: 'GSC access is unknown.', evidenceIds: ['msg-1'] }],
         },
-        {
-          currentContent: oldContent,
-          allowedEvidenceIds: new Set(['old-1', 'msg-1']),
-          currentEpisodeEvidence: currentEvidence,
-        },
+        context(oldContent),
       ),
-    ).toMatchObject({ action: 'replace_generated_memory', reasonCode: 'correction' });
+    ).toEqual({ action: 'noop', evidenceIds: [], reasonCode: 'duplicate' });
   });
 
-  it('rejects unknown evidence, silent drops, secrets, and non-correction supersession', () => {
+  it('deduplicates semantic candidates and stable existing facts without rewriting the document', () => {
+    const first = validateCuratorDecision(
+      {
+        action: 'replace_generated_memory',
+        reasonCode: 'durable_fact',
+        supersedesMemoryIds: [],
+        memories: [
+          { text: 'GSC data is in Snowflake.', evidenceIds: ['msg-1'] },
+          { text: 'gsc data is in snowflake.', evidenceIds: ['msg-2'] },
+        ],
+      },
+      context(),
+    );
+    if (first.action !== 'replace_generated_memory') throw new Error('expected replacement');
+    expect(parseGeneratedMemoryFacts(first.content)).toHaveLength(1);
+    expect(
+      validateCuratorDecision(
+        {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'GSC DATA IS IN SNOWFLAKE.', evidenceIds: ['msg-2'] }],
+        },
+        context(first.content),
+      ),
+    ).toEqual({ action: 'noop', evidenceIds: [], reasonCode: 'duplicate' });
+  });
+
+  it('rejects semantic hazards without depending on presentation spelling', () => {
     const base = {
       action: 'replace_generated_memory',
-      evidenceIds: ['msg-1'],
       reasonCode: 'durable_fact',
       supersedesMemoryIds: [],
-      content: [
-        '# Generated workgroup memory',
-        '',
-        '- Durable fact. <!-- nanoclaw-memory:id=mem_bbbbbbbbbbbbbbbb;evidence=msg-1;captured=2026-07-26T00:00:00.000Z -->',
-      ].join('\n'),
+      memories: [{ text: 'Durable fact.', evidenceIds: ['msg-1'] }],
     };
     expect(() =>
-      validateCuratorDecision(base, {
-        currentContent: oldContent,
-        allowedEvidenceIds: new Set(['old-1']),
-        currentEpisodeEvidence: currentEvidence,
-      }),
+      validateCuratorDecision({ ...base, memories: [{ text: 'Durable fact.', evidenceIds: ['unknown'] }] }, context()),
     ).toThrow(/unknown evidence/);
     expect(() =>
-      validateCuratorDecision(base, {
-        currentContent: oldContent,
-        allowedEvidenceIds: new Set(['old-1', 'msg-1']),
-        currentEpisodeEvidence: currentEvidence,
-      }),
-    ).toThrow(/dropped active id/);
-    expect(() =>
       validateCuratorDecision(
-        { ...base, content: `${base.content}\n- sk_live_12345678901234567890` },
-        {
-          currentContent: '',
-          allowedEvidenceIds: new Set(['msg-1']),
-          currentEpisodeEvidence: currentEvidence,
-        },
+        { ...base, memories: [{ text: 'Token sk_live_12345678901234567890', evidenceIds: ['msg-1'] }] },
+        context(),
       ),
     ).toThrow(/secret material/);
     expect(() =>
       validateCuratorDecision(
-        { ...base, supersedesMemoryIds: ['mem_aaaaaaaaaaaaaaaa'] },
-        {
-          currentContent: oldContent,
-          allowedEvidenceIds: new Set(['old-1', 'msg-1']),
-          currentEpisodeEvidence: currentEvidence,
-        },
+        { ...base, memories: [{ text: '# Generated Memory <!-- marker -->', evidenceIds: ['msg-1'] }] },
+        context(),
       ),
+    ).toThrow(/presentation markup/);
+    expect(() =>
+      validateCuratorDecision(
+        { ...base, memories: [{ text: 'Prior-only fact.', evidenceIds: ['old-1'] }] },
+        context(oldContent),
+      ),
+    ).toThrow(/no current-episode evidence/);
+    expect(() =>
+      validateCuratorDecision({ ...base, supersedesMemoryIds: ['mem_aaaaaaaaaaaaaaaa'] }, context(oldContent)),
     ).toThrow(/only a correction/);
+    expect(() =>
+      validateCuratorDecision(
+        { action: 'noop', reasonCode: 'duplicate', supersedesMemoryIds: [], memories: base.memories },
+        context(),
+      ),
+    ).toThrow(/noop must not contain mutations/);
   });
 
   it('does not echo untrusted evidence ids in validation errors', () => {
@@ -107,15 +176,12 @@ describe('background memory curator contract', () => {
     try {
       validateCuratorDecision(
         {
-          action: 'noop',
-          evidenceIds: [untrustedId],
-          reasonCode: 'insufficient_evidence',
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'Fact.', evidenceIds: [untrustedId] }],
         },
-        {
-          currentContent: oldContent,
-          allowedEvidenceIds: new Set(['old-1', 'msg-1']),
-          currentEpisodeEvidence: currentEvidence,
-        },
+        context(),
       );
     } catch (error) {
       message = (error as Error).message;
@@ -124,82 +190,13 @@ describe('background memory curator contract', () => {
     expect(message).not.toContain(untrustedId);
   });
 
-  it('normalizes an identical replacement to noop and parses stable fact markers', () => {
+  it('parses existing stable fact markers', () => {
     expect(parseGeneratedMemoryFacts(oldContent)).toEqual([
       { id: 'mem_aaaaaaaaaaaaaaaa', evidenceIds: ['old-1'], capturedAt: '2026-07-20T00:00:00.000Z' },
     ]);
-    expect(
-      validateCuratorDecision(
-        {
-          action: 'replace_generated_memory',
-          evidenceIds: ['msg-1'],
-          reasonCode: 'durable_fact',
-          supersedesMemoryIds: [],
-          content: oldContent,
-        },
-        {
-          currentContent: oldContent,
-          allowedEvidenceIds: new Set(['old-1', 'msg-1']),
-          currentEpisodeEvidence: currentEvidence,
-        },
-      ),
-    ).toEqual({ action: 'noop', evidenceIds: ['msg-1'], reasonCode: 'duplicate' });
   });
 
-  it('rejects unmarked prose, active-id text rewrites, prior-only evidence, and invented timestamps', () => {
-    const replacement = {
-      action: 'replace_generated_memory',
-      evidenceIds: ['msg-1'],
-      reasonCode: 'durable_fact',
-      supersedesMemoryIds: [],
-      content: [
-        '# Generated workgroup memory',
-        '',
-        oldContent.split('\n')[2],
-        '- New fact. <!-- nanoclaw-memory:id=mem_bbbbbbbbbbbbbbbb;evidence=msg-1;captured=2026-07-26T00:00:00.000Z -->',
-      ].join('\n'),
-    };
-    const context = {
-      currentContent: oldContent,
-      allowedEvidenceIds: new Set(['old-1', 'msg-1']),
-      currentEpisodeEvidence: currentEvidence,
-    };
-    expect(() =>
-      validateCuratorDecision(
-        { ...replacement, content: `${replacement.content}\nUnmarked factual paragraph.` },
-        context,
-      ),
-    ).toThrow(/unmarked|evidence-marked/);
-    expect(() =>
-      validateCuratorDecision(
-        { ...replacement, content: replacement.content.replace('GSC access is unknown', 'GSC is in BigQuery') },
-        context,
-      ),
-    ).toThrow(/rewrote an active fact/);
-    expect(() =>
-      validateCuratorDecision(
-        {
-          ...replacement,
-          content: replacement.content.replace('evidence=msg-1', 'evidence=old-1'),
-        },
-        context,
-      ),
-    ).toThrow(/no current-episode evidence/);
-    expect(() =>
-      validateCuratorDecision(
-        {
-          ...replacement,
-          content: replacement.content.replace(
-            'captured=2026-07-26T00:00:00.000Z',
-            'captured=2026-07-27T00:00:00.000Z',
-          ),
-        },
-        context,
-      ),
-    ).toThrow(/untrusted capture timestamp/);
-  });
-
-  it('scrubs untrusted transcript and preserves the explicit boundary', () => {
+  it('scrubs untrusted transcript and explicitly prohibits model-authored presentation', () => {
     const prompt = buildCuratorPrompt({
       workgroupId: 'wg-a',
       messages: [
@@ -228,25 +225,9 @@ describe('background memory curator contract', () => {
     expect(prompt.user).toContain('[REDACTED]');
     expect(prompt.user).not.toContain('sk_live_');
     expect(prompt.system).toContain('untrusted data');
-    expect(prompt.system).toContain('for noop use an empty array and empty string');
-  });
-
-  it('maintenance may reorganize prose but cannot change ids or provenance', () => {
-    const reorganized = oldContent.replace('- GSC access is unknown.', '- GSC access status remains unknown.');
-    expect(
-      validateMemoryMaintenanceDecision({ action: 'replace_generated_memory', content: reorganized }, oldContent),
-    ).toMatchObject({ action: 'replace_generated_memory' });
-    expect(() =>
-      validateMemoryMaintenanceDecision(
-        {
-          action: 'replace_generated_memory',
-          content: reorganized.replace('evidence=old-1', 'evidence=other'),
-        },
-        oldContent,
-      ),
-    ).toThrow(/changed provenance/);
-    const prompt = buildMemoryMaintenancePrompt(oldContent, 'BOUNDARY');
-    expect(prompt.user).toContain('BEGIN_UNTRUSTED_BOUNDARY');
-    expect(prompt.system).toContain('preserve every');
+    expect(prompt.system).toContain('semantic memory candidates only');
+    expect(prompt.system).toContain('NanoClaw owns the document format');
+    expect(prompt.system).toContain('Do not return Markdown');
+    expect(prompt.system).toContain('for noop both must be empty arrays');
   });
 });
