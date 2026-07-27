@@ -216,6 +216,7 @@ describe('E3 createEmailGateHook', () => {
     expect(card).toBeDefined();
     expect(card!.label).toBe('STUB-CORE email label');
     expect(card!.summary).toBe('STUB-CORE email summary');
+    expect(card!.command).toBe('gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
   });
 
   it('test_claude_email_gate_preserves_async_ack', async () => {
@@ -291,6 +292,18 @@ describe('E3 createEmailGateHook', () => {
     expect(r.permissionDecision).toBeUndefined();
     expect(gateCard()).toBeUndefined(); // bypassed → nothing staged
     expect(ackedRequestId).toBeNull(); // and no ack round-trip
+  });
+
+  it('inline fallback: the bounded gws help probe bypasses without staging', async () => {
+    process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
+    delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
+    const r = await runBashHook(
+      createEmailGateHook(),
+      'export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/primary.json && gws gmail users messages send --help 2>&1 | head -60',
+    );
+    expect(r.permissionDecision).toBeUndefined();
+    expect(gateCard()).toBeUndefined();
+    expect(ackedRequestId).toBeNull();
   });
 
   it('inline fallback: a bypass flag after a redirection does NOT bypass — it gates (QA codex re-pass #3)', async () => {

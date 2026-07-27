@@ -74,6 +74,11 @@ import {
 // on approvers who were in a call when the card landed.
 const BASH_GATE_TIMEOUT_MS = 60 * 60 * 1000;
 const GATE_CARD_TITLE_MAX_CHARS = 140;
+// Leave enough room for the structured summary and footer on both Slack
+// Block Kit and Discord embeds. A head+tail preview preserves both the
+// command being invoked and its final arguments, which are often the most
+// consequential part of a long shell command.
+const GATE_COMMAND_PREVIEW_MAX_CHARS = 1400;
 
 const pendingTimeouts = new Map<string, NodeJS.Timeout>();
 
@@ -162,14 +167,25 @@ interface GateCategory {
  * the summary, and the footer tells the approver what each outcome
  * means and what the timeout is. Matches v1's richer card layout.
  */
+function commandPreview(command: string): string {
+  const codePoints = Array.from(command);
+  if (codePoints.length <= GATE_COMMAND_PREVIEW_MAX_CHARS) return command;
+
+  const marker = '\n…[middle omitted; full command retained in the approval record]…\n';
+  const markerLength = Array.from(marker).length;
+  const headLength = Math.floor((GATE_COMMAND_PREVIEW_MAX_CHARS - markerLength) / 2);
+  const tailLength = GATE_COMMAND_PREVIEW_MAX_CHARS - markerLength - headLength;
+  return codePoints.slice(0, headLength).join('') + marker + codePoints.slice(-tailLength).join('');
+}
+
 function buildCardBody(category: GateCategory, summary: string, command: string): string {
   const parts: string[] = [summary];
   if (command) {
     // Multi-line fenced code block renders nicely on both Slack and
-    // Discord (mrkdwn + markdown). Truncate to keep the card readable —
-    // the full command is persisted in the approval payload for audit.
-    const trimmed = command.length > 800 ? command.slice(0, 800) + '\n…[truncated]' : command;
-    parts.push('```\n' + trimmed + '\n```');
+    // Discord (mrkdwn + markdown). The full command is persisted in the
+    // approval payload; the readable card preview keeps both its head and
+    // tail so an approver is not asked to infer omitted final arguments.
+    parts.push('```\n' + commandPreview(command) + '\n```');
   }
   const timeoutMinutes = BASH_GATE_TIMEOUT_MS / 60_000;
   parts.push(
@@ -198,7 +214,10 @@ function createGateHandler(category: GateCategory) {
   ): Promise<{ deferAck: true }> {
     const label = typeof content.label === 'string' ? content.label : category.defaultLabel;
     const summary = typeof content.summary === 'string' ? content.summary : category.defaultSummary;
-    const command = typeof content.command === 'string' ? (content.command as string).slice(0, 500) : '';
+    // Preserve the full command for audit and for a head+tail card preview.
+    // Truncating it here silently discarded the most important trailing flags
+    // before either of those consumers could see them.
+    const command = typeof content.command === 'string' ? content.command : '';
     const requestId = typeof content.requestId === 'string' ? (content.requestId as string) : '';
     if (!requestId) {
       log.warn(`${category.deliveryAction} missing requestId`, { content });

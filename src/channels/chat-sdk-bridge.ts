@@ -351,11 +351,17 @@ function resolveSelectedOption(
   render: { options: NormalizedOption[] } | undefined,
   eventValue: string | undefined,
   tail: string | undefined,
-): string {
-  const candidate = eventValue ?? tail ?? '';
-  if (render && /^\d+$/.test(candidate)) {
+): string | undefined {
+  const candidate = eventValue || tail;
+  if (!candidate) return undefined;
+  if (/^\d+$/.test(candidate)) {
+    // New cards use an index to fit Telegram's callback-data limit. An
+    // unresolvable index is *not* a legacy literal option: forwarding it
+    // would make "0" fall into approval's reject-by-default branch.
+    if (!render) return undefined;
     const idx = Number(candidate);
     if (render.options[idx]) return render.options[idx].value;
+    return undefined;
   }
   return candidate;
 }
@@ -842,9 +848,17 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // short to fit Telegram's 64-byte callback_data cap). Old format:
         // the full value is embedded in actionId/value directly.
         const selectedOption = resolveSelectedOption(render, event.value, tail);
+        if (!selectedOption) {
+          log.warn('Ignoring card action with an unresolved option', {
+            questionId,
+            encodedOption: event.value || tail || '',
+            adapter: adapter.name,
+          });
+          return;
+        }
         const title = render?.title ?? '❓ Question';
         const matched = render?.options.find((o) => o.value === selectedOption);
-        const selectedLabel = matched?.selectedLabel ?? selectedOption ?? '(clicked)';
+        const selectedLabel = matched?.selectedLabel ?? selectedOption;
 
         // Update the card to show the selected answer, who acted, and remove buttons
         const actorName = event.user?.userName || event.user?.fullName || '';
@@ -1523,61 +1537,88 @@ export async function handleForwardedEvent(
     // type 3 = MessageComponent (button/select)
     if (interaction.type === 3) {
       const customId = (interaction.data as Record<string, unknown>)?.custom_id as string;
-      // In guilds the clicker is at interaction.member.user; in DMs it's interaction.user directly.
-      const user =
-        ((interaction.member as Record<string, unknown>)?.user as Record<string, string> | undefined) ??
-        (interaction.user as Record<string, string> | undefined);
-      const interactionId = interaction.id as string;
-      const interactionToken = interaction.token as string;
-
-      // Parse the selected option from custom_id
-      let questionId: string | undefined;
-      let tail: string | undefined;
+      // Only NanoClaw approval cards belong to this bridge. Let the adapter
+      // receive every other component interaction unchanged below.
       if (customId?.startsWith('ncq:')) {
-        const colonIdx = customId.indexOf(':', 4); // after "ncq:"
-        if (colonIdx !== -1) {
-          questionId = customId.slice(4, colonIdx);
-          tail = customId.slice(colonIdx + 1);
+        // In guilds the clicker is at interaction.member.user; in DMs it's interaction.user directly.
+        const user =
+          ((interaction.member as Record<string, unknown>)?.user as Record<string, string> | undefined) ??
+          (interaction.user as Record<string, string> | undefined);
+        const interactionId = interaction.id as string;
+        const interactionToken = interaction.token as string;
+
+        // Parse the selected option from custom_id
+        let questionId: string | undefined;
+        let tail: string | undefined;
+        if (customId?.startsWith('ncq:')) {
+          const colonIdx = customId.indexOf(':', 4); // after "ncq:"
+          if (colonIdx !== -1) {
+            questionId = customId.slice(4, colonIdx);
+            tail = customId.slice(colonIdx + 1);
+          }
         }
-      }
 
-      // Update the card to show the selected answer and remove buttons
-      const originalEmbeds =
-        ((interaction.message as Record<string, unknown>)?.embeds as Array<Record<string, unknown>>) || [];
-      const originalDescription = (originalEmbeds[0]?.description as string) || '';
-      const render = questionId ? getAskQuestionRender(questionId) : undefined;
-      // Discord custom_id mirrors the new index-based encoding (see Button
-      // construction). Decode back to the real option value for downstream.
-      const selectedOption = resolveSelectedOption(render, tail, tail);
-      const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
-      const matchedOpt = render?.options.find((o) => o.value === selectedOption);
-      const selectedLabel = matchedOpt?.selectedLabel ?? selectedOption ?? customId;
-      try {
-        await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            type: 7, // UPDATE_MESSAGE — acknowledge + update in one call
-            data: {
-              embeds: [
-                {
-                  title: cardTitle,
-                  description: `${originalDescription}\n\n${selectedLabel}`,
+        // Update the card to show the selected answer and remove buttons
+        const originalEmbeds =
+          ((interaction.message as Record<string, unknown>)?.embeds as Array<Record<string, unknown>>) || [];
+        const originalDescription = (originalEmbeds[0]?.description as string) || '';
+        const render = questionId ? getAskQuestionRender(questionId) : undefined;
+        // Discord custom_id mirrors the new index-based encoding (see Button
+        // construction). Decode back to the real option value for downstream.
+        const selectedOption = resolveSelectedOption(render, tail, tail);
+        if (!questionId || !selectedOption) {
+          log.warn('Ignoring Discord card action with an unresolved option', {
+            questionId: questionId ?? '',
+            encodedOption: tail ?? '',
+            adapter: adapter.name,
+          });
+          try {
+            await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                // Acknowledge without mutating the original card. The approval
+                // remains pending and, crucially, cannot be mistaken for reject.
+                type: 4,
+                data: {
+                  content: 'Could not verify that approval selection. The card is still pending.',
+                  flags: 64,
                 },
-              ],
-              components: [], // remove buttons
-            },
-          }),
-        });
-      } catch (err) {
-        log.error('Failed to update interaction', { err });
-      }
+              }),
+            });
+          } catch (err) {
+            log.error('Failed to acknowledge unresolved Discord card action', { err });
+          }
+          return;
+        }
+        const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
+        const matchedOpt = render?.options.find((o) => o.value === selectedOption);
+        const selectedLabel = matchedOpt?.selectedLabel ?? selectedOption;
+        try {
+          await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              type: 7, // UPDATE_MESSAGE — acknowledge + update in one call
+              data: {
+                embeds: [
+                  {
+                    title: cardTitle,
+                    description: `${originalDescription}\n\n${selectedLabel}`,
+                  },
+                ],
+                components: [], // remove buttons
+              },
+            }),
+          });
+        } catch (err) {
+          log.error('Failed to update interaction', { err });
+        }
 
-      // Dispatch to host
-      if (questionId && selectedOption) {
+        // Dispatch to host
         setupConfig.onAction(questionId, selectedOption, user?.id || '');
+        return;
       }
-      return;
     }
   }
 

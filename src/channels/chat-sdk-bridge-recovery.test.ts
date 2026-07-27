@@ -5,6 +5,7 @@ import { parseMarkdown, type Adapter, type Message as ChatMessage } from 'chat';
 vi.mock('../webhook-server.js', () => ({ registerWebhookAdapter: vi.fn() }));
 
 import { closeDb, getDb, initTestDb, runMigrations } from '../db/index.js';
+import { createPendingApproval } from '../db/sessions.js';
 import type { ChannelSetup } from './adapter.js';
 import { createChatSdkBridge, handleForwardedEvent, RecoveryIngressGate } from './chat-sdk-bridge.js';
 
@@ -357,5 +358,78 @@ describe('Chat SDK bridge missed-message recovery', () => {
     expect(
       getDb().prepare("SELECT value FROM chat_sdk_kv WHERE key = 'nanoclaw:recovery-gap:stub'").get(),
     ).toBeUndefined();
+  });
+});
+
+describe('Chat SDK bridge Discord approval actions', () => {
+  function interaction(customId: string): string {
+    return JSON.stringify({
+      type: 'GATEWAY_INTERACTION_CREATE',
+      data: {
+        type: 3,
+        id: 'interaction-1',
+        token: 'token-1',
+        data: { custom_id: customId },
+        member: { user: { id: 'U1' } },
+        message: { embeds: [{ title: '⚠️ Test approval', description: 'Details' }] },
+      },
+    });
+  }
+
+  function seedApproval(id: string): void {
+    createPendingApproval({
+      approval_id: id,
+      request_id: id,
+      action: 'test',
+      payload: '{}',
+      created_at: new Date().toISOString(),
+      title: '⚠️ Test approval',
+      options_json: JSON.stringify([
+        { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve', style: 'primary' },
+        { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject', style: 'danger' },
+      ]),
+    });
+  }
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('maps Discord index zero to approve rather than rejecting it', async () => {
+    seedApproval('appr-discord');
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const onAction = vi.fn();
+
+    await handleForwardedEvent(
+      interaction('ncq:appr-discord:0'),
+      { name: 'gateway-stub', handleWebhook: vi.fn(async () => new Response('ok')) } as unknown as Adapter,
+      { onInbound: async () => {}, onInboundEvent: async () => {}, onMetadata: () => {}, onAction },
+      'bot-token',
+    );
+
+    expect(onAction).toHaveBeenCalledWith('appr-discord', 'approve', 'U1');
+    const callbackInit = fetchMock.mock.calls[0]?.[1];
+    expect(callbackInit).toBeDefined();
+    expect(JSON.parse(callbackInit!.body as string)).toMatchObject({ type: 7 });
+  });
+
+  it('keeps a Discord approval pending when its indexed option cannot be resolved', async () => {
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const onAction = vi.fn();
+
+    await handleForwardedEvent(
+      interaction('ncq:missing:0'),
+      { name: 'gateway-stub', handleWebhook: vi.fn(async () => new Response('ok')) } as unknown as Adapter,
+      { onInbound: async () => {}, onInboundEvent: async () => {}, onMetadata: () => {}, onAction },
+      'bot-token',
+    );
+
+    expect(onAction).not.toHaveBeenCalled();
+    const callbackInit = fetchMock.mock.calls[0]?.[1];
+    expect(callbackInit).toBeDefined();
+    expect(JSON.parse(callbackInit!.body as string)).toMatchObject({
+      type: 4,
+      data: { flags: 64 },
+    });
   });
 });

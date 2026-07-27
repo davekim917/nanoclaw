@@ -22,6 +22,7 @@ vi.mock('../webhook-server.js', () => ({
 }));
 
 import { closeDb, initTestDb, runMigrations } from '../db/index.js';
+import { createPendingApproval } from '../db/sessions.js';
 import type { ChannelSetup } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 
@@ -42,7 +43,10 @@ function makeAdapter(edits: CapturedEdit[]): Adapter {
   } as unknown as Adapter;
 }
 
-async function fireAction(user: Record<string, unknown>): Promise<{ edits: CapturedEdit[]; actions: string[] }> {
+async function fireAction(
+  user: Record<string, unknown>,
+  action: { actionId: string; value: string } = { actionId: 'ncq:q-1:approve', value: 'approve' },
+): Promise<{ edits: CapturedEdit[]; actions: string[] }> {
   const edits: CapturedEdit[] = [];
   const actions: string[] = [];
   const adapter = makeAdapter(edits);
@@ -61,17 +65,32 @@ async function fireAction(user: Record<string, unknown>): Promise<{ edits: Captu
   expect(chat).toBeTruthy();
   await chat.processAction(
     {
-      actionId: 'ncq:q-1:approve',
+      actionId: action.actionId,
       adapter,
       messageId: 'msg-1',
       raw: {},
       threadId: 'T-1',
       user: user as never,
-      value: 'approve',
+      value: action.value,
     },
     undefined,
   );
   return { edits, actions };
+}
+
+function seedApproval(id: string, title = '⚠️ Test approval'): void {
+  createPendingApproval({
+    approval_id: id,
+    request_id: id,
+    action: 'test',
+    payload: '{}',
+    created_at: new Date().toISOString(),
+    title,
+    options_json: JSON.stringify([
+      { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve', style: 'primary' },
+      { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject', style: 'danger' },
+    ]),
+  });
 }
 
 beforeEach(() => {
@@ -108,5 +127,28 @@ describe('chat-sdk-bridge approval-card byline', () => {
     expect(edits).toHaveLength(1);
     expect(edits[0].markdown).not.toContain('—');
     expect(edits[0].markdown).toContain('approve');
+  });
+
+  it('resolves an indexed Approve button to approve before dispatching it', async () => {
+    seedApproval('q-1');
+
+    const { edits, actions } = await fireAction(
+      { userId: 'U1', userName: 'gavriel' },
+      { actionId: 'ncq:q-1:0', value: '0' },
+    );
+
+    expect(actions).toEqual(['q-1:approve:U1']);
+    expect(edits).toHaveLength(1);
+    expect(edits[0].markdown).toContain('✅ Approved');
+  });
+
+  it('does not turn an unresolved indexed button into a rejection', async () => {
+    const { edits, actions } = await fireAction(
+      { userId: 'U1', userName: 'gavriel' },
+      { actionId: 'ncq:missing:0', value: '0' },
+    );
+
+    expect(actions).toEqual([]);
+    expect(edits).toEqual([]);
   });
 });

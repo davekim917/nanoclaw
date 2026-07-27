@@ -80,7 +80,7 @@ function seedSession(): void {
   initSessionFolder('ag-1', 'sess-1');
 }
 
-async function runDestructiveGate(label: string, requestId: string): Promise<void> {
+async function runDestructiveGate(label: string, requestId: string, command?: string): Promise<void> {
   const handler = getDeliveryAction('request_destructive_gate');
   const session = getSession('sess-1');
   expect(handler).toBeDefined();
@@ -93,6 +93,7 @@ async function runDestructiveGate(label: string, requestId: string): Promise<voi
         label,
         summary: 'The agent wants to run a destructive command.',
         command:
+          command ??
           'CREATE OR REPLACE PROCEDURE XZO_PLATFORM.MASTER._LONG_TEST_SP() RETURNS STRING LANGUAGE SQL AS $$ SELECT 1; $$',
       },
       session!,
@@ -151,6 +152,23 @@ describe('bash destructive gate delivery', () => {
     expect(codePoints.at(-2)).toBe('🚨');
     expect(codePoints.at(-1)).toBe('…');
     expect(hasLoneSurrogate(content.title)).toBe(false);
+  });
+
+  it('retains the full command for audit while showing both ends of a long command on the card', async () => {
+    mocks.deliver.mockResolvedValue('slack-msg-command');
+    const command = `terraform apply -var='opening=${'a'.repeat(1800)}' -auto-approve --target=module.production`;
+
+    await runDestructiveGate('Terraform apply', 'gate-long-command', command);
+
+    const content = JSON.parse(mocks.deliver.mock.calls[0][4] as string) as { question: string };
+    expect(content.question).toContain("terraform apply -var='opening=");
+    expect(content.question).toContain('--target=module.production');
+    expect(content.question).toContain('…[middle omitted; full command retained in the approval record]…');
+
+    const pending = getDb()
+      .prepare('SELECT payload FROM pending_approvals WHERE request_id = ?')
+      .get('gate-long-command') as { payload: string } | undefined;
+    expect(JSON.parse(pending!.payload).command).toBe(command);
   });
 
   it('fails the gate ack immediately when approval-card delivery throws', async () => {

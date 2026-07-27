@@ -378,10 +378,32 @@ export function getAskQuestionRender(
 ): { title: string; options: import('../channels/ask-question.js').NormalizedOption[] } | undefined {
   const q = getPendingQuestion(id);
   if (q) return { title: q.title, options: q.options };
+
+  const parseRender = (
+    row: { title: string; options_json: string } | undefined,
+  ): { title: string; options: import('../channels/ask-question.js').NormalizedOption[] } | undefined => {
+    if (!row) return undefined;
+    try {
+      const options = JSON.parse(row.options_json);
+      if (!Array.isArray(options)) return undefined;
+      // A blank legacy title must not make an otherwise-valid indexed card
+      // undecodable. The title is display-only; options are the authority.
+      return {
+        title: row.title || '❓ Question',
+        options: options as import('../channels/ask-question.js').NormalizedOption[],
+      };
+    } catch {
+      // Corrupt legacy metadata must never turn an index into an arbitrary
+      // approval response. The bridge leaves the card pending instead.
+      return undefined;
+    }
+  };
+
   const a = getDb().prepare('SELECT title, options_json FROM pending_approvals WHERE approval_id = ?').get(id) as
     | { title: string; options_json: string }
     | undefined;
-  if (a?.title) return { title: a.title, options: JSON.parse(a.options_json) };
+  const approvalRender = parseRender(a);
+  if (approvalRender) return approvalRender;
 
   // Channel-registration + unknown-sender approvals persist title/options_json
   // the same way pending_approvals does — just SELECT and return.
@@ -389,14 +411,16 @@ export function getAskQuestionRender(
     const c = getDb()
       .prepare('SELECT title, options_json FROM pending_channel_approvals WHERE messaging_group_id = ?')
       .get(id) as { title: string; options_json: string } | undefined;
-    if (c?.title) return { title: c.title, options: JSON.parse(c.options_json) };
+    const channelRender = parseRender(c);
+    if (channelRender) return channelRender;
   }
 
   if (hasTable(getDb(), 'pending_sender_approvals')) {
     const s = getDb().prepare('SELECT title, options_json FROM pending_sender_approvals WHERE id = ?').get(id) as
       | { title: string; options_json: string }
       | undefined;
-    if (s?.title) return { title: s.title, options: JSON.parse(s.options_json) };
+    const senderRender = parseRender(s);
+    if (senderRender) return senderRender;
   }
 
   return undefined;
