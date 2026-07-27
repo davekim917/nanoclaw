@@ -803,6 +803,19 @@ function emailBypassIsRealArgvToken(gwsSegment: string): boolean {
   return false;
 }
 
+// Narrow read-only help form: optional export assignments, one direct gws
+// invocation, then only stderr-to-stdout plus a bounded head reader. The
+// regular argv verifier still proves help is a real gws option.
+const EMAIL_SAFE_HELP_PROBE_RE =
+  /^(?:export\s+(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>\x60$(){}#'"]+)(?:\s+[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>\x60$(){}#'"]+)*\s+&&\s+)?((?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>\x60$(){}#'"]+\s+)*gws\s+gmail\s+(?:\+(?:send|reply|reply-all|forward)|users\s+(?:messages|drafts)\s+send)(?:\s+[^\s;&|<>\x60$(){}#'"]+)*)\s+2>&1\s*\|\s*head\s+-\d+\s*$/;
+
+function emailSafeHelpProbeIsReadOnly(command: string): boolean {
+  const match = command.match(EMAIL_SAFE_HELP_PROBE_RE);
+  if (!match) return false;
+  const gwsSegment = match[1];
+  return /(?:^|[ \t])(?:--help|-h)(?:$|[ \t])/.test(gwsSegment) && emailBypassIsRealArgvToken(gwsSegment);
+}
+
 /**
  * Decode the RFC 822 envelope from `--json '{"raw":"<base64url>"}'` so the
  * approval card shows real recipient/subject when the agent uses the raw API
@@ -896,8 +909,9 @@ function evaluateEmailSendInline(command: string, env: { isScheduledTask: boolea
   // send is regex-visible OR obfuscated (`+se''nd`). A determined adversary can
   // still evade DETECTION at the shell layer (egress proxy is the sound boundary
   // — see email-gate-core.ts header), but no bypass-flag decoy rides past the
-  // gate. Keep in sync with email-gate-core.ts evaluateEmailSend (QA codex #4/#5).
-  if (emailBypassIsRealArgvToken(command)) return { action: 'allow' };
+  // gate. The only shell-operator exception is the bounded read-only help
+  // probe above. Keep in sync with email-gate-core.ts evaluateEmailSend.
+  if (emailSafeHelpProbeIsReadOnly(command) || emailBypassIsRealArgvToken(command)) return { action: 'allow' };
 
   // Scheduled tasks intentionally bypass — v1 also did this so
   // automated email reports aren't prompted every run.
@@ -1046,10 +1060,10 @@ export function createEmailGateHook(): HookCallback {
         requestId,
         label,
         summary,
-        // Empty command → host omits the raw-bash code block in the card.
-        // The command is still captured by the SDK's tool-call history
-        // and log stream, so we keep audit coverage without showing noise.
-        command: '',
+        // The host renders a bounded head+tail preview and retains the full
+        // command in the approval record. Approvers need enough context to
+        // make a real decision, even when this fallback owns the gate.
+        command: evalCommand,
       }),
     });
 
@@ -1148,16 +1162,45 @@ function filterSdkEnv(env: Record<string, string | undefined>): Record<string, s
  * directory is mounted and CLAUDE_PLUGINS_ROOT is set. Mirrors v1
  * `container/agent-runner/src/index.ts:discoverPlugins`.
  */
-function discoverPlugins(): SdkPluginConfig[] {
-  const pluginsRoot = process.env.CLAUDE_PLUGINS_ROOT || '/workspace/plugins';
-  if (!fs.existsSync(pluginsRoot)) return [];
+export interface PluginDiscovery {
+  plugins: SdkPluginConfig[];
+  preToolUseGuards: string[];
+}
+
+/**
+ * Discover Claude plugins and their optional NanoClaw guard capabilities.
+ *
+ * `nanoclaw-plugin.json` is deliberately separate from Claude's plugin
+ * manifest: it is an explicit host/plugin integration contract without
+ * relying on undocumented Claude-manifest extension fields.
+ */
+export function discoverPlugins(
+  pluginsRoot = process.env.CLAUDE_PLUGINS_ROOT || '/workspace/plugins',
+): PluginDiscovery {
+  if (!fs.existsSync(pluginsRoot)) return { plugins: [], preToolUseGuards: [] };
   const plugins: SdkPluginConfig[] = [];
+  const preToolUseGuards = new Set<string>();
   const hasManifest = (p: string) => fs.existsSync(path.join(p, '.claude-plugin', 'plugin.json'));
+  const addPlugin = (pluginPath: string): void => {
+    plugins.push({ type: 'local', path: pluginPath });
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(pluginPath, 'nanoclaw-plugin.json'), 'utf8')) as {
+        preToolUseGuards?: unknown;
+      };
+      if (Array.isArray(raw.preToolUseGuards)) {
+        for (const guard of raw.preToolUseGuards) {
+          if (typeof guard === 'string') preToolUseGuards.add(guard);
+        }
+      }
+    } catch {
+      // A plugin without the optional declaration remains a normal SDK plugin.
+    }
+  };
   let entries: string[] = [];
   try {
     entries = fs.readdirSync(pluginsRoot);
   } catch {
-    return [];
+    return { plugins: [], preToolUseGuards: [] };
   }
   for (const entry of entries) {
     const repoPath = path.join(pluginsRoot, entry);
@@ -1167,7 +1210,7 @@ function discoverPlugins(): SdkPluginConfig[] {
       continue;
     }
     if (hasManifest(repoPath)) {
-      plugins.push({ type: 'local', path: repoPath });
+      addPlugin(repoPath);
       continue;
     }
     let subs: string[] = [];
@@ -1184,7 +1227,7 @@ function discoverPlugins(): SdkPluginConfig[] {
         continue;
       }
       if (hasManifest(subPath)) {
-        plugins.push({ type: 'local', path: subPath });
+        addPlugin(subPath);
         continue;
       }
       let sub2s: string[] = [];
@@ -1201,12 +1244,12 @@ function discoverPlugins(): SdkPluginConfig[] {
           continue;
         }
         if (hasManifest(sub2Path)) {
-          plugins.push({ type: 'local', path: sub2Path });
+          addPlugin(sub2Path);
         }
       }
     }
   }
-  return plugins;
+  return { plugins, preToolUseGuards: [...preToolUseGuards] };
 }
 // ── Continuation rotation (cold-resume guard) ──
 
@@ -1354,15 +1397,17 @@ function ensureOpus1mSuffix(model: string): string {
  * Per-model-family default effort, applied only when nothing upstream chose
  * one (-e flag, group provider config, operator NANOCLAW_EFFORT_OVERRIDE).
  *
- *   opus 4.7+ → xhigh — the recommended starting point for coding/agentic
- *           work per the effort docs; deliberate fleet default (operator
- *           decision 2026-06-10). Opus 4.6 caps at high (no xhigh support).
+ *   opus → high — operator decision 2026-07-27, aligned with the GPT 5.6 SOL
+ *           default for cross-provider parity. Applies to the bare `opus`
+ *           alias and every concrete claude-opus-* id; this install only
+ *           runs Opus 5+ (opus 4.8 and below are no longer used). Operators
+ *           can dial up via -e or NANOCLAW_EFFORT_OVERRIDE.
  *   fable → high  — fable's docs recommend `high` as the default starting
  *           point; lower levels "often exceed xhigh performance on prior
  *           models", and fable bills 2x Opus ($10/$50 per MTok).
  *   sonnet → xhigh — Sonnet 5 (the bare `sonnet` alias) defaults to xhigh, the
- *           recommended setting for coding/agentic work; fleet decision,
- *           mirrors opus 4.7+. (This fork only runs Sonnet 5.)
+ *           recommended setting for coding/agentic work; fleet decision.
+ *           (This fork only runs Sonnet 5.)
  *   haiku → undefined — no effort control at the API level.
  *
  * `-e <level>` (turn or sticky) always wins over all of these — subject to
@@ -1371,10 +1416,12 @@ function ensureOpus1mSuffix(model: string): string {
 function defaultEffortForModel(model: string | undefined): string | undefined {
   if (!model) return 'high';
   const m = model.toLowerCase();
-  if (m === 'opus' || m.startsWith('claude-opus-')) {
-    // 4.6 and earlier have no xhigh (xhigh shipped with 4.7).
-    return /^claude-opus-4-[0-6]\b/.test(m) ? 'high' : 'xhigh';
-  }
+  // Opus 5+ only — every opus id (and the bare alias, which resolves to the
+  // current production opus via ANTHROPIC_DEFAULT_OPUS_MODEL) defaults to
+  // `high`. Pre-5 opus ids are no longer used in this install; if one ever
+  // appears, it falls through to the same `high` default rather than 400 on
+  // the unsupported `xhigh` of older opus generations.
+  if (m === 'opus' || m.startsWith('claude-opus-')) return 'high';
   // Sonnet 5 (the bare `sonnet` alias resolves to it) defaults to xhigh.
   if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'xhigh';
   if (m.startsWith('claude-fable-')) return 'high';
@@ -1396,15 +1443,10 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
 function clampEffortForModel(model: string | undefined, effort: string | undefined): string | undefined {
   if (!effort) return effort;
   const m = (model ?? '').toLowerCase();
-  const supported = (() => {
-    if (m === 'haiku' || m.startsWith('claude-haiku-')) return new Set<string>();
-    if (/^claude-opus-4-[0-6]\b/.test(m)) return new Set(['low', 'medium', 'high', 'max']);
-    // opus 4.7+, sonnet 5 + bare `sonnet`/`opus` aliases, fable, unknown future
-    // models: full surface (incl. xhigh).
-    return new Set(['low', 'medium', 'high', 'xhigh', 'max']);
-  })();
-  if (supported.has(effort)) return effort;
-  return defaultEffortForModel(model);
+  if (m === 'haiku' || m.startsWith('claude-haiku-')) return defaultEffortForModel(model);
+  // All non-haiku models (opus 5+, sonnet 5, fable) support the full effort
+  // surface. Pre-5 opus ids are no longer used in this install.
+  return effort;
 }
 
 // ── Provider ──
@@ -1711,9 +1753,14 @@ export class ClaudeProvider implements AgentProvider {
     // Discover plugins each query so hot-mounted plugin drops are picked up
     // without a container restart. Cheap (just fs.readdir under
     // /workspace/plugins); if it grows expensive, hoist to constructor.
-    const plugins = discoverPlugins();
+    const pluginDiscovery = discoverPlugins();
+    const plugins = pluginDiscovery.plugins;
+    const pluginOwnsBashEmailGate = pluginDiscovery.preToolUseGuards.includes('bash-email');
     if (plugins.length > 0) {
       log(`Loaded ${plugins.length} plugin(s): ${plugins.map((p) => path.basename(p.path)).join(', ')}`);
+    }
+    if (pluginOwnsBashEmailGate) {
+      log('Delegating Bash email approval gate to loaded plugin');
     }
 
     // Leave CLAUDE_CODE_SUBAGENT_MODEL unset: a concrete value outranks
@@ -1765,7 +1812,7 @@ export class ClaudeProvider implements AgentProvider {
                 createBlockSnowflakeConnectorHook(),
                 createBlockGitCloneHook(),
                 createBlockCodexCompanionHook(),
-                createEmailGateHook(),
+                ...(pluginOwnsBashEmailGate ? [] : [createEmailGateHook()]),
               ],
             },
           ],

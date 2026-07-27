@@ -362,9 +362,11 @@ export function materializeRawImageGeneration(
 // uses low | medium | high | xhigh | max | ultra. Ultra is a real Codex effort
 // value that adds proactive task delegation, not Claude's `ultracode` flag.
 //
-// Default is `xhigh` for the production model (gpt-5.6-sol); operators can dial
-// down per-agent via container.json when cost/latency matters more than
-// reasoning depth.
+// Default is `high` for the production model (gpt-5.6-sol); operators can dial
+// down or up per-agent via container.json when cost/latency dictate ("high"
+// covers the deeper of the standard tiers without the proactive-delegation
+// extras of xhigh/max/ultra). Changed from xhigh → high per operator decision
+// for GPT 5.6 SOL and Opus 5 (see claude.ts defaultEffortForModel).
 //
 // Sticky-only: `model` is applied at thread-start; `reasoning_effort` and the
 // native collaboration cap are applied at app-server spawn. They persist for
@@ -372,7 +374,7 @@ export function materializeRawImageGeneration(
 // exposed by Codex's `thread/start` shape.
 export const codexConfigSchema = z.strictObject({
   model: z.string().min(1).optional(),
-  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional().default('xhigh'),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional().default('high'),
   max_concurrent_threads_per_session: z
     .number()
     .int()

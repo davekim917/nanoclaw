@@ -53,12 +53,13 @@ describe('codexConfigSchema', () => {
     expect(result.success).toBe(false);
   });
 
-  it('test_codexConfigSchema_empty_object_defaults_to_xhigh', () => {
-    // gpt-5.6-sol (our default model) supports xhigh — default to the deepest
-    // tier that doesn't require an extra opt-in. Operators dial down via
-    // container.json when cost/latency matter more than reasoning depth.
+  it('test_codexConfigSchema_empty_object_defaults_to_high', () => {
+    // Operator decision 2026-07-27: default reasoning_effort is `high` for
+    // gpt-5.6-sol (production default), tuned for parity with Opus 5. The full
+    // ladder (xhigh|max|ultra) is still accepted when operators opt in via
+    // container.json.
     const parsed = codexConfigSchema.parse({});
-    expect(parsed).toEqual({ reasoning_effort: 'xhigh', max_concurrent_threads_per_session: 7 });
+    expect(parsed).toEqual({ reasoning_effort: 'high', max_concurrent_threads_per_session: 7 });
   });
 
   it('test_codexConfigSchema_explicit_low_overrides_default', () => {
@@ -125,18 +126,19 @@ describe('CodexProvider sticky config + override propagation', () => {
     expect(overrides.find((o) => o.startsWith('model_reasoning_effort'))).toBeUndefined();
   });
 
-  it('test_stickyConfig_default_xhigh_emits_override', () => {
+  it('test_stickyConfig_default_high_emits_override', () => {
     // CodexProvider's constructor parses providerConfig through the schema,
-    // which defaults reasoning_effort to 'xhigh' for gpt-5.6-sol (the default
-    // model). This covers the production path: every codex agent gets xhigh
-    // effort unless explicitly overridden in container.json.
+    // which defaults reasoning_effort to 'high' for gpt-5.6-sol (the default
+    // model) per operator decision 2026-07-27. This covers the production
+    // path: every codex agent gets high effort unless explicitly overridden
+    // in container.json.
     const p = new CodexProvider();
     const sticky = (p as unknown as {
       stickyConfig: { reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' };
     }).stickyConfig;
-    expect(sticky.reasoning_effort).toBe('xhigh');
+    expect(sticky.reasoning_effort).toBe('high');
     const overrides = createCodexConfigOverrides(sticky);
-    expect(overrides).toContain('model_reasoning_effort="xhigh"');
+    expect(overrides).toContain('model_reasoning_effort="high"');
   });
 
   it('test_stickyConfig_model_overrides_default_and_env', () => {

@@ -49,7 +49,7 @@ mock.module('../worktree-autosave.js', () => ({
 }));
 
 // Now import the schema and provider (after mocks are set up)
-const { claudeConfigSchema } = await import('./claude.js');
+const { claudeConfigSchema, discoverPlugins } = await import('./claude.js');
 const { ClaudeProvider } = await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 const TEST_CLAUDE_CONFIG_DIR = '/tmp/nanoclaw-claude-config-schema';
@@ -109,6 +109,52 @@ describe('claudeConfigSchema', () => {
   it('test_claudeConfigSchema_empty_input_ok: empty object passes', () => {
     const result = claudeConfigSchema.parse({});
     expect(result).toEqual({});
+  });
+});
+
+describe('Claude plugin discovery', () => {
+  it('reads an explicit NanoClaw Bash-email guard capability from a loaded plugin', () => {
+    const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-plugin-discovery-'));
+    try {
+      const workflow = path.join(pluginsRoot, 'bootstrap', 'workflow');
+      fs.mkdirSync(path.join(workflow, '.claude-plugin'), { recursive: true });
+      fs.writeFileSync(path.join(workflow, '.claude-plugin', 'plugin.json'), '{"name":"bootstrap-workflow"}');
+      fs.writeFileSync(path.join(workflow, 'nanoclaw-plugin.json'), '{"preToolUseGuards":["bash-email"]}');
+
+      const discovery = discoverPlugins(pluginsRoot);
+      expect(discovery.plugins).toEqual([{ type: 'local', path: workflow }]);
+      expect(discovery.preToolUseGuards).toEqual(['bash-email']);
+    } finally {
+      fs.rmSync(pluginsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('gives a declared Bootstrap Bash-email guard sole ownership of the gate', () => {
+    const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-plugin-owner-'));
+    const originalPluginsRoot = process.env.CLAUDE_PLUGINS_ROOT;
+    try {
+      const workflow = path.join(pluginsRoot, 'bootstrap', 'workflow');
+      fs.mkdirSync(path.join(workflow, '.claude-plugin'), { recursive: true });
+      fs.writeFileSync(path.join(workflow, '.claude-plugin', 'plugin.json'), '{"name":"bootstrap-workflow"}');
+      fs.writeFileSync(path.join(workflow, 'nanoclaw-plugin.json'), '{"preToolUseGuards":["bash-email"]}');
+      process.env.CLAUDE_PLUGINS_ROOT = pluginsRoot;
+      capturedSdkOptions = null;
+      mockSdkQuery.mockClear();
+
+      makeClaudeProvider().query({ prompt: 'hi', cwd: '/tmp', continuation: undefined });
+
+      const hooks = capturedSdkOptions?.hooks as
+        | { PreToolUse?: Array<{ hooks?: unknown[] }> }
+        | undefined;
+      // The native Email gate would be the sixth Bash hook. Its absence makes
+      // the declared plugin the sole owner and prevents duplicate cards.
+      expect(hooks?.PreToolUse?.[0]?.hooks).toHaveLength(5);
+      expect(capturedSdkOptions?.plugins).toEqual([{ type: 'local', path: workflow }]);
+    } finally {
+      if (originalPluginsRoot === undefined) delete process.env.CLAUDE_PLUGINS_ROOT;
+      else process.env.CLAUDE_PLUGINS_ROOT = originalPluginsRoot;
+      fs.rmSync(pluginsRoot, { recursive: true, force: true });
+    }
   });
 });
 
@@ -190,20 +236,20 @@ describe('per-model-family effort defaults', () => {
     }
   };
 
-  it('test_effort_default_opus_xhigh: flagless turn (opus alias default) gets xhigh', () => {
+  it('test_effort_default_opus5_high: flagless turn (opus alias default → Opus 5) gets high', () => {
     const opts = run({});
     expect(opts?.model).toBe('opus');
-    expect(opts?.effort).toBe('xhigh');
+    expect(opts?.effort).toBe('high');
   });
 
-  // The concrete id the `opus` alias now resolves to. Guards the version gate
-  // in defaultEffortForModel/clampEffortForModel: it only special-cases
-  // claude-opus-4-[0-6] (no xhigh before 4.7), so a single-digit Opus 5 id
-  // must fall through to the full ladder, not get clamped down to high.
-  it('test_effort_default_opus5_xhigh: explicit claude-opus-5[1m] defaults to xhigh', () => {
+  // The concrete id the `opus` alias now resolves to (claude-opus-5[1m]).
+  // Operator decision 2026-07-27: Opus 5 defaults to `high` for parity with
+  // the Codex gpt-5.6-sol default. The clamp path keeps xhigh available, so an
+  // explicit `-e xhigh` still survives (guarded by the next test).
+  it('test_effort_default_opus5_high_explicit_id: explicit claude-opus-5[1m] defaults to high', () => {
     const opts = run({ model: 'claude-opus-5[1m]' });
     expect(opts?.model).toBe('claude-opus-5[1m]');
-    expect(opts?.effort).toBe('xhigh');
+    expect(opts?.effort).toBe('high');
   });
 
   it('test_effort_xhigh_on_opus5_not_clamped: an explicit -e xhigh survives on Opus 5', () => {
@@ -251,11 +297,18 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBe('xhigh');
   });
 
-  it('test_effort_clamp_opus46_no_xhigh: opus 4.6 has no xhigh — flagless default and explicit xhigh both land on high', () => {
+  it('test_effort_all_opus_default_high: all opus models (5+, older) default to high', () => {
     const flagless = run({ model: 'claude-opus-4-6[1m]' });
     expect(flagless?.effort).toBe('high');
+    const flagless5 = run({ model: 'claude-opus-5[1m]' });
+    expect(flagless5?.effort).toBe('high');
+  });
+
+  it('test_effort_xhigh_survives_on_all_opus: explicit -e xhigh passes through on any opus model', () => {
+    // Pre-5 opus ids (4.6 etc.) are no longer used, but xhigh passes through
+    // regardless — only haiku clamps, every other model gets the full surface.
     const explicit = run({ model: 'claude-opus-4-6[1m]', effort: 'xhigh' });
-    expect(explicit?.effort).toBe('high');
+    expect(explicit?.effort).toBe('xhigh');
   });
 
   it('test_effort_clamp_haiku_drops_any_effort: haiku drops even an explicit effort (no API support)', () => {
@@ -303,7 +356,7 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
   };
 
   it('test_applySettings_model_switch: -m fable mid-turn → setModel + family-default effort', async () => {
-    const q = start(); // opus @ xhigh
+    const q = start(); // opus @ high (Opus 5 default as of 2026-07-27)
     await q.applySettings!({ model: 'claude-fable-5[1m]' });
     expect(capturedSetModel).toEqual(['claude-fable-5[1m]']);
     expect(capturedFlagSettings).toEqual([{ effortLevel: 'high' }]);
