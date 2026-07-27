@@ -391,3 +391,8 @@
   now canonicalizes that shorthand only when it resolves to exactly one allowed
   evidence row; ambiguous and invented IDs still fail closed. The prompt also
   states the enforced 1,000-character per-fact bound explicitly.
+- Historical replay proved the original 64 KiB generated-store bound was a
+  storage ceiling disguised as a context ceiling. The canonical store is now
+  bounded at 256 KiB, while curator input is independently relevance-ranked and
+  capped at 32,000 characters and automatic agent recall remains capped at
+  12,000 final characters. No existing fact is evicted merely to make room.

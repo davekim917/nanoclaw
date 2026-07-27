@@ -5,6 +5,7 @@ import { createHash } from 'crypto';
 import { buildSessionServicesSnapshot, type SessionServicesSnapshot } from '../../capabilities.js';
 import { getDb } from '../../db/connection.js';
 import { queryArchiveExactLinks, searchArchiveEvidence, type ArchiveEvidenceRow } from '../../message-archive.js';
+import { GENERATED_MEMORY_MAX_BYTES, GENERATED_MEMORY_RELATIVE_PATH } from './curator-contract.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
@@ -525,6 +526,7 @@ function readBoundedFile(
   filePath: string,
   canonicalRoot: string,
   allowedBytes: number,
+  fileBytes: number = PRE_TURN_BOUNDS.markdownFileBytes,
 ): { content: string; bytes: number; truncated: boolean } {
   // Open the checked leaf itself without following a final-component symlink,
   // then validate the identity of the object that was actually opened. A
@@ -549,7 +551,7 @@ function readBoundedFile(
     if (!resolvedStat.isFile() || stat.dev !== resolvedStat.dev || stat.ino !== resolvedStat.ino) {
       throw new Error('opened Markdown file identity changed during validation');
     }
-    const bytes = Math.max(0, Math.min(stat.size, allowedBytes, PRE_TURN_BOUNDS.markdownFileBytes));
+    const bytes = Math.max(0, Math.min(stat.size, allowedBytes, fileBytes));
     const buffer = Buffer.alloc(bytes);
     const read = bytes > 0 ? fs.readSync(fd, buffer, 0, bytes, 0) : 0;
     const truncated = stat.size > read;
@@ -665,7 +667,12 @@ function readMemoryEvidence(
       });
       break;
     }
-    const read = readBoundedFile(path.join(root, relative), canonicalRoot, remaining);
+    const read = readBoundedFile(
+      path.join(root, relative),
+      canonicalRoot,
+      remaining,
+      relative === GENERATED_MEMORY_RELATIVE_PATH ? GENERATED_MEMORY_MAX_BYTES : PRE_TURN_BOUNDS.markdownFileBytes,
+    );
     scannedBytes += read.bytes;
     const headings = headingsOf(read.content);
     const searchable = `${relative}\n${headings.join('\n')}\n${read.content}`;

@@ -3,7 +3,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { MemoryCurationArchiveRow, MemoryCurationEpisode } from '../../message-archive.js';
 import type { CuratorBackendResult } from './curator-backend.js';
 import type { CuratorWriteResult } from './curator-write.js';
-import { boundEpisodeMessages, isMemoryCuratorEnabled, MemoryCuratorWorker } from './curator-worker.js';
+import {
+  boundEpisodeMessages,
+  isMemoryCuratorEnabled,
+  MemoryCuratorWorker,
+  selectGeneratedMemoryForPrompt,
+} from './curator-worker.js';
 import type { MemoryCuratorWorkerDependencies } from './curator-worker.js';
 
 const episode: MemoryCurationEpisode = {
@@ -339,6 +344,20 @@ describe('memory curator worker', () => {
     expect(result.messages[0]?.text.endsWith('\n[truncated:episode]')).toBe(true);
     expect(result.transcriptChars).toBe(24_000);
     expect(result.handledThroughRowid).toBe(1);
+  });
+
+  it('keeps curator input bounded while retaining the most relevant generated facts', () => {
+    const lines = Array.from({ length: 400 }, (_, index) => {
+      const topic = index === 0 ? 'Snowflake contains GSC data.' : `Unrelated durable fact ${index}.`;
+      return `- ${topic} <!-- nanoclaw-memory:id=mem_${index.toString(16).padStart(16, '0')};evidence=msg-${index};captured=2026-07-26T00:00:00.000Z -->`;
+    });
+    const selected = selectGeneratedMemoryForPrompt(
+      ['# Generated workgroup memory', '', ...lines, ''].join('\n'),
+      'Where is GSC data stored in Snowflake?',
+    );
+    expect(selected.length).toBeLessThanOrEqual(32_000);
+    expect(selected).toContain('Snowflake contains GSC data.');
+    expect(selected).toMatch(/^# Generated workgroup memory\n\n/);
   });
 
   it('retires thresholded maintenance deterministically without another model-authored document', async () => {

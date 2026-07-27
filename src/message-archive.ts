@@ -216,7 +216,7 @@ export const MEMORY_CURATION_HOURLY_LIMIT = 120;
 export const MEMORY_CURATION_DAILY_LIMIT = 3000;
 export const MEMORY_CURATION_CALL_RETENTION_MS = 2 * 24 * 60 * 60_000;
 export const MEMORY_MAINTENANCE_UPDATE_THRESHOLD = 50;
-export const MEMORY_MAINTENANCE_SIZE_THRESHOLD = 48 * 1024;
+export const MEMORY_MAINTENANCE_SIZE_THRESHOLD = 192 * 1024;
 
 export interface MemoryCurationEpisode {
   episodeKey: string;

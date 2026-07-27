@@ -12,6 +12,7 @@ const HELPER_PATH = fileURLToPath(
 );
 const HELPER_TIMEOUT_MS = 10_000;
 const HELPER_OUTPUT_MAX_BYTES = 16 * 1024;
+const HELPER_REQUEST_OVERHEAD_BYTES = 16 * 1024;
 const HISTORY_LIMIT = 20;
 
 export interface CuratorWriteResult {
@@ -160,7 +161,9 @@ function snapshotCurrent(
 
 async function invokeHelper(request: Record<string, unknown>): Promise<CuratorWriteResult> {
   const body = JSON.stringify(request);
-  if (Buffer.byteLength(body) > 80 * 1024) throw new Error('curator write request exceeds 80 KiB');
+  if (Buffer.byteLength(body) > GENERATED_MEMORY_MAX_BYTES + HELPER_REQUEST_OVERHEAD_BYTES) {
+    throw new Error('curator write request exceeds its bounded maximum');
+  }
   const bunBinary = resolveBunBinary();
   return await new Promise((resolve, reject) => {
     const child = spawn(bunBinary, [HELPER_PATH], {
@@ -205,7 +208,7 @@ export async function writeGeneratedMemory(
   options: { nowMs?: number } = {},
 ): Promise<CuratorWriteResult> {
   if (Buffer.byteLength(content, 'utf8') > GENERATED_MEMORY_MAX_BYTES) {
-    throw new Error('generated memory exceeds 64 KiB');
+    throw new Error('generated memory exceeds 256 KiB');
   }
   ensureGeneratedDirectory(workgroupId);
   const current = readGeneratedMemory(workgroupId);

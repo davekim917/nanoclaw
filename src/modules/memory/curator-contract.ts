@@ -4,7 +4,7 @@ import { scrubSecrets } from '../../secret-scrubber.js';
 import type { MemoryCurationArchiveRow } from '../../message-archive.js';
 
 export const GENERATED_MEMORY_RELATIVE_PATH = 'generated/memory.md';
-export const GENERATED_MEMORY_MAX_BYTES = 65_536;
+export const GENERATED_MEMORY_MAX_BYTES = 256 * 1024;
 export const CURATOR_MAX_EVIDENCE_IDS = 20;
 export const CURATOR_MAX_SUPERSESSIONS = 3;
 export const CURATOR_MAX_NEW_MEMORIES = 8;
@@ -299,7 +299,7 @@ export function validateCuratorDecision(value: unknown, context: CuratorValidati
     return { action: 'noop', evidenceIds: [...decisionEvidence], reasonCode: 'duplicate' };
   }
   if (Buffer.byteLength(content, 'utf8') > GENERATED_MEMORY_MAX_BYTES) {
-    throw new Error('generated memory exceeds 64 KiB');
+    throw new Error('generated memory exceeds 256 KiB');
   }
   validateGeneratedDocument(content);
   return {

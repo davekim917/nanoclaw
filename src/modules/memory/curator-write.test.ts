@@ -117,6 +117,15 @@ describe('host generated-memory writer', () => {
     expect(listGeneratedMemorySnapshots(TEST_WORKGROUP)).toHaveLength(1);
   });
 
+  it('writes a generated canon larger than the per-file recall default through the bounded helper', async () => {
+    const large = `${content}${'x'.repeat(70 * 1024)}\n`;
+    expect(Buffer.byteLength(large)).toBeGreaterThan(64 * 1024);
+    await expect(writeGeneratedMemory(TEST_WORKGROUP, large, null)).resolves.toMatchObject({
+      status: 'success',
+    });
+    expect(readGeneratedMemory(TEST_WORKGROUP).content).toBe(large);
+  });
+
   it('returns conflict before spawning when the expected hash is stale', async () => {
     await writeGeneratedMemory(TEST_WORKGROUP, content, null);
     await expect(writeGeneratedMemory(TEST_WORKGROUP, `${content}\n`, null)).resolves.toMatchObject({

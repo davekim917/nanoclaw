@@ -246,6 +246,23 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
   });
 
+  it('recalls relevant generated memory beyond the ordinary 64 KiB Markdown-file bound', () => {
+    memoryFile(
+      'generated/memory.md',
+      `# Generated workgroup memory\n\n${'unrelated filler '.repeat(4_500)}\n- GSC data is stored in Snowflake.`,
+    );
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'Where is GSC data stored?' }),
+    });
+    expect(
+      result.memoryEvidence.excerpts.some((excerpt) => excerpt.text.includes('GSC data is stored in Snowflake')),
+    ).toBe(true);
+  });
+
   it('detects a correction that conflicts with always-loaded core canon', () => {
     memoryFile('index.md', '# Canon\nSipTrue DNS is managed in Wix.');
     archive(

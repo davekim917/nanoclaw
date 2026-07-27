@@ -41,6 +41,7 @@ const MAX_RAW_MESSAGES = 80;
 const MAX_EPISODE_MESSAGES = 80;
 const MAX_EPISODE_CHARS = 24_000;
 const EPISODE_TRUNCATION_MARKER = '\n[truncated:episode]';
+const MAX_GENERATED_PROMPT_CHARS = 32_000;
 const MAX_MANUAL_FILES = 256;
 const MAX_MANUAL_SCAN_BYTES = 1_048_576;
 const MAX_MANUAL_FILE_BYTES = 65_536;
@@ -178,6 +179,32 @@ export function boundEpisodeMessages(raw: MemoryCurationArchiveRow[]): {
     transcriptChars += text.length;
   }
   return { messages, handledThroughRowid, transcriptChars };
+}
+
+export function selectGeneratedMemoryForPrompt(content: string, query: string): string {
+  if (content.length <= MAX_GENERATED_PROMPT_CHARS) return content;
+  const queryTokens = new Set(tokenizeForRecall(query));
+  const candidates = content
+    .split('\n')
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => line.startsWith('- '))
+    .map(({ line, index }) => {
+      const tokens = new Set(tokenizeForRecall(line.slice(0, line.indexOf('<!--'))));
+      let score = 0;
+      for (const token of queryTokens) if (tokens.has(token)) score++;
+      return { line, index, score };
+    })
+    .sort((a, b) => b.score - a.score || b.index - a.index);
+  const heading = '# Generated workgroup memory\n\n';
+  let chars = heading.length + 1;
+  const selected: Array<{ line: string; index: number }> = [];
+  for (const candidate of candidates) {
+    if (chars + candidate.line.length + 1 > MAX_GENERATED_PROMPT_CHARS) continue;
+    selected.push(candidate);
+    chars += candidate.line.length + 1;
+  }
+  selected.sort((a, b) => a.index - b.index);
+  return `${heading}${selected.map(({ line }) => line).join('\n')}\n`;
 }
 
 function safeReadManualFile(filePath: string, canonicalRoot: string, maxBytes: number): string | null {
@@ -346,11 +373,12 @@ export class MemoryCuratorWorker {
       const handledEpisode = { ...episode, claimedThroughRowid: bounded.handledThroughRowid };
       const generated = this.deps.readGenerated(episode.workgroupId);
       const query = bounded.messages.map((message) => message.text).join('\n');
+      const generatedPrompt = selectGeneratedMemoryForPrompt(generated.content, query);
       const manual = this.deps.manualMemory(episode.workgroupId, query);
       const prompt = buildCuratorPrompt({
         workgroupId: episode.workgroupId,
         messages: bounded.messages,
-        generatedMemory: generated.content,
+        generatedMemory: generatedPrompt,
         relevantManualMemory: manual,
         boundary: this.deps.uuid().replaceAll('-', ''),
       });

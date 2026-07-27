@@ -159,7 +159,9 @@ One job receives:
 
 - at most 20 de-duplicated archive messages;
 - at most 24,000 transcript characters;
-- the current `generated/memory.md`, capped at 64 KiB;
+- a relevance-ranked view of the current `generated/memory.md`, capped at
+  32,000 prompt characters; the canonical file remains independently bounded
+  at 256 KiB;
 - up to three relevant excerpts from other canonical Markdown;
 - trusted timestamps, roles, archive IDs, and workgroup scope;
 - no tools, mounts, capability credentials, or arbitrary filesystem access.
@@ -221,7 +223,7 @@ curator stops new jobs but leaves recall and foreground writes intact.
 The host records a maintenance threshold when either:
 
 - 50 accepted generated updates have accumulated; or
-- `generated/memory.md` exceeds 48 KiB.
+- `generated/memory.md` exceeds 192 KiB.
 
 The worker retires that threshold deterministically without a model call or
 write. The host renderer already emits the only supported flat canonical

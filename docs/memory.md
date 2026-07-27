@@ -78,8 +78,11 @@ Anthropic model endpoint bypasses the OneCLI credential proxy so the gateway
 cannot replace the selected identity. The host also recovers the real primary
 from `.env` when the OneCLI service wrapper has shadowed it with its
 `placeholder` sentinel. Each job is bounded to 80 de-duplicated messages and
-24,000 transcript characters, the current generated file, and up to three
-relevant manual-memory excerpts. Its default decision is `noop`.
+24,000 transcript characters, a relevance-ranked generated-memory view capped
+at 32,000 characters, and up to three relevant manual-memory excerpts. The
+canonical generated store is independently bounded at 256 KiB; automatic
+agent recall remains governed by the 12,000-character final context budget.
+Its default decision is `noop`.
 It captures only durable decisions, corrections, stable cross-task
 preferences, verified outcomes, and durable workflows. It rejects secrets,
 capability state, transient work, speculation, third-party uncertainty, and
@@ -120,7 +123,7 @@ due episodes, oldest due time, retry count, and per-slot cooldown state are
 reported by the runtime verifier, and admission delay or total credential
 unavailability emits a throttled warning without deleting work.
 
-After 50 accepted updates or when generated memory exceeds 48 KiB, the host
+After 50 accepted updates or when generated memory exceeds 192 KiB, the host
 retires the maintenance threshold without asking a model to rewrite the
 document. The deterministic renderer already maintains the one canonical flat
 representation, so a second model-authored presentation pass would add failure

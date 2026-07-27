@@ -14,10 +14,14 @@ interface ProcessWriteRequest {
   allowGeneratedMemory?: boolean;
 }
 
+const MAX_CURATOR_WRITE_REQUEST_BYTES = 272 * 1024;
+
 if (import.meta.main) {
   const encoded = process.argv[2];
   const raw = encoded ? Buffer.from(encoded, 'base64url').toString('utf8') : await Bun.stdin.text();
-  if (!raw || Buffer.byteLength(raw) > 80 * 1024) throw new Error('bounded write request is required');
+  if (!raw || Buffer.byteLength(raw) > MAX_CURATOR_WRITE_REQUEST_BYTES) {
+    throw new Error('bounded write request is required');
+  }
   const request = JSON.parse(raw) as ProcessWriteRequest;
 
   const result = await writeMemoryFile(
