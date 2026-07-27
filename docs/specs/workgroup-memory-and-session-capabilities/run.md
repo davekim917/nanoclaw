@@ -386,3 +386,8 @@
   IDs, trusted timestamps, and provenance markers, then validates its own
   rendered document. The old model-authored maintenance rewrite is retired for
   the same reason.
+- Retained-queue replay exposed provider-namespaced Discord archive IDs such as
+  `<platform-id>:<agent-group>` being cited by their raw platform ID. The host
+  now canonicalizes that shorthand only when it resolves to exactly one allowed
+  evidence row; ambiguous and invented IDs still fail closed. The prompt also
+  states the enforced 1,000-character per-fact bound explicitly.

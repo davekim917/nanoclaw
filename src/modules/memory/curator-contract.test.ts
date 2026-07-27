@@ -57,6 +57,46 @@ describe('background memory curator contract', () => {
     expect(parseGeneratedMemoryFacts(decision.content)).toHaveLength(1);
   });
 
+  it('canonicalizes an unambiguous raw platform evidence id to its archived provider namespace', () => {
+    const decision = validateCuratorDecision(
+      {
+        action: 'replace_generated_memory',
+        reasonCode: 'durable_fact',
+        supersedesMemoryIds: [],
+        memories: [{ text: 'Durable fact.', evidenceIds: ['platform-message'] }],
+      },
+      {
+        currentContent: '',
+        allowedEvidenceIds: new Set(['platform-message:provider-sibling']),
+        currentEpisodeEvidence: new Map([['platform-message:provider-sibling', '2026-07-26T00:00:00.000Z']]),
+      },
+    );
+    if (decision.action !== 'replace_generated_memory') throw new Error('expected replacement');
+    expect(decision.evidenceIds).toEqual(['platform-message:provider-sibling']);
+    expect(decision.content).toContain('evidence=platform-message:provider-sibling;');
+  });
+
+  it('rejects ambiguous raw platform evidence ids', () => {
+    expect(() =>
+      validateCuratorDecision(
+        {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'Durable fact.', evidenceIds: ['msg-1'] }],
+        },
+        {
+          currentContent: '',
+          allowedEvidenceIds: new Set(['msg-1:claude', 'msg-1:codex']),
+          currentEpisodeEvidence: new Map([
+            ['msg-1:claude', '2026-07-26T00:00:00.000Z'],
+            ['msg-1:codex', '2026-07-26T00:00:00.000Z'],
+          ]),
+        },
+      ),
+    ).toThrow(/unknown evidence/);
+  });
+
   it('preserves every active fact automatically while appending a new one', () => {
     const decision = validateCuratorDecision(
       {
@@ -228,6 +268,7 @@ describe('background memory curator contract', () => {
     expect(prompt.system).toContain('semantic memory candidates only');
     expect(prompt.system).toContain('NanoClaw owns the document format');
     expect(prompt.system).toContain('Do not return Markdown');
+    expect(prompt.system).toContain('under 1,000 characters');
     expect(prompt.system).toContain('for noop both must be empty arrays');
   });
 });
