@@ -11,15 +11,18 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
-import { getSessionSpawnTaskId } from './db/session-routing.js';
+import { getSessionRouting, getSessionSpawnTaskId } from './db/session-routing.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
   advanceMemoryContextEpoch,
   clearContinuation,
   clearCurrentInReplyTo,
+  clearPendingNext,
+  getPendingNext,
   migrateLegacyContinuation,
   setContinuation,
   setCurrentInReplyTo,
+  setPendingNext,
   getStickyModel,
   setStickyModel,
   clearStickyModel,
@@ -92,6 +95,72 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
 // waited out 5 minutes of silence.
 const CODEX_IDLE_RETRY_MAX = 1;
 const CODEX_IDLE_RETRY_BASE_MS = 3000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEXT: continuation — "announce, then actually do it".
+//
+// The failure mode this kills: the agent posts "Starting X next" as its final
+// output and the turn ends — the container goes idle, dies at the host's
+// 30-min ceiling, and the promise sits dead until a human pings. The agent's
+// intent to continue is only knowable to the agent, so the contract
+// (container/CLAUDE.md "Container lifecycle") gives it exactly one way to
+// declare that intent: end the turn with `<internal>NEXT: <task></internal>`.
+// The runner then continues the stream on that task IMMEDIATELY — no idle
+// gap, no scheduled wake, no human nudge. The task is persisted in
+// session_state so a container death mid-chain resumes instead of forgetting
+// (the poll loop injects it whenever it would otherwise go idle).
+//
+// Clearing rules: any clean result with no NEXT: directive clears the stored
+// task — a finished chain, or newer user input superseding the promise. Error
+// deliveries and nudge-retries never touch it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Hard bound on consecutive self-promised continuations (persisted, cross-restart). */
+export const NEXT_CHAIN_MAX = 50;
+const NEXT_TASK_MAX_CHARS = 500;
+const NEXT_PROMPT_MARK = '<system>You ended your previous turn by promising this next task';
+
+/**
+ * Parse the LAST `NEXT:` directive from a result's raw text. Accepted forms:
+ * a bare `NEXT: <task>` line, or one wrapped in `<internal>` tags (the
+ * contracted, never-user-visible form). Last-wins so a revised promise
+ * supersedes an earlier one in the same message.
+ */
+export function extractNextDirective(text: string): string | null {
+  let task: string | null = null;
+  for (const match of text.matchAll(/(?:^|\n)[ \t]*(?:<internal>)?[ \t]*NEXT:[ \t]+([^\n]+?)[ \t]*(?:<\/internal>)?[ \t]*(?=\n|$)/g)) {
+    task = match[1];
+  }
+  if (!task) return null;
+  return task.slice(0, NEXT_TASK_MAX_CHARS);
+}
+
+export function buildNextContinuationPrompt(task: string): string {
+  return (
+    `${NEXT_PROMPT_MARK}, and it has not been done:\n` +
+    `NEXT: ${task}\n` +
+    `Continue with it NOW — start the work immediately. Do not re-acknowledge, summarize, or announce; ` +
+    `if you must say something mid-work, use send_message. End this turn only when the task is done, ` +
+    `blocked on the user, or superseded by a new NEXT: directive.</system>`
+  );
+}
+
+export type NextContinuationDecision =
+  | { action: 'continue'; task: string; chain: number }
+  | { action: 'clear' }
+  | { action: 'park'; task: string };
+
+/**
+ * Pure state transition for a completed result. `storedChain` is the chain
+ * count persisted for this session (0 when no promise is stored).
+ */
+export function decideNextContinuation(resultText: string, storedChain: number): NextContinuationDecision {
+  const task = extractNextDirective(resultText);
+  if (task === null) return { action: 'clear' };
+  const chain = storedChain + 1;
+  if (chain > NEXT_CHAIN_MAX) return { action: 'park', task };
+  return { action: 'continue', task, chain };
+}
 
 /**
  * True for SQLite errors that indicate a corrupt READ view — almost always a
@@ -259,6 +328,34 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Periodic heartbeat so we know the loop is alive
     if (pollCount % 30 === 0) {
       log(`Poll heartbeat (${pollCount} iterations, ${messages.length} pending)`);
+    }
+
+    // Promised-next resume: whenever the loop would otherwise go idle and a
+    // NEXT: task is stored, run it NOW as a synthetic batch through the
+    // normal turn path — never written to inbound.db. This is what keeps a
+    // continuation chain alive across user interrupts and container
+    // restarts: the promise outlives both, and the chain cap bounds it.
+    if (messages.length === 0) {
+      const pending = getPendingNext();
+      if (pending) {
+        const sr = getSessionRouting();
+        messages.push({
+          id: `next-resume-${Date.now()}`,
+          seq: null,
+          kind: 'chat',
+          timestamp: new Date().toISOString(),
+          status: 'pending',
+          process_after: null,
+          recurrence: null,
+          tries: 0,
+          trigger: 1,
+          platform_id: sr.platform_id,
+          channel_type: sr.channel_type,
+          thread_id: sr.thread_id,
+          content: JSON.stringify({ text: buildNextContinuationPrompt(pending.task), sender: 'system', senderId: 'system' }),
+        });
+        log(`Resuming promised next task (chain ${pending.chain}/${NEXT_CHAIN_MAX}): ${pending.task.slice(0, 120)}`);
+      }
     }
 
     if (messages.length === 0) {
@@ -1376,7 +1473,39 @@ export async function processQuery(
             }
             // The wrapping-retry result answers the SAME user prompt — keep it
             // queued so the retry archives against it, not the nudge text.
-            if (!willRetryWrapping && !willRetryTaskBlocks) archivePrompts.shift();
+            if (!willRetryWrapping && !willRetryTaskBlocks) {
+              archivePrompts.shift();
+
+              // NEXT: continuation — the agent ended its turn with a promised
+              // next task. Push it into the still-open stream so the agent
+              // continues NOW instead of the turn ending into silence. The
+              // task persists in session_state so a death mid-chain resumes
+              // via the poll loop's idle injection. Only evaluated on a final
+              // result — a wrapping/task-block nudge's own result re-evaluates.
+              const decision = decideNextContinuation(event.text, getPendingNext()?.chain ?? 0);
+              if (decision.action === 'continue') {
+                setPendingNext(decision.task, decision.chain);
+                const nextPrompt = buildNextContinuationPrompt(decision.task);
+                log(`NEXT: continuation (chain ${decision.chain}/${NEXT_CHAIN_MAX}): ${decision.task.slice(0, 120)}`);
+                query.push(nextPrompt);
+                archivePrompts.push(nextPrompt);
+              } else if (decision.action === 'clear') {
+                clearPendingNext();
+              } else {
+                clearPendingNext();
+                log(`NEXT: chain cap (${NEXT_CHAIN_MAX}) reached — parking: ${decision.task.slice(0, 120)}`);
+                writeMessageOut({
+                  id: generateId(),
+                  kind: 'chat',
+                  platform_id: routing.platformId,
+                  channel_type: routing.channelType,
+                  thread_id: routing.threadId,
+                  content: JSON.stringify({
+                    text: `I've chained ${NEXT_CHAIN_MAX} promised next tasks without finishing — pausing autonomous continuation. Next up was: ${decision.task}. Reply and I'll pick it up.`,
+                  }),
+                });
+              }
+            }
           }
         } else {
           archivePrompts.shift();

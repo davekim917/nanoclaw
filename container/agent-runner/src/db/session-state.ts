@@ -208,3 +208,38 @@ export function getCurrentInReplyTo(): string | null {
   if (!Number.isFinite(age) || age > IN_REPLY_TO_MAX_AGE_MS) return null;
   return row.value;
 }
+
+/**
+ * A promised next task the agent handed itself via a `NEXT:` directive
+ * (see container/CLAUDE.md "Container lifecycle"). Persisted because a
+ * continuation chain must survive a container death mid-chain: the poll
+ * loop reads it whenever it would otherwise go idle and resumes the task.
+ * `chain` counts consecutive continuations so a runaway self-promising
+ * agent is capped across restarts, not just per process.
+ */
+const PENDING_NEXT_KEY = 'pending_next';
+
+export interface PendingNext {
+  task: string;
+  chain: number;
+}
+
+export function getPendingNext(): PendingNext | undefined {
+  const raw = getValue(PENDING_NEXT_KEY);
+  if (raw === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as Partial<PendingNext>;
+    if (typeof parsed.task !== 'string' || parsed.task.trim() === '') return undefined;
+    return { task: parsed.task, chain: typeof parsed.chain === 'number' ? parsed.chain : 0 };
+  } catch {
+    return undefined;
+  }
+}
+
+export function setPendingNext(task: string, chain: number): void {
+  setValue(PENDING_NEXT_KEY, JSON.stringify({ task, chain }));
+}
+
+export function clearPendingNext(): void {
+  deleteValue(PENDING_NEXT_KEY);
+}

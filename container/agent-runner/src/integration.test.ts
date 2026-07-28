@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { getContinuation, setContinuation } from './db/session-state.js';
+import { getContinuation, setContinuation, getPendingNext, setPendingNext } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { ProviderExchange } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
@@ -397,6 +397,32 @@ async function waitFor(condition: () => boolean, timeoutMs: number): Promise<voi
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+describe('NEXT: promised-task resume', () => {
+  it('runs a stored NEXT: task when the loop would otherwise go idle, then clears it on a clean finish', async () => {
+    setPendingNext('write the dbt consolidation plan', 1);
+    // No inbound messages at all — the stored promise alone must drive a turn.
+
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      return '<message to="discord-test">plan written</message>';
+    });
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => prompts.some((p) => p.includes('NEXT: write the dbt consolidation plan')), 4000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 4000);
+    controller.abort();
+
+    expect(JSON.parse(getUndeliveredMessages()[0].content).text).toBe('plan written');
+    // Clean result with no new directive → promise cleared, loop goes idle.
+    expect(getPendingNext()).toBeUndefined();
+
+    await loopPromise.catch(() => {});
+  });
+});
 
 describe('poll loop — exchange hook (onExchangeComplete)', () => {
   // A provider that declares the per-exchange hook. The hook call is the

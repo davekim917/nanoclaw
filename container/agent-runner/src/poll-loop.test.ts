@@ -18,15 +18,19 @@ import {
   dispatchFileAttachment,
   dispatchResultText,
   applyFlagBatch,
+  decideNextContinuation,
+  extractNextDirective,
   handleEvent,
   isAdmissibleTrigger,
   isAupRefusal,
   isCorruptionError,
+  NEXT_CHAIN_MAX,
   processQuery,
   retainCompleteRecallPairs,
   selectInTurnFollowUps,
   transientOverloadDelayMs,
 } from './poll-loop.js';
+import { getPendingNext, setPendingNext } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -1665,5 +1669,130 @@ describe('transientOverloadDelayMs — server-overload backoff schedule', () => 
     let worstCaseMs = 0;
     for (let n = 0; n < 30; n++) worstCaseMs += transientOverloadDelayMs(n, 1);
     expect(worstCaseMs).toBeLessThan(30 * 60 * 1000);
+  });
+});
+
+describe('extractNextDirective', () => {
+  it('parses a directive inside <internal> tags', () => {
+    expect(extractNextDirective('<message to="x">ack</message>\n<internal>NEXT: write the dbt tests</internal>')).toBe(
+      'write the dbt tests',
+    );
+  });
+
+  it('parses a bare line', () => {
+    expect(extractNextDirective('Done with step 1.\nNEXT: run /team-plan on the dbt consolidation')).toBe(
+      'run /team-plan on the dbt consolidation',
+    );
+  });
+
+  it('last directive wins when a message revises its promise', () => {
+    expect(extractNextDirective('NEXT: first idea\nsome work\nNEXT: better idea')).toBe('better idea');
+  });
+
+  it('returns null when there is no directive', () => {
+    expect(extractNextDirective('<message to="x">all done</message>')).toBeNull();
+  });
+
+  it('does not match mid-line mentions', () => {
+    expect(extractNextDirective('The NEXT: thing is not a directive')).toBeNull();
+  });
+
+  it('truncates absurdly long tasks', () => {
+    const task = extractNextDirective(`NEXT: ${'x'.repeat(900)}`);
+    expect(task).toHaveLength(500);
+  });
+});
+
+describe('decideNextContinuation', () => {
+  it('clears when the result carries no directive', () => {
+    expect(decideNextContinuation('<message to="x">done</message>', 3)).toEqual({ action: 'clear' });
+  });
+
+  it('continues with an incremented chain', () => {
+    expect(decideNextContinuation('<internal>NEXT: keep going</internal>', 0)).toEqual({
+      action: 'continue',
+      task: 'keep going',
+      chain: 1,
+    });
+    expect(decideNextContinuation('NEXT: keep going', 7)).toEqual({ action: 'continue', task: 'keep going', chain: 8 });
+  });
+
+  it('parks at the chain cap instead of continuing', () => {
+    expect(decideNextContinuation('NEXT: forever', NEXT_CHAIN_MAX)).toEqual({ action: 'park', task: 'forever' });
+  });
+});
+
+describe('NEXT: continuation wiring', () => {
+  beforeEach(() => {
+    // Register chan-1 as a destination so <message to="chan-1"> resolves and
+    // results are "delivered" rather than routed through the re-wrap nudge.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('chan-1', 'Chan 1', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+  });
+
+  it('pushes a continuation into the open stream and persists the task', async () => {
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: '<message to="chan-1">On it.</message>\n<internal>NEXT: write the dbt tests</internal>',
+    });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('NEXT: write the dbt tests');
+    expect(pushes[0]).toContain('Continue with it NOW');
+    expect(getPendingNext()).toEqual({ task: 'write the dbt tests', chain: 1 });
+  });
+
+  it('a clean result with no directive clears the stored promise', async () => {
+    setPendingNext('write the dbt tests', 1);
+    const { query, pushes } = makeResultQuery({ type: 'result', text: '<message to="chan-1">Tests are green.</message>' });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(pushes).toHaveLength(0);
+    expect(getPendingNext()).toBeUndefined();
+  });
+
+  it('a normal result that re-promises supersedes the stored task and restarts the chain from stored', async () => {
+    setPendingNext('stale task', 4);
+    const { query } = makeResultQuery({
+      type: 'result',
+      text: '<message to="chan-1">Changing gears.</message>\n<internal>NEXT: new task</internal>',
+    });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(getPendingNext()).toEqual({ task: 'new task', chain: 5 });
+  });
+
+  it('does not continue while a wrapping nudge is in flight', async () => {
+    // With no destination at all, unwrapped prose can't be delivered — the
+    // re-wrap nudge fires (mirrors the pre-seeded-destination case). The NEXT:
+    // directive must wait for the nudge's own result, not fire alongside.
+    getInboundDb().prepare('DELETE FROM destinations').run();
+    const { query, pushes } = makeResultQuery({ type: 'result', text: 'bare prose\nNEXT: premature' });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('was not delivered');
+    expect(getPendingNext()).toBeUndefined();
+  });
+
+  it('parks with a visible note at the chain cap instead of continuing', async () => {
+    setPendingNext('loop forever', NEXT_CHAIN_MAX);
+    const { query, pushes } = makeResultQuery({ type: 'result', text: '<message to="chan-1">again</message>\nNEXT: once more' });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(pushes).toHaveLength(0);
+    expect(getPendingNext()).toBeUndefined();
+    const out = getUndeliveredMessages();
+    expect(out.some((m) => JSON.parse(m.content).text.includes('pausing autonomous continuation'))).toBe(true);
   });
 });
