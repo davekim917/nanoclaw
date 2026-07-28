@@ -1,5 +1,6 @@
 import {
   cancelWorkContinuation,
+  getCurrentInReplyTo,
   queueWorkContinuation,
   WORK_CONTINUATION_CHAIN_MAX,
   WORK_CONTINUATION_TASK_MAX_CHARS,
@@ -42,7 +43,7 @@ export const continueWork: McpToolDefinition = {
     if (!task || task.length > WORK_CONTINUATION_TASK_MAX_CHARS) {
       return err(`task is required (max ${WORK_CONTINUATION_TASK_MAX_CHARS} chars)`);
     }
-    const queued = queueWorkContinuation(task);
+    const queued = queueWorkContinuation(task, getCurrentInReplyTo());
     if (!queued.accepted) {
       return err(
         `autonomous continuation reached its ${WORK_CONTINUATION_CHAIN_MAX}-turn safety cap; ` +

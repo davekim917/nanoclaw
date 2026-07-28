@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { findByName, findByRouting, findPeerName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
+  getMessageIn,
   markProcessing,
   markCompleted,
   markScriptSkipped,
@@ -304,13 +305,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (pending && !idleSuppressedContinuationIds.has(pending.id) && isWorkContinuationRunnable(pending, runnerId)) {
         const runningWork = markWorkContinuationRunning(pending.id, runnerId);
         if (runningWork) {
-          const routing = extractRouting([]);
+          const sourceMessage = runningWork.source_message_id ? getMessageIn(runningWork.source_message_id) : undefined;
+          const sourceBatch = sourceMessage ? [sourceMessage] : [];
+          const routing = extractRouting(sourceBatch);
           const prompt = buildWorkContinuationPrompt(runningWork.task);
           const settings = applyFlagBatch([], routing, config.providerName);
           log(`Resuming durable continuation: ${runningWork.task.slice(0, 120)}`);
           config.provider.resetRotationCycle?.();
-          setCurrentInReplyTo(null);
-          clearBatchAnchors();
+          setCurrentInReplyTo(routing.inReplyTo);
+          setCurrentBatchAnchors(sourceBatch);
           let query: AgentQuery | undefined;
           const abortDirectQuery = () => query?.abort();
           try {
@@ -376,7 +379,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    const routing = extractRouting(messages);
+    let routing = extractRouting(messages);
+    const savedWork = getWorkContinuation();
+    if (!routing.platformId && savedWork?.source_message_id && isContinuationRecoveryBatch(messages)) {
+      const sourceMessage = getMessageIn(savedWork.source_message_id);
+      if (sourceMessage) {
+        const sourceRouting = extractRouting([sourceMessage]);
+        routing = { ...sourceRouting, quietStatus: routing.quietStatus, taskRun: routing.taskRun };
+      }
+    }
 
     // Command handling: the host router gates filtered and unauthorized
     // admin commands before they reach the container. The only command
@@ -1015,6 +1026,19 @@ function hasRealInbound(messages: MessageInRow[]): boolean {
       return content.sender !== 'system' && content.senderId !== 'system';
     } catch {
       return true;
+    }
+  });
+}
+
+function isContinuationRecoveryBatch(messages: MessageInRow[]): boolean {
+  if (hasRealInbound(messages)) return false;
+  return messages.some((message) => {
+    if (message.kind !== 'chat' && message.kind !== 'chat-sdk') return false;
+    try {
+      const content = JSON.parse(message.content) as { _system?: { kind?: unknown } };
+      return content._system?.kind === 'agent_ceiling_respawn' || content._system?.kind === 'agent_host_restart';
+    } catch {
+      return false;
     }
   });
 }

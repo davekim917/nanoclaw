@@ -220,6 +220,8 @@ export const WORK_CONTINUATION_RESUME_MAX_ATTEMPTS = 2;
 export interface WorkContinuation {
   id: string;
   task: string;
+  /** Inbound row that supplied the exact reply route for restart recovery. */
+  source_message_id?: string;
   phase: 'queued' | 'running';
   chain: number;
   runner_id?: string;
@@ -254,9 +256,16 @@ function parseWorkContinuation(raw: string): WorkContinuation | undefined {
     if (parsed.runner_id !== undefined && (typeof parsed.runner_id !== 'string' || parsed.runner_id === '')) {
       return undefined;
     }
+    const sourceMessageId =
+      typeof parsed.source_message_id === 'string' &&
+      parsed.source_message_id.length > 0 &&
+      parsed.source_message_id.length <= 1024
+        ? parsed.source_message_id
+        : undefined;
     return {
       id: parsed.id,
       task: parsed.task.trim(),
+      ...(sourceMessageId ? { source_message_id: sourceMessageId } : {}),
       phase: parsed.phase,
       chain: parsed.chain as number,
       ...(parsed.runner_id ? { runner_id: parsed.runner_id } : {}),
@@ -302,14 +311,19 @@ export function getWorkContinuation(): WorkContinuation | undefined {
   return migrateLegacyPendingNext();
 }
 
-export function queueWorkContinuation(task: string): QueueWorkContinuationResult {
+export function queueWorkContinuation(task: string, sourceMessageId?: string | null): QueueWorkContinuationResult {
   const normalized = task.trim();
+  const normalizedSourceMessageId =
+    typeof sourceMessageId === 'string' && sourceMessageId.length > 0 && sourceMessageId.length <= 1024
+      ? sourceMessageId
+      : undefined;
   const current = getWorkContinuation();
   const chain = (current?.chain ?? 0) + 1;
   if (chain > WORK_CONTINUATION_CHAIN_MAX) return { accepted: false, reason: 'chain-cap', chain };
   const continuation: WorkContinuation = {
     id: randomUUID(),
     task: normalized,
+    ...(normalizedSourceMessageId ? { source_message_id: normalizedSourceMessageId } : {}),
     phase: 'queued',
     chain,
     resume_attempts: 0,

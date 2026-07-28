@@ -253,6 +253,7 @@ export function decideContinuationWake(args: {
 export interface HostWorkContinuation {
   id: string;
   task: string;
+  source_message_id?: string;
   phase: 'queued' | 'running';
   chain: number;
   runner_id?: string;
@@ -291,6 +292,11 @@ export function readWorkContinuation(outDb: Database.Database): HostWorkContinua
       return {
         id: parsed.id,
         task: parsed.task.trim(),
+        ...(typeof parsed.source_message_id === 'string' &&
+        parsed.source_message_id.length > 0 &&
+        parsed.source_message_id.length <= 1024
+          ? { source_message_id: parsed.source_message_id }
+          : {}),
         phase: parsed.phase,
         chain: parsed.chain as number,
         ...(parsed.runner_id ? { runner_id: parsed.runner_id } : {}),
@@ -491,7 +497,14 @@ export function notifyContinuationParked(
 ): boolean {
   const marker = `continuation_recovery_parked:${continuation.id}:${continuation.recovery_episode}`;
   if (outDb.prepare('SELECT 1 FROM messages_out WHERE content LIKE ? LIMIT 1').get(`%${marker}%`)) return false;
-  const routing = readSessionRouting(inDb);
+  const sourceRouting = continuation.source_message_id
+    ? (inDb
+        .prepare('SELECT channel_type, platform_id, thread_id FROM messages_in WHERE id = ?')
+        .get(continuation.source_message_id) as
+        | { channel_type: string | null; platform_id: string | null; thread_id: string | null }
+        | undefined)
+    : undefined;
+  const routing = sourceRouting?.channel_type && sourceRouting.platform_id ? sourceRouting : readSessionRouting(inDb);
   if (!routing) return false;
   writeMessage({
     id: `continuation-parked-${continuation.id}-${continuation.recovery_episode}`,

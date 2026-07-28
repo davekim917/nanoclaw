@@ -143,13 +143,14 @@ describe('session-state — sticky fast mode', () => {
 
 describe('session-state — durable work continuation', () => {
   test('queues, marks running, and compare-clears only the matching id', () => {
-    const first = queueWorkContinuation('write the migration tests');
+    const first = queueWorkContinuation('write the migration tests', 'origin-message');
     expect(first.accepted).toBe(true);
     if (!first.accepted) throw new Error('expected accepted continuation');
 
     const running = markWorkContinuationRunning(first.continuation.id, 'runner-a');
     expect(running?.phase).toBe('running');
     expect(running?.runner_id).toBe('runner-a');
+    expect(running?.source_message_id).toBe('origin-message');
     expect(clearWorkContinuationIfMatches('stale-id')).toBe(false);
     expect(getWorkContinuation()?.id).toBe(first.continuation.id);
     expect(clearWorkContinuationIfMatches(first.continuation.id)).toBe(true);

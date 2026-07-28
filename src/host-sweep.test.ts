@@ -492,6 +492,7 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
   const continuation = {
     id: 'cont-1',
     task: 'write the dbt tests',
+    source_message_id: 'origin-1',
     phase: 'queued' as const,
     chain: 1,
     resume_attempts: 0,
@@ -563,6 +564,7 @@ describe('durable continuation wake', () => {
   const continuation = {
     id: 'cont-1',
     task: 'write the dbt tests',
+    source_message_id: 'origin-1',
     phase: 'queued' as const,
     chain: 1,
     resume_attempts: 0,
@@ -626,6 +628,7 @@ describe('durable continuation wake', () => {
 
     const first = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
     expect(first?.resume_attempts).toBe(1);
+    expect(first?.source_message_id).toBe('origin-1');
     expect(first).toMatchObject({ phase: 'queued' });
     expect(first?.runner_id).toBeUndefined();
     expect(readContinuationRecoveryAttemptAt(outDb, first!)).toBeGreaterThan(Date.now() - 1_000);
@@ -715,6 +718,29 @@ describe('durable continuation wake', () => {
     expect(
       outDb.prepare("SELECT COUNT(*) AS count FROM messages_out WHERE id LIKE 'continuation-parked-%'").get(),
     ).toEqual({ count: 2 });
+  });
+
+  it('routes parked accounting through the continuation source in an agent-shared session', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+         VALUES (?, 2, 'chat', ?, 'completed', 1, 'C-SHARED', 'slack', 'T-SHARED', '{}')`,
+      )
+      .run('origin-1', new Date().toISOString());
+    const writes: Array<{ platformId: string | null; channelType: string | null; threadId: string | null }> = [];
+
+    expect(
+      notifyContinuationParked(inDb, outDb, fakeSession(), continuation, (message) =>
+        writes.push({
+          platformId: message.platformId,
+          channelType: message.channelType,
+          threadId: message.threadId,
+        }),
+      ),
+    ).toBe(true);
+    expect(writes).toEqual([{ platformId: 'C-SHARED', channelType: 'slack', threadId: 'T-SHARED' }]);
   });
 });
 

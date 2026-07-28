@@ -479,6 +479,122 @@ describe('durable work continuation', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('preserves the originating route when resuming stored work without default session routing', async () => {
+    insertMessage(
+      'm-origin',
+      { sender: 'Alice', senderId: 'alice', text: 'finish this after restart' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-origin' },
+    );
+    getInboundDb().prepare("UPDATE messages_in SET status = 'completed' WHERE id = ?").run('m-origin');
+    queueWorkContinuation('resume the routed work', 'm-origin');
+
+    const provider = new MockProvider();
+    provider.query = () => ({
+      push: () => {},
+      end: () => {},
+      abort: () => {},
+      events: (async function* () {
+        yield { type: 'init' as const, continuation: 'routed-continuation-session' };
+        yield { type: 'progress' as const, message: 'recovered progress' };
+        yield { type: 'result' as const, text: '<message to="discord-test">recovered result</message>' };
+      })(),
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => getUndeliveredMessages().length >= 2, 4000);
+    controller.abort();
+
+    const routed = getUndeliveredMessages();
+    expect(routed.map((message) => message.kind)).toEqual(['status', 'chat']);
+    expect(
+      routed.map((message) => ({
+        platform_id: message.platform_id,
+        channel_type: message.channel_type,
+        thread_id: message.thread_id,
+        in_reply_to: message.in_reply_to,
+      })),
+    ).toEqual([
+      {
+        platform_id: 'chan-1',
+        channel_type: 'discord',
+        thread_id: 'thread-origin',
+        in_reply_to: 'm-origin',
+      },
+      {
+        platform_id: 'chan-1',
+        channel_type: 'discord',
+        thread_id: 'thread-origin',
+        in_reply_to: 'm-origin',
+      },
+    ]);
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('preserves the originating route while processing a continuation recovery wake', async () => {
+    insertMessage(
+      'm-recovery-origin',
+      { sender: 'Alice', senderId: 'alice', text: 'continue after a host restart' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-recovery' },
+    );
+    getInboundDb().prepare("UPDATE messages_in SET status = 'completed' WHERE id = ?").run('m-recovery-origin');
+    insertMessage('host-restart-1', {
+      sender: 'system',
+      senderId: 'system',
+      text: '[system] host restarted',
+      _system: { kind: 'agent_host_restart' },
+    });
+    getInboundDb()
+      .prepare("UPDATE messages_in SET platform_id = 'agent-group', channel_type = 'agent' WHERE id = ?")
+      .run('host-restart-1');
+    queueWorkContinuation('resume after the accountability wake', 'm-recovery-origin');
+
+    const provider = new MockProvider();
+    provider.query = () => ({
+      push: () => {},
+      end: () => {},
+      abort: () => {},
+      events: (async function* () {
+        yield { type: 'init' as const, continuation: 'recovery-wake-session' };
+        yield { type: 'progress' as const, message: 'accounting for recovered work' };
+        yield { type: 'result' as const, text: '<message to="discord-test">recovery accounted</message>' };
+      })(),
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => getUndeliveredMessages().length >= 2, 4000);
+    controller.abort();
+
+    expect(
+      getUndeliveredMessages().map((message) => ({
+        kind: message.kind,
+        platform_id: message.platform_id,
+        channel_type: message.channel_type,
+        thread_id: message.thread_id,
+        in_reply_to: message.in_reply_to,
+      })),
+    ).toEqual([
+      {
+        kind: 'status',
+        platform_id: 'chan-1',
+        channel_type: 'discord',
+        thread_id: 'thread-recovery',
+        in_reply_to: 'm-recovery-origin',
+      },
+      {
+        kind: 'chat',
+        platform_id: 'chan-1',
+        channel_type: 'discord',
+        thread_id: 'thread-recovery',
+        in_reply_to: 'm-recovery-origin',
+      },
+    ]);
+
+    await loopPromise.catch(() => {});
+  });
+
   it('checkpoints and requeues when a direct continuation query throws', async () => {
     queueWorkContinuation('work through a provider startup failure');
     const provider = new MockProvider();
