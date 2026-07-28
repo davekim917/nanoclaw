@@ -294,7 +294,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       log(`Poll heartbeat (${pollCount} iterations, ${messages.length} pending)`);
     }
 
-    if (messages.length === 0) {
+    const hasTriggeringMessage = messages.some((m) => m.trigger === 1);
+
+    // Accumulated trigger=0 context is idle from the agent's perspective: it
+    // must not starve already-promised durable work. Leave those rows pending
+    // so they still accompany the next real inbound turn.
+    if (!hasTriggeringMessage) {
       const pending = getWorkContinuation();
       if (pending && !idleSuppressedContinuationIds.has(pending.id) && isWorkContinuationRunnable(pending, runnerId)) {
         const runningWork = markWorkContinuationRunning(pending.id, runnerId);
@@ -366,7 +371,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // (and potentially responding to) every accumulate-only batch, defeating
     // the "store as context, don't engage" contract. Host-side countDueMessages
     // gates the same way for wake-from-cold (see src/db/session-db.ts).
-    if (!messages.some((m) => m.trigger === 1)) {
+    if (!hasTriggeringMessage) {
       await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }

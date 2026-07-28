@@ -454,6 +454,31 @@ describe('durable work continuation', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('runs stored work past accumulated context without consuming that context', async () => {
+    queueWorkContinuation('finish the durable migration work');
+    insertMessage('m-context', { sender: 'Alice', senderId: 'alice', text: 'earlier context' });
+    getInboundDb().prepare('UPDATE messages_in SET trigger = 0 WHERE id = ?').run('m-context');
+
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      return '<message to="discord-test">migration finished</message>';
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 4000);
+    controller.abort();
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('finish the durable migration work');
+    expect(prompts[0]).not.toContain('earlier context');
+    expect(getWorkContinuation()).toBeUndefined();
+    expect(getPendingMessages().map((message) => message.id)).toEqual(['m-context']);
+
+    await loopPromise.catch(() => {});
+  });
+
   it('checkpoints and requeues when a direct continuation query throws', async () => {
     queueWorkContinuation('work through a provider startup failure');
     const provider = new MockProvider();
