@@ -24,7 +24,7 @@ The mechanical steps under **Install** carry `nc:` directive fences: an agent re
 
 Check whether the payload is already wired (a prior apply, or a trunk that still carries it). All of these present means installed, but a reapply still runs the branch and composed-tree conformance gates below before authentication:
 
-- `src/providers/codex.ts` and `src/providers/codex-agents-md.ts`
+- `src/providers/codex.ts`
 - `container/agent-runner/src/providers/codex.ts` and `codex-app-server.ts`
 - `setup/providers/codex.ts`
 - `import './codex.js';` in `src/providers/index.ts`, `container/agent-runner/src/providers/index.ts`, and `setup/providers/index.ts`
@@ -67,8 +67,7 @@ The host files are the provider contribution + AGENTS.md compose + their
 guards; the container files are the customized provider runtime, JSON-RPC
 wrapper, shared trusted-static lifecycle guidance, Codex opaque-memory disable,
 per-exchange archiver, and compatible guards; the setup file is the picker
-entry + vault auth walk-through; `container/AGENTS.md` is the runtime-contract
-base the composed AGENTS.md embeds. Upstream-only tests that require its
+entry + vault auth walk-through. Upstream-only tests that require its
 superseded dependency-injected turn runtime or `cli-tools.json` convention are
 deliberately not installed; this fork's matching provider tests and Dockerfile
 pin are the authority.
@@ -117,7 +116,7 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 ### 6. Validate
 
 ```nc:run effect:test
-pnpm vitest run src/providers/codex-registration.test.ts src/providers/codex-agents-md.test.ts src/providers/codex.container-config.test.ts setup/providers/
+pnpm vitest run src/providers/codex-registration.test.ts src/providers/codex.container-config.test.ts setup/providers/
 ```
 ```nc:run effect:test
 cd container/agent-runner && bun test src/providers/

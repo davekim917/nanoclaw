@@ -18,9 +18,7 @@ export type MemoryConformantProvider = 'codex' | 'opencode';
 export const PROVIDER_PAYLOAD_FILES: Readonly<Record<MemoryConformantProvider, readonly string[]>> = {
   codex: [
     'src/providers/codex.ts',
-    'src/providers/codex-agents-md.ts',
     'src/providers/codex-registration.test.ts',
-    'src/providers/codex-agents-md.test.ts',
     'container/agent-runner/src/providers/codex.ts',
     'container/agent-runner/src/providers/codex-app-server.ts',
     'container/agent-runner/src/providers/exchange-archive.ts',
@@ -31,7 +29,6 @@ export const PROVIDER_PAYLOAD_FILES: Readonly<Record<MemoryConformantProvider, r
     'setup/providers/codex.ts',
     'setup/providers/codex.test.ts',
     'setup/providers/codex-registration.test.ts',
-    'container/AGENTS.md',
   ],
   opencode: [
     '.claude/skills/add-opencode/SKILL.md',
@@ -179,21 +176,6 @@ export function validateProviderMemoryPayload(
   }
 
   if (provider === 'codex') {
-    const agentsMdFile = 'src/providers/codex-agents-md.ts';
-    const agentsMd = read(agentsMdFile);
-    if (agentsMd !== undefined) {
-      requireMatch(issues, agentsMdFile, agentsMd, /before every admissible turn/, 'per-turn memory evidence guidance');
-      requireMatch(issues, agentsMdFile, agentsMd, /delimited untrusted context/, 'untrusted memory evidence guidance');
-      requireMatch(issues, agentsMdFile, agentsMd, /write_memory_file/, 'guarded memory-write guidance');
-      rejectMatch(
-        issues,
-        agentsMdFile,
-        agentsMd,
-        /memory index and definition are supplied|preferences are binding|read the definition and index/i,
-        'stale lifecycle-loaded or binding memory guidance',
-      );
-    }
-
     const appServerFile = 'container/agent-runner/src/providers/codex-app-server.ts';
     const appServer = read(appServerFile);
     if (appServer !== undefined) {

@@ -37,7 +37,6 @@ describe('verifyCodexInstall', () => {
     try {
       for (const file of [
         'src/providers/codex.ts',
-        'src/providers/codex-agents-md.ts',
         'container/agent-runner/src/providers/codex.ts',
         'container/agent-runner/src/providers/codex-app-server.ts',
       ]) {
@@ -75,7 +74,6 @@ describe('verifyCodexInstall', () => {
     try {
       for (const file of [
         'src/providers/codex.ts',
-        'src/providers/codex-agents-md.ts',
         'container/agent-runner/src/providers/codex.ts',
         'container/agent-runner/src/providers/codex-app-server.ts',
       ]) {

@@ -16,11 +16,11 @@
  * rules live) — append an "Omitted for size" note so the agent knows, and log
  * loudly so the operator trims CLAUDE.md.
  *
- * Constants mirror upstream's `codex-agents-md.ts` (`origin/providers`) so the
- * cap value stays in lockstep if we later converge on its section-based
- * composer. NB: this is NOT a dormant safety net — the workgroup-enriched
- * groups already run ~33-34KB AGENTS.md and trip it on real spawns, so keep the
- * degrade minimal and the under-cap fast path cheap.
+ * Constants mirror Codex's own default project-doc cap (`project_doc_max_bytes`,
+ * 32KB) so we degrade under our control instead of letting Codex truncate
+ * silently. NB: this is NOT a dormant safety net — workgroup-enriched groups
+ * run near the cap and have tripped it on real spawns, so keep the degrade
+ * minimal and the under-cap fast path cheap.
  */
 import { log } from './log.js';
 

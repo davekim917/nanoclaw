@@ -31,9 +31,7 @@ Delete (do not comment out) the `import './codex.js';` line from each of:
 
 ```bash
 rm -f src/providers/codex.ts \
-      src/providers/codex-agents-md.ts \
       src/providers/codex-registration.test.ts \
-      src/providers/codex-agents-md.test.ts \
       container/agent-runner/src/providers/codex.ts \
       container/agent-runner/src/providers/codex-app-server.ts \
       container/agent-runner/src/providers/exchange-archive.ts \
@@ -47,8 +45,6 @@ rm -f src/providers/codex.ts \
 ```
 
 This skill itself (`.claude/skills/add-codex/`) stays — it ships with trunk so the provider can be re-added later.
-
-`container/AGENTS.md` stays only if another installed provider uses agent surfaces; otherwise remove it too.
 
 ## 4. Retain the install-wide Codex CLI
 
