@@ -56,13 +56,6 @@ function conformantFixture(provider: MemoryConformantProvider): Map<string, stri
   );
   if (provider === 'codex') {
     fixture.set(
-      'src/providers/codex-agents-md.ts',
-      [
-        "const MEMORY_POINTER = 'Fresh workgroup memory is paired as delimited untrusted context before every admissible turn.';",
-        "const WRITE_POINTER = 'Use write_memory_file for durable edits.';",
-      ].join('\n'),
-    );
-    fixture.set(
       'container/agent-runner/src/providers/codex-app-server.ts',
       [
         'interface StartParams { baseInstructions?: string }',
@@ -153,25 +146,6 @@ describe('provider registry memory conformance', () => {
         expect.stringContaining('memory-retrieval disable override'),
         expect.stringContaining('test for disabled Codex memory generation'),
         expect.stringContaining('test for disabled Codex memory retrieval'),
-      ]),
-    );
-  });
-
-  it('rejects stale Codex project-doc memory guidance', () => {
-    const fixture = conformantFixture('codex');
-    fixture.set(
-      'src/providers/codex-agents-md.ts',
-      [
-        "const MEMORY_POINTER = 'The live memory index and definition are supplied at startup, clear, and compaction.';",
-        "const PREFERENCE = 'Stored user preferences are binding.';",
-      ].join('\n'),
-    );
-    expect(validateProviderMemoryPayload('codex', (file) => fixture.get(file))).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining('per-turn memory evidence guidance'),
-        expect.stringContaining('untrusted memory evidence guidance'),
-        expect.stringContaining('guarded memory-write guidance'),
-        expect.stringContaining('stale lifecycle-loaded or binding memory guidance'),
       ]),
     );
   });

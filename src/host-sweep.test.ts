@@ -12,23 +12,39 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
-import { deleteOrphanProcessingClaims, getProcessingClaims } from './db/session-db.js';
+import { deleteOrphanProcessingClaims, getProcessingClaims, type ContainerState } from './db/session-db.js';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
+  CONTINUATION_WAKE_MIN_INTERVAL_MS,
   SESSION_ARTIFACT_IDLE_MS,
   SPAWN_GRACE_MS,
+  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  _applyCeilingFollowUpForTesting,
+  _hasWorkContinuationForTesting,
   _notifyKillCeilingForTesting,
   _prepareDueWakeForTesting,
   _resetStuckProcessingRowsForTesting,
   _sweepTaskWatchdogForTesting,
   autoArchiveOldCompleted,
+  canAttemptContinuationRecovery,
+  countToolRecoveryAttemptsSinceRealInbound,
+  decideCeilingFollowUp,
+  decideContinuationWake,
   decideStuckAction,
+  hasDueRecoveryWake,
   parseSqliteUtc,
+  parkDueRecoveryWakes,
   pruneIdleSessionArtifacts,
   pruneIdleThreadArtifacts,
   pruneSteerIdempotency,
+  readContinuationRecoveryAttemptAt,
+  readWorkContinuation,
+  restoreWorkContinuationResumeAttempt,
+  incrementWorkContinuationResumeAttempt,
+  migrateLegacyWorkContinuationForRecovery,
+  notifyContinuationParked,
   shouldCloseTaskSession,
   shouldReapIdleTaskContainer,
 } from './host-sweep.js';
@@ -386,6 +402,386 @@ describe('decideStuckAction', () => {
   });
 });
 
+describe('decideCeilingFollowUp', () => {
+  const NOW = Date.parse('2026-07-28T12:00:00.000Z');
+
+  it('wakes when a fresh tool was in flight at kill time', () => {
+    expect(
+      decideCeilingFollowUp({
+        hasContinuation: false,
+        currentTool: 'Bash',
+        toolStartedAt: new Date(NOW - 5 * 60_000).toISOString(),
+        priorToolAttempts: 0,
+        now: NOW,
+      }),
+    ).toEqual({
+      action: 'wake-accountable',
+      reason: 'tool',
+    });
+  });
+
+  it('wakes for an explicit durable continuation', () => {
+    expect(
+      decideCeilingFollowUp({
+        hasContinuation: true,
+        currentTool: null,
+        toolStartedAt: null,
+        priorToolAttempts: 0,
+        now: NOW,
+      }),
+    ).toEqual({
+      action: 'wake-accountable',
+      reason: 'continuation',
+    });
+  });
+
+  it('stays quiet without an explicit continuation or fresh tool', () => {
+    expect(
+      decideCeilingFollowUp({
+        hasContinuation: false,
+        currentTool: null,
+        toolStartedAt: null,
+        priorToolAttempts: 0,
+        now: NOW,
+      }),
+    ).toEqual({ action: 'none' });
+  });
+
+  it('rejects stale, future, and malformed tool timestamps', () => {
+    for (const toolStartedAt of [
+      new Date(NOW - ABSOLUTE_CEILING_MS - 1).toISOString(),
+      new Date(NOW + 1).toISOString(),
+      'not-a-time',
+    ]) {
+      expect(
+        decideCeilingFollowUp({
+          hasContinuation: false,
+          currentTool: 'Bash',
+          toolStartedAt,
+          priorToolAttempts: 0,
+          now: NOW,
+        }),
+      ).toEqual({ action: 'none' });
+    }
+  });
+
+  it('caps tool-only recovery after two attempts without real inbound', () => {
+    expect(
+      decideCeilingFollowUp({
+        hasContinuation: false,
+        currentTool: 'Bash',
+        toolStartedAt: new Date(NOW - 5 * 60_000).toISOString(),
+        priorToolAttempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+        now: NOW,
+      }),
+    ).toEqual({ action: 'none' });
+  });
+});
+
+describe('applyCeilingFollowUp — accountability wake rows', () => {
+  const HB_AGE = 35 * 60 * 1000;
+
+  function respawnRows(inDb: Database.Database) {
+    return inDb
+      .prepare(
+        "SELECT id, kind, status, trigger, on_wake, content FROM messages_in WHERE id LIKE 'ceiling-respawn-%' ORDER BY seq",
+      )
+      .all() as Array<{ id: string; kind: string; status: string; trigger: number; on_wake: number; content: string }>;
+  }
+
+  const continuation = {
+    id: 'cont-1',
+    task: 'write the dbt tests',
+    source_message_id: 'origin-1',
+    phase: 'queued' as const,
+    chain: 1,
+    resume_attempts: 0,
+    recovery_episode: 0,
+  };
+
+  it('writes one deterministic deferred on_wake pair for a continuation', () => {
+    const { inDb } = makeSessionDbs();
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES ('legacy-user', 2, 'chat', ?, 'completed', 1, 'legacy plain-text inbound')`,
+      )
+      .run('2026-07-28T11:59:00.000Z');
+    const res = _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, continuation, HB_AGE);
+    expect(res).toEqual({ action: 'wake-accountable', reason: 'continuation' });
+    const rows = respawnRows(inDb);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe('pending');
+    expect(rows[0].trigger).toBe(0);
+    expect(rows[0].on_wake).toBe(1);
+    const content = JSON.parse(rows[0].content);
+    expect(content.sender).toBe('system');
+    expect(content._system.kind).toBe('agent_ceiling_respawn');
+    expect(content._system.reason).toBe('continuation');
+    expect(content.text).toContain('idle ceiling');
+    const recall = inDb
+      .prepare("SELECT trigger, on_wake, content FROM messages_in WHERE id LIKE 'recall-ceiling-respawn-%'")
+      .get() as { trigger: number; on_wake: number; content: string };
+    expect(recall.trigger).toBe(0);
+    expect(recall.on_wake).toBe(1);
+    expect(JSON.parse(recall.content)).toEqual({ subtype: 'recall_context', deferred: true });
+    _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, continuation, HB_AGE);
+    expect(respawnRows(inDb)).toHaveLength(1);
+  });
+
+  it('writes a fresh wake after real inbound starts a new recovery episode', () => {
+    const { inDb } = makeSessionDbs();
+    _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, continuation, HB_AGE);
+    _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, { ...continuation, recovery_episode: 1 }, HB_AGE);
+
+    const rows = respawnRows(inDb);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].id).not.toBe(rows[1].id);
+  });
+
+  it('wakes on a fresh in-flight-tool signal', () => {
+    const { inDb } = makeSessionDbs();
+    const res = _applyCeilingFollowUpForTesting(
+      inDb,
+      fakeSession(),
+      { current_tool: 'Bash', tool_started_at: new Date().toISOString() } as ContainerState,
+      null,
+      HB_AGE,
+    );
+    expect(res).toEqual({ action: 'wake-accountable', reason: 'tool' });
+    expect(respawnRows(inDb)).toHaveLength(1);
+  });
+
+  it('does not fire for a quiet idle container', () => {
+    const { inDb } = makeSessionDbs();
+    const res = _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, null, HB_AGE);
+    expect(res).toEqual({ action: 'none' });
+    expect(respawnRows(inDb)).toHaveLength(0);
+  });
+});
+
+describe('durable continuation wake', () => {
+  const continuation = {
+    id: 'cont-1',
+    task: 'write the dbt tests',
+    source_message_id: 'origin-1',
+    phase: 'queued' as const,
+    chain: 1,
+    resume_attempts: 0,
+    recovery_episode: 0,
+  };
+
+  it('throttles respins after a recent spawn', () => {
+    const now = Date.now();
+    expect(decideContinuationWake({ now, spawnedAtMs: now - 60_000 })).toBe(false);
+    expect(decideContinuationWake({ now, spawnedAtMs: now - CONTINUATION_WAKE_MIN_INTERVAL_MS - 1 })).toBe(true);
+    expect(decideContinuationWake({ now, spawnedAtMs: 0 })).toBe(true);
+    expect(
+      decideContinuationWake({
+        now,
+        spawnedAtMs: 0,
+        lastRecoveryAttemptAtMs: now - 60_000,
+      }),
+    ).toBe(false);
+  });
+
+  it('reads valid current and legacy stored work', () => {
+    const { outDb } = makeSessionDbs();
+    expect(_hasWorkContinuationForTesting(outDb)).toBe(false);
+    outDb.prepare('INSERT INTO session_state VALUES (?, ?, ?)').run(
+      'work_continuation',
+      JSON.stringify({
+        id: continuation.id,
+        task: continuation.task,
+        phase: continuation.phase,
+        chain: continuation.chain,
+        resume_attempts: continuation.resume_attempts,
+      }),
+      new Date().toISOString(),
+    );
+    expect(_hasWorkContinuationForTesting(outDb)).toBe(true);
+    expect(readWorkContinuation(outDb)?.recovery_episode).toBe(0);
+    outDb
+      .prepare('UPDATE session_state SET value = ? WHERE key = ?')
+      .run(JSON.stringify({ ...continuation, task: '  ' }), 'work_continuation');
+    expect(_hasWorkContinuationForTesting(outDb)).toBe(false);
+    outDb.prepare('DELETE FROM session_state').run();
+    outDb
+      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
+      .run('pending_next', JSON.stringify({ task: 'legacy task', chain: 2 }), new Date().toISOString());
+    expect(_hasWorkContinuationForTesting(outDb)).toBe(true);
+  });
+
+  it('exposes the shared recovery cap', () => {
+    expect(WORK_CONTINUATION_RESUME_MAX_ATTEMPTS).toBe(2);
+  });
+
+  it('increments exactly twice, rejects a third attempt, and restores a rejected wake', () => {
+    const { outDb } = makeSessionDbs();
+    outDb
+      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
+      .run(
+        'work_continuation',
+        JSON.stringify({ ...continuation, phase: 'running', runner_id: 'stopped-runner' }),
+        new Date().toISOString(),
+      );
+
+    const previous = readWorkContinuation(outDb)!;
+    const first = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
+    expect(first?.resume_attempts).toBe(1);
+    expect(first?.source_message_id).toBe('origin-1');
+    expect(first).toMatchObject({ phase: 'queued' });
+    expect(first?.runner_id).toBeUndefined();
+    expect(readContinuationRecoveryAttemptAt(outDb, first!)).toBeGreaterThan(Date.now() - 1_000);
+    expect(restoreWorkContinuationResumeAttempt(outDb, first!, previous)).toMatchObject({
+      phase: 'running',
+      runner_id: 'stopped-runner',
+      resume_attempts: 0,
+    });
+
+    const retriedFirst = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
+    const second = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
+    expect(second?.resume_attempts).toBe(2);
+    expect(canAttemptContinuationRecovery(second!)).toBe(false);
+    expect(incrementWorkContinuationResumeAttempt(outDb, continuation.id)).toBeNull();
+
+    expect(restoreWorkContinuationResumeAttempt(outDb, second!, retriedFirst!)?.resume_attempts).toBe(1);
+    expect(restoreWorkContinuationResumeAttempt(outDb, second!, retriedFirst!)).toBeNull();
+    expect(readWorkContinuation(outDb)?.resume_attempts).toBe(1);
+  });
+
+  it('migrates a legacy promise into a counted one-shot recovery record', () => {
+    const { outDb } = makeSessionDbs();
+    outDb
+      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
+      .run('pending_next', JSON.stringify({ task: 'legacy task', chain: 2 }), new Date().toISOString());
+    const migrated = migrateLegacyWorkContinuationForRecovery(outDb);
+    expect(migrated?.id).not.toBe('legacy-pending-next');
+    expect(migrated?.resume_attempts).toBe(1);
+    expect(outDb.prepare("SELECT 1 FROM session_state WHERE key = 'pending_next'").get()).toBeUndefined();
+    expect(readWorkContinuation(outDb)?.id).toBe(migrated?.id);
+  });
+
+  it('restores the legacy promise exactly when its recovery spawn is rejected', () => {
+    const { outDb } = makeSessionDbs();
+    outDb
+      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
+      .run('pending_next', JSON.stringify({ task: 'legacy task', chain: 2 }), new Date().toISOString());
+
+    const previous = readWorkContinuation(outDb)!;
+    const attempted = migrateLegacyWorkContinuationForRecovery(outDb)!;
+    expect(restoreWorkContinuationResumeAttempt(outDb, attempted, previous)).toEqual(previous);
+    expect(outDb.prepare("SELECT 1 FROM session_state WHERE key = 'work_continuation'").get()).toBeUndefined();
+    expect(outDb.prepare("SELECT value FROM session_state WHERE key = 'pending_next'").get()).toEqual({
+      value: JSON.stringify({ task: 'legacy task', chain: 2 }),
+    });
+    expect(readWorkContinuation(outDb)).toEqual(previous);
+  });
+
+  it('parks only due recovery rows at the cap and leaves real inbound wakeable', () => {
+    const { inDb } = makeSessionDbs();
+    const now = new Date().toISOString();
+    const insert = inDb.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+       VALUES (?, ?, 'chat', ?, 'pending', 1, ?)`,
+    );
+    insert.run('ceiling-respawn-cont-1', 2, now, JSON.stringify({ sender: 'system' }));
+    insert.run('host-restart-cont-1', 4, now, JSON.stringify({ sender: 'system' }));
+    insert.run('user-1', 6, now, JSON.stringify({ sender: 'Alice' }));
+
+    expect(hasDueRecoveryWake(inDb, now)).toBe(true);
+    expect(parkDueRecoveryWakes(inDb, now)).toBe(2);
+    expect(hasDueRecoveryWake(inDb, now)).toBe(false);
+    expect(inDb.prepare("SELECT status FROM messages_in WHERE id = 'user-1'").get()).toEqual({ status: 'pending' });
+  });
+
+  it('caps tool-only episodes and resets the count after real inbound', () => {
+    const { inDb } = makeSessionDbs();
+    const insert = inDb.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+       VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
+    );
+    insert.run('ceiling-respawn-tool-1', 2, '2026-07-28T12:00:00.000Z', JSON.stringify({ sender: 'system' }));
+    insert.run('ceiling-respawn-tool-2', 4, '2026-07-28T12:01:00.000Z', JSON.stringify({ sender: 'system' }));
+    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(2);
+    insert.run('user-1', 6, '2026-07-28T12:02:00.000Z', JSON.stringify({ sender: 'user' }));
+    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(0);
+    insert.run('ceiling-respawn-tool-3', 8, '2026-07-28T12:03:00.000Z', JSON.stringify({ sender: 'system' }));
+    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(1);
+  });
+
+  it('treats historical non-JSON content as real inbound when counting tool recovery attempts', () => {
+    const { inDb } = makeSessionDbs();
+    const insert = inDb.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+       VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
+    );
+    insert.run('ceiling-respawn-tool-1', 2, '2026-07-28T12:00:00.000Z', JSON.stringify({ sender: 'system' }));
+    insert.run('legacy-user-1', 4, '2026-07-28T12:01:00.000Z', 'legacy plain-text inbound');
+    insert.run('ceiling-respawn-tool-2', 6, '2026-07-28T12:02:00.000Z', JSON.stringify({ sender: 'system' }));
+
+    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(1);
+  });
+
+  it('orders mixed ISO and SQLite-style timestamps chronologically when resetting tool attempts', () => {
+    const { inDb } = makeSessionDbs();
+    const insert = inDb.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+       VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
+    );
+    insert.run('user-old', 2, '2026-07-28T01:00:00.000Z', JSON.stringify({ sender: 'user' }));
+    insert.run('ceiling-respawn-tool-old', 4, '2026-07-28T01:30:00.000Z', JSON.stringify({ sender: 'system' }));
+    insert.run('user-new', 6, '2026-07-28 02:00:00', JSON.stringify({ sender: 'user' }));
+    insert.run('ceiling-respawn-tool-new', 8, '2026-07-28T02:30:00.000Z', JSON.stringify({ sender: 'system' }));
+
+    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(1);
+  });
+
+  it('writes exactly one public parked accounting for repeated sweeps', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    inDb.prepare('INSERT INTO session_routing VALUES (1, ?, ?, ?)').run('slack', 'C-1', 'T-1');
+    const capped = { ...continuation, resume_attempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS };
+    const write = (message: { id: string; kind: string; content: string }) => {
+      outDb
+        .prepare(
+          `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, content)
+           VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), ?, ?, ?)`,
+        )
+        .run(message.id, new Date().toISOString(), message.kind, message.content);
+    };
+
+    expect(notifyContinuationParked(inDb, outDb, fakeSession(), capped, write)).toBe(true);
+    expect(notifyContinuationParked(inDb, outDb, fakeSession(), capped, write)).toBe(false);
+    expect(notifyContinuationParked(inDb, outDb, fakeSession(), { ...capped, recovery_episode: 1 }, write)).toBe(true);
+    expect(
+      outDb.prepare("SELECT COUNT(*) AS count FROM messages_out WHERE id LIKE 'continuation-parked-%'").get(),
+    ).toEqual({ count: 2 });
+  });
+
+  it('routes parked accounting through the continuation source in an agent-shared session', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+         VALUES (?, 2, 'chat', ?, 'completed', 1, 'C-SHARED', 'slack', 'T-SHARED', '{}')`,
+      )
+      .run('origin-1', new Date().toISOString());
+    const writes: Array<{ platformId: string | null; channelType: string | null; threadId: string | null }> = [];
+
+    expect(
+      notifyContinuationParked(inDb, outDb, fakeSession(), continuation, (message) =>
+        writes.push({
+          platformId: message.platformId,
+          channelType: message.channelType,
+          threadId: message.threadId,
+        }),
+      ),
+    ).toBe(true);
+    expect(writes).toEqual([{ platformId: 'C-SHARED', channelType: 'slack', threadId: 'T-SHARED' }]);
+  });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Orphan claim cleanup (regression test for the SIGKILL → claim-stuck loop)
 //
@@ -416,7 +812,15 @@ function makeSessionDbs(): { inDb: Database.Database; outDb: Database.Database }
       platform_id   TEXT,
       channel_type  TEXT,
       thread_id     TEXT,
-      content       TEXT NOT NULL
+      content       TEXT NOT NULL,
+      source_session_id TEXT,
+      on_wake       INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE session_routing (
+      id            INTEGER PRIMARY KEY CHECK (id = 1),
+      channel_type  TEXT,
+      platform_id   TEXT,
+      thread_id     TEXT
     );
   `);
   const outDb = new Database(':memory:');
@@ -433,6 +837,11 @@ function makeSessionDbs(): { inDb: Database.Database; outDb: Database.Database }
       timestamp   TEXT NOT NULL,
       kind        TEXT NOT NULL,
       content     TEXT NOT NULL
+    );
+    CREATE TABLE session_state (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at TEXT NOT NULL
     );
   `);
   return { inDb, outDb };
@@ -1494,7 +1903,9 @@ function makeNotifyTestDbs(opts?: { withRouting?: boolean; recentNotice?: boolea
       platform_id   TEXT,
       channel_type  TEXT,
       thread_id     TEXT,
-      content       TEXT NOT NULL
+      content       TEXT NOT NULL,
+      source_session_id TEXT,
+      on_wake       INTEGER NOT NULL DEFAULT 0
     );
   `);
   if (opts?.withRouting !== false) {
@@ -1542,8 +1953,9 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), heartbeatAgeMs, 1);
 
     const rows = outDb
-      .prepare('SELECT kind, platform_id, channel_type, thread_id, content FROM messages_out')
+      .prepare('SELECT timestamp, kind, platform_id, channel_type, thread_id, content FROM messages_out')
       .all() as Array<{
+      timestamp: string;
       kind: string;
       platform_id: string | null;
       channel_type: string | null;
@@ -1551,6 +1963,7 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
       content: string;
     }>;
     expect(rows).toHaveLength(1);
+    expect(rows[0].timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
     expect(rows[0].kind).toBe('chat');
     expect(rows[0].channel_type).toBe('slack');
     expect(rows[0].platform_id).toBe('C-TEST');

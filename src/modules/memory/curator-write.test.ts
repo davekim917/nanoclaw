@@ -5,7 +5,10 @@ import { spawn } from 'child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { TEST_ROOT, TEST_WORKGROUP } = vi.hoisted(() => ({
-  TEST_ROOT: '/home/ubuntu/nanoclaw-v2/data',
+  // The real sibling writer deliberately accepts generated memory only below
+  // this checkout's canonical data/workgroups root. Derive the checkout at
+  // runtime so CI never depends on a developer's absolute path.
+  TEST_ROOT: `${process.cwd()}/data`,
   TEST_WORKGROUP: `test-curator-${process.pid}`,
 }));
 const LEGACY_HISTORY_TARGET = path.join('/tmp', `${TEST_WORKGROUP}-legacy-history`);

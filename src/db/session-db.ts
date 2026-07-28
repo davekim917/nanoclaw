@@ -245,6 +245,36 @@ export function insertMessageWithContextIfNew(
   })();
 }
 
+/**
+ * Persist a host-generated delayed/lifecycle turn inertly until the sweep's
+ * due-admission seam replaces its marker with fresh recall context.
+ *
+ * The marker is intentionally shaped like a recall row and shares the
+ * trigger's due/on-wake boundary. This keeps the pair atomic and prevents a
+ * warm or fresh container from seeing an unpaired trigger. At due time,
+ * `admitDueTaskContexts` rebuilds `recall-<id>` from current host state and
+ * flips the trigger to wakeable.
+ */
+export function insertDeferredMessageWithContextIfNew(db: Database.Database, message: MessageInsert): boolean {
+  if (message.kind === 'system') throw new Error('deferred context triggers must not be system rows');
+  const trigger: MessageInsert = { ...message, trigger: 0 };
+  const marker: MessageInsert = {
+    id: `recall-${message.id}`,
+    kind: 'system',
+    timestamp: message.timestamp,
+    platformId: message.platformId,
+    channelType: message.channelType,
+    threadId: message.threadId,
+    content: JSON.stringify({ subtype: 'recall_context', deferred: true }),
+    processAfter: message.processAfter,
+    recurrence: null,
+    trigger: 0,
+    sourceSessionId: message.sourceSessionId ?? null,
+    onWake: message.onWake ?? 0,
+  };
+  return insertMessageWithContextIfNew(db, trigger, marker);
+}
+
 /** Strict internal-host variant: duplicate ids retain the existing constraint error contract. */
 export function insertMessageWithContext(
   db: Database.Database,
@@ -294,6 +324,8 @@ export function getDueWakePriority(db: Database.Database): 'interactive' | 'sche
 /**
  * Mark long-pending NON-RECURRING rows as 'expired' so sweep stops re-waking
  * sessions on one-shot messages that have sat unprocessed for a day or more.
+ * Unscheduled rows age from insertion; scheduled rows age from their fire
+ * time, so a valid multi-day wait is not expired at the moment it becomes due.
  *
  * Recurring tasks (recurrence IS NOT NULL) are NEVER expired here. A recurring
  * row is inserted ~24h before its next daily fire, so it crosses the staleness
@@ -310,17 +342,18 @@ export function getDueWakePriority(db: Database.Database): 'interactive' | 'sche
  */
 export function expireStalePending(db: Database.Database, maxAgeMs: number): number {
   const cutoffIso = new Date(Date.now() - maxAgeMs).toISOString();
-  const nowIso = new Date().toISOString();
   const result = db
     .prepare(
       `UPDATE messages_in
        SET status = 'expired'
        WHERE status = 'pending'
          AND recurrence IS NULL
-         AND timestamp < ?
-         AND (process_after IS NULL OR process_after < ?)`,
+         AND (
+           (process_after IS NULL AND datetime(timestamp) < datetime(?))
+           OR (process_after IS NOT NULL AND datetime(process_after) < datetime(?))
+         )`,
     )
-    .run(cutoffIso, nowIso);
+    .run(cutoffIso, cutoffIso);
   return result.changes;
 }
 

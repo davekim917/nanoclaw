@@ -10,6 +10,7 @@
  * on file and resumes cleanly if the user flips back.
  */
 import { getOutboundDb } from './connection.js';
+import { randomUUID } from 'node:crypto';
 
 const LEGACY_KEY = 'sdk_session_id';
 const STICKY_MODEL_KEY = 'sticky_model';
@@ -26,9 +27,9 @@ function memoryContextEpochKey(providerName: string): string {
 }
 
 function getValue(key: string): string | undefined {
-  const row = getOutboundDb()
-    .prepare('SELECT value FROM session_state WHERE key = ?')
-    .get(key) as { value: string } | undefined;
+  const row = getOutboundDb().prepare('SELECT value FROM session_state WHERE key = ?').get(key) as
+    | { value: string }
+    | undefined;
   return row?.value;
 }
 
@@ -207,4 +208,193 @@ export function getCurrentInReplyTo(): string | null {
   const age = Date.now() - new Date(row.updated_at).getTime();
   if (!Number.isFinite(age) || age > IN_REPLY_TO_MAX_AGE_MS) return null;
   return row.value;
+}
+
+const WORK_CONTINUATION_KEY = 'work_continuation';
+const LEGACY_PENDING_NEXT_KEY = 'pending_next';
+
+export const WORK_CONTINUATION_CHAIN_MAX = 50;
+export const WORK_CONTINUATION_TASK_MAX_CHARS = 500;
+export const WORK_CONTINUATION_RESUME_MAX_ATTEMPTS = 2;
+
+export interface WorkContinuation {
+  id: string;
+  task: string;
+  /** Inbound row that supplied the exact reply route for restart recovery. */
+  source_message_id?: string;
+  phase: 'queued' | 'running';
+  chain: number;
+  runner_id?: string;
+  resume_attempts: number;
+  recovery_episode: number;
+}
+
+export type QueueWorkContinuationResult =
+  | { accepted: true; continuation: WorkContinuation }
+  | { accepted: false; reason: 'chain-cap'; chain: number };
+
+function parseWorkContinuation(raw: string): WorkContinuation | undefined {
+  try {
+    const parsed = JSON.parse(raw) as Partial<WorkContinuation>;
+    if (typeof parsed.id !== 'string' || parsed.id.trim() === '') return undefined;
+    if (
+      typeof parsed.task !== 'string' ||
+      parsed.task.trim() === '' ||
+      parsed.task.length > WORK_CONTINUATION_TASK_MAX_CHARS
+    ) {
+      return undefined;
+    }
+    if (parsed.phase !== 'queued' && parsed.phase !== 'running') return undefined;
+    if (!Number.isSafeInteger(parsed.chain) || (parsed.chain ?? -1) < 0) return undefined;
+    if (!Number.isSafeInteger(parsed.resume_attempts) || (parsed.resume_attempts ?? -1) < 0) return undefined;
+    if (
+      parsed.recovery_episode !== undefined &&
+      (!Number.isSafeInteger(parsed.recovery_episode) || parsed.recovery_episode < 0)
+    ) {
+      return undefined;
+    }
+    if (parsed.runner_id !== undefined && (typeof parsed.runner_id !== 'string' || parsed.runner_id === '')) {
+      return undefined;
+    }
+    const sourceMessageId =
+      typeof parsed.source_message_id === 'string' &&
+      parsed.source_message_id.length > 0 &&
+      parsed.source_message_id.length <= 1024
+        ? parsed.source_message_id
+        : undefined;
+    return {
+      id: parsed.id,
+      task: parsed.task.trim(),
+      ...(sourceMessageId ? { source_message_id: sourceMessageId } : {}),
+      phase: parsed.phase,
+      chain: parsed.chain as number,
+      ...(parsed.runner_id ? { runner_id: parsed.runner_id } : {}),
+      resume_attempts: parsed.resume_attempts as number,
+      recovery_episode: parsed.recovery_episode ?? 0,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function migrateLegacyPendingNext(): WorkContinuation | undefined {
+  const raw = getValue(LEGACY_PENDING_NEXT_KEY);
+  if (raw === undefined) return undefined;
+  deleteValue(LEGACY_PENDING_NEXT_KEY);
+  try {
+    const parsed = JSON.parse(raw) as { task?: unknown; chain?: unknown };
+    const task = typeof parsed.task === 'string' ? parsed.task.trim() : '';
+    if (!task || task.length > WORK_CONTINUATION_TASK_MAX_CHARS) return undefined;
+    const chain = Number.isSafeInteger(parsed.chain) && (parsed.chain as number) >= 0 ? (parsed.chain as number) : 0;
+    const migrated: WorkContinuation = {
+      id: `legacy-${randomUUID()}`,
+      task,
+      phase: 'queued',
+      chain,
+      resume_attempts: 0,
+      recovery_episode: 0,
+    };
+    setValue(WORK_CONTINUATION_KEY, JSON.stringify(migrated));
+    return migrated;
+  } catch {
+    return undefined;
+  }
+}
+
+export function getWorkContinuation(): WorkContinuation | undefined {
+  const raw = getValue(WORK_CONTINUATION_KEY);
+  if (raw !== undefined) {
+    const parsed = parseWorkContinuation(raw);
+    if (parsed) return parsed;
+    deleteValue(WORK_CONTINUATION_KEY);
+  }
+  return migrateLegacyPendingNext();
+}
+
+export function queueWorkContinuation(task: string, sourceMessageId?: string | null): QueueWorkContinuationResult {
+  const normalized = task.trim();
+  const normalizedSourceMessageId =
+    typeof sourceMessageId === 'string' && sourceMessageId.length > 0 && sourceMessageId.length <= 1024
+      ? sourceMessageId
+      : undefined;
+  const current = getWorkContinuation();
+  const chain = (current?.chain ?? 0) + 1;
+  if (chain > WORK_CONTINUATION_CHAIN_MAX) return { accepted: false, reason: 'chain-cap', chain };
+  const continuation: WorkContinuation = {
+    id: randomUUID(),
+    task: normalized,
+    ...(normalizedSourceMessageId ? { source_message_id: normalizedSourceMessageId } : {}),
+    phase: 'queued',
+    chain,
+    resume_attempts: 0,
+    recovery_episode: 0,
+  };
+  setValue(WORK_CONTINUATION_KEY, JSON.stringify(continuation));
+  return { accepted: true, continuation };
+}
+
+export function isWorkContinuationRunnable(continuation: WorkContinuation, _runnerId: string): boolean {
+  // A queued record with no owner is either fresh work from this runner or an
+  // attempt explicitly authorized by the stopped-container host path. Once a
+  // runner claims it, keep that claim across every pause/crash. A fresh runner
+  // may proceed only after the host counts a recovery attempt (or real inbound
+  // explicitly re-arms the work), so unrelated scheduled wakes cannot make the
+  // continuation hitchhike around the recovery throttle/cap.
+  return continuation.phase === 'queued' && continuation.runner_id === undefined;
+}
+
+export function markWorkContinuationRunning(id: string, runnerId: string): WorkContinuation | undefined {
+  return getOutboundDb().transaction(() => {
+    const current = getWorkContinuation();
+    if (!current || current.id !== id || !isWorkContinuationRunnable(current, runnerId)) return undefined;
+    const running: WorkContinuation = { ...current, phase: 'running', runner_id: runnerId };
+    setValue(WORK_CONTINUATION_KEY, JSON.stringify(running));
+    return running;
+  })();
+}
+
+export function requeueWorkContinuationIfMatches(id: string, runnerId: string): boolean {
+  return getOutboundDb().transaction(() => {
+    const current = getWorkContinuation();
+    if (!current || current.id !== id || current.phase !== 'running' || current.runner_id !== runnerId) return false;
+    const queued: WorkContinuation = { ...current, phase: 'queued' };
+    // Retain runner_id even below the cap. The host owns stopped-container
+    // recovery authorization and clears this claim only after counting an
+    // attempt; real inbound clears it when intentionally re-arming the work.
+    setValue(WORK_CONTINUATION_KEY, JSON.stringify(queued));
+    return true;
+  })();
+}
+
+export function clearWorkContinuationIfMatches(id: string): boolean {
+  return getOutboundDb().transaction(() => {
+    const current = getWorkContinuation();
+    if (!current || current.id !== id) return false;
+    deleteValue(WORK_CONTINUATION_KEY);
+    return true;
+  })();
+}
+
+export function cancelWorkContinuation(): boolean {
+  const existed = getValue(WORK_CONTINUATION_KEY) !== undefined || getValue(LEGACY_PENDING_NEXT_KEY) !== undefined;
+  deleteValue(WORK_CONTINUATION_KEY);
+  deleteValue(LEGACY_PENDING_NEXT_KEY);
+  return existed;
+}
+
+export function resetWorkContinuationForRealInbound(): WorkContinuation | undefined {
+  return getOutboundDb().transaction(() => {
+    const current = getWorkContinuation();
+    if (!current) return undefined;
+    const reset: WorkContinuation = {
+      ...current,
+      phase: 'queued',
+      chain: 0,
+      resume_attempts: 0,
+      recovery_episode: current.recovery_episode === Number.MAX_SAFE_INTEGER ? 0 : current.recovery_episode + 1,
+    };
+    delete reset.runner_id;
+    setValue(WORK_CONTINUATION_KEY, JSON.stringify(reset));
+    return reset;
+  })();
 }

@@ -37,3 +37,6 @@ import './channel-config/index.js';
 // its own Slack thread + per-issue session. Depends on the delivery action
 // registry being up (satisfied by import order).
 import './support-threads/index.js';
+// Scheduled-wake — schedule_wake delivery action: the container `wait` tool's
+// in-session delayed wake (process_after row in the caller's own session).
+import './scheduled-wake/index.js';

@@ -109,7 +109,7 @@ Channel recovery is an adapter contract rather than a Discord special case. Befo
 4. `pnpm exec tsc --noEmit` (host typecheck)
 5. `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` (container typecheck)
 6. `pnpm exec vitest run` (host tests)
-7. `bun test` in `container/agent-runner/` (container tests)
+7. `bun test --max-concurrency 1` in `container/agent-runner/` (container tests; the suite shares process-global session fixtures)
 
 Any failure fails the PR.
 

@@ -3,10 +3,16 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { getContinuation, setContinuation } from './db/session-state.js';
+import {
+  cancelWorkContinuation,
+  getContinuation,
+  getWorkContinuation,
+  queueWorkContinuation,
+  setContinuation,
+} from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { ProviderExchange } from './providers/types.js';
-import { runPollLoop } from './poll-loop.js';
+import { runPollLoop, type PollLoopConfig } from './poll-loop.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -187,7 +193,10 @@ describe('poll loop integration', () => {
       insertMessage('m1', { sender: 'Alice', text: 'hi' }, { platformId: 'chan-1', channelType: 'discord' });
 
       // The opencode failure mode: addresses the sibling as a destination.
-      const provider = new MockProvider({}, () => '<message to="Example Agent-Codex">Good catch — fixing the query.</message>');
+      const provider = new MockProvider(
+        {},
+        () => '<message to="Example Agent-Codex">Good catch — fixing the query.</message>',
+      );
       const controller = new AbortController();
       const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
@@ -368,7 +377,12 @@ describe('poll loop integration', () => {
 });
 
 // Helper: run poll loop until aborted or timeout
-async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
+async function runPollLoopWithTimeout(
+  provider: MockProvider,
+  signal: AbortSignal,
+  timeoutMs: number,
+  overrides: Pick<PollLoopConfig, 'autosaveWorktrees'> = {},
+): Promise<void> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
 
   return Promise.race([
@@ -377,6 +391,7 @@ async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSigna
       providerName: 'mock',
       cwd: '/tmp',
       signal,
+      ...overrides,
     }),
     new Promise<void>((_, reject) => {
       timeout = setTimeout(() => reject(new Error('timeout')), timeoutMs);
@@ -397,6 +412,256 @@ async function waitFor(condition: () => boolean, timeoutMs: number): Promise<voi
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+describe('durable work continuation', () => {
+  it('runs stored work when the loop would otherwise go idle, then clears it on a clean finish', async () => {
+    queueWorkContinuation('write the dbt consolidation plan');
+    // No inbound messages at all — durable work alone must drive a turn.
+
+    const prompts: string[] = [];
+    const provider = new MockProvider();
+    provider.query = (input) => {
+      prompts.push(input.prompt);
+      return {
+        push: () => {},
+        end: () => {},
+        abort: () => {},
+        events: (async function* () {
+          yield { type: 'init' as const, continuation: 'direct-continuation-session' };
+          yield { type: 'result' as const, text: '<message to="discord-test">plan written</message>' };
+        })(),
+      };
+    };
+    const autosaveReasons: string[] = [];
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000, {
+      autosaveWorktrees: async (reason) => {
+        autosaveReasons.push(reason);
+        return { committed: [], skipped: [], failed: [] };
+      },
+    });
+
+    await waitFor(() => prompts.some((p) => p.includes('write the dbt consolidation plan')), 4000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 4000);
+    await waitFor(() => autosaveReasons.length > 0, 4000);
+    controller.abort();
+
+    expect(JSON.parse(getUndeliveredMessages()[0].content).text).toBe('plan written');
+    expect(getWorkContinuation()).toBeUndefined();
+    expect(autosaveReasons).toEqual(['turn end']);
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('runs stored work past accumulated context without consuming that context', async () => {
+    queueWorkContinuation('finish the durable migration work');
+    insertMessage('m-context', { sender: 'Alice', senderId: 'alice', text: 'earlier context' });
+    getInboundDb().prepare('UPDATE messages_in SET trigger = 0 WHERE id = ?').run('m-context');
+
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      return '<message to="discord-test">migration finished</message>';
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 4000);
+    controller.abort();
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('finish the durable migration work');
+    expect(prompts[0]).not.toContain('earlier context');
+    expect(getWorkContinuation()).toBeUndefined();
+    expect(getPendingMessages().map((message) => message.id)).toEqual(['m-context']);
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('preserves the originating route when resuming stored work without default session routing', async () => {
+    insertMessage(
+      'm-origin',
+      { sender: 'Alice', senderId: 'alice', text: 'finish this after restart' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-origin' },
+    );
+    getInboundDb().prepare("UPDATE messages_in SET status = 'completed' WHERE id = ?").run('m-origin');
+    queueWorkContinuation('resume the routed work', 'm-origin');
+
+    const provider = new MockProvider();
+    provider.query = () => ({
+      push: () => {},
+      end: () => {},
+      abort: () => {},
+      events: (async function* () {
+        yield { type: 'init' as const, continuation: 'routed-continuation-session' };
+        yield { type: 'progress' as const, message: 'recovered progress' };
+        yield { type: 'result' as const, text: '<message to="discord-test">recovered result</message>' };
+      })(),
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => getUndeliveredMessages().length >= 2, 4000);
+    controller.abort();
+
+    const routed = getUndeliveredMessages();
+    expect(routed.map((message) => message.kind)).toEqual(['status', 'chat']);
+    expect(
+      routed.map((message) => ({
+        platform_id: message.platform_id,
+        channel_type: message.channel_type,
+        thread_id: message.thread_id,
+        in_reply_to: message.in_reply_to,
+      })),
+    ).toEqual([
+      {
+        platform_id: 'chan-1',
+        channel_type: 'discord',
+        thread_id: 'thread-origin',
+        in_reply_to: 'm-origin',
+      },
+      {
+        platform_id: 'chan-1',
+        channel_type: 'discord',
+        thread_id: 'thread-origin',
+        in_reply_to: 'm-origin',
+      },
+    ]);
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('preserves the originating route while processing a continuation recovery wake', async () => {
+    insertMessage(
+      'm-recovery-origin',
+      { sender: 'Alice', senderId: 'alice', text: 'continue after a host restart' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-recovery' },
+    );
+    getInboundDb().prepare("UPDATE messages_in SET status = 'completed' WHERE id = ?").run('m-recovery-origin');
+    insertMessage('host-restart-1', {
+      sender: 'system',
+      senderId: 'system',
+      text: '[system] host restarted',
+      _system: { kind: 'agent_host_restart' },
+    });
+    getInboundDb()
+      .prepare("UPDATE messages_in SET platform_id = 'agent-group', channel_type = 'agent' WHERE id = ?")
+      .run('host-restart-1');
+    queueWorkContinuation('resume after the accountability wake', 'm-recovery-origin');
+
+    const provider = new MockProvider();
+    provider.query = () => ({
+      push: () => {},
+      end: () => {},
+      abort: () => {},
+      events: (async function* () {
+        yield { type: 'init' as const, continuation: 'recovery-wake-session' };
+        yield { type: 'progress' as const, message: 'accounting for recovered work' };
+        yield { type: 'result' as const, text: '<message to="discord-test">recovery accounted</message>' };
+      })(),
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => getUndeliveredMessages().length >= 2, 4000);
+    controller.abort();
+
+    expect(
+      getUndeliveredMessages().map((message) => ({
+        kind: message.kind,
+        platform_id: message.platform_id,
+        channel_type: message.channel_type,
+        thread_id: message.thread_id,
+        in_reply_to: message.in_reply_to,
+      })),
+    ).toEqual([
+      {
+        kind: 'status',
+        platform_id: 'chan-1',
+        channel_type: 'discord',
+        thread_id: 'thread-recovery',
+        in_reply_to: 'm-recovery-origin',
+      },
+      {
+        kind: 'chat',
+        platform_id: 'chan-1',
+        channel_type: 'discord',
+        thread_id: 'thread-recovery',
+        in_reply_to: 'm-recovery-origin',
+      },
+    ]);
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('checkpoints and requeues when a direct continuation query throws', async () => {
+    queueWorkContinuation('work through a provider startup failure');
+    const provider = new MockProvider();
+    provider.query = () => {
+      throw new Error('provider startup failed');
+    };
+    const autosaveReasons: string[] = [];
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000, {
+      autosaveWorktrees: async (reason) => {
+        autosaveReasons.push(reason);
+        return { committed: [], skipped: [], failed: [] };
+      },
+    });
+
+    await waitFor(() => autosaveReasons.length > 0, 4000);
+    controller.abort();
+
+    expect(autosaveReasons).toEqual(['turn end']);
+    expect(getWorkContinuation()).toMatchObject({
+      task: 'work through a provider startup failure',
+      phase: 'queued',
+    });
+    await loopPromise.catch(() => {});
+  });
+
+  it('answers already-arrived user input before resuming queued work', async () => {
+    queueWorkContinuation('finish the migration');
+    insertMessage('m-status', { sender: 'Alice', senderId: 'alice', text: 'what is the status?' });
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      return prompt.includes('what is the status?')
+        ? '<message to="discord-test">status answered</message>'
+        : '<message to="discord-test">migration finished</message>';
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => prompts.length >= 2, 4000);
+    controller.abort();
+    expect(prompts[0]).toContain('what is the status?');
+    expect(prompts[1]).toContain('finish the migration');
+    expect(getWorkContinuation()).toBeUndefined();
+    await loopPromise.catch(() => {});
+  });
+
+  it('an explicit stop cancels queued work before it launches', async () => {
+    queueWorkContinuation('work that should stop');
+    insertMessage('m-stop', { sender: 'Alice', senderId: 'alice', text: 'stop that work' });
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      if (prompt.includes('stop that work')) cancelWorkContinuation();
+      return '<message to="discord-test">stopped</message>';
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 4000);
+    await sleep(200);
+    controller.abort();
+    expect(prompts).toHaveLength(1);
+    expect(getWorkContinuation()).toBeUndefined();
+    await loopPromise.catch(() => {});
+  });
+});
 
 describe('poll loop — exchange hook (onExchangeComplete)', () => {
   // A provider that declares the per-exchange hook. The hook call is the
@@ -551,7 +816,11 @@ describe('poll loop — stale session recovery', () => {
 
   it('clears and retries a provider-yielded system_error continuation before surfacing chat error', async () => {
     setContinuation('mock', 'poisoned-codex-thread');
-    insertMessage('m1', { sender: 'Alice', text: 'run support poller' }, { platformId: 'chan-1', channelType: 'discord' });
+    insertMessage(
+      'm1',
+      { sender: 'Alice', text: 'run support poller' },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
 
     const provider = new YieldingSystemErrorThenSuccessProvider();
     const controller = new AbortController();
@@ -738,9 +1007,7 @@ describe('poll loop — slash command during active query', () => {
     expect(getPendingMessages()).toHaveLength(0);
 
     await loopPromise.catch(() => {});
-    },
-    30000,
-  );
+  }, 30000);
 });
 
 /**

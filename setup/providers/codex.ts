@@ -387,7 +387,6 @@ export function verifyCodexInstall(root = process.cwd()): { ok: boolean; problem
 
   const requiredFiles = [
     'src/providers/codex.ts',
-    'src/providers/codex-agents-md.ts',
     'container/agent-runner/src/providers/codex.ts',
     'container/agent-runner/src/providers/codex-app-server.ts',
   ];

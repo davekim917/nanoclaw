@@ -1,9 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 
 import { findByName, findByRouting, findPeerName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
+  getMessageIn,
   markProcessing,
   markCompleted,
   markScriptSkipped,
@@ -17,7 +19,13 @@ import {
   advanceMemoryContextEpoch,
   clearContinuation,
   clearCurrentInReplyTo,
+  clearWorkContinuationIfMatches,
+  getWorkContinuation,
+  isWorkContinuationRunnable,
+  markWorkContinuationRunning,
   migrateLegacyContinuation,
+  requeueWorkContinuationIfMatches,
+  resetWorkContinuationForRealInbound,
   setContinuation,
   setCurrentInReplyTo,
   getStickyModel,
@@ -44,7 +52,7 @@ import {
 } from './formatter.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
-import { autoCommitDirtyWorktrees } from './worktree-autosave.js';
+import { autoCommitDirtyWorktrees, type AutoSaveResult } from './worktree-autosave.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
 
@@ -92,6 +100,15 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
 // waited out 5 minutes of silence.
 const CODEX_IDLE_RETRY_MAX = 1;
 const CODEX_IDLE_RETRY_BASE_MS = 3000;
+
+export function buildWorkContinuationPrompt(task: string): string {
+  return (
+    `<system>You durably handed yourself this unfinished task, and it has not been done:\n${task}\n` +
+    `Continue with it NOW — start the work immediately. Do not re-acknowledge, summarize, or announce; ` +
+    `if you must say something mid-work, use send_message. End this turn only when the task is done, ` +
+    `blocked on the user, cancelled, or replaced through continue_work.</system>`
+  );
+}
 
 /**
  * True for SQLite errors that indicate a corrupt READ view — almost always a
@@ -194,6 +211,17 @@ export interface PollLoopConfig {
    * polling forever and stealing messages from the next test's DB.
    */
   signal?: AbortSignal;
+  /** Optional dependency seam for deterministic turn-end checkpoint tests. */
+  autosaveWorktrees?: (reason: string) => Promise<AutoSaveResult>;
+}
+
+async function checkpointTurnEnd(autosaveWorktrees: (reason: string) => Promise<AutoSaveResult>): Promise<void> {
+  const autosave = await autosaveWorktrees('turn end');
+  if (autosave.committed.length > 0 || autosave.failed.length > 0) {
+    log(
+      `autosave: committed=[${autosave.committed.join(',')}] failed=[${autosave.failed.join(',')}] skipped=${autosave.skipped.length}`,
+    );
+  }
 }
 
 /**
@@ -207,6 +235,12 @@ export interface PollLoopConfig {
  * 6. Loop
  */
 export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+  const runnerId = randomUUID();
+  const autosaveWorktrees = config.autosaveWorktrees ?? autoCommitDirtyWorktrees;
+  const idleSuppressedContinuationIds = new Set<string>();
+  const suppressContinuationUntilRealInbound = (id: string): void => {
+    idleSuppressedContinuationIds.add(id);
+  };
   // Resume the agent's prior session from a previous container run if one
   // was persisted. The continuation is opaque to the poll-loop — the
   // provider decides how to use it (Claude resumes a .jsonl transcript,
@@ -261,6 +295,72 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       log(`Poll heartbeat (${pollCount} iterations, ${messages.length} pending)`);
     }
 
+    const hasTriggeringMessage = messages.some((m) => m.trigger === 1);
+
+    // Accumulated trigger=0 context is idle from the agent's perspective: it
+    // must not starve already-promised durable work. Leave those rows pending
+    // so they still accompany the next real inbound turn.
+    if (!hasTriggeringMessage) {
+      const pending = getWorkContinuation();
+      if (pending && !idleSuppressedContinuationIds.has(pending.id) && isWorkContinuationRunnable(pending, runnerId)) {
+        const runningWork = markWorkContinuationRunning(pending.id, runnerId);
+        if (runningWork) {
+          const sourceMessage = runningWork.source_message_id ? getMessageIn(runningWork.source_message_id) : undefined;
+          const sourceBatch = sourceMessage ? [sourceMessage] : [];
+          const routing = extractRouting(sourceBatch);
+          const prompt = buildWorkContinuationPrompt(runningWork.task);
+          const settings = applyFlagBatch([], routing, config.providerName);
+          log(`Resuming durable continuation: ${runningWork.task.slice(0, 120)}`);
+          config.provider.resetRotationCycle?.();
+          setCurrentInReplyTo(routing.inReplyTo);
+          setCurrentBatchAnchors(sourceBatch);
+          let query: AgentQuery | undefined;
+          const abortDirectQuery = () => query?.abort();
+          try {
+            query = config.provider.query({
+              prompt,
+              continuation,
+              cwd: config.cwd,
+              model: settings.model,
+              effort: settings.effort,
+              ultracode: settings.ultracode,
+              fast: settings.fast,
+              systemContext: config.systemContext,
+            });
+            if (config.signal?.aborted) query.abort();
+            else config.signal?.addEventListener('abort', abortDirectQuery, { once: true });
+            const result = await processQuery(
+              query,
+              routing,
+              [],
+              config.providerName,
+              config.provider.onExchangeComplete?.bind(config.provider),
+              prompt,
+              continuation,
+              settings,
+              runnerId,
+              runningWork.id,
+              suppressContinuationUntilRealInbound,
+            );
+            if (result.continuation && result.continuation !== continuation) {
+              continuation = result.continuation;
+              setContinuation(config.providerName, continuation);
+            }
+          } catch (err) {
+            requeueWorkContinuationIfMatches(runningWork.id, runnerId);
+            idleSuppressedContinuationIds.add(runningWork.id);
+            log(`Durable continuation paused after query error: ${err instanceof Error ? err.message : String(err)}`);
+          } finally {
+            config.signal?.removeEventListener('abort', abortDirectQuery);
+            clearCurrentInReplyTo();
+            clearBatchAnchors();
+          }
+          await checkpointTurnEnd(autosaveWorktrees);
+          continue;
+        }
+      }
+    }
+
     if (messages.length === 0) {
       await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
@@ -274,12 +374,20 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // (and potentially responding to) every accumulate-only batch, defeating
     // the "store as context, don't engage" contract. Host-side countDueMessages
     // gates the same way for wake-from-cold (see src/db/session-db.ts).
-    if (!messages.some((m) => m.trigger === 1)) {
+    if (!hasTriggeringMessage) {
       await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
 
-    const routing = extractRouting(messages);
+    let routing = extractRouting(messages);
+    const savedWork = getWorkContinuation();
+    if (!routing.platformId && savedWork?.source_message_id && isContinuationRecoveryBatch(messages)) {
+      const sourceMessage = getMessageIn(savedWork.source_message_id);
+      if (sourceMessage) {
+        const sourceRouting = extractRouting([sourceMessage]);
+        routing = { ...sourceRouting, quietStatus: routing.quietStatus, taskRun: routing.taskRun };
+      }
+    }
 
     // Command handling: the host router gates filtered and unauthorized
     // admin commands before they reach the container. The only command
@@ -373,6 +481,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Claim only the rows that will actually reach the prompt.
     const keptIds = keep.map((m) => m.id);
     markProcessing(keptIds);
+    if (hasRealInbound(keep)) {
+      resetWorkContinuationForRealInbound();
+      idleSuppressedContinuationIds.clear();
+    }
 
     const flagBatch = applyFlagBatch(keep, routing, config.providerName);
     let effectiveModel = flagBatch.model;
@@ -453,6 +565,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         prompt,
         continuation,
         { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
+        runnerId,
+        undefined,
+        suppressContinuationUntilRealInbound,
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
@@ -461,6 +576,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
+      const pausedWork = getWorkContinuation();
+      if (pausedWork?.phase === 'queued') idleSuppressedContinuationIds.add(pausedWork.id);
 
       let recovered = false;
 
@@ -508,6 +625,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               prompt,
               continuation,
               { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
+              runnerId,
+              undefined,
+              suppressContinuationUntilRealInbound,
             );
             if (retryResult.continuation && retryResult.continuation !== continuation) {
               continuation = retryResult.continuation;
@@ -576,6 +696,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               prompt,
               continuation,
               { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
+              runnerId,
+              undefined,
+              suppressContinuationUntilRealInbound,
             );
             if (retryResult.continuation && retryResult.continuation !== continuation) {
               continuation = retryResult.continuation;
@@ -642,6 +765,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             prompt,
             continuation,
             { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
+            runnerId,
+            undefined,
+            suppressContinuationUntilRealInbound,
           );
           if (retryResult.continuation && retryResult.continuation !== continuation) {
             continuation = retryResult.continuation;
@@ -708,6 +834,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             prompt,
             undefined,
             { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
+            runnerId,
+            undefined,
+            suppressContinuationUntilRealInbound,
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -761,6 +890,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             prompt,
             undefined,
             { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
+            runnerId,
+            undefined,
+            suppressContinuationUntilRealInbound,
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -817,6 +949,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             prompt,
             undefined,
             { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
+            runnerId,
+            undefined,
+            suppressContinuationUntilRealInbound,
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -862,12 +997,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // the agent forgot to commit. Mirrors v1's turn-end auto-commit pattern
     // (src/container-runner.ts cleanupThreadWorkspace, pre-fork). Never
     // throws; logs inside autoCommitDirtyWorktrees.
-    const autosave = await autoCommitDirtyWorktrees('turn end');
-    if (autosave.committed.length > 0 || autosave.failed.length > 0) {
-      log(
-        `autosave: committed=[${autosave.committed.join(',')}] failed=[${autosave.failed.join(',')}] skipped=${autosave.skipped.length}`,
-      );
-    }
+    await checkpointTurnEnd(autosaveWorktrees);
 
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).
@@ -886,6 +1016,31 @@ export function isAdmissibleTrigger(m: MessageInRow): boolean {
   if (m.kind === 'system') return false;
   if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
   return true;
+}
+
+function hasRealInbound(messages: MessageInRow[]): boolean {
+  return messages.some((message) => {
+    if (message.kind !== 'chat' && message.kind !== 'chat-sdk') return false;
+    try {
+      const content = JSON.parse(message.content) as { sender?: unknown; senderId?: unknown };
+      return content.sender !== 'system' && content.senderId !== 'system';
+    } catch {
+      return true;
+    }
+  });
+}
+
+function isContinuationRecoveryBatch(messages: MessageInRow[]): boolean {
+  if (hasRealInbound(messages)) return false;
+  return messages.some((message) => {
+    if (message.kind !== 'chat' && message.kind !== 'chat-sdk') return false;
+    try {
+      const content = JSON.parse(message.content) as { _system?: { kind?: unknown } };
+      return content._system?.kind === 'agent_ceiling_respawn' || content._system?.kind === 'agent_host_restart';
+    } catch {
+      return false;
+    }
+  });
 }
 
 function recallTargetId(m: MessageInRow): string | null {
@@ -1025,6 +1180,9 @@ export async function processQuery(
   // handler compares the current effective values against these to detect a
   // mid-turn change (flag OR change_model) and end-and-reopen on the new model.
   querySettings: { model?: string; effort?: string; ultracode?: boolean; fast?: boolean },
+  runnerId: string = randomUUID(),
+  initialContinuationId?: string,
+  onContinuationPaused?: (id: string) => void,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -1041,7 +1199,44 @@ export async function processQuery(
   // oldest unanswered prompt, except a wrapping-retry result, which answers
   // the same prompt again. Unused (and unmaintained) when the provider
   // doesn't implement `onExchangeComplete`.
-  const archivePrompts: string[] = [initialPrompt];
+  interface PromptLedgerEntry {
+    prompt: string;
+    continuationId?: string;
+  }
+  const archivePrompts: PromptLedgerEntry[] = [
+    { prompt: initialPrompt, ...(initialContinuationId ? { continuationId: initialContinuationId } : {}) },
+  ];
+
+  const requeueLedgerHead = (suppress: boolean): void => {
+    const continuationId = archivePrompts[0]?.continuationId;
+    if (!continuationId) return;
+    requeueWorkContinuationIfMatches(continuationId, runnerId);
+    if (suppress) onContinuationPaused?.(continuationId);
+  };
+
+  const pauseAnsweredPrompt = (): void => {
+    requeueLedgerHead(true);
+    archivePrompts.shift();
+  };
+
+  const completeDeliveredPrompt = (): void => {
+    const answered = archivePrompts.shift();
+    if (answered?.continuationId) clearWorkContinuationIfMatches(answered.continuationId);
+
+    // Real inbounds already queued in the stream take priority. Their result
+    // will revisit this function; only launch durable work when the prompt FIFO
+    // is otherwise empty. This lets an explicit user stop cancel the record
+    // before its prompt is ever pushed.
+    if (archivePrompts.length > 0) return;
+    const queued = getWorkContinuation();
+    if (!queued || !isWorkContinuationRunnable(queued, runnerId)) return;
+    const running = markWorkContinuationRunning(queued.id, runnerId);
+    if (!running) return;
+    const prompt = buildWorkContinuationPrompt(running.task);
+    log(`Starting durable continuation: ${running.task.slice(0, 120)}`);
+    query.push(prompt);
+    archivePrompts.push({ prompt, continuationId: running.id });
+  };
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -1189,6 +1384,7 @@ export async function processQuery(
 
         const keptIds = keep.map((m) => m.id);
         markProcessing(keptIds);
+        if (hasRealInbound(keep)) resetWorkContinuationForRealInbound();
         if (skipped.length > 0) {
           markScriptSkipped(skipped);
           log(`Pre-task script skipped ${skipped.length} follow-up task(s): ${skipped.map((s) => s.id).join(', ')}`);
@@ -1206,7 +1402,7 @@ export async function processQuery(
         unwrappedNudged = false;
         taskBlockNudged = false;
         query.push(prompt);
-        archivePrompts.push(prompt);
+        archivePrompts.push({ prompt });
         markCompleted(keptIds);
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
@@ -1259,11 +1455,12 @@ export async function processQuery(
           continue;
         }
         notifyExchangeComplete(onExchangeComplete, {
-          prompt: archivePrompts[0] ?? initialPrompt,
+          prompt: archivePrompts[0]?.prompt ?? initialPrompt,
           result: `Error: ${event.message}`,
           continuation: queryContinuation ?? initialContinuation,
           status: 'error',
         });
+        requeueLedgerHead(true);
         throw err;
       }
 
@@ -1313,7 +1510,8 @@ export async function processQuery(
           // real reason. Match conservatively: require both anchor phrases
           // (Claude Code prefix + Usage Policy URL) so legitimate prose
           // discussing policy doesn't trip the detector.
-          if (isAupRefusal(event.text)) {
+          const aupRefusal = isAupRefusal(event.text);
+          if (aupRefusal) {
             const taskId = getSessionSpawnTaskId();
             if (taskId !== null) {
               log(`AUP refusal detected — emitting spawn_failed for ${taskId}`);
@@ -1335,23 +1533,23 @@ export async function processQuery(
           const { sent, hasUnwrapped, taskBlocks } = dispatchResultText(event.text, routing);
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           if (routing.taskRun && !taskBlockNudged) autoAppendTaskLog(event.text);
-          if (sent === 0 && event.isError === true && !routing.taskRun) {
+          if ((event.isError === true || aupRefusal) && !routing.taskRun) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
             // the failing gateway turn after turn.
-            deliverErrorResult(event.text, routing);
+            if (sent === 0) deliverErrorResult(event.text, routing);
             notifyExchangeComplete(onExchangeComplete, {
-              prompt: archivePrompts[0] ?? initialPrompt,
+              prompt: archivePrompts[0]?.prompt ?? initialPrompt,
               result: event.text,
               continuation: queryContinuation ?? initialContinuation,
               status: 'error',
             });
-            archivePrompts.shift();
+            pauseAnsweredPrompt();
           } else {
             const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
             notifyExchangeComplete(onExchangeComplete, {
-              prompt: archivePrompts[0] ?? initialPrompt,
+              prompt: archivePrompts[0]?.prompt ?? initialPrompt,
               result: event.text,
               continuation: queryContinuation ?? initialContinuation,
               status: hasUnwrapped || willRetryTaskBlocks ? 'undelivered' : 'completed',
@@ -1376,10 +1574,12 @@ export async function processQuery(
             }
             // The wrapping-retry result answers the SAME user prompt — keep it
             // queued so the retry archives against it, not the nudge text.
-            if (!willRetryWrapping && !willRetryTaskBlocks) archivePrompts.shift();
+            if (!willRetryWrapping && !willRetryTaskBlocks) {
+              completeDeliveredPrompt();
+            }
           }
         } else {
-          archivePrompts.shift();
+          pauseAnsweredPrompt();
         }
       } else if (event.type === 'compacted') {
         advanceMemoryContextEpoch(providerName);
@@ -1407,10 +1607,12 @@ export async function processQuery(
     // SDK's internal retries were exhausted. Surface it via the catch below so
     // the user sees a real failure instead of silence. Any result clears this.
     if (!sawResult && lastRetryableErr) throw lastRetryableErr;
+    requeueLedgerHead(true);
   } catch (err) {
+    requeueLedgerHead(true);
     const errMsg = err instanceof Error ? err.message : String(err);
     notifyExchangeComplete(onExchangeComplete, {
-      prompt: archivePrompts[0] ?? initialPrompt,
+      prompt: archivePrompts[0]?.prompt ?? initialPrompt,
       result: `Error: ${errMsg}`,
       continuation: queryContinuation ?? initialContinuation,
       status: 'error',

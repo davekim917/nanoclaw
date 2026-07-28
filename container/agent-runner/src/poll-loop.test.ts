@@ -18,6 +18,7 @@ import {
   dispatchFileAttachment,
   dispatchResultText,
   applyFlagBatch,
+  buildWorkContinuationPrompt,
   handleEvent,
   isAdmissibleTrigger,
   isAupRefusal,
@@ -27,6 +28,12 @@ import {
   selectInTurnFollowUps,
   transientOverloadDelayMs,
 } from './poll-loop.js';
+import {
+  cancelWorkContinuation,
+  getWorkContinuation,
+  markWorkContinuationRunning,
+  queueWorkContinuation,
+} from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -191,6 +198,47 @@ describe('accumulate gate (trigger column)', () => {
     expect(messages.some((m) => m.trigger === 1)).toBe(true);
     // Both messages are present for the formatter → agent sees the prior context.
     expect(messages.map((m) => m.id).sort()).toEqual(['m1', 'm2']);
+  });
+
+  it('keeps a due deferred wake invisible when a warm container sees concurrent real inbound', () => {
+    insertMessage('schedule-wake-1', 'chat', { text: '[system] check CI' }, { trigger: 0 });
+    insertMessage('recall-schedule-wake-1', 'system', { subtype: 'recall_context', deferred: true }, { trigger: 0 });
+    insertMessage('m1', 'chat', { sender: 'A', text: 'new user turn' }, { trigger: 1 });
+
+    expect(getPendingMessages().map((m) => m.id)).toEqual(['m1']);
+  });
+
+  it('keeps a due deferred on-wake pair invisible on a concurrent fresh-container turn', () => {
+    insertMessage(
+      'host-restart-1',
+      'chat',
+      { text: '[system] account for interrupted work' },
+      { trigger: 0, onWake: 1 },
+    );
+    insertMessage(
+      'recall-host-restart-1',
+      'system',
+      { subtype: 'recall_context', deferred: true },
+      { trigger: 0, onWake: 1 },
+    );
+    insertMessage('m1', 'chat', { sender: 'A', text: 'new user turn' }, { trigger: 1 });
+
+    expect(getPendingMessages(true).map((m) => m.id)).toEqual(['m1']);
+    markCompleted(['m1']);
+
+    // Simulate host due-admission after that first poll. Admission replaces
+    // the marker, enables the trigger, and clears on_wake on both halves so
+    // this already-running fresh container can consume the accountability turn.
+    getInboundDb()
+      .prepare('UPDATE messages_in SET content = ?, on_wake = 0 WHERE id = ?')
+      .run(JSON.stringify({ subtype: 'recall_context', trustedCapabilities: {} }), 'recall-host-restart-1');
+    getInboundDb().prepare('UPDATE messages_in SET trigger = 1, on_wake = 0 WHERE id = ?').run('host-restart-1');
+
+    expect(
+      getPendingMessages(false)
+        .map((m) => m.id)
+        .sort(),
+    ).toEqual(['host-restart-1', 'recall-host-restart-1']);
   });
 
   it('selectInTurnFollowUps: pure trigger=0 batch defers (no push)', () => {
@@ -1598,7 +1646,10 @@ describe('mid-turn fast-mode changes', () => {
     expect(endCalls).toBe(1);
     expect(pushCalls).toBe(0);
     expect(getPendingMessages().map((m) => m.id)).toContain('m-fast');
-  }, 10_000);
+    // The full Bun suite runs CPU-heavy design-review tests concurrently in the
+    // same process. Keep this above their longest event-loop stall; in isolation
+    // the 500 ms active-poll path completes in well under a second.
+  }, 30_000);
 });
 
 describe('error result with no <message> envelope', () => {
@@ -1665,5 +1716,162 @@ describe('transientOverloadDelayMs — server-overload backoff schedule', () => 
     let worstCaseMs = 0;
     for (let n = 0; n < 30; n++) worstCaseMs += transientOverloadDelayMs(n, 1);
     expect(worstCaseMs).toBeLessThan(30 * 60 * 1000);
+  });
+});
+
+describe('durable continuation wiring', () => {
+  beforeEach(() => {
+    // Register chan-1 as a destination so <message to="chan-1"> resolves and
+    // results are "delivered" rather than routed through the re-wrap nudge.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('chan-1', 'Chan 1', 'channel', 'discord', 'chan-1', NULL)`,
+      )
+      .run();
+  });
+
+  it('pushes a queued continuation only after a delivered final result', async () => {
+    const queued = queueWorkContinuation('write the dbt tests');
+    expect(queued.accepted).toBe(true);
+    const { query, pushes } = makeResultQuery({ type: 'result', text: '<message to="chan-1">On it.</message>' });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {}, 'runner-a');
+
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('write the dbt tests');
+    expect(pushes[0]).toContain('Continue with it NOW');
+    expect(getWorkContinuation()).toMatchObject({ task: 'write the dbt tests', phase: 'queued' });
+  });
+
+  it('future-tense prose and NEXT text have no control effect', async () => {
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: '<message to="chan-1">Working on that next.</message>\n<internal>NEXT: old parser text</internal>',
+    });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+
+    expect(pushes).toHaveLength(0);
+    expect(getWorkContinuation()).toBeUndefined();
+  });
+
+  it('a replacement made during running work survives the stale result', async () => {
+    const first = queueWorkContinuation('first task');
+    if (!first.accepted) throw new Error('expected continuation');
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'result', text: '<message to="chan-1">initial turn done</message>' };
+      queueWorkContinuation('replacement task');
+      yield { type: 'result', text: '<message to="chan-1">old task result</message>' };
+    }
+    const query: AgentQuery = { push: (p) => pushes.push(p), end: () => {}, abort: () => {}, events: events() };
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {}, 'runner-a');
+
+    expect(pushes).toHaveLength(2);
+    expect(pushes[0]).toContain('first task');
+    expect(pushes[1]).toContain('replacement task');
+    expect(getWorkContinuation()).toMatchObject({ task: 'replacement task', phase: 'queued' });
+  });
+
+  it('does not launch while a wrapping nudge is in flight', async () => {
+    queueWorkContinuation('must stay queued');
+    getInboundDb().prepare('DELETE FROM destinations').run();
+    const { query, pushes } = makeResultQuery({ type: 'result', text: 'bare prose' });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {}, 'runner-a');
+
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain('was not delivered');
+    expect(getWorkContinuation()).toMatchObject({ task: 'must stay queued', phase: 'queued' });
+  });
+
+  it('requeues a continuation when its stream ends without completing it', async () => {
+    const queued = queueWorkContinuation('resume after stream loss');
+    if (!queued.accepted) throw new Error('expected continuation');
+    markWorkContinuationRunning(queued.continuation.id, 'runner-a');
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+
+    await processQuery(
+      query,
+      ERR_ROUTING,
+      [],
+      'claude',
+      undefined,
+      buildWorkContinuationPrompt(queued.continuation.task),
+      undefined,
+      {},
+      'runner-a',
+      queued.continuation.id,
+    );
+
+    expect(getWorkContinuation()).toMatchObject({ id: queued.continuation.id, phase: 'queued' });
+  });
+
+  it('requeues and suppresses a deterministic error result until real inbound', async () => {
+    const queued = queueWorkContinuation('resume after provider recovery');
+    if (!queued.accepted) throw new Error('expected continuation');
+    markWorkContinuationRunning(queued.continuation.id, 'runner-a');
+    const paused: string[] = [];
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: 'persistent gateway error',
+      isError: true,
+    });
+
+    await processQuery(
+      query,
+      ERR_ROUTING,
+      [],
+      'claude',
+      undefined,
+      buildWorkContinuationPrompt(queued.continuation.task),
+      undefined,
+      {},
+      'runner-a',
+      queued.continuation.id,
+      (id) => paused.push(id),
+    );
+
+    expect(pushes).toHaveLength(0);
+    expect(paused).toEqual([queued.continuation.id]);
+    expect(getWorkContinuation()).toMatchObject({ id: queued.continuation.id, phase: 'queued' });
+  });
+
+  it('does not complete or advance work on an empty result', async () => {
+    const queued = queueWorkContinuation('resume after empty result');
+    if (!queued.accepted) throw new Error('expected continuation');
+    markWorkContinuationRunning(queued.continuation.id, 'runner-a');
+    const paused: string[] = [];
+    const { query, pushes } = makeResultQuery({ type: 'result', text: null });
+
+    await processQuery(
+      query,
+      ERR_ROUTING,
+      [],
+      'claude',
+      undefined,
+      buildWorkContinuationPrompt(queued.continuation.task),
+      undefined,
+      {},
+      'runner-a',
+      queued.continuation.id,
+      (id) => paused.push(id),
+    );
+
+    expect(pushes).toHaveLength(0);
+    expect(paused).toEqual([queued.continuation.id]);
+    expect(getWorkContinuation()).toMatchObject({ id: queued.continuation.id, phase: 'queued' });
+  });
+
+  it('explicit cancellation is idempotent', () => {
+    queueWorkContinuation('cancel me');
+    expect(cancelWorkContinuation()).toBe(true);
+    expect(cancelWorkContinuation()).toBe(false);
   });
 });

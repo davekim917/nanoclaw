@@ -421,6 +421,8 @@ Everything below is handled by the agent-runner, not the provider.
 
 The agent-runner signals "busy" status to the host. The mechanism for this is provider-specific — for Claude, the query AsyncGenerator is still yielding events. For others, the agent-runner can write a heartbeat or status indicator to the session DB that the host checks before killing.
 
+**Durable work continuation.** Immediate follow-through is explicit tool state, not parsed prose. `continue_work({task})` stores a versioned task in `session_state.work_continuation`; `cancel_continuation()` removes it. A result is tied to the continuation ID whose prompt launched it, so completion cannot erase a replacement queued during that work. The runner starts queued work only after the current result was delivered and the prompt FIFO is empty; already-arrived user input therefore runs first and may cancel the task. A running row records the runner ID, preventing the same process from injecting it twice, while a fresh process may recover it. Real inbound resets the chain and recovery counters without silently deleting the task. Clean completion compare-clears the matching ID; errors or a stream ending without that result requeue it. Plain future-tense text and `NEXT:` have no control effect. The chain cap is 50; host recovery is capped at two attempts before a visible parked notice.
+
 ### Message Formatting
 
 The agent-runner transforms messages_in rows into a prompt string. The provider receives a ready-to-send string — it doesn't know about message kinds or routing.
