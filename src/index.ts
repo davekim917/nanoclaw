@@ -17,6 +17,7 @@ import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
 import { getMessagingGroupByPlatform, updateMessagingGroup } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning, cleanupOrphansStrict } from './container-runtime.js';
+import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } from './host-restart-warn.js';
 import { resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
 import { stopAllContainers } from './container-runner.js';
@@ -196,7 +197,15 @@ export async function main(): Promise<void> {
   // Canonical memory reconciliation can create links only after install-scoped
   // container absence has been proved. A failed runtime listing is not
   // equivalent to "none running": cleanupOrphansStrict throws and startup
-  // stops before any filesystem cutover.
+  // stops before any filesystem cutover. FIRST warn sessions still marked
+  // 'running' (unclean previous host) that their containers are about to be
+  // stopped — the on_wake note makes the next spawn account publicly instead
+  // of the session going dark until a human pings.
+  try {
+    warnMarkedRunningSessionsOfStartup('host startup after an unclean stop');
+  } catch (err) {
+    log.error('host-restart startup warn failed', { err });
+  }
   const memoryReports = runWorkgroupMemoryStartupGate(db);
   for (const report of memoryReports) {
     if (report.state.status === 'migration-required') {
@@ -500,6 +509,14 @@ async function shutdown(signal: string): Promise<void> {
   await stopCliServer();
   try {
     await teardownChannelAdapters();
+    // Warn mid-work sessions before their containers are stopped: the
+    // on_wake note (due immediately) makes the post-restart spawn account
+    // for the interruption publicly instead of the session going dark.
+    try {
+      warnActiveContainersOfShutdown('graceful host shutdown');
+    } catch (err) {
+      log.error('host-restart shutdown warn failed', { err });
+    }
     // Synchronously stop agent containers before exit. Without this, child
     // subprocesses linger in the cgroup and systemd TimeoutStopSec stalls
     // every restart. Matches v1's GroupQueue.shutdown semantics.
