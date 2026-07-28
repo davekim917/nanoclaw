@@ -200,6 +200,32 @@ describe('accumulate gate (trigger column)', () => {
     expect(messages.map((m) => m.id).sort()).toEqual(['m1', 'm2']);
   });
 
+  it('keeps a due deferred wake invisible when a warm container sees concurrent real inbound', () => {
+    insertMessage('schedule-wake-1', 'chat', { text: '[system] check CI' }, { trigger: 0 });
+    insertMessage('recall-schedule-wake-1', 'system', { subtype: 'recall_context', deferred: true }, { trigger: 0 });
+    insertMessage('m1', 'chat', { sender: 'A', text: 'new user turn' }, { trigger: 1 });
+
+    expect(getPendingMessages().map((m) => m.id)).toEqual(['m1']);
+  });
+
+  it('keeps a due deferred on-wake pair invisible on a concurrent fresh-container turn', () => {
+    insertMessage(
+      'host-restart-1',
+      'chat',
+      { text: '[system] account for interrupted work' },
+      { trigger: 0, onWake: 1 },
+    );
+    insertMessage(
+      'recall-host-restart-1',
+      'system',
+      { subtype: 'recall_context', deferred: true },
+      { trigger: 0, onWake: 1 },
+    );
+    insertMessage('m1', 'chat', { sender: 'A', text: 'new user turn' }, { trigger: 1 });
+
+    expect(getPendingMessages(true).map((m) => m.id)).toEqual(['m1']);
+  });
+
   it('selectInTurnFollowUps: pure trigger=0 batch defers (no push)', () => {
     // The agent is mid-stream on an earlier turn — a non-mention shouldn't
     // interrupt thinking-blocks with content the bot wasn't addressed in.
@@ -1605,9 +1631,9 @@ describe('mid-turn fast-mode changes', () => {
     expect(endCalls).toBe(1);
     expect(pushCalls).toBe(0);
     expect(getPendingMessages().map((m) => m.id)).toContain('m-fast');
-  // The full Bun suite runs CPU-heavy design-review tests concurrently in the
-  // same process. Keep this above their longest event-loop stall; in isolation
-  // the 500 ms active-poll path completes in well under a second.
+    // The full Bun suite runs CPU-heavy design-review tests concurrently in the
+    // same process. Keep this above their longest event-loop stall; in isolation
+    // the 500 ms active-poll path completes in well under a second.
   }, 30_000);
 });
 

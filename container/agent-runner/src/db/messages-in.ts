@@ -79,6 +79,17 @@ function recallTargetId(m: MessageInRow): string | null {
   }
 }
 
+/** A host-owned marker keeps its paired delayed/lifecycle turn invisible until due admission replaces it. */
+function deferredRecallTargetId(m: MessageInRow): string | null {
+  if (m.kind !== 'system' || !m.id.startsWith('recall-')) return null;
+  try {
+    const content = JSON.parse(m.content) as { subtype?: unknown; deferred?: unknown };
+    return content.subtype === 'recall_context' && content.deferred === true ? m.id.slice('recall-'.length) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Keep recall-enabled batches atomic in both cold-start and in-turn paths.
  *
@@ -219,7 +230,19 @@ export function getPendingMessages(isFirstPoll = false, diagnostics?: PendingSel
       const byTimestamp = parseDbUtc(b.timestamp) - parseDbUtc(a.timestamp);
       return byTimestamp !== 0 ? byTimestamp : b.id.localeCompare(a.id);
     });
-    const candidateIds = [...candidateById.keys()];
+    // Deferred host wakes are stored as trigger=0 chat plus a paired marker.
+    // Once due, a concurrent real inbound can wake a warm/fresh container
+    // before the host sweep replaces that marker with fresh recall. Hide both
+    // rows here so neither outer-turn nor in-turn admission can claim the wake
+    // as ordinary accumulated context. The exact-partner query above ensures
+    // that seeing either half is enough to identify and remove the full pair.
+    const deferredTargetIds = new Set(pending.map(deferredRecallTargetId).filter((id): id is string => id !== null));
+    const visiblePending = pending.filter(
+      (row) => deferredRecallTargetId(row) === null && !deferredTargetIds.has(row.id),
+    );
+    if (visiblePending.length === 0) return [];
+
+    const candidateIds = visiblePending.map((row) => row.id);
     const candidatePlaceholders = candidateIds.map(() => '?').join(', ');
 
     // Filter out messages already acknowledged in outbound.db
@@ -263,7 +286,7 @@ export function getPendingMessages(isFirstPoll = false, diagnostics?: PendingSel
       .all(...candidateIds) as Array<{ id: string; ts: string }>) {
       respondedAt.set(r.id, parseDbUtc(r.ts));
     }
-    const pendingById = new Map(pending.map((m) => [m.id, m]));
+    const pendingById = new Map(visiblePending.map((m) => [m.id, m]));
     const isAcked = (id: string): boolean => {
       const ts = ackedAt.get(id);
       if (ts === undefined) return false;
@@ -296,7 +319,7 @@ export function getPendingMessages(isFirstPoll = false, diagnostics?: PendingSel
     // target is also present in the same eligible snapshot. This drains
     // completed-trigger orphans and also prevents a recall for a not-yet-due
     // target from being promoted into a standalone prompt.
-    const eligible = pending.filter((m) => !isAcked(m.id) && !isResponded(m.id));
+    const eligible = visiblePending.filter((m) => !isAcked(m.id) && !isResponded(m.id));
     const paired = retainCompleteRecallUnits(eligible);
 
     const unitKey = (m: MessageInRow): string => recallTargetId(m) ?? m.id;

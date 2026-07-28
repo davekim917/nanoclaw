@@ -145,7 +145,8 @@ CI corrections:
 - Recovery-attempt counting now treats historical non-JSON inbound content as real user input without calling `json_extract` on malformed JSON, preserving ceiling accountability for legacy sessions.
 - Root lifecycle documentation now matches the shipped explicit-tool contract and evidence model; obsolete `NEXT:`, `pending_next`, status-evidence, and old constant/function guidance was removed.
 - Focused host-sweep suite after these corrections: 103 passed, 0 failed; host TypeScript, changed-file formatting, diff hygiene, and the public-boundary check passed.
-- Final container suite after the direct-continuation correction: 966 passed, 4 skipped, 0 failed. Both TypeScript checks passed.
+- Deferred wake markers and their paired trigger are now removed from the container's pending snapshot until host due-admission replaces the marker with fresh recall. Concurrent real inbound can no longer consume a scheduled or lifecycle wake as accumulated context; warm- and fresh-container races are covered.
+- Final container suite after the review corrections: 968 passed, 4 skipped, 0 failed. Both TypeScript checks passed.
 
 ## Activation boundary
 
