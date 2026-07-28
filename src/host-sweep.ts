@@ -5,7 +5,8 @@
  *   - Reads processing_ack + container_state from outbound.db
  *   - Writes to inbound.db (host-owned) for status updates + recurrence
  *   - Uses heartbeat file mtime for liveness (never polls DB for it)
- *   - Never writes to outbound.db — preserves single-writer-per-file invariant
+ *   - Writes outbound.db only while the session container is confirmed stopped
+ *     (continuation recovery counters / visible parked notice)
  *
  * Stuck / idle detection (replaces the old IDLE_TIMEOUT setTimeout + 10-min
  * heartbeat threshold):
@@ -44,7 +45,7 @@ import {
   getDueWakePriority,
   getMessageForRetry,
   getProcessingClaims,
-  insertMessage,
+  insertDeferredMessageWithContextIfNew,
   markMessageFailed,
   openInboundDb as openInboundDbByPath,
   readSessionRouting,
@@ -227,108 +228,328 @@ export function decideStuckAction(args: {
 // working, then went silent for hours," and the background job's state (plus
 // /tmp) is gone by the time anyone looks.
 //
-// When the kill plausibly interrupted work — a tool was in flight, or the
-// agent's last outbound was internal narration (kind='status') rather than a
-// user-facing message — queue an on_wake accountability row. The sweep's
-// due-wake step respawns the session within a tick, and the fresh container
-// must publicly account for the interruption (done / lost / next) instead of
-// silently sitting dead. Capped per quiet episode: an agent that never posts
-// a user-visible message gets at most CEILING_RESPAWN_MAX_ATTEMPTS automatic
-// restarts, then the session stays down until real inbound. Any real inbound
-// (user, peer relay, task) resets the episode; host-generated rows (recall
-// pairs, gate notices, our own respawns) deliberately do not — otherwise the
-// fresh recall admitted with each wake would reset the counter and the cap
-// would never bite.
+// When the kill interrupted an explicit continuation or a freshly-started
+// tool, queue an on_wake accountability row. Status/narration is deliberately
+// not evidence: "starting now" can be the final output of a completed turn.
+// The continuation record owns the two-attempt recovery cap; genuine inbound
+// resets that counter in the runner without deleting the saved task.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const CEILING_RESPAWN_MAX_ATTEMPTS = 2;
+export const WORK_CONTINUATION_RESUME_MAX_ATTEMPTS = 2;
+export const CONTINUATION_WAKE_MIN_INTERVAL_MS = 10 * 60 * 1000;
+const WORK_CONTINUATION_TASK_MAX_CHARS = 500;
 
-// A stored NEXT: promise (session_state.pending_next in outbound.db) wakes a
-// stopped container even with nothing due — the fresh container's poll loop
-// resumes the promised task from the stored row, no host-written message
-// needed. Throttled per session so a crash-looping task can't spin the
-// respawn path every tick.
-export const PENDING_NEXT_WAKE_MIN_INTERVAL_MS = 10 * 60 * 1000;
-
-/** Throttle gate: wake only when the last spawn is old (or never happened). */
-export function decidePendingNextWake(args: { now: number; spawnedAtMs: number }): boolean {
-  if (args.spawnedAtMs === 0) return true;
-  return args.now - args.spawnedAtMs >= PENDING_NEXT_WAKE_MIN_INTERVAL_MS;
+/** Throttle gate: wake only when the last spawn/recovery attempt is old. */
+export function decideContinuationWake(args: {
+  now: number;
+  spawnedAtMs: number;
+  lastRecoveryAttemptAtMs?: number;
+}): boolean {
+  const lastAttemptAtMs = Math.max(args.spawnedAtMs, args.lastRecoveryAttemptAtMs ?? 0);
+  if (lastAttemptAtMs === 0) return true;
+  return args.now - lastAttemptAtMs >= CONTINUATION_WAKE_MIN_INTERVAL_MS;
 }
 
-function hasPendingNextTask(outDb: Database.Database): boolean {
+export interface HostWorkContinuation {
+  id: string;
+  task: string;
+  phase: 'queued' | 'running';
+  chain: number;
+  runner_id?: string;
+  resume_attempts: number;
+}
+
+export function canAttemptContinuationRecovery(continuation: HostWorkContinuation): boolean {
+  return continuation.resume_attempts < WORK_CONTINUATION_RESUME_MAX_ATTEMPTS;
+}
+
+export function readWorkContinuation(outDb: Database.Database): HostWorkContinuation | null {
   try {
-    const row = outDb.prepare("SELECT value FROM session_state WHERE key = 'pending_next'").get() as
+    const row = outDb.prepare("SELECT value FROM session_state WHERE key = 'work_continuation'").get() as
       | { value: string }
       | undefined;
-    if (!row) return false;
-    const parsed = JSON.parse(row.value) as { task?: unknown };
-    return typeof parsed.task === 'string' && parsed.task.trim() !== '';
+    if (row) {
+      const parsed = JSON.parse(row.value) as Partial<HostWorkContinuation>;
+      if (
+        typeof parsed.id !== 'string' ||
+        parsed.id === '' ||
+        typeof parsed.task !== 'string' ||
+        parsed.task.trim() === '' ||
+        parsed.task.length > WORK_CONTINUATION_TASK_MAX_CHARS ||
+        (parsed.phase !== 'queued' && parsed.phase !== 'running') ||
+        !Number.isSafeInteger(parsed.chain) ||
+        (parsed.chain ?? -1) < 0 ||
+        !Number.isSafeInteger(parsed.resume_attempts) ||
+        (parsed.resume_attempts ?? -1) < 0 ||
+        (parsed.runner_id !== undefined && (typeof parsed.runner_id !== 'string' || parsed.runner_id === ''))
+      ) {
+        return null;
+      }
+      return {
+        id: parsed.id,
+        task: parsed.task.trim(),
+        phase: parsed.phase,
+        chain: parsed.chain as number,
+        ...(parsed.runner_id ? { runner_id: parsed.runner_id } : {}),
+        resume_attempts: parsed.resume_attempts as number,
+      };
+    }
+
+    // Rollout compatibility: the fresh runner owns migration/deletion because
+    // the host normally opens outbound.db read-only. A valid legacy promise is
+    // sufficient to wake once; the runner converts it before executing.
+    const legacy = outDb.prepare("SELECT value FROM session_state WHERE key = 'pending_next'").get() as
+      | { value: string }
+      | undefined;
+    if (!legacy) return null;
+    const parsed = JSON.parse(legacy.value) as { task?: unknown; chain?: unknown };
+    if (
+      typeof parsed.task !== 'string' ||
+      parsed.task.trim() === '' ||
+      parsed.task.length > WORK_CONTINUATION_TASK_MAX_CHARS
+    ) {
+      return null;
+    }
+    return {
+      id: 'legacy-pending-next',
+      task: parsed.task.trim(),
+      phase: 'queued',
+      chain: Number.isSafeInteger(parsed.chain) && (parsed.chain as number) >= 0 ? (parsed.chain as number) : 0,
+      resume_attempts: 0,
+    };
   } catch {
-    return false;
+    return null;
+  }
+}
+
+/**
+ * Durable throttle timestamp for an already-attempted recovery. The active
+ * container registry is cleared on exit, but session_state survives the
+ * crash, so a fast-failing replacement cannot be respawned every sweep tick.
+ */
+export function readContinuationRecoveryAttemptAt(
+  outDb: Database.Database,
+  continuation: HostWorkContinuation,
+): number {
+  if (continuation.id === 'legacy-pending-next' || continuation.resume_attempts === 0) return 0;
+  try {
+    const row = outDb.prepare("SELECT updated_at FROM session_state WHERE key = 'work_continuation'").get() as
+      | { updated_at: string }
+      | undefined;
+    if (!row) return 0;
+    const parsed = parseSqliteUtc(row.updated_at);
+    return Number.isFinite(parsed) ? parsed : 0;
+  } catch {
+    return 0;
   }
 }
 
 /** Test-only re-export with an injected outbound DB handle. */
-export function _hasPendingNextTaskForTesting(outDb: Database.Database): boolean {
-  return hasPendingNextTask(outDb);
+export function _hasWorkContinuationForTesting(outDb: Database.Database): boolean {
+  return readWorkContinuation(outDb) !== null;
 }
 
-export type CeilingFollowUp = { action: 'none' } | { action: 'wake-accountable'; attempt: number };
+export function incrementWorkContinuationResumeAttempt(
+  outDb: Database.Database,
+  expectedId: string,
+): HostWorkContinuation | null {
+  return outDb.transaction(() => {
+    const current = readWorkContinuation(outDb);
+    if (
+      !current ||
+      current.id !== expectedId ||
+      current.id === 'legacy-pending-next' ||
+      current.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
+    ) {
+      return null;
+    }
+    const updated = { ...current, resume_attempts: current.resume_attempts + 1 };
+    outDb
+      .prepare("UPDATE session_state SET value = ?, updated_at = ? WHERE key = 'work_continuation'")
+      .run(JSON.stringify(updated), new Date().toISOString());
+    return updated;
+  })();
+}
+
+export function migrateLegacyWorkContinuationForRecovery(outDb: Database.Database): HostWorkContinuation | null {
+  return outDb.transaction(() => {
+    const legacy = readWorkContinuation(outDb);
+    if (!legacy || legacy.id !== 'legacy-pending-next') return null;
+    const migrated: HostWorkContinuation = {
+      ...legacy,
+      id: randomUUID(),
+      resume_attempts: 1,
+    };
+    outDb
+      .prepare(
+        `INSERT INTO session_state (key, value, updated_at) VALUES ('work_continuation', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+      )
+      .run(JSON.stringify(migrated), new Date().toISOString());
+    outDb.prepare("DELETE FROM session_state WHERE key = 'pending_next'").run();
+    return migrated;
+  })();
+}
+
+function incrementStoppedContinuationAttempt(session: Session, expectedId: string): HostWorkContinuation | null {
+  let db: Database.Database | null = null;
+  try {
+    db = openOutboundDbRw(session.agent_group_id, session.id);
+    if (expectedId !== 'legacy-pending-next') return incrementWorkContinuationResumeAttempt(db, expectedId);
+    return migrateLegacyWorkContinuationForRecovery(db);
+  } catch (err) {
+    log.warn('Failed to increment continuation recovery attempt', { sessionId: session.id, err });
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
+export function restoreWorkContinuationResumeAttempt(
+  outDb: Database.Database,
+  expectedId: string,
+  expectedAttempts: number,
+): HostWorkContinuation | null {
+  return outDb.transaction(() => {
+    const current = readWorkContinuation(outDb);
+    if (!current || current.id !== expectedId || current.resume_attempts !== expectedAttempts) return null;
+    const restored = { ...current, resume_attempts: Math.max(0, expectedAttempts - 1) };
+    outDb
+      .prepare("UPDATE session_state SET value = ?, updated_at = ? WHERE key = 'work_continuation'")
+      .run(JSON.stringify(restored), new Date().toISOString());
+    return restored;
+  })();
+}
+
+function restoreStoppedContinuationAttempt(session: Session, expectedId: string, expectedAttempts: number): void {
+  let db: Database.Database | null = null;
+  try {
+    db = openOutboundDbRw(session.agent_group_id, session.id);
+    restoreWorkContinuationResumeAttempt(db, expectedId, expectedAttempts);
+  } catch (err) {
+    log.warn('Failed to restore continuation recovery attempt after rejected wake', { sessionId: session.id, err });
+  } finally {
+    db?.close();
+  }
+}
+
+export function hasDueRecoveryWake(inDb: Database.Database, nowIso: string): boolean {
+  return Boolean(
+    inDb
+      .prepare(
+        `SELECT 1 FROM messages_in
+         WHERE status = 'pending'
+           AND trigger = 1
+           AND (process_after IS NULL OR datetime(process_after) <= datetime(?))
+           AND (id LIKE 'ceiling-respawn-%' OR id LIKE 'host-restart-%')
+         LIMIT 1`,
+      )
+      .get(nowIso),
+  );
+}
+
+export function parkDueRecoveryWakes(inDb: Database.Database, nowIso: string): number {
+  return inDb
+    .prepare(
+      `UPDATE messages_in
+       SET status = 'completed'
+       WHERE status = 'pending'
+         AND trigger = 1
+         AND (process_after IS NULL OR datetime(process_after) <= datetime(?))
+         AND (id LIKE 'ceiling-respawn-%' OR id LIKE 'host-restart-%')`,
+    )
+    .run(nowIso).changes;
+}
+
+export function notifyContinuationParked(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  session: Session,
+  continuation: HostWorkContinuation,
+  writeMessage: (message: {
+    id: string;
+    kind: string;
+    platformId: string | null;
+    channelType: string | null;
+    threadId: string | null;
+    content: string;
+  }) => void = (message) => writeOutboundDirect(session.agent_group_id, session.id, message),
+): boolean {
+  const marker = `continuation_recovery_parked:${continuation.id}`;
+  if (outDb.prepare('SELECT 1 FROM messages_out WHERE content LIKE ? LIMIT 1').get(`%${marker}%`)) return false;
+  const routing = readSessionRouting(inDb);
+  if (!routing) return false;
+  writeMessage({
+    id: `continuation-parked-${continuation.id}`,
+    kind: 'chat',
+    platformId: routing.platform_id,
+    channelType: routing.channel_type,
+    threadId: routing.thread_id,
+    content: JSON.stringify({
+      text:
+        `⚠️ I could not resume the interrupted work after ${WORK_CONTINUATION_RESUME_MAX_ATTEMPTS} automatic attempts. ` +
+        `The task is still saved: ${continuation.task}. Reply in this thread and I will try again.`,
+      _system: { kind: marker, continuation_id: continuation.id },
+    }),
+  });
+  return true;
+}
+
+export type CeilingFollowUp = { action: 'none' } | { action: 'wake-accountable'; reason: 'continuation' | 'tool' };
 
 export function decideCeilingFollowUp(args: {
+  hasContinuation: boolean;
   currentTool: string | null;
-  lastOutboundKind: string | null;
-  priorAttempts: number;
+  toolStartedAt: string | null;
+  priorToolAttempts: number;
+  now: number;
 }): CeilingFollowUp {
-  const plausiblyMidWork = args.currentTool != null || args.lastOutboundKind === 'status';
-  if (!plausiblyMidWork) return { action: 'none' };
-  if (args.priorAttempts >= CEILING_RESPAWN_MAX_ATTEMPTS) return { action: 'none' };
-  return { action: 'wake-accountable', attempt: args.priorAttempts + 1 };
+  if (args.hasContinuation) return { action: 'wake-accountable', reason: 'continuation' };
+  if (!args.currentTool || !args.toolStartedAt) return { action: 'none' };
+  const startedAt = parseSqliteUtc(args.toolStartedAt);
+  if (!Number.isFinite(startedAt) || startedAt > args.now || args.now - startedAt > ABSOLUTE_CEILING_MS) {
+    return { action: 'none' };
+  }
+  if (args.priorToolAttempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) return { action: 'none' };
+  return { action: 'wake-accountable', reason: 'tool' };
 }
 
 const CEILING_RESPAWN_ID_PREFIX = 'ceiling-respawn-';
 
-function getLastOutboundKind(outDb: Database.Database): string | null {
-  const row = outDb.prepare('SELECT kind FROM messages_out ORDER BY seq DESC LIMIT 1').get() as
-    | { kind: string }
-    | undefined;
-  return row?.kind ?? null;
-}
-
-function countCeilingRespawnAttempts(inDb: Database.Database): number {
+export function countToolRecoveryAttemptsSinceRealInbound(inDb: Database.Database): number {
   const row = inDb
     .prepare(
-      `SELECT COUNT(*) AS c FROM messages_in
-       WHERE id LIKE '${CEILING_RESPAWN_ID_PREFIX}%'
+      `SELECT COUNT(*) AS count FROM messages_in
+       WHERE id LIKE '${CEILING_RESPAWN_ID_PREFIX}tool-%'
          AND timestamp > COALESCE((
            SELECT MAX(timestamp) FROM messages_in
-           WHERE id NOT LIKE '${CEILING_RESPAWN_ID_PREFIX}%'
-             AND kind != 'system'
+           WHERE kind != 'system'
              AND COALESCE(json_extract(content, '$.senderId'), '') != 'system'
              AND COALESCE(json_extract(content, '$.sender'), '') != 'system'
          ), '')`,
     )
-    .get() as { c: number };
-  return row.c;
+    .get() as { count: number };
+  return row.count;
 }
 
-function writeCeilingRespawn(inDb: Database.Database, session: Session, attempt: number, heartbeatAgeMs: number): void {
+function writeCeilingRespawn(
+  inDb: Database.Database,
+  session: Session,
+  reason: 'continuation' | 'tool',
+  recoveryKey: string,
+  heartbeatAgeMs: number,
+): void {
   const idleMinutes = Math.round(ABSOLUTE_CEILING_MS / 60_000);
   const silentMinutes = Math.round(heartbeatAgeMs / 60_000);
-  const final = attempt >= CEILING_RESPAWN_MAX_ATTEMPTS;
   const text =
     `[system] Your previous container was killed by the ${idleMinutes}-minute idle ceiling ` +
     `(no active turn for ~${silentMinutes} min). If work was in flight: check your durable checkpoints, ` +
     `resume what is safely resumable, and post ONE message accounting for state — done / lost / next. ` +
     `In-container background tasks, sleeps, and /tmp do not survive a restart; before going idle with ` +
-    `work in flight, checkpoint to a durable path and schedule a durable wake ` +
-    `(ncl tasks create --process-after). If nothing was in flight, say so in one line.` +
-    (final
-      ? ` This is the LAST automatic restart (${attempt}/${CEILING_RESPAWN_MAX_ATTEMPTS}) — post the accounting now; afterwards the session stays down until a user message.`
-      : ` (Auto-restart ${attempt}/${CEILING_RESPAWN_MAX_ATTEMPTS}.)`);
-  insertMessage(inDb, {
-    id: `${CEILING_RESPAWN_ID_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    `work in flight, checkpoint to a durable path and call continue_work, or use wait for a real time delay. ` +
+    `If nothing was in flight, say so in one line.`;
+  insertDeferredMessageWithContextIfNew(inDb, {
+    id: `${CEILING_RESPAWN_ID_PREFIX}${recoveryKey}`,
     kind: 'chat',
     timestamp: new Date().toISOString(),
     platformId: session.agent_group_id,
@@ -338,7 +559,7 @@ function writeCeilingRespawn(inDb: Database.Database, session: Session, attempt:
       text,
       sender: 'system',
       senderId: 'system',
-      _system: { kind: 'agent_ceiling_respawn', attempt, heartbeat_age_ms: heartbeatAgeMs },
+      _system: { kind: 'agent_ceiling_respawn', reason, heartbeat_age_ms: heartbeatAgeMs },
     }),
     processAfter: null,
     recurrence: null,
@@ -346,27 +567,28 @@ function writeCeilingRespawn(inDb: Database.Database, session: Session, attempt:
   });
 }
 
-/**
- * The follow-up half of the kill-ceiling branch. `lastOutboundKind` is
- * captured by the caller BEFORE notifyKillCeiling may insert its own
- * user-facing notice row — the signal must describe the agent's last act,
- * not the host's.
- */
+/** The follow-up half of the kill-ceiling branch, driven only by durable work state or a fresh tool start. */
 function applyCeilingFollowUp(
   inDb: Database.Database,
   session: Session,
   containerState: ContainerState | null,
-  lastOutboundKind: string | null,
+  workContinuation: HostWorkContinuation | null,
   heartbeatAgeMs: number,
 ): CeilingFollowUp {
   const followUp = decideCeilingFollowUp({
+    hasContinuation: workContinuation !== null && canAttemptContinuationRecovery(workContinuation),
     currentTool: containerState?.current_tool ?? null,
-    lastOutboundKind,
-    priorAttempts: countCeilingRespawnAttempts(inDb),
+    toolStartedAt: containerState?.tool_started_at ?? null,
+    priorToolAttempts: countToolRecoveryAttemptsSinceRealInbound(inDb),
+    now: Date.now(),
   });
   if (followUp.action === 'wake-accountable') {
-    writeCeilingRespawn(inDb, session, followUp.attempt, heartbeatAgeMs);
-    log.info('Queued ceiling-kill accountability wake', { sessionId: session.id, attempt: followUp.attempt });
+    const recoveryKey =
+      followUp.reason === 'continuation'
+        ? `continuation-${workContinuation!.id}-${workContinuation!.resume_attempts}`
+        : `tool-${encodeURIComponent(containerState?.tool_started_at ?? 'unknown')}`;
+    writeCeilingRespawn(inDb, session, followUp.reason, recoveryKey, heartbeatAgeMs);
+    log.info('Queued ceiling-kill accountability wake', { sessionId: session.id, reason: followUp.reason });
   }
   return followUp;
 }
@@ -376,10 +598,10 @@ export function _applyCeilingFollowUpForTesting(
   inDb: Database.Database,
   session: Session,
   containerState: ContainerState | null,
-  lastOutboundKind: string | null,
+  workContinuation: HostWorkContinuation | null,
   heartbeatAgeMs: number,
 ): CeilingFollowUp {
-  return applyCeilingFollowUp(inDb, session, containerState, lastOutboundKind, heartbeatAgeMs);
+  return applyCeilingFollowUp(inDb, session, containerState, workContinuation, heartbeatAgeMs);
 }
 
 let running = false;
@@ -838,13 +1060,15 @@ async function sweepSession(session: Session): Promise<void> {
       resetStuckProcessingRows(inDb, outDb, session, 'container not running');
     }
 
-    // 3. Admit due scheduled occurrences and crash retries with fresh
+    // 3. Admit due scheduled occurrences and lifecycle wakes with fresh
     // recall/capabilities
     // immediately before they become wakeable. Task rows stay trigger=0 from
-    // creation through this point; paired retries stay trigger=0 throughout
+    // creation through this point; paired lifecycle wakes stay trigger=0 throughout
     // backoff. A warm poller cannot race ahead of either context pair, and a
     // repeated sweep is idempotent.
-    const { admittedTasks, dueCount, wakePriority } = prepareDueWake(inDb, agentGroup.id, session.id);
+    const preparedWake = prepareDueWake(inDb, agentGroup.id, session.id);
+    const { admittedTasks } = preparedWake;
+    let { dueCount, wakePriority } = preparedWake;
     if (admittedTasks > 0) {
       log.debug('Admitted due turns with fresh context', {
         sessionId: session.id,
@@ -852,29 +1076,55 @@ async function sweepSession(session: Session): Promise<void> {
       });
     }
 
-    // 4. Wake a container if work is due and nothing is running.
-    // A stored NEXT: promise also wakes (throttled) — the fresh container's
-    // poll loop resumes it from session_state, so a crash mid-continuation
-    // can't park a promised task in silence until the next human ping.
+    // 4. Wake a container if work is due and nothing is running. Durable
+    // continuation state is also a wake source, but its automatic crash
+    // recovery is both throttled and hard-capped per continuation id.
     let justWoke = false;
-    const pendingNextWake =
-      dueCount === 0 &&
+    const workContinuation = outDb ? readWorkContinuation(outDb) : null;
+    if (
+      !isContainerRunning(session.id) &&
+      workContinuation &&
+      workContinuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS
+    ) {
+      const parked = parkDueRecoveryWakes(inDb, new Date().toISOString());
+      if (parked > 0) {
+        dueCount = countDueMessages(inDb);
+        wakePriority = dueCount > 0 ? getDueWakePriority(inDb) : 'interactive';
+      }
+      if (dueCount === 0) notifyContinuationParked(inDb, outDb!, session, workContinuation);
+    }
+    const recoveryWakeDue = hasDueRecoveryWake(inDb, new Date().toISOString());
+    const continuationWakeEligible =
       outDb !== null &&
       !isContainerRunning(session.id) &&
-      hasPendingNextTask(outDb) &&
-      decidePendingNextWake({ now: Date.now(), spawnedAtMs: getContainerSpawnedAt(session.id) });
-    if ((dueCount > 0 || pendingNextWake) && !isContainerRunning(session.id)) {
+      workContinuation !== null &&
+      canAttemptContinuationRecovery(workContinuation) &&
+      (dueCount === 0 || recoveryWakeDue) &&
+      decideContinuationWake({
+        now: Date.now(),
+        spawnedAtMs: getContainerSpawnedAt(session.id),
+        lastRecoveryAttemptAtMs: readContinuationRecoveryAttemptAt(outDb!, workContinuation),
+      });
+    const resumedContinuation = continuationWakeEligible
+      ? incrementStoppedContinuationAttempt(session, workContinuation!.id)
+      : null;
+    const continuationWake = resumedContinuation !== null;
+    if ((dueCount > 0 || continuationWake) && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', {
         sessionId: session.id,
         count: dueCount,
         priority: wakePriority,
+        continuationId: resumedContinuation?.id,
       });
       // wakeContainer never throws — transient spawn failures (OneCLI down,
       // etc.) return false and leave messages pending for the next tick.
       // Classification is passed into the atomic admission decision so a
       // scheduled wake can never reserve memory as interactive first.
-      await wakeContainer(session, wakePriority);
-      justWoke = true;
+      const woke = await wakeContainer(session, wakePriority);
+      justWoke = woke;
+      if (!woke && resumedContinuation) {
+        restoreStoppedContinuationAttempt(session, resumedContinuation.id, resumedContinuation.resume_attempts);
+      }
     }
 
     const alive = isContainerRunning(session.id);
@@ -1171,9 +1421,7 @@ function enforceRunningContainerSla(
     // state — resetStuckProcessingRows clears the claims, so a read
     // afterward would always be empty.
     const pendingClaims = getProcessingClaims(outDb).length;
-    // Same for the accountability wake: capture the agent's last outbound
-    // kind before notifyKillCeiling can insert the host's own notice row.
-    const lastOutboundKind = getLastOutboundKind(outDb);
+    const workContinuation = readWorkContinuation(outDb);
     killContainer(session.id, 'absolute-ceiling');
     // Posted AFTER kill to honor the outbound.db single-writer invariant
     // (session-db.ts:openOutboundDbWritable). The helper itself gates on
@@ -1188,7 +1436,7 @@ function enforceRunningContainerSla(
     // dead until the next human ping. Best-effort — a failure here must
     // not break the sweep's kill path.
     try {
-      applyCeilingFollowUp(inDb, session, containerState, lastOutboundKind, decision.heartbeatAgeMs);
+      applyCeilingFollowUp(inDb, session, containerState, workContinuation, decision.heartbeatAgeMs);
     } catch (err) {
       log.warn('ceiling-kill follow-up failed', { sessionId: session.id, err });
     }

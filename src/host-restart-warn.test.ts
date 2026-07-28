@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { warnSessionIfWorkInFlight } from './host-restart-warn.js';
 import type { Session } from './types.js';
@@ -60,6 +60,11 @@ function makeDbs(): { inDb: Database.Database; outDb: Database.Database } {
       value      TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE processing_ack (
+      message_id     TEXT PRIMARY KEY,
+      status         TEXT NOT NULL,
+      status_changed TEXT NOT NULL
+    );
   `);
   return { inDb, outDb };
 }
@@ -85,23 +90,14 @@ function noteRows(inDb: Database.Database) {
 }
 
 describe('warnSessionIfWorkInFlight', () => {
-  it('writes an on_wake trigger=1 note when the last outbound was internal narration', () => {
+  it('does not treat internal narration as proof that work remains', () => {
     const { inDb, outDb } = makeDbs();
     outDb
       .prepare("INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('o1', 1, ?, 'status', '{}')")
       .run(new Date().toISOString());
 
-    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'graceful host shutdown')).toBe(true);
-
-    const rows = noteRows(inDb);
-    expect(rows).toHaveLength(1);
-    expect(rows[0].on_wake).toBe(1);
-    expect(rows[0].trigger).toBe(1);
-    expect(rows[0].status).toBe('pending');
-    const content = JSON.parse(rows[0].content as string);
-    expect(content.sender).toBe('system');
-    expect(content._system.kind).toBe('agent_host_restart');
-    expect(content.text).toContain('stopped your container mid-work');
+    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'graceful host shutdown')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
   });
 
   it('fires when a tool is in flight even if the last outbound was a chat message', () => {
@@ -110,24 +106,43 @@ describe('warnSessionIfWorkInFlight', () => {
       .prepare("INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('o1', 1, ?, 'chat', '{}')")
       .run(new Date().toISOString());
     outDb
-      .prepare("INSERT INTO container_state (id, current_tool, updated_at) VALUES (1, 'Bash', ?)")
-      .run(new Date().toISOString());
+      .prepare("INSERT INTO container_state (id, current_tool, tool_started_at, updated_at) VALUES (1, 'Bash', ?, ?)")
+      .run(new Date().toISOString(), new Date().toISOString());
 
     expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'host startup after an unclean stop')).toBe(true);
     expect(noteRows(inDb)).toHaveLength(1);
   });
 
-  it('fires when a NEXT: promise is stored', () => {
+  it('fires when an explicit continuation is stored', () => {
     const { inDb, outDb } = makeDbs();
     outDb
       .prepare("INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('o1', 1, ?, 'chat', '{}')")
       .run(new Date().toISOString());
-    outDb
-      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
-      .run('pending_next', JSON.stringify({ task: 'write the dbt tests', chain: 2 }), new Date().toISOString());
+    outDb.prepare('INSERT INTO session_state VALUES (?, ?, ?)').run(
+      'work_continuation',
+      JSON.stringify({
+        id: 'cont-1',
+        task: 'write the dbt tests',
+        phase: 'queued',
+        chain: 2,
+        resume_attempts: 0,
+      }),
+      new Date().toISOString(),
+    );
 
     expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'graceful host shutdown')).toBe(true);
     expect(noteRows(inDb)).toHaveLength(1);
+    const pair = inDb.prepare('SELECT id, trigger, on_wake, content FROM messages_in ORDER BY seq').all() as Array<{
+      id: string;
+      trigger: number;
+      on_wake: number;
+      content: string;
+    }>;
+    expect(pair).toHaveLength(2);
+    expect(pair[0].id).toBe(`recall-${pair[1].id}`);
+    expect(pair.map((row) => row.trigger)).toEqual([0, 0]);
+    expect(pair.map((row) => row.on_wake)).toEqual([1, 1]);
+    expect(JSON.parse(pair[0].content)).toEqual({ subtype: 'recall_context', deferred: true });
   });
 
   it('stays quiet for an idle session whose last act was a user-facing message', () => {
@@ -142,12 +157,47 @@ describe('warnSessionIfWorkInFlight', () => {
 
   it('is idempotent within the restart window', () => {
     const { inDb, outDb } = makeDbs();
-    outDb
-      .prepare("INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('o1', 1, ?, 'status', '{}')")
-      .run(new Date().toISOString());
+    outDb.prepare('INSERT INTO processing_ack VALUES (?, ?, ?)').run('m-1', 'processing', new Date().toISOString());
 
     expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'first')).toBe(true);
     expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'second')).toBe(false);
     expect(noteRows(inDb)).toHaveLength(1);
+  });
+
+  it('ignores stale tool state and stale processing claims', () => {
+    const { inDb, outDb } = makeDbs();
+    const stale = new Date(Date.now() - 31 * 60_000).toISOString();
+    outDb
+      .prepare("INSERT INTO container_state (id, current_tool, tool_started_at, updated_at) VALUES (1, 'Bash', ?, ?)")
+      .run(stale, stale);
+    outDb.prepare('INSERT INTO processing_ack VALUES (?, ?, ?)').run('m-1', 'processing', stale);
+
+    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'startup')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
+  });
+
+  it('allows a distinct restart episode after the ten-minute replay window', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-07-28T12:00:00.000Z'));
+      const { inDb, outDb } = makeDbs();
+      outDb
+        .prepare("INSERT INTO container_state (id, current_tool, tool_started_at, updated_at) VALUES (1, 'Bash', ?, ?)")
+        .run(new Date().toISOString(), new Date().toISOString());
+      expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'first restart')).toBe(true);
+
+      vi.setSystemTime(new Date('2026-07-28T12:11:00.000Z'));
+      expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'second restart')).toBe(true);
+      expect(noteRows(inDb)).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('tolerates a legacy outbound DB without processing_ack', () => {
+    const { inDb, outDb } = makeDbs();
+    outDb.exec('DROP TABLE processing_ack');
+    expect(warnSessionIfWorkInFlight(inDb, outDb, fakeSession(), 'startup')).toBe(false);
+    expect(noteRows(inDb)).toHaveLength(0);
   });
 });

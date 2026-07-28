@@ -17,6 +17,7 @@ import {
   expireStalePending,
   getDueWakePriority,
   getInboundSourceSessionId,
+  insertDeferredMessageWithContextIfNew,
   migrateMessagesInTable,
   openOutboundDb,
   recoverHotJournal,
@@ -32,6 +33,44 @@ const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 afterEach(() => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+});
+
+describe('insertDeferredMessageWithContextIfNew', () => {
+  it('atomically stores an inert recall marker and trigger and ignores a replay', () => {
+    const db = new Database(':memory:');
+    db.exec(INBOUND_SCHEMA);
+    const message = {
+      id: 'schedule-wake-1',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: 'C-1',
+      channelType: 'slack',
+      threadId: 'T-1',
+      content: JSON.stringify({ text: '[system] check CI' }),
+      processAfter: new Date(Date.now() + 60_000).toISOString(),
+      recurrence: null,
+      onWake: 1 as const,
+    };
+
+    expect(insertDeferredMessageWithContextIfNew(db, message)).toBe(true);
+    expect(insertDeferredMessageWithContextIfNew(db, message)).toBe(false);
+    const rows = db
+      .prepare('SELECT id, kind, trigger, on_wake, process_after, content FROM messages_in ORDER BY seq')
+      .all() as Array<{
+      id: string;
+      kind: string;
+      trigger: number;
+      on_wake: number;
+      process_after: string;
+      content: string;
+    }>;
+    expect(rows.map((row) => row.id)).toEqual(['recall-schedule-wake-1', 'schedule-wake-1']);
+    expect(rows.map((row) => row.trigger)).toEqual([0, 0]);
+    expect(rows.map((row) => row.on_wake)).toEqual([1, 1]);
+    expect(rows[0].process_after).toBe(message.processAfter);
+    expect(JSON.parse(rows[0].content)).toEqual({ subtype: 'recall_context', deferred: true });
+    db.close();
+  });
 });
 
 describe('getDueWakePriority', () => {
@@ -534,17 +573,18 @@ describe('expireStalePending', () => {
     try {
       const oldTs = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(); // >24h old
       const overdue = new Date(Date.now() - 60 * 1000).toISOString(); // already due (in the past)
+      const staleOneShotFire = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
       const seq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m + 2;
       db.prepare(
         `INSERT INTO messages_in (id, seq, kind, timestamp, status, content, process_after, recurrence, series_id, trigger)
          VALUES ('cron-due', @seq, 'task', @ts, 'pending', '{}', @pa, '0 9 * * *', 'cron-due', 1)`,
       ).run({ seq, ts: oldTs, pa: overdue });
-      // A non-recurring row in the SAME overdue+stale state, to confirm the
+      // A non-recurring row whose own fire time is stale, to confirm the
       // protection is scoped to recurring rows (the one-shot still expires).
       db.prepare(
         `INSERT INTO messages_in (id, seq, kind, timestamp, status, content, process_after, series_id, trigger)
          VALUES ('oneshot-due', @seq, 'task', @ts, 'pending', '{}', @pa, 'oneshot-due', 1)`,
-      ).run({ seq: seq + 2, ts: oldTs, pa: overdue });
+      ).run({ seq: seq + 2, ts: oldTs, pa: staleOneShotFire });
 
       const changed = expireStalePending(db, 24 * 60 * 60 * 1000);
 
@@ -576,6 +616,26 @@ describe('expireStalePending', () => {
         status: string;
       };
       expect(row.status).toBe('expired');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('keeps a seven-day one-shot wake through its first due day', () => {
+    const db = makeInboundDb();
+    try {
+      const inserted = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const justDue = new Date(Date.now() - 60 * 1000).toISOString();
+      insertRow(db, {
+        id: 'scheduled-wake-7d',
+        timestamp: inserted,
+        processAfter: justDue,
+      });
+
+      expect(expireStalePending(db, 24 * 60 * 60 * 1000)).toBe(0);
+      expect(db.prepare("SELECT status FROM messages_in WHERE id = 'scheduled-wake-7d'").get()).toEqual({
+        status: 'pending',
+      });
     } finally {
       db.close();
     }

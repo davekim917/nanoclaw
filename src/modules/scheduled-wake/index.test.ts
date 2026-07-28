@@ -56,10 +56,16 @@ function fakeSession(): Session {
 }
 
 function rows(db: Database.Database) {
-  return db.prepare('SELECT * FROM messages_in').all() as Array<Record<string, unknown>>;
+  return db.prepare("SELECT * FROM messages_in WHERE kind != 'system'").all() as Array<Record<string, unknown>>;
+}
+
+function allRows(db: Database.Database) {
+  return db.prepare('SELECT * FROM messages_in ORDER BY seq').all() as Array<Record<string, unknown>>;
 }
 
 describe('schedule_wake delivery action', () => {
+  const wakeId = '123e4567-e89b-42d3-a456-426614174000';
+
   it('registers the action', () => {
     expect(getDeliveryAction('schedule_wake')).toBeDefined();
   });
@@ -68,7 +74,12 @@ describe('schedule_wake delivery action', () => {
     const db = makeInDb();
     const fireAt = new Date(Date.now() + 15 * 60_000).toISOString();
     await applyScheduleWake(
-      { action: 'schedule_wake', process_after: fireAt, prompt: 'Check CI for PR #207 and report status' },
+      {
+        action: 'schedule_wake',
+        wake_id: wakeId,
+        process_after: fireAt,
+        prompt: 'Check CI for PR #207 and report status',
+      },
       fakeSession(),
       db,
     );
@@ -77,41 +88,138 @@ describe('schedule_wake delivery action', () => {
     expect(r).toHaveLength(1);
     expect(r[0].kind).toBe('chat');
     expect(r[0].status).toBe('pending');
-    expect(r[0].trigger).toBe(1);
+    expect(r[0].trigger).toBe(0);
     expect(r[0].process_after).toBe(fireAt);
     expect(r[0].platform_id).toBe('C-1');
     expect(r[0].channel_type).toBe('slack');
     expect(r[0].thread_id).toBe('T-1');
+    expect(r[0].id).toBe(`schedule-wake-${wakeId}`);
     const content = JSON.parse(r[0].content as string);
     expect(content.senderId).toBe('system');
     expect(content._system.kind).toBe('agent_scheduled_wake');
     expect(content.text).toBe('[system] Check CI for PR #207 and report status');
+    const pair = allRows(db);
+    expect(pair.map((row) => row.id)).toEqual([`recall-schedule-wake-${wakeId}`, `schedule-wake-${wakeId}`]);
+    expect(pair.map((row) => row.trigger)).toEqual([0, 0]);
+    expect(JSON.parse(pair[0].content as string)).toMatchObject({ subtype: 'recall_context', deferred: true });
+  });
+
+  it('uses the initiating inbound route instead of a stale session default', async () => {
+    const db = makeInDb();
+    db.prepare(
+      `INSERT INTO messages_in
+         (id, seq, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+       VALUES ('initiating-turn', 2, 'chat', ?, 'completed', 1, 'C-2', 'slack', 'T-2', '{}')`,
+    ).run(new Date().toISOString());
+    const fireAt = new Date(Date.now() + 60_000).toISOString();
+
+    await applyScheduleWake(
+      {
+        action: 'schedule_wake',
+        wake_id: wakeId,
+        process_after: fireAt,
+        prompt: 'ping',
+        in_reply_to: 'initiating-turn',
+      },
+      fakeSession(),
+      db,
+    );
+
+    expect(
+      db
+        .prepare('SELECT platform_id, channel_type, thread_id FROM messages_in WHERE id = ?')
+        .get(`schedule-wake-${wakeId}`),
+    ).toMatchObject({
+      platform_id: 'C-2',
+      channel_type: 'slack',
+      thread_id: 'T-2',
+    });
   });
 
   it('tolerates a session with no routing row', async () => {
     const db = makeInDb(false);
     const fireAt = new Date(Date.now() + 60_000).toISOString();
-    await applyScheduleWake({ process_after: fireAt, prompt: 'ping' }, fakeSession(), db);
+    await applyScheduleWake(
+      { action: 'schedule_wake', wake_id: wakeId, process_after: fireAt, prompt: 'ping' },
+      fakeSession(),
+      db,
+    );
     const r = rows(db);
     expect(r).toHaveLength(1);
     expect(r[0].platform_id).toBeNull();
   });
 
-  it('rejects invalid payloads without writing', async () => {
+  it('rejects invalid payloads without writing or acknowledging success', async () => {
     const db = makeInDb();
     const future = new Date(Date.now() + 60_000).toISOString();
-    const past = new Date(Date.now() - 60_000).toISOString();
     const tooFar = new Date(Date.now() + 31 * 24 * 60 * 60 * 1000).toISOString();
     for (const payload of [
-      { process_after: future, prompt: '' },
-      { process_after: future, prompt: 'x'.repeat(2001) },
-      { process_after: past, prompt: 'ok' },
-      { process_after: 'not a date', prompt: 'ok' },
-      { process_after: tooFar, prompt: 'ok' },
-      { prompt: 'no time at all' },
+      { action: 'schedule_wake', wake_id: wakeId, process_after: future, prompt: '' },
+      { action: 'schedule_wake', wake_id: wakeId, process_after: future, prompt: 'x'.repeat(2001) },
+      { action: 'schedule_wake', wake_id: 'not-a-uuid', process_after: future, prompt: 'ok' },
+      { action: 'schedule_wake', wake_id: wakeId, process_after: 'not a date', prompt: 'ok' },
+      { action: 'schedule_wake', wake_id: wakeId, process_after: tooFar, prompt: 'ok' },
+      { action: 'schedule_wake', wake_id: wakeId, prompt: 'no time at all' },
+      { action: 'schedule_wake', wake_id: wakeId, process_after: future, prompt: 'ok', in_reply_to: 42 },
+      { action: 'schedule_wake', wake_id: wakeId, process_after: future, prompt: 'ok', extra: true },
     ]) {
-      await applyScheduleWake(payload, fakeSession(), db);
+      await expect(applyScheduleWake(payload, fakeSession(), db)).rejects.toThrow('invalid payload');
     }
     expect(rows(db)).toHaveLength(0);
+  });
+
+  it('rejects a reply anchor outside the caller session', async () => {
+    const db = makeInDb();
+    const future = new Date(Date.now() + 60_000).toISOString();
+    await expect(
+      applyScheduleWake(
+        {
+          action: 'schedule_wake',
+          wake_id: wakeId,
+          process_after: future,
+          prompt: 'ok',
+          in_reply_to: 'not-in-this-session',
+        },
+        fakeSession(),
+        db,
+      ),
+    ).rejects.toThrow('invalid reply anchor');
+    expect(rows(db)).toHaveLength(0);
+  });
+
+  it('delivers an overdue wake immediately instead of dropping it', async () => {
+    const db = makeInDb();
+    const before = Date.now();
+    const past = new Date(before - 60_000).toISOString();
+    await applyScheduleWake(
+      { action: 'schedule_wake', wake_id: wakeId, process_after: past, prompt: 'check now' },
+      fakeSession(),
+      db,
+    );
+    const processAfter = Date.parse(rows(db)[0].process_after as string);
+    expect(processAfter).toBeGreaterThanOrEqual(before);
+    expect(processAfter).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('is idempotent when the same outbound action is replayed', async () => {
+    const db = makeInDb();
+    const fireAt = new Date(Date.now() + 60_000).toISOString();
+    const payload = { action: 'schedule_wake', wake_id: wakeId, process_after: fireAt, prompt: 'ping' };
+    await applyScheduleWake(payload, fakeSession(), db);
+    await applyScheduleWake(payload, fakeSession(), db);
+    expect(rows(db)).toHaveLength(1);
+  });
+
+  it('accepts and idempotently derives an ID for a pre-wake_id payload', async () => {
+    const db = makeInDb();
+    const payload = {
+      action: 'schedule_wake',
+      process_after: new Date(Date.now() + 60_000).toISOString(),
+      prompt: 'legacy ping',
+    };
+    await applyScheduleWake(payload, fakeSession(), db);
+    await applyScheduleWake(payload, fakeSession(), db);
+    expect(rows(db)).toHaveLength(1);
+    expect(rows(db)[0].id).toMatch(/^schedule-wake-legacy-[0-9a-f]{32}$/);
   });
 });

@@ -24,6 +24,7 @@ import {
   encodeKey,
   invalidateScheduledCache,
   moduleOwner,
+  rateLimit,
   _resetScheduledRateLimitForTesting,
 } from './scheduled-shared.js';
 import type { AuthedRequestContext } from '../router.js';
@@ -577,15 +578,11 @@ describe('runNowHandler', () => {
 
   it('test_runnow_rate_limited', async () => {
     insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', process_after: isoIn(-60_000) });
-    let got429 = false;
-    for (let i = 0; i < 200; i++) {
-      const res = (await runNowHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
-      if (res.status === 429) {
-        got429 = true;
-        break;
-      }
-    }
-    expect(got429).toBe(true);
+    for (let i = 0; i < 30; i++) expect(rateLimit('owner', 'run_now').ok).toBe(true);
+
+    const res = (await runNowHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+
+    expect(res.status).toBe(429);
   });
 });
 

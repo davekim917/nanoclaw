@@ -8,11 +8,16 @@
  * isolated task session whose output posts to a destination.
  */
 import { writeMessageOut } from '../db/messages-out.js';
+import { getCurrentInReplyTo } from '../db/session-state.js';
+import { randomUUID } from 'node:crypto';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 const MAX_MINUTES = 7 * 24 * 60; // 7 days
 const MAX_PROMPT_CHARS = 2000;
+const MIN_DELAY_MS = 1000;
+const ALLOWED_KEYS = new Set(['minutes', 'at', 'prompt']);
+const ISO_WITH_ZONE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
@@ -28,10 +33,11 @@ export const wait: McpToolDefinition = {
     description:
       'Schedule a wake in THIS thread after a delay — for time-based waits like "check CI in 15 minutes". ' +
       'The prompt comes back to you as a message in this session when it fires, with full conversation context. ' +
-      'Not for next-step continuations (end the turn with a NEXT: directive instead) and not for standalone ' +
+      'Not for immediate next-step continuations (use continue_work instead) and not for standalone ' +
       'scheduled jobs that post to a destination (use ncl tasks create for those).',
     inputSchema: {
       type: 'object' as const,
+      additionalProperties: false,
       properties: {
         minutes: {
           type: 'number',
@@ -39,7 +45,8 @@ export const wait: McpToolDefinition = {
         },
         at: {
           type: 'string',
-          description: 'Absolute fire time as ISO 8601 (e.g. "2026-07-28T15:00:00Z"). Exactly one of minutes/at is required.',
+          description:
+            'Absolute fire time as ISO 8601 (e.g. "2026-07-28T15:00:00Z"). Exactly one of minutes/at is required.',
         },
         prompt: {
           type: 'string',
@@ -51,6 +58,9 @@ export const wait: McpToolDefinition = {
     },
   },
   async handler(args) {
+    const unknownKeys = Object.keys(args).filter((key) => !ALLOWED_KEYS.has(key));
+    if (unknownKeys.length > 0) return err(`unknown field(s): ${unknownKeys.join(', ')}`);
+
     const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
     const minutes = typeof args.minutes === 'number' ? args.minutes : undefined;
     const at = typeof args.at === 'string' ? args.at : undefined;
@@ -67,21 +77,35 @@ export const wait: McpToolDefinition = {
       if (!Number.isFinite(minutes) || minutes <= 0 || minutes > MAX_MINUTES) {
         return err(`minutes must be in (0, ${MAX_MINUTES}]`);
       }
-      fireAtMs = Date.now() + Math.round(minutes * 60_000);
+      const delayMs = Math.round(minutes * 60_000);
+      if (delayMs < MIN_DELAY_MS) return err('minutes must schedule at least 1 second in the future');
+      fireAtMs = Date.now() + delayMs;
     } else {
       fireAtMs = Date.parse(at as string);
       if (!Number.isFinite(fireAtMs)) return err(`at is not a valid timestamp: ${at}`);
-      if (fireAtMs <= Date.now()) return err('at must be in the future');
+      if (!ISO_WITH_ZONE_RE.test(at as string)) return err('at must be an ISO 8601 timestamp with a timezone');
+      if (fireAtMs - Date.now() < MIN_DELAY_MS) return err('at must be at least 1 second in the future');
       if (fireAtMs - Date.now() > MAX_MINUTES * 60_000) return err(`at must be within ${MAX_MINUTES} minutes (7 days)`);
     }
 
     const fireAtIso = new Date(fireAtMs).toISOString();
+    const wakeId = randomUUID();
+    const inReplyTo = getCurrentInReplyTo();
     writeMessageOut({
-      id: `wait-sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      id: `wait-sys-${wakeId}`,
+      in_reply_to: inReplyTo,
       kind: 'system',
-      content: JSON.stringify({ action: 'schedule_wake', process_after: fireAtIso, prompt }),
+      content: JSON.stringify({
+        action: 'schedule_wake',
+        wake_id: wakeId,
+        process_after: fireAtIso,
+        prompt,
+        in_reply_to: inReplyTo,
+      }),
     });
-    return ok(`Wake scheduled for ${fireAtIso}. It fires in THIS thread — the prompt comes back to you as a message then.`);
+    return ok(
+      `Wake scheduled for ${fireAtIso}. It fires in THIS thread — the prompt comes back to you as a message then.`,
+    );
   },
 };
 

@@ -3,7 +3,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { getContinuation, setContinuation, getPendingNext, setPendingNext } from './db/session-state.js';
+import {
+  cancelWorkContinuation,
+  getContinuation,
+  getWorkContinuation,
+  queueWorkContinuation,
+  setContinuation,
+} from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { ProviderExchange } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
@@ -398,10 +404,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-describe('NEXT: promised-task resume', () => {
-  it('runs a stored NEXT: task when the loop would otherwise go idle, then clears it on a clean finish', async () => {
-    setPendingNext('write the dbt consolidation plan', 1);
-    // No inbound messages at all — the stored promise alone must drive a turn.
+describe('durable work continuation', () => {
+  it('runs stored work when the loop would otherwise go idle, then clears it on a clean finish', async () => {
+    queueWorkContinuation('write the dbt consolidation plan');
+    // No inbound messages at all — durable work alone must drive a turn.
 
     const prompts: string[] = [];
     const provider = new MockProvider({}, (prompt) => {
@@ -412,14 +418,54 @@ describe('NEXT: promised-task resume', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
 
-    await waitFor(() => prompts.some((p) => p.includes('NEXT: write the dbt consolidation plan')), 4000);
+    await waitFor(() => prompts.some((p) => p.includes('write the dbt consolidation plan')), 4000);
     await waitFor(() => getUndeliveredMessages().length > 0, 4000);
     controller.abort();
 
     expect(JSON.parse(getUndeliveredMessages()[0].content).text).toBe('plan written');
-    // Clean result with no new directive → promise cleared, loop goes idle.
-    expect(getPendingNext()).toBeUndefined();
+    expect(getWorkContinuation()).toBeUndefined();
 
+    await loopPromise.catch(() => {});
+  });
+
+  it('answers already-arrived user input before resuming queued work', async () => {
+    queueWorkContinuation('finish the migration');
+    insertMessage('m-status', { sender: 'Alice', senderId: 'alice', text: 'what is the status?' });
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      return prompt.includes('what is the status?')
+        ? '<message to="discord-test">status answered</message>'
+        : '<message to="discord-test">migration finished</message>';
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => prompts.length >= 2, 4000);
+    controller.abort();
+    expect(prompts[0]).toContain('what is the status?');
+    expect(prompts[1]).toContain('finish the migration');
+    expect(getWorkContinuation()).toBeUndefined();
+    await loopPromise.catch(() => {});
+  });
+
+  it('an explicit stop cancels queued work before it launches', async () => {
+    queueWorkContinuation('work that should stop');
+    insertMessage('m-stop', { sender: 'Alice', senderId: 'alice', text: 'stop that work' });
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      if (prompt.includes('stop that work')) cancelWorkContinuation();
+      return '<message to="discord-test">stopped</message>';
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 4000);
+    await sleep(200);
+    controller.abort();
+    expect(prompts).toHaveLength(1);
+    expect(getWorkContinuation()).toBeUndefined();
     await loopPromise.catch(() => {});
   });
 });

@@ -6,8 +6,16 @@ import {
   clearContinuation,
   getContinuation,
   getMemoryContextEpoch,
+  getWorkContinuation,
+  isWorkContinuationRunnable,
+  markWorkContinuationRunning,
   getStickyFast,
   migrateLegacyContinuation,
+  queueWorkContinuation,
+  requeueWorkContinuationIfMatches,
+  resetWorkContinuationForRealInbound,
+  clearWorkContinuationIfMatches,
+  cancelWorkContinuation,
   setContinuation,
   setStickyFast,
 } from './session-state.js';
@@ -131,4 +139,84 @@ describe('session-state — sticky fast mode', () => {
     expect(getStickyFast()).toBe(false);
   });
 
+});
+
+describe('session-state — durable work continuation', () => {
+  test('queues, marks running, and compare-clears only the matching id', () => {
+    const first = queueWorkContinuation('write the migration tests');
+    expect(first.accepted).toBe(true);
+    if (!first.accepted) throw new Error('expected accepted continuation');
+
+    const running = markWorkContinuationRunning(first.continuation.id, 'runner-a');
+    expect(running?.phase).toBe('running');
+    expect(running?.runner_id).toBe('runner-a');
+    expect(clearWorkContinuationIfMatches('stale-id')).toBe(false);
+    expect(getWorkContinuation()?.id).toBe(first.continuation.id);
+    expect(clearWorkContinuationIfMatches(first.continuation.id)).toBe(true);
+    expect(getWorkContinuation()).toBeUndefined();
+  });
+
+  test('replacement survives stale completion and increments the chain', () => {
+    const first = queueWorkContinuation('step one');
+    if (!first.accepted) throw new Error('expected accepted continuation');
+    markWorkContinuationRunning(first.continuation.id, 'runner-a');
+    const replacement = queueWorkContinuation('step two');
+    if (!replacement.accepted) throw new Error('expected replacement');
+
+    expect(replacement.continuation.chain).toBe(2);
+    expect(clearWorkContinuationIfMatches(first.continuation.id)).toBe(false);
+    expect(getWorkContinuation()?.task).toBe('step two');
+  });
+
+  test('real inbound resets counters without deleting work', () => {
+    const queued = queueWorkContinuation('keep going');
+    if (!queued.accepted) throw new Error('expected continuation');
+    const db = getOutboundDb();
+    const row = getWorkContinuation();
+    if (!row) throw new Error('expected stored row');
+    db.prepare("UPDATE session_state SET value = ? WHERE key = 'work_continuation'").run(
+      JSON.stringify({ ...row, chain: 17, resume_attempts: 2 }),
+    );
+
+    resetWorkContinuationForRealInbound();
+    expect(getWorkContinuation()).toMatchObject({ task: 'keep going', chain: 0, resume_attempts: 0 });
+  });
+
+  test('same runner cannot re-inject running work; a fresh runner can', () => {
+    const queued = queueWorkContinuation('resume safely');
+    if (!queued.accepted) throw new Error('expected continuation');
+    const running = markWorkContinuationRunning(queued.continuation.id, 'runner-a');
+    expect(running).toBeDefined();
+    expect(isWorkContinuationRunnable(running!, 'runner-a')).toBe(false);
+    expect(isWorkContinuationRunnable(running!, 'runner-b')).toBe(true);
+    expect(requeueWorkContinuationIfMatches(queued.continuation.id, 'runner-b')).toBe(false);
+    expect(requeueWorkContinuationIfMatches(queued.continuation.id, 'runner-a')).toBe(true);
+    expect(getWorkContinuation()).toMatchObject({ phase: 'queued' });
+  });
+
+  test('migrates valid pending_next once and deletes malformed legacy state', () => {
+    const db = getOutboundDb();
+    db.prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      'pending_next',
+      JSON.stringify({ task: 'legacy task', chain: 4 }),
+      new Date().toISOString(),
+    );
+    expect(getWorkContinuation()).toMatchObject({ task: 'legacy task', phase: 'queued', chain: 4 });
+    expect(db.prepare("SELECT 1 FROM session_state WHERE key = 'pending_next'").get()).toBeNull();
+
+    cancelWorkContinuation();
+    db.prepare('INSERT INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      'pending_next',
+      'not-json',
+      new Date().toISOString(),
+    );
+    expect(getWorkContinuation()).toBeUndefined();
+    expect(db.prepare("SELECT 1 FROM session_state WHERE key = 'pending_next'").get()).toBeNull();
+  });
+
+  test('cancel is idempotent', () => {
+    queueWorkContinuation('cancel me');
+    expect(cancelWorkContinuation()).toBe(true);
+    expect(cancelWorkContinuation()).toBe(false);
+  });
 });

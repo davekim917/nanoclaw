@@ -10,6 +10,7 @@
  * on file and resumes cleanly if the user flips back.
  */
 import { getOutboundDb } from './connection.js';
+import { randomUUID } from 'node:crypto';
 
 const LEGACY_KEY = 'sdk_session_id';
 const STICKY_MODEL_KEY = 'sticky_model';
@@ -209,37 +210,152 @@ export function getCurrentInReplyTo(): string | null {
   return row.value;
 }
 
-/**
- * A promised next task the agent handed itself via a `NEXT:` directive
- * (see container/CLAUDE.md "Container lifecycle"). Persisted because a
- * continuation chain must survive a container death mid-chain: the poll
- * loop reads it whenever it would otherwise go idle and resumes the task.
- * `chain` counts consecutive continuations so a runaway self-promising
- * agent is capped across restarts, not just per process.
- */
-const PENDING_NEXT_KEY = 'pending_next';
+const WORK_CONTINUATION_KEY = 'work_continuation';
+const LEGACY_PENDING_NEXT_KEY = 'pending_next';
 
-export interface PendingNext {
+export const WORK_CONTINUATION_CHAIN_MAX = 50;
+export const WORK_CONTINUATION_TASK_MAX_CHARS = 500;
+export const WORK_CONTINUATION_RESUME_MAX_ATTEMPTS = 2;
+
+export interface WorkContinuation {
+  id: string;
   task: string;
+  phase: 'queued' | 'running';
   chain: number;
+  runner_id?: string;
+  resume_attempts: number;
 }
 
-export function getPendingNext(): PendingNext | undefined {
-  const raw = getValue(PENDING_NEXT_KEY);
-  if (raw === undefined) return undefined;
+export type QueueWorkContinuationResult =
+  | { accepted: true; continuation: WorkContinuation }
+  | { accepted: false; reason: 'chain-cap'; chain: number };
+
+function parseWorkContinuation(raw: string): WorkContinuation | undefined {
   try {
-    const parsed = JSON.parse(raw) as Partial<PendingNext>;
-    if (typeof parsed.task !== 'string' || parsed.task.trim() === '') return undefined;
-    return { task: parsed.task, chain: typeof parsed.chain === 'number' ? parsed.chain : 0 };
+    const parsed = JSON.parse(raw) as Partial<WorkContinuation>;
+    if (typeof parsed.id !== 'string' || parsed.id.trim() === '') return undefined;
+    if (
+      typeof parsed.task !== 'string' ||
+      parsed.task.trim() === '' ||
+      parsed.task.length > WORK_CONTINUATION_TASK_MAX_CHARS
+    ) {
+      return undefined;
+    }
+    if (parsed.phase !== 'queued' && parsed.phase !== 'running') return undefined;
+    if (!Number.isSafeInteger(parsed.chain) || (parsed.chain ?? -1) < 0) return undefined;
+    if (!Number.isSafeInteger(parsed.resume_attempts) || (parsed.resume_attempts ?? -1) < 0) return undefined;
+    if (parsed.runner_id !== undefined && (typeof parsed.runner_id !== 'string' || parsed.runner_id === '')) {
+      return undefined;
+    }
+    return {
+      id: parsed.id,
+      task: parsed.task.trim(),
+      phase: parsed.phase,
+      chain: parsed.chain as number,
+      ...(parsed.runner_id ? { runner_id: parsed.runner_id } : {}),
+      resume_attempts: parsed.resume_attempts as number,
+    };
   } catch {
     return undefined;
   }
 }
 
-export function setPendingNext(task: string, chain: number): void {
-  setValue(PENDING_NEXT_KEY, JSON.stringify({ task, chain }));
+function migrateLegacyPendingNext(): WorkContinuation | undefined {
+  const raw = getValue(LEGACY_PENDING_NEXT_KEY);
+  if (raw === undefined) return undefined;
+  deleteValue(LEGACY_PENDING_NEXT_KEY);
+  try {
+    const parsed = JSON.parse(raw) as { task?: unknown; chain?: unknown };
+    const task = typeof parsed.task === 'string' ? parsed.task.trim() : '';
+    if (!task || task.length > WORK_CONTINUATION_TASK_MAX_CHARS) return undefined;
+    const chain = Number.isSafeInteger(parsed.chain) && (parsed.chain as number) >= 0 ? (parsed.chain as number) : 0;
+    const migrated: WorkContinuation = {
+      id: `legacy-${randomUUID()}`,
+      task,
+      phase: 'queued',
+      chain,
+      resume_attempts: 0,
+    };
+    setValue(WORK_CONTINUATION_KEY, JSON.stringify(migrated));
+    return migrated;
+  } catch {
+    return undefined;
+  }
 }
 
-export function clearPendingNext(): void {
-  deleteValue(PENDING_NEXT_KEY);
+export function getWorkContinuation(): WorkContinuation | undefined {
+  const raw = getValue(WORK_CONTINUATION_KEY);
+  if (raw !== undefined) {
+    const parsed = parseWorkContinuation(raw);
+    if (parsed) return parsed;
+    deleteValue(WORK_CONTINUATION_KEY);
+  }
+  return migrateLegacyPendingNext();
+}
+
+export function queueWorkContinuation(task: string): QueueWorkContinuationResult {
+  const normalized = task.trim();
+  const current = getWorkContinuation();
+  const chain = (current?.chain ?? 0) + 1;
+  if (chain > WORK_CONTINUATION_CHAIN_MAX) return { accepted: false, reason: 'chain-cap', chain };
+  const continuation: WorkContinuation = {
+    id: randomUUID(),
+    task: normalized,
+    phase: 'queued',
+    chain,
+    resume_attempts: 0,
+  };
+  setValue(WORK_CONTINUATION_KEY, JSON.stringify(continuation));
+  return { accepted: true, continuation };
+}
+
+export function isWorkContinuationRunnable(continuation: WorkContinuation, runnerId: string): boolean {
+  return continuation.phase === 'queued' || continuation.runner_id !== runnerId;
+}
+
+export function markWorkContinuationRunning(id: string, runnerId: string): WorkContinuation | undefined {
+  return getOutboundDb().transaction(() => {
+    const current = getWorkContinuation();
+    if (!current || current.id !== id || !isWorkContinuationRunnable(current, runnerId)) return undefined;
+    const running: WorkContinuation = { ...current, phase: 'running', runner_id: runnerId };
+    setValue(WORK_CONTINUATION_KEY, JSON.stringify(running));
+    return running;
+  })();
+}
+
+export function requeueWorkContinuationIfMatches(id: string, runnerId: string): boolean {
+  return getOutboundDb().transaction(() => {
+    const current = getWorkContinuation();
+    if (!current || current.id !== id || current.phase !== 'running' || current.runner_id !== runnerId) return false;
+    const queued: WorkContinuation = { ...current, phase: 'queued' };
+    delete queued.runner_id;
+    setValue(WORK_CONTINUATION_KEY, JSON.stringify(queued));
+    return true;
+  })();
+}
+
+export function clearWorkContinuationIfMatches(id: string): boolean {
+  return getOutboundDb().transaction(() => {
+    const current = getWorkContinuation();
+    if (!current || current.id !== id) return false;
+    deleteValue(WORK_CONTINUATION_KEY);
+    return true;
+  })();
+}
+
+export function cancelWorkContinuation(): boolean {
+  const existed = getValue(WORK_CONTINUATION_KEY) !== undefined || getValue(LEGACY_PENDING_NEXT_KEY) !== undefined;
+  deleteValue(WORK_CONTINUATION_KEY);
+  deleteValue(LEGACY_PENDING_NEXT_KEY);
+  return existed;
+}
+
+export function resetWorkContinuationForRealInbound(): WorkContinuation | undefined {
+  return getOutboundDb().transaction(() => {
+    const current = getWorkContinuation();
+    if (!current) return undefined;
+    const reset: WorkContinuation = { ...current, chain: 0, resume_attempts: 0 };
+    setValue(WORK_CONTINUATION_KEY, JSON.stringify(reset));
+    return reset;
+  })();
 }

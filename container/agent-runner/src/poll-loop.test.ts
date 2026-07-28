@@ -18,19 +18,22 @@ import {
   dispatchFileAttachment,
   dispatchResultText,
   applyFlagBatch,
-  decideNextContinuation,
-  extractNextDirective,
+  buildWorkContinuationPrompt,
   handleEvent,
   isAdmissibleTrigger,
   isAupRefusal,
   isCorruptionError,
-  NEXT_CHAIN_MAX,
   processQuery,
   retainCompleteRecallPairs,
   selectInTurnFollowUps,
   transientOverloadDelayMs,
 } from './poll-loop.js';
-import { getPendingNext, setPendingNext } from './db/session-state.js';
+import {
+  cancelWorkContinuation,
+  getWorkContinuation,
+  markWorkContinuationRunning,
+  queueWorkContinuation,
+} from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -1602,7 +1605,10 @@ describe('mid-turn fast-mode changes', () => {
     expect(endCalls).toBe(1);
     expect(pushCalls).toBe(0);
     expect(getPendingMessages().map((m) => m.id)).toContain('m-fast');
-  }, 10_000);
+  // The full Bun suite runs CPU-heavy design-review tests concurrently in the
+  // same process. Keep this above their longest event-loop stall; in isolation
+  // the 500 ms active-poll path completes in well under a second.
+  }, 30_000);
 });
 
 describe('error result with no <message> envelope', () => {
@@ -1672,57 +1678,7 @@ describe('transientOverloadDelayMs — server-overload backoff schedule', () => 
   });
 });
 
-describe('extractNextDirective', () => {
-  it('parses a directive inside <internal> tags', () => {
-    expect(extractNextDirective('<message to="x">ack</message>\n<internal>NEXT: write the dbt tests</internal>')).toBe(
-      'write the dbt tests',
-    );
-  });
-
-  it('parses a bare line', () => {
-    expect(extractNextDirective('Done with step 1.\nNEXT: run /team-plan on the dbt consolidation')).toBe(
-      'run /team-plan on the dbt consolidation',
-    );
-  });
-
-  it('last directive wins when a message revises its promise', () => {
-    expect(extractNextDirective('NEXT: first idea\nsome work\nNEXT: better idea')).toBe('better idea');
-  });
-
-  it('returns null when there is no directive', () => {
-    expect(extractNextDirective('<message to="x">all done</message>')).toBeNull();
-  });
-
-  it('does not match mid-line mentions', () => {
-    expect(extractNextDirective('The NEXT: thing is not a directive')).toBeNull();
-  });
-
-  it('truncates absurdly long tasks', () => {
-    const task = extractNextDirective(`NEXT: ${'x'.repeat(900)}`);
-    expect(task).toHaveLength(500);
-  });
-});
-
-describe('decideNextContinuation', () => {
-  it('clears when the result carries no directive', () => {
-    expect(decideNextContinuation('<message to="x">done</message>', 3)).toEqual({ action: 'clear' });
-  });
-
-  it('continues with an incremented chain', () => {
-    expect(decideNextContinuation('<internal>NEXT: keep going</internal>', 0)).toEqual({
-      action: 'continue',
-      task: 'keep going',
-      chain: 1,
-    });
-    expect(decideNextContinuation('NEXT: keep going', 7)).toEqual({ action: 'continue', task: 'keep going', chain: 8 });
-  });
-
-  it('parks at the chain cap instead of continuing', () => {
-    expect(decideNextContinuation('NEXT: forever', NEXT_CHAIN_MAX)).toEqual({ action: 'park', task: 'forever' });
-  });
-});
-
-describe('NEXT: continuation wiring', () => {
+describe('durable continuation wiring', () => {
   beforeEach(() => {
     // Register chan-1 as a destination so <message to="chan-1"> resolves and
     // results are "delivered" rather than routed through the re-wrap nudge.
@@ -1734,65 +1690,147 @@ describe('NEXT: continuation wiring', () => {
       .run();
   });
 
-  it('pushes a continuation into the open stream and persists the task', async () => {
-    const { query, pushes } = makeResultQuery({
-      type: 'result',
-      text: '<message to="chan-1">On it.</message>\n<internal>NEXT: write the dbt tests</internal>',
-    });
+  it('pushes a queued continuation only after a delivered final result', async () => {
+    const queued = queueWorkContinuation('write the dbt tests');
+    expect(queued.accepted).toBe(true);
+    const { query, pushes } = makeResultQuery({ type: 'result', text: '<message to="chan-1">On it.</message>' });
 
-    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {}, 'runner-a');
 
     expect(pushes).toHaveLength(1);
-    expect(pushes[0]).toContain('NEXT: write the dbt tests');
+    expect(pushes[0]).toContain('write the dbt tests');
     expect(pushes[0]).toContain('Continue with it NOW');
-    expect(getPendingNext()).toEqual({ task: 'write the dbt tests', chain: 1 });
+    expect(getWorkContinuation()).toMatchObject({ task: 'write the dbt tests', phase: 'queued' });
   });
 
-  it('a clean result with no directive clears the stored promise', async () => {
-    setPendingNext('write the dbt tests', 1);
-    const { query, pushes } = makeResultQuery({ type: 'result', text: '<message to="chan-1">Tests are green.</message>' });
+  it('future-tense prose and NEXT text have no control effect', async () => {
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: '<message to="chan-1">Working on that next.</message>\n<internal>NEXT: old parser text</internal>',
+    });
 
     await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
 
     expect(pushes).toHaveLength(0);
-    expect(getPendingNext()).toBeUndefined();
+    expect(getWorkContinuation()).toBeUndefined();
   });
 
-  it('a normal result that re-promises supersedes the stored task and restarts the chain from stored', async () => {
-    setPendingNext('stale task', 4);
-    const { query } = makeResultQuery({
-      type: 'result',
-      text: '<message to="chan-1">Changing gears.</message>\n<internal>NEXT: new task</internal>',
-    });
+  it('a replacement made during running work survives the stale result', async () => {
+    const first = queueWorkContinuation('first task');
+    if (!first.accepted) throw new Error('expected continuation');
+    const pushes: string[] = [];
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'result', text: '<message to="chan-1">initial turn done</message>' };
+      queueWorkContinuation('replacement task');
+      yield { type: 'result', text: '<message to="chan-1">old task result</message>' };
+    }
+    const query: AgentQuery = { push: (p) => pushes.push(p), end: () => {}, abort: () => {}, events: events() };
 
-    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {}, 'runner-a');
 
-    expect(getPendingNext()).toEqual({ task: 'new task', chain: 5 });
+    expect(pushes).toHaveLength(2);
+    expect(pushes[0]).toContain('first task');
+    expect(pushes[1]).toContain('replacement task');
+    expect(getWorkContinuation()).toMatchObject({ task: 'replacement task', phase: 'queued' });
   });
 
-  it('does not continue while a wrapping nudge is in flight', async () => {
-    // With no destination at all, unwrapped prose can't be delivered — the
-    // re-wrap nudge fires (mirrors the pre-seeded-destination case). The NEXT:
-    // directive must wait for the nudge's own result, not fire alongside.
+  it('does not launch while a wrapping nudge is in flight', async () => {
+    queueWorkContinuation('must stay queued');
     getInboundDb().prepare('DELETE FROM destinations').run();
-    const { query, pushes } = makeResultQuery({ type: 'result', text: 'bare prose\nNEXT: premature' });
+    const { query, pushes } = makeResultQuery({ type: 'result', text: 'bare prose' });
 
-    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {}, 'runner-a');
 
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
-    expect(getPendingNext()).toBeUndefined();
+    expect(getWorkContinuation()).toMatchObject({ task: 'must stay queued', phase: 'queued' });
   });
 
-  it('parks with a visible note at the chain cap instead of continuing', async () => {
-    setPendingNext('loop forever', NEXT_CHAIN_MAX);
-    const { query, pushes } = makeResultQuery({ type: 'result', text: '<message to="chan-1">again</message>\nNEXT: once more' });
+  it('requeues a continuation when its stream ends without completing it', async () => {
+    const queued = queueWorkContinuation('resume after stream loss');
+    if (!queued.accepted) throw new Error('expected continuation');
+    markWorkContinuationRunning(queued.continuation.id, 'runner-a');
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
 
-    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {});
+    await processQuery(
+      query,
+      ERR_ROUTING,
+      [],
+      'claude',
+      undefined,
+      buildWorkContinuationPrompt(queued.continuation.task),
+      undefined,
+      {},
+      'runner-a',
+      queued.continuation.id,
+    );
+
+    expect(getWorkContinuation()).toMatchObject({ id: queued.continuation.id, phase: 'queued' });
+  });
+
+  it('requeues and suppresses a deterministic error result until real inbound', async () => {
+    const queued = queueWorkContinuation('resume after provider recovery');
+    if (!queued.accepted) throw new Error('expected continuation');
+    markWorkContinuationRunning(queued.continuation.id, 'runner-a');
+    const paused: string[] = [];
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: 'persistent gateway error',
+      isError: true,
+    });
+
+    await processQuery(
+      query,
+      ERR_ROUTING,
+      [],
+      'claude',
+      undefined,
+      buildWorkContinuationPrompt(queued.continuation.task),
+      undefined,
+      {},
+      'runner-a',
+      queued.continuation.id,
+      (id) => paused.push(id),
+    );
 
     expect(pushes).toHaveLength(0);
-    expect(getPendingNext()).toBeUndefined();
-    const out = getUndeliveredMessages();
-    expect(out.some((m) => JSON.parse(m.content).text.includes('pausing autonomous continuation'))).toBe(true);
+    expect(paused).toEqual([queued.continuation.id]);
+    expect(getWorkContinuation()).toMatchObject({ id: queued.continuation.id, phase: 'queued' });
+  });
+
+  it('does not complete or advance work on an empty result', async () => {
+    const queued = queueWorkContinuation('resume after empty result');
+    if (!queued.accepted) throw new Error('expected continuation');
+    markWorkContinuationRunning(queued.continuation.id, 'runner-a');
+    const paused: string[] = [];
+    const { query, pushes } = makeResultQuery({ type: 'result', text: null });
+
+    await processQuery(
+      query,
+      ERR_ROUTING,
+      [],
+      'claude',
+      undefined,
+      buildWorkContinuationPrompt(queued.continuation.task),
+      undefined,
+      {},
+      'runner-a',
+      queued.continuation.id,
+      (id) => paused.push(id),
+    );
+
+    expect(pushes).toHaveLength(0);
+    expect(paused).toEqual([queued.continuation.id]);
+    expect(getWorkContinuation()).toMatchObject({ id: queued.continuation.id, phase: 'queued' });
+  });
+
+  it('explicit cancellation is idempotent', () => {
+    queueWorkContinuation('cancel me');
+    expect(cancelWorkContinuation()).toBe(true);
+    expect(cancelWorkContinuation()).toBe(false);
   });
 });

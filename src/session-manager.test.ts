@@ -54,6 +54,7 @@ import {
 } from './session-manager.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
+import { insertDeferredMessageWithContextIfNew } from './db/session-db.js';
 import { insertRecurrence, insertTaskRow, type RecurringMessage } from './modules/scheduling/db.js';
 import type { Session } from './types.js';
 
@@ -929,6 +930,56 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
           .get('recall-task-first-fire', 'task-first-fire') as { count: number }
       ).count,
     ).toBe(2);
+    db.close();
+  });
+
+  it('replaces a due lifecycle marker with fresh recall before waking it', async () => {
+    initSessionFolder(AG, SESS);
+    const db = new Database(inboundDbPath(AG, SESS));
+    const wakeId = 'host-restart-1';
+    expect(
+      insertDeferredMessageWithContextIfNew(db, {
+        id: wakeId,
+        kind: 'chat',
+        timestamp: new Date().toISOString(),
+        platformId: AG,
+        channelType: 'agent',
+        threadId: null,
+        content: JSON.stringify({
+          text: '[system] account for interrupted work',
+          sender: 'system',
+          senderId: 'system',
+          _system: { kind: 'agent_host_restart' },
+        }),
+        processAfter: null,
+        recurrence: null,
+        onWake: 1,
+      }),
+    ).toBe(true);
+
+    const marker = JSON.parse(
+      (db.prepare('SELECT content FROM messages_in WHERE id = ?').get(`recall-${wakeId}`) as { content: string })
+        .content,
+    );
+    expect(marker).toEqual({ subtype: 'recall_context', deferred: true });
+
+    expect(await admitDueTaskContexts(db, AG, SESS)).toBe(1);
+    const pair = db
+      .prepare('SELECT id, kind, trigger, on_wake, content FROM messages_in WHERE id IN (?, ?) ORDER BY seq')
+      .all(`recall-${wakeId}`, wakeId) as Array<{
+      id: string;
+      kind: string;
+      trigger: number;
+      on_wake: number;
+      content: string;
+    }>;
+    expect(pair.map((row) => row.id)).toEqual([`recall-${wakeId}`, wakeId]);
+    expect(pair.map((row) => row.trigger)).toEqual([0, 1]);
+    expect(pair.map((row) => row.on_wake)).toEqual([1, 1]);
+    expect(JSON.parse(pair[0].content)).toMatchObject({
+      subtype: 'recall_context',
+      trustedCapabilities: { agentGroupId: AG },
+    });
     db.close();
   });
 

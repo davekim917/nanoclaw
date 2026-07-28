@@ -10,53 +10,69 @@
  * explanation, and only comes back when a human pings — the exact
  * "said it was working, then silence" failure family.
  *
- * The note is an on_wake trigger=1 row in the session's inbound.db, so the
- * sweep's due-wake respawns the session shortly after startup and the fresh
+ * The note and an inert recall marker are written atomically with on_wake=1.
+ * The sweep replaces the marker with fresh recall, flips the note to
+ * trigger=1, and respawns the session shortly after startup. The fresh
  * container must post a public accounting (done / lost / next) and resume
- * from durable state (checkpoints, pending_next).
+ * from durable state (checkpoints or an explicit work continuation).
  *
- * Spam guard: only sessions with plausible work in flight are warned — a
- * tool in flight per container_state, last outbound kind='status' (internal
- * narration, not a user-facing message), or a stored NEXT: promise — the
- * same signals as decideCeilingFollowUp plus pending_next. Quiet sessions
- * whose last act was a user-facing message get no note, so a restart
- * doesn't wake every idle container into a public "nothing happened".
+ * Spam guard: only sessions with explicit evidence of work in flight are
+ * warned — a resumable work continuation, a fresh tool start, or a fresh
+ * processing claim. Narration/status output is deliberately not evidence.
+ * Quiet sessions get no note, so a restart does not wake every idle
+ * container into a public "nothing happened".
  */
 import type Database from 'better-sqlite3';
+import { createHash } from 'crypto';
 
 import { getActiveContainerSessionIds } from './container-runner.js';
 import { getActiveSessions, getSession } from './db/sessions.js';
-import { getContainerState, insertMessage } from './db/session-db.js';
-import { decideCeilingFollowUp } from './host-sweep.js';
+import { getContainerState, getProcessingClaims, insertDeferredMessageWithContextIfNew } from './db/session-db.js';
+import {
+  ABSOLUTE_CEILING_MS,
+  decideCeilingFollowUp,
+  parseSqliteUtc,
+  readWorkContinuation,
+  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+} from './host-sweep.js';
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb } from './session-manager.js';
 import type { Session } from './types.js';
 
 const RESTART_NOTE_MARKER = 'agent_host_restart';
-const RESTART_NOTE_IDEMPOTENCY_MS = 10 * 60 * 1000;
+const RESTART_NOTE_DEDUPE_MS = 10 * 60 * 1000;
 
-function lastOutboundKind(outDb: Database.Database): string | null {
-  const row = outDb.prepare('SELECT kind FROM messages_out ORDER BY seq DESC LIMIT 1').get() as
-    | { kind: string }
-    | undefined;
-  return row?.kind ?? null;
+function freshProcessingClaimKey(outDb: Database.Database, now: number): string | null {
+  try {
+    for (const claim of getProcessingClaims(outDb)) {
+      const claimedAt = parseSqliteUtc(claim.status_changed);
+      if (Number.isFinite(claimedAt) && claimedAt <= now && now - claimedAt <= ABSOLUTE_CEILING_MS) {
+        return `${claim.message_id}-${claim.status_changed}`;
+      }
+    }
+  } catch {
+    // Legacy outbound DB without processing_ack.
+  }
+  return null;
 }
 
-function hasPendingNext(outDb: Database.Database): boolean {
-  try {
-    const row = outDb.prepare("SELECT value FROM session_state WHERE key = 'pending_next'").get() as
-      | { value: string }
-      | undefined;
-    return !!row && row.value.includes('"task"');
-  } catch {
-    return false; // no session_state table on an old session DB — treat as absent
-  }
+function hasRecentRestartNote(inDb: Database.Database, now: number): boolean {
+  const cutoff = new Date(now - RESTART_NOTE_DEDUPE_MS).toISOString();
+  return Boolean(
+    inDb
+      .prepare(
+        `SELECT 1 FROM messages_in
+         WHERE id LIKE 'host-restart-%' AND datetime(timestamp) >= datetime(?)
+         LIMIT 1`,
+      )
+      .get(cutoff),
+  );
 }
 
 /**
  * Write the restart accountability note for one session if (and only if)
- * work was plausibly in flight. Idempotent within 10 minutes so the
- * shutdown path and the startup backstop can't double-warn on one restart.
+ * work was plausibly in flight. The recovery-signal-derived ID makes the
+ * graceful shutdown path and startup backstop idempotent for one interruption.
  * Returns true when a note was written.
  */
 export function warnSessionIfWorkInFlight(
@@ -65,24 +81,32 @@ export function warnSessionIfWorkInFlight(
   session: Session,
   reason: string,
 ): boolean {
-  const cutoffIso = new Date(Date.now() - RESTART_NOTE_IDEMPOTENCY_MS).toISOString();
-  const recent = inDb
-    .prepare(`SELECT 1 FROM messages_in WHERE timestamp > ? AND content LIKE ? LIMIT 1`)
-    .get(cutoffIso, `%${RESTART_NOTE_MARKER}%`);
-  if (recent) return false;
-
+  const now = Date.now();
+  if (hasRecentRestartNote(inDb, now)) return false;
   const state = getContainerState(outDb);
+  const continuation = readWorkContinuation(outDb);
+  const processingClaimKey = freshProcessingClaimKey(outDb, now);
+  const resumableContinuation =
+    continuation !== null && continuation.resume_attempts < WORK_CONTINUATION_RESUME_MAX_ATTEMPTS;
   const midWork =
-    hasPendingNext(outDb) ||
+    resumableContinuation ||
+    processingClaimKey !== null ||
     decideCeilingFollowUp({
+      hasContinuation: false,
       currentTool: state?.current_tool ?? null,
-      lastOutboundKind: lastOutboundKind(outDb),
-      priorAttempts: 0,
+      toolStartedAt: state?.tool_started_at ?? null,
+      priorToolAttempts: 0,
+      now,
     }).action === 'wake-accountable';
   if (!midWork) return false;
 
-  insertMessage(inDb, {
-    id: `host-restart-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  const recoveryKey = continuation
+    ? `${continuation.id}-${continuation.resume_attempts}`
+    : (state?.tool_started_at ?? processingClaimKey!);
+  const episodeBucket = Math.floor(now / RESTART_NOTE_DEDUPE_MS);
+  const recoveryHash = createHash('sha256').update(recoveryKey).digest('hex').slice(0, 16);
+  const inserted = insertDeferredMessageWithContextIfNew(inDb, {
+    id: `host-restart-${episodeBucket}-${recoveryHash}`,
     kind: 'chat',
     timestamp: new Date().toISOString(),
     platformId: session.agent_group_id,
@@ -92,7 +116,7 @@ export function warnSessionIfWorkInFlight(
       text:
         `[system] The NanoClaw host restarted (${reason}) and stopped your container mid-work. ` +
         `Any in-flight turn, background task, or /tmp state was lost. Post ONE public accounting — ` +
-        `done / lost / next — then resume from your durable checkpoints or stored NEXT: task.`,
+        `done / lost / next — then resume from durable checkpoints or the stored continue_work task.`,
       sender: 'system',
       senderId: 'system',
       _system: { kind: RESTART_NOTE_MARKER, reason },
@@ -101,8 +125,8 @@ export function warnSessionIfWorkInFlight(
     recurrence: null,
     onWake: 1,
   });
-  log.info('Wrote host-restart accountability note', { sessionId: session.id, reason });
-  return true;
+  if (inserted) log.info('Wrote host-restart accountability note', { sessionId: session.id, reason });
+  return inserted;
 }
 
 function warnSessions(session: Session, reason: string): void {
@@ -133,12 +157,12 @@ export function warnActiveContainersOfShutdown(reason: string): void {
 }
 
 /**
- * Startup backstop (crash path): an unclean previous host left sessions
- * marked container_status='running' whose containers are about to be
- * stopped by the startup quiescence precondition. Warn them first.
+ * Startup backstop (crash and first-rollout paths): inspect every active
+ * session. Durable continuation is authoritative regardless of the stale
+ * central container_status; tool and processing signals are freshness-bound.
  */
 export function warnMarkedRunningSessionsOfStartup(reason: string): void {
-  for (const session of getActiveSessions().filter((s) => s.container_status === 'running')) {
+  for (const session of getActiveSessions()) {
     warnSessions(session, reason);
   }
 }
