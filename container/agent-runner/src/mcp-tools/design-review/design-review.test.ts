@@ -1,17 +1,8 @@
 import { describe, it, expect } from 'bun:test';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
-
-// The loop root is resolved from the environment at module load — pin it to a temp
-// dir BEFORE importing the module under test. CAVEAT: bun test shares one module
-// registry across test files, so this pin only works while no earlier-loading test
-// imports state.ts (directly or via a barrel/wrapper that pins a different root).
-// If such a test is ever added, run it in a subprocess or this file breaks.
-const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'design-review-test-'));
-process.env.DESIGN_ARTIFACT_LOOP_ROOT = ROOT;
+import { DEFAULT_BASE_DIR } from './state.js';
 
 const { designReviewTools, normalizeSeverity, criticReviewedFor, nextDirective } = await import('./design-review.js');
+const ROOT = DEFAULT_BASE_DIR;
 const tool = designReviewTools[0];
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const call = (args: Record<string, unknown>): Promise<any> => tool.handler(args) as Promise<any>;

@@ -44,4 +44,9 @@ jobs:
 
       - name: Container tests
         working-directory: container/agent-runner
-        run: bun test
+        # Agent-runner tests intentionally exercise process-global session DB,
+        # environment, and module-cache state. Bun otherwise runs up to 20 test
+        # files concurrently in one process, so unrelated files can close or
+        # repoint another file's fixture. Keep the suite deterministic; targeted
+        # pure tests can still opt into concurrency independently.
+        run: bun test --max-concurrency 1

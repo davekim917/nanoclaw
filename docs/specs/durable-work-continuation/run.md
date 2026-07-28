@@ -137,9 +137,11 @@ CI corrections:
 
 - The scheduled-mutation rate-limit integration test now deterministically pre-fills the limiter and exercises one rejected handler call instead of racing a five-second timeout through up to 200 expensive calls.
 - Memory curator tests now derive their canonical data root from the checkout under test rather than hard-coding one developer machine path.
+- Container CI runs with one test file at a time because the suite intentionally shares process-global session DB, environment, and module-cache fixtures. The previous Bun default ran up to 20 files concurrently and produced documented cross-file DB races.
+- The design-review validation test now uses the state module's resolved base directory instead of trying to repoint an already-cached module through environment mutation.
 - Final host suite: 873 suites passed; 3,152 tests passed, 1 skipped, 1 todo, 0 failed.
 - Final container suite: 965 passed, 4 skipped, 0 failed. Both TypeScript checks passed.
 
 ## Activation boundary
 
-- No commit, push, container image rebuild, service restart, or production activation was performed. Existing live sessions are unchanged until the operator explicitly publishes and deploys this work.
+- The reviewed commits were pushed to the open PR. No container image rebuild, service restart, or production activation was performed; existing live sessions remain unchanged.
