@@ -368,7 +368,16 @@ export function incrementWorkContinuationResumeAttempt(
     ) {
       return null;
     }
-    const updated = { ...current, resume_attempts: current.resume_attempts + 1 };
+    // The stopped-container host is authorizing one fresh runner to consume
+    // this recovery attempt. Clear the prior runner claim so the container can
+    // distinguish this authorized start from a capped attempt that has already
+    // run and is merely hitchhiking on an unrelated wake.
+    const updated: HostWorkContinuation = {
+      ...current,
+      phase: 'queued',
+      resume_attempts: current.resume_attempts + 1,
+    };
+    delete updated.runner_id;
     outDb
       .prepare("UPDATE session_state SET value = ?, updated_at = ? WHERE key = 'work_continuation'")
       .run(JSON.stringify(updated), new Date().toISOString());

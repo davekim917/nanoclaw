@@ -618,10 +618,16 @@ describe('durable continuation wake', () => {
     const { outDb } = makeSessionDbs();
     outDb
       .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
-      .run('work_continuation', JSON.stringify(continuation), new Date().toISOString());
+      .run(
+        'work_continuation',
+        JSON.stringify({ ...continuation, phase: 'running', runner_id: 'stopped-runner' }),
+        new Date().toISOString(),
+      );
 
     const first = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
     expect(first?.resume_attempts).toBe(1);
+    expect(first).toMatchObject({ phase: 'queued' });
+    expect(first?.runner_id).toBeUndefined();
     expect(readContinuationRecoveryAttemptAt(outDb, first!)).toBeGreaterThan(Date.now() - 1_000);
     const second = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
     expect(second?.resume_attempts).toBe(2);

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 
 import { getOutboundDb, initTestSessionDb } from './connection.js';
 import {
+  WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
   advanceMemoryContextEpoch,
   clearContinuation,
   getContinuation,
@@ -199,6 +200,33 @@ describe('session-state — durable work continuation', () => {
     expect(requeueWorkContinuationIfMatches(queued.continuation.id, 'runner-b')).toBe(false);
     expect(requeueWorkContinuationIfMatches(queued.continuation.id, 'runner-a')).toBe(true);
     expect(getWorkContinuation()).toMatchObject({ phase: 'queued' });
+  });
+
+  test('a capped attempt stays parked across unrelated runner wakes until real inbound', () => {
+    const queued = queueWorkContinuation('resume only after user input');
+    if (!queued.accepted) throw new Error('expected continuation');
+    const db = getOutboundDb();
+    db.prepare("UPDATE session_state SET value = ? WHERE key = 'work_continuation'").run(
+      JSON.stringify({
+        ...queued.continuation,
+        resume_attempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+      }),
+    );
+
+    // No runner_id means the host-authorized final attempt has not started.
+    const finalAttempt = markWorkContinuationRunning(queued.continuation.id, 'runner-a');
+    expect(finalAttempt).toBeDefined();
+    expect(isWorkContinuationRunnable(finalAttempt!, 'runner-b')).toBe(false);
+
+    expect(requeueWorkContinuationIfMatches(queued.continuation.id, 'runner-a')).toBe(true);
+    const parked = getWorkContinuation();
+    expect(parked).toMatchObject({ phase: 'queued', runner_id: 'runner-a' });
+    expect(isWorkContinuationRunnable(parked!, 'runner-b')).toBe(false);
+    expect(markWorkContinuationRunning(queued.continuation.id, 'runner-b')).toBeUndefined();
+
+    const reset = resetWorkContinuationForRealInbound();
+    expect(reset).toMatchObject({ resume_attempts: 0, phase: 'queued', runner_id: 'runner-a' });
+    expect(isWorkContinuationRunnable(reset!, 'runner-b')).toBe(true);
   });
 
   test('migrates valid pending_next once and deletes malformed legacy state', () => {
