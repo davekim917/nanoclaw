@@ -26,7 +26,7 @@ import type Database from 'better-sqlite3';
 import { createHash } from 'crypto';
 
 import { getActiveContainerSessionIds } from './container-runner.js';
-import { getActiveSessions, getSession } from './db/sessions.js';
+import { getRunningSessions, getSession } from './db/sessions.js';
 import { getContainerState, getProcessingClaims, insertDeferredMessageWithContextIfNew } from './db/session-db.js';
 import {
   ABSOLUTE_CEILING_MS,
@@ -157,12 +157,13 @@ export function warnActiveContainersOfShutdown(reason: string): void {
 }
 
 /**
- * Startup backstop (crash and first-rollout paths): inspect every active
- * session. Durable continuation is authoritative regardless of the stale
- * central container_status; tool and processing signals are freshness-bound.
+ * Startup backstop (crash and first-rollout paths): inspect only sessions the
+ * central DB still marks running/idle. Within that interrupted-container set,
+ * durable continuation is authoritative while tool and processing signals
+ * are freshness-bound.
  */
 export function warnMarkedRunningSessionsOfStartup(reason: string): void {
-  for (const session of getActiveSessions()) {
+  for (const session of getRunningSessions()) {
     warnSessions(session, reason);
   }
 }

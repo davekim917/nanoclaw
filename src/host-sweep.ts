@@ -573,8 +573,8 @@ export function countToolRecoveryAttemptsSinceRealInbound(inDb: Database.Databas
     .prepare(
       `SELECT COUNT(*) AS count FROM messages_in
        WHERE id LIKE '${CEILING_RESPAWN_ID_PREFIX}tool-%'
-         AND timestamp > COALESCE((
-           SELECT MAX(timestamp) FROM messages_in
+         AND datetime(timestamp) > COALESCE((
+           SELECT MAX(datetime(timestamp)) FROM messages_in
            WHERE kind != 'system'
              AND COALESCE(
                json_extract(CASE WHEN json_valid(content) THEN content ELSE '{}' END, '$.senderId'),
@@ -584,7 +584,7 @@ export function countToolRecoveryAttemptsSinceRealInbound(inDb: Database.Databas
                json_extract(CASE WHEN json_valid(content) THEN content ELSE '{}' END, '$.sender'),
                ''
              ) != 'system'
-         ), '')`,
+         ), datetime('0001-01-01T00:00:00.000Z'))`,
     )
     .get() as { count: number };
   return row.count;
@@ -1415,11 +1415,11 @@ export function pruneSteerIdempotency(): void {
     const db = getDb();
     // Delete applied rows older than 60 seconds
     db.prepare(
-      `DELETE FROM steer_idempotency WHERE status = 'applied' AND applied_at < datetime('now', '-60 seconds')`,
+      `DELETE FROM steer_idempotency WHERE status = 'applied' AND datetime(applied_at) < datetime('now', '-60 seconds')`,
     ).run();
     // Delete pending rows older than 5 minutes (crash-recovery window expires)
     db.prepare(
-      `DELETE FROM steer_idempotency WHERE status = 'pending' AND reserved_at < datetime('now', '-300 seconds')`,
+      `DELETE FROM steer_idempotency WHERE status = 'pending' AND datetime(reserved_at) < datetime('now', '-300 seconds')`,
     ).run();
   } catch (err) {
     log.warn('pruneSteerIdempotency: failed', { err });
@@ -1599,7 +1599,7 @@ export function notifyKillCeiling(
     // a schema migration. Cheap query against an already-open handle.
     const recent = outDb
       .prepare(
-        "SELECT 1 FROM messages_out WHERE timestamp > datetime('now', '-60 seconds') AND content LIKE '%agent_restart_inactivity%' LIMIT 1",
+        "SELECT 1 FROM messages_out WHERE datetime(timestamp) > datetime('now', '-60 seconds') AND content LIKE '%agent_restart_inactivity%' LIMIT 1",
       )
       .get();
     if (recent) {
@@ -1642,9 +1642,17 @@ export function notifyKillCeiling(
       writableOutDb
         .prepare(
           `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
-           VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), datetime('now'), ?, ?, ?, ?, ?)`,
+           VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), ?, ?, ?, ?, ?, ?)`,
         )
-        .run(id, 'chat', routing.platform_id, routing.channel_type, routing.thread_id, content);
+        .run(
+          id,
+          new Date().toISOString(),
+          'chat',
+          routing.platform_id,
+          routing.channel_type,
+          routing.thread_id,
+          content,
+        );
     } else {
       writeOutboundDirect(session.agent_group_id, session.id, {
         id,

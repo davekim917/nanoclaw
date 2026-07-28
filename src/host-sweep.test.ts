@@ -723,6 +723,20 @@ describe('durable continuation wake', () => {
     expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(1);
   });
 
+  it('orders mixed ISO and SQLite-style timestamps chronologically when resetting tool attempts', () => {
+    const { inDb } = makeSessionDbs();
+    const insert = inDb.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+       VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
+    );
+    insert.run('user-old', 2, '2026-07-28T01:00:00.000Z', JSON.stringify({ sender: 'user' }));
+    insert.run('ceiling-respawn-tool-old', 4, '2026-07-28T01:30:00.000Z', JSON.stringify({ sender: 'system' }));
+    insert.run('user-new', 6, '2026-07-28 02:00:00', JSON.stringify({ sender: 'user' }));
+    insert.run('ceiling-respawn-tool-new', 8, '2026-07-28T02:30:00.000Z', JSON.stringify({ sender: 'system' }));
+
+    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(1);
+  });
+
   it('writes exactly one public parked accounting for repeated sweeps', () => {
     const { inDb, outDb } = makeSessionDbs();
     inDb.prepare('INSERT INTO session_routing VALUES (1, ?, ?, ?)').run('slack', 'C-1', 'T-1');
@@ -1939,8 +1953,9 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), heartbeatAgeMs, 1);
 
     const rows = outDb
-      .prepare('SELECT kind, platform_id, channel_type, thread_id, content FROM messages_out')
+      .prepare('SELECT timestamp, kind, platform_id, channel_type, thread_id, content FROM messages_out')
       .all() as Array<{
+      timestamp: string;
       kind: string;
       platform_id: string | null;
       channel_type: string | null;
@@ -1948,6 +1963,7 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
       content: string;
     }>;
     expect(rows).toHaveLength(1);
+    expect(rows[0].timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
     expect(rows[0].kind).toBe('chat');
     expect(rows[0].channel_type).toBe('slack');
     expect(rows[0].platform_id).toBe('C-TEST');
