@@ -191,16 +191,22 @@ describe('session-state — durable work continuation', () => {
     expect(getWorkContinuation()?.recovery_episode).toBe(2);
   });
 
-  test('same runner cannot re-inject running work; a fresh runner can', () => {
+  test('a paused runner claim blocks fresh runners until real inbound re-arms it', () => {
     const queued = queueWorkContinuation('resume safely');
     if (!queued.accepted) throw new Error('expected continuation');
     const running = markWorkContinuationRunning(queued.continuation.id, 'runner-a');
     expect(running).toBeDefined();
     expect(isWorkContinuationRunnable(running!, 'runner-a')).toBe(false);
-    expect(isWorkContinuationRunnable(running!, 'runner-b')).toBe(true);
+    expect(isWorkContinuationRunnable(running!, 'runner-b')).toBe(false);
     expect(requeueWorkContinuationIfMatches(queued.continuation.id, 'runner-b')).toBe(false);
     expect(requeueWorkContinuationIfMatches(queued.continuation.id, 'runner-a')).toBe(true);
-    expect(getWorkContinuation()).toMatchObject({ phase: 'queued' });
+    const paused = getWorkContinuation();
+    expect(paused).toMatchObject({ phase: 'queued', runner_id: 'runner-a' });
+    expect(isWorkContinuationRunnable(paused!, 'runner-b')).toBe(false);
+    const reset = resetWorkContinuationForRealInbound();
+    expect(reset).toMatchObject({ phase: 'queued', resume_attempts: 0 });
+    expect(reset?.runner_id).toBeUndefined();
+    expect(isWorkContinuationRunnable(reset!, 'runner-b')).toBe(true);
   });
 
   test('a capped attempt stays parked across unrelated runner wakes until real inbound', () => {
@@ -226,7 +232,8 @@ describe('session-state — durable work continuation', () => {
     expect(markWorkContinuationRunning(queued.continuation.id, 'runner-b')).toBeUndefined();
 
     const reset = resetWorkContinuationForRealInbound();
-    expect(reset).toMatchObject({ resume_attempts: 0, phase: 'queued', runner_id: 'runner-a' });
+    expect(reset).toMatchObject({ resume_attempts: 0, phase: 'queued' });
+    expect(reset?.runner_id).toBeUndefined();
     expect(isWorkContinuationRunnable(reset!, 'runner-b')).toBe(true);
   });
 

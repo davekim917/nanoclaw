@@ -626,19 +626,27 @@ describe('durable continuation wake', () => {
         new Date().toISOString(),
       );
 
+    const previous = readWorkContinuation(outDb)!;
     const first = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
     expect(first?.resume_attempts).toBe(1);
     expect(first?.source_message_id).toBe('origin-1');
     expect(first).toMatchObject({ phase: 'queued' });
     expect(first?.runner_id).toBeUndefined();
     expect(readContinuationRecoveryAttemptAt(outDb, first!)).toBeGreaterThan(Date.now() - 1_000);
+    expect(restoreWorkContinuationResumeAttempt(outDb, first!, previous)).toMatchObject({
+      phase: 'running',
+      runner_id: 'stopped-runner',
+      resume_attempts: 0,
+    });
+
+    const retriedFirst = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
     const second = incrementWorkContinuationResumeAttempt(outDb, continuation.id);
     expect(second?.resume_attempts).toBe(2);
     expect(canAttemptContinuationRecovery(second!)).toBe(false);
     expect(incrementWorkContinuationResumeAttempt(outDb, continuation.id)).toBeNull();
 
-    expect(restoreWorkContinuationResumeAttempt(outDb, continuation.id, 2)?.resume_attempts).toBe(1);
-    expect(restoreWorkContinuationResumeAttempt(outDb, continuation.id, 2)).toBeNull();
+    expect(restoreWorkContinuationResumeAttempt(outDb, second!, retriedFirst!)?.resume_attempts).toBe(1);
+    expect(restoreWorkContinuationResumeAttempt(outDb, second!, retriedFirst!)).toBeNull();
     expect(readWorkContinuation(outDb)?.resume_attempts).toBe(1);
   });
 
@@ -652,6 +660,22 @@ describe('durable continuation wake', () => {
     expect(migrated?.resume_attempts).toBe(1);
     expect(outDb.prepare("SELECT 1 FROM session_state WHERE key = 'pending_next'").get()).toBeUndefined();
     expect(readWorkContinuation(outDb)?.id).toBe(migrated?.id);
+  });
+
+  it('restores the legacy promise exactly when its recovery spawn is rejected', () => {
+    const { outDb } = makeSessionDbs();
+    outDb
+      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
+      .run('pending_next', JSON.stringify({ task: 'legacy task', chain: 2 }), new Date().toISOString());
+
+    const previous = readWorkContinuation(outDb)!;
+    const attempted = migrateLegacyWorkContinuationForRecovery(outDb)!;
+    expect(restoreWorkContinuationResumeAttempt(outDb, attempted, previous)).toEqual(previous);
+    expect(outDb.prepare("SELECT 1 FROM session_state WHERE key = 'work_continuation'").get()).toBeUndefined();
+    expect(outDb.prepare("SELECT value FROM session_state WHERE key = 'pending_next'").get()).toEqual({
+      value: JSON.stringify({ task: 'legacy task', chain: 2 }),
+    });
+    expect(readWorkContinuation(outDb)).toEqual(previous);
   });
 
   it('parks only due recovery rows at the cap and leaves real inbound wakeable', () => {

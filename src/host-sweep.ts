@@ -427,13 +427,30 @@ function incrementStoppedContinuationAttempt(session: Session, expectedId: strin
 
 export function restoreWorkContinuationResumeAttempt(
   outDb: Database.Database,
-  expectedId: string,
-  expectedAttempts: number,
+  attempted: HostWorkContinuation,
+  previous: HostWorkContinuation,
 ): HostWorkContinuation | null {
   return outDb.transaction(() => {
     const current = readWorkContinuation(outDb);
-    if (!current || current.id !== expectedId || current.resume_attempts !== expectedAttempts) return null;
-    const restored = { ...current, resume_attempts: Math.max(0, expectedAttempts - 1) };
+    if (
+      !current ||
+      current.id !== attempted.id ||
+      current.resume_attempts !== attempted.resume_attempts ||
+      previous.resume_attempts !== attempted.resume_attempts - 1
+    ) {
+      return null;
+    }
+    if (previous.id === 'legacy-pending-next') {
+      outDb.prepare("DELETE FROM session_state WHERE key = 'work_continuation'").run();
+      outDb
+        .prepare(
+          `INSERT INTO session_state (key, value, updated_at) VALUES ('pending_next', ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+        )
+        .run(JSON.stringify({ task: previous.task, chain: previous.chain }), new Date().toISOString());
+      return previous;
+    }
+    const restored = { ...previous };
     outDb
       .prepare("UPDATE session_state SET value = ?, updated_at = ? WHERE key = 'work_continuation'")
       .run(JSON.stringify(restored), new Date().toISOString());
@@ -441,11 +458,15 @@ export function restoreWorkContinuationResumeAttempt(
   })();
 }
 
-function restoreStoppedContinuationAttempt(session: Session, expectedId: string, expectedAttempts: number): void {
+function restoreStoppedContinuationAttempt(
+  session: Session,
+  attempted: HostWorkContinuation,
+  previous: HostWorkContinuation,
+): void {
   let db: Database.Database | null = null;
   try {
     db = openOutboundDbRw(session.agent_group_id, session.id);
-    restoreWorkContinuationResumeAttempt(db, expectedId, expectedAttempts);
+    restoreWorkContinuationResumeAttempt(db, attempted, previous);
   } catch (err) {
     log.warn('Failed to restore continuation recovery attempt after rejected wake', { sessionId: session.id, err });
   } finally {
@@ -1130,13 +1151,15 @@ async function sweepSession(session: Session): Promise<void> {
       }
       if (dueCount === 0) notifyContinuationParked(inDb, outDb!, session, workContinuation);
     }
-    const recoveryWakeDue = hasDueRecoveryWake(inDb, new Date().toISOString());
+    // Every stopped-session wake must pass through continuation recovery
+    // admission, even when an unrelated scheduled row is already due. The
+    // runner retains its prior owner claim until this path clears it, so a
+    // scheduled wake cannot make saved work bypass the throttle or cap.
     const continuationWakeEligible =
       outDb !== null &&
       !isContainerRunning(session.id) &&
       workContinuation !== null &&
       canAttemptContinuationRecovery(workContinuation) &&
-      (dueCount === 0 || recoveryWakeDue) &&
       decideContinuationWake({
         now: Date.now(),
         spawnedAtMs: getContainerSpawnedAt(session.id),
@@ -1160,7 +1183,7 @@ async function sweepSession(session: Session): Promise<void> {
       const woke = await wakeContainer(session, wakePriority);
       justWoke = woke;
       if (!woke && resumedContinuation) {
-        restoreStoppedContinuationAttempt(session, resumedContinuation.id, resumedContinuation.resume_attempts);
+        restoreStoppedContinuationAttempt(session, resumedContinuation, workContinuation!);
       }
     }
 

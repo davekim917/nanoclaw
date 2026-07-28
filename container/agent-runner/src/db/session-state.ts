@@ -333,16 +333,14 @@ export function queueWorkContinuation(task: string, sourceMessageId?: string | n
   return { accepted: true, continuation };
 }
 
-export function isWorkContinuationRunnable(continuation: WorkContinuation, runnerId: string): boolean {
-  // resume_attempts is incremented by the stopped-container host path before
-  // it authorizes a recovery. A capped queued record with no runner_id is that
-  // final authorized attempt waiting to start. Once a runner has claimed it,
-  // keep it parked across crashes and unrelated wakes until real inbound
-  // resets the recovery budget.
-  if (continuation.resume_attempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS && continuation.runner_id !== undefined) {
-    return false;
-  }
-  return continuation.phase === 'queued' || continuation.runner_id !== runnerId;
+export function isWorkContinuationRunnable(continuation: WorkContinuation, _runnerId: string): boolean {
+  // A queued record with no owner is either fresh work from this runner or an
+  // attempt explicitly authorized by the stopped-container host path. Once a
+  // runner claims it, keep that claim across every pause/crash. A fresh runner
+  // may proceed only after the host counts a recovery attempt (or real inbound
+  // explicitly re-arms the work), so unrelated scheduled wakes cannot make the
+  // continuation hitchhike around the recovery throttle/cap.
+  return continuation.phase === 'queued' && continuation.runner_id === undefined;
 }
 
 export function markWorkContinuationRunning(id: string, runnerId: string): WorkContinuation | undefined {
@@ -360,10 +358,9 @@ export function requeueWorkContinuationIfMatches(id: string, runnerId: string): 
     const current = getWorkContinuation();
     if (!current || current.id !== id || current.phase !== 'running' || current.runner_id !== runnerId) return false;
     const queued: WorkContinuation = { ...current, phase: 'queued' };
-    // Below the cap, dropping runner_id makes the saved task recoverable by a
-    // fresh runner. At the cap, retaining it records that the last authorized
-    // attempt was consumed; only real inbound may re-arm the task.
-    if (queued.resume_attempts < WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) delete queued.runner_id;
+    // Retain runner_id even below the cap. The host owns stopped-container
+    // recovery authorization and clears this claim only after counting an
+    // attempt; real inbound clears it when intentionally re-arming the work.
     setValue(WORK_CONTINUATION_KEY, JSON.stringify(queued));
     return true;
   })();
@@ -391,10 +388,12 @@ export function resetWorkContinuationForRealInbound(): WorkContinuation | undefi
     if (!current) return undefined;
     const reset: WorkContinuation = {
       ...current,
+      phase: 'queued',
       chain: 0,
       resume_attempts: 0,
       recovery_episode: current.recovery_episode === Number.MAX_SAFE_INTEGER ? 0 : current.recovery_episode + 1,
     };
+    delete reset.runner_id;
     setValue(WORK_CONTINUATION_KEY, JSON.stringify(reset));
     return reset;
   })();
