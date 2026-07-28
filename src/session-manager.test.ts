@@ -975,7 +975,10 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     }>;
     expect(pair.map((row) => row.id)).toEqual([`recall-${wakeId}`, wakeId]);
     expect(pair.map((row) => row.trigger)).toEqual([0, 1]);
-    expect(pair.map((row) => row.on_wake)).toEqual([1, 1]);
+    // The inert pair is protected by on_wake=1 until admission. Once the host
+    // makes it wakeable, both halves must be visible even if real inbound
+    // already consumed the fresh container's first poll.
+    expect(pair.map((row) => row.on_wake)).toEqual([0, 0]);
     expect(JSON.parse(pair[0].content)).toMatchObject({
       subtype: 'recall_context',
       trustedCapabilities: { agentGroupId: AG },

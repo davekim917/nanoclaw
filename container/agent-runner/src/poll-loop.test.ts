@@ -224,6 +224,21 @@ describe('accumulate gate (trigger column)', () => {
     insertMessage('m1', 'chat', { sender: 'A', text: 'new user turn' }, { trigger: 1 });
 
     expect(getPendingMessages(true).map((m) => m.id)).toEqual(['m1']);
+    markCompleted(['m1']);
+
+    // Simulate host due-admission after that first poll. Admission replaces
+    // the marker, enables the trigger, and clears on_wake on both halves so
+    // this already-running fresh container can consume the accountability turn.
+    getInboundDb()
+      .prepare('UPDATE messages_in SET content = ?, on_wake = 0 WHERE id = ?')
+      .run(JSON.stringify({ subtype: 'recall_context', trustedCapabilities: {} }), 'recall-host-restart-1');
+    getInboundDb().prepare('UPDATE messages_in SET trigger = 1, on_wake = 0 WHERE id = ?').run('host-restart-1');
+
+    expect(
+      getPendingMessages(false)
+        .map((m) => m.id)
+        .sort(),
+    ).toEqual(['host-restart-1', 'recall-host-restart-1']);
   });
 
   it('selectInTurnFollowUps: pure trigger=0 batch defers (no push)', () => {

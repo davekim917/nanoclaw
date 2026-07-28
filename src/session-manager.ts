@@ -970,6 +970,9 @@ export function deferMessageForFreshContextRetry(db: Database.Database, messageI
  * status, tries, series, recurrence, content, and routing stay on the original
  * row. A repeated sweep sees the paired trigger and is a no-op. Ordinary
  * trigger=0 accumulated chat has no recall marker and is never promoted.
+ * Deferred on-wake rows keep on_wake=1 only until this host-owned barrier;
+ * admission clears it on both halves so a fresh container that was concurrently
+ * started by real inbound can still consume the now-safe pair on a later poll.
  */
 export function admitDueTaskContexts(db: Database.Database, agentGroupId: string, sessionId: string): number {
   // Legacy rows predate inert scheduling and were stored trigger=1. Demote
@@ -1028,7 +1031,7 @@ export function admitDueTaskContexts(db: Database.Database, agentGroupId: string
           processAfter: task.process_after,
           trigger: 1,
           sourceSessionId: task.source_session_id,
-          onWake: task.on_wake,
+          onWake: 0,
         },
         task.content,
         db,
@@ -1089,7 +1092,7 @@ export function admitDueTaskContexts(db: Database.Database, agentGroupId: string
       const changed = db
         .prepare(
           `UPDATE messages_in
-              SET seq = ?, trigger = 1
+              SET seq = ?, trigger = 1, on_wake = 0
             WHERE id = ? AND status = 'pending' AND trigger = 0`,
         )
         .run(recallSeq + 2, task.id).changes;
