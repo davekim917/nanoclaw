@@ -51,7 +51,7 @@ import {
 } from './formatter.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
-import { autoCommitDirtyWorktrees } from './worktree-autosave.js';
+import { autoCommitDirtyWorktrees, type AutoSaveResult } from './worktree-autosave.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
 import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
 
@@ -210,6 +210,17 @@ export interface PollLoopConfig {
    * polling forever and stealing messages from the next test's DB.
    */
   signal?: AbortSignal;
+  /** Optional dependency seam for deterministic turn-end checkpoint tests. */
+  autosaveWorktrees?: (reason: string) => Promise<AutoSaveResult>;
+}
+
+async function checkpointTurnEnd(autosaveWorktrees: (reason: string) => Promise<AutoSaveResult>): Promise<void> {
+  const autosave = await autosaveWorktrees('turn end');
+  if (autosave.committed.length > 0 || autosave.failed.length > 0) {
+    log(
+      `autosave: committed=[${autosave.committed.join(',')}] failed=[${autosave.failed.join(',')}] skipped=${autosave.skipped.length}`,
+    );
+  }
 }
 
 /**
@@ -224,6 +235,7 @@ export interface PollLoopConfig {
  */
 export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   const runnerId = randomUUID();
+  const autosaveWorktrees = config.autosaveWorktrees ?? autoCommitDirtyWorktrees;
   const idleSuppressedContinuationIds = new Set<string>();
   const suppressContinuationUntilRealInbound = (id: string): void => {
     idleSuppressedContinuationIds.add(id);
@@ -284,11 +296,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     if (messages.length === 0) {
       const pending = getWorkContinuation();
-      if (
-        pending &&
-        !idleSuppressedContinuationIds.has(pending.id) &&
-        isWorkContinuationRunnable(pending, runnerId)
-      ) {
+      if (pending && !idleSuppressedContinuationIds.has(pending.id) && isWorkContinuationRunnable(pending, runnerId)) {
         const runningWork = markWorkContinuationRunning(pending.id, runnerId);
         if (runningWork) {
           const routing = extractRouting([]);
@@ -296,22 +304,23 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           const settings = applyFlagBatch([], routing, config.providerName);
           log(`Resuming durable continuation: ${runningWork.task.slice(0, 120)}`);
           config.provider.resetRotationCycle?.();
-          const query = config.provider.query({
-            prompt,
-            continuation,
-            cwd: config.cwd,
-            model: settings.model,
-            effort: settings.effort,
-            ultracode: settings.ultracode,
-            fast: settings.fast,
-            systemContext: config.systemContext,
-          });
           setCurrentInReplyTo(null);
           clearBatchAnchors();
-          const abortDirectQuery = () => query.abort();
-          if (config.signal?.aborted) query.abort();
-          else config.signal?.addEventListener('abort', abortDirectQuery, { once: true });
+          let query: AgentQuery | undefined;
+          const abortDirectQuery = () => query?.abort();
           try {
+            query = config.provider.query({
+              prompt,
+              continuation,
+              cwd: config.cwd,
+              model: settings.model,
+              effort: settings.effort,
+              ultracode: settings.ultracode,
+              fast: settings.fast,
+              systemContext: config.systemContext,
+            });
+            if (config.signal?.aborted) query.abort();
+            else config.signal?.addEventListener('abort', abortDirectQuery, { once: true });
             const result = await processQuery(
               query,
               routing,
@@ -338,6 +347,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             clearCurrentInReplyTo();
             clearBatchAnchors();
           }
+          await checkpointTurnEnd(autosaveWorktrees);
           continue;
         }
       }
@@ -971,12 +981,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // the agent forgot to commit. Mirrors v1's turn-end auto-commit pattern
     // (src/container-runner.ts cleanupThreadWorkspace, pre-fork). Never
     // throws; logs inside autoCommitDirtyWorktrees.
-    const autosave = await autoCommitDirtyWorktrees('turn end');
-    if (autosave.committed.length > 0 || autosave.failed.length > 0) {
-      log(
-        `autosave: committed=[${autosave.committed.join(',')}] failed=[${autosave.failed.join(',')}] skipped=${autosave.skipped.length}`,
-      );
-    }
+    await checkpointTurnEnd(autosaveWorktrees);
 
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).

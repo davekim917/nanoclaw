@@ -141,7 +141,8 @@ CI corrections:
 - The design-review validation test now uses the state module's resolved base directory instead of trying to repoint an already-cached module through environment mutation.
 - Spawn-child tool tests now inject task routing, outbound writing, IDs, and logging through the production tool factory. They no longer read a process-global in-memory DB after an async boundary; the nine cases passed 50 consecutive reruns.
 - Final host suite: 873 suites passed; 3,152 tests passed, 1 skipped, 1 todo, 0 failed.
-- Final container suite: 965 passed, 4 skipped, 0 failed. Both TypeScript checks passed.
+- A direct durable-continuation turn now reaches the same worktree checkpoint as a normal inbound turn before the poll loop advances. Provider query construction is inside the recovery boundary, so a synchronous startup failure requeues the claimed work and still checkpoints instead of silently abandoning both.
+- Final container suite after the direct-continuation correction: 966 passed, 4 skipped, 0 failed. Both TypeScript checks passed.
 
 ## Activation boundary
 
