@@ -44,6 +44,7 @@ import {
   getDueWakePriority,
   getMessageForRetry,
   getProcessingClaims,
+  insertMessage,
   markMessageFailed,
   openInboundDb as openInboundDbByPath,
   readSessionRouting,
@@ -213,6 +214,177 @@ export function decideStuckAction(args: {
   }
 
   return { action: 'ok' };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ceiling-kill accountability wake.
+//
+// The absolute ceiling fires whenever a container goes 30 min without a
+// heartbeat — including right after the agent parked long-running work in an
+// in-container background task and ended its turn (the heartbeat only moves
+// while a turn is active). Respawn is wake-on-inbound, so without a follow-up
+// the session stays dead until a human pings — which reads as "said it was
+// working, then went silent for hours," and the background job's state (plus
+// /tmp) is gone by the time anyone looks.
+//
+// When the kill plausibly interrupted work — a tool was in flight, or the
+// agent's last outbound was internal narration (kind='status') rather than a
+// user-facing message — queue an on_wake accountability row. The sweep's
+// due-wake step respawns the session within a tick, and the fresh container
+// must publicly account for the interruption (done / lost / next) instead of
+// silently sitting dead. Capped per quiet episode: an agent that never posts
+// a user-visible message gets at most CEILING_RESPAWN_MAX_ATTEMPTS automatic
+// restarts, then the session stays down until real inbound. Any real inbound
+// (user, peer relay, task) resets the episode; host-generated rows (recall
+// pairs, gate notices, our own respawns) deliberately do not — otherwise the
+// fresh recall admitted with each wake would reset the counter and the cap
+// would never bite.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const CEILING_RESPAWN_MAX_ATTEMPTS = 2;
+
+// A stored NEXT: promise (session_state.pending_next in outbound.db) wakes a
+// stopped container even with nothing due — the fresh container's poll loop
+// resumes the promised task from the stored row, no host-written message
+// needed. Throttled per session so a crash-looping task can't spin the
+// respawn path every tick.
+export const PENDING_NEXT_WAKE_MIN_INTERVAL_MS = 10 * 60 * 1000;
+
+/** Throttle gate: wake only when the last spawn is old (or never happened). */
+export function decidePendingNextWake(args: { now: number; spawnedAtMs: number }): boolean {
+  if (args.spawnedAtMs === 0) return true;
+  return args.now - args.spawnedAtMs >= PENDING_NEXT_WAKE_MIN_INTERVAL_MS;
+}
+
+function hasPendingNextTask(outDb: Database.Database): boolean {
+  try {
+    const row = outDb.prepare("SELECT value FROM session_state WHERE key = 'pending_next'").get() as
+      | { value: string }
+      | undefined;
+    if (!row) return false;
+    const parsed = JSON.parse(row.value) as { task?: unknown };
+    return typeof parsed.task === 'string' && parsed.task.trim() !== '';
+  } catch {
+    return false;
+  }
+}
+
+/** Test-only re-export with an injected outbound DB handle. */
+export function _hasPendingNextTaskForTesting(outDb: Database.Database): boolean {
+  return hasPendingNextTask(outDb);
+}
+
+export type CeilingFollowUp = { action: 'none' } | { action: 'wake-accountable'; attempt: number };
+
+export function decideCeilingFollowUp(args: {
+  currentTool: string | null;
+  lastOutboundKind: string | null;
+  priorAttempts: number;
+}): CeilingFollowUp {
+  const plausiblyMidWork = args.currentTool != null || args.lastOutboundKind === 'status';
+  if (!plausiblyMidWork) return { action: 'none' };
+  if (args.priorAttempts >= CEILING_RESPAWN_MAX_ATTEMPTS) return { action: 'none' };
+  return { action: 'wake-accountable', attempt: args.priorAttempts + 1 };
+}
+
+const CEILING_RESPAWN_ID_PREFIX = 'ceiling-respawn-';
+
+function getLastOutboundKind(outDb: Database.Database): string | null {
+  const row = outDb.prepare('SELECT kind FROM messages_out ORDER BY seq DESC LIMIT 1').get() as
+    | { kind: string }
+    | undefined;
+  return row?.kind ?? null;
+}
+
+function countCeilingRespawnAttempts(inDb: Database.Database): number {
+  const row = inDb
+    .prepare(
+      `SELECT COUNT(*) AS c FROM messages_in
+       WHERE id LIKE '${CEILING_RESPAWN_ID_PREFIX}%'
+         AND timestamp > COALESCE((
+           SELECT MAX(timestamp) FROM messages_in
+           WHERE id NOT LIKE '${CEILING_RESPAWN_ID_PREFIX}%'
+             AND kind != 'system'
+             AND COALESCE(json_extract(content, '$.senderId'), '') != 'system'
+             AND COALESCE(json_extract(content, '$.sender'), '') != 'system'
+         ), '')`,
+    )
+    .get() as { c: number };
+  return row.c;
+}
+
+function writeCeilingRespawn(
+  inDb: Database.Database,
+  session: Session,
+  attempt: number,
+  heartbeatAgeMs: number,
+): void {
+  const idleMinutes = Math.round(ABSOLUTE_CEILING_MS / 60_000);
+  const silentMinutes = Math.round(heartbeatAgeMs / 60_000);
+  const final = attempt >= CEILING_RESPAWN_MAX_ATTEMPTS;
+  const text =
+    `[system] Your previous container was killed by the ${idleMinutes}-minute idle ceiling ` +
+    `(no active turn for ~${silentMinutes} min). If work was in flight: check your durable checkpoints, ` +
+    `resume what is safely resumable, and post ONE message accounting for state — done / lost / next. ` +
+    `In-container background tasks, sleeps, and /tmp do not survive a restart; before going idle with ` +
+    `work in flight, checkpoint to a durable path and schedule a durable wake ` +
+    `(ncl tasks create --process-after). If nothing was in flight, say so in one line.` +
+    (final
+      ? ` This is the LAST automatic restart (${attempt}/${CEILING_RESPAWN_MAX_ATTEMPTS}) — post the accounting now; afterwards the session stays down until a user message.`
+      : ` (Auto-restart ${attempt}/${CEILING_RESPAWN_MAX_ATTEMPTS}.)`);
+  insertMessage(inDb, {
+    id: `${CEILING_RESPAWN_ID_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: session.agent_group_id,
+    channelType: 'agent',
+    threadId: null,
+    content: JSON.stringify({
+      text,
+      sender: 'system',
+      senderId: 'system',
+      _system: { kind: 'agent_ceiling_respawn', attempt, heartbeat_age_ms: heartbeatAgeMs },
+    }),
+    processAfter: null,
+    recurrence: null,
+    onWake: 1,
+  });
+}
+
+/**
+ * The follow-up half of the kill-ceiling branch. `lastOutboundKind` is
+ * captured by the caller BEFORE notifyKillCeiling may insert its own
+ * user-facing notice row — the signal must describe the agent's last act,
+ * not the host's.
+ */
+function applyCeilingFollowUp(
+  inDb: Database.Database,
+  session: Session,
+  containerState: ContainerState | null,
+  lastOutboundKind: string | null,
+  heartbeatAgeMs: number,
+): CeilingFollowUp {
+  const followUp = decideCeilingFollowUp({
+    currentTool: containerState?.current_tool ?? null,
+    lastOutboundKind,
+    priorAttempts: countCeilingRespawnAttempts(inDb),
+  });
+  if (followUp.action === 'wake-accountable') {
+    writeCeilingRespawn(inDb, session, followUp.attempt, heartbeatAgeMs);
+    log.info('Queued ceiling-kill accountability wake', { sessionId: session.id, attempt: followUp.attempt });
+  }
+  return followUp;
+}
+
+/** Test-only re-export with injected session-DB handles. */
+export function _applyCeilingFollowUpForTesting(
+  inDb: Database.Database,
+  session: Session,
+  containerState: ContainerState | null,
+  lastOutboundKind: string | null,
+  heartbeatAgeMs: number,
+): CeilingFollowUp {
+  return applyCeilingFollowUp(inDb, session, containerState, lastOutboundKind, heartbeatAgeMs);
 }
 
 let running = false;
@@ -686,8 +858,17 @@ async function sweepSession(session: Session): Promise<void> {
     }
 
     // 4. Wake a container if work is due and nothing is running.
+    // A stored NEXT: promise also wakes (throttled) — the fresh container's
+    // poll loop resumes it from session_state, so a crash mid-continuation
+    // can't park a promised task in silence until the next human ping.
     let justWoke = false;
-    if (dueCount > 0 && !isContainerRunning(session.id)) {
+    const pendingNextWake =
+      dueCount === 0 &&
+      outDb !== null &&
+      !isContainerRunning(session.id) &&
+      hasPendingNextTask(outDb) &&
+      decidePendingNextWake({ now: Date.now(), spawnedAtMs: getContainerSpawnedAt(session.id) });
+    if ((dueCount > 0 || pendingNextWake) && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', {
         sessionId: session.id,
         count: dueCount,
@@ -995,6 +1176,9 @@ function enforceRunningContainerSla(
     // state — resetStuckProcessingRows clears the claims, so a read
     // afterward would always be empty.
     const pendingClaims = getProcessingClaims(outDb).length;
+    // Same for the accountability wake: capture the agent's last outbound
+    // kind before notifyKillCeiling can insert the host's own notice row.
+    const lastOutboundKind = getLastOutboundKind(outDb);
     killContainer(session.id, 'absolute-ceiling');
     // Posted AFTER kill to honor the outbound.db single-writer invariant
     // (session-db.ts:openOutboundDbWritable). The helper itself gates on
@@ -1003,6 +1187,16 @@ function enforceRunningContainerSla(
     // 30-min idle ceiling.
     notifyKillCeiling(inDb, outDb, session, decision.heartbeatAgeMs, pendingClaims, undefined, containerState);
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
+    // Accountability wake: if the kill plausibly interrupted parked work,
+    // queue an on_wake row so the session respawns (next sweep tick's
+    // due-wake step) and answers for the interruption instead of staying
+    // dead until the next human ping. Best-effort — a failure here must
+    // not break the sweep's kill path.
+    try {
+      applyCeilingFollowUp(inDb, session, containerState, lastOutboundKind, decision.heartbeatAgeMs);
+    } catch (err) {
+      log.warn('ceiling-kill follow-up failed', { sessionId: session.id, err });
+    }
     return;
   }
 
