@@ -421,6 +421,8 @@ Everything below is handled by the agent-runner, not the provider.
 
 The agent-runner signals "busy" status to the host. The mechanism for this is provider-specific — for Claude, the query AsyncGenerator is still yielding events. For others, the agent-runner can write a heartbeat or status indicator to the session DB that the host checks before killing.
 
+**NEXT: continuation (promised-task follow-through).** When a result's raw text contains a `NEXT: <task>` directive (contracted form: a line inside `<internal>` tags — see container/CLAUDE.md "Container lifecycle"), the runner does not let the turn end into idle: it pushes a continuation prompt into the still-open stream so the agent starts the promised task immediately, and persists `{task, chain}` to `session_state.pending_next`. Whenever the poll loop would otherwise go idle (fresh container, or after an interrupting user turn), it injects the stored task as a synthetic in-memory batch through the normal turn path. Any clean result with no directive clears the promise (finished chain, or newer user input superseding it); a persisted chain counter caps consecutive continuations at `NEXT_CHAIN_MAX` (50) and parks with a visible note. Pure decision logic: `extractNextDirective` / `decideNextContinuation` in `container/agent-runner/src/poll-loop.ts`.
+
 ### Message Formatting
 
 The agent-runner transforms messages_in rows into a prompt string. The provider receives a ready-to-send string — it doesn't know about message kinds or routing.
