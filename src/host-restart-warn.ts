@@ -101,7 +101,7 @@ export function warnSessionIfWorkInFlight(
   if (!midWork) return false;
 
   const recoveryKey = continuation
-    ? `${continuation.id}-${continuation.resume_attempts}`
+    ? `${continuation.id}-${continuation.recovery_episode}-${continuation.resume_attempts}`
     : (state?.tool_started_at ?? processingClaimKey!);
   const episodeBucket = Math.floor(now / RESTART_NOTE_DEDUPE_MS);
   const recoveryHash = createHash('sha256').update(recoveryKey).digest('hex').slice(0, 16);

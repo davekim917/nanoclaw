@@ -495,6 +495,7 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
     phase: 'queued' as const,
     chain: 1,
     resume_attempts: 0,
+    recovery_episode: 0,
   };
 
   it('writes one deterministic deferred on_wake pair for a continuation', () => {
@@ -527,6 +528,16 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
     expect(respawnRows(inDb)).toHaveLength(1);
   });
 
+  it('writes a fresh wake after real inbound starts a new recovery episode', () => {
+    const { inDb } = makeSessionDbs();
+    _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, continuation, HB_AGE);
+    _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, { ...continuation, recovery_episode: 1 }, HB_AGE);
+
+    const rows = respawnRows(inDb);
+    expect(rows).toHaveLength(2);
+    expect(rows[0].id).not.toBe(rows[1].id);
+  });
+
   it('wakes on a fresh in-flight-tool signal', () => {
     const { inDb } = makeSessionDbs();
     const res = _applyCeilingFollowUpForTesting(
@@ -555,6 +566,7 @@ describe('durable continuation wake', () => {
     phase: 'queued' as const,
     chain: 1,
     resume_attempts: 0,
+    recovery_episode: 0,
   };
 
   it('throttles respins after a recent spawn', () => {
@@ -574,10 +586,19 @@ describe('durable continuation wake', () => {
   it('reads valid current and legacy stored work', () => {
     const { outDb } = makeSessionDbs();
     expect(_hasWorkContinuationForTesting(outDb)).toBe(false);
-    outDb
-      .prepare('INSERT INTO session_state VALUES (?, ?, ?)')
-      .run('work_continuation', JSON.stringify(continuation), new Date().toISOString());
+    outDb.prepare('INSERT INTO session_state VALUES (?, ?, ?)').run(
+      'work_continuation',
+      JSON.stringify({
+        id: continuation.id,
+        task: continuation.task,
+        phase: continuation.phase,
+        chain: continuation.chain,
+        resume_attempts: continuation.resume_attempts,
+      }),
+      new Date().toISOString(),
+    );
     expect(_hasWorkContinuationForTesting(outDb)).toBe(true);
+    expect(readWorkContinuation(outDb)?.recovery_episode).toBe(0);
     outDb
       .prepare('UPDATE session_state SET value = ? WHERE key = ?')
       .run(JSON.stringify({ ...continuation, task: '  ' }), 'work_continuation');
@@ -675,15 +696,19 @@ describe('durable continuation wake', () => {
     const capped = { ...continuation, resume_attempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS };
     const write = (message: { id: string; kind: string; content: string }) => {
       outDb
-        .prepare('INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, content) VALUES (?, 2, ?, ?, ?)')
+        .prepare(
+          `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, content)
+           VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), ?, ?, ?)`,
+        )
         .run(message.id, new Date().toISOString(), message.kind, message.content);
     };
 
     expect(notifyContinuationParked(inDb, outDb, fakeSession(), capped, write)).toBe(true);
     expect(notifyContinuationParked(inDb, outDb, fakeSession(), capped, write)).toBe(false);
+    expect(notifyContinuationParked(inDb, outDb, fakeSession(), { ...capped, recovery_episode: 1 }, write)).toBe(true);
     expect(
       outDb.prepare("SELECT COUNT(*) AS count FROM messages_out WHERE id LIKE 'continuation-parked-%'").get(),
-    ).toEqual({ count: 1 });
+    ).toEqual({ count: 2 });
   });
 });
 

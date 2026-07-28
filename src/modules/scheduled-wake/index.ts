@@ -61,8 +61,15 @@ export async function applyScheduleWake(
   }
 
   const anchoredRouting = inReplyTo
-    ? (inDb.prepare('SELECT platform_id, channel_type, thread_id FROM messages_in WHERE id = ?').get(inReplyTo) as
-        | { platform_id: string | null; channel_type: string | null; thread_id: string | null }
+    ? (inDb
+        .prepare('SELECT platform_id, channel_type, thread_id, source_session_id FROM messages_in WHERE id = ?')
+        .get(inReplyTo) as
+        | {
+            platform_id: string | null;
+            channel_type: string | null;
+            thread_id: string | null;
+            source_session_id: string | null;
+          }
         | undefined)
     : undefined;
   if (inReplyTo && !anchoredRouting) {
@@ -84,6 +91,7 @@ export async function applyScheduleWake(
     platformId: routing?.platform_id ?? null,
     channelType: routing?.channel_type ?? null,
     threadId: routing?.thread_id ?? null,
+    sourceSessionId: anchoredRouting?.source_session_id ?? null,
     content: JSON.stringify({
       text: `[system] ${prompt}`,
       sender: 'system',

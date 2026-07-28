@@ -27,9 +27,9 @@ function memoryContextEpochKey(providerName: string): string {
 }
 
 function getValue(key: string): string | undefined {
-  const row = getOutboundDb()
-    .prepare('SELECT value FROM session_state WHERE key = ?')
-    .get(key) as { value: string } | undefined;
+  const row = getOutboundDb().prepare('SELECT value FROM session_state WHERE key = ?').get(key) as
+    | { value: string }
+    | undefined;
   return row?.value;
 }
 
@@ -224,6 +224,7 @@ export interface WorkContinuation {
   chain: number;
   runner_id?: string;
   resume_attempts: number;
+  recovery_episode: number;
 }
 
 export type QueueWorkContinuationResult =
@@ -244,6 +245,12 @@ function parseWorkContinuation(raw: string): WorkContinuation | undefined {
     if (parsed.phase !== 'queued' && parsed.phase !== 'running') return undefined;
     if (!Number.isSafeInteger(parsed.chain) || (parsed.chain ?? -1) < 0) return undefined;
     if (!Number.isSafeInteger(parsed.resume_attempts) || (parsed.resume_attempts ?? -1) < 0) return undefined;
+    if (
+      parsed.recovery_episode !== undefined &&
+      (!Number.isSafeInteger(parsed.recovery_episode) || parsed.recovery_episode < 0)
+    ) {
+      return undefined;
+    }
     if (parsed.runner_id !== undefined && (typeof parsed.runner_id !== 'string' || parsed.runner_id === '')) {
       return undefined;
     }
@@ -254,6 +261,7 @@ function parseWorkContinuation(raw: string): WorkContinuation | undefined {
       chain: parsed.chain as number,
       ...(parsed.runner_id ? { runner_id: parsed.runner_id } : {}),
       resume_attempts: parsed.resume_attempts as number,
+      recovery_episode: parsed.recovery_episode ?? 0,
     };
   } catch {
     return undefined;
@@ -275,6 +283,7 @@ function migrateLegacyPendingNext(): WorkContinuation | undefined {
       phase: 'queued',
       chain,
       resume_attempts: 0,
+      recovery_episode: 0,
     };
     setValue(WORK_CONTINUATION_KEY, JSON.stringify(migrated));
     return migrated;
@@ -304,6 +313,7 @@ export function queueWorkContinuation(task: string): QueueWorkContinuationResult
     phase: 'queued',
     chain,
     resume_attempts: 0,
+    recovery_episode: 0,
   };
   setValue(WORK_CONTINUATION_KEY, JSON.stringify(continuation));
   return { accepted: true, continuation };
@@ -354,7 +364,12 @@ export function resetWorkContinuationForRealInbound(): WorkContinuation | undefi
   return getOutboundDb().transaction(() => {
     const current = getWorkContinuation();
     if (!current) return undefined;
-    const reset: WorkContinuation = { ...current, chain: 0, resume_attempts: 0 };
+    const reset: WorkContinuation = {
+      ...current,
+      chain: 0,
+      resume_attempts: 0,
+      recovery_episode: current.recovery_episode === Number.MAX_SAFE_INTEGER ? 0 : current.recovery_episode + 1,
+    };
     setValue(WORK_CONTINUATION_KEY, JSON.stringify(reset));
     return reset;
   })();

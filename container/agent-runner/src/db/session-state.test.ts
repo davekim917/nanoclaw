@@ -138,7 +138,6 @@ describe('session-state — sticky fast mode', () => {
     setStickyFast(false);
     expect(getStickyFast()).toBe(false);
   });
-
 });
 
 describe('session-state — durable work continuation', () => {
@@ -179,7 +178,15 @@ describe('session-state — durable work continuation', () => {
     );
 
     resetWorkContinuationForRealInbound();
-    expect(getWorkContinuation()).toMatchObject({ task: 'keep going', chain: 0, resume_attempts: 0 });
+    expect(getWorkContinuation()).toMatchObject({
+      task: 'keep going',
+      chain: 0,
+      resume_attempts: 0,
+      recovery_episode: 1,
+    });
+
+    resetWorkContinuationForRealInbound();
+    expect(getWorkContinuation()?.recovery_episode).toBe(2);
   });
 
   test('same runner cannot re-inject running work; a fresh runner can', () => {

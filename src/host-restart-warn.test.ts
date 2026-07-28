@@ -126,6 +126,7 @@ describe('warnSessionIfWorkInFlight', () => {
         phase: 'queued',
         chain: 2,
         resume_attempts: 0,
+        recovery_episode: 0,
       }),
       new Date().toISOString(),
     );

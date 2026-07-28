@@ -108,8 +108,8 @@ describe('schedule_wake delivery action', () => {
     const db = makeInDb();
     db.prepare(
       `INSERT INTO messages_in
-         (id, seq, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
-       VALUES ('initiating-turn', 2, 'chat', ?, 'completed', 1, 'C-2', 'slack', 'T-2', '{}')`,
+         (id, seq, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content, source_session_id)
+       VALUES ('initiating-turn', 2, 'chat', ?, 'completed', 1, 'ag-peer', 'agent', NULL, '{}', 'sess-origin')`,
     ).run(new Date().toISOString());
     const fireAt = new Date(Date.now() + 60_000).toISOString();
 
@@ -125,15 +125,16 @@ describe('schedule_wake delivery action', () => {
       db,
     );
 
-    expect(
-      db
-        .prepare('SELECT platform_id, channel_type, thread_id FROM messages_in WHERE id = ?')
-        .get(`schedule-wake-${wakeId}`),
-    ).toMatchObject({
-      platform_id: 'C-2',
-      channel_type: 'slack',
-      thread_id: 'T-2',
-    });
+    const pair = db
+      .prepare(
+        `SELECT platform_id, channel_type, thread_id, source_session_id
+         FROM messages_in WHERE id IN (?, ?) ORDER BY seq`,
+      )
+      .all(`recall-schedule-wake-${wakeId}`, `schedule-wake-${wakeId}`);
+    expect(pair).toEqual([
+      { platform_id: 'ag-peer', channel_type: 'agent', thread_id: null, source_session_id: 'sess-origin' },
+      { platform_id: 'ag-peer', channel_type: 'agent', thread_id: null, source_session_id: 'sess-origin' },
+    ]);
   });
 
   it('tolerates a session with no routing row', async () => {

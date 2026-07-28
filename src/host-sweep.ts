@@ -257,6 +257,7 @@ export interface HostWorkContinuation {
   chain: number;
   runner_id?: string;
   resume_attempts: number;
+  recovery_episode: number;
 }
 
 export function canAttemptContinuationRecovery(continuation: HostWorkContinuation): boolean {
@@ -281,6 +282,8 @@ export function readWorkContinuation(outDb: Database.Database): HostWorkContinua
         (parsed.chain ?? -1) < 0 ||
         !Number.isSafeInteger(parsed.resume_attempts) ||
         (parsed.resume_attempts ?? -1) < 0 ||
+        (parsed.recovery_episode !== undefined &&
+          (!Number.isSafeInteger(parsed.recovery_episode) || parsed.recovery_episode < 0)) ||
         (parsed.runner_id !== undefined && (typeof parsed.runner_id !== 'string' || parsed.runner_id === ''))
       ) {
         return null;
@@ -292,6 +295,7 @@ export function readWorkContinuation(outDb: Database.Database): HostWorkContinua
         chain: parsed.chain as number,
         ...(parsed.runner_id ? { runner_id: parsed.runner_id } : {}),
         resume_attempts: parsed.resume_attempts as number,
+        recovery_episode: parsed.recovery_episode ?? 0,
       };
     }
 
@@ -316,6 +320,7 @@ export function readWorkContinuation(outDb: Database.Database): HostWorkContinua
       phase: 'queued',
       chain: Number.isSafeInteger(parsed.chain) && (parsed.chain as number) >= 0 ? (parsed.chain as number) : 0,
       resume_attempts: 0,
+      recovery_episode: 0,
     };
   } catch {
     return null;
@@ -475,12 +480,12 @@ export function notifyContinuationParked(
     content: string;
   }) => void = (message) => writeOutboundDirect(session.agent_group_id, session.id, message),
 ): boolean {
-  const marker = `continuation_recovery_parked:${continuation.id}`;
+  const marker = `continuation_recovery_parked:${continuation.id}:${continuation.recovery_episode}`;
   if (outDb.prepare('SELECT 1 FROM messages_out WHERE content LIKE ? LIMIT 1').get(`%${marker}%`)) return false;
   const routing = readSessionRouting(inDb);
   if (!routing) return false;
   writeMessage({
-    id: `continuation-parked-${continuation.id}`,
+    id: `continuation-parked-${continuation.id}-${continuation.recovery_episode}`,
     kind: 'chat',
     platformId: routing.platform_id,
     channelType: routing.channel_type,
@@ -489,7 +494,11 @@ export function notifyContinuationParked(
       text:
         `⚠️ I could not resume the interrupted work after ${WORK_CONTINUATION_RESUME_MAX_ATTEMPTS} automatic attempts. ` +
         `The task is still saved: ${continuation.task}. Reply in this thread and I will try again.`,
-      _system: { kind: marker, continuation_id: continuation.id },
+      _system: {
+        kind: marker,
+        continuation_id: continuation.id,
+        recovery_episode: continuation.recovery_episode,
+      },
     }),
   });
   return true;
@@ -591,7 +600,7 @@ function applyCeilingFollowUp(
   if (followUp.action === 'wake-accountable') {
     const recoveryKey =
       followUp.reason === 'continuation'
-        ? `continuation-${workContinuation!.id}-${workContinuation!.resume_attempts}`
+        ? `continuation-${workContinuation!.id}-${workContinuation!.recovery_episode}-${workContinuation!.resume_attempts}`
         : `tool-${encodeURIComponent(containerState?.tool_started_at ?? 'unknown')}`;
     writeCeilingRespawn(inDb, session, followUp.reason, recoveryKey, heartbeatAgeMs);
     log.info('Queued ceiling-kill accountability wake', { sessionId: session.id, reason: followUp.reason });
