@@ -454,7 +454,11 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
         `INSERT INTO messages_in (id, seq, kind, timestamp, status, content)
          VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_in), 'chat', ?, 'completed', ?)`,
       )
-      .run(id, new Date().toISOString(), JSON.stringify({ text: 'hi', ...(sender ? { sender, senderId: sender } : {}) }));
+      .run(
+        id,
+        new Date().toISOString(),
+        JSON.stringify({ text: 'hi', ...(sender ? { sender, senderId: sender } : {}) }),
+      );
   }
 
   it('writes an on_wake trigger=1 accountability row when mid-work', () => {

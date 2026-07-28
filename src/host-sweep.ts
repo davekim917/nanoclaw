@@ -313,12 +313,7 @@ function countCeilingRespawnAttempts(inDb: Database.Database): number {
   return row.c;
 }
 
-function writeCeilingRespawn(
-  inDb: Database.Database,
-  session: Session,
-  attempt: number,
-  heartbeatAgeMs: number,
-): void {
+function writeCeilingRespawn(inDb: Database.Database, session: Session, attempt: number, heartbeatAgeMs: number): void {
   const idleMinutes = Math.round(ABSOLUTE_CEILING_MS / 60_000);
   const silentMinutes = Math.round(heartbeatAgeMs / 60_000);
   const final = attempt >= CEILING_RESPAWN_MAX_ATTEMPTS;
