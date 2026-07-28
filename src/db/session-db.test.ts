@@ -10,7 +10,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 
 import {
   ensureSchema,
@@ -542,6 +542,37 @@ describe('expireStalePending', () => {
       expect(rows.find((r) => r.id === 'recent-1')?.status).toBe('pending');
     } finally {
       db.close();
+    }
+  });
+
+  it('normalizes SQLite-style timestamps before comparing the stale cutoff', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T12:00:00.000Z'));
+    const db = makeInboundDb();
+    try {
+      insertRow(db, { id: 'recent-insert', timestamp: '2026-07-28 11:30:00' });
+      insertRow(db, { id: 'stale-insert', timestamp: '2026-07-28 10:30:00' });
+      insertRow(db, {
+        id: 'recent-fire',
+        timestamp: '2026-07-20 12:00:00',
+        processAfter: '2026-07-28 11:30:00',
+      });
+      insertRow(db, {
+        id: 'stale-fire',
+        timestamp: '2026-07-20 12:00:00',
+        processAfter: '2026-07-28 10:30:00',
+      });
+
+      expect(expireStalePending(db, 60 * 60 * 1000)).toBe(2);
+      expect(db.prepare('SELECT id, status FROM messages_in ORDER BY id').all()).toEqual([
+        { id: 'recent-fire', status: 'pending' },
+        { id: 'recent-insert', status: 'pending' },
+        { id: 'stale-fire', status: 'expired' },
+        { id: 'stale-insert', status: 'expired' },
+      ]);
+    } finally {
+      db.close();
+      vi.useRealTimers();
     }
   });
 

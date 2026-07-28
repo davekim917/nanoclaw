@@ -349,8 +349,8 @@ export function expireStalePending(db: Database.Database, maxAgeMs: number): num
        WHERE status = 'pending'
          AND recurrence IS NULL
          AND (
-           (process_after IS NULL AND timestamp < ?)
-           OR (process_after IS NOT NULL AND process_after < ?)
+           (process_after IS NULL AND datetime(timestamp) < datetime(?))
+           OR (process_after IS NOT NULL AND datetime(process_after) < datetime(?))
          )`,
     )
     .run(cutoffIso, cutoffIso);
