@@ -142,6 +142,9 @@ CI corrections:
 - Spawn-child tool tests now inject task routing, outbound writing, IDs, and logging through the production tool factory. They no longer read a process-global in-memory DB after an async boundary; the nine cases passed 50 consecutive reruns.
 - Final host suite: 873 suites passed; 3,152 tests passed, 1 skipped, 1 todo, 0 failed.
 - A direct durable-continuation turn now reaches the same worktree checkpoint as a normal inbound turn before the poll loop advances. Provider query construction is inside the recovery boundary, so a synchronous startup failure requeues the claimed work and still checkpoints instead of silently abandoning both.
+- Recovery-attempt counting now treats historical non-JSON inbound content as real user input without calling `json_extract` on malformed JSON, preserving ceiling accountability for legacy sessions.
+- Root lifecycle documentation now matches the shipped explicit-tool contract and evidence model; obsolete `NEXT:`, `pending_next`, status-evidence, and old constant/function guidance was removed.
+- Focused host-sweep suite after these corrections: 103 passed, 0 failed; host TypeScript, changed-file formatting, diff hygiene, and the public-boundary check passed.
 - Final container suite after the direct-continuation correction: 966 passed, 4 skipped, 0 failed. Both TypeScript checks passed.
 
 ## Activation boundary

@@ -524,8 +524,14 @@ export function countToolRecoveryAttemptsSinceRealInbound(inDb: Database.Databas
          AND timestamp > COALESCE((
            SELECT MAX(timestamp) FROM messages_in
            WHERE kind != 'system'
-             AND COALESCE(json_extract(content, '$.senderId'), '') != 'system'
-             AND COALESCE(json_extract(content, '$.sender'), '') != 'system'
+             AND COALESCE(
+               json_extract(CASE WHEN json_valid(content) THEN content ELSE '{}' END, '$.senderId'),
+               ''
+             ) != 'system'
+             AND COALESCE(
+               json_extract(CASE WHEN json_valid(content) THEN content ELSE '{}' END, '$.sender'),
+               ''
+             ) != 'system'
          ), '')`,
     )
     .get() as { count: number };

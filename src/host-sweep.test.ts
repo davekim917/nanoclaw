@@ -499,6 +499,12 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
 
   it('writes one deterministic deferred on_wake pair for a continuation', () => {
     const { inDb } = makeSessionDbs();
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES ('legacy-user', 2, 'chat', ?, 'completed', 1, 'legacy plain-text inbound')`,
+      )
+      .run('2026-07-28T11:59:00.000Z');
     const res = _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, continuation, HB_AGE);
     expect(res).toEqual({ action: 'wake-accountable', reason: 'continuation' });
     const rows = respawnRows(inDb);
@@ -647,6 +653,19 @@ describe('durable continuation wake', () => {
     insert.run('user-1', 6, '2026-07-28T12:02:00.000Z', JSON.stringify({ sender: 'user' }));
     expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(0);
     insert.run('ceiling-respawn-tool-3', 8, '2026-07-28T12:03:00.000Z', JSON.stringify({ sender: 'system' }));
+    expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(1);
+  });
+
+  it('treats historical non-JSON content as real inbound when counting tool recovery attempts', () => {
+    const { inDb } = makeSessionDbs();
+    const insert = inDb.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+       VALUES (?, ?, 'chat', ?, 'completed', 1, ?)`,
+    );
+    insert.run('ceiling-respawn-tool-1', 2, '2026-07-28T12:00:00.000Z', JSON.stringify({ sender: 'system' }));
+    insert.run('legacy-user-1', 4, '2026-07-28T12:01:00.000Z', 'legacy plain-text inbound');
+    insert.run('ceiling-respawn-tool-2', 6, '2026-07-28T12:02:00.000Z', JSON.stringify({ sender: 'system' }));
+
     expect(countToolRecoveryAttemptsSinceRealInbound(inDb)).toBe(1);
   });
 
