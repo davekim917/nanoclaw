@@ -99,10 +99,7 @@ Post the triage table to the user before editing. It is the round's plan, and it
 Apply every accepted fix, run the tests that cover them, then commit **once**:
 
 Run whatever suite and typecheck the touched tree owns — the repo's own commands, not a remembered one.
-```
-git_commit({ repo: "...", message: "fix(review): <what the batch addressed>" })
-git_push({ repo: "..." })
-```
+Commit and push once — `git_commit` / `git_push` if you have those MCP tools, plain `git commit` / `git push` otherwise.
 
 One commit per round, not per comment. If a finding needs a design decision from the user, leave it out of the batch and say so — keep that thread open rather than stalling the other fixes on it. `codex-review.sh status` reports it in `open=`, so it can't be forgotten at merge time.
 
@@ -141,11 +138,13 @@ Then wait on `codex=`:
 codex-review.sh status "$SHA" "$SINCE"     # → codex=pending open=0 review=0 reaction=0
 ```
 
-Reviews take minutes. **Don't park this poll as a background shell and end your turn** — the container dies after ~30 minutes idle and takes the loop with it. Use the `wait` tool so the wake comes back into this thread with full context:
+Reviews take minutes, so how you wait depends on where you're running:
 
-```
-wait({ minutes: 5, prompt: "Run codex-review.sh status <sha> <since> for PR #<n>; if codex=findings go back to step 1 as round <n+1>, if codex=clean and open=0 merge, else wait again" })
-```
+- **In an agent container:** don't park the poll as a background shell and end your turn — the container dies after ~30 minutes idle and takes the loop with it. Use the `wait` tool, which brings the wake back into this thread with full context:
+  ```
+  wait({ minutes: 5, prompt: "Run codex-review.sh status <sha> <since> for PR #<n>; if codex=findings go back to step 1 as round <n+1>, if codex=clean and open=0 merge, else wait again" })
+  ```
+- **On a host session:** just re-run `status` between other work, or poll it on an interval. There's no idle ceiling to lose the loop to.
 
 `codex=findings` → back to step 1, increment the round. `codex=pending` → wait again.
 
@@ -159,7 +158,7 @@ gh pr merge "$PR" --repo "$REPO" --squash --delete-branch
 
 Squash is the default. Use `--merge` when the PR's topology matters — an upstream-sync PR whose second parent must survive; squashing one drops the merge base and makes the fork report "behind" forever.
 
-Then run your standing post-PR bookkeeping — `add_ship_log`, plus `update_backlog_item` if the PR closes a backlog entry.
+Then run whatever post-PR bookkeeping your environment expects — e.g. `add_ship_log`, plus `update_backlog_item` if the PR closes a backlog entry.
 
 ## Anti-patterns
 
