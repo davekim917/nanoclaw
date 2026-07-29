@@ -777,6 +777,85 @@ describe('poll loop — exchange hook (onExchangeComplete)', () => {
   });
 });
 
+/**
+ * Provider whose event stream actually COMPLETES.
+ *
+ * MockProvider parks in `while (!ended && !aborted)` waiting for a push()/end()
+ * the poll loop never sends, so its stream never terminates and processQuery
+ * never returns — no test using it reaches the turn tail. That is why every
+ * other test in this file asserts mid-turn and then aborts. Asserting anything
+ * about the turn BOUNDARY needs a provider that finishes.
+ */
+class SingleTurnProvider {
+  readonly supportsNativeSlashCommands = false;
+  constructor(private readonly text: string) {}
+  registerMemorySessionHook(): void {}
+  isSessionInvalid(): boolean {
+    return false;
+  }
+  query() {
+    const text = this.text;
+    return {
+      push() {},
+      end() {},
+      abort() {},
+      events: {
+        async *[Symbol.asyncIterator]() {
+          yield { type: 'activity' as const };
+          yield { type: 'init' as const, continuation: 'single-turn-session' };
+          yield { type: 'result' as const, text };
+          // Stream ends here — the batch reaches its tail.
+        },
+      },
+    };
+  }
+}
+
+describe('poll loop — turn_end boundary signal', () => {
+  const turnEnds = () =>
+    getUndeliveredMessages().filter(
+      (m) => m.kind === 'system' && (JSON.parse(m.content) as { action?: string }).action === 'turn_end',
+    );
+
+  async function runOneTurn(text: string) {
+    const controller = new AbortController();
+    const provider = new SingleTurnProvider(text) as unknown as MockProvider;
+    const loop = runPollLoopWithTimeout(provider, controller.signal, 6000);
+    await waitFor(() => turnEnds().length > 0, 6000);
+    controller.abort();
+    await loop.catch(() => {});
+  }
+
+  it('emits turn_end when the turn delivered no chat, so the host drops the 💭 orphan', async () => {
+    // The whole point of the signal: nothing superseded the thinking label, so
+    // the host must be told to delete it. Without this the 💭 is the turn's
+    // only visible output, permanently in a task session.
+    getInboundDb().prepare('DELETE FROM destinations').run();
+    insertMessage('m1', { sender: 'Alice', text: 'label this' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    await runOneTurn('<message to="nobody">dropped</message>');
+
+    expect(getUndeliveredMessages().some((m) => m.kind === 'chat')).toBe(false);
+    expect(turnEnds()).toHaveLength(1);
+  });
+
+  it('emits turn_end even when the turn DID deliver a chat-final', async () => {
+    // Deliberately unconditional. An earlier design skipped the emit whenever
+    // the turn wrote a chat row, which silently broke three paths — an
+    // agent-to-agent reply returns from delivery before the orphan cleanup, a
+    // mid-turn send_message let the flag latch past later status rows, and a
+    // failed insert still counted as a reply. The host is the only side that
+    // knows whether a status is tracked and no-ops when none is, so the
+    // container must not try to guess. Locking that in: emit ALWAYS.
+    insertMessage('m1', { sender: 'Alice', text: 'answer me' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    await runOneTurn('<message to="discord-test">done</message>');
+
+    expect(getUndeliveredMessages().some((m) => m.kind === 'chat')).toBe(true);
+    expect(turnEnds()).toHaveLength(1);
+  });
+});
+
 describe('poll loop — provider error recovery', () => {
   it('writes error to outbound and continues loop on provider throw', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'trigger error' }, { platformId: 'chan-1', channelType: 'discord' });
