@@ -29,7 +29,12 @@ const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
 import { resolveSession, outboundDbPath, openInboundDb } from './session-manager.js';
-import { deliverSessionMessages, setDeliveryAdapter, assertChannelRoutingConsistency } from './delivery.js';
+import {
+  clearSessionStatusOnKill,
+  deliverSessionMessages,
+  setDeliveryAdapter,
+  assertChannelRoutingConsistency,
+} from './delivery.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 
 function now(): string {
@@ -231,6 +236,41 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     // re-delete a message id the platform no longer has.
     insertOutboundKind('ag-1', session.id, 'end-2', 'system', 'telegram', 'telegram:123', { action: 'turn_end' });
     await deliverSessionMessages(session);
+    expect(deletes).toEqual(['plat-status-1']);
+  });
+
+  it('drops the tracked status when the container is killed, since it can never emit turn_end', async () => {
+    // The real-world failure the turn_end signal did NOT cover. For a
+    // scheduled-task session the idle reaper killing the container mid-stream
+    // IS the normal exit: markCompleted fires inside processQuery on the first
+    // result, processingClaimCount drops to 0, and the reaper kills seconds
+    // later with the provider stream still open — so the batch tail, and its
+    // emitTurnEnd, are never reached. Observed on the support-inbox poller:
+    // the 💭 stood as the run's only visible output in #support, twice.
+    // The host must not depend on a dying process to clean up after itself.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    const deletes: string[] = [];
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-status-1';
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        deletes.push(messageId);
+      },
+    });
+
+    insertOutboundKind('ag-1', session.id, 'status-1', 'status', 'telegram', 'telegram:123', { text: 'polling…' }, null, 'in-1');
+    await deliverSessionMessages(session);
+    expect(deletes).toHaveLength(0); // Tracked, container still alive.
+
+    await clearSessionStatusOnKill(session.id);
+    expect(deletes).toEqual(['plat-status-1']);
+
+    // Idempotent: a second kill (or a kill after a chat-final already cleared
+    // tracking) must not throw or re-delete a vanished platform message.
+    await clearSessionStatusOnKill(session.id);
     expect(deletes).toEqual(['plat-status-1']);
   });
 

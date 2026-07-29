@@ -119,6 +119,26 @@ const statusTracking = new Map<string, StatusTrack>();
  * already gone) leaves the orphan visible but must never block `markDelivered`
  * for the real answer — that would retry and duplicate it.
  */
+/**
+ * Drop a session's 💭 status because its container is being killed.
+ *
+ * The container signals a graceful turn end with a `turn_end` row, but a killed
+ * container never gets to — and for scheduled-task sessions that is the NORMAL
+ * exit, not an edge case. `markCompleted` fires inside processQuery on the first
+ * result (so the sweep doesn't see stale claims while the stream stays open for
+ * follow-ups), which drops processingClaimCount to 0; the idle reaper then kills
+ * the container seconds later with the stream still open, so the batch tail —
+ * and its emitTurnEnd — is never reached. Observed on the support-inbox poller:
+ * ack at 13:31:18.689Z, kill at 13:31:30, leaving the thinking label as the
+ * run's only visible output in #support.
+ *
+ * Covers every kill reason (idle reap, 30-min ceiling, host restart, OOM), so
+ * the host never depends on a dying process to clean up after itself.
+ */
+export async function clearSessionStatusOnKill(sessionId: string): Promise<void> {
+  await dropOrphanStatus(sessionId);
+}
+
 async function dropOrphanStatus(sessionId: string, opts: { skip?: boolean } = {}): Promise<void> {
   const orphan = opts.skip ? undefined : statusTracking.get(sessionId);
   if (orphan && deliveryAdapter?.deleteMessage) {

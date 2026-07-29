@@ -767,6 +767,23 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
   }
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+
+  // A killed container never reaches its turn boundary, so it can never emit
+  // the `turn_end` row that tells the host to delete this session's 💭 status.
+  // Without this the thinking label survives as the run's only visible output —
+  // permanently for a scheduled task, whose NORMAL exit is the idle reaper
+  // killing it mid-stream. Dynamic import: delivery.ts imports this module.
+  // Fire-and-forget and never throws — cleanup must not block the kill.
+  void import('./delivery.js')
+    .then((m) => m.clearSessionStatusOnKill(sessionId))
+    .catch((err) => {
+      log.warn('Failed to clear status on container kill — leaving as-is', {
+        sessionId,
+        reason,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    });
+
   try {
     stopContainer(entry.containerName);
   } catch {
@@ -2699,7 +2716,7 @@ async function buildContainerArgs(
   // Allow long foreground worker-codex calls without lengthening the default
   // timeout for ordinary Bash calls.
   args.push('-e', 'BASH_MAX_TIMEOUT_MS=3600000');
-  args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
+  args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=65');
   // Claude Code 2.1+ has a built-in auto-compact window default that is well
   // under 200k even when the session uses a 1M-context model (claude-opus-4-7[1m]).
   // Without this override, CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 fires against the
