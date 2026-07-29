@@ -342,7 +342,7 @@ export function validateCuratorDecision(value: unknown, context: CuratorValidati
     return { action: 'noop', evidenceIds: [...decisionEvidence], reasonCode: 'duplicate' };
   }
   if (Buffer.byteLength(content, 'utf8') > GENERATED_MEMORY_MAX_BYTES) {
-    throw new Error('generated memory exceeds 256 KiB');
+    throw new Error(`generated memory exceeds ${GENERATED_MEMORY_MAX_BYTES} bytes`);
   }
   validateGeneratedDocument(content);
   return {

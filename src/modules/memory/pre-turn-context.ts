@@ -35,6 +35,17 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // marker. Worst case 3 x 2200 is still inside finalChars alongside archive
   // recall, and enforceFinalBound trims the tail if a bootstrap turn is tight.
   generatedFactExcerptChars: 2_200,
+  // Total for BOTH memory lanes, enforced after selection.
+  //
+  // Load-bearing for the same reason capabilityTotalChars is. Per-lane caps
+  // alone took the worst-case memory footprint from 2,700 (3 x 900) to 9,300
+  // (3 x 2,200 + 3 x 900) inside an unchanged 12,000 finalChars. Facts, files
+  // and archive together then reach finalChars exactly, before per-excerpt JSON
+  // overhead — and enforceFinalBound sacrifices conversation excerpts FIRST, so
+  // a few long facts could silently evict every archive excerpt. 5,500 leaves
+  // the archive lane intact on a normal turn while still fitting three
+  // typical facts (median 817 chars) plus the file lane.
+  memoryExcerptTotalChars: 5_500,
   archiveCandidates: 96,
   archiveExcerpts: 3,
   archiveExcerptChars: 900,
@@ -661,6 +672,28 @@ function capturedAtOf(line: string): string {
   return CAPTURED_AT_PATTERN.exec(line)?.[1] ?? '';
 }
 
+/**
+ * Bound one generated fact, keeping its provenance marker attached.
+ *
+ * A fact can legitimately exceed the excerpt width: the text alone may reach
+ * CURATOR_MAX_MEMORY_TEXT_CHARS and the marker carries up to
+ * CURATOR_MAX_EVIDENCE_IDS archive ids after it. Windowing the line generically
+ * cuts from the end, which drops exactly the `id=` and `captured=` the agent
+ * needs to judge how old a fact is and to cite it. Trim the prose instead and
+ * re-attach the marker, so provenance survives at any width.
+ */
+function boundedFactLine(line: string, maxChars: number): string {
+  if (line.length <= maxChars) return line;
+  const markerAt = line.indexOf('<!--');
+  if (markerAt < 0) return boundedText(line, maxChars, TRUNCATED_MARKDOWN_EXCERPT);
+  const marker = line.slice(markerAt);
+  const budget = maxChars - marker.length - TRUNCATED_MARKDOWN_EXCERPT.length - 1;
+  // Marker alone over budget: keep it whole, since a citation without prose is
+  // still usable and prose without a citation is not.
+  if (budget <= 0) return marker;
+  return `${line.slice(0, budget).trimEnd()}${TRUNCATED_MARKDOWN_EXCERPT} ${marker}`;
+}
+
 function readMemoryEvidence(
   root: string,
   workgroupId: string,
@@ -704,7 +737,17 @@ function readMemoryEvidence(
   const expandedTokens = tokenizeForRecall(`${query} ${ephemeralExpansion(query).join(' ')}`);
   const fileCandidates: SearchableCandidate[] = [];
   const factCandidates: SearchableCandidate[] = [];
-  for (const relative of listMarkdownFiles(root, notices)) {
+  // Read the fact store first. `markdownScannedBytes` is a single budget spent
+  // in listing order, and `generated/` sorts after `bootstrap/`, `concepts/`,
+  // `conversations/`, `facts/` and `imports/`. A large manual tree would
+  // otherwise leave too few bytes for it and truncate the file MID-LINE, which
+  // is worse than dropping it: the partial line still starts with "- " and is
+  // parsed as a fact, so a half-sentence reaches the agent with its provenance
+  // marker cut off. Stable sort, so everything else keeps codepoint order.
+  const scanOrder = listMarkdownFiles(root, notices).sort(
+    (a, b) => Number(b === GENERATED_MEMORY_RELATIVE_PATH) - Number(a === GENERATED_MEMORY_RELATIVE_PATH),
+  );
+  for (const relative of scanOrder) {
     if ((CORE_PATHS as readonly string[]).includes(relative)) continue;
     if (NON_RECALL_PATHS.has(relative)) continue;
     const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
@@ -783,7 +826,10 @@ function readMemoryEvidence(
     { candidate, passage }: { candidate: SearchableCandidate; passage: PassageMatch },
     maxChars: number,
   ): MemoryEvidenceExcerpt => {
-    const text = contextualExcerpt(candidate.content, passage.text, maxChars, TRUNCATED_MARKDOWN_EXCERPT);
+    const text =
+      candidate.path === GENERATED_MEMORY_RELATIVE_PATH
+        ? boundedFactLine(candidate.content, maxChars)
+        : contextualExcerpt(candidate.content, passage.text, maxChars, TRUNCATED_MARKDOWN_EXCERPT);
     return {
       path: candidate.path,
       headings: candidate.headings,
@@ -851,6 +897,23 @@ function readMemoryEvidence(
   }
   // Most relevant first: enforceFinalBound pops from the end when over budget.
   const excerpts = [...factExcerpts, ...fileExcerpts].sort((a, b) => b.score - a.score);
+  // Keep both memory lanes inside one shared total, dropping the least relevant
+  // first, so memory cannot reach enforceFinalBound large enough to evict the
+  // archive lane that function sacrifices ahead of it.
+  let excerptChars = excerpts.reduce((sum, row) => sum + row.text.length, 0);
+  let droppedForBudget = 0;
+  while (excerpts.length > 1 && excerptChars > PRE_TURN_BOUNDS.memoryExcerptTotalChars) {
+    excerptChars -= excerpts.pop()!.text.length;
+    droppedForBudget += 1;
+  }
+  if (droppedForBudget > 0) {
+    notices.push({
+      source: 'markdown',
+      status: 'truncated',
+      code: 'memory-excerpt-total-budget',
+      detail: `dropped ${droppedForBudget} lower-ranked memory excerpt${droppedForBudget === 1 ? '' : 's'} to stay within ${PRE_TURN_BOUNDS.memoryExcerptTotalChars} characters`,
+    });
+  }
   if (excerpts.length === 0) {
     notices.push({
       source: 'markdown',

@@ -430,4 +430,13 @@ describe('memory curation episode queue', () => {
     expect(completeMemoryMaintenance(retry!, { nowMs: now + 1000 })).toBe(true);
     expect(claimMemoryMaintenance('done', { nowMs: now + 2000 })).toBeNull();
   });
+
+  it('keeps the maintenance size threshold mirrored on the generated-memory warn line', async () => {
+    // The constant is hand-mirrored because importing curator-contract here
+    // would close a runtime cycle. Left stale it fires every sweep for any
+    // workgroup past the old cap, claiming and completing a job that does
+    // nothing. The test file has no cycle, so it can assert the mirror.
+    const { GENERATED_MEMORY_WARN_BYTES } = await import('./modules/memory/curator-contract.js');
+    expect(MEMORY_MAINTENANCE_SIZE_THRESHOLD).toBe(GENERATED_MEMORY_WARN_BYTES);
+  });
 });
