@@ -30,8 +30,23 @@ if [ -z "${ADMIN_DM_PLATFORM_ID:-}" ] || [ -z "${ADMIN_DM_CHANNEL_TYPE:-}" ]; th
   exit 1
 fi
 
+# The runbook lives in the private operator repo, not here: it names this
+# install's agent groups, vault entries, and private repos, so it cannot satisfy
+# `pnpm run check:public-boundary`. Overridable for installs that keep it
+# elsewhere.
+RUNBOOK="${ONECLI_RUNBOOK:-$NANOCLAW_DIR/groups/_ops/onecli/upgrade-onecli-gateway.sh}"
+
+# Degrade cleanly rather than hard-failing: this script is tracked in a repo held
+# to the public boundary, so a clone without the private operator content must
+# not crash a scheduled timer. Skip with a clear message instead.
+if [ ! -f "$RUNBOOK" ]; then
+  echo "drift-check: no OneCLI runbook at $RUNBOOK — skipping."
+  echo "drift-check: set ONECLI_RUNBOOK to its path, or install the operator repo."
+  exit 0
+fi
+
 # Run dry-run, capture output and current/latest versions
-DRYRUN_OUTPUT=$(bash "$NANOCLAW_DIR/.migrations/upgrade-onecli-gateway.sh" --dry-run 2>&1)
+DRYRUN_OUTPUT=$(bash "$RUNBOOK" --dry-run 2>&1)
 echo "drift-check: dry-run output:"
 echo "$DRYRUN_OUTPUT" | sed 's/^/  /'
 
@@ -44,7 +59,7 @@ CURRENT_VER=$(echo "$DRYRUN_OUTPUT" | grep -oE "Current gateway: v[0-9.]+" | awk
 LATEST_VER=$(echo "$DRYRUN_OUTPUT" | grep -oE "Latest available: v[0-9.]+" | awk '{print $3}' || echo "?")
 RELEASE_COUNT=$(echo "$DRYRUN_OUTPUT" | grep -oE "\([0-9]+ releases\)" | grep -oE "[0-9]+" || echo "?")
 
-NOTIFICATION="System notification (monthly drift check): OneCLI gateway upgrade available — currently on $CURRENT_VER, latest is $LATEST_VER ($RELEASE_COUNT releases behind). Run \`bash .migrations/upgrade-onecli-gateway.sh\` from $NANOCLAW_DIR when convenient. Auto-rollback is built in if smoke tests fail."
+NOTIFICATION="System notification (monthly drift check): OneCLI gateway upgrade available — currently on $CURRENT_VER, latest is $LATEST_VER ($RELEASE_COUNT releases behind). Run \`bash $RUNBOOK\` when convenient — it prompts before swapping, backs up postgres first, and auto-rolls-back if the smoke test regresses against its pre-upgrade baseline. NOTE: this dry-run already pulled the new image; nothing is swapped until you run it."
 
 echo "drift-check: drift detected ($CURRENT_VER -> $LATEST_VER), notifying admin via CLI socket"
 
