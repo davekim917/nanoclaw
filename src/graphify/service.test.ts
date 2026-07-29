@@ -22,11 +22,11 @@ describe('Graphify systemd service', () => {
     expect(unit).toContain('OOMScoreAdjust=500');
   });
 
-  it('test_graphify_service_has_3g_hard_memory_cap', () => {
+  it('test_graphify_service_has_6g_hard_memory_cap', () => {
     const unit = userUnit();
 
-    expect(unit).toContain('MemoryHigh=1536M');
-    expect(unit).toContain('MemoryMax=3072M');
+    expect(unit).toContain('MemoryHigh=4G');
+    expect(unit).toContain('MemoryMax=6G');
   });
 
   it('test_graphify_service_kills_child_jobs_on_stop', () => {
