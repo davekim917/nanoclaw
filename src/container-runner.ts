@@ -1317,10 +1317,13 @@ const SCOPED_CREDENTIAL_VARS = [
   'LOOKER_CLIENT_SECRET',
   'ATLASSIAN_BASE_URL',
   'SELECT_ORGANIZATION_ID',
-  'OPENAI_API_KEY',
+  // OPENAI_API_KEY and DEEPGRAM_API_KEY removed 2026-07-27 — see the matching
+  // note in capabilities.ts SCOPED_ENV_NAMES, which this list must stay in sync
+  // with. Neither is in use; forwarding them only propagated a placeholder and a
+  // dead vault entry. The codex provider still forwards OPENAI_API_KEY itself
+  // from ctx.hostEnv (src/providers/codex.ts), so its fallback auth is intact.
   'BRAINTRUST_API_KEY',
   'EXA_API_KEY',
-  'DEEPGRAM_API_KEY',
   'ELEVENLABS_API_KEY',
   'RESIDENTIAL_PROXY_URL',
   // Omni API — required by the omni skill; absent → first call fails 401.

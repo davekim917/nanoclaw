@@ -61,6 +61,13 @@ agents-sdk-docs
 
 # Codex plugin marker
 .codex
+# Stays ignored — do NOT track. Attempted 2026-07-29 and `pnpm run
+# check:public-boundary` rejected it with 9 private-identifier findings: the
+# migration doc records this install's agent groups and vault entries, the smoke
+# test hardcodes a private org repo, and the upgrade script targets containers by
+# install-specific name. This content cannot meet the public boundary without
+# being gutted. It still needs versioning somewhere private — the groups repo is
+# the right home, not here.
 .migrations/
 .env.pre-migration.*
 

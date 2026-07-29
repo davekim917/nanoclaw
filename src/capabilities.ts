@@ -166,10 +166,15 @@ const SCOPED_ENV_NAMES = [
   'SNOWFLAKE_DATABASE',
   'DBT_CLOUD_ACCOUNT_ID',
   'DBT_CLOUD_API_TOKEN',
-  'OPENAI_API_KEY',
+  // OPENAI_API_KEY and DEEPGRAM_API_KEY removed 2026-07-27: neither is in use.
+  // Deepgram is commented out of .env (vault-only since 2026-04-28) and its vault
+  // value 401s; OpenAI's only .env value is the `placeholder_for_onecli_proxy`
+  // sentinel and there is no key to rotate. Advertising them here told agents the
+  // services were wired when every call 401s. The codex provider keeps its own
+  // OPENAI_API_KEY fallback (src/providers/codex.ts reads ctx.hostEnv directly),
+  // so that path is unaffected and still works the day a real key appears.
   'BRAINTRUST_API_KEY',
   'EXA_API_KEY',
-  'DEEPGRAM_API_KEY',
   'ELEVENLABS_API_KEY',
   'RESIDENTIAL_PROXY_URL',
   'SUPABASE_PROJECT_REF',
