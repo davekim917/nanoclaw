@@ -97,6 +97,31 @@ describe('BackgroundGraphRunner shutdown', () => {
     await runner.stop();
   });
 
+  it('settles the job when the pressure probe itself rejects', async () => {
+    const runner = new BackgroundGraphRunner({
+      sessionsRoot: '/nonexistent',
+      freeMemory: () => 10_000_000_000,
+      pollMs: 10,
+      pressure: async () => {
+        throw new Error('pressure scanner exited 1');
+      },
+    });
+    let ran = false;
+
+    // A rejecting probe used to escape execute(), so drain() threw after already
+    // shifting the job off its queue and the run() promise never settled — the
+    // semantic pump would then be latched forever.
+    const first = await runner.run(async () => {
+      ran = true;
+    });
+    expect(first.status).toBe('preempted');
+    expect(ran).toBe(false);
+
+    // The lane must still be usable afterwards.
+    expect((await runner.run(async () => 'ok')).status).toBe('preempted');
+    await runner.stop();
+  });
+
   it('does not destroy an admitted non-preemptible job when pressure rises', async () => {
     let pressure = false;
     let release!: () => void;

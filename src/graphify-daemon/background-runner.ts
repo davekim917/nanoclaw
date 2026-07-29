@@ -304,7 +304,18 @@ export class BackgroundGraphRunner {
     let admitted = false;
     try {
       if (this.freeMemory() < this.minimumFreeBytes) return { status: 'deferred', reason: 'memory' };
-      if (await this.pressure()) return { status: 'preempted' };
+      // The pressure probe is a worker thread and can reject (worker error, exit,
+      // or a failed scan). Letting that escape means `drain()` throws after
+      // shifting the job off its queue, so the job's promise never settles — the
+      // caller waits forever. Treat a broken probe as preemption: the work
+      // requeues without consuming its retry budget.
+      let pressured: boolean;
+      try {
+        pressured = await this.pressure();
+      } catch {
+        return { status: 'preempted' };
+      }
+      if (pressured) return { status: 'preempted' };
       if (this.stopped || controller.signal.aborted) return { status: 'preempted' };
       admitted = true;
     } finally {

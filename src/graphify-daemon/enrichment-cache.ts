@@ -75,6 +75,9 @@ export class EnrichmentRepository {
         available_at TEXT NOT NULL, enqueued_at TEXT NOT NULL, last_error TEXT
       );
       CREATE INDEX IF NOT EXISTS semantic_queue_ready ON semantic_queue(state, available_at, priority DESC, enqueued_at);
+      -- Per-workgroup counts run on every status call, which is on the read path
+      -- for every graphify query. Without this the whole queue is scanned.
+      CREATE INDEX IF NOT EXISTS semantic_queue_workgroup ON semantic_queue(workgroup_id, state);
       UPDATE semantic_queue SET state = 'pending' WHERE state = 'running';
     `);
     for (const sql of [
@@ -367,9 +370,11 @@ export class EnrichmentRepository {
   }
 
   /**
-   * Drop rows for workgroups that no longer exist. `claimBatch` is scoped to
-   * live workgroup ids, so orphaned rows are unclaimable forever — they inflate
-   * the backlog and the database without ever being processed.
+   * Drop queued rows for workgroups that no longer exist. `claimBatch` is scoped
+   * to live workgroup ids, so orphaned rows are unclaimable forever and inflate
+   * the reported backlog without ever being processed. Deliberately leaves the
+   * `enrichments` cache alone — those rows are still valid results and are far
+   * smaller; `clearWorkgroup` is the caller that wants both gone.
    */
   pruneOrphanWorkgroups(liveWorkgroupIds: string[]): number {
     const orphans = this.queuedWorkgroupIds().filter((id) => !liveWorkgroupIds.includes(id));

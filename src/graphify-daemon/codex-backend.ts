@@ -254,7 +254,9 @@ export class CodexSemanticBackend {
           '--config',
           `model_reasoning_effort="${candidate.effort}"`,
           '--skip-git-repo-check',
-          ...(imagePath ? ['--image', imagePath] : []),
+          // `--image` is variadic (`<FILE>...`), so without an explicit `--` it
+          // swallows the following `-` as a second filename and leaves no PROMPT.
+          ...(imagePath ? ['--image', imagePath, '--'] : []),
           // `-` makes codex exec read the prompt from stdin. A batch may carry
           // up to MAX_INPUT_BYTES (256 KiB), but Linux caps a single argv entry
           // at 128 KiB, so passing the prompt as an argument spawn-failed with

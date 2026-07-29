@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -124,6 +125,46 @@ describe('CodexSemanticBackend output boundary', () => {
     );
     expect(stdinBytes).toBeGreaterThan(128 * 1024);
     expect(argvBytes).toBeLessThan(128 * 1024);
+  });
+
+  it('keeps the stdin prompt marker out of the variadic image list', async () => {
+    let args: string[] = [];
+    const processRun = vi.fn(async (_command: string, commandArgs: string[], options?: { stdin?: string }) => {
+      args = commandArgs;
+      expect(options?.stdin ?? '').toContain('sourceId');
+      writeFileSync(
+        commandArgs[commandArgs.indexOf('--output-last-message') + 1],
+        JSON.stringify({ sources: [{ sourceId: 's', nodes: [], edges: [], hyperedges: [] }] }),
+      );
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+    const imageRoot = temp();
+    const imagePath = join(imageRoot, 'shot.png');
+    const bytes = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    writeFileSync(imagePath, bytes);
+    // stageVerifiedImage re-hashes the file and requires it to match contentHash.
+    const contentHash = createHash('sha256').update(bytes).digest('hex');
+
+    const backend = new CodexSemanticBackend({ processRun, tempRoot: temp() });
+    await backend.extractBatch([
+      {
+        source: { id: 's', workgroupId: 'wg', kind: 'document', relativePath: 'shot.png', contentHash },
+        segments: ['a raster source'],
+        imagePath,
+        imageRoot,
+      },
+    ]);
+
+    // `--image` takes `<FILE>...`, so a bare `-` after it is parsed as another
+    // filename and codex is left with no PROMPT at all. `--` terminates the list.
+    const imageIndex = args.indexOf('--image');
+    expect(imageIndex).toBeGreaterThan(-1);
+    expect(args[imageIndex + 1]).toContain('.png');
+    expect(args[imageIndex + 2]).toBe('--');
+    expect(args.at(-1)).toBe('-');
   });
 
   it('rejects an output artifact larger than four MiB before parsing it', async () => {

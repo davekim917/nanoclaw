@@ -237,7 +237,9 @@ describe('WorkgroupGraphDaemon', () => {
 
       writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), `quiet workgroup knowledge ${busy}`);
       await daemon.ensureFresh('madison');
-      await waitUntil(() => daemon.status('madison').freshness.pendingEnrichment === 0);
+      // Real reconcile + enrich per iteration; leave headroom for the full suite
+      // running in parallel, matching the other reconciliation waits in this file.
+      await waitUntil(() => daemon.status('madison').freshness.pendingEnrichment === 0, 5_000);
 
       expect(daemon.status('madison').freshness.pendingEnrichment).toBe(0);
       expect(daemon.status('madison').freshness.enrichmentEligible).toBe(true);
