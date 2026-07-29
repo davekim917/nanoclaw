@@ -261,7 +261,17 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       },
     });
 
-    insertOutboundKind('ag-1', session.id, 'status-1', 'status', 'telegram', 'telegram:123', { text: 'polling…' }, null, 'in-1');
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'status-1',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: 'polling…' },
+      null,
+      'in-1',
+    );
     await deliverSessionMessages(session);
     expect(deletes).toHaveLength(0); // Tracked, container still alive.
 
