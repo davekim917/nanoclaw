@@ -129,7 +129,16 @@ export interface WorkgroupGraphDaemonOptions {
   backgroundRunner?: BackgroundRunnerLike;
   semanticBackend?: SemanticBackendLike;
   codeWorker?: CodeWorkerLike;
+  /** Upstream structural extraction (code symbols, documents). Cheap, deterministic. */
   enableEnrichment?: boolean;
+  /**
+   * Our Codex semantic layer: an LLM re-reads each source and emits entity and
+   * assertion nodes on top of the structural graph. One model call per 25
+   * sources, re-queued whenever content changes, so it is a standing cost that
+   * scales with corpus churn rather than corpus value. Off by default — the
+   * structural graph already answers code-and-conversation retrieval on its own.
+   */
+  enableSemanticEnrichment?: boolean;
   threadWorktrees?: boolean;
   debounceMs?: number;
   archivePollMs?: number;
@@ -425,6 +434,7 @@ export class WorkgroupGraphDaemon {
   private readonly semantic?: SemanticBackendLike;
   private readonly codeWorker?: CodeWorkerLike;
   private readonly enableEnrichment: boolean;
+  private readonly enableSemanticEnrichment: boolean;
   private readonly states = new Map<string, WorkgroupState>();
   private readonly enrichmentRepository: EnrichmentRepository;
   private readonly reconcileStoreFactory: ReconcileStoreFactory;
@@ -451,6 +461,7 @@ export class WorkgroupGraphDaemon {
     this.background =
       options.backgroundRunner ?? new BackgroundGraphRunner({ sessionsRoot: join(options.dataDir, 'v2-sessions') });
     this.enableEnrichment = options.enableEnrichment ?? true;
+    this.enableSemanticEnrichment = options.enableSemanticEnrichment ?? false;
     this.threadWorktrees = options.threadWorktrees ?? process.env.NANOCLAW_THREAD_WORKTREES === '1';
     this.enrichmentRepository = new EnrichmentRepository(join(options.dataDir, 'graphify', 'enrichment.db'));
     this.reconcileStoreFactory = options.reconcileStoreFactory ?? createReconcileStore;
@@ -479,8 +490,13 @@ export class WorkgroupGraphDaemon {
       });
     }
     const jobsRoot = graphifyJobsRoot(options.dataDir);
+    // Structural extraction and semantic enrichment used to share one flag, so
+    // the cheap upstream half could not be run without the expensive LLM half.
     this.semantic =
-      options.semanticBackend ?? (this.enableEnrichment ? new CodexSemanticBackend({ tempRoot: jobsRoot }) : undefined);
+      options.semanticBackend ??
+      (this.enableEnrichment && this.enableSemanticEnrichment
+        ? new CodexSemanticBackend({ tempRoot: jobsRoot })
+        : undefined);
     this.codeWorker =
       options.codeWorker ??
       (this.enableEnrichment && options.containerImage
@@ -1170,6 +1186,7 @@ export class WorkgroupGraphDaemon {
         archivePath: this.archivePath,
         workgroupId: state.descriptor.id,
         enableEnrichment: this.enableEnrichment,
+        enableSemanticEnrichment: this.enableSemanticEnrichment,
         signal,
       });
       candidatePath = result.candidatePath;

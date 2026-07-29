@@ -9,6 +9,7 @@ interface WorkerOptions {
   archivePath: string;
   workgroupId: string;
   enableEnrichment: boolean;
+  enableSemanticEnrichment: boolean;
 }
 
 const port = parentPort;
@@ -21,6 +22,7 @@ const daemon = new WorkgroupGraphDaemon({
   centralDbPath: options.centralDbPath,
   archivePath: options.archivePath,
   enableEnrichment: options.enableEnrichment,
+  enableSemanticEnrichment: options.enableSemanticEnrichment,
   isolateReconcile: false,
   scheduleEnrichmentAfterReconcile: false,
   watchFilesystem: false,

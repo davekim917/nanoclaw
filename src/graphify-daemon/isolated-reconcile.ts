@@ -22,6 +22,7 @@ export interface IsolatedReconcileOptions {
   archivePath: string;
   workgroupId: string;
   enableEnrichment: boolean;
+  enableSemanticEnrichment: boolean;
   signal?: AbortSignal;
 }
 
@@ -34,6 +35,7 @@ export async function runIsolatedReconcile(options: IsolatedReconcileOptions): P
       archivePath: options.archivePath,
       workgroupId: options.workgroupId,
       enableEnrichment: options.enableEnrichment,
+      enableSemanticEnrichment: options.enableSemanticEnrichment,
     },
   });
   return await new Promise((resolve, reject) => {

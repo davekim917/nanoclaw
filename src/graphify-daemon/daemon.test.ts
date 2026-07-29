@@ -190,6 +190,37 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
+  it('keeps structural extraction when the Codex semantic layer is off', async () => {
+    const f = fixture();
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'structural knowledge worth finding');
+    const semanticBackend = {
+      extract: vi.fn(async () => ({ nodes: [], edges: [], hyperedges: [] })),
+      extractBatch: vi.fn(async () => new Map()),
+    };
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      backgroundRunner: immediateRunner() as never,
+      semanticMinIntervalMs: 0,
+      semanticPumpDelayMs: 0,
+      // Structural extraction on, our LLM layer off — these used to share one
+      // flag, so the cheap half could not run without the expensive half.
+      enableEnrichment: true,
+      enableSemanticEnrichment: false,
+      // Passed explicitly so a regression that re-enables the layer would call it.
+      semanticBackend: undefined,
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+
+    // The structural graph still answers, and nothing was queued for the LLM.
+    expect((await daemon.query('madison', 'structural knowledge worth finding')).nodes.length).toBeGreaterThan(0);
+    expect(daemon.status('madison').freshness.pendingEnrichment).toBe(0);
+    expect(semanticBackend.extractBatch).not.toHaveBeenCalled();
+    await daemon.close();
+  });
+
   it('drains a quiet workgroup while a sibling is dirty or queued behind the lane', async () => {
     const f = fixture();
     // A second workgroup that will stay permanently busy.
