@@ -190,6 +190,50 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     });
   });
 
+  it('deletes the orphan thinking-block at turn_end when the turn posted no chat-final', async () => {
+    // A thinking label is scaffolding, never an outcome. When a turn ends with
+    // no <message> block, the anchor-based reset only fires on the NEXT turn —
+    // and a task session (support-inbox poller, scheduled job) never gets one,
+    // so the 💭 stands in the channel as the "answer" forever. The container
+    // emits a `turn_end` system row after markCompleted; it must clean up.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    const deletes: string[] = [];
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-status-1';
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        deletes.push(messageId);
+      },
+    });
+
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'status-1',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: 'labeling…' },
+      null,
+      'in-1',
+    );
+    await deliverSessionMessages(session);
+    expect(deletes).toHaveLength(0); // Status posted and tracked; turn still open.
+
+    insertOutboundKind('ag-1', session.id, 'end-1', 'system', 'telegram', 'telegram:123', { action: 'turn_end' });
+    await deliverSessionMessages(session);
+    expect(deletes).toEqual(['plat-status-1']);
+
+    // Idempotent: a second turn_end with nothing tracked must not throw or
+    // re-delete a message id the platform no longer has.
+    insertOutboundKind('ag-1', session.id, 'end-2', 'system', 'telegram', 'telegram:123', { action: 'turn_end' });
+    await deliverSessionMessages(session);
+    expect(deletes).toEqual(['plat-status-1']);
+  });
+
   it('resets the status line on a new turn when the prior turn posted no chat-final', async () => {
     // Bug: a turn that ends WITHOUT a user-facing <message> block (agent
     // thought/used tools but chose not to reply) never writes a kind='chat'

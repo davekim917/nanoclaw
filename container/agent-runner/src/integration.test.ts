@@ -42,6 +42,19 @@ function insertMessage(
     .run(id, opts?.platformId ?? null, opts?.channelType ?? null, opts?.threadId ?? null, JSON.stringify(content));
 }
 
+/**
+ * Outbound rows a caller would actually deliver, excluding the per-turn
+ * `turn_end` boundary signal. Every turn emits that row and no content
+ * assertion in this file is about it; filtering here keeps the assertions
+ * expressing what they mean ("the turn produced one reply") instead of
+ * silently counting an internal signal.
+ */
+function deliverableOut() {
+  return getUndeliveredMessages().filter(
+    (m) => !(m.kind === 'system' && (JSON.parse(m.content) as { action?: string }).action === 'turn_end'),
+  );
+}
+
 describe('poll loop integration', () => {
   it('should pick up a message, process it, and write a response', async () => {
     insertMessage(
@@ -55,10 +68,10 @@ describe('poll loop integration', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe('42');
     expect(out[0].platform_id).toBe('chan-1');
@@ -80,10 +93,10 @@ describe('poll loop integration', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe('Got both messages');
 
@@ -119,10 +132,10 @@ describe('poll loop integration', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length >= 2, 2000);
+    await waitFor(() => deliverableOut().length >= 2, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     const discordOut = out.find((m) => m.platform_id === 'chan-1');
     const slackOut = out.find((m) => m.platform_id === 'chan-2');
 
@@ -149,10 +162,10 @@ describe('poll loop integration', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toContain('I am thinking about this...');
     expect(out[0].channel_type).toBe('discord');
@@ -171,10 +184,10 @@ describe('poll loop integration', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     // Only the valid destination should produce output
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe('delivered');
@@ -200,10 +213,10 @@ describe('poll loop integration', () => {
       const controller = new AbortController();
       const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-      await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+      await waitFor(() => deliverableOut().length > 0, 2000);
       controller.abort();
 
-      const out = getUndeliveredMessages();
+      const out = deliverableOut();
       // Recovered, not dropped: routed to the origin channel (chan-1) with the mention.
       expect(out).toHaveLength(1);
       expect(out[0].platform_id).toBe('chan-1');
@@ -237,10 +250,10 @@ describe('poll loop integration', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length >= 2, 2000);
+    await waitFor(() => deliverableOut().length >= 2, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(2);
     const discord = out.find((m) => m.platform_id === 'chan-1');
     const slack = out.find((m) => m.platform_id === 'chan-2');
@@ -272,10 +285,10 @@ describe('poll loop integration', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(out[0].platform_id).toBe('chan-new');
     expect(out[0].thread_id).toBeNull();
@@ -300,10 +313,10 @@ describe('poll loop integration', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(out[0].thread_id).toBe('thread-new');
     expect(out[0].in_reply_to).toBe('m-new');
@@ -320,10 +333,10 @@ describe('poll loop integration', () => {
     await sleep(200);
     insertMessage('m-late', { sender: 'Charlie', text: 'Late arrival' });
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out.length).toBeGreaterThanOrEqual(1);
 
     await loopPromise.catch(() => {});
@@ -340,10 +353,10 @@ describe('poll loop integration', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe('answer');
 
@@ -365,10 +378,10 @@ describe('poll loop integration', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(out[0].platform_id).toBe('chan-1');
 
@@ -443,11 +456,11 @@ describe('durable work continuation', () => {
     });
 
     await waitFor(() => prompts.some((p) => p.includes('write the dbt consolidation plan')), 4000);
-    await waitFor(() => getUndeliveredMessages().length > 0, 4000);
+    await waitFor(() => deliverableOut().length > 0, 4000);
     await waitFor(() => autosaveReasons.length > 0, 4000);
     controller.abort();
 
-    expect(JSON.parse(getUndeliveredMessages()[0].content).text).toBe('plan written');
+    expect(JSON.parse(deliverableOut()[0].content).text).toBe('plan written');
     expect(getWorkContinuation()).toBeUndefined();
     expect(autosaveReasons).toEqual(['turn end']);
 
@@ -467,7 +480,7 @@ describe('durable work continuation', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 4000);
+    await waitFor(() => deliverableOut().length > 0, 4000);
     controller.abort();
 
     expect(prompts).toHaveLength(1);
@@ -502,10 +515,10 @@ describe('durable work continuation', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
 
-    await waitFor(() => getUndeliveredMessages().length >= 2, 4000);
+    await waitFor(() => deliverableOut().length >= 2, 4000);
     controller.abort();
 
-    const routed = getUndeliveredMessages();
+    const routed = deliverableOut();
     expect(routed.map((message) => message.kind)).toEqual(['status', 'chat']);
     expect(
       routed.map((message) => ({
@@ -564,11 +577,11 @@ describe('durable work continuation', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
 
-    await waitFor(() => getUndeliveredMessages().length >= 2, 4000);
+    await waitFor(() => deliverableOut().length >= 2, 4000);
     controller.abort();
 
     expect(
-      getUndeliveredMessages().map((message) => ({
+      deliverableOut().map((message) => ({
         kind: message.kind,
         platform_id: message.platform_id,
         channel_type: message.channel_type,
@@ -654,7 +667,7 @@ describe('durable work continuation', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 5000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 4000);
+    await waitFor(() => deliverableOut().length > 0, 4000);
     await sleep(200);
     controller.abort();
     expect(prompts).toHaveLength(1);
@@ -753,10 +766,10 @@ describe('poll loop — exchange hook (onExchangeComplete)', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out.length).toBe(1);
     expect(out[0].content).toContain('delivered anyway');
 
@@ -772,10 +785,10 @@ describe('poll loop — provider error recovery', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toContain('Error:');
     expect(JSON.parse(out[0].content).text).toContain('API rate limit exceeded');
@@ -800,11 +813,11 @@ describe('poll loop — stale session recovery', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
     // Error was written to outbound
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toContain('Error:');
 
@@ -826,12 +839,12 @@ describe('poll loop — stale session recovery', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
     expect(provider.continuations).toEqual(['poisoned-codex-thread', undefined]);
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe('recovered');
     expect(getContinuation('mock')).toBe('fresh-codex-thread');
@@ -859,10 +872,10 @@ describe('poll loop — /clear command', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => deliverableOut().length > 0, 2000);
     controller.abort();
 
-    const out = getUndeliveredMessages();
+    const out = deliverableOut();
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe('Session cleared.');
 
@@ -997,7 +1010,7 @@ describe('poll loop — slash command during active query', () => {
 
     await waitFor(() => provider.aborts === 1, 15000);
     await waitFor(
-      () => getUndeliveredMessages().some((msg) => JSON.parse(msg.content).text === 'Session cleared.'),
+      () => deliverableOut().some((msg) => JSON.parse(msg.content).text === 'Session cleared.'),
       15000,
     );
     controller.abort();

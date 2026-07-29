@@ -28,7 +28,7 @@ import {
   migrateDeliveredTable,
 } from './db/session-db.js';
 import { runGuarded, type DeliveryGuardSpec, type GuardedDeliveryHandler } from './delivery-guard.js';
-import { isUnguarded, type Unguarded } from './guard/index.js';
+import { isUnguarded, unguarded, type Unguarded } from './guard/index.js';
 import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { archiveMessageAndScheduleMemoryCuration } from './message-archive.js';
@@ -102,6 +102,46 @@ interface StatusTrack {
   editExhausted?: boolean;
 }
 const statusTracking = new Map<string, StatusTrack>();
+
+/**
+ * Delete this session's tracked 💭 status and clear the tracking entry.
+ *
+ * Two callers, one rule — a status line is scaffolding, never an outcome:
+ *   - a chat-final landed, so the status has been superseded;
+ *   - the turn ended without one, so the status is all the user would see.
+ *
+ * Uses the *stored* route (pinned when the status was first posted), not the
+ * caller's — `send_message` can deliver a chat reply to a different
+ * channel/thread than the status went to, and deleting via the reply's route
+ * would target the wrong channel.
+ *
+ * Errors are swallowed: a failed delete (network, permission revoked, message
+ * already gone) leaves the orphan visible but must never block `markDelivered`
+ * for the real answer — that would retry and duplicate it.
+ */
+async function dropOrphanStatus(sessionId: string, opts: { skip?: boolean } = {}): Promise<void> {
+  const orphan = opts.skip ? undefined : statusTracking.get(sessionId);
+  if (orphan && deliveryAdapter?.deleteMessage) {
+    try {
+      await deliveryAdapter.deleteMessage(
+        orphan.channelType,
+        orphan.platformId,
+        orphan.threadId,
+        orphan.messageId,
+        orphan.instance,
+      );
+    } catch (err) {
+      log.warn('Failed to delete orphan thinking-block status — leaving as-is', {
+        sessionId,
+        channelType: orphan.channelType,
+        platformId: orphan.platformId,
+        messageId: orphan.messageId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  statusTracking.delete(sessionId);
+}
 
 /** Discord refuses further edits after an old message reaches its edit cap. */
 function isDiscordStatusEditLimitError(err: unknown): boolean {
@@ -958,27 +998,7 @@ async function deliverMessage(
     // `delete` anyway as a defensive no-op in case a regular chat row ever
     // got tracked before the session was classified as a spawn child.
     const isSpawnChild = isSpawnChildSession(session.id);
-    const orphan = isSpawnChild ? undefined : statusTracking.get(session.id);
-    if (orphan && deliveryAdapter.deleteMessage) {
-      try {
-        await deliveryAdapter.deleteMessage(
-          orphan.channelType,
-          orphan.platformId,
-          orphan.threadId,
-          orphan.messageId,
-          orphan.instance,
-        );
-      } catch (err) {
-        log.warn('Failed to delete orphan thinking-block status — leaving as-is', {
-          sessionId: session.id,
-          channelType: orphan.channelType,
-          platformId: orphan.platformId,
-          messageId: orphan.messageId,
-          err: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-    statusTracking.delete(session.id);
+    await dropOrphanStatus(session.id, { skip: isSpawnChild });
 
     // Mirror agent replies into the central archive (2.9). Scrubbed text
     // so any accidentally-included secret stays out of searchable history.
@@ -1148,3 +1168,30 @@ export function stopDeliveryPolls(): void {
   activePolling = false;
   sweepPolling = false;
 }
+
+/**
+ * Turn boundary from the container, emitted once per turn exit (including the
+ * durable work-continuation path). Sweeps up a 💭 status the turn never
+ * superseded with a chat-final. Without it, a turn that thought + acted but
+ * emitted no `<message>` leaves the thinking label as its only visible output —
+ * and in a task session (support-inbox poller, scheduled job) there is no next
+ * turn to reset it, so it stands as the "answer" forever.
+ *
+ * ORDERING: the container writes this row BEFORE `checkpointTurnEnd` and
+ * `markCompleted`, so the inbound rows for the turn may still be claimed as
+ * `processing` when it arrives — the checkpoint shells out to git and can take
+ * seconds. Do not treat this as a signal that the turn's inbound state has
+ * settled.
+ *
+ * No-op when a chat-final already cleared tracking, which is the common case.
+ * That no-op is load-bearing: the container emits unconditionally precisely
+ * because the host is the only side that knows whether a status is tracked.
+ */
+registerDeliveryAction(
+  'turn_end',
+  async (_content, session) => {
+    await dropOrphanStatus(session.id);
+    return undefined;
+  },
+  unguarded('turn boundary — deletes only this session’s own status line, no privileged effect'),
+);

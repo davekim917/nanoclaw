@@ -355,6 +355,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             clearCurrentInReplyTo();
             clearBatchAnchors();
           }
+          emitTurnEnd();
           await checkpointTurnEnd(autosaveWorktrees);
           continue;
         }
@@ -992,6 +993,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       clearBatchAnchors();
     }
 
+    emitTurnEnd();
+
     // Per-turn safety net: checkpoint any uncommitted worktree edits so the
     // agent's work survives compaction or a later container kill even if
     // the agent forgot to commit. Mirrors v1's turn-end auto-commit pattern
@@ -1002,6 +1005,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).
     markCompleted(processingIds);
+
     log(`Completed ${processingIds.length} message(s) (commands=${commandIds.length}, skipped=${skipped.length})`);
   }
 }
@@ -1830,6 +1834,33 @@ const STRAY_WRAPPER_RE = /<\/?message(?:\s+to="[^"]*")?\s*>/g;
 export interface TaskMessageBlock {
   to: string;
   body: string;
+}
+
+/**
+ * Signal the turn boundary to the host.
+ *
+ * The host tracks the session's currently-visible 💭 status line and deletes it
+ * when a chat-final supersedes it. Nothing supersedes a turn that ends without
+ * one, so the label stands as the turn's only visible output — permanently in a
+ * task session (inbox poller, scheduled job), which never gets a next turn whose
+ * differing batch anchor would reset it.
+ *
+ * Emitted UNCONDITIONALLY. An earlier version fired only when the turn wrote no
+ * chat row, which was wrong three ways: an agent-to-agent reply counts as a chat
+ * row but returns from delivery before the orphan cleanup; the flag latched, so
+ * status rows produced AFTER an early `send_message` were never cleaned; and a
+ * failed insert still marked the turn as having replied. The host is the only
+ * component that knows whether a status is actually tracked, and its handler is
+ * a no-op when none is — so let it decide rather than guessing here.
+ *
+ * Called from every turn exit, including the durable work-continuation branch,
+ * which returns through its own path. Emitted BEFORE `checkpointTurnEnd` and
+ * `markCompleted`: the checkpoint shells out to git and can take seconds, and
+ * there is no reason to leave a stale 💭 on screen for it. Callers must not
+ * assume inbound rows are already marked completed when this row lands.
+ */
+function emitTurnEnd(): void {
+  writeMessageOut({ id: generateId(), kind: 'system', content: JSON.stringify({ action: 'turn_end' }) });
 }
 
 export function dispatchResultText(
