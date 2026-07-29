@@ -30,23 +30,23 @@ const REQUIRED_ENV: Record<string, string> = {
   // Auto-compact at 80% of context window instead of SDK default (~97%).
   // Prevents sessions from hitting the hard context limit and triggering
   // silent model fallback on upstream 400 errors.
-  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '80',
+  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '65',
   // Paired with the percentage above: Claude Code 2.1+ has an internal
   // auto-compact window default well under 200k regardless of model. For
   // [1m] sessions that default triggers compaction at ~165k instead of at
   // 80% of 1M. Forcing the window to 1_000_000 aligns the percentage with
   // the [1m] capacity. Non-[1m] sessions still hit their own window first.
-  CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000'
   // Disable adaptive thinking so the CLI emits visible `thinking` content
   // blocks (the older fixed-budget mode). The CLI's internal gate only
   // applies this to model ids containing "opus-4-6" or "sonnet-4-6"; for
   // 4-7 it's a benign no-op but keeps 4-6 sessions consistent.
-  CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
+  // CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
   // Fixed thinking token budget. 127999 = max_output − 1 (Opus 4.7 max is
   // 128000). Deprecated in the SDK query option surface but still honored
   // by the CLI as an env-var knob that pairs with the disabled-adaptive
   // mode above — gives us a large budget on fixed-budget model variants.
-  MAX_THINKING_TOKENS: '127999',
+  // MAX_THINKING_TOKENS: '127999',
 };
 
 // Env keys whose meaning moved or got dropped. Removed from existing
