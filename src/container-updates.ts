@@ -31,6 +31,131 @@ export interface AuditItem {
   detail?: string;
   tag?: string;
   commit?: string;
+  /** Pin for this dependency in `upstream/main`, when it exists there. */
+  upstreamPin?: string;
+  /**
+   * The most recent `upstream/main` merge resolved this dependency KEEP-OURS —
+   * it kept our pin over a different upstream one. That is a standing decision,
+   * so a bump past it must be raised explicitly rather than applied silently.
+   */
+  heldByMerge?: boolean;
+  /**
+   * This dependency is one half of a client/server pair with something running
+   * locally. Names the component that must move in the SAME change. Such pairs
+   * share a wire contract no type or unit test can see, so they can only be
+   * validated by calling the running service.
+   */
+  pairedWith?: string;
+}
+
+/**
+ * Dependencies that are one half of a client/server pair with a locally-running
+ * component. Keyed by package name; the value names what must move with it.
+ *
+ * Exists because #135 bumped @onecli-sh/sdk ^0.5.0 -> ^2.8.0 and took the whole
+ * fleet down for ~1h. Both majors export the same methods, only the HTTP path
+ * moved (/api -> /v1), so the build and the full test suite passed on the broken
+ * version — nothing but a live call could have caught it.
+ */
+export const LOCAL_SERVICE_PAIRS: Readonly<Record<string, string>> = {
+  '@onecli-sh/sdk':
+    'the OneCLI gateway container — 0.5.x calls /api/*, 2.x calls /v1/*. Upgrade the gateway in the same change and verify with a real call (e.g. getGatewaySkill()), not a build.',
+};
+
+/** Per-dependency policy derived from upstream and from merge history. */
+export interface UpstreamPolicy {
+  upstreamPin?: string;
+  keptOurs?: boolean;
+}
+
+function parseDependencyPins(manifestText: string | null): Record<string, string> {
+  if (!manifestText) return {};
+  try {
+    const parsed = JSON.parse(manifestText) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    return { ...parsed.dependencies, ...parsed.devDependencies };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Derive per-dependency upstream policy from manifest texts. Pure on purpose —
+ * the git plumbing lives in readUpstreamPolicy so this stays testable with
+ * fixtures.
+ *
+ * `keptOurs` is the load-bearing signal: at the merge commit M, the dependency
+ * resolved to OUR side (M matches M^1) while upstream's side (M^2) differed.
+ * That is a deliberate hold. #135 bumped @onecli-sh/sdk five hours after merge
+ * ceb3fcd1 had kept ^0.5.0 over upstream's 2.2.1, and nothing connected the two.
+ */
+export function deriveUpstreamPolicy(texts: {
+  upstream?: string | null;
+  mergeOurs?: string | null;
+  mergeTheirs?: string | null;
+  mergeResult?: string | null;
+}): Map<string, UpstreamPolicy> {
+  const upstream = parseDependencyPins(texts.upstream ?? null);
+  const ours = parseDependencyPins(texts.mergeOurs ?? null);
+  const theirs = parseDependencyPins(texts.mergeTheirs ?? null);
+  const result = parseDependencyPins(texts.mergeResult ?? null);
+
+  const policy = new Map<string, UpstreamPolicy>();
+  const names = new Set([...Object.keys(upstream), ...Object.keys(result)]);
+  for (const name of names) {
+    const entry: UpstreamPolicy = {};
+    if (upstream[name]) entry.upstreamPin = upstream[name];
+    // Only claim keep-ours when all three merge sides are known for this dep and
+    // the two sides genuinely disagreed. A merge with no conflict on this line
+    // carries no decision.
+    const haveMergeSides = result[name] !== undefined && ours[name] !== undefined && theirs[name] !== undefined;
+    if (haveMergeSides && ours[name] !== theirs[name] && result[name] === ours[name]) {
+      entry.keptOurs = true;
+    }
+    if (entry.upstreamPin !== undefined || entry.keptOurs) policy.set(name, entry);
+  }
+  return policy;
+}
+
+/**
+ * Read the manifest at several revisions and derive policy. Fails OPEN: any git
+ * problem (no upstream remote, shallow clone, never merged) yields an empty map
+ * so the audit still runs. A missing signal must not become a blocked audit.
+ */
+export async function readUpstreamPolicy(
+  repoRoot: string,
+  relativeManifest: string,
+): Promise<Map<string, UpstreamPolicy>> {
+  const show = async (rev: string): Promise<string | null> => {
+    try {
+      const { stdout } = await execFileAsync('git', ['show', `${rev}:${relativeManifest}`], {
+        cwd: repoRoot,
+        maxBuffer: 16 * 1024 * 1024,
+      });
+      return stdout;
+    } catch {
+      return null;
+    }
+  };
+
+  const mergeCommit = await execFileAsync(
+    'git',
+    ['log', '--merges', '-1', '--format=%H', '--grep=Merge remote-tracking branch .upstream/main'],
+    { cwd: repoRoot, maxBuffer: 1024 * 1024 },
+  )
+    .then(({ stdout }) => stdout.trim() || null)
+    .catch(() => null);
+
+  const [upstream, mergeOurs, mergeTheirs, mergeResult] = await Promise.all([
+    show('upstream/main'),
+    mergeCommit ? show(`${mergeCommit}^1`) : Promise.resolve(null),
+    mergeCommit ? show(`${mergeCommit}^2`) : Promise.resolve(null),
+    mergeCommit ? show(mergeCommit) : Promise.resolve(null),
+  ]);
+
+  return deriveUpstreamPolicy({ upstream, mergeOurs, mergeTheirs, mergeResult });
 }
 
 export interface ReleaseResolved {
@@ -285,9 +410,11 @@ async function auditDependencies(
     devDependencies?: Record<string, string>;
   };
   const dependencies = { ...packageJson.dependencies, ...packageJson.devDependencies };
+  const policy = await readUpstreamPolicy(repoRoot, relativePackageJson);
   return Promise.all(
     Object.entries(dependencies).map(async ([name, specifier]) => {
       const current = dependencyVersion(specifier);
+      const entry = policy.get(name);
       const base: Omit<AuditItem, 'latest' | 'status' | 'detail' | 'tag'> = {
         id: `${kind === 'host-dependency' ? 'host' : 'bun'}:${name}`,
         name,
@@ -295,6 +422,9 @@ async function auditDependencies(
         surface,
         current: current ?? specifier,
         source: 'npm',
+        ...(entry?.upstreamPin ? { upstreamPin: entry.upstreamPin } : {}),
+        ...(entry?.keptOurs ? { heldByMerge: true } : {}),
+        ...(LOCAL_SERVICE_PAIRS[name] ? { pairedWith: LOCAL_SERVICE_PAIRS[name] } : {}),
       };
       if (!current) return { ...base, latest: null, status: 'blocked', detail: `unsupported specifier: ${specifier}` };
       const result = await audited(name, () => resolveSource({ kind: 'npm', package: name }, fetchJson));
@@ -521,6 +651,36 @@ export function renderAuditMarkdown(items: AuditItem[]): string {
   const blocked = items.filter((item) => item.status === 'blocked' || item.status === 'unknown');
   lines.push('', `${actionable.length} outdated; ${blocked.length} blocked or unknown.`);
   for (const item of blocked) lines.push(`- ${item.id}: ${item.detail ?? item.status}`);
+
+  // Constraints that must be READ, not inferred. These exist because #135 passed
+  // every gate — build green, tests green, identical method names — and still
+  // took the fleet down. Surface them next to the versions so an approval can't
+  // be given without seeing them.
+  const held = actionable.filter((item) => item.heldByMerge);
+  if (held.length > 0) {
+    lines.push('', '**HELD by the last upstream merge — do not bump without raising it explicitly:**');
+    for (const item of held) {
+      lines.push(
+        `- ${item.id}: merge kept ours (\`${item.current}\`)${
+          item.upstreamPin ? ` over upstream \`${item.upstreamPin}\`` : ''
+        }. That is a standing decision; ask before superseding it.`,
+      );
+    }
+  }
+
+  const drifted = actionable.filter(
+    (item) => item.upstreamPin && item.upstreamPin !== item.current && !item.heldByMerge,
+  );
+  if (drifted.length > 0) {
+    lines.push('', '**Upstream pins differ from ours** (upstream parity is usually the safer target than latest):');
+    for (const item of drifted) lines.push(`- ${item.id}: ours \`${item.current}\`, upstream \`${item.upstreamPin}\``);
+  }
+
+  const paired = actionable.filter((item) => item.pairedWith);
+  if (paired.length > 0) {
+    lines.push('', '**Client/server pairs — CANNOT be validated by building. Approve or skip as one unit:**');
+    for (const item of paired) lines.push(`- ${item.id}: moves with ${item.pairedWith}`);
+  }
   return lines.join('\n');
 }
 

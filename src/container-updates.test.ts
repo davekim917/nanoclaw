@@ -14,6 +14,8 @@ import {
   latestStableNpmVersion,
   latestStablePyPiVersion,
   renderAuditMarkdown,
+  deriveUpstreamPolicy,
+  LOCAL_SERVICE_PAIRS,
   type AuditItem,
 } from './container-updates.js';
 
@@ -356,5 +358,110 @@ describe('plugin version surface', () => {
     await expect(applySelectedUpdates({ repoRoot: root, items, selectedIds: [`plugin:${entry!.id}`] })).rejects.toThrow(
       /git pull/,
     );
+  });
+});
+
+describe('upstream policy — the gates that #135 slipped past', () => {
+  const manifest = (deps: Record<string, string>): string => JSON.stringify({ dependencies: deps });
+
+  it('flags a dependency the last upstream merge resolved KEEP-OURS', () => {
+    // The real shape of merge ceb3fcd1: ours ^0.5.0, upstream 2.2.1, result ^0.5.0.
+    const policy = deriveUpstreamPolicy({
+      upstream: manifest({ '@onecli-sh/sdk': '2.2.1' }),
+      mergeOurs: manifest({ '@onecli-sh/sdk': '^0.5.0' }),
+      mergeTheirs: manifest({ '@onecli-sh/sdk': '2.2.1' }),
+      mergeResult: manifest({ '@onecli-sh/sdk': '^0.5.0' }),
+    });
+    expect(policy.get('@onecli-sh/sdk')).toEqual({ upstreamPin: '2.2.1', keptOurs: true });
+  });
+
+  it('does NOT claim keep-ours when the merge adopted upstream', () => {
+    const policy = deriveUpstreamPolicy({
+      upstream: manifest({ chalk: '5.4.0' }),
+      mergeOurs: manifest({ chalk: '5.3.0' }),
+      mergeTheirs: manifest({ chalk: '5.4.0' }),
+      mergeResult: manifest({ chalk: '5.4.0' }),
+    });
+    expect(policy.get('chalk')?.keptOurs).toBeUndefined();
+    expect(policy.get('chalk')?.upstreamPin).toBe('5.4.0');
+  });
+
+  it('does NOT claim keep-ours when both sides already agreed (no decision was made)', () => {
+    const policy = deriveUpstreamPolicy({
+      upstream: manifest({ zod: '3.24.1' }),
+      mergeOurs: manifest({ zod: '3.24.1' }),
+      mergeTheirs: manifest({ zod: '3.24.1' }),
+      mergeResult: manifest({ zod: '3.24.1' }),
+    });
+    expect(policy.get('zod')?.keptOurs).toBeUndefined();
+  });
+
+  it('reports an upstream pin even when no merge history is available', () => {
+    const policy = deriveUpstreamPolicy({ upstream: manifest({ undici: '6.24.1' }) });
+    expect(policy.get('undici')).toEqual({ upstreamPin: '6.24.1' });
+  });
+
+  it('fails open on unreadable or absent manifests instead of throwing', () => {
+    expect(deriveUpstreamPolicy({ upstream: 'not json', mergeResult: null }).size).toBe(0);
+    expect(deriveUpstreamPolicy({}).size).toBe(0);
+  });
+
+  it('covers devDependencies, not just dependencies', () => {
+    const policy = deriveUpstreamPolicy({
+      upstream: JSON.stringify({ devDependencies: { vitest: '4.1.0' } }),
+    });
+    expect(policy.get('vitest')?.upstreamPin).toBe('4.1.0');
+  });
+
+  it('declares the OneCLI SDK as paired with a local service', () => {
+    expect(LOCAL_SERVICE_PAIRS['@onecli-sh/sdk']).toMatch(/gateway/i);
+  });
+});
+
+describe('audit rendering surfaces the constraints', () => {
+  const item = (over: Partial<AuditItem>): AuditItem => ({
+    id: 'host:pkg',
+    name: 'pkg',
+    kind: 'host-dependency',
+    surface: 'host',
+    current: '1.0.0',
+    latest: '2.0.0',
+    status: 'outdated',
+    source: 'npm',
+    ...over,
+  });
+
+  it('renders a HELD warning naming both pins', () => {
+    const md = renderAuditMarkdown([
+      item({
+        id: 'host:@onecli-sh/sdk',
+        name: '@onecli-sh/sdk',
+        current: '^0.5.0',
+        upstreamPin: '2.2.1',
+        heldByMerge: true,
+      }),
+    ]);
+    expect(md).toContain('HELD by the last upstream merge');
+    expect(md).toContain('^0.5.0');
+    expect(md).toContain('2.2.1');
+  });
+
+  it('reports upstream drift separately from held items', () => {
+    const md = renderAuditMarkdown([item({ upstreamPin: '1.5.0' })]);
+    expect(md).toContain('Upstream pins differ');
+    expect(md).toContain('upstream `1.5.0`');
+    expect(md).not.toContain('HELD by the last upstream merge');
+  });
+
+  it('warns that client/server pairs cannot be validated by building', () => {
+    const md = renderAuditMarkdown([item({ pairedWith: 'the OneCLI gateway container' })]);
+    expect(md).toContain('CANNOT be validated by building');
+  });
+
+  it('stays quiet when an outdated item carries no constraints', () => {
+    const md = renderAuditMarkdown([item({})]);
+    expect(md).not.toContain('HELD by');
+    expect(md).not.toContain('Upstream pins differ');
+    expect(md).not.toContain('CANNOT be validated');
   });
 });
