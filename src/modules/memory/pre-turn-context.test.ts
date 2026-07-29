@@ -40,7 +40,14 @@ vi.mock('../../message-archive.js', async (importOriginal) => {
   };
 });
 
-import { buildPreTurnContext, evaluateRecallCorpus, PRE_TURN_BOUNDS, type RecallCorpus } from './pre-turn-context.js';
+import {
+  boundedCapabilities,
+  buildPreTurnContext,
+  evaluateRecallCorpus,
+  PRE_TURN_BOUNDS,
+  type ContextNotice,
+  type RecallCorpus,
+} from './pre-turn-context.js';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
 
@@ -213,6 +220,36 @@ describe('bounded authoritative pre-turn retrieval', () => {
       threadId: 'discord:guild:channel:thread',
     });
     expect(result.conversationEvidence.excerpts[0]?.text).toContain('Wix');
+  });
+
+  it('caps the capability block so it cannot evict conversation and memory recall', () => {
+    // enforceFinalBound spends the shared `finalChars` budget in the order
+    // conversation excerpts -> memory excerpts -> halve memory core ->
+    // capability services. Capabilities are sacrificed LAST, so without a
+    // budget of their own they silently starve recall: the agent is asked
+    // "what did we decide last week", has zero archive and zero memory
+    // excerpts, and answers "I don't have context on that" for a question the
+    // archive answers. Only an internal notice records the loss.
+    const notices: ContextNotice[] = [];
+    const bounded = boundedCapabilities(
+      {
+        agentGroupId: 'ag-a',
+        services: Array.from({ length: 20 }, (_, i) => ({
+          name: `Service ${i}`,
+          declaredTools: [],
+          scopes: [],
+          credentialPaths: [],
+          useFor: 'x'.repeat(PRE_TURN_BOUNDS.capabilityDetailChars),
+        })),
+      },
+      notices,
+    );
+
+    // 20 x 2500 is ~50k unbounded — four times the entire final context budget.
+    const capChars = JSON.stringify(bounded.services).length;
+    expect(capChars).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityTotalChars);
+    expect(bounded.services.length).toBeLessThan(20);
+    expect(notices.some((n) => n.code === 'capability-total-budget')).toBe(true);
   });
 
   it('test_core_imports_conflicts_and_truncation_are_explicit', () => {

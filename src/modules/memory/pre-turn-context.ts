@@ -24,7 +24,27 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   exactLinkCandidates: 32,
   exactLinkExcerpts: 8,
   capabilityServices: 32,
-  capabilityDetailChars: 600,
+  // Capability text is authored in-tree (capabilities.ts), not user input, and
+  // its whole job is to stop the agent denying an ability it has. At 600 this
+  // amputated exactly the part that does that work: the Slack entry's "never
+  // tell the owner you can't read a thread without trying X" bottom line, and
+  // GitHub's CI verbs, both sat past the cut. Six entries were over 600 —
+  // Slack, GitHub, Wix, Cloudflare, SELECT, Hex. 2500 clears the largest with
+  // headroom, so a kept entry is never clipped mid-sentence.
+  capabilityDetailChars: 2500,
+  // Total budget for the capability block, enforced in boundedCapabilities.
+  //
+  // Load-bearing: `finalChars` below is a budget for the ENTIRE serialized
+  // context, and enforceFinalBound evicts in the order conversation excerpts →
+  // memory excerpts → halve memory core → capability services. Capabilities are
+  // therefore the LAST thing sacrificed, so a per-field cap alone lets them
+  // silently consume the whole budget and starve recall: raising the per-field
+  // cap to 2500 with no total pushed a widely-wired owner-safe group's block to
+  // ~11.2k of the 12k budget, leaving the agent with zero archive recall and
+  // zero workgroup-memory excerpts and only an internal notice as evidence.
+  // 8000 keeps the block at roughly its historical footprint (~7.4k measured at
+  // the old 600 cap) while leaving room for recall.
+  capabilityTotalChars: 8_000,
   finalChars: 12_000,
   exactLinkFinalChars: 16_000,
 });
@@ -777,7 +797,11 @@ function archiveExcerpt(row: ArchiveEvidenceRow, score: number, passageText?: st
   };
 }
 
-function boundedCapabilities(snapshot: SessionServicesSnapshot, notices: ContextNotice[]): SessionServicesSnapshot {
+/** Exported for direct test of the total-block budget — see pre-turn-context.test.ts. */
+export function boundedCapabilities(
+  snapshot: SessionServicesSnapshot,
+  notices: ContextNotice[],
+): SessionServicesSnapshot {
   const selected = snapshot.services.slice(0, PRE_TURN_BOUNDS.capabilityServices).map((service) => ({
     ...service,
     name: boundedText(service.name, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
@@ -813,6 +837,25 @@ function boundedCapabilities(snapshot: SessionServicesSnapshot, notices: Context
       status: 'truncated',
       code: 'capability-service-limit',
       detail: `selected ${selected.length} of ${snapshot.services.length} services`,
+    });
+  }
+  // Total-block budget. Drops whole services from the end rather than clipping
+  // a kept one, because boundedText cuts from the END and the operative
+  // sentence of every capability entry ("never tell the owner you can't X
+  // without first trying Y") is written last — clipping would remove exactly
+  // the guidance the entry exists to deliver. Enforced here so capabilities can
+  // never reach enforceFinalBound large enough to evict conversation and memory
+  // recall, which that function sacrifices first.
+  const droppedForBudget: string[] = [];
+  while (selected.length > 0 && JSON.stringify(selected).length > PRE_TURN_BOUNDS.capabilityTotalChars) {
+    droppedForBudget.push(selected.pop()!.name);
+  }
+  if (droppedForBudget.length > 0) {
+    notices.push({
+      source: 'capabilities',
+      status: 'truncated',
+      code: 'capability-total-budget',
+      detail: `dropped ${droppedForBudget.length} service(s) over ${PRE_TURN_BOUNDS.capabilityTotalChars} chars: ${droppedForBudget.join(', ')}`,
     });
   }
   return { agentGroupId: snapshot.agentGroupId, services: selected };

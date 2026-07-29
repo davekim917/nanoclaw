@@ -18,6 +18,7 @@ import { buildSessionServicesSnapshot, getHostCapabilities, renderSessionCapabil
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { writeContainerConfig } from './container-config.js';
 import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
+import { PRE_TURN_BOUNDS } from './modules/memory/pre-turn-context.js';
 import type { AgentGroup } from './types.js';
 
 function group(id: string, folder: string): AgentGroup {
@@ -54,6 +55,12 @@ beforeEach(() => {
 afterEach(() => {
   closeDb();
   fs.rmSync(dirs.TEST_ROOT, { recursive: true, force: true });
+  // vitest.config.ts sets no `unstubEnvs`, so it defaults to false and
+  // vi.stubEnv survives the test — leaking into later tests in this file and,
+  // since process.env is per worker process, into later files in the same
+  // worker. The GitHub capability gate keys off GITHUB_TOKEN, so a leaked stub
+  // silently flips other tests into a token-present configuration.
+  vi.unstubAllEnvs();
 });
 
 describe('buildSessionServicesSnapshot', () => {
@@ -151,6 +158,55 @@ describe('buildSessionServicesSnapshot', () => {
     const rendered = renderSessionCapabilities(snapshot);
     expect(rendered).toContain('**Cloudflare**');
     expect(rendered).toContain('MCP `mcp__cloudflare-api__*`');
+  });
+
+  it('keeps every authored capability detail inside the pre-turn truncation bound', () => {
+    // boundedCapabilities clips `useFor`/`activation` at
+    // PRE_TURN_BOUNDS.capabilityDetailChars, and it clips from the END. These
+    // strings exist to stop the agent denying an ability it has, and the
+    // operative sentence — "never tell the owner you can't X without first
+    // trying Y" — is written last, so silent truncation removes exactly the
+    // part that does the work. Fail here instead: tighten the prose or raise
+    // the bound deliberately.
+    //
+    // Exercised through an OWNER-SAFE session, not a bare group-level snapshot.
+    // Without a messaging group `sessionKnown` is false, which routes Slack to
+    // a short "withheld in this snapshot" string and skips the long
+    // file-attachment prose entirely — the branch most at risk would never be
+    // measured, and the guard would pass while the real string overflowed.
+    insertWorkgroup('example-retail', [
+      'Slack-User-Token-ExampleRetail',
+      'Cloudflare-ExampleRetail',
+      'Wix-ExampleRetail',
+    ]);
+    const ag = group('ag-wide', 'example-retail-wide');
+    createGroupInWorkgroup(ag, 'example-retail');
+    const OWNER_SAFE_MG = 'mg-owner-dm';
+    writeContainerConfig(ag.folder, {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      tools: [],
+      slack_user_token: { enabled: true, also_allowed_in: [OWNER_SAFE_MG] },
+    } as Parameters<typeof writeContainerConfig>[1]);
+    vi.stubEnv('GITHUB_TOKEN', 'dummy');
+
+    const snapshot = buildSessionServicesSnapshot(ag.id, OWNER_SAFE_MG);
+    expect(snapshot.services.length).toBeGreaterThan(0);
+
+    // Guard the guard: prove we actually took the owner-safe branch, so this
+    // test can never silently regress into measuring the short string again.
+    const slack = snapshot.services.find((s) => s.name === 'Slack (read)');
+    expect(slack?.useFor).toContain('FILE ATTACHMENTS');
+
+    const oversized = snapshot.services.flatMap((s) =>
+      (['useFor', 'activation'] as const)
+        .filter((f) => (s[f]?.length ?? 0) > PRE_TURN_BOUNDS.capabilityDetailChars)
+        .map((f) => `${s.name}.${f}=${s[f]?.length}`),
+    );
+    expect(oversized).toEqual([]);
+    expect(snapshot.services.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityServices);
   });
 
   it('does not surface Cloudflare unless both its secret and MCP server are wired', () => {
