@@ -252,8 +252,8 @@ describe('memory curator worker', () => {
 
     expect(report?.action).toBe('replace_generated_memory');
     // Offered before the first attempt, not only after a rejection.
-    expect(curate.mock.calls[0]?.[0]).toContain('split it into several candidates');
-    expect(curate.mock.calls[1]?.[0]).toContain('split it into several candidates');
+    expect(curate.mock.calls[0]?.[0]).toContain('Split it only when it is genuinely more than one fact');
+    expect(curate.mock.calls[1]?.[0]).toContain('Split it only when it is genuinely more than one fact');
     const written = (d.writeGenerated as ReturnType<typeof vi.fn>).mock.calls[0]![1] as string;
     expect(written).toContain('First half of the decision.');
     expect(written).toContain('Second half of the decision.');

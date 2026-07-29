@@ -336,7 +336,7 @@ const REPAIRABLE_VIOLATIONS = new Map<string, string>([
     // 24h backoff, which is how the old 1,000-char limit produced hundreds of
     // failures at a dozen attempts each. Splitting is the way out, and the
     // schema already allows up to CURATOR_MAX_NEW_MEMORIES candidates.
-    `Every memory candidate text must be at most ${CURATOR_MAX_MEMORY_TEXT_CHARS} characters while remaining self-contained. If one fact cannot fit, split it into several candidates that each stand alone with their own evidence ids, rather than compressing it past the point of being understandable. Do not omit a durable fact merely to satisfy this correction.`,
+    `Every memory candidate text must be at most ${CURATOR_MAX_MEMORY_TEXT_CHARS} characters while remaining self-contained. First tighten the wording. Split only when the candidate is genuinely more than one fact, so each part stands alone with its own evidence ids and is still true read on its own — never chop a single fact whose parts only make sense together. Do not compress past the point of being understandable, and do not omit a durable fact merely to satisfy this correction.`,
   ],
   [
     'curator replacement needs a capture reason code',
