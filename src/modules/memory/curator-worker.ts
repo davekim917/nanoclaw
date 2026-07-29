@@ -330,7 +330,13 @@ interface SuccessfulModelAttempt<T> {
 const REPAIRABLE_VIOLATIONS = new Map<string, string>([
   [
     'curator memory text exceeds the maximum',
-    `Every memory candidate text must be at most ${CURATOR_MAX_MEMORY_TEXT_CHARS} characters while remaining self-contained. Do not omit a durable fact merely to satisfy this correction.`,
+    // "Shorten it but lose nothing" is not always satisfiable in one fact, and
+    // the retry after this one starts from a clean prompt with no memory of the
+    // failure — so a candidate that cannot be compressed loops until it hits the
+    // 24h backoff, which is how the old 1,000-char limit produced hundreds of
+    // failures at a dozen attempts each. Splitting is the way out, and the
+    // schema already allows up to CURATOR_MAX_NEW_MEMORIES candidates.
+    `Every memory candidate text must be at most ${CURATOR_MAX_MEMORY_TEXT_CHARS} characters while remaining self-contained. If one fact cannot fit, split it into several candidates that each stand alone with their own evidence ids, rather than compressing it past the point of being understandable. Do not omit a durable fact merely to satisfy this correction.`,
   ],
   [
     'curator replacement needs a capture reason code',

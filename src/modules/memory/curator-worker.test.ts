@@ -216,6 +216,50 @@ describe('memory curator worker', () => {
     expect(d.fail).not.toHaveBeenCalled();
   });
 
+  it('offers splitting as the way out of an unshortenable fact, in the prompt and the repair', async () => {
+    // The retry after a failed repair starts from a clean prompt with no memory
+    // of the failure, so "shorten it but lose nothing" with no third option is
+    // how a stubborn candidate loops to the 24h backoff.
+    const curate = vi
+      .fn()
+      .mockResolvedValueOnce({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'x'.repeat(CURATOR_MAX_MEMORY_TEXT_CHARS + 1), evidenceIds: ['msg-1'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 400, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      } satisfies CuratorBackendResult)
+      .mockResolvedValueOnce({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [
+            { text: 'First half of the decision.', evidenceIds: ['msg-1'] },
+            { text: 'Second half of the decision.', evidenceIds: ['msg-1'] },
+          ],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 40, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      } satisfies CuratorBackendResult);
+    const d = deps({ curate });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+
+    expect(report?.action).toBe('replace_generated_memory');
+    // Offered before the first attempt, not only after a rejection.
+    expect(curate.mock.calls[0]?.[0]).toContain('split it into several candidates');
+    expect(curate.mock.calls[1]?.[0]).toContain('split it into several candidates');
+    const written = (d.writeGenerated as ReturnType<typeof vi.fn>).mock.calls[0]![1] as string;
+    expect(written).toContain('First half of the decision.');
+    expect(written).toContain('Second half of the decision.');
+    expect(d.fail).not.toHaveBeenCalled();
+  });
+
   it('retains the episode when the single length-repair attempt is still invalid', async () => {
     const curate = vi.fn(
       async (): Promise<CuratorBackendResult> => ({
