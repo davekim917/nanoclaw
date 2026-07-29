@@ -20,8 +20,12 @@ Nice=10
 CPUWeight=10
 IOWeight=10
 OOMScoreAdjust=500
-MemoryHigh=1536M
-MemoryMax=3072M
+# The hot set is the active workgroup graph plus the shared enrichment DB
+# (~4G today). Below that, the cgroup cannot cache enough of the SQLite files,
+# so the kernel swaps the daemon's anonymous pages and the control-socket
+# thread stalls in D-state — every graphify query then misses its 30s deadline.
+MemoryHigh=4G
+MemoryMax=6G
 
 Environment=HOME=/home/ubuntu
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin

@@ -162,6 +162,82 @@ describe('EnrichmentRepository', () => {
     repo.close();
   });
 
+  it('does not settle a row that changed under the running batch', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-cas-'));
+    roots.push(root);
+    const repo = new EnrichmentRepository(join(root, 'queue.db'));
+    const enqueue = (contentHash: string): void =>
+      repo.enqueue([
+        {
+          source: { id: 's', workgroupId: 'wg', kind: 'document', relativePath: 'a.md', contentHash },
+          segments: ['a'],
+          priority: 1,
+        },
+      ]);
+
+    enqueue('h1');
+    expect(repo.claimBatch()).toHaveLength(1);
+    // The source changes mid-batch: enqueue resets the row to fresh pending work.
+    enqueue('h2');
+
+    // Settling the *old* claim must not touch the new version.
+    repo.complete([{ sourceId: 's', contentHash: 'h1' }]);
+    expect(repo.counts('wg')).toMatchObject({ pending: 1 });
+    const reclaimed = repo.claimBatch();
+    expect(reclaimed).toHaveLength(1);
+    expect(reclaimed[0]!.source.contentHash).toBe('h2');
+
+    // Same for the failure and preemption paths.
+    repo.retry([{ sourceId: 's', contentHash: 'h1' }], 'stale');
+    expect(repo.counts('wg')).toMatchObject({ running: 1, failed: 0 });
+    repo.defer([{ sourceId: 's', contentHash: 'h1' }]);
+    expect(repo.counts('wg')).toMatchObject({ running: 1 });
+
+    repo.complete([{ sourceId: 's', contentHash: 'h2' }]);
+    expect(repo.counts('wg')).toMatchObject({ pending: 0, running: 0, failed: 0 });
+    repo.close();
+  });
+
+  it('keeps terminal failures visible outside the pending count', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-failed-counts-'));
+    roots.push(root);
+    const repo = new EnrichmentRepository(join(root, 'queue.db'));
+    repo.enqueue([
+      {
+        source: { id: 's', workgroupId: 'wg', kind: 'document', relativePath: 'a.md', contentHash: 'h' },
+        segments: ['a'],
+        priority: 1,
+      },
+    ]);
+    const claim = [{ sourceId: 's', contentHash: 'h' }];
+    for (let attempt = 0; attempt < 5; attempt += 1) repo.retry(claim, 'boom');
+
+    expect(repo.pending('wg')).toBe(0);
+    expect(repo.counts('wg')).toEqual({ pending: 0, running: 0, failed: 1 });
+    repo.close();
+  });
+
+  it('prunes queue rows for workgroups that no longer exist', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-orphan-'));
+    roots.push(root);
+    const repo = new EnrichmentRepository(join(root, 'queue.db'));
+    for (const workgroupId of ['live', 'deleted'])
+      repo.enqueue([
+        {
+          source: { id: `s-${workgroupId}`, workgroupId, kind: 'document', relativePath: 'a.md', contentHash: 'h' },
+          segments: ['a'],
+          priority: 1,
+        },
+      ]);
+
+    expect(repo.pruneOrphanWorkgroups(['live'])).toBe(1);
+    expect(repo.counts('deleted')).toEqual({ pending: 0, running: 0, failed: 0 });
+    expect(repo.counts('live')).toMatchObject({ pending: 1 });
+    // Idempotent, and a catalog that still lists the workgroup removes nothing.
+    expect(repo.pruneOrphanWorkgroups(['live'])).toBe(0);
+    repo.close();
+  });
+
   it('retries transient semantic failures with bounded backoff', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
@@ -176,7 +252,7 @@ describe('EnrichmentRepository', () => {
       },
     ]);
     expect(repo.claimBatch()).toHaveLength(1);
-    repo.retry(['s'], 'transient');
+    repo.retry([{ sourceId: 's', contentHash: 'h' }], 'transient');
     expect(repo.claimBatch()).toHaveLength(0);
     vi.advanceTimersByTime(5_001);
     expect(repo.claimBatch()).toHaveLength(1);
@@ -199,7 +275,7 @@ describe('EnrichmentRepository', () => {
     ]);
     for (let attempt = 0; attempt < 10; attempt += 1) {
       expect(repo.claimBatch()).toHaveLength(1);
-      repo.defer(['s']);
+      repo.defer([{ sourceId: 's', contentHash: 'h' }]);
       vi.advanceTimersByTime(5_001);
     }
     expect(repo.claimBatch()).toHaveLength(1);

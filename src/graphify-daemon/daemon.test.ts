@@ -190,6 +190,65 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
+  it('drains a quiet workgroup while a sibling is dirty or queued behind the lane', async () => {
+    const f = fixture();
+    // A second workgroup that will stay permanently busy.
+    const central = new Database(f.central);
+    central.exec(`
+      INSERT INTO workgroups VALUES ('sibling');
+      INSERT INTO agent_groups VALUES ('ag-b', 'sibling-agent', 'sibling');
+    `);
+    central.close();
+    mkdirSync(join(f.groups, 'sibling-agent'));
+    writeFileSync(join(f.groups, 'sibling-agent', 'busy.md'), 'sibling knowledge');
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'quiet workgroup knowledge');
+
+    const semanticBackend = {
+      extract: vi.fn(async () => ({ nodes: [], edges: [], hyperedges: [] })),
+      extractBatch: vi.fn(
+        async (items: Array<{ source: SourceInput }>) =>
+          new Map(
+            items.map(({ source }) => [source.id, { nodes: [], edges: [], hyperedges: [] } satisfies ExtractionBundle]),
+          ),
+      ),
+    };
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      semanticBackend,
+      backgroundRunner: immediateRunner() as never,
+      semanticMinIntervalMs: 0,
+      semanticPumpDelayMs: 0,
+    });
+    await daemon.refreshCatalog();
+
+    // Pin the sibling into each state that used to veto the whole fleet. Before
+    // this fix the gate was `some(...)` across every workgroup, so one busy
+    // sibling starved every other queue indefinitely.
+    const states = (daemon as unknown as { states: Map<string, Record<string, unknown>> }).states;
+    const sibling = states.get('sibling')!;
+
+    for (const busy of ['dirty', 'archiveDirty', 'backgroundQueued'] as const) {
+      sibling.dirty = false;
+      sibling.archiveDirty = false;
+      sibling.backgroundQueued = false;
+      sibling[busy] = true;
+
+      writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), `quiet workgroup knowledge ${busy}`);
+      await daemon.ensureFresh('madison');
+      // Real reconcile + enrich per iteration; leave headroom for the full suite
+      // running in parallel, matching the other reconciliation waits in this file.
+      await waitUntil(() => daemon.status('madison').freshness.pendingEnrichment === 0, 5_000);
+
+      expect(daemon.status('madison').freshness.pendingEnrichment).toBe(0);
+      expect(daemon.status('madison').freshness.enrichmentEligible).toBe(true);
+      expect(daemon.status('sibling').freshness.enrichmentEligible).toBe(false);
+    }
+
+    await daemon.close();
+  });
+
   it('removes semantic queue and cache state when an indexed source is deleted', async () => {
     const f = fixture();
     const root = join(f.groups, 'madison-agent');

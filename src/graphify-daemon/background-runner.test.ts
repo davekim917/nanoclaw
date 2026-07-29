@@ -55,6 +55,73 @@ describe('BackgroundGraphRunner shutdown', () => {
     await runner.stop();
   });
 
+  it('preempts enrichment that arrives while the pressure probe is still pending', async () => {
+    let releasePressure!: () => void;
+    const pressureGate = new Promise<void>((resolve) => {
+      releasePressure = resolve;
+    });
+    let probing!: () => void;
+    const probeStarted = new Promise<void>((resolve) => {
+      probing = resolve;
+    });
+    const runner = new BackgroundGraphRunner({
+      sessionsRoot: '/nonexistent',
+      freeMemory: () => 10_000_000_000,
+      pollMs: 10,
+      pressure: async () => {
+        probing();
+        await pressureGate;
+        return false;
+      },
+    });
+    const order: string[] = [];
+
+    const enrichment = runner.run(async () => {
+      order.push('enrichment-body');
+    });
+    // The enrichment job is inside execute(), awaiting the pressure probe. Its
+    // abort controller must already be registered, or the freshness job below
+    // has nothing to preempt and waits behind the batch it should have cut off.
+    await probeStarted;
+    const freshness = runner.run(
+      async () => {
+        order.push('freshness');
+      },
+      { priority: 'freshness', preemptActive: false },
+    );
+    releasePressure();
+
+    expect((await enrichment).status).toBe('preempted');
+    expect((await freshness).status).toBe('completed');
+    expect(order).toEqual(['freshness']);
+    await runner.stop();
+  });
+
+  it('settles the job when the pressure probe itself rejects', async () => {
+    const runner = new BackgroundGraphRunner({
+      sessionsRoot: '/nonexistent',
+      freeMemory: () => 10_000_000_000,
+      pollMs: 10,
+      pressure: async () => {
+        throw new Error('pressure scanner exited 1');
+      },
+    });
+    let ran = false;
+
+    // A rejecting probe used to escape execute(), so drain() threw after already
+    // shifting the job off its queue and the run() promise never settled — the
+    // semantic pump would then be latched forever.
+    const first = await runner.run(async () => {
+      ran = true;
+    });
+    expect(first.status).toBe('preempted');
+    expect(ran).toBe(false);
+
+    // The lane must still be usable afterwards.
+    expect((await runner.run(async () => 'ok')).status).toBe('preempted');
+    await runner.stop();
+  });
+
   it('does not destroy an admitted non-preemptible job when pressure rises', async () => {
     let pressure = false;
     let release!: () => void;

@@ -28,7 +28,12 @@ import { ArchiveConversationReader, type ConversationGraphSource } from './archi
 import { BackgroundGraphRunner, type BackgroundResult } from './background-runner.js';
 import { CodexSemanticBackend } from './codex-backend.js';
 import { GraphifyCodeWorker, type BinaryPreprocessResult, type CodeWorkerSource } from './code-worker.js';
-import { EnrichmentRepository, type PersistedEnrichment, type SemanticQueueItem } from './enrichment-cache.js';
+import {
+  EnrichmentRepository,
+  type PersistedEnrichment,
+  type SemanticQueueClaim,
+  type SemanticQueueItem,
+} from './enrichment-cache.js';
 import { runIsolatedReconcile, type IsolatedReconcileResult } from './isolated-reconcile.js';
 import { runIsolatedSourceReconcile } from './isolated-source-reconcile.js';
 import { IsolatedGraphifyWatchers } from './isolated-watchers.js';
@@ -79,6 +84,8 @@ interface WorkgroupState {
   pendingFilesystemChanges: Map<string, GraphifyFilesystemChange>;
   fullScanRequired: boolean;
   fullScanVersion: number;
+  /** Sticky: a watcher hit ENOSPC, so filesystem coverage is incomplete. */
+  watcherDegraded?: boolean;
 }
 
 interface BackgroundRunnerLike {
@@ -457,9 +464,17 @@ export class WorkgroupGraphDaemon {
           this.markFilesystemChanges(workgroupId, changes, fullScan);
         },
         onError: (workgroupId, error) => {
-          if (workgroupId && this.states.has(workgroupId))
-            this.requireState(workgroupId).lastFailure = `filesystem watcher: ${error}`;
-          else for (const state of this.states.values()) state.lastFailure = `filesystem watcher: ${error}`;
+          const degraded = String(error).includes('ENOSPC');
+          const mark = (state: WorkgroupState): void => {
+            state.lastFailure = `filesystem watcher: ${error}`;
+            // A watch that never registered means change events for those paths
+            // are simply never delivered. `lastFailure` is cleared by the next
+            // successful reconcile, so without a sticky flag the daemon forgets
+            // it is half-blind and keeps serving stale reads as fresh.
+            if (degraded) state.watcherDegraded = true;
+          };
+          if (workgroupId && this.states.has(workgroupId)) mark(this.requireState(workgroupId));
+          else for (const state of this.states.values()) mark(state);
         },
       });
     }
@@ -562,6 +577,12 @@ export class WorkgroupGraphDaemon {
 
   async start(): Promise<void> {
     const descriptors = await this.refreshCatalog();
+    // Queue rows are only ever claimed for workgroups that have a live state,
+    // so rows belonging to a deleted workgroup can never be processed — they
+    // just inflate the backlog and the database forever. Guarded on a non-empty
+    // catalog so a transient empty read can't wipe every queue.
+    if (descriptors.length > 0)
+      this.enrichmentRepository.pruneOrphanWorkgroups(descriptors.map((descriptor) => descriptor.id));
     for (const descriptor of descriptors) {
       const state = this.requireState(descriptor.id);
       const completedAt = this.readExistingLastCompletedAt(descriptor.id);
@@ -908,6 +929,7 @@ export class WorkgroupGraphDaemon {
   }
 
   private withFreshness(state: WorkgroupState, status: WorkgroupGraphStatus): DaemonWorkgroupStatus {
+    const queue = this.enrichmentRepository.counts(state.descriptor.id);
     return {
       ...status,
       freshness: {
@@ -918,7 +940,12 @@ export class WorkgroupGraphDaemon {
         lagMs: state.lastCompletedAt
           ? Math.max(0, Date.now() - Date.parse(state.lastCompletedAt))
           : Number.MAX_SAFE_INTEGER,
-        pendingEnrichment: state.pendingEnrichment + this.enrichmentRepository.pending(state.descriptor.id),
+        pendingEnrichment: state.pendingEnrichment + queue.pending + queue.running,
+        // Terminal failures leave the pending count entirely, so a queue that is
+        // quietly failing every item looked identical to one that drained.
+        failedEnrichment: queue.failed,
+        enrichmentEligible: this.isEnrichmentEligible(state.descriptor.id, state),
+        watcherDegraded: Boolean(state.watcherDegraded),
         lastFailure: state.lastFailure,
         paused: this.paused.has(state.descriptor.id),
       },
@@ -1757,41 +1784,59 @@ export class WorkgroupGraphDaemon {
       });
   }
 
+  private rearmSemanticPump(delayMs: number): void {
+    if (this.semanticWakeTimer) return;
+    this.semanticWakeTimer = setTimeout(() => {
+      this.semanticWakeTimer = undefined;
+      this.kickSemanticPump();
+    }, delayMs);
+    this.semanticWakeTimer.unref();
+  }
+
+  /**
+   * Deterministic freshness has priority over enrichment, but only for the
+   * workgroups that actually have freshness work pending. This used to be a
+   * fleet-wide veto: any single dirty/queued workgroup blocked every sibling's
+   * queue, and on a multi-workgroup install with live chat traffic the fleet
+   * was never simultaneously clean, so nothing ever drained. `backgroundQueued`
+   * still covers the original concern — a large workgroup waiting behind
+   * another owner of the serialized lane is ineligible on its own account.
+   */
+  private isEnrichmentEligible(workgroupId: string, state: WorkgroupState): boolean {
+    return (
+      !this.paused.has(workgroupId) &&
+      !state.dirty &&
+      !state.archiveDirty &&
+      !state.reconciling &&
+      !state.backgroundQueued &&
+      !state.fullReindexRequested
+    );
+  }
+
   private kickSemanticPump(): void {
     if (this.semanticPumpRunning || this.closing || !this.semantic) return;
-    // Deterministic freshness has priority over enrichment. In particular,
-    // do not let a queued large workgroup look idle merely because another
-    // workgroup currently owns the serialized background lane.
-    if (
-      [...this.states.values()].some(
-        (state) => state.dirty || state.archiveDirty || state.reconciling || state.backgroundQueued,
-      )
-    ) {
-      if (!this.semanticWakeTimer) {
-        this.semanticWakeTimer = setTimeout(() => {
-          this.semanticWakeTimer = undefined;
-          this.kickSemanticPump();
-        }, this.options.semanticPumpDelayMs ?? 5_000);
-        this.semanticWakeTimer.unref();
-      }
-      return;
-    }
     const wait = (this.options.semanticMinIntervalMs ?? 30_000) - (Date.now() - this.lastSemanticStartedAt);
     if (wait > 0) {
-      if (!this.semanticWakeTimer) {
-        this.semanticWakeTimer = setTimeout(() => {
-          this.semanticWakeTimer = undefined;
-          this.kickSemanticPump();
-        }, wait);
-        this.semanticWakeTimer.unref();
-      }
+      this.rearmSemanticPump(wait);
       return;
     }
     const active = [...this.states.entries()]
-      .filter(([id, state]) => !this.paused.has(id) && !state.reconciling)
+      .filter(([id, state]) => this.isEnrichmentEligible(id, state))
       .map(([id]) => id);
-    const batch = this.enrichmentRepository.claimBatch(25, 256 * 1024, active);
-    if (batch.length === 0) return;
+    const batch = active.length === 0 ? [] : this.enrichmentRepository.claimBatch(25, 256 * 1024, active);
+    if (batch.length === 0) {
+      // Nothing claimable right now (every workgroup busy, or the queue is
+      // empty). Keep waking so a workgroup going quiet resumes the drain.
+      this.rearmSemanticPump(this.options.semanticPumpDelayMs ?? 5_000);
+      return;
+    }
+    // Pin the exact row versions we claimed. The source can change under us
+    // mid-batch, which re-enqueues the row as fresh work; settling by id alone
+    // would then clobber that newer version.
+    const claims: SemanticQueueClaim[] = batch.map((item) => ({
+      sourceId: item.source.id,
+      contentHash: item.source.contentHash,
+    }));
     const epochs = new Map(
       batch.map((item) => [item.source.workgroupId, this.states.get(item.source.workgroupId)?.epoch ?? 0]),
     );
@@ -1890,15 +1935,14 @@ export class WorkgroupGraphDaemon {
             this.enrichmentRepository.put(item.entry);
           }
         }
-        this.enrichmentRepository.complete(batch.map((item) => item.source.id));
+        this.enrichmentRepository.complete(claims);
         return { appliedWorkgroups: [...workgroups.keys()] };
       })
       .then((result) => {
         this.semanticPumpRunning = false;
-        const ids = batch.map((item) => item.source.id);
         if (result.status === 'failed') {
           const message = result.error.message;
-          this.enrichmentRepository.retry(ids, message);
+          this.enrichmentRepository.retry(claims, message);
           for (const item of batch) {
             const state = this.states.get(item.source.workgroupId);
             if (state) state.lastFailure = `semantic enrichment: ${message}`;
@@ -1906,7 +1950,7 @@ export class WorkgroupGraphDaemon {
         } else if (result.status === 'preempted' || result.status === 'deferred') {
           // Interactive turns and freshness work are expected to win this
           // lane. Requeue without consuming the real failure retry budget.
-          this.enrichmentRepository.defer(ids, this.options.semanticPumpDelayMs ?? 5_000);
+          this.enrichmentRepository.defer(claims, this.options.semanticPumpDelayMs ?? 5_000);
         }
         if (!this.closing) {
           const timer = setTimeout(() => this.kickSemanticPump(), this.options.semanticPumpDelayMs ?? 5_000);
