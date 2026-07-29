@@ -295,11 +295,21 @@ export class BackgroundGraphRunner {
     options: BackgroundJobOptions,
   ): Promise<BackgroundResult<T>> {
     if (this.stopped) return { status: 'preempted' };
-    if (this.freeMemory() < this.minimumFreeBytes) return { status: 'deferred', reason: 'memory' };
-    if (await this.pressure()) return { status: 'preempted' };
-    if (this.stopped) return { status: 'preempted' };
+    // Register before the async pressure probe. `run()` only aborts jobs that
+    // are already in `this.active`, so a freshness job arriving while we awaited
+    // pressure used to find nothing to abort and would then wait behind the very
+    // enrichment batch it was supposed to preempt.
     const controller = new AbortController();
     this.active.set(controller, options);
+    let admitted = false;
+    try {
+      if (this.freeMemory() < this.minimumFreeBytes) return { status: 'deferred', reason: 'memory' };
+      if (await this.pressure()) return { status: 'preempted' };
+      if (this.stopped || controller.signal.aborted) return { status: 'preempted' };
+      admitted = true;
+    } finally {
+      if (!admitted) this.active.delete(controller);
+    }
     let preempted = false;
     let pressureScanRunning = false;
     const timer =

@@ -36,6 +36,12 @@ export interface FreshnessStatus {
   lastCompletedAt?: string;
   lagMs: number;
   pendingEnrichment: number;
+  /** Rows that exhausted their retry budget. Excluded from pendingEnrichment. */
+  failedEnrichment: number;
+  /** False while this workgroup yields the enrichment lane to freshness work. */
+  enrichmentEligible: boolean;
+  /** Sticky once a watcher hit ENOSPC: filesystem coverage is incomplete. */
+  watcherDegraded: boolean;
   lastFailure?: string;
   paused: boolean;
 }

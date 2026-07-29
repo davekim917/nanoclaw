@@ -324,8 +324,10 @@ describe('GraphifyCodeWorker', () => {
 describe('CodexSemanticBackend', () => {
   it('test_codex_semantic_backend_uses_luna_medium_then_terra_high', async () => {
     const calls: string[][] = [];
-    const processRun = vi.fn(async (_command: string, args: string[]) => {
+    const prompts: string[] = [];
+    const processRun = vi.fn(async (_command: string, args: string[], options?: { stdin?: string }) => {
       calls.push(args);
+      prompts.push(options?.stdin ?? '');
       const output = args[args.indexOf('--output-last-message') + 1];
       if (calls.length === 1) return { exitCode: 1, stdout: '', stderr: 'transient' };
       writeFileSync(output, JSON.stringify({ sources: [{ sourceId: 's', nodes: [], edges: [], hyperedges: [] }] }));
@@ -361,7 +363,10 @@ describe('CodexSemanticBackend', () => {
     expect(calls[0]).not.toContain('--yolo');
     expect(calls[0]).not.toContain('--search');
     expect(calls[0].some((value) => value.includes('dangerously-bypass'))).toBe(false);
-    const prompt = calls[0].at(-1)!;
+    // The payload travels on stdin, not argv — see the E2BIG regression in
+    // process.test.ts. `-` is what tells codex exec to read it from there.
+    const prompt = prompts[0]!;
+    expect(calls[0].at(-1)).toBe('-');
     expect(prompt).toContain('[{"sourceId":"s"');
     expect(prompt).not.toContain('"[{\\"sourceId\\"');
     const disabled = [

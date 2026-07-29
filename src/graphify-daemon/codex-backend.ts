@@ -255,7 +255,12 @@ export class CodexSemanticBackend {
           `model_reasoning_effort="${candidate.effort}"`,
           '--skip-git-repo-check',
           ...(imagePath ? ['--image', imagePath] : []),
-          prompt,
+          // `-` makes codex exec read the prompt from stdin. A batch may carry
+          // up to MAX_INPUT_BYTES (256 KiB), but Linux caps a single argv entry
+          // at 128 KiB, so passing the prompt as an argument spawn-failed with
+          // E2BIG for any batch above that — deterministically, and only for
+          // the largest batches.
+          '-',
         ];
         const result = await this.run(this.options.codexBinary ?? 'codex', args, {
           cwd: root,
@@ -263,6 +268,7 @@ export class CodexSemanticBackend {
           timeoutMs: this.options.timeoutMs ?? 5 * 60_000,
           maxOutputBytes: MAX_OUTPUT_BYTES,
           env: { ...process.env, HOME: privateHome, CODEX_HOME: privateCodexHome },
+          stdin: prompt,
         });
         if (result.terminationReason === 'timeout') throw new Error(`Codex ${candidate.model} timed out`);
         if (result.terminationReason === 'output_limit')

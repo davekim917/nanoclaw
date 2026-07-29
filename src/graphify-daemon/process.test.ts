@@ -24,6 +24,26 @@ describe('runManagedProcess', () => {
     expect(() => process.kill(childPid, 0)).toThrow();
   });
 
+  it('delivers a payload too large for argv over stdin', async () => {
+    // 200 KiB: over the 128 KiB Linux per-argument limit, under the backend's
+    // 256 KiB batch ceiling. Passing this as an argument fails the spawn with
+    // E2BIG before the child ever starts.
+    const payload = 'x'.repeat(200 * 1024);
+    const echoStdin = [
+      'const chunks = [];',
+      "process.stdin.on('data', (chunk) => chunks.push(chunk));",
+      "process.stdin.on('end', () => process.stdout.write(String(Buffer.concat(chunks).length)));",
+    ].join('');
+
+    await expect(runManagedProcess(process.execPath, ['-e', echoStdin, payload])).rejects.toMatchObject({
+      code: 'E2BIG',
+    });
+
+    const result = await runManagedProcess(process.execPath, ['-e', echoStdin], { stdin: payload });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe(String(Buffer.byteLength(payload)));
+  });
+
   it('handles an already-aborted signal without leaving a child running', async () => {
     const controller = new AbortController();
     controller.abort();

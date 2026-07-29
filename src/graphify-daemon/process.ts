@@ -14,6 +14,12 @@ export interface ProcessOptions {
   timeoutMs?: number;
   maxOutputBytes?: number;
   killGraceMs?: number;
+  /**
+   * Written to the child's stdin, which is then closed. Payloads too large for
+   * a single argv entry (Linux caps one argument at 128 KiB) must come through
+   * here — passing them as arguments fails the spawn outright with E2BIG.
+   */
+  stdin?: string;
 }
 
 export type ProcessRun = (command: string, args: string[], options?: ProcessOptions) => Promise<ProcessResult>;
@@ -24,7 +30,7 @@ export const runManagedProcess: ProcessRun = async (command, args, options = {})
       cwd: options.cwd,
       env: options.env ?? process.env,
       detached: process.platform !== 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [options.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
     const maxBytes = options.maxOutputBytes ?? 4 * 1024 * 1024;
     const stdout: Buffer[] = [];
@@ -74,8 +80,15 @@ export const runManagedProcess: ProcessRun = async (command, args, options = {})
       }
       target.push(chunk);
     };
-    child.stdout.on('data', (chunk: Buffer) => collect(stdout, chunk));
-    child.stderr.on('data', (chunk: Buffer) => collect(stderr, chunk));
+    // stdout/stderr are always 'pipe' above; only stdin varies.
+    child.stdout!.on('data', (chunk: Buffer) => collect(stdout, chunk));
+    child.stderr!.on('data', (chunk: Buffer) => collect(stderr, chunk));
+    if (options.stdin !== undefined && child.stdin) {
+      // A child that exits before draining stdin gives us EPIPE; that is the
+      // child's exit to report, not a spawn failure, so swallow it here.
+      child.stdin.on('error', () => {});
+      child.stdin.end(options.stdin);
+    }
     child.once('error', (error) => {
       if (settled) return;
       settled = true;

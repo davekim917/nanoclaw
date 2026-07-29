@@ -13,6 +13,19 @@ export interface PersistedEnrichment {
   semantic?: ExtractionBundle;
 }
 
+/** Identifies the exact row version a batch claimed, for compare-and-set settling. */
+export interface SemanticQueueClaim {
+  sourceId: string;
+  contentHash: string;
+}
+
+/** Queue counts broken out by state, so terminal failures stay visible. */
+export interface SemanticQueueCounts {
+  pending: number;
+  running: number;
+  failed: number;
+}
+
 export interface SemanticQueueItem {
   source: SourceInput;
   segments: string[];
@@ -228,11 +241,18 @@ export class EnrichmentRepository {
       return selected;
     })();
   }
-  complete(sourceIds: string[]): void {
-    const statement = this.db.prepare('DELETE FROM semantic_queue WHERE source_id=?');
-    this.db.transaction((ids: string[]) => {
-      for (const id of ids) statement.run(id);
-    })(sourceIds);
+  /**
+   * Settling a claimed batch is a compare-and-set on the content hash we
+   * claimed. `enqueue` resets a row to pending with `attempts=0` when the
+   * source changes underneath a running batch, so keying on `source_id` alone
+   * would delete (or fail, or delay) the *newer* version that nobody has
+   * processed yet.
+   */
+  complete(claims: SemanticQueueClaim[]): void {
+    const statement = this.db.prepare('DELETE FROM semantic_queue WHERE source_id=? AND content_hash=?');
+    this.db.transaction((batch: SemanticQueueClaim[]) => {
+      for (const claim of batch) statement.run(claim.sourceId, claim.contentHash);
+    })(claims);
   }
   removeSources(sourceIds: string[]): void {
     if (sourceIds.length === 0) return;
@@ -277,23 +297,24 @@ export class EnrichmentRepository {
       clearRetained.run();
     })(retainedSourceIds);
   }
-  defer(sourceIds: string[], delayMs = 5_000): void {
+  defer(claims: SemanticQueueClaim[], delayMs = 5_000): void {
     const availableAt = new Date(Date.now() + delayMs).toISOString();
-    const statement = this.db.prepare("UPDATE semantic_queue SET state='pending', available_at=? WHERE source_id=?");
-    this.db.transaction((ids: string[]) => {
-      for (const id of ids) statement.run(availableAt, id);
-    })(sourceIds);
-  }
-  retry(sourceIds: string[], error: string): void {
-    const rows = this.db
-      .prepare(
-        `SELECT source_id, attempts FROM semantic_queue WHERE source_id IN (${sourceIds.map(() => '?').join(',')})`,
-      )
-      .all(...sourceIds) as Array<{ source_id: string; attempts: number }>;
     const statement = this.db.prepare(
-      'UPDATE semantic_queue SET state=?, attempts=?, available_at=?, last_error=? WHERE source_id=?',
+      "UPDATE semantic_queue SET state='pending', available_at=? WHERE source_id=? AND content_hash=?",
     );
-    for (const row of rows) {
+    this.db.transaction((batch: SemanticQueueClaim[]) => {
+      for (const claim of batch) statement.run(availableAt, claim.sourceId, claim.contentHash);
+    })(claims);
+  }
+  retry(claims: SemanticQueueClaim[], error: string): void {
+    if (claims.length === 0) return;
+    const select = this.db.prepare('SELECT attempts FROM semantic_queue WHERE source_id=? AND content_hash=?');
+    const statement = this.db.prepare(
+      'UPDATE semantic_queue SET state=?, attempts=?, available_at=?, last_error=? WHERE source_id=? AND content_hash=?',
+    );
+    for (const claim of claims) {
+      const row = select.get(claim.sourceId, claim.contentHash) as { attempts: number } | undefined;
+      if (!row) continue;
       const attempt = row.attempts + 1;
       const terminal = attempt >= 5;
       statement.run(
@@ -301,7 +322,8 @@ export class EnrichmentRepository {
         attempt,
         new Date(Date.now() + Math.min(60_000, 5_000 * 2 ** (attempt - 1))).toISOString(),
         error.slice(0, 2000),
-        row.source_id,
+        claim.sourceId,
+        claim.contentHash,
       );
     }
   }
@@ -315,6 +337,51 @@ export class EnrichmentRepository {
       : this.db.prepare("SELECT count(*) AS count FROM semantic_queue WHERE state IN ('pending','running')").get();
     return (row as { count: number }).count;
   }
+  /**
+   * Counts split by state. `pending()` deliberately hides terminal failures, so
+   * a queue that is quietly failing looks identical to one that is draining.
+   */
+  counts(workgroupId?: string): SemanticQueueCounts {
+    const rows = (
+      workgroupId
+        ? this.db
+            .prepare('SELECT state, count(*) AS count FROM semantic_queue WHERE workgroup_id=? GROUP BY state')
+            .all(workgroupId)
+        : this.db.prepare('SELECT state, count(*) AS count FROM semantic_queue GROUP BY state').all()
+    ) as Array<{ state: string; count: number }>;
+    const counts: SemanticQueueCounts = { pending: 0, running: 0, failed: 0 };
+    for (const row of rows) {
+      if (row.state === 'pending') counts.pending = row.count;
+      else if (row.state === 'running') counts.running = row.count;
+      else if (row.state === 'failed') counts.failed = row.count;
+    }
+    return counts;
+  }
+
+  /** Workgroups holding queue rows. Used to find rows no live workgroup owns. */
+  queuedWorkgroupIds(): string[] {
+    const rows = this.db.prepare('SELECT DISTINCT workgroup_id FROM semantic_queue').all() as Array<{
+      workgroup_id: string;
+    }>;
+    return rows.map((row) => row.workgroup_id);
+  }
+
+  /**
+   * Drop rows for workgroups that no longer exist. `claimBatch` is scoped to
+   * live workgroup ids, so orphaned rows are unclaimable forever — they inflate
+   * the backlog and the database without ever being processed.
+   */
+  pruneOrphanWorkgroups(liveWorkgroupIds: string[]): number {
+    const orphans = this.queuedWorkgroupIds().filter((id) => !liveWorkgroupIds.includes(id));
+    if (orphans.length === 0) return 0;
+    const statement = this.db.prepare('DELETE FROM semantic_queue WHERE workgroup_id=?');
+    return this.db.transaction((ids: string[]) => {
+      let removed = 0;
+      for (const id of ids) removed += statement.run(id).changes;
+      return removed;
+    })(orphans);
+  }
+
   clearWorkgroup(workgroupId: string): void {
     this.db.transaction(() => {
       this.db.prepare('DELETE FROM semantic_queue WHERE workgroup_id=?').run(workgroupId);
