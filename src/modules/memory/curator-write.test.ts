@@ -26,6 +26,7 @@ import {
   restoreGeneratedMemorySnapshot,
   writeGeneratedMemory,
 } from './curator-write.js';
+import { GENERATED_MEMORY_MAX_BYTES } from './curator-contract.js';
 
 const content = [
   '# Generated workgroup memory',
@@ -193,5 +194,20 @@ describe('host generated-memory writer', () => {
     expect(fs.readFileSync(path.join(memoryRoot, 'index.md'), 'utf8')).toBe('# Canon\nSibling foreground edit.\n');
     expect(fs.readFileSync(path.join(memoryRoot, 'manual.md'), 'utf8')).toBe('manual bytes\n');
     expect(fs.readFileSync(path.join(memoryRoot, 'imports', 'claude', 'legacy.md'), 'utf8')).toBe('import bytes\n');
+  });
+
+  it('keeps the Bun helper request bound at or above the host generated-memory cap', () => {
+    // The helper lives in the container tree and cannot import the host constant,
+    // so the two are mirrored by hand. When only the host side was raised, writes
+    // succeeded until the document passed the stale helper bound and then failed
+    // forever. This asserts the mirror, so the next cap change cannot half-land.
+    const helper = fs.readFileSync(
+      path.join(process.cwd(), 'container/agent-runner/src/mcp-tools/memory-write-process-helper.ts'),
+      'utf8',
+    );
+    const declared = /MAX_CURATOR_WRITE_REQUEST_BYTES\s*=\s*([0-9_]+)\s*\*\s*1024/.exec(helper);
+    expect(declared).not.toBeNull();
+    const helperBytes = Number(declared![1]!.replace(/_/g, '')) * 1024;
+    expect(helperBytes).toBeGreaterThanOrEqual(GENERATED_MEMORY_MAX_BYTES + 16 * 1024);
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { MemoryCurationArchiveRow, MemoryCurationEpisode } from '../../message-archive.js';
 import type { CuratorBackendResult } from './curator-backend.js';
+import { CURATOR_MAX_MEMORY_TEXT_CHARS } from './curator-contract.js';
 import type { CuratorWriteResult } from './curator-write.js';
 import {
   boundEpisodeMessages,
@@ -141,7 +142,7 @@ describe('memory curator worker', () => {
           action: 'replace_generated_memory',
           reasonCode: 'durable_fact',
           supersedesMemoryIds: [],
-          memories: [{ text: 'x'.repeat(1_001), evidenceIds: ['msg-1'] }],
+          memories: [{ text: 'x'.repeat(CURATOR_MAX_MEMORY_TEXT_CHARS + 1), evidenceIds: ['msg-1'] }],
         },
         model: 'claude-sonnet-5',
         credentialSlot: 'oauth:2',
@@ -162,10 +163,56 @@ describe('memory curator worker', () => {
     const report = await new MemoryCuratorWorker(d).runOne(1000);
     expect(report?.action).toBe('replace_generated_memory');
     expect(curate).toHaveBeenCalledTimes(2);
-    expect(curate.mock.calls[1]?.[0]).toContain('at most 1000 characters');
+    expect(curate.mock.calls[1]?.[0]).toContain(`at most ${CURATOR_MAX_MEMORY_TEXT_CHARS} characters`);
     expect(d.finishCall).toHaveBeenNthCalledWith(1, expect.any(String), 'validation_retry');
     expect(d.finishCall).toHaveBeenNthCalledWith(2, expect.any(String), 'memory_written');
     expect(d.complete).toHaveBeenCalledOnce();
+    expect(d.fail).not.toHaveBeenCalled();
+  });
+
+  it('repairs a mislabelled reason code without dropping the supersession', async () => {
+    const supersedes = ['mem_aaaaaaaaaaaaaaaa'];
+    const curate = vi
+      .fn()
+      .mockResolvedValueOnce({
+        decision: {
+          action: 'replace_generated_memory',
+          // 'sensitive' explains a noop, so it cannot justify a write.
+          reasonCode: 'sensitive',
+          supersedesMemoryIds: supersedes,
+          memories: [{ text: 'GSC access is granted.', evidenceIds: ['msg-1'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 40, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      } satisfies CuratorBackendResult)
+      .mockResolvedValueOnce({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'explicit_decision',
+          supersedesMemoryIds: supersedes,
+          memories: [{ text: 'GSC access is granted.', evidenceIds: ['msg-1'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 40, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      } satisfies CuratorBackendResult);
+    const current = [
+      '# Generated workgroup memory',
+      '',
+      '- GSC access is unknown. <!-- nanoclaw-memory:id=mem_aaaaaaaaaaaaaaaa;evidence=msg-1;captured=2026-07-26T00:00:00.000Z -->',
+      '',
+    ].join('\n');
+    const d = deps({ curate, readGenerated: () => ({ content: current, sha256: 'a'.repeat(64) }) });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+
+    expect(report?.action).toBe('replace_generated_memory');
+    expect(curate).toHaveBeenCalledTimes(2);
+    expect(curate.mock.calls[1]?.[0]).toContain('only relabel the reason');
+    // The stale fact is gone and its replacement stands in its place.
+    const written = (d.writeGenerated as ReturnType<typeof vi.fn>).mock.calls[0]![1] as string;
+    expect(written).toContain('GSC access is granted.');
+    expect(written).not.toContain('GSC access is unknown.');
     expect(d.fail).not.toHaveBeenCalled();
   });
 
@@ -176,7 +223,7 @@ describe('memory curator worker', () => {
           action: 'replace_generated_memory',
           reasonCode: 'durable_fact',
           supersedesMemoryIds: [],
-          memories: [{ text: 'x'.repeat(1_001), evidenceIds: ['msg-1'] }],
+          memories: [{ text: 'x'.repeat(CURATOR_MAX_MEMORY_TEXT_CHARS + 1), evidenceIds: ['msg-1'] }],
         },
         model: 'claude-sonnet-5',
         credentialSlot: 'oauth:2',

@@ -16,6 +16,7 @@ import {
   archiveMessageAndScheduleMemoryCuration,
   claimMemoryCurationEpisode,
   claimMemoryMaintenance,
+  MEMORY_MAINTENANCE_SIZE_THRESHOLD,
   completeMemoryMaintenance,
   completeMemoryCurationEpisode,
   failMemoryMaintenance,
@@ -419,7 +420,7 @@ describe('memory curation episode queue', () => {
 
   it('durably leases threshold-triggered maintenance and retries without clearing it', () => {
     const now = Date.parse('2026-07-26T12:00:00.000Z');
-    recordAcceptedGeneratedMemory('wg-a', 193 * 1024, { nowMs: now });
+    recordAcceptedGeneratedMemory('wg-a', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1024, { nowMs: now });
     const first = claimMemoryMaintenance('maintenance-1', { nowMs: now });
     expect(first).toMatchObject({ workgroupId: 'wg-a', acceptedUpdates: 1 });
     expect(failMemoryMaintenance(first!, { nowMs: now, retryMs: 1000 })).toBe(true);

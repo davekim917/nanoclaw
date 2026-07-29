@@ -30,7 +30,10 @@ import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 import { MemoryCuratorBackend, MEMORY_CURATOR_EFFORT, type CuratorBackendResult } from './curator-backend.js';
 import {
   buildCuratorPrompt,
+  CURATOR_CAPTURE_REASON_CODES,
   CURATOR_MAX_MEMORY_TEXT_CHARS,
+  GENERATED_MEMORY_MAX_BYTES,
+  GENERATED_MEMORY_WARN_BYTES,
   parseGeneratedMemoryFacts,
   validateCuratorDecision,
   type CuratorDecision,
@@ -324,8 +327,19 @@ interface SuccessfulModelAttempt<T> {
   callId: string;
 }
 
-function isRepairableLengthViolation(error: unknown): boolean {
-  return error instanceof Error && error.message === 'curator memory text exceeds the maximum';
+const REPAIRABLE_VIOLATIONS = new Map<string, string>([
+  [
+    'curator memory text exceeds the maximum',
+    `Every memory candidate text must be at most ${CURATOR_MAX_MEMORY_TEXT_CHARS} characters while remaining self-contained. Do not omit a durable fact merely to satisfy this correction.`,
+  ],
+  [
+    'curator replacement needs a capture reason code',
+    `A replacement must use one of these reason codes: ${CURATOR_CAPTURE_REASON_CODES.join(', ')}. Keep the same memories and supersedesMemoryIds; only relabel the reason so it describes the new fact. Do not drop a supersession or a durable fact to satisfy this correction.`,
+  ],
+]);
+
+function repairInstructionFor(error: unknown): string | null {
+  return error instanceof Error ? (REPAIRABLE_VIOLATIONS.get(error.message) ?? null) : null;
 }
 
 export class MemoryCuratorWorker {
@@ -398,13 +412,14 @@ export class MemoryCuratorWorker {
       try {
         decision = validateCuratorDecision(backend.decision, validationContext);
       } catch (error) {
-        if (!isRepairableLengthViolation(error)) throw error;
+        const repairInstruction = repairInstructionFor(error);
+        if (repairInstruction === null) throw error;
         this.deps.finishCall(callId, 'validation_retry');
         callId = null;
         const repairSystem = [
           prompt.system,
-          'Your previous structured response was rejected because a memory candidate was too long.',
-          `Retry once. Every memory candidate text must be at most ${CURATOR_MAX_MEMORY_TEXT_CHARS} characters while remaining self-contained. Do not omit a durable fact merely to satisfy this correction.`,
+          `Your previous structured response was rejected: ${(error as Error).message}.`,
+          `Retry once. ${repairInstruction}`,
         ].join('\n');
         attempt = await this.runModelWithFailover(
           'memory-curator-repair',
@@ -420,7 +435,19 @@ export class MemoryCuratorWorker {
       if (decision.action === 'replace_generated_memory') {
         const write = await this.deps.writeGenerated(episode.workgroupId, decision.content, generated.sha256, nowMs);
         if (write.status !== 'success') throw new Error(`memory write ${write.status}: ${write.error ?? 'unknown'}`);
-        this.deps.recordAccepted(episode.workgroupId, Buffer.byteLength(decision.content, 'utf8'), nowMs);
+        const acceptedBytes = Buffer.byteLength(decision.content, 'utf8');
+        this.deps.recordAccepted(episode.workgroupId, acceptedBytes, nowMs);
+        // Facts are never evicted, so the store only grows. Say so early and
+        // loudly: at the old cap this filled silently and every later capture
+        // failed validation forever with nothing surfaced above debug logs.
+        if (acceptedBytes > GENERATED_MEMORY_WARN_BYTES) {
+          log.warn('memory-curator: generated memory approaching its ceiling', {
+            workgroupId: episode.workgroupId,
+            bytes: acceptedBytes,
+            maxBytes: GENERATED_MEMORY_MAX_BYTES,
+            percentOfMax: Math.round((acceptedBytes / GENERATED_MEMORY_MAX_BYTES) * 100),
+          });
+        }
       }
       if (!this.deps.complete(handledEpisode, nowMs)) throw new Error('memory curator lost its episode lease');
       outcome = decision.action === 'noop' ? 'noop' : 'memory_written';

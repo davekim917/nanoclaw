@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildCuratorPrompt,
+  CURATOR_CAPTURE_REASON_CODES,
+  CURATOR_MAX_MEMORY_TEXT_CHARS,
   CURATOR_OUTPUT_SCHEMA,
   parseGeneratedMemoryFacts,
   validateCuratorDecision,
@@ -199,9 +201,24 @@ describe('background memory curator contract', () => {
         context(oldContent),
       ),
     ).toThrow(/no current-episode evidence/);
-    expect(() =>
+    // Any capture reason code may supersede. Superseding is the only way a stale
+    // fact is ever updated, so gating it on the 'correction' label rejected
+    // legitimate updates — a new decision or preference displacing an old one —
+    // on a naming technicality. The real guards still apply below.
+    expect(
       validateCuratorDecision({ ...base, supersedesMemoryIds: ['mem_aaaaaaaaaaaaaaaa'] }, context(oldContent)),
-    ).toThrow(/only a correction/);
+    ).toMatchObject({ action: 'replace_generated_memory', supersedesMemoryIds: ['mem_aaaaaaaaaaaaaaaa'] });
+    // Superseding an id that is not in the current document is still refused,
+    // as is a write whose reason code does not justify writing at all.
+    expect(() =>
+      validateCuratorDecision({ ...base, supersedesMemoryIds: ['mem_bbbbbbbbbbbbbbbb'] }, context(oldContent)),
+    ).toThrow(/unknown memory id/);
+    expect(() => validateCuratorDecision({ ...base, reasonCode: 'sensitive' }, context())).toThrow(
+      /capture reason code/,
+    );
+    expect(() => validateCuratorDecision({ ...base, reasonCode: 'duplicate' }, context())).toThrow(
+      /capture reason code/,
+    );
     expect(() =>
       validateCuratorDecision(
         { action: 'noop', reasonCode: 'duplicate', supersedesMemoryIds: [], memories: base.memories },
@@ -268,7 +285,12 @@ describe('background memory curator contract', () => {
     expect(prompt.system).toContain('semantic memory candidates only');
     expect(prompt.system).toContain('NanoClaw owns the document format');
     expect(prompt.system).toContain('Do not return Markdown');
-    expect(prompt.system).toContain('under 1,000 characters');
+    // Bound to the constant: the prompt told the model 1,000 for a while after
+    // the limit moved to 2,000, so the model kept writing to the old ceiling.
+    expect(prompt.system).toContain(`under ${CURATOR_MAX_MEMORY_TEXT_CHARS.toLocaleString('en-US')} characters`);
+    // The supersession contract must actually be stated, not just enforced.
+    expect(prompt.system).toContain('supersede it');
+    for (const code of CURATOR_CAPTURE_REASON_CODES) expect(prompt.system).toContain(code);
     expect(prompt.system).toContain('for noop both must be empty arrays');
   });
 });
