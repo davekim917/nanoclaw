@@ -80,8 +80,17 @@ from `.env` when the OneCLI service wrapper has shadowed it with its
 `placeholder` sentinel. Each job is bounded to 80 de-duplicated messages and
 24,000 transcript characters, a relevance-ranked generated-memory view capped
 at 32,000 characters, and up to three relevant manual-memory excerpts. The
-canonical generated store is independently bounded at 256 KiB; automatic
+canonical generated store is independently bounded at 1 MiB; automatic
 agent recall remains governed by the 12,000-character final context budget.
+
+A fact is never evicted. Nothing ages out, and a decision captured months ago
+stays recallable for as long as it is the most relevant answer to a turn. The
+1 MiB bound is a runaway rail, not a retention policy, and its real cost is
+that the store is re-tokenized on each turn to rank it — roughly 525 ms per
+MiB. Crossing 75 percent logs a warning long before the ceiling bites, and a
+queue that has retried a write past three attempts is reported by the runtime
+verifier as a non-blocking `curator-episodes-stuck` warning instead of being
+indistinguishable from a healthy idle queue.
 Its default decision is `noop`.
 It captures only durable decisions, corrections, stable cross-task
 preferences, verified outcomes, and durable workflows. It rejects secrets,
@@ -97,9 +106,11 @@ rendered document, scrubs secrets, and promotes through the same workgroup lock
 and SHA compare-and-swap writer used by sibling agents. A model's heading,
 bullet, marker, ID, or timestamp spelling therefore cannot block a valid
 capture because those fields are not part of the model contract.
-If a semantic candidate exceeds the 1,000-character limit, the curator gets
+If a semantic candidate exceeds the 2,000-character limit, the curator gets
 one bounded repair attempt before the durable episode is retained for retry;
-content is never silently truncated or discarded.
+content is never silently truncated or discarded. The limit was 1,000, which
+rejected more captures than every other failure cause combined against a live
+median fact length of 658 characters.
 Provider-namespaced archive IDs may be cited by their raw platform ID only when
 that shorthand resolves to exactly one allowed row; ambiguous or invented IDs
 still fail closed.
@@ -123,7 +134,7 @@ due episodes, oldest due time, retry count, and per-slot cooldown state are
 reported by the runtime verifier, and admission delay or total credential
 unavailability emits a throttled warning without deleting work.
 
-After 50 accepted updates or when generated memory exceeds 192 KiB, the host
+After 50 accepted updates or when generated memory exceeds 768 KiB, the host
 retires the maintenance threshold without asking a model to rewrite the
 document. The deterministic renderer already maintains the one canonical flat
 representation, so a second model-authored presentation pass would add failure
@@ -159,11 +170,25 @@ require the agent to call it before declaring a service unavailable.
 Every pair then contains only the newly relevant evidence delta:
 
 1. up to three deeper Markdown excerpts from the workgroup canon;
-2. up to three lexical archive excerpts, preferring the current thread;
-3. a separately bounded exact Slack/Discord permalink lane when the input
+2. up to three generated-memory facts, in their own lane;
+3. up to three lexical archive excerpts, preferring the current thread;
+4. a separately bounded exact Slack/Discord permalink lane when the input
    contains a supported message link; and
-4. explicit degraded, conflict, truncation, already-delivered, or no-match
+5. explicit degraded, conflict, truncation, already-delivered, or no-match
    notices.
+
+`generated/memory.md` is a flat list of self-contained one-line facts, so it is
+ranked one fact at a time rather than as a single document, and each selected
+fact is delivered whole. Scored as one document it could contribute at most one
+900-character passage per turn however much it held — against a live 328-fact
+store that was one fact, and a larger store could not have improved it. Its own
+excerpt lane keeps facts and manual Markdown from crowding each other out.
+
+Ranking uses the fact text only; the provenance marker is excluded, because its
+tokens are about a fifth of a line and diluted the density term. The marker
+still reaches the agent, so `captured=` remains visible and an agent can tell
+how old a fact is. Capture time is a tiebreak between comparably relevant facts,
+never a filter: an older exact match still outranks a fresher weak one.
 
 `system/definition.md` is protocol guidance, not recalled evidence. Its
 behavioral contract belongs in standing lifecycle instructions and is not

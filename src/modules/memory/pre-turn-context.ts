@@ -10,7 +10,10 @@ import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
   markdownFiles: 256,
-  markdownScannedBytes: 1_048_576,
+  // Must clear GENERATED_MEMORY_MAX_BYTES with room for the manual tree beside
+  // it: this is a shared budget consumed in listing order, so a generated store
+  // at its own cap would otherwise silently truncate every file after it.
+  markdownScannedBytes: 4 * 1_048_576,
   markdownFileBytes: 65_536,
   markdownCoreChars: 2_500,
   markdownHeadings: 24,
@@ -18,6 +21,31 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   markdownCandidates: 48,
   markdownExcerpts: 3,
   markdownExcerptChars: 900,
+  // generated/memory.md is a flat list of self-contained one-line facts, so it
+  // is ranked per FACT rather than as one document. Scored as a single file it
+  // contributed at most one 900-char passage per turn no matter how much it
+  // held — measured against a live 328-fact store (median line 817 chars) that
+  // is ~1.1 facts surfaced out of 328, and growing the store could not improve
+  // it. Facts also get their own excerpt lane so they cannot crowd out manual
+  // memory in the shared markdownExcerpts budget, and vice versa.
+  generatedFactCandidates: 48,
+  generatedFactExcerpts: 3,
+  // A fact is one atomic unit, so it is delivered whole rather than windowed
+  // mid-sentence. Matched to CURATOR_MAX_MEMORY_TEXT_CHARS plus its provenance
+  // marker. Worst case 3 x 2200 is still inside finalChars alongside archive
+  // recall, and enforceFinalBound trims the tail if a bootstrap turn is tight.
+  generatedFactExcerptChars: 2_200,
+  // Total for BOTH memory lanes, enforced after selection.
+  //
+  // Load-bearing for the same reason capabilityTotalChars is. Per-lane caps
+  // alone took the worst-case memory footprint from 2,700 (3 x 900) to 9,300
+  // (3 x 2,200 + 3 x 900) inside an unchanged 12,000 finalChars. Facts, files
+  // and archive together then reach finalChars exactly, before per-excerpt JSON
+  // overhead — and enforceFinalBound sacrifices conversation excerpts FIRST, so
+  // a few long facts could silently evict every archive excerpt. 5,500 leaves
+  // the archive lane intact on a normal turn while still fitting three
+  // typical facts (median 817 chars) plus the file lane.
+  memoryExcerptTotalChars: 5_500,
   archiveCandidates: 96,
   archiveExcerpts: 3,
   archiveExcerptChars: 900,
@@ -627,6 +655,45 @@ function listMarkdownFiles(root: string, notices: ContextNotice[]): string[] {
   return files.sort();
 }
 
+interface SearchableCandidate {
+  path: string;
+  headings: string[];
+  /** Text handed to the agent: for a generated fact this keeps the provenance marker. */
+  content: string;
+  /** Text used for ranking only: for a generated fact this drops the marker. */
+  searchable: string;
+  /** ISO-8601 capture stamp for a generated fact; empty for ordinary files. */
+  capturedAt: string;
+}
+
+const CAPTURED_AT_PATTERN = /captured=([0-9T:.Z+-]+)/;
+
+function capturedAtOf(line: string): string {
+  return CAPTURED_AT_PATTERN.exec(line)?.[1] ?? '';
+}
+
+/**
+ * Bound one generated fact, keeping its provenance marker attached.
+ *
+ * A fact can legitimately exceed the excerpt width: the text alone may reach
+ * CURATOR_MAX_MEMORY_TEXT_CHARS and the marker carries up to
+ * CURATOR_MAX_EVIDENCE_IDS archive ids after it. Windowing the line generically
+ * cuts from the end, which drops exactly the `id=` and `captured=` the agent
+ * needs to judge how old a fact is and to cite it. Trim the prose instead and
+ * re-attach the marker, so provenance survives at any width.
+ */
+function boundedFactLine(line: string, maxChars: number): string {
+  if (line.length <= maxChars) return line;
+  const markerAt = line.indexOf('<!--');
+  if (markerAt < 0) return boundedText(line, maxChars, TRUNCATED_MARKDOWN_EXCERPT);
+  const marker = line.slice(markerAt);
+  const budget = maxChars - marker.length - TRUNCATED_MARKDOWN_EXCERPT.length - 1;
+  // Marker alone over budget: keep it whole, since a citation without prose is
+  // still usable and prose without a citation is not.
+  if (budget <= 0) return marker;
+  return `${line.slice(0, budget).trimEnd()}${TRUNCATED_MARKDOWN_EXCERPT} ${marker}`;
+}
+
 function readMemoryEvidence(
   root: string,
   workgroupId: string,
@@ -668,13 +735,19 @@ function readMemoryEvidence(
 
   const queryTokens = tokenizeForRecall(query);
   const expandedTokens = tokenizeForRecall(`${query} ${ephemeralExpansion(query).join(' ')}`);
-  const searchableCandidates: Array<{
-    path: string;
-    headings: string[];
-    content: string;
-    searchable: string;
-  }> = [];
-  for (const relative of listMarkdownFiles(root, notices)) {
+  const fileCandidates: SearchableCandidate[] = [];
+  const factCandidates: SearchableCandidate[] = [];
+  // Read the fact store first. `markdownScannedBytes` is a single budget spent
+  // in listing order, and `generated/` sorts after `bootstrap/`, `concepts/`,
+  // `conversations/`, `facts/` and `imports/`. A large manual tree would
+  // otherwise leave too few bytes for it and truncate the file MID-LINE, which
+  // is worse than dropping it: the partial line still starts with "- " and is
+  // parsed as a fact, so a half-sentence reaches the agent with its provenance
+  // marker cut off. Stable sort, so everything else keeps codepoint order.
+  const scanOrder = listMarkdownFiles(root, notices).sort(
+    (a, b) => Number(b === GENERATED_MEMORY_RELATIVE_PATH) - Number(a === GENERATED_MEMORY_RELATIVE_PATH),
+  );
+  for (const relative of scanOrder) {
     if ((CORE_PATHS as readonly string[]).includes(relative)) continue;
     if (NON_RECALL_PATHS.has(relative)) continue;
     const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
@@ -695,26 +768,68 @@ function readMemoryEvidence(
     );
     scannedBytes += read.bytes;
     const headings = headingsOf(read.content);
-    const searchable = `${relative}\n${headings.join('\n')}\n${read.content}`;
-    searchableCandidates.push({ path: relative, headings, content: read.content, searchable });
-  }
-  const rankMemory = (tokens: string[]) =>
-    rankByBestPassage(tokens, searchableCandidates, (candidate) => candidate.searchable, {
-      maxChars: PRE_TURN_BOUNDS.markdownExcerptChars,
-      tieBreak: (a, b) => compareCodepoint(a.path, b.path),
+    if (relative === GENERATED_MEMORY_RELATIVE_PATH) {
+      for (const line of read.content.split('\n')) {
+        if (!line.startsWith('- ')) continue;
+        const markerAt = line.indexOf('<!--');
+        factCandidates.push({
+          path: relative,
+          headings,
+          content: line,
+          // Score the fact, not its provenance marker. The marker is ~20% of a
+          // line's characters, and its tokens dilute the density term ranking
+          // uses, so scoring it penalised generated facts against clean manual
+          // Markdown. selectGeneratedMemoryForPrompt already strips it exactly
+          // this way on the curator side; this makes both paths agree.
+          searchable: markerAt < 0 ? line : line.slice(0, markerAt),
+          capturedAt: capturedAtOf(line),
+        });
+      }
+      continue;
+    }
+    fileCandidates.push({
+      path: relative,
+      headings,
+      content: read.content,
+      searchable: `${relative}\n${headings.join('\n')}\n${read.content}`,
+      capturedAt: '',
     });
-  const directCandidates = rankMemory(queryTokens);
-  const expandedCandidates = directCandidates.length === 0 ? rankMemory(expandedTokens) : [];
-  const expansionUsed = expandedCandidates.length > 0;
-  const candidates = expansionUsed ? expandedCandidates : directCandidates;
-  if (expansionUsed) markExpansionUsed(notices);
-  const rankedCandidates = candidates.map(({ candidate, passage }) => {
-    const text = contextualExcerpt(
-      candidate.content,
-      passage.text,
-      PRE_TURN_BOUNDS.markdownExcerptChars,
-      TRUNCATED_MARKDOWN_EXCERPT,
-    );
+  }
+  const rankPool = (
+    pool: SearchableCandidate[],
+    tokens: string[],
+    maxChars: number,
+    tieBreak: (a: SearchableCandidate, b: SearchableCandidate) => number,
+  ) =>
+    rankByBestPassage(tokens, pool, (candidate) => candidate.searchable, {
+      maxChars,
+      tieBreak,
+    });
+  const byPath = (a: SearchableCandidate, b: SearchableCandidate) => compareCodepoint(a.path, b.path);
+  // Age ranks, it never filters. Between facts of equal relevance the newer
+  // capture wins; an older exact match still outranks a fresher weak one, so a
+  // fact stays recallable however old it is. ISO-8601 sorts chronologically.
+  const byRecency = (a: SearchableCandidate, b: SearchableCandidate) => compareCodepoint(b.capturedAt, a.capturedAt);
+  const rankAll = (tokens: string[]) => ({
+    files: rankPool(fileCandidates, tokens, PRE_TURN_BOUNDS.markdownExcerptChars, byPath),
+    facts: rankPool(factCandidates, tokens, PRE_TURN_BOUNDS.generatedFactExcerptChars, byRecency),
+  });
+  let ranked = rankAll(queryTokens);
+  if (ranked.files.length === 0 && ranked.facts.length === 0) {
+    const expanded = rankAll(expandedTokens);
+    if (expanded.files.length > 0 || expanded.facts.length > 0) {
+      ranked = expanded;
+      markExpansionUsed(notices);
+    }
+  }
+  const toExcerpt = (
+    { candidate, passage }: { candidate: SearchableCandidate; passage: PassageMatch },
+    maxChars: number,
+  ): MemoryEvidenceExcerpt => {
+    const text =
+      candidate.path === GENERATED_MEMORY_RELATIVE_PATH
+        ? boundedFactLine(candidate.content, maxChars)
+        : contextualExcerpt(candidate.content, passage.text, maxChars, TRUNCATED_MARKDOWN_EXCERPT);
     return {
       path: candidate.path,
       headings: candidate.headings,
@@ -728,11 +843,14 @@ function readMemoryEvidence(
       ),
       provenance: { authority: 'workgroup-memory-canon' as const, workgroupId },
     };
-  });
-  const dedupedCandidates = bypassDedupe
-    ? rankedCandidates
-    : rankedCandidates.filter((candidate) => !seenEvidenceFingerprints.has(candidate.fingerprint));
-  const suppressed = rankedCandidates.length - dedupedCandidates.length;
+  };
+  const rankedFiles = ranked.files.map((row) => toExcerpt(row, PRE_TURN_BOUNDS.markdownExcerptChars));
+  const rankedFacts = ranked.facts.map((row) => toExcerpt(row, PRE_TURN_BOUNDS.generatedFactExcerptChars));
+  const keepUnseen = (rows: MemoryEvidenceExcerpt[]): MemoryEvidenceExcerpt[] =>
+    bypassDedupe ? rows : rows.filter((row) => !seenEvidenceFingerprints.has(row.fingerprint));
+  const dedupedFiles = keepUnseen(rankedFiles);
+  const dedupedFacts = keepUnseen(rankedFacts);
+  const suppressed = rankedFiles.length - dedupedFiles.length + (rankedFacts.length - dedupedFacts.length);
   if (suppressed > 0) {
     notices.push({
       source: 'context',
@@ -741,22 +859,59 @@ function readMemoryEvidence(
       detail: `suppressed ${suppressed} unchanged Markdown passage${suppressed === 1 ? '' : 's'} in this context epoch`,
     });
   }
-  const boundedCandidates = dedupedCandidates.slice(0, PRE_TURN_BOUNDS.markdownCandidates);
-  if (rankedCandidates.length > boundedCandidates.length) {
+  const boundedCandidates = dedupedFiles.slice(0, PRE_TURN_BOUNDS.markdownCandidates);
+  if (rankedFiles.length > boundedCandidates.length) {
     notices.push({
       source: 'markdown',
       status: 'truncated',
       code: 'markdown-candidate-limit',
-      detail: `selected ${boundedCandidates.length} of ${rankedCandidates.length} relevant Markdown candidates`,
+      detail: `selected ${boundedCandidates.length} of ${rankedFiles.length} relevant Markdown candidates`,
     });
   }
-  const excerpts = boundedCandidates.slice(0, PRE_TURN_BOUNDS.markdownExcerpts);
-  if (boundedCandidates.length > excerpts.length) {
+  const fileExcerpts = boundedCandidates.slice(0, PRE_TURN_BOUNDS.markdownExcerpts);
+  if (boundedCandidates.length > fileExcerpts.length) {
     notices.push({
       source: 'markdown',
       status: 'truncated',
       code: 'markdown-excerpt-limit',
-      detail: `selected ${excerpts.length} of ${boundedCandidates.length} bounded Markdown candidates`,
+      detail: `selected ${fileExcerpts.length} of ${boundedCandidates.length} bounded Markdown candidates`,
+    });
+  }
+  const boundedFacts = dedupedFacts.slice(0, PRE_TURN_BOUNDS.generatedFactCandidates);
+  if (rankedFacts.length > boundedFacts.length) {
+    notices.push({
+      source: 'markdown',
+      status: 'truncated',
+      code: 'generated-fact-candidate-limit',
+      detail: `selected ${boundedFacts.length} of ${rankedFacts.length} relevant generated facts`,
+    });
+  }
+  const factExcerpts = boundedFacts.slice(0, PRE_TURN_BOUNDS.generatedFactExcerpts);
+  if (boundedFacts.length > factExcerpts.length) {
+    notices.push({
+      source: 'markdown',
+      status: 'truncated',
+      code: 'generated-fact-excerpt-limit',
+      detail: `selected ${factExcerpts.length} of ${boundedFacts.length} bounded generated facts`,
+    });
+  }
+  // Most relevant first: enforceFinalBound pops from the end when over budget.
+  const excerpts = [...factExcerpts, ...fileExcerpts].sort((a, b) => b.score - a.score);
+  // Keep both memory lanes inside one shared total, dropping the least relevant
+  // first, so memory cannot reach enforceFinalBound large enough to evict the
+  // archive lane that function sacrifices ahead of it.
+  let excerptChars = excerpts.reduce((sum, row) => sum + row.text.length, 0);
+  let droppedForBudget = 0;
+  while (excerpts.length > 1 && excerptChars > PRE_TURN_BOUNDS.memoryExcerptTotalChars) {
+    excerptChars -= excerpts.pop()!.text.length;
+    droppedForBudget += 1;
+  }
+  if (droppedForBudget > 0) {
+    notices.push({
+      source: 'markdown',
+      status: 'truncated',
+      code: 'memory-excerpt-total-budget',
+      detail: `dropped ${droppedForBudget} lower-ranked memory excerpt${droppedForBudget === 1 ? '' : 's'} to stay within ${PRE_TURN_BOUNDS.memoryExcerptTotalChars} characters`,
     });
   }
   if (excerpts.length === 0) {

@@ -296,12 +296,15 @@ function statusFor(issues: VerificationIssue[]): VerificationStatus {
   return 'clean';
 }
 
+/** Retry count past which a pending episode is treated as stuck rather than in-flight. */
+const STUCK_EPISODE_ATTEMPTS = 3;
+
 function failure(issues: VerificationIssue[], code: string, subject?: string, detail?: string): void {
   issues.push({ code, severity: 'failure', ...(subject ? { subject } : {}), ...(detail ? { detail } : {}) });
 }
 
-function warning(issues: VerificationIssue[], code: string, subject?: string): void {
-  issues.push({ code, severity: 'warning', ...(subject ? { subject } : {}) });
+function warning(issues: VerificationIssue[], code: string, subject?: string, detail?: string): void {
+  issues.push({ code, severity: 'warning', ...(subject ? { subject } : {}), ...(detail ? { detail } : {}) });
 }
 
 function inventoryEntry(root: string, absolute: string, relativePath: string): InventoryEntry {
@@ -1281,6 +1284,18 @@ function verifyCurator(
           consecutiveFailures: credential.consecutive_failures,
           lastErrorClass: credential.last_error_class,
         }));
+        // A queue that retries forever looks identical to a healthy idle one in
+        // the raw counts, and reporting only those counts is how a workgroup sat
+        // at 24 stuck episodes and 202 wasted attempts while this said "clean".
+        // Non-blocking: the work is retained, not lost, but it needs an operator.
+        if (queue.pendingEpisodes > 0 && queue.maxAttemptCount >= STUCK_EPISODE_ATTEMPTS) {
+          warning(
+            issues,
+            'curator-episodes-stuck',
+            workgroupId,
+            `${queue.pendingEpisodes} pending episode(s), up to ${queue.maxAttemptCount} attempts, last error class ${queue.lastErrorClass ?? 'unknown'}`,
+          );
+        }
       }
     } catch (error) {
       if (!(error instanceof Error)) throw error;

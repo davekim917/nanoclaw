@@ -435,6 +435,132 @@ describe('bounded authoritative pre-turn retrieval', () => {
     );
   });
 
+  it('ranks generated memory per fact in its own lane, so store size does not throttle recall', () => {
+    // One fact per line, each self-contained, exactly as the curator renders it.
+    const fact = (id: string, capturedAt: string, text: string): string =>
+      `- ${text} <!-- nanoclaw-memory:id=mem_${id};evidence=arc-${id};captured=${capturedAt} -->`;
+    const filler = Array.from({ length: 200 }, (_, index) =>
+      fact(
+        String(index).padStart(16, '0'),
+        '2026-07-01T00:00:00.000Z',
+        `Unrelated fact ${index} about invoice reconciliation grain and warehouse origins.`,
+      ),
+    );
+    memoryFile(
+      'generated/memory.md',
+      [
+        '# Generated workgroup memory',
+        '',
+        // Old but exactly on point. Nothing prunes it; nothing should bury it.
+        fact('aaaaaaaaaaaaaaa1', '2026-05-01T00:00:00.000Z', 'Jordan owns deployment for the release pipeline.'),
+        ...filler,
+        fact('aaaaaaaaaaaaaaa2', '2026-07-25T00:00:00.000Z', 'Deployment rollbacks are approved by Jordan only.'),
+        fact('aaaaaaaaaaaaaaa3', '2026-07-26T00:00:00.000Z', 'Deployment freezes run over the weekend.'),
+      ].join('\n'),
+    );
+    memoryFile('facts/manual-owner.md', '# Manual\nThe deployment runbook lives in the ops repo.');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat',
+      trigger: 1,
+      normalizedContent: '{"text":"Who owns deployment?"}',
+    });
+
+    const facts = result.memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md');
+    const files = result.memoryEvidence.excerpts.filter((row) => row.path !== 'generated/memory.md');
+
+    // Was capped at one 900-char window for the whole store, whatever it held.
+    expect(facts.length).toBeGreaterThan(1);
+    expect(facts.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.generatedFactExcerpts);
+    // Each excerpt is one fact, not a window straddling its neighbours.
+    for (const row of facts) expect(row.text.split('nanoclaw-memory:id=')).toHaveLength(2);
+    // Age ranks but never filters: the May fact outranks 200 fresher irrelevant ones.
+    expect(facts.some((row) => row.text.includes('Jordan owns deployment'))).toBe(true);
+    // Provenance still reaches the agent, so it can tell how old a fact is.
+    expect(facts.some((row) => row.text.includes('captured=2026-05-01T00:00:00.000Z'))).toBe(true);
+    // Separate lanes: 200+ generated facts cannot starve manual Markdown.
+    expect(files.length).toBeGreaterThan(0);
+  });
+
+  it('keeps archive recall alive when long facts would otherwise consume the whole budget', () => {
+    // Worst case: three max-width facts. Per-lane caps alone let memory reach
+    // 9,300 chars of a 12,000 budget, and enforceFinalBound evicts conversation
+    // excerpts before memory ones, so archive recall vanished silently.
+    const marker = (n: number, id: string): string =>
+      `- ${`Deployment ownership detail ${n}. `.repeat(80)} <!-- nanoclaw-memory:id=mem_${id};evidence=arc-${id};captured=2026-07-2${n}T00:00:00.000Z -->`;
+    memoryFile(
+      'generated/memory.md',
+      [
+        '# Generated workgroup memory',
+        '',
+        marker(1, 'aaaaaaaaaaaaaaa1'),
+        marker(2, 'aaaaaaaaaaaaaaa2'),
+        marker(3, 'aaaaaaaaaaaaaaa3'),
+        '',
+      ].join('\n'),
+    );
+    // Every lane at full width, so the combined footprint exceeds finalChars and
+    // enforceFinalBound is forced to sacrifice something.
+    for (let index = 0; index < PRE_TURN_BOUNDS.markdownExcerpts; index++) {
+      memoryFile(
+        `facts/deployment-${index}.md`,
+        `# Deployment ${index}\n${'Jordan owns deployment and the release pipeline. '.repeat(40)}`,
+      );
+    }
+    for (const id of ['arc-1', 'arc-2', 'arc-3']) {
+      archive(
+        id,
+        'ag-a',
+        `${'Jordan owns deployment, discussed at length. '.repeat(40)} ${id}`,
+        '2026-07-26T00:00:00.000Z',
+      );
+    }
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat',
+      trigger: 1,
+      normalizedContent: '{"text":"Who owns deployment?"}',
+    });
+
+    const memoryChars = result.memoryEvidence.excerpts.reduce((sum, row) => sum + row.text.length, 0);
+    expect(memoryChars).toBeLessThanOrEqual(PRE_TURN_BOUNDS.memoryExcerptTotalChars);
+    // The point of the bound: conversation evidence still survives.
+    expect(result.conversationEvidence.excerpts.length).toBeGreaterThan(0);
+    expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
+  });
+
+  it('keeps the provenance marker on a fact too long to deliver whole', () => {
+    const longText = `${'Deployment ownership rationale. '.repeat(120)}`;
+    memoryFile(
+      'generated/memory.md',
+      [
+        '# Generated workgroup memory',
+        '',
+        // A full complement of evidence ids, so the marker is at its widest.
+        `- ${longText} <!-- nanoclaw-memory:id=mem_aaaaaaaaaaaaaaa1;evidence=${Array.from({ length: 20 }, (_, i) => `msg-${String(i).padStart(4, '0')}-evidence-row:ag-example-group`).join(',')};captured=2026-05-01T00:00:00.000Z -->`,
+        '',
+      ].join('\n'),
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat',
+      trigger: 1,
+      normalizedContent: '{"text":"Who owns deployment?"}',
+    });
+
+    const fact = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
+    expect(fact).toBeDefined();
+    // Trimmed, but the agent can still tell how old it is and cite it.
+    expect(fact!.text).toContain('nanoclaw-memory:id=mem_aaaaaaaaaaaaaaa1');
+    expect(fact!.text).toContain('captured=2026-05-01T00:00:00.000Z');
+  });
+
   it('uses codepoint order for equal-scoring Markdown paths', () => {
     memoryFile('facts/project_xzo216.md', '# Deployment owner\nJordan owns deployment.');
     memoryFile('facts/project_xzo_195.md', '# Deployment owner\nJordan owns deployment.');

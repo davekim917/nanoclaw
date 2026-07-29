@@ -208,7 +208,7 @@ export async function writeGeneratedMemory(
   options: { nowMs?: number } = {},
 ): Promise<CuratorWriteResult> {
   if (Buffer.byteLength(content, 'utf8') > GENERATED_MEMORY_MAX_BYTES) {
-    throw new Error('generated memory exceeds 256 KiB');
+    throw new Error(`generated memory exceeds ${GENERATED_MEMORY_MAX_BYTES} bytes`);
   }
   ensureGeneratedDirectory(workgroupId);
   const current = readGeneratedMemory(workgroupId);
