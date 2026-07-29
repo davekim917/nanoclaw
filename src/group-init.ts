@@ -36,7 +36,7 @@ const REQUIRED_ENV: Record<string, string> = {
   // [1m] sessions that default triggers compaction at ~165k instead of at
   // 80% of 1M. Forcing the window to 1_000_000 aligns the percentage with
   // the [1m] capacity. Non-[1m] sessions still hit their own window first.
-  CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000'
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
   // Disable adaptive thinking so the CLI emits visible `thinking` content
   // blocks (the older fixed-budget mode). The CLI's internal gate only
   // applies this to model ids containing "opus-4-6" or "sonnet-4-6"; for
