@@ -241,7 +241,17 @@ function normalizeMemoryText(text: string): string {
     .trim()
     .replace(/^(?:[-*]|\d+[.)])\s+/, '');
   if (!normalized) throw new Error('curator memory text is empty');
-  if (normalized.length > CURATOR_MAX_MEMORY_TEXT_CHARS) throw new Error('curator memory text exceeds the maximum');
+  if (normalized.length > CURATOR_MAX_MEMORY_TEXT_CHARS) {
+    // Carry the actual length as a property rather than in the message: the
+    // repair table keys on the exact message, and without this number there is
+    // no way to tell a candidate that missed by 20 characters from one that
+    // wanted to write ten times the limit — which is the difference between
+    // "raise the limit" and "the model is dumping a transcript".
+    throw Object.assign(new Error('curator memory text exceeds the maximum'), {
+      candidateChars: normalized.length,
+      limitChars: CURATOR_MAX_MEMORY_TEXT_CHARS,
+    });
+  }
   if (/<!--|-->|nanoclaw-memory:/i.test(normalized)) {
     throw new Error('curator memory text contains presentation markup');
   }

@@ -472,11 +472,18 @@ export class MemoryCuratorWorker {
     } catch (error) {
       const errorClass = classifyError(error);
       this.deps.fail(episode, errorClass, nowMs);
+      const detail = error as { candidateChars?: number; limitChars?: number };
       log.warn('memory-curator: episode failed', {
         workgroupId: episode.workgroupId,
         episodeKey: episode.episodeKey,
         errorClass,
         error: error instanceof Error ? error.message : String(error),
+        // Only present on a length rejection. Without it a length failure is
+        // unattributable: there is no way to tell "missed by 20 characters" from
+        // "tried to write a transcript", and those want opposite responses.
+        ...(typeof detail.candidateChars === 'number'
+          ? { candidateChars: detail.candidateChars, limitChars: detail.limitChars }
+          : {}),
       });
       return null;
     } finally {
