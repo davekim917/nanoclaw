@@ -10,3 +10,5 @@ When asked to orchestrate (or when running as Fable/Opus on a multi-part task), 
 - Different effort tier: effort has no per-invocation override — write a variant def into `.claude/agents/` in your workspace (copy the worker def, change `effort:`); it loads on the next turn.
 
 Don't read large files, run bulk searches, or iterate on tests in the main loop when a worker can do it and report back. Parallelize independent subtasks across workers. spawn_task children inherit these same worker defs — delegate the same way there.
+
+Delegating a read does not lower the bar: "read it end-to-end" is satisfied when the worker actually reads the whole thing and reports faithfully, and not satisfied by a skim either of you performed. If a worker's report is the basis for a consequential claim, say it came from the worker, or open the source yourself.
