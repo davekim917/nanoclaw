@@ -9,6 +9,7 @@ vi.mock('./log.js', async (importOriginal) => ({
 import {
   CODEX_PROJECT_DOC_MAX_BYTES,
   CODEX_PROJECT_DOC_WARN_BYTES,
+  PROTECTED_SECTION_MARKER,
   capCodexProjectDoc,
 } from './codex-project-doc-cap.js';
 
@@ -65,6 +66,41 @@ describe('capCodexProjectDoc', () => {
     expect(out).toContain('x'.repeat(24 * 1024)); // ...with its body intact
     expect(out).not.toContain('y'.repeat(9 * 1024)); // smaller section dropped
     expect(out).toContain('Drop Small'); // named in the omission note
+  });
+
+  it('spends unmarked sections before a PROTECTED_SECTION_MARKER one, even when the marked section is the smaller sufficient drop', () => {
+    // Discriminating case: BOTH removals individually fit, and the guarded
+    // section is the SMALLER one — so the smallest-sufficient rule alone would
+    // evict it. Precedence must outrank size. This is the production failure:
+    // `Credential Security` (small) was dropped while `Admin CLI (ncl)` (large,
+    // and rediscoverable via `ncl help`) survived.
+    const head = '# Title\n\nrules\n';
+    const guarded = `## Guarded\n\n${PROTECTED_SECTION_MARKER}\n${'g'.repeat(9 * 1024)}`;
+    const droppable = `## Droppable\n\n${'d'.repeat(24 * 1024)}`;
+    const doc = [head, guarded, droppable].join('\n');
+    expect(bytes(doc)).toBeGreaterThan(CODEX_PROJECT_DOC_MAX_BYTES);
+
+    const out = capCodexProjectDoc(doc);
+
+    expect(bytes(out)).toBeLessThanOrEqual(CODEX_PROJECT_DOC_MAX_BYTES);
+    expect(out).toContain('## Guarded'); // marked section survives...
+    expect(out).toContain('g'.repeat(9 * 1024)); // ...with its body intact
+    expect(out).not.toContain('d'.repeat(24 * 1024)); // unmarked one paid instead
+    expect(out).toContain('Droppable'); // named in the omission note
+  });
+
+  it('drops marked sections as a last resort rather than throwing, once no unmarked section is left', () => {
+    const head = '# Title\n\nrules\n';
+    const a = `## Guarded A\n\n${PROTECTED_SECTION_MARKER}\n${'a'.repeat(20 * 1024)}`;
+    const b = `## Guarded B\n\n${PROTECTED_SECTION_MARKER}\n${'b'.repeat(20 * 1024)}`;
+    const doc = [head, a, b].join('\n');
+
+    let out: string | undefined;
+    expect(() => {
+      out = capCodexProjectDoc(doc);
+    }).not.toThrow();
+    expect(bytes(out!)).toBeLessThanOrEqual(CODEX_PROJECT_DOC_MAX_BYTES);
+    expect(out).toContain('## Omitted for size');
   });
 
   it('does not throw when the head alone exceeds the cap (writes oversized)', () => {

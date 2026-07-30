@@ -10,11 +10,20 @@
  * This guard fits the composed doc under the cap by DEGRADING, never throwing:
  * a per-spawn throw would ride wakeContainer's transient-retry contract —
  * host-sweep respawns every 60s forever and the group goes silently dark.
- * Instead we drop top-level `## ` sections until it fits — smallest-sufficient
- * first, so we shed the least content (keeping the head — the peer-framing
- * preamble + whatever sits above the first `## `, where the highest-priority
- * rules live) — append an "Omitted for size" note so the agent knows, and log
- * loudly so the operator trims CLAUDE.md.
+ * Instead we drop top-level `## ` sections until it fits (keeping the head —
+ * the peer-framing preamble + whatever sits above the first `## `, where the
+ * highest-priority rules live) — append an "Omitted for size" note so the agent
+ * knows, and log loudly so the operator trims CLAUDE.md.
+ *
+ * Eviction order is two-tier: sections marked `PROTECTED_SECTION_MARKER` are
+ * spent only after every unmarked one is gone, and within a tier the smallest
+ * sufficient section goes first so we shed the least content. Size alone is
+ * content-blind — see the marker's docblock for the production failure that
+ * motivated the precedence tier.
+ *
+ * Only Codex is capped. `project_doc_max_bytes` is a Codex setting, so
+ * `claude-md-compose.ts` calls this for Codex groups only; OpenCode and Claude
+ * groups get the full doc.
  *
  * Constants mirror Codex's own default project-doc cap (`project_doc_max_bytes`,
  * 32KB) so we degrade under our control instead of letting Codex truncate
@@ -26,6 +35,24 @@ import { log } from './log.js';
 
 export const CODEX_PROJECT_DOC_MAX_BYTES = 32 * 1024;
 export const CODEX_PROJECT_DOC_WARN_BYTES = 28 * 1024;
+
+/**
+ * A `## ` section containing this marker is dropped only as a last resort —
+ * after every unmarked section is already gone. Mark the behavioral invariants
+ * whose silent disappearance is a safety or correctness problem (credential
+ * handling, container lifecycle, truth-grounding), NOT merely useful prose.
+ *
+ * The marker lives next to the rule it protects (in `container/CLAUDE.md` or a
+ * fragment) rather than in a title list here, so protection can't drift out of
+ * sync with a renamed heading. It is an HTML comment, so it costs the agent
+ * nothing to read.
+ *
+ * Rationale: size-ranked dropping is content-blind. In production it evicted
+ * `Credential Security` from one group and `Feature Work Routing` from three
+ * while keeping `Admin CLI (ncl)` — whose content is fully rediscoverable via
+ * `ncl help`. Precedence first, then smallest-sufficient within a tier.
+ */
+export const PROTECTED_SECTION_MARKER = '<!-- nanoclaw:keep -->';
 
 const bytesOf = (s: string): number => Buffer.byteLength(s, 'utf-8');
 
@@ -84,8 +111,10 @@ export function capCodexProjectDoc(content: string, label = 'AGENTS.md'): string
       .split('\n', 1)[0]
       .replace(/^##\s+/, '')
       .trim(),
+    guarded: text.includes(PROTECTED_SECTION_MARKER),
   }));
   const droppedTitles: string[] = [];
+  const droppedGuarded: string[] = [];
 
   const omissionNote = (titles: string[]): string =>
     `## Omitted for size\n\nThese sections were omitted to fit Codex's ${Math.round(
@@ -100,15 +129,18 @@ export function capCodexProjectDoc(content: string, label = 'AGENTS.md'): string
     return parts.join('\n');
   };
 
-  // Drop sections until it fits, losing as little as possible. At each step
-  // prefer the SMALLEST single section whose removal already makes the doc fit
-  // (minimal content loss — shed a 2KB section, not the 6KB one beside it);
-  // only when no single section suffices fall back to removing the largest
-  // (fastest progress). When just the head is left and still oversized, stop
-  // and write it rather than brick the group — Codex truncates, but the cause
-  // is logged below.
+  // Drop sections until it fits, losing as little as possible. Two tiers:
+  // unmarked sections are spent first, and only once none remain do we start
+  // evicting `PROTECTED_SECTION_MARKER` sections. WITHIN a tier the rule is
+  // unchanged — prefer the SMALLEST single section whose removal already makes
+  // the doc fit (minimal content loss — shed a 2KB section, not the 6KB one
+  // beside it); only when no single section suffices fall back to removing the
+  // largest (fastest progress). When just the head is left and still oversized,
+  // stop and write it rather than brick the group — Codex truncates, but the
+  // cause is logged below.
   while (kept.length > 0 && bytesOf(assemble(kept, droppedTitles)) > CODEX_PROJECT_DOC_MAX_BYTES) {
-    const bySizeAsc = [...kept.keys()].sort((a, b) => kept[a].bytes - kept[b].bytes);
+    const tier = kept.some((s) => !s.guarded) ? [...kept.keys()].filter((i) => !kept[i].guarded) : [...kept.keys()];
+    const bySizeAsc = tier.sort((a, b) => kept[a].bytes - kept[b].bytes);
     let pick = bySizeAsc.find(
       (i) =>
         bytesOf(
@@ -121,16 +153,28 @@ export function capCodexProjectDoc(content: string, label = 'AGENTS.md'): string
     if (pick === undefined) pick = bySizeAsc[bySizeAsc.length - 1];
     const [removed] = kept.splice(pick, 1);
     if (removed.title) droppedTitles.push(removed.title);
+    if (removed.guarded && removed.title) droppedGuarded.push(removed.title);
   }
 
   const out = assemble(kept, droppedTitles);
+  // `dropped` names the sections, not just a count: the count-only version of
+  // this log fired 4,131 times without anyone noticing that Credential Security
+  // and Feature Work Routing were the casualties. Never log a silent deletion
+  // without naming what was deleted.
   log.error('Codex project doc exceeded size cap — dropped sections to fit', {
     label,
     originalBytes: bytes,
     finalBytes: bytesOf(out),
     maxBytes: CODEX_PROJECT_DOC_MAX_BYTES,
     droppedCount: droppedTitles.length,
+    dropped: droppedTitles,
     headOversized: droppedTitles.length === 0,
   });
+  if (droppedGuarded.length > 0) {
+    log.error('Codex project doc dropped PROTECTED sections — behavioral invariants are missing', {
+      label,
+      droppedGuarded,
+    });
+  }
   return out;
 }

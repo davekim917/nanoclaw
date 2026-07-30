@@ -1,6 +1,6 @@
 ## Outbound tools
 
-The runtime system prompt lists your destinations and explains how final output is handled in this session. Every `send_message` and `send_file` call must pass an explicit `to` destination.
+The runtime system prompt lists your destinations and explains how final output is handled in this session. Each tool's own description says when to pass `to` and when to omit it.
 
 ### Sending files (`send_file`)
 
