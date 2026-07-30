@@ -8,8 +8,7 @@
  *
  * What changes the daemon catches:
  *   - `~/.claude/CLAUDE.md`                        — top-level behavioral rules
- *   - `~/.claude/` glob `*.md`                     — any `@`-included file (RTK.md today,
- *                                                    anything else Operator adds tomorrow)
+ *   - `~/.claude/` glob `*.md`                     — any top-level `@`-included file
  *   - `~/.claude/agents/*.md`                      — Claude personal-scope subagents
  *   - `~/.codex/config.toml`                       — local marketplace installs/enabled state
  *   - `~/plugins/` recursive `SKILL.md` files      — every plugin-bundled skill

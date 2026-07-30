@@ -13,7 +13,7 @@ deliverable changes and the verification steps so future drift can be caught.
 
 1. **`~/.codex/AGENTS.md`** — substantive global rules mirroring
    `~/.claude/CLAUDE.md` (Communication Style, Truth-Grounded, Completion
-   Protocol, Owner-mode, Reviewing Peer-AI Feedback). Keeps `@RTK.md` include.
+   Protocol, Owner-mode, Reviewing Peer-AI Feedback).
 2. **`~/.codex/config.toml`** — added `playwright`, `context7`, `deepwiki` MCP
    servers alongside the existing `exa` and `gitnexus`.
 3. **`~/.codex/hooks.json`** — wired Stop (mnemon capture), UserPromptSubmit
@@ -170,9 +170,6 @@ operator-placed) so we never overwrite them.
 
 ### Container parity (run after host restart + container respawn)
 
-Use `rtk proxy docker ps` to bypass the rtk docker-wrapper rewrite — plain
-`docker ps` may be rewritten and lose `--format` flag.
-
 | # | What | How | Expected |
 |---|------|-----|----------|
 | 8 | Container build picks up new code | `pnpm run build && sudo systemctl restart nanoclaw-v2`, wait ~5s | New containers under `nanoclaw-v2-*` Up |
@@ -186,7 +183,7 @@ Use `rtk proxy docker ps` to bypass the rtk docker-wrapper rewrite — plain
 | # | What | Command | Expected |
 |---|------|---------|----------|
 | 13 | Host: Codex sees all 20 Claude skills | `ls ~/.codex/skills/ \| wc -l` | `20` (plus `.system/` hidden) |
-| 14 | Host: AGENTS.md has @-includes resolved | `grep -c '^@' ~/.codex/AGENTS.md` | `0` (RTK.md content inline) |
+| 14 | Host: AGENTS.md has @-includes resolved | `grep -c '^@' ~/.codex/AGENTS.md` | `0` |
 | 15 | Host: regenerate AGENTS.md after editing CLAUDE.md | `pnpm exec tsx scripts/sync-codex-agents-md.ts` | reports byte count, AGENTS.md updated |
 | 16 | Container: group AGENTS.md generated | `ls -la groups/main/AGENTS.md` | exists, regenerated on each spawn |
 | 17 | Container: group AGENTS.md has no @-includes | `grep -c '^@\./' groups/main/AGENTS.md` | `0` |
@@ -219,7 +216,7 @@ Use `rtk proxy docker ps` to bypass the rtk docker-wrapper rewrite — plain
 
 When editing behavioral rules:
 
-1. Edit `~/.claude/CLAUDE.md` (or any `@`-included file like `~/.claude/RTK.md`).
+1. Edit `~/.claude/CLAUDE.md` (or any top-level `@`-included file).
 2. Run `pnpm exec tsx scripts/sync-codex-agents-md.ts` (host) to regenerate
    `~/.codex/AGENTS.md` with the resolved content.
 3. For group-level rules: the next container spawn auto-regenerates

@@ -155,6 +155,7 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(settings.autoMemoryEnabled).toBe(false);
     expect(settings.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1');
     expect(settings.hooks.SessionStart).toBeUndefined();
+    expect(settings.hooks.PreToolUse).toBeUndefined();
 
     withWorkgroup(ag);
     ensureContainerConfig(ag.id);

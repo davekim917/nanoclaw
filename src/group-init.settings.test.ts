@@ -48,6 +48,7 @@ describe('default settings.json for new groups', () => {
     expect(settings.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1');
     expect(settings.autoMemoryEnabled).toBe(false);
     expect(JSON.stringify(settings.hooks.PreCompact)).toContain('compact-instructions');
+    expect(settings.hooks.PreToolUse).toBeUndefined();
   });
 
   it('never rewrites an existing settings.json — a hand-edited re-enable sticks', () => {

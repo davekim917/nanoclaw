@@ -39,7 +39,7 @@ All are committed. CI and the Dockerfile run frozen/hash-locked install variants
 
 ## Image build surface
 
-`container/Dockerfile` uses pinned helper stages for MCP Toolbox and RTK, then a `node:22-slim` runtime stage:
+`container/Dockerfile` uses a pinned helper stage for MCP Toolbox, then a `node:22-slim` runtime stage:
 
 - **Pinned ARGs** — Bun, pnpm, helper tools, and global Node CLI versions are explicit Dockerfile build arguments. Bump deliberately in PRs. `INSTALL_CJK_FONTS` is the only feature-style build argument.
 - **CJK fonts** — `ARG INSTALL_CJK_FONTS=false`. `container/build.sh` reads `INSTALL_CJK_FONTS` from `.env` and passes it through. Default build saves ~200MB; opt in when the user works with Chinese/Japanese/Korean content.
