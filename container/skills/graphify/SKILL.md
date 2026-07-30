@@ -18,8 +18,8 @@ The graph is selected from trusted session context and maintained automatically.
 Ordinary file additions, edits, and deletions are applied as small transactional
 deltas. Queries use the latest complete generation immediately instead of
 blocking behind a safety rebuild; `graphify status` reports `dirty` or
-`reconciling` while a newer generation is in flight. Slower structural and
-semantic enrichment remains asynchronous.
+`reconciling` while a newer generation is in flight. Slower structural
+enrichment remains asynchronous.
 You do not need to choose a project, pre-authorize a folder, or manually refresh
 an index before asking a question. Queries work from any directory. In a managed
 worktree, the gateway reconciles current edits, new files, and deletions as the
@@ -41,6 +41,22 @@ Then inspect the source directly by opening the cited file or conversation
 provenance before drawing a final conclusion or changing code. Graphify results
 are advisory. Source and tests are authoritative; for code changes, run the
 repository's normal verification.
+
+### An empty result means "no term match", not "no such knowledge"
+
+The graph is built from the words that actually appear in your sources, so a
+model named `customer_ltv` will not match "retention" if that word is nowhere in
+the file. Treat zero nodes as a prompt to widen, not as an answer:
+
+1. Re-query with adjacent vocabulary — a likely table, file, or symbol name, the
+   project or person involved, or the term a teammate would have used.
+2. As soon as any related node comes back, use `path`, `explain`, or `affected`
+   to reach the rest. Those follow real indexed relationships rather than text,
+   so they cross the vocabulary gap that a keyword search cannot.
+
+Make the conceptual connection yourself from the sources you retrieve — that
+reasoning is yours to do, and it is why the graph does not precompute it. Only
+after widening and traversing should you report that the graph lacks coverage.
 
 `graphify --help` and `graphify <command> --help` show syntax without inspecting
 or refreshing a graph. `graphify status` reports workgroup freshness and indexing
