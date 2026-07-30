@@ -119,6 +119,7 @@ async function runCreateAgent(content: Record<string, unknown>, session: Session
         expires_at: null,
         status: 'pending',
         title: 'Create agent',
+        question: 'Create this agent?',
         options_json: '[]',
         approver_user_id: 'test-admin',
       } satisfies PendingApproval,

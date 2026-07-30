@@ -412,6 +412,28 @@ describe('Chat SDK bridge Discord approval actions', () => {
     expect(JSON.parse(callbackInit!.body as string)).toMatchObject({ type: 7 });
   });
 
+  it("decodes Discord's newline-delimited custom_id before resolving the option", async () => {
+    seedApproval('appr-discord-wire');
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const onAction = vi.fn();
+
+    // @chat-adapter/discord encodes a button carrying both id and value as
+    // `${actionId}\n${value}`. This is the literal wire shape from Discord,
+    // not the already-decoded shape delivered through Chat.processAction.
+    await handleForwardedEvent(
+      interaction('ncq:appr-discord-wire:0\n0'),
+      { name: 'gateway-stub', handleWebhook: vi.fn(async () => new Response('ok')) } as unknown as Adapter,
+      { onInbound: async () => {}, onInboundEvent: async () => {}, onMetadata: () => {}, onAction },
+      'bot-token',
+    );
+
+    expect(onAction).toHaveBeenCalledWith('appr-discord-wire', 'approve', 'U1');
+    const callbackInit = fetchMock.mock.calls[0]?.[1];
+    expect(callbackInit).toBeDefined();
+    expect(JSON.parse(callbackInit!.body as string)).toMatchObject({ type: 7 });
+  });
+
   it('keeps a Discord approval pending when its indexed option cannot be resolved', async () => {
     const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response(null, { status: 204 }));
     vi.stubGlobal('fetch', fetchMock);

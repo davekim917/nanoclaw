@@ -289,6 +289,7 @@ export interface PendingQuestion {
   channel_type: string | null;
   thread_id: string | null;
   title: string;
+  question: string;
   options: import('./channels/ask-question.js').NormalizedOption[];
   created_at: string;
 }
@@ -315,6 +316,7 @@ export interface PendingApproval {
   expires_at: string | null;
   status: 'pending' | 'approved' | 'rejected' | 'expired' | 'awaiting_reason';
   title: string;
+  question: string;
   options_json: string;
   /** When set, only this exact user may resolve the approval. */
   approver_user_id: string | null;

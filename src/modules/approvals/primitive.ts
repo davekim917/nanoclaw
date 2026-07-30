@@ -326,6 +326,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
     payload: JSON.stringify(payload),
     created_at: new Date().toISOString(),
     title,
+    question,
     options_json: JSON.stringify(normalizedOptions),
     // Populate the routing columns so the host can edit the card later
     // — cancel-on-follow-up (bash-gate), timeout, or other resolutions

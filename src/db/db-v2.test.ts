@@ -681,6 +681,7 @@ describe('pending questions', () => {
       channel_type: 'discord',
       thread_id: null,
       title: 'Test',
+      question: 'Choose an answer',
       options: [{ label: 'Yes', selectedLabel: 'Yes', value: 'yes' }],
       created_at: now(),
     });
@@ -688,6 +689,7 @@ describe('pending questions', () => {
     expect(result).toBeDefined();
     expect(result!.session_id).toBe('sess-1');
     expect(result!.title).toBe('Test');
+    expect(result!.question).toBe('Choose an answer');
     expect(result!.options[0].value).toBe('yes');
   });
 
@@ -700,6 +702,7 @@ describe('pending questions', () => {
       channel_type: null,
       thread_id: null,
       title: 'Test',
+      question: 'Choose an answer',
       options: [{ label: 'Yes', selectedLabel: 'Yes', value: 'yes' }],
       created_at: now(),
     });

@@ -367,6 +367,21 @@ function resolveSelectedOption(
 }
 
 /**
+ * Decode the raw Discord custom_id shape emitted by @chat-adapter/discord.
+ * The adapter joins a button's action id and value with a newline; forwarded
+ * Gateway events bypass the adapter's normal decoder and therefore need the
+ * same split here before parsing NanoClaw's `ncq:<id>:<index>` action id.
+ */
+function decodeDiscordCustomId(customId: string): { actionId: string; value: string | undefined } {
+  const delimiter = customId.indexOf('\n');
+  if (delimiter === -1) return { actionId: customId, value: undefined };
+  return {
+    actionId: customId.slice(0, delimiter),
+    value: customId.slice(delimiter + 1),
+  };
+}
+
+/**
  * Parse a 429 rate-limit error and return the number of milliseconds the
  * caller should wait before retrying, or null if the error isn't a 429.
  *
@@ -863,11 +878,23 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // Update the card to show the selected answer, who acted, and remove buttons
         const actorName = event.user?.userName || event.user?.fullName || '';
         const byLine = actorName ? ` — ${actorName}` : '';
+        const resolution = `${selectedLabel}${byLine}`;
         try {
           const tid = event.threadId;
-          await adapter.editMessage(tid, event.messageId, {
-            markdown: `${title}\n\n${selectedLabel}${byLine}`,
-          });
+          await adapter.editMessage(
+            tid,
+            event.messageId,
+            render?.question
+              ? {
+                  card: Card({
+                    title,
+                    subtitle: render.question,
+                    children: [CardText(resolution, { style: 'muted' })],
+                  }),
+                  fallbackText: `${title}\n\n${render.question}\n\n${resolution}`,
+                }
+              : { markdown: `${title}\n\n${resolution}` },
+          );
         } catch (err) {
           log.warn('Failed to update card after action', { err });
         }
@@ -991,8 +1018,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const options: NormalizedOption[] = normalizeOptions(content.options as never);
         const card = Card({
           title: displayTitle,
+          // Both the Discord and Slack adapters render Card.subtitle as the
+          // native card description. Keeping the decision context here avoids
+          // a platform producing a visually blank card body beside its buttons.
+          subtitle: question,
           children: [
-            CardText(question),
             Actions(
               // Encode button id/value with the option index rather than the
               // full value. Telegram caps callback_data at 64 bytes, and
@@ -1537,9 +1567,10 @@ export async function handleForwardedEvent(
     // type 3 = MessageComponent (button/select)
     if (interaction.type === 3) {
       const customId = (interaction.data as Record<string, unknown>)?.custom_id as string;
+      const decoded = typeof customId === 'string' ? decodeDiscordCustomId(customId) : undefined;
       // Only NanoClaw approval cards belong to this bridge. Let the adapter
       // receive every other component interaction unchanged below.
-      if (customId?.startsWith('ncq:')) {
+      if (decoded?.actionId.startsWith('ncq:')) {
         // In guilds the clicker is at interaction.member.user; in DMs it's interaction.user directly.
         const user =
           ((interaction.member as Record<string, unknown>)?.user as Record<string, string> | undefined) ??
@@ -1550,11 +1581,11 @@ export async function handleForwardedEvent(
         // Parse the selected option from custom_id
         let questionId: string | undefined;
         let tail: string | undefined;
-        if (customId?.startsWith('ncq:')) {
-          const colonIdx = customId.indexOf(':', 4); // after "ncq:"
+        if (decoded.actionId.startsWith('ncq:')) {
+          const colonIdx = decoded.actionId.indexOf(':', 4); // after "ncq:"
           if (colonIdx !== -1) {
-            questionId = customId.slice(4, colonIdx);
-            tail = customId.slice(colonIdx + 1);
+            questionId = decoded.actionId.slice(4, colonIdx);
+            tail = decoded.actionId.slice(colonIdx + 1);
           }
         }
 
@@ -1565,7 +1596,7 @@ export async function handleForwardedEvent(
         const render = questionId ? getAskQuestionRender(questionId) : undefined;
         // Discord custom_id mirrors the new index-based encoding (see Button
         // construction). Decode back to the real option value for downstream.
-        const selectedOption = resolveSelectedOption(render, tail, tail);
+        const selectedOption = resolveSelectedOption(render, decoded.value, tail);
         if (!questionId || !selectedOption) {
           log.warn('Ignoring Discord card action with an unresolved option', {
             questionId: questionId ?? '',
@@ -1604,7 +1635,7 @@ export async function handleForwardedEvent(
                 embeds: [
                   {
                     title: cardTitle,
-                    description: `${originalDescription}\n\n${selectedLabel}`,
+                    description: `${originalDescription || render?.question || ''}\n\n${selectedLabel}`,
                   },
                 ],
                 components: [], // remove buttons

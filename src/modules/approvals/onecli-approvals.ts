@@ -87,6 +87,15 @@ export function resolveOneCLIApproval(approvalId: string, selectedOption: string
     return false;
   }
 
+  if (selectedOption !== 'approve' && selectedOption !== 'reject') {
+    log.warn('Ignoring OneCLI approval response with an unknown option', {
+      approvalId,
+      selectedOption,
+      userId,
+    });
+    return true;
+  }
+
   pending.delete(approvalId);
   clearTimeout(state.timer);
 
@@ -211,6 +220,7 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
     expires_at: request.expiresAt,
     status: 'pending',
     title: onecliTitle,
+    question,
     options_json: JSON.stringify(onecliOptions),
   });
 

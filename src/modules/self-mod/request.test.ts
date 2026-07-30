@@ -387,7 +387,7 @@ describe('escapeInvisibles', () => {
 });
 
 describe('add_mcp_server card through the chat-sdk bridge', () => {
-  it('delivers CardText with the fence intact and escapes still visible', async () => {
+  it('delivers the card subtitle with the fence intact and escapes still visible', async () => {
     await submitAddMcpServer(
       {
         name: 'safe',
@@ -413,8 +413,8 @@ describe('add_mcp_server card through the chat-sdk bridge', () => {
     await bridge.deliver('slack:C1', null, { kind: 'chat-sdk', content: cardContent });
 
     expect(posts).toHaveLength(1);
-    const msg = posts[0].message as { card?: { children?: Array<{ type?: string; content?: string }> } };
-    const text = msg.card?.children?.find((c) => c.type === 'text')?.content ?? '';
+    const msg = posts[0].message as { card?: { subtitle?: string } };
+    const text = msg.card?.subtitle ?? '';
     expect(text.split('```')).toHaveLength(3);
     expect(text).toContain('\\u0060');
     expect(text).not.toContain('\u202e');

@@ -398,12 +398,36 @@ describe('createChatSdkBridge.deliver — ask_question cards', () => {
     });
 
     expect(calls).toHaveLength(1);
-    const msg = calls[0].message as { card?: { title?: string }; fallbackText?: string };
+    const msg = calls[0].message as { card?: { title?: string; subtitle?: string }; fallbackText?: string };
     const renderedTitle = msg.card?.title ?? '';
     expect(Array.from(renderedTitle)).toHaveLength(150);
     expect(renderedTitle).toMatch(/…$/);
     expect(hasLoneSurrogate(renderedTitle)).toBe(false);
+    expect(msg.card?.subtitle).toBe('Pick one');
     expect(msg.fallbackText?.startsWith(renderedTitle)).toBe(true);
+  });
+
+  it('puts decision context in the native card description used by Discord and Slack', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+
+    await bridge.deliver('discord:GUILD:CHANNEL', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'approval-with-detail',
+        title: 'Install Packages Request',
+        question: 'Agent "number-drinks" wants to install WebKit libraries. Approve?',
+        options: ['Approve', 'Reject'],
+      },
+    });
+
+    const msg = calls[0].message as { card?: { subtitle?: string }; fallbackText?: string };
+    expect(msg.card?.subtitle).toBe('Agent "number-drinks" wants to install WebKit libraries. Approve?');
+    expect(msg.fallbackText).toContain('Agent "number-drinks" wants to install WebKit libraries. Approve?');
   });
 });
 

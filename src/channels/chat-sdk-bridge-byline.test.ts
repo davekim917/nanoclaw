@@ -21,15 +21,16 @@ vi.mock('../webhook-server.js', () => ({
   }),
 }));
 
-import { closeDb, initTestDb, runMigrations } from '../db/index.js';
-import { createPendingApproval } from '../db/sessions.js';
+import { closeDb, createAgentGroup, createSession, initTestDb, runMigrations } from '../db/index.js';
+import { createPendingApproval, createPendingQuestion } from '../db/sessions.js';
 import type { ChannelSetup } from './adapter.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 
 interface CapturedEdit {
   threadId: string;
   messageId: string;
-  markdown: string;
+  markdown?: string;
+  card?: { title?: string; subtitle?: string; children?: Array<{ type?: string; content?: string }> };
 }
 
 function makeAdapter(edits: CapturedEdit[]): Adapter {
@@ -37,8 +38,15 @@ function makeAdapter(edits: CapturedEdit[]): Adapter {
     name: 'stub',
     initialize: async () => {},
     channelIdFromThreadId: (threadId: string) => `stub:${threadId}`,
-    editMessage: async (threadId: string, messageId: string, content: { markdown: string }) => {
-      edits.push({ threadId, messageId, markdown: content.markdown });
+    editMessage: async (
+      threadId: string,
+      messageId: string,
+      content: {
+        markdown?: string;
+        card?: { title?: string; subtitle?: string; children?: Array<{ type?: string; content?: string }> };
+      },
+    ) => {
+      edits.push({ threadId, messageId, markdown: content.markdown, card: content.card });
     },
   } as unknown as Adapter;
 }
@@ -78,7 +86,7 @@ async function fireAction(
   return { edits, actions };
 }
 
-function seedApproval(id: string, title = '⚠️ Test approval'): void {
+function seedApproval(id: string, title = '⚠️ Test approval', question = ''): void {
   createPendingApproval({
     approval_id: id,
     request_id: id,
@@ -86,10 +94,45 @@ function seedApproval(id: string, title = '⚠️ Test approval'): void {
     payload: '{}',
     created_at: new Date().toISOString(),
     title,
+    question,
     options_json: JSON.stringify([
       { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve', style: 'primary' },
       { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject', style: 'danger' },
     ]),
+  });
+}
+
+function seedInteractiveQuestion(id: string, title: string, question: string): void {
+  const createdAt = new Date().toISOString();
+  createAgentGroup({
+    id: 'ag-1',
+    name: 'Agent',
+    folder: 'agent',
+    agent_provider: null,
+    created_at: createdAt,
+  });
+  createSession({
+    id: 'sess-1',
+    agent_group_id: 'ag-1',
+    messaging_group_id: null,
+    thread_id: null,
+    agent_provider: null,
+    status: 'active',
+    container_status: 'stopped',
+    last_active: null,
+    created_at: createdAt,
+  });
+  createPendingQuestion({
+    question_id: id,
+    session_id: 'sess-1',
+    message_out_id: `out-${id}`,
+    platform_id: 'C1',
+    channel_type: 'slack',
+    thread_id: null,
+    title,
+    question,
+    options: [{ label: 'Proceed', selectedLabel: '✅ Proceeded', value: 'proceed' }],
+    created_at: createdAt,
   });
 }
 
@@ -140,6 +183,35 @@ describe('chat-sdk-bridge approval-card byline', () => {
     expect(actions).toEqual(['q-1:approve:U1']);
     expect(edits).toHaveLength(1);
     expect(edits[0].markdown).toContain('✅ Approved');
+  });
+
+  it('keeps the decision context visible after an approval resolves', async () => {
+    seedApproval('q-1', 'Install Packages Request', 'Agent "number-drinks" wants to install WebKit libraries.');
+
+    const { edits, actions } = await fireAction(
+      { userId: 'U1', userName: 'gavriel' },
+      { actionId: 'ncq:q-1:0', value: '0' },
+    );
+
+    expect(actions).toEqual(['q-1:approve:U1']);
+    expect(edits).toHaveLength(1);
+    expect(edits[0].card?.title).toBe('Install Packages Request');
+    expect(edits[0].card?.subtitle).toBe('Agent "number-drinks" wants to install WebKit libraries.');
+    expect(edits[0].card?.children?.[0]?.content).toContain('✅ Approved — gavriel');
+  });
+
+  it('keeps interactive-question context visible when pending_questions is the render source', async () => {
+    seedInteractiveQuestion('interactive-1', 'Choose a path', 'Which deployment path should I use?');
+
+    const { edits, actions } = await fireAction(
+      { userId: 'U1', userName: 'gavriel' },
+      { actionId: 'ncq:interactive-1:0', value: '0' },
+    );
+
+    expect(actions).toEqual(['interactive-1:proceed:U1']);
+    expect(edits[0].card?.title).toBe('Choose a path');
+    expect(edits[0].card?.subtitle).toBe('Which deployment path should I use?');
+    expect(edits[0].card?.children?.[0]?.content).toContain('✅ Proceeded — gavriel');
   });
 
   it('does not turn an unresolved indexed button into a rejection', async () => {

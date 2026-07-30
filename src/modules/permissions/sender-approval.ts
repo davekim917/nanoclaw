@@ -129,6 +129,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     approver_user_id: target.userId,
     created_at: new Date().toISOString(),
     title,
+    question,
     options_json: JSON.stringify(options),
   });
   if (!created) {

@@ -162,6 +162,40 @@ describe('approval response authorization', () => {
     expect(getPendingApproval('appr-3')).toBeUndefined();
   });
 
+  it('keeps an approval pending when an authorized click carries an unknown value', async () => {
+    upsertUser({ id: 'discord:owner', kind: 'discord', display_name: 'Owner', created_at: now() });
+    grantRole({ user_id: 'discord:owner', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+
+    const { registerApprovalHandler } = await import('./primitive.js');
+    const { handleApprovalsResponse } = await import('./response-handler.js');
+    const handler = vi.fn().mockResolvedValue(undefined);
+    registerApprovalHandler('malformed_value_guard', handler);
+
+    createPendingApproval({
+      approval_id: 'appr-malformed',
+      session_id: 'sess-1',
+      request_id: 'appr-malformed',
+      action: 'malformed_value_guard',
+      payload: JSON.stringify({}),
+      created_at: now(),
+      title: 'Approval',
+      options_json: JSON.stringify([]),
+    });
+
+    const claimed = await handleApprovalsResponse({
+      questionId: 'appr-malformed',
+      value: '0\n0',
+      userId: 'owner',
+      channelType: 'discord',
+      platformId: 'dm-owner',
+      threadId: null,
+    });
+
+    expect(claimed).toBe(true);
+    expect(handler).not.toHaveBeenCalled();
+    expect(getPendingApproval('appr-malformed')).toBeDefined();
+  });
+
   it('an approval with approver_user_id is resolvable by that user, not a non-assignee', async () => {
     const { registerApprovalHandler } = await import('./primitive.js');
     const { handleApprovalsResponse } = await import('./response-handler.js');

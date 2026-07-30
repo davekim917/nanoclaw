@@ -100,9 +100,21 @@ async function handleRegisteredApproval(
     return;
   }
 
-  // Plain Reject (or any other non-approve value) — instant fast path.
-  if (selectedOption !== 'approve') {
+  // Plain Reject — instant fast path. Unknown values are untrusted transport
+  // input, not a user decision: keep the approval pending instead of turning
+  // a malformed callback into a rejection.
+  if (selectedOption === 'reject') {
     await finalizeReject(approval, session, userId);
+    return;
+  }
+
+  if (selectedOption !== 'approve') {
+    log.warn('Ignoring approval response with an unknown option', {
+      approvalId: approval.approval_id,
+      action: approval.action,
+      selectedOption,
+      userId,
+    });
     return;
   }
 
