@@ -178,7 +178,7 @@ export const sendFile: McpToolDefinition = {
   tool: {
     name: 'send_file',
     description:
-      'Send a file. Omit `to` to post in the current conversation (the thread/channel you are working in) — the default, regardless of destination count. Pass `to` only to reach a different destination than the current conversation.',
+      'Send a file from your workspace. Omit `to` to post in the current conversation (the thread/channel you are working in) — the default, regardless of destination count. Pass `to` only to reach a different destination than the current conversation. Use this to deliver artifacts you produced — charts, PDFs, generated images, reports, self-contained HTML — rather than dumping their contents into chat.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -324,7 +324,8 @@ export const editMessage: McpToolDefinition = {
 export const addReaction: McpToolDefinition = {
   tool: {
     name: 'add_reaction',
-    description: 'Add an emoji reaction to a message.',
+    description:
+      'Add an emoji reaction to an inbound message, addressed by the numeric #N id shown on it. Good for lightweight acknowledgment when a full reply would be noise — eyes for seen, white_check_mark for done.',
     inputSchema: {
       type: 'object' as const,
       properties: {
