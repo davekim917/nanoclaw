@@ -26,23 +26,25 @@ The host is a single Node process that orchestrates per-session agent containers
 ## Entity Model
 
 ```
-users (id "<channel>:<handle>", kind, display_name)
-user_roles (user_id, role, agent_group_id)       — owner | admin (global or scoped)
-agent_group_members (user_id, agent_group_id)    — unprivileged access gate
-user_dms (user_id, channel_type, messaging_group_id) — cold-DM cache
-
-workgroups (id slug, display_name, onecli_secrets JSON)
-    ↑ 1:many
-agent_groups (... workgroup_id REFERENCES workgroups.id, plus workspace, CLAUDE.md, personality, container config)
-    ↕ many-to-many via messaging_group_agents (session_mode, engage_mode/engage_pattern, sender_scope, priority)
-messaging_groups (one chat/channel on one platform; instance = adapter-instance name, defaults to channel_type; unknown_sender_policy)
-
-sessions (agent_group_id + messaging_group_id + thread_id → per-session container)
+workgroups  →  agent_groups  ⇄  messaging_groups  →  sessions
+                    (many-to-many via messaging_group_agents)
+users → user_roles (owner|admin, global or scoped) + agent_group_members
 ```
 
-Sibling agent_groups (parent + codex twin and future siblings like `<x>-research`) share a workgroup; the workgroup is the data-pool boundary for chat archive, Graphify retrieval, shared files, and OneCLI secret declarations. Each agent_group keeps its own platform bot user, CLAUDE.md, routing identity, and mention-engage rules — the workgroup is the layer above, not a collapse. See [docs/workgroups.md](docs/workgroups.md) for the full model.
+A **messaging_group** is one chat/channel on one platform; an **agent_group** is
+one agent identity; a **session** is the (agent_group, messaging_group, thread)
+triple that owns a container.
 
-Privilege is user-level (owner/admin), not agent-group-level. See [docs/isolation-model.md](docs/isolation-model.md) for the three isolation levels (`agent-shared`, `shared`, separate agents).
+Two things that are easy to get wrong:
+
+- **Privilege is user-level, not agent-group-level** — owner/admin live on
+  `user_roles`. See [docs/isolation-model.md](docs/isolation-model.md).
+- **Siblings share a workgroup, they do not collapse into one.** The workgroup is
+  the data-pool boundary (chat archive, Graphify retrieval, shared files, OneCLI
+  secret declarations); each sibling keeps its own bot user, CLAUDE.md, routing
+  identity, and engage rules. See [docs/workgroups.md](docs/workgroups.md).
+
+Full schema: [docs/db-central.md](docs/db-central.md).
 
 ## Two-DB Session Split
 
@@ -55,46 +57,44 @@ Exactly one writer per file — no cross-mount lock contention. Heartbeat is a f
 
 ## Central DB
 
-`data/v2.db` holds everything that isn't per-session: users, user_roles, agent_groups, messaging_groups, wiring, pending_approvals, user_dms, chat_sdk_* (for the Chat SDK bridge), schema_version. Migrations live at `src/db/migrations/`.
+`data/v2.db` holds everything that isn't per-session. Migrations live at
+`src/db/migrations/`; schema reference is [docs/db-central.md](docs/db-central.md).
 
-For ad-hoc queries from skills or scripts, use the in-tree wrapper rather than the `sqlite3` CLI: `pnpm exec tsx scripts/q.ts <db> "<sql>"`. The host setup intentionally avoids depending on the `sqlite3` binary (`setup/verify.ts:5`); the wrapper goes through the `better-sqlite3` dep that setup already installs and verifies. Default-output format matches `sqlite3 -list` (pipe-separated, no header) so existing skill text reads identically.
+For ad-hoc queries use the in-tree wrapper, not the `sqlite3` CLI:
+`pnpm exec tsx scripts/q.ts <db> "<sql>"`. Setup intentionally avoids depending
+on the `sqlite3` binary (`setup/verify.ts:5`); the wrapper goes through the
+`better-sqlite3` dep setup already installs. Output matches `sqlite3 -list`, so
+existing skill text reads identically.
 
 ## Key Files
 
-| File | Purpose |
-|------|---------|
-| `src/index.ts` | Entry point: init DB, migrations, channel adapters, delivery polls, sweep, shutdown |
-| `src/router.ts` | Inbound routing: mg → agent → session → `inbound.db` → wake |
-| `src/delivery.ts` | Polls `outbound.db`, delivers via adapter, handles system actions |
-| `src/host-sweep.ts` | 60s sweep: `processing_ack` sync, stale detection, due-message wake, recurrence, ceiling-kill accountability wakes |
-| `src/session-manager.ts` | Resolves sessions; opens `inbound.db` / `outbound.db`; manages heartbeat path |
-| `src/container-runner.ts` | Spawns per-agent-group Docker containers with session DB + outbox mounts, OneCLI `ensureAgent` |
-| `src/container-runtime.ts` | Docker CLI wrapper (runtime binary, host-gateway args, mount args), orphan cleanup |
-| `src/guard/` | Privileged-action decision seam: `guard(action, input)` → allow \| hold \| deny. Module-edge `guard.ts` adapters (cli, agent-to-agent, self-mod, permissions) define each action's decision; ncl commands + delivery actions demand a guard at registration; approved replays carry the approval row as a grant and re-run the checks. Conformance test: `src/guard/conformance.test.ts` |
-| `src/modules/permissions/access.ts` | `canAccessAgentGroup` — owner / global admin / scoped admin / member resolution against `user_roles` + `agent_group_members` |
-| `src/modules/approvals/primitive.ts` | `pickApprover`, `pickApprovalDelivery`, `requestApproval`, approval-handler registry |
-| `src/command-gate.ts` | Router-side admin command gate — queries `user_roles` directly (no env var, no container-side check) |
-| `src/modules/approvals/onecli-approvals.ts` | OneCLI credentialed-action approval bridge |
-| `src/modules/permissions/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
-| `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
-| `src/db/container-configs.ts` | CRUD for `container_configs` table (per-group container runtime config) |
-| `src/backfill-container-configs.ts` | Migrates legacy `container.json` files into the DB on startup |
-| `src/container-restart.ts` | Kill + on-wake respawn for agent group containers |
-| `src/db/` | DB layer — agent_groups, messaging_groups, sessions, container_configs, user_roles, user_dms, pending_*, migrations |
-| `src/channels/` | Channel adapter infra (registry, Chat SDK bridge); specific channel adapters are skill-installed from the `channels` branch |
-| `src/channels/channel-defaults.ts` | Wiring-creation helpers over adapter-declared channel defaults (`resolveWiringDefaults`, `resolveThreadPolicy`, engage validation) |
-| `src/providers/` | Host-side provider container-config (`claude` baked in; `opencode` etc. installed from the `providers` branch) |
-| `container/agent-runner/src/` | Agent-runner: poll loop, formatter, provider abstraction, MCP tools, destinations |
-| `container/skills/` | Container skills mounted into every agent session (`agent-browser`, `frontend-engineer`, `onecli-gateway`, `self-customize`, `vercel-cli`, `welcome`; channel-specific skills like `slack-formatting` and `whatsapp-formatting` install with their channel) |
-| `groups/<folder>/` | Per-agent-group filesystem (CLAUDE.md, skills) — agent-runner source is a shared read-only mount, not copied per group |
-| `scripts/init-first-agent.ts` | Bootstrap the first DM-wired agent (used by `/init-first-agent` skill) |
-| `scripts/vendor-design-artifact-loop.ts` | Re-vendor the design-artifact-loop skill + `design_review` engine from `~/plugins/design-artifact-loop` (the dev home; OSS at davekim917/design-artifact-loop). Develop THERE, not in-tree — `src/design-artifact-loop-vendor.test.ts` fails on drift. |
-| `migrate-v2.sh` + `setup/migrate-v2/` | v1→v2 migration. Standalone script: `bash migrate-v2.sh`. Seeds DB, copies groups/sessions, installs channels, builds container, offers service switchover, then hands off to `/migrate-from-v1` skill for owner setup and CLAUDE.md cleanup. See [docs/migration-dev.md](docs/migration-dev.md). |
-| `nanoclaw.sh --uninstall` + `setup/uninstall/` | Uninstall this copy only (slug-scoped): service, containers + image, `data/`, `logs/`, `groups/`, this copy's OneCLI agents. Confirms per group; `--dry-run` previews, `--yes` skips prompts. Other copies and the shared OneCLI app are untouched. Bypasses bootstrap entirely; `uninstall.sh` is a pointer that execs it. |
+Most of `src/` is discoverable by reading it. These are the ones you would not
+guess:
+
+- **`src/guard/`** — the privileged-action decision seam. `guard(action, input)`
+  → allow | hold | deny. `ncl` commands and delivery actions *demand* a guard at
+  registration, and approved replays re-run the checks with the approval row as
+  a grant. Conformance test: `src/guard/conformance.test.ts`.
+- **`src/host-sweep.ts`** — one 60s sweep owns `processing_ack` sync, stale
+  detection, due-message wake, recurrence, and ceiling-kill accountability. If
+  something happens "on a timer," it happens here.
+- **`src/router.ts` → `src/delivery.ts`** — the two ends of the message path;
+  everything else hangs off them.
+- **`scripts/vendor-design-artifact-loop.ts`** — the design-artifact-loop skill
+  and `design_review` engine are **vendored**. Develop them in
+  `~/plugins/design-artifact-loop` (OSS at davekim917/design-artifact-loop), not
+  in-tree; `src/design-artifact-loop-vendor.test.ts` fails on drift.
+- **`src/group-init.ts`** — the agent-runner source is a shared read-only mount,
+  NOT copied per group. Editing it affects every group on next spawn.
+- **`migrate-v2.sh`** — standalone, requires an interactive terminal, and cannot
+  be run from inside Claude Code.
 
 ## Admin CLI (`ncl`)
 
-`ncl` queries and modifies the central DB — agent groups, messaging groups, wirings, users, roles, and more. On the host it connects via Unix socket (`src/cli/socket-server.ts`); inside containers it uses the session DB transport (`container/agent-runner/src/cli/ncl.ts`).
+`ncl` queries and modifies the central DB — agent groups, messaging groups,
+wirings, users, roles, tasks, and more. On the host it connects over a Unix
+socket (`src/cli/socket-server.ts`); inside containers it uses the session-DB
+transport (`container/agent-runner/src/cli/ncl.ts`).
 
 ```
 ncl <resource> <verb> [<id>] [--flags]
@@ -102,22 +102,12 @@ ncl <resource> help
 ncl help
 ```
 
-| Resource | Verbs | What it is |
-|----------|-------|------------|
-| groups | list, get, create, update, delete, restart, config get/update, config add-mcp-server/remove-mcp-server, config add-package/remove-package | Agent groups (workspace, personality, container config) |
-| messaging-groups | list, get, create, update, delete | A single chat/channel on one platform |
-| wirings | list, get, create, update, delete | Links a messaging group to an agent group (session mode, triggers) |
-| users | list, get, create, update | Platform identities (`<channel>:<handle>`) |
-| roles | list, grant, revoke | Owner / admin privileges (global or scoped to an agent group) |
-| members | list, add, remove | Unprivileged access gate for an agent group |
-| destinations | list, add, remove | Where an agent group can send messages |
-| sessions | list, get | Active sessions (read-only) |
-| tasks | list, get, create, update, cancel, pause, resume, delete, run, append-log | Scheduled tasks for an agent group |
-| user-dms | list | Cold-DM cache (read-only) |
-| dropped-messages | list | Messages from unregistered senders (read-only) |
-| approvals | list, get | Pending approval requests (read-only) |
+Run `ncl help` for the resource list and `ncl <resource> help` for fields and
+enums — that output is generated from the registry, so it is always current.
+Don't mirror it here; this file goes stale, `ncl help` doesn't.
 
-Key files: `src/cli/dispatch.ts` (dispatcher + approval handler), `src/cli/crud.ts` (generic CRUD registration), `src/cli/resources/` (per-resource definitions).
+Key files: `src/cli/dispatch.ts` (dispatcher + approval handler),
+`src/cli/crud.ts` (generic CRUD registration), `src/cli/resources/`.
 
 ## Channels and Providers (skill-installed)
 
@@ -154,66 +144,99 @@ Key files: `src/db/container-configs.ts`, `src/container-config.ts`, `src/cli/di
 
 ## Container Restart
 
-`ncl groups restart --id <group-id> [--rebuild] [--message <text>]`. Kills running containers; if `--message` is provided, writes an `on_wake` message and respawns via `onExit` callback. Without `--message`, containers come back on the next user message. From inside a container, `--id` is auto-filled and only the calling session is restarted.
+`ncl groups restart --id <group-id> [--rebuild] [--message <text>]`. With
+`--message` the host writes an `on_wake` row and respawns via the `onExit`
+callback; without one, the container returns on the next user message. From
+inside a container `--id` is auto-filled and only the calling session restarts.
 
-The `on_wake` column on `messages_in` ensures wake messages are only picked up by a fresh container's first poll iteration. This prevents the race where a dying container (still in its SIGTERM grace period) could steal the message. `killContainer` accepts an optional `onExit` callback that fires after the process exits, guaranteeing the old container is gone before the new one spawns.
+The invariants worth knowing before you touch this path:
 
-**Ceiling-kill accountability wakes.** When the 30-min idle ceiling (`ABSOLUTE_CEILING_MS`) kills a container with a resumable work continuation or a freshly started tool in flight, the sweep queues a deferred `on_wake` `ceiling-respawn-*` message; due-message admission adds fresh recall before making it triggerable, and the fresh container must post a public accounting (done / lost / next). Narration/status output is deliberately not recovery evidence. Continuation recovery and tool-only recovery are each capped at `WORK_CONTINUATION_RESUME_MAX_ATTEMPTS` (2); tool attempts are counted since the last real inbound. Decision: `decideCeilingFollowUp` in `src/host-sweep.ts`.
+- **`on_wake` exists to close a race.** A wake message is only picked up by a
+  fresh container's *first* poll, so a dying container still inside its SIGTERM
+  grace period cannot steal it. `killContainer`'s `onExit` callback guarantees
+  the old process is gone before the new one spawns.
+- **Ceiling kills must be accounted for publicly.** When the 30-min idle ceiling
+  (`ABSOLUTE_CEILING_MS`) kills a container with resumable work or a freshly
+  started tool in flight, the sweep queues a deferred `ceiling-respawn-*` wake and
+  the fresh container must post done / lost / next. Narration and status output
+  are deliberately **not** recovery evidence. Capped at
+  `WORK_CONTINUATION_RESUME_MAX_ATTEMPTS` (2). Decision:
+  `decideCeilingFollowUp` in `src/host-sweep.ts`.
+- **`continue_work({ task })` is the only sanctioned way to promise follow-up.**
+  It persists an ID-bearing record in `session_state.work_continuation` and runs
+  after any already-arrived user input; `cancel_continuation()` cancels it.
+  Only a delivered result bound to the active continuation ID completes it —
+  errors and empty streams requeue. Plain future-tense prose and `NEXT:` text
+  have no control effect. Chain cap 50; host recovery throttled to 10 minutes and
+  capped at 2 attempts before a visible parked notice.
+- **`wait` is an in-thread wake, `ncl tasks` is not.** `wait` writes a
+  `schedule_wake` action that becomes a `process_after` row in the SAME session
+  (full context preserved). `ncl tasks` fires in an isolated task session and
+  posts to a destination.
+- **Every host start stops all install-labeled containers** — quiescence is a
+  hard precondition for workgroup FS reconciliation. Sessions with fresh work
+  evidence get a deferred `host-restart-*` note (`src/host-restart-warn.ts`),
+  deduplicated within a ten-minute restart episode.
 
-**Durable work continuation (container-side).** The sanctioned way to promise follow-up work is `continue_work({ task })`; `cancel_continuation()` explicitly cancels it. The runner persists an ID-bearing record in `session_state.work_continuation` and starts it directly when the prompt queue is otherwise idle, after any already-arrived user input. User interruptions and `/clear` do not silently delete the task. Only a delivered result bound to the active continuation ID completes it; errors and empty or lost streams requeue it. Plain future-tense prose and `NEXT:` text have no control effect. The chain cap is 50. Host recovery of a stopped container is throttled to ten minutes and capped at two attempts before a visible parked notice. Agent contract: `container/CLAUDE.md` "Container lifecycle"; implementation details: `docs/agent-runner-details.md` "Durable work continuation".
-
-**`wait` — in-session delayed wake.** For time-based waits ("check CI in 15 minutes") the agent calls the `wait` MCP tool (`container/agent-runner/src/mcp-tools/wait.ts`), which writes a `schedule_wake` system action; the host handler (`src/modules/scheduled-wake/`) converts it into a `process_after` row in the SAME session's inbound.db — an in-thread wake with full context, not a standalone `ncl tasks` job (those fire in isolated task sessions and post to a destination).
-
-**Host-restart accountability.** Every host start stops all install-labeled containers — graceful shutdown via `stopAllContainers`, startup via `cleanupOrphansStrict` (quiescence is a hard precondition for workgroup FS reconciliation). Sessions with explicit fresh work evidence — a resumable continuation, a recent tool start, or a recent processing claim — get a deferred `on_wake` `host-restart-*` note (`src/host-restart-warn.ts`). Narration/status output is not evidence. The graceful-shutdown path inspects the live registry before containers stop; the startup crash backstop inspects active sessions, with notes deduplicated within a ten-minute restart episode. Due-message admission supplies fresh recall and the sweep respawns the warned session so the fresh container posts a public accounting (done / lost / next).
-
-Key files: `src/container-restart.ts`, `src/container-runner.ts` (`killContainer`), `container/agent-runner/src/db/messages-in.ts` (`getPendingMessages`).
+Agent-facing contract: `container/CLAUDE.md` "Container lifecycle".
+Implementation: [docs/agent-runner-details.md](docs/agent-runner-details.md).
+Key files: `src/container-restart.ts`, `src/container-runner.ts`
+(`killContainer`), `container/agent-runner/src/db/messages-in.ts`.
 
 ## Secrets / Credentials / OneCLI
 
-Secrets live in the OneCLI gateway, injected into per-agent containers at request time — never passed via env vars or chat. Host-side wiring: `src/modules/approvals/onecli-approvals.ts`, `ensureAgent()` + `applyOnecliSecrets()` in `container-runner.ts` (~line 1787). Container-side: `container/skills/onecli-gateway/SKILL.md`. Use `onecli --help` for commands.
+Secrets live in the OneCLI gateway and are injected per-request at the proxy
+boundary — never via env vars, never in chat, never on disk in usable form.
+Host wiring: `src/modules/approvals/onecli-approvals.ts`, `ensureAgent()` +
+`applyOnecliSecrets()` in `container-runner.ts`. Container side:
+`container/skills/onecli-gateway/SKILL.md`. `onecli --help` for commands.
 
-### Per-group secret scoping (declarative)
+**Per-group scoping is declarative.** `container.json` may carry
+`onecliSecrets: ["Datafold-ExampleRetail", "Anthropic", ...]` (names or UUIDs).
+On every spawn `applyOnecliSecrets()` resolves names → UUIDs, forces the agent to
+`selective` mode, and assigns exactly that set. **Fail-closed** — an unresolvable
+name throws, the spawn aborts, the sweep retries. No declaration is a no-op, so
+operator-set assignments survive. See `src/onecli-secrets.ts`.
 
-Each group's `container.json` may carry `onecliSecrets: ["Datafold-ExampleRetail", "Anthropic", ...]` (NAMES or UUIDs). On every spawn, `applyOnecliSecrets()` resolves names → UUIDs, forces the agent's secret mode to `selective`, and assigns exactly the declared set. Fail-closed: unresolvable names throw, spawn aborts, sweep retries. No declaration = no-op (preserves operator-set assignments). See `src/onecli-secrets.ts`.
+**Workgroup secrets are inherited as a union.** Workgroup-level `onecli_secrets`
+merge with per-group additions — a group can extend the baseline, never subtract
+from it. Populate via `scripts/set-workgroup-secrets.ts`, which validates names
+against the vault *before* writing so one bad name can't break every member's
+spawn. See [docs/workgroups.md](docs/workgroups.md).
 
-### Workgroup-level secret inheritance
+**Gotcha — auto-created agents start in `selective` mode with nothing assigned.**
+OneCLI's `POST /api/agents` defaults to `selective`, so a freshly created agent
+gets no secrets even when matching ones exist in the vault. Symptom: proxy and CA
+wired correctly, but `401` from an API whose credential *is* in the vault. Right
+fix is declaring `onecliSecrets` above. Escape hatches:
+`onecli agents set-secrets --id <uuid> --secret-ids <ids>`, or
+`set-secret-mode --mode all` (looser — cross-tenant risk if vault patterns
+overlap groups). Verified against `onecli@1.4.1`.
 
-Workgroup-level `onecli_secrets` (JSON on the `workgroups` row) are inherited by every member at spawn time. The host merges as a union (workgroup baseline ∪ per-group additive — per-group can extend, cannot subtract) before calling `applyOnecliSecrets`. Populate workgroup-level secrets via `scripts/set-workgroup-secrets.ts`. Names are validated against the OneCLI vault BEFORE write, so a bad name can't blast-radius every member's spawn. See [docs/workgroups.md](docs/workgroups.md).
-
-### Gotcha: auto-created agents start in `selective` secret mode (mitigated)
-
-`container-runner.ts:1787` calls `onecli.ensureAgent({...})` and the OneCLI `POST /api/agents` endpoint defaults to **`selective`** mode → no secrets assigned even when matching ones exist in the vault. Symptom: proxy + CA wired correctly, but agent gets `401` from APIs whose credentials *are* in the vault.
-
-Right fix: declare `onecliSecrets` in `container.json` (see above). Escape hatches: `onecli agents set-secrets --id <agent-uuid> --secret-ids <ids>` for explicit assignment or `onecli agents set-secret-mode --mode all` for matching-pattern injection (looser — cross-tenant risk if vault patterns overlap groups). UI at `http://127.0.0.1:10254` accepts either. Verified against `onecli@1.4.1`.
-
-### Requiring approval for credential use
-
-Approval-gating credentialed actions is a **two-sided** flow:
-
-- **Server-side** (OneCLI gateway): decides *when* to hold a request and emit a pending approval. As of `onecli@2.2.5`, the CLI does **not** expose this — `rules create --action` only accepts `block` or `rate_limit`, and `secrets create` has no approval flag. Approval policies must be configured via the OneCLI web UI at `http://127.0.0.1:10254`. If/when the CLI grows an `approve` action, this section needs updating.
-- **Host-side** (nanoclaw): receives pending approvals and routes them to a human. `src/modules/approvals/onecli-approvals.ts` registers a callback via `onecli.configureManualApproval(cb)` (long-polls `GET /api/approvals/pending`). The callback uses `pickApprover` + `pickApprovalDelivery` from `src/modules/approvals/primitive.ts` to DM an approver. Approvers are resolved from the `user_roles` table — preference order: scoped admins for the agent group → global admins → owners. There is no env var like `NANOCLAW_ADMIN_USER_IDS`; roles are persisted in the central DB only.
-
-If approvals are configured server-side but the host callback isn't running (or throws), every credentialed call hangs until the gateway times out. Conversely, if the gateway has no rule asking for approval, the host callback never fires regardless of how it's wired.
+**Approval-gating credentialed actions is two-sided.** The gateway decides *when*
+to hold a request (configure via the web UI at `http://127.0.0.1:10254` — the CLI
+still only exposes `block`/`rate_limit`, not `approve`), and the host routes the
+pending approval to a human via `onecli.configureManualApproval(cb)`. Approvers
+resolve from `user_roles`: scoped admins → global admins → owners. There is no
+admin env var. If approvals are configured server-side but the host callback
+isn't running, every credentialed call hangs until the gateway times out; if the
+gateway has no rule, the callback never fires no matter how it's wired.
 
 ## Skills
 
-Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxonomy.
+Four types — channel/provider installers, utility skills that ship code,
+instruction-only operational skills, and container skills mounted into agent
+sessions. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxonomy and
+[docs/skill-guidelines.md](docs/skill-guidelines.md) for the authoring checklist.
 
-- **Channel/provider install skills** — copy the relevant module(s) in from the `channels` or `providers` branch, wire imports, install pinned deps (e.g. `/add-discord`, `/add-slack`, `/add-whatsapp`, `/add-opencode`).
-- **Utility skills** — ship code files alongside `SKILL.md` (e.g. a `scripts/` CLI or helper).
-- **Operational skills** — instruction-only workflows (`/setup`, `/debug`, `/customize`, `/init-first-agent`, `/manage-channels`, `/init-onecli`, `/update-nanoclaw`).
-- **Container skills** — loaded inside agent containers at runtime (this install's `container/skills/`: `agent-browser`, `design-artifact-loop`, `frontend-engineer`, `graphify`, `hex`, `onecli-gateway`, `pr-review-loop`, `render-diagram`, `self-customize`, `slack-formatting`, `vercel-cli`, `welcome`; channel-specific skills like `slack-formatting` are normally copied in by their `/add-<channel>` skill — ours is customized in-tree).
+Skill descriptions are the discovery mechanism — run `/help` or read
+`.claude/skills/*/SKILL.md` and `container/skills/*/SKILL.md` rather than
+consulting a list here.
 
-| Skill | When to Use |
-|-------|-------------|
-| `/setup` | First-time install, auth, service config |
-| `/init-first-agent` | Bootstrap first DM-wired agent |
-| `/manage-channels` | Wire channels with isolation level decisions |
-| `/customize` | Add channels, integrations, behavior changes |
-| `/debug` | Container issues, logs, troubleshooting |
-| `/update-nanoclaw` | Bring upstream updates into a customized install |
-| `/init-onecli` | Install OneCLI Agent Vault, migrate `.env` credentials |
-| `/migrate-memory` | Carry a group's agent memory across a provider switch (operator-run, both directions) |
+Non-obvious: channel skills carry their install steps as `nc:` directive fences,
+so setup applies them via `scripts/skill-apply.ts` and an agent applies the same
+steps as prose — identical install either way. See
+[docs/skill-directives.md](docs/skill-directives.md).
 
 ## Contributing
 
@@ -294,29 +317,25 @@ This project intentionally tracks the latest stable releases, including majors. 
 
 ## Docs Index
 
-| Doc | Purpose |
-|-----|---------|
-| [docs/architecture.md](docs/architecture.md) | Full architecture writeup |
-| [docs/api-details.md](docs/api-details.md) | Host API + DB schema details |
-| [docs/db.md](docs/db.md) | DB architecture overview: three-DB model, cross-mount rules, readers/writers map |
-| [docs/db-central.md](docs/db-central.md) | Central DB (`data/v2.db`) — every table + migration system |
-| [docs/db-session.md](docs/db-session.md) | Per-session `inbound.db` + `outbound.db` schemas + seq parity |
-| [docs/agent-runner-details.md](docs/agent-runner-details.md) | Agent-runner internals + MCP tool interface |
-| [docs/isolation-model.md](docs/isolation-model.md) | Three-level channel isolation model |
-| [docs/setup-wiring.md](docs/setup-wiring.md) | What's wired, what's open in the setup flow |
-| [docs/architecture-diagram.md](docs/architecture-diagram.md) | Diagram version of the architecture |
-| [docs/build-and-runtime.md](docs/build-and-runtime.md) | Runtime split (Node host + Bun container), lockfiles, image build surface, CI, key invariants |
-| [docs/v1-to-v2-changes.md](docs/v1-to-v2-changes.md) | v1→v2 architecture diff — vocabulary for where v1 things moved |
-| [docs/migration-dev.md](docs/migration-dev.md) | Migration development guide — testing, debugging, dev loop |
-| [docs/provider-migration.md](docs/provider-migration.md) | Switching a live agent group between providers (e.g. Claude → Codex) — what carries over, rollback |
-| [docs/customizing.md](docs/customizing.md) | Short intro to customizing via skills |
-| [docs/skills-model.md](docs/skills-model.md) | The skills model in full: recipes, tests, upgrades, migrations |
-| [docs/skill-guidelines.md](docs/skill-guidelines.md) | Authoritative checklist for writing a skill |
-| [docs/skill-directives.md](docs/skill-directives.md) | `nc:` directive reference: fence grammar, the eight kinds, effects, guards, lint |
-| [docs/skill-engine-seam.md](docs/skill-engine-seam.md) | Skill-engine consumer contract (wizard / pipeline / agent-relay) + boundary-rule rationale |
-| [docs/templates.md](docs/templates.md) | Agent templates: what they are, stamping via `ncl groups create --template` + the setup wizard, the OneCLI/MCP-credential model, supported providers, and how to contribute one |
-| [docs/memory.md](docs/memory.md) | Source-grounded memory and Graphify retrieval |
-| [docs/workgroups.md](docs/workgroups.md) | Workgroup model — sibling agent groups, shared data pool (fork) |
+`docs/` holds the long-form reference. Start points:
+
+| Topic | Doc |
+|---|---|
+| Architecture, end to end | `architecture.md`, `architecture-diagram.md` |
+| DB model | `db.md` → `db-central.md`, `db-session.md` |
+| Host API + schema detail | `api-details.md` |
+| Agent-runner internals, MCP tools | `agent-runner-details.md` |
+| Channel isolation levels | `isolation-model.md` |
+| Workgroups / siblings | `workgroups.md` |
+| Skills: model, guidelines, directives, engine seam | `skills-model.md`, `skill-guidelines.md`, `skill-directives.md`, `skill-engine-seam.md` |
+| Runtime split, lockfiles, CI | `build-and-runtime.md` |
+| Migration (v1→v2) | `v1-to-v2-changes.md`, `migration-dev.md` |
+| Provider switching | `provider-migration.md` |
+| Templates | `templates.md` |
+| Memory + Graphify retrieval | `memory.md` |
+| Setup wiring, customizing | `setup-wiring.md`, `customizing.md` |
+| CJK fonts | `cjk-fonts.md` |
+| Always-on directive audit | `always-on-directive-classification.md`, `always-on-directive-baseline.md` |
 
 ## Container Build Cache
 
@@ -338,7 +357,7 @@ The agent container runs on **Bun**; the host runs on **Node** (pnpm). They comm
 
 ## CJK font support
 
-Off by default (~200MB). On signals the user works with CJK content (CJK conversation, `Asia/Tokyo|Shanghai|Seoul|Taipei|Hong_Kong` timezone, screenshots/PDFs needing CJK render — symptom is "tofu" rectangles), offer to set `INSTALL_CJK_FONTS=true` in `.env` and rebuild. Full runbook: `docs/cjk-fonts.md`.
+Off by default (~200MB). On signals the user works with CJK content (CJK conversation, `Asia/Tokyo|Shanghai|Seoul|Taipei|Hong_Kong` timezone, screenshots/PDFs needing CJK render — symptom is "tofu" rectangles), offer to set `INSTALL_CJK_FONTS=true` in `.env` and rebuild the image.
 
 ## Code and knowledge intelligence
 
