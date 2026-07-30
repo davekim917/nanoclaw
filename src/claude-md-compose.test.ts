@@ -134,3 +134,51 @@ describe('session capability authority', () => {
     expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'session-capabilities.md'))).toBe(false);
   });
 });
+
+describe('CLAUDE.local.md reach across providers', () => {
+  // Regression: operator standing instructions used to be Claude-only. Claude
+  // Code auto-discovers CLAUDE.local.md, but Codex and OpenCode read only the
+  // project doc, so per-group rules silently reached one sibling of three —
+  // including trust-boundary rules ("never permanently delete an email", a
+  // client's "never name AI tooling in these repos"), each of which was
+  // measured at 0 hits in both of its non-Claude siblings' AGENTS.md.
+  const RULE = 'Never permanently delete an email.';
+
+  function withLocal(folder: string, body: string): void {
+    const dir = path.join(GROUPS_DIR, folder);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'CLAUDE.local.md'), body);
+  }
+
+  for (const provider of ['claude', 'codex', 'opencode']) {
+    it(`flattens local standing instructions into AGENTS.md for ${provider}`, () => {
+      const ag = group(`ag-local-${provider}`, `local-${provider}`);
+      seed(ag);
+      withLocal(ag.folder, `# Group rules\n\n${RULE}\n`);
+
+      composeGroupClaudeMd(ag, provider);
+
+      const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
+      expect(agents).toContain(RULE);
+    });
+  }
+
+  it('creates the local file before flattening so a first spawn is not missing it', () => {
+    const ag = group('ag-local-first', 'local-first');
+    seed(ag);
+
+    expect(() => composeGroupClaudeMd(ag, 'codex')).not.toThrow();
+    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.local.md'))).toBe(true);
+  });
+
+  it('omits the standing-instructions heading when the local file is empty', () => {
+    const ag = group('ag-local-empty', 'local-empty');
+    seed(ag);
+    withLocal(ag.folder, '   \n');
+
+    composeGroupClaudeMd(ag, 'codex');
+
+    const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
+    expect(agents).not.toContain('## Standing instructions for this group');
+  });
+});

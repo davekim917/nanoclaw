@@ -119,7 +119,7 @@ export function capCodexProjectDoc(content: string, label = 'AGENTS.md'): string
   const omissionNote = (titles: string[]): string =>
     `## Omitted for size\n\nThese sections were omitted to fit Codex's ${Math.round(
       CODEX_PROJECT_DOC_MAX_BYTES / 1024,
-    )}KB project-doc cap: ${titles.join(', ')}. Their behavior still applies where the underlying tools/rules are active; trim CLAUDE.md to restore them.`;
+    )}KB project-doc cap: ${titles.join(', ')}. You are operating WITHOUT their text — do not assume you know what they said. If a task plausibly touches one of them, say so and ask rather than guessing. Operator: trim CLAUDE.md to restore them.`;
 
   // head + the given sections, plus an omission note when any title is present.
   // Pure (takes its inputs) so the loop can cheaply trial a candidate removal.
