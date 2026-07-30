@@ -15,6 +15,7 @@ vi.mock('./log.js', () => ({
 }));
 
 import { composeGroupClaudeMd } from './claude-md-compose.js';
+import { PROTECTED_SECTION_MARKER } from './codex-project-doc-cap.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
 import { PERSONA_PREPEND_FILE } from './group-persona.js';
@@ -189,6 +190,21 @@ describe('CLAUDE.local.md reach across providers', () => {
     const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
     expect(agents).toContain(`@${secretFile}`);
     expect(agents).not.toContain('SENTINEL_HOST_SECRET_d41d8cd9');
+  });
+
+  it('marks the standing section protected so the cap cannot evict it first', () => {
+    // On a workgroup-enriched group the local body is the LARGEST section, so
+    // unmarked it would be size-ranked out ahead of generic base sections —
+    // dropping exactly the trust-boundary rules it exists to deliver.
+    const ag = group('ag-local-prot', 'local-prot');
+    seed(ag);
+    withLocal(ag.folder, `# Group rules\n\n${RULE}\n`);
+
+    composeGroupClaudeMd(ag, 'codex');
+
+    const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
+    const section = agents.slice(agents.indexOf('## Standing instructions for this group'));
+    expect(section).toContain(PROTECTED_SECTION_MARKER);
   });
 
   it('omits the standing-instructions heading when the local file is empty', () => {

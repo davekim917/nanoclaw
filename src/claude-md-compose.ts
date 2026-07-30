@@ -21,7 +21,7 @@ import { GROUPS_DIR } from './config.js';
 import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
-import { CODEX_PROJECT_DOC_MAX_BYTES, capCodexProjectDoc } from './codex-project-doc-cap.js';
+import { CODEX_PROJECT_DOC_MAX_BYTES, PROTECTED_SECTION_MARKER, capCodexProjectDoc } from './codex-project-doc-cap.js';
 import { readGroupPersona } from './group-persona.js';
 import { log } from './log.js';
 import type { AgentGroup } from './types.js';
@@ -242,8 +242,16 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
   // CLAUDE.md and ignores a sibling AGENTS.md). Cap only the provider that
   // actually truncates; others get the full doc, with a size log so a future
   // provider-side limit still leaves a breadcrumb.
+  // The standing section is marked protected: these are the operator's explicit
+  // rules for THIS group, recoverable from nowhere else, unlike the shared base.
+  // Unmarked it is an ordinary section, and on a workgroup-enriched group it is
+  // also the LARGEST one — so size-ranked eviction would spend the very
+  // trust-boundary rules this section exists to deliver. Headroom on the tightest
+  // group is ~1KB, so this is reachable, not theoretical.
   const fullAgents =
-    agentsHeader + agentsBody + (localBody ? `\n\n## Standing instructions for this group\n\n${localBody}\n` : '');
+    agentsHeader +
+    agentsBody +
+    (localBody ? `\n\n## Standing instructions for this group\n\n${PROTECTED_SECTION_MARKER}\n\n${localBody}\n` : '');
   const agentsOut = provider === 'codex' ? capCodexProjectDoc(fullAgents, `${group.folder}/AGENTS.md`) : fullAgents;
   if (provider !== 'codex' && Buffer.byteLength(fullAgents, 'utf-8') > CODEX_PROJECT_DOC_MAX_BYTES) {
     log.info('AGENTS.md exceeds Codex cap but provider is not Codex — written uncapped', {
