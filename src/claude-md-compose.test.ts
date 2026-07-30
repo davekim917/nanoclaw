@@ -171,6 +171,26 @@ describe('CLAUDE.local.md reach across providers', () => {
     expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.local.md'))).toBe(true);
   });
 
+  it('does NOT expand @-includes in the local file (host-side exfiltration guard)', () => {
+    // The group folder is mounted RW at /workspace/agent, so a container can
+    // write this file. The flattener runs host-side and follows absolute and ~
+    // paths, so expanding here would let an agent inline arbitrary host files
+    // (e.g. `@~/.env`) into AGENTS.md and read them back through its own mount.
+    // A literal, unexpanded reference is the safe failure.
+    const secretFile = path.join(TEST_ROOT, 'host-only-secret.txt');
+    fs.writeFileSync(secretFile, 'SENTINEL_HOST_SECRET_d41d8cd9\n');
+
+    const ag = group('ag-local-inc', 'local-inc');
+    seed(ag);
+    withLocal(ag.folder, `@${secretFile}\n`);
+
+    composeGroupClaudeMd(ag, 'codex');
+
+    const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
+    expect(agents).toContain(`@${secretFile}`);
+    expect(agents).not.toContain('SENTINEL_HOST_SECRET_d41d8cd9');
+  });
+
   it('omits the standing-instructions heading when the local file is empty', () => {
     const ag = group('ag-local-empty', 'local-empty');
     seed(ag);
