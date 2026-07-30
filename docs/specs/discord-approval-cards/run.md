@@ -41,4 +41,13 @@ Fresh preflight verification:
 - Full corrected host suite: 231 files passed; 3,193 tests passed, 1 skipped, 1 todo.
 - TypeScript build and focused correction suite remain green.
 
-Pending direct publish and live deployment.
+Completed:
+
+- Reviewed implementation commit: `5ea4c3feaf42881e3717f225dd2a6a932c7214f9` (`fix(approvals): make Discord decisions reliable`).
+- Direct push to `origin/main` passed the public-boundary hook; remote SHA matched the commit.
+- The live source checkout had unrelated dirty feature-branch work, so it was not switched, pulled, staged, or rebuilt.
+- The exact reviewed `dist/` artifact was backed up, synchronized into `/home/ubuntu/nanoclaw-v2/dist`, and verified byte-for-byte before restart.
+- System-level `nanoclaw-v2.service` restarted successfully at 2026-07-30 14:41:51 UTC with a new PID and `NRestarts=0`.
+- Migration `approval-question-render-metadata` applied at 2026-07-30T14:41:52.366Z; `question` exists on pending questions and all three pending approval tables.
+- Discord, Discord-Codex, Discord-OpenCode, and all five Slack adapters initialized; delivery polls, host sweep, OneCLI approvals, and the CLI server started.
+- The pre-deploy generated artifact remains recoverable at `/tmp/nanoclaw-dist-before-5ea4c3fe` for this host session.
