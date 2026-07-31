@@ -50,9 +50,15 @@ Skills-only plugins need neither — they already reach all three on the next sp
    - **Strip runtime noise**: activation banners ("X MODE ACTIVE"), statusline/setup
      nudges, and anything host-Claude-specific. Codex/OpenCode agents should see only
      the behavioral rules.
-   - **Keep it tight.** Codex caps `AGENTS.md` at ~32KB and drops sections to fit; a
-     bloated ruleset evicts NanoClaw's own instructions. Aim for the essential rules,
-     not the full README. (For ponytail specifically, this matches its own ethos.)
+   - **Keep it tight, but NEVER condense away the plugin's own carve-outs.** If a rule
+     has an exception or scope limit in the source ("only unrequested prose", "unless
+     the user asks", "except at trust boundaries"), the condensed version MUST carry
+     it. Dropping ponytail's requested-explanation carve-out once turned its output cap
+     into an absolute that contradicted the Completion Protocol in the same AGENTS.md —
+     an exception IS the rule's scope, not optional detail.
+   - Size is not a constraint worth distorting rules for: container Codex spawns set
+     `project_doc_max_bytes=262144` (codex-app-server.ts), and nothing evicts sections
+     anymore. Condense for signal, not for bytes.
    - This file is what `composeGroupClaudeMd` folds into every non-Claude group.
 
 4. **Re-run the enabler** so it re-checks the now-present ruleset file (no `--report-json`
