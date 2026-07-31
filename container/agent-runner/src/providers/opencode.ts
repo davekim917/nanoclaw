@@ -47,9 +47,9 @@ function opencodeAuthHasCredential(provider: string): boolean {
  */
 // Memoized at module scope: auth.json is copied once at spawn and never written
 // from inside the container, so the provider set is fixed for the container
-// lifetime (same rationale as cachedAgentInstructions below). Without this the
-// file was read + JSON-parsed 1-3× per turn on the hot path (runtimeConfigKey,
-// buildOpenCodeConfig, and opencodeAuthHasCredential all call this).
+// lifetime. Without this the file was read + JSON-parsed 1-3× per turn on the
+// hot path (runtimeConfigKey, buildOpenCodeConfig, and opencodeAuthHasCredential
+// all call this).
 let cachedAuthProviders: string[] | null = null;
 function opencodeAuthProviders(): string[] {
   if (cachedAuthProviders !== null) return cachedAuthProviders;
@@ -206,49 +206,26 @@ function spawnOpencodeServer(
   });
 }
 
-function pickGroupInstructions(groupDir: string): string | null {
-  // Prefer AGENTS.md (flattened by composeGroupClaudeMd with @-imports resolved
-  // inline — the same content Codex consumes). Fall back to CLAUDE.md only
-  // when AGENTS.md is absent; that path drops to a stub of literal @-imports
-  // that OpenCode would not expand, leaving the agent with no instructions.
-  const agents = `${groupDir}/AGENTS.md`;
-  const claude = `${groupDir}/CLAUDE.md`;
-  if (fs.existsSync(agents)) return agents;
-  if (fs.existsSync(claude)) return claude;
-  return null;
-}
-
-// Memoized at module scope: AGENTS.md is static for the container lifetime
-// (composed once at spawn by host-side composeGroupClaudeMd; not regenerated
-// mid-session). Previously read on every turn — multi-KB synchronous file
-// reads twice per prompt. Now read once, reused for every push().
-let cachedAgentInstructions: string | undefined | null = null;
-
-function readAgentInstructionsForPrompt(): string | undefined {
-  if (cachedAgentInstructions !== null) return cachedAgentInstructions;
-  let content = '';
-  const groupSrc = pickGroupInstructions('/workspace/agent');
-  if (groupSrc) content += fs.readFileSync(groupSrc, 'utf-8');
-  const isMain = process.env.NANOCLAW_IS_MAIN === '1';
-  if (!isMain) {
-    const globalSrc = pickGroupInstructions('/workspace/global');
-    if (globalSrc) {
-      if (content) content += '\n\n---\n\n';
-      content += fs.readFileSync(globalSrc, 'utf-8');
-    }
-  }
-  cachedAgentInstructions = content || undefined;
-  return cachedAgentInstructions;
-}
-
+// AGENTS.md/CLAUDE.md instructions no longer get pushed onto the prompt here.
+// `opencode serve` is spawned with cwd=/workspace/agent (see
+// spawnOpencodeServer) and OpenCode natively auto-loads AGENTS.md/CLAUDE.md
+// from its cwd into every session — verified empirically against 1.18.9 serve
+// mode (a sentinel placed only in the cwd's AGENTS.md was answered with zero
+// prompt wrapping). The removed `readAgentInstructionsForPrompt` (formerly
+// called from here) sent the same AGENTS.md content a SECOND time on every
+// turn, plus a `/workspace/global` half that was already dead:
+// `groups/global/` was deleted by the v2 migration (migrateGroupsToClaudeLocal),
+// so that mount never fires and every group's own AGENTS.md already carries
+// the shared base + CLAUDE.local.md via composeGroupClaudeMd. No reach
+// regression — just dedup, same shape as the Codex per-turn duplication fix.
+// `systemInstructions` below is unrelated dynamic per-turn content (tone
+// profile, capability note, live destinations addendum — built in index.ts,
+// never present in AGENTS.md) with no other delivery path into OpenCode, so
+// that wrap stays.
 function wrapPromptWithContext(text: string, systemInstructions?: string, currentModel?: string): string {
   let out = text;
   if (systemInstructions) {
     out = `<system>\n${systemInstructions}\n</system>\n\n${out}`;
-  }
-  const agentMd = readAgentInstructionsForPrompt();
-  if (agentMd) {
-    out = `<system>\n${agentMd}\n</system>\n\n${out}`;
   }
   // Tell the agent which model it is ACTUALLY running on this turn. OpenCode
   // doesn't surface this to the model, so without it the agent guesses its own

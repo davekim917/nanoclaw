@@ -17,8 +17,8 @@ const spies: Array<{ mockRestore: () => void }> = [];
 function stubGuardPresent(present: boolean): void {
   const s = spyOn(fs, 'existsSync').mockImplementation((p: fs.PathLike) => {
     if (String(p) === GUARD_PLUGIN) return present;
-    // Other existsSync calls (e.g. pickGroupInstructions) — default to absent so
-    // the config build stays hermetic; instructions are not under test here.
+    // Other existsSync calls — default to absent so the config build stays
+    // hermetic; instructions are not under test here.
     return false;
   });
   spies.push(s);
