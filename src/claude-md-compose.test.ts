@@ -15,7 +15,6 @@ vi.mock('./log.js', () => ({
 }));
 
 import { composeGroupClaudeMd } from './claude-md-compose.js';
-import { PROTECTED_SECTION_MARKER } from './codex-project-doc-cap.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
 import { PERSONA_PREPEND_FILE } from './group-persona.js';
@@ -192,21 +191,6 @@ describe('CLAUDE.local.md reach across providers', () => {
     expect(agents).not.toContain('SENTINEL_HOST_SECRET_d41d8cd9');
   });
 
-  it('marks the standing section protected so the cap cannot evict it first', () => {
-    // On a workgroup-enriched group the local body is the LARGEST section, so
-    // unmarked it would be size-ranked out ahead of generic base sections —
-    // dropping exactly the trust-boundary rules it exists to deliver.
-    const ag = group('ag-local-prot', 'local-prot');
-    seed(ag);
-    withLocal(ag.folder, `# Group rules\n\n${RULE}\n`);
-
-    composeGroupClaudeMd(ag, 'codex');
-
-    const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
-    const section = agents.slice(agents.indexOf('## Standing instructions for this group'));
-    expect(section).toContain(PROTECTED_SECTION_MARKER);
-  });
-
   it('omits the standing-instructions heading when the local file is empty', () => {
     const ag = group('ag-local-empty', 'local-empty');
     seed(ag);
@@ -219,40 +203,28 @@ describe('CLAUDE.local.md reach across providers', () => {
   });
 });
 
-describe('cap gating is provider-specific', () => {
-  // 37acd18d gated the 32KB cap to Codex, because `project_doc_max_bytes` is a
-  // Codex setting: OpenCode has no equivalent and Claude ignores a sibling
-  // AGENTS.md entirely. Applying it universally made OpenCode groups shed whole
-  // behavioral sections to satisfy a limit their runtime does not have.
+describe('AGENTS.md is never truncated', () => {
+  // The eviction machinery was deleted — content bloat is judged by a human
+  // reading the file, never by a byte number. A group with an oversized
+  // CLAUDE.local.md must still get the FULL doc, for every provider.
   function withHugeLocal(folder: string): void {
     const dir = path.join(GROUPS_DIR, folder);
     fs.mkdirSync(dir, { recursive: true });
-    // Comfortably over the 32KB cap, as many separate droppable sections.
-    const body = Array.from({ length: 40 }, (_, i) => `## Filler ${i}\n\n${'x'.repeat(1000)}`).join('\n\n');
+    // Comfortably over 40KB, as many separate sections.
+    const body = Array.from({ length: 45 }, (_, i) => `## Filler ${i}\n\n${'x'.repeat(1000)}`).join('\n\n');
     fs.writeFileSync(path.join(dir, 'CLAUDE.local.md'), body);
   }
 
-  it('caps the document for codex', () => {
-    const ag = group('ag-cap-codex', 'cap-codex');
-    seed(ag);
-    withHugeLocal(ag.folder);
-
-    composeGroupClaudeMd(ag, 'codex');
-
-    const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
-    expect(Buffer.byteLength(agents, 'utf-8')).toBeLessThanOrEqual(32 * 1024);
-  });
-
-  for (const provider of ['opencode', 'claude']) {
-    it(`does NOT cap the document for ${provider}`, () => {
-      const ag = group(`ag-cap-${provider}`, `cap-${provider}`);
+  for (const provider of ['codex', 'opencode', 'claude']) {
+    it(`does not truncate the document for ${provider}`, () => {
+      const ag = group(`ag-notrunc-${provider}`, `notrunc-${provider}`);
       seed(ag);
       withHugeLocal(ag.folder);
 
       composeGroupClaudeMd(ag, provider);
 
       const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
-      expect(Buffer.byteLength(agents, 'utf-8')).toBeGreaterThan(32 * 1024);
+      expect(Buffer.byteLength(agents, 'utf-8')).toBeGreaterThan(40 * 1024);
       expect(agents).not.toContain('## Omitted for size');
     });
   }

@@ -6,8 +6,8 @@ import crypto from 'crypto';
 // Snapshot real fs BEFORE the mock.module replaces it, so afterAll can put
 // it back. Without this, the mocked writeFileSync (no-op) and existsSync
 // (always false) leak globally and clobber every later test file in the
-// `bun test` run — verified to break codex.factory.test.ts's
-// resolveClaudeImports tests.
+// `bun test` run — verified to break other codex.factory.test.ts tests that
+// touch the real filesystem.
 const realFsSnapshot = { ...realFs };
 
 // We mock 'fs' before importing the module under test. atomicWrite uses

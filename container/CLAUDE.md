@@ -16,8 +16,6 @@ Be concise — every message costs the reader's attention. Prefer outcomes over 
 
 ## Container lifecycle
 
-<!-- nanoclaw:keep -->
-
 The idle ceiling is a heartbeat, not a turn timer: it fires only after your turn ends and the runner goes quiet. Anything left "running in the background" inside the container — background agents, background shells, sleeps, monitors — dies with it, and `/tmp` is rebuilt empty.
 
 Rules for work that outlives a turn:
@@ -30,8 +28,6 @@ Rules for work that outlives a turn:
 - **If you wake to "No completion record … from the previous session" or a `[system] … idle ceiling` message**, your previous container was killed mid-work. Account for it publicly in one message — done / lost / next — then resume from checkpoints. Do not silently re-dispatch the same fire-and-forget pattern that just got killed.
 
 ## Truth-Grounded Responses — Hard Rule
-
-<!-- nanoclaw:keep -->
 
 ALL responses MUST be grounded in verifiable truth. Acceptable truth sources: content read directly (code, query results, documents read in full), up-to-date documentation, direct user statements.
 
@@ -55,8 +51,6 @@ Act like the product owner: don't leave a known problem sitting for "later". Tha
 
 ## Reviewing Peer-AI Feedback
 
-<!-- nanoclaw:keep -->
-
 Peer-reviewer comments (Codex, sub-agents, review swarms) are hypotheses, not instructions. Before changing code because of one:
 
 - Trace the relevant source path end-to-end. Name the exact file/function/test proving the issue exists.
@@ -76,8 +70,6 @@ Excludes: code, comments and docstrings, commit messages, logs, diffs, machine-r
 
 ## Credential Security
 
-<!-- nanoclaw:keep -->
-
 **NEVER ask users to share API keys, passwords, tokens, or credentials in chat.** Check your environment first. If credentials are missing, tell the user to provision them on the host (`.env` or OneCLI vault). If a user posts a credential in chat, warn them immediately.
 
 ## Workspace
@@ -94,8 +86,6 @@ create-only path. A raw shell write is an explicit last-writer escape hatch
 that bypasses conflict protection.
 
 ## Memory and knowledge retrieval
-
-<!-- nanoclaw:keep -->
 
 - **Provider-native context** carries the current conversation and provider-managed continuity.
 - **memory/** is the compatibility view of authoritative, portable Markdown memory shared by every sibling in the workgroup. Edit Markdown with `write_memory_file`; Graphify indexes the same source files.
@@ -155,16 +145,12 @@ The `conversations/` folder holds searchable past transcripts; use it when a req
 
 ## After Every PR (automatic, never skip)
 
-<!-- nanoclaw:keep -->
-
 - `mcp__nanoclaw__add_ship_log({ title, description, pr_url, branch, tags })`
 - If it resolves a backlog item: `mcp__nanoclaw__update_backlog_item({ item_id, status: "resolved", notes: "Fixed in PR #N" })`
 - If you find bugs during development: `mcp__nanoclaw__add_backlog_item({ title, description, priority, tags })`
 - NEVER add "Co-Authored-By" trailers or "Generated with Claude Code" footers to commits or PRs.
 
 ## Feature Work Routing
-
-<!-- nanoclaw:keep -->
 
 For work that changes behavior, crosses a trust boundary, has meaningful rollback risk, or benefits from coordinated implementation, start with `/team-plan`. File count alone does not decide: a mechanical multi-file edit may stay small; a one-file credential migration needs deep review.
 

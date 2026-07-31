@@ -655,6 +655,12 @@ export function createCodexConfigOverrides(
   const overrides = [
     'features.use_linux_sandbox_bwrap=false',
     'features.goals=true',
+    // Raises Codex's silent-truncation ceiling for the group AGENTS.md — the
+    // 32KB default (`project_doc_max_bytes`) truncated whole behavioral
+    // sections in production (4,131 logged incidents). 262144 = 256KB, ~8x
+    // the largest current doc. Keep src/codex-project-doc-cap.ts's warn
+    // threshold numerically in sync with this value.
+    'project_doc_max_bytes=262144',
     'features.steer=true',
     'features.fast_mode=true',
     // Bound native collaboration at the app-server boundary. Each Codex

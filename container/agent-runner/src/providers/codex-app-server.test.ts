@@ -174,6 +174,17 @@ describe('createCodexConfigOverrides', () => {
     expect(createCodexConfigOverrides()).toContain('features.fast_mode=true');
   });
 
+  it('always raises project_doc_max_bytes above Codex\'s 32KB default', () => {
+    // 32KB default (`project_doc_max_bytes`) truncated whole behavioral
+    // sections of the group AGENTS.md silently. Tripwire: this must not
+    // regress back to Codex's default on a future refactor.
+    expect(createCodexConfigOverrides()).toContain('project_doc_max_bytes=262144');
+    expect(createCodexConfigOverrides({ reasoning_effort: 'xhigh' })).toContain(
+      'project_doc_max_bytes=262144',
+    );
+    expect(createCodexConfigOverrides(undefined, true)).toContain('project_doc_max_bytes=262144');
+  });
+
   it('bounds native subagent concurrency with a safe fleet default', () => {
     const overrides = createCodexConfigOverrides();
     expect(overrides).toContain('features.multi_agent_v2=true');
