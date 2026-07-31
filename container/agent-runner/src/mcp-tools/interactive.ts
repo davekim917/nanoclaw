@@ -38,7 +38,7 @@ export const askUserQuestion: McpToolDefinition = {
   tool: {
     name: 'ask_user_question',
     description:
-      'Ask the user a multiple-choice question and wait for their response. This is a blocking call — execution pauses until the user responds or the timeout expires. Provide a short card title (e.g. "Confirm deletion") and an array of options — each option may be a plain string (used as both button label and result value) or an object { label, selectedLabel?, value? } where selectedLabel is the text shown on the card after the user clicks.',
+      'Ask the user a multiple-choice question and wait for their response. This is a blocking call — execution pauses until the user responds or the timeout expires, so reach for it only when you genuinely cannot proceed without the decision. For free-text input, send a normal message and wait for their reply instead. Provide a short card title (e.g. "Confirm deletion") and an array of options — each option may be a plain string (used as both button label and result value) or an object { label, selectedLabel?, value? } where selectedLabel is the text shown on the card after the user clicks.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -132,7 +132,8 @@ export const askUserQuestion: McpToolDefinition = {
 export const sendCard: McpToolDefinition = {
   tool: {
     name: 'send_card',
-    description: 'Send a structured card (interactive or display-only) to the current conversation.',
+    description:
+      'Send a structured card (interactive or display-only) to the current conversation. Returns immediately — it does not pause your turn or collect a response. Use it to present information more cleanly than prose: summaries, results with contextual buttons, or options the user can read but you are not waiting on. If you need the user to choose something and return a value to you, use ask_user_question instead.',
     inputSchema: {
       type: 'object' as const,
       properties: {

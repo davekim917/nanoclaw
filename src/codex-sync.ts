@@ -12,7 +12,7 @@ import os from 'os';
 import path from 'path';
 
 import { flattenClaudeMd } from './agents-md-flatten.js';
-import { capCodexProjectDoc } from './codex-project-doc-cap.js';
+import { CODEX_PROJECT_DOC_DEFAULT_MAX_BYTES, warnIfOversized } from './codex-project-doc-cap.js';
 import { formatCodexAgentToml, isManagedToml, parseClaudeAgentMd } from './claude-agent-md.js';
 import { discoverClaudeSubagents, type DiscoveredSubagent } from './claude-subagent-discovery.js';
 
@@ -53,7 +53,18 @@ export function syncCodexAgentsMd(): AgentsMdSyncResult {
   }
 
   const flattened = flattenClaudeMd(claudeMd);
-  const output = capCodexProjectDoc(CODEX_PEER_HEADER + flattened, '~/.codex/AGENTS.md');
+  const output = CODEX_PEER_HEADER + flattened;
+  // The host Codex CLI does NOT receive the container `-c project_doc_max_bytes`
+  // override (codex-app-server.ts) — it truncates at Codex's own built-in
+  // default. Write uncapped and warn; if this fires, set
+  // `project_doc_max_bytes` in ~/.codex/config.toml. Don't auto-edit that file
+  // here — the codex-sync-watcher reads it as input, so writing it from here
+  // risks a loop.
+  warnIfOversized(
+    '~/.codex/AGENTS.md (host codex truncates at its own default; set project_doc_max_bytes in ~/.codex/config.toml)',
+    output,
+    CODEX_PROJECT_DOC_DEFAULT_MAX_BYTES,
+  );
 
   const target = path.join(os.homedir(), '.codex', 'AGENTS.md');
   fs.mkdirSync(path.dirname(target), { recursive: true });

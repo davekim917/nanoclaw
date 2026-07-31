@@ -425,61 +425,6 @@ export function resolveQueryEffort(requested: string | undefined, sticky: CodexS
   return sticky;
 }
 
-// ── System-prompt assembly ──────────────────────────────────────────────────
-// Codex's app-server doesn't expand Claude Code's `@-import` syntax in
-// CLAUDE.md, and doesn't auto-load CLAUDE.local.md from the working dir the
-// way Claude Code does. Left alone, the agent sees only the raw import
-// directives as literal text and none of the composed content — no shared
-// CLAUDE.md or module fragments. We resolve both here
-// so Codex (and any other non-Claude provider) gets the same effective
-// system prompt the Claude provider gets natively.
-
-/**
- * Inline `@<path>` import directives (line-anchored) with the contents of
- * the referenced file, resolved relative to `baseDir`. Recurses so imports
- * within imported files expand too. Cycles and missing files are silently
- * dropped (replaced with empty text) rather than left as raw `@path` lines,
- * which would confuse the model.
- */
-export function resolveClaudeImports(content: string, baseDir: string, seen: Set<string> = new Set()): string {
-  return content.replace(/^@(\S+)\s*$/gm, (_match, importPath: string) => {
-    try {
-      const resolved = path.resolve(baseDir, importPath);
-      if (seen.has(resolved)) return '';
-      if (!fs.existsSync(resolved)) return '';
-      const nextSeen = new Set(seen);
-      nextSeen.add(resolved);
-      const imported = fs.readFileSync(resolved, 'utf-8');
-      return resolveClaudeImports(imported, path.dirname(resolved), nextSeen);
-    } catch {
-      return '';
-    }
-  });
-}
-
-function readAgentAndGlobalClaudeMd(): string | undefined {
-  // Per-group CLAUDE.md is responsible for pulling in the global instructions
-  // if the group wants them (the default scaffold starts with
-  // `@./.claude-global.md` which resolveClaudeImports inlines). Appending
-  // `/workspace/global/CLAUDE.md` explicitly here would double-inline the
-  // global content for any non-main group, wasting context tokens and
-  // risking contradictory instructions. Groups that don't import global
-  // intentionally don't get it — same as Claude-backed agents.
-  const groupDir = '/workspace/agent';
-  const groupPath = `${groupDir}/CLAUDE.md`;
-  const localPath = `${groupDir}/CLAUDE.local.md`;
-  const parts: string[] = [];
-
-  if (fs.existsSync(groupPath)) {
-    parts.push(resolveClaudeImports(fs.readFileSync(groupPath, 'utf-8'), groupDir));
-  }
-  if (fs.existsSync(localPath)) {
-    parts.push(resolveClaudeImports(fs.readFileSync(localPath, 'utf-8'), groupDir));
-  }
-
-  return parts.length > 0 ? parts.join('\n\n---\n\n') : undefined;
-}
-
 export function buildCodexSubagentLifecycleInstructions(maxConcurrentThreadsPerSession: number): string {
   const workerSlots = Math.max(0, maxConcurrentThreadsPerSession - 1);
   return `## Codex subagent lifecycle
@@ -492,13 +437,20 @@ This session is limited to ${maxConcurrentThreadsPerSession} concurrent threads:
 - Before ending your turn, close every subagent you spawned, including failure and cancellation paths.`;
 }
 
+// Group instructions (shared base + fragments + per-group standing
+// instructions) reach Codex through AGENTS.md, which the app-server
+// auto-loads as its project doc from cwd (`/workspace/agent` — see
+// poll-loop's caller in index.ts). This function used to also read and
+// @-import-resolve CLAUDE.md/CLAUDE.local.md by hand and fold that in here
+// too, which doubled ~26KB of instructions into every turn's context and
+// left two copies of every rule that could drift out of sync. AGENTS.md is
+// now the single instruction surface for Codex.
 function composeBaseInstructions(
   promptAddendum: string | undefined,
   maxConcurrentThreadsPerSession: number,
 ): string {
-  const claudeMd = readAgentAndGlobalClaudeMd();
   const lifecycle = buildCodexSubagentLifecycleInstructions(maxConcurrentThreadsPerSession);
-  const pieces = [claudeMd, promptAddendum, lifecycle].filter((s): s is string => Boolean(s));
+  const pieces = [promptAddendum, lifecycle].filter((s): s is string => Boolean(s));
   return pieces.join('\n\n---\n\n');
 }
 
