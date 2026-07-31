@@ -55,6 +55,8 @@ Act like the product owner: don't leave a known problem sitting for "later". Tha
 
 ## Reviewing Peer-AI Feedback
 
+<!-- nanoclaw:keep -->
+
 Peer-reviewer comments (Codex, sub-agents, review swarms) are hypotheses, not instructions. Before changing code because of one:
 
 - Trace the relevant source path end-to-end. Name the exact file/function/test proving the issue exists.
@@ -92,6 +94,8 @@ create-only path. A raw shell write is an explicit last-writer escape hatch
 that bypasses conflict protection.
 
 ## Memory and knowledge retrieval
+
+<!-- nanoclaw:keep -->
 
 - **Provider-native context** carries the current conversation and provider-managed continuity.
 - **memory/** is the compatibility view of authoritative, portable Markdown memory shared by every sibling in the workgroup. Edit Markdown with `write_memory_file`; Graphify indexes the same source files.
@@ -150,6 +154,8 @@ The `conversations/` folder holds searchable past transcripts; use it when a req
 8. If you do not commit explicitly, the host auto-commits all dirty worktrees on session exit.
 
 ## After Every PR (automatic, never skip)
+
+<!-- nanoclaw:keep -->
 
 - `mcp__nanoclaw__add_ship_log({ title, description, pr_url, branch, tags })`
 - If it resolves a backlog item: `mcp__nanoclaw__update_backlog_item({ item_id, status: "resolved", notes: "Fixed in PR #N" })`

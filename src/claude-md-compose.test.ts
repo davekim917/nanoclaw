@@ -218,3 +218,42 @@ describe('CLAUDE.local.md reach across providers', () => {
     expect(agents).not.toContain('## Standing instructions for this group');
   });
 });
+
+describe('cap gating is provider-specific', () => {
+  // 37acd18d gated the 32KB cap to Codex, because `project_doc_max_bytes` is a
+  // Codex setting: OpenCode has no equivalent and Claude ignores a sibling
+  // AGENTS.md entirely. Applying it universally made OpenCode groups shed whole
+  // behavioral sections to satisfy a limit their runtime does not have.
+  function withHugeLocal(folder: string): void {
+    const dir = path.join(GROUPS_DIR, folder);
+    fs.mkdirSync(dir, { recursive: true });
+    // Comfortably over the 32KB cap, as many separate droppable sections.
+    const body = Array.from({ length: 40 }, (_, i) => `## Filler ${i}\n\n${'x'.repeat(1000)}`).join('\n\n');
+    fs.writeFileSync(path.join(dir, 'CLAUDE.local.md'), body);
+  }
+
+  it('caps the document for codex', () => {
+    const ag = group('ag-cap-codex', 'cap-codex');
+    seed(ag);
+    withHugeLocal(ag.folder);
+
+    composeGroupClaudeMd(ag, 'codex');
+
+    const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
+    expect(Buffer.byteLength(agents, 'utf-8')).toBeLessThanOrEqual(32 * 1024);
+  });
+
+  for (const provider of ['opencode', 'claude']) {
+    it(`does NOT cap the document for ${provider}`, () => {
+      const ag = group(`ag-cap-${provider}`, `cap-${provider}`);
+      seed(ag);
+      withHugeLocal(ag.folder);
+
+      composeGroupClaudeMd(ag, provider);
+
+      const agents = fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'AGENTS.md'), 'utf-8');
+      expect(Buffer.byteLength(agents, 'utf-8')).toBeGreaterThan(32 * 1024);
+      expect(agents).not.toContain('## Omitted for size');
+    });
+  }
+});

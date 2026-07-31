@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 
 // Suppress the warn/error logs the cap emits; we assert on the returned doc.
@@ -110,5 +112,35 @@ describe('capCodexProjectDoc', () => {
       out = capCodexProjectDoc(doc);
     }).not.toThrow();
     expect(out).toBe(doc); // nothing droppable — returned as-is, logged loudly
+  });
+});
+
+describe('production keep-markers are bound to their intended rules', () => {
+  // The cap tests above use synthetic sections, so nothing caught a marker
+  // drifting off the rule it protects — a section split, a renamed heading, or
+  // a rule moved under a new `##` would silently orphan it. These assert against
+  // the real shipped file. If you intentionally rename a section, update this
+  // list; if a rule MOVES, the marker must move with it.
+  const SOURCE = path.join(process.cwd(), 'container', 'CLAUDE.md');
+
+  // heading → a phrase from the invariant that heading is protecting
+  const PROTECTED: Array<[string, string]> = [
+    ['## Container lifecycle', 'continue_work'],
+    ['## Truth-Grounded Responses', 'grounded in verifiable truth'],
+    ['## Credential Security', 'NEVER ask users to share API keys'],
+    ['## Feature Work Routing', 'team-plan'],
+    ['## Reviewing Peer-AI Feedback', 'treat that test as the current contract'],
+    ['## Memory and knowledge retrieval', 'open cited provenance'],
+    ['## After Every PR', 'Co-Authored-By'],
+  ];
+
+  const sectionsOf = (text: string): string[] => text.split(/^(?=## (?!#))/m).slice(1);
+
+  it.each(PROTECTED)('%s carries the marker and still contains its rule', (heading, phrase) => {
+    const text = fs.readFileSync(SOURCE, 'utf-8');
+    const section = sectionsOf(text).find((s) => s.startsWith(heading));
+    expect(section, `section not found: ${heading} — was it renamed?`).toBeDefined();
+    expect(section).toContain(PROTECTED_SECTION_MARKER);
+    expect(section, `${heading} no longer contains its protected rule`).toContain(phrase);
   });
 });
