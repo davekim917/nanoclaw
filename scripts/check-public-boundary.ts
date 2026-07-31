@@ -75,6 +75,10 @@ const GENERIC_IDENTIFIERS = new Set([
   'discord-opencode',
   'cli:local',
   'cli:test-driver',
+  // Slack's built-in bot; ingress auto-creates a user row named this in any
+  // install with a Slack workspace, and it collides with generic camelCase
+  // `slackBot` variables in channel code. Universal, not install-specific.
+  'slackbot',
 ]);
 
 const RESERVED_EMAIL_DOMAINS = new Set([

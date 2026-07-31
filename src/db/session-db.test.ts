@@ -85,14 +85,22 @@ describe('getDueWakePriority', () => {
     db: Database.Database,
     id: string,
     kind: string,
-    options: { trigger?: 0 | 1; processAfter?: string | null } = {},
+    options: { trigger?: 0 | 1; processAfter?: string | null; timestamp?: string } = {},
   ): void {
     const seq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m + 2;
     db.prepare(
       `INSERT INTO messages_in
          (id, seq, kind, timestamp, status, content, process_after, series_id, trigger)
        VALUES (?, ?, ?, ?, 'pending', '{}', ?, ?, ?)`,
-    ).run(id, seq, kind, new Date().toISOString(), options.processAfter ?? null, id, options.trigger ?? 1);
+    ).run(
+      id,
+      seq,
+      kind,
+      options.timestamp ?? new Date().toISOString(),
+      options.processAfter ?? null,
+      id,
+      options.trigger ?? 1,
+    );
   }
 
   it('classifies scheduled-only due work as scheduled', () => {
@@ -134,6 +142,48 @@ describe('getDueWakePriority', () => {
     const db = makeInboundDb();
     try {
       expect(getDueWakePriority(db)).toBe('interactive');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('demotes aged chat backlog to scheduled (restart-stampede case)', () => {
+    const db = makeInboundDb();
+    try {
+      // A channel-recovery / stale-reset row: chat kind, but hours old.
+      insertDueRow(db, 'old-chat', 'chat-sdk', {
+        timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      });
+      expect(getDueWakePriority(db)).toBe('scheduled');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('keeps interactive when a fresh message sits alongside aged backlog', () => {
+    const db = makeInboundDb();
+    try {
+      insertDueRow(db, 'old-chat', 'chat-sdk', {
+        timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      });
+      insertDueRow(db, 'fresh-chat', 'chat-sdk');
+      expect(getDueWakePriority(db)).toBe('interactive');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('keeps aged backlog scheduled even when backoff stamps a fresh fire time', () => {
+    const db = makeInboundDb();
+    try {
+      // Stale-reset retry: inserted hours ago, but each backoff cycle sets a
+      // recent process_after. Freshness must come from insertion, or backlog
+      // rows would be permanently "fresh".
+      insertDueRow(db, 'retried-chat', 'chat-sdk', {
+        timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+        processAfter: new Date(Date.now() - 60 * 1000).toISOString(),
+      });
+      expect(getDueWakePriority(db)).toBe('scheduled');
     } finally {
       db.close();
     }

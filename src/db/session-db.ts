@@ -301,23 +301,45 @@ export function countDueMessages(db: Database.Database): number {
 }
 
 /**
+ * A due non-task row older than this no longer forces an interactive wake.
+ * Nobody is sitting on the other end of a 15-minute-old message the way they
+ * are for one sent seconds ago — rows past this age are backlog (channel
+ * recovery after a restart, stale-reset retries) and must not let a stampede
+ * of old chat rows starve a live thread out of the memory-budget queue.
+ * Demotion is decided per wake attempt from row age; an entry already queued
+ * as interactive is never demoted (admission promotes only, see
+ * MemoryAdmissionController.request), so a fresh message that then waits in
+ * a full queue keeps its class.
+ */
+export const INTERACTIVE_WAKE_MAX_AGE_MS = 15 * 60 * 1000;
+
+/**
  * Priority for a session wake based on the work that is due right now.
- * A wake is scheduled only when every due triggering row is a scheduled-task
- * row. Any due chat, system notification, approval, or agent message makes
- * the wake interactive. No due rows defaults to interactive, which is the
+ * A wake is interactive only when some due triggering row is BOTH non-task
+ * (chat, system notification, approval, agent message) AND recent — see
+ * INTERACTIVE_WAKE_MAX_AGE_MS. Scheduled-task rows and aged backlog rows
+ * classify as scheduled. No due rows defaults to interactive, which is the
  * fail-safe classification for callers racing with another writer.
+ * Age is measured from INSERTION (`timestamp`), deliberately not from
+ * `process_after`: stale-reset backoff stamps a fresh fire time on every
+ * retry, which would keep months-old backlog permanently "fresh". Insertion
+ * time is when the human-visible event actually happened, which is the only
+ * thing interactive priority is about.
  */
 export function getDueWakePriority(db: Database.Database): 'interactive' | 'scheduled' {
+  const freshCutoffIso = new Date(Date.now() - INTERACTIVE_WAKE_MAX_AGE_MS).toISOString();
   const row = db
     .prepare(
       `SELECT COUNT(*) AS count,
-              MAX(CASE WHEN kind <> 'task' THEN 1 ELSE 0 END) AS has_interactive
+              MAX(CASE WHEN kind <> 'task'
+                        AND datetime(timestamp) >= datetime(?)
+                       THEN 1 ELSE 0 END) AS has_interactive
          FROM messages_in
         WHERE status = 'pending'
           AND trigger = 1
           AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
     )
-    .get() as { count: number; has_interactive: number | null };
+    .get(freshCutoffIso) as { count: number; has_interactive: number | null };
   return row.count > 0 && row.has_interactive === 0 ? 'scheduled' : 'interactive';
 }
 
