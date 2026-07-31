@@ -1261,6 +1261,91 @@ describe('dispatchResultText — unwrapped output fallback', () => {
   });
 });
 
+describe('dispatchResultText — "here" alias', () => {
+  function seedDestination(name: string, channelType: string, platformId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run(name, name, channelType, platformId);
+  }
+
+  function routing(channelType: string | null, platformId: string | null) {
+    return { channelType, platformId, threadId: null, inReplyTo: null, quietStatus: false };
+  }
+
+  it('routes <message to="here"> to the origin destination', () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    seedDestination('discord-side', 'discord', 'chan-9');
+
+    const result = dispatchResultText('<message to="here">reply in place</message>', routing('slack', 'C-MAIN'));
+
+    expect(result.sent).toBe(1);
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].channel_type).toBe('slack');
+    expect(out[0].platform_id).toBe('C-MAIN');
+    expect(JSON.parse(out[0].content).text).toBe('reply in place');
+  });
+
+  it('is case-insensitive — <message to="HERE"> resolves the same way', () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    dispatchResultText('<message to="HERE">shout back</message>', routing('slack', 'C-MAIN'));
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('shout back');
+  });
+
+  it('a real destination literally named "here" wins over the alias', () => {
+    seedDestination('here', 'slack', 'C-LITERAL');
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+
+    dispatchResultText('<message to="here">literal destination</message>', routing('slack', 'C-MAIN'));
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].platform_id).toBe('C-LITERAL');
+  });
+
+  it('unresolvable origin falls through to unknown-destination handling instead of a silent drop', () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    seedDestination('discord-side', 'discord', 'chan-9');
+
+    const result = dispatchResultText(
+      '<message to="here">nowhere to land</message>',
+      routing('telegram', 'unknown-chat'),
+    );
+
+    // No destination and no single-destination fallback available — same
+    // "no safe target" outcome as an unknown named destination; not a throw.
+    expect(result.sent).toBe(0);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('is rejected like any other block in a task-run session', () => {
+    seedDestination('slack-main', 'slack', 'C-TASK');
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+         VALUES ('task-here', 'task', datetime('now'), 'pending', 1, 'C-TASK', 'slack', 'thread-99', '{"prompt":"do the thing"}')`,
+      )
+      .run();
+
+    const taskRouting = extractRouting(getPendingMessages());
+    const result = dispatchResultText('<message to="here">task reply</message>', taskRouting);
+
+    expect(result).toEqual({
+      sent: 0,
+      hasUnwrapped: false,
+      taskBlocks: [{ to: 'here', body: 'task reply' }],
+    });
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+});
+
 describe('task-fire routing — a stamped `ncl tasks` row routes end-to-end', () => {
   // Simulates what the host now writes for a routed task series (WI1): a
   // messages_in row with kind='task' carrying its own platform_id/channel_type/

@@ -1911,6 +1911,22 @@ export function dispatchResultText(
     }
     const dest = findByName(toName);
     if (!dest) {
+      // "here" alias: current-conversation shorthand for the origin
+      // destination. A real destination literally named "here" wins over
+      // the alias — findByName above already checked, so we only get here
+      // when no such destination exists. Checked before peer recovery
+      // since 'here' is never a peer name.
+      if (toName.trim().toLowerCase() === 'here') {
+        const origin = findByRouting(routing.channelType, routing.platformId);
+        if (origin) {
+          log(`to="here" resolved to origin "${origin.name}"`);
+          sendToDestination(origin, body, routing);
+          sent++;
+          continue;
+        }
+        // Origin unresolvable — fall through to the unknown-destination
+        // handling below instead of inventing new behavior.
+      }
       // Recovery: the agent addressed a PEER (sibling) as a destination — a
       // common mistake, esp. opencode (observed: `<message to="Example Agent-Codex">`
       // dropped). Peers aren't destinations; you reach them by @-mentioning in
@@ -1930,6 +1946,10 @@ export function dispatchResultText(
       log(`Unknown destination in <message to="${toName}">, dropping block`);
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
+    }
+    const origin = findByRouting(routing.channelType, routing.platformId);
+    if (origin && dest.name !== origin.name) {
+      log(`Cross-destination final block: to="${toName}" from origin "${origin.name}"`);
     }
     sendToDestination(dest, body, routing);
     sent++;

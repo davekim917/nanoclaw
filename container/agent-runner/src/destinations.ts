@@ -269,11 +269,11 @@ function buildDestinationsSection(mode: SessionMode): string {
   }
 
   lines.push(
-    'Wrap each delivered message in a `<message to="name">…</message>` block; include several blocks in one response to address several destinations. `<internal>…</internal>` marks thinking you don\'t want sent.',
+    'Wrap every delivered message in a `<message …>` block. Use `<message to="here">…</message>` for the current conversation — the thread/channel this request came from. `to="here"` is the default and is always correct for progress updates and the results of the work you were asked to do. Use `<message to="name">…</message>` with a destination name from the list above ONLY to reach a DIFFERENT channel or DM, and only when the request explicitly asks for it. Include several blocks in one response to address several destinations. `<internal>…</internal>` marks thinking you don\'t want sent.',
   );
   lines.push('');
   lines.push(
-    'When replying to an incoming message, default to addressing the destination it came `from` (every inbound `<message>` tag carries a `from="name"` attribute). Pick a different destination when the request asks for it (e.g., "tell Laura that…").',
+    '`to="here"` is the default when replying to an incoming message. The inbound `<message>` tag\'s `from="name"` attribute still identifies where the request came from — naming that destination explicitly is equivalent to `here`. Pick a different destination when the request asks for it (e.g., "tell Laura that…").',
   );
   lines.push('');
   lines.push(

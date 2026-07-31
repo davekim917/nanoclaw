@@ -20,7 +20,7 @@ export function buildCompactInstructions(names: string[], taskId: string | null)
         `   Available destinations: ${formatDestinationNames(names)}."`,
       ]
     : [
-        '   "You MUST wrap all responses in <message to="name">...</message> blocks.',
+        '   "You MUST wrap all responses in <message to="name">...</message> blocks — use to="here" for the current conversation (the default).',
         `   Available destinations: ${formatDestinationNames(names)}."`,
       ];
 
