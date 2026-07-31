@@ -422,14 +422,14 @@ describe('createChatSdkBridge.deliver — ask_question cards', () => {
         type: 'ask_question',
         questionId: 'approval-with-detail',
         title: 'Install Packages Request',
-        question: 'Agent "number-drinks" wants to install WebKit libraries. Approve?',
+        question: 'Agent "example-group" wants to install WebKit libraries. Approve?',
         options: ['Approve', 'Reject'],
       },
     });
 
     const msg = calls[0].message as { card?: { subtitle?: string }; fallbackText?: string };
-    expect(msg.card?.subtitle).toBe('Agent "number-drinks" wants to install WebKit libraries. Approve?');
-    expect(msg.fallbackText).toContain('Agent "number-drinks" wants to install WebKit libraries. Approve?');
+    expect(msg.card?.subtitle).toBe('Agent "example-group" wants to install WebKit libraries. Approve?');
+    expect(msg.fallbackText).toContain('Agent "example-group" wants to install WebKit libraries. Approve?');
   });
 
   it('puts Discord decision context in ordinary message content with native buttons', async () => {
@@ -458,7 +458,7 @@ describe('createChatSdkBridge.deliver — ask_question cards', () => {
         type: 'ask_question',
         questionId: 'q-discord-content',
         title: 'Install Packages Request',
-        question: 'Agent "number-drinks" wants to install WebKit libraries. Approve?',
+        question: 'Agent "example-group" wants to install WebKit libraries. Approve?',
         options: [
           { label: 'Approve', value: 'approve', style: 'primary' },
           { label: 'Reject', value: 'reject', style: 'danger' },
@@ -474,7 +474,7 @@ describe('createChatSdkBridge.deliver — ask_question cards', () => {
     expect((init?.headers as Record<string, string>).Authorization).toBe('Bot test-bot-token');
     const body = JSON.parse(init?.body as string);
     expect(body).toMatchObject({
-      content: '**Install Packages Request**\n\nAgent "number-drinks" wants to install WebKit libraries. Approve?',
+      content: '**Install Packages Request**\n\nAgent "example-group" wants to install WebKit libraries. Approve?',
       allowed_mentions: { parse: [] },
     });
     expect(body.embeds).toBeUndefined();

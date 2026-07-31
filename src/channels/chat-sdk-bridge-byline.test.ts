@@ -186,7 +186,7 @@ describe('chat-sdk-bridge approval-card byline', () => {
   });
 
   it('keeps the decision context visible after an approval resolves', async () => {
-    seedApproval('q-1', 'Install Packages Request', 'Agent "number-drinks" wants to install WebKit libraries.');
+    seedApproval('q-1', 'Install Packages Request', 'Agent "example-group" wants to install WebKit libraries.');
 
     const { edits, actions } = await fireAction(
       { userId: 'U1', userName: 'gavriel' },
@@ -196,7 +196,7 @@ describe('chat-sdk-bridge approval-card byline', () => {
     expect(actions).toEqual(['q-1:approve:U1']);
     expect(edits).toHaveLength(1);
     expect(edits[0].card?.title).toBe('Install Packages Request');
-    expect(edits[0].card?.subtitle).toBe('Agent "number-drinks" wants to install WebKit libraries.');
+    expect(edits[0].card?.subtitle).toBe('Agent "example-group" wants to install WebKit libraries.');
     expect(edits[0].card?.children?.[0]?.content).toContain('✅ Approved — gavriel');
   });
 
