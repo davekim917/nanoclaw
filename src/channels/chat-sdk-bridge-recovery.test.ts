@@ -409,7 +409,15 @@ describe('Chat SDK bridge Discord approval actions', () => {
     expect(onAction).toHaveBeenCalledWith('appr-discord', 'approve', 'U1');
     const callbackInit = fetchMock.mock.calls[0]?.[1];
     expect(callbackInit).toBeDefined();
-    expect(JSON.parse(callbackInit!.body as string)).toMatchObject({ type: 7 });
+    expect(JSON.parse(callbackInit!.body as string)).toMatchObject({
+      type: 7,
+      data: {
+        content: '**⚠️ Test approval**\n\nDetails\n\n✅ Approved',
+        embeds: [],
+        components: [],
+        allowed_mentions: { parse: [] },
+      },
+    });
   });
 
   it("decodes Discord's newline-delimited custom_id before resolving the option", async () => {

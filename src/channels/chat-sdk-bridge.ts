@@ -418,6 +418,10 @@ export function parseRetryAfterMs(err: unknown): number | null {
 const MAX_RATE_LIMIT_RETRIES = 3;
 const RATE_LIMIT_BUFFER_MS = 100;
 const CARD_TITLE_MAX_CODE_POINTS = 150;
+const DISCORD_MESSAGE_MAX_CODE_UNITS = 2000;
+const DISCORD_BUTTON_LABEL_MAX_CODE_POINTS = 80;
+const DISCORD_COMPONENTS_PER_ROW = 5;
+const DISCORD_COMPONENT_ROW_MAX = 5;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -432,6 +436,97 @@ function fitCardTitle(title: string): string {
       .join('')
       .trimEnd() + '…'
   );
+}
+
+function fitDiscordButtonLabel(label: string): string {
+  const codePoints = Array.from(label);
+  if (codePoints.length <= DISCORD_BUTTON_LABEL_MAX_CODE_POINTS) return label;
+  return (
+    codePoints
+      .slice(0, DISCORD_BUTTON_LABEL_MAX_CODE_POINTS - 1)
+      .join('')
+      .trimEnd() + '…'
+  );
+}
+
+function discordDeliveryChannelId(threadId: string): string {
+  const parts = threadId.split(':');
+  if (parts[0] !== 'discord' || parts.length < 3 || !parts[2]) {
+    throw new Error(`Invalid Discord thread ID: ${threadId}`);
+  }
+  return parts[3] || parts[2];
+}
+
+function discordButtonStyle(style: NormalizedOption['style']): number {
+  if (style === 'primary') return 1;
+  if (style === 'danger') return 4;
+  return 2;
+}
+
+/**
+ * Post an interactive Discord question with its decision context in ordinary
+ * message content. Discord clients can suppress embeds, which previously left
+ * users looking at an unexplained row of buttons even though the embed payload
+ * contained the title and question.
+ */
+async function postDiscordQuestion(
+  threadId: string,
+  botToken: string,
+  title: string,
+  question: string,
+  questionId: string,
+  options: NormalizedOption[],
+  configuredTextLimit?: number,
+): Promise<string> {
+  if (options.length > DISCORD_COMPONENTS_PER_ROW * DISCORD_COMPONENT_ROW_MAX) {
+    throw new Error(`Discord question has ${options.length} options; maximum is 25`);
+  }
+
+  const limit = Math.min(configuredTextLimit ?? DISCORD_MESSAGE_MAX_CODE_UNITS, DISCORD_MESSAGE_MAX_CODE_UNITS);
+  const fullContent = `**${title}**\n\n${question}`;
+  const content =
+    fullContent.length > limit ? `${splitForLimit(fullContent, Math.max(1, limit - 1))[0].trimEnd()}…` : fullContent;
+  const buttons = options.map((option, index) => {
+    const customId = `ncq:${questionId}:${index}\n${index}`;
+    if (customId.length > 100) {
+      throw new Error(`Discord question ID is too long for a button custom_id: ${questionId}`);
+    }
+    return {
+      type: 2,
+      style: discordButtonStyle(option.style),
+      label: fitDiscordButtonLabel(option.label),
+      custom_id: customId,
+    };
+  });
+  const components: Array<{ type: number; components: typeof buttons }> = [];
+  for (let i = 0; i < buttons.length; i += DISCORD_COMPONENTS_PER_ROW) {
+    components.push({ type: 1, components: buttons.slice(i, i + DISCORD_COMPONENTS_PER_ROW) });
+  }
+
+  const channelId = discordDeliveryChannelId(threadId);
+  const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bot ${botToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      content,
+      components,
+      // Moving approval context into message content must not turn user- or
+      // agent-supplied text into an accidental @everyone/user notification.
+      allowed_mentions: { parse: [] },
+    }),
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 500);
+    throw new Error(`Discord card delivery failed (${response.status}): ${detail}`);
+  }
+  const posted = (await response.json()) as { id?: unknown };
+  if (typeof posted.id !== 'string' || !posted.id) {
+    throw new Error('Discord card delivery response did not include a message id');
+  }
+  return posted.id;
 }
 
 export function splitForLimit(text: string, limit: number): string[] {
@@ -452,6 +547,8 @@ export function splitForLimit(text: string, limit: number): string[] {
 
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
+  const bridgeChannelType = config.channelType ?? adapter.name;
+  const isDiscordBridge = bridgeChannelType === 'discord' || bridgeChannelType.startsWith('discord-');
   // The instance name becomes a webhook route segment (the route regex is
   // [^/?]+) and ':' is the state-namespace delimiter — reject anything that
   // would break either, at construction time rather than at first webhook.
@@ -483,8 +580,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   let recoveryCursorMs = 0;
   let recoveryGapFloorMs: number | null = null;
   const ingressGate = new RecoveryIngressGate();
-  const recoveryCursorKey = `nanoclaw:recovery-cursor:${config.channelType ?? adapter.name}`;
-  const recoveryGapKey = `nanoclaw:recovery-gap:${config.channelType ?? adapter.name}`;
+  const recoveryCursorKey = `nanoclaw:recovery-cursor:${bridgeChannelType}`;
+  const recoveryGapKey = `nanoclaw:recovery-gap:${bridgeChannelType}`;
 
   async function advanceRecoveryCursor(timestamp: string): Promise<void> {
     const timestampMs = Date.parse(timestamp);
@@ -886,12 +983,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             event.messageId,
             render?.question
               ? {
-                  card: Card({
-                    title,
-                    subtitle: render.question,
-                    children: [CardText(resolution, { style: 'muted' })],
-                  }),
-                  fallbackText: `${title}\n\n${render.question}\n\n${resolution}`,
+                  ...(isDiscordBridge
+                    ? { markdown: `**${title}**\n\n${render.question}\n\n${resolution}` }
+                    : {
+                        card: Card({
+                          title,
+                          subtitle: render.question,
+                          children: [CardText(resolution, { style: 'muted' })],
+                        }),
+                        fallbackText: `${title}\n\n${render.question}\n\n${resolution}`,
+                      }),
                 }
               : { markdown: `${title}\n\n${resolution}` },
           );
@@ -1016,6 +1117,17 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           return;
         }
         const options: NormalizedOption[] = normalizeOptions(content.options as never);
+        if (isDiscordBridge && config.botToken) {
+          return postDiscordQuestion(
+            tid,
+            config.botToken,
+            displayTitle,
+            question,
+            questionId,
+            options,
+            config.maxTextLength,
+          );
+        }
         const card = Card({
           title: displayTitle,
           // Both the Discord and Slack adapters render Card.subtitle as the
@@ -1593,6 +1705,9 @@ export async function handleForwardedEvent(
         const originalEmbeds =
           ((interaction.message as Record<string, unknown>)?.embeds as Array<Record<string, unknown>>) || [];
         const originalDescription = (originalEmbeds[0]?.description as string) || '';
+        const originalContent = (
+          ((interaction.message as Record<string, unknown>)?.content as string | undefined) || ''
+        ).trim();
         const render = questionId ? getAskQuestionRender(questionId) : undefined;
         // Discord custom_id mirrors the new index-based encoding (see Button
         // construction). Decode back to the real option value for downstream.
@@ -1625,6 +1740,12 @@ export async function handleForwardedEvent(
         const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
         const matchedOpt = render?.options.find((o) => o.value === selectedOption);
         const selectedLabel = matchedOpt?.selectedLabel ?? selectedOption;
+        const resolvedQuestion = render?.question || originalDescription;
+        const resolvedContent = render
+          ? [`**${cardTitle}**`, resolvedQuestion, selectedLabel].filter(Boolean).join('\n\n')
+          : originalContent
+            ? [originalContent, selectedLabel].filter(Boolean).join('\n\n')
+            : [`**${cardTitle}**`, originalDescription, selectedLabel].filter(Boolean).join('\n\n');
         try {
           await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
             method: 'POST',
@@ -1632,13 +1753,10 @@ export async function handleForwardedEvent(
             body: JSON.stringify({
               type: 7, // UPDATE_MESSAGE — acknowledge + update in one call
               data: {
-                embeds: [
-                  {
-                    title: cardTitle,
-                    description: `${originalDescription || render?.question || ''}\n\n${selectedLabel}`,
-                  },
-                ],
+                content: resolvedContent,
+                embeds: [],
                 components: [], // remove buttons
+                allowed_mentions: { parse: [] },
               },
             }),
           });

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 
@@ -379,6 +379,8 @@ describe('createChatSdkBridge — outbound transform path', () => {
 });
 
 describe('createChatSdkBridge.deliver — ask_question cards', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it('caps rendered ask_question titles before creating the Card header', async () => {
     const { calls, postMessage } = makePostCapture();
     const bridge = createChatSdkBridge({
@@ -428,6 +430,93 @@ describe('createChatSdkBridge.deliver — ask_question cards', () => {
     const msg = calls[0].message as { card?: { subtitle?: string }; fallbackText?: string };
     expect(msg.card?.subtitle).toBe('Agent "number-drinks" wants to install WebKit libraries. Approve?');
     expect(msg.fallbackText).toContain('Agent "number-drinks" wants to install WebKit libraries. Approve?');
+  });
+
+  it('puts Discord decision context in ordinary message content with native buttons', async () => {
+    const postMessage = vi.fn(async () => {
+      throw new Error('Discord card delivery must not fall back to the embed-only adapter path');
+    });
+    const fetchMock = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) =>
+        new Response(JSON.stringify({ id: 'discord-message-1' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord', postMessage }),
+      channelType: 'discord-codex',
+      botToken: 'test-bot-token',
+      supportsThreads: true,
+      maxTextLength: 2000,
+    });
+
+    const id = await bridge.deliver('discord:GUILD:PARENT', 'discord:GUILD:PARENT:THREAD', {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-discord-content',
+        title: 'Install Packages Request',
+        question: 'Agent "number-drinks" wants to install WebKit libraries. Approve?',
+        options: [
+          { label: 'Approve', value: 'approve', style: 'primary' },
+          { label: 'Reject', value: 'reject', style: 'danger' },
+        ],
+      },
+    });
+
+    expect(id).toBe('discord-message-1');
+    expect(postMessage).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('https://discord.com/api/v10/channels/THREAD/messages');
+    expect((init?.headers as Record<string, string>).Authorization).toBe('Bot test-bot-token');
+    const body = JSON.parse(init?.body as string);
+    expect(body).toMatchObject({
+      content: '**Install Packages Request**\n\nAgent "number-drinks" wants to install WebKit libraries. Approve?',
+      allowed_mentions: { parse: [] },
+    });
+    expect(body.embeds).toBeUndefined();
+    expect(body.components).toEqual([
+      {
+        type: 1,
+        components: [
+          { type: 2, style: 1, label: 'Approve', custom_id: 'ncq:q-discord-content:0\n0' },
+          { type: 2, style: 4, label: 'Reject', custom_id: 'ncq:q-discord-content:1\n1' },
+        ],
+      },
+    ]);
+  });
+
+  it('splits Discord options into rows of at most five buttons', async () => {
+    const fetchMock = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) =>
+        new Response(JSON.stringify({ id: 'discord-message-rows' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'discord' }),
+      botToken: 'test-bot-token',
+      supportsThreads: false,
+    });
+
+    await bridge.deliver('discord:GUILD:CHANNEL', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-rows',
+        title: 'Choose',
+        question: 'Pick one',
+        options: ['One', 'Two', 'Three', 'Four', 'Five', 'Six'],
+      },
+    });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(body.components.map((row: { components: unknown[] }) => row.components.length)).toEqual([5, 1]);
   });
 });
 
