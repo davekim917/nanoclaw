@@ -2702,7 +2702,10 @@ async function buildContainerArgs(
   // archive projection (race-fix).
   resolvedWgId?: string,
 ): Promise<string[]> {
-  const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+  // --init: tini as PID 1 reaps orphaned children (esbuild/gh corpses were
+  // accumulating as zombies under bun, which doesn't reap as PID 1) and still
+  // forwards signals to the entrypoint, so SIGTERM handling is unchanged.
+  const args: string[] = ['run', '--rm', '--init', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
   args.push(...dockerResourceLimitArgs(containerConfig.resources));
   args.push(...graphifyContainerArgs());
 
