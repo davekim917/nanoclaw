@@ -38,7 +38,7 @@ vi.mock('./db/messaging-groups.js', async (importOriginal) => {
 
 import { buildMounts } from './container-runner.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
-import { ensureContainerConfig } from './db/container-configs.js';
+import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
 import { PERSONA_PREPEND_FILE, readGroupPersona } from './group-persona.js';
 import {
@@ -269,6 +269,35 @@ describe('initGroupFilesystem legacy seed isolation', () => {
 });
 
 describe('buildMounts agent surfaces', () => {
+  it('uses the OpenCode Go Grok 4.5 default at medium effort when no DB override exists', () => {
+    const ag = group('ag-opencode-defaults', 'opencode-defaults');
+    createAgentGroup(ag);
+    ensureContainerConfig(ag.id);
+
+    const contribution = providerContribution('opencode', ag, session('s-opencode-defaults', ag.id));
+
+    expect(contribution.env).toMatchObject({
+      OPENCODE_MODEL: 'opencode-go/grok-4.5',
+      OPENCODE_PROVIDER: 'opencode-go',
+      OPENCODE_EFFORT: 'medium',
+    });
+  });
+
+  it('keeps explicit OpenCode DB model and effort overrides authoritative', () => {
+    const ag = group('ag-opencode-overrides', 'opencode-overrides');
+    createAgentGroup(ag);
+    ensureContainerConfig(ag.id);
+    updateContainerConfigScalars(ag.id, { model: 'opencode-go/kimi-k3', effort: 'high' });
+
+    const contribution = providerContribution('opencode', ag, session('s-opencode-overrides', ag.id));
+
+    expect(contribution.env).toMatchObject({
+      OPENCODE_MODEL: 'opencode-go/kimi-k3',
+      OPENCODE_PROVIDER: 'opencode-go',
+      OPENCODE_EFFORT: 'high',
+    });
+  });
+
   it('mounts one shared kernel-lock inode for real Claude, Codex, and OpenCode build plans', () => {
     const workgroupId = 'shared-house';
     const providerGroups = [

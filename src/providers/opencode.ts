@@ -27,11 +27,11 @@ import { registerProviderContainerConfig } from './provider-container-registry.j
 // (container_configs), mirroring DEFAULT_OPUS_MODEL etc. for claude in
 // container-runner.ts. Default to the Go subscription (cheapest tier); Zen is
 // opt-in via an explicit `opencode/*` model. Bump these when the fleet default
-// moves (e.g. a new Kimi). The provider is derived from the model prefix at
+// moves. The provider is derived from the model prefix at
 // runtime; the constant only guards a malformed override.
-const DEFAULT_OPENCODE_MODEL = 'opencode-go/kimi-k2.7-code';
+const DEFAULT_OPENCODE_MODEL = 'opencode-go/grok-4.5';
 const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
-const DEFAULT_OPENCODE_EFFORT = 'high';
+const DEFAULT_OPENCODE_EFFORT = 'medium';
 
 function mergeNoProxy(current: string | undefined, additions: string): string {
   if (!current?.trim()) return additions;
