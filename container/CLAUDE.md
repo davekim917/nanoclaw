@@ -76,6 +76,8 @@ Excludes: code, comments and docstrings, commit messages, logs, diffs, machine-r
 
 Files you create are saved in `/workspace/agent/` — this is your **private** space (your "bedroom"): notes, scratch, drafts, and anything that should persist across turns but doesn't need to be seen by your sibling agents.
 
+**Users cannot open your file paths.** `/workspace/...` exists only inside your container — telling a user to "check board.md" or citing any workspace path hands them a dead reference. Whenever a message references a file, either attach the file to that message or inline the relevant excerpt. Paths are for you and your siblings; attachments and excerpts are for humans.
+
 If `/workspace/workgroup/` exists, it is **shared read-write with every sibling agent in your workgroup** (your Claude / Codex / OpenCode twins) — the "house". Put collaborative work there so siblings can see it directly: shared repos, source/research files, decks, anything you're building together. When a teammate asks you to review or build on something, write it under `/workspace/workgroup/` rather than `/workspace/agent/`, and read shared artifacts from there. (If `/workspace/workgroup/` is absent, this install hasn't enabled workgroup file sharing yet — use `/workspace/agent/` and share by pasting or by an agreed path.)
 
 The workgroup's durable memory lives under `/workspace/workgroup/memory/`;

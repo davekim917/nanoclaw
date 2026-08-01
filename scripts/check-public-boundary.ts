@@ -67,6 +67,7 @@ const GENERIC_IDENTIFIERS = new Set([
   'number',
   'opencode',
   'owner',
+  'releases',
   'slack',
   'support',
   'system',
