@@ -30,6 +30,7 @@ export interface PreparedScheduledTask {
   recurrence: string | null;
   script: string | null;
   processAfter: string;
+  muteChat?: boolean;
 }
 
 export interface ScheduledTaskRow {
@@ -102,6 +103,7 @@ export function prepareScheduledTask(input: {
   recurrence?: string | null;
   processAfter?: string;
   script?: string | null;
+  muteChat?: boolean;
   dangerouslyOverrideRecurrenceLimit?: boolean;
 }): PreparedScheduledTask {
   if (!input.prompt) throw new Error('--prompt is required');
@@ -119,7 +121,14 @@ export function prepareScheduledTask(input: {
     processAfter = parseProcessAfter(input.processAfter);
   }
 
-  return { name: input.name, prompt: input.prompt, recurrence, script, processAfter };
+  return {
+    name: input.name,
+    prompt: input.prompt,
+    recurrence,
+    script,
+    processAfter,
+    muteChat: input.muteChat === true,
+  };
 }
 
 /** Persist a prepared task through NanoClaw's single task/session representation. */
@@ -144,6 +153,10 @@ export function createScheduledTask(
         prompt: task.prompt,
         script: task.script,
         originSessionId: options?.originSessionId ?? null,
+        // Physical send suppression: the agent-runner drops chat-kind
+        // outbound writes for tasks carrying muteChat (watcher-style tasks
+        // whose contract is board/file output, never channel posts).
+        ...(task.muteChat ? { muteChat: true } : {}),
       }),
       status: options?.status ?? 'pending',
     });

@@ -12,7 +12,7 @@ import path from 'path';
 
 import { awaitDeliveryAck } from '../db/delivery-acks.js';
 import { findByName, getAllDestinations } from '../destinations.js';
-import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
+import { isChatMuted, getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo } from '../db/session-state.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { registerTools } from './server.js';
@@ -159,6 +159,11 @@ export const sendMessage: McpToolDefinition = {
     if ('error' in routing) return err(routing.error);
 
     const id = generateId();
+    if (isChatMuted()) {
+      return err(
+        'Chat sends are disabled for this task (muteChat). Alerts go through the outbox file contract; your completion report goes in the ledger.',
+      );
+    }
     const seq = writeMessageOut({
       id,
       in_reply_to: getCurrentInReplyTo(),

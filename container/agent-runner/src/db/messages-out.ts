@@ -42,7 +42,28 @@ export interface WriteMessageOut {
  * by seq across BOTH tables. If inbound and outbound could share a seq,
  * the agent's "edit message #5" could resolve to the wrong row.
  */
+/**
+ * Chat mute — physical send suppression for tasks created with muteChat
+ * (e.g. a watcher task whose contract is "never post"). Set per-turn by the
+ * poll loop from the task row's content; when active, chat-kind writes are
+ * dropped at this choke point — every send path (final <message> blocks,
+ * send_message MCP tool) funnels through writeMessageOut, so no instruction
+ * drift can reach the channel. Non-chat kinds (system actions, processing
+ * acks) pass through untouched.
+ */
+let chatMuted = false;
+export function setChatMute(muted: boolean): void {
+  chatMuted = muted;
+}
+export function isChatMuted(): boolean {
+  return chatMuted;
+}
+
 export function writeMessageOut(msg: WriteMessageOut): number {
+  if (chatMuted && msg.kind === 'chat') {
+    console.error(`[messages-out] chat muted for this task — dropped outbound message ${msg.id}`);
+    return -1;
+  }
   const outbound = getOutboundDb();
   const inbound = getInboundDb();
 

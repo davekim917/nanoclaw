@@ -12,7 +12,7 @@ import {
   retainCompleteRecallUnits,
   type MessageInRow,
 } from './db/messages-in.js';
-import { writeMessageOut } from './db/messages-out.js';
+import { setChatMute, writeMessageOut } from './db/messages-out.js';
 import { getSessionSpawnTaskId } from './db/session-routing.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
@@ -2162,6 +2162,23 @@ export function applyFlagBatch(
   _routing: RoutingContext,
   providerName: string,
 ): { model?: string; effort?: string; ultracode?: boolean; fast: boolean } {
+  // Physical chat mute: a task created with muteChat can never write a
+  // chat-kind outbound row this turn — set BEFORE the provider runs, reset
+  // every turn (sticky module state would otherwise leak across turns).
+  let mute = false;
+  for (const m of messages) {
+    if (m.kind !== 'task') continue;
+    try {
+      if ((JSON.parse(m.content) as { muteChat?: boolean }).muteChat) {
+        mute = true;
+        break;
+      }
+    } catch {
+      // malformed content row
+    }
+  }
+  setChatMute(mute);
+
   let intent: FlagIntent | undefined;
   for (const m of messages) {
     // Tasks carry flagIntent the same way chat messages do — used by scheduled

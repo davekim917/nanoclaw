@@ -303,6 +303,9 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
         script,
         originSessionId,
         ...(flagIntent && (flagIntent.turnModel || flagIntent.turnEffort) ? { flagIntent } : {}),
+        // Physical send suppression, enforced by the agent-runner: chat-kind
+        // outbound writes are dropped for tasks carrying muteChat.
+        ...(bool(args.mute_chat) ? { muteChat: true } : {}),
       }),
     });
     return selectTask(db, id);
@@ -676,6 +679,12 @@ registerResource({
           name: 'isolated',
           type: 'boolean',
           description: 'Stamp no routing — an unaddressed reply is discarded; only an explicit send reaches anyone.',
+        },
+        {
+          name: 'mute_chat',
+          type: 'boolean',
+          description:
+            'Physically disable chat sends from this task — the agent-runner drops them at the write layer. For tasks whose contract is file/board output only (e.g. a watcher).',
         },
         {
           name: 'messaging_group',
