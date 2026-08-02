@@ -138,9 +138,12 @@ describe('migrate-repo-store', () => {
     expect(git(movedWt, ['show', 'HEAD:followup.sql'])).toBe('select 4');
     expect(fs.lstatSync(path.join(wgDir, 'PROJ-pr213-review')).isSymbolicLink()).toBe(true);
 
-    // Thread worktree: transplanted to a standalone clone IN PLACE (path now
-    // under the wg namespace), uncommitted dirt intact.
-    const nsThreadWt = path.join(dataDir, 'v2-threads', 'wg-testwg', 'slack_CTEST20001_123', 'worktrees', 'PROJ');
+    // Thread worktree: transplanted to a standalone clone IN PLACE,
+    // uncommitted dirt intact. No central DB in this fixture, so the
+    // namespace move fail-safes to leaving the legacy path (the DB-scoped
+    // move is exercised against live data in the dry-run).
+    expect(out).toContain('legacy thread dir(s) left un-namespaced');
+    const nsThreadWt = path.join(dataDir, 'v2-threads', 'slack_CTEST20001_123', 'worktrees', 'PROJ');
     expect(fs.statSync(path.join(nsThreadWt, '.git')).isDirectory()).toBe(true);
     expect(git(nsThreadWt, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('thread-sess-PROJ');
     expect(fs.readFileSync(path.join(nsThreadWt, 'wip.sql'), 'utf-8')).toContain('uncommitted');

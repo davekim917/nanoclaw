@@ -60,6 +60,8 @@ if (!WORKGROUP) {
   console.error('Usage: tsx scripts/migrate-repo-store.ts --workgroup <id> [--execute]');
   process.exit(1);
 }
+// process.exit above doesn't narrow for closures — pin the non-null value.
+const WG: string = WORKGROUP;
 
 const WG_DIR = path.join(DATA_DIR, 'workgroups', WORKGROUP);
 const RUN = new Date().toISOString().replace(/[:.]/g, '-');
@@ -437,6 +439,43 @@ for (const { dir, repo } of threadWts) {
 }
 
 // ─── Legacy thread-state dirs → wg namespace ─────────────────────────────────
+// Ownership comes from the central DB: a legacy dir moves only when its
+// thread key belongs to a session of THIS workgroup. Multi-workgroup installs
+// have interleaved legacy dirs — a blanket move would hand other workgroups'
+// thread state to this one.
+
+function fsSlug(s: string): string {
+  return s.replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
+function workgroupThreadSlugs(): Set<string> | null {
+  const centralDb = path.join(DATA_DIR, 'v2.db');
+  if (!fs.existsSync(centralDb)) return null;
+  try {
+    const out = execFileSync(
+      'pnpm',
+      [
+        'exec', 'tsx', path.join(ROOT, 'scripts', 'q.ts'), centralDb,
+        `SELECT DISTINCT COALESCE(s.thread_id, 'dm-' || mg.platform_id) AS tid
+           FROM sessions s
+           JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+           JOIN agent_groups ag ON ag.id = s.agent_group_id
+          WHERE COALESCE(ag.workgroup_id, ag.folder) = '${WG.replace(/'/g, "''")}'`,
+      ],
+      { cwd: ROOT, stdio: 'pipe', encoding: 'utf-8', timeout: 60_000 },
+    ).toString();
+    return new Set(
+      out
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .map((tid) => fsSlug(tid)),
+    );
+  } catch (e) {
+    console.warn(`WARNING: cannot read central DB for thread ownership (${e instanceof Error ? e.message : e})`);
+    return null;
+  }
+}
 
 const threadsBase = path.join(DATA_DIR, 'v2-threads');
 if (fs.existsSync(threadsBase)) {
@@ -444,12 +483,25 @@ if (fs.existsSync(threadsBase)) {
     .readdirSync(threadsBase, { withFileTypes: true })
     .filter((e) => e.isDirectory() && !e.name.startsWith('wg-'))
     .map((e) => e.name);
-  if (legacyDirs.length > 0) {
-    act('thread-namespace', `move ${legacyDirs.length} legacy thread dir(s) under wg-${WORKGROUP}/ (single-workgroup install assumption — verify)`, () => {
-      const nsDir = path.join(threadsBase, `wg-${WORKGROUP}`);
-      fs.mkdirSync(nsDir, { recursive: true });
-      for (const d of legacyDirs) fs.renameSync(path.join(threadsBase, d), path.join(nsDir, d));
-    });
+  const owned = workgroupThreadSlugs();
+  if (owned === null) {
+    manualFlags.push(
+      `thread-namespace: central DB unavailable — ${legacyDirs.length} legacy thread dir(s) left un-namespaced`,
+    );
+  } else {
+    const toMove = legacyDirs.filter((d) => owned.has(d));
+    const foreign = legacyDirs.length - toMove.length;
+    if (toMove.length > 0) {
+      act(
+        'thread-namespace',
+        `move ${toMove.length} of ${legacyDirs.length} legacy thread dir(s) under wg-${WORKGROUP}/ (${foreign} belong to other workgroups or are orphaned — left in place)`,
+        () => {
+          const nsDir = path.join(threadsBase, `wg-${WORKGROUP}`);
+          fs.mkdirSync(nsDir, { recursive: true });
+          for (const d of toMove) fs.renameSync(path.join(threadsBase, d), path.join(nsDir, d));
+        },
+      );
+    }
   }
 }
 

@@ -1299,9 +1299,7 @@ describe('threadWorktreeDir — workgroup namespace', () => {
       const got = threadWorktreeDir('slack:CTEST10004', tid, 'illysium');
       expect(got).toContain('wg-illysium');
       // The stamped owner keeps serving its own legacy dir.
-      expect(threadWorktreeDir('slack:CTEST10004', tid, 'madison-reed')).toBe(
-        path.join(legacyState, 'worktrees'),
-      );
+      expect(threadWorktreeDir('slack:CTEST10004', tid, 'madison-reed')).toBe(path.join(legacyState, 'worktrees'));
     } finally {
       fs.rmSync(legacyState, { recursive: true, force: true });
     }
