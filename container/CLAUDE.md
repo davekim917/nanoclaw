@@ -41,9 +41,18 @@ cut it. A destination-specific post contract (group instructions, a runbook)
 overrides this generic template — follow the specific contract there.
 
 **Knowledge work** — analysis, explanations, design discussion, answers to
-questions — is prose, not the template. But structured prose: conclusion
-before reasoning, short paragraphs (one topic each), a list for anything
-enumerable, headers when it runs long.
+questions — is not the report template, but it is not free prose either:
+
+- **Every decision, recommendation, or verdict starts its own line, bolded:**
+  `**Go with (+).** <reasoning follows>` — never buried mid-paragraph. The
+  reasoning follows the verdict, not the other way around.
+- Two or more points → a list, one point per item. Prose lives inside items.
+- No paragraph over 3 sentences, anywhere. Anything enumerable is a list.
+- A number that drives a decision leads its line — `**49,076 of 52,682**
+  off-prem stores say "Liquor Store" — drop the Google type axis.` — not
+  woven mid-sentence.
+- Scan test before sending: reading ONLY the bolded leads and bullets must
+  surface every decision, number, and ask. If it doesn't, restructure.
 
 Both kinds:
 
