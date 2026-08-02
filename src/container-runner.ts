@@ -99,6 +99,7 @@ import {
   sessionDir,
   threadGraphifyCacheDir,
   threadWorktreeDir,
+  stampThreadDirOwner,
   writeSessionRouting,
 } from './session-manager.js';
 import { resolveStoragePolicy } from './storage-manager.js';
@@ -1517,6 +1518,10 @@ export function buildMounts(
     if (mg) {
       const tDir = threadWorktreeDir(mg.platform_id, session.thread_id, wgKey);
       fs.mkdirSync(tDir, { recursive: true });
+      // Stamp workgroup ownership on the state dir (parent of worktrees/) so
+      // the legacy-dir fallback in threadStateDir can refuse cross-workgroup
+      // adoption on colliding platform/thread keys.
+      stampThreadDirOwner(path.dirname(tDir), wgKey);
       mounts.push({ hostPath: tDir, containerPath: '/workspace/worktrees', readonly: false });
     }
   }
@@ -1612,15 +1617,42 @@ export function buildMounts(
     // respawn — bounded, and the freshness worker owns the tree meanwhile.
     const wgReposDir = path.join(wgShared, '.repos');
     if (fs.existsSync(wgReposDir)) {
-      for (const entry of fs.readdirSync(wgReposDir)) {
-        if (!entry.endsWith('.git')) continue;
-        const snapName = entry.slice(0, -'.git'.length);
+      // Same containment discipline as the symlink-overlay mounts: the
+      // workgroup tree is agent-writable, so an agent could replace a
+      // snapshot dir with a symlink pointing anywhere on the host and get it
+      // mounted (RO, but a cross-boundary READ). Mount only real
+      // directories whose realpath stays inside this workgroup's tree, and
+      // re-validate at docker-args time via overlayAllowedRoots.
+      let wgSharedReal: string;
+      try {
+        wgSharedReal = fs.realpathSync(wgShared);
+      } catch {
+        wgSharedReal = path.resolve(wgShared);
+      }
+      for (const entry of fs.readdirSync(wgReposDir, { withFileTypes: true })) {
+        if (!entry.name.endsWith('.git') || entry.isSymbolicLink() || !entry.isDirectory()) continue;
+        const snapName = entry.name.slice(0, -'.git'.length);
         const snapDir = path.join(wgShared, snapName);
+        let snapReal: string;
+        try {
+          if (fs.lstatSync(snapDir).isSymbolicLink()) {
+            log.warn('Refusing snapshot mount: path is a symlink', { wgId, snapDir });
+            continue;
+          }
+          snapReal = fs.realpathSync(snapDir);
+        } catch {
+          continue;
+        }
+        if (snapReal !== wgSharedReal && !snapReal.startsWith(wgSharedReal + path.sep)) {
+          log.warn('Refusing snapshot mount outside workgroup tree', { wgId, snapDir, target: snapReal });
+          continue;
+        }
         if (!fs.existsSync(path.join(snapDir, '.git'))) continue;
         mounts.push({
-          hostPath: snapDir,
+          hostPath: snapReal,
           containerPath: `${WORKGROUP_CONTAINER_PATH}/${snapName}`,
           readonly: true,
+          overlayAllowedRoots: [wgSharedReal],
         });
       }
     }

@@ -58,18 +58,33 @@ export function mirrorDir(name: string): string {
   return path.join(mirrorBaseDir(), '.repos', `${name}.git`);
 }
 
-/** A bare repo has HEAD + objects/ at its top level (no .git subdir). */
+/**
+ * A VALID bare repo — git's own verdict, not a file-shape guess. A partial
+ * failed clone can leave HEAD+objects behind and must not be accepted
+ * (codex phase-B/C review #5).
+ */
 function isBareRepo(dir: string): boolean {
-  return fs.existsSync(path.join(dir, 'HEAD')) && fs.existsSync(path.join(dir, 'objects'));
+  if (!fs.existsSync(path.join(dir, 'HEAD'))) return false;
+  return tryGit(dir, ['rev-parse', '--is-bare-repository']) === 'true';
 }
 
-/** Resolve the bare mirror for <name>, or null when not yet migrated/cloned. */
+/** The mirror path exists on disk (valid or not) — the topology is claimed. */
+export function mirrorPresent(name: string): boolean {
+  return validateRepoName(name) === null && fs.existsSync(mirrorDir(name));
+}
+
+/** Resolve the VALID bare mirror for <name>, or null when not yet migrated/cloned. */
 export function resolveMirror(name: string): string | null {
   const nameErr = validateRepoName(name);
   if (nameErr) return null;
   const dir = mirrorDir(name);
   return isBareRepo(dir) ? dir : null;
 }
+
+const MALFORMED_MIRROR_MSG = (repo: string) =>
+  `Repo '${repo}' has a mirror directory at ${mirrorDir(repo)} that is NOT a valid bare repository ` +
+  `(interrupted clone or corruption). Refusing to fall back to legacy resolution — the browsing ` +
+  `snapshot must not become a mutable canonical. Ask the operator to remove or repair the mirror.`;
 
 /** True when <dir> is a standalone clone (real .git directory, not a pointer file). */
 function isStandaloneClone(dir: string): boolean {
@@ -391,10 +406,16 @@ function rebaseOntoOriginHead(
 
   const tip = tryGit(worktreeDir, ['rev-parse', '--short', 'HEAD']) ?? '';
   let text = `Worktree ready at ${worktreeDir} (branch ${branch}, rebased onto origin/HEAD${tip ? `; tip ${tip}` : ''})`;
-  if (hasRemoteTracking) {
+  // Warn about force-push only when the rebase actually rewrote published
+  // history: if origin/<branch> is still an ancestor of the new HEAD (the
+  // rebase fast-forwarded a merely-behind branch), a normal push succeeds.
+  const forcePushNeeded =
+    hasRemoteTracking &&
+    tryGit(worktreeDir, ['merge-base', '--is-ancestor', `refs/remotes/origin/${branch}`, 'HEAD']) === null;
+  if (forcePushNeeded) {
     text += `. NOTE: branch was previously pushed; next \`git_push\` must use \`force: true\` because history was rewritten.`;
   }
-  log(`rebase: ${branch} rebased onto origin/HEAD${hasRemoteTracking ? ' (force-push needed)' : ''}`);
+  log(`rebase: ${branch} rebased onto origin/HEAD${forcePushNeeded ? ' (force-push needed)' : ''}`);
   return { kind: 'ok', text };
 }
 
@@ -448,9 +469,23 @@ export const cloneRepoTool: McpToolDefinition = {
             `does not match the requested URL (${url}). Use a different name.`,
         );
       }
+      if (mirrorOrigin === null) {
+        // Originless mirror + a caller telling us the URL: adopt it. Without
+        // this, clones keep the mirror path as origin and the freshness
+        // worker's fetch fails forever (codex phase-B/C review #5).
+        try {
+          runGit(existingMirror, ['remote', 'add', 'origin', url]);
+        } catch {
+          runGit(existingMirror, ['remote', 'set-url', 'origin', url]);
+        }
+        runGit(existingMirror, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*']);
+        log(`clone_repo: adopted origin ${url} on originless mirror ${existingMirror}`);
+        return ok(`Repo already present (mirror at ${existingMirror}); adopted origin ${url}. Use create_worktree to work on it.`);
+      }
       log(`clone_repo: ${repoName} already present as mirror ${existingMirror} (idempotent)`);
       return ok(`Repo already present (mirror at ${existingMirror}); use create_worktree to work on it.`);
     }
+    if (mirrorPresent(repoName)) return err(MALFORMED_MIRROR_MSG(repoName));
 
     // Idempotent: reuse an existing real clone (workgroup/repos, namespaced
     // private repos/, or legacy root) — but only when its origin matches the
@@ -553,13 +588,21 @@ export const cloneRepoTool: McpToolDefinition = {
       try { fs.mkdirSync(path.dirname(mirror), { recursive: true }); } catch { /* ignore */ }
       try {
         execFileSync('git', ['clone', '--bare', url, mirror], { stdio: 'pipe', timeout: 300_000 });
+        // Bare clones get no fetch refspec; the freshness worker's plain
+        // `git fetch origin` must advance refs/heads. Config failure fails
+        // the clone — a refspec-less mirror looks valid but stays stale
+        // forever. gc.auto=0: automatic repack/prune in the mirror could race
+        // a container clone reading its objects; the mirror only ever grows
+        // via fetch, so gc is an operator action, not automatic.
+        runGit(mirror, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*']);
+        runGit(mirror, ['config', 'gc.auto', '0']);
       } catch (e) {
+        // Never leave a partial dir behind — it would satisfy mirrorPresent()
+        // and hard-error every subsequent call (codex phase-B/C review #5).
+        try { fs.rmSync(mirror, { recursive: true, force: true }); } catch { /* ignore */ }
         const msg = e instanceof Error ? e.message : String(e);
         return err(`git clone --bare failed: ${msg}`);
       }
-      // Bare clones get no fetch refspec; the freshness worker's plain
-      // `git fetch origin` must advance refs/heads.
-      tryGit(mirror, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*']);
       const snapshot = path.join(workgroupDir(), repoName);
       let snapshotNote = '';
       if (!fs.existsSync(snapshot)) {
@@ -710,9 +753,13 @@ export const createWorktreeTool: McpToolDefinition = {
     if (nameErr) return err(nameErr);
 
     // Mirror topology wins when present; legacy full-clone canonicals keep
-    // the linked-worktree flow below until their workgroup is migrated.
+    // the linked-worktree flow below until their workgroup is migrated. A
+    // PRESENT but malformed mirror is a hard error, not a legacy fallback —
+    // resolveRepoDir would resolve the browsing snapshot and quietly turn it
+    // back into a mutable canonical (codex phase-B/C review #6).
     const mirror = resolveMirror(repo);
     if (mirror) return createWorktreeFromMirror(mirror, repo, branchArg);
+    if (mirrorPresent(repo)) return err(MALFORMED_MIRROR_MSG(repo));
 
     const repoDir = resolveRepoDir(repo);
     if (!repoDir) {

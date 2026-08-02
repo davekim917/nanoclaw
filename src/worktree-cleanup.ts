@@ -93,7 +93,21 @@ function getLastModifiedDays(worktreePath: string): number {
   }
 }
 
+/** Mirror-topology checkouts are standalone clones — their .git is a directory. */
+function isStandaloneClone(worktreePath: string): boolean {
+  try {
+    return fs.statSync(path.join(worktreePath, '.git')).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function removeWorktree(canonicalRepoPath: string, worktreePath: string): void {
+  if (isStandaloneClone(worktreePath)) {
+    // Self-contained metadata — nothing to detach from a canonical.
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    return;
+  }
   execFileSync('git', ['worktree', 'remove', '--force', worktreePath], {
     cwd: canonicalRepoPath,
     stdio: 'pipe',
@@ -384,7 +398,8 @@ function cleanupOne(target: WorktreeTarget): void {
   // liveness source; kernel close releases Graphify's fcntl lock.
   if (preserveForParticipantGuard(target)) return;
 
-  if (!fs.existsSync(path.join(canonicalRepoPath, '.git'))) {
+  // Standalone clones need no canonical; legacy linked worktrees do.
+  if (!isStandaloneClone(worktreePath) && !fs.existsSync(path.join(canonicalRepoPath, '.git'))) {
     log.debug('Worktree cleanup: canonical repo missing, skipping', { ...ctx, canonicalRepoPath });
     return;
   }

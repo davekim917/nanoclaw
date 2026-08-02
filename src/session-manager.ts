@@ -120,8 +120,35 @@ function threadStateDir(platformId: string, threadId: string | null, workgroupId
   const legacy = path.join(threadsBaseDir(), fsSlug(tid));
   if (!workgroupId) return legacy;
   const scoped = path.join(threadsBaseDir(), `wg-${fsSlug(workgroupId)}`, fsSlug(tid));
-  if (fs.existsSync(legacy) && !fs.existsSync(scoped)) return legacy;
+  if (fs.existsSync(legacy) && !fs.existsSync(scoped)) {
+    // Ownership check: without it, workgroup B would adopt workgroup A's
+    // legacy dir on a colliding platform/thread key — the exact leak the
+    // namespace exists to prevent. The marker is stamped by container spawn
+    // (buildMounts) on first post-upgrade use; an unstamped dir is adoptable.
+    const owner = readThreadDirOwner(legacy);
+    if (owner === null || owner === workgroupId) return legacy;
+  }
   return scoped;
+}
+
+const THREAD_DIR_OWNER_FILE = '.wg-owner';
+
+export function readThreadDirOwner(stateDir: string): string | null {
+  try {
+    return fs.readFileSync(path.join(stateDir, THREAD_DIR_OWNER_FILE), 'utf-8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Stamp workgroup ownership on a thread-state dir (idempotent, creator-only). */
+export function stampThreadDirOwner(stateDir: string, workgroupId: string): void {
+  const file = path.join(stateDir, THREAD_DIR_OWNER_FILE);
+  try {
+    if (!fs.existsSync(file)) fs.writeFileSync(file, `${workgroupId}\n`);
+  } catch {
+    /* advisory marker — never block a spawn on it */
+  }
 }
 
 /** Per-session Graphify cache. Sessions never share this directory. */

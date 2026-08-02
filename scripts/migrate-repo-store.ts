@@ -299,6 +299,7 @@ for (const canonical of canonicals) {
   act('mirror', `${repo}: bare-clone canonical → .repos/${repo}.git, repoint origin, set default HEAD`, () => {
     fs.mkdirSync(REPOS, { recursive: true });
     execFileSync('git', ['clone', '--bare', canonical, mirror], { stdio: 'pipe', timeout: 300_000 });
+    git(mirror, ['config', 'gc.auto', '0']);
     if (originUrl) {
       git(mirror, ['remote', 'set-url', 'origin', originUrl]);
       git(mirror, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*']);

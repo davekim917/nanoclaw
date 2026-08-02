@@ -146,9 +146,11 @@ describe('Claude plugin discovery', () => {
       const hooks = capturedSdkOptions?.hooks as
         | { PreToolUse?: Array<{ hooks?: unknown[] }> }
         | undefined;
-      // The native Email gate would be the sixth Bash hook. Its absence makes
-      // the declared plugin the sole owner and prevents duplicate cards.
-      expect(hooks?.PreToolUse?.[0]?.hooks).toHaveLength(5);
+      // The native Email gate would be the seventh Bash hook (sanitize,
+      // self-approval, snowflake, git-clone, snapshot-mutation,
+      // codex-companion). Its absence makes the declared plugin the sole
+      // owner and prevents duplicate cards.
+      expect(hooks?.PreToolUse?.[0]?.hooks).toHaveLength(6);
       expect(capturedSdkOptions?.plugins).toEqual([{ type: 'local', path: workflow }]);
     } finally {
       if (originalPluginsRoot === undefined) delete process.env.CLAUDE_PLUGINS_ROOT;

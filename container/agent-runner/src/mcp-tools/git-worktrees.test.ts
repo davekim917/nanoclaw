@@ -670,3 +670,72 @@ describe('mirror topology', () => {
     expect(badRes.content[0].text).toContain('does not match');
   });
 });
+
+describe('mirror topology — malformed and originless mirrors', () => {
+  let root: string;
+  let workgroupDir: string;
+  const ENV_KEYS = [
+    'NANOCLAW_AGENT_DIR_OVERRIDE',
+    'NANOCLAW_WORKTREES_DIR_OVERRIDE',
+    'NANOCLAW_WORKGROUP_DIR_OVERRIDE',
+    'NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE',
+    'NANOCLAW_WORKGROUP_ID',
+  ] as const;
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
+    root = mkdtempSync(join(tmpdir(), 'gw-malformed-'));
+    workgroupDir = join(root, 'workgroup');
+    mkdirSync(workgroupDir, { recursive: true });
+    process.env.NANOCLAW_AGENT_DIR_OVERRIDE = join(root, 'agent');
+    process.env.NANOCLAW_WORKGROUP_DIR_OVERRIDE = workgroupDir;
+    process.env.NANOCLAW_WORKTREES_DIR_OVERRIDE = join(root, 'worktrees');
+    process.env.NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE = join(root, 'graphify-cache');
+    delete process.env.NANOCLAW_WORKGROUP_ID;
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (savedEnv[k] !== undefined) process.env[k] = savedEnv[k];
+      else delete process.env[k];
+    }
+    try { rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  test('malformed mirror hard-errors instead of falling back to legacy resolution', async () => {
+    // Partial clone remnant: HEAD file exists, but not a valid bare repo.
+    const mirror = join(workgroupDir, '.repos', 'proj.git');
+    mkdirSync(mirror, { recursive: true });
+    writeFileSync(join(mirror, 'HEAD'), 'ref: refs/heads/main\n');
+    mkdirSync(join(mirror, 'objects'), { recursive: true });
+    // A browsing snapshot exists at the root — the trap: legacy resolution
+    // would happily treat it as a canonical.
+    const snapshot = join(workgroupDir, 'proj');
+    mkdirSync(snapshot, { recursive: true });
+    execFileSync('git', ['init', '-q', snapshot], { stdio: 'pipe' });
+
+    const wtRes = await createWorktreeTool.handler({ repo: 'proj' });
+    expect(wtRes.isError).toBe(true);
+    expect(wtRes.content[0].text).toContain('NOT a valid bare repository');
+
+    const cloneRes = await cloneRepoTool.handler({ url: 'https://github.com/acme/proj' });
+    expect(cloneRes.isError).toBe(true);
+    expect(cloneRes.content[0].text).toContain('NOT a valid bare repository');
+  });
+
+  test('originless mirror adopts the requested URL instead of staying unfetchable', async () => {
+    const mirror = join(workgroupDir, '.repos', 'proj.git');
+    mkdirSync(join(workgroupDir, '.repos'), { recursive: true });
+    execFileSync('git', ['init', '-q', '--bare', mirror], { stdio: 'pipe' });
+
+    const res = await cloneRepoTool.handler({ url: 'https://github.com/acme/proj' });
+    expect(res.isError).toBeUndefined();
+    expect(res.content[0].text).toContain('adopted origin');
+    const origin = execFileSync('git', ['config', '--get', 'remote.origin.url'], { cwd: mirror })
+      .toString()
+      .trim();
+    expect(origin).toBe('https://github.com/acme/proj');
+  });
+});

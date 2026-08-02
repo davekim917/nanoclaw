@@ -84,16 +84,20 @@ export function discoverMirrors(root: string = workgroupsRoot()): MirrorTarget[]
   }
   for (const wg of wgs) {
     const reposDir = path.join(root, wg, '.repos');
-    let entries: string[];
+    let entries: fs.Dirent[];
     try {
-      entries = fs.readdirSync(reposDir).filter((n) => n.endsWith('.git'));
+      entries = fs.readdirSync(reposDir, { withFileTypes: true });
     } catch {
       continue;
     }
     for (const entry of entries) {
-      const mirrorPath = path.join(reposDir, entry);
+      // Never follow symlinked mirror entries — the workgroup tree is
+      // agent-writable, and a symlink here could point the worker (and the
+      // snapshot it maintains) at a foreign repo.
+      if (!entry.name.endsWith('.git') || entry.isSymbolicLink() || !entry.isDirectory()) continue;
+      const mirrorPath = path.join(reposDir, entry.name);
       if (!fs.existsSync(path.join(mirrorPath, 'HEAD'))) continue;
-      const repo = entry.slice(0, -'.git'.length);
+      const repo = entry.name.slice(0, -'.git'.length);
       targets.push({ workgroupId: wg, repo, mirrorPath, snapshotPath: path.join(root, wg, repo) });
     }
   }
@@ -120,22 +124,42 @@ export async function refreshOne(target: MirrorTarget): Promise<RepoFreshness> {
   const ctx = { workgroupId, repo };
   const ts = new Date().toISOString();
 
+  // Automatic gc in the mirror could repack/prune objects while a container
+  // clone is reading them; the mirror only grows via fetch, so gc stays an
+  // explicit operator action. Idempotent, cheap, and also covers mirrors
+  // created before this setting existed.
+  await tryGit(mirrorPath, ['config', 'gc.auto', '0']);
+
   const fetched = await tryGit(mirrorPath, ['fetch', 'origin', '--prune']);
   const fetchOk = fetched !== null;
   if (!fetchOk) {
     log.error('repo-freshness: mirror fetch FAILED — snapshot is stale', { ...ctx, mirrorPath });
   }
 
+  const freshness: RepoFreshness = { ts, oid: null, ref: null, fetchOk };
+
   // Follow a default-branch rename. Only meaningful after a successful
   // fetch; ls-remote is its own network call, so skip it when fetch failed.
+  // A symref lookup failure must be VISIBLE — silently keeping the old HEAD
+  // would report a stale default branch as fresh.
   if (fetchOk) {
-    const symref = parseSymrefHead(await tryGit(mirrorPath, ['ls-remote', '--symref', 'origin', 'HEAD']));
-    if (symref) await tryGit(mirrorPath, ['symbolic-ref', 'HEAD', symref]);
+    const symrefOut = await tryGit(mirrorPath, ['ls-remote', '--symref', 'origin', 'HEAD']);
+    const symref = parseSymrefHead(symrefOut);
+    if (symref) {
+      const set = await tryGit(mirrorPath, ['symbolic-ref', 'HEAD', symref]);
+      if (set === null) {
+        freshness.error = 'default-branch symref update failed';
+        log.warn('repo-freshness: symbolic-ref HEAD update failed', { ...ctx, symref });
+      }
+    } else {
+      freshness.error = 'default-branch symref lookup failed';
+      log.warn('repo-freshness: ls-remote --symref failed or unparsable — keeping current HEAD', ctx);
+    }
   }
 
-  const ref = await tryGit(mirrorPath, ['symbolic-ref', 'HEAD']);
+  freshness.ref = await tryGit(mirrorPath, ['symbolic-ref', 'HEAD']);
   const oid = await tryGit(mirrorPath, ['rev-parse', 'HEAD']);
-  const freshness: RepoFreshness = { ts, oid, ref, fetchOk };
+  freshness.oid = oid;
 
   if (!oid) {
     freshness.error = 'mirror HEAD unresolvable';

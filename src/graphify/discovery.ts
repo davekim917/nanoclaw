@@ -45,6 +45,12 @@ const EXCLUDED_DIRECTORIES = new Set([
   '.git',
   '.graphify',
   '.gitnexus',
+  // Repo-store rework: bare mirrors, migration rescue archives, and
+  // noncanonical checkouts must never compete with the canonical snapshot
+  // as indexed "current source".
+  '.repos',
+  '.rescues',
+  '.worktrees',
   'node_modules',
   '.pnpm-store',
   '.yarn',
