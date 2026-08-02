@@ -49,12 +49,28 @@ export interface SlackBotIdentity {
 
 const knownSlackBots = new Map<string, SlackBotIdentity>();
 
+/**
+ * Workspace humans, keyed by teamId. Populated from `users.list` at adapter
+ * init (and refreshed hourly) so agent-emitted `@Alice` / `<@bob>` resolve
+ * to real mentions without any hand-maintained roster. Same identity shape
+ * as bots; resolution is scoped to the current workspace like bots are.
+ */
+const knownSlackHumans = new Map<string, SlackBotIdentity[]>();
+
 export function registerSlackBot(channelType: string, identity: SlackBotIdentity): void {
   knownSlackBots.set(channelType, identity);
 }
 
+export function registerSlackWorkspaceHumans(teamId: string, humans: SlackBotIdentity[]): void {
+  knownSlackHumans.set(teamId, humans);
+}
+
 export function getKnownSlackBots(): ReadonlyMap<string, SlackBotIdentity> {
   return knownSlackBots;
+}
+
+export function getKnownSlackHumans(): ReadonlyMap<string, SlackBotIdentity[]> {
+  return knownSlackHumans;
 }
 
 /**
@@ -99,6 +115,7 @@ export function resolveSlackMentions(
   text: string,
   currentChannelType: string,
   bots: ReadonlyMap<string, SlackBotIdentity> = knownSlackBots,
+  humans: ReadonlyMap<string, SlackBotIdentity[]> = knownSlackHumans,
 ): string {
   if (bots.size === 0) return text;
 
@@ -164,6 +181,19 @@ export function resolveSlackMentions(
       const normalized = normalizeHandle(literal);
       if (normalized === literal) continue;
       tryAddAlias(normalized, ident.userId);
+    }
+  }
+  // Fourth pass: workspace humans (from users.list). All human aliases go
+  // through tryAddAlias, so every bot alias — literal or normalized — wins
+  // any collision with a human handle. Same-team scoping as bots.
+  for (const ident of humans.get(currentBot.teamId) ?? []) {
+    tryAddAlias(ident.username, ident.userId);
+    tryAddAlias(ident.displayName, ident.userId);
+    tryAddAlias(ident.realName, ident.userId);
+    for (const candidate of [ident.username, ident.displayName, ident.realName]) {
+      if (!candidate) continue;
+      const normalized = normalizeHandle(candidate.toLowerCase());
+      if (normalized !== candidate.toLowerCase()) tryAddAlias(normalized, ident.userId);
     }
   }
   if (byName.size === 0) return text;

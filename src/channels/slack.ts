@@ -37,9 +37,50 @@ import { registerChannelAdapter } from './channel-registry.js';
 import {
   fetchSlackBotIdentity,
   registerSlackBot,
+  registerSlackWorkspaceHumans,
   resolveSlackMentions,
   upgradeSlackBotProfile,
+  type SlackBotIdentity,
 } from './slack-mentions.js';
+
+/**
+ * Fetch the workspace's human members and register them for outbound
+ * mention resolution. Bots/apps/deleted users are excluded — bot mentions
+ * resolve through the sibling-bot registry, and Slackbot is never a target.
+ * Fail-soft: a missing `users:read` scope logs a warning and leaves human
+ * mentions unresolved (bot mentions keep working).
+ */
+async function syncSlackWorkspaceHumans(client: WebClient, teamId: string, channelType: string): Promise<void> {
+  try {
+    const humans: SlackBotIdentity[] = [];
+    let cursor: string | undefined;
+    do {
+      const res = await client.users.list({ limit: 200, cursor });
+      for (const m of res.members ?? []) {
+        if (!m.id || m.deleted || m.is_bot || m.is_app_user || m.id === 'USLACKBOT') continue;
+        humans.push({
+          userId: m.id,
+          username: m.name ?? '',
+          displayName: m.profile?.display_name || undefined,
+          realName: m.profile?.real_name || undefined,
+          teamId,
+        });
+      }
+      cursor = res.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+    registerSlackWorkspaceHumans(teamId, humans);
+    log.info('Slack workspace humans registered for mention resolution', {
+      channelType,
+      teamId,
+      count: humans.length,
+    });
+  } catch (err) {
+    log.warn('Slack users.list failed — human @-mentions will not resolve for this workspace', {
+      channelType,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 export interface SlackWorkspace {
   channelType: string;
@@ -287,6 +328,16 @@ for (const ws of workspaces) {
       if (identity) {
         registerSlackBot(ws.channelType, identity);
         void upgradeSlackBotProfile(client, ws.channelType);
+        // Workspace humans → mention registry, so agent-emitted `@Alice` /
+        // `<@bob>` resolve without a hand-maintained roster. Fire-and-forget
+        // at init (same pattern as profile enrichment) + hourly refresh so
+        // new teammates resolve without a restart. Degrades gracefully when
+        // the token lacks users:read.
+        void syncSlackWorkspaceHumans(client, identity.teamId, ws.channelType);
+        setInterval(
+          () => void syncSlackWorkspaceHumans(client, identity.teamId, ws.channelType),
+          60 * 60 * 1000,
+        ).unref();
       } else {
         log.warn('Slack bot identity unavailable — outbound @-mentions for this bot will not resolve', {
           channelType: ws.channelType,

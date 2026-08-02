@@ -293,6 +293,74 @@ describe('resolveSlackMentions', () => {
       ).toBe('https://example.com — over to <@U-CODEX>');
     });
   });
+
+  describe('workspace humans', () => {
+    function makeHumans(): Map<string, SlackBotIdentity[]> {
+      const humans = new Map<string, SlackBotIdentity[]>();
+      humans.set(LABS_TEAM, [
+        {
+          userId: 'U-OPERATOR1',
+          username: 'operator.one',
+          displayName: 'Opal',
+          realName: 'Opal Operator',
+          teamId: LABS_TEAM,
+        },
+        { userId: 'U-OPERATOR2', username: 'jsmith', displayName: '', realName: 'Jay', teamId: LABS_TEAM },
+      ]);
+      humans.set(RETAIL_TEAM, [
+        {
+          userId: 'U-RETAILHUM',
+          username: 'retail.human',
+          displayName: 'Rhea',
+          realName: 'Rhea R',
+          teamId: RETAIL_TEAM,
+        },
+      ]);
+      return humans;
+    }
+
+    it('rewrites a human display name → <@USER_ID>', () => {
+      expect(resolveSlackMentions('cc @Opal for approval', 'slack-example-labs', makeBots(), makeHumans())).toBe(
+        'cc <@U-OPERATOR1> for approval',
+      );
+    });
+
+    it('rewrites a human real name when display name is empty', () => {
+      expect(resolveSlackMentions('over to @Jay', 'slack-example-labs', makeBots(), makeHumans())).toBe(
+        'over to <@U-OPERATOR2>',
+      );
+    });
+
+    it('rewrites bracketed `<@username>` for a human', () => {
+      expect(resolveSlackMentions('<@jsmith> please review', 'slack-example-labs', makeBots(), makeHumans())).toBe(
+        '<@U-OPERATOR2> please review',
+      );
+    });
+
+    it('does NOT resolve humans from a different workspace', () => {
+      expect(resolveSlackMentions('ping @Rhea', 'slack-example-labs', makeBots(), makeHumans())).toBe('ping @Rhea');
+    });
+
+    it('bot aliases win alias collisions with humans', () => {
+      const humans = makeHumans();
+      humans.get(LABS_TEAM)!.push({
+        userId: 'U-IMPOSTER',
+        username: 'humanuser',
+        displayName: 'helper-codex',
+        realName: 'Helper Codex',
+        teamId: LABS_TEAM,
+      });
+      expect(resolveSlackMentions('@helper-codex take this', 'slack-example-labs', makeBots(), humans)).toBe(
+        '<@U-CODEX> take this',
+      );
+    });
+
+    it('leaves human mentions untouched inside code spans', () => {
+      expect(resolveSlackMentions('run `@Opal` literally', 'slack-example-labs', makeBots(), makeHumans())).toBe(
+        'run `@Opal` literally',
+      );
+    });
+  });
 });
 
 describe('getSlackBotDisplayName', () => {

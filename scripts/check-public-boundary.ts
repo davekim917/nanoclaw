@@ -79,7 +79,10 @@ const GENERIC_IDENTIFIERS = new Set([
   // Slack's built-in bot; ingress auto-creates a user row named this in any
   // install with a Slack workspace, and it collides with generic camelCase
   // `slackBot` variables in channel code. Universal, not install-specific.
+  // Same for its platform ID: USLACKBOT is identical in every workspace and
+  // appears as a literal in adapter filter code.
   'slackbot',
+  'uslackbot',
 ]);
 
 const RESERVED_EMAIL_DOMAINS = new Set([
@@ -185,6 +188,7 @@ function addIdentifier(target: Set<string>, value: unknown): void {
   if (trimmed.length < 2 || GENERIC_IDENTIFIERS.has(trimmed.toLowerCase())) return;
   target.add(trimmed);
   for (const platformId of trimmed.match(/[CDGUWT][A-Z0-9]{8,}|\d{17,20}/g) ?? []) {
+    if (GENERIC_IDENTIFIERS.has(platformId.toLowerCase())) continue;
     target.add(platformId);
   }
 }
