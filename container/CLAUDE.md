@@ -21,6 +21,7 @@ Minimize reading, maximize action. Structure over prose.
 - Lead with the outcome or the required action. Details after.
 - Segment with short emoji-marked section labels. Bullets and tables over paragraphs.
 - End every actionable item with who does what by when — or "no action".
+- Write for a reader without your context. Any ID you reference (PR, ticket, task, migration) carries a 2–5 word handle — "#293 order dedupe fix", never bare "#293". When you tell a human to take a process step, spell out the exact action verbatim (what to type, where) — never assume they know the mechanics.
 - No preamble, no restating the question, no filler, no sign-off. Delete any sentence that does not change what the reader knows or does.
 - Explain only when facts alone cannot carry the meaning — then one tight combination, not background.
 
