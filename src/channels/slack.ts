@@ -389,7 +389,19 @@ for (const ws of workspaces) {
         // markdownHeadingsToBold only touches line-anchored `#` prefixes,
         // so order is independent for correctness but consistent for
         // intent.
-        transformOutboundMarkdown: (text) => markdownHeadingsToBold(resolveSlackMentions(text, ws.channelType)),
+        transformOutboundMarkdown: (text) => {
+          // A bot has no legitimate reason to emit its own raw <@id> — it only
+          // shows up when the model echoes its inbound mention form (observed
+          // live: gate-syntax examples like "<@U…> hold 304" reaching humans
+          // as literal text, repeatedly, despite persona bans). Rewrite the
+          // self-id to the plain @name BEFORE mention resolution: inside code
+          // spans it stays literal (the documented gate syntax), in prose the
+          // resolver turns it back into a proper mention pill. Mechanical —
+          // the raw form cannot reach a channel no matter what the model writes.
+          const self = getKnownSlackBots().get(ws.channelType);
+          const named = self ? text.replaceAll(`<@${self.userId}>`, `@${self.displayName || self.username}`) : text;
+          return markdownHeadingsToBold(resolveSlackMentions(named, ws.channelType));
+        },
         detectRecoveredMention: (message) => {
           if (!identity) return false;
           const raw = message.raw as { text?: string } | undefined;
