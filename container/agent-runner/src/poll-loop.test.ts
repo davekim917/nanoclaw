@@ -139,6 +139,26 @@ describe('formatter', () => {
   });
 });
 
+describe('chat budget from task content', () => {
+  it('muteChat zeroes the budget; chatLimit sets it; absent leaves unlimited', () => {
+    const { isChatMuted } = require('./db/messages-out.js');
+    insertMessage('t-mute', 'task', { prompt: 'watch', muteChat: true });
+    let messages = getPendingMessages().filter((m) => m.id === 't-mute');
+    applyFlagBatch(messages, extractRouting(messages), 'claude');
+    expect(isChatMuted()).toBe(true);
+
+    insertMessage('t-lim', 'task', { prompt: 'standup', chatLimit: 1 });
+    messages = getPendingMessages().filter((m) => m.id === 't-lim');
+    applyFlagBatch(messages, extractRouting(messages), 'claude');
+    expect(isChatMuted()).toBe(false); // budget 1, not muted
+
+    insertMessage('t-plain', 'task', { prompt: 'normal' });
+    messages = getPendingMessages().filter((m) => m.id === 't-plain');
+    applyFlagBatch(messages, extractRouting(messages), 'claude');
+    expect(isChatMuted()).toBe(false);
+  });
+});
+
 describe('fast-mode flag application', () => {
   it('persists sticky Codex on/off and honors one-turn precedence', () => {
     insertMessage('m1', 'chat', { sender: 'Operator', text: 'hi', flagIntent: { stickyFast: true } });

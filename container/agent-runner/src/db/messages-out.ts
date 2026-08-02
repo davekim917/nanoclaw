@@ -51,18 +51,28 @@ export interface WriteMessageOut {
  * drift can reach the channel. Non-chat kinds (system actions, processing
  * acks) pass through untouched.
  */
-let chatMuted = false;
+// null = unlimited; 0 = fully muted; N>0 = at most N chat sends this turn
+// (e.g. a standup task whose contract is ONE digest post — the trailing
+// "summary for the work log" message gets dropped here instead of relying
+// on instructions, which demonstrably do not hold).
+let chatBudget: number | null = null;
 export function setChatMute(muted: boolean): void {
-  chatMuted = muted;
+  chatBudget = muted ? 0 : null;
+}
+export function setChatLimit(limit: number | null): void {
+  chatBudget = limit;
 }
 export function isChatMuted(): boolean {
-  return chatMuted;
+  return chatBudget === 0;
 }
 
 export function writeMessageOut(msg: WriteMessageOut): number {
-  if (chatMuted && msg.kind === 'chat') {
-    console.error(`[messages-out] chat muted for this task — dropped outbound message ${msg.id}`);
-    return -1;
+  if (msg.kind === 'chat' && chatBudget !== null) {
+    if (chatBudget <= 0) {
+      console.error(`[messages-out] chat budget exhausted for this task — dropped outbound message ${msg.id}`);
+      return -1;
+    }
+    chatBudget -= 1;
   }
   const outbound = getOutboundDb();
   const inbound = getInboundDb();

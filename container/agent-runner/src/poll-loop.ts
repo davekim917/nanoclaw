@@ -12,7 +12,7 @@ import {
   retainCompleteRecallUnits,
   type MessageInRow,
 } from './db/messages-in.js';
-import { setChatMute, writeMessageOut } from './db/messages-out.js';
+import { setChatLimit, writeMessageOut } from './db/messages-out.js';
 import { getSessionSpawnTaskId } from './db/session-routing.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
@@ -2165,19 +2165,23 @@ export function applyFlagBatch(
   // Physical chat mute: a task created with muteChat can never write a
   // chat-kind outbound row this turn — set BEFORE the provider runs, reset
   // every turn (sticky module state would otherwise leak across turns).
-  let mute = false;
+  let limit: number | null = null;
   for (const m of messages) {
     if (m.kind !== 'task') continue;
     try {
-      if ((JSON.parse(m.content) as { muteChat?: boolean }).muteChat) {
-        mute = true;
+      const c = JSON.parse(m.content) as { muteChat?: boolean; chatLimit?: number };
+      if (c.muteChat) {
+        limit = 0;
         break;
+      }
+      if (typeof c.chatLimit === 'number' && Number.isFinite(c.chatLimit) && c.chatLimit >= 0) {
+        limit = c.chatLimit;
       }
     } catch {
       // malformed content row
     }
   }
-  setChatMute(mute);
+  setChatLimit(limit);
 
   let intent: FlagIntent | undefined;
   for (const m of messages) {

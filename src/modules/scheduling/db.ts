@@ -123,6 +123,7 @@ export interface TaskUpdate {
    * string here — the same loose shape the chat-side FlagIntent carries.
    */
   flagIntent?: { turnModel?: string; turnEffort?: string };
+  chatLimit?: number;
 }
 
 // Merges content JSON in-place so callers can update prompt/script without
@@ -132,7 +133,11 @@ export interface TaskUpdate {
 export function updateTask(db: Database.Database, taskId: string, update: TaskUpdate): number {
   const setProcessAfter = update.processAfter !== undefined;
   const setRecurrence = update.recurrence !== undefined;
-  const mergeContent = update.prompt !== undefined || update.script !== undefined || update.flagIntent !== undefined;
+  const mergeContent =
+    update.prompt !== undefined ||
+    update.script !== undefined ||
+    update.flagIntent !== undefined ||
+    update.chatLimit !== undefined;
 
   const updateRows = db.transaction(() => {
     const rows = db
@@ -159,6 +164,7 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
       if (mergeContent) {
         const parsed = JSON.parse(row.content) as Record<string, unknown>;
         if (update.prompt !== undefined) parsed.prompt = update.prompt;
+        if (update.chatLimit !== undefined) parsed.chatLimit = update.chatLimit;
         if (update.script !== undefined) parsed.script = update.script;
         if (update.flagIntent !== undefined) {
           // Merge, don't replace: a model-only change keeps an existing effort

@@ -36,6 +36,7 @@ import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js
 import { registerChannelAdapter } from './channel-registry.js';
 import {
   fetchSlackBotIdentity,
+  getKnownSlackBots,
   registerSlackBot,
   registerSlackWorkspaceHumans,
   resolveSlackMentions,
@@ -364,6 +365,14 @@ for (const ws of workspaces) {
           if (!identity) return false;
           const raw = message.raw as { text?: string } | undefined;
           return raw?.text?.includes(`<@${identity.userId}>`) === true;
+        },
+        // Sibling-bot messages are admissible in recovery (mirrors discord.ts):
+        // without this, a sibling's @-mention that arrives during an event-loop
+        // stall is dropped by recovery's default bot filter and the assignment
+        // is silently lost.
+        allowRecoveredBotMessage: (message) => {
+          const authorId = message.author.userId;
+          return authorId !== identity?.userId && [...getKnownSlackBots().values()].some((b) => b.userId === authorId);
         },
         fetchRecoveryPage: makeSlackRecoveryPageFetcher(slackAdapter, client),
         discoverRecoveryTargets: (request) => discoverSlackRecoveryTargets(client, request),

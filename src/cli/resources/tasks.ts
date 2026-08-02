@@ -306,6 +306,9 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
         // Physical send suppression, enforced by the agent-runner: chat-kind
         // outbound writes are dropped for tasks carrying muteChat.
         ...(bool(args.mute_chat) ? { muteChat: true } : {}),
+        // Per-turn chat send budget (e.g. 1 for a standup whose contract is
+        // one digest post — trailing work-log messages get dropped).
+        ...(chatLimitArg(args) !== undefined ? { chatLimit: chatLimitArg(args) } : {}),
       }),
     });
     return selectTask(db, id);
@@ -449,10 +452,19 @@ function mutateTask(
   return { series_id: id, touched };
 }
 
+function chatLimitArg(args: Record<string, unknown>): number | undefined {
+  const raw = args.chat_limit;
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) throw new Error('--chat-limit must be a non-negative integer');
+  return n;
+}
+
 function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const id = taskId(args);
   const update: TaskUpdate = {};
   if (typeof args.prompt === 'string') update.prompt = args.prompt;
+  if (chatLimitArg(args) !== undefined) update.chatLimit = chatLimitArg(args);
   if (args.process_after !== undefined) update.processAfter = parseProcessAfter(args.process_after);
   const recurrence = normalizeNullableString(args.recurrence);
   const script = normalizeNullableString(args.script);
@@ -687,6 +699,12 @@ registerResource({
             'Physically disable chat sends from this task — the agent-runner drops them at the write layer. For tasks whose contract is file/board output only (e.g. a watcher).',
         },
         {
+          name: 'chat_limit',
+          type: 'string',
+          description:
+            'Max chat sends per turn, enforced by the agent-runner at the write layer (e.g. 1 for a digest task — extra work-log messages are dropped). Omit for unlimited.',
+        },
+        {
           name: 'messaging_group',
           type: 'string',
           description: 'Host-only: stamp routing to this messaging group id (rejected from an agent caller).',
@@ -749,6 +767,11 @@ registerResource({
         { name: 'id', type: 'string', description: 'Task series id.', required: true },
         { name: 'prompt', type: 'string', description: 'Replace the task prompt.' },
         { name: 'process_after', type: 'string', description: 'New next-run time (ISO 8601 or naive local).' },
+        {
+          name: 'chat_limit',
+          type: 'string',
+          description: 'Max chat sends per turn (agent-runner enforced). 0 = mute.',
+        },
         { name: 'recurrence', type: 'string', description: 'New cron expression; "null"/"none" clears it (one-shot).' },
         {
           name: 'dangerously_override_recurrence_limit',
