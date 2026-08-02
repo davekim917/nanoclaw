@@ -1077,3 +1077,88 @@ describe('bounded authoritative pre-turn retrieval', () => {
     ).toThrow(/trusted session scope/i);
   });
 });
+
+describe('per-person preference recall', () => {
+  function archiveFrom(
+    id: string,
+    senderName: string,
+    sentAt: string,
+    threadId = 'discord:guild:channel:thread',
+  ): void {
+    upsertArchiveMessage({
+      id,
+      agentGroupId: 'ag-a',
+      messagingGroupId: 'mg-a',
+      channelType: 'discord',
+      channelName: 'room',
+      platformId: 'discord:guild:channel',
+      threadId,
+      role: 'user',
+      senderId: `discord:${senderName}`,
+      senderName,
+      text: `message from ${senderName}`,
+      sentAt,
+    });
+  }
+
+  it('injects the trigger sender preference file deterministically, outside the ranked lane', () => {
+    memoryFile('preferences/alex.md', '# Alex\nProduct altitude always. No file paths or code identifiers.');
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'what shipped this week?', sender: 'Alex Stone' }),
+    });
+
+    const preference = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md');
+    expect(preference).toBeDefined();
+    expect(preference?.score).toBe(Number.MAX_SAFE_INTEGER);
+    expect(preference?.text).toContain('Product altitude always');
+    expect(result.memoryEvidence.excerpts[0]?.path).toBe('preferences/alex.md');
+    expect(result.notices.some((notice) => notice.code === 'preference-recall')).toBe(true);
+    expect(result.memoryEvidence.excerpts.filter((row) => row.path === 'preferences/alex.md')).toHaveLength(1);
+  });
+
+  it('keys on recent conversation senders in the same thread only', () => {
+    memoryFile('preferences/rowan.md', '# Rowan\nShort summaries, no tables.');
+    memoryFile('preferences/zed.md', '# Zed\nAlways include SQL.');
+    archiveFrom('m1', 'Rowan Vale', '2026-08-01T00:00:00.000Z');
+    archiveFrom('m2', 'Zed Other', '2026-08-01T01:00:00.000Z', 'discord:guild:channel:other-thread');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'status?', sender: 'Pat Doe' }),
+    });
+
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('preferences/rowan.md');
+    expect(paths).not.toContain('preferences/zed.md');
+  });
+
+  it('suppresses an unchanged preference within an epoch and re-injects after a change', () => {
+    memoryFile('preferences/alex.md', '# Alex\nProduct altitude always.');
+    const input = {
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'update?', sender: 'Alex Stone' }),
+    } as const;
+
+    const first = buildPreTurnContext(input);
+    const fingerprint = first.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md')?.fingerprint;
+    expect(fingerprint).toBeDefined();
+
+    const second = buildPreTurnContext({ ...input, seenEvidenceFingerprints: [fingerprint!] });
+    expect(second.memoryEvidence.excerpts.some((row) => row.path === 'preferences/alex.md')).toBe(false);
+
+    memoryFile('preferences/alex.md', '# Alex\nCode-level detail is fine now.');
+    const third = buildPreTurnContext({ ...input, seenEvidenceFingerprints: [fingerprint!] });
+    const changed = third.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md');
+    expect(changed?.text).toContain('Code-level detail');
+  });
+});

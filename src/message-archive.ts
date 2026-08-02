@@ -831,6 +831,48 @@ export function sanitizeArchiveFtsQuery(query: string): string {
 }
 
 /**
+ * Distinct sender names of recent inbound messages in the current
+ * conversation, newest first. Deterministic key set for per-person
+ * preference recall — no ranking, no FTS.
+ */
+export function recentConversationSenderNames(input: {
+  memberAgentGroupIds: string[];
+  messagingGroupId: string | null;
+  threadId: string | null;
+  rowLimit?: number;
+  nameLimit?: number;
+}): string[] {
+  if (input.memberAgentGroupIds.length === 0 || !input.messagingGroupId) return [];
+  const scope = trustedMemberClause(input.memberAgentGroupIds);
+  const rows = openDb()
+    .prepare(
+      `SELECT sender_name
+         FROM messages_archive
+        WHERE ${scope.sql}
+          AND role = 'user'
+          AND sender_name IS NOT NULL
+          AND messaging_group_id = ?
+          AND ((? IS NOT NULL AND thread_id = ?) OR (? IS NULL AND thread_id IS NULL))
+        ORDER BY sent_at DESC, id DESC
+        LIMIT ?`,
+    )
+    .all(
+      ...scope.params,
+      input.messagingGroupId,
+      input.threadId,
+      input.threadId,
+      input.threadId,
+      input.rowLimit ?? 100,
+    ) as Array<{ sender_name: string }>;
+  const names: string[] = [];
+  for (const row of rows) {
+    if (!names.includes(row.sender_name)) names.push(row.sender_name);
+    if (names.length >= (input.nameLimit ?? 8)) break;
+  }
+  return names;
+}
+
+/**
  * Retrieve bounded archive message candidates for a trusted workgroup member
  * set. FTS performs candidate generation only; the pre-turn builder applies
  * its deterministic lexical score and excerpt bounds.

@@ -4,7 +4,12 @@ import { createHash } from 'crypto';
 
 import { buildSessionServicesSnapshot, type SessionServicesSnapshot } from '../../capabilities.js';
 import { getDb } from '../../db/connection.js';
-import { queryArchiveExactLinks, searchArchiveEvidence, type ArchiveEvidenceRow } from '../../message-archive.js';
+import {
+  queryArchiveExactLinks,
+  recentConversationSenderNames,
+  searchArchiveEvidence,
+  type ArchiveEvidenceRow,
+} from '../../message-archive.js';
 import { GENERATED_MEMORY_MAX_BYTES, GENERATED_MEMORY_RELATIVE_PATH } from './curator-contract.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
@@ -35,6 +40,10 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // marker. Worst case 3 x 2200 is still inside finalChars alongside archive
   // recall, and enforceFinalBound trims the tail if a bootstrap turn is tight.
   generatedFactExcerptChars: 2_200,
+  // Deterministic per-person preference lane: preferences/<name-slug>.md files
+  // matching the conversation's involved senders are injected whole (bounded),
+  // never lexically ranked. Cap covers a busy multi-human thread.
+  preferenceExcerpts: 6,
   // Total for BOTH memory lanes, enforced after selection.
   //
   // Load-bearing for the same reason capabilityTotalChars is. Per-lane caps
@@ -179,6 +188,31 @@ export interface RecallCorpusResult {
 
 const CORE_PATHS = ['index.md'] as const;
 const NON_RECALL_PATHS = new Set(['system/definition.md']);
+const PREFERENCES_DIR = 'preferences/';
+
+/** Canonical filename key for a person: "Pat Doe" -> "pat-doe". */
+export function preferenceSlug(name: string): string {
+  return name
+    .toLocaleLowerCase('en-US')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/** Stem matches a sender when equal or hyphen-prefix either way ("alex" <-> "alex-stone"). */
+function preferenceStemMatches(stem: string, senderSlug: string): boolean {
+  return stem === senderSlug || senderSlug.startsWith(`${stem}-`) || stem.startsWith(`${senderSlug}-`);
+}
+
+function extractSenderName(normalizedContent: string): string | null {
+  try {
+    const parsed = JSON.parse(normalizedContent) as { sender?: unknown };
+    return typeof parsed.sender === 'string' && parsed.sender.trim().length > 0 ? parsed.sender.trim() : null;
+  } catch {
+    return null;
+  }
+}
 const TRUNCATED_MARKDOWN_FILE = '\n[truncated:markdown-file]';
 const TRUNCATED_MARKDOWN_EXCERPT = '\n[truncated:markdown-excerpt]';
 const TRUNCATED_ARCHIVE_EXCERPT = '\n[truncated:archive-excerpt]';
@@ -702,6 +736,7 @@ function readMemoryEvidence(
   includeBootstrap: boolean,
   seenEvidenceFingerprints: ReadonlySet<string>,
   bypassDedupe: boolean,
+  involvedSenderNames: readonly string[] = [],
 ): PreTurnContext['memoryEvidence'] {
   if (!fs.existsSync(root)) throw new Error(`canonical memory tree missing: ${root}`);
   const canonicalRoot = fs.realpathSync(root);
@@ -744,12 +779,68 @@ function readMemoryEvidence(
   // is worse than dropping it: the partial line still starts with "- " and is
   // parsed as a fact, so a half-sentence reaches the agent with its provenance
   // marker cut off. Stable sort, so everything else keeps codepoint order.
-  const scanOrder = listMarkdownFiles(root, notices).sort(
+  const allFiles = listMarkdownFiles(root, notices);
+
+  // Deterministic per-person preference lane. Files under preferences/ are
+  // keyed by name slug and injected whole for the conversation's involved
+  // senders — never lexically ranked, so a preference cannot lose a relevance
+  // contest to unrelated memory. Reads run before the ranked scan so the
+  // shared byte budget cannot starve them.
+  const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
+  if (involvedSenderNames.length > 0) {
+    const senderSlugs = [...new Set(involvedSenderNames.map(preferenceSlug))].filter((slug) => slug.length > 0);
+    const matched = allFiles.filter((relative) => {
+      if (!relative.startsWith(PREFERENCES_DIR)) return false;
+      const stem = relative.slice(PREFERENCES_DIR.length, -'.md'.length);
+      if (stem.length === 0 || stem.includes('/')) return false;
+      return senderSlugs.some((slug) => preferenceStemMatches(stem, slug));
+    });
+    for (const relative of matched.slice(0, PRE_TURN_BOUNDS.preferenceExcerpts)) {
+      const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
+      if (remaining <= 0) break;
+      try {
+        const read = readBoundedFile(path.join(root, relative), canonicalRoot, remaining);
+        scannedBytes += read.bytes;
+        const text = boundedText(read.content, PRE_TURN_BOUNDS.markdownExcerptChars, TRUNCATED_MARKDOWN_EXCERPT);
+        preferenceExcerpts.push({
+          path: relative,
+          headings: headingsOf(read.content),
+          text,
+          score: Number.MAX_SAFE_INTEGER,
+          fingerprint: evidenceFingerprint(
+            'workgroup-memory-canon',
+            workgroupId,
+            `${relative}\0${sha256(text)}`,
+            read.content,
+          ),
+          provenance: { authority: 'workgroup-memory-canon', workgroupId },
+        });
+      } catch (error) {
+        notices.push({
+          source: 'markdown',
+          status: 'degraded',
+          code: 'preference-read-failed',
+          detail: `${relative}: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
+    if (preferenceExcerpts.length > 0) {
+      notices.push({
+        source: 'markdown',
+        status: 'ok',
+        code: 'preference-recall',
+        detail: `injected sender preference file${preferenceExcerpts.length === 1 ? '' : 's'}: ${preferenceExcerpts.map((row) => row.path).join(', ')}`,
+      });
+    }
+  }
+
+  const scanOrder = allFiles.sort(
     (a, b) => Number(b === GENERATED_MEMORY_RELATIVE_PATH) - Number(a === GENERATED_MEMORY_RELATIVE_PATH),
   );
   for (const relative of scanOrder) {
     if ((CORE_PATHS as readonly string[]).includes(relative)) continue;
     if (NON_RECALL_PATHS.has(relative)) continue;
+    if (relative.startsWith(PREFERENCES_DIR)) continue;
     const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
     if (remaining <= 0) {
       notices.push({
@@ -850,7 +941,12 @@ function readMemoryEvidence(
     bypassDedupe ? rows : rows.filter((row) => !seenEvidenceFingerprints.has(row.fingerprint));
   const dedupedFiles = keepUnseen(rankedFiles);
   const dedupedFacts = keepUnseen(rankedFacts);
-  const suppressed = rankedFiles.length - dedupedFiles.length + (rankedFacts.length - dedupedFacts.length);
+  const dedupedPreferences = keepUnseen(preferenceExcerpts);
+  const suppressed =
+    rankedFiles.length -
+    dedupedFiles.length +
+    (rankedFacts.length - dedupedFacts.length) +
+    (preferenceExcerpts.length - dedupedPreferences.length);
   if (suppressed > 0) {
     notices.push({
       source: 'context',
@@ -896,7 +992,9 @@ function readMemoryEvidence(
     });
   }
   // Most relevant first: enforceFinalBound pops from the end when over budget.
-  const excerpts = [...factExcerpts, ...fileExcerpts].sort((a, b) => b.score - a.score);
+  // Preferences carry MAX_SAFE_INTEGER scores, so they sort first and the
+  // budget loop below (which pops the tail) can never drop them.
+  const excerpts = [...dedupedPreferences, ...factExcerpts, ...fileExcerpts].sort((a, b) => b.score - a.score);
   // Keep both memory lanes inside one shared total, dropping the least relevant
   // first, so memory cannot reach enforceFinalBound large enough to evict the
   // archive lane that function sacrifices ahead of it.
@@ -1180,6 +1278,29 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     }
   }
 
+  // Involved senders for the deterministic preference lane: the triggering
+  // message's sender plus recent inbound senders in this conversation.
+  const involvedSenderNames: string[] = [];
+  const triggerSender = extractSenderName(input.normalizedContent);
+  if (triggerSender) involvedSenderNames.push(triggerSender);
+  try {
+    for (const name of recentConversationSenderNames({
+      memberAgentGroupIds,
+      messagingGroupId: currentMessagingGroupId,
+      threadId: currentThreadId,
+    })) {
+      if (!involvedSenderNames.includes(name)) involvedSenderNames.push(name);
+    }
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    notices.push({
+      source: 'archive',
+      status: 'degraded',
+      code: 'sender-recall-failed',
+      detail: error.message,
+    });
+  }
+
   let memoryEvidence: PreTurnContext['memoryEvidence'];
   try {
     memoryEvidence = readMemoryEvidence(
@@ -1190,6 +1311,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       includeBootstrap,
       seenEvidenceFingerprints,
       bypassDedupe,
+      involvedSenderNames,
     );
   } catch (error) {
     if (!(error instanceof Error)) throw error;

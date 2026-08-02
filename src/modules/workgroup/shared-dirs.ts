@@ -245,6 +245,13 @@ export function prepareWorkgroupMemoryMember(
     fs.symlinkSync(WORKGROUP_MEMORY_CONTAINER_PATH, local);
     changed = true;
   }
+  // Per-person preference files live here; write_memory_file cannot create
+  // parent directories, so the host provisions the folder for every workgroup.
+  const preferencesDir = path.join(canonicalPath, 'preferences');
+  if (!lstatOrNull(preferencesDir)) {
+    fs.mkdirSync(preferencesDir);
+    changed = true;
+  }
   return { canonicalPath, changed };
 }
 
