@@ -287,6 +287,23 @@ export function insertMessageWithContext(
   })();
 }
 
+/**
+ * Earliest FUTURE process_after among pending rows, or null. Used by the host
+ * sweep's quiet-session cache: a session with nothing due may be skipped only
+ * until its next scheduled row becomes due — never past it.
+ */
+export function getNextFutureProcessAfter(db: Database.Database): string | null {
+  const row = db
+    .prepare(
+      `SELECT MIN(process_after) AS next FROM messages_in
+       WHERE status = 'pending'
+         AND process_after IS NOT NULL
+         AND datetime(process_after) > datetime('now')`,
+    )
+    .get() as { next: string | null };
+  return row.next;
+}
+
 export function countDueMessages(db: Database.Database): number {
   return (
     db

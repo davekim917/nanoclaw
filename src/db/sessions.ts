@@ -144,6 +144,24 @@ export function getActiveSessions(): Session[] {
   return getDb().prepare("SELECT * FROM sessions WHERE status = 'active'").all() as Session[];
 }
 
+/**
+ * Active sessions with recent activity (or a live container). Bounds the
+ * minute-cadence bulk loops: iterating every active session ever created
+ * (3k+ rows, synchronous SQLite each) was blocking the event loop 3-5s per
+ * cycle. A session idle past the horizon has no deliverable outbound and no
+ * ack traffic; anything scheduled in it is the host sweep's quiet-cache job.
+ */
+export function getSessionsActiveSince(sinceIso: string): Session[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM sessions
+       WHERE status = 'active'
+         AND (container_status IN ('running', 'idle')
+              OR datetime(COALESCE(last_active, created_at)) >= datetime(?))`,
+    )
+    .all(sinceIso) as Session[];
+}
+
 export function getRunningSessions(): Session[] {
   return getDb().prepare("SELECT * FROM sessions WHERE container_status IN ('running', 'idle')").all() as Session[];
 }

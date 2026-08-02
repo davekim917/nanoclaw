@@ -39,6 +39,7 @@ import { getActiveSessions, getSession, isTaskThread, updateSession } from './db
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   countDueMessages,
+  getNextFutureProcessAfter,
   deleteOrphanProcessingClaims,
   expireStalePending,
   getContainerState,
@@ -113,6 +114,16 @@ export function parseSqliteUtc(s: string): number {
 }
 
 const SWEEP_INTERVAL_MS = 60_000;
+
+// Quiet-session cache — see the sweep loop. A fully-quiet session is skipped
+// for at most this long (or until its next scheduled row is due, if sooner).
+const QUIET_SESSION_BACKOFF_MS = 30 * 60_000;
+interface QuietMark {
+  skipUntilMs: number;
+  lastActive: string | null;
+}
+const quietSessions = new Map<string, QuietMark>();
+let lastSkippedQuiet = 0;
 // Absolute idle ceiling for a running container. If the heartbeat file hasn't
 // been touched in this long, the container is either stuck or doing genuinely
 // nothing — kill and restart on the next inbound.
@@ -704,16 +715,46 @@ async function sweep(): Promise<void> {
 
   // Isolate failures per-session — a throw from one stuck session's
   // cleanup must not skip every later session for the rest of the tick.
+  //
+  // Quiet cache: iterating EVERY active session ever created (3k+ rows of
+  // synchronous SQLite) blocked the event loop 4-5s per tick — the residual
+  // stall source after the recovery-storm fix. A session the previous sweep
+  // found fully quiet (no container, nothing due, no continuation) is skipped
+  // until its next scheduled row is due or the backoff cap, whichever is
+  // sooner. Any new inbound bumps `last_active`, which invalidates the mark —
+  // so fresh activity is swept on the very next tick, and future wakes can
+  // never be skipped past their due time.
   const sessionsStartedAtMs = Date.now();
+  let skippedQuiet = 0;
+  let processed = 0;
   for (const session of sessions) {
+    const mark = quietSessions.get(session.id);
+    if (mark && Date.now() < mark.skipUntilMs && mark.lastActive === session.last_active) {
+      skippedQuiet++;
+      continue;
+    }
+    quietSessions.delete(session.id);
     try {
-      await sweepSession(session);
+      const quietUntil = await sweepSession(session);
+      if (quietUntil !== null) {
+        quietSessions.set(session.id, { skipUntilMs: quietUntil, lastActive: session.last_active });
+      }
       sweptSessions++;
     } catch (err) {
       log.error('Host sweep error', { err, sessionId: session.id });
     }
+    // Yield to the macrotask queue so a large sweep batch cannot trip the
+    // event-loop stall detector even on a cold tick.
+    if (++processed % 25 === 0) await new Promise((resolve) => setImmediate(resolve));
+  }
+  // Bound the cache to sessions that still exist (closed sessions drop out
+  // of getActiveSessions and would otherwise accumulate forever).
+  if (quietSessions.size > sessions.length + 500) {
+    const live = new Set(sessions.map((s) => s.id));
+    for (const id of quietSessions.keys()) if (!live.has(id)) quietSessions.delete(id);
   }
   sessionsMs = Date.now() - sessionsStartedAtMs;
+  lastSkippedQuiet = skippedQuiet;
 
   // Finalize any "Reject with reason…" holds whose reply window elapsed (admin
   // ghosted, or the host restarted mid-capture). Central-DB scan, once per tick
@@ -783,7 +824,7 @@ async function sweep(): Promise<void> {
 
   const sweepMs = Date.now() - sweepStartedAtMs;
   if (sweepMs >= 1_000) {
-    log.info('Host sweep tick timing', { sweepMs, sessionsMs, sweptSessions });
+    log.info('Host sweep tick timing', { sweepMs, sessionsMs, sweptSessions, skippedQuiet: lastSkippedQuiet });
   }
 
   setTimeout(sweep, SWEEP_INTERVAL_MS);
@@ -1086,19 +1127,23 @@ export function pruneAuditBodies(centralDb: Database.Database, options: { nowMs?
   }
 }
 
-async function sweepSession(session: Session): Promise<void> {
+/**
+ * Sweep one session. Returns a quiet-until timestamp (ms) when the session is
+ * fully quiet and safe to skip until then, or null when it must stay hot.
+ */
+async function sweepSession(session: Session): Promise<number | null> {
   const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) return;
+  if (!agentGroup) return Date.now() + QUIET_SESSION_BACKOFF_MS;
 
   const inPath = inboundDbPath(agentGroup.id, session.id);
-  if (!fs.existsSync(inPath)) return;
+  if (!fs.existsSync(inPath)) return Date.now() + QUIET_SESSION_BACKOFF_MS;
 
   let inDb: Database.Database;
   let outDb: Database.Database | null = null;
   try {
     inDb = openInboundDb(agentGroup.id, session.id);
   } catch {
-    return;
+    return Date.now() + QUIET_SESSION_BACKOFF_MS;
   }
 
   try {
@@ -1252,6 +1297,18 @@ async function sweepSession(session: Session): Promise<void> {
         log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
       }
     }
+
+    // Quiet-cache hint: nothing live here — no container, nothing due or
+    // admitted, no continuation. Safe to skip until the next scheduled row is
+    // due (never past it) or the backoff cap. New inbound invalidates via
+    // last_active in the sweep loop.
+    if (dueCount === 0 && admittedTasks === 0 && !justWoke && workContinuation === null && !alive) {
+      const nextDue = getNextFutureProcessAfter(inDb);
+      const cap = Date.now() + QUIET_SESSION_BACKOFF_MS;
+      const nextDueMs = nextDue ? Date.parse(nextDue) : Number.POSITIVE_INFINITY;
+      return Math.min(Number.isFinite(nextDueMs) ? nextDueMs : cap, cap);
+    }
+    return null;
   } finally {
     inDb.close();
     outDb?.close();

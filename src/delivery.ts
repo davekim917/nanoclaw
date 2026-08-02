@@ -12,7 +12,7 @@ import type Database from 'better-sqlite3';
 import {
   bumpLastOutbound,
   getRunningSessions,
-  getActiveSessions,
+  getSessionsActiveSince,
   createPendingQuestion,
   isTaskThread,
   TASKS_SYSTEM_THREAD_ID,
@@ -362,16 +362,23 @@ async function pollActive(): Promise<void> {
   setTimeout(pollActive, ACTIVE_POLL_MS);
 }
 
+// A session idle past this horizon has no deliverable outbound left — its
+// container hasn't written in a week. Iterating EVERY active session ever
+// created (3k+, synchronous SQLite each) cost ~3s of event-loop time per
+// minute; the recent-activity bound keeps the cycle in the tens of ms.
+const SWEEP_POLL_ACTIVITY_HORIZON_MS = 7 * 24 * 60 * 60 * 1000;
+
 async function pollSweep(): Promise<void> {
   if (!sweepPolling) return;
 
   const startedAtMs = Date.now();
   let polled = 0;
   try {
-    const sessions = getActiveSessions();
+    const sessions = getSessionsActiveSince(new Date(Date.now() - SWEEP_POLL_ACTIVITY_HORIZON_MS).toISOString());
     for (const session of sessions) {
       await deliverSessionMessages(session);
       polled++;
+      if (polled % 25 === 0) await new Promise((resolve) => setImmediate(resolve));
     }
   } catch (err) {
     log.error('Sweep delivery poll error', { err });
