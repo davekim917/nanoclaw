@@ -17,7 +17,7 @@
  * to a stale or wrong user ID.
  */
 import { log } from '../log.js';
-import { transformOutsideProtectedRegions } from '../text-styles.js';
+import { transformInsideInlineCode, transformOutsideProtectedRegions } from '../text-styles.js';
 
 export interface SlackBotIdentity {
   /** Slack user_id, e.g. "UTEST00021" — the value to substitute into `<@…>`. */
@@ -248,7 +248,14 @@ export function resolveSlackMentions(
   const BRACKETED_RE = new RegExp(String.raw`(?<![${WORD}/:=?&#])<@(${USERNAME})>`, 'gu');
   const BARE_RE = new RegExp(String.raw`(?<![${WORD}/:=?&#])@(${USERNAME})`, 'gu');
 
-  return transformOutsideProtectedRegions(text, (segment) => {
+  // Bot-ID → name map for the inline-code normalization pass below.
+  const botNameById = new Map<string, string>();
+  for (const ident of bots.values()) {
+    if (ident.teamId !== currentBot.teamId) continue;
+    botNameById.set(ident.userId, (ident.displayName || ident.realName || ident.username).toLowerCase());
+  }
+
+  const resolved = transformOutsideProtectedRegions(text, (segment) => {
     const rewriteByName = (match: string, name: string): string => {
       // Skip names that look like Slack user IDs (`U…` followed by 8+
       // uppercase alphanumerics) — those are already canonical and shouldn't
@@ -269,6 +276,22 @@ export function resolveSlackMentions(
       return rewriteByName(match, name);
     });
   });
+
+  // Agents write gate-syntax examples in inline code and — taught by their
+  // own thread transcripts — sometimes use the raw bot ID form
+  // (`<@U…> ship 297`), which humans can't read or type. Normalize known
+  // same-workspace BOT IDs inside inline code back to the plain typed name.
+  // Unknown IDs and human IDs pass through (a deliberate raw-ID display in
+  // a debugging discussion keeps its meaning); fenced blocks are untouched.
+  // Broad capture, narrow rewrite: anything `<@…>`-shaped is looked up, but
+  // only a registered same-team bot ID is replaced — the map is the gate,
+  // not the pattern.
+  return transformInsideInlineCode(resolved, (inner) =>
+    inner.replace(/<@([^<>\s]+)>/g, (match, id: string) => {
+      const name = botNameById.get(id);
+      return name ? `@${name}` : match;
+    }),
+  );
 }
 
 /**

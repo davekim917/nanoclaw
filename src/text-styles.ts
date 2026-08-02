@@ -303,6 +303,24 @@ export function transformOutsideProtectedRegions(text: string, transform: (segme
 }
 
 /**
+ * Apply `transform` to the CONTENT of inline code spans (`...`) only.
+ * Fenced blocks and non-code text pass through unchanged — the complement
+ * of transformOutsideProtectedRegions, for the rare rewrite that must reach
+ * into inline code (e.g. normalizing bot IDs inside gate-syntax examples).
+ */
+export function transformInsideInlineCode(text: string, transform: (inner: string) => string): string {
+  if (!text) return text;
+  return splitProtectedRegions(text)
+    .map(({ content, protected: isProtected }) => {
+      if (!isProtected || content.startsWith('```')) return content;
+      const m = content.match(/^(`+)([\s\S]*)\1$/);
+      if (!m) return content;
+      return `${m[1]}${transform(m[2])}${m[1]}`;
+    })
+    .join('');
+}
+
+/**
  * Markdown→Markdown: `## Heading` → `**Heading**`. For chat-adapters that
  * render ATX headings as plain text but bold natively — pre-bumping keeps
  * heading emphasis without leaving the `markdown` delivery path (which is

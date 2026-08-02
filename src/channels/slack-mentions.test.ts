@@ -424,6 +424,32 @@ describe('resolveSlackMentions', () => {
       }
     });
 
+    it('normalizes a known bot ID inside inline code to the plain name (gate syntax)', () => {
+      expect(
+        resolveSlackMentions(
+          'reply `<@U-CODEX> ship 302 300 295` in the channel',
+          'slack-example-labs',
+          makeBots(),
+          makeHumans(),
+        ),
+      ).toBe('reply `@helper-codex ship 302 300 295` in the channel');
+    });
+
+    it('leaves unknown and human IDs inside inline code untouched', () => {
+      const input = 'the raw id was `<@U-OPERATOR1>` and `<@UTEST99ZZZ>` — investigate';
+      expect(resolveSlackMentions(input, 'slack-example-labs', makeBots(), makeHumans())).toBe(input);
+    });
+
+    it('does not normalize bot IDs inside fenced code blocks', () => {
+      const input = 'log:\n```\nsender=<@U-CODEX> action=ship\n```\ndone';
+      expect(resolveSlackMentions(input, 'slack-example-labs', makeBots(), makeHumans())).toBe(input);
+    });
+
+    it('does not normalize a cross-workspace bot ID in inline code', () => {
+      const input = 'try `<@U-BEACON> ship 1`';
+      expect(resolveSlackMentions(input, 'slack-example-labs', makeBots(), makeHumans())).toBe(input);
+    });
+
     it('punctuation-rich names degrade to unresolved, never a wrong ping', () => {
       // `@O'Brien` captures only `@O`; "o" is not a registered alias, so the
       // text stays literal — degraded but safe. (Exotic aliases with spaces/
