@@ -338,16 +338,25 @@ export function startSweepDeliveryPoll(): void {
   pollSweep();
 }
 
+// Stall attribution: both loops do synchronous SQLite per session, so a slow
+// cycle is a stall suspect. One line per slow cycle convicts or clears them.
 async function pollActive(): Promise<void> {
   if (!activePolling) return;
 
+  const startedAtMs = Date.now();
+  let polled = 0;
   try {
     const sessions = getRunningSessions();
     for (const session of sessions) {
       await deliverSessionMessages(session);
+      polled++;
     }
   } catch (err) {
     log.error('Active delivery poll error', { err });
+  }
+  const cycleMs = Date.now() - startedAtMs;
+  if (cycleMs >= 1_000) {
+    log.info('Active delivery poll timing', { cycleMs, polled });
   }
 
   setTimeout(pollActive, ACTIVE_POLL_MS);
@@ -356,13 +365,20 @@ async function pollActive(): Promise<void> {
 async function pollSweep(): Promise<void> {
   if (!sweepPolling) return;
 
+  const startedAtMs = Date.now();
+  let polled = 0;
   try {
     const sessions = getActiveSessions();
     for (const session of sessions) {
       await deliverSessionMessages(session);
+      polled++;
     }
   } catch (err) {
     log.error('Sweep delivery poll error', { err });
+  }
+  const cycleMs = Date.now() - startedAtMs;
+  if (cycleMs >= 1_000) {
+    log.info('Sweep delivery poll timing', { cycleMs, polled });
   }
 
   setTimeout(pollSweep, SWEEP_POLL_MS);

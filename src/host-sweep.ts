@@ -676,6 +676,13 @@ export function stopHostSweep(): void {
 }
 
 async function sweep(): Promise<void> {
+  // Stall attribution: the sweep is the main 60s-periodic bulk worker, so a
+  // slow tick is the first suspect whenever the event-loop stall detector
+  // fires. One line per slow tick, with the per-session share, convicts or
+  // clears it from the log alone.
+  const sweepStartedAtMs = Date.now();
+  let sessionsMs = 0;
+  let sweptSessions = 0;
   if (!running) return;
 
   // Re-heal the egress network so already-running agents keep their gateway hop
@@ -697,13 +704,16 @@ async function sweep(): Promise<void> {
 
   // Isolate failures per-session — a throw from one stuck session's
   // cleanup must not skip every later session for the rest of the tick.
+  const sessionsStartedAtMs = Date.now();
   for (const session of sessions) {
     try {
       await sweepSession(session);
+      sweptSessions++;
     } catch (err) {
       log.error('Host sweep error', { err, sessionId: session.id });
     }
   }
+  sessionsMs = Date.now() - sessionsStartedAtMs;
 
   // Finalize any "Reject with reason…" holds whose reply window elapsed (admin
   // ghosted, or the host restarted mid-capture). Central-DB scan, once per tick
@@ -770,6 +780,11 @@ async function sweep(): Promise<void> {
   // MODULE-HOOK:orchestrator-dispatch:watchdog — reap tasks that have exceeded
   // their deadline, spawn window, no-progress timeout, or whose child container exited.
   await sweepTaskWatchdog();
+
+  const sweepMs = Date.now() - sweepStartedAtMs;
+  if (sweepMs >= 1_000) {
+    log.info('Host sweep tick timing', { sweepMs, sessionsMs, sweptSessions });
+  }
 
   setTimeout(sweep, SWEEP_INTERVAL_MS);
 }
