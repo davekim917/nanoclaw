@@ -784,6 +784,31 @@ describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
     expect(getMessagingGroupAgents('mg-wg')).toHaveLength(1);
   });
 
+  it('permits cross-workgroup rows on a colliding platform_id (isolation is by path namespace)', () => {
+    // Same platform_id via a SECOND adapter row can be a workspace-id
+    // collision from an unrelated tenant (see getChannelPeers
+    // tenant-boundary tests) — wiring must not reject it. Isolation comes
+    // from workgroup-namespaced thread paths (session-manager.ts), not from
+    // wiring rejection.
+    createMessagingGroup({
+      id: 'mg-wg-sibling',
+      channel_type: 'slack-other-tenant',
+      platform_id: 'C-wg-guard',
+      name: 'wg-guard-colliding-tenant',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    makeWorkgroup('wg-1');
+    makeWorkgroup('wg-2');
+    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-a'").run();
+    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-2' WHERE id = 'ag-c'").run();
+    createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
+    expect(() =>
+      createMessagingGroupAgent({ ...mgaRow('mga-c', 'ag-c'), messaging_group_id: 'mg-wg-sibling' }),
+    ).not.toThrow();
+  });
+
   it('falls back to folder identity when workgroup_id is null', () => {
     // Pre-workgroup rows: identity = folder, matching container-runner's
     // shared-dir resolution. Different folders → different data pools → reject.

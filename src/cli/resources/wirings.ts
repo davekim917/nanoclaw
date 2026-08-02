@@ -261,13 +261,15 @@ registerResource({
         const colNames = Object.keys(values);
         const placeholders = colNames.map((c) => `@${c}`);
         const db = getDb();
-        assertSameWorkgroupWiring(values.messaging_group_id as string, agId);
+        // Guard inside an IMMEDIATE transaction so check + insert are atomic
+        // against a concurrent wiring from another process.
         db.transaction(() => {
+          assertSameWorkgroupWiring(values.messaging_group_id as string, agId);
           db.prepare(
             `INSERT INTO messaging_group_agents (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`,
           ).run(values);
           ensureAgentDestinationForWiring(values as unknown as MessagingGroupAgent);
-        })();
+        }).immediate();
 
         // postCommit parity — live-refresh with `ncl destinations add`: the
         // transaction above only wrote the central `agent_destinations` row.

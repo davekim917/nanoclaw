@@ -184,13 +184,16 @@ function discoverThreadParticipantsByDir(): Map<string, ThreadParticipant[]> {
     agent_group_id: string;
     thread_id: string | null;
     platform_id: string;
+    wg: string;
   }>;
   try {
     rows = getDb()
       .prepare(
-        `SELECT s.id AS session_id, s.agent_group_id, s.thread_id, mg.platform_id
+        `SELECT s.id AS session_id, s.agent_group_id, s.thread_id, mg.platform_id,
+                COALESCE(ag.workgroup_id, ag.folder) AS wg
            FROM sessions s
            JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+           JOIN agent_groups ag ON ag.id = s.agent_group_id
           WHERE s.status = 'active' AND s.messaging_group_id IS NOT NULL`,
       )
       .all() as typeof rows;
@@ -201,7 +204,7 @@ function discoverThreadParticipantsByDir(): Map<string, ThreadParticipant[]> {
 
   const participantsByDir = new Map<string, ThreadParticipant[]>();
   for (const row of rows) {
-    const worktreeDir = threadWorktreeDir(row.platform_id, row.thread_id);
+    const worktreeDir = threadWorktreeDir(row.platform_id, row.thread_id, row.wg);
     const participants = participantsByDir.get(worktreeDir) ?? [];
     participants.push({
       sessionId: row.session_id,

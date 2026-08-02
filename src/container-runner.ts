@@ -524,7 +524,9 @@ async function acquireContainerStorageActivity(session: Session): Promise<Storag
   const roots = new Set<string>([sessionDir(session.agent_group_id, session.id)]);
   if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
     const mg = getMessagingGroup(session.messaging_group_id);
-    if (mg) roots.add(threadWorktreeDir(mg.platform_id, session.thread_id));
+    const ag = getAgentGroup(session.agent_group_id);
+    if (mg)
+      roots.add(threadWorktreeDir(mg.platform_id, session.thread_id, ag ? (ag.workgroup_id ?? ag.folder) : undefined));
   }
 
   const leases: StorageActivityLease[] = [];
@@ -1475,10 +1477,13 @@ export function buildMounts(
   // sessions keep an isolated cache; thread-worktree siblings share the cache
   // derived from the same platform/thread key. Runtime coordination remains
   // install-scoped and is never placed under a source checkout or host home.
+  // Workgroup key for every thread-scoped/shared path below — resolved once
+  // so mounts, overlay allowlist, and the workgroup tree agree.
+  const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
   let graphifyCache = sessionGraphifyCacheDir(agentGroup.id, session.id);
   if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
     const mg = getMessagingGroup(session.messaging_group_id);
-    if (mg) graphifyCache = threadGraphifyCacheDir(mg.platform_id, session.thread_id);
+    if (mg) graphifyCache = threadGraphifyCacheDir(mg.platform_id, session.thread_id, wgKey);
   }
   const graphifyRuntime = graphifyRuntimeDir();
   fs.mkdirSync(graphifyCache, { recursive: true });
@@ -1510,7 +1515,7 @@ export function buildMounts(
     // so collaborative code edits in a thread are visible across siblings.
     const mg = getMessagingGroup(session.messaging_group_id);
     if (mg) {
-      const tDir = threadWorktreeDir(mg.platform_id, session.thread_id);
+      const tDir = threadWorktreeDir(mg.platform_id, session.thread_id, wgKey);
       fs.mkdirSync(tDir, { recursive: true });
       mounts.push({ hostPath: tDir, containerPath: '/workspace/worktrees', readonly: false });
     }
@@ -1540,11 +1545,10 @@ export function buildMounts(
   // that this agent is entitled to see anyway: its own group dir, a sibling
   // group dir in the SAME workgroup, or the workgroup shared tree. Anything
   // else is skipped with a loud warning.
-  const overlayWgId = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
   const allowedOverlayRoots = [
-    workgroupSharedDir(overlayWgId),
+    workgroupSharedDir(wgKey),
     ...getAllAgentGroups()
-      .filter((g) => (g.workgroup_id ?? g.folder) === overlayWgId)
+      .filter((g) => (g.workgroup_id ?? g.folder) === wgKey)
       .map((g) => path.resolve(GROUPS_DIR, g.folder)),
     groupDir,
   ].map((p) => {
@@ -1573,7 +1577,12 @@ export function buildMounts(
       });
       continue;
     }
-    mounts.push({ hostPath: realTarget, containerPath: `/workspace/agent/${entry.name}`, readonly: false });
+    mounts.push({
+      hostPath: realTarget,
+      containerPath: `/workspace/agent/${entry.name}`,
+      readonly: false,
+      overlayAllowedRoots: allowedOverlayRoots,
+    });
   }
 
   // Workgroup shared filesystem — flag-gated. Bind-mount data/workgroups/<id>/
@@ -1588,7 +1597,7 @@ export function buildMounts(
   // been settled by reconcileWorkgroupAtSpawn under the writer lock, so every
   // subsystem inside this spawn sees the same value. Fall back to the
   // agentGroup field for direct callers (tests, scripts).
-  const wgId = overlayWgId;
+  const wgId = wgKey;
   const wgShared = workgroupSharedDir(wgId);
   if (WORKGROUP_SHARED_FS || fs.existsSync(path.join(wgShared, '.migrated'))) {
     fs.mkdirSync(wgShared, { recursive: true });
@@ -3358,6 +3367,27 @@ async function buildContainerArgs(
 
   // Volume mounts
   for (const mount of mounts) {
+    // Symlink-overlay sources live under agent-writable trees; re-validate at
+    // the last moment before the docker arg is emitted so a target swapped
+    // after buildMounts' check aborts the spawn instead of mounting. Docker's
+    // -v takes a pathname (no fd-based binds), so a sub-millisecond race
+    // between this check and runc's own resolution remains — accepted: it
+    // requires a concurrent same-workgroup process, which already shares the
+    // trees these roots allow.
+    if (mount.overlayAllowedRoots) {
+      let recheck: string;
+      try {
+        recheck = fs.realpathSync(mount.hostPath);
+      } catch {
+        throw new Error(`Overlay mount source vanished before spawn: ${mount.hostPath}`);
+      }
+      const allowed = mount.overlayAllowedRoots.some((root) => recheck === root || recheck.startsWith(root + path.sep));
+      if (recheck !== mount.hostPath || !allowed) {
+        throw new Error(
+          `Overlay mount source changed between validation and spawn (${mount.hostPath} -> ${recheck}); aborting spawn`,
+        );
+      }
+    }
     if (mount.readonly) {
       args.push(...readonlyMountArgs(mount.hostPath, mount.containerPath));
     } else {

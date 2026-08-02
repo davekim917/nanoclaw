@@ -165,6 +165,18 @@ export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): 
  * matching container-runner's resolution.
  */
 export function assertSameWorkgroupWiring(messagingGroupId: string, agentGroupId: string): void {
+  // Scope: THIS messaging-group row only. Cross-row sharing on the same
+  // platform_id cannot be policed here — an identical platform_id may be the
+  // same real channel reached via a sibling bot app (must share) OR an
+  // unrelated channel from a colliding workspace (must NOT share; see the
+  // getChannelPeers tenant-boundary tests). That ambiguity is resolved where
+  // the sharing actually happens: thread worktree/cache paths are namespaced
+  // by workgroup (session-manager.ts), so cross-workgroup rows never resolve
+  // to the same directory regardless of platform_id.
+  //
+  // This row-level invariant is intentional and unconditional — fan-out on
+  // one wiring row never spans workgroups, with or without
+  // NANOCLAW_THREAD_WORKTREES: the workgroup is the data-pool boundary.
   const row = getDb()
     .prepare(
       `SELECT ag.id AS agent_group_id, COALESCE(ag.workgroup_id, ag.folder) AS wg
@@ -178,8 +190,8 @@ export function assertSameWorkgroupWiring(messagingGroupId: string, agentGroupId
   if (row) {
     throw new Error(
       `Cannot wire agent group ${agentGroupId} to messaging group ${messagingGroupId}: ` +
-        `existing agent ${row.agent_group_id} belongs to workgroup '${row.wg}'. Agents on one ` +
-        `channel share thread worktrees, so all must belong to the same workgroup.`,
+        `agent ${row.agent_group_id} on the same channel surface belongs to workgroup '${row.wg}'. ` +
+        `Agents on one channel share thread worktrees, so all must belong to the same workgroup.`,
     );
   }
 }
@@ -198,7 +210,19 @@ export function assertSameWorkgroupWiring(messagingGroupId: string, agentGroupId
  * mirrors the backfill logic in migration 004.
  */
 export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
-  assertSameWorkgroupWiring(mga.messaging_group_id, mga.agent_group_id);
+  // Immediate transaction so guard + insert are atomic against a concurrent
+  // wiring from another process (codex phase-A review P2).
+  getDb()
+    .transaction(() => {
+      assertSameWorkgroupWiring(mga.messaging_group_id, mga.agent_group_id);
+      insertMessagingGroupAgentRow(mga);
+    })
+    .immediate();
+
+  ensureAgentDestinationForWiring(mga);
+}
+
+function insertMessagingGroupAgentRow(mga: MessagingGroupAgent): void {
   getDb()
     .prepare(
       `INSERT INTO messaging_group_agents (
@@ -215,8 +239,6 @@ export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
        )`,
     )
     .run(mga);
-
-  ensureAgentDestinationForWiring(mga);
 }
 
 /**

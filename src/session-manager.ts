@@ -95,9 +95,33 @@ function fsSlug(s: string): string {
  * the host path turns `-v src:dst` into a three-part `src:dst:opts` which
  * Docker rejects with exit 125. fsSlug strips any embedded colons too.
  */
-export function threadWorktreeDir(platformId: string, threadId: string | null): string {
+export function threadWorktreeDir(platformId: string, threadId: string | null, workgroupId?: string): string {
+  return path.join(threadStateDir(platformId, threadId, workgroupId), 'worktrees');
+}
+
+/**
+ * Workgroup-namespaced thread-state base dir.
+ *
+ * The platform/thread key alone is ambiguous across workgroups: an identical
+ * platform_id can be the same real channel via a sibling bot app (same
+ * workgroup — must share) or an unrelated channel from a colliding workspace
+ * (different workgroup — must NOT share; see the getChannelPeers
+ * tenant-boundary tests). Adding the workgroup segment makes cross-workgroup
+ * rows resolve to different directories while same-workgroup siblings keep
+ * sharing.
+ *
+ * Legacy fallback: pre-namespace threads live at `<base>/<tid>/`. If that
+ * dir exists and no workgroup-scoped dir does, keep serving it so in-flight
+ * threads don't lose their worktrees on upgrade; the repo-store migration
+ * relocates them and ends the fallback window.
+ */
+function threadStateDir(platformId: string, threadId: string | null, workgroupId?: string): string {
   const tid = threadId ?? `dm-${platformId}`;
-  return path.join(threadsBaseDir(), fsSlug(tid), 'worktrees');
+  const legacy = path.join(threadsBaseDir(), fsSlug(tid));
+  if (!workgroupId) return legacy;
+  const scoped = path.join(threadsBaseDir(), `wg-${fsSlug(workgroupId)}`, fsSlug(tid));
+  if (fs.existsSync(legacy) && !fs.existsSync(scoped)) return legacy;
+  return scoped;
 }
 
 /** Per-session Graphify cache. Sessions never share this directory. */
@@ -106,9 +130,8 @@ export function sessionGraphifyCacheDir(agentGroupId: string, sessionId: string)
 }
 
 /** Thread-scoped Graphify cache shared by sibling agents in one conversation. */
-export function threadGraphifyCacheDir(platformId: string, threadId: string | null): string {
-  const tid = threadId ?? `dm-${platformId}`;
-  return path.join(threadsBaseDir(), fsSlug(tid), 'graphify-cache');
+export function threadGraphifyCacheDir(platformId: string, threadId: string | null, workgroupId?: string): string {
+  return path.join(threadStateDir(platformId, threadId, workgroupId), 'graphify-cache');
 }
 
 /** Install-scoped runtime state for the Graphify gateway. */
