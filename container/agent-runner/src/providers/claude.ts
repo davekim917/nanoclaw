@@ -1402,8 +1402,9 @@ function ensureOpus1mSuffix(model: string): string {
  *           alias and every concrete claude-opus-* id; this install only
  *           runs Opus 5+ (opus 4.8 and below are no longer used). Operators
  *           can dial up via -e or NANOCLAW_EFFORT_OVERRIDE.
- *   fable → medium — keep Fable's default at medium; operators can dial up
- *           via -e or NANOCLAW_EFFORT_OVERRIDE when a task warrants it.
+ *   fable → high  — fable's docs recommend `high` as the default starting
+ *           point; lower levels "often exceed xhigh performance on prior
+ *           models", and fable bills 2x Opus ($10/$50 per MTok).
  *   sonnet → xhigh — Sonnet 5 (the bare `sonnet` alias) defaults to xhigh, the
  *           recommended setting for coding/agentic work; fleet decision.
  *           (This fork only runs Sonnet 5.)
@@ -1423,7 +1424,7 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
   if (m === 'opus' || m.startsWith('claude-opus-')) return 'high';
   // Sonnet 5 (the bare `sonnet` alias resolves to it) defaults to xhigh.
   if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'xhigh';
-  if (m.startsWith('claude-fable-')) return 'medium';
+  if (m.startsWith('claude-fable-')) return 'high';
   if (m === 'haiku' || m.startsWith('claude-haiku-')) return undefined;
   return 'high';
 }
@@ -1991,7 +1992,7 @@ export class ClaudeProvider implements AgentProvider {
       // requests mirror interactive Claude Code's /model. Re-runs the same
       // effort resolution chain as query() so a model switch without an
       // explicit -e lands on the new model's family default (e.g. -m fable
-      // mid-turn → fable@medium, not fable@inherited-xhigh).
+      // mid-turn → fable@high, not fable@inherited-xhigh).
       applySettings: async (s) => {
         const newModel = s.model ? ensureOpus1mSuffix(s.model) : undefined;
         if (newModel && newModel !== activeModel) {

@@ -257,9 +257,9 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBe('xhigh');
   });
 
-  it('test_effort_default_fable_medium: -m fable without -e defaults to medium', () => {
+  it('test_effort_default_fable_high: -m fable without -e defaults to high (2x-cost model, docs-recommended default)', () => {
     const opts = run({ model: 'claude-fable-5[1m]' });
-    expect(opts?.effort).toBe('medium');
+    expect(opts?.effort).toBe('high');
   });
 
   it('test_effort_flag_wins_on_fable: -e xhigh on fable overrides the family default', () => {
@@ -359,7 +359,7 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
     const q = start(); // opus @ high (Opus 5 default as of 2026-07-27)
     await q.applySettings!({ model: 'claude-fable-5[1m]' });
     expect(capturedSetModel).toEqual(['claude-fable-5[1m]']);
-    expect(capturedFlagSettings).toEqual([{ effortLevel: 'medium' }]);
+    expect(capturedFlagSettings).toEqual([{ effortLevel: 'high' }]);
   });
 
   it('test_applySettings_effort_only: -e medium mid-turn → no setModel, effortLevel applied', async () => {
