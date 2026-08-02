@@ -127,12 +127,19 @@ function ensureQuiesced(): void {
   try {
     out = execFileSync(
       'docker',
-      ['ps', '--filter', `name=nanoclaw-v2-${WORKGROUP}`, '--format', '{{.Names}}'],
+      ['ps', '--filter', `name=nanoclaw-v2-${WG}`, '--format', '{{.Names}}'],
       { stdio: 'pipe', encoding: 'utf-8' },
     ).toString().trim();
   } catch {
-    console.warn('WARNING: docker ps failed — cannot verify quiesce; continuing on your authority.');
-    return;
+    // Quiesce is a hard precondition — an unverifiable state is a refusal,
+    // not a shrug (codex final review P1 #5). --force overrides on the
+    // operator's explicit authority.
+    if (args.includes('--force')) {
+      console.warn('WARNING: docker ps failed — quiesce unverified, continuing under --force.');
+      return;
+    }
+    console.error('REFUSING to execute: docker ps failed, cannot verify workgroup containers are stopped. Pass --force to override.');
+    process.exit(2);
   }
   if (out) {
     console.error(
@@ -143,10 +150,29 @@ function ensureQuiesced(): void {
   }
 }
 
-/** Container-absolute → host path for workgroup-tree paths; null if unmappable. */
+/**
+ * Migration lock: the live host's freshness worker discovers mirrors as they
+ * appear and would advance snapshots while this script is mid-swap. The lock
+ * file under .repos/ makes the worker skip this workgroup for the duration.
+ */
+const MIGRATION_LOCK = path.join(REPOS, '.migration-lock');
+function withMigrationLock(fn: () => void): void {
+  fs.mkdirSync(REPOS, { recursive: true });
+  fs.writeFileSync(MIGRATION_LOCK, `${RUN} pid=${process.pid}\n`);
+  try {
+    fn();
+  } finally {
+    try { fs.rmSync(MIGRATION_LOCK, { force: true }); } catch { /* ignore */ }
+  }
+}
+
+/** Container-absolute → host path for workgroup-tree paths; null if unmappable
+ *  or escaping the workgroup dir (stale/malformed gitdir with `..`). */
 function mapContainerPath(p: string): string | null {
-  if (p.startsWith('/workspace/workgroup/')) return path.join(WG_DIR, p.slice('/workspace/workgroup/'.length));
-  return null;
+  if (!p.startsWith('/workspace/workgroup/')) return null;
+  const mapped = path.resolve(WG_DIR, p.slice('/workspace/workgroup/'.length));
+  if (mapped !== WG_DIR && !mapped.startsWith(WG_DIR + path.sep)) return null;
+  return mapped;
 }
 
 interface WorktreeRecord {
@@ -191,30 +217,53 @@ function readLinkedWorktrees(canonical: string): WorktreeRecord[] {
   return records;
 }
 
-/** Standalone-clone transplant: give <dir> its own .git at branch/sha, preserving the working tree. */
+/**
+ * Standalone-clone transplant: give <dir> its own .git at branch/sha,
+ * preserving the working tree.
+ *
+ * Prepare-then-swap: the replacement .git is FULLY configured (refs, HEAD,
+ * origin URL) inside a temp clone before the original .git file is touched,
+ * and the sha is verified reachable in the mirror up front — any preparation
+ * failure leaves the original checkout byte-for-byte untouched (codex final
+ * review P0 #2). Only the post-swap `git reset` (index rebuild) can fail
+ * after the swap; the .git dir is already valid then, so the checkout stays
+ * usable and the failure is flagged rather than destructive.
+ */
 function transplant(dir: string, mirror: string, branch: string | null, sha: string | null): boolean {
   if (!sha) return false;
+  if (tryGit(mirror, ['cat-file', '-e', `${sha}^{commit}`]) === null) {
+    manualFlags.push(`transplant skipped for ${dir}: commit ${sha.slice(0, 12)} not in mirror — left untouched`);
+    return false;
+  }
   const temp = `${dir}.git-transplant`;
   try {
+    fs.rmSync(temp, { recursive: true, force: true });
     execFileSync('git', ['clone', '--no-checkout', mirror, temp], { stdio: 'pipe', timeout: 120_000 });
+    const realUrl = tryGit(mirror, ['config', '--get', 'remote.origin.url']);
+    if (realUrl) git(temp, ['remote', 'set-url', 'origin', realUrl]);
+    if (branch) {
+      git(temp, ['update-ref', branch, sha]);
+      git(temp, ['symbolic-ref', 'HEAD', branch]);
+    } else {
+      git(temp, ['update-ref', '--no-deref', 'HEAD', sha]);
+    }
+  } catch (e) {
+    try { fs.rmSync(temp, { recursive: true, force: true }); } catch { /* ignore */ }
+    manualFlags.push(`transplant preparation failed for ${dir} (checkout untouched): ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
+  try {
     fs.rmSync(path.join(dir, '.git'), { force: true });
     fs.renameSync(path.join(temp, '.git'), path.join(dir, '.git'));
     fs.rmSync(temp, { recursive: true, force: true });
-    const realUrl = tryGit(mirror, ['config', '--get', 'remote.origin.url']);
-    if (realUrl) tryGit(dir, ['remote', 'set-url', 'origin', realUrl]);
-    if (branch) {
-      git(dir, ['update-ref', branch, sha]);
-      git(dir, ['symbolic-ref', 'HEAD', branch]);
-    } else {
-      git(dir, ['update-ref', '--no-deref', 'HEAD', sha]);
-    }
-    git(dir, ['reset', '-q', sha]);
-    return true;
   } catch (e) {
-    try { fs.rmSync(temp, { recursive: true, force: true }); } catch { /* ignore */ }
-    manualFlags.push(`transplant failed for ${dir}: ${e instanceof Error ? e.message : String(e)}`);
+    manualFlags.push(`transplant swap failed for ${dir}: ${e instanceof Error ? e.message : String(e)} — prepared .git at ${temp}`);
     return false;
   }
+  if (tryGit(dir, ['reset', '-q', sha]) === null) {
+    manualFlags.push(`transplant index rebuild failed for ${dir} — .git is valid; run \`git -C ${dir} reset ${sha}\` manually`);
+  }
+  return true;
 }
 
 /**
@@ -250,11 +299,43 @@ const canonicals = fs
 console.log(`\n=== repo-store migration — workgroup '${WORKGROUP}' — ${EXECUTE ? 'EXECUTE' : 'DRY-RUN'} ===`);
 console.log(`${canonicals.length} legacy canonical clone(s): ${canonicals.map((c) => path.basename(c)).join(', ') || '(none)'}\n`);
 
+// Rerun repair: a prior partial run may have left a valid mirror with a
+// missing canonical (crash between the two swap renames). Recreate the
+// snapshot from the mirror before the per-canonical pass, which only sees
+// dirs that exist.
+if (fs.existsSync(REPOS)) {
+  for (const entry of fs.readdirSync(REPOS)) {
+    if (!entry.endsWith('.git')) continue;
+    const repo = entry.slice(0, -'.git'.length);
+    const mirror = path.join(REPOS, entry);
+    const canonical = path.join(WG_DIR, repo);
+    if (fs.existsSync(canonical)) continue;
+    if (tryGit(mirror, ['rev-parse', '--is-bare-repository']) !== 'true') continue;
+    act('rerun-repair', `${repo}: mirror exists but canonical path is missing — recreate snapshot`, () => {
+      const tmp = `${canonical}.snapshot-tmp`;
+      fs.rmSync(tmp, { recursive: true, force: true });
+      execFileSync('git', ['clone', mirror, tmp], { stdio: 'pipe', timeout: 300_000 });
+      const url = tryGit(mirror, ['config', '--get', 'remote.origin.url']);
+      if (url) git(tmp, ['remote', 'set-url', 'origin', url]);
+      git(tmp, ['checkout', '--detach']);
+      fs.renameSync(tmp, canonical);
+    });
+  }
+}
+
 for (const canonical of canonicals) {
   const repo = path.basename(canonical);
   const mirror = path.join(REPOS, `${repo}.git`);
-  if (fs.existsSync(path.join(mirror, 'HEAD'))) {
-    console.log(`-- ${repo}: mirror already exists, skipping (already migrated?)`);
+  if (fs.existsSync(mirror)) {
+    if (tryGit(mirror, ['rev-parse', '--is-bare-repository']) === 'true') {
+      console.log(`-- ${repo}: valid mirror already exists, skipping (already migrated?)`);
+    } else {
+      manualFlags.push(
+        `${repo}: mirror dir ${mirror} exists but is NOT a valid bare repo (partial clone?) — ` +
+          `remove it and re-run; canonical left untouched`,
+      );
+      console.log(`-- ${repo}: INVALID mirror present — flagged for manual attention, skipping`);
+    }
     continue;
   }
 
@@ -298,20 +379,37 @@ for (const canonical of canonicals) {
 
   // 3. Convert to bare mirror (from the LOCAL canonical → captures every
   // local branch, then repoint at the real remote).
-  act('mirror', `${repo}: bare-clone canonical → .repos/${repo}.git, repoint origin, set default HEAD`, () => {
+  act('mirror', `${repo}: bare-clone canonical → .repos/${repo}.git, repoint origin, fetch, set default HEAD`, () => {
     fs.mkdirSync(REPOS, { recursive: true });
-    execFileSync('git', ['clone', '--bare', canonical, mirror], { stdio: 'pipe', timeout: 300_000 });
+    try {
+      execFileSync('git', ['clone', '--bare', canonical, mirror], { stdio: 'pipe', timeout: 300_000 });
+    } catch (e) {
+      // A partial dir would be mistaken for a mirror on rerun — remove it.
+      try { fs.rmSync(mirror, { recursive: true, force: true }); } catch { /* ignore */ }
+      throw e;
+    }
     git(mirror, ['config', 'gc.auto', '0']);
     if (originUrl) {
       git(mirror, ['remote', 'set-url', 'origin', originUrl]);
       git(mirror, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*']);
+      // The canonical may be arbitrarily stale — fetch so the snapshot cut
+      // from this mirror starts at CURRENT origin, not the parked state.
+      // Best-effort: offline, the snapshot serves last-known state and the
+      // freshness worker catches up.
+      // NO --prune: with the +refs/heads/*:refs/heads/* refspec, prune would
+      // DELETE the parked/rescue branches this mirror exists to preserve —
+      // they don't exist on origin (caught by the e2e test).
+      if (tryGit(mirror, ['fetch', 'origin'], 300_000) === null) {
+        manualFlags.push(`${repo}: mirror fetch from ${originUrl} failed — snapshot starts at last-known local state`);
+      }
       const symref = tryGit(mirror, ['ls-remote', '--symref', 'origin', 'HEAD'], 60_000);
       const m = symref?.match(/^ref:\s+(refs\/heads\/\S+)\s+HEAD/m);
-      if (m) tryGit(mirror, ['symbolic-ref', 'HEAD', m[1]]);
-      else {
-        const guess = ['refs/heads/main', 'refs/heads/master'].find((r) => tryGit(mirror, ['rev-parse', '--verify', r]) !== null);
-        if (guess) tryGit(mirror, ['symbolic-ref', 'HEAD', guess]);
-      }
+      // Only point HEAD at a ref that actually resolves locally — a remote
+      // default absent from the fetch would make the snapshot clone fail
+      // after the canonical had already moved.
+      const candidates = [...(m ? [m[1]] : []), 'refs/heads/main', 'refs/heads/master'];
+      const target = candidates.find((r) => tryGit(mirror, ['rev-parse', '--verify', r]) !== null);
+      if (target) git(mirror, ['symbolic-ref', 'HEAD', target]);
     }
   });
 
@@ -357,24 +455,80 @@ for (const canonical of canonicals) {
     });
   }
 
-  // 6. Swap canonical → snapshot.
-  act('snapshot-swap', `${repo}: move canonical → .rescues/${RUN}/${repo}-old, create detached snapshot`, () => {
-    // worktree metadata pruned so the mirror (cloned earlier) is not affected.
+  // 6. Swap canonical → snapshot. Prepare-then-swap: the snapshot clone is
+  // fully built at a temp path BEFORE the canonical moves, so a clone or
+  // detach failure aborts with the canonical untouched (codex final review
+  // P0 #1). The two renames are same-filesystem — the "no canonical at the
+  // old path" window is two rename syscalls, not a network clone.
+  act('snapshot-swap', `${repo}: build snapshot, then swap canonical → .rescues/${RUN}/${repo}-old`, () => {
+    const tmp = `${canonical}.snapshot-tmp`;
+    fs.rmSync(tmp, { recursive: true, force: true });
+    execFileSync('git', ['clone', mirror, tmp], { stdio: 'pipe', timeout: 300_000 });
+    if (originUrl) git(tmp, ['remote', 'set-url', 'origin', originUrl]);
+    git(tmp, ['checkout', '--detach']);
     fs.renameSync(canonical, path.join(RESCUES, `${repo}-old`));
-    execFileSync('git', ['clone', mirror, canonical], { stdio: 'pipe', timeout: 300_000 });
-    if (originUrl) tryGit(canonical, ['remote', 'set-url', 'origin', originUrl]);
-    git(canonical, ['checkout', '--detach']);
+    fs.renameSync(tmp, canonical);
   });
 }
 
 // ─── Per-thread worktrees ────────────────────────────────────────────────────
+// Scoped by DB ownership (codex final review P1 #3): repo NAME alone cannot
+// decide eligibility — two workgroups may clone same-named repos, and a
+// global scan would transplant the other workgroup's checkout against this
+// workgroup's mirror. Only walk session dirs of THIS workgroup's agent
+// groups and thread dirs whose key belongs to THIS workgroup. No DB → skip
+// the pass entirely (fail-safe, flagged).
+
+function workgroupAgentGroupIds(): Set<string> | null {
+  const centralDb = path.join(DATA_DIR, 'v2.db');
+  if (!fs.existsSync(centralDb)) return null;
+  try {
+    const out = execFileSync(
+      'pnpm',
+      [
+        'exec', 'tsx', path.join(import.meta.dirname, 'q.ts'), centralDb,
+        `SELECT id FROM agent_groups WHERE COALESCE(workgroup_id, folder) = '${WG.replace(/'/g, "''")}'`,
+      ],
+      { cwd: path.join(import.meta.dirname, '..'), stdio: 'pipe', encoding: 'utf-8', timeout: 60_000 },
+    ).toString();
+    return new Set(out.split('\n').map((l) => l.trim()).filter(Boolean));
+  } catch {
+    return null;
+  }
+}
 
 interface ThreadWt {
   dir: string;
   repo: string;
 }
 const threadWts: ThreadWt[] = [];
-for (const base of [path.join(DATA_DIR, 'v2-threads'), path.join(DATA_DIR, 'v2-sessions')]) {
+const ownedAgentGroups = workgroupAgentGroupIds();
+const ownedThreadSlugs = workgroupThreadSlugs();
+if (ownedAgentGroups === null || ownedThreadSlugs === null) {
+  manualFlags.push(
+    'thread-worktrees: central DB unavailable — per-thread worktree conversion SKIPPED for safety; ' +
+      're-run once the DB is readable',
+  );
+}
+const threadBases: string[] = [];
+if (ownedAgentGroups !== null && ownedThreadSlugs !== null) {
+  const threadsRoot = path.join(DATA_DIR, 'v2-threads');
+  if (fs.existsSync(threadsRoot)) {
+    for (const e of fs.readdirSync(threadsRoot, { withFileTypes: true })) {
+      if (!e.isDirectory()) continue;
+      if (e.name === `wg-${WG}` || (!e.name.startsWith('wg-') && ownedThreadSlugs.has(e.name))) {
+        threadBases.push(path.join(threadsRoot, e.name));
+      }
+    }
+  }
+  const sessionsRoot = path.join(DATA_DIR, 'v2-sessions');
+  if (fs.existsSync(sessionsRoot)) {
+    for (const e of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
+      if (e.isDirectory() && ownedAgentGroups.has(e.name)) threadBases.push(path.join(sessionsRoot, e.name));
+    }
+  }
+}
+for (const base of threadBases) {
   if (!fs.existsSync(base)) continue;
   const walk = (dir: string, depth: number) => {
     if (depth > 3) return;
@@ -455,14 +609,14 @@ function workgroupThreadSlugs(): Set<string> | null {
     const out = execFileSync(
       'pnpm',
       [
-        'exec', 'tsx', path.join(ROOT, 'scripts', 'q.ts'), centralDb,
+        'exec', 'tsx', path.join(import.meta.dirname, 'q.ts'), centralDb,
         `SELECT DISTINCT COALESCE(s.thread_id, 'dm-' || mg.platform_id) AS tid
            FROM sessions s
            JOIN messaging_groups mg ON mg.id = s.messaging_group_id
            JOIN agent_groups ag ON ag.id = s.agent_group_id
           WHERE COALESCE(ag.workgroup_id, ag.folder) = '${WG.replace(/'/g, "''")}'`,
       ],
-      { cwd: ROOT, stdio: 'pipe', encoding: 'utf-8', timeout: 60_000 },
+      { cwd: path.join(import.meta.dirname, '..'), stdio: 'pipe', encoding: 'utf-8', timeout: 60_000 },
     ).toString();
     return new Set(
       out
@@ -483,7 +637,7 @@ if (fs.existsSync(threadsBase)) {
     .readdirSync(threadsBase, { withFileTypes: true })
     .filter((e) => e.isDirectory() && !e.name.startsWith('wg-'))
     .map((e) => e.name);
-  const owned = workgroupThreadSlugs();
+  const owned = ownedThreadSlugs;
   if (owned === null) {
     manualFlags.push(
       `thread-namespace: central DB unavailable — ${legacyDirs.length} legacy thread dir(s) left un-namespaced`,
@@ -524,6 +678,11 @@ act('rescue-index', `write .rescues/${RUN}/INDEX.md + workgroup memory note`, ()
     '',
     'Full pre-migration archives (git bundle + tree tarball + the old canonical',
     `itself) are in \`.rescues/${RUN}/\`. Nothing was deleted.`,
+    '',
+    'NanoClaw-injected artifacts (.claude/, CLAUDE.md, AGENTS.md, .mcp.json,',
+    '.gitignore edits) were NOT committed to rescue branches — they are',
+    'pollution, not work. If one of those was a deliberate edit, recover it',
+    'from the tree tarball or the moved canonical above.',
     manualFlags.length ? `\n## Needs manual attention\n\n${manualFlags.map((f) => `- ${f}`).join('\n')}` : '',
   ].join('\n');
   fs.writeFileSync(path.join(RESCUES, 'INDEX.md'), body);
@@ -544,17 +703,22 @@ if (!EXECUTE) {
 
 ensureQuiesced();
 console.log('\nExecuting…');
-for (const p of plan) {
-  if (!p.run) continue;
-  try {
-    p.run();
-    console.log(`  ✓ [${p.kind}] ${p.detail}`);
-  } catch (e) {
-    console.error(`  ✗ [${p.kind}] ${p.detail}\n    ${e instanceof Error ? e.message : String(e)}`);
-    console.error('Aborting — state so far is preserved (archives are written before any destructive step).');
-    process.exit(3);
+let aborted = false;
+withMigrationLock(() => {
+  for (const p of plan) {
+    if (!p.run) continue;
+    try {
+      p.run();
+      console.log(`  ✓ [${p.kind}] ${p.detail}`);
+    } catch (e) {
+      console.error(`  ✗ [${p.kind}] ${p.detail}\n    ${e instanceof Error ? e.message : String(e)}`);
+      console.error('Aborting — state so far is preserved (archives are written before any destructive step).');
+      aborted = true; // no process.exit inside the lock — finally must release it
+      break;
+    }
   }
-}
+});
+if (aborted) process.exit(3);
 if (manualFlags.length) {
   console.log('\nNeeds manual attention:');
   for (const f of manualFlags) console.log(`  - ${f}`);

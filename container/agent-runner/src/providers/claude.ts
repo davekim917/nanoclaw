@@ -1141,8 +1141,8 @@ export function createBlockGitCloneHook(): HookCallback {
 // hook exists so a blocked agent gets a useful message instead of EROFS.
 // Shared core owns the policy; inline fallback mirrors it fail-closed.
 const SNAPSHOT_MUTATION_RE =
-  /\bgit\b[^|;&]*\b(checkout|switch|commit|reset|restore|clean|merge|rebase|cherry-pick|stash|am|apply)\b/;
-const SNAPSHOT_PATH_RE = /\/workspace\/workgroup\/(?!\.repos\b|\.worktrees\b|\.rescues\b|memory\b)/;
+  /\bgit\b(?:\s+(?:-C|--work-tree|--git-dir)\s+\S+|\s+-c\s+\S+|\s+--\S+)*\s+(checkout|switch|commit|reset|restore|clean|merge|rebase|cherry-pick|stash|am|apply|update-ref|branch|worktree)\b/;
+const SNAPSHOT_PATH_RE = /\/workspace\/workgroup\/(?!\.worktrees\b|memory\b)/;
 const SNAPSHOT_MUTATION_BLOCK_MSG =
   'Git working-tree mutations under /workspace/workgroup/<repo> are blocked: that path is a read-only snapshot of origin/HEAD maintained by the host. Use `create_worktree` and work in /workspace/worktrees/<repo>; shared long-lived checkouts belong under /workspace/workgroup/.worktrees/.';
 

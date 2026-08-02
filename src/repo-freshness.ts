@@ -84,6 +84,12 @@ export function discoverMirrors(root: string = workgroupsRoot()): MirrorTarget[]
   }
   for (const wg of wgs) {
     const reposDir = path.join(root, wg, '.repos');
+    // A live migration owns this workgroup's repo store for its duration —
+    // advancing snapshots mid-swap would race the cutover renames.
+    if (fs.existsSync(path.join(reposDir, '.migration-lock'))) {
+      log.info('repo-freshness: migration lock present, skipping workgroup', { workgroupId: wg });
+      continue;
+    }
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(reposDir, { withFileTypes: true });
@@ -130,7 +136,11 @@ export async function refreshOne(target: MirrorTarget): Promise<RepoFreshness> {
   // created before this setting existed.
   await tryGit(mirrorPath, ['config', 'gc.auto', '0']);
 
-  const fetched = await tryGit(mirrorPath, ['fetch', 'origin', '--prune']);
+  // NO --prune: migration-created mirrors hold parked/rescue branches that
+  // exist nowhere on origin; with the refs/heads mirror refspec, prune would
+  // delete them. Remote-deleted branches lingering in the mirror are noise,
+  // not risk — the snapshot tracks HEAD only.
+  const fetched = await tryGit(mirrorPath, ['fetch', 'origin']);
   const fetchOk = fetched !== null;
   if (!fetchOk) {
     log.error('repo-freshness: mirror fetch FAILED — snapshot is stale', { ...ctx, mirrorPath });

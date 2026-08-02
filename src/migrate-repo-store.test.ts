@@ -9,6 +9,7 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import BetterSqlite3 from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 const SCRIPT = path.join(process.cwd(), 'scripts', 'migrate-repo-store.ts');
@@ -43,6 +44,20 @@ beforeEach(() => {
   dataDir = path.join(root, 'data');
   wgDir = path.join(dataDir, 'workgroups', 'testwg');
   fs.mkdirSync(wgDir, { recursive: true });
+
+  // Minimal central DB — the script scopes thread-worktree conversion and
+  // legacy-dir namespacing by DB ownership and fail-safes to skipping both
+  // without it.
+  const db = new BetterSqlite3(path.join(dataDir, 'v2.db'));
+  db.exec(`
+    CREATE TABLE agent_groups (id TEXT PRIMARY KEY, folder TEXT, workgroup_id TEXT);
+    CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, platform_id TEXT);
+    CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_group_id TEXT, messaging_group_id TEXT, thread_id TEXT);
+    INSERT INTO agent_groups VALUES ('ag-t', 'testwg-agent', 'testwg');
+    INSERT INTO messaging_groups VALUES ('mg-t', 'slack:CTEST20001');
+    INSERT INTO sessions VALUES ('sess-t', 'ag-t', 'mg-t', 'slack:CTEST20001:123');
+  `);
+  db.close();
 
   // Real remote (bare) with two commits on main.
   remote = path.join(root, 'remote', 'PROJ.git');
@@ -97,7 +112,7 @@ afterEach(() => {
 });
 
 describe('migrate-repo-store', () => {
-  it('dry-run prints the plan and changes nothing', () => {
+  it('dry-run prints the plan and changes nothing', { timeout: 120_000 }, () => {
     const out = runMigration(false);
     expect(out).toContain('DRY-RUN');
     expect(out).toContain('rescue-archive');
@@ -107,7 +122,7 @@ describe('migrate-repo-store', () => {
     expect(git(canonical, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('XZO-210-obt-drift-fix');
   });
 
-  it('execute converts the layout and preserves every piece of parked work', () => {
+  it('execute converts the layout and preserves every piece of parked work', { timeout: 120_000 }, () => {
     const out = runMigration(true);
     expect(out).toContain('Done.');
 
@@ -138,12 +153,9 @@ describe('migrate-repo-store', () => {
     expect(git(movedWt, ['show', 'HEAD:followup.sql'])).toBe('select 4');
     expect(fs.lstatSync(path.join(wgDir, 'PROJ-pr213-review')).isSymbolicLink()).toBe(true);
 
-    // Thread worktree: transplanted to a standalone clone IN PLACE,
-    // uncommitted dirt intact. No central DB in this fixture, so the
-    // namespace move fail-safes to leaving the legacy path (the DB-scoped
-    // move is exercised against live data in the dry-run).
-    expect(out).toContain('legacy thread dir(s) left un-namespaced');
-    const nsThreadWt = path.join(dataDir, 'v2-threads', 'slack_CTEST20001_123', 'worktrees', 'PROJ');
+    // Thread worktree: transplanted to a standalone clone in place, then the
+    // DB-owned legacy dir moves under the wg namespace, dirt intact.
+    const nsThreadWt = path.join(dataDir, 'v2-threads', 'wg-testwg', 'slack_CTEST20001_123', 'worktrees', 'PROJ');
     expect(fs.statSync(path.join(nsThreadWt, '.git')).isDirectory()).toBe(true);
     expect(git(nsThreadWt, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('thread-sess-PROJ');
     expect(fs.readFileSync(path.join(nsThreadWt, 'wip.sql'), 'utf-8')).toContain('uncommitted');

@@ -735,4 +735,23 @@ describe('createBlockSnapshotMutationHook (inline fallback — no core mounted)'
       expect(r.permissionDecision).toBeUndefined();
     }
   });
+
+  it('does not false-positive on mutation verbs in ARGUMENTS of read-only commands', async () => {
+    const r = await runBashHook(
+      createBlockSnapshotMutationHook(),
+      'git -C /workspace/workgroup/XZO log --grep commit --oneline',
+    );
+    expect(r.permissionDecision).toBeUndefined();
+  });
+
+  it('blocks ref surgery aimed at the mirror and rescue namespaces', async () => {
+    for (const cmd of [
+      'git -C /workspace/workgroup/.repos/XZO.git update-ref refs/heads/main deadbeef',
+      'git -C /workspace/workgroup/.repos/XZO.git branch -D some-branch',
+      'cd /workspace/workgroup/.rescues/2026 && git reset --hard HEAD~1',
+    ]) {
+      const r = await runBashHook(createBlockSnapshotMutationHook(), cmd);
+      expect(r.permissionDecision).toBe('deny');
+    }
+  });
 });
