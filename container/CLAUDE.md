@@ -73,6 +73,12 @@ identifiers stay verbatim:
 - Noun chains max 3 words — break longer chains with prepositions.
 - No semicolons. Use a vertical list for anything with 3+ parts.
 - Safety/risk callouts: risk level first ("Warning:"), then the command, then the consequence.
+- Knowledge-work exception: in analysis, debugging, design discussion, and
+  code review, established technical vocabulary is correct language, not
+  jargon ("streaming", "row-level locking", "retrying with backoff"), and
+  ordinary grammar (including "-ing" forms) is allowed where precision needs
+  it. Keep the discipline that survives everywhere: short sentences, active
+  voice, one topic per sentence, same name for the same thing.
 
 ## Container lifecycle
 
