@@ -2783,7 +2783,7 @@ async function buildContainerArgs(
   // NANOCLAW_EFFORT_OVERRIDE is an OPERATOR override (per-channel wiring or
   // per-group container.json) — injected only when one is actually set.
   // When absent, the claude provider applies per-model-family defaults
-  // (opus/sonnet → xhigh, fable → high, haiku → none; see
+  // (opus/sonnet → xhigh, fable → medium, haiku → none; see
   // defaultEffortForModel in agent-runner claude.ts). The old unconditional
   // `?? DEFAULT_EFFORT` fold made every model inherit one blanket value,
   // which breaks per-family defaults (e.g. haiku has no effort surface) and
