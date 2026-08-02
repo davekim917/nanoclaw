@@ -507,3 +507,166 @@ describe('getReposDir / resolveRepoDir / clone_repo', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Mirror + standalone-clone topology (repo-store rework)
+// ---------------------------------------------------------------------------
+
+describe('mirror topology', () => {
+  let root: string;
+  let workgroupDir: string;
+  let worktreesDir: string;
+  const ENV_KEYS = [
+    'NANOCLAW_AGENT_DIR_OVERRIDE',
+    'NANOCLAW_WORKTREES_DIR_OVERRIDE',
+    'NANOCLAW_WORKGROUP_DIR_OVERRIDE',
+    'NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE',
+    'NANOCLAW_WORKGROUP_ID',
+  ] as const;
+  let savedEnv: Record<string, string | undefined>;
+
+  const git = (cwd: string, args: string[]) =>
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, stdio: 'pipe' })
+      .toString()
+      .trim();
+
+  /** Bare fixture "remote" seeded with one commit on main. */
+  function makeRemote(dir: string): string {
+    const work = `${dir}-work`;
+    mkdirSync(work, { recursive: true });
+    git(work, ['init', '-q', '-b', 'main']);
+    writeFileSync(join(work, 'README.md'), 'hello\n');
+    git(work, ['add', '-A']);
+    git(work, ['commit', '-q', '-m', 'init']);
+    execFileSync('git', ['clone', '-q', '--bare', work, dir], { stdio: 'pipe' });
+    rmSync(work, { recursive: true, force: true });
+    return dir;
+  }
+
+  /** What clone_repo produces: bare mirror of <remote> under .repos/. */
+  function makeMirror(name: string, remote: string): string {
+    const mirror = join(workgroupDir, '.repos', `${name}.git`);
+    mkdirSync(join(workgroupDir, '.repos'), { recursive: true });
+    execFileSync('git', ['clone', '-q', '--bare', remote, mirror], { stdio: 'pipe' });
+    execFileSync('git', ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*'], {
+      cwd: mirror,
+      stdio: 'pipe',
+    });
+    return mirror;
+  }
+
+  beforeEach(() => {
+    savedEnv = {};
+    for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
+    root = mkdtempSync(join(tmpdir(), 'gw-mirror-'));
+    workgroupDir = join(root, 'workgroup');
+    worktreesDir = join(root, 'worktrees');
+    mkdirSync(workgroupDir, { recursive: true });
+    process.env.NANOCLAW_AGENT_DIR_OVERRIDE = join(root, 'agent');
+    process.env.NANOCLAW_WORKGROUP_DIR_OVERRIDE = workgroupDir;
+    process.env.NANOCLAW_WORKTREES_DIR_OVERRIDE = worktreesDir;
+    process.env.NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE = join(root, 'graphify-cache');
+    delete process.env.NANOCLAW_WORKGROUP_ID;
+  });
+
+  afterEach(() => {
+    for (const k of ENV_KEYS) {
+      if (savedEnv[k] !== undefined) process.env[k] = savedEnv[k];
+      else delete process.env[k];
+    }
+    try { rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  test('test_mirror_create_worktree_standalone_clone: clone from mirror, origin repointed at real remote', async () => {
+    const remote = makeRemote(join(root, 'remote', 'proj.git'));
+    makeMirror('proj', remote);
+    const res = await createWorktreeTool.handler({ repo: 'proj' });
+    expect(res.isError).toBeUndefined();
+    const wt = join(worktreesDir, 'proj');
+    // Standalone clone: .git is a DIRECTORY (self-contained metadata), not a
+    // linked-worktree pointer file.
+    expect(existsSync(join(wt, '.git', 'HEAD'))).toBe(true);
+    expect(git(wt, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('thread-session-proj');
+    expect(git(wt, ['config', '--get', 'remote.origin.url'])).toBe(remote);
+  });
+
+  test('test_mirror_reuse_rebases_onto_advanced_origin', async () => {
+    const remote = makeRemote(join(root, 'remote', 'proj.git'));
+    makeMirror('proj', remote);
+    await createWorktreeTool.handler({ repo: 'proj' });
+    // Advance the remote past the clone's base.
+    const scratch = join(root, 'scratch');
+    execFileSync('git', ['clone', '-q', remote, scratch], { stdio: 'pipe' });
+    writeFileSync(join(scratch, 'new.txt'), 'more\n');
+    git(scratch, ['add', '-A']);
+    git(scratch, ['commit', '-q', '-m', 'advance']);
+    git(scratch, ['push', '-q', 'origin', 'main']);
+    const remoteTip = git(scratch, ['rev-parse', 'HEAD']);
+
+    const res = await createWorktreeTool.handler({ repo: 'proj' });
+    expect(res.isError).toBeUndefined();
+    const wt = join(worktreesDir, 'proj');
+    // Thread branch rebased onto fresh origin/HEAD even though the MIRROR was
+    // never fetched — the clone talks to the real remote directly.
+    expect(git(wt, ['rev-parse', 'HEAD'])).toBe(remoteTip);
+  });
+
+  test('test_mirror_legacy_linked_worktree_refused', async () => {
+    const remote = makeRemote(join(root, 'remote', 'proj.git'));
+    makeMirror('proj', remote);
+    const wt = join(worktreesDir, 'proj');
+    mkdirSync(wt, { recursive: true });
+    writeFileSync(join(wt, '.git'), 'gitdir: /workspace/workgroup/proj/.git/worktrees/proj\n');
+    const res = await createWorktreeTool.handler({ repo: 'proj' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('legacy linked worktree');
+    // Nothing destroyed.
+    expect(existsSync(join(wt, '.git'))).toBe(true);
+  });
+
+  test('test_mirror_commit_and_push_flow', async () => {
+    const remote = makeRemote(join(root, 'remote', 'proj.git'));
+    makeMirror('proj', remote);
+    await createWorktreeTool.handler({ repo: 'proj' });
+    const wt = join(worktreesDir, 'proj');
+    writeFileSync(join(wt, 'feature.txt'), 'work\n');
+    const commitRes = await gitCommitTool.handler({ repo: 'proj', message: 'feat: work' });
+    expect(commitRes.isError).toBeUndefined();
+    const pushRes = await gitPushTool.handler({ repo: 'proj' });
+    expect(pushRes.isError).toBeUndefined();
+    // Branch landed on the REAL remote, not the mirror.
+    const remoteBranches = git(remote, ['branch', '--list', 'thread-session-proj']);
+    expect(remoteBranches).toContain('thread-session-proj');
+  });
+
+  test('test_mirror_wins_over_snapshot_clone_at_root', async () => {
+    const remote = makeRemote(join(root, 'remote', 'proj.git'));
+    const mirror = makeMirror('proj', remote);
+    // Migrated layout: browsing snapshot (a real clone, detached) at the old
+    // canonical path. resolveRepoDir would match it; the mirror must win.
+    const snapshot = join(workgroupDir, 'proj');
+    execFileSync('git', ['clone', '-q', mirror, snapshot], { stdio: 'pipe' });
+    git(snapshot, ['checkout', '-q', '--detach']);
+    const res = await createWorktreeTool.handler({ repo: 'proj' });
+    expect(res.isError).toBeUndefined();
+    const wt = join(worktreesDir, 'proj');
+    // Clone origin is the real remote (via mirror config), NOT the snapshot.
+    expect(git(wt, ['config', '--get', 'remote.origin.url'])).toBe(remote);
+  });
+
+  test('test_clone_repo_mirror_idempotent_and_origin_guard', async () => {
+    const mirror = join(workgroupDir, '.repos', 'proj.git');
+    mkdirSync(mirror, { recursive: true });
+    execFileSync('git', ['init', '-q', '--bare', mirror], { stdio: 'pipe' });
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/acme/proj.git'], {
+      cwd: mirror,
+      stdio: 'pipe',
+    });
+    const okRes = await cloneRepoTool.handler({ url: 'https://github.com/acme/proj' });
+    expect(okRes.isError).toBeUndefined();
+    expect(okRes.content[0].text).toContain('already present (mirror');
+    const badRes = await cloneRepoTool.handler({ url: 'https://github.com/other/proj' });
+    expect(badRes.isError).toBe(true);
+    expect(badRes.content[0].text).toContain('does not match');
+  });
+});
