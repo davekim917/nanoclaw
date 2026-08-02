@@ -51,28 +51,45 @@ export interface WriteMessageOut {
  * drift can reach the channel. Non-chat kinds (system actions, processing
  * acks) pass through untouched.
  */
-// null = unlimited; 0 = fully muted; N>0 = at most N chat sends this turn
+// null = unlimited; 0 = fully muted; N>0 = at most N new chat posts this turn
 // (e.g. a standup task whose contract is ONE digest post — the trailing
 // "summary for the work log" message gets dropped here instead of relying
 // on instructions, which demonstrably do not hold).
+// Edits and reactions (content carries an `operation` field) are exempt: the
+// budget caps how many messages land in the channel, and amending an
+// already-sent message is the sanctioned way to add essential detail after
+// the budget is spent.
 let chatBudget: number | null = null;
+let chatLimitInitial: number | null = null;
 export function setChatMute(muted: boolean): void {
-  chatBudget = muted ? 0 : null;
+  setChatLimit(muted ? 0 : null);
 }
 export function setChatLimit(limit: number | null): void {
   chatBudget = limit;
+  chatLimitInitial = limit;
 }
 export function isChatMuted(): boolean {
-  return chatBudget === 0;
+  return chatLimitInitial === 0;
+}
+export function chatBudgetExhausted(): boolean {
+  return chatBudget !== null && chatBudget <= 0;
 }
 
 export function writeMessageOut(msg: WriteMessageOut): number {
   if (msg.kind === 'chat' && chatBudget !== null) {
-    if (chatBudget <= 0) {
-      console.error(`[messages-out] chat budget exhausted for this task — dropped outbound message ${msg.id}`);
-      return -1;
+    let operation: string | undefined;
+    try {
+      operation = (JSON.parse(msg.content) as { operation?: string }).operation;
+    } catch {
+      // non-JSON content — treat as a new post
     }
-    chatBudget -= 1;
+    if (!operation) {
+      if (chatBudget <= 0) {
+        console.error(`[messages-out] chat budget exhausted for this task — dropped outbound message ${msg.id}`);
+        return -1;
+      }
+      chatBudget -= 1;
+    }
   }
   const outbound = getOutboundDb();
   const inbound = getInboundDb();

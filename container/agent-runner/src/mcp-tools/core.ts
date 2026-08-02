@@ -12,7 +12,20 @@ import path from 'path';
 
 import { awaitDeliveryAck } from '../db/delivery-acks.js';
 import { findByName, getAllDestinations } from '../destinations.js';
-import { isChatMuted, getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
+import { chatBudgetExhausted, isChatMuted, getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
+
+// Shared refusal copy for send paths under the physical chat budget. Edits and
+// reactions stay allowed — amending the already-sent message is the sanctioned
+// escape hatch once the budget is spent.
+function chatSendDenial(): string | null {
+  if (isChatMuted()) {
+    return 'Chat sends are disabled for this task (muteChat). Alerts go through the outbox file contract; your completion report goes in the ledger.';
+  }
+  if (chatBudgetExhausted()) {
+    return 'The per-turn chat send budget for this scheduled task is used up. Do not post follow-up or summary messages. If something essential is missing, amend the message you already sent with edit_message.';
+  }
+  return null;
+}
 import { getCurrentInReplyTo } from '../db/session-state.js';
 import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { registerTools } from './server.js';
@@ -159,11 +172,8 @@ export const sendMessage: McpToolDefinition = {
     if ('error' in routing) return err(routing.error);
 
     const id = generateId();
-    if (isChatMuted()) {
-      return err(
-        'Chat sends are disabled for this task (muteChat). Alerts go through the outbox file contract; your completion report goes in the ledger.',
-      );
-    }
+    const denial = chatSendDenial();
+    if (denial) return err(denial);
     const seq = writeMessageOut({
       id,
       in_reply_to: getCurrentInReplyTo(),
@@ -198,6 +208,9 @@ export const sendFile: McpToolDefinition = {
   async handler(args) {
     const filePath = args.path as string;
     if (!filePath) return err('path is required');
+
+    const denial = chatSendDenial();
+    if (denial) return err(denial);
 
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);

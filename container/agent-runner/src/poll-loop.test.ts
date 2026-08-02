@@ -157,6 +157,28 @@ describe('chat budget from task content', () => {
     applyFlagBatch(messages, extractRouting(messages), 'claude');
     expect(isChatMuted()).toBe(false);
   });
+
+  it('budget counts new posts only — edits and reactions stay allowed after exhaustion', () => {
+    const { setChatLimit, chatBudgetExhausted, writeMessageOut } = require('./db/messages-out.js');
+    setChatLimit(1);
+    expect(chatBudgetExhausted()).toBe(false);
+
+    const first = writeMessageOut({ id: 'b-post-1', kind: 'chat', content: JSON.stringify({ text: 'digest' }) });
+    expect(first).toBeGreaterThan(0);
+    expect(chatBudgetExhausted()).toBe(true);
+
+    const second = writeMessageOut({ id: 'b-post-2', kind: 'chat', content: JSON.stringify({ text: 'follow-up summary' }) });
+    expect(second).toBe(-1);
+
+    const edit = writeMessageOut({
+      id: 'b-edit-1',
+      kind: 'chat',
+      content: JSON.stringify({ operation: 'edit', messageId: 'x', text: 'digest v2' }),
+    });
+    expect(edit).toBeGreaterThan(0);
+
+    setChatLimit(null);
+  });
 });
 
 describe('fast-mode flag application', () => {
