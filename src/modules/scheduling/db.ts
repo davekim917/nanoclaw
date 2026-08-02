@@ -137,12 +137,24 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
   const updateRows = db.transaction(() => {
     const rows = db
       .prepare(
-        "SELECT id, content FROM messages_in WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status IN ('pending', 'paused')",
+        "SELECT id, content, recurrence FROM messages_in WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status IN ('pending', 'paused')",
       )
-      .all(taskId, taskId) as Array<{ id: string; content: string }>;
+      .all(taskId, taskId) as Array<{ id: string; content: string; recurrence: string | null }>;
+
+    // Schedule fields (recurrence / process_after) belong to the series'
+    // recurring chain. A queued `run` row shares the series_id but carries
+    // recurrence = NULL; stamping a recurrence onto it would rearm it as a
+    // SECOND recurring chain and duplicate the series forever. When the
+    // series has a recurring row, schedule edits target only those rows;
+    // a pure one-shot (no recurring row anywhere) keeps the old behavior so
+    // `--process-after` can still reschedule it. Content edits apply to
+    // every live row either way — a queued run should execute the new prompt.
+    const hasRecurringRow = rows.some((r) => r.recurrence != null);
 
     let touched = 0;
     for (const row of rows) {
+      const applySchedule = (setProcessAfter || setRecurrence) && (!hasRecurringRow || row.recurrence != null);
+      if (!applySchedule && !mergeContent) continue;
       let content = row.content;
       if (mergeContent) {
         const parsed = JSON.parse(row.content) as Record<string, unknown>;
@@ -164,11 +176,11 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
       db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${row.id}`);
       const sets: string[] = ['seq = ?', 'trigger = 0', 'content = ?'];
       const params: unknown[] = [nextEvenSeq(db), content];
-      if (setProcessAfter) {
+      if (setProcessAfter && applySchedule) {
         sets.push('process_after = ?');
         params.push(update.processAfter);
       }
-      if (setRecurrence) {
+      if (setRecurrence && applySchedule) {
         sets.push('recurrence = ?');
         params.push(update.recurrence);
       }

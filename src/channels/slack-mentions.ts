@@ -239,10 +239,14 @@ export function resolveSlackMentions(
   // `\w` would capture `@Jos`, and a truncated prefix that happens to be a
   // registered alias would ping the wrong person. Same classes in the
   // lookbehind so a mention can't start mid-word after a Unicode letter.
+  // The lookbehind also excludes URL-structural chars (`=?&#` on top of
+  // `/:`) so `?owner=@alice`, `&cc=@alice`, and `#@alice` fragments inside
+  // URLs stay literal — `transformOutsideProtectedRegions` shields only
+  // code spans, so URL safety lives here.
   const WORD = String.raw`\w\p{L}\p{M}\p{N}`;
   const USERNAME = String.raw`[${WORD}-]+(?:\.[${WORD}-]+)*`;
-  const BRACKETED_RE = new RegExp(String.raw`(?<![${WORD}/:])<@(${USERNAME})>`, 'gu');
-  const BARE_RE = new RegExp(String.raw`(?<![${WORD}/:])@(${USERNAME})`, 'gu');
+  const BRACKETED_RE = new RegExp(String.raw`(?<![${WORD}/:=?&#])<@(${USERNAME})>`, 'gu');
+  const BARE_RE = new RegExp(String.raw`(?<![${WORD}/:=?&#])@(${USERNAME})`, 'gu');
 
   return transformOutsideProtectedRegions(text, (segment) => {
     const rewriteByName = (match: string, name: string): string => {

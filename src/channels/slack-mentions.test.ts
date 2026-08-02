@@ -412,6 +412,28 @@ describe('resolveSlackMentions', () => {
     it('unknown Unicode names stay untouched', () => {
       expect(resolveSlackMentions('ping @Zoë', 'slack-example-labs', makeBots(), makeHumans())).toBe('ping @Zoë');
     });
+
+    it('does not rewrite registered names inside URL query strings or fragments', () => {
+      const urls = [
+        'see https://example.com/prs?owner=@Opal for the list',
+        'filter https://example.com/prs?a=1&assignee=@Opal too',
+        'anchor https://example.com/board#@Opal stays',
+      ];
+      for (const u of urls) {
+        expect(resolveSlackMentions(u, 'slack-example-labs', makeBots(), makeHumans())).toBe(u);
+      }
+    });
+
+    it('punctuation-rich names degrade to unresolved, never a wrong ping', () => {
+      // `@O'Brien` captures only `@O`; "o" is not a registered alias, so the
+      // text stays literal — degraded but safe. (Exotic aliases with spaces/
+      // apostrophes are out of scope for the rewriter; ambiguity-drop plus
+      // this test guard the failure mode that matters: pinging the wrong
+      // person.)
+      expect(resolveSlackMentions("ask @O'Brien about it", 'slack-example-labs', makeBots(), makeHumans())).toBe(
+        "ask @O'Brien about it",
+      );
+    });
   });
 });
 

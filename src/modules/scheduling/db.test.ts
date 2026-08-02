@@ -364,6 +364,70 @@ describe('updateTask', () => {
     expect(row.process_after).toBe('2026-02-01T00:00:00Z');
   });
 
+  it('schedule edits skip a queued run-now row — no second recurring chain', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-1',
+      seriesId: 'task-1',
+      processAfter: '2026-01-01T00:00:00Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'p' }),
+    });
+    // `ncl tasks run` queues an extra occurrence: pending, same series,
+    // recurrence NULL. A recurrence update must not stamp it — that would
+    // rearm it as a duplicate series after it completes.
+    insertTaskRow(db, {
+      id: 'task-1-run-abc',
+      seriesId: 'task-1',
+      processAfter: '2026-01-01T00:00:01Z',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'p' }),
+    });
+
+    updateTask(db, 'task-1', { recurrence: '0 18 * * *', processAfter: '2026-02-01T00:00:00Z' });
+
+    const canonical = db.prepare('SELECT recurrence, process_after FROM messages_in WHERE id = ?').get('task-1') as {
+      recurrence: string;
+      process_after: string;
+    };
+    expect(canonical.recurrence).toBe('0 18 * * *');
+    expect(canonical.process_after).toBe('2026-02-01T00:00:00Z');
+    const runNow = db
+      .prepare('SELECT recurrence, process_after FROM messages_in WHERE id = ?')
+      .get('task-1-run-abc') as {
+      recurrence: string | null;
+      process_after: string;
+    };
+    expect(runNow.recurrence).toBeNull();
+    expect(runNow.process_after).toBe('2026-01-01T00:00:01Z');
+  });
+
+  it('content edits still reach a queued run-now row', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-1',
+      seriesId: 'task-1',
+      processAfter: '2026-01-01T00:00:00Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'old' }),
+    });
+    insertTaskRow(db, {
+      id: 'task-1-run-abc',
+      seriesId: 'task-1',
+      processAfter: '2026-01-01T00:00:01Z',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'old' }),
+    });
+
+    const touched = updateTask(db, 'task-1', { prompt: 'new' });
+
+    expect(touched).toBe(2);
+    for (const id of ['task-1', 'task-1-run-abc']) {
+      const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(id) as { content: string };
+      expect(JSON.parse(row.content).prompt).toBe('new');
+    }
+  });
+
   it('clears recurrence when null is passed', () => {
     const db = freshDb();
     insertTaskRow(db, {
