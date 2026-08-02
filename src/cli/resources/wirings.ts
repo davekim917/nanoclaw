@@ -9,6 +9,7 @@ import { hasDeclaredChannelDefaults } from '../../channels/channel-registry.js';
 import { getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import {
+  assertSameWorkgroupWiring,
   ensureAgentDestinationForWiring,
   getMessagingGroup,
   getMessagingGroupAgentByPair,
@@ -260,6 +261,7 @@ registerResource({
         const colNames = Object.keys(values);
         const placeholders = colNames.map((c) => `@${c}`);
         const db = getDb();
+        assertSameWorkgroupWiring(values.messaging_group_id as string, agId);
         db.transaction(() => {
           db.prepare(
             `INSERT INTO messaging_group_agents (${colNames.join(', ')}) VALUES (${placeholders.join(', ')})`,

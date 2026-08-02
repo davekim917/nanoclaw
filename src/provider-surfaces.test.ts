@@ -614,3 +614,38 @@ describe('worker agent def sync (orchestrator roster)', () => {
     );
   });
 });
+
+describe('symlink overlay workgroup allowlist', () => {
+  it('mounts same-workgroup targets and refuses outside targets', () => {
+    const ag = group('ag-sym', 'sym-main');
+    const sib = group('ag-sym-sib', 'sym-sib');
+    const outsider = group('ag-out', 'out-group');
+    createAgentGroup(ag);
+    createAgentGroup(sib);
+    createAgentGroup(outsider);
+    assignWorkgroup(ag, 'wg-sym');
+    assignWorkgroup(sib, 'wg-sym');
+    assignWorkgroup(outsider, 'wg-other');
+    ensureContainerConfig(ag.id);
+
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    const sibTarget = path.join(GROUPS_DIR, sib.folder, 'SHARED-REPO');
+    const outsiderTarget = path.join(GROUPS_DIR, outsider.folder, 'SECRET');
+    const hostTarget = path.join(TEST_ROOT, 'host-secret');
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.mkdirSync(sibTarget, { recursive: true });
+    fs.mkdirSync(outsiderTarget, { recursive: true });
+    fs.mkdirSync(hostTarget, { recursive: true });
+    // Sibling share (legit clone-as-codex pattern), cross-workgroup theft,
+    // and arbitrary host path — only the first may mount.
+    fs.symlinkSync(sibTarget, path.join(groupDir, 'SHARED-REPO'));
+    fs.symlinkSync(outsiderTarget, path.join(groupDir, 'STOLEN'));
+    fs.symlinkSync(hostTarget, path.join(groupDir, 'HOST'));
+
+    const mounts = buildMounts(ag, session('s-sym', ag.id), containerConfig(), 'claude', {}, 'wg-sym');
+    const containerPaths = mounts.map((m) => m.containerPath);
+    expect(containerPaths).toContain('/workspace/agent/SHARED-REPO');
+    expect(containerPaths).not.toContain('/workspace/agent/STOLEN');
+    expect(containerPaths).not.toContain('/workspace/agent/HOST');
+  });
+});

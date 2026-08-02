@@ -45,6 +45,18 @@ vi.mock('./config.js', async () => {
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-host' };
 });
 
+function sameWorkgroup(wgId: string, agentGroupIds: string[]): void {
+  getDb()
+    .prepare(
+      `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
+       VALUES (?, ?, '[]', ?, datetime('now'))`,
+    )
+    .run(wgId, wgId, agentGroupIds[0]);
+  getDb()
+    .prepare(`UPDATE agent_groups SET workgroup_id = ? WHERE id IN (${agentGroupIds.map(() => '?').join(',')})`)
+    .run(wgId, ...agentGroupIds);
+}
+
 function now() {
   return new Date().toISOString();
 }
@@ -541,6 +553,8 @@ describe('router', () => {
       agent_provider: null,
       created_at: now(),
     });
+    // Fan-out siblings must share a workgroup (assertSameWorkgroupWiring).
+    sameWorkgroup('wg-fanout', ['ag-1', 'ag-2']);
     createMessagingGroupAgent({
       id: 'mga-2',
       messaging_group_id: 'mg-1',
@@ -1102,6 +1116,8 @@ describe('routing metadata preservation', () => {
       agent_provider: null,
       created_at: now(),
     });
+    // Fan-out siblings must share a workgroup (assertSameWorkgroupWiring).
+    sameWorkgroup('wg-fanout-2', ['ag-1', 'ag-2']);
     createMessagingGroupAgent({
       id: 'mga-2',
       messaging_group_id: 'mg-1',

@@ -54,7 +54,12 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 // ensureOpus1mSuffix — see its use below.
 import { resolveEffectiveModel, DEFAULT_OPUS_MODEL, DEFAULT_SONNET_MODEL, DEFAULT_HAIKU_MODEL } from './flag-parser.js';
 import { readEnvFileMatching } from './env.js';
-import { getAgentGroup, getWorkgroupOnecliSecrets, getWorkgroupOnecliSecretsById } from './db/agent-groups.js';
+import {
+  getAgentGroup,
+  getAllAgentGroups,
+  getWorkgroupOnecliSecrets,
+  getWorkgroupOnecliSecretsById,
+} from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-projections.js';
@@ -1528,6 +1533,29 @@ export function buildMounts(
   // .claude-shared.md -> /app/CLAUDE.md) are skipped: realpathSync fails
   // on the host because /app doesn't exist there, and the existing /app
   // mount makes the symlink work inside the container anyway.
+  //
+  // SECURITY: the group dir is mounted RW at /workspace/agent, so an agent can
+  // plant a symlink here pointing anywhere on the host and it would be
+  // RW-mounted into its own container on the next spawn. Only overlay targets
+  // that this agent is entitled to see anyway: its own group dir, a sibling
+  // group dir in the SAME workgroup, or the workgroup shared tree. Anything
+  // else is skipped with a loud warning.
+  const overlayWgId = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
+  const allowedOverlayRoots = [
+    workgroupSharedDir(overlayWgId),
+    ...getAllAgentGroups()
+      .filter((g) => (g.workgroup_id ?? g.folder) === overlayWgId)
+      .map((g) => path.resolve(GROUPS_DIR, g.folder)),
+    groupDir,
+  ].map((p) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  });
+  const isAllowedOverlayTarget = (target: string): boolean =>
+    allowedOverlayRoots.some((root) => target === root || target.startsWith(root + path.sep));
   for (const entry of fs.readdirSync(groupDir, { withFileTypes: true })) {
     if (!entry.isSymbolicLink()) continue;
     const linkPath = path.join(groupDir, entry.name);
@@ -1535,6 +1563,14 @@ export function buildMounts(
     try {
       realTarget = fs.realpathSync(linkPath);
     } catch {
+      continue;
+    }
+    if (!isAllowedOverlayTarget(realTarget)) {
+      log.warn('Refusing symlink-overlay mount outside workgroup boundary', {
+        agentGroupId: agentGroup.id,
+        link: linkPath,
+        target: realTarget,
+      });
       continue;
     }
     mounts.push({ hostPath: realTarget, containerPath: `/workspace/agent/${entry.name}`, readonly: false });
@@ -1552,7 +1588,7 @@ export function buildMounts(
   // been settled by reconcileWorkgroupAtSpawn under the writer lock, so every
   // subsystem inside this spawn sees the same value. Fall back to the
   // agentGroup field for direct callers (tests, scripts).
-  const wgId = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
+  const wgId = overlayWgId;
   const wgShared = workgroupSharedDir(wgId);
   if (WORKGROUP_SHARED_FS || fs.existsSync(path.join(wgShared, '.migrated'))) {
     fs.mkdirSync(wgShared, { recursive: true });

@@ -155,6 +155,36 @@ export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): 
 // ── Messaging Group Agents ──
 
 /**
+ * Refuse to wire an agent into a channel already served by a different
+ * workgroup. Thread worktrees and Graphify caches are keyed by
+ * platform/thread only (session-manager.ts threadWorktreeDir), so agents
+ * sharing a channel share those RW dirs — the workgroup boundary holds only
+ * if every agent on a channel belongs to the same workgroup. Enforce that
+ * invariant here, at wiring time, rather than re-keying every thread path.
+ * Workgroup identity falls back to the group folder for pre-workgroup rows,
+ * matching container-runner's resolution.
+ */
+export function assertSameWorkgroupWiring(messagingGroupId: string, agentGroupId: string): void {
+  const row = getDb()
+    .prepare(
+      `SELECT ag.id AS agent_group_id, COALESCE(ag.workgroup_id, ag.folder) AS wg
+         FROM messaging_group_agents mga
+         JOIN agent_groups ag ON ag.id = mga.agent_group_id
+        WHERE mga.messaging_group_id = ?
+          AND wg != (SELECT COALESCE(workgroup_id, folder) FROM agent_groups WHERE id = ?)
+        LIMIT 1`,
+    )
+    .get(messagingGroupId, agentGroupId) as { agent_group_id: string; wg: string } | undefined;
+  if (row) {
+    throw new Error(
+      `Cannot wire agent group ${agentGroupId} to messaging group ${messagingGroupId}: ` +
+        `existing agent ${row.agent_group_id} belongs to workgroup '${row.wg}'. Agents on one ` +
+        `channel share thread worktrees, so all must belong to the same workgroup.`,
+    );
+  }
+}
+
+/**
  * Wire a messaging group to an agent group. Also auto-creates the matching
  * `agent_destinations` row so the agent can deliver to this chat as a
  * target, not just reply to the origin. Without this, routing to chats that
@@ -168,6 +198,7 @@ export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): 
  * mirrors the backfill logic in migration 004.
  */
 export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
+  assertSameWorkgroupWiring(mga.messaging_group_id, mga.agent_group_id);
   getDb()
     .prepare(
       `INSERT INTO messaging_group_agents (

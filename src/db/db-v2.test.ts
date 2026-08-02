@@ -224,6 +224,15 @@ describe('messaging group agents', () => {
       agent_provider: null,
       created_at: now(),
     });
+    // Same-workgroup siblings — cross-workgroup wiring is rejected by
+    // assertSameWorkgroupWiring, which is not this test's subject.
+    getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
+         VALUES ('wg-prio', 'wg-prio', '[]', 'ag-1', datetime('now'))`,
+      )
+      .run();
+    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-prio' WHERE id IN ('ag-1','ag-2')").run();
     createMessagingGroupAgent({ ...mga(), id: 'mga-2', agent_group_id: 'ag-2', priority: 10 });
     const results = getMessagingGroupAgents('mg-1');
     expect(results[0].agent_group_id).toBe('ag-2');
@@ -708,5 +717,77 @@ describe('pending questions', () => {
     });
     deletePendingQuestion('q-1');
     expect(getPendingQuestion('q-1')).toBeUndefined();
+  });
+});
+
+// ── Wiring workgroup guard ──
+
+describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
+  const mgaRow = (id: string, agId: string) => ({
+    id,
+    messaging_group_id: 'mg-wg',
+    agent_group_id: agId,
+    engage_mode: 'mention' as const,
+    engage_pattern: null,
+    sender_scope: 'all' as const,
+    ignored_message_policy: 'drop' as const,
+    session_mode: 'shared' as const,
+    priority: 0,
+    default_model: null,
+    default_effort: null,
+    default_tone: null,
+    created_at: now(),
+  });
+
+  beforeEach(() => {
+    createMessagingGroup({
+      id: 'mg-wg',
+      channel_type: 'slack',
+      platform_id: 'C-wg-guard',
+      name: 'wg-guard',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    for (const [id, folder] of [
+      ['ag-a', 'alpha'],
+      ['ag-b', 'beta'],
+      ['ag-c', 'gamma'],
+    ] as const) {
+      createAgentGroup({ id, name: id, folder, agent_provider: null, created_at: now() });
+    }
+  });
+
+  const makeWorkgroup = (id: string) =>
+    getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
+         VALUES (?, ?, '[]', ?, datetime('now'))`,
+      )
+      .run(id, id, id);
+
+  it('allows wiring agents that share a workgroup', () => {
+    makeWorkgroup('wg-1');
+    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id IN ('ag-a','ag-b')").run();
+    createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
+    createMessagingGroupAgent(mgaRow('mga-b', 'ag-b'));
+    expect(getMessagingGroupAgents('mg-wg')).toHaveLength(2);
+  });
+
+  it('rejects wiring an agent from a different workgroup', () => {
+    makeWorkgroup('wg-1');
+    makeWorkgroup('wg-2');
+    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-1' WHERE id = 'ag-a'").run();
+    getDb().prepare("UPDATE agent_groups SET workgroup_id = 'wg-2' WHERE id = 'ag-c'").run();
+    createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
+    expect(() => createMessagingGroupAgent(mgaRow('mga-c', 'ag-c'))).toThrow(/same workgroup/);
+    expect(getMessagingGroupAgents('mg-wg')).toHaveLength(1);
+  });
+
+  it('falls back to folder identity when workgroup_id is null', () => {
+    // Pre-workgroup rows: identity = folder, matching container-runner's
+    // shared-dir resolution. Different folders → different data pools → reject.
+    createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
+    expect(() => createMessagingGroupAgent(mgaRow('mga-b', 'ag-b'))).toThrow(/same workgroup/);
   });
 });
