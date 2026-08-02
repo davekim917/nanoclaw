@@ -309,6 +309,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           const sourceBatch = sourceMessage ? [sourceMessage] : [];
           const routing = extractRouting(sourceBatch);
           const prompt = buildWorkContinuationPrompt(runningWork.task);
+          // Budget inherits from the continuation's SOURCE row: work promised
+          // from a muted/capped task turn stays muted/capped when it resumes.
+          applyChatBudget(sourceBatch);
           const settings = applyFlagBatch([], routing, config.providerName);
           log(`Resuming durable continuation: ${runningWork.task.slice(0, 120)}`);
           config.provider.resetRotationCycle?.();
@@ -487,6 +490,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       idleSuppressedContinuationIds.clear();
     }
 
+    applyChatBudget(keep);
     const flagBatch = applyFlagBatch(keep, routing, config.providerName);
     let effectiveModel = flagBatch.model;
     let effectiveEffort = flagBatch.effort;
@@ -2157,14 +2161,15 @@ interface FlagIntent {
 // per-model-family) are applied inside the claude provider, not here.
 // ultracode follows the same precedence; effort is already forced to xhigh
 // host-side when ultracode is requested, so it rides alongside effort here.
-export function applyFlagBatch(
-  messages: MessageInRow[],
-  _routing: RoutingContext,
-  providerName: string,
-): { model?: string; effort?: string; ultracode?: boolean; fast: boolean } {
-  // Physical chat mute: a task created with muteChat can never write a
-  // chat-kind outbound row this turn — set BEFORE the provider runs, reset
-  // every turn (sticky module state would otherwise leak across turns).
+// Physical chat budget: a task created with muteChat (or chatLimit N) caps
+// chat-kind outbound writes for the turn — set BEFORE the provider runs,
+// reset at every TURN BOUNDARY (sticky module state would otherwise leak
+// across turns). Deliberately NOT part of applyFlagBatch: that also runs
+// mid-turn on follow-up batches (see the settings-change path), and a
+// mid-turn batch with no task row must not clear an active mute — observed
+// live 2026-08-02: a deferred recall row arriving two minutes into a muted
+// task turn reset the budget and the "muted" agent posted to the channel.
+export function applyChatBudget(messages: MessageInRow[]): void {
   let limit: number | null = null;
   for (const m of messages) {
     if (m.kind !== 'task') continue;
@@ -2182,7 +2187,13 @@ export function applyFlagBatch(
     }
   }
   setChatLimit(limit);
+}
 
+export function applyFlagBatch(
+  messages: MessageInRow[],
+  _routing: RoutingContext,
+  providerName: string,
+): { model?: string; effort?: string; ultracode?: boolean; fast: boolean } {
   let intent: FlagIntent | undefined;
   for (const m of messages) {
     // Tasks carry flagIntent the same way chat messages do — used by scheduled

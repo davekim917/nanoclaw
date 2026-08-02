@@ -17,6 +17,7 @@ import { formatMessages, extractRouting } from './formatter.js';
 import {
   dispatchFileAttachment,
   dispatchResultText,
+  applyChatBudget,
   applyFlagBatch,
   buildWorkContinuationPrompt,
   handleEvent,
@@ -144,17 +145,36 @@ describe('chat budget from task content', () => {
     const { isChatMuted } = require('./db/messages-out.js');
     insertMessage('t-mute', 'task', { prompt: 'watch', muteChat: true });
     let messages = getPendingMessages().filter((m) => m.id === 't-mute');
-    applyFlagBatch(messages, extractRouting(messages), 'claude');
+    applyChatBudget(messages);
     expect(isChatMuted()).toBe(true);
 
     insertMessage('t-lim', 'task', { prompt: 'standup', chatLimit: 1 });
     messages = getPendingMessages().filter((m) => m.id === 't-lim');
-    applyFlagBatch(messages, extractRouting(messages), 'claude');
+    applyChatBudget(messages);
     expect(isChatMuted()).toBe(false); // budget 1, not muted
 
     insertMessage('t-plain', 'task', { prompt: 'normal' });
     messages = getPendingMessages().filter((m) => m.id === 't-plain');
+    applyChatBudget(messages);
+    expect(isChatMuted()).toBe(false);
+  });
+
+  it('mid-turn applyFlagBatch does not clear an active budget', () => {
+    // Regression: a deferred recall row arriving mid-turn hit the settings
+    // re-check path (applyFlagBatch with no task rows) and un-muted a muted
+    // task turn — observed live 2026-08-02.
+    const { isChatMuted } = require('./db/messages-out.js');
+    insertMessage('t-mute-2', 'task', { prompt: 'watch', muteChat: true });
+    let messages = getPendingMessages().filter((m) => m.id === 't-mute-2');
+    applyChatBudget(messages);
+    expect(isChatMuted()).toBe(true);
+
+    insertMessage('mid-turn-chat', 'chat', { sender: 'Operator', text: 'hi' });
+    messages = getPendingMessages().filter((m) => m.id === 'mid-turn-chat');
     applyFlagBatch(messages, extractRouting(messages), 'claude');
+    expect(isChatMuted()).toBe(true); // still muted
+
+    applyChatBudget([]); // next turn boundary resets
     expect(isChatMuted()).toBe(false);
   });
 
