@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   fetchSlackBotIdentity,
   registerSlackBot,
+  registerSlackWorkspaceHumans,
+  resolveInboundSlackIds,
   resolveSlackMentions,
   upgradeSlackBotProfile,
   type SlackBotIdentity,
@@ -629,5 +631,36 @@ describe('upgradeSlackBotProfile (fire-and-forget profile enrichment)', () => {
       expect(got?.realName).toBeUndefined();
       expect(got?.displayName).toBeUndefined();
     });
+  });
+});
+
+describe('resolveInboundSlackIds', () => {
+  it('resolves known bot and human raw ids to @name; unknown ids pass through', () => {
+    registerSlackBot('slack-test-inbound', {
+      userId: 'U-GATEBOT',
+      username: 'testbot',
+      displayName: 'skipper',
+      teamId: 'T-INBOUND',
+    });
+    registerSlackWorkspaceHumans('T-INBOUND', [
+      { userId: 'U-HUMAN1', username: 'alice.w', realName: 'Alice Woods', teamId: 'T-INBOUND' },
+    ]);
+    try {
+      expect(resolveInboundSlackIds('<@U-GATEBOT> hold 304 before <@U-HUMAN1> replies', 'slack-test-inbound')).toBe(
+        '@skipper hold 304 before @alice.w replies',
+      );
+      // Label form and unknown id
+      expect(resolveInboundSlackIds('<@U-GATEBOT|skipper> vs <@U-UNKNOWN9>', 'slack-test-inbound')).toBe(
+        '@skipper vs <@U-UNKNOWN9>',
+      );
+      expect(resolveInboundSlackIds('no mentions here', 'slack-test-inbound')).toBe('no mentions here');
+    } finally {
+      registerSlackBot('slack-test-inbound', {
+        userId: 'U-GATEBOT',
+        username: 'testbot',
+        teamId: '__cleared__',
+      });
+      registerSlackWorkspaceHumans('T-INBOUND', []);
+    }
   });
 });

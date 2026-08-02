@@ -39,6 +39,7 @@ import {
   getKnownSlackBots,
   registerSlackBot,
   registerSlackWorkspaceHumans,
+  resolveInboundSlackIds,
   resolveSlackMentions,
   upgradeSlackBotProfile,
   type SlackBotIdentity,
@@ -390,18 +391,30 @@ for (const ws of workspaces) {
         // so order is independent for correctness but consistent for
         // intent.
         transformOutboundMarkdown: (text) => {
-          // A bot has no legitimate reason to emit its own raw <@id> — it only
-          // shows up when the model echoes its inbound mention form (observed
-          // live: gate-syntax examples like "<@U…> hold 304" reaching humans
-          // as literal text, repeatedly, despite persona bans). Rewrite the
-          // self-id to the plain @name BEFORE mention resolution: inside code
-          // spans it stays literal (the documented gate syntax), in prose the
-          // resolver turns it back into a proper mention pill. Mechanical —
-          // the raw form cannot reach a channel no matter what the model writes.
+          // A bot has no legitimate reason to emit a raw bot <@id> — it only
+          // shows up when the model echoes the inbound mention wire form
+          // (observed live: gate-syntax examples like "<@U…> hold 304"
+          // reaching humans as literal text, from the gate bot AND siblings
+          // quoting it, despite persona bans). Rewrite every known bot id in
+          // this workspace to its plain @name BEFORE mention resolution:
+          // inside code spans it stays literal (the documented gate syntax),
+          // in prose the resolver turns it back into a proper mention pill.
+          // Human raw ids pass through — those are legitimate deterministic
+          // mentions, and re-resolution by alias could drop an ambiguous one.
           const self = getKnownSlackBots().get(ws.channelType);
-          const named = self ? text.replaceAll(`<@${self.userId}>`, `@${self.displayName || self.username}`) : text;
+          let named = text;
+          if (self && named.includes('<@')) {
+            for (const bot of getKnownSlackBots().values()) {
+              if (bot.teamId !== self.teamId) continue;
+              named = named.replaceAll(`<@${bot.userId}>`, `@${bot.displayName || bot.username}`);
+            }
+          }
           return markdownHeadingsToBold(resolveSlackMentions(named, ws.channelType));
         },
+        // Inbound wire text carries mentions as raw <@U…>; resolving them to
+        // @name here is what stops agents from ever LEARNING the raw form —
+        // the outbound rewrite above is the backstop, this is the cure.
+        transformInboundText: (text) => resolveInboundSlackIds(text, ws.channelType),
         detectRecoveredMention: (message) => {
           if (!identity) return false;
           const raw = message.raw as { text?: string } | undefined;

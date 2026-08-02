@@ -419,3 +419,34 @@ export async function upgradeSlackBotProfile(
     });
   }
 }
+
+/**
+ * Inbound raw-id resolution. Slack wire text carries mentions as `<@U…>` (or
+ * `<@U…|label>`), and unlike Discord the bridge never resolved them — so
+ * every agent reading a channel where humans type gate syntax ("@skipper
+ * hold 304" arrives as "<@U…> hold 304") learns the raw form and echoes it
+ * back into its own output. Resolving inbound kills the echo at its origin:
+ * agents only ever see `@name`, so `@name` is the only form they reproduce.
+ * Scoped to the workspace's known bots and humans; unknown ids pass through
+ * untouched (better a raw id the model treats as opaque than a wrong name).
+ */
+export function resolveInboundSlackIds(text: string, channelType: string): string {
+  if (!text.includes('<@')) return text;
+  const self = knownSlackBots.get(channelType);
+  const teamId = self?.teamId;
+  let out = text;
+  const substitute = (identity: SlackBotIdentity, name: string | undefined): void => {
+    if (!name) return;
+    out = out.replace(new RegExp(`<@${identity.userId}(\\|[^>]*)?>`, 'g'), `@${name}`);
+  };
+  for (const bot of knownSlackBots.values()) {
+    if (teamId && bot.teamId !== teamId) continue;
+    substitute(bot, bot.displayName || bot.username);
+  }
+  if (teamId) {
+    for (const human of knownSlackHumans.get(teamId) ?? []) {
+      substitute(human, human.displayName || human.realName || human.username);
+    }
+  }
+  return out;
+}
