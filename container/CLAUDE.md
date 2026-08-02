@@ -16,36 +16,40 @@ Be concise — every message costs the reader's attention. Prefer outcomes over 
 
 ## Output Format — every message to a human
 
-Structure is MANDATORY, not stylistic. Every status update, report, or
-completion message uses this exact shape — free prose is only for genuine
-conversational back-and-forth:
+First line = the outcome or answer. If you need something from the reader,
+state it explicitly at the end — never implied mid-paragraph.
+
+**Work reports** — status updates, completion messages, operational asks
+("I did things, here is the result") — use this exact shape, not prose:
 
 ```
-✅|⚠️|🚫 **<outcome, one line>**            ← always the first line
+✅|⚠️|🚫 **<outcome, one line>**            ← first line
 
 **<emoji> <section label>**
 - <one fact per line, ≤15 words, no dependent clauses>
 - <...>
 
-**👉 You:** <who does what, by when>       ← always the last line, or "no action needed"
+**👉 You:** <who does what, by when>       ← last line, or "no action needed"
 ```
 
-Hard rules:
+In a work report, a paragraph over 2 sentences is a defect — convert it to
+bulleted facts. Bold headers over paragraphs is NOT compliance; the paragraph
+itself is the violation. Detail that does not change the reader's next action:
+cut it, attach it, or put it in a thread reply.
 
-- **A paragraph over 2 sentences in a report is a defect.** Convert it to
-  bulleted facts. Bold headers over paragraphs is NOT compliance — the
-  paragraph itself is the violation.
-- First and last lines carry the message: outcome on top, reader's action at
-  the bottom. Everything between must survive being skipped entirely.
-- Detail that does not change the reader's next action: cut it, attach it, or
-  put it in a thread reply — never in the message body.
-- **Earlier messages in this conversation are not a style precedent.** A
-  verbose thread history never overrides this contract — comply now, even if
-  every previous message was paragraphs.
+**Knowledge work** — analysis, explanations, design discussion, answers to
+questions — is prose, not the template. But structured prose: conclusion
+before reasoning, short paragraphs (one topic each), a list for anything
+enumerable, headers when it runs long.
+
+Both kinds:
+
+- Earlier messages in this conversation are not a style precedent — a verbose
+  thread history never overrides this contract.
 - Write for a reader without your context. Any ID you reference (PR, ticket, task, migration) carries a 2–5 word handle — "#293 order dedupe fix", never bare "#293". When you tell a human to take a process step, spell out the exact action verbatim (what to type, where) — never assume they know the mechanics.
 - No preamble, no restating the question, no filler, no sign-off. Delete any sentence that does not change what the reader knows or does.
 
-Write in Simplified Technical English (ASD-STE100) — apply it inside every bullet:
+Write in Simplified Technical English (ASD-STE100) — always, in every message:
 
 - Instructions: imperative form, one instruction per sentence, max 20 words.
 - Descriptions: one topic per sentence, max 25 words. One topic per paragraph, max 6 sentences. Give information gradually.
