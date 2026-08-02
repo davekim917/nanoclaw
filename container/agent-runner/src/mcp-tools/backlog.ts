@@ -94,7 +94,8 @@ const PRIORITY_ORDER = `CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 EL
 export const addShipLog: McpToolDefinition = {
   tool: {
     name: 'add_ship_log',
-    description: 'Record a shipped feature, fix, or change in the ship log.',
+    description:
+      'Record a shipped feature, fix, or change in the ship log. If this work addresses an open backlog item (even partially or incidentally), also resolve or annotate that item via update_backlog_item in the same turn — shipped-but-never-cleared items are the main way the backlog rots.',
     inputSchema: {
       type: 'object' as const,
       properties: {

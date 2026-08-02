@@ -274,6 +274,13 @@ export interface ContainerConfig {
    */
   dailySummary?: {
     messagingGroupId?: string;
+    /**
+     * Include the shipped-work sections (🤖 Agent Shipped / 🛠 Other commits)
+     * in the digest. Defaults to true. Workgroups whose ship state already
+     * lives in a dedicated release channel (a release scrum-master agent)
+     * set false so the digest carries only backlog activity.
+     */
+    shipLog?: boolean;
   };
 
   /**

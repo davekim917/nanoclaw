@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { extractRepo, formatDigest, isCommitScanEntry } from './daily-summary.js';
+import { extractRepo, formatDigest, formatDigestParts, isCommitScanEntry, rankBacklog } from './daily-summary.js';
 import type { ShipLogEntry, BacklogItem } from './db/backlog.js';
 
 function shipEntry(over: Partial<ShipLogEntry> = {}): ShipLogEntry {
@@ -177,8 +177,8 @@ describe('formatDigest', () => {
     expect(out).toContain('🚫 wont-do');
   });
 
-  it('renders Open Backlog with priority emoji + in-progress suffix', () => {
-    const out = formatDigest(WG, {
+  it('parent carries the backlog headline; the ranked list lives in the thread part', () => {
+    const { parent, backlogThread } = formatDigestParts(WG, {
       ...emptySummary(),
       openBacklog: [
         backlogItem({ id: 'b1', title: 'high-thing', priority: 'high', status: 'open' }),
@@ -186,11 +186,75 @@ describe('formatDigest', () => {
         backlogItem({ id: 'b3', title: 'low-thing', priority: 'low', status: 'open' }),
       ],
     });
-    expect(out).toContain('📌 **Open Backlog** (3):');
-    expect(out).toContain('🔴 high-thing');
-    expect(out).toContain('🟡 mid-thing [in progress]');
-    expect(out).toContain('⚪ low-thing');
-    expect(out).not.toContain('🔴 high-thing [in progress]');
+    expect(parent).toContain('📌 **Open Backlog** (3) — ranked list in 🧵');
+    expect(parent).not.toContain('high-thing');
+    expect(backlogThread).toContain('🔴 high-thing');
+    expect(backlogThread).toContain('🟡 mid-thing');
+    expect(backlogThread).toContain('· in progress');
+    expect(backlogThread).toContain('⚪ low-thing');
+    expect(backlogThread).toContain('👉 **Address first:**');
+  });
+
+  it('ranks in-progress first, then priority, then oldest', () => {
+    const ranked = rankBacklog([
+      backlogItem({ id: 'b1', title: 'old-low', priority: 'low', status: 'open', created_at: '2026-01-01T00:00:00Z' }),
+      backlogItem({
+        id: 'b2',
+        title: 'new-high',
+        priority: 'high',
+        status: 'open',
+        created_at: '2026-07-01T00:00:00Z',
+      }),
+      backlogItem({
+        id: 'b3',
+        title: 'old-high',
+        priority: 'high',
+        status: 'open',
+        created_at: '2026-02-01T00:00:00Z',
+      }),
+      backlogItem({
+        id: 'b4',
+        title: 'wip-low',
+        priority: 'low',
+        status: 'in_progress',
+        created_at: '2026-06-01T00:00:00Z',
+      }),
+    ]);
+    expect(ranked.map((i) => i.title)).toEqual(['wip-low', 'old-high', 'new-high', 'old-low']);
+  });
+
+  it('shows item descriptions as an indented why-line in the thread', () => {
+    const { backlogThread } = formatDigestParts(WG, {
+      ...emptySummary(),
+      openBacklog: [
+        backlogItem({
+          id: 'b1',
+          title: 'thing',
+          priority: 'high',
+          status: 'open',
+          description: 'exists because X breaks Y',
+        }),
+      ],
+    });
+    expect(backlogThread).toContain('↳ exists because X breaks Y');
+  });
+
+  it('shipLog:false drops the shipped sections but keeps backlog + resolved', () => {
+    const { parent } = formatDigestParts(
+      WG,
+      {
+        ...emptySummary(),
+        agentShipped: [shipEntry({ title: 'agent-ship' })],
+        otherCommits: [shipEntry({ title: 'human-ship', tags: 'commit-digest,repo' })],
+        resolved: [backlogItem({ id: 'r1', title: 'fixed-thing', status: 'resolved' })],
+        openBacklog: [backlogItem({ id: 'b1', title: 'open-thing', priority: 'low', status: 'open' })],
+      },
+      { includeShipLog: false },
+    );
+    expect(parent).not.toContain('agent-ship');
+    expect(parent).not.toContain('human-ship');
+    expect(parent).toContain('fixed-thing');
+    expect(parent).toContain('📌 **Open Backlog** (1)');
   });
 
   it('omits sections that have no entries', () => {
