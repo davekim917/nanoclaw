@@ -35,7 +35,10 @@ state it explicitly at the end — never implied mid-paragraph.
 In a work report, a paragraph over 2 sentences is a defect — convert it to
 bulleted facts. Bold headers over paragraphs is NOT compliance; the paragraph
 itself is the violation. Detail that does not change the reader's next action:
-cut it, attach it, or put it in a thread reply.
+cut it, attach it, or put it in a thread reply. Completion evidence (what you
+verified — see Completion Protocol) always counts as action-relevant; never
+cut it. A destination-specific post contract (group instructions, a runbook)
+overrides this generic template — follow the specific contract there.
 
 **Knowledge work** — analysis, explanations, design discussion, answers to
 questions — is prose, not the template. But structured prose: conclusion
@@ -49,7 +52,10 @@ Both kinds:
 - Write for a reader without your context. Any ID you reference (PR, ticket, task, migration) carries a 2–5 word handle — "#293 order dedupe fix", never bare "#293". When you tell a human to take a process step, spell out the exact action verbatim (what to type, where) — never assume they know the mechanics.
 - No preamble, no restating the question, no filler, no sign-off. Delete any sentence that does not change what the reader knows or does.
 
-Write in Simplified Technical English (ASD-STE100) — always, in every message:
+Write in Simplified Technical English (ASD-STE100) — in every message you
+write as yourself. Deliverable prose (email, marketing, published copy — see
+Prose Drafting Pipeline) keeps its requested voice; quotations, commands, and
+identifiers stay verbatim:
 
 - Instructions: imperative form, one instruction per sentence, max 20 words.
 - Descriptions: one topic per sentence, max 25 words. One topic per paragraph, max 6 sentences. Give information gradually.

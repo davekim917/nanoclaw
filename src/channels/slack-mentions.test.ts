@@ -360,6 +360,58 @@ describe('resolveSlackMentions', () => {
         'run `@Opal` literally',
       );
     });
+
+    it('a human username beats another human’s display name for the same alias', () => {
+      // Earlier user's free-text display name = later user's canonical
+      // username. The username (unique per Slack) must own the alias
+      // regardless of users.list ordering.
+      const humans = new Map<string, SlackBotIdentity[]>();
+      humans.set(LABS_TEAM, [
+        { userId: 'U-FIRST', username: 'first.user', displayName: 'jsmith', realName: 'F', teamId: LABS_TEAM },
+        { userId: 'U-REAL-JSMITH', username: 'jsmith', displayName: 'Jay S', realName: 'J', teamId: LABS_TEAM },
+      ]);
+      expect(resolveSlackMentions('@jsmith review this', 'slack-example-labs', makeBots(), humans)).toBe(
+        '<@U-REAL-JSMITH> review this',
+      );
+    });
+
+    it('drops a display-name alias shared by two humans instead of guessing', () => {
+      const humans = new Map<string, SlackBotIdentity[]>();
+      humans.set(LABS_TEAM, [
+        { userId: 'U-ALEX1', username: 'alex.a', displayName: 'Alex', realName: 'Alex One', teamId: LABS_TEAM },
+        { userId: 'U-ALEX2', username: 'alex.b', displayName: 'Alex', realName: 'Alex Two', teamId: LABS_TEAM },
+      ]);
+      // Ambiguous "@Alex" stays literal; unique usernames still resolve.
+      expect(resolveSlackMentions('ping @Alex', 'slack-example-labs', makeBots(), humans)).toBe('ping @Alex');
+      expect(resolveSlackMentions('ping @alex.a', 'slack-example-labs', makeBots(), humans)).toBe('ping <@U-ALEX1>');
+      expect(resolveSlackMentions('ping @alex.b', 'slack-example-labs', makeBots(), humans)).toBe('ping <@U-ALEX2>');
+    });
+
+    it('resolves Unicode display names whole — no ASCII-prefix truncation', () => {
+      const humans = new Map<string, SlackBotIdentity[]>();
+      humans.set(LABS_TEAM, [
+        { userId: 'U-JOSE', username: 'jose.g', displayName: 'José', realName: 'José García', teamId: LABS_TEAM },
+        // "jos" is a real registered alias — the trap: ASCII \w would match
+        // `@Jos` out of `@José` and ping the wrong person.
+        { userId: 'U-JOS', username: 'jos', displayName: '', realName: '', teamId: LABS_TEAM },
+      ]);
+      expect(resolveSlackMentions('gracias @José', 'slack-example-labs', makeBots(), humans)).toBe('gracias <@U-JOSE>');
+      expect(resolveSlackMentions('ping @jos', 'slack-example-labs', makeBots(), humans)).toBe('ping <@U-JOS>');
+    });
+
+    it('resolves CJK display names', () => {
+      const humans = new Map<string, SlackBotIdentity[]>();
+      humans.set(LABS_TEAM, [
+        { userId: 'U-KIM', username: 'dkim', displayName: '김대현', realName: '', teamId: LABS_TEAM },
+      ]);
+      expect(resolveSlackMentions('@김대현 확인 부탁해요', 'slack-example-labs', makeBots(), humans)).toBe(
+        '<@U-KIM> 확인 부탁해요',
+      );
+    });
+
+    it('unknown Unicode names stay untouched', () => {
+      expect(resolveSlackMentions('ping @Zoë', 'slack-example-labs', makeBots(), makeHumans())).toBe('ping @Zoë');
+    });
   });
 });
 

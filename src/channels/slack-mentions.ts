@@ -186,15 +186,39 @@ export function resolveSlackMentions(
   // Fourth pass: workspace humans (from users.list). All human aliases go
   // through tryAddAlias, so every bot alias — literal or normalized — wins
   // any collision with a human handle. Same-team scoping as bots.
-  for (const ident of humans.get(currentBot.teamId) ?? []) {
-    tryAddAlias(ident.username, ident.userId);
-    tryAddAlias(ident.displayName, ident.userId);
-    tryAddAlias(ident.realName, ident.userId);
+  //
+  // Usernames register before display/real names: Slack guarantees usernames
+  // unique per workspace, display names are free-text — an earlier user's
+  // display name must never capture a later user's canonical username. And a
+  // display/real alias shared by two different humans is dropped entirely
+  // rather than first-writer-wins, which would silently ping the wrong person
+  // half the time.
+  const teamHumans = humans.get(currentBot.teamId) ?? [];
+  for (const ident of teamHumans) tryAddAlias(ident.username, ident.userId);
+  const humanClaims = new Map<string, string>();
+  const ambiguousAliases = new Set<string>();
+  const claimHumanAlias = (alias: string | undefined, userId: string): void => {
+    if (!alias) return;
+    const lower = alias.toLowerCase();
+    if (!lower) return;
+    const prior = humanClaims.get(lower);
+    if (prior !== undefined && prior !== userId) {
+      ambiguousAliases.add(lower);
+      return;
+    }
+    humanClaims.set(lower, userId);
+  };
+  for (const ident of teamHumans) {
+    claimHumanAlias(ident.displayName, ident.userId);
+    claimHumanAlias(ident.realName, ident.userId);
     for (const candidate of [ident.username, ident.displayName, ident.realName]) {
       if (!candidate) continue;
       const normalized = normalizeHandle(candidate.toLowerCase());
-      if (normalized !== candidate.toLowerCase()) tryAddAlias(normalized, ident.userId);
+      if (normalized !== candidate.toLowerCase()) claimHumanAlias(normalized, ident.userId);
     }
+  }
+  for (const [alias, userId] of humanClaims) {
+    if (!ambiguousAliases.has(alias)) tryAddAlias(alias, userId);
   }
   if (byName.size === 0) return text;
 
@@ -210,9 +234,15 @@ export function resolveSlackMentions(
   // URLs (path char `/` is not `\w`, so `(?<!\w)` alone would let it
   // through). `transformOutsideProtectedRegions` only shields code spans,
   // not URL regions — so URL safety has to live in the lookbehind itself.
-  const USERNAME = String.raw`[\w-]+(?:\.[\w-]+)*`;
-  const BRACKETED_RE = new RegExp(String.raw`(?<![\w/:])<@(${USERNAME})>`, 'g');
-  const BARE_RE = new RegExp(String.raw`(?<![\w/:])@(${USERNAME})`, 'g');
+  // `\p{L}\p{M}\p{N}` widen `\w` to Unicode letters (accents via combining
+  // marks, CJK) so human display names like `@José` match whole — ASCII-only
+  // `\w` would capture `@Jos`, and a truncated prefix that happens to be a
+  // registered alias would ping the wrong person. Same classes in the
+  // lookbehind so a mention can't start mid-word after a Unicode letter.
+  const WORD = String.raw`\w\p{L}\p{M}\p{N}`;
+  const USERNAME = String.raw`[${WORD}-]+(?:\.[${WORD}-]+)*`;
+  const BRACKETED_RE = new RegExp(String.raw`(?<![${WORD}/:])<@(${USERNAME})>`, 'gu');
+  const BARE_RE = new RegExp(String.raw`(?<![${WORD}/:])@(${USERNAME})`, 'gu');
 
   return transformOutsideProtectedRegions(text, (segment) => {
     const rewriteByName = (match: string, name: string): string => {

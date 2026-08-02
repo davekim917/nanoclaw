@@ -64,9 +64,13 @@ export async function handleRecurrence(inDb: Database.Database, session: Session
 
       if (scriptFails >= SCRIPT_FAIL_PAUSE_CAP) {
         // Re-arm PAUSED at the cron time so `ncl tasks resume` revives the
-        // series in place; leave the why in the run log.
-        insertRecurrence(inDb, msg, newId, cronNext.toISOString(), 'paused');
-        clearRecurrence(inDb, msg.id);
+        // series in place; leave the why in the run log. Insert + clear are
+        // one transaction: a crash between them would leave the predecessor
+        // still recurrence-armed next to a live successor → double-fire.
+        inDb.transaction(() => {
+          insertRecurrence(inDb, msg, newId, cronNext.toISOString(), 'paused');
+          clearRecurrence(inDb, msg.id);
+        })();
         appendHostTaskNote(
           session.agent_group_id,
           msg.series_id,
@@ -83,8 +87,10 @@ export async function handleRecurrence(inDb: Database.Database, session: Session
       const backoffAt = scriptFails > 0 ? Date.now() + scriptBackoffMinutes(scriptFails) * 60_000 : 0;
       const nextRun = new Date(Math.max(cronNext.getTime(), backoffAt)).toISOString();
 
-      insertRecurrence(inDb, msg, newId, nextRun);
-      clearRecurrence(inDb, msg.id);
+      inDb.transaction(() => {
+        insertRecurrence(inDb, msg, newId, nextRun);
+        clearRecurrence(inDb, msg.id);
+      })();
 
       log.info('Inserted next recurrence', {
         originalId: msg.id,

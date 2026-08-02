@@ -469,6 +469,12 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
     }
     enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), scriptAfter != null);
     update.recurrence = recurrence;
+    // A new cron with the old armed timestamp fires off the new grid (or a
+    // day late). Unless the caller pinned --process-after explicitly,
+    // re-derive the next fire from the new expression.
+    if (recurrence !== null && args.process_after === undefined) {
+      update.processAfter = CronExpressionParser.parse(recurrence, { tz: TIMEZONE }).next().toDate().toISOString();
+    }
   }
   if (script !== undefined) update.script = script;
   const model = str(args.model);
