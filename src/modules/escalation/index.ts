@@ -19,6 +19,29 @@ import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { registerApprovalHandler, requestApproval } from '../approvals/index.js';
+import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permissions/db/user-roles.js';
+
+/**
+ * OWNERS-FIRST candidate order — the reverse of pickApprover. An escalation's
+ * question is addressed to the owner personally ("was this actually you?");
+ * routing it to a group admin sends the question to someone who cannot
+ * answer it (observed live: the card landed in a teammate's DM while the
+ * owner saw nothing). Admins remain as reachability fallback only.
+ */
+function escalationApprovers(agentGroupId: string): string[] {
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const add = (id: string): void => {
+    if (!seen.has(id)) {
+      seen.add(id);
+      ordered.push(id);
+    }
+  };
+  for (const r of getOwners()) add(r.user_id);
+  for (const r of getGlobalAdmins()) add(r.user_id);
+  for (const r of getAdminsOfAgentGroup(agentGroupId)) add(r.user_id);
+  return ordered;
+}
 
 const MAX_QUESTION_CHARS = 1500;
 const ALLOWED_KEYS = new Set(['action', 'question']);
@@ -62,6 +85,7 @@ export async function applyOwnerEscalation(
     title: `🚩 Escalation from ${agentName}`,
     question,
     deliveryTarget: 'admin',
+    approvers: escalationApprovers(session.agent_group_id),
   });
   if (!delivered) {
     // requestApproval already notified the agent about the specific failure.

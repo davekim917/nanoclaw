@@ -260,6 +260,14 @@ export interface RequestApprovalOptions {
   deliveryTarget?: 'thread' | 'admin';
   /** Deliver the card to this specific user instead of all of the session group's admins. */
   approverUserId?: string;
+  /**
+   * Ordered approver-candidate override. Replaces the default pickApprover
+   * chain (group admins → global admins → owners) when the action's audience
+   * is not "whoever administers this group" — e.g. an owner escalation whose
+   * question is addressed to the owner personally must try owners FIRST.
+   * Ignored when approverUserId is set.
+   */
+  approvers?: string[];
 }
 
 /**
@@ -269,7 +277,17 @@ export interface RequestApprovalOptions {
  * approval handler for this action via the response dispatcher.
  */
 export async function requestApproval(opts: RequestApprovalOptions): Promise<boolean> {
-  const { session, action, payload, title, question, agentName, deliveryTarget = 'admin', approverUserId } = opts;
+  const {
+    session,
+    action,
+    payload,
+    title,
+    question,
+    agentName,
+    deliveryTarget = 'admin',
+    approverUserId,
+    approvers: approverOverride,
+  } = opts;
 
   // Resolve delivery destination based on target policy.
   // thread: originating messaging_group + session's thread_id.
@@ -294,7 +312,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
   } else {
     // A named approver (e.g. an a2a policy's designated user) narrows the set
     // to exactly that user; otherwise fall back to the group's approver chain.
-    const approvers = approverUserId ? [approverUserId] : pickApprover(session.agent_group_id);
+    const approvers = approverUserId ? [approverUserId] : (approverOverride ?? pickApprover(session.agent_group_id));
     if (approvers.length === 0) {
       await notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
       return false;

@@ -77,6 +77,32 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
   return true;
 }
 
+/**
+ * Host-operator resolution path — `ncl approvals approve|reject`. Runs the
+ * exact same resolution as an authorized card click. Exists because DM
+ * delivery is best-effort (a card can land with an admin who isn't the right
+ * decider, or a platform hiccup can eat it): the operator terminal must
+ * always be able to resolve a pending approval. Callers MUST have rejected
+ * agent-originated requests before calling — an agent must never resolve an
+ * approval, least of all its own.
+ */
+export async function resolveApprovalFromHost(
+  approvalId: string,
+  decision: 'approve' | 'reject',
+  userId: string,
+): Promise<{ resolved: boolean; error?: string }> {
+  const approval = getPendingApproval(approvalId);
+  if (!approval) return { resolved: false, error: `No pending approval ${approvalId}` };
+  if (approval.action === ONECLI_ACTION) {
+    return {
+      resolved: false,
+      error: 'OneCLI credential approvals resolve through the gateway flow, not the CLI.',
+    };
+  }
+  await handleRegisteredApproval(approval, decision, userId);
+  return { resolved: true };
+}
+
 async function handleRegisteredApproval(
   approval: PendingApproval,
   selectedOption: string,
