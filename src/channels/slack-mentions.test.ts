@@ -647,7 +647,7 @@ describe('resolveInboundSlackIds', () => {
     ]);
     try {
       expect(resolveInboundSlackIds('<@U-GATEBOT> hold 304 before <@U-HUMAN1> replies', 'slack-test-inbound')).toBe(
-        '@skipper hold 304 before @alice.w replies',
+        '@skipper hold 304 before @Alice Woods replies',
       );
       // Label form and unknown id
       expect(resolveInboundSlackIds('<@U-GATEBOT|skipper> vs <@U-UNKNOWN9>', 'slack-test-inbound')).toBe(
