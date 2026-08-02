@@ -615,6 +615,32 @@ describe('worker agent def sync (orchestrator roster)', () => {
   });
 });
 
+describe('RO snapshot mounts for migrated repos', () => {
+  it('mounts each mirror-backed snapshot read-only when the workgroup tree is mounted', () => {
+    const ag = group('ag-snap', 'snap-group');
+    createAgentGroup(ag);
+    assignWorkgroup(ag, 'wg-snap');
+    ensureContainerConfig(ag.id);
+    fs.mkdirSync(path.join(GROUPS_DIR, ag.folder), { recursive: true });
+
+    const wgShared = path.join(DATA_DIR, 'workgroups', 'wg-snap');
+    // .migrated marker forces the workgroup mount on even though the test
+    // config pins WORKGROUP_SHARED_FS=false.
+    fs.mkdirSync(wgShared, { recursive: true });
+    fs.writeFileSync(path.join(wgShared, '.migrated'), '');
+    fs.mkdirSync(path.join(wgShared, '.repos', 'proj.git'), { recursive: true });
+    fs.mkdirSync(path.join(wgShared, 'proj', '.git'), { recursive: true });
+    // A mirror with no snapshot yet must NOT produce a mount.
+    fs.mkdirSync(path.join(wgShared, '.repos', 'pending.git'), { recursive: true });
+
+    const mounts = buildMounts(ag, session('s-snap', ag.id), containerConfig(), 'claude', {}, 'wg-snap');
+    const snap = mounts.find((m) => m.containerPath === '/workspace/workgroup/proj');
+    expect(snap).toBeDefined();
+    expect(snap!.readonly).toBe(true);
+    expect(mounts.find((m) => m.containerPath === '/workspace/workgroup/pending')).toBeUndefined();
+  });
+});
+
 describe('symlink overlay workgroup allowlist', () => {
   it('mounts same-workgroup targets and refuses outside targets', () => {
     const ag = group('ag-sym', 'sym-main');

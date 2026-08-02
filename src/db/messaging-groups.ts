@@ -155,14 +155,11 @@ export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): 
 // ── Messaging Group Agents ──
 
 /**
- * Refuse to wire an agent into a channel already served by a different
- * workgroup. Thread worktrees and Graphify caches are keyed by
- * platform/thread only (session-manager.ts threadWorktreeDir), so agents
- * sharing a channel share those RW dirs — the workgroup boundary holds only
- * if every agent on a channel belongs to the same workgroup. Enforce that
- * invariant here, at wiring time, rather than re-keying every thread path.
- * Workgroup identity falls back to the group folder for pre-workgroup rows,
- * matching container-runner's resolution.
+ * Refuse to wire an agent into a messaging-group row already served by a
+ * different workgroup. Agents fanned out on one wiring row share thread
+ * worktrees and Graphify caches, so a row never spans workgroups. Workgroup
+ * identity falls back to the group folder for pre-workgroup rows, matching
+ * container-runner's resolution.
  */
 export function assertSameWorkgroupWiring(messagingGroupId: string, agentGroupId: string): void {
   // Scope: THIS messaging-group row only. Cross-row sharing on the same

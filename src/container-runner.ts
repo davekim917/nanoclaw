@@ -1602,6 +1602,28 @@ export function buildMounts(
   if (WORKGROUP_SHARED_FS || fs.existsSync(path.join(wgShared, '.migrated'))) {
     fs.mkdirSync(wgShared, { recursive: true });
     mounts.push({ hostPath: wgShared, containerPath: WORKGROUP_CONTAINER_PATH, readonly: false });
+
+    // Browsing snapshots of migrated repos are READ-ONLY — enforcement, not
+    // advisory. For each bare mirror `.repos/<name>.git`, the snapshot at the
+    // old canonical path `<wgShared>/<name>` gets a nested RO mount on top of
+    // the RW workgroup mount, making "cd into the canonical and checkout a
+    // branch" (the stale-tree failure mode) impossible rather than
+    // discouraged. A repo cloned mid-session gains its RO overlay on the next
+    // respawn — bounded, and the freshness worker owns the tree meanwhile.
+    const wgReposDir = path.join(wgShared, '.repos');
+    if (fs.existsSync(wgReposDir)) {
+      for (const entry of fs.readdirSync(wgReposDir)) {
+        if (!entry.endsWith('.git')) continue;
+        const snapName = entry.slice(0, -'.git'.length);
+        const snapDir = path.join(wgShared, snapName);
+        if (!fs.existsSync(path.join(snapDir, '.git'))) continue;
+        mounts.push({
+          hostPath: snapDir,
+          containerPath: `${WORKGROUP_CONTAINER_PATH}/${snapName}`,
+          readonly: true,
+        });
+      }
+    }
   }
   // These nested mounts are unconditional. In memory-only mode
   // /workspace/workgroup itself is container-local, so the lock needs its own

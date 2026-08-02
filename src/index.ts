@@ -32,6 +32,7 @@ import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { stopStorageMaintenanceWorker } from './storage-maintenance-worker.js';
 import { resetStorageActivityState } from './storage-activity.js';
 import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
+import { startRepoFreshness, stopRepoFreshness } from './repo-freshness.js';
 import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
 import { startCommitScan, stopCommitScan } from './commit-scan.js';
 import { startDailySummary, stopDailySummary } from './daily-summary.js';
@@ -430,6 +431,11 @@ export async function main(): Promise<void> {
   startWorktreeCleanup();
   log.info('Worktree cleanup started');
 
+  // 7b. Repo freshness worker: fetch workgroup bare mirrors + advance the
+  // read-only browsing snapshots (10min, first run 90s after startup).
+  startRepoFreshness();
+  log.info('Repo freshness worker started');
+
   // 8. Start plugin auto-updater (hourly, first run 5min after startup)
   startPluginUpdater({
     notify: async (platformId, text) => {
@@ -502,6 +508,7 @@ async function shutdown(signal: string): Promise<void> {
     log.error('Storage maintenance worker failed to stop cleanly', { err });
   }
   stopWorktreeCleanup();
+  stopRepoFreshness();
   stopPluginUpdater();
   stopCommitScan();
   stopDailySummary();
