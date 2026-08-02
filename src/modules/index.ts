@@ -40,3 +40,4 @@ import './support-threads/index.js';
 // Scheduled-wake — schedule_wake delivery action: the container `wait` tool's
 // in-session delayed wake (process_after row in the caller's own session).
 import './scheduled-wake/index.js';
+import './escalation/index.js';
