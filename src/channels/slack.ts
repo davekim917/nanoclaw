@@ -140,15 +140,39 @@ export function makeSlackRecoveryPageFetcher(slackAdapter: ReturnType<typeof cre
   };
 }
 
+/**
+ * Slack error codes that mean a recovery target is unreachable by WIRING, not
+ * by outage: the channel is gone, archived, or the bot was removed. Retrying
+ * cannot succeed until a human changes the wiring, so the bridge parks the
+ * target instead of failing the pass.
+ */
+const PERMANENT_SLACK_RECOVERY_ERRORS = ['channel_not_found', 'is_archived', 'not_in_channel'];
+
+export function classifySlackRecoveryError(err: unknown): 'permanent' | 'transient' {
+  const code = (err as { data?: { error?: string } })?.data?.error;
+  if (code && PERMANENT_SLACK_RECOVERY_ERRORS.includes(code)) return 'permanent';
+  // WebClient sometimes surfaces only "An API error occurred: <code>".
+  const message = err instanceof Error ? err.message : '';
+  return PERMANENT_SLACK_RECOVERY_ERRORS.some((c) => message.includes(c)) ? 'permanent' : 'transient';
+}
+
 /** Find threads created or updated during the gap before they have a session. */
 export async function discoverSlackRecoveryTargets(
   client: WebClient,
   request: ChannelRecoveryRequest,
-): Promise<{ targets: ChannelRecoveryTarget[]; complete: boolean }> {
+): Promise<{
+  targets: ChannelRecoveryTarget[];
+  complete: boolean;
+  failed: Array<{ target: ChannelRecoveryTarget; error: unknown }>;
+}> {
   const sinceMs = Date.parse(request.since);
   const targets: ChannelRecoveryTarget[] = [];
+  const failed: Array<{ target: ChannelRecoveryTarget; error: unknown }> = [];
   let complete = true;
 
+  // Per-root fault isolation: one unreachable channel must not abort
+  // discovery for every other root (it did — the bridge then failed the
+  // whole pass and froze the recovery window).
   for (const root of request.targets) {
     if (root.threadId !== null) continue;
     const channel = root.platformId.split(':')[1];
@@ -156,36 +180,41 @@ export async function discoverSlackRecoveryTargets(
     let cursor: string | undefined;
     let coveredBoundary = false;
     const seenCursors = new Set<string>();
-    for (;;) {
-      const response = await client.conversations.history({ channel, limit: 100, cursor });
-      const messages = (response.messages ?? []) as SlackRecoveryMessage[];
-      for (const message of messages) {
-        const rootTs = message.ts ?? '';
-        const rootMs = Number(rootTs) * 1000;
-        const latestReplyMs = Number(message.latest_reply) * 1000;
-        const hasGapReply = (message.reply_count ?? 0) > 0 && Number.isFinite(latestReplyMs) && latestReplyMs > sinceMs;
-        const createdInGap = Number.isFinite(rootMs) && rootMs > sinceMs;
-        if ((hasGapReply || createdInGap) && rootTs) {
-          targets.push({ platformId: root.platformId, threadId: `slack:${channel}:${rootTs}`, isDM: root.isDM });
+    try {
+      for (;;) {
+        const response = await client.conversations.history({ channel, limit: 100, cursor });
+        const messages = (response.messages ?? []) as SlackRecoveryMessage[];
+        for (const message of messages) {
+          const rootTs = message.ts ?? '';
+          const rootMs = Number(rootTs) * 1000;
+          const latestReplyMs = Number(message.latest_reply) * 1000;
+          const hasGapReply =
+            (message.reply_count ?? 0) > 0 && Number.isFinite(latestReplyMs) && latestReplyMs > sinceMs;
+          const createdInGap = Number.isFinite(rootMs) && rootMs > sinceMs;
+          if ((hasGapReply || createdInGap) && rootTs) {
+            targets.push({ platformId: root.platformId, threadId: `slack:${channel}:${rootTs}`, isDM: root.isDM });
+          }
         }
+        const nextCursor = response.response_metadata?.next_cursor || undefined;
+        // Slack has no thread-activity index: an old channel or DM root can
+        // receive its first reply during the gap. Cover the conversation's full
+        // root history so those threads are discoverable, not just roots newer
+        // than `since`.
+        if (!nextCursor) {
+          coveredBoundary = true;
+          break;
+        }
+        if (seenCursors.has(nextCursor)) break;
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
       }
-      const nextCursor = response.response_metadata?.next_cursor || undefined;
-      // Slack has no thread-activity index: an old channel or DM root can
-      // receive its first reply during the gap. Cover the conversation's full
-      // root history so those threads are discoverable, not just roots newer
-      // than `since`.
-      if (!nextCursor) {
-        coveredBoundary = true;
-        break;
-      }
-      if (seenCursors.has(nextCursor)) break;
-      seenCursors.add(nextCursor);
-      cursor = nextCursor;
+      if (!coveredBoundary) complete = false;
+    } catch (err) {
+      failed.push({ target: root, error: err });
     }
-    if (!coveredBoundary) complete = false;
   }
 
-  return { targets, complete };
+  return { targets, complete, failed };
 }
 
 /**
@@ -376,6 +405,7 @@ for (const ws of workspaces) {
         },
         fetchRecoveryPage: makeSlackRecoveryPageFetcher(slackAdapter, client),
         discoverRecoveryTargets: (request) => discoverSlackRecoveryTargets(client, request),
+        classifyRecoveryError: classifySlackRecoveryError,
       });
       bridge.postParent = (platformId, text) => slackPostParent(client, platformId, text);
       bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>

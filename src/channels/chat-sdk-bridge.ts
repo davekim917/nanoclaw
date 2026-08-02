@@ -266,9 +266,22 @@ export interface ChatSdkBridgeConfig {
     options: { limit: number; direction: 'backward'; cursor?: string; since: string },
   ) => Promise<{ messages: ChatMessage[]; nextCursor?: string }>;
   /** Discover thread targets that do not yet have a NanoClaw session. */
-  discoverRecoveryTargets?: (
-    request: ChannelRecoveryRequest,
-  ) => Promise<{ targets: ChannelRecoveryTarget[]; complete: boolean }>;
+  discoverRecoveryTargets?: (request: ChannelRecoveryRequest) => Promise<{
+    targets: ChannelRecoveryTarget[];
+    complete: boolean;
+    /** Roots whose discovery failed, with the causing error, so the bridge can classify per target instead of failing the whole pass. */
+    failed?: Array<{ target: ChannelRecoveryTarget; error: unknown }>;
+  }>;
+  /**
+   * Classify a per-target recovery error. 'permanent' (channel deleted, bot
+   * evicted, missing scope) parks the target in the durable dead-target
+   * registry — skipped for 24h then re-probed once, never failing the pass —
+   * so one unreachable channel cannot freeze the adapter's recovery cursor
+   * or drive an infinite whole-window retry loop. Anything unclassified is
+   * 'transient': the pass fails and retries with backoff, preserving the
+   * conservative whole-window replay. Default: everything transient.
+   */
+  classifyRecoveryError?: (err: unknown) => 'permanent' | 'transient';
   /**
    * Override the channelType (and webhook path) for this bridge. Defaults to
    * `adapter.name`. Used by channels that register multiple instances in one
@@ -582,6 +595,38 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   const ingressGate = new RecoveryIngressGate();
   const recoveryCursorKey = `nanoclaw:recovery-cursor:${bridgeChannelType}`;
   const recoveryGapKey = `nanoclaw:recovery-gap:${bridgeChannelType}`;
+  const recoveryDeadKey = `nanoclaw:recovery-dead:${bridgeChannelType}`;
+
+  // Dead-target registry: targets whose recovery failed with a PERMANENT
+  // error (classifyRecoveryError). Parked targets are excluded from passes
+  // without counting as failures, so the pass completes and the adapter
+  // cursor advances — one dead channel must never freeze the recovery
+  // window (observed live: a channel_not_found target held `since` at a
+  // 10-day-old floor and drove a 60s whole-window refetch loop). Entries
+  // expire after 24h so a re-invited bot heals without manual clearing; a
+  // still-dead target re-parks with one warning per day.
+  const DEAD_TARGET_TTL_MS = 24 * 60 * 60 * 1000;
+  type DeadTargetMap = Record<string, { until: string; error: string }>;
+
+  async function loadDeadTargets(): Promise<DeadTargetMap> {
+    const raw = await state.get<string>(recoveryDeadKey);
+    if (!raw) return {};
+    try {
+      const map = JSON.parse(raw) as DeadTargetMap;
+      const nowIso = new Date().toISOString();
+      let changed = false;
+      for (const [key, entry] of Object.entries(map)) {
+        if (entry.until <= nowIso) {
+          delete map[key];
+          changed = true;
+        }
+      }
+      if (changed) await state.set(recoveryDeadKey, JSON.stringify(map));
+      return map;
+    } catch {
+      return {};
+    }
+  }
 
   async function advanceRecoveryCursor(timestamp: string): Promise<void> {
     const timestampMs = Date.parse(timestamp);
@@ -1428,9 +1473,41 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const effectiveSince = new Date(sinceMs).toISOString();
         const recoveryStartedAtMs = Date.now();
 
+        const dead = await loadDeadTargets();
+        const targetAddress = (target: ChannelRecoveryTarget): string =>
+          `${target.platformId}\u0000${target.threadId ?? ''}`;
+        // A dead ROOT (threadId '') parks every target on that platformId —
+        // thread fetches against an unreachable channel fail identically.
+        const deadRoots = new Set(
+          Object.keys(dead)
+            .filter((key) => key.endsWith('\u0000'))
+            .map((key) => key.split('\u0000')[0]),
+        );
+        const isDeadTarget = (target: ChannelRecoveryTarget): boolean =>
+          deadRoots.has(target.platformId) || targetAddress(target) in dead;
+        const parkTarget = async (target: ChannelRecoveryTarget, err: unknown): Promise<void> => {
+          const key = targetAddress(target);
+          dead[key] = {
+            until: new Date(Date.now() + DEAD_TARGET_TTL_MS).toISOString(),
+            error: err instanceof Error ? err.message : String(err),
+          };
+          if (target.threadId === null) deadRoots.add(target.platformId);
+          await state.set(recoveryDeadKey, JSON.stringify(dead));
+          log.warn('Channel recovery target parked — permanent failure, next probe in 24h', {
+            adapter: adapter.name,
+            instance: bridgeChannelType,
+            platformId: target.platformId,
+            threadId: target.threadId,
+            err: dead[key].error,
+          });
+        };
+        const classify = (err: unknown): 'permanent' | 'transient' =>
+          config.classifyRecoveryError?.(err) ?? 'transient';
+
         const targetsByAddress = new Map<string, ChannelRecoveryTarget>();
         for (const target of request.targets) {
-          targetsByAddress.set(`${target.platformId}\u0000${target.threadId ?? ''}`, target);
+          if (isDeadTarget(target)) continue;
+          targetsByAddress.set(targetAddress(target), target);
         }
         let failedTargets = 0;
         if (config.discoverRecoveryTargets) {
@@ -1441,7 +1518,22 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               targets: [...targetsByAddress.values()],
             });
             for (const target of discovery.targets) {
-              targetsByAddress.set(`${target.platformId}\u0000${target.threadId ?? ''}`, target);
+              if (isDeadTarget(target)) continue;
+              targetsByAddress.set(targetAddress(target), target);
+            }
+            for (const failure of discovery.failed ?? []) {
+              if (classify(failure.error) === 'permanent') {
+                await parkTarget(failure.target, failure.error);
+                targetsByAddress.delete(targetAddress(failure.target));
+              } else {
+                failedTargets++;
+                log.warn('Channel recovery target discovery failed', {
+                  adapter: adapter.name,
+                  platformId: failure.target.platformId,
+                  since: effectiveSince,
+                  err: failure.error instanceof Error ? failure.error.message : String(failure.error),
+                });
+              }
             }
             if (!discovery.complete) failedTargets++;
           } catch (err) {
@@ -1521,20 +1613,32 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               });
             }
           } catch (err) {
-            failedTargets++;
-            log.warn('Channel recovery target fetch failed', {
-              adapter: adapter.name,
-              targetThreadId,
-              since: effectiveSince,
-              err: err instanceof Error ? err.message : String(err),
-            });
+            if (classify(err) === 'permanent') {
+              await parkTarget(target, err);
+            } else {
+              failedTargets++;
+              log.warn('Channel recovery target fetch failed', {
+                adapter: adapter.name,
+                targetThreadId,
+                since: effectiveSince,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
         }
 
         recovered.sort((a, b) => a.message.metadata.dateSent.getTime() - b.message.metadata.dateSent.getTime());
+        const routeStartedAtMs = Date.now();
         let recoveredMessages = 0;
         let newestRecoveredAt = 0;
         for (const { target, message } of recovered) {
+          // Routing does synchronous DB work (better-sqlite3): yield to the
+          // macrotask queue every few messages so a large recovered batch
+          // cannot block the event loop past the stall threshold and
+          // re-trigger recovery (the stall→recovery→stall feedback loop).
+          if (recoveredMessages > 0 && recoveredMessages % 10 === 0) {
+            await new Promise((resolve) => setImmediate(resolve));
+          }
           let threadId = target.threadId;
           if (target.isDM) {
             threadId = message.threadId;
@@ -1575,6 +1679,19 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // cursor advancement by later live messages until a complete pass.
         if (failedTargets === 0) {
           await completeRecovery(Math.max(newestRecoveredAt, recoveryStartedAtMs));
+        }
+        const routeMs = Date.now() - routeStartedAtMs;
+        const totalMs = Date.now() - recoveryStartedAtMs;
+        if (totalMs >= 1_000) {
+          log.info('Channel recovery pass timing', {
+            adapter: adapter.name,
+            instance: bridgeChannelType,
+            fetchMs: totalMs - routeMs,
+            routeMs,
+            scannedTargets: targets.length,
+            recoveredMessages,
+            failedTargets,
+          });
         }
         return { scannedTargets: targets.length, recoveredMessages, failedTargets };
       });

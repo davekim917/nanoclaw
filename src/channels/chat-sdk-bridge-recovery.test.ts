@@ -463,3 +463,131 @@ describe('Chat SDK bridge Discord approval actions', () => {
     });
   });
 });
+
+describe('Chat SDK bridge dead-target registry', () => {
+  const stubAdapter = (fetchMessages: ReturnType<typeof vi.fn>) =>
+    ({
+      name: 'stub',
+      initialize: async () => {},
+      channelIdFromThreadId: () => 'stub:C',
+      fetchMessages,
+    }) as unknown as Adapter;
+  const setup = {
+    onInbound: async () => {},
+    onInboundEvent: async () => {},
+    onMetadata: () => {},
+    onAction: () => {},
+  } as ChannelSetup;
+  const classify = (err: unknown) =>
+    err instanceof Error && err.message.includes('channel_not_found') ? ('permanent' as const) : ('transient' as const);
+  const readKv = (key: string): string | undefined =>
+    (getDb().prepare('SELECT value FROM chat_sdk_kv WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+
+  it('parks a permanently-failing target, completes the pass, and skips it next pass', async () => {
+    const fetchMessages = vi.fn(async () => {
+      throw new Error('An API error occurred: channel_not_found');
+    });
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter(fetchMessages),
+      supportsThreads: true,
+      classifyRecoveryError: classify,
+    });
+    await bridge.setup(setup);
+
+    await expect(
+      bridge.recoverMissedMessages!({
+        since: '2026-07-21T18:16:00Z',
+        reason: 'transport-ready',
+        targets: [{ platformId: 'stub:C', threadId: null, isDM: false }],
+      }),
+    ).resolves.toEqual({ scannedTargets: 1, recoveredMessages: 0, failedTargets: 0 });
+
+    const dead = JSON.parse(JSON.parse(readKv('nanoclaw:recovery-dead:stub')!)) as Record<string, { error: string }>;
+    expect(Object.values(dead)[0].error).toContain('channel_not_found');
+    // Pass completed → gap floor cleared, cursor advanced (the window is unfrozen).
+    expect(readKv('nanoclaw:recovery-gap:stub')).toBeUndefined();
+
+    fetchMessages.mockClear();
+    await expect(
+      bridge.recoverMissedMessages!({
+        since: '2026-07-21T18:16:00Z',
+        reason: 'event-loop-stall',
+        targets: [{ platformId: 'stub:C', threadId: null, isDM: false }],
+      }),
+    ).resolves.toEqual({ scannedTargets: 0, recoveredMessages: 0, failedTargets: 0 });
+    expect(fetchMessages).not.toHaveBeenCalled();
+  });
+
+  it('parks a target reported failed by discovery with a permanent error', async () => {
+    const fetchMessages = vi.fn(async () => ({ messages: [] }));
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter(fetchMessages),
+      supportsThreads: true,
+      classifyRecoveryError: classify,
+      discoverRecoveryTargets: async () => ({
+        targets: [],
+        complete: true,
+        failed: [
+          { target: { platformId: 'stub:C', threadId: null, isDM: false }, error: new Error('channel_not_found') },
+        ],
+      }),
+    });
+    await bridge.setup(setup);
+
+    await expect(
+      bridge.recoverMissedMessages!({
+        since: '2026-07-21T18:16:00Z',
+        reason: 'transport-ready',
+        targets: [{ platformId: 'stub:C', threadId: null, isDM: false }],
+      }),
+    ).resolves.toEqual({ scannedTargets: 0, recoveredMessages: 0, failedTargets: 0 });
+    expect(fetchMessages).not.toHaveBeenCalled();
+    expect(readKv('nanoclaw:recovery-dead:stub')).toBeDefined();
+  });
+
+  it('re-probes an expired dead entry and clears it on success', async () => {
+    const expired = { 'stub:C-expired-key': { until: '2020-01-01T00:00:00.000Z', error: 'channel_not_found' } };
+    getDb()
+      .prepare('INSERT INTO chat_sdk_kv (key, value, expires_at) VALUES (?, ?, NULL)')
+      .run('nanoclaw:recovery-dead:stub', JSON.stringify(JSON.stringify(expired)));
+    const fetchMessages = vi.fn(async () => ({ messages: [] }));
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter(fetchMessages),
+      supportsThreads: true,
+      classifyRecoveryError: classify,
+    });
+    await bridge.setup(setup);
+
+    await expect(
+      bridge.recoverMissedMessages!({
+        since: '2026-07-21T18:16:00Z',
+        reason: 'transport-ready',
+        targets: [{ platformId: 'stub:C', threadId: null, isDM: false }],
+      }),
+    ).resolves.toEqual({ scannedTargets: 1, recoveredMessages: 0, failedTargets: 0 });
+    expect(fetchMessages).toHaveBeenCalled();
+    const dead = JSON.parse(JSON.parse(readKv('nanoclaw:recovery-dead:stub')!)) as Record<string, unknown>;
+    expect(Object.keys(dead)).toHaveLength(0);
+  });
+
+  it('still fails the pass on a transient error (default classification)', async () => {
+    const fetchMessages = vi.fn(async () => {
+      throw new Error('socket hang up');
+    });
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter(fetchMessages),
+      supportsThreads: true,
+      classifyRecoveryError: classify,
+    });
+    await bridge.setup(setup);
+
+    await expect(
+      bridge.recoverMissedMessages!({
+        since: '2026-07-21T18:16:00Z',
+        reason: 'transport-ready',
+        targets: [{ platformId: 'stub:C', threadId: null, isDM: false }],
+      }),
+    ).resolves.toEqual({ scannedTargets: 1, recoveredMessages: 0, failedTargets: 1 });
+    expect(readKv('nanoclaw:recovery-dead:stub')).toBeUndefined();
+  });
+});

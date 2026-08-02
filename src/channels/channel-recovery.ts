@@ -12,10 +12,22 @@ interface RecoveryDrain {
   promise: Promise<void>;
 }
 
+// Transient-failure retries back off to a 15-minute ceiling and park after
+// 8 consecutive failed passes instead of hammering forever (observed live:
+// a permanently-failing pass retried every 60s for 10 days, refetching the
+// whole recovery window each time). Parked adapters resume on the next
+// transport-level trigger (transport-ready/resumed, host-startup) — those
+// clear the breaker; stall-triggered recovery does NOT, so a recovery storm
+// cannot un-park itself. Dropping the in-memory `since` on un-park is safe:
+// the durable gap floor (chat_sdk_kv) re-applies it inside the bridge.
+const RECOVERY_RETRY_MAX_DELAY_MS = 15 * 60_000;
+const RECOVERY_PARK_AFTER_ATTEMPTS = 8;
+
 interface RecoveryRetry {
   attempt: number;
   timer: NodeJS.Timeout | null;
   info: ChannelConnectionRestored;
+  parked?: boolean;
 }
 
 const recoveries = new Map<string, RecoveryDrain>();
@@ -60,7 +72,17 @@ function scheduleRecoveryRetry(adapter: ChannelAdapter, info: ChannelConnectionR
     if (existing.timer) return;
   }
   const attempt = (existing?.attempt ?? 0) + 1;
-  const delayMs = Math.min(60_000, 1_000 * 2 ** Math.min(attempt - 1, 6));
+  if (attempt > RECOVERY_PARK_AFTER_ATTEMPTS) {
+    recoveryRetries.set(key, { attempt, timer: null, info: existing?.info ?? info, parked: true });
+    log.error('Channel recovery parked after repeated failures — resumes on next transport event', {
+      channelType: adapter.channelType,
+      instance: key,
+      since: (existing?.info ?? info).since,
+      attempt,
+    });
+    return;
+  }
+  const delayMs = Math.min(RECOVERY_RETRY_MAX_DELAY_MS, 1_000 * 2 ** Math.min(attempt - 1, 10));
   const retry: RecoveryRetry = { attempt, timer: null, info: existing?.info ?? info };
   retry.timer = setTimeout(() => {
     retry.timer = null;
@@ -112,7 +134,12 @@ export function getChannelRecoveryTargets(adapter: ChannelAdapter): ChannelRecov
 export function recoverChannelAdapter(adapter: ChannelAdapter, info: ChannelConnectionRestored): Promise<void> {
   if (!adapter.recoverMissedMessages) return Promise.resolve();
   const key = adapterKey(adapter);
-  const retry = recoveryRetries.get(key);
+  let retry = recoveryRetries.get(key);
+  if (retry?.parked) {
+    if (info.reason === 'event-loop-stall') return Promise.resolve();
+    clearRecoveryRetry(key);
+    retry = undefined;
+  }
   if (retry) info = mergeRecoveryInfo(retry.info, info);
   const existing = recoveries.get(key);
   if (existing) {

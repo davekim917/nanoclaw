@@ -39,6 +39,7 @@ describe('Discord recovery target discovery', () => {
         },
       ],
       complete: true,
+      failed: [],
     });
   });
 

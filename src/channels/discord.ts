@@ -51,12 +51,34 @@ function discordThreadTarget(root: ChannelRecoveryTarget, guildId: string, threa
 }
 
 /** Discover threads that received messages during a gap before a session existed. */
+/**
+ * Discord error codes that mean a recovery target is unreachable by WIRING:
+ * the channel/guild is gone or the bot lost access. The bridge parks these
+ * targets instead of failing the pass.
+ */
+const PERMANENT_DISCORD_RECOVERY_CODES = new Set([10003, 10004, 50001]); // Unknown Channel, Unknown Guild, Missing Access
+
+export function classifyDiscordRecoveryError(err: unknown): 'permanent' | 'transient' {
+  const code = (err as { code?: unknown })?.code;
+  if (typeof code === 'number' && PERMANENT_DISCORD_RECOVERY_CODES.has(code)) return 'permanent';
+  const message = err instanceof Error ? err.message : '';
+  return message.includes('Unknown Channel') || message.includes('Unknown Guild') || message.includes('Missing Access')
+    ? 'permanent'
+    : 'transient';
+}
+
 export async function discoverDiscordRecoveryTargets(
   rest: Pick<REST, 'get'>,
   request: ChannelRecoveryRequest,
-): Promise<{ targets: ChannelRecoveryTarget[]; complete: boolean }> {
+): Promise<{
+  targets: ChannelRecoveryTarget[];
+  complete: boolean;
+  failed: Array<{ target: ChannelRecoveryTarget; error: unknown }>;
+}> {
   const roots = request.targets.filter((target) => !target.isDM && target.threadId === null);
   const targets: ChannelRecoveryTarget[] = [];
+  const failed: Array<{ target: ChannelRecoveryTarget; error: unknown }> = [];
+  const failedRootKeys = new Set<string>();
   const rootsByGuild = new Map<string, ChannelRecoveryTarget[]>();
   for (const root of roots) {
     const [, guildId, channelId] = root.platformId.split(':');
@@ -66,59 +88,73 @@ export async function discoverDiscordRecoveryTargets(
     rootsByGuild.set(guildId, guildRoots);
   }
 
+  // Per-guild / per-root fault isolation: one dead channel or guild must not
+  // abort discovery for every other root.
   for (const [guildId, guildRoots] of rootsByGuild) {
-    const active = (await rest.get(Routes.guildActiveThreads(guildId))) as DiscordThreadList;
-    const rootByChannel = new Map(guildRoots.map((root) => [root.platformId.split(':')[2], root]));
-    for (const thread of active.threads ?? []) {
-      const root = thread.parent_id ? rootByChannel.get(thread.parent_id) : undefined;
-      if (root) targets.push(discordThreadTarget(root, guildId, thread.id));
+    try {
+      const active = (await rest.get(Routes.guildActiveThreads(guildId))) as DiscordThreadList;
+      const rootByChannel = new Map(guildRoots.map((root) => [root.platformId.split(':')[2], root]));
+      for (const thread of active.threads ?? []) {
+        const root = thread.parent_id ? rootByChannel.get(thread.parent_id) : undefined;
+        if (root) targets.push(discordThreadTarget(root, guildId, thread.id));
+      }
+    } catch (err) {
+      for (const root of guildRoots) {
+        failed.push({ target: root, error: err });
+        failedRootKeys.add(root.platformId);
+      }
     }
   }
 
   let complete = true;
   const sinceMs = Date.parse(request.since);
   for (const root of roots) {
+    if (failedRootKeys.has(root.platformId)) continue;
     const [, guildId, channelId] = root.platformId.split(':');
     if (!guildId || !channelId) continue;
-    for (const archive of [
-      { route: Routes.channelThreads(channelId, 'public'), cursor: 'timestamp' as const },
-      { route: Routes.channelJoinedArchivedThreads(channelId), cursor: 'snowflake' as const },
-    ]) {
-      let before: string | undefined;
-      let coveredBoundary = false;
-      const seenCursors = new Set<string>();
-      for (;;) {
-        const query = new URLSearchParams({ limit: '100' });
-        if (before) query.set('before', before);
-        const archived = (await rest.get(archive.route, { query })) as DiscordThreadList;
-        const threads = archived.threads ?? [];
-        let oldestArchiveMs = Number.POSITIVE_INFINITY;
-        for (const thread of threads) {
-          targets.push(discordThreadTarget(root, guildId, thread.id));
-          const archivedMs = Date.parse(thread.thread_metadata?.archive_timestamp ?? '');
-          if (Number.isFinite(archivedMs)) oldestArchiveMs = Math.min(oldestArchiveMs, archivedMs);
+    try {
+      for (const archive of [
+        { route: Routes.channelThreads(channelId, 'public'), cursor: 'timestamp' as const },
+        { route: Routes.channelJoinedArchivedThreads(channelId), cursor: 'snowflake' as const },
+      ]) {
+        let before: string | undefined;
+        let coveredBoundary = false;
+        const seenCursors = new Set<string>();
+        for (;;) {
+          const query = new URLSearchParams({ limit: '100' });
+          if (before) query.set('before', before);
+          const archived = (await rest.get(archive.route, { query })) as DiscordThreadList;
+          const threads = archived.threads ?? [];
+          let oldestArchiveMs = Number.POSITIVE_INFINITY;
+          for (const thread of threads) {
+            targets.push(discordThreadTarget(root, guildId, thread.id));
+            const archivedMs = Date.parse(thread.thread_metadata?.archive_timestamp ?? '');
+            if (Number.isFinite(archivedMs)) oldestArchiveMs = Math.min(oldestArchiveMs, archivedMs);
+          }
+          // Public archives are ordered by archive_timestamp, so reaching the
+          // gap boundary proves older pages cannot contain a missed message.
+          // Joined private archives are ordered by thread snowflake instead;
+          // an old private thread can be reactivated during the gap, so that
+          // endpoint must be exhausted regardless of archive timestamps.
+          const reachedTimeBoundary = archive.cursor === 'timestamp' && oldestArchiveMs <= sinceMs;
+          if (reachedTimeBoundary || archived.has_more !== true) {
+            coveredBoundary = true;
+            break;
+          }
+          before =
+            archive.cursor === 'timestamp' ? threads.at(-1)?.thread_metadata?.archive_timestamp : threads.at(-1)?.id;
+          if (!before) break;
+          if (seenCursors.has(before)) break;
+          seenCursors.add(before);
         }
-        // Public archives are ordered by archive_timestamp, so reaching the
-        // gap boundary proves older pages cannot contain a missed message.
-        // Joined private archives are ordered by thread snowflake instead;
-        // an old private thread can be reactivated during the gap, so that
-        // endpoint must be exhausted regardless of archive timestamps.
-        const reachedTimeBoundary = archive.cursor === 'timestamp' && oldestArchiveMs <= sinceMs;
-        if (reachedTimeBoundary || archived.has_more !== true) {
-          coveredBoundary = true;
-          break;
-        }
-        before =
-          archive.cursor === 'timestamp' ? threads.at(-1)?.thread_metadata?.archive_timestamp : threads.at(-1)?.id;
-        if (!before) break;
-        if (seenCursors.has(before)) break;
-        seenCursors.add(before);
+        if (!coveredBoundary) complete = false;
       }
-      if (!coveredBoundary) complete = false;
+    } catch (err) {
+      failed.push({ target: root, error: err });
     }
   }
 
-  return { targets, complete };
+  return { targets, complete, failed };
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -715,6 +751,7 @@ for (const ws of workspaces) {
           return authorId !== identity?.userId && [...knownDiscordBots.values()].some((bot) => bot.userId === authorId);
         },
         discoverRecoveryTargets: (request) => discoverDiscordRecoveryTargets(rest, request),
+        classifyRecoveryError: classifyDiscordRecoveryError,
         fetchThreadAnchor: makeFetchThreadAnchor(ws.botToken),
       });
       bridge.postParent = (platformId, text) => discordPostParent(rest, platformId, text);

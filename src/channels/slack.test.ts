@@ -96,6 +96,7 @@ describe('Slack missed-message recovery', () => {
     expect(result).toEqual({
       targets: [{ platformId: 'slack:C1', threadId: 'slack:C1:1753121820.000001', isDM: false }],
       complete: true,
+      failed: [],
     });
   });
 
@@ -120,6 +121,7 @@ describe('Slack missed-message recovery', () => {
     expect(result).toEqual({
       targets: [{ platformId: 'slack:C1', threadId: 'slack:C1:1650000000.000001', isDM: false }],
       complete: true,
+      failed: [],
     });
   });
 
@@ -161,6 +163,7 @@ describe('Slack missed-message recovery', () => {
     expect(result).toEqual({
       targets: [{ platformId: 'slack:D1', threadId: 'slack:D1:1650000000.000001', isDM: true }],
       complete: true,
+      failed: [],
     });
   });
 });

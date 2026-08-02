@@ -206,3 +206,35 @@ describe('channel recovery coordinator', () => {
     }
   });
 });
+
+describe('recovery retry circuit-breaker', () => {
+  it('parks after repeated failures; stall triggers stay parked, transport triggers resume', async () => {
+    vi.useFakeTimers();
+    try {
+      const recover = vi.fn().mockResolvedValue({ scannedTargets: 1, recoveredMessages: 0, failedTargets: 1 });
+      const live = adapter('slack-park', recover);
+
+      await recoverChannelAdapter(live, { since: '2026-07-21T18:16:00Z', reason: 'host-startup' });
+      expect(recover).toHaveBeenCalledOnce();
+      // Drive the retry ladder: attempts 1..8 run, the 9th schedule parks.
+      for (let i = 0; i < 8; i++) {
+        await vi.advanceTimersByTimeAsync(130_000);
+      }
+      await vi.waitFor(() => expect(recover).toHaveBeenCalledTimes(9));
+      await vi.advanceTimersByTimeAsync(3_600_000);
+      expect(recover).toHaveBeenCalledTimes(9);
+
+      // Parked: a stall-triggered recovery is a no-op — the storm cannot un-park itself.
+      await recoverChannelAdapter(live, { since: '2026-07-21T19:00:00Z', reason: 'event-loop-stall' });
+      expect(recover).toHaveBeenCalledTimes(9);
+
+      // A transport-level trigger clears the breaker and runs with ITS window —
+      // the durable gap floor re-applies the old window inside the bridge.
+      await recoverChannelAdapter(live, { since: '2026-07-21T19:30:00Z', reason: 'transport-ready' });
+      expect(recover).toHaveBeenCalledTimes(10);
+      expect(recover.mock.calls[9][0]).toMatchObject({ since: '2026-07-21T19:30:00Z' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
