@@ -21,6 +21,7 @@ import {
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
   createBlockGitCloneHook,
+  createBlockSnapshotMutationHook,
   createEmailGateHook,
 } from '../providers/claude.js';
 import {
@@ -396,6 +397,7 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
     createSelfApprovalBlockHook(),
     createBlockSnowflakeConnectorHook(),
     createBlockGitCloneHook(),
+    createBlockSnapshotMutationHook(),
     createEmailGateHook(),
   ];
   let currentInput: CodexHookInput = normalized;

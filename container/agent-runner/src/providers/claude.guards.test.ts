@@ -710,19 +710,19 @@ describe('createBlockSnapshotMutationHook (inline fallback — no core mounted)'
   it('blocks a checkout aimed at a snapshot path', async () => {
     const r = await runBashHook(
       createBlockSnapshotMutationHook(),
-      'cd /workspace/workgroup/XZO-ANALYTICS && git checkout XZO-210-obt-drift-fix',
+      'cd /workspace/workgroup/REPO-A && git checkout TICKET-1-fix',
     );
     expect(r.permissionDecision).toBe('deny');
     expect(r.permissionDecisionReason).toContain('read-only snapshot');
   });
 
   it('blocks git -C mutations in a snapshot', async () => {
-    const r = await runBashHook(createBlockSnapshotMutationHook(), 'git -C /workspace/workgroup/XZO commit -am wip');
+    const r = await runBashHook(createBlockSnapshotMutationHook(), 'git -C /workspace/workgroup/REPO-B commit -am wip');
     expect(r.permissionDecision).toBe('deny');
   });
 
   it('allows read-only git in a snapshot', async () => {
-    const r = await runBashHook(createBlockSnapshotMutationHook(), 'git -C /workspace/workgroup/XZO log --oneline -5');
+    const r = await runBashHook(createBlockSnapshotMutationHook(), 'git -C /workspace/workgroup/REPO-B log --oneline -5');
     expect(r.permissionDecision).toBeUndefined();
   });
 
@@ -739,7 +739,7 @@ describe('createBlockSnapshotMutationHook (inline fallback — no core mounted)'
   it('does not false-positive on mutation verbs in ARGUMENTS of read-only commands', async () => {
     const r = await runBashHook(
       createBlockSnapshotMutationHook(),
-      'git -C /workspace/workgroup/XZO log --grep commit --oneline',
+      'git -C /workspace/workgroup/REPO-B log --grep commit --oneline',
     );
     expect(r.permissionDecision).toBeUndefined();
   });

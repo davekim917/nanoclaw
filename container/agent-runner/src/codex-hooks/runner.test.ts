@@ -65,6 +65,22 @@ describe('runPreToolUseChain — guardrails', () => {
     expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
   });
 
+  it('blocks git mutation inside a workgroup snapshot', async () => {
+    const out = (await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'git -C /workspace/workgroup/APOLLO checkout -b feature' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string } };
+    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
+
+  it('allows git mutation inside .worktrees shared checkouts', async () => {
+    const out = (await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'git -C /workspace/workgroup/.worktrees/shared commit -m x' },
+    })) as { continue?: boolean; hookSpecificOutput?: { permissionDecision?: string } };
+    expect(out.hookSpecificOutput?.permissionDecision).toBeUndefined();
+  });
+
   it('blocks .claude-destructive-gate self-approval', async () => {
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',

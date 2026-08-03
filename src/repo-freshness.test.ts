@@ -65,7 +65,7 @@ afterEach(() => {
 
 describe('repo-freshness', () => {
   it('discovers mirrors and creates + advances the detached snapshot to the fetched OID', async () => {
-    const { remote, snapshot } = fixture('illysium', 'proj');
+    const { remote, snapshot } = fixture('acme', 'proj');
     const targets = discoverMirrors(root);
     expect(targets).toHaveLength(1);
 
@@ -81,7 +81,7 @@ describe('repo-freshness', () => {
     expect(git(snapshot, ['rev-parse', 'HEAD'])).toBe(newOid);
     expect(fs.existsSync(path.join(snapshot, 'later.txt'))).toBe(true);
 
-    const freshnessFile = path.join(root, 'illysium', '.repos', 'proj.freshness.json');
+    const freshnessFile = path.join(root, 'acme', '.repos', 'proj.freshness.json');
     const recorded = JSON.parse(fs.readFileSync(freshnessFile, 'utf-8'));
     expect(recorded.oid).toBe(newOid);
     expect(recorded.ref).toBe('refs/heads/main');
@@ -89,7 +89,7 @@ describe('repo-freshness', () => {
   });
 
   it('refuses to advance a dirty snapshot and records the error loudly', async () => {
-    fixture('illysium', 'proj');
+    fixture('acme', 'proj');
     const targets = discoverMirrors(root);
     await refreshOne(targets[0], root);
     const snapshot = targets[0].snapshotPath;
@@ -102,7 +102,7 @@ describe('repo-freshness', () => {
   });
 
   it('marks fetchOk=false and screams when the remote is unreachable', async () => {
-    const { remote } = fixture('illysium', 'proj');
+    const { remote } = fixture('acme', 'proj');
     fs.rmSync(remote, { recursive: true, force: true });
     const [target] = discoverMirrors(root);
     const result = await refreshOne(target, root);
@@ -113,10 +113,10 @@ describe('repo-freshness', () => {
   });
 
   it('runFreshnessOnce covers every workgroup mirror', async () => {
-    fixture('illysium', 'proj-a');
-    fixture('madison-reed', 'proj-b');
+    fixture('acme', 'proj-a');
+    fixture('bluesky', 'proj-b');
     await runFreshnessOnce(root);
-    expect(fs.existsSync(path.join(root, 'illysium', 'proj-a', 'README.md'))).toBe(true);
-    expect(fs.existsSync(path.join(root, 'madison-reed', 'proj-b', 'README.md'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'acme', 'proj-a', 'README.md'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'bluesky', 'proj-b', 'README.md'))).toBe(true);
   });
 });

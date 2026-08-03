@@ -73,7 +73,7 @@ beforeEach(() => {
   // Legacy canonical, parked on a feature branch with mixed dirt.
   canonical = path.join(wgDir, 'PROJ');
   execFileSync('git', ['clone', '-q', remote, canonical], { stdio: 'pipe' });
-  git(canonical, ['checkout', '-q', '-b', 'XZO-210-obt-drift-fix']);
+  git(canonical, ['checkout', '-q', '-b', 'TICKET-1-fix']);
   fs.writeFileSync(path.join(canonical, 'model.sql'), 'select 2 -- parked work\n');
   fs.writeFileSync(path.join(canonical, 'validation.sql'), 'select 3\n');
   fs.mkdirSync(path.join(canonical, '.claude'), { recursive: true });
@@ -119,7 +119,7 @@ describe('migrate-repo-store', () => {
     expect(out).toContain('2 real work file(s)');
     expect(out).toContain('2 injected artifact(s)');
     expect(fs.existsSync(path.join(wgDir, '.repos'))).toBe(false);
-    expect(git(canonical, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('XZO-210-obt-drift-fix');
+    expect(git(canonical, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('TICKET-1-fix');
   });
 
   it('execute converts the layout and preserves every piece of parked work', { timeout: 120_000 }, () => {
@@ -130,7 +130,7 @@ describe('migrate-repo-store', () => {
     const mirror = path.join(wgDir, '.repos', 'PROJ.git');
     expect(git(mirror, ['config', '--get', 'remote.origin.url'])).toBe(remote);
     const branches = git(mirror, ['branch', '--list']);
-    expect(branches).toContain('XZO-210-obt-drift-fix');
+    expect(branches).toContain('TICKET-1-fix');
     expect(branches).toContain('fix/pr213-followups');
     expect(branches).toMatch(/nanoclaw-rescue\//);
 
