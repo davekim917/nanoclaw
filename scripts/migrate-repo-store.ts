@@ -429,8 +429,8 @@ for (const canonical of canonicals) {
       //
       // The refspec is also FORCED: a parked branch whose NAME exists on
       // origin at a different tip gets clobbered by this fetch (and by every
-      // later freshness fetch — apollo-analytics thread-session branch, live
-      // illysium run). Record local tips first; any tip the fetch moves is
+      // later freshness fetch — hit live on a parked thread-session branch
+      // during the first rollout). Record local tips first; any tip the fetch moves is
       // preserved under a LOCAL-ONLY nanoclaw-parked/<run>/ name that origin
       // fetches can never touch — reachable, clonable, in the rescue index.
       const preFetchTips = (tryGit(mirror, ['for-each-ref', '--format=%(refname:short) %(objectname)', 'refs/heads/']) ?? '')
