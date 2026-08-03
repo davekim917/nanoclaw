@@ -258,6 +258,12 @@ function transplant(dir: string, mirror: string, branch: string | null, sha: str
     execFileSync('git', ['clone', '--no-checkout', mirror, temp], { stdio: 'pipe', timeout: 120_000 });
     const realUrl = tryGit(mirror, ['config', '--get', 'remote.origin.url']);
     if (realUrl) git(temp, ['remote', 'set-url', 'origin', realUrl]);
+    // The clone only transfers objects reachable from the mirror's CURRENT
+    // refs; a parked tip preserved under nanoclaw-parked/ (or any sha the
+    // clone missed) is fetched explicitly from the local mirror.
+    if (tryGit(temp, ['cat-file', '-e', `${sha}^{commit}`]) === null) {
+      git(temp, ['fetch', mirror, sha]);
+    }
     if (branch) {
       git(temp, ['update-ref', branch, sha]);
       git(temp, ['symbolic-ref', 'HEAD', branch]);
@@ -420,8 +426,30 @@ for (const canonical of canonicals) {
       // NO --prune: with the +refs/heads/*:refs/heads/* refspec, prune would
       // DELETE the parked/rescue branches this mirror exists to preserve —
       // they don't exist on origin (caught by the e2e test).
+      //
+      // The refspec is also FORCED: a parked branch whose NAME exists on
+      // origin at a different tip gets clobbered by this fetch (and by every
+      // later freshness fetch — apollo-analytics thread-session branch, live
+      // illysium run). Record local tips first; any tip the fetch moves is
+      // preserved under a LOCAL-ONLY nanoclaw-parked/<run>/ name that origin
+      // fetches can never touch — reachable, clonable, in the rescue index.
+      const preFetchTips = (tryGit(mirror, ['for-each-ref', '--format=%(refname:short) %(objectname)', 'refs/heads/']) ?? '')
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => {
+          const sp = l.lastIndexOf(' ');
+          return { branch: l.slice(0, sp), tip: l.slice(sp + 1) };
+        });
       if (tryGit(mirror, ['fetch', 'origin'], 300_000) === null) {
         manualFlags.push(`${repo}: mirror fetch from ${originUrl} failed — snapshot starts at last-known local state`);
+      }
+      for (const { branch: b, tip } of preFetchTips) {
+        if (b.startsWith('nanoclaw-parked/') || b.startsWith('nanoclaw-rescue/')) continue;
+        const now = tryGit(mirror, ['rev-parse', '--verify', `refs/heads/${b}`]);
+        if (now !== tip) {
+          git(mirror, ['update-ref', `refs/heads/nanoclaw-parked/${RUN}/${b}`, tip]);
+          rescueIndex.push(`| ${repo} | ${b} | parked tip preserved as nanoclaw-parked/${RUN}/${b} (origin moved the branch name) |`);
+        }
       }
       const symref = tryGit(mirror, ['ls-remote', '--symref', 'origin', 'HEAD'], 60_000);
       const m = symref?.match(/^ref:\s+(refs\/heads\/\S+)\s+HEAD/m);

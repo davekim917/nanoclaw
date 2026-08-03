@@ -60,8 +60,23 @@ export interface RepoFreshness {
   error?: string;
 }
 
+// The host service runs behind the onecli gateway proxy, which overrides the
+// Authorization header for matched hosts. GitHub creds are env-only (never in
+// the vault), so a proxied fetch always fails auth. Pins are github.com-only;
+// bypass the proxy so git uses the host's own credential helper directly.
+const GIT_ENV = {
+  ...process.env,
+  NO_PROXY: [process.env.NO_PROXY, 'github.com'].filter(Boolean).join(','),
+  no_proxy: [process.env.no_proxy, 'github.com'].filter(Boolean).join(','),
+};
+
 async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileP('git', args, { cwd, timeout: GIT_TIMEOUT_MS, encoding: 'utf-8' });
+  const { stdout } = await execFileP('git', args, {
+    cwd,
+    timeout: GIT_TIMEOUT_MS,
+    encoding: 'utf-8',
+    env: GIT_ENV,
+  });
   return stdout.trim();
 }
 
@@ -231,11 +246,17 @@ export async function refreshOne(target: MirrorTarget, root: string = workgroups
   // mirror/snapshot paths before ANY host git operation touches them.
   const wgRoot = path.join(root, workgroupId);
   if (!containedRealDir(mirrorPath, wgRoot)) {
-    log.error('repo-freshness: mirror path is symlinked or escapes the workgroup tree — skipping', { ...ctx, mirrorPath });
+    log.error('repo-freshness: mirror path is symlinked or escapes the workgroup tree — skipping', {
+      ...ctx,
+      mirrorPath,
+    });
     return { ts, oid: null, ref: null, fetchOk: false, error: 'mirror path rejected' };
   }
   if (fs.existsSync(snapshotPath) && !containedRealDir(snapshotPath, wgRoot)) {
-    log.error('repo-freshness: snapshot path is symlinked or escapes the workgroup tree — skipping', { ...ctx, snapshotPath });
+    log.error('repo-freshness: snapshot path is symlinked or escapes the workgroup tree — skipping', {
+      ...ctx,
+      snapshotPath,
+    });
     return { ts, oid: null, ref: null, fetchOk: false, error: 'snapshot path rejected' };
   }
 
@@ -246,15 +267,34 @@ export async function refreshOne(target: MirrorTarget, root: string = workgroups
   if (mirrorOrigin) {
     if (pinned === undefined) {
       if (!isPinnableOrigin(mirrorOrigin)) {
-        log.error('repo-freshness: mirror origin is not a pinnable github.com HTTPS URL — skipping fetch', { ...ctx, mirrorOrigin });
-        const freshnessEarly: RepoFreshness = { ts, oid: null, ref: null, fetchOk: false, error: 'origin not pinnable' };
+        log.error('repo-freshness: mirror origin is not a pinnable github.com HTTPS URL — skipping fetch', {
+          ...ctx,
+          mirrorOrigin,
+        });
+        const freshnessEarly: RepoFreshness = {
+          ts,
+          oid: null,
+          ref: null,
+          fetchOk: false,
+          error: 'origin not pinnable',
+        };
         writeFreshness(target, freshnessEarly);
         return freshnessEarly;
       }
       writeOriginPin(root, workgroupId, repo, mirrorOrigin);
     } else if (pinned !== mirrorOrigin) {
-      log.error('repo-freshness: mirror origin DRIFTED from host pin — skipping fetch', { ...ctx, pinned, mirrorOrigin });
-      const freshnessDrift: RepoFreshness = { ts, oid: null, ref: null, fetchOk: false, error: 'origin drifted from pin' };
+      log.error('repo-freshness: mirror origin DRIFTED from host pin — skipping fetch', {
+        ...ctx,
+        pinned,
+        mirrorOrigin,
+      });
+      const freshnessDrift: RepoFreshness = {
+        ts,
+        oid: null,
+        ref: null,
+        fetchOk: false,
+        error: 'origin drifted from pin',
+      };
       writeFreshness(target, freshnessDrift);
       return freshnessDrift;
     }
