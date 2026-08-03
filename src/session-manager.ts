@@ -133,6 +133,20 @@ function threadStateDir(platformId: string, threadId: string | null, workgroupId
 
 const THREAD_DIR_OWNER_FILE = '.wg-owner';
 
+/** The pre-namespace state dir for a thread key (exists only for threads
+ *  created before the wg namespace or not yet migrated). */
+export function legacyThreadStateDir(platformId: string, threadId: string | null): string {
+  const tid = threadId ?? `dm-${platformId}`;
+  return path.join(threadsBaseDir(), fsSlug(tid));
+}
+
+/**
+ * Sentinel owner that matches no real workgroup id (real ids never contain
+ * spaces). Stamped when DB ownership of a legacy dir is ambiguous — every
+ * workgroup then resolves to its own scoped dir and nobody adopts.
+ */
+export const THREAD_DIR_OWNER_CONFLICT = '!! conflict';
+
 export function readThreadDirOwner(stateDir: string): string | null {
   try {
     return fs.readFileSync(path.join(stateDir, THREAD_DIR_OWNER_FILE), 'utf-8').trim() || null;

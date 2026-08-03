@@ -586,20 +586,34 @@ export const cloneRepoTool: McpToolDefinition = {
     if (fs.existsSync(workgroupDir())) {
       const mirror = mirrorDir(repoName);
       try { fs.mkdirSync(path.dirname(mirror), { recursive: true }); } catch { /* ignore */ }
+      // Clone into a UNIQUE temp path and rename into place. Two sibling
+      // agents can race this branch; cloning straight at the final path
+      // would make the loser's cleanup delete the winner's valid mirror
+      // (codex native review P1 #8). We only ever create/remove OUR temp;
+      // the final path is claimed by one atomic rename.
+      const mirrorTmp = `${mirror}.tmp-${process.pid}-${Date.now()}`;
       try {
-        execFileSync('git', ['clone', '--bare', url, mirror], { stdio: 'pipe', timeout: 300_000 });
+        execFileSync('git', ['clone', '--bare', url, mirrorTmp], { stdio: 'pipe', timeout: 300_000 });
         // Bare clones get no fetch refspec; the freshness worker's plain
         // `git fetch origin` must advance refs/heads. Config failure fails
         // the clone — a refspec-less mirror looks valid but stays stale
         // forever. gc.auto=0: automatic repack/prune in the mirror could race
         // a container clone reading its objects; the mirror only ever grows
         // via fetch, so gc is an operator action, not automatic.
-        runGit(mirror, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*']);
-        runGit(mirror, ['config', 'gc.auto', '0']);
+        runGit(mirrorTmp, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*']);
+        runGit(mirrorTmp, ['config', 'gc.auto', '0']);
+        fs.renameSync(mirrorTmp, mirror);
       } catch (e) {
-        // Never leave a partial dir behind — it would satisfy mirrorPresent()
-        // and hard-error every subsequent call (codex phase-B/C review #5).
-        try { fs.rmSync(mirror, { recursive: true, force: true }); } catch { /* ignore */ }
+        try { fs.rmSync(mirrorTmp, { recursive: true, force: true }); } catch { /* ignore */ }
+        // Lost the race to a concurrent winner? Their mirror is the repo.
+        const winner = resolveMirror(repoName);
+        if (winner) {
+          const winnerOrigin = tryGit(winner, ['config', '--get', 'remote.origin.url']);
+          if (winnerOrigin && originsMatch(winnerOrigin, url)) {
+            log(`clone_repo: lost creation race for ${repoName}, reusing winner ${winner}`);
+            return ok(`Repo already present (mirror at ${winner}); use create_worktree to work on it.`);
+          }
+        }
         const msg = e instanceof Error ? e.message : String(e);
         return err(`git clone --bare failed: ${msg}`);
       }

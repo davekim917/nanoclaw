@@ -100,6 +100,9 @@ import {
   threadGraphifyCacheDir,
   threadWorktreeDir,
   stampThreadDirOwner,
+  readThreadDirOwner,
+  legacyThreadStateDir,
+  THREAD_DIR_OWNER_CONFLICT,
   writeSessionRouting,
 } from './session-manager.js';
 import { resolveStoragePolicy } from './storage-manager.js';
@@ -1481,6 +1484,40 @@ export function buildMounts(
   // Workgroup key for every thread-scoped/shared path below — resolved once
   // so mounts, overlay allowlist, and the workgroup tree agree.
   const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
+
+  // Unstamped legacy thread dirs are stamped from DB-proven ownership BEFORE
+  // any path resolution (codex native review P1 #3): first-caller adoption
+  // would hand workgroup A's dir to workgroup B on a colliding thread key.
+  // Sole DB owner → stamp that owner; ambiguous → stamp a conflict sentinel
+  // so every workgroup resolves to its own scoped dir.
+  if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
+    const mgForStamp = getMessagingGroup(session.messaging_group_id);
+    if (mgForStamp) {
+      const legacyDir = legacyThreadStateDir(mgForStamp.platform_id, session.thread_id);
+      if (fs.existsSync(legacyDir) && readThreadDirOwner(legacyDir) === null) {
+        const owners = getDb()
+          .prepare(
+            `SELECT DISTINCT COALESCE(ag.workgroup_id, ag.folder) AS wg
+               FROM sessions s
+               JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+               JOIN agent_groups ag ON ag.id = s.agent_group_id
+              WHERE mg.platform_id = ? AND s.thread_id IS ?`,
+          )
+          .all(mgForStamp.platform_id, session.thread_id) as Array<{ wg: string }>;
+        const distinct = owners.map((o) => o.wg);
+        if (distinct.length === 1) {
+          stampThreadDirOwner(legacyDir, distinct[0]);
+        } else if (distinct.length > 1) {
+          log.warn('Thread dir ownership ambiguous — stamping conflict sentinel, all workgroups use scoped dirs', {
+            platformId: mgForStamp.platform_id,
+            threadId: session.thread_id,
+            owners: distinct,
+          });
+          stampThreadDirOwner(legacyDir, THREAD_DIR_OWNER_CONFLICT);
+        }
+      }
+    }
+  }
   let graphifyCache = sessionGraphifyCacheDir(agentGroup.id, session.id);
   if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
     const mg = getMessagingGroup(session.messaging_group_id);

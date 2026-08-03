@@ -144,6 +144,11 @@ describe('migrate-repo-store', () => {
     const rescueBranch = git(mirror, ['branch', '--list', 'nanoclaw-rescue/*']).replace(/^\*?\s*/, '');
     const rescued = git(mirror, ['show', `${rescueBranch}:validation.sql`]);
     expect(rescued).toBe('select 3');
+    // Injected artifacts must NOT ride along on the rescue branch (they are
+    // preserved in the tarball + moved canonical instead).
+    const rescueFiles = git(mirror, ['ls-tree', '-r', '--name-only', rescueBranch]);
+    expect(rescueFiles).not.toContain('AGENTS.md');
+    expect(rescueFiles).not.toContain('.claude/settings.json');
 
     // Named worktree with unpushed commits: standalone clone under
     // .worktrees/, discoverable through a root symlink.

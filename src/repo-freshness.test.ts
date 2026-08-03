@@ -53,10 +53,14 @@ function advanceRemote(remote: string, file: string): string {
 beforeEach(() => {
   vi.clearAllMocks();
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'repo-freshness-'));
+  // Fixture remotes are local paths; production pins github-only origins.
+  process.env.NANOCLAW_FRESHNESS_ALLOW_ANY_ORIGIN = '1';
 });
 
 afterEach(() => {
+  delete process.env.NANOCLAW_FRESHNESS_ALLOW_ANY_ORIGIN;
   fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(`${root}.repo-pins`, { recursive: true, force: true });
 });
 
 describe('repo-freshness', () => {
@@ -65,14 +69,14 @@ describe('repo-freshness', () => {
     const targets = discoverMirrors(root);
     expect(targets).toHaveLength(1);
 
-    const first = await refreshOne(targets[0]);
+    const first = await refreshOne(targets[0], root);
     expect(first.fetchOk).toBe(true);
     expect(fs.existsSync(path.join(snapshot, 'README.md'))).toBe(true);
     // Detached — no branch to park.
     expect(git(snapshot, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('HEAD');
 
     const newOid = advanceRemote(remote, 'later.txt');
-    const second = await refreshOne(targets[0]);
+    const second = await refreshOne(targets[0], root);
     expect(second.oid).toBe(newOid);
     expect(git(snapshot, ['rev-parse', 'HEAD'])).toBe(newOid);
     expect(fs.existsSync(path.join(snapshot, 'later.txt'))).toBe(true);
@@ -87,11 +91,11 @@ describe('repo-freshness', () => {
   it('refuses to advance a dirty snapshot and records the error loudly', async () => {
     fixture('illysium', 'proj');
     const targets = discoverMirrors(root);
-    await refreshOne(targets[0]);
+    await refreshOne(targets[0], root);
     const snapshot = targets[0].snapshotPath;
     fs.writeFileSync(path.join(snapshot, 'README.md'), 'local edit\n');
 
-    const result = await refreshOne(targets[0]);
+    const result = await refreshOne(targets[0], root);
     expect(result.error).toBe('snapshot has local modifications');
     expect(fs.readFileSync(path.join(snapshot, 'README.md'), 'utf-8')).toBe('local edit\n');
     expect(log.error).toHaveBeenCalled();
@@ -101,7 +105,7 @@ describe('repo-freshness', () => {
     const { remote } = fixture('illysium', 'proj');
     fs.rmSync(remote, { recursive: true, force: true });
     const [target] = discoverMirrors(root);
-    const result = await refreshOne(target);
+    const result = await refreshOne(target, root);
     expect(result.fetchOk).toBe(false);
     expect(log.error).toHaveBeenCalled();
     // Snapshot still materializes from the mirror's last-known state.

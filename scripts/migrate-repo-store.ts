@@ -116,20 +116,37 @@ function classifyDirt(statusPorcelain: string): { injected: string[]; real: stri
   const injected: string[] = [];
   const real: string[] = [];
   for (const line of statusPorcelain.split('\n').filter(Boolean)) {
-    const file = line.slice(3).split(' -> ').pop()!;
+    // git() trims output, so the FIRST line loses its leading status space
+    // (` M x` → `M x`) — a fixed slice(3) truncates that filename. Parse the
+    // 1-2 char status token explicitly instead.
+    const m = line.match(/^[MTADRCU?!\s]{1,2}\s(.*)$/);
+    const file = (m ? m[1] : line).split(' -> ').pop()!;
     (INJECTED_PATTERNS.some((re) => re.test(file)) ? injected : real).push(file);
   }
   return { injected, real };
 }
 
 function ensureQuiesced(): void {
+  // Container names derive from agent_groups.folder, NOT the workgroup id —
+  // filter by every member folder (codex native review P1 #1). No DB means
+  // we cannot enumerate members: refuse unless --force.
+  const members = workgroupAgentGroups();
+  if (members === null) {
+    if (args.includes('--force')) {
+      console.warn('WARNING: central DB unavailable — member containers unverifiable, continuing under --force.');
+      return;
+    }
+    console.error('REFUSING to execute: central DB unavailable, cannot enumerate member containers. Pass --force to override.');
+    process.exit(2);
+  }
   let out = '';
   try {
-    out = execFileSync(
-      'docker',
-      ['ps', '--filter', `name=nanoclaw-v2-${WG}`, '--format', '{{.Names}}'],
-      { stdio: 'pipe', encoding: 'utf-8' },
-    ).toString().trim();
+    out = execFileSync('docker', ['ps', '--format', '{{.Names}}'], { stdio: 'pipe', encoding: 'utf-8' })
+      .toString()
+      .trim()
+      .split('\n')
+      .filter((name) => members.some((m) => name.startsWith(`nanoclaw-v2-${m.folder}-`) || name === `nanoclaw-v2-${m.folder}`))
+      .join('\n');
   } catch {
     // Quiesce is a hard precondition — an unverifiable state is a refusal,
     // not a shrug (codex final review P1 #5). --force overrides on the
@@ -366,7 +383,11 @@ for (const canonical of canonicals) {
   if (real.length > 0) {
     act('rescue-commit', `${repo}: commit ${real.length} real-work file(s) → ${rescueBranch}`, () => {
       git(canonical, ['checkout', '-b', rescueBranch]);
-      git(canonical, ['add', '-A']);
+      // Stage ONLY the classified real-work paths — `add -A` would also
+      // commit (and best-effort push) the injected artifacts this migration
+      // promises to exclude (codex native review P1 #2). `-A --` handles
+      // deletions and renames within the given pathspecs.
+      git(canonical, ['add', '-A', '--', ...real]);
       git(canonical, [
         '-c', 'user.email=migration@nanoclaw.local', '-c', 'user.name=nanoclaw-migration',
         'commit', '--no-verify', '-m', `nanoclaw-rescue: parked working-tree changes from ${branch} (${RUN})`,
@@ -479,22 +500,37 @@ for (const canonical of canonicals) {
 // groups and thread dirs whose key belongs to THIS workgroup. No DB → skip
 // the pass entirely (fail-safe, flagged).
 
-function workgroupAgentGroupIds(): Set<string> | null {
+let cachedMembers: Array<{ id: string; folder: string }> | null | undefined;
+function workgroupAgentGroups(): Array<{ id: string; folder: string }> | null {
+  if (cachedMembers !== undefined) return cachedMembers;
   const centralDb = path.join(DATA_DIR, 'v2.db');
-  if (!fs.existsSync(centralDb)) return null;
+  if (!fs.existsSync(centralDb)) return (cachedMembers = null);
   try {
     const out = execFileSync(
       'pnpm',
       [
         'exec', 'tsx', path.join(import.meta.dirname, 'q.ts'), centralDb,
-        `SELECT id FROM agent_groups WHERE COALESCE(workgroup_id, folder) = '${WG.replace(/'/g, "''")}'`,
+        `SELECT id, folder FROM agent_groups WHERE COALESCE(workgroup_id, folder) = '${WG.replace(/'/g, "''")}'`,
       ],
       { cwd: path.join(import.meta.dirname, '..'), stdio: 'pipe', encoding: 'utf-8', timeout: 60_000 },
     ).toString();
-    return new Set(out.split('\n').map((l) => l.trim()).filter(Boolean));
+    cachedMembers = out
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .map((l) => {
+        const [id, folder] = l.split('|');
+        return { id, folder };
+      });
+    return cachedMembers;
   } catch {
-    return null;
+    return (cachedMembers = null);
   }
+}
+
+function workgroupAgentGroupIds(): Set<string> | null {
+  const members = workgroupAgentGroups();
+  return members === null ? null : new Set(members.map((m) => m.id));
 }
 
 interface ThreadWt {
