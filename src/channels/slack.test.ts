@@ -7,8 +7,16 @@ import {
   slackCreateThread,
   discoverSlackRecoveryTargets,
   makeSlackRecoveryPageFetcher,
+  SLACK_MESSAGE_MAX_TEXT_LENGTH,
   type SlackPostMessageClient,
 } from './slack.js';
+
+describe('Slack outbound limits', () => {
+  it('keeps bridge chunks below the Block Kit section-text ceiling', () => {
+    expect(SLACK_MESSAGE_MAX_TEXT_LENGTH).toBeGreaterThan(0);
+    expect(SLACK_MESSAGE_MAX_TEXT_LENGTH).toBeLessThan(3000);
+  });
+});
 
 describe('Slack missed-message recovery', () => {
   it('parses channel-root history with each message native thread id', async () => {

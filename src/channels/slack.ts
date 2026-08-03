@@ -45,6 +45,11 @@ import {
   type SlackBotIdentity,
 } from './slack-mentions.js';
 
+// Slack Block Kit section text objects cap at 3,000 characters. Keep a
+// little headroom for adapter-side serialization while preserving complete
+// replies by letting the shared bridge split longer chat messages.
+export const SLACK_MESSAGE_MAX_TEXT_LENGTH = 2800;
+
 /**
  * Fetch the workspace's human members and register them for outbound
  * mention resolution. Bots/apps/deleted users are excluded — bot mentions
@@ -379,6 +384,7 @@ for (const ws of workspaces) {
         adapter: slackAdapter,
         concurrency: 'concurrent',
         supportsThreads: true,
+        maxTextLength: SLACK_MESSAGE_MAX_TEXT_LENGTH,
         channelType: ws.channelType,
         // ATX headings → bold so Block Kit table delivery stays on the
         // `markdown` path (table-block conversion only fires for markdown/ast
