@@ -664,3 +664,36 @@ describe('resolveInboundSlackIds', () => {
     }
   });
 });
+
+// Wire-level contract with the PATCHED @chat-adapter/slack (mirrors the
+// discord.test.ts patched-adapter suite). The vendor `finalize()` rewrote
+// bare `@name` to `<@name>` across the WHOLE markdown string — code spans
+// included — so the documented gate syntax the agent correctly wrote as
+// `` `@skipper hold 281` `` reached Slack as `<@skipper>`, was resolved
+// server-side to the raw `<@USERID>` form, and rendered as unreadable
+// literal text inside the code span. The patch scopes the rewrite to
+// non-code segments only.
+describe('patched @chat-adapter/slack finalize (code spans stay literal)', async () => {
+  const { SlackFormatConverter } = await import('@chat-adapter/slack');
+
+  function payload(markdown: string): string {
+    const converter = new SlackFormatConverter();
+    return (converter as unknown as { toSlackPayload(m: object): { markdown_text: string } }).toSlackPayload({
+      markdown,
+    }).markdown_text;
+  }
+
+  it('keeps gate syntax inside inline code as plain @name', () => {
+    expect(payload('confirm here, or `@skipper hold 281`')).toBe('confirm here, or `@skipper hold 281`');
+  });
+
+  it('keeps fenced blocks untouched', () => {
+    expect(payload('```\n@skipper ship 297\n```')).toBe('```\n@skipper ship 297\n```');
+  });
+
+  it('still rewrites bare mentions in prose', () => {
+    expect(payload('mixed `@skipper hold 1` and prose @skipper here')).toBe(
+      'mixed `@skipper hold 1` and prose <@skipper> here',
+    );
+  });
+});

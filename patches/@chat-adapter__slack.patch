@@ -1,0 +1,26 @@
+diff --git a/dist/index.js b/dist/index.js
+index dd24754940357407f5116920325c427ffac61d03..4b971177b04d3831ef828fd167a43d67ff2bb250 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -423,10 +423,17 @@ var SlackFormatConverter = class extends BaseFormatConverter {
+     return "";
+   }
+   finalize(text) {
+-    return convertEmojiPlaceholders(
+-      text.replace(BARE_MENTION_REGEX, "<@$1>"),
+-      "slack"
+-    );
++    // Apply the bare-mention rewrite only OUTSIDE code regions. Inside
++    // backticks, `@name` is documented literal text (e.g. gate syntax the
++    // reader is told to type); rewriting it to <@name> makes Slack resolve
++    // and store the raw <@USERID> form, which renders as unreadable literal
++    // text inside a code span. Split keeps code segments (odd indices, via
++    // the capture group) byte-identical.
++    const rewritten = text
++      .split(/(```[\s\S]*?```|`[^`\n]+`)/g)
++      .map((seg, i) => (i % 2 === 1 ? seg : seg.replace(BARE_MENTION_REGEX, "<@$1>")))
++      .join("");
++    return convertEmojiPlaceholders(rewritten, "slack");
+   }
+   astToMrkdwn(ast) {
+     return this.fromAstWithNodeConverter(
