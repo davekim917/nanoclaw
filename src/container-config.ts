@@ -281,6 +281,12 @@ export interface ContainerConfig {
      * set false so the digest carries only backlog activity.
      */
     shipLog?: boolean;
+    /**
+     * Include backlog items resolved during the digest window. Defaults to
+     * true. Set false when another workflow already reports completed work
+     * and this digest should be an open-backlog-only reminder.
+     */
+    resolved?: boolean;
   };
 
   /**

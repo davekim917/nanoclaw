@@ -115,8 +115,13 @@ async function fireDigests(): Promise<void> {
       const summary = buildSummary(members, since);
       if (isEmpty(summary)) continue;
 
-      const includeShipLog = readContainerConfig(poster.folder).dailySummary?.shipLog !== false;
-      const { parent, backlogThread } = formatDigestParts(workgroupId, summary, { includeShipLog });
+      const dailySummaryConfig = readContainerConfig(poster.folder).dailySummary;
+      const includeShipLog = dailySummaryConfig?.shipLog !== false;
+      const includeResolved = dailySummaryConfig?.resolved !== false;
+      const { parent, backlogThread } = formatDigestParts(workgroupId, summary, {
+        includeShipLog,
+        includeResolved,
+      });
       const parentId = await adapter.deliver(
         target.channel_type,
         target.platform_id,
@@ -131,7 +136,13 @@ async function fireDigests(): Promise<void> {
         // id (platform can't thread) → second channel message instead.
         const threadId = parentId ? `${target.platform_id}:${parentId}` : null;
         const sendThread = () =>
-          adapter.deliver(target.channel_type, target.platform_id, threadId, 'chat', JSON.stringify({ text: backlogThread }));
+          adapter.deliver(
+            target.channel_type,
+            target.platform_id,
+            threadId,
+            'chat',
+            JSON.stringify({ text: backlogThread }),
+          );
         try {
           await sendThread();
         } catch (firstErr) {
@@ -283,7 +294,7 @@ function resolveTarget(poster: AgentGroup): MessagingGroup | null {
 export function formatDigestParts(
   label: string,
   s: Summary,
-  opts: { includeShipLog?: boolean } = {},
+  opts: { includeShipLog?: boolean; includeResolved?: boolean } = {},
 ): { parent: string; backlogThread: string | null } {
   const lines: string[] = [`📋 **Daily Summary** — ${label}`];
 
@@ -292,7 +303,7 @@ export function formatDigestParts(
     appendShipSection(lines, '🛠 **Other commits**', s.otherCommits);
   }
 
-  if (s.resolved.length > 0) {
+  if (opts.includeResolved !== false && s.resolved.length > 0) {
     lines.push('', `✅ **Resolved** (${s.resolved.length}):`);
     for (const item of s.resolved) {
       const emoji = item.status === 'resolved' ? '✅' : '🚫';

@@ -257,6 +257,22 @@ describe('formatDigest', () => {
     expect(parent).toContain('📌 **Open Backlog** (1)');
   });
 
+  it('resolved:false produces an open-backlog-only parent when shipLog is also false', () => {
+    const { parent, backlogThread } = formatDigestParts(
+      WG,
+      {
+        ...emptySummary(),
+        agentShipped: [shipEntry({ title: 'agent-ship' })],
+        otherCommits: [shipEntry({ title: 'human-ship', tags: 'commit-digest,repo' })],
+        resolved: [backlogItem({ id: 'r1', title: 'fixed-thing', status: 'resolved' })],
+        openBacklog: [backlogItem({ id: 'b1', title: 'open-thing', priority: 'high', status: 'open' })],
+      },
+      { includeShipLog: false, includeResolved: false },
+    );
+    expect(parent).toBe('📋 **Daily Summary** — example-retail\n\n📌 **Open Backlog** (1) — ranked list in 🧵');
+    expect(backlogThread).toContain('🔴 open-thing');
+  });
+
   it('omits sections that have no entries', () => {
     const out = formatDigest(WG, {
       ...emptySummary(),
