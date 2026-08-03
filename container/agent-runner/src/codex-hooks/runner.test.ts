@@ -68,7 +68,7 @@ describe('runPreToolUseChain — guardrails', () => {
   it('blocks git mutation inside a workgroup snapshot', async () => {
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
-      tool_input: { command: 'git -C /workspace/workgroup/APOLLO checkout -b feature' },
+      tool_input: { command: 'git -C /workspace/workgroup/REPO-A checkout -b feature' },
     })) as { hookSpecificOutput?: { permissionDecision?: string } };
     expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
   });
