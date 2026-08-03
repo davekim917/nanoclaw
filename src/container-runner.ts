@@ -54,7 +54,12 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 // ensureOpus1mSuffix — see its use below.
 import { resolveEffectiveModel, DEFAULT_OPUS_MODEL, DEFAULT_SONNET_MODEL, DEFAULT_HAIKU_MODEL } from './flag-parser.js';
 import { readEnvFileMatching } from './env.js';
-import { getAgentGroup, getWorkgroupOnecliSecrets, getWorkgroupOnecliSecretsById } from './db/agent-groups.js';
+import {
+  getAgentGroup,
+  getAllAgentGroups,
+  getWorkgroupOnecliSecrets,
+  getWorkgroupOnecliSecretsById,
+} from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-projections.js';
@@ -94,6 +99,10 @@ import {
   sessionDir,
   threadGraphifyCacheDir,
   threadWorktreeDir,
+  stampThreadDirOwner,
+  readThreadDirOwner,
+  legacyThreadStateDir,
+  THREAD_DIR_OWNER_CONFLICT,
   writeSessionRouting,
 } from './session-manager.js';
 import { resolveStoragePolicy } from './storage-manager.js';
@@ -519,7 +528,9 @@ async function acquireContainerStorageActivity(session: Session): Promise<Storag
   const roots = new Set<string>([sessionDir(session.agent_group_id, session.id)]);
   if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
     const mg = getMessagingGroup(session.messaging_group_id);
-    if (mg) roots.add(threadWorktreeDir(mg.platform_id, session.thread_id));
+    const ag = getAgentGroup(session.agent_group_id);
+    if (mg)
+      roots.add(threadWorktreeDir(mg.platform_id, session.thread_id, ag ? (ag.workgroup_id ?? ag.folder) : undefined));
   }
 
   const leases: StorageActivityLease[] = [];
@@ -1470,10 +1481,47 @@ export function buildMounts(
   // sessions keep an isolated cache; thread-worktree siblings share the cache
   // derived from the same platform/thread key. Runtime coordination remains
   // install-scoped and is never placed under a source checkout or host home.
+  // Workgroup key for every thread-scoped/shared path below — resolved once
+  // so mounts, overlay allowlist, and the workgroup tree agree.
+  const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
+
+  // Unstamped legacy thread dirs are stamped from DB-proven ownership BEFORE
+  // any path resolution (codex native review P1 #3): first-caller adoption
+  // would hand workgroup A's dir to workgroup B on a colliding thread key.
+  // Sole DB owner → stamp that owner; ambiguous → stamp a conflict sentinel
+  // so every workgroup resolves to its own scoped dir.
+  if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
+    const mgForStamp = getMessagingGroup(session.messaging_group_id);
+    if (mgForStamp) {
+      const legacyDir = legacyThreadStateDir(mgForStamp.platform_id, session.thread_id);
+      if (fs.existsSync(legacyDir) && readThreadDirOwner(legacyDir) === null) {
+        const owners = getDb()
+          .prepare(
+            `SELECT DISTINCT COALESCE(ag.workgroup_id, ag.folder) AS wg
+               FROM sessions s
+               JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+               JOIN agent_groups ag ON ag.id = s.agent_group_id
+              WHERE mg.platform_id = ? AND s.thread_id IS ?`,
+          )
+          .all(mgForStamp.platform_id, session.thread_id) as Array<{ wg: string }>;
+        const distinct = owners.map((o) => o.wg);
+        if (distinct.length === 1) {
+          stampThreadDirOwner(legacyDir, distinct[0]);
+        } else if (distinct.length > 1) {
+          log.warn('Thread dir ownership ambiguous — stamping conflict sentinel, all workgroups use scoped dirs', {
+            platformId: mgForStamp.platform_id,
+            threadId: session.thread_id,
+            owners: distinct,
+          });
+          stampThreadDirOwner(legacyDir, THREAD_DIR_OWNER_CONFLICT);
+        }
+      }
+    }
+  }
   let graphifyCache = sessionGraphifyCacheDir(agentGroup.id, session.id);
   if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
     const mg = getMessagingGroup(session.messaging_group_id);
-    if (mg) graphifyCache = threadGraphifyCacheDir(mg.platform_id, session.thread_id);
+    if (mg) graphifyCache = threadGraphifyCacheDir(mg.platform_id, session.thread_id, wgKey);
   }
   const graphifyRuntime = graphifyRuntimeDir();
   fs.mkdirSync(graphifyCache, { recursive: true });
@@ -1505,8 +1553,12 @@ export function buildMounts(
     // so collaborative code edits in a thread are visible across siblings.
     const mg = getMessagingGroup(session.messaging_group_id);
     if (mg) {
-      const tDir = threadWorktreeDir(mg.platform_id, session.thread_id);
+      const tDir = threadWorktreeDir(mg.platform_id, session.thread_id, wgKey);
       fs.mkdirSync(tDir, { recursive: true });
+      // Stamp workgroup ownership on the state dir (parent of worktrees/) so
+      // the legacy-dir fallback in threadStateDir can refuse cross-workgroup
+      // adoption on colliding platform/thread keys.
+      stampThreadDirOwner(path.dirname(tDir), wgKey);
       mounts.push({ hostPath: tDir, containerPath: '/workspace/worktrees', readonly: false });
     }
   }
@@ -1528,6 +1580,28 @@ export function buildMounts(
   // .claude-shared.md -> /app/CLAUDE.md) are skipped: realpathSync fails
   // on the host because /app doesn't exist there, and the existing /app
   // mount makes the symlink work inside the container anyway.
+  //
+  // SECURITY: the group dir is mounted RW at /workspace/agent, so an agent can
+  // plant a symlink here pointing anywhere on the host and it would be
+  // RW-mounted into its own container on the next spawn. Only overlay targets
+  // that this agent is entitled to see anyway: its own group dir, a sibling
+  // group dir in the SAME workgroup, or the workgroup shared tree. Anything
+  // else is skipped with a loud warning.
+  const allowedOverlayRoots = [
+    workgroupSharedDir(wgKey),
+    ...getAllAgentGroups()
+      .filter((g) => (g.workgroup_id ?? g.folder) === wgKey)
+      .map((g) => path.resolve(GROUPS_DIR, g.folder)),
+    groupDir,
+  ].map((p) => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  });
+  const isAllowedOverlayTarget = (target: string): boolean =>
+    allowedOverlayRoots.some((root) => target === root || target.startsWith(root + path.sep));
   for (const entry of fs.readdirSync(groupDir, { withFileTypes: true })) {
     if (!entry.isSymbolicLink()) continue;
     const linkPath = path.join(groupDir, entry.name);
@@ -1537,7 +1611,20 @@ export function buildMounts(
     } catch {
       continue;
     }
-    mounts.push({ hostPath: realTarget, containerPath: `/workspace/agent/${entry.name}`, readonly: false });
+    if (!isAllowedOverlayTarget(realTarget)) {
+      log.warn('Refusing symlink-overlay mount outside workgroup boundary', {
+        agentGroupId: agentGroup.id,
+        link: linkPath,
+        target: realTarget,
+      });
+      continue;
+    }
+    mounts.push({
+      hostPath: realTarget,
+      containerPath: `/workspace/agent/${entry.name}`,
+      readonly: false,
+      overlayAllowedRoots: allowedOverlayRoots,
+    });
   }
 
   // Workgroup shared filesystem — flag-gated. Bind-mount data/workgroups/<id>/
@@ -1552,11 +1639,60 @@ export function buildMounts(
   // been settled by reconcileWorkgroupAtSpawn under the writer lock, so every
   // subsystem inside this spawn sees the same value. Fall back to the
   // agentGroup field for direct callers (tests, scripts).
-  const wgId = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
+  const wgId = wgKey;
   const wgShared = workgroupSharedDir(wgId);
   if (WORKGROUP_SHARED_FS || fs.existsSync(path.join(wgShared, '.migrated'))) {
     fs.mkdirSync(wgShared, { recursive: true });
     mounts.push({ hostPath: wgShared, containerPath: WORKGROUP_CONTAINER_PATH, readonly: false });
+
+    // Browsing snapshots of migrated repos are READ-ONLY — enforcement, not
+    // advisory. For each bare mirror `.repos/<name>.git`, the snapshot at the
+    // old canonical path `<wgShared>/<name>` gets a nested RO mount on top of
+    // the RW workgroup mount, making "cd into the canonical and checkout a
+    // branch" (the stale-tree failure mode) impossible rather than
+    // discouraged. A repo cloned mid-session gains its RO overlay on the next
+    // respawn — bounded, and the freshness worker owns the tree meanwhile.
+    const wgReposDir = path.join(wgShared, '.repos');
+    if (fs.existsSync(wgReposDir)) {
+      // Same containment discipline as the symlink-overlay mounts: the
+      // workgroup tree is agent-writable, so an agent could replace a
+      // snapshot dir with a symlink pointing anywhere on the host and get it
+      // mounted (RO, but a cross-boundary READ). Mount only real
+      // directories whose realpath stays inside this workgroup's tree, and
+      // re-validate at docker-args time via overlayAllowedRoots.
+      let wgSharedReal: string;
+      try {
+        wgSharedReal = fs.realpathSync(wgShared);
+      } catch {
+        wgSharedReal = path.resolve(wgShared);
+      }
+      for (const entry of fs.readdirSync(wgReposDir, { withFileTypes: true })) {
+        if (!entry.name.endsWith('.git') || entry.isSymbolicLink() || !entry.isDirectory()) continue;
+        const snapName = entry.name.slice(0, -'.git'.length);
+        const snapDir = path.join(wgShared, snapName);
+        let snapReal: string;
+        try {
+          if (fs.lstatSync(snapDir).isSymbolicLink()) {
+            log.warn('Refusing snapshot mount: path is a symlink', { wgId, snapDir });
+            continue;
+          }
+          snapReal = fs.realpathSync(snapDir);
+        } catch {
+          continue;
+        }
+        if (snapReal !== wgSharedReal && !snapReal.startsWith(wgSharedReal + path.sep)) {
+          log.warn('Refusing snapshot mount outside workgroup tree', { wgId, snapDir, target: snapReal });
+          continue;
+        }
+        if (!fs.existsSync(path.join(snapDir, '.git'))) continue;
+        mounts.push({
+          hostPath: snapReal,
+          containerPath: `${WORKGROUP_CONTAINER_PATH}/${snapName}`,
+          readonly: true,
+          overlayAllowedRoots: [wgSharedReal],
+        });
+      }
+    }
   }
   // These nested mounts are unconditional. In memory-only mode
   // /workspace/workgroup itself is container-local, so the lock needs its own
@@ -3322,6 +3458,27 @@ async function buildContainerArgs(
 
   // Volume mounts
   for (const mount of mounts) {
+    // Symlink-overlay sources live under agent-writable trees; re-validate at
+    // the last moment before the docker arg is emitted so a target swapped
+    // after buildMounts' check aborts the spawn instead of mounting. Docker's
+    // -v takes a pathname (no fd-based binds), so a sub-millisecond race
+    // between this check and runc's own resolution remains — accepted: it
+    // requires a concurrent same-workgroup process, which already shares the
+    // trees these roots allow.
+    if (mount.overlayAllowedRoots) {
+      let recheck: string;
+      try {
+        recheck = fs.realpathSync(mount.hostPath);
+      } catch {
+        throw new Error(`Overlay mount source vanished before spawn: ${mount.hostPath}`);
+      }
+      const allowed = mount.overlayAllowedRoots.some((root) => recheck === root || recheck.startsWith(root + path.sep));
+      if (recheck !== mount.hostPath || !allowed) {
+        throw new Error(
+          `Overlay mount source changed between validation and spawn (${mount.hostPath} -> ${recheck}); aborting spawn`,
+        );
+      }
+    }
     if (mount.readonly) {
       args.push(...readonlyMountArgs(mount.hostPath, mount.containerPath));
     } else {

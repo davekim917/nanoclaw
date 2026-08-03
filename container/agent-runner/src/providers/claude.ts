@@ -1134,6 +1134,41 @@ export function createBlockGitCloneHook(): HookCallback {
   };
 }
 
+// ── Snapshot git-mutation guard (repo-store rework) ──
+
+// The old canonical paths (/workspace/workgroup/<repo>) are read-only
+// browsing snapshots of origin/HEAD. The RO mount is the enforcement; this
+// hook exists so a blocked agent gets a useful message instead of EROFS.
+// Shared core owns the policy; inline fallback mirrors it fail-closed.
+const SNAPSHOT_MUTATION_RE =
+  /\bgit\b(?:\s+(?:-C|--work-tree|--git-dir)\s+\S+|\s+-c\s+\S+|\s+--\S+)*\s+(checkout|switch|commit|reset|restore|clean|merge|rebase|cherry-pick|stash|am|apply|update-ref|branch|worktree)\b/;
+const SNAPSHOT_PATH_RE = /\/workspace\/workgroup\/(?!\.worktrees\b|memory\b)/;
+const SNAPSHOT_MUTATION_BLOCK_MSG =
+  'Git working-tree mutations under /workspace/workgroup/<repo> are blocked: that path is a read-only snapshot of origin/HEAD maintained by the host. Use `create_worktree` and work in /workspace/worktrees/<repo>; shared long-lived checkouts belong under /workspace/workgroup/.worktrees/.';
+
+export function createBlockSnapshotMutationHook(): HookCallback {
+  return async (input) => {
+    const pre = input as PreToolUseHookInput;
+    const command = (pre.tool_input as { command?: string })?.command;
+    if (!command) return {};
+
+    const evaluator = await loadCoreEvaluator('evaluateSnapshotGitMutation');
+    if (evaluator) {
+      try {
+        const verdict = evaluator(command);
+        if (verdict?.action !== 'allow') return denyBash(verdict?.reason ?? SNAPSHOT_MUTATION_BLOCK_MSG);
+        return {};
+      } catch {
+        // evaluator threw — fall through to the inline fallback.
+      }
+    }
+    if (SNAPSHOT_MUTATION_RE.test(command) && SNAPSHOT_PATH_RE.test(command)) {
+      return denyBash(SNAPSHOT_MUTATION_BLOCK_MSG);
+    }
+    return {};
+  };
+}
+
 // ── SDK env denylist ──
 
 // These secrets are either rotating short-lived tokens (Granola) or
@@ -1810,6 +1845,7 @@ export class ClaudeProvider implements AgentProvider {
                 createSelfApprovalBlockHook(),
                 createBlockSnowflakeConnectorHook(),
                 createBlockGitCloneHook(),
+                createBlockSnapshotMutationHook(),
                 createBlockCodexCompanionHook(),
                 ...(pluginOwnsBashEmailGate ? [] : [createEmailGateHook()]),
               ],

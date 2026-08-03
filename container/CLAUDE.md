@@ -213,14 +213,17 @@ The `conversations/` folder holds searchable past transcripts; use it when a req
 
 ## Working with Repos
 
-1. `create_worktree({ repo: "REPO-NAME" })` — get a working directory at `/workspace/worktrees/<repo>`. Fetches origin and rebases the thread branch onto fresh `origin/HEAD` so resumed threads start latest. Passing an explicit `branch: "..."` opts out of the rebase (use this for deliberate stale checkouts: bisect, rollback, working off an existing feature branch). If the response includes `next git_push must use force: true`, the branch was rewritten — pass `force: true` on the next push. If a rebase conflict is reported, resolve it manually before continuing.
+**Layout (migrated workgroups):** `/workspace/workgroup/<repo>/` is a **read-only snapshot of `origin/HEAD`**, kept current by the host — browse and read it freely, it is always the latest default branch. The repo store itself is a bare mirror at `/workspace/workgroup/.repos/<repo>.git` (leave it alone). All editing happens in per-thread checkouts. Never `git checkout`/`commit` in the snapshot — writes fail (read-only mount) and a guard redirects you. Long-lived shared checkouts (cross-thread collaboration) live under `/workspace/workgroup/.worktrees/<name>/`. Check `.repos/<repo>.freshness.json` if you need to know exactly how fresh the snapshot is.
+
+1. `create_worktree({ repo: "REPO-NAME" })` — get a working directory at `/workspace/worktrees/<repo>` (a standalone clone). Fetches origin and rebases the thread branch onto fresh `origin/HEAD` so resumed threads start latest. Passing an explicit `branch: "..."` opts out of the rebase (use this for deliberate stale checkouts: bisect, rollback, working off an existing feature branch). If the response includes `next git_push must use force: true`, the branch was rewritten — pass `force: true` on the next push. If a rebase conflict is reported, resolve it manually before continuing.
 2. Edit files, run tests, iterate
 3. `git_commit({ repo: "REPO-NAME", message: "feat: description" })` — stage + commit
 4. `git_push({ repo: "REPO-NAME" })` — push branch to origin. Pass `force: true` only when `create_worktree` warned about a rewrite.
 5. `open_pr({ repo: "REPO-NAME", title: "...", body: "..." })` — create a GitHub PR
-6. Use `create_worktree` for existing repos or `clone_repo` for new ones — don't `git clone` ad-hoc into the workspace. An **advisory** guard blocks `git clone` into `/workspace/{agent,worktrees,workgroup,...}` and steers you to the MCP tools (a nudge, not a hard boundary); `codex exec` sub-delegations fire no hooks, so follow the rule by convention there.
+6. Use `create_worktree` for existing repos or `clone_repo` for new ones — don't `git clone` ad-hoc into the workspace. **Advisory** guards block `git clone` into `/workspace/{agent,worktrees,workgroup,...}` and git mutations inside snapshots, steering you to the MCP tools (a nudge, not a hard boundary); `codex exec` sub-delegations fire no hooks, so follow the rule by convention there.
 7. On thread resume, check `/workspace/worktrees/` for prior work from this session.
 8. If you do not commit explicitly, the host auto-commits all dirty worktrees on session exit.
+9. **If your branch seems to have vanished after a repo-store migration**, read `/workspace/workgroup/memory/repo-store-migration-*.md` — every parked branch's new location is indexed there, and full archives live under `/workspace/workgroup/.rescues/`. Nothing was deleted.
 
 ## After Every PR (automatic, never skip)
 

@@ -95,9 +95,74 @@ function fsSlug(s: string): string {
  * the host path turns `-v src:dst` into a three-part `src:dst:opts` which
  * Docker rejects with exit 125. fsSlug strips any embedded colons too.
  */
-export function threadWorktreeDir(platformId: string, threadId: string | null): string {
+export function threadWorktreeDir(platformId: string, threadId: string | null, workgroupId?: string): string {
+  return path.join(threadStateDir(platformId, threadId, workgroupId), 'worktrees');
+}
+
+/**
+ * Workgroup-namespaced thread-state base dir.
+ *
+ * The platform/thread key alone is ambiguous across workgroups: an identical
+ * platform_id can be the same real channel via a sibling bot app (same
+ * workgroup — must share) or an unrelated channel from a colliding workspace
+ * (different workgroup — must NOT share; see the getChannelPeers
+ * tenant-boundary tests). Adding the workgroup segment makes cross-workgroup
+ * rows resolve to different directories while same-workgroup siblings keep
+ * sharing.
+ *
+ * Legacy fallback: pre-namespace threads live at `<base>/<tid>/`. If that
+ * dir exists and no workgroup-scoped dir does, keep serving it so in-flight
+ * threads don't lose their worktrees on upgrade; the repo-store migration
+ * relocates them and ends the fallback window.
+ */
+function threadStateDir(platformId: string, threadId: string | null, workgroupId?: string): string {
   const tid = threadId ?? `dm-${platformId}`;
-  return path.join(threadsBaseDir(), fsSlug(tid), 'worktrees');
+  const legacy = path.join(threadsBaseDir(), fsSlug(tid));
+  if (!workgroupId) return legacy;
+  const scoped = path.join(threadsBaseDir(), `wg-${fsSlug(workgroupId)}`, fsSlug(tid));
+  if (fs.existsSync(legacy) && !fs.existsSync(scoped)) {
+    // Ownership check: without it, workgroup B would adopt workgroup A's
+    // legacy dir on a colliding platform/thread key — the exact leak the
+    // namespace exists to prevent. The marker is stamped by container spawn
+    // (buildMounts) on first post-upgrade use; an unstamped dir is adoptable.
+    const owner = readThreadDirOwner(legacy);
+    if (owner === null || owner === workgroupId) return legacy;
+  }
+  return scoped;
+}
+
+const THREAD_DIR_OWNER_FILE = '.wg-owner';
+
+/** The pre-namespace state dir for a thread key (exists only for threads
+ *  created before the wg namespace or not yet migrated). */
+export function legacyThreadStateDir(platformId: string, threadId: string | null): string {
+  const tid = threadId ?? `dm-${platformId}`;
+  return path.join(threadsBaseDir(), fsSlug(tid));
+}
+
+/**
+ * Sentinel owner that matches no real workgroup id (real ids never contain
+ * spaces). Stamped when DB ownership of a legacy dir is ambiguous — every
+ * workgroup then resolves to its own scoped dir and nobody adopts.
+ */
+export const THREAD_DIR_OWNER_CONFLICT = '!! conflict';
+
+export function readThreadDirOwner(stateDir: string): string | null {
+  try {
+    return fs.readFileSync(path.join(stateDir, THREAD_DIR_OWNER_FILE), 'utf-8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Stamp workgroup ownership on a thread-state dir (idempotent, creator-only). */
+export function stampThreadDirOwner(stateDir: string, workgroupId: string): void {
+  const file = path.join(stateDir, THREAD_DIR_OWNER_FILE);
+  try {
+    if (!fs.existsSync(file)) fs.writeFileSync(file, `${workgroupId}\n`);
+  } catch {
+    /* advisory marker — never block a spawn on it */
+  }
 }
 
 /** Per-session Graphify cache. Sessions never share this directory. */
@@ -106,9 +171,8 @@ export function sessionGraphifyCacheDir(agentGroupId: string, sessionId: string)
 }
 
 /** Thread-scoped Graphify cache shared by sibling agents in one conversation. */
-export function threadGraphifyCacheDir(platformId: string, threadId: string | null): string {
-  const tid = threadId ?? `dm-${platformId}`;
-  return path.join(threadsBaseDir(), fsSlug(tid), 'graphify-cache');
+export function threadGraphifyCacheDir(platformId: string, threadId: string | null, workgroupId?: string): string {
+  return path.join(threadStateDir(platformId, threadId, workgroupId), 'graphify-cache');
 }
 
 /** Install-scoped runtime state for the Graphify gateway. */

@@ -35,6 +35,66 @@ function workgroupDir(): string {
   return process.env.NANOCLAW_WORKGROUP_DIR_OVERRIDE || '/workspace/workgroup';
 }
 
+/**
+ * Mirror+clone topology (repo-store rework).
+ *
+ * New layout: the canonical store for a repo is a BARE mirror at
+ * `<base>/.repos/<name>.git` (base = the shared workgroup tree when mounted,
+ * else the private agent dir). A host-maintained detached snapshot of
+ * origin/HEAD lives at the old canonical path (`<base>/<name>/`) for
+ * browsing/Graphify; per-thread work happens in STANDALONE clones at
+ * /workspace/worktrees/<repo> — not linked worktrees. Standalone clones are
+ * self-contained (relocatable .git dir), which is what lets the host run git
+ * against them (cleanup, autosave) even though they were created inside the
+ * container namespace. Legacy full-clone canonicals keep resolving so
+ * un-migrated repos keep working through the old linked-worktree paths.
+ */
+function mirrorBaseDir(): string {
+  const wg = workgroupDir();
+  return fs.existsSync(wg) ? wg : agentDir();
+}
+
+export function mirrorDir(name: string): string {
+  return path.join(mirrorBaseDir(), '.repos', `${name}.git`);
+}
+
+/**
+ * A VALID bare repo — git's own verdict, not a file-shape guess. A partial
+ * failed clone can leave HEAD+objects behind and must not be accepted
+ * (codex phase-B/C review #5).
+ */
+function isBareRepo(dir: string): boolean {
+  if (!fs.existsSync(path.join(dir, 'HEAD'))) return false;
+  return tryGit(dir, ['rev-parse', '--is-bare-repository']) === 'true';
+}
+
+/** The mirror path exists on disk (valid or not) — the topology is claimed. */
+export function mirrorPresent(name: string): boolean {
+  return validateRepoName(name) === null && fs.existsSync(mirrorDir(name));
+}
+
+/** Resolve the VALID bare mirror for <name>, or null when not yet migrated/cloned. */
+export function resolveMirror(name: string): string | null {
+  const nameErr = validateRepoName(name);
+  if (nameErr) return null;
+  const dir = mirrorDir(name);
+  return isBareRepo(dir) ? dir : null;
+}
+
+const MALFORMED_MIRROR_MSG = (repo: string) =>
+  `Repo '${repo}' has a mirror directory at ${mirrorDir(repo)} that is NOT a valid bare repository ` +
+  `(interrupted clone or corruption). Refusing to fall back to legacy resolution — the browsing ` +
+  `snapshot must not become a mutable canonical. Ask the operator to remove or repair the mirror.`;
+
+/** True when <dir> is a standalone clone (real .git directory, not a pointer file). */
+function isStandaloneClone(dir: string): boolean {
+  try {
+    return fs.statSync(path.join(dir, '.git')).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /** Contained per-repository Graphify cache path. */
 export function graphifyCacheDir(repo: string): string {
   const nameErr = validateRepoName(repo);
@@ -164,6 +224,27 @@ function canonPath(p: string): string {
  * dir (the caller's own existence checks handle those). (codex #126 N4 + N5)
  */
 function staleWorktreeAttachmentError(worktreeDir: string, repo: string): string | null {
+  // Standalone clone (mirror topology): the clone owns its metadata, so the
+  // only cross-wiring to catch is an origin pointing at a DIFFERENT repo than
+  // the mirror serves. The clone's origin is either the real remote URL
+  // (set-url after cloning) or the mirror path itself (mirror had no origin,
+  // e.g. a local-only repo) — both are legitimate.
+  if (isStandaloneClone(worktreeDir)) {
+    const mirror = resolveMirror(repo);
+    if (!mirror) return null;
+    const cloneOrigin = tryGit(worktreeDir, ['config', '--get', 'remote.origin.url']);
+    if (!cloneOrigin) return null;
+    if (canonPath(cloneOrigin) === canonPath(mirror)) return null;
+    const mirrorOrigin = tryGit(mirror, ['config', '--get', 'remote.origin.url']);
+    if (mirrorOrigin && !originsMatch(cloneOrigin, mirrorOrigin)) {
+      return (
+        `Clone at ${worktreeDir} has origin ${cloneOrigin}, but the repo's mirror (${mirror}) serves ` +
+        `${mirrorOrigin} — this checkout belongs to a different repository. Push any wanted work, then ` +
+        `remove it (\`rm -rf ${worktreeDir}\`) and re-run create_worktree.`
+      );
+    }
+    return null;
+  }
   const repoDir = resolveRepoDir(repo);
   if (!repoDir) return null;
   const commonDir = tryGit(worktreeDir, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
@@ -325,10 +406,16 @@ function rebaseOntoOriginHead(
 
   const tip = tryGit(worktreeDir, ['rev-parse', '--short', 'HEAD']) ?? '';
   let text = `Worktree ready at ${worktreeDir} (branch ${branch}, rebased onto origin/HEAD${tip ? `; tip ${tip}` : ''})`;
-  if (hasRemoteTracking) {
+  // Warn about force-push only when the rebase actually rewrote published
+  // history: if origin/<branch> is still an ancestor of the new HEAD (the
+  // rebase fast-forwarded a merely-behind branch), a normal push succeeds.
+  const forcePushNeeded =
+    hasRemoteTracking &&
+    tryGit(worktreeDir, ['merge-base', '--is-ancestor', `refs/remotes/origin/${branch}`, 'HEAD']) === null;
+  if (forcePushNeeded) {
     text += `. NOTE: branch was previously pushed; next \`git_push\` must use \`force: true\` because history was rewritten.`;
   }
-  log(`rebase: ${branch} rebased onto origin/HEAD${hasRemoteTracking ? ' (force-push needed)' : ''}`);
+  log(`rebase: ${branch} rebased onto origin/HEAD${forcePushNeeded ? ' (force-push needed)' : ''}`);
   return { kind: 'ok', text };
 }
 
@@ -340,7 +427,7 @@ export const cloneRepoTool: McpToolDefinition = {
   tool: {
     name: 'clone_repo',
     description:
-      'Clone a GitHub repo into this agent group. Lands in the shared workgroup tree (/workspace/workgroup/repos/<name>) when it is mounted, otherwise the private /workspace/agent/repos/<name>. Idempotent: returns the existing path if the repo is already cloned (origin must match). Use this INSTEAD of `git clone` — direct git clone is not set up with credentials.',
+      'Clone a GitHub repo into this agent group. In a shared workgroup it lands as a bare mirror (/workspace/workgroup/.repos/<name>.git) plus a read-only browsing snapshot at /workspace/workgroup/<name>; without a workgroup it lands at /workspace/agent/repos/<name>. Idempotent: returns the existing repo if already cloned (origin must match). Use this INSTEAD of `git clone` — direct git clone is not set up with credentials.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -369,6 +456,36 @@ export const cloneRepoTool: McpToolDefinition = {
     const repoName = typeof args.name === 'string' && args.name ? args.name : urlParts[1];
     const nameErr = validateRepoName(repoName);
     if (nameErr) return err(nameErr);
+
+    // Mirror topology first: an existing bare mirror is THE repo. Checked
+    // before legacy resolution because the migrated layout leaves a snapshot
+    // clone at the old canonical path that resolveRepoDir would match.
+    const existingMirror = resolveMirror(repoName);
+    if (existingMirror) {
+      const mirrorOrigin = tryGit(existingMirror, ['config', '--get', 'remote.origin.url']);
+      if (mirrorOrigin !== null && !originsMatch(mirrorOrigin, url)) {
+        return err(
+          `Repo '${repoName}' already exists as mirror ${existingMirror} but its origin (${mirrorOrigin}) ` +
+            `does not match the requested URL (${url}). Use a different name.`,
+        );
+      }
+      if (mirrorOrigin === null) {
+        // Originless mirror + a caller telling us the URL: adopt it. Without
+        // this, clones keep the mirror path as origin and the freshness
+        // worker's fetch fails forever (codex phase-B/C review #5).
+        try {
+          runGit(existingMirror, ['remote', 'add', 'origin', url]);
+        } catch {
+          runGit(existingMirror, ['remote', 'set-url', 'origin', url]);
+        }
+        runGit(existingMirror, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*']);
+        log(`clone_repo: adopted origin ${url} on originless mirror ${existingMirror}`);
+        return ok(`Repo already present (mirror at ${existingMirror}); adopted origin ${url}. Use create_worktree to work on it.`);
+      }
+      log(`clone_repo: ${repoName} already present as mirror ${existingMirror} (idempotent)`);
+      return ok(`Repo already present (mirror at ${existingMirror}); use create_worktree to work on it.`);
+    }
+    if (mirrorPresent(repoName)) return err(MALFORMED_MIRROR_MSG(repoName));
 
     // Idempotent: reuse an existing real clone (workgroup/repos, namespaced
     // private repos/, or legacy root) — but only when its origin matches the
@@ -461,6 +578,60 @@ export const cloneRepoTool: McpToolDefinition = {
     }
     try { fs.mkdirSync(reposDir, { recursive: true }); } catch { /* ignore */ }
 
+    // New repos in a shared workgroup land as mirror + snapshot (the
+    // migrated topology): bare mirror under .repos/, detached browsing
+    // snapshot at the old canonical path. Private (no-workgroup) groups keep
+    // the plain-clone layout — the shared-canonical staleness problem this
+    // topology fixes is a shared-tree problem.
+    if (fs.existsSync(workgroupDir())) {
+      const mirror = mirrorDir(repoName);
+      try { fs.mkdirSync(path.dirname(mirror), { recursive: true }); } catch { /* ignore */ }
+      // Clone into a UNIQUE temp path and rename into place. Two sibling
+      // agents can race this branch; cloning straight at the final path
+      // would make the loser's cleanup delete the winner's valid mirror
+      // (codex native review P1 #8). We only ever create/remove OUR temp;
+      // the final path is claimed by one atomic rename.
+      const mirrorTmp = `${mirror}.tmp-${process.pid}-${Date.now()}`;
+      try {
+        execFileSync('git', ['clone', '--bare', url, mirrorTmp], { stdio: 'pipe', timeout: 300_000 });
+        // Bare clones get no fetch refspec; the freshness worker's plain
+        // `git fetch origin` must advance refs/heads. Config failure fails
+        // the clone — a refspec-less mirror looks valid but stays stale
+        // forever. gc.auto=0: automatic repack/prune in the mirror could race
+        // a container clone reading its objects; the mirror only ever grows
+        // via fetch, so gc is an operator action, not automatic.
+        runGit(mirrorTmp, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*']);
+        runGit(mirrorTmp, ['config', 'gc.auto', '0']);
+        fs.renameSync(mirrorTmp, mirror);
+      } catch (e) {
+        try { fs.rmSync(mirrorTmp, { recursive: true, force: true }); } catch { /* ignore */ }
+        // Lost the race to a concurrent winner? Their mirror is the repo.
+        const winner = resolveMirror(repoName);
+        if (winner) {
+          const winnerOrigin = tryGit(winner, ['config', '--get', 'remote.origin.url']);
+          if (winnerOrigin && originsMatch(winnerOrigin, url)) {
+            log(`clone_repo: lost creation race for ${repoName}, reusing winner ${winner}`);
+            return ok(`Repo already present (mirror at ${winner}); use create_worktree to work on it.`);
+          }
+        }
+        const msg = e instanceof Error ? e.message : String(e);
+        return err(`git clone --bare failed: ${msg}`);
+      }
+      const snapshot = path.join(workgroupDir(), repoName);
+      let snapshotNote = '';
+      if (!fs.existsSync(snapshot)) {
+        const snapOk =
+          tryGit(path.dirname(snapshot), ['clone', mirror, snapshot], 120_000) !== null &&
+          tryGit(snapshot, ['remote', 'set-url', 'origin', url]) !== null &&
+          tryGit(snapshot, ['checkout', '--detach']) !== null;
+        snapshotNote = snapOk
+          ? `; browsing snapshot at ${snapshot}`
+          : `; snapshot creation failed (host freshness worker will retry)`;
+      }
+      log(`clone_repo: mirrored ${url} → ${mirror}${snapshotNote}`);
+      return ok(`Cloned ${url} as mirror ${mirror}${snapshotNote}. Use create_worktree to work on it.`);
+    }
+
     try {
       execFileSync('git', ['clone', url, destDir], { stdio: 'pipe', timeout: 120_000 });
       log(`clone_repo: cloned ${url} → ${destDir}`);
@@ -476,11 +647,110 @@ export const cloneRepoTool: McpToolDefinition = {
 // create_worktree
 // -----------------------------------------------------------------------------
 
+/**
+ * Mirror-topology create/reuse: a STANDALONE clone at worktrees/<repo>,
+ * cloned from the local bare mirror (fast object transfer) with origin
+ * repointed at the real remote so fetch/rebase/push run against the source
+ * of truth. Self-contained metadata — no linked-worktree gitdir pointers, so
+ * host-side git (cleanup, autosave verification) works on the same dir.
+ */
+function createWorktreeFromMirror(
+  mirror: string,
+  repo: string,
+  branchArg: string | undefined,
+): ReturnType<typeof ok> | ReturnType<typeof err> {
+  const worktreeDir = path.join(worktreesDir(), repo);
+  const branchName = branchArg ?? defaultBranchName(repo);
+  if (tryGit(mirror, ['check-ref-format', '--branch', branchName]) === null) {
+    return err(`Invalid branch name: ${branchName}`);
+  }
+  const shouldRebase = branchArg === undefined;
+
+  if (fs.existsSync(worktreeDir)) {
+    if (!isStandaloneClone(worktreeDir)) {
+      if (fs.existsSync(path.join(worktreeDir, '.git'))) {
+        // .git pointer FILE — a linked worktree from the pre-migration layout.
+        // Its gitdir points into a canonical that no longer serves worktrees;
+        // converting in place is the migration script's job, not a tool
+        // side-effect on a dir that may hold unpushed work.
+        return err(
+          `Worktree at ${worktreeDir} is a legacy linked worktree from the pre-migration layout. ` +
+            `Push any wanted work from it, then remove it (\`rm -rf ${worktreeDir}\`) and re-run ` +
+            `create_worktree to get a standalone clone.`,
+        );
+      }
+      log(`create_worktree: corrupt worktree at ${worktreeDir}, removing`);
+      try {
+        invalidateGraphifyCacheForCorruptWorktree(repo);
+        fs.rmSync(worktreeDir, { recursive: true, force: true });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return err(`Cannot replace corrupt worktree at ${worktreeDir}: ${msg}`);
+      }
+    } else {
+      const staleErr = staleWorktreeAttachmentError(worktreeDir, repo);
+      if (staleErr) return err(staleErr);
+      const current = tryGit(worktreeDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+      if (current && current !== branchName) {
+        return err(
+          `Worktree at ${worktreeDir} is currently on branch '${current}', not the requested '${branchName}'. ` +
+            `To resume work on '${current}', pass branch: "${current}" explicitly. ` +
+            `To start fresh, run \`git -C ${worktreeDir} switch -c ${branchName} origin/HEAD\` first, ` +
+            `then retry create_worktree.`,
+        );
+      }
+      const fetchOk = tryGit(worktreeDir, ['fetch', 'origin'], 60_000) !== null;
+      tryGit(worktreeDir, ['remote', 'set-head', 'origin', '--auto']);
+      const originHeadOk = tryGit(worktreeDir, ['rev-parse', '--verify', 'origin/HEAD']) !== null;
+      if (!shouldRebase) {
+        return ok(`Worktree ready at ${worktreeDir} (branch ${current ?? branchName}; explicit branch — not rebased)`);
+      }
+      const result = rebaseOntoOriginHead(worktreeDir, worktreeDir, fetchOk, originHeadOk);
+      return result.kind === 'ok' ? ok(result.text) : err(result.text);
+    }
+  }
+
+  fs.mkdirSync(worktreesDir(), { recursive: true });
+  try {
+    execFileSync('git', ['clone', mirror, worktreeDir], { stdio: 'pipe', timeout: 120_000 });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return err(`git clone from mirror failed: ${msg}`);
+  }
+  const realUrl = tryGit(mirror, ['config', '--get', 'remote.origin.url']);
+  if (realUrl) tryGit(worktreeDir, ['remote', 'set-url', 'origin', realUrl]);
+  const fetchOk = tryGit(worktreeDir, ['fetch', 'origin', '--prune'], 60_000) !== null;
+  tryGit(worktreeDir, ['remote', 'set-head', 'origin', '--auto']);
+  const originHeadOk = tryGit(worktreeDir, ['rev-parse', '--verify', 'origin/HEAD']) !== null;
+
+  const branchExists = tryGit(worktreeDir, ['rev-parse', '--verify', `refs/remotes/origin/${branchName}`]) !== null;
+  try {
+    if (branchExists) {
+      runGit(worktreeDir, ['switch', branchName]);
+      log(`create_worktree: ${worktreeDir} standalone clone on existing branch ${branchName}`);
+      if (!shouldRebase) {
+        return ok(`Worktree created at ${worktreeDir} on branch ${branchName} (explicit branch — not rebased)`);
+      }
+      const result = rebaseOntoOriginHead(worktreeDir, worktreeDir, fetchOk, originHeadOk);
+      return result.kind === 'ok' ? ok(result.text) : err(result.text);
+    } else if (originHeadOk) {
+      runGit(worktreeDir, ['switch', '-c', branchName, 'origin/HEAD']);
+      log(`create_worktree: ${worktreeDir} standalone clone on new branch ${branchName}`);
+      return ok(`Worktree created at ${worktreeDir} on branch ${branchName}`);
+    } else {
+      return err('Cannot create worktree: origin/HEAD not resolved (fetch may have failed)');
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return err(`branch setup failed: ${msg}`);
+  }
+}
+
 export const createWorktreeTool: McpToolDefinition = {
   tool: {
     name: 'create_worktree',
     description:
-      'Create (or reuse) a per-thread git worktree for <repo> at /workspace/worktrees/<repo>. Fetches origin, then checks out the given branch if it exists, or branches off origin/HEAD. Idempotent. Default branch: thread-<sessionId>-<repo>.',
+      'Create (or reuse) the per-thread working checkout for <repo> at /workspace/worktrees/<repo> (a standalone clone). Fetches origin, then checks out the given branch if it exists, or branches off origin/HEAD. Idempotent. Default branch: thread-<sessionId>-<repo>.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -495,6 +765,15 @@ export const createWorktreeTool: McpToolDefinition = {
     const branchArg = typeof args.branch === 'string' && args.branch ? args.branch : undefined;
     const nameErr = validateRepoName(repo);
     if (nameErr) return err(nameErr);
+
+    // Mirror topology wins when present; legacy full-clone canonicals keep
+    // the linked-worktree flow below until their workgroup is migrated. A
+    // PRESENT but malformed mirror is a hard error, not a legacy fallback —
+    // resolveRepoDir would resolve the browsing snapshot and quietly turn it
+    // back into a mutable canonical (codex phase-B/C review #6).
+    const mirror = resolveMirror(repo);
+    if (mirror) return createWorktreeFromMirror(mirror, repo, branchArg);
+    if (mirrorPresent(repo)) return err(MALFORMED_MIRROR_MSG(repo));
 
     const repoDir = resolveRepoDir(repo);
     if (!repoDir) {

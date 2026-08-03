@@ -126,6 +126,36 @@ When sibling agents are wired to the same chat channel, each agent's adapter wri
 
 ---
 
+## Repo store (mirror + snapshot topology)
+
+Shared repos in a migrated workgroup live in three layers under
+`data/workgroups/<id>/`:
+
+- **`.repos/<repo>.git`** — the bare mirror, the store of record. The host's
+  freshness worker (`src/repo-freshness.ts`, 10-min serialized loop) fetches
+  it with `--prune`, follows default-branch renames, and records
+  `.repos/<repo>.freshness.json` (ts, oid, ref, fetchOk). Fetch failures are
+  loud, never silent.
+- **`<repo>/`** — a detached snapshot of `origin/HEAD`, advanced by the host
+  to the exact fetched OID and mounted **read-only** into member containers.
+  This is what agents browse and Graphify indexes — it cannot be checked out
+  onto a branch or dirtied, which retires the parked-canonical staleness
+  failure mode.
+- **`/workspace/worktrees/<repo>`** — per-thread STANDALONE clones (not
+  linked worktrees), created from the mirror with origin repointed at the
+  real remote. Self-contained metadata means host-side git (cleanup cron,
+  autosave checks) works on container-created checkouts. Long-lived shared
+  checkouts live under `.worktrees/<name>` with a root symlink for
+  discoverability.
+
+`.repos`, `.rescues`, and `.worktrees` are excluded from Graphify discovery —
+only the snapshot competes as "current source". Migration from the legacy
+shared-canonical layout: `scripts/migrate-repo-store.ts --workgroup <id>`
+(dry-run by default; archives everything under `.rescues/<run>/` before any
+destructive step and writes a parked-branch index into workgroup memory).
+
+---
+
 ## Graphify graph routing
 
 Every workgroup has one derived Graphify database under

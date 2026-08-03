@@ -90,3 +90,4 @@ forks.md
 
 # impeccable plugin hook cache — regenerated wherever the hook runs
 .impeccable/
+/graphify-out/

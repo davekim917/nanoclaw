@@ -1265,3 +1265,50 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     }
   });
 });
+
+describe('threadWorktreeDir — workgroup namespace', () => {
+  it('same workgroup + same thread share one scoped path; different workgroups do not', () => {
+    const tid = 'slack:CTEST10001:1778800261.935259';
+    const a1 = threadWorktreeDir('slack:CTEST10001', tid, 'illysium');
+    const a2 = threadWorktreeDir('slack:CTEST10001', tid, 'illysium');
+    const b = threadWorktreeDir('slack:CTEST10001', tid, 'madison-reed');
+    expect(a1).toBe(a2);
+    expect(a1).not.toBe(b);
+    expect(a1).toContain('wg-illysium');
+    expect(a1).not.toContain(':');
+  });
+
+  it('serves the legacy un-namespaced dir while it exists (in-flight threads)', () => {
+    const tid = 'slack:CTEST10002:1778800261.935259';
+    const legacy = path.join(threadsBaseDir(), 'slack_CTEST10002_1778800261.935259', 'worktrees');
+    fs.mkdirSync(legacy, { recursive: true });
+    try {
+      const got = threadWorktreeDir('slack:CTEST10002', tid, 'illysium');
+      expect(got).toBe(legacy);
+    } finally {
+      fs.rmSync(path.dirname(legacy), { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to adopt a legacy dir stamped by a DIFFERENT workgroup', () => {
+    const tid = 'slack:CTEST10004:1778800261.935259';
+    const legacyState = path.join(threadsBaseDir(), 'slack_CTEST10004_1778800261.935259');
+    fs.mkdirSync(path.join(legacyState, 'worktrees'), { recursive: true });
+    fs.writeFileSync(path.join(legacyState, '.wg-owner'), 'madison-reed\n');
+    try {
+      const got = threadWorktreeDir('slack:CTEST10004', tid, 'illysium');
+      expect(got).toContain('wg-illysium');
+      // The stamped owner keeps serving its own legacy dir.
+      expect(threadWorktreeDir('slack:CTEST10004', tid, 'madison-reed')).toBe(path.join(legacyState, 'worktrees'));
+    } finally {
+      fs.rmSync(legacyState, { recursive: true, force: true });
+    }
+  });
+
+  it('without a workgroup id resolves to the legacy path (back-compat callers)', () => {
+    const tid = 'slack:CTEST10003:1778800261.935259';
+    expect(threadWorktreeDir('slack:CTEST10003', tid)).toBe(
+      path.join(threadsBaseDir(), 'slack_CTEST10003_1778800261.935259', 'worktrees'),
+    );
+  });
+});

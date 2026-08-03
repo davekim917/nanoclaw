@@ -20,6 +20,13 @@ export interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+  /**
+   * Set on symlink-overlay mounts whose source lives under an agent-writable
+   * tree. Spawn re-validates hostPath against these roots immediately before
+   * emitting docker args (TOCTOU window between buildMounts' realpath check
+   * and container start — codex phase-A review P1).
+   */
+  overlayAllowedRoots?: string[];
 }
 
 export interface ProviderContainerContext {

@@ -529,13 +529,16 @@ export function collectThreadWorktreeActivity(
     thread_id: string | null;
     last_active: string | null;
     platform_id: string;
+    wg: string;
   }>;
   try {
     rows = getDb()
       .prepare(
-        `SELECT s.id, s.agent_group_id, s.thread_id, s.last_active, mg.platform_id
+        `SELECT s.id, s.agent_group_id, s.thread_id, s.last_active, mg.platform_id,
+                COALESCE(ag.workgroup_id, ag.folder) AS wg
            FROM sessions s
            JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+           JOIN agent_groups ag ON ag.id = s.agent_group_id
           WHERE s.messaging_group_id IS NOT NULL`,
       )
       .all() as typeof rows;
@@ -545,7 +548,7 @@ export function collectThreadWorktreeActivity(
   }
 
   for (const row of rows) {
-    const worktreeDir = threadWorktreeDir(row.platform_id, row.thread_id);
+    const worktreeDir = threadWorktreeDir(row.platform_id, row.thread_id, row.wg);
     const current = activity.get(worktreeDir) ?? {
       lastActivityMs: 0,
       hasRunningContainer: false,

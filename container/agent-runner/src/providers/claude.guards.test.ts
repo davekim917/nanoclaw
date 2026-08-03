@@ -6,6 +6,7 @@ import {
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
   createBlockGitCloneHook,
+  createBlockSnapshotMutationHook,
   createBlockCodexCompanionHook,
   createEmailGateHook,
 } from './claude.js';
@@ -693,5 +694,64 @@ describe('createSanitizeBashHook codex exec stdin fix', () => {
   it('does not wrap non-codex commands', async () => {
     const out = await sanitize('ls -la /workspace');
     expect(out ?? 'ls -la /workspace').not.toContain('</dev/null');
+  });
+});
+
+describe('createBlockSnapshotMutationHook (inline fallback — no core mounted)', () => {
+  const saved = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+  beforeEach(() => {
+    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/core.ts';
+  });
+  afterEach(() => {
+    if (saved !== undefined) process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = saved;
+    else delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+  });
+
+  it('blocks a checkout aimed at a snapshot path', async () => {
+    const r = await runBashHook(
+      createBlockSnapshotMutationHook(),
+      'cd /workspace/workgroup/XZO-ANALYTICS && git checkout XZO-210-obt-drift-fix',
+    );
+    expect(r.permissionDecision).toBe('deny');
+    expect(r.permissionDecisionReason).toContain('read-only snapshot');
+  });
+
+  it('blocks git -C mutations in a snapshot', async () => {
+    const r = await runBashHook(createBlockSnapshotMutationHook(), 'git -C /workspace/workgroup/XZO commit -am wip');
+    expect(r.permissionDecision).toBe('deny');
+  });
+
+  it('allows read-only git in a snapshot', async () => {
+    const r = await runBashHook(createBlockSnapshotMutationHook(), 'git -C /workspace/workgroup/XZO log --oneline -5');
+    expect(r.permissionDecision).toBeUndefined();
+  });
+
+  it('allows mutations in thread worktrees and .worktrees checkouts', async () => {
+    for (const cmd of [
+      'git -C /workspace/worktrees/XZO commit -am wip',
+      'git -C /workspace/workgroup/.worktrees/XZO-pr213-review commit -am wip',
+    ]) {
+      const r = await runBashHook(createBlockSnapshotMutationHook(), cmd);
+      expect(r.permissionDecision).toBeUndefined();
+    }
+  });
+
+  it('does not false-positive on mutation verbs in ARGUMENTS of read-only commands', async () => {
+    const r = await runBashHook(
+      createBlockSnapshotMutationHook(),
+      'git -C /workspace/workgroup/XZO log --grep commit --oneline',
+    );
+    expect(r.permissionDecision).toBeUndefined();
+  });
+
+  it('blocks ref surgery aimed at the mirror and rescue namespaces', async () => {
+    for (const cmd of [
+      'git -C /workspace/workgroup/.repos/XZO.git update-ref refs/heads/main deadbeef',
+      'git -C /workspace/workgroup/.repos/XZO.git branch -D some-branch',
+      'cd /workspace/workgroup/.rescues/2026 && git reset --hard HEAD~1',
+    ]) {
+      const r = await runBashHook(createBlockSnapshotMutationHook(), cmd);
+      expect(r.permissionDecision).toBe('deny');
+    }
   });
 });

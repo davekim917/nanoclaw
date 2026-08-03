@@ -93,7 +93,21 @@ function getLastModifiedDays(worktreePath: string): number {
   }
 }
 
+/** Mirror-topology checkouts are standalone clones — their .git is a directory. */
+function isStandaloneClone(worktreePath: string): boolean {
+  try {
+    return fs.statSync(path.join(worktreePath, '.git')).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function removeWorktree(canonicalRepoPath: string, worktreePath: string): void {
+  if (isStandaloneClone(worktreePath)) {
+    // Self-contained metadata — nothing to detach from a canonical.
+    fs.rmSync(worktreePath, { recursive: true, force: true });
+    return;
+  }
   execFileSync('git', ['worktree', 'remove', '--force', worktreePath], {
     cwd: canonicalRepoPath,
     stdio: 'pipe',
@@ -184,13 +198,16 @@ function discoverThreadParticipantsByDir(): Map<string, ThreadParticipant[]> {
     agent_group_id: string;
     thread_id: string | null;
     platform_id: string;
+    wg: string;
   }>;
   try {
     rows = getDb()
       .prepare(
-        `SELECT s.id AS session_id, s.agent_group_id, s.thread_id, mg.platform_id
+        `SELECT s.id AS session_id, s.agent_group_id, s.thread_id, mg.platform_id,
+                COALESCE(ag.workgroup_id, ag.folder) AS wg
            FROM sessions s
            JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+           JOIN agent_groups ag ON ag.id = s.agent_group_id
           WHERE s.status = 'active' AND s.messaging_group_id IS NOT NULL`,
       )
       .all() as typeof rows;
@@ -201,7 +218,7 @@ function discoverThreadParticipantsByDir(): Map<string, ThreadParticipant[]> {
 
   const participantsByDir = new Map<string, ThreadParticipant[]>();
   for (const row of rows) {
-    const worktreeDir = threadWorktreeDir(row.platform_id, row.thread_id);
+    const worktreeDir = threadWorktreeDir(row.platform_id, row.thread_id, row.wg);
     const participants = participantsByDir.get(worktreeDir) ?? [];
     participants.push({
       sessionId: row.session_id,
@@ -381,7 +398,8 @@ function cleanupOne(target: WorktreeTarget): void {
   // liveness source; kernel close releases Graphify's fcntl lock.
   if (preserveForParticipantGuard(target)) return;
 
-  if (!fs.existsSync(path.join(canonicalRepoPath, '.git'))) {
+  // Standalone clones need no canonical; legacy linked worktrees do.
+  if (!isStandaloneClone(worktreePath) && !fs.existsSync(path.join(canonicalRepoPath, '.git'))) {
     log.debug('Worktree cleanup: canonical repo missing, skipping', { ...ctx, canonicalRepoPath });
     return;
   }
