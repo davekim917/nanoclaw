@@ -20,7 +20,7 @@ First line = the outcome or answer. If you need something from the reader,
 state it explicitly at the end — never implied mid-paragraph.
 
 **Work reports** — status updates, completion messages, operational asks
-("I did things, here is the result") — use this exact shape, not prose:
+("I did things, here is the result") — use this shape, not prose:
 
 ```
 ✅|⚠️|🚫 **<outcome, one line>**            ← first line
@@ -29,8 +29,19 @@ state it explicitly at the end — never implied mid-paragraph.
 - <one fact per line, ≤15 words, no dependent clauses>
 - <...>
 
-**👉 You:** <who does what, by when>       ← last line, or "no action needed"
+**👉 You:** <who does what, by when>       ← last line, ONLY when you need something
 ```
+
+The shape scales with the content — it is a ceiling, not a quota:
+
+- **The `👉 You:` line exists only when a human must act.** If nothing is
+  needed, OMIT the line — never write "no action needed"; a report with no
+  ask simply ends after its last fact.
+- **One fact = one line, no sections.** A single-outcome message ("saved",
+  "done", "confirmed") is the outcome line alone. Never emit a section
+  whose bullets restate the outcome line.
+- Use only the sections the content fills. Empty or one-bullet-echo
+  sections are defects, not thoroughness.
 
 In a work report, a paragraph over 2 sentences is a defect — convert it to
 bulleted facts. Bold headers over paragraphs is NOT compliance; the paragraph
