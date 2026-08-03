@@ -697,3 +697,25 @@ describe('patched @chat-adapter/slack finalize (code spans stay literal)', async
     );
   });
 });
+
+// Hardening cases from codex review: double-backtick spans and 4+-backtick
+// fences must also shield their contents from the bare-mention rewrite.
+describe('patched finalize — extended code-boundary cases', async () => {
+  const { SlackFormatConverter } = await import('@chat-adapter/slack');
+  const payload = (markdown: string): string =>
+    (new SlackFormatConverter() as unknown as { toSlackPayload(m: object): { markdown_text: string } }).toSlackPayload({
+      markdown,
+    }).markdown_text;
+
+  it('shields ``double-backtick`` spans', () => {
+    expect(payload('use ``lit`@skipper`` here')).toBe('use ``lit`@skipper`` here');
+  });
+
+  it('shields four-backtick fences', () => {
+    expect(payload('````\n@skipper ship 1\n````')).toBe('````\n@skipper ship 1\n````');
+  });
+
+  it('unpaired single backtick does not swallow the rest of the message', () => {
+    expect(payload('stray ` then @skipper prose')).toBe('stray ` then <@skipper> prose');
+  });
+});

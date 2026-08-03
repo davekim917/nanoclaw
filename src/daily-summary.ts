@@ -125,27 +125,28 @@ async function fireDigests(): Promise<void> {
         JSON.stringify({ text: parent }),
       );
       if (backlogThread) {
-        if (parentId) {
-          // Long backlog lists live in the parent's thread so the channel
-          // shows one compact line. Thread id shape matches the router's
-          // (`<platform_id>:<message ts>` — see slack.ts targets).
-          await adapter.deliver(
-            target.channel_type,
-            target.platform_id,
-            `${target.platform_id}:${parentId}`,
-            'chat',
-            JSON.stringify({ text: backlogThread }),
-          );
-        } else {
-          // Adapter gave no message id (platform can't thread) — fall back
-          // to a second channel message rather than dropping the list.
-          await adapter.deliver(
-            target.channel_type,
-            target.platform_id,
-            null,
-            'chat',
-            JSON.stringify({ text: backlogThread }),
-          );
+        // Long backlog lists live in the parent's thread so the channel
+        // shows one compact line. Thread id shape matches the router's
+        // (`<platform_id>:<message ts>` — see slack.ts targets). No message
+        // id (platform can't thread) → second channel message instead.
+        const threadId = parentId ? `${target.platform_id}:${parentId}` : null;
+        const sendThread = () =>
+          adapter.deliver(target.channel_type, target.platform_id, threadId, 'chat', JSON.stringify({ text: backlogThread }));
+        try {
+          await sendThread();
+        } catch (firstErr) {
+          // The parent already posted, so the day is marked complete either
+          // way — one retry, then a loud error, is the whole recovery
+          // budget: re-running the tick would double-post every parent.
+          log.warn('Daily summary backlog thread failed — retrying once', { workgroupId, err: firstErr });
+          try {
+            await sendThread();
+          } catch (err) {
+            log.error('Daily summary backlog thread LOST for today (parent posted, thread failed twice)', {
+              workgroupId,
+              err,
+            });
+          }
         }
       }
       sentCount += 1;

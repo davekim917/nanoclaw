@@ -12,6 +12,7 @@
  * PR #8, the install skill re-fills the marker on install.
  */
 import type Database from 'better-sqlite3';
+import { touchSessionActivity } from '../../db/sessions.js';
 import { CronExpressionParser } from 'cron-parser';
 
 import { TIMEZONE } from '../../config.js';
@@ -71,6 +72,7 @@ export async function handleRecurrence(inDb: Database.Database, session: Session
           insertRecurrence(inDb, msg, newId, cronNext.toISOString(), 'paused');
           clearRecurrence(inDb, msg.id);
         })();
+        touchSessionActivity(session.id);
         appendHostTaskNote(
           session.agent_group_id,
           msg.series_id,
@@ -91,6 +93,7 @@ export async function handleRecurrence(inDb: Database.Database, session: Session
         insertRecurrence(inDb, msg, newId, nextRun);
         clearRecurrence(inDb, msg.id);
       })();
+      touchSessionActivity(session.id);
 
       log.info('Inserted next recurrence', {
         originalId: msg.id,

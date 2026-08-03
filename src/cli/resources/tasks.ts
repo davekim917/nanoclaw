@@ -12,6 +12,7 @@ import {
   getSession,
   isTaskThread,
   TASKS_SYSTEM_THREAD_ID,
+  touchSessionActivity,
 } from '../../db/sessions.js';
 import {
   cancelAllTasks,
@@ -314,6 +315,7 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
     return selectTask(db, id);
   });
   if (!created) throw new Error('task system session inbound.db not found');
+  touchSessionActivity(session.id);
   const output = toOutput(session, created);
   return routingNote ? { ...output, routing_note: routingNote } : output;
 }
@@ -446,7 +448,10 @@ function mutateTask(
   const id = taskId(args);
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
-    touched += withInbound(session, (db) => fn(db, id)) ?? 0;
+    const n = withInbound(session, (db) => fn(db, id)) ?? 0;
+    // Quiet-cache/delivery-horizon invalidation — see touchSessionActivity.
+    if (n > 0) touchSessionActivity(session.id);
+    touched += n;
   }
   if (touched === 0) throw new Error(`no live task matched: ${id}`);
   return { series_id: id, touched };
@@ -506,7 +511,9 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
 
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
-    touched += withInbound(session, (db) => updateTask(db, id, update)) ?? 0;
+    const n = withInbound(session, (db) => updateTask(db, id, update)) ?? 0;
+    if (n > 0) touchSessionActivity(session.id);
+    touched += n;
   }
   if (touched === 0) throw new Error(`no live task matched: ${id}`);
   return { series_id: id, touched, fields };
@@ -555,7 +562,10 @@ function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
       });
       return { series_id: seriesKey, row_id: rowId, status: 'pending' };
     });
-    if (fired) return fired;
+    if (fired) {
+      touchSessionActivity(session.id);
+      return fired;
+    }
   }
   throw new Error(`task not found: ${id}`);
 }

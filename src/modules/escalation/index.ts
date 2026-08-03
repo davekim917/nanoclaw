@@ -68,7 +68,14 @@ export async function applyOwnerEscalation(
   }
 
   const now = Date.now();
-  const recent = (recentBySession.get(session.id) ?? []).filter((ts) => now - ts < RATE_LIMIT_WINDOW_MS);
+  // Prune the whole map, not just this session's entry — long-lived hosts
+  // otherwise accumulate one array per session that ever escalated.
+  for (const [key, stamps] of recentBySession) {
+    const live = stamps.filter((ts) => now - ts < RATE_LIMIT_WINDOW_MS);
+    if (live.length === 0) recentBySession.delete(key);
+    else if (live.length !== stamps.length) recentBySession.set(key, live);
+  }
+  const recent = recentBySession.get(session.id) ?? [];
   if (recent.length >= RATE_LIMIT_MAX) {
     log.warn('escalate_to_owner rate-limited', { sessionId: session.id, recent: recent.length });
     throw new Error(`escalate_to_owner rejected: rate limit (${RATE_LIMIT_MAX}/hour per session)`);

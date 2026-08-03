@@ -1,5 +1,6 @@
 import type { PendingApproval, PendingQuestion, Session } from '../types.js';
 import { getDb, hasTable } from './connection.js';
+import { log } from '../log.js';
 
 // ── Sessions ──
 
@@ -184,6 +185,25 @@ export function updateSession(
   getDb()
     .prepare(`UPDATE sessions SET ${fields.join(', ')} WHERE id = @id`)
     .run(values);
+}
+
+/**
+ * Bump a session's central last_active to now. REQUIRED after any write that
+ * changes when the session next has due work (task insert, process_after
+ * edit, recurrence re-arm): the host-sweep quiet cache and the delivery
+ * sweep's activity horizon both key on last_active, so a task written into a
+ * quiet/dormant session without this bump sits unseen until the cache
+ * expires — or, past the 7-day delivery horizon, indefinitely.
+ */
+export function touchSessionActivity(id: string): void {
+  try {
+    updateSession(id, { last_active: new Date().toISOString() });
+  } catch (err) {
+    // Advisory freshness hint — a failed bump must never abort the task
+    // write it rides on. Worst case is the old behavior (cache skips until
+    // expiry), loudly.
+    log.warn('touchSessionActivity failed', { sessionId: id, err });
+  }
 }
 
 export function deleteSession(id: string): void {

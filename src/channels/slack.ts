@@ -147,7 +147,7 @@ export function makeSlackRecoveryPageFetcher(slackAdapter: ReturnType<typeof cre
  * cannot succeed until a human changes the wiring, so the bridge parks the
  * target instead of failing the pass.
  */
-const PERMANENT_SLACK_RECOVERY_ERRORS = ['channel_not_found', 'is_archived', 'not_in_channel'];
+const PERMANENT_SLACK_RECOVERY_ERRORS = ['channel_not_found', 'is_archived', 'not_in_channel', 'missing_scope'];
 
 export function classifySlackRecoveryError(err: unknown): 'permanent' | 'transient' {
   const code = (err as { data?: { error?: string } })?.data?.error;

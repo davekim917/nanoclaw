@@ -789,12 +789,26 @@ function readMemoryEvidence(
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
   if (involvedSenderNames.length > 0) {
     const senderSlugs = [...new Set(involvedSenderNames.map(preferenceSlug))].filter((slug) => slug.length > 0);
-    const matched = allFiles.filter((relative) => {
-      if (!relative.startsWith(PREFERENCES_DIR)) return false;
-      const stem = relative.slice(PREFERENCES_DIR.length, -'.md'.length);
-      if (stem.length === 0 || stem.includes('/')) return false;
-      return senderSlugs.some((slug) => preferenceStemMatches(stem, slug));
-    });
+    const preferenceStems = allFiles
+      .filter((relative) => relative.startsWith(PREFERENCES_DIR))
+      .map((relative) => relative.slice(PREFERENCES_DIR.length, -'.md'.length))
+      .filter((stem) => stem.length > 0 && !stem.includes('/'));
+    // ONE file per sender: exact slug match wins outright; otherwise the
+    // longest prefix-compatible stem. Injecting every prefix match would let
+    // `alex.md` ride along with `alex-stone.md` for the same person.
+    const matched = [
+      ...new Set(
+        senderSlugs
+          .map((slug) => {
+            if (preferenceStems.includes(slug)) return slug;
+            const compatible = preferenceStems
+              .filter((stem) => preferenceStemMatches(stem, slug))
+              .sort((a, b) => b.length - a.length || compareCodepoint(a, b));
+            return compatible[0];
+          })
+          .filter((stem): stem is string => stem !== undefined),
+      ),
+    ].map((stem) => `${PREFERENCES_DIR}${stem}.md`);
     for (const relative of matched.slice(0, PRE_TURN_BOUNDS.preferenceExcerpts)) {
       const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
       if (remaining <= 0) break;

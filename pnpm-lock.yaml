@@ -12,7 +12,7 @@ patchedDependencies:
     hash: e43e04f4324e986655b80530bd8fb39889b4d4f3b17419753d32afab9bb18b11
     path: patches/@chat-adapter__discord@4.29.0.patch
   '@chat-adapter/slack':
-    hash: 805f7c779872b257ce6ee3592ee51b0ed35cad072f9e69b6f48fb0c3a5167a96
+    hash: 4cc50a33eeb49440e3e2e085f85078f9524f3081dd5196ccb0d9d50e328f4b7a
     path: patches/@chat-adapter__slack.patch
 
 importers:
@@ -24,7 +24,7 @@ importers:
         version: 4.29.0(patch_hash=e43e04f4324e986655b80530bd8fb39889b4d4f3b17419753d32afab9bb18b11)
       '@chat-adapter/slack':
         specifier: 4.29.0
-        version: 4.29.0(patch_hash=805f7c779872b257ce6ee3592ee51b0ed35cad072f9e69b6f48fb0c3a5167a96)
+        version: 4.29.0(patch_hash=4cc50a33eeb49440e3e2e085f85078f9524f3081dd5196ccb0d9d50e328f4b7a)
       '@clack/core':
         specifier: ^1.4.3
         version: 1.4.3
@@ -1770,7 +1770,7 @@ snapshots:
       - supports-color
       - zod
 
-  '@chat-adapter/slack@4.29.0(patch_hash=805f7c779872b257ce6ee3592ee51b0ed35cad072f9e69b6f48fb0c3a5167a96)':
+  '@chat-adapter/slack@4.29.0(patch_hash=4cc50a33eeb49440e3e2e085f85078f9524f3081dd5196ccb0d9d50e328f4b7a)':
     dependencies:
       '@chat-adapter/shared': 4.29.0
       '@slack/socket-mode': 2.0.7

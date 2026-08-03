@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { touchSessionActivity } from '../../db/sessions.js';
 import fs from 'fs';
 
 import { CronExpressionParser } from 'cron-parser';
@@ -167,6 +168,8 @@ export function createScheduledTask(
       )
       .get(id) as ScheduledTaskRow;
   });
+  // Quiet-cache/delivery-horizon invalidation — see touchSessionActivity.
+  touchSessionActivity(session.id);
 
   return { session: { id: session.id, agent_group_id: session.agent_group_id }, row };
 }

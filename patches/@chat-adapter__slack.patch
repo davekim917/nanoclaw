@@ -1,8 +1,8 @@
 diff --git a/dist/index.js b/dist/index.js
-index dd24754940357407f5116920325c427ffac61d03..4b971177b04d3831ef828fd167a43d67ff2bb250 100644
+index dd24754940357407f5116920325c427ffac61d03..596674a14763c1675a775c6d9879adbcf0e8fa5c 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -423,10 +423,17 @@ var SlackFormatConverter = class extends BaseFormatConverter {
+@@ -423,10 +423,19 @@ var SlackFormatConverter = class extends BaseFormatConverter {
      return "";
    }
    finalize(text) {
@@ -15,9 +15,11 @@ index dd24754940357407f5116920325c427ffac61d03..4b971177b04d3831ef828fd167a43d67
 +    // reader is told to type); rewriting it to <@name> makes Slack resolve
 +    // and store the raw <@USERID> form, which renders as unreadable literal
 +    // text inside a code span. Split keeps code segments (odd indices, via
-+    // the capture group) byte-identical.
++    // the capture group) byte-identical. Fences match 3+ backticks so a
++    // ````-fenced block is one segment; ``double`` spans (inline code
++    // containing a backtick) are recognized before single spans.
 +    const rewritten = text
-+      .split(/(```[\s\S]*?```|`[^`\n]+`)/g)
++      .split(/(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/g)
 +      .map((seg, i) => (i % 2 === 1 ? seg : seg.replace(BARE_MENTION_REGEX, "<@$1>")))
 +      .join("");
 +    return convertEmojiPlaceholders(rewritten, "slack");

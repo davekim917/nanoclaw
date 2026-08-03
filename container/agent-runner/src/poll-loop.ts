@@ -311,7 +311,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           const prompt = buildWorkContinuationPrompt(runningWork.task);
           // Budget inherits from the continuation's SOURCE row: work promised
           // from a muted/capped task turn stays muted/capped when it resumes.
-          applyChatBudget(sourceBatch);
+          // If the source row is gone (deleted task, legacy pending_next),
+          // KEEP the current budget — an empty batch must not reset an
+          // active mute/cap to unlimited.
+          if (sourceBatch.length > 0) applyChatBudget(sourceBatch);
           const settings = applyFlagBatch([], routing, config.providerName);
           log(`Resuming durable continuation: ${runningWork.task.slice(0, 120)}`);
           config.provider.resetRotationCycle?.();

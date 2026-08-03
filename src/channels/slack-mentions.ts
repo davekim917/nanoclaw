@@ -433,7 +433,12 @@ export async function upgradeSlackBotProfile(
 export function resolveInboundSlackIds(text: string, channelType: string): string {
   if (!text.includes('<@')) return text;
   const self = knownSlackBots.get(channelType);
-  const teamId = self?.teamId;
+  // Fail closed to pass-through: without this workspace's own identity there
+  // is no teamId to scope by, and an unscoped loop would rewrite a pasted
+  // foreign raw id to ANOTHER workspace's bot name — an isolation violation
+  // worse than the raw id it hides.
+  if (!self) return text;
+  const teamId = self.teamId;
   let out = text;
   const substitute = (identity: SlackBotIdentity, name: string | undefined): void => {
     if (!name) return;
