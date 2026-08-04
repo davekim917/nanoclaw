@@ -82,8 +82,17 @@ export function formatElapsed(ms: number): string {
   return h >= 10 ? `${Math.round(h)}h` : `${h.toFixed(1).replace(/\.0$/, '')}h`;
 }
 
+// Same gotcha as repo-freshness: the service env proxies HTTPS through the
+// onecli gateway, which overrides Authorization; GitHub creds are env-only,
+// so proxied fetches always fail auth. Bypass the proxy for github.com.
+const GIT_ENV = {
+  ...process.env,
+  NO_PROXY: [process.env.NO_PROXY, 'github.com'].filter(Boolean).join(','),
+  no_proxy: [process.env.no_proxy, 'github.com'].filter(Boolean).join(','),
+};
+
 async function git(...args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync('git', args, { cwd: REPO_ROOT, timeout: 30_000 });
+  const { stdout } = await execFileAsync('git', args, { cwd: REPO_ROOT, timeout: 30_000, env: GIT_ENV });
   return stdout.trim();
 }
 
@@ -213,7 +222,11 @@ async function tick(): Promise<void> {
   if (running) return;
   running = true;
   try {
-    await execFileAsync('git', ['fetch', '--quiet', 'origin', 'main'], { cwd: REPO_ROOT, timeout: 30_000 });
+    await execFileAsync('git', ['fetch', '--quiet', 'origin', 'main'], {
+      cwd: REPO_ROOT,
+      timeout: 30_000,
+      env: GIT_ENV,
+    });
     const check = await checkStaleness();
     if (!check.stale) {
       log.debug('Container image up to date', { reason: check.reason });
