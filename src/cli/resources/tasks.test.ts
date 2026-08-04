@@ -153,6 +153,49 @@ describe('tasks CLI resource', () => {
     systemDb.close();
   });
 
+  it('create and update persist quiet-status independently from the chat budget', async () => {
+    const resp = await dispatch(
+      {
+        id: 'quiet-create',
+        command: 'tasks-create',
+        args: {
+          prompt: 'publish one consolidated verdict',
+          process_after: '2026-01-15T09:00:00Z',
+          quiet_status: true,
+          chat_limit: '1',
+        },
+      },
+      agentCtx(),
+    );
+
+    expect(resp.ok).toBe(true);
+    if (!resp.ok) return;
+    const created = resp.data as { series_id: string; session_id: string };
+    const db = new Database(inboundDbPath('ag-1', created.session_id));
+    const before = JSON.parse(
+      (db.prepare("SELECT content FROM messages_in WHERE kind = 'task'").get() as { content: string }).content,
+    ) as Record<string, unknown>;
+    expect(before).toMatchObject({ quietStatus: true, chatLimit: 1 });
+    db.close();
+
+    const updated = await dispatch(
+      {
+        id: 'quiet-update',
+        command: 'tasks-update',
+        args: { id: created.series_id, quiet_status: false },
+      },
+      agentCtx(),
+    );
+    expect(updated.ok).toBe(true);
+
+    const updatedDb = new Database(inboundDbPath('ag-1', created.session_id), { readonly: true });
+    const after = JSON.parse(
+      (updatedDb.prepare("SELECT content FROM messages_in WHERE kind = 'task'").get() as { content: string }).content,
+    ) as Record<string, unknown>;
+    expect(after).toMatchObject({ quietStatus: false, chatLimit: 1 });
+    updatedDb.close();
+  });
+
   it('tasks-list attaches a server-rendered human table (so the container agent gets it too)', async () => {
     await dispatch(
       {

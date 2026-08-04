@@ -254,8 +254,9 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
   // shouldn't get silenced — so this is conservative: only quiet when
   // ALL non-task messages would also be no-op (currently: when the batch
   // is task-only).
-  const quietStatus = messages.every((m) => {
-    if (m.kind !== 'task') return false;
+  const substantiveMessages = messages.filter((m) => m.kind !== 'system');
+  const taskOnly = substantiveMessages.length > 0 && substantiveMessages.every((m) => m.kind === 'task');
+  const quietStatus = taskOnly && substantiveMessages.every((m) => {
     try {
       const c = JSON.parse(m.content);
       return c?.quietStatus === true;
@@ -273,7 +274,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     threadId: useOwnRouting ? (first.thread_id ?? null) : (sessionRouting.thread_id ?? null),
     inReplyTo: first?.id ?? null,
     quietStatus,
-    taskRun: messages.length > 0 && messages.every((m) => m.kind === 'task'),
+    taskRun: taskOnly,
   };
 }
 

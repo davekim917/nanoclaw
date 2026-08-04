@@ -114,6 +114,7 @@ export function deleteTask(db: Database.Database, taskId: string): number {
 export interface TaskUpdate {
   prompt?: string;
   script?: string | null;
+  quietStatus?: boolean;
   recurrence?: string | null;
   processAfter?: string;
   /**
@@ -136,6 +137,7 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
   const mergeContent =
     update.prompt !== undefined ||
     update.script !== undefined ||
+    update.quietStatus !== undefined ||
     update.flagIntent !== undefined ||
     update.chatLimit !== undefined;
 
@@ -166,6 +168,7 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
         if (update.prompt !== undefined) parsed.prompt = update.prompt;
         if (update.chatLimit !== undefined) parsed.chatLimit = update.chatLimit;
         if (update.script !== undefined) parsed.script = update.script;
+        if (update.quietStatus !== undefined) parsed.quietStatus = update.quietStatus;
         if (update.flagIntent !== undefined) {
           // Merge, don't replace: a model-only change keeps an existing effort
           // pin (and vice versa).

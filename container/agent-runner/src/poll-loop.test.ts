@@ -915,6 +915,25 @@ describe('routing', () => {
     expect(routing.threadId).toBeNull(); // NOT 'slack:C123:thread-from-prior-wake'
   });
 
+  it('keeps task routing and quiet status when due admission prepends recall context', () => {
+    const db = getInboundDb();
+    db.prepare(
+      `INSERT INTO messages_in (id, kind, timestamp, status, trigger, content)
+       VALUES ('recall-quiet-task', 'system', datetime('now'), 'pending', 0,
+               '{"subtype":"recall_context"}')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, content)
+       VALUES ('quiet-task', 'task', datetime('now'), 'pending', 1, 'slack:C123', 'slack',
+               '{"prompt":"one verdict","quietStatus":true}')`,
+    ).run();
+
+    const routing = extractRouting(getPendingMessages());
+    expect(routing.taskRun).toBe(true);
+    expect(routing.quietStatus).toBe(true);
+    expect(routing.platformId).toBe('slack:C123');
+  });
+
   it('falls back to session_routing per-field when message has no platform_id (a-to-a case)', () => {
     // Agent-to-agent inbounds carry channel_type='agent' but no platform_id
     // (the message originates from another agent, not a Slack/Discord

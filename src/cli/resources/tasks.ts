@@ -307,6 +307,9 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
         // Physical send suppression, enforced by the agent-runner: chat-kind
         // outbound writes are dropped for tasks carrying muteChat.
         ...(bool(args.mute_chat) ? { muteChat: true } : {}),
+        // Streaming status is useful interactively but noisy for scheduled
+        // orchestrators that publish one consolidated channel message.
+        ...(bool(args.quiet_status) ? { quietStatus: true } : {}),
         // Per-turn chat send budget (e.g. 1 for a standup whose contract is
         // one digest post — trailing work-log messages get dropped).
         ...(chatLimitArg(args) !== undefined ? { chatLimit: chatLimitArg(args) } : {}),
@@ -470,6 +473,7 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   const update: TaskUpdate = {};
   if (typeof args.prompt === 'string') update.prompt = args.prompt;
   if (chatLimitArg(args) !== undefined) update.chatLimit = chatLimitArg(args);
+  if (args.quiet_status !== undefined) update.quietStatus = bool(args.quiet_status);
   if (args.process_after !== undefined) update.processAfter = parseProcessAfter(args.process_after);
   const recurrence = normalizeNullableString(args.recurrence);
   const script = normalizeNullableString(args.script);
@@ -715,6 +719,12 @@ registerResource({
             'Max chat sends per turn, enforced by the agent-runner at the write layer (e.g. 1 for a digest task — extra work-log messages are dropped). Omit for unlimited.',
         },
         {
+          name: 'quiet_status',
+          type: 'boolean',
+          description:
+            'Suppress streaming status/thinking posts while preserving final chat sends. Use with --chat-limit for one-message scheduled orchestrators.',
+        },
+        {
           name: 'messaging_group',
           type: 'string',
           description: 'Host-only: stamp routing to this messaging group id (rejected from an agent caller).',
@@ -781,6 +791,11 @@ registerResource({
           name: 'chat_limit',
           type: 'string',
           description: 'Max chat sends per turn (agent-runner enforced). 0 = mute.',
+        },
+        {
+          name: 'quiet_status',
+          type: 'boolean',
+          description: 'Enable or disable streaming status suppression without muting final chat sends.',
         },
         { name: 'recurrence', type: 'string', description: 'New cron expression; "null"/"none" clears it (one-shot).' },
         {
