@@ -222,6 +222,15 @@ export function resolveSlackMentions(
   }
   if (byName.size === 0) return text;
 
+  // The release-digest contract uses a structured `Who:` field. Models have
+  // repeatedly emitted the correct human names there while dropping the `@`
+  // required to make them real Slack mentions (the same post then mentions
+  // those people correctly elsewhere). Treat only this explicit owner field
+  // as semantic: unambiguous live-workspace names become canonical mentions;
+  // ordinary prose is untouched. This is a mechanical backstop for the
+  // contract, not a general "guess names and ping people" pass.
+  const structured = resolveStructuredWhoMentions(text, currentBot.teamId, bots, humans);
+
   // Slack usernames allow `[a-z0-9._-]` per Slack's user-handle rules.
   // Composed as a base + optional `.SUFFIX` segments so a trailing
   // sentence-ending period ("Your turn, @helper-codex.") doesn't get
@@ -255,7 +264,7 @@ export function resolveSlackMentions(
     botNameById.set(ident.userId, (ident.displayName || ident.realName || ident.username).toLowerCase());
   }
 
-  const resolved = transformOutsideProtectedRegions(text, (segment) => {
+  const resolved = transformOutsideProtectedRegions(structured, (segment) => {
     const rewriteByName = (match: string, name: string): string => {
       // Skip names that look like Slack user IDs (`U…` followed by 8+
       // uppercase alphanumerics) — those are already canonical and shouldn't
@@ -292,6 +301,117 @@ export function resolveSlackMentions(
       return name ? `@${name}` : match;
     }),
   );
+}
+
+/** Escape a literal value before embedding it in a RegExp. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Resolve names only inside an explicit `Who:` owner field. Alias conflicts
+ * fail closed: if two workspace identities claim the same visible name, the
+ * name remains plain text instead of pinging the wrong person.
+ */
+function resolveStructuredWhoMentions(
+  text: string,
+  teamId: string,
+  bots: ReadonlyMap<string, SlackBotIdentity>,
+  humans: ReadonlyMap<string, SlackBotIdentity[]>,
+): string {
+  if (!/^\s*(?:[-*◦•]\s+)?(?:\*\*)?Who(?::(?:\*\*)?|\*\*:)/imu.test(text)) return text;
+
+  const claims = new Map<string, { alias: string; userId: string }>();
+  const ambiguous = new Set<string>();
+  const claim = (alias: string | undefined, userId: string): void => {
+    const literal = alias?.trim();
+    if (!literal) return;
+    const key = literal.toLocaleLowerCase();
+    const prior = claims.get(key);
+    if (prior && prior.userId !== userId) {
+      ambiguous.add(key);
+      return;
+    }
+    claims.set(key, { alias: literal, userId });
+  };
+  for (const identity of bots.values()) {
+    if (identity.teamId !== teamId) continue;
+    claim(identity.username, identity.userId);
+    claim(identity.displayName, identity.userId);
+    claim(identity.realName, identity.userId);
+  }
+  for (const identity of humans.get(teamId) ?? []) {
+    claim(identity.username, identity.userId);
+    claim(identity.displayName, identity.userId);
+    claim(identity.realName, identity.userId);
+  }
+
+  const aliases = [...claims.entries()]
+    .filter(([key]) => !ambiguous.has(key))
+    .map(([, value]) => value)
+    .sort((left, right) => right.alias.length - left.alias.length);
+  if (aliases.length === 0) return text;
+
+  return transformOutsideProtectedRegions(text, (segment) =>
+    segment.replace(
+      /^(\s*(?:[-*◦•]\s+)?(?:\*\*)?Who(?::(?:\*\*)?|\*\*:)\s*)(.*)$/gimu,
+      (_line, prefix: string, owners: string) => {
+        // Preserve canonical Slack mentions already present in the field.
+        const parts = owners.split(/(<@[^>\n]+>)/g);
+        for (let i = 0; i < parts.length; i += 2) {
+          let plain = parts[i];
+          for (const { alias, userId } of aliases) {
+            const literal = escapeRegExp(alias);
+            const re = new RegExp(String.raw`(?<![@\p{L}\p{M}\p{N}\w])${literal}(?![\p{L}\p{M}\p{N}\w])`, 'giu');
+            plain = plain.replace(re, `<@${userId}>`);
+          }
+          parts[i] = plain;
+        }
+        return prefix + parts.join('');
+      },
+    ),
+  );
+}
+
+/**
+ * Keep ordered digest items in one Slack Markdown list when their detail lines
+ * use the release template's visible `•`/`◦` marker. Slack resets an ordered
+ * list across the template's blank item separators, rendering each explicit
+ * number as `1.`. Remove only blanks whose next nonblank line is another
+ * ordered item, and indent any unindented detail markers. The blank separating
+ * the list from the following section is preserved.
+ */
+export function normalizeSlackOrderedListContinuations(text: string): string {
+  const lines = text.split('\n');
+  let insideOrderedList = false;
+  const normalized: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (/^\d+\.\s+\S/u.test(line)) {
+      insideOrderedList = true;
+      normalized.push(line);
+      continue;
+    }
+    if (!insideOrderedList) {
+      normalized.push(line);
+      continue;
+    }
+    if (/^[◦•]\s+\S/u.test(line)) {
+      normalized.push(`   ${line}`);
+      continue;
+    }
+    if (/^\s+\S/u.test(line)) {
+      normalized.push(line);
+      continue;
+    }
+    if (/^\s*$/u.test(line)) {
+      const nextNonblank = lines.slice(index + 1).find((candidate) => /\S/u.test(candidate));
+      if (nextNonblank && /^\d+\.\s+\S/u.test(nextNonblank)) continue;
+    }
+    insideOrderedList = false;
+    normalized.push(line);
+  }
+  return normalized.join('\n');
 }
 
 /**
@@ -431,7 +551,11 @@ export async function upgradeSlackBotProfile(
  * untouched (better a raw id the model treats as opaque than a wrong name).
  */
 export function resolveInboundSlackIds(text: string, channelType: string): string {
-  if (!text.includes('<@')) return text;
+  // Chat SDK's inbound parser can hand this seam either Slack's raw
+  // `<@U…>` token or its already-flattened `@U…` form. Supporting only the
+  // former left thread-history context contaminated with raw bot IDs even
+  // after the original inbound fix.
+  if (!text.includes('<@') && !/@U[A-Z0-9_-]{2,}/u.test(text)) return text;
   const self = knownSlackBots.get(channelType);
   // Fail closed to pass-through: without this workspace's own identity there
   // is no teamId to scope by, and an unscoped loop would rewrite a pasted
@@ -442,7 +566,9 @@ export function resolveInboundSlackIds(text: string, channelType: string): strin
   let out = text;
   const substitute = (identity: SlackBotIdentity, name: string | undefined): void => {
     if (!name) return;
-    out = out.replace(new RegExp(`<@${identity.userId}(\\|[^>]*)?>`, 'g'), `@${name}`);
+    const id = escapeRegExp(identity.userId);
+    out = out.replace(new RegExp(`<@${id}(\\|[^>]*)?>`, 'g'), `@${name}`);
+    out = out.replace(new RegExp(`(?<![\\w])@${id}(?![A-Z0-9_-])`, 'g'), `@${name}`);
   };
   for (const bot of knownSlackBots.values()) {
     if (teamId && bot.teamId !== teamId) continue;

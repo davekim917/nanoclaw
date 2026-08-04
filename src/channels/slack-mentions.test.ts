@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   fetchSlackBotIdentity,
+  normalizeSlackOrderedListContinuations,
   registerSlackBot,
   registerSlackWorkspaceHumans,
   resolveInboundSlackIds,
@@ -327,6 +328,32 @@ describe('resolveSlackMentions', () => {
       );
     });
 
+    it('turns unprefixed names in a structured Who field into real mentions', () => {
+      const humans = makeHumans();
+      humans.get(LABS_TEAM)!.push({
+        userId: 'U-JAMES',
+        username: 'james',
+        displayName: 'James',
+        realName: 'James Operator',
+        teamId: LABS_TEAM,
+      });
+      expect(
+        resolveSlackMentions('◦ Who: Opal or James\n◦ Why: decision needed', 'slack-example-labs', makeBots(), humans),
+      ).toBe('◦ Who: <@U-OPERATOR1> or <@U-JAMES>\n◦ Why: decision needed');
+    });
+
+    it('does not infer mentions from the same names in ordinary prose', () => {
+      expect(resolveSlackMentions('Opal or Jay can decide', 'slack-example-labs', makeBots(), makeHumans())).toBe(
+        'Opal or Jay can decide',
+      );
+    });
+
+    it('preserves an explicit mention already present in a Who field', () => {
+      expect(resolveSlackMentions('• **Who:** @Opal', 'slack-example-labs', makeBots(), makeHumans())).toBe(
+        '• **Who:** <@U-OPERATOR1>',
+      );
+    });
+
     it('rewrites a human real name when display name is empty', () => {
       expect(resolveSlackMentions('over to @Jay', 'slack-example-labs', makeBots(), makeHumans())).toBe(
         'over to <@U-OPERATOR2>',
@@ -635,7 +662,7 @@ describe('upgradeSlackBotProfile (fire-and-forget profile enrichment)', () => {
 });
 
 describe('resolveInboundSlackIds', () => {
-  it('resolves known bot and human raw ids to @name; unknown ids pass through', () => {
+  it('resolves bracketed and flattened bot/human ids to @name; unknown ids pass through', () => {
     registerSlackBot('slack-test-inbound', {
       userId: 'U-GATEBOT',
       username: 'testbot',
@@ -653,6 +680,10 @@ describe('resolveInboundSlackIds', () => {
       expect(resolveInboundSlackIds('<@U-GATEBOT|skipper> vs <@U-UNKNOWN9>', 'slack-test-inbound')).toBe(
         '@skipper vs <@U-UNKNOWN9>',
       );
+      expect(resolveInboundSlackIds('@U-GATEBOT ship 100 before @U-HUMAN1 replies', 'slack-test-inbound')).toBe(
+        '@skipper ship 100 before @Alice Woods replies',
+      );
+      expect(resolveInboundSlackIds('@U-UNKNOWN9 ship 100', 'slack-test-inbound')).toBe('@U-UNKNOWN9 ship 100');
       expect(resolveInboundSlackIds('no mentions here', 'slack-test-inbound')).toBe('no mentions here');
     } finally {
       registerSlackBot('slack-test-inbound', {
@@ -662,6 +693,39 @@ describe('resolveInboundSlackIds', () => {
       });
       registerSlackWorkspaceHumans('T-INBOUND', []);
     }
+  });
+});
+
+describe('normalizeSlackOrderedListContinuations', () => {
+  it('indents digest detail bullets so explicit item numbers stay in one Slack list', () => {
+    const input = [
+      '1. First ask',
+      '◦ Who: Dave',
+      '◦ Reply: ship 1',
+      '',
+      '2. Second ask',
+      '• Who: James',
+      '• Reply: ship 2',
+      '',
+      ':gear: AUTO',
+    ].join('\n');
+    expect(normalizeSlackOrderedListContinuations(input)).toBe(
+      [
+        '1. First ask',
+        '   ◦ Who: Dave',
+        '   ◦ Reply: ship 1',
+        '2. Second ask',
+        '   • Who: James',
+        '   • Reply: ship 2',
+        '',
+        ':gear: AUTO',
+      ].join('\n'),
+    );
+  });
+
+  it('leaves an already-indented ordered list unchanged', () => {
+    const input = '1. First\n   • detail\n2. Second';
+    expect(normalizeSlackOrderedListContinuations(input)).toBe(input);
   });
 });
 
@@ -717,5 +781,87 @@ describe('patched finalize — extended code-boundary cases', async () => {
 
   it('unpaired single backtick does not swallow the rest of the message', () => {
     expect(payload('stray ` then @skipper prose')).toBe('stray ` then <@skipper> prose');
+  });
+});
+
+describe('patched @chat-adapter/slack outgoing mention resolver', async () => {
+  const { SlackAdapter } = await import('@chat-adapter/slack');
+
+  async function resolve(markdown: string): Promise<string> {
+    const adapter = new SlackAdapter({ botToken: 'xoxb-test', signingSecret: 'test-secret' });
+    const state = {
+      getList: vi.fn(async (key: string) => (key === 'slack:user-by-name:admiral' ? ['UTESTADM1'] : [])),
+    };
+    (adapter as unknown as { chat: unknown }).chat = { getState: () => state };
+    return (
+      adapter as unknown as { resolveOutgoingMentions(text: string, threadId: string): Promise<string> }
+    ).resolveOutgoingMentions(markdown, 'slack:C-TEST:123.456');
+  }
+
+  it('keeps semantic gate syntax in inline code while resolving prose mentions', async () => {
+    await expect(resolve('Reply: `@admiral ship 100`; prose @admiral owns it.')).resolves.toBe(
+      'Reply: `@admiral ship 100`; prose <@UTESTADM1> owns it.',
+    );
+  });
+
+  it('keeps semantic gate syntax in fenced code', async () => {
+    await expect(resolve('```\n@admiral ship 100\n```')).resolves.toBe('```\n@admiral ship 100\n```');
+  });
+});
+
+describe('release digest incident regression', async () => {
+  const { SlackAdapter, SlackFormatConverter } = await import('@chat-adapter/slack');
+
+  it('ships numbered items, real Who pings, and semantic reply syntax in one wire payload', async () => {
+    const bots = new Map<string, SlackBotIdentity>([
+      ['slack-illysium-admiral', { userId: 'UTESTADM1', username: 'admiral', teamId: 'TTESTTEAM1' }],
+    ]);
+    const humans = new Map<string, SlackBotIdentity[]>([
+      [
+        'TTESTTEAM1',
+        [
+          { userId: 'UTESTDAVE1', username: 'dave', displayName: 'Dave', teamId: 'TTESTTEAM1' },
+          { userId: 'UTESTJAMES1', username: 'james', displayName: 'James', teamId: 'TTESTTEAM1' },
+        ],
+      ],
+    ]);
+    const source = [
+      '1. **#100 — release gate**',
+      '   • **Who:** Dave or James',
+      '   • **Reply:** `@admiral ship 100`',
+      '',
+      '2. **#56 — second gate**',
+      '   • **Who:** Dave',
+      '   • **Reply:** `@admiral ship 56`',
+      '',
+      '⚙️ **AUTO**',
+    ].join('\n');
+    const transformed = resolveSlackMentions(
+      normalizeSlackOrderedListContinuations(source),
+      'slack-illysium-admiral',
+      bots,
+      humans,
+    );
+
+    const adapter = new SlackAdapter({ botToken: 'xoxb-test', signingSecret: 'test-secret' });
+    const state = { getList: vi.fn(async () => []) };
+    (adapter as unknown as { chat: unknown }).chat = { getState: () => state };
+    const resolved = await (
+      adapter as unknown as { resolveOutgoingMentions(text: string, threadId: string): Promise<string> }
+    ).resolveOutgoingMentions(transformed, 'slack:CTESTCHAN1:1785755345.439779');
+    const payload = new SlackFormatConverter().toSlackPayload({ markdown: resolved });
+
+    expect(payload).toEqual({
+      markdown_text: [
+        '1. **#100 — release gate**',
+        '   • **Who:** <@UTESTDAVE1> or <@UTESTJAMES1>',
+        '   • **Reply:** `@admiral ship 100`',
+        '2. **#56 — second gate**',
+        '   • **Who:** <@UTESTDAVE1>',
+        '   • **Reply:** `@admiral ship 56`',
+        '',
+        '⚙️ **AUTO**',
+      ].join('\n'),
+    });
   });
 });

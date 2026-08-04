@@ -39,6 +39,7 @@ import {
   getKnownSlackBots,
   registerSlackBot,
   registerSlackWorkspaceHumans,
+  normalizeSlackOrderedListContinuations,
   resolveInboundSlackIds,
   resolveSlackMentions,
   upgradeSlackBotProfile,
@@ -415,7 +416,8 @@ for (const ws of workspaces) {
               named = named.replaceAll(`<@${bot.userId}>`, `@${bot.displayName || bot.username}`);
             }
           }
-          return markdownHeadingsToBold(resolveSlackMentions(named, ws.channelType));
+          const structured = normalizeSlackOrderedListContinuations(named);
+          return markdownHeadingsToBold(resolveSlackMentions(structured, ws.channelType));
         },
         // Inbound wire text carries mentions as raw <@U…>; resolving them to
         // @name here is what stops agents from ever LEARNING the raw form —

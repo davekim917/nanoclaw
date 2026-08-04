@@ -1,0 +1,120 @@
+diff --git a/dist/index.js b/dist/index.js
+index dd24754940357407f5116920325c427ffac61d03..c8fa2296bea1b552af47e8d423adb5b888cedfde 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -345,6 +345,10 @@ import {
+   tableToAscii
+ } from "chat";
+ var BARE_MENTION_REGEX = /(?<![<\w])@(\w+)/g;
++var SLACK_CODE_REGION_REGEX = /(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/g;
++function transformOutsideSlackCodeRegions(text, transform) {
++  return text.split(SLACK_CODE_REGION_REGEX).map((segment, index) => index % 2 === 1 ? segment : transform(segment)).join("");
++}
+ var SlackFormatConverter = class extends BaseFormatConverter {
+   /**
+    * Render an AST to standard markdown. Slack accepts this directly via
+@@ -423,10 +427,14 @@ var SlackFormatConverter = class extends BaseFormatConverter {
+     return "";
+   }
+   finalize(text) {
+-    return convertEmojiPlaceholders(
+-      text.replace(BARE_MENTION_REGEX, "<@$1>"),
+-      "slack"
++    // Gate instructions inside backticks are literal text for a human to
++    // type, not a mention to resolve. Keep code regions byte-identical while
++    // preserving normal mention behavior in prose.
++    const rewritten = transformOutsideSlackCodeRegions(
++      text,
++      (segment) => segment.replace(BARE_MENTION_REGEX, "<@$1>")
+     );
++    return convertEmojiPlaceholders(rewritten, "slack");
+   }
+   astToMrkdwn(ast) {
+     return this.fromAstWithNodeConverter(
+@@ -2697,17 +2705,19 @@ var SlackAdapter = class _SlackAdapter {
+     const state = this.chat.getState();
+     const mentionPattern = /@(\w+)/g;
+     const mentions = /* @__PURE__ */ new Map();
+-    for (const match of text.matchAll(mentionPattern)) {
+-      const name = match[1];
+-      if (SLACK_USER_ID_EXACT_PATTERN.test(name)) {
+-        continue;
+-      }
+-      const idx = match.index;
+-      if (idx > 0 && text[idx - 1] === "<") {
+-        continue;
+-      }
+-      if (!mentions.has(name.toLowerCase())) {
+-        mentions.set(name.toLowerCase(), []);
++    for (const segment of text.split(SLACK_CODE_REGION_REGEX).filter((_, index) => index % 2 === 0)) {
++      for (const match of segment.matchAll(mentionPattern)) {
++        const name = match[1];
++        if (SLACK_USER_ID_EXACT_PATTERN.test(name)) {
++          continue;
++        }
++        const idx = match.index;
++        if (idx > 0 && segment[idx - 1] === "<") {
++          continue;
++        }
++        if (!mentions.has(name.toLowerCase())) {
++          mentions.set(name.toLowerCase(), []);
++        }
+       }
+     }
+     if (mentions.size === 0) {
+@@ -2728,30 +2738,33 @@ var SlackAdapter = class _SlackAdapter {
+       );
+       participants = new Set(participantList);
+     }
+-    return text.replace(
+-      mentionPattern,
+-      (match, name, offset) => {
+-        if (offset > 0 && text[offset - 1] === "<") {
+-          return match;
+-        }
+-        if (SLACK_USER_ID_EXACT_PATTERN.test(name)) {
+-          return match;
+-        }
+-        const userIds = mentions.get(name.toLowerCase());
+-        if (!userIds || userIds.length === 0) {
+-          return match;
+-        }
+-        if (userIds.length === 1) {
+-          return `<@${userIds[0]}>`;
+-        }
+-        if (participants) {
+-          const inThread = userIds.filter((id) => participants.has(id));
+-          if (inThread.length === 1) {
+-            return `<@${inThread[0]}>`;
++    return transformOutsideSlackCodeRegions(
++      text,
++      (segment) => segment.replace(
++        mentionPattern,
++        (match, name, offset) => {
++          if (offset > 0 && segment[offset - 1] === "<") {
++            return match;
++          }
++          if (SLACK_USER_ID_EXACT_PATTERN.test(name)) {
++            return match;
++          }
++          const userIds = mentions.get(name.toLowerCase());
++          if (!userIds || userIds.length === 0) {
++            return match;
+           }
++          if (userIds.length === 1) {
++            return `<@${userIds[0]}>`;
++          }
++          if (participants) {
++            const inThread = userIds.filter((id) => participants.has(id));
++            if (inThread.length === 1) {
++              return `<@${inThread[0]}>`;
++            }
++          }
++          return match;
+         }
+-        return match;
+-      }
++      )
+     );
+   }
+   /**
