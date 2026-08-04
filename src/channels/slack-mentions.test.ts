@@ -331,15 +331,15 @@ describe('resolveSlackMentions', () => {
     it('turns unprefixed names in a structured Who field into real mentions', () => {
       const humans = makeHumans();
       humans.get(LABS_TEAM)!.push({
-        userId: 'U-JAMES',
-        username: 'james',
-        displayName: 'James',
-        realName: 'James Operator',
+        userId: 'U-BOSUN',
+        username: 'bosun',
+        displayName: 'Bosun',
+        realName: 'Bosun Operator',
         teamId: LABS_TEAM,
       });
       expect(
-        resolveSlackMentions('◦ Who: Opal or James\n◦ Why: decision needed', 'slack-example-labs', makeBots(), humans),
-      ).toBe('◦ Who: <@U-OPERATOR1> or <@U-JAMES>\n◦ Why: decision needed');
+        resolveSlackMentions('◦ Who: Opal or Bosun\n◦ Why: decision needed', 'slack-example-labs', makeBots(), humans),
+      ).toBe('◦ Who: <@U-OPERATOR1> or <@U-BOSUN>\n◦ Why: decision needed');
     });
 
     it('does not infer mentions from the same names in ordinary prose', () => {
@@ -700,11 +700,11 @@ describe('normalizeSlackOrderedListContinuations', () => {
   it('indents digest detail bullets so explicit item numbers stay in one Slack list', () => {
     const input = [
       '1. First ask',
-      '◦ Who: Dave',
+      '◦ Who: Skipper',
       '◦ Reply: ship 1',
       '',
       '2. Second ask',
-      '• Who: James',
+      '• Who: Bosun',
       '• Reply: ship 2',
       '',
       ':gear: AUTO',
@@ -712,10 +712,10 @@ describe('normalizeSlackOrderedListContinuations', () => {
     expect(normalizeSlackOrderedListContinuations(input)).toBe(
       [
         '1. First ask',
-        '   ◦ Who: Dave',
+        '   ◦ Who: Skipper',
         '   ◦ Reply: ship 1',
         '2. Second ask',
-        '   • Who: James',
+        '   • Who: Bosun',
         '   • Reply: ship 2',
         '',
         ':gear: AUTO',
@@ -790,7 +790,7 @@ describe('patched @chat-adapter/slack outgoing mention resolver', async () => {
   async function resolve(markdown: string): Promise<string> {
     const adapter = new SlackAdapter({ botToken: 'xoxb-test', signingSecret: 'test-secret' });
     const state = {
-      getList: vi.fn(async (key: string) => (key === 'slack:user-by-name:admiral' ? ['UTESTADM1'] : [])),
+      getList: vi.fn(async (key: string) => (key === 'slack:user-by-name:flotilla' ? ['UTESTADM1'] : [])),
     };
     (adapter as unknown as { chat: unknown }).chat = { getState: () => state };
     return (
@@ -799,13 +799,13 @@ describe('patched @chat-adapter/slack outgoing mention resolver', async () => {
   }
 
   it('keeps semantic gate syntax in inline code while resolving prose mentions', async () => {
-    await expect(resolve('Reply: `@admiral ship 100`; prose @admiral owns it.')).resolves.toBe(
-      'Reply: `@admiral ship 100`; prose <@UTESTADM1> owns it.',
+    await expect(resolve('Reply: `@flotilla ship 100`; prose @flotilla owns it.')).resolves.toBe(
+      'Reply: `@flotilla ship 100`; prose <@UTESTADM1> owns it.',
     );
   });
 
   it('keeps semantic gate syntax in fenced code', async () => {
-    await expect(resolve('```\n@admiral ship 100\n```')).resolves.toBe('```\n@admiral ship 100\n```');
+    await expect(resolve('```\n@flotilla ship 100\n```')).resolves.toBe('```\n@flotilla ship 100\n```');
   });
 });
 
@@ -814,31 +814,31 @@ describe('release digest incident regression', async () => {
 
   it('ships numbered items, real Who pings, and semantic reply syntax in one wire payload', async () => {
     const bots = new Map<string, SlackBotIdentity>([
-      ['slack-illysium-admiral', { userId: 'UTESTADM1', username: 'admiral', teamId: 'TTESTTEAM1' }],
+      ['slack-wg-acme-flotilla', { userId: 'UTESTADM1', username: 'flotilla', teamId: 'TTESTTEAM1' }],
     ]);
     const humans = new Map<string, SlackBotIdentity[]>([
       [
         'TTESTTEAM1',
         [
-          { userId: 'UTESTDAVE1', username: 'dave', displayName: 'Dave', teamId: 'TTESTTEAM1' },
-          { userId: 'UTESTJAMES1', username: 'james', displayName: 'James', teamId: 'TTESTTEAM1' },
+          { userId: 'UTESTSKIP1', username: 'skipper', displayName: 'Skipper', teamId: 'TTESTTEAM1' },
+          { userId: 'UTESTBOSUN1', username: 'bosun', displayName: 'Bosun', teamId: 'TTESTTEAM1' },
         ],
       ],
     ]);
     const source = [
       '1. **#100 — release gate**',
-      '   • **Who:** Dave or James',
-      '   • **Reply:** `@admiral ship 100`',
+      '   • **Who:** Skipper or Bosun',
+      '   • **Reply:** `@flotilla ship 100`',
       '',
       '2. **#56 — second gate**',
-      '   • **Who:** Dave',
-      '   • **Reply:** `@admiral ship 56`',
+      '   • **Who:** Skipper',
+      '   • **Reply:** `@flotilla ship 56`',
       '',
       '⚙️ **AUTO**',
     ].join('\n');
     const transformed = resolveSlackMentions(
       normalizeSlackOrderedListContinuations(source),
-      'slack-illysium-admiral',
+      'slack-wg-acme-flotilla',
       bots,
       humans,
     );
@@ -854,11 +854,11 @@ describe('release digest incident regression', async () => {
     expect(payload).toEqual({
       markdown_text: [
         '1. **#100 — release gate**',
-        '   • **Who:** <@UTESTDAVE1> or <@UTESTJAMES1>',
-        '   • **Reply:** `@admiral ship 100`',
+        '   • **Who:** <@UTESTSKIP1> or <@UTESTBOSUN1>',
+        '   • **Reply:** `@flotilla ship 100`',
         '2. **#56 — second gate**',
-        '   • **Who:** <@UTESTDAVE1>',
-        '   • **Reply:** `@admiral ship 56`',
+        '   • **Who:** <@UTESTSKIP1>',
+        '   • **Reply:** `@flotilla ship 56`',
         '',
         '⚙️ **AUTO**',
       ].join('\n'),
