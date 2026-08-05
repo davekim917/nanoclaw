@@ -299,6 +299,17 @@ export interface ChatSdkBridgeConfig {
    */
   maxTextLength?: number;
   /**
+   * Thread continuation chunks of an oversize channel-level post under the
+   * first chunk instead of posting them as additional channel parents. On
+   * platforms with Slack-style threads, sibling parents read as unrelated
+   * messages and repliers thread under the wrong one. Requires the adapter
+   * to accept `<platformId>:<messageId>` as a thread target (Slack does;
+   * Discord threads are separate channels, so leave this unset there).
+   * Thread-targeted deliveries are unaffected — their chunks already land
+   * in the same thread.
+   */
+  threadContinuationChunks?: boolean;
+  /**
    * Optional fetch for the thread's anchor/starter message(s) — context
    * that seeded the thread but lives outside `fetchMessages(threadId)`.
    *
@@ -1299,6 +1310,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               : splitForLimit(text, config.maxTextLength)
             : [text];
         let firstId: string | undefined;
+        let chunkTid = tid;
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
@@ -1307,8 +1319,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           let chunkPosted = false;
           while (!chunkPosted) {
             try {
-              const result = await adapter.postMessage(tid, attachFiles ? { ...body, files: fileUploads } : body);
-              if (i === 0 && firstId === undefined) firstId = result?.id;
+              const result = await adapter.postMessage(chunkTid, attachFiles ? { ...body, files: fileUploads } : body);
+              if (i === 0 && firstId === undefined) {
+                firstId = result?.id;
+                if (config.threadContinuationChunks && threadId === null && firstId) {
+                  chunkTid = `${platformId}:${firstId}`;
+                }
+              }
               chunkPosted = true;
             } catch (err) {
               // 429 rate limit: Discord/Slack are explicitly telling us to

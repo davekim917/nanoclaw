@@ -857,8 +857,10 @@ describe('createChatSdkBridge.deliver — status fresh-post truncation', () => {
 
   it('chat fresh-post still splits and posts all chunks (no regression)', async () => {
     const calls: Array<{ markdown?: string }> = [];
+    const targets: string[] = [];
     const adapter = stubAdapter({
-      postMessage: async (_threadId: string, body: { markdown?: string }) => {
+      postMessage: async (threadId: string, body: { markdown?: string }) => {
+        targets.push(threadId);
         calls.push(body);
         return { id: `id-${calls.length}`, threadId: 'x', raw: {} };
       },
@@ -870,6 +872,50 @@ describe('createChatSdkBridge.deliver — status fresh-post truncation', () => {
     expect(calls[0].markdown).toContain('A');
     expect(calls[1].markdown).toContain('B');
     expect(calls[2].markdown).toContain('C');
+    // Without threadContinuationChunks every chunk stays channel-level.
+    expect(targets).toEqual(['discord:c1', 'discord:c1', 'discord:c1']);
+  });
+
+  it('threadContinuationChunks: channel-level continuation chunks thread under the first chunk', async () => {
+    // Regression guard: a 4.2k channel-level post on Slack split into two
+    // sibling parents; the second parent carried the @-mention, so the
+    // mentioned peer threaded the whole run under the wrong root.
+    const targets: string[] = [];
+    const adapter = stubAdapter({
+      postMessage: async (threadId: string) => {
+        targets.push(threadId);
+        return { id: `ts-${targets.length}`, threadId, raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      maxTextLength: 30,
+      threadContinuationChunks: true,
+    });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30) + '\n' + 'C'.repeat(30);
+    const id = await bridge.deliver('slack:C1', null, { kind: 'chat', content: { text } });
+    expect(targets).toEqual(['slack:C1', 'slack:C1:ts-1', 'slack:C1:ts-1']);
+    expect(id).toBe('ts-1');
+  });
+
+  it('threadContinuationChunks: thread-targeted deliveries keep all chunks on the given thread', async () => {
+    const targets: string[] = [];
+    const adapter = stubAdapter({
+      postMessage: async (threadId: string) => {
+        targets.push(threadId);
+        return { id: `ts-${targets.length}`, threadId, raw: {} };
+      },
+    } as unknown as Partial<Adapter>);
+    const bridge = createChatSdkBridge({
+      adapter,
+      supportsThreads: true,
+      maxTextLength: 30,
+      threadContinuationChunks: true,
+    });
+    const text = 'A'.repeat(30) + '\n' + 'B'.repeat(30) + '\n' + 'C'.repeat(30);
+    await bridge.deliver('slack:C1', 'slack:C1:root', { kind: 'chat', content: { text } });
+    expect(targets).toEqual(['slack:C1:root', 'slack:C1:root', 'slack:C1:root']);
   });
 
   it('short status delivered verbatim (no spurious ellipsis)', async () => {

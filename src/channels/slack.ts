@@ -386,6 +386,10 @@ for (const ws of workspaces) {
         concurrency: 'concurrent',
         supportsThreads: true,
         maxTextLength: SLACK_MESSAGE_MAX_TEXT_LENGTH,
+        // Oversize channel-level posts: continuation chunks reply in the
+        // first chunk's thread rather than landing as sibling parents that
+        // repliers thread under by mistake.
+        threadContinuationChunks: true,
         channelType: ws.channelType,
         // ATX headings → bold so Block Kit table delivery stays on the
         // `markdown` path (table-block conversion only fires for markdown/ast
