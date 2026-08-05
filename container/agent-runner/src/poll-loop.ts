@@ -166,12 +166,16 @@ function isProviderQuotaExhausted(err: unknown): boolean {
  * declared fallback. Reporting only happens when a fallback exists — a group
  * that never opted in keeps its outage loud.
  *
- * Returns true when the caller must NOT write a chat error. That is reserved
- * for a RECOGNIZED quota wall: the account is spent, nothing the reader can
- * act on, so a slightly slow reply beats a dead end (and a scheduled agent
- * must not post the same wall on every fire). Every other unrecovered
- * failure is still recorded for routing but stays visible — silently
- * swallowing a real bug would be worse than the outage it hides.
+ * Returns true when the caller must NOT write a chat error — which is
+ * whenever a reroute is actually about to happen. The host respawns this
+ * session on the fallback and the message is requeued, so the user gets a
+ * real answer moments later; posting "I'll pick up from your next message"
+ * first is both noise and a lie.
+ *
+ * The safety property lives in `alreadyOnFallback`: a container running AS
+ * the fallback never suppresses, so at most ONE attempt is ever silent. A
+ * genuine bug that breaks both providers still surfaces — one turn later,
+ * having been tried on two runtimes instead of one.
  */
 function reportProviderUnavailable(providerName: string, message: string, recognizedQuota: boolean): boolean {
   const fallbackProvider = getConfig().providerFallback?.provider;
@@ -195,7 +199,7 @@ function reportProviderUnavailable(providerName: string, message: string, recogn
         fallbackProvider,
       }),
     });
-    const suppress = recognizedQuota && !alreadyOnFallback;
+    const suppress = !alreadyOnFallback;
     log(
       `Provider ${providerName} unusable (${recognizedQuota ? 'quota' : 'unrecovered failure'}); ` +
         `reported for fallback to ${fallbackProvider}${suppress ? ' — suppressing the chat error' : ''}`,
