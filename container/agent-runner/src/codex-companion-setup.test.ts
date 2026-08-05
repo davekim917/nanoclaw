@@ -12,13 +12,11 @@ import os from 'os';
 import path from 'path';
 
 import {
-  buildMergedConfigForTest,
-  parseHostMcpServersForTest,
+  buildRuntimeConfigForTest,
   planCodexPluginRegistration,
   projectCodexPluginConfigForTest,
   renderMcpServerForTest,
   setupCodexRuntime,
-  stripExistingMcpServersForTest,
   stripPluginsAndMarketplacesForTest,
 } from './codex-companion-setup.js';
 
@@ -80,225 +78,57 @@ describe('renderMcpServer', () => {
   });
 });
 
-describe('stripExistingMcpServers', () => {
-  it('removes [mcp_servers.X] blocks but keeps other tables and top-level keys', () => {
-    const input = [
-      'model = "gpt-5.5"',
-      'effort = "high"',
-      '',
-      '[mcp_servers.exa]',
-      'type = "http"',
-      'url = "https://exa.example.com"',
-      'http_headers = { "Authorization" = "Bearer placeholder" }',
-      '',
-      '[mcp_servers.gitnexus]',
-      'type = "stdio"',
-      'command = "npx"',
-      'args = ["-y", "gitnexus", "mcp"]',
-      '',
-      '[mcp_servers.gitnexus.env]',
-      'KEY = "value"',
-      '',
-      '[projects."/home/foo"]',
-      'trust_level = "trusted"',
-      '',
-      '[features]',
-      'codex_hooks = true',
-    ].join('\n');
-
-    const stripped = stripExistingMcpServersForTest(input);
-    expect(stripped).toContain('model = "gpt-5.5"');
-    expect(stripped).toContain('effort = "high"');
-    expect(stripped).toContain('[projects."/home/foo"]');
-    expect(stripped).toContain('trust_level = "trusted"');
-    expect(stripped).toContain('[features]');
-    expect(stripped).toContain('codex_hooks = true');
-    expect(stripped).not.toContain('[mcp_servers.exa]');
-    expect(stripped).not.toContain('[mcp_servers.gitnexus]');
-    expect(stripped).not.toContain('[mcp_servers.gitnexus.env]');
-    expect(stripped).not.toContain('url = "https://exa.example.com"');
-  });
-
-  it('passes through TOML with no mcp_servers tables', () => {
-    const input = 'model = "x"\n[features]\nfoo = true\n';
-    expect(stripExistingMcpServersForTest(input)).toBe(input);
-  });
-
-  it('handles empty input', () => {
-    expect(stripExistingMcpServersForTest('')).toBe('');
-  });
-});
-
-describe('buildMergedConfig', () => {
-  it('union of host base + container MCP servers (both preserved)', () => {
-    const hostConfig = [
-      'model = "gpt-5.5"',
-      '',
-      '[mcp_servers.exa]',
-      'type = "http"',
-      'url = "https://exa"',
-      '',
-      '[mcp_servers.gitnexus]',
-      'type = "stdio"',
-      'command = "npx"',
-      'args = ["-y", "gitnexus", "mcp"]',
-      '',
-      '[projects."/home/x"]',
-      'trust_level = "trusted"',
-    ].join('\n');
-
-    const merged = buildMergedConfigForTest(hostConfig, {
+describe('buildRuntimeConfig', () => {
+  it('is generated base + runtime MCP servers — host config contributes nothing by construction', () => {
+    const config = buildRuntimeConfigForTest({
       nanoclaw: { type: 'stdio', command: 'bun', args: ['run', '/app/mcp.ts'], env: {} },
       deepwiki: { type: 'http', url: 'https://mcp.deepwiki.com/mcp' },
     });
 
-    expect(merged).toContain('model = "gpt-5.5"');
-    expect(merged).toContain('[projects."/home/x"]');
-    // Unrelated host MCPs are preserved (re-emitted in the union).
-    expect(merged).toContain('[mcp_servers.exa]');
-    expect(merged).toContain('url = "https://exa"');
-    expect(merged).not.toContain('[mcp_servers.gitnexus]');
-    expect(merged).not.toContain('args = ["-y", "gitnexus", "mcp"]');
-    // Container MCPs added
-    expect(merged).toContain('[mcp_servers.nanoclaw]');
-    expect(merged).toContain('command = "bun"');
-    expect(merged).toContain('[mcp_servers.deepwiki]');
-    expect(merged).toContain('url = "https://mcp.deepwiki.com/mcp"');
-    // No duplicate table headers for a given name
-    expect((merged.match(/\[mcp_servers\.exa\]/g) ?? []).length).toBe(1);
-    expect((merged.match(/\[mcp_servers\.gitnexus\]/g) ?? []).length).toBe(0);
-    expect((merged.match(/\[mcp_servers\.nanoclaw\]/g) ?? []).length).toBe(1);
+    // Generated container base, load-bearing settings present.
+    expect(config).toContain('sandbox_mode = "workspace-write"');
+    expect(config).toContain('approval_policy = "on-request"');
+    expect(config).toContain('[features]');
+    expect(config).toContain('hooks = true');
+    expect(config).toContain('[features.multi_agent_v2]');
+    expect(config).toContain('[projects."/workspace/agent"]');
+    // Runtime MCP servers appended.
+    expect(config).toContain('[mcp_servers.nanoclaw]');
+    expect(config).toContain('command = "bun"');
+    expect(config).toContain('[mcp_servers.deepwiki]');
+    expect(config).toContain('url = "https://mcp.deepwiki.com/mcp"');
+    // No model pin or personality can exist — the base is a constant.
+    expect(config).not.toContain('model =');
+    expect(config).not.toContain('personality');
   });
 
-  it('runtime entries override host entries on name collision', () => {
-    const hostConfig = [
-      '[mcp_servers.foo]',
-      'type = "http"',
-      'url = "https://old-host-url"',
-    ].join('\n');
-
-    const merged = buildMergedConfigForTest(hostConfig, {
-      foo: { type: 'stdio', command: 'bun', args: ['run', '/new.ts'], env: {} },
-    });
-
-    expect(merged).not.toContain('https://old-host-url');
-    expect(merged).toContain('command = "bun"');
-    expect(merged).toContain('args = ["run", "/new.ts"]');
-    expect((merged.match(/\[mcp_servers\.foo\]/g) ?? []).length).toBe(1);
-  });
-
-  it('handles empty host config', () => {
-    const merged = buildMergedConfigForTest('', {
-      nanoclaw: { type: 'stdio', command: 'bun', args: ['run', '/x.ts'], env: {} },
-    });
-    expect(merged).toContain('[mcp_servers.nanoclaw]');
-  });
-
-  it('handles no container servers (host MCPs preserved)', () => {
-    const hostConfig = 'model = "x"\n\n[mcp_servers.foo]\ntype = "http"\nurl = "u"\n';
-    const merged = buildMergedConfigForTest(hostConfig, {});
-    expect(merged).toContain('model = "x"');
-    expect(merged).toContain('[mcp_servers.foo]');
-    expect(merged).toContain('url = "u"');
-  });
-
-  it('test_codex_companion_does_not_link_host_gitnexus_instructions', () => {
-    const hostConfig = [
-      'model = "gpt-5.5"',
-      'approval_policy = "on-request"',
-      '',
-      '[mcp_servers.context7]',
-      'type = "http"',
-      'url = "https://context7.example.com/mcp"',
-      '',
-      '[mcp_servers.gitnexus]',
-      'command = "npx"',
-      'args = ["-y", "gitnexus", "mcp"]',
-      '',
-      '[plugins.humanizer]',
-      'enabled = true',
-      '',
-      '[plugins.gitnexus]',
-      'enabled = true',
-      'cache_path = "/home/node/.codex/plugins/cache/gitnexus/1.0.0"',
-      '',
-      '[plugin_marketplaces.gitnexus]',
-      'source = "/home/ubuntu/plugins/gitnexus"',
-    ].join('\n');
-    const merged = buildMergedConfigForTest(hostConfig, {
-      nanoclaw: { type: 'stdio', command: 'bun', args: ['run', '/app/mcp.ts'], env: {} },
+  it('drops a container-retired gitnexus entry even if wired', () => {
+    const config = buildRuntimeConfigForTest({
       gitnexus: { type: 'stdio', command: '/pnpm/gitnexus', args: ['mcp'], env: {} },
+      nanoclaw: { type: 'stdio', command: 'bun', args: ['run', '/app/mcp.ts'], env: {} },
     });
+    expect(config).not.toMatch(/gitnexus/i);
+    expect(config).toContain('[mcp_servers.nanoclaw]');
+  });
 
-    expect(merged).not.toMatch(/gitnexus/i);
-    expect(merged).toContain('model = "gpt-5.5"');
-    expect(merged).toContain('approval_policy = "on-request"');
-    expect(merged).toContain('[mcp_servers.context7]');
-    expect(merged).toContain('[mcp_servers.nanoclaw]');
-    // Containers must have zero dependency on host CLI plugin state: ALL
-    // [plugins.*] / [plugin_marketplaces.*] blocks are stripped now, not just
-    // gitnexus's — even a harmless-looking one like humanizer.
-    expect(merged).not.toContain('[plugins.humanizer]');
-    expect(merged).not.toContain('[plugins.gitnexus]');
-    expect(merged).not.toContain('[plugin_marketplaces.gitnexus]');
+  it('handles zero runtime servers', () => {
+    const config = buildRuntimeConfigForTest({});
+    expect(config).toContain('sandbox_mode = "workspace-write"');
+    expect(config).not.toContain('[mcp_servers.');
+  });
 
+  it('test_codex_companion_never_reads_host_config_or_agents', () => {
     const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf8');
+    // Regression pins from past incidents, plus the decoupling contract:
     expect(source).not.toContain("path.join(HOST_CODEX_DIR, 'AGENTS.md')");
     expect(source).not.toContain("path.join(RUNTIME_CODEX_DIR, 'AGENTS.md')");
-    expect(source).not.toContain('symlink the host\'s behavioral rules');
-  });
-});
-
-describe('parseHostMcpServers', () => {
-  it('parses stdio + http + env sub-table', () => {
-    const toml = [
-      '[mcp_servers.gitnexus]',
-      'type = "stdio"',
-      'command = "npx"',
-      'args = ["-y", "gitnexus", "mcp"]',
-      '',
-      '[mcp_servers.exa]',
-      'type = "http"',
-      'url = "https://exa.example.com"',
-      'http_headers = { "Authorization" = "Bearer placeholder" }',
-      '',
-      '[mcp_servers.with_env]',
-      'type = "stdio"',
-      'command = "bun"',
-      'args = ["x"]',
-      '',
-      '[mcp_servers.with_env.env]',
-      'KEY = "value"',
-      'OTHER = "also"',
-    ].join('\n');
-
-    const parsed = parseHostMcpServersForTest(toml);
-    expect(parsed.gitnexus).toEqual({
-      type: 'stdio',
-      command: 'npx',
-      args: ['-y', 'gitnexus', 'mcp'],
-      env: {},
-    });
-    expect(parsed.exa).toEqual({
-      type: 'http',
-      url: 'https://exa.example.com',
-      headers: { Authorization: 'Bearer placeholder' },
-    });
-    expect(parsed.with_env).toEqual({
-      type: 'stdio',
-      command: 'bun',
-      args: ['x'],
-      env: { KEY: 'value', OTHER: 'also' },
-    });
-  });
-
-  it('returns empty for TOML with no mcp_servers tables', () => {
-    expect(parseHostMcpServersForTest('model = "x"\n[features]\nfoo = true\n')).toEqual({});
-  });
-
-  it('rejects deprecated SSE host MCP entries', () => {
-    const toml = ['[mcp_servers.legacy]', 'type = "sse"', 'url = "https://example.com/sse"'].join('\n');
-    expect(() => parseHostMcpServersForTest(toml)).toThrow(/deprecated SSE transport/);
+    expect(source).not.toContain("symlink the host's behavioral rules");
+    // Peer runtime must not read the host's agents/ dir or merge host config.
+    // (setupCodexPrimaryRuntime legitimately reads /home/node/.codex/config.toml
+    // — in provider=codex mode that is the session-local GENERATED config.)
+    expect(source).not.toContain("path.join(HOST_CODEX_DIR, 'agents')");
+    expect(source).not.toContain('parseHostMcpServers');
+    expect(source).not.toContain('buildMergedConfig');
   });
 });
 
@@ -601,18 +431,20 @@ const CAN_RUN_FS = (() => {
     expect(fs.readlinkSync(runtimeAuth)).toBe(path.join(HOST_CODEX_DIR, 'auth.json'));
   });
 
-  it('writes merged config.toml with container MCP servers', () => {
+  it('writes generated config.toml with container MCP servers; host config is ignored', () => {
     fs.writeFileSync(path.join(HOST_CODEX_DIR, 'auth.json'), '{}');
     fs.writeFileSync(
       path.join(HOST_CODEX_DIR, 'config.toml'),
-      'model = "gpt-5.5"\n[mcp_servers.exa]\ntype = "http"\nurl = "https://exa"\n',
+      'model = "gpt-5.5"\npersonality = "pragmatic"\n[mcp_servers.exa]\ntype = "http"\nurl = "https://exa"\n',
     );
     setupCodexRuntime({
       nanoclaw: { type: 'stdio', command: 'bun', args: ['run', '/app/mcp.ts'], env: {} },
     });
-    const merged = fs.readFileSync(path.join(RUNTIME_CODEX_DIR, 'config.toml'), 'utf-8');
-    expect(merged).toContain('model = "gpt-5.5"');
-    expect(merged).toContain('[mcp_servers.exa]');
-    expect(merged).toContain('[mcp_servers.nanoclaw]');
+    const written = fs.readFileSync(path.join(RUNTIME_CODEX_DIR, 'config.toml'), 'utf-8');
+    expect(written).not.toContain('gpt-5.5');
+    expect(written).not.toContain('personality');
+    expect(written).not.toContain('[mcp_servers.exa]');
+    expect(written).toContain('sandbox_mode = "workspace-write"');
+    expect(written).toContain('[mcp_servers.nanoclaw]');
   });
 });
