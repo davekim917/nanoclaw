@@ -353,7 +353,7 @@ API; adapt the wrapper's env or the fetch block for other deploy hosts) to
 equal the exact branch SHA across two observations before it wakes. It records
 candidate, active, and completed SHAs in the agent workspace, refuses
 duplicates, and permits a recovery wake only after an active run has been
-abandoned for 12 hours.
+abandoned for 4 hours.
 
 On every terminal verdict, the coordinator closes the gate atomically:
 

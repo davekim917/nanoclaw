@@ -17,7 +17,9 @@ STATE_DIR="${SMOKE_GATE_STATE_DIR:-/workspace/agent/smoke-gate}"
 STATE_FILE="$STATE_DIR/develop-state.json"
 LOCK_FILE="$STATE_DIR/develop-state.lock"
 DEBOUNCE_SECONDS="${SMOKE_GATE_DEBOUNCE_SECONDS:-600}"
-ACTIVE_STALE_SECONDS="${SMOKE_GATE_ACTIVE_STALE_SECONDS:-43200}"
+# 4h: campaigns finish in 1-3h; a host restart mid-run otherwise strands the
+# gate for the full window before the recovery wake can reclaim the SHA.
+ACTIVE_STALE_SECONDS="${SMOKE_GATE_ACTIVE_STALE_SECONDS:-14400}"
 
 mkdir -p "$STATE_DIR"
 exec 9>"$LOCK_FILE"
