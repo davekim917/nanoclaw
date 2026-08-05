@@ -59,6 +59,11 @@ const GENERIC_IDENTIFIERS = new Set([
   'codex',
   'dbt cloud',
   'discord',
+  // Common orchestration term (src/modules/orchestrator-dispatch/ and
+  // dispatch.ts throughout). A Slack channel renamed to "#dispatch" put it
+  // in the registry-derived set and blocked every commit with ~154 hits in
+  // long-committed code. The channel's platform ID stays banned.
+  'dispatch',
   'general',
   'github actions',
   'main',
