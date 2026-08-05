@@ -17,9 +17,14 @@ STATE_DIR="${SMOKE_GATE_STATE_DIR:-/workspace/agent/smoke-gate}"
 STATE_FILE="$STATE_DIR/develop-state.json"
 LOCK_FILE="$STATE_DIR/develop-state.lock"
 DEBOUNCE_SECONDS="${SMOKE_GATE_DEBOUNCE_SECONDS:-600}"
-# 4h: campaigns finish in 1-3h; a host restart mid-run otherwise strands the
-# gate for the full window before the recovery wake can reclaim the SHA.
+# 4h hard ceiling: campaigns finish in 1-3h; a host restart mid-run otherwise
+# strands the gate for the full window before recovery can reclaim the SHA.
 ACTIVE_STALE_SECONDS="${SMOKE_GATE_ACTIVE_STALE_SECONDS:-14400}"
+# Liveness: the coordinator stamps `progress <run-id>` while working. An
+# active run whose newest stamp (or start, if never stamped) is older than
+# this is treated as dead — catches containers killed at spawn without
+# waiting out the hard ceiling.
+PROGRESS_STALE_SECONDS="${SMOKE_GATE_PROGRESS_STALE_SECONDS:-1800}"
 
 mkdir -p "$STATE_DIR"
 exec 9>"$LOCK_FILE"
@@ -36,6 +41,7 @@ default_state() {
     activeSha: null,
     activeStartedAt: null,
     activeRunId: null,
+    activeProgressAt: null,
     completedSha: null,
     completedAt: null,
     completedRunId: null,
@@ -101,11 +107,32 @@ if [ "$COMMAND" = "finish" ]; then
      .activeSha=null |
      .activeStartedAt=null |
      .activeRunId=null |
+     .activeProgressAt=null |
      .candidateSha=null |
      .candidateFirstSeen=null' <<<"$STATE")"
   write_state "$STATE"
   jq -cn --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" \
     '{ok:true,finishedSha:$sha,runId:$run,verdict:$verdict}'
+  exit 0
+fi
+
+# Liveness stamp. The coordinator calls `progress <run-id>` after the freeze
+# and at least every 15 minutes while lanes run. ok:false means the run is no
+# longer the active one (reclaimed or finished) — the caller must stop that
+# campaign instead of double-running the SHA.
+if [ "$COMMAND" = "progress" ]; then
+  RUN_ID="${2:-}"
+  ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
+  if [ -z "$RUN_ID" ] || [ "$RUN_ID" != "$ACTIVE_RUN" ]; then
+    jq -cn --arg run "$RUN_ID" --arg active "$ACTIVE_RUN" \
+      '{ok:false,error:"not the active run (reclaimed or finished) — stop this campaign",
+        runId:(if $run == "" then null else $run end),
+        activeRunId:(if $active == "" then null else $active end)}'
+    exit 0
+  fi
+  STATE="$(jq -c --arg now "$(iso_now)" '.activeProgressAt=$now' <<<"$STATE")"
+  write_state "$STATE"
+  jq -cn --arg run "$RUN_ID" '{ok:true,runId:$run}'
   exit 0
 fi
 
@@ -239,7 +266,15 @@ fi
 if [ -n "$ACTIVE_SHA" ]; then
   ACTIVE_EPOCH="$(epoch_or_zero "$ACTIVE_STARTED")"
   ACTIVE_AGE="$(( NOW_EPOCH - ACTIVE_EPOCH ))"
-  if [ "$ACTIVE_AGE" -lt "$ACTIVE_STALE_SECONDS" ]; then
+  # A run is live while its newest liveness signal (progress stamp, else the
+  # start itself) is fresh AND it is under the hard age ceiling. A killed
+  # container stops stamping, so the run goes reclaimable after
+  # PROGRESS_STALE_SECONDS of silence instead of the full ceiling.
+  PROGRESS_EPOCH="$(epoch_or_zero "$(jq -r '.activeProgressAt // empty' <<<"$STATE")")"
+  LAST_ACTIVITY_EPOCH="$ACTIVE_EPOCH"
+  if [ "$PROGRESS_EPOCH" -gt "$LAST_ACTIVITY_EPOCH" ]; then LAST_ACTIVITY_EPOCH="$PROGRESS_EPOCH"; fi
+  QUIET_FOR="$(( NOW_EPOCH - LAST_ACTIVITY_EPOCH ))"
+  if [ "$ACTIVE_AGE" -lt "$ACTIVE_STALE_SECONDS" ] && [ "$QUIET_FOR" -lt "$PROGRESS_STALE_SECONDS" ]; then
     if [ "$ACTIVE_SHA" != "$SOURCE_SHA" ]; then
       if [ "$CANDIDATE_SHA" != "$SOURCE_SHA" ]; then
         STATE="$(jq -c --arg sha "$SOURCE_SHA" --arg now "$NOW" '.candidateSha=$sha | .candidateFirstSeen=$now' <<<"$STATE")"
@@ -284,6 +319,7 @@ STATE="$(jq -c \
   '.activeSha=$sha |
    .activeStartedAt=$now |
    .activeRunId=$run |
+   .activeProgressAt=null |
    .candidateSha=null |
    .candidateFirstSeen=null' <<<"$STATE")"
 write_state "$STATE"

@@ -376,8 +376,21 @@ settle and the live frontend and backend deploy commits (read from the Render
 API; adapt the wrapper's env or the fetch block for other deploy hosts) to
 equal the exact branch SHA across two observations before it wakes. It records
 candidate, active, and completed SHAs in the agent workspace, refuses
-duplicates, and permits a recovery wake only after an active run has been
-abandoned for 4 hours.
+duplicates, and reclaims an abandoned active run through two independent
+signals: a liveness window (no `progress` stamp for 30 minutes,
+`SMOKE_GATE_PROGRESS_STALE_SECONDS`) and a hard age ceiling (4 hours,
+`SMOKE_GATE_ACTIVE_STALE_SECONDS`). A container killed mid-run simply stops
+stamping, so the gate recovers the SHA on the next poll past the window.
+
+The coordinator must therefore stamp liveness — after the freeze, then at
+least every 15 minutes while lanes run:
+
+```bash
+bash /workspace/agent/smoke-develop-gate.sh progress <run-id>
+```
+
+An `ok:false` response means this run is no longer the active one (reclaimed
+or finished): stop the campaign immediately instead of double-running the SHA.
 
 On every terminal verdict, the coordinator closes the gate atomically:
 
