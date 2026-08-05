@@ -1476,7 +1476,13 @@ export function assertStorageAdmission(options: Omit<StorageReportOptions, 'mode
     return { allowed: true, reason: 'below-threshold', report };
   }
 
-  const report = getStorageReport({ ...options, policy, mode: 'apply', force: false });
+  // respectCadence: admission fires on EVERY container spawn, so without the
+  // throttle any usage in the [threshold, refuse) band turns spawn traffic
+  // into full session-tree scan+apply passes (observed live: one ~40s pass
+  // per spawn for hours at 85-89%). Inside the cadence window admission
+  // decides from current usage alone; at >= admissionRefusePct the throttle
+  // is bypassed upstream (criticalPressure), so emergency passes still scan.
+  const report = getStorageReport({ ...options, policy, mode: 'apply', force: false, respectCadence: true });
   const afterPct = report.filesystem.after?.usagePct ?? before.usagePct;
   if (afterPct >= policy.admissionRefusePct) {
     return { allowed: false, reason: 'still-over-threshold', report };

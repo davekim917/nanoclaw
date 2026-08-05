@@ -777,6 +777,37 @@ describe('storage-manager Docker cleanup', () => {
     });
     expect(allowed).toMatchObject({ allowed: true, reason: 'below-threshold' });
   });
+
+  it('throttles admission scans to the cadence in the pressure band, but never under critical pressure', () => {
+    const options = {
+      sessionsRoot: path.join(os.tmpdir(), 'missing-sessions'),
+      threadsRoot: path.join(os.tmpdir(), 'missing-threads'),
+      policy: {
+        filesystemPath: process.cwd(),
+        cleanupThresholdPct: 85,
+        admissionRefusePct: 95,
+        scanCadenceMs: 60 * 60 * 1000,
+      },
+    };
+
+    // usage 92: in the [threshold, refuse) band. First admission scans and
+    // arms the cadence; a second admission moments later (spawn traffic)
+    // must NOT run another full scan+apply pass.
+    const first = assertStorageAdmission({ ...options, now });
+    expect(first.report.warnings).not.toContain('expensive storage scan skipped by cadence throttle');
+    const second = assertStorageAdmission({ ...options, now: now + 40_000 });
+    expect(second.report.warnings).toContain('expensive storage scan skipped by cadence throttle');
+    expect(second).toMatchObject({ allowed: true, reason: 'cleanup-succeeded' });
+
+    // Critical pressure (>= admissionRefusePct) bypasses the throttle.
+    const critical = assertStorageAdmission({
+      ...options,
+      now: now + 80_000,
+      policy: { ...options.policy, admissionRefusePct: 90 },
+    });
+    expect(critical.report.warnings).not.toContain('expensive storage scan skipped by cadence throttle');
+    expect(critical).toMatchObject({ allowed: false, reason: 'still-over-threshold' });
+  });
 });
 
 describe('storage-manager image protection', () => {

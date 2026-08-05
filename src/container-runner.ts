@@ -1556,6 +1556,13 @@ export function buildMounts(
   const graphifyRuntime = graphifyRuntimeDir();
   fs.mkdirSync(graphifyCache, { recursive: true });
   fs.mkdirSync(graphifyRuntime, { recursive: true });
+  // Pre-create the /workspace/.cache/graphify mountpoint host-side. /workspace
+  // is the session-dir bind, so when Docker creates this nested mountpoint it
+  // materializes <sess>/.cache/graphify on the host owned by ROOT — which the
+  // storage manager (running as the host user) can then never delete once the
+  // session idles out (observed live: 286 EACCES retries per pass). Docker
+  // leaves a pre-existing dir's ownership alone.
+  fs.mkdirSync(path.join(sessionDir(agentGroup.id, session.id), '.cache', 'graphify'), { recursive: true });
   mounts.push({ hostPath: graphifyCache, containerPath: '/workspace/.cache/graphify', readonly: false });
   mounts.push({ hostPath: graphifyRuntime, containerPath: '/run/nanoclaw-graphify', readonly: false });
 

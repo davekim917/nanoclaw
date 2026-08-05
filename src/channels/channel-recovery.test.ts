@@ -21,6 +21,9 @@ import {
   recoverAllChannelsAfterStall,
   recoverAllChannelsAfterStartup,
   recoverChannelAdapter,
+  STALL_RECOVERY_COOLDOWN_MS,
+  STALL_TARGET_ACTIVITY_HORIZON_MS,
+  _resetStallRecoveryCooldownForTesting,
 } from './channel-recovery.js';
 import type { ChannelAdapter } from './adapter.js';
 
@@ -48,6 +51,7 @@ beforeEach(() => {
   mocks.adapters = [];
   mocks.groups = [];
   mocks.sessions = [];
+  _resetStallRecoveryCooldownForTesting();
 });
 
 describe('channel recovery coordinator', () => {
@@ -93,6 +97,59 @@ describe('channel recovery coordinator', () => {
     });
     expect(discordRecover.mock.calls[0][0]).toMatchObject({ reason: 'event-loop-stall' });
     expect(slackRecover.mock.calls[0][0]).toMatchObject({ reason: 'event-loop-stall' });
+  });
+
+  it('bounds stall-pass thread expansion to recently-active sessions, fail-open on missing timestamps', () => {
+    const now = Date.now();
+    const fresh = new Date(now - 60_000).toISOString();
+    const stale = new Date(now - STALL_TARGET_ACTIVITY_HORIZON_MS - 60_000).toISOString();
+    mocks.groups = [
+      { id: 'mg-1', channel_type: 'discord', instance: 'discord', platform_id: 'discord:g:c', is_group: 1 },
+    ];
+    mocks.sessions = [
+      { messaging_group_id: 'mg-1', thread_id: 'discord:g:c:fresh', last_active: fresh },
+      { messaging_group_id: 'mg-1', thread_id: 'discord:g:c:stale', last_active: stale },
+      { messaging_group_id: 'mg-1', thread_id: 'discord:g:c:untimed', last_active: null },
+    ];
+
+    const bounded = getChannelRecoveryTargets(adapter('discord'), {
+      activeSinceMs: now - STALL_TARGET_ACTIVITY_HORIZON_MS,
+    });
+    expect(bounded.map((t) => t.threadId)).toEqual([null, 'discord:g:c:fresh', 'discord:g:c:untimed']);
+
+    // Unbounded (transport/startup) passes keep the stale thread.
+    const full = getChannelRecoveryTargets(adapter('discord'));
+    expect(full.map((t) => t.threadId)).toContain('discord:g:c:stale');
+  });
+
+  it('coalesces stalls inside the cooldown into one deferred pass with the earliest since', async () => {
+    vi.useFakeTimers();
+    try {
+      const recover = vi.fn().mockResolvedValue({ scannedTargets: 1, recoveredMessages: 0, failedTargets: 0 });
+      mocks.adapters = [adapter('discord', recover)];
+      mocks.groups = [
+        { id: 'mg-d', channel_type: 'discord', instance: 'discord', platform_id: 'discord:g:c', is_group: 1 },
+      ];
+
+      const t0 = Date.now();
+      recoverAllChannelsAfterStall(t0 - 10_000);
+      await vi.waitFor(() => expect(recover).toHaveBeenCalledOnce());
+
+      // Two more stalls inside the cooldown: neither fires a pass now.
+      recoverAllChannelsAfterStall(t0 + 20_000);
+      recoverAllChannelsAfterStall(t0 + 5_000);
+      expect(recover).toHaveBeenCalledOnce();
+
+      // Cooldown expiry fires ONE deferred pass carrying the earliest since.
+      await vi.advanceTimersByTimeAsync(STALL_RECOVERY_COOLDOWN_MS);
+      await vi.waitFor(() => expect(recover).toHaveBeenCalledTimes(2));
+      expect(recover.mock.calls[1][0]).toMatchObject({
+        reason: 'event-loop-stall',
+        since: new Date(t0 + 5_000).toISOString(),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('initiates catch-up for webhook adapters after host startup too', async () => {

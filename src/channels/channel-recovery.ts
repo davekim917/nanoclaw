@@ -7,6 +7,26 @@ import { log } from '../log.js';
 const MONITOR_INTERVAL_MS = 1_000;
 export const EVENT_LOOP_STALL_THRESHOLD_MS = 5_000;
 
+// Stall-triggered catch-up is an amplifier when unthrottled: each pass fans
+// out REST scans across every adapter, whose response decompression alone can
+// stall the loop past the 5s threshold and trigger the next pass (observed
+// live 2026-08-05: 30-42 passes/min, ~40% of host CPU in zlib/brotli, self-
+// sustaining for hours after the original load spike ended). Rules:
+//   - At most one stall-triggered fleet pass per cooldown window. Stalls
+//     inside the window coalesce their `since` (earliest wins) into one
+//     deferred pass when the window expires — the gap is still recovered,
+//     just batched, so coverage is delayed rather than lost.
+//   - Stall passes scan a bounded target set: thread expansion only for
+//     sessions active within the horizon. A stall gap is seconds long; a
+//     thread quiet for 48h+ almost never has a message land inside one, and
+//     scanning every thread ever created (403 observed) is what made passes
+//     expensive enough to self-sustain. Roots are never bounded (they are
+//     ≤ the wired-group count and catch first messages in quiet channels),
+//     and transport-resumed / host-startup passes keep the full set — those
+//     cover long gaps where a stale thread plausibly heard something.
+export const STALL_RECOVERY_COOLDOWN_MS = 5 * 60_000;
+export const STALL_TARGET_ACTIVITY_HORIZON_MS = 48 * 60 * 60_000;
+
 interface RecoveryDrain {
   pending: ChannelConnectionRestored | null;
   promise: Promise<void>;
@@ -103,8 +123,14 @@ function scheduleRecoveryRetry(adapter: ChannelAdapter, info: ChannelConnectionR
 /**
  * Build a bounded recovery set. Adapters with platform-native thread
  * discovery receive roots only; all others receive roots plus known threads.
+ * When `activeSinceMs` is set (stall-triggered passes), thread expansion only
+ * includes sessions with activity at or after it; sessions with no parseable
+ * activity timestamp are included (fail-open — never silently drop coverage).
  */
-export function getChannelRecoveryTargets(adapter: ChannelAdapter): ChannelRecoveryTarget[] {
+export function getChannelRecoveryTargets(
+  adapter: ChannelAdapter,
+  opts: { activeSinceMs?: number } = {},
+): ChannelRecoveryTarget[] {
   const key = adapterKey(adapter);
   const groups = getMessagingGroupsByChannel(adapter.channelType).filter(
     (group) => (group.instance ?? group.channel_type) === key,
@@ -113,6 +139,10 @@ export function getChannelRecoveryTargets(adapter: ChannelAdapter): ChannelRecov
   if (adapter.recoveryDiscoversThreads !== true) {
     for (const session of getActiveSessions()) {
       if (!session.messaging_group_id || !session.thread_id) continue;
+      if (opts.activeSinceMs !== undefined) {
+        const activityMs = Date.parse(session.last_active ?? session.created_at ?? '');
+        if (Number.isFinite(activityMs) && activityMs < opts.activeSinceMs) continue;
+      }
       const threads = sessionsByGroup.get(session.messaging_group_id) ?? new Set<string>();
       threads.add(session.thread_id);
       sessionsByGroup.set(session.messaging_group_id, threads);
@@ -153,7 +183,10 @@ export function recoverChannelAdapter(adapter: ChannelAdapter, info: ChannelConn
       const next = drain.pending;
       drain.pending = null;
       try {
-        const targets = getChannelRecoveryTargets(adapter);
+        const targets = getChannelRecoveryTargets(
+          adapter,
+          next.reason === 'event-loop-stall' ? { activeSinceMs: Date.now() - STALL_TARGET_ACTIVITY_HORIZON_MS } : {},
+        );
         const result = await adapter.recoverMissedMessages!({ ...next, targets });
         const context = {
           channelType: adapter.channelType,
@@ -191,7 +224,37 @@ export function recoverChannelAdapter(adapter: ChannelAdapter, info: ChannelConn
   return drain.promise;
 }
 
+let lastStallPassStartedAtMs = 0;
+let pendingStallSinceMs: number | null = null;
+let pendingStallTimer: NodeJS.Timeout | null = null;
+
+/** Test seam: clear the fleet-wide stall-recovery cooldown state. */
+export function _resetStallRecoveryCooldownForTesting(): void {
+  lastStallPassStartedAtMs = 0;
+  pendingStallSinceMs = null;
+  if (pendingStallTimer) clearTimeout(pendingStallTimer);
+  pendingStallTimer = null;
+}
+
 export function recoverAllChannelsAfterStall(sinceMs: number): void {
+  const now = Date.now();
+  const elapsed = now - lastStallPassStartedAtMs;
+  if (elapsed < STALL_RECOVERY_COOLDOWN_MS) {
+    // Inside the cooldown: coalesce this stall's gap into one deferred pass
+    // (earliest `since` wins) instead of dropping it or firing immediately.
+    pendingStallSinceMs = Math.min(pendingStallSinceMs ?? sinceMs, sinceMs);
+    if (!pendingStallTimer) {
+      pendingStallTimer = setTimeout(() => {
+        pendingStallTimer = null;
+        const deferredSinceMs = pendingStallSinceMs;
+        pendingStallSinceMs = null;
+        if (deferredSinceMs !== null) recoverAllChannelsAfterStall(deferredSinceMs);
+      }, STALL_RECOVERY_COOLDOWN_MS - elapsed);
+      pendingStallTimer.unref();
+    }
+    return;
+  }
+  lastStallPassStartedAtMs = now;
   const since = new Date(sinceMs).toISOString();
   for (const adapter of getActiveAdapters()) {
     void recoverChannelAdapter(adapter, { since, reason: 'event-loop-stall' });
