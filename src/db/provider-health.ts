@@ -45,10 +45,21 @@ function clampCooldown(ms: number): number {
 }
 
 function cooldownMs(consecutiveFailures: number, resetAtMs: number | null, nowMs: number): number {
+  const backoff = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, consecutiveFailures - 1));
+  // A provider's stated reset is an UPPER BOUND, never the schedule. Accounts
+  // are often restored before the quoted time, and a window pinned to that
+  // quote would keep a group on its fallback for days after the primary came
+  // back — the exact hard-lock this mechanism exists to avoid. Taking the
+  // minimum still honors a SHORT stated reset ("try again in 5 minutes")
+  // while retrying a long one on the backoff schedule instead.
+  //
+  // Retries are cheap because spawns are demand-driven: a probe costs one
+  // container start and a turn that dies immediately, it is suppressed from
+  // chat, and it reroutes to the fallback in the same breath.
   if (resetAtMs !== null && Number.isFinite(resetAtMs)) {
-    return clampCooldown(resetAtMs - nowMs);
+    return clampCooldown(Math.min(resetAtMs - nowMs, backoff));
   }
-  return clampCooldown(Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, consecutiveFailures - 1)));
+  return clampCooldown(backoff);
 }
 
 export function getProviderHealth(agentGroupId: string, provider: string): ProviderHealthRow | undefined {

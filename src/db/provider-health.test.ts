@@ -31,13 +31,25 @@ describe('provider health cooldown', () => {
     expect(getProviderHealth(GID, 'codex')).toBeUndefined();
   });
 
-  it("honors the provider's own reset time when it gives one", () => {
-    const resetAt = new Date(NOW + 6 * 60 * 60_000).toISOString();
+  it('honors a SHORT stated reset — the provider knows better than the backoff', () => {
+    const resetAt = new Date(NOW + 5 * 60_000).toISOString();
     const until = markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW, resetAt });
-    expect(until).toBe(resetAt);
+    // Floor is 1 minute; 5 minutes is under the 15-minute first backoff, so
+    // the provider's own word wins.
+    expect(Date.parse(until) - NOW).toBe(5 * 60_000);
     expect(isProviderUnavailable(GID, 'codex', { nowMs: NOW })).toBe(true);
     // One millisecond past the window it is available again — no cron needed.
-    expect(isProviderUnavailable(GID, 'codex', { nowMs: Date.parse(resetAt) })).toBe(false);
+    expect(isProviderUnavailable(GID, 'codex', { nowMs: Date.parse(until) })).toBe(false);
+  });
+
+  it('treats a LONG stated reset as an upper bound, not a schedule', () => {
+    // Codex quoting a date ~60h out must not pin the group to its fallback
+    // until then: accounts are often restored early, and the retry is cheap.
+    const resetAt = new Date(NOW + 60 * 60 * 60_000).toISOString();
+    const first = markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW, resetAt });
+    expect(Date.parse(first) - NOW).toBe(15 * 60_000);
+    const second = markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW, resetAt });
+    expect(Date.parse(second) - NOW).toBe(30 * 60_000);
   });
 
   it('backs off on the failure streak when no reset time is given', () => {
@@ -50,10 +62,12 @@ describe('provider health cooldown', () => {
     expect(getProviderHealth(GID, 'codex')?.consecutive_failures).toBe(3);
   });
 
-  it('clamps an absurd provider-stated window instead of trusting it', () => {
+  it('never lets a provider park a group on its fallback for a year', () => {
     const silly = new Date(NOW + 400 * 24 * 60 * 60_000).toISOString();
     const until = markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW, resetAt: silly });
-    expect(Date.parse(until) - NOW).toBe(7 * 24 * 60 * 60_000);
+    // Bounded by the backoff schedule, and in every case by the 7-day ceiling.
+    expect(Date.parse(until) - NOW).toBe(15 * 60_000);
+    expect(Date.parse(until) - NOW).toBeLessThanOrEqual(7 * 24 * 60 * 60_000);
   });
 
   it('a success clears the cooldown and the streak', () => {

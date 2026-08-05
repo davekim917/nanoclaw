@@ -66,13 +66,13 @@ describe('provider_unavailable handler', () => {
       {} as never,
     );
     expect(isProviderUnavailable(GID, 'codex')).toBe(true);
-    // The stated reset parsed and flowed through, but a century-long lockout
-    // is clamped to the 7-day ceiling — a provider must not be able to park a
-    // group on its fallback indefinitely.
+    // The stated reset parsed, but it is only an upper bound: the retry lands
+    // on the backoff schedule so an early account restore is discovered
+    // quickly instead of waiting out the quoted date.
     const row = getProviderHealth(GID, 'codex');
     const windowMs = Date.parse(row!.unavailable_until as string) - Date.now();
-    expect(windowMs).toBeGreaterThan(7 * 24 * 60 * 60_000 - 5_000);
-    expect(windowMs).toBeLessThanOrEqual(7 * 24 * 60 * 60_000);
+    expect(windowMs).toBeGreaterThan(14 * 60_000);
+    expect(windowMs).toBeLessThanOrEqual(15 * 60_000);
     expect(killed).toHaveLength(1);
     expect(killed[0].sessionId).toBe('sess-pf');
   });
