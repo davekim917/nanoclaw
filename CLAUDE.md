@@ -130,7 +130,12 @@ A second tier (direct source-level self-edits via a draft/activate flow) is plan
 
 ## Container Config
 
-Per-agent-group container runtime config (provider, model, packages, MCP servers, mounts, etc.) lives in the `container_configs` table in the central DB. Materialized to `groups/<folder>/container.json` at spawn time so the container runner can read it. Managed via `ncl groups config get/update` and the self-mod MCP tools.
+Per-agent-group container runtime config (provider, model, packages, MCP servers, mounts, etc.) is split across two stores, and the split is easy to get wrong:
+
+- **`groups/<folder>/container.json` is authoritative for the runtime.** The spawn path reads it (`readContainerConfig`), bind-mounts it read-only, and the in-container runner reads `provider`/`model`/`effort` from it. There is no DB→file materialization at spawn — the spawn path only syncs identity fields (`agentGroupId`, `groupName`). `configFromDb()` exists but has no callers.
+- **`container_configs` (central DB) is a read-side projection** used for `-m`/`-e` flag vocabulary (`src/router.ts`), scheduled-task flag validation, and image builds (packages).
+
+`ncl groups config get/update` and the self-mod MCP tools manage both: as of the mirror fix, `config update` writes `provider`/`model`/`effort` to the DB row *and* mirrors them into `container.json`, so a provider change actually takes effect on the next `ncl groups restart`. Anything that writes only the DB row will leave the container booting its old provider.
 
 **`cli_scope`** — controls what the agent can do with `ncl` from inside the container:
 

@@ -55,6 +55,21 @@ each runtime. The coordinator asks the challenger for an independent pass; the
 challenger owns its native Codex worker tree. The coordinator never directly
 launches Codex through `worker-codex`.
 
+**Single-provider fallback.** When the challenger's provider is unavailable —
+an exhausted account, a suspended key, an outage — the deployment may run the
+challenger on the coordinator's provider instead, using a different model
+family and its own native worker role. This is a deliberate degradation, not
+an equivalent: a stalled challenge blocks every run at the evidence barrier,
+whereas a same-provider challenge still delivers a separate agent, a separate
+session, fresh context, an adversarial mandate, and an independently recorded
+conclusion. What it does not deliver is vendor-independent failure modes.
+Both parents must therefore treat it as reportable state: the challenger
+declares it in its disposition, and **the coordinator's verdict must say
+plainly that the challenge ran on the same provider family and that
+cross-model diversity was reduced for that run.** Never let a run appear
+more independently verified than it was. Never switch providers mid-run;
+change it between runs, at the operator's direction.
+
 Every worker records its conclusion before reading another worker's verdict.
 The coordinator and challenger then record their parent-level conclusions
 independently before cross-synthesis. Worker count, model confidence, and

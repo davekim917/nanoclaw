@@ -340,6 +340,83 @@ describe('groups CLI resource config', () => {
     });
   });
 
+  it('test_groups_config_update_mirrors_runtime_scalars_into_container_json', async () => {
+    // The spawn path and the in-container runner read provider/model/effort
+    // from container.json; the DB row only feeds flag vocabulary and
+    // task-flag validation. Writing the DB alone left a group booting its
+    // OLD provider while `config get` reported the new one.
+    const id = 'ag-provider-mirror';
+    const folder = 'provider-mirror';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    getDb()
+      .prepare(
+        `INSERT INTO container_configs
+           (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
+            skills, mcp_servers, packages_apt, packages_npm, additional_mounts, cli_scope, updated_at)
+         VALUES (?, 'codex', 'gpt-5.6-sol', 'high', NULL, NULL, NULL, '"all"', '{}', '[]', '[]', '[]', 'group', ?)`,
+      )
+      .run(id, now());
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({
+        provider: 'codex',
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        onecliSecrets: ['Keep-Me'],
+      }) + '\n',
+    );
+
+    const response = await dispatch(
+      {
+        id: 'req-provider-mirror',
+        command: 'groups-config-update',
+        args: { id, provider: 'claude', model: 'claude-fable-5[1m]', effort: 'high' },
+      },
+      { caller: 'host' },
+    );
+    expect(response.ok).toBe(true);
+
+    const file = readContainerConfig(folder);
+    expect(file.provider).toBe('claude');
+    expect(file.model).toBe('claude-fable-5[1m]');
+    expect(file.effort).toBe('high');
+    // Unrelated operator-owned fields survive the mirror.
+    expect(file.onecliSecrets).toEqual(['Keep-Me']);
+    // DB projection still updated too.
+    expect(getContainerConfig(id)?.provider).toBe('claude');
+  });
+
+  it('test_groups_config_update_without_runtime_scalars_leaves_provider_alone', async () => {
+    const id = 'ag-no-mirror';
+    const folder = 'no-mirror';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    getDb()
+      .prepare(
+        `INSERT INTO container_configs
+           (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
+            skills, mcp_servers, packages_apt, packages_npm, additional_mounts, cli_scope, updated_at)
+         VALUES (?, 'codex', NULL, NULL, NULL, NULL, NULL, '"all"', '{}', '[]', '[]', '[]', 'group', ?)`,
+      )
+      .run(id, now());
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ provider: 'codex', mcpServers: {}, packages: { apt: [], npm: [] }, skills: 'all' }) + '\n',
+    );
+
+    const response = await dispatch(
+      { id: 'req-no-mirror', command: 'groups-config-update', args: { id, assistant_name: 'Renamed' } },
+      { caller: 'host' },
+    );
+    expect(response.ok).toBe(true);
+    expect(readContainerConfig(folder).provider).toBe('codex');
+  });
+
   it('test_legacy_gitnexus_key_is_behaviorally_inert', () => {
     const folder = 'legacy-gitnexus';
     const groupDir = `${TEST_DIR}/groups/${folder}`;
