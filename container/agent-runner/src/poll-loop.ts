@@ -162,15 +162,18 @@ function isProviderQuotaExhausted(err: unknown): boolean {
 }
 
 /**
- * Report a spent provider to the host and let it respawn this session on the
- * declared fallback. Returns true when the caller must NOT write a chat
- * error: the user should experience a slightly slow reply, not a dead end,
- * and a scheduled agent must not post the same wall on every fire.
+ * Report an unusable provider to the host so later spawns route to the
+ * declared fallback. Reporting only happens when a fallback exists — a group
+ * that never opted in keeps its outage loud.
  *
- * Reporting only makes sense when a fallback exists — otherwise the outage
- * stays loud, which is the correct behavior for a group that never opted in.
+ * Returns true when the caller must NOT write a chat error. That is reserved
+ * for a RECOGNIZED quota wall: the account is spent, nothing the reader can
+ * act on, so a slightly slow reply beats a dead end (and a scheduled agent
+ * must not post the same wall on every fire). Every other unrecovered
+ * failure is still recorded for routing but stays visible — silently
+ * swallowing a real bug would be worse than the outage it hides.
  */
-function reportProviderUnavailable(providerName: string, message: string): boolean {
+function reportProviderUnavailable(providerName: string, message: string, recognizedQuota: boolean): boolean {
   const fallbackProvider = getConfig().providerFallback?.provider;
   if (!fallbackProvider) return false;
   // Already running AS the fallback (the host set the spawn override) and the
@@ -187,17 +190,17 @@ function reportProviderUnavailable(providerName: string, message: string): boole
       content: JSON.stringify({
         action: 'provider_unavailable',
         provider: providerName,
-        classification: 'quota',
+        classification: recognizedQuota ? 'quota' : 'unavailable',
         message: message.slice(0, 500),
         fallbackProvider,
       }),
     });
+    const suppress = recognizedQuota && !alreadyOnFallback;
     log(
-      alreadyOnFallback
-        ? `Provider ${providerName} is quota-exhausted while already running as the fallback — surfacing the error`
-        : `Provider ${providerName} is quota-exhausted; reported for fallback to ${fallbackProvider}`,
+      `Provider ${providerName} unusable (${recognizedQuota ? 'quota' : 'unrecovered failure'}); ` +
+        `reported for fallback to ${fallbackProvider}${suppress ? ' — suppressing the chat error' : ''}`,
     );
-    return !alreadyOnFallback;
+    return suppress;
   } catch (err) {
     // Reporting is best-effort: if the outbound write fails we fall back to
     // the visible error rather than swallowing the failure silently.
@@ -1038,10 +1041,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // surfaces quota in more than one shape. Fall back to the classified
       // event form for providers that don't implement the hook.
       const quotaExhausted = config.provider.isQuotaExhausted?.(err) ?? isProviderQuotaExhausted(err);
+      // Any failure the in-turn recovery could not fix means this provider is
+      // not currently usable for this group — a spent account, a wedged
+      // app-server, a dead credential. Record it either way so the next spawn
+      // routes to the fallback; only a recognized quota also silences the
+      // chat error.
       const quotaHandled =
         !recovered &&
-        quotaExhausted &&
-        reportProviderUnavailable(config.providerName, err instanceof Error ? err.message : String(err));
+        reportProviderUnavailable(
+          config.providerName,
+          err instanceof Error ? err.message : String(err),
+          quotaExhausted,
+        );
 
       // Only surface the error to the user if we couldn't recover inline.
       if (!recovered && !quotaHandled) {
@@ -1743,7 +1754,7 @@ export function handleEvent(event: ProviderEvent, routing: RoutingContext): void
       // instead of shown: the session respawns on the fallback provider.
       // See the thrown-error sibling branch for the same decision.
       if (event.retryable === false && event.classification === 'quota') {
-        if (reportProviderUnavailable(getConfig().provider, event.message)) break;
+        if (reportProviderUnavailable(getConfig().provider, event.message, true)) break;
       }
       if (event.retryable === false) {
         writeMessageOut({

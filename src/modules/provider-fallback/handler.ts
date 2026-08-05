@@ -49,8 +49,12 @@ export async function handleProviderUnavailable(
   }
 
   const message = str(content.message) ?? null;
-  const until = markProviderUnavailable(agentGroup.id, reportedProvider.toLowerCase(), 'quota', {
-    resetAt: parseProviderResetAt(message),
+  // 'quota' means a recognized spent account (the reported reset time is
+  // meaningful); 'unavailable' is any other unrecovered provider failure,
+  // which only earns a short backoff window.
+  const errorClass = str(content.classification) === 'quota' ? 'quota' : 'unavailable';
+  const until = markProviderUnavailable(agentGroup.id, reportedProvider.toLowerCase(), errorClass, {
+    resetAt: errorClass === 'quota' ? parseProviderResetAt(message) : null,
     message,
   });
   log.warn('Provider recorded unavailable — sessions will spawn on the fallback', {
