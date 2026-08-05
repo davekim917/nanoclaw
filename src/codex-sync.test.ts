@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { syncCodexAgentsMd, syncCodexLocalMarketplacePluginCache } from './codex-sync.js';
+import { discoverCodexAgentTargets, syncCodexAgentsMd, syncCodexLocalMarketplacePluginCache } from './codex-sync.js';
 
 let tmpDir: string;
 
@@ -171,5 +171,31 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
       'SKILL.md',
     );
     expect(fs.readFileSync(cachedSkill, 'utf-8')).toContain('git body');
+  });
+});
+
+describe('discoverCodexAgentTargets', () => {
+  it('adds groups/<folder>/.codex/agents for provider=codex groups only', () => {
+    const groupsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-sync-groups-'));
+    try {
+      // provider=codex → target
+      fs.mkdirSync(path.join(groupsDir, 'acme-codex'));
+      fs.writeFileSync(path.join(groupsDir, 'acme-codex', 'container.json'), JSON.stringify({ provider: 'codex' }));
+      // provider=claude → no target
+      fs.mkdirSync(path.join(groupsDir, 'acme'));
+      fs.writeFileSync(path.join(groupsDir, 'acme', 'container.json'), JSON.stringify({ provider: 'claude' }));
+      // malformed container.json → skipped, no throw
+      fs.mkdirSync(path.join(groupsDir, 'broken-codex'));
+      fs.writeFileSync(path.join(groupsDir, 'broken-codex', 'container.json'), '{nope');
+
+      const targets = discoverCodexAgentTargets(groupsDir);
+      expect(targets).toContain(path.join(groupsDir, 'acme-codex', '.codex', 'agents'));
+      expect(targets).not.toContain(path.join(groupsDir, 'acme', '.codex', 'agents'));
+      expect(targets).not.toContain(path.join(groupsDir, 'broken-codex', '.codex', 'agents'));
+      // the global host-CLI roster target is still present
+      expect(targets).toContain(path.join(os.homedir(), '.codex', 'agents'));
+    } finally {
+      fs.rmSync(groupsDir, { recursive: true, force: true });
+    }
   });
 });

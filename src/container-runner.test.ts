@@ -744,7 +744,12 @@ describe('materializeCodexFallbackRuntime', () => {
           readonly: false,
         },
       ]);
-      expect(fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8')).toContain('[features]');
+      const generated = fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8');
+      expect(generated).toContain('[features]');
+      expect(generated).toContain('[features.multi_agent_v2]');
+      // Host config never reaches the runtime home — generated base only.
+      expect(generated).not.toContain('stale@host');
+      expect(generated).not.toContain('codex_hooks');
       expect(fs.existsSync(path.join(runtimeHome, 'auth.json'))).toBe(true);
       expect(mounts.some((mount) => mount.hostPath.includes('/plugins'))).toBe(false);
     } finally {
@@ -787,7 +792,11 @@ describe('materializeCodexFallbackRuntime', () => {
       expect(fs.readFileSync(path.join(outside, 'plugins', 'sentinel'), 'utf8')).toBe('keep');
       expect(fs.readFileSync(path.join(outside, 'sessions', 'sentinel'), 'utf8')).toBe('keep');
       expect(fs.lstatSync(path.join(runtimeHome, 'config.toml')).isFile()).toBe(true);
-      expect(fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8')).toBe('model = "gpt-5.6-terra"\n');
+      // The host home's config (with its model pin) must not leak; the runtime
+      // gets the generated container base instead.
+      const rewritten = fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8');
+      expect(rewritten).not.toContain('gpt-5.6-terra');
+      expect(rewritten).toContain('sandbox_mode = "workspace-write"');
       expect(fs.lstatSync(path.join(runtimeHome, 'auth.json')).isFile()).toBe(true);
       expect(fs.lstatSync(path.join(runtimeHome, 'sessions')).isDirectory()).toBe(true);
       expect(fs.existsSync(path.join(runtimeHome, '.tmp'))).toBe(false);
@@ -831,13 +840,16 @@ describe('materializeCodexFallbackRuntime', () => {
       ).toThrow(/Unsafe fallback sessions directory/);
 
       fs.unlinkSync(path.join(hostHome, 'sessions'));
+      fs.mkdirSync(path.join(hostHome, 'sessions'));
       fs.symlinkSync(outside, path.join(hostHome, 'config.toml'), 'dir');
-      expect(() =>
-        materializeCodexFallbackRuntime(
-          { hostPath: hostHome, containerPath: '/home/node/.codex-fallback-1' },
-          path.join(root, 'runtime'),
-        ),
-      ).toThrow(/Unsafe fallback config file/);
+      // Host config.toml is never read anymore (generated base instead), so a
+      // symlinked host config is inert rather than an error.
+      const mounts = materializeCodexFallbackRuntime(
+        { hostPath: hostHome, containerPath: '/home/node/.codex-fallback-1' },
+        path.join(root, 'runtime'),
+      );
+      expect(mounts.length).toBeGreaterThan(0);
+      expect(fs.readFileSync(path.join(root, 'runtime', 'config.toml'), 'utf8')).toContain('sandbox_mode');
 
       fs.unlinkSync(path.join(hostHome, 'config.toml'));
       fs.unlinkSync(path.join(hostHome, 'auth.json'));

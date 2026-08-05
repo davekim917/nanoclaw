@@ -88,6 +88,7 @@ import {
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
+import { buildContainerCodexConfig } from './providers/codex.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import {
   CLAUDE_CODE_PROJECTS_DIR,
@@ -1047,18 +1048,15 @@ export function materializeCodexFallbackRuntime(fallback: CodexAuthFallback, run
   removeUntrustedPathEntry(runtimeHostPath, 'plugins');
   removeUntrustedPathEntry(runtimeHostPath, '.tmp');
 
-  const hostConfig = path.join(fallback.hostPath, 'config.toml');
-  const hostConfigStat = fs.lstatSync(hostConfig, { throwIfNoEntry: false });
-  if (hostConfigStat && (hostConfigStat.isSymbolicLink() || !hostConfigStat.isFile())) {
-    throw new Error(`Unsafe fallback config file: ${hostConfig}`);
-  }
   const fallbackAuth = path.join(fallback.hostPath, 'auth.json');
   const fallbackAuthStat = fs.lstatSync(fallbackAuth, { throwIfNoEntry: false });
   if (!fallbackAuthStat || fallbackAuthStat.isSymbolicLink() || !fallbackAuthStat.isFile()) {
     throw new Error(`Unsafe fallback auth file: ${fallbackAuth}`);
   }
-  const configContents = hostConfigStat ? fs.readFileSync(hostConfig) : '';
-  replaceUntrustedFile(runtimeHostPath, 'config.toml', configContents);
+  // Container-owned base config — same generated content as the primary home.
+  // The fallback host dir contributes credentials (auth.json) and history
+  // (sessions/) only; its config.toml, if any, never reaches the container.
+  replaceUntrustedFile(runtimeHostPath, 'config.toml', buildContainerCodexConfig());
 
   // Docker file bind targets must exist before the parent runtime-home mount.
   replaceUntrustedFile(runtimeHostPath, 'auth.json', '');

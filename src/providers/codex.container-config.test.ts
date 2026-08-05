@@ -1,15 +1,12 @@
 /**
- * Regression test for the codex provider's container-config contribution —
- * specifically that synced named subagent role definitions
- * (`$CODEX_HOME/agents/*.toml`) reach codex-primary containers.
+ * Regression tests for the codex provider's container-config contribution.
  *
- * The `multi_agent` feature (stable, default-on in Codex 0.140) gives the
- * spawn_agent tool unconditionally, so GENERIC subagents work without any of
- * this. What this guards is the NAMED role layer: Codex reads `[agents.*]`
- * roles from `$CODEX_HOME/agents/*.toml`, and the host writes them (via
- * src/codex-sync.ts) into the per-group / global codex home. The session-local
- * `/home/node/.codex` must surface that dir or codex-primary groups silently
- * lose every custom role.
+ * Contract: host coupling is credential-only. auth.json comes from the
+ * scoped `~/.codex-<folder>` (else the shared-account `~/.codex`) — but
+ * config.toml is GENERATED (never copied from any host home) and the named
+ * subagent roles (`$CODEX_HOME/agents/*.toml`) come exclusively from the
+ * group-owned `groups/<folder>/.codex/agents/`. A host `~/.codex/agents/`
+ * dir must never reach a container, even when it exists.
  */
 import fs from 'fs';
 import os from 'os';
@@ -20,6 +17,7 @@ import { afterAll, beforeAll, describe, it, expect } from 'vitest';
 import { getProviderContainerConfig, type ProviderContainerContext } from './provider-container-registry.js';
 // Importing the module registers the 'codex' container-config callback.
 import './codex.js';
+import { buildContainerCodexConfig } from './codex.js';
 
 const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-cc-'));
 const SESSION_DIR = path.join(TEST_HOME, 'session');
@@ -53,72 +51,69 @@ afterAll(() => {
 });
 
 describe('codex provider container-config: agents/ mount', () => {
-  it('test_mounts_global_agents_dir_readonly', () => {
+  it('test_mounts_group_owned_agents_dir_readonly_never_host', () => {
     const fn = getProviderContainerConfig('codex');
     expect(fn).toBeDefined();
 
-    const contribution = fn!(makeCtx());
+    // Group-owned defs exist AND a host ~/.codex/agents exists (beforeAll) —
+    // the group dir must win and the host dir must be ignored entirely.
+    const groupDir = path.join(TEST_HOME, 'group');
+    fs.mkdirSync(path.join(groupDir, '.codex', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(groupDir, '.codex', 'agents', 'qa-worker.toml'), 'name = "qa-worker"\n');
+
+    const contribution = fn!(makeCtx({ groupDir }));
     const agentsMount = (contribution.mounts ?? []).find((m) => m.containerPath === '/home/node/.codex/agents');
 
     expect(agentsMount).toBeDefined();
     expect(agentsMount!.readonly).toBe(true);
-    expect(agentsMount!.hostPath).toBe(path.join(TEST_HOME, '.codex', 'agents'));
+    expect(agentsMount!.hostPath).toBe(path.join(groupDir, '.codex', 'agents'));
   });
 
-  it('test_no_agents_mount_when_dir_absent', () => {
+  it('test_no_agents_mount_when_group_dir_absent_even_with_host_agents', () => {
     const fn = getProviderContainerConfig('codex')!;
-    // Point HOME at a codex home with auth but no agents/ dir.
-    const bareHome = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-bare-'));
+    // Host home HAS an agents/ dir (beforeAll), but the group owns none —
+    // no mount. Host defs must never fall through to a container.
+    const emptyGroupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-nogroup-'));
     try {
-      fs.mkdirSync(path.join(bareHome, '.codex'), { recursive: true });
-      fs.writeFileSync(path.join(bareHome, '.codex', 'auth.json'), '{}');
-
-      const contribution = fn(makeCtx({ hostEnv: { HOME: bareHome } as NodeJS.ProcessEnv }));
+      const contribution = fn(makeCtx({ groupDir: emptyGroupDir }));
       const agentsMount = (contribution.mounts ?? []).find((m) => m.containerPath === '/home/node/.codex/agents');
       expect(agentsMount).toBeUndefined();
     } finally {
-      fs.rmSync(bareHome, { recursive: true, force: true });
+      fs.rmSync(emptyGroupDir, { recursive: true, force: true });
     }
   });
 
-  it('test_codex_config_drops_host_plugin_state_and_keeps_unrelated_settings', () => {
+  it('test_codex_config_is_generated_never_copied_from_host', () => {
     const fn = getProviderContainerConfig('codex')!;
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-sanitize-'));
     const sessionDir = path.join(home, 'session');
     const codexHome = path.join(home, '.codex');
-    fs.mkdirSync(path.join(codexHome, 'plugins'), { recursive: true });
+    fs.mkdirSync(codexHome, { recursive: true });
     fs.mkdirSync(sessionDir, { recursive: true });
     fs.writeFileSync(path.join(codexHome, 'auth.json'), '{"tokens":{"access_token":"kept"}}\n');
+    // A maximally leaky host config: personal model pin, personality, project
+    // trust table, TUI/hook state, plugins. NONE of it may reach the session.
     const hostConfig = [
       'model = "gpt-5.5"',
-      'approval_policy = "on-request"',
-      'sandbox_mode = "workspace-write"',
+      'personality = "pragmatic"',
       '',
-      '[mcp_servers.context7]',
-      'url = "https://mcp.context7.com/mcp"',
+      '[projects."/home/hostuser/secret-repo"]',
+      'trust_level = "trusted"',
       '',
-      '[mcp_servers.gitnexus]',
-      'command = "npx"',
-      'args = ["-y", "gitnexus", "mcp"]',
+      '[hooks.state."/home/hostuser/.codex/hooks.json:stop:0:0"]',
+      'acknowledged = true',
       '',
       '[plugins.humanizer]',
       'enabled = true',
       '',
-      '[plugins.gitnexus]',
-      'enabled = true',
-      `cache_path = "${home}/.codex/plugins/cache/gitnexus/1.0.0"`,
-      '',
-      '[plugin_marketplaces.gitnexus]',
-      `source = "${home}/plugins/gitnexus"`,
-      '',
-      '[plugin_marketplaces.team_tools]',
-      `source = "${home}/plugins/team-tools"`,
+      '[tui.model_availability_nux]',
+      '"gpt-5.5" = 4',
       '',
     ].join('\n');
     fs.writeFileSync(path.join(codexHome, 'config.toml'), hostConfig);
 
     try {
-      const contribution = fn(
+      fn(
         makeCtx({
           sessionDir,
           agentGroupFolder: 'sanitize',
@@ -127,18 +122,22 @@ describe('codex provider container-config: agents/ mount', () => {
       );
       const written = fs.readFileSync(path.join(sessionDir, 'codex', 'config.toml'), 'utf8');
 
-      expect(written).not.toMatch(/gitnexus/i);
-      expect(written).toContain('model = "gpt-5.5"');
-      expect(written).toContain('approval_policy = "on-request"');
-      expect(written).toContain('sandbox_mode = "workspace-write"');
-      expect(written).toContain('[mcp_servers.context7]\nurl = "https://mcp.context7.com/mcp"');
+      // Exactly the generated container base.
+      expect(written).toBe(buildContainerCodexConfig());
+      expect(written).not.toContain('gpt-5.5');
+      expect(written).not.toContain('personality');
+      expect(written).not.toContain('secret-repo');
+      expect(written).not.toContain('hooks.state');
       expect(written).not.toContain('[plugins.humanizer]');
-      expect(written).not.toContain('[plugin_marketplaces.team_tools]');
+      // Load-bearing container settings are present.
+      expect(written).toContain('sandbox_mode = "workspace-write"');
+      expect(written).toContain('approval_policy = "on-request"');
+      expect(written).toContain('[features]');
+      expect(written).toContain('[features.multi_agent_v2]');
+      expect(written).toContain('[projects."/workspace/agent"]');
+      // Credentials still flow.
       expect(fs.readFileSync(path.join(sessionDir, 'codex', 'auth.json'), 'utf8')).toBe(
         '{"tokens":{"access_token":"kept"}}\n',
-      );
-      expect(contribution.mounts).not.toContainEqual(
-        expect.objectContaining({ containerPath: '/home/node/.codex/plugins' }),
       );
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
@@ -174,6 +173,7 @@ describe('codex provider container-config: agents/ mount', () => {
         makeCtx({
           sessionDir,
           agentGroupFolder: 'poisoned',
+          groupDir: path.join(root, 'group'), // no .codex/agents → entry removed
           hostEnv: { HOME: home } as NodeJS.ProcessEnv,
         }),
       );
@@ -184,7 +184,7 @@ describe('codex provider container-config: agents/ mount', () => {
       expect(fs.readFileSync(path.join(outside, 'config-victim'), 'utf8')).toBe('keep');
       expect(fs.readFileSync(path.join(outside, 'auth-victim'), 'utf8')).toBe('keep');
       expect(fs.lstatSync(path.join(runtimeHome, 'config.toml')).isFile()).toBe(true);
-      expect(fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8')).toBe('');
+      expect(fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8')).toBe(buildContainerCodexConfig());
       expect(fs.lstatSync(path.join(runtimeHome, 'auth.json')).isFile()).toBe(true);
       expect(fs.readFileSync(path.join(runtimeHome, 'auth.json'), 'utf8')).toBe('{"fresh":true}');
       expect(fs.existsSync(path.join(runtimeHome, '.tmp'))).toBe(false);

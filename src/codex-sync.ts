@@ -12,6 +12,7 @@ import os from 'os';
 import path from 'path';
 
 import { flattenClaudeMd } from './agents-md-flatten.js';
+import { GROUPS_DIR } from './config.js';
 import { CODEX_PROJECT_DOC_DEFAULT_MAX_BYTES, warnIfOversized } from './codex-project-doc-cap.js';
 import { formatCodexAgentToml, isManagedToml, parseClaudeAgentMd } from './claude-agent-md.js';
 import { discoverClaudeSubagents, type DiscoveredSubagent } from './claude-subagent-discovery.js';
@@ -382,12 +383,17 @@ function syncOneCodexAgentsDir(target: string, sources: DiscoveredSubagent[]): O
 }
 
 /**
- * Find every Codex agents/ output directory. Always includes the global
- * `~/.codex/agents/`. Adds `~/.codex-<folder>/agents/` for every per-group
- * sibling dir that has an `auth.json` (so we don't write into half-set-up
- * siblings).
+ * Find every Codex agents/ output directory:
+ *
+ * - the global `~/.codex/agents/` (the HOST codex CLI's roster);
+ * - `~/.codex-<folder>/agents/` for every per-group sibling dir that has an
+ *   `auth.json` (host-CLI convenience for scoped logins);
+ * - `groups/<folder>/.codex/agents/` for every provider=codex agent group —
+ *   the GROUP-OWNED dir that containers actually read (the codex provider
+ *   contribution mounts it RO at /home/node/.codex/agents; there is no
+ *   host-dir fallback).
  */
-function discoverCodexAgentTargets(): string[] {
+export function discoverCodexAgentTargets(groupsDir: string = GROUPS_DIR): string[] {
   const home = os.homedir();
   const targets: string[] = [path.join(home, '.codex', 'agents')];
 
@@ -395,7 +401,7 @@ function discoverCodexAgentTargets(): string[] {
   try {
     entries = fs.readdirSync(home, { withFileTypes: true });
   } catch {
-    return targets;
+    entries = [];
   }
 
   for (const entry of entries) {
@@ -404,6 +410,25 @@ function discoverCodexAgentTargets(): string[] {
     const auth = path.join(home, entry.name, 'auth.json');
     if (!fs.existsSync(auth)) continue;
     targets.push(path.join(home, entry.name, 'agents'));
+  }
+
+  let groupEntries: fs.Dirent[];
+  try {
+    groupEntries = fs.readdirSync(groupsDir, { withFileTypes: true });
+  } catch {
+    return targets;
+  }
+
+  for (const entry of groupEntries) {
+    if (!entry.isDirectory()) continue;
+    const configPath = path.join(groupsDir, entry.name, 'container.json');
+    try {
+      const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as { provider?: string };
+      if (parsed.provider !== 'codex') continue;
+    } catch {
+      continue;
+    }
+    targets.push(path.join(groupsDir, entry.name, '.codex', 'agents'));
   }
 
   return targets;
