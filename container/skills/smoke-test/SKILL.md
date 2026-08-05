@@ -42,8 +42,8 @@ front of a headless Codex worker, or a Codex wrapper in front of a Claude worker
 |---|---|---|
 | Coordinator parent | Claude Opus 5, high effort | Visible run controller. Freezes the build, owns the coverage manifest, dispatches native Claude workers, reconciles evidence, and publishes the one consolidated verdict. |
 | Challenger parent | GPT-5.6 Sol, high effort | Visible independent challenger. Dispatches native Codex workers, attempts to falsify coverage and findings, and returns `CLEAR`, `DISSENT`, or additional evidence before the coordinator synthesizes. |
-| `qa-smoke-worker` under the coordinator | Claude Sonnet 5, high effort | Executes bounded manifest slices and records evidence without seeing other workers' conclusions. |
-| `qa-smoke-worker` under the challenger | GPT-5.6 Luna, xhigh effort | Independently replays and attacks claims, with multimodal browser evidence when applicable. |
+| `qa-smoke-worker` under the coordinator | Claude Sonnet 5, xhigh effort | Executes bounded manifest slices and records evidence without seeing other workers' conclusions. |
+| `qa-smoke-worker` under the challenger | GPT-5.6 Luna, max effort | Independently replays and attacks claims, with multimodal browser evidence when applicable. |
 
 The same role name intentionally resolves to a provider-native definition in
 each runtime. The coordinator asks the challenger for an independent pass; the
@@ -173,7 +173,7 @@ non-overlapping manifest IDs.
 ### UI adversary
 
 The challenger normally assigns this lane to a native GPT-5.6 Luna worker at
-xhigh effort. Use the `agent-browser` skill.
+max effort. Use the `agent-browser` skill.
 
 - Start from a clean browser state, then repeat important paths with saved auth.
 - Own the browser authentication lease. If another lane owns it, do not retry
@@ -201,7 +201,7 @@ xhigh effort. Use the `agent-browser` skill.
 ### Backend and specification verifier
 
 The coordinator normally assigns this lane to a native Claude Sonnet 5 worker
-at high effort.
+at xhigh effort.
 
 - Trace the changed source and its production-relevant call path.
 - Run focused tests first, then the full relevant suite. Record exact commands,
@@ -384,8 +384,8 @@ promote production.
 
 ## Cost controls
 
-- Two provider-native worker lanes by default: Sonnet/high under the
-  coordinator and Luna/xhigh under the challenger. The frontier parents stay
+- Two provider-native worker lanes by default: Sonnet/xhigh under the
+  coordinator and Luna/max under the challenger. The frontier parents stay
   sparse: assign, challenge, synthesize.
 - Raise parent effort or add one `qa-adjudicator` pass only on the escalation
   conditions above.
