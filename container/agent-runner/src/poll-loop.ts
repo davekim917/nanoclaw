@@ -12,6 +12,7 @@ import {
   retainCompleteRecallUnits,
   type MessageInRow,
 } from './db/messages-in.js';
+import { getConfig } from './config.js';
 import { setChatLimit, writeMessageOut } from './db/messages-out.js';
 import { getSessionSpawnTaskId } from './db/session-routing.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
@@ -149,6 +150,60 @@ class ProviderEventError extends Error {
 
 function isProviderSystemError(err: unknown): boolean {
   return err instanceof ProviderEventError && err.classification === 'system_error';
+}
+
+/**
+ * A provider-level quota wall (exhausted account / weekly limit), as opposed
+ * to a per-request rate limit. Nothing inside this container can recover it:
+ * the credential itself is spent until the provider's window resets.
+ */
+function isProviderQuotaExhausted(err: unknown): boolean {
+  return err instanceof ProviderEventError && err.classification === 'quota';
+}
+
+/**
+ * Report a spent provider to the host and let it respawn this session on the
+ * declared fallback. Returns true when the caller must NOT write a chat
+ * error: the user should experience a slightly slow reply, not a dead end,
+ * and a scheduled agent must not post the same wall on every fire.
+ *
+ * Reporting only makes sense when a fallback exists — otherwise the outage
+ * stays loud, which is the correct behavior for a group that never opted in.
+ */
+function reportProviderUnavailable(providerName: string, message: string): boolean {
+  const fallbackProvider = getConfig().providerFallback?.provider;
+  if (!fallbackProvider) return false;
+  // Already running AS the fallback (the host set the spawn override) and the
+  // fallback is spent too: there is nowhere left to route. Still record the
+  // outage, but let the error reach the user — silently respawning here would
+  // bounce between two dead providers forever.
+  const alreadyOnFallback = Boolean(
+    typeof process !== 'undefined' ? process.env?.NANOCLAW_PROVIDER_OVERRIDE : undefined,
+  );
+  try {
+    writeMessageOut({
+      id: generateId(),
+      kind: 'system',
+      content: JSON.stringify({
+        action: 'provider_unavailable',
+        provider: providerName,
+        classification: 'quota',
+        message: message.slice(0, 500),
+        fallbackProvider,
+      }),
+    });
+    log(
+      alreadyOnFallback
+        ? `Provider ${providerName} is quota-exhausted while already running as the fallback — surfacing the error`
+        : `Provider ${providerName} is quota-exhausted; reported for fallback to ${fallbackProvider}`,
+    );
+    return !alreadyOnFallback;
+  } catch (err) {
+    // Reporting is best-effort: if the outbound write fails we fall back to
+    // the visible error rather than swallowing the failure silently.
+    log(`Failed to report provider outage: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
 }
 
 const FILE_EVENT_MAX_BYTES = 50 * 1024 * 1024;
@@ -974,8 +1029,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
 
+      // A spent provider account is not a turn failure the user can act on.
+      // When a fallback is declared, report it and stay silent: the host
+      // respawns this session on the fallback and the requeued message is
+      // answered there, so the conversation shows a slow reply rather than
+      // an error the reader can do nothing about.
+      const quotaHandled =
+        !recovered &&
+        isProviderQuotaExhausted(err) &&
+        reportProviderUnavailable(config.providerName, err instanceof Error ? err.message : String(err));
+
       // Only surface the error to the user if we couldn't recover inline.
-      if (!recovered) {
+      if (!recovered && !quotaHandled) {
         const chatText = transient
           ? `⚠️ Anthropic's API stayed overloaded across ${TRANSIENT_OVERLOAD_MAX_TRIES} retries — I couldn't finish this turn. I'll pick up from your next message.`
           : codexIdle
@@ -1670,6 +1735,12 @@ export function handleEvent(event: ProviderEvent, routing: RoutingContext): void
       // error branch in runPollLoop has its own chat write (search for
       // `Error: ${errMsg}` in this file) — this case is its yielded-event
       // sibling.
+      // Quota exhaustion with a declared fallback is reported to the host
+      // instead of shown: the session respawns on the fallback provider.
+      // See the thrown-error sibling branch for the same decision.
+      if (event.retryable === false && event.classification === 'quota') {
+        if (reportProviderUnavailable(getConfig().provider, event.message)) break;
+      }
       if (event.retryable === false) {
         writeMessageOut({
           id: generateId(),

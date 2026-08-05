@@ -24,6 +24,15 @@ export interface RunnerConfig {
   providerConfig: Record<string, unknown>;
   model?: string;
   effort?: string;
+
+  /**
+   * Where the host routes spawns while this provider is unavailable. The
+   * runner only needs to know whether one EXISTS: when a turn dies on a
+   * provider-level quota and a fallback is declared, the failure is reported
+   * to the host and the session respawns onto the fallback instead of
+   * surfacing a dead-end error to the user.
+   */
+  providerFallback?: { provider: string; model?: string; effort?: string };
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -53,8 +62,16 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   // operator-static while the env is channel-aware. See
   // src/container-runner.ts `resolveAssistantName`.
   const envAssistantName = typeof process !== 'undefined' ? process.env?.NANOCLAW_ASSISTANT_NAME : undefined;
+  // Spawn-time provider fallback. The host decides which provider this
+  // container runs (it owns the outage record and the credentials it
+  // mounted); container.json is static per group and cannot express "the
+  // primary is exhausted right now". Same precedence shape as the assistant
+  // name: env is per-spawn truth, the file is the static default.
+  const env = typeof process !== 'undefined' ? process.env : undefined;
+  const envProvider = env?.NANOCLAW_PROVIDER_OVERRIDE;
+  const envModel = env?.NANOCLAW_MODEL_OVERRIDE;
   return {
-    provider: (raw.provider as string) || 'claude',
+    provider: envProvider || (raw.provider as string) || 'claude',
     assistantName: envAssistantName || (raw.assistantName as string) || '',
     groupName: (raw.groupName as string) || '',
     agentGroupId: (raw.agentGroupId as string) || '',
@@ -64,8 +81,9 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
       ? raw.excludeMcpServers.filter((name): name is string => typeof name === 'string')
       : [],
     providerConfig: (raw.providerConfig as Record<string, unknown>) ?? {},
-    model: (raw.model as string) || undefined,
+    model: envModel || (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,
+    providerFallback: (raw.providerFallback as RunnerConfig['providerFallback']) || undefined,
   };
 }
 

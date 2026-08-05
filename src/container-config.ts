@@ -97,6 +97,23 @@ export interface ContainerConfig {
   effort?: string;
 
   /**
+   * Where to route spawns while `provider` is recorded unavailable (an
+   * exhausted account, a suspended key). Opt-in per group: with no
+   * declaration a provider outage still fails loudly rather than silently
+   * changing which model answers a user.
+   *
+   * A fallback is a deliberate degradation — a different vendor means
+   * different failure modes and, for adversarial roles, a loss of the
+   * independence the pairing was built for. Groups that care must say so in
+   * their own output; this field only keeps them running.
+   */
+  providerFallback?: {
+    provider: string;
+    model?: string;
+    effort?: string;
+  };
+
+  /**
    * Per-group OneCLI secret declaration. Each entry is either a secret
    * NAME (e.g. "Datafold-ExampleRetail") or a UUID. Names resolve via
    * `onecli secrets list` at apply time. When non-empty, the host
@@ -438,6 +455,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
     resources: raw.resources,
     model: raw.model,
     effort: raw.effort,
+    providerFallback: raw.providerFallback,
     githubTokenEnv: raw.githubTokenEnv,
     excludePlugins: raw.excludePlugins,
     codexHostAuth: raw.codexHostAuth,

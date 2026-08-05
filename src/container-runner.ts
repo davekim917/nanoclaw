@@ -38,6 +38,7 @@ import {
   resolveContainerResources,
   type ContainerResources,
 } from './container-resources.js';
+import { resolveSpawnProvider } from './provider-fallback.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
@@ -627,13 +628,43 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
   // idempotent: it only writes paths that don't already exist, so this call
   // is a no-op for groups that have spawned before. Runs before the provider
   // contribution so a surfaces-providing provider finds the group dir ready.
-  const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
+  // Spawn-time provider fallback: if the primary provider is inside a
+  // recorded unavailability window (exhausted account) and the group declares
+  // a fallback, run the fallback instead of waking a container that can only
+  // fail. Applied AFTER normal resolution because `session.agent_provider`
+  // outranks container.json — and mirrored onto the config + a synthetic
+  // session so every downstream consumer (mounts, credentials, instruction
+  // composition, worker roster) agrees on one provider.
+  const providerDecision = resolveSpawnProvider({
+    agentGroupId: agentGroup.id,
+    sessionProvider: session.agent_provider,
+    containerConfig,
+  });
+  if (providerDecision.fallbackApplied) {
+    containerConfig.provider = providerDecision.provider;
+    if (providerDecision.model) containerConfig.model = providerDecision.model;
+    if (providerDecision.effort) containerConfig.effort = providerDecision.effort;
+    log.warn('Provider fallback engaged — primary is in a recorded outage window', {
+      sessionId: session.id,
+      agentGroup: agentGroup.name,
+      primaryProvider: providerDecision.primaryProvider,
+      fallbackProvider: providerDecision.provider,
+      model: providerDecision.model,
+    });
+  }
+  // Local shadow: the fallback must beat a stamped session row for THIS spawn
+  // without persisting a provider change to the session.
+  const spawnSession = providerDecision.fallbackApplied
+    ? { ...session, agent_provider: providerDecision.provider }
+    : session;
+
+  const providerName = resolveProviderName(spawnSession.agent_provider, containerConfig.provider);
   initGroupFilesystem({ ...agentGroup, workgroup_id: resolvedWgId }, { provider: providerName });
 
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  const { provider, contribution } = resolveProviderContribution(spawnSession, agentGroup, containerConfig);
 
   const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution, resolvedWgId);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
@@ -672,6 +703,7 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
     },
     session.messaging_group_id ?? null,
     resolvedWgId,
+    providerDecision.fallbackApplied,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -2835,6 +2867,13 @@ async function buildContainerArgs(
   // resolution stay aligned with the /workspace/workgroup mount and the
   // archive projection (race-fix).
   resolvedWgId?: string,
+  /**
+   * Set when a spawn-time provider fallback diverged from container.json.
+   * Drives the NANOCLAW_PROVIDER_OVERRIDE/_MODEL_OVERRIDE bridge — the
+   * container reads its provider from the bind-mounted file, which the host
+   * does not rewrite per spawn.
+   */
+  providerFallbackApplied?: boolean,
 ): Promise<string[]> {
   // --init: tini as PID 1 reaps orphaned children (esbuild/gh corpses were
   // accumulating as zombies under bun, which doesn't reap as PID 1) and still
@@ -2925,6 +2964,19 @@ async function buildContainerArgs(
   const defaultEffort = channelDefaults?.channelDefaultEffort ?? containerConfig.defaultEffort;
   if (defaultEffort) {
     args.push('-e', `NANOCLAW_EFFORT_OVERRIDE=${defaultEffort}`);
+  }
+
+  // Provider fallback bridge. The container reads its provider and model from
+  // the bind-mounted container.json, which the host does not rewrite per
+  // spawn — so a spawn-time fallback has to travel as env, exactly like
+  // NANOCLAW_ASSISTANT_NAME beats the file's static value. Emitted only when
+  // the effective provider actually diverges from the file, so a normal
+  // spawn's environment is unchanged.
+  if (providerFallbackApplied && containerConfig.provider) {
+    args.push('-e', `NANOCLAW_PROVIDER_OVERRIDE=${containerConfig.provider}`);
+    if (containerConfig.model) {
+      args.push('-e', `NANOCLAW_MODEL_OVERRIDE=${containerConfig.model}`);
+    }
   }
 
   // Per-channel default tone profile — ports v1's "always-on tone" feature.

@@ -40,4 +40,9 @@ import './support-threads/index.js';
 // Scheduled-wake — schedule_wake delivery action: the container `wait` tool's
 // in-session delayed wake (process_after row in the caller's own session).
 import './scheduled-wake/index.js';
+// Provider fallback — provider_unavailable: a container reports its own
+// exhausted provider account; the host records the outage window and
+// respawns that session onto the group's declared fallback provider.
+import './provider-fallback/index.js';
+
 import './escalation/index.js';
