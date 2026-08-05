@@ -1034,9 +1034,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // respawns this session on the fallback and the requeued message is
       // answered there, so the conversation shows a slow reply rather than
       // an error the reader can do nothing about.
+      // Ask the provider first — it knows its own error vocabulary and
+      // surfaces quota in more than one shape. Fall back to the classified
+      // event form for providers that don't implement the hook.
+      const quotaExhausted = config.provider.isQuotaExhausted?.(err) ?? isProviderQuotaExhausted(err);
       const quotaHandled =
         !recovered &&
-        isProviderQuotaExhausted(err) &&
+        quotaExhausted &&
         reportProviderUnavailable(config.providerName, err instanceof Error ? err.message : String(err));
 
       // Only surface the error to the user if we couldn't recover inline.

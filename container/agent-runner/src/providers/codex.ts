@@ -529,6 +529,14 @@ export function augmentWithProxyEnv(baseEnv: Record<string, string>): Record<str
 const ROTATABLE_CODEX_ERROR_KINDS: ReadonlySet<string> = new Set(['UsageLimitExceeded', 'ServerOverloaded']);
 
 /**
+ * The app-server's own usage-limit sentence, as thrown from the query path
+ * (the event path carries the structured `UsageLimitExceeded` kind instead).
+ * Deliberately anchored on the stable phrase pair rather than the whole
+ * message, which embeds a per-account reset date and billing URL.
+ */
+const CODEX_USAGE_LIMIT_RE = /hit your usage limit|usage limit reached|purchase more credits/i;
+
+/**
  * Map a terminal turn error to a ProviderEvent `classification` consumed by
  * the poll-loop catch path:
  *   - `quota` / `overloaded` → rotation-eligible (structured CodexErrorInfo)
@@ -865,6 +873,19 @@ export class CodexProvider implements AgentProvider {
   isSessionInvalid(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);
     return STALE_THREAD_RE.test(msg);
+  }
+
+  /**
+   * Codex reports an exhausted account two ways: as a structured
+   * `UsageLimitExceeded` on the event path, and as a plain thrown Error
+   * carrying the CLI's own sentence on the query path ("You've hit your usage
+   * limit … try again at <date>"). Both mean the same thing to the caller, so
+   * match either — the app-server owns this wording, and a missed match only
+   * costs the old behavior (a visible error) rather than a wrong one.
+   */
+  isQuotaExhausted(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return CODEX_USAGE_LIMIT_RE.test(msg);
   }
 
   query(input: QueryInput): AgentQuery {

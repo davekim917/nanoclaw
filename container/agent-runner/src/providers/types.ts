@@ -66,6 +66,19 @@ export interface AgentProvider {
   isTransientOverload?(err: unknown): boolean;
 
   /**
+   * True when the error means this ACCOUNT is spent (a usage/credit limit
+   * that resets on the provider's own schedule), as opposed to a transient
+   * server-side rate limit. Nothing inside the container can recover it:
+   * every retry on this credential fails until the window resets.
+   *
+   * Providers surface quota in more than one shape — a classified event on
+   * one path, a plain thrown Error on another — so the decision belongs with
+   * the provider that knows its own error vocabulary, not with a string match
+   * in the poll loop.
+   */
+  isQuotaExhausted?(err: unknown): boolean;
+
+  /**
    * Advance to the next configured fallback credential (API key or OAuth
    * token). Returns `rotated: true` if a rotation happened, false if no
    * more fallbacks remain. The stored continuation is preserved across
