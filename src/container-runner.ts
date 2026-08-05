@@ -643,8 +643,13 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
   });
   if (providerDecision.fallbackApplied) {
     containerConfig.provider = providerDecision.provider;
-    if (providerDecision.model) containerConfig.model = providerDecision.model;
-    if (providerDecision.effort) containerConfig.effort = providerDecision.effort;
+    // Assign unconditionally. A fallback that declares no model wants the new
+    // provider's own default, NOT the primary's model id — keeping the old
+    // value here would emit NANOCLAW_MODEL_OVERRIDE=<codex model> to a claude
+    // container, which is the same class of failure as shipping the primary's
+    // providerConfig across (see parseRawConfig in the agent-runner).
+    containerConfig.model = providerDecision.model;
+    containerConfig.effort = providerDecision.effort;
     log.warn('Provider fallback engaged — primary is in a recorded outage window', {
       sessionId: session.id,
       agentGroup: agentGroup.name,
