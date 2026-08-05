@@ -27,7 +27,12 @@ in the deploying group's standing instructions, never in this skill.
 - `full` expands the UI manifest to every reachable in-scope control and runs
   the full relevant backend suite.
 - `fix` may repair confirmed findings. It does not authorize merge, production
-  deploy, destructive test data, or unrelated changes.
+  deploy, destructive test data, or unrelated changes. `fix` authority gates
+  only the QA agents editing code THEMSELVES — handing a confirmed finding to
+  a domain fixer is that fixer's normal development work and needs no smoke
+  authority; never tell a fixer to stand by. The one restriction to pass
+  along: a fixer never certifies its own fix — the QA pair re-verifies the
+  deployed SHA.
 - `verify` reruns the recorded reproductions against the deployed fix.
 
 If repo, ref, environment, feature boundary, authentication, or write authority
