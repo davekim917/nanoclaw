@@ -92,10 +92,14 @@ queue that has retried a write past three attempts is reported by the runtime
 verifier as a non-blocking `curator-episodes-stuck` warning instead of being
 indistinguishable from a healthy idle queue.
 Its default decision is `noop`.
-It captures only durable decisions, corrections, stable cross-task
-preferences, verified outcomes, and durable workflows. It rejects secrets,
-capability state, transient work, speculation, third-party uncertainty, and
-facts recoverable from code or Graphify.
+It captures durable decisions, corrections, stable cross-task preferences,
+verified outcomes, durable workflows, and durable facts about people,
+organizations, and external systems — who they are, what they own, and how to
+route work to them. A stated role or ownership counts even when it arrives in
+passing rather than as a decision; before this category existed, 134 archived
+messages mentioning two named feed liaisons distilled to zero facts about who
+they were. It rejects secrets, capability state, transient work, speculation,
+third-party uncertainty, and facts recoverable from code or Graphify.
 
 The model returns semantic facts plus archive evidence IDs, never Markdown.
 The host owns the complete representation: it normalizes fact text, derives

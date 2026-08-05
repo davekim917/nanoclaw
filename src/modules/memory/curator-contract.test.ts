@@ -290,6 +290,12 @@ describe('background memory curator contract', () => {
     expect(prompt.system).toContain(`under ${CURATOR_MAX_MEMORY_TEXT_CHARS.toLocaleString('en-US')} characters`);
     // The supersession contract must actually be stated, not just enforced.
     expect(prompt.system).toContain('supersede it');
+    // People, org, and system knowledge is capturable. Before this category
+    // existed, 134 archived messages mentioning two named feed liaisons
+    // distilled to zero facts about who they were — a role stated in passing
+    // fit no capture category.
+    expect(prompt.system).toContain('what they own or are responsible for');
+    expect(prompt.system).toContain('even when it arrives in passing');
     for (const code of CURATOR_CAPTURE_REASON_CODES) expect(prompt.system).toContain(code);
     expect(prompt.system).toContain('for noop both must be empty arrays');
   });
