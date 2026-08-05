@@ -11,9 +11,28 @@ vi.mock('child_process', () => ({
   execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
 }));
 
+// Default: central DB unavailable (throws) — proves the manager works without
+// it and that session reclaim fails closed. Tests that exercise reclaim set
+// mocks.centralDb to a row map; UPDATEd session ids land in centralDb.updates.
+const centralDbMock = vi.hoisted(() => ({
+  current: null as null | {
+    rows: Record<string, { status: string; last_activity: string | null }>;
+    updates: string[];
+  },
+}));
 vi.mock('./db/connection.js', () => ({
   getDb: () => {
-    throw new Error('central db unavailable in storage-manager unit test');
+    if (!centralDbMock.current) throw new Error('central db unavailable in storage-manager unit test');
+    const db = centralDbMock.current;
+    return {
+      prepare: (sql: string) => ({
+        get: (id: string) => db.rows[id],
+        run: (id: string) => {
+          if (sql.includes('UPDATE sessions')) db.updates.push(id);
+        },
+        all: () => [],
+      }),
+    };
   },
 }));
 
@@ -365,6 +384,117 @@ describe('storage-manager cache cleanup', () => {
       path.join(legacyDir, 'worktrees', 'repo', '.turbo'),
     );
     expect(report.skipped.unreadableSessions).toBe(1);
+  });
+});
+
+describe('storage-manager session archive-then-reclaim', () => {
+  let tmpRoot: string;
+  const now = Date.parse('2026-06-30T00:00:00.000Z');
+  const DAY = 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetStorageManagerThrottleForTesting();
+    centralDbMock.current = null;
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-sess-reclaim-'));
+    mockExecFileSync.mockImplementation((cmd: string, cmdArgs?: unknown) => {
+      if (cmd === 'df') {
+        return 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 900 100 90% /\n';
+      }
+      if (cmd === 'tar') {
+        const argv = cmdArgs as string[];
+        fs.writeFileSync(argv[argv.indexOf('-cf') + 1]!, 'fake-zstd-archive');
+        return '';
+      }
+      throw new Error(`unexpected command ${cmd}`);
+    });
+  });
+
+  afterEach(() => {
+    centralDbMock.current = null;
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function makeIdleSession(id: string, idleMs: number): string {
+    const dir = path.join(tmpRoot, 'v2-sessions', 'ag-1', id);
+    fs.mkdirSync(path.join(dir, 'creds'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'creds', 'secret.json'), 'secret-material');
+    fs.writeFileSync(path.join(dir, 'notes.md'), 'human work');
+    const db = new Database(path.join(dir, 'inbound.db'));
+    db.exec("CREATE TABLE messages_in (status TEXT NOT NULL DEFAULT 'completed', trigger INTEGER, process_after TEXT)");
+    db.close();
+    const mtime = (now - idleMs) / 1000;
+    fs.utimesSync(path.join(dir, 'inbound.db'), mtime, mtime);
+    return dir;
+  }
+
+  function runApply() {
+    return getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot: path.join(tmpRoot, 'v2-sessions'),
+      threadsRoot: path.join(tmpRoot, 'no-threads'),
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 1 * DAY, worktreeReclaimMs: 30 * DAY },
+    });
+  }
+
+  function iso(msAgo: number): string {
+    return new Date(now - msAgo).toISOString();
+  }
+
+  it('archives a 30d-idle session, closes its row, and excludes creds from the rescue', () => {
+    const dir = makeIdleSession('sess-old', 31 * DAY);
+    centralDbMock.current = {
+      rows: { 'sess-old': { status: 'active', last_activity: iso(31 * DAY) } },
+      updates: [],
+    };
+
+    const report = runApply();
+
+    const action = report.actions.find((a) => a.kind === 'archive-session');
+    expect(action?.status).toBe('applied');
+    expect(centralDbMock.current.updates).toEqual(['sess-old']);
+    expect(fs.existsSync(dir)).toBe(false);
+    const rescues = fs.readdirSync(path.join(tmpRoot, 'session-rescues'));
+    expect(rescues.some((f) => f.startsWith('ag-1__sess-old-') && f.endsWith('.tar.zst'))).toBe(true);
+    const tarCall = mockExecFileSync.mock.calls.find((c) => c[0] === 'tar');
+    expect(tarCall?.[1]).toContain('--exclude=creds');
+  });
+
+  it('holds a session whose central row shows fresh activity, whatever the dir mtime says', () => {
+    const dir = makeIdleSession('sess-db-fresh', 31 * DAY);
+    centralDbMock.current = {
+      rows: { 'sess-db-fresh': { status: 'active', last_activity: iso(1 * DAY) } },
+      updates: [],
+    };
+
+    const report = runApply();
+
+    expect(report.actions.filter((a) => a.kind === 'archive-session')).toEqual([]);
+    expect(centralDbMock.current.updates).toEqual([]);
+    expect(fs.existsSync(path.join(dir, 'notes.md'))).toBe(true);
+  });
+
+  it('fails closed when the central DB is unavailable, while cache pruning continues', () => {
+    makeIdleSession('sess-no-db', 31 * DAY);
+    // centralDbMock.current stays null -> getDb throws
+
+    const report = runApply();
+
+    expect(report.actions.filter((a) => a.kind === 'archive-session')).toEqual([]);
+  });
+
+  it('reclaims an orphan dir with no central row without touching the DB', () => {
+    const dir = makeIdleSession('sess-orphan', 40 * DAY);
+    centralDbMock.current = { rows: {}, updates: [] };
+
+    const report = runApply();
+
+    const action = report.actions.find((a) => a.kind === 'archive-session');
+    expect(action?.status).toBe('applied');
+    expect(centralDbMock.current.updates).toEqual([]);
+    expect(fs.existsSync(dir)).toBe(false);
   });
 });
 

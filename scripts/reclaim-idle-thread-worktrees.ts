@@ -37,14 +37,17 @@ const report = getStorageReport({
   force: true, // one-shot operator run — bypass the scan cadence throttle
 });
 
-const archives = report.actions.filter((a) => a.kind === 'archive-thread-worktree');
+const archives = report.actions.filter(
+  (a) => a.kind === 'archive-thread-worktree' || a.kind === 'archive-session',
+);
 let reclaimed = 0;
 for (const action of archives) {
   const line = `${action.status.toUpperCase().padEnd(8)} ${Math.round(action.estimatedBytes / 1048576)} MB  ${action.path}${action.error ? `  ERROR: ${action.error}` : ''}`;
   console.log(line);
   if (action.status === 'applied') reclaimed += action.estimatedBytes;
 }
+const planned = archives.reduce((t, a) => t + a.estimatedBytes, 0);
 console.log(
-  `\n${dryRun ? 'DRY-RUN: would reclaim' : 'Reclaimed'} ${Math.round(reclaimed / 1048576)} MB across ${archives.length} thread dir(s) ` +
-    `(skipped: live=${report.skipped.liveThreads} busy=${report.skipped.busySessions} fresh=${report.skipped.freshThreads})`,
+  `\n${dryRun ? `DRY-RUN: would reclaim ${Math.round(planned / 1048576)}` : `Reclaimed ${Math.round(reclaimed / 1048576)}`} MB across ${archives.length} dir(s) ` +
+    `(skipped: live=${report.skipped.liveSessions + report.skipped.liveThreads} busy=${report.skipped.busySessions} fresh=${report.skipped.freshSessions + report.skipped.freshThreads})`,
 );

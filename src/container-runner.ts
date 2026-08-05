@@ -1569,13 +1569,9 @@ export function buildMounts(
   const graphifyRuntime = graphifyRuntimeDir();
   fs.mkdirSync(graphifyCache, { recursive: true });
   fs.mkdirSync(graphifyRuntime, { recursive: true });
-  // Pre-create the /workspace/.cache/graphify mountpoint host-side. /workspace
-  // is the session-dir bind, so when Docker creates this nested mountpoint it
-  // materializes <sess>/.cache/graphify on the host owned by ROOT — which the
-  // storage manager (running as the host user) can then never delete once the
-  // session idles out (observed live: 286 EACCES retries per pass). Docker
-  // leaves a pre-existing dir's ownership alone.
-  fs.mkdirSync(path.join(sessionDir(agentGroup.id, session.id), '.cache', 'graphify'), { recursive: true });
+  // Nested /workspace mountpoints are pre-created host-side at spawn-args
+  // build time (see the workspace-stub loop before the volume-mount args) so
+  // Docker never materializes them root-owned inside the session dir.
   mounts.push({ hostPath: graphifyCache, containerPath: '/workspace/.cache/graphify', readonly: false });
   mounts.push({ hostPath: graphifyRuntime, containerPath: '/run/nanoclaw-graphify', readonly: false });
 
@@ -3524,6 +3520,37 @@ async function buildContainerArgs(
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
     args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', 'HOME=/home/node');
+  }
+
+  // Pre-create every nested /workspace mountpoint host-side as the host user.
+  // /workspace is itself a bind of the session dir, so when Docker creates a
+  // missing nested mountpoint (/workspace/agent, /workspace/.cache/graphify,
+  // /workspace/project/README.md, ...) it materializes that stub inside the
+  // session dir owned by ROOT — which the storage manager (host user) can
+  // then never delete once the session idles out. Docker leaves pre-existing
+  // stubs' ownership alone. Best-effort: a failure here just reproduces the
+  // old behavior (root-owned stub), loudly.
+  const workspaceHostRoot = mounts.find((m) => m.containerPath === '/workspace')?.hostPath;
+  if (workspaceHostRoot) {
+    for (const mount of mounts) {
+      if (!mount.containerPath.startsWith('/workspace/')) continue;
+      const stubPath = path.join(workspaceHostRoot, mount.containerPath.slice('/workspace/'.length));
+      try {
+        if (fs.existsSync(stubPath)) continue;
+        const sourceIsFile = fs.existsSync(mount.hostPath) && fs.lstatSync(mount.hostPath).isFile();
+        if (sourceIsFile) {
+          fs.mkdirSync(path.dirname(stubPath), { recursive: true });
+          fs.writeFileSync(stubPath, '');
+        } else {
+          fs.mkdirSync(stubPath, { recursive: true });
+        }
+      } catch (err) {
+        log.warn('Failed to pre-create workspace mountpoint stub — Docker will create it root-owned', {
+          stubPath,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   // Volume mounts

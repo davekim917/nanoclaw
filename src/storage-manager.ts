@@ -80,6 +80,7 @@ export type StorageActionKind =
   | 'delete-cache-dir'
   | 'delete-derived-file'
   | 'archive-thread-worktree'
+  | 'archive-session'
   | 'docker-prune-containers'
   | 'docker-prune-images'
   | 'docker-prune-builder-cache';
@@ -703,6 +704,106 @@ function isRealDirectory(dirPath: string): boolean {
   }
 }
 
+export const SESSION_RESCUES_DIRNAME = 'session-rescues';
+// Secret material and per-spawn regenerables never enter a rescue archive:
+// creds/ is re-materialized on every spawn; the graphify dirs are caches.
+const SESSION_ARCHIVE_EXTRA_EXCLUDES = ['creds', 'graphify-cache', '.graphify-stage'];
+
+interface CentralSessionRow {
+  status: string;
+  last_activity: string | null;
+}
+
+/**
+ * Central-DB row for a session dir, or null when the row is gone (orphan
+ * dir), or 'unavailable' when the central DB cannot be read — in which case
+ * session reclaim MUST NOT run (fail closed: without the row we cannot see
+ * status or true activity).
+ */
+function centralSessionRow(sessionId: string): CentralSessionRow | null | 'unavailable' {
+  try {
+    const row = getDb()
+      .prepare('SELECT status, COALESCE(last_active, created_at) AS last_activity FROM sessions WHERE id = ?')
+      .get(sessionId) as CentralSessionRow | undefined;
+    return row ?? null;
+  } catch {
+    return 'unavailable';
+  }
+}
+
+/**
+ * Archive-then-reclaim one whole session dir, closing the central session row
+ * first. findSessionForAgent only matches status='active', so the next
+ * inbound for the same thread creates a FRESH session with a fresh dir
+ * (initSessionFolder is idempotent) — conversation history stays in the
+ * canonical data/archive.db and Graphify. The rescue archive preserves the
+ * session DBs, provider continuity files, and any worktree content minus
+ * regenerable trees and creds.
+ */
+function createArchiveSessionAction(args: {
+  id: string;
+  sessionId: string;
+  sessionStatus: 'active' | 'closed' | 'orphan';
+  sessPath: string;
+  sessionsRoot: string;
+  rescuesDir: string;
+  estimatedBytes: number;
+  reason: string;
+}): StorageAction {
+  return {
+    id: args.id,
+    pool: 'session-cache',
+    kind: 'archive-session',
+    path: args.sessPath,
+    estimatedBytes: args.estimatedBytes,
+    reason: args.reason,
+    safety:
+      'Whole long-idle session dir; DBs and worktree content preserved in a zstd rescue archive before removal (creds and regenerable trees excluded). Session row closed first so the next inbound message creates a fresh session.',
+    status: 'planned',
+    apply: () => {
+      return tryRunWithStorageCleanupClaim(args.sessPath, () => {
+        if (!isPathInside(args.sessionsRoot, args.sessPath)) {
+          throw new Error(`refusing to archive path outside sessions root: ${args.sessPath}`);
+        }
+        const st = fs.lstatSync(args.sessPath);
+        if (!st.isDirectory() || st.isSymbolicLink()) {
+          throw new Error(`refusing to archive non-directory or symlink: ${args.sessPath}`);
+        }
+        // Close the row BEFORE removal so an inbound racing this reclaim
+        // routes to a fresh session instead of writing into a dying dir.
+        // An 'unavailable' DB at apply time aborts (dir kept).
+        if (args.sessionStatus === 'active') {
+          getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(args.sessionId);
+        }
+        fs.mkdirSync(args.rescuesDir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const archiveName = `${args.sessPath.slice(args.sessionsRoot.length + 1).replace(/[/\\]/g, '__')}-${stamp}.tar.zst`;
+        const archivePath = path.join(args.rescuesDir, archiveName);
+        execFileSync(
+          'tar',
+          [
+            '-I',
+            'zstd -T0',
+            ...ARCHIVE_EXCLUDED_DIR_NAMES.map((name) => `--exclude=${name}`),
+            ...SESSION_ARCHIVE_EXTRA_EXCLUDES.map((name) => `--exclude=${name}`),
+            '-cf',
+            archivePath,
+            '-C',
+            path.dirname(args.sessPath),
+            path.basename(args.sessPath),
+          ],
+          { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60 * 60 * 1000 },
+        );
+        const archiveSt = fs.statSync(archivePath);
+        if (!archiveSt.isFile() || archiveSt.size === 0) {
+          throw new Error(`rescue archive missing or empty: ${archivePath}`);
+        }
+        fs.rmSync(args.sessPath, { recursive: true, force: true });
+      });
+    },
+  };
+}
+
 function collectSessionCacheActions(args: {
   now: number;
   root: string;
@@ -716,6 +817,7 @@ function collectSessionCacheActions(args: {
   const dataRoot = path.dirname(args.root);
   const canonicalArchive = path.join(dataRoot, 'archive.db');
   const canonicalCentral = path.join(dataRoot, 'v2.db');
+  const rescuesDir = path.join(dataRoot, SESSION_RESCUES_DIRNAME);
   let warnedArchiveSourceUnavailable = false;
   let warnedCentralSourceUnavailable = false;
   for (const groupDirent of safeReaddirDirents(args.root)) {
@@ -748,6 +850,34 @@ function collectSessionCacheActions(args: {
       if (args.now - lastActivity < args.policy.idleArtifactMs) {
         args.skipped.freshSessions += 1;
         continue;
+      }
+
+      // Long-idle: archive the whole session dir and reclaim it. Requires
+      // BOTH the on-disk signal and the central-DB row (when one exists) to
+      // agree the session has been quiet past the reclaim threshold; an
+      // unreadable central DB disables reclaim entirely (fail closed) while
+      // the ordinary cache pruning below continues to work.
+      const row = centralSessionRow(sessionId);
+      if (row !== 'unavailable') {
+        const dbActivityMs = row ? parseSqliteUtc(row.last_activity ?? '') : NaN;
+        const newestActivity = Number.isFinite(dbActivityMs) ? Math.max(lastActivity, dbActivityMs) : lastActivity;
+        if (args.now - newestActivity >= args.policy.worktreeReclaimMs) {
+          const sessionStatus: 'active' | 'closed' | 'orphan' =
+            row === null ? 'orphan' : row.status === 'closed' ? 'closed' : 'active';
+          actions.push(
+            createArchiveSessionAction({
+              id: `session-reclaim:${groupDirent.name}:${sessionId}`,
+              sessionId,
+              sessionStatus,
+              sessPath,
+              sessionsRoot: args.root,
+              rescuesDir,
+              estimatedBytes: dirSizeBytes(sessPath),
+              reason: `session ${sessionStatus === 'active' ? 'idle' : sessionStatus} for at least ${Math.round(args.policy.worktreeReclaimMs / 86400000)}d — archived to ${SESSION_RESCUES_DIRNAME}/ then reclaimed`,
+            }),
+          );
+          continue;
+        }
       }
 
       for (const target of findPrunableArtifactDirs(sessPath)) {
@@ -1049,7 +1179,7 @@ function dockerReclaimableBytes(): Partial<Record<'Images' | 'Containers' | 'Bui
 
 function createDockerAction(args: {
   id: string;
-  kind: Exclude<StorageActionKind, 'delete-cache-dir' | 'delete-derived-file' | 'archive-thread-worktree'>;
+  kind: Exclude<StorageActionKind, 'delete-cache-dir' | 'delete-derived-file' | 'archive-thread-worktree' | 'archive-session'>;
   dockerArgs: string[];
   estimatedBytes: number;
   reason: string;
