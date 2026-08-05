@@ -403,6 +403,29 @@ at that path. Downstream gates — e.g. a release-promotion checklist — consum
 the artifact, never a chat message: durable files can carry gate semantics,
 bot chat cannot.
 
+Two further wrapper-optional artifacts and behaviours:
+
+- `SMOKE_GATE_ACTIVE_FILE` — a live-run marker written on claim, refreshed by
+  `progress`, removed by `finish`. It carries `holdMergesUntil`
+  (`SMOKE_GATE_MERGE_HOLD_SECONDS`, default 90 min from run start) so a merge
+  queue can pause while a run owns the environment without ever stalling on a
+  run that died: the cap expires on its own.
+- `SMOKE_GATE_FRONTEND_PATHS` / `SMOKE_GATE_BACKEND_PATHS` — comma-separated
+  path prefixes a service actually builds from. When a host skips a deploy
+  because nothing under its root changed, that service's live SHA lags the
+  branch head and strict three-way equality can never settle. With paths set,
+  a lagging deploy is accepted only when it is a strict ancestor of the head
+  AND no file changed between them falls under that service's paths — so the
+  deployed artifact is what a fresh deploy would produce. Fail-closed on any
+  fetch error, non-ancestor state, or a truncated compare. The wake payload
+  reports `deployLagAccepted`; the coordinator then freezes the build as a
+  documented SHA **pair** and says so in the run record. Unset = strict
+  equality.
+- A head that stays unsettled beyond `SMOKE_GATE_UNSETTLED_ALERT_SECONDS`
+  (default 45 min) produces exactly one `develop_unsettled` wake naming the
+  failing workflows and lagging deploys — one per SHA, never a re-spam. A red
+  or hung branch must never be silent.
+
 When `SMOKE_GATE_HOLD_FILE` is set, `finish` additionally maintains an
 explicit, default-open block flag for promotion gating: a `NO_GO` verdict
 writes the file, a later `GO` removes it, and `BLOCKED`/`HUMAN_DECISION`
