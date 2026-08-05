@@ -39,6 +39,7 @@ import {
   type ContainerResources,
 } from './container-resources.js';
 import { resolveSpawnProvider } from './provider-fallback.js';
+import { markProviderAvailable } from './db/provider-health.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
@@ -651,6 +652,13 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
       fallbackProvider: providerDecision.provider,
       model: providerDecision.model,
     });
+  }
+  if (!providerDecision.fallbackApplied) {
+    // The window (if any) has expired and we are giving the primary another
+    // go: close out that outage episode. Without this the failure streak
+    // grows monotonically forever, so a provider healthy for weeks would
+    // still open its next outage at the 6h backoff cap instead of 15m.
+    markProviderAvailable(agentGroup.id, providerDecision.primaryProvider);
   }
   // Local shadow: the fallback must beat a stamped session row for THIS spawn
   // without persisting a provider change to the session.
