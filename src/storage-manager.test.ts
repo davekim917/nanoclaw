@@ -59,6 +59,7 @@ describe('storage-manager cache cleanup', () => {
 
   function makeSession(opts: {
     id: string;
+    root?: string;
     pending?: boolean;
     fresh?: boolean;
     trigger?: number;
@@ -66,7 +67,7 @@ describe('storage-manager cache cleanup', () => {
     status?: 'pending' | 'processing';
     processingAck?: boolean;
   }): string {
-    const dir = path.join(tmpRoot, 'ag-1', opts.id);
+    const dir = path.join(opts.root ?? tmpRoot, 'ag-1', opts.id);
     fs.mkdirSync(path.join(dir, 'worktrees', 'repo', '.next', 'cache'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'worktrees', 'repo', '.next', 'cache', 'compiled.bin'), 'next-cache');
     fs.mkdirSync(path.join(dir, 'worktrees', 'repo', '.turbo'), { recursive: true });
@@ -102,6 +103,49 @@ describe('storage-manager cache cleanup', () => {
     return dir;
   }
 
+  function markSessionIdle(dir: string): void {
+    const mtime = (now - 30 * 60 * 60 * 1000) / 1000;
+    for (const name of ['inbound.db', 'outbound.db', 'archive.db', 'central.db']) {
+      const target = path.join(dir, name);
+      if (fs.existsSync(target)) fs.utimesSync(target, mtime, mtime);
+    }
+  }
+
+  function createCanonicalProjectionSources(dataRoot: string): { archivePath: string; centralPath: string } {
+    fs.mkdirSync(dataRoot, { recursive: true });
+    const archivePath = path.join(dataRoot, 'archive.db');
+    const archive = new Database(archivePath);
+    archive.exec('CREATE TABLE messages_archive (id TEXT PRIMARY KEY, text TEXT NOT NULL)');
+    archive.prepare("INSERT INTO messages_archive VALUES ('canonical-history', 'retain this history')").run();
+    archive.close();
+
+    const centralPath = path.join(dataRoot, 'v2.db');
+    const central = new Database(centralPath);
+    central.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY)');
+    central.close();
+    return { archivePath, centralPath };
+  }
+
+  function createSessionProjections(dir: string): void {
+    const archive = new Database(path.join(dir, 'archive.db'));
+    archive.exec('CREATE TABLE messages_archive (id TEXT PRIMARY KEY, text TEXT NOT NULL)');
+    archive.prepare("INSERT INTO messages_archive VALUES ('projection-history', 'old projected history')").run();
+    archive.close();
+
+    const central = new Database(path.join(dir, 'central.db'));
+    central.exec('CREATE TABLE backlog_items (id TEXT PRIMARY KEY)');
+    central.close();
+
+    const outbound = new Database(path.join(dir, 'outbound.db'));
+    outbound.exec('CREATE TABLE processing_ack (message_id TEXT, status TEXT, status_changed TEXT)');
+    outbound.close();
+
+    fs.mkdirSync(path.join(dir, 'codex', 'plugins', 'cache'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'codex', 'plugins', 'cache', 'plugin.json'), 'derived-plugin-cache');
+    fs.writeFileSync(path.join(dir, 'codex', 'auth.json'), 'must-be-retained');
+    markSessionIdle(dir);
+  }
+
   it('estimates regenerable cache dirs and skips sessions with pending work', () => {
     const idleDir = makeSession({ id: 'sess-idle' });
     const pendingDir = makeSession({ id: 'sess-pending', pending: true });
@@ -133,6 +177,121 @@ describe('storage-manager cache cleanup', () => {
     expect(fs.existsSync(path.join(idleDir, 'worktrees', 'repo', '.turbo'))).toBe(false);
     expect(fs.existsSync(path.join(idleDir, 'worktrees', 'repo'))).toBe(true);
     expect(fs.existsSync(path.join(idleDir, 'inbound.db'))).toBe(true);
+  });
+
+  it('removes only rebuildable session projections and Codex plugin caches after verifying canonical sources', () => {
+    const dataRoot = path.join(tmpRoot, 'data');
+    const sessionsRoot = path.join(dataRoot, 'v2-sessions');
+    const canonical = createCanonicalProjectionSources(dataRoot);
+    const idleDir = makeSession({ id: 'sess-derived', root: sessionsRoot });
+    createSessionProjections(idleDir);
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(dataRoot, 'no-threads'),
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 24 * 60 * 60 * 1000 },
+    });
+
+    expect(report.actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: path.join(idleDir, 'codex', 'plugins'),
+          kind: 'delete-cache-dir',
+          status: 'applied',
+        }),
+        expect.objectContaining({
+          path: path.join(idleDir, 'archive.db'),
+          kind: 'delete-derived-file',
+          status: 'applied',
+        }),
+        expect.objectContaining({
+          path: path.join(idleDir, 'central.db'),
+          kind: 'delete-derived-file',
+          status: 'applied',
+        }),
+      ]),
+    );
+    expect(fs.existsSync(path.join(idleDir, 'codex', 'plugins'))).toBe(false);
+    expect(fs.existsSync(path.join(idleDir, 'archive.db'))).toBe(false);
+    expect(fs.existsSync(path.join(idleDir, 'central.db'))).toBe(false);
+
+    expect(fs.existsSync(path.join(idleDir, 'inbound.db'))).toBe(true);
+    expect(fs.existsSync(path.join(idleDir, 'outbound.db'))).toBe(true);
+    expect(fs.existsSync(path.join(idleDir, 'codex', 'auth.json'))).toBe(true);
+    expect(fs.existsSync(path.join(idleDir, 'worktrees', 'repo'))).toBe(true);
+
+    const archive = new Database(canonical.archivePath, { readonly: true });
+    expect(archive.prepare("SELECT text FROM messages_archive WHERE id = 'canonical-history'").get()).toEqual({
+      text: 'retain this history',
+    });
+    archive.close();
+    expect(fs.existsSync(canonical.centralPath)).toBe(true);
+  });
+
+  it('fails closed and retains projections when their canonical sources are unavailable', () => {
+    const dataRoot = path.join(tmpRoot, 'data');
+    const sessionsRoot = path.join(dataRoot, 'v2-sessions');
+    const idleDir = makeSession({ id: 'sess-no-canonical-source', root: sessionsRoot });
+    createSessionProjections(idleDir);
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(dataRoot, 'no-threads'),
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 24 * 60 * 60 * 1000 },
+    });
+
+    expect(report.actions.map((action) => action.path)).not.toContain(path.join(idleDir, 'archive.db'));
+    expect(report.actions.map((action) => action.path)).not.toContain(path.join(idleDir, 'central.db'));
+    expect(report.warnings).toContain(
+      'session archive projections retained: canonical data/archive.db is unavailable or unreadable',
+    );
+    expect(report.warnings).toContain(
+      'session central projections retained: canonical data/v2.db is unavailable or unreadable',
+    );
+    expect(fs.existsSync(path.join(idleDir, 'archive.db'))).toBe(true);
+    expect(fs.existsSync(path.join(idleDir, 'central.db'))).toBe(true);
+    expect(fs.existsSync(path.join(idleDir, 'codex', 'plugins'))).toBe(false);
+
+    const projection = new Database(path.join(idleDir, 'archive.db'), { readonly: true });
+    expect(projection.prepare("SELECT text FROM messages_archive WHERE id = 'projection-history'").get()).toEqual({
+      text: 'old projected history',
+    });
+    projection.close();
+  });
+
+  it('rechecks the canonical archive immediately before deleting its projection', () => {
+    const dataRoot = path.join(tmpRoot, 'data');
+    const sessionsRoot = path.join(dataRoot, 'v2-sessions');
+    const canonical = createCanonicalProjectionSources(dataRoot);
+    const idleDir = makeSession({ id: 'sess-source-disappears', root: sessionsRoot });
+    createSessionProjections(idleDir);
+    const pluginCache = path.join(idleDir, 'codex', 'plugins');
+    const realRmSync = fs.rmSync;
+    const rmSpy = vi.spyOn(fs, 'rmSync').mockImplementation((target, options) => {
+      if (target === pluginCache) realRmSync(canonical.archivePath, { force: true });
+      return realRmSync(target, options);
+    });
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(dataRoot, 'no-threads'),
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 24 * 60 * 60 * 1000 },
+    });
+    rmSpy.mockRestore();
+
+    expect(report.actions.find((action) => action.path === path.join(idleDir, 'archive.db'))).toMatchObject({
+      status: 'skipped',
+    });
+    expect(fs.existsSync(path.join(idleDir, 'archive.db'))).toBe(true);
   });
 
   it('treats only due triggered work as busy', () => {

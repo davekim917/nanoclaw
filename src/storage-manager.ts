@@ -3,11 +3,14 @@
  *
  * Reclaims only regenerable storage:
  *   - package/build caches inside idle session and thread worktrees
+ *   - per-session archive/central database projections rebuilt on container spawn
+ *   - per-session Codex plugin caches rebuilt on container spawn
  *   - stopped containers carrying this NanoClaw install's ownership label
  *   - unused NanoClaw images and bounded Docker builder cache
  *
- * It deliberately does not remove DBs, outboxes, source checkouts, .git
- * directories, or anything attached to a live/in-flight session.
+ * It deliberately does not remove canonical DBs, session inbound/outbound DBs,
+ * source checkouts, .git directories, or anything attached to a live/in-flight
+ * session.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -56,6 +59,7 @@ export type StorageMode = 'dry-run' | 'apply';
 export type StoragePool = 'session-cache' | 'thread-cache' | 'docker';
 export type StorageActionKind =
   | 'delete-cache-dir'
+  | 'delete-derived-file'
   | 'docker-prune-containers'
   | 'docker-prune-images'
   | 'docker-prune-builder-cache';
@@ -570,36 +574,105 @@ export function collectThreadWorktreeActivity(
   return activity;
 }
 
-function createDeleteCacheAction(args: {
+type ArtifactTargetType = 'directory' | 'file';
+
+function createDeleteArtifactAction(args: {
   id: string;
   pool: 'session-cache' | 'thread-cache';
   target: string;
   root: string;
   estimatedBytes: number;
   reason: string;
+  targetType: ArtifactTargetType;
+  safety: string;
+  canApply?: () => boolean;
 }): StorageAction {
   return {
     id: args.id,
     pool: args.pool,
-    kind: 'delete-cache-dir',
+    kind: args.targetType === 'directory' ? 'delete-cache-dir' : 'delete-derived-file',
     path: args.target,
     estimatedBytes: args.estimatedBytes,
     reason: args.reason,
-    safety: 'Regenerable cache directory under an idle NanoClaw-owned session/thread subtree.',
+    safety: args.safety,
     status: 'planned',
     apply: () => {
-      return tryRunWithStorageCleanupClaim(args.root, () => {
+      let allowed = true;
+      const claimed = tryRunWithStorageCleanupClaim(args.root, () => {
+        if (args.canApply && !args.canApply()) {
+          allowed = false;
+          return;
+        }
         if (!isPathInside(args.root, args.target)) {
           throw new Error(`refusing to remove path outside root: ${args.target}`);
         }
         const st = fs.lstatSync(args.target);
-        if (!st.isDirectory() || st.isSymbolicLink()) {
+        if (args.targetType === 'directory' && (!st.isDirectory() || st.isSymbolicLink())) {
           throw new Error(`refusing to remove non-directory or symlink: ${args.target}`);
+        }
+        if (args.targetType === 'file' && (!st.isFile() || st.isSymbolicLink())) {
+          throw new Error(`refusing to remove non-file or symlink: ${args.target}`);
         }
         fs.rmSync(args.target, { recursive: true, force: true });
       });
+      return claimed && allowed;
     },
   };
+}
+
+interface SessionProjectionSources {
+  archiveReady: boolean;
+  centralReady: boolean;
+}
+
+function isReadableSqliteDatabase(dbPath: string, requiredTable?: string): boolean {
+  if (!fs.existsSync(dbPath)) return false;
+  let db: Database.Database | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    if (requiredTable) {
+      const row = db
+        .prepare("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")
+        .get(requiredTable) as { found: number } | undefined;
+      return row?.found === 1;
+    }
+    db.pragma('schema_version');
+    return true;
+  } catch {
+    return false;
+  } finally {
+    db?.close();
+  }
+}
+
+function sessionProjectionSources(sessionsRoot: string): SessionProjectionSources {
+  const dataRoot = path.dirname(sessionsRoot);
+  return {
+    // Archive projections hold conversation history. Require the canonical history table,
+    // not merely a file that happens to open as SQLite, before reclaiming any projection.
+    archiveReady: isReadableSqliteDatabase(path.join(dataRoot, 'archive.db'), 'messages_archive'),
+    // central.db is a per-session projection too. Its canonical source must be readable
+    // before reclamation so cleanup never turns a source-database outage into data loss.
+    centralReady: isReadableSqliteDatabase(path.join(dataRoot, 'v2.db')),
+  };
+}
+
+function regularFileSize(filePath: string): number | null {
+  try {
+    const st = fs.lstatSync(filePath);
+    return st.isFile() && !st.isSymbolicLink() ? st.size : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRealDirectory(dirPath: string): boolean {
+  try {
+    const st = fs.lstatSync(dirPath);
+    return st.isDirectory() && !st.isSymbolicLink();
+  } catch {
+    return false;
+  }
 }
 
 function collectSessionCacheActions(args: {
@@ -608,8 +681,15 @@ function collectSessionCacheActions(args: {
   policy: StoragePolicy;
   isContainerRunning: (sessionId: string) => boolean;
   skipped: StorageReport['skipped'];
+  projectionSources: SessionProjectionSources;
+  warnings: string[];
 }): StorageAction[] {
   const actions: StorageAction[] = [];
+  const dataRoot = path.dirname(args.root);
+  const canonicalArchive = path.join(dataRoot, 'archive.db');
+  const canonicalCentral = path.join(dataRoot, 'v2.db');
+  let warnedArchiveSourceUnavailable = false;
+  let warnedCentralSourceUnavailable = false;
   for (const groupDirent of safeReaddirDirents(args.root)) {
     if (!groupDirent.isDirectory() || groupDirent.isSymbolicLink()) continue;
     const groupPath = path.join(args.root, groupDirent.name);
@@ -645,15 +725,87 @@ function collectSessionCacheActions(args: {
       for (const target of findPrunableArtifactDirs(sessPath)) {
         const estimatedBytes = dirSizeBytes(target);
         actions.push(
-          createDeleteCacheAction({
+          createDeleteArtifactAction({
             id: `session-cache:${groupDirent.name}:${sessionId}:${path.relative(sessPath, target)}`,
             pool: 'session-cache',
             target,
             root: sessPath,
             estimatedBytes,
             reason: `session has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`,
+            targetType: 'directory',
+            safety: 'Regenerable cache directory under an idle NanoClaw-owned session subtree.',
           }),
         );
+      }
+
+      // This exact path is intentionally separate from findPrunableArtifactDirs:
+      // a generic "plugins" directory could be source content, while this one
+      // is Codex's session-local cache and is recreated on every spawn.
+      const codexPluginCache = path.join(sessPath, 'codex', 'plugins');
+      if (isRealDirectory(codexPluginCache)) {
+        actions.push(
+          createDeleteArtifactAction({
+            id: `session-cache:${groupDirent.name}:${sessionId}:codex/plugins`,
+            pool: 'session-cache',
+            target: codexPluginCache,
+            root: sessPath,
+            estimatedBytes: dirSizeBytes(codexPluginCache),
+            reason: `session has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`,
+            targetType: 'directory',
+            safety: 'Codex session plugin cache only; recreated from mounted /workspace/plugins on container spawn.',
+          }),
+        );
+      }
+
+      const projectionReason = `session has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`;
+      const archiveProjection = path.join(sessPath, 'archive.db');
+      const archiveProjectionBytes = regularFileSize(archiveProjection);
+      if (archiveProjectionBytes !== null) {
+        if (args.projectionSources.archiveReady) {
+          actions.push(
+            createDeleteArtifactAction({
+              id: `session-projection:${groupDirent.name}:${sessionId}:archive.db`,
+              pool: 'session-cache',
+              target: archiveProjection,
+              root: sessPath,
+              estimatedBytes: archiveProjectionBytes,
+              reason: projectionReason,
+              targetType: 'file',
+              safety:
+                'Per-session archive projection only; rebuilt from the readable canonical data/archive.db on container spawn.',
+              canApply: () => isReadableSqliteDatabase(canonicalArchive, 'messages_archive'),
+            }),
+          );
+        } else if (!warnedArchiveSourceUnavailable) {
+          args.warnings.push(
+            'session archive projections retained: canonical data/archive.db is unavailable or unreadable',
+          );
+          warnedArchiveSourceUnavailable = true;
+        }
+      }
+
+      const centralProjection = path.join(sessPath, 'central.db');
+      const centralProjectionBytes = regularFileSize(centralProjection);
+      if (centralProjectionBytes !== null) {
+        if (args.projectionSources.centralReady) {
+          actions.push(
+            createDeleteArtifactAction({
+              id: `session-projection:${groupDirent.name}:${sessionId}:central.db`,
+              pool: 'session-cache',
+              target: centralProjection,
+              root: sessPath,
+              estimatedBytes: centralProjectionBytes,
+              reason: projectionReason,
+              targetType: 'file',
+              safety:
+                'Per-session central projection only; rebuilt from the readable canonical data/v2.db on container spawn.',
+              canApply: () => isReadableSqliteDatabase(canonicalCentral),
+            }),
+          );
+        } else if (!warnedCentralSourceUnavailable) {
+          args.warnings.push('session central projections retained: canonical data/v2.db is unavailable or unreadable');
+          warnedCentralSourceUnavailable = true;
+        }
       }
     }
   }
@@ -699,13 +851,15 @@ function collectThreadCacheActions(args: {
     for (const target of findPrunableArtifactDirs(worktreeDir)) {
       const estimatedBytes = dirSizeBytes(target);
       actions.push(
-        createDeleteCacheAction({
+        createDeleteArtifactAction({
           id: `thread-cache:${threadDirent.name}:${path.relative(worktreeDir, target)}`,
           pool: 'thread-cache',
           target,
           root: worktreeDir,
           estimatedBytes,
           reason: `thread worktree has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`,
+          targetType: 'directory',
+          safety: 'Regenerable cache directory under an idle NanoClaw-owned thread worktree subtree.',
         }),
       );
     }
@@ -764,7 +918,7 @@ function dockerReclaimableBytes(): Partial<Record<'Images' | 'Containers' | 'Bui
 
 function createDockerAction(args: {
   id: string;
-  kind: Exclude<StorageActionKind, 'delete-cache-dir'>;
+  kind: Exclude<StorageActionKind, 'delete-cache-dir' | 'delete-derived-file'>;
   dockerArgs: string[];
   estimatedBytes: number;
   reason: string;
@@ -1225,7 +1379,15 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
     ? collectDockerActions(policy, now, mode, warnings, usageBefore, options.force === true)
     : { actions: [], images: [] };
   const actions: StorageAction[] = [
-    ...collectSessionCacheActions({ now, root: sessionsRoot, policy, isContainerRunning, skipped }),
+    ...collectSessionCacheActions({
+      now,
+      root: sessionsRoot,
+      policy,
+      isContainerRunning,
+      skipped,
+      projectionSources: sessionProjectionSources(sessionsRoot),
+      warnings,
+    }),
     ...collectThreadCacheActions({
       now,
       root: threadsRoot,
