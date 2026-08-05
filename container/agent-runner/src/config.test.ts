@@ -27,11 +27,46 @@ describe('parseRawConfig provider fallback bridge', () => {
     expect(config.model).toBe('claude-opus-5[1m]');
   });
 
-  it('a provider override alone does not strip the declared model', () => {
+  it('drops the primary provider-specific fields under an override — they are the wrong provider now', () => {
+    // Live crash 2026-08-05: a codex group fell back to claude and every
+    // spawn died with `Unrecognized key: "reasoning_effort"` — the file's codex
+    // providerConfig was parsed by claude's strict schema. A codex model id
+    // reaching the Anthropic API is the same class of failure.
     process.env.NANOCLAW_PROVIDER_OVERRIDE = 'claude';
-    const config = parseRawConfig({ ...BASE });
+    const config = parseRawConfig({
+      ...BASE,
+      effort: 'high',
+      providerConfig: { model: 'gpt-5.6-sol', reasoning_effort: 'high' },
+    });
     expect(config.provider).toBe('claude');
+    expect(config.providerConfig).toEqual({});
+    expect(config.model).toBeUndefined();
+    expect(config.effort).toBeUndefined();
+  });
+
+  it('takes model and effort from the matching fallback declaration', () => {
+    process.env.NANOCLAW_PROVIDER_OVERRIDE = 'claude';
+    const config = parseRawConfig({
+      ...BASE,
+      effort: 'xhigh',
+      providerConfig: { reasoning_effort: 'xhigh' },
+      providerFallback: { provider: 'claude', model: 'claude-opus-5[1m]', effort: 'high' },
+    });
+    expect(config.model).toBe('claude-opus-5[1m]');
+    expect(config.effort).toBe('high');
+    expect(config.providerConfig).toEqual({});
+  });
+
+  it('keeps the file settings when no override is in play', () => {
+    clearEnv();
+    const config = parseRawConfig({
+      ...BASE,
+      effort: 'high',
+      providerConfig: { reasoning_effort: 'high' },
+    });
     expect(config.model).toBe('gpt-5.6-sol');
+    expect(config.effort).toBe('high');
+    expect(config.providerConfig).toEqual({ reasoning_effort: 'high' });
   });
 
   it('surfaces providerFallback so the loop can tell a recoverable outage from a dead end', () => {

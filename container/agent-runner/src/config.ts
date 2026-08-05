@@ -70,8 +70,19 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   const env = typeof process !== 'undefined' ? process.env : undefined;
   const envProvider = env?.NANOCLAW_PROVIDER_OVERRIDE;
   const envModel = env?.NANOCLAW_MODEL_OVERRIDE;
+  const fileProvider = (raw.provider as string) || 'claude';
+  const provider = envProvider || fileProvider;
+  // `providerConfig`, `model` and `effort` in the file describe the PRIMARY
+  // provider. Under a spawn-time override they are the wrong provider's
+  // settings, and the provider config schemas are strict — codex's
+  // `reasoning_effort` key is a fatal boot error under claude, which turned
+  // every fallback spawn into an instant crash loop. Take the declared
+  // fallback's own model/effort instead; drop the primary's sticky config.
+  const declaredFallback = raw.providerFallback as RunnerConfig['providerFallback'];
+  const onFallback = provider !== fileProvider;
+  const activeFallback = onFallback && declaredFallback?.provider === provider ? declaredFallback : undefined;
   return {
-    provider: envProvider || (raw.provider as string) || 'claude',
+    provider,
     assistantName: envAssistantName || (raw.assistantName as string) || '',
     groupName: (raw.groupName as string) || '',
     agentGroupId: (raw.agentGroupId as string) || '',
@@ -80,10 +91,10 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
     excludeMcpServers: Array.isArray(raw.excludeMcpServers)
       ? raw.excludeMcpServers.filter((name): name is string => typeof name === 'string')
       : [],
-    providerConfig: (raw.providerConfig as Record<string, unknown>) ?? {},
-    model: envModel || (raw.model as string) || undefined,
-    effort: (raw.effort as string) || undefined,
-    providerFallback: (raw.providerFallback as RunnerConfig['providerFallback']) || undefined,
+    providerConfig: onFallback ? {} : ((raw.providerConfig as Record<string, unknown>) ?? {}),
+    model: envModel || activeFallback?.model || (onFallback ? undefined : (raw.model as string)) || undefined,
+    effort: activeFallback?.effort || (onFallback ? undefined : (raw.effort as string)) || undefined,
+    providerFallback: declaredFallback || undefined,
   };
 }
 

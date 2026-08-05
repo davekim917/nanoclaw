@@ -610,6 +610,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // skipped task rows were marked completed by the pre-task block, and
     // we only claimed the rows that actually reach the prompt.
     const processingIds = keptIds;
+    // Set when this batch is being handed to the fallback provider: the rows
+    // must stay claimed-but-unfinished so the respawned container answers
+    // them. Marking them completed would leave the reader with silence.
+    let deferredToFallback = false;
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
@@ -1057,6 +1061,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           err instanceof Error ? err.message : String(err),
           quotaExhausted,
         );
+      deferredToFallback = quotaHandled;
 
       // Only surface the error to the user if we couldn't recover inline.
       if (!recovered && !quotaHandled) {
@@ -1094,10 +1099,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     await checkpointTurnEnd(autosaveWorktrees);
 
     // Ensure completed even if processQuery ended without a result event
-    // (e.g. stream closed unexpectedly).
-    markCompleted(processingIds);
-
-    log(`Completed ${processingIds.length} message(s) (commands=${commandIds.length}, skipped=${skipped.length})`);
+    // (e.g. stream closed unexpectedly). The one exception is a batch handed
+    // to the fallback provider: those rows keep their 'processing' claim,
+    // which the next container's clearStaleProcessingAcks() releases, so the
+    // fallback answers the message the primary could not.
+    if (deferredToFallback) {
+      log(`Deferred ${processingIds.length} message(s) to the fallback provider — not marking completed`);
+    } else {
+      markCompleted(processingIds);
+      log(`Completed ${processingIds.length} message(s) (commands=${commandIds.length}, skipped=${skipped.length})`);
+    }
   }
 }
 
