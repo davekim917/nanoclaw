@@ -137,6 +137,13 @@ export function configureOutboundDb(outbound: Database): void {
     (outbound.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((c) => c.name),
   );
   const forwardColumns: Array<[string, string]> = [
+    // The tool-in-flight columns were RENAMED in the CREATE TABLE
+    // (last_tool/last_tool_at/last_tool_timeout_ms -> these) without a
+    // migration, so pre-rename DBs lack them; the stale last_* columns
+    // stay behind as harmless dead weight.
+    ['current_tool', 'TEXT'],
+    ['tool_declared_timeout_ms', 'INTEGER'],
+    ['tool_started_at', 'TEXT'],
     ['provider_status', 'TEXT'],
     ['provider_last_event_at', 'TEXT'],
     ['provider_last_probe_at', 'TEXT'],
@@ -149,6 +156,11 @@ export function configureOutboundDb(outbound: Database): void {
     ['memory_oom_events', 'INTEGER'],
     ['memory_oom_kill_events', 'INTEGER'],
     ['memory_telemetry_at', 'TEXT'],
+    // Added to CREATE TABLE without a backfill entry — any outbound.db older
+    // than the column made every INSERT throw at boot, so the session
+    // crash-looped on each sweep wake and never answered again (observed
+    // live: a channel-root session silent for 3+ weeks).
+    ['updated_at', "TEXT NOT NULL DEFAULT ''"],
   ];
   for (const [name, type] of forwardColumns) {
     if (!containerCols.has(name)) outbound.exec(`ALTER TABLE container_state ADD COLUMN ${name} ${type}`);
