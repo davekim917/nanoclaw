@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { _resetConfig, loadConfig } from './config.js';
 import {
   clearStaleProcessingAcks,
   closeSessionDb,
@@ -1688,6 +1689,17 @@ describe('handleEvent — terminal-error visibility (Layer-1 fix)', () => {
   // reaped the container. The fix surfaces the error on the user's
   // delivery channel as a normal chat outbound. Retryable errors stay
   // quiet (the runner retries upstream); only the terminal branch posts.
+
+  // A quota-classified error consults the config to decide whether a
+  // fallback provider exists. In the container that is always loaded before
+  // the loop runs; here it has to be loaded explicitly. loadConfig falls back
+  // to defaults when the file is absent, which is the "no fallback declared"
+  // case these tests assume.
+  beforeEach(() => {
+    _resetConfig();
+    loadConfig();
+  });
+
   function routingFixture() {
     return {
       channelType: 'slack',
