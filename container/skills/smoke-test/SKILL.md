@@ -392,6 +392,12 @@ bash /workspace/agent/smoke-develop-gate.sh progress <run-id>
 An `ok:false` response means this run is no longer the active one (reclaimed
 or finished): stop the campaign immediately instead of double-running the SHA.
 
+When `SMOKE_GATE_PUBLISH_FILE` is set in the wrapper, `finish` also writes the
+terminal verdict as a small JSON artifact (`{sha, runId, verdict, finishedAt}`)
+at that path. Downstream gates — e.g. a release-promotion checklist — consume
+the artifact, never a chat message: durable files can carry gate semantics,
+bot chat cannot.
+
 On every terminal verdict, the coordinator closes the gate atomically:
 
 ```bash

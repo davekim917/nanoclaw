@@ -127,4 +127,13 @@ bash "$GATE" poll | jq -e '
   .wakeAgent == true and .data.recovery == true
 ' >/dev/null
 
+# 14. finish publishes the verdict artifact when SMOKE_GATE_PUBLISH_FILE is set.
+PUBLISH="$STATE_DIR/pub/latest-verdict.json"
+SMOKE_GATE_PUBLISH_FILE="$PUBLISH" bash "$GATE" finish "$BUILD_SHA" "$RUN_ID2" NO_GO \
+  | jq -e '.ok == true' >/dev/null
+jq -e --arg sha "$BUILD_SHA" --arg run "$RUN_ID2" '
+  .schemaVersion == 1 and .sha == $sha and .runId == $run and
+  .verdict == "NO_GO" and (.finishedAt | type == "string")
+' "$PUBLISH" >/dev/null
+
 echo "smoke develop gate tests passed"

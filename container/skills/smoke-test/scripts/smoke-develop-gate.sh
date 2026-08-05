@@ -25,6 +25,11 @@ ACTIVE_STALE_SECONDS="${SMOKE_GATE_ACTIVE_STALE_SECONDS:-14400}"
 # this is treated as dead — catches containers killed at spawn without
 # waiting out the hard ceiling.
 PROGRESS_STALE_SECONDS="${SMOKE_GATE_PROGRESS_STALE_SECONDS:-1800}"
+# Optional: on finish, additionally publish the terminal verdict as a small
+# JSON artifact at this path (e.g. a shared workgroup file). Downstream
+# gates (release promotion) read the artifact — durable file, not chat —
+# so a bot message can never carry gate authority.
+PUBLISH_FILE="${SMOKE_GATE_PUBLISH_FILE:-}"
 
 mkdir -p "$STATE_DIR"
 exec 9>"$LOCK_FILE"
@@ -111,6 +116,13 @@ if [ "$COMMAND" = "finish" ]; then
      .candidateSha=null |
      .candidateFirstSeen=null' <<<"$STATE")"
   write_state "$STATE"
+  if [ -n "$PUBLISH_FILE" ]; then
+    mkdir -p "$(dirname "$PUBLISH_FILE")"
+    PUB_TMP="$(mktemp "$(dirname "$PUBLISH_FILE")/.latest-verdict.XXXXXX")"
+    jq -cn --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
+      '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now}' > "$PUB_TMP"
+    mv "$PUB_TMP" "$PUBLISH_FILE"
+  fi
   jq -cn --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" \
     '{ok:true,finishedSha:$sha,runId:$run,verdict:$verdict}'
   exit 0
