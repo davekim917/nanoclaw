@@ -305,20 +305,44 @@ plainly; do not say the bug is fixed in the environment.
 
 ## 8. Report one verdict
 
-Post a compact channel summary and attach the detailed manifest/evidence:
+Outcome tokens (`PASS`, `NO_GO`, `BLOCKED_BUILD_IDENTITY`, `CLEAR`, finding
+IDs) are machine values. They belong on machine surfaces only: the gate
+`finish` arguments, JSON markers, and run-directory records. A chat message a
+human reads never shows a bare token — it shows the translation:
+
+| Machine token | Chat language |
+|---|---|
+| `PASS` | ✅ Cleared — everything tested held |
+| `PASS_WITH_GAPS` | 🟡 Cleared where tested — named surfaces untested |
+| `FAIL` | 🔴 Confirmed defects |
+| `BLOCKED` | ⛔ Could not test honestly |
+| `GO` | Safe to ship |
+| `NO_GO` | Do not ship this build |
+| `HUMAN_DECISION` | Needs a human call |
+| `CLEAR` (challenger) | ✅ Challenge found no material contradiction |
+| `DISSENT` (challenger) | ⚠️ Challenge disputes specific findings |
+| `BLOCKED` (challenger) | ⛔ Challenge could not verify |
+
+Reason codes become plain sentences — "the deployed build changed mid-run, so
+the frozen build could no longer be proven", never `BLOCKED_BUILD_IDENTITY`
+in prose. The run ID and short SHA stay verbatim (they anchor the thread).
+
+Post a compact, human-formatted channel summary (platform bold/bullets, no
+key-value dump) and attach the detailed manifest/evidence plus the key
+screenshots:
 
 ```text
-SMOKE <run_id> — PASS | PASS_WITH_GAPS | FAIL | BLOCKED
-Build: <sha>  Environment: <url>  Scope: <feature>
-Coverage: <executed>/<planned>; <passed> pass, <failed> fail,
-          <blocked> blocked, <skipped> skipped
-Tests: <exact counts and limitations>
-Findings: <confirmed/refuted/reclassified/blocked by severity>
-Fixes: <PRs and deployed SHAs, or none>
-Evidence: <artifact/index link>
-Frontend proof: <journeys completed, screenshots, viewport coverage>
-Untested: <explicit list>
-Ship recommendation: GO | NO_GO | HUMAN_DECISION, with one sentence why
+**Smoke <run_id> — <chat language from the table>**
+*<one-sentence reason a non-operator understands>*
+- Build `<sha12>` on <environment> — <scope in words>
+- Coverage: ran <executed> of <planned> checks (<passed> passed, <failed>
+  failed, <blocked> blocked) — plus exact test counts and limitations
+- Frontend: <journeys completed>, <n> screenshots (attached)
+- Findings: <each in one plain-language line with severity, or "none confirmed">
+- Fixes: <PRs and deployed SHAs, or none>
+- Untested: <explicit list, or "nothing in scope">
+- Challenge: <challenger chat language> — <one clause of substance>
+**Recommendation: <chat language> — <one sentence why>**
 ```
 
 The coordinator synthesizes recorded evidence; it must not invent a result,
