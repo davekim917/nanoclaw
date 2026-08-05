@@ -259,7 +259,7 @@ Use one frontier adjudicator only when at least one condition holds:
 First raise the existing frontier parent's effort: the coordinator may use Opus
 xhigh and the challenger may use Sol xhigh. If the dispute remains
 cross-provider or specification authority is still unclear, the coordinator
-dispatches its native `qa-adjudicator` role — Claude Fable 5 at xhigh effort —
+dispatches its native `qa-adjudicator` role — Claude Fable 5 at high effort —
 exactly once per dispute. The challenger requests adjudication through the
 coordinator; it never spawns the adjudicator itself. Do not run every frontier
 model routinely. Give the adjudicator the frozen run record, full finding
