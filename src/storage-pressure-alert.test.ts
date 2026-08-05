@@ -37,6 +37,7 @@ function report(usagePct: number): StorageReport {
       cleanupThresholdPct: 85,
       admissionRefusePct: 90,
       idleArtifactMs: 1,
+      worktreeReclaimMs: 1,
       scanCadenceMs: 1,
       dockerPruneCadenceMs: 21_600_000,
       dockerBuildCacheUnusedFor: '168h',
@@ -121,6 +122,36 @@ describe('storage pressure administrator alerts', () => {
     await handleStoragePressureAlert(report(93), now + 120_000);
 
     expect(mocks.deliver).toHaveBeenCalledTimes(2);
+  });
+
+  it('alerts through exactly ONE bot even when the owner has identities on every platform', async () => {
+    mocks.roleRows = [
+      { user_id: 'slack-a:owner' },
+      { user_id: 'slack-b:owner' },
+      { user_id: 'discord:owner' },
+    ];
+    try {
+      await handleStoragePressureAlert(report(93), now);
+      expect(mocks.deliver).toHaveBeenCalledTimes(1);
+      expect(mocks.ensureUserDm).toHaveBeenCalledTimes(1);
+    } finally {
+      mocks.roleRows = [{ user_id: 'discord:owner-1' }];
+    }
+  });
+
+  it('fails over to the next identity only when the first is unreachable', async () => {
+    mocks.roleRows = [{ user_id: 'slack-a:owner' }, { user_id: 'discord:owner' }];
+    mocks.ensureUserDm.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      channel_type: 'discord',
+      platform_id: 'dm-owner-1',
+    });
+    try {
+      await handleStoragePressureAlert(report(93), now);
+      expect(mocks.deliver).toHaveBeenCalledTimes(1);
+      expect(mocks.ensureUserDm).toHaveBeenCalledTimes(2);
+    } finally {
+      mocks.roleRows = [{ user_id: 'discord:owner-1' }];
+    }
   });
 
   it('fails safely when adapters or administrators are unreachable', async () => {

@@ -368,6 +368,104 @@ describe('storage-manager cache cleanup', () => {
   });
 });
 
+describe('storage-manager thread worktree archive-then-reclaim', () => {
+  let tmpRoot: string;
+  const now = Date.parse('2026-06-30T00:00:00.000Z');
+  const DAY = 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetStorageManagerThrottleForTesting();
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-threads-'));
+    mockExecFileSync.mockImplementation((cmd: string, cmdArgs?: unknown) => {
+      if (cmd === 'df') {
+        return 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 900 100 90% /\n';
+      }
+      if (cmd === 'tar') {
+        const argv = cmdArgs as string[];
+        const archivePath = argv[argv.indexOf('-cf') + 1];
+        fs.writeFileSync(archivePath, 'fake-zstd-archive');
+        return '';
+      }
+      throw new Error(`unexpected command ${cmd}`);
+    });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function makeThreadDir(relative: string, idleMs: number): string {
+    const threadDir = path.join(tmpRoot, 'v2-threads', relative);
+    fs.mkdirSync(path.join(threadDir, 'worktrees', 'repo', 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(threadDir, 'worktrees', 'repo', 'notes.md'), 'unpushed human work');
+    fs.writeFileSync(path.join(threadDir, 'worktrees', 'repo', 'node_modules', 'blob.bin'), 'reinstallable');
+    const mtime = (now - idleMs) / 1000;
+    fs.utimesSync(path.join(threadDir, 'worktrees'), mtime, mtime);
+    return threadDir;
+  }
+
+  function runApply() {
+    return getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot: path.join(tmpRoot, 'no-sessions'),
+      threadsRoot: path.join(tmpRoot, 'v2-threads'),
+      includeDocker: false,
+      policy: {
+        filesystemPath: tmpRoot,
+        idleArtifactMs: 1 * DAY,
+        worktreeReclaimMs: 30 * DAY,
+      },
+    });
+  }
+
+  it('archives a 30d-idle thread dir into thread-rescues then removes it, covering the nested layout', () => {
+    const flat = makeThreadDir('flat-thread', 31 * DAY);
+    const nested = makeThreadDir(path.join('wg-example', 'nested-thread'), 40 * DAY);
+
+    const report = runApply();
+
+    const archiveActions = report.actions.filter((a) => a.kind === 'archive-thread-worktree');
+    expect(archiveActions.map((a) => a.status)).toEqual(['applied', 'applied']);
+    expect(fs.existsSync(flat)).toBe(false);
+    expect(fs.existsSync(nested)).toBe(false);
+    const rescues = fs.readdirSync(path.join(tmpRoot, 'thread-rescues'));
+    expect(rescues.some((f) => f.startsWith('flat-thread-') && f.endsWith('.tar.zst'))).toBe(true);
+    expect(rescues.some((f) => f.startsWith('wg-example__nested-thread-'))).toBe(true);
+    // tar was told to skip regenerable trees
+    const tarCall = mockExecFileSync.mock.calls.find((c) => c[0] === 'tar');
+    expect(tarCall?.[1]).toContain('--exclude=node_modules');
+  });
+
+  it('keeps a merely cache-idle thread dir on the pruning path, not the archive path', () => {
+    const threadDir = makeThreadDir('young-thread', 2 * DAY);
+
+    const report = runApply();
+
+    expect(report.actions.filter((a) => a.kind === 'archive-thread-worktree')).toEqual([]);
+    expect(fs.existsSync(path.join(threadDir, 'worktrees', 'repo', 'notes.md'))).toBe(true);
+    expect(fs.existsSync(path.join(threadDir, 'worktrees', 'repo', 'node_modules'))).toBe(false);
+  });
+
+  it('keeps the thread dir untouched when the archive cannot be produced', () => {
+    const threadDir = makeThreadDir('doomed-thread', 31 * DAY);
+    mockExecFileSync.mockImplementation((cmd: string) => {
+      if (cmd === 'df') {
+        return 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 900 100 90% /\n';
+      }
+      if (cmd === 'tar') throw new Error('zstd: not enough space');
+      throw new Error(`unexpected command ${cmd}`);
+    });
+
+    const report = runApply();
+
+    const action = report.actions.find((a) => a.kind === 'archive-thread-worktree');
+    expect(action?.status).toBe('failed');
+    expect(fs.existsSync(path.join(threadDir, 'worktrees', 'repo', 'notes.md'))).toBe(true);
+  });
+});
+
 describe('storage-manager Docker cleanup', () => {
   const now = Date.parse('2026-07-19T00:00:00.000Z');
   let images: Array<Record<string, unknown>>;

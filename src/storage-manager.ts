@@ -43,6 +43,25 @@ const DEFAULT_CLEANUP_TARGET_MARGIN_PCT = 3;
 const DEFAULT_EMERGENCY_RETRY_SECONDS = 60;
 const DEFAULT_IMAGE_RETENTION_HOURS = 168;
 const DEFAULT_LEGACY_IMAGE_GRACE_HOURS = 168;
+// Archive-then-reclaim: a thread worktree dir idle this long is tarred
+// (minus regenerable dirs) into data/thread-rescues/ and then removed.
+// Owner-approved policy 2026-08-05; 47GB of never-reclaimed checkouts
+// (oldest from May) motivated it.
+const DEFAULT_WORKTREE_RECLAIM_DAYS = 30;
+export const THREAD_RESCUES_DIRNAME = 'thread-rescues';
+// Regenerable trees excluded from rescue archives — pure reinstallable weight.
+const ARCHIVE_EXCLUDED_DIR_NAMES = [
+  'node_modules',
+  '.pnpm-store',
+  '.turbo',
+  '.cache',
+  '.next',
+  'dist',
+  'build',
+  'coverage',
+  '__pycache__',
+  '.venv',
+];
 
 const parsedIdleHours = Number(process.env.SESSION_ARTIFACT_IDLE_HOURS);
 export const SESSION_ARTIFACT_IDLE_MS =
@@ -60,6 +79,7 @@ export type StoragePool = 'session-cache' | 'thread-cache' | 'docker';
 export type StorageActionKind =
   | 'delete-cache-dir'
   | 'delete-derived-file'
+  | 'archive-thread-worktree'
   | 'docker-prune-containers'
   | 'docker-prune-images'
   | 'docker-prune-builder-cache';
@@ -70,6 +90,8 @@ export interface StoragePolicy {
   cleanupThresholdPct: number;
   admissionRefusePct: number;
   idleArtifactMs: number;
+  /** Archive-then-reclaim threshold for whole thread worktree dirs. */
+  worktreeReclaimMs: number;
   scanCadenceMs: number;
   dockerPruneCadenceMs: number;
   dockerBuildCacheUnusedFor: string;
@@ -331,6 +353,12 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     cleanupThresholdPct: cleanupThreshold,
     admissionRefusePct: admissionRefuse,
     idleArtifactMs: idleHours * 60 * 60 * 1000,
+    worktreeReclaimMs:
+      parsePositiveNumber(process.env.NANOCLAW_THREAD_WORKTREE_RECLAIM_DAYS, DEFAULT_WORKTREE_RECLAIM_DAYS) *
+      24 *
+      60 *
+      60 *
+      1000,
     scanCadenceMs: scanHours * 60 * 60 * 1000,
     dockerPruneCadenceMs: dockerPruneHours * 60 * 60 * 1000,
     dockerBuildCacheUnusedFor:
@@ -812,6 +840,93 @@ function collectSessionCacheActions(args: {
   return actions;
 }
 
+/**
+ * Enumerate thread dirs across BOTH on-disk layouts:
+ *   flat:   <root>/<threadKey>/worktrees
+ *   nested: <root>/wg-<workgroup>/<threadKey>/worktrees   (shared-FS rework)
+ * The pre-rework collector only looked at the flat layout, which made the
+ * entire nested population invisible to cleanup (observed live: 47GB of
+ * never-reclaimed checkouts, oldest 3 months).
+ */
+function* threadDirs(root: string): Generator<{ threadDir: string; label: string }> {
+  for (const dirent of safeReaddirDirents(root)) {
+    if (!dirent.isDirectory() || dirent.isSymbolicLink()) continue;
+    const direct = path.join(root, dirent.name);
+    if (fs.existsSync(path.join(direct, 'worktrees'))) {
+      yield { threadDir: direct, label: dirent.name };
+      continue;
+    }
+    for (const nested of safeReaddirDirents(direct)) {
+      if (!nested.isDirectory() || nested.isSymbolicLink()) continue;
+      const nestedDir = path.join(direct, nested.name);
+      if (fs.existsSync(path.join(nestedDir, 'worktrees'))) {
+        yield { threadDir: nestedDir, label: `${dirent.name}/${nested.name}` };
+      }
+    }
+  }
+}
+
+/**
+ * Archive-then-reclaim one whole thread dir: tar (zstd) the checkout minus
+ * regenerable trees into <dataRoot>/thread-rescues/, verify the archive is a
+ * non-empty file, and only then remove the thread dir. Any tar failure keeps
+ * the dir untouched — the archive is the license to delete.
+ */
+function createArchiveThreadWorktreeAction(args: {
+  id: string;
+  threadDir: string;
+  threadsRoot: string;
+  rescuesDir: string;
+  estimatedBytes: number;
+  reason: string;
+}): StorageAction {
+  return {
+    id: args.id,
+    pool: 'thread-cache',
+    kind: 'archive-thread-worktree',
+    path: args.threadDir,
+    estimatedBytes: args.estimatedBytes,
+    reason: args.reason,
+    safety:
+      'Whole idle thread dir; source and untracked files preserved in a zstd rescue archive before removal. Regenerable trees (node_modules, build caches) excluded from the archive.',
+    status: 'planned',
+    apply: () => {
+      return tryRunWithStorageCleanupClaim(args.threadDir, () => {
+        if (!isPathInside(args.threadsRoot, args.threadDir)) {
+          throw new Error(`refusing to archive path outside threads root: ${args.threadDir}`);
+        }
+        const st = fs.lstatSync(args.threadDir);
+        if (!st.isDirectory() || st.isSymbolicLink()) {
+          throw new Error(`refusing to archive non-directory or symlink: ${args.threadDir}`);
+        }
+        fs.mkdirSync(args.rescuesDir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const archiveName = `${args.threadDir.slice(args.threadsRoot.length + 1).replace(/[/\\]/g, '__')}-${stamp}.tar.zst`;
+        const archivePath = path.join(args.rescuesDir, archiveName);
+        execFileSync(
+          'tar',
+          [
+            '-I',
+            'zstd -T0',
+            ...ARCHIVE_EXCLUDED_DIR_NAMES.map((name) => `--exclude=${name}`),
+            '-cf',
+            archivePath,
+            '-C',
+            path.dirname(args.threadDir),
+            path.basename(args.threadDir),
+          ],
+          { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60 * 60 * 1000 },
+        );
+        const archiveSt = fs.statSync(archivePath);
+        if (!archiveSt.isFile() || archiveSt.size === 0) {
+          throw new Error(`rescue archive missing or empty: ${archivePath}`);
+        }
+        fs.rmSync(args.threadDir, { recursive: true, force: true });
+      });
+    },
+  };
+}
+
 function collectThreadCacheActions(args: {
   now: number;
   root: string;
@@ -820,9 +935,9 @@ function collectThreadCacheActions(args: {
   skipped: StorageReport['skipped'];
 }): StorageAction[] {
   const actions: StorageAction[] = [];
-  for (const threadDirent of safeReaddirDirents(args.root)) {
-    if (!threadDirent.isDirectory() || threadDirent.isSymbolicLink()) continue;
-    const worktreeDir = path.join(args.root, threadDirent.name, 'worktrees');
+  const rescuesDir = path.join(path.dirname(args.root), THREAD_RESCUES_DIRNAME);
+  for (const { threadDir, label } of threadDirs(args.root)) {
+    const worktreeDir = path.join(threadDir, 'worktrees');
     let st: fs.Stats;
     try {
       st = fs.statSync(worktreeDir);
@@ -848,11 +963,27 @@ function collectThreadCacheActions(args: {
       continue;
     }
 
+    // Long-idle: archive the whole thread dir and reclaim it. Emitting this
+    // INSTEAD of per-cache deletes — the removal covers the caches anyway.
+    if (args.now - lastActivity >= args.policy.worktreeReclaimMs) {
+      actions.push(
+        createArchiveThreadWorktreeAction({
+          id: `thread-worktree:${label}`,
+          threadDir,
+          threadsRoot: args.root,
+          rescuesDir,
+          estimatedBytes: dirSizeBytes(threadDir),
+          reason: `thread worktree idle for at least ${Math.round(args.policy.worktreeReclaimMs / 86400000)}d — archived to ${THREAD_RESCUES_DIRNAME}/ then reclaimed`,
+        }),
+      );
+      continue;
+    }
+
     for (const target of findPrunableArtifactDirs(worktreeDir)) {
       const estimatedBytes = dirSizeBytes(target);
       actions.push(
         createDeleteArtifactAction({
-          id: `thread-cache:${threadDirent.name}:${path.relative(worktreeDir, target)}`,
+          id: `thread-cache:${label}:${path.relative(worktreeDir, target)}`,
           pool: 'thread-cache',
           target,
           root: worktreeDir,
@@ -918,7 +1049,7 @@ function dockerReclaimableBytes(): Partial<Record<'Images' | 'Containers' | 'Bui
 
 function createDockerAction(args: {
   id: string;
-  kind: Exclude<StorageActionKind, 'delete-cache-dir' | 'delete-derived-file'>;
+  kind: Exclude<StorageActionKind, 'delete-cache-dir' | 'delete-derived-file' | 'archive-thread-worktree'>;
   dockerArgs: string[];
   estimatedBytes: number;
   reason: string;

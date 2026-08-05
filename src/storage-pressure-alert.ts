@@ -82,6 +82,11 @@ export async function handleStoragePressureAlert(report: StorageReport, now = Da
 
   const text = alertText(report);
   let delivered = 0;
+  // One alert through ONE bot. The owner typically holds a distinct user_id
+  // per platform instance, so delivering to every owner/admin row fanned the
+  // SAME text out through every wired bot (observed live: one pressure
+  // episode -> a DM from every agent). Recipients are ordered owner-first;
+  // later rows are failover only.
   for (const recipient of recipients) {
     try {
       const dm = await ensureUserDm(recipient.user_id);
@@ -91,6 +96,7 @@ export async function handleStoragePressureAlert(report: StorageReport, now = Da
       }
       await adapter.deliver(dm.channel_type, dm.platform_id, null, 'chat', JSON.stringify({ text }));
       delivered += 1;
+      break;
     } catch (err) {
       log.warn('storage-manager: pressure alert delivery failed', { userId: recipient.user_id, err });
     }
