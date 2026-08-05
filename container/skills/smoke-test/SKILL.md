@@ -398,6 +398,14 @@ at that path. Downstream gates — e.g. a release-promotion checklist — consum
 the artifact, never a chat message: durable files can carry gate semantics,
 bot chat cannot.
 
+When `SMOKE_GATE_HOLD_FILE` is set, `finish` additionally maintains an
+explicit, default-open block flag for promotion gating: a `NO_GO` verdict
+writes the file, a later `GO` removes it, and `BLOCKED`/`HUMAN_DECISION`
+leave it untouched (an infra-blocked run neither raises a false hold nor
+clears a real one). Downstream rule: flag present → automatic hold on
+promotion; flag absent → no smoke objection. Absence semantics make rollout
+safe — history predating the smoke watcher never gates anything.
+
 On every terminal verdict, the coordinator closes the gate atomically:
 
 ```bash

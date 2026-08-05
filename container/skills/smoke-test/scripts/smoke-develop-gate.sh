@@ -30,6 +30,12 @@ PROGRESS_STALE_SECONDS="${SMOKE_GATE_PROGRESS_STALE_SECONDS:-1800}"
 # gates (release promotion) read the artifact — durable file, not chat —
 # so a bot message can never carry gate authority.
 PUBLISH_FILE="${SMOKE_GATE_PUBLISH_FILE:-}"
+# Optional explicit block flag (default-open promotion gating): NO_GO writes
+# it, a later GO removes it, BLOCKED/HUMAN_DECISION leave it untouched — an
+# infra-blocked run neither raises a false hold nor clears a real one.
+# Absence of the file means "no smoke objection", so history predating the
+# smoke watcher and watcher downtime never gate a promotion by themselves.
+HOLD_FILE="${SMOKE_GATE_HOLD_FILE:-}"
 
 mkdir -p "$STATE_DIR"
 exec 9>"$LOCK_FILE"
@@ -122,6 +128,21 @@ if [ "$COMMAND" = "finish" ]; then
     jq -cn --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
       '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now}' > "$PUB_TMP"
     mv "$PUB_TMP" "$PUBLISH_FILE"
+  fi
+  if [ -n "$HOLD_FILE" ]; then
+    case "$VERDICT" in
+      NO_GO)
+        mkdir -p "$(dirname "$HOLD_FILE")"
+        HOLD_TMP="$(mktemp "$(dirname "$HOLD_FILE")/.develop-hold.XXXXXX")"
+        jq -cn --arg sha "$SHA" --arg run "$RUN_ID" --arg now "$NOW" \
+          '{schemaVersion:1,sha:$sha,runId:$run,verdict:"NO_GO",raisedAt:$now,
+            reason:"confirmed defects on this develop lineage — see the run thread and run directory"}' > "$HOLD_TMP"
+        mv "$HOLD_TMP" "$HOLD_FILE"
+        ;;
+      GO)
+        rm -f "$HOLD_FILE"
+        ;;
+    esac
   fi
   jq -cn --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" \
     '{ok:true,finishedSha:$sha,runId:$run,verdict:$verdict}'

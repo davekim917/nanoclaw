@@ -136,4 +136,19 @@ jq -e --arg sha "$BUILD_SHA" --arg run "$RUN_ID2" '
   .verdict == "NO_GO" and (.finishedAt | type == "string")
 ' "$PUBLISH" >/dev/null
 
+# 15. Hold flag: NO_GO raises it, BLOCKED leaves it untouched, GO clears it.
+HOLD="$STATE_DIR/pub/develop-hold.json"
+SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-1 NO_GO >/dev/null
+jq -e --arg sha "$BUILD_SHA" '
+  .verdict == "NO_GO" and .sha == $sha and .runId == "run-hold-1" and
+  (.reason | length > 0)
+' "$HOLD" >/dev/null
+SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-2 BLOCKED >/dev/null
+jq -e '.runId == "run-hold-1"' "$HOLD" >/dev/null   # unchanged by BLOCKED
+SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-3 GO >/dev/null
+[ ! -e "$HOLD" ]
+# GO with no prior hold is a no-op, not an error.
+SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-4 GO \
+  | jq -e '.ok == true' >/dev/null
+
 echo "smoke develop gate tests passed"
