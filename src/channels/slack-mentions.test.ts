@@ -7,6 +7,7 @@ import {
   registerSlackWorkspaceHumans,
   resolveInboundSlackIds,
   resolveSlackMentions,
+  slackMentionOutsideCode,
   upgradeSlackBotProfile,
   type SlackBotIdentity,
 } from './slack-mentions.js';
@@ -863,5 +864,45 @@ describe('release digest incident regression', async () => {
         '⚙️ **AUTO**',
       ].join('\n'),
     });
+  });
+});
+
+// Slack fires app_mention for a literal `@name` inside backticks (observed
+// live: a sibling's report documenting the gate syntax `@skipper ship 356`
+// woke the gate bot, which replied "Nothing needs you" to its own docs).
+// The refine hook demotes a platform mention whose only occurrence is
+// inside code regions.
+describe('slackMentionOutsideCode', () => {
+  const identity = { userId: 'U-GATEBOT', username: 'gatebot', displayName: 'skipper', teamId: 'T-X' };
+
+  it('demotes when the mention is only inside inline code', () => {
+    expect(slackMentionOutsideCode('ready for the gate. Reply `@skipper ship 356` to merge.', identity)).toBe(false);
+  });
+
+  it('demotes when the mention is only inside a fenced block', () => {
+    expect(slackMentionOutsideCode('usage:\n```\n@skipper hold 42\n```\ndone', identity)).toBe(false);
+  });
+
+  it('keeps a prose mention', () => {
+    expect(slackMentionOutsideCode('@skipper you are up', identity)).toBe(true);
+  });
+
+  it('keeps a prose mention even when code spans also reference it', () => {
+    expect(slackMentionOutsideCode('@skipper see `@skipper ship 1` syntax', identity)).toBe(true);
+  });
+
+  it('keeps a raw-id mention outside code', () => {
+    expect(slackMentionOutsideCode('<@U-GATEBOT> status?', identity)).toBe(true);
+  });
+
+  it('matches username and realName aliases case-insensitively', () => {
+    expect(slackMentionOutsideCode('@GateBot please', identity)).toBe(true);
+    expect(
+      slackMentionOutsideCode('@The Gate Bot please', {
+        ...identity,
+        displayName: undefined,
+        realName: 'The Gate Bot',
+      }),
+    ).toBe(true);
   });
 });

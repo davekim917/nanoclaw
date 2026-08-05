@@ -550,6 +550,23 @@ export async function upgradeSlackBotProfile(
  * Scoped to the workspace's known bots and humans; unknown ids pass through
  * untouched (better a raw id the model treats as opaque than a wrong name).
  */
+/**
+ * True when the bot's mention appears OUTSIDE code regions of the inbound
+ * text. Slack's markdown_text parser fires app_mention even for a literal
+ * `@name` inside backticks (documented gate syntax like \`@gatebot ship 42\`),
+ * so the platform's isMention alone wakes mention-mode agents off their own
+ * documentation. Inbound text at this point has raw ids already resolved to
+ * @name (resolveInboundSlackIds), so both forms are checked.
+ */
+export function slackMentionOutsideCode(text: string, identity: SlackBotIdentity): boolean {
+  const outsideCode = text.replace(/(`{3,}[\s\S]*?`{3,}|``[\s\S]*?``|`[^`\n]+`)/g, ' ');
+  if (outsideCode.includes(`<@${identity.userId}>`)) return true;
+  const lower = outsideCode.toLocaleLowerCase('en-US');
+  return [identity.displayName, identity.realName, identity.username]
+    .filter((name): name is string => !!name)
+    .some((name) => lower.includes(`@${name.toLocaleLowerCase('en-US')}`));
+}
+
 export function resolveInboundSlackIds(text: string, channelType: string): string {
   // Chat SDK's inbound parser can hand this seam either Slack's raw
   // `<@U…>` token or its already-flattened `@U…` form. Supporting only the

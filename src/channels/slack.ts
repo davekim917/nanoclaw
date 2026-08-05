@@ -39,6 +39,7 @@ import {
   getKnownSlackBots,
   registerSlackBot,
   registerSlackWorkspaceHumans,
+  slackMentionOutsideCode,
   normalizeSlackOrderedListContinuations,
   resolveInboundSlackIds,
   resolveSlackMentions,
@@ -427,6 +428,14 @@ for (const ws of workspaces) {
         // @name here is what stops agents from ever LEARNING the raw form —
         // the outbound rewrite above is the backstop, this is the cure.
         transformInboundText: (text) => resolveInboundSlackIds(text, ws.channelType),
+        // Slack's markdown_text parser fires app_mention even for literal
+        // `@name` inside backticks (gate-syntax documentation). Demote the
+        // mention when it appears ONLY inside code regions; keep the
+        // platform verdict when identity is unavailable.
+        refineInboundMention: (text) => {
+          const self = getKnownSlackBots().get(ws.channelType);
+          return self ? slackMentionOutsideCode(text, self) : true;
+        },
         detectRecoveredMention: (message) => {
           if (!identity) return false;
           const raw = message.raw as { text?: string } | undefined;

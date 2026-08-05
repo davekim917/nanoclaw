@@ -233,6 +233,14 @@ export interface ChatSdkBridgeConfig {
    */
   transformOutboundMarkdown?: (markdown: string) => string;
   /**
+   * Re-verify a platform-claimed mention against the final inbound text.
+   * Called only when the platform said isMention; returning false demotes
+   * the flag. Slack fires app_mention for a literal `@name` inside code
+   * spans (documented gate syntax), which wakes mention-mode agents off
+   * their own documentation without this.
+   */
+  refineInboundMention?: (text: string) => boolean;
+  /**
    * Optional transform applied to the inbound message's user-facing text
    * fields before it lands in `messages_in`. Used by channels whose raw
    * wire format leaks non-human-readable user references (Discord's
@@ -799,9 +807,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
     }
 
+    // Re-verify platform-claimed mentions against the final text (raw ids
+    // already resolved to @name above). See refineInboundMention.
+    let effectiveMention = isMention;
+    if (effectiveMention && config.refineInboundMention && typeof serialized.text === 'string') {
+      effectiveMention = config.refineInboundMention(serialized.text);
+    }
+
     // Preserve isMention as an explicit flat field the router can read
     // without depending on chat-sdk's internal field naming.
-    serialized.isMention = Boolean(serialized.isMention);
+    serialized.isMention = effectiveMention;
 
     // Drop raw to save DB space (can be very large)
     serialized.raw = undefined;
@@ -811,7 +826,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       kind: 'chat-sdk',
       content: serialized,
       timestamp: message.metadata.dateSent.toISOString(),
-      isMention,
+      isMention: effectiveMention,
       isDM,
       isGroup: isDM === undefined ? undefined : !isDM,
       recovered,
