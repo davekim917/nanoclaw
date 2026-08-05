@@ -100,6 +100,16 @@ if [ "$PREV_LOG_OFF" -gt 0 ] || [ "$PREV_ERR_OFF" -gt 0 ]; then
   if [ "$SLOW_SWEEPS" -ge 1 ]; then
     BREACHES+=("sweep|$SLOW_SWEEPS sweep tick(s) over $((SWEEP_MS_MAX / 1000))s in the last window (control-plane saturation)")
   fi
+
+  # A session whose container repeatedly exits non-zero is an agent that
+  # silently never answers (wake -> crash -> re-wake). Observed live: a
+  # schema-migration gap crash-looped a channel session for weeks with user
+  # mentions pending, invisible to every load/stall/disk vital.
+  CRASHED=$( (window_err | grep "Container exited non-zero" | grep -oE 'sessionId[^ ]*"[a-z0-9-]+"' | sort | uniq -c | awk -v m="${CONTAINER_CRASHES_MAX:-3}" '$1>=m' | wc -l) || true)
+  CRASHED=${CRASHED:-0}
+  if [ "$CRASHED" -ge 1 ]; then
+    BREACHES+=("crashloop|$CRASHED session(s) crash-looped ${CONTAINER_CRASHES_MAX:-3}+ times in the last window — those agents are not answering")
+  fi
 fi
 
 DISK_PCT=$(df --output=pcent "$NANOCLAW_DIR/data" 2>/dev/null | tail -1 | tr -dc '0-9')
