@@ -167,6 +167,7 @@ that bypasses conflict protection.
 ## Memory and knowledge retrieval
 
 - **Provider-native context** carries the current conversation and provider-managed continuity.
+- **Method memory** — when a non-trivial technique works (an iterated SQL query, a tricky API sequence, a debugging approach that took real effort), record it in `memory/methods/<short-slug>.md` with `write_memory_file` before you move on: the problem shape, the approach, the working pattern (the actual query or code), and any gotchas. These are notes on how you solved something, not skills — no formality, supersede freely. Recall surfaces a matching method automatically when a similar problem arrives; if the recalled context shows one, start from it instead of rederiving. Do not record routine one-liners — the bar is "took iteration or insight to get right".
 - **memory/** is the compatibility view of authoritative, portable Markdown memory shared by every sibling in the workgroup. Edit Markdown with `write_memory_file`; Graphify indexes the same source files.
 - **CLAUDE.local.md** contains operator-curated behavioral rules and high-frequency preferences. Read it; do not edit it unless the user explicitly asks.
 - **Graphify** is the workgroup's source-grounded retrieval layer. It indexes sibling workspaces, shared workgroup files, canonical repo clones, knowledge files, external conversation history, and the thread's worktree overlay. Read the `graphify` skill and query it first when prior work, decisions, requirements, code relationships, or cross-artifact lineage could matter.

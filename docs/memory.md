@@ -100,6 +100,12 @@ passing rather than as a decision; before this category existed, 134 archived
 messages mentioning two named feed liaisons distilled to zero facts about who
 they were. It rejects secrets, capability state, transient work, speculation,
 third-party uncertainty, and facts recoverable from code or Graphify.
+A worked method that succeeded — a query pattern, an API sequence, a debugging
+technique — is a durable workflow, distinct from the raw output around it.
+Agents also record methods directly at solve time under `memory/methods/`
+(standing instruction in `container/CLAUDE.md`), where recall surfaces them
+when a similar problem arrives; the curator complements that from what agents
+narrate in chat, since it never sees container tool calls.
 
 The model returns semantic facts plus archive evidence IDs, never Markdown.
 The host owns the complete representation: it normalizes fact text, derives

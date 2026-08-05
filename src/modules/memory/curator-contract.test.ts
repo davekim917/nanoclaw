@@ -296,6 +296,10 @@ describe('background memory curator contract', () => {
     // fit no capture category.
     expect(prompt.system).toContain('what they own or are responsible for');
     expect(prompt.system).toContain('even when it arrives in passing');
+    // Procedural knowledge: a narrated technique is a durable workflow. Without
+    // this the reject list's "raw output" wording suppressed exactly the query
+    // patterns and debugging approaches agents narrate in chat.
+    expect(prompt.system).toContain('is a durable workflow, not raw output');
     for (const code of CURATOR_CAPTURE_REASON_CODES) expect(prompt.system).toContain(code);
     expect(prompt.system).toContain('for noop both must be empty arrays');
   });
