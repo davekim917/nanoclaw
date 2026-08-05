@@ -18,7 +18,7 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // Must clear GENERATED_MEMORY_MAX_BYTES with room for the manual tree beside
   // it: this is a shared budget consumed in listing order, so a generated store
   // at its own cap would otherwise silently truncate every file after it.
-  markdownScannedBytes: 4 * 1_048_576,
+  markdownScannedBytes: 16 * 1_048_576,
   markdownFileBytes: 65_536,
   markdownCoreChars: 2_500,
   markdownHeadings: 24,
@@ -296,15 +296,41 @@ export function tokenizeForRecall(value: string): string[] {
   return [...new Set(tokenStreamForRecall(value).map((token) => token.value))];
 }
 
-function tokenStreamForRecall(value: string): Array<{ value: string; start: number; end: number }> {
+type RecallToken = { value: string; start: number; end: number };
+
+// Tokenizing the generated store is the single largest per-turn cost, and it
+// repeats identically every turn: the curator rewrites the file a few times an
+// hour while turns are constant, so the same fact lines are re-normalized,
+// re-matched and re-filtered over and over. Measured on a live 1 MiB / 1,058
+// fact store that was 875 ms added to EVERY turn, and it scales linearly with
+// the store — which made the size cap a latency decision rather than a storage
+// one.
+//
+// Keyed on the text itself, so it needs no invalidation: a rewritten fact is a
+// different string and simply misses. Cleared wholesale when full rather than
+// evicted least-recently-used — the working set is the current fact store, so a
+// clear costs one turn of recompute and the LRU bookkeeping is not worth it.
+// ponytail: plain Map, swap for an LRU only if clears start showing up hot.
+const TOKEN_STREAM_CACHE = new Map<string, readonly RecallToken[]>();
+// Sized to hold the whole fact store plus a turn's manual files and archive
+// candidates several times over, so a clear stays rare. Roughly 6 MB of heap
+// per 1,000 cached fact lines.
+const TOKEN_STREAM_CACHE_MAX = 8192;
+
+function tokenStreamForRecall(value: string): readonly RecallToken[] {
+  const cached = TOKEN_STREAM_CACHE.get(value);
+  if (cached) return cached;
   const normalized = value.normalize('NFKC').toLocaleLowerCase('en-US');
-  return [...normalized.matchAll(/[\p{L}\p{N}_-]{2,}/gu)]
+  const tokens = [...normalized.matchAll(/[\p{L}\p{N}_-]{2,}/gu)]
     .map((match) => ({
       value: canonicalToken(match[0]),
       start: match.index,
       end: match.index + match[0].length,
     }))
     .filter((token) => token.value.length > 1 && !STOP_WORDS.has(token.value));
+  if (TOKEN_STREAM_CACHE.size >= TOKEN_STREAM_CACHE_MAX) TOKEN_STREAM_CACHE.clear();
+  TOKEN_STREAM_CACHE.set(value, tokens);
+  return tokens;
 }
 
 interface PassageMatch {
@@ -376,7 +402,7 @@ function boundedPassages(candidate: string, maxChars: number): string[] {
   return windows;
 }
 
-function minimumTokenSpan(queryTokens: Set<string>, passageTokens: Array<{ value: string }>): number {
+function minimumTokenSpan(queryTokens: Set<string>, passageTokens: readonly { value: string }[]): number {
   let best = Number.POSITIVE_INFINITY;
   for (let start = 0; start < passageTokens.length; start++) {
     if (!queryTokens.has(passageTokens[start]!.value)) continue;

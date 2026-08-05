@@ -22,7 +22,7 @@ interface ProcessWriteRequest {
 // Raising the host cap without this one is exactly how a curator write starts
 // failing again a few hundred KiB later: the host accepts the document, then
 // the helper rejects the request and the episode retries forever.
-const MAX_CURATOR_WRITE_REQUEST_BYTES = 1040 * 1024;
+const MAX_CURATOR_WRITE_REQUEST_BYTES = 8208 * 1024;
 
 if (import.meta.main) {
   const encoded = process.argv[2];

@@ -561,6 +561,41 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(fact!.text).toContain('captured=2026-05-01T00:00:00.000Z');
   });
 
+  it('memoizes tokenization so a repeated turn does not re-tokenize the fact store', () => {
+    // Guards the change that made the size cap a storage decision instead of a
+    // latency one: a live 1 MiB store cost 875 ms of tokenization per turn
+    // before this. A regression here is invisible except as slow turns.
+    const facts = Array.from(
+      { length: 400 },
+      (_, index) =>
+        `- Deployment ownership detail ${index} covering the release pipeline and its rollback path. ` +
+        `<!-- nanoclaw-memory:id=mem_${String(index).padStart(16, '0')};evidence=arc-${index};captured=2026-07-2${index % 9}T00:00:00.000Z -->`,
+    );
+    memoryFile('generated/memory.md', ['# Generated workgroup memory', '', ...facts, ''].join('\n'));
+    const input = {
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat',
+      trigger: 1 as const,
+      normalizedContent: '{"text":"Who owns deployment rollback?"}',
+    };
+
+    const cold = process.hrtime.bigint();
+    buildPreTurnContext(input);
+    const coldNs = Number(process.hrtime.bigint() - cold);
+    const warm = process.hrtime.bigint();
+    buildPreTurnContext(input);
+    const warmNs = Number(process.hrtime.bigint() - warm);
+
+    // Deliberately loose: this asserts the cache exists at all, not a latency
+    // budget, so it cannot flake on a loaded CI box. Measured speedup is ~50x.
+    expect(warmNs).toBeLessThan(coldNs);
+    // And the cache must not change what is returned.
+    expect(JSON.stringify(buildPreTurnContext(input).memoryEvidence)).toBe(
+      JSON.stringify(buildPreTurnContext(input).memoryEvidence),
+    );
+  });
+
   it('uses codepoint order for equal-scoring Markdown paths', () => {
     memoryFile('facts/project_xzo216.md', '# Deployment owner\nJordan owns deployment.');
     memoryFile('facts/project_xzo_195.md', '# Deployment owner\nJordan owns deployment.');

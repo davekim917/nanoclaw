@@ -12,24 +12,42 @@ export const GENERATED_MEMORY_RELATIVE_PATH = 'generated/memory.md';
 // that could never fit, because the overflow threw and the queue retries
 // forever.
 //
-// ponytail: 1 MiB, because the store is re-tokenized on every turn to rank it.
-// Measured on the live 328-fact store: ~525 ms per MiB, so full = ~540 ms added
-// to each turn. That cost is not new (as one document the same bytes were
-// tokenized anyway), but it is what bounds the store, not disk. Upgrade path
-// when this starts to bite: memoize the token stream per fact keyed on the
-// file's SHA — the curator writes a few times an hour while turns are constant,
-// so the cache would essentially always hit and the cap could then grow freely.
-export const GENERATED_MEMORY_MAX_BYTES = 1024 * 1024;
+// 1 MiB lasted a week. The busiest workgroup went 295 KB -> 1 MiB in seven
+// days (~108 KB/day) and saturated again, because the previous headroom
+// estimate was extrapolated from a growth rate measured while capture was
+// BROKEN — repairing capture roughly tripled the write rate and invalidated it.
+// Facts are never evicted, so this only ever grows; treat any cap as a runaway
+// rail with the 75% warning as the real signal, not as a ceiling that will hold
+// forever.
+//
+// Latency used to be what bounded this: the store was re-tokenized on every
+// turn, measured at 875 ms per turn on a live 1 MiB / 1,058-fact store. That is
+// now memoized in pre-turn-context.ts (648 ms cold, ~13 ms warm, 50x), and
+// because the cache keys on fact text a curator rewrite only re-tokenizes the
+// facts that actually changed. Disk and the per-turn file read are what remain.
+export const GENERATED_MEMORY_MAX_BYTES = 8 * 1024 * 1024;
 export const GENERATED_MEMORY_WARN_BYTES = Math.floor(GENERATED_MEMORY_MAX_BYTES * 0.75);
 export const CURATOR_MAX_EVIDENCE_IDS = 20;
 export const CURATOR_MAX_SUPERSESSIONS = 3;
 export const CURATOR_MAX_NEW_MEMORIES = 8;
-// Was 1,000, which rejected 458 captures outright — the single largest cause of
-// curator failure. Live facts have a median length of 658 characters, so 1,000
-// left almost no headroom for a legitimately detailed decision, and the one
-// bounded repair retry mostly failed too. The generated lane delivers a fact
-// whole up to generatedFactExcerptChars, so this stays matched to that.
-export const CURATOR_MAX_MEMORY_TEXT_CHARS = 2_000;
+// This is a STORAGE bound, deliberately larger than the delivery width. A fact
+// is written whole and trimmed only when injected (marker preserved), so length
+// pressure never silently waters down what is recorded — the full text stays on
+// disk for an agent that opens the file.
+//
+// 1,000 rejected 458 captures. 2,000 then looked generous against accepted
+// lengths, but that sample is censored: rejected candidates never become facts.
+// With 304 recorded rejections the real distribution shows candidates wanting
+// p50 2,295 and up to 3,715 characters, while accepted facts piled against the
+// ceiling at 1,995 and 1,997 — the signature of a binding limit. 4,000 clears
+// the observed maximum with headroom.
+//
+// Not lowered by asking for terser prose: retrieval already discards stopwords,
+// so 28.5% of fact text earns nothing at match time — but `before` and `should`
+// are stopwords too, and losing them inverts meaning for the agent that reads
+// the fact. The longest facts measured are dense analysis (point estimates,
+// p-values, named confounders), not padding.
+export const CURATOR_MAX_MEMORY_TEXT_CHARS = 4_000;
 
 export const CURATOR_REASON_CODES = [
   'duplicate',
@@ -403,6 +421,7 @@ export function buildCuratorPrompt(input: CuratorPromptInput): { system: string;
     `If a durable fact will not fit in ${CURATOR_MAX_MEMORY_TEXT_CHARS.toLocaleString('en-US')} characters, first tighten the wording. Split it only when it is genuinely more than one fact, so that each candidate stands alone with its own evidence ids and is still true read on its own. Do not split a single fact whose parts only make sense together, do not compress one past the point of being understandable, and never drop one to fit.`,
     'Do not return Markdown, bullets, headings, HTML comments, memory IDs, capture timestamps, or the full generated memory document.',
     'Use only current episode message IDs as evidence for a new candidate.',
+    'NanoClaw stamps every fact with its capture date, so do not open a fact by restating that date. State a date only when it differs from when the evidence was said — a deadline, or when something happened earlier.',
     'When current evidence makes an existing memory wrong or out of date, supersede it: name its exact memory ID in supersedesMemoryIds and provide the updated fact as a new candidate. Do not leave a stale fact standing beside its replacement.',
     `A replacement must use one of these reason codes: ${CURATOR_CAPTURE_REASON_CODES.join(', ')}. Any of them may accompany supersedesMemoryIds — pick the one that describes the new fact, so a superseding decision is 'explicit_decision' and a superseding preference is 'stable_preference'. Reserve 'correction' for fixing something that was wrong.`,
     'Always return supersedesMemoryIds and memories; for noop both must be empty arrays.',
