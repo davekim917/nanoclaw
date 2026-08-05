@@ -212,7 +212,11 @@ export function loadRegistryIdentifiers(dbPath: string): Set<string> {
     'SELECT id, display_name FROM workgroups',
     'SELECT id, name, folder, workgroup_id FROM agent_groups',
     'SELECT id, platform_id, instance, name FROM messaging_groups',
-    'SELECT id, display_name FROM users',
+    // system:* rows are synthetic senders minted when a host script DMs via
+    // the CLI socket (health-sentinel, drift-check, ...). Their ids are
+    // constants IN tracked scripts — treating them as install-private would
+    // make the boundary check flag the very script that authors them.
+    "SELECT id, display_name FROM users WHERE id NOT LIKE 'system:%'",
   ];
   try {
     for (const query of queries) {
@@ -343,9 +347,6 @@ export function scanInputs(
 
     for (const identifier of privateIdentifiers) {
       if (isAllowed(input.file, identifier, allowlist)) continue;
-      // The allowlist file necessarily serializes every allowlisted value —
-      // same exemption the structural rules get via isSerializedAllowlistValue.
-      if (isSerializedAllowlistValue(input.file, identifier, allowlist)) continue;
       const pattern = normalizedIdentifierPattern(identifier);
       const match = pattern?.exec(content);
       if (match) {

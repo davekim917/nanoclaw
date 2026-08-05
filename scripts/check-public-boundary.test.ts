@@ -204,6 +204,8 @@ describe('install-aware inputs', () => {
       CREATE TABLE users (id TEXT, display_name TEXT);
       INSERT INTO workgroups VALUES ('mr', 'Private House');
       INSERT INTO agent_groups VALUES ('ag-private123', 'Private Agent', 'private-agent', 'private-house');
+      INSERT INTO users VALUES ('u-real-1', 'Private Person');
+      INSERT INTO users VALUES ('system:health-sentinel', NULL);
     `);
     db.prepare('INSERT INTO messaging_groups VALUES (?, ?, ?, ?)').run(
       'mg-private123',
@@ -216,6 +218,10 @@ describe('install-aware inputs', () => {
     expect(values.has('Private House')).toBe(true);
     expect(values.has(platformId)).toBe(true);
     expect(values.has('mr')).toBe(true);
+    expect(values.has('u-real-1')).toBe(true);
+    // system:* senders are script-authored constants living in tracked code —
+    // never install-private identifiers (see loadRegistryIdentifiers comment).
+    expect(values.has('system:health-sentinel')).toBe(false);
     expect(() => loadRegistryIdentifiers(path.join(root, 'missing.db'))).toThrow('missing');
   });
 });
