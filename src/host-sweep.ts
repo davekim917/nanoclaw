@@ -854,6 +854,44 @@ export function shouldReapIdleTaskContainer(
   return isTaskThread(threadId) && dueMessageCount === 0 && processingClaimCount === 0 && providerStatus === 'idle';
 }
 
+/**
+ * Chat/channel containers have an interactive follow-up window worth
+ * preserving (a human may reply within seconds), so unlike task containers
+ * they get a quiet-duration floor before reaping. `provider_status` is not
+ * usable here — only the Codex provider (container/agent-runner/src/providers/codex.ts)
+ * ever writes it; Claude-provider sessions leave it null forever, so this
+ * keys on the durable, provider-agnostic signal instead: no due message, no
+ * claimed message, no pending work_continuation promise, and the container's
+ * last outbound row (chat or status) is older than CHAT_IDLE_REAP_MS. State
+ * lives entirely in inbound.db/outbound.db, so the next @mention respawns
+ * and resumes exactly like a stuck-ceiling kill does today.
+ */
+export const CHAT_IDLE_REAP_MS = 15 * 60 * 1000;
+
+export function shouldReapIdleChatContainer(
+  threadId: string | null,
+  dueMessageCount: number,
+  processingClaimCount: number,
+  hasActiveContinuation: boolean,
+  lastOutboundAtMs: number | null,
+  now: number,
+): boolean {
+  if (isTaskThread(threadId)) return false; // task threads use shouldReapIdleTaskContainer
+  if (dueMessageCount !== 0 || processingClaimCount !== 0 || hasActiveContinuation) return false;
+  if (lastOutboundAtMs === null) return false;
+  return now - lastOutboundAtMs >= CHAT_IDLE_REAP_MS;
+}
+
+/** Most recent messages_out timestamp for a session, or null if it has never produced output. */
+function getLastOutboundAtMs(outDb: Database.Database): number | null {
+  const row = outDb.prepare('SELECT timestamp FROM messages_out ORDER BY seq DESC LIMIT 1').get() as
+    | { timestamp: string }
+    | undefined;
+  if (!row) return null;
+  const ms = parseSqliteUtc(row.timestamp);
+  return Number.isNaN(ms) ? null : ms;
+}
+
 function prepareDueWake(
   inDb: Database.Database,
   agentGroupId: string,
@@ -1262,6 +1300,22 @@ async function sweepSession(session: Session): Promise<number | null> {
       ) {
         log.info('Reaping idle scheduled-task container', { sessionId: session.id, threadId: session.thread_id });
         killContainer(session.id, 'scheduled-task-idle');
+      } else if (
+        shouldReapIdleChatContainer(
+          session.thread_id,
+          dueCount,
+          processingClaimCount,
+          workContinuation !== null,
+          getLastOutboundAtMs(outDb),
+          Date.now(),
+        )
+      ) {
+        log.info('Reaping idle chat container', {
+          sessionId: session.id,
+          threadId: session.thread_id,
+          idleFloorMs: CHAT_IDLE_REAP_MS,
+        });
+        killContainer(session.id, 'chat-idle-reap');
       } else {
         enforceRunningContainerSla(inDb, outDb, session, agentGroup.id, agentGroup.folder);
       }

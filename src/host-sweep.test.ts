@@ -47,6 +47,8 @@ import {
   notifyContinuationParked,
   shouldCloseTaskSession,
   shouldReapIdleTaskContainer,
+  shouldReapIdleChatContainer,
+  CHAT_IDLE_REAP_MS,
 } from './host-sweep.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
@@ -2412,5 +2414,37 @@ describe('shouldReapIdleTaskContainer', () => {
   it('never reaps an interactive session through the scheduled-task policy', () => {
     expect(shouldReapIdleTaskContainer('discord:guild:channel:thread', 0, 0, 'idle')).toBe(false);
     expect(shouldReapIdleTaskContainer(null, 0, 0, 'idle')).toBe(false);
+  });
+});
+
+describe('shouldReapIdleChatContainer', () => {
+  const THREAD = 'discord:guild:channel:thread';
+  const NOW = 1_700_000_000_000;
+  const LONG_QUIET = NOW - CHAT_IDLE_REAP_MS - 1;
+  const JUST_QUIET = NOW - CHAT_IDLE_REAP_MS + 1;
+
+  it('reaps a chat container quiet past the floor with nothing pending', () => {
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, NOW)).toBe(true);
+  });
+
+  it('keeps a chat container inside the quiet floor', () => {
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, JUST_QUIET, NOW)).toBe(false);
+  });
+
+  it('keeps a chat container while work is due or claimed', () => {
+    expect(shouldReapIdleChatContainer(THREAD, 1, 0, false, LONG_QUIET, NOW)).toBe(false);
+    expect(shouldReapIdleChatContainer(THREAD, 0, 1, false, LONG_QUIET, NOW)).toBe(false);
+  });
+
+  it('keeps a chat container with a pending work_continuation promise', () => {
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, true, LONG_QUIET, NOW)).toBe(false);
+  });
+
+  it('keeps a chat container that has never produced output', () => {
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, null, NOW)).toBe(false);
+  });
+
+  it('never reaps a task-thread session through the chat policy', () => {
+    expect(shouldReapIdleChatContainer('system:tasks:task-1', 0, 0, false, LONG_QUIET, NOW)).toBe(false);
   });
 });
