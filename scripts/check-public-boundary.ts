@@ -343,6 +343,9 @@ export function scanInputs(
 
     for (const identifier of privateIdentifiers) {
       if (isAllowed(input.file, identifier, allowlist)) continue;
+      // The allowlist file necessarily serializes every allowlisted value —
+      // same exemption the structural rules get via isSerializedAllowlistValue.
+      if (isSerializedAllowlistValue(input.file, identifier, allowlist)) continue;
       const pattern = normalizedIdentifierPattern(identifier);
       const match = pattern?.exec(content);
       if (match) {

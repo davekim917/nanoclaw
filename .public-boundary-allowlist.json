@@ -24,6 +24,11 @@
       "path": "README_zh.md",
       "value": "1470188214710046894",
       "reason": "Published NanoClaw community Discord server identifier"
+    },
+    {
+      "path": "scripts/health-sentinel.sh",
+      "value": "system:health-sentinel",
+      "reason": "Synthetic system sender the sentinel's own DM mints as a user row; a generic script constant, not an install-private identifier"
     }
   ]
 }
