@@ -57,8 +57,11 @@ launches Codex through `worker-codex`.
 
 **Single-provider fallback.** When the challenger's provider is unavailable —
 an exhausted account, a suspended key, an outage — the deployment may run the
-challenger on the coordinator's provider instead, using a different model
-family and its own native worker role. This is a deliberate degradation, not
+challenger on the coordinator's provider instead, using its own native worker
+role. Match the coordinator's parent model and effort exactly: a weaker
+challenger rubber-stamps and a stronger one overpowers, and the escalation
+tier must stay strictly above both parents, so never borrow the adjudicator's
+model for a parent. This is a deliberate degradation, not
 an equivalent: a stalled challenge blocks every run at the evidence barrier,
 whereas a same-provider challenge still delivers a separate agent, a separate
 session, fresh context, an adversarial mandate, and an independently recorded
