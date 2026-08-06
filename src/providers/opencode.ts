@@ -33,6 +33,25 @@ const DEFAULT_OPENCODE_MODEL = 'opencode-go/grok-4.5';
 const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
 const DEFAULT_OPENCODE_EFFORT = 'medium';
 
+/**
+ * Remove dangling symlinks under `root` (recursively), then any directories
+ * the removal left empty. Skill mirrors are add-oriented — a skill retired
+ * from its source plugin leaves its support-file links dangling forever —
+ * and the spawn-time dereferencing copy hard-fails on the first one.
+ */
+export function pruneDanglingSymlinks(root: string): void {
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const p = path.join(root, entry.name);
+    if (entry.isSymbolicLink()) {
+      // existsSync follows the link — false means the target is gone.
+      if (!fs.existsSync(p)) fs.unlinkSync(p);
+    } else if (entry.isDirectory()) {
+      pruneDanglingSymlinks(p);
+      if (fs.readdirSync(p).length === 0) fs.rmdirSync(p);
+    }
+  }
+}
+
 function mergeNoProxy(current: string | undefined, additions: string): string {
   if (!current?.trim()) return additions;
   const parts = new Set(
@@ -103,6 +122,13 @@ registerProviderContainerConfig('opencode', (ctx) => {
     // automatically per packages/opencode/src/command/index.ts.
     const hostSkillsDir = path.join(sourceDir, 'skill');
     if (fs.existsSync(hostSkillsDir)) {
+      // cpSync({dereference: true}) throws ENOENT on a dangling symlink, and
+      // one stale mirror entry (a skill retired from its source plugin) then
+      // wedges EVERY spawn of this group until someone hand-cleans the
+      // mirror — bit an opencode group's session on 2026-08-06. The mirror
+      // sync is add-oriented and leaves support-file links behind, so prune
+      // dangling links (and dirs the prune empties) before each copy.
+      pruneDanglingSymlinks(hostSkillsDir);
       const targetSkillsDir = path.join(opencodeSubdir, 'skill');
       fs.cpSync(hostSkillsDir, targetSkillsDir, {
         recursive: true,
