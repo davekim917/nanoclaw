@@ -1224,10 +1224,11 @@ function resolveScopedRotationSet(
  * delete placeholder values OneCLI injects for credentials we plan to
  * substitute with the real value ourselves. Mutates args in place.
  */
-function stripEnvEntry(args: string[], key: string): void {
+export function stripEnvEntry(args: string[], key: string, onlyValue?: string): void {
   const prefix = `${key}=`;
   for (let i = args.length - 2; i >= 0; i--) {
     if (args[i] === '-e' && args[i + 1].startsWith(prefix)) {
+      if (onlyValue !== undefined && args[i + 1] !== `${prefix}${onlyValue}`) continue;
       args.splice(i, 2);
     }
   }
@@ -3471,6 +3472,14 @@ async function buildContainerArgs(
     // OneCLI's placeholder is all we need.
     if (oauthBypassAnthropic) {
       mergeNoProxy(args, 'api.anthropic.com');
+      // OneCLI also injects `-e ANTHROPIC_API_KEY=placeholder`. The SDK
+      // prefers ANTHROPIC_API_KEY over the OAuth token, and with
+      // api.anthropic.com bypassed the proxy never substitutes the real
+      // value — the literal "placeholder" reaches Anthropic as the bearer
+      // (401 Invalid API key; bit a provider-fallback spawn 2026-08-05).
+      // Strip only the sentinel: a real key forwarded by the
+      // custom-upstream block below is pushed after this and wins.
+      stripEnvEntry(args, 'ANTHROPIC_API_KEY', PLACEHOLDER_SENTINEL);
       stripEnvEntry(args, 'CLAUDE_CODE_OAUTH_TOKEN');
       args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${hostOauth}`);
       for (const fb of auth.oauthFallbacks) {

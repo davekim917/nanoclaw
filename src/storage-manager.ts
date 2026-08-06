@@ -1179,7 +1179,10 @@ function dockerReclaimableBytes(): Partial<Record<'Images' | 'Containers' | 'Bui
 
 function createDockerAction(args: {
   id: string;
-  kind: Exclude<StorageActionKind, 'delete-cache-dir' | 'delete-derived-file' | 'archive-thread-worktree' | 'archive-session'>;
+  kind: Exclude<
+    StorageActionKind,
+    'delete-cache-dir' | 'delete-derived-file' | 'archive-thread-worktree' | 'archive-session'
+  >;
   dockerArgs: string[];
   estimatedBytes: number;
   reason: string;

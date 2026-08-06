@@ -125,11 +125,7 @@ describe('storage pressure administrator alerts', () => {
   });
 
   it('alerts through exactly ONE bot even when the owner has identities on every platform', async () => {
-    mocks.roleRows = [
-      { user_id: 'slack-a:owner' },
-      { user_id: 'slack-b:owner' },
-      { user_id: 'discord:owner' },
-    ];
+    mocks.roleRows = [{ user_id: 'slack-a:owner' }, { user_id: 'slack-b:owner' }, { user_id: 'discord:owner' }];
     try {
       await handleStoragePressureAlert(report(93), now);
       expect(mocks.deliver).toHaveBeenCalledTimes(1);

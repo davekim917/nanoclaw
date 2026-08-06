@@ -21,6 +21,7 @@ import {
   WORKGROUP_MEMORY_LOCK_CONTAINER_PATH,
   replaceClaudeNativeMemoryMount,
   reconcileWorkgroupAtSpawn,
+  stripEnvEntry,
 } from './container-runner.js';
 import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
@@ -562,6 +563,29 @@ describe('resolveAnthropicAuth', () => {
     const auth = resolveAnthropicAuth('any-folder', env, envFile);
     expect(auth.oauthPrimary).toBe('global-oauth');
     expect(auth.oauthFallbacks).toEqual([{ index: 2, value: 'global-oauth-2' }]);
+  });
+});
+
+describe('stripEnvEntry', () => {
+  it('removes every matching -e pair when no value filter is given', () => {
+    const args = ['-e', 'FOO=a', '-e', 'BAR=b', '-e', 'FOO=c'];
+    stripEnvEntry(args, 'FOO');
+    expect(args).toEqual(['-e', 'BAR=b']);
+  });
+
+  it('with onlyValue, drops the placeholder but keeps a real key', () => {
+    // The OAuth-bypass path strips OneCLI's ANTHROPIC_API_KEY=placeholder so
+    // the literal sentinel never reaches api.anthropic.com as a bearer, while
+    // a real operator-forwarded key must survive.
+    const args = ['-e', 'ANTHROPIC_API_KEY=placeholder', '-e', 'ANTHROPIC_API_KEY=sk-real'];
+    stripEnvEntry(args, 'ANTHROPIC_API_KEY', 'placeholder');
+    expect(args).toEqual(['-e', 'ANTHROPIC_API_KEY=sk-real']);
+  });
+
+  it('does not match keys that merely share a prefix', () => {
+    const args = ['-e', 'ANTHROPIC_API_KEY_2=x', '-e', 'ANTHROPIC_API_KEY=placeholder'];
+    stripEnvEntry(args, 'ANTHROPIC_API_KEY', 'placeholder');
+    expect(args).toEqual(['-e', 'ANTHROPIC_API_KEY_2=x']);
   });
 });
 
