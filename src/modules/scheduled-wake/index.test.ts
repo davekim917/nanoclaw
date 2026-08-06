@@ -97,7 +97,9 @@ describe('schedule_wake delivery action', () => {
     const content = JSON.parse(r[0].content as string);
     expect(content.senderId).toBe('system');
     expect(content._system.kind).toBe('agent_scheduled_wake');
-    expect(content.text).toBe('[system] Check CI for PR #207 and report status');
+    expect(content.text).toContain('[system] Check CI for PR #207 and report status');
+    // Delivery contract rides with every wake — see routing.selfWake in the runner.
+    expect(content.text).toContain('bare final text is NOT delivered');
     const pair = allRows(db);
     expect(pair.map((row) => row.id)).toEqual([`recall-schedule-wake-${wakeId}`, `schedule-wake-${wakeId}`]);
     expect(pair.map((row) => row.trigger)).toEqual([0, 0]);
