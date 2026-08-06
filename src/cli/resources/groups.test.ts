@@ -415,6 +415,9 @@ describe('groups CLI resource config', () => {
     );
     expect(response.ok).toBe(true);
     expect(readContainerConfig(folder).provider).toBe('codex');
+    // assistant_name IS mirrored — the spawn path reads it from the file, so
+    // a DB-only write would silently keep the old name (same trap as provider).
+    expect(readContainerConfig(folder).assistantName).toBe('Renamed');
   });
 
   it('test_legacy_gitnexus_key_is_behaviorally_inert', () => {

@@ -407,17 +407,24 @@ registerResource({
         // Mirror the runtime-selecting scalars into container.json. The DB row
         // is a read-side projection (flag vocabulary, task-flag validation);
         // the FILE is what the spawn path and the in-container runner actually
-        // read for provider/model/effort. Writing only the DB silently left a
+        // read for provider/model/effort/assistantName. Writing only the DB silently left a
         // group running its old provider after `config update --provider`,
         // which reads as "the command did nothing" — the update appears in
         // `config get` while the container keeps booting the old runtime.
         // updateContainerConfig re-reads before writing, so a concurrent
         // spawn-time identity write is not clobbered.
-        if (updates.provider !== undefined || updates.model !== undefined || updates.effort !== undefined) {
+        if (
+          updates.provider !== undefined ||
+          updates.model !== undefined ||
+          updates.effort !== undefined ||
+          updates.assistant_name !== undefined
+        ) {
           updateContainerConfig(group.folder, (config) => {
             if (updates.provider !== undefined) config.provider = updates.provider as string;
             if (updates.model !== undefined) config.model = (updates.model as string) || undefined;
             if (updates.effort !== undefined) config.effort = (updates.effort as string) || undefined;
+            if (updates.assistant_name !== undefined)
+              config.assistantName = (updates.assistant_name as string) || undefined;
             return config;
           });
         }
