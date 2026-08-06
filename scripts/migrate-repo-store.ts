@@ -45,6 +45,7 @@
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import BetterSqlite3 from 'better-sqlite3';
 
 const args = process.argv.slice(2);
 function flagValue(name: string): string | null {
@@ -534,22 +535,18 @@ function workgroupAgentGroups(): Array<{ id: string; folder: string }> | null {
   const centralDb = path.join(DATA_DIR, 'v2.db');
   if (!fs.existsSync(centralDb)) return (cachedMembers = null);
   try {
-    const out = execFileSync(
-      'pnpm',
-      [
-        'exec', 'tsx', path.join(import.meta.dirname, 'q.ts'), centralDb,
-        `SELECT id, folder FROM agent_groups WHERE COALESCE(workgroup_id, folder) = '${WG.replace(/'/g, "''")}'`,
-      ],
-      { cwd: path.join(import.meta.dirname, '..'), stdio: 'pipe', encoding: 'utf-8', timeout: 60_000 },
-    ).toString();
-    cachedMembers = out
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .map((l) => {
-        const [id, folder] = l.split('|');
-        return { id, folder };
-      });
+    // In-process read, not a `pnpm exec tsx q.ts` subprocess: nested pnpm
+    // inherits pnpm_config_verify_deps_before_run and burns ~80s of CPU per
+    // exec before running anything (observed pnpm 10.33), which blew this
+    // call's timeout and silently degraded the migration to "no DB".
+    const db = new BetterSqlite3(centralDb, { readonly: true, fileMustExist: true });
+    try {
+      cachedMembers = db
+        .prepare('SELECT id, folder FROM agent_groups WHERE COALESCE(workgroup_id, folder) = ?')
+        .all(WG) as Array<{ id: string; folder: string }>;
+    } finally {
+      db.close();
+    }
     return cachedMembers;
   } catch {
     return (cachedMembers = null);
@@ -670,25 +667,23 @@ function workgroupThreadSlugs(): Set<string> | null {
   const centralDb = path.join(DATA_DIR, 'v2.db');
   if (!fs.existsSync(centralDb)) return null;
   try {
-    const out = execFileSync(
-      'pnpm',
-      [
-        'exec', 'tsx', path.join(import.meta.dirname, 'q.ts'), centralDb,
-        `SELECT DISTINCT COALESCE(s.thread_id, 'dm-' || mg.platform_id) AS tid
-           FROM sessions s
-           JOIN messaging_groups mg ON mg.id = s.messaging_group_id
-           JOIN agent_groups ag ON ag.id = s.agent_group_id
-          WHERE COALESCE(ag.workgroup_id, ag.folder) = '${WG.replace(/'/g, "''")}'`,
-      ],
-      { cwd: path.join(import.meta.dirname, '..'), stdio: 'pipe', encoding: 'utf-8', timeout: 60_000 },
-    ).toString();
-    return new Set(
-      out
-        .split('\n')
-        .map((l) => l.trim())
-        .filter(Boolean)
-        .map((tid) => fsSlug(tid)),
-    );
+    // In-process read — see workgroupAgentGroups for why this must not be a
+    // nested `pnpm exec` subprocess.
+    const db = new BetterSqlite3(centralDb, { readonly: true, fileMustExist: true });
+    try {
+      const rows = db
+        .prepare(
+          `SELECT DISTINCT COALESCE(s.thread_id, 'dm-' || mg.platform_id) AS tid
+             FROM sessions s
+             JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+             JOIN agent_groups ag ON ag.id = s.agent_group_id
+            WHERE COALESCE(ag.workgroup_id, ag.folder) = ?`,
+        )
+        .all(WG) as Array<{ tid: string }>;
+      return new Set(rows.map((r) => fsSlug(r.tid)));
+    } finally {
+      db.close();
+    }
   } catch (e) {
     console.warn(`WARNING: cannot read central DB for thread ownership (${e instanceof Error ? e.message : e})`);
     return null;

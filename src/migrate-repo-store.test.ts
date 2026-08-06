@@ -26,9 +26,14 @@ let remote: string;
 let canonical: string;
 
 function runMigration(execute: boolean): string {
+  // Invoke the tsx bin directly — `pnpm exec` here would be pnpm-under-pnpm
+  // (this test already runs under `pnpm exec vitest`), and the inherited
+  // pnpm_config_verify_deps_before_run makes each nested exec burn ~80s of
+  // CPU before running anything (pnpm 10.33), timing the spawn out.
+  const tsxBin = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
   return execFileSync(
-    'pnpm',
-    ['exec', 'tsx', SCRIPT, '--workgroup', 'testwg', '--root', root, ...(execute ? ['--execute'] : [])],
+    tsxBin,
+    [SCRIPT, '--workgroup', 'testwg', '--root', root, ...(execute ? ['--execute'] : [])],
     {
       cwd: process.cwd(),
       stdio: 'pipe',
