@@ -55,24 +55,6 @@ each runtime. The coordinator asks the challenger for an independent pass; the
 challenger owns its native Codex worker tree. The coordinator never directly
 launches Codex through `worker-codex`.
 
-**Single-provider fallback.** When the challenger's provider is unavailable —
-an exhausted account, a suspended key, an outage — the deployment may run the
-challenger on the coordinator's provider instead, using its own native worker
-role. Match the coordinator's parent model and effort exactly: a weaker
-challenger rubber-stamps and a stronger one overpowers, and the escalation
-tier must stay strictly above both parents, so never borrow the adjudicator's
-model for a parent. This is a deliberate degradation, not
-an equivalent: a stalled challenge blocks every run at the evidence barrier,
-whereas a same-provider challenge still delivers a separate agent, a separate
-session, fresh context, an adversarial mandate, and an independently recorded
-conclusion. What it does not deliver is vendor-independent failure modes.
-Both parents must therefore treat it as reportable state: the challenger
-declares it in its disposition, and **the coordinator's verdict must say
-plainly that the challenge ran on the same provider family and that
-cross-model diversity was reduced for that run.** Never let a run appear
-more independently verified than it was. Never switch providers mid-run;
-change it between runs, at the operator's direction.
-
 Every worker records its conclusion before reading another worker's verdict.
 The coordinator and challenger then record their parent-level conclusions
 independently before cross-synthesis. Worker count, model confidence, and
@@ -150,7 +132,18 @@ when changed feature files are byte-identical. Stop workers, record the timing,
 close the gate with a non-clear verdict, and let the watcher debounce the
 successor SHA; a synthesis session never starts a replacement campaign itself.
 
-Use a managed isolated worktree. Before every test, edit, or commit batch:
+Use a managed isolated worktree, and only a managed one: obtain it with
+`create_worktree` (it lands under `/workspace/worktrees/<repo>`), or use an
+agreed long-lived checkout under `/workspace/workgroup/.worktrees/`. Never
+`git clone`, copy a repo, or build scratch checkouts under `/workspace/agent/`
+— nothing manages or reclaims that directory, and ad-hoc checkouts there are
+process violations subject to deletion without notice (owner decision
+2026-08-06; 28GB of orphaned QA checkouts motivated it). A broken or partial
+`node_modules` is deleted in-run and reinstalled — never renamed and kept
+(`node_modules-bad-*` dumps are the anti-pattern). At run end, remove any
+scratch the run created outside the run directory.
+
+Before every test, edit, or commit batch:
 
 1. print the current SHA;
 2. require a clean status except for named run artifacts;
