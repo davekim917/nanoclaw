@@ -726,7 +726,6 @@ async function sweep(): Promise<void> {
   // never be skipped past their due time.
   const sessionsStartedAtMs = Date.now();
   let skippedQuiet = 0;
-  let processed = 0;
   for (const session of sessions) {
     const mark = quietSessions.get(session.id);
     if (mark && Date.now() < mark.skipUntilMs && mark.lastActive === session.last_active) {
@@ -745,7 +744,13 @@ async function sweep(): Promise<void> {
     }
     // Yield to the macrotask queue so a large sweep batch cannot trip the
     // event-loop stall detector even on a cold tick.
-    if (++processed % 25 === 0) await new Promise((resolve) => setImmediate(resolve));
+    // Yield after EVERY swept session, not every 25. A swept session costs
+    // up to ~1.5s of synchronous SQLite/filesystem work, so a 10-session
+    // batch between yields was one contiguous 15s event-loop freeze — the
+    // dominant source of the residual 5-8s stall detections (and delivery
+    // latency) after the recovery-storm fixes. Per-session setImmediate
+    // overhead is microseconds against that cost.
+    await new Promise((resolve) => setImmediate(resolve));
   }
   // Bound the cache to sessions that still exist (closed sessions drop out
   // of getActiveSessions and would otherwise accumulate forever).
