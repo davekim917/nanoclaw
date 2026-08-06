@@ -852,6 +852,36 @@ describe('routing', () => {
     expect(routing.inReplyTo).toBe('m1');
   });
 
+  it('marks a batch of only agent_scheduled_wake rows as selfWake, and dispatch drops its bare text', () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+       VALUES ('schedule-wake-1', 'chat', datetime('now'), 'pending', 'chan-123', 'slack-x', NULL,
+               '{"text":"[system] check CI","sender":"system","senderId":"system","_system":{"kind":"agent_scheduled_wake"}}')`,
+      )
+      .run();
+
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+    expect(routing.selfWake).toBe(true);
+    expect(routing.taskRun).toBe(false);
+
+    // The spam shape: bare narration on a wake turn must be logged, not
+    // origin-fallback-delivered, and must not trigger the wrap nudge.
+    const result = dispatchResultText('Nothing moved. No post. Next check at 14:36 ET.', routing);
+    expect(result.sent).toBe(0);
+    expect(result.hasUnwrapped).toBe(false);
+
+    // A mixed batch (wake + real user message) is NOT selfWake.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+       VALUES ('m-user', 'chat', datetime('now'), 'pending', 'chan-123', 'slack-x', NULL, '{"text":"hi"}')`,
+      )
+      .run();
+    expect(extractRouting(getPendingMessages()).selfWake).toBe(false);
+  });
+
   it('skips system rows (recall_context) when picking the routing anchor', () => {
     // recall_context is inserted before its paired inbound message and would
     // otherwise hijack inReplyTo, making outbound replies attach to recall-X

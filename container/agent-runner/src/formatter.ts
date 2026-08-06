@@ -187,6 +187,12 @@ export interface RoutingContext {
   /** Batch is an isolated task run. Final-text message blocks are inert;
    *  only explicitly addressed tools deliver, and final text is logged. */
   taskRun: boolean;
+  /** Batch is solely the agent's own scheduled wake(s) (`wait` tool firing).
+   *  Explicit <message> blocks still deliver, but bare final text is
+   *  logged instead of origin-fallback-delivered: a wake's unwrapped
+   *  output is almost always self-narration ("nothing moved"), and
+   *  posting it spammed channels with no-op status lines. */
+  selfWake: boolean;
 }
 
 /**
@@ -256,6 +262,16 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
   // is task-only).
   const substantiveMessages = messages.filter((m) => m.kind !== 'system');
   const taskOnly = substantiveMessages.length > 0 && substantiveMessages.every((m) => m.kind === 'task');
+  const selfWakeOnly =
+    substantiveMessages.length > 0 &&
+    substantiveMessages.every((m) => {
+      try {
+        const c = JSON.parse(m.content) as { _system?: { kind?: string } };
+        return c?._system?.kind === 'agent_scheduled_wake';
+      } catch {
+        return false;
+      }
+    });
   const quietStatus = taskOnly && substantiveMessages.every((m) => {
     try {
       const c = JSON.parse(m.content);
@@ -275,6 +291,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     inReplyTo: first?.id ?? null,
     quietStatus,
     taskRun: taskOnly,
+    selfWake: selfWakeOnly,
   };
 }
 

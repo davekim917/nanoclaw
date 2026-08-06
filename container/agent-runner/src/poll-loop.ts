@@ -454,7 +454,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const sourceMessage = getMessageIn(savedWork.source_message_id);
       if (sourceMessage) {
         const sourceRouting = extractRouting([sourceMessage]);
-        routing = { ...sourceRouting, quietStatus: routing.quietStatus, taskRun: routing.taskRun };
+        routing = {
+          ...sourceRouting,
+          quietStatus: routing.quietStatus,
+          taskRun: routing.taskRun,
+          selfWake: routing.selfWake,
+        };
       }
     }
 
@@ -2095,7 +2100,12 @@ export function dispatchResultText(
   // per-destination routing via resolveDestinationThread, and we route to
   // the origin (not blindly broadcast) so we never bleed into another
   // channel.
-  if (!routing.taskRun && sent === 0 && scratchpad) {
+  // Self-wake turns are excluded: their unwrapped output is almost always
+  // self-narration of the "nothing changed, no post" decision, and the
+  // fallback turned that into channel spam (one no-op status line per wake).
+  // A wake that HAS news posts it via an explicit <message> block — the wake
+  // prompt states this contract.
+  if (!routing.taskRun && !routing.selfWake && sent === 0 && scratchpad) {
     const origin = findByRouting(routing.channelType, routing.platformId);
     if (origin) {
       sendToDestination(origin, scratchpad, routing);
@@ -2116,7 +2126,7 @@ export function dispatchResultText(
 
   // In a task run, plain final text is the NORMAL ending (it becomes the run
   // log) — never treat it as an undelivered reply or nudge the agent to wrap it.
-  const hasUnwrapped = !routing.taskRun && sent === 0 && !!scratchpad;
+  const hasUnwrapped = !routing.taskRun && !routing.selfWake && sent === 0 && !!scratchpad;
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }

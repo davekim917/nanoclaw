@@ -93,7 +93,11 @@ export async function applyScheduleWake(
     threadId: routing?.thread_id ?? null,
     sourceSessionId: anchoredRouting?.source_session_id ?? null,
     content: JSON.stringify({
-      text: `[system] ${prompt}`,
+      // Delivery contract stated at fire time: on a self-wake, bare final
+      // text is logged, never posted (see Routing.selfWake in the runner) —
+      // without this line agents narrated "nothing moved, no post" and the
+      // origin-fallback posted exactly that to the channel, every wake.
+      text: `[system] ${prompt}\n\n(Scheduled wake: bare final text is NOT delivered. Wrap anything that should post in a <message> block; if nothing needs posting, end with no message at all.)`,
       sender: 'system',
       senderId: 'system',
       _system: { kind: 'agent_scheduled_wake' },
