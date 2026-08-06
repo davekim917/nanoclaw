@@ -140,8 +140,11 @@ describe('fallbackChannelDefaults — behavior-faithful values', () => {
     const { fallbackChannelDefaults } = await import('./channel-registry.js');
     expect(fallbackChannelDefaults(true)).toEqual({
       dm: { engageMode: 'pattern', engagePattern: '.', threads: true, unknownSenderPolicy: 'request_approval' },
-      // Fork policy: plain mention, not mention-sticky (owner directive 2026-05-26).
-      group: { engageMode: 'mention', threads: true, unknownSenderPolicy: 'request_approval' },
+      // Fork policies: plain mention, not mention-sticky (owner directive
+      // 2026-05-26); group channels default public like the router
+      // auto-create branch (owner directive 2026-08-06) — DMs stay
+      // request_approval.
+      group: { engageMode: 'mention', threads: true, unknownSenderPolicy: 'public' },
       mentions: 'platform',
     });
     // threads track the raw capability in BOTH contexts so NULL-inherit

@@ -180,7 +180,13 @@ export function fallbackChannelDefaults(supportsThreads: boolean): ChannelDefaul
       // still win over this fallback.
       engageMode: 'mention',
       threads: supportsThreads,
-      unknownSenderPolicy: 'request_approval',
+      // Fork policy (owner directive 2026-08-06): group channels default
+      // public, matching the router auto-create branch — inviting the bot
+      // to a channel IS the access decision; teammates must not be silently
+      // black-holed behind a sender-approval cascade. DMs stay
+      // request_approval. Upstream's faithful fallback is 'request_approval'
+      // in both contexts.
+      unknownSenderPolicy: 'public',
     },
     mentions: 'platform',
   };
