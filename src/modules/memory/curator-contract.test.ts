@@ -300,6 +300,13 @@ describe('background memory curator contract', () => {
     // this the reject list's "raw output" wording suppressed exactly the query
     // patterns and debugging approaches agents narrate in chat.
     expect(prompt.system).toContain('is a durable workflow, not raw output');
+    // An operator correcting the agent's wrong architectural assumption is a
+    // capture signal that overrides the code-derived rejection. Live failure:
+    // "Postgres is cache, Snowflake is the materialized view" existed only in
+    // code and Graphify, the agent proposed a Postgres-only fix that the
+    // nightly sync would have reverted for 73 of 78 rows, and the owner had to
+    // correct it in-channel — proof the fact was not being recovered from code.
+    expect(prompt.system).toContain('the correction is proof that recovery from code failed');
     for (const code of CURATOR_CAPTURE_REASON_CODES) expect(prompt.system).toContain(code);
     expect(prompt.system).toContain('for noop both must be empty arrays');
   });
