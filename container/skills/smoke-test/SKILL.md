@@ -319,6 +319,27 @@ A commit is not a verified fix. After the exact fix SHA reaches the dev build:
 If deployment is unavailable, stop at `fixed_not_deployed`. State that limitation
 plainly; do not say the bug is fixed in the environment.
 
+When the deployment configures an issue tracker, each confirmed finding gets one
+issue there and the tracker — not a chat thread — is the cross-run record. Three
+rules make it consistent with the lifecycle above:
+
+- **The coordinator closes the issue, and only at `verified`.** A fix PR
+  references the issue (`Refs #N`), never with a closing keyword: auto-close on
+  merge records `fixed` as `verified` and lets the implementer certify its own
+  work, which this skill forbids. Tracker state then needs no status labels —
+  open with no linked PR means unfixed, open with a merged PR means awaiting
+  re-verification, closed means verified on a deployed build.
+- **Classify regression versus gap at filing time.** A regression has evidence
+  of prior working behavior and may be fixed autonomously. A gap — behavior
+  never specified — is a product decision: mark it as such and do not hand it
+  off as fix work. If the two cannot be told apart, it is a gap.
+- **A surface with no deployed-verification path stays out of the lifecycle.**
+  If nothing in the environment can prove a fix for that surface reached a
+  deployed build, its findings cannot reach `verified`; report them and route
+  them to planning rather than opening an unclosable loop.
+- Cap autonomous repair: after two failed re-verifications of the same finding,
+  stop, mark it escalated, and hand it to a human.
+
 ## 8. Report one verdict
 
 Outcome tokens (`PASS`, `NO_GO`, `BLOCKED_BUILD_IDENTITY`, `CLEAR`, finding
