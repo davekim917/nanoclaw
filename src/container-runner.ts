@@ -3546,7 +3546,11 @@ async function buildContainerArgs(
       const stubPath = path.join(workspaceHostRoot, mount.containerPath.slice('/workspace/'.length));
       try {
         if (fs.existsSync(stubPath)) continue;
-        const sourceIsFile = fs.existsSync(mount.hostPath) && fs.lstatSync(mount.hostPath).isFile();
+        // statSync, not lstatSync: a symlink source (AGENTS.md -> CLAUDE.md)
+        // must stub as what it RESOLVES to — lstat said "not a file" for the
+        // symlink, the stub became a directory, and Docker then failed the
+        // file bind-mount with "not a directory" on every owner-group spawn.
+        const sourceIsFile = fs.existsSync(mount.hostPath) && fs.statSync(mount.hostPath).isFile();
         if (sourceIsFile) {
           fs.mkdirSync(path.dirname(stubPath), { recursive: true });
           fs.writeFileSync(stubPath, '');
