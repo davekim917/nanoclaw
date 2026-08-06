@@ -31,17 +31,13 @@ function runMigration(execute: boolean): string {
   // pnpm_config_verify_deps_before_run makes each nested exec burn ~80s of
   // CPU before running anything (pnpm 10.33), timing the spawn out.
   const tsxBin = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
-  return execFileSync(
-    tsxBin,
-    [SCRIPT, '--workgroup', 'testwg', '--root', root, ...(execute ? ['--execute'] : [])],
-    {
-      cwd: process.cwd(),
-      stdio: 'pipe',
-      encoding: 'utf-8',
-      timeout: 180_000,
-      env: { ...process.env, NANOCLAW_DATA_DIR: dataDir, PATH: process.env.PATH },
-    },
-  ).toString();
+  return execFileSync(tsxBin, [SCRIPT, '--workgroup', 'testwg', '--root', root, ...(execute ? ['--execute'] : [])], {
+    cwd: process.cwd(),
+    stdio: 'pipe',
+    encoding: 'utf-8',
+    timeout: 180_000,
+    env: { ...process.env, NANOCLAW_DATA_DIR: dataDir, PATH: process.env.PATH },
+  }).toString();
 }
 
 beforeEach(() => {
