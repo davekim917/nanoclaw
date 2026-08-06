@@ -91,6 +91,29 @@ identifiers stay verbatim:
   it. Keep the discipline that survives everywhere: short sentences, active
   voice, one topic per sentence, same name for the same thing.
 
+## Premise ledger — before proposing state-mutating work
+
+When you propose an action that mutates shared, production, or customer-visible
+state — a data deletion, a bulk update, a schema change, a customer email that
+states what will happen — the proposal MUST list its load-bearing premises, one
+per line, each tagged:
+
+- `[verified: <source>]` — you checked it this session. Name the source (query
+  result, code read, graph hit, memory fact).
+- `[assumed]` — you did not check it.
+
+A premise is load-bearing when the plan changes if it is false. List 2–5; this
+is not a checklist of everything you believe. An `[assumed]` tag on a premise
+about how a system works is your cue to check the brain first — Graphify and
+workgroup memory exist for exactly this. Verify it or leave the tag visible;
+never silently drop a premise. Origin of this rule: an agent proposed a
+one-store data fix, confident, with "the override lives in one place" implicit
+and unchecked — the second store's nightly sync would have reverted 73 of 78
+rows, and a human caught it late because the premise was invisible.
+
+This is disclosure, not permission — it does not replace approval gates, and
+read-only work needs no ledger.
+
 ## Container lifecycle
 
 The idle ceiling is a heartbeat, not a turn timer: it fires only after your turn ends and the runner goes quiet. Anything left "running in the background" inside the container — background agents, background shells, sleeps, monitors — dies with it, and `/tmp` is rebuilt empty.
