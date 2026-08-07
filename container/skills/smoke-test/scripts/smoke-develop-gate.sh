@@ -54,6 +54,13 @@ UNSETTLED_ALERT_SECONDS="${SMOKE_GATE_UNSETTLED_ALERT_SECONDS:-2700}"
 # three-way SHA equality can never happen.
 FRONTEND_PATHS="${SMOKE_GATE_FRONTEND_PATHS:-}"
 BACKEND_PATHS="${SMOKE_GATE_BACKEND_PATHS:-}"
+# `check` runs the poll derivation and reports settledness WITHOUT mutating
+# state or claiming anything. It exists for human-requested campaigns, which
+# freeze on a person's word rather than on a gate wake and would otherwise
+# judge "is this head testable" by eye — the failure that voided the
+# 2026-08-07 marketing campaign, whose frozen pair was replaced by a merge
+# burst two minutes after the freeze.
+READONLY=false
 
 mkdir -p "$STATE_DIR"
 exec 9>"$LOCK_FILE"
@@ -93,6 +100,7 @@ read_state() {
 
 write_state() {
   local next="$1" tmp
+  [ "$READONLY" = true ] && return 0
   tmp="$(mktemp "$STATE_DIR/.develop-state.XXXXXX")"
   printf '%s\n' "$next" > "$tmp"
   mv "$tmp" "$STATE_FILE"
@@ -130,6 +138,15 @@ write_active_file() {
 
 STATE="$(read_state)"
 COMMAND="${1:-poll}"
+
+# `check` is `poll` with every write suppressed and an early exit once
+# readiness is known. Reusing the poll derivation is the point: a campaign
+# must be judged testable by the SAME rule the watcher uses, not a parallel
+# one that can drift away from it.
+if [ "$COMMAND" = "check" ]; then
+  READONLY=true
+  COMMAND=poll
+fi
 
 if [ "$COMMAND" = "finish" ]; then
   SHA="${2:-}"
@@ -188,6 +205,101 @@ if [ "$COMMAND" = "finish" ]; then
   exit 0
 fi
 
+# Is the currently-recorded active run still live? Shared by `claim` (refuse to
+# stomp a running campaign) and the poll path (reclaim an abandoned one).
+active_run_is_live() {
+  local started="$1" progress="$2" now_epoch started_epoch progress_epoch last quiet age
+  now_epoch="$(date -u +%s)"
+  started_epoch="$(epoch_or_zero "$started")"
+  progress_epoch="$(epoch_or_zero "$progress")"
+  last="$started_epoch"
+  if [ "$progress_epoch" -gt "$last" ]; then last="$progress_epoch"; fi
+  age="$(( now_epoch - started_epoch ))"
+  quiet="$(( now_epoch - last ))"
+  if [ "$age" -lt "$ACTIVE_STALE_SECONDS" ] && [ "$quiet" -lt "$PROGRESS_STALE_SECONDS" ]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+# Register a human-requested campaign as the active run. This is the ONLY way a
+# chat-initiated campaign becomes stampable: `progress` keys on activeRunId, so
+# without a claim a campaign is invisible to the watcher, which then starts a
+# competing run on the same environment, browser lease and worktree.
+#
+# `claim` deliberately carries no verdict authority. It cannot write the hold
+# file, the publish artifact, or completedSha — only `finish` does, and a
+# campaign that never routed through the gate must never call it. Release with
+# `release`, which clears the slot and nothing else.
+if [ "$COMMAND" = "claim" ]; then
+  RUN_ID="${2:-}"
+  SHA="${3:-}"
+  MERGE_HOLD="${4:-true}"
+  if [ -z "$RUN_ID" ]; then
+    jq -cn '{ok:false,error:"claim requires a run id"}'
+    exit 2
+  fi
+  if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+    jq -cn '{ok:false,error:"claim requires the 40-character frozen source SHA"}'
+    exit 2
+  fi
+  case "$MERGE_HOLD" in
+    true|false) ;;
+    *) jq -cn '{ok:false,error:"claim merge-hold argument must be true or false"}'; exit 2 ;;
+  esac
+  ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
+  if [ -n "$ACTIVE_RUN" ] && [ "$ACTIVE_RUN" != "$RUN_ID" ] &&
+     [ "$(active_run_is_live "$(jq -r '.activeStartedAt // empty' <<<"$STATE")" \
+                             "$(jq -r '.activeProgressAt // empty' <<<"$STATE")")" = true ]; then
+    jq -cn --arg active "$ACTIVE_RUN" --arg sha "$(jq -r '.activeSha // empty' <<<"$STATE")" \
+      '{ok:false,error:"another run already owns the environment — wait for it or ask its coordinator",
+        activeRunId:$active,activeSha:(if $sha == "" then null else $sha end)}'
+    exit 0
+  fi
+  NOW="$(iso_now)"
+  STATE="$(jq -c --arg sha "$SHA" --arg now "$NOW" --arg run "$RUN_ID" \
+    '.activeSha=$sha |
+     .activeStartedAt=$now |
+     .activeRunId=$run |
+     .activeProgressAt=$now |
+     .candidateSha=null |
+     .candidateFirstSeen=null' <<<"$STATE")"
+  write_state "$STATE"
+  # A campaign that wants the build to keep moving (its own browser lanes are
+  # blocked, a fix must land) opts out; the watcher is still suppressed either
+  # way, which is the part that prevents two runs on one environment.
+  if [ "$MERGE_HOLD" = true ]; then
+    write_active_file "$RUN_ID" "$SHA" "$NOW" "$NOW"
+  elif [ -n "$ACTIVE_FILE" ]; then
+    rm -f "$ACTIVE_FILE"
+  fi
+  jq -cn --arg run "$RUN_ID" --arg sha "$SHA" --argjson hold "$MERGE_HOLD" \
+    '{ok:true,runId:$run,sha:$sha,mergeHold:$hold}'
+  exit 0
+fi
+
+# Release the active slot without recording a verdict. Use this to end a
+# human-requested campaign: the watcher is free again, no hold is raised, and
+# no hold another run raised is cleared.
+if [ "$COMMAND" = "release" ]; then
+  RUN_ID="${2:-}"
+  ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
+  if [ -z "$RUN_ID" ] || [ "$RUN_ID" != "$ACTIVE_RUN" ]; then
+    jq -cn --arg run "$RUN_ID" --arg active "$ACTIVE_RUN" \
+      '{ok:false,error:"not the active run — nothing released",
+        runId:(if $run == "" then null else $run end),
+        activeRunId:(if $active == "" then null else $active end)}'
+    exit 0
+  fi
+  STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null |
+                  .activeProgressAt=null' <<<"$STATE")"
+  write_state "$STATE"
+  [ -n "$ACTIVE_FILE" ] && rm -f "$ACTIVE_FILE"
+  jq -cn --arg run "$RUN_ID" '{ok:true,releasedRunId:$run}'
+  exit 0
+fi
+
 # Liveness stamp. The coordinator calls `progress <run-id>` after the freeze
 # and at least every 15 minutes while lanes run. ok:false means the run is no
 # longer the active one (reclaimed or finished) — the caller must stop that
@@ -212,7 +324,9 @@ if [ "$COMMAND" = "progress" ]; then
 fi
 
 if [ "$COMMAND" != "poll" ]; then
-  jq -cn --arg command "$COMMAND" '{ok:false,error:("unknown command: " + $command)}'
+  jq -cn --arg command "$COMMAND" \
+    '{ok:false,error:("unknown command: " + $command),
+      commands:["poll","check","claim","release","progress","finish"]}'
   exit 2
 fi
 
@@ -236,7 +350,7 @@ if [ -n "$MISSING" ]; then
   write_state "$STATE"
   jq -cn --argjson wake "$WAKE" \
     --argjson missing "$(printf '%s\n' $MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-    '{wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_misconfigured",missing:$missing}}'
+    '{wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_misconfigured",settled:false,missing:$missing}}'
   exit 0
 fi
 
@@ -301,7 +415,7 @@ if [ "$FETCH_OK" != true ]; then
   fi
   write_state "$STATE"
   jq -cn --argjson wake "$WAKE" --argjson failures "$FAILURES" \
-    '{wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_fetch_failed",consecutiveFailures:$failures}}'
+    '{wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_fetch_failed",settled:false,consecutiveFailures:$failures}}'
   exit 0
 fi
 
@@ -357,6 +471,42 @@ elif [ "$CI_READY" = true ]; then
     FRONTEND_LAG_ACCEPTED=true
   fi
   if [ "$BACKEND_OK" = true ] && [ "$FRONTEND_OK" = true ]; then DEPLOY_READY=true; fi
+fi
+
+# `check` stops here: readiness is known, and everything past this point is
+# claim/debounce bookkeeping a read-only caller must not participate in.
+# It reports the same CI and deploy facts the watcher acts on, so a campaign
+# can quote them in its run record instead of asserting the build settled.
+if [ "$READONLY" = true ]; then
+  jq -cn \
+    --argjson ciReady "$CI_READY" \
+    --argjson deployReady "$DEPLOY_READY" \
+    --arg sha "$SOURCE_SHA" \
+    --arg backend "$BACKEND_SHA" \
+    --arg frontend "$FRONTEND_SHA" \
+    --arg activeRun "$(jq -r '.activeRunId // empty' <<<"$STATE")" \
+    --arg completed "$(jq -r '.completedSha // empty' <<<"$STATE")" \
+    --argjson checks "$CHECK_TOTAL" \
+    --argjson pending "$CHECK_PENDING" \
+    --argjson failed "$CHECK_FAILED" \
+    --argjson succeeded "$CHECK_SUCCESS" \
+    --argjson backendLag "$BACKEND_LAG_ACCEPTED" \
+    --argjson frontendLag "$FRONTEND_LAG_ACCEPTED" \
+    '{ok:true,
+      settled:($ciReady and $deployReady),
+      sourceSha:$sha,
+      backendDeploySha:$backend,
+      frontendDeploySha:$frontend,
+      ciReady:$ciReady,
+      deployReady:$deployReady,
+      checkCount:$checks,
+      pendingChecks:$pending,
+      failedChecks:$failed,
+      succeededChecks:$succeeded,
+      deployLagAccepted:{backend:$backendLag,frontend:$frontendLag},
+      activeRunId:(if $activeRun == "" then null else $activeRun end),
+      completedSha:(if $completed == "" then null else $completed end)}'
+  exit 0
 fi
 
 emit_no_wake() {
@@ -423,17 +573,13 @@ if [ "$COMPLETED_SHA" = "$SOURCE_SHA" ]; then
 fi
 
 if [ -n "$ACTIVE_SHA" ]; then
-  ACTIVE_EPOCH="$(epoch_or_zero "$ACTIVE_STARTED")"
-  ACTIVE_AGE="$(( NOW_EPOCH - ACTIVE_EPOCH ))"
   # A run is live while its newest liveness signal (progress stamp, else the
   # start itself) is fresh AND it is under the hard age ceiling. A killed
   # container stops stamping, so the run goes reclaimable after
-  # PROGRESS_STALE_SECONDS of silence instead of the full ceiling.
-  PROGRESS_EPOCH="$(epoch_or_zero "$(jq -r '.activeProgressAt // empty' <<<"$STATE")")"
-  LAST_ACTIVITY_EPOCH="$ACTIVE_EPOCH"
-  if [ "$PROGRESS_EPOCH" -gt "$LAST_ACTIVITY_EPOCH" ]; then LAST_ACTIVITY_EPOCH="$PROGRESS_EPOCH"; fi
-  QUIET_FOR="$(( NOW_EPOCH - LAST_ACTIVITY_EPOCH ))"
-  if [ "$ACTIVE_AGE" -lt "$ACTIVE_STALE_SECONDS" ] && [ "$QUIET_FOR" -lt "$PROGRESS_STALE_SECONDS" ]; then
+  # PROGRESS_STALE_SECONDS of silence instead of the full ceiling. Shared with
+  # `claim` so a campaign and the watcher can never disagree about liveness.
+  if [ "$(active_run_is_live "$ACTIVE_STARTED" \
+            "$(jq -r '.activeProgressAt // empty' <<<"$STATE")")" = true ]; then
     if [ "$ACTIVE_SHA" != "$SOURCE_SHA" ]; then
       if [ "$CANDIDATE_SHA" != "$SOURCE_SHA" ]; then
         STATE="$(jq -c --arg sha "$SOURCE_SHA" --arg now "$NOW" '.candidateSha=$sha | .candidateFirstSeen=$now' <<<"$STATE")"

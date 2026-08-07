@@ -125,6 +125,10 @@ record its full SHA, and confirm that the dev deployment serves that SHA. If the
 deployed SHA cannot be proved, report the run as `BLOCKED_BUILD_IDENTITY`; do not
 attach a confident verdict to an unknown build.
 
+A scheduled run arrives with the head already proven settled by the gate. A
+campaign someone asked for in chat does not, and must prove it before freezing
+and claim the environment after — see "Human-requested campaigns" below.
+
 Recheck source, frontend deploy, and backend deploy immediately before the
 public run root, immediately before each worker starts, and when evidence is
 captured. A deploy that changes after the gate wake voids the frozen run even
@@ -482,6 +486,67 @@ bash /workspace/agent/smoke-develop-gate.sh progress <run-id>
 
 An `ok:false` response means this run is no longer the active one (reclaimed
 or finished): stop the campaign immediately instead of double-running the SHA.
+
+### Human-requested campaigns
+
+A campaign someone asks for in chat gets no gate wake, so it inherits none of
+the gate's guarantees: nobody has proved the head is testable, and the watcher
+does not know the environment is taken. Both gaps are real. On 2026-08-07 a
+requested campaign froze a pair by eye while the merge queue was draining;
+four PRs landed and both services redeployed within five minutes, and every
+browser observation in the run belonged to a build the run's own header did
+not name. Run these three commands — the campaign is otherwise invisible to
+the same machinery that protects a scheduled run.
+
+**Before freezing, prove the head is settled** with the same rule the watcher
+uses. `check` is read-only: it claims nothing, debounces nothing, and writes
+no state.
+
+```bash
+bash /workspace/agent/smoke-develop-gate.sh check
+```
+
+Freeze only on `settled: true`, and record the returned `sourceSha`,
+`backendDeploySha`, `frontendDeploySha` and `deployLagAccepted` in the run
+record as the proof. Anything else — `ciReady:false`, a pending or failed
+check, an unaccepted deploy lag, `gate_fetch_failed` — means the head is not
+testable yet. Say so and wait; do not freeze on a build you cannot prove.
+`settled: true` is a statement about this instant, so freeze immediately
+after and recheck at every point §1 already requires.
+
+**Then claim the slot**, using the frozen SHA:
+
+```bash
+bash /workspace/agent/smoke-develop-gate.sh claim <run-id> <source-sha> [true|false]
+```
+
+The claim is what makes the campaign visible: the watcher reports
+`queued_behind_active_run` instead of starting a competing run on the same
+environment, browser lease and worktree, and `progress` starts working —
+without a claim it always answers `ok:false`, because it keys on the active
+run. Stamp liveness from then on exactly as a scheduled run does; a campaign
+that stops stamping for 30 minutes is reclaimed, which is correct.
+
+The optional third argument is the merge hold, default `true`. Leave it true
+while browser lanes are running — a build that moves under an open campaign
+is the failure above. Pass `false` deliberately when the campaign wants merges
+to continue: its browser lanes are blocked on something else, or a confirmed
+fix should land now and the campaign will re-freeze on the new build. Either
+way the watcher stays suppressed; only the merge queue is released.
+
+**End with `release`, never `finish`:**
+
+```bash
+bash /workspace/agent/smoke-develop-gate.sh release <run-id>
+```
+
+`release` frees the slot and does nothing else. `finish` is verdict authority —
+it records a completed SHA, publishes the verdict artifact, and raises or
+clears the promotion hold. A campaign that never routed through the gate has
+not earned any of that, and a `GO` from one would clear a hold raised by a run
+it never exercised. `claim` cannot write those artifacts at all, and neither
+can `release`; that separation is deliberate, not a convention to be careful
+about.
 
 When `SMOKE_GATE_PUBLISH_FILE` is set in the wrapper, `finish` also writes the
 terminal verdict as a small JSON artifact (`{sha, runId, verdict, finishedAt}`)
