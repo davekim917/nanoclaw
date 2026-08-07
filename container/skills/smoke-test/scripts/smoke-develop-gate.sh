@@ -265,7 +265,14 @@ SOURCE_SHA="$(jq -r '.commit.sha // empty' "$TMP_DIR/branch.json" 2>/dev/null)"
 CHECK_TOTAL="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha)] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
 CHECK_PENDING="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha and .status != "completed")] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
 CHECK_FAILED="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha) | select((.conclusion // "") as $c | (["success","skipped","neutral"] | index($c) | not))] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
-FRONTEND_CHECKS="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha and .workflowName == "Frontend CI" and .status == "completed" and .conclusion == "success")] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
+# Any completed successful run counts. Requiring one NAMED workflow here
+# ("Frontend CI") deadlocked every backend-only merge forever: the workflow
+# is path-filtered, never starts, and a run that never existed reads the
+# same as zero. Requiring ≥1 success (rather than deleting the term) keeps
+# the gate fail-closed on a head where every triggered workflow was
+# path-skipped — CHECK_FAILED allowlists "skipped", so total>0/pending=0/
+# failed=0 alone would clear a head with zero CI actually executed.
+CHECK_SUCCESS="$(jq -r --arg sha "$SOURCE_SHA" '[.[]? | select(.headSha == $sha and .status == "completed" and .conclusion == "success")] | length' "$TMP_DIR/checks.json" 2>/dev/null)"
 BACKEND_SHA="$(jq -r '[.[]? | (.deploy // .) | select(.status == "live")][0].commit.id // empty' "$TMP_DIR/backend.json" 2>/dev/null)"
 FRONTEND_SHA="$(jq -r '[.[]? | (.deploy // .) | select(.status == "live")][0].commit.id // empty' "$TMP_DIR/frontend.json" 2>/dev/null)"
 
@@ -273,7 +280,7 @@ if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
    ! printf '%s' "$BACKEND_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
    ! printf '%s' "$FRONTEND_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
    ! printf '%s' "$CHECK_TOTAL" | grep -Eq '^[0-9]+$' ||
-   ! printf '%s' "$FRONTEND_CHECKS" | grep -Eq '^[0-9]+$'; then
+   ! printf '%s' "$CHECK_SUCCESS" | grep -Eq '^[0-9]+$'; then
   FETCH_OK=false
 fi
 
@@ -302,7 +309,7 @@ STATE="$(jq -c '.fetchFailures=0' <<<"$STATE")"
 NOW="$(iso_now)"
 NOW_EPOCH="$(date -u +%s)"
 CI_READY=false
-if [ "$CHECK_TOTAL" -gt 0 ] && [ "$FRONTEND_CHECKS" -gt 0 ] && [ "$CHECK_PENDING" -eq 0 ] && [ "$CHECK_FAILED" -eq 0 ]; then
+if [ "$CHECK_TOTAL" -gt 0 ] && [ "$CHECK_SUCCESS" -gt 0 ] && [ "$CHECK_PENDING" -eq 0 ] && [ "$CHECK_FAILED" -eq 0 ]; then
   CI_READY=true
 fi
 # Is a lagging live deploy still the correct artifact for the source SHA?
