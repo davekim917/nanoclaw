@@ -249,6 +249,31 @@ When two NanoClaw agents are wired to the same channel, each has its own bot use
 - To end the back-and-forth, stop `@`-mentioning the peer. Default to dropping it after ~3–4 exchanges with no progress — runaway loops waste tokens.
 - The self-echo filter drops only messages from YOUR OWN bot id; cross-sibling mentions work because each sibling is a distinct bot user.
 
+### Check the room, not the roster
+
+Channel membership is live state, and a human @-mentioning someone changes it
+mid-thread — the mention itself auto-wires them. So:
+
+- **A sibling that has posted in this thread is reachable in this thread.**
+  Reply here and @-mention it. Never hand the assignment to a third agent to
+  carry somewhere else.
+- **Never settle "can X be reached here" from a roster, a runbook, or the
+  message archive.** Those record where someone HAS posted, never where they
+  are now. The thread already in front of you outranks all three.
+- **An assignment that arrives with a premise attached** — "Codex is capped",
+  "X isn't in this room", "nobody has reviewed this" — is not a fact you
+  inherit. Check it before executing, starting with the thread it came from,
+  read to its last message. If the premise is dead, say so and stop. A dead
+  premise executed faithfully is a second bug, not obedience.
+- **Before accepting work, check whether you already did it.** Your own last
+  few messages are the cheapest source you have.
+
+Origin: on 2026-08-07 three agents in a row acted on "Jian-Yang isn't in
+#dispatch" — first asserted 36 seconds after Jian-Yang posted in #dispatch,
+and 97 seconds after the wiring existed. Nobody re-read the thread. It cost a
+full duplicate review of five PRs and a stale report delivered into a decision
+that had already been made.
+
 ### When the user @-mentions BOTH you and your sibling in one message
 
 You both wake independently — there is no router-side disambiguation. **Parse which work is for YOU** and ack only your slice:

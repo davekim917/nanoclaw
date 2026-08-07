@@ -29,6 +29,7 @@ import {
   createMessagingGroupAgent,
   getMessagingGroupAgents,
   getMessagingGroupWithAgentCount,
+  updateMessagingGroup,
 } from './db/messaging-groups.js';
 import { getDb } from './db/connection.js';
 import {
@@ -542,6 +543,21 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           channelType: event.channelType,
           platformId: event.platformId,
         });
+        // Resolve the channel name the same way the approval path does. Only
+        // that path used to do it, so a workspace-trust auto-wire left name
+        // NULL forever — the row was invisible to any name-keyed roster query,
+        // and the agent's own pre-turn context (channelName, below) told it it
+        // was nowhere. A sibling auto-wired into #dispatch mid-thread on
+        // 2026-08-07 could not name the room it was posting in. Non-critical:
+        // never let a name lookup undo a wiring that already succeeded.
+        try {
+          if (adapter?.resolveChannelName) {
+            const name = await adapter.resolveChannelName(mg.platform_id);
+            if (name) updateMessagingGroup(mg.id, { name });
+          }
+        } catch {
+          /* non-critical — the wiring stands either way */
+        }
         // Re-enter routing with the fresh wiring in place.
         return routeInboundClaimed(event, markReplayPending);
       } catch (err) {

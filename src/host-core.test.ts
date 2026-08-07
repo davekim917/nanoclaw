@@ -1020,6 +1020,85 @@ describe('router — per-wiring thread policy', () => {
     await routeInbound(mention('tp-undeclared', 'tp:U1', true));
     expect(getMessagingGroupByPlatform('tp-undeclared', 'tp:U1')!.unknown_sender_policy).toBe('public');
   });
+
+  it('workspace-trust auto-wire resolves and persists the channel name', async () => {
+    const { registerChannelAdapter, initChannelAdapters, teardownChannelAdapters } =
+      await import('./channels/channel-registry.js');
+    const { routeInbound } = await import('./router.js');
+    const { getMessagingGroupByPlatform } = await import('./db/messaging-groups.js');
+
+    // An existing wiring in the same workspace is what lets a new channel
+    // inherit without an approval card — that is the path that used to skip
+    // the name lookup the approval path always did.
+    createMessagingGroup({
+      id: 'mg-ws-seed',
+      channel_type: 'slack-testws',
+      platform_id: 'slack:C-SEED',
+      name: '#seed',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-ws-seed',
+      messaging_group_id: 'mg-ws-seed',
+      agent_group_id: 'ag-tp',
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
+      created_at: now(),
+    });
+
+    registerChannelAdapter('slack-testws', {
+      factory: () => ({
+        name: 'slack-testws',
+        channelType: 'slack-testws',
+        supportsThreads: true,
+        async setup() {},
+        async teardown() {},
+        isConnected: () => true,
+        async deliver() {
+          return undefined;
+        },
+        resolveChannelName: async () => '#dispatch',
+      }),
+    });
+    await initChannelAdapters(() => ({
+      onInbound: () => {},
+      onInboundEvent: () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    }));
+
+    try {
+      await routeInbound({
+        channelType: 'slack-testws',
+        platformId: 'slack:C-NEW',
+        threadId: null,
+        message: {
+          id: 'msg-ws-new',
+          kind: 'chat',
+          content: JSON.stringify({ sender: 'U', text: '@bot hi' }),
+          timestamp: now(),
+          isMention: true,
+          isGroup: true,
+        },
+      });
+
+      // Before the fix this stayed null forever: the row was invisible to any
+      // name-keyed roster query, and the agent's own pre-turn context could
+      // not name the room it had just been wired into.
+      expect(getMessagingGroupByPlatform('slack-testws', 'slack:C-NEW')!.name).toBe('#dispatch');
+    } finally {
+      await teardownChannelAdapters();
+    }
+  });
 });
 
 describe('routing metadata preservation', () => {
