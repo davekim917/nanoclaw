@@ -28,16 +28,27 @@ fi
 
 mkdir -p "$TARGET"
 cp -r "$RUNTIME/src" "$TARGET/src"
+cp -r "$RUNTIME/public" "$TARGET/public"
 cp "$RUNTIME/package.json" "$RUNTIME/tsconfig.json" "$RUNTIME/remotion.config.ts" "$TARGET/"
 ln -s "$RUNTIME/node_modules" "$TARGET/node_modules"
 
 cat <<EOF
 Scaffolded $TARGET
 
-  cd $TARGET
-  # edit src/Root.tsx (compositions) and src/Demo.tsx (the composition itself)
-  npx remotion render src/index.ts Demo out.mp4
+Two compositions are registered:
 
-Render the untouched starter first — if that produces an mp4, the runtime is
-fine and any later failure is your composition.
+  Demo       runtime smoke test — render this FIRST
+  DemoVideo  data-driven product demo, driven by src/demo/timeline.json
+
+  cd $TARGET
+  npx remotion render src/index.ts Demo out.mp4        # proves the toolchain
+  npx remotion render src/index.ts DemoVideo demo.mp4  # renders the timeline
+
+If the smoke test produces an mp4, the runtime is fine and any later failure is
+your composition or your timeline.
+
+To build a real demo: put full-resolution screenshots in public/shots/, describe
+them in src/demo/timeline.json (one entry per step, with the element rect from
+\`agent-browser get box <sel> --json\`), then render DemoVideo. Duration follows
+the timeline — you do not edit Root.tsx.
 EOF

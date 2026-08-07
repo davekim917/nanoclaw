@@ -12,6 +12,7 @@ export const CONTAINER_PLUGINS_ROOT = '/workspace/plugins';
 export type UpdateKind =
   | 'host-dependency'
   | 'bun-dependency'
+  | 'remotion-dependency'
   | 'dockerfile-pin'
   | 'graphify'
   | 'codex-sync'
@@ -398,10 +399,17 @@ function readArg(dockerfile: string, name: string): string | null {
   return match?.[1] ?? null;
 }
 
+/** id prefix per dependency manifest — every manifest the audit scans needs one. */
+const DEPENDENCY_ID_PREFIX: Record<'host-dependency' | 'bun-dependency' | 'remotion-dependency', string> = {
+  'host-dependency': 'host',
+  'bun-dependency': 'bun',
+  'remotion-dependency': 'remotion',
+};
+
 async function auditDependencies(
   repoRoot: string,
   relativePackageJson: string,
-  kind: 'host-dependency' | 'bun-dependency',
+  kind: 'host-dependency' | 'bun-dependency' | 'remotion-dependency',
   surface: UpdateSurface,
   fetchJson: JsonFetcher,
 ): Promise<AuditItem[]> {
@@ -416,7 +424,7 @@ async function auditDependencies(
       const current = dependencyVersion(specifier);
       const entry = policy.get(name);
       const base: Omit<AuditItem, 'latest' | 'status' | 'detail' | 'tag'> = {
-        id: `${kind === 'host-dependency' ? 'host' : 'bun'}:${name}`,
+        id: `${DEPENDENCY_ID_PREFIX[kind]}:${name}`,
         name,
         kind,
         surface,
@@ -581,9 +589,14 @@ export async function auditRepository(
   repoRoot: string,
   fetchJson: JsonFetcher = defaultFetchJson,
 ): Promise<AuditItem[]> {
-  const [host, bun, sourceText, dockerfile, graphifyText] = await Promise.all([
+  const [host, bun, remotion, sourceText, dockerfile, graphifyText] = await Promise.all([
     auditDependencies(repoRoot, 'package.json', 'host-dependency', 'host', fetchJson),
     auditDependencies(repoRoot, 'container/agent-runner/package.json', 'bun-dependency', 'container', fetchJson),
+    // Remotion video runtime baked at /opt/remotion. A third dependency
+    // manifest that the audit would otherwise never see — an unaudited
+    // manifest rots silently, which is the whole failure this tool exists to
+    // prevent.
+    auditDependencies(repoRoot, 'container/remotion/package.json', 'remotion-dependency', 'container', fetchJson),
     readFile(path.join(repoRoot, 'container/update-sources.json'), 'utf8'),
     readFile(path.join(repoRoot, 'container/Dockerfile'), 'utf8'),
     readFile(path.join(repoRoot, 'container/graphify-integration.json'), 'utf8'),
@@ -631,7 +644,9 @@ export async function auditRepository(
     auditCodexSources(manifest, fetchJson),
     auditPluginVersions(manifest, fetchJson),
   ]);
-  return [...host, ...bun, ...docker, graphifyItem, ...codex, ...plugins].sort((a, b) => a.id.localeCompare(b.id));
+  return [...host, ...bun, ...remotion, ...docker, graphifyItem, ...codex, ...plugins].sort((a, b) =>
+    a.id.localeCompare(b.id),
+  );
 }
 
 function statusLabel(status: AuditStatus): string {
@@ -777,6 +792,7 @@ export async function applySelectedUpdates(options: {
   }
   const host = selected.filter((item) => item.kind === 'host-dependency');
   const bun = selected.filter((item) => item.kind === 'bun-dependency');
+  const remotion = selected.filter((item) => item.kind === 'remotion-dependency');
   const docker = selected.filter((item) => item.kind === 'dockerfile-pin');
   const graphify = selected.filter((item) => item.kind === 'graphify');
 
@@ -788,6 +804,15 @@ export async function applySelectedUpdates(options: {
     const runnerRoot = path.join(repoRoot, 'container/agent-runner');
     await updatePackageJson(path.join(runnerRoot, 'package.json'), bun);
     await run(['bun', 'install', '--lockfile-only'], runnerRoot);
+  }
+  if (remotion.length > 0) {
+    const remotionRoot = path.join(repoRoot, 'container/remotion');
+    await updatePackageJson(path.join(remotionRoot, 'package.json'), remotion);
+    // --ignore-workspace is REQUIRED: the repo root's pnpm-workspace.yaml
+    // otherwise makes pnpm resolve against the host workspace and refuse to
+    // write a nested lockfile, leaving package.json bumped against a stale
+    // lock and the Dockerfile's --frozen-lockfile install failing at build.
+    await run(['pnpm', 'install', '--lockfile-only', '--ignore-workspace'], remotionRoot);
   }
   if (docker.length > 0) {
     const sources = JSON.parse(

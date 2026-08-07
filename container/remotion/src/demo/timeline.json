@@ -1,0 +1,22 @@
+{
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "title": "Product Demo",
+  "subtitle": "Replace this timeline with your own capture",
+  "steps": [
+    {
+      "shot": "01-placeholder.png",
+      "hold": 3,
+      "caption": "Establishing shot — no focus box, so the camera holds wide.",
+      "action": "look"
+    },
+    {
+      "shot": "02-placeholder.png",
+      "hold": 3.5,
+      "caption": "Camera pushes onto the element and clicks it.",
+      "focus": { "x": 1180, "y": 300, "width": 260, "height": 90 },
+      "action": "click"
+    }
+  ]
+}

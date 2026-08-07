@@ -39,46 +39,80 @@ API. This skill only covers the local wiring and the recipes below.
 
 ## Product demos from agent-browser evidence
 
-The high-value case: turn a UI walkthrough into a demo that looks art-directed
-rather than screen-recorded.
+**The `DemoVideo` composition already implements this — you supply data, not
+animation code.** Scaffolding gives you `src/demo/`:
 
-**Build it from screenshots, not from the screen recording.** `agent-browser
-record` is locked at 10fps, so zooming into that footage is soft and choppy.
-Screenshots have no such limit:
+| File | What it is |
+|---|---|
+| `timeline.json` | **The only file you normally edit.** Steps, captions, element rects. |
+| `types.ts` | The timeline contract, and where duration is derived. |
+| `camera.ts` | Framing maths: zoom-to-box, edge clamping, screen projection. |
+| `DemoVideo.tsx` | Renders it: camera moves, cursor, click ripples, typing, captions. |
+
+```bash
+npx remotion render src/index.ts DemoVideo demo.mp4
+```
+
+Duration, dimensions, and fps all follow `timeline.json` — you never touch
+`Root.tsx`. Add a step, the video gets longer.
+
+### Capturing a timeline
 
 ```bash
 agent-browser set viewport 1920 1080 2      # 2 = retina; stills come out ~3840px
-agent-browser screenshot step-01.png
+agent-browser screenshot public/shots/01-dashboard.png
 agent-browser get box "#submit" --json      # exact rect of the element you act on
 ```
 
 `get box --json` nests the rect under `.data` — `{"success":true,"data":{"x":256,
 "y":94.9,"width":768,"height":27,...}}` — so read `.data.x` / `.data.y` /
-`.data.width` / `.data.height`, not the top level.
-
-Capture a still at every step plus the `get box` of the element being acted on,
-and emit a timeline the composition consumes:
+`.data.width` / `.data.height`, not the top level. Those numbers go straight
+into a step's `focus`:
 
 ```json
-[{"step":1,"shot":"step-01.png","action":"click","box":{"x":840,"y":95,"width":120,"height":40}},
- {"step":2,"shot":"step-02.png","action":"fill","text":"acme@example.com","box":{"x":320,"y":210,"width":280,"height":44}}]
+{
+  "width": 1920, "height": 1080, "fps": 30,
+  "title": "Market Scope", "subtitle": "Forecast in three clicks",
+  "steps": [
+    { "shot": "01-dashboard.png", "hold": 3, "caption": "Start on the dashboard", "action": "look" },
+    { "shot": "02-scope.png", "hold": 3.5, "caption": "Pick the market",
+      "focus": {"x":840,"y":95,"width":120,"height":40}, "action": "click" },
+    { "shot": "03-form.png", "hold": 4, "caption": "Set the target",
+      "focus": {"x":320,"y":210,"width":280,"height":44}, "action": "type", "text": "California" }
+  ]
+}
 ```
 
-Then the composition animates *from data* — no hand-placed keyframes, and it
-stays correct when the UI moves:
+`focus` is in SCREENSHOT pixel coordinates, and the composition projects
+overlays through the same transform, so the cursor stays glued to the element
+as the camera moves.
 
-- **Zoom to a region**: interpolate a wrapper's `transform: scale()` +
-  `translate()` so the box's center lands at the composition's center.
-  `spring()` reads better than linear `interpolate()` for camera moves.
-- **Cursor**: absolutely position a cursor graphic and interpolate it between
-  consecutive boxes; add a scale-down blip on the click frame.
-- **Click ripple**: an expanding, fading circle at the box center.
-- **Form fill**: render `text.slice(0, charsShown)` where `charsShown` is
-  derived from the frame — typing appears live without recording it.
-- **Callouts**: fade a label anchored to the box.
+### Directing it
 
-Two artifacts with different jobs: the 10fps capture is QA evidence that the
-flow really ran; the stills-plus-Remotion piece is the polished asset.
+The engine handles mechanics; these choices decide whether it looks like a
+product demo or a slideshow:
+
+- **Do not zoom every step.** Omit `focus` for establishing shots. Constant
+  pushing is seasick — earn the zoom by alternating wide and tight.
+- **`hold` is your pacing.** 3s reads comfortably; 4–5s when a caption carries
+  real information. Under 2s and nobody can read the caption.
+- **Captions say what the user achieves, not what the UI is.** "Forecast the
+  quarter in three clicks" beats "Click the Submit button."
+- **Order for narrative, not for chronology.** You control the timeline — drop
+  the steps that only exist because the app made you take them.
+- **Re-capture rather than re-animate.** When the UI changes, retake the shots
+  and the boxes; the animation is derived.
+
+### Why stills and not the screen recording
+
+`agent-browser record` is locked at 10fps, so zooming into that footage is soft
+and choppy no matter what the composition does. Retina screenshots stay sharp at
+any zoom, and let you cut dead time, reorder for narrative, and re-shoot one
+step without redoing the walk.
+
+The two artifacts have different jobs: the 10fps capture is QA evidence that the
+flow really ran, and the stills-plus-Remotion piece is the polished asset. Do
+not substitute one for the other — a demo is directed, so it is never proof.
 
 ## Gotchas
 

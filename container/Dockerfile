@@ -357,7 +357,16 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 COPY remotion/tsconfig.json remotion/remotion.config.ts /opt/remotion/
 COPY remotion/src /opt/remotion/src
 COPY remotion/new-video.sh /opt/remotion/new-video.sh
-RUN chmod +x /opt/remotion/new-video.sh && \
+# Placeholder shots so the DemoVideo composition renders out of the box, which
+# is what proves the demo engine (camera, cursor, captions) works before an
+# agent has captured anything. Generated with the ffmpeg installed above rather
+# than committed as binaries — the repo stays text-only and they cost ~20KB.
+RUN mkdir -p /opt/remotion/public/shots && \
+    ffmpeg -loglevel error -f lavfi -i color=c=0x14203c:s=1920x1080 -frames:v 1 \
+        /opt/remotion/public/shots/01-placeholder.png && \
+    ffmpeg -loglevel error -f lavfi -i color=c=0x1d2c4f:s=1920x1080 -frames:v 1 \
+        /opt/remotion/public/shots/02-placeholder.png && \
+    chmod +x /opt/remotion/new-video.sh && \
     ln -sf /opt/remotion/new-video.sh /usr/local/bin/new-video
 
 # ---- Graphify code intelligence ----------------------------------------------
