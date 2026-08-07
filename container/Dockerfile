@@ -328,6 +328,38 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
         "@openai/codex@${CODEX_VERSION}" \
         "opencode-ai@${OPENCODE_VERSION}"
 
+# ---- Remotion video runtime --------------------------------------------------
+# Shared runtime for programmatic video, available to EVERY agent group at
+# /opt/remotion — deliberately not a per-group folder, because a video toolchain
+# that lives in one agent's workspace is invisible to its siblings.
+#
+# Installed as a real project (not `pnpm install -g`) because Remotion renders
+# from a project entry point: the CLI alone cannot resolve `remotion`/`react`
+# from an arbitrary cwd. Agents scaffold their own project with
+# `/opt/remotion/new-video.sh <dir>`, which SYMLINKS this node_modules rather
+# than copying ~300MB per video.
+#
+# --frozen-lockfile per the supply-chain policy; the lockfile is committed at
+# container/remotion/pnpm-lock.yaml and regenerated with
+# `pnpm install --lockfile-only --ignore-workspace` from that directory (the
+# repo root's pnpm-workspace.yaml otherwise suppresses a nested lockfile).
+#
+# No allowBuilds entry: esbuild's postinstall stays unapproved here and rendering
+# works regardless — verified by rendering a composition end to end in the built
+# image. Do not add one without human approval.
+#
+# remotion.config.ts points Remotion at the system Chromium installed above, so
+# no Chrome Headless Shell download (~150MB) and the first render works with no
+# network egress.
+COPY remotion/package.json remotion/pnpm-lock.yaml /opt/remotion/
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    cd /opt/remotion && pnpm install --frozen-lockfile --ignore-workspace
+COPY remotion/tsconfig.json remotion/remotion.config.ts /opt/remotion/
+COPY remotion/src /opt/remotion/src
+COPY remotion/new-video.sh /opt/remotion/new-video.sh
+RUN chmod +x /opt/remotion/new-video.sh && \
+    ln -sf /opt/remotion/new-video.sh /usr/local/bin/new-video
+
 # ---- Graphify code intelligence ----------------------------------------------
 # Graphify is a private, wheel-only Python environment. The upstream console
 # script is removed; only NanoClaw's policy-enforcing freshness gateway is
