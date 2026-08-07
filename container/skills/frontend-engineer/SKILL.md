@@ -155,3 +155,26 @@ When reporting results, always include:
 - The live URL (if deployed)
 - Screenshots of the final result (desktop minimum)
 - Any known limitations or follow-up needed
+
+### Demo clips
+
+A screenshot shows a state. A feature that is *about* interaction — a flow, a
+drag, a filter that rewrites a chart, an animation, a multi-step form — does not
+read as a still. Record a clip when the change is interaction-heavy:
+
+```bash
+agent-browser record start demo.mp4
+#   ... walk the happy path, and nothing else ...
+agent-browser record stop
+```
+
+- Name the file `.mp4` — that yields H.264, which plays inline in chat. Attach
+  it with `send_file`.
+- One clip per feature, 20–60s, happy path only. A clip that spans a whole
+  session is unwatchable and nobody opens it.
+- **Never record across a login.** Recording captures typed keystrokes, so a
+  clip spanning authentication publishes the password. Sign in first, confirm
+  the logged-in state, then start recording.
+- **A demo clip is a showcase, not verification.** It shows the one path you
+  chose to walk. It does not replace the checks above, and it is never QA
+  evidence — a reviewer who watches it has seen a demo, not a tested feature.

@@ -55,6 +55,8 @@ ARG AWS_CLI_VERSION=2.36.8
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
 # SIGTERM instead of being orphaned by the shell entrypoint.
+# ffmpeg: `agent-browser record start/stop` shells out to it — without it the
+# recording starts and then fails at stop with "ffmpeg not found". ~141MB.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
@@ -76,6 +78,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libxshmfence1 \
         ca-certificates \
         curl \
+        ffmpeg \
         git \
         jq \
         less \

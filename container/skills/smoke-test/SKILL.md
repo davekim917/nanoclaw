@@ -212,7 +212,49 @@ max effort. Use the `agent-browser` skill.
   Treat mismatched names, dates, fiscal years, labels, interaction affordances,
   confirmation behavior, accessibility, and visual hierarchy as testable parity
   candidates rather than subjective nits.
+- Record a short clip of each candidate finding's reproduction. See below.
 - Restore mutated test data or list every residue that could not be restored.
+
+### Reproduction clips
+
+A screenshot cannot show a transition, a state that flashes and disappears, or
+how long a spinner ran. A short clip can. `agent-browser` records the live
+session itself:
+
+```bash
+mkdir -p <run-dir>/clips
+agent-browser record start <run-dir>/clips/<finding-id>.mp4
+#   ... the reproduction steps, and nothing else ...
+agent-browser record stop
+```
+
+Name the file `.mp4` — that yields H.264/yuv420p, which every chat platform
+plays inline. `.webm` also works but previews less reliably.
+
+Scope, because an unwatched artifact is worse than none:
+
+- **Record the reproduction, never the campaign.** Start recording at the last
+  known-good state, run only the steps that produce the defect, stop. Target
+  20–60s. A recording that spans a whole lane is unwatchable and nobody opens
+  it.
+- **Clip defects, not passes.** Record while you reproduce a candidate — that is
+  the moment the repro is already in your hands. Delete the clip if the finding
+  is later refuted; attach only clips of confirmed findings. At most one clip
+  per finding plus its section 7 after-clip, and at most five clips per run.
+- **Never record authentication.** Recording captures typed keystrokes, so a
+  clip that spans a login publishes the password. Authenticate first, confirm
+  the logged-in state, then start recording. Any clip that captured a
+  credential field gets deleted, not trimmed.
+- **A clip is supplementary and never substitutes for evidence.** The
+  screenshots, request/response capture, and console errors above remain
+  required. A clip alone never moves a candidate to `confirmed` — it shows what
+  happened, not why.
+- **Never block on it.** If `record start` errors (missing `ffmpeg`, no browser
+  lease), note it in the run record and continue. A clip is never a gate.
+
+Attach clips with `send_file` to the run thread. Files under the run root are
+already inside the allowed prefixes, and the 50MB attachment cap is far above a
+60s clip.
 
 ### Backend and specification verifier
 
@@ -312,7 +354,8 @@ A commit is not a verified fix. After the exact fix SHA reaches the dev build:
 1. prove the deployed SHA;
 2. rerun every original reproduction;
 3. rerun its adjacent happy path and one failure path;
-4. capture before/after screenshots plus request evidence;
+4. capture before/after screenshots plus request evidence, and re-clip a
+   finding that was clipped when it was found;
 5. rerun the applicable automated tests;
 6. update the finding to `verified` only when all required checks pass.
 
@@ -374,7 +417,7 @@ screenshots:
 - Build `<sha12>` on <environment> — <scope in words>
 - Coverage: ran <executed> of <planned> checks (<passed> passed, <failed>
   failed, <blocked> blocked) — plus exact test counts and limitations
-- Frontend: <journeys completed>, <n> screenshots (attached)
+- Frontend: <journeys completed>, <n> screenshots and <n> clips (attached)
 - Findings: <each in one plain-language line with severity, or "none confirmed">
 - Fixes: <PRs and deployed SHAs, or none>
 - Untested: <explicit list, or "nothing in scope">

@@ -73,14 +73,21 @@ agent-browser get url             # Get current URL
 agent-browser get count ".item"   # Count matching elements
 ```
 
-### Screenshots & PDF
+### Screenshots, PDF & video
 
 ```bash
 agent-browser screenshot          # Save to temp directory
 agent-browser screenshot path.png # Save to specific path
 agent-browser screenshot --full   # Full page
 agent-browser pdf output.pdf      # Save as PDF
+
+agent-browser record start clip.mp4   # Start recording (name it .mp4 → H.264)
+agent-browser record stop             # Stop and save
 ```
+
+Record only the span worth watching — a clip covering a whole session is
+unwatchable. Never record across a login: recording captures typed keystrokes,
+so a clip that spans authentication publishes the password.
 
 ### Wait
 
