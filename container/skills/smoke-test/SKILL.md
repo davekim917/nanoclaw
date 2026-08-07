@@ -384,6 +384,13 @@ rules make it consistent with the lifecycle above:
   If nothing in the environment can prove a fix for that surface reached a
   deployed build, its findings cannot reach `verified`; report them and route
   them to planning rather than opening an unclosable loop.
+- **Re-verification is a lane every run opens, never a side effect.** Testing
+  this build's changed surface does not re-test an earlier finding, so without
+  an explicit lane nothing reaches `verified` and open findings accumulate
+  indefinitely. At freeze, take every open finding whose fix has already
+  merged and re-run only its recorded reproduction against the frozen deployed
+  build: close what passes, record a failure count on what does not. These are
+  narrow scripted repros, so the lane is cheap.
 - Cap autonomous repair: after two failed re-verifications of the same finding,
   stop, mark it escalated, and hand it to a human.
 
