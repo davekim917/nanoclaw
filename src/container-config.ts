@@ -257,8 +257,19 @@ export interface ContainerConfig {
    * name (`snowflake`) or scoped (`snowflake:archive-one`, `aws:example-data`).
    * Omit to grant every credential surface; include to filter per-tool
    * before mount. Supported tool names: gmail, gmail-readonly, calendar,
-   * google-workspace, snowflake, aws, gcloud, dbt, github, render,
-   * browser-auth, datafold.
+   * google-workspace, snowflake, aws, gcloud, dbt, github, render, datafold,
+   * linear, atlassian, looker, dbt-mcp.
+   *
+   * This is a FILTER, not a grant — an entry here only permits a surface some
+   * other code path mounts or injects. A name that nothing honors is silently
+   * inert, so do not read a `tools` entry as evidence that a credential is
+   * wired. `browser-auth` was listed here for a long time and never had an
+   * implementation: no `isToolEnabled('browser-auth')` call, no `.env` section,
+   * no staged `creds/` dir. Groups declaring `browser-auth:<account>` read as
+   * though browser credentials were scoped per agent when nothing was
+   * delivered; browser logins are supplied by an explicit `additionalMounts`
+   * entry or a shared workgroup file instead. Removed 2026-08-07 after it cost
+   * a live debugging session.
    */
   tools?: string[];
 
