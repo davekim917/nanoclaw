@@ -173,8 +173,11 @@ agent-browser record stop
 - One clip per feature, 20–60s, happy path only. A clip that spans a whole
   session is unwatchable and nobody opens it.
 - **Never record across a login.** Recording captures typed keystrokes, so a
-  clip spanning authentication publishes the password. Sign in first, confirm
-  the logged-in state, then start recording.
+  clip spanning authentication publishes the password. Sign in first, then
+  start recording — but note `record start` opens a fresh context that drops
+  `localStorage`, so on a token-in-storage app the clip begins logged out.
+  Use the capture/restore recipe in the `agent-browser` skill, and confirm
+  you're still signed in before walking the flow.
 - **A demo clip is a showcase, not verification.** It shows the one path you
   chose to walk. It does not replace the checks above, and it is never QA
   evidence — a reviewer who watches it has seen a demo, not a tested feature.

@@ -242,9 +242,13 @@ Scope, because an unwatched artifact is worse than none:
   is later refuted; attach only clips of confirmed findings. At most one clip
   per finding plus its section 7 after-clip, and at most five clips per run.
 - **Never record authentication.** Recording captures typed keystrokes, so a
-  clip that spans a login publishes the password. Authenticate first, confirm
-  the logged-in state, then start recording. Any clip that captured a
-  credential field gets deleted, not trimmed.
+  clip that spans a login publishes the password. Authenticate first, then
+  start recording. Any clip that captured a credential field gets deleted, not
+  trimmed. Authenticating first is necessary but NOT sufficient: `record start`
+  opens a fresh context that drops `localStorage`, so on a token-in-storage app
+  the clip begins logged out. Follow the capture/restore recipe in the
+  `agent-browser` skill, and prove the session survived `record start` before
+  walking the reproduction.
 - **A clip is supplementary and never substitutes for evidence.** The
   screenshots, request/response capture, and console errors above remain
   required. A clip alone never moves a candidate to `confirmed` — it shows what

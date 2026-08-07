@@ -89,6 +89,37 @@ Record only the span worth watching — a clip covering a whole session is
 unwatchable. Never record across a login: recording captures typed keystrokes,
 so a clip that spans authentication publishes the password.
 
+**`record start` opens a fresh browser context and drops `localStorage`.**
+Cookies survive; `localStorage` does not — verified on 0.33.2, whose own
+`record --help` wrongly claims it "preserves cookies and localStorage". So on
+an app that keeps its auth token in `localStorage`, signing in first and then
+recording starts the clip logged OUT, while signing in after the recorder
+starts puts the password on camera. Both orders fail, which is why this needs
+a recipe rather than a rule:
+
+```bash
+# 1. Authenticate BEFORE recording — this part is never filmed.
+agent-browser open https://app.example.com
+#    ...sign in...
+agent-browser storage local get --json > /tmp/auth.json   # capture while authed
+
+# 2. Start the recorder, then restore what it dropped.
+agent-browser record start clip.mp4
+agent-browser storage local set <key> <value>             # one per key from auth.json
+agent-browser reload
+
+# 3. PROVE you are still signed in before walking the flow.
+agent-browser get url        # not the login page?
+agent-browser snapshot -i    # authed-only element present?
+
+agent-browser record stop
+```
+
+Step 3 is the durable part. Whatever the tool does with context in a future
+version, confirm the session survived `record start` before you record a flow —
+otherwise you produce a clean recording of a logged-out app and don't find out
+until someone watches it.
+
 ### Wait
 
 ```bash
