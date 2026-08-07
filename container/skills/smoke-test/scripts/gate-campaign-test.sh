@@ -13,7 +13,6 @@ ck(){ if [ "$2" = "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1: got [$2] 
 st(){ jq -r "$1" "$T/state/develop-state.json" 2>/dev/null; }
 
 echo "1. check with no config: settled:false, writes nothing"
-printf '{"schemaVersion":1,"sentinel":"untouched"}\n' > "$T/state-probe" 2>/dev/null
 mkdir -p "$T/state"; echo '{"schemaVersion":1,"completedSha":"sentinel"}' > "$T/state/develop-state.json"
 OUT="$(bash "$G" check 2>/dev/null)"
 ck "settled=false"      "$(jq -r '.data.settled' <<<"$OUT")" "false"
@@ -76,6 +75,110 @@ jq -c --arg s "$SHA" '{schemaVersion:1,activeRunId:"dead-1",activeSha:$s,
   -n > "$T/state/develop-state.json"
 ck "reclaimed"          "$(bash "$G" claim camp-6 "$SHB" | jq -r '.ok')" "true"
 ck "new owner"          "$(st '.activeRunId')"                "camp-6"
+
+echo "11. merge-hold opt-out SURVIVES progress (regression: the stamp used to resurrect it)"
+echo '{"schemaVersion":1}' > "$T/state/develop-state.json"; rm -f "$T/run-active.json"
+bash "$G" claim camp-7 "$SHA" false >/dev/null
+ck "absent after claim"  "$([ -f "$T/run-active.json" ] && echo yes || echo no)" "no"
+OUT="$(bash "$G" progress camp-7)"
+ck "progress ok"         "$(jq -r '.ok' <<<"$OUT")"           "true"
+ck "reports hold off"    "$(jq -r '.mergeHold' <<<"$OUT")"    "false"
+ck "STILL absent"        "$([ -f "$T/run-active.json" ] && echo yes || echo no)" "no"
+ck "stamp still taken"   "$([ "$(st '.activeProgressAt')" != "null" ] && echo yes)" "yes"
+bash "$G" release camp-7 >/dev/null
+
+echo "12. merge-hold ON still refreshes the active file on every stamp"
+bash "$G" claim camp-8 "$SHA" >/dev/null; rm -f "$T/run-active.json"
+ck "reports hold on"     "$(bash "$G" progress camp-8 | jq -r '.mergeHold')" "true"
+ck "refreshed"           "$([ -f "$T/run-active.json" ] && echo yes || echo no)" "yes"
+bash "$G" release camp-8 >/dev/null
+
+echo "13. finish is refused for a non-active run (reclaimed run cannot clobber its successor)"
+echo '{"schemaVersion":1,"sha":"x","runId":"scheduled-9","verdict":"NO_GO"}' > "$T/develop-hold.json"
+bash "$G" claim live-2 "$SHB" >/dev/null
+OUT="$(bash "$G" finish "$SHA" stale-1 GO)"
+ck "refused"             "$(jq -r '.ok' <<<"$OUT")"           "false"
+ck "no verdict recorded" "$(st '.completedSha')"              "null"
+ck "hold NOT cleared"    "$(jq -r '.runId' "$T/develop-hold.json")" "scheduled-9"
+ck "live slot intact"    "$(st '.activeRunId')"               "live-2"
+
+echo "14. finish by the active run still works, and clears its own slot"
+OUT="$(bash "$G" finish "$SHB" live-2 GO)"
+ck "accepted"            "$(jq -r '.ok' <<<"$OUT")"           "true"
+ck "verdict recorded"    "$(st '.completedSha')"              "$SHB"
+ck "slot cleared"        "$(st '.activeRunId')"               "null"
+ck "own GO cleared hold" "$([ -f "$T/develop-hold.json" ] && echo yes || echo no)" "no"
+ck "merge-hold nulled"   "$(st '.activeMergeHold')"           "null"
+
+echo "15. legacy state with no activeMergeHold field defaults to holding"
+jq -c --arg s "$SHA" --arg n "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{schemaVersion:1,activeRunId:"legacy-1",activeSha:$s,activeStartedAt:$n,activeProgressAt:$n}' \
+  -n > "$T/state/develop-state.json"
+rm -f "$T/run-active.json"
+ck "defaults to hold"    "$(bash "$G" progress legacy-1 | jq -r '.mergeHold')" "true"
+ck "active file written" "$([ -f "$T/run-active.json" ] && echo yes || echo no)" "yes"
+
+# The check SUCCESS path needs the network. Stub gh/curl on PATH so the settled
+# derivation and the output shape are exercised deterministically instead of
+# resting on one manual live run.
+BIN="$T/bin"; mkdir -p "$BIN"
+cat > "$BIN/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *branches*)  jq -cn --arg s "$FAKE_SOURCE" '{commit:{sha:$s}}' ;;
+  *"run list"*) cat "$FAKE_CHECKS" ;;
+  *compare*)   jq -cn '{status:"ahead",behind_by:0,files:[{filename:"XZO-BACKEND/src/x.ts"}]}' ;;
+esac
+SH
+cat > "$BIN/curl" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"$FAKE_BACKEND_ID"*)  jq -cn --arg s "$FAKE_BACKEND"  '[{deploy:{status:"live",commit:{id:$s}}}]' ;;
+  *"$FAKE_FRONTEND_ID"*) jq -cn --arg s "$FAKE_FRONTEND" '[{deploy:{status:"live",commit:{id:$s}}}]' ;;
+esac
+SH
+chmod +x "$BIN/gh" "$BIN/curl"
+export PATH="$BIN:$PATH"
+export SMOKE_GATE_REPO=o/r SMOKE_GATE_BACKEND_SERVICE=srv-be SMOKE_GATE_FRONTEND_SERVICE=srv-fe \
+       SMOKE_GATE_DEV_URL=https://dev.example SMOKE_GATE_FRONTEND_PATHS=XZO-FRONTEND/ \
+       FAKE_BACKEND_ID=srv-be FAKE_FRONTEND_ID=srv-fe
+export FAKE_SOURCE="$SHA" FAKE_BACKEND="$SHA" FAKE_FRONTEND="$SHA" FAKE_CHECKS="$T/checks.json"
+
+echo "16. check success path: three-way equality, CI green"
+jq -cn --arg s "$SHA" '[{headSha:$s,status:"completed",conclusion:"success",workflowName:"CI"}]' > "$T/checks.json"
+echo '{"schemaVersion":1,"completedSha":"sentinel"}' > "$T/state/develop-state.json"
+rm -f "$T/run-active.json"   # case 15's stamp wrote it; check must not
+OUT="$(bash "$G" check)"
+ck "settled"             "$(jq -r '.settled' <<<"$OUT")"      "true"
+ck "ok"                  "$(jq -r '.ok' <<<"$OUT")"           "true"
+ck "sourceSha echoed"    "$(jq -r '.sourceSha' <<<"$OUT")"    "$SHA"
+ck "ciReady"             "$(jq -r '.ciReady' <<<"$OUT")"      "true"
+ck "deployReady"         "$(jq -r '.deployReady' <<<"$OUT")"  "true"
+ck "state untouched"     "$(st '.completedSha')"              "sentinel"
+ck "no active file"      "$([ -f "$T/run-active.json" ] && echo yes || echo no)" "no"
+
+echo "17. check refuses a head with a pending check"
+jq -cn --arg s "$SHA" '[{headSha:$s,status:"completed",conclusion:"success",workflowName:"CI"},
+                        {headSha:$s,status:"in_progress",conclusion:null,workflowName:"E2E"}]' > "$T/checks.json"
+OUT="$(bash "$G" check)"
+ck "not settled"         "$(jq -r '.settled' <<<"$OUT")"      "false"
+ck "pending counted"     "$(jq -r '.pendingChecks' <<<"$OUT")" "1"
+
+echo "18. check refuses a head where every workflow was path-skipped"
+jq -cn --arg s "$SHA" '[{headSha:$s,status:"completed",conclusion:"skipped",workflowName:"CI"}]' > "$T/checks.json"
+ck "not settled"         "$(bash "$G" check | jq -r '.settled')" "false"
+
+echo "19. check accepts a provably-safe frontend deploy lag"
+jq -cn --arg s "$SHA" '[{headSha:$s,status:"completed",conclusion:"success",workflowName:"CI"}]' > "$T/checks.json"
+FAKE_FRONTEND="$SHB" bash "$G" check > "$T/lag.json"
+ck "settled"             "$(jq -r '.settled' "$T/lag.json")"  "true"
+ck "lag recorded"        "$(jq -r '.deployLagAccepted.frontend' "$T/lag.json")" "true"
+
+echo "20. check does NOT hold the write lock across its fetches"
+( flock -x 9; sleep 3 ) 9>"$T/state/develop-state.lock" &
+BLOCKER=$!; sleep 0.3
+ck "check still answers"  "$(bash "$G" check | jq -r '.settled')" "true"
+wait $BLOCKER
 
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || echo "FAILURES PRESENT"
 exit "$FAIL"

@@ -65,7 +65,7 @@ READONLY=false
 mkdir -p "$STATE_DIR"
 exec 9>"$LOCK_FILE"
 if ! flock -w 5 9; then
-  jq -cn '{wakeAgent:true,data:{schemaVersion:1,trigger:"gate_lock_failed"}}'
+  jq -cn '{ok:false,settled:false,wakeAgent:true,data:{schemaVersion:1,trigger:"gate_lock_failed"}}'
   exit 0
 fi
 
@@ -78,6 +78,7 @@ default_state() {
     activeStartedAt: null,
     activeRunId: null,
     activeProgressAt: null,
+    activeMergeHold: null,
     unsettledSha: null,
     unsettledSince: null,
     unsettledWakeSha: null,
@@ -146,6 +147,12 @@ COMMAND="${1:-poll}"
 if [ "$COMMAND" = "check" ]; then
   READONLY=true
   COMMAND=poll
+  # Drop the write lock immediately: state has been read once above and a
+  # read-only caller never writes. Holding it across `check`'s network fetches
+  # (four parallel, plus up to two compares — ~30s worst case) would make a
+  # concurrent scheduled poll exhaust its 5s flock wait and emit
+  # gate_lock_failed, which spawns the coordinator for nothing.
+  flock -u 9
 fi
 
 if [ "$COMMAND" = "finish" ]; then
@@ -160,6 +167,20 @@ if [ "$COMMAND" = "finish" ]; then
     GO|NO_GO|HUMAN_DECISION|BLOCKED) ;;
     *) jq -cn '{ok:false,error:"finish verdict must be GO, NO_GO, HUMAN_DECISION, or BLOCKED"}'; exit 2 ;;
   esac
+  # Only the run that currently owns the slot may record a verdict. Without
+  # this, a run reclaimed for being stale can revive and finish late: it would
+  # overwrite the completed SHA, null the live successor's active slot
+  # mid-flight, and — on GO — delete a promotion hold a different run raised.
+  # `progress` has always refused a non-active run; verdict authority is
+  # strictly more dangerous and was the only verb still failing open.
+  ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
+  if [ "$RUN_ID" != "$ACTIVE_RUN" ]; then
+    jq -cn --arg run "$RUN_ID" --arg active "$ACTIVE_RUN" \
+      '{ok:false,error:"not the active run (reclaimed or already finished) — no verdict recorded, no hold touched",
+        runId:(if $run == "" then null else $run end),
+        activeRunId:(if $active == "" then null else $active end)}'
+    exit 0
+  fi
   NOW="$(iso_now)"
   STATE="$(jq -c \
     --arg sha "$SHA" \
@@ -174,6 +195,7 @@ if [ "$COMMAND" = "finish" ]; then
      .activeStartedAt=null |
      .activeRunId=null |
      .activeProgressAt=null |
+     .activeMergeHold=null |
      .candidateSha=null |
      .candidateFirstSeen=null' <<<"$STATE")"
   write_state "$STATE"
@@ -259,10 +281,12 @@ if [ "$COMMAND" = "claim" ]; then
   fi
   NOW="$(iso_now)"
   STATE="$(jq -c --arg sha "$SHA" --arg now "$NOW" --arg run "$RUN_ID" \
+    --argjson hold "$MERGE_HOLD" \
     '.activeSha=$sha |
      .activeStartedAt=$now |
      .activeRunId=$run |
      .activeProgressAt=$now |
+     .activeMergeHold=$hold |
      .candidateSha=null |
      .candidateFirstSeen=null' <<<"$STATE")"
   write_state "$STATE"
@@ -293,7 +317,7 @@ if [ "$COMMAND" = "release" ]; then
     exit 0
   fi
   STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null |
-                  .activeProgressAt=null' <<<"$STATE")"
+                  .activeProgressAt=null | .activeMergeHold=null' <<<"$STATE")"
   write_state "$STATE"
   [ -n "$ACTIVE_FILE" ] && rm -f "$ACTIVE_FILE"
   jq -cn --arg run "$RUN_ID" '{ok:true,releasedRunId:$run}'
@@ -317,9 +341,17 @@ if [ "$COMMAND" = "progress" ]; then
   PROGRESS_NOW="$(iso_now)"
   STATE="$(jq -c --arg now "$PROGRESS_NOW" '.activeProgressAt=$now' <<<"$STATE")"
   write_state "$STATE"
-  write_active_file "$RUN_ID" "$(jq -r '.activeSha // empty' <<<"$STATE")" \
-    "$(jq -r '.activeStartedAt // empty' <<<"$STATE")" "$PROGRESS_NOW"
-  jq -cn --arg run "$RUN_ID" '{ok:true,runId:$run}'
+  # A campaign that claimed with merge-hold off stays off. Re-writing the
+  # active file here would resurrect the hold it opted out of on the very
+  # first stamp — and stamping is mandatory, so the opt-out would never
+  # survive 15 minutes. Absent field (scheduled runs, pre-existing state)
+  # means hold, which is the safe default.
+  MERGE_HOLD="$(jq -r 'if .activeMergeHold == false then "false" else "true" end' <<<"$STATE")"
+  if [ "$MERGE_HOLD" = true ]; then
+    write_active_file "$RUN_ID" "$(jq -r '.activeSha // empty' <<<"$STATE")" \
+      "$(jq -r '.activeStartedAt // empty' <<<"$STATE")" "$PROGRESS_NOW"
+  fi
+  jq -cn --arg run "$RUN_ID" --argjson hold "$MERGE_HOLD" '{ok:true,runId:$run,mergeHold:$hold}'
   exit 0
 fi
 
@@ -350,7 +382,7 @@ if [ -n "$MISSING" ]; then
   write_state "$STATE"
   jq -cn --argjson wake "$WAKE" \
     --argjson missing "$(printf '%s\n' $MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-    '{wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_misconfigured",settled:false,missing:$missing}}'
+    '{ok:false,settled:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_misconfigured",settled:false,missing:$missing}}'
   exit 0
 fi
 
@@ -415,7 +447,7 @@ if [ "$FETCH_OK" != true ]; then
   fi
   write_state "$STATE"
   jq -cn --argjson wake "$WAKE" --argjson failures "$FAILURES" \
-    '{wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_fetch_failed",settled:false,consecutiveFailures:$failures}}'
+    '{ok:false,settled:false,wakeAgent:$wake,data:{schemaVersion:1,trigger:"gate_fetch_failed",settled:false,consecutiveFailures:$failures}}'
   exit 0
 fi
 
@@ -625,6 +657,7 @@ STATE="$(jq -c \
    .activeStartedAt=$now |
    .activeRunId=$run |
    .activeProgressAt=null |
+   .activeMergeHold=true |
    .candidateSha=null |
    .candidateFirstSeen=null' <<<"$STATE")"
 write_state "$STATE"

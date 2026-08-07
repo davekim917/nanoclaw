@@ -532,7 +532,10 @@ while browser lanes are running — a build that moves under an open campaign
 is the failure above. Pass `false` deliberately when the campaign wants merges
 to continue: its browser lanes are blocked on something else, or a confirmed
 fix should land now and the campaign will re-freeze on the new build. Either
-way the watcher stays suppressed; only the merge queue is released.
+way the watcher stays suppressed; only the merge queue is released. The choice
+is persisted with the claim and echoed back by every `progress` response as
+`mergeHold`, so a stamp can never quietly reinstate a hold the campaign opted
+out of.
 
 **End with `release`, never `finish`:**
 
@@ -546,7 +549,10 @@ clears the promotion hold. A campaign that never routed through the gate has
 not earned any of that, and a `GO` from one would clear a hold raised by a run
 it never exercised. `claim` cannot write those artifacts at all, and neither
 can `release`; that separation is deliberate, not a convention to be careful
-about.
+about. `finish` additionally refuses any run that no longer owns the active
+slot, so a campaign or a reclaimed run that revives late cannot overwrite a
+successor's verdict — the same rule `progress` has always applied, extended to
+the one verb that was still failing open.
 
 When `SMOKE_GATE_PUBLISH_FILE` is set in the wrapper, `finish` also writes the
 terminal verdict as a small JSON artifact (`{sha, runId, verdict, finishedAt}`)
