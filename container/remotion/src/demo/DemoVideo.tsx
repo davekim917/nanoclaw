@@ -1,6 +1,18 @@
 import React from 'react';
-import { AbsoluteFill, Img, interpolate, Sequence, spring, staticFile, useCurrentFrame, useVideoConfig } from 'remotion';
+import {
+  AbsoluteFill,
+  Audio,
+  Img,
+  interpolate,
+  OffthreadVideo,
+  Sequence,
+  spring,
+  staticFile,
+  useCurrentFrame,
+  useVideoConfig,
+} from 'remotion';
 
+import { MUSIC_BED_VOLUME, musicVolumeAt, narrationRanges } from './audio';
 import { boxCentre, cameraFor, project } from './camera';
 import { DEFAULT_FPS, stepFrames, TITLE_SECONDS, TRANSITION_SECONDS, type Step, type Timeline } from './types';
 
@@ -170,7 +182,20 @@ const StepScene: React.FC<{ step: Step; prev?: Step; timeline: Timeline; duratio
           transformOrigin: 'center center',
         }}
       >
-        <Img src={staticFile(`shots/${step.shot}`)} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+        {step.clip ? (
+          // OffthreadVideo (not <Video>) — it extracts frames with ffmpeg
+          // rather than driving a <video> element, which is what makes
+          // frame-exact, non-realtime rendering deterministic.
+          <OffthreadVideo
+            src={staticFile(`clips/${step.clip}`)}
+            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+          />
+        ) : (
+          <Img
+            src={staticFile(`shots/${step.shot}`)}
+            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+          />
+        )}
       </AbsoluteFill>
 
       {typed !== null && typedScreen ? (
@@ -198,6 +223,10 @@ const StepScene: React.FC<{ step: Step; prev?: Step; timeline: Timeline; duratio
       ) : null}
 
       {step.caption ? <Caption text={step.caption} opacity={fadeIn} /> : null}
+
+      {/* Narration rides inside the step's Sequence, so it starts when the step
+          does and needs no global offset bookkeeping. */}
+      {step.voice ? <Audio src={staticFile(`audio/${step.voice}`)} /> : null}
     </AbsoluteFill>
   );
 };
@@ -205,10 +234,19 @@ const StepScene: React.FC<{ step: Step; prev?: Step; timeline: Timeline; duratio
 export const DemoVideo: React.FC<{ timeline: Timeline }> = ({ timeline }) => {
   const fps = timeline.fps ?? DEFAULT_FPS;
   const titleFrames = timeline.title ? Math.round(TITLE_SECONDS * fps) : 0;
+  const bed = timeline.musicVolume ?? MUSIC_BED_VOLUME;
+
+  // Music at a constant level under a voice is the usual reason a demo sounds
+  // amateur, so the bed ducks automatically. Maths lives in audio.ts — see
+  // container/remotion-camera.test.ts.
+  const ranges = narrationRanges(timeline);
+  const musicVolume = (frame: number): number => musicVolumeAt(frame, ranges, bed, fps);
 
   let cursor = titleFrames;
   return (
     <AbsoluteFill style={{ background: '#000' }}>
+      {timeline.music ? <Audio src={staticFile(`audio/${timeline.music}`)} volume={musicVolume} loop /> : null}
+
       {timeline.title ? (
         <Sequence durationInFrames={titleFrames}>
           <TitleCard title={timeline.title} subtitle={timeline.subtitle} />

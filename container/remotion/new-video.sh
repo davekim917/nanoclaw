@@ -30,7 +30,15 @@ mkdir -p "$TARGET"
 cp -r "$RUNTIME/src" "$TARGET/src"
 cp -r "$RUNTIME/public" "$TARGET/public"
 cp "$RUNTIME/package.json" "$RUNTIME/tsconfig.json" "$RUNTIME/remotion.config.ts" "$TARGET/"
-ln -s "$RUNTIME/node_modules" "$TARGET/node_modules"
+
+# node_modules is a REAL directory of symlinks, not one symlink to the shared
+# tree. The packages stay shared (no ~300MB copy), but the directory itself is
+# writable — which webpack needs, because it writes its build cache to
+# node_modules/.cache. A single symlink into the root-owned runtime makes that
+# mkdir fail with EACCES, and the render then silently rebuilds from scratch
+# every time.
+mkdir -p "$TARGET/node_modules"
+find "$RUNTIME/node_modules" -maxdepth 1 -mindepth 1 -exec ln -s {} "$TARGET/node_modules/" \;
 
 cat <<EOF
 Scaffolded $TARGET

@@ -12,6 +12,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
+import { DUCK_RATIO, musicVolumeAt, narrationRanges } from './remotion/src/demo/audio.js';
 import { boxCentre, cameraFor, IDENTITY_CAMERA, project } from './remotion/src/demo/camera.js';
 import type { Timeline } from './remotion/src/demo/types.js';
 
@@ -52,6 +53,39 @@ describe('cameraFor', () => {
     const slackY = (timeline.height * (corner.scale - 1)) / 2 / corner.scale;
     expect(Math.abs(corner.translateX)).toBeLessThanOrEqual(slackX + 1e-6);
     expect(Math.abs(corner.translateY)).toBeLessThanOrEqual(slackY + 1e-6);
+  });
+
+  it('ducks music under narration and restores it afterwards', () => {
+    // Title 2.5s (75f) + step1 3s (90f) + step2 3.5s (105f). Only step2 has voice,
+    // so narration runs frames 165..270.
+    const withVoice: Timeline = {
+      width: 1920,
+      height: 1080,
+      fps: 30,
+      title: 'T',
+      steps: [
+        { shot: 'a.png', hold: 3 },
+        { shot: 'b.png', hold: 3.5, voice: 'v.mp3' },
+      ],
+    };
+    expect(narrationRanges(withVoice)).toEqual([[165, 270]]);
+
+    const bed = 0.2;
+    const level = (f: number) => musicVolumeAt(f, narrationRanges(withVoice), bed, 30);
+
+    expect(level(100)).toBeCloseTo(bed); // well before narration: full bed
+    expect(level(200)).toBeCloseTo(bed * DUCK_RATIO); // mid-narration: ducked
+    expect(level(400)).toBeCloseTo(bed); // well after: restored
+
+    // Ramped, not stepped — a hard cut is audible as a click.
+    const entering = level(165 - 4);
+    expect(entering).toBeLessThan(bed);
+    expect(entering).toBeGreaterThan(bed * DUCK_RATIO);
+  });
+
+  it('reports no narration ranges when no step has voice', () => {
+    expect(narrationRanges({ width: 1, height: 1, steps: [{ shot: 'a.png' }] })).toEqual([]);
+    expect(musicVolumeAt(50, [], 0.2, 30)).toBeCloseTo(0.2);
   });
 
   it('projects screenshot coordinates to screen so overlays track the camera', () => {

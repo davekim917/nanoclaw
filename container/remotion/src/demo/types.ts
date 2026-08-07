@@ -19,8 +19,31 @@ export interface Box {
 export type StepAction = 'click' | 'type' | 'look';
 
 export interface Step {
-  /** Filename under public/shots/, e.g. "01-dashboard.png". */
-  shot: string;
+  /**
+   * Filename under public/shots/, e.g. "01-dashboard.png". Ignored when `clip`
+   * is set. One of `shot` or `clip` is required.
+   */
+  shot?: string;
+  /**
+   * Filename under public/clips/, e.g. "03-drag.mp4" — use INSTEAD of `shot`
+   * for the few moments a still genuinely cannot carry: a drag, a chart
+   * animating in, a transition, a live-updating number.
+   *
+   * The trade is real: `agent-browser record` captures at 10fps, so a clip is
+   * visibly softer and choppier than a retina still, and zooming it makes that
+   * worse. Use clips for motion that IS the point, stills for everything else.
+   *
+   * `hold` must not exceed the clip's own length or the last frame freezes.
+   * Measure it — `ffprobe -v error -show_entries format=duration -of csv=p=0
+   * <clip>` — and set `hold` from that.
+   */
+  clip?: string;
+  /**
+   * Narration for this step: a filename under public/audio/. The step's `hold`
+   * should be at least the audio length or the voice is cut off mid-sentence —
+   * measure it with ffprobe, same as a clip.
+   */
+  voice?: string;
   /** Seconds this step is on screen, transition included. Default 3. */
   hold?: number;
   /** Lower-third caption. Omit for no caption. */
@@ -45,6 +68,14 @@ export interface Timeline {
   /** Optional opening title card. */
   title?: string;
   subtitle?: string;
+  /**
+   * Background music: a filename under public/audio/. Automatically ducked
+   * under any step that has `voice`, because music at a constant level under
+   * narration is the single most common reason a demo sounds amateur.
+   */
+  music?: string;
+  /** Music level with no narration over it. 0-1, default 0.18. */
+  musicVolume?: number;
   steps: Step[];
 }
 

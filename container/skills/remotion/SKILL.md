@@ -103,6 +103,70 @@ product demo or a slideshow:
 - **Re-capture rather than re-animate.** When the UI changes, retake the shots
   and the boxes; the animation is derived.
 
+### Video clips for the moments a still cannot carry
+
+Set `clip` instead of `shot` on a step and it renders through `OffthreadVideo`:
+
+```json
+{ "clip": "03-drag.mp4", "hold": 3, "caption": "Drag to reforecast", "action": "look" }
+```
+
+Clips live in `public/clips/`. Camera, captions, and audio all work the same.
+
+Use them sparingly and deliberately. `agent-browser record` captures at 10fps,
+so a clip is visibly softer and choppier than a retina still, and zooming makes
+that worse. Reach for one only when the *motion is the point* — a drag, a chart
+animating in, a live-updating number, a transition. Everything else looks better
+as a still.
+
+**`hold` must not exceed the clip's own length** or the last frame freezes.
+Measure it, don't guess:
+
+```bash
+ffprobe -v error -show_entries format=duration -of csv=p=0 public/clips/03-drag.mp4
+```
+
+### Voice
+
+Any step can carry narration — `voice` is a filename in `public/audio/`:
+
+```json
+{ "shot": "02-scope.png", "hold": 4.5, "voice": "02.mp3", "caption": "Pick the market" }
+```
+
+Set `music` at the timeline level for a background bed. **It ducks
+automatically** under any step that has `voice` (ramped, not stepped) — music at
+a constant level under a voice is the single most common reason a demo sounds
+amateur. Tune the resting level with `musicVolume` (0–1, default 0.18).
+
+**Set `hold` from the audio's real duration** or the narration is cut off
+mid-sentence — the composition cannot know the length of a file it hasn't
+decoded:
+
+```bash
+ffprobe -v error -show_entries format=duration -of csv=p=0 public/audio/02.mp3
+```
+
+Write narration per step rather than as one long track. Per-step audio starts
+with its step, so re-recording one line never re-times the rest of the video.
+
+**Generating narration** needs a text-to-speech credential. The vault holds
+`OpenAI` (`api.openai.com`) and `ElevenLabs` (`api.elevenlabs.io`), but a group
+only reaches one if it is declared in that group's `onecliSecrets` — otherwise
+the call returns `401`. With one granted, the gateway injects the key and the
+ordinary REST call works:
+
+```bash
+curl -sS https://api.openai.com/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini-tts","voice":"alloy","input":"Forecast the quarter in three clicks."}' \
+  -o public/audio/02.mp3
+```
+
+Never put an API key in the command — the gateway attaches it at the proxy
+boundary. If you get a `401`, the credential is not scoped to your group; ask an
+operator rather than trying to supply a key yourself.
+
 ### Why stills and not the screen recording
 
 `agent-browser record` is locked at 10fps, so zooming into that footage is soft
