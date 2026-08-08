@@ -32,7 +32,6 @@ vi.mock('./db/messaging-groups.js', () => ({
   getMessagingGroupAgents: vi.fn(() => []),
   createMessagingGroup: vi.fn(),
   createMessagingGroupAgent: vi.fn(),
-  getMessagingGroupAgentByPair: vi.fn(() => undefined),
 }));
 
 vi.mock('./db/agent-groups.js', () => ({
