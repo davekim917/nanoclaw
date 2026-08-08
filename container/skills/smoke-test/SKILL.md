@@ -95,11 +95,29 @@ old one: stale lanes cannot vouch for a build they never touched.
 
 The coordinator then runs `scripts/smoke-evidence-barrier.sh <run-dir> lanes`
 and writes `coordinator/preliminary.md`. The challenger writes
-`challenger/disposition.md` before checking only for the existence of the
-coordinator's preliminary file. Neither parent reads the other file before its
-own conclusion is durable — and note that the run thread is a channel too: a
-disposition posted with a mention lands in the other parent's context whether
-or not its own conclusion is written yet. Write to disk first, post second.
+`challenger/disposition.md` first. Neither parent reads the other file before
+its own conclusion is durable.
+
+**The run thread is a contamination channel, and it is gated.** A disposition
+posted with a mention injects its full contents into the other parent's context
+whether or not that parent has written a line — files ordered correctly cannot
+save you from a chat transport that ignores the ordering. The challenger
+therefore asks before it posts:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-evidence-barrier.sh <run-dir> disposition
+```
+
+`ready:true` means both conclusions are durable — the challenger's own, and the
+coordinator's preliminary — so the post can no longer contaminate a conclusion
+that does not exist yet. Anything else names what is missing; wait and re-ask,
+do not post. The gate deliberately does NOT require the coordinator's lane
+markers: the challenger must never queue behind the lanes it exists to
+challenge.
+
+The coordinator's own publish gate is the `synthesis` phase, which additionally
+requires every declared lane marker. Neither parent posts conclusions to the
+thread on a `ready:false`.
 
 The coordinator is the sole verdict writer. The challenger posts one challenger
 disposition in the run thread, and any dissent must remain visible in the
@@ -198,7 +216,7 @@ Give every check a stable ID. At minimum cover the applicable surfaces below:
 | Navigation | every in-scope route, entry point, back/forward path, deep link |
 | Controls | every visible button, menu item, tab, filter, form, upload, export, undo, reset |
 | State | empty, loading, populated, changed, saved, refreshed, restored, failed |
-| Permissions | relevant roles, unknown/expired session, forbidden mutations |
+| Permissions | relevant roles, unknown/expired session, forbidden mutations — score crossings by the rule below, never by whether the run completed |
 | Display | supported viewport sizes, overflow, labels, units, dates, currency, accessibility tree |
 | Parity and polish | sibling modules/reference implementations, naming, years, formatting, contrast, tooltips, confirmations, responsive/mobile behavior |
 | Network | feeding request status/body, retries, console errors, partial/slow failure |
@@ -209,6 +227,41 @@ Give every check a stable ID. At minimum cover the applicable surfaces below:
 `Push every button` means `checks_executed / checks_planned`, with the manifest
 attached. Never call a run 100% complete when anything is blocked, skipped, or
 outside the stated scope.
+
+### Scoring permission crossings — a success is the defect
+
+Permission checks invert the usual scoring, and getting this backwards makes a
+run report a clean pass on exactly the defects it was convened to find.
+
+Write every permission check as an attempt to do **somebody else's job** — one
+scope reaching for another's data or money — and score the attempt, never the
+run's completion:
+
+| Outcome | Meaning | Verdict |
+|---|---|---|
+| `REFUSED` | the server refused it | **pass** |
+| `ALLOWED` | the server performed it | **defect**, whether or not the screen offered the control |
+| `HIDDEN_ONLY` | the screen offered no control, and the same request sent directly succeeded | **defect**, and the most dangerous shape |
+
+**Never record `HIDDEN_ONLY` as `REFUSED`. A hidden control is not a control.**
+It is the shape a browser-only lane always records as a pass, because the
+tester never tries what the UI does not offer.
+
+This has teeth only when the seats are real. Requirements:
+
+- **Two or more seats, scoped and non-overlapping**, and no seat holding the
+  admin/superuser flag the product genuinely enforces — an all-powerful seat
+  returns a meaningless pass on every crossing.
+- **The scope of each seat is read back by an agent that did not create it.**
+  A mis-scoped seat turns a real permission failure into a silent pass and the
+  screenshot looks identical either way. Whoever provisioned the accounts
+  cannot be the one who certifies their scope.
+- **Write the scoring rule into the manifest before anyone logs in.** After the
+  fact, every screenshot looks the same and nobody can tell which seat produced
+  which.
+- Where a module has many unguarded routes, played naturally both seats will do
+  everything, nothing will error, and the run will look clean. That appearance
+  is the failure mode this section exists to prevent.
 
 ## 3. Run two independent provider-native lanes
 
