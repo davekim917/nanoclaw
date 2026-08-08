@@ -35,6 +35,7 @@ import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js
 import { startRepoFreshness, stopRepoFreshness } from './repo-freshness.js';
 import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
 import { startCommitScan, stopCommitScan } from './commit-scan.js';
+import { startBacklogCanvas, stopBacklogCanvas } from './backlog-canvas.js';
 import { startDailySummary, stopDailySummary } from './daily-summary.js';
 import { restoreRemoteControl } from './remote-control.js';
 import { startDiscordSlashCommands, stopDiscordSlashCommands } from './channels/discord-slash-commands.js';
@@ -472,6 +473,14 @@ export async function main(): Promise<void> {
     log.info('Daily summary started');
   }
 
+  // 10b. Live backlog board (5min tick, edits a Slack channel canvas in place).
+  //      Opt-in per workgroup via container.json's backlogCanvas; no
+  //      declaration anywhere means this loops over nothing.
+  if (process.env.BACKLOG_CANVAS_ENABLED !== '0') {
+    startBacklogCanvas();
+    log.info('Backlog canvas started');
+  }
+
   // 11. Restore any Remote Control session that was running before restart
   restoreRemoteControl();
 
@@ -512,6 +521,7 @@ async function shutdown(signal: string): Promise<void> {
   stopPluginUpdater();
   stopCommitScan();
   stopDailySummary();
+  stopBacklogCanvas();
   await stopDiscordSlashCommands();
   await stopCliServer();
   try {

@@ -118,10 +118,20 @@ async function fireDigests(): Promise<void> {
       const dailySummaryConfig = readContainerConfig(poster.folder).dailySummary;
       const includeShipLog = dailySummaryConfig?.shipLog !== false;
       const includeResolved = dailySummaryConfig?.resolved !== false;
+      const includeBacklog = dailySummaryConfig?.backlog !== false;
       const { parent, backlogThread } = formatDigestParts(workgroupId, summary, {
         includeShipLog,
         includeResolved,
+        includeBacklog,
       });
+      // isEmpty() above tests the DATA; the include* flags can still strip every
+      // section from a non-empty summary (illysium runs all three off now that
+      // its board lives in Linear + the canvas). Posting the bare "📋 Daily
+      // Summary" header every morning is worse than posting nothing.
+      if (!backlogThread && parent.trim().split('\n').length <= 1) {
+        log.info('Daily summary: every section disabled for this workgroup — skipping', { workgroupId });
+        continue;
+      }
       const parentId = await adapter.deliver(
         target.channel_type,
         target.platform_id,
@@ -294,7 +304,7 @@ function resolveTarget(poster: AgentGroup): MessagingGroup | null {
 export function formatDigestParts(
   label: string,
   s: Summary,
-  opts: { includeShipLog?: boolean; includeResolved?: boolean } = {},
+  opts: { includeShipLog?: boolean; includeResolved?: boolean; includeBacklog?: boolean } = {},
 ): { parent: string; backlogThread: string | null } {
   const lines: string[] = [`📋 **Daily Summary** — ${label}`];
 
@@ -312,7 +322,7 @@ export function formatDigestParts(
   }
 
   let backlogThread: string | null = null;
-  if (s.openBacklog.length > 0) {
+  if (opts.includeBacklog !== false && s.openBacklog.length > 0) {
     lines.push('', `📌 **Open Backlog** (${s.openBacklog.length}) — ranked list in 🧵`);
     backlogThread = formatBacklogThread(s.openBacklog);
   }

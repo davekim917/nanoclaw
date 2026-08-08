@@ -315,6 +315,29 @@ export interface ContainerConfig {
      * and this digest should be an open-backlog-only reminder.
      */
     resolved?: boolean;
+    /**
+     * Include the ranked open-backlog list (parent headline + threaded list).
+     * Defaults to true. Set false once the workgroup's backlog lives in a real
+     * tracker and is rendered by `backlogCanvas` — the daily repost of a list
+     * that barely changes day to day is noise, and the canvas is always current.
+     */
+    backlog?: boolean;
+  };
+
+  /**
+   * Per-workgroup live backlog board, rendered into a Slack channel canvas by
+   * `src/backlog-canvas.ts`. Presence of `messagingGroupId` is the opt-in — no
+   * declaration means no canvas, so other workgroups are unaffected.
+   *
+   * Declare this on the group whose Slack bot holds the `canvases:write` scope;
+   * the canvas is a property of the channel, not of the posting bot, so the
+   * choice of writer is invisible to readers.
+   */
+  backlogCanvas?: {
+    /** Destination channel. Its channel_type also selects the bot token. */
+    messagingGroupId?: string;
+    /** Linear team whose issues the board renders (e.g. "XZO"). */
+    linearTeam?: string;
   };
 
   /**
@@ -481,6 +504,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
     tools: raw.tools,
     providerConfig: raw.providerConfig,
     dailySummary: raw.dailySummary,
+    backlogCanvas: raw.backlogCanvas,
     onecliSecrets: raw.onecliSecrets,
     workgroup_id: raw.workgroup_id,
     slack_user_token: raw.slack_user_token,
