@@ -97,6 +97,24 @@ function adapterHasWorkspaceIdentity(channelType: string): boolean {
   return false;
 }
 
+/**
+ * The tone this agent group uses on this platform, but only when every one of
+ * its existing channels there agrees. Returns null when they differ (or when
+ * they unanimously have none), so the wiring falls through to the group
+ * default rather than adopting an arbitrary channel's override.
+ */
+function unanimousToneFor(agentGroupId: string, channelType: string): string | null {
+  const rows = getDb()
+    .prepare(
+      `SELECT DISTINCT mga.default_tone AS tone
+         FROM messaging_group_agents mga
+         JOIN messaging_groups m ON m.id = mga.messaging_group_id
+        WHERE mga.agent_group_id = ? AND m.channel_type = ?`,
+    )
+    .all(agentGroupId, channelType) as Array<{ tone: string | null }>;
+  return rows.length === 1 ? rows[0].tone : null;
+}
+
 function inheritedAgentGroupFor(mg: MessagingGroup): { id: string; sourceMessagingGroupId: string } | null {
   const db = getDb();
   let rows: Array<{ agent_group_id: string; messaging_group_id: string; cnt: number }>;
@@ -515,6 +533,25 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     const inheritedAgent = inheritedAgentGroupFor(mg);
     if (inheritedAgent) {
       try {
+        // Voice travels with the agent identity, so a channel auto-wired from
+        // an existing one inherits its tone. Without this every auto-wired
+        // channel ran with NO tone injection while the hand-wired ones kept
+        // theirs, so one agent sounded like two different agents depending on
+        // which of its channels you were in (owner report 2026-08-08).
+        //
+        // Only when the agent's existing channels AGREE. Copying one arbitrary
+        // wiring guesses: `inheritedAgentGroupFor` returns MIN(messaging_group_id),
+        // which has nothing to do with which channel is representative, so on a
+        // platform where tone varies per channel it propagates whichever row
+        // sorted first. Verified 2026-08-08: a new Discord guild channel would
+        // have inherited the casual tone set on the one channel deliberately
+        // different from every other. Disagreement means we don't know, so
+        // leave NULL and let the group default in container.json answer.
+        //
+        // Tone ONLY: default_model / default_effort are sticky per-channel
+        // operational pins (`-m` / `-e` persist), and spreading one channel's
+        // pin to every future channel is a worse bug than the one this fixes.
+        const inheritedTone = unanimousToneFor(inheritedAgent.id, mg.channel_type);
         createMessagingGroupAgent({
           id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           messaging_group_id: mg.id,
@@ -533,7 +570,7 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
           ignored_message_policy: 'accumulate',
           default_model: null,
           default_effort: null,
-          default_tone: null,
+          default_tone: inheritedTone,
           created_at: new Date().toISOString(),
         });
         log.info('Workspace-trust auto-wire', {

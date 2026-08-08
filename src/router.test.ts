@@ -32,6 +32,7 @@ vi.mock('./db/messaging-groups.js', () => ({
   getMessagingGroupAgents: vi.fn(() => []),
   createMessagingGroup: vi.fn(),
   createMessagingGroupAgent: vi.fn(),
+  getMessagingGroupAgentByPair: vi.fn(() => undefined),
 }));
 
 vi.mock('./db/agent-groups.js', () => ({
@@ -123,7 +124,12 @@ import {
   isSlackChannelType,
   isDiscordChannelType,
 } from './router.js';
-import { getMessagingGroupWithAgentCount, getMessagingGroupAgents } from './db/messaging-groups.js';
+import {
+  getMessagingGroupWithAgentCount,
+  getMessagingGroupAgents,
+  createMessagingGroupAgent,
+} from './db/messaging-groups.js';
+import { getDb } from './db/connection.js';
 import { writeSessionMessageIfNew, writeOutboundDirect, resolveSession } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
@@ -586,5 +592,72 @@ describe('channel-type predicates accept bare base and variants', () => {
     expect(isDiscordChannelType('discord-second')).toBe(true);
     expect(isDiscordChannelType('slack')).toBe(false);
     expect(isDiscordChannelType('discordia')).toBe(false);
+  });
+});
+
+describe('workspace-trust auto-wire inherits voice', () => {
+  // Regression: the auto-wire path copied the agent group from an incumbent
+  // channel but hardcoded default_tone null, so every channel created after
+  // the hand-wired ones ran with NO tone injection — one agent sounded like
+  // two different agents depending on the channel, for four months.
+  function arrangeAutoWire(existingTones: Array<string | null>) {
+    const mg = makeMg({ id: 'mg-new', platform_id: 'slack:CNEW' });
+    // Auto-wire re-enters routing once the row exists; the second lookup must
+    // report the channel as wired or routeInbound recurses forever.
+    vi.mocked(getMessagingGroupWithAgentCount)
+      .mockReturnValueOnce({ mg, agentCount: 0 })
+      .mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent({ messaging_group_id: 'mg-new' })]);
+    vi.mocked(getDb).mockReturnValue({
+      prepare: (sql: string) => ({
+        // inheritedAgentGroupFor picks the incumbent; unanimousToneFor asks
+        // what tone that agent already uses on this platform.
+        all: () =>
+          /DISTINCT/.test(sql)
+            ? existingTones.map((tone) => ({ tone }))
+            : [{ agent_group_id: 'ag-1', messaging_group_id: 'mg-src', cnt: 3 }],
+      }),
+    } as never);
+  }
+
+  it('adopts the tone when every existing channel agrees', async () => {
+    arrangeAutoWire(['engineering']);
+
+    await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW' }));
+
+    expect(createMessagingGroupAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ agent_group_id: 'ag-1', default_tone: 'engineering' }),
+    );
+  });
+
+  it('stays NULL when existing channels disagree, rather than guessing one', async () => {
+    // A deployment can hold one channel at a deliberately different tone from
+    // every other. Copying an arbitrary row would spread that exception to
+    // every new channel.
+    arrangeAutoWire(['engineering', 'assistant']);
+
+    await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW' }));
+
+    expect(createMessagingGroupAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ agent_group_id: 'ag-1', default_tone: null }),
+    );
+  });
+
+  it('stays NULL when the agent has no tone anywhere on the platform', async () => {
+    arrangeAutoWire([null]);
+
+    await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW' }));
+
+    expect(createMessagingGroupAgent).toHaveBeenCalledWith(expect.objectContaining({ default_tone: null }));
+  });
+
+  it('never inherits model or effort — a sticky -m pin must not spread', async () => {
+    arrangeAutoWire(['engineering']);
+
+    await routeInbound(makeChatEvent('@bot hello', { platformId: 'slack:CNEW' }));
+
+    expect(createMessagingGroupAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ default_model: null, default_effort: null }),
+    );
   });
 });

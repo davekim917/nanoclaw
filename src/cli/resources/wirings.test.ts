@@ -233,3 +233,63 @@ describe('wirings-update — same validation as create', () => {
     await expect(update({ id: 'mga-legacy', engage_pattern: '' })).rejects.toThrow(/--engage-pattern/);
   });
 });
+
+describe('wirings — per-channel tone/model/effort overrides', () => {
+  // These three columns existed and drove behavior for months while being
+  // neither readable nor writable through ncl. A sticky `-m` on one channel
+  // was invisible here, and a channel silently missing its tone looked
+  // identical to one that never had it. Assertions read the persisted row,
+  // since create() returns the assembled values, not a DB read.
+  const stored = (id: unknown) => getMessagingGroupAgent(id as string)!;
+
+  it('omitted overrides stay NULL so the group default is inherited', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+    expect(stored(row.id).default_tone).toBeNull();
+    expect(stored(row.id).default_model).toBeNull();
+    expect(stored(row.id).default_effort).toBeNull();
+  });
+
+  it('create accepts all three', async () => {
+    const row = await create({
+      messaging_group_id: 'mg-group',
+      agent_group_id: 'ag-1',
+      default_tone: 'gilfoyle',
+      default_model: 'sonnet',
+      default_effort: 'xhigh',
+    });
+    expect(stored(row.id).default_tone).toBe('gilfoyle');
+    expect(stored(row.id).default_model).toBe('sonnet');
+    expect(stored(row.id).default_effort).toBe('xhigh');
+  });
+
+  it('update sets an override on an existing wiring', async () => {
+    const row = await create({ messaging_group_id: 'mg-group', agent_group_id: 'ag-1' });
+    await update({ id: row.id, default_tone: 'engineering' });
+    expect(stored(row.id).default_tone).toBe('engineering');
+  });
+
+  it('--default-tone "" clears back to NULL, not to empty string', async () => {
+    // NULL and '' are NOT equivalent downstream: NULL falls through to
+    // container.json `tone`, '' resolves to no tone at all AND suppresses the
+    // group default. A column that can be set but never unset is the trap.
+    const row = await create({
+      messaging_group_id: 'mg-group',
+      agent_group_id: 'ag-1',
+      default_tone: 'jian-yang',
+    });
+    await update({ id: row.id, default_tone: '' });
+    expect(stored(row.id).default_tone).toBeNull();
+  });
+
+  it('clears model and effort the same way', async () => {
+    const row = await create({
+      messaging_group_id: 'mg-group',
+      agent_group_id: 'ag-1',
+      default_model: 'sonnet',
+      default_effort: 'xhigh',
+    });
+    await update({ id: row.id, default_model: '', default_effort: '' });
+    expect(stored(row.id).default_model).toBeNull();
+    expect(stored(row.id).default_effort).toBeNull();
+  });
+});

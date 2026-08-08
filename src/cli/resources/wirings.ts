@@ -128,6 +128,36 @@ registerResource({
       default: 0,
       updatable: true,
     },
+    // The three per-channel overrides. NULL (the norm) means "inherit the
+    // group default from container.json" — set one only to make this channel
+    // deliberately different. They were undeclared until 2026-08-08, so they
+    // could neither be read nor written here: a `-m sonnet` that went sticky
+    // on one channel was invisible to `ncl wirings get`, and a channel that
+    // silently lost its tone looked identical to one that never had it.
+    {
+      name: 'default_tone',
+      type: 'string',
+      description:
+        'Voice for this channel — a tone profile name resolved group-local first (groups/<folder>/tone-profiles/<name>.md, private) then shared (tone-profiles/<name>.md). Agent personas are group-local profiles, so this is also how a persona is scoped to one channel. NULL inherits container.json `tone`; `--default-tone ""` clears it back to NULL.',
+      updatable: true,
+      nullable: true,
+    },
+    {
+      name: 'default_model',
+      type: 'string',
+      description:
+        'Sticky model for this channel — same vocabulary as the `-m` chat flag (family alias like `opus`/`sonnet`, a pinned id, or a provider slug). An in-chat `-m` PERSISTS here, so a one-off experiment silently becomes the channel default. NULL inherits the group/install default; `--default-model ""` clears it.',
+      updatable: true,
+      nullable: true,
+    },
+    {
+      name: 'default_effort',
+      type: 'string',
+      description:
+        'Sticky reasoning effort for this channel — same vocabulary as the `-e` chat flag, and provider-specific in what it accepts. Persists from chat like --default-model. NULL inherits the group/install default; `--default-effort ""` clears it.',
+      updatable: true,
+      nullable: true,
+    },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
   // Generic create is replaced by the custom `create` below — it resolves
@@ -213,6 +243,11 @@ registerResource({
         if (args.engage_pattern !== undefined) values.engage_pattern = args.engage_pattern;
         if (args.threads !== undefined) values.threads = args.threads;
         if (args.priority !== undefined) values.priority = Number(args.priority);
+        // Per-channel overrides. Omitted stays absent → column NULL → inherit
+        // the group default, which is the right answer for almost every wiring.
+        for (const name of ['default_tone', 'default_model', 'default_effort'] as const) {
+          if (args[name] !== undefined && args[name] !== '') values[name] = args[name];
+        }
 
         // Pass-2 parity: context-aware defaults + cross-column validation.
         const mg = requireMessagingGroup(values.messaging_group_id);

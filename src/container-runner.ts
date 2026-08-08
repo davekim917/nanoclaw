@@ -2137,6 +2137,21 @@ export function buildMounts(
     });
   }
 
+  // Group-owned tone profiles — overlay, resolved BEFORE the shared set by
+  // the container (agent-runner/src/tone-profiles.ts). This is what lets a
+  // voice be selected per channel without publishing it: agent personas live
+  // here, in the private groups repo, invisible to other workgroups, and are
+  // chosen through `default_tone` exactly like a shared profile. A group can
+  // also shadow a shared name for itself alone.
+  const groupToneProfilesDir = path.join(groupDir, 'tone-profiles');
+  if (fs.existsSync(groupToneProfilesDir)) {
+    mounts.push({
+      hostPath: groupToneProfilesDir,
+      containerPath: '/workspace/tone-profiles-group',
+      readonly: true,
+    });
+  }
+
   // Host-side credential dirs — gated by the per-agent `tools` allowlist in
   // container.json. Two modes:
   //

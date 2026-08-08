@@ -36,6 +36,7 @@ import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
+import { readToneProfile } from './tone-profiles.js';
 import {
   setupCodexPrimaryRuntime,
   setupCodexRuntime,
@@ -87,22 +88,24 @@ async function main(): Promise<void> {
     taskId ? { kind: 'task', taskId } : { kind: 'chat' },
   );
 
-  // Always-on tone profile injection. Host resolves per-channel tone (via
+  // Always-on voice injection. Host resolves per-channel tone (via
   // messaging_group_agents.default_tone → container.json `tone`) and forwards
-  // the name in NANOCLAW_DEFAULT_TONE. When set, read the corresponding
-  // tone-profiles/<name>.md and prepend it to the system prompt so every
-  // response — chat or drafted content — picks up the voice. Mirrors v1
-  // index.ts:2138-2147.
+  // the name in NANOCLAW_DEFAULT_TONE. The name resolves group-local first
+  // (groups/<folder>/tone-profiles/) then shared — see ../tone-profiles.ts —
+  // so a group-owned persona and a fleet-wide tone are the same mechanism and
+  // occupy the same single slot. THIS IS THE ONLY ALWAYS-ON VOICE LAYER: never
+  // add a second one (a persona section in a group's instructions file, say),
+  // because a per-group layer cannot vary by channel and ends up arguing with
+  // this one in rooms where a different voice was selected.
   let toneBlock: string | undefined;
   const toneName = process.env.NANOCLAW_DEFAULT_TONE;
   if (toneName) {
-    const toneProfilePath = `/workspace/tone-profiles/${toneName}.md`;
-    try {
-      const toneContent = fs.readFileSync(toneProfilePath, 'utf-8');
+    const toneContent = readToneProfile(toneName);
+    if (toneContent !== null) {
       toneBlock = `## Default Tone: ${toneName}\n\nApply this voice to every response in this session — chat replies AND any content you draft (emails, documents, messages). Per-response overrides from the user ("use X tone") take precedence.\n\n${toneContent}`;
       log(`Loaded default tone profile: ${toneName}`);
-    } catch {
-      log(`NANOCLAW_DEFAULT_TONE=${toneName} but ${toneProfilePath} not found — skipping injection`);
+    } else {
+      log(`NANOCLAW_DEFAULT_TONE=${toneName} but no such profile in group or shared tone-profiles — skipping injection`);
     }
   }
 

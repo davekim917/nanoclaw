@@ -34,6 +34,14 @@ export interface ColumnDef {
   defaultFrom?: string;
   /** Allowed values (shown in help). */
   enum?: string[];
+  /**
+   * Column is meaningfully NULL, and `--flag ""` clears it back to NULL on
+   * update. Without this a nullable column can be SET from the CLI but never
+   * UNSET, which is a trap: for per-channel overrides, empty string and NULL
+   * are not the same thing — NULL falls through to the group default, `''`
+   * suppresses it.
+   */
+  nullable?: boolean;
 }
 
 export interface CustomOperation {
@@ -282,6 +290,13 @@ function genericUpdate(def: ResourceDef) {
     for (const col of updatableCols) {
       const v = args[col.name];
       if (v !== undefined) {
+        // `--flag ""` on a nullable column means "clear it", not "set empty
+        // string". Checked before the enum test so clearing never has to
+        // satisfy the enum.
+        if (col.nullable && v === '') {
+          updates[col.name] = null;
+          continue;
+        }
         if (col.enum && !col.enum.includes(String(v))) {
           throw new Error(`${col.name} must be one of: ${col.enum.join(', ')}`);
         }

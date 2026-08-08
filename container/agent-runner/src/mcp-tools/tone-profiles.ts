@@ -11,15 +11,15 @@
  * overrides (e.g. "respond in a pirate voice") work by passing any
  * name — unknown names return an instruction to interpret ad-hoc.
  */
-import fs from 'fs';
-import path from 'path';
-
+import {
+  listToneProfileNames,
+  readToneAuxFile,
+  readToneProfile,
+  SELECTION_GUIDE_FILE,
+  WRITING_RULES_FILE,
+} from '../tone-profiles.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
-
-const TONE_PROFILES_DIR = '/workspace/tone-profiles';
-const WRITING_RULES_FILE = 'writing-rules.md';
-const SELECTION_GUIDE_FILE = 'selection-guide.md';
 
 function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
@@ -45,14 +45,10 @@ export const getToneProfileTool: McpToolDefinition = {
     const name = typeof args.name === 'string' ? args.name : '';
     if (!name) return ok('Error: name is required');
 
-    const profilePath = path.join(TONE_PROFILES_DIR, `${name}.md`);
-    if (fs.existsSync(profilePath)) {
-      const content = fs.readFileSync(profilePath, 'utf-8');
-      const rulesPath = path.join(TONE_PROFILES_DIR, WRITING_RULES_FILE);
-      const rules = fs.existsSync(rulesPath)
-        ? '\n\n---\n\n' + fs.readFileSync(rulesPath, 'utf-8')
-        : '';
-      return ok(content + rules);
+    const content = readToneProfile(name);
+    if (content !== null) {
+      const rulesBody = readToneAuxFile(WRITING_RULES_FILE);
+      return ok(content + (rulesBody ? '\n\n---\n\n' + rulesBody : ''));
     }
 
     return ok(
@@ -72,17 +68,10 @@ export const listToneProfilesTool: McpToolDefinition = {
     },
   },
   handler: async () => {
-    if (!fs.existsSync(TONE_PROFILES_DIR)) {
-      return ok('No tone profiles directory mounted.');
-    }
-    const files = fs.readdirSync(TONE_PROFILES_DIR)
-      .filter((f) => f.endsWith('.md') && f !== WRITING_RULES_FILE && f !== SELECTION_GUIDE_FILE);
-    const profiles = files.map((f) => f.replace('.md', ''));
+    const profiles = listToneProfileNames();
 
-    const selectionGuidePath = path.join(TONE_PROFILES_DIR, SELECTION_GUIDE_FILE);
-    const selectionGuide = fs.existsSync(selectionGuidePath)
-      ? '\n\n---\n\n' + fs.readFileSync(selectionGuidePath, 'utf-8')
-      : '';
+    const guideBody = readToneAuxFile(SELECTION_GUIDE_FILE);
+    const selectionGuide = guideBody ? '\n\n---\n\n' + guideBody : '';
 
     const list = profiles.length > 0
       ? `Available tone profiles: ${profiles.join(', ')}`
