@@ -39,6 +39,9 @@ if bash "$GATE" finish "$SHA" run-1 SHIP_IT | jq -e '.ok == true' >/dev/null 2>&
 fi
 
 # 5. finish records the completed run and clears active/candidate state.
+#    A run must own the active slot to record a verdict (poll claims it for a
+#    scheduled run); claim stands in for poll here so this needs no network.
+bash "$GATE" claim run-1 "$SHA" >/dev/null
 bash "$GATE" finish "$SHA" run-1 NO_GO | jq -e '.ok == true' >/dev/null
 jq -e --arg sha "$SHA" '
   .completedSha == $sha and .completedVerdict == "NO_GO" and
@@ -143,6 +146,7 @@ bash "$GATE" poll | jq -e '
 
 # 14. finish publishes the verdict artifact when SMOKE_GATE_PUBLISH_FILE is set.
 PUBLISH="$STATE_DIR/pub/latest-verdict.json"
+bash "$GATE" claim "$RUN_ID2" "$BUILD_SHA" >/dev/null
 SMOKE_GATE_PUBLISH_FILE="$PUBLISH" bash "$GATE" finish "$BUILD_SHA" "$RUN_ID2" NO_GO \
   | jq -e '.ok == true' >/dev/null
 jq -e --arg sha "$BUILD_SHA" --arg run "$RUN_ID2" '
@@ -152,16 +156,20 @@ jq -e --arg sha "$BUILD_SHA" --arg run "$RUN_ID2" '
 
 # 15. Hold flag: NO_GO raises it, BLOCKED leaves it untouched, GO clears it.
 HOLD="$STATE_DIR/pub/develop-hold.json"
+bash "$GATE" claim run-hold-1 "$BUILD_SHA" >/dev/null
 SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-1 NO_GO >/dev/null
 jq -e --arg sha "$BUILD_SHA" '
   .verdict == "NO_GO" and .sha == $sha and .runId == "run-hold-1" and
   (.reason | length > 0)
 ' "$HOLD" >/dev/null
+bash "$GATE" claim run-hold-2 "$BUILD_SHA" >/dev/null
 SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-2 BLOCKED >/dev/null
 jq -e '.runId == "run-hold-1"' "$HOLD" >/dev/null   # unchanged by BLOCKED
+bash "$GATE" claim run-hold-3 "$BUILD_SHA" >/dev/null
 SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-3 GO >/dev/null
 [ ! -e "$HOLD" ]
 # GO with no prior hold is a no-op, not an error.
+bash "$GATE" claim run-hold-4 "$BUILD_SHA" >/dev/null
 SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-4 GO \
   | jq -e '.ok == true' >/dev/null
 

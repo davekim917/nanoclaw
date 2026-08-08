@@ -62,16 +62,44 @@ parent agreement are not evidence; reproductions, requests, source paths,
 tests, and immutable artifacts are evidence.
 
 Independence must survive a container or thread handoff. Conversation state is
-not the handoff surface. Before dispatch, the coordinator writes
-`completion-contract.json` in the canonical run directory with the frozen
-`sourceSha` and every required lane marker. Each worker writes its own marker
-only after its evidence is durable; terminal statuses are `pass`, `fail`,
-`blocked`, `void`, or `completed`. The coordinator runs
-`scripts/smoke-evidence-barrier.sh <run-dir> lanes` (mounted in containers
-at `/app/skills/smoke-test/scripts/`), then writes
-`coordinator/preliminary.md`. The challenger writes `challenger/disposition.md`
-before checking only for the existence of the coordinator's preliminary file.
-Neither parent reads the other file before its own conclusion is durable.
+not the handoff surface.
+
+**Never hand-write the contract or a marker.** Both come from
+`scripts/smoke-run-scaffold.sh` (mounted in containers at
+`/app/skills/smoke-test/scripts/`), because a freehand artifact drifts from
+what the barrier validates and the barrier's failure mode is silent — it
+returns `ready:false` forever while the run proceeds on self-discipline,
+reporting a governed posture it does not have. That is not hypothetical: it
+is what happened on 2026-08-07.
+
+Before dispatch, the coordinator writes the contract with the frozen SHA and
+every lane it is committing to:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh contract \
+  <run-dir> <source-sha> B1:browser:'Program master' S1:source:'Fund ledger' ...
+```
+
+Each worker writes its own marker only after its evidence is durable:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh marker \
+  <run-dir> <lane-id> <pass|fail|blocked|void|completed> '<summary>' '<evidence,paths>'
+```
+
+The marker takes its `sourceSha` from the contract, never from the caller, so
+a worker cannot certify a build it was not assigned — and an undeclared lane
+is refused rather than leaving the real lane forever missing. Re-freezing on a
+new build rewrites the contract, which invalidates every marker bound to the
+old one: stale lanes cannot vouch for a build they never touched.
+
+The coordinator then runs `scripts/smoke-evidence-barrier.sh <run-dir> lanes`
+and writes `coordinator/preliminary.md`. The challenger writes
+`challenger/disposition.md` before checking only for the existence of the
+coordinator's preliminary file. Neither parent reads the other file before its
+own conclusion is durable — and note that the run thread is a channel too: a
+disposition posted with a mention lands in the other parent's context whether
+or not its own conclusion is written yet. Write to disk first, post second.
 
 The coordinator is the sole verdict writer. The challenger posts one challenger
 disposition in the run thread, and any dissent must remain visible in the
