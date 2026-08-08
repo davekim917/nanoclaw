@@ -98,10 +98,11 @@ function inboundDb(): Database.Database {
 function insertChatInbound(
   db: Database.Database,
   content: Record<string, unknown>,
-  opts: { channelType?: string; timestamp?: string } = {},
+  opts: { channelType?: string; timestamp?: string; kind?: string } = {},
 ): void {
-  db.prepare(`INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, 'chat', ?, ?, ?)`).run(
+  db.prepare(`INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, ?, ?, ?, ?)`).run(
     `in-${Math.random().toString(36).slice(2, 8)}`,
+    opts.kind ?? 'chat',
     opts.timestamp ?? now(),
     opts.channelType ?? 'slack-example-labs',
     JSON.stringify(content),
@@ -215,6 +216,28 @@ describe('_deriveCallerId', () => {
 
   it('returns null when there are no chat messages', () => {
     expect(_deriveCallerId(makeSession(), inboundDb())).toBeNull();
+  });
+
+  // Regression: the chat-SDK bridge writes kind='chat-sdk'. A `kind='chat'`-only
+  // filter matched nothing, so every admin action was denied as "unidentified".
+  it("reads kind='chat-sdk' rows", () => {
+    const db = inboundDb();
+    insertChatInbound(db, { senderId: 'OWNER', author: { userId: 'OWNER' } }, { kind: 'chat-sdk' });
+    expect(_deriveCallerId(makeSession(), db)).toBe('slack-example-labs:OWNER');
+  });
+
+  // Regression: notifyAgent writes its own failure notice as kind='chat' with
+  // senderId 'system'. Without the skip, a retry attributes the action to the
+  // previous attempt's error message instead of the human.
+  it("skips the host's own system notices", () => {
+    const db = inboundDb();
+    insertChatInbound(db, { senderId: 'OWNER' }, { kind: 'chat-sdk', timestamp: '2026-01-01T00:00:00.000Z' });
+    insertChatInbound(
+      db,
+      { text: 'grant_access failed: ...', sender: 'system', senderId: 'system' },
+      { channelType: 'agent', timestamp: '2026-01-01T00:00:01.000Z' },
+    );
+    expect(_deriveCallerId(makeSession(), db)).toBe('slack-example-labs:OWNER');
   });
 
   it('returns null on malformed content JSON', () => {

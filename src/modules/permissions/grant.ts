@@ -25,6 +25,7 @@ import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
+import { deriveCallerId } from '../../caller-identity.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
@@ -49,36 +50,6 @@ interface GrantArgs {
   user?: unknown;
   role?: unknown;
   agentGroupId?: unknown;
-}
-
-/** Resolve the session's most recent inbound chat senderId, namespaced. */
-function deriveCallerId(session: Session, inDb: Database.Database): string | null {
-  // `kind='chat'` so we skip `task`/`system` messages that wouldn't carry a sender.
-  const row = inDb
-    .prepare(`SELECT content, channel_type FROM messages_in WHERE kind='chat' ORDER BY timestamp DESC LIMIT 1`)
-    .get() as { content?: string; channel_type?: string } | undefined;
-  if (!row?.content) return null;
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(row.content) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  const rawId = (() => {
-    const direct = parsed.senderId;
-    if (typeof direct === 'string' && direct.length > 0) return direct;
-    const author = parsed.author as { userId?: unknown } | undefined;
-    if (typeof author?.userId === 'string' && author.userId.length > 0) return author.userId;
-    return null;
-  })();
-  if (!rawId) return null;
-  if (rawId.includes(':')) return rawId;
-  // Fall back to the session's messaging_group for channel_type when
-  // the message row didn't carry it.
-  const mgFallback = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : undefined;
-  const channelType = row.channel_type ?? mgFallback?.channel_type ?? null;
-  if (!channelType) return null;
-  return `${channelType}:${rawId}`;
 }
 
 /** Strip `<@…>` wrapping and prepend channel_type when needed. */

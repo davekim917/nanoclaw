@@ -54,7 +54,7 @@ export const setChannelModelTool: McpToolDefinition = {
   tool: {
     name: 'set_channel_model',
     description:
-      'Set the default model for a specific channel (messaging group) wired to this agent. Applies to every future turn on that channel unless the user passes `-m <model>` explicitly. Mutates messaging_group_agents.default_model. Pass `model` as a short alias (opus5, sonnet5, haiku45) or a full SDK id (e.g. claude-opus-5). Opus runs in 1M-context mode only — `[1m]` is auto-appended if omitted. Pass model=null to clear the per-channel override and fall back to the agent / host defaults. Admin-only.',
+      'Set the default model for a specific channel (messaging group) wired to this agent. Applies to every future turn on that channel unless the user passes `-m <model>` explicitly. Mutates messaging_group_agents.default_model. PREFER a bare family alias (`opus`, `sonnet`, `haiku`, `fable`) — it tracks the install\'s current model for that family, so a future bump propagates with no DB edit. Use a pinned alias (opus5, sonnet5, haiku45) or a full SDK id (claude-opus-5) only when the user explicitly wants that exact version frozen. Opus runs in 1M-context mode only — `[1m]` is auto-appended if omitted. Pass model=null to clear the per-channel override and fall back to the agent / host defaults. Admin-only.',
     inputSchema: {
       type: 'object' as const,
       properties: {

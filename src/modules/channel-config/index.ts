@@ -35,9 +35,9 @@ import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
+import { deriveCallerId } from '../../caller-identity.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import {
-  getMessagingGroup,
   getMessagingGroupAgentByPair,
   getMessagingGroupByPlatform,
   updateMessagingGroupAgent,
@@ -46,35 +46,6 @@ import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { notifyAgent } from '../approvals/primitive.js';
 import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
-
-// Reuse the caller derivation pattern from grant.ts. Copied (not imported)
-// because this module is default-tier and grant.ts is optional — a fork
-// that drops permissions shouldn't cascade-break channel-config.
-function deriveCallerId(session: Session, inDb: Database.Database): string | null {
-  const row = inDb
-    .prepare(`SELECT content, channel_type FROM messages_in WHERE kind='chat' ORDER BY timestamp DESC LIMIT 1`)
-    .get() as { content?: string; channel_type?: string } | undefined;
-  if (!row?.content) return null;
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(row.content) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  const rawId = (() => {
-    const direct = parsed.senderId;
-    if (typeof direct === 'string' && direct.length > 0) return direct;
-    const author = parsed.author as { userId?: unknown } | undefined;
-    if (typeof author?.userId === 'string' && author.userId.length > 0) return author.userId;
-    return null;
-  })();
-  if (!rawId) return null;
-  if (rawId.includes(':')) return rawId;
-  const mgFallback = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : undefined;
-  const channelType = row.channel_type ?? mgFallback?.channel_type ?? null;
-  if (!channelType) return null;
-  return `${channelType}:${rawId}`;
-}
 
 function hasMutateAuthority(userId: string, agentGroupId: string): boolean {
   return isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId);
