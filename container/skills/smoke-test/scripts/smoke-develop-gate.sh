@@ -87,7 +87,8 @@ default_state() {
     completedRunId: null,
     completedVerdict: null,
     fetchFailures: 0,
-    lastFailureWakeAt: null
+    lastFailureWakeAt: null,
+    holdAlertFor: null
   }'
 }
 
@@ -590,6 +591,46 @@ if [ "$CI_READY" != true ] || [ "$DEPLOY_READY" != true ]; then
   exit 0
 fi
 
+# Hold-file reconciliation. The hold lives on the shared workgroup mount so the
+# release desk can read it, which means every sibling can also delete or edit
+# it — including the builders whose promotion it blocks, under a standing
+# "bias to build" mandate. The gate's own ledger is private and authoritative,
+# so it can tell when the projection stopped matching: a NO_GO ledger with no
+# hold file means the objection was cleared by something that is not this gate.
+# Detection, not prevention — but it converts a silent hole into one visible
+# wake instead of a promotion nobody knows was ungated.
+HOLD_INTEGRITY=ok
+if [ -n "$HOLD_FILE" ]; then
+  LEDGER_VERDICT="$(jq -r '.completedVerdict // empty' <<<"$STATE")"
+  LEDGER_RUN="$(jq -r '.completedRunId // empty' <<<"$STATE")"
+  case "$LEDGER_VERDICT" in
+    NO_GO)
+      if [ ! -s "$HOLD_FILE" ]; then
+        HOLD_INTEGRITY=missing
+      elif [ "$(jq -r '.runId // empty' "$HOLD_FILE" 2>/dev/null)" != "$LEDGER_RUN" ]; then
+        HOLD_INTEGRITY=mismatched
+      fi
+      ;;
+    GO)
+      [ -s "$HOLD_FILE" ] && HOLD_INTEGRITY=unexpected
+      ;;
+    # BLOCKED / HUMAN_DECISION deliberately leave the hold untouched, so the
+    # ledger implies no expectation and there is nothing to reconcile.
+  esac
+fi
+if [ "$HOLD_INTEGRITY" != ok ] &&
+   [ "$(jq -r '.holdAlertFor // empty' <<<"$STATE")" != "$HOLD_INTEGRITY" ]; then
+  STATE="$(jq -c --arg s "$HOLD_INTEGRITY" '.holdAlertFor=$s' <<<"$STATE")"
+  write_state "$STATE"
+  jq -cn --arg state "$HOLD_INTEGRITY" --arg run "$(jq -r '.completedRunId // empty' <<<"$STATE")" \
+    --arg verdict "$(jq -r '.completedVerdict // empty' <<<"$STATE")" \
+    '{wakeAgent:true,data:{schemaVersion:1,trigger:"gate_hold_tampered",
+      holdIntegrity:$state,ledgerVerdict:$verdict,ledgerRunId:$run}}'
+  exit 0
+fi
+[ "$HOLD_INTEGRITY" = ok ] &&
+  STATE="$(jq -c '.holdAlertFor=null' <<<"$STATE")"
+
 # Settled: clear the stuck-head alert so the next stall alerts again.
 STATE="$(jq -c '.unsettledSha=null | .unsettledSince=null | .unsettledWakeSha=null' <<<"$STATE")"
 
@@ -648,7 +689,19 @@ PREVIOUS_SHA="$COMPLETED_SHA"
 if [ -z "$PREVIOUS_SHA" ]; then
   PREVIOUS_SHA="$(timeout 8 gh api "repos/$REPO/commits/$SOURCE_SHA" --jq '.parents[0].sha // empty' 2>/dev/null || true)"
 fi
-RUN_ID="${SMOKE_GATE_RUN_PREFIX:-smoke}-${SOURCE_SHA:0:12}-$(date -u +%Y%m%dT%H%M%SZ)"
+# Run ids are second-granular, so reclaiming an abandoned run on the SAME SHA
+# inside one second would reissue the SAME id — and then the zombie container's
+# `progress` and `finish` would match the new active run and be accepted,
+# silently defeating the not-the-active-run guards. Walk the timestamp forward
+# until the id is distinct from both the run being replaced and the last
+# completed one. Preserves the id format; costs a second at most.
+RUN_STAMP_EPOCH="$(date -u +%s)"
+RUN_ID="${SMOKE_GATE_RUN_PREFIX:-smoke}-${SOURCE_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
+while [ "$RUN_ID" = "$(jq -r '.activeRunId // empty' <<<"$STATE")" ] ||
+      [ "$RUN_ID" = "$(jq -r '.completedRunId // empty' <<<"$STATE")" ]; do
+  RUN_STAMP_EPOCH="$(( RUN_STAMP_EPOCH + 1 ))"
+  RUN_ID="${SMOKE_GATE_RUN_PREFIX:-smoke}-${SOURCE_SHA:0:12}-$(date -u -d "@$RUN_STAMP_EPOCH" +%Y%m%dT%H%M%SZ)"
+done
 STATE="$(jq -c \
   --arg sha "$SOURCE_SHA" \
   --arg now "$NOW" \

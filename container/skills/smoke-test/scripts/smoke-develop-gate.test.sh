@@ -146,10 +146,12 @@ bash "$GATE" poll | jq -e '
 
 # 14. finish publishes the verdict artifact when SMOKE_GATE_PUBLISH_FILE is set.
 PUBLISH="$STATE_DIR/pub/latest-verdict.json"
-bash "$GATE" claim "$RUN_ID2" "$BUILD_SHA" >/dev/null
-SMOKE_GATE_PUBLISH_FILE="$PUBLISH" bash "$GATE" finish "$BUILD_SHA" "$RUN_ID2" NO_GO \
+# Test 13's ceiling recovery already claimed a fresh run, so finish the run
+# that actually owns the slot — a verdict from any other run is refused now.
+RUN_ID3="$(jq -r '.activeRunId' "$STATE_FILE")"
+SMOKE_GATE_PUBLISH_FILE="$PUBLISH" bash "$GATE" finish "$BUILD_SHA" "$RUN_ID3" NO_GO \
   | jq -e '.ok == true' >/dev/null
-jq -e --arg sha "$BUILD_SHA" --arg run "$RUN_ID2" '
+jq -e --arg sha "$BUILD_SHA" --arg run "$RUN_ID3" '
   .schemaVersion == 1 and .sha == $sha and .runId == $run and
   .verdict == "NO_GO" and (.finishedAt | type == "string")
 ' "$PUBLISH" >/dev/null
@@ -247,5 +249,30 @@ bash "$GATE" progress "$ACTIVE_RUN" | jq -e '.ok == true' >/dev/null
 jq -e '.progressAt != null' "$SMOKE_GATE_ACTIVE_FILE" >/dev/null
 bash "$GATE" finish "$BUILD_SHA" "$ACTIVE_RUN" GO | jq -e '.ok == true' >/dev/null
 [ ! -e "$SMOKE_GATE_ACTIVE_FILE" ]
+
+# 18. Hold reconciliation: a NO_GO ledger whose hold file was deleted by
+# something other than this gate wakes once, then stays quiet until it changes.
+HOLD2="$STATE_DIR/pub2/develop-hold.json"
+bash "$GATE" claim run-tamper "$BUILD_SHA" >/dev/null
+SMOKE_GATE_HOLD_FILE="$HOLD2" bash "$GATE" finish "$BUILD_SHA" run-tamper NO_GO >/dev/null
+[ -s "$HOLD2" ]
+trash "$HOLD2" 2>/dev/null || command rm -f "$HOLD2"   # a sibling clears the objection
+export STUB_SOURCE_SHA="$(printf 'c%.0s' $(seq 40))"
+SMOKE_GATE_HOLD_FILE="$HOLD2" bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "gate_hold_tampered" and
+  .data.holdIntegrity == "missing" and .data.ledgerVerdict == "NO_GO"
+' >/dev/null
+SMOKE_GATE_HOLD_FILE="$HOLD2" bash "$GATE" poll | jq -e '
+  .data.trigger != "gate_hold_tampered"
+' >/dev/null                                    # throttled, not a wake per poll
+
+# 19. A hold whose runId is not the ledger's is tampering too, not just absence.
+printf '{"runId":"someone-else","verdict":"NO_GO"}' > "$HOLD2"
+SMOKE_GATE_HOLD_FILE="$HOLD2" bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.holdIntegrity == "mismatched"
+' >/dev/null
+
+# 20. With no hold file configured the reconciliation is inert.
+bash "$GATE" poll | jq -e '.data.trigger != "gate_hold_tampered"' >/dev/null
 
 echo "smoke develop gate tests passed"
