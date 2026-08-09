@@ -182,7 +182,7 @@ async function runStep(
   env?: NodeJS.ProcessEnv,
 ): Promise<StepResult> {
   try {
-    await execFileAsync(bin, args, { cwd: REPO_ROOT, timeout: timeoutMs, env: env ?? process.env });
+    await execFileAsync(bin, args, { cwd: REPO_ROOT, timeout: timeoutMs, env: env ?? GIT_ENV });
     return { ok: true, detail: label };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -198,7 +198,7 @@ async function pullAndBuild(): Promise<StepResult> {
   // own base via container_image_base() and can drift from what we inspect if
   // CONTAINER_IMAGE is overridden (env var, custom install slug, etc.).
   return runStep('image rebuild', 'bash', [path.join(REPO_ROOT, 'container', 'build.sh'), IMAGE_TAG], 900_000, 500, {
-    ...process.env,
+    ...GIT_ENV,
     CONTAINER_IMAGE_REF: IMAGE_REF,
   });
 }
