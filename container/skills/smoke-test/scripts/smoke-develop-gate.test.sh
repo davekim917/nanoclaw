@@ -275,4 +275,35 @@ SMOKE_GATE_HOLD_FILE="$HOLD2" bash "$GATE" poll | jq -e '
 # 20. With no hold file configured the reconciliation is inert.
 bash "$GATE" poll | jq -e '.data.trigger != "gate_hold_tampered"' >/dev/null
 
+# 21. Wake window. Pure-logic table over in_wake_window — the campaign wake is
+# the only trigger it gates, and the two failure shapes that would be invisible
+# in production are a midnight-wrapping window and the `08`/`09` octal trap
+# (without `10#` the gate errors every day between 08:00 and 09:59).
+WIN_FN="$STATE_DIR/in-wake-window.sh"
+sed -n '/^in_wake_window() {/,/^}/p' "$GATE" > "$WIN_FN"
+win_case() {                                    # window now expected
+  local got
+  got="$(WAKE_WINDOW="$1" WAKE_TZ=UTC bash -c "
+    $(cat "$WIN_FN")
+    date() { case \"\$*\" in '+%H') echo ${2%%:*};; '+%M') echo ${2##*:};; esac; }
+    in_wake_window")"
+  [ "$got" = "$3" ] || { echo "wake window: $1 at $2 gave $got, wanted $3" >&2; exit 1; }
+}
+win_case "03:00-06:00" "03:00" true             # inclusive lower bound
+win_case "03:00-06:00" "05:59" true
+win_case "03:00-06:00" "06:00" false            # exclusive upper bound
+win_case "03:00-06:00" "02:59" false
+win_case "03:00-06:00" "08:15" false            # octal trap
+win_case "03:00-06:00" "09:09" false            # octal trap
+win_case "22:00-02:00" "23:30" true             # wraps midnight
+win_case "22:00-02:00" "01:59" true
+win_case "22:00-02:00" "02:00" false
+win_case "22:00-02:00" "12:00" false
+
+# 22. An unset window is always open — no deployment changes behaviour by
+# picking up a new skill version, and the campaign wake still fires.
+export STUB_SOURCE_SHA="$(printf 'd%.0s' $(seq 40))"
+bash "$GATE" poll >/dev/null                     # debounce: first sighting
+bash "$GATE" poll | jq -e '.data.trigger == "outside_wake_window" | not' >/dev/null
+
 echo "smoke develop gate tests passed"

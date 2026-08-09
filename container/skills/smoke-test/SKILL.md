@@ -663,6 +663,22 @@ Two further wrapper-optional artifacts and behaviours:
   (default 45 min) produces exactly one `develop_unsettled` wake naming the
   failing workflows and lagging deploys — one per SHA, never a re-spam. A red
   or hung branch must never be silent.
+- `SMOKE_GATE_WAKE_WINDOW` (`HH:MM-HH:MM`, may wrap midnight) with
+  `SMOKE_GATE_WAKE_TZ` restricts **campaign starts** to quiet hours. Unset =
+  always open, so an existing deployment is unchanged by picking up this
+  version. Use it when the branch under test merges faster than a campaign
+  runs: a full campaign needs the environment to hold still for an hour-plus,
+  and on a branch taking dozens of merges a day the settle test rarely holds
+  and a run that does start gets voided by the next deploy.
+  Two properties make it safe, and both are load-bearing:
+  - **It gates only `develop_build_settled`.** `develop_unsettled` and every
+    gate-failure trigger still fire around the clock — an alarm you only hear
+    at 3am is not an alarm.
+  - **It is checked after the debounce and before any state is marked**, so a
+    settled candidate stays a candidate. The first poll inside the window
+    fires on whatever the branch has settled on by then, never on a stale SHA.
+    Suppressing the wake after `activeSha` were set would strand the SHA as an
+    active run with nobody testing it.
 
 When `SMOKE_GATE_HOLD_FILE` is set, `finish` additionally maintains an
 explicit, default-open block flag for promotion gating: a `NO_GO` verdict
@@ -682,9 +698,20 @@ bash /workspace/agent/smoke-develop-gate.sh finish \
 The scheduled-task registration is runtime state created through `ncl`, not an
 in-tree core reach-in. Verify that integration with `ncl tasks get` plus one
 live gated fire that completes with no provider output; never reproduce the
-registration through raw SQL. Configure `quietStatus: true` and `chatLimit: 1`
-so the scheduled controller emits one consolidated root without streaming its
-internal work log into the channel.
+registration through raw SQL. Configure `quietStatus: true` plus a `chatLimit`
+sized to the run's real posting contract — the root, one reply per browser lane
+whose evidence became durable, the verdict, and the fix hand-off. `chatLimit: 1`
+contradicts that contract and physically drops the verdict; around 8 fits it.
+
+Know what the cap does and does not reach before relying on it. It is a hard
+send cap enforced at the write layer, so no instruction drift gets past it —
+but it is **per turn, and it binds task sessions only**
+(`applyChatBudget`, agent-runner `poll-loop.ts`). A campaign spans several
+turns via `wait`, continuation and ceiling respawn, and each turn gets a fresh
+budget; the challenger posts from interactive sessions woken by mention, which
+the budget never sees at all. So this caps streaming narration, not the total
+volume of a run — the coordinator/challenger exchange has to be bounded by the
+posting contract itself.
 
 Run a changed-surface `audit` for each settled develop SHA. Any user-visible
 change must include a real-browser frontend lane even when the diff looks

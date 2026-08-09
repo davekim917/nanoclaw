@@ -25,6 +25,14 @@ ACTIVE_STALE_SECONDS="${SMOKE_GATE_ACTIVE_STALE_SECONDS:-14400}"
 # this is treated as dead — catches containers killed at spawn without
 # waiting out the hard ceiling.
 PROGRESS_STALE_SECONDS="${SMOKE_GATE_PROGRESS_STALE_SECONDS:-1800}"
+# Optional campaign wake window, `HH:MM-HH:MM` (may wrap midnight), evaluated
+# in SMOKE_GATE_WAKE_TZ. Unset = always open, so no existing deployment
+# changes behaviour. This gates only the full-campaign wake: every other
+# trigger (develop_unsettled, gate_misconfigured, gate_fetch_failed) still
+# fires around the clock, because those are alarms and an alarm you only hear
+# at 3am is not an alarm.
+WAKE_WINDOW="${SMOKE_GATE_WAKE_WINDOW:-}"
+WAKE_TZ="${SMOKE_GATE_WAKE_TZ:-UTC}"
 # Optional: on finish, additionally publish the terminal verdict as a small
 # JSON artifact at this path (e.g. a shared workgroup file). Downstream
 # gates (release promotion) read the artifact — durable file, not chat —
@@ -119,6 +127,31 @@ epoch_or_zero() {
   else
     printf '0'
   fi
+}
+
+# `HH:MM-HH:MM` in WAKE_TZ, wrapping midnight when the start is later than the
+# end (`22:00-02:00`). Compared in minutes-since-midnight so DST just works:
+# the window is a wall-clock statement ("quiet hours"), and re-reading the zone
+# every call is what keeps it one after the clocks move. `10#` forces base 10 —
+# without it `08` and `09` are invalid octal and the whole gate errors for two
+# hours a day, which is exactly the kind of bug that only ever fires at 08:xx.
+in_wake_window() {
+  local now_min from to from_min to_min
+  now_min=$(( 10#$(TZ="$WAKE_TZ" date +%H) * 60 + 10#$(TZ="$WAKE_TZ" date +%M) ))
+  from="${WAKE_WINDOW%%-*}"
+  to="${WAKE_WINDOW##*-}"
+  from_min=$(( 10#${from%%:*} * 60 + 10#${from##*:} ))
+  to_min=$(( 10#${to%%:*} * 60 + 10#${to##*:} ))
+  if [ "$from_min" -le "$to_min" ]; then
+    if [ "$now_min" -ge "$from_min" ] && [ "$now_min" -lt "$to_min" ]; then
+      printf 'true'; return 0
+    fi
+  else
+    if [ "$now_min" -ge "$from_min" ] || [ "$now_min" -lt "$to_min" ]; then
+      printf 'true'; return 0
+    fi
+  fi
+  printf 'false'
 }
 
 # Live-run artifact. `holdMergesUntil` is an absolute cap from run start: a run
@@ -682,6 +715,18 @@ CANDIDATE_EPOCH="$(epoch_or_zero "$CANDIDATE_FIRST")"
 CANDIDATE_AGE="$(( NOW_EPOCH - CANDIDATE_EPOCH ))"
 if [ "$CANDIDATE_AGE" -lt "$DEBOUNCE_SECONDS" ]; then
   emit_no_wake "debouncing_candidate"
+  exit 0
+fi
+
+# Campaign wake window. This check sits AFTER the debounce and BEFORE any
+# state is marked, and the ordering is the whole design: `emit_no_wake` writes
+# STATE, so the settled candidate survives untouched and the first poll inside
+# the window fires on whatever develop has settled on by then. Suppressing the
+# wake after `.activeSha` were set would strand the SHA as an active run with
+# nobody testing it — the gate would then have to time it out before anything
+# could run again.
+if [ -n "$WAKE_WINDOW" ] && [ "$(in_wake_window)" != true ]; then
+  emit_no_wake "outside_wake_window"
   exit 0
 fi
 
