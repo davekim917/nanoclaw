@@ -285,7 +285,7 @@ win_case() {                                    # window now expected
   local got
   got="$(WAKE_WINDOW="$1" WAKE_TZ=UTC bash -c "
     $(cat "$WIN_FN")
-    date() { case \"\$*\" in '+%H') echo ${2%%:*};; '+%M') echo ${2##*:};; esac; }
+    date() { echo '$2'; }
     in_wake_window")"
   [ "$got" = "$3" ] || { echo "wake window: $1 at $2 gave $got, wanted $3" >&2; exit 1; }
 }

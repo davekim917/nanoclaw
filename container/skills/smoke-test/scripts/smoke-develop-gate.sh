@@ -136,8 +136,12 @@ epoch_or_zero() {
 # without it `08` and `09` are invalid octal and the whole gate errors for two
 # hours a day, which is exactly the kind of bug that only ever fires at 08:xx.
 in_wake_window() {
-  local now_min from to from_min to_min
-  now_min=$(( 10#$(TZ="$WAKE_TZ" date +%H) * 60 + 10#$(TZ="$WAKE_TZ" date +%M) ))
+  local now now_min from to from_min to_min
+  # ONE clock read, split locally. Two calls (`+%H` then `+%M`) can straddle an
+  # hour boundary — 05:59:59 followed by 06:00:00 reads as 05:00 and reopens a
+  # window that just shut. Fires roughly never, and always at the worst minute.
+  now="$(TZ="$WAKE_TZ" date +%H:%M)"
+  now_min=$(( 10#${now%%:*} * 60 + 10#${now##*:} ))
   from="${WAKE_WINDOW%%-*}"
   to="${WAKE_WINDOW##*-}"
   from_min=$(( 10#${from%%:*} * 60 + 10#${from##*:} ))
