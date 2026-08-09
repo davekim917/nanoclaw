@@ -158,6 +158,42 @@ in_wake_window() {
   printf 'false'
 }
 
+# Advisory freeze visibility on the forge itself. Opt-in via
+# SMOKE_GATE_FREEZE_STATUS_CONTEXT (unset = off, so no deployment changes).
+#
+# The merge hold is an artifact inside this fleet, which means it binds only
+# agents that read that artifact. Anyone merging from GitHub — a human, or an
+# automation on someone's personal token — cannot see it and never could. On
+# 2026-08-08 four merges landed 20 minutes into a campaign from exactly there
+# and voided it, and the run spent its remaining time investigating a gate
+# failure that had not happened.
+#
+# **State is always `success`, and that is deliberate.** `pending` is the
+# semantically obvious choice and it is the wrong one: it lands in
+# `statusCheckRollup`, which is what every merge actuator here reads to decide
+# "CI green" — so an advisory notice would silently become a merge blocker on
+# the automated path. The notice lives in the DESCRIPTION; the state stays
+# green so nothing that gates on green can ever be moved by it. Advisory by
+# construction, not by policy.
+#
+# Best-effort throughout: a status write must never fail a claim or a verdict.
+FREEZE_STATUS_CONTEXT="${SMOKE_GATE_FREEZE_STATUS_CONTEXT:-}"
+
+freeze_status() {
+  local desc="$1" heads sha
+  [ -n "$FREEZE_STATUS_CONTEXT" ] || return 0
+  [ -n "$REPO" ] || return 0
+  heads="$(timeout 10 gh pr list -R "$REPO" --base "$BRANCH" --state open \
+    --limit 100 --json headRefOid --jq '.[].headRefOid' 2>/dev/null)" || return 0
+  for sha in $heads; do
+    timeout 6 gh api -X POST "repos/$REPO/statuses/$sha" \
+      -f state=success \
+      -f context="$FREEZE_STATUS_CONTEXT" \
+      -f description="${desc:0:140}" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
 # Live-run artifact. `holdMergesUntil` is an absolute cap from run start: a run
 # that dies without finishing stops holding the merge queue on its own.
 write_active_file() {
@@ -260,6 +296,7 @@ if [ "$COMMAND" = "finish" ]; then
     esac
   fi
   [ -n "$ACTIVE_FILE" ] && rm -f "$ACTIVE_FILE"
+  freeze_status "No active QA freeze."
   jq -cn --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" \
     '{ok:true,finishedSha:$sha,runId:$run,verdict:$verdict}'
   exit 0
@@ -333,8 +370,10 @@ if [ "$COMMAND" = "claim" ]; then
   # way, which is the part that prevents two runs on one environment.
   if [ "$MERGE_HOLD" = true ]; then
     write_active_file "$RUN_ID" "$SHA" "$NOW" "$NOW"
+    freeze_status "QA smoke run active on $BRANCH (${SHA:0:12}) — merging now voids it. Advisory only; you may merge."
   elif [ -n "$ACTIVE_FILE" ]; then
     rm -f "$ACTIVE_FILE"
+    freeze_status "No active QA freeze."
   fi
   jq -cn --arg run "$RUN_ID" --arg sha "$SHA" --argjson hold "$MERGE_HOLD" \
     '{ok:true,runId:$run,sha:$sha,mergeHold:$hold}'
@@ -358,6 +397,7 @@ if [ "$COMMAND" = "release" ]; then
                   .activeProgressAt=null | .activeMergeHold=null' <<<"$STATE")"
   write_state "$STATE"
   [ -n "$ACTIVE_FILE" ] && rm -f "$ACTIVE_FILE"
+  freeze_status "No active QA freeze."
   jq -cn --arg run "$RUN_ID" '{ok:true,releasedRunId:$run}'
   exit 0
 fi
@@ -764,6 +804,7 @@ STATE="$(jq -c \
    .candidateFirstSeen=null' <<<"$STATE")"
 write_state "$STATE"
 write_active_file "$RUN_ID" "$SOURCE_SHA" "$NOW" ""
+freeze_status "QA smoke run active on $BRANCH (${SOURCE_SHA:0:12}) — merging now voids it. Advisory only; you may merge."
 
 jq -cn \
   --arg repo "$REPO" \
