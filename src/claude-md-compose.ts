@@ -19,6 +19,7 @@ import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
 import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
+import { getDb } from './db/connection.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { CODEX_PROJECT_DOC_CONFIGURED_MAX_BYTES, warnIfOversized } from './codex-project-doc-cap.js';
@@ -54,6 +55,31 @@ const COMPOSED_HEADER =
  * session-level provider override would otherwise make this gate disagree
  * with the worker-def sync gate in buildMounts.
  */
+/**
+ * Directories a group's `instructions.prepend.md` symlink may resolve into:
+ * its own, plus every agent group sharing its workgroup. Siblings that build
+ * together share one instruction file, and the workgroup is the data-pool
+ * boundary — a group in another workgroup is a different tenant, so a link
+ * there would pull that tenant's content into this always-on prompt. A group
+ * with no workgroup gets its own directory only.
+ */
+function personaSymlinkRoots(group: AgentGroup, groupDir: string): string[] {
+  if (!group.workgroup_id) return [groupDir];
+  try {
+    const siblings = getDb()
+      .prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`)
+      .all(group.workgroup_id) as Array<{ folder: string }>;
+    return [groupDir, ...siblings.map((s) => path.resolve(GROUPS_DIR, s.folder))];
+  } catch (err) {
+    // Fail closed: an unreadable roster must not widen the boundary.
+    log.warn('Could not resolve workgroup siblings for persona symlink containment', {
+      group: group.folder,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [groupDir];
+  }
+}
+
 export function composeGroupClaudeMd(group: AgentGroup, provider: string): void {
   const groupDir = path.resolve(GROUPS_DIR, group.folder);
   if (!fs.existsSync(groupDir)) {
@@ -157,7 +183,7 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
 
   // Template persona (if any) — inline so it survives the prune below; imported
   // first (see the imports assembly) so it prepends the composed system prompt.
-  const persona = readGroupPersona(groupDir);
+  const persona = readGroupPersona(groupDir, personaSymlinkRoots(group, groupDir));
   if (persona) {
     desired.set(PERSONA_FRAGMENT, { type: 'inline', content: persona });
   }

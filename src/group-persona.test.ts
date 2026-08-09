@@ -39,10 +39,10 @@ describe('readGroupPersona', () => {
 
   // Sibling agents that build together share ONE instruction set by symlink,
   // so drift is impossible rather than merely detectable. Following is scoped
-  // to the groups tree: the group dir is mounted read-write into the container,
-  // so an unrestricted symlink would let an agent point its own always-on
-  // prompt at content outside its trust boundary.
-  it('follows a symlink that resolves inside the groups tree', () => {
+  // to the caller's allowed set: the group dir is mounted read-write into the
+  // container, so an unrestricted symlink would let an agent point its own
+  // always-on prompt at content outside its trust boundary.
+  it('follows a symlink into a workgroup sibling the caller allows', () => {
     const root = path.join(TMP, 'groups');
     const source = path.join(root, 'source-group');
     const sibling = path.join(root, 'sibling-group');
@@ -51,12 +51,48 @@ describe('readGroupPersona', () => {
     fs.writeFileSync(path.join(source, PERSONA_PREPEND_FILE), 'Shared standing instructions.\n');
     fs.symlinkSync(path.join(source, PERSONA_PREPEND_FILE), path.join(sibling, PERSONA_PREPEND_FILE));
 
-    expect(readGroupPersona(sibling)).toBe('Shared standing instructions.');
-    expect(readGroupPersona(source)).toBe(readGroupPersona(sibling));
+    const roots = [sibling, source];
+    expect(readGroupPersona(sibling, roots)).toBe('Shared standing instructions.');
+    expect(readGroupPersona(source, roots)).toBe(readGroupPersona(sibling, roots));
     expect(log.warn).not.toHaveBeenCalled();
   });
 
-  it('refuses a symlink that escapes the groups tree', () => {
+  // The whole groups tree is NOT the boundary — a workgroup is. A container
+  // mounts only its own group directory, so another workgroup's group holds
+  // another tenant's CLAUDE.local.md and memory. Following a link there would
+  // inject that tenant's content into this prompt.
+  it('refuses a symlink into a group outside the caller-allowed workgroup', () => {
+    const root = path.join(TMP, 'groups');
+    const group = path.join(root, 'tenant-a-group');
+    const otherTenant = path.join(root, 'tenant-b-group');
+    fs.mkdirSync(group, { recursive: true });
+    fs.mkdirSync(otherTenant, { recursive: true });
+    const theirs = path.join(otherTenant, 'CLAUDE.local.md');
+    fs.writeFileSync(theirs, 'other tenant scope rules\n');
+    fs.symlinkSync(theirs, path.join(group, PERSONA_PREPEND_FILE));
+
+    expect(readGroupPersona(group, [group])).toBeNull();
+    expect(log.warn).toHaveBeenCalledWith(
+      'Group standing instructions symlink escapes its workgroup; omitting persona',
+      expect.objectContaining({ target: theirs }),
+    );
+  });
+
+  // A caller that forgets the sibling set must not silently widen the
+  // boundary back to the whole tree.
+  it('defaults to own-directory-only when no allowed set is given', () => {
+    const root = path.join(TMP, 'groups');
+    const group = path.join(root, 'source-group');
+    const sibling = path.join(root, 'sibling-group');
+    fs.mkdirSync(group, { recursive: true });
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(sibling, PERSONA_PREPEND_FILE), 'sibling content\n');
+    fs.symlinkSync(path.join(sibling, PERSONA_PREPEND_FILE), path.join(group, PERSONA_PREPEND_FILE));
+
+    expect(readGroupPersona(group)).toBeNull();
+  });
+
+  it('refuses a symlink that escapes the groups tree entirely', () => {
     const root = path.join(TMP, 'groups');
     const group = path.join(root, 'source-group');
     fs.mkdirSync(group, { recursive: true });
@@ -64,9 +100,9 @@ describe('readGroupPersona', () => {
     fs.writeFileSync(outside, 'host-only content\n');
     fs.symlinkSync(outside, path.join(group, PERSONA_PREPEND_FILE));
 
-    expect(readGroupPersona(group)).toBeNull();
+    expect(readGroupPersona(group, [group])).toBeNull();
     expect(log.warn).toHaveBeenCalledWith(
-      'Group standing instructions symlink escapes the groups tree; omitting persona',
+      'Group standing instructions symlink escapes its workgroup; omitting persona',
       expect.objectContaining({ target: outside }),
     );
   });

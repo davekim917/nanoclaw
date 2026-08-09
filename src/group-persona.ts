@@ -44,32 +44,40 @@ export function stageGroupPersona(groupDir: string, instructions: string): boole
  * here. An unrestricted symlink would therefore be a way to point its own
  * always-on prompt at content outside its trust boundary, which is source-level
  * self-modification without the approval flow that tier is supposed to have.
- * In-tree targets are already agent-reachable content, so following them grants
- * nothing new; anything resolving outside is refused and the persona omitted.
+ *
+ * `allowedRoots` must be the group's own directory plus its WORKGROUP siblings
+ * — never the whole groups tree. A workgroup is the data-pool boundary and a
+ * container mounts only its own group directory, so a sibling in a *different*
+ * workgroup is not already-reachable content: following a link there would
+ * inject another tenant's `CLAUDE.local.md` or memory into this prompt. The
+ * default is own-directory-only so a caller that forgets the set fails closed.
+ * Anything resolving outside is refused and the persona omitted.
  */
-export function readGroupPersona(groupDir: string, groupsRoot?: string): string | null {
+export function readGroupPersona(groupDir: string, allowedRoots?: string[]): string | null {
   const file = path.join(groupDir, PERSONA_PREPEND_FILE);
-  const root = path.resolve(groupsRoot ?? path.dirname(path.resolve(groupDir)));
+  const roots = (allowedRoots?.length ? allowedRoots : [groupDir]).map((dir) => path.resolve(dir));
   let fd: number | undefined;
   try {
     try {
       fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     } catch (err) {
       // ELOOP is the only signal that the path IS a symlink. Resolve it and
-      // require containment before reading; a target outside the tree is
-      // treated as absent, not as an error worth failing the spawn over.
+      // require containment before reading; a target outside the allowed set
+      // is treated as absent, not an error worth failing the spawn over.
       if (!isErrno(err, 'ELOOP')) throw err;
       const target = fs.realpathSync(file);
-      const contained = target === root || target.startsWith(root + path.sep);
+      const contained = roots.some((root) => target === root || target.startsWith(root + path.sep));
       if (!contained) {
-        log.warn('Group standing instructions symlink escapes the groups tree; omitting persona', {
+        log.warn('Group standing instructions symlink escapes its workgroup; omitting persona', {
           file,
           target,
-          root,
+          roots,
         });
         return null;
       }
-      fd = fs.openSync(target, fs.constants.O_RDONLY);
+      // O_NOFOLLOW again: `target` is a realpath so it is not itself a link,
+      // and re-asserting that closes the window between resolve and open.
+      fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     }
     if (!fs.fstatSync(fd).isFile()) return null;
     const content = fs.readFileSync(fd, 'utf-8').trim();
