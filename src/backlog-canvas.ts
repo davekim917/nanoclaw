@@ -44,9 +44,10 @@
  * block and `renderBoard` deliberately emits NO heading — including one would
  * render a second title under the pinned one on every refresh.
  */
-import { EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
+import { OneCLI } from '@onecli-sh/sdk';
+import { EnvHttpProxyAgent, ProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
-import { TIMEZONE } from './config.js';
+import { ONECLI_API_KEY, ONECLI_URL, TIMEZONE } from './config.js';
 import { readContainerConfig } from './container-config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
@@ -109,6 +110,82 @@ function getProxyDispatcher(): Dispatcher | null {
   return _envProxyDispatcher;
 }
 
+/**
+ * Does this proxy URL carry an agent identity (`x:<token>@host`)?
+ *
+ * Exported only so it can be tested. A URL without userinfo resolves to the
+ * Default Agent at the gateway, which is precisely the 401 this whole path
+ * exists to avoid — so accepting one would reproduce the bug silently while
+ * looking like the fix was applied.
+ */
+export function carriesAgentIdentity(proxyUrl: string): boolean {
+  return /^\w+:\/\/[^@/]+@/.test(proxyUrl);
+}
+
+/**
+ * Dispatcher carrying a specific agent group's OneCLI identity.
+ *
+ * The gateway resolves WHICH credentials to inject from the identity in the
+ * proxy URL's userinfo (`x:<agent-token>@`). Containers get that from
+ * `applyContainerConfig({ agent })`; the host's own `HTTPS_PROXY` has no
+ * userinfo at all, so every host-side call is the Default Agent.
+ *
+ * That is why this refresh 401'd 686 times in a row on one install while the
+ * very same Linear call succeeded from inside every one of that workgroup's
+ * containers: the Linear secret is scoped to those agents, and the Default
+ * Agent does not hold it. Verified against a live gateway — no userinfo, and
+ * an explicit Default Agent identity, both return 401; a workgroup agent's
+ * identity returns 200.
+ *
+ * Per group rather than per host, deliberately: the canvas is already a
+ * per-folder feature, so it should borrow that workgroup's credentials and
+ * nothing else. Granting Linear to the Default Agent would have fixed the
+ * symptom by widening a workgroup-scoped credential to every host-side call.
+ *
+ * Falls back to the env dispatcher when the gateway cannot be reached, so a
+ * gateway blip degrades to today's behaviour instead of losing the board.
+ */
+/**
+ * Keep the agent identity, swap the address for one this process can reach.
+ *
+ * `getContainerConfig` answers with the URL a CONTAINER would use — on this
+ * install `host.docker.internal:10255`, which does not resolve from the host
+ * and fails as a bare `fetch failed` with no mention of proxies. The identity
+ * is the part we came for; the address has to be the host's own.
+ *
+ * Exported for tests.
+ */
+export function hostReachableProxy(containerProxyUrl: string, env: NodeJS.ProcessEnv = process.env): string {
+  const userinfo = /^\w+:\/\/([^@/]+)@/.exec(containerProxyUrl)?.[1];
+  if (!userinfo) return containerProxyUrl;
+  const hostProxy = env['HTTPS_PROXY'] || env['https_proxy'] || env['HTTP_PROXY'] || env['http_proxy'] || '';
+  const hostPart = /^(\w+):\/\/(?:[^@/]+@)?([^/]+)/.exec(hostProxy);
+  // No host proxy configured: the container URL is all we have. Better to try
+  // it than to silently drop the identity and fall back to Default Agent.
+  if (!hostPart) return containerProxyUrl;
+  return `${hostPart[1]}://${userinfo}@${hostPart[2]}`;
+}
+
+const agentDispatchers = new Map<string, Dispatcher | null>();
+async function getAgentProxyDispatcher(agentGroupId: string): Promise<Dispatcher | null> {
+  const cached = agentDispatchers.get(agentGroupId);
+  if (cached !== undefined) return cached;
+  let dispatcher: Dispatcher | null = null;
+  try {
+    const cfg = await new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30_000 }).getContainerConfig({
+      agent: agentGroupId,
+    });
+    const url = cfg.env['HTTPS_PROXY'] || cfg.env['https_proxy'] || '';
+    // Only useful if it actually carries an identity; a bare proxy URL would
+    // reproduce the Default Agent 401 with extra steps.
+    if (url && carriesAgentIdentity(url)) dispatcher = new ProxyAgent(hostReachableProxy(url));
+  } catch (err) {
+    log.warn('Backlog canvas: could not resolve agent proxy identity', { agentGroupId, err });
+  }
+  agentDispatchers.set(agentGroupId, dispatcher);
+  return dispatcher;
+}
+
 export function startBacklogCanvas(): void {
   if (timer) return;
   timer = setTimeout(function tick() {
@@ -130,14 +207,15 @@ export async function runTick(): Promise<void> {
     const config = readContainerConfig(group.folder).backlogCanvas;
     if (!config?.messagingGroupId) continue; // not opted in
     try {
-      await refreshBoard(config.messagingGroupId, config.linearTeam || 'XZO');
+      const team = config.linearTeam || 'XZO';
+      await refreshBoard(config.messagingGroupId, team, group.id);
     } catch (err) {
       log.warn('Backlog canvas refresh failed', { folder: group.folder, err });
     }
   }
 }
 
-async function refreshBoard(messagingGroupId: string, team: string): Promise<void> {
+async function refreshBoard(messagingGroupId: string, team: string, agentGroupId: string): Promise<void> {
   const mg = getMessagingGroup(messagingGroupId);
   if (!mg) {
     log.warn('Backlog canvas: messagingGroupId not found — skipping', { messagingGroupId });
@@ -149,7 +227,7 @@ async function refreshBoard(messagingGroupId: string, team: string): Promise<voi
     return;
   }
   const channelId = extractSlackChannelId(mg.platform_id);
-  const issues = await fetchLinearIssues(team);
+  const issues = await fetchLinearIssues(team, agentGroupId);
   await writeCanvas(token, channelId, renderBoard(issues), `${team} backlog board`);
   log.info('Backlog canvas refreshed', { channelId, team, issues: issues.length });
 }
@@ -185,8 +263,11 @@ export interface BoardIssue {
  * JSON-RPC envelope, and the tool's own payload is JSON *inside* a text content
  * block — hence the double parse.
  */
-async function mcpCall(tool: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const dispatcher = getProxyDispatcher();
+async function mcpCall(
+  tool: string,
+  args: Record<string, unknown>,
+  dispatcher: Dispatcher | null,
+): Promise<Record<string, unknown>> {
   const res = await undiciFetch(LINEAR_MCP, {
     method: 'POST',
     headers: {
@@ -221,17 +302,23 @@ async function mcpCall(tool: string, args: Record<string, unknown>): Promise<Rec
 }
 
 /** Every unstarted/started issue on the team, paged out. */
-export async function fetchLinearIssues(team: string): Promise<BoardIssue[]> {
+export async function fetchLinearIssues(team: string, agentGroupId: string): Promise<BoardIssue[]> {
+  // Agent-scoped identity, falling back to the host env dispatcher.
+  const dispatcher = (await getAgentProxyDispatcher(agentGroupId)) ?? getProxyDispatcher();
   const out: BoardIssue[] = [];
   for (const state of ['backlog', 'unstarted', 'started']) {
     let cursor: string | undefined;
     do {
-      const page = (await mcpCall('list_issues', {
-        team,
-        state,
-        limit: 250,
-        ...(cursor ? { cursor } : {}),
-      })) as { issues?: unknown[]; hasNextPage?: boolean; cursor?: string };
+      const page = (await mcpCall(
+        'list_issues',
+        {
+          team,
+          state,
+          limit: 250,
+          ...(cursor ? { cursor } : {}),
+        },
+        dispatcher,
+      )) as { issues?: unknown[]; hasNextPage?: boolean; cursor?: string };
       for (const raw of page.issues ?? []) {
         const it = raw as Record<string, unknown>;
         out.push({

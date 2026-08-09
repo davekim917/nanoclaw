@@ -14,6 +14,8 @@ import path from 'path';
 
 import { fetchLinearIssues, renderBoard, runTick } from '../src/backlog-canvas.js';
 import { DATA_DIR } from '../src/config.js';
+import { readContainerConfig } from '../src/container-config.js';
+import { getAllAgentGroups } from '../src/db/agent-groups.js';
 import { initDb } from '../src/db/connection.js';
 
 initDb(path.join(DATA_DIR, 'v2.db'));
@@ -23,7 +25,15 @@ const team = process.argv.find((a) => !a.startsWith('-') && a !== process.argv[0
 
 const run = preview
   ? async () => {
-      const issues = await fetchLinearIssues(team);
+      // Linear is reached with the OPTED-IN GROUP's OneCLI identity, because
+      // the Linear credential is scoped to that workgroup's agent and not to
+      // the host's default one. Same resolution runTick does.
+      const group = getAllAgentGroups().find((g) => readContainerConfig(g.folder).backlogCanvas?.messagingGroupId);
+      if (!group) {
+        console.error('No group declares backlogCanvas.messagingGroupId — nothing to preview.');
+        process.exit(1);
+      }
+      const issues = await fetchLinearIssues(team, group.id);
       const md = renderBoard(issues);
       console.log(`--- ${issues.length} issues · ${md.length} bytes · ${(md.match(/^#/gm) || []).length} header(s) ---`);
       console.log(md);
