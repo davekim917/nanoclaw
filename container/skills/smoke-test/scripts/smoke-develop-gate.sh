@@ -77,6 +77,12 @@ PREFLIGHT_TIMEOUT="${SMOKE_GATE_PREFLIGHT_TIMEOUT:-120}"
 # new head), so a per-SHA one-shot would re-alarm on each merge. Throttle on
 # time instead, and re-arm immediately whenever the reason text changes.
 PREFLIGHT_ALERT_SECONDS="${SMOKE_GATE_PREFLIGHT_ALERT_SECONDS:-21600}"
+# ...and a FLOOR under the re-arm. The ceiling alone assumed the reason text is
+# stable while a condition persists, which it is not: a reason that names which
+# checks failed changes whenever one of them flaps, so text-change re-arm on its
+# own can wake once per poll. Ceiling stops silence; floor stops a storm. An
+# alarm that fires six times an hour is one nobody reads.
+PREFLIGHT_REARM_FLOOR_SECONDS="${SMOKE_GATE_PREFLIGHT_REARM_FLOOR_SECONDS:-900}"
 # Comma-separated path prefixes that require each service to redeploy. When a
 # service's live deploy lags the source SHA, the lag is accepted only if every
 # file changed between them falls OUTSIDE that service's paths — the deployed
@@ -815,7 +821,9 @@ if [ -n "$PREFLIGHT_CMD" ]; then
     [ "$PREFLIGHT_RC" -eq 124 ] && PREFLIGHT_REASON="preflight timed out after ${PREFLIGHT_TIMEOUT}s: $PREFLIGHT_REASON"
     LAST_REASON="$(jq -r '.preflightReason // empty' <<<"$STATE")"
     SINCE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.preflightWakeAt // empty' <<<"$STATE")") ))"
-    if [ "$PREFLIGHT_REASON" != "$LAST_REASON" ] || [ "$SINCE_WAKE" -ge "$PREFLIGHT_ALERT_SECONDS" ]; then
+    if { [ "$PREFLIGHT_REASON" != "$LAST_REASON" ] &&
+         [ "$SINCE_WAKE" -ge "$PREFLIGHT_REARM_FLOOR_SECONDS" ]; } ||
+       [ "$SINCE_WAKE" -ge "$PREFLIGHT_ALERT_SECONDS" ]; then
       STATE="$(jq -c --arg r "$PREFLIGHT_REASON" --arg now "$NOW" \
         '.preflightReason=$r | .preflightWakeAt=$now' <<<"$STATE")"
       write_state "$STATE"

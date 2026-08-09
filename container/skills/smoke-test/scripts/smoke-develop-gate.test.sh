@@ -324,6 +324,15 @@ PF_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
 # the throttled second result, hiding every re-arm.
 pf_poll() { SMOKE_GATE_PREFLIGHT_CMD="$1" bash "$GATE" poll; }
 
+# Push the last preflight wake back past the re-arm floor. Cases that assert a
+# changed reason DOES wake have to say so explicitly now — the floor is the
+# default, and a test that got a wake without ageing the latch would be
+# asserting the bug the floor exists to prevent.
+pf_age() {
+  local t; t="$(date -u -d '@'$(( $(date -u +%s) - 1000 )) +'%Y-%m-%dT%H:%M:%SZ')"
+  jq --arg t "$t" '.preflightWakeAt=$t' "$PF_STATE" > "$PF_STATE.tmp" && mv "$PF_STATE.tmp" "$PF_STATE"
+}
+
 pf_sha() {                                       # new SHA: first sighting debounces
   export STUB_SOURCE_SHA="$(printf "$1%.0s" $(seq 40))"
   SMOKE_GATE_PREFLIGHT_CMD='exit 0' bash "$GATE" poll >/dev/null
@@ -343,18 +352,34 @@ pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '
   .wakeAgent == false and .data.trigger == "preflight_failed"
 ' >/dev/null
 
-# A CHANGED reason re-arms immediately — 3 dead seats becoming 8 is news.
+# A CHANGED reason does NOT re-arm inside the floor. The reason text names
+# which checks failed, so it is rewritten by any flap — network blip, one seat
+# recovering — and text-change alone would wake once per poll. The gate's own
+# rule is that an alarm nobody can ignore is one that does not repeat every ten
+# minutes.
 pf_poll 'echo "8 of 8 QA seats could not be verified"; exit 1' | jq -e '
-  .wakeAgent == true and .data.reason == "8 of 8 QA seats could not be verified"
+  .wakeAgent == false and .data.trigger == "preflight_failed"
+' >/dev/null
+# ...but the new text IS recorded, so it is the text the next wake compares
+# against rather than a stale one.
+jq -e '.preflightReason == "8 of 8 QA seats could not be verified"' "$PF_STATE" >/dev/null
+
+# Once the floor has passed, a changed reason re-arms — 3 dead seats becoming 8
+# is news, and the floor delays that news, never suppresses it.
+pf_age
+pf_poll 'echo "6 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == true and .data.reason == "6 of 8 QA seats could not be verified"
 ' >/dev/null
 
 # Silent failure still yields a usable reason rather than an empty Slack line.
+pf_age
 pf_poll 'exit 3' | jq -e '
   .wakeAgent == true and .data.exitCode == 3 and
   (.data.reason | test("exited 3 with no output"))
 ' >/dev/null
 
 # A hanging preflight is a failure, not a hang: bounded and reported as one.
+pf_age
 SMOKE_GATE_PREFLIGHT_TIMEOUT=1 pf_poll 'sleep 30' | jq -e '
   .wakeAgent == true and .data.exitCode == 124 and (.data.reason | test("timed out"))
 ' >/dev/null
