@@ -418,7 +418,7 @@ for (const ws of workspaces) {
           if (self && named.includes('<@')) {
             for (const bot of getKnownSlackBots().values()) {
               if (bot.teamId !== self.teamId) continue;
-              named = named.replaceAll(`<@${bot.userId}>`, `@${bot.displayName || bot.username}`);
+              named = named.replaceAll(`<@${bot.userId}>`, `@${bot.displayName || bot.realName || bot.username}`);
             }
           }
           const structured = normalizeSlackOrderedListContinuations(named);

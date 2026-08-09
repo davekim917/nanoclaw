@@ -206,9 +206,9 @@ export interface MessagingGroupAgent {
    */
   default_model: string | null;
   /**
-   * Per-channel effort override. One of 'low' | 'medium' | 'high' | 'xhigh'.
-   * Null = fall through to agent container.json → install-wide DEFAULT_EFFORT
-   * constant in container-runner.ts.
+   * Per-channel effort override. Provider-specific: Claude/OpenCode use their
+   * supported levels; Codex additionally supports 'xhigh' | 'max' | 'ultra'.
+   * Null = fall through to the agent container config / provider default.
    */
   default_effort: string | null;
   /**

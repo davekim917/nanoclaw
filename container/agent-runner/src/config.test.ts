@@ -7,6 +7,8 @@ const BASE = { provider: 'codex', model: 'gpt-5.6-sol' };
 function clearEnv(): void {
   delete process.env.NANOCLAW_PROVIDER_OVERRIDE;
   delete process.env.NANOCLAW_MODEL_OVERRIDE;
+  delete process.env.NANOCLAW_CODEX_MODEL_OVERRIDE;
+  delete process.env.NANOCLAW_CODEX_EFFORT_OVERRIDE;
 }
 
 describe('parseRawConfig provider fallback bridge', () => {
@@ -66,7 +68,40 @@ describe('parseRawConfig provider fallback bridge', () => {
     });
     expect(config.model).toBe('gpt-5.6-sol');
     expect(config.effort).toBe('high');
-    expect(config.providerConfig).toEqual({ reasoning_effort: 'high' });
+    // Codex consumes its sticky model from providerConfig; the top-level
+    // container model is mirrored there at parse time so `ncl groups config`
+    // changes are effective on the next spawn.
+    expect(config.providerConfig).toEqual({ model: 'gpt-5.6-sol', reasoning_effort: 'high' });
+  });
+
+  it('applies a primary Codex channel model and effort over the file config', () => {
+    clearEnv();
+    process.env.NANOCLAW_CODEX_MODEL_OVERRIDE = 'gpt-5.6-luna';
+    process.env.NANOCLAW_CODEX_EFFORT_OVERRIDE = 'max';
+    const config = parseRawConfig({
+      ...BASE,
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      providerConfig: { model: 'gpt-5.6-sol', reasoning_effort: 'high' },
+    });
+    expect(config.model).toBe('gpt-5.6-luna');
+    expect(config.effort).toBe('max');
+    expect(config.providerConfig).toMatchObject({ model: 'gpt-5.6-luna', reasoning_effort: 'max' });
+  });
+
+  it('does not leak Codex channel overrides into a provider fallback', () => {
+    clearEnv();
+    process.env.NANOCLAW_PROVIDER_OVERRIDE = 'claude';
+    process.env.NANOCLAW_CODEX_MODEL_OVERRIDE = 'gpt-5.6-luna';
+    process.env.NANOCLAW_CODEX_EFFORT_OVERRIDE = 'max';
+    const config = parseRawConfig({
+      ...BASE,
+      providerFallback: { provider: 'claude', model: 'claude-opus-5[1m]', effort: 'high' },
+    });
+    expect(config.provider).toBe('claude');
+    expect(config.model).toBe('claude-opus-5[1m]');
+    expect(config.effort).toBe('high');
+    expect(config.providerConfig).toEqual({});
   });
 
   it('surfaces providerFallback so the loop can tell a recoverable outage from a dead end', () => {

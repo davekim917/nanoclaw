@@ -192,6 +192,12 @@ const CODEX_MODEL_ALIAS_MAP: Record<string, string> = {
   'gpt5.6-sol': 'gpt-5.6-sol',
   'gpt5.6-terra': 'gpt-5.6-terra',
   'gpt5.6-luna': 'gpt-5.6-luna',
+  // Friendly family names used by the channel-config MCP tool. Store the
+  // fully-qualified id so the Codex provider's gpt-* guard remains the final
+  // authority at app-server startup.
+  sol: 'gpt-5.6-sol',
+  terra: 'gpt-5.6-terra',
+  luna: 'gpt-5.6-luna',
 };
 
 /**

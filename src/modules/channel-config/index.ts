@@ -37,11 +37,13 @@ import { registerDeliveryAction } from '../../delivery.js';
 import { unguarded } from '../../guard/index.js';
 import { deriveCallerId } from '../../caller-identity.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
 import {
   getMessagingGroupAgentByPair,
   getMessagingGroupByPlatform,
   updateMessagingGroupAgent,
 } from '../../db/messaging-groups.js';
+import { parseMessageFlags } from '../../flag-parser.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { notifyAgent } from '../approvals/primitive.js';
@@ -85,6 +87,38 @@ interface ChannelConfigArgs {
   effort?: unknown;
 }
 
+type ParsedChannelValue = { value?: string | null; error?: string };
+
+/**
+ * Channel defaults use the same provider-aware vocabulary as chat flags.
+ * Codex's friendly `luna`/`terra`/`sol` names are normalized to gpt-* ids;
+ * other providers retain their existing model strings for forward-compatible
+ * SDK ids. Effort is validated for every provider so `max`/`ultra` cannot be
+ * written to a Claude or OpenCode wiring by accident.
+ */
+function parseChannelModel(model: string, provider: string): ParsedChannelValue {
+  if (provider !== 'codex') return { value: model };
+  const parsed = parseMessageFlags(`-m ${model}`, provider);
+  if (parsed.errors.length > 0 || parsed.cleanedText.trim() !== '' || !parsed.intent?.stickyModel) {
+    return { error: parsed.errors.join('; ') || `invalid model ${JSON.stringify(model)}` };
+  }
+  return { value: parsed.intent.stickyModel };
+}
+
+function parseChannelEffort(effort: string, provider: string): ParsedChannelValue {
+  const normalized = effort.trim().toLowerCase();
+  const parsed = parseMessageFlags(`-e ${normalized}`, provider);
+  if (
+    parsed.errors.length > 0 ||
+    parsed.cleanedText.trim() !== '' ||
+    !parsed.intent?.stickyEffort ||
+    parsed.intent.stickyUltracode
+  ) {
+    return { error: parsed.errors.join('; ') || `invalid effort ${JSON.stringify(effort)}` };
+  }
+  return { value: parsed.intent.stickyEffort };
+}
+
 async function handleSetChannelModel(
   content: Record<string, unknown>,
   session: Session,
@@ -126,15 +160,31 @@ async function handleSetChannelModel(
     return;
   }
 
-  updateMessagingGroupAgent(wiring.id, { default_model: model });
+  const provider = resolveProviderName(
+    session.agent_provider,
+    getContainerConfig(agent.id)?.provider ?? agent.agent_provider,
+  );
+  const parsedModel: ParsedChannelValue = model === null ? { value: null } : parseChannelModel(model.trim(), provider);
+  if (parsedModel.error || (model !== null && !parsedModel.value)) {
+    notifyAgent(session, `set_channel_model failed: ${parsedModel.error ?? 'invalid model'}.`);
+    return;
+  }
+  const normalizedModel = parsedModel.value ?? null;
+
+  updateMessagingGroupAgent(wiring.id, { default_model: normalizedModel });
   log.info('Channel default_model updated', {
     wiringId: wiring.id,
     agentGroupId: agent.id,
     messagingGroupId: mgId,
-    model,
+    model: normalizedModel,
     by: callerId,
   });
-  const label = model === null ? 'cleared' : `set to ${model}`;
+  const label =
+    normalizedModel === null
+      ? 'cleared'
+      : normalizedModel === model
+        ? `set to ${normalizedModel}`
+        : `set to ${normalizedModel} (via ${model})`;
   notifyAgent(
     session,
     `✅ Channel default_model ${label} for ${channelName ?? 'current channel'}. Takes effect on next container spawn.`,
@@ -150,11 +200,7 @@ async function handleSetChannelEffort(
   const channelName = typeof args.channel === 'string' ? args.channel : undefined;
   const effort = args.effort === null ? null : typeof args.effort === 'string' ? args.effort : undefined;
   if (effort === undefined) {
-    notifyAgent(session, 'set_channel_effort failed: `effort` must be low/medium/high/xhigh or null.');
-    return;
-  }
-  if (effort !== null && !['low', 'medium', 'high', 'xhigh'].includes(effort)) {
-    notifyAgent(session, `set_channel_effort failed: invalid effort level ${JSON.stringify(effort)}.`);
+    notifyAgent(session, 'set_channel_effort failed: `effort` must be a provider-supported level or null.');
     return;
   }
 
@@ -185,15 +231,26 @@ async function handleSetChannelEffort(
     return;
   }
 
-  updateMessagingGroupAgent(wiring.id, { default_effort: effort });
+  const provider = resolveProviderName(
+    session.agent_provider,
+    getContainerConfig(agent.id)?.provider ?? agent.agent_provider,
+  );
+  const parsedEffort: ParsedChannelValue = effort === null ? { value: null } : parseChannelEffort(effort, provider);
+  if (parsedEffort.error || (effort !== null && !parsedEffort.value)) {
+    notifyAgent(session, `set_channel_effort failed: ${parsedEffort.error ?? 'invalid effort'}.`);
+    return;
+  }
+  const normalizedEffort = parsedEffort.value ?? null;
+
+  updateMessagingGroupAgent(wiring.id, { default_effort: normalizedEffort });
   log.info('Channel default_effort updated', {
     wiringId: wiring.id,
     agentGroupId: agent.id,
     messagingGroupId: mgId,
-    effort,
+    effort: normalizedEffort,
     by: callerId,
   });
-  const label = effort === null ? 'cleared' : `set to ${effort}`;
+  const label = normalizedEffort === null ? 'cleared' : `set to ${normalizedEffort}`;
   notifyAgent(
     session,
     `✅ Channel default_effort ${label} for ${channelName ?? 'current channel'}. Takes effect on next container spawn.`,

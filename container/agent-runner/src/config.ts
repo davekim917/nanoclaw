@@ -70,6 +70,13 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   const env = typeof process !== 'undefined' ? process.env : undefined;
   const envProvider = env?.NANOCLAW_PROVIDER_OVERRIDE;
   const envModel = env?.NANOCLAW_MODEL_OVERRIDE;
+  // Channel defaults are injected by the host at spawn time. Keep them on a
+  // provider-specific surface: Codex's config schema uses `model` and
+  // `reasoning_effort`, while Claude uses `model` and `effort`. They must be
+  // applied only to the primary Codex provider; a provider fallback gets its
+  // own model/effort from providerFallback / the generic bridge above.
+  const envCodexModel = env?.NANOCLAW_CODEX_MODEL_OVERRIDE;
+  const envCodexEffort = env?.NANOCLAW_CODEX_EFFORT_OVERRIDE;
   const fileProvider = (raw.provider as string) || 'claude';
   const provider = envProvider || fileProvider;
   // `providerConfig`, `model` and `effort` in the file describe the PRIMARY
@@ -81,6 +88,25 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
   const declaredFallback = raw.providerFallback as RunnerConfig['providerFallback'];
   const onFallback = provider !== fileProvider;
   const activeFallback = onFallback && declaredFallback?.provider === provider ? declaredFallback : undefined;
+  const configuredProviderConfig = (raw.providerConfig as Record<string, unknown>) ?? {};
+  const providerConfig = onFallback ? {} : { ...configuredProviderConfig };
+  const configuredModel = typeof raw.model === 'string' ? raw.model : undefined;
+  const configuredEffort = typeof raw.effort === 'string' ? raw.effort : undefined;
+  const configuredProviderModel = typeof providerConfig.model === 'string' ? providerConfig.model : undefined;
+  const configuredProviderEffort =
+    typeof providerConfig.reasoning_effort === 'string' ? providerConfig.reasoning_effort : undefined;
+  const activeCodexModel = !onFallback && provider === 'codex' ? envCodexModel : undefined;
+  const activeCodexEffort = !onFallback && provider === 'codex' ? envCodexEffort : undefined;
+  if (!onFallback && provider === 'codex') {
+    // Channel values beat the per-agent provider config, which in turn beats
+    // the provider-level model/effort fields materialized by `ncl groups
+    // config`. Copy into the strict providerConfig object because Codex reads
+    // its sticky values there at app-server startup.
+    const codexModel = activeCodexModel || configuredProviderModel || configuredModel;
+    const codexEffort = activeCodexEffort || configuredProviderEffort || configuredEffort;
+    if (codexModel) providerConfig.model = codexModel;
+    if (codexEffort) providerConfig.reasoning_effort = codexEffort;
+  }
   return {
     provider,
     assistantName: envAssistantName || (raw.assistantName as string) || '',
@@ -91,9 +117,18 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
     excludeMcpServers: Array.isArray(raw.excludeMcpServers)
       ? raw.excludeMcpServers.filter((name): name is string => typeof name === 'string')
       : [],
-    providerConfig: onFallback ? {} : ((raw.providerConfig as Record<string, unknown>) ?? {}),
-    model: envModel || activeFallback?.model || (onFallback ? undefined : (raw.model as string)) || undefined,
-    effort: activeFallback?.effort || (onFallback ? undefined : (raw.effort as string)) || undefined,
+    providerConfig,
+    model:
+      activeCodexModel ||
+      envModel ||
+      activeFallback?.model ||
+      (onFallback ? undefined : configuredProviderModel || configuredModel) ||
+      undefined,
+    effort:
+      activeCodexEffort ||
+      activeFallback?.effort ||
+      (onFallback ? undefined : configuredProviderEffort || configuredEffort) ||
+      undefined,
     providerFallback: declaredFallback || undefined,
   };
 }

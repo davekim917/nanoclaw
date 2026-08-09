@@ -2885,7 +2885,7 @@ async function buildContainerArgs(
   containerName: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-  _provider: string,
+  provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
   channelDefaults?: {
@@ -2974,28 +2974,44 @@ async function buildContainerArgs(
   // of a frozen concrete id — a future family-default bump (e.g. Sonnet 5 →
   // 5.1) then propagates on respawn with no DB edit. Without this, the bare
   // alias would reach the API verbatim and 400 (see comment above).
-  const rawDefaultModel = channelDefaults?.channelDefaultModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL;
-  // resolveEffectiveModel maps family aliases first (so `opus` keeps tracking
-  // DEFAULT_OPUS_MODEL rather than freezing), then PINNED short aliases
-  // (`opus5`, `opus48`, `sonnet5`, `fable`), then applies ensureOpus1mSuffix to
-  // bare ids. The chat ack calls the same function, so the confirmation the
-  // user sees is exactly what lands in ANTHROPIC_DEFAULT_OPUS_MODEL here.
-  const defaultOpusModel = resolveEffectiveModel(rawDefaultModel);
-  args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
-  args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
-  args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
+  // Channel defaults are provider-specific. A Codex wiring must not be sent
+  // through Claude's ANTHROPIC_* aliases (and, during a provider fallback,
+  // must not pin the fallback to the primary provider's model). The runner
+  // applies the channel layer only while the primary provider is active;
+  // fallback model/effort travel through the existing provider-fallback bridge
+  // below.
+  const activeChannelModel = providerFallbackApplied ? null : channelDefaults?.channelDefaultModel;
+  const activeChannelEffort = providerFallbackApplied ? null : channelDefaults?.channelDefaultEffort;
 
-  // NANOCLAW_EFFORT_OVERRIDE is an OPERATOR override (per-channel wiring or
-  // per-group container.json) — injected only when one is actually set.
-  // When absent, the claude provider applies per-model-family defaults
-  // (opus/sonnet → xhigh, fable → medium, haiku → none; see
-  // defaultEffortForModel in agent-runner claude.ts). The old unconditional
-  // `?? DEFAULT_EFFORT` fold made every model inherit one blanket value,
-  // which breaks per-family defaults (e.g. haiku has no effort surface) and
-  // masked whether the operator had chosen anything at all.
-  const defaultEffort = channelDefaults?.channelDefaultEffort ?? containerConfig.defaultEffort;
-  if (defaultEffort) {
-    args.push('-e', `NANOCLAW_EFFORT_OVERRIDE=${defaultEffort}`);
+  if (provider === 'codex') {
+    // The Codex provider reads model/reasoning_effort from its strict
+    // providerConfig schema. These spawn-scoped envs are overlaid into that
+    // config by agent-runner/src/config.ts, so a per-channel pin beats the
+    // per-agent container config without mutating the mounted file.
+    const codexModel = activeChannelModel ?? containerConfig.model ?? containerConfig.defaultModel;
+    const codexEffort = activeChannelEffort ?? containerConfig.effort ?? containerConfig.defaultEffort;
+    if (codexModel) args.push('-e', `NANOCLAW_CODEX_MODEL_OVERRIDE=${codexModel}`);
+    if (codexEffort) args.push('-e', `NANOCLAW_CODEX_EFFORT_OVERRIDE=${codexEffort}`);
+  } else {
+    // resolveEffectiveModel maps family aliases first (so `opus` keeps
+    // tracking DEFAULT_OPUS_MODEL rather than freezing), then pinned short
+    // aliases (`opus5`, `opus48`, `sonnet5`, `fable`), then applies
+    // ensureOpus1mSuffix to bare ids. The chat ack calls the same function, so
+    // the confirmation the user sees is exactly what lands in
+    // ANTHROPIC_DEFAULT_OPUS_MODEL here.
+    const rawDefaultModel = activeChannelModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL;
+    const defaultOpusModel = resolveEffectiveModel(rawDefaultModel);
+    args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
+    args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
+    args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
+
+    // NANOCLAW_EFFORT_OVERRIDE is an OPERATOR override (per-channel wiring or
+    // per-group container.json) — injected only when one is actually set.
+    // When absent, the claude provider applies per-model-family defaults.
+    const defaultEffort = activeChannelEffort ?? containerConfig.defaultEffort;
+    if (defaultEffort) {
+      args.push('-e', `NANOCLAW_EFFORT_OVERRIDE=${defaultEffort}`);
+    }
   }
 
   // Provider fallback bridge. The container reads its provider and model from
@@ -3293,10 +3309,21 @@ async function buildContainerArgs(
   }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
-  if (providerContribution.env) {
-    for (const [key, value] of Object.entries(providerContribution.env)) {
-      args.push('-e', `${key}=${value}`);
-    }
+  const providerEnv = { ...(providerContribution.env ?? {}) };
+  // OpenCode reads its model/effort selectors directly from OPENCODE_* env
+  // vars (the provider contribution supplies the per-agent DB defaults). A
+  // channel wiring is more specific, so replace those values before emitting
+  // the environment rather than relying on duplicate Docker `-e` flags. The
+  // same path covers an OpenCode provider fallback, where containerConfig has
+  // already been replaced with the declared fallback model/effort.
+  if (provider === 'opencode') {
+    const opencodeModel = activeChannelModel ?? (providerFallbackApplied ? containerConfig.model : undefined);
+    const opencodeEffort = activeChannelEffort ?? (providerFallbackApplied ? containerConfig.effort : undefined);
+    if (opencodeModel) providerEnv.OPENCODE_MODEL = opencodeModel;
+    if (opencodeEffort) providerEnv.OPENCODE_EFFORT = opencodeEffort;
+  }
+  for (const [key, value] of Object.entries(providerEnv)) {
+    args.push('-e', `${key}=${value}`);
   }
 
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls

@@ -388,6 +388,12 @@ describe('provider-aware vocabulary (codex)', () => {
     expect(r.intent).toEqual({ stickyModel: 'gpt-5.5' });
   });
 
+  it('resolves the Codex family names used by channel pins', () => {
+    expect(parseMessageFlags('-m luna hi', 'codex').intent).toEqual({ stickyModel: 'gpt-5.6-luna' });
+    expect(parseMessageFlags('-m terra hi', 'codex').intent).toEqual({ stickyModel: 'gpt-5.6-terra' });
+    expect(parseMessageFlags('-m sol hi', 'codex').intent).toEqual({ stickyModel: 'gpt-5.6-sol' });
+  });
+
   it('rejects claude ids on a codex group with a shape hint', () => {
     const r = parseMessageFlags('-m fable hi', 'codex');
     expect(r.intent).toBeUndefined();

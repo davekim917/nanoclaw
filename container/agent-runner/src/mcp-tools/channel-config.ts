@@ -28,7 +28,11 @@ import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
-const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh']);
+// The host validates the final value against the target provider. Keep the
+// MCP-side gate broad enough for Codex's max/ultra surface; Claude/OpenCode
+// requests that are not valid for their provider are rejected host-side before
+// any DB mutation.
+const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 
 function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -54,7 +58,7 @@ export const setChannelModelTool: McpToolDefinition = {
   tool: {
     name: 'set_channel_model',
     description:
-      'Set the default model for a specific channel (messaging group) wired to this agent. Applies to every future turn on that channel unless the user passes `-m <model>` explicitly. Mutates messaging_group_agents.default_model. PREFER a bare family alias (`opus`, `sonnet`, `haiku`, `fable`) — it tracks the install\'s current model for that family, so a future bump propagates with no DB edit. Use a pinned alias (opus5, sonnet5, haiku45) or a full SDK id (claude-opus-5) only when the user explicitly wants that exact version frozen. Opus runs in 1M-context mode only — `[1m]` is auto-appended if omitted. Pass model=null to clear the per-channel override and fall back to the agent / host defaults. Admin-only.',
+      'Set the default model for a specific channel (messaging group) wired to this agent. Applies to every future turn on that channel unless the user passes `-m <model>` explicitly. Mutates messaging_group_agents.default_model. Claude models accept family aliases such as `opus`, `sonnet`, `haiku`, and `fable`; Codex models accept `luna`, `terra`, `sol`, or full `gpt-*` ids (for example `gpt-5.6-luna`); OpenCode Zen models use slugs such as `opencode/deepseek-v4-flash-free`. Pass model=null to clear the per-channel override and fall back to the agent / host defaults. Admin-only.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -64,7 +68,8 @@ export const setChannelModelTool: McpToolDefinition = {
         },
         model: {
           type: ['string', 'null'],
-          description: 'Model to pin (e.g. `opus5`, `claude-sonnet-5`). Pass null to clear the per-channel override.',
+          description:
+            'Model to pin. Use a provider-valid id or alias (`luna` / `gpt-5.6-luna` for Codex, `opencode/deepseek-v4-flash-free` for OpenCode Zen). Pass null to clear the per-channel override.',
         },
       },
       required: ['model'],
@@ -88,7 +93,7 @@ export const setChannelEffortTool: McpToolDefinition = {
   tool: {
     name: 'set_channel_effort',
     description:
-      'Set the default reasoning effort for a specific channel (messaging group) wired to this agent. Applies until the user passes `-e <level>` explicitly. Values: low | medium | high | xhigh, or null to clear. Admin-only. Mutates messaging_group_agents.default_effort.',
+      'Set the default reasoning effort for a specific channel (messaging group) wired to this agent. Applies until the user passes `-e <level>` explicitly. Values are provider-specific: Claude/OpenCode use low | medium | high | max (Claude may also use xhigh); Codex uses low | medium | high | xhigh | max | ultra. Pass null to clear. Admin-only. Mutates messaging_group_agents.default_effort.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -98,7 +103,7 @@ export const setChannelEffortTool: McpToolDefinition = {
         },
         effort: {
           type: ['string', 'null'],
-          description: 'Effort level (low | medium | high | xhigh) or null to clear the override.',
+          description: 'Provider-specific effort level (Codex: low | medium | high | xhigh | max | ultra) or null to clear the override.',
         },
       },
       required: ['effort'],
@@ -108,10 +113,12 @@ export const setChannelEffortTool: McpToolDefinition = {
     const channel = typeof args.channel === 'string' ? args.channel.trim() : undefined;
     const effort = args.effort === null ? null : typeof args.effort === 'string' ? args.effort.trim().toLowerCase() : undefined;
     if (effort === undefined) {
-      return ok('Error: `effort` is required. Pass low/medium/high/xhigh, or null to clear.');
+      return ok('Error: `effort` is required. Pass a provider-supported level (for example max), or null to clear.');
     }
     if (effort !== null && !VALID_EFFORTS.has(effort)) {
-      return ok(`Error: effort must be one of low, medium, high, xhigh (or null). Got ${JSON.stringify(args.effort)}.`);
+      return ok(
+        `Error: effort must be one of low, medium, high, xhigh, max, ultra (or null). Got ${JSON.stringify(args.effort)}.`,
+      );
     }
     emit('set_channel_effort', { channel, effort });
     const action = effort === null ? 'clear' : `set to ${effort}`;
