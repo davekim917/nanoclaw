@@ -29,7 +29,7 @@ Track the round number and say it out loud in each status message.
 | 1–2 | Normal. Batch, fix, re-review. |
 | 3 | Before pushing, reread the **entire** diff yourself and run the full suite. Land your own findings in the same batch. |
 | 4+ | Stop and diagnose out loud before pushing again. Only the churn protocol's single re-implementation commit may be pushed — even if the assignment text says "push a fix". "Address the Nth review" as a commit message for N ≥ 4 IS the anti-pattern. |
-| 6+ | **Hard stop. No push of any kind without an explicit human go-ahead in that PR's thread.** Reply with the round count and "standing down pending a human call", then stop. Escalation is the release scrum-master's job and is already in flight. Work you do here is you overriding a deliberate freeze; a PR reaching round 10 means this rule was broken repeatedly, not that review is hard. |
+| 6+ | **Hard stop. No push of any kind without an explicit human go-ahead in that PR's thread.** Reply with the round count and "standing down pending a human call", then stop — that reply is what surfaces the freeze, so it is never optional. Where a release owner exists, escalation is its job and is already in flight; where none does, your stand-down reply is the only signal, which makes posting it more important, not less. Work you do past this line overrides a deliberate freeze; a PR reaching round 10 means this rule was broken repeatedly, not that review is hard. |
 
 ### Diagnosing round 4+
 
