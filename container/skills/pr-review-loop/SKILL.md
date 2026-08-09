@@ -9,6 +9,15 @@ Codex (`chatgpt-codex-connector[bot]`) re-reviews every new head commit and file
 
 **The whole skill is one rule: a round is a batch.** Collect every unresolved comment, decide on all of them, fix all the accepted ones in one commit, push once, ask for exactly one re-review. Never push a commit for a single comment. Never ping `@codex review` more than once per round.
 
+## When to enter, and at what round
+
+**Entering is not optional and not only for assigned work.** A review landing on
+your own PR is a signal, not an assignment — it puts you in this skill too. The
+mandatory first action either way is to query the API for the review count.
+Never trust the ping, the assignment text, or your memory of how many rounds
+have happened. Round N = that count. If someone hands you review work and names
+a round, the count still wins.
+
 ## Round budget
 
 A round is one full batch, and only batched rounds count. Ten pushes of one comment each are not ten rounds of evidence — they're one round stretched over ten pushes, which is the most common way this loop runs away.
@@ -19,7 +28,8 @@ Track the round number and say it out loud in each status message.
 |---|---|
 | 1–2 | Normal. Batch, fix, re-review. |
 | 3 | Before pushing, reread the **entire** diff yourself and run the full suite. Land your own findings in the same batch. |
-| 4+ | Stop and diagnose out loud before pushing again. |
+| 4+ | Stop and diagnose out loud before pushing again. Only the churn protocol's single re-implementation commit may be pushed — even if the assignment text says "push a fix". "Address the Nth review" as a commit message for N ≥ 4 IS the anti-pattern. |
+| 6+ | **Hard stop. No push of any kind without an explicit human go-ahead in that PR's thread.** Reply with the round count and "standing down pending a human call", then stop. Escalation is the release scrum-master's job and is already in flight. Work you do here is you overriding a deliberate freeze; a PR reaching round 10 means this rule was broken repeatedly, not that review is hard. |
 
 ### Diagnosing round 4+
 

@@ -37,15 +37,37 @@ describe('readGroupPersona', () => {
     expect(readGroupPersona(TMP)).toBe('You are an SDR agent.');
   });
 
-  it('does not follow a symlink', () => {
-    const target = path.join(TMP, 'outside.md');
-    fs.writeFileSync(target, 'host-only content\n');
-    fs.symlinkSync(target, path.join(TMP, PERSONA_PREPEND_FILE));
+  // Sibling agents that build together share ONE instruction set by symlink,
+  // so drift is impossible rather than merely detectable. Following is scoped
+  // to the groups tree: the group dir is mounted read-write into the container,
+  // so an unrestricted symlink would let an agent point its own always-on
+  // prompt at content outside its trust boundary.
+  it('follows a symlink that resolves inside the groups tree', () => {
+    const root = path.join(TMP, 'groups');
+    const source = path.join(root, 'source-group');
+    const sibling = path.join(root, 'sibling-group');
+    fs.mkdirSync(source, { recursive: true });
+    fs.mkdirSync(sibling, { recursive: true });
+    fs.writeFileSync(path.join(source, PERSONA_PREPEND_FILE), 'Shared standing instructions.\n');
+    fs.symlinkSync(path.join(source, PERSONA_PREPEND_FILE), path.join(sibling, PERSONA_PREPEND_FILE));
 
-    expect(readGroupPersona(TMP)).toBeNull();
+    expect(readGroupPersona(sibling)).toBe('Shared standing instructions.');
+    expect(readGroupPersona(source)).toBe(readGroupPersona(sibling));
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it('refuses a symlink that escapes the groups tree', () => {
+    const root = path.join(TMP, 'groups');
+    const group = path.join(root, 'source-group');
+    fs.mkdirSync(group, { recursive: true });
+    const outside = path.join(TMP, 'outside.md');
+    fs.writeFileSync(outside, 'host-only content\n');
+    fs.symlinkSync(outside, path.join(group, PERSONA_PREPEND_FILE));
+
+    expect(readGroupPersona(group)).toBeNull();
     expect(log.warn).toHaveBeenCalledWith(
-      'Could not read group standing instructions; omitting persona',
-      expect.objectContaining({ file: path.join(TMP, PERSONA_PREPEND_FILE) }),
+      'Group standing instructions symlink escapes the groups tree; omitting persona',
+      expect.objectContaining({ target: outside }),
     );
   });
 });
