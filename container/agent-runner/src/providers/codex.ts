@@ -18,10 +18,7 @@ import path from 'path';
 
 import { z } from 'zod';
 
-import {
-  memoryContextForSessionStart,
-  type MemorySessionHookRegistration,
-} from '../memory/session-hook.js';
+import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import {
   clearContainerToolInFlight,
   setContainerToolInFlight,
@@ -205,11 +202,7 @@ export function isCodexNotificationForActiveTurn(
 ): boolean {
   if (method === 'thread/started') {
     const thread = params.thread;
-    return (
-      !!thread &&
-      typeof thread === 'object' &&
-      (thread as Record<string, unknown>).id === threadId
-    );
+    return !!thread && typeof thread === 'object' && (thread as Record<string, unknown>).id === threadId;
   }
 
   // Every current Codex lifecycle notification except thread/started carries
@@ -224,9 +217,7 @@ export function isCodexNotificationForActiveTurn(
       : null;
   const notificationTurnId = typeof params.turnId === 'string' ? params.turnId : nestedTurnId;
   const isTurnScoped =
-    method.startsWith('turn/') ||
-    method.startsWith('item/') ||
-    method.startsWith('rawResponseItem/');
+    method.startsWith('turn/') || method.startsWith('item/') || method.startsWith('rawResponseItem/');
   if (isTurnScoped && !notificationTurnId) return false;
   if (isTurnScoped && currentTurnId && notificationTurnId !== currentTurnId) return false;
   return true;
@@ -445,10 +436,7 @@ This session is limited to ${maxConcurrentThreadsPerSession} concurrent threads:
 // too, which doubled ~26KB of instructions into every turn's context and
 // left two copies of every rule that could drift out of sync. AGENTS.md is
 // now the single instruction surface for Codex.
-function composeBaseInstructions(
-  promptAddendum: string | undefined,
-  maxConcurrentThreadsPerSession: number,
-): string {
+function composeBaseInstructions(promptAddendum: string | undefined, maxConcurrentThreadsPerSession: number): string {
   const lifecycle = buildCodexSubagentLifecycleInstructions(maxConcurrentThreadsPerSession);
   const pieces = [promptAddendum, lifecycle].filter((s): s is string => Boolean(s));
   return pieces.join('\n\n---\n\n');
@@ -521,12 +509,18 @@ export function augmentWithProxyEnv(baseEnv: Record<string, string>): Record<str
 
 /**
  * `codexErrorInfo.type` values that should trigger OAuth fallback rotation.
- * Both are quota-flavored — distinct from `Unauthorized` / `BadRequest` /
- * `ContextWindowExceeded` etc., which are terminal regardless of which
- * identity is used. Source: openai/codex `CodexErrorInfo` enum + the TUI's
- * `app_server_rate_limit_error_kind` rate-limit classifier.
+ * `Unauthorized` is also account-scoped: a second authenticated Codex
+ * account can recover an invalidated primary token. Other terminal kinds
+ * (`BadRequest`, `ContextWindowExceeded`, etc.) are not identity-specific
+ * and must not consume a fallback account. Source: openai/codex
+ * `CodexErrorInfo` enum + the TUI's `app_server_rate_limit_error_kind`
+ * rate-limit classifier.
  */
-const ROTATABLE_CODEX_ERROR_KINDS: ReadonlySet<string> = new Set(['UsageLimitExceeded', 'ServerOverloaded']);
+const ROTATABLE_CODEX_ERROR_KINDS: ReadonlySet<string> = new Set([
+  'UsageLimitExceeded',
+  'ServerOverloaded',
+  'Unauthorized',
+]);
 
 /**
  * The app-server's own usage-limit sentence, as thrown from the query path
@@ -539,7 +533,8 @@ const CODEX_USAGE_LIMIT_RE = /hit your usage limit|usage limit reached|purchase 
 /**
  * Map a terminal turn error to a ProviderEvent `classification` consumed by
  * the poll-loop catch path:
- *   - `quota` / `overloaded` → rotation-eligible (structured CodexErrorInfo)
+ *   - `quota` / `overloaded` / `auth_invalidated` → rotation-eligible
+ *     (structured CodexErrorInfo)
  *   - `system_error` → coarse thread/status/changed wedge (no structured detail)
  *   - `control_plane_unresponsive` / `protocol_desync` → provider-local
  *     app-server replacement + persisted-thread resume
@@ -551,6 +546,7 @@ export function classifyCodexError(message: string, errorKind: string | null): s
   if (errorKind && ROTATABLE_CODEX_ERROR_KINDS.has(errorKind)) {
     if (errorKind === 'UsageLimitExceeded') return 'quota';
     if (errorKind === 'ServerOverloaded') return 'overloaded';
+    if (errorKind === 'Unauthorized') return 'auth_invalidated';
     return undefined;
   }
   if (message.startsWith('codex_system_error')) return 'system_error';
@@ -558,6 +554,20 @@ export function classifyCodexError(message: string, errorKind: string | null): s
   if (message.startsWith('codex_protocol_desync')) return 'protocol_desync';
   if (message.includes('idle for')) return 'idle_timeout';
   return undefined;
+}
+
+/**
+ * Only these terminal classifications can be recovered by changing Codex
+ * OAuth identities. Keep this predicate central so a new classification
+ * cannot accidentally fall through to the host's cross-provider fallback.
+ */
+export function isCodexOAuthRotationEligible(classification: string | undefined): boolean {
+  return (
+    classification === 'quota' ||
+    classification === 'overloaded' ||
+    classification === 'system_error' ||
+    classification === 'auth_invalidated'
+  );
 }
 
 export function buildCodexRecoveryPrompt(): string {
@@ -1115,12 +1125,9 @@ export class CodexProvider implements AgentProvider {
                   rotateAndRetry = true;
                   break;
                 }
-                const eligible =
-                  ev.classification === 'quota' ||
-                  ev.classification === 'overloaded' ||
-                  ev.classification === 'system_error';
+                const eligible = isCodexOAuthRotationEligible(ev.classification);
                 const canRefreshPrimaryAuth =
-                  ev.classification === 'system_error' &&
+                  (ev.classification === 'system_error' || ev.classification === 'auth_invalidated') &&
                   !primaryAuthRefreshAttempted &&
                   currentCodexHome === primaryCodexHome &&
                   refreshCodexAuthFromHost(currentCodexHome, primaryHostCodexHome);
@@ -1130,7 +1137,9 @@ export class CodexProvider implements AgentProvider {
                     type: 'progress',
                     message: formatBlockquoteLabel(
                       '↻',
-                      'Codex auth refreshed from host copy after system error; restarting app-server and retrying turn',
+                      `Codex auth refreshed from host copy after ${
+                        ev.classification === 'auth_invalidated' ? 'authentication failure' : 'system error'
+                      }; restarting app-server and retrying turn`,
                     ),
                   };
 
@@ -1511,15 +1520,9 @@ export async function* runOneTurn(
           ...completedTurn,
           ...backfilled,
           id: completedTurnId,
-          status:
-            typeof backfilled.status === 'string'
-              ? backfilled.status
-              : completedTurn?.status,
+          status: typeof backfilled.status === 'string' ? backfilled.status : completedTurn?.status,
           items: Array.isArray(backfilled.items) ? backfilled.items : completedTurn?.items,
-          itemsView:
-            typeof backfilled.itemsView === 'string'
-              ? backfilled.itemsView
-              : completedTurn?.itemsView,
+          itemsView: typeof backfilled.itemsView === 'string' ? backfilled.itemsView : completedTurn?.itemsView,
         };
       } catch (err) {
         console.error(

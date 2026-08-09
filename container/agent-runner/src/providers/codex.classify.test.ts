@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 
-import { classifyCodexError } from './codex.js';
+import { classifyCodexError, isCodexOAuthRotationEligible } from './codex.js';
 
 // classifyCodexError maps a terminal codex turn error to the ProviderEvent
 // `classification` the provider recovery and poll-loop catch paths key on.
@@ -9,9 +9,10 @@ describe('classifyCodexError', () => {
     expect(classifyCodexError('Codex turn idle for 60000ms (no notifications)', null)).toBe('idle_timeout');
   });
 
-  it('classifies structured quota/overload errorKinds (rotation-eligible)', () => {
+  it('classifies structured quota, overload, and account-auth errors as rotation-eligible', () => {
     expect(classifyCodexError('whatever', 'UsageLimitExceeded')).toBe('quota');
     expect(classifyCodexError('whatever', 'ServerOverloaded')).toBe('overloaded');
+    expect(classifyCodexError('Unauthorized: token has been invalidated', 'Unauthorized')).toBe('auth_invalidated');
   });
 
   it('a rotation-eligible errorKind short-circuits the message checks', () => {
@@ -31,8 +32,16 @@ describe('classifyCodexError', () => {
     expect(classifyCodexError('codex_protocol_desync: root was idle', null)).toBe('protocol_desync');
   });
 
+  it('only treats identity-specific failures as OAuth rotation-eligible', () => {
+    expect(isCodexOAuthRotationEligible('quota')).toBe(true);
+    expect(isCodexOAuthRotationEligible('overloaded')).toBe(true);
+    expect(isCodexOAuthRotationEligible('system_error')).toBe(true);
+    expect(isCodexOAuthRotationEligible('auth_invalidated')).toBe(true);
+    expect(isCodexOAuthRotationEligible('control_plane_unresponsive')).toBe(false);
+    expect(isCodexOAuthRotationEligible(undefined)).toBe(false);
+  });
+
   it('returns undefined for an unclassified terminal error', () => {
-    expect(classifyCodexError('Unauthorized: bad token', 'Unauthorized')).toBeUndefined();
     expect(classifyCodexError('some other failure', null)).toBeUndefined();
   });
 });

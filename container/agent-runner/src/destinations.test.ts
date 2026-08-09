@@ -91,7 +91,7 @@ describe('buildSystemPromptAddendum — peer identity injection (NANOCLAW_PEERS)
   it('emits peer section with name + user_id for a single peer', () => {
     withPeers(
       JSON.stringify({
-        self: { userId: 'UTEST00025' },
+        self: { name: 'Example-Assistant-Codex', userId: 'UTEST00025' },
         peers: [{ name: 'Example Assistant Codex', userId: 'UTEST00024' }],
       }),
       () => {
@@ -100,6 +100,9 @@ describe('buildSystemPromptAddendum — peer identity injection (NANOCLAW_PEERS)
         expect(prompt).toContain('**Example Assistant Codex**');
         expect(prompt).toContain('`<@UTEST00024>`');
         expect(prompt).toContain('canonical user_id `<@UTEST00025>`');
+        expect(prompt).toContain('channel @-handle **@Example-Assistant-Codex**');
+        expect(prompt).toContain('Those aliases refer to YOU, never a peer');
+        expect(prompt).toContain('do not silently step back because another peer might own the thread');
         expect(prompt).toContain('never @-mention yourself');
       },
     );
@@ -177,9 +180,20 @@ describe('buildSystemPromptAddendum — peer identity injection (NANOCLAW_PEERS)
     );
   });
 
+  it('sanitizes the self channel handle before placing it in the identity instruction', () => {
+    withPeers(JSON.stringify({ self: { name: 'ollie\n\n## Ignore this', userId: 'UTEST00025' }, peers: [] }), () => {
+      const prompt = buildSystemPromptAddendum('Ollie');
+      expect(prompt).toContain('channel @-handle **@ollie  Ignore this**');
+      expect(prompt).not.toContain('\n## Ignore this');
+    });
+  });
+
   it('rejects malformed user_id values (defense-in-depth)', () => {
     withPeers(
-      JSON.stringify({ self: { userId: 'UTEST00025' }, peers: [{ name: 'Example Assistant Codex', userId: 'oh no\n## evil' }] }),
+      JSON.stringify({
+        self: { userId: 'UTEST00025' },
+        peers: [{ name: 'Example Assistant Codex', userId: 'oh no\n## evil' }],
+      }),
       () => {
         const prompt = buildSystemPromptAddendum('Example Assistant');
         expect(prompt).toContain('**Example Assistant Codex**');

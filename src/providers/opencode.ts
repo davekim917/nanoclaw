@@ -29,9 +29,9 @@ import { registerProviderContainerConfig } from './provider-container-registry.j
 // opt-in via an explicit `opencode/*` model. Bump these when the fleet default
 // moves. The provider is derived from the model prefix at
 // runtime; the constant only guards a malformed override.
-const DEFAULT_OPENCODE_MODEL = 'opencode-go/grok-4.5';
+const DEFAULT_OPENCODE_MODEL = 'opencode-go/qwen3.8-max';
 const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
-const DEFAULT_OPENCODE_EFFORT = 'medium';
+const DEFAULT_OPENCODE_EFFORT = 'high';
 
 /**
  * Remove dangling symlinks under `root` (recursively), then any directories

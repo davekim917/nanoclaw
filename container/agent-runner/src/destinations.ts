@@ -65,9 +65,9 @@ export function findByRouting(
   const db = getInboundDb();
   const row =
     channelType === 'agent'
-      ? (db
-          .prepare("SELECT * FROM destinations WHERE type = 'agent' AND agent_group_id = ?")
-          .get(platformId) as DestRow | undefined)
+      ? (db.prepare("SELECT * FROM destinations WHERE type = 'agent' AND agent_group_id = ?").get(platformId) as
+          | DestRow
+          | undefined)
       : (db
           .prepare("SELECT * FROM destinations WHERE type = 'channel' AND channel_type = ? AND platform_id = ?")
           .get(channelType, platformId) as DestRow | undefined);
@@ -88,7 +88,10 @@ export function findByRouting(
  */
 function sanitizeDisplayName(name: string): string {
   // eslint-disable-next-line no-control-regex
-  return name.replace(/[\r\n\t\x00-\x1f]+/g, ' ').replace(/[`#*_~]/g, '').slice(0, 80);
+  return name
+    .replace(/[\r\n\t\x00-\x1f]+/g, ' ')
+    .replace(/[`#*_~]/g, '')
+    .slice(0, 80);
 }
 
 /**
@@ -108,8 +111,7 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
     // the multi-agent tenant boundary (chat archive, Graphify retrieval, OneCLI
     // secret pool). The agent knows which scope it operates under so prompts
     // grounded in "my workgroup is X" reach the right peers and data pool.
-    const workgroupId =
-      typeof process !== 'undefined' ? process.env?.NANOCLAW_WORKGROUP_ID : undefined;
+    const workgroupId = typeof process !== 'undefined' ? process.env?.NANOCLAW_WORKGROUP_ID : undefined;
     // Peer identity injection — NANOCLAW_PEERS is set by container-runner
     // per spawn with the in-channel peer agents (auto-derived from
     // messaging_group platform_id). Surfacing explicit name → user_id
@@ -118,15 +120,23 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
     // collapsed the shared display-name prefix to self-reference.
     const peerSpec = readPeersFromEnv();
     const selfUserId = peerSpec?.self?.userId;
+    const selfChannelName = typeof peerSpec?.self?.name === 'string' ? sanitizeDisplayName(peerSpec.self.name) : '';
+    const selfAliases = [
+      selfUserId ? `canonical user_id \`<@${selfUserId}>\`` : '',
+      selfChannelName ? `channel @-handle **@${selfChannelName}**` : '',
+    ].filter(Boolean);
     const headerLines = [
       '# You are ' + assistantName,
       '',
       selfUserId
-        ? `Your name is **${assistantName}** (canonical user_id \`<@${selfUserId}>\`). Use the name when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature. If you see \`<@${selfUserId}>\` in an inbound message, someone is talking to YOU — never @-mention yourself in outbound.`
+        ? `Your name is **${assistantName}** (${selfAliases.join('; ')}). Those aliases refer to YOU, never a peer. If a direct mention is routed to this session, answer it or state the concrete blocker; do not silently step back because another peer might own the thread. Use the name when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature; never @-mention yourself in outbound.`
         : `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`,
     ];
     if (workgroupId) {
-      headerLines.push('', `Your workgroup is **${workgroupId}** — this is the multi-agent tenant boundary you operate under. Peers in the same workgroup share your chat archive and memory; agents in other workgroups do not.`);
+      headerLines.push(
+        '',
+        `Your workgroup is **${workgroupId}** — this is the multi-agent tenant boundary you operate under. Peers in the same workgroup share your chat archive and memory; agents in other workgroups do not.`,
+      );
     }
     sections.push(headerLines.join('\n'));
 
@@ -167,14 +177,14 @@ interface PeerEntry {
 }
 
 interface PeerSpec {
-  self?: { userId?: string };
+  self?: { name?: string; userId?: string };
   peers: PeerEntry[];
 }
 
 /**
  * Parse NANOCLAW_PEERS env. Fails soft — returns undefined on any error or
- * if the env is unset. Host sets it as JSON `{ self: { userId }, peers: [
- * { name, userId? }, ... ] }`. Container-runner's resolver computes the
+ * if the env is unset. Host sets it as JSON `{ self: { name?, userId }, peers:
+ * [{ name, userId? }, ...] }`. Container-runner's resolver computes the
  * payload per spawn via `getChannelPeers` + bot registry lookup.
  */
 function readPeersFromEnv(): PeerSpec | undefined {
