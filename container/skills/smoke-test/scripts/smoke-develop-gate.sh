@@ -54,6 +54,29 @@ MERGE_HOLD_SECONDS="${SMOKE_GATE_MERGE_HOLD_SECONDS:-5400}"
 # hung checks, stuck deploys). Without it the watcher waits silently forever —
 # fail-quiet, which this gate refuses everywhere else.
 UNSETTLED_ALERT_SECONDS="${SMOKE_GATE_UNSETTLED_ALERT_SECONDS:-2700}"
+# Optional readiness command run immediately before a campaign is opened, for
+# preconditions this gate cannot see: test-account liveness, a seeded fixture,
+# a reachable dependency. Exit 0 = go. Non-zero = the campaign never opens and
+# the last line of stdout becomes the human-readable reason.
+#
+# The gate deliberately knows NOTHING about what the command checks or how it
+# gets its credentials. That is the point: on 2026-08-09 three unattended
+# campaigns ran 03:00-06:00 against eight stale QA logins, failed every browser
+# journey, verified nothing, and were discovered by a human at 09:00. The fix
+# has to survive the credential architecture changing underneath it — file
+# today, derived-from-one-secret with a seed step later — so the seam is a
+# command, not a credential format this script would have to learn twice.
+#
+# It runs AFTER the wake window and BEFORE any state mark, for the same reason
+# the window check does: `emit_no_wake` preserves the settled candidate, so the
+# first poll after the preconditions are repaired opens the campaign normally.
+PREFLIGHT_CMD="${SMOKE_GATE_PREFLIGHT_CMD:-}"
+PREFLIGHT_TIMEOUT="${SMOKE_GATE_PREFLIGHT_TIMEOUT:-120}"
+# A failing precondition is an alarm, so it wakes — but the condition is not
+# SHA-bound the way `develop_unsettled` is (dead accounts stay dead across every
+# new head), so a per-SHA one-shot would re-alarm on each merge. Throttle on
+# time instead, and re-arm immediately whenever the reason text changes.
+PREFLIGHT_ALERT_SECONDS="${SMOKE_GATE_PREFLIGHT_ALERT_SECONDS:-21600}"
 # Comma-separated path prefixes that require each service to redeploy. When a
 # service's live deploy lags the source SHA, the lag is accepted only if every
 # file changed between them falls OUTSIDE that service's paths — the deployed
@@ -96,7 +119,9 @@ default_state() {
     completedVerdict: null,
     fetchFailures: 0,
     lastFailureWakeAt: null,
-    holdAlertFor: null
+    holdAlertFor: null,
+    preflightReason: null,
+    preflightWakeAt: null
   }'
 }
 
@@ -772,6 +797,45 @@ fi
 if [ -n "$WAKE_WINDOW" ] && [ "$(in_wake_window)" != true ]; then
   emit_no_wake "outside_wake_window"
   exit 0
+fi
+
+# Campaign preconditions. Everything above this line proves the BUILD is
+# testable; this proves the harness can actually test it. A campaign that opens
+# without its test accounts still freezes the environment, still holds the merge
+# queue for 90 minutes, and still produces a verdict-shaped nothing.
+if [ -n "$PREFLIGHT_CMD" ]; then
+  PREFLIGHT_OUT="$TMP_DIR/preflight.out"
+  if timeout "$PREFLIGHT_TIMEOUT" bash -c "$PREFLIGHT_CMD" >"$PREFLIGHT_OUT" 2>&1; then
+    :
+  else
+    PREFLIGHT_RC=$?
+    # Last non-empty line, trimmed — the command's own summary of what is wrong.
+    PREFLIGHT_REASON="$(grep -v '^[[:space:]]*$' "$PREFLIGHT_OUT" 2>/dev/null | tail -1 | cut -c1-300)"
+    [ -n "$PREFLIGHT_REASON" ] || PREFLIGHT_REASON="preflight command exited $PREFLIGHT_RC with no output"
+    [ "$PREFLIGHT_RC" -eq 124 ] && PREFLIGHT_REASON="preflight timed out after ${PREFLIGHT_TIMEOUT}s: $PREFLIGHT_REASON"
+    LAST_REASON="$(jq -r '.preflightReason // empty' <<<"$STATE")"
+    SINCE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.preflightWakeAt // empty' <<<"$STATE")") ))"
+    if [ "$PREFLIGHT_REASON" != "$LAST_REASON" ] || [ "$SINCE_WAKE" -ge "$PREFLIGHT_ALERT_SECONDS" ]; then
+      STATE="$(jq -c --arg r "$PREFLIGHT_REASON" --arg now "$NOW" \
+        '.preflightReason=$r | .preflightWakeAt=$now' <<<"$STATE")"
+      write_state "$STATE"
+      jq -cn \
+        --arg reason "$PREFLIGHT_REASON" \
+        --arg sha "$SOURCE_SHA" \
+        --argjson rc "$PREFLIGHT_RC" \
+        '{wakeAgent:true,data:{schemaVersion:1,trigger:"preflight_failed",
+          sourceSha:$sha,reason:$reason,exitCode:$rc}}'
+      exit 0
+    fi
+    # Already alarmed on this exact reason inside the throttle window. Refuse
+    # the campaign silently rather than waking every poll for the same news.
+    STATE="$(jq -c --arg r "$PREFLIGHT_REASON" '.preflightReason=$r' <<<"$STATE")"
+    emit_no_wake "preflight_failed"
+    exit 0
+  fi
+  # Passed — clear the latch so the next failure alarms immediately instead of
+  # inheriting a throttle window from an outage that is already repaired.
+  STATE="$(jq -c '.preflightReason=null | .preflightWakeAt=null' <<<"$STATE")"
 fi
 
 PREVIOUS_SHA="$COMPLETED_SHA"

@@ -679,6 +679,33 @@ Two further wrapper-optional artifacts and behaviours:
     fires on whatever the branch has settled on by then, never on a stale SHA.
     Suppressing the wake after `activeSha` were set would strand the SHA as an
     active run with nobody testing it.
+- `SMOKE_GATE_PREFLIGHT_CMD` runs one command immediately before a campaign is
+  opened, for preconditions the gate cannot see: test-account liveness, a seeded
+  fixture, a reachable dependency. **Exit 0 = go. Non-zero = the campaign never
+  opens**, and the last non-empty line of the command's output becomes the
+  `reason` a human reads. `SMOKE_GATE_PREFLIGHT_TIMEOUT` (default 120s) bounds
+  it; a timeout is reported as a failure, never a hang. Unset = inert.
+  - **The gate deliberately knows nothing about what the command checks.** That
+    is what makes the seam durable: a deployment can change where its test
+    credentials come from — a mounted file, a derived secret, a seed step — and
+    this script never learns the difference.
+  - **A failure wakes.** Everything above the check proves the *build* is
+    testable; this proves the *harness* is. A campaign that opens without its
+    test accounts still freezes the build, still holds the merge queue for its
+    full window, and still produces a verdict-shaped nothing — so refusing it
+    silently would stack a silent refusal on the silent failure the check
+    exists to catch. The wake is `preflight_failed`, throttled by
+    `SMOKE_GATE_PREFLIGHT_ALERT_SECONDS` (default 6h) and **re-armed the moment
+    the reason text changes** — three dead accounts becoming eight is news. A
+    pass clears the latch, so the next outage alarms immediately.
+  - Like the wake window, it is checked after the debounce and before any state
+    is marked: the settled candidate survives, and the campaign opens on the
+    first poll after the precondition is repaired.
+  - Origin: on 2026-08-09 eight QA seats went stale out of band. Three
+    campaigns ran unattended 03:00-06:00, every browser journey failed at the
+    login screen, zero findings were verified, and the open count went 54 → 61.
+    Nothing in the fleet could distinguish "the product is broken" from "the
+    tester cannot log in".
 
 When `SMOKE_GATE_HOLD_FILE` is set, `finish` additionally maintains an
 explicit, default-open block flag for promotion gating: a `NO_GO` verdict

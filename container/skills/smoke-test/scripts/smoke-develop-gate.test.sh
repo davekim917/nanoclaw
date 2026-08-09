@@ -306,4 +306,74 @@ export STUB_SOURCE_SHA="$(printf 'd%.0s' $(seq 40))"
 bash "$GATE" poll >/dev/null                     # debounce: first sighting
 bash "$GATE" poll | jq -e '.data.trigger == "outside_wake_window" | not' >/dev/null
 
+# 23. Campaign preflight. A failing precondition must REFUSE the campaign and
+# still be heard — a silent no-wake here would stack a silent refusal on top of
+# the silent failure the check exists to catch. It must also not re-alarm every
+# poll, must re-arm the moment the reason text changes, and must never leave a
+# stale latch behind once the precondition is repaired.
+# Own state dir, per this file's convention from case 16 on — the cases above
+# leave a claimed run behind, and `$STATE_FILE` still points at the ORIGINAL
+# dir rather than the rebound one, so asserting against it here would read an
+# unrelated file while every poll returned `queued_behind_active_run`.
+fresh_state
+PF_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
+
+# ONE poll per call. A refused campaign leaves the candidate settled (that is
+# the design — the campaign opens as soon as the precondition is repaired), so a
+# helper that polled twice would run the preflight twice and only ever return
+# the throttled second result, hiding every re-arm.
+pf_poll() { SMOKE_GATE_PREFLIGHT_CMD="$1" bash "$GATE" poll; }
+
+pf_sha() {                                       # new SHA: first sighting debounces
+  export STUB_SOURCE_SHA="$(printf "$1%.0s" $(seq 40))"
+  SMOKE_GATE_PREFLIGHT_CMD='exit 0' bash "$GATE" poll >/dev/null
+}
+pf_sha e
+
+# Fails -> wakes with the last line of output as the reason, campaign not opened.
+pf_poll 'echo noise; echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == true and .data.trigger == "preflight_failed" and
+  .data.reason == "3 of 8 QA seats could not be verified" and .data.exitCode == 1
+' >/dev/null
+jq -e '.activeSha == null and .candidateSha != null' "$PF_STATE" >/dev/null
+
+# Same reason on the next poll is throttled to a no-wake, and the candidate is
+# still preserved so the campaign opens as soon as the seats are fixed.
+pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == false and .data.trigger == "preflight_failed"
+' >/dev/null
+
+# A CHANGED reason re-arms immediately — 3 dead seats becoming 8 is news.
+pf_poll 'echo "8 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == true and .data.reason == "8 of 8 QA seats could not be verified"
+' >/dev/null
+
+# Silent failure still yields a usable reason rather than an empty Slack line.
+pf_poll 'exit 3' | jq -e '
+  .wakeAgent == true and .data.exitCode == 3 and
+  (.data.reason | test("exited 3 with no output"))
+' >/dev/null
+
+# A hanging preflight is a failure, not a hang: bounded and reported as one.
+SMOKE_GATE_PREFLIGHT_TIMEOUT=1 pf_poll 'sleep 30' | jq -e '
+  .wakeAgent == true and .data.exitCode == 124 and (.data.reason | test("timed out"))
+' >/dev/null
+
+# Passing preflight opens the campaign AND clears the latch, so the next failure
+# alarms immediately instead of inheriting a throttle window from a fixed outage.
+pf_poll 'echo "All 8 QA seats authenticated."; exit 0' | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_build_settled"
+' >/dev/null
+jq -e '.preflightReason == null and .preflightWakeAt == null' "$PF_STATE" >/dev/null
+
+# 24. With no preflight configured the seam is inert — a deployment that never
+# sets it behaves exactly as it did before the check existed.
+bash "$GATE" finish \
+  "$(jq -r '.activeSha' "$PF_STATE")" "$(jq -r '.activeRunId' "$PF_STATE")" GO \
+  | jq -e '.ok == true' >/dev/null
+export STUB_SOURCE_SHA="$(printf '1%.0s' $(seq 40))"   # hex only: the gate validates ^[0-9a-f]{40}$
+unset SMOKE_GATE_PREFLIGHT_CMD 2>/dev/null || true
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_build_settled"' >/dev/null
+
 echo "smoke develop gate tests passed"
