@@ -3,48 +3,6 @@ export interface AuthMe {
   scopes: { role: string; allowed_group_ids: string[]; no_filter: boolean };
 }
 
-export interface TaskSummary {
-  task_id: string;
-  parent_session_id: string;
-  task_content: string;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
-  admitted_at: string;
-  last_progress_message?: string;
-  fail_reason?: string;
-  /** 0/1 boolean — worker has stopped and is waiting for operator steer. */
-  needs_input?: number;
-  /** Optional one-line summary of what the worker is asking for. */
-  steer_question?: string | null;
-  /** ISO timestamp when an operator dismissed this task from the board; null = visible. */
-  archived_at?: string | null;
-}
-
-// Matches backend src/dashboard/api/tasks.ts TranscriptEntry exactly.
-// Post-build QA fix MF-4: previous shape was {seq, role, text, ts} which had
-// no overlap with backend {id, seq, kind, timestamp, content, direction, source}
-// — TaskDetail rendered empty rows for every transcript entry.
-export interface TranscriptEntry {
-  id: string;
-  seq: number;
-  kind: string;
-  timestamp: string;          // ISO 8601 — host writes T+ms+Z; container writes 'YYYY-MM-DD HH:MM:SS'
-  content: unknown;           // JSON-parsed; usually has a `text` field for human-readable rendering
-  direction: 'inbound' | 'outbound';
-  source: 'dashboard' | 'chat' | 'agent' | 'system';
-}
-
-export interface TaskDetail extends TaskSummary {
-  started_at?: string;
-  completed_at?: string;
-  failed_at?: string;
-  // Backend SELECT * on detail returns child_session_id; SPA uses it to filter
-  // chokidar-emitted SSE inbound_message events (post-build QA fix SF-8).
-  child_session_id?: string | null;
-  // Set by the child via spawn_complete / spawn_failed. Empty for tasks the
-  // watchdog reaped before the child got a chance to emit a terminal action.
-  result_summary?: string | null;
-}
-
 export type AttentionState = 'needs_me' | 'active' | 'idle' | 'stale';
 
 export interface SessionSummary {
@@ -72,15 +30,6 @@ export interface SessionSummary {
    * new code should prefer `last_inbound_at`.
    */
   last_active: string | null;
-}
-
-export interface TaskListResponse {
-  tasks: TaskSummary[];
-}
-
-export interface TaskDetailResponse {
-  task: TaskDetail;
-  transcript: TranscriptEntry[];   // top-level, NOT nested in task
 }
 
 export interface SessionsResponse {
@@ -147,19 +96,6 @@ export async function exchangeToken(token: string): Promise<ExchangeResponse> {
   });
 }
 
-export async function listTasks(
-  filter?: { status?: string; limit?: number; before?: string; group_id?: string; include_archived?: boolean }
-): Promise<TaskListResponse> {
-  const params = new URLSearchParams();
-  if (filter?.status) params.set('status', filter.status);
-  if (filter?.limit != null) params.set('limit', String(filter.limit));
-  if (filter?.before) params.set('before', filter.before);
-  if (filter?.group_id) params.set('group_id', filter.group_id);
-  if (filter?.include_archived) params.set('include_archived', '1');
-  const qs = params.toString();
-  return apiFetch<TaskListResponse>(`/dashboard/api/tasks${qs ? `?${qs}` : ''}`);
-}
-
 export interface GroupSummary {
   id: string;
   name: string;
@@ -171,10 +107,6 @@ export interface GroupListResponse {
 
 export async function listGroups(): Promise<GroupListResponse> {
   return apiFetch<GroupListResponse>('/dashboard/api/groups');
-}
-
-export async function getTask(id: string): Promise<TaskDetailResponse> {
-  return apiFetch<TaskDetailResponse>(`/dashboard/api/tasks/${encodeURIComponent(id)}`);
 }
 
 export async function getSessionDetail(sessionId: string): Promise<SessionDetailResponse> {
@@ -192,20 +124,6 @@ export async function listSessions(filter?: {
   if (filter?.limit) params.append('limit', String(filter.limit));
   const qs = params.toString();
   return apiFetch<SessionsResponse>(`/dashboard/api/sessions${qs ? `?${qs}` : ''}`);
-}
-
-export async function postSteer(
-  taskId: string,
-  body: { idempotency_key: string; text: string }
-): Promise<SteerResponse> {
-  return apiFetch<SteerResponse>(
-    `/dashboard/api/tasks/${encodeURIComponent(taskId)}/message`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }
-  );
 }
 
 export async function postSessionMessage(
@@ -234,56 +152,6 @@ export async function unarchiveSession(sessionId: string): Promise<{ session_id:
     `/dashboard/api/sessions/${encodeURIComponent(sessionId)}/unarchive`,
     { method: 'POST' }
   );
-}
-
-export interface RetryResponse {
-  status: 'admitted';
-  original_task_id: string;
-  idempotency_key: string;
-}
-
-export async function retryTask(taskId: string): Promise<RetryResponse> {
-  return apiFetch<RetryResponse>(
-    `/dashboard/api/tasks/${encodeURIComponent(taskId)}/retry`,
-    { method: 'POST' }
-  );
-}
-
-export interface ArchiveResponse {
-  task_id: string;
-  archived_at?: string;
-}
-
-export async function archiveTask(taskId: string): Promise<ArchiveResponse> {
-  return apiFetch<ArchiveResponse>(
-    `/dashboard/api/tasks/${encodeURIComponent(taskId)}/archive`,
-    { method: 'POST' },
-  );
-}
-
-export async function unarchiveTask(taskId: string): Promise<ArchiveResponse> {
-  return apiFetch<ArchiveResponse>(
-    `/dashboard/api/tasks/${encodeURIComponent(taskId)}/unarchive`,
-    { method: 'POST' },
-  );
-}
-
-export interface BulkArchiveResponse {
-  archived: number;
-}
-
-/** Mirrors backend `TerminalTaskStatus` in `src/modules/orchestrator-dispatch/db/tasks.ts`. */
-export type TerminalTaskStatus = 'failed' | 'completed' | 'cancelled';
-
-export async function bulkArchive(
-  status: TerminalTaskStatus,
-  group_id: string,
-): Promise<BulkArchiveResponse> {
-  return apiFetch<BulkArchiveResponse>('/dashboard/api/tasks/bulk-archive', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ status, group_id }),
-  });
 }
 
 // ─── Scheduled-tasks board (Group E) ────────────────────────────────────────
@@ -349,6 +217,8 @@ export interface ScheduledRow {
   quiet_status: boolean;
   /** Per-fire flagIntent override (model/effort) — brief-required metadata; opaque to the SPA. */
   flag_intent: Record<string, unknown> | null;
+  /** Host-side pre-task script execution flag — drives the "host-gated" badge. */
+  script_host: boolean;
   last_fires: FireOutcome[];
   /** The matrix output. Verb buttons render solely from this (single source of truth, E4). */
   available_verbs: ScheduledVerb[];
@@ -484,4 +354,93 @@ export async function moveScheduled(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+// ─── Workgroup dashboard (fleet-hardening Phase 3) ──────────────────────────
+//
+// Read-only. Types mirror the host-side contract in
+// src/dashboard/api/workgroups.ts.
+
+export interface WorkgroupSummary {
+  id: string;
+  name: string;
+}
+
+export interface WorkgroupsResponse {
+  workgroups: WorkgroupSummary[];
+}
+
+export async function listWorkgroups(): Promise<WorkgroupsResponse> {
+  return apiFetch<WorkgroupsResponse>('/dashboard/api/workgroups');
+}
+
+export interface WorkgroupBoardSummary {
+  /** Raw markdown of `releases/board.md`, or null if the workgroup has no release board. */
+  board: string | null;
+  /** Tail of the newest `releases/gates/*.jsonl` file — opaque gate log entries. */
+  gates: Record<string, unknown>[];
+}
+
+export async function getWorkgroupSummary(id: string): Promise<WorkgroupBoardSummary> {
+  return apiFetch<WorkgroupBoardSummary>(`/dashboard/api/workgroup/${encodeURIComponent(id)}/summary`);
+}
+
+/** Mirrors central-DB `usage_daily` — src/db/usage.ts `UsageDailyRow`. */
+export interface WorkgroupUsageRow {
+  date: string;
+  agent_group_id: string;
+  provider: string;
+  model: string;
+  turns: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number;
+}
+
+export interface WorkgroupUsageResponse {
+  usage: WorkgroupUsageRow[];
+}
+
+export async function getWorkgroupUsage(id: string, days?: number): Promise<WorkgroupUsageResponse> {
+  const qs = new URLSearchParams();
+  if (days != null) qs.set('days', String(days));
+  const query = qs.toString();
+  return apiFetch<WorkgroupUsageResponse>(
+    `/dashboard/api/workgroup/${encodeURIComponent(id)}/usage${query ? `?${query}` : ''}`,
+  );
+}
+
+export interface WorkgroupClaim {
+  slug: string;
+  owner: string | null;
+  claimed_at: string | null;
+  ttl_hours: number | null;
+  note: string | null;
+  escalated_at: string | null;
+  stale: boolean;
+  escalated: boolean;
+}
+
+/** Read-only projection of a live task series — see ScheduledRow for the full shape. */
+export interface WorkgroupSeriesRow {
+  series_id: string;
+  agent_group_id: string;
+  agent_group_name: string;
+  cron: string | null;
+  health: HealthState;
+  next_fire_utc: string | null;
+  next_fire_local: string | null;
+  last_fires: FireOutcome[];
+  script_host: boolean;
+}
+
+export interface WorkgroupClaimsResponse {
+  claims: WorkgroupClaim[];
+  series: WorkgroupSeriesRow[];
+}
+
+export async function getWorkgroupClaims(id: string): Promise<WorkgroupClaimsResponse> {
+  return apiFetch<WorkgroupClaimsResponse>(`/dashboard/api/workgroup/${encodeURIComponent(id)}/claims`);
 }

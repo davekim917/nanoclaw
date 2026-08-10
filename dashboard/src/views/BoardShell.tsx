@@ -4,27 +4,20 @@ import type { GroupSummary } from '../lib/api.js';
 import type { GroupFilter } from '../lib/use-group-filter.js';
 
 /**
- * Composable building blocks shared between `/dashboard/board` (KanbanBoard)
- * and `/dashboard/inbox` (InboxBoard, added in C8). The two views differ in
- * what they put inside the frame — task-status columns vs. attention-state
- * lanes — but the chrome (frame wrapper, brand, route nav, archive toggle)
- * is identical, and the inbox needs to render it the same way the board
- * does today.
- *
- * Pure refactor: every primitive in this file replaces an inline equivalent
- * inside KanbanBoard.tsx with byte-identical output. No new DOM nodes, no
- * reordered children. C8 reuses the same primitives without forking them.
+ * Composable building blocks shared across the dashboard's routed views
+ * (`/dashboard/inbox`, `/dashboard/scheduled`, `/dashboard/workgroup`). The
+ * chrome (frame wrapper, brand, route nav, archive toggle) is identical
+ * across routes; each view differs only in what it puts inside the frame.
  */
 
-export type BoardRoute = 'board' | 'inbox' | 'scheduled';
+export type BoardRoute = 'inbox' | 'scheduled' | 'workgroup';
 
 const MOBILE_QUERY = '(max-width: 899px)';
 
 /**
- * Tracks the viewport breakpoint. Lifted out of KanbanBoard so InboxBoard
- * can call the same hook and get the identical isMobile signal — useful
- * when both routes mount on the same page-load and a switch shouldn't
- * trigger a remeasure flicker.
+ * Tracks the viewport breakpoint. Shared so every routed view gets the
+ * identical isMobile signal — useful when multiple routes mount on the same
+ * page-load and a switch shouldn't trigger a remeasure flicker.
  */
 export function useIsMobile(): boolean {
   const [isMobile, setIsMobile] = useState(() => window.matchMedia(MOBILE_QUERY).matches);
@@ -70,9 +63,10 @@ export function BoardBrand({
 }
 
 /**
- * Primary nav (Board / Inbox) for the pulse header — rendered on both
- * mobile and desktop. Active-route highlighting drives off `route === ...`
- * so the component is layout-agnostic; positioning is up to the consumer.
+ * Primary nav (Inbox / Scheduled / Workgroup) for the pulse header —
+ * rendered on both mobile and desktop. Active-route highlighting drives off
+ * `route === ...` so the component is layout-agnostic; positioning is up to
+ * the consumer.
  */
 export function RouteNav({
   route,
@@ -83,9 +77,6 @@ export function RouteNav({
 }) {
   return (
     <nav className="nc-pulse-actions">
-      <button className={`nav-link ${route === 'board' ? 'active' : ''}`} onClick={() => onRouteChange('board')}>
-        Board
-      </button>
       <button className={`nav-link ${route === 'inbox' ? 'active' : ''}`} onClick={() => onRouteChange('inbox')}>
         Inbox
       </button>
@@ -94,6 +85,12 @@ export function RouteNav({
         onClick={() => onRouteChange('scheduled')}
       >
         Scheduled
+      </button>
+      <button
+        className={`nav-link ${route === 'workgroup' ? 'active' : ''}`}
+        onClick={() => onRouteChange('workgroup')}
+      >
+        Workgroup
       </button>
     </nav>
   );

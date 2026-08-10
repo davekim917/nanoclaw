@@ -6,7 +6,7 @@
  * `ctx.scopes.allowed_group_ids`. Out-of-scope ids are not leaked.
  *
  * Used by the SPA's group-filter dropdown — the brand-line header in
- * `dashboard/src/views/KanbanBoard.tsx` morphs to display the active group's
+ * `dashboard/src/views/InboxBoard.tsx` morphs to display the active group's
  * name when a filter is selected.
  */
 import { getDb } from '../../db/connection.js';

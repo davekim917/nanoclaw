@@ -9,21 +9,19 @@ import { register, requireAuth, registerCookieVerifier } from './router.js';
 import { ensureServerStarted } from '../webhook-server.js';
 import { startSSEFeed, stopSSEFeed, eventsHandler } from './api/events.js';
 import { indexHtmlHandler, staticHandler } from './static.js';
-import { tasksListHandler, tasksDetailHandler } from './api/tasks.js';
 import { sessionsHandler, sessionsDetailHandler } from './api/sessions.js';
 import { groupsListHandler } from './api/groups.js';
-import { steerHandler, sessionMessageHandler } from './steer.js';
-import { retryHandler } from './api/retry.js';
-import {
-  archiveHandler,
-  unarchiveHandler,
-  bulkArchiveHandler,
-  sessionArchiveHandler,
-  sessionUnarchiveHandler,
-} from './archive.js';
+import { sessionMessageHandler } from './steer.js';
+import { sessionArchiveHandler, sessionUnarchiveHandler } from './archive.js';
 import { scheduledListHandler, scheduledDetailHandler, scheduledSearchHandler } from './api/scheduled-read.js';
 import { editHandler, pauseHandler, resumeHandler, runNowHandler, cancelHandler } from './api/scheduled-mutations.js';
 import { movePreviewHandler, moveExecuteHandler } from './api/scheduled-move.js';
+import {
+  workgroupsListHandler,
+  workgroupSummaryHandler,
+  workgroupUsageHandler,
+  workgroupClaimsHandler,
+} from './api/workgroups.js';
 
 // Side-effect imports — these files register their routes/handlers at module load
 import './auth/exchange.js'; // POST /dashboard/api/auth/exchange
@@ -51,19 +49,21 @@ export function startDashboard(): void {
 
   // Auth-gated API routes (requireAuth wrap):
   register('GET', '/dashboard/api/events', requireAuth(eventsHandler));
-  register('GET', '/dashboard/api/tasks', requireAuth(tasksListHandler));
-  register('GET', '/dashboard/api/tasks/:id', requireAuth(tasksDetailHandler));
   register('GET', '/dashboard/api/sessions', requireAuth(sessionsHandler));
   register('GET', '/dashboard/api/sessions/:id', requireAuth(sessionsDetailHandler));
   register('GET', '/dashboard/api/groups', requireAuth(groupsListHandler));
-  register('POST', '/dashboard/api/tasks/:id/message', requireAuth(steerHandler));
   register('POST', '/dashboard/api/sessions/:id/message', requireAuth(sessionMessageHandler));
-  register('POST', '/dashboard/api/tasks/:id/retry', requireAuth(retryHandler));
-  register('POST', '/dashboard/api/tasks/bulk-archive', requireAuth(bulkArchiveHandler));
-  register('POST', '/dashboard/api/tasks/:id/archive', requireAuth(archiveHandler));
-  register('POST', '/dashboard/api/tasks/:id/unarchive', requireAuth(unarchiveHandler));
   register('POST', '/dashboard/api/sessions/:id/archive', requireAuth(sessionArchiveHandler));
   register('POST', '/dashboard/api/sessions/:id/unarchive', requireAuth(sessionUnarchiveHandler));
+
+  // Workgroup dashboard (fleet-hardening Phase 3) — read-only. :id must
+  // appear after the other single-segment sub-resources it doesn't collide
+  // with; each sub-route is its own segment count so ordering among them
+  // doesn't matter (unlike /scheduled's /search-vs-/:key collision).
+  register('GET', '/dashboard/api/workgroups', requireAuth(workgroupsListHandler));
+  register('GET', '/dashboard/api/workgroup/:id/summary', requireAuth(workgroupSummaryHandler));
+  register('GET', '/dashboard/api/workgroup/:id/usage', requireAuth(workgroupUsageHandler));
+  register('GET', '/dashboard/api/workgroup/:id/claims', requireAuth(workgroupClaimsHandler));
 
   // Scheduled Tasks Board — 10 routes (design §3b + prompt/title search). The
   // `scheduled` namespace is distinct from `tasks` (the spawn board owns that).

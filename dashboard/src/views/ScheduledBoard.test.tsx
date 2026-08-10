@@ -79,6 +79,7 @@ function row(overrides: Partial<ScheduledRow> = {}): ScheduledRow {
     module_owner: null,
     quiet_status: false,
     flag_intent: null,
+    script_host: false,
     last_fires: [],
     available_verbs: ['edit', 'pause', 'cancel'],
     ...overrides,

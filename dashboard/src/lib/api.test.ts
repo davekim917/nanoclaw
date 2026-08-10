@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   authMe,
-  postSteer,
+  postSessionMessage,
   listScheduled,
   searchScheduled,
   getScheduledDetail,
@@ -43,19 +43,19 @@ describe('api', () => {
     });
   });
 
-  describe('test_api_postSteer_body_shape', () => {
-    it('postSteer sends correct body', async () => {
+  describe('test_api_postSessionMessage_body_shape', () => {
+    it('postSessionMessage sends correct body', async () => {
       const mockFetch = vi.fn().mockResolvedValue({
         ok: true,
-        json: () => Promise.resolve({ task_id: 'spawn-abc', message_id: 'msg-1', echo_status: 'pending' }),
+        json: () => Promise.resolve({ session_id: 'sess-abc', message_id: 'msg-1', echo_status: 'pending' }),
       });
       vi.stubGlobal('fetch', mockFetch);
 
-      await postSteer('spawn-abc', { idempotency_key: 'uuid-1', text: 'hi' });
+      await postSessionMessage('sess-abc', { idempotency_key: 'uuid-1', text: 'hi' });
 
       expect(mockFetch).toHaveBeenCalledOnce();
       const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
-      expect(url).toBe('/dashboard/api/tasks/spawn-abc/message');
+      expect(url).toBe('/dashboard/api/sessions/sess-abc/message');
       expect(init.method).toBe('POST');
       expect(JSON.parse(init.body as string)).toEqual({ idempotency_key: 'uuid-1', text: 'hi' });
     });
@@ -71,7 +71,7 @@ describe('api', () => {
       vi.stubGlobal('fetch', mockFetch);
 
       await expect(
-        postSteer('spawn-abc', { idempotency_key: 'x', text: 'hi' })
+        postSessionMessage('sess-abc', { idempotency_key: 'x', text: 'hi' })
       ).rejects.toMatchObject({ status: 422, error: 'mismatched_idempotency_payload' });
     });
   });
@@ -86,7 +86,7 @@ describe('api', () => {
       vi.stubGlobal('fetch', mockFetch);
 
       await expect(
-        postSteer('spawn-abc', { idempotency_key: 'x', text: 'hi' })
+        postSessionMessage('sess-abc', { idempotency_key: 'x', text: 'hi' })
       ).rejects.toMatchObject({ status: 429, error: 'rate_limit_exceeded', retry_after: 5 });
     });
   });

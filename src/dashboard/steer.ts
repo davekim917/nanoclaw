@@ -1,22 +1,16 @@
 /**
- * Steer write path — shared by `POST /dashboard/api/tasks/:id/message` and
- * `POST /dashboard/api/sessions/:id/message`.
+ * Steer write path for `POST /dashboard/api/sessions/:id/message`.
  *
- * Both endpoints share the same flow:
- *   - input validation, §2a scope filter, role gate, per-(user, child)
- *     rate-limit, reserve-before-write idempotency, partial-write recovery,
- *     SSE emit, wakeContainer, fire-and-forget echo to the originating
- *     Slack/Discord thread via setImmediate.
- *
- * The only differences are: where we look up the destination (task row vs
- * session row), which idempotency target_type we record, and one optional
- * post-write hook (clearNeedsInput is task-only). `_writeAndEchoSteer` is
- * the unified core; `applySteer` and `applySessionSteer` are thin loaders.
+ * Flow: input validation, §2a scope filter, role gate, per-(user, child)
+ * rate-limit, reserve-before-write idempotency, partial-write recovery,
+ * SSE emit, wakeContainer, fire-and-forget echo to the originating
+ * Slack/Discord thread via setImmediate. `_writeAndEchoSteer` is the core;
+ * `applySessionSteer` is a thin loader that resolves the session and its
+ * echo destination.
  */
 import { randomUUID } from 'crypto';
 import { createHash } from 'crypto';
 
-import { getDb } from '../db/connection.js';
 import { getSession } from '../db/sessions.js';
 import { getMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
@@ -34,7 +28,6 @@ import {
   type SteerResponse,
   type SteerTarget,
 } from './db/steer-idempotency.js';
-import { clearNeedsInput } from '../modules/orchestrator-dispatch/db/tasks.js';
 import { emitDashboardEvent } from './api/events.js';
 import type { AuthHandler, AuthedRequestContext } from './router.js';
 
@@ -351,72 +344,6 @@ async function _emitEchoStatus(
   }
 }
 
-// ── Task steer ────────────────────────────────────────────────────────────────
-
-export async function applySteer(
-  taskId: string,
-  body: { idempotency_key: string; text: string },
-  ctx: AuthedRequestContext,
-): Promise<SteerResult> {
-  const task = getDb().prepare('SELECT * FROM tasks WHERE task_id = ?').get(taskId) as
-    | {
-        task_id: string;
-        parent_agent_group_id: string;
-        child_session_id: string | null;
-        surface_mode: string;
-        child_messaging_group_id: string | null;
-        child_platform_thread_id: string | null;
-        status: string;
-      }
-    | undefined;
-
-  if (!task) return { status: 404, body: { error: 'task_not_found' } };
-
-  if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(task.parent_agent_group_id)) {
-    return { status: 404, body: { error: 'task_not_found' } };
-  }
-
-  if (!task.child_session_id) return { status: 409, body: { error: 'task_has_no_child_session' } };
-
-  const childSession = getSession(task.child_session_id);
-  if (!childSession) return { status: 404, body: { error: 'task_not_found' } };
-
-  const echo: EchoConfig =
-    task.surface_mode === 'native_thread' && task.child_messaging_group_id && task.child_platform_thread_id
-      ? {
-          kind: 'thread',
-          messagingGroupId: task.child_messaging_group_id,
-          platformThreadId: task.child_platform_thread_id,
-        }
-      : { kind: 'headless' };
-
-  const result = await _writeAndEchoSteer(
-    {
-      target: { type: 'task', id: taskId },
-      agentGroupId: task.parent_agent_group_id,
-      childAgentGroupId: childSession.agent_group_id,
-      childSessionId: task.child_session_id,
-      echo,
-      onWrite: () => {
-        try {
-          clearNeedsInput(taskId);
-        } catch (err) {
-          log.warn('steer: failed to clear needs_input — non-fatal', { taskId, err });
-        }
-      },
-      envelope: { task_id: taskId, user_id: ctx.user.id },
-    },
-    body,
-    ctx,
-  );
-
-  // `not_found` → `task_not_found` for backwards compatibility with task callers.
-  if (result.status === 404 && result.body['error'] === 'not_found') {
-    return { status: 404, body: { error: 'task_not_found' } };
-  }
-  return result;
-}
-
 // ── Session steer ─────────────────────────────────────────────────────────────
 
 export async function applySessionSteer(
@@ -499,18 +426,6 @@ function _httpStatusOf(status: SteerStatus): number {
   };
   return statusMap[status] ?? 500;
 }
-
-export const steerHandler: AuthHandler = async (req, params, ctx) => {
-  const body = await _readSteerBody(req);
-  if ('error' in body) return body.error;
-
-  const taskId = params['id'] ?? '';
-  const result = await applySteer(taskId, body, ctx);
-  return new Response(JSON.stringify(result.body), {
-    status: _httpStatusOf(result.status),
-    headers: { 'Content-Type': 'application/json' },
-  });
-};
 
 export const sessionMessageHandler: AuthHandler = async (req, params, ctx) => {
   const body = await _readSteerBody(req);

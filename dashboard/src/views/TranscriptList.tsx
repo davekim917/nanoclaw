@@ -1,21 +1,12 @@
 import { renderMarkdown } from '../lib/markdown.js';
-import { relAge, textOfEntry } from '../lib/derive.js';
-import type { SessionTranscriptEntry, TranscriptEntry } from '../lib/api.js';
+import { relAge } from '../lib/derive.js';
+import type { SessionTranscriptEntry } from '../lib/api.js';
 
 /**
- * Shared transcript renderer for both TaskDetail and SessionDetail.
- *
- * Why a single component:
- *   - Markdown rendering, expand-on-truncation, and the contiguous-status
- *     coalesce (thinking groups) used to live only in SessionDetail; TaskDetail
- *     used its own `TranscriptBubble` that did markdown but neither of the
- *     other two. Operator feedback flagged the asymmetry.
- *   - The two API endpoints return different entry shapes (TaskDetail's
- *     `TranscriptEntry` has `.id/.seq/.content/.source/.direction='inbound'|
- *     'outbound'`; SessionDetail's `SessionTranscriptEntry` has
- *     `.seq/.kind/.text/.direction='in'|'out'`). The `normalize*` helpers
- *     adapt each into a single internal shape; the rendering doesn't care
- *     which side fed it.
+ * Transcript renderer for SessionDetail. Markdown rendering, expand-on-
+ * truncation, and the contiguous-status coalesce (thinking groups) all live
+ * here; `normalizeSessionEntry` adapts the API's `SessionTranscriptEntry`
+ * shape into the internal `NormalizedEntry` shape the rendering below uses.
  */
 
 interface NormalizedEntry {
@@ -34,17 +25,6 @@ export function normalizeSessionEntry(e: SessionTranscriptEntry): NormalizedEntr
     kind: e.kind,
     timestamp: e.timestamp,
     text: e.text,
-  };
-}
-
-export function normalizeTaskEntry(e: TranscriptEntry): NormalizedEntry {
-  return {
-    key: e.id,
-    direction: e.direction === 'inbound' ? 'in' : 'out',
-    kind: e.kind,
-    source: e.source,
-    timestamp: e.timestamp,
-    text: textOfEntry(e),
   };
 }
 

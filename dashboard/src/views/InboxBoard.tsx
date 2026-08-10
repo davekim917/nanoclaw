@@ -457,13 +457,12 @@ function SessionCard({
   const lastInbound = session.last_inbound_at ?? session.last_active;
   const lastOutbound = session.last_outbound_at;
 
-  // Cards with an attached_task short-circuit to TaskDetail (existing UX
-  // for spawn workers). Every other card opens its own SessionDetail at
-  // `#/session/:id`, where the operator can read recent messages and
-  // send a steer via the C5 session-message endpoint.
+  // Every card opens its own SessionDetail at `#/session/:id`, where the
+  // operator can read recent messages and send a steer via the C5
+  // session-message endpoint. (Cards with an attached_task used to
+  // short-circuit to the spawn-board's TaskDetail — that view is retired.)
   const onClick = () => {
-    if (isAttachedTask) location.hash = `#/task/${session.attached_task_id}`;
-    else location.hash = `#/session/${session.session_id}`;
+    location.hash = `#/session/${session.session_id}`;
   };
   const onKey = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' || e.key === ' ') {

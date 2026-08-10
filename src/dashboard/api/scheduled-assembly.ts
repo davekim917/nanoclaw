@@ -66,6 +66,9 @@ export interface ScheduledRow {
   module_owner: string | null;
   quiet_status: boolean;
   flag_intent: Record<string, unknown> | null;
+  /** Host-side pre-task script execution flag (content.scriptHost) — surfaced for the
+   *  workgroup dashboard's "host-gated" badge (fleet-hardening Phase 3). */
+  script_host: boolean;
   last_fires: FireOutcome[];
   available_verbs: Verb[];
 }
@@ -344,6 +347,7 @@ function parseContent(content: string): {
   script: string | null;
   quietStatus: boolean;
   flagIntent: Record<string, unknown> | null;
+  scriptHost: boolean;
 } {
   let parsed: Record<string, unknown> = {};
   try {
@@ -359,6 +363,9 @@ function parseContent(content: string): {
       parsed.flagIntent && typeof parsed.flagIntent === 'object'
         ? (parsed.flagIntent as Record<string, unknown>)
         : null,
+    // Mirrors src/cli/resources/tasks.ts's parseContent — content.scriptHost is
+    // the only place this flag lives (not a DB column).
+    scriptHost: parsed.scriptHost === true,
   };
 }
 
@@ -432,6 +439,7 @@ function rawToRow(
     module_owner: moduleOwner(seriesId).owner ?? null,
     quiet_status: parsed.quietStatus,
     flag_intent: parsed.flagIntent,
+    script_host: parsed.scriptHost,
     last_fires: [],
     available_verbs: availableVerbs({
       state: health,

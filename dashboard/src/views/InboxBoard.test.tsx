@@ -132,7 +132,7 @@ describe('InboxBoard', () => {
     expect(mutate.mock.calls.length).toBe(1);
   });
 
-  it('clicking a session with attached_task navigates to TaskDetail', async () => {
+  it('clicking a session with attached_task opens its SessionDetail (TaskDetail is retired)', async () => {
     vi.mocked(useSWR).mockReturnValue({
       data: {
         sessions: [
@@ -148,7 +148,7 @@ describe('InboxBoard', () => {
     const card = cards.find((el) => el.dataset.sessionId === 'sess-task');
     expect(card).toBeTruthy();
     await userEvent.click(card!);
-    expect(location.hash).toBe('#/task/task-99');
+    expect(location.hash).toBe('#/session/sess-task');
   });
 
   it('clicking a direct-conversation session navigates to SessionDetail', async () => {
@@ -183,15 +183,15 @@ describe('InboxBoard', () => {
     expect(vi.mocked(archiveSession)).toHaveBeenCalledWith('sess-arch');
   });
 
-  it('clicking the Board nav button fires onRouteChange', async () => {
+  it('clicking the Scheduled nav button fires onRouteChange', async () => {
     vi.mocked(useSWR).mockReturnValue({
       data: { sessions: [] },
       mutate: vi.fn(),
     } as unknown as ReturnType<typeof useSWR>);
     const onRouteChange = vi.fn();
     render(<InboxBoard authMe={mockAuthMe} route="inbox" onRouteChange={onRouteChange} />);
-    // The primary RouteNav renders "Board" + "Inbox" on both layouts.
-    await userEvent.click(screen.getByRole('button', { name: /^Board$/i }));
-    expect(onRouteChange).toHaveBeenCalledWith('board');
+    // The primary RouteNav renders "Inbox" + "Scheduled" + "Workgroup" on both layouts.
+    await userEvent.click(screen.getByRole('button', { name: /^Scheduled$/i }));
+    expect(onRouteChange).toHaveBeenCalledWith('scheduled');
   });
 });
