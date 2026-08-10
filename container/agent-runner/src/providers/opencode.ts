@@ -11,6 +11,7 @@ import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
+import { shouldPostInfraWarning } from '../db/session-state.js';
 
 function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
@@ -793,10 +794,18 @@ export class OpenCodeProvider implements AgentProvider {
         // message instead of dead air.
         if (!resultText.trim()) {
           const m = effectiveModel ?? 'the current model';
-          log(`Empty assistant response (model=${m}) — surfacing fallback instead of silent no-reply`);
-          resultText =
+          const warningText =
             `⚠️ \`${m}\` returned an empty response this turn (no text generated). ` +
             `Some models/providers do this under load — try again, or switch with \`-m <provider/model>\`.`;
+          log(`Empty assistant response (model=${m}) — surfacing fallback instead of silent no-reply`);
+          // Dedupe the CHANNEL POST only — the log line above always fires.
+          // A flapping model can hit this every turn; without the gate the
+          // same verbatim warning spams the channel repeatedly (observed 3x
+          // in one night). Suppressed repeats leave resultText empty, which
+          // poll-loop's dispatch treats as a quiet no-text turn.
+          if (shouldPostInfraWarning(warningText)) {
+            resultText = warningText;
+          }
         }
         const assistantUsage = lastAssistantMessageId ? assistantUsageById.get(lastAssistantMessageId) : undefined;
         yield {

@@ -41,6 +41,7 @@ import {
   clearStickyUltracode,
   getStickyFast,
   setStickyFast,
+  shouldPostInfraWarning,
 } from './db/session-state.js';
 import { clearBatchAnchors, getBatchAnchor, setCurrentBatchAnchors } from './current-batch.js';
 import {
@@ -1071,21 +1072,30 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       // Only surface the error to the user if we couldn't recover inline.
       if (!recovered && !quotaHandled) {
+        // Deliberately un-gated: an unclassified error can be a real bug, not
+        // a flapping provider, and shouldn't be silently swallowed by dedupe.
+        const providerEventErr = err instanceof ProviderEventError && err.retryable === false;
+        const isInfraWarning = transient || codexIdle || providerEventErr;
         const chatText = transient
           ? `⚠️ Anthropic's API stayed overloaded across ${TRANSIENT_OVERLOAD_MAX_TRIES} retries — I couldn't finish this turn. I'll pick up from your next message.`
           : codexIdle
             ? `⚠️ The Codex app-server stalled across ${CODEX_IDLE_RETRY_MAX} retries — I couldn't finish this turn. I'll pick up from your next message.`
-            : err instanceof ProviderEventError && err.retryable === false
+            : providerEventErr
               ? `⚠️ Turn ended with an error: ${err.message}. I'll pick up from your next message.`
               : `Error: ${errMsg}`;
-        writeMessageOut({
-          id: generateId(),
-          kind: 'chat',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
-          content: JSON.stringify({ text: chatText }),
-        });
+        // `log(\`Query error: ${errMsg}\`)` above already covers unconditional
+        // logging for this whole branch — the dedupe below only gates the
+        // channel post, and only for the classified infra/provider notices.
+        if (!isInfraWarning || shouldPostInfraWarning(chatText)) {
+          writeMessageOut({
+            id: generateId(),
+            kind: 'chat',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify({ text: chatText }),
+          });
+        }
       }
     } finally {
       if (abortActiveQuery) config.signal?.removeEventListener('abort', abortActiveQuery);
@@ -1783,16 +1793,19 @@ export function handleEvent(event: ProviderEvent, routing: RoutingContext): void
         if (reportProviderUnavailable(getConfig().provider, event.message, true)) break;
       }
       if (event.retryable === false) {
-        writeMessageOut({
-          id: generateId(),
-          kind: 'chat',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
-          content: JSON.stringify({
-            text: `⚠️ Turn ended with an error: ${event.message}. I'll pick up from your next message.`,
-          }),
-        });
+        // `log()` above already covers unconditional logging for this
+        // branch — dedupe below only gates the repeated channel post.
+        const chatText = `⚠️ Turn ended with an error: ${event.message}. I'll pick up from your next message.`;
+        if (shouldPostInfraWarning(chatText)) {
+          writeMessageOut({
+            id: generateId(),
+            kind: 'chat',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify({ text: chatText }),
+          });
+        }
       }
       break;
     case 'progress':

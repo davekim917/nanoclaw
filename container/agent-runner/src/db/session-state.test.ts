@@ -19,6 +19,8 @@ import {
   cancelWorkContinuation,
   setContinuation,
   setStickyFast,
+  shouldPostInfraWarning,
+  INFRA_WARNING_COOLDOWN_MS,
 } from './session-state.js';
 
 beforeEach(() => {
@@ -261,5 +263,30 @@ describe('session-state — durable work continuation', () => {
     queueWorkContinuation('cancel me');
     expect(cancelWorkContinuation()).toBe(true);
     expect(cancelWorkContinuation()).toBe(false);
+  });
+});
+
+describe('shouldPostInfraWarning — dedupe', () => {
+  test('first occurrence posts', () => {
+    expect(shouldPostInfraWarning('provider X is flapping')).toBe(true);
+  });
+
+  test('identical text within cooldown is suppressed', () => {
+    expect(shouldPostInfraWarning('provider X is flapping')).toBe(true);
+    expect(shouldPostInfraWarning('provider X is flapping')).toBe(false);
+    expect(shouldPostInfraWarning('provider X is flapping')).toBe(false);
+  });
+
+  test('identical text posts again once the cooldown has elapsed', () => {
+    expect(shouldPostInfraWarning('provider X is flapping')).toBe(true);
+    const db = getOutboundDb();
+    const staleTimestamp = new Date(Date.now() - INFRA_WARNING_COOLDOWN_MS - 1000).toISOString();
+    db.prepare("UPDATE session_state SET updated_at = ? WHERE key = 'last_infra_warning'").run(staleTimestamp);
+    expect(shouldPostInfraWarning('provider X is flapping')).toBe(true);
+  });
+
+  test('a different warning text posts even while another is in cooldown', () => {
+    expect(shouldPostInfraWarning('provider X is flapping')).toBe(true);
+    expect(shouldPostInfraWarning('provider Y stalled')).toBe(true);
   });
 });

@@ -382,6 +382,36 @@ export function cancelWorkContinuation(): boolean {
   return existed;
 }
 
+const INFRA_WARNING_KEY = 'last_infra_warning';
+
+/** Cooldown window for `shouldPostInfraWarning` — see that function's doc. */
+export const INFRA_WARNING_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h
+
+/**
+ * Dedupe identical infra/provider warning text (empty-response fallback,
+ * retry-exhausted notices) so a flapping provider doesn't spam the channel
+ * with the same notice every turn. Callers must still log unconditionally —
+ * this only decides whether the text is worth posting to chat again.
+ *
+ * ponytail: tracks only the single most recently posted warning text + time,
+ * not a per-text history. Two distinct warning types alternating within the
+ * cooldown both post every time (the second overwrites the tracked slot) —
+ * fine for the observed failure mode (one flapping condition repeating
+ * itself verbatim); upgrade to a per-text map if overlapping warning types
+ * ever need independent cooldown windows.
+ */
+export function shouldPostInfraWarning(text: string): boolean {
+  const row = getOutboundDb().prepare('SELECT value, updated_at FROM session_state WHERE key = ?').get(
+    INFRA_WARNING_KEY,
+  ) as { value: string; updated_at: string } | undefined;
+  if (row && row.value === text) {
+    const age = Date.now() - new Date(row.updated_at).getTime();
+    if (Number.isFinite(age) && age < INFRA_WARNING_COOLDOWN_MS) return false;
+  }
+  setValue(INFRA_WARNING_KEY, text);
+  return true;
+}
+
 export function resetWorkContinuationForRealInbound(): WorkContinuation | undefined {
   return getOutboundDb().transaction(() => {
     const current = getWorkContinuation();
