@@ -102,6 +102,7 @@ import { decideTaskAction, pendingTerminalSpawnOutboundSeenAt } from './modules/
 import { OomKillObserver } from './resource-oom-observer.js';
 import { pruneChannelIngressReceipts } from './db/channel-ingress-receipts.js';
 import { runMemoryCurationInBackground, stopMemoryCurationInBackground } from './modules/memory/curator-worker.js';
+import { sweepClaimsEscalation } from './modules/claims/escalation.js';
 
 const oomKillObserver = new OomKillObserver();
 
@@ -840,6 +841,16 @@ async function sweep(): Promise<void> {
     sweepUsageRollup(sessions);
   } catch (err) {
     log.warn('Usage rollup sweep step failed', { err });
+  }
+
+  // Fleet-hardening Phase 2.2: escalate work-claims stale past their grace
+  // window that no sibling ever took over — see
+  // src/modules/claims/escalation.ts. Throttled internally to once per 10
+  // minutes; isolated so a scan failure never blocks the rest of the tick.
+  try {
+    sweepClaimsEscalation();
+  } catch (err) {
+    log.warn('Claims escalation sweep step failed', { err });
   }
 
   const sweepMs = Date.now() - sweepStartedAtMs;
