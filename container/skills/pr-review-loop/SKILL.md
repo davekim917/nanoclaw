@@ -1,13 +1,15 @@
 ---
 name: pr-review-loop
-description: Drive a PR to merge through Codex's automated review in batched rounds — collect every open comment, accept or reject each with evidence, fix them in one commit, reply and resolve every thread, then re-review until clean. Use this whenever a PR has Codex review comments to work through, right after opening a PR that Codex will auto-review, and any time the user says "address the codex comments", "work the review", "resolve the PR comments", or "get this PR merged". Use it especially when a PR is on its third round of review and isn't converging.
+description: Drive a PR to merge through Codex's automated review in batched rounds — collect every open comment, accept or reject each with evidence, fix them in one commit, reply and resolve every thread, then let the reviewer decide whether another round is warranted. Use this whenever a PR has Codex review comments to work through, right after opening a PR that Codex will auto-review, and any time the user says "address the codex comments", "work the review", "resolve the PR comments", or "get this PR merged". Use it especially when a PR is on its third round of review and isn't converging.
 ---
 
 # PR review loop
 
 Codex (`chatgpt-codex-connector[bot]`) re-reviews every new head commit and files fresh inline comments as it sees fit. Worked one comment at a time, that is an unbounded loop: patch → new review → patch → new review. Worked in rounds, it converges in two or three.
 
-**The whole skill is one rule: a round is a batch.** Collect every unresolved comment, decide on all of them, fix all the accepted ones in one commit, push once, ask for exactly one re-review. Never push a commit for a single comment. Never ping `@codex review` more than once per round.
+**The whole skill is one rule: a round is a batch.** Collect every unresolved comment, decide on all of them, fix all the accepted ones in one commit, push once. Never push a commit for a single comment.
+
+**Then stop, and do not ask for a re-review.** The reviewer decides whether your commit warrants another look, and silence is an answer — it means the change did not need one. A `@codex review` comment overrides that judgment and manufactures a round nobody wanted. On 2026-08-09 one deployment drove a 213-line PR to four requested rounds in two and a half hours, then blocked its own merge on the count; four PRs sat frozen with CI green, one with every thread already resolved. If a repo genuinely has no automatic reviewer, that is a deployment fact its instructions should state — it is not a reason to start pinging.
 
 ## When to enter, and at what round
 
@@ -18,18 +20,33 @@ Never trust the ping, the assignment text, or your memory of how many rounds
 have happened. Round N = that count. If someone hands you review work and names
 a round, the count still wins.
 
-## Round budget
+## Reading the rounds you actually get
 
 A round is one full batch, and only batched rounds count. Ten pushes of one comment each are not ten rounds of evidence — they're one round stretched over ten pushes, which is the most common way this loop runs away.
 
 Track the round number and say it out loud in each status message.
 
-| Round | What you do |
-|---|---|
-| 1–2 | Normal. Batch, fix, re-review. |
-| 3 | Before pushing, reread the **entire** diff yourself and run the full suite. Land your own findings in the same batch. |
-| 4+ | Stop and diagnose out loud before pushing again. Only the churn protocol's single re-implementation commit may be pushed — even if the assignment text says "push a fix". "Address the Nth review" as a commit message for N ≥ 4 IS the anti-pattern. |
-| 6+ | **Hard stop. No push of any kind without an explicit human go-ahead in that PR's thread.** Reply with the round count and "standing down pending a human call", then stop — that reply is what surfaces the freeze, so it is never optional. Where a release owner exists, escalation is its job and is already in flight; where none does, your stand-down reply is the only signal, which makes posting it more important, not less. Work you do past this line overrides a deliberate freeze; a PR reaching round 10 means this rule was broken repeatedly, not that review is hard. |
+Rounds are now something you RECEIVE, not something you spend. Track how many
+have arrived and say it out loud in each status message — the count is evidence
+about the change, not a budget.
+
+- **Rounds 1–2** — normal. Batch, fix, push, wait.
+- **Round 3** — before pushing, reread the entire diff yourself and run the full
+  suite. Land your own findings in the same batch.
+- **Third arriving review and still not converging** — stop and diagnose out
+  loud before touching code. Post your read to the PR thread and mention the PR
+  owner and whoever owns release calls in this deployment: the trend (same subsystem? same invariant? severity flat or
+  rising?) and which of the three cases below you think you are in. Then act on
+  that diagnosis. What you must not do is push another patch because a patch is
+  what you pushed last time — "address the Nth review" as a commit message is
+  the anti-pattern this skill exists to stop, and it is how #299 reached round
+  18.
+
+There is no round number that forbids a push. There used to be, and it froze
+four PRs with CI green — one with every thread already resolved — because the
+rounds being counted were ones the fleet had asked for. Now that nobody
+manufactures them, a high count means the change keeps failing review, and that
+is a conversation to have, not a budget to run out of.
 
 ### Diagnosing round 4+
 
