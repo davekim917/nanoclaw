@@ -109,6 +109,26 @@ describe('memory curator worker', () => {
     expect(d.finishCall).toHaveBeenCalledWith(expect.any(String), 'noop');
   });
 
+  // P0-AC8. The curator computes a reason for every decision, including each noop, and
+  // the value was dropped on the floor: the run report carried `action` only, so
+  // `code_derived` — the machine-readable footprint of the "recoverable from code"
+  // prohibition — was uncountable. runMemoryCurationInBackground spreads the report into
+  // one log.info, so surfacing it here is what makes the refusal measurable.
+  it('reports the decision reason code so refusals are countable', async () => {
+    const d = deps({
+      curate: vi.fn(
+        async (_system, _user, credentialSlot): Promise<CuratorBackendResult> => ({
+          decision: { action: 'noop', reasonCode: 'code_derived', supersedesMemoryIds: [], memories: [] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toMatchObject({ action: 'noop', reasonCode: 'code_derived' });
+  });
+
   it('writes a validated replacement before advancing the cursor', async () => {
     const d = deps({
       curate: vi.fn(

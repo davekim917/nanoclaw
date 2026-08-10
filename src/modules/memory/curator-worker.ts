@@ -55,6 +55,19 @@ export interface MemoryCuratorRunReport {
   workgroupId: string;
   episodeKey: string;
   action: CuratorDecision['action'] | 'maintenance_noop' | 'maintenance_written';
+  /**
+   * Why the curator decided what it decided — present for model-backed episodes, absent
+   * for maintenance, which makes no model decision.
+   *
+   * The curator already computes a reason for every decision including each noop, and
+   * this was previously dropped. It is surfaced because the noop codes are the only
+   * machine-readable record of what memory is being REFUSED: `code_derived` in
+   * particular is the footprint of the "recoverable from code/Graphify" prohibition, so
+   * without this the suppression can only be estimated by classifying the store after
+   * the fact. runMemoryCurationInBackground spreads this report into one log.info, so
+   * adding the field is what makes the refusal countable.
+   */
+  reasonCode?: CuratorDecision['reasonCode'];
   messageCount: number;
   transcriptChars: number;
   model?: string;
@@ -461,6 +474,7 @@ export class MemoryCuratorWorker {
         workgroupId: episode.workgroupId,
         episodeKey: episode.episodeKey,
         action: decision.action,
+        reasonCode: decision.reasonCode,
         messageCount: bounded.messages.length,
         transcriptChars: bounded.transcriptChars,
         model: backend.model,
