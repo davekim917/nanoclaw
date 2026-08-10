@@ -128,6 +128,8 @@ Commit and push once — `git_commit` / `git_push` if you have those MCP tools, 
 
 One commit per round, not per comment. If a finding needs a design decision from the user, leave it out of the batch and say so — keep that thread open rather than stalling the other fixes on it. `codex-review.sh status` reports it in `open=`, so it can't be forgotten at merge time.
 
+**A finding that belongs to a different change gets tracked, then resolved — not left open.** Some accepted findings are real and correctly not fixed here: the defect is cross-cutting, or the fix lands on another PR, or it is one instance of a pattern already filed as an issue. Reply with the trace and the issue or PR that owns it, link this thread from there, then **resolve the thread**. An open thread is a merge blocker with no owner and nobody woken to clear it — the tracking issue is what carries the finding forward, and it carries it better than a thread on a PR that merged. Leave a thread open only when the answer must arrive on THIS PR before it ships.
+
 Capture the head SHA and a timestamp from **before** you push — the timestamp is what filters out the previous round's stale 👍:
 
 ```bash
