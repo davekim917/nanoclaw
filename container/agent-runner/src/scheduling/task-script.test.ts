@@ -69,4 +69,30 @@ describe('script-skip ack chain (container leg)', () => {
     expect(keep).toHaveLength(1);
     expect(JSON.parse(keep[0].content).scriptOutput).toEqual({ alerts: 2 });
   });
+
+  // Fleet-hardening Phase 1.1: a host-gated fire (content.scriptHost) already
+  // ran its script on the host and wrote scriptOutput before the container
+  // was even spawned (src/modules/scheduling/host-script.ts). The container
+  // must not run it a second time.
+  it('a row that already carries scriptOutput is passed through without re-running the script', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, content)
+         VALUES ('t-host-gated', 'task', datetime('now'), 'pending', 1, ?)`,
+      )
+      .run(
+        JSON.stringify({
+          prompt: 'monitor',
+          script: 'exit 1', // would fail if re-run — proves it never executes
+          scriptHost: true,
+          scriptOutput: { alerts: 5 },
+        }),
+      );
+
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(skipped).toHaveLength(0);
+    expect(keep).toHaveLength(1);
+    expect(JSON.parse(keep[0].content).scriptOutput).toEqual({ alerts: 5 });
+  });
 });

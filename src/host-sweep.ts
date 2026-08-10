@@ -55,6 +55,7 @@ import {
 } from './db/session-db.js';
 import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
 import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
+import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
 import { purgeIntentBody } from './dashboard/api/scheduled-shared.js';
 import { log } from './log.js';
 import {
@@ -616,6 +617,7 @@ function writeCeilingRespawn(
     `[system] Your previous container was killed by the ${idleMinutes}-minute idle ceiling ` +
     `(no active turn for ~${silentMinutes} min). If work was in flight: check your durable checkpoints, ` +
     `resume what is safely resumable, and post ONE message accounting for state — done / lost / next. ` +
+    `Re-check any work claims in claims/ before resuming a seam — a sibling may have taken it over while you were down. ` +
     `In-container background tasks, sleeps, and /tmp do not survive a restart; before going idle with ` +
     `work in flight, checkpoint to a durable path and call continue_work, or use wait for a real time delay. ` +
     `If nothing was in flight, say so in one line.`;
@@ -910,11 +912,15 @@ function getLastOutboundAtMs(outDb: Database.Database): number | null {
   return Number.isNaN(ms) ? null : ms;
 }
 
-function prepareDueWake(
+async function prepareDueWake(
   inDb: Database.Database,
   agentGroupId: string,
   sessionId: string,
-): { admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' } {
+): Promise<{ admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' }> {
+  // Fleet-hardening Phase 1.1: run any opted-in (scriptHost) pre-task scripts
+  // on the host BEFORE admission, so a gated/errored fire never becomes due
+  // and never spawns a container. See host-script.ts's runHostGatedTaskScripts.
+  await runHostGatedTaskScripts(inDb, sessionId);
   const admittedTasks = admitDueTaskContexts(inDb, agentGroupId, sessionId);
   const dueCount = countDueMessages(inDb);
   return {
@@ -924,11 +930,11 @@ function prepareDueWake(
   };
 }
 
-export function _prepareDueWakeForTesting(
+export async function _prepareDueWakeForTesting(
   inDb: Database.Database,
   agentGroupId: string,
   sessionId: string,
-): { admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' } {
+): Promise<{ admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' }> {
   return prepareDueWake(inDb, agentGroupId, sessionId);
 }
 
@@ -1240,7 +1246,7 @@ async function sweepSession(session: Session): Promise<number | null> {
     // creation through this point; paired lifecycle wakes stay trigger=0 throughout
     // backoff. A warm poller cannot race ahead of either context pair, and a
     // repeated sweep is idempotent.
-    const preparedWake = prepareDueWake(inDb, agentGroup.id, session.id);
+    const preparedWake = await prepareDueWake(inDb, agentGroup.id, session.id);
     const { admittedTasks } = preparedWake;
     let { dueCount, wakePriority } = preparedWake;
     if (admittedTasks > 0) {

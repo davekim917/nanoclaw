@@ -152,18 +152,24 @@ function withInbound<T>(session: ScopedSession, fn: (db: Database.Database) => T
   return withInboundDb(session.agent_group_id, session.id, fn);
 }
 
-function parseContent(raw: string): { prompt: string; script: string | null; originSessionId: string | null } {
+function parseContent(raw: string): {
+  prompt: string;
+  script: string | null;
+  scriptHost: boolean;
+  originSessionId: string | null;
+} {
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     return {
       prompt: typeof parsed.prompt === 'string' ? parsed.prompt : '',
       script: typeof parsed.script === 'string' ? parsed.script : null,
+      scriptHost: parsed.scriptHost === true,
       originSessionId: typeof parsed.originSessionId === 'string' ? parsed.originSessionId : null,
     };
   } catch {
     // LEGACY-COMPAT(v1-tasks): plain-string content from rows that predate the
     // JSON envelope. Removable once no pre-v2 session DBs remain in the wild.
-    return { prompt: raw, script: null, originSessionId: null };
+    return { prompt: raw, script: null, scriptHost: false, originSessionId: null };
   }
 }
 
@@ -179,6 +185,7 @@ function toOutput(session: ScopedSession, row: TaskRow) {
     recurrence: row.recurrence,
     prompt: content.prompt.length > 120 ? content.prompt.slice(0, 117) + '...' : content.prompt,
     has_script: content.script ? 1 : 0,
+    script_host: content.scriptHost ? 1 : 0,
     origin_session_id: content.originSessionId, // which session created the task (null for CLI-created)
     created_at: row.timestamp,
     tries: row.tries,
@@ -287,6 +294,15 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   if (!prompt) throw new Error('--prompt is required');
   const recurrence = normalizeNullableString(args.recurrence) ?? null;
   const script = normalizeNullableString(args.script) ?? null;
+  const scriptHost = bool(args.script_host);
+  if (scriptHost && !script) throw new Error('--script-host requires --script');
+  // Host execution is opt-in by a HOST OPERATOR only. The host-side classifier
+  // (classifyForHostExecution) is a regex subset, not a sandbox — for
+  // agent-authored script text the trust boundary has to be who set the flag,
+  // not what the script looks like.
+  if (scriptHost && ctx.caller === 'agent') {
+    throw new Error('--script-host runs the script on the host and can only be set by a host operator');
+  }
   validateRecurrence(recurrence);
   enforceRecurrenceLimit(recurrence, bool(args.dangerously_override_recurrence_limit), script != null);
   const processAfter = firstRunIso(args.process_after, recurrence);
@@ -316,6 +332,7 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
       content: JSON.stringify({
         prompt,
         script,
+        ...(scriptHost ? { scriptHost: true } : {}),
         originSessionId,
         ...(flagIntent && (flagIntent.turnModel || flagIntent.turnEffort) ? { flagIntent } : {}),
         // Physical send suppression, enforced by the agent-runner: chat-kind
@@ -538,6 +555,21 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
     }
   }
   if (script !== undefined) update.script = script;
+  if (args.script_host !== undefined) {
+    const scriptHost = bool(args.script_host);
+    // Same trust boundary as createTask: agents may clear the flag (execution
+    // moves back to the container — strictly safer) but never set it.
+    if (scriptHost && ctx.caller === 'agent') {
+      throw new Error('--script-host runs the script on the host and can only be set by a host operator');
+    }
+    // ponytail: only catches the same-call clear (--script-host true --script none);
+    // a scriptHost=true call that leaves an already-scriptless task alone is a
+    // silent no-op in host-script.ts rather than a hard error — narrower check,
+    // add the existing-row lookup (mirrors the scriptAfter derivation above) if
+    // that gap ever bites in practice.
+    if (scriptHost && script === null) throw new Error('--script-host requires --script');
+    update.scriptHost = scriptHost;
+  }
   const model = str(args.model);
   const effort = str(args.effort);
   if (model !== undefined || effort !== undefined) {
@@ -554,6 +586,19 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   for (const session of selectedSessions(args, ctx)) {
     const result = withInbound(session, (db) => {
       const before = selectTask(db, id);
+      // Close the indirect path to host execution: an agent swapping the
+      // script text on a series a host operator flagged scriptHost would get
+      // its own script run on the host next fire. Unless the same call also
+      // clears the flag, reject.
+      if (
+        ctx.caller === 'agent' &&
+        update.script !== undefined &&
+        update.scriptHost !== false &&
+        before &&
+        parseContent(before.content).scriptHost
+      ) {
+        throw new Error('this series runs its script on the host — an operator must make script changes');
+      }
       const n = updateTask(db, id, update);
       return { before, n };
     });
@@ -775,6 +820,12 @@ registerResource({
           description: 'Pre-task gate script (bash) — see the --script contract above.',
         },
         {
+          name: 'script_host',
+          type: 'boolean',
+          description:
+            'Run --script on the host at fire time instead of in the container — a gated (wakeAgent=false) fire skips the container boot entirely. Requires --script. Only classifier-clean scripts actually run host-side; anything the classifier flags (destructive filesystem ops, destructive SQL/cloud/infra commands) transparently falls back to the normal container execution for that fire.',
+        },
+        {
           name: 'group',
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
@@ -889,6 +940,12 @@ registerResource({
             'Schedule more than 4 fires/day anyway. Only after the user explicitly confirmed they understand the quota/token cost and you agree it is right.',
         },
         { name: 'script', type: 'string', description: 'New pre-task script; "null"/"none" removes it.' },
+        {
+          name: 'script_host',
+          type: 'boolean',
+          description:
+            'Run --script on the host at fire time instead of in the container. Requires the task to have --script set.',
+        },
         {
           name: 'group',
           type: 'string',

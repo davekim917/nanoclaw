@@ -280,6 +280,133 @@ describe('tasks CLI resource', () => {
     expect(cleared.ok).toBe(false);
   });
 
+  it('--script-host round-trips through create, update, and get', async () => {
+    const created = await dispatch(
+      {
+        id: 'ch',
+        command: 'tasks-create',
+        args: {
+          prompt: 'triage queue',
+          name: 'host-gated',
+          group: 'ag-1',
+          recurrence: '*/10 * * * *',
+          script: 'echo {"wakeAgent": false}',
+          script_host: true,
+        },
+      },
+      // Host ctx: agents can no longer SET --script-host (trust boundary,
+      // see the dedicated describe below); clearing it stays agent-allowed.
+      { caller: 'host' },
+    );
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const seriesId = (created.data as { series_id: string }).series_id;
+    expect((created.data as { script_host: number }).script_host).toBe(1);
+
+    const got = await dispatch({ id: 'gh', command: 'tasks-get', args: { id: seriesId } }, agentCtx());
+    expect(got.ok).toBe(true);
+    if (got.ok) expect((got.data as { script_host: number }).script_host).toBe(1);
+
+    const cleared = await dispatch(
+      { id: 'uh', command: 'tasks-update', args: { id: seriesId, script_host: false } },
+      agentCtx(),
+    );
+    expect(cleared.ok).toBe(true);
+    const gotAfter = await dispatch({ id: 'gh2', command: 'tasks-get', args: { id: seriesId } }, agentCtx());
+    expect(gotAfter.ok).toBe(true);
+    if (gotAfter.ok) expect((gotAfter.data as { script_host: number }).script_host).toBe(0);
+  });
+
+  it('--script-host without --script is refused on create and on update', async () => {
+    const created = await dispatch(
+      { id: 'ns', command: 'tasks-create', args: { prompt: 'x', name: 'no-script', script_host: true, group: 'ag-1' } },
+      { caller: 'host' },
+    );
+    expect(created.ok).toBe(false);
+    if (!created.ok) expect(created.error.message).toContain('--script-host requires --script');
+
+    const withScript = await dispatch(
+      {
+        id: 'ws',
+        command: 'tasks-create',
+        args: { prompt: 'x', name: 'has-script', process_after: '2999-01-01T00:00:00Z', script: 'echo ok' },
+      },
+      agentCtx(),
+    );
+    expect(withScript.ok).toBe(true);
+    if (!withScript.ok) return;
+    const seriesId = (withScript.data as { series_id: string }).series_id;
+
+    const badUpdate = await dispatch(
+      { id: 'bu', command: 'tasks-update', args: { id: seriesId, script_host: true, script: 'none', group: 'ag-1' } },
+      { caller: 'host' },
+    );
+    expect(badUpdate.ok).toBe(false);
+    if (!badUpdate.ok) expect(badUpdate.error.message).toContain('--script-host requires --script');
+  });
+
+  it('agents cannot set --script-host, change a host-flagged script, and can only clear the flag', async () => {
+    // Agent tries to SET the flag on create → refused.
+    const agentCreate = await dispatch(
+      {
+        id: 'ac',
+        command: 'tasks-create',
+        args: { prompt: 'x', name: 'agent-host', script: 'echo ok', script_host: true },
+      },
+      agentCtx(),
+    );
+    expect(agentCreate.ok).toBe(false);
+    if (!agentCreate.ok) expect(agentCreate.error.message).toContain('host operator');
+
+    // Host creates a host-flagged series.
+    const hostCreate = await dispatch(
+      {
+        id: 'hc',
+        command: 'tasks-create',
+        args: {
+          prompt: 'x',
+          name: 'host-flagged',
+          group: 'ag-1',
+          process_after: '2999-01-01T00:00:00Z',
+          script: 'echo {"wakeAgent": false}',
+          script_host: true,
+        },
+      },
+      { caller: 'host' },
+    );
+    expect(hostCreate.ok).toBe(true);
+    if (!hostCreate.ok) return;
+    const seriesId = (hostCreate.data as { series_id: string }).series_id;
+
+    // Agent tries to SET the flag on update → refused.
+    const agentSet = await dispatch(
+      { id: 'as', command: 'tasks-update', args: { id: seriesId, script_host: true } },
+      agentCtx(),
+    );
+    expect(agentSet.ok).toBe(false);
+    if (!agentSet.ok) expect(agentSet.error.message).toContain('host operator');
+
+    // Agent tries to swap the SCRIPT on a host-flagged series → refused
+    // (its script text would run on the host next fire).
+    const agentScript = await dispatch(
+      { id: 'asc', command: 'tasks-update', args: { id: seriesId, script: 'echo pwned' } },
+      agentCtx(),
+    );
+    expect(agentScript.ok).toBe(false);
+    if (!agentScript.ok) expect(agentScript.error.message).toContain('operator must make script changes');
+
+    // Agent clearing the flag (with or without a script change) → allowed;
+    // execution moves back to the container, which is strictly safer.
+    const agentClear = await dispatch(
+      { id: 'acl', command: 'tasks-update', args: { id: seriesId, script_host: false, script: 'echo fine' } },
+      agentCtx(),
+    );
+    expect(agentClear.ok).toBe(true);
+    const gotAfter = await dispatch({ id: 'gac', command: 'tasks-get', args: { id: seriesId } }, agentCtx());
+    expect(gotAfter.ok).toBe(true);
+    if (gotAfter.ok) expect((gotAfter.data as { script_host: number }).script_host).toBe(0);
+  });
+
   it('the limit also guards update --recurrence (no create-slow-then-update bypass)', async () => {
     const created = await dispatch(
       { id: 'c', command: 'tasks-create', args: { prompt: 'x', name: 'sneak', recurrence: '0 9 * * *' } },

@@ -105,6 +105,19 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
       continue;
     }
 
+    // Fleet-hardening Phase 1.1: a host-gated fire (content.scriptHost) already
+    // ran this script on the host and wrote its scriptOutput before the
+    // container was even spawned — see runHostGatedTaskScripts in
+    // src/modules/scheduling/host-script.ts. Running it again here would
+    // double-execute a script that may have side effects (state files, API
+    // calls) for no reason. A due row the host classifier routed back to the
+    // container (hard-block/gated script, or scriptHost unset) never carries
+    // scriptOutput and reaches the normal execution path below.
+    if (content.scriptOutput !== undefined) {
+      keep.push(msg);
+      continue;
+    }
+
     log(`running script for task ${msg.id}`);
     touchHeartbeat();
     const result = await runScript(script, msg.id);

@@ -889,7 +889,7 @@ describe('deleteOrphanProcessingClaims', () => {
 });
 
 describe('scheduled due admission precedes wake classification', () => {
-  it('counts and classifies the trigger inserted by the admission seam', () => {
+  it('counts and classifies the trigger inserted by the admission seam', async () => {
     const { inDb } = makeSessionDbs();
     mockAdmitDueTaskContexts.mockImplementationOnce((db: Database.Database) => {
       db.prepare(
@@ -900,7 +900,7 @@ describe('scheduled due admission precedes wake classification', () => {
       return 1;
     });
 
-    const result = _prepareDueWakeForTesting(inDb, 'ag-test', 'sess-test');
+    const result = await _prepareDueWakeForTesting(inDb, 'ag-test', 'sess-test');
 
     expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(inDb, 'ag-test', 'sess-test');
     expect(result).toEqual({ admittedTasks: 1, dueCount: 1, wakePriority: 'scheduled' });
