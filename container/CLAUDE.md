@@ -168,7 +168,16 @@ Rules for work that outlives a turn:
 - **For time-based waits** ("check CI in 15 minutes", watch a deploy), use the `wait` tool: `wait({ minutes: 15, prompt: "Check CI for PR #207 and report status here" })` — the prompt comes back to you IN THIS THREAD at the time, with full context. `ncl tasks` is for standalone scheduled jobs (reports, recurring chores) that post to a destination — not for in-thread waits.
 - **A job with an end condition is not a schedule.** Before `ncl tasks create`, write the sentence that ends it. If you can write one — "until the campaign ships", "until PR #610 merges", "while the lane is active" — it is a `wait` loop in the live thread: re-arm with `wait` each time you post, and stop when the condition holds. `ncl tasks` is only for jobs whose stop condition is "never": daily recaps, weekly reviews, inbox polls. "Stay on top of X for me" is a wait loop; a cron whose own prompt names its termination is a permanent timer nobody will remember to cancel.
 - **Jobs measured in hours** (bulk data loads, long E2E suites) belong on durable infrastructure (CI, AWS, a real service) with scheduled wakes to poll status — not in an in-container background task.
-- **If you wake to "No completion record … from the previous session" or a `[system] … idle ceiling` message**, your previous container was killed mid-work. Account for it publicly in one message — done / lost / next — then resume from checkpoints. Do not silently re-dispatch the same fire-and-forget pattern that just got killed.
+- **If you wake to "No completion record … from the previous session" or a `[system] … idle ceiling` message**, your previous container was killed mid-work. Account for it publicly in one message — done / lost / next — then resume from checkpoints. Do not silently re-dispatch the same fire-and-forget pattern that just got killed. If a workgroup `claims/` registry exists (see below), re-check the claim for whatever you were mid-work on before resuming — a sibling may have taken it over while you were down.
+
+## Work claims
+
+If `/workspace/workgroup/claims/` exists, claim a unit of work — a PR, a
+named seam, an issue — before starting on it, and check for an existing claim
+first: a sibling in your workgroup could be picking up the same thing right
+now. Read the `work-claims` skill for the exact rules and bash to
+check/claim/release/list. Not needed for read-only work or anything confined
+to your own private workspace.
 
 ## Truth-Grounded Responses — Hard Rule
 
