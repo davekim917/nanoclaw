@@ -516,6 +516,54 @@ export const TRANSIENT_OVERLOAD_RESULT_RE =
 const CODEX_EXEC_RE = /\bcodex\s+exec\b/;
 const ALREADY_DEVNULL_STDIN_RE = /<\s*\/dev\/null\b/;
 
+// Two concurrent jest runs will OOM-kill this container no matter how each one
+// is configured. On 2026-08-09 one agent had two background suites going and
+// its container was OOM-killed 109 times in a single session; two siblings hit
+// 46 and 36. Worker sizing (XZO PR #691) bounds ONE run to fit the cgroup, but
+// a run cannot see a sibling process, so the multiplication survives it.
+//
+// The invariant is "one jest at a time in this container", and the mechanical
+// form of that is a lock on the resource, not a rule about intent. `flock -n`
+// fails immediately rather than queueing: a second suite that waits would sit
+// there burning the turn and then die at the idle ceiling anyway, so refusing
+// with a message the agent can act on is strictly better.
+//
+// Deliberately NOT a "did you pass a path filter" check. That polices intent,
+// is trivially lawyered (`--testPathPattern .`), and misses the actual failure —
+// two *small* suites at once OOM just as dead as one big one.
+//
+// The oom_kill delta is the other half. Killed workers surface to jest as
+// ordinary test failures, so an OOM-shredded run reads as "93 tests failed" and
+// an agent chases phantom assertions — the same fail-open shape as every other
+// silent failure this fleet has hit. Reporting the delta turns that into a
+// visible "results void".
+const JEST_RE = /(?:^|[\s;&|(])(?:npx\s+)?jest\b|\bnpm\s+(?:run\s+)?test\b|\byarn\s+(?:run\s+)?test\b/;
+const ALREADY_FLOCKED_RE = /\bflock\b/;
+const JEST_LOCK = '/tmp/.nanoclaw-jest.lock';
+
+/** Serialise jest and report any OOM kills the run took. Exported for tests. */
+export function wrapJestSerialized(command: string): string {
+  // cgroup v2 exposes the counter; when it is absent (v1, or no cgroupfs) the
+  // reads yield empty and the delta is simply skipped rather than failing.
+  const oomRead = `$(awk '/^oom_kill /{print $2}' /sys/fs/cgroup/memory.events 2>/dev/null)`;
+  return [
+    `__nc_oom0=${oomRead};`,
+    `flock -n -E 126 ${JEST_LOCK} bash -c ${JSON.stringify(command)};`,
+    '__nc_rc=$?;',
+    `__nc_oom1=${oomRead};`,
+    // `-E 126` because flock's DEFAULT conflict exit is 1 — the same code jest
+    // returns for ordinary test failures, which would make a refused run and a
+    // red suite indistinguishable. 126 is otherwise unused here.
+    'if [ "$__nc_rc" = 126 ]; then',
+    '  echo "REFUSED: another jest run holds this container\'s test lock. Two concurrent suites OOM-kill the container regardless of worker settings. Wait for it, or kill it, then retry." >&2;',
+    'fi;',
+    'if [ -n "$__nc_oom0" ] && [ -n "$__nc_oom1" ] && [ "$__nc_oom1" -gt "$__nc_oom0" ]; then',
+    '  echo "WARNING: $((__nc_oom1 - __nc_oom0)) worker(s) were OOM-killed during this run — treat the results as VOID, not as test failures. Run a narrower suite." >&2;',
+    'fi;',
+    'exit $__nc_rc',
+  ].join(' ');
+}
+
 export function createSanitizeBashHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
@@ -527,6 +575,12 @@ export function createSanitizeBashHook(): HookCallback {
 
     let rewritten = unsetPrefix + command;
     if (wrapCodexStdin) rewritten = `{ ${rewritten} ; } </dev/null`;
+    // After the codex wrap, so a `codex exec` that itself runs jest keeps its
+    // /dev/null stdin; before returning, so the lock covers the unset prefix's
+    // command too.
+    if (JEST_RE.test(command) && !ALREADY_FLOCKED_RE.test(command)) {
+      rewritten = wrapJestSerialized(rewritten);
+    }
     if (rewritten === command) return {};
 
     return {

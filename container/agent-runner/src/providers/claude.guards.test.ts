@@ -3,6 +3,7 @@ import type { HookCallback, PreToolUseHookInput } from '@anthropic-ai/claude-age
 
 import {
   createSanitizeBashHook,
+  wrapJestSerialized,
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
   createBlockGitCloneHook,
@@ -753,5 +754,68 @@ describe('createBlockSnapshotMutationHook (inline fallback — no core mounted)'
       const r = await runBashHook(createBlockSnapshotMutationHook(), cmd);
       expect(r.permissionDecision).toBe('deny');
     }
+  });
+});
+
+// ── wrapJestSerialized: one jest at a time, and OOM kills reported as void ──
+describe('wrapJestSerialized', () => {
+  it('takes a lock that FAILS rather than queues, with a distinct conflict code', () => {
+    const out = wrapJestSerialized('npx jest');
+    // -E 126: flock's default conflict exit is 1, which is also jest's exit for
+    // ordinary test failures — the two would be indistinguishable.
+    expect(out).toContain('flock -n -E 126 /tmp/.nanoclaw-jest.lock');
+    expect(out).not.toContain('flock -w');
+  });
+
+  it('preserves the real exit code so a red suite still reads as red', () => {
+    expect(wrapJestSerialized('npx jest')).toContain('exit $__nc_rc');
+  });
+
+  it('reports an OOM delta as VOID rather than as test failures', () => {
+    const out = wrapJestSerialized('npx jest');
+    expect(out).toContain('oom_kill');
+    expect(out).toContain('VOID');
+  });
+
+  it('passes the command through a single argument, quoting included', () => {
+    // A naive concatenation would break on the quotes real invocations carry.
+    const out = wrapJestSerialized(`npx jest --testPathPattern "a b"`);
+    expect(out).toContain(JSON.stringify(`npx jest --testPathPattern "a b"`));
+  });
+});
+
+describe('createSanitizeBashHook: jest serialization', () => {
+  const runHook = async (command: string): Promise<string> => {
+    const hook = createSanitizeBashHook();
+    const res = (await hook(
+      { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } } as never,
+      undefined as never,
+      undefined as never,
+    )) as { hookSpecificOutput?: { updatedInput?: { command?: string } } };
+    return res.hookSpecificOutput?.updatedInput?.command ?? command;
+  };
+
+  it('serialises the shapes agents actually type', async () => {
+    for (const cmd of ['npx jest --selectProjects unit', 'npm test', 'npm run test:unit', 'yarn test']) {
+      expect(await runHook(cmd)).toContain('flock -n -E 126');
+    }
+  });
+
+  it('leaves an already-locked command alone rather than nesting locks', async () => {
+    const out = await runHook('flock -n /tmp/mine.lock npx jest');
+    expect(out).not.toContain('/tmp/.nanoclaw-jest.lock');
+  });
+
+  it('does not fire on unrelated commands that merely mention testing', async () => {
+    // "jest" as a bare word in prose, and a test-named script that is not jest.
+    for (const cmd of ['echo "jest is the runner"', 'ls src/__tests__']) {
+      expect(await runHook(cmd)).not.toContain('.nanoclaw-jest.lock');
+    }
+  });
+
+  it('keeps the codex stdin wrap when codex is the one running jest', async () => {
+    const out = await runHook('codex exec --yolo "npm test"');
+    expect(out).toContain('</dev/null');
+    expect(out).toContain('flock -n -E 126');
   });
 });
