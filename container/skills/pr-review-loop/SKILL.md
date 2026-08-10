@@ -5,7 +5,7 @@ description: Drive a PR to merge through Codex's automated review in batched rou
 
 # PR review loop
 
-Codex (`chatgpt-codex-connector[bot]`) re-reviews every new head commit and files fresh inline comments as it sees fit. Worked one comment at a time, that is an unbounded loop: patch → new review → patch → new review. Worked in rounds, it converges in two or three.
+Codex (`chatgpt-codex-connector[bot]`) reviews a PR when it opens, and afterwards decides for itself whether a new head commit warrants another look. Worked one comment at a time, that is an unbounded loop: patch → new review → patch → new review. Worked in rounds, it converges in two or three.
 
 **The whole skill is one rule: a round is a batch.** Collect every unresolved comment, decide on all of them, fix all the accepted ones in one commit, push once. Never push a commit for a single comment.
 
@@ -24,11 +24,9 @@ a round, the count still wins.
 
 A round is one full batch, and only batched rounds count. Ten pushes of one comment each are not ten rounds of evidence — they're one round stretched over ten pushes, which is the most common way this loop runs away.
 
-Track the round number and say it out loud in each status message.
-
-Rounds are now something you RECEIVE, not something you spend. Track how many
-have arrived and say it out loud in each status message — the count is evidence
-about the change, not a budget.
+Rounds are something you RECEIVE, not something you spend. Track how many have
+arrived and say it out loud in each status message — the count is evidence about
+the change, not a budget.
 
 - **Rounds 1–2** — normal. Batch, fix, push, wait.
 - **Round 3** — before pushing, reread the entire diff yourself and run the full
@@ -130,7 +128,7 @@ Commit and push once — `git_commit` / `git_push` if you have those MCP tools, 
 
 One commit per round, not per comment. If a finding needs a design decision from the user, leave it out of the batch and say so — keep that thread open rather than stalling the other fixes on it. `codex-review.sh status` reports it in `open=`, so it can't be forgotten at merge time.
 
-Capture the head SHA and a timestamp from **before** you request the review — the timestamp is what filters out the previous round's stale 👍:
+Capture the head SHA and a timestamp from **before** you push — the timestamp is what filters out the previous round's stale 👍:
 
 ```bash
 SHA=$(git rev-parse HEAD)
@@ -149,14 +147,17 @@ codex-review.sh resolve "$THREAD_ID"
 
 Resolve only what you actually replied to. Resolving a thread you didn't answer hides the finding instead of closing it.
 
-## Step 5 — Ask for exactly one re-review
+## Step 5 — Let the reviewer decide
 
-One `@codex review` comment per round, after the whole batch is pushed:
+The batch is pushed. Do not comment `@codex review`. Codex sees the new head and
+decides for itself whether it warrants another look — that judgment is the thing
+keeping this loop finite, and a request overrides it.
+
+Post the round summary as a plain comment if it is useful to a human reader —
+just never with the trigger phrase in it:
 
 ```bash
-gh pr comment "$PR" --repo "$REPO" --body "@codex review
-
-Round <n>. Batched fixes at ${SHA:0:8}: <one line>. Rejected with evidence: <one line>. Please review the full head, not the individual threads."
+gh pr comment "$PR" --repo "$REPO" --body "Round <n>. Batched fixes at ${SHA:0:8}: <one line>. Rejected with evidence: <one line>."
 ```
 
 Then wait on `codex=`:
@@ -173,11 +174,20 @@ Reviews take minutes, so how you wait depends on where you're running:
   ```
 - **On a host session:** just re-run `status` between other work, or poll it on an interval. There's no idle ceiling to lose the loop to.
 
-`codex=findings` → back to step 1, increment the round. `codex=pending` → wait again.
+`codex=findings` → back to step 1, increment the round.
+
+**`codex=pending` is not a permanent state to sit in.** Now that nobody asks
+for the review, a head the reviewer declined to look at never produces a
+verdict — it stays `pending` forever, and a loop that waits for one waits until
+the container dies. So bound it: after **20 minutes** of `pending` with CI green
+and `open=0`, the reviewer has declined, and a declined re-review is a merge
+signal, not a missing one. Say that is what you concluded, and merge.
 
 ## Step 6 — Merge
 
-Merge on `codex=clean open=0`, and not before. `codex=clean` alone is only the reviewer's verdict on the last commit; `open=0` is what says nothing is still outstanding.
+Merge on `open=0` plus either `codex=clean` or a bounded decline (above). Never
+on `open=0` alone: that says nothing is outstanding, not that the last commit was
+looked at.
 
 ```bash
 gh pr merge "$PR" --repo "$REPO" --squash --delete-branch
@@ -189,8 +199,9 @@ Then run whatever post-PR bookkeeping your environment expects — e.g. `add_shi
 
 ## Anti-patterns
 
-- **One comment, one commit, one `@codex review`.** The loop that never ends. Batch or don't push.
-- **Pinging `@codex review` while a review is already running.** You get a second review of a moving head and twice the comments.
+- **One comment, one commit, one push.** The loop that never ends. Batch or don't push.
+- **Commenting `@codex review` at all.** It overrides the reviewer's own judgment about whether the commit needed a look, and every one you send is a round you then have to work.
+- **Treating a review you asked for as evidence the change is troubled.** It is evidence you asked.
 - **Replying without resolving.** Next round you re-triage threads you already answered.
 - **Rejecting to save a round.** A rejection without a traced `file:line` is an accept you skipped.
 - **Editing a test so a review comment passes.** The test is the contract; change it only when the user changes the contract.
