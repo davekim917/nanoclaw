@@ -28,7 +28,9 @@ const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
-import { resolveSession, outboundDbPath, openInboundDb } from './session-manager.js';
+import { resolveSession, resolveTaskSession, outboundDbPath, openInboundDb } from './session-manager.js';
+import { getTaskThreadAnchor, setTaskThreadAnchor } from './db/task-thread-anchors.js';
+import { getDb } from './db/connection.js';
 import {
   clearSessionStatusOnKill,
   deliverSessionMessages,
@@ -1126,5 +1128,141 @@ describe('per-turn channel-root threading', () => {
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: 'thr-9' }]);
+  });
+});
+
+describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
+  // Task sessions have messaging_group_id = null, so origin-chat delivery
+  // permission doesn't apply — grant the explicit agent_destinations row the
+  // permission check requires instead.
+  function grantChannelDestination(agentGroupId: string, messagingGroupId: string): void {
+    getDb()
+      .prepare(
+        `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+         VALUES (?, 'main', 'channel', ?, ?)`,
+      )
+      .run(agentGroupId, messagingGroupId, now());
+  }
+
+  function insertTaskChat(
+    agentGroupId: string,
+    sessionId: string,
+    msgId: string,
+    ts: string,
+    threadId: string | null = null,
+  ): void {
+    const db = new Database(outboundDbPath(agentGroupId, sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
+       VALUES (?, ?, 'chat', 'telegram:123', 'telegram', ?, ?, ?)`,
+    ).run(msgId, ts, threadId, `task-fire-${msgId}`, JSON.stringify({ text: msgId }));
+    db.close();
+  }
+
+  it('first post: no anchor yet — posts at root and stores the anchor', async () => {
+    seedAgentAndChannel();
+    grantChannelDestination('ag-1', 'mg-1');
+    const { session } = resolveTaskSession('ag-1', 'series-1');
+    insertTaskChat('ag-1', session.id, 'out-1', '2026-08-10T09:00:00.000Z');
+
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        return 'plat-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }]);
+    const anchor = getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
+    expect(anchor).toEqual({ threadPlatformId: 'plat-1', createdAt: expect.any(String) });
+  });
+
+  it('second post same UTC day: threads under the stored anchor', async () => {
+    seedAgentAndChannel();
+    grantChannelDestination('ag-1', 'mg-1');
+    const { session } = resolveTaskSession('ag-1', 'series-1');
+    setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', '2026-08-10T09:00:00.000Z');
+    insertTaskChat('ag-1', session.id, 'out-2', '2026-08-10T15:00:00.000Z');
+
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        return 'plat-2';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'telegram:123:plat-1' }]);
+    // Threading under an existing anchor must not overwrite it.
+    const anchor = getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
+    expect(anchor?.threadPlatformId).toBe('plat-1');
+  });
+
+  it('day rollover: posts a fresh root message and replaces the anchor', async () => {
+    seedAgentAndChannel();
+    grantChannelDestination('ag-1', 'mg-1');
+    const { session } = resolveTaskSession('ag-1', 'series-1');
+    setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', '2026-08-09T09:00:00.000Z');
+    insertTaskChat('ag-1', session.id, 'out-3', '2026-08-10T09:00:00.000Z');
+
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        return 'plat-3';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }]);
+    const anchor = getTaskThreadAnchor(session.id, 'telegram', 'telegram:123');
+    expect(anchor?.threadPlatformId).toBe('plat-3');
+  });
+
+  it('interactive (non-task) session posts are never anchored in task_thread_anchors', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const db = new Database(outboundDbPath('ag-1', session.id));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
+       VALUES ('out-1', '2026-08-10T09:00:00.000Z', 'chat', 'telegram:123', 'telegram', NULL, 'turn-A', ?)`,
+    ).run(JSON.stringify({ text: 'out-1' }));
+    db.close();
+
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
+  });
+
+  it('a task post that already targets an explicit thread is left untouched (not anchored)', async () => {
+    seedAgentAndChannel();
+    grantChannelDestination('ag-1', 'mg-1');
+    const { session } = resolveTaskSession('ag-1', 'series-1');
+    insertTaskChat('ag-1', session.id, 'out-1', '2026-08-10T09:00:00.000Z', 'thr-9');
+
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        return 'plat-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'thr-9' }]);
+    expect(getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
   });
 });

@@ -19,6 +19,12 @@ import {
 } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import {
+  getTaskThreadAnchor,
+  setTaskThreadAnchor,
+  deleteTaskThreadAnchor,
+  anchorRotationKey,
+} from './db/task-thread-anchors.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import {
   getDueOutboundMessages,
@@ -189,13 +195,15 @@ function isDiscordChannelType(channelType: string): boolean {
  * thread parent; later messages of the same turn reply under it instead of
  * each landing as a separate top-level post.
  *
- * This is the only correct fix for scheduled-task sessions: a scheduled task
- * MUST stay thread-unbound (binding it to a thread would tie its lifetime to
- * a session that dies), so the anchor lives delivery-side, keyed by the
- * turn's `in_reply_to`. Each fire of a recurring task gets a fresh inbound
- * id, so a long-lived poller (e.g. the every-15-min inbox poller) starts a
- * NEW thread every fire rather than chaining days of output under one
- * ancient root post.
+ * Turn-scoped and in-memory on purpose: a scheduled task MUST stay
+ * thread-unbound (binding it to a thread would tie its lifetime to a session
+ * that dies), and within one fire this is the right fix — the anchor lives
+ * delivery-side, keyed by the turn's `in_reply_to`. It does NOT survive
+ * across fires (each fire gets a fresh inbound id, so a new turn always
+ * resets it) — that's `task_thread_anchors` (db/task-thread-anchors.ts), a
+ * persistent, rotating anchor keyed by (session, destination). Task-session
+ * posts use that one instead; this one only ever engages for everything
+ * else (see `taskAnchorEligible` / `turnAnchorEligible` in deliverMessage).
  *
  * Sessions already bound to a thread (per-thread channel replies carry a
  * non-null `thread_id`) are untouched — the anchor only engages when
@@ -923,17 +931,39 @@ async function deliverMessage(
   // thinking bubble remains a single growing message; only the final
   // answer separates out into its own message at the bottom.
 
-  // Per-turn channel-root threading (see ChatThreadAnchor above). Only
-  // engages when the agent didn't already target a thread (thread_id null)
-  // and the turn has an inbound anchor (in_reply_to set). The first message
-  // of the turn posts at root and is recorded below; later messages of the
-  // same turn reply under it so a scheduled task's follow-ups thread instead
-  // of stacking as separate top-level posts.
   const baseThreadId = msg.thread_id && msg.thread_id.length > 0 ? msg.thread_id : null;
-  const anchorEligible = baseThreadId === null && msg.in_reply_to != null;
+
+  // Rolling task-session thread anchor (fleet-hardening Phase 1.4). A task
+  // session is 1:1 with a series (thread_id = system:tasks:<seriesId>, see
+  // resolveTaskSession) and lives for the series' whole life, but each fire
+  // is a fresh turn with a fresh in_reply_to — so the per-turn anchor below
+  // resets every fire, and every fire minted a brand-new top-level post
+  // (and, on Slack, a brand-new thread every wired sibling had to re-notice).
+  // task_thread_anchors persists the anchor ACROSS fires instead, keyed by
+  // (session, destination) in the central DB, and rotates to a fresh
+  // top-level post once `anchorRotationKey` disagrees (default: UTC day
+  // change). Scoped to task sessions with no explicit thread_id — an
+  // agent-targeted thread (baseThreadId set) is always left untouched.
+  const isTaskSessionPost = session.messaging_group_id === null && isTaskThread(session.thread_id);
+  const taskAnchorEligible = isTaskSessionPost && baseThreadId === null;
+
+  // Per-turn channel-root threading (see ChatThreadAnchor above) — everything
+  // that isn't a task-session post. Only engages when the agent didn't
+  // already target a thread (thread_id null) and the turn has an inbound
+  // anchor (in_reply_to set). The first message of the turn posts at root
+  // and is recorded below; later messages of the same turn reply under it.
+  const turnAnchorEligible = !taskAnchorEligible && baseThreadId === null && msg.in_reply_to != null;
+
   let effectiveThreadId = baseThreadId;
   let usedAnchor = false;
-  if (anchorEligible && chatThreadAnchorDisabled.get(session.id) !== msg.in_reply_to) {
+  if (taskAnchorEligible) {
+    const anchor = getTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
+    if (anchor && anchorRotationKey(anchor.createdAt) === anchorRotationKey(new Date().toISOString())) {
+      // Same encoding as the turn anchor below: `<platform-address>:<thread>`.
+      effectiveThreadId = `${msg.platform_id}:${anchor.threadPlatformId}`;
+      usedAnchor = true;
+    }
+  } else if (turnAnchorEligible && chatThreadAnchorDisabled.get(session.id) !== msg.in_reply_to) {
     const anchor = chatThreadAnchor.get(session.id);
     if (
       anchor &&
@@ -978,18 +1008,23 @@ async function deliverMessage(
     // shares its snowflake, but when none was created the encoded id resolves to
     // nothing. Never let that cost the message: post at root instead.
     //
-    // Also record that anchoring is off for the REST OF THIS TURN, so the
-    // remaining messages go straight to root rather than each paying a failed
-    // call. Keyed by in_reply_to, so the next turn retries — a transient error
-    // costs one turn of threading, not the session's.
-    log.warn('Threaded delivery under turn anchor failed — posting at root', {
+    // Also record that anchoring is off for the REST OF THIS TURN (turn anchor)
+    // or drop the stale anchor outright (task anchor — the next fire just
+    // starts a fresh one), so the remaining messages go straight to root
+    // rather than each paying a failed call.
+    log.warn('Threaded delivery under anchor failed — posting at root', {
       id: msg.id,
       sessionId: session.id,
+      taskAnchor: taskAnchorEligible,
       attemptedThreadId: effectiveThreadId,
       err: err instanceof Error ? err.message : String(err),
     });
-    chatThreadAnchor.delete(session.id);
-    chatThreadAnchorDisabled.set(session.id, msg.in_reply_to as string);
+    if (taskAnchorEligible) {
+      deleteTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id);
+    } else {
+      chatThreadAnchor.delete(session.id);
+      chatThreadAnchorDisabled.set(session.id, msg.in_reply_to as string);
+    }
     effectiveThreadId = null;
     usedAnchor = false;
     platformMsgId = await deliveryAdapter.deliver(
@@ -1003,17 +1038,21 @@ async function deliverMessage(
     );
   }
 
-  // Record the turn's first root post as the anchor for its follow-ups. Only
-  // when we actually posted at root (effectiveThreadId still null) — a message
-  // that already threaded under an existing anchor must not overwrite it, or
-  // the third message would chain off the second instead of the first.
-  if (anchorEligible && effectiveThreadId === null && platformMsgId) {
-    chatThreadAnchor.set(session.id, {
-      inReplyTo: msg.in_reply_to as string,
-      channelType: msg.channel_type,
-      platformId: msg.platform_id,
-      messageId: platformMsgId,
-    });
+  // Record a fresh root post as the anchor for what follows. Only when we
+  // actually posted at root (effectiveThreadId still null) — a message that
+  // already threaded under an existing anchor must not overwrite it, or the
+  // next post would chain off it instead of the original root.
+  if (effectiveThreadId === null && platformMsgId) {
+    if (taskAnchorEligible) {
+      setTaskThreadAnchor(session.id, msg.channel_type, msg.platform_id, platformMsgId, new Date().toISOString());
+    } else if (turnAnchorEligible) {
+      chatThreadAnchor.set(session.id, {
+        inReplyTo: msg.in_reply_to as string,
+        channelType: msg.channel_type,
+        platformId: msg.platform_id,
+        messageId: platformMsgId,
+      });
+    }
   }
   log.info('Message delivered', {
     id: msg.id,
