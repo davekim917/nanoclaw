@@ -31,14 +31,37 @@ the change, not a budget.
 - **Rounds 1–2** — normal. Batch, fix, push, wait.
 - **Round 3** — before pushing, reread the entire diff yourself and run the full
   suite. Land your own findings in the same batch.
-- **Third arriving review and still not converging** — stop and diagnose out
-  loud before touching code. Post your read to the PR thread and mention the PR
-  owner and whoever owns release calls in this deployment: the trend (same subsystem? same invariant? severity flat or
-  rising?) and which of the three cases below you think you are in. Then act on
-  that diagnosis. What you must not do is push another patch because a patch is
-  what you pushed last time — "address the Nth review" as a commit message is
-  the anti-pattern this skill exists to stop, and it is how #299 reached round
-  18.
+- **Third arriving review and still not converging** — first ask whether the
+  findings actually block anything (below). A trend of non-blocking findings is
+  not an escalation; it is a queue of things to record so the PR can move.
+  If the trend IS in the blocking class — same subsystem, same invariant,
+  severity flat or rising — stop and diagnose out loud before touching code.
+  Post your read to the PR thread and mention the PR owner and whoever owns
+  release calls in this deployment, then act on that diagnosis. What you must
+  not do is push another patch because a patch is what you pushed last time —
+  "address the Nth review" as a commit message is the anti-pattern this skill
+  exists to stop, and it is how #299 reached round 18.
+
+### Correct is not the test — blocking is
+
+**Most findings should not stop a merge, including real ones.** A reviewer's
+job on a PR is to catch what is glaringly destructive, not to perfect a diff.
+Quality comes from the whole gauntlet — automated review, QA, humans using the
+thing — and a PR held at round 4 over granular findings is a PR nobody can
+exercise. That trade is backwards, and it is the single most expensive habit
+this skill can teach you.
+
+- **Blocks — destructive.** Data loss or corruption; money computed, moved or
+  reported wrong; tenant or scope isolation breached; auth or permission
+  bypassed; credentials exposed; a migration with no undo. These block at any
+  round and no deadline lowers the bar.
+- **Does not block — record it and merge.** Everything else, including real
+  defects that are narrow, cosmetic, adjacent, pre-existing, or hardening
+  niceties. Record the finding wherever this deployment collects them, link it
+  from the thread, resolve the thread, merge.
+
+State the classification in one line in the thread. An unnamed call cannot be
+overruled, and a human overruling you is the point.
 
 There is no round number that forbids a push. There used to be, and it froze
 four PRs with CI green — one with every thread already resolved — because the
@@ -130,7 +153,9 @@ One commit per round, not per comment. If a finding needs a design decision from
 
 **A finding that belongs to a different change gets tracked, then resolved — not left open.** Some accepted findings are real and correctly not fixed here: the defect is cross-cutting, or the fix lands on another PR, or it is one instance of a pattern already filed as an issue. Reply with the trace and the issue or PR that owns it, link this thread from there, then **resolve the thread**. An open thread is a merge blocker with no owner and nobody woken to clear it — the tracking issue is what carries the finding forward, and it carries it better than a thread on a PR that merged. Leave a thread open only when the answer must arrive on THIS PR before it ships.
 
-**"Tracked" means something will pick it up.** Filing an issue is not tracking if no queue polls its labels and no human is assigned — that is the same finding, moved somewhere quieter. Before you resolve on a tracking link, check that the issue carries whatever label the fix queue in this deployment actually selects on, or name an assignee. The failure this prevents, observed: a cross-cutting P1 that two separate PRs deferred to with good traces, filed under a label no queue polled, unassigned and with no PR twenty hours later — while both PRs stayed blocked on the fix it was supposed to be carrying.
+**"Tracked" means something will pick it up.** A record is not tracking if nothing sweeps it and nobody is assigned — that is the same finding, moved somewhere quieter. The destination depends on the class: a **blocking-class** finding needs an issue carrying whatever label this deployment's fix queue selects on, or a named assignee; a **non-blocking** one belongs in the shared record the deployment sweeps, not its own issue — one issue per nit rebuilds the jam somewhere cheaper to ignore. Check which exists here before you resolve on a link.
+
+The failure this prevents, observed: a cross-cutting P1 that two separate PRs deferred to with good traces, filed under a label no queue polled, unassigned and with no PR twenty hours later — while both PRs stayed blocked on the fix it was supposed to be carrying.
 
 Capture the head SHA and a timestamp from **before** you push — the timestamp is what filters out the previous round's stale 👍:
 
