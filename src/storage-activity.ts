@@ -131,36 +131,67 @@ export function tryRunWithStorageCleanupClaim(resourceRoot: string, action: () =
   }
 }
 
-function resourceRoots(): string[] {
-  const roots: string[] = [];
-  const sessionsRoot = path.join(DATA_DIR, 'v2-sessions');
+function realDirectory(dirPath: string): boolean {
+  try {
+    const stat = fs.lstatSync(dirPath);
+    return stat.isDirectory() && !stat.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Enumerate every resource that can carry a storage-activity lease.
+ *
+ * Thread worktrees exist in both layouts:
+ *   flat:   v2-threads/<thread>/worktrees
+ *   nested: v2-threads/wg-<workgroup>/<thread>/worktrees
+ *
+ * Startup cleanup must cover both. Missing the nested layout leaves markers
+ * behind after a forced host stop, which then makes every future cache action
+ * for that thread safely skip forever.
+ */
+function resourceRoots(dataDir: string = DATA_DIR): string[] {
+  const roots = new Set<string>();
+  const sessionsRoot = path.join(dataDir, 'v2-sessions');
   try {
     for (const group of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
-      if (!group.isDirectory()) continue;
+      if (!group.isDirectory() || group.isSymbolicLink()) continue;
       const groupPath = path.join(sessionsRoot, group.name);
       for (const session of fs.readdirSync(groupPath, { withFileTypes: true })) {
-        if (session.isDirectory()) roots.push(path.join(groupPath, session.name));
+        if (session.isDirectory() && !session.isSymbolicLink()) roots.add(path.join(groupPath, session.name));
       }
     }
   } catch {
     // Fresh installs have no session root yet.
   }
 
-  const threadsRoot = path.join(DATA_DIR, 'v2-threads');
+  const threadsRoot = path.join(dataDir, 'v2-threads');
   try {
-    for (const thread of fs.readdirSync(threadsRoot, { withFileTypes: true })) {
-      if (!thread.isDirectory()) continue;
-      roots.push(path.join(threadsRoot, thread.name, 'worktrees'));
+    for (const topLevel of fs.readdirSync(threadsRoot, { withFileTypes: true })) {
+      if (!topLevel.isDirectory() || topLevel.isSymbolicLink()) continue;
+      const topLevelPath = path.join(threadsRoot, topLevel.name);
+      const flatWorktrees = path.join(topLevelPath, 'worktrees');
+      if (realDirectory(flatWorktrees)) {
+        roots.add(flatWorktrees);
+        continue;
+      }
+
+      for (const thread of fs.readdirSync(topLevelPath, { withFileTypes: true })) {
+        if (!thread.isDirectory() || thread.isSymbolicLink()) continue;
+        const nestedWorktrees = path.join(topLevelPath, thread.name, 'worktrees');
+        if (realDirectory(nestedWorktrees)) roots.add(nestedWorktrees);
+      }
     }
   } catch {
     // Thread worktrees are optional.
   }
-  return roots;
+  return [...roots];
 }
 
 /** Remove claims left by a terminated worker without disturbing live leases. */
-export function clearStorageCleanupClaims(): void {
-  for (const resourceRoot of resourceRoots()) {
+export function clearStorageCleanupClaims(dataDir: string = DATA_DIR): void {
+  for (const resourceRoot of resourceRoots(dataDir)) {
     fs.rmSync(cleanupClaimPath(resourceRoot), { force: true });
   }
 }
@@ -169,8 +200,8 @@ export function clearStorageCleanupClaims(): void {
  * Startup-only reset, called after orphan containers have been stopped. At
  * that point every marker and cleanup claim left by the previous host is stale.
  */
-export function resetStorageActivityState(): void {
-  for (const resourceRoot of resourceRoots()) {
+export function resetStorageActivityState(dataDir: string = DATA_DIR): void {
+  for (const resourceRoot of resourceRoots(dataDir)) {
     fs.rmSync(cleanupClaimPath(resourceRoot), { force: true });
     fs.rmSync(activeDirPath(resourceRoot), { recursive: true, force: true });
   }

@@ -1699,6 +1699,7 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
       actualMb: Math.round(actualReclaimedBytes / 1024 / 1024),
       actions: actionReports.length,
       failedActions: actionReports.filter((a) => a.status === 'failed').length,
+      skippedActions: actionReports.filter((a) => a.status === 'skipped').length,
       skipped,
     });
   }

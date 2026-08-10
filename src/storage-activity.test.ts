@@ -4,7 +4,12 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { acquireStorageActivityLease, tryRunWithStorageCleanupClaim } from './storage-activity.js';
+import {
+  acquireStorageActivityLease,
+  clearStorageCleanupClaims,
+  resetStorageActivityState,
+  tryRunWithStorageCleanupClaim,
+} from './storage-activity.js';
 
 const roots: string[] = [];
 
@@ -70,5 +75,31 @@ describe('storage activity leases', () => {
 
     expect(() => tryRunWithStorageCleanupClaim(root, () => {})).toThrow('disk full');
     expect(fs.existsSync(path.join(root, '.nanoclaw-storage-cleanup'))).toBe(false);
+  });
+
+  it('resets stale activity markers and claims in both flat and nested thread layouts', () => {
+    const dataDir = tempRoot();
+    const flat = path.join(dataDir, 'v2-threads', 'thread-flat', 'worktrees');
+    const nested = path.join(dataDir, 'v2-threads', 'wg-example', 'thread-nested', 'worktrees');
+    const session = path.join(dataDir, 'v2-sessions', 'ag-example', 'sess-example');
+    const rootsToReset = [flat, nested, session];
+
+    for (const root of rootsToReset) {
+      fs.mkdirSync(path.join(root, '.nanoclaw-storage-active'), { recursive: true });
+      fs.writeFileSync(path.join(root, '.nanoclaw-storage-active', 'stale-holder'), '1234\n');
+      fs.writeFileSync(path.join(root, '.nanoclaw-storage-cleanup'), '{"pid":1234}');
+    }
+
+    clearStorageCleanupClaims(dataDir);
+    for (const root of rootsToReset) {
+      expect(fs.existsSync(path.join(root, '.nanoclaw-storage-cleanup'))).toBe(false);
+      expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(true);
+    }
+
+    resetStorageActivityState(dataDir);
+    for (const root of rootsToReset) {
+      expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(false);
+      expect(fs.existsSync(path.join(root, '.nanoclaw-storage-cleanup'))).toBe(false);
+    }
   });
 });
