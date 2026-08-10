@@ -5,6 +5,7 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   findTaskSessions,
@@ -32,6 +33,7 @@ import {
   validateRecurrence,
 } from '../../modules/scheduling/create.js';
 import { resolveTaskFlagIntent } from '../../modules/scheduling/task-flags.js';
+import { writeAudit } from '../../dashboard/api/scheduled-shared.js';
 import { inboundDbPath, resolveTaskSession, withInboundDb } from '../../session-manager.js';
 import { formatLocalStamp, parseZonedToUtc } from '../../timezone.js';
 import { registerResource } from '../crud.js';
@@ -76,6 +78,18 @@ function str(value: unknown): string | undefined {
 
 function bool(value: unknown): boolean {
   return value === true || value === 'true' || value === '1';
+}
+
+/**
+ * scheduled_audit actor string — the best identity CallerContext actually
+ * carries. Neither transport threads a human user_id through to the CLI
+ * dispatch layer (the host socket's auth boundary is the 0600 socket file
+ * itself, socket-server.ts; an agent caller is identified by its own group),
+ * so unlike the dashboard's `ctx.user.id`, "host" and "agent:<group>" are all
+ * that's available here — never invented.
+ */
+function actorFor(ctx: CallerContext): string {
+  return ctx.caller === 'agent' ? `agent:${ctx.agentGroupId}` : 'host';
 }
 
 function firstRunIso(value: unknown, recurrence: string | null): string {
@@ -319,6 +333,16 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   });
   if (!created) throw new Error('task system session inbound.db not found');
   touchSessionActivity(session.id);
+  writeAudit(getDb(), {
+    actor: actorFor(ctx),
+    action: 'create',
+    agentGroupId: session.agent_group_id,
+    sessionId: session.id,
+    seriesId: id,
+    after: prompt,
+    ...(script !== null ? { scriptAfter: script } : {}),
+    detail: { recurrence, processAfter },
+  });
   const output = toOutput(session, created);
   return routingNote ? { ...output, routing_note: routingNote } : output;
 }
@@ -446,6 +470,7 @@ function getTask(args: Record<string, unknown>, ctx: CallerContext) {
 function mutateTask(
   args: Record<string, unknown>,
   ctx: CallerContext,
+  action: 'pause' | 'resume' | 'delete' | 'cancel',
   fn: (db: Database.Database, id: string) => number,
 ) {
   const id = taskId(args);
@@ -453,7 +478,19 @@ function mutateTask(
   for (const session of selectedSessions(args, ctx)) {
     const n = withInbound(session, (db) => fn(db, id)) ?? 0;
     // Quiet-cache/delivery-horizon invalidation — see touchSessionActivity.
-    if (n > 0) touchSessionActivity(session.id);
+    if (n > 0) {
+      touchSessionActivity(session.id);
+      // No before/after body: pause/resume/delete/cancel don't touch the
+      // prompt, matching the dashboard's own pause/resume/cancel audit rows
+      // (scheduled-mutations.ts) — a status-only change is the "after" here.
+      writeAudit(getDb(), {
+        actor: actorFor(ctx),
+        action,
+        agentGroupId: session.agent_group_id,
+        sessionId: session.id,
+        seriesId: id,
+      });
+    }
     touched += n;
   }
   if (touched === 0) throw new Error(`no live task matched: ${id}`);
@@ -515,8 +552,30 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
 
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
-    const n = withInbound(session, (db) => updateTask(db, id, update)) ?? 0;
-    if (n > 0) touchSessionActivity(session.id);
+    const result = withInbound(session, (db) => {
+      const before = selectTask(db, id);
+      const n = updateTask(db, id, update);
+      return { before, n };
+    });
+    if (!result) continue;
+    const { before, n } = result;
+    if (n > 0) {
+      touchSessionActivity(session.id);
+      writeAudit(getDb(), {
+        actor: actorFor(ctx),
+        action: 'update',
+        agentGroupId: session.agent_group_id,
+        sessionId: session.id,
+        seriesId: id,
+        before: before ? parseContent(before.content).prompt : undefined,
+        ...(update.prompt !== undefined ? { after: update.prompt } : {}),
+        ...(update.script !== undefined && update.script !== null ? { scriptAfter: update.script } : {}),
+        detail: {
+          ...(update.recurrence !== undefined ? { recurrence: update.recurrence } : {}),
+          ...(update.processAfter !== undefined ? { processAfter: update.processAfter } : {}),
+        },
+      });
+    }
     touched += n;
   }
   if (touched === 0) throw new Error(`no live task matched: ${id}`);
@@ -525,12 +584,30 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
 
 function cancelTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
   if (!bool(args.all)) {
-    return mutateTask(args, ctx, cancelTask);
+    return mutateTask(args, ctx, 'cancel', cancelTask);
   }
 
   let touched = 0;
   for (const session of selectedSessions(args, ctx)) {
-    touched += withInbound(session, cancelAllTasks) ?? 0;
+    const result = withInbound(session, (db) => {
+      const seriesIds = selectLiveTasks(db).map((r) => r.series_id ?? r.row_id);
+      return { seriesIds, n: cancelAllTasks(db) };
+    });
+    if (!result) continue;
+    if (result.n > 0) {
+      touchSessionActivity(session.id);
+      for (const seriesId of result.seriesIds) {
+        writeAudit(getDb(), {
+          actor: actorFor(ctx),
+          action: 'cancel',
+          agentGroupId: session.agent_group_id,
+          sessionId: session.id,
+          seriesId,
+          detail: { bulk: true },
+        });
+      }
+    }
+    touched += result.n;
   }
   return { cancelled: touched };
 }
@@ -568,6 +645,13 @@ function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
     });
     if (fired) {
       touchSessionActivity(session.id);
+      writeAudit(getDb(), {
+        actor: actorFor(ctx),
+        action: 'run_now',
+        agentGroupId: session.agent_group_id,
+        sessionId: session.id,
+        seriesId: fired.series_id,
+      });
       return fired;
     }
   }
@@ -866,7 +950,7 @@ registerResource({
         },
         { name: 'session', type: 'string', description: 'Limit to one task session id.' },
       ],
-      handler: async (args, ctx) => mutateTask(args, ctx, pauseTask),
+      handler: async (args, ctx) => mutateTask(args, ctx, 'pause', pauseTask),
     },
     resume: {
       access: 'open',
@@ -880,7 +964,7 @@ registerResource({
         },
         { name: 'session', type: 'string', description: 'Limit to one task session id.' },
       ],
-      handler: async (args, ctx) => mutateTask(args, ctx, resumeTask),
+      handler: async (args, ctx) => mutateTask(args, ctx, 'resume', resumeTask),
     },
     delete: {
       access: 'open',
@@ -894,7 +978,7 @@ registerResource({
         },
         { name: 'session', type: 'string', description: 'Limit to one task session id.' },
       ],
-      handler: async (args, ctx) => mutateTask(args, ctx, deleteTask),
+      handler: async (args, ctx) => mutateTask(args, ctx, 'delete', deleteTask),
     },
   },
 });

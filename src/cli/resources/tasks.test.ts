@@ -21,7 +21,7 @@ vi.mock('../../container-runner.js', () => ({
 
 const TEST_DIR = '/tmp/nanoclaw-test-cli-tasks';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
 import { countDueMessages } from '../../db/session-db.js';
@@ -869,6 +869,167 @@ describe('tasks CLI resource', () => {
       db.close();
       const content = JSON.parse(row.content);
       expect(content.flagIntent).toEqual({ turnModel: 'sonnet', turnEffort: 'low' });
+    });
+  });
+
+  describe('scheduled_audit trail (fleet-hardening Phase 0.2)', () => {
+    function auditRows(seriesId: string) {
+      return getDb()
+        .prepare(
+          'SELECT actor, action, agent_group_id, session_id, series_id, before_hash, after_hash, ts ' +
+            'FROM scheduled_audit WHERE series_id = ? ORDER BY id ASC',
+        )
+        .all(seriesId) as Array<{
+        actor: string;
+        action: string;
+        agent_group_id: string;
+        session_id: string;
+        series_id: string;
+        before_hash: string | null;
+        after_hash: string | null;
+        ts: string;
+      }>;
+    }
+
+    it('create writes one audit row: actor is the calling agent group, action create, after set', async () => {
+      const r = await dispatch(
+        {
+          id: 'a-c',
+          command: 'tasks-create',
+          args: { prompt: 'send a briefing', name: 'audited', process_after: '2999-01-01T00:00:00Z' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const { series_id } = r.data as { series_id: string };
+
+      const rows = auditRows(series_id);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ actor: 'agent:ag-1', action: 'create', agent_group_id: 'ag-1' });
+      expect(rows[0]!.before_hash).toBeNull();
+      expect(rows[0]!.after_hash).toBeTruthy();
+      expect(rows[0]!.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/); // explicit ISO, not sqlite's naive default
+    });
+
+    it('update writes before+after with differing hashes when the prompt changes', async () => {
+      const created = await dispatch(
+        { id: 'a-u0', command: 'tasks-create', args: { prompt: 'v1', process_after: '2999-01-01T00:00:00Z' } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { series_id } = created.data as { series_id: string };
+
+      const updated = await dispatch(
+        { id: 'a-u1', command: 'tasks-update', args: { id: series_id, prompt: 'v2' } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(updated.ok).toBe(true);
+
+      const rows = auditRows(series_id);
+      expect(rows.map((r) => r.action)).toEqual(['create', 'update']);
+      const editRow = rows[1]!;
+      expect(editRow.before_hash).toBeTruthy();
+      expect(editRow.after_hash).toBeTruthy();
+      expect(editRow.before_hash).not.toBe(editRow.after_hash);
+    });
+
+    it('cancel writes an audit row', async () => {
+      const created = await dispatch(
+        { id: 'a-x0', command: 'tasks-create', args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z' } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { series_id } = created.data as { series_id: string };
+
+      const cancelled = await dispatch(
+        { id: 'a-x1', command: 'tasks-cancel', args: { id: series_id } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(cancelled.ok).toBe(true);
+
+      const rows = auditRows(series_id);
+      expect(rows.map((r) => r.action)).toEqual(['create', 'cancel']);
+    });
+
+    it('delete writes an audit row', async () => {
+      const created = await dispatch(
+        { id: 'a-d0', command: 'tasks-create', args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z' } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { series_id } = created.data as { series_id: string };
+
+      const deleted = await dispatch(
+        { id: 'a-d1', command: 'tasks-delete', args: { id: series_id } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(deleted.ok).toBe(true);
+
+      const rows = auditRows(series_id);
+      expect(rows.map((r) => r.action)).toEqual(['create', 'delete']);
+    });
+
+    it('pause, resume, and run each write their own action row; a host caller is recorded as actor "host"', async () => {
+      const created = await dispatch(
+        {
+          id: 'a-p0',
+          command: 'tasks-create',
+          args: { prompt: 'x', group: 'ag-1', process_after: '2999-01-01T00:00:00Z' },
+        },
+        { caller: 'host' },
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { series_id } = created.data as { series_id: string };
+
+      const paused = await dispatch(
+        { id: 'a-p1', command: 'tasks-pause', args: { id: series_id, group: 'ag-1' } },
+        { caller: 'host' },
+      );
+      expect(paused.ok).toBe(true);
+      const resumed = await dispatch(
+        { id: 'a-p2', command: 'tasks-resume', args: { id: series_id, group: 'ag-1' } },
+        { caller: 'host' },
+      );
+      expect(resumed.ok).toBe(true);
+      const ran = await dispatch(
+        { id: 'a-p3', command: 'tasks-run', args: { id: series_id, group: 'ag-1' } },
+        { caller: 'host' },
+      );
+      expect(ran.ok).toBe(true);
+
+      const rows = auditRows(series_id);
+      expect(rows.map((r) => r.action)).toEqual(['create', 'pause', 'resume', 'run_now']);
+      expect(rows.every((r) => r.actor === 'host')).toBe(true);
+    });
+
+    it('bulk cancel (--all) writes one audit row per live series', async () => {
+      const a = await dispatch(
+        { id: 'a-b0', command: 'tasks-create', args: { prompt: 'A', process_after: '2999-01-01T00:00:00Z' } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      const b = await dispatch(
+        { id: 'a-b1', command: 'tasks-create', args: { prompt: 'B', process_after: '2999-01-01T00:00:00Z' } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(a.ok && b.ok).toBe(true);
+      if (!a.ok || !b.ok) return;
+      const seriesA = (a.data as { series_id: string }).series_id;
+      const seriesB = (b.data as { series_id: string }).series_id;
+
+      const cancelled = await dispatch(
+        { id: 'a-b2', command: 'tasks-cancel', args: { all: true } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(cancelled.ok).toBe(true);
+      if (cancelled.ok) expect((cancelled.data as { cancelled: number }).cancelled).toBe(2);
+
+      expect(auditRows(seriesA).map((r) => r.action)).toEqual(['create', 'cancel']);
+      expect(auditRows(seriesB).map((r) => r.action)).toEqual(['create', 'cancel']);
     });
   });
 });

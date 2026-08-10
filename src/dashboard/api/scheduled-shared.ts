@@ -122,13 +122,18 @@ export function writeAudit(db: Database.Database, e: AuditEntry): void {
 
   db.prepare(
     `INSERT INTO scheduled_audit
-       (actor, action, agent_group_id, session_id, series_id,
+       (ts, actor, action, agent_group_id, session_id, series_id,
         before_hash, after_hash, before_preview, after_preview, before_len, after_len,
         detail_json, correlation_id)
-     VALUES (@actor, @action, @agentGroupId, @sessionId, @seriesId,
+     VALUES (@ts, @actor, @action, @agentGroupId, @sessionId, @seriesId,
         @beforeHash, @afterHash, @beforePreview, @afterPreview, @beforeLen, @afterLen,
         @detailJson, @correlationId)`,
   ).run({
+    // Explicit ISO ts, not the column's `datetime('now')` default (CLAUDE.md
+    // Timestamps rule — datetime('now') is naive UTC and gets misparsed as
+    // local by `new Date()`; every downstream reader already tolerates the
+    // 'Z'-suffixed form, e.g. scheduled-move.ts's tsMs parse).
+    ts: new Date().toISOString(),
     actor: e.actor,
     action: e.action,
     agentGroupId: e.agentGroupId,
