@@ -260,6 +260,23 @@ export interface AgentQuery {
   applySettings?(settings: { model?: string; effort?: string; ultracode?: boolean }): Promise<void>;
 }
 
+/**
+ * Per-turn token/cost usage, as reported by the provider's own result
+ * payload. Every field is optional/nullable because coverage varies by
+ * provider (and by SDK version within a provider) — omit a field the
+ * provider doesn't expose rather than guessing. The poll-loop writes
+ * whatever arrives (all-NULL included) as one `turn_usage` row per
+ * completed turn, so gaps stay visible instead of silently missing.
+ */
+export interface TurnUsageInfo {
+  model?: string | null;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
+  costUsd?: number | null;
+}
+
 export type ProviderEvent =
   | { type: 'init'; continuation: string }
   /**
@@ -267,8 +284,10 @@ export type ProviderEvent =
    * turn as an error (e.g. a non-retryable Anthropic 403 billing_error). The
    * poll-loop uses it to surface the result text to the user instead of
    * dropping it as un-wrapped scratchpad, and to skip the re-wrap nudge.
+   * `usage` carries whatever token/cost accounting the provider exposed for
+   * this turn — see TurnUsageInfo.
    */
-  | { type: 'result'; text: string | null; isError?: boolean }
+  | { type: 'result'; text: string | null; isError?: boolean; usage?: TurnUsageInfo }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**

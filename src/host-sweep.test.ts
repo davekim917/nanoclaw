@@ -48,6 +48,7 @@ import {
   shouldCloseTaskSession,
   shouldReapIdleTaskContainer,
   shouldReapIdleChatContainer,
+  shouldSkipUsageRollup,
   CHAT_IDLE_REAP_MS,
 } from './host-sweep.js';
 import { getDb } from './db/connection.js';
@@ -2446,5 +2447,19 @@ describe('shouldReapIdleChatContainer', () => {
 
   it('never reaps a task-thread session through the chat policy', () => {
     expect(shouldReapIdleChatContainer('system:tasks:task-1', 0, 0, false, LONG_QUIET, NOW)).toBe(false);
+  });
+});
+
+describe('shouldSkipUsageRollup', () => {
+  it('skips when the cached mtime matches the current outbound.db mtime (unchanged since last rollup)', () => {
+    expect(shouldSkipUsageRollup(1000, 1000)).toBe(true);
+  });
+
+  it('does not skip when the outbound.db mtime moved (new turn_usage rows written)', () => {
+    expect(shouldSkipUsageRollup(1000, 2000)).toBe(false);
+  });
+
+  it('does not skip a session never seen before (no cache entry)', () => {
+    expect(shouldSkipUsageRollup(undefined, 1000)).toBe(false);
   });
 });

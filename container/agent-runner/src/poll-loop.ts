@@ -14,6 +14,7 @@ import {
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
 import { setChatLimit, writeMessageOut } from './db/messages-out.js';
+import { recordTurnUsage } from './db/turn-usage.js';
 import { getSessionSpawnTaskId } from './db/session-routing.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
@@ -1589,6 +1590,11 @@ export async function processQuery(
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
         sawResult = true; // the SDK produced output → any prior api_retry recovered
+        // Fleet Hardening Phase 0.1: one turn_usage row per completed turn,
+        // written here because every provider's query converges on this
+        // event regardless of which one ran. Whatever the provider didn't
+        // expose comes through as NULL — see TurnUsageInfo.
+        recordTurnUsage(providerName, event.usage);
         // A `result` event signals the assistant's turn is complete, but the
         // provider's events generator stays open for follow-up `push()` calls
         // (see container/agent-runner/src/providers/claude.ts:1080 — the

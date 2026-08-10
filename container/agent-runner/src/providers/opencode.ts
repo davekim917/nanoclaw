@@ -633,6 +633,20 @@ export class OpenCodeProvider implements AgentProvider {
         // previously keying by messageID overwrote earlier parts.
         const partTextById = new Map<string, { messageID: string; text: string }>();
         const roleByMessageId = new Map<string, string>();
+        // Fleet Hardening Phase 0.1 (see TurnUsageInfo). AssistantMessage
+        // carries cumulative cost/tokens as of that update; message.updated
+        // fires repeatedly as the message streams, so the last write for a
+        // given id wins and is the final total by the time session.idle ends
+        // the turn.
+        const assistantUsageById = new Map<
+          string,
+          {
+            modelID?: string;
+            providerID?: string;
+            cost?: number;
+            tokens?: { input?: number; output?: number; cache?: { read?: number; write?: number } };
+          }
+        >();
         let lastEventAt = Date.now();
         let eventTimedOut = false;
         const timeoutCheck = setInterval(() => {
@@ -674,9 +688,19 @@ export class OpenCodeProvider implements AgentProvider {
 
             switch (ev.type) {
               case 'message.updated': {
-                const info = ev.properties.info as { id?: string; role?: string } | undefined;
+                const info = ev.properties.info as
+                  | {
+                      id?: string;
+                      role?: string;
+                      modelID?: string;
+                      providerID?: string;
+                      cost?: number;
+                      tokens?: { input?: number; output?: number; cache?: { read?: number; write?: number } };
+                    }
+                  | undefined;
                 if (info?.id && info?.role) {
                   roleByMessageId.set(info.id, info.role);
+                  if (info.role === 'assistant') assistantUsageById.set(info.id, info);
                 }
                 break;
               }
@@ -774,7 +798,24 @@ export class OpenCodeProvider implements AgentProvider {
             `⚠️ \`${m}\` returned an empty response this turn (no text generated). ` +
             `Some models/providers do this under load — try again, or switch with \`-m <provider/model>\`.`;
         }
-        yield { type: 'result', text: resultText };
+        const assistantUsage = lastAssistantMessageId ? assistantUsageById.get(lastAssistantMessageId) : undefined;
+        yield {
+          type: 'result',
+          text: resultText,
+          usage: assistantUsage
+            ? {
+                model:
+                  assistantUsage.providerID && assistantUsage.modelID
+                    ? `${assistantUsage.providerID}/${assistantUsage.modelID}`
+                    : (assistantUsage.modelID ?? null),
+                inputTokens: assistantUsage.tokens?.input ?? null,
+                outputTokens: assistantUsage.tokens?.output ?? null,
+                cacheReadTokens: assistantUsage.tokens?.cache?.read ?? null,
+                cacheWriteTokens: assistantUsage.tokens?.cache?.write ?? null,
+                costUsd: typeof assistantUsage.cost === 'number' ? assistantUsage.cost : null,
+              }
+            : undefined,
+        };
       }
     }
 

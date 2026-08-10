@@ -282,6 +282,20 @@ type ImageGenerationThreadItem = {
   saved_path?: unknown;
 };
 
+/**
+ * `TokenUsageBreakdown` from the codex app-server protocol (`thread/tokenUsage/updated`
+ * notification's `tokenUsage.last`). Fleet Hardening Phase 0.1 — see
+ * TurnUsageInfo in providers/types.ts.
+ */
+type CodexTokenUsageBreakdown = {
+  totalTokens: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+};
+
 type RawImageGenerationResponseItem = {
   id?: unknown;
   type?: string;
@@ -1318,6 +1332,16 @@ export async function* runOneTurn(
   const turnState: { error: Error | null; errorKind: string | null } = { error: null, errorKind: null };
   let resultText = '';
   let turnDone = false;
+  // Fleet Hardening Phase 0.1 (see TurnUsageInfo). `thread/tokenUsage/updated`
+  // notifications fire zero or more times per turn as the app-server updates
+  // its running total; `last` is the breakdown for the most recent turn, so
+  // the latest notification received before turn/completed is authoritative.
+  // No cost field exists on this protocol (ChatGPT-plan billing, not
+  // per-token pricing) — cost_usd stays NULL for codex. Object-property ref
+  // (not a bare `let`) for the same reason as `turnState` above — TS can't
+  // track closure assignments for narrowing, but property access keeps the
+  // declared type visible.
+  const tokenUsageState: { last: CodexTokenUsageBreakdown | null } = { last: null };
   // Codex can deliver reasoning two ways: streaming item/reasoning/* deltas
   // when enabled by the app-server, or finalized reasoning ThreadItems via
   // item/completed. Streamed item IDs are tracked so lifecycle fallback
@@ -1618,6 +1642,14 @@ export async function* runOneTurn(
         if (delta) resultText += delta;
         break;
       }
+      case 'thread/tokenUsage/updated': {
+        // See lastTokenUsage declaration above — `last` is this turn's
+        // breakdown; later notifications for the same turn supersede earlier
+        // ones.
+        const usage = (params as { tokenUsage?: { last?: CodexTokenUsageBreakdown } }).tokenUsage;
+        if (usage?.last) tokenUsageState.last = usage.last;
+        break;
+      }
       case 'item/started': {
         // Surface both the legacy collab tool-call shape and Codex 0.144.1's
         // native sub-agent lifecycle events. Some app-server versions also
@@ -1794,7 +1826,20 @@ export async function* runOneTurn(
       return;
     }
 
-    yield { type: 'result', text: resultText || null };
+    yield {
+      type: 'result',
+      text: resultText || null,
+      usage: tokenUsageState.last
+        ? {
+            model,
+            inputTokens: tokenUsageState.last.inputTokens,
+            outputTokens: tokenUsageState.last.outputTokens,
+            cacheReadTokens: tokenUsageState.last.cachedInputTokens,
+            cacheWriteTokens: tokenUsageState.last.cacheWriteInputTokens,
+            costUsd: null,
+          }
+        : undefined,
+    };
   } finally {
     try {
       clearContainerToolInFlight();

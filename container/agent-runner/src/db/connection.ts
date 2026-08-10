@@ -165,6 +165,24 @@ export function configureOutboundDb(outbound: Database): void {
   for (const [name, type] of forwardColumns) {
     if (!containerCols.has(name)) outbound.exec(`ALTER TABLE container_state ADD COLUMN ${name} ${type}`);
   }
+  // turn_usage: added after the initial v2 schema (Fleet Hardening Phase
+  // 0.1), so older outbound.db files don't have it. CREATE IF NOT EXISTS
+  // backfills it on the next connect — same forward-compat pattern as
+  // session_state/container_state above. Column names/types are a fixed
+  // contract with the host-side usage_daily rollup — do not rename.
+  outbound.exec(`
+      CREATE TABLE IF NOT EXISTS turn_usage (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts                 TEXT NOT NULL,
+        provider           TEXT NOT NULL,
+        model              TEXT,
+        input_tokens       INTEGER,
+        output_tokens      INTEGER,
+        cache_read_tokens  INTEGER,
+        cache_write_tokens INTEGER,
+        cost_usd           REAL
+      );
+    `);
 }
 
 /** Open and fully configure one outbound connection, closing it on failure. */
@@ -393,6 +411,17 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       memory_oom_kill_events   INTEGER,
       memory_telemetry_at      TEXT,
       updated_at               TEXT NOT NULL
+    );
+    CREATE TABLE turn_usage (
+      id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts                 TEXT NOT NULL,
+      provider           TEXT NOT NULL,
+      model              TEXT,
+      input_tokens       INTEGER,
+      output_tokens      INTEGER,
+      cache_read_tokens  INTEGER,
+      cache_write_tokens INTEGER,
+      cost_usd           REAL
     );
   `);
 

@@ -62,6 +62,7 @@ import {
   openOutboundDb,
   openOutboundDbRw,
   inboundDbPath,
+  outboundDbPath,
   heartbeatPath,
   sessionsBaseDir,
   writeOutboundDirect,
@@ -69,6 +70,7 @@ import {
   admitDueTaskContexts,
   deferMessageForFreshContextRetry,
 } from './session-manager.js';
+import { rollupSessionUsage } from './db/usage.js';
 import {
   getContainerSpawnedAt,
   hasContainerEverRun,
@@ -827,6 +829,17 @@ async function sweep(): Promise<void> {
   // their deadline, spawn window, no-progress timeout, or whose child container exited.
   await sweepTaskWatchdog();
 
+  // Fleet-hardening Phase 0.1 (per-turn usage accounting): roll
+  // per-session turn_usage rows into the central usage_daily table for `ncl
+  // usage`. Reuses the same `sessions` list the per-session loop above already
+  // fetched — no extra DB query. Isolated so a rollup failure never blocks
+  // the rest of the tick.
+  try {
+    sweepUsageRollup(sessions);
+  } catch (err) {
+    log.warn('Usage rollup sweep step failed', { err });
+  }
+
   const sweepMs = Date.now() - sweepStartedAtMs;
   if (sweepMs >= 1_000) {
     log.info('Host sweep tick timing', { sweepMs, sessionsMs, sweptSessions, skippedQuiet: lastSkippedQuiet });
@@ -1371,6 +1384,53 @@ async function sweepSession(session: Session): Promise<number | null> {
   } finally {
     inDb.close();
     outDb?.close();
+  }
+}
+
+// ── Usage rollup (fleet-hardening Phase 0.1) ──
+//
+// Per-session cache of the outbound.db mtime last successfully rolled up, so
+// a session whose outbound.db hasn't changed since the last tick costs one
+// fs.statSync and nothing else — no DB open, no query. Same shape as the
+// `quietSessions` cache above (module-level Map, bounded to sessions still
+// active). Lost on host restart, which just means the next tick re-checks
+// every session once; rollupSessionUsage's own watermark still guarantees no
+// double-counting either way.
+const usageRollupMtimeCache = new Map<string, number>(); // session.id -> outbound.db mtimeMs
+
+/** Pure so the cache decision has one thing to unit-test. */
+export function shouldSkipUsageRollup(cachedMtimeMs: number | undefined, currentMtimeMs: number): boolean {
+  return cachedMtimeMs === currentMtimeMs;
+}
+
+function sweepUsageRollup(sessions: Session[]): void {
+  for (const session of sessions) {
+    try {
+      const outPath = outboundDbPath(session.agent_group_id, session.id);
+      let mtimeMs: number;
+      try {
+        mtimeMs = fs.statSync(outPath).mtimeMs;
+      } catch {
+        continue; // container never spawned yet — no outbound.db to roll up
+      }
+      if (shouldSkipUsageRollup(usageRollupMtimeCache.get(session.id), mtimeMs)) continue;
+
+      const outDb = openOutboundDb(session.agent_group_id, session.id);
+      try {
+        rollupSessionUsage(outDb, session.agent_group_id, `${session.agent_group_id}/${session.id}`);
+      } finally {
+        outDb.close();
+      }
+      usageRollupMtimeCache.set(session.id, mtimeMs);
+    } catch (err) {
+      log.warn('Usage rollup failed for session', { err, sessionId: session.id });
+    }
+  }
+  // Bound the cache to sessions that still exist, mirroring the quietSessions
+  // cleanup above — closed sessions would otherwise accumulate forever.
+  if (usageRollupMtimeCache.size > sessions.length + 500) {
+    const live = new Set(sessions.map((s) => s.id));
+    for (const id of usageRollupMtimeCache.keys()) if (!live.has(id)) usageRollupMtimeCache.delete(id);
   }
 }
 

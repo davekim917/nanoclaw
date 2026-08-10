@@ -17,7 +17,15 @@ import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
-import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+import type {
+  AgentProvider,
+  AgentQuery,
+  McpServerConfig,
+  ProviderEvent,
+  ProviderOptions,
+  QueryInput,
+  TurnUsageInfo,
+} from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
 import {
   createMemoryCaptureWebFetchHook,
@@ -1925,6 +1933,33 @@ export class ClaudeProvider implements AgentProvider {
     let aborted = false;
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
+      // Fleet Hardening Phase 0.1 (see TurnUsageInfo). Both SDKResultSuccess
+      // and SDKResultError carry usage/total_cost_usd/modelUsage — the
+      // existing narrow-cast pattern below (`m = message as {...}`) already
+      // sidesteps the subtype union for `result`/`is_error`; this reuses it.
+      function extractUsage(m: {
+        usage?: {
+          input_tokens?: number | null;
+          output_tokens?: number | null;
+          cache_creation_input_tokens?: number | null;
+          cache_read_input_tokens?: number | null;
+        };
+        total_cost_usd?: number;
+        modelUsage?: Record<string, unknown>;
+      }): TurnUsageInfo {
+        const modelKeys = m.modelUsage ? Object.keys(m.modelUsage) : [];
+        return {
+          // modelUsage is keyed by model; only trust it when the turn used
+          // exactly one — a subagent turn spanning multiple models has no
+          // single "the model" to report, so leave it NULL rather than guess.
+          model: modelKeys.length === 1 ? modelKeys[0] : null,
+          inputTokens: m.usage?.input_tokens ?? null,
+          outputTokens: m.usage?.output_tokens ?? null,
+          cacheReadTokens: m.usage?.cache_read_input_tokens ?? null,
+          cacheWriteTokens: m.usage?.cache_creation_input_tokens ?? null,
+          costUsd: typeof m.total_cost_usd === 'number' ? m.total_cost_usd : null,
+        };
+      }
       let messageCount = 0;
       // Throttle tool-call progress so every Bash/Grep doesn't spam status
       // updates. One tool-call-derived progress per ~1.5s is enough to show
@@ -1966,7 +2001,19 @@ export class ClaudeProvider implements AgentProvider {
           // (e.g. a non-retryable 403 billing_error) carry their message in
           // `errors[]` instead. Surface either so the poll-loop can deliver a
           // billing/quota notice to the user rather than dropping the turn.
-          const m = message as { result?: string; is_error?: boolean; errors?: string[] };
+          const m = message as {
+            result?: string;
+            is_error?: boolean;
+            errors?: string[];
+            usage?: {
+              input_tokens?: number | null;
+              output_tokens?: number | null;
+              cache_creation_input_tokens?: number | null;
+              cache_read_input_tokens?: number | null;
+            };
+            total_cost_usd?: number;
+            modelUsage?: Record<string, unknown>;
+          };
           const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
           // Retry-path guards run FIRST — these turn error text into a throw so
           // poll-loop's rotation / recap / backoff machinery retries instead of
@@ -1995,7 +2042,7 @@ export class ClaudeProvider implements AgentProvider {
             // to the user's channel as the agent's reply.
             throw new Error(`transient_overload: ${text}`);
           }
-          yield { type: 'result', text, isError: m.is_error === true };
+          yield { type: 'result', text, isError: m.is_error === true, usage: extractUsage(m) };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'rate_limit_event') {
