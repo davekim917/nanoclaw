@@ -457,8 +457,16 @@ if [ "$COMMAND" = "progress" ]; then
   # means hold, which is the safe default.
   MERGE_HOLD="$(jq -r 'if .activeMergeHold == false then "false" else "true" end' <<<"$STATE")"
   if [ "$MERGE_HOLD" = true ]; then
-    write_active_file "$RUN_ID" "$(jq -r '.activeSha // empty' <<<"$STATE")" \
+    ACTIVE_SHA="$(jq -r '.activeSha // empty' <<<"$STATE")"
+    write_active_file "$RUN_ID" "$ACTIVE_SHA" \
       "$(jq -r '.activeStartedAt // empty' <<<"$STATE")" "$PROGRESS_NOW"
+    # Re-post the advisory notice, because `claim` could only reach the PRs
+    # that existed at freeze. A PR opened mid-run gets no notice at all
+    # otherwise: on 2026-08-11 #752 opened at 08:05 into a run frozen at
+    # 07:00 and carried no qa/freeze status, so anyone merging it from the
+    # GitHub UI saw nothing. Cheap and best-effort — the same write `claim`
+    # already makes, on the cadence that is already mandatory.
+    freeze_status "QA smoke run active on $BRANCH (${ACTIVE_SHA:0:12}) — merging now voids it. Advisory only; you may merge."
   fi
   jq -cn --arg run "$RUN_ID" --argjson hold "$MERGE_HOLD" '{ok:true,runId:$run,mergeHold:$hold}'
   exit 0

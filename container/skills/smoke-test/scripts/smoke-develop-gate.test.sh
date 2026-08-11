@@ -58,7 +58,15 @@ STUB_BIN="$(mktemp -d)"
 trap 'rm -rf "$STATE_DIR" "$STUB_BIN"' EXIT
 cat > "$STUB_BIN/gh" <<'STUB'
 #!/usr/bin/env bash
+# Advisory freeze notice: record every status POST so a test can assert which
+# PR heads got one, and serve the open-PR head list the notice iterates.
+case "$*" in
+  *"/statuses/"*)
+    [ -n "${STUB_STATUS_LOG:-}" ] && printf '%s\n' "$*" >> "$STUB_STATUS_LOG"
+    echo '{}'; exit 0 ;;
+esac
 case "$1 $2" in
+  "pr list") printf '%s\n' ${STUB_PR_HEADS:-}; exit 0 ;;
   "api repos/org/repo/branches/develop")
     printf '{"commit":{"sha":"%s"}}' "$STUB_SOURCE_SHA" ;;
   "run list")
@@ -247,6 +255,24 @@ jq -e --arg run "$ACTIVE_RUN" --arg sha "$BUILD_SHA" '
 ' "$SMOKE_GATE_ACTIVE_FILE" >/dev/null
 bash "$GATE" progress "$ACTIVE_RUN" | jq -e '.ok == true' >/dev/null
 jq -e '.progressAt != null' "$SMOKE_GATE_ACTIVE_FILE" >/dev/null
+
+# 19b. A PR opened AFTER the freeze still gets the advisory notice, because
+# progress re-posts it. Claim could only reach the heads that existed then.
+export SMOKE_GATE_FREEZE_STATUS_CONTEXT="qa/freeze"
+export STUB_STATUS_LOG="$STATE_DIR2/statuses.log"
+export STUB_PR_HEADS="head-opened-mid-run"
+: > "$STUB_STATUS_LOG"
+bash "$GATE" progress "$ACTIVE_RUN" | jq -e '.mergeHold == true' >/dev/null
+grep -q "statuses/head-opened-mid-run" "$STUB_STATUS_LOG"
+grep -q "QA smoke run active on develop" "$STUB_STATUS_LOG"
+# A campaign that opted out of the hold must not raise one from a stamp.
+bash "$GATE" claim "$ACTIVE_RUN" "$BUILD_SHA" false >/dev/null
+: > "$STUB_STATUS_LOG"
+bash "$GATE" progress "$ACTIVE_RUN" | jq -e '.mergeHold == false' >/dev/null
+[ ! -s "$STUB_STATUS_LOG" ]
+bash "$GATE" claim "$ACTIVE_RUN" "$BUILD_SHA" true >/dev/null
+unset SMOKE_GATE_FREEZE_STATUS_CONTEXT STUB_STATUS_LOG STUB_PR_HEADS
+
 bash "$GATE" finish "$BUILD_SHA" "$ACTIVE_RUN" GO | jq -e '.ok == true' >/dev/null
 [ ! -e "$SMOKE_GATE_ACTIVE_FILE" ]
 
