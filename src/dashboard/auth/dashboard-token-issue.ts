@@ -48,7 +48,12 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
       null,
       'chat',
       JSON.stringify({
-        text: `Your dashboard token (valid ${formatTtl(ttlHours)}):\n${rawToken}\n\nOpen ${dashboardUrl}`,
+        // One clickable link, not a token to copy by hand. The token rides in
+        // the URL FRAGMENT, which browsers never send to the server, so it
+        // cannot land in an access or proxy log on the way in; the SPA reads
+        // it, exchanges it, and scrubs it from the address bar and history.
+        // Single-use and TTL-bound either way.
+        text: `Open your dashboard (valid ${formatTtl(ttlHours)}, works once):\n${dashboardUrl}#token=${rawToken}`,
       }),
     );
   } else {

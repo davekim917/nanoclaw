@@ -124,11 +124,11 @@ describe('dashboardTokenIssue', () => {
     await dashboardTokenIssue(makeCtx());
 
     const deliveredContent = JSON.parse(deliverMock.mock.calls[0][4] as string) as { text: string };
-    // URL must be present without ?token= query param
-    expect(deliveredContent.text).toMatch(/https?:\/\/[^/]+\/dashboard\//);
+    // One clickable link carrying the token in the FRAGMENT. The fragment is
+    // never sent to the server, so a live token cannot reach an access or
+    // proxy log; a query param would, which is why that form stays banned.
+    expect(deliveredContent.text).toMatch(/https?:\/\/[^/]+\/dashboard\/#token=[0-9a-f]{64}/);
     expect(deliveredContent.text).not.toMatch(/\?token=/);
-    // Raw token (64 hex chars) must be present
-    expect(deliveredContent.text).toMatch(/[0-9a-f]{64}/);
   });
 
   it('test_dashboardTokenIssue_token_entropy', async () => {

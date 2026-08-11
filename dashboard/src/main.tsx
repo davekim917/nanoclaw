@@ -5,8 +5,9 @@ import { InboxBoard } from './views/InboxBoard.js';
 import { ScheduledBoard } from './views/ScheduledBoard.js';
 import { WorkgroupDashboard } from './views/WorkgroupDashboard.js';
 import { SessionDetail } from './views/SessionDetail.js';
-import { authMe as fetchAuthMe } from './lib/api.js';
+import { authMe as fetchAuthMe, exchangeToken } from './lib/api.js';
 import { startSSE } from './lib/sse.ts';
+import { takeUrlToken } from './lib/url-token.js';
 import type { AuthMe } from './lib/api.js';
 import type { BoardRoute } from './views/BoardShell.js';
 import './styles.css';
@@ -28,12 +29,23 @@ function App() {
   const [authState, setAuthState] = useState<'loading' | 'unauthenticated' | 'authenticated'>('loading');
   const [me, setMe] = useState<AuthMe | null>(null);
   const [hashState, setHashState] = useState(parseHash);
+  const [linkFailed, setLinkFailed] = useState(false);
 
   useEffect(() => {
-    if (location.search.includes('token')) {
-      history.replaceState(null, '', location.pathname + location.hash);
-    }
-    fetchAuthMe()
+    const urlToken = takeUrlToken();
+    // A dead link must still land on the paste form rather than a blank one:
+    // tokens are single-use, so the second click on the same link always fails.
+    const exchanged = urlToken
+      ? exchangeToken(urlToken).then(
+          () => true,
+          () => false,
+        )
+      : Promise.resolve(true);
+    exchanged
+      .then((ok) => {
+        if (!ok) setLinkFailed(true);
+        return fetchAuthMe();
+      })
       .then((m) => {
         setMe(m);
         setAuthState('authenticated');
@@ -82,7 +94,7 @@ function App() {
   if (authState === 'unauthenticated') {
     return (
       <div className={TWEAK_CLASS}>
-        <AuthGate onAuthenticated={handleAuthenticated} />
+        <AuthGate onAuthenticated={handleAuthenticated} linkFailed={linkFailed} />
       </div>
     );
   }

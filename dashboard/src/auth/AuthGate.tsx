@@ -4,11 +4,15 @@ import type { AuthMe } from '../lib/api.js';
 
 interface AuthGateProps {
   onAuthenticated: (me: AuthMe) => void;
+  /** A one-click link was used and its token was already spent or expired. */
+  linkFailed?: boolean;
 }
 
-export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
+export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated, linkFailed = false }) => {
   const [token, setToken] = useState('');
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(
+    linkFailed ? 'That link is expired or already used — links work once. DM `/dashboard-token` for a new one.' : null,
+  );
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {

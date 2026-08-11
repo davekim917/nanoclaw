@@ -96,4 +96,18 @@ describe('AuthGate', () => {
       setItemSpy.mockRestore();
     });
   });
+
+  describe('one-click link', () => {
+    it('explains a spent link instead of showing a bare form', () => {
+      // Tokens are single-use, so the second click on the same link always
+      // fails. Without this the user lands on an empty box with no reason.
+      render(<AuthGate onAuthenticated={vi.fn()} linkFailed />);
+      expect(screen.getByRole('alert')).toHaveTextContent(/expired or already used/i);
+    });
+
+    it('shows no error on a normal visit', () => {
+      render(<AuthGate onAuthenticated={vi.fn()} />);
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+  });
 });
