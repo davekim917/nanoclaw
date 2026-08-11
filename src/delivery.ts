@@ -386,7 +386,14 @@ async function pollSweep(): Promise<void> {
     for (const session of sessions) {
       await deliverSessionMessages(session);
       polled++;
-      if (polled % 25 === 0) await new Promise((resolve) => setImmediate(resolve));
+      // Yield after EVERY session, not every 25 — same correction host-sweep
+      // made for the same reason (host-sweep.ts, "Yield after EVERY swept
+      // session"). Each drain opens two SQLite files synchronously, so a
+      // 25-session batch was one contiguous multi-second event-loop freeze.
+      // The 7-day horizon below stopped bounding this loop once session
+      // volume grew (2350 sessions/cycle observed), and every stall drops
+      // live Discord inbound at the local forward hop.
+      await new Promise((resolve) => setImmediate(resolve));
     }
   } catch (err) {
     log.error('Sweep delivery poll error', { err });

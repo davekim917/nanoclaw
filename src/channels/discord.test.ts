@@ -16,6 +16,9 @@ import {
   type DiscordRestClient,
 } from './discord.js';
 
+/** Build a Discord snowflake whose embedded timestamp is `iso`. */
+const snowflakeFor = (iso: string): string => String((BigInt(Date.parse(iso)) - 1420070400000n) << 22n);
+
 describe('Discord recovery target discovery', () => {
   it('adds a newly-created active thread even when no session exists yet', async () => {
     const get = vi
@@ -53,13 +56,16 @@ describe('Discord recovery target discovery', () => {
           {
             id: '900',
             parent_id: 'channel-1',
+            // Written inside the gap, so the activity filter keeps it; this
+            // case is about pagination order, not about the filter.
+            last_message_id: snowflakeFor('2026-07-22T00:00:00Z'),
             thread_metadata: { archive_timestamp: '2020-01-01T00:00:00Z' },
           },
         ],
         has_more: true,
       })
       .mockResolvedValueOnce({
-        threads: [{ id: '800', parent_id: 'channel-1' }],
+        threads: [{ id: '800', parent_id: 'channel-1', last_message_id: snowflakeFor('2026-07-22T00:00:00Z') }],
         has_more: false,
       });
 
@@ -79,6 +85,83 @@ describe('Discord recovery target discovery', () => {
       'discord:guild-1:channel-1:900',
       'discord:guild-1:channel-1:800',
     ]);
+  });
+
+  // The recovery storm: every pass re-scanned every thread ever created (406
+  // observed live), so stall-triggered passes took 4-8 min and ran back-to-back.
+  describe('last-activity bound', () => {
+    const since = '2026-07-21T18:16:00Z';
+
+    const discover = (threads: unknown[]) =>
+      discoverDiscordRecoveryTargets(
+        {
+          get: vi
+            .fn()
+            .mockResolvedValueOnce({ threads })
+            .mockResolvedValueOnce({ threads: [], has_more: false })
+            .mockResolvedValueOnce({ threads: [], has_more: false }),
+        } as never,
+        {
+          since,
+          reason: 'event-loop-stall',
+          targets: [{ platformId: 'discord:g:channel-1', threadId: null, isDM: false }],
+        },
+      );
+
+    it('drops an active thread whose last message predates the gap', async () => {
+      const result = await discover([
+        { id: 'quiet', parent_id: 'channel-1', last_message_id: snowflakeFor('2026-06-01T00:00:00Z') },
+      ]);
+      expect(result.targets).toEqual([]);
+    });
+
+    it('keeps an active thread written inside the gap', async () => {
+      const result = await discover([
+        { id: 'busy', parent_id: 'channel-1', last_message_id: snowflakeFor('2026-07-22T00:00:00Z') },
+      ]);
+      expect(result.targets.map((t) => t.threadId)).toEqual(['discord:g:channel-1:busy']);
+    });
+
+    // Fail-open: a payload without the marker must never silently lose coverage.
+    it('keeps a thread whose last_message_id is missing or unparseable', async () => {
+      const result = await discover([
+        { id: 'no-marker', parent_id: 'channel-1' },
+        { id: 'junk', parent_id: 'channel-1', last_message_id: 'not-a-snowflake' },
+      ]);
+      expect(result.targets.map((t) => t.threadId)).toEqual([
+        'discord:g:channel-1:no-marker',
+        'discord:g:channel-1:junk',
+      ]);
+    });
+
+    // An old private thread reactivated during the gap gets a fresh
+    // last_message_id, so the bound still catches it despite an old id.
+    it('keeps a long-dormant thread that was reactivated inside the gap', async () => {
+      const result = await discover([
+        {
+          id: snowflakeFor('2026-01-01T00:00:00Z'),
+          parent_id: 'channel-1',
+          last_message_id: snowflakeFor('2026-07-22T00:00:00Z'),
+        },
+      ]);
+      expect(result.targets).toHaveLength(1);
+    });
+
+    it('keeps everything when since is unparseable', async () => {
+      const get = vi
+        .fn()
+        .mockResolvedValueOnce({
+          threads: [{ id: 'old', parent_id: 'channel-1', last_message_id: snowflakeFor('2020-01-01T00:00:00Z') }],
+        })
+        .mockResolvedValueOnce({ threads: [], has_more: false })
+        .mockResolvedValueOnce({ threads: [], has_more: false });
+      const result = await discoverDiscordRecoveryTargets({ get } as never, {
+        since: 'not-a-date',
+        reason: 'host-startup',
+        targets: [{ platformId: 'discord:g:channel-1', threadId: null, isDM: false }],
+      });
+      expect(result.targets).toHaveLength(1);
+    });
   });
 });
 

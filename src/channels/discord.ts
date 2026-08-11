@@ -33,7 +33,41 @@ interface DiscordRecoveryThread {
   id: string;
   parent_id?: string | null;
   guild_id?: string | null;
+  last_message_id?: string | null;
   thread_metadata?: { archive_timestamp?: string };
+}
+
+// Discord snowflakes embed a millisecond timestamp above bit 22.
+const DISCORD_EPOCH_MS = 1420070400000n;
+
+function snowflakeMs(id: string | null | undefined): number | null {
+  if (!id) return null;
+  try {
+    return Number((BigInt(id) >> 22n) + DISCORD_EPOCH_MS);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A thread can only hold a missed message if it was still being written at or
+ * after the gap start, so discovery filters on Discord's own last-activity
+ * marker (`last_message_id`) — already in the list payload, no extra request.
+ * Slack's discovery has always bounded this way (`hasGapReply || createdInGap`);
+ * Discord did not, so it re-scanned every thread ever created (406 observed)
+ * on every pass, and stall-triggered passes ran back-to-back for minutes.
+ *
+ * Applies to all reasons, not just stall passes: the comparison is against the
+ * pass's own `since`, which the bridge has already floored to the durable gap
+ * floor, so a long outage still widens the window correctly.
+ *
+ * Fails OPEN — a thread with no parseable marker is kept, so a payload change
+ * can never silently drop recovery coverage.
+ */
+function threadTouchedSince(thread: DiscordRecoveryThread, sinceMs: number): boolean {
+  if (!Number.isFinite(sinceMs)) return true;
+  const lastMs = snowflakeMs(thread.last_message_id) ?? snowflakeMs(thread.id);
+  return lastMs === null || lastMs >= sinceMs;
 }
 
 interface DiscordThreadList {
@@ -76,6 +110,7 @@ export async function discoverDiscordRecoveryTargets(
   failed: Array<{ target: ChannelRecoveryTarget; error: unknown }>;
 }> {
   const roots = request.targets.filter((target) => !target.isDM && target.threadId === null);
+  const sinceMs = Date.parse(request.since);
   const targets: ChannelRecoveryTarget[] = [];
   const failed: Array<{ target: ChannelRecoveryTarget; error: unknown }> = [];
   const failedRootKeys = new Set<string>();
@@ -96,7 +131,7 @@ export async function discoverDiscordRecoveryTargets(
       const rootByChannel = new Map(guildRoots.map((root) => [root.platformId.split(':')[2], root]));
       for (const thread of active.threads ?? []) {
         const root = thread.parent_id ? rootByChannel.get(thread.parent_id) : undefined;
-        if (root) targets.push(discordThreadTarget(root, guildId, thread.id));
+        if (root && threadTouchedSince(thread, sinceMs)) targets.push(discordThreadTarget(root, guildId, thread.id));
       }
     } catch (err) {
       for (const root of guildRoots) {
@@ -107,7 +142,6 @@ export async function discoverDiscordRecoveryTargets(
   }
 
   let complete = true;
-  const sinceMs = Date.parse(request.since);
   for (const root of roots) {
     if (failedRootKeys.has(root.platformId)) continue;
     const [, guildId, channelId] = root.platformId.split(':');
@@ -127,7 +161,9 @@ export async function discoverDiscordRecoveryTargets(
           const threads = archived.threads ?? [];
           let oldestArchiveMs = Number.POSITIVE_INFINITY;
           for (const thread of threads) {
-            targets.push(discordThreadTarget(root, guildId, thread.id));
+            if (threadTouchedSince(thread, sinceMs)) targets.push(discordThreadTarget(root, guildId, thread.id));
+            // Boundary detection stays over EVERY thread on the page, filtered
+            // or not — it drives pagination termination below.
             const archivedMs = Date.parse(thread.thread_metadata?.archive_timestamp ?? '');
             if (Number.isFinite(archivedMs)) oldestArchiveMs = Math.min(oldestArchiveMs, archivedMs);
           }
