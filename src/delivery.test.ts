@@ -28,7 +28,7 @@ const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
-import { resolveSession, resolveTaskSession, outboundDbPath, openInboundDb } from './session-manager.js';
+import { resolveSession, resolveTaskSession, outboundDbPath, inboundDbPath, openInboundDb } from './session-manager.js';
 import { getTaskThreadAnchor, setTaskThreadAnchor } from './db/task-thread-anchors.js';
 import { getDb } from './db/connection.js';
 import {
@@ -1184,8 +1184,10 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
     const { session } = resolveTaskSession('ag-1', 'series-1');
-    setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', '2026-08-10T09:00:00.000Z');
-    insertTaskChat('ag-1', session.id, 'out-2', '2026-08-10T15:00:00.000Z');
+    // Now-relative: rotation compares against the real clock, so a hardcoded
+    // date makes this test fail the day after it was written.
+    setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', new Date().toISOString());
+    insertTaskChat('ag-1', session.id, 'out-2', new Date().toISOString());
 
     const calls: Array<{ threadId: string | null }> = [];
     setDeliveryAdapter({
@@ -1207,8 +1209,14 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
     const { session } = resolveTaskSession('ag-1', 'series-1');
-    setTaskThreadAnchor(session.id, 'telegram', 'telegram:123', 'plat-1', '2026-08-09T09:00:00.000Z');
-    insertTaskChat('ag-1', session.id, 'out-3', '2026-08-10T09:00:00.000Z');
+    setTaskThreadAnchor(
+      session.id,
+      'telegram',
+      'telegram:123',
+      'plat-1',
+      new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+    );
+    insertTaskChat('ag-1', session.id, 'out-3', new Date().toISOString());
 
     const calls: Array<{ threadId: string | null }> = [];
     setDeliveryAdapter({
@@ -1263,6 +1271,35 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     await deliverSessionMessages(session);
 
     expect(calls).toEqual([{ threadId: 'thr-9' }]);
+    expect(getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
+  });
+
+  it('a series with threadAnchor:false posts every message at root and stores no anchor', async () => {
+    seedAgentAndChannel();
+    grantChannelDestination('ag-1', 'mg-1');
+    const { session } = resolveTaskSession('ag-1', 'series-exempt');
+    // The exemption is read from the series' own task row (content.threadAnchor
+    // === false, set via `ncl tasks … --thread-anchor false`).
+    const inDb = new Database(inboundDbPath('ag-1', session.id));
+    inDb
+      .prepare("INSERT INTO messages_in (id, kind, timestamp, series_id, content) VALUES (?, 'task', ?, ?, ?)")
+      .run('task-row-1', now(), 'series-exempt', JSON.stringify({ prompt: 'p', threadAnchor: false }));
+    inDb.close();
+    insertTaskChat('ag-1', session.id, 'root-a', '2026-08-10T09:00:00.000Z');
+    insertTaskChat('ag-1', session.id, 'root-b', '2026-08-10T10:00:00.000Z');
+
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        return `plat-${calls.length}`;
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    // Both posts land at root — same UTC day, but the series opted out.
+    expect(calls).toEqual([{ threadId: null }, { threadId: null }]);
     expect(getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
   });
 });

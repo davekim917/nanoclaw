@@ -568,6 +568,42 @@ async function drainSession(session: Session): Promise<void> {
   }
 }
 
+/**
+ * Per-series thread-anchor opt-out (`content.threadAnchor === false`, set via
+ * `ncl tasks … --thread-anchor false`). Read from the series' own task row in
+ * the session's inbound.db and cached briefly so the flag costs one DB open
+ * per session per TTL, not one per delivered message. Any failure (legacy
+ * shared task thread, missing row, unparseable content) means NOT exempt —
+ * the anchored default is the safe one for the storm shape.
+ */
+const threadAnchorExemptCache = new Map<string, { exempt: boolean; at: number }>();
+const THREAD_ANCHOR_CACHE_TTL_MS = 5 * 60 * 1000;
+
+function isThreadAnchorExempt(session: Session): boolean {
+  const prefix = `${TASKS_SYSTEM_THREAD_ID}:`;
+  if (!session.thread_id?.startsWith(prefix)) return false;
+  const cached = threadAnchorExemptCache.get(session.id);
+  if (cached && Date.now() - cached.at < THREAD_ANCHOR_CACHE_TTL_MS) return cached.exempt;
+
+  let exempt = false;
+  try {
+    const seriesId = session.thread_id.slice(prefix.length);
+    const inDb = openInboundDb(session.agent_group_id, session.id);
+    try {
+      const row = inDb
+        .prepare("SELECT content FROM messages_in WHERE kind = 'task' AND series_id = ? ORDER BY timestamp DESC LIMIT 1")
+        .get(seriesId) as { content: string } | undefined;
+      if (row) exempt = (JSON.parse(row.content) as { threadAnchor?: unknown }).threadAnchor === false;
+    } finally {
+      inDb.close();
+    }
+  } catch {
+    exempt = false;
+  }
+  threadAnchorExemptCache.set(session.id, { exempt, at: Date.now() });
+  return exempt;
+}
+
 async function deliverMessage(
   msg: {
     id: string;
@@ -944,8 +980,14 @@ async function deliverMessage(
   // top-level post once `anchorRotationKey` disagrees (default: UTC day
   // change). Scoped to task sessions with no explicit thread_id — an
   // agent-targeted thread (baseThreadId set) is always left untouched.
+  // Per-series opt-out (`ncl tasks … --thread-anchor false`): a series whose
+  // contract is one NEW thread per logical item — a smoke campaign's
+  // one-root-per-SHA, a per-ticket dispatcher — must never have consecutive
+  // roots glued into one day-thread. content.threadAnchor === false exempts
+  // the whole series; the anchor default stays ON because the storm shape
+  // (repeated status posts) is the common case.
   const isTaskSessionPost = session.messaging_group_id === null && isTaskThread(session.thread_id);
-  const taskAnchorEligible = isTaskSessionPost && baseThreadId === null;
+  const taskAnchorEligible = isTaskSessionPost && baseThreadId === null && !isThreadAnchorExempt(session);
 
   // Per-turn channel-root threading (see ChatThreadAnchor above) — everything
   // that isn't a task-session post. Only engages when the agent didn't

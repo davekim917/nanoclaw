@@ -116,6 +116,8 @@ export interface TaskUpdate {
   script?: string | null;
   /** Fleet-hardening Phase 1.1: run --script on the host at fire time instead of in the container. */
   scriptHost?: boolean;
+  /** false = never glue this series' channel posts into a rolling day-thread (one-thread-per-item series). */
+  threadAnchor?: boolean;
   quietStatus?: boolean;
   recurrence?: string | null;
   processAfter?: string;
@@ -140,6 +142,7 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
     update.prompt !== undefined ||
     update.script !== undefined ||
     update.scriptHost !== undefined ||
+    update.threadAnchor !== undefined ||
     update.quietStatus !== undefined ||
     update.flagIntent !== undefined ||
     update.chatLimit !== undefined;
@@ -172,6 +175,7 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
         if (update.chatLimit !== undefined) parsed.chatLimit = update.chatLimit;
         if (update.script !== undefined) parsed.script = update.script;
         if (update.scriptHost !== undefined) parsed.scriptHost = update.scriptHost;
+        if (update.threadAnchor !== undefined) parsed.threadAnchor = update.threadAnchor;
         if (update.quietStatus !== undefined) parsed.quietStatus = update.quietStatus;
         if (update.flagIntent !== undefined) {
           // Merge, don't replace: a model-only change keeps an existing effort

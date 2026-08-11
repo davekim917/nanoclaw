@@ -345,6 +345,48 @@ describe('tasks CLI resource', () => {
     if (!badUpdate.ok) expect(badUpdate.error.message).toContain('--script-host requires --script');
   });
 
+  it('--thread-anchor false round-trips through create, update, and get', async () => {
+    const created = await dispatch(
+      {
+        id: 'ta1',
+        command: 'tasks-create',
+        args: {
+          prompt: 'one root per smoke run',
+          name: 'per-item-threads',
+          process_after: '2999-01-01T00:00:00Z',
+          thread_anchor: false,
+        },
+      },
+      agentCtx(),
+    );
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const seriesId = (created.data as { series_id: string }).series_id;
+    expect((created.data as { thread_anchor: number }).thread_anchor).toBe(0);
+
+    // Default (flag omitted) is anchored.
+    const plain = await dispatch(
+      {
+        id: 'ta2',
+        command: 'tasks-create',
+        args: { prompt: 'x', name: 'anchored', process_after: '2999-01-01T00:00:00Z' },
+      },
+      agentCtx(),
+    );
+    expect(plain.ok).toBe(true);
+    if (plain.ok) expect((plain.data as { thread_anchor: number }).thread_anchor).toBe(1);
+
+    // Update flips it back on.
+    const updated = await dispatch(
+      { id: 'ta3', command: 'tasks-update', args: { id: seriesId, thread_anchor: true } },
+      agentCtx(),
+    );
+    expect(updated.ok).toBe(true);
+    const got = await dispatch({ id: 'ta4', command: 'tasks-get', args: { id: seriesId } }, agentCtx());
+    expect(got.ok).toBe(true);
+    if (got.ok) expect((got.data as { thread_anchor: number }).thread_anchor).toBe(1);
+  });
+
   it('agents cannot set --script-host, change a host-flagged script, and can only clear the flag', async () => {
     // Agent tries to SET the flag on create → refused.
     const agentCreate = await dispatch(

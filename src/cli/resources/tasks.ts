@@ -156,6 +156,7 @@ function parseContent(raw: string): {
   prompt: string;
   script: string | null;
   scriptHost: boolean;
+  threadAnchor: boolean;
   originSessionId: string | null;
 } {
   try {
@@ -164,12 +165,13 @@ function parseContent(raw: string): {
       prompt: typeof parsed.prompt === 'string' ? parsed.prompt : '',
       script: typeof parsed.script === 'string' ? parsed.script : null,
       scriptHost: parsed.scriptHost === true,
+      threadAnchor: parsed.threadAnchor !== false,
       originSessionId: typeof parsed.originSessionId === 'string' ? parsed.originSessionId : null,
     };
   } catch {
     // LEGACY-COMPAT(v1-tasks): plain-string content from rows that predate the
     // JSON envelope. Removable once no pre-v2 session DBs remain in the wild.
-    return { prompt: raw, script: null, scriptHost: false, originSessionId: null };
+    return { prompt: raw, script: null, scriptHost: false, threadAnchor: true, originSessionId: null };
   }
 }
 
@@ -186,6 +188,7 @@ function toOutput(session: ScopedSession, row: TaskRow) {
     prompt: content.prompt.length > 120 ? content.prompt.slice(0, 117) + '...' : content.prompt,
     has_script: content.script ? 1 : 0,
     script_host: content.scriptHost ? 1 : 0,
+    thread_anchor: content.threadAnchor ? 1 : 0,
     origin_session_id: content.originSessionId, // which session created the task (null for CLI-created)
     created_at: row.timestamp,
     tries: row.tries,
@@ -333,6 +336,7 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
         prompt,
         script,
         ...(scriptHost ? { scriptHost: true } : {}),
+        ...(args.thread_anchor !== undefined && !bool(args.thread_anchor) ? { threadAnchor: false } : {}),
         originSessionId,
         ...(flagIntent && (flagIntent.turnModel || flagIntent.turnEffort) ? { flagIntent } : {}),
         // Physical send suppression, enforced by the agent-runner: chat-kind
@@ -570,6 +574,7 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
     if (scriptHost && script === null) throw new Error('--script-host requires --script');
     update.scriptHost = scriptHost;
   }
+  if (args.thread_anchor !== undefined) update.threadAnchor = bool(args.thread_anchor);
   const model = str(args.model);
   const effort = str(args.effort);
   if (model !== undefined || effort !== undefined) {
@@ -826,6 +831,12 @@ registerResource({
             'Run --script on the host at fire time instead of in the container — a gated (wakeAgent=false) fire skips the container boot entirely. Requires --script. Only classifier-clean scripts actually run host-side; anything the classifier flags (destructive filesystem ops, destructive SQL/cloud/infra commands) transparently falls back to the normal container execution for that fire.',
         },
         {
+          name: 'thread_anchor',
+          type: 'boolean',
+          description:
+            "false = this series' channel posts are never glued into a rolling day-thread. Use for one-thread-per-item series (a new root per smoke run / ticket / incident). Default true: consecutive posts within a UTC day thread under one anchor.",
+        },
+        {
           name: 'group',
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
@@ -945,6 +956,12 @@ registerResource({
           type: 'boolean',
           description:
             'Run --script on the host at fire time instead of in the container. Requires the task to have --script set.',
+        },
+        {
+          name: 'thread_anchor',
+          type: 'boolean',
+          description:
+            "false = this series' channel posts are never glued into a rolling day-thread (one-thread-per-item series).",
         },
         {
           name: 'group',
