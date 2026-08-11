@@ -712,6 +712,20 @@ admin approval, applied host-side):
 Both write a `messages_out` row with `kind: 'system'` and the matching `action`, then return
 immediately; the host notifies the agent when approval resolves.
 
+#### Guard-coverage boundary: the destructive classifier sees Bash only
+
+The shared destructive-command classifier (`block-destructive-core.ts`, consumed by the
+Claude PreToolUse hook, codex-guard, opencode-guard, and the pre-task script classifier)
+evaluates **Bash command strings only**. Calls made through MCP tools are never string-
+classified — an MCP server that can delete data executes on its own authority once wired.
+
+This is a deliberate boundary, not a gap to patch with string matching: MCP tools are
+**trusted by registration, not by call**. The enforcement point is `add_mcp_server` being
+HOLD-gated (admin approval per server, above) plus the review of what each approved server
+can do — so approve a server for what its *worst* tool can do, not its typical use. Adding
+per-call classification of MCP arguments would give false safety: arguments are opaque
+JSON with server-specific semantics, and a classifier that can't see meaning can't gate it.
+
 ### Media Handling
 
 #### Inbound (messages_in → agent prompt)

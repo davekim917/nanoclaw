@@ -17,11 +17,21 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markScriptSkipped } from '../db/messages-in.js';
 import { applyPreTaskScripts } from './task-script.js';
 
+// Point the pre-task classifier at the real shared destructive core (same
+// module the interactive Bash gate uses). In a container this lives at
+// /workspace/plugins/...; on the host test runner it's the bootstrap checkout.
+const REAL_CORE =
+  '/home/ubuntu/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
+const savedCore = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+
 beforeEach(() => {
+  process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = REAL_CORE;
   initTestSessionDb();
 });
 
 afterEach(() => {
+  if (savedCore === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+  else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedCore;
   closeSessionDb();
 });
 
@@ -94,5 +104,55 @@ describe('script-skip ack chain (container leg)', () => {
     expect(skipped).toHaveLength(0);
     expect(keep).toHaveLength(1);
     expect(JSON.parse(keep[0].content).scriptOutput).toEqual({ alerts: 5 });
+  });
+});
+
+// Fleet-hardening Phase 4, P1 leg 2: a pre-task script runs unattended with no
+// approval round-trip, so it must be classified by the SAME destructive-command
+// core as the interactive Bash gate, and its subprocess env must be sanitized of
+// auth secrets — otherwise `ncl tasks create --script` was an ungated exec path.
+describe('pre-task script destructive-classifier gate (P1 leg 2)', () => {
+  it('refuses a destructive script (rm -rf) — never executes it, acks script-skip:error', async () => {
+    // If it ran, the `touch` side effect would prove execution — but block
+    // means runScript is never reached, so only the ack is observable.
+    insertTask('t-rm', 'rm -rf /workspace/workgroup\necho \'{"wakeAgent": false}\'');
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(keep).toHaveLength(0);
+    expect(skipped).toEqual([{ id: 't-rm', reason: 'blocked' }]);
+
+    markScriptSkipped(skipped);
+    expect(ackStatus('t-rm')).toBe('script-skip:error');
+  });
+
+  it('refuses a gated destructive script (DROP TABLE) the same way', async () => {
+    insertTask('t-drop', 'sqlite3 x.db "DROP TABLE users"\necho \'{"wakeAgent": true}\'');
+    const { skipped } = await applyPreTaskScripts(getPendingMessages());
+    expect(skipped).toEqual([{ id: 't-drop', reason: 'blocked' }]);
+  });
+
+  it('lets a legit credentialed monitor script through (curl | jq)', async () => {
+    insertTask('t-ok', 'echo \'{"wakeAgent": true, "data": {"n": 1}}\'');
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+    expect(skipped).toHaveLength(0);
+    expect(JSON.parse(keep[0].content).scriptOutput).toEqual({ n: 1 });
+  });
+
+  it('strips auth secrets from the script env but keeps ordinary vars', async () => {
+    process.env.ANTHROPIC_API_KEY = 'sk-secret';
+    process.env.TASK_SCRIPT_KEEP = 'kept';
+    try {
+      insertTask(
+        't-env',
+        'echo "{\\"wakeAgent\\": true, \\"data\\": {\\"secret\\": \\"$ANTHROPIC_API_KEY\\", \\"kept\\": \\"$TASK_SCRIPT_KEEP\\"}}"',
+      );
+      const { keep } = await applyPreTaskScripts(getPendingMessages());
+      const out = JSON.parse(keep[0].content).scriptOutput;
+      expect(out.secret).toBe(''); // stripped
+      expect(out.kept).toBe('kept'); // ordinary var survives
+    } finally {
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.TASK_SCRIPT_KEEP;
+    }
   });
 });

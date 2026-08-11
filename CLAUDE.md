@@ -143,7 +143,7 @@ Per-agent-group container runtime config (provider, model, packages, MCP servers
 |-------|----------|
 | `disabled` | Agent never learns about ncl (instructions excluded from CLAUDE.md). Host dispatch rejects any `cli_request`. |
 | `group` (default) | Agent can access `groups`, `sessions`, `destinations`, `members`, `tasks` only, scoped to its own agent group. `--id` and group args are auto-filled. Cross-group access rejected. `cli_scope` changes blocked. |
-| `global` | Unrestricted. Set automatically for owner agent groups via `init-first-agent`. |
+| `global` | Unrestricted. Set by `scripts/init-first-agent.ts` **only** when it runs with `--role owner` (`init-first-agent.ts:272`). It is not implied by ownership: an install can run every group at `group` (stricter), and a fleet commonly does — a DB with zero `global` groups is a valid, tighter-than-default state, never a drift to "fix" by widening. |
 
 Key files: `src/db/container-configs.ts`, `src/container-config.ts`, `src/cli/dispatch.ts` (scope enforcement), `src/claude-md-compose.ts` (instructions exclusion).
 

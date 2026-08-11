@@ -414,9 +414,10 @@ export function markCompleted(ids: string[]): void {
 /**
  * Ack task messages whose pre-task script gated the run. The reason decides
  * the ack: `gated` (wakeAgent=false) is the monitor working as designed → a
- * plain `completed`; `error` (broken script) → `script-skip:error`, which the
- * host's ack sync records as a FAILED run so recurrence can read the trailing
- * failed streak off the occurrence rows and back the series off.
+ * plain `completed`; `error` (broken script) and `blocked` (classifier refused
+ * a destructive script) → `script-skip:error`, which the host's ack sync
+ * records as a FAILED run so recurrence can read the trailing failed streak off
+ * the occurrence rows and back the series off.
  */
 export function markScriptSkipped(skips: Array<{ id: string; reason: string }>): void {
   if (skips.length === 0) return;
@@ -426,7 +427,11 @@ export function markScriptSkipped(skips: Array<{ id: string; reason: string }>):
   );
   db.transaction(() => {
     for (const s of skips)
-      stmt.run(s.id, s.reason === 'error' ? 'script-skip:error' : 'completed', new Date().toISOString());
+      stmt.run(
+        s.id,
+        s.reason === 'error' || s.reason === 'blocked' ? 'script-skip:error' : 'completed',
+        new Date().toISOString(),
+      );
   })();
 }
 
