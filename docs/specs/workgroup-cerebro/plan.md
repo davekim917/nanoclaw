@@ -522,12 +522,34 @@ export function probeGraphScentWarmth(workgroupId: string): number;
 ### 5.2 Term construction
 
 Tokenize the raw query with the existing `/[\p{L}\p{N}_-]{2,}/gu` pattern, lowercase,
-drop `STOP_WORDS`, dedupe, keep the **longest** `graphScentTerms` (8) — longer tokens
-carry more signal than short ones and this bounds the OR fan-out. Emit
-`"tok1"* OR "tok2"* OR …`. Fewer than 2 surviving terms → return `null` (a one-token
-scent is noise).
+drop `STOP_WORDS`, dedupe, keep the **longest** `graphScentTerms` (**4**) — longer tokens
+carry more signal and are rarer in the index. Emit **exact** terms,
+`"tok1" OR "tok2" OR …` — **no prefix `*`**. Fewer than 2 surviving terms → return
+`null` (a one-token scent is noise).
 
-`STOP_WORDS` is reused as-is. `canonicalToken` is deliberately **not** used (§4.5).
+**Corrected at build time by the step-6 gate — the original design (8 prefix terms)
+FAILED it.** Replaying 40 real user queries against the largest live graph: 8-prefix-OR
+came in at warm p50 643 ms / p95 2,519 ms — the §4.4 probe queries had used 3–4 terms,
+and eight OR'd prefixes force bm25 to score a vastly larger match union. Variants
+measured on the same 40 queries, same graph:
+
+| variant | p50 | p95 | max | hit rate |
+|---|---|---|---|---|
+| 8 prefix OR (original design) | 199 | 749 | 774 | 40/40 |
+| 4 prefix OR | 245 | 584 | 685 | 40/40 |
+| **4 exact OR (chosen)** | **78** | **231** | **716** | **40/40** |
+| 8 exact OR | 169 | 545 | 676 | 40/40 |
+| 3 prefix OR | 84 | 480 | 807 | 40/40 |
+| 2×2 AND-of-pairs | 67 | 1,427 | 1,838 | 36/40 |
+
+Prefix expansion — not term count — is the dominant cost, and the identical hit rate
+shows the advisory lane does not need the morphological recall prefixes were buying.
+The tail (max ~700 ms) is handled by self-healing warmth (§5.4): a turn query that
+overruns `budgetMs` unmarks the workgroup, so a slow tail cannot repeat until a sweep
+probe re-verifies it.
+
+`STOP_WORDS` is reused as-is. `canonicalToken` is deliberately **not** used (§4.5) —
+the index is unstemmed, so terms must stay verbatim.
 
 ### 5.3 Query
 
@@ -570,6 +592,14 @@ So the cold cost is moved off the turn path entirely:
   (§5.3) with a fixed probe term. Elapsed ≤ `GRAPH_SCENT_BUDGET_MS` (300) marks the
   workgroup **warm**; over budget, or a throw, unmarks it. Worst case adds one ~800 ms
   probe to one sweep — a batch timer, not a user turn.
+- **A warm mark is bound to the probed file's identity** (`ino` + `mtimeMs`, captured
+  after the probe query so a racing promote cannot inherit the old timing). Every read
+  revalidates: identity mismatch — the daemon promoted a new index — treats the
+  workgroup as cold until reprobed. Added after implementation review: a mark keyed by
+  workgroup alone let graph A's warmth authorize an immediate query against freshly
+  promoted, cold graph B.
+- **Any turn-query failure or over-budget completion unmarks.** A failing or busy-locked
+  graph must not be retried on every subsequent turn.
 - **`readGraphScent` queries only a warm workgroup.** Cold → `null` plus a
   `graph-scent-cold` notice, costing nothing. Warmth is measured, so "warm" means "this
   graph answered inside budget within the last sweep cycle".
@@ -605,7 +635,10 @@ New bound `graphScentChars: 600` in `PRE_TURN_BOUNDS`, enforced by dropping
 lowest-ranked pointers before the field is attached. Five paths plus types fits
 comfortably; the bound exists so a pathological path length cannot blow the lane.
 
-In `enforceFinalBound`, `graphScent` is deleted **first — before any other lane**.
+In `enforceFinalBound`, the whole graph lane — `graphScent` **and every
+`source: 'graph'` notice** — is deleted **first, before any other lane**. Notices are
+included after implementation review: a cold/no-match notice surviving the excerpt loops
+could evict a 900-char archive excerpt to keep ~140 bytes of advisory bookkeeping.
 Corrected after plan review: an earlier draft shed it after conversation excerpts, which
 would let 600 chars of advisory pointers push a previously-fitting turn over `finalChars`
 and evict a real archive excerpt in their place. That directly violates invariant 5.
@@ -652,19 +685,25 @@ real graph with `WorkgroupGraphStore` (writable) then read it back — no mockin
 
 | # | Test name | Assertion |
 |---|---|---|
-| AC1 | `graph-scent > builds unstemmed prefix terms from the raw query` | `graphScentTerms('Which columns does the materialized view expose?')` returns terms containing `materialized` and `columns` verbatim (not `materializ`/`column`), excludes `which`/`does`/`the`, and every emitted FTS term ends in `*`. |
+| AC1 | `graph-scent > builds unstemmed exact terms from the raw query` | `graphScentTerms('Which columns does the materialized view expose?')` returns terms containing `materialized` and `columns` verbatim (not `materializ`/`column`), excludes `which`/`does`/`the`. At most 4 terms, emitted exact (no `*` — see §5.2 measurement). |
 | AC2 | `graph-scent > returns fewer than two terms as null` | `readGraphScent(wg, 'the a is', notices)` is `null`; notices contain `graph-scent-no-match`. |
 | AC3 | `graph-scent > orders pointers by bm25 rank` | Fixture where one source repeats the term far more; that source's path is `pointers[0].path`. |
 | AC4 | `graph-scent > deduplicates by basename, keeping the highest ranked` | Fixture with `workgroup/a/x.ts` and `workgroup/b/x.ts` both matching; exactly one pointer whose basename is `x.ts`. |
 | AC5 | `graph-scent > excludes agents/ and conversations/ sources` | Fixture with one matching source under each of `agents/`, `conversations/`, `workgroup/`; result contains only the `workgroup/` path. |
 | AC6 | `graph-scent > returns null and a degraded notice when the graph is absent` | Call against a workgroup with no `index.db`: returns `null`, does not throw, notices contain `graph-scent-unavailable` with status `degraded`. |
-| AC7 | `graph-scent > observes an index swap because nothing is cached` | Warm the workgroup, query graph A, then rename a differently-populated graph B over `index.db` and query again **with the identical query string**: the second call returns B's pointers. Identical terms are the point — a result cache would fail this. |
+| AC7 | `graph-scent > treats a promoted index as cold until reprobed, then serves it` | Warm the workgroup, query graph A, rename a differently-populated graph B over `index.db`, query again with the identical string: the call REFUSES (`graph-scent-cold`) — the warm mark was earned against A's file identity and must not authorize a query of cold B (review finding; the original AC required exactly that unsafe path). After a fresh probe, the same query returns B's pointers. Identical terms also expose any result cache. |
+| AC7b | `graph-scent > unmarks warmth when a query fails, so failures do not repeat per turn` | Injected opener throws a non-ENOENT error: first call emits `graph-scent-read-failed` (one open), second call emits `graph-scent-cold` with ZERO opens. |
 | AC8 | `graph-scent > does not query a cold workgroup` | Without a warmth probe, `readGraphScent` performs **zero** graph opens (counted via injected opener), returns `null`, and emits `graph-scent-cold`. |
 | AC9 | `graph-scent > a probe inside budget marks the workgroup warm` | `probeGraphScentWarmth` with an injected clock reporting 100 ms → the next `readGraphScent` queries and returns pointers. |
 | AC10 | `graph-scent > a probe over budget leaves the workgroup cold` | Injected clock reports 900 ms (over `GRAPH_SCENT_BUDGET_MS`) → the next `readGraphScent` performs zero opens and emits `graph-scent-cold`. A previously warm workgroup that probes over budget is unmarked. |
 | AC11 | `pre-turn-context > attaches the graph scent within its char bound` (in `pre-turn-context.test.ts`) | `JSON.stringify(context.graphScent).length <= PRE_TURN_BOUNDS.graphScentChars`. |
-| AC12 | `pre-turn-context > the graph scent never displaces memory or archive excerpts` (in `pre-turn-context.test.ts`) | **Two fixtures**: (a) every lane filled but under `finalChars`; (b) a lane set sized so that attaching the scent tips the context *over* `finalChars`. In both, memory-excerpt and archive-excerpt counts equal the no-scent baseline. Fixture (b) is the case the pre-review eviction order would have failed. |
+| AC12 | `pre-turn-context > the graph scent never displaces memory or archive excerpts` (in `pre-turn-context.test.ts`) | Fixture (a), every lane filled but under `finalChars`: the scent **attaches** (`graphScent` defined, no `final-context-limit` notice — asserted, per review finding: without this a lane that never attaches passes trivially) and excerpt counts equal the cold baseline. |
+| AC12b | `pre-turn-context > a scent that alone tips the context over the bound is shed, displacing nothing` | Measured two-channel fixture lands the cold baseline INSIDE `(finalChars - graphScentChars, finalChars]` — guard-asserted — so attaching the scent alone crosses the bound. Result: `graphScent` undefined, excerpt counts equal the baseline. This is the exact boundary the pre-review eviction order failed. |
 | AC13 | `pre-turn-context > sheds the graph scent before any other lane` (in `pre-turn-context.test.ts`) | Fixture pushed over `finalChars`: `graphScent` is `undefined` while every conversation and memory excerpt from the no-scent baseline survives. |
+| AC13b | `pre-turn-context > sheds graph notices with the lane at the bound` | Over-bound fixture with a present-but-COLD graph: the final context contains **no `source: 'graph'` notice**, and excerpt counts equal a no-graph baseline. Guards the review finding that a ~140-byte advisory notice could otherwise evict a 900-char archive excerpt. |
+| AC16 | `graph-scent > matches exactly, not by prefix` | A document whose every content token is a morphological variant of a query token (`forecasting pipelines …` vs `forecast pipeline …`) yields `null`/`no-match`. Restoring the failed 8-prefix design flips this test — the regression guard the review found missing. |
+| AC17 | `graph-scent > returns null rather than an over-bound scent when the only pointer exceeds the budget` | Single source whose path serializes past `graphScentChars`: `null` + `no-match`, never an over-bound field. |
+| AC18 | `graph-scent > stays completely silent for a workgroup with no graph, whatever the input` | No graph on disk: zero notices for both a short and a full query. |
 | AC14 | `formatter > renders graphScent when present` (in `container/agent-runner/src/formatter.test.ts`, `bun:test`) | A `recall_context` payload carrying `graphScent` renders its terms and pointer paths inside the untrusted-evidence envelope. |
 | AC15 | `formatter > a recall row without graphScent still renders complete` (same file) | A payload with only the three legacy evidence keys renders the normal complete output — **not** the `malformed structured payload` branch. This is the in-flight-row regression guard for §5.8(1). |
 
@@ -736,7 +775,7 @@ change, the largest of the four.
 |---|---|
 | A cold graph costs ~800 ms | Measured. Resolved by construction: the cold cost is paid by the sweep probe, never on the message-write path (§5.4). The residual is up to ~800 ms added to one 60 s sweep, for one workgroup, once per cycle. |
 | `better-sqlite3` cannot be interrupted | Accepted ceiling, stated in code. It is why warm-gating replaces a breaker: an uninterruptible query must be prevented from starting, not stopped once running. |
-| Warmth is a proxy, not a guarantee | A fixed probe term measures page-cache residency, not the cost of the actual turn's terms. A pathological real query on a "warm" graph can still overrun. Bounded by the same `LIMIT 24` + canonical-prefix shape that produced the §4.4 envelope; step 6 measures the real distribution before deploy. |
+| Warmth is a proxy, not a guarantee | Confirmed by the step-6 gate failure, not just predicted: probe-term page residency did not cover real-query terms, and the original term shape overran 8×. Now bounded two ways: exact-term construction (§5.2 table) and self-healing warmth — a turn query over `budgetMs` unmarks the workgroup until a probe re-verifies, so a slow tail costs one turn per probe cycle, not every turn. |
 | Warmth converges at one workgroup per minute after restart | The lane is silent for the first minutes on a multi-workgroup host. Accepted for an advisory lane; the alternative is probing every workgroup per sweep, which is the ~8 s stall this design exists to avoid. |
 | Pointers are noise for conversational turns | Every warm turn runs the lane, including "thanks". Mitigated by the ≥2-term floor and bm25 ranking; if it proves noisy in practice the fix is a relevance floor on `rank`, not more machinery. Not pre-built. |
 | Agent ignores the scent entirely | The real failure mode, and unmeasurable from the host. §11 defines what would count as evidence. |

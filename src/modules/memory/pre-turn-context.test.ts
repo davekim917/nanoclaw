@@ -49,6 +49,8 @@ import {
   type RecallCorpus,
 } from './pre-turn-context.js';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import { probeGraphScentWarmth, _resetGraphScentForTest } from './graph-scent.js';
+import { WorkgroupGraphStore } from '../../graphify/store.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
 
 const FIXTURE = JSON.parse(
@@ -165,6 +167,7 @@ beforeEach(() => {
 
 afterEach(() => {
   closeDb();
+  _resetGraphScentForTest();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
@@ -1195,5 +1198,197 @@ describe('per-person preference recall', () => {
     const third = buildPreTurnContext({ ...input, seenEvidenceFingerprints: [fingerprint!] });
     const changed = third.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md');
     expect(changed?.text).toContain('Code-level detail');
+  });
+});
+
+describe('graph scent lane (AC11-AC13)', () => {
+  const GRAPH_QUERY = 'How does the forecast pipeline reconcile snowflake volume data?';
+
+  function seedScentGraph(probe = true): void {
+    const store = new WorkgroupGraphStore(path.join(TEST_ROOT, 'graphify', 'workgroups', 'wg-a', 'index.db'), 'wg-a');
+    const generation = store.beginGeneration('scent');
+    for (let index = 0; index < 3; index++) {
+      store.upsertSource(
+        {
+          id: `src-${index}`,
+          workgroupId: 'wg-a',
+          kind: 'document',
+          relativePath: `workgroup/repo/forecast-${index}.md`,
+          contentHash: `hash-${index}`,
+        },
+        {
+          nodes: [
+            {
+              id: `node-${index}`,
+              name: 'forecast pipeline reconcile snowflake volume',
+              type: 'document_chunk',
+              description: 'forecast pipeline reconcile snowflake volume data',
+              evidence: [
+                {
+                  sourceId: `src-${index}`,
+                  relativePath: `workgroup/repo/forecast-${index}.md`,
+                  line: 1,
+                  excerpt: 'forecast',
+                },
+              ],
+            },
+          ],
+          edges: [],
+          hyperedges: [],
+        },
+        generation,
+      );
+    }
+    store.completeGeneration(generation);
+    store.close();
+    if (probe) probeGraphScentWarmth('wg-a');
+  }
+
+  function scentInput(overrides: Record<string, unknown> = {}) {
+    return {
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1 as const,
+      normalizedContent: JSON.stringify({ text: GRAPH_QUERY }),
+      ...overrides,
+    };
+  }
+
+  /** Enough matching memory + archive volume to sit near the final bound. */
+  function seedHeavyRecall(): void {
+    const sentence = 'The forecast pipeline reconcile snowflake volume data step is documented here in detail. ';
+    memoryFile('concepts/forecast.md', `# Forecast\n${sentence.repeat(30)}`);
+    memoryFile('facts/pipeline.md', `# Pipeline\n${sentence.repeat(30)}`);
+    memoryFile('conversations/volume.md', `# Volume\n${sentence.repeat(30)}`);
+    for (let index = 0; index < 4; index++) {
+      archive(`heavy-${index}`, 'ag-a', `${sentence.repeat(12)} (row ${index})`, `2026-07-2${index}T00:00:00.000Z`);
+    }
+  }
+
+  it('attaches the graph scent within its char bound (AC11)', () => {
+    seedScentGraph();
+    const result = buildPreTurnContext(scentInput());
+    expect(result.graphScent).toBeDefined();
+    expect(result.graphScent!.pointers.length).toBeGreaterThan(0);
+    expect(JSON.stringify(result.graphScent).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.graphScentChars);
+  });
+
+  it('never displaces memory or archive excerpts (AC12)', () => {
+    seedHeavyRecall();
+    // Baseline: lane cold (no probe), scent absent.
+    const baseline = buildPreTurnContext(scentInput());
+    expect(baseline.graphScent).toBeUndefined();
+    const baselineMemory = baseline.memoryEvidence.excerpts.length;
+    const baselineConversation = baseline.conversationEvidence.excerpts.length;
+    expect(baselineMemory).toBeGreaterThan(0);
+    expect(baselineConversation).toBeGreaterThan(0);
+
+    // Same content with the lane warm and populated. Under the bound the
+    // scent must actually ATTACH (review finding: without this assertion, a
+    // lane that never attaches passes the equality trivially).
+    seedScentGraph();
+    const withScent = buildPreTurnContext(scentInput());
+    expect(withScent.graphScent).toBeDefined();
+    expect(withScent.notices.some((n) => n.code === 'final-context-limit')).toBe(false);
+    expect(withScent.memoryEvidence.excerpts.length).toBe(baselineMemory);
+    expect(withScent.conversationEvidence.excerpts.length).toBe(baselineConversation);
+  });
+
+  it('a scent that alone tips the context over the bound is shed, displacing nothing (AC12b)', () => {
+    seedHeavyRecall();
+    // Tune the fixture into the window (finalChars - 600, finalChars): the
+    // cold baseline must FIT, and attaching the ≤600-char scent alone must
+    // cross the bound. Two padding channels, both measured rather than
+    // guessed, because every lane is individually capped (core 2,500 chars,
+    // memory lanes 5,500 total): generated facts first, then core padding.
+    const target = PRE_TURN_BOUNDS.finalChars - 250;
+    const sentence = 'forecast pipeline reconcile snowflake volume data filler sentence. ';
+    const measure = () => JSON.stringify(buildPreTurnContext(scentInput())).length;
+    let room = target - measure();
+    if (room > 500) {
+      // Each selected fact costs roughly its text plus ~260 chars of JSON
+      // envelope; two facts sized to half the room land inside the window.
+      const factChars = Math.min(2_100, Math.max(400, Math.floor(room / 2) - 260));
+      const factText = sentence.repeat(40).slice(0, factChars);
+      const factLines = [0, 1].map(
+        (index) =>
+          `- ${factText} (fact ${index}) <!-- nanoclaw-memory:id=mem_${String(index).repeat(16)};evidence=ev-${index};captured=2026-08-0${index + 1}T00:00:00.000Z -->`,
+      );
+      memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${factLines.join('\n')}\n`);
+      room = target - measure();
+    }
+    if (room > 0) {
+      memoryFile('index.md', `# Canon\n${sentence.repeat(40)}`.slice(0, Math.min(2_400, room + 40)));
+    }
+    const baseline = buildPreTurnContext(scentInput());
+    const baselineLength = JSON.stringify(baseline).length;
+    // Guard: the fixture must genuinely sit in the tip-over window.
+    expect(baselineLength).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
+    expect(baselineLength).toBeGreaterThan(PRE_TURN_BOUNDS.finalChars - PRE_TURN_BOUNDS.graphScentChars);
+    expect(baseline.notices.some((n) => n.code === 'final-context-limit')).toBe(false);
+
+    seedScentGraph();
+    const result = buildPreTurnContext(scentInput());
+    // The scent tipped it over and was shed FIRST: no recall excerpt moves.
+    expect(result.graphScent).toBeUndefined();
+    expect(result.memoryEvidence.excerpts.length).toBe(baseline.memoryEvidence.excerpts.length);
+    expect(result.conversationEvidence.excerpts.length).toBe(baseline.conversationEvidence.excerpts.length);
+  });
+
+  it('sheds graph notices with the lane at the bound, so a notice never evicts recall', () => {
+    seedHeavyRecall();
+    const sentence = 'The forecast pipeline reconcile snowflake volume data step is documented here in detail. ';
+    memoryFile('index.md', `# Canon\n${sentence.repeat(40)}`);
+    const fact = sentence.repeat(24).slice(0, 2_100);
+    const factLines = [0, 1, 2].map(
+      (index) =>
+        `- ${fact} (fact ${index}) <!-- nanoclaw-memory:id=mem_${String(index).repeat(16)};evidence=ev-${index};captured=2026-08-0${index + 1}T00:00:00.000Z -->`,
+    );
+    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${factLines.join('\n')}\n`);
+    // No graph at all: the true no-lane baseline, over the bound.
+    const baseline = buildPreTurnContext(scentInput());
+    expect(baseline.notices.some((n) => n.code === 'final-context-limit')).toBe(true);
+
+    // Graph present but COLD: the lane contributes only a graph-scent-cold
+    // notice. At the bound that notice must be shed with the lane — never
+    // traded against an excerpt.
+    seedScentGraph(false);
+    const result = buildPreTurnContext(scentInput());
+    expect(result.notices.some((n) => n.source === 'graph')).toBe(false);
+    expect(result.memoryEvidence.excerpts.length).toBe(baseline.memoryEvidence.excerpts.length);
+    expect(result.conversationEvidence.excerpts.length).toBe(baseline.conversationEvidence.excerpts.length);
+  });
+
+  it('sheds the graph scent before any other lane at the final bound (AC12b + AC13)', () => {
+    seedHeavyRecall();
+    // Saturate every lane so the serialized context crosses finalChars on its
+    // own: full core (2,500), full memory-lane budget (5,500 via long facts),
+    // full archive lane (3 x 900), plus per-excerpt JSON overhead.
+    const sentence = 'The forecast pipeline reconcile snowflake volume data step is documented here in detail. ';
+    memoryFile('index.md', `# Canon\n${sentence.repeat(40)}`);
+    const fact = sentence.repeat(24).slice(0, 2_100);
+    const factLines = [0, 1, 2].map(
+      (index) =>
+        `- ${fact} (fact ${index}) <!-- nanoclaw-memory:id=mem_${String(index).repeat(16)};evidence=ev-${index};captured=2026-08-0${index + 1}T00:00:00.000Z -->`,
+    );
+    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${factLines.join('\n')}\n`);
+
+    // Cold baseline over the same content: the fixture must reach the bound
+    // WITHOUT the scent, or this test is not exercising eviction at all.
+    const baseline = buildPreTurnContext(scentInput());
+    expect(baseline.notices.some((n) => n.code === 'final-context-limit')).toBe(true);
+    expect(baseline.graphScent).toBeUndefined();
+    expect(baseline.conversationEvidence.excerpts.length).toBeGreaterThan(0);
+
+    // Warm lane, same content: the scent is shed FIRST, so every surviving
+    // lane count must equal the cold baseline exactly. Under the rejected
+    // eviction order (scent shed after conversation excerpts) the scent would
+    // survive here and one more conversation excerpt would be evicted instead.
+    seedScentGraph();
+    const result = buildPreTurnContext(scentInput());
+    expect(result.graphScent).toBeUndefined();
+    expect(result.memoryEvidence.excerpts.length).toBe(baseline.memoryEvidence.excerpts.length);
+    expect(result.conversationEvidence.excerpts.length).toBe(baseline.conversationEvidence.excerpts.length);
   });
 });

@@ -342,6 +342,183 @@ which is the operator's call).
    content as *unevidenced* rather than as *code-recoverable*, which would redirect the
    pillar-0 prompt fix at a different line.
 
+---
+
+## 2026-08-10 (later) — `/team-build`, pillar 1 (graph scent lane) — COMPLETE
+
+Operator decisions received first: degraded review on step 0 **accepted explicitly**;
+step 0 committed as `ea4b5a08` (scoped to this work's four files only); deploy verified
+live rather than assumed — `reasonCode=` visible in `logs/nanoclaw.log` since ~18:05 UTC,
+first 12 decisions: 10 `insufficient_evidence`, 2 `transient`, 0 `code_derived`. Sample
+too small to judge the P0.2 premise; early shape noted in case it holds (suppression may
+be evidence-shaped, not code-derived-shaped).
+
+Builder: single cohesive builder (the lead, directly) — every stage shares
+`pre-turn-context.ts` or its types, so parallel builders fail the write-set rule.
+
+### Files changed
+
+| file | change |
+|---|---|
+| `src/modules/memory/graph-scent.ts` | new module: terms, bounded FTS query, warm-gating, degradation, sweep probe rotation. STOP_WORDS moved here (leaf) so the value dependency runs one way. |
+| `src/modules/memory/graph-scent.test.ts` | new — AC1–AC10 plus probe rotation and serialized-bound cases, on real seeded `WorkgroupGraphStore` fixtures (no SQLite mocking). |
+| `src/modules/memory/pre-turn-context.ts` | `'graph'` notice source, `graphScent?` field, `graphScentChars` bound, call site, **first** eviction step in `enforceFinalBound`; STOP_WORDS now imported. |
+| `src/modules/memory/pre-turn-context.test.ts` | AC11, AC12(a), AC12(b)+AC13 (baseline-vs-warm equality at the bound, with a fixture-reaches-the-bound guard assertion). |
+| `src/host-sweep.ts` | one probe call per sweep, round-robin, try/caught. |
+| `container/agent-runner/src/formatter.ts` | renders `graphScent` when present + advisory line; `RECALL_EVIDENCE_KEYS` untouched. |
+| `container/agent-runner/src/formatter.test.ts` | AC14 (failure-first) and AC15. |
+
+### Failure-first evidence
+
+- graph-scent suite run before the module existed: failed (unresolvable import).
+- AC14 run before the formatter change: failed (`graphScent` absent from output). AC15
+  passed pre-change, as it must — it guards the legacy path staying untouched.
+
+### Deviations from the plan (both recorded as grounded judgment)
+
+1. **No-graph workgroups are SILENT, not `degraded`.** The plan's degradation table
+   emitted `graph-scent-unavailable` whenever `index.db` is absent. Implemented per-turn,
+   that stamps a permanent degraded notice on every turn of every workgroup that never
+   enabled graphify — notice spam, the exact failure the notice budget exists to prevent,
+   and it broke the pre-existing `test_source_failure_degrades_independently` contract.
+   Semantics shipped: no graph on disk → silent (lane inapplicable); graph present but
+   cold → `graph-scent-cold` degraded; **warm** but file gone (mid-rename/deleted) →
+   `graph-scent-unavailable` degraded. AC6 unchanged (tests the warm+missing case).
+2. **Sweep probe rotation is tested in `graph-scent.test.ts`**, not `host-sweep.test.ts`:
+   the rotation logic lives in the module; the sweep wiring is one guarded call, verified
+   by inspection.
+
+### Step 6 — live latency gate: FAILED, root-caused, design revised, PASSED
+
+First run (module as planned, 40 most recent real user queries from the live archive,
+largest graph, warm): **p50 643 ms / p95 2,519 ms / max 5,063 ms — FAIL** against the
+p95 ≤ 300 ms gate. Root cause: the §4.4 design probes used 3–4 terms; real queries
+produced eight OR'd **prefix** terms, and FTS5 must bm25-score the whole match union —
+prefix expansion multiplies that union.
+
+Variants measured on the same 40 queries (table now in plan §5.2): prefix vs exact is
+the dominant axis; **4-exact-OR** wins at p50 78 / p95 231 / max 716 with an identical
+40/40 hit rate. Plan corrected first (§5.2, AC1, risk table), then the module: `terms`
+8→4, exact match expression, plus **self-healing warmth** — a turn query over `budgetMs`
+unmarks the workgroup so a tail costs one turn per probe cycle, not every turn.
+
+Gate re-run with the corrected module: **p50 80.5 ms / p95 161.1 ms / max 162.9 ms,
+40/40 populated — PASS.** Honesty note: the OS page cache was warm from the variant
+sweeps; a genuinely cold graph costs the sweep probe (~2.8 s observed once on this box),
+which is the design — that cost lands on the batch timer, never on a turn.
+
+### Verification (fresh runs, this session)
+
+| check | result |
+|---|---|
+| `pnpm exec vitest run src/modules/memory/` | 99 passed |
+| `pnpm test` (full host) | **246 files, 3,459 passed**, 1 skipped, 1 todo |
+| `pnpm run build` | clean |
+| `bun test src/formatter.test.ts` | 66 passed |
+| `bun run typecheck` (container tsconfig) | clean |
+| full `bun test` (container) | 4 failures in `task-script.test.ts` — the recorded parallel-run DB race; the file passes 4/4 isolated and is untouched by this change |
+| step 6 live gate | PASS (above) |
+
+### Edge cases checked beyond the happy path
+
+Cold workgroup (zero opens), absent graph while warm, index swap mid-session with an
+identical query, over-budget probe unmarking a warm workgroup, fewer-than-two-term
+queries, basename-duplicate collapse, `agents/`+`conversations/` exclusion, serialized
+scent > 600 chars, final-bound tip-over with counts compared against a cold baseline,
+legacy recall rows without the field, and a malicious-payload serialization test that
+predates this change still passing around the new field.
+
+### Remaining risk carried to review
+
+The scent lane has clean latency and zero proof it changes an agent's answer — §11's
+efficacy evidence remains unbuilt by design. Next stage: `/team-review --implementation`
+(non-auto; operator present). The other-family reviewer transport remains the open
+question from the step-0 attempt.
+
+---
+
+## 2026-08-11 — `/team-review --implementation`, pillar 1 — must_fix, corrected, re-verified
+
+### Transport
+
+| field | value |
+|---|---|
+| primary | Claude Code / Anthropic (lead) |
+| reviewer | **Codex CLI, `gpt-5.6-sol`, `model_reasoning_effort=high`** — the configured other-family primary, re-authenticated by the operator |
+| command | contract transport + `< /dev/null` |
+| outcome | `completed` |
+| raw verdict | **`must_fix` — 3 MUST-FIX, 2 SHOULD-FIX** |
+
+Two transport incidents, recorded so they stop recurring: (1) the first launch hung for
+54 minutes on an open stdin — the documented `codex exec` gotcha (`</dev/null`), known in
+the operator's memory and not applied; (2) the kill-and-relaunch died instantly because
+`pkill -f "codex exec"` matched its own wrapper's command line. Third launch (stdin
+closed, no self-matching pkill) completed normally.
+
+### Findings — all five verified against source and ACCEPTED
+
+| # | Finding | Verification |
+|---|---|---|
+| 1 | **(MUST-FIX)** Warm mark keyed by workgroup only: survives an index promote (authorizing a query against the freshly promoted cold graph) and survives query failures (retrying a failing graph every turn). AC7 as materialized *required* the unsafe post-promote path. | Confirmed — `WARM` was a `Set<string>`; nothing tied the mark to the probed file. Fixed: marks are `{ino, mtimeMs}` captured **after** the probe query (a racing promote cannot inherit the old timing); every read revalidates and any mismatch or failure unmarks. AC7 rewritten to demand cold-refusal-then-reprobe; AC7b added for failure unmarking. |
+| 2 | **(MUST-FIX)** Graph notices survive the excerpt-eviction loops: a ~140-byte cold/no-match notice could evict a 900-char archive excerpt, violating invariant 5 structurally. | Confirmed against `enforceFinalBound` — only the field was shed. Fixed: the shed-first step removes `graphScent` AND all `source:'graph'` notices. AC13b added (over-bound + cold graph → zero graph notices, counts equal a no-graph baseline). |
+| 3 | **(SHOULD-FIX)** Term validation ran before applicability, so a short query on a graph-less workgroup emitted `no-match` — recreating the notice spam the recorded deviation exists to prevent. | Confirmed. Fixed: existence check first; no graph → silent for any input. AC18 added. |
+| 4 | **(MUST-FIX)** The 600-char bound was not absolute: the trim loop stopped at one pointer, so a single pathological path escaped over-bound. | Confirmed. Fixed: trim to zero; zero pointers → `null` + `no-match`. AC17 added with a single-oversized-pointer fixture. |
+| 5 | **(SHOULD-FIX)** Three ACs materialized weaker than specified: nothing exercised the MATCH expression (restoring the failed `*` prefix would pass silently); AC4 didn't assert which duplicate survived; AC12 lacked the attach assertion and the true tip-over fixture. | Confirmed on all three. Fixed: AC16 (morphological-variant document must NOT match — flips if prefix returns), AC4 asserts the higher-ranked path, AC12 asserts attach + no bound notice, AC12b lands a measured two-channel fixture inside the `(finalChars−600, finalChars]` window with guard assertions. |
+
+No findings rejected. Finding 1 is the standout: the reviewer caught that my own AC
+enshrined the unsafe behavior as the expected result — a test asserting the bug.
+
+### Correction batch (one) and re-verification
+
+`graph-scent.ts` (identity-bound warmth, failure unmark, absolute bound, applicability
+order), `pre-turn-context.ts` (lane-wide shed), tests (AC7 rewrite; AC7b, AC12
+strengthened, AC12b, AC13b, AC16, AC17, AC18 added; AC4 sharpened), `plan.md` AC table
+and §5.4/§5.7 updated first per the contract.
+
+| check (fresh, post-correction) | result |
+|---|---|
+| `graph-scent.test.ts` | 17 passed |
+| `pre-turn-context.test.ts` | 39 passed |
+| `pnpm test` | **246 files, 3,446 passed**, 1 skipped, 1 todo (count moved −13 vs the build run from ANOTHER session's uncommitted test edits in the shared tree; all green) |
+| `pnpm run build` | clean |
+| `bun test src/formatter.test.ts` + container typecheck | 65 passed / clean |
+
+### Step-0 counter (in passing)
+
+203 curator decisions logged since deploy: `insufficient_evidence` 53, `transient` 51,
+`durable_fact` 33, `duplicate` 28, `durable_workflow` 20, `correction` 15,
+`explicit_decision` 3, **`code_derived` 0**. Trend says P0.2's blamed prohibition is not
+the operative filter — the line-416 whitelist likely rejects domain content before the
+code-recoverable question is reached, surfacing as `insufficient_evidence`/`transient`.
+Formal read at ~day 7; if it holds, pillar 0 narrows to the capture line and the
+prohibition scoping is dropped.
+
+---
+
+## 2026-08-11 (later) — pillar 1 live verification (deployed via the fleet's ordinary cadence)
+
+The operator's deploys picked the working tree up before commit: `dist/` carries the
+post-correction build and the service (restarted 15:15 UTC) is running it.
+
+**~13h of live behavior (788 probes, 75 populated scents):**
+
+- Probe rotation round-robin across 12 graphed workgroups; budget refusal visibly
+  working (one mid-size graph probed at 357 ms → left cold).
+- Turn-path delivery: populated p50 **152 ms**; the largest workgroup's scents deliver 4–5 pointers.
+- **The live tail is heavier than the step-6 replay predicted: 32 of 75 populated
+  scents (43%) overran the 300 ms budget** — 26 + 6, all on the two multi-GB graphs; populated p95 1,322 ms, max 2,487 ms. Root cause: the replay ran on
+  a quiet box; live, the graphify daemon's continuous reindex and container workloads
+  churn the page cache, so probe warmth covers less of a real query's pages.
+- Self-healing is working as designed: the largest workgroup was cold-refused 14 times — each an
+  overrun unmarking the workgroup until the next probe re-verified. The overrun cost is
+  therefore bounded at ~one slow turn per workgroup per probe cycle (~12 min), observed
+  ~2 stalls/hour fleet-wide at 0.3–2.5 s each on the single-process host.
+
+**Watch item, with an action threshold instead of vibes:** if overruns exceed ~5/hour
+fleet-wide or any single stall exceeds 3 s, the next lever is raising the re-warm bar
+for large graphs (N consecutive clean probes), not removing the lane. Not built now —
+the current cost is modest and the mechanism that bounds it is verified live.
+
 ### Not done at this stage
 
 No production code written; planning is artifact-only. No tests materialized — per the

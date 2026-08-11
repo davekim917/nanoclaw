@@ -102,6 +102,7 @@ import { decideTaskAction, pendingTerminalSpawnOutboundSeenAt } from './modules/
 import { OomKillObserver } from './resource-oom-observer.js';
 import { pruneChannelIngressReceipts } from './db/channel-ingress-receipts.js';
 import { runMemoryCurationInBackground, stopMemoryCurationInBackground } from './modules/memory/curator-worker.js';
+import { probeNextGraphScentWorkgroup } from './modules/memory/graph-scent.js';
 import { sweepClaimsEscalation } from './modules/claims/escalation.js';
 
 const oomKillObserver = new OomKillObserver();
@@ -820,6 +821,16 @@ async function sweep(): Promise<void> {
   // Workgroup memory curation is durable, debounced, and never awaited by the
   // sweep. The module enforces one active pump globally and fails closed.
   void runMemoryCurationInBackground().catch((err) => log.warn('memory-curator: background pump failed', { err }));
+
+  // Graph-scent warmth: probe ONE workgroup per sweep, round-robin. The probe
+  // pays the cold-graph cost (up to ~800ms measured) here on the batch timer;
+  // readGraphScent only ever queries workgroups a probe marked warm, so the
+  // message-write path never runs a cold FTS query.
+  try {
+    probeNextGraphScentWorkgroup();
+  } catch (err) {
+    log.warn('graph-scent: warmth probe failed', { err });
+  }
 
   // Prune dashboard_tokens rows past expiry + 1d grace (post-build QA fix SF-6).
   void import('./dashboard/db/dashboard-tokens.js')

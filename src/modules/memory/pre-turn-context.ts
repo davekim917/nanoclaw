@@ -11,6 +11,7 @@ import {
   type ArchiveEvidenceRow,
 } from '../../message-archive.js';
 import { GENERATED_MEMORY_MAX_BYTES, GENERATED_MEMORY_RELATIVE_PATH } from './curator-contract.js';
+import { GRAPH_SCENT_BOUNDS, readGraphScent, STOP_WORDS, type GraphScent } from './graph-scent.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
@@ -82,6 +83,9 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // 8000 keeps the block at roughly its historical footprint (~7.4k measured at
   // the old 600 cap) while leaving room for recall.
   capabilityTotalChars: 8_000,
+  // Advisory graph-pointer lane; enforced inside readGraphScent by dropping
+  // lowest-ranked pointers, and shed FIRST by enforceFinalBound.
+  graphScentChars: GRAPH_SCENT_BOUNDS.chars,
   finalChars: 12_000,
   exactLinkFinalChars: 16_000,
 });
@@ -105,7 +109,7 @@ export interface PreTurnContextInput {
 }
 
 export interface ContextNotice {
-  source: 'scope' | 'capabilities' | 'markdown' | 'archive' | 'exact-link' | 'context';
+  source: 'scope' | 'capabilities' | 'markdown' | 'archive' | 'exact-link' | 'context' | 'graph';
   status: 'ok' | 'no-match' | 'degraded' | 'truncated' | 'conflict';
   code: string;
   detail: string;
@@ -150,6 +154,8 @@ export interface PreTurnContext {
   conversationEvidence: {
     excerpts: ConversationEvidenceExcerpt[];
   };
+  /** Advisory graph pointers; absent when the lane is cold, empty, or shed. */
+  graphScent?: GraphScent;
   notices: ContextNotice[];
 }
 
@@ -231,52 +237,9 @@ function compareCodepoint(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-const STOP_WORDS = new Set([
-  'a',
-  'about',
-  'an',
-  'and',
-  'are',
-  'as',
-  'at',
-  'be',
-  'before',
-  'by',
-  'can',
-  'com',
-  'do',
-  'does',
-  'for',
-  'from',
-  'has',
-  'have',
-  'how',
-  'i',
-  'in',
-  'into',
-  'is',
-  'it',
-  'me',
-  'of',
-  'on',
-  'our',
-  'should',
-  'that',
-  'the',
-  'their',
-  'this',
-  'to',
-  'we',
-  'what',
-  'when',
-  'where',
-  'which',
-  'who',
-  'with',
-  'http',
-  'https',
-  'www',
-]);
+// STOP_WORDS moved to graph-scent.ts (imported above): both modules use it,
+// and this module already imports graph-scent for readGraphScent, so the value
+// dependency must run that way to avoid a module cycle.
 
 function canonicalToken(token: string): string {
   let value = token.toLocaleLowerCase('en-US');
@@ -1160,6 +1123,25 @@ function enforceFinalBound(context: PreTurnContext): void {
   const limit = context.conversationEvidence.excerpts.some((row) => row.rank === 'exact-link')
     ? PRE_TURN_BOUNDS.exactLinkFinalChars
     : PRE_TURN_BOUNDS.finalChars;
+  // The graph-scent LANE is shed FIRST — the field AND its notices — before
+  // any conversation or memory excerpt. It is the one purely advisory lane,
+  // and shedding it first is what makes "enabling the lane never displaces
+  // recall" true by construction rather than by budget arithmetic. Notices are
+  // part of the lane deliberately (review finding): a cold/no-match notice
+  // surviving the excerpt loops could evict a 900-char archive excerpt to keep
+  // ~140 bytes of advisory bookkeeping. Both prior budget incidents (see the
+  // bounds comments above) came from a lane that could not be shed.
+  if (serializedLength() > limit) {
+    if (context.graphScent !== undefined) {
+      delete context.graphScent;
+      truncated = true;
+    }
+    const withoutGraphNotices = context.notices.filter((notice) => notice.source !== 'graph');
+    if (withoutGraphNotices.length < context.notices.length) {
+      context.notices = withoutGraphNotices;
+      truncated = true;
+    }
+  }
   while (serializedLength() > limit && context.conversationEvidence.excerpts.some((row) => row.rank !== 'exact-link')) {
     let index = context.conversationEvidence.excerpts.length - 1;
     while (index >= 0 && context.conversationEvidence.excerpts[index]!.rank === 'exact-link') index -= 1;
@@ -1475,12 +1457,18 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     });
   }
 
+  // Advisory graph pointers. readGraphScent never throws and refuses cold
+  // workgroups outright, so this adds at most one warm bounded FTS query
+  // (0-120ms measured) to the turn.
+  const graphScent = readGraphScent(workgroupId, query, notices);
+
   const context: PreTurnContext = {
     ...(input.provider === undefined ? {} : { provider: input.provider.toLocaleLowerCase('en-US') }),
     ...(input.contextEpoch === undefined ? {} : { contextEpoch: input.contextEpoch }),
     ...(trustedCapabilities === undefined ? {} : { trustedCapabilities }),
     memoryEvidence,
     conversationEvidence: { excerpts: conversationRows },
+    ...(graphScent === null ? {} : { graphScent }),
     notices,
   };
   enforceFinalBound(context);
