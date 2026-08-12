@@ -406,4 +406,38 @@ bash "$GATE" finish "$NORMAL_SHA" run-normal-1 NO_GO | jq -e '
 [ ! -e "$DEV_HOLD2" ]
 [ ! -e "$DEV_PUBLISH2" ]
 
+# --- 15. P2 regression: a ledger append failure must be reported truthfully
+# — handoff.written must be false (not true) with a reason, even though the
+# hold/publish artifacts (written first, independently) succeeded. Forcing
+# the failure: the lock's directory is a path component that is actually a
+# regular file, so both bounded-retry attempts fail deterministically and
+# fast (flock refuses a bad fd instantly — no timeout wait needed to
+# reproduce this).
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+LOCKFAIL_TARGET="$(sha 1)"
+LOCKFAIL_HEAD="$(sha 2)"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$LOCKFAIL_TARGET"
+bash "$GATE" claim run-lockfail 70 "$LOCKFAIL_HEAD" >/dev/null
+
+DEV_PUBLISH3="$STATE_DIR/dev-gate3/latest-verdict.json"
+DEV_HOLD3="$STATE_DIR/dev-gate3/develop-hold.json"
+BLOCKER="$STATE_DIR/dev-gate3-blocker"
+: > "$BLOCKER"
+BAD_LEDGER="$BLOCKER/subdir/handoff-ledger.jsonl"
+export SMOKE_GATE_PUBLISH_FILE="$DEV_PUBLISH3" SMOKE_GATE_HOLD_FILE="$DEV_HOLD3" \
+  SMOKE_GATE_HANDOFF_LEDGER="$BAD_LEDGER"
+
+bash "$GATE" finish "$LOCKFAIL_HEAD" run-lockfail NO_GO | jq -e --arg target "$LOCKFAIL_TARGET" '
+  .ok == true and .handoff.written == false and .handoff.targetSha == $target and
+  (.handoff.reason | test("retry"))
+' >/dev/null
+# The hold/publish artifacts were still written correctly — only the
+# ledger's own append failed.
+jq -e --arg sha "$LOCKFAIL_TARGET" '.sha == $sha and .verdict == "NO_GO"' "$DEV_PUBLISH3" >/dev/null
+jq -e --arg sha "$LOCKFAIL_TARGET" '.sha == $sha and .verdict == "NO_GO"' "$DEV_HOLD3" >/dev/null
+[ ! -e "$BAD_LEDGER" ]
+
 echo "smoke pr gate tests passed"

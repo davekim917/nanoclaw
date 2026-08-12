@@ -541,4 +541,68 @@ bash "$GATE" poll | jq -e '
   .wakeAgent == true and .data.trigger == "gate_hold_tampered" and .data.holdIntegrity == "mismatched"
 ' >/dev/null
 
+# --- 30. P1 regression: ledger adoption must bind to the SAME freezePr as
+# the currently open handoff, not just targetSha — targetSha is the develop
+# head SHA, public and echoed in our own wake payload, so it alone proves
+# nothing. Reproduced exactly as reported: a forged/stale line naming a
+# DIFFERENT freezePr (999) for the real handoff's targetSha must never be
+# adopted, must never free the real handoff (PR 100), and must alarm once
+# rather than silently mis-completing a campaign that never ran.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+FORGE_TARGET="$(printf 'a%.0s' $(seq 40))"
+FORGE_HEAD="$(printf 'b%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$FORGE_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":100,\"branch\":\"smoke/freeze-a\",\"freezeSha\":\"$FORGE_HEAD\",\"targetSha\":\"$FORGE_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened" and .data.freezePr == 100' >/dev/null
+jq -cn --arg target "$FORGE_TARGET" --arg freeze "$FORGE_HEAD" --argjson pr 999 \
+  --arg run "smoke-pr999-fake-run" --arg verdict "GO" --arg now "2026-08-12T00:00:00Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e --argjson expected 100 --argjson got 999 --arg sha "$FORGE_TARGET" '
+  .wakeAgent == true and .data.trigger == "develop_freeze_ledger_tampered" and
+  .data.expectedFreezePr == $expected and .data.gotFreezePr == $got and .data.targetSha == $sha
+' >/dev/null
+jq -e --argjson pr 100 --arg sha "$FORGE_TARGET" '
+  .handoffFreezePr == $pr and .handoffTargetSha == $sha and .completedSha == null
+' "$STATE_DIR2/develop-state.json" >/dev/null
+# Latched: the identical mismatch does not re-alarm every poll — the real
+# handoff (PR 100) is still open, so the busy-check reports it as such.
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "already_active"' >/dev/null
+
+# --- 31. develop_freeze_abandoned now names the target SHA's own hold/
+# publish artifacts, so the responder checks for a completed-but-unrecorded
+# campaign before assuming the campaign died silently.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+HINT_PUBLISH="$STATE_DIR2/pub/latest-verdict.json"
+HINT_HOLD="$STATE_DIR2/pub/develop-hold.json"
+export SMOKE_GATE_PUBLISH_FILE="$HINT_PUBLISH" SMOKE_GATE_HOLD_FILE="$HINT_HOLD"
+HINT_TARGET="$(printf 'c%.0s' $(seq 40))"
+HINT_HEAD="$(printf 'd%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$HINT_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":66,\"branch\":\"smoke/freeze-c\",\"freezeSha\":\"$HINT_HEAD\",\"targetSha\":\"$HINT_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+export STUB_FREEZE_PR_STATE=CLOSED
+bash "$GATE" poll | jq -e --arg publish "$HINT_PUBLISH" --arg hold "$HINT_HOLD" '
+  .data.trigger == "develop_freeze_abandoned" and
+  (.data.hint | length) > 0 and .data.publishFile == $publish and .data.holdFile == $hold
+' >/dev/null
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE STUB_FREEZE_PR_STATE
+
+# --- 32. P3: a freeze-helper "branch already exists" failure names the
+# orphaned branch in the alarm data, not just the free-text reason.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+ORPHAN_SHA="$(printf 'e%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$ORPHAN_SHA"
+export STUB_FREEZE_JSON='{"ok":false,"error":"branch already exists — delete it first or pick a different target","branch":"smoke/freeze-eeeeeeeeeeee"}'
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_freeze_failed" and
+  .data.orphanBranch == "smoke/freeze-eeeeeeeeeeee"
+' >/dev/null
+
 echo "smoke develop gate tests passed"

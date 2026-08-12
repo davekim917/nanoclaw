@@ -684,17 +684,33 @@ if [ "$COMMAND" = "finish" ]; then
         fi
         HANDOFF_WRITTEN=true
         if [ -n "$HANDOFF_LEDGER" ]; then
-          mkdir -p "$(dirname "$HANDOFF_LEDGER")"
-          exec 7>"$HANDOFF_LEDGER.lock"
-          if flock -w 5 7; then
-            jq -cn --arg target "$TARGET_SHA" --arg freeze "$SHA" --argjson pr "$PR" \
-              --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
-              '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,
-                runId:$run,verdict:$verdict,finishedAt:$now}' >> "$HANDOFF_LEDGER"
-          else
-            HANDOFF_REASON="ledger lock failed — develop gate will not see this outcome until a later poll retries"
+          mkdir -p "$(dirname "$HANDOFF_LEDGER")" 2>/dev/null
+          LEDGER_APPENDED=false
+          # One bounded retry (2 attempts total, 5s wait each): the develop
+          # gate has no other way to learn this outcome, so a single
+          # transient contention loss must not silently drop it.
+          for LEDGER_ATTEMPT in 1 2; do
+            exec 7>"$HANDOFF_LEDGER.lock"
+            if flock -w 5 7; then
+              jq -cn --arg target "$TARGET_SHA" --arg freeze "$SHA" --argjson pr "$PR" \
+                --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
+                '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,
+                  runId:$run,verdict:$verdict,finishedAt:$now}' >> "$HANDOFF_LEDGER"
+              flock -u 7
+              LEDGER_APPENDED=true
+              break
+            fi
+            flock -u 7 2>/dev/null
+          done
+          if [ "$LEDGER_APPENDED" != true ]; then
+            # The publish/hold artifacts above are correctly written, but the
+            # develop gate will never see this outcome without the ledger
+            # line — from its side that is indistinguishable from "never
+            # finished", so `written` must reflect the WHOLE handoff, not
+            # just the artifact files.
+            HANDOFF_WRITTEN=false
+            HANDOFF_REASON="ledger append failed after retry — develop gate will not see this outcome until a manual sync or a later re-finish"
           fi
-          flock -u 7
         fi
       fi
     fi

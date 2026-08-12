@@ -152,7 +152,8 @@ default_state() {
     handoffTargetSha: null,
     handoffOpenedAt: null,
     freezeFailReason: null,
-    freezeFailWakeAt: null
+    freezeFailWakeAt: null,
+    ledgerTamperAlertFor: null
   }'
 }
 
@@ -755,16 +756,42 @@ if [ "$FREEZE_HANDOFF" = true ]; then
       LEDGER_ENTRY="$(jq -c --arg t "$HANDOFF_TARGET" 'select(.targetSha == $t)' "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
     fi
     if [ -n "$LEDGER_ENTRY" ]; then
-      # The freeze run finished: smoke-pr-gate.sh already wrote the verdict.
-      # Adopt it as this gate's own completed record and free the handoff
-      # slot — this is the "same develop SHA never re-freezes" dedup advance.
-      L_RUN="$(jq -r '.runId' <<<"$LEDGER_ENTRY")"
-      L_VERDICT="$(jq -r '.verdict' <<<"$LEDGER_ENTRY")"
-      L_FINISHED="$(jq -r '.finishedAt' <<<"$LEDGER_ENTRY")"
-      STATE="$(jq -c --arg sha "$HANDOFF_TARGET" --arg run "$L_RUN" --arg verdict "$L_VERDICT" --arg now "$L_FINISHED" \
-        '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
-         .handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null | .handoffOpenedAt=null' <<<"$STATE")"
+      # Bind adoption to the SAME freeze PR as the handoff we currently have
+      # open — targetSha alone is not enough to trust a ledger line: it is
+      # the develop head SHA, public and echoed in our own wake payload, so
+      # a forged or stale (a zombie campaign's late finish on a previously
+      # abandoned handoff) line can share it while naming a different PR.
+      L_FREEZE_PR="$(jq -r '.freezePr' <<<"$LEDGER_ENTRY")"
+      if [ "$L_FREEZE_PR" = "$HANDOFF_PR" ]; then
+        # The freeze run finished: smoke-pr-gate.sh already wrote the
+        # verdict. Adopt it as this gate's own completed record and free the
+        # handoff slot — the "same develop SHA never re-freezes" dedup
+        # advance.
+        L_RUN="$(jq -r '.runId' <<<"$LEDGER_ENTRY")"
+        L_VERDICT="$(jq -r '.verdict' <<<"$LEDGER_ENTRY")"
+        L_FINISHED="$(jq -r '.finishedAt' <<<"$LEDGER_ENTRY")"
+        STATE="$(jq -c --arg sha "$HANDOFF_TARGET" --arg run "$L_RUN" --arg verdict "$L_VERDICT" --arg now "$L_FINISHED" \
+          '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
+           .handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null | .handoffOpenedAt=null |
+           .ledgerTamperAlertFor=null' <<<"$STATE")"
+      else
+        # Tamper evidence, same shape as gate_hold_tampered: never adopt,
+        # never free the real handoff (its own freezePr/targetSha are
+        # untouched, so the busy-check below keeps queuing candidates behind
+        # it exactly as if this line did not exist). One latched alarm, not
+        # a re-spam every poll — re-arms only if the offending freezePr
+        # changes.
+        if [ "$(jq -r '.ledgerTamperAlertFor // empty' <<<"$STATE")" != "$L_FREEZE_PR" ]; then
+          STATE="$(jq -c --arg pr "$L_FREEZE_PR" '.ledgerTamperAlertFor=$pr' <<<"$STATE")"
+          write_state "$STATE"
+          jq -cn --arg target "$HANDOFF_TARGET" --arg expected "$HANDOFF_PR" --arg got "$L_FREEZE_PR" \
+            '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_ledger_tampered",
+              targetSha:$target,expectedFreezePr:($expected|tonumber),gotFreezePr:($got|tonumber)}}'
+          exit 0
+        fi
+      fi
     elif [ -n "$HANDOFF_PR" ]; then
+      STATE="$(jq -c '.ledgerTamperAlertFor=null' <<<"$STATE")"
       # No ledger outcome yet. Is the freeze PR still open? Fail-closed: a
       # fetch problem means "cannot prove it is closed", so do NOT reclaim —
       # leave the handoff in place and let a later poll try again.
@@ -776,11 +803,21 @@ if [ "$FREEZE_HANDOFF" = true ]; then
         # (crash, manual PR close) rather than reported a result. Freeing and
         # alarming happen together in the SAME poll, so there is nothing to
         # re-arm — the transition itself can only ever fire once per
-        # abandonment.
-        STATE="$(jq -c '.handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null | .handoffOpenedAt=null' <<<"$STATE")"
+        # abandonment. The alarm names the target SHA's own publish/hold
+        # artifacts (this gate's own config, shared by wrapper convention
+        # with smoke-pr-gate.sh's finish) so the responder checks whether the
+        # campaign actually completed and failed only to report before
+        # assuming it died.
+        STATE="$(jq -c '.handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null |
+                        .handoffOpenedAt=null | .ledgerTamperAlertFor=null' <<<"$STATE")"
         write_state "$STATE"
         jq -cn --argjson pr "$HANDOFF_PR" --arg sha "$HANDOFF_TARGET" \
-          '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_abandoned",freezePr:$pr,targetSha:$sha}}'
+          --arg publish "$PUBLISH_FILE" --arg hold "$HOLD_FILE" \
+          '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_abandoned",
+            freezePr:$pr,targetSha:$sha,
+            hint:"Before assuming the campaign died, check whether it actually completed but failed only to report: inspect the hold/publish artifacts for this target SHA.",
+            publishFile:(if $publish == "" then null else $publish end),
+            holdFile:(if $hold == "" then null else $hold end)}}'
         exit 0
       fi
     fi
@@ -974,6 +1011,14 @@ if [ "$FREEZE_HANDOFF" = true ]; then
     # poll retries once the underlying problem is fixed.
     FREEZE_REASON="$(jq -r '.error // empty' <<<"$FREEZE_JSON" 2>/dev/null)"
     [ -n "$FREEZE_REASON" ] || FREEZE_REASON="freeze helper exited $FREEZE_RC with no parseable output"
+    # smoke-freeze-pr.sh's own "branch already exists" error already carries
+    # the deterministic branch name (smoke/freeze-<sha12>) as a `branch`
+    # field — surface it here too. This is the retry-after-a-lost-attempt
+    # case: an earlier freeze that helper-succeeded but never got recorded in
+    # our state (a crash or race between the helper call and write_state)
+    # leaves an orphaned PR/branch that this later collision is the only
+    # trace of; without the name, the responder has to guess it.
+    FREEZE_ORPHAN_BRANCH="$(jq -r '.branch // empty' <<<"$FREEZE_JSON" 2>/dev/null)"
     LAST_FREEZE_REASON="$(jq -r '.freezeFailReason // empty' <<<"$STATE")"
     SINCE_FREEZE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.freezeFailWakeAt // empty' <<<"$STATE")") ))"
     if { [ "$FREEZE_REASON" != "$LAST_FREEZE_REASON" ] && [ "$SINCE_FREEZE_WAKE" -ge "$PREFLIGHT_REARM_FLOOR_SECONDS" ]; } ||
@@ -981,7 +1026,9 @@ if [ "$FREEZE_HANDOFF" = true ]; then
       STATE="$(jq -c --arg r "$FREEZE_REASON" --arg now "$NOW" '.freezeFailReason=$r | .freezeFailWakeAt=$now' <<<"$STATE")"
       write_state "$STATE"
       jq -cn --arg reason "$FREEZE_REASON" --arg sha "$SOURCE_SHA" --argjson rc "$FREEZE_RC" \
-        '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_failed",sourceSha:$sha,reason:$reason,exitCode:$rc}}'
+        --arg branch "$FREEZE_ORPHAN_BRANCH" \
+        '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_failed",sourceSha:$sha,reason:$reason,exitCode:$rc,
+          orphanBranch:(if $branch == "" then null else $branch end)}}'
       exit 0
     fi
     STATE="$(jq -c --arg r "$FREEZE_REASON" '.freezeFailReason=$r' <<<"$STATE")"
