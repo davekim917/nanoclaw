@@ -122,7 +122,8 @@ reset_stubs() {
         STUB_COMMIT_TREE STUB_BLOB_RESPONSE STUB_TREE_RESPONSE STUB_COMMIT_RESPONSE \
         STUB_REF_RESPONSE STUB_REF_EXIT STUB_BRANCH_EXISTS STUB_PR_LIST_EXIT \
         STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
-        STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS 2>/dev/null || true
+        STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS \
+        SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER 2>/dev/null || true
 }
 
 fresh_state() {
@@ -348,5 +349,61 @@ bash "$GATE" check 55 | jq -e '
   .fetchOk == false and .settled == false and
   .migrationsTouched == true and .frontendTouched == true
 ' >/dev/null
+
+# --- 12. Develop-freeze-handoff: finish on a FREEZE pr writes hold/publish/
+# ledger keyed to the TARGET develop sha (the marker commit's parent), not
+# the freeze marker sha itself.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+TARGET_SHA="$(sha 7)"
+FREEZE_HEAD_SHA="$(sha 8)"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$TARGET_SHA"
+bash "$GATE" claim run-freeze-1 60 "$FREEZE_HEAD_SHA" >/dev/null
+
+DEV_PUBLISH="$STATE_DIR/dev-gate/latest-verdict.json"
+DEV_HOLD="$STATE_DIR/dev-gate/develop-hold.json"
+DEV_LEDGER="$STATE_DIR/dev-gate/handoff-ledger.jsonl"
+export SMOKE_GATE_PUBLISH_FILE="$DEV_PUBLISH" SMOKE_GATE_HOLD_FILE="$DEV_HOLD" \
+  SMOKE_GATE_HANDOFF_LEDGER="$DEV_LEDGER"
+
+bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-1 NO_GO | jq -e --arg target "$TARGET_SHA" '
+  .ok == true and .handoff.written == true and .handoff.targetSha == $target
+' >/dev/null
+jq -e --arg sha "$TARGET_SHA" '.sha == $sha and .verdict == "NO_GO"' "$DEV_PUBLISH" >/dev/null
+jq -e --arg sha "$TARGET_SHA" '.sha == $sha and .verdict == "NO_GO" and .runId == "run-freeze-1"' "$DEV_HOLD" >/dev/null
+jq -e --arg target "$TARGET_SHA" --arg freeze "$FREEZE_HEAD_SHA" --argjson pr 60 --arg run "run-freeze-1" '
+  .targetSha == $target and .freezeSha == $freeze and .freezePr == $pr and
+  .verdict == "NO_GO" and .runId == $run
+' "$DEV_LEDGER" >/dev/null
+
+# --- 13. GO clears the hold, keyed the same way.
+bash "$GATE" claim run-freeze-2 60 "$FREEZE_HEAD_SHA" >/dev/null
+bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-2 GO | jq -e --arg target "$TARGET_SHA" '
+  .ok == true and .handoff.written == true and .handoff.targetSha == $target
+' >/dev/null
+[ ! -e "$DEV_HOLD" ]
+# The ledger records BOTH outcomes (append-only) so the develop gate's dedup
+# advance always reads the most recent one.
+[ "$(wc -l < "$DEV_LEDGER")" -eq 2 ]
+
+# --- 14. Non-freeze PRs never touch publish/hold/ledger, even when the
+# wrapper has them configured — "never touch them" is unconditional, not
+# dependent on the wrapper only enabling them for freeze deployments.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+NORMAL_SHA="$(sha 9)"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+bash "$GATE" claim run-normal-1 61 "$NORMAL_SHA" >/dev/null
+DEV_HOLD2="$STATE_DIR/dev-gate2/develop-hold.json"
+DEV_PUBLISH2="$STATE_DIR/dev-gate2/latest-verdict.json"
+export SMOKE_GATE_PUBLISH_FILE="$DEV_PUBLISH2" SMOKE_GATE_HOLD_FILE="$DEV_HOLD2"
+bash "$GATE" finish "$NORMAL_SHA" run-normal-1 NO_GO | jq -e '
+  .ok == true and .handoff.written == false and .handoff.targetSha == null
+' >/dev/null
+[ ! -e "$DEV_HOLD2" ]
+[ ! -e "$DEV_PUBLISH2" ]
 
 echo "smoke pr gate tests passed"
