@@ -88,6 +88,36 @@ export function findSessionByAgentGroup(agentGroupId: string): Session | undefin
  * channel-root session because it's likely newer, and the task gets inserted
  * into the wrong inbound.db.
  */
+/**
+ * Any active session on a messaging group, newest first, preferring the
+ * channel-root one when it exists.
+ *
+ * For callers that need a session only as a DELIVERY PIPE — they write an
+ * outbound row carrying its own `thread_id`, so where the message lands is
+ * decided by that row, not by the session. `findSession(mg, null)` is wrong
+ * for them: it matches root sessions only, and a channel with a per-thread
+ * policy never has one, so the lookup can never succeed. That is exactly how
+ * claims escalation went a full day emitting "no messaging group"/"no live
+ * session" warnings without ever delivering.
+ *
+ * Do NOT use this to route inbound work or schedule a task — those must land
+ * in a specific session, and picking "whichever is newest" would drop them
+ * into an unrelated thread's container. See
+ * `findSessionByAgentGroupAndMessagingGroup` for that case.
+ */
+export function findAnySessionForMessagingGroup(messagingGroupId: string): Session | undefined {
+  return getDb()
+    .prepare(
+      `SELECT * FROM sessions
+       WHERE messaging_group_id = ?
+         AND status = 'active'
+         AND (thread_id IS NULL OR thread_id NOT LIKE 'system:%')
+       ORDER BY (thread_id IS NULL) DESC, created_at DESC
+       LIMIT 1`,
+    )
+    .get(messagingGroupId) as Session | undefined;
+}
+
 export function findSessionByAgentGroupAndMessagingGroup(
   agentGroupId: string,
   messagingGroupId: string,

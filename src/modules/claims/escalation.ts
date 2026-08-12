@@ -23,7 +23,7 @@ import path from 'path';
 
 import { DATA_DIR } from '../../config.js';
 import { getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
-import { findSession } from '../../db/sessions.js';
+import { findAnySessionForMessagingGroup } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { outboundDbPath, writeOutboundDirect } from '../../session-manager.js';
 
@@ -201,7 +201,12 @@ export interface EscalationDeliveryDeps {
 
 const defaultDeps: EscalationDeliveryDeps = {
   resolveMessagingGroup: getMessagingGroupByPlatform,
-  resolveSession: (messagingGroupId) => findSession(messagingGroupId, null),
+  // Any active session on the channel — it is only the pipe. The outbound
+  // row below carries `threadId: null`, so the escalation posts to the channel
+  // root regardless of which session's outbound.db it travels through, and
+  // never wakes a container. Asking for a ROOT session here was the bug: a
+  // per-thread channel has none, so this returned undefined every time.
+  resolveSession: (messagingGroupId) => findAnySessionForMessagingGroup(messagingGroupId),
   hasOutbound: (agentGroupId, sessionId) => fs.existsSync(outboundDbPath(agentGroupId, sessionId)),
   writeMessage: writeOutboundDirect,
 };
