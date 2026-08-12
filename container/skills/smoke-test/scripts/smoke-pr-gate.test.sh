@@ -32,6 +32,7 @@ set -u
 [ -n "${STUB_REF_RESPONSE+x}" ] || STUB_REF_RESPONSE='{"ref":"refs/heads/x"}'
 [ -n "${STUB_BRANCH_EXISTS+x}" ] || STUB_BRANCH_EXISTS=false
 [ -n "${STUB_PR_LIST_EXIT+x}" ] || STUB_PR_LIST_EXIT=0
+[ -n "${STUB_PR_FILES_EXIT+x}" ] || STUB_PR_FILES_EXIT=0
 
 case "$1" in
   pr)
@@ -54,7 +55,7 @@ case "$1" in
       printf '%s' "$STUB_PARENT_SHA"; exit 0
     fi
     if printf '%s' "$P" | grep -qF '/pulls/' && printf '%s' "$P" | grep -qF '/files'; then
-      printf '%s' "$STUB_PR_FILES"; exit 0
+      printf '%s' "$STUB_PR_FILES"; exit "$STUB_PR_FILES_EXIT"
     fi
     if printf '%s' "$P" | grep -qF '/check-runs'; then
       printf '%s' "$STUB_CHECK_RUNS"; exit 0
@@ -120,8 +121,8 @@ reset_stubs() {
   unset STUB_PR_LIST STUB_PR_VIEW STUB_PR_FILES STUB_CHECK_RUNS STUB_PARENT_SHA \
         STUB_COMMIT_TREE STUB_BLOB_RESPONSE STUB_TREE_RESPONSE STUB_COMMIT_RESPONSE \
         STUB_REF_RESPONSE STUB_REF_EXIT STUB_BRANCH_EXISTS STUB_PR_LIST_EXIT \
-        STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE STUB_HEALTHZ_CODE \
-        STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS 2>/dev/null || true
+        STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
+        STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS 2>/dev/null || true
 }
 
 fresh_state() {
@@ -298,6 +299,54 @@ bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "gate_fetch_failed"' >/dev/null
 bash "$GATE" poll | jq -e '
   .wakeAgent == true and .data.trigger == "gate_fetch_failed" and .data.consecutiveFailures == 3
+' >/dev/null
+
+# --- 11. P1 regression: run ids must be unique ACROSS PRs, not just within
+# one PR's own state file. Before the fix, `claim` only checked collision
+# against the TARGET pr's own state, so two different PRs could both claim
+# the same caller-chosen run id. `finish`/`progress`/`release` then resolve a
+# bare run id by scanning for the first matching state file
+# (find_pr_for_run) — with two matches, the wrong PR wins by glob order, and
+# `finish` could record one PR's verdict under a DIFFERENT PR's SHA while
+# leaving the true owner a zombie forever "active".
+fresh_state
+SHA_A="$(sha 7)"
+SHA_B="$(sha 8)"
+bash "$GATE" claim shared-run 100 "$SHA_A" | jq -e '.ok == true' >/dev/null
+bash "$GATE" claim shared-run 200 "$SHA_B" | jq -e '
+  .ok == false and (.error | test("unique"))
+' >/dev/null
+# PR 100 still owns the run id untouched; PR 200 was never written at all.
+jq -e --arg sha "$SHA_A" '
+  .activeSha == $sha and .activeRunId == "shared-run"
+' "$STATE_DIR/pr-100-state.json" >/dev/null
+[ ! -e "$STATE_DIR/pr-200-state.json" ]
+# finish resolves unambiguously to PR 100, with PR 100's own SHA — never
+# PR 200's, and never both.
+bash "$GATE" finish "$SHA_A" shared-run GO | jq -e --arg sha "$SHA_A" '
+  .ok == true and .pr == 100 and .sha == $sha
+' >/dev/null
+
+# --- 12. P1 regression: `check` must never assert settled:true when a
+# required fetch failed, even though CI/deploy/healthz are all otherwise
+# green. Before the fix, the files-fetch failure branch left
+# migrations_touched/frontend_touched computed as FALSE (fail-OPEN) instead
+# of the promised fail-closed TRUE, so a human trusting `check` before a
+# manual claim could freeze a migrations-carrying PR without ever seeing the
+# refusal.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha 9)"
+export STUB_PR_VIEW="{\"number\":55,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES_EXIT=1
+export STUB_CHECK_RUNS='{"check_runs":[{"name":"CI","status":"completed","conclusion":"success"}]}'
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-55\",\"name\":\"XZO-DEV-BACKEND PR #55\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-55.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+bash "$GATE" check 55 | jq -e '
+  .fetchOk == false and .settled == false and
+  .migrationsTouched == true and .frontendTouched == true
 ' >/dev/null
 
 echo "smoke pr gate tests passed"

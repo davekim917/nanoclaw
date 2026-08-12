@@ -770,8 +770,11 @@ Commands: `poll` (default), `check <pr>` (read-only, mirrors the develop
 gate's `check`), `claim <run-id> <pr> <sha>`, `progress <run-id>`,
 `release <run-id>`, `finish <sha> <run-id> <verdict>`. `progress`/`release`/
 `finish` take no PR argument — the gate recovers it by locating whichever
-PR's state currently holds that run id, so a caller-chosen run id (from
-`claim`) works exactly like a gate-generated one.
+PR's state currently holds that run id. That resolution is only unambiguous
+if run ids are unique across the whole gate, not just within one PR, so
+`claim` enforces it: it refuses a run id that is already active on a
+*different* PR, so a caller-chosen id (from `claim`) is always safe to pass
+to `progress`/`release`/`finish` exactly like a gate-generated one.
 
 A PR settles when: it is open and carries `SMOKE_GATE_LABEL` (default
 `render-preview`); its backend preview exists, is `live`, and its deploy

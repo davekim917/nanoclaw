@@ -45,6 +45,13 @@ WARMUP_TIMEOUT="${SMOKE_GATE_WARMUP_TIMEOUT:-600}"
 
 CONTROL_FILE="$STATE_DIR/control.json"
 CONTROL_LOCK="$STATE_DIR/control.lock"
+# Most CONTROL_LOCK call sites use `flock -w 5 8 || true` — best-effort, not
+# fail-closed like the per-PR locks. Accepted: under rare contention (two
+# concurrent polls hitting the same misconfig/fetch-failure/preflight edge at
+# once) the worst case is a duplicate throttled alarm, never a lost or
+# corrupted write — informational, not correctness-critical. `claim`'s use of
+# this lock is the one exception and DOES fail closed (see below), because it
+# guards a real write (cross-PR run-id uniqueness), not just an alarm stamp.
 
 # Deployment-specific path conventions from the design doc — not exposed as
 # env because they are facts about this repo's layout, not gate policy.
@@ -209,22 +216,27 @@ healthz_ok() {
 # defaults to not-ready. Prints one JSON facts line.
 evaluate_pr() {
   local pr="$1" head_sha="$2"
-  local files_json files_len migrations_touched frontend_touched is_freeze ci_sha
+  local files_json files_len files_fetch_failed migrations_touched frontend_touched is_freeze ci_sha
   local checks_json ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
   local services_json backend backend_id backend_url backend_deploy_sha backend_ready
   local frontend frontend_id frontend_url frontend_deploy_sha frontend_ready
   local healthz_ready settled fetch_ok=true
 
+  files_fetch_failed=false
   if ! files_json="$(timeout 10 gh api "repos/$REPO/pulls/$pr/files?per_page=100" 2>/dev/null)" ||
      ! jq -e 'type == "array"' <<<"$files_json" >/dev/null 2>&1; then
     fetch_ok=false
     files_json='[]'
+    files_fetch_failed=true
   fi
   files_len="$(jq -r 'length' <<<"$files_json" 2>/dev/null || printf 0)"
-  if [ "$files_len" -ge 100 ] 2>/dev/null; then
-    # Truncated — cannot prove either path was NOT touched. Fail closed on
-    # both: assume migrations touched (refuse) and frontend touched (require
-    # the frontend preview too).
+  if [ "$files_fetch_failed" = true ] || { [ "$files_len" -ge 100 ] 2>/dev/null; }; then
+    # Truncated OR the fetch itself failed — cannot prove either path was NOT
+    # touched. Fail closed on both: assume migrations touched (refuse) and
+    # frontend touched (require the frontend preview too). Before this fix
+    # the fetch-failure path fell through to the empty-array branch below,
+    # which computed both as false — the exact fail-OPEN bug this comment
+    # already promised was impossible (P1-2, confirmed live 2026-08-12).
     migrations_touched=true
     frontend_touched=true
   else
@@ -377,6 +389,11 @@ if [ "$COMMAND" = "check" ]; then
   fi
   HEAD_SHA="$(jq -r '.headRefOid' <<<"$PR_JSON")"
   FACTS="$(evaluate_pr "$PR" "$HEAD_SHA")"
+  # Belt and braces (P1-2): `check` is the one path a human trusts before a
+  # manual claim, so it must never assert settled:true on a fetch failure —
+  # independent of whatever evaluate_pr's own per-field fail-closed defaults
+  # did, in case a future field is added there without updating this clamp.
+  FACTS="$(jq -c 'if .fetchOk != true then .settled = false else . end' <<<"$FACTS")"
   jq -cn --argjson facts "$FACTS" '{ok:true} + {eligible:true} + $facts'
   exit 0
 fi
@@ -397,6 +414,27 @@ if [ "$COMMAND" = "claim" ]; then
   if ! printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{40}$'; then
     jq -cn '{ok:false,error:"claim requires the 40-character frozen head SHA"}'
     exit 2
+  fi
+  # Run ids must be unique across the WHOLE gate, not just within one PR's
+  # state file — finish/progress/release resolve a bare run id by scanning
+  # every pr-*-state.json for the first match (find_pr_for_run), so two PRs
+  # sharing a caller-chosen id makes that resolution ambiguous: finish could
+  # record PR A's verdict under PR B's SHA and leave PR B a zombie forever
+  # "active". Serialize the whole claim behind CONTROL_LOCK (same lock
+  # ordering as poll's preflight-then-claim path: control lock first, then
+  # the target PR's own lock) so the scan below can't race a concurrent claim
+  # on a different PR.
+  exec 8>"$CONTROL_LOCK"
+  if ! flock -w 5 8; then
+    jq -cn --argjson pr "$PR" '{ok:false,error:"gate lock failed",pr:$pr}'
+    exit 0
+  fi
+  OTHER_PR="$(find_pr_for_run "$RUN_ID" || true)"
+  if [ -n "$OTHER_PR" ] && [ "$OTHER_PR" != "$PR" ]; then
+    jq -cn --argjson pr "$PR" --argjson otherPr "$OTHER_PR" --arg run "$RUN_ID" \
+      '{ok:false,error:"run id already claimed on a different PR — run ids must be unique across the gate",
+        pr:$pr,runId:$run,activePr:$otherPr}'
+    exit 0
   fi
   exec 9>"$(pr_lock_file "$PR")"
   if ! flock -w 5 9; then
@@ -614,10 +652,15 @@ fi
 PR_LIST_JSON="$(timeout 10 gh pr list -R "$REPO" --base "$BRANCH" --label "$LABEL" --state open \
   --json number,headRefOid --limit 100 2>/dev/null)"
 PR_LIST_RC=$?
-# Exit code AND shape both gate here — a command that fails but still prints
-# something that happens to parse as an empty/valid array must not be read
-# as a legitimate "no labeled PRs" result.
-if [ "$PR_LIST_RC" -ne 0 ] || ! jq -e 'type == "array"' <<<"$PR_LIST_JSON" >/dev/null 2>&1; then
+PR_LIST_LEN="$(jq -r 'length' <<<"$PR_LIST_JSON" 2>/dev/null || printf -- '-1')"
+# Exit code, shape, AND truncation (>=100, the --limit ceiling — same guard
+# evaluate_pr already applies to its own files/check-runs fetches) all gate
+# here. A command that fails but still prints something that happens to
+# parse as an empty/valid array must not be read as a legitimate "no labeled
+# PRs" result, and a truncated page must not be read as "only these PRs are
+# labeled" — either way some labeled PRs would silently never get polled.
+if [ "$PR_LIST_RC" -ne 0 ] || ! jq -e 'type == "array"' <<<"$PR_LIST_JSON" >/dev/null 2>&1 || \
+   [ "$PR_LIST_LEN" -ge 100 ] 2>/dev/null; then
   exec 8>"$CONTROL_LOCK"
   flock -w 5 8 || true
   CONTROL="$(read_control)"
