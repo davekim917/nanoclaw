@@ -2425,28 +2425,41 @@ describe('shouldReapIdleChatContainer', () => {
   const JUST_QUIET = NOW - CHAT_IDLE_REAP_MS + 1;
 
   it('reaps a chat container quiet past the floor with nothing pending', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, NOW)).toBe(true);
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(true);
   });
 
   it('keeps a chat container inside the quiet floor', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, JUST_QUIET, NOW)).toBe(false);
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, JUST_QUIET, JUST_QUIET, NOW)).toBe(false);
   });
 
   it('keeps a chat container while work is due or claimed', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 1, 0, false, LONG_QUIET, NOW)).toBe(false);
-    expect(shouldReapIdleChatContainer(THREAD, 0, 1, false, LONG_QUIET, NOW)).toBe(false);
+    expect(shouldReapIdleChatContainer(THREAD, 1, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
+    expect(shouldReapIdleChatContainer(THREAD, 0, 1, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
   });
 
   it('keeps a chat container with a pending work_continuation promise', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, true, LONG_QUIET, NOW)).toBe(false);
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, true, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
   });
 
   it('keeps a chat container that has never produced output', () => {
-    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, null, NOW)).toBe(false);
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, null, LONG_QUIET, NOW)).toBe(false);
   });
 
   it('never reaps a task-thread session through the chat policy', () => {
-    expect(shouldReapIdleChatContainer('system:tasks:task-1', 0, 0, false, LONG_QUIET, NOW)).toBe(false);
+    expect(shouldReapIdleChatContainer('system:tasks:task-1', 0, 0, false, LONG_QUIET, LONG_QUIET, NOW)).toBe(false);
+  });
+
+  // The live failure: a user message arrives 16 min after the previous reply,
+  // the container consumes it (so dueCount is already 0) and is killed 11s
+  // into the turn before emitting its first status. Outbound alone cannot see
+  // this; inbound can.
+  it('keeps a chat container that just consumed a message but has not replied yet', () => {
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, JUST_QUIET, NOW)).toBe(false);
+  });
+
+  it('still reaps when the newest inbound is also past the floor', () => {
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, JUST_QUIET, LONG_QUIET, NOW)).toBe(false);
+    expect(shouldReapIdleChatContainer(THREAD, 0, 0, false, LONG_QUIET, null, NOW)).toBe(true);
   });
 });
 

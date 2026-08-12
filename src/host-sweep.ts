@@ -916,12 +916,33 @@ export function shouldReapIdleChatContainer(
   processingClaimCount: number,
   hasActiveContinuation: boolean,
   lastOutboundAtMs: number | null,
+  lastInboundAtMs: number | null,
   now: number,
 ): boolean {
   if (isTaskThread(threadId)) return false; // task threads use shouldReapIdleTaskContainer
   if (dueMessageCount !== 0 || processingClaimCount !== 0 || hasActiveContinuation) return false;
   if (lastOutboundAtMs === null) return false;
-  return now - lastOutboundAtMs >= CHAT_IDLE_REAP_MS;
+  // Idleness is the newest activity in EITHER direction, not just outbound.
+  // A container that has consumed a fresh message but not yet emitted its
+  // first status looks identical to an idle one from outbound alone, and the
+  // other guards do not cover it: the row is already `completed` so dueCount
+  // is 0, and processing claims are not written on this path. Observed live
+  // 2026-08-12 — a user message landed 16.0 min after the previous reply and
+  // the reaper killed the container 11s into the turn, so the turn produced
+  // no answer at all. 15 min after the last reply is precisely when a human
+  // returns to a thread, so this was the common case, not an edge.
+  const lastActivityAtMs = Math.max(lastOutboundAtMs, lastInboundAtMs ?? 0);
+  return now - lastActivityAtMs >= CHAT_IDLE_REAP_MS;
+}
+
+/** Most recent messages_in timestamp for a session, or null if it has none. */
+function getLastInboundAtMs(inDb: Database.Database): number | null {
+  const row = inDb.prepare('SELECT timestamp FROM messages_in ORDER BY seq DESC LIMIT 1').get() as
+    | { timestamp: string }
+    | undefined;
+  if (!row) return null;
+  const ms = Date.parse(row.timestamp);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 /** Most recent messages_out timestamp for a session, or null if it has never produced output. */
@@ -1353,6 +1374,7 @@ async function sweepSession(session: Session): Promise<number | null> {
           processingClaimCount,
           workContinuation !== null,
           getLastOutboundAtMs(outDb),
+          getLastInboundAtMs(inDb),
           Date.now(),
         )
       ) {
