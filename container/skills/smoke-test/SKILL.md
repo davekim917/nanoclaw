@@ -753,6 +753,72 @@ release channel remains the ship authority: send it the final verdict, PRs,
 deployed SHA, and remaining decision. Never let the smoke task auto-merge or
 promote production.
 
+### PR-scoped campaigns (Render preview environments)
+
+`scripts/smoke-pr-gate.sh` is the develop gate's sibling for a labeled PR's
+own Render preview instead of the shared develop environment. Because a PR
+preview is immutable-by-construction from everyone except the PR author, the
+develop gate's environment-serialization machinery does not exist here: no
+wake window, no merge hold, no `qa/freeze` status, no develop-hold file. State
+is split per PR (one state file, one `flock`, keyed by PR number) so unrelated
+PRs never contend, and `poll` may find several PRs settled at once but emits
+at most **one** wake per call — the coordinator that consumes it is serial.
+Same conventions as the develop gate otherwise: env-only config, jq-composed
+state, fail-closed on every fetch, one-line JSON stdout.
+
+Commands: `poll` (default), `check <pr>` (read-only, mirrors the develop
+gate's `check`), `claim <run-id> <pr> <sha>`, `progress <run-id>`,
+`release <run-id>`, `finish <sha> <run-id> <verdict>`. `progress`/`release`/
+`finish` take no PR argument — the gate recovers it by locating whichever
+PR's state currently holds that run id. That resolution is only unambiguous
+if run ids are unique across the whole gate, not just within one PR, so
+`claim` enforces it: it refuses a run id that is already active on a
+*different* PR, so a caller-chosen id (from `claim`) is always safe to pass
+to `progress`/`release`/`finish` exactly like a gate-generated one.
+
+A PR settles when: it is open and carries `SMOKE_GATE_LABEL` (default
+`render-preview`); its backend preview exists, is `live`, and its deploy
+commit equals the PR head SHA; the frontend preview additionally matches when
+the diff touches `XZO-FRONTEND/`; CI is green on the head — **except** a
+freeze PR (see below), where CI is checked on the head's *parent* commit,
+since freeze commits get no path-filtered CI of their own; and the backend's
+`/healthz` returns 200 (a fresh preview can read `{"status":"warming"}` for
+~6-10 minutes after `live` — the gate never sleeps waiting this out, it just
+reports not-settled and lets the next poll catch it). Any labeled PR whose
+diff touches `XZO-BACKEND/migrations/` is refused outright (one throttled
+`pr_migrations_refused` alarm, never a settle) — a preview boot runs
+migrations against the **shared** dev Postgres. `finish` records a per-PR
+verdict JSON under the state dir, then suspends the backend preview
+(`POST .../suspend`) so a finished PR stops billing compute while it waits on
+merge/close; a failed suspend is logged in the JSON, never fails the finish.
+Teardown itself is Render's job (auto-delete on PR close) — this gate and
+`smoke-freeze-pr.sh` never delete services.
+
+**Freeze PRs** turn the same mechanism into an on-demand frozen environment
+for an arbitrary develop SHA — useful when a campaign needs a still target
+without waiting on (or being voided by) develop's own merge volume.
+`scripts/smoke-freeze-pr.sh <target-sha>` brands a branch at that SHA with one
+marker commit (`.render-freeze`, containing the target SHA, under both
+service rootDirs — a real diff, since an empty commit triggers no preview),
+opens it as a draft PR against `SMOKE_GATE_BRANCH` with the preview label, and
+prints `{prNumber, branch, freezeSha, targetSha}`. `smoke-pr-gate.sh` polls it
+like any other labeled PR; close the PR when the campaign is done.
+
+Config: `SMOKE_GATE_REPO`, `SMOKE_GATE_BRANCH` (default `develop`),
+`SMOKE_GATE_BACKEND_SERVICE` / `SMOKE_GATE_FRONTEND_SERVICE` (the **base**
+Render service ids — previews are discovered per PR by matching
+`serviceDetails.parentServer.id` plus a `PR #<n>` name suffix, never
+hardcoded preview ids), `SMOKE_GATE_LABEL`, `SMOKE_GATE_STATE_DIR`,
+`SMOKE_GATE_RUN_PREFIX`, `SMOKE_GATE_PREFLIGHT_CMD` / `_TIMEOUT` (same
+seam and semantics as the develop gate — one readiness command run once per
+poll, immediately before a settled candidate is actually claimed), and
+`SMOKE_GATE_WARMUP_TIMEOUT` (default 600s — a backend stuck past this long
+without a healthy `/healthz` after going `live` raises one throttled
+`pr_warmup_stuck` alarm instead of polling silently forever).
+
+Full design and the live Render verification behind every rule above:
+`groups/_ops/specs/fleet-hardening/phase5-preview-envs.md`.
+
 ## Cost controls
 
 - Two provider-native worker lanes by default: Sonnet/xhigh under the
