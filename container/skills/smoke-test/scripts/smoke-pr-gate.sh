@@ -42,6 +42,18 @@ PREFLIGHT_REARM_FLOOR_SECONDS="${SMOKE_GATE_PREFLIGHT_REARM_FLOOR_SECONDS:-900}"
 # fresh disk. Below this ceiling, "still warming" is normal and silent. At or
 # past it, a backend stuck warming this long is worth one throttled alarm.
 WARMUP_TIMEOUT="${SMOKE_GATE_WARMUP_TIMEOUT:-600}"
+# Freeze-PR handoff wiring, `finish` only, freeze PRs only (see the header
+# comment above `detect_freeze` and the `finish` command below). All three
+# are no-ops unless set — a deployment that never wires them keeps today's
+# behavior: finish still records a verdict and suspends the preview, nothing
+# more.
+PUBLISH_FILE="${SMOKE_GATE_PUBLISH_FILE:-}"
+HOLD_FILE="${SMOKE_GATE_HOLD_FILE:-}"
+# Same path the develop gate reads as its own HANDOFF_LEDGER (its
+# SMOKE_GATE_STATE_DIR/handoff-ledger.jsonl) — the wrapper is responsible for
+# pointing this at that file. Single writer per file: this gate APPENDS,
+# never rewrites; the develop gate only ever reads.
+HANDOFF_LEDGER="${SMOKE_GATE_HANDOFF_LEDGER:-}"
 
 CONTROL_FILE="$STATE_DIR/control.json"
 CONTROL_LOCK="$STATE_DIR/control.lock"
@@ -353,6 +365,29 @@ evaluate_pr() {
     }'
 }
 
+# Minimal freeze-PR detection for `finish` only — NOT evaluate_pr, which does
+# far more (CI/deploy/healthz) that finish has no use for.
+# ponytail: duplicates evaluate_pr's ~8-line files-diff/marker check rather
+# than threading a shared helper through two call sites with very different
+# needs (finish wants exactly 2 fetches total; reusing evaluate_pr here would
+# cost 4 more — check-runs, services, two deploy lookups, a healthz curl —
+# entirely wasted, since finish already has its own verdict from the caller).
+detect_freeze() {
+  local pr="$1" sha="$2" files_json is_freeze target_sha
+  files_json="$(timeout 10 gh api "repos/$REPO/pulls/$pr/files?per_page=100" 2>/dev/null)"
+  jq -e 'type == "array"' <<<"$files_json" >/dev/null 2>&1 || files_json='[]'
+  is_freeze="$(jq -r --arg a "$FREEZE_MARKER_BACKEND" --arg b "$FREEZE_MARKER_FRONTEND" '
+    (length == 2) and ((map(.filename) | sort) == ([$a,$b] | sort))
+  ' <<<"$files_json" 2>/dev/null)"
+  [ "$is_freeze" = true ] || is_freeze=false
+  target_sha=""
+  if [ "$is_freeze" = true ]; then
+    target_sha="$(timeout 8 gh api "repos/$REPO/commits/$sha" --jq '.parents[0].sha // empty' 2>/dev/null)"
+  fi
+  jq -cn --argjson isFreeze "$is_freeze" --arg target "$target_sha" \
+    '{isFreezePr:$isFreeze, targetSha:(if $target == "" then null else $target end)}'
+}
+
 COMMAND="${1:-poll}"
 
 # ---------------------------------------------------------------------------
@@ -601,13 +636,98 @@ if [ "$COMMAND" = "finish" ]; then
     SUSPEND_REASON="failed to list services"
   fi
 
+  # Freeze-PR develop handoff (SMOKE_GATE_PUBLISH_FILE / SMOKE_GATE_HOLD_FILE
+  # / SMOKE_GATE_HANDOFF_LEDGER — set by the wrapper only for a deployment
+  # wired for smoke-develop-gate.sh's handoff mode). Non-freeze PRs and
+  # deployments that never set these are completely untouched: detect_freeze
+  # only runs when at least one of publish/hold is configured, and nothing
+  # below writes anything unless this PR turns out to be a freeze PR.
+  HANDOFF_WRITTEN=false
+  HANDOFF_REASON=""
+  HANDOFF_TARGET_SHA=""
+  if [ -n "$PUBLISH_FILE" ] || [ -n "$HOLD_FILE" ]; then
+    FREEZE_INFO="$(detect_freeze "$PR" "$SHA")"
+    if [ "$(jq -r '.isFreezePr' <<<"$FREEZE_INFO")" = true ]; then
+      TARGET_SHA="$(jq -r '.targetSha // empty' <<<"$FREEZE_INFO")"
+      if [ -z "$TARGET_SHA" ]; then
+        HANDOFF_REASON="could not determine the target develop sha for this freeze PR — hold/publish/ledger not written"
+      else
+        HANDOFF_TARGET_SHA="$TARGET_SHA"
+        # Publish + hold, the develop gate's EXACT semantics, keyed to the
+        # TARGET develop sha (not the freeze marker sha) — every downstream
+        # reader (release promotion, the develop gate's own reconciliation)
+        # only ever reasons about develop lineage, never a freeze branch that
+        # is about to be closed and torn down.
+        if [ -n "$PUBLISH_FILE" ]; then
+          mkdir -p "$(dirname "$PUBLISH_FILE")"
+          PUB_TMP="$(mktemp "$(dirname "$PUBLISH_FILE")/.latest-verdict.XXXXXX")"
+          jq -cn --arg sha "$TARGET_SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
+            '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now}' > "$PUB_TMP"
+          mv "$PUB_TMP" "$PUBLISH_FILE"
+        fi
+        if [ -n "$HOLD_FILE" ]; then
+          case "$VERDICT" in
+            NO_GO)
+              mkdir -p "$(dirname "$HOLD_FILE")"
+              HOLD_TMP="$(mktemp "$(dirname "$HOLD_FILE")/.develop-hold.XXXXXX")"
+              jq -cn --arg sha "$TARGET_SHA" --arg run "$RUN_ID" --arg now "$NOW" \
+                '{schemaVersion:1,sha:$sha,runId:$run,verdict:"NO_GO",raisedAt:$now,
+                  reason:"confirmed defects on this develop lineage — see the run thread and run directory"}' > "$HOLD_TMP"
+              mv "$HOLD_TMP" "$HOLD_FILE"
+              ;;
+            GO)
+              rm -f "$HOLD_FILE"
+              ;;
+            # BLOCKED / HUMAN_DECISION leave the hold untouched — same as the
+            # develop gate's own finish.
+          esac
+        fi
+        HANDOFF_WRITTEN=true
+        if [ -n "$HANDOFF_LEDGER" ]; then
+          mkdir -p "$(dirname "$HANDOFF_LEDGER")" 2>/dev/null
+          LEDGER_APPENDED=false
+          # One bounded retry (2 attempts total, 5s wait each): the develop
+          # gate has no other way to learn this outcome, so a single
+          # transient contention loss must not silently drop it.
+          for LEDGER_ATTEMPT in 1 2; do
+            exec 7>"$HANDOFF_LEDGER.lock"
+            if flock -w 5 7; then
+              jq -cn --arg target "$TARGET_SHA" --arg freeze "$SHA" --argjson pr "$PR" \
+                --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
+                '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,
+                  runId:$run,verdict:$verdict,finishedAt:$now}' >> "$HANDOFF_LEDGER"
+              flock -u 7
+              LEDGER_APPENDED=true
+              break
+            fi
+            flock -u 7 2>/dev/null
+          done
+          if [ "$LEDGER_APPENDED" != true ]; then
+            # The publish/hold artifacts above are correctly written, but the
+            # develop gate will never see this outcome without the ledger
+            # line — from its side that is indistinguishable from "never
+            # finished", so `written` must reflect the WHOLE handoff, not
+            # just the artifact files.
+            HANDOFF_WRITTEN=false
+            HANDOFF_REASON="ledger append failed after retry — develop gate will not see this outcome until a manual sync or a later re-finish"
+          fi
+        fi
+      fi
+    fi
+  fi
+
   VERDICT_JSON="$(jq -cn \
     --argjson pr "$PR" --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
     --argjson attempted "$SUSPEND_ATTEMPTED" --argjson ok "$SUSPEND_OK" \
     --argjson status "$SUSPEND_STATUS" --arg reason "$SUSPEND_REASON" \
+    --argjson handoffWritten "$HANDOFF_WRITTEN" --arg handoffReason "$HANDOFF_REASON" \
+    --arg handoffTargetSha "$HANDOFF_TARGET_SHA" \
     '{schemaVersion:1,pr:$pr,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now,
       suspend:{attempted:$attempted,ok:$ok,httpStatus:$status,
-               reason:(if $reason == "" then null else $reason end)}}')"
+               reason:(if $reason == "" then null else $reason end)},
+      handoff:{written:$handoffWritten,
+               targetSha:(if $handoffTargetSha == "" then null else $handoffTargetSha end),
+               reason:(if $handoffReason == "" then null else $handoffReason end)}}')"
   VERDICT_TMP="$(mktemp "$STATE_DIR/.pr-$PR-verdict.XXXXXX")"
   printf '%s\n' "$VERDICT_JSON" > "$VERDICT_TMP"
   mv "$VERDICT_TMP" "$(pr_verdict_file "$PR")"

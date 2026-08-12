@@ -67,6 +67,7 @@ case "$*" in
 esac
 case "$1 $2" in
   "pr list") printf '%s\n' ${STUB_PR_HEADS:-}; exit 0 ;;
+  "pr view") printf '{"state":"%s"}' "${STUB_FREEZE_PR_STATE:-OPEN}"; exit 0 ;;
   "api repos/org/repo/branches/develop")
     printf '{"commit":{"sha":"%s"}}' "$STUB_SOURCE_SHA" ;;
   "run list")
@@ -89,7 +90,15 @@ case "$*" in
   *)       printf '[{"status":"live","commit":{"id":"%s"}}]' "${STUB_FRONTEND_SHA:-$STUB_SOURCE_SHA}" ;;
 esac
 STUB
-chmod +x "$STUB_BIN/gh" "$STUB_BIN/curl"
+cat > "$STUB_BIN/freeze-helper" <<'STUB'
+#!/usr/bin/env bash
+set -u
+[ -n "${STUB_FREEZE_EXIT+x}" ] || STUB_FREEZE_EXIT=0
+[ -n "${STUB_FREEZE_JSON+x}" ] || STUB_FREEZE_JSON='{"ok":false,"error":"no STUB_FREEZE_JSON configured"}'
+printf '%s' "$STUB_FREEZE_JSON"
+exit "$STUB_FREEZE_EXIT"
+STUB
+chmod +x "$STUB_BIN/gh" "$STUB_BIN/curl" "$STUB_BIN/freeze-helper"
 export PATH="$STUB_BIN:$PATH"
 export STUB_SOURCE_SHA="$BUILD_SHA"
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-b \
@@ -192,7 +201,9 @@ fresh_state() {
   export SMOKE_GATE_DEBOUNCE_SECONDS=0
   unset SMOKE_GATE_FRONTEND_PATHS SMOKE_GATE_BACKEND_PATHS SMOKE_GATE_ACTIVE_FILE \
         STUB_FRONTEND_SHA STUB_BACKEND_SHA STUB_FRONTEND_CI STUB_COMPARE_FILES \
-        SMOKE_GATE_UNSETTLED_ALERT_SECONDS 2>/dev/null || true
+        SMOKE_GATE_UNSETTLED_ALERT_SECONDS \
+        SMOKE_GATE_FREEZE_HANDOFF SMOKE_GATE_FREEZE_HELPER SMOKE_GATE_HOLD_FILE \
+        STUB_FREEZE_EXIT STUB_FREEZE_JSON STUB_FREEZE_PR_STATE 2>/dev/null || true
 }
 
 # 16. Backend-only merge: frontend deploy lags, nothing under frontend paths
@@ -426,5 +437,225 @@ export STUB_SOURCE_SHA="$(printf '1%.0s' $(seq 40))"   # hex only: the gate vali
 unset SMOKE_GATE_PREFLIGHT_CMD 2>/dev/null || true
 bash "$GATE" poll >/dev/null
 bash "$GATE" poll | jq -e '.data.trigger == "develop_build_settled"' >/dev/null
+
+# --- 25. Handoff mode: settle cuts a freeze PR instead of opening a QA
+# campaign, at the exact point develop_build_settled would otherwise fire.
+# wakeAgent stays FALSE — zero agent tokens on the trigger step.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+FREEZE_TARGET="$(printf '1%.0s' $(seq 40))"
+FREEZE_HEAD="$(printf '2%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$FREEZE_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":21,\"branch\":\"smoke/freeze-h\",\"freezeSha\":\"$FREEZE_HEAD\",\"targetSha\":\"$FREEZE_TARGET\"}"
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "debouncing_candidate"' >/dev/null
+bash "$GATE" poll | jq -e --arg sha "$FREEZE_TARGET" --arg freeze "$FREEZE_HEAD" '
+  .wakeAgent == false and .data.trigger == "develop_freeze_opened" and
+  .data.freezePr == 21 and .data.freezeSha == $freeze and
+  .data.targetSha == $sha and .data.sourceSha == $sha
+' >/dev/null
+jq -e --arg sha "$FREEZE_TARGET" --arg freeze "$FREEZE_HEAD" '
+  .handoffFreezePr == 21 and .handoffFreezeSha == $freeze and .handoffTargetSha == $sha and
+  .activeSha == null and .activeRunId == null
+' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# --- 26. A new settled candidate while the handoff is open queues exactly
+# like queued_behind_active_run — never a second freeze (one at a time, v1).
+NEW_HEAD_SHA="$(printf '3%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$NEW_HEAD_SHA"
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "queued_behind_active_run"' >/dev/null
+jq -e --arg sha "$FREEZE_TARGET" --arg newsha "$NEW_HEAD_SHA" '
+  .handoffTargetSha == $sha and .candidateSha == $newsha
+' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# --- 27. Abandoned-handoff recovery: the freeze PR closed with no completed
+# verdict ever recorded. Frees the slot AND alarms in the same poll — a
+# closed-with-no-verdict freeze PR is evidence a campaign died silently.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+ABANDON_TARGET="$(printf '4%.0s' $(seq 40))"
+ABANDON_HEAD="$(printf '5%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$ABANDON_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":33,\"branch\":\"smoke/freeze-m\",\"freezeSha\":\"$ABANDON_HEAD\",\"targetSha\":\"$ABANDON_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+export STUB_FREEZE_PR_STATE=CLOSED
+bash "$GATE" poll | jq -e --argjson pr 33 --arg sha "$ABANDON_TARGET" '
+  .wakeAgent == true and .data.trigger == "develop_freeze_abandoned" and
+  .data.freezePr == $pr and .data.targetSha == $sha
+' >/dev/null
+jq -e '
+  .handoffFreezePr == null and .handoffTargetSha == null and .completedSha == null
+' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# --- 28. Dedup advance: smoke-pr-gate.sh's finish appends a ledger entry for
+# the target sha. The next poll on the SAME source sha adopts it as completed
+# (already_completed) instead of re-freezing — the ledger is the single
+# source of truth for "this develop SHA already ran."
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+DEDUP_TARGET="$(printf '6%.0s' $(seq 40))"
+DEDUP_HEAD="$(printf '7%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$DEDUP_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":44,\"branch\":\"smoke/freeze-p\",\"freezeSha\":\"$DEDUP_HEAD\",\"targetSha\":\"$DEDUP_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+jq -cn --arg target "$DEDUP_TARGET" --arg freeze "$DEDUP_HEAD" --argjson pr 44 \
+  --arg run "smoke-pr44-run-1" --arg verdict "GO" --arg now "2026-08-12T00:00:00Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "already_completed"' >/dev/null
+jq -e --arg sha "$DEDUP_TARGET" --arg run "smoke-pr44-run-1" '
+  .completedSha == $sha and .completedVerdict == "GO" and .completedRunId == $run and
+  .handoffFreezePr == null and .handoffTargetSha == null
+' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# --- 29. Tamper check accepts a legitimate freeze-run hold, and still fires
+# on a genuinely foreign one. The ledger consult (28) runs BEFORE hold-file
+# reconciliation every poll, so a hold this exact finish wrote is never read
+# as tampered — not even transiently on the first poll that sees it.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+TAMPER_HOLD="$STATE_DIR2/pub/develop-hold.json"
+export SMOKE_GATE_HOLD_FILE="$TAMPER_HOLD"
+TAMPER_TARGET="$(printf '8%.0s' $(seq 40))"
+TAMPER_HEAD="$(printf '9%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$TAMPER_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":55,\"branch\":\"smoke/freeze-r\",\"freezeSha\":\"$TAMPER_HEAD\",\"targetSha\":\"$TAMPER_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+FREEZE_RUN_ID="smoke-pr55-run-tamper-ok"
+mkdir -p "$(dirname "$TAMPER_HOLD")"
+jq -cn --arg sha "$TAMPER_TARGET" --arg run "$FREEZE_RUN_ID" --arg now "2026-08-12T00:00:00Z" \
+  '{schemaVersion:1,sha:$sha,runId:$run,verdict:"NO_GO",raisedAt:$now,reason:"x"}' > "$TAMPER_HOLD"
+jq -cn --arg target "$TAMPER_TARGET" --arg freeze "$TAMPER_HEAD" --argjson pr 55 \
+  --arg run "$FREEZE_RUN_ID" --arg verdict "NO_GO" --arg now "2026-08-12T00:00:00Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e '
+  .data.trigger == "already_completed" and .data.trigger != "gate_hold_tampered"
+' >/dev/null
+# Now corrupt the hold to a runId that matches neither the ledger nor this
+# gate's own completedRunId — a genuinely foreign hold must still be caught.
+printf '{"runId":"someone-else-entirely"}' > "$TAMPER_HOLD"
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "gate_hold_tampered" and .data.holdIntegrity == "mismatched"
+' >/dev/null
+
+# --- 30. P1 regression: ledger adoption must bind to the SAME freezePr as
+# the currently open handoff, not just targetSha — targetSha is the develop
+# head SHA, public and echoed in our own wake payload, so it alone proves
+# nothing. Reproduced exactly as reported: a forged/stale line naming a
+# DIFFERENT freezePr (999) for the real handoff's targetSha must never be
+# adopted, must never free the real handoff (PR 100), and must alarm once
+# rather than silently mis-completing a campaign that never ran.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+FORGE_TARGET="$(printf 'a%.0s' $(seq 40))"
+FORGE_HEAD="$(printf 'b%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$FORGE_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":100,\"branch\":\"smoke/freeze-a\",\"freezeSha\":\"$FORGE_HEAD\",\"targetSha\":\"$FORGE_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened" and .data.freezePr == 100' >/dev/null
+jq -cn --arg target "$FORGE_TARGET" --arg freeze "$FORGE_HEAD" --argjson pr 999 \
+  --arg run "smoke-pr999-fake-run" --arg verdict "GO" --arg now "2026-08-12T00:00:00Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e --argjson expected 100 --argjson got 999 --arg sha "$FORGE_TARGET" '
+  .wakeAgent == true and .data.trigger == "develop_freeze_ledger_tampered" and
+  .data.expectedFreezePr == $expected and .data.gotFreezePr == $got and .data.targetSha == $sha
+' >/dev/null
+jq -e --argjson pr 100 --arg sha "$FORGE_TARGET" '
+  .handoffFreezePr == $pr and .handoffTargetSha == $sha and .completedSha == null
+' "$STATE_DIR2/develop-state.json" >/dev/null
+# Latched: the identical mismatch does not re-alarm every poll — the real
+# handoff (PR 100) is still open, so the busy-check reports it as such.
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "already_active"' >/dev/null
+
+# --- 31. develop_freeze_abandoned now names the target SHA's own hold/
+# publish artifacts, so the responder checks for a completed-but-unrecorded
+# campaign before assuming the campaign died silently.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+HINT_PUBLISH="$STATE_DIR2/pub/latest-verdict.json"
+HINT_HOLD="$STATE_DIR2/pub/develop-hold.json"
+export SMOKE_GATE_PUBLISH_FILE="$HINT_PUBLISH" SMOKE_GATE_HOLD_FILE="$HINT_HOLD"
+HINT_TARGET="$(printf 'c%.0s' $(seq 40))"
+HINT_HEAD="$(printf 'd%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$HINT_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":66,\"branch\":\"smoke/freeze-c\",\"freezeSha\":\"$HINT_HEAD\",\"targetSha\":\"$HINT_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+export STUB_FREEZE_PR_STATE=CLOSED
+bash "$GATE" poll | jq -e --arg publish "$HINT_PUBLISH" --arg hold "$HINT_HOLD" '
+  .data.trigger == "develop_freeze_abandoned" and
+  (.data.hint | length) > 0 and .data.publishFile == $publish and .data.holdFile == $hold
+' >/dev/null
+unset SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE STUB_FREEZE_PR_STATE
+
+# --- 32. P3: a freeze-helper "branch already exists" failure names the
+# orphaned branch in the alarm data, not just the free-text reason.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+ORPHAN_SHA="$(printf 'e%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$ORPHAN_SHA"
+export STUB_FREEZE_JSON='{"ok":false,"error":"branch already exists — delete it first or pick a different target","branch":"smoke/freeze-eeeeeeeeeeee"}'
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_freeze_failed" and
+  .data.orphanBranch == "smoke/freeze-eeeeeeeeeeee"
+' >/dev/null
+
+# --- 33. P2 regression: a latched tamper mismatch must never shadow
+# abandonment. Reviewer's exact repro: latch the tamper alarm via a
+# mismatched ledger entry, then close the real freeze PR — abandonment must
+# still fire and free the slot. Before the fix, the abandonment check sat
+# only in the `elif` (ledger entirely empty), so ANY targetSha-matching
+# entry — including a mismatched one that only latches the tamper alarm —
+# shadowed it forever: every later poll reported already_active, no
+# abandonment ever fired, and no gate command could clear
+# handoffFreezePr/handoffTargetSha by hand.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+WEDGE_TARGET="$(printf 'f%.0s' $(seq 40))"
+WEDGE_HEAD="$(printf '0%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$WEDGE_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":200,\"branch\":\"smoke/freeze-f\",\"freezeSha\":\"$WEDGE_HEAD\",\"targetSha\":\"$WEDGE_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened" and .data.freezePr == 200' >/dev/null
+jq -cn --arg target "$WEDGE_TARGET" --arg freeze "$WEDGE_HEAD" --argjson pr 777 \
+  --arg run "smoke-pr777-fake-run" --arg verdict "GO" --arg now "2026-08-12T00:00:00Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_ledger_tampered"' >/dev/null
+# The real freeze PR closes with no matching verdict ever recorded.
+export STUB_FREEZE_PR_STATE=CLOSED
+bash "$GATE" poll | jq -e --argjson pr 200 --arg sha "$WEDGE_TARGET" '
+  .wakeAgent == true and .data.trigger == "develop_freeze_abandoned" and
+  .data.freezePr == $pr and .data.targetSha == $sha
+' >/dev/null
+jq -e '
+  .handoffFreezePr == null and .handoffTargetSha == null and .completedSha == null
+' "$STATE_DIR2/develop-state.json" >/dev/null
+unset STUB_FREEZE_PR_STATE
+
+# --- 34. A ledger line with no freezePr at all (malformed) must never crash
+# the tamper-alarm jq (tonumber on the literal "null") — it is treated as a
+# mismatch and still alarms, reporting the raw value instead of erroring
+# into an empty-stdout poll.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+MALFORMED_TARGET="$(printf '3%.0s' $(seq 40))"
+MALFORMED_HEAD="$(printf '4%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$MALFORMED_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":300,\"branch\":\"smoke/freeze-3\",\"freezeSha\":\"$MALFORMED_HEAD\",\"targetSha\":\"$MALFORMED_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+jq -cn --arg target "$MALFORMED_TARGET" --arg freeze "$MALFORMED_HEAD" \
+  --arg run "smoke-malformed-run" --arg verdict "GO" --arg now "2026-08-12T00:00:00Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_freeze_ledger_tampered" and .data.gotFreezePr == "null"
+' >/dev/null
 
 echo "smoke develop gate tests passed"

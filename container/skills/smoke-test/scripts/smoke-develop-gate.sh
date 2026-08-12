@@ -16,6 +16,12 @@ DEV_URL="${SMOKE_GATE_DEV_URL:-}"
 STATE_DIR="${SMOKE_GATE_STATE_DIR:-/workspace/agent/smoke-gate}"
 STATE_FILE="$STATE_DIR/develop-state.json"
 LOCK_FILE="$STATE_DIR/develop-state.lock"
+# Single writer per file: smoke-pr-gate.sh's `finish` (given the SAME path via
+# its own SMOKE_GATE_HANDOFF_LEDGER) APPENDS one line per freeze-run outcome
+# here; this gate only ever reads it. Owned by this gate's state dir (not
+# smoke-pr-gate.sh's) because it is this gate's dedup/tamper-check ledger —
+# smoke-pr-gate.sh has no use for it once written.
+HANDOFF_LEDGER="$STATE_DIR/handoff-ledger.jsonl"
 DEBOUNCE_SECONDS="${SMOKE_GATE_DEBOUNCE_SECONDS:-600}"
 # 4h hard ceiling: campaigns finish in 1-3h; a host restart mid-run otherwise
 # strands the gate for the full window before recovery can reclaim the SHA.
@@ -91,6 +97,19 @@ PREFLIGHT_REARM_FLOOR_SECONDS="${SMOKE_GATE_PREFLIGHT_REARM_FLOOR_SECONDS:-900}"
 # three-way SHA equality can never happen.
 FRONTEND_PATHS="${SMOKE_GATE_FRONTEND_PATHS:-}"
 BACKEND_PATHS="${SMOKE_GATE_BACKEND_PATHS:-}"
+# Opt-in handoff to PR-scoped previews (smoke-pr-gate.sh / smoke-freeze-pr.sh):
+# instead of opening a QA campaign against the shared dev environment, poll
+# cuts a freeze PR pinning develop at the settled SHA and hands the actual
+# campaign to smoke-pr-gate.sh polling that PR like any other labeled PR —
+# the original Phase 5 problem (mid-run merges voiding a campaign on the one
+# shared environment) stops applying, because the frozen preview is nobody
+# else's to move. Unset (default) = today's behavior, byte-for-byte; this
+# whole codepath is inert until explicitly turned on.
+FREEZE_HANDOFF="${SMOKE_GATE_FREEZE_HANDOFF:-false}"
+# Path to smoke-freeze-pr.sh. Required (fail-closed, folded into the existing
+# gate_misconfigured alarm below) whenever FREEZE_HANDOFF is on — there is no
+# fallback freeze mechanism this gate could improvise.
+FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
 # `check` runs the poll derivation and reports settledness WITHOUT mutating
 # state or claiming anything. It exists for human-requested campaigns, which
 # freeze on a person's word rather than on a gate wake and would otherwise
@@ -127,7 +146,14 @@ default_state() {
     lastFailureWakeAt: null,
     holdAlertFor: null,
     preflightReason: null,
-    preflightWakeAt: null
+    preflightWakeAt: null,
+    handoffFreezePr: null,
+    handoffFreezeSha: null,
+    handoffTargetSha: null,
+    handoffOpenedAt: null,
+    freezeFailReason: null,
+    freezeFailWakeAt: null,
+    ledgerTamperAlertFor: null
   }'
 }
 
@@ -487,6 +513,9 @@ MISSING=""
 [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
 [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
 [ -n "$DEV_URL" ] || MISSING="$MISSING SMOKE_GATE_DEV_URL"
+if [ "$FREEZE_HANDOFF" = true ] && { [ -z "$FREEZE_HELPER" ] || [ ! -x "$FREEZE_HELPER" ]; }; then
+  MISSING="$MISSING SMOKE_GATE_FREEZE_HELPER"
+fi
 if [ -n "$MISSING" ]; then
   LAST_FAILURE_WAKE="$(jq -r '.lastFailureWakeAt // empty' <<<"$STATE")"
   LAST_FAILURE_EPOCH="$(epoch_or_zero "$LAST_FAILURE_WAKE")"
@@ -707,6 +736,108 @@ if [ "$CI_READY" != true ] || [ "$DEPLOY_READY" != true ]; then
   exit 0
 fi
 
+# Handoff bookkeeping (handoff mode only). Runs BEFORE hold-file
+# reconciliation below and updates completedSha/completedRunId/
+# completedVerdict in-place when the ledger has an answer — so a hold this
+# same freeze-run finish legitimately wrote is read as legitimate on the very
+# first poll that sees it, never flagged gate_hold_tampered. This is the
+# "cleaner ownership split" for point 4: the tamper-check itself is
+# UNCHANGED and still trusts only completedRunId/completedVerdict: it never
+# learns the ledger exists. Consulting the ledger is entirely this block's
+# job, scoped to whatever THIS gate currently believes is its own open
+# handoff (handoffTargetSha) — never an arbitrary ledger line — so a foreign
+# or stale ledger entry can never be laundered into "legitimate" here.
+if [ "$FREEZE_HANDOFF" = true ]; then
+  HANDOFF_TARGET="$(jq -r '.handoffTargetSha // empty' <<<"$STATE")"
+  HANDOFF_PR="$(jq -r '.handoffFreezePr // empty' <<<"$STATE")"
+  if [ -n "$HANDOFF_TARGET" ]; then
+    LEDGER_ENTRY=""
+    if [ -s "$HANDOFF_LEDGER" ]; then
+      LEDGER_ENTRY="$(jq -c --arg t "$HANDOFF_TARGET" 'select(.targetSha == $t)' "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
+    fi
+    # Bind adoption to the SAME freeze PR as the handoff we currently have
+    # open — targetSha alone is not enough to trust a ledger line: it is the
+    # develop head SHA, public and echoed in our own wake payload, so a
+    # forged or stale (a zombie campaign's late finish on a previously
+    # abandoned handoff) line can share it while naming a different PR. A
+    # line with no freezePr at all (malformed) reads as literal "null",
+    # which can never equal a real PR number — falls through to the tamper
+    # path below rather than adopting, and never crashes.
+    L_FREEZE_PR=""
+    [ -n "$LEDGER_ENTRY" ] && L_FREEZE_PR="$(jq -r '.freezePr' <<<"$LEDGER_ENTRY")"
+
+    if [ -n "$LEDGER_ENTRY" ] && [ "$L_FREEZE_PR" = "$HANDOFF_PR" ]; then
+      # The freeze run finished: smoke-pr-gate.sh already wrote the verdict.
+      # Adopt it as this gate's own completed record and free the handoff
+      # slot — the "same develop SHA never re-freezes" dedup advance.
+      L_RUN="$(jq -r '.runId' <<<"$LEDGER_ENTRY")"
+      L_VERDICT="$(jq -r '.verdict' <<<"$LEDGER_ENTRY")"
+      L_FINISHED="$(jq -r '.finishedAt' <<<"$LEDGER_ENTRY")"
+      STATE="$(jq -c --arg sha "$HANDOFF_TARGET" --arg run "$L_RUN" --arg verdict "$L_VERDICT" --arg now "$L_FINISHED" \
+        '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
+         .handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null | .handoffOpenedAt=null |
+         .ledgerTamperAlertFor=null' <<<"$STATE")"
+    elif [ -n "$HANDOFF_PR" ]; then
+      # Either no ledger outcome yet, or one that names a DIFFERENT freeze PR
+      # (tamper-shaped — handled below). Either way, check abandonment
+      # FIRST: a confirmed-CLOSED freeze PR must free the handoff regardless
+      # of what a stale or mismatched ledger tail claims. Checking this only
+      # when the ledger was empty (the original shape) let a single latched
+      # tamper mismatch shadow abandonment forever — closing the real freeze
+      # PR would never be noticed again, and no gate command can clear
+      # handoffFreezePr/handoffTargetSha by hand. Fail-closed on the fetch
+      # itself: a lookup problem means "cannot prove it is closed", so do
+      # NOT reclaim — leave the handoff in place and let a later poll retry.
+      FREEZE_PR_STATE="$(timeout 8 gh pr view "$HANDOFF_PR" -R "$REPO" --json state 2>/dev/null \
+        | jq -r '.state // empty' 2>/dev/null)"
+      if [ "$FREEZE_PR_STATE" = "CLOSED" ] || [ "$FREEZE_PR_STATE" = "MERGED" ]; then
+        # Closed with no completed (matching) verdict ever recorded —
+        # abandoned. Free the slot and alarm regardless of a mismatched or
+        # stale ledger tail: a closed PR is a stronger, independently
+        # verified signal than a ledger line this gate already refused to
+        # trust. Freeing and alarming happen together in the SAME poll, so
+        # there is nothing to re-arm. The alarm names the target SHA's own
+        # publish/hold artifacts (this gate's own config, shared by wrapper
+        # convention with smoke-pr-gate.sh's finish) so the responder checks
+        # whether the campaign actually completed and failed only to report
+        # before assuming it died.
+        STATE="$(jq -c '.handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null |
+                        .handoffOpenedAt=null | .ledgerTamperAlertFor=null' <<<"$STATE")"
+        write_state "$STATE"
+        jq -cn --argjson pr "$HANDOFF_PR" --arg sha "$HANDOFF_TARGET" \
+          --arg publish "$PUBLISH_FILE" --arg hold "$HOLD_FILE" \
+          '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_abandoned",
+            freezePr:$pr,targetSha:$sha,
+            hint:"Before assuming the campaign died, check whether it actually completed but failed only to report: inspect the hold/publish artifacts for this target SHA.",
+            publishFile:(if $publish == "" then null else $publish end),
+            holdFile:(if $hold == "" then null else $hold end)}}'
+        exit 0
+      fi
+      # Still open. No ledger entry at all is silent (no news yet). A
+      # mismatched (or malformed) entry is tamper evidence, same shape as
+      # gate_hold_tampered: never adopt, never free the real handoff — one
+      # latched alarm, not a re-spam every poll, re-arming only if the
+      # offending freezePr changes. `try...catch` guards a malformed line
+      # (freezePr missing → literal "null", not a number) from crashing this
+      # jq call — it reports the raw value instead.
+      if [ -n "$LEDGER_ENTRY" ]; then
+        if [ "$(jq -r '.ledgerTamperAlertFor // empty' <<<"$STATE")" != "$L_FREEZE_PR" ]; then
+          STATE="$(jq -c --arg pr "$L_FREEZE_PR" '.ledgerTamperAlertFor=$pr' <<<"$STATE")"
+          write_state "$STATE"
+          jq -cn --arg target "$HANDOFF_TARGET" --arg expected "$HANDOFF_PR" --arg got "$L_FREEZE_PR" \
+            '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_ledger_tampered",
+              targetSha:$target,
+              expectedFreezePr:(try ($expected|tonumber) catch $expected),
+              gotFreezePr:(try ($got|tonumber) catch $got)}}'
+          exit 0
+        fi
+      else
+        STATE="$(jq -c '.ledgerTamperAlertFor=null' <<<"$STATE")"
+      fi
+    fi
+  fi
+fi
+
 # Hold-file reconciliation. The hold lives on the shared workgroup mount so the
 # release desk can read it, which means every sibling can also delete or edit
 # it — including the builders whose promotion it blocks, under a standing
@@ -770,6 +901,27 @@ if [ -n "$ACTIVE_SHA" ]; then
   if [ "$(active_run_is_live "$ACTIVE_STARTED" \
             "$(jq -r '.activeProgressAt // empty' <<<"$STATE")")" = true ]; then
     if [ "$ACTIVE_SHA" != "$SOURCE_SHA" ]; then
+      if [ "$CANDIDATE_SHA" != "$SOURCE_SHA" ]; then
+        STATE="$(jq -c --arg sha "$SOURCE_SHA" --arg now "$NOW" '.candidateSha=$sha | .candidateFirstSeen=$now' <<<"$STATE")"
+      fi
+      emit_no_wake "queued_behind_active_run"
+    else
+      emit_no_wake "already_active"
+    fi
+    exit 0
+  fi
+fi
+
+# Handoff mode: an open freeze PR occupies the "one campaign at a time" slot
+# exactly like activeSha does for a manually-claimed run, but it survives
+# across polls as a durable GitHub PR rather than a liveness-stamped process
+# — no staleness check here. Only the ledger (completed, handled above) or the
+# freeze PR's own closed state (abandoned, also handled above) ever free it.
+if [ "$FREEZE_HANDOFF" = true ]; then
+  HANDOFF_PR="$(jq -r '.handoffFreezePr // empty' <<<"$STATE")"
+  if [ -n "$HANDOFF_PR" ]; then
+    HANDOFF_TARGET="$(jq -r '.handoffTargetSha // empty' <<<"$STATE")"
+    if [ "$HANDOFF_TARGET" != "$SOURCE_SHA" ]; then
       if [ "$CANDIDATE_SHA" != "$SOURCE_SHA" ]; then
         STATE="$(jq -c --arg sha "$SOURCE_SHA" --arg now "$NOW" '.candidateSha=$sha | .candidateFirstSeen=$now' <<<"$STATE")"
       fi
@@ -858,6 +1010,67 @@ PREVIOUS_SHA="$COMPLETED_SHA"
 if [ -z "$PREVIOUS_SHA" ]; then
   PREVIOUS_SHA="$(timeout 8 gh api "repos/$REPO/commits/$SOURCE_SHA" --jq '.parents[0].sha // empty' 2>/dev/null || true)"
 fi
+
+if [ "$FREEZE_HANDOFF" = true ]; then
+  # This is the exact point poll would otherwise open a develop_build_settled
+  # campaign. Cut a freeze PR instead and hand the campaign off — zero agent
+  # tokens spent here, it is a subprocess call, not a dispatch.
+  FREEZE_JSON="$("$FREEZE_HELPER" "$SOURCE_SHA" 2>/dev/null)"
+  FREEZE_RC=$?
+  if [ "$FREEZE_RC" -ne 0 ] || ! jq -e 'type == "object" and has("prNumber") and has("freezeSha")' \
+       <<<"$FREEZE_JSON" >/dev/null 2>&1; then
+    # The helper itself failed (branch collision, PR create failure, etc).
+    # Same throttle shape as preflight above: one wake per distinct reason,
+    # never a re-spam, and the candidate survives untouched so the very next
+    # poll retries once the underlying problem is fixed.
+    FREEZE_REASON="$(jq -r '.error // empty' <<<"$FREEZE_JSON" 2>/dev/null)"
+    [ -n "$FREEZE_REASON" ] || FREEZE_REASON="freeze helper exited $FREEZE_RC with no parseable output"
+    # smoke-freeze-pr.sh's own "branch already exists" error already carries
+    # the deterministic branch name (smoke/freeze-<sha12>) as a `branch`
+    # field — surface it here too. This is the retry-after-a-lost-attempt
+    # case: an earlier freeze that helper-succeeded but never got recorded in
+    # our state (a crash or race between the helper call and write_state)
+    # leaves an orphaned PR/branch that this later collision is the only
+    # trace of; without the name, the responder has to guess it.
+    FREEZE_ORPHAN_BRANCH="$(jq -r '.branch // empty' <<<"$FREEZE_JSON" 2>/dev/null)"
+    LAST_FREEZE_REASON="$(jq -r '.freezeFailReason // empty' <<<"$STATE")"
+    SINCE_FREEZE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.freezeFailWakeAt // empty' <<<"$STATE")") ))"
+    if { [ "$FREEZE_REASON" != "$LAST_FREEZE_REASON" ] && [ "$SINCE_FREEZE_WAKE" -ge "$PREFLIGHT_REARM_FLOOR_SECONDS" ]; } ||
+       [ "$SINCE_FREEZE_WAKE" -ge "$PREFLIGHT_ALERT_SECONDS" ]; then
+      STATE="$(jq -c --arg r "$FREEZE_REASON" --arg now "$NOW" '.freezeFailReason=$r | .freezeFailWakeAt=$now' <<<"$STATE")"
+      write_state "$STATE"
+      jq -cn --arg reason "$FREEZE_REASON" --arg sha "$SOURCE_SHA" --argjson rc "$FREEZE_RC" \
+        --arg branch "$FREEZE_ORPHAN_BRANCH" \
+        '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_failed",sourceSha:$sha,reason:$reason,exitCode:$rc,
+          orphanBranch:(if $branch == "" then null else $branch end)}}'
+      exit 0
+    fi
+    STATE="$(jq -c --arg r "$FREEZE_REASON" '.freezeFailReason=$r' <<<"$STATE")"
+    emit_no_wake "develop_freeze_failed"
+    exit 0
+  fi
+  # Success — clear the failure latch so the next failure alarms immediately
+  # instead of inheriting a throttle window from an outage already repaired.
+  FREEZE_PR_NUM="$(jq -r '.prNumber' <<<"$FREEZE_JSON")"
+  FREEZE_SHA_OUT="$(jq -r '.freezeSha' <<<"$FREEZE_JSON")"
+  STATE="$(jq -c \
+    --arg sha "$SOURCE_SHA" --arg now "$NOW" --argjson pr "$FREEZE_PR_NUM" --arg freezeSha "$FREEZE_SHA_OUT" \
+    '.handoffFreezePr=$pr | .handoffFreezeSha=$freezeSha | .handoffTargetSha=$sha | .handoffOpenedAt=$now |
+     .freezeFailReason=null | .freezeFailWakeAt=null |
+     .candidateSha=null | .candidateFirstSeen=null' <<<"$STATE")"
+  write_state "$STATE"
+  jq -cn \
+    --arg repo "$REPO" --arg branch "$BRANCH" --arg sha "$SOURCE_SHA" --arg previous "$PREVIOUS_SHA" \
+    --argjson pr "$FREEZE_PR_NUM" --arg freezeSha "$FREEZE_SHA_OUT" \
+    '{wakeAgent:false,data:{
+      schemaVersion:1, trigger:"develop_freeze_opened",
+      repo:$repo, branch:$branch, sourceSha:$sha,
+      previousCompletedSha:(if $previous == "" then null else $previous end),
+      freezePr:$pr, freezeSha:$freezeSha, targetSha:$sha
+    }}'
+  exit 0
+fi
+
 # Run ids are second-granular, so reclaiming an abandoned run on the SAME SHA
 # inside one second would reissue the SAME id — and then the zombie container's
 # `progress` and `finish` would match the new active run and be accepted,
