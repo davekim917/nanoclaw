@@ -605,4 +605,57 @@ bash "$GATE" poll | jq -e '
   .data.orphanBranch == "smoke/freeze-eeeeeeeeeeee"
 ' >/dev/null
 
+# --- 33. P2 regression: a latched tamper mismatch must never shadow
+# abandonment. Reviewer's exact repro: latch the tamper alarm via a
+# mismatched ledger entry, then close the real freeze PR — abandonment must
+# still fire and free the slot. Before the fix, the abandonment check sat
+# only in the `elif` (ledger entirely empty), so ANY targetSha-matching
+# entry — including a mismatched one that only latches the tamper alarm —
+# shadowed it forever: every later poll reported already_active, no
+# abandonment ever fired, and no gate command could clear
+# handoffFreezePr/handoffTargetSha by hand.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+WEDGE_TARGET="$(printf 'f%.0s' $(seq 40))"
+WEDGE_HEAD="$(printf '0%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$WEDGE_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":200,\"branch\":\"smoke/freeze-f\",\"freezeSha\":\"$WEDGE_HEAD\",\"targetSha\":\"$WEDGE_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened" and .data.freezePr == 200' >/dev/null
+jq -cn --arg target "$WEDGE_TARGET" --arg freeze "$WEDGE_HEAD" --argjson pr 777 \
+  --arg run "smoke-pr777-fake-run" --arg verdict "GO" --arg now "2026-08-12T00:00:00Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_ledger_tampered"' >/dev/null
+# The real freeze PR closes with no matching verdict ever recorded.
+export STUB_FREEZE_PR_STATE=CLOSED
+bash "$GATE" poll | jq -e --argjson pr 200 --arg sha "$WEDGE_TARGET" '
+  .wakeAgent == true and .data.trigger == "develop_freeze_abandoned" and
+  .data.freezePr == $pr and .data.targetSha == $sha
+' >/dev/null
+jq -e '
+  .handoffFreezePr == null and .handoffTargetSha == null and .completedSha == null
+' "$STATE_DIR2/develop-state.json" >/dev/null
+unset STUB_FREEZE_PR_STATE
+
+# --- 34. A ledger line with no freezePr at all (malformed) must never crash
+# the tamper-alarm jq (tonumber on the literal "null") — it is treated as a
+# mismatch and still alarms, reporting the raw value instead of erroring
+# into an empty-stdout poll.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+MALFORMED_TARGET="$(printf '3%.0s' $(seq 40))"
+MALFORMED_HEAD="$(printf '4%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$MALFORMED_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":300,\"branch\":\"smoke/freeze-3\",\"freezeSha\":\"$MALFORMED_HEAD\",\"targetSha\":\"$MALFORMED_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+jq -cn --arg target "$MALFORMED_TARGET" --arg freeze "$MALFORMED_HEAD" \
+  --arg run "smoke-malformed-run" --arg verdict "GO" --arg now "2026-08-12T00:00:00Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_freeze_ledger_tampered" and .data.gotFreezePr == "null"
+' >/dev/null
+
 echo "smoke develop gate tests passed"

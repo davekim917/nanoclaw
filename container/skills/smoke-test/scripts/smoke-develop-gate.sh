@@ -755,59 +755,52 @@ if [ "$FREEZE_HANDOFF" = true ]; then
     if [ -s "$HANDOFF_LEDGER" ]; then
       LEDGER_ENTRY="$(jq -c --arg t "$HANDOFF_TARGET" 'select(.targetSha == $t)' "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
     fi
-    if [ -n "$LEDGER_ENTRY" ]; then
-      # Bind adoption to the SAME freeze PR as the handoff we currently have
-      # open — targetSha alone is not enough to trust a ledger line: it is
-      # the develop head SHA, public and echoed in our own wake payload, so
-      # a forged or stale (a zombie campaign's late finish on a previously
-      # abandoned handoff) line can share it while naming a different PR.
-      L_FREEZE_PR="$(jq -r '.freezePr' <<<"$LEDGER_ENTRY")"
-      if [ "$L_FREEZE_PR" = "$HANDOFF_PR" ]; then
-        # The freeze run finished: smoke-pr-gate.sh already wrote the
-        # verdict. Adopt it as this gate's own completed record and free the
-        # handoff slot — the "same develop SHA never re-freezes" dedup
-        # advance.
-        L_RUN="$(jq -r '.runId' <<<"$LEDGER_ENTRY")"
-        L_VERDICT="$(jq -r '.verdict' <<<"$LEDGER_ENTRY")"
-        L_FINISHED="$(jq -r '.finishedAt' <<<"$LEDGER_ENTRY")"
-        STATE="$(jq -c --arg sha "$HANDOFF_TARGET" --arg run "$L_RUN" --arg verdict "$L_VERDICT" --arg now "$L_FINISHED" \
-          '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
-           .handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null | .handoffOpenedAt=null |
-           .ledgerTamperAlertFor=null' <<<"$STATE")"
-      else
-        # Tamper evidence, same shape as gate_hold_tampered: never adopt,
-        # never free the real handoff (its own freezePr/targetSha are
-        # untouched, so the busy-check below keeps queuing candidates behind
-        # it exactly as if this line did not exist). One latched alarm, not
-        # a re-spam every poll — re-arms only if the offending freezePr
-        # changes.
-        if [ "$(jq -r '.ledgerTamperAlertFor // empty' <<<"$STATE")" != "$L_FREEZE_PR" ]; then
-          STATE="$(jq -c --arg pr "$L_FREEZE_PR" '.ledgerTamperAlertFor=$pr' <<<"$STATE")"
-          write_state "$STATE"
-          jq -cn --arg target "$HANDOFF_TARGET" --arg expected "$HANDOFF_PR" --arg got "$L_FREEZE_PR" \
-            '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_ledger_tampered",
-              targetSha:$target,expectedFreezePr:($expected|tonumber),gotFreezePr:($got|tonumber)}}'
-          exit 0
-        fi
-      fi
+    # Bind adoption to the SAME freeze PR as the handoff we currently have
+    # open — targetSha alone is not enough to trust a ledger line: it is the
+    # develop head SHA, public and echoed in our own wake payload, so a
+    # forged or stale (a zombie campaign's late finish on a previously
+    # abandoned handoff) line can share it while naming a different PR. A
+    # line with no freezePr at all (malformed) reads as literal "null",
+    # which can never equal a real PR number — falls through to the tamper
+    # path below rather than adopting, and never crashes.
+    L_FREEZE_PR=""
+    [ -n "$LEDGER_ENTRY" ] && L_FREEZE_PR="$(jq -r '.freezePr' <<<"$LEDGER_ENTRY")"
+
+    if [ -n "$LEDGER_ENTRY" ] && [ "$L_FREEZE_PR" = "$HANDOFF_PR" ]; then
+      # The freeze run finished: smoke-pr-gate.sh already wrote the verdict.
+      # Adopt it as this gate's own completed record and free the handoff
+      # slot — the "same develop SHA never re-freezes" dedup advance.
+      L_RUN="$(jq -r '.runId' <<<"$LEDGER_ENTRY")"
+      L_VERDICT="$(jq -r '.verdict' <<<"$LEDGER_ENTRY")"
+      L_FINISHED="$(jq -r '.finishedAt' <<<"$LEDGER_ENTRY")"
+      STATE="$(jq -c --arg sha "$HANDOFF_TARGET" --arg run "$L_RUN" --arg verdict "$L_VERDICT" --arg now "$L_FINISHED" \
+        '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
+         .handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null | .handoffOpenedAt=null |
+         .ledgerTamperAlertFor=null' <<<"$STATE")"
     elif [ -n "$HANDOFF_PR" ]; then
-      STATE="$(jq -c '.ledgerTamperAlertFor=null' <<<"$STATE")"
-      # No ledger outcome yet. Is the freeze PR still open? Fail-closed: a
-      # fetch problem means "cannot prove it is closed", so do NOT reclaim —
-      # leave the handoff in place and let a later poll try again.
+      # Either no ledger outcome yet, or one that names a DIFFERENT freeze PR
+      # (tamper-shaped — handled below). Either way, check abandonment
+      # FIRST: a confirmed-CLOSED freeze PR must free the handoff regardless
+      # of what a stale or mismatched ledger tail claims. Checking this only
+      # when the ledger was empty (the original shape) let a single latched
+      # tamper mismatch shadow abandonment forever — closing the real freeze
+      # PR would never be noticed again, and no gate command can clear
+      # handoffFreezePr/handoffTargetSha by hand. Fail-closed on the fetch
+      # itself: a lookup problem means "cannot prove it is closed", so do
+      # NOT reclaim — leave the handoff in place and let a later poll retry.
       FREEZE_PR_STATE="$(timeout 8 gh pr view "$HANDOFF_PR" -R "$REPO" --json state 2>/dev/null \
         | jq -r '.state // empty' 2>/dev/null)"
       if [ "$FREEZE_PR_STATE" = "CLOSED" ] || [ "$FREEZE_PR_STATE" = "MERGED" ]; then
-        # Closed with no completed verdict ever recorded — abandoned. Free
-        # the slot and alarm: this is evidence a campaign died silently
-        # (crash, manual PR close) rather than reported a result. Freeing and
-        # alarming happen together in the SAME poll, so there is nothing to
-        # re-arm — the transition itself can only ever fire once per
-        # abandonment. The alarm names the target SHA's own publish/hold
-        # artifacts (this gate's own config, shared by wrapper convention
-        # with smoke-pr-gate.sh's finish) so the responder checks whether the
-        # campaign actually completed and failed only to report before
-        # assuming it died.
+        # Closed with no completed (matching) verdict ever recorded —
+        # abandoned. Free the slot and alarm regardless of a mismatched or
+        # stale ledger tail: a closed PR is a stronger, independently
+        # verified signal than a ledger line this gate already refused to
+        # trust. Freeing and alarming happen together in the SAME poll, so
+        # there is nothing to re-arm. The alarm names the target SHA's own
+        # publish/hold artifacts (this gate's own config, shared by wrapper
+        # convention with smoke-pr-gate.sh's finish) so the responder checks
+        # whether the campaign actually completed and failed only to report
+        # before assuming it died.
         STATE="$(jq -c '.handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null |
                         .handoffOpenedAt=null | .ledgerTamperAlertFor=null' <<<"$STATE")"
         write_state "$STATE"
@@ -819,6 +812,27 @@ if [ "$FREEZE_HANDOFF" = true ]; then
             publishFile:(if $publish == "" then null else $publish end),
             holdFile:(if $hold == "" then null else $hold end)}}'
         exit 0
+      fi
+      # Still open. No ledger entry at all is silent (no news yet). A
+      # mismatched (or malformed) entry is tamper evidence, same shape as
+      # gate_hold_tampered: never adopt, never free the real handoff — one
+      # latched alarm, not a re-spam every poll, re-arming only if the
+      # offending freezePr changes. `try...catch` guards a malformed line
+      # (freezePr missing → literal "null", not a number) from crashing this
+      # jq call — it reports the raw value instead.
+      if [ -n "$LEDGER_ENTRY" ]; then
+        if [ "$(jq -r '.ledgerTamperAlertFor // empty' <<<"$STATE")" != "$L_FREEZE_PR" ]; then
+          STATE="$(jq -c --arg pr "$L_FREEZE_PR" '.ledgerTamperAlertFor=$pr' <<<"$STATE")"
+          write_state "$STATE"
+          jq -cn --arg target "$HANDOFF_TARGET" --arg expected "$HANDOFF_PR" --arg got "$L_FREEZE_PR" \
+            '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_ledger_tampered",
+              targetSha:$target,
+              expectedFreezePr:(try ($expected|tonumber) catch $expected),
+              gotFreezePr:(try ($got|tonumber) catch $got)}}'
+          exit 0
+        fi
+      else
+        STATE="$(jq -c '.ledgerTamperAlertFor=null' <<<"$STATE")"
       fi
     fi
   fi
