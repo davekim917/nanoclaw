@@ -33,6 +33,34 @@ interface Claim {
   ttl_hours?: unknown;
   note?: unknown;
   escalated_at?: unknown;
+  released_at?: unknown;
+  status?: unknown;
+}
+
+/**
+ * A claim that says it is finished, whatever shape it said it in.
+ *
+ * The `work-claims` skill says releasing means deleting the file, and a deleted
+ * file is never scanned. But agents also stamp completion in place — a
+ * `released_at`, a `status`, a note that opens with RELEASED — and leave the
+ * file as an audit trail. That is not the documented protocol, and it is also
+ * not something to page a human about: the claim is telling us the work is
+ * done. On the first live escalation batch (2026-08-12) two of four alerts
+ * were claims carrying `released_at` AND `status: "done"`, one of them naming
+ * the merge commit that closed it.
+ *
+ * Read as "finished", not "well-formed" — the point is to not alarm on a claim
+ * that already answered the question the alarm would ask.
+ */
+function declaresItselfFinished(claim: Claim): boolean {
+  if (typeof claim.released_at === 'string' && claim.released_at.trim() !== '') return true;
+  if (
+    typeof claim.status === 'string' &&
+    ['done', 'released', 'complete', 'completed'].includes(claim.status.trim().toLowerCase())
+  ) {
+    return true;
+  }
+  return typeof claim.note === 'string' && /^\s*released\b/i.test(claim.note);
 }
 
 /** Grace window past a claim's own TTL expiry before it counts as "abandoned"
@@ -93,6 +121,7 @@ export function isStalePastGrace(
 /** Pure — should this claim be (re-)escalated right now? */
 export function shouldEscalate(claim: Claim, now: number): boolean {
   if (typeof claim.claimed_at !== 'string' || typeof claim.ttl_hours !== 'number') return false;
+  if (declaresItselfFinished(claim)) return false;
   if (!isStalePastGrace(claim.claimed_at, claim.ttl_hours, now).stale) return false;
   if (typeof claim.escalated_at !== 'string') return true;
   // Re-claimed (takeover) after the last escalation → treat as fresh work,

@@ -87,6 +87,52 @@ describe('shouldEscalate', () => {
     expect(shouldEscalate({ claimed_at: iso(8 * HOUR_MS) }, NOW)).toBe(false); // no ttl_hours
     expect(shouldEscalate({ ttl_hours: 4 }, NOW)).toBe(false); // no claimed_at
   });
+
+  // The documented release is `rm` the file, but agents also stamp completion
+  // in place and leave the file as an audit trail. On the first live batch
+  // (2026-08-12) two of four alerts were claims carrying released_at AND
+  // status "done" — one naming the merge commit that closed it.
+  describe('a claim that declares itself finished never escalates', () => {
+    const stale = { claimed_at: iso(8 * HOUR_MS), ttl_hours: 4 };
+
+    it('released_at set', () => {
+      expect(shouldEscalate({ ...stale, released_at: iso(2 * HOUR_MS) }, NOW)).toBe(false);
+    });
+
+    it('status done / released / complete, case and padding insensitive', () => {
+      for (const status of ['done', 'Released', ' COMPLETE ', 'completed']) {
+        expect(shouldEscalate({ ...stale, status }, NOW)).toBe(false);
+      }
+    });
+
+    it('note opening with RELEASED', () => {
+      expect(shouldEscalate({ ...stale, note: 'RELEASED. PR #757 merged at 15:17:47Z' }, NOW)).toBe(false);
+    });
+
+    it('the exact live shape that misfired — released_at + status + note together', () => {
+      const claim = {
+        claimed_at: '2026-08-11T15:05:00Z',
+        released_at: '2026-08-11T15:21:00Z',
+        ttl_hours: 0,
+        status: 'done',
+        note: 'RELEASED. PR #757 merged by davekim917 at 15:17:47Z (squash, ab61511f).',
+      };
+      expect(shouldEscalate(claim, Date.parse('2026-08-12T04:18:25Z'))).toBe(false);
+    });
+
+    it('still escalates a live claim whose note merely mentions a release elsewhere', () => {
+      // Only a note that OPENS with "released" counts — otherwise any claim
+      // discussing a release would silence its own alarm.
+      const claim = { ...stale, note: 'blocked until the 172 migration is released to dev' };
+      expect(shouldEscalate(claim, NOW)).toBe(true);
+    });
+
+    it('an in-progress status is not a finished one', () => {
+      for (const status of ['active', 'in_progress', 'blocked', '']) {
+        expect(shouldEscalate({ ...stale, status }, NOW)).toBe(true);
+      }
+    });
+  });
 });
 
 describe('shouldSkipClaimsScan', () => {

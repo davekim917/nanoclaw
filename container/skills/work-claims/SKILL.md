@@ -105,6 +105,21 @@ else
 fi
 ```
 
+**Releasing means DELETING the file.** Do not stamp `released_at` or
+`status: done` and leave it behind. A claim file is a live-work marker, not a
+log — the record of what you did belongs in the PR, the ledger, or your own
+notes. A finished claim left on disk keeps showing up as live work: it hides
+the item from sweeps that skip claimed work, and it looks abandoned to anyone
+reading the directory.
+
+**One exception to "only your own": work that is provably complete.** If the
+PR the claim names has MERGED, delete the claim whatever the owner says. The
+ownership rule exists to stop you taking live work off someone — a merged PR
+is not live work, and its owner is not coming back to tidy up. Verify the
+merge first (`gh pr view <n> --json state,mergedAt`), never infer it from a
+stale timestamp, and say in your report which claims you cleared and why.
+Anything short of a confirmed merge, leave alone and escalate instead.
+
 **List all live claims:**
 
 ```bash
