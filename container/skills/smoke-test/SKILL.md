@@ -819,6 +819,34 @@ without a healthy `/healthz` after going `live` raises one throttled
 Full design and the live Render verification behind every rule above:
 `groups/_ops/specs/fleet-hardening/phase5-preview-envs.md`.
 
+### Develop-gate freeze handoff
+
+`smoke-develop-gate.sh` can hand its campaigns to this PR-scoped machinery
+instead of opening them against the shared dev environment — the actual fix
+for the original mid-run-merge problem, since a frozen preview is nobody
+else's to move. Opt in with `SMOKE_GATE_FREEZE_HANDOFF=true` (default unset =
+unchanged behavior, byte-for-byte) plus `SMOKE_GATE_FREEZE_HELPER` (path to
+`smoke-freeze-pr.sh`; required and fail-closed once handoff is on). At the
+exact point `poll` would otherwise emit `develop_build_settled`, handoff mode
+instead cuts a freeze PR for the settled SHA, records the handoff, and emits
+`wakeAgent:false` / `develop_freeze_opened` — zero agent tokens on the trigger
+step. A settled SHA while a handoff is open queues like any other
+`queued_behind_active_run` (one freeze at a time); a freeze PR closed with no
+verdict ever recorded wakes `develop_freeze_abandoned` once and frees the
+slot; a failing helper wakes `develop_freeze_failed`, throttled like a
+failing preflight command.
+
+The other half lives in `smoke-pr-gate.sh`'s `finish`: `SMOKE_GATE_PUBLISH_FILE`
+/ `SMOKE_GATE_HOLD_FILE` / `SMOKE_GATE_HANDOFF_LEDGER` (all no-ops unless set,
+and only ever act on a freeze PR) make a freeze-PR finish write the develop
+gate's exact publish/hold artifacts, keyed to the *target* develop SHA, and
+append the outcome to a ledger the develop gate reads before its own
+hold-integrity check runs each poll — the mechanism that keeps a legitimate
+freeze-run hold from ever reading as `gate_hold_tampered`. **All three
+PR-gate vars and develop-gate handoff mode must be set together in the same
+deployment's wrappers** — any one missing silently breaks the tamper-shield,
+not just the publish/hold write.
+
 ## Cost controls
 
 - Two provider-native worker lanes by default: Sonnet/xhigh under the
