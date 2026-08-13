@@ -62,7 +62,40 @@ export const log = {
   fatal: (msg: string, data?: Record<string, unknown>) => emit('fatal', msg, data),
 };
 
+/**
+ * A dead peer on a socket write is not a reason to kill the orchestrator.
+ * These escape as uncaught exceptions whenever a stream write completes with
+ * EPIPE/ECONNRESET and nothing listened for 'error' on that handle — most of
+ * them come from inside dependencies, and the async completion stack names no
+ * user frame, so there is nothing to fix at the call site. Exiting on them
+ * took the whole host down mid-turn (systemd restarted it) and forced every
+ * mid-work session to post a "host restarted" accounting note.
+ */
+export function isSurvivableIoError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code === 'EPIPE' || code === 'ECONNRESET';
+}
+
+// One diagnostic report per process — enough to identify the owning handle,
+// not enough to fill the disk when a peer flaps.
+let ioReportWritten = false;
+
 process.on('uncaughtException', (err) => {
+  if (isSurvivableIoError(err)) {
+    let report: string | undefined;
+    if (!ioReportWritten) {
+      ioReportWritten = true;
+      try {
+        // Names the libuv handle list (sockets, pipes, their fds) at the
+        // moment of failure — the only way to attribute an async write error.
+        report = process.report.writeReport(`logs/io-error-report-${Date.now()}.json`);
+      } catch {
+        // best-effort diagnostics
+      }
+    }
+    log.error('Survivable I/O error reached uncaughtException — continuing', { err, report });
+    return;
+  }
   log.fatal('Uncaught exception', { err });
   process.exit(1);
 });

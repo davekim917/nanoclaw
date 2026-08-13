@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readdir, realpath, rename, rm } from 'node:fs/promises';
-import { basename, join, posix, relative, resolve, sep } from 'node:path';
+import { basename, isAbsolute, join, posix, relative, resolve, sep } from 'node:path';
 
 import Database from 'better-sqlite3';
 import chokidar, { type FSWatcher } from 'chokidar';
@@ -46,6 +46,7 @@ import type {
   WorkgroupDescriptor,
   WorkgroupRoot,
 } from './types.js';
+import { acquireStorageActivityLease, type StorageActivityLease } from '../storage-activity.js';
 
 export const DEFAULT_FULL_RECONCILE_MS = 6 * 60 * 60_000;
 export const DEFAULT_CATALOG_REFRESH_MS = 60_000;
@@ -116,6 +117,58 @@ interface CodeWorkerLike {
   cleanupOrphans?(): Promise<void>;
 }
 
+export interface GraphifyRepositorySnapshot {
+  repo: string;
+  generation: string;
+  snapshotPath: string;
+  sourcePrefix: string;
+}
+
+/**
+ * One host-committed catalog with every selected immutable generation already
+ * pinned. The adapter owns catalog hashing, generation markers, and recovery;
+ * Graphify holds `release` until its candidate is committed or aborted.
+ */
+export interface GraphifyPinnedCatalog {
+  workgroupId: string;
+  catalogHash: string;
+  repositories: GraphifyRepositorySnapshot[];
+  /** Mutable canonical mount targets and repo-store internals omitted from ordinary root discovery. */
+  excludedRoots: string[];
+  /** Re-read the committed record and prove this exact hash/generation selection is still current. */
+  isCurrent(): Promise<boolean>;
+  /** Optional early cancellation supplied by a catalog/freshness watcher. */
+  changeSignal?: AbortSignal;
+  release(): Promise<void>;
+}
+
+export interface GraphifyRepositorySnapshotAdapter {
+  pinCommittedCatalog(input: { workgroupId: string; signal?: AbortSignal }): Promise<GraphifyPinnedCatalog>;
+  subscribe?(
+    workgroupId: string,
+    onChange: () => void,
+  ): Promise<() => Promise<void> | void> | (() => Promise<void> | void);
+}
+
+export interface GraphifyOverlayResolutionRequest {
+  workgroupId: string;
+  agentGroupId: string;
+  sessionId: string;
+  platformId: string | null;
+  threadId: string | null;
+  threadWorktrees: boolean;
+}
+
+export interface GraphifyOverlayLocation {
+  sourceRoot: string;
+  /** Exact canonical namespaced root leased by spawn, checkout, and cleanup. */
+  workUnitRoot: string;
+}
+
+export type GraphifyOverlayResolver = (
+  request: GraphifyOverlayResolutionRequest,
+) => GraphifyOverlayLocation | Promise<GraphifyOverlayLocation>;
+
 export interface WorkgroupGraphDaemonOptions {
   dataDir: string;
   groupsDir: string;
@@ -152,6 +205,10 @@ export interface WorkgroupGraphDaemonOptions {
   isolateReconcile?: boolean;
   scheduleEnrichmentAfterReconcile?: boolean;
   watchFilesystem?: boolean;
+  repositorySnapshots?: GraphifyRepositorySnapshotAdapter;
+  /** Repo-workspace adapter; production integration must pass the spawn path resolver here. */
+  resolveOverlay?: GraphifyOverlayResolver;
+  acquireOverlayReadClaim?: (workUnitRoot: string, holderId: string) => Promise<StorageActivityLease>;
 }
 
 /** Host-visible even when the systemd service uses PrivateTmp=yes. */
@@ -185,6 +242,27 @@ function sourceExtractionFailure(error: unknown): string {
 
 function isAbortFailure(error: unknown, signal?: AbortSignal): boolean {
   return Boolean(signal?.aborted) || (error instanceof Error && error.name === 'AbortError');
+}
+
+class CatalogChangedError extends Error {
+  constructor(readonly catalogHash: string) {
+    super(`Graphify committed catalog changed while reconciling: ${catalogHash}`);
+    this.name = 'CatalogChangedError';
+  }
+}
+
+function containedBy(candidate: string, root: string): boolean {
+  const offset = relative(resolve(root), resolve(candidate));
+  return offset === '' || (!offset.startsWith(`..${sep}`) && offset !== '..' && !isAbsolute(offset));
+}
+
+interface ReconcileRoot extends WorkgroupRoot {
+  excludedRoots?: string[];
+}
+
+interface ReconcileCatalogPlan {
+  roots: ReconcileRoot[];
+  pinned?: GraphifyPinnedCatalog;
 }
 
 function anySignal(signals: AbortSignal[]): AbortSignal {
@@ -445,6 +523,7 @@ export class WorkgroupGraphDaemon {
   private readonly attempted = new Set<string>();
   private readonly retryAttempts = new Map<string, number>();
   private readonly watchers = new Map<string, FSWatcher>();
+  private readonly catalogSubscriptions = new Map<string, () => Promise<void> | void>();
   private readonly timers: NodeJS.Timeout[] = [];
   private readonly paused = new Set<string>();
   private semanticPumpRunning = false;
@@ -593,6 +672,7 @@ export class WorkgroupGraphDaemon {
 
   async start(): Promise<void> {
     const descriptors = await this.refreshCatalog();
+    await this.syncRepositoryCatalogSubscriptions(descriptors);
     // Queue rows are only ever claimed for workgroups that have a live state,
     // so rows belonging to a deleted workgroup can never be processed — they
     // just inflate the backlog and the database forever. Guarded on a non-empty
@@ -637,6 +717,7 @@ export class WorkgroupGraphDaemon {
       void this.refreshCatalog()
         .then(async (current) => {
           if (this.closing) return;
+          await this.syncRepositoryCatalogSubscriptions(current);
           await this.syncWatchers(current);
           for (const [id, state] of this.states)
             if (state.dirty || state.archiveDirty || state.fullReindexRequested) this.queueReconcile(id);
@@ -703,17 +784,44 @@ export class WorkgroupGraphDaemon {
     const archive = new Database(this.archivePath, { readonly: true, fileMustExist: true });
     const changed: string[] = [];
     try {
+      // One grouped pass for every workgroup, not one scan each. The previous
+      // shape ran a per-workgroup aggregate that summed length(text) — which
+      // forces SQLite to read every matching row's text, including overflow
+      // pages — on a fresh handle (so, a cold cache) every 10 seconds. That
+      // one poll was reading ~22 MB/s around the clock, held the disk at 90%
+      // utilization, and the resulting IO stalls are what froze the host's
+      // event loop. Appends move count/max_rowid and deletes move count, so
+      // the byte sum bought no change-detection the counters didn't already
+      // give — the archive is insert-only (src/message-archive.ts).
+      const totals = new Map<string, { count: number; max_rowid: number | null; max_sent: string | null }>();
+      for (const row of archive
+        .prepare(
+          `SELECT agent_group_id, count(*) AS count, max(rowid) AS max_rowid, max(sent_at) AS max_sent
+             FROM messages_archive
+            WHERE role IN ('user','assistant') AND channel_type <> 'agent'
+            GROUP BY agent_group_id`,
+        )
+        .all() as { agent_group_id: string; count: number; max_rowid: number | null; max_sent: string | null }[]) {
+        totals.set(row.agent_group_id, { count: row.count, max_rowid: row.max_rowid, max_sent: row.max_sent });
+      }
+
       for (const [id, state] of this.states) {
         if (state.descriptor.memberIds.length === 0) continue;
-        const placeholders = state.descriptor.memberIds.map(() => '?').join(',');
-        const row = archive
-          .prepare(
-            `SELECT count(*) AS count, max(rowid) AS max_rowid, max(sent_at) AS max_sent,
-          sum(length(text)) AS text_bytes FROM messages_archive WHERE agent_group_id IN (${placeholders})
-          AND role IN ('user','assistant') AND channel_type <> 'agent'`,
-          )
-          .get(...state.descriptor.memberIds) as Record<string, unknown>;
-        const fingerprint = JSON.stringify(row);
+        let count = 0;
+        let maxRowid: number | null = null;
+        let maxSent: string | null = null;
+        for (const memberId of state.descriptor.memberIds) {
+          const member = totals.get(memberId);
+          if (!member) continue;
+          count += member.count;
+          if (member.max_rowid !== null && (maxRowid === null || member.max_rowid > maxRowid)) {
+            maxRowid = member.max_rowid;
+          }
+          if (member.max_sent !== null && (maxSent === null || member.max_sent > maxSent)) {
+            maxSent = member.max_sent;
+          }
+        }
+        const fingerprint = JSON.stringify({ count, max_rowid: maxRowid, max_sent: maxSent });
         if (state.archiveFingerprint !== undefined && state.archiveFingerprint !== fingerprint) {
           changed.push(id);
           state.archiveDirty = true;
@@ -1000,6 +1108,8 @@ export class WorkgroupGraphDaemon {
     if (this.semanticWakeTimer) clearTimeout(this.semanticWakeTimer);
     await Promise.all([...this.watchers.values()].map((watcher) => watcher.close()));
     this.watchers.clear();
+    await Promise.all([...this.catalogSubscriptions.values()].map((release) => release()));
+    this.catalogSubscriptions.clear();
     await this.isolatedWatchers?.close();
     await this.background.stop?.();
     for (const state of this.states.values()) state.store?.close();
@@ -1030,6 +1140,31 @@ export class WorkgroupGraphDaemon {
       if (desired.has(key)) continue;
       await watcher.close();
       this.watchers.delete(key);
+    }
+  }
+
+  private async syncRepositoryCatalogSubscriptions(descriptors: WorkgroupDescriptor[]): Promise<void> {
+    const adapter = this.options.repositorySnapshots;
+    if (!adapter?.subscribe) return;
+    const active = new Set(descriptors.map((descriptor) => descriptor.id));
+    for (const descriptor of descriptors) {
+      if (this.catalogSubscriptions.has(descriptor.id)) continue;
+      const release = await adapter.subscribe(descriptor.id, () => {
+        if (this.closing || !this.states.has(descriptor.id)) return;
+        const state = this.requireState(descriptor.id);
+        state.dirty = true;
+        state.dirtyVersion += 1;
+        state.fullScanRequired = true;
+        state.fullScanVersion += 1;
+        for (const controller of state.reconcileAborts) controller.abort('repository catalog changed');
+        this.queueReconcile(descriptor.id);
+      });
+      this.catalogSubscriptions.set(descriptor.id, release);
+    }
+    for (const [workgroupId, release] of this.catalogSubscriptions) {
+      if (active.has(workgroupId)) continue;
+      await release();
+      this.catalogSubscriptions.delete(workgroupId);
     }
   }
 
@@ -1166,6 +1301,50 @@ export class WorkgroupGraphDaemon {
   }
 
   private async reconcile(state: WorkgroupState, signal?: AbortSignal): Promise<void> {
+    if (this.options.repositorySnapshots) {
+      for (;;) {
+        if (signal?.aborted) throw new Error('Graphify reconcile aborted before catalog pin');
+        const pinned = await this.options.repositorySnapshots.pinCommittedCatalog({
+          workgroupId: state.descriptor.id,
+          signal,
+        });
+        try {
+          if (pinned.workgroupId !== state.descriptor.id)
+            throw new Error(`Graphify catalog workgroup mismatch: ${pinned.workgroupId}`);
+          const mutableRepositoryRoots = state.descriptor.roots.flatMap((root) =>
+            pinned.repositories.map((repo) => {
+              const candidate = join(root.absolutePath, repo.repo);
+              if (!containedBy(candidate, root.absolutePath) || resolve(candidate) === resolve(root.absolutePath)) {
+                throw new Error(`Graphify repository name escapes workgroup root: ${repo.repo}`);
+              }
+              return candidate;
+            }),
+          );
+          const roots: ReconcileRoot[] = [
+            ...state.descriptor.roots.map((root) => ({
+              ...root,
+              excludedRoots: [...pinned.excludedRoots, ...mutableRepositoryRoots],
+            })),
+            ...pinned.repositories.map((repo) => ({
+              absolutePath: repo.snapshotPath,
+              prefix: repo.sourcePrefix,
+            })),
+          ];
+          const reconcileSignal = pinned.changeSignal
+            ? anySignal([signal ?? new AbortController().signal, pinned.changeSignal])
+            : signal;
+          await this.reconcileInProcess(state, reconcileSignal, true, { roots, pinned });
+          return;
+        } catch (error) {
+          const catalogChanged = error instanceof CatalogChangedError || !(await pinned.isCurrent());
+          if (!catalogChanged || signal?.aborted || this.closing) throw error;
+          // The candidate was private and has been discarded. Pin one fresh
+          // committed catalog and restart; never supplement a mixed candidate.
+        } finally {
+          await pinned.release();
+        }
+      }
+    }
     if (!this.isolateReconcile) {
       await this.reconcileInProcess(state, signal);
       return;
@@ -1231,6 +1410,7 @@ export class WorkgroupGraphDaemon {
     state: WorkgroupState,
     signal?: AbortSignal,
     promote = true,
+    catalogPlan: ReconcileCatalogPlan = { roots: state.descriptor.roots },
   ): Promise<IsolatedReconcileResult> {
     state.lastStartedAt = new Date().toISOString();
     const dirtyVersion = state.dirtyVersion;
@@ -1278,9 +1458,14 @@ export class WorkgroupGraphDaemon {
         semanticBatch.push(item);
         if (semanticBatch.length >= 25) flushSemantic();
       };
-      for (const root of state.descriptor.roots) {
+      for (const root of catalogPlan.roots) {
         if (signal?.aborted) throw new Error('fast reconcile preempted by interactive chat');
-        const found = await this.discover({ workgroupId: state.descriptor.id, root: root.absolutePath, signal });
+        const discovered = await this.discover({ workgroupId: state.descriptor.id, root: root.absolutePath, signal });
+        const found = root.excludedRoots?.length
+          ? discovered.filter(
+              (source) => !root.excludedRoots!.some((excluded) => containedBy(source.absolutePath, excluded)),
+            )
+          : discovered;
         for (const original of found) {
           if (signal?.aborted) throw new Error('fast reconcile preempted by interactive chat');
           const relativePath = prefixed(root.prefix, original.relativePath);
@@ -1392,6 +1577,8 @@ export class WorkgroupGraphDaemon {
       }
       await flushSources();
       flushSemantic();
+      if (catalogPlan.pinned && !(await catalogPlan.pinned.isCurrent()))
+        throw new CatalogChangedError(catalogPlan.pinned.catalogHash);
       await next.completeGeneration(generation);
       await next.close();
       next = undefined;
@@ -1410,6 +1597,8 @@ export class WorkgroupGraphDaemon {
       }
       const completedAt = new Date().toISOString();
       if (!promote) return { codeSources, completedAt, candidatePath: nextPath };
+      if (catalogPlan.pinned && !(await catalogPlan.pinned.isCurrent()))
+        throw new CatalogChangedError(catalogPlan.pinned.catalogHash);
       state.store?.close();
       state.store = undefined;
       await rename(nextPath, livePath);
@@ -1652,7 +1841,8 @@ export class WorkgroupGraphDaemon {
   ): void {
     if (this.closing) return;
     if (this.codeWorker) {
-      for (const root of state.descriptor.roots) {
+      const buildRoots = new Map(builds.map((item) => [`${item.root.prefix}\0${item.root.absolutePath}`, item.root]));
+      for (const root of buildRoots.values()) {
         const candidates = builds.filter(
           (item) =>
             item.root.absolutePath === root.absolutePath &&
@@ -2141,20 +2331,49 @@ export class WorkgroupGraphDaemon {
     } finally {
       db.close();
     }
-    const root =
-      this.threadWorktrees && row?.platform_id
-        ? join(this.options.dataDir, 'v2-threads', cleanSlug(row.thread_id ?? `dm-${row.platform_id}`), 'worktrees')
-        : join(this.options.dataDir, 'v2-sessions', context.agentGroupId, context.sessionId, 'worktrees');
+    const defaultResolve: GraphifyOverlayResolver = (request) => {
+      if (request.threadWorktrees && request.platformId) {
+        const key = cleanSlug(request.threadId ?? `dm-${request.platformId}`);
+        const legacy = join(this.options.dataDir, 'v2-threads', key, 'worktrees');
+        const scoped = join(
+          this.options.dataDir,
+          'v2-threads',
+          `wg-${cleanSlug(request.workgroupId)}`,
+          key,
+          'worktrees',
+        );
+        // Compatibility only: the repo-workspace migration ends this fallback.
+        const sourceRoot = existsSync(legacy) && !existsSync(scoped) ? legacy : scoped;
+        return { sourceRoot, workUnitRoot: sourceRoot };
+      }
+      const sessionRoot = join(this.options.dataDir, 'v2-sessions', request.agentGroupId, request.sessionId);
+      return { sourceRoot: join(sessionRoot, 'worktrees'), workUnitRoot: sessionRoot };
+    };
+    const location = await (this.options.resolveOverlay ?? defaultResolve)({
+      workgroupId,
+      agentGroupId: context.agentGroupId,
+      sessionId: context.sessionId,
+      platformId: row?.platform_id ?? null,
+      threadId: row?.thread_id ?? null,
+      threadWorktrees: this.threadWorktrees,
+    });
+    const root = location.sourceRoot;
+    const acquireRead = this.options.acquireOverlayReadClaim ?? acquireStorageActivityLease;
+    const lease = existsSync(root)
+      ? await acquireRead(location.workUnitRoot, `graphify:${workgroupId}:${context.sessionId}`)
+      : undefined;
     const overlayDir = join(this.options.dataDir, 'graphify', 'overlays');
-    await mkdir(overlayDir, { recursive: true, mode: 0o700 });
-    const path = join(overlayDir, `${hash(workgroupId, context.agentGroupId, context.sessionId, randomToken())}.db`);
-    const store = new WorkgroupGraphStore(path, workgroupId);
+    let overlayPath: string | undefined;
+    let store: WorkgroupGraphStore | undefined;
     try {
+      await mkdir(overlayDir, { recursive: true, mode: 0o700 });
+      overlayPath = join(overlayDir, `${hash(workgroupId, context.agentGroupId, context.sessionId, randomToken())}.db`);
+      store = new WorkgroupGraphStore(overlayPath, workgroupId);
       const generation = store.beginGeneration('thread-overlay');
       if (existsSync(root)) {
         const found = await this.discover({ workgroupId, root });
         const mapped = found.map((original) => {
-          const relativePath = `overlay/${cleanSlug(context.sessionId)}/${original.relativePath}`;
+          const relativePath = `overlay/${hash(workgroupId, location.workUnitRoot)}/${original.relativePath}`;
           return { ...original, id: stableSourceId(workgroupId, relativePath), relativePath };
         });
         for (const source of mapped) {
@@ -2177,8 +2396,9 @@ export class WorkgroupGraphDaemon {
       store.completeGeneration(generation);
       return operation(store);
     } finally {
-      store.close();
-      await rm(path, { force: true });
+      store?.close();
+      if (overlayPath) await rm(overlayPath, { force: true });
+      await lease?.release();
     }
   }
 }

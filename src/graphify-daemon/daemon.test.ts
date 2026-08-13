@@ -914,6 +914,32 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
+  it('archive polling still sees a deletion', async () => {
+    // The fingerprint dropped sum(length(text)) — the one signal that caught a
+    // same-row-count text change. Deletes must still register through count.
+    const f = fixture();
+    const archive = new Database(join(f.data, 'archive.db'));
+    archive.exec(`CREATE TABLE messages_archive (
+      id TEXT PRIMARY KEY, agent_group_id TEXT, channel_type TEXT, role TEXT, text TEXT, sent_at TEXT)`);
+    archive
+      .prepare("INSERT INTO messages_archive VALUES ('m','ag-a','discord','user','gone','2026-01-01T00:00:00Z')")
+      .run();
+    archive.close();
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+    });
+    await daemon.refreshCatalog();
+    expect(await daemon.pollArchiveOnce(false)).toEqual([]);
+    const writer = new Database(join(f.data, 'archive.db'));
+    writer.prepare("DELETE FROM messages_archive WHERE id = 'm'").run();
+    writer.close();
+    expect(await daemon.pollArchiveOnce(false)).toEqual(['madison']);
+    await daemon.close();
+  });
+
   it('archive reconciliation updates the live DB in place and leaves unchanged source generations untouched', async () => {
     const f = fixture();
     writeFileSync(join(f.groups, 'madison-agent', 'sentinel.md'), 'large stable sentinel');
@@ -1522,6 +1548,226 @@ describe('WorkgroupGraphDaemon', () => {
     const result = await daemon.query('madison', 'changed', 20, { agentGroupId: 'ag-a', sessionId: 's1' });
     expect(result.nodes.length).toBeGreaterThan(0);
     expect(codeWorker.extract).not.toHaveBeenCalled();
+    await daemon.close();
+  });
+
+  it('test_graphify_full_reconcile_pins_one_catalog_and_publishes_all_old_or_all_new', async () => {
+    const f = fixture();
+    const canonical = join(f.groups, 'madison-agent', 'analytics');
+    const oldSnapshot = join(f.root, 'snapshots', 'old');
+    const newSnapshot = join(f.root, 'snapshots', 'new');
+    mkdirSync(canonical, { recursive: true });
+    mkdirSync(oldSnapshot, { recursive: true });
+    mkdirSync(newSnapshot, { recursive: true });
+    writeFileSync(join(canonical, 'mixed.md'), 'mutable canonical must be excluded');
+    writeFileSync(join(oldSnapshot, 'catalog.md'), 'all old catalog knowledge');
+    writeFileSync(join(newSnapshot, 'catalog.md'), 'all new catalog knowledge');
+    let selected = { generation: 'old', path: oldSnapshot };
+    const release = vi.fn(async () => {});
+    const pinCommittedCatalog = vi.fn(async () => ({
+      workgroupId: 'madison',
+      catalogHash: `catalog-${selected.generation}`,
+      repositories: [
+        {
+          repo: 'analytics',
+          generation: selected.generation,
+          snapshotPath: selected.path,
+          sourcePrefix: 'repositories/analytics',
+        },
+      ],
+      // The production adapter only knows repo-store roots. The daemon derives
+      // mutable mount exclusions from its own member-root descriptor.
+      excludedRoots: [],
+      isCurrent: async () => true,
+      release,
+    }));
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+      repositorySnapshots: { pinCommittedCatalog },
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    expect((await daemon.query('madison', 'all old catalog')).nodes.length).toBeGreaterThan(0);
+    expect((await daemon.query('madison', 'all new catalog')).nodes).toHaveLength(0);
+    expect((await daemon.query('madison', 'mutable canonical')).nodes).toHaveLength(0);
+
+    selected = { generation: 'new', path: newSnapshot };
+    daemon.markDirty('madison');
+    await daemon.ensureFresh('madison');
+    expect((await daemon.query('madison', 'all old catalog')).nodes).toHaveLength(0);
+    expect((await daemon.query('madison', 'all new catalog')).nodes.length).toBeGreaterThan(0);
+    expect(pinCommittedCatalog).toHaveBeenCalledTimes(2);
+    expect(release).toHaveBeenCalledTimes(2);
+    await daemon.close();
+  });
+
+  it('test_graphify_catalog_change_cancels_mixed_candidate_and_restarts_with_new_pin_set', async () => {
+    const f = fixture();
+    const oldSnapshot = join(f.root, 'snapshots', 'old');
+    const newSnapshot = join(f.root, 'snapshots', 'new');
+    mkdirSync(oldSnapshot, { recursive: true });
+    mkdirSync(newSnapshot, { recursive: true });
+    writeFileSync(join(oldSnapshot, 'catalog.md'), 'stale generation should never publish');
+    writeFileSync(join(newSnapshot, 'catalog.md'), 'fresh generation publishes atomically');
+    let pins = 0;
+    const released: string[] = [];
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+      repositorySnapshots: {
+        pinCommittedCatalog: async () => {
+          pins += 1;
+          const generation = pins === 1 ? 'old' : 'new';
+          return {
+            workgroupId: 'madison',
+            catalogHash: generation,
+            repositories: [
+              {
+                repo: 'analytics',
+                generation,
+                snapshotPath: generation === 'old' ? oldSnapshot : newSnapshot,
+                sourcePrefix: 'repositories/analytics',
+              },
+            ],
+            excludedRoots: [],
+            isCurrent: async () => generation === 'new',
+            release: async () => {
+              released.push(generation);
+            },
+          };
+        },
+      },
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    expect(pins).toBe(2);
+    expect(released).toEqual(['old', 'new']);
+    expect((await daemon.query('madison', 'stale generation')).nodes).toHaveLength(0);
+    expect((await daemon.query('madison', 'fresh generation')).nodes.length).toBeGreaterThan(0);
+    await daemon.close();
+  });
+
+  it('test_graphify_same_workgroup_thread_siblings_share_canonical_overlay_root', async () => {
+    const f = fixture();
+    const db = new Database(f.central);
+    db.exec(`
+      INSERT INTO agent_groups VALUES ('ag-b', 'madison-codex', 'madison');
+      INSERT INTO messaging_groups VALUES ('mg1', 'slack:C');
+      INSERT INTO sessions VALUES ('s1', 'ag-a', 'mg1', 'thread-shared');
+      INSERT INTO sessions VALUES ('s2', 'ag-b', 'mg1', 'thread-shared');
+    `);
+    db.close();
+    mkdirSync(join(f.groups, 'madison-codex'));
+    const shared = join(f.data, 'v2-threads', 'wg-madison', 'thread-shared', 'worktrees');
+    mkdirSync(shared, { recursive: true });
+    writeFileSync(join(shared, 'draft.md'), 'sibling shared overlay knowledge');
+    const rootsSeen: string[] = [];
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      threadWorktrees: true,
+      enableEnrichment: false,
+      resolveOverlay: (request) => {
+        const sourceRoot = join(f.data, 'v2-threads', `wg-${request.workgroupId}`, request.threadId!, 'worktrees');
+        rootsSeen.push(sourceRoot);
+        return { sourceRoot, workUnitRoot: sourceRoot };
+      },
+    });
+    await daemon.refreshCatalog();
+    expect(
+      (await daemon.query('madison', 'sibling shared overlay', 20, { agentGroupId: 'ag-a', sessionId: 's1' })).nodes
+        .length,
+    ).toBeGreaterThan(0);
+    expect(
+      (await daemon.query('madison', 'sibling shared overlay', 20, { agentGroupId: 'ag-b', sessionId: 's2' })).nodes
+        .length,
+    ).toBeGreaterThan(0);
+    expect(new Set(rootsSeen).size).toBe(1);
+    await daemon.close();
+  });
+
+  it('test_graphify_identical_platform_thread_ids_are_isolated_by_workgroup', async () => {
+    const f = fixture();
+    const db = new Database(f.central);
+    db.exec(`
+      INSERT INTO workgroups VALUES ('other');
+      INSERT INTO agent_groups VALUES ('ag-other', 'other-agent', 'other');
+      INSERT INTO messaging_groups VALUES ('mg1', 'slack:C');
+      INSERT INTO messaging_groups VALUES ('mg2', 'slack:C');
+      INSERT INTO sessions VALUES ('s1', 'ag-a', 'mg1', 'thread-same');
+      INSERT INTO sessions VALUES ('s2', 'ag-other', 'mg2', 'thread-same');
+    `);
+    db.close();
+    mkdirSync(join(f.groups, 'other-agent'));
+    const madison = join(f.data, 'v2-threads', 'wg-madison', 'thread-same', 'worktrees');
+    const other = join(f.data, 'v2-threads', 'wg-other', 'thread-same', 'worktrees');
+    mkdirSync(madison, { recursive: true });
+    mkdirSync(other, { recursive: true });
+    writeFileSync(join(madison, 'draft.md'), 'madison private overlay');
+    writeFileSync(join(other, 'draft.md'), 'other private overlay');
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      threadWorktrees: true,
+      enableEnrichment: false,
+    });
+    await daemon.refreshCatalog();
+    expect(
+      (await daemon.query('madison', 'madison private overlay', 20, { agentGroupId: 'ag-a', sessionId: 's1' })).nodes
+        .length,
+    ).toBeGreaterThan(0);
+    expect(
+      (await daemon.query('madison', 'other private overlay', 20, { agentGroupId: 'ag-a', sessionId: 's1' })).nodes,
+    ).toHaveLength(0);
+    expect(
+      (await daemon.query('other', 'other private overlay', 20, { agentGroupId: 'ag-other', sessionId: 's2' })).nodes
+        .length,
+    ).toBeGreaterThan(0);
+    await daemon.close();
+  });
+
+  it('test_graphify_overlay_holds_exact_work_unit_read_claim_through_candidate_commit', async () => {
+    const f = fixture();
+    const db = new Database(f.central);
+    db.exec(
+      "INSERT INTO messaging_groups VALUES ('mg1','discord:C'); INSERT INTO sessions VALUES ('s1','ag-a','mg1','thread-one')",
+    );
+    db.close();
+    const sourceRoot = join(f.root, 'overlay-work-unit');
+    mkdirSync(sourceRoot);
+    writeFileSync(join(sourceRoot, 'draft.md'), 'claimed overlay knowledge');
+    let released = false;
+    let observedDuringDiscovery = false;
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      threadWorktrees: true,
+      enableEnrichment: false,
+      resolveOverlay: () => ({ sourceRoot, workUnitRoot: sourceRoot }),
+      acquireOverlayReadClaim: async () => ({
+        release: async () => {
+          released = true;
+        },
+      }),
+      discover: async (options) => {
+        if (options.root === sourceRoot) observedDuringDiscovery = !released;
+        return discoverWorkgroup(options);
+      },
+    });
+    await daemon.refreshCatalog();
+    expect(
+      (await daemon.query('madison', 'claimed overlay', 20, { agentGroupId: 'ag-a', sessionId: 's1' })).nodes.length,
+    ).toBeGreaterThan(0);
+    expect(observedDuringDiscovery).toBe(true);
+    expect(released).toBe(true);
     await daemon.close();
   });
 });

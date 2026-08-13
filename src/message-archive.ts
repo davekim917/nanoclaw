@@ -93,6 +93,13 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_archive_ag_sent ON messages_archive(agent_group_id, sent_at);
     CREATE INDEX IF NOT EXISTS idx_archive_thread ON messages_archive(agent_group_id, thread_id, sent_at);
     CREATE INDEX IF NOT EXISTS idx_archive_channel ON messages_archive(channel_type, platform_id, thread_id);
+    -- Covering index for the Graphify daemon's archive-change fingerprint
+    -- (pollArchiveOnce, every 10s). Without it that poll scans the table and
+    -- reads every row's text — it was the single largest disk consumer on the
+    -- box, and the resulting IO saturation is what stalled the host's event
+    -- loop. Keep the column order aligned with that query's filters.
+    CREATE INDEX IF NOT EXISTS idx_archive_fingerprint
+      ON messages_archive(agent_group_id, role, channel_type, sent_at);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_archive_fts USING fts5(
       text,
