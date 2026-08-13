@@ -23,7 +23,8 @@ set -u
 [ -n "${STUB_PR_LIST+x}" ] || STUB_PR_LIST='[]'
 [ -n "${STUB_PR_VIEW+x}" ] || STUB_PR_VIEW='{}'
 [ -n "${STUB_PR_FILES+x}" ] || STUB_PR_FILES='[]'
-[ -n "${STUB_CHECK_RUNS+x}" ] || STUB_CHECK_RUNS='{"check_runs":[]}'
+[ -n "${STUB_RUN_LIST+x}" ] || STUB_RUN_LIST='[]'
+[ -n "${STUB_RUN_LIST_EXIT+x}" ] || STUB_RUN_LIST_EXIT=0
 [ -n "${STUB_PARENT_SHA+x}" ] || STUB_PARENT_SHA=''
 [ -n "${STUB_COMMIT_TREE+x}" ] || STUB_COMMIT_TREE='{"tree":{"sha":"tree-abc"}}'
 [ -n "${STUB_BLOB_RESPONSE+x}" ] || STUB_BLOB_RESPONSE='{"sha":"blob-abc"}'
@@ -35,6 +36,10 @@ set -u
 [ -n "${STUB_PR_FILES_EXIT+x}" ] || STUB_PR_FILES_EXIT=0
 
 case "$1" in
+  run)
+    # CI facts now come from `gh run list --branch` (the check-runs REST
+    # endpoint is invisible to the container's scoped token — see the gate).
+    printf '%s' "$STUB_RUN_LIST"; exit "$STUB_RUN_LIST_EXIT" ;;
   pr)
     case "$2" in
       list) printf '%s' "$STUB_PR_LIST"; exit "$STUB_PR_LIST_EXIT" ;;
@@ -56,9 +61,6 @@ case "$1" in
     fi
     if printf '%s' "$P" | grep -qF '/pulls/' && printf '%s' "$P" | grep -qF '/files'; then
       printf '%s' "$STUB_PR_FILES"; exit "$STUB_PR_FILES_EXIT"
-    fi
-    if printf '%s' "$P" | grep -qF '/check-runs'; then
-      printf '%s' "$STUB_CHECK_RUNS"; exit 0
     fi
     if printf '%s' "$P" | grep -qF '/git/ref/heads/'; then
       if [ "$STUB_BRANCH_EXISTS" = true ]; then echo '{"ref":"exists"}'; exit 0; else exit 1; fi
@@ -118,7 +120,7 @@ chmod +x "$STUB_BIN/gh" "$STUB_BIN/curl"
 export PATH="$STUB_BIN:$PATH"
 
 reset_stubs() {
-  unset STUB_PR_LIST STUB_PR_VIEW STUB_PR_FILES STUB_CHECK_RUNS STUB_PARENT_SHA \
+  unset STUB_PR_LIST STUB_PR_VIEW STUB_PR_FILES STUB_RUN_LIST STUB_RUN_LIST_EXIT STUB_PARENT_SHA \
         STUB_COMMIT_TREE STUB_BLOB_RESPONSE STUB_TREE_RESPONSE STUB_COMMIT_RESPONSE \
         STUB_REF_RESPONSE STUB_REF_EXIT STUB_BRANCH_EXISTS STUB_PR_LIST_EXIT \
         STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
@@ -161,9 +163,9 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 HEAD_SHA="$(sha b)"
-export STUB_PR_LIST="[{\"number\":42,\"headRefOid\":\"$HEAD_SHA\"}]"
+export STUB_PR_LIST="[{\"number\":42,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
 export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
-export STUB_CHECK_RUNS='{"check_runs":[{"name":"CI","status":"completed","conclusion":"success"}]}'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-42\",\"name\":\"XZO-DEV-BACKEND PR #42\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-42.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
@@ -187,9 +189,9 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 HEAD_SHA="$(sha c)"
 STALE_SHA="$(sha d)"
-export STUB_PR_VIEW="{\"number\":7,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_VIEW="{\"number\":7,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
-export STUB_CHECK_RUNS='{"check_runs":[{"name":"CI","status":"completed","conclusion":"success"}]}'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-7\",\"name\":\"XZO-DEV-BACKEND PR #7\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-7.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$STALE_SHA\"}}]"
 bash "$GATE" check 7 | jq -e --arg head "$HEAD_SHA" --arg stale "$STALE_SHA" '
@@ -203,10 +205,10 @@ export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 PARENT_SHA="$(sha e)"
 FREEZE_SHA="$(sha f)"
-export STUB_PR_VIEW="{\"number\":9,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_VIEW="{\"number\":9,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
 export STUB_PARENT_SHA="$PARENT_SHA"
-export STUB_CHECK_RUNS='{"check_runs":[{"name":"pr-title-check","status":"completed","conclusion":"success"}]}'
+export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
 bash "$GATE" check 9 | jq -e --arg parent "$PARENT_SHA" --arg head "$FREEZE_SHA" '
   .isFreezePr == true and .ciSha == $parent and .ciReady == true and
   .migrationsTouched == false and .frontendTouched == true and .headSha == $head
@@ -217,11 +219,11 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 HEAD_SHA="$(sha 1)"
-export STUB_PR_VIEW="{\"number\":11,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_VIEW="{\"number\":11,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"XZO-BACKEND/migrations/0099_add_col.sql"},{"filename":"XZO-BACKEND/src/foo.ts"}]'
 bash "$GATE" check 11 | jq -e '.migrationsTouched == true and .settled == false' >/dev/null
 # Same PR through poll: refuses with a throttled alarm, never a settle wake.
-export STUB_PR_LIST="[{\"number\":11,\"headRefOid\":\"$HEAD_SHA\"}]"
+export STUB_PR_LIST="[{\"number\":11,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
 bash "$GATE" poll | jq -e --arg sha "$HEAD_SHA" '
   .wakeAgent == true and .data.trigger == "pr_migrations_refused" and
   .data.pr == 11 and .data.sourceSha == $sha
@@ -339,9 +341,9 @@ fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
 HEAD_SHA="$(sha 9)"
-export STUB_PR_VIEW="{\"number\":55,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_VIEW="{\"number\":55,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES_EXIT=1
-export STUB_CHECK_RUNS='{"check_runs":[{"name":"CI","status":"completed","conclusion":"success"}]}'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 export STUB_SERVICES="[{\"id\":\"srv-backend-pr-55\",\"name\":\"XZO-DEV-BACKEND PR #55\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-55.onrender.com\"}}]"
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
@@ -439,5 +441,65 @@ bash "$GATE" finish "$LOCKFAIL_HEAD" run-lockfail NO_GO | jq -e --arg target "$L
 jq -e --arg sha "$LOCKFAIL_TARGET" '.sha == $sha and .verdict == "NO_GO"' "$DEV_PUBLISH3" >/dev/null
 jq -e --arg sha "$LOCKFAIL_TARGET" '.sha == $sha and .verdict == "NO_GO"' "$DEV_HOLD3" >/dev/null
 [ ! -e "$BAD_LEDGER" ]
+
+# --- 16. CI facts are filtered to the target SHA -------------------------
+# `gh run list --branch` returns the branch's recent runs, not one commit's,
+# so the SHA filter is the whole correctness of the port away from the
+# check-runs endpoint. A branch whose recent runs are all for OTHER commits
+# must read as "no CI for our head" (fail closed), never as green.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha 1)"
+OTHER_SHA="$(sha 2)"
+export STUB_PR_VIEW="{\"number\":61,\"state\":\"OPEN\",\"isDraft\":false,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$OTHER_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-61\",\"name\":\"XZO-DEV-BACKEND PR #61\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+bash "$GATE" check 61 | jq -e '
+  .ciTotal == 0 and .ciReady == false and .settled == false
+' >/dev/null
+# Same fixtures, but the branch listing now carries OUR sha: settles.
+export STUB_RUN_LIST="[{\"headSha\":\"$OTHER_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"},{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+bash "$GATE" check 61 | jq -e '
+  .ciTotal == 1 and .ciReady == true and .settled == true
+' >/dev/null
+
+# --- 17. A PR that can never settle alarms instead of failing silently ----
+# The 2026-08-12 outage in one test: freeze PR #786 was built, live and warm
+# for 6.5h while its CI fetch returned nothing, and every poll skipped it
+# without a word. Unfetchable facts must alarm once past the window.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha 3)"
+export STUB_PR_LIST="[{\"number\":77,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST_EXIT=1
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-77\",\"name\":\"XZO-DEV-BACKEND PR #77\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+
+# Inside the window: silent, but the stall is now RECORDED.
+export SMOKE_GATE_FACTS_STUCK_SECONDS=3600
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
+jq -e --arg sha "$HEAD_SHA" '.factsStuckSha == $sha and .factsStuckSince != null' \
+  "$STATE_DIR/pr-77-state.json" >/dev/null
+
+# Past the window: one alarm, latched.
+export SMOKE_GATE_FACTS_STUCK_SECONDS=0
+bash "$GATE" poll | jq -e --arg sha "$HEAD_SHA" '
+  .wakeAgent == true and .data.trigger == "pr_facts_unavailable" and
+  .data.pr == 77 and .data.sourceSha == $sha
+' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null
+
+# Facts recover: the latch clears, so a later stall alarms again.
+unset STUB_RUN_LIST_EXIT
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+bash "$GATE" poll >/dev/null
+jq -e '.factsStuckSha == null and .factsStuckAlertSha == null' "$STATE_DIR/pr-77-state.json" >/dev/null
 
 echo "smoke pr gate tests passed"

@@ -42,6 +42,13 @@ PREFLIGHT_REARM_FLOOR_SECONDS="${SMOKE_GATE_PREFLIGHT_REARM_FLOOR_SECONDS:-900}"
 # fresh disk. Below this ceiling, "still warming" is normal and silent. At or
 # past it, a backend stuck warming this long is worth one throttled alarm.
 WARMUP_TIMEOUT="${SMOKE_GATE_WARMUP_TIMEOUT:-600}"
+# How long a labeled PR may sit with unfetchable gate facts before it alarms.
+# Facts come from several fetches (PR files, CI, Render services/deploys); any
+# of them failing means the PR can never settle, and before 2026-08-12 that
+# state was completely silent — freeze PR #786 sat fully built and warm for
+# 6.5 hours while the CI fetch returned nothing on every 10-minute poll, and
+# nothing anywhere said so. A gate that cannot settle must be loud.
+FACTS_STUCK_TIMEOUT="${SMOKE_GATE_FACTS_STUCK_SECONDS:-3600}"
 # Freeze-PR handoff wiring, `finish` only, freeze PRs only (see the header
 # comment above `detect_freeze` and the `finish` command below). All three
 # are no-ops unless set — a deployment that never wires them keeps today's
@@ -106,7 +113,10 @@ default_pr_state() {
     deployLiveSha: null,
     deployLiveSince: null,
     warmupAlertSha: null,
-    refusedAlertSha: null
+    refusedAlertSha: null,
+    factsStuckSha: null,
+    factsStuckSince: null,
+    factsStuckAlertSha: null
   }'
 }
 
@@ -227,9 +237,9 @@ healthz_ok() {
 # direction: migrations-touched and frontend-touched default to true, CI
 # defaults to not-ready. Prints one JSON facts line.
 evaluate_pr() {
-  local pr="$1" head_sha="$2"
+  local pr="$1" head_sha="$2" head_ref="${3:-}"
   local files_json files_len files_fetch_failed migrations_touched frontend_touched is_freeze ci_sha
-  local checks_json ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
+  local runs_json runs_len ci_ref ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
   local services_json backend backend_id backend_url backend_deploy_sha backend_ready
   local frontend frontend_id frontend_url frontend_deploy_sha frontend_ready
   local healthz_ready settled fetch_ok=true
@@ -269,18 +279,40 @@ evaluate_pr() {
     ci_sha="$head_sha"
   fi
 
+  # CI facts come from `gh run list --branch`, deliberately NOT the check-runs
+  # REST endpoint. This gate originally read
+  # `repos/<repo>/commits/<sha>/check-runs`, which works with an operator token
+  # but returns nothing to the agent container's scoped GitHub token — so every
+  # in-container poll computed ci_total=0 / fetch_ok=false and silently refused
+  # to settle. Freeze PR #786 was fully built, warm and correct for 6.5 hours on
+  # 2026-08-12 and never ran. smoke-develop-gate.sh:540 has always used this
+  # same `gh run list` call and has worked in-container for months; both gates
+  # now read CI through the one mechanism proven under the container's token.
   ci_ready=false
   ci_total=0; ci_pending=0; ci_failed=0; ci_succeeded=0; ci_truncated=false
   if [ -n "$ci_sha" ]; then
-    if checks_json="$(timeout 10 gh api "repos/$REPO/commits/$ci_sha/check-runs?per_page=100" 2>/dev/null)" &&
-       jq -e '.check_runs | type == "array"' <<<"$checks_json" >/dev/null 2>&1; then
-      ci_total="$(jq -r '.check_runs | length' <<<"$checks_json")"
-      if [ "$ci_total" -ge 100 ]; then
+    # A freeze PR's ci_sha is its marker commit's PARENT, which lives on the
+    # base branch; a normal PR's ci_sha is its own head, on its head branch.
+    if [ "$is_freeze" = true ]; then ci_ref="$BRANCH"; else ci_ref="$head_ref"; fi
+    if [ -n "$ci_ref" ] &&
+       runs_json="$(timeout 10 gh run list -R "$REPO" --branch "$ci_ref" --limit 100 \
+         --json headSha,status,conclusion,workflowName 2>/dev/null)" &&
+       jq -e 'type == "array"' <<<"$runs_json" >/dev/null 2>&1; then
+      runs_len="$(jq -r 'length' <<<"$runs_json")"
+      ci_total="$(jq -r --arg s "$ci_sha" '[.[] | select(.headSha == $s)] | length' <<<"$runs_json")"
+      if [ "$runs_len" -ge 100 ] && [ "$ci_total" -eq 0 ]; then
+        # Full page and none of it is our SHA — the runs may simply be older
+        # than one page. Cannot prove CI state, so fail closed rather than
+        # read a paging artifact as "no CI ran".
         ci_truncated=true
+        fetch_ok=false
       else
-        ci_pending="$(jq -r '[.check_runs[] | select(.status != "completed")] | length' <<<"$checks_json")"
-        ci_failed="$(jq -r '[.check_runs[] | select((.conclusion // "") as $c | (["success","skipped","neutral"] | index($c) | not))] | length' <<<"$checks_json")"
-        ci_succeeded="$(jq -r '[.check_runs[] | select(.status == "completed" and .conclusion == "success")] | length' <<<"$checks_json")"
+        ci_pending="$(jq -r --arg s "$ci_sha" '[.[] | select(.headSha == $s and .status != "completed")] | length' <<<"$runs_json")"
+        ci_failed="$(jq -r --arg s "$ci_sha" '[.[] | select(.headSha == $s) | select((.conclusion // "") as $c | (["success","skipped","neutral"] | index($c) | not))] | length' <<<"$runs_json")"
+        ci_succeeded="$(jq -r --arg s "$ci_sha" '[.[] | select(.headSha == $s and .status == "completed" and .conclusion == "success")] | length' <<<"$runs_json")"
+        # Same rule the develop gate applies: >=1 real success required, so a
+        # head whose every workflow was path-skipped can never clear on
+        # "nothing failed" alone.
         if [ "$ci_total" -gt 0 ] && [ "$ci_succeeded" -gt 0 ] && [ "$ci_pending" -eq 0 ] && [ "$ci_failed" -eq 0 ]; then
           ci_ready=true
         fi
@@ -406,7 +438,7 @@ if [ "$COMMAND" = "check" ]; then
       '{ok:false,error:"gate misconfigured",missing:$missing}'
     exit 2
   fi
-  if ! PR_JSON="$(timeout 10 gh pr view "$PR" -R "$REPO" --json number,state,isDraft,headRefOid,baseRefName,labels 2>/dev/null)" ||
+  if ! PR_JSON="$(timeout 10 gh pr view "$PR" -R "$REPO" --json number,state,isDraft,headRefOid,headRefName,baseRefName,labels 2>/dev/null)" ||
      ! jq -e 'type == "object"' <<<"$PR_JSON" >/dev/null 2>&1; then
     jq -cn --argjson pr "$PR" '{ok:false,error:"failed to fetch PR",pr:$pr}'
     exit 1
@@ -423,7 +455,8 @@ if [ "$COMMAND" = "check" ]; then
     exit 0
   fi
   HEAD_SHA="$(jq -r '.headRefOid' <<<"$PR_JSON")"
-  FACTS="$(evaluate_pr "$PR" "$HEAD_SHA")"
+  HEAD_REF="$(jq -r '.headRefName // empty' <<<"$PR_JSON")"
+  FACTS="$(evaluate_pr "$PR" "$HEAD_SHA" "$HEAD_REF")"
   # Belt and braces (P1-2): `check` is the one path a human trusts before a
   # manual claim, so it must never assert settled:true on a fetch failure —
   # independent of whatever evaluate_pr's own per-field fail-closed defaults
@@ -770,7 +803,7 @@ if [ -n "$MISSING" ]; then
 fi
 
 PR_LIST_JSON="$(timeout 10 gh pr list -R "$REPO" --base "$BRANCH" --label "$LABEL" --state open \
-  --json number,headRefOid --limit 100 2>/dev/null)"
+  --json number,headRefOid,headRefName --limit 100 2>/dev/null)"
 PR_LIST_RC=$?
 PR_LIST_LEN="$(jq -r 'length' <<<"$PR_LIST_JSON" 2>/dev/null || printf -- '-1')"
 # Exit code, shape, AND truncation (>=100, the --limit ceiling — same guard
@@ -825,10 +858,37 @@ NOW_EPOCH="$(date -u +%s)"
 while IFS= read -r ROW; do
   PR="$(jq -r '.number' <<<"$ROW")"
   HEAD_SHA="$(jq -r '.headRefOid' <<<"$ROW")"
+  HEAD_REF="$(jq -r '.headRefName // empty' <<<"$ROW")"
   printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$' || continue
 
-  FACTS="$(evaluate_pr "$PR" "$HEAD_SHA")"
-  [ "$(jq -r '.fetchOk' <<<"$FACTS")" = true ] || continue
+  FACTS="$(evaluate_pr "$PR" "$HEAD_SHA" "$HEAD_REF")"
+
+  # Facts incomplete — this PR cannot settle this poll. This used to be a bare
+  # `continue`, which is how a permanently-unsettleable gate stayed silent for
+  # 6.5 hours (see FACTS_STUCK_TIMEOUT). Record when the stall started and
+  # alarm once it outlives the window.
+  if [ "$(jq -r '.fetchOk' <<<"$FACTS")" != true ]; then
+    exec 9>"$(pr_lock_file "$PR")"
+    if flock -w 5 9; then
+      STATE="$(read_pr_state "$PR")"
+      if [ "$(jq -r '.factsStuckSha // empty' <<<"$STATE")" != "$HEAD_SHA" ]; then
+        STATE="$(jq -c --arg sha "$HEAD_SHA" --arg now "$(iso_now)" \
+          '.factsStuckSha=$sha | .factsStuckSince=$now' <<<"$STATE")"
+        write_pr_state "$PR" "$STATE"
+      fi
+      STUCK_SINCE="$(epoch_or_zero "$(jq -r '.factsStuckSince // empty' <<<"$STATE")")"
+      STUCK_ALERT_SHA="$(jq -r '.factsStuckAlertSha // empty' <<<"$STATE")"
+      flock -u 9
+      exec 9>&-
+      if [ "$STUCK_ALERT_SHA" != "$HEAD_SHA" ] && [ "$STUCK_SINCE" -gt 0 ] &&
+         [ "$(( NOW_EPOCH - STUCK_SINCE ))" -ge "$FACTS_STUCK_TIMEOUT" ]; then
+        jq -cn --argjson pr "$PR" --arg sha "$HEAD_SHA" '{pr:$pr,sha:$sha,subtype:"facts"}' >> "$ALARM_CANDIDATES"
+      fi
+    else
+      exec 9>&-
+    fi
+    continue
+  fi
 
   exec 9>"$(pr_lock_file "$PR")"
   if ! flock -w 5 9; then
@@ -836,14 +896,24 @@ while IFS= read -r ROW; do
     continue
   fi
   STATE="$(read_pr_state "$PR")"
+  STATE_DIRTY=false
+
+  # Facts are complete again — drop any stall latch so a later stall re-alarms.
+  if [ -n "$(jq -r '.factsStuckSha // empty' <<<"$STATE")" ]; then
+    STATE="$(jq -c '.factsStuckSha=null | .factsStuckSince=null | .factsStuckAlertSha=null' <<<"$STATE")"
+    STATE_DIRTY=true
+  fi
 
   BACKEND_READY="$(jq -r '.backendReady' <<<"$FACTS")"
   if [ "$BACKEND_READY" = true ]; then
     if [ "$(jq -r '.deployLiveSha // empty' <<<"$STATE")" != "$HEAD_SHA" ]; then
       STATE="$(jq -c --arg sha "$HEAD_SHA" --arg now "$(iso_now)" \
         '.deployLiveSha=$sha | .deployLiveSince=$now' <<<"$STATE")"
-      write_pr_state "$PR" "$STATE"
+      STATE_DIRTY=true
     fi
+  fi
+  if [ "$STATE_DIRTY" = true ]; then
+    write_pr_state "$PR" "$STATE"
   fi
   flock -u 9
   exec 9>&-
@@ -900,12 +970,14 @@ if [ -s "$ALARM_CANDIDATES" ]; then
     STATE="$(read_pr_state "$W_PR")"
     FIELD="refusedAlertSha"
     [ "$W_SUB" = "warmup" ] && FIELD="warmupAlertSha"
+    [ "$W_SUB" = "facts" ] && FIELD="factsStuckAlertSha"
     ALREADY="$(jq -r --arg f "$FIELD" '.[$f] // empty' <<<"$STATE")"
     if [ "$ALREADY" != "$W_SHA" ]; then
       STATE="$(jq -c --arg f "$FIELD" --arg sha "$W_SHA" '.[$f]=$sha' <<<"$STATE")"
       write_pr_state "$W_PR" "$STATE"
       TRIGGER="pr_migrations_refused"
       [ "$W_SUB" = "warmup" ] && TRIGGER="pr_warmup_stuck"
+      [ "$W_SUB" = "facts" ] && TRIGGER="pr_facts_unavailable"
       jq -cn --argjson pr "$W_PR" --arg sha "$W_SHA" --arg trigger "$TRIGGER" \
         '{wakeAgent:true,data:{schemaVersion:1,trigger:$trigger,pr:$pr,sourceSha:$sha}}'
       exit 0
