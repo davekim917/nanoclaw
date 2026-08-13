@@ -8,6 +8,7 @@ import {
   resolveInboundSlackIds,
   resolveSlackMentions,
   slackMentionOutsideCode,
+  slackPermalink,
   upgradeSlackBotProfile,
   type SlackBotIdentity,
 } from './slack-mentions.js';
@@ -904,5 +905,56 @@ describe('slackMentionOutsideCode', () => {
         realName: 'The Gate Bot',
       }),
     ).toBe(true);
+  });
+});
+
+describe('slackPermalink', () => {
+  const CHANNEL_TYPE = 'slack-permalink-test';
+
+  function register(workspaceUrl: string | undefined): void {
+    registerSlackBot(CHANNEL_TYPE, {
+      userId: 'U1',
+      username: 'bot',
+      teamId: 'T1',
+      ...(workspaceUrl === undefined ? {} : { workspaceUrl }),
+    });
+  }
+
+  it('builds a Slack thread link from the routing thread id', () => {
+    register('https://acme.slack.com/');
+
+    expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', 'slack:C0AAA:1786621514.008659')).toBe(
+      'https://acme.slack.com/archives/C0AAA/p1786621514008659',
+    );
+  });
+
+  it('tolerates a workspace url with no trailing slash', () => {
+    register('https://acme.slack.com');
+
+    expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', 'slack:C0AAA:1786621514.008659')).toBe(
+      'https://acme.slack.com/archives/C0AAA/p1786621514008659',
+    );
+  });
+
+  it('falls back to the platform id when the thread id is a bare ts', () => {
+    register('https://acme.slack.com/');
+
+    expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', '1786621514.008659')).toBe(
+      'https://acme.slack.com/archives/C0AAA/p1786621514008659',
+    );
+  });
+
+  it('declines rather than guessing when the workspace url is unknown', () => {
+    register(undefined);
+
+    expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', 'slack:C0AAA:1786621514.008659')).toBeNull();
+  });
+
+  it('declines for an unregistered channel type, a null thread, and a non-ts thread id', () => {
+    register('https://acme.slack.com/');
+
+    expect(slackPermalink('slack-unregistered', 'slack:C0AAA', 'slack:C0AAA:1786621514.008659')).toBeNull();
+    expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', null)).toBeNull();
+    expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', 'slack:C0AAA:not-a-timestamp')).toBeNull();
   });
 });

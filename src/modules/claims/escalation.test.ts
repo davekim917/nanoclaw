@@ -232,6 +232,7 @@ describe('escalateClaim', () => {
       resolveSession: vi.fn(() => ({ agent_group_id: 'ag-1', id: 'sess-1' })),
       hasOutbound: vi.fn(() => true),
       writeMessage: vi.fn(),
+      resolvePermalink: vi.fn(() => null),
       ...overrides,
     };
   }
@@ -296,10 +297,10 @@ describe('escalateClaim', () => {
    * detail, and the whole point of the summary is that a human can act on the
    * alert without reading a paragraph in a notification.
    */
-  function textFor(claim: Record<string, unknown>): string {
+  function textFor(claim: Record<string, unknown>, overrides: Partial<EscalationDeliveryDeps> = {}): string {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
     const file = writeClaim(path.join(root, 'wg-a', 'claims'), 'seam-publish-gate', claim);
-    const d = deps();
+    const d = deps(overrides);
     escalateClaim(candidate({ claim }, file), NOW, d);
     const [, , message] = (d.writeMessage as ReturnType<typeof vi.fn>).mock.calls[0];
     return (JSON.parse(message.content) as { text: string }).text;
@@ -334,6 +335,53 @@ describe('escalateClaim', () => {
 
     expect(summary.endsWith(' …')).toBe(true);
     expect(summary.length).toBeLessThanOrEqual(201);
+  });
+
+  it('links the thread the claim was worked in when it recorded one', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
+    const claim = { owner: 'ava', note: 'Wallet tie-out.', thread_id: 'slack:C0AAA:1786621514.008659' };
+    const file = writeClaim(path.join(root, 'wg-a', 'claims'), 'seam-publish-gate', claim);
+    const d = deps({ resolvePermalink: vi.fn(() => 'https://acme.slack.com/archives/C0AAA/p1786621514008659') });
+
+    escalateClaim(candidate({ claim }, file), NOW, d);
+
+    expect(d.resolvePermalink).toHaveBeenCalledWith('slack', 'C000TEST', 'slack:C0AAA:1786621514.008659');
+    const [, , message] = (d.writeMessage as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect((JSON.parse(message.content) as { text: string }).text).toContain(
+      '- **Worked in:** https://acme.slack.com/archives/C0AAA/p1786621514008659',
+    );
+  });
+
+  it('omits the link line for a claim written before thread ids were recorded', () => {
+    const resolvePermalink = vi.fn(() => 'https://acme.slack.com/archives/C0AAA/p1');
+    const text = textFor({ owner: 'ava', note: 'Legacy claim.' }, { resolvePermalink });
+
+    expect(resolvePermalink).not.toHaveBeenCalled();
+    expect(text).not.toContain('Worked in');
+  });
+
+  it('still alerts when the adapter cannot build a link', () => {
+    const text = textFor(
+      { owner: 'ava', note: 'Unlinkable.', thread_id: 'slack:C0AAA:1786621514.008659' },
+      { resolvePermalink: vi.fn(() => null) },
+    );
+
+    expect(text).not.toContain('Worked in');
+    expect(text).toContain('- **Owner:** ava');
+  });
+
+  it('alerts without a link when permalink resolution throws', () => {
+    const text = textFor(
+      { owner: 'ava', note: 'Adapter blew up.', thread_id: 'slack:C0AAA:1786621514.008659' },
+      {
+        resolvePermalink: vi.fn(() => {
+          throw new Error('adapter gone');
+        }),
+      },
+    );
+
+    expect(text).not.toContain('Worked in');
+    expect(text).toContain('- **Owner:** ava');
   });
 
   it('omits the TTL clause when the claim carries no ttl_hours', () => {

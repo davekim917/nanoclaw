@@ -21,6 +21,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { DATA_DIR } from '../../config.js';
 import { getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import { findAnySessionForMessagingGroup } from '../../db/sessions.js';
@@ -35,6 +36,8 @@ interface Claim {
   escalated_at?: unknown;
   released_at?: unknown;
   status?: unknown;
+  /** Routing id of the thread the work was claimed in, straight from the claimant's `session_routing`. */
+  thread_id?: unknown;
 }
 
 /**
@@ -207,13 +210,13 @@ function noteHeadline(note: string): string {
   return head.length < full.length ? `${head} …` : head;
 }
 
-function formatEscalationText(candidate: EscalationCandidate): string {
+function formatEscalationText(candidate: EscalationCandidate, threadLink: string | null): string {
   const owner = typeof candidate.claim.owner === 'string' ? candidate.claim.owner : 'unknown';
   const rawNote = typeof candidate.claim.note === 'string' ? candidate.claim.note.trim() : '';
   const staleHours = (candidate.staleMs / (60 * 60 * 1000)).toFixed(1);
   const ttl = typeof candidate.claim.ttl_hours === 'number' ? candidate.claim.ttl_hours : undefined;
 
-  return [
+  const lines = [
     `⚠️ **Abandoned work claim** — \`${candidate.slug}\``,
     rawNote ? noteHeadline(rawNote) : '(no note)',
     '',
@@ -221,8 +224,32 @@ function formatEscalationText(candidate: EscalationCandidate): string {
     ttl === undefined
       ? `- **Stale:** ${staleHours}h past grace`
       : `- **Stale:** ${staleHours}h past grace, on a ${ttl}h TTL`,
-    `- **Next:** nothing happens automatically — ${owner} releases it, or anyone takes it over.`,
-  ].join('\n');
+  ];
+  if (threadLink) lines.push(`- **Worked in:** ${threadLink}`);
+  lines.push(`- **Next:** nothing happens automatically — ${owner} releases it, or anyone takes it over.`);
+  return lines.join('\n');
+}
+
+/**
+ * Resolve the claim's recorded thread to a clickable link.
+ *
+ * `thread_id` is written by the claiming agent from its own `session_routing`
+ * row, so it is a real routing id rather than the free-text `session_id`
+ * nickname that sat here before and resolved to nothing. Claims written
+ * before the skill started recording it simply have no link.
+ */
+function resolveClaimThreadLink(candidate: EscalationCandidate, deps: EscalationDeliveryDeps): string | null {
+  const threadId = candidate.claim.thread_id;
+  if (typeof threadId !== 'string' || threadId.trim() === '') return null;
+  try {
+    return deps.resolvePermalink(candidate.dest.channelType, candidate.dest.platformId, threadId.trim());
+  } catch (err) {
+    log.warn('Claims escalation: permalink resolution failed, alerting without a link', {
+      slug: candidate.slug,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
 }
 
 /** Stamp escalated_at onto the claim file — atomic tmp+rename, same convention as the skill's own claim write. */
@@ -250,6 +277,12 @@ export interface EscalationDeliveryDeps {
       content: string;
     },
   ) => void;
+  /**
+   * Clickable URL for the thread a claim was worked in, or null. Injected
+   * rather than imported so this module stays free of the channel registry
+   * and the alert text stays unit-testable without an adapter.
+   */
+  resolvePermalink: (channelType: string, platformId: string, threadId: string) => string | null;
 }
 
 const defaultDeps: EscalationDeliveryDeps = {
@@ -262,6 +295,8 @@ const defaultDeps: EscalationDeliveryDeps = {
   resolveSession: (messagingGroupId) => findAnySessionForMessagingGroup(messagingGroupId),
   hasOutbound: (agentGroupId, sessionId) => fs.existsSync(outboundDbPath(agentGroupId, sessionId)),
   writeMessage: writeOutboundDirect,
+  resolvePermalink: (channelType, platformId, threadId) =>
+    getChannelAdapter(channelType)?.permalink?.(platformId, threadId) ?? null,
 };
 
 /**
@@ -303,7 +338,7 @@ export function escalateClaim(
     channelType: dest.channelType,
     threadId: null,
     content: JSON.stringify({
-      text: formatEscalationText(candidate),
+      text: formatEscalationText(candidate, resolveClaimThreadLink(candidate, deps)),
       _system: { kind: 'claim_escalation', workgroupId: candidate.workgroupId, slug: candidate.slug },
     }),
   });

@@ -258,6 +258,18 @@ export interface ChannelAdapter {
   resolveChannelName?(platformId: string): Promise<string | null>;
 
   /**
+   * Human-clickable URL for a thread, or null when one can't be built.
+   *
+   * Synchronous and side-effect free — every platform's link form is derivable
+   * from ids the host already holds plus something learned once at adapter
+   * init, so callers on a timer (the sweep) can build a link without an API
+   * round trip. Optional: adapters whose platform has no addressable thread
+   * URL omit it, and every caller must treat null as "no link", never as an
+   * error.
+   */
+  permalink?(platformId: string, threadId: string | null): string | null;
+
+  /**
    * Subscribe the bot to a thread so follow-up messages route via the
    * platform's "subscribed message" path (onSubscribedMessage in Chat SDK).
    * Called by the router when a mention-sticky wiring first engages in a

@@ -45,6 +45,14 @@ export interface SlackBotIdentity {
   realName?: string;
   /** Slack workspace identifier (team_id). Used to scope cross-bot resolution to siblings in the same workspace. */
   teamId: string;
+  /**
+   * Workspace base URL as reported by `auth.test` (`https://acme.slack.com/`).
+   * The only piece a thread permalink needs that isn't already in a thread id,
+   * and it arrives free on a call the adapter already makes at init. Optional:
+   * an older cached identity or a stubbed client may not carry it, and a
+   * missing URL degrades to no link rather than a wrong one.
+   */
+  workspaceUrl?: string;
 }
 
 const knownSlackBots = new Map<string, SlackBotIdentity>();
@@ -67,6 +75,32 @@ export function registerSlackWorkspaceHumans(teamId: string, humans: SlackBotIde
 
 export function getKnownSlackBots(): ReadonlyMap<string, SlackBotIdentity> {
   return knownSlackBots;
+}
+
+/**
+ * Slack thread permalink, or null when one can't be built exactly.
+ *
+ * A thread id already carries both halves Slack needs — channel and the
+ * parent message `ts` (`slack:C0AAA:1786621514.008659`) — and the workspace
+ * base URL rides along on the identity captured at adapter init. Slack's own
+ * link form drops the dot from the ts:
+ * `https://acme.slack.com/archives/C0AAA/p1786621514008659`.
+ *
+ * Returns null rather than guessing. A link that 404s is worse than no link,
+ * so an unregistered workspace, a channel-level (unthreaded) destination, or
+ * a thread id that isn't a Slack ts all decline instead of improvising.
+ */
+export function slackPermalink(channelType: string, platformId: string, threadId: string | null): string | null {
+  if (!threadId) return null;
+  const base = knownSlackBots.get(channelType)?.workspaceUrl;
+  if (!base) return null;
+
+  const parts = threadId.split(':');
+  const ts = parts[parts.length - 1];
+  const channel = parts.length >= 2 ? parts[parts.length - 2] : platformId.split(':').pop();
+  if (!channel || !/^\d+\.\d+$/.test(ts)) return null;
+
+  return `${base.replace(/\/+$/, '')}/archives/${channel}/p${ts.replace('.', '')}`;
 }
 
 export function getKnownSlackHumans(): ReadonlyMap<string, SlackBotIdentity[]> {
@@ -443,6 +477,7 @@ interface SlackAuthTestClient {
       user_id?: string;
       user?: string;
       team_id?: string;
+      url?: string;
     }>;
   };
   users?: {
@@ -477,7 +512,7 @@ export async function fetchSlackBotIdentity(client: SlackAuthTestClient): Promis
       });
       return null;
     }
-    return { userId: res.user_id, username: res.user, teamId: res.team_id };
+    return { userId: res.user_id, username: res.user, teamId: res.team_id, workspaceUrl: res.url };
   } catch (err) {
     log.warn('Slack bot identity fetch failed', {
       err: err instanceof Error ? err.message : String(err),

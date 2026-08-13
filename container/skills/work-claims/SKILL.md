@@ -32,11 +32,18 @@ Claim shape:
 {
   "owner": "ava",
   "session_id": "a1b2c3d4",
+  "thread_id": "slack:C0AAA:1786621514.008659",
   "claimed_at": "2026-08-10T18:22:00Z",
   "ttl_hours": 4,
   "note": "publish-gate seam, PR #733"
 }
 ```
+
+`thread_id` is `$NANOCLAW_THREAD_ID` verbatim — your own routing id, already in
+your environment. Write it unedited and omit the field when the variable is
+empty (a channel-level session has no thread). It is what lets an abandoned-
+claim alert link a human back to where the work was happening; `session_id` is
+a local nickname and cannot. Never hand-assemble one.
 
 ## Rules
 
@@ -86,8 +93,10 @@ NOTE="publish-gate seam, PR #733"
 NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 TMP=$(mktemp "$CLAIMS_DIR/.tmp.XXXXXX")
 jq -n --arg owner "$NANOCLAW_ASSISTANT_NAME" --arg sid "$(hostname)" \
+      --arg tid "$NANOCLAW_THREAD_ID" \
       --arg at "$NOW_ISO" --arg note "$NOTE" \
-      '{owner:$owner, session_id:$sid, claimed_at:$at, ttl_hours:4, note:$note}' > "$TMP"
+      '{owner:$owner, session_id:$sid, claimed_at:$at, ttl_hours:4, note:$note}
+       + (if $tid == "" then {} else {thread_id:$tid} end)' > "$TMP"
 mv "$TMP" "$FILE"
 ```
 

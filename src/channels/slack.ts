@@ -40,6 +40,7 @@ import {
   registerSlackBot,
   registerSlackWorkspaceHumans,
   slackMentionOutsideCode,
+  slackPermalink,
   normalizeSlackOrderedListContinuations,
   resolveInboundSlackIds,
   resolveSlackMentions,
@@ -453,6 +454,7 @@ for (const ws of workspaces) {
         discoverRecoveryTargets: (request) => discoverSlackRecoveryTargets(client, request),
         classifyRecoveryError: classifySlackRecoveryError,
       });
+      bridge.permalink = (platformId, threadId) => slackPermalink(ws.channelType, platformId, threadId);
       bridge.postParent = (platformId, text) => slackPostParent(client, platformId, text);
       bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>
         slackCreateThread(client, platformId, parentMessageId, title, firstMessage);

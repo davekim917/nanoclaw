@@ -717,6 +717,7 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
     session.messaging_group_id ?? null,
     resolvedWgId,
     providerDecision.fallbackApplied,
+    session.thread_id ?? null,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -2906,6 +2907,14 @@ async function buildContainerArgs(
    * does not rewrite per spawn.
    */
   providerFallbackApplied?: boolean,
+  /**
+   * Routing id of this session's thread, surfaced as NANOCLAW_THREAD_ID.
+   * The `work-claims` skill stamps it onto a claim so an escalation can link
+   * back to where the work was happening — the field it used to write
+   * (`session_id`) was free text and resolved to nothing. Null for
+   * channel-level sessions, which have no thread to link to.
+   */
+  sessionThreadId?: string | null,
 ): Promise<string[]> {
   // --init: tini as PID 1 reaps orphaned children (esbuild/gh corpses were
   // accumulating as zombies under bun, which doesn't reap as PID 1) and still
@@ -3049,6 +3058,7 @@ async function buildContainerArgs(
     sessionMessagingGroupId ?? null,
   );
   args.push('-e', `NANOCLAW_ASSISTANT_NAME=${resolvedAssistantName}`);
+  if (sessionThreadId) args.push('-e', `NANOCLAW_THREAD_ID=${sessionThreadId}`);
 
   // Workgroup awareness — the agent learns which workgroup (multi-agent
   // tenant boundary) it belongs to, so prompts grounded in "my workgroup is
