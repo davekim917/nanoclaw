@@ -58,61 +58,44 @@ a local nickname and cannot. Never hand-assemble one.
    whatever seam you were mid-work on before resuming — a sibling may have
    taken it over while you were down.
 
-## Mechanics
+## Mechanics — always the script, never hand-rolled JSON
 
 ```bash
-CLAIMS_DIR=/workspace/workgroup/claims
-mkdir -p "$CLAIMS_DIR"
-SLUG="acme-pr-733"          # your stable slug for this unit of work
-FILE="$CLAIMS_DIR/$SLUG.json"
+CLAIM=/app/skills/work-claims/claim.sh
+
+bash $CLAIM check   acme-pr-733
+bash $CLAIM take    acme-pr-733 4 "publish-gate seam, PR #733"
+bash $CLAIM release acme-pr-733
+bash $CLAIM list
 ```
 
-**Check / stale test:**
+**Do not assemble a claim with `jq` yourself.** The fields are not a shape to
+remember — `owner`, `session_id` and `thread_id` all come from your environment,
+and the script reads them for you. This replaced a hand-written snippet, and the
+reason is worth one line: when `thread_id` was added, 0 of 16 live claims carried
+it, and the first claim written afterwards left it out too, with the variable set
+and the updated skill mounted. Agents write from memory of a format. There is now
+nothing to remember.
 
-```bash
-if [ -f "$FILE" ]; then
-  OWNER=$(jq -r .owner "$FILE")
-  CLAIMED_AT=$(jq -r .claimed_at "$FILE")
-  TTL=$(jq -r .ttl_hours "$FILE")
-  EXPIRES=$(date -u -d "$CLAIMED_AT + ${TTL} hours" +%s)
-  NOW=$(date -u +%s)
-  if [ "$NOW" -gt "$EXPIRES" ]; then
-    echo "STALE — owned by $OWNER, may be taken over"
-  else
-    echo "LIVE — owned by $OWNER, do not start this unless you are $OWNER"
-  fi
-else
-  echo "unclaimed"
-fi
-```
+Exit codes make it scriptable: **0** ok, **2** usage error, **3** held live by
+another agent. So `bash $CLAIM check <slug> || exit` is a correct guard.
 
-**Claim (fresh or takeover) — atomic write:**
+What the script enforces, so you do not have to:
 
-```bash
-NOTE="publish-gate seam, PR #733"
-NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-TMP=$(mktemp "$CLAIMS_DIR/.tmp.XXXXXX")
-jq -n --arg owner "$NANOCLAW_ASSISTANT_NAME" --arg sid "$(hostname)" \
-      --arg tid "$NANOCLAW_THREAD_ID" \
-      --arg at "$NOW_ISO" --arg note "$NOTE" \
-      '{owner:$owner, session_id:$sid, claimed_at:$at, ttl_hours:4, note:$note}
-       + (if $tid == "" then {} else {thread_id:$tid} end)' > "$TMP"
-mv "$TMP" "$FILE"
-```
+- Atomic same-directory `mktemp` + `mv` — no reader ever sees a half-written file.
+- `take` REFUSES a live claim that is not yours (exit 3). `--takeover` records an
+  override; it does not make one correct.
+- A stale takeover keeps the previous owner in the note instead of erasing them.
+- A claim with no parseable expiry counts as **stale**, never an indefinite lock —
+  a corrupt file must not wedge a slug forever.
+- `release` deletes only your own claim, and `--merged-pr <n>` verifies the merge
+  against GitHub rather than trusting your assertion.
+- No `/workspace/workgroup` → prints that the convention does not apply and exits
+  0, so you can call it unconditionally.
 
-`$NANOCLAW_ASSISTANT_NAME` is your own canonical name, already set in your
-container's environment. `mktemp` + `mv` within the same directory is an
-atomic rename — no other reader ever sees a half-written claim file.
-
-**Release (only your own claim):**
-
-```bash
-if [ -f "$FILE" ] && [ "$(jq -r .owner "$FILE")" = "$NANOCLAW_ASSISTANT_NAME" ]; then
-  rm "$FILE"
-else
-  echo "not your claim — do not delete"
-fi
-```
+The JSON shape above is still documented because you will READ claims — yours,
+siblings', and the ones the digest reports. Reading them is normal; writing them
+by hand is not.
 
 **Releasing means DELETING the file.** Do not stamp `released_at` or
 `status: done` and leave it behind. A claim file is a live-work marker, not a
@@ -124,19 +107,11 @@ reading the directory.
 **One exception to "only your own": work that is provably complete.** If the
 PR the claim names has MERGED, delete the claim whatever the owner says. The
 ownership rule exists to stop you taking live work off someone — a merged PR
-is not live work, and its owner is not coming back to tidy up. Verify the
-merge first (`gh pr view <n> --json state,mergedAt`), never infer it from a
-stale timestamp, and say in your report which claims you cleared and why.
-Anything short of a confirmed merge, leave alone and escalate instead.
-
-**List all live claims:**
-
-```bash
-for f in "$CLAIMS_DIR"/*.json; do
-  [ -e "$f" ] || continue
-  echo "$(basename "$f" .json): $(jq -c . "$f")"
-done
-```
+is not live work, and its owner is not coming back to tidy up. Use
+`bash $CLAIM release <slug> --merged-pr <n>` — it checks the PR state itself and
+refuses on anything but `MERGED`, so the merge is never inferred from a stale
+timestamp or from your own belief. Say in your report which claims you cleared
+and why. Anything short of a confirmed merge, leave alone and escalate instead.
 
 ## Known ceiling
 
