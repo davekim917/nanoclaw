@@ -58,6 +58,15 @@ For `develop_build_settled`:
    capture screenshots, request evidence, console evidence, save/reload
    persistence, failure/boundary behavior, parity/polish, and cleanup. A
    backend-only result cannot clear a user-visible change.
+   - **Dispatch every worker in the foreground and await it inside this turn.**
+     Never start a background agent and end the turn expecting its notification
+     to wake you: background agents live inside the container, and the host
+     reaps a scheduled-task container within seconds of the turn going idle, so
+     the workers die unrun and the next fire finds no completion markers.
+   - If the lanes genuinely cannot finish inside one turn, call
+     `continue_work({ task })` before yielding and resume them from durable
+     state on the next wake. That is the only follow-up promise the host
+     honors — future-tense prose in a work log is not one.
 5. Keep candidate findings and worker narration in the canonical run directory.
    Workers write their declared completion markers only after all referenced
    evidence is durable. Before this scheduled turn yields or ends, run:
