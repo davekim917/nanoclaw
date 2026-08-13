@@ -114,6 +114,10 @@ FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
 # develop SHA; past this, with develop moved on, the slot is freed so the next
 # poll re-freezes on current head rather than campaigning a superseded build.
 FREEZE_STALE_SECONDS="${SMOKE_GATE_FREEZE_STALE_SECONDS:-14400}"
+# Minimum interval between freeze cuts (campaign cadence floor). 0 = no floor
+# (default, no behavior change for existing deployments); the wrapper sets the
+# policy. Counted from the last freeze OPEN, so campaign duration eats into it.
+FREEZE_MIN_INTERVAL_SECONDS="${SMOKE_GATE_FREEZE_MIN_INTERVAL_SECONDS:-0}"
 # `check` runs the poll derivation and reports settledness WITHOUT mutating
 # state or claiming anything. It exists for human-requested campaigns, which
 # freeze on a person's word rather than on a gate wake and would otherwise
@@ -157,6 +161,7 @@ default_state() {
     handoffOpenedAt: null,
     freezeFailReason: null,
     freezeFailWakeAt: null,
+    lastFreezeOpenedAt: null,
     ledgerTamperAlertFor: null
   }'
 }
@@ -1046,6 +1051,23 @@ if [ -z "$PREVIOUS_SHA" ]; then
 fi
 
 if [ "$FREEZE_HANDOFF" = true ]; then
+  # Campaign cadence floor. Polls are token-free, but every freeze becomes a
+  # full campaign (coordinator + workers + challenger — measured ~$65-70 on
+  # the coordinator side alone, 2026-08-13), and each campaign's findings
+  # feed the fix lane, which costs more still. Removing the old wake window
+  # uncapped campaigns/day; this floor re-caps them without bringing the
+  # window back. Sits AFTER the settle/debounce checks and BEFORE any state
+  # mark: emit_no_wake preserves the settled candidate, so the first poll
+  # past the cooldown freezes whatever develop has settled on BY THEN —
+  # everything that merged during the cooldown batches into one campaign
+  # instead of queueing several.
+  if [ "$FREEZE_MIN_INTERVAL_SECONDS" -gt 0 ]; then
+    SINCE_LAST_FREEZE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.lastFreezeOpenedAt // empty' <<<"$STATE")") ))"
+    if [ "$SINCE_LAST_FREEZE" -lt "$FREEZE_MIN_INTERVAL_SECONDS" ]; then
+      emit_no_wake "freeze_cooldown"
+      exit 0
+    fi
+  fi
   # This is the exact point poll would otherwise open a develop_build_settled
   # campaign. Cut a freeze PR instead and hand the campaign off — zero agent
   # tokens spent here, it is a subprocess call, not a dispatch.
@@ -1090,6 +1112,7 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   STATE="$(jq -c \
     --arg sha "$SOURCE_SHA" --arg now "$NOW" --argjson pr "$FREEZE_PR_NUM" --arg freezeSha "$FREEZE_SHA_OUT" \
     '.handoffFreezePr=$pr | .handoffFreezeSha=$freezeSha | .handoffTargetSha=$sha | .handoffOpenedAt=$now |
+     .lastFreezeOpenedAt=$now |
      .freezeFailReason=null | .freezeFailWakeAt=null |
      .candidateSha=null | .candidateFirstSeen=null' <<<"$STATE")"
   write_state "$STATE"

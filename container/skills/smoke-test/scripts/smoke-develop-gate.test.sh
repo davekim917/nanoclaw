@@ -706,4 +706,34 @@ jq -e --arg sha "$MOVED_HEAD" '
   .data.trigger == "develop_freeze_opened" and .data.targetSha == $sha
 ' <<<"$STALE_OUT" >/dev/null
 
+# --- 34. Campaign cadence floor: a settled head inside the cooldown does NOT
+# freeze (candidate preserved), and the first poll past it freezes whatever
+# develop has settled on by then — merges during cooldown batch into one
+# campaign. Floor unset/0 = no behavior change (covered by every prior test).
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+CD_FIRST="$(printf '9%.0s' $(seq 40))"
+CD_SECOND="$(printf 'a%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$CD_FIRST"
+export STUB_FREEZE_JSON="{\"prNumber\":50,\"branch\":\"smoke/freeze-c1\",\"freezeSha\":\"$CD_FIRST\",\"targetSha\":\"$CD_FIRST\"}"
+export SMOKE_GATE_FREEZE_MIN_INTERVAL_SECONDS=99999
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+
+# Complete run 50 via ledger so the slot frees, then settle a NEW head inside
+# the cooldown: no freeze, candidate survives.
+printf '%s\n' "{\"schemaVersion\":1,\"targetSha\":\"$CD_FIRST\",\"freezeSha\":\"$CD_FIRST\",\"freezePr\":50,\"runId\":\"r50\",\"verdict\":\"GO\",\"finishedAt\":\"2026-01-01T00:00:00Z\"}" >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll >/dev/null
+export STUB_SOURCE_SHA="$CD_SECOND"
+bash "$GATE" poll >/dev/null   # debounce mark
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "freeze_cooldown"' >/dev/null
+jq -e '.handoffFreezePr == null and .candidateSha != null' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# Cooldown elapsed: the SAME preserved candidate freezes on the next poll.
+export SMOKE_GATE_FREEZE_MIN_INTERVAL_SECONDS=0
+export STUB_FREEZE_JSON="{\"prNumber\":51,\"branch\":\"smoke/freeze-c2\",\"freezeSha\":\"$CD_SECOND\",\"targetSha\":\"$CD_SECOND\"}"
+bash "$GATE" poll | jq -e --arg sha "$CD_SECOND" '
+  .data.trigger == "develop_freeze_opened" and .data.targetSha == $sha
+' >/dev/null
+
 echo "smoke develop gate tests passed"
