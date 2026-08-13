@@ -735,6 +735,88 @@ Each step is one ownership boundary and ends with a runnable check.
    Check: a throwaway script under the scratchpad, output pasted into `run.md`.
 7. **Full suite + build.** `pnpm test` and `pnpm run build`.
 
+## B — Bootstrap recall budget (incident 2026-08-13, approved same day)
+
+### B.1 The incident
+
+A user asked an agent about a project the workgroup had discussed for weeks. The store
+held **165 facts** about it plus dedicated project files; the archive held 1,300+ exact
+mentions. The agent replied that it did not recognize the name.
+
+Autopsy (session inbound DB, recall rows read directly): the question arrived on a
+**bootstrap turn** — fresh context, so the row carries the trusted capability block
+(≤8,000 chars), the core index (≤2,500), and an involved-sender preference file (~900,
+never evicted). That is ~11.4k of the 12,000-char final budget before one fact or archive
+row. The lanes FOUND the project evidence — the notices prove it — then
+`enforceFinalBound` evicted every archive and ranked-memory excerpt, in the designed
+order, keeping capabilities (last-evicted by design). The delivered recall row contained
+the sender's communication preferences and nothing else. The very next turn in the same
+thread — no bootstrap block — delivered the project's tenant file and archive rows
+correctly. Same store, same query, same code.
+
+**The failure is arithmetic, not retrieval: 12,000 was calibrated for ordinary turns,
+and bootstrap turns carry ~10–11.5k of mandatory payload by design.** A fleet's first
+impression of every new thread is currently its most amnesiac moment.
+
+### B.2 Capability-block audit (operator asked whether 8,000 is too much)
+
+Measured fleet-wide by building every active group's live snapshot:
+
+| group family | raw snapshot | services |
+|---|---|---|
+| largest | **9,508** | 18 |
+| second | 6,313 | 9 |
+| median band | 2,900–4,400 | 6–12 |
+
+Three conclusions:
+
+1. **The prose earns its size.** The dominant field is `activation`, and it is operative
+   instruction ("CI is included — never tell the user you lack access; exact verbs
+   follow"), hardened by prior denial incidents recorded in the bounds comments.
+   Trimming is whack-a-mole with a known failure class. Not pursued.
+2. **8,000 is too SMALL for the largest family** — its bootstrap turns silently drop
+   whole services today (`capability-total-budget`), the mirror image of the incident
+   the cap was added to prevent.
+3. **The real defect is placement**: a ~3–9.5k static-per-group block competes, on
+   bootstrap turns only, with the situational recall that is the only novel content of
+   the turn.
+
+### B.3 Design — two constants and one branch
+
+- `PRE_TURN_BOUNDS.bootstrapFinalChars = 22_000` — **derived as
+  `finalChars + capabilityTotalChars`**, corrected twice during build and both
+  corrections are worth recording. A first-draft 18,000 re-created the incident
+  in the worst-case fixture (mandatory payload had grown with the cap raise).
+  The next draft summed every bootstrap cap (24,500) — and fixture arithmetic
+  showed that number is *unreachable*: the per-lane caps already bound the row
+  below it, so the final bound would have become dead code. 22,000 keeps it a
+  live safety net: the capability block is the one bootstrap-only payload large
+  enough to displace recall, the core index rides in the ordinary envelope's
+  measured slack (~11.8k natural non-bootstrap ceiling vs the 12k bound), and
+  the worst-case bootstrap row sheds at most one excerpt. A row carrying
+  `trustedCapabilities` is by definition bootstrap; `enforceFinalBound` takes
+  the max of the applicable bounds. Cost: ~2.5k tokens on first turns only.
+- `capabilityTotalChars: 8_000 → 10_000`, so the largest family stops silently losing
+  services. Only bootstrap rows carry the block, and those now have 18k of room, so the
+  raise cannot recreate the recall-starvation incident the cap guards against.
+- Everything else — lane caps, eviction order, scent-shed-first — unchanged.
+
+### B.4 Acceptance criteria
+
+In `pre-turn-context.test.ts`:
+
+| # | Test name | Assertion |
+|---|---|---|
+| B-AC1 | `bootstrap turns keep recall alongside a full capability block` | The incident's shape: full capability block + core + injected preference file + matching facts and archive rows. Delivered row retains ≥1 archive excerpt AND ≥1 ranked memory excerpt. This fixture fails on the pre-fix code. |
+| B-AC2 | `ordinary turns keep the 12k bound` | Non-bootstrap over-budget fixture still bounds to `finalChars`. |
+| B-AC3 | `a 10k capability block keeps all services` | 18-service snapshot totalling ~9.5k serialized survives `boundedCapabilities` intact; at the old 8k cap it lost services. |
+| B-AC4 | `bootstrap bound applies only with capabilities present` | Same content minus `trustedCapabilities` bounds at 12k. |
+
+### B.5 Verification beyond tests
+
+Post-deploy: re-ask the incident's question in a fresh thread; the recall row must carry
+the project evidence. This doubles as §11's first live efficacy case.
+
 ## 9. Pillars 2–4 — sequenced, deliberately not designed here
 
 Recorded scope: `project_workgroup_cerebro_plan.md`. This plan builds pillars 0 and 1.

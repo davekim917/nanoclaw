@@ -3,9 +3,10 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { TEST_ROOT, FAILURES } = vi.hoisted(() => ({
+const { TEST_ROOT, FAILURES, CAPABILITY_FIXTURE } = vi.hoisted(() => ({
   TEST_ROOT: '/tmp/nanoclaw-pre-turn-context-test',
   FAILURES: { archive: false, exactLink: false, capabilities: false },
+  CAPABILITY_FIXTURE: { services: null as null | Array<Record<string, unknown>> },
 }));
 
 vi.mock('../../config.js', async (importOriginal) => ({
@@ -18,7 +19,7 @@ vi.mock('../../capabilities.js', () => ({
     if (FAILURES.capabilities) throw new Error('fixture capability failure');
     return {
       agentGroupId,
-      services: [
+      services: CAPABILITY_FIXTURE.services ?? [
         { name: `safe-for:${messagingGroupId ?? 'none'}`, declaredTools: [], scopes: [], credentialPaths: [] },
       ],
     };
@@ -43,9 +44,12 @@ vi.mock('../../message-archive.js', async (importOriginal) => {
 import {
   boundedCapabilities,
   buildPreTurnContext,
+  enforceFinalBound,
   evaluateRecallCorpus,
   PRE_TURN_BOUNDS,
   type ContextNotice,
+  type ConversationEvidenceExcerpt,
+  type MemoryEvidenceExcerpt,
   type RecallCorpus,
 } from './pre-turn-context.js';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
@@ -157,6 +161,7 @@ beforeEach(() => {
   FAILURES.archive = false;
   FAILURES.exactLink = false;
   FAILURES.capabilities = false;
+  CAPABILITY_FIXTURE.services = null;
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
   runMigrations(initTestDb());
@@ -1201,6 +1206,90 @@ describe('per-person preference recall', () => {
   });
 });
 
+describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
+  const ASK = 'Can you help me build a practice app about losophe?';
+
+  /** The incident's shape: sender preferences + rich matching store + archive. */
+  function seedIncidentShape(): void {
+    const sentence = 'Losophe is the streets-only dev tenant for the practice build losophe app project detail. ';
+    memoryFile('index.md', `# Canon\n${sentence.repeat(30)}`);
+    memoryFile('preferences/operator.md', `# Operator — preferences\n${'Use plain language. '.repeat(40)}`);
+    const fact = sentence.repeat(24).slice(0, 2_000);
+    const factLines = [0, 1, 2].map(
+      (index) =>
+        `- ${fact} (fact ${index}) <!-- nanoclaw-memory:id=mem_${String(index).repeat(16)};evidence=ev-${index};captured=2026-08-0${index + 1}T00:00:00.000Z -->`,
+    );
+    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${factLines.join('\n')}\n`);
+    memoryFile('imports/losophe-tenant.md', `# Losophe tenant\n${sentence.repeat(30)}`);
+    for (let index = 0; index < 4; index++) {
+      archive(`losophe-${index}`, 'ag-a', `${sentence.repeat(10)} (row ${index})`, `2026-07-2${index}T00:00:00.000Z`);
+    }
+  }
+
+  function bootstrapInput(bootstrap: boolean) {
+    return {
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1 as const,
+      normalizedContent: JSON.stringify({ text: ASK, sender: 'Operator' }),
+      includeBootstrap: bootstrap,
+    };
+  }
+
+  it('bootstrap turns keep recall alongside a full capability block (B-AC1)', () => {
+    seedIncidentShape();
+    // A capability block at the (new) cap, like the widest-wired group.
+    CAPABILITY_FIXTURE.services = Array.from({ length: 18 }, (_, index) => ({
+      name: `service-${index}`,
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      activation: `Authenticated via TOKEN_${index}. Operative bottom line ${index}: never tell the owner you lack access before trying. ${'Detail. '.repeat(50)}`,
+    }));
+    const result = buildPreTurnContext(bootstrapInput(true));
+    expect(result.trustedCapabilities).toBeDefined();
+    // The incident: these two were zero while capabilities survived.
+    expect(result.conversationEvidence.excerpts.length).toBeGreaterThan(0);
+    expect(result.memoryEvidence.excerpts.filter((row) => !row.path.startsWith('preferences/')).length).toBeGreaterThan(
+      0,
+    );
+    expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.bootstrapFinalChars);
+  });
+
+  it('ordinary turns keep the 12k bound (B-AC2)', () => {
+    seedIncidentShape();
+    const result = buildPreTurnContext(bootstrapInput(false));
+    expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
+  });
+
+  it('a 10k capability block keeps all services (B-AC3)', () => {
+    const notices: ContextNotice[] = [];
+    const services = Array.from({ length: 18 }, (_, index) => ({
+      name: `service-${index}`,
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      activation: `${'Operative capability detail. '.repeat(15)}${index}`,
+    }));
+    const snapshot = { agentGroupId: 'ag-a', services } as Parameters<typeof boundedCapabilities>[0];
+    const raw = JSON.stringify(snapshot).length;
+    expect(raw).toBeGreaterThan(8_000);
+    expect(raw).toBeLessThanOrEqual(PRE_TURN_BOUNDS.capabilityTotalChars);
+    const bounded = boundedCapabilities(snapshot, notices);
+    expect(bounded.services).toHaveLength(18);
+    expect(notices.some((n) => n.code === 'capability-total-budget')).toBe(false);
+  });
+
+  it('the bootstrap bound applies only with capabilities present (B-AC4)', () => {
+    seedIncidentShape();
+    const withoutCaps = buildPreTurnContext(bootstrapInput(false));
+    expect(JSON.stringify(withoutCaps).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
+    const withCaps = buildPreTurnContext(bootstrapInput(true));
+    expect(withCaps.trustedCapabilities).toBeDefined();
+  });
+});
+
 describe('graph scent lane (AC11-AC13)', () => {
   const GRAPH_QUERY = 'How does the forecast pipeline reconcile snowflake volume data?';
 
@@ -1251,6 +1340,10 @@ describe('graph scent lane (AC11-AC13)', () => {
       kind: 'chat-sdk',
       trigger: 1 as const,
       normalizedContent: JSON.stringify({ text: GRAPH_QUERY }),
+      // Scent/eviction tests exercise the ORDINARY 12k bound; bootstrap rows
+      // now get bootstrapFinalChars and would never reach it with these
+      // fixtures.
+      includeBootstrap: false,
       ...overrides,
     };
   }
@@ -1295,100 +1388,179 @@ describe('graph scent lane (AC11-AC13)', () => {
     expect(withScent.conversationEvidence.excerpts.length).toBe(baselineConversation);
   });
 
+  // The shed-order invariant is tested at the enforceFinalBound seam directly
+  // (see the 'final-bound eviction order' describe): the bound fix made the
+  // final limit unreachable by naturally-constructed rows — measured saturated
+  // ceiling 21,134 chars vs the 22,000 bootstrap bound — which is the fix
+  // working, not missing coverage.
+});
+
+describe('final-bound eviction order (AC12b, AC13, AC13b at the seam)', () => {
+  const filler = (chars: number, tag: string) => `${tag} ${'x'.repeat(Math.max(0, chars - tag.length - 1))}`;
+
+  function memRow(index: number, chars: number): MemoryEvidenceExcerpt {
+    return {
+      path: `facts/${index}.md`,
+      headings: [],
+      text: filler(chars, `mem-${index}`),
+      score: 100 - index,
+      fingerprint: `fp-mem-${index}`,
+      provenance: { authority: 'workgroup-memory-canon', workgroupId: 'wg-a' },
+    };
+  }
+  function convRow(
+    index: number,
+    chars: number,
+    rank: 'current-thread' | 'exact-link' = 'current-thread',
+  ): ConversationEvidenceExcerpt {
+    return {
+      id: `arc-${index}`,
+      agentGroupId: 'ag-a',
+      messagingGroupId: 'mg-a',
+      channelType: 'discord',
+      channelName: 'room',
+      platformId: 'p',
+      threadId: 't',
+      role: 'user',
+      senderId: 'u',
+      senderName: 'Operator',
+      text: filler(chars, `conv-${index}`),
+      sentAt: '2026-08-01T00:00:00.000Z',
+      rank,
+      score: 50 - index,
+      fingerprint: `fp-conv-${index}`,
+      provenance: { authority: 'host-message-archive', archiveId: `arc-${index}` },
+    };
+  }
+  const GRAPH_NOTICE: ContextNotice = { source: 'graph', status: 'degraded', code: 'graph-scent-cold', detail: 'cold' };
+
+  /** A context whose serialized length lands finalChars + overBy exactly-ish. */
+  function makeContext(overBy: number, withScent: boolean, withGraphNotice: boolean) {
+    const context: Parameters<typeof enforceFinalBound>[0] = {
+      memoryEvidence: { core: [], excerpts: [memRow(0, 1_800), memRow(1, 1_800), memRow(2, 1_800)] },
+      conversationEvidence: { excerpts: [convRow(0, 900), convRow(1, 900), convRow(2, 900)] },
+      ...(withScent
+        ? { graphScent: { terms: ['forecast', 'pipeline'], pointers: [{ path: 'workgroup/repo/a.ts', type: 'code' }] } }
+        : {}),
+      notices: [
+        { source: 'context', status: 'ok', code: 'current-input-authoritative', detail: 'x' },
+        ...(withGraphNotice ? [{ ...GRAPH_NOTICE }] : []),
+      ],
+    };
+    const pad = PRE_TURN_BOUNDS.finalChars + overBy - JSON.stringify(context).length;
+    if (pad > 160) context.memoryEvidence.excerpts.unshift(memRow(9, pad - 152));
+    return context;
+  }
+
   it('a scent that alone tips the context over the bound is shed, displacing nothing (AC12b)', () => {
-    seedHeavyRecall();
-    // Tune the fixture into the window (finalChars - 600, finalChars): the
-    // cold baseline must FIT, and attaching the ≤600-char scent alone must
-    // cross the bound. Two padding channels, both measured rather than
-    // guessed, because every lane is individually capped (core 2,500 chars,
-    // memory lanes 5,500 total): generated facts first, then core padding.
-    const target = PRE_TURN_BOUNDS.finalChars - 250;
-    const sentence = 'forecast pipeline reconcile snowflake volume data filler sentence. ';
-    const measure = () => JSON.stringify(buildPreTurnContext(scentInput())).length;
-    let room = target - measure();
-    if (room > 500) {
-      // Each selected fact costs roughly its text plus ~260 chars of JSON
-      // envelope; two facts sized to half the room land inside the window.
-      const factChars = Math.min(2_100, Math.max(400, Math.floor(room / 2) - 260));
-      const factText = sentence.repeat(40).slice(0, factChars);
-      const factLines = [0, 1].map(
-        (index) =>
-          `- ${factText} (fact ${index}) <!-- nanoclaw-memory:id=mem_${String(index).repeat(16)};evidence=ev-${index};captured=2026-08-0${index + 1}T00:00:00.000Z -->`,
-      );
-      memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${factLines.join('\n')}\n`);
-      room = target - measure();
-    }
-    if (room > 0) {
-      memoryFile('index.md', `# Canon\n${sentence.repeat(40)}`.slice(0, Math.min(2_400, room + 40)));
-    }
-    const baseline = buildPreTurnContext(scentInput());
-    const baselineLength = JSON.stringify(baseline).length;
-    // Guard: the fixture must genuinely sit in the tip-over window.
-    expect(baselineLength).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
-    expect(baselineLength).toBeGreaterThan(PRE_TURN_BOUNDS.finalChars - PRE_TURN_BOUNDS.graphScentChars);
-    expect(baseline.notices.some((n) => n.code === 'final-context-limit')).toBe(false);
-
-    seedScentGraph();
-    const result = buildPreTurnContext(scentInput());
-    // The scent tipped it over and was shed FIRST: no recall excerpt moves.
-    expect(result.graphScent).toBeUndefined();
-    expect(result.memoryEvidence.excerpts.length).toBe(baseline.memoryEvidence.excerpts.length);
-    expect(result.conversationEvidence.excerpts.length).toBe(baseline.conversationEvidence.excerpts.length);
+    const context = makeContext(90, true, false);
+    // Guard the construction: over WITH the scent, under WITHOUT it.
+    const withScentLength = JSON.stringify(context).length;
+    const scentChars = JSON.stringify({ graphScent: context.graphScent }).length;
+    expect(withScentLength).toBeGreaterThan(PRE_TURN_BOUNDS.finalChars);
+    expect(withScentLength - scentChars).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
+    const memBefore = context.memoryEvidence.excerpts.length;
+    const convBefore = context.conversationEvidence.excerpts.length;
+    enforceFinalBound(context);
+    expect(context.graphScent).toBeUndefined();
+    expect(context.memoryEvidence.excerpts.length).toBe(memBefore);
+    expect(context.conversationEvidence.excerpts.length).toBe(convBefore);
+    // Contract note: the function appends its final-context-limit notice AFTER
+    // trimming, so a minimal-notice context may end slightly over; real rows
+    // absorb this in late notice eviction. Assert the trim, not notice bytes.
+    expect(JSON.stringify(context).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars + 200);
   });
 
-  it('sheds graph notices with the lane at the bound, so a notice never evicts recall', () => {
-    seedHeavyRecall();
-    const sentence = 'The forecast pipeline reconcile snowflake volume data step is documented here in detail. ';
-    memoryFile('index.md', `# Canon\n${sentence.repeat(40)}`);
-    const fact = sentence.repeat(24).slice(0, 2_100);
-    const factLines = [0, 1, 2].map(
-      (index) =>
-        `- ${fact} (fact ${index}) <!-- nanoclaw-memory:id=mem_${String(index).repeat(16)};evidence=ev-${index};captured=2026-08-0${index + 1}T00:00:00.000Z -->`,
-    );
-    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${factLines.join('\n')}\n`);
-    // No graph at all: the true no-lane baseline, over the bound.
-    const baseline = buildPreTurnContext(scentInput());
-    expect(baseline.notices.some((n) => n.code === 'final-context-limit')).toBe(true);
-
-    // Graph present but COLD: the lane contributes only a graph-scent-cold
-    // notice. At the bound that notice must be shed with the lane — never
-    // traded against an excerpt.
-    seedScentGraph(false);
-    const result = buildPreTurnContext(scentInput());
-    expect(result.notices.some((n) => n.source === 'graph')).toBe(false);
-    expect(result.memoryEvidence.excerpts.length).toBe(baseline.memoryEvidence.excerpts.length);
-    expect(result.conversationEvidence.excerpts.length).toBe(baseline.conversationEvidence.excerpts.length);
+  it('sheds the whole graph lane before any excerpt moves (AC13)', () => {
+    const context = makeContext(140, true, true);
+    const memBefore = context.memoryEvidence.excerpts.length;
+    const convBefore = context.conversationEvidence.excerpts.length;
+    enforceFinalBound(context);
+    expect(context.graphScent).toBeUndefined();
+    expect(context.notices.some((n) => n.source === 'graph')).toBe(false);
+    expect(context.memoryEvidence.excerpts.length).toBe(memBefore);
+    expect(context.conversationEvidence.excerpts.length).toBe(convBefore);
   });
 
-  it('sheds the graph scent before any other lane at the final bound (AC12b + AC13)', () => {
-    seedHeavyRecall();
-    // Saturate every lane so the serialized context crosses finalChars on its
-    // own: full core (2,500), full memory-lane budget (5,500 via long facts),
-    // full archive lane (3 x 900), plus per-excerpt JSON overhead.
-    const sentence = 'The forecast pipeline reconcile snowflake volume data step is documented here in detail. ';
-    memoryFile('index.md', `# Canon\n${sentence.repeat(40)}`);
-    const fact = sentence.repeat(24).slice(0, 2_100);
-    const factLines = [0, 1, 2].map(
-      (index) =>
-        `- ${fact} (fact ${index}) <!-- nanoclaw-memory:id=mem_${String(index).repeat(16)};evidence=ev-${index};captured=2026-08-0${index + 1}T00:00:00.000Z -->`,
-    );
-    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${factLines.join('\n')}\n`);
+  it('sheds a graph notice with the lane even when no scent attached (AC13b)', () => {
+    const context = makeContext(50, false, true);
+    const memBefore = context.memoryEvidence.excerpts.length;
+    const convBefore = context.conversationEvidence.excerpts.length;
+    enforceFinalBound(context);
+    expect(context.notices.some((n) => n.source === 'graph')).toBe(false);
+    expect(context.memoryEvidence.excerpts.length).toBe(memBefore);
+    expect(context.conversationEvidence.excerpts.length).toBe(convBefore);
+  });
 
-    // Cold baseline over the same content: the fixture must reach the bound
-    // WITHOUT the scent, or this test is not exercising eviction at all.
-    const baseline = buildPreTurnContext(scentInput());
-    expect(baseline.notices.some((n) => n.code === 'final-context-limit')).toBe(true);
-    expect(baseline.graphScent).toBeUndefined();
-    expect(baseline.conversationEvidence.excerpts.length).toBeGreaterThan(0);
+  /** Build a context whose serialized size lands near targetChars. */
+  function makeSized(
+    targetChars: number,
+    shape: { caps?: boolean; exactLinks?: number } = {},
+  ): Parameters<typeof enforceFinalBound>[0] {
+    const context: Parameters<typeof enforceFinalBound>[0] = {
+      ...(shape.caps ? { trustedCapabilities: { agentGroupId: 'ag-a', services: [] } } : {}),
+      memoryEvidence: { core: [], excerpts: [memRow(0, 1_800), memRow(1, 1_800), memRow(2, 1_800)] },
+      conversationEvidence: {
+        excerpts: [
+          ...Array.from({ length: shape.exactLinks ?? 0 }, (_, i) => convRow(10 + i, 900, 'exact-link')),
+          convRow(0, 900),
+          convRow(1, 900),
+        ],
+      },
+      notices: [{ source: 'context', status: 'ok', code: 'current-input-authoritative', detail: 'x' }],
+    };
+    const pad = targetChars - JSON.stringify(context).length;
+    if (pad > 160) context.memoryEvidence.excerpts.unshift(memRow(9, pad - 152));
+    return context;
+  }
 
-    // Warm lane, same content: the scent is shed FIRST, so every surviving
-    // lane count must equal the cold baseline exactly. Under the rejected
-    // eviction order (scent shed after conversation excerpts) the scent would
-    // survive here and one more conversation excerpt would be evicted instead.
-    seedScentGraph();
-    const result = buildPreTurnContext(scentInput());
-    expect(result.graphScent).toBeUndefined();
-    expect(result.memoryEvidence.excerpts.length).toBe(baseline.memoryEvidence.excerpts.length);
-    expect(result.conversationEvidence.excerpts.length).toBe(baseline.conversationEvidence.excerpts.length);
+  // MUST-FIX from the section-B review: the limit-selection matrix was
+  // unprotected — a regression to 16k-instead-of-max, or treating an EMPTY
+  // capabilities object as absent, would have passed every B acceptance test.
+  it('limit matrix: absent capabilities trims at 12k', () => {
+    const context = makeSized(14_000);
+    expect(JSON.stringify(context).length).toBeGreaterThan(13_000);
+    enforceFinalBound(context);
+    expect(JSON.stringify(context).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars + 200);
+  });
+
+  it('limit matrix: exact-link rows select 16k, not 12k', () => {
+    const context = makeSized(17_500, { exactLinks: 3 });
+    expect(JSON.stringify(context).length).toBeGreaterThan(17_000);
+    enforceFinalBound(context);
+    const length = JSON.stringify(context).length;
+    expect(length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.exactLinkFinalChars + 200);
+    // Discriminating half: it must NOT have trimmed toward the ordinary bound.
+    expect(length).toBeGreaterThan(PRE_TURN_BOUNDS.finalChars);
+  });
+
+  it('limit matrix: an EMPTY-but-present capability snapshot still selects the bootstrap bound', () => {
+    const context = makeSized(21_000, { caps: true });
+    const before = JSON.stringify(context).length;
+    expect(before).toBeGreaterThan(PRE_TURN_BOUNDS.exactLinkFinalChars);
+    enforceFinalBound(context);
+    // 21k < 22k: under the bootstrap bound, nothing may be evicted. A
+    // regression selecting 12k or 16k trims heavily and fails here.
+    expect(JSON.stringify(context).length).toBe(before);
+    expect(context.notices.some((n) => n.code === 'final-context-limit')).toBe(false);
+  });
+
+  it('limit matrix: bootstrap + exact-link takes the max (22k), not 16k', () => {
+    const context = makeSized(21_000, { caps: true, exactLinks: 3 });
+    const before = JSON.stringify(context).length;
+    expect(before).toBeGreaterThan(PRE_TURN_BOUNDS.exactLinkFinalChars);
+    enforceFinalBound(context);
+    expect(JSON.stringify(context).length).toBe(before);
+    expect(context.notices.some((n) => n.code === 'final-context-limit')).toBe(false);
+  });
+
+  it('past the lane, conversation excerpts still evict before memory (order regression)', () => {
+    const context = makeContext(1_500, true, true);
+    const memBefore = context.memoryEvidence.excerpts.length;
+    enforceFinalBound(context);
+    expect(context.graphScent).toBeUndefined();
+    expect(context.conversationEvidence.excerpts.length).toBeLessThan(3);
+    expect(context.memoryEvidence.excerpts.length).toBe(memBefore);
+    expect(JSON.stringify(context).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars + 200);
   });
 });

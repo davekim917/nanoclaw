@@ -80,14 +80,31 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // cap to 2500 with no total pushed a widely-wired owner-safe group's block to
   // ~11.2k of the 12k budget, leaving the agent with zero archive recall and
   // zero workgroup-memory excerpts and only an internal notice as evidence.
-  // 8000 keeps the block at roughly its historical footprint (~7.4k measured at
-  // the old 600 cap) while leaving room for recall.
-  capabilityTotalChars: 8_000,
+  // 10,000 after the 2026-08-13 fleet audit: the widest-wired group's snapshot
+  // measures 9,508 chars raw, so the previous 8,000 silently dropped whole
+  // services from its bootstrap turns — the mirror image of the recall-starving
+  // incident this cap was added to prevent. Only bootstrap rows carry the
+  // block, and those are bounded by bootstrapFinalChars below, so this raise
+  // cannot starve recall.
+  capabilityTotalChars: 10_000,
   // Advisory graph-pointer lane; enforced inside readGraphScent by dropping
   // lowest-ranked pointers, and shed FIRST by enforceFinalBound.
   graphScentChars: GRAPH_SCENT_BOUNDS.chars,
   finalChars: 12_000,
   exactLinkFinalChars: 16_000,
+  // Bootstrap turns carry mandatory payload the ordinary bound never sees —
+  // the capability block (capabilityTotalChars) and the core index
+  // (markdownCoreChars) — so bounding them at the ordinary 12,000 evicted
+  // every fact and archive excerpt on exactly the fleet's first impression of
+  // each thread. The 2026-08-13 incident: an agent denied knowing a project
+  // with 165 facts in its own store because the delivered bootstrap row held
+  // only a preference file. Derived: finalChars + capabilityTotalChars — the
+  // capability block is the one bootstrap-only payload large enough to
+  // displace recall (the core index rides within the ordinary envelope's
+  // measured slack). Deliberately NOT the sum of every lane cap: that number
+  // (~24.5k) is unreachable, which would turn the final bound into dead code
+  // instead of a live safety net.
+  bootstrapFinalChars: 22_000,
 });
 
 export interface PreTurnContextInput {
@@ -1117,12 +1134,23 @@ export function boundedCapabilities(
   return { agentGroupId: snapshot.agentGroupId, services: selected };
 }
 
-function enforceFinalBound(context: PreTurnContext): void {
+/**
+ * Exported for direct test of the eviction order. After the 2026-08-13 bound
+ * fix this rarely fires on natural content (measured saturated ceiling
+ * ~21.1k vs the 22k bootstrap bound) — it is a safety net, and the shed-order
+ * invariant is guarded at this seam rather than through end-to-end fixtures.
+ */
+export function enforceFinalBound(context: PreTurnContext): void {
   let truncated = false;
   const serializedLength = (): number => JSON.stringify(context).length;
-  const limit = context.conversationEvidence.excerpts.some((row) => row.rank === 'exact-link')
-    ? PRE_TURN_BOUNDS.exactLinkFinalChars
-    : PRE_TURN_BOUNDS.finalChars;
+  // A row carrying trustedCapabilities is by definition a bootstrap row and
+  // gets the raised bound; exact-link keeps its own. Max wins when both apply.
+  const limit = Math.max(
+    context.conversationEvidence.excerpts.some((row) => row.rank === 'exact-link')
+      ? PRE_TURN_BOUNDS.exactLinkFinalChars
+      : PRE_TURN_BOUNDS.finalChars,
+    context.trustedCapabilities !== undefined ? PRE_TURN_BOUNDS.bootstrapFinalChars : 0,
+  );
   // The graph-scent LANE is shed FIRST — the field AND its notices — before
   // any conversation or memory excerpt. It is the one purely advisory lane,
   // and shedding it first is what makes "enabling the lane never displaces

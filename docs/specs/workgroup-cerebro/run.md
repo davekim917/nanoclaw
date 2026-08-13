@@ -519,6 +519,86 @@ fleet-wide or any single stall exceeds 3 s, the next lever is raising the re-war
 for large graphs (N consecutive clean probes), not removing the lane. Not built now —
 the current cost is modest and the mechanism that bounds it is verified live.
 
+---
+
+## 2026-08-13 — section B build (bootstrap recall budget + capability audit)
+
+Triggered by a live incident: an agent denied knowing a project with 165 facts in its
+own store. Autopsy in plan §B.1 — retrieval found the evidence; the 12k final bound
+evicted all of it on a bootstrap turn in favor of the capability block. Operator asked
+in the same breath whether the 8,000-char capability cap was too generous.
+
+### Capability audit (operator question answered with measurement)
+
+Built every active group's live snapshot offline: largest family **9,508 chars raw
+(18 services)** — OVER the 8k cap, silently dropping services today; second 6,313;
+median band 2,900–4,400. The prose is dominated by `activation` text that is operative
+instruction hardened by prior denial incidents; trimming was rejected as whack-a-mole
+against a known failure class. So the cap was too SMALL for one family and mis-placed
+for everyone — the fix is stopping the block from competing with recall, not shrinking it.
+
+### The bound was corrected twice during build, both by test arithmetic
+
+1. First draft 18,000 **re-created the incident** in the worst-case fixture (the cap
+   raise had grown the mandatory payload).
+2. Second draft summed every bootstrap lane cap (24,500) — and fixture work proved that
+   number **unreachable**: the per-lane caps bound a natural row below it, which would
+   have made the final bound dead code.
+3. Landed: `bootstrapFinalChars = 22_000 = finalChars + capabilityTotalChars`, with
+   `capabilityTotalChars` 8,000 → 10,000. Measured saturated ceiling of a natural
+   bootstrap row: **21,134** — the bound is a live safety net ~900 above the worst
+   natural row, and `final-context-limit` should now effectively vanish from
+   production rows. That disappearance is itself the observable success signal.
+
+### Test restructuring forced by the fix succeeding
+
+The three heavy shed-order tests (AC12b/AC13/AC13b) were built by pushing natural
+fixtures over the bound — which the fix made impossible (21,134 < 22,000; ordinary rows
+ceiling ~11.8k < 12k). Two failed attempts to force it are recorded honestly: growing
+the capability fixture (clipped by its own cap) and exact-link bulk (dead end —
+`parseArchivePermalinks` matches platform permalinks only, not arbitrary URLs).
+
+Resolution: `enforceFinalBound` is now exported and the shed-order invariant is tested
+**at the seam** with synthetic contexts — four deterministic cases (scent tips → shed,
+whole lane incl. notices before any excerpt, notice-only lane, conversation-before-memory
+order regression) replacing ~100 lines of fixture arithmetic. One contract subtlety
+documented in-test: the function appends its own bound notice after trimming, so a
+minimal-notice context may end ~140 chars over; real rows absorb this in late notice
+eviction.
+
+### Verification
+
+| check | result |
+|---|---|
+| `pre-turn-context.test.ts` | 44 passed (B-AC1..4 + 4 seam tests; B-AC1 failed pre-fix as required) |
+| `graph-scent.test.ts` | 17 passed |
+| memory module | 61 passed |
+| `pnpm test` full / `pnpm run build` | **BLOCKED by another session's in-flight edits**, not this change: uncommitted `session-manager.ts/.test.ts` (+119 lines, UNIQUE-constraint bug in their new test), `repo_fence_epoch` column referenced by their session-db change without its migration in fixtures, and a tsc error in their `repo-publication-coordinator.test.ts`. My suites pass isolated; their files are untouched by this commit. |
+
+Deploy note: `dist/` cannot rebuild until the concurrent session's tsc error clears, so
+this fix reaches production on their next green build + restart, not before.
+
+### Cross-model review — section B
+
+| field | value |
+|---|---|
+| target | Codex `gpt-5.6-sol`, high effort, contract transport, `</dev/null` |
+| outcome | `completed` |
+| raw verdict | `must_fix` — 1 MUST-FIX, 0 SHOULD-FIX |
+
+**Finding (ACCEPTED): the limit-selection matrix was unprotected.** Verified against the
+materialized B-AC4: it asserted only "no-caps row ≤12k" and "caps field exists". The
+implementation at the `Math.max` branch is correct, but a regression to
+16k-instead-of-max on bootstrap+exact-link rows, or treating an empty-but-present
+capability snapshot as absent, would have passed every B test. Exactly the AC-weaker-
+than-spec failure class this workflow keeps catching.
+
+Correction: four matrix cases at the `enforceFinalBound` seam, each with a guard that
+the fixture genuinely exceeds the smaller bound so the selection is discriminated —
+absent caps trims at 12k; exact-link selects 16k (and provably not 12k); an EMPTY
+capability snapshot still gets 22k with zero eviction; bootstrap+exact-link takes
+max = 22k. Memory module after correction: **114 passed**.
+
 ### Not done at this stage
 
 No production code written; planning is artifact-only. No tests materialized — per the
