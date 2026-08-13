@@ -55,7 +55,7 @@ interface Claim {
  * Read as "finished", not "well-formed" — the point is to not alarm on a claim
  * that already answered the question the alarm would ask.
  */
-function declaresItselfFinished(claim: Claim): boolean {
+export function declaresItselfFinished(claim: { released_at?: unknown; status?: unknown; note?: unknown }): boolean {
   if (typeof claim.released_at === 'string' && claim.released_at.trim() !== '') return true;
   if (
     typeof claim.status === 'string' &&
@@ -203,7 +203,7 @@ export function findEscalationCandidates(root: string, now: number): EscalationC
  * (open questions, verification state, who owes an answer), and that belongs
  * in the file, which is what a human or a digest actually reads.
  */
-function noteHeadline(note: string): string {
+export function noteHeadline(note: string): string {
   const full = note.trim().replace(/\s+/g, ' ');
   const sentence = /^.*?[.!?](?=\s|$)/.exec(full)?.[0] ?? full;
   const head = sentence.length > 200 ? sentence.slice(0, 199).trimEnd() : sentence;

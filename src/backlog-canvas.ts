@@ -48,11 +48,13 @@ import { OneCLI } from '@onecli-sh/sdk';
 import { EnvHttpProxyAgent, ProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
 import { ONECLI_API_KEY, ONECLI_URL, TIMEZONE } from './config.js';
+import { readClaims, renderClaims } from './claims-board.js';
 import { readContainerConfig } from './container-config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { readEnvFileMatching } from './env.js';
 import { extractSlackChannelId, parseSlackWorkspaces } from './channels/slack.js';
+import { slackPermalink } from './channels/slack-mentions.js';
 import { log } from './log.js';
 import { formatLocalTime } from './timezone.js';
 
@@ -208,14 +210,19 @@ export async function runTick(): Promise<void> {
     if (!config?.messagingGroupId) continue; // not opted in
     try {
       const team = config.linearTeam || 'XZO';
-      await refreshBoard(config.messagingGroupId, team, group.id);
+      await refreshBoard(config.messagingGroupId, team, group.id, group.workgroup_id ?? null);
     } catch (err) {
       log.warn('Backlog canvas refresh failed', { folder: group.folder, err });
     }
   }
 }
 
-async function refreshBoard(messagingGroupId: string, team: string, agentGroupId: string): Promise<void> {
+async function refreshBoard(
+  messagingGroupId: string,
+  team: string,
+  agentGroupId: string,
+  workgroupId: string | null,
+): Promise<void> {
   const mg = getMessagingGroup(messagingGroupId);
   if (!mg) {
     log.warn('Backlog canvas: messagingGroupId not found — skipping', { messagingGroupId });
@@ -228,8 +235,20 @@ async function refreshBoard(messagingGroupId: string, team: string, agentGroupId
   }
   const channelId = extractSlackChannelId(mg.platform_id);
   const issues = await fetchLinearIssues(team, agentGroupId);
-  await writeCanvas(token, channelId, renderBoard(issues), `${team} backlog board`);
-  log.info('Backlog canvas refreshed', { channelId, team, issues: issues.length });
+
+  // "Who has it" above "what exists" — a claim needing a human is the only
+  // thing on this canvas that is time-sensitive, so it must not sit under a
+  // long backlog. Claims are best-effort: a workgroup with no shared FS reads
+  // as none, and the backlog board still renders.
+  const claims = workgroupId ? readClaims(workgroupId, Date.now()) : [];
+  const body = [
+    renderClaims(claims, (threadId) => slackPermalink(mg.channel_type, mg.platform_id, threadId)),
+    '',
+    renderBoard(issues),
+  ].join('\n');
+
+  await writeCanvas(token, channelId, body, `${team} backlog board`);
+  log.info('Backlog canvas refreshed', { channelId, team, issues: issues.length, claims: claims.length });
 }
 
 /** Bot token for a channel type, from the same env parse the adapter uses. */
