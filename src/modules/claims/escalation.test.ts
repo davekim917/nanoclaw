@@ -289,4 +289,56 @@ describe('escalateClaim', () => {
     expect(escalateClaim(candidate({}, file), NOW, d)).toBe(false);
     expect(d.writeMessage).not.toHaveBeenCalled();
   });
+
+  /**
+   * The alert renders one fact per line and carries only the note's first
+   * sentence. Notes routinely run several hundred characters of handoff
+   * detail, and the whole point of the summary is that a human can act on the
+   * alert without reading a paragraph in a notification.
+   */
+  function textFor(claim: Record<string, unknown>): string {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
+    const file = writeClaim(path.join(root, 'wg-a', 'claims'), 'seam-publish-gate', claim);
+    const d = deps();
+    escalateClaim(candidate({ claim }, file), NOW, d);
+    const [, , message] = (d.writeMessage as ReturnType<typeof vi.fn>).mock.calls[0];
+    return (JSON.parse(message.content) as { text: string }).text;
+  }
+
+  it('renders owner, staleness and next step on their own lines', () => {
+    const text = textFor({ owner: 'ava', claimed_at: iso(8 * HOUR_MS), ttl_hours: 4, note: 'Wallet tie-out.' });
+
+    expect(text.split('\n')).toEqual([
+      '⚠️ **Abandoned work claim** — `seam-publish-gate`',
+      'Wallet tie-out.',
+      '',
+      '- **Owner:** ava',
+      '- **Stale:** 4.0h past grace, on a 4h TTL',
+      '- **Next:** nothing happens automatically — ava releases it, or anyone takes it over.',
+    ]);
+  });
+
+  it('carries only the first sentence of a long note, marked as truncated', () => {
+    const text = textFor({
+      owner: 'ava',
+      note: 'Dev activation verified already live, no change made.\nOPEN: UI screenshots, saved-id migration decision (owner unassigned). DO NOT flip prod.',
+    });
+
+    expect(text).toContain('Dev activation verified already live, no change made. …');
+    expect(text).not.toContain('DO NOT flip prod');
+  });
+
+  it('caps a first sentence that is itself enormous', () => {
+    const text = textFor({ owner: 'ava', note: `${'x'.repeat(400)}. tail` });
+    const summary = text.split('\n')[1];
+
+    expect(summary.endsWith(' …')).toBe(true);
+    expect(summary.length).toBeLessThanOrEqual(201);
+  });
+
+  it('omits the TTL clause when the claim carries no ttl_hours', () => {
+    const text = textFor({ owner: 'ava', note: 'Untimed claim.' });
+
+    expect(text.split('\n')).toContain('- **Stale:** 4.0h past grace');
+  });
 });

@@ -194,11 +194,35 @@ export function findEscalationCandidates(root: string, now: number): EscalationC
   return candidates;
 }
 
+/**
+ * First sentence of a claim note, capped — the alert only has to identify the
+ * work. Notes routinely run several hundred characters of handoff detail
+ * (open questions, verification state, who owes an answer), and that belongs
+ * in the file, which is what a human or a digest actually reads.
+ */
+function noteHeadline(note: string): string {
+  const full = note.trim().replace(/\s+/g, ' ');
+  const sentence = /^.*?[.!?](?=\s|$)/.exec(full)?.[0] ?? full;
+  const head = sentence.length > 200 ? sentence.slice(0, 199).trimEnd() : sentence;
+  return head.length < full.length ? `${head} …` : head;
+}
+
 function formatEscalationText(candidate: EscalationCandidate): string {
   const owner = typeof candidate.claim.owner === 'string' ? candidate.claim.owner : 'unknown';
-  const note = typeof candidate.claim.note === 'string' && candidate.claim.note ? candidate.claim.note : '(no note)';
+  const rawNote = typeof candidate.claim.note === 'string' ? candidate.claim.note.trim() : '';
   const staleHours = (candidate.staleMs / (60 * 60 * 1000)).toFixed(1);
-  return `⚠️ Abandoned work claim \`${candidate.slug}\` — owner ${owner}, stale ${staleHours}h past grace.\nNote: ${note}`;
+  const ttl = typeof candidate.claim.ttl_hours === 'number' ? candidate.claim.ttl_hours : undefined;
+
+  return [
+    `⚠️ **Abandoned work claim** — \`${candidate.slug}\``,
+    rawNote ? noteHeadline(rawNote) : '(no note)',
+    '',
+    `- **Owner:** ${owner}`,
+    ttl === undefined
+      ? `- **Stale:** ${staleHours}h past grace`
+      : `- **Stale:** ${staleHours}h past grace, on a ${ttl}h TTL`,
+    `- **Next:** nothing happens automatically — ${owner} releases it, or anyone takes it over.`,
+  ].join('\n');
 }
 
 /** Stamp escalated_at onto the claim file — atomic tmp+rename, same convention as the skill's own claim write. */
