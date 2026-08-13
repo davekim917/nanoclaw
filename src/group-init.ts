@@ -30,7 +30,7 @@ const REQUIRED_ENV: Record<string, string> = {
   // Auto-compact at 80% of context window instead of SDK default (~97%).
   // Prevents sessions from hitting the hard context limit and triggering
   // silent model fallback on upstream 400 errors.
-  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '65',
+  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '80',
   // Paired with the percentage above: Claude Code 2.1+ has an internal
   // auto-compact window default well under 200k regardless of model. For
   // [1m] sessions that default triggers compaction at ~165k instead of at
