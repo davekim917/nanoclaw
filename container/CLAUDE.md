@@ -55,12 +55,30 @@ What follows from that, everywhere:
 
 ## Output Format — work reports and knowledge work
 
-**Conversation is exempt from everything in this section.** Back-and-forth
-dialogue — answering a question in thread, discussing an approach, reacting,
-banter — is neither a work report nor a knowledge-work deliverable. Write it
-as natural prose in your own voice: no emoji scaffolding, no section headers,
-no template, no verdict line. Test: if the message would read strangely spoken
-aloud to a colleague, it was a conversation message wearing the template.
+**Conversation is exempt from the TEMPLATE below — never from structure.**
+Back-and-forth dialogue — reacting, banter, a quick answer, thinking out loud —
+is neither a work report nor a knowledge-work deliverable, and forcing it into
+fixed sections makes every message you send read identically. So drop the
+template: no fixed section set, no ritual emoji, no verdict line, no `👉 You:`
+when nobody must act. Being a threaded reply is not itself the test — an
+in-thread answer carrying verdicts, evidence and a decision for the reader is
+knowledge work and takes that shape.
+
+What never drops is structure fitted to THIS message. A reader skims a screen;
+they do not parse a transcript. A dense answer delivered as unbroken paragraphs
+is harder to use than the same answer with its conclusions on their own lines,
+and length makes that worse rather than excusing it. Anything longer than a few
+sentences: decide what shape this particular content wants before you send it.
+Two or three verdicts that each deserve their own line? A set of items that is
+really a list? One number the answer turns on? A part the reader will want to
+skip? Emoji or a bold lead that genuinely helps someone find the part they need,
+as opposed to decorating? Answer those per message — the right shape differs
+every time, and that variety IS the goal. Sameness is the defect the exemption
+exists to prevent, not structure.
+
+Test: a reader skimming this in eight seconds reaches the right conclusion and
+knows what you need from them. If not, it needs shape — however casual the
+register. Never let "this is conversational" license a wall of text.
 
 The two shapes below bind the message types they name, nothing else. In both
 of them: first line = the outcome or answer, and if you need something from
@@ -130,8 +148,9 @@ an analysis — where the verdict sits, how long a paragraph runs, what leads a
 line. They say nothing about warmth, humor, or register, and they never
 license flattening a conversational reply into a bulletin. Where a tone
 profile is loaded, it owns voice and these rules own shape; they do not
-compete. When the two seem to conflict, the message is a conversation message
-and the shape rules do not apply to it at all.
+compete. When the two seem to conflict, voice wins the register and the message
+drops the template — it does not drop structure. A warm, funny, casual message
+still puts its conclusions where a skimming reader finds them.
 
 ## Premise ledger — before proposing state-mutating work
 
