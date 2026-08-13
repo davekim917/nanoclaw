@@ -2399,22 +2399,30 @@ describe('shouldCloseTaskSession', () => {
 
 describe('shouldReapIdleTaskContainer', () => {
   it('reaps an idle scheduled-task container with no claimed or due work', () => {
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, 'idle')).toBe(true);
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, false, false)).toBe(true);
   });
 
   it('keeps a scheduled-task container while work is due or claimed', () => {
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 1, 0, 'idle')).toBe(false);
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 1, 'idle')).toBe(false);
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 1, 0, false, false)).toBe(false);
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 1, false, false)).toBe(false);
   });
 
-  it('keeps a scheduled-task container while its provider is active or unknown', () => {
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, 'active')).toBe(false);
-    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, null)).toBe(false);
+  it('keeps a scheduled-task container while the provider is executing a turn', () => {
+    // Runner-pushed follow-up turns (wrapping-retry nudges, post-compaction
+    // bootstrap re-injection) execute with no processing claim at all.
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, true, false)).toBe(false);
+  });
+
+  it('keeps a scheduled-task container holding a work continuation', () => {
+    // `continue_work` is the sanctioned follow-up promise. Between turn end
+    // and continuation admission there is no claim and no execution, and
+    // reaping there demotes the agent to the throttled recovery path.
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, false, true)).toBe(false);
   });
 
   it('never reaps an interactive session through the scheduled-task policy', () => {
-    expect(shouldReapIdleTaskContainer('discord:guild:channel:thread', 0, 0, 'idle')).toBe(false);
-    expect(shouldReapIdleTaskContainer(null, 0, 0, 'idle')).toBe(false);
+    expect(shouldReapIdleTaskContainer('discord:guild:channel:thread', 0, 0, false, false)).toBe(false);
+    expect(shouldReapIdleTaskContainer(null, 0, 0, false, false)).toBe(false);
   });
 });
 

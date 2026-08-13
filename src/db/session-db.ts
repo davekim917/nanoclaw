@@ -16,7 +16,22 @@ import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): void {
   const db = new Database(dbPath);
   db.pragma('journal_mode = DELETE');
-  db.exec(schema === 'inbound' ? INBOUND_SCHEMA : OUTBOUND_SCHEMA);
+  if (schema === 'inbound') {
+    const existing = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages_in'").get();
+    if (existing) migrateMessagesInTable(db);
+    db.exec(INBOUND_SCHEMA);
+    migrateMessagesInTable(db);
+  } else {
+    db.exec(OUTBOUND_SCHEMA);
+    const containerColumns = new Set(
+      (db.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map(
+        (column) => column.name,
+      ),
+    );
+    if (!containerColumns.has('provider_executing')) {
+      db.exec('ALTER TABLE container_state ADD COLUMN provider_executing INTEGER NOT NULL DEFAULT 0');
+    }
+  }
   db.close();
 }
 
@@ -197,16 +212,170 @@ export interface MessageInsert {
   onWake?: 0 | 1;
 }
 
+export interface RepoIngressFence {
+  epoch: string;
+  state: 'active' | 'released';
+}
+
+export interface RepoIngressAdmissionResult {
+  admittedRows: number;
+  wakeRequired: boolean;
+}
+
+export interface RepoIngressReleaseResult extends RepoIngressAdmissionResult {
+  released: boolean;
+}
+
+function installRepoIngressFenceGuards(db: Database.Database): void {
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS messages_in_repo_fence_insert_guard
+    BEFORE INSERT ON messages_in
+    WHEN
+      (NEW.repo_fence_epoch IS NULL AND NEW.repo_fence_original_trigger IS NOT NULL)
+      OR (NEW.repo_fence_epoch IS NOT NULL AND NEW.repo_fence_original_trigger IS NULL)
+      OR (NEW.repo_fence_epoch IS NOT NULL AND NEW.trigger <> 0)
+      OR (NEW.repo_fence_original_trigger IS NOT NULL AND NEW.repo_fence_original_trigger NOT IN (0, 1))
+    BEGIN
+      SELECT RAISE(ABORT, 'repository-fenced inbound rows must be tagged, inert, and retain their original trigger');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS messages_in_repo_fence_update_guard
+    BEFORE UPDATE OF trigger, repo_fence_epoch, repo_fence_original_trigger ON messages_in
+    WHEN
+      (NEW.repo_fence_epoch IS NULL AND NEW.repo_fence_original_trigger IS NOT NULL)
+      OR (NEW.repo_fence_epoch IS NOT NULL AND NEW.repo_fence_original_trigger IS NULL)
+      OR (NEW.repo_fence_epoch IS NOT NULL AND NEW.trigger <> 0)
+      OR (NEW.repo_fence_original_trigger IS NOT NULL AND NEW.repo_fence_original_trigger NOT IN (0, 1))
+    BEGIN
+      SELECT RAISE(ABORT, 'repository-fenced inbound rows must be tagged, inert, and retain their original trigger');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS messages_in_repo_fence_auto_tag_insert
+    AFTER INSERT ON messages_in
+    WHEN NEW.repo_fence_epoch IS NULL
+      AND EXISTS (SELECT 1 FROM repo_ingress_fence WHERE id = 1 AND state = 'active')
+    BEGIN
+      UPDATE messages_in
+      SET repo_fence_epoch = (SELECT epoch FROM repo_ingress_fence WHERE id = 1),
+          repo_fence_original_trigger = NEW.trigger,
+          trigger = 0
+      WHERE id = NEW.id;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS messages_in_repo_fence_auto_tag_trigger_update
+    AFTER UPDATE OF trigger ON messages_in
+    WHEN NEW.repo_fence_epoch IS NULL
+      AND NEW.trigger = 1
+      AND EXISTS (SELECT 1 FROM repo_ingress_fence WHERE id = 1 AND state = 'active')
+    BEGIN
+      UPDATE messages_in
+      SET repo_fence_epoch = (SELECT epoch FROM repo_ingress_fence WHERE id = 1),
+          repo_fence_original_trigger = NEW.trigger,
+          trigger = 0
+      WHERE id = NEW.id;
+    END;
+  `);
+}
+
+export function readRepoIngressFence(db: Database.Database): RepoIngressFence | null {
+  const row = db.prepare('SELECT epoch, state FROM repo_ingress_fence WHERE id = 1').get() as
+    | RepoIngressFence
+    | undefined;
+  return row ?? null;
+}
+
+/** Activate the per-session DB mirror of a publication fence. Idempotent for the same epoch. */
+export function activateRepoIngressFence(db: Database.Database, epoch: string): void {
+  if (!epoch) throw new Error('repository ingress fence epoch must not be empty');
+  migrateMessagesInTable(db);
+  db.transaction(() => {
+    const current = readRepoIngressFence(db);
+    if (current?.state === 'active' && current.epoch !== epoch) {
+      throw new Error(`repository ingress fence ${current.epoch} is already active`);
+    }
+    db.prepare(
+      `INSERT INTO repo_ingress_fence (id, epoch, state) VALUES (1, ?, 'active')
+       ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch, state = 'active'`,
+    ).run(epoch);
+  })();
+}
+
+function admitTaggedRows(db: Database.Database, epoch: string, messageId?: string): RepoIngressAdmissionResult {
+  const idFilter = messageId === undefined ? '' : " AND (id = @messageId OR id = 'recall-' || @messageId)";
+  const wakeRequired =
+    (db
+      .prepare(
+        `SELECT 1 FROM messages_in
+           WHERE repo_fence_epoch = @epoch
+             AND repo_fence_original_trigger = 1
+             AND status = 'pending'
+             AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))${idFilter}
+           LIMIT 1`,
+      )
+      .get({ epoch, messageId: messageId ?? null }) as { 1: number } | undefined) !== undefined;
+  const result = db
+    .prepare(
+      `UPDATE messages_in
+       SET trigger = repo_fence_original_trigger,
+           repo_fence_epoch = NULL,
+           repo_fence_original_trigger = NULL
+       WHERE repo_fence_epoch = @epoch${idFilter}`,
+    )
+    .run({ epoch, messageId: messageId ?? null });
+  return { admittedRows: result.changes, wakeRequired };
+}
+
+/**
+ * Admit one logical inbound unit after a writer discovers its observed fence
+ * epoch was already released or replaced. Replays are harmless.
+ */
+export function admitRepoIngressFenceMessage(
+  db: Database.Database,
+  epoch: string,
+  messageId: string,
+): RepoIngressAdmissionResult {
+  migrateMessagesInTable(db);
+  return db.transaction(() => {
+    const current = readRepoIngressFence(db);
+    if (current?.state === 'active' && current.epoch === epoch) {
+      return { admittedRows: 0, wakeRequired: false };
+    }
+    return admitTaggedRows(db, epoch, messageId);
+  })();
+}
+
+/** Release a matching active epoch and restore every tagged row exactly once. */
+export function releaseRepoIngressFence(db: Database.Database, epoch: string): RepoIngressReleaseResult {
+  migrateMessagesInTable(db);
+  return db.transaction(() => {
+    const current = readRepoIngressFence(db);
+    if (!current || current.epoch !== epoch || current.state !== 'active') {
+      return { released: false, admittedRows: 0, wakeRequired: false };
+    }
+    db.prepare("UPDATE repo_ingress_fence SET state = 'released' WHERE id = 1 AND epoch = ? AND state = 'active'").run(
+      epoch,
+    );
+    const admitted = admitTaggedRows(db, epoch);
+    return { released: true, ...admitted };
+  })();
+}
+
 function runInsertMessage(db: Database.Database, message: MessageInsert, ignoreDuplicateId: boolean): boolean {
+  migrateMessagesInTable(db);
+  const activeFence = readRepoIngressFence(db);
+  const originalTrigger = message.trigger ?? 1;
+  const repoFenceEpoch = activeFence?.state === 'active' ? activeFence.epoch : null;
   const conflictClause = ignoreDuplicateId ? ' ON CONFLICT(id) DO NOTHING' : '';
   const result = db
     .prepare(
-      `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, on_wake)
-       VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger, @sourceSessionId, @onWake)${conflictClause}`,
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, on_wake, repo_fence_epoch, repo_fence_original_trigger)
+       VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger, @sourceSessionId, @onWake, @repoFenceEpoch, @repoFenceOriginalTrigger)${conflictClause}`,
     )
     .run({
       ...message,
-      trigger: message.trigger ?? 1,
+      trigger: repoFenceEpoch === null ? originalTrigger : 0,
+      repoFenceEpoch,
+      repoFenceOriginalTrigger: repoFenceEpoch === null ? null : originalTrigger,
       onWake: message.onWake ?? 0,
       sourceSessionId: message.sourceSessionId ?? null,
       seq: nextEvenSeq(db),
@@ -293,10 +462,12 @@ export function insertMessageWithContext(
  * until its next scheduled row becomes due — never past it.
  */
 export function getNextFutureProcessAfter(db: Database.Database): string | null {
+  migrateMessagesInTable(db);
   const row = db
     .prepare(
       `SELECT MIN(process_after) AS next FROM messages_in
        WHERE status = 'pending'
+         AND repo_fence_epoch IS NULL
          AND process_after IS NOT NULL
          AND datetime(process_after) > datetime('now')`,
     )
@@ -305,11 +476,13 @@ export function getNextFutureProcessAfter(db: Database.Database): string | null 
 }
 
 export function countDueMessages(db: Database.Database): number {
+  migrateMessagesInTable(db);
   return (
     db
       .prepare(
         `SELECT COUNT(*) as count FROM messages_in
        WHERE status = 'pending'
+         AND repo_fence_epoch IS NULL
          AND trigger = 1
          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
       )
@@ -344,6 +517,7 @@ export const INTERACTIVE_WAKE_MAX_AGE_MS = 15 * 60 * 1000;
  * thing interactive priority is about.
  */
 export function getDueWakePriority(db: Database.Database): 'interactive' | 'scheduled' {
+  migrateMessagesInTable(db);
   const freshCutoffIso = new Date(Date.now() - INTERACTIVE_WAKE_MAX_AGE_MS).toISOString();
   const row = db
     .prepare(
@@ -353,6 +527,7 @@ export function getDueWakePriority(db: Database.Database): 'interactive' | 'sche
                        THEN 1 ELSE 0 END) AS has_interactive
          FROM messages_in
         WHERE status = 'pending'
+          AND repo_fence_epoch IS NULL
           AND trigger = 1
           AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
     )
@@ -380,12 +555,14 @@ export function getDueWakePriority(db: Database.Database): 'interactive' | 'sche
  * Returns the number of rows expired this call.
  */
 export function expireStalePending(db: Database.Database, maxAgeMs: number): number {
+  migrateMessagesInTable(db);
   const cutoffIso = new Date(Date.now() - maxAgeMs).toISOString();
   const result = db
     .prepare(
       `UPDATE messages_in
        SET status = 'expired'
        WHERE status = 'pending'
+         AND repo_fence_epoch IS NULL
          AND recurrence IS NULL
          AND (
            (process_after IS NULL AND datetime(timestamp) < datetime(?))
@@ -492,6 +669,7 @@ export interface ContainerState {
   tool_declared_timeout_ms: number | null;
   tool_started_at: string | null;
   provider_status?: string | null;
+  provider_executing?: number | null;
   provider_last_event_at?: string | null;
   provider_last_probe_at?: string | null;
   provider_probe_failures?: number | null;
@@ -516,7 +694,7 @@ export function getContainerState(outDb: Database.Database): ContainerState | nu
     const row = outDb
       .prepare(
         `SELECT current_tool, tool_declared_timeout_ms, tool_started_at,
-                provider_status, provider_last_event_at, provider_last_probe_at,
+                provider_status, provider_executing, provider_last_event_at, provider_last_probe_at,
                 provider_probe_failures, provider_recovery_attempts, provider_failure_reason,
                 memory_current_bytes, memory_peak_bytes, memory_max_bytes,
                 memory_oom_events, memory_oom_kill_events, memory_telemetry_at
@@ -530,7 +708,7 @@ export function getContainerState(outDb: Database.Database): ContainerState | nu
       const row = outDb
         .prepare(
           `SELECT current_tool, tool_declared_timeout_ms, tool_started_at,
-                  provider_status, provider_last_event_at, provider_last_probe_at,
+                  provider_status, provider_executing, provider_last_event_at, provider_last_probe_at,
                   provider_probe_failures, provider_recovery_attempts, provider_failure_reason
              FROM container_state WHERE id = 1`,
         )
@@ -674,6 +852,20 @@ export function migrateMessagesInTable(db: Database.Database): void {
     // All existing rows are normal messages, so default 0.
     db.prepare('ALTER TABLE messages_in ADD COLUMN on_wake INTEGER NOT NULL DEFAULT 0').run();
   }
+  if (!cols.has('repo_fence_epoch')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN repo_fence_epoch TEXT').run();
+  }
+  if (!cols.has('repo_fence_original_trigger')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN repo_fence_original_trigger INTEGER').run();
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS repo_ingress_fence (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      epoch TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('active', 'released'))
+    )
+  `);
+  installRepoIngressFenceGuards(db);
   // Read-path enabler for the Scheduled Tasks Board (design §4.8). Added
   // unconditionally — existing DBs already carry `series_id` (so the branch
   // above is skipped) yet still need this compound index. Created on the next

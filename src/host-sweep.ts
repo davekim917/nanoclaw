@@ -883,26 +883,53 @@ export function shouldCloseTaskSession(
 
 /**
  * Scheduled-task containers have no interactive follow-up window to preserve.
- * Once the provider is idle, no message is claimed, and no work is due, reap
- * the container immediately so background work does not hold a memory
- * reservation until the general 30-minute idle ceiling.
+ * Once the provider is not executing, no message is claimed, and no work is
+ * due, reap the container immediately so background work does not hold a
+ * memory reservation until the general 30-minute idle ceiling.
+ *
+ * This deliberately does NOT key on `provider_status`. Every container clears
+ * that column to 'idle' at startup (clearStaleProcessingAcks →
+ * clearProviderHealthState, container/agent-runner/src/db/connection.ts), and
+ * only the Codex provider ever writes it again — so for every other provider
+ * the old `providerStatus === 'idle'` term was true from second one of the
+ * container's life and the guard did nothing. `provider_executing` is the
+ * maintained equivalent: the shared poll loop sets it around every turn for
+ * every provider, including the runner-pushed follow-up turns (wrapping-retry
+ * nudges, post-compaction bootstrap re-injection) that hold no processing
+ * claim and would otherwise be killable mid-turn.
+ *
+ * An active work_continuation also blocks the reap. `continue_work` is the
+ * only sanctioned way to promise follow-up, and between turn end and
+ * continuation admission the container has no claim and is not executing —
+ * reaping there punished the agent for doing the sanctioned thing and
+ * demoted it to the throttled 10-minute host recovery path. The chat path
+ * has always guarded this; the task path now matches.
  */
 export function shouldReapIdleTaskContainer(
   threadId: string | null,
   dueMessageCount: number,
   processingClaimCount: number,
-  providerStatus: string | null | undefined,
+  providerExecuting: boolean,
+  hasActiveContinuation: boolean,
 ): boolean {
-  return isTaskThread(threadId) && dueMessageCount === 0 && processingClaimCount === 0 && providerStatus === 'idle';
+  return (
+    isTaskThread(threadId) &&
+    dueMessageCount === 0 &&
+    processingClaimCount === 0 &&
+    !providerExecuting &&
+    !hasActiveContinuation
+  );
 }
 
 /**
  * Chat/channel containers have an interactive follow-up window worth
  * preserving (a human may reply within seconds), so unlike task containers
  * they get a quiet-duration floor before reaping. `provider_status` is not
- * usable here — only the Codex provider (container/agent-runner/src/providers/codex.ts)
- * ever writes it; Claude-provider sessions leave it null forever, so this
- * keys on the durable, provider-agnostic signal instead: no due message, no
+ * usable here — every container clears it to 'idle' at startup and only the
+ * Codex provider (container/agent-runner/src/providers/codex.ts) writes it
+ * again, so for other providers it reads 'idle' for the container's whole
+ * life. This keys on the durable, provider-agnostic signal instead: no due
+ * message, no
  * claimed message, no pending work_continuation promise, and the container's
  * last outbound row (chat or status) is older than CHAT_IDLE_REAP_MS. State
  * lives entirely in inbound.db/outbound.db, so the next @mention respawns
@@ -1363,7 +1390,13 @@ async function sweepSession(session: Session): Promise<number | null> {
       const containerState = getContainerState(outDb);
       const processingClaimCount = getProcessingClaims(outDb).length;
       if (
-        shouldReapIdleTaskContainer(session.thread_id, dueCount, processingClaimCount, containerState?.provider_status)
+        shouldReapIdleTaskContainer(
+          session.thread_id,
+          dueCount,
+          processingClaimCount,
+          containerState?.provider_executing === 1,
+          workContinuation !== null,
+        )
       ) {
         log.info('Reaping idle scheduled-task container', { sessionId: session.id, threadId: session.thread_id });
         killContainer(session.id, 'scheduled-task-idle');
