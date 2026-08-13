@@ -56,6 +56,20 @@ interface Claim {
  * that already answered the question the alarm would ask.
  */
 export function declaresItselfFinished(claim: { released_at?: unknown; status?: unknown; note?: unknown }): boolean {
+  const note = typeof claim.note === 'string' ? claim.note : '';
+
+  // "Released" does NOT mean "done" in practice — agents use it for stepping
+  // OFF work, and say so in the same breath. Two live examples on 2026-08-13,
+  // both carrying released_at AND status:"released":
+  //   xzo-gh-522-618      "RELEASED, not done. … needs a QA re-verification run only"
+  //   xzo-gh-571-600      "RELEASED, HELD not done. PR #768 … 8 review threads open"
+  // The second is an open do-not-merge PR that nobody owns. Treating those as
+  // finished filtered them off the board AND exempted them from escalation, so
+  // the one state this whole system exists to surface — open work with no
+  // owner — was the single state guaranteed invisible everywhere at once.
+  // A claim that contradicts itself is not finished; the contradiction wins.
+  if (/\bnot\s+(done|complete|completed|finished)\b|\bheld\b/i.test(note)) return false;
+
   if (typeof claim.released_at === 'string' && claim.released_at.trim() !== '') return true;
   if (
     typeof claim.status === 'string' &&
@@ -63,7 +77,7 @@ export function declaresItselfFinished(claim: { released_at?: unknown; status?: 
   ) {
     return true;
   }
-  return typeof claim.note === 'string' && /^\s*released\b/i.test(claim.note);
+  return /^\s*released\b/i.test(note);
 }
 
 /** Grace window past a claim's own TTL expiry before it counts as "abandoned"

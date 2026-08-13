@@ -81,11 +81,29 @@ describe('readClaims', () => {
     const dir = root({
       'by-timestamp': claim(9, { released_at: '2026-08-12T10:00:00Z' }),
       'by-status': claim(9, { status: 'released' }),
-      'by-note': claim(9, { note: 'RELEASED, not done. Needs QA re-verification only.' }),
+      'by-note': claim(9, { note: 'RELEASED — merged as abc1234, branch deleted.' }),
       'still-open': claim(9),
     });
 
     expect(readClaims('wg-a', NOW, dir).map((c) => c.slug)).toEqual(['still-open']);
+  });
+
+  /**
+   * The inverse, and the one that matters most: "released" is how agents say
+   * they stepped OFF work, not that it finished. An earlier version of this
+   * file asserted these were hidden — that assertion was the bug. Open work
+   * with no owner is the single thing the board exists to show.
+   */
+  it('shows a claim whose note contradicts its own released flag', () => {
+    const dir = root({
+      parked: claim(9, {
+        released_at: '2026-08-12T01:40:00Z',
+        status: 'released',
+        note: 'RELEASED, HELD not done. PR #768 open with do-not-merge, 8 review threads.',
+      }),
+    });
+
+    expect(readClaims('wg-a', NOW, dir).map((c) => c.slug)).toEqual(['parked']);
   });
 
   it('truncates a paragraph-long note to its first sentence', () => {

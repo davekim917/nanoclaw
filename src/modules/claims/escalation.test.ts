@@ -92,6 +92,39 @@ describe('shouldEscalate', () => {
   // in place and leave the file as an audit trail. On the first live batch
   // (2026-08-12) two of four alerts were claims carrying released_at AND
   // status "done" — one naming the merge commit that closed it.
+  /**
+   * "Released" is how agents say they stepped OFF work, not that it is done.
+   * Both fixtures are real claims from 2026-08-13 that carried released_at and
+   * status:"released" over genuinely open work — one an open do-not-merge PR
+   * with 8 unresolved review threads. Filtering these was the bug: unowned
+   * open work is the exact state the escalation exists to surface.
+   */
+  describe('a claim whose note contradicts its own released flag still escalates', () => {
+    for (const note of [
+      'RELEASED, not done. Needs a QA re-verification run only.',
+      'RELEASED, HELD not done. PR #768 open with do-not-merge, 8 review threads.',
+      'Done with my part; the migration is NOT COMPLETE.',
+    ]) {
+      it(`escalates: ${note.slice(0, 34)}…`, () => {
+        expect(
+          shouldEscalate(
+            { owner: 'ava', claimed_at: iso(9 * HOUR_MS), ttl_hours: 4, released_at: '2026-08-12T01:40:00Z', status: 'released', note },
+            NOW,
+          ),
+        ).toBe(true);
+      });
+    }
+
+    it('still treats an uncontradicted release as finished', () => {
+      expect(
+        shouldEscalate(
+          { owner: 'ava', claimed_at: iso(9 * HOUR_MS), ttl_hours: 4, status: 'released', note: 'RELEASED — merged as abc1234.' },
+          NOW,
+        ),
+      ).toBe(false);
+    });
+  });
+
   describe('a claim that declares itself finished never escalates', () => {
     const stale = { claimed_at: iso(8 * HOUR_MS), ttl_hours: 4 };
 
