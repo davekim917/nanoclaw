@@ -110,6 +110,10 @@ FREEZE_HANDOFF="${SMOKE_GATE_FREEZE_HANDOFF:-false}"
 # gate_misconfigured alarm below) whenever FREEZE_HANDOFF is on — there is no
 # fallback freeze mechanism this gate could improvise.
 FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
+# How long an open freeze handoff stays worth testing. A freeze pins one
+# develop SHA; past this, with develop moved on, the slot is freed so the next
+# poll re-freezes on current head rather than campaigning a superseded build.
+FREEZE_STALE_SECONDS="${SMOKE_GATE_FREEZE_STALE_SECONDS:-14400}"
 # `check` runs the poll derivation and reports settledness WITHOUT mutating
 # state or claiming anything. It exists for human-requested campaigns, which
 # freeze on a person's word rather than on a gate wake and would otherwise
@@ -813,7 +817,37 @@ if [ "$FREEZE_HANDOFF" = true ]; then
             holdFile:(if $hold == "" then null else $hold end)}}'
         exit 0
       fi
-      # Still open. No ledger entry at all is silent (no news yet). A
+      # Still open, but is it still worth testing? A freeze pins ONE develop
+      # SHA; while it sits, develop keeps moving, and a campaign that finally
+      # runs against a long-superseded freeze produces a verdict about a build
+      # nobody ships. That happened on the very first live cycle: freeze PR
+      # #786 was cut at 12:01Z, a gate bug kept it from ever settling, and the
+      # campaign that eventually ran at 01:50Z tested a 14-hour-old build with
+      # develop nine commits past it — the run's own verdict opened by saying
+      # so. Past the ceiling, with develop actually moved on, free the slot so
+      # the next poll re-freezes on current head, and tell the coordinator to
+      # close the stale PR (which also tears down its previews). Freeing and
+      # alarming happen in the SAME poll, so there is nothing to re-arm.
+      #
+      # Deliberately NOT closing the PR from here: a campaign may be mid-run
+      # on it, and this gate cannot see smoke-pr-gate.sh's per-PR state. The
+      # worst case of freeing the slot is one extra concurrent preview pair
+      # (the running campaign still owns its own claim and finishes normally);
+      # the worst case of closing it here would be killing a live run's
+      # environment out from under it.
+      HANDOFF_AGE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.handoffOpenedAt // empty' <<<"$STATE")") ))"
+      if [ "$HANDOFF_AGE" -ge "$FREEZE_STALE_SECONDS" ] && [ "$HANDOFF_TARGET" != "$SOURCE_SHA" ]; then
+        STATE="$(jq -c '.handoffFreezePr=null | .handoffFreezeSha=null | .handoffTargetSha=null |
+                        .handoffOpenedAt=null | .ledgerTamperAlertFor=null' <<<"$STATE")"
+        write_state "$STATE"
+        jq -cn --argjson pr "$HANDOFF_PR" --arg sha "$HANDOFF_TARGET" \
+          --arg current "$SOURCE_SHA" --argjson age "$HANDOFF_AGE" \
+          '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_stale",
+            freezePr:$pr,targetSha:$sha,currentSha:$current,ageSeconds:$age,
+            hint:"This freeze is older than the staleness ceiling and develop has moved past it. Close the freeze PR (this also tears down its previews) unless a campaign is still live on it; a fresh freeze is cut on the next poll. Do not publish a verdict for a build nobody ships."}}'
+        exit 0
+      fi
+      # Still open and still current enough. No ledger entry at all is silent (no news yet). A
       # mismatched (or malformed) entry is tamper evidence, same shape as
       # gate_hold_tampered: never adopt, never free the real handoff — one
       # latched alarm, not a re-spam every poll, re-arming only if the

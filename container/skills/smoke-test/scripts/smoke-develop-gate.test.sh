@@ -658,4 +658,52 @@ bash "$GATE" poll | jq -e '
   .wakeAgent == true and .data.trigger == "develop_freeze_ledger_tampered" and .data.gotFreezePr == "null"
 ' >/dev/null
 
+# --- 33. Staleness ceiling: a freeze that outlives the ceiling while develop
+# moves on frees its slot and alarms, so the next poll re-freezes on current
+# head instead of campaigning a superseded build. The first live cycle ran a
+# 14-hour-old freeze for exactly this reason.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+STALE_TARGET="$(printf '6%.0s' $(seq 40))"
+STALE_FREEZE="$(printf '7%.0s' $(seq 40))"
+MOVED_HEAD="$(printf '8%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$STALE_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":44,\"branch\":\"smoke/freeze-s\",\"freezeSha\":\"$STALE_FREEZE\",\"targetSha\":\"$STALE_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+
+# Ceiling not reached: still held, no alarm, even once develop moves.
+export STUB_SOURCE_SHA="$MOVED_HEAD"
+export SMOKE_GATE_FREEZE_STALE_SECONDS=99999
+bash "$GATE" poll | jq -e '.data.trigger != "develop_freeze_stale"' >/dev/null
+jq -e --argjson pr 44 '.handoffFreezePr == $pr' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# Ceiling reached but develop has NOT moved: the freeze still describes the
+# current head, so there is nothing stale about it.
+export STUB_SOURCE_SHA="$STALE_TARGET"
+export SMOKE_GATE_FREEZE_STALE_SECONDS=0
+bash "$GATE" poll | jq -e '.data.trigger != "develop_freeze_stale"' >/dev/null
+jq -e --argjson pr 44 '.handoffFreezePr == $pr' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# Both: alarm once, slot freed, no verdict invented for the stale target.
+export STUB_SOURCE_SHA="$MOVED_HEAD"
+bash "$GATE" poll | jq -e --argjson pr 44 --arg sha "$STALE_TARGET" --arg cur "$MOVED_HEAD" '
+  .wakeAgent == true and .data.trigger == "develop_freeze_stale" and
+  .data.freezePr == $pr and .data.targetSha == $sha and .data.currentSha == $cur
+' >/dev/null
+jq -e '
+  .handoffFreezePr == null and .handoffTargetSha == null and .completedSha == null
+' "$STATE_DIR2/develop-state.json" >/dev/null
+# Slot free: the next poll cuts a fresh freeze on the CURRENT head.
+export STUB_FREEZE_JSON="{\"prNumber\":45,\"branch\":\"smoke/freeze-s2\",\"freezeSha\":\"$STALE_FREEZE\",\"targetSha\":\"$MOVED_HEAD\"}"
+# The moved head was already debounced during the checks above, so the freeze
+# may open on this poll or the next; accept either rather than pinning the
+# debounce bookkeeping this test is not about.
+STALE_OUT="$(bash "$GATE" poll)"
+jq -e '.data.trigger == "develop_freeze_opened"' <<<"$STALE_OUT" >/dev/null ||
+  STALE_OUT="$(bash "$GATE" poll)"
+jq -e --arg sha "$MOVED_HEAD" '
+  .data.trigger == "develop_freeze_opened" and .data.targetSha == $sha
+' <<<"$STALE_OUT" >/dev/null
+
 echo "smoke develop gate tests passed"
