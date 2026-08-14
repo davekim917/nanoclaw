@@ -22,6 +22,7 @@ import {
   workgroupUsageHandler,
   workgroupClaimsHandler,
 } from './api/workgroups.js';
+import { observatoryHandler } from './api/observatory.js';
 
 // Side-effect imports — these files register their routes/handlers at module load
 import './auth/exchange.js'; // POST /dashboard/api/auth/exchange
@@ -64,6 +65,7 @@ export function startDashboard(): void {
   register('GET', '/dashboard/api/workgroup/:id/summary', requireAuth(workgroupSummaryHandler));
   register('GET', '/dashboard/api/workgroup/:id/usage', requireAuth(workgroupUsageHandler));
   register('GET', '/dashboard/api/workgroup/:id/claims', requireAuth(workgroupClaimsHandler));
+  register('GET', '/dashboard/api/observatory', requireAuth(observatoryHandler));
 
   // Scheduled Tasks Board — 10 routes (design §3b + prompt/title search). The
   // `scheduled` namespace is distinct from `tasks` (the spawn board owns that).

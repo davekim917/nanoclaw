@@ -10,7 +10,7 @@ import type { GroupFilter } from '../lib/use-group-filter.js';
  * across routes; each view differs only in what it puts inside the frame.
  */
 
-export type BoardRoute = 'inbox' | 'scheduled' | 'workgroup';
+export type BoardRoute = 'inbox' | 'scheduled' | 'workgroup' | 'observatory';
 
 const MOBILE_QUERY = '(max-width: 899px)';
 
@@ -91,6 +91,12 @@ export function RouteNav({
         onClick={() => onRouteChange('workgroup')}
       >
         Workgroup
+      </button>
+      <button
+        className={`nav-link ${route === 'observatory' ? 'active' : ''}`}
+        onClick={() => onRouteChange('observatory')}
+      >
+        Observatory
       </button>
     </nav>
   );

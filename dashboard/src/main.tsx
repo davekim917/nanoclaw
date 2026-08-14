@@ -4,6 +4,7 @@ import { AuthGate } from './auth/AuthGate.js';
 import { InboxBoard } from './views/InboxBoard.js';
 import { ScheduledBoard } from './views/ScheduledBoard.js';
 import { WorkgroupDashboard } from './views/WorkgroupDashboard.js';
+import { Observatory } from './views/Observatory.js';
 import { SessionDetail } from './views/SessionDetail.js';
 import { authMe as fetchAuthMe, exchangeToken } from './lib/api.js';
 import { startSSE } from './lib/sse.ts';
@@ -20,6 +21,7 @@ function parseHash(): { route: BoardRoute | 'session'; sessionId?: string } {
   if (hash.startsWith('/session/')) return { route: 'session', sessionId: hash.slice(9) };
   if (hash === '/scheduled') return { route: 'scheduled' };
   if (hash === '/workgroup') return { route: 'workgroup' };
+  if (hash === '/observatory') return { route: 'observatory' };
   // Any other/stale hash (including the removed /board and /task/:id routes)
   // falls back to the inbox rather than rendering nothing.
   return { route: 'inbox' };
@@ -69,7 +71,8 @@ function App() {
   }, []);
 
   const navigate = useCallback((r: BoardRoute) => {
-    location.hash = r === 'scheduled' ? '#/scheduled' : r === 'workgroup' ? '#/workgroup' : '#/inbox';
+    location.hash =
+      r === 'scheduled' ? '#/scheduled' : r === 'workgroup' ? '#/workgroup' : r === 'observatory' ? '#/observatory' : '#/inbox';
   }, []);
 
   if (authState === 'loading') {
@@ -107,6 +110,9 @@ function App() {
       )}
       {hashState.route === 'workgroup' && me && (
         <WorkgroupDashboard authMe={me} route="workgroup" onRouteChange={navigate} />
+      )}
+      {hashState.route === 'observatory' && me && (
+        <Observatory authMe={me} route="observatory" onRouteChange={navigate} />
       )}
       {hashState.route === 'session' && hashState.sessionId && me && (
         <SessionDetail authMe={me} sessionId={hashState.sessionId} />

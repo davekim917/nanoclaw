@@ -1549,3 +1549,133 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   .nc-sched-drawer-meta { grid-template-columns: 1fr; }
   .nc-sched-delta { grid-template-columns: 1fr; }
 }
+
+/* ─── Observatory — agents' office, ambient status view ──────────────────────
+   Warm, physical, calm: a small office at night, not an admin table. Two
+   extra pill variants (done/pending) piggyback on the existing --st-* tokens
+   used everywhere else for status color. */
+
+.nc-pill.done    { background: var(--st-done-bg);    color: var(--st-done); }
+.nc-pill.pending { background: var(--st-pending-bg); color: var(--st-pending); }
+
+.nc-obs-body { max-width: 1200px; margin: 0 auto; padding: 16px; }
+
+.nc-obs-offline {
+  margin: 40px auto; max-width: 320px; padding: 24px;
+  border: 1px dashed var(--line); border-radius: 8px;
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--fg-3); text-align: center;
+}
+
+/* Desks — home strip for idle (location: null) agents. */
+.nc-obs-desks {
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg-panel); padding: 10px 14px; margin-bottom: 16px;
+}
+.nc-obs-desks-label {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--fg-3); margin-bottom: 8px;
+}
+.nc-obs-desks-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.nc-obs-desks-empty { font-size: 12px; color: var(--fg-4); font-style: italic; }
+
+.nc-obs-main { display: grid; grid-template-columns: 1fr 300px; gap: 16px; align-items: start; }
+
+/* Rooms — position STABLE (sorted platform, name), never reordered by activity. */
+.nc-obs-rooms {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px;
+}
+
+.nc-obs-room {
+  border-radius: 10px; padding: 12px 14px; min-height: 96px;
+  background: var(--bg-card); border: 1px solid var(--line);
+  box-shadow: 0 1px 3px oklch(0 0 0 / 0.2);
+  transition: opacity 0.2s ease, filter 0.2s ease;
+}
+.nc-obs-room.lit   { opacity: 1;    filter: saturate(1); }
+.nc-obs-room.dim   { opacity: 0.72; filter: saturate(0.75); }
+.nc-obs-room.dusty { opacity: 0.45; filter: saturate(0.35); }
+
+.nc-obs-room-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.nc-obs-room-name { font-weight: 600; color: var(--fg); font-size: 13.5px; }
+.nc-obs-room-cobweb { font-size: 13px; }
+.nc-obs-room-platform {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--fg-4); margin: 2px 0 10px;
+}
+.nc-obs-room-bodies { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.nc-obs-room-link {
+  display: inline-block; margin-top: 10px; font-size: 11px;
+  color: var(--fg-3); font-family: var(--font-mono);
+}
+.nc-obs-room-link:hover { color: var(--fg-2); }
+
+/* Faint initials for wired-but-not-present members. */
+.nc-obs-room-absent {
+  width: 22px; height: 22px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--font-mono); font-size: 9px; color: var(--fg-4);
+  border: 1px dashed var(--line-2); opacity: 0.55;
+}
+
+/* Agent chip — one body per agent. */
+.nc-obs-chip {
+  position: relative;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 9px; border-radius: 14px;
+  font-size: 12px; font-family: var(--font-sans); color: var(--fg);
+  background: var(--bg-card-2); border: 1px solid var(--line-2);
+  cursor: default;
+}
+.nc-obs-chip.awake  { background: var(--bg-card-2); border-color: var(--brand); }
+.nc-obs-chip.asleep { opacity: 0.55; }
+.nc-obs-chip.highlighted { border-color: var(--st-done); box-shadow: 0 0 0 1px var(--st-done); }
+.nc-obs-chip-glyph { font-size: 9px; color: var(--brand); }
+.nc-obs-chip.asleep .nc-obs-chip-glyph { font-size: 11px; }
+
+.nc-obs-hover {
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 20;
+  min-width: 180px; padding: 8px 10px; border-radius: 6px;
+  background: var(--bg-inset); border: 1px solid var(--line-2);
+  box-shadow: 0 4px 14px oklch(0 0 0 / 0.35);
+  font-family: var(--font-mono); font-size: 11px; color: var(--fg-2);
+  display: flex; flex-direction: column; gap: 3px;
+}
+.nc-obs-hover-canonical { color: var(--fg-4); font-style: italic; }
+
+/* Claims wall — "Who's on what". */
+.nc-obs-claims {
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg-panel);
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
+}
+.nc-obs-claims-title {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--fg-2);
+}
+.nc-obs-claim-group-label {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--fg-4); margin-bottom: 4px;
+}
+.nc-obs-claim-row {
+  border-radius: 6px; padding: 7px 9px; margin-bottom: 4px;
+  background: var(--bg-card); border: 1px solid var(--line); cursor: pointer;
+}
+.nc-obs-claim-row:hover { border-color: var(--line-2); }
+.nc-obs-claim-row.stale { border-left: 2px solid var(--st-failed); }
+.nc-obs-claim-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.nc-obs-claim-slug {
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--fg); font-weight: 600;
+}
+.nc-obs-claim-owner { font-size: 11px; color: var(--fg-3); margin-top: 2px; }
+.nc-obs-claim-note { font-size: 11.5px; color: var(--fg-2); margin-top: 3px; line-height: 1.4; }
+
+.nc-obs-footer {
+  padding: 10px 16px 18px; text-align: center;
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--fg-4);
+}
+.nc-obs-stale { color: var(--st-needs); }
+
+@media (max-width: 899px) {
+  .nc-obs-main { grid-template-columns: 1fr; }
+}

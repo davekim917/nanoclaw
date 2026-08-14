@@ -444,3 +444,57 @@ export interface WorkgroupClaimsResponse {
 export async function getWorkgroupClaims(id: string): Promise<WorkgroupClaimsResponse> {
   return apiFetch<WorkgroupClaimsResponse>(`/dashboard/api/workgroup/${encodeURIComponent(id)}/claims`);
 }
+
+// ─── Observatory (agents' office ambient status view) ───────────────────────
+//
+// Read-only. Polled every 15s by the view itself (no SSE).
+
+export interface ObservatoryRoom {
+  key: string;
+  name: string;
+  platform: string;
+  memberAgentIds: string[];
+  lastActivityAt: string | null;
+  permalink: string | null;
+}
+
+export interface ObservatoryAgent {
+  id: string;
+  /** Channel-facing persona name — what renders on the chip. */
+  name: string;
+  /** Infra name (agent_groups.name) — secondary detail only. */
+  canonicalName: string;
+  folder: string;
+  provider: string;
+  awake: boolean;
+  location: string | null;
+  lastSeenAt: string | null;
+  holding: string[];
+  nextTask: { title: string; at: string } | null;
+}
+
+export type ObservatoryClaimState = 'live' | 'expiring' | 'stale' | 'parked';
+
+export interface ObservatoryClaim {
+  slug: string;
+  owner: string | null;
+  note: string | null;
+  state: ObservatoryClaimState;
+  staleMs: number;
+  threadId: string | null;
+  escalated: boolean;
+}
+
+export interface ObservatorySnapshot {
+  workgroupId: string;
+  asOf: string;
+  rooms: ObservatoryRoom[];
+  agents: ObservatoryAgent[];
+  claims: ObservatoryClaim[];
+}
+
+export async function getObservatory(workgroupId: string): Promise<ObservatorySnapshot> {
+  return apiFetch<ObservatorySnapshot>(
+    `/dashboard/api/observatory?workgroup=${encodeURIComponent(workgroupId)}`,
+  );
+}

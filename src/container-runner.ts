@@ -2816,7 +2816,7 @@ function ensureRuntimeFields(
  * Same agent_group routed to different channels gets different names; on the
  * Slack Example Retail channel "Example Assistant", on Discord "Example Agent", on admin sessions "example-retail".
  */
-async function resolveAssistantName(
+export async function resolveAssistantName(
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
   sessionMessagingGroupId: string | null,
