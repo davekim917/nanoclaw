@@ -4,12 +4,14 @@ import {
   type LoadedReviewedRecoveryDecisions,
   type ReviewedCheckoutRecoveryDecision,
   type ReviewedOriginSelection,
+  type ReviewedRepositoryAlias,
 } from './repository-migration-recovery.js';
 
 export interface MergedReviewedRecoveryDecisions {
   version: 2;
   checkouts: ReviewedCheckoutRecoveryDecision[];
   origins: ReviewedOriginSelection[];
+  repositoryAliases: ReviewedRepositoryAlias[];
 }
 
 function checkoutKey(decision: ReviewedCheckoutRecoveryDecision): string {
@@ -18,6 +20,10 @@ function checkoutKey(decision: ReviewedCheckoutRecoveryDecision): string {
 
 function originKey(decision: ReviewedOriginSelection): string {
   return `${decision.workgroupId}\0${decision.repo}`;
+}
+
+function aliasKey(decision: ReviewedRepositoryAlias): string {
+  return `${decision.workgroupId}\0${decision.sourceRepo}`;
 }
 
 function sameDecision(left: unknown, right: unknown): boolean {
@@ -30,6 +36,7 @@ export function mergeReviewedRecoveryDecisions(input: {
 }): MergedReviewedRecoveryDecisions {
   const checkouts = new Map<string, ReviewedCheckoutRecoveryDecision>();
   const origins = new Map<string, ReviewedOriginSelection>();
+  const repositoryAliases = new Map<string, ReviewedRepositoryAlias>();
 
   const addBase = <T>(target: Map<string, T>, key: string, decision: T, description: string): void => {
     const existing = target.get(key);
@@ -49,10 +56,14 @@ export function mergeReviewedRecoveryDecisions(input: {
     for (const decision of source.origins) {
       addBase(origins, originKey(decision), decision, `${decision.workgroupId}/${decision.repo}`);
     }
+    for (const decision of source.repositoryAliases) {
+      addBase(repositoryAliases, aliasKey(decision), decision, `${decision.workgroupId}/${decision.sourceRepo}`);
+    }
   }
 
   const overriddenCheckouts = new Set<string>();
   const overriddenOrigins = new Set<string>();
+  const overriddenAliases = new Set<string>();
   for (const source of input.overrides) {
     for (const decision of source.checkouts) {
       const key = checkoutKey(decision);
@@ -68,6 +79,14 @@ export function mergeReviewedRecoveryDecisions(input: {
       overriddenOrigins.add(key);
       origins.set(key, decision);
     }
+    for (const decision of source.repositoryAliases) {
+      const key = aliasKey(decision);
+      if (overriddenAliases.has(key)) {
+        throw new Error(`duplicate repository alias override: ${decision.workgroupId}/${decision.sourceRepo}`);
+      }
+      overriddenAliases.add(key);
+      repositoryAliases.set(key, decision);
+    }
   }
 
   return {
@@ -76,5 +95,8 @@ export function mergeReviewedRecoveryDecisions(input: {
       path.resolve(left.checkoutPath).localeCompare(path.resolve(right.checkoutPath)),
     ),
     origins: [...origins.values()].sort((left, right) => originKey(left).localeCompare(originKey(right))),
+    repositoryAliases: [...repositoryAliases.values()].sort((left, right) =>
+      aliasKey(left).localeCompare(aliasKey(right)),
+    ),
   };
 }

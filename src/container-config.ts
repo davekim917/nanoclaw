@@ -470,6 +470,28 @@ export function readContainerConfig(folder: string): ContainerConfig {
     return emptyConfig();
   }
 
+  return materializeContainerConfig(raw);
+}
+
+/**
+ * Read one trustworthy config snapshot for an operator-gated spawn. Unlike the
+ * legacy reader, absence, malformed JSON, and symlinks are fatal so a canary
+ * fence cannot silently fall back to stale DB identity.
+ */
+export function readContainerConfigStrict(folder: string): ContainerConfig {
+  const p = configPath(folder);
+  const stat = fs.lstatSync(p);
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Unsafe container config: ${p}`);
+  const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ContainerConfig>;
+  return materializeContainerConfig(raw);
+}
+
+/** Select strict admission reads only while an operator spawn fence is active. */
+export function readContainerConfigForSpawn(folder: string, requireAuthoritativeFile: boolean): ContainerConfig {
+  return requireAuthoritativeFile ? readContainerConfigStrict(folder) : readContainerConfig(folder);
+}
+
+function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerConfig {
   validateContainerResources(raw.resources);
 
   return {

@@ -27,6 +27,7 @@ import {
 } from './config.js';
 import {
   readContainerConfig,
+  readContainerConfigForSpawn,
   validateMcpServers,
   writeContainerConfig,
   type ContainerConfig,
@@ -320,17 +321,17 @@ export function reconcileWorkgroupAtSpawn(
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
   containerConfig: Pick<ContainerConfig, 'workgroup_id'>,
 ): { workgroupId: string } {
-  // Determine declared workgroup_id with the precedence above.
-  let declared: string;
-  if (containerConfig.workgroup_id !== undefined) {
-    declared = containerConfig.workgroup_id;
-  } else {
-    const existing = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1').get(agentGroup.id) as
-      | { workgroup_id: string | null }
-      | undefined;
-    declared = existing?.workgroup_id ?? agentGroup.folder;
-  }
+  const declared = resolveWorkgroupIdAtSpawn(db, agentGroup, containerConfig);
 
+  return persistResolvedWorkgroupAtSpawn(db, agentGroup, declared);
+}
+
+/** Persist the exact workgroup identity already resolved at admission. */
+export function persistResolvedWorkgroupAtSpawn(
+  db: Database.Database,
+  agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
+  declared: string,
+): { workgroupId: string } {
   db.transaction(() => {
     db.prepare(
       `
@@ -356,6 +357,19 @@ export function reconcileWorkgroupAtSpawn(
   // inside the same spawn observe different workgroup ids under a
   // concurrent reconcile.
   return { workgroupId: declared };
+}
+
+/** Resolve the exact workgroup identity spawn reconciliation will persist. */
+export function resolveWorkgroupIdAtSpawn(
+  db: Database.Database,
+  agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
+  containerConfig: Pick<ContainerConfig, 'workgroup_id'>,
+): string {
+  if (containerConfig.workgroup_id !== undefined) return containerConfig.workgroup_id;
+  const existing = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1').get(agentGroup.id) as
+    | { workgroup_id: string | null }
+    | undefined;
+  return existing?.workgroup_id ?? agentGroup.folder;
 }
 
 /**
@@ -439,6 +453,26 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
   });
 }
 
+/**
+ * Temporary operator-controlled fence for controlled fleet canaries. When the
+ * variable is absent every workgroup is admitted. When present, only exact,
+ * comma-separated workgroup ids are admitted; an empty value deliberately
+ * blocks all spawns. Inbound rows remain pending for a later ungated wake.
+ */
+export function isContainerSpawnWorkgroupAllowed(
+  workgroupId: string,
+  rawAllowlist = process.env.NANOCLAW_CONTAINER_SPAWN_WORKGROUP_ALLOWLIST,
+): boolean {
+  if (rawAllowlist === undefined) return true;
+  const allowed = new Set(
+    rawAllowlist
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  return allowed.has(workgroupId);
+}
+
 function startReservedWake(session: Session): Promise<boolean> {
   if (activeContainers.has(session.id)) return Promise.resolve(true);
   const existing = wakePromises.get(session.id);
@@ -504,6 +538,46 @@ async function checkStorageAdmission(session: Session, queued: boolean): Promise
 
 async function spawnReservedContainer(session: Session): Promise<boolean> {
   if (containerShutdownInProgress) return false;
+  const spawnAgentGroup = getAgentGroup(session.agent_group_id);
+  if (!spawnAgentGroup) {
+    log.error('Container wake rejected — agent group not found at reserved spawn', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+    });
+    releaseMemoryReservation(session.id);
+    return false;
+  }
+  let spawnContainerConfig: ContainerConfig;
+  let spawnWorkgroupId: string;
+  try {
+    // Read once at the actual spawn boundary. The same snapshot supplies the
+    // authoritative workgroup declaration and every downstream spawn option.
+    spawnContainerConfig = readContainerConfigForSpawn(
+      spawnAgentGroup.folder,
+      process.env.NANOCLAW_CONTAINER_SPAWN_WORKGROUP_ALLOWLIST !== undefined,
+    );
+    spawnWorkgroupId = resolveWorkgroupIdAtSpawn(getDb(), spawnAgentGroup, spawnContainerConfig);
+  } catch (err) {
+    log.warn('Container wake rejected — unable to resolve authoritative spawn configuration', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      err,
+    });
+    releaseMemoryReservation(session.id);
+    return false;
+  }
+  if (
+    process.env.NANOCLAW_CONTAINER_SPAWN_WORKGROUP_ALLOWLIST !== undefined &&
+    !isContainerSpawnWorkgroupAllowed(spawnWorkgroupId)
+  ) {
+    log.warn('Container wake deferred — workgroup excluded by operator canary fence', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      workgroupId: spawnWorkgroupId,
+    });
+    releaseMemoryReservation(session.id);
+    return false;
+  }
   const activeCount = activeContainers.size;
   // Storage-admission promises are tracked for dedupe but are not consuming a
   // container slot. Count spawning sessions only until their process enters
@@ -524,8 +598,8 @@ async function spawnReservedContainer(session: Session): Promise<boolean> {
   spawningSessions.add(session.id);
   let storageActivity: StorageActivityLease | null = null;
   try {
-    storageActivity = await acquireContainerStorageActivity(session);
-    await spawnContainer(session, storageActivity);
+    storageActivity = await acquireContainerStorageActivity(session, spawnWorkgroupId);
+    await spawnContainer(session, storageActivity, spawnAgentGroup, spawnContainerConfig, spawnWorkgroupId);
     storageActivity = null; // activeContainers owns it until process exit
     return true;
   } catch (err) {
@@ -538,13 +612,12 @@ async function spawnReservedContainer(session: Session): Promise<boolean> {
   }
 }
 
-async function acquireContainerStorageActivity(session: Session): Promise<StorageActivityLease> {
+async function acquireContainerStorageActivity(
+  session: Session,
+  admittedWorkgroupId: string,
+): Promise<StorageActivityLease> {
   const roots = new Set<string>([sessionDir(session.agent_group_id, session.id)]);
-  const ag = getAgentGroup(session.agent_group_id);
-  if (ag) {
-    const workgroupId = ag.workgroup_id ?? ag.folder;
-    roots.add(topicWorktreesDir(resolveSessionRepositoryWorkUnit(session, workgroupId)));
-  }
+  roots.add(topicWorktreesDir(resolveSessionRepositoryWorkUnit(session, admittedWorkgroupId)));
 
   const leases: StorageActivityLease[] = [];
   try {
@@ -635,12 +708,13 @@ function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMoun
   ];
 }
 
-async function spawnContainer(session: Session, storageActivity: StorageActivityLease): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) {
-    throw new Error(`Agent group not found: ${session.agent_group_id}`);
-  }
-
+async function spawnContainer(
+  session: Session,
+  storageActivity: StorageActivityLease,
+  agentGroup: AgentGroup,
+  containerConfig: ContainerConfig,
+  admittedWorkgroupId: string,
+): Promise<void> {
   // Refresh the destination map and current-thread routing so any admin
   // changes take effect on wake. Destinations come from the agent-to-agent
   // module — skip when the module isn't installed (table absent).
@@ -655,9 +729,8 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
   // credentials / plugins / channel registrations appear immediately.
   writeCapabilitiesSnapshot(agentGroup.id, session.id, session.messaging_group_id);
 
-  // Read container config once — threaded through provider resolution,
-  // buildMounts, and buildContainerArgs so we don't re-read the file.
-  const containerConfig = readContainerConfig(agentGroup.folder);
+  // The config was read once at the reserved-spawn boundary and is threaded
+  // through workgroup reconciliation, provider resolution, mounts, and args.
   const effectiveResources = resolveContainerResources(containerConfig.resources);
 
   // Refuse spawn if the agent-runner deps (package.json + bun.lock) on disk
@@ -695,7 +768,7 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
   // The returned workgroupId is threaded through buildMounts and other
   // downstream subsystems so they don't each re-derive from agentGroups,
   // which would race against any concurrent reconcile.
-  const { workgroupId: resolvedWgId } = reconcileWorkgroupAtSpawn(getDb(), agentGroup, containerConfig);
+  const { workgroupId: resolvedWgId } = persistResolvedWorkgroupAtSpawn(getDb(), agentGroup, admittedWorkgroupId);
   const repositoryWorkUnit = resolveSessionRepositoryWorkUnit(session, resolvedWgId);
   if (isWorkgroupRepositoryMountClaimed(resolvedWgId)) {
     throw new Error(`Repository mount reconciliation in progress for ${resolvedWgId}; spawn will retry`);

@@ -55,6 +55,7 @@ import {
   recoverySeedGitDirSha256,
   selectReviewedOrigin,
   type LoadedReviewedRecoveryDecisions,
+  type ReviewedCheckoutRecoveryDecision,
 } from '../src/repository-migration-recovery.js';
 import {
   normalizedCredentialFreeGithubOrigin,
@@ -238,15 +239,18 @@ function originFor(candidate: LegacyCheckoutCandidate, context: LegacyGitResolut
   }
   const seen = new Set<string>();
   while (origin !== null && path.isAbsolute(origin)) {
-    if (seen.has(origin)) throw new Error(`local repository origin cycle while resolving ${candidate.checkoutPath}`);
-    seen.add(origin);
+    const currentOrigin = origin;
+    if (seen.has(currentOrigin)) {
+      throw new Error(`local repository origin cycle while resolving ${candidate.checkoutPath}`);
+    }
+    seen.add(currentOrigin);
     let localStore: string | undefined;
-    if (fs.existsSync(origin)) {
-      localStore = fs.existsSync(path.join(origin, '.git')) ? path.join(origin, '.git') : origin;
+    if (fs.existsSync(currentOrigin)) {
+      localStore = fs.existsSync(path.join(currentOrigin, '.git')) ? path.join(currentOrigin, '.git') : currentOrigin;
     } else {
-      const repoName = path.basename(origin).replace(/\.git$/, '');
+      const repoName = path.basename(currentOrigin).replace(/\.git$/, '');
       localStore = (candidate.candidateCommonGitDirs ?? []).find((common) => {
-        if (origin.includes('/.repos/')) return path.basename(common).replace(/\.git$/, '') === repoName;
+        if (currentOrigin.includes('/.repos/')) return path.basename(common).replace(/\.git$/, '') === repoName;
         return path.basename(path.dirname(common)) === repoName;
       });
     }
@@ -713,9 +717,10 @@ function inventoryBareStores(groups: AgentGroupRow[], selectedWorkgroup?: string
   return result;
 }
 
-function coalesceRepositoryIdentityAliases(
+export function coalesceRepositoryIdentityAliases(
   grouped: Map<string, LegacyCheckoutCandidate[]>,
   bareStores: Map<string, string[]>,
+  reviewedAliases: Array<{ workgroupId: string; sourceRepo: string; destinationRepo: string }> = [],
 ): void {
   const keys = new Set([...grouped.keys(), ...bareStores.keys()]);
   const identityGroups = [...keys].map((key) => {
@@ -750,7 +755,7 @@ function coalesceRepositoryIdentityAliases(
       observedOrigins,
     };
   });
-  const plan = planLegacyRepositoryCoalescing(identityGroups);
+  const plan = planLegacyRepositoryCoalescing(identityGroups, reviewedAliases);
   for (const sourceKey of [...keys].sort()) {
     const destinationKey = plan.get(sourceKey) ?? sourceKey;
     if (sourceKey === destinationKey) continue;
@@ -783,6 +788,111 @@ function coalesceRepositoryIdentityAliases(
     ];
     for (const candidate of candidates) candidate.candidateCommonGitDirs = [...new Set(common)].sort();
   }
+}
+
+export interface PreparedReviewedRepositoryAliases {
+  reviewedRecovery: LoadedReviewedRecoveryDecisions | null;
+  consumedOriginKeys: Set<string>;
+  aliasedCheckoutPaths: Set<string>;
+  aliasedObjectStores: Set<string>;
+}
+
+export function prepareReviewedRepositoryAliases(
+  grouped: Map<string, LegacyCheckoutCandidate[]>,
+  bareStores: Map<string, string[]>,
+  reviewedRecovery: LoadedReviewedRecoveryDecisions | null,
+): PreparedReviewedRepositoryAliases {
+  if (!reviewedRecovery || reviewedRecovery.repositoryAliases.length === 0) {
+    return {
+      reviewedRecovery,
+      consumedOriginKeys: new Set(),
+      aliasedCheckoutPaths: new Set(),
+      aliasedObjectStores: new Set(),
+    };
+  }
+  const checkoutByPath = new Map(
+    reviewedRecovery.checkouts.map((decision) => [path.resolve(decision.checkoutPath), decision]),
+  );
+  const originByKey = new Map(
+    reviewedRecovery.origins.map((decision) => [`${decision.workgroupId}\0${decision.repo}`, decision]),
+  );
+  const normalizedCheckouts = new Map<string, ReviewedCheckoutRecoveryDecision>(checkoutByPath);
+  const consumedOriginKeys = new Set<string>();
+  const aliasedCheckoutPaths = new Set<string>();
+  const aliasedObjectStores = new Set<string>();
+
+  for (const alias of reviewedRecovery.repositoryAliases) {
+    const sourceKey = `${alias.workgroupId}\0${alias.sourceRepo}`;
+    const destinationKey = `${alias.workgroupId}\0${alias.destinationRepo}`;
+    const sourceCandidates = grouped.get(sourceKey);
+    if (!sourceCandidates && !bareStores.has(sourceKey)) {
+      throw new Error(`reviewed repository alias source is absent: ${alias.workgroupId}/${alias.sourceRepo}`);
+    }
+    if (!grouped.has(destinationKey) && !bareStores.has(destinationKey)) {
+      throw new Error(`reviewed repository alias destination is absent: ${alias.workgroupId}/${alias.destinationRepo}`);
+    }
+    const originDecision = originByKey.get(sourceKey);
+    if (!originDecision || originDecision.archiveOnly !== true || originDecision.selectedOrigin !== null) {
+      throw new Error(
+        `reviewed repository alias source requires an originless archive-only disposition: ` +
+          `${alias.workgroupId}/${alias.sourceRepo}`,
+      );
+    }
+    const context = createLegacyGitResolutionContext([
+      ...(sourceCandidates ?? []).flatMap((candidate) => candidate.candidateCommonGitDirs ?? []),
+      ...(bareStores.get(sourceKey) ?? []),
+    ]);
+    const observedOrigins = [
+      ...(sourceCandidates ?? []).flatMap((candidate) => {
+        try {
+          return [normalizedObservedOrigin(originFor(candidate, context))];
+        } catch {
+          return [];
+        }
+      }),
+      ...(bareStores.get(sourceKey) ?? []).map((store) =>
+        normalizedObservedOrigin(originForObjectStore(store, context)),
+      ),
+    ];
+    if (
+      selectReviewedOrigin({
+        workgroupId: alias.workgroupId,
+        repo: alias.sourceRepo,
+        observedOrigins,
+        decision: originDecision,
+      }) !== null
+    ) {
+      throw new Error(
+        `reviewed repository alias source must remain originless: ${alias.workgroupId}/${alias.sourceRepo}`,
+      );
+    }
+    consumedOriginKeys.add(sourceKey);
+
+    for (const candidate of sourceCandidates ?? []) {
+      const checkoutPath = path.resolve(candidate.checkoutPath);
+      const decision = checkoutByPath.get(checkoutPath);
+      if (
+        !decision ||
+        decision.workgroupId !== alias.workgroupId ||
+        decision.repo !== alias.sourceRepo ||
+        decision.action !== 'archive-visible-state'
+      ) {
+        throw new Error(
+          `reviewed repository alias source checkout requires an exact archive-visible-state decision: ${checkoutPath}`,
+        );
+      }
+      normalizedCheckouts.set(checkoutPath, { ...decision, repo: alias.destinationRepo });
+      aliasedCheckoutPaths.add(checkoutPath);
+    }
+    for (const store of bareStores.get(sourceKey) ?? []) aliasedObjectStores.add(path.resolve(store));
+  }
+
+  return {
+    reviewedRecovery: { ...reviewedRecovery, checkouts: [...normalizedCheckouts.values()] },
+    consumedOriginKeys,
+    aliasedCheckoutPaths,
+    aliasedObjectStores,
+  };
 }
 
 export function assertServiceInactive(
@@ -1687,13 +1797,31 @@ async function main(): Promise<void> {
   }
   const reviewedMappings = loadReviewedWorkUnitMappings(args.mappingFile);
   const reviewedRecovery = loadReviewedRecoveryDecisions(args.recoveryFile);
-  const recoveryDecisionInScope = (decision: { workgroupId: string; repo: string }): boolean =>
-    (!args.workgroup || decision.workgroupId === args.workgroup) && (!args.repo || decision.repo === args.repo);
-  const scopedReviewedRecovery = reviewedRecovery
+  const scopedRepositoryAliases = (reviewedRecovery?.repositoryAliases ?? []).filter(
+    (entry) =>
+      (!args.workgroup || entry.workgroupId === args.workgroup) && (!args.repo || entry.destinationRepo === args.repo),
+  );
+  if (
+    args.repo &&
+    (reviewedRecovery?.repositoryAliases ?? []).some(
+      (entry) => (!args.workgroup || entry.workgroupId === args.workgroup) && entry.sourceRepo === args.repo,
+    )
+  ) {
+    throw new Error(`repository ${args.repo} is a reviewed retired alias; select its canonical destination instead`);
+  }
+  const aliasDestinationBySource = new Map(
+    scopedRepositoryAliases.map((entry) => [`${entry.workgroupId}\0${entry.sourceRepo}`, entry.destinationRepo]),
+  );
+  const recoveryDecisionInScope = (decision: { workgroupId: string; repo: string }): boolean => {
+    const canonicalRepo = aliasDestinationBySource.get(`${decision.workgroupId}\0${decision.repo}`) ?? decision.repo;
+    return (!args.workgroup || decision.workgroupId === args.workgroup) && (!args.repo || canonicalRepo === args.repo);
+  };
+  let scopedReviewedRecovery = reviewedRecovery
     ? {
         ...reviewedRecovery,
         checkouts: reviewedRecovery.checkouts.filter(recoveryDecisionInScope),
         origins: reviewedRecovery.origins.filter(recoveryDecisionInScope),
+        repositoryAliases: scopedRepositoryAliases,
       }
     : null;
   const scopedReviewedMappings = reviewedMappings
@@ -1704,7 +1832,9 @@ async function main(): Promise<void> {
     : null;
   const grouped = inventoryCandidates(rows, groups, args.workgroup, reviewedMappings?.entries);
   const bareStores = inventoryBareStores(groups, args.workgroup);
-  coalesceRepositoryIdentityAliases(grouped, bareStores);
+  const preparedRepositoryAliases = prepareReviewedRepositoryAliases(grouped, bareStores, scopedReviewedRecovery);
+  scopedReviewedRecovery = preparedRepositoryAliases.reviewedRecovery;
+  coalesceRepositoryIdentityAliases(grouped, bareStores, scopedReviewedRecovery?.repositoryAliases);
   const knownWorkUnits = rows.map((row) =>
     resolveRepositoryWorkUnit({
       workgroupId: row.workgroup_id,
@@ -1729,7 +1859,8 @@ async function main(): Promise<void> {
     console.error(
       `Loaded reviewed recovery decisions from ${scopedReviewedRecovery.sourcePath} ` +
         `(sha256 ${scopedReviewedRecovery.sha256}; ${scopedReviewedRecovery.checkouts.length} checkout, ` +
-        `${scopedReviewedRecovery.origins.length} origin in scope)`,
+        `${scopedReviewedRecovery.origins.length} origin, ` +
+        `${scopedReviewedRecovery.repositoryAliases.length} repository alias in scope)`,
     );
   }
   const checkoutRecoveryByPath = new Map(
@@ -1739,7 +1870,7 @@ async function main(): Promise<void> {
     (scopedReviewedRecovery?.origins ?? []).map((decision) => [`${decision.workgroupId}\0${decision.repo}`, decision]),
   );
   const usedCheckoutRecovery = new Set<string>();
-  const usedOriginRecovery = new Set<string>();
+  const usedOriginRecovery = new Set<string>(preparedRepositoryAliases.consumedOriginKeys);
   for (const candidates of grouped.values()) {
     for (const candidate of candidates) {
       const decision = checkoutRecoveryByPath.get(path.resolve(candidate.checkoutPath));
@@ -1783,6 +1914,7 @@ async function main(): Promise<void> {
         console.error(
           `Resolving origin ${workgroupId}/${repo} ${index + 1}/${candidates.length}: ${candidate.checkoutPath}`,
         );
+        if (preparedRepositoryAliases.aliasedCheckoutPaths.has(path.resolve(candidate.checkoutPath))) return [];
         try {
           const observedOrigin = originFor(candidate, originResolution);
           if (repositoryOriginContainsCredentials(observedOrigin)) candidate.credentialBearingOrigin = true;
@@ -1792,9 +1924,9 @@ async function main(): Promise<void> {
           throw error;
         }
       });
-      const storeOrigins = (bareStores.get(key) ?? []).map((store) =>
-        normalizedObservedOrigin(originForObjectStore(store, originResolution)),
-      );
+      const storeOrigins = (bareStores.get(key) ?? [])
+        .filter((store) => !preparedRepositoryAliases.aliasedObjectStores.has(path.resolve(store)))
+        .map((store) => normalizedObservedOrigin(originForObjectStore(store, originResolution)));
       const origins = [...new Set([...candidateOrigins, ...storeOrigins])];
       const origin = selectReviewedOrigin({ workgroupId, repo, observedOrigins: origins, decision: originDecision });
       if (originDecision) usedOriginRecovery.add(key);

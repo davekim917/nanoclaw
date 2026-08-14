@@ -47,11 +47,18 @@ export interface ReviewedOriginSelection {
   archiveOnly?: true;
 }
 
+export interface ReviewedRepositoryAlias {
+  workgroupId: string;
+  sourceRepo: string;
+  destinationRepo: string;
+}
+
 export interface LoadedReviewedRecoveryDecisions {
   sourcePath: string;
   sha256: string;
   checkouts: ReviewedCheckoutRecoveryDecision[];
   origins: ReviewedOriginSelection[];
+  repositoryAliases: ReviewedRepositoryAlias[];
 }
 
 function sha256(value: Buffer | string): string {
@@ -119,10 +126,15 @@ export function loadReviewedRecoveryDecisions(file?: string): LoadedReviewedReco
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw new Error('reviewed recovery decision is malformed');
   const root = value as Record<string, unknown>;
-  if (root.version !== 2 || !Array.isArray(root.checkouts) || !Array.isArray(root.origins)) {
+  if (
+    root.version !== 2 ||
+    !Array.isArray(root.checkouts) ||
+    !Array.isArray(root.origins) ||
+    (root.repositoryAliases !== undefined && !Array.isArray(root.repositoryAliases))
+  ) {
     throw new Error('reviewed recovery decision is malformed');
   }
-  if (Object.keys(root).some((key) => !['version', 'checkouts', 'origins'].includes(key))) {
+  if (Object.keys(root).some((key) => !['version', 'checkouts', 'origins', 'repositoryAliases'].includes(key))) {
     throw new Error('reviewed recovery decision contains unknown top-level fields');
   }
 
@@ -235,6 +247,32 @@ export function loadReviewedRecoveryDecisions(file?: string): LoadedReviewedReco
     return { ...record, selectedOrigin } as unknown as ReviewedOriginSelection;
   });
 
+  const repositoryAliases = ((root.repositoryAliases ?? []) as unknown[]).map((entry, index) => {
+    const location = `reviewed repository alias ${index}`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`${location} is malformed`);
+    const record = entry as Record<string, unknown>;
+    if (Object.keys(record).some((key) => !['workgroupId', 'sourceRepo', 'destinationRepo'].includes(key))) {
+      throw new Error(`${location} contains unknown fields`);
+    }
+    for (const key of ['workgroupId', 'sourceRepo', 'destinationRepo']) {
+      const value = record[key];
+      if (
+        typeof value !== 'string' ||
+        value === '' ||
+        value === '.' ||
+        value === '..' ||
+        value.includes('/') ||
+        value.includes('\\') ||
+        value.includes('\0')
+      ) {
+        throw new Error(`${location} requires a safe ${key}`);
+      }
+    }
+    if (record.sourceRepo === record.destinationRepo)
+      throw new Error(`${location} cannot alias a repository to itself`);
+    return record as unknown as ReviewedRepositoryAlias;
+  });
+
   const missingPaths = new Set<string>();
   for (const decision of checkouts) {
     const resolved = path.resolve(decision.checkoutPath);
@@ -248,7 +286,15 @@ export function loadReviewedRecoveryDecisions(file?: string): LoadedReviewedReco
       throw new Error(`duplicate reviewed origin decision: ${decision.workgroupId}/${decision.repo}`);
     originKeys.add(key);
   }
-  return { sourcePath, sha256: sha256(bytes), checkouts, origins };
+  const aliasKeys = new Set<string>();
+  for (const alias of repositoryAliases) {
+    const key = `${alias.workgroupId}\0${alias.sourceRepo}`;
+    if (aliasKeys.has(key)) {
+      throw new Error(`duplicate reviewed repository alias: ${alias.workgroupId}/${alias.sourceRepo}`);
+    }
+    aliasKeys.add(key);
+  }
+  return { sourcePath, sha256: sha256(bytes), checkouts, origins, repositoryAliases };
 }
 
 export function observedOriginsSha256(origins: Iterable<string | null>): string {
@@ -295,7 +341,10 @@ export function selectReviewedOrigin(input: {
   }
   const observedHash = observedOriginsSha256(unique);
   if (observedHash !== input.decision.observedOriginsSha256) {
-    throw new Error(`reviewed origin decision is stale for ${input.workgroupId}/${input.repo}`);
+    throw new Error(
+      `reviewed origin decision is stale for ${input.workgroupId}/${input.repo} ` +
+        `(current observed set sha256 ${observedHash})`,
+    );
   }
   return credentialFreeGithubOrigin(input.decision.selectedOrigin, 'reviewed origin decision');
 }

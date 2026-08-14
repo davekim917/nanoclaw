@@ -3,7 +3,12 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { readContainerConfig, writeContainerConfig } from './container-config.js';
+import {
+  readContainerConfig,
+  readContainerConfigForSpawn,
+  readContainerConfigStrict,
+  writeContainerConfig,
+} from './container-config.js';
 
 let tmpDir: string;
 
@@ -86,6 +91,27 @@ describe('workgroup and capability config', () => {
     });
     const result = readContainerConfig(folder);
     expect(result.slack_user_token).toBeUndefined();
+  });
+});
+
+describe('readContainerConfigStrict', () => {
+  it('returns the same normalized snapshot for a valid regular file', () => {
+    writeGroupConfig('test-strict-valid', { workgroup_id: 'illysium' });
+    expect(readContainerConfigStrict('test-strict-valid').workgroup_id).toBe('illysium');
+  });
+
+  it('rejects a missing config instead of falling back to empty defaults', () => {
+    expect(() => readContainerConfigStrict('test-strict-missing')).toThrow();
+    expect(() => readContainerConfigForSpawn('test-strict-missing', true)).toThrow();
+    expect(readContainerConfigForSpawn('test-strict-missing', false).mcpServers).toEqual({});
+  });
+
+  it('rejects malformed JSON instead of falling back to empty defaults', () => {
+    const dir = path.join(GROUPS_DIR, 'test-strict-malformed');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'container.json'), '{not-json\n');
+    expect(() => readContainerConfigStrict('test-strict-malformed')).toThrow();
+    expect(() => readContainerConfigForSpawn('test-strict-malformed', true)).toThrow();
   });
 });
 

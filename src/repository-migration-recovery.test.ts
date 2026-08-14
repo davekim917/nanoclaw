@@ -145,4 +145,29 @@ describe('reviewed repository recovery decisions', () => {
     );
     expect(() => loadReviewedRecoveryDecisions(file)).toThrow(/archiveOnly requires selectedOrigin null/);
   });
+
+  it('loads strict reviewed repository aliases and rejects unsafe or duplicate sources', () => {
+    const file = writeRecovery({
+      version: 2,
+      checkouts: [],
+      origins: [],
+      repositoryAliases: [{ workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'XZO' }],
+    });
+    expect(loadReviewedRecoveryDecisions(file)?.repositoryAliases).toEqual([
+      { workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'XZO' },
+    ]);
+
+    for (const repositoryAliases of [
+      [{ workgroupId: 'illysium', sourceRepo: '../XZO-BACKEND', destinationRepo: 'XZO' }],
+      [
+        { workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'XZO' },
+        { workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'OTHER' },
+      ],
+    ]) {
+      fs.writeFileSync(file, `${JSON.stringify({ version: 2, checkouts: [], origins: [], repositoryAliases })}\n`, {
+        mode: 0o600,
+      });
+      expect(() => loadReviewedRecoveryDecisions(file)).toThrow(/safe sourceRepo|duplicate reviewed repository alias/);
+    }
+  });
 });

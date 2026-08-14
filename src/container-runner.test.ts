@@ -21,6 +21,9 @@ import {
   WORKGROUP_MEMORY_LOCK_CONTAINER_PATH,
   replaceClaudeNativeMemoryMount,
   reconcileWorkgroupAtSpawn,
+  isContainerSpawnWorkgroupAllowed,
+  persistResolvedWorkgroupAtSpawn,
+  resolveWorkgroupIdAtSpawn,
   stripEnvEntry,
 } from './container-runner.js';
 import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
@@ -48,6 +51,79 @@ describe('resolveProviderName', () => {
   it('treats empty string as unset (falls through)', () => {
     expect(resolveProviderName('', 'opencode')).toBe('opencode');
     expect(resolveProviderName(null, '')).toBe('claude');
+  });
+});
+
+describe('operator canary workgroup spawn fence', () => {
+  it('admits every workgroup when the fence is absent', () => {
+    expect(isContainerSpawnWorkgroupAllowed('madison-reed', undefined)).toBe(true);
+  });
+
+  it('admits only exact trimmed workgroup ids when the fence is present', () => {
+    const allowlist = 'madison-reed, illysium,legacy-canary';
+    expect(isContainerSpawnWorkgroupAllowed('madison-reed', allowlist)).toBe(true);
+    expect(isContainerSpawnWorkgroupAllowed('illysium', allowlist)).toBe(true);
+    expect(isContainerSpawnWorkgroupAllowed('legacy-canary', allowlist)).toBe(true);
+    expect(isContainerSpawnWorkgroupAllowed('madison', allowlist)).toBe(false);
+    expect(isContainerSpawnWorkgroupAllowed('other', allowlist)).toBe(false);
+  });
+
+  it('fails closed when the operator explicitly supplies an empty fence', () => {
+    expect(isContainerSpawnWorkgroupAllowed('illysium', '')).toBe(false);
+    expect(isContainerSpawnWorkgroupAllowed('illysium', ' , ')).toBe(false);
+  });
+
+  it('uses container.json identity ahead of a stale DB workgroup', () => {
+    const db = new BetterSQLite3(':memory:');
+    try {
+      db.exec('CREATE TABLE agent_groups (id TEXT PRIMARY KEY, workgroup_id TEXT)');
+      db.prepare('INSERT INTO agent_groups (id, workgroup_id) VALUES (?, ?)').run('ag-a', 'illysium');
+      const resolved = resolveWorkgroupIdAtSpawn(
+        db,
+        { id: 'ag-a', folder: 'agent-a' },
+        { workgroup_id: 'madison-reed' },
+      );
+      expect(resolved).toBe('madison-reed');
+      expect(isContainerSpawnWorkgroupAllowed(resolved, 'illysium')).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('uses the DB workgroup when container.json is silent', () => {
+    const db = new BetterSQLite3(':memory:');
+    try {
+      db.exec('CREATE TABLE agent_groups (id TEXT PRIMARY KEY, workgroup_id TEXT)');
+      db.prepare('INSERT INTO agent_groups (id, workgroup_id) VALUES (?, ?)').run('ag-a', 'illysium');
+      expect(resolveWorkgroupIdAtSpawn(db, { id: 'ag-a', folder: 'agent-a' }, {})).toBe('illysium');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('persists the fenced identity even if the DB changes after admission', () => {
+    const db = new BetterSQLite3(':memory:');
+    try {
+      db.exec(`
+        CREATE TABLE workgroups (
+          id TEXT PRIMARY KEY,
+          display_name TEXT,
+          onecli_secrets TEXT,
+          created_at TEXT
+        );
+        CREATE TABLE agent_groups (id TEXT PRIMARY KEY, workgroup_id TEXT);
+      `);
+      db.prepare('INSERT INTO agent_groups (id, workgroup_id) VALUES (?, ?)').run('ag-a', 'illysium');
+      const agentGroup = { id: 'ag-a', folder: 'agent-a' };
+      const admitted = resolveWorkgroupIdAtSpawn(db, agentGroup, {});
+      expect(isContainerSpawnWorkgroupAllowed(admitted, 'illysium')).toBe(true);
+
+      db.prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run('madison-reed', 'ag-a');
+      expect(persistResolvedWorkgroupAtSpawn(db, agentGroup, admitted)).toEqual({ workgroupId: 'illysium' });
+      expect(db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').pluck().get('ag-a')).toBe('illysium');
+    } finally {
+      db.close();
+    }
   });
 });
 

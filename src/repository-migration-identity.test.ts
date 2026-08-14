@@ -80,4 +80,87 @@ describe('legacy repository identity coalescing', () => {
     expect(plan.get('wg\0Repo')).toBe('wg\0Repo');
     expect(plan.get('wg\0repo')).toBe('wg\0repo');
   });
+
+  it('applies a reviewed retired-repository alias without reviving a standalone canonical', () => {
+    const plan = planLegacyRepositoryCoalescing(
+      [
+        {
+          key: 'illysium\0XZO',
+          workgroupId: 'illysium',
+          repo: 'XZO',
+          physicalCount: 1,
+          objectStoreCount: 1,
+          observedOrigins: ['https://github.com/example/XZO'],
+        },
+        {
+          key: 'illysium\0snapshot-XZO',
+          workgroupId: 'illysium',
+          repo: 'snapshot-XZO',
+          physicalCount: 10,
+          objectStoreCount: 1,
+          observedOrigins: ['https://github.com/example/xzo.git'],
+        },
+        {
+          key: 'illysium\0XZO-BACKEND',
+          workgroupId: 'illysium',
+          repo: 'XZO-BACKEND',
+          physicalCount: 3,
+          objectStoreCount: 0,
+          observedOrigins: [],
+        },
+      ],
+      [{ workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'XZO' }],
+    );
+    expect(plan.get('illysium\0XZO-BACKEND')).toBe('illysium\0XZO');
+    expect(plan.get('illysium\0snapshot-XZO')).toBe('illysium\0XZO');
+  });
+
+  it('pins an origin-unreadable reviewed destination ahead of a larger same-origin snapshot', () => {
+    const plan = planLegacyRepositoryCoalescing(
+      [
+        {
+          key: 'illysium\0XZO',
+          workgroupId: 'illysium',
+          repo: 'XZO',
+          physicalCount: 1,
+          objectStoreCount: 0,
+          observedOrigins: [],
+        },
+        {
+          key: 'illysium\0snapshot-XZO',
+          workgroupId: 'illysium',
+          repo: 'snapshot-XZO',
+          physicalCount: 10,
+          objectStoreCount: 1,
+          observedOrigins: ['https://github.com/example/xzo.git'],
+        },
+        {
+          key: 'illysium\0XZO-BACKEND',
+          workgroupId: 'illysium',
+          repo: 'XZO-BACKEND',
+          physicalCount: 3,
+          objectStoreCount: 0,
+          observedOrigins: [],
+        },
+      ],
+      [{ workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'XZO' }],
+    );
+    expect([...plan.values()]).toEqual(['illysium\0XZO', 'illysium\0XZO', 'illysium\0XZO']);
+  });
+
+  it('rejects reviewed aliases with absent destinations and cycles', () => {
+    const groups = [
+      { key: 'wg\0a', workgroupId: 'wg', repo: 'a', physicalCount: 1, objectStoreCount: 0, observedOrigins: [] },
+      { key: 'wg\0b', workgroupId: 'wg', repo: 'b', physicalCount: 1, objectStoreCount: 0, observedOrigins: [] },
+    ];
+    expect(() =>
+      planLegacyRepositoryCoalescing(groups, [{ workgroupId: 'wg', sourceRepo: 'a', destinationRepo: 'missing' }]),
+    ).toThrow(/destination is absent/);
+    expect(() =>
+      planLegacyRepositoryCoalescing(groups, [
+        { workgroupId: 'wg', sourceRepo: 'a', destinationRepo: 'b' },
+        { workgroupId: 'wg', sourceRepo: 'b', destinationRepo: 'a' },
+      ]),
+    ).toThrow(/cycle/);
+  });
 });

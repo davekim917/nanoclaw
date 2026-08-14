@@ -40,7 +40,13 @@ function source(
   checkouts: ReviewedCheckoutRecoveryDecision[],
   origins: ReviewedOriginSelection[] = [],
 ): LoadedReviewedRecoveryDecisions {
-  return { sourcePath: `/tmp/${name}.json`, sha256: 'c'.repeat(64), checkouts, origins };
+  return {
+    sourcePath: `/tmp/${name}.json`,
+    sha256: 'c'.repeat(64),
+    checkouts,
+    origins,
+    repositoryAliases: [],
+  };
 }
 
 describe('reviewed repository recovery decision merging', () => {
@@ -74,5 +80,12 @@ describe('reviewed repository recovery decision merging', () => {
         overrides: [source('one', [replacement]), source('two', [replacement])],
       }),
     ).toThrow(/duplicate checkout override/);
+  });
+
+  it('preserves reviewed repository aliases in merged ledgers', () => {
+    const alias = { workgroupId: 'wg', sourceRepo: 'legacy-backend', destinationRepo: 'repo' };
+    const base = source('base', []);
+    base.repositoryAliases = [alias];
+    expect(mergeReviewedRecoveryDecisions({ bases: [base], overrides: [] }).repositoryAliases).toEqual([alias]);
   });
 });
