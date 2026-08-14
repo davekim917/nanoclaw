@@ -75,11 +75,15 @@ takes it.
 CLAIM=/app/skills/work-claims/claim.sh
 
 bash $CLAIM check   acme-pr-733
-bash $CLAIM take    acme-pr-733 4 "publish-gate seam, PR #733"
+bash $CLAIM take    acme-pr-733 4 "publish-gate seam, PR #733" --source "QA hand-off run r123"
 bash $CLAIM park    acme-pr-733 "not done: schema done, handlers TODO"
 bash $CLAIM release acme-pr-733
 bash $CLAIM list
 ```
+
+`--source` (optional, on `take` and `park`) records where the assignment came
+from — a QA hand-off, a human in a channel, a review thread. Everything else
+you might want to record (PR, branch, files) belongs in the note as prose.
 
 **Do not assemble a claim with `jq` yourself.** The fields are not a shape to
 remember — `owner`, `session_id` and `thread_id` all come from your environment,

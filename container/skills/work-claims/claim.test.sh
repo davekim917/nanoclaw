@@ -168,4 +168,17 @@ done < "$CLAIMS_DIR/ledger.ndjson"
 # 23. ledger.ndjson is never picked up by list.
 bash "$CLAIM" list | grep -q 'ledger' && fail "list picked up the ledger file"
 
+# 24. --source records assignment provenance on take and survives a park.
+bash "$CLAIM" take acme-sourced 4 build the widget --source "QA hand-off run r123" >/dev/null
+jq -e '.source == "QA hand-off run r123"' "$CLAIMS_DIR/acme-sourced.json" >/dev/null \
+  || fail "take --source not recorded"
+bash "$CLAIM" park acme-sourced half built, needs owner >/dev/null
+jq -e '.source == "QA hand-off run r123" and .status == "parked"' \
+  "$CLAIMS_DIR/acme-sourced.json" >/dev/null || fail "park dropped the source"
+
+# 25. park --source sets provenance when advertising fresh work.
+bash "$CLAIM" park acme-advertised needs an owner from the start --source "operator, #build" >/dev/null
+jq -e '.source == "operator, #build"' "$CLAIMS_DIR/acme-advertised.json" >/dev/null \
+  || fail "park --source not recorded"
+
 echo "all claim.sh tests passed"

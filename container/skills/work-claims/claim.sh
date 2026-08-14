@@ -23,8 +23,8 @@ usage() {
   cat >&2 <<'USAGE'
 usage:
   claim.sh check   <slug>
-  claim.sh take    <slug> <ttl_hours> <note...>   [--takeover]
-  claim.sh park    <slug> <note...>
+  claim.sh take    <slug> <ttl_hours> <note...>   [--takeover] [--source <where this came from>]
+  claim.sh park    <slug> <note...>               [--source <where this came from>]
   claim.sh release <slug> [--merged-pr <n>]
   claim.sh list
 
@@ -119,9 +119,13 @@ cmd_take() {
   local slug="${1:-}" ttl="${2:-}"; shift 2 2>/dev/null || usage
   [ -n "$slug" ] && [ -n "$ttl" ] || usage
 
-  local takeover=0 note_parts=()
-  for a in "$@"; do
-    if [ "$a" = "--takeover" ]; then takeover=1; else note_parts+=("$a"); fi
+  local takeover=0 source="" note_parts=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --takeover) takeover=1; shift ;;
+      --source)   source="${2:-}"; shift 2 ;;
+      *)          note_parts+=("$1"); shift ;;
+    esac
   done
   local note="${note_parts[*]:-}"
   [ -n "$note" ] || die "a note is required — say what you are taking and why"
@@ -146,12 +150,16 @@ cmd_take() {
   tmp="$(mktemp "$CLAIMS_DIR/.tmp.XXXXXX")"
   # thread_id is omitted rather than written empty — a channel-level session
   # has no thread, and an empty string would render as a broken link.
+  # source = where the assignment came from ("QA hand-off run X", "the
+  # operator, in the build channel"). Adopted from the field agents kept adding by hand — the
+  # one thing their improvised schema recorded that this one could not.
   jq -n --arg owner "$(me)" --arg sid "$(hostname)" \
         --arg tid "${NANOCLAW_THREAD_ID:-}" \
         --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --argjson ttl "$ttl" --arg note "$note" \
+        --argjson ttl "$ttl" --arg note "$note" --arg source "$source" \
      '{owner:$owner, session_id:$sid, claimed_at:$at, ttl_hours:$ttl, note:$note}
-      + (if $tid == "" then {} else {thread_id:$tid} end)' > "$tmp"
+      + (if $tid == "" then {} else {thread_id:$tid} end)
+      + (if $source == "" then {} else {source:$source} end)' > "$tmp"
   mv "$tmp" "$f"   # same-directory rename: no reader ever sees a partial file
 
   echo "claimed $slug for $(me), ttl ${ttl}h"
@@ -206,7 +214,14 @@ cmd_release() {
 cmd_park() {
   local slug="${1:-}"; shift || usage
   [ -n "$slug" ] || usage
-  local note="$*"
+  local source="" note_parts=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source) source="${2:-}"; shift 2 ;;
+      *)        note_parts+=("$1"); shift ;;
+    esac
+  done
+  local note="${note_parts[*]:-}"
   [ -n "$note" ] || die "a note is required — say what state the work is in and what's needed"
 
   require_workgroup
@@ -228,6 +243,7 @@ cmd_park() {
     claimed_at="$(jq -r '.claimed_at // empty' "$f")"
     ttl_hours="$(jq -r '.ttl_hours // empty' "$f")"
     thread_id="$(jq -r '.thread_id // empty' "$f")"
+    [ -n "$source" ] || source="$(jq -r '.source // empty' "$f")"
   else
     claimed_at="" ttl_hours="" thread_id=""
   fi
@@ -240,11 +256,12 @@ cmd_park() {
   jq -n --arg owner "$owner_out" --arg sid "$(hostname)" \
         --arg tid "$thread_id" --arg claimed_at "$claimed_at" \
         --arg parked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        --argjson ttl "${ttl_hours:-null}" --arg note "$note" \
+        --argjson ttl "${ttl_hours:-null}" --arg note "$note" --arg source "$source" \
      '{owner:$owner, session_id:$sid, claimed_at:$claimed_at, status:"parked",
        parked_at:$parked_at, note:$note}
       + (if $ttl == null then {} else {ttl_hours:$ttl} end)
-      + (if $tid == "" then {} else {thread_id:$tid} end)' > "$tmp"
+      + (if $tid == "" then {} else {thread_id:$tid} end)
+      + (if $source == "" then {} else {source:$source} end)' > "$tmp"
 
   ledger_append parked "$slug" "$owner_out" "$note" "$claimed_at" "$thread_id" ""
   mv "$tmp" "$f"   # same-directory rename: no reader ever sees a partial file
