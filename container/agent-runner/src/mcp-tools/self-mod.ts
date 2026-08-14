@@ -125,14 +125,26 @@ export const addMcpServer: McpToolDefinition = {
   },
 };
 
+export function unavailableModelInventory(provider: string) {
+  if (provider === 'opencode') return null;
+  return ok(
+    `This is a ${provider} session. \`list_models\` inventories OpenCode slugs only and is not a ${provider} model catalog. ` +
+      'For an authorized request to change this channel default, call `set_channel_model` directly; the host validates the provider-specific model.',
+  );
+}
+
 export const listModels: McpToolDefinition = {
   tool: {
     name: 'list_models',
     description:
-      "REQUIRED whenever the user asks anything about available models, model options, what you can switch to, what models are available, what your provider supports, or similar — you MUST call this tool first and report its result, NOT speculate from training data. Returns every model reachable from this container's auth.json + env (asking OpenCode itself), grouped by upstream provider prefix (opencode-go/*, opencode/*, nvidia/*, etc.), minus any slugs the operator has put on the deny list. Training-data lists of models are not authoritative; this tool is. Also call this before invoking change_model to validate any slug the user proposes. Read-only, no approval needed.",
+      "OpenCode-only model inventory for the session-scoped `change_model` tool. It returns OpenCode slugs reachable from this container's auth.json + env, grouped by upstream provider prefix (opencode-go/*, opencode/*, nvidia/*, etc.), minus any operator-denied slugs. Do NOT use it to validate or reject a channel-default request (`set_channel_model`): that host-side tool is provider-aware and must be called directly for an authorized request. Read-only, no approval needed.",
     inputSchema: { type: 'object' as const, properties: {} },
   },
   async handler() {
+    const provider = getConfig().provider;
+    const unavailable = unavailableModelInventory(provider);
+    if (unavailable) return unavailable;
+
     // Live source of truth: `opencode models` enumerates every reachable
     // model given the container's auth.json + env. We then subtract the
     // operator-curated deny list (central.db: denied_models).
@@ -287,4 +299,11 @@ export const changeModel: McpToolDefinition = {
   },
 };
 
-registerTools([installPackages, addMcpServer, listModels, changeModel]);
+// `list_models` shells out to OpenCode and therefore cannot describe a Codex
+// or Claude catalog. Register the shared tools at import time, then let the
+// MCP barrel add that provider-specific tool after it has loaded config.
+registerTools([installPackages, addMcpServer, changeModel]);
+
+export function registerProviderSpecificSelfModTools(provider: string = getConfig().provider): void {
+  if (provider === 'opencode') registerTools([listModels]);
+}

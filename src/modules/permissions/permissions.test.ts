@@ -6,6 +6,7 @@
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 
 import type { ChannelAdapter, OutboundMessage } from '../../channels/adapter.js';
+import { registerSlackBot } from '../../channels/slack-mentions.js';
 import {
   initChannelAdapters,
   registerChannelAdapter,
@@ -177,6 +178,33 @@ describe('isSiblingBotSender', () => {
 });
 
 describe('role helpers', () => {
+  it('honors an owner role from a same-workspace Slack sibling adapter only', () => {
+    const baseUser = 'slack-authz-base:UOWNER';
+    const siblingUser = 'slack-authz-codex:UOWNER';
+    const otherWorkspaceUser = 'slack-authz-other:UOWNER';
+    const baseIdentity = { userId: 'UBOTBASE', username: 'base', teamId: 'T-AUTHZ-A' };
+    const siblingIdentity = { userId: 'UBOTCODEX', username: 'codex', teamId: 'T-AUTHZ-A' };
+    const otherIdentity = { userId: 'UBOTOTHER', username: 'other', teamId: 'T-AUTHZ-B' };
+
+    seedUser(baseUser, 'slack-authz-base');
+    seedUser(siblingUser, 'slack-authz-codex');
+    seedUser(otherWorkspaceUser, 'slack-authz-other');
+    grantRole({ user_id: baseUser, role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
+
+    registerSlackBot('slack-authz-base', baseIdentity);
+    registerSlackBot('slack-authz-codex', siblingIdentity);
+    registerSlackBot('slack-authz-other', otherIdentity);
+    try {
+      expect(isOwner(siblingUser)).toBe(true);
+      expect(isOwner(otherWorkspaceUser)).toBe(false);
+    } finally {
+      // The Slack registry is process-global. Keep later tests isolated.
+      registerSlackBot('slack-authz-base', { ...baseIdentity, teamId: '__cleared__' });
+      registerSlackBot('slack-authz-codex', { ...siblingIdentity, teamId: '__cleared__' });
+      registerSlackBot('slack-authz-other', { ...otherIdentity, teamId: '__cleared__' });
+    }
+  });
+
   it('rejects owner rows with a scope', () => {
     seedUser('u-1', 'telegram');
     expect(() =>

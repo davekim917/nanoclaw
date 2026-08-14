@@ -12,6 +12,7 @@
  * own test goes red.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import fs from 'node:fs';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
 import { getPendingMessages, markScriptSkipped } from '../db/messages-in.js';
@@ -20,20 +21,47 @@ import { applyPreTaskScripts } from './task-script.js';
 // Point the pre-task classifier at the real shared destructive core (same
 // module the interactive Bash gate uses). In a container this lives at
 // /workspace/plugins/...; on the host test runner it's the bootstrap checkout.
-const REAL_CORE =
-  '/home/ubuntu/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
+const REAL_CORE = '/home/ubuntu/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
 const savedCore = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+const savedHostDataDir = process.env.NANOCLAW_HOST_DATA_DIR;
+const savedHostTopicWorktreesDir = process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR;
+const markerPaths = new Set<string>();
 
 beforeEach(() => {
   process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = REAL_CORE;
+  process.env.NANOCLAW_HOST_DATA_DIR = '/srv/nanoclaw/data';
+  process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR = '/srv/nanoclaw/data/topic-worktrees';
   initTestSessionDb();
 });
 
 afterEach(() => {
   if (savedCore === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
   else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = savedCore;
+  if (savedHostDataDir === undefined) delete process.env.NANOCLAW_HOST_DATA_DIR;
+  else process.env.NANOCLAW_HOST_DATA_DIR = savedHostDataDir;
+  if (savedHostTopicWorktreesDir === undefined) delete process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR;
+  else process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR = savedHostTopicWorktreesDir;
+  for (const markerPath of markerPaths) {
+    try {
+      fs.unlinkSync(markerPath);
+    } catch {
+      // Missing means the guarded script did not execute, which is expected.
+    }
+  }
+  markerPaths.clear();
   closeSessionDb();
 });
+
+function freshMarker(name: string): string {
+  const markerPath = `/tmp/nanoclaw-task-script-${process.pid}-${name}`;
+  try {
+    fs.unlinkSync(markerPath);
+  } catch {
+    // Already absent.
+  }
+  markerPaths.add(markerPath);
+  return markerPath;
+}
 
 function insertTask(id: string, script: string) {
   getInboundDb()
@@ -45,8 +73,11 @@ function insertTask(id: string, script: string) {
 }
 
 const ackStatus = (id: string): string | undefined =>
-  (getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as { status: string } | undefined)
-    ?.status;
+  (
+    getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+      | { status: string }
+      | undefined
+  )?.status;
 
 describe('script-skip ack chain (container leg)', () => {
   it('an erroring script skips with reason "error" and acks script-skip:error', async () => {
@@ -154,5 +185,47 @@ describe('pre-task script destructive-classifier gate (P1 leg 2)', () => {
       delete process.env.ANTHROPIC_API_KEY;
       delete process.env.TASK_SCRIPT_KEEP;
     }
+  });
+});
+
+describe('pre-task managed Git guard', () => {
+  it('blocks managed worktree maintenance before any script side effect', async () => {
+    const marker = freshMarker('worktree-prune');
+    insertTask(
+      't-managed-worktree-prune',
+      `git --git-dir="$NANOCLAW_HOST_DATA_DIR/repositories/wg/repo/.git" worktree prune\ntouch ${marker}\necho '{"wakeAgent": true}'`,
+    );
+
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(keep).toHaveLength(0);
+    expect(skipped).toEqual([{ id: 't-managed-worktree-prune', reason: 'blocked' }]);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('blocks managed Git object maintenance before any script side effect', async () => {
+    const marker = freshMarker('git-gc');
+    insertTask(
+      't-managed-git-gc',
+      `git -C "$NANOCLAW_HOST_DATA_DIR/repositories/wg/repo" gc\ntouch ${marker}\necho '{"wakeAgent": true}'`,
+    );
+
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(keep).toHaveLength(0);
+    expect(skipped).toEqual([{ id: 't-managed-git-gc', reason: 'blocked' }]);
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it('still executes an ordinary safe script when managed Git paths are configured', async () => {
+    const marker = freshMarker('safe-command');
+    insertTask('t-managed-safe', `touch ${marker}\necho '{"wakeAgent": true, "data": {"safe": true}}'`);
+
+    const { keep, skipped } = await applyPreTaskScripts(getPendingMessages());
+
+    expect(skipped).toHaveLength(0);
+    expect(keep).toHaveLength(1);
+    expect(JSON.parse(keep[0]!.content).scriptOutput).toEqual({ safe: true });
+    expect(fs.existsSync(marker)).toBe(true);
   });
 });

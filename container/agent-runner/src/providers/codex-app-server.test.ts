@@ -149,6 +149,38 @@ describe('buildCodexHooksJson', () => {
     const data = buildCodexHooksJson();
     expect(data.hooks.PostToolUse[0].hooks[0].timeout).toBe(30);
   });
+
+  it('writes to an explicit codexHome before environment fallbacks', () => {
+    const previousHome = process.env.HOME;
+    const previousCodexHome = process.env.CODEX_HOME;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-hooks-home-'));
+    const explicitHome = path.join(root, 'explicit');
+    const environmentHome = path.join(root, 'environment');
+    const home = path.join(root, 'home');
+    try {
+      process.env.HOME = home;
+      process.env.CODEX_HOME = environmentHome;
+
+      writeCodexHooksJson({ codexHome: explicitHome, emailGateTimeoutSec: 7200 });
+
+      const hooks = JSON.parse(fs.readFileSync(path.join(explicitHome, 'hooks.json'), 'utf-8')) as {
+        hooks: { PreToolUse: Array<{ hooks: Array<{ command: string; timeout: number }> }> };
+      };
+      expect(hooks.hooks.PreToolUse[0].hooks[0]).toEqual({
+        type: 'command',
+        command: 'bun /app/src/codex-hooks/cli.ts PreToolUse',
+        timeout: 7200,
+      });
+      expect(fs.existsSync(path.join(environmentHome, 'hooks.json'))).toBe(false);
+      expect(fs.existsSync(path.join(home, '.codex', 'hooks.json'))).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('createCodexConfigOverrides', () => {
@@ -174,14 +206,12 @@ describe('createCodexConfigOverrides', () => {
     expect(createCodexConfigOverrides()).toContain('features.fast_mode=true');
   });
 
-  it('always raises project_doc_max_bytes above Codex\'s 32KB default', () => {
+  it("always raises project_doc_max_bytes above Codex's 32KB default", () => {
     // 32KB default (`project_doc_max_bytes`) truncated whole behavioral
     // sections of the group AGENTS.md silently. Tripwire: this must not
     // regress back to Codex's default on a future refactor.
     expect(createCodexConfigOverrides()).toContain('project_doc_max_bytes=262144');
-    expect(createCodexConfigOverrides({ reasoning_effort: 'xhigh' })).toContain(
-      'project_doc_max_bytes=262144',
-    );
+    expect(createCodexConfigOverrides({ reasoning_effort: 'xhigh' })).toContain('project_doc_max_bytes=262144');
     expect(createCodexConfigOverrides(undefined, true)).toContain('project_doc_max_bytes=262144');
   });
 

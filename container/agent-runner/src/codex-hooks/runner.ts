@@ -21,7 +21,6 @@ import {
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
   createBlockGitCloneHook,
-  createBlockSnapshotMutationHook,
   createEmailGateHook,
 } from '../providers/claude.js';
 import {
@@ -29,6 +28,7 @@ import {
   createMemoryCaptureWebFetchHook,
   createMemoryCaptureMcpHook,
 } from '../mcp-tools/memory-capture.js';
+import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
 
 /**
  * Codex shell-tool aliases. Normalized to Claude's `Bash` so existing hooks
@@ -89,9 +89,16 @@ export type HookEvent = 'PreToolUse' | 'PostToolUse' | 'PostToolUseFailure';
 // The equivalent HOST codex adapter is workflow-agents/hooks/codex-guard.ts
 // (wired via ~/.codex/hooks.json, which fires in interactive codex).
 type GuardCore = {
-  evaluateBashCommand: (cmd: string, opts?: { skipGate?: boolean }) => { action: 'allow' | 'block' | 'gate'; reason?: string };
+  evaluateBashCommand: (
+    cmd: string,
+    opts?: { skipGate?: boolean },
+  ) => { action: 'allow' | 'block' | 'gate'; reason?: string };
   consumeGateApproval: (cmd: string) => boolean;
-  runNanoclawGate: (cmd: string, reason: string, onStageError?: (e: unknown) => void) => 'approved' | 'denied' | 'timeout';
+  runNanoclawGate: (
+    cmd: string,
+    reason: string,
+    onStageError?: (e: unknown) => void,
+  ) => 'approved' | 'denied' | 'timeout';
   IS_NANOCLAW: boolean;
 };
 
@@ -165,9 +172,7 @@ function denyDecision(reason: string): {
 /** Evaluate a bash command against the shared core; return a deny decision to
  *  block, or null to allow. Mirrors the control flow of block-destructive.ts /
  *  opencode-guard.ts / codex-guard.ts (each a thin adapter over the same core). */
-async function runDestructiveGuard(
-  command: string,
-): Promise<ReturnType<typeof denyDecision> | null> {
+async function runDestructiveGuard(command: string): Promise<ReturnType<typeof denyDecision> | null> {
   if (!command) return null;
   const loaded = await loadGuardCore();
   // Fail-CLOSED (D17/C4): a missing or malformed core denies, it does NOT allow.
@@ -213,7 +218,8 @@ async function runDestructiveGuard(
     // Anything else falls through to real gate staging (fail-closed). (codex #126 N1)
     if (core.consumeGateApproval(command) === true) {
       const post = core.evaluateBashCommand(command, { skipGate: true });
-      if (!wellFormedVerdict(post)) return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
+      if (!wellFormedVerdict(post))
+        return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
       // Only an explicit `allow` passes. A repeated `gate` (a stale/malformed core
       // that ignored skipGate) must NOT become an allow — deny it. (codex #126 N2)
       return post.action === 'allow' ? null : denyDecision(post.reason ?? reason);
@@ -226,7 +232,8 @@ async function runDestructiveGuard(
       if (!staged) return denyDecision(`${reason} — could not stage approval request (session DBs unavailable).`);
       if (decision === 'approved') {
         const post = core.evaluateBashCommand(command, { skipGate: true });
-        if (!wellFormedVerdict(post)) return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
+        if (!wellFormedVerdict(post))
+          return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
         // Only an explicit `allow` passes — a repeated `gate` after approval (stale
         // core ignoring skipGate) must deny, not fall through to allow. (codex #126 N2)
         return post.action === 'allow' ? null : denyDecision(post.reason ?? reason);
@@ -394,10 +401,10 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
   // also get the unset prefix stripped from logs); then the guardrails.
   const chain: HookCallback[] = [
     createSanitizeBashHook(),
+    createManagedGitMaintenanceHook(),
     createSelfApprovalBlockHook(),
     createBlockSnowflakeConnectorHook(),
     createBlockGitCloneHook(),
-    createBlockSnapshotMutationHook(),
     createEmailGateHook(),
   ];
   let currentInput: CodexHookInput = normalized;
@@ -437,7 +444,10 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
       return ret;
     }
     if (ret.hookSpecificOutput?.updatedInput) {
-      mergedUpdatedInput = { ...(mergedUpdatedInput ?? currentInput.tool_input), ...ret.hookSpecificOutput.updatedInput };
+      mergedUpdatedInput = {
+        ...(mergedUpdatedInput ?? currentInput.tool_input),
+        ...ret.hookSpecificOutput.updatedInput,
+      };
       currentInput = { ...currentInput, tool_input: mergedUpdatedInput };
     }
   }

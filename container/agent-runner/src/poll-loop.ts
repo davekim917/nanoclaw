@@ -5,8 +5,10 @@ import { randomUUID } from 'node:crypto';
 import { findByName, findByRouting, findPeerName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
+  getActiveRepositoryMountBarrier,
   getMessageIn,
   markProcessing,
+  releaseProcessingClaims,
   markCompleted,
   markScriptSkipped,
   retainCompleteRecallUnits,
@@ -42,6 +44,7 @@ import {
   getStickyFast,
   setStickyFast,
   shouldPostInfraWarning,
+  acknowledgeRepositoryMountBarrier,
 } from './db/session-state.js';
 import { clearBatchAnchors, getBatchAnchor, setCurrentBatchAnchors } from './current-batch.js';
 import {
@@ -179,9 +182,19 @@ function isProviderQuotaExhausted(err: unknown): boolean {
  * genuine bug that breaks both providers still surfaces — one turn later,
  * having been tried on two runtimes instead of one.
  */
-function reportProviderUnavailable(providerName: string, message: string, recognizedQuota: boolean): boolean {
-  const fallbackProvider = getConfig().providerFallback?.provider;
+function reportProviderUnavailable(providerName: string | null, message: string, recognizedQuota: boolean): boolean {
+  let runnerConfig: ReturnType<typeof getConfig>;
+  try {
+    runnerConfig = getConfig();
+  } catch {
+    // The production runner always loads config before polling. Keeping this
+    // best-effort outage path non-throwing preserves visible errors for tests
+    // and any future caller that invokes the event handler before bootstrap.
+    return false;
+  }
+  const fallbackProvider = runnerConfig.providerFallback?.provider;
   if (!fallbackProvider) return false;
+  const activeProvider = providerName ?? runnerConfig.provider;
   // Already running AS the fallback (the host set the spawn override) and the
   // fallback is spent too: there is nowhere left to route. Still record the
   // outage, but let the error reach the user — silently respawning here would
@@ -195,7 +208,7 @@ function reportProviderUnavailable(providerName: string, message: string, recogn
       kind: 'system',
       content: JSON.stringify({
         action: 'provider_unavailable',
-        provider: providerName,
+        provider: activeProvider,
         classification: recognizedQuota ? 'quota' : 'unavailable',
         message: message.slice(0, 500),
         fallbackProvider,
@@ -203,7 +216,7 @@ function reportProviderUnavailable(providerName: string, message: string, recogn
     });
     const suppress = !alreadyOnFallback;
     log(
-      `Provider ${providerName} unusable (${recognizedQuota ? 'quota' : 'unrecovered failure'}); ` +
+      `Provider ${activeProvider} unusable (${recognizedQuota ? 'quota' : 'unrecovered failure'}); ` +
         `reported for fallback to ${fallbackProvider}${suppress ? ' — suppressing the chat error' : ''}`,
     );
     return suppress;
@@ -289,6 +302,18 @@ async function checkpointTurnEnd(autosaveWorktrees: (reason: string) => Promise<
 }
 
 /**
+ * Stop outer-loop admission at a container-visible repository mount barrier.
+ * The acknowledgement is written only from this provider-idle boundary; the
+ * host never treats the active-query observer below as drained.
+ */
+export function repositoryMountBarrierBlocksPoll(): boolean {
+  const epoch = getActiveRepositoryMountBarrier();
+  if (epoch === null) return false;
+  acknowledgeRepositoryMountBarrier(epoch);
+  return true;
+}
+
+/**
  * Main poll loop. Runs indefinitely until the process is killed.
  *
  * 1. Poll messages_in for pending rows
@@ -339,6 +364,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   let isFirstPoll = true;
   while (true) {
     if (config.signal?.aborted) return;
+    if (repositoryMountBarrierBlocksPoll()) {
+      await sleep(POLL_INTERVAL_MS, config.signal);
+      continue;
+    }
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question).
     // Exception: recall_context system messages must reach the prompt path so the agent sees recalled facts.
     // isFirstPoll → getPendingMessages so on_wake rows only fire on the fresh container's first poll.
@@ -367,8 +396,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     if (!hasTriggeringMessage) {
       const pending = getWorkContinuation();
       if (pending && !idleSuppressedContinuationIds.has(pending.id) && isWorkContinuationRunnable(pending, runnerId)) {
+        // A fence can commit after the first outer-loop check and while the
+        // pending batch is being read. Do not turn durable queued work into a
+        // running provider turn once repository admission is closed.
+        if (repositoryMountBarrierBlocksPoll()) continue;
         const runningWork = markWorkContinuationRunning(pending.id, runnerId);
         if (runningWork) {
+          if (repositoryMountBarrierBlocksPoll()) {
+            requeueWorkContinuationIfMatches(runningWork.id, runnerId);
+            continue;
+          }
           const sourceMessage = runningWork.source_message_id ? getMessageIn(runningWork.source_message_id) : undefined;
           const sourceBatch = sourceMessage ? [sourceMessage] : [];
           const routing = extractRouting(sourceBatch);
@@ -555,6 +592,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     // Claim only the rows that will actually reach the prompt.
+    // The barrier may have committed while scripts/settings were awaited.
+    // Re-check at the final admission seam and acknowledge from this still-
+    // provider-idle boundary rather than creating a new processing claim.
+    if (repositoryMountBarrierBlocksPoll()) continue;
     const keptIds = keep.map((m) => m.id);
     markProcessing(keptIds);
     if (hasRealInbound(keep)) {
@@ -621,6 +662,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // must stay claimed-but-unfinished so the respawned container answers
     // them. Marking them completed would leave the reader with silence.
     let deferredToFallback = false;
+    let deferredForRepositoryBarrier = false;
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
@@ -661,6 +703,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (pausedWork?.phase === 'queued') idleSuppressedContinuationIds.add(pausedWork.id);
 
       let recovered = false;
+      const repositoryRecoveryAllowed = (): boolean => {
+        if (deferredForRepositoryBarrier) return false;
+        const epoch = getActiveRepositoryMountBarrier();
+        if (epoch === null) return true;
+        deferredForRepositoryBarrier = true;
+        log(`Repository mount barrier ${epoch} suppressed in-turn provider recovery; requeueing the admitted batch`);
+        return false;
+      };
+
+      // Close the no-await seam immediately after processQuery returns. Each
+      // retry branch re-checks at its own final query-admission point, which is
+      // required for the backoff branches that may sleep while a fence lands.
+      repositoryRecoveryAllowed();
 
       // Transient server-overload recovery: the provider's runtime hit a
       // 429/529 ("temporarily limiting requests · not your usage limit"),
@@ -672,7 +727,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // growing jittered sleep. Touch the heartbeat across each sleep so the
       // host sweep doesn't kill the container as stale while we wait.
       const transient = config.provider.isTransientOverload?.(err) ?? false;
-      if (transient) {
+      if (transient && repositoryRecoveryAllowed()) {
         for (let attempt = 0; attempt < TRANSIENT_OVERLOAD_MAX_TRIES && !recovered; attempt++) {
           const sleepMs = transientOverloadDelayMs(attempt);
           log(
@@ -686,6 +741,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             clearInterval(beat);
           }
           touchHeartbeat();
+          if (!repositoryRecoveryAllowed()) break;
           try {
             const retryQuery = config.provider.query({
               prompt,
@@ -746,7 +802,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // linear backoff; heartbeat touched across the sleep so host-sweep
       // doesn't reap the container mid-retry.
       const codexIdle = !recovered && err instanceof ProviderEventError && err.classification === 'idle_timeout';
-      if (codexIdle) {
+      if (codexIdle && repositoryRecoveryAllowed()) {
         for (let attempt = 0; attempt < CODEX_IDLE_RETRY_MAX && !recovered; attempt++) {
           const sleepMs = CODEX_IDLE_RETRY_BASE_MS * (attempt + 1);
           log(`Codex idle-timeout — retry ${attempt + 1}/${CODEX_IDLE_RETRY_MAX} in ${sleepMs}ms`);
@@ -757,6 +813,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             clearInterval(beat);
           }
           touchHeartbeat();
+          if (!repositoryRecoveryAllowed()) break;
           try {
             const retryQuery = config.provider.query({
               prompt,
@@ -823,9 +880,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // contains "Rate limited"), but rotation is the wrong cure — it was
       // already handled by the backoff loop above. Exclude it here.
       let rotation =
-        !transient && !recovered && config.provider.isRetryable?.(err) ? config.provider.rotateApiKey?.() : undefined;
+        !transient && !recovered && repositoryRecoveryAllowed() && config.provider.isRetryable?.(err)
+          ? config.provider.rotateApiKey?.()
+          : undefined;
       while (rotation?.rotated && !recovered) {
         log(`Upstream transient error — rotated credential, retrying same prompt in-turn`);
+        if (!repositoryRecoveryAllowed()) break;
         try {
           const retryQuery = config.provider.query({
             prompt,
@@ -882,7 +942,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // Recap from the per-session DB tells the agent what was just
       // discussed so it doesn't lose the thread. The marker is for the
       // case where there's no recap (no completed messages yet).
-      if (!recovered && continuation && config.provider.isContextTooLong?.(err)) {
+      if (!recovered && repositoryRecoveryAllowed() && continuation && config.provider.isContextTooLong?.(err)) {
         log(`Context-too-long detected — clearing session and retrying once with fresh continuation`);
         continuation = undefined;
         resetProviderContext(config.providerName);
@@ -932,7 +992,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           continuation = undefined;
           clearContinuation(config.providerName);
         }
-      } else if (!recovered && continuation && config.provider.isSessionInvalid(err)) {
+      } else if (!recovered && repositoryRecoveryAllowed() && continuation && config.provider.isSessionInvalid(err)) {
         // Stale/corrupt continuation — most often a transcript .jsonl
         // that got pruned out from under us, or a session id that was
         // valid in a prior container but doesn't exist in this one's
@@ -997,7 +1057,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // resumes the same dead thread and posts the same warning every 15 min.
       // Clear once and retry fresh with a recap, mirroring stale-session
       // recovery. If the fresh thread also fails, surface that final error.
-      if (!recovered && continuation && isProviderSystemError(err)) {
+      if (!recovered && repositoryRecoveryAllowed() && continuation && isProviderSystemError(err)) {
         log(`Provider system_error (${continuation}) - clearing session and retrying with recap`);
         continuation = undefined;
         resetProviderContext(config.providerName);
@@ -1061,8 +1121,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // app-server, a dead credential. Record it either way so the next spawn
       // routes to the fallback; only a recognized quota also silences the
       // chat error.
+      if (deferredForRepositoryBarrier) releaseProcessingClaims(processingIds);
       const quotaHandled =
         !recovered &&
+        !deferredForRepositoryBarrier &&
         reportProviderUnavailable(
           config.providerName,
           err instanceof Error ? err.message : String(err),
@@ -1071,7 +1133,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       deferredToFallback = quotaHandled;
 
       // Only surface the error to the user if we couldn't recover inline.
-      if (!recovered && !quotaHandled) {
+      if (!recovered && !quotaHandled && !deferredForRepositoryBarrier) {
         // Deliberately un-gated: an unclassified error can be a real bug, not
         // a flapping provider, and shouldn't be silently swallowed by dedupe.
         const providerEventErr = err instanceof ProviderEventError && err.retryable === false;
@@ -1107,11 +1169,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     emitTurnEnd();
 
-    // Per-turn safety net: checkpoint any uncommitted worktree edits so the
-    // agent's work survives compaction or a later container kill even if
-    // the agent forgot to commit. Mirrors v1's turn-end auto-commit pattern
-    // (src/container-runner.ts cleanupThreadWorkspace, pre-fork). Never
-    // throws; logs inside autoCommitDirtyWorktrees.
+    // Compatibility callback is intentionally non-mutating in production.
+    // Sibling agents share this topic checkout, so turn-end code must never
+    // stage, commit, reset, or remove another sibling's live index lock.
     await checkpointTurnEnd(autosaveWorktrees);
 
     // Ensure completed even if processQuery ended without a result event
@@ -1119,7 +1179,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // to the fallback provider: those rows keep their 'processing' claim,
     // which the next container's clearStaleProcessingAcks() releases, so the
     // fallback answers the message the primary could not.
-    if (deferredToFallback) {
+    if (deferredForRepositoryBarrier) {
+      log(`Deferred ${processingIds.length} message(s) until the repository mount barrier is released`);
+    } else if (deferredToFallback) {
       log(`Deferred ${processingIds.length} message(s) to the fallback provider — not marking completed`);
     } else {
       markCompleted(processingIds);
@@ -1350,10 +1412,16 @@ export async function processQuery(
     // is otherwise empty. This lets an explicit user stop cancel the record
     // before its prompt is ever pushed.
     if (archivePrompts.length > 0) return;
+    if (getActiveRepositoryMountBarrier() !== null) return;
     const queued = getWorkContinuation();
     if (!queued || !isWorkContinuationRunnable(queued, runnerId)) return;
     const running = markWorkContinuationRunning(queued.id, runnerId);
     if (!running) return;
+    if (getActiveRepositoryMountBarrier() !== null) {
+      requeueWorkContinuationIfMatches(running.id, runnerId);
+      query.end();
+      return;
+    }
     const prompt = buildWorkContinuationPrompt(running.task);
     log(`Starting durable continuation: ${running.task.slice(0, 120)}`);
     query.push(prompt);
@@ -1381,6 +1449,16 @@ export async function processQuery(
 
     void (async () => {
       try {
+        const repositoryBarrier = getActiveRepositoryMountBarrier();
+        if (repositoryBarrier !== null) {
+          // Stop accepting follow-ups and let the current provider turn/tool
+          // finish. The outer loop acknowledges only after processQuery has
+          // returned, which proves this active query is fully drained.
+          log(`Repository mount barrier ${repositoryBarrier} observed — ending active query after current work`);
+          endedForCommand = true;
+          query.end();
+          return;
+        }
         const allPending = getPendingMessages();
 
         // Slash commands need a fresh query: /clear resets the SDK's
@@ -1505,6 +1583,13 @@ export async function processQuery(
         }
 
         const keptIds = keep.map((m) => m.id);
+        const lateRepositoryBarrier = getActiveRepositoryMountBarrier();
+        if (lateRepositoryBarrier !== null) {
+          log(`Repository mount barrier ${lateRepositoryBarrier} committed before follow-up claim — ending query`);
+          endedForCommand = true;
+          query.end();
+          return;
+        }
         markProcessing(keptIds);
         if (hasRealInbound(keep)) resetWorkContinuationForRealInbound();
         if (skipped.length > 0) {
@@ -1790,7 +1875,7 @@ export function handleEvent(event: ProviderEvent, routing: RoutingContext): void
       // instead of shown: the session respawns on the fallback provider.
       // See the thrown-error sibling branch for the same decision.
       if (event.retryable === false && event.classification === 'quota') {
-        if (reportProviderUnavailable(getConfig().provider, event.message, true)) break;
+        if (reportProviderUnavailable(null, event.message, true)) break;
       }
       if (event.retryable === false) {
         // `log()` above already covers unconditional logging for this

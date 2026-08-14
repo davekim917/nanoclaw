@@ -38,7 +38,7 @@ import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { tomlBasicString } from './providers/codex-app-server.js';
+import { tomlBasicString, writeCodexHooksJson } from './providers/codex-app-server.js';
 import {
   type AgentRuntime,
   discoverPortableSkills,
@@ -164,7 +164,10 @@ function parseTomlString(raw: string): string {
 
 function parseTomlInlineStringMap(raw: string): Record<string, string> {
   const map: Record<string, string> = {};
-  const body = raw.trim().replace(/^\{\s*/, '').replace(/\s*\}$/, '');
+  const body = raw
+    .trim()
+    .replace(/^\{\s*/, '')
+    .replace(/\s*\}$/, '');
   for (const part of splitTomlArray(body)) {
     const m = part.match(/^("((?:[^"\\]|\\.)*)"|[A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.+)$/);
     if (!m) continue;
@@ -363,6 +366,17 @@ export function setupCodexRuntime(
     return null;
   }
 
+  // Peer-mode `codex exec` reads this synthesized CODEX_HOME directly. Its
+  // commands do not pass back through the parent Claude/OpenCode Bash hook, so
+  // install the same in-tree PreToolUse chain used by the Codex provider before
+  // exposing the runtime. Fail closed if the guard wiring cannot be persisted.
+  try {
+    writeCodexHooksJson({ codexHome: RUNTIME_CODEX_DIR });
+  } catch (err) {
+    log(`Failed to write peer Codex hooks.json: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+
   // Container-owned plugin registration: build the runtime's own plugin
   // cache from /workspace/plugins rather than inheriting the host's. Must
   // run AFTER config.toml is written (registration mutates config.toml
@@ -413,9 +427,7 @@ export function setupCodexPrimaryRuntime(
       );
 
       const fallbackConfigPath = path.join(fallbackHome, 'config.toml');
-      const fallbackConfig = fs.existsSync(fallbackConfigPath)
-        ? fs.readFileSync(fallbackConfigPath, 'utf-8')
-        : '';
+      const fallbackConfig = fs.existsSync(fallbackConfigPath) ? fs.readFileSync(fallbackConfigPath, 'utf-8') : '';
       fs.writeFileSync(fallbackConfigPath, projectCodexPluginConfig(primaryConfig, fallbackConfig));
       projectedFallbacks.push(fallbackHome);
     } catch (err) {

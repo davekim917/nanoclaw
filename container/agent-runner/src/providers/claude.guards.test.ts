@@ -7,7 +7,6 @@ import {
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
   createBlockGitCloneHook,
-  createBlockSnapshotMutationHook,
   createBlockCodexCompanionHook,
   createEmailGateHook,
 } from './claude.js';
@@ -28,7 +27,10 @@ const EMPTY_CTX = {} as Parameters<HookCallback>[1];
 const EMPTY_OPTS = {} as Parameters<HookCallback>[2];
 
 /** Drive a PreToolUse hook with a Bash command and return its decision shape. */
-async function runBashHook(hook: HookCallback, command: string): Promise<{
+async function runBashHook(
+  hook: HookCallback,
+  command: string,
+): Promise<{
   permissionDecision?: string;
   permissionDecisionReason?: string;
   raw: unknown;
@@ -37,7 +39,11 @@ async function runBashHook(hook: HookCallback, command: string): Promise<{
   const out = await hook(input as Parameters<HookCallback>[0], EMPTY_CTX, EMPTY_OPTS);
   const hso = (out as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } })
     ?.hookSpecificOutput;
-  return { permissionDecision: hso?.permissionDecision, permissionDecisionReason: hso?.permissionDecisionReason, raw: out };
+  return {
+    permissionDecision: hso?.permissionDecision,
+    permissionDecisionReason: hso?.permissionDecisionReason,
+    raw: out,
+  };
 }
 
 // ── E1: createSelfApprovalBlockHook delegates to the core ──
@@ -123,20 +129,14 @@ describe('E2 createBlockSnowflakeConnectorHook', () => {
   it('test_claude_snowflake_fallback_when_core_absent', async () => {
     process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/guard-core.ts';
     // Inline fallback blocks the python snowflake.connector form.
-    const r = await runBashHook(
-      createBlockSnowflakeConnectorHook(),
-      'python -c "import snowflake.connector"',
-    );
+    const r = await runBashHook(createBlockSnowflakeConnectorHook(), 'python -c "import snowflake.connector"');
     expect(r.permissionDecision).toBe('deny');
     expect(r.permissionDecisionReason).toContain('snowflake.connector');
   });
 
   it('falls back (fail-closed) when the core evaluator throws', async () => {
     process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = THROWING_CORE;
-    const r = await runBashHook(
-      createBlockSnowflakeConnectorHook(),
-      'python3 -c "import snowflake.connector"',
-    );
+    const r = await runBashHook(createBlockSnowflakeConnectorHook(), 'python3 -c "import snowflake.connector"');
     expect(r.permissionDecision).toBe('deny');
   });
 
@@ -209,7 +209,10 @@ describe('E3 createEmailGateHook', () => {
     process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
-    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
+    const r = await runBashHook(
+      createEmailGateHook(),
+      'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com',
+    );
     // Approved → hook allows. The staged card carries the CORE's label/summary,
     // proving the verdict came from the core (not the inline fallback, which
     // would render a real "*To:* person8@fixture1.example.com" envelope rather than the stub text).
@@ -226,7 +229,10 @@ describe('E3 createEmailGateHook', () => {
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     // Admin DECLINES → the async round-trip resolves to failed → hook denies.
     ackToReturn = { status: 'failed', error: 'admin declined' };
-    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
+    const r = await runBashHook(
+      createEmailGateHook(),
+      'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com',
+    );
     // Round-trip preserved: staged a request_bash_gate AND awaited its ack keyed
     // on the same requestId (proving writeMessageOut → awaitDeliveryAck plumbing).
     const card = gateCard();
@@ -241,7 +247,10 @@ describe('E3 createEmailGateHook', () => {
     process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = { status: 'delivered' };
-    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
+    const r = await runBashHook(
+      createEmailGateHook(),
+      'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com',
+    );
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
   });
@@ -250,7 +259,10 @@ describe('E3 createEmailGateHook', () => {
     process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     ackToReturn = null; // awaitDeliveryAck timed out
-    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
+    const r = await runBashHook(
+      createEmailGateHook(),
+      'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com',
+    );
     expect(r.permissionDecision).toBe('deny');
     expect(r.permissionDecisionReason).toContain('timed out');
   });
@@ -258,7 +270,10 @@ describe('E3 createEmailGateHook', () => {
   it('scheduled tasks bypass the gate (verdict allow, no staging)', async () => {
     process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_STUB_CORE;
     process.env.NANOCLAW_IS_SCHEDULED_TASK = '1';
-    const r = await runBashHook(createEmailGateHook(), 'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com');
+    const r = await runBashHook(
+      createEmailGateHook(),
+      'gws gmail +send STUB_EMAIL_GATE --to person8@fixture1.example.com',
+    );
     expect(r.permissionDecision).toBeUndefined();
     expect(gateCard()).toBeUndefined(); // nothing staged
     expect(ackedRequestId).toBeNull(); // and no ack round-trip
@@ -477,7 +492,7 @@ describe('E3 createEmailGateHook', () => {
     expect(r.permissionDecision).toBeUndefined();
   });
 
-  it('inline fallback: a real --dry-run with ANSI-C $\'…\' body still bypasses (QA codex re-pass #4)', async () => {
+  it("inline fallback: a real --dry-run with ANSI-C $'…' body still bypasses (QA codex re-pass #4)", async () => {
     process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts';
     delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
     const r = await runBashHook(
@@ -620,10 +635,7 @@ describe('E6 claude dispatch — each guard', () => {
     // Each guard must fall back to its inline policy and still BLOCK the marker.
     const selfApproval = await runBashHook(createSelfApprovalBlockHook(), 'touch .claude-destructive-gate');
     expect(selfApproval.permissionDecision).toBe('deny');
-    const snowflake = await runBashHook(
-      createBlockSnowflakeConnectorHook(),
-      'python -c "import snowflake.connector"',
-    );
+    const snowflake = await runBashHook(createBlockSnowflakeConnectorHook(), 'python -c "import snowflake.connector"');
     expect(snowflake.permissionDecision).toBe('deny');
     const gitClone = await runBashHook(
       createBlockGitCloneHook(),
@@ -664,13 +676,8 @@ describe('createBlockCodexCompanionHook', () => {
 describe('createSanitizeBashHook codex exec stdin fix', () => {
   async function sanitize(command: string): Promise<string | undefined> {
     const input = { tool_name: 'Bash', tool_input: { command } } as unknown as PreToolUseHookInput;
-    const out = await createSanitizeBashHook()(
-      input as Parameters<HookCallback>[0],
-      EMPTY_CTX,
-      EMPTY_OPTS,
-    );
-    const hso = (out as { hookSpecificOutput?: { updatedInput?: { command?: string } } })
-      ?.hookSpecificOutput;
+    const out = await createSanitizeBashHook()(input as Parameters<HookCallback>[0], EMPTY_CTX, EMPTY_OPTS);
+    const hso = (out as { hookSpecificOutput?: { updatedInput?: { command?: string } } })?.hookSpecificOutput;
     return hso?.updatedInput?.command;
   }
 
@@ -695,65 +702,6 @@ describe('createSanitizeBashHook codex exec stdin fix', () => {
   it('does not wrap non-codex commands', async () => {
     const out = await sanitize('ls -la /workspace');
     expect(out ?? 'ls -la /workspace').not.toContain('</dev/null');
-  });
-});
-
-describe('createBlockSnapshotMutationHook (inline fallback — no core mounted)', () => {
-  const saved = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-  beforeEach(() => {
-    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/core.ts';
-  });
-  afterEach(() => {
-    if (saved !== undefined) process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = saved;
-    else delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
-  });
-
-  it('blocks a checkout aimed at a snapshot path', async () => {
-    const r = await runBashHook(
-      createBlockSnapshotMutationHook(),
-      'cd /workspace/workgroup/REPO-A && git checkout TICKET-1-fix',
-    );
-    expect(r.permissionDecision).toBe('deny');
-    expect(r.permissionDecisionReason).toContain('read-only snapshot');
-  });
-
-  it('blocks git -C mutations in a snapshot', async () => {
-    const r = await runBashHook(createBlockSnapshotMutationHook(), 'git -C /workspace/workgroup/REPO-B commit -am wip');
-    expect(r.permissionDecision).toBe('deny');
-  });
-
-  it('allows read-only git in a snapshot', async () => {
-    const r = await runBashHook(createBlockSnapshotMutationHook(), 'git -C /workspace/workgroup/REPO-B log --oneline -5');
-    expect(r.permissionDecision).toBeUndefined();
-  });
-
-  it('allows mutations in thread worktrees and .worktrees checkouts', async () => {
-    for (const cmd of [
-      'git -C /workspace/worktrees/XZO commit -am wip',
-      'git -C /workspace/workgroup/.worktrees/XZO-pr213-review commit -am wip',
-    ]) {
-      const r = await runBashHook(createBlockSnapshotMutationHook(), cmd);
-      expect(r.permissionDecision).toBeUndefined();
-    }
-  });
-
-  it('does not false-positive on mutation verbs in ARGUMENTS of read-only commands', async () => {
-    const r = await runBashHook(
-      createBlockSnapshotMutationHook(),
-      'git -C /workspace/workgroup/REPO-B log --grep commit --oneline',
-    );
-    expect(r.permissionDecision).toBeUndefined();
-  });
-
-  it('blocks ref surgery aimed at the mirror and rescue namespaces', async () => {
-    for (const cmd of [
-      'git -C /workspace/workgroup/.repos/XZO.git update-ref refs/heads/main deadbeef',
-      'git -C /workspace/workgroup/.repos/XZO.git branch -D some-branch',
-      'cd /workspace/workgroup/.rescues/2026 && git reset --hard HEAD~1',
-    ]) {
-      const r = await runBashHook(createBlockSnapshotMutationHook(), cmd);
-      expect(r.permissionDecision).toBe('deny');
-    }
   });
 });
 

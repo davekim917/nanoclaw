@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const TEST_ROOT = '/tmp/nanoclaw-provider-surfaces-test';
@@ -269,6 +270,79 @@ describe('initGroupFilesystem legacy seed isolation', () => {
 });
 
 describe('buildMounts agent surfaces', () => {
+  it('canonical-working-tree-is-not-container-accessible', () => {
+    const workgroupId = 'wg-repositories';
+    const ag = group('ag-repositories', 'repositories-agent');
+    createAgentGroup(ag);
+    assignWorkgroup(ag, workgroupId);
+    ensureContainerConfig(ag.id);
+    initGroupFilesystem({ ...ag, workgroup_id: workgroupId }, { provider: 'claude' });
+
+    const canonical = path.join(DATA_DIR, 'repositories', workgroupId, 'proj');
+    fs.mkdirSync(canonical, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: canonical });
+    const state = path.join(DATA_DIR, 'repository-state', workgroupId, 'proj');
+    fs.mkdirSync(state, { recursive: true });
+    fs.writeFileSync(
+      path.join(state, 'origin.json'),
+      JSON.stringify({ origin: 'https://github.com/acme/proj.git', repositoryId: 'github.com/acme/proj' }),
+    );
+
+    const siblingA = {
+      ...session('s-repo-a', ag.id),
+      messaging_group_id: 'mg-shared',
+      thread_id: 'slack:C1:171234.567',
+    } as Session;
+    const siblingB = {
+      ...session('s-repo-b', ag.id),
+      messaging_group_id: 'mg-shared',
+      thread_id: 'slack:C1:171234.567',
+    } as Session;
+    const otherTopic = {
+      ...session('s-repo-other', ag.id),
+      messaging_group_id: 'mg-shared',
+      thread_id: 'slack:C1:999999.000',
+    } as Session;
+
+    const a = buildMounts(ag, siblingA, containerConfig(), 'claude', {}, workgroupId);
+    const b = buildMounts(ag, siblingB, containerConfig(), 'claude', {}, workgroupId);
+    const other = buildMounts(ag, otherTopic, containerConfig(), 'claude', {}, workgroupId);
+    const stableA = a.find((mount) => mount.containerPath === '/workspace/worktrees');
+    const stableB = b.find((mount) => mount.containerPath === '/workspace/worktrees');
+    const stableOther = other.find((mount) => mount.containerPath === '/workspace/worktrees');
+
+    expect(stableA?.hostPath).toBe(stableB?.hostPath);
+    expect(stableOther?.hostPath).not.toBe(stableA?.hostPath);
+    expect(a).toContainEqual({ hostPath: stableA?.hostPath, containerPath: stableA?.hostPath, readonly: false });
+    expect(a).toContainEqual({
+      hostPath: path.join(canonical, '.git'),
+      containerPath: path.join(canonical, '.git'),
+      readonly: false,
+    });
+    expect(a).toContainEqual({
+      hostPath: path.join(canonical, '.git', 'HEAD'),
+      containerPath: path.join(canonical, '.git', 'HEAD'),
+      readonly: true,
+    });
+    expect(a).toContainEqual({
+      hostPath: path.join(state, 'canonical-index-unavailable'),
+      containerPath: path.join(canonical, '.git', 'index'),
+      readonly: true,
+    });
+    const commonMount = a.findIndex((mount) => mount.containerPath === path.join(canonical, '.git'));
+    const headOverlay = a.findIndex((mount) => mount.containerPath === path.join(canonical, '.git', 'HEAD'));
+    const indexOverlay = a.findIndex((mount) => mount.containerPath === path.join(canonical, '.git', 'index'));
+    expect(headOverlay).toBeGreaterThan(commonMount);
+    expect(indexOverlay).toBeGreaterThan(commonMount);
+    expect(a).toContainEqual({
+      hostPath: path.join(state, 'repository.lock'),
+      containerPath: path.join(state, 'repository.lock'),
+      readonly: false,
+    });
+    expect(a.some((mount) => mount.hostPath === canonical || mount.containerPath === canonical)).toBe(false);
+    expect(fs.lstatSync(path.join(state, 'repository.lock')).isFile()).toBe(true);
+  });
+
   it('uses the OpenCode Go Qwen 3.8 Max default at high effort when no DB override exists', () => {
     const ag = group('ag-opencode-defaults', 'opencode-defaults');
     createAgentGroup(ag);
@@ -544,7 +618,7 @@ describe('worker agent def sync (orchestrator roster)', () => {
     buildMounts(ag, session('s-wd', ag.id), containerConfig(), 'claude', {});
 
     // Trunk roster copied byte-for-byte.
-    for (const def of ['worker.md', 'worker-opus.md', 'worker-codex.md']) {
+    for (const def of ['worker-fast.md', 'worker.md', 'worker-high.md', 'worker-codex.md']) {
       expect(fs.readFileSync(path.join(agentsDir, def), 'utf-8')).toBe(
         fs.readFileSync(path.join(process.cwd(), 'container', 'agents', def), 'utf-8'),
       );
@@ -554,7 +628,7 @@ describe('worker agent def sync (orchestrator roster)', () => {
     // Regression guard for the 1M-window fix (F4): opus worker must carry [1m],
     // not a bare id that collapses to 200k under proxy auth. Reverting to
     // `model: opus` or bare `claude-opus-5` fails here.
-    expect(fs.readFileSync(path.join(agentsDir, 'worker-opus.md'), 'utf-8')).toContain('model: claude-opus-5[1m]');
+    expect(fs.readFileSync(path.join(agentsDir, 'worker-high.md'), 'utf-8')).toContain('model: claude-opus-5[1m]');
     const codexWorker = fs.readFileSync(path.join(agentsDir, 'worker-codex.md'), 'utf-8');
     expect(codexWorker).toContain('Always run Codex in the foreground');
     expect(codexWorker).toContain('`timeout` to `3600000`');
@@ -615,8 +689,8 @@ describe('worker agent def sync (orchestrator roster)', () => {
   });
 });
 
-describe('RO snapshot mounts for migrated repos', () => {
-  it('mounts each mirror-backed snapshot read-only when the workgroup tree is mounted', () => {
+describe('retired mirror snapshot topology', () => {
+  it('does not expose old mirror-backed snapshots as repository canonicals', () => {
     const ag = group('ag-snap', 'snap-group');
     createAgentGroup(ag);
     assignWorkgroup(ag, 'wg-snap');
@@ -635,8 +709,7 @@ describe('RO snapshot mounts for migrated repos', () => {
 
     const mounts = buildMounts(ag, session('s-snap', ag.id), containerConfig(), 'claude', {}, 'wg-snap');
     const snap = mounts.find((m) => m.containerPath === '/workspace/workgroup/proj');
-    expect(snap).toBeDefined();
-    expect(snap!.readonly).toBe(true);
+    expect(snap).toBeUndefined();
     expect(mounts.find((m) => m.containerPath === '/workspace/workgroup/pending')).toBeUndefined();
   });
 });

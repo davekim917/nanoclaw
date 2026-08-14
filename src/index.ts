@@ -432,8 +432,8 @@ export async function main(): Promise<void> {
   startWorktreeCleanup();
   log.info('Worktree cleanup started');
 
-  // 7b. Repo freshness worker: fetch workgroup bare mirrors + advance the
-  // read-only browsing snapshots (10min, first run 90s after startup).
+  // 7b. Local-only canonical recovery: advance clean host working trees from
+  // refs already fetched by scoped containers (10min, first run 90s).
   startRepoFreshness();
   log.info('Repo freshness worker started');
 

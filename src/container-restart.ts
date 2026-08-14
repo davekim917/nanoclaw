@@ -4,11 +4,245 @@
  * Writes an on_wake message to each session, kills the container, then
  * wakes a fresh container via the onExit callback — race-free.
  */
-import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
-import { countDueMessages } from './db/session-db.js';
+import { isContainerRunning, isContainerSpawning, killContainer, wakeContainer } from './container-runner.js';
+import { randomUUID } from 'crypto';
+import {
+  activateRepoIngressFence,
+  countDueMessages,
+  getContainerState,
+  getProcessingClaims,
+  repoIngressFenceAckToken,
+  readRepoIngressFence,
+  readRepositoryMountBarrierAck,
+  releaseRepoIngressFence,
+} from './db/session-db.js';
 import { getSession, getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
-import { openInboundDb, writeSessionMessage } from './session-manager.js';
+import { openInboundDb, openOutboundDb, writeSessionMessage } from './session-manager.js';
+import type { Session } from './types.js';
+
+async function waitUntil(predicate: () => boolean, message: string, timeoutMs = 120_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(message);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+export interface RepositoryMountQuiescence {
+  epoch: string;
+  /** Containers stopped by this quiescence and eligible for a later wake. */
+  sessions: Session[];
+  /** Every session DB fenced against concurrent ingress until release. */
+  barrierSessions: Session[];
+  /** Exact fresh/adopted activation token expected from each running session. */
+  barrierAcks: Record<string, string>;
+  barrierGenerations: Record<string, string>;
+}
+
+export class RepositoryMountQuiescenceError extends Error {
+  readonly quiescence: RepositoryMountQuiescence;
+  readonly releaseWakeSessions: Session[];
+  readonly barriersReleased: boolean;
+
+  constructor(
+    cause: unknown,
+    quiescence: RepositoryMountQuiescence,
+    releaseWakeSessions: Session[],
+    barriersReleased: boolean,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = 'RepositoryMountQuiescenceError';
+    this.quiescence = quiescence;
+    this.releaseWakeSessions = releaseWakeSessions;
+    this.barriersReleased = barriersReleased;
+  }
+}
+
+function uniqueSessions(sessions: Session[]): Session[] {
+  return [...new Map(sessions.map((session) => [session.id, session])).values()];
+}
+
+function activateRepositoryMountBarriers(
+  sessions: Session[],
+  epoch: string,
+): { barrierAcks: Record<string, string>; barrierGenerations: Record<string, string> } {
+  const activated: Session[] = [];
+  const barrierAcks: Record<string, string> = {};
+  const barrierGenerations: Record<string, string> = {};
+  try {
+    for (const session of sessions) {
+      const inDb = openInboundDb(session.agent_group_id, session.id);
+      try {
+        const prior = readRepoIngressFence(inDb);
+        const active = activateRepoIngressFence(inDb, epoch);
+        barrierAcks[session.id] = repoIngressFenceAckToken(active);
+        barrierGenerations[session.id] = active.generation;
+        // A replay may be adopting a crash-left active barrier with this exact
+        // deterministic epoch. It did not create that barrier and therefore
+        // must never roll it back if a later session activation fails.
+        if (prior?.state !== 'active' || prior.epoch !== epoch) activated.push(session);
+      } finally {
+        inDb.close();
+      }
+    }
+  } catch (error) {
+    // No topology mutation has happened yet. Restore every DB fenced by this
+    // attempt so an activation failure cannot strand unrelated inbound work.
+    const releaseErrors: unknown[] = [];
+    for (const session of activated.reverse()) {
+      try {
+        const inDb = openInboundDb(session.agent_group_id, session.id);
+        try {
+          const generation = barrierGenerations[session.id];
+          if (!generation) {
+            throw new Error(`repository mount barrier generation missing for session ${session.id}`, { cause: error });
+          }
+          releaseRepoIngressFence(inDb, epoch, generation);
+        } finally {
+          inDb.close();
+        }
+      } catch (releaseError) {
+        releaseErrors.push(releaseError);
+      }
+    }
+    if (releaseErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...releaseErrors],
+        `repository mount barrier ${epoch} activation failed and could not be fully rolled back`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  return { barrierAcks, barrierGenerations };
+}
+
+function sessionReachedRepositoryBarrier(session: Session, expectedAck: string): boolean {
+  if (!isContainerRunning(session.id) && !isContainerSpawning(session.id)) return true;
+  try {
+    const outDb = openOutboundDb(session.agent_group_id, session.id);
+    try {
+      return (
+        readRepositoryMountBarrierAck(outDb) === expectedAck &&
+        getProcessingClaims(outDb).length === 0 &&
+        !getContainerState(outDb)?.current_tool
+      );
+    } finally {
+      outDb.close();
+    }
+  } catch {
+    // Unknown acknowledgement or work state is never safe to stop.
+    return false;
+  }
+}
+
+/**
+ * Release the exact durable ingress epoch after the mount transition and its
+ * on-wake confirmation are committed. Idempotent for an already-released
+ * matching epoch; any different/missing state fails closed.
+ */
+export function releaseRepositoryMountQuiescence(quiescence: RepositoryMountQuiescence): Session[] {
+  const wakeRequired: Session[] = [];
+  for (const session of quiescence.barrierSessions) {
+    const inDb = openInboundDb(session.agent_group_id, session.id);
+    try {
+      const generation = quiescence.barrierGenerations[session.id];
+      if (!generation) throw new Error(`repository mount barrier generation missing for session ${session.id}`);
+      const result = releaseRepoIngressFence(inDb, quiescence.epoch, generation);
+      if (!result.released) {
+        const current = readRepoIngressFence(inDb);
+        if (
+          !current ||
+          current.epoch !== quiescence.epoch ||
+          current.generation !== generation ||
+          current.state !== 'released'
+        ) {
+          throw new Error(`repository mount barrier state changed for session ${session.id}`);
+        }
+      }
+      // Recompute from durable state even on an idempotent replay. This closes
+      // the crash-after-release-before-wake boundary for both rows tagged by
+      // this epoch and ordinary due rows that predated the fence.
+      if (countDueMessages(inDb) > 0) wakeRequired.push(session);
+    } finally {
+      inDb.close();
+    }
+  }
+  return wakeRequired;
+}
+
+/**
+ * Called while a workgroup-wide repository mount claim blocks new spawns.
+ * It catches spawns already past the claim check, then stops every affected
+ * running container and returns the exact sessions to wake after claim release.
+ */
+export async function quiesceAgentGroupsForRepositoryMounts(
+  agentGroupIds: string[],
+  epoch: string = `repository-mount-${randomUUID()}`,
+): Promise<RepositoryMountQuiescence> {
+  const sessions = agentGroupIds.flatMap((id) => getSessionsByAgentGroup(id));
+  return quiesceSessionsForRepositoryMounts(sessions, epoch);
+}
+
+/** Stop the running subset of an exact topic/session set while its lifecycle claim is held. */
+export async function quiesceSessionsForRepositoryMounts(
+  sessions: Session[],
+  epoch: string = `repository-mount-${randomUUID()}`,
+  timeoutMs = 120_000,
+): Promise<RepositoryMountQuiescence> {
+  if (!epoch) throw new Error('repository mount barrier epoch must not be empty');
+  const barrierSessions = uniqueSessions(sessions);
+  // Runtime process maps are authoritative. A stale inactive DB row can still
+  // own a live RW mount and must not escape quiescence.
+  const affected = barrierSessions.filter(
+    (session) => isContainerRunning(session.id) || isContainerSpawning(session.id),
+  );
+  const { barrierAcks, barrierGenerations } = activateRepositoryMountBarriers(barrierSessions, epoch);
+  const quiescence = { epoch, sessions: affected, barrierSessions, barrierAcks, barrierGenerations };
+  try {
+    await waitUntil(
+      () => affected.every((session) => !isContainerSpawning(session.id)),
+      'timed out waiting for in-progress container spawns before repository mount reconciliation',
+      timeoutMs,
+    );
+    await waitUntil(
+      () => affected.every((session) => sessionReachedRepositoryBarrier(session, barrierAcks[session.id]!)),
+      'timed out waiting for container poll admission and active repository work to drain',
+      timeoutMs,
+    );
+    for (const session of affected) {
+      if (isContainerRunning(session.id)) killContainer(session.id, 'repository mount set changed');
+    }
+    await waitUntil(
+      () => affected.every((session) => !isContainerRunning(session.id)),
+      'timed out stopping containers for repository mount reconciliation',
+      timeoutMs,
+    );
+    return quiescence;
+  } catch (error) {
+    try {
+      const releaseWakeSessions = releaseRepositoryMountQuiescence(quiescence);
+      throw new RepositoryMountQuiescenceError(error, quiescence, releaseWakeSessions, true);
+    } catch (releaseError) {
+      if (releaseError instanceof RepositoryMountQuiescenceError) throw releaseError;
+      throw new RepositoryMountQuiescenceError(
+        new AggregateError(
+          [error, releaseError],
+          'repository quiescence failed and its ingress barrier could not be released',
+        ),
+        quiescence,
+        [],
+        false,
+      );
+    }
+    throw error;
+  }
+}
+
+export function wakeRepositoryMountSessions(sessions: Session[]): void {
+  for (const session of sessions) wakeContainer(session);
+}
 
 /**
  * Kill all running containers for an agent group and respawn them.
@@ -19,7 +253,12 @@ import { openInboundDb, writeSessionMessage } from './session-manager.js';
  * wakeContainer call on exit. Without it, containers are killed and
  * only come back on the next real user message.
  */
-export function restartAgentGroupContainers(agentGroupId: string, reason: string, wakeMessage?: string): number {
+export function restartAgentGroupContainers(
+  agentGroupId: string,
+  reason: string,
+  wakeMessage?: string,
+  options: { respawnAll?: boolean } = {},
+): number {
   const sessions = getSessionsByAgentGroup(agentGroupId).filter(
     (s) => s.status === 'active' && isContainerRunning(s.id),
   );
@@ -46,7 +285,7 @@ export function restartAgentGroupContainers(agentGroupId: string, reason: string
     // claimed. Without this, a provider switch mid-conversation leaves the
     // claimed messages dark until the next inbound or a slow sweep backoff.
     const inDb = openInboundDb(session.agent_group_id, session.id);
-    let hasPending = false;
+    let hasPending: boolean;
     try {
       hasPending = countDueMessages(inDb) > 0;
     } finally {
@@ -57,7 +296,7 @@ export function restartAgentGroupContainers(agentGroupId: string, reason: string
     killContainer(
       session.id,
       reason,
-      wakeMessage || hasPending
+      wakeMessage || hasPending || options.respawnAll
         ? () => {
             const s = getSession(session.id);
             if (s) wakeContainer(s);

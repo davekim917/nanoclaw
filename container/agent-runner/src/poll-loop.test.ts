@@ -26,6 +26,8 @@ import {
   isAupRefusal,
   isCorruptionError,
   processQuery,
+  repositoryMountBarrierBlocksPoll,
+  runPollLoop,
   retainCompleteRecallPairs,
   selectInTurnFollowUps,
   transientOverloadDelayMs,
@@ -37,6 +39,7 @@ import {
   queueWorkContinuation,
 } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
+import { postToolUseHook, preToolUseHook } from './providers/claude.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
 beforeEach(() => {
@@ -74,6 +77,154 @@ describe('container startup recovery', () => {
       current_tool: null,
     });
   });
+});
+
+describe('repository mount poll and tool admission barrier', () => {
+  const activateBarrier = (epoch: string): void => {
+    getInboundDb()
+      .prepare("INSERT INTO repo_ingress_fence (id, epoch, generation, state) VALUES (1, ?, ?, 'active')")
+      .run(epoch, `generation-${epoch}`);
+  };
+
+  it('hides inbound inserted after activation and acknowledges only from the provider-idle poll boundary', () => {
+    activateBarrier('repository-publish:req-1');
+    insertMessage('late-after-fence', 'chat', { sender: 'Operator', text: 'must wait' });
+
+    expect(getPendingMessages()).toEqual([]);
+    expect(
+      getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'repository_mount_barrier_ack'").get(),
+    ).toBe(null);
+    expect(repositoryMountBarrierBlocksPoll()).toBe(true);
+    expect(
+      getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'repository_mount_barrier_ack'").get(),
+    ).toEqual({
+      value: JSON.stringify(['repository-publish:req-1', 'generation-repository-publish:req-1']),
+    });
+    expect(getOutboundDb().prepare('SELECT COUNT(*) AS count FROM processing_ack').get()).toEqual({ count: 0 });
+  });
+
+  it('drains an already-open query without claiming late inbound and acknowledges only after it returns', async () => {
+    let finishTurn!: () => void;
+    const turnFinished = new Promise<void>((resolve) => {
+      finishTurn = resolve;
+    });
+    let confirmEndRequested!: () => void;
+    const endRequested = new Promise<void>((resolve) => {
+      confirmEndRequested = resolve;
+    });
+    let endCalls = 0;
+    let pushCalls = 0;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'active-before-fence' };
+      await turnFinished;
+    }
+    const query: AgentQuery = {
+      push: () => {
+        pushCalls += 1;
+      },
+      end: () => {
+        endCalls += 1;
+        confirmEndRequested();
+      },
+      abort: finishTurn,
+      events: events(),
+    };
+    const activeQuery = processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'already running', undefined, {});
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    activateBarrier('repository-transfer:req-2');
+    insertMessage('late-while-active', 'chat', { sender: 'Operator', text: 'must not start' });
+    // A tool belonging to the already-admitted turn remains allowed to finish;
+    // query.end is graceful admission close, not an abort or a provider hook
+    // denial. The host cannot observe an idle ACK while this query/tool lives.
+    const admittedTool = (await preToolUseHook(
+      { tool_name: 'Bash', tool_input: { command: 'echo admitted-before-fence', timeout: 30_000 } } as never,
+      {} as never,
+      {} as never,
+    )) as { continue?: boolean; decision?: string };
+    expect(admittedTool).toEqual({ continue: true });
+    await endRequested;
+    expect(getOutboundDb().prepare('SELECT current_tool FROM container_state WHERE id = 1').get()).toEqual({
+      current_tool: 'Bash',
+    });
+    expect(
+      getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'repository_mount_barrier_ack'").get(),
+    ).toBe(null);
+    await postToolUseHook({} as never, {} as never, {} as never);
+    finishTurn();
+
+    await activeQuery;
+    expect(endCalls).toBe(1);
+    expect(pushCalls).toBe(0);
+    expect(getOutboundDb().prepare('SELECT COUNT(*) AS count FROM processing_ack').get()).toEqual({ count: 0 });
+    expect(
+      getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'repository_mount_barrier_ack'").get(),
+    ).toBe(null);
+
+    // The active-query observer only drains. Exact ACK is deliberately later,
+    // after processQuery returned to this provider-idle boundary.
+    expect(repositoryMountBarrierBlocksPoll()).toBe(true);
+    expect(
+      getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'repository_mount_barrier_ack'").get(),
+    ).toEqual({
+      value: JSON.stringify(['repository-transfer:req-2', 'generation-repository-transfer:req-2']),
+    });
+  }, 5_000);
+
+  it('requeues a failed admitted batch instead of starting an in-turn recovery after the fence lands', async () => {
+    insertMessage('retry-me-after-transition', 'chat', { sender: 'Operator', text: 'preserve this request' });
+    let queryCalls = 0;
+    let rotationCalls = 0;
+    const provider = {
+      supportsNativeSlashCommands: false,
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      isRetryable: () => true,
+      rotateApiKey: () => {
+        rotationCalls += 1;
+        return { rotated: true };
+      },
+      query: () => {
+        queryCalls += 1;
+        async function* events(): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'failed-before-recovery' };
+          activateBarrier('repository-publish:req-recovery');
+          throw new Error('retryable upstream failure');
+        }
+        return { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+      },
+    };
+    const abort = new AbortController();
+    const loop = runPollLoop({
+      provider: provider as never,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: abort.signal,
+      autosaveWorktrees: async () => ({ committed: [], failed: [], skipped: [] }),
+    });
+
+    const deadline = Date.now() + 3_000;
+    while (
+      (
+        getOutboundDb().prepare("SELECT value FROM session_state WHERE key = 'repository_mount_barrier_ack'").get() as
+          | { value: string }
+          | undefined
+      )?.value !== JSON.stringify(['repository-publish:req-recovery', 'generation-repository-publish:req-recovery'])
+    ) {
+      if (Date.now() >= deadline) throw new Error('timed out waiting for repository barrier acknowledgement');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(queryCalls).toBe(1);
+    expect(rotationCalls).toBe(0);
+    expect(getOutboundDb().prepare('SELECT COUNT(*) AS count FROM processing_ack').get()).toEqual({ count: 0 });
+    expect(
+      getInboundDb().prepare('SELECT status FROM messages_in WHERE id = ?').get('retry-me-after-transition'),
+    ).toEqual({
+      status: 'pending',
+    });
+    abort.abort();
+    await loop;
+  }, 5_000);
 });
 
 describe('formatter', () => {
@@ -188,7 +339,11 @@ describe('chat budget from task content', () => {
     expect(first).toBeGreaterThan(0);
     expect(chatBudgetExhausted()).toBe(true);
 
-    const second = writeMessageOut({ id: 'b-post-2', kind: 'chat', content: JSON.stringify({ text: 'follow-up summary' }) });
+    const second = writeMessageOut({
+      id: 'b-post-2',
+      kind: 'chat',
+      content: JSON.stringify({ text: 'follow-up summary' }),
+    });
     expect(second).toBe(-1);
 
     const edit = writeMessageOut({

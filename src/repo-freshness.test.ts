@@ -9,8 +9,9 @@ vi.mock('./log.js', async (importOriginal) => ({
   log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
 }));
 
-import { discoverMirrors, refreshOne, runFreshnessOnce } from './repo-freshness.js';
+import { discoverCanonicalRefreshTargets, refreshOne, runFreshnessOnce } from './repo-freshness.js';
 import { log } from './log.js';
+import { canonicalRepoDir, writeOriginPin } from './repository-workspaces.js';
 
 const git = (cwd: string, args: string[]) =>
   execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...args], { cwd, stdio: 'pipe' })
@@ -19,104 +20,83 @@ const git = (cwd: string, args: string[]) =>
 
 let root: string;
 
-/** remote (bare, seeded) + mirror under <root>/<wg>/.repos/<name>.git */
-function fixture(wg: string, name: string): { remote: string; mirror: string; snapshot: string } {
-  const remote = path.join(root, 'remotes', `${name}.git`);
-  const work = path.join(root, 'remotes', `${name}-work`);
-  fs.mkdirSync(work, { recursive: true });
-  git(work, ['init', '-q', '-b', 'main']);
-  fs.writeFileSync(path.join(work, 'README.md'), 'hello\n');
-  git(work, ['add', '-A']);
-  git(work, ['commit', '-q', '-m', 'init']);
-  execFileSync('git', ['clone', '-q', '--bare', work, remote], { stdio: 'pipe' });
-  fs.rmSync(work, { recursive: true, force: true });
-
-  const mirror = path.join(root, wg, '.repos', `${name}.git`);
-  fs.mkdirSync(path.dirname(mirror), { recursive: true });
-  execFileSync('git', ['clone', '-q', '--bare', remote, mirror], { stdio: 'pipe' });
-  execFileSync('git', ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*'], { cwd: mirror, stdio: 'pipe' });
-  return { remote, mirror, snapshot: path.join(root, wg, name) };
-}
-
-function advanceRemote(remote: string, file: string): string {
-  const scratch = path.join(root, 'scratch');
-  execFileSync('git', ['clone', '-q', remote, scratch], { stdio: 'pipe' });
-  fs.writeFileSync(path.join(scratch, file), 'x\n');
-  git(scratch, ['add', '-A']);
-  git(scratch, ['commit', '-q', '-m', `add ${file}`]);
-  git(scratch, ['push', '-q', 'origin', 'main']);
-  const oid = git(scratch, ['rev-parse', 'HEAD']);
-  fs.rmSync(scratch, { recursive: true, force: true });
-  return oid;
+function fixture(workgroupId: string, repo: string): { remote: string; canonical: string } {
+  const seed = path.join(root, 'seed', workgroupId, repo);
+  fs.mkdirSync(seed, { recursive: true });
+  git(seed, ['init', '-q', '-b', 'main']);
+  fs.writeFileSync(path.join(seed, 'README.md'), 'base\n');
+  git(seed, ['add', '-A']);
+  git(seed, ['commit', '-q', '-m', 'base']);
+  const remote = path.join(root, 'remotes', workgroupId, `${repo}.git`);
+  fs.mkdirSync(path.dirname(remote), { recursive: true });
+  execFileSync('git', ['clone', '-q', '--bare', seed, remote]);
+  const canonical = canonicalRepoDir(workgroupId, repo, root);
+  fs.mkdirSync(path.dirname(canonical), { recursive: true });
+  execFileSync('git', ['clone', '-q', remote, canonical]);
+  git(canonical, ['remote', 'set-head', 'origin', '--auto']);
+  writeOriginPin(workgroupId, repo, { origin: remote, repositoryId: remote }, root);
+  return { remote, canonical };
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
-  root = fs.mkdtempSync(path.join(os.tmpdir(), 'repo-freshness-'));
-  // Fixture remotes are local paths; production pins github-only origins.
-  process.env.NANOCLAW_FRESHNESS_ALLOW_ANY_ORIGIN = '1';
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'repo-freshness-normal-'));
+  process.env.NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN = '1';
 });
 
 afterEach(() => {
-  delete process.env.NANOCLAW_FRESHNESS_ALLOW_ANY_ORIGIN;
+  delete process.env.NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN;
   fs.rmSync(root, { recursive: true, force: true });
-  fs.rmSync(`${root}.repo-pins`, { recursive: true, force: true });
 });
 
-describe('repo-freshness', () => {
-  it('discovers mirrors and creates + advances the detached snapshot to the fetched OID', async () => {
-    const { remote, snapshot } = fixture('acme', 'proj');
-    const targets = discoverMirrors(root);
-    expect(targets).toHaveLength(1);
+describe('normal canonical freshness', () => {
+  it('discovers one host-owned normal canonical per workgroup/repo and ignores old mirrors', () => {
+    fixture('wg-a', 'proj');
+    fs.mkdirSync(path.join(root, 'workgroups', 'wg-a', '.repos', 'old.git'), { recursive: true });
 
-    const first = await refreshOne(targets[0], root);
-    expect(first.fetchOk).toBe(true);
-    expect(fs.existsSync(path.join(snapshot, 'README.md'))).toBe(true);
-    // Detached — no branch to park.
-    expect(git(snapshot, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('HEAD');
-
-    const newOid = advanceRemote(remote, 'later.txt');
-    const second = await refreshOne(targets[0], root);
-    expect(second.oid).toBe(newOid);
-    expect(git(snapshot, ['rev-parse', 'HEAD'])).toBe(newOid);
-    expect(fs.existsSync(path.join(snapshot, 'later.txt'))).toBe(true);
-
-    const freshnessFile = path.join(root, 'acme', '.repos', 'proj.freshness.json');
-    const recorded = JSON.parse(fs.readFileSync(freshnessFile, 'utf-8'));
-    expect(recorded.oid).toBe(newOid);
-    expect(recorded.ref).toBe('refs/heads/main');
-    expect(recorded.fetchOk).toBe(true);
+    expect(discoverCanonicalRefreshTargets(root).map((target) => `${target.workgroupId}/${target.repo}`)).toEqual([
+      'wg-a/proj',
+    ]);
   });
 
-  it('refuses to advance a dirty snapshot and records the error loudly', async () => {
-    fixture('acme', 'proj');
-    const targets = discoverMirrors(root);
-    await refreshOne(targets[0], root);
-    const snapshot = targets[0].snapshotPath;
-    fs.writeFileSync(path.join(snapshot, 'README.md'), 'local edit\n');
-
-    const result = await refreshOne(targets[0], root);
-    expect(result.error).toBe('snapshot has local modifications');
-    expect(fs.readFileSync(path.join(snapshot, 'README.md'), 'utf-8')).toBe('local edit\n');
-    expect(log.error).toHaveBeenCalled();
-  });
-
-  it('marks fetchOk=false and screams when the remote is unreachable', async () => {
-    const { remote } = fixture('acme', 'proj');
+  it('advances from already-fetched refs after the remote is gone and records freshness', async () => {
+    const { remote, canonical } = fixture('wg-a', 'proj');
+    const scratch = path.join(root, 'scratch');
+    execFileSync('git', ['clone', '-q', remote, scratch]);
+    fs.writeFileSync(path.join(scratch, 'new.txt'), 'new\n');
+    git(scratch, ['add', '-A']);
+    git(scratch, ['commit', '-q', '-m', 'advance']);
+    git(scratch, ['push', '-q', 'origin', 'main']);
+    const oid = git(scratch, ['rev-parse', 'HEAD']);
+    git(canonical, ['fetch', 'origin']);
     fs.rmSync(remote, { recursive: true, force: true });
-    const [target] = discoverMirrors(root);
-    const result = await refreshOne(target, root);
-    expect(result.fetchOk).toBe(false);
-    expect(log.error).toHaveBeenCalled();
-    // Snapshot still materializes from the mirror's last-known state.
-    expect(fs.existsSync(path.join(target.snapshotPath, 'README.md'))).toBe(true);
+
+    const result = await refreshOne(discoverCanonicalRefreshTargets(root)[0], root);
+    expect(result.ok).toBe(true);
+    expect(result.oid).toBe(oid);
+    expect(git(canonical, ['rev-parse', 'HEAD'])).toBe(oid);
+    const state = JSON.parse(
+      fs.readFileSync(path.join(root, 'repository-state', 'wg-a', 'proj', 'refresh.json'), 'utf8'),
+    );
+    expect(state).toMatchObject({ ok: true, oid });
   });
 
-  it('runFreshnessOnce covers every workgroup mirror', async () => {
-    fixture('acme', 'proj-a');
-    fixture('bluesky', 'proj-b');
+  it('fails loudly and preserves a dirty canonical', async () => {
+    const { canonical } = fixture('wg-a', 'proj');
+    fs.writeFileSync(path.join(canonical, 'README.md'), 'ongoing host work\n');
+
+    const result = await refreshOne(discoverCanonicalRefreshTargets(root)[0], root);
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('local modifications');
+    expect(fs.readFileSync(path.join(canonical, 'README.md'), 'utf8')).toBe('ongoing host work\n');
+    expect(log.error).toHaveBeenCalled();
+  });
+
+  it('serially refreshes all discovered workgroups without host network fallback', async () => {
+    fixture('wg-a', 'one');
+    fixture('wg-b', 'two');
     await runFreshnessOnce(root);
-    expect(fs.existsSync(path.join(root, 'acme', 'proj-a', 'README.md'))).toBe(true);
-    expect(fs.existsSync(path.join(root, 'bluesky', 'proj-b', 'README.md'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'repository-state', 'wg-a', 'one', 'refresh.json'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'repository-state', 'wg-b', 'two', 'refresh.json'))).toBe(true);
   });
 });

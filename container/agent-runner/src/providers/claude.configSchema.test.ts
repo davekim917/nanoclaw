@@ -67,7 +67,9 @@ afterAll(() => {
   else process.env.CLAUDE_CONFIG_DIR = ORIGINAL_CLAUDE_CONFIG_DIR;
 });
 
-function makeClaudeProvider(options: ConstructorParameters<typeof ClaudeProvider>[0] = {}): InstanceType<typeof ClaudeProvider> {
+function makeClaudeProvider(
+  options: ConstructorParameters<typeof ClaudeProvider>[0] = {},
+): InstanceType<typeof ClaudeProvider> {
   const provider = new ClaudeProvider(options);
   provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
   return provider;
@@ -143,12 +145,11 @@ describe('Claude plugin discovery', () => {
 
       makeClaudeProvider().query({ prompt: 'hi', cwd: '/tmp', continuation: undefined });
 
-      const hooks = capturedSdkOptions?.hooks as
-        | { PreToolUse?: Array<{ hooks?: unknown[] }> }
-        | undefined;
+      const hooks = capturedSdkOptions?.hooks as { PreToolUse?: Array<{ hooks?: unknown[] }> } | undefined;
       // The native Email gate would be the seventh Bash hook (sanitize,
-      // self-approval, snowflake, git-clone, snapshot-mutation,
-      // codex-companion). Its absence makes the declared plugin the sole
+      // managed-Git maintenance, self-approval, snowflake, git-clone,
+      // codex-companion). Its absence
+      // makes the declared plugin the sole
       // owner and prevents duplicate cards.
       expect(hooks?.PreToolUse?.[0]?.hooks).toHaveLength(6);
       expect(capturedSdkOptions?.plugins).toEqual([{ type: 'local', path: workflow }]);

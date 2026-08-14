@@ -32,6 +32,7 @@ import {
   createMemoryCaptureBashHook,
   createMemoryCaptureMcpHook,
 } from '../mcp-tools/memory-capture.js';
+import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
 
 // Per D9 / D7 / A6: 5-value enum matching EffortLevel at
 // node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts:462
@@ -393,12 +394,10 @@ export function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input) => {
     const preCompact = input as PreCompactHookInput;
 
-    // Compaction is about to drop the older transcript from context, so
-    // pin any uncommitted worktree edits to git FIRST. Without this, the
-    // agent can lose its memory of having made the edits and subsequently
-    // re-do or undo work that's still in the filesystem but absent from
-    // its compacted context. Runs before transcript archiving so even a
-    // crash during the archive step keeps the safety commits.
+    // The compatibility autosave is deliberately non-mutating. Topic
+    // siblings share HEAD/index, so PreCompact must never stage or commit a
+    // sibling's partial work; the persistent dirty worktree is the recovery
+    // artifact.
     try {
       const autosave = await autoCommitDirtyWorktrees('pre-compact');
       if (autosave.committed.length > 0 || autosave.failed.length > 0) {
@@ -431,7 +430,8 @@ const OAUTH_FALLBACK_RE = /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
 // below) — when the SDK returns the Claude Max quota message as a
 // normal result text instead of throwing, we re-throw with this prefix
 // so the existing rotation+retry path picks it up.
-const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned|subscription_quota_exhausted|subscription_access_disabled/i;
+const RETRYABLE_ERROR_RE =
+  /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned|subscription_quota_exhausted|subscription_access_disabled/i;
 
 // Claude Max subscription quota exhaustion. The Agent SDK delivers this
 // as a plain result-text string rather than a thrown error or a
@@ -713,7 +713,7 @@ export function createSelfApprovalBlockHook(): HookCallback {
 // is the fail-closed fallback when the core is unavailable.
 const SNOWFLAKE_CONNECTOR_EXEC_RE = /\bpython[23]?\b.*\bsnowflake[._]connector\b/i;
 const SNOWFLAKE_CONNECTOR_BLOCK_MSG =
-  'Direct use of Python snowflake.connector is blocked. Use `snow sql` for ad-hoc queries. If `snow` isn\'t working, report the error rather than falling back to the Python connector.';
+  "Direct use of Python snowflake.connector is blocked. Use `snow sql` for ad-hoc queries. If `snow` isn't working, report the error rather than falling back to the Python connector.";
 
 export function createBlockSnowflakeConnectorHook(): HookCallback {
   return async (input) => {
@@ -898,9 +898,7 @@ export function envelopeFromJsonRaw(segment: string): {
   } catch {
     return {};
   }
-  const raw =
-    (payload as { raw?: unknown })?.raw ??
-    (payload as { message?: { raw?: unknown } })?.message?.raw;
+  const raw = (payload as { raw?: unknown })?.raw ?? (payload as { message?: { raw?: unknown } })?.message?.raw;
   if (typeof raw !== 'string') return {};
   let decoded: string;
   try {
@@ -946,8 +944,7 @@ async function loadEmailGateEvaluator(): Promise<EmailGateEvaluator | null> {
   if (_emailGateEvaluators[corePath] !== undefined) return _emailGateEvaluators[corePath]!;
   try {
     const core = (await import(corePath)) as { evaluateEmailSend?: EmailGateEvaluator };
-    _emailGateEvaluators[corePath] =
-      typeof core.evaluateEmailSend === 'function' ? core.evaluateEmailSend : null;
+    _emailGateEvaluators[corePath] = typeof core.evaluateEmailSend === 'function' ? core.evaluateEmailSend : null;
   } catch {
     _emailGateEvaluators[corePath] = null;
   }
@@ -1007,9 +1004,7 @@ function evaluateEmailSendInline(command: string, env: { isScheduledTask: boolea
   // Parse the sending identity from GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE.
   // Path convention: /home/node/.config/gws/accounts/<slug>.json.
   // The slug is the human-facing account name the user configured.
-  const credsMatch = command.match(
-    /GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=\S*?\/accounts\/([\w.-]+)\.json/,
-  );
+  const credsMatch = command.match(/GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=\S*?\/accounts\/([\w.-]+)\.json/);
   const fromAccount = credsMatch?.[1] ?? 'default';
   // Anchor to the four allowed helper verbs only — the prior `\+(\w[\w-]*)`
   // could capture spurious `+ABC` substrings from a base64 payload in the
@@ -1136,9 +1131,7 @@ export function createEmailGateHook(): HookCallback {
     if (ack.status === 'delivered') {
       return {};
     }
-    return denyBash(
-      `Email ${action} blocked: ${ack.error ?? 'admin declined'}. Do not retry — acknowledge briefly.`,
-    );
+    return denyBash(`Email ${action} blocked: ${ack.error ?? 'admin declined'}. Do not retry — acknowledge briefly.`);
   };
 }
 
@@ -1192,41 +1185,6 @@ export function createBlockGitCloneHook(): HookCallback {
     if (!GIT_CLONE_RE.test(command)) return {};
     if (MANAGED_DIR_RE.test(command)) return denyBash(GIT_CLONE_BLOCK_MSG);
     // Allow pure /tmp-only clones (tool installs, scratch builds).
-    return {};
-  };
-}
-
-// ── Snapshot git-mutation guard (repo-store rework) ──
-
-// The old canonical paths (/workspace/workgroup/<repo>) are read-only
-// browsing snapshots of origin/HEAD. The RO mount is the enforcement; this
-// hook exists so a blocked agent gets a useful message instead of EROFS.
-// Shared core owns the policy; inline fallback mirrors it fail-closed.
-const SNAPSHOT_MUTATION_RE =
-  /\bgit\b(?:\s+(?:-C|--work-tree|--git-dir)\s+\S+|\s+-c\s+\S+|\s+--\S+)*\s+(checkout|switch|commit|reset|restore|clean|merge|rebase|cherry-pick|stash|am|apply|update-ref|branch|worktree)\b/;
-const SNAPSHOT_PATH_RE = /\/workspace\/workgroup\/(?!\.worktrees\b|memory\b)/;
-const SNAPSHOT_MUTATION_BLOCK_MSG =
-  'Git working-tree mutations under /workspace/workgroup/<repo> are blocked: that path is a read-only snapshot of origin/HEAD maintained by the host. Use `create_worktree` and work in /workspace/worktrees/<repo>; shared long-lived checkouts belong under /workspace/workgroup/.worktrees/.';
-
-export function createBlockSnapshotMutationHook(): HookCallback {
-  return async (input) => {
-    const pre = input as PreToolUseHookInput;
-    const command = (pre.tool_input as { command?: string })?.command;
-    if (!command) return {};
-
-    const evaluator = await loadCoreEvaluator('evaluateSnapshotGitMutation');
-    if (evaluator) {
-      try {
-        const verdict = evaluator(command);
-        if (verdict?.action !== 'allow') return denyBash(verdict?.reason ?? SNAPSHOT_MUTATION_BLOCK_MSG);
-        return {};
-      } catch {
-        // evaluator threw — fall through to the inline fallback.
-      }
-    }
-    if (SNAPSHOT_MUTATION_RE.test(command) && SNAPSHOT_PATH_RE.test(command)) {
-      return denyBash(SNAPSHOT_MUTATION_BLOCK_MSG);
-    }
     return {};
   };
 }
@@ -1629,7 +1587,9 @@ export class ClaudeProvider implements AgentProvider {
       })
       .map(([k, v]) => ({ name: k, value: v as string }));
     if (this.fallbackKeys.length > 0) {
-      log(`Loaded ${this.fallbackKeys.length} ANTHROPIC_API_KEY fallback(s): ${this.fallbackKeys.map((k) => k.name).join(', ')}`);
+      log(
+        `Loaded ${this.fallbackKeys.length} ANTHROPIC_API_KEY fallback(s): ${this.fallbackKeys.map((k) => k.name).join(', ')}`,
+      );
     }
     this.fallbackOauth = Object.entries(this.env)
       .filter(([k, v]) => OAUTH_FALLBACK_RE.test(k) && typeof v === 'string' && v.length > 0)
@@ -1640,7 +1600,9 @@ export class ClaudeProvider implements AgentProvider {
       })
       .map(([k, v]) => ({ name: k, value: v as string }));
     if (this.fallbackOauth.length > 0) {
-      log(`Loaded ${this.fallbackOauth.length} CLAUDE_CODE_OAUTH_TOKEN fallback(s): ${this.fallbackOauth.map((k) => k.name).join(', ')}`);
+      log(
+        `Loaded ${this.fallbackOauth.length} CLAUDE_CODE_OAUTH_TOKEN fallback(s): ${this.fallbackOauth.map((k) => k.name).join(', ')}`,
+      );
     }
     // Build the circular OAuth rotation ring: primary + numbered fallbacks,
     // deduped by value so a token that appears in two slots isn't visited
@@ -1887,7 +1849,9 @@ export class ClaudeProvider implements AgentProvider {
         // blocks; default is empty-text + signature only.
         thinking: { type: 'adaptive', display: 'summarized' },
         pathToClaudeCodeExecutable: '/pnpm/claude',
-        systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
+        systemPrompt: instructions
+          ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions }
+          : undefined,
         disallowedTools: SDK_DISALLOWED_TOOLS,
         env: perQueryEnv,
         permissionMode: 'bypassPermissions',
@@ -1904,10 +1868,10 @@ export class ClaudeProvider implements AgentProvider {
               // hooks run after and return deny if they match.
               hooks: [
                 createSanitizeBashHook(),
+                createManagedGitMaintenanceHook(),
                 createSelfApprovalBlockHook(),
                 createBlockSnowflakeConnectorHook(),
                 createBlockGitCloneHook(),
-                createBlockSnapshotMutationHook(),
                 createBlockCodexCompanionHook(),
                 ...(pluginOwnsBashEmailGate ? [] : [createEmailGateHook()]),
               ],
@@ -1983,7 +1947,9 @@ export class ClaudeProvider implements AgentProvider {
           await sdkResult.applyFlagSettings({ ultracode: true });
           log('ultracode enabled for session (xhigh + standing dynamic-workflow orchestration)');
         } catch (err) {
-          log(`applyFlagSettings(ultracode) failed — continuing without: ${err instanceof Error ? err.message : String(err)}`);
+          log(
+            `applyFlagSettings(ultracode) failed — continuing without: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       }
 
@@ -2136,7 +2102,10 @@ export class ClaudeProvider implements AgentProvider {
           activeModel = newModel;
         }
         const requested =
-          s.effort ?? this.stickyConfig.effort ?? process.env.NANOCLAW_EFFORT_OVERRIDE ?? defaultEffortForModel(activeModel);
+          s.effort ??
+          this.stickyConfig.effort ??
+          process.env.NANOCLAW_EFFORT_OVERRIDE ??
+          defaultEffortForModel(activeModel);
         const clamped = clampEffortForModel(activeModel, requested);
         if (clamped === 'max') {
           // Settings.effortLevel has no 'max' — signal the poll-loop to

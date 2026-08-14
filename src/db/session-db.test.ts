@@ -13,13 +13,16 @@ import path from 'path';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 
 import {
+  activateRepoIngressFence,
   ensureSchema,
   expireStalePending,
   getDueWakePriority,
   getInboundSourceSessionId,
+  insertMessage,
   insertDeferredMessageWithContextIfNew,
   migrateMessagesInTable,
   openOutboundDb,
+  releaseRepoIngressFence,
   recoverHotJournal,
   sessionInboundHasMessage,
   syncProcessingAcks,
@@ -33,6 +36,67 @@ const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 afterEach(() => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+});
+
+describe('repository ingress fence statement-time admission', () => {
+  const message = (id: string) => ({
+    id,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: 'C-1',
+    channelType: 'slack',
+    threadId: 'T-1',
+    content: JSON.stringify({ text: id }),
+    processAfter: null,
+    recurrence: null,
+    trigger: 1 as const,
+  });
+
+  it('never strands an insert when release wins immediately before the insert statement', () => {
+    const db = new Database(':memory:');
+    db.exec(INBOUND_SCHEMA);
+    migrateMessagesInTable(db);
+    const fence = activateRepoIngressFence(db, 'repository-publish:req-race');
+    expect(releaseRepoIngressFence(db, fence.epoch, fence.generation).released).toBe(true);
+
+    insertMessage(db, message('after-release'));
+    expect(
+      db
+        .prepare('SELECT trigger, repo_fence_epoch, repo_fence_original_trigger FROM messages_in WHERE id = ?')
+        .get('after-release'),
+    ).toEqual({ trigger: 1, repo_fence_epoch: null, repo_fence_original_trigger: null });
+    db.close();
+  });
+
+  it('atomically tags an insert whose statement runs while the fence is active and restores it on release', () => {
+    const db = new Database(':memory:');
+    db.exec(INBOUND_SCHEMA);
+    migrateMessagesInTable(db);
+    const fence = activateRepoIngressFence(db, 'repository-transfer:req-active');
+
+    insertMessage(db, message('during-fence'));
+    expect(
+      db
+        .prepare('SELECT trigger, repo_fence_epoch, repo_fence_original_trigger FROM messages_in WHERE id = ?')
+        .get('during-fence'),
+    ).toEqual({
+      trigger: 0,
+      repo_fence_epoch: 'repository-transfer:req-active',
+      repo_fence_original_trigger: 1,
+    });
+
+    expect(releaseRepoIngressFence(db, fence.epoch, fence.generation)).toMatchObject({
+      released: true,
+      admittedRows: 1,
+      wakeRequired: true,
+    });
+    expect(
+      db
+        .prepare('SELECT trigger, repo_fence_epoch, repo_fence_original_trigger FROM messages_in WHERE id = ?')
+        .get('during-fence'),
+    ).toEqual({ trigger: 1, repo_fence_epoch: null, repo_fence_original_trigger: null });
+    db.close();
+  });
 });
 
 describe('insertDeferredMessageWithContextIfNew', () => {

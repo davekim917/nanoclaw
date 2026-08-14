@@ -50,7 +50,9 @@ CREATE TABLE messages_in (
   thread_id      TEXT,
   content        TEXT NOT NULL,            -- JSON; shape depends on kind
   source_session_id TEXT,                  -- agent-to-agent return path
-  on_wake        INTEGER NOT NULL DEFAULT 0 -- 1 = only deliver on container's first poll
+  on_wake        INTEGER NOT NULL DEFAULT 0, -- 1 = only deliver on container's first poll
+  repo_fence_epoch TEXT,                   -- non-NULL while held behind a repository fence
+  repo_fence_original_trigger INTEGER      -- exact trigger value restored on release
 );
 CREATE INDEX idx_messages_in_series ON messages_in(series_id);
 ```
@@ -106,6 +108,32 @@ CREATE TABLE session_routing (
 ```
 
 Written by `writeSessionRouting()` on every container wake, derived from `sessions.messaging_group_id` + `sessions.thread_id`.
+
+### 2.5 Repository ingress fence
+
+Repository publication and topic transfer can change the Git paths mounted into a container. A durable, single-row fence in `inbound.db` prevents new work from crossing that mount transition:
+
+```sql
+CREATE TABLE repo_ingress_fence (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  epoch      TEXT NOT NULL,
+  generation TEXT NOT NULL,
+  state      TEXT NOT NULL CHECK (state IN ('active', 'released'))
+);
+```
+
+`epoch` identifies the durable publication or transfer action. `generation` is fresh for each released-to-active transition; replay of an already-active matching epoch adopts its existing generation. The exact acknowledgment token is the JSON encoding of `[epoch, generation]`, so an acknowledgment from an earlier activation of the same action cannot authorize a later stop.
+
+The protocol is:
+
+1. While holding the workgroup mount claim or the source/destination topic lifecycle claims, the host activates the fence for every affected session. SQLite triggers atomically convert concurrent `messages_in` inserts or trigger promotions into inert rows: `repo_fence_epoch` is set, the original `trigger` is retained, and `trigger` becomes `0`. Host wake queries and container poll queries exclude tagged rows.
+2. The container stops new outer-poll admissions, in-query follow-up claims, durable-continuation starts, and poll-loop provider recovery/retry turns. A provider turn admitted before activation, including tools it already invokes, is allowed to finish. An active query ends gracefully without acknowledging; only the provider-idle outer poll writes the exact token to `outbound.db.session_state` under `repository_mount_barrier_ack`.
+3. The host waits for in-progress spawns to leave the spawn path. A running container is drained only when its acknowledgment matches the exact epoch and generation, `processing_ack` has no `processing` row, and `container_state.current_tool` is empty. It then kills the container and proves the process exited. A new spawn also reads the durable fence and refuses to construct mounts while it is active.
+4. The host performs the topology mutation and writes its durable completion message while the fence and lifecycle claim remain held. Exact-pair release restores each tagged row's original trigger. Due sessions wake only after the lifecycle claim is released.
+
+Crash replay is fail-closed. A replay adopts a crash-left active generation; a new activation after release receives a different generation. Exact-pair release is replay-safe and recomputes due work, closing a crash after release but before wake. Activation failure rolls back only fences created by that attempt, never a pre-existing adopted fence. Partial drain/stop failure returns the quiescence handle and wake candidates so the action handler can release and recover them; if exact release also fails, the durable active fence continues to block spawn until recovery or replay completes.
+
+These columns, table, and guard triggers are installed by `migrateMessagesInTable()` whenever the host opens an inbound DB. That lazy migration is the upgrade path for both old and newly created session folders.
 
 ---
 
@@ -177,7 +205,7 @@ CREATE TABLE session_state (
 );
 ```
 
-Access: `container/agent-runner/src/db/session-state.ts`.
+Access: `container/agent-runner/src/db/session-state.ts`. Repository mount quiescence also stores the exact active fence acknowledgment here under `repository_mount_barrier_ack`; the host accepts it only when the epoch and generation both match the current activation (see §2.5).
 
 ### 4.4 `container_state`
 

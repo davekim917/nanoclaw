@@ -24,6 +24,7 @@ import path from 'node:path';
 import type Database from 'better-sqlite3';
 
 import { log } from '../../log.js';
+import { evaluateManagedGitCommand } from '../../managed-git-command-guard.js';
 
 const SCRIPT_TIMEOUT_MS = 30_000;
 const SCRIPT_MAX_BUFFER = 1024 * 1024;
@@ -43,9 +44,10 @@ export interface ScriptResult {
 // explicit approved audit for new deps; see CLAUDE.md "Supply Chain
 // Security"). This subset only has to answer one conservative question: is it
 // safe to run this text UNSANDBOXED, in the same long-lived process that
-// holds every session's state? A match on EITHER list below routes to
-// "unsafe" → the fire falls back to the container path unchanged, which is
-// sandboxed per-run even though it doesn't run this classifier itself.
+// holds every session's state? Managed Git mutations are classified first by
+// the dependency-free parser in managed-git-command-guard.ts. A match there
+// or on EITHER list below routes to "unsafe" → the fire falls back to the
+// container path unchanged, which is sandboxed per-run.
 // Upgrade path: vendor block-destructive-core.ts into the host the same way
 // scripts/vendor-design-artifact-loop.ts vendors design-artifact-loop, once a
 // host-side `unbash` dependency is approved (Phase 4).
@@ -81,6 +83,10 @@ export interface ClassifyResult {
 
 /** Pure — classify script text for host-unsandboxed execution. */
 export function classifyForHostExecution(script: string): ClassifyResult {
+  const managedGit = evaluateManagedGitCommand(script);
+  if (managedGit.action === 'deny') {
+    return { safe: false, category: 'hard-block', label: managedGit.operation };
+  }
   for (const { rx, label } of HARD_BLOCK_PATTERNS) {
     if (rx.test(script)) return { safe: false, category: 'hard-block', label };
   }

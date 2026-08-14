@@ -1,527 +1,27 @@
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-import {
-  graphifyCacheDir,
-  getReposDir,
-  resolveRepoDir,
-  cloneRepoTool,
-  createWorktreeTool,
-  gitCommitTool,
-  gitPushTool,
-  openPrTool,
-} from './git-worktrees';
+import { cloneRepoTool, createWorktreeTool, gitCommitTool, gitPushTool } from './git-worktrees';
+import { closeSessionDb, initTestSessionDb } from '../db/connection';
 
-// ---------------------------------------------------------------------------
-// getReposDir / resolveRepoDir / clone_repo (Group G — workgroup repoint)
-//
-// These exercise the real filesystem rather than module mocks. The
-// dir-resolution helpers read
-// their base paths from NANOCLAW_*_DIR_OVERRIDE env vars (a test-only escape
-// hatch that production never sets), so we point them at fresh temp dirs.
-// ---------------------------------------------------------------------------
-
-/** Init a real git repo at <dir> with `origin` set to <originUrl>. */
-function initRepoWithOrigin(dir: string, originUrl: string): void {
-  mkdirSync(dir, { recursive: true });
-  execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'pipe' });
-  execFileSync('git', ['remote', 'add', 'origin', originUrl], { cwd: dir, stdio: 'pipe' });
-}
-
-describe('getReposDir / resolveRepoDir / clone_repo', () => {
+describe('topic-linked worktree topology', () => {
   let root: string;
-  let agentDir: string;
-  let workgroupDir: string;
+  let dataDir: string;
+  let canonical: string;
+  let remote: string;
+  let firstTopic: string;
   const ENV_KEYS = [
-    'NANOCLAW_AGENT_DIR_OVERRIDE',
     'NANOCLAW_WORKTREES_DIR_OVERRIDE',
-    'NANOCLAW_WORKGROUP_DIR_OVERRIDE',
     'NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE',
     'NANOCLAW_WORKGROUP_ID',
-  ] as const;
-  let savedEnv: Record<string, string | undefined>;
-
-  beforeEach(() => {
-    savedEnv = {};
-    for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
-
-    root = mkdtempSync(join(tmpdir(), 'gw-'));
-    agentDir = join(root, 'agent');
-    workgroupDir = join(root, 'workgroup');
-    mkdirSync(agentDir, { recursive: true });
-
-    process.env.NANOCLAW_AGENT_DIR_OVERRIDE = agentDir;
-    process.env.NANOCLAW_WORKGROUP_DIR_OVERRIDE = workgroupDir;
-    process.env.NANOCLAW_WORKTREES_DIR_OVERRIDE = join(root, 'worktrees');
-    process.env.NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE = join(root, 'graphify-cache');
-    delete process.env.NANOCLAW_WORKGROUP_ID;
-  });
-
-  afterEach(() => {
-    for (const k of ENV_KEYS) {
-      if (savedEnv[k] !== undefined) process.env[k] = savedEnv[k];
-      else delete process.env[k];
-    }
-    try { rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
-  });
-
-  // --- G1: getReposDir() -------------------------------------------------
-
-  test('test_repos_dir_workgroup_present: prefers workgroup/repos when mounted', () => {
-    mkdirSync(workgroupDir, { recursive: true });
-    expect(getReposDir()).toBe(join(workgroupDir, 'repos'));
-  });
-
-  test('test_repos_dir_no_workgroup_private: falls back to agent/repos with no workgroup + no env', () => {
-    // workgroupDir does not exist, NANOCLAW_WORKGROUP_ID unset.
-    expect(existsSync(workgroupDir)).toBe(false);
-    expect(getReposDir()).toBe(join(agentDir, 'repos'));
-  });
-
-  test('test_repos_dir_expected_but_missing_warns: env set but dir absent → loud warn, not silent private', () => {
-    process.env.NANOCLAW_WORKGROUP_ID = 'wg-test';
-    expect(existsSync(workgroupDir)).toBe(false);
-
-    const warnings: string[] = [];
-    const origErr = console.error;
-    console.error = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
-    try {
-      // Still returns the private dir so the op can proceed degraded...
-      expect(getReposDir()).toBe(join(agentDir, 'repos'));
-    } finally {
-      console.error = origErr;
-    }
-    // ...but it must have logged loudly about the missing mount (not silent).
-    const joined = warnings.join('\n');
-    expect(joined).toContain('WARNING');
-    expect(joined).toContain('wg-test');
-    expect(joined.toLowerCase()).toContain('mount');
-  });
-
-  // --- G2: resolveRepoDir() ----------------------------------------------
-
-  test('test_resolve_precedence_order: workgroup/repos > agent/repos > legacy agent/<name>', () => {
-    const name = 'demo';
-    const legacy = join(agentDir, name);
-    const namespaced = join(agentDir, 'repos', name);
-    const shared = join(workgroupDir, 'repos', name);
-
-    // Only legacy exists → legacy wins.
-    mkdirSync(join(legacy, '.git'), { recursive: true });
-    expect(resolveRepoDir(name)).toBe(legacy);
-
-    // Add namespaced private → outranks legacy.
-    mkdirSync(join(namespaced, '.git'), { recursive: true });
-    expect(resolveRepoDir(name)).toBe(namespaced);
-
-    // Add workgroup shared → outranks everything.
-    mkdirSync(join(shared, '.git'), { recursive: true });
-    expect(resolveRepoDir(name)).toBe(shared);
-  });
-
-  test('test_resolve_legacy_fallback: only legacy agent/<name> present resolves to legacy', () => {
-    const name = 'oldrepo';
-    const legacy = join(agentDir, name);
-    mkdirSync(join(legacy, '.git'), { recursive: true });
-    // No namespaced, no workgroup copy.
-    expect(resolveRepoDir(name)).toBe(legacy);
-  });
-
-  test('test_resolve_same_name_two_locations_warns: prefer higher-precedence AND warn (no silent shadow)', () => {
-    const name = 'dup';
-    const namespaced = join(agentDir, 'repos', name);
-    const shared = join(workgroupDir, 'repos', name);
-    // Two real clones of the same name, different origins to surface the mismatch note.
-    initRepoWithOrigin(namespaced, 'https://github.com/acme/dup.git');
-    initRepoWithOrigin(shared, 'https://github.com/other/dup.git');
-
-    const warnings: string[] = [];
-    const origErr = console.error;
-    console.error = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
-    let resolved: string | null;
-    try {
-      resolved = resolveRepoDir(name);
-    } finally {
-      console.error = origErr;
-    }
-    // Higher-precedence (workgroup shared) wins.
-    expect(resolved).toBe(shared);
-    // And a shadow warning was emitted naming the shadowed lower-precedence dir.
-    const joined = warnings.join('\n');
-    expect(joined).toContain('WARNING');
-    expect(joined).toContain(namespaced);
-    expect(joined).toContain('ORIGIN MISMATCH');
-  });
-
-  test('test_resolve_workgroup_root_legacy: a clone at the workgroup ROOT (pre-repos/) is resolved', () => {
-    // Shared clones predating the repos/ namespacing live at /workspace/workgroup/<name>.
-    // Without a candidate for the root, a sibling resolves null and clone_repo
-    // re-clones a duplicate into repos/ — this is the fix that prevents that.
-    const name = 'svc';
-    const root = join(workgroupDir, name);
-    initRepoWithOrigin(root, 'https://github.com/acme/svc.git');
-    expect(resolveRepoDir(name)).toBe(root);
-  });
-
-  test('test_resolve_shared_root_beats_private: workgroup ROOT outranks a private bedroom clone', () => {
-    // SHARED always wins over PRIVATE so siblings converge on the shared clone.
-    const name = 'svc';
-    const sharedRoot = join(workgroupDir, name);
-    const privateNs = join(agentDir, 'repos', name);
-    initRepoWithOrigin(privateNs, 'https://github.com/acme/svc.git');
-    expect(resolveRepoDir(name)).toBe(privateNs); // only private exists → private
-    initRepoWithOrigin(sharedRoot, 'https://github.com/acme/svc.git');
-    expect(resolveRepoDir(name)).toBe(sharedRoot); // shared root now outranks private
-  });
-
-  test('test_resolve_symlink_alias_not_shadow: a bedroom symlink to the workgroup clone is NOT a shadow', () => {
-    // agent/<name> -> workgroup/<name> is one shared clone reached two ways. The
-    // realpath dedup must (a) return the workgroup path and (b) emit NO warning.
-    const name = 'svc';
-    const root = join(workgroupDir, name);
-    initRepoWithOrigin(root, 'https://github.com/acme/svc.git');
-    symlinkSync(root, join(agentDir, name)); // bedroom compat symlink
-
-    const warnings: string[] = [];
-    const origErr = console.error;
-    console.error = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
-    let resolved: string | null;
-    try {
-      resolved = resolveRepoDir(name);
-    } finally {
-      console.error = origErr;
-    }
-    expect(resolved).toBe(root); // canonical shared path, not the symlink
-    expect(warnings.join('\n')).not.toContain('WARNING'); // symlink alias ≠ shadow
-  });
-
-  // --- G3: clone_repo ----------------------------------------------------
-
-  test('test_clone_lands_in_workgroup: idempotent reuse resolves to workgroup/repos when mounted', async () => {
-    const name = 'svc';
-    const url = 'https://github.com/acme/svc';
-    // Pre-place a matching-origin clone in the workgroup tree.
-    const shared = join(workgroupDir, 'repos', name);
-    initRepoWithOrigin(shared, url);
-
-    const res = await cloneRepoTool.handler({ url, name });
-    expect(res.isError).toBeFalsy();
-    const text = res.content[0].text;
-    // Reuse must report the workgroup destination, not the private agent dir.
-    expect(text).toContain(shared);
-    expect(text).not.toContain(join(agentDir, 'repos', name));
-  });
-
-  test('test_clone_origin_mismatch_errors: same-name dir with different origin is rejected (no silent reuse)', async () => {
-    const name = 'svc';
-    const wrong = join(agentDir, 'repos', name);
-    initRepoWithOrigin(wrong, 'https://github.com/someoneelse/svc.git');
-
-    const res = await cloneRepoTool.handler({ url: 'https://github.com/acme/svc', name });
-    expect(res.isError).toBe(true);
-    const text = res.content[0].text;
-    expect(text).toContain('does not');
-    expect(text).toContain('someoneelse/svc');
-  });
-
-  test('test_clone_null_origin_warns_not_silent_reuse (S-QA1): no-origin clone reused but flagged loudly', async () => {
-    const name = 'svc';
-    const url = 'https://github.com/acme/svc';
-    // A .git dir with NO origin remote (partial clone / operator local-only repo).
-    const noOrigin = join(workgroupDir, 'repos', name);
-    mkdirSync(noOrigin, { recursive: true });
-    execFileSync('git', ['init', '-q'], { cwd: noOrigin, stdio: 'pipe' });
-
-    const res = await cloneRepoTool.handler({ url, name });
-    // Non-destructive: reused (not an error — a hard error would break legit
-    // local-only repos), but the message flags the missing origin loudly so the
-    // mismatch is resolvable rather than silently handing back the wrong repo.
-    expect(res.isError).toBeFalsy();
-    const text = res.content[0].text;
-    expect(text).toContain(noOrigin);
-    expect(text).toContain("NO 'origin' remote");
-    expect(text).toContain(url);
-  });
-
-  test('test_worktree_stale_attachment_rejected (codex #126 N4): worktree bound to a shadowed clone errors', async () => {
-    const name = 'svc';
-    const url = 'https://github.com/acme/svc';
-    // Agent clone with a commit + a worktree ATTACHED to it.
-    const agentClone = join(agentDir, 'repos', name);
-    initRepoWithOrigin(agentClone, url);
-    execFileSync(
-      'git',
-      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'],
-      { cwd: agentClone, stdio: 'pipe' },
-    );
-    const worktreeDir = join(root, 'worktrees', name);
-    execFileSync('git', ['worktree', 'add', '-b', 'thread-old', worktreeDir], { cwd: agentClone, stdio: 'pipe' });
-
-    // A workgroup clone of the same name now SHADOWS the agent clone, so
-    // resolveRepoDir returns it — but the worktree is still bound to the agent clone.
-    const wgClone = join(workgroupDir, 'repos', name);
-    initRepoWithOrigin(wgClone, url);
-    expect(resolveRepoDir(name)).toBe(wgClone); // premise: workgroup now wins
-
-    const res = await createWorktreeTool.handler({ repo: name });
-    expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain('different clone');
-  });
-
-  test('test_commit_push_pr_reject_stale_worktree_attachment (codex #126 N5)', async () => {
-    const name = 'svc';
-    const url = 'https://github.com/acme/svc';
-    // Worktree attached to the agent clone...
-    const agentClone = join(agentDir, 'repos', name);
-    initRepoWithOrigin(agentClone, url);
-    execFileSync(
-      'git',
-      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'],
-      { cwd: agentClone, stdio: 'pipe' },
-    );
-    const worktreeDir = join(root, 'worktrees', name);
-    execFileSync('git', ['worktree', 'add', '-b', 'thread-old', worktreeDir], { cwd: agentClone, stdio: 'pipe' });
-    // ...then a workgroup clone shadows it.
-    initRepoWithOrigin(join(workgroupDir, 'repos', name), url);
-
-    // commit / push / open_pr must all refuse before doing any git/gh work.
-    for (const tool of [gitCommitTool, gitPushTool, openPrTool]) {
-      const res = await tool.handler({ repo: name, message: 'm', title: 't' });
-      expect(res.isError).toBe(true);
-      expect(res.content[0].text).toContain('different clone');
-    }
-  });
-
-  test('test_clone_nonempty_no_git_dir_errors: non-empty no-.git destination is NOT destroyed', async () => {
-    const name = 'svc';
-    process.env.NANOCLAW_WORKGROUP_ID = undefined; // private path
-    delete process.env.NANOCLAW_WORKGROUP_ID;
-    const dest = join(agentDir, 'repos', name);
-    mkdirSync(dest, { recursive: true });
-    const precious = join(dest, 'IMPORTANT.txt');
-    writeFileSync(precious, 'do not delete me');
-
-    const res = await cloneRepoTool.handler({ url: 'https://github.com/acme/svc', name });
-    expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain('Refusing to destroy');
-    // The non-empty dir and its contents must survive untouched.
-    expect(existsSync(precious)).toBe(true);
-    expect(readdirSync(dest)).toContain('IMPORTANT.txt');
-  });
-
-  test('test_clone_empty_no_git_dir_cleared: empty no-.git destination may be cleared (then clone attempted)', async () => {
-    const name = 'svc';
-    const dest = join(agentDir, 'repos', name);
-    mkdirSync(dest, { recursive: true }); // empty, no .git
-
-    // The clone itself targets github.com over the network, which is not
-    // reachable here — so it fails AT THE CLONE step, not the guard. Proving
-    // we got past the guard (no "Refusing to destroy") is the assertion that
-    // an empty no-.git dir is permitted to be cleared.
-    const res = await cloneRepoTool.handler({ url: 'https://github.com/acme/svc', name });
-    expect(res.isError).toBe(true);
-    const text = res.content[0].text;
-    expect(text).not.toContain('Refusing to destroy');
-    expect(text).toContain('git clone failed');
-  });
-
-  // --- codex #126 round-5 fixes ------------------------------------------
-
-  test('test_stale_check_symlink_alias_not_false_rejected (codex #126): a worktree on a symlinked repo alias is NOT flagged stale', async () => {
-    // Migration compat symlink: resolveRepoDir returns the symlink alias
-    // (/workspace/agent/<name> -> real clone), but git --git-common-dir reports
-    // the real target. A path.resolve()-only compare would call this "a different
-    // clone" and false-reject every worktree op. canonPath() (realpath) must
-    // reconcile them.
-    const name = 'svc';
-    const url = 'https://github.com/acme/svc';
-    // Real clone living OUTSIDE the agent dir, with a commit + an attached worktree.
-    const realClone = join(root, 'realhome', name);
-    initRepoWithOrigin(realClone, url);
-    execFileSync(
-      'git',
-      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'],
-      { cwd: realClone, stdio: 'pipe' },
-    );
-    const branch = 'thread-session-svc'; // = defaultBranchName('svc') with no NANOCLAW_SESSION_ID
-    const worktreeDir = join(root, 'worktrees', name);
-    execFileSync('git', ['worktree', 'add', '-b', branch, worktreeDir], { cwd: realClone, stdio: 'pipe' });
-
-    // Legacy candidate-3 path is a SYMLINK to the real clone; no workgroup/private
-    // copies exist, so resolveRepoDir must return the symlink alias itself.
-    symlinkSync(realClone, join(agentDir, name));
-    expect(resolveRepoDir(name)).toBe(join(agentDir, name));
-    // Sanity: the alias really does resolve to the real clone.
-    expect(realpathSync(join(agentDir, name))).toBe(realpathSync(realClone));
-
-    const res = await createWorktreeTool.handler({ repo: name });
-    // The op may no-op/succeed (fetch is offline), but it must NOT mis-fire the
-    // stale-attachment guard. Before the canonPath fix this returned "different clone".
-    expect(res.content[0].text).not.toContain('different clone');
-    expect(res.isError).toBeFalsy();
-  });
-
-  test('test_clone_refuses_private_reuse_when_shared_mounted (codex #126): silent bedroom reuse is rejected', async () => {
-    const name = 'svc';
-    const url = 'https://github.com/acme/svc';
-    // Shared tree IS mounted, but the only existing clone is PRIVATE (bedroom).
-    mkdirSync(workgroupDir, { recursive: true });
-    const privateClone = join(agentDir, 'repos', name);
-    initRepoWithOrigin(privateClone, url);
-    expect(resolveRepoDir(name)).toBe(privateClone); // premise: private resolves
-
-    const res = await cloneRepoTool.handler({ url, name });
-    // Refuse loudly — a private clone is invisible to siblings under shared-FS.
-    expect(res.isError).toBe(true);
-    const text = res.content[0].text;
-    expect(text).toContain('PRIVATE');
-    expect(text).toContain(privateClone);
-    expect(text).toContain(join(workgroupDir, 'repos', name)); // the relocation hint
-  });
-
-  test('test_clone_symlinked_shared_repo_not_refused (codex #126): compat symlink whose realpath is in the shared tree is reused, not flagged private', async () => {
-    const name = 'svc';
-    const url = 'https://github.com/acme/svc';
-    // Shared tree mounted; the real clone lives in the workgroup tree, exposed to
-    // the agent only through the migration compat symlink /agent/<name> -> /workgroup/<name>.
-    mkdirSync(workgroupDir, { recursive: true });
-    const realInShared = join(workgroupDir, name); // realpath under the shared tree
-    initRepoWithOrigin(realInShared, url);
-    symlinkSync(realInShared, join(agentDir, name));
-    // resolveRepoDir prefers the canonical workgroup ROOT clone (candidate 2) over
-    // the bedroom symlink (candidate 4) — same real clone, canonical path returned.
-    expect(resolveRepoDir(name)).toBe(realInShared);
-
-    const res = await cloneRepoTool.handler({ url, name });
-    // Its realpath is inside the workgroup tree → siblings CAN see it → reuse, not refuse.
-    expect(res.isError).toBeFalsy();
-    expect(res.content[0].text).not.toContain('PRIVATE');
-  });
-
-  test('test_clone_private_reuse_ok_when_no_shared_tree (codex #126): degraded mode still reuses the bedroom clone', async () => {
-    const name = 'svc';
-    const url = 'https://github.com/acme/svc';
-    // No workgroup mounted (default) — private reuse must still work, gate stays off.
-    expect(existsSync(workgroupDir)).toBe(false);
-    const privateClone = join(agentDir, 'repos', name);
-    initRepoWithOrigin(privateClone, url);
-
-    const res = await cloneRepoTool.handler({ url, name });
-    expect(res.isError).toBeFalsy();
-    const text = res.content[0].text;
-    expect(text).toContain(privateClone);
-    expect(text).not.toContain('PRIVATE'); // the new gate did NOT fire
-  });
-
-  test('test_corrupt_worktree_replacement_removes_matching_graphify_cache', async () => {
-    const name = 'corrupt-repo';
-    const repo = join(agentDir, 'repos', name);
-    initRepoWithOrigin(repo, 'https://github.com/acme/corrupt-repo.git');
-    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'], {
-      cwd: repo,
-      stdio: 'pipe',
-    });
-    execFileSync('git', ['branch', 'feature'], { cwd: repo, stdio: 'pipe' });
-
-    const corruptWorktree = join(root, 'worktrees', name);
-    mkdirSync(corruptWorktree, { recursive: true });
-    writeFileSync(join(corruptWorktree, 'partial-checkout'), 'corrupt');
-    const cache = graphifyCacheDir(name);
-    mkdirSync(join(cache, 'timeout-debris'), { recursive: true });
-    writeFileSync(join(cache, 'enospc.partial'), 'partial');
-    writeFileSync(join(cache, 'lock'), '');
-
-    const response = await createWorktreeTool.handler({ repo: name, branch: 'feature' });
-
-    expect(response.isError).toBeFalsy();
-    expect(existsSync(join(corruptWorktree, '.git'))).toBe(true);
-    expect(existsSync(cache)).toBe(false);
-  });
-
-  test('test_valid_worktree_reuse_keeps_graphify_cache', async () => {
-    const name = 'valid-repo';
-    const repo = join(agentDir, 'repos', name);
-    initRepoWithOrigin(repo, 'https://github.com/acme/valid-repo.git');
-    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'], {
-      cwd: repo,
-      stdio: 'pipe',
-    });
-    const worktree = join(root, 'worktrees', name);
-    execFileSync('git', ['worktree', 'add', '-b', 'feature', worktree], { cwd: repo, stdio: 'pipe' });
-    const cache = graphifyCacheDir(name);
-    mkdirSync(cache, { recursive: true });
-    writeFileSync(join(cache, 'index.db'), 'stable');
-
-    const reused = await createWorktreeTool.handler({ repo: name, branch: 'feature' });
-    expect(reused.isError).toBeFalsy();
-    expect(existsSync(join(cache, 'index.db'))).toBe(true);
-
-    const mismatch = await createWorktreeTool.handler({ repo: name, branch: 'different-branch' });
-    expect(mismatch.isError).toBe(true);
-    expect(existsSync(join(cache, 'index.db'))).toBe(true);
-
-    writeFileSync(join(worktree, 'dirty.ts'), 'uncommitted');
-    const editedReuse = await createWorktreeTool.handler({ repo: name, branch: 'feature' });
-    expect(editedReuse.isError).toBeFalsy();
-    expect(existsSync(join(cache, 'index.db'))).toBe(true);
-  });
-
-  test('test_git_commit_returns_sha_without_advisory_subprocess', async () => {
-    const name = 'commit-repo';
-    const repo = join(agentDir, 'repos', name);
-    initRepoWithOrigin(repo, 'https://github.com/acme/commit-repo.git');
-    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'], {
-      cwd: repo,
-      stdio: 'pipe',
-    });
-    const worktree = join(root, 'worktrees', name);
-    execFileSync('git', ['worktree', 'add', '-b', 'feature', worktree], { cwd: repo, stdio: 'pipe' });
-    writeFileSync(join(worktree, 'changed.ts'), 'export const changed = true;\n');
-
-    const fakeBin = join(root, 'fake-bin');
-    const nodeCanary = join(root, 'node-was-run');
-    mkdirSync(fakeBin, { recursive: true });
-    writeFileSync(join(fakeBin, 'node'), `#!/bin/sh\ntouch "${nodeCanary}"\nexit 99\n`);
-    chmodSync(join(fakeBin, 'node'), 0o755);
-    const previousPath = process.env.PATH;
-    process.env.PATH = `${fakeBin}:${previousPath ?? ''}`;
-
-    try {
-      const response = await gitCommitTool.handler({ repo: name, message: 'commit everything' });
-      const sha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
-        cwd: worktree,
-        encoding: 'utf-8',
-      }).trim();
-      expect(response.isError).toBeFalsy();
-      expect(response.content[0].text).toBe(`Committed ${sha}`);
-      expect(existsSync(nodeCanary)).toBe(false);
-      expect(execFileSync('git', ['status', '--porcelain'], { cwd: worktree, encoding: 'utf-8' }).trim()).toBe('');
-      expect(
-        execFileSync('git', ['log', '-1', '--format=%an <%ae>'], { cwd: worktree, encoding: 'utf-8' }).trim(),
-      ).toBe('agent <agent@nanoclaw.local>');
-    } finally {
-      process.env.PATH = previousPath;
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Mirror + standalone-clone topology (repo-store rework)
-// ---------------------------------------------------------------------------
-
-describe('mirror topology', () => {
-  let root: string;
-  let workgroupDir: string;
-  let worktreesDir: string;
-  const ENV_KEYS = [
-    'NANOCLAW_AGENT_DIR_OVERRIDE',
-    'NANOCLAW_WORKTREES_DIR_OVERRIDE',
-    'NANOCLAW_WORKGROUP_DIR_OVERRIDE',
-    'NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE',
-    'NANOCLAW_WORKGROUP_ID',
+    'NANOCLAW_HOST_DATA_DIR',
+    'NANOCLAW_HOST_TOPIC_WORKTREES_DIR',
+    'NANOCLAW_WORK_UNIT_KEY',
+    'NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN',
+    'NANOCLAW_REPOSITORY_ACTION_TRANSPORT',
   ] as const;
   let savedEnv: Record<string, string | undefined>;
 
@@ -530,212 +30,284 @@ describe('mirror topology', () => {
       .toString()
       .trim();
 
-  /** Bare fixture "remote" seeded with one commit on main. */
-  function makeRemote(dir: string): string {
-    const work = `${dir}-work`;
-    mkdirSync(work, { recursive: true });
-    git(work, ['init', '-q', '-b', 'main']);
-    writeFileSync(join(work, 'README.md'), 'hello\n');
-    git(work, ['add', '-A']);
-    git(work, ['commit', '-q', '-m', 'init']);
-    execFileSync('git', ['clone', '-q', '--bare', work, dir], { stdio: 'pipe' });
-    rmSync(work, { recursive: true, force: true });
-    return dir;
+  function seedCanonical(): void {
+    const seed = join(root, 'seed');
+    mkdirSync(seed, { recursive: true });
+    git(seed, ['init', '-q', '-b', 'main']);
+    writeFileSync(join(seed, 'README.md'), 'base\n');
+    git(seed, ['add', '-A']);
+    git(seed, ['commit', '-q', '-m', 'base']);
+    remote = join(root, 'remote.git');
+    execFileSync('git', ['clone', '-q', '--bare', seed, remote]);
+    canonical = join(dataDir, 'repositories', 'wg-a', 'proj');
+    mkdirSync(join(dataDir, 'repositories', 'wg-a'), { recursive: true });
+    execFileSync('git', ['clone', '-q', remote, canonical]);
+    git(canonical, ['remote', 'set-head', 'origin', '--auto']);
+    git(canonical, ['config', 'gc.auto', '0']);
+
+    const state = join(dataDir, 'repository-state', 'wg-a', 'proj');
+    mkdirSync(state, { recursive: true });
+    writeFileSync(join(state, 'origin.json'), JSON.stringify({ origin: remote, repositoryId: remote }));
+    writeFileSync(join(state, 'repository.lock'), '');
   }
 
-  /** What clone_repo produces: bare mirror of <remote> under .repos/. */
-  function makeMirror(name: string, remote: string): string {
-    const mirror = join(workgroupDir, '.repos', `${name}.git`);
-    mkdirSync(join(workgroupDir, '.repos'), { recursive: true });
-    execFileSync('git', ['clone', '-q', '--bare', remote, mirror], { stdio: 'pipe' });
-    execFileSync('git', ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*'], {
-      cwd: mirror,
-      stdio: 'pipe',
-    });
-    return mirror;
+  function useTopic(name: string, workUnitKey: string): string {
+    const topic = join(dataDir, 'v2-topics', 'wg-a', name, 'worktrees');
+    mkdirSync(topic, { recursive: true });
+    process.env.NANOCLAW_WORKTREES_DIR_OVERRIDE = topic;
+    process.env.NANOCLAW_HOST_TOPIC_WORKTREES_DIR = topic;
+    process.env.NANOCLAW_WORK_UNIT_KEY = workUnitKey;
+    return topic;
   }
 
   beforeEach(() => {
     savedEnv = {};
-    for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
-    root = mkdtempSync(join(tmpdir(), 'gw-mirror-'));
-    workgroupDir = join(root, 'workgroup');
-    worktreesDir = join(root, 'worktrees');
-    mkdirSync(workgroupDir, { recursive: true });
-    process.env.NANOCLAW_AGENT_DIR_OVERRIDE = join(root, 'agent');
-    process.env.NANOCLAW_WORKGROUP_DIR_OVERRIDE = workgroupDir;
-    process.env.NANOCLAW_WORKTREES_DIR_OVERRIDE = worktreesDir;
+    for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
+    root = mkdtempSync(join(tmpdir(), 'gw-topic-linked-'));
+    dataDir = join(root, 'data');
     process.env.NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE = join(root, 'graphify-cache');
-    delete process.env.NANOCLAW_WORKGROUP_ID;
+    process.env.NANOCLAW_WORKGROUP_ID = 'wg-a';
+    process.env.NANOCLAW_HOST_DATA_DIR = dataDir;
+    process.env.NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN = '1';
+    process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT = 'disabled';
+    firstTopic = useTopic('topic-one', 'thread:slack:C1:1.1');
+    seedCanonical();
   });
 
   afterEach(() => {
-    for (const k of ENV_KEYS) {
-      if (savedEnv[k] !== undefined) process.env[k] = savedEnv[k];
-      else delete process.env[k];
+    for (const key of ENV_KEYS) {
+      if (savedEnv[key] !== undefined) process.env[key] = savedEnv[key];
+      else delete process.env[key];
     }
-    try { rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
   });
 
-  test('test_mirror_create_worktree_standalone_clone: clone from mirror, origin repointed at real remote', async () => {
-    const remote = makeRemote(join(root, 'remote', 'proj.git'));
-    makeMirror('proj', remote);
-    const res = await createWorktreeTool.handler({ repo: 'proj' });
-    expect(res.isError).toBeUndefined();
-    const wt = join(worktreesDir, 'proj');
-    // Standalone clone: .git is a DIRECTORY (self-contained metadata), not a
-    // linked-worktree pointer file.
-    expect(existsSync(join(wt, '.git', 'HEAD'))).toBe(true);
-    expect(git(wt, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe('thread-session-proj');
-    expect(git(wt, ['config', '--get', 'remote.origin.url'])).toBe(remote);
+  test('same-topic-siblings-share-one-worktree', async () => {
+    const first = await createWorktreeTool.handler({ repo: 'proj' });
+    const second = await createWorktreeTool.handler({ repo: 'proj' });
+    const worktree = join(firstTopic, 'proj');
+
+    expect(first.isError).toBeFalsy();
+    expect(second.isError).toBeFalsy();
+    expect(lstatSync(join(worktree, '.git')).isFile()).toBe(true);
+    expect(git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).toBe(join(canonical, '.git'));
+    expect(second.content[0].text).toContain('Worktree ready');
   });
 
-  test('test_mirror_reuse_rebases_onto_advanced_origin', async () => {
-    const remote = makeRemote(join(root, 'remote', 'proj.git'));
-    makeMirror('proj', remote);
-    await createWorktreeTool.handler({ repo: 'proj' });
-    // Advance the remote past the clone's base.
-    const scratch = join(root, 'scratch');
-    execFileSync('git', ['clone', '-q', remote, scratch], { stdio: 'pipe' });
-    writeFileSync(join(scratch, 'new.txt'), 'more\n');
+  test('host-list-move-remove-works-with-container-created-host-native-metadata', async () => {
+    const created = await createWorktreeTool.handler({ repo: 'proj' });
+    const worktree = join(firstTopic, 'proj');
+    const moved = join(firstTopic, 'proj-moved-by-host');
+
+    expect(created.isError).toBeFalsy();
+    expect(git(canonical, ['worktree', 'list', '--porcelain'])).toContain(`worktree ${worktree}`);
+    expect(git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).toBe(join(canonical, '.git'));
+
+    git(canonical, ['worktree', 'move', worktree, moved]);
+    expect(existsSync(worktree)).toBe(false);
+    expect(existsSync(moved)).toBe(true);
+    expect(git(canonical, ['worktree', 'list', '--porcelain'])).toContain(`worktree ${moved}`);
+    expect(git(moved, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).toBe(join(canonical, '.git'));
+
+    git(canonical, ['worktree', 'remove', moved]);
+    expect(existsSync(moved)).toBe(false);
+    expect(git(canonical, ['worktree', 'list', '--porcelain'])).not.toContain(`worktree ${moved}`);
+  });
+
+  test('different-topics-have-distinct-path-head-index-and-admin-dir', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const one = join(firstTopic, 'proj');
+    const oneBranch = git(one, ['branch', '--show-current']);
+
+    const secondTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const two = join(secondTopic, 'proj');
+
+    expect(two).not.toBe(one);
+    expect(git(two, ['branch', '--show-current'])).not.toBe(oneBranch);
+    expect(git(two, ['rev-parse', '--git-path', 'index'])).not.toBe(git(one, ['rev-parse', '--git-path', 'index']));
+    expect(git(two, ['rev-parse', '--absolute-git-dir'])).not.toBe(git(one, ['rev-parse', '--absolute-git-dir']));
+
+    writeFileSync(join(one, 'only-one.txt'), 'one\n');
+    git(one, ['add', '-A']);
+    git(one, ['commit', '-q', '-m', 'topic one']);
+    expect(existsSync(join(two, 'only-one.txt'))).toBe(false);
+    expect(git(two, ['status', '--porcelain'])).toBe('');
+  });
+
+  test('branch-switch-or-commit-in-one-topic-does-not-affect-another', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const one = join(firstTopic, 'proj');
+    const secondTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const two = join(secondTopic, 'proj');
+    const twoBranch = git(two, ['branch', '--show-current']);
+    const twoHead = git(two, ['rev-parse', 'HEAD']);
+
+    git(one, ['switch', '-q', '-c', 'topic-one-only']);
+    writeFileSync(join(one, 'topic-one-only.txt'), 'isolated\n');
+    git(one, ['add', '-A']);
+    git(one, ['commit', '-q', '-m', 'topic one only']);
+
+    expect(git(two, ['branch', '--show-current'])).toBe(twoBranch);
+    expect(git(two, ['rev-parse', 'HEAD'])).toBe(twoHead);
+    expect(git(two, ['status', '--porcelain'])).toBe('');
+    expect(existsSync(join(two, 'topic-one-only.txt'))).toBe(false);
+  });
+
+  test('new-worktree-starts-at-fresh-origin-head-and-existing-worktree-is-untouched', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const existing = join(firstTopic, 'proj');
+    const existingHead = git(existing, ['rev-parse', 'HEAD']);
+
+    const scratch = join(root, 'advance');
+    execFileSync('git', ['clone', '-q', remote, scratch]);
+    writeFileSync(join(scratch, 'fresh.txt'), 'fresh\n');
     git(scratch, ['add', '-A']);
-    git(scratch, ['commit', '-q', '-m', 'advance']);
+    git(scratch, ['commit', '-q', '-m', 'fresh']);
     git(scratch, ['push', '-q', 'origin', 'main']);
-    const remoteTip = git(scratch, ['rev-parse', 'HEAD']);
+    const freshHead = git(scratch, ['rev-parse', 'HEAD']);
 
-    const res = await createWorktreeTool.handler({ repo: 'proj' });
-    expect(res.isError).toBeUndefined();
-    const wt = join(worktreesDir, 'proj');
-    // Thread branch rebased onto fresh origin/HEAD even though the MIRROR was
-    // never fetched — the clone talks to the real remote directly.
-    expect(git(wt, ['rev-parse', 'HEAD'])).toBe(remoteTip);
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    expect(git(existing, ['rev-parse', 'HEAD'])).toBe(existingHead);
+    expect(git(existing, ['rev-parse', 'refs/remotes/origin/main'])).toBe(freshHead);
+
+    const secondTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const fresh = join(secondTopic, 'proj');
+
+    expect(git(fresh, ['rev-parse', 'HEAD'])).toBe(freshHead);
+    expect(git(existing, ['rev-parse', 'HEAD'])).toBe(existingHead);
+    expect(existsSync(join(existing, 'fresh.txt'))).toBe(false);
   });
 
-  test('test_mirror_legacy_linked_worktree_refused', async () => {
-    const remote = makeRemote(join(root, 'remote', 'proj.git'));
-    makeMirror('proj', remote);
-    const wt = join(worktreesDir, 'proj');
-    mkdirSync(wt, { recursive: true });
-    writeFileSync(join(wt, '.git'), 'gitdir: /workspace/workgroup/proj/.git/worktrees/proj\n');
-    const res = await createWorktreeTool.handler({ repo: 'proj' });
-    expect(res.isError).toBe(true);
-    expect(res.content[0].text).toContain('legacy linked worktree');
-    // Nothing destroyed.
-    expect(existsSync(join(wt, '.git'))).toBe(true);
+  test('an unexplained surviving topic ref is reattached and never reset to origin HEAD', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'unpushed.txt'), 'must survive\n');
+    git(worktree, ['add', '-A']);
+    git(worktree, ['commit', '-q', '-m', 'unpushed local work']);
+    const preservedHead = git(worktree, ['rev-parse', 'HEAD']);
+    git(canonical, ['worktree', 'remove', worktree]);
+
+    const scratch = join(root, 'advance-after-loss');
+    execFileSync('git', ['clone', '-q', remote, scratch]);
+    writeFileSync(join(scratch, 'remote-new.txt'), 'new remote work\n');
+    git(scratch, ['add', '-A']);
+    git(scratch, ['commit', '-q', '-m', 'advance remote']);
+    git(scratch, ['push', '-q', 'origin', 'main']);
+
+    const recreated = await createWorktreeTool.handler({ repo: 'proj' });
+    expect(recreated.isError).toBeFalsy();
+    expect(git(worktree, ['rev-parse', 'HEAD'])).toBe(preservedHead);
+    expect(existsSync(join(worktree, 'unpushed.txt'))).toBe(true);
+    expect(existsSync(join(worktree, 'remote-new.txt'))).toBe(false);
   });
 
-  test('test_mirror_commit_and_push_flow', async () => {
-    const remote = makeRemote(join(root, 'remote', 'proj.git'));
-    makeMirror('proj', remote);
-    await createWorktreeTool.handler({ repo: 'proj' });
-    const wt = join(worktreesDir, 'proj');
-    writeFileSync(join(wt, 'feature.txt'), 'work\n');
-    const commitRes = await gitCommitTool.handler({ repo: 'proj', message: 'feat: work' });
-    expect(commitRes.isError).toBeUndefined();
-    const pushRes = await gitPushTool.handler({ repo: 'proj' });
-    expect(pushRes.isError).toBeUndefined();
-    // Branch landed on the REAL remote, not the mirror.
-    const remoteBranches = git(remote, ['branch', '--list', 'thread-session-proj']);
-    expect(remoteBranches).toContain('thread-session-proj');
+  test('migration local-only canonical preserves work and creates linked topics without fetching', async () => {
+    git(canonical, ['remote', 'remove', 'origin']);
+    writeFileSync(
+      join(dataDir, 'repository-state', 'wg-a', 'proj', 'origin.json'),
+      JSON.stringify({ kind: 'local-only', origin: null, repositoryId: 'local-only:wg-a-proj' }),
+    );
+    const canonicalHead = git(canonical, ['rev-parse', 'HEAD']);
+
+    const created = await createWorktreeTool.handler({ repo: 'proj' });
+    const worktree = join(firstTopic, 'proj');
+    expect(created.isError).toBeFalsy();
+    expect(created.content[0].text).toContain('preserved local-only canonical');
+    expect(git(worktree, ['rev-parse', 'HEAD'])).toBe(canonicalHead);
+    expect(git(worktree, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).toBe(join(canonical, '.git'));
+
+    writeFileSync(join(worktree, 'ongoing.txt'), 'safe\n');
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'keep local work' })).isError).toBeFalsy();
+    const push = await gitPushTool.handler({ repo: 'proj' });
+    expect(push.isError).toBe(true);
+    expect(git(worktree, ['status', '--porcelain'])).toBe('');
   });
 
-  test('test_mirror_wins_over_snapshot_clone_at_root', async () => {
-    const remote = makeRemote(join(root, 'remote', 'proj.git'));
-    const mirror = makeMirror('proj', remote);
-    // Migrated layout: browsing snapshot (a real clone, detached) at the old
-    // canonical path. resolveRepoDir would match it; the mirror must win.
-    const snapshot = join(workgroupDir, 'proj');
-    execFileSync('git', ['clone', '-q', mirror, snapshot], { stdio: 'pipe' });
-    git(snapshot, ['checkout', '-q', '--detach']);
-    const res = await createWorktreeTool.handler({ repo: 'proj' });
-    expect(res.isError).toBeUndefined();
-    const wt = join(worktreesDir, 'proj');
-    // Clone origin is the real remote (via mirror config), NOT the snapshot.
-    expect(git(wt, ['config', '--get', 'remote.origin.url'])).toBe(remote);
+  test('explicit branch already owned by another worktree is rejected without mutation', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj', branch: 'shared-feature' })).isError).toBeFalsy();
+    const firstHead = git(join(firstTopic, 'proj'), ['rev-parse', 'HEAD']);
+    const secondTopic = useTopic('topic-two', 'thread:slack:C1:2.2');
+
+    const response = await createWorktreeTool.handler({ repo: 'proj', branch: 'shared-feature' });
+    expect(response.isError).toBe(true);
+    expect(response.content[0].text).toContain('already checked out');
+    expect(existsSync(join(secondTopic, 'proj'))).toBe(false);
+    expect(git(join(firstTopic, 'proj'), ['rev-parse', 'HEAD'])).toBe(firstHead);
   });
 
-  test('test_clone_repo_mirror_idempotent_and_origin_guard', async () => {
-    const mirror = join(workgroupDir, '.repos', 'proj.git');
-    mkdirSync(mirror, { recursive: true });
-    execFileSync('git', ['init', '-q', '--bare', mirror], { stdio: 'pipe' });
-    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/acme/proj.git'], {
-      cwd: mirror,
-      stdio: 'pipe',
-    });
-    const okRes = await cloneRepoTool.handler({ url: 'https://github.com/acme/proj' });
-    expect(okRes.isError).toBeUndefined();
-    expect(okRes.content[0].text).toContain('already present (mirror');
-    const badRes = await cloneRepoTool.handler({ url: 'https://github.com/other/proj' });
-    expect(badRes.isError).toBe(true);
-    expect(badRes.content[0].text).toContain('does not match');
-  });
-});
+  test('linked-worktree-fetch-commit-push-works-through-scoped-git-metadata', async () => {
+    expect((await createWorktreeTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const worktree = join(firstTopic, 'proj');
+    writeFileSync(join(worktree, 'feature.txt'), 'feature\n');
 
-describe('mirror topology — malformed and originless mirrors', () => {
-  let root: string;
-  let workgroupDir: string;
-  const ENV_KEYS = [
-    'NANOCLAW_AGENT_DIR_OVERRIDE',
-    'NANOCLAW_WORKTREES_DIR_OVERRIDE',
-    'NANOCLAW_WORKGROUP_DIR_OVERRIDE',
-    'NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE',
-    'NANOCLAW_WORKGROUP_ID',
-  ] as const;
-  let savedEnv: Record<string, string | undefined>;
-
-  beforeEach(() => {
-    savedEnv = {};
-    for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
-    root = mkdtempSync(join(tmpdir(), 'gw-malformed-'));
-    workgroupDir = join(root, 'workgroup');
-    mkdirSync(workgroupDir, { recursive: true });
-    process.env.NANOCLAW_AGENT_DIR_OVERRIDE = join(root, 'agent');
-    process.env.NANOCLAW_WORKGROUP_DIR_OVERRIDE = workgroupDir;
-    process.env.NANOCLAW_WORKTREES_DIR_OVERRIDE = join(root, 'worktrees');
-    process.env.NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE = join(root, 'graphify-cache');
-    delete process.env.NANOCLAW_WORKGROUP_ID;
+    expect((await gitCommitTool.handler({ repo: 'proj', message: 'feature' })).isError).toBeFalsy();
+    expect((await gitPushTool.handler({ repo: 'proj' })).isError).toBeFalsy();
+    const branch = git(worktree, ['branch', '--show-current']);
+    expect(git(remote, ['show-ref', '--verify', `refs/heads/${branch}`])).toContain(branch);
   });
 
-  afterEach(() => {
-    for (const k of ENV_KEYS) {
-      if (savedEnv[k] !== undefined) process.env[k] = savedEnv[k];
-      else delete process.env[k];
+  test('origin-pin-drift-and-corrupt-destination-fail-closed-without-loss', async () => {
+    git(canonical, ['remote', 'set-url', 'origin', join(root, 'different.git')]);
+    const drift = await createWorktreeTool.handler({ repo: 'proj' });
+    expect(drift.isError).toBe(true);
+    expect(drift.content[0].text).toContain('origin pin');
+    expect(existsSync(join(firstTopic, 'proj'))).toBe(false);
+
+    git(canonical, ['remote', 'set-url', 'origin', remote]);
+    const destination = join(firstTopic, 'proj');
+    mkdirSync(destination, { recursive: true });
+    writeFileSync(join(destination, 'ONGOING-WORK.txt'), 'preserve me\n');
+    const corrupt = await createWorktreeTool.handler({ repo: 'proj' });
+    expect(corrupt.isError).toBe(true);
+    expect(corrupt.content[0].text).toContain('left untouched');
+    expect(existsSync(join(destination, 'ONGOING-WORK.txt'))).toBe(true);
+  });
+
+  test('clone_repo rejects authority, cross-host, and traversal before any network or host mutation', async () => {
+    for (const input of [
+      { url: 'https://token@github.com/acme/proj.git' },
+      { url: 'https://gitlab.com/acme/proj.git' },
+      { url: 'https://github.com/acme/proj.git', name: '../escape' },
+    ]) {
+      const response = await cloneRepoTool.handler(input);
+      expect(response.isError).toBe(true);
     }
-    try { rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
+    expect(existsSync(join(root, 'escape'))).toBe(false);
   });
 
-  test('malformed mirror hard-errors instead of falling back to legacy resolution', async () => {
-    // Partial clone remnant: HEAD file exists, but not a valid bare repo.
-    const mirror = join(workgroupDir, '.repos', 'proj.git');
-    mkdirSync(mirror, { recursive: true });
-    writeFileSync(join(mirror, 'HEAD'), 'ref: refs/heads/main\n');
-    mkdirSync(join(mirror, 'objects'), { recursive: true });
-    // A browsing snapshot exists at the root — the trap: legacy resolution
-    // would happily treat it as a canonical.
-    const snapshot = join(workgroupDir, 'proj');
-    mkdirSync(snapshot, { recursive: true });
-    execFileSync('git', ['init', '-q', snapshot], { stdio: 'pipe' });
-
-    const wtRes = await createWorktreeTool.handler({ repo: 'proj' });
-    expect(wtRes.isError).toBe(true);
-    expect(wtRes.content[0].text).toContain('NOT a valid bare repository');
-
-    const cloneRes = await cloneRepoTool.handler({ url: 'https://github.com/acme/proj' });
-    expect(cloneRes.isError).toBe(true);
-    expect(cloneRes.content[0].text).toContain('NOT a valid bare repository');
-  });
-
-  test('originless mirror adopts the requested URL instead of staying unfetchable', async () => {
-    const mirror = join(workgroupDir, '.repos', 'proj.git');
-    mkdirSync(join(workgroupDir, '.repos'), { recursive: true });
-    execFileSync('git', ['init', '-q', '--bare', mirror], { stdio: 'pipe' });
-
-    const res = await cloneRepoTool.handler({ url: 'https://github.com/acme/proj' });
-    expect(res.isError).toBeUndefined();
-    expect(res.content[0].text).toContain('adopted origin');
-    const origin = execFileSync('git', ['config', '--get', 'remote.origin.url'], { cwd: mirror })
-      .toString()
-      .trim();
-    expect(origin).toBe('https://github.com/acme/proj');
+  test('clone_repo rejects query and fragment credentials before staging or durable action writes', async () => {
+    const stagingRoot = '/workspace/repository-staging';
+    const before = existsSync(stagingRoot) ? readdirSync(stagingRoot).sort() : [];
+    const { outbound } = initTestSessionDb();
+    delete process.env.NANOCLAW_REPOSITORY_ACTION_TRANSPORT;
+    try {
+      for (const rawOrigin of [
+        'https://github.com/example/proj.git?access_token=QUERY_SYNTHETIC_SECRET',
+        'https://github.com/example/proj.git#FRAGMENT_SYNTHETIC_SECRET',
+      ]) {
+        const response = await cloneRepoTool.handler({ url: rawOrigin });
+        expect(response.isError).toBe(true);
+        expect(response.content[0].text).toContain('must not include query parameters or fragments');
+        expect(response.content[0].text).not.toContain('SYNTHETIC_SECRET');
+        expect(response.content[0].text).not.toContain(rawOrigin);
+      }
+      const malformedOrigin = 'not-a-url?access_token=MALFORMED_SYNTHETIC_SECRET';
+      const malformed = await cloneRepoTool.handler({ url: malformedOrigin });
+      expect(malformed.isError).toBe(true);
+      expect(malformed.content[0].text).toContain('Invalid repository URL');
+      expect(malformed.content[0].text).not.toContain('MALFORMED_SYNTHETIC_SECRET');
+      expect(malformed.content[0].text).not.toContain(malformedOrigin);
+      expect(outbound.query('SELECT content FROM messages_out').all()).toEqual([]);
+      expect(existsSync(stagingRoot) ? readdirSync(stagingRoot).sort() : []).toEqual(before);
+    } finally {
+      closeSessionDb();
+    }
   });
 });

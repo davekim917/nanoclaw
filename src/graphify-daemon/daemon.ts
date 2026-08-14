@@ -15,6 +15,12 @@ import {
 } from '../graphify/discovery.js';
 import { preprocessDiscoveredSource, type PreprocessedSource } from '../graphify/extractors.js';
 import { WorkgroupGraphStore, type SourceReconciliation, type SourceStateAppend } from '../graphify/store.js';
+import {
+  discoverCanonicalRepositories,
+  resolveRepositoryWorkUnit,
+  topicStateDir,
+  topicWorktreesDir,
+} from '../repository-workspaces.js';
 import type {
   ExtractionBundle,
   GraphAffectedResult,
@@ -155,6 +161,7 @@ export interface GraphifyOverlayResolutionRequest {
   agentGroupId: string;
   sessionId: string;
   platformId: string | null;
+  messagingGroupId: string | null;
   threadId: string | null;
   threadWorktrees: boolean;
 }
@@ -231,10 +238,6 @@ function prefixed(prefix: string, path: string): string {
 function stableSourceId(workgroupId: string, relativePath: string): string {
   return `source_${hash(workgroupId, relativePath)}`;
 }
-function cleanSlug(value: string): string {
-  return value.replace(/[^A-Za-z0-9._-]/g, '_');
-}
-
 function sourceExtractionFailure(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return `deterministic extraction failed: ${message}`.slice(0, 1_000);
@@ -618,6 +621,13 @@ export class WorkgroupGraphDaemon {
       for (const member of members) {
         const root = join(this.options.groupsDir, member.folder);
         if (existsSync(root)) candidates.push({ absolutePath: root, prefix: `agents/${member.id}` });
+      }
+      // Canonical repositories are host-only normal clones outside all
+      // agent-writable workgroup roots. Graphify reads their clean working
+      // trees directly; topic overlays below add in-progress changes only to
+      // the requesting topic's query.
+      for (const repository of discoverCanonicalRepositories(id, this.options.dataDir)) {
+        candidates.push({ absolutePath: repository.path, prefix: `repositories/${repository.name}` });
       }
       const seen = new Set<string>();
       const roots: WorkgroupRoot[] = [];
@@ -2320,11 +2330,11 @@ export class WorkgroupGraphDaemon {
   ): Promise<T> {
     await this.validateOverlayContext(workgroupId, context);
     const db = new Database(this.centralDbPath, { readonly: true, fileMustExist: true });
-    let row: { platform_id: string | null; thread_id: string | null };
+    let row: { platform_id: string | null; messaging_group_id: string | null; thread_id: string | null };
     try {
       row = db
         .prepare(
-          `SELECT mg.platform_id, s.thread_id FROM sessions s
+          `SELECT mg.platform_id, s.messaging_group_id, s.thread_id FROM sessions s
         LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id WHERE s.id = ?`,
         )
         .get(context.sessionId) as typeof row;
@@ -2332,28 +2342,24 @@ export class WorkgroupGraphDaemon {
       db.close();
     }
     const defaultResolve: GraphifyOverlayResolver = (request) => {
-      if (request.threadWorktrees && request.platformId) {
-        const key = cleanSlug(request.threadId ?? `dm-${request.platformId}`);
-        const legacy = join(this.options.dataDir, 'v2-threads', key, 'worktrees');
-        const scoped = join(
-          this.options.dataDir,
-          'v2-threads',
-          `wg-${cleanSlug(request.workgroupId)}`,
-          key,
-          'worktrees',
-        );
-        // Compatibility only: the repo-workspace migration ends this fallback.
-        const sourceRoot = existsSync(legacy) && !existsSync(scoped) ? legacy : scoped;
-        return { sourceRoot, workUnitRoot: sourceRoot };
-      }
-      const sessionRoot = join(this.options.dataDir, 'v2-sessions', request.agentGroupId, request.sessionId);
-      return { sourceRoot: join(sessionRoot, 'worktrees'), workUnitRoot: sessionRoot };
+      const unit = resolveRepositoryWorkUnit({
+        workgroupId: request.workgroupId,
+        sessionId: request.sessionId,
+        platformId: request.platformId,
+        messagingGroupId: request.messagingGroupId,
+        threadId: request.threadId,
+      });
+      return {
+        sourceRoot: topicWorktreesDir(unit, this.options.dataDir),
+        workUnitRoot: topicStateDir(unit, this.options.dataDir),
+      };
     };
     const location = await (this.options.resolveOverlay ?? defaultResolve)({
       workgroupId,
       agentGroupId: context.agentGroupId,
       sessionId: context.sessionId,
       platformId: row?.platform_id ?? null,
+      messagingGroupId: row?.messaging_group_id ?? null,
       threadId: row?.thread_id ?? null,
       threadWorktrees: this.threadWorktrees,
     });

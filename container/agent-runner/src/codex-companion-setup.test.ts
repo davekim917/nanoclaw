@@ -130,6 +130,11 @@ describe('buildRuntimeConfig', () => {
     expect(source).not.toContain('parseHostMcpServers');
     expect(source).not.toContain('buildMergedConfig');
   });
+
+  it('installs the in-tree hook chain into the peer-mode CODEX_HOME', () => {
+    const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf8');
+    expect(source).toMatch(/writeCodexHooksJson\(\{\s*codexHome:\s*RUNTIME_CODEX_DIR\s*\}\)/);
+  });
 });
 
 describe('stripPluginsAndMarketplaces', () => {
@@ -182,9 +187,7 @@ describe('stripPluginsAndMarketplaces', () => {
     // TOML, so a trailing top-level key would need its own header to close
     // the preceding block (exactly like stripExistingMcpServers/
     // stripGitNexusReentrySurfaces, which share this same block-scoping).
-    const toml = ['model = "x"', '', '[plugins]', 'some_key = true', '', '[marketplaces]', 'other = false'].join(
-      '\n',
-    );
+    const toml = ['model = "x"', '', '[plugins]', 'some_key = true', '', '[marketplaces]', 'other = false'].join('\n');
     const stripped = stripPluginsAndMarketplacesForTest(toml);
     expect(stripped).not.toContain('some_key');
     expect(stripped).not.toContain('other = false');
@@ -405,10 +408,18 @@ const CAN_RUN_FS = (() => {
 
   afterEach(() => {
     if (!savedRuntimeExists) {
-      try { fs.rmSync(RUNTIME_CODEX_DIR, { recursive: true, force: true }); } catch { /* noop */ }
+      try {
+        fs.rmSync(RUNTIME_CODEX_DIR, { recursive: true, force: true });
+      } catch {
+        /* noop */
+      }
     }
     if (!savedHostExists) {
-      try { fs.rmSync(HOST_CODEX_DIR, { recursive: true, force: true }); } catch { /* noop */ }
+      try {
+        fs.rmSync(HOST_CODEX_DIR, { recursive: true, force: true });
+      } catch {
+        /* noop */
+      }
     } else {
       if (savedHostAuth !== null) fs.writeFileSync(path.join(HOST_CODEX_DIR, 'auth.json'), savedHostAuth);
       if (savedHostConfig !== null) fs.writeFileSync(path.join(HOST_CODEX_DIR, 'config.toml'), savedHostConfig);
@@ -446,5 +457,9 @@ const CAN_RUN_FS = (() => {
     expect(written).not.toContain('[mcp_servers.exa]');
     expect(written).toContain('sandbox_mode = "workspace-write"');
     expect(written).toContain('[mcp_servers.nanoclaw]');
+    const hooks = JSON.parse(fs.readFileSync(path.join(RUNTIME_CODEX_DIR, 'hooks.json'), 'utf-8')) as {
+      hooks: { PreToolUse: Array<{ hooks: Array<{ command: string }> }> };
+    };
+    expect(hooks.hooks.PreToolUse[0].hooks[0].command).toBe('bun /app/src/codex-hooks/cli.ts PreToolUse');
   });
 });

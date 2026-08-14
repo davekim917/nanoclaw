@@ -13,8 +13,18 @@
  *   frontmatter.description → toml description
  *   markdown body           → toml developer_instructions (multiline `"""…"""`)
  *
+ * Model tiering (`CODEX_WORKER_TIERS`): the tiered `worker*` defs exist to put
+ * cheap work on a cheap model, and that intent does not survive a name-only
+ * copy — a Codex role with no `model` silently inherits the parent's, so every
+ * "tier" resolves to the same model while its description still claims
+ * otherwise. Named workers therefore get an explicit Codex model + reasoning
+ * effort, and their trailing "Runs on <Claude model>" sentence is rewritten to
+ * name the Codex one. Unmapped agents keep the old inherit-from-parent
+ * behavior, which is correct for roles that aren't tiers (codex-rescue, etc).
+ *
  * Dropped (no Codex equivalent or runtime-specific):
- *   frontmatter.model       — Claude model names differ; let Codex inherit
+ *   frontmatter.model       — Claude model names differ; Codex model comes
+ *                              from CODEX_WORKER_TIERS, not from frontmatter
  *   frontmatter.tools       — Claude tool-restriction model; Codex uses
  *                              mcp_servers / skills.config at a coarser level
  *   frontmatter.color       — Claude UI only
@@ -28,6 +38,24 @@ export interface ClaudeAgent {
   description: string;
   body: string;
 }
+
+export interface CodexWorkerTier {
+  model: string;
+  effort: string;
+}
+
+/**
+ * Codex equivalents of the tiered Claude workers. Cheaper models carry a
+ * higher reasoning effort to compensate; the top tier matches the parent's
+ * own model and effort, so escalating buys reasoning depth rather than a
+ * bigger model. Only tiers belong here — a role that is a *kind* of worker
+ * rather than a rung (worker-codex, codex-rescue) is left to inherit.
+ */
+export const CODEX_WORKER_TIERS: Record<string, CodexWorkerTier> = {
+  'worker-fast': { model: 'gpt-5.6-luna', effort: 'max' },
+  worker: { model: 'gpt-5.6-terra', effort: 'xhigh' },
+  'worker-high': { model: 'gpt-5.6-sol', effort: 'high' },
+};
 
 /**
  * Parse a Claude subagent `.md` file's text content. Returns null when the
@@ -146,6 +174,8 @@ function tomlMultilineString(value: string): string {
  * output (and leave manually-authored TOMLs alone).
  */
 export function formatCodexAgentToml(agent: ClaudeAgent): string {
+  const tier = CODEX_WORKER_TIERS[agent.name];
+  const description = tier ? retargetRunsOnSentence(agent.description, tier) : agent.description;
   const lines: string[] = [
     MANAGED_MARKER,
     '',
@@ -153,13 +183,28 @@ export function formatCodexAgentToml(agent: ClaudeAgent): string {
     // Description can contain literal newlines (Claude's frontmatter often
     // packs multi-line "Examples" lists in description). Single-line basic
     // strings can't carry newlines, so pick multiline when needed.
-    agent.description.includes('\n')
-      ? `description = ${tomlMultilineString(agent.description)}`
-      : `description = ${tomlBasicString(agent.description)}`,
+    description.includes('\n')
+      ? `description = ${tomlMultilineString(description)}`
+      : `description = ${tomlBasicString(description)}`,
     `developer_instructions = ${tomlMultilineString(agent.body)}`,
-    '',
   ];
+  if (tier) {
+    lines.push(`model = ${tomlBasicString(tier.model)}`);
+    lines.push(`model_reasoning_effort = ${tomlBasicString(tier.effort)}`);
+  }
+  lines.push('');
   return lines.join('\n');
+}
+
+/**
+ * Replace the Claude-model claim that ends a tiered worker's description
+ * ("Runs on Sonnet at xhigh effort.") with the Codex model it actually runs
+ * on. Left alone when the sentence isn't there — the description is a routing
+ * signal, so a wrong model name in it actively mis-routes the orchestrator.
+ */
+function retargetRunsOnSentence(description: string, tier: CodexWorkerTier): string {
+  const stripped = description.replace(/\s*Runs on [^.]*\.\s*$/, '');
+  return `${stripped} Runs on ${tier.model} at ${tier.effort} reasoning.`;
 }
 
 /**

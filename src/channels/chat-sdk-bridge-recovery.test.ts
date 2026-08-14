@@ -16,13 +16,17 @@ function message(options: {
   threadId?: string;
   isBot?: boolean;
   isMe?: boolean;
+  authorUserId?: string;
+  authorUserName?: string;
+  authorFullName?: string;
+  links?: ChatMessage['links'];
   raw?: unknown;
 }): ChatMessage {
   const formatted = parseMarkdown(options.text);
   const author = {
-    userId: options.isMe ? 'bot-self' : `user-${options.id}`,
-    userName: options.isMe ? 'Example Agent' : 'Operator',
-    fullName: options.isMe ? 'Example Agent' : 'Operator',
+    userId: options.authorUserId ?? (options.isMe ? 'bot-self' : `user-${options.id}`),
+    userName: options.authorUserName ?? (options.isMe ? 'Example Agent' : 'Operator'),
+    fullName: options.authorFullName ?? (options.isMe ? 'Example Agent' : 'Operator'),
     isBot: options.isBot ?? false,
     isMe: options.isMe ?? false,
   };
@@ -36,7 +40,7 @@ function message(options: {
     author,
     metadata,
     attachments: [],
-    links: [],
+    links: options.links ?? [],
     toJSON: () => ({
       id: options.id,
       threadId: options.threadId ?? 'stub:C:T',
@@ -46,7 +50,7 @@ function message(options: {
       author,
       metadata: { dateSent: options.timestamp, edited: false },
       attachments: [],
-      links: [],
+      links: options.links ?? [],
     }),
   } as unknown as ChatMessage;
 }
@@ -212,6 +216,95 @@ describe('Chat SDK bridge missed-message recovery', () => {
       { id: 'new-2', isMention: false },
     ]);
     expect(result).toEqual({ scannedTargets: 1, recoveredMessages: 2, failedTargets: 0 });
+  });
+
+  it('normalizes stale sibling sender names before recovered messages reach the router', async () => {
+    const fetched = [
+      message({
+        id: 'peer',
+        timestamp: '2026-07-21T18:18:00Z',
+        text: 'assignment',
+        isBot: true,
+        authorUserId: 'U-DINESH',
+        authorUserName: 'argus',
+        authorFullName: 'Argus',
+      }),
+    ];
+    const bridge = createChatSdkBridge({
+      adapter: {
+        name: 'stub',
+        initialize: async () => {},
+        channelIdFromThreadId: () => 'stub:C',
+        fetchMessages: vi.fn(async () => ({ messages: fetched })),
+      } as unknown as Adapter,
+      supportsThreads: true,
+      allowRecoveredBotMessage: () => true,
+      transformInboundSender: (author) => (author.userId === 'U-DINESH' ? 'Dinesh' : null),
+    });
+    const senders: string[] = [];
+    await bridge.setup({
+      onInbound: async (_platformId, _threadId, msg) => {
+        senders.push((msg.content as { senderName?: string }).senderName ?? 'missing');
+      },
+      onInboundEvent: async () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    } as ChannelSetup);
+
+    await bridge.recoverMissedMessages!({
+      since: '2026-07-21T18:16:00Z',
+      reason: 'event-loop-stall',
+      targets: [{ platformId: 'stub:C', threadId: 'stub:C:T', isDM: false }],
+    });
+
+    expect(senders).toEqual(['Dinesh']);
+  });
+
+  it('normalizes a stale sibling name in recovered quoted-message context', async () => {
+    const fetched = [
+      message({
+        id: 'quote',
+        timestamp: '2026-07-21T18:18:00Z',
+        text: 'following up',
+        links: [
+          {
+            fetchMessage: async () => ({
+              id: 'quoted-peer',
+              text: 'original assignment',
+              author: { userId: 'U-DINESH', userName: 'argus', fullName: 'Argus' },
+            }),
+          },
+        ] as ChatMessage['links'],
+      }),
+    ];
+    const bridge = createChatSdkBridge({
+      adapter: {
+        name: 'stub',
+        initialize: async () => {},
+        channelIdFromThreadId: () => 'stub:C',
+        fetchMessages: vi.fn(async () => ({ messages: fetched })),
+      } as unknown as Adapter,
+      supportsThreads: true,
+      transformInboundSender: (author) => (author.userId === 'U-DINESH' ? 'Dinesh' : null),
+    });
+    const quotedSenders: string[] = [];
+    await bridge.setup({
+      onInbound: async (_platformId, _threadId, msg) => {
+        const content = msg.content as { replyTo?: { sender?: string } };
+        quotedSenders.push(content.replyTo?.sender ?? 'missing');
+      },
+      onInboundEvent: async () => {},
+      onMetadata: () => {},
+      onAction: () => {},
+    } as ChannelSetup);
+
+    await bridge.recoverMissedMessages!({
+      since: '2026-07-21T18:16:00Z',
+      reason: 'event-loop-stall',
+      targets: [{ platformId: 'stub:C', threadId: 'stub:C:T', isDM: false }],
+    });
+
+    expect(quotedSenders).toEqual(['Dinesh']);
   });
 
   it('fails soft per target and reports incomplete coverage', async () => {

@@ -17,6 +17,7 @@ const STICKY_MODEL_KEY = 'sticky_model';
 const STICKY_EFFORT_KEY = 'sticky_effort';
 const STICKY_ULTRACODE_KEY = 'sticky_ultracode';
 const STICKY_FAST_KEY = 'sticky_fast';
+const REPOSITORY_MOUNT_BARRIER_ACK_KEY = 'repository_mount_barrier_ack';
 
 function continuationKey(providerName: string): string {
   return `continuation:${providerName.toLowerCase()}`;
@@ -41,6 +42,17 @@ function setValue(key: string, value: string): void {
 
 function deleteValue(key: string): void {
   getOutboundDb().prepare('DELETE FROM session_state WHERE key = ?').run(key);
+}
+
+/**
+ * Acknowledge that the poll loop reached an admission boundary while the
+ * host-owned repository ingress fence was active. The host waits for this
+ * exact epoch before stopping the container, so a stale acknowledgement from
+ * an earlier publication can never authorize a later mount transition.
+ */
+export function acknowledgeRepositoryMountBarrier(epoch: string): void {
+  if (!epoch) throw new Error('repository mount barrier epoch must not be empty');
+  setValue(REPOSITORY_MOUNT_BARRIER_ACK_KEY, epoch);
 }
 
 /**
@@ -401,9 +413,9 @@ export const INFRA_WARNING_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6h
  * ever need independent cooldown windows.
  */
 export function shouldPostInfraWarning(text: string): boolean {
-  const row = getOutboundDb().prepare('SELECT value, updated_at FROM session_state WHERE key = ?').get(
-    INFRA_WARNING_KEY,
-  ) as { value: string; updated_at: string } | undefined;
+  const row = getOutboundDb()
+    .prepare('SELECT value, updated_at FROM session_state WHERE key = ?')
+    .get(INFRA_WARNING_KEY) as { value: string; updated_at: string } | undefined;
   if (row && row.value === text) {
     const age = Date.now() - new Date(row.updated_at).getTime();
     if (Number.isFinite(age) && age < INFRA_WARNING_COOLDOWN_MS) return false;

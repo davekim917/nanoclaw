@@ -1,785 +1,1905 @@
+#!/usr/bin/env tsx
 /**
- * Repo-store migration: legacy shared canonical clones → bare mirror +
- * detached RO snapshot + standalone thread clones.
+ * Server-wide, lossless repository topology migration.
  *
- *   pnpm exec tsx scripts/migrate-repo-store.ts --workgroup <id> [--execute]
- *
- * Default is DRY-RUN: prints the full per-repo action plan and touches
- * nothing. `--execute` requires the workgroup's containers to be stopped
- * (quiesce is a hard precondition — live containers hold cwds and git state
- * inside the trees being rewritten).
- *
- * Per legacy canonical clone at the workgroup root:
- *   1. Inventory: checked-out branch, dirty files, linked worktrees.
- *   2. Rescue archive: `git bundle --all` + full tar (tree + .git) into
- *      `.rescues/<run>/` — nothing is touched before both exist.
- *   3. Dirt classification: NanoClaw-injected artifacts (.claude/, CLAUDE.md,
- *      AGENTS.md, .mcp.json, .gitignore) vs real work. Real work is committed
- *      to `nanoclaw-rescue/<run>/<branch>` — the original branch is never
- *      polluted. Push of original + rescue branches is best-effort (the
- *      bundle already guarantees nothing is lost).
- *   4. Convert: bare-clone the canonical (captures every local branch,
- *      including unpushed and the rescue branch) to `.repos/<repo>.git`,
- *      repoint origin at the real remote, set the fetch refspec, set HEAD
- *      from the remote's default when reachable.
- *   5. Linked worktrees:
- *      - workgroup-root named checkouts (`/workspace/workgroup/<name>`) are
- *        converted to standalone clones under `.worktrees/<name>` with a
- *        root-level relative symlink keeping the old name findable (Graphify
- *        skips symlinks, agents don't lose the path). Clean + fully-pushed
- *        ones are simply removed.
- *      - per-thread worktrees (data/v2-threads|v2-sessions .../worktrees/<repo>)
- *        get a .git-dir transplant: clone --no-checkout from the mirror, move
- *        the .git dir in, recreate the branch ref at the recorded commit, and
- *        `git reset` to rebuild the index without touching the working tree —
- *        dirt survives byte-for-byte. Clean + pushed ones are deleted
- *        (create_worktree recreates on demand).
- *      - anything unmappable is left in place and listed for manual handling.
- *   6. The old canonical moves to `.rescues/<run>/<repo>-old` (never deleted)
- *      and a fresh detached snapshot clone takes its place at the old path.
- *   7. Legacy thread-state dirs move under the wg-<id> namespace, ending the
- *      threadStateDir fallback window for this workgroup.
- *   8. Rescue index written to `.rescues/<run>/INDEX.md` and the workgroup
- *      memory (`memory/repo-store-migration-<date>.md`).
+ * Dry-run is read-only. Execute requires an already-stopped fleet and creates
+ * per-repository synthetic rescue refs, bundles, retained renamed checkouts,
+ * normal host canonicals, and per-topic linked worktrees.
  */
 import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import BetterSqlite3 from 'better-sqlite3';
+import { pathToFileURL } from 'url';
 
-const args = process.argv.slice(2);
-function flagValue(name: string): string | null {
-  const i = args.indexOf(name);
-  return i >= 0 && args[i + 1] ? args[i + 1] : null;
+import Database from 'better-sqlite3';
+
+import { CONTAINER_INSTALL_LABEL, DATA_DIR, GROUPS_DIR, REPO_ROOT } from '../src/config.js';
+import {
+  auditRepositoryMigration,
+  createLegacyGitResolutionContext,
+  createRepositoryMigrationManifest,
+  executeRepositoryMigration,
+  manifestPath,
+  mergeLegacyCheckoutProvenance,
+  readLegacyCheckoutOrigin,
+  readLegacyGitDirOrigin,
+  repositoryMigrationPath,
+  rollbackRepositoryMigration,
+  validateReviewedRecoverySeeds,
+  verifyRepositoryMigrationManifest,
+  type LegacyCheckoutCandidate,
+  type LegacyGitResolutionContext,
+  type RepositoryMigrationManifest,
+} from '../src/repository-migration.js';
+import {
+  canonicalRepoDir,
+  readOriginPin,
+  repositoriesRoot,
+  repositoryStateRoot,
+  resolveRepositoryWorkUnit,
+  topicWorktreesDir,
+  topicsRoot,
+  withHostRepositoryLock,
+  type RepositoryWorkUnit,
+} from '../src/repository-workspaces.js';
+import { readThreadDirOwner, threadWorktreeDir } from '../src/session-manager.js';
+import {
+  applyReviewedWorkUnitMappings,
+  loadReviewedWorkUnitMappings,
+  type ReviewedMappingEntry,
+} from '../src/repository-migration-mapping.js';
+import {
+  loadReviewedRecoveryDecisions,
+  recoverySeedGitDirSha256,
+  selectReviewedOrigin,
+  type LoadedReviewedRecoveryDecisions,
+} from '../src/repository-migration-recovery.js';
+import {
+  normalizedCredentialFreeGithubOrigin,
+  normalizedGithubRepositoryIdentity,
+  planLegacyRepositoryCoalescing,
+  repositoryOriginContainsCredentials,
+} from '../src/repository-migration-identity.js';
+import {
+  discoverPhysicalGitCheckouts,
+  isPhysicalGitCheckout,
+  isLegacyCanonicalCheckout,
+  SESSION_RUNTIME_REPOSITORY_EXCLUSIONS,
+} from '../src/repository-discovery.js';
+import {
+  captureProtectedArchive,
+  verifyProtectedArchives,
+  type ProtectedArchiveEvidence,
+} from '../src/repository-protected-archives.js';
+
+interface Args {
+  execute: boolean;
+  quiesced: boolean;
+  rollbackRun?: string;
+  workgroup?: string;
+  repo?: string;
+  runId?: string;
+  mappingFile?: string;
+  recoveryFile?: string;
+  proposalFile?: string;
 }
-const WORKGROUP = flagValue('--workgroup');
-const EXECUTE = args.includes('--execute');
-const ROOT = path.resolve(flagValue('--root') ?? path.join(import.meta.dirname, '..'));
-const DATA_DIR = process.env.NANOCLAW_DATA_DIR ?? path.join(ROOT, 'data');
 
-if (!WORKGROUP) {
-  console.error('Usage: tsx scripts/migrate-repo-store.ts --workgroup <id> [--execute]');
-  process.exit(1);
-}
-// process.exit above doesn't narrow for closures — pin the non-null value.
-const WG: string = WORKGROUP;
-
-const WG_DIR = path.join(DATA_DIR, 'workgroups', WORKGROUP);
-const RUN = new Date().toISOString().replace(/[:.]/g, '-');
-const RESCUES = path.join(WG_DIR, '.rescues', RUN);
-const REPOS = path.join(WG_DIR, '.repos');
-const WORKTREES_NS = path.join(WG_DIR, '.worktrees');
-
-const INJECTED_PATTERNS = [
-  /^\.claude\//,
-  /^CLAUDE\.md$/,
-  /^CLAUDE\.local\.md$/,
-  /^AGENTS\.md$/,
-  /^\.mcp\.json$/,
-  /^\.gitignore$/,
-  /^\.claude-fragments\//,
-];
-
-interface PlannedAction {
-  kind: string;
-  detail: string;
-  run?: () => void;
+interface SessionRow {
+  session_id: string;
+  agent_group_id: string;
+  folder: string;
+  workgroup_id: string;
+  messaging_group_id: string | null;
+  platform_id: string | null;
+  thread_id: string | null;
 }
 
-const plan: PlannedAction[] = [];
-const manualFlags: string[] = [];
-const rescueIndex: string[] = [];
-
-function act(kind: string, detail: string, run?: () => void): void {
-  plan.push({ kind, detail, run });
+interface AgentGroupRow {
+  agent_group_id: string;
+  folder: string;
+  workgroup_id: string;
 }
 
-function git(cwd: string, gitArgs: string[], timeoutMs = 120_000): string {
-  return execFileSync('git', gitArgs, { cwd, stdio: 'pipe', encoding: 'utf-8', timeout: timeoutMs }).toString().trim();
+function parseArgs(argv: string[]): Args {
+  const args: Args = { execute: false, quiesced: false };
+  for (let index = 0; index < argv.length; index += 1) {
+    const value = argv[index];
+    if (value === '--execute') args.execute = true;
+    else if (value === '--quiesced') args.quiesced = true;
+    else if (value === '--rollback-run') args.rollbackRun = argv[++index];
+    else if (value === '--all') args.workgroup = undefined;
+    else if (value === '--workgroup') args.workgroup = argv[++index];
+    else if (value === '--repo') args.repo = argv[++index];
+    else if (value === '--run-id') args.runId = argv[++index];
+    else if (value === '--mapping-file') args.mappingFile = argv[++index];
+    else if (value === '--recovery-file') args.recoveryFile = argv[++index];
+    else if (value === '--proposal-file') args.proposalFile = argv[++index];
+    else throw new Error(`unknown argument: ${value}`);
+  }
+  if (args.execute && !args.quiesced) throw new Error('--execute requires --quiesced');
+  if (args.rollbackRun && !args.quiesced) throw new Error('--rollback-run requires --quiesced');
+  if (args.rollbackRun && args.execute) throw new Error('--rollback-run and --execute are mutually exclusive');
+  if (
+    args.rollbackRun &&
+    (args.workgroup || args.repo || args.runId || args.mappingFile || args.recoveryFile || args.proposalFile)
+  ) {
+    throw new Error('--rollback-run cannot be combined with inventory or recovery-selection arguments');
+  }
+  return args;
 }
-function tryGit(cwd: string, gitArgs: string[], timeoutMs = 120_000): string | null {
+
+function atomicJson(file: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temp = `${file}.tmp-${process.pid}-${createHash('sha256').update(String(Math.random())).digest('hex').slice(0, 12)}`;
   try {
-    return git(cwd, gitArgs, timeoutMs);
+    fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    const fd = fs.openSync(temp, fs.constants.O_RDONLY);
+    try {
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(temp, file);
+    const parentFd = fs.openSync(path.dirname(file), fs.constants.O_RDONLY);
+    try {
+      fs.fsyncSync(parentFd);
+    } finally {
+      fs.closeSync(parentFd);
+    }
+  } finally {
+    try {
+      fs.unlinkSync(temp);
+    } catch {
+      // Published or never created.
+    }
+  }
+}
+
+function sha(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+    .join(',')}}`;
+}
+
+function captureProtectedArchives(groups: AgentGroupRow[], workgroups: Set<string>): ProtectedArchiveEvidence[] {
+  const roots = new Set<string>();
+  for (const group of groups) {
+    if (!workgroups.has(group.workgroup_id)) continue;
+    const groupRoot = path.join(GROUPS_DIR, group.folder);
+    for (const child of safeDirectories(groupRoot)) {
+      const candidate = path.join(groupRoot, child);
+      try {
+        const marker = fs.lstatSync(path.join(candidate, '.archive-sha'));
+        const candidateStat = fs.lstatSync(candidate);
+        if (
+          candidateStat.isSymbolicLink() ||
+          !candidateStat.isDirectory() ||
+          marker.isSymbolicLink() ||
+          !marker.isFile()
+        ) {
+          throw new Error(`unsafe protected archive root: ${candidate}`);
+        }
+        roots.add(fs.realpathSync(candidate));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+  }
+  return [...roots].sort().map(captureProtectedArchive);
+}
+
+function fallbackUnit(workgroupId: string, identity: string): RepositoryWorkUnit {
+  const key = `session:legacy:${sha(identity).slice(0, 24)}`;
+  return { workgroupId, kind: 'session', key, id: sha(`${workgroupId}\0${key}`).slice(0, 32) };
+}
+
+function safeDirectories(directory: string): string[] {
+  try {
+    fs.lstatSync(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw new Error(
+      `cannot inspect configured repository root ${directory}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+  try {
+    return fs
+      .readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => (entry.isDirectory() || entry.isSymbolicLink()) && entry.name !== '.git')
+      .map((entry) => entry.name)
+      .sort();
+  } catch (error) {
+    throw new Error(
+      `cannot enumerate configured repository root ${directory}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+}
+
+function originFor(candidate: LegacyCheckoutCandidate, context: LegacyGitResolutionContext): string | null {
+  let origin: string | null;
+  try {
+    origin = readLegacyCheckoutOrigin(candidate, context);
+  } catch (error) {
+    const gitDir = path.join(candidate.checkoutPath, '.git');
+    if (!fs.lstatSync(gitDir).isDirectory() || readLegacyGitDirOrigin(gitDir, context) !== null) throw error;
+    origin = null;
+  }
+  const seen = new Set<string>();
+  while (origin !== null && path.isAbsolute(origin)) {
+    if (seen.has(origin)) throw new Error(`local repository origin cycle while resolving ${candidate.checkoutPath}`);
+    seen.add(origin);
+    let localStore: string | undefined;
+    if (fs.existsSync(origin)) {
+      localStore = fs.existsSync(path.join(origin, '.git')) ? path.join(origin, '.git') : origin;
+    } else {
+      const repoName = path.basename(origin).replace(/\.git$/, '');
+      localStore = (candidate.candidateCommonGitDirs ?? []).find((common) => {
+        if (origin.includes('/.repos/')) return path.basename(common).replace(/\.git$/, '') === repoName;
+        return path.basename(path.dirname(common)) === repoName;
+      });
+    }
+    if (!localStore) throw new Error(`local repository origin target is missing or ambiguous: ${origin}`);
+    origin = readLegacyGitDirOrigin(localStore, context);
+  }
+  return origin?.replace(/\.git\/?$/, '').replace(/\/$/, '') ?? null;
+}
+
+function originForObjectStore(store: string, context: LegacyGitResolutionContext): string | null {
+  let origin = readLegacyGitDirOrigin(store, context);
+  const seen = new Set<string>();
+  while (origin !== null && path.isAbsolute(origin)) {
+    if (seen.has(origin)) throw new Error(`local object-store origin cycle while resolving ${store}`);
+    seen.add(origin);
+    if (!fs.existsSync(origin)) throw new Error(`local object-store origin target is missing: ${origin}`);
+    const localStore = fs.existsSync(path.join(origin, '.git')) ? path.join(origin, '.git') : origin;
+    origin = readLegacyGitDirOrigin(localStore, context);
+  }
+  return origin?.replace(/\.git\/?$/, '').replace(/\/$/, '') ?? null;
+}
+
+function repoFromPointer(checkoutPath: string): string | null {
+  try {
+    const match = /^gitdir:\s*(.+)\s*$/i.exec(fs.readFileSync(path.join(checkoutPath, '.git'), 'utf8'));
+    if (!match) return null;
+    const pointer = match[1].replaceAll('\\', '/');
+    const patterns = [
+      /\/workspace\/workgroup\/\.repos\/([^/]+?)\.git\/worktrees\//,
+      /\/workspace\/workgroup\/([^/]+?)\/\.git\/worktrees\//,
+      /\/workspace\/worktrees\/([^/]+?)\/\.git\/worktrees\//,
+      /\/([^/]+?)\.git\/worktrees\//,
+      /\/([^/]+?)\/\.git\/worktrees\//,
+    ];
+    for (const pattern of patterns) {
+      const parsed = pattern.exec(pointer);
+      if (parsed) return parsed[1];
+    }
+  } catch {
+    // Standalone checkout or unreadable pointer; caller uses its legacy name.
+  }
+  return null;
+}
+
+function repoForCheckout(checkoutPath: string, fallback: string): string {
+  const linked = repoFromPointer(checkoutPath);
+  if (linked) return linked;
+  const gitDir = path.join(checkoutPath, '.git');
+  try {
+    if (!fs.lstatSync(gitDir).isDirectory()) return fallback;
+    const origin = execFileSync('git', ['--git-dir', gitDir, 'config', '--get', 'remote.origin.url'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+    }).trim();
+    const pathname = (() => {
+      try {
+        return new URL(origin).pathname;
+      } catch {
+        return origin;
+      }
+    })();
+    return path.basename(pathname).replace(/\.git$/, '') || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function loadRows(db: Database.Database): SessionRow[] {
+  return db
+    .prepare(
+      `SELECT s.id AS session_id, s.agent_group_id, ag.folder,
+              COALESCE(ag.workgroup_id, ag.folder) AS workgroup_id,
+              s.messaging_group_id, mg.platform_id, s.thread_id
+         FROM sessions s
+         JOIN agent_groups ag ON ag.id = s.agent_group_id
+         LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id`,
+    )
+    .all() as SessionRow[];
+}
+
+function loadAgentGroups(db: Database.Database): AgentGroupRow[] {
+  return db
+    .prepare(
+      `SELECT id AS agent_group_id, folder,
+              COALESCE(workgroup_id, folder) AS workgroup_id
+         FROM agent_groups`,
+    )
+    .all() as AgentGroupRow[];
+}
+
+function addCandidate(
+  grouped: Map<string, LegacyCheckoutCandidate[]>,
+  seen: Set<string>,
+  physicalOwners: Map<string, string>,
+  candidate: LegacyCheckoutCandidate,
+): void {
+  let real: string;
+  try {
+    real = fs.realpathSync(candidate.checkoutPath);
+  } catch {
+    return;
+  }
+  if (!isPhysicalGitCheckout(real)) return;
+  const discoveredCandidate: LegacyCheckoutCandidate = {
+    ...candidate,
+    checkoutPath: real,
+    ...configuredOriginProvenance(real),
+  };
+  const priorOwner = physicalOwners.get(real);
+  if (priorOwner && priorOwner !== candidate.workgroupId) {
+    throw new Error(`physical checkout is shared across workgroups (${priorOwner}, ${candidate.workgroupId}): ${real}`);
+  }
+  physicalOwners.set(real, candidate.workgroupId);
+  const identity = `${candidate.workgroupId}\0${candidate.repo}\0${real}`;
+  const key = `${candidate.workgroupId}\0${candidate.repo}`;
+  const entries = grouped.get(key) ?? [];
+  if (seen.has(identity)) {
+    const index = entries.findIndex((entry) => entry.checkoutPath === real);
+    if (index < 0) throw new Error(`repository discovery identity is missing from its group: ${real}`);
+    entries[index] = mergeLegacyCheckoutProvenance(entries[index], discoveredCandidate);
+    grouped.set(key, entries);
+    return;
+  }
+  seen.add(identity);
+  entries.push(discoveredCandidate);
+  grouped.set(key, entries);
+}
+
+function configuredOrigin(checkoutPath: string): string | null {
+  const gitDir = path.join(checkoutPath, '.git');
+  try {
+    if (!fs.lstatSync(gitDir).isDirectory()) return null;
+    return (
+      execFileSync('git', ['--git-dir', gitDir, 'config', '--get', 'remote.origin.url'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+        timeout: 10_000,
+      }).trim() || null
+    );
   } catch {
     return null;
   }
 }
 
-function isGitClone(dir: string): boolean {
+export function configuredOriginProvenance(
+  checkoutPath: string,
+): Pick<LegacyCheckoutCandidate, 'credentialBearingOrigin'> {
+  return repositoryOriginContainsCredentials(configuredOrigin(checkoutPath)) ? { credentialBearingOrigin: true } : {};
+}
+
+export function normalizedObservedOrigin(origin: string | null): string | null {
+  if (origin === null) return null;
+  return normalizedCredentialFreeGithubOrigin(origin) ?? origin;
+}
+
+export function classifySessionRepositoryCheckout(input: {
+  checkoutPath: string;
+  physicalSession: string;
+  workgroupId: string;
+  liveWorkUnit: RepositoryWorkUnit;
+}): Pick<LegacyCheckoutCandidate, 'workUnit' | 'sourceRole' | 'credentialBearingOrigin'> {
+  const checkoutPath = fs.realpathSync(input.checkoutPath);
+  const stagingRoot = path.join(input.physicalSession, 'repository-staging');
+  let stagingRootReal: string;
   try {
-    return fs.statSync(path.join(dir, '.git')).isDirectory();
-  } catch {
-    return false;
+    stagingRootReal = fs.realpathSync(stagingRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { workUnit: input.liveWorkUnit };
+    throw new Error(
+      `cannot classify the requesting session repository-staging root: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      { cause: error },
+    );
   }
+  if (!contained(checkoutPath, stagingRootReal)) return { workUnit: input.liveWorkUnit };
+  return {
+    workUnit: fallbackUnit(input.workgroupId, `repository-staging\0${checkoutPath}`),
+    sourceRole: 'repository-staging',
+    ...configuredOriginProvenance(checkoutPath),
+  };
 }
 
-function classifyDirt(statusPorcelain: string): { injected: string[]; real: string[] } {
-  const injected: string[] = [];
-  const real: string[] = [];
-  for (const line of statusPorcelain.split('\n').filter(Boolean)) {
-    // git() trims output, so the FIRST line loses its leading status space
-    // (` M x` → `M x`) — a fixed slice(3) truncates that filename. Parse the
-    // 1-2 char status token explicitly instead.
-    const m = line.match(/^[MTADRCU?!\s]{1,2}\s(.*)$/);
-    const file = (m ? m[1] : line).split(' -> ').pop()!;
-    (INJECTED_PATTERNS.some((re) => re.test(file)) ? injected : real).push(file);
-  }
-  return { injected, real };
-}
+function inventoryCandidates(
+  rows: SessionRow[],
+  groups: AgentGroupRow[],
+  selectedWorkgroup?: string,
+  reviewedMappings: ReviewedMappingEntry[] = [],
+): Map<string, LegacyCheckoutCandidate[]> {
+  const grouped = new Map<string, LegacyCheckoutCandidate[]>();
+  const seen = new Set<string>();
+  const physicalOwners = new Map<string, string>();
+  const reviewedByPath = new Map(reviewedMappings.map((entry) => [path.resolve(entry.checkoutPath), entry]));
+  const ownershipErrors: string[] = [];
 
-function ensureQuiesced(): void {
-  // Container names derive from agent_groups.folder, NOT the workgroup id —
-  // filter by every member folder (codex native review P1 #1). No DB means
-  // we cannot enumerate members: refuse unless --force.
-  const members = workgroupAgentGroups();
-  if (members === null) {
-    if (args.includes('--force')) {
-      console.warn('WARNING: central DB unavailable — member containers unverifiable, continuing under --force.');
-      return;
+  // Agent-group and workgroup-local checkouts, including legacy .worktrees.
+  const rootsByWorkgroup = new Map<string, Set<string>>();
+  for (const group of groups) {
+    if (selectedWorkgroup && group.workgroup_id !== selectedWorkgroup) continue;
+    const roots = rootsByWorkgroup.get(group.workgroup_id) ?? new Set<string>();
+    roots.add(path.join(GROUPS_DIR, group.folder));
+    roots.add(path.join(DATA_DIR, 'workgroups', group.workgroup_id));
+    rootsByWorkgroup.set(group.workgroup_id, roots);
+  }
+  for (const [workgroupId, roots] of rootsByWorkgroup) {
+    const allowedRoots = [...roots];
+    for (const root of roots) {
+      for (const checkoutPath of discoverPhysicalGitCheckouts(root, allowedRoots)) {
+        const fallback = path.basename(checkoutPath);
+        const repositoryName = repoForCheckout(checkoutPath, fallback);
+        const sourceRole = isLegacyCanonicalCheckout(checkoutPath, root) ? ('legacy-canonical' as const) : undefined;
+        addCandidate(grouped, seen, physicalOwners, {
+          workgroupId,
+          repo: repositoryName,
+          checkoutPath,
+          workUnit: fallbackUnit(workgroupId, checkoutPath),
+          ...(sourceRole ? { sourceRole } : {}),
+        });
+      }
     }
-    console.error('REFUSING to execute: central DB unavailable, cannot enumerate member containers. Pass --force to override.');
-    process.exit(2);
   }
-  let out = '';
+
+  // Recursively inventory every live and historical physical session root,
+  // not only the conventional worktrees/ child. Agents could previously make
+  // standalone or nested clones anywhere under writable /workspace.
+  const rowsByPhysicalSession = new Map(rows.map((row) => [`${row.agent_group_id}\0${row.session_id}`, row]));
+  const groupsById = new Map(groups.map((group) => [group.agent_group_id, group]));
+  const sessionsRoot = path.join(DATA_DIR, 'v2-sessions');
+  for (const agentGroupId of safeDirectories(sessionsRoot)) {
+    const groupRoot = path.join(sessionsRoot, agentGroupId);
+    const groupRootStat = fs.lstatSync(groupRoot);
+    if (groupRootStat.isSymbolicLink() || !groupRootStat.isDirectory()) {
+      throw new Error(`session agent-group root is not a real directory: ${groupRoot}`);
+    }
+    const group = groupsById.get(agentGroupId);
+    if (!group) throw new Error(`historical session root has no workgroup owner: ${groupRoot}`);
+    if (selectedWorkgroup && group.workgroup_id !== selectedWorkgroup) continue;
+    for (const sessionId of safeDirectories(groupRoot).filter((name) => !name.startsWith('.'))) {
+      const physicalSession = path.join(groupRoot, sessionId);
+      const sessionStat = fs.lstatSync(physicalSession);
+      if (sessionStat.isSymbolicLink() || !sessionStat.isDirectory()) {
+        throw new Error(`session root is not a real directory: ${physicalSession}`);
+      }
+      const row = rowsByPhysicalSession.get(`${agentGroupId}\0${sessionId}`);
+      const unit = row
+        ? resolveRepositoryWorkUnit({
+            workgroupId: row.workgroup_id,
+            sessionId: row.session_id,
+            platformId: row.platform_id,
+            messagingGroupId: row.messaging_group_id,
+            threadId: row.thread_id,
+          })
+        : fallbackUnit(group.workgroup_id, physicalSession);
+      const sessionAllowedRoots = [
+        physicalSession,
+        path.join(DATA_DIR, 'workgroups', group.workgroup_id),
+        ...groups
+          .filter((candidate) => candidate.workgroup_id === group.workgroup_id)
+          .map((candidate) => path.join(GROUPS_DIR, candidate.folder)),
+      ];
+      for (const checkoutPath of discoverPhysicalGitCheckouts(physicalSession, sessionAllowedRoots, {
+        skipRootEntries: SESSION_RUNTIME_REPOSITORY_EXCLUSIONS,
+      })) {
+        const fallback = path.basename(checkoutPath);
+        const classification = classifySessionRepositoryCheckout({
+          checkoutPath,
+          physicalSession,
+          workgroupId: group.workgroup_id,
+          liveWorkUnit: unit,
+        });
+        addCandidate(grouped, seen, physicalOwners, {
+          workgroupId: group.workgroup_id,
+          repo: repoForCheckout(checkoutPath, fallback),
+          checkoutPath,
+          ...classification,
+        });
+      }
+    }
+  }
+
+  // Legacy thread checkout paths outside session roots get the same canonical
+  // work-unit used by spawn/create/Graphify/cleanup. Inventory the physical
+  // tree too so deleted DB rows cannot hide historical work.
+  const physicalThreadUnits = new Map<string, RepositoryWorkUnit[]>();
+  for (const row of rows) {
+    const unit = resolveRepositoryWorkUnit({
+      workgroupId: row.workgroup_id,
+      sessionId: row.session_id,
+      platformId: row.platform_id,
+      messagingGroupId: row.messaging_group_id,
+      threadId: row.thread_id,
+    });
+    if (!row.platform_id) continue;
+    const root = threadWorktreeDir(row.platform_id, row.thread_id, row.workgroup_id);
+    const key = path.resolve(root);
+    const units = physicalThreadUnits.get(key) ?? [];
+    if (!units.some((candidate) => candidate.workgroupId === unit.workgroupId && candidate.key === unit.key))
+      units.push(unit);
+    physicalThreadUnits.set(key, units);
+  }
+  const threadsRoot = path.join(DATA_DIR, 'v2-threads');
+  for (const topName of safeDirectories(threadsRoot)) {
+    const top = path.join(threadsRoot, topName);
+    const topStat = fs.lstatSync(top);
+    if (topStat.isSymbolicLink() || !topStat.isDirectory())
+      throw new Error(`thread root is not a real directory: ${top}`);
+    const roots: Array<{ state: string; worktrees: string; scopedWorkgroup?: string }> = [];
+    const flatWorktrees = path.join(top, 'worktrees');
+    if (fs.existsSync(flatWorktrees)) {
+      roots.push({ state: top, worktrees: flatWorktrees });
+    } else {
+      if (topName.startsWith('wg-')) {
+        const scopedWorkgroup = topName.slice(3);
+        if (!groups.some((group) => group.workgroup_id === scopedWorkgroup)) {
+          throw new Error(`historical thread namespace has no configured workgroup owner: ${top}`);
+        }
+        for (const threadName of safeDirectories(top)) {
+          const state = path.join(top, threadName);
+          const worktrees = path.join(state, 'worktrees');
+          if (fs.existsSync(worktrees)) roots.push({ state, worktrees, scopedWorkgroup });
+        }
+      } else {
+        // Old installs can leave empty messaging-group directories or put a
+        // checkout directly below one. Empty roots are harmless; any actual
+        // checkout is inventoried and requires an exact reviewed owner mapping.
+        roots.push({ state: top, worktrees: top });
+      }
+    }
+    for (const physical of roots) {
+      const checkoutPaths = discoverPhysicalGitCheckouts(physical.worktrees, [physical.worktrees]);
+      if (checkoutPaths.length === 0) continue;
+      const mapped = physicalThreadUnits.get(path.resolve(physical.worktrees)) ?? [];
+      const mappedWorkgroups = new Set(mapped.map((unit) => unit.workgroupId));
+      const markerOwner = readThreadDirOwner(physical.state);
+      const reviewedOwners = new Set(
+        checkoutPaths
+          .map((checkoutPath) => reviewedByPath.get(path.resolve(checkoutPath))?.workgroupId)
+          .filter(Boolean),
+      );
+      if (reviewedOwners.size > 1) {
+        throw new Error(`reviewed mappings split one historical thread root across workgroups: ${physical.worktrees}`);
+      }
+      const reviewedOwner = reviewedOwners.size === 1 ? [...reviewedOwners][0]! : null;
+      const owner =
+        physical.scopedWorkgroup ??
+        markerOwner ??
+        (mappedWorkgroups.size === 1 ? [...mappedWorkgroups][0] : null) ??
+        reviewedOwner;
+      if (!owner || owner === '!! conflict' || (mappedWorkgroups.size > 0 && !mappedWorkgroups.has(owner))) {
+        ownershipErrors.push(
+          ...checkoutPaths.map(
+            (checkoutPath) => `${checkoutPath} (historical thread ownership missing; add an exact reviewed mapping)`,
+          ),
+        );
+        continue;
+      }
+      if (reviewedOwner && reviewedOwner !== owner) {
+        throw new Error(
+          `reviewed historical checkout owner conflicts with live ownership evidence: ${physical.worktrees}`,
+        );
+      }
+      if (selectedWorkgroup && owner !== selectedWorkgroup) continue;
+      const ownerUnits = mapped.filter((unit) => unit.workgroupId === owner);
+      const unit = ownerUnits.length > 0 ? ownerUnits[0] : fallbackUnit(owner, physical.state);
+      if (ownerUnits.some((candidate) => candidate.key !== unit.key)) {
+        throw new Error(`historical thread path maps to multiple work units: ${physical.worktrees}`);
+      }
+      for (const checkoutPath of checkoutPaths) {
+        const fallback = path.basename(checkoutPath);
+        addCandidate(grouped, seen, physicalOwners, {
+          workgroupId: owner,
+          repo: repoForCheckout(checkoutPath, fallback),
+          checkoutPath,
+          workUnit: unit,
+        });
+      }
+    }
+  }
+  if (ownershipErrors.length > 0) {
+    throw new Error(
+      `historical repository ownership requires reviewed mappings:\n${ownershipErrors.map((entry) => `- ${entry}`).join('\n')}`,
+    );
+  }
+
+  // Object overlap is diagnostic evidence, not repository identity. Shared
+  // templates, forks, and copied files can overlap heavily; an originless
+  // checkout therefore remains its own local-only repository unless an
+  // operator supplies an explicit mapping in a future reviewed manifest.
+
+  // Add common Git dirs as collision-recovery candidates after the complete
+  // repository inventory is known.
+  for (const candidates of grouped.values()) {
+    const common = candidates
+      .map((candidate) => path.join(candidate.checkoutPath, '.git'))
+      .filter((entry) => {
+        try {
+          return fs.lstatSync(entry).isDirectory();
+        } catch {
+          return false;
+        }
+      });
+    for (const candidate of candidates) candidate.candidateCommonGitDirs = common;
+  }
+  return grouped;
+}
+
+function inventoryBareStores(groups: AgentGroupRow[], selectedWorkgroup?: string): Map<string, string[]> {
+  const result = new Map<string, string[]>();
+  const physicalOwners = new Map<string, string>();
+  const roots = new Set<string>();
+  for (const group of groups) {
+    if (selectedWorkgroup && group.workgroup_id !== selectedWorkgroup) continue;
+    roots.add(`${group.workgroup_id}\0${path.join(GROUPS_DIR, group.folder, '.repos')}`);
+    roots.add(`${group.workgroup_id}\0${path.join(DATA_DIR, 'workgroups', group.workgroup_id, '.repos')}`);
+  }
+  for (const entry of roots) {
+    const separator = entry.indexOf('\0');
+    const workgroupId = entry.slice(0, separator);
+    const root = entry.slice(separator + 1);
+    if (!fs.existsSync(root)) continue;
+    const rootStat = fs.lstatSync(root);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      throw new Error(`bare repository root is not a real directory: ${root}`);
+    }
+    const rootReal = fs.realpathSync(root);
+    for (const name of safeDirectories(root)) {
+      if (!name.endsWith('.git')) continue;
+      const store = path.join(root, name);
+      const storeStat = fs.lstatSync(store);
+      if (storeStat.isSymbolicLink() || !storeStat.isDirectory()) {
+        throw new Error(`bare repository entry is not a real directory: ${store}`);
+      }
+      const storeReal = fs.realpathSync(store);
+      if (!contained(storeReal, rootReal)) throw new Error(`bare repository escapes workgroup root: ${store}`);
+      try {
+        if (
+          execFileSync('git', ['--git-dir', store, 'rev-parse', '--is-bare-repository'], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim() !== 'true'
+        ) {
+          throw new Error(`.repos entry is not a bare repository: ${store}`);
+        }
+      } catch (error) {
+        throw new Error(
+          `cannot validate bare repository ${store}: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      }
+      const priorOwner = physicalOwners.get(storeReal);
+      if (priorOwner && priorOwner !== workgroupId) {
+        throw new Error(`bare repository is shared across workgroups (${priorOwner}, ${workgroupId}): ${storeReal}`);
+      }
+      physicalOwners.set(storeReal, workgroupId);
+      const repo = name.slice(0, -4);
+      const key = `${workgroupId}\0${repo}`;
+      const stores = result.get(key) ?? [];
+      stores.push(storeReal);
+      result.set(key, [...new Set(stores)].sort());
+    }
+  }
+  return result;
+}
+
+function coalesceRepositoryIdentityAliases(
+  grouped: Map<string, LegacyCheckoutCandidate[]>,
+  bareStores: Map<string, string[]>,
+): void {
+  const keys = new Set([...grouped.keys(), ...bareStores.keys()]);
+  const identityGroups = [...keys].map((key) => {
+    const [workgroupId, repo] = key.split('\0');
+    const candidates = grouped.get(key) ?? [];
+    const stores = bareStores.get(key) ?? [];
+    const context = createLegacyGitResolutionContext([
+      ...candidates.flatMap((candidate) => candidate.candidateCommonGitDirs ?? []),
+      ...stores,
+    ]);
+    const observedOrigins: Array<string | null> = [];
+    for (const candidate of candidates) {
+      try {
+        observedOrigins.push(originFor(candidate, context));
+      } catch {
+        // A broken pointer may become recoverable after its repository alias is coalesced.
+      }
+    }
+    for (const store of stores) {
+      try {
+        observedOrigins.push(originForObjectStore(store, context));
+      } catch {
+        // The final repository inventory reports the exact store error.
+      }
+    }
+    return {
+      key,
+      workgroupId,
+      repo,
+      physicalCount: candidates.length,
+      objectStoreCount: stores.length,
+      observedOrigins,
+    };
+  });
+  const plan = planLegacyRepositoryCoalescing(identityGroups);
+  for (const sourceKey of [...keys].sort()) {
+    const destinationKey = plan.get(sourceKey) ?? sourceKey;
+    if (sourceKey === destinationKey) continue;
+    const destinationRepo = destinationKey.split('\0')[1];
+    const sourceCandidates = grouped.get(sourceKey) ?? [];
+    const destinationCandidates = grouped.get(destinationKey) ?? [];
+    for (const candidate of sourceCandidates) candidate.repo = destinationRepo;
+    grouped.set(destinationKey, [...destinationCandidates, ...sourceCandidates]);
+    grouped.delete(sourceKey);
+    const sourceStores = bareStores.get(sourceKey) ?? [];
+    bareStores.set(destinationKey, [...new Set([...(bareStores.get(destinationKey) ?? []), ...sourceStores])].sort());
+    bareStores.delete(sourceKey);
+    console.error(
+      `Coalesced legacy repository alias ${sourceKey.replace('\0', '/')} -> ${destinationKey.replace('\0', '/')}`,
+    );
+  }
+  for (const [key, candidates] of grouped) {
+    const common = [
+      ...(bareStores.get(key) ?? []),
+      ...candidates.flatMap((candidate) => candidate.candidateCommonGitDirs ?? []),
+      ...candidates
+        .map((candidate) => path.join(candidate.checkoutPath, '.git'))
+        .filter((entry) => {
+          try {
+            return fs.lstatSync(entry).isDirectory();
+          } catch {
+            return false;
+          }
+        }),
+    ];
+    for (const candidate of candidates) candidate.candidateCommonGitDirs = [...new Set(common)].sort();
+  }
+}
+
+export function assertServiceInactive(
+  service: string,
+  query: (command: string, args: string[]) => string = (command, args) =>
+    execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 }),
+): void {
+  let output: string;
   try {
-    out = execFileSync('docker', ['ps', '--format', '{{.Names}}'], { stdio: 'pipe', encoding: 'utf-8' })
-      .toString()
+    output = query('systemctl', ['--user', 'show', service, '--property=LoadState', '--property=ActiveState']);
+  } catch (error) {
+    throw new Error(
+      `cannot prove service quiescence for ${service}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+  const state = new Map(
+    output
       .trim()
       .split('\n')
-      .filter((name) => members.some((m) => name.startsWith(`nanoclaw-v2-${m.folder}-`) || name === `nanoclaw-v2-${m.folder}`))
-      .join('\n');
-  } catch {
-    // Quiesce is a hard precondition — an unverifiable state is a refusal,
-    // not a shrug (codex final review P1 #5). --force overrides on the
-    // operator's explicit authority.
-    if (args.includes('--force')) {
-      console.warn('WARNING: docker ps failed — quiesce unverified, continuing under --force.');
-      return;
-    }
-    console.error('REFUSING to execute: docker ps failed, cannot verify workgroup containers are stopped. Pass --force to override.');
-    process.exit(2);
-  }
-  if (out) {
-    console.error(
-      `REFUSING to execute: workgroup containers are running:\n${out}\n` +
-        `Stop them first (the host also stops install-labeled containers on restart).`,
-    );
-    process.exit(2);
-  }
+      .filter(Boolean)
+      .map((line) => {
+        const separator = line.indexOf('=');
+        if (separator < 1) throw new Error(`malformed systemd state for ${service}: ${line}`);
+        return [line.slice(0, separator), line.slice(separator + 1)] as const;
+      }),
+  );
+  const loadState = state.get('LoadState');
+  const activeState = state.get('ActiveState');
+  if (loadState === 'not-found' && activeState === 'inactive') return;
+  if (loadState === 'loaded' && activeState === 'inactive') return;
+  if (!loadState || !activeState) throw new Error(`systemd did not return complete state for ${service}`);
+  throw new Error(`fleet is not quiescent: ${service} is ${loadState}/${activeState}`);
 }
 
-/**
- * Migration lock: the live host's freshness worker discovers mirrors as they
- * appear and would advance snapshots while this script is mid-swap. The lock
- * file under .repos/ makes the worker skip this workgroup for the duration.
- */
-const MIGRATION_LOCK = path.join(REPOS, '.migration-lock');
-function withMigrationLock(fn: () => void): void {
-  fs.mkdirSync(REPOS, { recursive: true });
-  fs.writeFileSync(MIGRATION_LOCK, `${RUN} pid=${process.pid}\n`);
-  try {
-    fn();
-  } finally {
-    try { fs.rmSync(MIGRATION_LOCK, { force: true }); } catch { /* ignore */ }
-  }
-}
-
-/** Container-absolute → host path for workgroup-tree paths; null if unmappable
- *  or escaping the workgroup dir (stale/malformed gitdir with `..`). */
-function mapContainerPath(p: string): string | null {
-  if (!p.startsWith('/workspace/workgroup/')) return null;
-  const mapped = path.resolve(WG_DIR, p.slice('/workspace/workgroup/'.length));
-  if (mapped !== WG_DIR && !mapped.startsWith(WG_DIR + path.sep)) return null;
-  return mapped;
-}
-
-interface WorktreeRecord {
-  metaName: string;
-  gitdirTarget: string; // path of the worktree's .git FILE, often container-absolute
-  branch: string | null; // refs/heads/<b> or null (detached)
-  sha: string | null;
-}
-
-function readLinkedWorktrees(canonical: string): WorktreeRecord[] {
-  const metaRoot = path.join(canonical, '.git', 'worktrees');
-  let names: string[] = [];
-  try {
-    names = fs.readdirSync(metaRoot);
-  } catch {
-    return [];
-  }
-  const records: WorktreeRecord[] = [];
-  for (const metaName of names) {
-    const meta = path.join(metaRoot, metaName);
-    let gitdirTarget = '';
-    try {
-      gitdirTarget = fs.readFileSync(path.join(meta, 'gitdir'), 'utf-8').trim().replace(/\/\.git$/, '');
-    } catch {
-      continue;
-    }
-    let branch: string | null = null;
-    let sha: string | null = null;
-    try {
-      const head = fs.readFileSync(path.join(meta, 'HEAD'), 'utf-8').trim();
-      if (head.startsWith('ref: ')) {
-        branch = head.slice('ref: '.length);
-        sha = tryGit(canonical, ['rev-parse', branch]);
-      } else {
-        sha = head;
-      }
-    } catch {
-      /* leave nulls */
-    }
-    records.push({ metaName, gitdirTarget, branch, sha });
-  }
-  return records;
-}
-
-/**
- * Standalone-clone transplant: give <dir> its own .git at branch/sha,
- * preserving the working tree.
- *
- * Prepare-then-swap: the replacement .git is FULLY configured (refs, HEAD,
- * origin URL) inside a temp clone before the original .git file is touched,
- * and the sha is verified reachable in the mirror up front — any preparation
- * failure leaves the original checkout byte-for-byte untouched (codex final
- * review P0 #2). Only the post-swap `git reset` (index rebuild) can fail
- * after the swap; the .git dir is already valid then, so the checkout stays
- * usable and the failure is flagged rather than destructive.
- */
-function transplant(dir: string, mirror: string, branch: string | null, sha: string | null): boolean {
-  if (!sha) return false;
-  if (tryGit(mirror, ['cat-file', '-e', `${sha}^{commit}`]) === null) {
-    manualFlags.push(`transplant skipped for ${dir}: commit ${sha.slice(0, 12)} not in mirror — left untouched`);
-    return false;
-  }
-  const temp = `${dir}.git-transplant`;
-  try {
-    fs.rmSync(temp, { recursive: true, force: true });
-    execFileSync('git', ['clone', '--no-checkout', mirror, temp], { stdio: 'pipe', timeout: 120_000 });
-    const realUrl = tryGit(mirror, ['config', '--get', 'remote.origin.url']);
-    if (realUrl) git(temp, ['remote', 'set-url', 'origin', realUrl]);
-    // The clone only transfers objects reachable from the mirror's CURRENT
-    // refs; a parked tip preserved under nanoclaw-parked/ (or any sha the
-    // clone missed) is fetched explicitly from the local mirror.
-    if (tryGit(temp, ['cat-file', '-e', `${sha}^{commit}`]) === null) {
-      git(temp, ['fetch', mirror, sha]);
-    }
-    if (branch) {
-      git(temp, ['update-ref', branch, sha]);
-      git(temp, ['symbolic-ref', 'HEAD', branch]);
-    } else {
-      git(temp, ['update-ref', '--no-deref', 'HEAD', sha]);
-    }
-  } catch (e) {
-    try { fs.rmSync(temp, { recursive: true, force: true }); } catch { /* ignore */ }
-    manualFlags.push(`transplant preparation failed for ${dir} (checkout untouched): ${e instanceof Error ? e.message : String(e)}`);
-    return false;
+function assertFleetQuiescent(paths: string[]): void {
+  for (const service of ['nanoclaw.service', 'nanoclaw-v2.service']) {
+    assertServiceInactive(service);
   }
   try {
-    fs.rmSync(path.join(dir, '.git'), { force: true });
-    fs.renameSync(path.join(temp, '.git'), path.join(dir, '.git'));
-    fs.rmSync(temp, { recursive: true, force: true });
-  } catch (e) {
-    manualFlags.push(`transplant swap failed for ${dir}: ${e instanceof Error ? e.message : String(e)} — prepared .git at ${temp}`);
-    return false;
-  }
-  if (tryGit(dir, ['reset', '-q', sha]) === null) {
-    manualFlags.push(`transplant index rebuild failed for ${dir} — .git is valid; run \`git -C ${dir} reset ${sha}\` manually`);
-  }
-  return true;
-}
-
-/**
- * "Fully pushed" must be judged against the REAL remote, not the local
- * mirror — the mirror contains every parked local branch by construction, so
- * `log HEAD --not --remotes` would call unpushed work "pushed" and delete
- * its checkout. Offline (ls-remote fails) counts as NOT pushed — keep the dir.
- */
-function isFullyPushed(dir: string): boolean {
-  const status = tryGit(dir, ['status', '--porcelain']);
-  if (status !== '') return false;
-  const branch = tryGit(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
-  if (!branch || branch === 'HEAD') return false;
-  const local = tryGit(dir, ['rev-parse', 'HEAD']);
-  const remote = tryGit(dir, ['ls-remote', 'origin', `refs/heads/${branch}`], 60_000);
-  if (!local || remote === null || remote === '') return false;
-  return remote.split('\t')[0] === local;
-}
-
-// ─── Discovery ───────────────────────────────────────────────────────────────
-
-if (!fs.existsSync(WG_DIR)) {
-  console.error(`No workgroup dir at ${WG_DIR}`);
-  process.exit(1);
-}
-
-const canonicals = fs
-  .readdirSync(WG_DIR, { withFileTypes: true })
-  .filter((e) => e.isDirectory() && !e.isSymbolicLink() && !e.name.startsWith('.'))
-  .map((e) => path.join(WG_DIR, e.name))
-  .filter((dir) => isGitClone(dir));
-
-console.log(`\n=== repo-store migration — workgroup '${WORKGROUP}' — ${EXECUTE ? 'EXECUTE' : 'DRY-RUN'} ===`);
-console.log(`${canonicals.length} legacy canonical clone(s): ${canonicals.map((c) => path.basename(c)).join(', ') || '(none)'}\n`);
-
-// Rerun repair: a prior partial run may have left a valid mirror with a
-// missing canonical (crash between the two swap renames). Recreate the
-// snapshot from the mirror before the per-canonical pass, which only sees
-// dirs that exist.
-if (fs.existsSync(REPOS)) {
-  for (const entry of fs.readdirSync(REPOS)) {
-    if (!entry.endsWith('.git')) continue;
-    const repo = entry.slice(0, -'.git'.length);
-    const mirror = path.join(REPOS, entry);
-    const canonical = path.join(WG_DIR, repo);
-    if (fs.existsSync(canonical)) continue;
-    if (tryGit(mirror, ['rev-parse', '--is-bare-repository']) !== 'true') continue;
-    act('rerun-repair', `${repo}: mirror exists but canonical path is missing — recreate snapshot`, () => {
-      const tmp = `${canonical}.snapshot-tmp`;
-      fs.rmSync(tmp, { recursive: true, force: true });
-      execFileSync('git', ['clone', mirror, tmp], { stdio: 'pipe', timeout: 300_000 });
-      const url = tryGit(mirror, ['config', '--get', 'remote.origin.url']);
-      if (url) git(tmp, ['remote', 'set-url', 'origin', url]);
-      git(tmp, ['checkout', '--detach']);
-      fs.renameSync(tmp, canonical);
+    const containers = execFileSync('docker', ['ps', '-q', '--filter', `label=${CONTAINER_INSTALL_LABEL}`], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 20_000,
+    }).trim();
+    if (containers) throw new Error(`fleet is not quiescent: containers remain (${containers.split('\n').length})`);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('fleet is not quiescent')) throw error;
+    throw new Error(`cannot prove container quiescence: ${error instanceof Error ? error.message : String(error)}`, {
+      cause: error,
     });
   }
-}
-
-for (const canonical of canonicals) {
-  const repo = path.basename(canonical);
-  const mirror = path.join(REPOS, `${repo}.git`);
-  if (fs.existsSync(mirror)) {
-    if (tryGit(mirror, ['rev-parse', '--is-bare-repository']) === 'true') {
-      console.log(`-- ${repo}: valid mirror already exists, skipping (already migrated?)`);
-    } else {
-      manualFlags.push(
-        `${repo}: mirror dir ${mirror} exists but is NOT a valid bare repo (partial clone?) — ` +
-          `remove it and re-run; canonical left untouched`,
-      );
-      console.log(`-- ${repo}: INVALID mirror present — flagged for manual attention, skipping`);
-    }
-    continue;
-  }
-
-  const branch = tryGit(canonical, ['rev-parse', '--abbrev-ref', 'HEAD']) ?? '(unknown)';
-  const status = tryGit(canonical, ['status', '--porcelain']) ?? '';
-  const { injected, real } = classifyDirt(status);
-  const originUrl = tryGit(canonical, ['config', '--get', 'remote.origin.url']);
-  const worktrees = readLinkedWorktrees(canonical);
-
-  console.log(`-- ${repo}`);
-  console.log(`   branch: ${branch}   origin: ${originUrl ?? '(none)'}`);
-  console.log(`   dirt: ${real.length} real work file(s), ${injected.length} injected artifact(s)`);
-  if (real.length) console.log(`     real: ${real.slice(0, 8).join(', ')}${real.length > 8 ? ` (+${real.length - 8})` : ''}`);
-  console.log(`   linked worktrees: ${worktrees.length}`);
-
-  // 1. Rescue archives.
-  act('rescue-archive', `${repo}: bundle --all + tar → .rescues/${RUN}/`, () => {
-    fs.mkdirSync(RESCUES, { recursive: true });
-    git(canonical, ['bundle', 'create', path.join(RESCUES, `${repo}.bundle`), '--all'], 300_000);
-    execFileSync('tar', ['-czf', path.join(RESCUES, `${repo}-tree.tgz`), '-C', path.dirname(canonical), repo], {
-      stdio: 'pipe',
-      timeout: 600_000,
-    });
-  });
-
-  // 2. Rescue-commit real dirt on a dedicated branch (never the original).
-  const rescueBranch = `nanoclaw-rescue/${RUN}/${branch.replace(/[^A-Za-z0-9._/-]/g, '-')}`;
-  if (real.length > 0) {
-    act('rescue-commit', `${repo}: commit ${real.length} real-work file(s) → ${rescueBranch}`, () => {
-      git(canonical, ['checkout', '-b', rescueBranch]);
-      // Stage ONLY the classified real-work paths — `add -A` would also
-      // commit (and best-effort push) the injected artifacts this migration
-      // promises to exclude (codex native review P1 #2). `-A --` handles
-      // deletions and renames within the given pathspecs.
-      git(canonical, ['add', '-A', '--', ...real]);
-      git(canonical, [
-        '-c', 'user.email=migration@nanoclaw.local', '-c', 'user.name=nanoclaw-migration',
-        'commit', '--no-verify', '-m', `nanoclaw-rescue: parked working-tree changes from ${branch} (${RUN})`,
-      ]);
-      rescueIndex.push(`| ${repo} | ${branch} | rescue branch \`${rescueBranch}\` (was parked dirty on canonical) |`);
-    });
-  } else if (branch !== '(unknown)' && !['main', 'master'].includes(branch)) {
-    rescueIndex.push(`| ${repo} | ${branch} | branch preserved in mirror \`.repos/${repo}.git\` |`);
-  }
-
-  // 3. Convert to bare mirror (from the LOCAL canonical → captures every
-  // local branch, then repoint at the real remote).
-  act('mirror', `${repo}: bare-clone canonical → .repos/${repo}.git, repoint origin, fetch, set default HEAD`, () => {
-    fs.mkdirSync(REPOS, { recursive: true });
+  for (const candidate of paths) {
     try {
-      execFileSync('git', ['clone', '--bare', canonical, mirror], { stdio: 'pipe', timeout: 300_000 });
-    } catch (e) {
-      // A partial dir would be mistaken for a mirror on rerun — remove it.
-      try { fs.rmSync(mirror, { recursive: true, force: true }); } catch { /* ignore */ }
-      throw e;
-    }
-    git(mirror, ['config', 'gc.auto', '0']);
-    if (originUrl) {
-      git(mirror, ['remote', 'set-url', 'origin', originUrl]);
-      git(mirror, ['config', 'remote.origin.fetch', '+refs/heads/*:refs/heads/*']);
-      // The canonical may be arbitrarily stale — fetch so the snapshot cut
-      // from this mirror starts at CURRENT origin, not the parked state.
-      // Best-effort: offline, the snapshot serves last-known state and the
-      // freshness worker catches up.
-      // NO --prune: with the +refs/heads/*:refs/heads/* refspec, prune would
-      // DELETE the parked/rescue branches this mirror exists to preserve —
-      // they don't exist on origin (caught by the e2e test).
-      //
-      // The refspec is also FORCED: a parked branch whose NAME exists on
-      // origin at a different tip gets clobbered by this fetch (and by every
-      // later freshness fetch — hit live on a parked thread-session branch
-      // during the first rollout). Record local tips first; any tip the fetch moves is
-      // preserved under a LOCAL-ONLY nanoclaw-parked/<run>/ name that origin
-      // fetches can never touch — reachable, clonable, in the rescue index.
-      const preFetchTips = (tryGit(mirror, ['for-each-ref', '--format=%(refname:short) %(objectname)', 'refs/heads/']) ?? '')
+      const output = execFileSync('lsof', ['-t', '+D', candidate], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 60_000,
+      }).trim();
+      const foreign = output
         .split('\n')
         .filter(Boolean)
-        .map((l) => {
-          const sp = l.lastIndexOf(' ');
-          return { branch: l.slice(0, sp), tip: l.slice(sp + 1) };
-        });
-      if (tryGit(mirror, ['fetch', 'origin'], 300_000) === null) {
-        manualFlags.push(`${repo}: mirror fetch from ${originUrl} failed — snapshot starts at last-known local state`);
-      }
-      for (const { branch: b, tip } of preFetchTips) {
-        if (b.startsWith('nanoclaw-parked/') || b.startsWith('nanoclaw-rescue/')) continue;
-        const now = tryGit(mirror, ['rev-parse', '--verify', `refs/heads/${b}`]);
-        if (now !== tip) {
-          git(mirror, ['update-ref', `refs/heads/nanoclaw-parked/${RUN}/${b}`, tip]);
-          rescueIndex.push(`| ${repo} | ${b} | parked tip preserved as nanoclaw-parked/${RUN}/${b} (origin moved the branch name) |`);
-        }
-      }
-      const symref = tryGit(mirror, ['ls-remote', '--symref', 'origin', 'HEAD'], 60_000);
-      const m = symref?.match(/^ref:\s+(refs\/heads\/\S+)\s+HEAD/m);
-      // Only point HEAD at a ref that actually resolves locally — a remote
-      // default absent from the fetch would make the snapshot clone fail
-      // after the canonical had already moved.
-      const candidates = [...(m ? [m[1]] : []), 'refs/heads/main', 'refs/heads/master'];
-      const target = candidates.find((r) => tryGit(mirror, ['rev-parse', '--verify', r]) !== null);
-      if (target) git(mirror, ['symbolic-ref', 'HEAD', target]);
-    }
-  });
-
-  // 4. Best-effort pushes (bundle already guarantees preservation).
-  if (originUrl) {
-    act('push', `${repo}: best-effort push of ${branch}${real.length ? ` + ${rescueBranch}` : ''}`, () => {
-      const toPush = [branch, ...(real.length ? [rescueBranch] : [])].filter((b) => b !== '(unknown)' && b !== 'HEAD');
-      for (const b of toPush) {
-        const pushed = tryGit(mirror, ['push', 'origin', `refs/heads/${b}:refs/heads/${b}`], 120_000);
-        if (pushed === null) manualFlags.push(`${repo}: push of ${b} failed — preserved in mirror + bundle only`);
-      }
-    });
-  }
-
-  // 5. Named workgroup-root worktrees.
-  for (const wt of worktrees) {
-    const hostDir = mapContainerPath(wt.gitdirTarget);
-    const label = `${repo}:${wt.metaName}`;
-    if (!hostDir || !fs.existsSync(hostDir)) {
-      if (hostDir === null && fs.existsSync(path.join(canonical, '.git', 'worktrees', wt.metaName))) {
-        // Thread worktrees (/workspace/worktrees/...) are handled in the
-        // thread pass below; anything else unmappable is flagged.
-        if (!wt.gitdirTarget.startsWith('/workspace/worktrees/')) {
-          manualFlags.push(`${label}: unmappable worktree at ${wt.gitdirTarget} — left as-is`);
-        }
-      }
-      continue;
-    }
-    act('named-worktree', `${repo}: convert ${path.relative(WG_DIR, hostDir)} (${wt.branch ?? 'detached'})`, () => {
-      const name = path.relative(WG_DIR, hostDir);
-      const converted = transplant(hostDir, mirror, wt.branch, wt.sha);
-      if (!converted) return;
-      if (isFullyPushed(hostDir)) {
-        fs.rmSync(hostDir, { recursive: true, force: true });
-        return;
-      }
-      const dest = path.join(WORKTREES_NS, name);
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.renameSync(hostDir, dest);
-      // Relative symlink keeps the old name findable; Graphify skips symlinks.
-      fs.symlinkSync(path.relative(path.dirname(hostDir), dest), hostDir);
-      rescueIndex.push(`| ${repo} | ${wt.branch ?? '(detached)'} | \`.worktrees/${name}\` (symlinked at \`${name}\`) |`);
-    });
-  }
-
-  // 6. Swap canonical → snapshot. Prepare-then-swap: the snapshot clone is
-  // fully built at a temp path BEFORE the canonical moves, so a clone or
-  // detach failure aborts with the canonical untouched (codex final review
-  // P0 #1). The two renames are same-filesystem — the "no canonical at the
-  // old path" window is two rename syscalls, not a network clone.
-  act('snapshot-swap', `${repo}: build snapshot, then swap canonical → .rescues/${RUN}/${repo}-old`, () => {
-    const tmp = `${canonical}.snapshot-tmp`;
-    fs.rmSync(tmp, { recursive: true, force: true });
-    execFileSync('git', ['clone', mirror, tmp], { stdio: 'pipe', timeout: 300_000 });
-    if (originUrl) git(tmp, ['remote', 'set-url', 'origin', originUrl]);
-    git(tmp, ['checkout', '--detach']);
-    fs.renameSync(canonical, path.join(RESCUES, `${repo}-old`));
-    fs.renameSync(tmp, canonical);
-  });
-}
-
-// ─── Per-thread worktrees ────────────────────────────────────────────────────
-// Scoped by DB ownership (codex final review P1 #3): repo NAME alone cannot
-// decide eligibility — two workgroups may clone same-named repos, and a
-// global scan would transplant the other workgroup's checkout against this
-// workgroup's mirror. Only walk session dirs of THIS workgroup's agent
-// groups and thread dirs whose key belongs to THIS workgroup. No DB → skip
-// the pass entirely (fail-safe, flagged).
-
-let cachedMembers: Array<{ id: string; folder: string }> | null | undefined;
-function workgroupAgentGroups(): Array<{ id: string; folder: string }> | null {
-  if (cachedMembers !== undefined) return cachedMembers;
-  const centralDb = path.join(DATA_DIR, 'v2.db');
-  if (!fs.existsSync(centralDb)) return (cachedMembers = null);
-  try {
-    // In-process read, not a `pnpm exec tsx q.ts` subprocess: nested pnpm
-    // inherits pnpm_config_verify_deps_before_run and burns ~80s of CPU per
-    // exec before running anything (observed pnpm 10.33), which blew this
-    // call's timeout and silently degraded the migration to "no DB".
-    const db = new BetterSqlite3(centralDb, { readonly: true, fileMustExist: true });
-    try {
-      cachedMembers = db
-        .prepare('SELECT id, folder FROM agent_groups WHERE COALESCE(workgroup_id, folder) = ?')
-        .all(WG) as Array<{ id: string; folder: string }>;
-    } finally {
-      db.close();
-    }
-    return cachedMembers;
-  } catch {
-    return (cachedMembers = null);
-  }
-}
-
-function workgroupAgentGroupIds(): Set<string> | null {
-  const members = workgroupAgentGroups();
-  return members === null ? null : new Set(members.map((m) => m.id));
-}
-
-interface ThreadWt {
-  dir: string;
-  repo: string;
-}
-const threadWts: ThreadWt[] = [];
-const ownedAgentGroups = workgroupAgentGroupIds();
-const ownedThreadSlugs = workgroupThreadSlugs();
-if (ownedAgentGroups === null || ownedThreadSlugs === null) {
-  manualFlags.push(
-    'thread-worktrees: central DB unavailable — per-thread worktree conversion SKIPPED for safety; ' +
-      're-run once the DB is readable',
-  );
-}
-const threadBases: string[] = [];
-if (ownedAgentGroups !== null && ownedThreadSlugs !== null) {
-  const threadsRoot = path.join(DATA_DIR, 'v2-threads');
-  if (fs.existsSync(threadsRoot)) {
-    for (const e of fs.readdirSync(threadsRoot, { withFileTypes: true })) {
-      if (!e.isDirectory()) continue;
-      if (e.name === `wg-${WG}` || (!e.name.startsWith('wg-') && ownedThreadSlugs.has(e.name))) {
-        threadBases.push(path.join(threadsRoot, e.name));
-      }
-    }
-  }
-  const sessionsRoot = path.join(DATA_DIR, 'v2-sessions');
-  if (fs.existsSync(sessionsRoot)) {
-    for (const e of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
-      if (e.isDirectory() && ownedAgentGroups.has(e.name)) threadBases.push(path.join(sessionsRoot, e.name));
-    }
-  }
-}
-for (const base of threadBases) {
-  if (!fs.existsSync(base)) continue;
-  const walk = (dir: string, depth: number) => {
-    if (depth > 3) return;
-    let entries: fs.Dirent[] = [];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
-      const full = path.join(dir, e.name);
-      if (e.name === 'worktrees') {
-        for (const repoEnt of fs.readdirSync(full, { withFileTypes: true })) {
-          if (!repoEnt.isDirectory()) continue;
-          const wtDir = path.join(full, repoEnt.name);
-          const gitFile = path.join(wtDir, '.git');
-          try {
-            if (fs.statSync(gitFile).isFile()) threadWts.push({ dir: wtDir, repo: repoEnt.name });
-          } catch {
-            /* no .git — skip */
-          }
-        }
-      } else {
-        walk(full, depth + 1);
-      }
-    }
-  };
-  walk(base, 0);
-}
-
-for (const { dir, repo } of threadWts) {
-  const mirror = path.join(REPOS, `${repo}.git`);
-  const canonicalOld = path.join(RESCUES, `${repo}-old`);
-  const mirrorWillExist = canonicals.some((c) => path.basename(c) === repo) || fs.existsSync(path.join(mirror, 'HEAD'));
-  if (!mirrorWillExist) continue; // repo not part of this workgroup migration
-  act('thread-worktree', `transplant ${dir}`, () => {
-    let meta: WorktreeRecord | undefined;
-    // The worktree's .git file names the canonical's .git/worktrees/<n>;
-    // the canonical has moved to .rescues by now, so read metadata there.
-    try {
-      const gitfile = fs.readFileSync(path.join(dir, '.git'), 'utf-8').trim();
-      const metaName = path.basename(gitfile.replace(/^gitdir:\s*/, ''));
-      meta = readLinkedWorktrees(canonicalOld).find((w) => w.metaName === metaName);
-      if (meta && meta.sha === null && meta.branch) {
-        meta.sha = tryGit(canonicalOld, ['rev-parse', meta.branch]);
-      }
-    } catch {
-      /* fall through */
-    }
-    if (!meta) {
-      manualFlags.push(`${dir}: no worktree metadata found — left as-is (recoverable from ${canonicalOld})`);
-      return;
-    }
-    const converted = transplant(dir, mirror, meta.branch, meta.sha);
-    if (converted && isFullyPushed(dir)) {
-      fs.rmSync(dir, { recursive: true, force: true });
-    } else if (converted) {
-      rescueIndex.push(`| ${repo} | ${meta.branch ?? '(detached)'} | thread worktree \`${dir}\` (converted in place) |`);
-    }
-  });
-}
-
-// ─── Legacy thread-state dirs → wg namespace ─────────────────────────────────
-// Ownership comes from the central DB: a legacy dir moves only when its
-// thread key belongs to a session of THIS workgroup. Multi-workgroup installs
-// have interleaved legacy dirs — a blanket move would hand other workgroups'
-// thread state to this one.
-
-function fsSlug(s: string): string {
-  return s.replace(/[^A-Za-z0-9._-]/g, '_');
-}
-
-function workgroupThreadSlugs(): Set<string> | null {
-  const centralDb = path.join(DATA_DIR, 'v2.db');
-  if (!fs.existsSync(centralDb)) return null;
-  try {
-    // In-process read — see workgroupAgentGroups for why this must not be a
-    // nested `pnpm exec` subprocess.
-    const db = new BetterSqlite3(centralDb, { readonly: true, fileMustExist: true });
-    try {
-      const rows = db
-        .prepare(
-          `SELECT DISTINCT COALESCE(s.thread_id, 'dm-' || mg.platform_id) AS tid
-             FROM sessions s
-             JOIN messaging_groups mg ON mg.id = s.messaging_group_id
-             JOIN agent_groups ag ON ag.id = s.agent_group_id
-            WHERE COALESCE(ag.workgroup_id, ag.folder) = ?`,
-        )
-        .all(WG) as Array<{ tid: string }>;
-      return new Set(rows.map((r) => fsSlug(r.tid)));
-    } finally {
-      db.close();
-    }
-  } catch (e) {
-    console.warn(`WARNING: cannot read central DB for thread ownership (${e instanceof Error ? e.message : e})`);
-    return null;
-  }
-}
-
-const threadsBase = path.join(DATA_DIR, 'v2-threads');
-if (fs.existsSync(threadsBase)) {
-  const legacyDirs = fs
-    .readdirSync(threadsBase, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && !e.name.startsWith('wg-'))
-    .map((e) => e.name);
-  const owned = ownedThreadSlugs;
-  if (owned === null) {
-    manualFlags.push(
-      `thread-namespace: central DB unavailable — ${legacyDirs.length} legacy thread dir(s) left un-namespaced`,
-    );
-  } else {
-    const toMove = legacyDirs.filter((d) => owned.has(d));
-    const foreign = legacyDirs.length - toMove.length;
-    if (toMove.length > 0) {
-      act(
-        'thread-namespace',
-        `move ${toMove.length} of ${legacyDirs.length} legacy thread dir(s) under wg-${WORKGROUP}/ (${foreign} belong to other workgroups or are orphaned — left in place)`,
-        () => {
-          const nsDir = path.join(threadsBase, `wg-${WORKGROUP}`);
-          fs.mkdirSync(nsDir, { recursive: true });
-          for (const d of toMove) fs.renameSync(path.join(threadsBase, d), path.join(nsDir, d));
-        },
+        .filter((pid) => Number(pid) !== process.pid);
+      if (foreign.length > 0) throw new Error(`repository writers remain below ${candidate}: ${foreign.join(',')}`);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException & { status?: number }).status;
+      if (code === 1) continue; // lsof: no matches.
+      if (error instanceof Error && error.message.startsWith('repository writers remain')) throw error;
+      throw new Error(
+        `cannot prove writer quiescence below ${candidate}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
       );
     }
   }
 }
 
-// ─── Index + memory note ─────────────────────────────────────────────────────
-
-act('rescue-index', `write .rescues/${RUN}/INDEX.md + workgroup memory note`, () => {
-  fs.mkdirSync(RESCUES, { recursive: true });
-  const table = ['| repo | branch | where it lives now |', '|---|---|---|', ...rescueIndex].join('\n');
-  const body = [
-    `# Repo-store migration — ${RUN}`,
-    '',
-    'Canonical repo clones were converted to bare mirrors (`.repos/<repo>.git`).',
-    'The old canonical paths now hold **read-only snapshots of origin/HEAD**,',
-    'kept current by the host. Work happens in per-thread checkouts via',
-    '`create_worktree` — same tools, same paths as before.',
-    '',
-    '## Where parked work went',
-    '',
-    table,
-    '',
-    'Full pre-migration archives (git bundle + tree tarball + the old canonical',
-    `itself) are in \`.rescues/${RUN}/\`. Nothing was deleted.`,
-    '',
-    'NanoClaw-injected artifacts (.claude/, CLAUDE.md, AGENTS.md, .mcp.json,',
-    '.gitignore edits) were NOT committed to rescue branches — they are',
-    'pollution, not work. If one of those was a deliberate edit, recover it',
-    'from the tree tarball or the moved canonical above.',
-    manualFlags.length ? `\n## Needs manual attention\n\n${manualFlags.map((f) => `- ${f}`).join('\n')}` : '',
-  ].join('\n');
-  fs.writeFileSync(path.join(RESCUES, 'INDEX.md'), body);
-  const memDir = path.join(WG_DIR, 'memory');
-  fs.mkdirSync(memDir, { recursive: true });
-  fs.writeFileSync(path.join(memDir, `repo-store-migration-${RUN.slice(0, 10)}.md`), body);
-});
-
-// ─── Run ─────────────────────────────────────────────────────────────────────
-
-console.log(`\nPlanned actions (${plan.length}):`);
-for (const p of plan) console.log(`  [${p.kind}] ${p.detail}`);
-
-if (!EXECUTE) {
-  console.log('\nDRY-RUN — nothing was changed. Re-run with --execute to apply.');
-  process.exit(0);
+function minimalQuiescenceRoots(paths: readonly string[]): string[] {
+  const selected: string[] = [];
+  for (const candidate of [...new Set(paths.map((entry) => path.resolve(entry)))].sort(
+    (left, right) => left.length - right.length || left.localeCompare(right),
+  )) {
+    if (selected.some((root) => contained(candidate, root))) continue;
+    selected.push(candidate);
+  }
+  return selected.sort();
 }
 
-ensureQuiesced();
-console.log('\nExecuting…');
-let aborted = false;
-withMigrationLock(() => {
-  for (const p of plan) {
-    if (!p.run) continue;
-    try {
-      p.run();
-      console.log(`  ✓ [${p.kind}] ${p.detail}`);
-    } catch (e) {
-      console.error(`  ✗ [${p.kind}] ${p.detail}\n    ${e instanceof Error ? e.message : String(e)}`);
-      console.error('Aborting — state so far is preserved (archives are written before any destructive step).');
-      aborted = true; // no process.exit inside the lock — finally must release it
-      break;
+function preManifestQuiescencePaths(
+  groups: AgentGroupRow[],
+  grouped: Map<string, LegacyCheckoutCandidate[]>,
+  bareStores: Map<string, string[]>,
+): string[] {
+  const workgroups = new Set([...grouped.keys()].map((key) => key.slice(0, key.indexOf('\0'))));
+  const paths = new Set<string>();
+  for (const candidates of grouped.values()) {
+    for (const candidate of candidates) {
+      paths.add(path.resolve(candidate.checkoutPath));
+      for (const gitDir of candidate.candidateCommonGitDirs ?? []) paths.add(path.resolve(gitDir));
     }
   }
-});
-if (aborted) process.exit(3);
-if (manualFlags.length) {
-  console.log('\nNeeds manual attention:');
-  for (const f of manualFlags) console.log(`  - ${f}`);
+  for (const stores of bareStores.values()) {
+    for (const store of stores) paths.add(path.resolve(store));
+  }
+  for (const group of groups) {
+    if (!workgroups.has(group.workgroup_id)) continue;
+    // These are the configured legacy roots searched by inventory. Proving
+    // only the checkout directory quiet is insufficient: another process can
+    // mutate a linked external common Git dir, create a new nested checkout,
+    // or update a group-local bare store while the hash-bound manifest is
+    // being captured.
+    paths.add(path.resolve(GROUPS_DIR, group.folder));
+    paths.add(path.resolve(DATA_DIR, 'workgroups', group.workgroup_id));
+    paths.add(path.resolve(DATA_DIR, 'v2-sessions', group.agent_group_id));
+    paths.add(path.resolve(DATA_DIR, 'repositories', group.workgroup_id));
+  }
+  paths.add(path.resolve(DATA_DIR, 'v2-threads'));
+  return minimalQuiescenceRoots([...paths]);
 }
-console.log('\nDone. Restart the host (or respawn workgroup containers) to pick up RO snapshot mounts.');
+
+function controlPlaneBackupSources(): string[] {
+  return [
+    path.join(DATA_DIR, 'v2.db'),
+    path.join(DATA_DIR, 'v2.db-wal'),
+    path.join(DATA_DIR, 'v2.db-shm'),
+    path.join(REPO_ROOT, '.env'),
+    ...safeDirectories(GROUPS_DIR).map((folder) => path.join(GROUPS_DIR, folder, 'container.json')),
+  ].filter((file) => fs.existsSync(file));
+}
+
+function controlPlaneBackupCapacityBytes(): number {
+  const blockSize = Number(fs.statfsSync(DATA_DIR).bsize);
+  const sources = controlPlaneBackupSources();
+  const fileBytes = sources.reduce(
+    (sum, source) => sum + Math.ceil(fs.lstatSync(source).size / blockSize) * blockSize,
+    0,
+  );
+  // Inventory JSON, temporary atomic publication, and directory entries.
+  return fileBytes + Math.max(1024 * 1024, (sources.length + 4) * blockSize * 2);
+}
+
+export function aggregateCapacityEvidence(manifests: RepositoryMigrationManifest[]): AggregateCapacityEvidence {
+  const migrationCoreBytes = manifests.reduce(
+    (sum, manifest) => sum + manifest.capacity.requiredBytes - manifest.capacity.safetyBytes,
+    0,
+  );
+  const controlPlaneBackupBytes = controlPlaneBackupCapacityBytes();
+  const globalSafetyBytes = Math.max(1024 ** 3, Math.ceil(migrationCoreBytes * 0.1));
+  return {
+    migrationCoreBytes,
+    controlPlaneBackupBytes,
+    globalSafetyBytes,
+    requiredBytes: migrationCoreBytes + controlPlaneBackupBytes + globalSafetyBytes,
+  };
+}
+
+function verifyAggregateCapacityEvidence(
+  manifests: RepositoryMigrationManifest[],
+  aggregate: AggregateCapacityEvidence,
+): void {
+  const migrationCoreBytes = manifests.reduce(
+    (sum, manifest) => sum + manifest.capacity.requiredBytes - manifest.capacity.safetyBytes,
+    0,
+  );
+  const globalSafetyBytes = Math.max(1024 ** 3, Math.ceil(migrationCoreBytes * 0.1));
+  if (
+    aggregate.migrationCoreBytes !== migrationCoreBytes ||
+    aggregate.globalSafetyBytes !== globalSafetyBytes ||
+    !Number.isSafeInteger(aggregate.controlPlaneBackupBytes) ||
+    aggregate.controlPlaneBackupBytes < 0 ||
+    aggregate.requiredBytes !== migrationCoreBytes + aggregate.controlPlaneBackupBytes + globalSafetyBytes
+  ) {
+    throw new Error('server migration aggregate capacity evidence mismatch');
+  }
+}
+
+export function assertRemainingAggregateCapacity(
+  remaining: RepositoryMigrationManifest[],
+  aggregate: AggregateCapacityEvidence,
+  availableBytesOverride?: number,
+): void {
+  const remainingCoreBytes = remaining.reduce(
+    (sum, manifest) => sum + manifest.capacity.requiredBytes - manifest.capacity.safetyBytes,
+    0,
+  );
+  const requiredBytes = remainingCoreBytes + aggregate.globalSafetyBytes;
+  const statfs = availableBytesOverride === undefined ? fs.statfsSync(DATA_DIR) : null;
+  const availableBytes = availableBytesOverride ?? Number(statfs!.bavail) * Number(statfs!.bsize);
+  if (availableBytes < requiredBytes) {
+    throw new Error(
+      `remaining aggregate capacity gate rejected before mutation: ${availableBytes} bytes available, ` +
+        `${requiredBytes} bytes required`,
+    );
+  }
+}
+
+function backupControlPlane(runId: string): void {
+  const root = path.join(DATA_DIR, 'repository-migrations', runId, 'control-plane-backup');
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  const files = controlPlaneBackupSources();
+  const inventory: Array<{ source: string; backup: string; size: number; sha256: string }> = [];
+  for (const source of files) {
+    const relative = path.relative(REPO_ROOT, source);
+    if (relative.startsWith('..') || path.isAbsolute(relative))
+      throw new Error(`control-plane backup path escapes: ${source}`);
+    const backup = path.join(root, relative);
+    fs.mkdirSync(path.dirname(backup), { recursive: true, mode: 0o700 });
+    if (fs.existsSync(backup)) {
+      const sourceHash = createHash('sha256').update(fs.readFileSync(source)).digest('hex');
+      const backupHash = createHash('sha256').update(fs.readFileSync(backup)).digest('hex');
+      if (sourceHash !== backupHash) throw new Error(`control-plane backup drift on resume: ${source}`);
+    } else {
+      fs.copyFileSync(source, backup, fs.constants.COPYFILE_EXCL);
+    }
+    fs.chmodSync(backup, 0o600);
+    const backupFd = fs.openSync(backup, fs.constants.O_RDONLY);
+    try {
+      fs.fsyncSync(backupFd);
+    } finally {
+      fs.closeSync(backupFd);
+    }
+    const bytes = fs.readFileSync(backup);
+    inventory.push({
+      source,
+      backup,
+      size: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    });
+  }
+  atomicJson(path.join(root, 'inventory.json'), inventory);
+}
+
+export interface ActiveServerMigration {
+  version: 2;
+  runId: string;
+  manifestPaths: string[];
+  manifestHashes: string[];
+  createdAt: string;
+  reviewedMapping?: { sourcePath: string; sha256: string; applied: number };
+  reviewedRecovery?: { sourcePath: string; sha256: string; checkouts: number; origins: number };
+  recoverySeeds: Array<{ gitDir: string; sha256: string }>;
+  aggregateCapacity: AggregateCapacityEvidence;
+  protectedArchives?: ProtectedArchiveEvidence[];
+  descriptorSha256: string;
+}
+
+export interface AggregateCapacityEvidence {
+  migrationCoreBytes: number;
+  controlPlaneBackupBytes: number;
+  globalSafetyBytes: number;
+  requiredBytes: number;
+}
+
+function activeMigrationPath(): string {
+  return path.join(DATA_DIR, 'repository-migrations', 'active-server-migration.json');
+}
+
+function completedMigrationPath(runId: string): string {
+  if (!/^[A-Za-z0-9._-]+$/.test(runId)) throw new Error(`invalid migration run id: ${runId}`);
+  return path.join(DATA_DIR, 'repository-migrations', runId, 'completed-server-migration.json');
+}
+
+function activeRollbackPath(runId: string): string {
+  return path.join(DATA_DIR, 'repository-migrations', runId, 'active-server-rollback.json');
+}
+
+function completedRollbackPath(runId: string): string {
+  return path.join(DATA_DIR, 'repository-migrations', runId, 'completed-server-rollback.json');
+}
+
+function recoverySeedEvidence(
+  reviewedRecovery: LoadedReviewedRecoveryDecisions | null,
+): Array<{ gitDir: string; sha256: string }> {
+  const seeds = new Map<string, string>();
+  for (const decision of reviewedRecovery?.checkouts ?? []) {
+    const candidates = [
+      decision.externalSeedGitDirSha256
+        ? { gitDir: decision.selectedCommonGitDir, sha256: decision.externalSeedGitDirSha256 }
+        : null,
+      decision.supplementalSeedGitDir && decision.supplementalSeedGitDirSha256
+        ? { gitDir: decision.supplementalSeedGitDir, sha256: decision.supplementalSeedGitDirSha256 }
+        : null,
+    ].filter((entry): entry is { gitDir: string; sha256: string } => entry !== null);
+    for (const candidate of candidates) {
+      const gitDir = fs.realpathSync(candidate.gitDir);
+      const prior = seeds.get(gitDir);
+      if (prior && prior !== candidate.sha256) throw new Error(`conflicting recovery seed evidence: ${gitDir}`);
+      seeds.set(gitDir, candidate.sha256);
+    }
+  }
+  return [...seeds]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([gitDir, sha256]) => ({ gitDir, sha256 }));
+}
+
+function validateRecoverySeedEvidence(seeds: Array<{ gitDir: string; sha256: string }>): void {
+  for (const seed of seeds) {
+    if (!/^[a-f0-9]{64}$/.test(seed.sha256)) throw new Error(`invalid recovery seed digest: ${seed.gitDir}`);
+    if (recoverySeedGitDirSha256(seed.gitDir) !== seed.sha256) {
+      throw new Error(`recovery seed changed after reviewed inventory: ${seed.gitDir}`);
+    }
+  }
+}
+
+function descriptorSha256(descriptor: Omit<ActiveServerMigration, 'descriptorSha256'>): string {
+  return sha(canonicalJson(descriptor));
+}
+
+export function loadMigrationDescriptor(
+  file: string,
+  dataDir: string = DATA_DIR,
+): { descriptor: ActiveServerMigration; manifests: RepositoryMigrationManifest[] } {
+  const stat = fs.lstatSync(file);
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`migration descriptor is not a regular file: ${file}`);
+  const descriptor = JSON.parse(fs.readFileSync(file, 'utf8')) as ActiveServerMigration;
+  if (
+    descriptor.version !== 2 ||
+    !descriptor.runId ||
+    !Array.isArray(descriptor.manifestPaths) ||
+    !Array.isArray(descriptor.manifestHashes) ||
+    !Array.isArray(descriptor.recoverySeeds) ||
+    descriptor.manifestPaths.length !== descriptor.manifestHashes.length
+  ) {
+    throw new Error('server migration descriptor is malformed');
+  }
+  const { descriptorSha256: expectedDescriptorSha256, ...descriptorBase } = descriptor;
+  if (
+    !/^[a-f0-9]{64}$/.test(expectedDescriptorSha256) ||
+    descriptorSha256(descriptorBase) !== expectedDescriptorSha256
+  ) {
+    throw new Error('server migration descriptor hash mismatch');
+  }
+  const manifests = descriptor.manifestPaths.map((entry, index) => {
+    const expectedRoot = path.join(dataDir, 'repository-migrations', descriptor.runId);
+    const resolved = path.resolve(entry);
+    if (resolved !== expectedRoot && !resolved.startsWith(`${expectedRoot}${path.sep}`)) {
+      throw new Error(`active manifest path escapes the run root: ${entry}`);
+    }
+    const manifest = JSON.parse(fs.readFileSync(resolved, 'utf8')) as RepositoryMigrationManifest;
+    if (manifest.runId !== descriptor.runId || manifest.manifestSha256 !== descriptor.manifestHashes[index]) {
+      throw new Error(`server migration manifest identity mismatch: ${entry}`);
+    }
+    verifyRepositoryMigrationManifest(manifest);
+    return manifest;
+  });
+  assertRepositoryMigrationManifestOrder(manifests);
+  verifyAggregateCapacityEvidence(manifests, descriptor.aggregateCapacity);
+  validateRecoverySeedEvidence(descriptor.recoverySeeds);
+  return { descriptor, manifests };
+}
+
+function loadActiveMigration(): { descriptor: ActiveServerMigration; manifests: RepositoryMigrationManifest[] } | null {
+  const file = activeMigrationPath();
+  if (!fs.existsSync(file)) return null;
+  return loadMigrationDescriptor(file);
+}
+
+function persistActiveMigration(
+  runId: string,
+  manifests: RepositoryMigrationManifest[],
+  reviewedMapping: { sourcePath: string; sha256: string; applied: number } | null,
+  reviewedRecovery: LoadedReviewedRecoveryDecisions | null,
+  protectedArchives: ProtectedArchiveEvidence[],
+  aggregateCapacity: AggregateCapacityEvidence,
+): void {
+  assertRepositoryMigrationManifestOrder(manifests);
+  for (const manifest of manifests) atomicJson(manifestPath(manifest), manifest);
+  const descriptorBase: Omit<ActiveServerMigration, 'descriptorSha256'> = {
+    version: 2,
+    runId,
+    manifestPaths: manifests.map(manifestPath),
+    manifestHashes: manifests.map((manifest) => manifest.manifestSha256),
+    createdAt: new Date().toISOString(),
+    ...(reviewedMapping ? { reviewedMapping } : {}),
+    ...(reviewedRecovery
+      ? {
+          reviewedRecovery: {
+            sourcePath: reviewedRecovery.sourcePath,
+            sha256: reviewedRecovery.sha256,
+            checkouts: reviewedRecovery.checkouts.length,
+            origins: reviewedRecovery.origins.length,
+          },
+        }
+      : {}),
+    recoverySeeds: recoverySeedEvidence(reviewedRecovery),
+    aggregateCapacity,
+    ...(protectedArchives.length > 0 ? { protectedArchives } : {}),
+  };
+  atomicJson(activeMigrationPath(), {
+    ...descriptorBase,
+    descriptorSha256: descriptorSha256(descriptorBase),
+  } satisfies ActiveServerMigration);
+}
+
+function contained(candidate: string, root: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function manifestExecutionKey(manifest: RepositoryMigrationManifest): string {
+  return `${manifest.workgroupId}\0${manifest.repo}\0${manifest.manifestSha256}`;
+}
+
+/**
+ * Return a deterministic physical-containment topological order. A repository
+ * with a checkout nested below another repository's checkout must be cut over
+ * first, regardless of workgroup/repository lexical order. The descriptor
+ * persists this exact order; rollback deliberately reverses it.
+ */
+export function orderRepositoryMigrationManifests(
+  manifests: readonly RepositoryMigrationManifest[],
+): RepositoryMigrationManifest[] {
+  const keys = manifests.map(manifestExecutionKey);
+  if (new Set(keys.map((key) => key.slice(0, key.lastIndexOf('\0')))).size !== manifests.length) {
+    throw new Error('server migration contains duplicate workgroup/repository manifests');
+  }
+  const outgoing = manifests.map(() => new Set<number>());
+  const indegree = manifests.map(() => 0);
+  for (let leftIndex = 0; leftIndex < manifests.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < manifests.length; rightIndex += 1) {
+      let leftBeforeRight = false;
+      let rightBeforeLeft = false;
+      for (const leftCapture of manifests[leftIndex].captures) {
+        const leftPath = path.resolve(leftCapture.checkoutPath);
+        for (const rightCapture of manifests[rightIndex].captures) {
+          const rightPath = path.resolve(rightCapture.checkoutPath);
+          if (leftPath === rightPath) {
+            throw new Error(`physical checkout is claimed by multiple repositories: ${leftPath}`);
+          }
+          if (contained(leftPath, rightPath)) leftBeforeRight = true;
+          if (contained(rightPath, leftPath)) rightBeforeLeft = true;
+        }
+      }
+      if (leftBeforeRight) outgoing[leftIndex].add(rightIndex);
+      if (rightBeforeLeft) outgoing[rightIndex].add(leftIndex);
+    }
+  }
+  for (const destinations of outgoing) {
+    for (const destination of destinations) indegree[destination] += 1;
+  }
+  const ready = manifests
+    .map((_manifest, index) => index)
+    .filter((index) => indegree[index] === 0)
+    .sort((left, right) => keys[left].localeCompare(keys[right]));
+  const ordered: RepositoryMigrationManifest[] = [];
+  while (ready.length > 0) {
+    const current = ready.shift()!;
+    ordered.push(manifests[current]);
+    for (const destination of [...outgoing[current]].sort((left, right) => keys[left].localeCompare(keys[right]))) {
+      indegree[destination] -= 1;
+      if (indegree[destination] === 0) {
+        ready.push(destination);
+        ready.sort((left, right) => keys[left].localeCompare(keys[right]));
+      }
+    }
+  }
+  if (ordered.length !== manifests.length) {
+    const cycle = manifests
+      .filter((_manifest, index) => indegree[index] > 0)
+      .map((manifest) => `${manifest.workgroupId}/${manifest.repo}`)
+      .sort();
+    throw new Error(`repository checkout containment cannot be ordered safely: ${cycle.join(', ')}`);
+  }
+  return ordered;
+}
+
+function assertRepositoryMigrationManifestOrder(manifests: readonly RepositoryMigrationManifest[]): void {
+  const expected = orderRepositoryMigrationManifests(manifests);
+  if (expected.some((manifest, index) => manifestExecutionKey(manifest) !== manifestExecutionKey(manifests[index]))) {
+    throw new Error('server migration manifests are not in deterministic physical-containment order');
+  }
+}
+
+function strictDirectoryNames(root: string, label: string): string[] {
+  try {
+    const stat = fs.lstatSync(root);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`${label} is not a real directory: ${root}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  return fs
+    .readdirSync(root, { withFileTypes: true })
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((entry) => {
+      if (entry.isSymbolicLink() || !entry.isDirectory()) {
+        throw new Error(`unsafe entry in ${label}: ${path.join(root, entry.name)}`);
+      }
+      return entry.name;
+    });
+}
+
+export function assertExactRepositoryNamespaces(
+  manifests: RepositoryMigrationManifest[],
+  dataDir: string = DATA_DIR,
+): void {
+  const migratedWorkgroups = new Set(manifests.map((manifest) => manifest.workgroupId));
+  const expectedCanonicals = new Set(
+    manifests
+      .filter((manifest) => !manifest.archiveOnly)
+      .map((manifest) => `${manifest.workgroupId}\0${manifest.repo}`),
+  );
+  const actualCanonicals = new Set<string>();
+  for (const workgroupId of strictDirectoryNames(repositoriesRoot(dataDir), 'canonical repository namespace')) {
+    if (!migratedWorkgroups.has(workgroupId)) continue;
+    for (const repo of strictDirectoryNames(
+      path.join(repositoriesRoot(dataDir), workgroupId),
+      `canonical repository workgroup namespace ${workgroupId}`,
+    )) {
+      actualCanonicals.add(`${workgroupId}\0${repo}`);
+    }
+  }
+  const expectedCoordination = new Set(manifests.map((manifest) => `${manifest.workgroupId}\0${manifest.repo}`));
+  const actualCoordination = new Set<string>();
+  const actualPins = new Set<string>();
+  for (const workgroupId of strictDirectoryNames(repositoryStateRoot(dataDir), 'repository coordination namespace')) {
+    if (!migratedWorkgroups.has(workgroupId)) continue;
+    for (const repo of strictDirectoryNames(
+      path.join(repositoryStateRoot(dataDir), workgroupId),
+      `repository coordination workgroup namespace ${workgroupId}`,
+    )) {
+      const key = `${workgroupId}\0${repo}`;
+      actualCoordination.add(key);
+      const pinPath = path.join(repositoryStateRoot(dataDir), workgroupId, repo, 'origin.json');
+      try {
+        const stat = fs.lstatSync(pinPath);
+        if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`unsafe origin pin: ${pinPath}`);
+        actualPins.add(key);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+  }
+  const compare = (label: string, expected: Set<string>, actual: Set<string>): void => {
+    const missing = [...expected].filter((key) => !actual.has(key));
+    const extra = [...actual].filter((key) => !expected.has(key));
+    if (missing.length > 0 || extra.length > 0) {
+      throw new Error(
+        `${label} does not exactly match the migration manifest; ` +
+          `missing=[${missing.map((key) => key.replace('\0', '/')).join(', ')}], ` +
+          `extra=[${extra.map((key) => key.replace('\0', '/')).join(', ')}]`,
+      );
+    }
+  };
+  compare('canonical repository namespace', expectedCanonicals, actualCanonicals);
+  compare('repository coordination namespace', expectedCoordination, actualCoordination);
+  compare('origin pin namespace', expectedCanonicals, actualPins);
+}
+
+export function assertNoResidualLegacyCheckoutTopology(
+  residual: ReadonlyMap<string, readonly LegacyCheckoutCandidate[]>,
+  migratedWorkgroups: ReadonlySet<string>,
+): void {
+  const residualKeys = [...residual.keys()]
+    .filter((key) => migratedWorkgroups.has(key.slice(0, key.indexOf('\0'))))
+    .sort();
+  if (residualKeys.length > 0) {
+    throw new Error(`residual legacy checkout topology remains: ${residualKeys.join(', ')}`);
+  }
+}
+
+function auditServerTopology(
+  manifests: RepositoryMigrationManifest[],
+  protectedArchives: ProtectedArchiveEvidence[],
+): void {
+  const canonicalKeys = new Set<string>();
+  const topicDestinations = new Map<string, string>();
+  for (const manifest of manifests) {
+    auditRepositoryMigration(manifest);
+    const key = `${manifest.workgroupId}\0${manifest.repo}`;
+    if (canonicalKeys.has(key))
+      throw new Error(`duplicate canonical manifest: ${manifest.workgroupId}/${manifest.repo}`);
+    canonicalKeys.add(key);
+    const canonical = canonicalRepoDir(manifest.workgroupId, manifest.repo, manifest.dataDir);
+    if (manifest.archiveOnly) {
+      if (fs.existsSync(canonical)) {
+        throw new Error(`archive-only repository has an active canonical: ${manifest.workgroupId}/${manifest.repo}`);
+      }
+      if (readOriginPin(manifest.workgroupId, manifest.repo, manifest.dataDir)) {
+        throw new Error(`archive-only repository has an active origin pin: ${manifest.workgroupId}/${manifest.repo}`);
+      }
+    } else {
+      if (!contained(fs.realpathSync(canonical), path.join(repositoriesRoot(manifest.dataDir), manifest.workgroupId))) {
+        throw new Error(`canonical escapes workgroup namespace: ${canonical}`);
+      }
+      const pin = readOriginPin(manifest.workgroupId, manifest.repo, manifest.dataDir);
+      if (!pin || pin.origin !== manifest.origin || pin.repositoryId !== manifest.repositoryId) {
+        throw new Error(`canonical origin pin mismatch: ${manifest.workgroupId}/${manifest.repo}`);
+      }
+    }
+    for (const capture of manifest.captures) {
+      if (!capture.renamedOldPath || !fs.existsSync(capture.renamedOldPath)) {
+        throw new Error(`retained old checkout is missing: ${capture.checkoutPath}`);
+      }
+      if (fs.existsSync(capture.checkoutPath)) throw new Error(`legacy checkout remains live: ${capture.checkoutPath}`);
+      if (!capture.destinationPath) continue;
+      if (capture.preservedLegacy) {
+        const expectedRoot = path.join(manifest.dataDir, 'repository-rescues', manifest.workgroupId, manifest.repo);
+        if (!contained(fs.realpathSync(capture.destinationPath), expectedRoot)) {
+          throw new Error(`legacy canonical rescue escapes its host-only namespace: ${capture.destinationPath}`);
+        }
+        continue;
+      }
+      const expectedRoot = topicWorktreesDir(capture.workUnit, manifest.dataDir);
+      if (!contained(fs.realpathSync(capture.destinationPath), expectedRoot)) {
+        throw new Error(`topic worktree escapes its work-unit namespace: ${capture.destinationPath}`);
+      }
+      if (!contained(capture.destinationPath, path.join(topicsRoot(manifest.dataDir), manifest.workgroupId))) {
+        throw new Error(`topic worktree escapes its workgroup namespace: ${capture.destinationPath}`);
+      }
+      const topicKey = `${capture.workgroupId}\0${capture.workUnit.key}\0${capture.repo}`;
+      const prior = topicDestinations.get(topicKey);
+      if (prior && prior !== capture.destinationPath)
+        throw new Error(`same topic resolves to multiple worktrees: ${topicKey}`);
+      topicDestinations.set(topicKey, capture.destinationPath);
+    }
+    for (const store of manifest.objectStores) {
+      if (store.split(path.sep).includes('.repos') && fs.existsSync(store)) {
+        throw new Error(`live bare-mirror topology remains: ${store}`);
+      }
+    }
+  }
+
+  // Re-run discovery from the configured DB roots after conversion. A checkout
+  // omitted by the manifest, an unreadable root, or a residual bare store is a
+  // hard activation blocker even when every listed manifest audits cleanly.
+  const db = new Database(path.join(DATA_DIR, 'v2.db'), { readonly: true, fileMustExist: true });
+  let rows: SessionRow[];
+  let groups: AgentGroupRow[];
+  try {
+    rows = loadRows(db);
+    groups = loadAgentGroups(db);
+  } finally {
+    db.close();
+  }
+  const migratedWorkgroups = new Set(manifests.map((manifest) => manifest.workgroupId));
+  const residual = inventoryCandidates(rows, groups);
+  assertNoResidualLegacyCheckoutTopology(residual, migratedWorkgroups);
+  const residualBare = inventoryBareStores(groups);
+  const residualBareKeys = [...residualBare.keys()].filter((key) =>
+    migratedWorkgroups.has(key.slice(0, key.indexOf('\0'))),
+  );
+  if (residualBareKeys.length > 0) {
+    throw new Error(`residual bare repository topology remains: ${residualBareKeys.join(', ')}`);
+  }
+  assertExactRepositoryNamespaces(manifests);
+  verifyProtectedArchives(protectedArchives);
+}
+
+function migrationQuiescencePaths(
+  manifests: RepositoryMigrationManifest[],
+  protectedArchives: ProtectedArchiveEvidence[],
+): string[] {
+  return minimalQuiescenceRoots([
+    ...new Set([
+      ...manifests.flatMap((manifest) => [
+        ...manifest.captures.map((capture) => capture.checkoutPath),
+        ...manifest.captures.flatMap((capture) =>
+          [capture.destinationPath, capture.renamedOldPath].filter((entry): entry is string => Boolean(entry)),
+        ),
+        ...manifest.objectStores,
+        repositoryMigrationPath(manifest),
+        path.dirname(canonicalRepoDir(manifest.workgroupId, manifest.repo, manifest.dataDir)),
+        path.join(repositoryStateRoot(manifest.dataDir), manifest.workgroupId, manifest.repo),
+        path.join(manifest.dataDir, 'repository-migrations', manifest.runId, manifest.workgroupId, manifest.repo),
+      ]),
+      ...protectedArchives.map((archive) => archive.root),
+    ]),
+  ]);
+}
+
+async function executeAndAudit(
+  manifests: RepositoryMigrationManifest[],
+  runId: string,
+  protectedArchives: ProtectedArchiveEvidence[],
+  aggregateCapacity: AggregateCapacityEvidence,
+  recoverySeeds: Array<{ gitDir: string; sha256: string }>,
+): Promise<void> {
+  assertRepositoryMigrationManifestOrder(manifests);
+  const allPaths = migrationQuiescencePaths(manifests, protectedArchives);
+  assertFleetQuiescent(allPaths);
+  backupControlPlane(runId);
+  validateRecoverySeedEvidence(recoverySeeds);
+  try {
+    for (let index = 0; index < manifests.length; index += 1) {
+      const remaining = manifests.slice(index).filter((candidate) => {
+        try {
+          auditRepositoryMigration(candidate);
+          return false;
+        } catch {
+          return true;
+        }
+      });
+      assertRemainingAggregateCapacity(remaining, aggregateCapacity);
+      const manifest = manifests[index];
+      const repositoryPaths = migrationQuiescencePaths([manifest], []);
+      await executeRepositoryMigration(manifest, {
+        assertQuiescent: () => assertFleetQuiescent(repositoryPaths),
+      });
+    }
+    auditServerTopology(manifests, protectedArchives);
+  } catch (error) {
+    const rollbackErrors: string[] = [];
+    for (const manifest of [...manifests].reverse()) {
+      try {
+        await rollbackRepositoryMigration(manifest);
+      } catch (rollbackError) {
+        rollbackErrors.push(
+          `${manifest.workgroupId}/${manifest.repo}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+    }
+    for (const manifest of manifests) {
+      for (const capture of manifest.captures) {
+        if (!fs.existsSync(capture.checkoutPath)) {
+          rollbackErrors.push(
+            `${manifest.workgroupId}/${manifest.repo}: original checkout not restored: ${capture.checkoutPath}`,
+          );
+        }
+      }
+      for (const store of manifest.objectStores) {
+        if (!fs.existsSync(store))
+          rollbackErrors.push(`${manifest.workgroupId}/${manifest.repo}: object store not restored: ${store}`);
+      }
+      if (fs.existsSync(repositoryMigrationPath(manifest))) {
+        rollbackErrors.push(`${manifest.workgroupId}/${manifest.repo}: migration repository remains after rollback`);
+      }
+    }
+    try {
+      verifyProtectedArchives(protectedArchives);
+    } catch (archiveError) {
+      rollbackErrors.push(archiveError instanceof Error ? archiveError.message : String(archiveError));
+    }
+    if (rollbackErrors.length > 0) {
+      throw new Error(
+        `server migration failed and rollback could not prove the original topology:\n${rollbackErrors.join('\n')}\n` +
+          `original error: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+    throw new Error(
+      `server migration failed; every mutated repository was rolled back and original paths were verified: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+  const active = activeMigrationPath();
+  const completed = completedMigrationPath(runId);
+  if (fs.existsSync(active)) {
+    fs.renameSync(active, completed);
+    const parentFd = fs.openSync(path.dirname(completed), fs.constants.O_RDONLY);
+    try {
+      fs.fsyncSync(parentFd);
+    } finally {
+      fs.closeSync(parentFd);
+    }
+  }
+  console.log('OFFLINE AUDIT PASSED. Old topology remains renamed in place; fleet is still stopped.');
+}
+
+export function verifyServerRollback(
+  manifests: RepositoryMigrationManifest[],
+  protectedArchives: ProtectedArchiveEvidence[],
+): void {
+  const errors: string[] = [];
+  for (const manifest of manifests) {
+    for (const capture of manifest.captures) {
+      if (!fs.existsSync(capture.checkoutPath)) {
+        errors.push(
+          `${manifest.workgroupId}/${manifest.repo}: original checkout not restored: ${capture.checkoutPath}`,
+        );
+      }
+    }
+    for (const store of manifest.objectStores) {
+      if (!fs.existsSync(store))
+        errors.push(`${manifest.workgroupId}/${manifest.repo}: object store not restored: ${store}`);
+    }
+    const migrationRepository = repositoryMigrationPath(manifest);
+    if (fs.existsSync(migrationRepository)) {
+      errors.push(
+        `${manifest.workgroupId}/${manifest.repo}: migration repository remains after rollback: ${migrationRepository}`,
+      );
+    }
+    if (readOriginPin(manifest.workgroupId, manifest.repo, manifest.dataDir)) {
+      errors.push(`${manifest.workgroupId}/${manifest.repo}: migration origin pin remains after rollback`);
+    }
+  }
+  try {
+    verifyProtectedArchives(protectedArchives);
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+  }
+  if (errors.length > 0) {
+    throw new Error(`server rollback could not prove the original topology:\n${errors.join('\n')}`);
+  }
+}
+
+function durableRename(source: string, destination: string): void {
+  if (fs.existsSync(destination)) throw new Error(`durable destination already exists: ${destination}`);
+  fs.renameSync(source, destination);
+  const parentFd = fs.openSync(path.dirname(destination), fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(parentFd);
+  } finally {
+    fs.closeSync(parentFd);
+  }
+}
+
+async function rollbackCompletedServerMigration(runId: string): Promise<void> {
+  const completed = completedMigrationPath(runId);
+  const activeRollback = activeRollbackPath(runId);
+  const completedRollback = completedRollbackPath(runId);
+  if (fs.existsSync(completedRollback) && !fs.existsSync(completed) && !fs.existsSync(activeRollback)) {
+    const prior = loadMigrationDescriptor(completedRollback);
+    const paths = migrationQuiescencePaths(prior.manifests, prior.descriptor.protectedArchives ?? []);
+    assertFleetQuiescent(paths);
+    verifyServerRollback(prior.manifests, prior.descriptor.protectedArchives ?? []);
+    console.log(`ROLLBACK ALREADY COMPLETE for ${runId}. Fleet remains stopped.`);
+    return;
+  }
+  if (fs.existsSync(completed) && fs.existsSync(activeRollback)) {
+    throw new Error(
+      `rollback state is ambiguous for ${runId}: both completed migration and active rollback descriptors exist`,
+    );
+  }
+  const firstAttempt = fs.existsSync(completed);
+  const source = firstAttempt ? completed : activeRollback;
+  if (!fs.existsSync(source)) throw new Error(`no completed or resumable rollback descriptor exists for ${runId}`);
+  const loaded = loadMigrationDescriptor(source);
+  if (loaded.descriptor.runId !== runId) throw new Error(`rollback descriptor run id mismatch: ${runId}`);
+  const protectedArchives = loaded.descriptor.protectedArchives ?? [];
+  const allPaths = migrationQuiescencePaths(loaded.manifests, protectedArchives);
+  assertFleetQuiescent(allPaths);
+  validateRecoverySeedEvidence(loaded.descriptor.recoverySeeds);
+  if (firstAttempt) {
+    // Canary rollback is permitted only while the post-migration repository
+    // topology remains byte-for-byte identical to the offline audit. Any edit
+    // or newly created linked worktree blocks before the first rollback write.
+    auditServerTopology(loaded.manifests, protectedArchives);
+    durableRename(completed, activeRollback);
+  }
+  for (const manifest of [...loaded.manifests].reverse()) {
+    const repositoryPaths = migrationQuiescencePaths([manifest], []);
+    assertFleetQuiescent(repositoryPaths);
+    await withHostRepositoryLock(
+      manifest.workgroupId,
+      manifest.repo,
+      async () => {
+        assertFleetQuiescent(repositoryPaths);
+        await rollbackRepositoryMigration(manifest);
+      },
+      manifest.dataDir,
+    );
+  }
+  verifyServerRollback(loaded.manifests, protectedArchives);
+  durableRename(activeRollback, completedRollback);
+  console.log(`CONTROLLED ROLLBACK PASSED for ${runId}. Original topology is restored; fleet remains stopped.`);
+}
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+  if (args.rollbackRun) {
+    await rollbackCompletedServerMigration(args.rollbackRun);
+    return;
+  }
+  if (args.execute) {
+    const active = loadActiveMigration();
+    if (active) {
+      if (args.runId && args.runId !== active.descriptor.runId) {
+        throw new Error(`active migration ${active.descriptor.runId} must be resumed before starting ${args.runId}`);
+      }
+      console.log(`RESUMING controlled migration ${active.descriptor.runId} from durable manifests.`);
+      await executeAndAudit(
+        active.manifests,
+        active.descriptor.runId,
+        active.descriptor.protectedArchives ?? [],
+        active.descriptor.aggregateCapacity,
+        active.descriptor.recoverySeeds,
+      );
+      return;
+    }
+  }
+  const db = new Database(path.join(DATA_DIR, 'v2.db'), { readonly: true, fileMustExist: true });
+  let rows: SessionRow[];
+  let groups: AgentGroupRow[];
+  try {
+    rows = loadRows(db);
+    groups = loadAgentGroups(db);
+  } finally {
+    db.close();
+  }
+  const reviewedMappings = loadReviewedWorkUnitMappings(args.mappingFile);
+  const reviewedRecovery = loadReviewedRecoveryDecisions(args.recoveryFile);
+  const recoveryDecisionInScope = (decision: { workgroupId: string; repo: string }): boolean =>
+    (!args.workgroup || decision.workgroupId === args.workgroup) && (!args.repo || decision.repo === args.repo);
+  const scopedReviewedRecovery = reviewedRecovery
+    ? {
+        ...reviewedRecovery,
+        checkouts: reviewedRecovery.checkouts.filter(recoveryDecisionInScope),
+        origins: reviewedRecovery.origins.filter(recoveryDecisionInScope),
+      }
+    : null;
+  const scopedReviewedMappings = reviewedMappings
+    ? {
+        ...reviewedMappings,
+        entries: reviewedMappings.entries.filter((entry) => !args.workgroup || entry.workgroupId === args.workgroup),
+      }
+    : null;
+  const grouped = inventoryCandidates(rows, groups, args.workgroup, reviewedMappings?.entries);
+  const bareStores = inventoryBareStores(groups, args.workgroup);
+  coalesceRepositoryIdentityAliases(grouped, bareStores);
+  const knownWorkUnits = rows.map((row) =>
+    resolveRepositoryWorkUnit({
+      workgroupId: row.workgroup_id,
+      sessionId: row.session_id,
+      platformId: row.platform_id,
+      messagingGroupId: row.messaging_group_id,
+      threadId: row.thread_id,
+    }),
+  );
+  const mappingEvidence = applyReviewedWorkUnitMappings(grouped, knownWorkUnits, scopedReviewedMappings);
+  if (mappingEvidence) {
+    console.error(
+      `Applied ${mappingEvidence.applied} reviewed checkout mapping(s) from ${mappingEvidence.sourcePath} ` +
+        `(sha256 ${mappingEvidence.sha256})`,
+    );
+  }
+  if (args.repo) {
+    for (const key of [...grouped.keys()]) if (key.split('\0')[1] !== args.repo) grouped.delete(key);
+    for (const key of [...bareStores.keys()]) if (key.split('\0')[1] !== args.repo) bareStores.delete(key);
+  }
+  if (scopedReviewedRecovery) {
+    console.error(
+      `Loaded reviewed recovery decisions from ${scopedReviewedRecovery.sourcePath} ` +
+        `(sha256 ${scopedReviewedRecovery.sha256}; ${scopedReviewedRecovery.checkouts.length} checkout, ` +
+        `${scopedReviewedRecovery.origins.length} origin in scope)`,
+    );
+  }
+  const checkoutRecoveryByPath = new Map(
+    (scopedReviewedRecovery?.checkouts ?? []).map((decision) => [path.resolve(decision.checkoutPath), decision]),
+  );
+  const originRecoveryByRepo = new Map(
+    (scopedReviewedRecovery?.origins ?? []).map((decision) => [`${decision.workgroupId}\0${decision.repo}`, decision]),
+  );
+  const usedCheckoutRecovery = new Set<string>();
+  const usedOriginRecovery = new Set<string>();
+  for (const candidates of grouped.values()) {
+    for (const candidate of candidates) {
+      const decision = checkoutRecoveryByPath.get(path.resolve(candidate.checkoutPath));
+      const reviewedStores = [
+        ...(decision?.externalSeedGitDirSha256 ? [decision.selectedCommonGitDir] : []),
+        ...(decision?.supplementalSeedGitDir ? [decision.supplementalSeedGitDir] : []),
+      ];
+      if (reviewedStores.length === 0) continue;
+      candidate.candidateCommonGitDirs = [
+        ...new Set([...(candidate.candidateCommonGitDirs ?? []), ...reviewedStores]),
+      ].sort();
+    }
+  }
+  for (const key of bareStores.keys()) {
+    if (!grouped.has(key)) grouped.set(key, []);
+  }
+  for (const [key, candidates] of grouped) {
+    const common = new Set(candidates.flatMap((candidate) => candidate.candidateCommonGitDirs ?? []));
+    for (const store of bareStores.get(key) ?? []) common.add(store);
+    for (const candidate of candidates) candidate.candidateCommonGitDirs = [...common].sort();
+  }
+  if (grouped.size === 0) throw new Error('no legacy physical repository checkouts discovered');
+
+  const preManifestPaths = preManifestQuiescencePaths(groups, grouped, bareStores);
+  if (args.execute) assertFleetQuiescent(preManifestPaths);
+
+  let manifests: RepositoryMigrationManifest[] = [];
+  const manifestErrors: string[] = [];
+  const serverRunId =
+    args.runId ?? `${new Date().toISOString().replace(/[:.]/g, '-')}-${sha(String(process.pid)).slice(0, 8)}`;
+  for (const [key, candidates] of [...grouped].sort(([a], [b]) => a.localeCompare(b))) {
+    const [workgroupId, repo] = key.split('\0');
+    console.error(`Inventorying ${workgroupId}/${repo}: ${candidates.length} physical checkout(s)`);
+    try {
+      const originResolution = createLegacyGitResolutionContext([
+        ...candidates.flatMap((candidate) => candidate.candidateCommonGitDirs ?? []),
+        ...(bareStores.get(key) ?? []),
+      ]);
+      const originDecision = originRecoveryByRepo.get(key);
+      const candidateOrigins = candidates.flatMap((candidate, index) => {
+        console.error(
+          `Resolving origin ${workgroupId}/${repo} ${index + 1}/${candidates.length}: ${candidate.checkoutPath}`,
+        );
+        try {
+          const observedOrigin = originFor(candidate, originResolution);
+          if (repositoryOriginContainsCredentials(observedOrigin)) candidate.credentialBearingOrigin = true;
+          return [normalizedObservedOrigin(observedOrigin)];
+        } catch (error) {
+          if (originDecision) return [];
+          throw error;
+        }
+      });
+      const storeOrigins = (bareStores.get(key) ?? []).map((store) =>
+        normalizedObservedOrigin(originForObjectStore(store, originResolution)),
+      );
+      const origins = [...new Set([...candidateOrigins, ...storeOrigins])];
+      const origin = selectReviewedOrigin({ workgroupId, repo, observedOrigins: origins, decision: originDecision });
+      if (originDecision) usedOriginRecovery.add(key);
+      const repositoryId =
+        origin === null
+          ? `local-only:${sha(`${workgroupId}\0${repo}`)}`
+          : (normalizedGithubRepositoryIdentity(origin) ?? `migration:${sha(origin)}`);
+      manifests.push(
+        createRepositoryMigrationManifest({
+          dataDir: DATA_DIR,
+          workgroupId,
+          repo,
+          origin,
+          archiveOnly: originDecision?.archiveOnly === true,
+          repositoryId,
+          candidates,
+          objectStores: bareStores.get(key),
+          runId: serverRunId,
+          resolutionContext: originResolution,
+          recoveryDecisions: candidates
+            .map((candidate) => checkoutRecoveryByPath.get(path.resolve(candidate.checkoutPath)))
+            .filter((decision): decision is NonNullable<typeof decision> => {
+              if (decision) usedCheckoutRecovery.add(path.resolve(decision.checkoutPath));
+              return decision !== undefined;
+            }),
+          onCaptureProgress: ({ phase, current, total, checkoutPath }) => {
+            if (phase === 'starting') {
+              console.error(`Capturing ${workgroupId}/${repo} ${current}/${total}: ${checkoutPath}`);
+            } else if (current === 1 || current === total || current % 10 === 0) {
+              console.error(`Captured ${workgroupId}/${repo}: ${current}/${total}`);
+            }
+          },
+        }),
+      );
+    } catch (error) {
+      manifestErrors.push(`${workgroupId}/${repo}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (manifestErrors.length > 0) {
+    if (args.proposalFile) {
+      const proposalPath = path.resolve(args.proposalFile);
+      const temporaryRoot = `${path.resolve('/tmp')}${path.sep}`;
+      if (!proposalPath.startsWith(temporaryRoot)) throw new Error('--proposal-file must be a path below /tmp');
+      const checkouts = manifestErrors.flatMap((entry) =>
+        [...entry.matchAll(/reviewed recovery proposal \(action requires operator review\): (\{[^\n]+\})/g)].map(
+          (match) => JSON.parse(match[1]),
+        ),
+      );
+      atomicJson(proposalPath, { version: 2, checkouts, origins: [] });
+      fs.chmodSync(proposalPath, 0o600);
+      console.error(
+        `Wrote ${checkouts.length} hash-bound recovery proposal(s) to ${proposalPath}; operator review is required.`,
+      );
+    }
+    throw new Error(
+      `server-wide inventory has ${manifestErrors.length} blocking repository error(s):\n${manifestErrors.map((entry) => `- ${entry}`).join('\n')}`,
+    );
+  }
+  const unusedCheckouts = [...checkoutRecoveryByPath.keys()].filter((entry) => !usedCheckoutRecovery.has(entry));
+  const unusedOrigins = [...originRecoveryByRepo.keys()].filter((entry) => !usedOriginRecovery.has(entry));
+  if (unusedCheckouts.length > 0 || unusedOrigins.length > 0) {
+    throw new Error(
+      `reviewed recovery decision(s) did not match the current inventory:\n` +
+        [...unusedCheckouts, ...unusedOrigins.map((entry) => entry.replace('\0', '/'))]
+          .map((entry) => `- ${entry}`)
+          .join('\n'),
+    );
+  }
+  manifests = orderRepositoryMigrationManifests(manifests);
+
+  const statfs = fs.statfsSync(DATA_DIR);
+  const available = Number(statfs.bavail) * Number(statfs.bsize);
+  const aggregateCapacity = aggregateCapacityEvidence(manifests);
+  console.log(`Repositories: ${manifests.length}`);
+  console.log(`Physical checkouts: ${manifests.reduce((sum, manifest) => sum + manifest.captures.length, 0)}`);
+  console.log(
+    `Capacity: ${(available / 2 ** 30).toFixed(2)} GiB available, ` +
+      `${(aggregateCapacity.requiredBytes / 2 ** 30).toFixed(2)} GiB required`,
+  );
+  console.log(
+    `Control-plane backup allowance: ${(aggregateCapacity.controlPlaneBackupBytes / 2 ** 20).toFixed(2)} MiB`,
+  );
+  for (const manifest of manifests) {
+    console.log(`- ${manifest.workgroupId}/${manifest.repo}: ${manifest.captures.length} checkout(s)`);
+  }
+  if (available < aggregateCapacity.requiredBytes)
+    throw new Error('server-wide capacity gate rejected before mutation');
+  if (!args.execute) {
+    console.log('DRY RUN: no files, refs, services, containers, or repositories were changed.');
+    return;
+  }
+
+  assertFleetQuiescent(preManifestPaths);
+  validateReviewedRecoverySeeds(scopedReviewedRecovery?.checkouts ?? []);
+  const protectedArchives = captureProtectedArchives(
+    groups,
+    new Set(manifests.map((manifest) => manifest.workgroupId)),
+  );
+  persistActiveMigration(
+    serverRunId,
+    manifests,
+    mappingEvidence,
+    scopedReviewedRecovery,
+    protectedArchives,
+    aggregateCapacity,
+  );
+  await executeAndAudit(
+    manifests,
+    serverRunId,
+    protectedArchives,
+    aggregateCapacity,
+    recoverySeedEvidence(scopedReviewedRecovery),
+  );
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  void main().catch((error) => {
+    console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
+    process.exitCode = 1;
+  });
+}

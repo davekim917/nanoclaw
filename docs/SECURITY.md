@@ -40,7 +40,9 @@ spawn. For the default (Claude) provider these are:
 
 | Container path                                 | Host source                                         | Mode                     | Purpose                                                                      |
 | ---------------------------------------------- | --------------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------- |
-| `/workspace`                                   | `data/v2-sessions/<group>/<session>/`               | RW                       | Session folder — DBs, outbox, heartbeat, and worktrees                       |
+| `/workspace`                                   | `data/v2-sessions/<group>/<session>/`               | RW                       | Session folder — DBs, outbox, and heartbeat                                  |
+| `/workspace/worktrees`                         | `data/v2-topics/<workgroup>/<work-unit>/worktrees`  | RW                       | Exact topic checkout root; same-topic siblings share, different topics split |
+| host-absolute canonical `.git` paths           | `data/repositories/<workgroup>/<repo>/.git`         | RW                       | Linked-worktree common metadata; canonical working tree is not mounted       |
 | `/workspace/inbound.db`                        | session `inbound.db`                                | RO overlay               | Host-owned inbound transport; container cannot forge delivery state          |
 | `/workspace/agent`                             | `groups/<folder>/`                                  | RW                       | Agent-private working files and standing instructions                        |
 | `/workspace/workgroup`                         | `data/workgroups/<workgroup>/`                      | RW when shared-FS active | Workgroup house shared by sibling agent groups                               |

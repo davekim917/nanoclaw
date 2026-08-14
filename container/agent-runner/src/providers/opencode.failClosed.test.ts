@@ -8,6 +8,7 @@ import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env
 // touch the real filesystem here — every test stubs fs.existsSync so "present"
 // and "absent" are controlled, not dependent on the runner's /workspace layout.
 const GUARD_PLUGIN = '/workspace/plugins/bootstrap/plugins/workflow/hooks/guards/opencode-guard.ts';
+const MANAGED_GIT_GUARD_PLUGIN = '/app/src/managed-git-guard-opencode.ts';
 
 // spyOn the live fs namespace (same object opencode.ts imports) and restore per
 // test — mock.restore() does NOT undo mock.module(), so we deliberately avoid
@@ -43,10 +44,10 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
     expect(() => buildOpenCodeConfig({}, {})).toThrow(/guard plugin not found/i);
   });
 
-  it('test_oc_provider_plugin_always_present: returned config always includes plugin: [GUARD_PLUGIN] (no conditional)', () => {
+  it('test_oc_provider_plugin_always_present: returned config always includes both guard plugins', () => {
     stubGuardPresent(true);
     const cfg = buildOpenCodeConfig({}, {}) as { plugin?: unknown; permission?: unknown };
-    expect(cfg.plugin).toEqual([GUARD_PLUGIN]);
+    expect(cfg.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN]);
     // Sanity: the auto-approve setting the guard is protecting against is present,
     // so the guard's presence is load-bearing, not cosmetic.
     expect(cfg.permission).toBe('allow');
@@ -67,7 +68,7 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
     stubGuardPresent(true);
     const guarded = buildOpenCodeConfig({}, {}) as { plugin?: unknown; permission?: unknown };
     expect(guarded.permission).toBe('allow');
-    expect(guarded.plugin).toEqual([GUARD_PLUGIN]);
+    expect(guarded.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN]);
 
     // Reset and exercise the opt-out path.
     for (const s of spies.splice(0)) s.mockRestore();
@@ -78,9 +79,8 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
     // harmlessly ignores a missing plugin path — verified on opencode@1.15.7), so
     // there is no permission:'allow'-without-plugin config anywhere.
     expect(optout.permission).toBe('allow');
-    expect(optout.plugin).toEqual([GUARD_PLUGIN]);
+    expect(optout.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN]);
   });
-
 });
 
 describe('buildOpencodeServerEnv — secret strip (F2)', () => {
@@ -224,7 +224,7 @@ describe('buildOpenCodeConfig + buildOpencodeServerEnv — combined spawn (F3)',
       mcp?: Record<string, unknown>;
       model?: unknown;
     };
-    expect(cfg.plugin).toEqual([GUARD_PLUGIN]);
+    expect(cfg.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN]);
     expect(cfg.permission).toBe('allow');
     expect(cfg.model).toBe('anthropic/claude-opus-4-8');
     expect(cfg.mcp?.nanoclaw).toBeDefined();

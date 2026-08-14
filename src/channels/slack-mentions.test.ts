@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   fetchSlackBotIdentity,
+  getSlackBotSenderName,
   normalizeSlackOrderedListContinuations,
   registerSlackBot,
   registerSlackWorkspaceHumans,
@@ -694,6 +695,62 @@ describe('resolveInboundSlackIds', () => {
         teamId: '__cleared__',
       });
       registerSlackWorkspaceHumans('T-INBOUND', []);
+    }
+  });
+
+  it('prefers a bot real name over its deprecated install-time username', () => {
+    registerSlackBot('slack-test-inbound-real-name', {
+      userId: 'U-CLAW',
+      username: 'claw',
+      realName: 'illie',
+      teamId: 'T-INBOUND-REAL-NAME',
+    });
+    try {
+      expect(resolveInboundSlackIds('<@U-CLAW> please take this', 'slack-test-inbound-real-name')).toBe(
+        '@illie please take this',
+      );
+    } finally {
+      registerSlackBot('slack-test-inbound-real-name', {
+        userId: 'U-CLAW',
+        username: 'claw',
+        teamId: '__cleared__',
+      });
+    }
+  });
+});
+
+describe('getSlackBotSenderName', () => {
+  it('uses the current profile name for sibling authors in the same workspace', () => {
+    registerSlackBot('slack-sender-self', {
+      userId: 'U-SELF-SENDER',
+      username: 'self-old',
+      realName: 'illie',
+      teamId: 'T-SENDER',
+    });
+    registerSlackBot('slack-sender-peer', {
+      userId: 'U-PEER-SENDER',
+      username: 'argus',
+      realName: 'Dinesh',
+      teamId: 'T-SENDER',
+    });
+    registerSlackBot('slack-sender-foreign', {
+      userId: 'U-FOREIGN-SENDER',
+      username: 'foreign',
+      realName: 'Foreign',
+      teamId: 'T-OTHER-SENDER',
+    });
+    try {
+      expect(getSlackBotSenderName('slack-sender-self', 'U-PEER-SENDER')).toBe('Dinesh');
+      expect(getSlackBotSenderName('slack-sender-self', 'U-FOREIGN-SENDER')).toBeNull();
+      expect(getSlackBotSenderName('slack-sender-self', 'U-HUMAN-SENDER')).toBeNull();
+    } finally {
+      for (const channelType of ['slack-sender-self', 'slack-sender-peer', 'slack-sender-foreign']) {
+        registerSlackBot(channelType, {
+          userId: `cleared-${channelType}`,
+          username: 'cleared',
+          teamId: '__cleared__',
+        });
+      }
     }
   });
 });

@@ -388,9 +388,7 @@ export async function readCodexTurnSnapshot(
 
   const turn = turns.find(
     (candidate): candidate is Record<string, unknown> =>
-      !!candidate &&
-      typeof candidate === 'object' &&
-      (candidate as Record<string, unknown>).id === turnId,
+      !!candidate && typeof candidate === 'object' && (candidate as Record<string, unknown>).id === turnId,
   );
   if (!turn) throw new Error(`thread/read turn backfill response missing turn ${turnId}`);
   return turn;
@@ -604,11 +602,14 @@ export function buildCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): {
  * approval wait requires a long timeout (`emailGateTimeoutSec`), so this
  * event gets the longest timeout in the file.
  */
-export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): void {
+export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number; codexHome?: string }): void {
   // Honor CODEX_HOME (see writeCodexMcpConfigToml): hooks.json is the destructive-
   // guard wiring, so a rotated fallback home MUST get the regenerated hooks or the
-  // guard silently stops firing after an OAuth rotation. (codex #126)
-  const codexConfigDir = process.env.CODEX_HOME || path.join(process.env.HOME || '/home/node', '.codex');
+  // guard silently stops firing after an OAuth rotation. An explicit codexHome
+  // lets peer-mode `codex exec` receive the same in-tree hook before CODEX_HOME
+  // is switched to its synthesized runtime directory. (codex #126)
+  const codexConfigDir =
+    opts?.codexHome ?? process.env.CODEX_HOME ?? path.join(process.env.HOME || '/home/node', '.codex');
   fs.mkdirSync(codexConfigDir, { recursive: true });
   const hooksJsonPath = path.join(codexConfigDir, 'hooks.json');
   const hooks = buildCodexHooksJson(opts);

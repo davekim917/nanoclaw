@@ -127,6 +127,25 @@ export function getSlackBotDisplayName(channelType: string): string | null {
 }
 
 /**
+ * Resolve a sibling bot author to the name users see in this Slack workspace.
+ *
+ * Chat SDK author fields can retain the app's legacy install-time name even
+ * after the bot profile is renamed. Trust the live bot registry instead, but
+ * only inside the current bot's workspace so a matching Slack user id from a
+ * different tenant can never acquire the wrong name.
+ */
+export function getSlackBotSenderName(channelType: string, userId: string): string | null {
+  const self = knownSlackBots.get(channelType);
+  if (!self) return null;
+  for (const bot of knownSlackBots.values()) {
+    if (bot.teamId === self.teamId && bot.userId === userId) {
+      return bot.displayName || bot.realName || bot.username || null;
+    }
+  }
+  return null;
+}
+
+/**
  * Rewrite `@beacont-username` and `<@beacont-username>` to Slack's canonical
  * `<@USER_ID>` mention syntax for every sibling bot that lives in the
  * same Slack workspace as `currentChannelType`.
@@ -624,7 +643,7 @@ export function resolveInboundSlackIds(text: string, channelType: string): strin
   };
   for (const bot of knownSlackBots.values()) {
     if (teamId && bot.teamId !== teamId) continue;
-    substitute(bot, bot.displayName || bot.username);
+    substitute(bot, bot.displayName || bot.realName || bot.username);
   }
   if (teamId) {
     for (const human of knownSlackHumans.get(teamId) ?? []) {

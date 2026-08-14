@@ -126,33 +126,32 @@ When sibling agents are wired to the same chat channel, each agent's adapter wri
 
 ---
 
-## Repo store (mirror + snapshot topology)
+## Canonical repositories and topic worktrees
 
-Shared repos in a migrated workgroup live in three layers under
-`data/workgroups/<id>/`:
+Each `(workgroup, repository)` has one host-owned normal clone at
+`data/repositories/<workgroup>/<repo>`. Its working tree is never mounted into
+agent containers. Graphify reads that clean host tree directly.
 
-- **`.repos/<repo>.git`** — the bare mirror, the store of record. The host's
-  freshness worker (`src/repo-freshness.ts`, 10-min serialized loop) fetches
-  it with `--prune`, follows default-branch renames, and records
-  `.repos/<repo>.freshness.json` (ts, oid, ref, fetchOk). Fetch failures are
-  loud, never silent.
-- **`<repo>/`** — a detached snapshot of `origin/HEAD`, advanced by the host
-  to the exact fetched OID and mounted **read-only** into member containers.
-  This is what agents browse and Graphify indexes — it cannot be checked out
-  onto a branch or dirtied, which retires the parked-canonical staleness
-  failure mode.
-- **`/workspace/worktrees/<repo>`** — per-thread STANDALONE clones (not
-  linked worktrees), created from the mirror with origin repointed at the
-  real remote. Self-contained metadata means host-side git (cleanup cron,
-  autosave checks) works on container-created checkouts. Long-lived shared
-  checkouts live under `.worktrees/<name>` with a root symlink for
-  discoverability.
+Each conversation topic gets one standard linked worktree under
+`data/v2-topics/<workgroup>/<work-unit>/worktrees/<repo>`, mounted at
+`/workspace/worktrees/<repo>`. Sibling agents in the same topic resolve the
+same work-unit and checkout. Different topics have distinct paths, branches,
+indexes, and Git admin directories. Existing worktrees are never automatically
+rebased, branch-switched, or reset.
 
-`.repos`, `.rescues`, and `.worktrees` are excluded from Graphify discovery —
-only the snapshot competes as "current source". Migration from the legacy
-shared-canonical layout: `scripts/migrate-repo-store.ts --workgroup <id>`
-(dry-run by default; archives everything under `.rescues/<run>/` before any
-destructive step and writes a parked-branch index into workgroup memory).
+Containers fetch with their scoped OneCLI identity. The host never performs a
+credentialed Git network operation: it publishes validated local clones and
+advances a clean canonical only from refs already fetched into its mounted Git
+metadata. One stable host lock inode serializes create/fetch, refresh, transfer,
+cleanup, and maintenance. Origin pins and transfer tombstones live in
+`data/repository-state/<workgroup>/<repo>` and are not agent-writable.
+
+`scripts/migrate-repo-store.ts` inventories legacy clones, mirrors, and collided
+worktrees read-only by default. `--execute --quiesced` is accepted only with a
+stopped service, zero install containers, no repository writers, and a passing
+allocated-byte capacity gate. It keeps hash-bound manifests, synthetic rescue
+refs, external bundles, and the complete old topology in host-only migration
+storage through audit and rollback retention.
 
 ---
 

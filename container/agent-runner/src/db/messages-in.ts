@@ -69,6 +69,31 @@ export interface PendingSelectionDiagnostics {
   inboundRowBudget: number;
 }
 
+function activeRepositoryMountBarrier(db: ReturnType<typeof openInboundDb>): string | null {
+  try {
+    const row = db
+      .prepare("SELECT epoch, generation FROM repo_ingress_fence WHERE id = 1 AND state = 'active'")
+      .get() as { epoch: string; generation: string } | undefined;
+    return row ? JSON.stringify([row.epoch, row.generation]) : null;
+  } catch (error) {
+    // A pre-fence session DB cannot contain an active barrier. The host's
+    // activation path migrates the DB before publishing one, so every real
+    // barrier is visible here. Other read failures remain fail-closed.
+    if (error instanceof Error && /no such table: repo_ingress_fence/i.test(error.message)) return null;
+    throw error;
+  }
+}
+
+/** Fresh, host-visible read used at both outer and active-query admission seams. */
+export function getActiveRepositoryMountBarrier(): string | null {
+  const inbound = openInboundDb();
+  try {
+    return activeRepositoryMountBarrier(inbound);
+  } finally {
+    inbound.close();
+  }
+}
+
 function recallTargetId(m: MessageInRow): string | null {
   if (m.kind !== 'system' || !m.id.startsWith('recall-')) return null;
   try {
@@ -138,6 +163,10 @@ export function getPendingMessages(isFirstPoll = false, diagnostics?: PendingSel
   const outbound = getOutboundDb();
 
   try {
+    // Host publication/transfer activates this fence before quiescence. Do
+    // not even materialize accumulated trigger=0 context while it is active:
+    // the caller must reach the explicit poll-boundary acknowledgement first.
+    if (activeRepositoryMountBarrier(inbound) !== null) return [];
     const maxUnits = Math.max(1, Math.floor(getMaxMessagesPerPrompt()));
     const recentLimit = maxUnits * 4 + 8;
     const wakeLimit = maxUnits + 2;
@@ -396,6 +425,21 @@ export function markProcessing(ids: string[]): void {
   );
   db.transaction(() => {
     for (const id of ids) stmt.run(id, new Date().toISOString());
+  })();
+}
+
+/**
+ * Return an admitted batch to pending ownership without completing it.
+ * Used when a host repository fence becomes visible between a failed provider
+ * turn and an in-turn recovery: the fresh post-transition container must retry
+ * the original inbound instead of losing it or deadlocking on a stale claim.
+ */
+export function releaseProcessingClaims(ids: string[]): void {
+  if (ids.length === 0) return;
+  const db = getOutboundDb();
+  const stmt = db.prepare("DELETE FROM processing_ack WHERE message_id = ? AND status = 'processing'");
+  db.transaction(() => {
+    for (const id of ids) stmt.run(id);
   })();
 }
 

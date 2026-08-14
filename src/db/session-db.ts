@@ -6,6 +6,7 @@
  * (open-write-close per op). See session-manager.ts header for invariants.
  */
 import Database from 'better-sqlite3';
+import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -214,7 +215,12 @@ export interface MessageInsert {
 
 export interface RepoIngressFence {
   epoch: string;
+  generation: string;
   state: 'active' | 'released';
+}
+
+export function repoIngressFenceAckToken(fence: Pick<RepoIngressFence, 'epoch' | 'generation'>): string {
+  return JSON.stringify([fence.epoch, fence.generation]);
 }
 
 export interface RepoIngressAdmissionResult {
@@ -224,6 +230,21 @@ export interface RepoIngressAdmissionResult {
 
 export interface RepoIngressReleaseResult extends RepoIngressAdmissionResult {
   released: boolean;
+}
+
+const REPOSITORY_MOUNT_BARRIER_ACK_KEY = 'repository_mount_barrier_ack';
+
+/** Exact-epoch acknowledgement written by the container at a provider-idle poll boundary. */
+export function readRepositoryMountBarrierAck(outDb: Database.Database): string | null {
+  try {
+    const row = outDb.prepare('SELECT value FROM session_state WHERE key = ?').get(REPOSITORY_MOUNT_BARRIER_ACK_KEY) as
+      | { value: string }
+      | undefined;
+    return row?.value ?? null;
+  } catch {
+    // Missing/corrupt outbound state is never an acknowledgement.
+    return null;
+  }
 }
 
 function installRepoIngressFenceGuards(db: Database.Database): void {
@@ -278,25 +299,28 @@ function installRepoIngressFenceGuards(db: Database.Database): void {
 }
 
 export function readRepoIngressFence(db: Database.Database): RepoIngressFence | null {
-  const row = db.prepare('SELECT epoch, state FROM repo_ingress_fence WHERE id = 1').get() as
+  const row = db.prepare('SELECT epoch, generation, state FROM repo_ingress_fence WHERE id = 1').get() as
     | RepoIngressFence
     | undefined;
   return row ?? null;
 }
 
 /** Activate the per-session DB mirror of a publication fence. Idempotent for the same epoch. */
-export function activateRepoIngressFence(db: Database.Database, epoch: string): void {
+export function activateRepoIngressFence(db: Database.Database, epoch: string): RepoIngressFence {
   if (!epoch) throw new Error('repository ingress fence epoch must not be empty');
   migrateMessagesInTable(db);
-  db.transaction(() => {
+  return db.transaction(() => {
     const current = readRepoIngressFence(db);
     if (current?.state === 'active' && current.epoch !== epoch) {
       throw new Error(`repository ingress fence ${current.epoch} is already active`);
     }
+    if (current?.state === 'active') return current;
+    const generation = randomUUID();
     db.prepare(
-      `INSERT INTO repo_ingress_fence (id, epoch, state) VALUES (1, ?, 'active')
-       ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch, state = 'active'`,
-    ).run(epoch);
+      `INSERT INTO repo_ingress_fence (id, epoch, generation, state) VALUES (1, ?, ?, 'active')
+       ON CONFLICT(id) DO UPDATE SET epoch = excluded.epoch, generation = excluded.generation, state = 'active'`,
+    ).run(epoch, generation);
+    return { epoch, generation, state: 'active' as const };
   })();
 }
 
@@ -345,16 +369,20 @@ export function admitRepoIngressFenceMessage(
 }
 
 /** Release a matching active epoch and restore every tagged row exactly once. */
-export function releaseRepoIngressFence(db: Database.Database, epoch: string): RepoIngressReleaseResult {
+export function releaseRepoIngressFence(
+  db: Database.Database,
+  epoch: string,
+  generation: string,
+): RepoIngressReleaseResult {
   migrateMessagesInTable(db);
   return db.transaction(() => {
     const current = readRepoIngressFence(db);
-    if (!current || current.epoch !== epoch || current.state !== 'active') {
+    if (!current || current.epoch !== epoch || current.generation !== generation || current.state !== 'active') {
       return { released: false, admittedRows: 0, wakeRequired: false };
     }
-    db.prepare("UPDATE repo_ingress_fence SET state = 'released' WHERE id = 1 AND epoch = ? AND state = 'active'").run(
-      epoch,
-    );
+    db.prepare(
+      "UPDATE repo_ingress_fence SET state = 'released' WHERE id = 1 AND epoch = ? AND generation = ? AND state = 'active'",
+    ).run(epoch, generation);
     const admitted = admitTaggedRows(db, epoch);
     return { released: true, ...admitted };
   })();
@@ -362,10 +390,14 @@ export function releaseRepoIngressFence(db: Database.Database, epoch: string): R
 
 function runInsertMessage(db: Database.Database, message: MessageInsert, ignoreDuplicateId: boolean): boolean {
   migrateMessagesInTable(db);
-  const activeFence = readRepoIngressFence(db);
   const originalTrigger = message.trigger ?? 1;
-  const repoFenceEpoch = activeFence?.state === 'active' ? activeFence.epoch : null;
   const conflictClause = ignoreDuplicateId ? ' ON CONFLICT(id) DO NOTHING' : '';
+  // Always insert the caller's ordinary trigger shape. The AFTER INSERT guard
+  // observes repo_ingress_fence in the same SQLite statement and atomically
+  // converts the row to an inert, epoch-tagged row when a fence is active.
+  // Reading the fence here first would race release on another connection:
+  // a row could be tagged with an epoch only after that epoch's release had
+  // already admitted its prior rows, stranding the new row forever.
   const result = db
     .prepare(
       `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, on_wake, repo_fence_epoch, repo_fence_original_trigger)
@@ -373,9 +405,9 @@ function runInsertMessage(db: Database.Database, message: MessageInsert, ignoreD
     )
     .run({
       ...message,
-      trigger: repoFenceEpoch === null ? originalTrigger : 0,
-      repoFenceEpoch,
-      repoFenceOriginalTrigger: repoFenceEpoch === null ? null : originalTrigger,
+      trigger: originalTrigger,
+      repoFenceEpoch: null,
+      repoFenceOriginalTrigger: null,
       onWake: message.onWake ?? 0,
       sourceSessionId: message.sourceSessionId ?? null,
       seq: nextEvenSeq(db),
@@ -862,9 +894,17 @@ export function migrateMessagesInTable(db: Database.Database): void {
     CREATE TABLE IF NOT EXISTS repo_ingress_fence (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       epoch TEXT NOT NULL,
+      generation TEXT NOT NULL,
       state TEXT NOT NULL CHECK (state IN ('active', 'released'))
     )
   `);
+  const fenceCols = new Set(
+    (db.prepare("PRAGMA table_info('repo_ingress_fence')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!fenceCols.has('generation')) {
+    db.prepare('ALTER TABLE repo_ingress_fence ADD COLUMN generation TEXT').run();
+    db.prepare('UPDATE repo_ingress_fence SET generation = lower(hex(randomblob(16))) WHERE generation IS NULL').run();
+  }
   installRepoIngressFenceGuards(db);
   // Read-path enabler for the Scheduled Tasks Board (design §4.8). Added
   // unconditionally — existing DBs already carry `series_id` (so the branch

@@ -45,8 +45,7 @@ describe('runPreToolUseChain — guardrails', () => {
 
   beforeEach(() => {
     // Snapshot env vars the hooks read.
-    for (const k of ['NANOCLAW_IS_SCHEDULED_TASK', 'NANOCLAW_DESTRUCTIVE_GUARD_CORE'])
-      savedEnv[k] = process.env[k];
+    for (const k of ['NANOCLAW_IS_SCHEDULED_TASK', 'NANOCLAW_DESTRUCTIVE_GUARD_CORE']) savedEnv[k] = process.env[k];
     process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_CORE;
   });
 
@@ -61,14 +60,6 @@ describe('runPreToolUseChain — guardrails', () => {
     const out = (await runPreToolUseChain({
       tool_name: 'exec_command',
       tool_input: { command: 'git clone https://github.com/x/y /workspace/agent/y' },
-    })) as { hookSpecificOutput?: { permissionDecision?: string } };
-    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
-  });
-
-  it('blocks git mutation inside a workgroup snapshot', async () => {
-    const out = (await runPreToolUseChain({
-      tool_name: 'exec_command',
-      tool_input: { command: 'git -C /workspace/workgroup/REPO-A checkout -b feature' },
     })) as { hookSpecificOutput?: { permissionDecision?: string } };
     expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
   });
@@ -475,11 +466,26 @@ describe('E6 codex dispatch — each guard + uniform fail-closed', () => {
       // denylist (SDK_DISALLOWED_TOOLS) — first hook in preToolUseHook.
       { name: 'denylist:CronCreate', tool: 'CronCreate', input: {}, expectDeny: true },
       // self-approval (chain hook)
-      { name: 'self-approval', tool: 'exec_command', input: { command: 'touch .claude-destructive-gate' }, expectDeny: true },
+      {
+        name: 'self-approval',
+        tool: 'exec_command',
+        input: { command: 'touch .claude-destructive-gate' },
+        expectDeny: true,
+      },
       // snowflake (chain hook)
-      { name: 'snowflake', tool: 'exec_command', input: { command: 'python -c "import snowflake.connector"' }, expectDeny: true },
+      {
+        name: 'snowflake',
+        tool: 'exec_command',
+        input: { command: 'python -c "import snowflake.connector"' },
+        expectDeny: true,
+      },
       // git-clone (chain hook, inline fallback since stub lacks the export)
-      { name: 'git-clone', tool: 'exec_command', input: { command: 'git clone https://x/y /workspace/agent/y' }, expectDeny: true },
+      {
+        name: 'git-clone',
+        tool: 'exec_command',
+        input: { command: 'git clone https://x/y /workspace/agent/y' },
+        expectDeny: true,
+      },
       // destructive core (post-chain guard)
       { name: 'destructive', tool: 'exec_command', input: { command: 'echo STUB_BLOCK' }, expectDeny: true },
       // file-protection (non-Bash edit tool)
@@ -511,16 +517,22 @@ describe('E6 codex dispatch — each guard + uniform fail-closed', () => {
     // Both the destructive core AND the file-protection core fail CLOSED in the
     // same direction when missing: bash command denies, edit denies.
     process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/block-destructive-core.ts';
-    const bash = decisionOf(await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'echo hi' } }));
+    const bash = decisionOf(
+      await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'echo hi' } }),
+    );
     expect(bash.decision).toBe('deny');
     const edit = decisionOf(await runPreToolUseChain({ tool_name: 'Write', tool_input: { file_path: 'src/x.ts' } }));
     expect(edit.decision).toBe('deny');
 
     // Same uniform direction under malformed cores.
     process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = MALFORMED_CORE;
-    const bash2 = decisionOf(await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'echo hi' } }));
+    const bash2 = decisionOf(
+      await runPreToolUseChain({ tool_name: 'exec_command', tool_input: { command: 'echo hi' } }),
+    );
     expect(bash2.decision).toBe('deny');
-    const edit2 = decisionOf(await runPreToolUseChain({ tool_name: 'apply_patch', tool_input: { input: '*** Add File: y.ts' } }));
+    const edit2 = decisionOf(
+      await runPreToolUseChain({ tool_name: 'apply_patch', tool_input: { input: '*** Add File: y.ts' } }),
+    );
     expect(edit2.decision).toBe('deny');
   });
 });

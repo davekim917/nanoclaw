@@ -1,5 +1,15 @@
 import type { UserRole, UserRoleKind } from '../../../types.js';
 import { getDb } from '../../../db/connection.js';
+import { equivalentSlackUserIds } from '../../../slack-user-identity.js';
+
+/**
+ * Run a role predicate for the caller's exact identity and, for Slack only,
+ * sibling adapter identities registered to the same workspace. See
+ * `slack-user-identity.ts` for the teamId-bound equivalence rule.
+ */
+function hasEquivalentRole(userId: string, predicate: (candidate: string) => boolean): boolean {
+  return equivalentSlackUserIds(userId).some(predicate);
+}
 
 /**
  * Grant a role. Owner rows must have agent_group_id = null (enforced here,
@@ -34,24 +44,30 @@ export function getUserRoles(userId: string): UserRole[] {
 }
 
 export function isOwner(userId: string): boolean {
-  const row = getDb()
-    .prepare('SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS NULL LIMIT 1')
-    .get(userId, 'owner');
-  return !!row;
+  return hasEquivalentRole(userId, (candidate) => {
+    const row = getDb()
+      .prepare('SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS NULL LIMIT 1')
+      .get(candidate, 'owner');
+    return !!row;
+  });
 }
 
 export function isGlobalAdmin(userId: string): boolean {
-  const row = getDb()
-    .prepare('SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS NULL LIMIT 1')
-    .get(userId, 'admin');
-  return !!row;
+  return hasEquivalentRole(userId, (candidate) => {
+    const row = getDb()
+      .prepare('SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id IS NULL LIMIT 1')
+      .get(candidate, 'admin');
+    return !!row;
+  });
 }
 
 export function isAdminOfAgentGroup(userId: string, agentGroupId: string): boolean {
-  const row = getDb()
-    .prepare('SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id = ? LIMIT 1')
-    .get(userId, 'admin', agentGroupId);
-  return !!row;
+  return hasEquivalentRole(userId, (candidate) => {
+    const row = getDb()
+      .prepare('SELECT 1 FROM user_roles WHERE user_id = ? AND role = ? AND agent_group_id = ? LIMIT 1')
+      .get(candidate, 'admin', agentGroupId);
+    return !!row;
+  });
 }
 
 /** Any admin privilege over this agent group: global admin OR scoped admin. */
@@ -86,8 +102,10 @@ export function getAdminsOfAgentGroup(agentGroupId: string): UserRole[] {
 
 /** True if the user has any admin role: owner or admin (global or scoped). */
 export function isAnyAdmin(userId: string): boolean {
-  const row = getDb()
-    .prepare("SELECT 1 FROM user_roles WHERE user_id = ? AND role IN ('owner', 'admin') LIMIT 1")
-    .get(userId);
-  return !!row;
+  return hasEquivalentRole(userId, (candidate) => {
+    const row = getDb()
+      .prepare("SELECT 1 FROM user_roles WHERE user_id = ? AND role IN ('owner', 'admin') LIMIT 1")
+      .get(candidate);
+    return !!row;
+  });
 }

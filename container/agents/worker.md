@@ -1,6 +1,6 @@
 ---
 name: worker
-description: Default execution worker. Use PROACTIVELY when orchestrating — delegate implementation, research, file edits, test runs, and any token-heavy execution here instead of doing it in the main loop. Runs on Sonnet at xhigh effort.
+description: Default execution worker — the tier to pick unless something specifically says otherwise. Use PROACTIVELY when orchestrating: implementation with clear acceptance criteria, research, file edits, test runs, and any token-heavy execution that would otherwise bloat the main loop. Escalate to worker-high only after this tier has failed or when reasoning is clearly the bottleneck. Runs on Sonnet at xhigh effort.
 model: claude-sonnet-5
 effort: xhigh
 ---

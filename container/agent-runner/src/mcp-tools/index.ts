@@ -9,7 +9,7 @@ import { loadConfig } from '../config.js';
 import './core.js';
 import './interactive.js';
 import './agents.js';
-import './self-mod.js';
+import { registerProviderSpecificSelfModTools } from './self-mod.js';
 import './thread-search.js';
 import './git-worktrees.js';
 import './tone-profiles.js';
@@ -37,6 +37,7 @@ function log(msg: string): void {
 // which throws if loadConfig() hasn't been called — populate it before tools
 // can be invoked.
 loadConfig();
+registerProviderSpecificSelfModTools();
 
 // Mount spawn tools bifurcated (orchestrator vs child) then start the server.
 mountSpawnTools()

@@ -3,15 +3,13 @@ import { spawn, type ChildProcess } from 'child_process';
 
 import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
 
-import {
-  memoryContextForSessionStart,
-  type MemorySessionHookRegistration,
-} from '../memory/session-hook.js';
+import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import { shouldPostInfraWarning } from '../db/session-state.js';
+import { MANAGED_GIT_OPENCODE_PLUGIN_PATH } from '../managed-git-guard.js';
 
 function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
@@ -107,10 +105,7 @@ const STALE_SESSION_RE =
  *
  * Pure + exported so it can be unit-tested without actually spawning a process.
  */
-export function buildOpencodeServerEnv(
-  baseEnv: NodeJS.ProcessEnv,
-  config: Record<string, unknown>,
-): NodeJS.ProcessEnv {
+export function buildOpencodeServerEnv(baseEnv: NodeJS.ProcessEnv, config: Record<string, unknown>): NodeJS.ProcessEnv {
   // Strip the env-derived auth list PLUS the MCP/header-only secrets Claude also
   // strips (filterSdkEnv) — env-hygiene parity so opencode's bash/MCP children
   // can't printenv Exa/Braintrust/Granola. Data-tool secrets (SNOWFLAKE_PASSWORD,
@@ -348,7 +343,8 @@ export function buildOpenCodeConfig(
 
   const mcp = mcpServersToOpenCodeConfig(options.mcpServers);
 
-  // NanoClaw guard plugin: the destructive-action gate, at parity with the
+  // NanoClaw guard plugins: the in-tree managed-Git maintenance boundary plus
+  // the Bootstrap destructive-action gate, at parity with the
   // Claude Code `block-destructive` hook via a shared decision core. OpenCode
   // auto-approves every tool call
   // (`permission: 'allow'` + permission auto-reply), so this plugin's
@@ -390,14 +386,13 @@ export function buildOpenCodeConfig(
     snapshot: false,
     provider: providerOptions,
     mcp,
-    // Unconditional. The fail-closed throw above guarantees we only reach here
-    // when either the plugin exists OR the explicit OPENCODE_ALLOW_UNGUARDED
-    // opt-out is set. In the opt-out + absent case opencode harmlessly ignores
-    // a non-existent plugin path (verified empirically on opencode@1.15.7: the
-    // server starts and skips the missing plugin), so an unconditional mount is
-    // safe and keeps the guard mounted on every guarded spawn — no config path
-    // can return permission:'allow' without it.
-    plugin: [GUARD_PLUGIN],
+    // Both entries are unconditional. The first-party managed-Git guard lives
+    // in the read-only /app/src mount and has no opt-out; MCP and host Git
+    // operations bypass it because they execute outside the agent bash tool.
+    // The fail-closed check above owns Bootstrap guard availability. In the
+    // explicit opt-out + absent case OpenCode ignores only that missing second
+    // path while the managed-Git guard remains active.
+    plugin: [MANAGED_GIT_OPENCODE_PLUGIN_PATH, GUARD_PLUGIN],
   };
 }
 
@@ -480,7 +475,11 @@ async function ensureSharedRuntime(
       // On the success path orphanProc was reset to undefined above; it is set
       // here only if init threw between spawn and the sharedRuntime assignment.
       if (orphanProc) {
-        try { orphanProc.kill('SIGKILL'); } catch { /* ignore */ }
+        try {
+          orphanProc.kill('SIGKILL');
+        } catch {
+          /* ignore */
+        }
       }
       // Clear the in-flight promise on BOTH success and failure. On success the
       // result is cached in sharedRuntime (line 450 short-circuits next time); on

@@ -64,6 +64,7 @@ import {
 } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
+import { readRepoIngressFence } from './db/session-db.js';
 import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-projections.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
@@ -98,16 +99,22 @@ import {
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
-  sessionGraphifyCacheDir,
+  openInboundDb,
   sessionDir,
-  threadGraphifyCacheDir,
-  threadWorktreeDir,
-  stampThreadDirOwner,
-  readThreadDirOwner,
-  legacyThreadStateDir,
-  THREAD_DIR_OWNER_CONFLICT,
   writeSessionRouting,
 } from './session-manager.js';
+import {
+  discoverCanonicalRepositories,
+  isRepositoryLifecycleClaimed,
+  isWorkgroupRepositoryMountClaimed,
+  readOriginPin,
+  readTransferTombstone,
+  resolveRepositoryWorkUnit,
+  transferTombstonesDir,
+  topicGraphifyCacheDir,
+  topicWorktreesDir,
+  type RepositoryWorkUnit,
+} from './repository-workspaces.js';
 import { resolveStoragePolicy } from './storage-manager.js';
 import { assertStorageAdmissionInBackground } from './storage-maintenance-worker.js';
 import { acquireStorageActivityLease, type StorageActivityLease } from './storage-activity.js';
@@ -272,6 +279,10 @@ export function getActiveContainerCount(): number {
 
 export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
+}
+
+export function isContainerSpawning(sessionId: string): boolean {
+  return spawningSessions.has(sessionId) || wakePromises.has(sessionId);
 }
 
 /** Snapshot passed to isolated maintenance workers; never expose the mutable map. */
@@ -529,11 +540,10 @@ async function spawnReservedContainer(session: Session): Promise<boolean> {
 
 async function acquireContainerStorageActivity(session: Session): Promise<StorageActivityLease> {
   const roots = new Set<string>([sessionDir(session.agent_group_id, session.id)]);
-  if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
-    const mg = getMessagingGroup(session.messaging_group_id);
-    const ag = getAgentGroup(session.agent_group_id);
-    if (mg)
-      roots.add(threadWorktreeDir(mg.platform_id, session.thread_id, ag ? (ag.workgroup_id ?? ag.folder) : undefined));
+  const ag = getAgentGroup(session.agent_group_id);
+  if (ag) {
+    const workgroupId = ag.workgroup_id ?? ag.folder;
+    roots.add(topicWorktreesDir(resolveSessionRepositoryWorkUnit(session, workgroupId)));
   }
 
   const leases: StorageActivityLease[] = [];
@@ -554,6 +564,75 @@ async function acquireContainerStorageActivity(session: Session): Promise<Storag
       await Promise.all(leases.map((lease) => lease.release()));
     },
   };
+}
+
+export function resolveSessionRepositoryWorkUnit(session: Session, workgroupId: string): RepositoryWorkUnit {
+  const messagingGroup = session.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : null;
+  return resolveRepositoryWorkUnit({
+    workgroupId,
+    sessionId: session.id,
+    platformId: messagingGroup?.platform_id ?? null,
+    messagingGroupId: session.messaging_group_id ?? null,
+    threadId: session.thread_id ?? null,
+  });
+}
+
+function canonicalGitControlMounts(gitDir: string, stateDir: string): VolumeMount[] {
+  const config = path.join(gitDir, 'config');
+  const head = path.join(gitDir, 'HEAD');
+  const index = path.join(gitDir, 'index');
+  const hooks = path.join(gitDir, 'hooks');
+  const objectsInfo = path.join(gitDir, 'objects', 'info');
+  const configStat = fs.lstatSync(config);
+  if (configStat.isSymbolicLink() || !configStat.isFile()) throw new Error(`Unsafe canonical Git config: ${config}`);
+  const headStat = fs.lstatSync(head);
+  if (headStat.isSymbolicLink() || !headStat.isFile()) throw new Error(`Unsafe canonical Git HEAD: ${head}`);
+  let indexSource = index;
+  try {
+    const indexStat = fs.lstatSync(index);
+    if (indexStat.isSymbolicLink() || !indexStat.isFile()) throw new Error(`Unsafe canonical Git index: ${index}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    // An unborn/just-initialized normal clone can legitimately lack an index.
+    // Bind a host-owned empty placeholder over the container path so the RW
+    // parent mount cannot be used to create the canonical main-worktree index.
+    indexSource = path.join(stateDir, 'canonical-index-unavailable');
+    fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    try {
+      fs.writeFileSync(indexSource, '', { flag: 'wx', mode: 0o600 });
+    } catch (writeError) {
+      if ((writeError as NodeJS.ErrnoException).code !== 'EEXIST') throw writeError;
+      const placeholderStat = fs.lstatSync(indexSource);
+      if (placeholderStat.isSymbolicLink() || !placeholderStat.isFile() || placeholderStat.size !== 0) {
+        throw new Error(`Unsafe canonical Git index placeholder: ${indexSource}`);
+      }
+    }
+  }
+  for (const directory of [hooks, objectsInfo]) {
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const stat = fs.lstatSync(directory);
+    if (stat.isSymbolicLink() || !stat.isDirectory())
+      throw new Error(`Unsafe canonical Git control path: ${directory}`);
+  }
+  for (const name of ['alternates', 'http-alternates']) {
+    const file = path.join(objectsInfo, name);
+    try {
+      fs.writeFileSync(file, '', { flag: 'wx', mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      const stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== 0) {
+        throw new Error(`Canonical repository has unsafe object alternates: ${file}`);
+      }
+    }
+  }
+  return [
+    { hostPath: config, containerPath: config, readonly: true },
+    { hostPath: head, containerPath: head, readonly: true },
+    { hostPath: indexSource, containerPath: index, readonly: true },
+    { hostPath: hooks, containerPath: hooks, readonly: true },
+    { hostPath: objectsInfo, containerPath: objectsInfo, readonly: true },
+  ];
 }
 
 async function spawnContainer(session: Session, storageActivity: StorageActivityLease): Promise<void> {
@@ -617,6 +696,28 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
   // downstream subsystems so they don't each re-derive from agentGroups,
   // which would race against any concurrent reconcile.
   const { workgroupId: resolvedWgId } = reconcileWorkgroupAtSpawn(getDb(), agentGroup, containerConfig);
+  const repositoryWorkUnit = resolveSessionRepositoryWorkUnit(session, resolvedWgId);
+  if (isWorkgroupRepositoryMountClaimed(resolvedWgId)) {
+    throw new Error(`Repository mount reconciliation in progress for ${resolvedWgId}; spawn will retry`);
+  }
+  if (isRepositoryLifecycleClaimed(repositoryWorkUnit)) {
+    throw new Error(`Repository lifecycle transition in progress for ${repositoryWorkUnit.key}; spawn will retry`);
+  }
+  // The in-memory claims above close ordinary concurrent spawn admission. The
+  // per-session DB fence survives a host crash, so it is the recovery gate for
+  // a publication/transfer that died after quiescence began. A replay with the
+  // same deterministic action epoch releases it at the durable boundary.
+  const repositoryFenceDb = openInboundDb(session.agent_group_id, session.id);
+  try {
+    const repositoryFence = readRepoIngressFence(repositoryFenceDb);
+    if (repositoryFence?.state === 'active') {
+      throw new Error(
+        `Repository mount transition ${repositoryFence.epoch} is still active for session ${session.id}; spawn will retry`,
+      );
+    }
+  } finally {
+    repositoryFenceDb.close();
+  }
 
   const [memoryReport] = reconcileWorkgroupMemory(getDb(), { workgroupIds: [resolvedWgId] });
   if (!memoryReport || memoryReport.state.status === 'migration-required') {
@@ -718,6 +819,7 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
     resolvedWgId,
     providerDecision.fallbackApplied,
     session.thread_id ?? null,
+    repositoryWorkUnit,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -1522,93 +1624,51 @@ export function buildMounts(
     mounts.push({ hostPath: inboundDbFile, containerPath: '/workspace/inbound.db', readonly: true });
   }
 
-  // Graphify indexes persist beside the checkout scope they describe. Normal
-  // sessions keep an isolated cache; thread-worktree siblings share the cache
-  // derived from the same platform/thread key. Runtime coordination remains
-  // install-scoped and is never placed under a source checkout or host home.
-  // Workgroup key for every thread-scoped/shared path below — resolved once
-  // so mounts, overlay allowlist, and the workgroup tree agree.
+  // Repository and Graphify scope are derived by one canonical work-unit
+  // resolver. Same-topic siblings therefore share both checkout and index;
+  // different topics receive different roots even when they use one repo.
   const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
-
-  // Unstamped legacy thread dirs are stamped from DB-proven ownership BEFORE
-  // any path resolution (codex native review P1 #3): first-caller adoption
-  // would hand workgroup A's dir to workgroup B on a colliding thread key.
-  // Sole DB owner → stamp that owner; ambiguous → stamp a conflict sentinel
-  // so every workgroup resolves to its own scoped dir.
-  if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
-    const mgForStamp = getMessagingGroup(session.messaging_group_id);
-    if (mgForStamp) {
-      const legacyDir = legacyThreadStateDir(mgForStamp.platform_id, session.thread_id);
-      if (fs.existsSync(legacyDir) && readThreadDirOwner(legacyDir) === null) {
-        const owners = getDb()
-          .prepare(
-            `SELECT DISTINCT COALESCE(ag.workgroup_id, ag.folder) AS wg
-               FROM sessions s
-               JOIN messaging_groups mg ON mg.id = s.messaging_group_id
-               JOIN agent_groups ag ON ag.id = s.agent_group_id
-              WHERE mg.platform_id = ? AND s.thread_id IS ?`,
-          )
-          .all(mgForStamp.platform_id, session.thread_id) as Array<{ wg: string }>;
-        const distinct = owners.map((o) => o.wg);
-        if (distinct.length === 1) {
-          stampThreadDirOwner(legacyDir, distinct[0]);
-        } else if (distinct.length > 1) {
-          log.warn('Thread dir ownership ambiguous — stamping conflict sentinel, all workgroups use scoped dirs', {
-            platformId: mgForStamp.platform_id,
-            threadId: session.thread_id,
-            owners: distinct,
-          });
-          stampThreadDirOwner(legacyDir, THREAD_DIR_OWNER_CONFLICT);
-        }
-      }
-    }
-  }
-  let graphifyCache = sessionGraphifyCacheDir(agentGroup.id, session.id);
-  if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
-    const mg = getMessagingGroup(session.messaging_group_id);
-    if (mg) graphifyCache = threadGraphifyCacheDir(mg.platform_id, session.thread_id, wgKey);
-  }
+  const repositoryWorkUnit = resolveSessionRepositoryWorkUnit(session, wgKey);
+  const graphifyCache = topicGraphifyCacheDir(repositoryWorkUnit);
+  const worktrees = topicWorktreesDir(repositoryWorkUnit);
   const graphifyRuntime = graphifyRuntimeDir();
   fs.mkdirSync(graphifyCache, { recursive: true });
   fs.mkdirSync(graphifyRuntime, { recursive: true });
-  // Nested /workspace mountpoints are pre-created host-side at spawn-args
-  // build time (see the workspace-stub loop before the volume-mount args) so
-  // Docker never materializes them root-owned inside the session dir.
+  fs.mkdirSync(worktrees, { recursive: true });
   mounts.push({ hostPath: graphifyCache, containerPath: '/workspace/.cache/graphify', readonly: false });
   mounts.push({ hostPath: graphifyRuntime, containerPath: '/run/nanoclaw-graphify', readonly: false });
+  // Stable agent-facing path plus the exact host path. Git worktree metadata
+  // records the latter, so the same pointer works from host and container.
+  mounts.push({ hostPath: worktrees, containerPath: '/workspace/worktrees', readonly: false });
+  mounts.push({ hostPath: worktrees, containerPath: worktrees, readonly: false });
 
-  // Thread-scoped worktrees: shared bind-mount across all sibling agents
-  // (Claude + Codex) in the same thread, so collaborative code edits land
-  // in one repo checkout regardless of which agent ran them. The session
-  // dir mount above provides `/workspace/worktrees` by default; this layered
-  // mount overrides it with the thread-keyed path. Docker applies mounts
-  // in declaration order — inner overrides outer for the subpath.
-  //
-  // The thread key collapses to `<mg>:msg-<first-msg-id>` when threadId is
-  // null (DM channels) so every conversation still gets a deterministic
-  // worktree identity rather than sharing one global `<mg>:none` dir.
-  //
-  // Gated on NANOCLAW_THREAD_WORKTREES=1 for backward-compat: existing
-  // single-agent deployments keep their session-scoped worktrees and don't
-  // lose access on container restart after this deploy. Set the env var to
-  // opt in (required for sibling-agent collaboration to share code state).
-  if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
-    // Two-bot sibling design: helper (slack-example-labs) and helper-codex
-    // (slack-helpercodex) each have their own MG row in this channel,
-    // but they share the same platform_id (the Slack channel id) and the
-    // same thread_id from chat-sdk-bridge. Keying threadWorktreeDir on
-    // platform_id + thread_id resolves both bots to the same worktree dir,
-    // so collaborative code edits in a thread are visible across siblings.
-    const mg = getMessagingGroup(session.messaging_group_id);
-    if (mg) {
-      const tDir = threadWorktreeDir(mg.platform_id, session.thread_id, wgKey);
-      fs.mkdirSync(tDir, { recursive: true });
-      // Stamp workgroup ownership on the state dir (parent of worktrees/) so
-      // the legacy-dir fallback in threadStateDir can refuse cross-workgroup
-      // adoption on colliding platform/thread keys.
-      stampThreadDirOwner(path.dirname(tDir), wgKey);
-      mounts.push({ hostPath: tDir, containerPath: '/workspace/worktrees', readonly: false });
+  // Canonical working trees stay host-only. A linked worktree needs only the
+  // common `.git`, origin pin, and one shared kernel-lock inode. All are bound
+  // at their exact host paths so no container-relative back-pointer can leak
+  // into Git's administrative records.
+  for (const repository of discoverCanonicalRepositories(wgKey)) {
+    if (!readOriginPin(wgKey, repository.name)) {
+      throw new Error(`Canonical repository ${wgKey}/${repository.name} is missing its host origin pin`);
     }
+    const transfers = transferTombstonesDir(wgKey, repository.name);
+    fs.mkdirSync(transfers, { recursive: true, mode: 0o700 });
+    mounts.push({ hostPath: transfers, containerPath: transfers, readonly: true });
+    if (readTransferTombstone(repositoryWorkUnit, repository.name)) {
+      // The exact worktree left this source topic. Withholding the common Git
+      // metadata makes the tombstone a spawn-time capability boundary too,
+      // rather than relying only on the create_worktree MCP check.
+      continue;
+    }
+    mounts.push({ hostPath: repository.gitDir, containerPath: repository.gitDir, readonly: false });
+    // The common object/ref/worktree store is writable, but host-executable
+    // configuration, hooks, canonical main-worktree HEAD/index, and
+    // object-alternate escape hatches are immutable overlays. Linked
+    // worktrees use their own .git/worktrees/<id>/HEAD and index, so container
+    // Git can fetch/commit/push without being able to clobber the host
+    // canonical checkout state.
+    mounts.push(...canonicalGitControlMounts(repository.gitDir, path.dirname(repository.lockPath)));
+    mounts.push({ hostPath: repository.lockPath, containerPath: repository.lockPath, readonly: false });
+    mounts.push({ hostPath: repository.originPinPath, containerPath: repository.originPinPath, readonly: true });
   }
 
   // Agent group folder at /workspace/agent (RW for working files + shared memory)
@@ -1692,55 +1752,6 @@ export function buildMounts(
   if (WORKGROUP_SHARED_FS || fs.existsSync(path.join(wgShared, '.migrated'))) {
     fs.mkdirSync(wgShared, { recursive: true });
     mounts.push({ hostPath: wgShared, containerPath: WORKGROUP_CONTAINER_PATH, readonly: false });
-
-    // Browsing snapshots of migrated repos are READ-ONLY — enforcement, not
-    // advisory. For each bare mirror `.repos/<name>.git`, the snapshot at the
-    // old canonical path `<wgShared>/<name>` gets a nested RO mount on top of
-    // the RW workgroup mount, making "cd into the canonical and checkout a
-    // branch" (the stale-tree failure mode) impossible rather than
-    // discouraged. A repo cloned mid-session gains its RO overlay on the next
-    // respawn — bounded, and the freshness worker owns the tree meanwhile.
-    const wgReposDir = path.join(wgShared, '.repos');
-    if (fs.existsSync(wgReposDir)) {
-      // Same containment discipline as the symlink-overlay mounts: the
-      // workgroup tree is agent-writable, so an agent could replace a
-      // snapshot dir with a symlink pointing anywhere on the host and get it
-      // mounted (RO, but a cross-boundary READ). Mount only real
-      // directories whose realpath stays inside this workgroup's tree, and
-      // re-validate at docker-args time via overlayAllowedRoots.
-      let wgSharedReal: string;
-      try {
-        wgSharedReal = fs.realpathSync(wgShared);
-      } catch {
-        wgSharedReal = path.resolve(wgShared);
-      }
-      for (const entry of fs.readdirSync(wgReposDir, { withFileTypes: true })) {
-        if (!entry.name.endsWith('.git') || entry.isSymbolicLink() || !entry.isDirectory()) continue;
-        const snapName = entry.name.slice(0, -'.git'.length);
-        const snapDir = path.join(wgShared, snapName);
-        let snapReal: string;
-        try {
-          if (fs.lstatSync(snapDir).isSymbolicLink()) {
-            log.warn('Refusing snapshot mount: path is a symlink', { wgId, snapDir });
-            continue;
-          }
-          snapReal = fs.realpathSync(snapDir);
-        } catch {
-          continue;
-        }
-        if (snapReal !== wgSharedReal && !snapReal.startsWith(wgSharedReal + path.sep)) {
-          log.warn('Refusing snapshot mount outside workgroup tree', { wgId, snapDir, target: snapReal });
-          continue;
-        }
-        if (!fs.existsSync(path.join(snapDir, '.git'))) continue;
-        mounts.push({
-          hostPath: snapReal,
-          containerPath: `${WORKGROUP_CONTAINER_PATH}/${snapName}`,
-          readonly: true,
-          overlayAllowedRoots: [wgSharedReal],
-        });
-      }
-    }
   }
   // These nested mounts are unconditional. In memory-only mode
   // /workspace/workgroup itself is container-local, so the lock needs its own
@@ -2716,12 +2727,21 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
  * pruned from groups that already have it. Current names may stay listed
  * (they're re-copied every spawn, so listing them is a harmless no-op).
  */
-const MANAGED_WORKER_DEFS = ['worker.md', 'worker-opus.md', 'worker-codex.md'];
+const MANAGED_WORKER_DEFS = [
+  'worker-fast.md',
+  'worker.md',
+  'worker-high.md',
+  'worker-codex.md',
+  // Retired: renamed to worker-high.md so the tier name describes the rung
+  // rather than a Claude model (the same def is gpt-5.6-sol on Codex). Listed
+  // so groups that already have the old file get it pruned on next spawn.
+  'worker-opus.md',
+];
 
 /**
  * Copy trunk worker subagent defs (container/agents/*.md) into
  * .claude-shared/agents/ — the container's ~/.claude/agents — so every Claude
- * group gets the orchestrator worker roster (worker, worker-opus,
+ * group gets the orchestrator worker roster (worker-fast, worker, worker-high,
  * worker-codex). Copies, not symlinks: agent discovery through dangling host
  * symlinks is unverified, and the files are tiny. Trunk is canonical: a
  * managed def absent from the current trunk set is pruned; operator-added defs
@@ -2915,6 +2935,7 @@ async function buildContainerArgs(
    * channel-level sessions, which have no thread to link to.
    */
   sessionThreadId?: string | null,
+  repositoryWorkUnit?: RepositoryWorkUnit,
 ): Promise<string[]> {
   // --init: tini as PID 1 reaps orphaned children (esbuild/gh corpses were
   // accumulating as zombies under bun, which doesn't reap as PID 1) and still
@@ -3059,6 +3080,11 @@ async function buildContainerArgs(
   );
   args.push('-e', `NANOCLAW_ASSISTANT_NAME=${resolvedAssistantName}`);
   if (sessionThreadId) args.push('-e', `NANOCLAW_THREAD_ID=${sessionThreadId}`);
+  if (repositoryWorkUnit) {
+    args.push('-e', `NANOCLAW_HOST_DATA_DIR=${DATA_DIR}`);
+    args.push('-e', `NANOCLAW_HOST_TOPIC_WORKTREES_DIR=${topicWorktreesDir(repositoryWorkUnit)}`);
+    args.push('-e', `NANOCLAW_WORK_UNIT_KEY=${repositoryWorkUnit.key}`);
+  }
 
   // Workgroup awareness — the agent learns which workgroup (multi-agent
   // tenant boundary) it belongs to, so prompts grounded in "my workgroup is
@@ -3099,8 +3125,8 @@ async function buildContainerArgs(
   // platform-side channel as THIS session, with its bot user_id resolved
   // for canonical `<@U…>` mentions. The container's
   // buildSystemPromptAddendum reads NANOCLAW_PEERS and renders an
-  // identity block: "You are X (<@uid>). Peers: ...". This gives the
-  // model an explicit name→user_id mapping per turn so prose handoff
+  // identity block: "You are X (@handle, <@uid>). Peers: ...". This gives the
+  // model an explicit self and peer name→user_id mapping per turn so prose handoff
   // ("@Example Assistant Codex" → `<@UTEST00024>`) doesn't depend on chat-history
   // inference. Self user_id is included separately so the agent
   // recognizes inbound @-mentions to itself.
@@ -3138,15 +3164,30 @@ async function buildContainerArgs(
       }
       return { name, userId };
     });
-    // Self user_id — same dual-registry lookup. Discord-only sessions
-    // also get the self-mention guard text in the runtime prompt.
+    // Self identity — same dual-registry lookup. The channel-facing display
+    // name is deliberately distinct from assistantName: an operator may call
+    // this agent "ollie" while Slack routes it as @illie-codex. Supplying
+    // both aliases prevents the model from treating its own platform mention
+    // as a request for a sibling.
     const selfMg = getMessagingGroup(sessionMessagingGroupId);
     let selfUserId: string | undefined;
+    let selfName: string | undefined;
     if (selfMg) {
-      selfUserId = slackBots.get(selfMg.channel_type)?.userId ?? discordBots.get(selfMg.channel_type)?.userId;
+      const slackBot = slackBots.get(selfMg.channel_type);
+      const discordBot = discordBots.get(selfMg.channel_type);
+      if (slackBot) {
+        selfUserId = slackBot.userId;
+        selfName = getSlackBotDisplayName(selfMg.channel_type) ?? undefined;
+      } else if (discordBot) {
+        selfUserId = discordBot.userId;
+        selfName = getDiscordBotDisplayName(selfMg.channel_type) ?? undefined;
+      }
     }
-    if (peerEntries.length > 0 || selfUserId) {
-      args.push('-e', `NANOCLAW_PEERS=${JSON.stringify({ self: { userId: selfUserId }, peers: peerEntries })}`);
+    if (peerEntries.length > 0 || selfUserId || selfName) {
+      args.push(
+        '-e',
+        `NANOCLAW_PEERS=${JSON.stringify({ self: { name: selfName, userId: selfUserId }, peers: peerEntries })}`,
+      );
     }
   }
 

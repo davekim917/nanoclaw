@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { MessageInRow } from '../db/messages-in.js';
 import { touchHeartbeat } from '../db/connection.js';
+import { evaluateManagedGitCommand } from '../managed-git-guard.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
 
 const SCRIPT_TIMEOUT_MS = 30_000;
@@ -66,6 +67,13 @@ const FALLBACK_BLOCK: RegExp[] = [
 
 /** Refuse a pre-task script the interactive Bash gate would block or gate. */
 export async function classifyScript(script: string): Promise<{ safe: boolean; reason?: string }> {
+  // Managed canonical metadata is shared by every topic worktree in a
+  // workgroup. Enforce its host-only maintenance boundary before consulting
+  // the Bootstrap evaluator so unattended scripts cannot reach a command the
+  // interactive provider hooks would deny.
+  const managedGit = evaluateManagedGitCommand(script);
+  if (managedGit.action === 'deny') return { safe: false, reason: managedGit.reason };
+
   const evaluate = await loadBashEvaluator();
   if (evaluate) {
     try {

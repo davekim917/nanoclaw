@@ -348,7 +348,15 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       channel_type   TEXT,
       thread_id      TEXT,
       content        TEXT NOT NULL,
-      on_wake        INTEGER NOT NULL DEFAULT 0
+      on_wake        INTEGER NOT NULL DEFAULT 0,
+      repo_fence_epoch TEXT,
+      repo_fence_original_trigger INTEGER
+    );
+    CREATE TABLE repo_ingress_fence (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      epoch TEXT NOT NULL,
+      generation TEXT NOT NULL,
+      state TEXT NOT NULL CHECK (state IN ('active', 'released'))
     );
     CREATE TABLE delivered (
       message_out_id      TEXT PRIMARY KEY,

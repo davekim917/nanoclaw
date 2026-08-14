@@ -36,6 +36,7 @@ import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js
 import { registerChannelAdapter } from './channel-registry.js';
 import {
   fetchSlackBotIdentity,
+  getSlackBotSenderName,
   getKnownSlackBots,
   registerSlackBot,
   registerSlackWorkspaceHumans,
@@ -429,6 +430,13 @@ for (const ws of workspaces) {
         // @name here is what stops agents from ever LEARNING the raw form —
         // the outbound rewrite above is the backstop, this is the cure.
         transformInboundText: (text) => resolveInboundSlackIds(text, ws.channelType),
+        // Chat SDK can retain a bot's immutable install-time username in
+        // author.fullName even after Slack shows a new profile name. Resolve
+        // sibling authors through the same live, workspace-scoped registry as
+        // mentions so thread context and archive rows never teach the agent a
+        // deprecated backend codename.
+        transformInboundSender: (author) =>
+          author.userId ? getSlackBotSenderName(ws.channelType, author.userId) : null,
         // Slack's markdown_text parser fires app_mention even for literal
         // `@name` inside backticks (gate-syntax documentation). Demote the
         // mention when it appears ONLY inside code regions; keep the

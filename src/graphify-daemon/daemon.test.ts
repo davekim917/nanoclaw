@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { discoverWorkgroup } from '../graphify/discovery.js';
 import { WorkgroupGraphStore } from '../graphify/store.js';
 import type { ExtractionBundle, GraphQueryResult, SourceInput } from '../graphify/types.js';
+import { canonicalRepoDir, resolveRepositoryWorkUnit, topicWorktreesDir } from '../repository-workspaces.js';
 import {
   bridgeCodeBundle,
   DEFAULT_FULL_RECONCILE_MS,
@@ -83,6 +85,29 @@ async function waitUntil(check: () => boolean, timeoutMs = 2_000): Promise<void>
 }
 
 describe('WorkgroupGraphDaemon', () => {
+  it('indexes host-owned canonical repositories outside agent-writable workgroup roots', async () => {
+    const f = fixture();
+    const canonical = canonicalRepoDir('madison', 'analytics', f.data);
+    mkdirSync(canonical, { recursive: true });
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: canonical });
+    writeFileSync(join(canonical, 'model.sql'), 'select canonical_repository_fact as metric');
+    execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'add', '-A'], { cwd: canonical });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-q', '-m', 'canonical'],
+      { cwd: canonical },
+    );
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+    });
+    await daemon.refreshCatalog();
+    expect((await daemon.query('madison', 'canonical repository fact')).nodes.length).toBeGreaterThan(0);
+    await daemon.close();
+  });
+
   it('uses a host-visible data job root in production construction', () => {
     expect(graphifyJobsRoot('/srv/nanoclaw/data')).toBe('/srv/nanoclaw/data/graphify/jobs');
     expect(graphifyJobsRoot('/srv/nanoclaw/data')).not.toContain('/tmp');
@@ -713,8 +738,26 @@ describe('WorkgroupGraphDaemon', () => {
       INSERT INTO sessions VALUES ('s2', 'ag-a', 'mg2', 'thread-two');
     `);
     db.close();
-    const one = join(f.data, 'v2-threads', 'thread-one', 'worktrees');
-    const two = join(f.data, 'v2-threads', 'thread-two', 'worktrees');
+    const one = topicWorktreesDir(
+      resolveRepositoryWorkUnit({
+        workgroupId: 'madison',
+        sessionId: 's1',
+        platformId: 'discord:one',
+        messagingGroupId: 'mg1',
+        threadId: 'thread-one',
+      }),
+      f.data,
+    );
+    const two = topicWorktreesDir(
+      resolveRepositoryWorkUnit({
+        workgroupId: 'madison',
+        sessionId: 's2',
+        platformId: 'discord:two',
+        messagingGroupId: 'mg2',
+        threadId: 'thread-two',
+      }),
+      f.data,
+    );
     mkdirSync(one, { recursive: true });
     mkdirSync(two, { recursive: true });
     writeFileSync(join(one, 'draft.md'), 'alpha private draft');
@@ -1515,7 +1558,16 @@ describe('WorkgroupGraphDaemon', () => {
       "INSERT INTO messaging_groups VALUES ('mg1','discord:one'); INSERT INTO sessions VALUES ('s1','ag-a','mg1','thread-one')",
     );
     db.close();
-    const worktree = join(f.data, 'v2-threads', 'thread-one', 'worktrees');
+    const worktree = topicWorktreesDir(
+      resolveRepositoryWorkUnit({
+        workgroupId: 'madison',
+        sessionId: 's1',
+        platformId: 'discord:one',
+        messagingGroupId: 'mg1',
+        threadId: 'thread-one',
+      }),
+      f.data,
+    );
     mkdirSync(worktree, { recursive: true });
     writeFileSync(join(worktree, 'change.ts'), 'changed()');
     const codeWorker = {
@@ -1705,8 +1757,26 @@ describe('WorkgroupGraphDaemon', () => {
     `);
     db.close();
     mkdirSync(join(f.groups, 'other-agent'));
-    const madison = join(f.data, 'v2-threads', 'wg-madison', 'thread-same', 'worktrees');
-    const other = join(f.data, 'v2-threads', 'wg-other', 'thread-same', 'worktrees');
+    const madison = topicWorktreesDir(
+      resolveRepositoryWorkUnit({
+        workgroupId: 'madison',
+        sessionId: 's1',
+        platformId: 'slack:C',
+        messagingGroupId: 'mg1',
+        threadId: 'thread-same',
+      }),
+      f.data,
+    );
+    const other = topicWorktreesDir(
+      resolveRepositoryWorkUnit({
+        workgroupId: 'other',
+        sessionId: 's2',
+        platformId: 'slack:C',
+        messagingGroupId: 'mg2',
+        threadId: 'thread-same',
+      }),
+      f.data,
+    );
     mkdirSync(madison, { recursive: true });
     mkdirSync(other, { recursive: true });
     writeFileSync(join(madison, 'draft.md'), 'madison private overlay');

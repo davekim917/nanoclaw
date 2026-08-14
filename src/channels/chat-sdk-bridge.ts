@@ -50,6 +50,7 @@ interface GatewayAdapter extends Adapter {
 export interface ReplyContext {
   text: string;
   sender: string;
+  senderId?: string;
 }
 
 /** Extract reply context from a platform-specific raw message. Return null if no reply. */
@@ -171,12 +172,17 @@ export async function resolveQuotedReply(
     const resolved = (await withTimeout(resolver(), timeoutMs)) as {
       id?: string;
       text?: string;
-      author?: { fullName?: string; userName?: string };
+      author?: { userId?: string; fullName?: string; userName?: string };
     } | null;
     const text = resolved?.text;
     if (!resolved || typeof text !== 'string' || !text.trim()) return null;
     const sender = resolved.author?.fullName ?? resolved.author?.userName ?? 'unknown';
-    return { id: resolved.id, sender, text };
+    return {
+      id: resolved.id,
+      sender,
+      text,
+      ...(resolved.author?.userId ? { senderId: resolved.author.userId } : {}),
+    };
   } catch (err) {
     log.warn('Failed to resolve quoted message link', { err: String(err) });
     return null;
@@ -256,6 +262,18 @@ export interface ChatSdkBridgeConfig {
    * need its own pass.
    */
   transformInboundText?: (text: string) => string;
+  /**
+   * Optional live identity override for an inbound author. Chat SDK adapters
+   * can expose a stale install-time bot name after the platform profile has
+   * been renamed. Return a current channel-facing name for known bot authors,
+   * or null/undefined to preserve the SDK-provided human name.
+   */
+  transformInboundSender?: (author: {
+    userId?: string;
+    fullName?: string;
+    userName?: string;
+    isMe?: boolean;
+  }) => string | null | undefined;
   /**
    * Optional filter applied to inbound Chat SDK messages before they reach
    * the host router. Return false to drop. Used by channels that need to
@@ -769,9 +787,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     // Project chat-sdk's nested author into the flat sender fields the router
     // expects (see src/router.ts extractAndUpsertUser). Native adapters already
     // populate these directly; this brings chat-sdk adapters in line.
-    const author = serialized.author as { userId?: string; fullName?: string; userName?: string } | undefined;
+    const author = serialized.author as
+      | { userId?: string; fullName?: string; userName?: string; isMe?: boolean }
+      | undefined;
     if (author) {
-      const name = author.fullName ?? author.userName;
+      const name = config.transformInboundSender?.(author) ?? author.fullName ?? author.userName;
       serialized.senderId = author.userId;
       serialized.sender = name;
       serialized.senderName = name;
@@ -805,6 +825,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       if (replyTo && typeof replyTo.text === 'string') {
         replyTo.text = config.transformInboundText(replyTo.text);
       }
+    }
+
+    const replyTo = serialized.replyTo as { sender?: string; senderId?: string } | undefined;
+    if (replyTo?.senderId && config.transformInboundSender) {
+      const sender = config.transformInboundSender({ userId: replyTo.senderId, fullName: replyTo.sender });
+      if (sender) replyTo.sender = sender;
     }
 
     // Re-verify platform-claimed mentions against the final text (raw ids
@@ -1436,14 +1462,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const msgs = (result?.messages ?? []) as Array<{
           id: string;
           text: string;
-          author: { fullName: string; userName: string; isMe: boolean };
+          author: { userId?: string; fullName: string; userName: string; isMe: boolean };
           metadata: { dateSent: Date };
         }>;
         for (const m of msgs) {
           if (m.id === opts?.excludeMessageId) continue;
           if (!m.text || m.text.length === 0) continue;
           inThread.push({
-            sender: m.author.isMe ? 'assistant' : m.author.fullName || m.author.userName || 'unknown',
+            sender: m.author.isMe
+              ? 'assistant'
+              : config.transformInboundSender?.(m.author) || m.author.fullName || m.author.userName || 'unknown',
             text: applyInboundTransform(m.text),
             timestamp: m.metadata.dateSent.toISOString(),
           });

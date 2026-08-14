@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'vitest';
 
-import { MANAGED_MARKER, formatCodexAgentToml, isManagedToml, parseClaudeAgentMd } from './claude-agent-md.js';
+import {
+  CODEX_WORKER_TIERS,
+  MANAGED_MARKER,
+  formatCodexAgentToml,
+  isManagedToml,
+  parseClaudeAgentMd,
+} from './claude-agent-md.js';
 
 describe('parseClaudeAgentMd', () => {
   test('parses plain frontmatter', () => {
@@ -124,6 +130,47 @@ Body line 2.
     expect(toml).toContain('name = "r"');
     expect(toml).toContain('A round-trip example');
     expect(toml).toMatch(/Body line 1\.\nBody line 2\./);
+  });
+});
+
+describe('formatCodexAgentToml — worker model tiering', () => {
+  test('emits the Codex model and reasoning effort for each tiered worker', () => {
+    for (const [name, tier] of Object.entries(CODEX_WORKER_TIERS)) {
+      const out = formatCodexAgentToml({ name, description: 'd. Runs on Sonnet.', body: 'b' });
+      expect(out).toContain(`model = "${tier.model}"`);
+      expect(out).toContain(`model_reasoning_effort = "${tier.effort}"`);
+    }
+  });
+
+  test('rewrites the Claude model claim so the description names the Codex model', () => {
+    const out = formatCodexAgentToml({
+      name: 'worker',
+      description: 'Default execution worker. Runs on Sonnet at xhigh effort.',
+      body: 'b',
+    });
+    expect(out).toContain('Runs on gpt-5.6-terra at xhigh reasoning.');
+    expect(out).not.toContain('Sonnet');
+  });
+
+  test('appends the model sentence when the description has no "Runs on" clause', () => {
+    const out = formatCodexAgentToml({ name: 'worker-fast', description: 'Bulk work.', body: 'b' });
+    expect(out).toContain('Bulk work. Runs on gpt-5.6-luna at max reasoning.');
+  });
+
+  test('leaves untiered agents inheriting the parent model', () => {
+    const out = formatCodexAgentToml({ name: 'codex-rescue', description: 'd', body: 'b' });
+    expect(out).not.toContain('model = ');
+    expect(out).not.toContain('model_reasoning_effort');
+  });
+
+  test('cheap tiers carry higher effort than the top tier', () => {
+    // The whole point of the ladder: dropping to a cheaper model buys back
+    // quality with reasoning effort, so a cheap tier must never be cheaper
+    // on BOTH axes at once.
+    const order = ['low', 'medium', 'high', 'xhigh', 'max'];
+    const fast = CODEX_WORKER_TIERS['worker-fast']!;
+    const top = CODEX_WORKER_TIERS['worker-high']!;
+    expect(order.indexOf(fast.effort)).toBeGreaterThan(order.indexOf(top.effort));
   });
 });
 

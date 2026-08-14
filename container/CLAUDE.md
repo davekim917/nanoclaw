@@ -130,7 +130,7 @@ questions — is not the report template, but it is not free prose either:
 - No paragraph over 3 sentences in the deliverable. Anything enumerable is a
   list.
 - A number that drives a decision leads its line — `**49,076 of 52,682**
-  off-prem stores say "Liquor Store" — drop the Google type axis.` — not
+off-prem stores say "Liquor Store" — drop the Google type axis.` — not
   woven mid-sentence.
 - Scan test before sending: reading ONLY the bolded leads and bullets must
   surface every decision, number, and ask. If it doesn't, restructure.
@@ -324,7 +324,7 @@ You both wake independently — there is no router-side disambiguation. **Parse 
 - `@you and @peer, please collaborate on Z` → pick a sub-task consistent with your strengths, say which slice you're taking, let the peer take the rest.
 - `@you @peer status?` → each replies for itself. Don't speak for the peer.
 
-Read split-task framings (*have*, *while*, *kick off*, *in parallel*) as delegational by default; ack your slice briefly rather than silently grabbing all the work. If you see yourself in the peer slot of your own outbound, you mis-parsed — stop and reread the original message.
+Read split-task framings (_have_, _while_, _kick off_, _in parallel_) as delegational by default; ack your slice briefly rather than silently grabbing all the work. If you see yourself in the peer slot of your own outbound, you mis-parsed — stop and reread the original message.
 
 ## Running Codex from inside the container
 
@@ -348,17 +348,17 @@ The `conversations/` folder holds searchable past transcripts; use it when a req
 
 ## Working with Repos
 
-**Layout (migrated workgroups):** `/workspace/workgroup/<repo>/` is a **read-only snapshot of `origin/HEAD`**, kept current by the host — browse and read it freely, it is always the latest default branch. The repo store itself is a bare mirror at `/workspace/workgroup/.repos/<repo>.git` (leave it alone). All editing happens in per-thread checkouts. Never `git checkout`/`commit` in the snapshot — writes fail (read-only mount) and a guard redirects you. Long-lived shared checkouts (cross-thread collaboration) live under `/workspace/workgroup/.worktrees/<name>/`. Check `.repos/<repo>.freshness.json` if you need to know exactly how fresh the snapshot is.
+**Layout:** each workgroup has one host-owned canonical clone, but its working tree is not mounted in the container. All repository browsing and editing happens in this topic's standard linked checkout at `/workspace/worktrees/<repo>`. Sibling agents in the same topic share that checkout. A different topic gets a different path, branch, HEAD, index, and Git admin directory.
 
-1. `create_worktree({ repo: "REPO-NAME" })` — get a working directory at `/workspace/worktrees/<repo>` (a standalone clone). Fetches origin and rebases the thread branch onto fresh `origin/HEAD` so resumed threads start latest. Passing an explicit `branch: "..."` opts out of the rebase (use this for deliberate stale checkouts: bisect, rollback, working off an existing feature branch). If the response includes `next git_push must use force: true`, the branch was rewritten — pass `force: true` on the next push. If a rebase conflict is reported, resolve it manually before continuing.
+1. `create_worktree({ repo: "REPO-NAME" })` — create or idempotently reuse this topic's linked checkout at `/workspace/worktrees/<repo>`. A new checkout starts at the freshly fetched `origin/HEAD`. An existing checkout is never rebased, branch-switched, reset, or otherwise rewritten. An explicit branch already owned by another worktree is rejected.
 2. Edit files, run tests, iterate
 3. `git_commit({ repo: "REPO-NAME", message: "feat: description" })` — stage + commit
-4. `git_push({ repo: "REPO-NAME" })` — push branch to origin. Pass `force: true` only when `create_worktree` warned about a rewrite.
+4. `git_push({ repo: "REPO-NAME" })` — push the current topic branch to origin. Force push remains an explicit exceptional operation.
 5. `open_pr({ repo: "REPO-NAME", title: "...", body: "..." })` — create a GitHub PR
-6. Use `create_worktree` for existing repos or `clone_repo` for new ones — don't `git clone` ad-hoc into the workspace. **Advisory** guards block `git clone` into `/workspace/{agent,worktrees,workgroup,...}` and git mutations inside snapshots, steering you to the MCP tools (a nudge, not a hard boundary); `codex exec` sub-delegations fire no hooks, so follow the rule by convention there.
-7. On thread resume, check `/workspace/worktrees/` for prior work from this session.
-8. If you do not commit explicitly, the host auto-commits all dirty worktrees on session exit.
-9. **If your branch seems to have vanished after a repo-store migration**, read `/workspace/workgroup/memory/repo-store-migration-*.md` — every parked branch's new location is indexed there, and full archives live under `/workspace/workgroup/.rescues/`. Nothing was deleted.
+6. Use `create_worktree` for existing repos or `clone_repo` for new ones — don't `git clone` ad-hoc into the workspace. The clone guard is advisory; the mount and host-action boundaries are authoritative.
+7. On topic resume, check `/workspace/worktrees/` for prior work shared by this topic's sibling agents.
+8. Dirty, staged, and untracked state persists exactly. Turn-end and compaction never auto-stage, auto-commit, reset, or remove Git locks; coordinate explicit commits with sibling agents.
+9. **If migrated work appears missing**, stop and ask the operator to consult the host-only hash-bound migration manifest, rescue refs, bundle, and retained old checkout. Do not recreate or reset the branch; the source topology is intentionally kept outside agent mounts for rollback.
 
 ## After Every PR (automatic, never skip)
 
@@ -374,7 +374,7 @@ For work that changes behavior, crosses a trust boundary, has meaningful rollbac
 After the user approves `plan.md`, run `/team-build`, then `/team-review --implementation`. `/team-auto` may run an approved plan through build and implementation review, but it never ships. `/team-ship` is a separate human-controlled publish or merge boundary. Trivial fixes, config changes, and conversation do not need the workflow.
 
 This is a default, and a group that tells you to build first outranks it (see
-the precedence rule at the top). Reach for `/team-plan` when the *risk* calls
+the precedence rule at the top). Reach for `/team-plan` when the _risk_ calls
 for it — a trust boundary, a migration, an undo nobody has — not because a
 request is called a feature. A planning document produced where the group's
 rule was "build the smallest slice" is not diligence; it is the failure that

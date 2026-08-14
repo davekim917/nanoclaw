@@ -154,13 +154,15 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
   // that anchor so the agent's first wake inside the thread sees what the
   // user is replying to.
 
-  function adapterWithFetchMessages(msgs: Array<{ id: string; text: string; sender: string; iso: string }>) {
+  function adapterWithFetchMessages(
+    msgs: Array<{ id: string; text: string; sender: string; iso: string; userId?: string }>,
+  ) {
     return stubAdapter({
       fetchMessages: async () => ({
         messages: msgs.map((m) => ({
           id: m.id,
           text: m.text,
-          author: { fullName: m.sender, userName: m.sender, isMe: false },
+          author: { userId: m.userId, fullName: m.sender, userName: m.sender, isMe: false },
           metadata: { dateSent: new Date(m.iso) },
         })),
       }),
@@ -272,6 +274,31 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
     });
     const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
     expect(history.map((m) => m.text)).toEqual(['hey @Example Agent-Codex can you check', 'sure thing']);
+  });
+
+  it('applies transformInboundSender to stale sibling bylines in thread history', async () => {
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        {
+          id: 'in-1',
+          text: 'assignment',
+          sender: 'Argus',
+          userId: 'U-DINESH',
+          iso: '2026-05-03T12:00:00Z',
+        },
+        {
+          id: 'in-2',
+          text: 'question',
+          sender: 'Operator',
+          userId: 'U-HUMAN',
+          iso: '2026-05-03T12:01:00Z',
+        },
+      ]),
+      supportsThreads: true,
+      transformInboundSender: (author) => (author.userId === 'U-DINESH' ? 'Dinesh' : null),
+    });
+    const history = await bridge.fetchThreadHistory!('slack:C:T', { limit: 50 });
+    expect(history.map((m) => m.sender)).toEqual(['Dinesh', 'Operator']);
   });
 
   it('applies transformInboundText to anchor messages too', async () => {
@@ -1046,9 +1073,20 @@ describe('resolveQuotedReply', () => {
   it('resolves the first link exposing a fetchMessage into reply context', async () => {
     const m = msg([
       { url: 'https://x' }, // no fetchMessage — skipped
-      { fetchMessage: async () => ({ id: 'm1', text: 'the quoted text', author: { fullName: 'Operator' } }) },
+      {
+        fetchMessage: async () => ({
+          id: 'm1',
+          text: 'the quoted text',
+          author: { userId: 'U-OPERATOR', fullName: 'Operator' },
+        }),
+      },
     ]);
-    expect(await resolveQuotedReply(m)).toEqual({ id: 'm1', sender: 'Operator', text: 'the quoted text' });
+    expect(await resolveQuotedReply(m)).toEqual({
+      id: 'm1',
+      sender: 'Operator',
+      senderId: 'U-OPERATOR',
+      text: 'the quoted text',
+    });
   });
 
   it('falls back to userName when fullName is absent', async () => {

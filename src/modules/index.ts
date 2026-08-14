@@ -44,5 +44,8 @@ import './scheduled-wake/index.js';
 // exhausted provider account; the host records the outage window and
 // respawns that session onto the group's declared fallback provider.
 import './provider-fallback/index.js';
+// Repository workspaces — durable clone publication, local canonical refresh,
+// and exact topic-to-topic linked-worktree transfer.
+import './repository-workspaces/index.js';
 
 import './escalation/index.js';

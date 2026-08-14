@@ -143,6 +143,23 @@ describe('runHostGatedTaskScripts', () => {
     db.close();
   });
 
+  it('a managed Git maintenance script never executes host-side and leaves its marker absent', async () => {
+    const db = freshDb();
+    const marker = path.join(TEST_DIR, 'managed-git-ran.marker');
+    insertHostGatedTask(
+      db,
+      't-managed-git',
+      `touch ${marker}\ncommand git --git-dir=/host/canonical/.git worktree prune --expire now\necho '{"wakeAgent": false}'`,
+    );
+
+    await runHostGatedTaskScripts(db, 'sess-test');
+
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(rowStatus(db, 't-managed-git')).toBe('pending');
+    expect(rowContent(db, 't-managed-git').scriptOutput).toBeUndefined();
+    db.close();
+  });
+
   it('never leaks the host process env into the script — only PATH/HOME/TZ', async () => {
     const db = freshDb();
     const before = process.env.HOST_SCRIPT_TEST_CANARY;

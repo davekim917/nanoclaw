@@ -598,7 +598,9 @@ function isThreadAnchorExempt(session: Session): boolean {
     const inDb = openInboundDb(session.agent_group_id, session.id);
     try {
       const row = inDb
-        .prepare("SELECT content FROM messages_in WHERE kind = 'task' AND series_id = ? ORDER BY timestamp DESC LIMIT 1")
+        .prepare(
+          "SELECT content FROM messages_in WHERE kind = 'task' AND series_id = ? ORDER BY timestamp DESC LIMIT 1",
+        )
         .get(seriesId) as { content: string } | undefined;
       if (row) exempt = (JSON.parse(row.content) as { threadAnchor?: unknown }).threadAnchor === false;
     } finally {
