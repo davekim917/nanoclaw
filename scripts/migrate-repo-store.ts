@@ -74,6 +74,12 @@ import {
   verifyProtectedArchives,
   type ProtectedArchiveEvidence,
 } from '../src/repository-protected-archives.js';
+import {
+  extendProtectedInodeInventory,
+  pidsWithOpenFilesBelow,
+  type ProtectedInodeInventory,
+} from '../src/repository-migration-quiescence.js';
+import { completedRepositoryQuiescencePaths } from '../src/repository-migration-quiescence-paths.js';
 
 interface Args {
   execute: boolean;
@@ -935,7 +941,9 @@ export function assertServiceInactive(
   throw new Error(`fleet is not quiescent: ${service} is ${loadState}/${activeState}`);
 }
 
-function assertFleetQuiescent(paths: string[]): void {
+let protectedMigrationInodes: ProtectedInodeInventory | undefined;
+
+function assertFleetQuiescent(paths: string[], refreshInodes = false): void {
   const services = [...new Set(['nanoclaw.service', 'nanoclaw-v2.service', `${getSystemdUnit(REPO_ROOT)}.service`])];
   for (const service of services) {
     assertServiceInactive(service);
@@ -957,27 +965,44 @@ function assertFleetQuiescent(paths: string[]): void {
       cause: error,
     });
   }
-  for (const candidate of paths) {
-    try {
-      const output = execFileSync('lsof', ['-t', '+D', candidate], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 60_000,
-      }).trim();
-      const foreign = output
-        .split('\n')
-        .filter(Boolean)
-        .filter((pid) => Number(pid) !== process.pid);
-      if (foreign.length > 0) throw new Error(`repository writers remain below ${candidate}: ${foreign.join(',')}`);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException & { status?: number }).status;
-      if (code === 1) continue; // lsof: no matches.
-      if (error instanceof Error && error.message.startsWith('repository writers remain')) throw error;
-      throw new Error(
-        `cannot prove writer quiescence below ${candidate}: ${error instanceof Error ? error.message : String(error)}`,
-        { cause: error },
+  {
+    const startedAt = Date.now();
+    const before = protectedMigrationInodes?.inodes.size ?? 0;
+    protectedMigrationInodes = extendProtectedInodeInventory(paths, protectedMigrationInodes, {
+      refresh: refreshInodes,
+    });
+    const added = protectedMigrationInodes.inodes.size - before;
+    if (added > 0) {
+      console.error(
+        `Captured ${added} new protected inode(s) for writer quiescence ` +
+          `(${protectedMigrationInodes.inodes.size} total) in ${Date.now() - startedAt}ms`,
       );
     }
+  }
+  let snapshot: Buffer;
+  try {
+    // `lsof +D <root>` recursively stats the entire root before it examines
+    // descriptors. Large workgroups can therefore time out even when no file
+    // is open, and repeating that traversal for every migration boundary is
+    // quadratic in the retained topology. Capture the kernel's open-file view
+    // once and filter its NUL-delimited records against the exact protected
+    // roots instead. Service/container admission is already stopped above, so
+    // the snapshot closes the remaining same-host process writer surface.
+    snapshot = execFileSync('lsof', ['-nP', '-F0pDin'], {
+      encoding: 'buffer',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30_000,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch (error) {
+    throw new Error(
+      `cannot prove repository writer quiescence: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+  const foreign = pidsWithOpenFilesBelow(paths, snapshot, process.pid, protectedMigrationInodes.inodes);
+  if (foreign.length > 0) {
+    throw new Error(`repository writers remain below protected roots: ${foreign.join(',')}`);
   }
 }
 
@@ -1600,16 +1625,25 @@ async function executeAndAudit(
       assertRemainingAggregateCapacity(remaining, aggregateCapacity);
       const manifest = manifests[index];
       const repositoryPaths = migrationQuiescencePaths([manifest], []);
+      const completedPaths = completedRepositoryQuiescencePaths(manifest);
       await executeRepositoryMigration(manifest, {
         assertQuiescent: () => assertFleetQuiescent(repositoryPaths),
+        refreshQuiescent: () => assertFleetQuiescent(completedPaths, true),
       });
+      // Migration creates new canonical, linked-worktree, state, journal, and
+      // bundle inodes under roots captured before the manifest existed. Merge
+      // those exact post-mutation trees, then take another open-file snapshot
+      // before advancing to the next repository.
+      assertFleetQuiescent(completedPaths, true);
     }
     auditServerTopology(manifests, protectedArchives);
   } catch (error) {
     const rollbackErrors: string[] = [];
     for (const manifest of [...manifests].reverse()) {
       try {
+        assertFleetQuiescent(completedRepositoryQuiescencePaths(manifest), true);
         await rollbackRepositoryMigration(manifest);
+        assertFleetQuiescent(completedRepositoryQuiescencePaths(manifest), true);
       } catch (rollbackError) {
         rollbackErrors.push(
           `${manifest.workgroupId}/${manifest.repo}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
@@ -1757,6 +1791,7 @@ async function rollbackCompletedServerMigration(runId: string): Promise<void> {
       },
       manifest.dataDir,
     );
+    assertFleetQuiescent(completedRepositoryQuiescencePaths(manifest), true);
   }
   verifyServerRollback(loaded.manifests, protectedArchives);
   durableRename(activeRollback, completedRollback);

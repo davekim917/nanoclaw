@@ -21,6 +21,7 @@ import {
   type MigrationPhase,
 } from './repository-migration.js';
 import { recoverySeedGitDirSha256, type ReviewedCheckoutRecoveryDecision } from './repository-migration-recovery.js';
+import { completedRepositoryQuiescencePaths } from './repository-migration-quiescence-paths.js';
 import {
   canonicalRepoDir,
   readOriginPin,
@@ -1115,6 +1116,37 @@ describe('lossless server-wide repository migration', () => {
       auditRepositoryMigration(resumed);
     }
   }, 180_000);
+
+  it('refuses automatic rollback when refreshed quiescence detects a writer', async () => {
+    const f = fixture({ dirty: true, repo: 'rollback-writer-fence' });
+    const manifest = manifestFor([candidate(f.legacy, f.repo)], f.remote, f.repo, 'rollback-writer-fence-run');
+    process.env.NANOCLAW_MIGRATION_FAIL_AFTER = 'canonical-published';
+    let refreshChecks = 0;
+    await expect(
+      executeRepositoryMigration(manifest, {
+        assertQuiescent: () => undefined,
+        refreshQuiescent: () => {
+          refreshChecks += 1;
+          throw new Error('repository writers remain below protected roots: 991');
+        },
+      }),
+    ).rejects.toThrow('repository writers remain below protected roots: 991');
+    expect(refreshChecks).toBe(1);
+    expect(fs.existsSync(canonicalRepoDir('wg-a', f.repo, dataDir))).toBe(true);
+    expect(fs.existsSync(f.legacy)).toBe(true);
+  });
+
+  it('refreshes both restored original and retained renamed object-store paths after rollback', () => {
+    const f = fixture({ repo: 'rollback-object-store-refresh' });
+    const manifest = manifestFor([candidate(f.legacy, f.repo)], f.remote, f.repo);
+    const refreshPaths = completedRepositoryQuiescencePaths(manifest);
+    for (const store of manifest.objectStores) {
+      expect(refreshPaths.some((root) => store === root || store.startsWith(`${root}${path.sep}`))).toBe(true);
+    }
+    for (const renamed of Object.values(manifest.renamedObjectStores ?? {})) {
+      expect(refreshPaths.some((root) => renamed === root || renamed.startsWith(`${root}${path.sep}`))).toBe(true);
+    }
+  });
 
   it.each<MigrationPhase>([
     'manifested',

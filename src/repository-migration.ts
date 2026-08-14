@@ -2717,7 +2717,10 @@ function canonicalMatchesManifest(canonical: string, manifest: RepositoryMigrati
 
 async function executeRepositoryMigrationLocked(
   manifest: RepositoryMigrationManifest,
-  options: { assertQuiescent: () => Promise<void> | void },
+  options: {
+    assertQuiescent: () => Promise<void> | void;
+    refreshQuiescent?: () => Promise<void> | void;
+  },
 ): Promise<RepositoryMigrationManifest> {
   // The outer preflight avoids taking the lock for an already-busy repo. This
   // second proof is load-bearing: it closes the writer race under the exact
@@ -2876,14 +2879,23 @@ async function executeRepositoryMigrationLocked(
     atomicJson(manifestPath(manifest), manifest);
     return manifest;
   } catch (error) {
+    const proveCurrentTopologyQuiescent = options.refreshQuiescent ?? options.assertQuiescent;
+    // A failure can leave newly created migration inodes that were absent from
+    // the pre-mutation proof. Refresh and prove them quiet before rollback;
+    // otherwise preserve the journaled topology for controlled recovery.
+    await proveCurrentTopologyQuiescent();
     await rollbackRepositoryMigration(manifest);
+    await proveCurrentTopologyQuiescent();
     throw error;
   }
 }
 
 export async function executeRepositoryMigration(
   manifest: RepositoryMigrationManifest,
-  options: { assertQuiescent: () => Promise<void> | void },
+  options: {
+    assertQuiescent: () => Promise<void> | void;
+    refreshQuiescent?: () => Promise<void> | void;
+  },
 ): Promise<RepositoryMigrationManifest> {
   verifyRepositoryMigrationManifest(manifest);
   if (manifest.capacity.availableBytes < manifest.capacity.requiredBytes)
