@@ -232,6 +232,37 @@ describe('server repository migration safety helpers', () => {
     ).toThrow(/cannot prove service quiescence.*Failed to connect to bus/);
   });
 
+  it('queries the system manager by default and the user manager only when explicitly requested', () => {
+    const calls: string[][] = [];
+    const query = (_command: string, args: string[]): string => {
+      calls.push(args);
+      return 'LoadState=loaded\nActiveState=inactive\n';
+    };
+
+    assertServiceInactive('nanoclaw-v2.service', query);
+    assertServiceInactive('nanoclaw-v2.service', query, 'user');
+
+    expect(calls).toEqual([
+      ['show', 'nanoclaw-v2.service', '--property=LoadState', '--property=ActiveState'],
+      ['--user', 'show', 'nanoclaw-v2.service', '--property=LoadState', '--property=ActiveState'],
+    ]);
+  });
+
+  it('fails closed for an active or unavailable user-manager unit', () => {
+    expect(() =>
+      assertServiceInactive('nanoclaw-v2.service', () => 'LoadState=loaded\nActiveState=active\n', 'user'),
+    ).toThrow(/fleet is not quiescent.*loaded\/active/);
+    expect(() =>
+      assertServiceInactive(
+        'nanoclaw-v2.service',
+        () => {
+          throw new Error('Failed to connect to user bus');
+        },
+        'user',
+      ),
+    ).toThrow(/cannot prove service quiescence.*Failed to connect to user bus/);
+  });
+
   it('accepts only explicit inactive service states and rejects failed or active states', () => {
     expect(() =>
       assertServiceInactive('nanoclaw.service', () => 'LoadState=loaded\nActiveState=inactive\n'),

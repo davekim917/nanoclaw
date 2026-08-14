@@ -15,6 +15,7 @@ import { pathToFileURL } from 'url';
 import Database from 'better-sqlite3';
 
 import { CONTAINER_INSTALL_LABEL, DATA_DIR, GROUPS_DIR, REPO_ROOT } from '../src/config.js';
+import { getSystemdUnit } from '../src/install-slug.js';
 import {
   auditRepositoryMigration,
   createLegacyGitResolutionContext,
@@ -788,10 +789,17 @@ export function assertServiceInactive(
   service: string,
   query: (command: string, args: string[]) => string = (command, args) =>
     execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 }),
+  scope: 'system' | 'user' = 'system',
 ): void {
   let output: string;
   try {
-    output = query('systemctl', ['--user', 'show', service, '--property=LoadState', '--property=ActiveState']);
+    output = query('systemctl', [
+      ...(scope === 'user' ? ['--user'] : []),
+      'show',
+      service,
+      '--property=LoadState',
+      '--property=ActiveState',
+    ]);
   } catch (error) {
     throw new Error(
       `cannot prove service quiescence for ${service}: ${error instanceof Error ? error.message : String(error)}`,
@@ -818,8 +826,13 @@ export function assertServiceInactive(
 }
 
 function assertFleetQuiescent(paths: string[]): void {
-  for (const service of ['nanoclaw.service', 'nanoclaw-v2.service']) {
+  const services = [...new Set(['nanoclaw.service', 'nanoclaw-v2.service', `${getSystemdUnit(REPO_ROOT)}.service`])];
+  for (const service of services) {
     assertServiceInactive(service);
+    // Check both managers unconditionally. A unit may remain loaded after its
+    // file is removed, so filesystem registration discovery cannot prove that
+    // the user manager is quiet. An unavailable manager therefore fails closed.
+    assertServiceInactive(service, undefined, 'user');
   }
   try {
     const containers = execFileSync('docker', ['ps', '-q', '--filter', `label=${CONTAINER_INSTALL_LABEL}`], {
