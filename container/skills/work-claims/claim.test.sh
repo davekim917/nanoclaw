@@ -96,4 +96,76 @@ CLAIMS_DIR="$ROOT/absent/claims" bash "$CLAIM" check anything | grep -q 'does no
 # 13. list renders one row per claim with its state.
 bash "$CLAIM" list | grep -q 'broken' || fail "list omitted a claim"
 
+# 14. Parking your own live claim rewrites it with status parked and appends
+#     a "parked" ledger line carrying the note.
+bash "$CLAIM" take acme-park 3 building the seam >/dev/null
+bash "$CLAIM" park acme-park handed off, seam half-built, needs tests >/dev/null
+jq -e '
+  .status == "parked" and .owner == "ava" and
+  .note == "handed off, seam half-built, needs tests" and
+  (.parked_at | endswith("Z")) and (.claimed_at | endswith("Z"))
+' "$CLAIMS_DIR/acme-park.json" >/dev/null || fail "park did not rewrite fields correctly"
+tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
+  .event == "parked" and .slug == "acme-park" and .owner == "ava" and
+  .note == "handed off, seam half-built, needs tests"
+' >/dev/null || fail "park did not write a ledger line"
+
+# 15. check on a parked claim reads PARKED and free to take, exit 0.
+bash "$CLAIM" check acme-park | grep -q '^PARKED — was ava:.*free to take' \
+  || fail "parked claim did not read PARKED/free to take"
+
+# 16. Parking an unclaimed slug creates it (coordinator advertising work).
+bash "$CLAIM" park acme-fresh-park nobody started this yet, needs an owner >/dev/null
+jq -e '.status == "parked" and .owner == "ava"' "$CLAIMS_DIR/acme-fresh-park.json" >/dev/null \
+  || fail "parking an unclaimed slug did not create it"
+
+# 17. take on a parked claim is always allowed and records the resume note.
+NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-park 2 resuming the seam >/dev/null
+jq -e '
+  .owner == "bo" and .status != "parked" and
+  (.note | startswith("resumed parked work from ava: "))
+' "$CLAIMS_DIR/acme-park.json" >/dev/null || fail "take on parked did not record resume note"
+
+# 18. A sibling may not park another agent's LIVE claim; file untouched.
+NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-park-live 4 owned by bo >/dev/null
+[ "$(bash "$CLAIM" park acme-park-live nope >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "park of a sibling's live claim did not exit 3"
+[ "$(jq -r .owner "$CLAIMS_DIR/acme-park-live.json")" = bo ] \
+  || fail "refused park still wrote"
+
+# 19. A sibling may not park another agent's STALE claim either — hint says
+#     take it over first.
+jq '.claimed_at = "2020-01-01T00:00:00Z"' "$CLAIMS_DIR/acme-park-live.json" > "$ROOT/t" \
+  && mv "$ROOT/t" "$CLAIMS_DIR/acme-park-live.json"
+bash "$CLAIM" check acme-park-live | grep -q '^STALE' || fail "expired park target not stale"
+bash "$CLAIM" park acme-park-live nope >/dev/null 2>&1 \
+  && fail "parked a sibling's stale claim"
+[ "$(jq -r .owner "$CLAIMS_DIR/acme-park-live.json")" = bo ] \
+  || fail "refused stale park still wrote"
+
+# 20. release writes a "released" ledger line with the full note, before the
+#     claim file disappears.
+bash "$CLAIM" take acme-release-ledger 2 own work, needs the full note preserved >/dev/null
+bash "$CLAIM" release acme-release-ledger >/dev/null
+tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
+  .event == "released" and .slug == "acme-release-ledger" and .owner == "ava" and
+  .note == "own work, needs the full note preserved"
+' >/dev/null || fail "release did not write a released ledger line with the full note"
+
+# 21. --merged-pr clearing (a different owner than the caller) writes a
+#     cleared_merged ledger line with the pr number.
+NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-pr-733 4 publish-gate seam >/dev/null
+bash "$CLAIM" release acme-pr-733 --merged-pr 733 >/dev/null
+tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
+  .event == "cleared_merged" and .slug == "acme-pr-733" and .pr == 733 and .owner == "bo"
+' >/dev/null || fail "merged-pr release did not write cleared_merged with pr number"
+
+# 22. Every ledger line is valid single-line JSON.
+while IFS= read -r line; do
+  echo "$line" | jq -e . >/dev/null || fail "ledger line is not valid JSON: $line"
+done < "$CLAIMS_DIR/ledger.ndjson"
+
+# 23. ledger.ndjson is never picked up by list.
+bash "$CLAIM" list | grep -q 'ledger' && fail "list picked up the ledger file"
+
 echo "all claim.sh tests passed"

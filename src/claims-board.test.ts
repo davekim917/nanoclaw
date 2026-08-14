@@ -106,6 +106,37 @@ describe('readClaims', () => {
     expect(readClaims('wg-a', NOW, dir).map((c) => c.slug)).toEqual(['parked']);
   });
 
+  it('classifies a parked claim regardless of TTL, with age since parked_at', () => {
+    // claimed 100h ago on a 4h ttl — would be 'stale' by TTL alone.
+    const dir = root({
+      handoff: claim(100, { status: 'parked', parked_at: new Date(NOW - 3 * HOUR).toISOString(), ttl_hours: 4 }),
+    });
+
+    expect(readClaims('wg-a', NOW, dir)[0]).toMatchObject({ state: 'parked', staleMs: 3 * HOUR });
+  });
+
+  it('parking wins even when the note says "not done"', () => {
+    const dir = root({
+      handoff: claim(9, {
+        status: 'parked',
+        parked_at: new Date(NOW - 1 * HOUR).toISOString(),
+        note: 'RELEASED, not done. Needs a QA re-verification run only.',
+      }),
+    });
+
+    expect(readClaims('wg-a', NOW, dir).map((c) => c.slug)).toEqual(['handoff']);
+    expect(readClaims('wg-a', NOW, dir)[0].state).toBe('parked');
+  });
+
+  it('defaults staleMs to 0 for a parked claim missing or with an unparseable parked_at', () => {
+    const dir = root({ missing: claim(9, { status: 'parked' }), bad: claim(9, { status: 'parked', parked_at: 'nope' }) });
+
+    const byslug = Object.fromEntries(readClaims('wg-a', NOW, dir).map((c) => [c.slug, c]));
+
+    expect(byslug.missing).toMatchObject({ state: 'parked', staleMs: 0 });
+    expect(byslug.bad).toMatchObject({ state: 'parked', staleMs: 0 });
+  });
+
   it('truncates a paragraph-long note to its first sentence', () => {
     const dir = root({
       verbose: claim(1, { note: 'Dev activation verified live. OPEN: screenshots, migration decision. DO NOT flip prod.' }),
@@ -123,14 +154,25 @@ describe('renderClaims', () => {
     { slug: 'live-one', owner: 'kit', note: 'seam', threadId: null, state: 'live', staleMs: -2 * HOUR, escalated: false },
     { slug: 'gone', owner: 'ava', note: 'drift', threadId: 't', state: 'stale', staleMs: 3 * HOUR, escalated: true },
     { slug: 'soon', owner: 'bo', note: 'guard', threadId: null, state: 'expiring', staleMs: 30 * 60000, escalated: false },
+    { slug: 'handoff', owner: 'kit', note: 'stepped off', threadId: null, state: 'parked', staleMs: 5 * HOUR, escalated: false },
   ];
 
-  it('puts what needs a human first and live work last', () => {
-    const out = renderClaims(claims).split('\n').filter((l) => l.startsWith('🔴') || l.startsWith('🟡') || l.startsWith('🟢'));
+  it('puts what needs a human first, parked next, and live work last', () => {
+    const out = renderClaims(claims)
+      .split('\n')
+      .filter((l) => l.startsWith('🔴') || l.startsWith('🅿️') || l.startsWith('🟡') || l.startsWith('🟢'));
 
     expect(out[0]).toContain('Stale');
-    expect(out[1]).toContain('Past TTL');
-    expect(out[2]).toContain('Live');
+    expect(out[1]).toContain('Parked');
+    expect(out[2]).toContain('Past TTL');
+    expect(out[3]).toContain('Live');
+  });
+
+  it('renders parked age as "parked <duration>", not past-TTL phrasing', () => {
+    const out = renderClaims(claims);
+
+    expect(out).toContain('parked 5.0h');
+    expect(out).not.toContain('5.0h past TTL');
   });
 
   it('renders a thread link only when the claim recorded one', () => {
@@ -154,5 +196,13 @@ describe('renderClaims', () => {
 
   it('renders an explicit empty state rather than a bare heading', () => {
     expect(renderClaims([])).toContain('nothing claimed right now');
+  });
+
+  it('stamps a populated render with when it was drawn and what the source of truth is', () => {
+    expect(renderClaims(claims)).toMatch(/_claims as of .+ — source of truth: the claims\/ directory_$/);
+  });
+
+  it('stamps the empty render too', () => {
+    expect(renderClaims([])).toMatch(/_claims as of .+ — source of truth: the claims\/ directory_$/);
   });
 });

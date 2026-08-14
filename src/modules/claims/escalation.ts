@@ -138,6 +138,8 @@ export function isStalePastGrace(
 /** Pure — should this claim be (re-)escalated right now? */
 export function shouldEscalate(claim: Claim, now: number): boolean {
   if (typeof claim.claimed_at !== 'string' || typeof claim.ttl_hours !== 'number') return false;
+  // Parking is a deliberate handoff, not abandonment — the board surfaces it, the alert must not.
+  if (typeof claim.status === 'string' && claim.status.trim().toLowerCase() === 'parked') return false;
   if (declaresItselfFinished(claim)) return false;
   if (!isStalePastGrace(claim.claimed_at, claim.ttl_hours, now).stale) return false;
   if (typeof claim.escalated_at !== 'string') return true;

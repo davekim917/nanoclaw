@@ -49,14 +49,25 @@ a local nickname and cannot. Never hand-assemble one.
 
 1. **Check before starting** substantive work on a claimable unit.
 2. **Write your claim before starting**, not after.
-3. **Delete your claim on completion or handoff.**
+3. **Delete your claim on completion or handoff** (release), **or park it**
+   if you're stopping without finishing — see states below.
 4. **A claim past `claimed_at + ttl_hours` is stale** — anyone may take it
    over. Taking over means overwriting it with your own claim and a `note`
    that says it was a takeover.
-5. **Never delete another agent's live (non-stale) claim.**
+5. **Never delete or park another agent's live (non-stale) claim.**
 6. **After an idle-ceiling or host-restart recovery**, re-check the claim for
    whatever seam you were mid-work on before resuming — a sibling may have
    taken it over while you were down.
+
+## The four states
+
+`claimed` (live, TTL-bound) → `parked` (off it, NOT done — a third state for
+the case that used to get stuffed into a note like "RELEASED, not done") →
+either `taken` (a sibling or you resumes it, always allowed regardless of who
+parked it) or `released` (deleted, done). A stale claim (past its TTL) is a
+variant of `claimed` that anyone may take over; `parked` overrides TTL
+entirely — a parked claim is never stale, it just sits there until someone
+takes it.
 
 ## Mechanics — always the script, never hand-rolled JSON
 
@@ -65,6 +76,7 @@ CLAIM=/app/skills/work-claims/claim.sh
 
 bash $CLAIM check   acme-pr-733
 bash $CLAIM take    acme-pr-733 4 "publish-gate seam, PR #733"
+bash $CLAIM park    acme-pr-733 "not done: schema done, handlers TODO"
 bash $CLAIM release acme-pr-733
 bash $CLAIM list
 ```
@@ -84,12 +96,19 @@ What the script enforces, so you do not have to:
 
 - Atomic same-directory `mktemp` + `mv` — no reader ever sees a half-written file.
 - `take` REFUSES a live claim that is not yours (exit 3). `--takeover` records an
-  override; it does not make one correct.
+  override; it does not make one correct. Taking a **parked** claim is always
+  allowed, whoever parked it — the note records `resumed parked work from <them>:`.
 - A stale takeover keeps the previous owner in the note instead of erasing them.
 - A claim with no parseable expiry counts as **stale**, never an indefinite lock —
-  a corrupt file must not wedge a slug forever.
+  a corrupt file must not wedge a slug forever. `parked` overrides this: a parked
+  claim is never reclassified as stale by its TTL.
+- `park` REFUSES another agent's live claim (exit 3, same as `take`) and another
+  agent's stale claim ("take it over first, then park") — you can only park your
+  own claim, or an unclaimed slug (advertising work that needs an owner).
 - `release` deletes only your own claim, and `--merged-pr <n>` verifies the merge
   against GitHub rather than trusting your assertion.
+- `release` and `park` both append a line to `claims/ledger.ndjson` first —
+  see below.
 - No `/workspace/workgroup` → prints that the convention does not apply and exits
   0, so you can call it unconditionally.
 
@@ -97,12 +116,19 @@ The JSON shape above is still documented because you will READ claims — yours,
 siblings', and the ones the digest reports. Reading them is normal; writing them
 by hand is not.
 
-**Releasing means DELETING the file.** Do not stamp `released_at` or
-`status: done` and leave it behind. A claim file is a live-work marker, not a
-log — the record of what you did belongs in the PR, the ledger, or your own
-notes. A finished claim left on disk keeps showing up as live work: it hides
-the item from sweeps that skip claimed work, and it looks abandoned to anyone
-reading the directory.
+**Releasing still means DELETING the file.** `release` writes your full note to
+`claims/ledger.ndjson` automatically before it deletes, so deleting costs you
+nothing — the record survives. Do not stamp `released_at` or `status: done`
+and leave the claim file behind instead: a claim file is a live-work marker,
+not a log, and a finished claim left on disk keeps showing up as live work —
+it hides the item from sweeps that skip claimed work and looks abandoned to
+anyone reading the directory. If you're stopping without finishing, that's
+`park`, not a note left on a claim you keep — see states above.
+
+`claims/ledger.ndjson` is append-only history: one JSON line per `released`,
+`parked`, or `cleared_merged` event, each carrying the full note at that
+moment. Read it ad hoc with `jq` (e.g. `jq 'select(.slug=="acme-pr-733")' claims/ledger.ndjson`
+for one slug's history) — never edit it, and it never shows up in `list`.
 
 **One exception to "only your own": work that is provably complete.** If the
 PR the claim names has MERGED, delete the claim whatever the owner says. The

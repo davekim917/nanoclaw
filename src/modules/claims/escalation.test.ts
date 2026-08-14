@@ -5,6 +5,7 @@ import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  declaresItselfFinished,
   ESCALATION_GRACE_MS,
   escalateClaim,
   findEscalationCandidates,
@@ -164,6 +165,20 @@ describe('shouldEscalate', () => {
       for (const status of ['active', 'in_progress', 'blocked', '']) {
         expect(shouldEscalate({ ...stale, status }, NOW)).toBe(true);
       }
+    });
+  });
+
+  describe('a parked claim never escalates', () => {
+    it('false when stale past grace, case/padding-insensitive', () => {
+      for (const status of ['parked', 'Parked', ' PARKED ']) {
+        expect(shouldEscalate({ claimed_at: iso(8 * HOUR_MS), ttl_hours: 4, status }, NOW)).toBe(false);
+      }
+    });
+
+    it('is not treated as finished by declaresItselfFinished', () => {
+      // Parked is neither the abandonment state (escalation) nor the
+      // completion state (board filter) — it must not collapse into either.
+      expect(declaresItselfFinished({ status: 'parked' })).toBe(false);
     });
   });
 });

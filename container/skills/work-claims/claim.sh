@@ -24,6 +24,7 @@ usage() {
 usage:
   claim.sh check   <slug>
   claim.sh take    <slug> <ttl_hours> <note...>   [--takeover]
+  claim.sh park    <slug> <note...>
   claim.sh release <slug> [--merged-pr <n>]
   claim.sh list
 
@@ -46,15 +47,42 @@ file_for() { printf '%s/%s.json' "$CLAIMS_DIR" "$1"; }
 
 me() { printf '%s' "${NANOCLAW_ASSISTANT_NAME:-unknown}"; }
 
-# Echoes: state<TAB>owner<TAB>note   where state is unclaimed|yours|live|stale
+# Appends one append-only ledger line, flock-guarded so a note larger than an
+# atomic write can never interleave with a concurrent append. Aborts (exit 2)
+# on any failure — callers append BEFORE the mutation that would otherwise
+# destroy the record, so a failed append leaves the claim file untouched.
+ledger_append() {
+  local event="$1" slug="$2" owner="$3" note="$4" claimed_at="$5" thread_id="$6" pr="$7"
+  local lock="$CLAIMS_DIR/.ledger.lock" now line
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  line="$(jq -nc \
+    --arg event "$event" --arg slug "$slug" --arg owner "$owner" \
+    --arg by "$(me)" --arg at "$now" \
+    --arg claimed_at "$claimed_at" --arg thread_id "$thread_id" \
+    --arg note "$note" --argjson pr "${pr:-null}" \
+    '{event:$event, slug:$slug, owner:$owner, by:$by, at:$at}
+     + (if $claimed_at == "" then {} else {claimed_at:$claimed_at} end)
+     + (if $thread_id == "" then {} else {thread_id:$thread_id} end)
+     + (if $pr == null then {} else {pr:$pr} end)
+     + {note:$note}')" || die "failed to build ledger entry for $slug — claim left in place"
+  ( flock -x 200 && printf '%s\n' "$line" >> "$CLAIMS_DIR/ledger.ndjson" ) 200>"$lock" \
+    || die "failed to append ledger entry for $slug — claim left in place"
+}
+
+# Echoes: state<TAB>owner<TAB>note   where state is unclaimed|yours|live|stale|parked
 inspect() {
-  local f="$1" owner claimed_at ttl expires now note
+  local f="$1" owner claimed_at ttl expires now note status
   if [ ! -f "$f" ]; then printf 'unclaimed\t\t\n'; return; fi
 
   owner="$(jq -r '.owner // "unknown"' "$f")"
   note="$(jq -r '.note // ""' "$f")"
+  status="$(jq -r '.status // ""' "$f")"
   claimed_at="$(jq -r '.claimed_at // empty' "$f")"
   ttl="$(jq -r '.ttl_hours // empty' "$f")"
+
+  # A parked claim is a declared third state, not a timestamp — it wins over
+  # TTL classification even if claimed_at/ttl_hours are still on the file.
+  if [ "$status" = "parked" ]; then printf 'parked\t%s\t%s\n' "$owner" "$note"; return; fi
 
   # A claim with no parseable expiry is treated as stale, never as an
   # indefinite lock — an unreadable claim must not wedge a slug forever.
@@ -83,6 +111,7 @@ cmd_check() {
     yours)     echo "YOURS — $note"; exit 0 ;;
     stale)     echo "STALE — was $owner: $note — you may take it over"; exit 0 ;;
     live)      echo "LIVE — held by $owner: $note — do not start this"; exit 3 ;;
+    parked)    echo "PARKED — was $owner: $note — free to take"; exit 0 ;;
   esac
 }
 
@@ -111,6 +140,7 @@ cmd_take() {
   fi
   [ "$state" = "live" ] && note="TAKEOVER from $owner: $note"
   [ "$state" = "stale" ] && note="took over stale claim from $owner: $note"
+  [ "$state" = "parked" ] && note="resumed parked work from $owner: $note"
 
   local tmp
   tmp="$(mktemp "$CLAIMS_DIR/.tmp.XXXXXX")"
@@ -139,10 +169,13 @@ cmd_release() {
   done
 
   require_workgroup
-  local f owner
+  local f owner note claimed_at thread_id
   f="$(file_for "$slug")"
   [ -f "$f" ] || { echo "no claim at $slug — nothing to release"; exit 0; }
   owner="$(jq -r '.owner // "unknown"' "$f")"
+  note="$(jq -r '.note // ""' "$f")"
+  claimed_at="$(jq -r '.claimed_at // empty' "$f")"
+  thread_id="$(jq -r '.thread_id // empty' "$f")"
 
   if [ "$owner" != "$(me)" ]; then
     [ -n "$merged_pr" ] || {
@@ -159,10 +192,64 @@ cmd_release() {
       exit 3
     }
     echo "PR #$merged_pr verified MERGED — clearing $owner's completed claim"
+    ledger_append cleared_merged "$slug" "$owner" "$note" "$claimed_at" "$thread_id" "$merged_pr"
+  else
+    ledger_append released "$slug" "$owner" "$note" "$claimed_at" "$thread_id" ""
   fi
 
-  rm -f "$f"   # releasing means DELETING; a claim file is a marker, not a log
+  # releasing still means DELETING the file — the note above just went to
+  # claims/ledger.ndjson first, so deleting costs nothing.
+  rm -f "$f"
   echo "released $slug"
+}
+
+cmd_park() {
+  local slug="${1:-}"; shift || usage
+  [ -n "$slug" ] || usage
+  local note="$*"
+  [ -n "$note" ] || die "a note is required — say what state the work is in and what's needed"
+
+  require_workgroup
+  local f state owner
+  f="$(file_for "$slug")"
+  IFS=$'\t' read -r state owner _ <<<"$(inspect "$f")"
+
+  if [ -f "$f" ] && [ "$owner" != "$(me)" ]; then
+    if [ "$state" = "live" ]; then
+      echo "REFUSED — $slug is held live by $owner. Park only your own claim." >&2
+      exit 3
+    fi
+    echo "REFUSED — $slug is $state, held by $owner. Take it over first, then park." >&2
+    exit 3
+  fi
+
+  local claimed_at ttl_hours thread_id
+  if [ -f "$f" ]; then
+    claimed_at="$(jq -r '.claimed_at // empty' "$f")"
+    ttl_hours="$(jq -r '.ttl_hours // empty' "$f")"
+    thread_id="$(jq -r '.thread_id // empty' "$f")"
+  else
+    claimed_at="" ttl_hours="" thread_id=""
+  fi
+  [ -n "$claimed_at" ] || claimed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  [ -n "$thread_id" ] || thread_id="${NANOCLAW_THREAD_ID:-}"
+  local owner_out="${owner:-$(me)}"
+
+  local tmp
+  tmp="$(mktemp "$CLAIMS_DIR/.tmp.XXXXXX")"
+  jq -n --arg owner "$owner_out" --arg sid "$(hostname)" \
+        --arg tid "$thread_id" --arg claimed_at "$claimed_at" \
+        --arg parked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson ttl "${ttl_hours:-null}" --arg note "$note" \
+     '{owner:$owner, session_id:$sid, claimed_at:$claimed_at, status:"parked",
+       parked_at:$parked_at, note:$note}
+      + (if $ttl == null then {} else {ttl_hours:$ttl} end)
+      + (if $tid == "" then {} else {thread_id:$tid} end)' > "$tmp"
+
+  ledger_append parked "$slug" "$owner_out" "$note" "$claimed_at" "$thread_id" ""
+  mv "$tmp" "$f"   # same-directory rename: no reader ever sees a partial file
+
+  echo "parked $slug"
 }
 
 cmd_list() {
@@ -181,6 +268,7 @@ cmd_list() {
 case "${1:-}" in
   check)   shift; cmd_check "$@" ;;
   take)    shift; cmd_take "$@" ;;
+  park)    shift; cmd_park "$@" ;;
   release) shift; cmd_release "$@" ;;
   list)    shift; cmd_list "$@" ;;
   *)       usage ;;
