@@ -179,6 +179,35 @@ describe('canonical adoption', () => {
     expect(git(canonical, 'status', '--porcelain=v1', '--untracked-files=all')).toBe('');
   });
 
+  it('resolves a missing origin/HEAD from unambiguous local evidence', async () => {
+    const legacy = legacyCheckout('sip-true-demo-stage');
+    // A checkout built by init + remote add never gets one. Delete the symref
+    // itself — `update-ref -d` would delete the branch it points at instead.
+    git(legacy, 'symbolic-ref', '--delete', 'refs/remotes/origin/HEAD');
+    git(legacy, 'config', 'branch.develop.remote', 'origin');
+    git(legacy, 'config', 'branch.develop.merge', 'refs/heads/develop');
+
+    const [checkout] = planRepositoryActivation(WG, root).adopt;
+    const result = await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
+
+    const canonical = canonicalRepoDir(WG, 'sip-true-demo-stage', root);
+    expect(git(canonical, 'symbolic-ref', 'refs/remotes/origin/HEAD')).toBe('refs/remotes/origin/develop');
+    expect(result.detachedAt).toBe(git(canonical, 'rev-parse', 'refs/remotes/origin/develop'));
+  });
+
+  it('leaves origin/HEAD unset rather than guessing when candidates are ambiguous', async () => {
+    const legacy = legacyCheckout('XZO');
+    git(legacy, 'symbolic-ref', '--delete', 'refs/remotes/origin/HEAD');
+    // Two plausible defaults and no configured upstream — never pick one.
+    git(legacy, 'update-ref', 'refs/remotes/origin/main', git(legacy, 'rev-parse', 'HEAD'));
+
+    const [checkout] = planRepositoryActivation(WG, root).adopt;
+    await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
+
+    const canonical = canonicalRepoDir(WG, 'XZO', root);
+    expect(() => git(canonical, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD')).toThrow();
+  });
+
   it('records a tracked deletion that reset --hard will resurrect', async () => {
     const legacy = legacyCheckout('dbt');
     fs.rmSync(path.join(legacy, 'file-1.txt'));

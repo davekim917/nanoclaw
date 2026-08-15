@@ -136,6 +136,39 @@ function inProgressOperation(cwd: string): string | null {
   return null;
 }
 
+/**
+ * Resolve `origin/HEAD` locally, without network and without assuming `main`.
+ *
+ * A checkout made by `git init` + `git remote add` never gets an origin/HEAD,
+ * and both create_worktree and refreshCanonicalFromLocalRefs hard-require it —
+ * so a canonical adopted without one mounts fine but can never seed a fresh
+ * topic worktree or report Graphify freshness. Only unambiguous evidence
+ * already in the repository is used: the configured upstream of the current
+ * branch, or a sole remote-tracking branch. Anything ambiguous is left unset
+ * for an operator to resolve deliberately.
+ */
+function resolveOriginHead(cwd: string): string | null {
+  const resolves = (ref: string): boolean =>
+    tryGit(cwd, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], 30_000) !== null;
+
+  // An existing origin/HEAD can dangle — `git update-ref -d refs/remotes/origin/HEAD`
+  // deletes the branch it points at, not the symref — so verify before trusting it.
+  const existing = tryGit(cwd, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 30_000);
+  if (existing?.startsWith('refs/remotes/origin/') && resolves(existing)) return existing;
+
+  const upstream = tryGit(cwd, ['rev-parse', '--symbolic-full-name', '@{upstream}'], 30_000);
+  let candidate = upstream?.startsWith('refs/remotes/origin/') && resolves(upstream) ? upstream : null;
+  if (!candidate) {
+    const remotes = (tryGit(cwd, ['for-each-ref', '--format=%(refname)', 'refs/remotes/origin'], 60_000) ?? '')
+      .split('\n')
+      .filter((ref) => ref && ref !== 'refs/remotes/origin/HEAD' && resolves(ref));
+    if (remotes.length === 1) candidate = remotes[0]!;
+  }
+  if (!candidate) return null;
+  if (tryGit(cwd, ['symbolic-ref', 'refs/remotes/origin/HEAD', candidate], 30_000) === null) return null;
+  return candidate;
+}
+
 /** Every worktree path carrying state that a fresh clone would not reproduce. */
 function dirtyWorktreePaths(cwd: string): string[] {
   return [
@@ -441,8 +474,17 @@ export async function activateCanonicalRepository(input: {
       // 3. Detach at the fetched remote default. origin/HEAD is authoritative;
       //    `main` is never assumed. Local branches are left untouched so a
       //    topic worktree can still check them out.
-      const remoteHead = tryGit(checkout.path, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD'], 30_000);
-      const target = remoteHead ?? git(checkout.path, ['rev-parse', '--verify', 'HEAD^{commit}'], 30_000);
+      const remoteHead = resolveOriginHead(checkout.path);
+      if (!remoteHead) {
+        log.warn('Canonical has no resolvable origin/HEAD; fresh topic worktrees and Graphify refresh will refuse', {
+          workgroupId,
+          repo: checkout.repo,
+        });
+      }
+      // Always detach onto a resolved object id. A full ref path is ambiguous
+      // with a pathspec and `checkout --detach refs/remotes/origin/x` is
+      // rejected outright when the ref does not also resolve as a rev.
+      const target = git(checkout.path, ['rev-parse', '--verify', `${remoteHead ?? 'HEAD'}^{commit}`], 30_000);
       if (checkout.dirtyPaths.length > 0) {
         // Preserved above; the canonical must present a clean tree.
         //
