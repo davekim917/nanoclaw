@@ -102,6 +102,32 @@ describe('legacy checkout classification', () => {
     expect(skipped?.reason).toMatch(/must be pushed or adopted manually/);
   });
 
+  it('plans without writing anything, including for a checkout missing origin/HEAD', () => {
+    // Adoption repairs a missing origin/HEAD by writing a symbolic-ref. Planning
+    // must never reach that path: an operator inspects a plan before approving
+    // it, and a survey that mutates is not a survey.
+    const clean = legacyCheckout('XZO');
+    const needsRepair = legacyCheckout('sip-true');
+    git(needsRepair, 'symbolic-ref', '--delete', 'refs/remotes/origin/HEAD');
+
+    const snapshot = () => {
+      const seen: string[] = [];
+      for (const dir of [clean, needsRepair]) {
+        for (const entry of fs.readdirSync(path.join(dir, '.git'), { withFileTypes: true }).sort()) {
+          const stat = fs.lstatSync(path.join(dir, '.git', entry.name));
+          seen.push(`${dir}/${entry.name}:${stat.mtimeMs}:${stat.size}`);
+        }
+      }
+      return seen.join('\n');
+    };
+
+    const before = snapshot();
+    planRepositoryActivation(WG, root);
+
+    expect(snapshot()).toBe(before);
+    expect(() => git(needsRepair, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD')).toThrow();
+  });
+
   it('never treats a linked worktree or a non-github checkout as a canonical', () => {
     const canonicalSource = legacyCheckout('XZO');
     const linked = path.join(workgroupLegacyRoot(WG, root), 'XZO-pr688');
