@@ -179,6 +179,40 @@ describe('canonical adoption', () => {
     expect(git(canonical, 'status', '--porcelain=v1', '--untracked-files=all')).toBe('');
   });
 
+  it('records a tracked deletion that reset --hard will resurrect', async () => {
+    const legacy = legacyCheckout('dbt');
+    fs.rmSync(path.join(legacy, 'file-1.txt'));
+
+    const [checkout] = planRepositoryActivation(WG, root).adopt;
+    expect(checkout!.dirtyPaths).toContain('file-1.txt');
+    const result = await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
+
+    const manifest = JSON.parse(fs.readFileSync(path.join(result.preservedStatePath!, 'MANIFEST.json'), 'utf8'));
+    expect(manifest.revertedDeletions).toEqual(['file-1.txt']);
+    expect(manifest.copied).toEqual([]);
+    // The file is back, which is exactly why the deletion needed recording.
+    expect(fs.existsSync(path.join(canonicalRepoDir(WG, 'dbt', root), 'file-1.txt'))).toBe(true);
+  });
+
+  it('refuses a checkout with a merge in progress rather than reset --hard over it', async () => {
+    const legacy = legacyCheckout('XZO');
+    git(legacy, 'checkout', '-q', '-b', 'side', 'HEAD~1');
+    fs.writeFileSync(path.join(legacy, 'file-1.txt'), 'conflicting\n');
+    git(legacy, 'add', '-A');
+    git(legacy, 'commit', '-q', '-m', 'conflicting change');
+    // Leaves MERGE_HEAD and an unmerged index behind.
+    try {
+      git(legacy, 'merge', 'develop');
+    } catch {
+      // Expected: the merge conflicts.
+    }
+
+    const plan = planRepositoryActivation(WG, root);
+
+    expect(plan.adopt).toEqual([]);
+    expect(plan.skip.find((entry) => entry.repo === 'XZO')?.reason).toMatch(/in progress; finish or abort it/);
+  });
+
   it('carries local-only commits and unpushed branches across the move', async () => {
     const legacy = legacyCheckout('dbt');
     git(legacy, 'checkout', '-q', '-b', 'feat/unpushed');
@@ -226,6 +260,35 @@ describe('canonical adoption', () => {
     expect(result.prunedWorktrees).toBe(1);
     const canonical = canonicalRepoDir(WG, 'XZO', root);
     expect(git(canonical, 'worktree', 'list', '--porcelain')).not.toContain('stale-worktree');
+  });
+
+  it('replays its own completed move instead of reporting a conflict', async () => {
+    legacyCheckout('XZO');
+    const [checkout] = planRepositoryActivation(WG, root).adopt;
+    const first = await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
+
+    // Same input again, exactly as a retry after a crash between the rename and
+    // the caller recording success.
+    const replay = await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
+
+    expect(replay.canonicalPath).toBe(first.canonicalPath);
+    expect(replay.detachedAt).toBe(first.detachedAt);
+  });
+
+  it('still refuses when a foreign repository occupies the canonical path', async () => {
+    legacyCheckout('XZO');
+    const [checkout] = planRepositoryActivation(WG, root).adopt;
+    // A different repository already sitting there must never be adopted as
+    // this one just because the path matches.
+    const impostor = canonicalRepoDir(WG, 'XZO', root);
+    fs.mkdirSync(impostor, { recursive: true });
+    git(impostor, 'init', '-q', '-b', 'main');
+    git(impostor, 'remote', 'add', 'origin', 'https://github.com/Example/other.git');
+
+    await expect(activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root })).rejects.toThrow(
+      /canonical already exists/,
+    );
+    expect(fs.existsSync(path.join(workgroupLegacyRoot(WG, root), 'XZO'))).toBe(true);
   });
 
   it('refuses to overwrite an existing canonical and leaves the legacy checkout in place', async () => {

@@ -109,6 +109,33 @@ function gitPaths(cwd: string, args: string[], timeout = 300_000): string[] {
   return raw.split('\0').filter(Boolean);
 }
 
+/**
+ * Name any half-finished Git operation holding state in `.git` rather than in
+ * the working tree.
+ *
+ * `git reset --hard` silently discards all of it — conflict resolutions, the
+ * remaining pick list of a rebase, a cherry-pick in flight — and none of it is
+ * covered by the working-tree preservation pass. Adoption refuses instead.
+ */
+function inProgressOperation(cwd: string): string | null {
+  const gitDir = tryGit(cwd, ['rev-parse', '--absolute-git-dir'], 30_000);
+  if (!gitDir) return null;
+  const markers: Array<[string, string]> = [
+    ['MERGE_HEAD', 'a merge'],
+    ['rebase-merge', 'a rebase'],
+    ['rebase-apply', 'a rebase or am'],
+    ['CHERRY_PICK_HEAD', 'a cherry-pick'],
+    ['REVERT_HEAD', 'a revert'],
+    ['BISECT_LOG', 'a bisect'],
+  ];
+  for (const [marker, label] of markers) {
+    if (fs.existsSync(path.join(gitDir, marker))) return label;
+  }
+  // An unmerged index can outlive the marker files after a partial cleanup.
+  if (gitPaths(cwd, ['ls-files', '--unmerged', '-z'], 120_000).length > 0) return 'an unresolved merge conflict';
+  return null;
+}
+
 /** Every worktree path carrying state that a fresh clone would not reproduce. */
 function dirtyWorktreePaths(cwd: string): string[] {
   return [
@@ -186,6 +213,10 @@ function classify(repo: string, checkoutPath: string): LegacyCheckout {
   const detail = { ...base, origin, head, detached, localOnlyCommits, unpushedBranches, dirtyPaths };
   if (!rawOrigin) return { ...detail, reason: 'no origin remote; publish it deliberately before adopting' };
   if (!origin) return { ...detail, reason: `origin is not an HTTPS github.com URL: ${rawOrigin}` };
+  const inProgress = inProgressOperation(checkoutPath);
+  if (inProgress) {
+    return { ...detail, reason: `${inProgress} is in progress; finish or abort it before adopting this checkout` };
+  }
   return { ...detail, reusable: true };
 }
 
@@ -278,13 +309,18 @@ function fsyncDir(target: string): void {
  */
 function preserveDirtyState(checkout: LegacyCheckout, destination: string): number {
   let copied = 0;
+  // A tracked-but-deleted path has no bytes to copy, yet `reset --hard` will
+  // resurrect the file and the deletion is a real change. Record it so the
+  // manifest, not the operator's memory, is the account of what was reverted.
+  const reverted: string[] = [];
   for (const relative of checkout.dirtyPaths) {
     const source = path.join(checkout.path, relative);
     let stat: fs.Stats;
     try {
       stat = fs.lstatSync(source);
     } catch {
-      continue; // A deletion has no bytes to preserve.
+      reverted.push(relative);
+      continue;
     }
     const target = path.join(destination, relative);
     if (!path.resolve(target).startsWith(`${path.resolve(destination)}${path.sep}`)) {
@@ -301,6 +337,26 @@ function preserveDirtyState(checkout: LegacyCheckout, destination: string): numb
     }
     copied += 1;
   }
+
+  fs.writeFileSync(
+    path.join(destination, 'MANIFEST.json'),
+    `${JSON.stringify(
+      {
+        version: 1,
+        repo: checkout.repo,
+        sourcePath: checkout.path,
+        head: checkout.head,
+        detached: checkout.detached,
+        copied: checkout.dirtyPaths.filter((entry) => !reverted.includes(entry)),
+        // Restored by `reset --hard`; listed here because the deletion itself
+        // was a change and nothing else records it.
+        revertedDeletions: reverted,
+      },
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  );
   return copied;
 }
 
@@ -328,12 +384,31 @@ export async function activateCanonicalRepository(input: {
     workgroupId,
     checkout.repo,
     async () => {
-      if (fs.existsSync(canonical)) {
-        throw new Error(`canonical already exists and was left untouched: ${canonical}`);
-      }
       const existingPin = readOriginPin(workgroupId, checkout.repo, dataDir);
       if (existingPin && (existingPin.kind === 'local-only' || existingPin.origin !== origin)) {
         throw new Error(`origin pin conflict for ${workgroupId}/${checkout.repo}`);
+      }
+      if (fs.existsSync(canonical)) {
+        // A crash between the rename and this function returning leaves the
+        // move already done. Replaying must recognize its own completed work
+        // instead of reporting a conflict during an incident — but only when
+        // the canonical really is this repository and the source is gone.
+        const sameOrigin = normalizeGitHubOrigin(
+          tryGit(canonical, ['config', '--get', 'remote.origin.url'], 30_000) ?? '',
+        );
+        if (existingPin && sameOrigin === origin && !fs.existsSync(checkout.path)) {
+          return {
+            repo: checkout.repo,
+            canonicalPath: canonical,
+            origin,
+            preservedStatePath: null,
+            preservedFileCount: 0,
+            prunedWorktrees: 0,
+            detachedAt: git(canonical, ['rev-parse', 'HEAD'], 30_000),
+            residue: dirtyWorktreePaths(canonical),
+          };
+        }
+        throw new Error(`canonical already exists and was left untouched: ${canonical}`);
       }
 
       // 1. Preserve irreplaceable working state before anything is reset.
