@@ -24,6 +24,7 @@ import {
   normalizedCredentialFreeGithubOrigin,
   normalizedGithubRepositoryIdentity,
 } from './repository-migration-identity.js';
+import type { RepositoryMigrationPrestageCache } from './repository-migration-prestage.js';
 
 export interface LegacyCheckoutCandidate {
   workgroupId: string;
@@ -674,7 +675,12 @@ export function readLegacyCheckoutOrigin(
   }
 }
 
-function inventoryFiles(checkoutPath: string, gitDir: string, env?: NodeJS.ProcessEnv): FileInventoryEntry[] {
+function inventoryFiles(
+  checkoutPath: string,
+  gitDir: string,
+  env?: NodeJS.ProcessEnv,
+  fileHashCache?: RepositoryMigrationPrestageCache,
+): FileInventoryEntry[] {
   const raw = gitRaw(
     ['--git-dir', gitDir, '--work-tree', checkoutPath, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
     { env },
@@ -710,28 +716,55 @@ function inventoryFiles(checkoutPath: string, gitDir: string, env?: NodeJS.Proce
       throw error;
     }
     if (stat.isSymbolicLink()) {
-      const target = fs.readlinkSync(absolute, { encoding: 'buffer' });
+      const cached = fileHashCache?.hash(absolute, 'symlink');
+      const target = cached
+        ? Buffer.from(cached.symlinkTargetBase64!, 'base64')
+        : fs.readlinkSync(absolute, { encoding: 'buffer' });
       const targetText = target.toString('utf8');
       entries.push({
         path: relative,
         type: 'symlink',
-        mode: stat.mode & 0o7777,
-        size: target.length,
-        sha256: sha256(target),
+        mode: cached?.mode ?? stat.mode & 0o7777,
+        size: cached?.size ?? target.length,
+        sha256: cached?.sha256 ?? sha256(target),
         symlinkTargetBase64: target.toString('base64'),
         ...(Buffer.from(targetText, 'utf8').equals(target) ? { symlinkTarget: targetText } : {}),
       });
     } else if (stat.isFile()) {
+      const cached = fileHashCache?.hash(absolute, 'file');
       entries.push({
         path: relative,
         type: 'file',
-        mode: stat.mode & 0o7777,
-        size: stat.size,
-        sha256: sha256(fs.readFileSync(absolute)),
+        mode: cached?.mode ?? stat.mode & 0o7777,
+        size: cached?.size ?? stat.size,
+        sha256: cached?.sha256 ?? sha256(fs.readFileSync(absolute)),
       });
     }
   }
   return entries;
+}
+
+/**
+ * Populate only the advisory content-hash cache while the legacy runtime is
+ * still live. This deliberately does not capture or persist HEAD/index/status,
+ * create refs, write a manifest, or publish any repository state. The offline
+ * manifest capture still takes all of those snapshots afresh under quiescence.
+ */
+export function prestageLegacyCheckoutFileHashes(
+  candidate: LegacyCheckoutCandidate,
+  fileHashCache: RepositoryMigrationPrestageCache,
+  context?: LegacyGitResolutionContext,
+): { files: number; reusedFiles: number; rehashedFiles: number } {
+  const checkoutPath = fs.realpathSync(candidate.checkoutPath);
+  const { gitDir } = resolveLegacyGitAdmin({ ...candidate, checkoutPath }, context);
+  const before = fileHashCache.stats();
+  const files = inventoryFiles(checkoutPath, gitDir, undefined, fileHashCache);
+  const after = fileHashCache.stats();
+  return {
+    files: files.length,
+    reusedFiles: after.reusedEntries - before.reusedEntries,
+    rehashedFiles: after.rehashedEntries - before.rehashedEntries,
+  };
 }
 
 interface OrphanRecovery {
@@ -1192,6 +1225,7 @@ export function captureCheckout(
     operatorRecovery?: ReviewedCheckoutRecoveryDecision;
     preferMetadataSelection?: boolean;
     skipOperatorEvidenceValidation?: boolean;
+    fileHashCache?: RepositoryMigrationPrestageCache;
   } = {},
 ): CheckoutCapture {
   const checkoutPath = fs.realpathSync(candidate.checkoutPath);
@@ -1305,7 +1339,7 @@ export function captureCheckout(
       '-z',
       '--untracked-files=all',
     ]);
-  const files = recovered?.files ?? inventoryFiles(checkoutPath, gitDir);
+  const files = recovered?.files ?? inventoryFiles(checkoutPath, gitDir, undefined, options.fileHashCache);
   const capture: CheckoutCapture = {
     id: captureId(candidate),
     workgroupId: candidate.workgroupId,
@@ -1673,6 +1707,8 @@ export function createRepositoryMigrationManifest(input: {
   availableBytes?: number;
   resolutionContext?: LegacyGitResolutionContext;
   recoveryDecisions?: ReviewedCheckoutRecoveryDecision[];
+  /** Optional advisory cache populated before the fleet is stopped. */
+  fileHashCache?: RepositoryMigrationPrestageCache;
   onCaptureProgress?: (progress: {
     phase: 'starting' | 'completed';
     current: number;
@@ -1724,6 +1760,7 @@ export function createRepositoryMigrationManifest(input: {
       const capture = captureCheckout(candidate, input.resolutionContext, {
         requireOriginalAdmin: true,
         ...(decision ? { operatorRecovery: decision } : {}),
+        ...(input.fileHashCache ? { fileHashCache: input.fileHashCache } : {}),
       });
       if (decision?.action === 'archive-visible-state') {
         capture.archivedLegacy = { reason: 'operator-reviewed-checkout' };
@@ -1733,7 +1770,10 @@ export function createRepositoryMigrationManifest(input: {
       let detail = error instanceof Error ? error.message : String(error);
       if (/explicit operator recovery decision/.test(detail)) {
         try {
-          const diagnostic = captureCheckout(candidate, input.resolutionContext, { preferMetadataSelection: true });
+          const diagnostic = captureCheckout(candidate, input.resolutionContext, {
+            preferMetadataSelection: true,
+            ...(input.fileHashCache ? { fileHashCache: input.fileHashCache } : {}),
+          });
           if (diagnostic.recoveredMissingAdmin && diagnostic.head && diagnostic.branch && diagnostic.gitPointer) {
             detail +=
               `\nreviewed recovery proposal (action requires operator review): ` +

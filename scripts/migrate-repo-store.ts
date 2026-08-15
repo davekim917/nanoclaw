@@ -23,6 +23,7 @@ import {
   executeRepositoryMigration,
   manifestPath,
   mergeLegacyCheckoutProvenance,
+  prestageLegacyCheckoutFileHashes,
   readLegacyCheckoutOrigin,
   readLegacyGitDirOrigin,
   repositoryMigrationPath,
@@ -33,6 +34,7 @@ import {
   type LegacyGitResolutionContext,
   type RepositoryMigrationManifest,
 } from '../src/repository-migration.js';
+import { loadRepositoryMigrationPrestageCache } from '../src/repository-migration-prestage.js';
 import {
   canonicalRepoDir,
   readOriginPin,
@@ -83,6 +85,7 @@ import { completedRepositoryQuiescencePaths } from '../src/repository-migration-
 
 interface Args {
   execute: boolean;
+  prestage: boolean;
   quiesced: boolean;
   rollbackRun?: string;
   workgroup?: string;
@@ -110,10 +113,11 @@ export interface AgentGroupRow {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { execute: false, quiesced: false };
+  const args: Args = { execute: false, prestage: false, quiesced: false };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === '--execute') args.execute = true;
+    else if (value === '--prestage') args.prestage = true;
     else if (value === '--quiesced') args.quiesced = true;
     else if (value === '--rollback-run') args.rollbackRun = argv[++index];
     else if (value === '--all') args.workgroup = undefined;
@@ -126,6 +130,8 @@ function parseArgs(argv: string[]): Args {
     else throw new Error(`unknown argument: ${value}`);
   }
   if (args.execute && !args.quiesced) throw new Error('--execute requires --quiesced');
+  if (args.prestage && args.execute) throw new Error('--prestage and --execute are mutually exclusive');
+  if (args.prestage && args.rollbackRun) throw new Error('--prestage and --rollback-run are mutually exclusive');
   if (args.rollbackRun && !args.quiesced) throw new Error('--rollback-run requires --quiesced');
   if (args.rollbackRun && args.execute) throw new Error('--rollback-run and --execute are mutually exclusive');
   if (
@@ -135,6 +141,15 @@ function parseArgs(argv: string[]): Args {
     throw new Error('--rollback-run cannot be combined with inventory or recovery-selection arguments');
   }
   return args;
+}
+
+/**
+ * This is deliberately outside any active migration run. It is an advisory
+ * host-only byte-hash cache, never a rescue, origin pin, manifest, or a
+ * published canonical. A subsequent offline run revalidates every entry.
+ */
+export function repositoryMigrationPrestageCachePath(dataDir: string = DATA_DIR): string {
+  return path.join(dataDir, 'repository-migration-prestage', 'file-hashes-v1.json');
 }
 
 function atomicJson(file: string, value: unknown): void {
@@ -1063,6 +1078,61 @@ function preManifestQuiescencePaths(
   return minimalQuiescenceRoots([...paths]);
 }
 
+function prestageRepositoryMigrationFileHashes(
+  grouped: ReadonlyMap<string, readonly LegacyCheckoutCandidate[]>,
+  bareStores: ReadonlyMap<string, readonly string[]>,
+): void {
+  const cache = loadRepositoryMigrationPrestageCache(repositoryMigrationPrestageCachePath());
+  let checkouts = 0;
+  let files = 0;
+  let skipped = 0;
+  for (const [key, candidates] of [...grouped].sort(([left], [right]) => left.localeCompare(right))) {
+    const [workgroupId, repo] = key.split('\0');
+    const context = createLegacyGitResolutionContext([
+      ...candidates.flatMap((candidate) => candidate.candidateCommonGitDirs ?? []),
+      ...(bareStores.get(key) ?? []),
+    ]);
+    for (const candidate of [...candidates].sort((left, right) =>
+      left.checkoutPath.localeCompare(right.checkoutPath),
+    )) {
+      try {
+        const result = prestageLegacyCheckoutFileHashes(candidate, cache, context);
+        checkouts += 1;
+        files += result.files;
+        console.error(
+          `Prestaged ${workgroupId}/${repo}: ${candidate.checkoutPath} ` +
+            `(${result.files} files; ${result.reusedFiles} reused, ${result.rehashedFiles} rehashed)`,
+        );
+      } catch (error) {
+        // This cache is an outage-reduction optimization, not inventory
+        // evidence. Missing/collided admins and files changing under the live
+        // runtime are left for the authoritative quiescent capture to decide.
+        skipped += 1;
+        console.error(
+          `Skipped prestage for ${workgroupId}/${repo}: ${candidate.checkoutPath}: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+  // Cache entries absent from this live path inventory must not survive into
+  // the offline run; pruning keeps the bounded envelope representative of the
+  // current prestage rather than accumulating stale server history.
+  cache.flush({ pruneUntouched: true });
+  const stats = cache.stats();
+  console.log(
+    `PRESTAGE COMPLETE: ${checkouts} checkout(s), ${files} visible file(s), ` +
+      `${stats.rehashedEntries} newly hashed (${(stats.rehashedBytes / 2 ** 30).toFixed(2)} GiB), ` +
+      `${stats.reusedEntries} reused (${(stats.reusedBytes / 2 ** 30).toFixed(2)} GiB), ` +
+      `${stats.prunedEntries} stale entries pruned, ${skipped} skipped.`,
+  );
+  console.log(
+    'No migration manifests, rescue refs, origin pins, canonical repositories, or topic worktrees were created. ' +
+      'The offline run will still freshly capture HEAD, branch, raw index, status, and path inventory; ' +
+      'immutable Git object import/copy reads remain on the outage path.',
+  );
+}
+
 function controlPlaneBackupSources(): string[] {
   return [
     path.join(DATA_DIR, 'v2.db'),
@@ -1944,6 +2014,14 @@ async function main(): Promise<void> {
   if (grouped.size === 0) throw new Error('no legacy physical repository checkouts discovered');
 
   const preManifestPaths = preManifestQuiescencePaths(groups, grouped, bareStores);
+  if (args.prestage) {
+    prestageRepositoryMigrationFileHashes(grouped, bareStores);
+    return;
+  }
+  // Cache reads are advisory only. This call never writes: only --prestage
+  // persists hashes, so an ordinary dry run remains read-only. Validate its
+  // host-only path before taking the fleet offline.
+  const fileHashCache = loadRepositoryMigrationPrestageCache(repositoryMigrationPrestageCachePath());
   if (args.execute) assertFleetQuiescent(preManifestPaths);
 
   let manifests: RepositoryMigrationManifest[] = [];
@@ -1995,6 +2073,7 @@ async function main(): Promise<void> {
           objectStores: bareStores.get(key),
           runId: serverRunId,
           resolutionContext: originResolution,
+          fileHashCache,
           recoveryDecisions: candidates
             .map((candidate) => checkoutRecoveryByPath.get(path.resolve(candidate.checkoutPath)))
             .filter((decision): decision is NonNullable<typeof decision> => {
@@ -2057,6 +2136,16 @@ async function main(): Promise<void> {
   );
   console.log(
     `Control-plane backup allowance: ${(aggregateCapacity.controlPlaneBackupBytes / 2 ** 20).toFixed(2)} MiB`,
+  );
+  const prestageStats = fileHashCache.stats();
+  console.log(
+    `File-hash cache during final capture: ${prestageStats.reusedEntries} reused ` +
+      `(${(prestageStats.reusedBytes / 2 ** 30).toFixed(2)} GiB), ${prestageStats.rehashedEntries} rehashed ` +
+      `(${(prestageStats.rehashedBytes / 2 ** 30).toFixed(2)} GiB).`,
+  );
+  console.log(
+    'Remaining outage reads are fresh Git HEAD/branch/index/status/path inventory plus immutable object import/copy, ' +
+      'rescue construction, restore, and audit reads.',
   );
   for (const manifest of manifests) {
     console.log(`- ${manifest.workgroupId}/${manifest.repo}: ${manifest.captures.length} checkout(s)`);
