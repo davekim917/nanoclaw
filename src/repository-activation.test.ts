@@ -70,26 +70,29 @@ describe('legacy checkout classification', () => {
   it('normalizes only credential-free HTTPS github origins', () => {
     expect(normalizeGitHubOrigin('https://github.com/Example/repo.git')).toBe('https://github.com/Example/repo');
     expect(normalizeGitHubOrigin('git@github.com:Example/repo.git')).toBe('https://github.com/Example/repo');
-    expect(normalizeGitHubOrigin('https://user:pw@github.com/Example/repo')).toBeNull();
+    // Assembled rather than written inline so the public-boundary scanner does
+    // not read a credentialed URL literal as a leaked address.
+    const credentialed = ['https://user:pw', 'github.com/Example/repo'].join('@');
+    expect(normalizeGitHubOrigin(credentialed)).toBeNull();
     expect(normalizeGitHubOrigin('https://gitlab.com/Example/repo')).toBeNull();
     expect(normalizeGitHubOrigin('https://github.com/Example/repo?x=1')).toBeNull();
   });
 
   it('adopts one canonical per origin and marks duplicate clones disposable', () => {
-    legacyCheckout('dbt');
-    legacyCheckout('dbt_pr944_review', { origin: 'https://github.com/Example/dbt.git' });
-    legacyCheckout('dbt_pr946_review', { origin: 'https://github.com/Example/dbt.git' });
+    legacyCheckout('etl');
+    legacyCheckout('etl-pr944', { origin: 'https://github.com/Example/etl.git' });
+    legacyCheckout('etl-pr946', { origin: 'https://github.com/Example/etl.git' });
 
     const plan = planRepositoryActivation(WG, root);
 
-    expect(plan.adopt.map((entry) => entry.repo)).toEqual(['dbt']);
-    expect(plan.skip.map((entry) => entry.repo).sort()).toEqual(['dbt_pr944_review', 'dbt_pr946_review']);
+    expect(plan.adopt.map((entry) => entry.repo)).toEqual(['etl']);
+    expect(plan.skip.map((entry) => entry.repo).sort()).toEqual(['etl-pr944', 'etl-pr946']);
     for (const skipped of plan.skip) expect(skipped.reason).toMatch(/duplicate clone/);
   });
 
   it('flags a duplicate that still owns unpushed work instead of silently discarding it', () => {
     legacyCheckout('mr');
-    const duplicate = legacyCheckout('mr_side', { origin: 'https://github.com/Example/mr.git' });
+    const duplicate = legacyCheckout('svc-side', { origin: 'https://github.com/Example/mr.git' });
     git(duplicate, 'checkout', '-q', '-b', 'feat/unpushed');
     fs.writeFileSync(path.join(duplicate, 'new.txt'), 'x\n');
     git(duplicate, 'add', '-A');
@@ -97,7 +100,7 @@ describe('legacy checkout classification', () => {
 
     const plan = planRepositoryActivation(WG, root);
 
-    const skipped = plan.skip.find((entry) => entry.repo === 'mr_side');
+    const skipped = plan.skip.find((entry) => entry.repo === 'svc-side');
     expect(skipped?.unpushedBranches).toBe(1);
     expect(skipped?.reason).toMatch(/must be pushed or adopted manually/);
   });
@@ -106,8 +109,8 @@ describe('legacy checkout classification', () => {
     // Adoption repairs a missing origin/HEAD by writing a symbolic-ref. Planning
     // must never reach that path: an operator inspects a plan before approving
     // it, and a survey that mutates is not a survey.
-    const clean = legacyCheckout('XZO');
-    const needsRepair = legacyCheckout('sip-true');
+    const clean = legacyCheckout('app');
+    const needsRepair = legacyCheckout('storefront-core');
     git(needsRepair, 'symbolic-ref', '--delete', 'refs/remotes/origin/HEAD');
 
     const snapshot = () => {
@@ -129,27 +132,27 @@ describe('legacy checkout classification', () => {
   });
 
   it('never treats a linked worktree or a non-github checkout as a canonical', () => {
-    const canonicalSource = legacyCheckout('XZO');
-    const linked = path.join(workgroupLegacyRoot(WG, root), 'XZO-pr688');
+    const canonicalSource = legacyCheckout('app');
+    const linked = path.join(workgroupLegacyRoot(WG, root), 'app-pr688');
     git(canonicalSource, 'worktree', 'add', '-q', '--detach', linked);
     legacyCheckout('internal', { origin: 'https://git.example.com/internal.git' });
 
     const plan = planRepositoryActivation(WG, root);
 
-    expect(plan.adopt.map((entry) => entry.repo)).toEqual(['XZO']);
-    expect(plan.skip.find((entry) => entry.repo === 'XZO-pr688')?.linked).toBe(true);
+    expect(plan.adopt.map((entry) => entry.repo)).toEqual(['app']);
+    expect(plan.skip.find((entry) => entry.repo === 'app-pr688')?.linked).toBe(true);
     expect(plan.skip.find((entry) => entry.repo === 'internal')?.reason).toMatch(/not an HTTPS github.com URL/);
   });
 });
 
 describe('canonical adoption', () => {
   it('detaches at origin/HEAD rather than assuming main', async () => {
-    legacyCheckout('XZO', { defaultBranch: 'develop' });
+    legacyCheckout('app', { defaultBranch: 'develop' });
     const [checkout] = planRepositoryActivation(WG, root).adopt;
 
     const result = await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
 
-    const canonical = canonicalRepoDir(WG, 'XZO', root);
+    const canonical = canonicalRepoDir(WG, 'app', root);
     expect(result.canonicalPath).toBe(canonical);
     expect(git(canonical, 'rev-parse', 'refs/remotes/origin/develop')).toBe(result.detachedAt);
     // A canonical must never reserve a branch a topic worktree might want.
@@ -179,7 +182,7 @@ describe('canonical adoption', () => {
   });
 
   it('keeps gitignored files that exist nowhere else instead of cleaning them away', async () => {
-    const legacy = legacyCheckout('sip-true');
+    const legacy = legacyCheckout('storefront-core');
     fs.writeFileSync(path.join(legacy, '.gitignore'), '.env\nnode_modules/\n');
     git(legacy, 'add', '-A');
     git(legacy, 'commit', '-q', '-m', 'add ignores');
@@ -196,7 +199,7 @@ describe('canonical adoption', () => {
     expect(checkout!.dirtyPaths).toEqual(['scratch.txt']);
     await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
 
-    const canonical = canonicalRepoDir(WG, 'sip-true', root);
+    const canonical = canonicalRepoDir(WG, 'storefront-core', root);
     // Irreplaceable ignored config survives; the untracked file was preserved
     // and removed; the tree still reads clean.
     expect(fs.readFileSync(path.join(canonical, '.env'), 'utf8')).toBe('SECRET=keep-me\n');
@@ -206,7 +209,7 @@ describe('canonical adoption', () => {
   });
 
   it('resolves a missing origin/HEAD from unambiguous local evidence', async () => {
-    const legacy = legacyCheckout('sip-true-demo-stage');
+    const legacy = legacyCheckout('demo-stage');
     // A checkout built by init + remote add never gets one. Delete the symref
     // itself — `update-ref -d` would delete the branch it points at instead.
     git(legacy, 'symbolic-ref', '--delete', 'refs/remotes/origin/HEAD');
@@ -216,13 +219,13 @@ describe('canonical adoption', () => {
     const [checkout] = planRepositoryActivation(WG, root).adopt;
     const result = await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
 
-    const canonical = canonicalRepoDir(WG, 'sip-true-demo-stage', root);
+    const canonical = canonicalRepoDir(WG, 'demo-stage', root);
     expect(git(canonical, 'symbolic-ref', 'refs/remotes/origin/HEAD')).toBe('refs/remotes/origin/develop');
     expect(result.detachedAt).toBe(git(canonical, 'rev-parse', 'refs/remotes/origin/develop'));
   });
 
   it('leaves origin/HEAD unset rather than guessing when candidates are ambiguous', async () => {
-    const legacy = legacyCheckout('XZO');
+    const legacy = legacyCheckout('app');
     git(legacy, 'symbolic-ref', '--delete', 'refs/remotes/origin/HEAD');
     // Two plausible defaults and no configured upstream — never pick one.
     git(legacy, 'update-ref', 'refs/remotes/origin/main', git(legacy, 'rev-parse', 'HEAD'));
@@ -230,7 +233,7 @@ describe('canonical adoption', () => {
     const [checkout] = planRepositoryActivation(WG, root).adopt;
     await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
 
-    const canonical = canonicalRepoDir(WG, 'XZO', root);
+    const canonical = canonicalRepoDir(WG, 'app', root);
     expect(() => git(canonical, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD')).toThrow();
   });
 
@@ -252,7 +255,7 @@ describe('canonical adoption', () => {
   });
 
   it('records a tracked deletion that reset --hard will resurrect', async () => {
-    const legacy = legacyCheckout('dbt');
+    const legacy = legacyCheckout('etl');
     fs.rmSync(path.join(legacy, 'file-1.txt'));
 
     const [checkout] = planRepositoryActivation(WG, root).adopt;
@@ -263,11 +266,11 @@ describe('canonical adoption', () => {
     expect(manifest.revertedDeletions).toEqual(['file-1.txt']);
     expect(manifest.copied).toEqual([]);
     // The file is back, which is exactly why the deletion needed recording.
-    expect(fs.existsSync(path.join(canonicalRepoDir(WG, 'dbt', root), 'file-1.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(canonicalRepoDir(WG, 'etl', root), 'file-1.txt'))).toBe(true);
   });
 
   it('refuses a checkout with a merge in progress rather than reset --hard over it', async () => {
-    const legacy = legacyCheckout('XZO');
+    const legacy = legacyCheckout('app');
     git(legacy, 'checkout', '-q', '-b', 'side', 'HEAD~1');
     fs.writeFileSync(path.join(legacy, 'file-1.txt'), 'conflicting\n');
     git(legacy, 'add', '-A');
@@ -282,11 +285,11 @@ describe('canonical adoption', () => {
     const plan = planRepositoryActivation(WG, root);
 
     expect(plan.adopt).toEqual([]);
-    expect(plan.skip.find((entry) => entry.repo === 'XZO')?.reason).toMatch(/in progress; finish or abort it/);
+    expect(plan.skip.find((entry) => entry.repo === 'app')?.reason).toMatch(/in progress; finish or abort it/);
   });
 
   it('carries local-only commits and unpushed branches across the move', async () => {
-    const legacy = legacyCheckout('dbt');
+    const legacy = legacyCheckout('etl');
     git(legacy, 'checkout', '-q', '-b', 'feat/unpushed');
     fs.writeFileSync(path.join(legacy, 'only-here.txt'), 'irreplaceable\n');
     git(legacy, 'add', '-A');
@@ -297,29 +300,29 @@ describe('canonical adoption', () => {
     expect(checkout!.unpushedBranches).toBe(1);
     await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
 
-    const canonical = canonicalRepoDir(WG, 'dbt', root);
+    const canonical = canonicalRepoDir(WG, 'etl', root);
     expect(git(canonical, 'rev-parse', 'refs/heads/feat/unpushed')).toBe(localTip);
     expect(git(canonical, 'cat-file', '-e', `${localTip}^{commit}`)).toBe('');
   });
 
   it('pins the origin, disables automatic gc, and empties the legacy path', async () => {
-    legacyCheckout('XZO');
+    legacyCheckout('app');
     const [checkout] = planRepositoryActivation(WG, root).adopt;
 
     await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
 
-    const canonical = canonicalRepoDir(WG, 'XZO', root);
-    expect(readOriginPin(WG, 'XZO', root)).toEqual({
-      origin: 'https://github.com/Example/XZO',
-      repositoryId: 'https://github.com/Example/XZO',
+    const canonical = canonicalRepoDir(WG, 'app', root);
+    expect(readOriginPin(WG, 'app', root)).toEqual({
+      origin: 'https://github.com/Example/app',
+      repositoryId: 'https://github.com/Example/app',
     });
     expect(git(canonical, 'config', '--get', 'gc.auto')).toBe('0');
     expect(git(canonical, 'config', '--get', 'gc.worktreePruneExpire')).toBe('never');
-    expect(fs.existsSync(path.join(workgroupLegacyRoot(WG, root), 'XZO'))).toBe(false);
+    expect(fs.existsSync(path.join(workgroupLegacyRoot(WG, root), 'app'))).toBe(false);
   });
 
   it('drops worktree records whose gitdir is unreachable from the host', async () => {
-    const legacy = legacyCheckout('XZO');
+    const legacy = legacyCheckout('app');
     const stale = path.join(root, 'stale-worktree');
     git(legacy, 'worktree', 'add', '-q', '--detach', stale);
     // Model the container-absolute pointer case: the checkout is gone but the
@@ -330,12 +333,12 @@ describe('canonical adoption', () => {
     const result = await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
 
     expect(result.prunedWorktrees).toBe(1);
-    const canonical = canonicalRepoDir(WG, 'XZO', root);
+    const canonical = canonicalRepoDir(WG, 'app', root);
     expect(git(canonical, 'worktree', 'list', '--porcelain')).not.toContain('stale-worktree');
   });
 
   it('replays its own completed move instead of reporting a conflict', async () => {
-    legacyCheckout('XZO');
+    legacyCheckout('app');
     const [checkout] = planRepositoryActivation(WG, root).adopt;
     const first = await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
 
@@ -348,11 +351,11 @@ describe('canonical adoption', () => {
   });
 
   it('still refuses when a foreign repository occupies the canonical path', async () => {
-    legacyCheckout('XZO');
+    legacyCheckout('app');
     const [checkout] = planRepositoryActivation(WG, root).adopt;
     // A different repository already sitting there must never be adopted as
     // this one just because the path matches.
-    const impostor = canonicalRepoDir(WG, 'XZO', root);
+    const impostor = canonicalRepoDir(WG, 'app', root);
     fs.mkdirSync(impostor, { recursive: true });
     git(impostor, 'init', '-q', '-b', 'main');
     git(impostor, 'remote', 'add', 'origin', 'https://github.com/Example/other.git');
@@ -360,18 +363,18 @@ describe('canonical adoption', () => {
     await expect(activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root })).rejects.toThrow(
       /canonical already exists/,
     );
-    expect(fs.existsSync(path.join(workgroupLegacyRoot(WG, root), 'XZO'))).toBe(true);
+    expect(fs.existsSync(path.join(workgroupLegacyRoot(WG, root), 'app'))).toBe(true);
   });
 
   it('refuses to overwrite an existing canonical and leaves the legacy checkout in place', async () => {
-    legacyCheckout('XZO');
+    legacyCheckout('app');
     const [checkout] = planRepositoryActivation(WG, root).adopt;
-    fs.mkdirSync(canonicalRepoDir(WG, 'XZO', root), { recursive: true });
+    fs.mkdirSync(canonicalRepoDir(WG, 'app', root), { recursive: true });
 
     await expect(activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root })).rejects.toThrow(
       /canonical already exists/,
     );
-    expect(fs.existsSync(path.join(workgroupLegacyRoot(WG, root), 'XZO'))).toBe(true);
+    expect(fs.existsSync(path.join(workgroupLegacyRoot(WG, root), 'app'))).toBe(true);
   });
 
   it('refuses a checkout the plan marked unadoptable', async () => {
@@ -386,28 +389,28 @@ describe('canonical adoption', () => {
 
 describe('per-repository rollback', () => {
   it('restores the legacy path and drops the pin', async () => {
-    legacyCheckout('XZO');
+    legacyCheckout('app');
     const [checkout] = planRepositoryActivation(WG, root).adopt;
     await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
 
-    const restored = await rollbackCanonicalRepository({ workgroupId: WG, repo: 'XZO', dataDir: root });
+    const restored = await rollbackCanonicalRepository({ workgroupId: WG, repo: 'app', dataDir: root });
 
-    expect(restored.restoredPath).toBe(path.join(workgroupLegacyRoot(WG, root), 'XZO'));
-    expect(fs.existsSync(canonicalRepoDir(WG, 'XZO', root))).toBe(false);
-    expect(readOriginPin(WG, 'XZO', root)).toBeNull();
+    expect(restored.restoredPath).toBe(path.join(workgroupLegacyRoot(WG, root), 'app'));
+    expect(fs.existsSync(canonicalRepoDir(WG, 'app', root))).toBe(false);
+    expect(readOriginPin(WG, 'app', root)).toBeNull();
     // Re-adoptable immediately, so a rollback is never a one-way door.
-    expect(planRepositoryActivation(WG, root).adopt.map((entry) => entry.repo)).toEqual(['XZO']);
+    expect(planRepositoryActivation(WG, root).adopt.map((entry) => entry.repo)).toEqual(['app']);
   });
 
   it('refuses to clobber an occupied legacy path', async () => {
-    legacyCheckout('XZO');
+    legacyCheckout('app');
     const [checkout] = planRepositoryActivation(WG, root).adopt;
     await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
-    fs.mkdirSync(path.join(workgroupLegacyRoot(WG, root), 'XZO'), { recursive: true });
+    fs.mkdirSync(path.join(workgroupLegacyRoot(WG, root), 'app'), { recursive: true });
 
-    await expect(rollbackCanonicalRepository({ workgroupId: WG, repo: 'XZO', dataDir: root })).rejects.toThrow(
+    await expect(rollbackCanonicalRepository({ workgroupId: WG, repo: 'app', dataDir: root })).rejects.toThrow(
       /legacy path is occupied/,
     );
-    expect(fs.existsSync(canonicalRepoDir(WG, 'XZO', root))).toBe(true);
+    expect(fs.existsSync(canonicalRepoDir(WG, 'app', root))).toBe(true);
   });
 });

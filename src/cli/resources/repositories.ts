@@ -141,7 +141,7 @@ registerResource({
       'Classify every checkout in a workgroup and show what activation would adopt, skip, and preserve. Read-only.',
       [workgroupArg],
       async (args: Record<string, unknown>, _ctx: CallerContext) => planRepositoryActivation(requiredWorkgroup(args)),
-      ['ncl repositories plan --workgroup illysium'],
+      ['ncl repositories plan --workgroup example-retail'],
       (data) => {
         const plan = data as ReturnType<typeof planRepositoryActivation>;
         const lines = [
@@ -198,7 +198,7 @@ registerResource({
         }
         return { workgroupId, activated, failed };
       },
-      ['ncl repositories activate --workgroup illysium --repos XZO'],
+      ['ncl repositories activate --workgroup example-retail --repos app'],
     ),
     rollback: operation(
       'approval',
@@ -214,7 +214,7 @@ registerResource({
         });
         return { workgroupId, restored };
       },
-      ['ncl repositories rollback --workgroup illysium --repos XZO'],
+      ['ncl repositories rollback --workgroup example-retail --repos app'],
     ),
   },
 });
