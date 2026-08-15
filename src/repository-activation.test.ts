@@ -208,6 +208,23 @@ describe('canonical adoption', () => {
     expect(() => git(canonical, 'symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD')).toThrow();
   });
 
+  it('preserves an edit hidden behind assume-unchanged, which git diff will not report', async () => {
+    const legacy = legacyCheckout('mr');
+    git(legacy, 'update-index', '--assume-unchanged', 'file-0.txt');
+    fs.writeFileSync(path.join(legacy, 'file-0.txt'), 'edit git diff cannot see\n');
+    // Proof the ordinary union is blind to it: reset --hard would overwrite
+    // this file regardless, because it consults neither bit.
+    expect(git(legacy, 'diff', '--name-only')).toBe('');
+
+    const [checkout] = planRepositoryActivation(WG, root).adopt;
+    expect(checkout!.dirtyPaths).toContain('file-0.txt');
+    const result = await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
+
+    expect(fs.readFileSync(path.join(result.preservedStatePath!, 'file-0.txt'), 'utf8')).toBe(
+      'edit git diff cannot see\n',
+    );
+  });
+
   it('records a tracked deletion that reset --hard will resurrect', async () => {
     const legacy = legacyCheckout('dbt');
     fs.rmSync(path.join(legacy, 'file-1.txt'));

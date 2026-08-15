@@ -169,6 +169,22 @@ function resolveOriginHead(cwd: string): string | null {
   return candidate;
 }
 
+/**
+ * Paths whose index entry carries `--assume-unchanged` or `--skip-worktree`.
+ *
+ * `git diff` deliberately trusts the cached stat for these and reports nothing
+ * even when the file on disk differs, while `git reset --hard` consults neither
+ * bit and overwrites anyway. Verified: with `assume-unchanged` set, the whole
+ * dirty union comes back empty and a local edit is destroyed. They are folded
+ * into the preservation set unconditionally — copying a handful of possibly
+ * unmodified files is a trivial cost against silently losing an edit.
+ */
+function untrackedByStatPaths(cwd: string): string[] {
+  return gitPaths(cwd, ['ls-files', '-v', '-z'], 300_000)
+    .filter((entry) => entry.length > 2 && /[a-z]/.test(entry[0]!))
+    .map((entry) => entry.slice(2));
+}
+
 /** Every worktree path carrying state that a fresh clone would not reproduce. */
 function dirtyWorktreePaths(cwd: string): string[] {
   return [
@@ -176,6 +192,7 @@ function dirtyWorktreePaths(cwd: string): string[] {
       ...gitPaths(cwd, ['ls-files', '--others', '--exclude-standard', '-z']),
       ...gitPaths(cwd, ['diff', '--name-only', '-z']),
       ...gitPaths(cwd, ['diff', '--cached', '--name-only', '-z']),
+      ...untrackedByStatPaths(cwd),
     ]),
   ].sort();
 }
