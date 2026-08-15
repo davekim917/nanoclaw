@@ -70,6 +70,19 @@ describe('container image retention metadata', () => {
     expect(dockerfile).toContain('nanoclaw.image.role=$NANOCLAW_IMAGE_ROLE');
   });
 
+  it('sets deterministic runtime-readable modes for copied agent files', () => {
+    const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
+
+    expect(dockerfile).toContain('COPY --chmod=0644 agent-runner/package.json agent-runner/bun.lock ./');
+    expect(dockerfile).toContain('COPY --chmod=0755 slack-mcp-wrapper.sh /usr/local/bin/slack-mcp-server');
+    expect(dockerfile).toContain('COPY --chmod=0755 hex-wrapper.sh /usr/local/bin/hex-wrapper.sh');
+    expect(dockerfile).toContain('chmod -R a+rX /opt/remotion');
+    expect(dockerfile).toContain('COPY --chmod=0644 puppeteer-config.json /app/puppeteer-config.json');
+    expect(dockerfile).toContain('COPY --chmod=0755 entrypoint.sh /app/entrypoint.sh');
+    expect(dockerfile).toContain('find /opt/remotion \\( -type f ! -readable -o -type d ! -executable \\)');
+    expect(dockerfile).toContain('test -x /usr/local/bin/slack-mcp-server');
+  });
+
   it('marks derived group images with the group owner and role', () => {
     const source = fs.readFileSync(path.join(projectRoot, 'src', 'container-runner.ts'), 'utf8');
 

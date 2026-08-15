@@ -146,7 +146,7 @@ RUN python3 -m venv /opt/atlassian-venv \
 # container/build.sh:55 — `docker build … .` after `cd "$SCRIPT_DIR"`). The
 # prior `container/slack-mcp-wrapper.sh` form double-nested and broke the
 # build because Docker resolves COPY paths relative to the context root.
-COPY slack-mcp-wrapper.sh /usr/local/bin/slack-mcp-server
+COPY --chmod=0755 slack-mcp-wrapper.sh /usr/local/bin/slack-mcp-server
 RUN ARCH=$(uname -m) \
     && case "$ARCH" in \
          x86_64)  SLACK_ARCH=amd64 ;; \
@@ -155,7 +155,7 @@ RUN ARCH=$(uname -m) \
        esac \
     && curl -fsSL "https://github.com/korotovsky/slack-mcp-server/releases/download/v${SLACK_MCP_VERSION}/slack-mcp-server-linux-${SLACK_ARCH}" \
        -o /usr/local/bin/slack-mcp-server.real \
-    && chmod +x /usr/local/bin/slack-mcp-server.real /usr/local/bin/slack-mcp-server \
+    && chmod 0755 /usr/local/bin/slack-mcp-server.real /usr/local/bin/slack-mcp-server \
     && test -x /usr/local/bin/slack-mcp-server.real \
     && test -x /usr/local/bin/slack-mcp-server
 
@@ -240,8 +240,8 @@ RUN ARCH=$(dpkg --print-architecture) \
     && install -m 0755 "/tmp/hex-${RARCH}-unknown-linux-gnu/hex" /usr/local/bin/hex-real \
     && rm -rf /tmp/hex*
 
-COPY hex-wrapper.sh /usr/local/bin/hex-wrapper.sh
-RUN chmod +x /usr/local/bin/hex-wrapper.sh \
+COPY --chmod=0755 hex-wrapper.sh /usr/local/bin/hex-wrapper.sh
+RUN chmod 0755 /usr/local/bin/hex-wrapper.sh \
     && ln -s /usr/local/bin/hex-wrapper.sh /usr/local/bin/hex \
     && /usr/local/bin/hex-real --version
 
@@ -267,7 +267,7 @@ RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" && \
 # it's provided by the shared RO mount at runtime.
 WORKDIR /app
 
-COPY agent-runner/package.json agent-runner/bun.lock ./
+COPY --chmod=0644 agent-runner/package.json agent-runner/bun.lock ./
 
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --frozen-lockfile
@@ -366,7 +366,8 @@ RUN mkdir -p /opt/remotion/public/shots /opt/remotion/public/clips /opt/remotion
         /opt/remotion/public/shots/01-placeholder.png && \
     ffmpeg -loglevel error -f lavfi -i color=c=0x1d2c4f:s=1920x1080 -frames:v 1 \
         /opt/remotion/public/shots/02-placeholder.png && \
-    chmod +x /opt/remotion/new-video.sh && \
+    chmod -R a+rX /opt/remotion && \
+    chmod 0755 /opt/remotion/new-video.sh && \
     ln -sf /opt/remotion/new-video.sh /usr/local/bin/new-video
 
 # ---- Graphify code intelligence ----------------------------------------------
@@ -446,7 +447,7 @@ RUN printf "%s\n" \
 # Puppeteer config used by mmdc — points at the system Chromium and passes
 # --no-sandbox, without which mmdc launches and silently exits 0 producing no
 # output on Debian containers that lack unprivileged user namespaces.
-COPY puppeteer-config.json /app/puppeteer-config.json
+COPY --chmod=0644 puppeteer-config.json /app/puppeteer-config.json
 
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.
@@ -454,8 +455,7 @@ RUN printf '#!/bin/sh\nexec bun /app/src/cli/ncl.ts "$@"\n' > /usr/local/bin/ncl
     chmod +x /usr/local/bin/ncl
 
 # ---- Entrypoint --------------------------------------------------------------
-COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY --chmod=0755 entrypoint.sh /app/entrypoint.sh
 
 # ---- Workspace + permissions -------------------------------------------------
 # Remap the `node` user+group to UID/GID 1001 before any chowns so the
@@ -481,6 +481,15 @@ RUN groupmod -g ${HOST_GID} node && usermod -u ${HOST_UID} -g ${HOST_GID} node &
     chmod 755 /home/node
 
 USER node
+RUN unreadable="$(find /opt/remotion \( -type f ! -readable -o -type d ! -executable \) -print -quit)" \
+    && test -z "$unreadable" \
+    && test -r /app/package.json \
+    && test -r /app/bun.lock \
+    && test -r /app/puppeteer-config.json \
+    && test -x /app/entrypoint.sh \
+    && test -x /usr/local/bin/slack-mcp-server \
+    && test -x /usr/local/bin/hex-wrapper.sh \
+    && test -x /opt/remotion/new-video.sh
 WORKDIR /workspace/group
 
 # tini is PID 1, reaps zombies, forwards signals cleanly. entrypoint.sh does
