@@ -882,6 +882,33 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     }
   });
 
+  it('admits nothing while a repository ingress fence is active, then admits after release', async () => {
+    // Admission sets trigger = 1, which a fenced row may never carry. Without
+    // the fence check this aborts the whole sweep for the session on the guard.
+    initSessionFolder(AG, SESS);
+    const fencedDb = new Database(inboundDbPath(AG, SESS));
+    insertTaskRow(fencedDb, {
+      id: 'task-fenced',
+      seriesId: 'task-fenced',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'deferred by the fence' }),
+    });
+
+    const { activateRepoIngressFence, releaseRepoIngressFence } = await import('./db/session-db.js');
+    const fence = activateRepoIngressFence(fencedDb, 'repository-activation:test');
+
+    expect(await admitDueTaskContexts(fencedDb, AG, SESS)).toBe(0);
+    expect(
+      (fencedDb.prepare('SELECT trigger FROM messages_in WHERE id = ?').get('task-fenced') as { trigger: number })
+        .trigger,
+    ).toBe(0);
+
+    releaseRepoIngressFence(fencedDb, 'repository-activation:test', fence.generation);
+    expect(await admitDueTaskContexts(fencedDb, AG, SESS)).toBe(1);
+    fencedDb.close();
+  });
+
   it('admits a first scheduled fire as one fresh adjacent pair and is idempotent on sweep retry', async () => {
     initSessionFolder(AG, SESS);
     const db = new Database(inboundDbPath(AG, SESS));

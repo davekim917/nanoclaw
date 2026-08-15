@@ -41,6 +41,7 @@ import {
   insertMessageWithContextIfNew,
   migrateMessagesInTable,
   nextEvenSeq,
+  readRepoIngressFence,
   type MessageInsert,
 } from './db/session-db.js';
 import { log } from './log.js';
@@ -1039,6 +1040,14 @@ export function deferMessageForFreshContextRetry(db: Database.Database, messageI
  * started by real inbound can still consume the now-safe pair on a later poll.
  */
 export function admitDueTaskContexts(db: Database.Database, agentGroupId: string, sessionId: string): number {
+  // An active repository ingress fence means this session must admit nothing:
+  // the whole point is that no new turn starts while its mounts change. The
+  // admission below sets trigger = 1, which a fenced row may never carry, so
+  // proceeding aborts the sweep for this session on the fence guard. Release
+  // has its own admission path (admitTaggedRows) and replays the deferred rows
+  // with their original triggers, so skipping here defers rather than drops.
+  if (readRepoIngressFence(db)?.state === 'active') return 0;
+
   // Legacy rows predate inert scheduling and were stored trigger=1. Demote
   // only unpaired live tasks before selecting due work; already-admitted
   // pairs remain wakeable and untouched.
