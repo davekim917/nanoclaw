@@ -876,6 +876,259 @@ describe('lossless server-wide repository migration', () => {
     );
   });
 
+  it('recovers a missing original admin from one exact hash-bound external Git-admin seed', async () => {
+    const f = fixture({ repo: 'external-exact-admin' });
+    const orphan = path.join(root, 'legacy', 'external-exact-orphan');
+    git(f.legacy, ['worktree', 'add', '-q', '-b', 'feat/external-exact', orphan, 'HEAD']);
+    fs.writeFileSync(path.join(orphan, 'staged.txt'), 'exact staged state\n');
+    git(orphan, ['add', 'staged.txt']);
+    fs.writeFileSync(path.join(orphan, 'unstaged.txt'), 'exact unstaged state\n');
+    fs.writeFileSync(path.join(orphan, 'untracked.txt'), 'exact untracked state\n');
+    fs.chmodSync(path.join(orphan, 'untracked.txt'), 0o640);
+    fs.writeFileSync(path.join(orphan, 'executable.sh'), '#!/bin/sh\nexit 7\n');
+    fs.chmodSync(path.join(orphan, 'executable.sh'), 0o755);
+    fs.symlinkSync('unstaged.txt', path.join(orphan, 'unstaged-link'));
+
+    const selectedGitDir = git(orphan, ['rev-parse', '--path-format=absolute', '--git-dir']);
+    const commonGitDir = git(orphan, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+    const orphanCandidate: LegacyCheckoutCandidate = {
+      ...candidate(orphan, f.repo, 'thread-external-exact'),
+      candidateCommonGitDirs: [commonGitDir],
+    };
+    const original = captureCheckout(orphanCandidate);
+
+    const seedRoot = path.join(root, 'recovery-seeds');
+    const externalSeed = path.join(seedRoot, 'external-exact.git');
+    fs.mkdirSync(seedRoot, { recursive: true, mode: 0o700 });
+    fs.cpSync(commonGitDir, externalSeed, { recursive: true, dereference: false });
+    const adminName = path.basename(selectedGitDir);
+    const externalAdmin = path.join(externalSeed, 'worktrees', adminName);
+    const externalSeedGitDirSha256 = recoverySeedGitDirSha256(externalSeed);
+    process.env.NANOCLAW_REPOSITORY_RECOVERY_SEED_ROOT = seedRoot;
+
+    fs.rmSync(selectedGitDir, { recursive: true, force: true });
+    expect(() => captureCheckout(orphanCandidate)).toThrow(/missing Git admin directory/);
+
+    const decision = createReviewedExactGitAdminRecoveryProposal({
+      candidate: orphanCandidate,
+      selectedGitDir: externalAdmin,
+      externalSeedGitDirSha256,
+      action: 'restore-visible-state',
+    });
+    expect(decision).toMatchObject({
+      selection: 'exact-git-admin',
+      selectedGitDir: externalAdmin,
+      selectedCommonGitDir: externalSeed,
+      selectedHead: original.head,
+      selectedBranch: original.branch,
+      selectedIndexSha256: original.indexSha256,
+      externalSeedGitDirSha256,
+    });
+
+    const recovered = captureCheckout(orphanCandidate, undefined, { operatorRecovery: decision });
+    expect(recovered).toMatchObject({
+      head: original.head,
+      branch: original.branch,
+      indexSha256: original.indexSha256,
+      indexBytesBase64: original.indexBytesBase64,
+      indexMode: original.indexMode,
+      indexAuxiliaryFiles: original.indexAuxiliaryFiles,
+      indexEntriesZBase64: original.indexEntriesZBase64,
+      statusZBase64: original.statusZBase64,
+      files: original.files,
+      gitPointer: original.gitPointer,
+      reviewedRecovery: { externalSeedGitDirSha256 },
+    });
+
+    expect(() =>
+      captureCheckout(orphanCandidate, undefined, {
+        operatorRecovery: { ...decision, externalSeedGitDirSha256: '0'.repeat(64) },
+      }),
+    ).toThrow(/recovery seed checksum is stale/);
+    expect(() =>
+      captureCheckout(orphanCandidate, undefined, {
+        operatorRecovery: { ...decision, selectedGitDir: path.join(f.legacy, '.git') },
+      }),
+    ).toThrow(/outside the selected external recovery seed/);
+
+    const linkedSeed = path.join(seedRoot, 'linked.git');
+    fs.symlinkSync(externalSeed, linkedSeed);
+    expect(() =>
+      captureCheckout(orphanCandidate, undefined, {
+        operatorRecovery: {
+          ...decision,
+          selectedGitDir: path.join(linkedSeed, 'worktrees', adminName),
+          selectedCommonGitDir: linkedSeed,
+        },
+      }),
+    ).toThrow(/recovery seed is not a safe directory/);
+
+    const tamperedSeed = path.join(seedRoot, 'tampered.git');
+    fs.cpSync(externalSeed, tamperedSeed, { recursive: true, dereference: false });
+    const tamperedSeedSha256 = recoverySeedGitDirSha256(tamperedSeed);
+    fs.writeFileSync(path.join(tamperedSeed, 'description'), 'tampered after review\n');
+    expect(() =>
+      captureCheckout(orphanCandidate, undefined, {
+        operatorRecovery: {
+          ...decision,
+          selectedGitDir: path.join(tamperedSeed, 'worktrees', adminName),
+          selectedCommonGitDir: tamperedSeed,
+          externalSeedGitDirSha256: tamperedSeedSha256,
+        },
+      }),
+    ).toThrow(/recovery seed checksum is stale/);
+
+    for (const alternateName of ['alternates', 'http-alternates']) {
+      const alternateSeed = path.join(seedRoot, `${alternateName}.git`);
+      fs.cpSync(externalSeed, alternateSeed, { recursive: true, dereference: false });
+      fs.writeFileSync(path.join(alternateSeed, 'objects', 'info', alternateName), `${commonGitDir}/objects\n`);
+      expect(() =>
+        captureCheckout(orphanCandidate, undefined, {
+          operatorRecovery: {
+            ...decision,
+            selectedGitDir: path.join(alternateSeed, 'worktrees', adminName),
+            selectedCommonGitDir: alternateSeed,
+            externalSeedGitDirSha256: recoverySeedGitDirSha256(alternateSeed),
+          },
+        }),
+      ).toThrow(/object store alternates are forbidden during migration/);
+    }
+
+    const executionTamperSeed = path.join(seedRoot, 'execution-tamper.git');
+    fs.cpSync(externalSeed, executionTamperSeed, { recursive: true, dereference: false });
+    const executionTamperDecision = createReviewedExactGitAdminRecoveryProposal({
+      candidate: orphanCandidate,
+      selectedGitDir: path.join(executionTamperSeed, 'worktrees', adminName),
+      externalSeedGitDirSha256: recoverySeedGitDirSha256(executionTamperSeed),
+      action: 'restore-visible-state',
+    });
+    const executionTamperManifest = manifestFor(
+      [candidate(f.legacy, f.repo), orphanCandidate],
+      f.remote,
+      f.repo,
+      undefined,
+      [executionTamperDecision],
+    );
+    fs.writeFileSync(path.join(executionTamperSeed, 'description'), 'changed after manifest capture\n');
+    await expect(
+      executeRepositoryMigration(executionTamperManifest, { assertQuiescent: () => undefined }),
+    ).rejects.toThrow(/recovery seed checksum is stale/);
+    expect(fs.existsSync(manifestPath(executionTamperManifest))).toBe(false);
+
+    const manifest = manifestFor([candidate(f.legacy, f.repo), orphanCandidate], f.remote, f.repo, undefined, [
+      decision,
+    ]);
+    const captured = manifest.captures.find((entry) => entry.checkoutPath === orphan)!;
+    expect(captured).toMatchObject({
+      head: original.head,
+      branch: original.branch,
+      indexSha256: original.indexSha256,
+      indexBytesBase64: original.indexBytesBase64,
+      indexMode: original.indexMode,
+      indexAuxiliaryFiles: original.indexAuxiliaryFiles,
+      indexEntriesZBase64: original.indexEntriesZBase64,
+      statusZBase64: original.statusZBase64,
+      files: original.files,
+      gitPointer: original.gitPointer,
+    });
+    expect(manifest.objectStores).toContain(externalSeed);
+
+    const immutableSeedSha256 = recoverySeedGitDirSha256(externalSeed);
+    const crashInput = path.join(root, 'external-seed-crash-input.json');
+    fs.writeFileSync(crashInput, JSON.stringify(manifest));
+    const crashChild = [
+      "import fs from 'fs';",
+      "import { executeRepositoryMigration } from './src/repository-migration.ts';",
+      '(async () => {',
+      "  const manifest = JSON.parse(fs.readFileSync(process.env.MIGRATION_INPUT!, 'utf8'));",
+      '  await executeRepositoryMigration(manifest, { assertQuiescent: () => undefined });',
+      '})().catch((error) => { console.error(error); process.exit(1); });',
+    ].join('\n');
+    let crashStatus: number | undefined;
+    try {
+      execFileSync('pnpm', ['exec', 'tsx', '-e', crashChild], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          MIGRATION_INPUT: crashInput,
+          NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN: '1',
+          NANOCLAW_MIGRATION_CRASH_AFTER: 'rescued',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 120_000,
+      });
+    } catch (error) {
+      crashStatus = (error as NodeJS.ErrnoException & { status?: number }).status;
+    }
+    expect(crashStatus).toBe(86);
+    expect(recoverySeedGitDirSha256(externalSeed)).toBe(immutableSeedSha256);
+    const rescueObjectStore = path.join(
+      dataDir,
+      'repository-migrations',
+      manifest.runId,
+      'wg-a',
+      f.repo,
+      'rescue-object-stores',
+      `${captured.id}.git`,
+    );
+    for (const alternateName of ['alternates', 'http-alternates']) {
+      expect(fs.existsSync(path.join(rescueObjectStore, 'objects', 'info', alternateName))).toBe(false);
+    }
+
+    const descriptorFile = path.join(root, 'active-server-migration.json');
+    const descriptorChild = [
+      "import fs from 'fs';",
+      "import { createHash } from 'crypto';",
+      "import { aggregateCapacityEvidence, loadMigrationDescriptor } from './scripts/migrate-repo-store.ts';",
+      "const canonicalJson = (value) => value === null || typeof value !== 'object'",
+      '  ? JSON.stringify(value)',
+      '  : Array.isArray(value)',
+      "    ? `[${value.map(canonicalJson).join(',')}]`",
+      "    : `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;",
+      "const manifest = JSON.parse(fs.readFileSync(process.env.MIGRATION_MANIFEST!, 'utf8'));",
+      'const base = {',
+      '  version: 2,',
+      '  runId: manifest.runId,',
+      '  manifestPaths: [process.env.MIGRATION_MANIFEST],',
+      '  manifestHashes: [manifest.manifestSha256],',
+      "  createdAt: '2026-08-15T00:00:00.000Z',",
+      '  recoverySeeds: [{ gitDir: process.env.RECOVERY_SEED, sha256: process.env.RECOVERY_SEED_SHA }],',
+      '  aggregateCapacity: aggregateCapacityEvidence([manifest]),',
+      '};',
+      "const descriptor = { ...base, descriptorSha256: createHash('sha256').update(canonicalJson(base)).digest('hex') };",
+      'fs.writeFileSync(process.env.DESCRIPTOR_FILE!, `${JSON.stringify(descriptor, null, 2)}\\n`, { mode: 0o600 });',
+      'loadMigrationDescriptor(process.env.DESCRIPTOR_FILE!, process.env.MIGRATION_DATA_DIR!);',
+    ].join('\n');
+    execFileSync('pnpm', ['exec', 'tsx', '-e', descriptorChild], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DESCRIPTOR_FILE: descriptorFile,
+        MIGRATION_DATA_DIR: dataDir,
+        MIGRATION_MANIFEST: manifestPath(manifest),
+        RECOVERY_SEED: externalSeed,
+        RECOVERY_SEED_SHA: immutableSeedSha256,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 120_000,
+    });
+
+    const resumed = JSON.parse(fs.readFileSync(manifestPath(manifest), 'utf8')) as typeof manifest;
+    await executeRepositoryMigration(resumed, { assertQuiescent: () => undefined });
+    auditRepositoryMigration(resumed);
+    expect(recoverySeedGitDirSha256(externalSeed)).toBe(immutableSeedSha256);
+    expect(fs.readFileSync(path.join(captured.destinationPath!, 'staged.txt'), 'utf8')).toBe('exact staged state\n');
+    expect(fs.readFileSync(path.join(captured.destinationPath!, 'unstaged.txt'), 'utf8')).toBe(
+      'exact unstaged state\n',
+    );
+    expect(fs.lstatSync(path.join(captured.destinationPath!, 'untracked.txt')).mode & 0o7777).toBe(0o640);
+    expect(fs.lstatSync(path.join(captured.destinationPath!, 'executable.sh')).mode & 0o7777).toBe(0o755);
+    expect(fs.readlinkSync(path.join(captured.destinationPath!, 'unstaged-link'))).toBe('unstaged.txt');
+
+    await rollbackRepositoryMigration(resumed);
+    expect(recoverySeedGitDirSha256(externalSeed)).toBe(immutableSeedSha256);
+  }, 30_000);
+
   it('archives an unborn standalone checkout only through an exact hash-bound Git-admin decision', async () => {
     const f = fixture({ repo: 'reviewed-unborn-archive' });
     const unborn = path.join(root, 'legacy', 'reviewed-unborn');

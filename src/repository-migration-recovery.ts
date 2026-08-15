@@ -194,9 +194,6 @@ export function loadReviewedRecoveryDecisions(file?: string): LoadedReviewedReco
       if (!Object.prototype.hasOwnProperty.call(record, 'selectedIndexSha256')) {
         throw new Error(`${location} exact-git-admin selection requires selectedIndexSha256`);
       }
-      if (record.externalSeedGitDirSha256 !== undefined) {
-        throw new Error(`${location} exact-git-admin selection cannot use externalSeedGitDirSha256`);
-      }
     } else {
       if (record.selectedGitDir !== undefined || record.selectedIndexSha256 !== undefined) {
         throw new Error(`${location} synthesized selection cannot specify exact Git-admin fields`);

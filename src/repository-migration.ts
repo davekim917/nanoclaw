@@ -130,6 +130,8 @@ export interface CheckoutCapture {
     gitPointerSha256?: string;
     selectedGitDir?: string;
     selectedIndexSha256?: string | null;
+    /** Revalidated before every execution; the protected seed itself stays immutable. */
+    externalSeedGitDirSha256?: string;
   };
   repositoryIdentityRecovery?: LegacyCheckoutCandidate['repositoryIdentityRecovery'];
 }
@@ -342,6 +344,17 @@ function fsyncDirectories(...directories: string[]): void {
       fs.closeSync(fd);
     }
   }
+}
+
+function fsyncDirectoryTree(directory: string): void {
+  for (const name of fs.readdirSync(directory)) {
+    const candidate = path.join(directory, name);
+    const stat = fs.lstatSync(candidate);
+    if (stat.isSymbolicLink())
+      throw new Error(`cannot fsync a migration directory tree containing a symlink: ${candidate}`);
+    if (stat.isDirectory()) fsyncDirectoryTree(candidate);
+  }
+  fsyncDirectories(directory);
 }
 
 function atomicBytes(file: string, bytes: Buffer, mode: number): void {
@@ -849,7 +862,12 @@ function validateReviewedRecoverySeed(
   checkoutPath: string,
   context?: LegacyGitResolutionContext,
 ): string {
-  const seed = fs.realpathSync(seedDirectory);
+  const unresolvedSeed = path.resolve(seedDirectory);
+  const seedStat = fs.lstatSync(unresolvedSeed);
+  if (seedStat.isSymbolicLink() || !seedStat.isDirectory()) {
+    throw new Error(`reviewed recovery seed is not a safe directory: ${unresolvedSeed}`);
+  }
+  const seed = fs.realpathSync(unresolvedSeed);
   const seedRoot = path.resolve(
     process.env.NANOCLAW_REPOSITORY_RECOVERY_SEED_ROOT ??
       '/home/ubuntu/backups/nanoclaw-worktree-recovery/repository-seeds',
@@ -857,12 +875,29 @@ function validateReviewedRecoverySeed(
   if (!pathContained(seed, seedRoot)) throw new Error(`reviewed recovery seed escapes its host-only root: ${seed}`);
   const cacheKey = `${seed}\0${expectedSha256}`;
   if (context?.validatedRecoverySeeds.has(cacheKey)) return seed;
+  assertObjectStoreAlternatesDisabled(seed);
   if (recoverySeedGitDirSha256(seed) !== expectedSha256) {
     throw new Error(`reviewed recovery seed checksum is stale for ${checkoutPath}`);
   }
   git(['--git-dir', seed, 'fsck', '--full']);
   context?.validatedRecoverySeeds.add(cacheKey);
   return seed;
+}
+
+function assertObjectStoreAlternatesDisabled(store: string): void {
+  for (const alternateName of ['alternates', 'http-alternates']) {
+    const alternate = path.join(store, 'objects', 'info', alternateName);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(alternate);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== 0) {
+      throw new Error(`object store alternates are forbidden during migration: ${alternate}`);
+    }
+  }
 }
 
 /** Revalidate every unique host-only recovery seed once at a durable gate. */
@@ -885,6 +920,18 @@ export function validateReviewedRecoverySeeds(decisions: readonly ReviewedChecko
         context,
       );
     }
+  }
+}
+
+function validateManifestRecoverySeeds(manifest: RepositoryMigrationManifest): void {
+  const context = createLegacyGitResolutionContext([]);
+  for (const capture of manifest.captures) {
+    const expectedSha256 = capture.reviewedRecovery?.externalSeedGitDirSha256;
+    if (!expectedSha256) continue;
+    if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
+      throw new Error(`invalid recovery seed digest in migration capture ${capture.id}`);
+    }
+    validateReviewedRecoverySeed(capture.commonGitDir, expectedSha256, capture.checkoutPath, context);
   }
 }
 
@@ -1099,6 +1146,7 @@ function resolveReviewedExactGitAdmin(
   candidate: LegacyCheckoutCandidate,
   checkoutPath: string,
   decision: ReviewedCheckoutRecoveryDecision,
+  context?: LegacyGitResolutionContext,
 ): { gitDir: string; commonGitDir: string } {
   if (decision.selection !== 'exact-git-admin' || !decision.selectedGitDir) {
     throw new Error(`reviewed exact Git-admin selection is incomplete for ${checkoutPath}`);
@@ -1109,14 +1157,30 @@ function resolveReviewedExactGitAdmin(
     throw new Error(`reviewed exact Git admin is not a safe directory: ${unresolved}`);
   }
   const selected = fs.realpathSync(unresolved);
+  const externalCommon = decision.externalSeedGitDirSha256
+    ? validateReviewedRecoverySeed(
+        decision.selectedCommonGitDir,
+        decision.externalSeedGitDirSha256,
+        checkoutPath,
+        context,
+      )
+    : null;
   const marker = path.join(checkoutPath, '.git');
   const allowed = new Set<string>();
-  const markerStat = fs.lstatSync(marker);
-  if (markerStat.isDirectory() && !markerStat.isSymbolicLink()) allowed.add(fs.realpathSync(marker));
-  for (const commonCandidate of candidate.candidateCommonGitDirs ?? []) {
-    if (!fs.existsSync(commonCandidate)) continue;
-    const common = fs.realpathSync(commonCandidate);
-    if (selected === common || pathContained(selected, path.join(common, 'worktrees'))) allowed.add(selected);
+  if (externalCommon) {
+    const externalWorktreeAdmins = path.join(externalCommon, 'worktrees');
+    if (path.dirname(selected) !== externalWorktreeAdmins) {
+      throw new Error(`reviewed exact Git admin is outside the selected external recovery seed: ${selected}`);
+    }
+    allowed.add(selected);
+  } else {
+    const markerStat = fs.lstatSync(marker);
+    if (markerStat.isDirectory() && !markerStat.isSymbolicLink()) allowed.add(fs.realpathSync(marker));
+    for (const commonCandidate of candidate.candidateCommonGitDirs ?? []) {
+      if (!fs.existsSync(commonCandidate)) continue;
+      const common = fs.realpathSync(commonCandidate);
+      if (selected === common || pathContained(selected, path.join(common, 'worktrees'))) allowed.add(selected);
+    }
   }
   if (!allowed.has(selected)) {
     throw new Error(`reviewed exact Git admin is outside the inventoried repository stores: ${selected}`);
@@ -1126,7 +1190,7 @@ function resolveReviewedExactGitAdmin(
   }
   const commonRaw = git(['--git-dir', selected, 'rev-parse', '--path-format=absolute', '--git-common-dir']);
   const common = fs.realpathSync(commonRaw);
-  if (common !== fs.realpathSync(decision.selectedCommonGitDir)) {
+  if (common !== (externalCommon ?? fs.realpathSync(decision.selectedCommonGitDir))) {
     throw new Error(`reviewed exact Git common directory is stale for ${checkoutPath}`);
   }
   return { gitDir: selected, commonGitDir: common };
@@ -1257,7 +1321,7 @@ export function captureCheckout(
   let resolved: ReturnType<typeof resolveLegacyGitAdmin>;
   let recovered: OrphanRecovery | undefined;
   if (options.operatorRecovery?.selection === 'exact-git-admin') {
-    resolved = resolveReviewedExactGitAdmin(candidate, checkoutPath, options.operatorRecovery);
+    resolved = resolveReviewedExactGitAdmin(candidate, checkoutPath, options.operatorRecovery, context);
   } else {
     try {
       resolved = resolveLegacyGitAdmin({ ...candidate, checkoutPath }, context);
@@ -1387,6 +1451,9 @@ export function captureCheckout(
             ...(Object.prototype.hasOwnProperty.call(options.operatorRecovery, 'selectedIndexSha256')
               ? { selectedIndexSha256: options.operatorRecovery.selectedIndexSha256 }
               : {}),
+            ...(options.operatorRecovery.externalSeedGitDirSha256
+              ? { externalSeedGitDirSha256: options.operatorRecovery.externalSeedGitDirSha256 }
+              : {}),
           },
         }
       : {}),
@@ -1451,6 +1518,7 @@ export function createReviewedExactGitAdminRecoveryProposal(input: {
   candidate: LegacyCheckoutCandidate;
   selectedGitDir: string;
   action: ReviewedCheckoutRecoveryDecision['action'];
+  externalSeedGitDirSha256?: string;
   context?: LegacyGitResolutionContext;
 }): ReviewedCheckoutRecoveryDecision {
   const checkoutPath = fs.realpathSync(input.candidate.checkoutPath);
@@ -1483,6 +1551,7 @@ export function createReviewedExactGitAdminRecoveryProposal(input: {
     selectedHead,
     selectedBranch,
     selectedIndexSha256,
+    ...(input.externalSeedGitDirSha256 ? { externalSeedGitDirSha256: input.externalSeedGitDirSha256 } : {}),
     ...(gitPointer ? { gitPointerSha256: gitPointer.sha256 } : {}),
     visibleStateSha256: '0'.repeat(64),
   };
@@ -1528,9 +1597,14 @@ function expectedRescueRefs(capture: CheckoutCapture, runId: string): NonNullabl
   };
 }
 
-function expectedRenamedObjectStores(objectStores: readonly string[], root: string): Record<string, string> {
+function expectedRenamedObjectStores(
+  objectStores: readonly string[],
+  root: string,
+  protectedObjectStores: ReadonlySet<string>,
+): Record<string, string> {
   const renamed: Record<string, string> = {};
   for (const store of objectStores) {
+    if (protectedObjectStores.has(path.resolve(store))) continue;
     // Legacy repository stores were rooted under a literal `.repos` segment.
     // Their destination is derived only from the hash-bound source path, not
     // from mutable filesystem state encountered midway through cutover.
@@ -1576,7 +1650,15 @@ function expectedOperationalFields(input: {
   }
   return {
     captures,
-    renamedObjectStores: expectedRenamedObjectStores(input.objectStores, root),
+    renamedObjectStores: expectedRenamedObjectStores(
+      input.objectStores,
+      root,
+      new Set(
+        input.captures
+          .filter((capture) => capture.reviewedRecovery?.externalSeedGitDirSha256)
+          .map((capture) => path.resolve(capture.commonGitDir)),
+      ),
+    ),
   };
 }
 
@@ -2140,21 +2222,34 @@ function recordPhase(manifest: RepositoryMigrationManifest, journal: MigrationJo
   if (process.env.NANOCLAW_MIGRATION_FAIL_AFTER === phase) throw new Error(`injected failure after ${phase}`);
 }
 
-function createSyntheticCommit(capture: CheckoutCapture, runId: string): void {
-  const expected = expectedRescueRefs(capture, runId);
+function rescueObjectStorePath(manifest: RepositoryMigrationManifest, capture: CheckoutCapture): string {
+  return path.join(migrationRoot(manifest), 'rescue-object-stores', `${capture.id}.git`);
+}
+
+function createSyntheticCommit(capture: CheckoutCapture, manifest: RepositoryMigrationManifest): void {
+  const expected = expectedRescueRefs(capture, manifest.runId);
   if (canonicalJson(capture.rescue) !== canonicalJson(expected)) {
     throw new Error(`capture ${capture.id} has an invalid rescue-ref plan`);
   }
+  const rescueGitDir = rescueObjectStorePath(manifest, capture);
+  fs.rmSync(rescueGitDir, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(rescueGitDir), { recursive: true, mode: 0o700 });
+  git(['init', '--bare', '-q', `--object-format=${manifest.canonicalBase.objectFormat}`, rescueGitDir]);
+  const sourceObjects = path.join(capture.commonGitDir, 'objects');
+  assertObjectStoreAlternatesDisabled(capture.commonGitDir);
+  const objectEnv = { GIT_ALTERNATE_OBJECT_DIRECTORIES: sourceObjects };
   const { headRef, indexRef, worktreeRef } = expected;
-  if (capture.head && headRef) git(['--git-dir', capture.commonGitDir, 'update-ref', headRef, capture.head]);
+  if (capture.head && headRef) {
+    git(['--git-dir', rescueGitDir, 'update-ref', headRef, capture.head], { env: objectEnv });
+  }
 
-  const rescueIndex = path.join(migrationRootForCapture(capture, runId), `index-${capture.id}.index`);
+  const rescueIndex = path.join(migrationRoot(manifest), 'rescue-indexes', `index-${capture.id}.index`);
   fs.mkdirSync(path.dirname(rescueIndex), { recursive: true, mode: 0o700 });
   fs.rmSync(rescueIndex, { force: true });
   let indexTree: string;
   try {
-    const env = { GIT_INDEX_FILE: rescueIndex };
-    git(['--git-dir', capture.commonGitDir, 'read-tree', '--empty'], { env });
+    const env = { ...objectEnv, GIT_INDEX_FILE: rescueIndex };
+    git(['--git-dir', rescueGitDir, 'read-tree', '--empty'], { env });
     const indexRecords: Buffer[] = [];
     let hasConflictStages = false;
     for (const record of Buffer.from(capture.indexEntriesZBase64, 'base64').toString('utf8').split('\0')) {
@@ -2175,21 +2270,22 @@ function createSyntheticCommit(capture: CheckoutCapture, runId: string): void {
       const metadata = Buffer.from(
         `${JSON.stringify({ version: 1, indexEntriesZBase64: capture.indexEntriesZBase64 }, null, 2)}\n`,
       );
-      const metadataOid = git(['--git-dir', capture.commonGitDir, 'hash-object', '--no-filters', '-w', '--stdin'], {
+      const metadataOid = git(['--git-dir', rescueGitDir, 'hash-object', '--no-filters', '-w', '--stdin'], {
+        env: objectEnv,
         input: metadata,
       });
       indexRecords.push(Buffer.from(`100644 ${metadataOid}\t.nanoclaw-conflict-objects/index.json\0`));
     }
-    git(['--git-dir', capture.commonGitDir, 'update-index', '-z', '--index-info'], {
+    git(['--git-dir', rescueGitDir, 'update-index', '-z', '--index-info'], {
       env,
       input: Buffer.concat(indexRecords),
     });
-    indexTree = git(['--git-dir', capture.commonGitDir, 'write-tree'], { env });
+    indexTree = git(['--git-dir', rescueGitDir, 'write-tree'], { env });
     if (indexRecords.length === 0) {
-      const materializedEmptyTree = git(
-        ['--git-dir', capture.commonGitDir, 'hash-object', '-t', 'tree', '-w', '--stdin'],
-        { input: Buffer.alloc(0) },
-      );
+      const materializedEmptyTree = git(['--git-dir', rescueGitDir, 'hash-object', '-t', 'tree', '-w', '--stdin'], {
+        env: objectEnv,
+        input: Buffer.alloc(0),
+      });
       if (materializedEmptyTree !== indexTree) {
         throw new Error(`empty rescue index tree object mismatch for ${capture.id}`);
       }
@@ -2198,17 +2294,17 @@ function createSyntheticCommit(capture: CheckoutCapture, runId: string): void {
     fs.rmSync(rescueIndex, { force: true });
   }
   const indexCommit = git(
-    ['--git-dir', capture.commonGitDir, 'commit-tree', indexTree, ...(capture.head ? ['-p', capture.head] : [])],
-    { input: `NanoClaw rescue index ${capture.id}\n` },
+    ['--git-dir', rescueGitDir, 'commit-tree', indexTree, ...(capture.head ? ['-p', capture.head] : [])],
+    { env: objectEnv, input: `NanoClaw rescue index ${capture.id}\n` },
   );
-  git(['--git-dir', capture.commonGitDir, 'update-ref', indexRef, indexCommit]);
+  git(['--git-dir', rescueGitDir, 'update-ref', indexRef, indexCommit], { env: objectEnv });
 
-  const tempIndex = path.join(migrationRootForCapture(capture, runId), `worktree-${capture.id}.index`);
+  const tempIndex = path.join(migrationRoot(manifest), 'rescue-indexes', `worktree-${capture.id}.index`);
   fs.mkdirSync(path.dirname(tempIndex), { recursive: true, mode: 0o700 });
   fs.rmSync(tempIndex, { force: true });
   try {
-    const env = { GIT_INDEX_FILE: tempIndex };
-    git(['--git-dir', capture.commonGitDir, 'read-tree', '--empty'], { env });
+    const env = { ...objectEnv, GIT_INDEX_FILE: tempIndex };
+    git(['--git-dir', rescueGitDir, 'read-tree', '--empty'], { env });
 
     // Construct the worktree tree directly from the verified byte inventory.
     // `git add` is forbidden here: repository-defined filters, autocrlf, or
@@ -2232,29 +2328,29 @@ function createSyntheticCommit(capture: CheckoutCapture, runId: string): void {
       if (bytes.length !== entry.size || sha256(bytes) !== entry.sha256) {
         throw new Error(`worktree changed after capture: ${capture.checkoutPath}/${entry.path}`);
       }
-      const oid = git(['--git-dir', capture.commonGitDir, 'hash-object', '--no-filters', '-w', '--stdin'], {
+      const oid = git(['--git-dir', rescueGitDir, 'hash-object', '--no-filters', '-w', '--stdin'], {
+        env: objectEnv,
         input: bytes,
       });
       const mode = entry.type === 'symlink' ? '120000' : entry.mode & 0o111 ? '100755' : '100644';
       entries.push(Buffer.from(`${mode} ${oid}\t${entry.path}\0`));
     }
-    git(['--git-dir', capture.commonGitDir, 'update-index', '-z', '--index-info'], {
+    git(['--git-dir', rescueGitDir, 'update-index', '-z', '--index-info'], {
       env,
       input: Buffer.concat(entries),
     });
-    const worktreeTree = git(['--git-dir', capture.commonGitDir, 'write-tree'], { env });
+    const worktreeTree = git(['--git-dir', rescueGitDir, 'write-tree'], { env });
     const worktreeCommit = git(
-      ['--git-dir', capture.commonGitDir, 'commit-tree', worktreeTree, ...(capture.head ? ['-p', capture.head] : [])],
-      { input: `NanoClaw rescue worktree ${capture.id}\n` },
+      ['--git-dir', rescueGitDir, 'commit-tree', worktreeTree, ...(capture.head ? ['-p', capture.head] : [])],
+      { env: objectEnv, input: `NanoClaw rescue worktree ${capture.id}\n` },
     );
-    git(['--git-dir', capture.commonGitDir, 'update-ref', worktreeRef, worktreeCommit]);
+    git(['--git-dir', rescueGitDir, 'update-ref', worktreeRef, worktreeCommit], { env: objectEnv });
   } finally {
     fs.rmSync(tempIndex, { force: true });
   }
-}
-
-function migrationRootForCapture(capture: CheckoutCapture, runId: string): string {
-  return path.join(path.dirname(path.dirname(capture.checkoutPath)), '.nanoclaw-migration-temp', runId);
+  assertObjectStoreAlternatesDisabled(rescueGitDir);
+  fsyncDirectoryTree(rescueGitDir);
+  fsyncDirectories(path.dirname(rescueGitDir));
 }
 
 function stateFingerprint(capture: CheckoutCapture): string {
@@ -2318,11 +2414,14 @@ function deduplicateCaptures(captures: CheckoutCapture[]): CheckoutCapture[] {
   return [...selected.values()];
 }
 
-function importRescues(canonical: string, capture: CheckoutCapture): void {
+function importRescues(canonical: string, capture: CheckoutCapture, manifest: RepositoryMigrationManifest): void {
   if (!capture.rescue) throw new Error(`capture ${capture.id} has no rescue refs`);
+  const rescueGitDir = rescueObjectStorePath(manifest, capture);
+  importObjectStore(canonical, rescueGitDir);
+  const objectEnv = { GIT_ALTERNATE_OBJECT_DIRECTORIES: path.join(capture.commonGitDir, 'objects') };
   for (const [kind, sourceRef] of Object.entries(capture.rescue)) {
     if (!sourceRef) continue;
-    const oid = git(['--git-dir', capture.commonGitDir, 'rev-parse', '--verify', `${sourceRef}^{commit}`]);
+    const oid = git(['--git-dir', rescueGitDir, 'show-ref', '--verify', '--hash', sourceRef], { env: objectEnv });
     git(['-C', canonical, 'update-ref', `refs/nanoclaw-import/${capture.id}/${kind.replace(/Ref$/, '')}`, oid]);
   }
 }
@@ -2349,14 +2448,7 @@ function importObjectStore(canonical: string, store: string): void {
     fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
     fs.chmodSync(destination, stat.mode & 0o7777);
   };
-  for (const alternateName of ['alternates', 'http-alternates']) {
-    const alternate = path.join(sourceObjects, 'info', alternateName);
-    if (!fs.existsSync(alternate)) continue;
-    const stat = fs.lstatSync(alternate);
-    if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== 0) {
-      throw new Error(`object store alternates are forbidden during migration: ${alternate}`);
-    }
-  }
+  assertObjectStoreAlternatesDisabled(store);
   for (const name of fs.readdirSync(sourceObjects)) {
     const source = path.join(sourceObjects, name);
     const stat = fs.lstatSync(source);
@@ -2767,6 +2859,7 @@ async function executeRepositoryMigrationLocked(
   // lock immediately before the first durable migration mutation.
   await options.assertQuiescent();
   verifyRepositoryMigrationManifest(manifest);
+  validateManifestRecoverySeeds(manifest);
   const root = migrationRoot(manifest);
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   atomicJson(manifestPath(manifest), manifest);
@@ -2775,7 +2868,7 @@ async function executeRepositoryMigrationLocked(
 
   try {
     if (!journal.phases.includes('rescued')) {
-      for (const capture of manifest.captures) createSyntheticCommit(capture, manifest.runId);
+      for (const capture of manifest.captures) createSyntheticCommit(capture, manifest);
       recordPhase(manifest, journal, 'rescued');
     }
 
@@ -2814,7 +2907,7 @@ async function executeRepositoryMigrationLocked(
         git(['-C', temp, 'config', 'gc.auto', '0']);
         git(['-C', temp, 'config', 'gc.worktreePruneExpire', 'never']);
         for (const store of manifest.objectStores) importObjectStore(temp, store);
-        for (const capture of manifest.captures) importRescues(temp, capture);
+        for (const capture of manifest.captures) importRescues(temp, capture, manifest);
         git([
           '-C',
           temp,
@@ -2938,6 +3031,7 @@ export async function executeRepositoryMigration(
   },
 ): Promise<RepositoryMigrationManifest> {
   verifyRepositoryMigrationManifest(manifest);
+  validateManifestRecoverySeeds(manifest);
   if (manifest.capacity.availableBytes < manifest.capacity.requiredBytes)
     throw new Error('capacity gate no longer passes');
   const statfs = fs.statfsSync(manifest.dataDir);

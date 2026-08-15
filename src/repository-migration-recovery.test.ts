@@ -61,6 +61,42 @@ describe('reviewed repository recovery decisions', () => {
     expect(() => loadReviewedRecoveryDecisions(file)).toThrow(/group\/world writable/);
   });
 
+  it('loads an exact Git-admin decision bound to a host-only external seed', () => {
+    const checkoutPath = path.join(root, 'checkout');
+    const common = path.join(root, 'recovery-seeds', 'repo.git');
+    const selectedGitDir = path.join(common, 'worktrees', 'checkout');
+    const externalSeedGitDirSha256 = 'd'.repeat(64);
+    const file = writeRecovery({
+      version: 2,
+      checkouts: [
+        {
+          checkoutPath,
+          workgroupId: 'wg-a',
+          repo: 'xzo',
+          action: 'restore-visible-state',
+          selection: 'exact-git-admin',
+          selectedGitDir,
+          selectedCommonGitDir: common,
+          selectedHead: 'a'.repeat(40),
+          selectedBranch: 'feature/recovery',
+          selectedIndexSha256: 'b'.repeat(64),
+          gitPointerSha256: 'c'.repeat(64),
+          externalSeedGitDirSha256,
+          visibleStateSha256: 'e'.repeat(64),
+        },
+      ],
+      origins: [],
+    });
+
+    expect(loadReviewedRecoveryDecisions(file)?.checkouts[0]).toMatchObject({
+      checkoutPath,
+      selection: 'exact-git-admin',
+      selectedGitDir,
+      selectedCommonGitDir: common,
+      externalSeedGitDirSha256,
+    });
+  });
+
   it('selects a credential-free reviewed origin only for the exact observed origin set', () => {
     const observed = ['https://github.com/old/repo', 'https://github.com/new/repo'];
     const decision = {

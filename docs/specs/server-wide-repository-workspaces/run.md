@@ -212,3 +212,36 @@ and must be recorded before their respective states are declared complete.
   intentionally fails closed on any post-cutover state. If a canary changes
   repository state despite the constraint, rollback remains blocked until that
   new work is captured into a separate lossless ledger.
+
+## Exact external Git-admin recovery
+
+- Added a hash-bound host-only external-seed path for an exact linked-worktree
+  Git admin when cleanup has already removed its original admin directory. The
+  selected admin must be an immediate child of the seed common directory's
+  `worktrees/` directory; the seed must be a real directory beneath the
+  configured recovery root, match its reviewed SHA-256 inventory, pass
+  `git fsck --full`, and contain no active `objects/info/alternates` or
+  `http-alternates` escape hatch.
+- Execution never writes rescue objects or refs into a reviewed seed. Synthetic
+  rescues are built in deterministic migration-owned bare stores using a
+  process-local object-read path, contain no persisted object alternates, and
+  have their directory trees and parent entries fsynced before the `rescued`
+  phase is journaled. The external seed digest is persisted in each applicable
+  capture and revalidated before lock acquisition and again under the lock
+  before the first migration-root mutation; protected seeds are never renamed.
+- The successful recovery test regenerates the complete reviewed decision from
+  the protected final seed through `createReviewedExactGitAdminRecoveryProposal`
+  after the original admin is deleted. Capture, migration, and audit preserve
+  HEAD, branch, raw index bytes/mode/auxiliary files, staged and unstaged state,
+  untracked files, executable modes, symlinks, and the original broken pointer.
+  Hash, path, seed-symlink, post-review mutation, and both object-alternate
+  tamper cases fail closed.
+- The external-seed regression performs a true child-process exit 86 after the
+  durable `rescued` phase, reloads the hash-bound active descriptor, resumes to
+  a successful audit, and rolls back while proving the seed digest remains
+  unchanged throughout. A post-manifest seed mutation rejects before the
+  manifest is durably written.
+- Final fresh verification after the immutable-rescue-store correction: 53/53
+  migration and recovery tests passed; host TypeScript, candidate Prettier, and
+  `git diff --check` passed. Independent adversarial review cleared the final
+  blocker. This lane made no live mutation, outage, commit, or push.
