@@ -2,13 +2,14 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   assertExactRepositoryNamespaces,
   assertNoResidualLegacyCheckoutTopology,
   assertRemainingAggregateCapacity,
   assertServiceInactive,
+  captureProtectedArchives,
   classifySessionRepositoryCheckout,
   configuredOriginProvenance,
   loadMigrationDescriptor,
@@ -32,6 +33,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -128,6 +130,53 @@ function normalCheckout(directory: string, origin?: string): void {
 }
 
 describe('server repository migration safety helpers', () => {
+  it('ignores group file symlinks while preserving archive-root symlink rejection', () => {
+    const groupsDir = path.join(root, 'groups');
+    const groupRoot = path.join(groupsDir, 'group-a');
+    fs.mkdirSync(groupRoot, { recursive: true });
+    fs.writeFileSync(path.join(groupRoot, 'CLAUDE.md'), '# group\n');
+    fs.symlinkSync('CLAUDE.md', path.join(groupRoot, 'CLAUDE.local.md'));
+
+    expect(
+      captureProtectedArchives(
+        [{ agent_group_id: 'ag-a', folder: 'group-a', workgroup_id: 'wg-a' }],
+        new Set(['wg-a']),
+        groupsDir,
+      ),
+    ).toEqual([]);
+
+    const archive = path.join(groupRoot, 'archive');
+    fs.mkdirSync(archive);
+    fs.writeFileSync(path.join(archive, '.archive-sha'), 'a'.repeat(40));
+    fs.symlinkSync('archive', path.join(groupRoot, 'archive-link'));
+    expect(() =>
+      captureProtectedArchives(
+        [{ agent_group_id: 'ag-a', folder: 'group-a', workgroup_id: 'wg-a' }],
+        new Set(['wg-a']),
+        groupsDir,
+      ),
+    ).toThrow(/unsafe protected archive root/);
+  });
+
+  it('propagates ENOTDIR after a real protected archive marker is found', () => {
+    const groupsDir = path.join(root, 'groups');
+    const archive = path.join(groupsDir, 'group-a', 'archive');
+    fs.mkdirSync(archive, { recursive: true });
+    fs.writeFileSync(path.join(archive, '.archive-sha'), 'a'.repeat(40));
+    const error = Object.assign(new Error('path topology changed'), { code: 'ENOTDIR' });
+    vi.spyOn(fs, 'realpathSync').mockImplementationOnce(() => {
+      throw error;
+    });
+
+    expect(() =>
+      captureProtectedArchives(
+        [{ agent_group_id: 'ag-a', folder: 'group-a', workgroup_id: 'wg-a' }],
+        new Set(['wg-a']),
+        groupsDir,
+      ),
+    ).toThrow(error);
+  });
+
   it('residual topology audit catches group dist plus session and thread build repositories', () => {
     const groupRoot = path.join(root, 'group');
     const sessionRoot = path.join(root, 'session');

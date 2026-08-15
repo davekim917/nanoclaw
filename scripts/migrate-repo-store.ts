@@ -103,7 +103,7 @@ interface SessionRow {
   thread_id: string | null;
 }
 
-interface AgentGroupRow {
+export interface AgentGroupRow {
   agent_group_id: string;
   folder: string;
   workgroup_id: string;
@@ -178,28 +178,42 @@ function canonicalJson(value: unknown): string {
     .join(',')}}`;
 }
 
-function captureProtectedArchives(groups: AgentGroupRow[], workgroups: Set<string>): ProtectedArchiveEvidence[] {
+export function captureProtectedArchives(
+  groups: AgentGroupRow[],
+  workgroups: Set<string>,
+  groupsDir = GROUPS_DIR,
+): ProtectedArchiveEvidence[] {
   const roots = new Set<string>();
   for (const group of groups) {
     if (!workgroups.has(group.workgroup_id)) continue;
-    const groupRoot = path.join(GROUPS_DIR, group.folder);
+    const groupRoot = path.join(groupsDir, group.folder);
     for (const child of safeDirectories(groupRoot)) {
       const candidate = path.join(groupRoot, child);
-      try {
-        const marker = fs.lstatSync(path.join(candidate, '.archive-sha'));
-        const candidateStat = fs.lstatSync(candidate);
-        if (
-          candidateStat.isSymbolicLink() ||
-          !candidateStat.isDirectory() ||
-          marker.isSymbolicLink() ||
-          !marker.isFile()
-        ) {
-          throw new Error(`unsafe protected archive root: ${candidate}`);
+      const candidateStat = fs.lstatSync(candidate);
+      if (candidateStat.isSymbolicLink()) {
+        try {
+          // safeDirectories deliberately includes symlinks so repository
+          // discovery can validate directory aliases. Group configuration
+          // also uses symlinks to regular files; those cannot be archives.
+          if (!fs.statSync(candidate).isDirectory()) continue;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+          throw error;
         }
-        roots.add(fs.realpathSync(candidate));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      } else if (!candidateStat.isDirectory()) {
+        throw new Error(`protected archive candidate changed type during inventory: ${candidate}`);
       }
+      let marker: fs.Stats;
+      try {
+        marker = fs.lstatSync(path.join(candidate, '.archive-sha'));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      if (candidateStat.isSymbolicLink() || marker.isSymbolicLink() || !marker.isFile()) {
+        throw new Error(`unsafe protected archive root: ${candidate}`);
+      }
+      roots.add(fs.realpathSync(candidate));
     }
   }
   return [...roots].sort().map(captureProtectedArchive);
