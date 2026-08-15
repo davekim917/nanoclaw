@@ -601,7 +601,7 @@ export async function applyRepositoryPublishAction(
         content: JSON.stringify({ text: confirmation, sender: 'system', senderId: 'system' }),
         onWake: 1,
       });
-      releaseWakeSessions = releaseRepositoryMountQuiescence(quiescence);
+      releaseWakeSessions = await releaseRepositoryMountQuiescence(quiescence);
       quiescence = null;
     });
     const sessionsToWake = uniqueSessionsById(affectedSessions, releaseWakeSessions, [session]);
@@ -616,7 +616,7 @@ export async function applyRepositoryPublishAction(
     let barriersReleased = quiescence === null;
     if (quiescence) {
       try {
-        releaseWakeSessions = releaseRepositoryMountQuiescence(quiescence);
+        releaseWakeSessions = await releaseRepositoryMountQuiescence(quiescence);
         barriersReleased = true;
         quiescence = null;
       } catch (releaseError) {
@@ -850,7 +850,7 @@ export async function applyRepositoryTransferAction(
           });
         }
         if (!quiescence) throw new Error('repository transfer quiescence was lost before barrier release');
-        releaseWakeSessions = releaseRepositoryMountQuiescence(quiescence);
+        releaseWakeSessions = await releaseRepositoryMountQuiescence(quiescence);
         quiescence = null;
       },
     });
@@ -866,7 +866,7 @@ export async function applyRepositoryTransferAction(
     let barriersReleased = quiescence === null;
     if (quiescence) {
       try {
-        releaseWakeSessions = releaseRepositoryMountQuiescence(quiescence);
+        releaseWakeSessions = await releaseRepositoryMountQuiescence(quiescence);
         barriersReleased = true;
         quiescence = null;
       } catch (releaseError) {

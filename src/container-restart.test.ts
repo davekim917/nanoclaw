@@ -27,10 +27,28 @@ vi.mock('./db/sessions.js', () => ({
 
 const mockWriteSessionMessage = vi.fn();
 type MockSessionDb = { sessionId: string; close: ReturnType<typeof vi.fn> };
+/** Session rows that exist in the central DB but own no inbound DB file. */
+const missingInboundDbs = new Set<string>();
 vi.mock('./session-manager.js', () => ({
   writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
-  openInboundDb: (...args: unknown[]) => ({ sessionId: args[1] as string, close: vi.fn() }),
+  openInboundDb: (...args: unknown[]) => {
+    const sessionId = args[1] as string;
+    if (missingInboundDbs.has(sessionId)) {
+      // Exactly what better-sqlite3 throws for a reclaimed session directory.
+      throw new TypeError('Cannot open database because the directory does not exist');
+    }
+    return { sessionId, close: vi.fn() };
+  },
   openOutboundDb: (...args: unknown[]) => ({ sessionId: args[1] as string, close: vi.fn() }),
+  inboundDbPath: (...args: unknown[]) => `/mock-sessions/${args[0]}/${args[1]}/inbound.db`,
+}));
+vi.mock('fs', () => ({
+  default: {
+    existsSync: (target: string) => {
+      const sessionId = String(target).split('/').at(-2);
+      return sessionId !== undefined && !missingInboundDbs.has(sessionId);
+    },
+  },
 }));
 
 const mockCountDueMessages = vi.fn((..._args: unknown[]) => 0);
@@ -91,6 +109,7 @@ beforeEach(() => {
   processingSessions.clear();
   toolSessions.clear();
   activationFailures.clear();
+  missingInboundDbs.clear();
   autoAcknowledgeBarrier = true;
   barrierGeneration = 0;
   mockCountDueMessages.mockReturnValue(0);
@@ -111,7 +130,7 @@ describe('repository mount reconciliation', () => {
     expect(quiescence.sessions.map((session) => session.id).sort()).toEqual(['s1', 's2']);
     expect(quiescence.barrierSessions.map((session) => session.id).sort()).toEqual(['s1', 's2']);
 
-    expect(releaseRepositoryMountQuiescence(quiescence)).toEqual([]);
+    expect(await releaseRepositoryMountQuiescence(quiescence)).toEqual([]);
     wakeRepositoryMountSessions(quiescence.sessions);
     expect(mockWakeContainer).toHaveBeenCalledTimes(2);
   });
@@ -126,6 +145,9 @@ describe('repository mount reconciliation', () => {
     });
 
     const pending = quiesceSessionsForRepositoryMounts([session] as never, 'repository-transfer:req-1');
+    // Fencing yields to the event loop, so it lands a turn after the call —
+    // still strictly before any kill, which is what this test pins.
+    await new Promise((resolve) => setImmediate(resolve));
     expect(activeEpochs.get('s1')).toEqual({
       epoch: 'repository-transfer:req-1',
       generation: 'generation-1',
@@ -148,7 +170,7 @@ describe('repository mount reconciliation', () => {
     const quiescence = await pending;
     expect(mockKillContainer).toHaveBeenCalledWith('s1', 'repository mount set changed', undefined);
     expect(quiescence.epoch).toBe('repository-transfer:req-1');
-    releaseRepositoryMountQuiescence(quiescence);
+    await releaseRepositoryMountQuiescence(quiescence);
   });
 
   it('returns every stopped or initially-idle session with durable due rows after release', async () => {
@@ -163,7 +185,64 @@ describe('repository mount reconciliation', () => {
       [running, initiallyIdle] as never,
       'repository-publish:req-2',
     );
-    expect(releaseRepositoryMountQuiescence(quiescence).map((session) => session.id)).toEqual(['s2']);
+    expect((await releaseRepositoryMountQuiescence(quiescence)).map((session) => session.id)).toEqual(['s2']);
+  });
+
+  it('fences around session rows whose inbound database no longer exists', async () => {
+    // A reclaimed session directory used to throw out of activation and fail
+    // the whole publication permanently. Such a row owns no ingress path, so
+    // quiescence must skip it and still fence its live siblings.
+    const live = makeSession('s1', 'g1');
+    const reclaimed = makeSession('s2', 'g1');
+    missingInboundDbs.add('s2');
+    const running = new Set(['s1']);
+    mockIsContainerRunning.mockImplementation((id) => running.has(id));
+    mockKillContainer.mockImplementation((id) => {
+      running.delete(id);
+    });
+
+    const quiescence = await quiesceSessionsForRepositoryMounts(
+      [live, reclaimed] as never,
+      'repository-publish:req-missing',
+    );
+
+    expect(quiescence.barrierSessions.map((session) => session.id)).toEqual(['s1']);
+    expect(activeEpochs.get('s1')?.state).toBe('active');
+    expect(activeEpochs.has('s2')).toBe(false);
+    expect(await releaseRepositoryMountQuiescence(quiescence)).toEqual([]);
+    expect(activeEpochs.get('s1')?.state).toBe('released');
+  });
+
+  it('refuses to quiesce when a running container has no inbound database to fence', async () => {
+    // The stop set is derived before the fenceable filter, so an inconsistent
+    // host view fails fast instead of waiting out the full barrier timeout.
+    const running = makeSession('s1', 'g1');
+    missingInboundDbs.add('s1');
+    mockIsContainerRunning.mockImplementation((id) => id === 's1');
+
+    await expect(
+      quiesceSessionsForRepositoryMounts([running] as never, 'repository-publish:req-inconsistent'),
+    ).rejects.toThrow(/no inbound database to fence: s1/);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+  });
+
+  it('yields to the event loop while fencing a large workgroup', async () => {
+    // Fencing commits one fsync per session DB. Without yields a few thousand
+    // sessions block every unrelated channel adapter for the whole cycle.
+    const sessions = Array.from({ length: 250 }, (_, index) => makeSession(`s${index}`, 'g1'));
+    mockIsContainerRunning.mockReturnValue(false);
+    let macrotasksObserved = 0;
+    const tick = setInterval(() => {
+      macrotasksObserved += 1;
+    }, 0);
+
+    try {
+      const quiescence = await quiesceSessionsForRepositoryMounts([...sessions] as never, 'repository-publish:req-big');
+      expect(quiescence.barrierSessions).toHaveLength(250);
+      expect(macrotasksObserved).toBeGreaterThan(0);
+    } finally {
+      clearInterval(tick);
+    }
   });
 
   it('does not roll back a crash-left same-epoch barrier when a later session activation fails', async () => {
@@ -202,6 +281,7 @@ describe('repository mount reconciliation', () => {
     mockKillContainer.mockImplementation((id) => running.delete(id));
 
     const pending = quiesceSessionsForRepositoryMounts([session] as never, 'repository-publish:req-replayed');
+    await new Promise((resolve) => setImmediate(resolve));
     expect(activeEpochs.get('s1')).toEqual({
       epoch: 'repository-publish:req-replayed',
       generation: 'generation-1',
@@ -213,7 +293,7 @@ describe('repository mount reconciliation', () => {
     acknowledgedEpochs.set('s1', JSON.stringify(['repository-publish:req-replayed', 'generation-1']));
     const quiescence = await pending;
     expect(mockKillContainer).toHaveBeenCalledTimes(1);
-    releaseRepositoryMountQuiescence(quiescence);
+    await releaseRepositoryMountQuiescence(quiescence);
   });
 
   it('attaches the exact stopped/due recovery set when post-kill stop proof times out', async () => {

@@ -18,8 +18,9 @@ import {
 } from './db/session-db.js';
 import { getSession, getSessionsByAgentGroup } from './db/sessions.js';
 import { log } from './log.js';
-import { openInboundDb, openOutboundDb, writeSessionMessage } from './session-manager.js';
+import { inboundDbPath, openInboundDb, openOutboundDb, writeSessionMessage } from './session-manager.js';
 import type { Session } from './types.js';
+import fs from 'fs';
 
 async function waitUntil(predicate: () => boolean, message: string, timeoutMs = 120_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -63,15 +64,40 @@ function uniqueSessions(sessions: Session[]): Session[] {
   return [...new Map(sessions.map((session) => [session.id, session])).values()];
 }
 
-function activateRepositoryMountBarriers(
+/**
+ * A session row whose inbound DB was never created (or was reclaimed) has no
+ * ingress path to fence: messages_in only exists inside that file, and the only
+ * writer that could create it is a spawn, which is already rejected at the
+ * workgroup mount claim (container-runner `isWorkgroupRepositoryMountClaimed`)
+ * for the whole quiescence window. Opening it instead throws inside
+ * better-sqlite3 ("directory does not exist") and fails the entire publication.
+ */
+function hasFenceableIngress(session: Session): boolean {
+  return fs.existsSync(inboundDbPath(session.agent_group_id, session.id));
+}
+
+/**
+ * Fencing writes one commit per session DB under `journal_mode=DELETE`, which
+ * costs ~9ms of synchronous fsync each. A workgroup with thousands of sessions
+ * therefore blocks the host event loop for a minute or more, starving every
+ * unrelated channel adapter and workgroup. Yielding keeps the stall scoped to
+ * the workgroup being reconciled; the mount claim (not this loop) is what holds
+ * admission closed, so a yield here cannot let a spawn through.
+ */
+async function yieldEventLoop(index: number): Promise<void> {
+  if (index > 0 && index % 100 === 0) await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function activateRepositoryMountBarriers(
   sessions: Session[],
   epoch: string,
-): { barrierAcks: Record<string, string>; barrierGenerations: Record<string, string> } {
+): Promise<{ barrierAcks: Record<string, string>; barrierGenerations: Record<string, string> }> {
   const activated: Session[] = [];
   const barrierAcks: Record<string, string> = {};
   const barrierGenerations: Record<string, string> = {};
   try {
-    for (const session of sessions) {
+    for (const [index, session] of sessions.entries()) {
+      await yieldEventLoop(index);
       const inDb = openInboundDb(session.agent_group_id, session.id);
       try {
         const prior = readRepoIngressFence(inDb);
@@ -142,9 +168,10 @@ function sessionReachedRepositoryBarrier(session: Session, expectedAck: string):
  * on-wake confirmation are committed. Idempotent for an already-released
  * matching epoch; any different/missing state fails closed.
  */
-export function releaseRepositoryMountQuiescence(quiescence: RepositoryMountQuiescence): Session[] {
+export async function releaseRepositoryMountQuiescence(quiescence: RepositoryMountQuiescence): Promise<Session[]> {
   const wakeRequired: Session[] = [];
-  for (const session of quiescence.barrierSessions) {
+  for (const [index, session] of quiescence.barrierSessions.entries()) {
+    await yieldEventLoop(index);
     const inDb = openInboundDb(session.agent_group_id, session.id);
     try {
       const generation = quiescence.barrierGenerations[session.id];
@@ -192,13 +219,22 @@ export async function quiesceSessionsForRepositoryMounts(
   timeoutMs = 120_000,
 ): Promise<RepositoryMountQuiescence> {
   if (!epoch) throw new Error('repository mount barrier epoch must not be empty');
-  const barrierSessions = uniqueSessions(sessions);
+  const known = uniqueSessions(sessions);
   // Runtime process maps are authoritative. A stale inactive DB row can still
-  // own a live RW mount and must not escape quiescence.
-  const affected = barrierSessions.filter(
-    (session) => isContainerRunning(session.id) || isContainerSpawning(session.id),
-  );
-  const { barrierAcks, barrierGenerations } = activateRepositoryMountBarriers(barrierSessions, epoch);
+  // own a live RW mount and must not escape quiescence — so the stop set is
+  // derived before the fenceable filter, never from it.
+  const affected = known.filter((session) => isContainerRunning(session.id) || isContainerSpawning(session.id));
+  const barrierSessions = known.filter(hasFenceableIngress);
+  // A live container always owns an inbound DB to poll. If one is running
+  // without a fenceable DB the host's view is inconsistent, and proceeding
+  // would wait the full barrier timeout for an ack that can never be written.
+  const unfenceable = affected.filter((session) => !hasFenceableIngress(session));
+  if (unfenceable.length > 0) {
+    throw new Error(
+      `running session(s) have no inbound database to fence: ${unfenceable.map((session) => session.id).join(', ')}`,
+    );
+  }
+  const { barrierAcks, barrierGenerations } = await activateRepositoryMountBarriers(barrierSessions, epoch);
   const quiescence = { epoch, sessions: affected, barrierSessions, barrierAcks, barrierGenerations };
   try {
     await waitUntil(
@@ -222,7 +258,7 @@ export async function quiesceSessionsForRepositoryMounts(
     return quiescence;
   } catch (error) {
     try {
-      const releaseWakeSessions = releaseRepositoryMountQuiescence(quiescence);
+      const releaseWakeSessions = await releaseRepositoryMountQuiescence(quiescence);
       throw new RepositoryMountQuiescenceError(error, quiescence, releaseWakeSessions, true);
     } catch (releaseError) {
       if (releaseError instanceof RepositoryMountQuiescenceError) throw releaseError;
