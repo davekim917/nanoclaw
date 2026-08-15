@@ -289,8 +289,8 @@ default** is the floor, the **per-group DB value** (`container_configs`, set via
 `OPENCODE_MODEL_<FOLDER>` / `OPENCODE_PROVIDER_<FOLDER>` / `OPENCODE_BASE_URL_<FOLDER>`
 scoped vars were removed (one config pattern across all harnesses).
 
-A new Go-billing sibling needs **no model config at all** — it inherits
-`DEFAULT_OPENCODE_MODEL` (`opencode-go/qwen3.8-max`, effort `high`) from
+A new sibling needs **no model config at all** — it inherits
+`DEFAULT_OPENCODE_MODEL` (`opencode/gemini-3.7-flash`, effort `high`) from
 `src/providers/opencode.ts`. To run a different model, set it on the DB row
 **after** the `agent_groups` row exists (step 7):
 
@@ -304,15 +304,16 @@ endpoint, and the host derives `OPENCODE_PROVIDER` from it automatically:
 
 | Model slug prefix | Endpoint | Billing |
 |---|---|---|
-| `opencode-go/*` (e.g. `opencode-go/kimi-k2.7-code`) | `/zen/go/v1` | **Go subscription** (default — cheapest) |
-| `opencode/*` (e.g. `opencode/gpt-5.5`) | `/zen/v1` | **Zen credit** (opt-in; use only for a Zen-only model) |
+| `opencode-go/*` (e.g. `opencode-go/kimi-k2.7-code`) | `/zen/go/v1` | **Go subscription** |
+| `opencode/*` (e.g. `opencode/gpt-5.5`) | `/zen/v1` | **Zen credit** |
 | `nvidia/*` | NVIDIA | per NVIDIA cred |
 
 The container enables EVERY credentialed provider in-session, so the agent can
 switch to any go/zen/nvidia model mid-thread with the `-m <slug>` flag (no
 restart) — `ncl groups config update --model` / `change_model` is the
-persistent group-level equivalent. Default to `opencode-go/*`; reach for
-`opencode/*` only when you deliberately want a Zen-only model.
+persistent group-level equivalent. The code default is
+`opencode/gemini-3.7-flash`; choose `opencode-go/*` explicitly when you want a
+model routed through the Go subscription.
 
 **Reasoning effort** — `-e` / the `--effort` DB field accept `low | medium | high`
 (the portable intersection). `xhigh`/`max`/`minimal` are NOT accepted for
@@ -492,7 +493,7 @@ WHERE mga.agent_group_id='${SIBLING_FOLDER}'"
 # .env var to read anymore).
 MODEL=$(pnpm exec tsx scripts/q.ts data/v2.db \
   "SELECT model FROM container_configs WHERE agent_group_id='${SIBLING_FOLDER}'" 2>/dev/null | tr -d '\n')
-[ -n "$MODEL" ] || MODEL="opencode-go/qwen3.8-max"   # DEFAULT_OPENCODE_MODEL
+[ -n "$MODEL" ] || MODEL="opencode/gemini-3.7-flash"   # DEFAULT_OPENCODE_MODEL
 PROV="${MODEL%%/*}"   # e.g. opencode-go (Go), opencode (Zen), nvidia
 # Resolve the auth.json this sibling uses: scoped dir if present, else global.
 AUTH="$HOME/.local/share/opencode-${SIBLING_FOLDER}/auth.json"

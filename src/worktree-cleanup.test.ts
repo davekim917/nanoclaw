@@ -188,6 +188,32 @@ describe('per-topic linked worktree cleanup', () => {
     expect(git(fixture.canonical, ['rev-parse', `refs/heads/${otherBranch}^{commit}`])).toBe(branchBefore);
   });
 
+  it('preserves a standalone checkout that owns sibling worktree metadata', async () => {
+    const fixture = repositoryFixture();
+    const remote = git(fixture.canonical, ['remote', 'get-url', 'origin']);
+    const sibling = path.join(state.dataDir, 'legacy-sibling');
+    fs.rmSync(fixture.worktree, { recursive: true, force: true });
+    execFileSync('git', ['clone', '-q', remote, fixture.worktree]);
+    git(fixture.worktree, ['worktree', 'add', '-q', '-b', 'legacy-sibling', sibling, 'origin/HEAD']);
+    const siblingPointer = fs.readFileSync(path.join(sibling, '.git'), 'utf8');
+    const siblingAdmin = git(sibling, ['rev-parse', '--absolute-git-dir']);
+    const old = new Date(Date.now() - 8 * 86_400_000);
+    fs.utimesSync(fixture.worktree, old, old);
+
+    // This checkout is otherwise eligible for deletion. The common-dir
+    // identity check is the only reason cleanup must refuse it.
+    expect(git(fixture.worktree, ['status', '--porcelain=v1'])).toBe('');
+    expect(git(fixture.worktree, ['log', 'HEAD', '--not', '--remotes', '--oneline'])).toBe('');
+
+    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    await _cleanupOneForTesting(target, state.dataDir);
+
+    expect(fs.existsSync(fixture.worktree)).toBe(true);
+    expect(fs.existsSync(siblingAdmin)).toBe(true);
+    expect(fs.readFileSync(path.join(sibling, '.git'), 'utf8')).toBe(siblingPointer);
+    expect(fs.existsSync(fixture.cache)).toBe(true);
+  });
+
   it.each([
     ['running', () => state.running.add('s1')],
     ['spawning', () => state.spawning.add('s1')],
