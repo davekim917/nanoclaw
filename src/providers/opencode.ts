@@ -25,11 +25,12 @@ import { registerProviderContainerConfig } from './provider-container-registry.j
 
 // Code-level opencode defaults — the floor under the per-group DB value
 // (container_configs), mirroring DEFAULT_OPUS_MODEL etc. for claude in
-// container-runner.ts. Default to gemini-3.7-flash at high effort.
-// Bump these when the fleet default moves. The provider is derived from the
-// model prefix at runtime; the constant only guards a malformed override.
-const DEFAULT_OPENCODE_MODEL = 'opencode/gemini-3.7-flash';
-const DEFAULT_OPENCODE_PROVIDER = 'opencode';
+// container-runner.ts. Default to the Go subscription (cheapest tier); Zen is
+// opt-in via an explicit `opencode/*` model. Bump these when the fleet default
+// moves. The provider is derived from the model prefix at
+// runtime; the constant only guards a malformed override.
+const DEFAULT_OPENCODE_MODEL = 'opencode-go/qwen3.8-max';
+const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
 const DEFAULT_OPENCODE_EFFORT = 'high';
 
 /**
