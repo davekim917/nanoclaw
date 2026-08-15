@@ -152,6 +152,33 @@ describe('canonical adoption', () => {
     expect(git(canonical, 'status', '--porcelain=v1', '--untracked-files=all')).toBe('');
   });
 
+  it('keeps gitignored files that exist nowhere else instead of cleaning them away', async () => {
+    const legacy = legacyCheckout('sip-true');
+    fs.writeFileSync(path.join(legacy, '.gitignore'), '.env\nnode_modules/\n');
+    git(legacy, 'add', '-A');
+    git(legacy, 'commit', '-q', '-m', 'add ignores');
+    // The ignore rules must be part of the published remote default, otherwise
+    // detaching there rewinds past them and the files stop being ignored.
+    git(legacy, 'update-ref', 'refs/remotes/origin/develop', git(legacy, 'rev-parse', 'HEAD'));
+    fs.writeFileSync(path.join(legacy, '.env'), 'SECRET=keep-me\n');
+    fs.mkdirSync(path.join(legacy, 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(legacy, 'node_modules', 'vendor.js'), '// regenerable\n');
+    // Force the cleaning branch by adding one non-ignored untracked file.
+    fs.writeFileSync(path.join(legacy, 'scratch.txt'), 'transient\n');
+
+    const [checkout] = planRepositoryActivation(WG, root).adopt;
+    expect(checkout!.dirtyPaths).toEqual(['scratch.txt']);
+    await activateCanonicalRepository({ workgroupId: WG, checkout: checkout!, dataDir: root });
+
+    const canonical = canonicalRepoDir(WG, 'sip-true', root);
+    // Irreplaceable ignored config survives; the untracked file was preserved
+    // and removed; the tree still reads clean.
+    expect(fs.readFileSync(path.join(canonical, '.env'), 'utf8')).toBe('SECRET=keep-me\n');
+    expect(fs.existsSync(path.join(canonical, 'node_modules', 'vendor.js'))).toBe(true);
+    expect(fs.existsSync(path.join(canonical, 'scratch.txt'))).toBe(false);
+    expect(git(canonical, 'status', '--porcelain=v1', '--untracked-files=all')).toBe('');
+  });
+
   it('carries local-only commits and unpushed branches across the move', async () => {
     const legacy = legacyCheckout('dbt');
     git(legacy, 'checkout', '-q', '-b', 'feat/unpushed');

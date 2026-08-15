@@ -66,6 +66,8 @@ export interface RepositoryActivationResult {
   preservedFileCount: number;
   prunedWorktrees: number;
   detachedAt: string;
+  /** Paths still dirty after detaching. Non-empty blocks Graphify refresh. */
+  residue: string[];
 }
 
 function git(cwd: string, args: string[], timeout = 120_000): string {
@@ -368,11 +370,35 @@ export async function activateCanonicalRepository(input: {
       const target = remoteHead ?? git(checkout.path, ['rev-parse', '--verify', 'HEAD^{commit}'], 30_000);
       if (checkout.dirtyPaths.length > 0) {
         // Preserved above; the canonical must present a clean tree.
+        //
+        // Deliberately no `-x`. Ignored files are not migration inputs, but
+        // they are also not all regenerable — a gitignored `.env` or
+        // profiles.yml exists nowhere else and is not covered by the
+        // preservation pass, which only walks non-ignored dirty paths. Leaving
+        // them in place moves them with the repository and still leaves a
+        // clean `git status`. Single `-f` likewise protects nested Git
+        // directories from being removed wholesale.
         git(checkout.path, ['reset', '--hard', '--quiet'], 300_000);
-        git(checkout.path, ['clean', '-qfdx'], 300_000);
+        git(checkout.path, ['clean', '-qfd'], 300_000);
       }
       git(checkout.path, ['checkout', '-q', '--detach', target], 300_000);
       const detachedAt = git(checkout.path, ['rev-parse', 'HEAD'], 30_000);
+
+      // The detach target can carry different ignore rules than the branch that
+      // was checked out, which can leave previously-ignored files visible. That
+      // does not endanger any data, but it does block
+      // refreshCanonicalFromLocalRefs (and therefore Graphify freshness), so it
+      // is reported rather than silently accepted. Throwing here would be worse
+      // than reporting: the state is already preserved and the move is next.
+      const residue = dirtyWorktreePaths(checkout.path);
+      if (residue.length > 0) {
+        log.warn('Canonical is not clean after detaching; Graphify refresh will refuse until resolved', {
+          workgroupId,
+          repo: checkout.repo,
+          residue: residue.slice(0, 20),
+          residueCount: residue.length,
+        });
+      }
 
       // 4. Automatic GC must never run while linked worktrees hold refs.
       git(checkout.path, ['config', 'gc.auto', '0'], 30_000);
@@ -405,6 +431,7 @@ export async function activateCanonicalRepository(input: {
         preservedFileCount,
         prunedWorktrees: Math.max(0, before - after),
         detachedAt,
+        residue,
       };
     },
     dataDir,
