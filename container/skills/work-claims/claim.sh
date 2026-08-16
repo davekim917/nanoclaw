@@ -14,6 +14,11 @@
 
 set -euo pipefail
 
+# A park is a handoff offer; if nobody takes it inside a day the offer lapsed.
+# Mirrors PARK_GRACE_MS in src/claims-board.ts — the board and the script must
+# classify the same file the same way.
+PARK_GRACE_HOURS=24
+
 CLAIMS_DIR="${CLAIMS_DIR:-/workspace/workgroup/claims}"
 WORKGROUP_ROOT="$(dirname "$CLAIMS_DIR")"
 
@@ -80,9 +85,24 @@ inspect() {
   claimed_at="$(jq -r '.claimed_at // empty' "$f")"
   ttl="$(jq -r '.ttl_hours // empty' "$f")"
 
-  # A parked claim is a declared third state, not a timestamp — it wins over
-  # TTL classification even if claimed_at/ttl_hours are still on the file.
-  if [ "$status" = "parked" ]; then printf 'parked\t%s\t%s\n' "$owner" "$note"; return; fi
+  # A parked claim wins over TTL classification even if claimed_at/ttl_hours
+  # are still on the file — but it is a WAYPOINT, not a terminus. This used to
+  # return here unconditionally, which made parked an absorbing state: a park
+  # says "someone should pick this up" and nothing ever did. Seven parked
+  # claims were found sitting in one workgroup, three with no ttl_hours at all,
+  # the oldest at 93 hours. Past the grace window the offer has lapsed and the
+  # slug goes back to stale, which is already the state that means "free to
+  # take". PARK_GRACE_HOURS matches PARK_GRACE_MS in src/claims-board.ts.
+  if [ "$status" = "parked" ]; then
+    local parked_at parked_secs
+    parked_at="$(jq -r '.parked_at // empty' "$f")"
+    if [ -n "$parked_at" ] && parked_secs="$(date -u -d "$parked_at + $PARK_GRACE_HOURS hours" +%s 2>/dev/null)"; then
+      if [ "$(date -u +%s)" -gt "$parked_secs" ]; then
+        printf 'stale\t%s\t%s\n' "$owner" "$note"; return
+      fi
+    fi
+    printf 'parked\t%s\t%s\n' "$owner" "$note"; return
+  fi
 
   # A claim with no parseable expiry is treated as stale, never as an
   # indefinite lock — an unreadable claim must not wedge a slug forever.

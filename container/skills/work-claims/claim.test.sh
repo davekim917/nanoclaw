@@ -114,6 +114,25 @@ tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
 bash "$CLAIM" check acme-park | grep -q '^PARKED — was ava:.*free to take' \
   || fail "parked claim did not read PARKED/free to take"
 
+# 15b. A park nobody came back for lapses into stale — parked is a waypoint,
+#      not a terminus. Backdate parked_at past PARK_GRACE_HOURS and re-check.
+bash "$CLAIM" take acme-lapsed 3 seam work >/dev/null
+bash "$CLAIM" park acme-lapsed stepping off, needs an owner >/dev/null
+jq '.parked_at = "2020-01-01T00:00:00Z"' "$CLAIMS_DIR/acme-lapsed.json" > "$CLAIMS_DIR/.tmp" \
+  && mv "$CLAIMS_DIR/.tmp" "$CLAIMS_DIR/acme-lapsed.json"
+bash "$CLAIM" check acme-lapsed | grep -qi 'stale' \
+  || fail "a park past its grace window did not lapse to stale"
+
+# 15c. A park with NO ttl_hours still lapses — an absent field must not grant
+#      immortality. park only carries ttl forward when the claim had one.
+bash "$CLAIM" park acme-nottl advertising this, no ttl on the file >/dev/null
+jq -e '.ttl_hours == null' "$CLAIMS_DIR/acme-nottl.json" >/dev/null \
+  || fail "expected a park of an unclaimed slug to carry no ttl_hours"
+jq '.parked_at = "2020-01-01T00:00:00Z"' "$CLAIMS_DIR/acme-nottl.json" > "$CLAIMS_DIR/.tmp" \
+  && mv "$CLAIMS_DIR/.tmp" "$CLAIMS_DIR/acme-nottl.json"
+bash "$CLAIM" check acme-nottl | grep -qi 'stale' \
+  || fail "a ttl-less park past its grace window did not lapse to stale"
+
 # 16. Parking an unclaimed slug creates it (coordinator advertising work).
 bash "$CLAIM" park acme-fresh-park nobody started this yet, needs an owner >/dev/null
 jq -e '.status == "parked" and .owner == "ava"' "$CLAIMS_DIR/acme-fresh-park.json" >/dev/null \

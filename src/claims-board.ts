@@ -95,9 +95,17 @@ export function readClaims(workgroupId: string, now: number, root: string = clai
     let state: ClaimState;
     let staleMs: number;
     if (isParked) {
-      state = 'parked';
       const parkedAt = typeof raw.parked_at === 'string' ? Date.parse(raw.parked_at) : NaN;
       staleMs = Number.isFinite(parkedAt) ? now - parkedAt : 0;
+      // Parked is a WAYPOINT, not a terminus. It used to return here with no
+      // expiry at all, which made it an absorbing state: a park meant "someone
+      // should pick this up" and then nothing ever did. Live evidence at the
+      // time of this fix — 7 parked claims in one workgroup, three of them
+      // with no ttl_hours at all, the oldest sitting 93 hours. A state with no
+      // exit is the shape of the whole problem, so parked now decays into
+      // stale, which is already the state everything downstream treats as
+      // "free to take, and say so out loud".
+      state = staleMs > PARK_GRACE_MS ? 'stale' : 'parked';
     } else {
       const claimedAt = typeof raw.claimed_at === 'string' ? raw.claimed_at : '';
       const ttlHours = typeof raw.ttl_hours === 'number' ? raw.ttl_hours : NaN;
@@ -135,6 +143,12 @@ const SECTION: Record<ClaimState, { icon: string; label: string }> = {
   expiring: { icon: '🟡', label: 'Past TTL — still inside the grace window' },
   live: { icon: '🟢', label: 'Live' },
 };
+/**
+ * How long a parked claim may sit before it is treated as abandoned. A park is
+ * a handoff offer; if nobody takes it inside a day, the offer lapsed.
+ */
+export const PARK_GRACE_MS = 24 * 60 * 60 * 1000;
+
 const ORDER: ClaimState[] = ['stale', 'parked', 'expiring', 'live'];
 
 /**
@@ -151,19 +165,14 @@ function stampLine(): string {
   return `_claims as of ${formatLocalTime(new Date().toISOString(), TIMEZONE)} — source of truth: the claims/ directory_`;
 }
 
-export function renderClaims(
-  claims: BoardClaim[],
-  linkFor: (threadId: string) => string | null = () => null,
-): string {
+export function renderClaims(claims: BoardClaim[], linkFor: (threadId: string) => string | null = () => null): string {
   if (claims.length === 0) {
     return `**Who’s on what** — _nothing claimed right now._\n\n${stampLine()}`;
   }
 
   const lines: string[] = [`**Who’s on what — ${claims.length}**`, ''];
   for (const state of ORDER) {
-    const group = claims
-      .filter((c) => c.state === state)
-      .sort((a, b) => b.staleMs - a.staleMs);
+    const group = claims.filter((c) => c.state === state).sort((a, b) => b.staleMs - a.staleMs);
     if (group.length === 0) continue;
 
     lines.push(`${SECTION[state].icon} ${SECTION[state].label} · ${group.length}`);

@@ -115,6 +115,21 @@ describe('readClaims', () => {
     expect(readClaims('wg-a', NOW, dir)[0]).toMatchObject({ state: 'parked', staleMs: 3 * HOUR });
   });
 
+  it('a park that nobody came back for decays to stale — parked is a waypoint, not a terminus', () => {
+    const dir = root({
+      // 30h parked, past the 24h grace: the handoff offer lapsed.
+      lapsed: claim(100, { status: 'parked', parked_at: new Date(NOW - 30 * HOUR).toISOString() }),
+    });
+    expect(readClaims('wg-a', NOW, dir)[0]).toMatchObject({ state: 'stale', staleMs: 30 * HOUR });
+  });
+
+  it('a park with no ttl_hours still expires — the field being absent must not grant immortality', () => {
+    const dir = root({
+      forever: claim(100, { status: 'parked', parked_at: new Date(NOW - 90 * HOUR).toISOString() }),
+    });
+    expect(readClaims('wg-a', NOW, dir)[0].state).toBe('stale');
+  });
+
   it('parking wins even when the note says "not done"', () => {
     const dir = root({
       handoff: claim(9, {
@@ -129,7 +144,10 @@ describe('readClaims', () => {
   });
 
   it('defaults staleMs to 0 for a parked claim missing or with an unparseable parked_at', () => {
-    const dir = root({ missing: claim(9, { status: 'parked' }), bad: claim(9, { status: 'parked', parked_at: 'nope' }) });
+    const dir = root({
+      missing: claim(9, { status: 'parked' }),
+      bad: claim(9, { status: 'parked', parked_at: 'nope' }),
+    });
 
     const byslug = Object.fromEntries(readClaims('wg-a', NOW, dir).map((c) => [c.slug, c]));
 
@@ -139,7 +157,9 @@ describe('readClaims', () => {
 
   it('truncates a paragraph-long note to its first sentence', () => {
     const dir = root({
-      verbose: claim(1, { note: 'Dev activation verified live. OPEN: screenshots, migration decision. DO NOT flip prod.' }),
+      verbose: claim(1, {
+        note: 'Dev activation verified live. OPEN: screenshots, migration decision. DO NOT flip prod.',
+      }),
     });
 
     const note = readClaims('wg-a', NOW, dir)[0].note;
@@ -151,10 +171,34 @@ describe('readClaims', () => {
 
 describe('renderClaims', () => {
   const claims: BoardClaim[] = [
-    { slug: 'live-one', owner: 'kit', note: 'seam', threadId: null, state: 'live', staleMs: -2 * HOUR, escalated: false },
+    {
+      slug: 'live-one',
+      owner: 'kit',
+      note: 'seam',
+      threadId: null,
+      state: 'live',
+      staleMs: -2 * HOUR,
+      escalated: false,
+    },
     { slug: 'gone', owner: 'ava', note: 'drift', threadId: 't', state: 'stale', staleMs: 3 * HOUR, escalated: true },
-    { slug: 'soon', owner: 'bo', note: 'guard', threadId: null, state: 'expiring', staleMs: 30 * 60000, escalated: false },
-    { slug: 'handoff', owner: 'kit', note: 'stepped off', threadId: null, state: 'parked', staleMs: 5 * HOUR, escalated: false },
+    {
+      slug: 'soon',
+      owner: 'bo',
+      note: 'guard',
+      threadId: null,
+      state: 'expiring',
+      staleMs: 30 * 60000,
+      escalated: false,
+    },
+    {
+      slug: 'handoff',
+      owner: 'kit',
+      note: 'stepped off',
+      threadId: null,
+      state: 'parked',
+      staleMs: 5 * HOUR,
+      escalated: false,
+    },
   ];
 
   it('puts what needs a human first, parked next, and live work last', () => {
