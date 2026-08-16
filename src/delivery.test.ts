@@ -38,6 +38,7 @@ import {
   assertChannelRoutingConsistency,
 } from './delivery.js';
 import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
+import { isContainerRunning } from './container-runner.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -1431,7 +1432,13 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
     expect(mark!.mtimeNs).toBeLessThanOrEqual(after.mtimeNs);
   });
 
-  it('A9 polls a session whose container is running regardless of cache', async () => {
+  it('A9 polls a session whose container is live regardless of cache', async () => {
+    // Isolates the live-container bypass: the cache is armed to the CURRENT
+    // stat, so the change signal says "nothing moved". The only thing that can
+    // cause a poll here is the liveness check — if it were deleted, this test
+    // fails. `isContainerRunning` is authoritative because spawn records its
+    // in-memory entry before the central row is updated, so a swept snapshot
+    // can still read 'stopped' for a container that is already writing.
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
     setDeliveryAdapter({
       async deliver() {
@@ -1442,6 +1449,13 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
     expect(peekQuietDeliveryMark(session.id)).toBeDefined();
 
     insertOutbound('ag-1', session.id, 'out-live');
+    const stat = fs.statSync(outboundDbPath('ag-1', session.id), { bigint: true });
+    _setQuietDeliveryMarkForTest(session.id, {
+      mtimeNs: stat.mtimeNs,
+      size: Number(stat.size),
+      armedAtMs: Date.now(),
+    });
+
     const calls: string[] = [];
     setDeliveryAdapter({
       async deliver(_c, _p, _t, _k, content) {
@@ -1449,10 +1463,16 @@ describe('delivery sweep gate — arming rules (A6-A12)', () => {
         return 'plat-2';
       },
     });
-    const running = { ...session, container_status: 'running' as const };
-    const outcome = await sweepDeliverSession(running, Date.now());
-    expect(outcome).not.toBe('skipped');
-    expect(calls).toHaveLength(1);
+
+    // The session row still says stopped — exactly the staleness window.
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    try {
+      const outcome = await sweepDeliverSession(session, Date.now());
+      expect(outcome).not.toBe('skipped');
+      expect(calls).toHaveLength(1);
+    } finally {
+      vi.mocked(isContainerRunning).mockReturnValue(false);
+    }
   });
 
   it('A10 polls when a hot journal exists', async () => {

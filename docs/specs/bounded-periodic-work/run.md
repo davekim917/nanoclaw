@@ -139,7 +139,100 @@ missing `outbound.db` (drain returns `pending`, no arm).
 - Phase 3 Graphify spike (D-2), phase 4 session lifecycle (D-1 option (a): nothing).
 - D-3's 7-day-horizon hole remains open, recorded in plan.md as its own future change.
 
-### Ready for `/team-review --implementation`
+### Ready for review (superseded by the review stage below)
 
 Implementation is coherent, focused checks pass, the diff has been inspected hunk by hunk, and the
 three deviations above are explicit.
+
+## Stage: review --implementation (2026-08-16)
+
+Target: approved `plan.md` + raw diff of commit `9c9e7e81`. Nothing was deployed at review time —
+`dist/` was deliberately not compiled, so this review gated activation rather than following it.
+
+### Lenses selected
+
+Correctness, failure handling, plan fidelity, verification quality (always), plus **state and
+rollback** (in-memory cache, concurrent pollActive/pollSweep lifecycle) and **performance** (the
+drain's query order changed on a hot path). Security and product lenses not selected: no trust
+boundary, credential, or user-visible surface changed.
+
+### Lead pass, before the external review
+
+Traced the central question — can the gate arm on a session that still has deliverable work? — to
+source:
+
+- Arming requires `outcome === 'clean'`, which requires every row in `messages_out` to have a
+  `delivered` row. `deferAck` rows are excluded from `deliveredNow`, so they force `pending`.
+- `delivered` is **append-only**: no `DELETE FROM delivered` exists anywhere in `src/` or
+  `container/agent-runner/src/`, and every `status='failed'` write in the tree targets inbound
+  `messages_in`, not the outbound `delivered` table. So a row can never return to outstanding
+  without the outbound file changing. This is what makes an armed gate safe.
+- Delivery writes to `inbound.db`, never `outbound.db`, so a drain that delivers does not move the
+  stat it armed with — correct, because everything it delivered is now recorded.
+- `busy` and every error path call `quietDeliveryCache.delete`, so uncertainty actively disarms.
+
+### Cross-model review
+
+- Stage: implementation. Primary: Claude (Opus 5). Reviewer: Codex, requested `gpt-5.6-sol`,
+  `model_reasoning_effort="high"`.
+- Command: `codex exec --ignore-user-config --model gpt-5.6-sol -c 'model_reasoning_effort="high"' --ephemeral --yolo`, stdin = rubric + approved plan + raw diff, timeout 3600000 ms.
+- Outcome: `completed`, exit 0, one valid JSON object. Raw verdict: **must_fix**, 1 MUST-FIX.
+- Coverage: cross-family. Not degraded.
+
+| # | Sev | Finding | Lead verification | Disposition |
+|---|---|---|---|---|
+| G1 | MUST-FIX | The live-container bypass used `session.container_status` (the swept snapshot) instead of `isContainerRunning`. Spawn records its in-memory entry before the central row updates and the sweep snapshots all sessions up front, so a live container can read `stopped`. Worse, A9 could not catch it: the test inserted a row before the second sweep, which moves the mtime, so it passed even with the bypass deleted entirely | Confirmed both halves. `activeContainers.set(session.id, …)` at `src/container-runner.ts:914` is the authoritative record and precedes the row update. A9 as written did insert `out-live` before re-sweeping. **Mutation-checked**: deleting the bypass left A9 green | **ACCEPTED** |
+
+Lead's amendment to the finding's framing, recorded because it changes severity reasoning but not
+the disposition: the practical failure is **plan fidelity + verification quality**, not message
+stranding. mtime carries the real safety — a live container that writes moves the file, and
+`pollActive` drains running sessions every second regardless. The genuine defect is that the plan
+specified `isContainerRunning`, the build silently substituted a weaker signal, and the test could
+not tell the difference. That substitution was never recorded as a deviation, which is the drift
+this gate exists to catch.
+
+### Correction batch (one, per the contract)
+
+1. `sweepDeliverSession` now treats a session as live when `isContainerRunning(session.id)` **or**
+   the row says running/idle (row kept as a fallback for the reverse skew).
+2. A9 rewritten to isolate the bypass: the cache is armed to the **current** post-insert stat, so
+   the change signal says "nothing moved" and the liveness check is the only thing that can cause a
+   poll.
+3. `isContainerRunning` is imported **lazily** (`await import`). The first attempt used a static
+   import, which pulled container-runner (docker, spawn, image builds) into the module graph of
+   every consumer of `delivery.ts` and broke `src/storage-manager.test.ts` — an unrelated suite
+   whose partial `child_process` mock lacks `execFile`. Completing another area's mock to
+   accommodate this change would have been the wrong repair; keeping the graph unchanged is the
+   smaller correction, and `await import()` is the repository's sanctioned tool for it (CLAUDE.md,
+   host module-system rule).
+
+### Fresh verification after the correction
+
+```
+# mutation check — proves A9 now bites
+bypass deleted   → A9 FAILS: "expected 'skipped' not to be 'skipped'"
+bypass restored  → A9 passes
+
+node_modules/.bin/tsc <delivery.ts, delivery.test.ts> --noEmit    → clean
+node_modules/.bin/vitest run src/delivery.test.ts src/storage-manager.test.ts
+                                                                  → 88 passed (2 files)
+node_modules/.bin/vitest run                                      → 1 failed | 3824 passed | 1 skipped | 1 todo
+```
+
+The single remaining failure is `src/design-artifact-loop-vendor.test.ts`, pre-existing vendor
+drift against `~/plugins/design-artifact-loop`; its files are clean against HEAD and share no code
+with this diff. Before the correction the run showed **two** failing files (storage-manager's mock);
+after, it is back to one.
+
+### Edge cases exercised this stage
+
+Live container with a stale `stopped` row (A9, mutation-checked), unreadable session DB mid-cycle
+(A18), frozen change signal past the deadline (A14), commit racing the pre-open stat (A11, A15),
+concurrent `pollActive` ownership (A16), delivery error (A6, A17), future `deliver_after` (A7), hot
+journal (A10), plus the lead's source trace that `delivered` rows are never revoked.
+
+### Verdict
+
+**`clear`** — no verified MUST-FIX remains after one bounded correction batch. Known risks carried
+forward: R-1 (a gate bug costs ≤10 min of delay, not loss), R-2 (~1,657 stats/min), and D-3's
+pre-existing 7-day-horizon hole, which this change neither causes nor fixes.

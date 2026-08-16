@@ -671,8 +671,19 @@ export async function sweepDeliverSession(session: Session, nowMs: number): Prom
   const outPath = outboundDbPath(session.agent_group_id, session.id);
 
   // A live container is about to write, and pollActive already drains it every
-  // second — never gate it.
-  const containerLive = session.container_status === 'running' || session.container_status === 'idle';
+  // second — never gate it. `isContainerRunning` is the authoritative signal:
+  // spawn records the container in its in-memory map (container-runner.ts,
+  // `activeContainers.set`) before the central row is updated, and the sweep
+  // snapshots every session up front, so `session.container_status` can still
+  // read 'stopped' for a container that is already writing. The row is kept as
+  // a fallback for the reverse skew.
+  // Imported lazily: a static import would pull container-runner (docker,
+  // spawn, image builds) into the module graph of everything that imports
+  // delivery. Node caches the module, so this is a map lookup after the first
+  // call.
+  const { isContainerRunning } = await import('./container-runner.js');
+  const containerLive =
+    isContainerRunning(session.id) || session.container_status === 'running' || session.container_status === 'idle';
 
   let current: { mtimeNs: bigint; size: number } | null = null;
   if (!containerLive) {
