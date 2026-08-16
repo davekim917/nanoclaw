@@ -63,10 +63,13 @@ export function BoardBrand({
 }
 
 /**
- * Primary nav (Inbox / Scheduled / Workgroup) for the pulse header —
- * rendered on both mobile and desktop. Active-route highlighting drives off
- * `route === ...` so the component is layout-agnostic; positioning is up to
- * the consumer.
+ * Primary nav (Scheduled / Observatory) for the pulse header — rendered on
+ * both mobile and desktop. Active-route highlighting drives off `route === ...`
+ * so the component is layout-agnostic; positioning is up to the consumer.
+ *
+ * The inbox and workgroup routes are deliberately absent from the nav: their
+ * components and `#/inbox` / `#/workgroup` hashes still work for anyone
+ * holding an old link, they just aren't offered as a destination any more.
  */
 export function RouteNav({
   route,
@@ -77,20 +80,11 @@ export function RouteNav({
 }) {
   return (
     <nav className="nc-pulse-actions">
-      <button className={`nav-link ${route === 'inbox' ? 'active' : ''}`} onClick={() => onRouteChange('inbox')}>
-        Inbox
-      </button>
       <button
         className={`nav-link ${route === 'scheduled' ? 'active' : ''}`}
         onClick={() => onRouteChange('scheduled')}
       >
         Scheduled
-      </button>
-      <button
-        className={`nav-link ${route === 'workgroup' ? 'active' : ''}`}
-        onClick={() => onRouteChange('workgroup')}
-      >
-        Workgroup
       </button>
       <button
         className={`nav-link ${route === 'observatory' ? 'active' : ''}`}

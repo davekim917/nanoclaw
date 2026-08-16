@@ -1556,9 +1556,10 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    deliberately BRIGHT: the board is a control surface at night, the office is
    a lit room you're looking down into.
 
-   House rules for this view: hard edges only (0-blur shadows), 4px chunky
-   walls, no animation, no images — sprites are inline-SVG data URIs from
-   office-sprites.ts, upscaled with image-rendering: pixelated. */
+   House rules for this view: hard edges only (0-blur shadows), an open floor
+   plan (rugs and hanging signs, never walls), no animation, no images —
+   sprites are inline-SVG data URIs from office-sprites.ts, upscaled with
+   image-rendering: pixelated. */
 
 .nc-pill.done    { background: var(--st-done-bg);    color: var(--st-done); }
 .nc-pill.pending { background: var(--st-pending-bg); color: var(--st-pending); }
@@ -1620,9 +1621,10 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   text-transform: uppercase; color: var(--of-ink-2); text-align: center;
 }
 
-/* Single column top to bottom: job board, whiteboard, then the floor. The
-   claims wall stays a direct child of .nc-obs-main and in normal document
-   flow — no fixed/sticky position, no independent scroll region. */
+/* Single column top to bottom: job board, whiteboard, what's scheduled, then
+   the floor. The claims wall stays a direct child of .nc-obs-main and in
+   normal document flow — no fixed/sticky position, no independent scroll
+   region. */
 .nc-of .nc-obs-main { display: grid; grid-template-columns: 1fr; gap: 0; align-items: start; }
 
 /* ─── JOB BOARD — a corkboard with pinned notes ──────────────────────────── */
@@ -1645,8 +1647,28 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   text-shadow: 2px 2px 0 rgb(0 0 0 / 0.3);
 }
 .nc-of .nc-obs-release-fresh { font-size: 11px; color: #f0e0c4; }
+.nc-of-tally-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .nc-of .nc-obs-release-counts { display: flex; flex-wrap: wrap; align-items: baseline; }
 .nc-of-tally { display: inline-flex; align-items: baseline; }
+/* Each tally is a filter switch — chunky enough to hit, flat until selected. */
+.nc-of-tally-btn {
+  display: inline-flex; align-items: baseline; gap: 0;
+  min-height: 44px; padding: 4px 8px; border: 3px solid transparent; border-radius: 0;
+  background: transparent; cursor: pointer;
+}
+.nc-of-tally-btn:hover { border-color: rgb(255 255 255 / 0.4); }
+.nc-of-tally-btn.active {
+  background: var(--of-paper); border-color: var(--of-ink); box-shadow: 3px 3px 0 rgb(0 0 0 / 0.25);
+}
+.nc-of-tally-btn.active .nc-of-tally-n { color: var(--of-ink); text-shadow: none; }
+.nc-of-tally-btn.active .nc-of-tally-l { color: var(--of-ink-2); }
+.nc-of-tally-all {
+  min-height: 44px; padding: 4px 14px; border-radius: 0;
+  border: 3px solid var(--of-wall-sh); background: var(--of-cork); cursor: pointer;
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  letter-spacing: 0.14em; text-transform: uppercase; color: var(--of-cream);
+}
+.nc-of-tally-all.active { background: var(--of-paper); color: var(--of-ink); box-shadow: 3px 3px 0 rgb(0 0 0 / 0.25); }
 .nc-of-tally-n {
   font-family: var(--font-mono); font-size: 26px; font-weight: 600; line-height: 1;
   color: var(--of-cream); text-shadow: 2px 2px 0 rgb(0 0 0 / 0.35);
@@ -1716,10 +1738,28 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-obs-release-row-owner { font-size: 11px; color: var(--of-ink-2); }
 .nc-of .nc-obs-release-row-owner strong { color: var(--of-ink); font-weight: 600; }
-.nc-of .nc-obs-release-row-why { flex-basis: 100%; font-size: 11px; color: var(--of-ink-2); line-height: 1.45; }
+.nc-of .nc-obs-release-row-why { font-size: 11px; color: var(--of-ink-2); line-height: 1.45; }
 .nc-of .nc-obs-release-row-age {
   margin-left: auto; font-family: var(--font-mono); font-size: 10.5px; color: var(--of-ink-2);
 }
+/* The row body is the expander; the id stays a real link beside it. */
+.nc-of .nc-obs-release-row-toggle {
+  flex: 1 1 200px; min-height: 44px; padding: 0; border: none; border-radius: 0;
+  background: transparent; cursor: pointer; text-align: left; color: var(--of-ink);
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
+}
+.nc-of .nc-obs-release-row-toggle:hover .nc-obs-release-row-title { text-decoration: underline; }
+.nc-of .nc-obs-release-row-detail {
+  flex-basis: 100%; margin-top: 6px; padding-top: 8px; border-top: 2px dashed var(--of-ink-2);
+  display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
+}
+.nc-of .nc-obs-release-row-meta { font-size: 11px; color: var(--of-ink-2); }
+.nc-of .nc-of-link {
+  display: inline-flex; align-items: center; min-height: 44px; padding: 4px 0;
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--of-ink); text-decoration: underline;
+}
+.nc-of .nc-of-link:hover { color: var(--of-alert); }
 
 /* ─── WHITEBOARD — "Who's on what" ───────────────────────────────────────── */
 
@@ -1741,21 +1781,71 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-claim-row {
   border-radius: 0; padding: 8px 10px; margin-bottom: 6px; min-height: 44px;
   background: #fff; border: 3px solid var(--of-ink-2); box-shadow: 3px 3px 0 rgb(0 0 0 / 0.14);
-  cursor: pointer; color: var(--of-ink);
+  color: var(--of-ink);
 }
 .nc-of .nc-obs-claim-row:hover { border-color: var(--of-ink); }
+.nc-of .nc-obs-claim-toggle {
+  display: block; width: 100%; min-height: 44px; padding: 0; border: none; border-radius: 0;
+  background: transparent; cursor: pointer; text-align: left; color: inherit; font: inherit;
+}
+.nc-of .nc-obs-claim-toggle:hover .nc-obs-claim-slug { text-decoration: underline; }
+.nc-of .nc-obs-claim-detail {
+  margin-top: 8px; padding-top: 8px; border-top: 2px dashed var(--of-ink-2);
+  display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
+}
 .nc-of .nc-obs-claim-row.stale { border-left: 8px solid var(--of-alert); }
 .nc-of .nc-obs-claim-row.parked { border-left: 8px solid var(--of-note); }
 .nc-of .nc-obs-claim-row.live { border-left: 8px solid var(--of-ok); }
 .nc-of .nc-obs-claim-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.nc-of .nc-obs-claim-escalated { font-size: 11px; color: var(--of-ink-2); margin-top: 3px; }
-.nc-of .nc-obs-claim-age { font-size: 11px; color: var(--of-ink-2); margin-top: 2px; }
+.nc-of .nc-obs-claim-escalated { display: block; font-size: 11px; color: var(--of-ink-2); margin-top: 3px; }
+.nc-of .nc-obs-claim-age { display: block; font-size: 11px; color: var(--of-ink-2); margin-top: 2px; }
 .nc-of .nc-obs-claim-slug {
   font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; color: var(--of-ink);
 }
-.nc-of .nc-obs-claim-owner { font-size: 11px; color: var(--of-ink-2); margin-top: 2px; }
-.nc-of .nc-obs-claim-note { font-size: 11.5px; color: var(--of-ink); margin-top: 3px; line-height: 1.45; }
+.nc-of .nc-obs-claim-owner { display: block; font-size: 11px; color: var(--of-ink-2); margin-top: 2px; }
+.nc-of .nc-obs-claim-note { font-size: 11.5px; color: var(--of-ink); line-height: 1.45; }
 .nc-of .nc-pill { border-radius: 0; border: 2px solid currentColor; }
+
+/* ─── WHAT'S SCHEDULED — same paper-on-a-board family as the job board ───── */
+
+.nc-of .nc-of-sched {
+  border: 6px solid var(--of-wall-sh); border-radius: 0;
+  background:
+    repeating-linear-gradient(45deg, rgb(0 0 0 / 0.05) 0 2px, transparent 2px 5px),
+    var(--of-cork);
+  box-shadow: inset 0 4px 0 rgb(255 255 255 / 0.14), var(--of-drop);
+  padding: 14px 16px 16px; margin-bottom: 18px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.nc-of .nc-of-sched-title {
+  font-family: var(--font-mono); font-size: 13px; font-weight: 600;
+  letter-spacing: 0.18em; text-transform: uppercase; color: var(--of-cream);
+  text-shadow: 2px 2px 0 rgb(0 0 0 / 0.3);
+}
+.nc-of .nc-of-sched-empty {
+  background: var(--of-paper); border: 3px solid var(--of-ink-2);
+  box-shadow: var(--of-drop); padding: 10px 12px;
+  font-size: 12px; color: var(--of-ink-2); font-style: italic;
+}
+.nc-of .nc-of-sched-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.nc-of .nc-of-sched-row {
+  background: var(--of-paper); border: 3px solid var(--of-ink-2);
+  box-shadow: 3px 3px 0 rgb(0 0 0 / 0.22); padding: 8px 12px; min-height: 44px;
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; color: var(--of-ink);
+}
+.nc-of .nc-of-sched-who {
+  font-family: var(--font-mono); font-size: 11.5px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--of-ink);
+}
+.nc-of .nc-of-sched-what { font-size: 12.5px; color: var(--of-ink); }
+.nc-of .nc-of-sched-when {
+  font-family: var(--font-mono); font-size: 11px; color: var(--of-ink);
+  border: 2px solid var(--of-ink-2); padding: 0 6px;
+}
+.nc-of .nc-of-sched-where { font-size: 11px; color: var(--of-ink-2); }
+.nc-of .nc-of-sched-id {
+  margin-left: auto; font-family: var(--font-mono); font-size: 10px; color: var(--of-ink-2);
+}
 
 /* ─── THE FLOOR ──────────────────────────────────────────────────────────── */
 
@@ -1767,55 +1857,71 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   box-shadow: var(--of-drop);
 }
 
-/* Rooms — position STABLE (sorted platform, name), never reordered by
-   activity, and each room's furniture is hashed from its key. */
-.nc-of .nc-obs-rooms { display: grid; grid-template-columns: 1fr; gap: 20px; }
+/* Zones — desk clusters standing on rugs, NOT walled rooms. Position is
+   STABLE (sorted platform, name), never reordered by activity; each zone's
+   rug tone and furniture are hashed from its key. What separates one cluster
+   from the next is aisle space and furniture, so the gaps are load-bearing. */
+.nc-of .nc-obs-rooms { display: grid; grid-template-columns: 1fr; gap: 44px 20px; }
 
 @media (min-width: 640px) {
-  .nc-of .nc-obs-rooms { grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
+  .nc-of .nc-obs-rooms { grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 48px 36px; }
 }
 
+/* The rug: a flat colour block with a hard pixel edge — no walls, no insets. */
 .nc-of .nc-obs-room {
+  --rug: var(--of-room);
   position: relative; border-radius: 0;
-  padding: 26px 12px 12px; min-height: 168px;
-  background: var(--of-room);
-  border: 4px solid var(--of-wall);
-  box-shadow:
-    inset 0 4px 0 var(--of-wall-hi),
-    inset 0 -4px 0 var(--of-wall-sh),
-    var(--of-drop);
+  margin-top: 34px; padding: 16px 12px 12px; min-height: 150px;
+  background: var(--rug);
+  border: 0;
+  box-shadow: 0 0 0 3px rgb(43 36 22 / 0.22), 5px 5px 0 rgb(0 0 0 / 0.12);
   transition: none;
 }
-/* Lighting is colour, never opacity/filter on the room itself — both create a
-   stacking context that traps an open popover (and breaks the mobile
-   position:fixed sheet) inside the room. */
-.nc-of .nc-obs-room.lit   { background: var(--of-room); }
-.nc-of .nc-obs-room.dim   { background: var(--of-room-dim); }
+/* Four rug tones so neighbouring zones read as separate areas of one floor. */
+.nc-of .nc-obs-room.rug-0 { --rug: #f5ead6; }
+.nc-of .nc-obs-room.rug-1 { --rug: #eee0c8; }
+.nc-of .nc-obs-room.rug-2 { --rug: #f0e7d2; }
+.nc-of .nc-obs-room.rug-3 { --rug: #e9e2cd; }
+/* Lighting is colour, never opacity/filter on the zone itself — both create a
+   stacking context that traps an open panel (and breaks the mobile
+   position:fixed sheet) inside the zone. */
+.nc-of .nc-obs-room.dim   { --rug: var(--of-room-dim); }
 .nc-of .nc-obs-room.dusty {
-  background: var(--of-room-dead);
-  border-color: #7a6242;
+  --rug: var(--of-room-dead);
+  box-shadow: 0 0 0 3px rgb(43 36 22 / 0.14), 5px 5px 0 rgb(0 0 0 / 0.08);
 }
 .nc-of .nc-obs-room.dusty .nc-of-sprite,
 .nc-of .nc-obs-room.dusty .nc-obs-avatar { filter: grayscale(0.85) brightness(0.88); }
+.nc-of .nc-obs-room.dusty .nc-of-sign { background: #9b8a72; border-color: #6f6250; }
+.nc-of .nc-obs-room.dusty .nc-obs-room-name { color: #ece4d4; }
 .nc-of .nc-obs-room.has-open-popover { z-index: 5; }
 
-/* Door plate — a small plaque let into the top wall. */
-.nc-of .nc-obs-room-head {
-  position: absolute; top: -4px; left: 50%; transform: translateX(-50%);
-  max-width: calc(100% - 28px);
-  display: flex; align-items: center; gap: 6px;
-  background: var(--of-wall-hi); border: 3px solid var(--of-wall-sh);
-  padding: 2px 10px;
+/* Hanging sign — a plaque on two chains, suspended over the cluster. */
+.nc-of .nc-of-sign {
+  position: absolute; top: -30px; left: 50%; transform: translateX(-50%);
+  max-width: calc(100% - 16px); min-height: 44px; z-index: 2;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
+  background: var(--of-wall-hi); border: 3px solid var(--of-wall-sh); border-radius: 0;
+  box-shadow: 3px 3px 0 rgb(0 0 0 / 0.18);
+  padding: 4px 14px; cursor: pointer;
+}
+.nc-of .nc-of-sign:hover { background: var(--of-wall); }
+/* The two chains, drawn as a pair of hard gradient strips above the plaque. */
+.nc-of .nc-of-sign::before {
+  content: ''; position: absolute; left: 12px; right: 12px; top: -14px; height: 14px;
+  background:
+    linear-gradient(var(--of-wall-sh), var(--of-wall-sh)) left top / 3px 100% no-repeat,
+    linear-gradient(var(--of-wall-sh), var(--of-wall-sh)) right top / 3px 100% no-repeat;
 }
 .nc-of .nc-obs-room-name {
   font-family: var(--font-mono); font-size: 10px; font-weight: 600;
   letter-spacing: 0.14em; text-transform: uppercase; color: var(--of-cream);
   text-shadow: 1px 1px 0 var(--of-wall-sh);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .nc-of .nc-obs-room-platform {
   font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.14em;
-  text-transform: uppercase; color: var(--of-ink-2); margin: 4px 0 10px;
+  text-transform: uppercase; color: #f0e0c4;
 }
 
 .nc-of .nc-obs-room-cobweb {
@@ -1824,8 +1930,10 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 
 .nc-of-sprite { image-rendering: pixelated; display: block; }
+/* Furniture sits at the rug's edge, spilling into the aisle — that overlap is
+   what makes one cluster feel bounded without a wall. */
 .nc-of-decor {
-  position: absolute; right: 10px; bottom: 10px;
+  position: absolute; right: -12px; bottom: -10px;
   display: flex; align-items: flex-end; gap: 10px; pointer-events: none;
 }
 .nc-of-decor-plant      { width: 36px; height: 48px; }
@@ -1833,20 +1941,23 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of-decor-couch      { width: 48px; height: 30px; }
 .nc-of-decor-cooler     { width: 30px; height: 48px; }
 
-/* Desk row — one station per agent body present. */
+/* Desk cluster — two stations across, wrapping. */
 .nc-of .nc-obs-room-bodies {
-  display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;
+  justify-items: center; align-items: end;
   min-height: 60px; position: relative; z-index: 1;
 }
+.nc-of .nc-obs-room-bodies > .nc-of-empty-desks,
+.nc-of .nc-of-absent-row { grid-column: 1 / -1; }
 .nc-of-empty-desks { display: flex; gap: 10px; align-items: flex-end; opacity: 0.85; }
 .nc-of-empty-desks .nc-of-desk { width: 56px; height: 42px; }
+.nc-of .nc-of-absent-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 
-.nc-of .nc-obs-room-link {
-  display: inline-block; margin-top: 10px;
-  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em;
-  text-transform: uppercase; color: var(--of-ink-2);
+/* The zone panel opens under the sign — same paper card as an agent popover. */
+.nc-of .nc-of-zone-panel { top: calc(100% + 4px); left: 8px; right: 8px; }
+.nc-of .nc-of-zone-panel-name {
+  font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
 }
-.nc-of .nc-obs-room-link:hover { color: var(--of-ink); }
 
 /* Wired-but-absent members: an empty chair marker, not a body. */
 .nc-of .nc-obs-room-absent {
@@ -1922,20 +2033,32 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-obs-hover-close:hover { color: var(--of-ink); background: rgb(0 0 0 / 0.08); }
 
-/* ─── The bullpen — agents with no room stand in the open area ───────────── */
+/* ─── The lounge — another rug on the same floor, for unplaced agents ────── */
 
 .nc-of .nc-obs-desks {
-  position: relative; margin: 20px 0 0; border-radius: 0;
-  border: 4px dashed var(--of-wall); background: rgb(255 255 255 / 0.32);
-  padding: 22px 12px 12px;
+  position: relative; margin: 52px 0 0; border-radius: 0;
+  border: 0; background: #ecdfc6;
+  box-shadow: 0 0 0 3px rgb(43 36 22 / 0.22), 5px 5px 0 rgb(0 0 0 / 0.12);
+  padding: 18px 12px 12px;
 }
 .nc-of .nc-obs-desks-label {
-  position: absolute; top: -4px; left: 12px;
+  position: absolute; top: -30px; left: 24px;
   background: var(--of-wall-hi); border: 3px solid var(--of-wall-sh);
-  padding: 2px 10px; margin: 0;
+  box-shadow: 3px 3px 0 rgb(0 0 0 / 0.18);
+  padding: 8px 14px; margin: 0; min-height: 44px;
+  display: flex; align-items: center;
   font-family: var(--font-mono); font-size: 10px; font-weight: 600;
   letter-spacing: 0.14em; text-transform: uppercase; color: var(--of-cream);
   text-shadow: 1px 1px 0 var(--of-wall-sh);
+}
+.nc-of .nc-obs-desks-label::before {
+  content: ''; position: absolute; left: 12px; right: 12px; top: -14px; height: 14px;
+  background:
+    linear-gradient(var(--of-wall-sh), var(--of-wall-sh)) left top / 3px 100% no-repeat,
+    linear-gradient(var(--of-wall-sh), var(--of-wall-sh)) right top / 3px 100% no-repeat;
+}
+.nc-of .nc-of-lounge-couch {
+  position: absolute; right: -12px; bottom: -8px; width: 64px; height: 40px; pointer-events: none;
 }
 .nc-of .nc-obs-desks-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
 .nc-of .nc-obs-desks-empty { font-size: 12px; color: var(--of-ink-2); font-style: italic; }
@@ -1947,12 +2070,12 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-obs-stale { color: var(--of-alert); }
 
-/* Small screens: rooms are already a single column; the popover becomes a
+/* Small screens: zones are already a single column; the popover becomes a
    bottom sheet so there's no viewport-clamping math to get wrong. */
 @media (max-width: 639px) {
   .nc-of-floor { padding: 10px; }
-  .nc-of .nc-obs-room { padding: 26px 10px 10px; }
-  .nc-of-decor { opacity: 0.9; }
+  .nc-of .nc-obs-room { padding: 14px 10px 10px; }
+  .nc-of-decor { opacity: 0.9; right: -6px; }
   .nc-of .nc-obs-hover {
     position: fixed; top: auto; left: 0; right: 0; bottom: 0; z-index: 200;
     width: auto; min-width: 0; max-height: 70vh; overflow-y: auto;

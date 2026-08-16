@@ -11,6 +11,7 @@ vi.mock('swr', () => {
 vi.mock('../lib/api.js', () => ({
   listWorkgroups: vi.fn(),
   getObservatory: vi.fn(),
+  listScheduled: vi.fn(),
 }));
 
 import {
@@ -21,8 +22,10 @@ import {
   claimAgeLabel,
   groupReleaseItems,
   releaseCounts,
+  upcomingScheduled,
 } from './Observatory.js';
-import { roomDecor, COBWEB, BLANK_AVATAR, DESK_ON, DESK_OFF } from './office-sprites.js';
+import { RouteNav } from './BoardShell.js';
+import { roomDecor, rugTone, COBWEB, BLANK_AVATAR, DESK_ON, DESK_OFF } from './office-sprites.js';
 import useSWR from 'swr';
 import type {
   ObservatoryRoom,
@@ -31,6 +34,8 @@ import type {
   ObservatorySnapshot,
   ReleaseItem,
   ReleaseState,
+  ScheduledRow,
+  ScheduledSnapshot,
 } from '../lib/api.js';
 
 const mockAuthMe = {
@@ -76,7 +81,33 @@ function claim(overrides: Partial<ObservatoryClaim> = {}): ObservatoryClaim {
     state: 'live',
     staleMs: 0,
     threadId: null,
+    threadUrl: null,
     escalated: false,
+    ...overrides,
+  };
+}
+
+function schedRow(overrides: Partial<ScheduledRow> = {}): ScheduledRow {
+  return {
+    key: 'k1',
+    series_id: 's1',
+    agent_group_id: 'ava',
+    agent_group_name: 'ava',
+    provider: 'claude',
+    channel_name: 'general',
+    channel_type: 'slack',
+    thread_id: null,
+    kind: 'recurring',
+    cron: '0 9 * * *',
+    next_fire_utc: new Date(Date.now() + 3600_000).toISOString(),
+    next_fire_local: null,
+    health: 'healthy',
+    module_owner: null,
+    quiet_status: false,
+    flag_intent: null,
+    script_host: false,
+    last_fires: [],
+    available_verbs: [],
     ...overrides,
   };
 }
@@ -111,13 +142,21 @@ function releaseState(overrides: Partial<ReleaseState> = {}): ReleaseState {
   };
 }
 
-// The workgroups key is a bare string; the observatory key embeds the id.
-function mockData(snap: ObservatorySnapshot | undefined, error: unknown = undefined) {
+// The workgroups key is a bare string; the observatory key embeds the id, and
+// the scheduled section polls its own key off the same 15s cycle.
+function mockData(
+  snap: ObservatorySnapshot | undefined,
+  error: unknown = undefined,
+  sched: { data?: ScheduledSnapshot; error?: unknown } = { data: { rows: [], degraded: false, counts: {}, assembled_at: '' } },
+) {
   vi.mocked(useSWR).mockImplementation((key: unknown) => {
     if (typeof key === 'string' && key.includes('/workgroups')) {
       return { data: { workgroups: [{ id: 'wg-1', name: 'Example Workgroup' }] }, mutate: vi.fn() } as unknown as ReturnType<
         typeof useSWR
       >;
+    }
+    if (typeof key === 'string' && key.includes('/scheduled')) {
+      return { data: sched.data, error: sched.error, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>;
     }
     return { data: snap, error, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>;
   });
@@ -519,7 +558,7 @@ describe('Observatory', () => {
           releaseItem({ id: 'A1', nextMover: 'agent' }),
           releaseItem({ id: 'A2', nextMover: 'agent' }),
         ]),
-      ).toBe('1 holding release · 2 in flight');
+      ).toBe('1 blocking · 2 automated');
     });
 
     it('blockers group renders first and dedupes a blocksRelease item out of its mover group', () => {
@@ -557,14 +596,14 @@ describe('Observatory', () => {
       const labels = Array.from(
         container.querySelectorAll('.nc-obs-release-group:not(.blockers) .nc-obs-release-group-label'),
       ).map((el) => el.textContent);
-      expect(labels).toEqual(['Your move', "In agents' hands", "Nobody's — at risk"]);
+      expect(labels).toEqual(['Waiting on a person', 'Agents are handling it', 'Nobody is on this']);
       const subs = Array.from(
         container.querySelectorAll('.nc-obs-release-group:not(.blockers) .nc-obs-release-group-sub'),
       ).map((el) => el.textContent);
       expect(subs).toEqual([
-        'waiting on a person; nothing proceeds until they act',
-        "autonomously handled; watch, don't touch",
-        'no owner and no motion; these rot unless someone takes them',
+        'nothing moves until someone decides or approves',
+        'being worked automatically right now',
+        'no owner, no progress — it stays stuck until someone picks it up',
       ]);
     });
 
@@ -626,7 +665,7 @@ describe('Observatory', () => {
         }),
       );
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('1 holding release · 2 in flight');
+      expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('1 blocking · 2 automated');
     });
 
     it('renders a link for items with a url, plain text for items without', () => {
@@ -646,6 +685,254 @@ describe('Observatory', () => {
       expect(linked.getAttribute('href')).toBe('https://example.com/pr/1');
       const unlinked = container.querySelector('[data-item-id="H2"] .nc-obs-release-row-id')!;
       expect(unlinked.tagName).toBe('SPAN');
+    });
+
+    it('clicking a tally filters the board to that group, clicking it again clears', async () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'H1', nextMover: 'human' }),
+              releaseItem({ id: 'A1', nextMover: 'agent' }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const humanTally = container.querySelector('[data-tally="human"]')! as HTMLElement;
+      expect(container.querySelectorAll('.nc-obs-release-group').length).toBe(2);
+
+      await userEvent.click(humanTally);
+      expect(humanTally.getAttribute('aria-pressed')).toBe('true');
+      expect(container.querySelector('[data-item-id="H1"]')).toBeTruthy();
+      expect(container.querySelector('[data-item-id="A1"]')).toBeFalsy();
+
+      await userEvent.click(humanTally);
+      expect(humanTally.getAttribute('aria-pressed')).toBe('false');
+      expect(container.querySelector('[data-item-id="A1"]')).toBeTruthy();
+    });
+
+    it('the ALL reset clears an active tally filter', async () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'H1', nextMover: 'human' }),
+              releaseItem({ id: 'A1', nextMover: 'agent' }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await userEvent.click(container.querySelector('[data-tally="human"]')! as HTMLElement);
+      expect(container.querySelector('[data-item-id="A1"]')).toBeFalsy();
+
+      await userEvent.click(container.querySelector('.nc-of-tally-all')! as HTMLElement);
+      expect(container.querySelector('[data-item-id="A1"]')).toBeTruthy();
+    });
+
+    it('expanding an item row reveals its full why and a labelled link out', async () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({
+                id: 'H1',
+                kind: 'pr',
+                nextMover: 'human',
+                why: 'waiting on a second approval',
+                url: 'https://example.com/pr/1',
+              }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const row = container.querySelector('[data-item-id="H1"]')!;
+      expect(row.querySelector('.nc-obs-release-row-why')).toBeFalsy();
+
+      await userEvent.click(row.querySelector('.nc-obs-release-row-toggle')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-release-row-why')!.textContent).toBe('waiting on a second approval');
+      const out = row.querySelector('.nc-obs-release-row-detail .nc-of-link')!;
+      expect(out.textContent).toContain('open PR');
+      expect(out.getAttribute('target')).toBe('_blank');
+      expect(out.getAttribute('rel')).toBe('noopener noreferrer');
+    });
+  });
+
+  describe('open floor plan', () => {
+    it('rugTone is stable per zone key and stays inside the four-tone set', () => {
+      expect(rugTone('slack:C123')).toBe(rugTone('slack:C123'));
+      for (const key of ['slack:C1', 'discord:D2', 'slack:C999', 'x']) {
+        expect(rugTone(key)).toBeGreaterThanOrEqual(0);
+        expect(rugTone(key)).toBeLessThan(4);
+      }
+    });
+
+    it('a zone is a rug under a hanging sign, with no wall styling left', () => {
+      mockData(snapshot({ rooms: [room({ key: 'r1', name: 'general' })] }));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const zone = container.querySelector('.nc-obs-room[data-room-key="r1"]')!;
+      expect(zone.className).toContain('nc-of-zone');
+      expect(zone.className).toMatch(/rug-[0-3]/);
+      const sign = zone.querySelector('.nc-of-sign')!;
+      expect(sign.tagName).toBe('BUTTON');
+      expect(sign.textContent).toContain('general');
+    });
+
+    it('clicking a zone opens a detail panel with who is there, last activity and a channel link', async () => {
+      const lastActivityAt = new Date(Date.now() - 3600_000).toISOString();
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1', name: 'general', lastActivityAt, permalink: 'https://example.com/c/general' })],
+          agents: [agent({ id: 'ava', name: 'ava', location: 'r1' })],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const zone = container.querySelector('.nc-obs-room[data-room-key="r1"]')!;
+      expect(zone.querySelector('.nc-of-zone-panel')).toBeFalsy();
+
+      await userEvent.click(zone.querySelector('.nc-of-sign')! as HTMLElement);
+      const panel = zone.querySelector('.nc-of-zone-panel')!;
+      expect(panel.textContent).toContain('general');
+      expect(panel.textContent).toContain('ava');
+      expect(panel.textContent).toContain('last active');
+      const link = panel.querySelector('a.nc-of-link')!;
+      expect(link.getAttribute('href')).toBe('https://example.com/c/general');
+      expect(link.getAttribute('target')).toBe('_blank');
+      expect(link.textContent).toContain('open channel');
+
+      // Same button toggles it shut again.
+      await userEvent.click(zone.querySelector('.nc-of-sign')! as HTMLElement);
+      expect(zone.querySelector('.nc-of-zone-panel')).toBeFalsy();
+    });
+
+    it('a zone with no permalink shows no link affordance', async () => {
+      mockData(snapshot({ rooms: [room({ key: 'r1', permalink: null })] }));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const zone = container.querySelector('.nc-obs-room[data-room-key="r1"]')!;
+      await userEvent.click(zone.querySelector('.nc-of-sign')! as HTMLElement);
+      expect(zone.querySelector('.nc-of-zone-panel')).toBeTruthy();
+      expect(zone.querySelector('.nc-of-zone-panel a')).toBeFalsy();
+    });
+  });
+
+  describe('claim rows', () => {
+    it('expanding a claim reveals its note and a thread link when threadUrl is present', async () => {
+      mockData(
+        snapshot({
+          claims: [claim({ slug: 'c1', note: 'holding the migration', threadUrl: 'https://example.com/t/1' })],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const row = container.querySelector('.nc-obs-claim-row[data-slug="c1"]')!;
+      expect(row.querySelector('.nc-obs-claim-detail')).toBeFalsy();
+
+      await userEvent.click(row.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-claim-note')!.textContent).toBe('holding the migration');
+      const link = row.querySelector('.nc-obs-claim-detail a')!;
+      expect(link.getAttribute('href')).toBe('https://example.com/t/1');
+      expect(link.getAttribute('target')).toBe('_blank');
+      expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+      expect(link.textContent).toContain('open thread');
+    });
+
+    it('a claim with no threadUrl expands without any link', async () => {
+      mockData(snapshot({ claims: [claim({ slug: 'c1', threadUrl: null })] }));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const row = container.querySelector('.nc-obs-claim-row[data-slug="c1"]')!;
+      await userEvent.click(row.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-claim-detail')).toBeTruthy();
+      expect(row.querySelector('.nc-obs-claim-detail a')).toBeFalsy();
+    });
+
+    it('clicking a claim still highlights the agent that owns it', async () => {
+      mockData(
+        snapshot({
+          claims: [claim({ slug: 'c1', owner: 'ava' })],
+          agents: [agent({ id: 'ava', name: 'ava', location: null })],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await userEvent.click(container.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
+      expect(container.querySelector('.nc-obs-chip[data-agent-id="ava"]')!.className).toContain('highlighted');
+    });
+  });
+
+  describe("what's scheduled", () => {
+    it('upcomingScheduled: keeps only this floor\'s agent groups, soonest first, capped', () => {
+      const t = (mins: number) => new Date(Date.now() + mins * 60_000).toISOString();
+      const rows = [
+        schedRow({ key: 'b', agent_group_id: 'ava', next_fire_utc: t(60) }),
+        schedRow({ key: 'x', agent_group_id: 'outsider', next_fire_utc: t(1) }),
+        schedRow({ key: 'a', agent_group_id: 'kit', next_fire_utc: t(10) }),
+        schedRow({ key: 'n', agent_group_id: 'kit', next_fire_utc: null }),
+      ];
+      expect(upcomingScheduled(rows, ['ava', 'kit']).map((r) => r.key)).toEqual(['a', 'b']);
+      expect(upcomingScheduled(rows, ['ava', 'kit'], 1).map((r) => r.key)).toEqual(['a']);
+    });
+
+    it('renders only rows for agent groups on this floor', () => {
+      mockData(
+        snapshot({ agents: [agent({ id: 'ava', name: 'ava' })] }),
+        undefined,
+        {
+          data: {
+            rows: [
+              // 90m out, so the "1h" bucket holds however long the render takes.
+              schedRow({
+                key: 'mine',
+                agent_group_id: 'ava',
+                agent_group_name: 'ava',
+                channel_name: 'general',
+                next_fire_utc: new Date(Date.now() + 90 * 60_000).toISOString(),
+              }),
+              schedRow({ key: 'theirs', agent_group_id: 'outsider', agent_group_name: 'outsider' }),
+            ],
+            degraded: false,
+            counts: {},
+            assembled_at: '',
+          },
+        },
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const keys = Array.from(container.querySelectorAll('.nc-of-sched-row')).map((el) =>
+        el.getAttribute('data-sched-key'),
+      );
+      expect(keys).toEqual(['mine']);
+      const row = container.querySelector('.nc-of-sched-row[data-sched-key="mine"]')!;
+      expect(row.textContent).toContain('ava');
+      expect(row.textContent).toContain('repeating job');
+      expect(row.textContent).toContain('in 1h');
+      expect(row.textContent).toContain('general');
+    });
+
+    it('shows the empty state when nothing on this floor is scheduled', () => {
+      mockData(snapshot({ agents: [agent({ id: 'ava' })] }), undefined, {
+        data: {
+          rows: [schedRow({ key: 'theirs', agent_group_id: 'outsider' })],
+          degraded: false,
+          counts: {},
+          assembled_at: '',
+        },
+      });
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('.nc-of-sched-empty')!.textContent).toBe('nothing scheduled');
+    });
+
+    it('degrades quietly when the scheduled call fails, leaving the rest of the page intact', () => {
+      mockData(snapshot({ rooms: [room({ key: 'r1' })] }), undefined, { error: new Error('500') });
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('.nc-of-sched-empty')!.textContent).toBe("couldn't load scheduled work");
+      expect(container.querySelector('.nc-obs-room[data-room-key="r1"]')).toBeTruthy();
+    });
+  });
+
+  describe('RouteNav', () => {
+    it('no longer offers the inbox or workgroup destinations', () => {
+      const { container } = render(<RouteNav route="observatory" onRouteChange={noop} />);
+      const labels = Array.from(container.querySelectorAll('button')).map((b) => b.textContent);
+      expect(labels).toEqual(['Scheduled', 'Observatory']);
     });
   });
 });

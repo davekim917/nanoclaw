@@ -162,7 +162,16 @@ export function hashKey(key: string): number {
 }
 
 /**
- * 1-2 pieces of furniture for a room, derived from its key alone — a room
+ * Which of the four rug tones a zone stands on, from its key alone. Uses a
+ * different slice of the hash than the furniture pick so the two don't
+ * correlate into visible stripes across the floor.
+ */
+export function rugTone(key: string): number {
+  return (hashKey(key) >>> 4) % 4;
+}
+
+/**
+ * 1-2 pieces of furniture for a zone, derived from its key alone — a zone
  * always looks the same, so the floor stays a place you can remember.
  */
 export function roomDecor(key: string): Decor[] {

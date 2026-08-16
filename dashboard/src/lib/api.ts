@@ -484,6 +484,8 @@ export interface ObservatoryClaim {
   state: ObservatoryClaimState;
   staleMs: number;
   threadId: string | null;
+  /** Permalink to the thread the work was claimed in — null when unresolvable. */
+  threadUrl: string | null;
   escalated: boolean;
 }
 

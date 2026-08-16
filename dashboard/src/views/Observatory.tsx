@@ -3,6 +3,7 @@ import useSWR from 'swr';
 import {
   listWorkgroups,
   getObservatory,
+  listScheduled,
   type AuthMe,
   type ObservatorySnapshot,
   type ObservatoryRoom,
@@ -12,28 +13,36 @@ import {
   type ReleaseState,
   type ReleaseItem,
   type ReleaseNextMover,
+  type ScheduledRow,
+  type ScheduledSnapshot,
 } from '../lib/api.js';
 import { relAge } from '../lib/derive.js';
 import { RouteNav, type BoardRoute } from './BoardShell.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
-import { DESK_ON, DESK_OFF, COBWEB, BLANK_AVATAR, roomDecor } from './office-sprites.js';
+import { DESK_ON, DESK_OFF, COBWEB, COUCH, BLANK_AVATAR, roomDecor, rugTone } from './office-sprites.js';
 
 /**
- * Observatory — a top-down pixel-art office floor you look down into. Each
- * workgroup channel is a walled ROOM on a tiled floor, each agent has ONE body
- * sitting at a desk, and agents with no room stand in the BULLPEN at the
- * bottom. Above the floor sit the two boards the operator actually acts on:
- * the corkboard JOB BOARD (release desk) and the WHITEBOARD (claims).
+ * Observatory — a top-down pixel-art OPEN-PLAN office floor you look down into.
+ * One continuous checkerboard floor holds everything: each workgroup channel is
+ * a desk cluster standing on its own rug under a hanging sign, agents with no
+ * channel hang out in the lounge, and the clusters are separated by furniture
+ * and aisle space rather than walls. Above the floor sit the boards the
+ * operator acts on: the corkboard JOB BOARD (release desk), the WHITEBOARD
+ * (claims), and WHAT'S SCHEDULED.
  *
  * Deliberately bright and warm — the rest of the dashboard is a dark control
  * surface; this is a lit room with people in it. No animation, no canvas, no
  * images: everything is CSS plus inline-SVG data URIs from office-sprites.ts.
  *
  * Polls GET /dashboard/api/observatory?workgroup=:id every 15s (no SSE — this
- * is a slow-moving status board, not a live chat feed). Room POSITION is
- * stable (sorted platform, then name) regardless of activity, and each room's
- * furniture is hashed from its key — spatial memory is the point. Activity is
- * conveyed by lighting only.
+ * is a slow-moving status board, not a live chat feed). Zone POSITION is
+ * stable (sorted platform, then name) regardless of activity, and each zone's
+ * rug tone and furniture are hashed from its key — spatial memory is the
+ * point. Activity is conveyed by lighting only.
+ *
+ * Everything a human would poke at is a real button or anchor: zones, tallies,
+ * job-board rows and claim rows all open in place, and anything with a URL
+ * links out in a new tab.
  */
 
 const POLL_MS = 15_000;
@@ -73,24 +82,28 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
   );
 
   const [highlightedAgentId, setHighlightedAgentId] = useState<string | null>(null);
+  const [expandedClaim, setExpandedClaim] = useState<string | null>(null);
+  const [openZone, setOpenZone] = useState<string | null>(null);
 
   // Which agent's popover is open, and whether a click pinned it there (vs. a
   // hover that closes on mouseleave). Single piece of state — one popover can
   // ever be open, whatever chip it came from.
   const [popover, setPopover] = useState<{ id: string; pinned: boolean } | null>(null);
 
-  // Outside click closes the popover. A click ON a chip (or inside its own
-  // popover, nested in the same div) is handled by the chip's own handlers —
-  // this only fires for clicks that land nowhere near a chip.
+  // Outside click closes whatever is open. A click ON a chip (or inside its own
+  // popover, nested in the same div) is handled by the chip's own handlers, and
+  // the same holds for a zone and its panel — this only fires for clicks that
+  // land nowhere near either.
   useEffect(() => {
-    if (!popover) return;
+    if (!popover && !openZone) return;
     function onDocClick(e: MouseEvent) {
       const el = e.target as Element | null;
       if (!el?.closest?.('.nc-obs-chip')) setPopover(null);
+      if (!el?.closest?.('.nc-obs-room')) setOpenZone(null);
     }
     document.addEventListener('click', onDocClick);
     return () => document.removeEventListener('click', onDocClick);
-  }, [popover]);
+  }, [popover, openZone]);
 
   function bindPopover(id: string) {
     return {
@@ -125,6 +138,7 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
   const claimClicked = (claim: ObservatoryClaim) => {
     const match = agents.find((a) => a.id === claim.owner || a.name === claim.owner);
     setHighlightedAgentId((prev) => (match && prev === match.id ? null : match?.id ?? null));
+    setExpandedClaim((prev) => (prev === claim.slug ? null : claim.slug));
   };
 
   return (
@@ -137,7 +151,7 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
           </div>
           {snapshot && (
             <div className="nc-of-headcount">
-              {awakeCount} awake <span aria-hidden="true">·</span> {rooms.length} rooms
+              {awakeCount} awake <span aria-hidden="true">·</span> {rooms.length} channels
             </div>
           )}
           <RouteNav route={route} onRouteChange={onRouteChange} />
@@ -153,12 +167,14 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
             <ReleaseDesk releaseState={snapshot.releaseState} />
 
             <div className="nc-obs-main">
-              <ClaimsWall claims={claims} onClaimClick={claimClicked} />
+              <ClaimsWall claims={claims} expandedSlug={expandedClaim} onClaimClick={claimClicked} />
+
+              <ScheduledSection agentGroupIds={agents.map((a) => a.id)} />
 
               <div className="nc-of-floor">
                 <div className="nc-obs-rooms">
                   {rooms.map((room) => (
-                    <RoomCard
+                    <Zone
                       key={room.key}
                       room={room}
                       bodies={agents.filter((a) => a.location === room.key)}
@@ -166,13 +182,20 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
                       highlightedAgentId={highlightedAgentId}
                       openAgentId={popover?.id ?? null}
                       bindPopover={bindPopover}
+                      panelOpen={openZone === room.key}
+                      onToggle={() => {
+                        setPopover(null);
+                        setOpenZone((prev) => (prev === room.key ? null : room.key));
+                      }}
+                      onClosePanel={() => setOpenZone(null)}
                     />
                   ))}
-                  {rooms.length === 0 && <div className="nc-empty">no rooms wired for this workgroup</div>}
+                  {rooms.length === 0 && <div className="nc-empty">no channels wired for this workgroup</div>}
                 </div>
 
                 <div className="nc-obs-desks nc-of-bullpen">
-                  <div className="nc-obs-desks-label">Bullpen</div>
+                  <div className="nc-obs-desks-label">Lounge</div>
+                  <img className="nc-of-sprite nc-of-lounge-couch" src={COUCH} alt="" aria-hidden="true" />
                   <div className="nc-obs-desks-row">
                     {deskAgents.length === 0 && <span className="nc-obs-desks-empty">no one home</span>}
                     {deskAgents.map((a) => (
@@ -197,7 +220,7 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
 
 /* ─── Pure helpers (exported for tests) ──────────────────────────────────── */
 
-/** Stable room ordering — platform, then name. Never by activity. */
+/** Stable zone ordering — platform, then name. Never by activity. */
 export function sortRooms(rooms: ObservatoryRoom[]): ObservatoryRoom[] {
   return [...rooms].sort((a, b) => a.platform.localeCompare(b.platform) || a.name.localeCompare(b.name));
 }
@@ -209,7 +232,7 @@ export function sortClaims(claims: ObservatoryClaim[]): ObservatoryClaim[] {
   return [...claims].sort((a, b) => CLAIM_ORDER.indexOf(a.state) - CLAIM_ORDER.indexOf(b.state));
 }
 
-/** Room light level, driven by lastActivityAt: today lit, 1-7d dim, else dusty. */
+/** Zone light level, driven by lastActivityAt: today lit, 1-7d dim, else dusty. */
 export function roomActivityClass(lastActivityAt: string | null, now = Date.now()): 'lit' | 'dim' | 'dusty' {
   if (!lastActivityAt) return 'dusty';
   const days = (now - new Date(lastActivityAt).getTime()) / 86_400_000;
@@ -244,27 +267,47 @@ export function claimAgeLabel(c: ObservatoryClaim, now = Date.now()): string {
   return `${mag} past deadline`;
 }
 
-/* ─── Job board — "can we ship, what's in the way, whose move" ───────────── */
+/** Link that always leaves the page safely. */
+function OutLink({ href, children }: { href: string; children: string }) {
+  return (
+    <a className="nc-of-link" href={href} target="_blank" rel="noopener noreferrer">
+      {children} ↗
+    </a>
+  );
+}
+
+/* ─── Job board — "what's in the way, and who has to move" ───────────────── */
+
+type ReleaseGroupKey = 'blockers' | ReleaseNextMover;
 
 const MOVER_ORDER: ReleaseNextMover[] = ['human', 'agent', 'nobody'];
 
 const MOVER_GROUP_LABELS: Record<ReleaseNextMover, string> = {
-  human: 'Your move',
-  agent: "In agents' hands",
-  nobody: "Nobody's — at risk",
+  human: 'Waiting on a person',
+  agent: 'Agents are handling it',
+  nobody: 'Nobody is on this',
 };
 
 const MOVER_GROUP_SUBTITLES: Record<ReleaseNextMover, string> = {
-  human: 'waiting on a person; nothing proceeds until they act',
-  agent: "autonomously handled; watch, don't touch",
-  nobody: 'no owner and no motion; these rot unless someone takes them',
+  human: 'nothing moves until someone decides or approves',
+  agent: 'being worked automatically right now',
+  nobody: 'no owner, no progress — it stays stuck until someone picks it up',
 };
 
-const MOVER_TAG: Record<ReleaseNextMover, string> = { human: 'your move', agent: 'agents', nobody: 'unowned' };
+const MOVER_TAG: Record<ReleaseNextMover, string> = {
+  human: 'needs a person',
+  agent: 'automated',
+  nobody: 'unowned',
+};
 
 const KIND_GLYPH: Record<string, string> = { pr: '🔀', finding: '🐞', decision: '⚖️', claim: '📌', ops: '🧰' };
 function kindGlyph(kind: string): string {
   return KIND_GLYPH[kind] ?? '•';
+}
+
+/** "open PR" for a pull request, "open issue" for everything else. */
+function itemLinkLabel(kind: string): string {
+  return kind === 'pr' ? 'open PR' : 'open issue';
 }
 
 /**
@@ -289,21 +332,21 @@ export function groupReleaseItems(items: ReleaseItem[]): {
 }
 
 /**
- * The four tallies, zero terms dropped. Rendered as big chunky numbers on the
- * corkboard; the joined form is `releaseCounts`, and the two must stay in
- * lockstep — the counts line is a contract, not decoration.
+ * The four tallies, zero terms dropped. Rendered as big chunky number buttons
+ * on the corkboard; the joined form is `releaseCounts`, and the two must stay
+ * in lockstep — the counts line is a contract, not decoration.
  */
-export function releaseCountParts(items: ReleaseItem[]): { n: number; label: string }[] {
+export function releaseCountParts(items: ReleaseItem[]): { key: ReleaseGroupKey; n: number; label: string }[] {
   const g = groupReleaseItems(items);
   return [
-    { n: g.blockers.length, label: 'holding release' },
-    { n: g.human.length, label: 'your move' },
-    { n: g.agent.length, label: 'in flight' },
-    { n: g.nobody.length, label: 'at risk' },
+    { key: 'blockers' as const, n: g.blockers.length, label: 'blocking' },
+    { key: 'human' as const, n: g.human.length, label: 'need a person' },
+    { key: 'agent' as const, n: g.agent.length, label: 'automated' },
+    { key: 'nobody' as const, n: g.nobody.length, label: 'unowned' },
   ].filter((p) => p.n > 0);
 }
 
-/** "2 holding release · 3 your move · 5 in flight · 4 at risk" — zero terms omitted. */
+/** "2 blocking · 28 need a person · 9 automated · 32 unowned" — zero terms omitted. */
 export function releaseCounts(items: ReleaseItem[]): string {
   return releaseCountParts(items)
     .map((p) => `${p.n} ${p.label}`)
@@ -314,35 +357,51 @@ function ReleaseRow({
   item,
   moverTag,
   boldOwner,
+  expanded,
+  onToggle,
 }: {
   item: ReleaseItem;
   moverTag?: string;
   boldOwner?: boolean;
+  expanded: boolean;
+  onToggle: () => void;
 }) {
   return (
     <div className="nc-obs-release-row" data-item-id={item.id}>
-      <span className="nc-obs-release-row-kind" aria-hidden="true">
-        {kindGlyph(item.kind)}
-      </span>
       {item.url ? (
-        <a className="nc-obs-release-row-id" href={item.url} target="_blank" rel="noreferrer">
+        <a className="nc-obs-release-row-id" href={item.url} target="_blank" rel="noopener noreferrer">
           {item.id}
         </a>
       ) : (
         <span className="nc-obs-release-row-id">{item.id}</span>
       )}
-      <span className="nc-obs-release-row-title">{item.title}</span>
-      {moverTag && <span className="nc-obs-release-row-tag">{moverTag}</span>}
-      {item.owner && (
-        <span className="nc-obs-release-row-owner">{boldOwner ? <strong>{item.owner}</strong> : item.owner}</span>
+      <button type="button" className="nc-obs-release-row-toggle" aria-expanded={expanded} onClick={onToggle}>
+        <span className="nc-obs-release-row-kind" aria-hidden="true">
+          {kindGlyph(item.kind)}
+        </span>
+        <span className="nc-obs-release-row-title">{item.title}</span>
+        {moverTag && <span className="nc-obs-release-row-tag">{moverTag}</span>}
+        {item.owner && (
+          <span className="nc-obs-release-row-owner">{boldOwner ? <strong>{item.owner}</strong> : item.owner}</span>
+        )}
+        {item.since && <span className="nc-obs-release-row-age">{relAge(item.since)}</span>}
+      </button>
+      {expanded && (
+        <div className="nc-obs-release-row-detail">
+          {item.why && <div className="nc-obs-release-row-why">{item.why}</div>}
+          {item.owner && <div className="nc-obs-release-row-meta">owner: {item.owner}</div>}
+          {item.since && <div className="nc-obs-release-row-meta">open for {relAge(item.since)}</div>}
+          {item.url && <OutLink href={item.url}>{itemLinkLabel(item.kind)}</OutLink>}
+        </div>
       )}
-      {item.since && <span className="nc-obs-release-row-age">{relAge(item.since)}</span>}
-      {item.why && <div className="nc-obs-release-row-why">{item.why}</div>}
     </div>
   );
 }
 
 function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
+  const [filter, setFilter] = useState<ReleaseGroupKey | null>(null);
+  const [expandedItem, setExpandedItem] = useState<string | null>(null);
+
   if (!releaseState) {
     return (
       <section className="nc-obs-release nc-of-corkboard">
@@ -357,6 +416,8 @@ function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
   const { items, release, asOf } = releaseState;
   const groups = groupReleaseItems(items);
   const parts = releaseCountParts(items);
+  const shows = (key: ReleaseGroupKey) => filter === null || filter === key;
+  const toggleItem = (id: string) => setExpandedItem((prev) => (prev === id ? null : id));
 
   return (
     <section className="nc-obs-release nc-of-corkboard">
@@ -366,16 +427,34 @@ function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
           <span className="nc-obs-release-fresh"> — updated {relAge(asOf)} ago by the release watcher</span>
         </div>
         {parts.length > 0 && (
-          // textContent stays exactly "1 holding release · 2 in flight" — the
-          // spans only give CSS something to make the numbers big.
-          <div className="nc-obs-release-counts">
-            {parts.map((p, i) => (
-              <span key={p.label} className="nc-of-tally">
-                {i > 0 && <span className="nc-of-tally-sep">{' · '}</span>}
-                <span className="nc-of-tally-n">{p.n}</span>
-                <span className="nc-of-tally-l">{' ' + p.label}</span>
-              </span>
-            ))}
+          <div className="nc-of-tally-row">
+            {/* textContent of .nc-obs-release-counts stays exactly
+                "1 blocking · 2 automated" — the ALL reset lives outside it. */}
+            <div className="nc-obs-release-counts">
+              {parts.map((p, i) => (
+                <span key={p.key} className="nc-of-tally">
+                  {i > 0 && <span className="nc-of-tally-sep">{' · '}</span>}
+                  <button
+                    type="button"
+                    className={`nc-of-tally-btn ${filter === p.key ? 'active' : ''}`}
+                    data-tally={p.key}
+                    aria-pressed={filter === p.key}
+                    onClick={() => setFilter((prev) => (prev === p.key ? null : p.key))}
+                  >
+                    <span className="nc-of-tally-n">{p.n}</span>
+                    <span className="nc-of-tally-l">{' ' + p.label}</span>
+                  </button>
+                </span>
+              ))}
+            </div>
+            <button
+              type="button"
+              className={`nc-of-tally-all ${filter === null ? 'active' : ''}`}
+              aria-pressed={filter === null}
+              onClick={() => setFilter(null)}
+            >
+              All
+            </button>
           </div>
         )}
       </div>
@@ -397,29 +476,90 @@ function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
         <div className="nc-obs-release-empty">nothing open — clear to ship pending the usual gates</div>
       )}
 
-      {groups.blockers.length > 0 && (
+      {groups.blockers.length > 0 && shows('blockers') && (
         <div className="nc-obs-release-group blockers">
-          <div className="nc-obs-release-group-label">Holding the release</div>
-          <div className="nc-obs-release-group-sub">these decide whether develop promotes to main</div>
+          <div className="nc-obs-release-group-label">Blocking the release</div>
+          <div className="nc-obs-release-group-sub">nothing ships until these are cleared</div>
           {groups.blockers.map((item) => (
-            <ReleaseRow key={item.id} item={item} moverTag={MOVER_TAG[item.nextMover]} />
+            <ReleaseRow
+              key={item.id}
+              item={item}
+              moverTag={MOVER_TAG[item.nextMover]}
+              expanded={expandedItem === item.id}
+              onToggle={() => toggleItem(item.id)}
+            />
           ))}
         </div>
       )}
 
       {MOVER_ORDER.map((mover) => {
         const rows = groups[mover];
-        if (rows.length === 0) return null;
+        if (rows.length === 0 || !shows(mover)) return null;
         return (
           <div key={mover} className="nc-obs-release-group">
             <div className="nc-obs-release-group-label">{MOVER_GROUP_LABELS[mover]}</div>
             <div className="nc-obs-release-group-sub">{MOVER_GROUP_SUBTITLES[mover]}</div>
             {rows.map((item) => (
-              <ReleaseRow key={item.id} item={item} boldOwner={mover === 'human'} />
+              <ReleaseRow
+                key={item.id}
+                item={item}
+                boldOwner={mover === 'human'}
+                expanded={expandedItem === item.id}
+                onToggle={() => toggleItem(item.id)}
+              />
             ))}
           </div>
         );
       })}
+    </section>
+  );
+}
+
+/* ─── What's scheduled — the next few automatic jobs ─────────────────────── */
+
+const SCHED_KIND_LABEL: Record<string, string> = {
+  recurring: 'repeating job',
+  one_off: 'one-time job',
+  thread_loop: 'follow-up check',
+};
+
+/**
+ * The next `limit` fires belonging to agents on this floor, soonest first.
+ * Rows with no next fire (cancelled, finished one-offs) are not upcoming work
+ * and drop out.
+ */
+export function upcomingScheduled(rows: ScheduledRow[], agentGroupIds: string[], limit = 8): ScheduledRow[] {
+  const mine = new Set(agentGroupIds);
+  return rows
+    .filter((r) => mine.has(r.agent_group_id) && r.next_fire_utc)
+    .sort((a, b) => Date.parse(a.next_fire_utc!) - Date.parse(b.next_fire_utc!))
+    .slice(0, limit);
+}
+
+function ScheduledSection({ agentGroupIds }: { agentGroupIds: string[] }) {
+  const { data, error } = useSWR<ScheduledSnapshot>('/dashboard/api/scheduled', () => listScheduled(), {
+    refreshInterval: POLL_MS,
+  });
+  const rows = upcomingScheduled(data?.rows ?? [], agentGroupIds);
+
+  return (
+    <section className="nc-of-sched">
+      <div className="nc-of-sched-title">What&apos;s scheduled</div>
+      {error && !data && <div className="nc-of-sched-empty">couldn&apos;t load scheduled work</div>}
+      {!error && data && rows.length === 0 && <div className="nc-of-sched-empty">nothing scheduled</div>}
+      {rows.length > 0 && (
+        <ul className="nc-of-sched-list">
+          {rows.map((r) => (
+            <li key={r.key} className="nc-of-sched-row" data-sched-key={r.key}>
+              <span className="nc-of-sched-who">{r.agent_group_name}</span>
+              <span className="nc-of-sched-what">{SCHED_KIND_LABEL[r.kind] ?? 'job'}</span>
+              <span className="nc-of-sched-when">{relTime(r.next_fire_utc!)}</span>
+              {r.channel_name && <span className="nc-of-sched-where">in {r.channel_name}</span>}
+              <span className="nc-of-sched-id">{r.series_id}</span>
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
@@ -508,15 +648,18 @@ function AgentChip({
   );
 }
 
-/* ─── Room — a walled area on the floor ──────────────────────────────────── */
+/* ─── Zone — a rug, a hanging sign and a desk cluster on the open floor ──── */
 
-function RoomCard({
+function Zone({
   room,
   bodies,
   agentsById,
   highlightedAgentId,
   openAgentId,
   bindPopover,
+  panelOpen,
+  onToggle,
+  onClosePanel,
 }: {
   room: ObservatoryRoom;
   bodies: ObservatoryAgent[];
@@ -524,23 +667,34 @@ function RoomCard({
   highlightedAgentId: string | null;
   openAgentId: string | null;
   bindPopover: (id: string) => PopoverBinding;
+  panelOpen: boolean;
+  onToggle: () => void;
+  onClosePanel: () => void;
 }) {
   const cls = roomActivityClass(room.lastActivityAt);
   const presentIds = new Set(bodies.map((a) => a.id));
   const absentMembers = room.memberAgentIds.filter((id) => !presentIds.has(id));
   const decor = roomDecor(room.key);
-  // A dim/dusty room's opacity creates its own stacking context, trapping any
-  // popover rendered inside it below sibling room cards later in the grid.
-  // Elevating the room itself (grid items honor z-index without needing
-  // position:relative) lifts the trapped popover above every sibling.
-  const hasOpenPopover = bodies.some((a) => a.id === openAgentId);
+  // A dusty zone's filtered sprites create their own stacking context, which
+  // can trap an open panel below zones later in the grid. Elevating the zone
+  // itself (grid items honor z-index without needing position:relative) lifts
+  // anything open inside it above every sibling.
+  const hasOpenPanel = panelOpen || bodies.some((a) => a.id === openAgentId);
 
   return (
-    <div className={`nc-obs-room ${cls} ${hasOpenPopover ? 'has-open-popover' : ''}`} data-room-key={room.key}>
-      <div className="nc-obs-room-head">
+    <div
+      className={`nc-obs-room nc-of-zone rug-${rugTone(room.key)} ${cls} ${hasOpenPanel ? 'has-open-popover' : ''}`}
+      data-room-key={room.key}
+    >
+      <button
+        type="button"
+        className="nc-obs-room-head nc-of-sign"
+        aria-expanded={panelOpen}
+        onClick={onToggle}
+      >
         <span className="nc-obs-room-name">{room.name}</span>
-      </div>
-      <div className="nc-obs-room-platform">{room.platform}</div>
+        <span className="nc-obs-room-platform">{room.platform}</span>
+      </button>
 
       {cls === 'dusty' && (
         <img className="nc-obs-room-cobweb" src={COBWEB} alt="" aria-hidden="true" title="quiet for a while" />
@@ -562,30 +716,45 @@ function RoomCard({
             <img className="nc-of-sprite nc-of-desk" src={DESK_OFF} alt="" />
           </div>
         )}
-        {absentMembers.map((id) => {
-          const known = agentsById.get(id);
-          return known?.avatarUrl ? (
-            <img
-              key={id}
-              className="nc-obs-avatar-sm pixelated"
-              src={known.avatarUrl}
-              alt={known.name}
-              title={known.name}
-              loading="lazy"
-              referrerPolicy="no-referrer"
-            />
-          ) : (
-            <span key={id} className="nc-obs-room-absent" title={known?.name ?? id}>
-              {initials(known?.name ?? id)}
-            </span>
-          );
-        })}
+        {absentMembers.length > 0 && (
+          <div className="nc-of-absent-row">
+            {absentMembers.map((id) => {
+              const known = agentsById.get(id);
+              return known?.avatarUrl ? (
+                <img
+                  key={id}
+                  className="nc-obs-avatar-sm pixelated"
+                  src={known.avatarUrl}
+                  alt={known.name}
+                  title={known.name}
+                  loading="lazy"
+                  referrerPolicy="no-referrer"
+                />
+              ) : (
+                <span key={id} className="nc-obs-room-absent" title={known?.name ?? id}>
+                  {initials(known?.name ?? id)}
+                </span>
+              );
+            })}
+          </div>
+        )}
       </div>
 
-      {room.permalink && (
-        <a className="nc-obs-room-link" href={room.permalink} target="_blank" rel="noreferrer">
-          open ↗
-        </a>
+      {panelOpen && (
+        <div className="nc-obs-hover pinned nc-of-zone-panel" onClick={(e) => e.stopPropagation()}>
+          <button type="button" className="nc-obs-hover-close" aria-label="close" onClick={onClosePanel}>
+            ✕
+          </button>
+          <div className="nc-of-zone-panel-name">{room.name}</div>
+          <div className="nc-obs-hover-canonical">{room.platform}</div>
+          <div>
+            {bodies.length > 0 ? `here now: ${bodies.map((a) => a.name).join(', ')}` : 'nobody at these desks'}
+          </div>
+          <div>
+            {room.lastActivityAt ? `last active ${relAge(room.lastActivityAt)} ago` : 'no activity on record'}
+          </div>
+          {room.permalink && <OutLink href={room.permalink}>open channel</OutLink>}
+        </div>
       )}
     </div>
   );
@@ -594,10 +763,10 @@ function RoomCard({
 /* ─── Whiteboard — "Who's on what" ───────────────────────────────────────── */
 
 const CLAIM_GROUP_LABELS: Record<ObservatoryClaimState, string> = {
-  stale: 'Stale',
-  parked: 'Parked',
-  expiring: 'Expiring',
-  live: 'Live',
+  stale: 'Abandoned',
+  parked: 'Handed off, needs an owner',
+  expiring: 'Running out of time',
+  live: 'Being worked on now',
 };
 
 const CLAIM_GROUP_SUBTITLES: Record<ObservatoryClaimState, string> = {
@@ -607,17 +776,26 @@ const CLAIM_GROUP_SUBTITLES: Record<ObservatoryClaimState, string> = {
   live: 'actively held — leave it alone',
 };
 
+const CLAIM_PILL: Record<ObservatoryClaimState, { cls: string; text: string }> = {
+  stale: { cls: 'failed', text: 'abandoned' },
+  parked: { cls: 'needs', text: '🅿️ needs an owner' },
+  expiring: { cls: 'pending', text: 'running out of time' },
+  live: { cls: 'done', text: 'in progress' },
+};
+
 function ClaimsWall({
   claims,
+  expandedSlug,
   onClaimClick,
 }: {
   claims: ObservatoryClaim[];
+  expandedSlug: string | null;
   onClaimClick: (claim: ObservatoryClaim) => void;
 }) {
   return (
     <aside className="nc-obs-claims nc-of-whiteboard">
       <div className="nc-obs-claims-title">Who&apos;s on what</div>
-      {claims.length === 0 && <div className="nc-empty">no claims</div>}
+      {claims.length === 0 && <div className="nc-empty">nobody has picked anything up</div>}
       {CLAIM_ORDER.map((state) => {
         const rows = claims.filter((c) => c.state === state);
         if (rows.length === 0) return null;
@@ -625,30 +803,40 @@ function ClaimsWall({
           <div key={state} className="nc-obs-claim-group">
             <div className="nc-obs-claim-group-label">{CLAIM_GROUP_LABELS[state]}</div>
             <div className="nc-obs-claim-group-sub">{CLAIM_GROUP_SUBTITLES[state]}</div>
-            {rows.map((c) => (
-              <div
-                key={c.slug}
-                className={`nc-obs-claim-row ${c.state}`}
-                data-slug={c.slug}
-                onClick={() => onClaimClick(c)}
-              >
-                <div className="nc-obs-claim-top">
-                  <span className="nc-obs-claim-slug">{c.slug}</span>
-                  {!c.escalated && c.state === 'stale' && <span className="nc-pill failed">stale</span>}
-                  {c.state === 'parked' && <span className="nc-pill needs">🅿️ needs an owner</span>}
-                  {c.state === 'live' && <span className="nc-pill done">live</span>}
-                  {c.state === 'expiring' && <span className="nc-pill pending">expiring</span>}
+            {rows.map((c) => {
+              const expanded = expandedSlug === c.slug;
+              const pill = CLAIM_PILL[c.state];
+              return (
+                <div key={c.slug} className={`nc-obs-claim-row ${c.state}`} data-slug={c.slug}>
+                  <button
+                    type="button"
+                    className="nc-obs-claim-toggle"
+                    aria-expanded={expanded}
+                    onClick={() => onClaimClick(c)}
+                  >
+                    <span className="nc-obs-claim-top">
+                      <span className="nc-obs-claim-slug">{c.slug}</span>
+                      {!(c.escalated && c.state === 'stale') && (
+                        <span className={`nc-pill ${pill.cls}`}>{pill.text}</span>
+                      )}
+                    </span>
+                    {c.escalated && (
+                      <span className="nc-obs-claim-escalated">escalated · already announced in channel</span>
+                    )}
+                    <span className="nc-obs-claim-owner">
+                      {c.owner && c.owner !== 'unknown' ? c.owner : <em>owner unknown</em>}
+                    </span>
+                    <span className="nc-obs-claim-age">{claimAgeLabel(c)}</span>
+                  </button>
+                  {expanded && (
+                    <div className="nc-obs-claim-detail">
+                      {c.note && <div className="nc-obs-claim-note">{c.note}</div>}
+                      {c.threadUrl && <OutLink href={c.threadUrl}>open thread</OutLink>}
+                    </div>
+                  )}
                 </div>
-                {c.escalated && (
-                  <div className="nc-obs-claim-escalated">escalated · already announced in channel</div>
-                )}
-                <div className="nc-obs-claim-owner">
-                  {c.owner && c.owner !== 'unknown' ? c.owner : <em>owner unknown</em>}
-                </div>
-                <div className="nc-obs-claim-age">{claimAgeLabel(c)}</div>
-                {c.note && <div className="nc-obs-claim-note">{c.note}</div>}
-              </div>
-            ))}
+              );
+            })}
           </div>
         );
       })}
