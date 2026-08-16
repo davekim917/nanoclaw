@@ -1743,91 +1743,165 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-release-lane-sum { font-size: 11px; color: #efdcbb; }
 
 /* Collapsed boards. Native <details> — progressive disclosure with no JS, and
-   the summary is the affordance. These sit BELOW the office deliberately. */
-.nc-of .nc-of-board {
-  background: var(--of-paper); border: 3px solid var(--of-ink-2); box-shadow: var(--of-drop);
+   the summary is the affordance. These sit BELOW the office deliberately.
+   Atrium chrome: hairline card, sentence case. The uppercase-letterspaced-mono
+   summary this replaced was costume on the wrong layer — the map is the only
+   illustrated surface in the product. */
+.nc-of .nc-of-board{
+  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r); overflow:hidden;
 }
-.nc-of .nc-of-board + .nc-of-board { margin-top: 10px; }
-.nc-of .nc-of-board-summary {
-  cursor: pointer; list-style: none; padding: 11px 14px; min-height: 44px;
-  display: flex; align-items: center; gap: 9px;
-  font-family: var(--font-mono); font-size: 12px; font-weight: 700;
-  letter-spacing: 0.12em; text-transform: uppercase; color: var(--of-ink);
+.nc-of .nc-of-board + .nc-of-board{margin-top:10px}
+.nc-of .nc-of-board-summary{
+  cursor:pointer; list-style:none; padding:12px 14px; min-height:44px;
+  display:flex; align-items:center; gap:9px; font-size:13px; font-weight:600; color:var(--ink);
 }
-.nc-of .nc-of-board-summary::-webkit-details-marker { display: none; }
-.nc-of .nc-of-board-summary::after { content: '\25B8'; margin-left: auto; }
-.nc-of .nc-of-board[open] > .nc-of-board-summary::after { content: '\25BE'; }
-.nc-of .nc-of-board-summary:focus-visible { outline: 3px solid var(--of-ink); outline-offset: -3px; }
-.nc-of .nc-of-board-n {
-  border: 2px solid var(--of-ink-2); padding: 0 6px; font-size: 11px; letter-spacing: 0.06em;
+.nc-of .nc-of-board-summary::-webkit-details-marker{display:none}
+.nc-of .nc-of-board-summary::after{content:'\25B8'; margin-left:auto; color:var(--ink-3); font-size:10px}
+.nc-of .nc-of-board[open] > .nc-of-board-summary::after{content:'\25BE'}
+.nc-of .nc-of-board[open] > .nc-of-board-summary{border-bottom:1px solid var(--line)}
+.nc-of .nc-of-board-summary:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+.nc-of .nc-of-board-n{
+  font-size:11.5px; font-weight:500; color:var(--ink-3); font-variant-numeric:tabular-nums;
 }
-.nc-of .nc-of-board > *:not(.nc-of-board-summary) { padding: 0 12px 12px; }
+.nc-of .nc-of-board > *:not(.nc-of-board-summary){padding:12px 14px}
 
-/* The one-line summary strip, directly above the office. */
-.nc-of .nc-of-tally-strip {
-  margin-bottom: 10px; padding: 2px 10px;
-  background: var(--of-paper); border: 3px solid var(--of-ink-2); box-shadow: var(--of-drop);
+/* The job board's own filter control. It is the board's, not the page's — the
+   headline above already answers "how much"; these four choose what to list. */
+.nc-of .nc-of-tally-strip{margin-bottom:12px}
+.nc-of .nc-of-tally-strip .nc-of-tally-n{
+  color:var(--ink); text-shadow:none; font-size:17px; font-weight:600;
+  font-family:'IBM Plex Mono',ui-monospace,monospace; font-variant-numeric:tabular-nums;
 }
-/* These colours were authored for the dark corkboard the strip used to sit on.
-   On the light page they were cream-on-cream — the numbers survived on their
-   drop shadow alone and the labels vanished entirely. */
-.nc-of .nc-of-tally-strip .nc-of-tally-n { color: var(--of-ink); text-shadow: none; font-size: 22px; }
-.nc-of .nc-of-tally-strip .nc-of-tally-l { color: var(--of-ink-2); }
-.nc-of .nc-of-tally-strip .nc-of-tally-sep { color: var(--of-ink-2); opacity: 0.5; }
-.nc-of .nc-of-tally-strip .nc-of-tally-btn:hover { border-color: var(--of-ink-2); }
-.nc-of .nc-of-tally-strip .nc-of-tally-btn.active { background: var(--of-cork); border-color: var(--of-ink); }
-.nc-of .nc-of-tally-strip .nc-of-tally-btn.active .nc-of-tally-n { color: var(--of-cream); }
-.nc-of .nc-of-tally-strip .nc-of-tally-btn.active .nc-of-tally-l { color: var(--of-cream); }
-.nc-of .nc-of-tally-strip .nc-of-tally-all { margin-left: auto; }
-/* On a phone the row wrapped, `margin-left:auto` threw ALL onto its own line,
-   and the strip ate half the viewport before the office — the exact failure
-   this strip exists to prevent. Below 700px it is a fixed 2x2 of compact
-   cells with ALL inline, so it stays one block and the floor stays near the
-   top of the page. */
-@media (max-width: 700px) {
-  .nc-of .nc-of-tally-strip { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 8px; padding: 6px 8px; }
-  .nc-of .nc-of-tally-strip .nc-obs-release-counts { display: contents; }
-  .nc-of .nc-of-tally-strip .nc-of-tally { display: flex; align-items: baseline; }
-  .nc-of .nc-of-tally-strip .nc-of-tally-sep { display: none; }
-  .nc-of .nc-of-tally-strip .nc-of-tally-btn { min-height: 36px; padding: 2px 4px; }
-  .nc-of .nc-of-tally-strip .nc-of-tally-n { font-size: 18px; }
-  .nc-of .nc-of-tally-strip .nc-of-tally-l { font-size: 9px; letter-spacing: 0.06em; }
-  .nc-of .nc-of-tally-strip .nc-of-tally-all {
-    grid-column: 1 / -1; margin-left: 0; min-height: 36px; padding: 2px 10px; justify-self: start;
-  }
+.nc-of .nc-of-tally-strip .nc-of-tally-l{
+  color:var(--ink-3); font-size:11.5px; letter-spacing:0; text-transform:none;
+}
+.nc-of .nc-of-tally-strip .nc-of-tally-sep{display:none}
+.nc-of .nc-of-tally-strip .nc-of-tally-btn{
+  border:1px solid var(--line); border-radius:8px; background:var(--card);
+  padding:6px 10px; min-height:44px;
+}
+.nc-of .nc-of-tally-strip .nc-of-tally-btn:hover{border-color:var(--line-2)}
+.nc-of .nc-of-tally-strip .nc-of-tally-btn.active{
+  background:var(--card-2); border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent);
+}
+.nc-of .nc-of-tally-strip .nc-of-tally-btn.active .nc-of-tally-n,
+.nc-of .nc-of-tally-strip .nc-of-tally-btn.active .nc-of-tally-l{color:var(--accent)}
+.nc-of .nc-of-tally-strip .nc-of-tally-all{margin-left:auto}
+@media (max-width:700px){
+  .nc-of .nc-of-tally-strip{display:grid; grid-template-columns:1fr 1fr; gap:6px}
+  .nc-of .nc-of-tally-strip .nc-obs-release-counts{display:contents}
+  .nc-of .nc-of-tally-strip .nc-of-tally{display:flex; align-items:baseline}
+  .nc-of .nc-of-tally-strip .nc-of-tally-all{grid-column:1 / -1; margin-left:0; justify-self:stretch}
+}
+
+/* ─── atrium: the light chrome ───────────────────────────────────────────── */
+/* One system across every surface. The map is the only illustrated thing in
+   the product; its container, and everything around it, is quiet light UI. */
+.nc-of{
+  --ink:#23201b; --ink-2:rgba(35,32,27,.62); --ink-3:rgba(35,32,27,.45);
+  --line:rgba(35,32,27,.10); --line-2:rgba(35,32,27,.16);
+  --page:#efece5; --card:#faf7f2; --card-2:#fff;
+  --accent:#3f68c9;
+  --stop:#b0503f; --warn:#b3862c; --go:#4a7c59; --idle:#8f8b82;
+  --r:10px;
+  background:var(--page); color:var(--ink);
+  font-family:'Instrument Sans',ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  font-size:13px; -webkit-font-smoothing:antialiased;
+}
+.nc-of .num,.nc-of .mono{font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+
+.nc-of .nc-of-bar{
+  display:flex; align-items:center; gap:16px; padding:13px 20px;
+  background:var(--card-2); border-bottom:1px solid var(--line);
+}
+.nc-of .nc-of-bar-title{font-size:14.5px; font-weight:600; letter-spacing:-.01em}
+.nc-of .nc-of-bar-meta{
+  margin-left:auto; display:flex; align-items:center; gap:14px;
+  font-size:12px; color:var(--ink-3);
+}
+.nc-of .nc-of-live{display:inline-flex; align-items:center; gap:6px}
+.nc-of .nc-of-live i{width:6px; height:6px; border-radius:50%; background:var(--idle)}
+.nc-of .nc-of-live i.on{background:var(--go)}
+
+/* Headline: one dominant number, two secondary, the data gaps beside them. */
+.nc-of .nc-of-head{
+  display:flex; gap:20px; align-items:stretch; padding:18px 20px 16px;
+  border-bottom:1px solid var(--line); background:var(--card-2); margin-bottom:12px;
+  border-radius:var(--r);
+}
+.nc-of .nc-of-head-main{flex:1; min-width:0}
+.nc-of .nc-of-hero{display:flex; align-items:baseline; gap:13px}
+.nc-of .nc-of-hero-n{
+  font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:60px; font-weight:600;
+  color:var(--stop); line-height:.86; letter-spacing:-.03em; font-variant-numeric:tabular-nums;
+}
+.nc-of .nc-of-hero-l{font-size:14.5px; line-height:1.35}
+.nc-of .nc-of-hero-l span{display:block; color:var(--ink-2); font-size:12.5px}
+.nc-of .nc-of-sub{
+  display:flex; gap:26px; margin-top:16px; padding-top:13px; border-top:1px solid var(--line);
+  font-size:12.5px; color:var(--ink-2); align-items:baseline; flex-wrap:wrap;
+}
+.nc-of .nc-of-sub b{
+  font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:19px; font-weight:600;
+  margin-right:6px; font-variant-numeric:tabular-nums;
+}
+.nc-of .nc-of-sub b.warn{color:var(--warn)} .nc-of .nc-of-sub b.go{color:var(--go)}
+.nc-of .nc-of-sub-total{margin-left:auto; color:var(--ink-3)}
+.nc-of .nc-of-notes{
+  width:430px; max-width:100%; display:flex; flex-direction:column; gap:10px;
+  border-left:1px solid var(--line); padding-left:20px;
+}
+.nc-of .nc-of-notes p{margin:0; display:flex; gap:9px; align-items:flex-start; font-size:12.5px; line-height:1.45}
+.nc-of .nc-of-notes i{width:6px; height:6px; border-radius:50%; margin-top:5px; flex:none}
+.nc-of .nc-of-notes i.warn{background:var(--warn)} .nc-of .nc-of-notes i.stop{background:var(--stop)}
+.nc-of .nc-of-notes b{font-weight:600}
+.nc-of .nc-of-notes span{color:var(--ink-2)}
+.nc-of .nc-of-notes b + span,.nc-of .nc-of-notes span b{color:var(--ink)}
+@media (max-width:900px){
+  .nc-of .nc-of-head{flex-direction:column; gap:14px}
+  .nc-of .nc-of-notes{width:auto; border-left:0; border-top:1px solid var(--line); padding-left:0; padding-top:12px}
+  .nc-of .nc-of-hero-n{font-size:46px}
 }
 
 /* ─── The office map card ────────────────────────────────────────────────── */
 /* The floor is the vendored <office-map> element. Its chrome is deliberately
    quiet — the map is the only illustrated surface, its container is not. */
 .nc-of .nc-of-mapcard{
-  background:#fff; border:1px solid rgba(35,32,27,.10); border-radius:10px; overflow:hidden;
+  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r); overflow:hidden;
   box-shadow:0 1px 2px rgba(35,32,27,.05); margin-bottom:12px;
 }
 .nc-of .nc-of-mapcard-head{
-  display:flex; align-items:center; gap:10px; padding:10px 12px;
-  border-bottom:1px solid rgba(35,32,27,.09);
+  display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid var(--line);
 }
-.nc-of .nc-of-mapcard-title{font-size:12.5px; font-weight:600; color:#23201b}
-.nc-of .nc-of-mapcard-hint{font-size:12px; color:rgba(35,32,27,.45)}
+.nc-of .nc-of-mapcard-title{font-size:12.5px; font-weight:600; color:var(--ink)}
+.nc-of .nc-of-mapcard-hint{font-size:12px; color:var(--ink-3)}
 .nc-of .nc-of-mapcard-head .nc-of-chip{margin-left:auto}
 .nc-of .nc-of-teleport{
-  display:flex; gap:7px; padding:9px 12px; border-top:1px solid rgba(35,32,27,.09);
+  display:flex; gap:7px; padding:9px 12px; border-top:1px solid var(--line);
   overflow-x:auto; align-items:center;
 }
 .nc-of .nc-of-chip{
   appearance:none; display:inline-flex; align-items:center; gap:6px; flex:none;
   height:28px; padding:0 10px; border-radius:7px; cursor:pointer;
-  border:1px solid rgba(35,32,27,.14); background:#fff; color:#23201b;
+  border:1px solid var(--line-2); background:var(--card-2); color:var(--ink);
   font:500 11.5px/1 inherit; white-space:nowrap;
 }
 .nc-of .nc-of-chip:hover{background:rgba(35,32,27,.04)}
-.nc-of .nc-of-chip.on{background:#23201b; color:#faf7f2; border-color:#23201b}
-.nc-of .nc-of-sd{width:6px; height:6px; border-radius:50%; flex:none; background:#8f8b82}
-.nc-of .nc-of-sd.blocked{background:#c1554a}
-.nc-of .nc-of-sd.waiting{background:#c08a2e}
-.nc-of .nc-of-sd.working{background:#4a7c59}
-.nc-of .nc-of-overflow{font-size:11.5px; color:rgba(35,32,27,.45); flex:none}
+.nc-of .nc-of-chip.on{background:var(--ink); color:var(--card); border-color:var(--ink)}
+.nc-of .nc-of-sd{width:6px; height:6px; border-radius:50%; flex:none; background:var(--idle)}
+.nc-of .nc-of-sd.blocked{background:var(--stop)}
+.nc-of .nc-of-sd.waiting{background:var(--warn)}
+.nc-of .nc-of-sd.working{background:var(--go)}
+.nc-of .nc-of-overflow{font-size:11.5px; color:var(--ink-3); flex:none}
+/* Phone: the bar carries the title, the picker and the one live number. The
+   agent/channel counts are reference, not signal, and pushed the live dot off
+   the right edge — nothing may be wider than the viewport but the map. */
+@media (max-width:700px){
+  .nc-of .nc-of-bar{gap:10px; padding:11px 14px}
+  .nc-of .nc-of-bar-meta{gap:10px; flex:none}
+  .nc-of .nc-of-bar-count{display:none}
+  .nc-of .nc-of-teleport{padding:9px 12px 9px 12px}
+}
 
 /* ─── Commitment strip + ledger ──────────────────────────────────────────── */
 
@@ -1852,60 +1926,118 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   .nc-of .nc-of-commit .n{font-size:20px}
 }
 
-.nc-of .nc-obs-ledger{display:flex; flex-direction:column; gap:9px}
-.nc-of .nc-obs-ledger-cov{
-  background:var(--of-paper); border:3px solid var(--of-ink-2); box-shadow:var(--of-drop);
-  padding:8px 12px; font-size:12.5px; color:var(--of-ink);
+/* ─── The queue ──────────────────────────────────────────────────────────── */
+/* ONE card with hairline dividers, not a stack of individually bordered boxes.
+   Fixed grammar across every row — lead | title | owner | type | age — so the
+   columns share an edge and the list reads down as well as across. */
+.nc-of .nc-obs-ledger{display:flex; flex-direction:column; gap:10px}
+.nc-of .nc-obs-ledger-cov,.nc-of .nc-obs-ledger-sec,.nc-of .nc-obs-ledger-empty{
+  display:flex; gap:9px; align-items:baseline; font-size:12.5px; color:var(--ink-2);
+  padding:9px 14px; background:var(--card-2); border:1px solid var(--line); border-radius:var(--r);
 }
-.nc-of .nc-obs-ledger-cov.partial{border-color:#c8922e}
-.nc-of .nc-obs-ledger-gap{color:var(--of-ink-2)}
-.nc-of .nc-obs-ledger-empty{
-  background:var(--of-paper); border:3px solid var(--of-ink-2); box-shadow:var(--of-drop);
-  padding:10px 12px; font-size:12.5px; color:var(--of-ink-2); font-style:italic;
+.nc-of .nc-obs-ledger-cov.partial{border-color:rgba(179,134,44,.4)}
+.nc-of .nc-obs-ledger-sec{border-color:rgba(176,80,63,.4); color:var(--stop)}
+.nc-of .nc-obs-ledger-empty{font-style:italic; color:var(--ink-3)}
+.nc-of .nc-obs-ledger-gap{color:var(--ink-3)}
+
+.nc-of .nc-obs-ledger-rows{
+  list-style:none; margin:0; padding:0;
+  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r); overflow:hidden;
 }
-.nc-of .nc-obs-ledger-sec{
-  background:var(--of-alert); color:#fff; border:3px solid var(--of-ink-2); box-shadow:var(--of-drop);
-  padding:9px 12px; font-size:12.5px;
-}
-.nc-of .nc-obs-ledger-row.blocks{border-left-color:var(--of-alert); border-left-width:11px}
-.nc-of .nc-obs-ledger-blocks{
-  font-family:var(--font-mono); font-size:10px; font-weight:700; flex:none;
-  background:var(--of-alert); color:#fff; border:2px solid var(--of-ink-2); padding:0 5px;
-}
-.nc-of .nc-obs-ledger-rows{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px}
-.nc-of .nc-obs-ledger-row{
-  background:var(--of-paper); border:3px solid var(--of-ink-2); box-shadow:var(--of-drop);
-  border-left-width:7px;
-}
-/* The left edge is the state. Breached and unowned share it deliberately —
-   an item nobody owns has already failed a promise nobody made. */
-.nc-of .nc-obs-ledger-row.breached,
-.nc-of .nc-obs-ledger-row.unowned{border-left-color:var(--of-alert)}
-.nc-of .nc-obs-ledger-row.due-soon{border-left-color:#b5822c}
-.nc-of .nc-obs-ledger-row.undated{border-left-color:#8f887f; border-left-style:dashed}
+.nc-of .nc-obs-ledger-row + .nc-obs-ledger-row{border-top:1px solid var(--line)}
 .nc-of .nc-obs-ledger-btn{
-  appearance:none; background:none; border:0; margin:0; width:100%; font:inherit; color:var(--of-ink);
-  padding:9px 12px; min-height:44px; text-align:left; cursor:pointer;
-  display:flex; align-items:baseline; flex-wrap:wrap; gap:9px;
+  appearance:none; background:none; border:0; margin:0; width:100%; font:inherit; color:var(--ink);
+  padding:10px 14px; min-height:44px; text-align:left; cursor:pointer;
+  display:grid; grid-template-columns:112px minmax(0,1fr) 104px 86px 52px;
+  gap:12px; align-items:center;
 }
-.nc-of .nc-obs-ledger-btn:hover{background:rgb(0 0 0 / .04)}
-.nc-of .nc-obs-ledger-btn:focus-visible{outline:3px solid var(--of-ink); outline-offset:-3px}
+.nc-of .nc-obs-ledger-btn:hover{background:rgba(35,32,27,.03)}
+.nc-of .nc-obs-ledger-btn:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+.nc-of .nc-obs-ledger-lead{display:flex; flex-direction:column; align-items:flex-start; gap:3px; min-width:0}
+/* The due chip is the ONLY urgency encoding on the row — no bar, no row tint,
+   no coloured title stacked on top of it. */
 .nc-of .nc-obs-ledger-due{
-  font-family:var(--font-mono); font-size:11.5px; font-weight:700; flex:none;
-  border:2px solid var(--of-ink-2); padding:0 6px;
+  font-size:11.5px; font-weight:600; color:var(--ink-2); white-space:nowrap;
 }
-.nc-of .nc-obs-ledger-due.breached,
-.nc-of .nc-obs-ledger-due.unowned{background:var(--of-alert); color:#fff; border-color:var(--of-ink-2)}
-.nc-of .nc-obs-ledger-due.due-soon{background:#f2e2bf}
-.nc-of .nc-obs-ledger-title{font-size:13px; flex:1 1 200px; min-width:0}
-.nc-of .nc-obs-ledger-kind{
-  font-family:var(--font-mono); font-size:10px; border:2px solid var(--of-ink-2); padding:0 5px; flex:none;
+.nc-of .nc-obs-ledger-due.breached,.nc-of .nc-obs-ledger-due.unowned{color:var(--stop)}
+.nc-of .nc-obs-ledger-due.due-soon{color:var(--warn)}
+.nc-of .nc-obs-ledger-due.on-track{color:var(--go)}
+.nc-of .nc-obs-ledger-due.undated{color:var(--ink-3)}
+.nc-of .nc-obs-ledger-blocks{
+  font-size:10px; font-weight:600; letter-spacing:.01em; white-space:nowrap;
+  background:var(--stop); color:#fff; border-radius:4px; padding:1px 5px;
 }
-.nc-of .nc-obs-ledger-owner{font-size:11.5px; color:var(--of-ink-2); flex:none}
-.nc-of .nc-obs-ledger-age{font-family:var(--font-mono); font-size:11px; color:var(--of-ink-2); flex:none}
-.nc-of .nc-obs-ledger-detail{padding:0 12px 10px; font-size:12.5px; color:var(--of-ink)}
-.nc-of .nc-obs-ledger-next{font-weight:600; margin-bottom:3px}
-.nc-of .nc-obs-ledger-meta{font-size:11.5px; color:var(--of-ink-2); margin-top:3px}
+.nc-of .nc-obs-ledger-title{
+  font-size:13px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.nc-of .nc-obs-ledger-owner,.nc-of .nc-obs-ledger-kind,.nc-of .nc-obs-ledger-age{
+  font-size:11.5px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.nc-of .nc-obs-ledger-age{text-align:right; font-variant-numeric:tabular-nums}
+.nc-of .nc-obs-ledger-detail{padding:0 14px 12px; font-size:12.5px; color:var(--ink-2)}
+.nc-of .nc-obs-ledger-next{font-weight:600; color:var(--ink); margin-bottom:3px}
+.nc-of .nc-obs-ledger-meta{font-size:11.5px; color:var(--ink-3); margin-top:3px}
+.nc-of .nc-obs-ledger-more{
+  appearance:none; background:none; border:0; cursor:pointer; font:inherit; color:var(--accent);
+  font-size:12.5px; font-weight:600; padding:10px 0; min-height:44px; text-align:left; align-self:flex-start;
+}
+.nc-of .nc-obs-ledger-more:hover{text-decoration:underline}
+/* Inside a board the queue is the board's content, not a second card sitting
+   inside the first — full bleed, no border of its own. */
+.nc-of .nc-of-board > .nc-obs-ledger{padding:0}
+.nc-of .nc-of-board .nc-obs-ledger-rows{border:0; border-radius:0; background:none}
+.nc-of .nc-of-board .nc-obs-ledger-more{padding:10px 14px}
+
+/* The workgroup picker reads as chrome here, not as a tiny mono caption. */
+.nc-of .nc-group-title-trigger{
+  font-family:inherit; font-size:12.5px; letter-spacing:0; text-transform:none;
+  color:var(--ink-2); background:none; border:1px solid var(--line); border-radius:7px;
+  padding:4px 9px; min-height:32px; cursor:pointer; display:inline-flex; align-items:center; gap:6px;
+}
+.nc-of .nc-group-title-trigger:hover{border-color:var(--line-2); color:var(--ink)}
+.nc-of .nc-group-title-chev{color:var(--ink-3); font-size:9px}
+/* Phone: the metadata columns fold under the title rather than crushing it. */
+@media (max-width:720px){
+  .nc-of .nc-obs-ledger-btn{grid-template-columns:minmax(0,1fr) auto; gap:4px 10px; padding:11px 14px}
+  .nc-of .nc-obs-ledger-lead{grid-column:1; flex-direction:row; align-items:center}
+  .nc-of .nc-obs-ledger-age{grid-column:2; grid-row:1}
+  .nc-of .nc-obs-ledger-title{grid-column:1 / -1; white-space:normal}
+  .nc-of .nc-obs-ledger-owner{grid-column:1}
+  .nc-of .nc-obs-ledger-kind{grid-column:2; text-align:right}
+}
+
+/* ─── The room sheet ─────────────────────────────────────────────────────── */
+/* Steering an agent lives HERE, next to the room it is standing in — not on a
+   separate page. Detail opens over the floor, never away from it. */
+.nc-of .nc-of-sheet{
+  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r);
+  margin-bottom:12px; overflow:hidden;
+}
+.nc-of .nc-of-sheet > header{
+  display:flex; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line);
+}
+.nc-of .nc-of-sheet-title{font-size:13px; font-weight:600}
+.nc-of .nc-of-sheet-x{
+  margin-left:auto; appearance:none; background:none; border:0; cursor:pointer;
+  color:var(--ink-3); font-size:13px; width:32px; height:32px; border-radius:6px;
+}
+.nc-of .nc-of-sheet-x:hover{background:rgba(35,32,27,.05); color:var(--ink)}
+.nc-of .nc-of-sheet-empty{margin:0; padding:12px 14px; font-size:12.5px; color:var(--ink-3); font-style:italic}
+.nc-of .nc-of-sheet-list{list-style:none; margin:0; padding:0}
+.nc-of .nc-of-sheet-list li{
+  display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+  padding:10px 14px; min-height:44px; font-size:12.5px;
+}
+.nc-of .nc-of-sheet-list li + li{border-top:1px solid var(--line)}
+.nc-of .nc-of-sheet-who{display:inline-flex; align-items:center; gap:7px; font-weight:600; min-width:120px}
+.nc-of .nc-of-sd{width:7px; height:7px; border-radius:50%; background:var(--idle); flex:none}
+.nc-of .nc-of-sd.blocked{background:var(--stop)}
+.nc-of .nc-of-sd.waiting{background:var(--warn)}
+.nc-of .nc-of-sd.working{background:var(--go)}
+.nc-of .nc-of-sheet-holding{color:var(--ink-3); flex:1 1 160px; min-width:0}
+.nc-of .nc-of-sheet-steer{color:var(--accent); text-decoration:none; font-weight:600}
+.nc-of .nc-of-sheet-steer:hover{text-decoration:underline}
+.nc-of .nc-of-sheet-nosession{color:var(--ink-3); font-style:italic}
 
 /* ─── Dependency view ────────────────────────────────────────────────────── */
 

@@ -327,13 +327,6 @@ describe('Observatory', () => {
     expect(container.querySelector('.nc-of-tally-strip')).toBeTruthy();
   });
 
-  describe('avatar faces', () => {
-  
-
-  
-
-  
-  });
 
   describe('Release Desk', () => {
     it('groupReleaseItems: dedupes a blocksRelease item out of its mover group', () => {
@@ -639,19 +632,110 @@ describe('Observatory', () => {
     });
   });
 
-  describe('open floor plan', () => {
-  
 
-    // Renamed from "…with no wall styling left". Rooms ARE walled now: the
-    // office-16 amendment adopted enclosure after three independent critics
-    // read the unwalled version as a colour-block chart rather than a floor
-    // plan. The name asserted a contract the body never checked; the body's
-    // real subject is the zone class, its rug tone and its hanging sign.
-  
+  describe('the queue', () => {
+    // 62 rows rendered at once is the wall of list the floor exists to replace.
+    const many = (n: number) =>
+      Array.from({ length: n }, (_, i) => releaseItem({ id: `XZO#${i}`, title: `item ${i}` }));
 
-  
+    it('shows one screen of the ranked queue and says how much is behind the fold', async () => {
+      mockData(snapshot({ releaseState: releaseState({ items: many(20) }) }));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelectorAll('.nc-obs-ledger-row')).toHaveLength(15);
+      const more = container.querySelector('.nc-obs-ledger-more')!;
+      expect(more.textContent).toBe('show the other 5');
 
-  
+      await userEvent.click(more as HTMLElement);
+      expect(container.querySelectorAll('.nc-obs-ledger-row')).toHaveLength(20);
+      expect(container.querySelector('.nc-obs-ledger-more')).toBeFalsy();
+    });
+
+    it('offers no fold when the whole queue already fits', () => {
+      mockData(snapshot({ releaseState: releaseState({ items: many(4) }) }));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelectorAll('.nc-obs-ledger-row')).toHaveLength(4);
+      expect(container.querySelector('.nc-obs-ledger-more')).toBeFalsy();
+    });
+
+    it('carries the same five columns on every row, so the list reads down', () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [releaseItem({ id: 'XZO#9', title: 'a thing', owner: 'ava', kind: 'finding', blocksRelease: true })],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const btn = container.querySelector('.nc-obs-ledger-btn')!;
+      expect(btn.querySelector('.nc-obs-ledger-due')).toBeTruthy();
+      expect(btn.querySelector('.nc-obs-ledger-blocks')!.textContent).toBe('blocks release');
+      expect(btn.querySelector('.nc-obs-ledger-title')!.textContent).toBe('a thing');
+      expect(btn.querySelector('.nc-obs-ledger-owner')!.textContent).toBe('ava');
+      expect(btn.querySelector('.nc-obs-ledger-kind')!.textContent).toBe('finding');
+      expect(btn.querySelector('.nc-obs-ledger-age')).toBeTruthy();
+    });
+
+    it('renders an ownerless row without collapsing its columns', () => {
+      mockData(snapshot({ releaseState: releaseState({ items: [releaseItem()] }) }));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const btn = container.querySelector('.nc-obs-ledger-btn')!;
+      expect(btn.querySelector('.nc-obs-ledger-owner')!.textContent).toBe('—');
+      expect(btn.querySelector('.nc-obs-ledger-blocks')).toBeFalsy();
+    });
+  });
+
+  describe('the room sheet', () => {
+    // Steering used to mean leaving the floor for a separate page. It now
+    // opens over the floor, in the room the agent is standing in.
+    function floor() {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1', name: 'general' }), room({ key: 'r2', name: 'quiet' })],
+          agents: [
+            agent({ id: 'ava', name: 'ava', location: 'r1', holding: ['#12'], lastSessionId: 's-1' }),
+            agent({ id: 'kit', name: 'kit', location: 'r1', lastSessionId: null }),
+            agent({ id: 'zed', name: 'zed', location: 'r2', lastSessionId: 's-3' }),
+          ],
+        }),
+      );
+      return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    }
+    const open = async (c: HTMLElement, label: string) => {
+      const chip = Array.from(c.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
+        b.textContent?.includes(label),
+      );
+      await userEvent.click(chip! as HTMLElement);
+    };
+
+    it('is closed until a room is picked', () => {
+      const { container } = floor();
+      expect(container.querySelector('.nc-of-sheet')).toBeFalsy();
+    });
+
+    it('lists only that room\'s occupants, with what each is holding', async () => {
+      const { container } = floor();
+      await open(container, '#general');
+      const who = Array.from(container.querySelectorAll('.nc-of-sheet-who')).map((e) => e.textContent);
+      expect(who).toEqual(['ava', 'kit']);
+      expect(container.querySelector('.nc-of-sheet-holding')!.textContent).toBe('holding #12');
+    });
+
+    it('offers steer as a session link, and says so plainly when there is no session', async () => {
+      const { container } = floor();
+      await open(container, '#general');
+      const rows = container.querySelectorAll('.nc-of-sheet-list li');
+      expect(rows[0]!.querySelector('a')!.getAttribute('href')).toBe('#/session/s-1');
+      expect(rows[1]!.querySelector('a')).toBeFalsy();
+      expect(rows[1]!.querySelector('.nc-of-sheet-nosession')).toBeTruthy();
+    });
+
+    it('closes on the sheet\'s own control, which also clears the queue filter', async () => {
+      const { container } = floor();
+      await open(container, '#general');
+      await userEvent.click(container.querySelector('.nc-of-sheet-x')! as HTMLElement);
+      expect(container.querySelector('.nc-of-sheet')).toBeFalsy();
+      expect(container.querySelector('.nc-of-chip.on')).toBeFalsy();
+    });
   });
 
   describe('claim rows', () => {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import useSWR from 'swr';
 import {
   listWorkgroups,
@@ -16,7 +16,7 @@ import {
   type ScheduledSnapshot,
 } from '../lib/api.js';
 import { relAge } from '../lib/derive.js';
-import { RouteNav, type BoardRoute } from './BoardShell.js';
+import { type BoardRoute } from './BoardShell.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildReleaseGraph, unblockRanking } from './release-graph.js';
 import { buildLedger, dueLabel, type Commitment } from './commitments.js';
@@ -26,27 +26,26 @@ import { WorkgroupPicker } from './WorkgroupDashboard.js';
 
 
 /**
- * Observatory — a top-down pixel-art OPEN-PLAN office floor you look down into.
- * One continuous checkerboard floor holds everything: each workgroup channel is
- * a desk cluster standing on its own rug under a hanging sign, agents with no
- * channel hang out in the lounge, and the clusters are separated by furniture
- * and aisle space rather than walls. Above the floor sit the boards the
- * operator acts on: the corkboard JOB BOARD (release desk), the WHITEBOARD
- * (claims), and WHAT'S SCHEDULED.
+ * Observatory — the layer above Slack: one page that answers what is stuck,
+ * what needs a person, and what is moving on its own, before any interaction.
  *
- * Deliberately bright and warm — the rest of the dashboard is a dark control
- * surface; this is a lit room with people in it. No animation, no canvas, no
- * images: everything is CSS plus inline-SVG data URIs from office-sprites.ts.
+ * Three surfaces, in this order:
+ *   1. the headline — one dominant number (stalled), two secondary, and the
+ *      coverage gaps that qualify them, stated once;
+ *   2. the office — the vendored <office-map> custom element, a hand-authored
+ *      tile plan where each channel is a room and each agent sits in the room
+ *      it last worked in. Geometry is FIXED; only occupancy comes from data.
+ *      Picking a room opens the room sheet and filters the queue to its people;
+ *   3. the queue and the collapsed boards — the ranked commitment ledger, the
+ *      job board, work claims, and what is scheduled.
  *
- * Polls GET /dashboard/api/observatory?workgroup=:id every 15s (no SSE — this
- * is a slow-moving status board, not a live chat feed). Zone POSITION is
- * stable (sorted platform, then name) regardless of activity, and each zone's
- * rug tone and furniture are hashed from its key — spatial memory is the
- * point. Activity is conveyed by lighting only.
+ * The map is the ONLY illustrated surface. Everything around it is the atrium
+ * light chrome (see styles.css): hairline cards, sentence case, one accent used
+ * for interaction and muted status colours used for nothing else.
  *
- * Everything a human would poke at is a real button or anchor: zones, tallies,
- * job-board rows and claim rows all open in place, and anything with a URL
- * links out in a new tab.
+ * Polls GET /dashboard/api/observatory?workgroup=:id every 15s — this is a
+ * slow-moving status board, not a live feed. Detail opens IN PLACE, never by
+ * navigating away; anything with a URL still links out in a new tab.
  */
 
 const POLL_MS = 15_000;
@@ -57,7 +56,10 @@ interface ObservatoryProps {
   onRouteChange: (r: BoardRoute) => void;
 }
 
-export function Observatory({ route, onRouteChange }: ObservatoryProps) {
+// Props are the shell's routing contract, kept so main.tsx and the legacy
+// boards stay uniform. The Observatory itself no longer navigates: it is the
+// only destination, and detail opens over the floor rather than away from it.
+export function Observatory(_props: ObservatoryProps) {
   const { data: wgData } = useSWR('/dashboard/api/workgroups', () => listWorkgroups(), { refreshInterval: 0 });
   const workgroups = wgData?.workgroups ?? [];
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -108,11 +110,36 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
   // and it answers the same question — "what is going on in there" — without
   // inventing a field. It becomes a true room filter the day the watcher
   // publishes `channel`.
-  const roomOwners = useMemo(() => {
+  const officeData = useMemo(() => buildOfficeData(rooms, agents, allItems), [rooms, agents, allItems]);
+
+  // The occupants of the selected room, with the live fields the sheet needs
+  // (holding, session) that the map's plan data does not carry. Uncapped, on
+  // purpose: the plan seats two, but a filter that silently ignored the third
+  // occupant would under-report the room.
+  const selectedRoomAgents = useMemo(() => {
     if (!selectedRoom) return null;
-    const room = officeDataRef.current?.rooms.find((r) => r.slot === selectedRoom);
-    return room ? new Set(room.agents.map((a) => a.name)) : null;
-  }, [selectedRoom, snapshot]);
+    const idx = officeData.rooms.findIndex((r) => r.slot === selectedRoom);
+    const room = officeData.rooms[idx];
+    const src = idx >= 0 ? rooms[idx] : undefined;
+    if (!room || !src) return null;
+    return {
+      label: room.label,
+      agents: agents
+        .filter((a) => a.location === src.key)
+        .map((a) => ({
+          id: a.id,
+          name: a.name,
+          holding: a.holding,
+          lastSessionId: a.lastSessionId,
+          state: room.agents.find((x) => x.name === a.name)?.status ?? 'idle',
+        })),
+    };
+  }, [selectedRoom, officeData, rooms, agents]);
+
+  const roomOwners = useMemo(
+    () => (selectedRoomAgents ? new Set(selectedRoomAgents.agents.map((a) => a.name)) : null),
+    [selectedRoomAgents],
+  );
 
   const ownerFilter = roomOwners ? [...roomOwners].join(', ') : null;
   const ownerFilteredItems = roomOwners
@@ -120,9 +147,6 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
     : allItems;
 
   const ledgerCounts = useMemo(() => buildLedger(ownerFilteredItems).counts, [ownerFilteredItems]);
-  const officeData = useMemo(() => buildOfficeData(rooms, agents, allItems), [rooms, agents, allItems]);
-  const officeDataRef = useRef(officeData);
-  officeDataRef.current = officeData;
 
   const claimClicked = (claim: ObservatoryClaim) => {
     setExpandedClaim((prev) => (prev === claim.slug ? null : claim.slug));
@@ -130,19 +154,20 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
 
   return (
     <div className="nc-frame nc-of">
-      <header className="nc-pulse nc-of-topbar">
-        <div className="nc-pulse-top">
-          <div className="nc-brand">
-            <span className="mark" aria-hidden="true"></span>
-            <WorkgroupPicker workgroups={workgroups} selectedId={selectedId} onChange={selectWorkgroup} />
-          </div>
-          {snapshot && (
-            <div className="nc-of-headcount">
-              {awakeCount} awake <span aria-hidden="true">·</span> {rooms.length} channels
-            </div>
-          )}
-          <RouteNav route={route} onRouteChange={onRouteChange} />
-        </div>
+      <header className="nc-of-bar">
+        <span className="nc-of-bar-title">The Observatory</span>
+        <WorkgroupPicker workgroups={workgroups} selectedId={selectedId} onChange={selectWorkgroup} />
+        {snapshot && (
+          <span className="nc-of-bar-meta">
+            <span className="nc-of-bar-count">
+              {agents.length} agents <span aria-hidden="true">·</span> {rooms.length} channels
+            </span>
+            <span className="nc-of-live">
+              <i className={awakeCount > 0 ? 'on' : ''} />
+              {awakeCount} awake
+            </span>
+          </span>
+        )}
       </header>
 
       <div className="nc-obs-body">
@@ -156,12 +181,6 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
                 rendered first and fully expanded, which put the floor ten
                 pages down and made the office a footnote to its own page. */}
             <CommitmentStrip items={ownerFilteredItems} />
-
-            <ReleaseTallies
-              items={ownerFilteredItems}
-              filter={releaseFilter}
-              onFilter={setReleaseFilter}
-            />
 
             <div className="nc-obs-main">
               {/* The floor is the vendored <office-map> custom element: a
@@ -180,6 +199,7 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
                 </div>
                 <OfficeMap
                   data={officeData}
+                  {...(officeData.rooms[0] ? { start: officeData.rooms[0].slot } : {})}
                   selected={selectedRoom}
                   onSelect={(k) => setSelectedRoom((prev) => (prev === k ? '' : k))}
                   teleportTo={teleportTo}
@@ -208,6 +228,44 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
                 </div>
               </section>
 
+              {selectedRoomAgents && (
+                <aside className="nc-of-sheet">
+                  <header>
+                    <span className="nc-of-sheet-title">{selectedRoomAgents.label}</span>
+                    <button type="button" className="nc-of-sheet-x" onClick={() => setSelectedRoom('')} aria-label="Close">
+                      ✕
+                    </button>
+                  </header>
+                  {selectedRoomAgents.agents.length === 0 ? (
+                    <p className="nc-of-sheet-empty">nobody is in this room right now</p>
+                  ) : (
+                    <ul className="nc-of-sheet-list">
+                      {selectedRoomAgents.agents.map((a) => (
+                        <li key={a.id}>
+                          <span className="nc-of-sheet-who">
+                            <i className={`nc-of-sd ${a.state}`} />
+                            {a.name}
+                          </span>
+                          <span className="nc-of-sheet-holding">
+                            {a.holding.length > 0 ? `holding ${a.holding.join(', ')}` : 'holding nothing'}
+                          </span>
+                          {/* Steer lived on the old agent popover. It links to
+                              the session rather than embedding a composer: a
+                              steer written without the transcript is a guess. */}
+                          {a.lastSessionId ? (
+                            <a className="nc-of-sheet-steer" href={`#/session/${a.lastSessionId}`}>
+                              open session to steer →
+                            </a>
+                          ) : (
+                            <span className="nc-of-sheet-nosession">no session — it has never spoken</span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </aside>
+              )}
+
               <details className="nc-of-board" open>
                 <summary className="nc-of-board-summary">
                   Needs attention{' '}
@@ -222,6 +280,13 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
                 <summary className="nc-of-board-summary">
                   Job Board <span className="nc-of-board-n">{ownerFilteredItems.length}</span>
                 </summary>
+                <div className="inner">
+                  <ReleaseTallies
+                    items={ownerFilteredItems}
+                    filter={releaseFilter}
+                    onFilter={setReleaseFilter}
+                  />
+                </div>
                 <ReleaseDesk
                   releaseState={snapshot.releaseState}
                   ownerFilter={ownerFilter}
@@ -710,23 +775,56 @@ function ReleaseDesk({
 export const STATE_WORDS = { stalled: 'stalled', person: 'need a person', moving: 'moving' } as const;
 
 export function CommitmentStrip({ items }: { items: ReleaseItem[] }) {
-  const { counts } = useMemo(() => buildLedger(items), [items]);
+  const ledger = useMemo(() => buildLedger(items), [items]);
+  const { counts } = ledger;
   if (items.length === 0) return null;
   return (
-    <div className="nc-of-commit-strip">
-      <div className="nc-of-commit stop">
-        <span className="n">{counts.breached}</span>
-        <span className="l">stalled</span>
+    <section className="nc-of-head">
+      <div className="nc-of-head-main">
+        {/* ONE dominant number. Three equal ones made the reader choose which
+            to care about; the ten-second read has to answer that for them. */}
+        <div className="nc-of-hero">
+          <span className="nc-of-hero-n">{counts.breached}</span>
+          <span className="nc-of-hero-l">
+            items are stalled
+            <span>past a promised deadline, or owned by nobody</span>
+          </span>
+        </div>
+        <div className="nc-of-sub">
+          <span>
+            <b className="warn">{counts.person}</b> need a person
+          </span>
+          <span>
+            <b className="go">{counts.onTrack}</b> moving on their own
+          </span>
+          <span className="nc-of-sub-total">of {items.length} open commitments</span>
+        </div>
       </div>
-      <div className="nc-of-commit warn">
-        <span className="n">{counts.person}</span>
-        <span className="l">need a person</span>
+      {/* The gaps in the data, as one line each. They were full-bleed tinted
+          prose blocks; a lot of coloured surface spent above the list it
+          describes. */}
+      <div className="nc-of-notes">
+        <p>
+          <i className="warn" />
+          <span>
+            <b>{ledger.datedPct}% of owned work has a deadline.</b> Nothing here can be measured as late, so
+            &ldquo;stalled&rdquo; undercounts.
+          </span>
+        </p>
+        {ledger.unclassifiedP1 > 0 && (
+          <p>
+            <i className="stop" />
+            <span>
+              <b>
+                {ledger.unclassifiedP1} p1 security {ledger.unclassifiedP1 === 1 ? 'finding is' : 'findings are'} not
+                classified as release-blocking either way.
+              </b>{' '}
+              A person has to decide.
+            </span>
+          </p>
+        )}
       </div>
-      <div className="nc-of-commit go">
-        <span className="n">{counts.onTrack}</span>
-        <span className="l">moving</span>
-      </div>
-    </div>
+    </section>
   );
 }
 
@@ -747,34 +845,23 @@ const LEDGER_STATE_LABEL: Record<Commitment['state'], string> = {
  * It is a list on purpose: this has to work on a phone, and the answer to
  * "what is stuck" is a ranking, not a picture.
  */
+/** Rows on the first screen. The rest expand on demand. */
+const LEDGER_FIRST_PAGE = 15;
+
 function LedgerBoard({ items, now = Date.now() }: { items: ReleaseItem[]; now?: number }) {
   const ledger = useMemo(() => buildLedger(items, now), [items, now]);
   const [expanded, setExpanded] = useState<string | null>(null);
-  const shown = ledger.rows.filter((r) => r.state !== 'on-track');
+  const [showAll, setShowAll] = useState(false);
+  const all = ledger.rows.filter((r) => r.state !== 'on-track');
+  // The queue is ranked, so the first screen is the answer. 62 rows rendered
+  // at once is the wall of list the operator asked us to get out from under —
+  // the rest is one tap away, and the count says how much is behind it.
+  const shown = showAll ? all : all.slice(0, LEDGER_FIRST_PAGE);
 
   return (
     <div className="nc-obs-ledger">
-      {/* Coverage before anything derived from it, same rule as the dependency
-          view: a ledger where most promises have no clock is not a schedule. */}
-      <div className={`nc-obs-ledger-cov ${ledger.datedPct < 100 ? 'partial' : ''}`}>
-        <strong>{ledger.datedPct}%</strong> of owned work has a deadline
-        {ledger.undatedCount > 0 && (
-          <span className="nc-obs-ledger-gap">
-            {' '}
-            — {ledger.undatedCount} {ledger.undatedCount === 1 ? 'item has' : 'items have'} an owner but no clock,
-            so nothing can tell whether they are late
-          </span>
-        )}
-      </div>
-
-      {ledger.unclassifiedP1 > 0 && (
-        <div className="nc-obs-ledger-sec">
-          <strong>{ledger.unclassifiedP1}</strong> p1 {ledger.unclassifiedP1 === 1 ? 'finding is' : 'findings are'} not
-          classified as release-blocking either way. Tenant isolation and auth bypass block the release by rule; until
-          QA applies the label, nothing computes it and they ship.
-        </div>
-      )}
-
+      {/* The two coverage gaps are stated ONCE, in the headline above. Repeating
+          them here read as two separate warnings about two separate problems. */}
       {shown.length === 0 ? (
         <div className="nc-obs-ledger-empty">every open commitment is on track</div>
       ) : (
@@ -791,12 +878,19 @@ function LedgerBoard({ items, now = Date.now() }: { items: ReleaseItem[]; now?: 
                 aria-expanded={expanded === c.item.id}
                 onClick={() => setExpanded((p) => (p === c.item.id ? null : c.item.id))}
               >
-                <span className={`nc-obs-ledger-due ${c.state}`}>{dueLabel(c)}</span>
+                {/* Fixed grammar down the row: lead · title · owner · type ·
+                    age. Every column shares one edge so the list is scannable
+                    top to bottom rather than ragged. */}
+                <span className="nc-obs-ledger-lead">
+                  <span className={`nc-obs-ledger-due ${c.state}`}>{dueLabel(c)}</span>
+                  {c.item.blocksRelease && <span className="nc-obs-ledger-blocks">blocks release</span>}
+                </span>
                 <span className="nc-obs-ledger-title">{c.item.title}</span>
-                {c.item.blocksRelease && <span className="nc-obs-ledger-blocks">blocks release</span>}
-                {c.item.kind === 'finding' && <span className="nc-obs-ledger-kind">finding</span>}
-                <span className="nc-obs-ledger-owner">{c.item.owner ?? LEDGER_STATE_LABEL[c.state]}</span>
-                {c.ageMs !== null && <span className="nc-obs-ledger-age">{magnitude(c.ageMs, now + c.ageMs)}</span>}
+                <span className="nc-obs-ledger-owner">{c.item.owner ?? '—'}</span>
+                <span className="nc-obs-ledger-kind">{c.item.kind}</span>
+                <span className="nc-obs-ledger-age num">
+                  {c.ageMs !== null ? magnitude(c.ageMs, now + c.ageMs) : '—'}
+                </span>
               </button>
               {expanded === c.item.id && (
                 <div className="nc-obs-ledger-detail">
@@ -812,6 +906,11 @@ function LedgerBoard({ items, now = Date.now() }: { items: ReleaseItem[]; now?: 
             </li>
           ))}
         </ul>
+      )}
+      {all.length > shown.length && (
+        <button type="button" className="nc-obs-ledger-more" onClick={() => setShowAll(true)}>
+          show the other {all.length - shown.length}
+        </button>
       )}
     </div>
   );

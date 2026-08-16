@@ -35,6 +35,7 @@ export function OfficeMap({
   data,
   selected,
   onSelect,
+  start,
   scale = '1.35',
   labels = 'sign',
   agents = 'bubble',
@@ -44,6 +45,9 @@ export function OfficeMap({
   data: OfficeData;
   selected: string;
   onSelect: (key: string) => void;
+  /** Slot to centre on when the map first appears. Without it the viewport
+      opens at the plan's top-left corner, which on a phone is all lawn. */
+  start?: string;
   scale?: string;
   labels?: string;
   agents?: string;
@@ -81,6 +85,7 @@ export function OfficeMap({
       labels={labels}
       agents={agents}
       selected={selected}
+      {...(start ? { start } : {})}
       style={{ display: 'block', height: `${height}px` }}
     />
   );
