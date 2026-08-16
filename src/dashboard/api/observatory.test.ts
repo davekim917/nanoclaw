@@ -151,6 +151,41 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe('platform allow-list and claim thread links', () => {
+  it('hides rooms on platforms the workgroup did not allow-list', async () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1', 'ava', 'ava-folder');
+    addMessagingGroup('mg-s', 'slack-ava', 'slack:C1', '#build');
+    addMessagingGroup('mg-d', 'discord', 'discord:g:c', 'general');
+    wire('mg-s', 'ag-1');
+    wire('mg-d', 'ag-1');
+
+    const all = await buildObservatoryScene('wg-1', makeDeps());
+    expect(all.rooms.map((r) => r.key).sort()).toEqual(['discord:g:c', 'slack:C1']);
+
+    // Declaring platforms: ["slack"] keeps slack-* and drops the rest — the
+    // wiring survives, only the floor hides it.
+    const filtered = await buildObservatoryScene('wg-1', makeDeps({ platforms: ['slack'] }));
+    expect(filtered.rooms.map((r) => r.key)).toEqual(['slack:C1']);
+  });
+
+  it('resolves a thread url for every claim that recorded a thread', async () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1', 'ava', 'ava-folder');
+    writeClaim('wg-1', 'seam-1', { owner: 'ava', claimed_at: now(), ttl_hours: 4, thread_id: 'slack:C1:1.2' });
+    writeClaim('wg-1', 'seam-2', { owner: 'ava', claimed_at: now(), ttl_hours: 4 });
+
+    const scene = await buildObservatoryScene(
+      'wg-1',
+      makeDeps({ resolveThreadUrl: (t) => `https://acme.slack.com/${t}` }),
+    );
+    const byslug = Object.fromEntries(scene.claims.map((c) => [c.slug, c]));
+
+    expect(byslug['seam-1'].threadUrl).toBe('https://acme.slack.com/slack:C1:1.2');
+    expect(byslug['seam-2'].threadUrl).toBeNull();
+  });
+});
+
 describe('avatarUrl', () => {
   it('resolves through the injected channel-type lookup and defaults to null', async () => {
     addWorkgroup('wg-1');

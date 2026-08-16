@@ -30,7 +30,11 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
-export type ObservatoryClaim = BoardClaim;
+export type ObservatoryClaim = BoardClaim & {
+  /** Resolved permalink to the thread the work was claimed in — every row on the
+   *  board links back to where it actually happened. Null when unresolvable. */
+  threadUrl: string | null;
+};
 
 export interface ObservatoryRoom {
   key: string;
@@ -179,7 +183,29 @@ interface WiringRow {
   agent_group_id: string;
 }
 
-function buildRooms(workgroupId: string): ObservatoryRoom[] {
+/**
+ * Platform allow-list for a workgroup's floor, declared as
+ * `observatory.platforms` on any one member's container.json (same
+ * one-declaration convention as backlogCanvas). Lets a workgroup that lives on
+ * Slack hide dormant wiring on another platform without un-wiring it. Absent =
+ * every platform shows.
+ */
+export function observatoryPlatforms(workgroupId: string): string[] | null {
+  const members = getDb()
+    .prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?')
+    .all(workgroupId) as { folder: string }[];
+  for (const { folder } of members) {
+    try {
+      const declared = readContainerConfig(folder).observatory?.platforms;
+      if (Array.isArray(declared) && declared.length > 0) return declared;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function buildRooms(workgroupId: string, allowed: string[] | null): ObservatoryRoom[] {
   const wiringRows = getDb()
     .prepare(
       `SELECT mg.id AS messaging_group_id, mg.platform_id AS platform_id, mg.channel_type AS channel_type,
@@ -191,8 +217,12 @@ function buildRooms(workgroupId: string): ObservatoryRoom[] {
     )
     .all(workgroupId) as WiringRow[];
 
+  const onFloor = allowed
+    ? wiringRows.filter((r) => allowed.some((p) => r.channel_type === p || r.channel_type.startsWith(`${p}-`)))
+    : wiringRows;
+
   const byPlatformId = new Map<string, RoomAccum>();
-  for (const row of wiringRows) {
+  for (const row of onFloor) {
     let room = byPlatformId.get(row.platform_id);
     if (!room) {
       room = {
@@ -360,6 +390,10 @@ export interface ObservatoryDeps {
   ) => Promise<string>;
   /** Bot avatar by channel type — defaults to the live Slack bot registry. Injected so tests never need an adapter. */
   avatarByChannelType?: (channelType: string) => string | null;
+  /** Thread-id → permalink; defaults to resolving through the owning channel adapter. */
+  resolveThreadUrl?: (threadId: string) => string | null;
+  /** Platform allow-list override for tests; defaults to the workgroup's declared observatory.platforms. */
+  platforms?: string[] | null;
 }
 
 const defaultDeps: ObservatoryDeps = { getActiveContainerSessionIds, resolveAssistantName };
@@ -369,15 +403,36 @@ export async function buildObservatoryScene(
   deps: ObservatoryDeps = defaultDeps,
 ): Promise<ObservatoryScene> {
   // deps.claimsRoot undefined → readClaims falls back to its own live claimsBaseDir().
-  const claims =
+  const rawClaims =
     deps.claimsRoot !== undefined
       ? readClaims(workgroupId, Date.now(), deps.claimsRoot)
       : readClaims(workgroupId, Date.now());
 
+  // Every claim carries a link back to the thread it was worked in. A claim's
+  // thread_id already encodes its channel type + channel + ts, so the adapter
+  // that owns that platform resolves it — one hop, no extra state.
+  const linkFor =
+    deps.resolveThreadUrl ??
+    ((threadId: string): string | null => {
+      const channelType = threadId.split(':')[0] ?? '';
+      const adapter = getChannelAdapter(channelType);
+      if (!adapter?.permalink) return null;
+      const platformId = threadId.split(':').slice(0, 2).join(':');
+      try {
+        return adapter.permalink(platformId, threadId);
+      } catch {
+        return null;
+      }
+    });
+  const claims: ObservatoryClaim[] = rawClaims.map((c) => ({
+    ...c,
+    threadUrl: c.threadId ? linkFor(c.threadId) : null,
+  }));
+
   return {
     workgroupId,
     asOf: new Date().toISOString(),
-    rooms: buildRooms(workgroupId),
+    rooms: buildRooms(workgroupId, deps.platforms !== undefined ? deps.platforms : observatoryPlatforms(workgroupId)),
     agents: await buildAgents(workgroupId, claims, deps),
     claims,
     releaseState: deps.groupsDir !== undefined ? readReleaseState(workgroupId, deps.groupsDir) : readReleaseState(workgroupId),

@@ -341,6 +341,19 @@ export interface ContainerConfig {
   };
 
   /**
+   * Observatory presentation for this agent's WORKGROUP. Declared on any one
+   * member group (same convention as backlogCanvas); the first declaration
+   * found wins.
+   *
+   * `platforms` is an allow-list of channel-type prefixes the office floor
+   * shows — `["slack"]` hides a workgroup's dormant Discord wiring without
+   * un-wiring it. Absent = show every platform.
+   */
+  observatory?: {
+    platforms?: string[];
+  };
+
+  /**
    * The workgroup this agent belongs to. Set by migration 036 and written
    * into container.json for workgroup-scoped Graphify indexing and retrieval.
    *
@@ -527,6 +540,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     providerConfig: raw.providerConfig,
     dailySummary: raw.dailySummary,
     backlogCanvas: raw.backlogCanvas,
+    observatory: raw.observatory,
     onecliSecrets: raw.onecliSecrets,
     workgroup_id: raw.workgroup_id,
     slack_user_token: raw.slack_user_token,
