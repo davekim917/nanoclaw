@@ -519,6 +519,15 @@ export interface ReleaseItem {
    * independent must never render alike. See views/release-graph.ts.
    */
   dependsOn?: string[];
+  /**
+   * When this item's CURRENT owner has promised the next transition by. An
+   * owned item with no `dueAt` is a promise with no clock, which is
+   * indistinguishable from no promise — the ledger reports those as a coverage
+   * gap rather than treating them as on track. See views/commitments.ts.
+   */
+  dueAt?: string;
+  /** What the mover has promised to do next, one line. Shown on the row. */
+  nextAction?: string;
 }
 
 export interface ReleaseState {

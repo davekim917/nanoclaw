@@ -20,6 +20,7 @@ import { relAge } from '../lib/derive.js';
 import { RouteNav, type BoardRoute } from './BoardShell.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildReleaseGraph, unblockRanking } from './release-graph.js';
+import { buildLedger, dueLabel, type Commitment } from './commitments.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
 import { DESK_ON, DESK_OFF, COBWEB, COUCH, BLANK_AVATAR, roomDecor, rugTone } from './office-sprites.js';
 
@@ -150,6 +151,8 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
   const allItems = snapshot?.releaseState?.items ?? [];
   const ownerFilteredItems = ownerFilter ? allItems.filter((i) => i.owner === ownerFilter) : allItems;
 
+  const ledgerCounts = useMemo(() => buildLedger(ownerFilteredItems).counts, [ownerFilteredItems]);
+
   const claimClicked = (claim: ObservatoryClaim) => {
     const match = agents.find((a) => a.id === claim.owner || a.name === claim.owner);
     setHighlightedAgentId((prev) => (match && prev === match.id ? null : match?.id ?? null));
@@ -183,6 +186,8 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
                 boards — below the fold and closed. Before this, the job board
                 rendered first and fully expanded, which put the floor ten
                 pages down and made the office a footnote to its own page. */}
+            <CommitmentStrip items={ownerFilteredItems} />
+
             <ReleaseTallies
               items={ownerFilteredItems}
               filter={releaseFilter}
@@ -223,6 +228,16 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
                   </div>
                 </div>
               </div>
+
+              <details className="nc-of-board" open>
+                <summary className="nc-of-board-summary">
+                  Needs attention{' '}
+                  <span className="nc-of-board-n">{ledgerCounts.breached + ledgerCounts.person}</span>
+                </summary>
+                <div className="inner">
+                  <LedgerBoard items={ownerFilteredItems} />
+                </div>
+              </details>
 
               <details className="nc-of-board">
                 <summary className="nc-of-board-summary">
@@ -703,6 +718,107 @@ function ReleaseDesk({
         );
       })}
     </section>
+  );
+}
+
+/**
+ * The headline. It used to read "4 awake · 10 channels", which measures agent
+ * liveness — a container can be awake, animated and busy-looking while the work
+ * it holds rotted three days ago. These three numbers measure FLOW instead:
+ * what has already failed its promise, what a person owes, and what is moving.
+ */
+export function CommitmentStrip({ items }: { items: ReleaseItem[] }) {
+  const { counts } = useMemo(() => buildLedger(items), [items]);
+  if (items.length === 0) return null;
+  return (
+    <div className="nc-of-commit-strip">
+      <div className="nc-of-commit stop">
+        <span className="n">{counts.breached}</span>
+        <span className="l">past its promise or unowned</span>
+      </div>
+      <div className="nc-of-commit warn">
+        <span className="n">{counts.person}</span>
+        <span className="l">waiting on a person</span>
+      </div>
+      <div className="nc-of-commit go">
+        <span className="n">{counts.onTrack}</span>
+        <span className="l">moving on its own</span>
+      </div>
+    </div>
+  );
+}
+
+/* ─── The ledger — every open commitment, breach-ordered ─────────────────── */
+
+const LEDGER_STATE_LABEL: Record<Commitment['state'], string> = {
+  unowned: 'nobody owns this',
+  breached: 'past its promise',
+  undated: 'no deadline set',
+  'due-soon': 'due soon',
+  'on-track': 'on track',
+};
+
+/**
+ * The one view. Every open item as a commitment, ordered so that anything that
+ * has already failed its promise is first and the oldest failure leads.
+ *
+ * It is a list on purpose: this has to work on a phone, and the answer to
+ * "what is stuck" is a ranking, not a picture.
+ */
+function LedgerBoard({ items, now = Date.now() }: { items: ReleaseItem[]; now?: number }) {
+  const ledger = useMemo(() => buildLedger(items, now), [items, now]);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const shown = ledger.rows.filter((r) => r.state !== 'on-track');
+
+  return (
+    <div className="nc-obs-ledger">
+      {/* Coverage before anything derived from it, same rule as the dependency
+          view: a ledger where most promises have no clock is not a schedule. */}
+      <div className={`nc-obs-ledger-cov ${ledger.datedPct < 100 ? 'partial' : ''}`}>
+        <strong>{ledger.datedPct}%</strong> of owned work has a deadline
+        {ledger.undatedCount > 0 && (
+          <span className="nc-obs-ledger-gap">
+            {' '}
+            — {ledger.undatedCount} {ledger.undatedCount === 1 ? 'item has' : 'items have'} an owner but no clock,
+            so nothing can tell whether they are late
+          </span>
+        )}
+      </div>
+
+      {shown.length === 0 ? (
+        <div className="nc-obs-ledger-empty">every open commitment is on track</div>
+      ) : (
+        <ul className="nc-obs-ledger-rows">
+          {shown.map((c) => (
+            <li key={c.item.id} className={`nc-obs-ledger-row ${c.state}`} data-ledger-id={c.item.id}>
+              <button
+                type="button"
+                className="nc-obs-ledger-btn"
+                aria-expanded={expanded === c.item.id}
+                onClick={() => setExpanded((p) => (p === c.item.id ? null : c.item.id))}
+              >
+                <span className={`nc-obs-ledger-due ${c.state}`}>{dueLabel(c)}</span>
+                <span className="nc-obs-ledger-title">{c.item.title}</span>
+                {c.item.kind === 'finding' && <span className="nc-obs-ledger-kind">finding</span>}
+                <span className="nc-obs-ledger-owner">{c.item.owner ?? LEDGER_STATE_LABEL[c.state]}</span>
+                {c.ageMs !== null && <span className="nc-obs-ledger-age">{magnitude(c.ageMs, now + c.ageMs)}</span>}
+              </button>
+              {expanded === c.item.id && (
+                <div className="nc-obs-ledger-detail">
+                  {c.item.nextAction && <div className="nc-obs-ledger-next">next: {c.item.nextAction}</div>}
+                  {c.item.why && <div>{c.item.why}</div>}
+                  <div className="nc-obs-ledger-meta">
+                    {LEDGER_STATE_LABEL[c.state]}
+                    {c.item.owner ? ` · ${c.item.owner}` : ''}
+                  </div>
+                  {c.item.url && <OutLink href={c.item.url}>{itemLinkLabel(c.item.kind)}</OutLink>}
+                </div>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 

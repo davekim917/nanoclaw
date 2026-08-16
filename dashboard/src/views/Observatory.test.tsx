@@ -441,9 +441,15 @@ describe('Observatory', () => {
     // The floor is the FIRST thing in the main column — the whole complaint
     // was scrolling past ten pages of board to reach it.
     expect(kids[0]!.className).toContain('nc-of-floor');
-    const boards = Array.from(container.querySelectorAll('details.nc-of-board'));
-    expect(boards).toHaveLength(3);
-    expect(boards.every((d) => !(d as HTMLDetailsElement).open)).toBe(true);
+    const boards = Array.from(container.querySelectorAll('details.nc-of-board')) as HTMLDetailsElement[];
+    expect(boards).toHaveLength(4);
+    // "Needs attention" is deliberately the ONE board that opens itself. A
+    // breach list behind a disclosure is a dead end with a chevron on it —
+    // the whole point is that it cannot be not-seen. Everything else stays
+    // closed so the office is still reachable without scrolling.
+    expect(boards[0]!.querySelector('summary')!.textContent).toContain('Needs attention');
+    expect(boards[0]!.open).toBe(true);
+    expect(boards.slice(1).every((d) => !d.open)).toBe(true);
     // and the summary strip is above the floor, outside the main column
     expect(container.querySelector('.nc-of-tally-strip')).toBeTruthy();
   });
