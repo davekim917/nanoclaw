@@ -17,6 +17,7 @@ import { getContainerConfig } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
+import { getKnownSlackBots } from '../../channels/slack-mentions.js';
 import { GROUPS_DIR } from '../../config.js';
 import { getActiveContainerSessionIds, resolveAssistantName } from '../../container-runner.js';
 import { readContainerConfig, type ContainerConfig } from '../../container-config.js';
@@ -48,6 +49,8 @@ export interface ObservatoryAgent {
   canonicalName: string;
   folder: string;
   provider: string;
+  /** The bot's real Slack avatar (public slack-edge URL) — the UI pixelates it client-side. Null when no wired bot has one. */
+  avatarUrl: string | null;
   awake: boolean;
   location: string | null;
   lastSeenAt: string | null;
@@ -310,10 +313,28 @@ async function buildAgents(
         .filter((c) => ownerMatchesAgent(c.owner, { name, folder: row.folder }))
         .map((c) => c.slug);
 
+      // The agent's face: its own bot's Slack avatar, found via whichever of
+      // its wired channel types carries a registered identity with an image.
+      const lookup =
+        deps.avatarByChannelType ?? ((ct: string) => getKnownSlackBots().get(ct)?.imageUrl ?? null);
+      const channelTypes = getDb()
+        .prepare(
+          `SELECT DISTINCT mg.channel_type FROM messaging_group_agents mga
+             JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+            WHERE mga.agent_group_id = ?`,
+        )
+        .all(row.id) as { channel_type: string }[];
+      let avatarUrl: string | null = null;
+      for (const { channel_type } of channelTypes) {
+        avatarUrl = lookup(channel_type);
+        if (avatarUrl) break;
+      }
+
       return {
         id: row.id,
         name,
         canonicalName: row.name,
+        avatarUrl,
         folder: row.folder,
         provider,
         awake,
@@ -337,6 +358,8 @@ export interface ObservatoryDeps {
     containerConfig: ContainerConfig,
     sessionMessagingGroupId: string | null,
   ) => Promise<string>;
+  /** Bot avatar by channel type — defaults to the live Slack bot registry. Injected so tests never need an adapter. */
+  avatarByChannelType?: (channelType: string) => string | null;
 }
 
 const defaultDeps: ObservatoryDeps = { getActiveContainerSessionIds, resolveAssistantName };

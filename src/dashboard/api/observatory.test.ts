@@ -151,6 +151,25 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe('avatarUrl', () => {
+  it('resolves through the injected channel-type lookup and defaults to null', async () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1');
+    addGroup('ag-2', 'wg-1');
+    addMessagingGroup('mg-1', 'slack-ava', 'C1');
+    wire('mg-1', 'ag-1');
+
+    const scene = await buildObservatoryScene(
+      'wg-1',
+      makeDeps({ avatarByChannelType: (ct) => (ct === 'slack-ava' ? 'https://cdn.example/ava-192.png' : null) }),
+    );
+    const byId = Object.fromEntries(scene.agents.map((a) => [a.id, a]));
+
+    expect(byId['ag-1'].avatarUrl).toBe('https://cdn.example/ava-192.png');
+    expect(byId['ag-2'].avatarUrl).toBeNull(); // no wiring, no face — never invented
+  });
+});
+
 describe('readReleaseState', () => {
   function groupsDir(files: Record<string, string>): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'obs-groups-'));

@@ -46,6 +46,12 @@ export interface SlackBotIdentity {
   /** Slack workspace identifier (team_id). Used to scope cross-bot resolution to siblings in the same workspace. */
   teamId: string;
   /**
+   * Bot avatar URL from the profile fetch (image_192 preferred). Public
+   * slack-edge CDN URL, safe to hand to a browser <img>. Optional: absent
+   * until upgradeSlackBotProfile runs, and for identities that never get one.
+   */
+  imageUrl?: string;
+  /**
    * Workspace base URL as reported by `auth.test` (`https://acme.slack.com/`).
    * The only piece a thread permalink needs that isn't already in a thread id,
    * and it arrives free on a call the adapter already makes at init. Optional:
@@ -505,6 +511,8 @@ interface SlackAuthTestClient {
       user?: {
         name?: string;
         profile?: {
+          image_192?: string;
+          image_72?: string;
           display_name?: string;
           real_name?: string;
         };
@@ -579,13 +587,14 @@ export async function upgradeSlackBotProfile(
     const profile = profileRes.user.profile;
     const displayName = profile?.display_name || undefined;
     const realName = profile?.real_name || undefined;
-    if (!displayName && !realName) return;
+    const imageUrl = profile?.image_192 || profile?.image_72 || undefined;
+    if (!displayName && !realName && !imageUrl) return;
     // Re-register with augmented identity. Re-read first in case another
     // call to registerSlackBot happened in the meantime (unlikely — adapter
     // factories only register once — but defensive against future callers).
     const current = knownSlackBots.get(channelType);
     if (!current) return;
-    registerSlackBot(channelType, { ...current, displayName, realName });
+    registerSlackBot(channelType, { ...current, displayName, realName, imageUrl });
   } catch (err) {
     log.warn('Slack users.info fetch failed — outbound @-mentions limited to username only', {
       channelType,
