@@ -115,7 +115,7 @@ export function WorkgroupDashboard({ route, onRouteChange }: WorkgroupDashboardP
  * shows exactly one workgroup, never a merged "all" view.
  */
 
-function WorkgroupPicker({
+export function WorkgroupPicker({
   workgroups,
   selectedId,
   onChange,

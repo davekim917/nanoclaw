@@ -12,6 +12,7 @@ import {
 } from '../lib/api.js';
 import { relAge } from '../lib/derive.js';
 import { RouteNav, type BoardRoute } from './BoardShell.js';
+import { WorkgroupPicker } from './WorkgroupDashboard.js';
 
 /**
  * Observatory — an ambient "who is where, doing what" view for the human
@@ -38,9 +39,19 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
   const workgroups = wgData?.workgroups ?? [];
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
+  // Remember the operator's office across visits — the first-workgroup default
+  // put a viewer of a 13-room workgroup in a 1-room one with no way out.
   useEffect(() => {
-    if (selectedId === null && workgroups.length > 0) setSelectedId(workgroups[0]!.id);
+    if (selectedId !== null || workgroups.length === 0) return;
+    const remembered = localStorage.getItem('nc-obs-workgroup');
+    const match = remembered && workgroups.find((w) => w.id === remembered);
+    setSelectedId(match ? match.id : workgroups[0]!.id);
   }, [workgroups, selectedId]);
+
+  const selectWorkgroup = (id: string) => {
+    localStorage.setItem('nc-obs-workgroup', id);
+    setSelectedId(id);
+  };
 
   const {
     data: snapshot,
@@ -70,7 +81,7 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
         <div className="nc-pulse-top">
           <div className="nc-brand">
             <span className="mark" aria-hidden="true"></span>
-            <span className="nc-group-title nc-group-title-static">Observatory</span>
+            <WorkgroupPicker workgroups={workgroups} selectedId={selectedId} onChange={selectWorkgroup} />
           </div>
           <RouteNav route={route} onRouteChange={onRouteChange} />
         </div>
