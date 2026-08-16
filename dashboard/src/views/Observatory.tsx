@@ -84,6 +84,8 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
   );
 
   const [highlightedAgentId, setHighlightedAgentId] = useState<string | null>(null);
+  // Shared across the fold: the strip sits above the office, the board below it.
+  const [releaseFilter, setReleaseFilter] = useState<ReleaseGroupKey | null>(null);
   const [expandedClaim, setExpandedClaim] = useState<string | null>(null);
   const [openZone, setOpenZone] = useState<string | null>(null);
 
@@ -142,6 +144,12 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
   const agentsById = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
   const awakeCount = agents.filter((a) => a.awake).length;
 
+  // The strip above the floor must count the same set the board below shows,
+  // so the owner filter is applied once, here, and handed to both.
+  const ownerFilter = highlightedAgentId ? (agentsById.get(highlightedAgentId)?.name ?? null) : null;
+  const allItems = snapshot?.releaseState?.items ?? [];
+  const ownerFilteredItems = ownerFilter ? allItems.filter((i) => i.owner === ownerFilter) : allItems;
+
   const claimClicked = (claim: ObservatoryClaim) => {
     const match = agents.find((a) => a.id === claim.owner || a.name === claim.owner);
     setHighlightedAgentId((prev) => (match && prev === match.id ? null : match?.id ?? null));
@@ -171,17 +179,17 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
 
         {snapshot && (
           <>
-            <ReleaseDesk
-              releaseState={snapshot.releaseState}
-              ownerFilter={highlightedAgentId ? (agentsById.get(highlightedAgentId)?.name ?? null) : null}
-              onClearOwnerFilter={() => setHighlightedAgentId(null)}
+            {/* Layout law 1: one-line summary, then the OFFICE, then the dense
+                boards — below the fold and closed. Before this, the job board
+                rendered first and fully expanded, which put the floor ten
+                pages down and made the office a footnote to its own page. */}
+            <ReleaseTallies
+              items={ownerFilteredItems}
+              filter={releaseFilter}
+              onFilter={setReleaseFilter}
             />
 
             <div className="nc-obs-main">
-              <ClaimsWall claims={claims} expandedSlug={expandedClaim} onClaimClick={claimClicked} />
-
-              <ScheduledSection agentGroupIds={agents.map((a) => a.id)} />
-
               <div className="nc-of-floor">
                 <div className="nc-obs-rooms">
                   {rooms.map((room) => (
@@ -215,6 +223,30 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
                   </div>
                 </div>
               </div>
+
+              <details className="nc-of-board">
+                <summary className="nc-of-board-summary">
+                  Job Board <span className="nc-of-board-n">{ownerFilteredItems.length}</span>
+                </summary>
+                <ReleaseDesk
+                  releaseState={snapshot.releaseState}
+                  ownerFilter={ownerFilter}
+                  onClearOwnerFilter={() => setHighlightedAgentId(null)}
+                  filter={releaseFilter}
+                />
+              </details>
+
+              <details className="nc-of-board">
+                <summary className="nc-of-board-summary">
+                  Who&apos;s on what <span className="nc-of-board-n">{claims.length}</span>
+                </summary>
+                <ClaimsWall claims={claims} expandedSlug={expandedClaim} onClaimClick={claimClicked} />
+              </details>
+
+              <details className="nc-of-board">
+                <summary className="nc-of-board-summary">What&apos;s scheduled</summary>
+                <ScheduledSection agentGroupIds={agents.map((a) => a.id)} />
+              </details>
             </div>
           </>
         )}
@@ -461,17 +493,69 @@ function ReleaseRow({
   );
 }
 
+/**
+ * The tally strip — one line, directly under the header and directly above the
+ * floor. It is the page's summary and its only always-open dense element; the
+ * boards it filters sit BELOW the office, collapsed. Layout law 1 of the
+ * office-16 system: the office is the hero and is reachable without scrolling.
+ */
+export function ReleaseTallies({
+  items,
+  filter,
+  onFilter,
+}: {
+  items: ReleaseItem[];
+  filter: ReleaseGroupKey | null;
+  onFilter: (next: ReleaseGroupKey | null) => void;
+}) {
+  const parts = releaseCountParts(items);
+  if (parts.length === 0) return null;
+  return (
+    <div className="nc-of-tally-row nc-of-tally-strip">
+      {/* textContent of .nc-obs-release-counts stays exactly
+          "1 blocking · 2 automated" — the ALL reset lives outside it. */}
+      <div className="nc-obs-release-counts">
+        {parts.map((p, i) => (
+          <span key={p.key} className="nc-of-tally">
+            {i > 0 && <span className="nc-of-tally-sep">{' · '}</span>}
+            <button
+              type="button"
+              className={`nc-of-tally-btn ${filter === p.key ? 'active' : ''}`}
+              data-tally={p.key}
+              aria-pressed={filter === p.key}
+              onClick={() => onFilter(filter === p.key ? null : p.key)}
+            >
+              <span className="nc-of-tally-n">{p.n}</span>
+              <span className="nc-of-tally-l">{' ' + p.label}</span>
+            </button>
+          </span>
+        ))}
+      </div>
+      <button
+        type="button"
+        className={`nc-of-tally-all ${filter === null ? 'active' : ''}`}
+        aria-pressed={filter === null}
+        onClick={() => onFilter(null)}
+      >
+        All
+      </button>
+    </div>
+  );
+}
+
 function ReleaseDesk({
   releaseState,
   ownerFilter,
   onClearOwnerFilter,
+  filter,
 }: {
   releaseState: ReleaseState | null;
   /** Set by clicking someone on the floor. Matched against `item.owner`. */
   ownerFilter?: string | null;
   onClearOwnerFilter?: () => void;
+  /** Lifted: the strip above the floor and the board below it share one filter. */
+  filter: ReleaseGroupKey | null;
 }) {
-  const [filter, setFilter] = useState<ReleaseGroupKey | null>(null);
   const [view, setView] = useState<'status' | 'agent' | 'graph'>('status');
   const [expandedItem, setExpandedItem] = useState<string | null>(null);
 
@@ -492,7 +576,6 @@ function ReleaseDesk({
   // rows below aren't showing.
   const items = ownerFilter ? releaseState.items.filter((i) => i.owner === ownerFilter) : releaseState.items;
   const groups = groupReleaseItems(items);
-  const parts = releaseCountParts(items);
   const lanes = groupReleaseItemsByOwner(items);
   const shows = (key: ReleaseGroupKey) => filter === null || filter === key;
   const toggleItem = (id: string) => setExpandedItem((prev) => (prev === id ? null : id));
@@ -530,37 +613,6 @@ function ReleaseDesk({
             </button>
           </div>
         </div>
-        {parts.length > 0 && (
-          <div className="nc-of-tally-row">
-            {/* textContent of .nc-obs-release-counts stays exactly
-                "1 blocking · 2 automated" — the ALL reset lives outside it. */}
-            <div className="nc-obs-release-counts">
-              {parts.map((p, i) => (
-                <span key={p.key} className="nc-of-tally">
-                  {i > 0 && <span className="nc-of-tally-sep">{' · '}</span>}
-                  <button
-                    type="button"
-                    className={`nc-of-tally-btn ${filter === p.key ? 'active' : ''}`}
-                    data-tally={p.key}
-                    aria-pressed={filter === p.key}
-                    onClick={() => setFilter((prev) => (prev === p.key ? null : p.key))}
-                  >
-                    <span className="nc-of-tally-n">{p.n}</span>
-                    <span className="nc-of-tally-l">{' ' + p.label}</span>
-                  </button>
-                </span>
-              ))}
-            </div>
-            <button
-              type="button"
-              className={`nc-of-tally-all ${filter === null ? 'active' : ''}`}
-              aria-pressed={filter === null}
-              onClick={() => setFilter(null)}
-            >
-              All
-            </button>
-          </div>
-        )}
       </div>
 
       {release?.moratorium && <div className="nc-obs-release-moratorium">release-day moratorium active</div>}
@@ -960,6 +1012,11 @@ function Zone({
     <div
       className={`nc-obs-room nc-of-zone rug-${rugTone(room.key)} ${cls} ${hasOpenPanel ? 'has-open-popover' : ''}`}
       data-room-key={room.key}
+      // Occupancy sets the footprint (layout law 4). Absent members still take
+      // a seat — they belong to this channel and their empty desk is part of
+      // what the room is — but a dead channel with nobody at all stays small
+      // instead of becoming a big colour slab with one desk in the middle.
+      style={{ ['--seats' as string]: String(Math.min(bodies.length + Math.min(absentMembers.length, 2) * 0.5, 3.5)) }}
     >
       <button
         type="button"
@@ -968,7 +1025,6 @@ function Zone({
         onClick={onToggle}
       >
         <span className="nc-obs-room-name">{room.name}</span>
-        <span className="nc-obs-room-platform">{room.platform}</span>
       </button>
 
       {cls === 'dusty' && (

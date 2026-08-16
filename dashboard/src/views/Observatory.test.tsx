@@ -33,7 +33,7 @@ import {
   upcomingScheduled,
 } from './Observatory.js';
 import { RouteNav } from './BoardShell.js';
-import { roomDecor, rugTone, COBWEB, BLANK_AVATAR, DESK_ON, DESK_OFF } from './office-sprites.js';
+import { roomDecor, rugTone, RUG_TONES, COBWEB, BLANK_AVATAR, DESK_ON, DESK_OFF } from './office-sprites.js';
 import useSWR from 'swr';
 import type {
   ObservatoryRoom,
@@ -414,12 +414,38 @@ describe('Observatory', () => {
     expect(ownerEl.textContent).not.toBe('unknown');
   });
 
-  it('the claims wall carries no fixed/sticky positioning class and lives inside the main grid', () => {
+  it('the claims wall carries no fixed/sticky positioning class and stays in normal flow', () => {
     mockData(snapshot({ claims: [claim({ slug: 'c1' })] }));
     const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
     const wall = container.querySelector('.nc-obs-claims')!;
     expect(wall.className).not.toMatch(/fixed|sticky/);
-    expect(container.querySelector('.nc-obs-main > .nc-obs-claims')).toBeTruthy();
+    // Was `.nc-obs-main > .nc-obs-claims`. The wall now sits one level deeper,
+    // inside its collapsed <details>, so the direct-child selector no longer
+    // holds. The CONTRACT it protected is unchanged and still asserted: this
+    // panel is in normal document flow inside the main column, never a fixed
+    // side rail that ignores page scroll.
+    expect(container.querySelector('.nc-obs-main .nc-obs-claims')).toBeTruthy();
+  });
+
+  it('puts the office above the boards, and leaves every board closed', () => {
+    mockData(
+      snapshot({
+        rooms: [room({ key: 'r1' })],
+        claims: [claim({ slug: 'c1' })],
+        releaseState: releaseState({ items: [releaseItem({ id: 'A1' })] }),
+      }),
+    );
+    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    const main = container.querySelector('.nc-obs-main')!;
+    const kids = Array.from(main.children);
+    // The floor is the FIRST thing in the main column — the whole complaint
+    // was scrolling past ten pages of board to reach it.
+    expect(kids[0]!.className).toContain('nc-of-floor');
+    const boards = Array.from(container.querySelectorAll('details.nc-of-board'));
+    expect(boards).toHaveLength(3);
+    expect(boards.every((d) => !(d as HTMLDetailsElement).open)).toBe(true);
+    // and the summary strip is above the floor, outside the main column
+    expect(container.querySelector('.nc-of-tally-strip')).toBeTruthy();
   });
 
   describe('avatar faces', () => {
@@ -900,20 +926,25 @@ describe('Observatory', () => {
   });
 
   describe('open floor plan', () => {
-    it('rugTone is stable per zone key and stays inside the four-tone set', () => {
+    it('rugTone is stable per zone key and stays inside the tone set', () => {
       expect(rugTone('slack:C123')).toBe(rugTone('slack:C123'));
       for (const key of ['slack:C1', 'discord:D2', 'slack:C999', 'x']) {
         expect(rugTone(key)).toBeGreaterThanOrEqual(0);
-        expect(rugTone(key)).toBeLessThan(4);
+        expect(rugTone(key)).toBeLessThan(RUG_TONES);
       }
     });
 
-    it('a zone is a rug under a hanging sign, with no wall styling left', () => {
+    // Renamed from "…with no wall styling left". Rooms ARE walled now: the
+    // office-16 amendment adopted enclosure after three independent critics
+    // read the unwalled version as a colour-block chart rather than a floor
+    // plan. The name asserted a contract the body never checked; the body's
+    // real subject is the zone class, its rug tone and its hanging sign.
+    it('a zone carries a rug tone and a hanging sign that names the channel', () => {
       mockData(snapshot({ rooms: [room({ key: 'r1', name: 'general' })] }));
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       const zone = container.querySelector('.nc-obs-room[data-room-key="r1"]')!;
       expect(zone.className).toContain('nc-of-zone');
-      expect(zone.className).toMatch(/rug-[0-3]/);
+      expect(zone.className).toMatch(/rug-[0-5]/);
       const sign = zone.querySelector('.nc-of-sign')!;
       expect(sign.tagName).toBe('BUTTON');
       expect(sign.textContent).toContain('general');

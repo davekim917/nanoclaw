@@ -1742,6 +1742,44 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-obs-release-lane-sum { font-size: 11px; color: #efdcbb; }
 
+/* Collapsed boards. Native <details> — progressive disclosure with no JS, and
+   the summary is the affordance. These sit BELOW the office deliberately. */
+.nc-of .nc-of-board {
+  background: var(--of-paper); border: 3px solid var(--of-ink-2); box-shadow: var(--of-drop);
+}
+.nc-of .nc-of-board + .nc-of-board { margin-top: 10px; }
+.nc-of .nc-of-board-summary {
+  cursor: pointer; list-style: none; padding: 11px 14px; min-height: 44px;
+  display: flex; align-items: center; gap: 9px;
+  font-family: var(--font-mono); font-size: 12px; font-weight: 700;
+  letter-spacing: 0.12em; text-transform: uppercase; color: var(--of-ink);
+}
+.nc-of .nc-of-board-summary::-webkit-details-marker { display: none; }
+.nc-of .nc-of-board-summary::after { content: '\25B8'; margin-left: auto; }
+.nc-of .nc-of-board[open] > .nc-of-board-summary::after { content: '\25BE'; }
+.nc-of .nc-of-board-summary:focus-visible { outline: 3px solid var(--of-ink); outline-offset: -3px; }
+.nc-of .nc-of-board-n {
+  border: 2px solid var(--of-ink-2); padding: 0 6px; font-size: 11px; letter-spacing: 0.06em;
+}
+.nc-of .nc-of-board > *:not(.nc-of-board-summary) { padding: 0 12px 12px; }
+
+/* The one-line summary strip, directly above the office. */
+.nc-of .nc-of-tally-strip {
+  margin-bottom: 10px; padding: 2px 10px;
+  background: var(--of-paper); border: 3px solid var(--of-ink-2); box-shadow: var(--of-drop);
+}
+/* These colours were authored for the dark corkboard the strip used to sit on.
+   On the light page they were cream-on-cream — the numbers survived on their
+   drop shadow alone and the labels vanished entirely. */
+.nc-of .nc-of-tally-strip .nc-of-tally-n { color: var(--of-ink); text-shadow: none; font-size: 22px; }
+.nc-of .nc-of-tally-strip .nc-of-tally-l { color: var(--of-ink-2); }
+.nc-of .nc-of-tally-strip .nc-of-tally-sep { color: var(--of-ink-2); opacity: 0.5; }
+.nc-of .nc-of-tally-strip .nc-of-tally-btn:hover { border-color: var(--of-ink-2); }
+.nc-of .nc-of-tally-strip .nc-of-tally-btn.active { background: var(--of-cork); border-color: var(--of-ink); }
+.nc-of .nc-of-tally-strip .nc-of-tally-btn.active .nc-of-tally-n { color: var(--of-cream); }
+.nc-of .nc-of-tally-strip .nc-of-tally-btn.active .nc-of-tally-l { color: var(--of-cream); }
+.nc-of .nc-of-tally-strip .nc-of-tally-all { margin-left: auto; }
+
 /* ─── Dependency view ────────────────────────────────────────────────────── */
 
 .nc-of .nc-obs-hover-steer {
@@ -2003,27 +2041,64 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    STABLE (sorted platform, name), never reordered by activity; each zone's
    rug tone and furniture are hashed from its key. What separates one cluster
    from the next is aisle space and furniture, so the gaps are load-bearing. */
-.nc-of .nc-obs-rooms { display: grid; grid-template-columns: 1fr; gap: 44px 20px; }
+/* NOT a uniform grid — "equal-sized cards in a uniform grid (reads as cubicles,
+   not an office)" is anti-pattern 1 of the office-16 system, and a two-column
+   auto-fill grid is exactly that. Rooms flow at sizes derived from occupancy
+   (see --seats below) and wrap into an open floor, so room size varies, rows
+   break unevenly, and the aisle space between clusters is real space rather
+   than grid gutter. Position stays STABLE because the source order is sorted
+   (platform, name) and nothing here reorders. */
+.nc-of .nc-obs-rooms {
+  display: flex; flex-wrap: wrap; align-items: flex-start;
+  gap: 46px 30px;
+}
+/* The lounge is a room, not a footer rule across the whole floor. */
+.nc-of .nc-of-bullpen { max-width: 420px; }
 
-@media (min-width: 640px) {
-  .nc-of .nc-obs-rooms { grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 48px 36px; }
+/* Occupancy sets the footprint: layout law 4, "a room's size is its occupancy".
+   --seats is set per room from its body count; an empty channel gets a small
+   room instead of a colour slab with a desk marooned in the middle. */
+.nc-of .nc-obs-room {
+  flex: 0 1 auto;
+  width: calc(126px + (var(--seats, 0) * 84px));
+  max-width: 100%;
+}
+@media (min-width: 900px) {
+  .nc-of .nc-obs-room { min-width: 208px; }
 }
 
-/* The rug: a flat colour block with a hard pixel edge — no walls, no insets. */
+/* The rug, ENCLOSED. The original rule said zones are told apart by rug colour
+   "never by borders", and three rounds of independent critique read that as a
+   colour-block chart rather than a floor plan. The amended rule: the rug still
+   names the zone, the wall gives it extent. What stays banned is the thing the
+   original was protecting against — a hairline box border used as a card edge.
+   This is 10px of drawn masonry with a lit cap, not a 1px outline. */
 .nc-of .nc-obs-room {
   --rug: var(--of-room);
   position: relative; border-radius: 0;
-  margin-top: 34px; padding: 16px 12px 12px; min-height: 150px;
+  margin-top: 34px; padding: 26px 16px 16px; min-height: 150px;
   background: var(--rug);
-  border: 0;
-  box-shadow: 0 0 0 3px rgb(43 36 22 / 0.22), 5px 5px 0 rgb(0 0 0 / 0.12);
+  border: 10px solid var(--of-wall, #7c5f3e);
+  border-top-width: 22px;
+  box-shadow:
+    inset 0 0 0 2px rgb(43 36 22 / 0.30),
+    inset 5px 5px 0 rgb(43 36 22 / 0.16),
+    0 0 0 2px rgb(43 36 22 / 0.5),
+    5px 5px 0 rgb(0 0 0 / 0.18);
   transition: none;
 }
 /* Four rug tones so neighbouring zones read as separate areas of one floor. */
-.nc-of .nc-obs-room.rug-0 { --rug: #f5ead6; }
-.nc-of .nc-obs-room.rug-1 { --rug: #eee0c8; }
-.nc-of .nc-obs-room.rug-2 { --rug: #f0e7d2; }
-.nc-of .nc-obs-room.rug-3 { --rug: #e9e2cd; }
+/* Six distinct hues, desaturated-warm — the office-16 zone palette. These were
+   four shades of the same cream, which made the rug carry no identity at all:
+   a reader could not tell one zone from another by colour, which is the ONLY
+   job the rug has. None of them is a state colour (green/amber/red/grey stay
+   reserved for working / waiting / blocking / stale). */
+.nc-of .nc-obs-room.rug-0 { --rug: #c9a3cf; }
+.nc-of .nc-obs-room.rug-1 { --rug: #8fb8d8; }
+.nc-of .nc-obs-room.rug-2 { --rug: #93b5b0; }
+.nc-of .nc-obs-room.rug-3 { --rug: #e0a87c; }
+.nc-of .nc-obs-room.rug-4 { --rug: #d8c98a; }
+.nc-of .nc-obs-room.rug-5 { --rug: #b7cdd4; }
 /* Lighting is colour, never opacity/filter on the zone itself — both create a
    stacking context that traps an open panel (and breaks the mobile
    position:fixed sheet) inside the zone. */

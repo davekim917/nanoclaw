@@ -161,13 +161,20 @@ export function hashKey(key: string): number {
   return h >>> 0;
 }
 
+/** How many distinct rug tones the floor has. */
+export const RUG_TONES = 6;
+
 /**
- * Which of the four rug tones a zone stands on, from its key alone. Uses a
- * different slice of the hash than the furniture pick so the two don't
- * correlate into visible stripes across the floor.
+ * Which rug tone a zone stands on, from its key alone. Uses a different slice
+ * of the hash than the furniture pick so the two don't correlate into visible
+ * stripes across the floor.
+ *
+ * Six tones, not four, and they are genuinely distinct hues rather than four
+ * shades of the same cream — with near-identical tones the whole floor read as
+ * one colour and rug-as-zone-identity carried no information at all.
  */
 export function rugTone(key: string): number {
-  return (hashKey(key) >>> 4) % 4;
+  return (hashKey(key) >>> 4) % RUG_TONES;
 }
 
 /**
