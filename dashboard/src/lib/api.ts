@@ -471,6 +471,8 @@ export interface ObservatoryAgent {
   lastSeenAt: string | null;
   holding: string[];
   nextTask: { title: string; at: string } | null;
+  /** Bot's real Slack avatar (public slack-edge CDN URL), null when none. */
+  avatarUrl: string | null;
 }
 
 export type ObservatoryClaimState = 'live' | 'expiring' | 'stale' | 'parked';

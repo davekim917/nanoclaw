@@ -62,6 +62,7 @@ function agent(overrides: Partial<ObservatoryAgent> = {}): ObservatoryAgent {
     lastSeenAt: new Date().toISOString(),
     holding: [],
     nextTask: null,
+    avatarUrl: null,
     ...overrides,
   };
 }
@@ -370,6 +371,45 @@ describe('Observatory', () => {
     const wall = container.querySelector('.nc-obs-claims')!;
     expect(wall.className).not.toMatch(/fixed|sticky/);
     expect(container.querySelector('.nc-obs-main > .nc-obs-claims')).toBeTruthy();
+  });
+
+  describe('avatar faces', () => {
+    it('renders a pixelated avatar image on the chip when avatarUrl is present', () => {
+      mockData(
+        snapshot({
+          agents: [agent({ id: 'ava', name: 'ava', avatarUrl: 'https://avatars.slack-edge.com/ava.png', awake: true })],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const img = container.querySelector('.nc-obs-chip[data-agent-id="ava"] img')! as HTMLImageElement;
+      expect(img).toBeTruthy();
+      expect(img.className).toContain('pixelated');
+      expect(img.getAttribute('src')).toBe('https://avatars.slack-edge.com/ava.png');
+    });
+
+    it('falls back to dashed initials for the wired-member marker when avatarUrl is null', () => {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1', memberAgentIds: ['kit'] })],
+          agents: [agent({ id: 'kit', name: 'kit', location: null, avatarUrl: null })],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const absent = container.querySelector('.nc-obs-room-absent')!;
+      expect(absent.textContent).toBe('K');
+      expect(container.querySelector('.nc-obs-room-bodies img')).toBeFalsy();
+    });
+
+    it('applies the grayscale "asleep" class to the avatar image when the agent is asleep', () => {
+      mockData(
+        snapshot({
+          agents: [agent({ id: 'ava', name: 'ava', avatarUrl: 'https://avatars.slack-edge.com/ava.png', awake: false })],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const img = container.querySelector('.nc-obs-chip[data-agent-id="ava"] img')!;
+      expect(img.className).toContain('asleep');
+    });
   });
 
   describe('Release Desk', () => {

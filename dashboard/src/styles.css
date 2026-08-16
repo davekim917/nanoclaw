@@ -1599,8 +1599,8 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 
 .nc-obs-room {
   border-radius: 10px; padding: 12px 14px; min-height: 96px;
-  background: var(--bg-card); border: 1px solid var(--line);
-  box-shadow: 0 1px 3px oklch(0 0 0 / 0.2);
+  background: var(--bg-card); border: 2px solid var(--line);
+  box-shadow: 2px 2px 0 0 oklch(0 0 0 / 0.3);
   transition: opacity 0.2s ease, filter 0.2s ease;
 }
 .nc-obs-room.lit   { opacity: 1;    filter: saturate(1); }
@@ -1649,13 +1649,27 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-obs-chip-glyph { font-size: 9px; color: var(--brand); }
 .nc-obs-chip.asleep .nc-obs-chip-glyph { font-size: 11px; }
 
+/* Bot avatar faces — nearest-neighbor upscale via image-rendering IS the
+   pixel-art filter, no canvas/processing. 32px on room-body chips, 40px in
+   the desks strip; 16px greyed for the faint wired-but-absent markers. */
+.nc-obs-avatar {
+  width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+  image-rendering: pixelated;
+}
+.nc-obs-desks-row .nc-obs-avatar { width: 40px; height: 40px; }
+.nc-obs-avatar.asleep { filter: grayscale(1) brightness(.7); }
+.nc-obs-avatar-sm {
+  width: 16px; height: 16px; border-radius: 50%;
+  image-rendering: pixelated; filter: grayscale(1);
+}
+
 /* z-index comfortably above every other .nc-obs-* element (all unset/auto,
    or 5 on an elevated room) so it never renders under a sibling card. */
 .nc-obs-hover {
   position: absolute; top: calc(100% + 6px); left: 0; z-index: 50;
   min-width: 180px; padding: 8px 26px 8px 10px; border-radius: 6px;
-  background: var(--bg-inset); border: 1px solid var(--line-2);
-  box-shadow: 0 4px 14px oklch(0 0 0 / 0.35);
+  background: var(--bg-inset); border: 2px solid var(--line-2);
+  box-shadow: 3px 3px 0 0 oklch(0 0 0 / 0.4);
   font-family: var(--font-mono); font-size: 11px; color: var(--fg-2);
   display: flex; flex-direction: column; gap: 3px;
   cursor: default;

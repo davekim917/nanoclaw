@@ -426,6 +426,15 @@ function AgentChip({
         }
       }}
     >
+      {agent.avatarUrl && (
+        <img
+          className={`nc-obs-avatar pixelated${agent.awake ? '' : ' asleep'}`}
+          src={agent.avatarUrl}
+          alt={agent.name}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+        />
+      )}
       <span className="nc-obs-chip-glyph" aria-hidden="true">
         {agent.awake ? '●' : '💤'}
       </span>
@@ -491,7 +500,17 @@ function RoomCard({
         ))}
         {absentMembers.map((id) => {
           const known = agentsById.get(id);
-          return (
+          return known?.avatarUrl ? (
+            <img
+              key={id}
+              className="nc-obs-avatar-sm pixelated"
+              src={known.avatarUrl}
+              alt={known.name}
+              title={known.name}
+              loading="lazy"
+              referrerPolicy="no-referrer"
+            />
+          ) : (
             <span key={id} className="nc-obs-room-absent" title={known?.name ?? id}>
               {initials(known?.name ?? id)}
             </span>
