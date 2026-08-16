@@ -8,24 +8,37 @@ description: Enable a ~/plugins/<name> plugin across all three container agent p
 Bring a plugin in `~/plugins/<name>` to **all three** container agent providers with
 parity. The container mount + `CLAUDE_PLUGINS_ROOT` already gives Claude groups any
 plugin that carries a Claude manifest — this skill closes the gaps that aren't
-automatic: a missing Claude manifest, and always-on activation on Codex/OpenCode
-(which fire **no** plugin hooks in NanoClaw containers).
+automatic: missing manifests, the OpenCode skill mirror, and always-on activation on
+Codex/OpenCode (which fire **no** plugin hooks in NanoClaw containers).
+
+## Scope: container agent groups only — never a host CLI
+
+This skill delivers plugins to the **fleet**, not to the operator's own CLIs. Do NOT
+run `codex plugin marketplace add` / `codex plugin add`, do NOT register a Claude
+marketplace on the host, and do NOT touch `~/.codex/config.toml` or `~/.claude/`.
+
+That isn't just tidiness — host registration buys the fleet nothing. Containers
+strip every inherited `[plugins.*]` / `[marketplaces.*]` table out of the host Codex
+config and register fresh from `/workspace/plugins` at spawn
+(`container/agent-runner/src/codex-companion-setup.ts`). Installing into a host CLI
+only changes the operator's own terminal sessions, and that is their call to make by
+hand, not a side effect of this skill.
 
 ## The model (why this skill exists)
 
-NanoClaw does **not** run Codex's `.codex-plugin` or OpenCode's `opencode.json`
-plugin systems. It re-implements the useful parts on its own surfaces, so you do
-**not** generate three platform manifests. Parity decomposes like this:
+Each provider reaches the plugin by its own path, all rooted at the `~/plugins` →
+`/workspace/plugins` container mount:
 
 | Plugin provides | Claude group | Codex group | OpenCode group |
 |---|---|---|---|
-| **Skills / commands** (`skills/<n>/SKILL.md`) | Claude manifest + mount | mirror → `~/.agents/skills/` | mirror → `~/.config/opencode/skill/` |
+| **Skills / commands** (`skills/<n>/SKILL.md`) | `.claude-plugin/plugin.json` + mount (`CLAUDE_PLUGINS_ROOT`) | native registration at spawn from the mount, needs `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` | mirror → `~/.config/opencode/skill/` (no plugin loader) |
 | **Always-on ruleset** (e.g. ponytail) | plugin SessionStart hook (auto) | `~/plugins/<n>/.nanoclaw-always-on.md` → `AGENTS.md`/`CLAUDE.md` | same |
-| **Opt-out** | `excludePlugins` (drops mount) | skip the ruleset | skip the ruleset |
+| **Opt-out** | `excludePlugins` (drops mount) | `excludePlugins` (drops mount) + skip the ruleset | same |
 
-So the only artifacts ever worth generating are: **(1)** a Claude `plugin.json` if the
-repo ships none, and **(2)** a condensed always-on ruleset for "mode" plugins.
-Skills-only plugins need neither — they already reach all three on the next spawn.
+So the only artifacts ever worth generating are: **(1)** the manifests a repo ships
+none of, and **(2)** a condensed always-on ruleset for "mode" plugins. A skills-only
+plugin that already ships its manifests needs neither — it reaches all three on the
+next spawn, and the enabler run is just a verification pass.
 
 ## Steps
 
@@ -33,15 +46,17 @@ Skills-only plugins need neither — they already reach all three on the next sp
    directory the container mount reads. If the user cloned it elsewhere, have them
    move/clone it there first: `git clone <url> ~/plugins/<name>`.
 
-2. **Run the deterministic enabler** (generates a Claude manifest if missing, mirrors
-   skills to Codex + OpenCode, and classifies the plugin):
+2. **Run the deterministic enabler** (generates the Claude/Codex manifests if missing,
+   mirrors skills to OpenCode, and classifies the plugin):
 
    ```bash
    pnpm exec tsx scripts/enable-agent-plugin.ts <name> --report-json
    ```
 
    Read the JSON. `sessionStartHook: true` means it's an always-on "mode" plugin →
-   do step 3. `false` means skills-only → skip to step 5.
+   do step 3. `false` means skills-only → skip to step 5. `codexRegisterable: true`
+   means Codex **containers** will register it themselves at spawn — there is no
+   command for you to run.
 
 3. **Author the always-on ruleset** (only when `sessionStartHook` is true and
    `hasAlwaysOnFile` is false/stub). This is the one judgment step — do NOT dump the
@@ -94,16 +109,23 @@ Skills-only plugins need neither — they already reach all three on the next sp
 After respawn:
 - **Claude** groups: the plugin loads via the mount (confirm the manifest exists). Its
   SessionStart hook fires if it has one.
-- **Codex / OpenCode** groups: the skills appear as commands (already mirrored in step 2);
-  for mode plugins, the condensed ruleset is in `groups/<folder>/AGENTS.md`.
-
-Spot-check one Codex group: `grep -c "<a distinctive ruleset phrase>" groups/<name>-codex/AGENTS.md`.
+- **Codex** groups: the container registered the plugin itself at spawn — skills appear
+  namespaced `<plugin>:<skill>`. Predict it without a container:
+  `bun run -e "import {planCodexPluginRegistration} from './container/agent-runner/src/codex-companion-setup.ts'; console.log(planCodexPluginRegistration('/home/ubuntu/plugins').filter(p=>p.name==='<name>'))"`
+  → expect `action: "register"`.
+- **OpenCode** groups: the skills appear as commands (mirrored in step 2).
+- For mode plugins, the condensed ruleset is in `groups/<folder>/AGENTS.md` — spot-check
+  one Codex group: `grep -c "<a distinctive ruleset phrase>" groups/<name>-codex/AGENTS.md`.
 
 ## Notes
 
 - **Skills-only plugins** (no SessionStart hook): steps 3–4 don't apply. They're live on
-  all three on the next spawn; a build+restart is only needed if a Claude manifest was generated.
-- The generated `.claude-plugin/plugin.json` is written into the plugin's own repo (it's
-  your clone). Commit it there if you want it to survive a re-clone.
+  all three on the next spawn; a build+restart is only needed if a manifest was generated.
+- Generated manifests (`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`,
+  `.agents/plugins/marketplace.json`) are written into the plugin's own repo (it's your
+  clone). Commit them there if you want them to survive a re-clone.
+- If the user explicitly asks for the plugin in their **own** `codex`/`claude` CLI, that's
+  a separate request outside this skill — do it deliberately and say what host state it
+  changes, don't fold it into the fleet enablement.
 - `~/plugins/<name>/.nanoclaw-always-on.md` is the opt-in marker for always-on injection.
   Delete it (then rebuild) to make a plugin skills-only again.

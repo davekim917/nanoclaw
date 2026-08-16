@@ -9,14 +9,22 @@
  *   - Claude   → the mount + CLAUDE_PLUGINS_ROOT auto-loads the plugin, but ONLY
  *                if it carries a Claude manifest. We generate a minimal
  *                `.claude-plugin/plugin.json` when one is missing (the taste-skill gap).
- *   - Codex    → native `codex plugin` loading. We generate `.codex-plugin/plugin.json`
- *                and a self-referencing `.agents/plugins/marketplace.json` when either
- *                is missing, then report the `codex plugin marketplace add` / `codex
- *                plugin add` commands the caller must run (this script never mutates
- *                Codex's own state).
+ *   - Codex    → native `codex plugin` loading, registered by the CONTAINER at spawn
+ *                (`registerContainerCodexPlugins`, which builds its own plugin cache
+ *                from `/workspace/plugins`). All this script does is make the plugin
+ *                registerable: generate `.codex-plugin/plugin.json` and a
+ *                self-referencing `.agents/plugins/marketplace.json` when either is
+ *                missing.
  *   - OpenCode → portable `skills/<n>/SKILL.md` mirror into `~/.config/opencode/skill/`
  *                (and per-sibling XDG dirs). OpenCode has no plugin loader, so the
  *                mirror is its only delivery path.
+ *
+ * SCOPE: container agent groups only. This script never touches a host CLI's plugin
+ * state — not `~/.codex/config.toml`, not the host Claude marketplace. Containers
+ * strip every inherited `[plugins.*]` / `[marketplaces.*]` table from the host Codex
+ * config (see `codex-companion-setup.ts`), so host registration would buy the fleet
+ * exactly nothing. Installing a plugin into your own host CLI is a separate,
+ * operator-owned decision — do it by hand if you want it there.
  *
  * Per-provider opt-out is controlled by `~/plugins/<name>/.nanoclaw-plugin.json`
  * (`{ "denySiblings": [...] }`, read by `readPluginDenySiblings`). `--deny`/`--allow`
@@ -56,8 +64,8 @@ interface Classification {
   codexSkillsRoot: string | null;
   codexManifestGenerated: boolean;
   codexMarketplaceGenerated: boolean;
-  codexRegistered: boolean;
-  codexCommands: string[];
+  /** Manifests resolve, so a Codex container can register it natively at spawn. */
+  codexRegisterable: boolean;
   portableSkills: string[];
   sessionStartHook: boolean;
   hasAlwaysOnFile: boolean;
@@ -274,13 +282,14 @@ interface CodexRegistration {
   skillsRoot: string | null;
   manifestGenerated: boolean;
   marketplaceGenerated: boolean;
-  registered: boolean;
-  commands: string[];
+  /** Manifests resolve — a Codex CONTAINER can register this natively at spawn. */
+  registerable: boolean;
   reason: string | null;
 }
 
-/** Codex-native registration: generate `.codex-plugin/plugin.json` + a self-referencing
- * marketplace.json when missing, then report (never execute) the `codex plugin` commands. */
+/** Make the plugin Codex-registerable: generate `.codex-plugin/plugin.json` + a
+ * self-referencing marketplace.json when missing. Containers do the actual
+ * registration at spawn; no host CLI is involved. */
 /**
  * Marketplace monorepos carry no skills at the repo root — each plugin lives one level
  * down (`claude-plugins-official/plugins/playground`, `role-specific-plugins/plugins/
@@ -362,13 +371,7 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
         skillsRoot: `${subs.length} sub-plugin(s)`,
         manifestGenerated: subs.some((s) => s.generated),
         marketplaceGenerated: false,
-        registered: Boolean(mkt) && entries.length > 0,
-        commands: mkt
-          ? [
-              `codex plugin marketplace add ${dir}`,
-              ...entries.map((e) => `codex plugin add ${e}@${mkt}`),
-            ]
-          : [],
+        registerable: Boolean(mkt) && entries.length > 0,
         reason: mkt ? null : 'monorepo has no marketplace.json name',
       };
     }
@@ -376,8 +379,7 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
       skillsRoot: null,
       manifestGenerated: false,
       marketplaceGenerated: false,
-      registered: false,
-      commands: [],
+      registerable: false,
       reason: 'no skills root found under .agents/skills, skills, or plugin/skills',
     };
   }
@@ -422,19 +424,7 @@ function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): C
     if (!self) reason = 'existing marketplace.json has no self-referencing entry';
   }
 
-  const commands = self
-    ? [`codex plugin marketplace add ${dir}`, `codex plugin add ${self.pluginEntryName}@${self.marketplaceName}`]
-    : [];
-
-  return { skillsRoot, manifestGenerated, marketplaceGenerated, registered: self !== null, commands, reason };
-}
-
-/** Denied for codex: never generate anything, but surface the removal command if a marketplace entry exists. */
-function resolveCodexRemoval(dir: string): string[] {
-  const marketplacePath = path.join(dir, '.agents', 'plugins', 'marketplace.json');
-  if (!fs.existsSync(marketplacePath)) return [];
-  const self = parseCodexMarketplaceSelfEntry(marketplacePath);
-  return self ? [`codex plugin remove ${self.pluginEntryName}@${self.marketplaceName}`] : [];
+  return { skillsRoot, manifestGenerated, marketplaceGenerated, registerable: self !== null, reason };
 }
 
 function applyOptOut(exclude: string[], pluginName: string, dryRun: boolean): string[] {
@@ -472,8 +462,7 @@ function main(): void {
         skillsRoot: null,
         manifestGenerated: false,
         marketplaceGenerated: false,
-        registered: false,
-        commands: resolveCodexRemoval(dir),
+        registerable: false,
         reason: null,
       }
     : resolveCodexRegistration(dir, name, dryRun);
@@ -495,8 +484,7 @@ function main(): void {
     codexSkillsRoot: codexReg.skillsRoot,
     codexManifestGenerated: codexReg.manifestGenerated,
     codexMarketplaceGenerated: codexReg.marketplaceGenerated,
-    codexRegistered: codexReg.registered,
-    codexCommands: codexReg.commands,
+    codexRegisterable: codexReg.registerable,
     portableSkills,
     sessionStartHook: detectSessionStartHook(dir),
     hasAlwaysOnFile,
@@ -531,18 +519,15 @@ function main(): void {
   } else {
     console.log(`  Codex skills root: ${codexReg.skillsRoot}`);
     console.log(
-      `  Codex manifest:    ${codexReg.manifestGenerated ? 'generated' : 'present'}, marketplace: ${codexReg.marketplaceGenerated ? 'generated' : codexReg.registered ? 'present' : `MISSING SELF ENTRY (${codexReg.reason})`}`,
+      `  Codex manifest:    ${codexReg.manifestGenerated ? 'generated' : 'present'}, marketplace: ${codexReg.marketplaceGenerated ? 'generated' : codexReg.registerable ? 'present' : `MISSING SELF ENTRY (${codexReg.reason})`}`,
     );
+    console.log(`  Codex registers:   at container spawn, from /workspace/plugins (no host CLI involved)`);
   }
   console.log(`  portable skills:   ${portableSkills.length}${portableSkills.length ? ` (${portableSkills.join(', ')})` : ''}`);
   console.log(`  skills mirrored:   opencode +${opencodeCreated}`);
   console.log(`  always-on plugin:  ${classification.sessionStartHook ? 'yes (has SessionStart hook)' : 'no (skills-only)'}`);
   console.log(`  ruleset file:      ${hasAlwaysOnFile ? (alwaysOnIsStub ? 'present but EMPTY' : 'present') : 'absent'}`);
   if (optedOut.length) console.log(`  opted out:         ${optedOut.join(', ')}`);
-  if (codexReg.commands.length) {
-    console.log('\n  codex commands to run (not executed by this script):');
-    for (const cmd of codexReg.commands) console.log(`    ${cmd}`);
-  }
   console.log('\n  next steps:');
   if (needsRuleset) {
     console.log(`    1. Author ${path.join(dir, '.nanoclaw-always-on.md')} with the plugin's clean always-on`);
