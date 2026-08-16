@@ -17,18 +17,18 @@ Entered from the recorded scope in the operator's persistent memory
 Probe scripts run under the session scratchpad; no repository files written by them.
 Largest graph: 337,091 nodes / 142,144 indexed sources / 7.6 GB.
 
-| measurement | result |
-|---|---|
-| `count(*)` FTS, one common term | 48,405 ms |
-| `count(*)` FTS, OR of three terms | 25,494 ms |
-| same match set, `LIMIT 8`, warm | 0–1 ms |
-| `ORDER BY node_fts.node_id` + node join | 92,232 ms |
-| `ORDER BY rank` (bm25) | 737 ms cold |
-| `ORDER BY rank` + `relative_path LIKE 'workgroup/%'` | 132 ms cold / 118 ms warm |
-| cold canonical query across four workgroups | 197 / 761 / 449 / 593 ms |
-| readonly handle open | 0.2–4.3 ms |
-| total miss | 0–10 ms |
-| source prefixes (largest graph) | `agents/` 117,928 · `workgroup/` 18,734 · `conversations/` 5,522 |
+| measurement                                          | result                                                           |
+| ---------------------------------------------------- | ---------------------------------------------------------------- |
+| `count(*)` FTS, one common term                      | 48,405 ms                                                        |
+| `count(*)` FTS, OR of three terms                    | 25,494 ms                                                        |
+| same match set, `LIMIT 8`, warm                      | 0–1 ms                                                           |
+| `ORDER BY node_fts.node_id` + node join              | 92,232 ms                                                        |
+| `ORDER BY rank` (bm25)                               | 737 ms cold                                                      |
+| `ORDER BY rank` + `relative_path LIKE 'workgroup/%'` | 132 ms cold / 118 ms warm                                        |
+| cold canonical query across four workgroups          | 197 / 761 / 449 / 593 ms                                         |
+| readonly handle open                                 | 0.2–4.3 ms                                                       |
+| total miss                                           | 0–10 ms                                                          |
+| source prefixes (largest graph)                      | `agents/` 117,928 · `workgroup/` 18,734 · `conversations/` 5,522 |
 
 **Decisions forced by measurement**, each contradicting the recorded scope or the obvious
 implementation:
@@ -47,24 +47,24 @@ implementation:
 
 ### Cross-model review (plan stage)
 
-| field | value |
-|---|---|
-| stage | plan, on the raw proposed `plan.md` |
-| primary runtime / family | Claude Code / Anthropic (Opus 5) |
-| requested target | Codex CLI, `gpt-5.6-sol`, `model_reasoning_effort=high` |
-| command | `codex exec --ignore-user-config --model gpt-5.6-sol -c 'model_reasoning_effort="high"' --ephemeral --yolo` |
-| outcome | **`unauthenticated`** — `401 token_invalidated` on the default `CODEX_HOME`; retried once against the configured fallback `CODEX_HOME`, `401 token_expired`. Both ChatGPT OAuth credentials are dead. |
+| field                    | value                                                                                                                                                                                                 |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| stage                    | plan, on the raw proposed `plan.md`                                                                                                                                                                   |
+| primary runtime / family | Claude Code / Anthropic (Opus 5)                                                                                                                                                                      |
+| requested target         | Codex CLI, `gpt-5.6-sol`, `model_reasoning_effort=high`                                                                                                                                               |
+| command                  | `codex exec --ignore-user-config --model gpt-5.6-sol -c 'model_reasoning_effort="high"' --ephemeral --yolo`                                                                                           |
+| outcome                  | **`unauthenticated`** — `401 token_invalidated` on the default `CODEX_HOME`; retried once against the configured fallback `CODEX_HOME`, `401 token_expired`. Both ChatGPT OAuth credentials are dead. |
 
 **Substitution** (the one permitted by the cross-model contract, different model family):
 
-| field | value |
-|---|---|
-| target runtime | OpenCode CLI 1.18.9 |
-| effective model | `grok-4.5` (xAI) — different model family from both Claude and GPT |
-| command | `opencode run "$(cat <prompt>)"` |
-| timeout | 600,000 ms (the Bash tool caps at 600 s; the contract specifies 3,600,000 ms — **deviation recorded**, review completed in well under the cap) |
-| outcome | `completed` |
-| raw verdict | `must_fix` — 4 MUST-FIX, 1 SHOULD-FIX |
+| field           | value                                                                                                                                          |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| target runtime  | OpenCode CLI 1.18.9                                                                                                                            |
+| effective model | `grok-4.5` (xAI) — different model family from both Claude and GPT                                                                             |
+| command         | `opencode run "$(cat <prompt>)"`                                                                                                               |
+| timeout         | 600,000 ms (the Bash tool caps at 600 s; the contract specifies 3,600,000 ms — **deviation recorded**, review completed in well under the cap) |
+| outcome         | `completed`                                                                                                                                    |
+| raw verdict     | `must_fix` — 4 MUST-FIX, 1 SHOULD-FIX                                                                                                          |
 
 Coverage is **not** degraded — an other-family reviewer succeeded — but it is not the
 configured primary reviewer. Effort/model were not self-reported by the target and were
@@ -72,13 +72,13 @@ not asked for; the model line above is what the CLI printed.
 
 ### Findings — verified individually against source
 
-| # | Reviewer claim | Lead verdict | Evidence traced |
-|---|---|---|---|
-| 1 | Eviction order lets the 600-char scent evict an archive excerpt, violating the plan's own invariant 5; AC12 would still pass | **ACCEPTED (MUST-FIX)** | `pre-turn-context.ts:1163-1171` — the first eviction loop drops non-exact-link conversation excerpts. Shedding the scent *after* them means a turn that previously fit can lose a real archive excerpt while keeping advisory pointers. My draft §5.7 was wrong. |
-| 2 | The pointer cache reintroduces exactly the index-promote staleness §4.6 rejects for handles; AC7 and AC8 are mutually unsatisfiable | **ACCEPTED (MUST-FIX)** | AC7 required a post-rename call to return the new graph; AC8 required a repeated identical query to skip the open. With a terms-keyed cache both cannot hold. Confirmed against the promote path at `daemon.ts:1245-1247`, `:2032-2038`. |
-| 3 | The sync FTS read stalls the whole host, and a 1,000 ms breaker above the ~800 ms measured cold cost never fires | **ACCEPTED (MUST-FIX)** | `session-manager.ts:813` calls `buildRecallRow` synchronously inside `writeSessionMessage` with the inbound DB open, in the host's single Node process (`CLAUDE.md`: "The host is a single Node process"). So the stall is host-wide, not per-turn. The threshold criticism is arithmetic and correct: 1,000 > 800 means the breaker is dead code on the measured envelope, and 3 strikes permits 3 full stalls first. |
-| 4 | No AC covers container rendering; `RECALL_EVIDENCE_KEYS` is a closed list, so the host could ship a field the agent never sees | **ACCEPTED (MUST-FIX), and worse than stated** | `formatter.ts:528` — the constant is exactly `['memoryEvidence','conversationEvidence','notices']`, and `:567` requires `presentEvidenceKeys.length === RECALL_EVIDENCE_KEYS.length`. The reviewer noted the silent-drop risk. It verified worse: *adding* the key makes every pre-existing recall row — including rows already written into session inbound DBs — fail `isComplete` and render as `"malformed structured payload / No capability state was accepted from this row"` (`:569-577`), dropping trusted capability delivery for in-flight rows. |
-| 5 | Cache + breaker are complexity compensating for main-thread sync (SHOULD-FIX) | **ACCEPTED** | Correct, and resolved as a consequence of #2 and #3 rather than separately: the corrected design deletes the cache, the strike counter, and the disable state, replacing all three with one measured boolean per workgroup. |
+| #   | Reviewer claim                                                                                                                      | Lead verdict                                   | Evidence traced                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Eviction order lets the 600-char scent evict an archive excerpt, violating the plan's own invariant 5; AC12 would still pass        | **ACCEPTED (MUST-FIX)**                        | `pre-turn-context.ts:1163-1171` — the first eviction loop drops non-exact-link conversation excerpts. Shedding the scent _after_ them means a turn that previously fit can lose a real archive excerpt while keeping advisory pointers. My draft §5.7 was wrong.                                                                                                                                                                                                                                                                                            |
+| 2   | The pointer cache reintroduces exactly the index-promote staleness §4.6 rejects for handles; AC7 and AC8 are mutually unsatisfiable | **ACCEPTED (MUST-FIX)**                        | AC7 required a post-rename call to return the new graph; AC8 required a repeated identical query to skip the open. With a terms-keyed cache both cannot hold. Confirmed against the promote path at `daemon.ts:1245-1247`, `:2032-2038`.                                                                                                                                                                                                                                                                                                                    |
+| 3   | The sync FTS read stalls the whole host, and a 1,000 ms breaker above the ~800 ms measured cold cost never fires                    | **ACCEPTED (MUST-FIX)**                        | `session-manager.ts:813` calls `buildRecallRow` synchronously inside `writeSessionMessage` with the inbound DB open, in the host's single Node process (`CLAUDE.md`: "The host is a single Node process"). So the stall is host-wide, not per-turn. The threshold criticism is arithmetic and correct: 1,000 > 800 means the breaker is dead code on the measured envelope, and 3 strikes permits 3 full stalls first.                                                                                                                                      |
+| 4   | No AC covers container rendering; `RECALL_EVIDENCE_KEYS` is a closed list, so the host could ship a field the agent never sees      | **ACCEPTED (MUST-FIX), and worse than stated** | `formatter.ts:528` — the constant is exactly `['memoryEvidence','conversationEvidence','notices']`, and `:567` requires `presentEvidenceKeys.length === RECALL_EVIDENCE_KEYS.length`. The reviewer noted the silent-drop risk. It verified worse: _adding_ the key makes every pre-existing recall row — including rows already written into session inbound DBs — fail `isComplete` and render as `"malformed structured payload / No capability state was accepted from this row"` (`:569-577`), dropping trusted capability delivery for in-flight rows. |
+| 5   | Cache + breaker are complexity compensating for main-thread sync (SHOULD-FIX)                                                       | **ACCEPTED**                                   | Correct, and resolved as a consequence of #2 and #3 rather than separately: the corrected design deletes the cache, the strike counter, and the disable state, replacing all three with one measured boolean per workgroup.                                                                                                                                                                                                                                                                                                                                 |
 
 No findings rejected. All five traced to a named file and line before acceptance.
 
@@ -138,13 +138,13 @@ correction after the fact.
 
 ### Cross-model review — revision 2
 
-| field | value |
-|---|---|
-| requested target | Codex `gpt-5.6-sol` — still `unauthenticated`, not retried |
-| target used | OpenCode CLI 1.18.9, **`opencode-go/grok-4.5`**, other-family |
-| command | `opencode run -m opencode-go/grok-4.5 "$(cat <prompt>)"` |
-| outcome | `completed` |
-| raw verdict | `must_fix` — 2 MUST-FIX, 2 SHOULD-FIX |
+| field            | value                                                         |
+| ---------------- | ------------------------------------------------------------- |
+| requested target | Codex `gpt-5.6-sol` — still `unauthenticated`, not retried    |
+| target used      | OpenCode CLI 1.18.9, **`opencode-go/grok-4.5`**, other-family |
+| command          | `opencode run -m opencode-go/grok-4.5 "$(cat <prompt>)"`      |
+| outcome          | `completed`                                                   |
+| raw verdict      | `must_fix` — 2 MUST-FIX, 2 SHOULD-FIX                         |
 
 Two transport notes worth keeping. A first foreground attempt hit the **Bash tool's
 600 s cap**, which is below the contract's 3,600 s ceiling — not a `timeout` under the
@@ -157,12 +157,12 @@ It is additive only — same family as the lead, so it adds a lens and **not** d
 
 ### Findings — all verified against source before acceptance
 
-| # | Claim | Verdict | Evidence traced |
-|---|---|---|---|
-| 1 | `domain_knowledge` must join **both** reason enums, not just the capture subset | **ACCEPTED (MUST-FIX)** | `curator-contract.ts:52-65` is the 12-value parent; `:73` is the subset declared `satisfies readonly CuratorReasonCode[]`; the provider JSON schema binds to the parent at `:134`; `parseModelDecision` re-validates against the parent at `:230`. Capture-only would not compile, and if forced would throw `curator reasonCode is invalid` on every domain decision — a feature capturing nothing. My draft was wrong. |
-| 2 | The new marker regex group shifts capture indices and breaks the parser | **ACCEPTED (MUST-FIX)** | `parseGeneratedMemoryFacts` (`:157-165`) reads `match[1]/[2]/[3]` positionally. A capturing `reason` group after `id=` moves evidence to `[3]` and captured to `[4]`, so the evidence list reaches `Date.parse` and every reason-bearing fact throws `has invalid timestamp`. Fails closed, but fails every write. **Took the smaller fix than the reviewer proposed**: make the group non-capturing so indices are untouched and the consumer needs no change, rather than reindexing the consumer and extending `GeneratedMemoryFact`. Nothing in the write path needs the reason — only the audit does. |
-| 3 | The "required enum protects against the premise-ledger failure" argument is false | **ACCEPTED (SHOULD-FIX)** | Correct, and it was my reasoning. The enum constrains how a decision is *labelled*, never whether the model captures. Noop → nothing written, nothing counted. Written as `durable_fact` → counted under that code. Either way the domain share stays flat while every string-level test passes. Claim withdrawn from P0.7 rather than softened; an offline fixture eval added as non-blocking evidence. |
-| 4 | Stale `§5.4 (breaker) and §5.5 (cache)` cross-reference survives from revision 1 | **ACCEPTED (SHOULD-FIX)** | Confirmed at plan line 333. Revision 1's correction deleted the cache and replaced the breaker with warm-gating; the stale pointer invites reintroducing a rejected design during build. |
+| #   | Claim                                                                             | Verdict                   | Evidence traced                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| --- | --------------------------------------------------------------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | `domain_knowledge` must join **both** reason enums, not just the capture subset   | **ACCEPTED (MUST-FIX)**   | `curator-contract.ts:52-65` is the 12-value parent; `:73` is the subset declared `satisfies readonly CuratorReasonCode[]`; the provider JSON schema binds to the parent at `:134`; `parseModelDecision` re-validates against the parent at `:230`. Capture-only would not compile, and if forced would throw `curator reasonCode is invalid` on every domain decision — a feature capturing nothing. My draft was wrong.                                                                                                                                                                                   |
+| 2   | The new marker regex group shifts capture indices and breaks the parser           | **ACCEPTED (MUST-FIX)**   | `parseGeneratedMemoryFacts` (`:157-165`) reads `match[1]/[2]/[3]` positionally. A capturing `reason` group after `id=` moves evidence to `[3]` and captured to `[4]`, so the evidence list reaches `Date.parse` and every reason-bearing fact throws `has invalid timestamp`. Fails closed, but fails every write. **Took the smaller fix than the reviewer proposed**: make the group non-capturing so indices are untouched and the consumer needs no change, rather than reindexing the consumer and extending `GeneratedMemoryFact`. Nothing in the write path needs the reason — only the audit does. |
+| 3   | The "required enum protects against the premise-ledger failure" argument is false | **ACCEPTED (SHOULD-FIX)** | Correct, and it was my reasoning. The enum constrains how a decision is _labelled_, never whether the model captures. Noop → nothing written, nothing counted. Written as `durable_fact` → counted under that code. Either way the domain share stays flat while every string-level test passes. Claim withdrawn from P0.7 rather than softened; an offline fixture eval added as non-blocking evidence.                                                                                                                                                                                                   |
+| 4   | Stale `§5.4 (breaker) and §5.5 (cache)` cross-reference survives from revision 1  | **ACCEPTED (SHOULD-FIX)** | Confirmed at plan line 333. Revision 1's correction deleted the cache and replaced the breaker with warm-gating; the stale pointer invites reintroducing a rejected design during build.                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 No findings rejected.
 
@@ -193,11 +193,11 @@ wrong and the rest of pillar 0 should not be built.
 
 ### Second reviewer — Fable (same-family consult, operator-requested)
 
-| field | value |
-|---|---|
-| target | Claude Fable 5, in-process subagent with source access |
-| status | `completed` after two explicit requests (it idled twice before delivering) |
-| verdict | **SOUND WITH CHANGES** |
+| field    | value                                                                                                                                                                       |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| target   | Claude Fable 5, in-process subagent with source access                                                                                                                      |
+| status   | `completed` after two explicit requests (it idled twice before delivering)                                                                                                  |
+| verdict  | **SOUND WITH CHANGES**                                                                                                                                                      |
 | coverage | **Additive only.** Same model family as the lead, so under the cross-model contract it adds a lens and **not** diversity. The other-family requirement was met by grok-4.5. |
 
 It verified all six briefed questions against source, checked both marker regexes
@@ -205,23 +205,23 @@ character by character, and confirmed via grep that only two parsers exist
 (`curator-contract.ts:273` is a substring sniff; `CAPTURED_AT_PATTERN` is a loose search).
 Findings accepted after independent verification:
 
-| # | Claim | Verdict | Evidence traced |
-|---|---|---|---|
-| 5 | **P0-AC6 is unsatisfiable as written** | **ACCEPTED (MUST-FIX)** | The delivered excerpt text *includes* the marker: `toExcerpt` calls `boundedFactLine(candidate.content, …)` (`pre-turn-context.ts:962`) and `candidate.content` is the full line, marker attached, by deliberate design (`:735-744`). Two stores differing only by `reason=` therefore can never produce byte-identical excerpts. The guarded invariant is true — ranking scores the marker-stripped `searchable` (`:915`) — but the assertion would have failed a *correct* implementation, or been silently reinterpreted at build time. This was the one AC guarding a durable-store invariant, and neither the lead nor the other-family reviewer caught it. |
-| 6 | `reason=` is per-**decision**, not per-fact | **ACCEPTED (SHOULD-FIX)** | `CuratorModelDecision` carries one `reasonCode`; the render loop (`curator-contract.ts:358-366`) stamps it on every fact in the batch. Multi-fact decisions are normal. Countability was the stated justification for the marker change, so the limit is now stated with it: the count is directional, not exact. |
-| 7 | The enum-argument correction needs an (a)/(b) split | **ACCEPTED (SHOULD-FIX)** | Sharper than the other reviewer's version. Case (a) noop = real failure. Case (b) captured-but-mislabelled = **the intervention succeeded and only the counter missed it**, since recall does not read the reason. So the share is a *lower bound on domain capture*, not the outcome. P0.7 rewritten accordingly, and day-7 now requires spot-reading facts, not just counting. |
-| 8 | Prompt-line citations off by one | **ACCEPTED** | Verified: `:415` is `Default to noop`, `:416` is the `Remember only …` whitelist, `:417` the roles line. Plan said 417/416. |
-| 9 | "Only one placement satisfies both" is overstated | **ACCEPTED** | Before `id=` also satisfies both regexes. Chosen placement unchanged; the claim was softened. |
-| — | Capture-group renumbering hazard | Already fixed in the first batch via the non-capturing group; Fable reached it independently. |
+| #   | Claim                                               | Verdict                                                                                       | Evidence traced                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| --- | --------------------------------------------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 5   | **P0-AC6 is unsatisfiable as written**              | **ACCEPTED (MUST-FIX)**                                                                       | The delivered excerpt text _includes_ the marker: `toExcerpt` calls `boundedFactLine(candidate.content, …)` (`pre-turn-context.ts:962`) and `candidate.content` is the full line, marker attached, by deliberate design (`:735-744`). Two stores differing only by `reason=` therefore can never produce byte-identical excerpts. The guarded invariant is true — ranking scores the marker-stripped `searchable` (`:915`) — but the assertion would have failed a _correct_ implementation, or been silently reinterpreted at build time. This was the one AC guarding a durable-store invariant, and neither the lead nor the other-family reviewer caught it. |
+| 6   | `reason=` is per-**decision**, not per-fact         | **ACCEPTED (SHOULD-FIX)**                                                                     | `CuratorModelDecision` carries one `reasonCode`; the render loop (`curator-contract.ts:358-366`) stamps it on every fact in the batch. Multi-fact decisions are normal. Countability was the stated justification for the marker change, so the limit is now stated with it: the count is directional, not exact.                                                                                                                                                                                                                                                                                                                                                |
+| 7   | The enum-argument correction needs an (a)/(b) split | **ACCEPTED (SHOULD-FIX)**                                                                     | Sharper than the other reviewer's version. Case (a) noop = real failure. Case (b) captured-but-mislabelled = **the intervention succeeded and only the counter missed it**, since recall does not read the reason. So the share is a _lower bound on domain capture_, not the outcome. P0.7 rewritten accordingly, and day-7 now requires spot-reading facts, not just counting.                                                                                                                                                                                                                                                                                 |
+| 8   | Prompt-line citations off by one                    | **ACCEPTED**                                                                                  | Verified: `:415` is `Default to noop`, `:416` is the `Remember only …` whitelist, `:417` the roles line. Plan said 417/416.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| 9   | "Only one placement satisfies both" is overstated   | **ACCEPTED**                                                                                  | Before `id=` also satisfies both regexes. Chosen placement unchanged; the claim was softened.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| —   | Capture-group renumbering hazard                    | Already fixed in the first batch via the non-capturing group; Fable reached it independently. |
 
 **The most valuable thing it produced was a pointer it explicitly refused to vouch for.**
-It suggested `scripts/run-memory-provider-behavior-eval.ts` *might* be the shape needed and
+It suggested `scripts/run-memory-provider-behavior-eval.ts` _might_ be the shape needed and
 said plainly it had not read the file. Following it up found a better one:
 **`scripts/run-memory-curator-model-eval.ts` already exists** and already has
 `CuratorEvalCase { transcript, expectedAction: 'capture'|'noop', acceptedReasons,
 mustInclude, mustExclude }` over a JSON fixture with `baseline`/`hard` corpora.
 
-Both reviewers independently proposed *building* an offline eval. The correct answer was
+Both reviewers independently proposed _building_ an offline eval. The correct answer was
 that the harness exists and the work is fixture data plus a `curatorCorpusSha256` update.
 That converted P0.5 from "non-blocking evidence" into **P0.6 step 4, a real pre-deploy
 gate**: the new prompt must flip at least one known-domain episode from noop to capture,
@@ -267,7 +267,7 @@ reviewer's findings because it was slower.
 - Branch `main`. `src/container-runner.ts` carries **another session's uncommitted work**;
   every operation was scoped to this change's own paths and **nothing was committed**.
 - **Approval interpretation, recorded because it was inferred, not stated.** The operator
-  never wrote an explicit approval — their last statement on the plan was that it was *not*
+  never wrote an explicit approval — their last statement on the plan was that it was _not_
   yet approved — but then invoked `/team-auto` against this feature, which presupposes an
   approved plan. Treated the invocation as the approval act. It commits to the plan's two
   standing defaults: scope is pillars 0+1 with 2–4 sequenced, and no numeric success gate
@@ -288,28 +288,28 @@ fail for the right reason (`reasonCode` absent from the report) before implement
   `MemoryCuratorRunReport`, populated from the episode decision; deliberately absent on the
   maintenance path, which makes no model decision.
 
-Verified before writing that the field would actually be *countable*:
+Verified before writing that the field would actually be _countable_:
 `runMemoryCurationInBackground` (`curator-worker.ts:600-612`) spreads the report into
 `log.info('memory-curator: episode complete', { ...report })`, so the new field reaches
 `logs/nanoclaw.log` with no logging change. Without that spread the field would have been
 countable in name only.
 
-| check | result |
-|---|---|
-| `pnpm exec vitest run src/modules/memory/curator-worker.test.ts -t countable` (pre-implementation) | **failed as expected** — field absent |
-| `pnpm exec vitest run src/modules/memory/` | 83 passed |
-| `pnpm test` | **239 files, 3373 passed**, 1 skipped, 1 todo |
-| `pnpm run build` | clean |
-| diff | 2 files, 34 lines |
+| check                                                                                              | result                                        |
+| -------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `pnpm exec vitest run src/modules/memory/curator-worker.test.ts -t countable` (pre-implementation) | **failed as expected** — field absent         |
+| `pnpm exec vitest run src/modules/memory/`                                                         | 83 passed                                     |
+| `pnpm test`                                                                                        | **239 files, 3373 passed**, 1 skipped, 1 todo |
+| `pnpm run build`                                                                                   | clean                                         |
+| diff                                                                                               | 2 files, 34 lines                             |
 
 ### Review — DID NOT COMPLETE. This is the blocker.
 
-| field | value |
-|---|---|
-| requested target | Codex `gpt-5.6-sol` — `unauthenticated` since 2026-08-08, both credentials dead |
-| substitute | OpenCode `opencode-go/grok-4.5`, other-family, model pinned |
-| outcome | **killed at ~35 min with zero bytes written** |
-| classification | **not `timeout`** — the contract's ceiling is 60 min and this ended before it. Closest to `empty-output`; the kill cause is not known to this session. |
+| field            | value                                                                                                                                                  |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| requested target | Codex `gpt-5.6-sol` — `unauthenticated` since 2026-08-08, both credentials dead                                                                        |
+| substitute       | OpenCode `opencode-go/grok-4.5`, other-family, model pinned                                                                                            |
+| outcome          | **killed at ~35 min with zero bytes written**                                                                                                          |
+| classification   | **not `timeout`** — the contract's ceiling is 60 min and this ended before it. Closest to `empty-output`; the kill cause is not known to this session. |
 
 **Coverage: `degraded`.** The mandatory cross-model implementation review produced no
 verdict, so this change has **test evidence but no independent review**. Per the shared
@@ -339,7 +339,7 @@ which is the operator's call).
    the step-0 readout needs days. Worth noting the early shape anyway: if
    `code_derived` stays at zero while `insufficient_evidence` dominates, the suppression
    story may be wrong in an unexpected direction — the curator may be discarding domain
-   content as *unevidenced* rather than as *code-recoverable*, which would redirect the
+   content as _unevidenced_ rather than as _code-recoverable_, which would redirect the
    pillar-0 prompt fix at a different line.
 
 ---
@@ -358,15 +358,15 @@ Builder: single cohesive builder (the lead, directly) — every stage shares
 
 ### Files changed
 
-| file | change |
-|---|---|
-| `src/modules/memory/graph-scent.ts` | new module: terms, bounded FTS query, warm-gating, degradation, sweep probe rotation. STOP_WORDS moved here (leaf) so the value dependency runs one way. |
-| `src/modules/memory/graph-scent.test.ts` | new — AC1–AC10 plus probe rotation and serialized-bound cases, on real seeded `WorkgroupGraphStore` fixtures (no SQLite mocking). |
-| `src/modules/memory/pre-turn-context.ts` | `'graph'` notice source, `graphScent?` field, `graphScentChars` bound, call site, **first** eviction step in `enforceFinalBound`; STOP_WORDS now imported. |
-| `src/modules/memory/pre-turn-context.test.ts` | AC11, AC12(a), AC12(b)+AC13 (baseline-vs-warm equality at the bound, with a fixture-reaches-the-bound guard assertion). |
-| `src/host-sweep.ts` | one probe call per sweep, round-robin, try/caught. |
-| `container/agent-runner/src/formatter.ts` | renders `graphScent` when present + advisory line; `RECALL_EVIDENCE_KEYS` untouched. |
-| `container/agent-runner/src/formatter.test.ts` | AC14 (failure-first) and AC15. |
+| file                                           | change                                                                                                                                                     |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/modules/memory/graph-scent.ts`            | new module: terms, bounded FTS query, warm-gating, degradation, sweep probe rotation. STOP_WORDS moved here (leaf) so the value dependency runs one way.   |
+| `src/modules/memory/graph-scent.test.ts`       | new — AC1–AC10 plus probe rotation and serialized-bound cases, on real seeded `WorkgroupGraphStore` fixtures (no SQLite mocking).                          |
+| `src/modules/memory/pre-turn-context.ts`       | `'graph'` notice source, `graphScent?` field, `graphScentChars` bound, call site, **first** eviction step in `enforceFinalBound`; STOP_WORDS now imported. |
+| `src/modules/memory/pre-turn-context.test.ts`  | AC11, AC12(a), AC12(b)+AC13 (baseline-vs-warm equality at the bound, with a fixture-reaches-the-bound guard assertion).                                    |
+| `src/host-sweep.ts`                            | one probe call per sweep, round-robin, try/caught.                                                                                                         |
+| `container/agent-runner/src/formatter.ts`      | renders `graphScent` when present + advisory line; `RECALL_EVIDENCE_KEYS` untouched.                                                                       |
+| `container/agent-runner/src/formatter.test.ts` | AC14 (failure-first) and AC15.                                                                                                                             |
 
 ### Failure-first evidence
 
@@ -409,15 +409,15 @@ which is the design — that cost lands on the batch timer, never on a turn.
 
 ### Verification (fresh runs, this session)
 
-| check | result |
-|---|---|
-| `pnpm exec vitest run src/modules/memory/` | 99 passed |
-| `pnpm test` (full host) | **246 files, 3,459 passed**, 1 skipped, 1 todo |
-| `pnpm run build` | clean |
-| `bun test src/formatter.test.ts` | 66 passed |
-| `bun run typecheck` (container tsconfig) | clean |
-| full `bun test` (container) | 4 failures in `task-script.test.ts` — the recorded parallel-run DB race; the file passes 4/4 isolated and is untouched by this change |
-| step 6 live gate | PASS (above) |
+| check                                      | result                                                                                                                                |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm exec vitest run src/modules/memory/` | 99 passed                                                                                                                             |
+| `pnpm test` (full host)                    | **246 files, 3,459 passed**, 1 skipped, 1 todo                                                                                        |
+| `pnpm run build`                           | clean                                                                                                                                 |
+| `bun test src/formatter.test.ts`           | 66 passed                                                                                                                             |
+| `bun run typecheck` (container tsconfig)   | clean                                                                                                                                 |
+| full `bun test` (container)                | 4 failures in `task-script.test.ts` — the recorded parallel-run DB race; the file passes 4/4 isolated and is untouched by this change |
+| step 6 live gate                           | PASS (above)                                                                                                                          |
 
 ### Edge cases checked beyond the happy path
 
@@ -441,13 +441,13 @@ question from the step-0 attempt.
 
 ### Transport
 
-| field | value |
-|---|---|
-| primary | Claude Code / Anthropic (lead) |
-| reviewer | **Codex CLI, `gpt-5.6-sol`, `model_reasoning_effort=high`** — the configured other-family primary, re-authenticated by the operator |
-| command | contract transport + `< /dev/null` |
-| outcome | `completed` |
-| raw verdict | **`must_fix` — 3 MUST-FIX, 2 SHOULD-FIX** |
+| field       | value                                                                                                                               |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| primary     | Claude Code / Anthropic (lead)                                                                                                      |
+| reviewer    | **Codex CLI, `gpt-5.6-sol`, `model_reasoning_effort=high`** — the configured other-family primary, re-authenticated by the operator |
+| command     | contract transport + `< /dev/null`                                                                                                  |
+| outcome     | `completed`                                                                                                                         |
+| raw verdict | **`must_fix` — 3 MUST-FIX, 2 SHOULD-FIX**                                                                                           |
 
 Two transport incidents, recorded so they stop recurring: (1) the first launch hung for
 54 minutes on an open stdin — the documented `codex exec` gotcha (`</dev/null`), known in
@@ -457,13 +457,13 @@ closed, no self-matching pkill) completed normally.
 
 ### Findings — all five verified against source and ACCEPTED
 
-| # | Finding | Verification |
-|---|---|---|
-| 1 | **(MUST-FIX)** Warm mark keyed by workgroup only: survives an index promote (authorizing a query against the freshly promoted cold graph) and survives query failures (retrying a failing graph every turn). AC7 as materialized *required* the unsafe post-promote path. | Confirmed — `WARM` was a `Set<string>`; nothing tied the mark to the probed file. Fixed: marks are `{ino, mtimeMs}` captured **after** the probe query (a racing promote cannot inherit the old timing); every read revalidates and any mismatch or failure unmarks. AC7 rewritten to demand cold-refusal-then-reprobe; AC7b added for failure unmarking. |
-| 2 | **(MUST-FIX)** Graph notices survive the excerpt-eviction loops: a ~140-byte cold/no-match notice could evict a 900-char archive excerpt, violating invariant 5 structurally. | Confirmed against `enforceFinalBound` — only the field was shed. Fixed: the shed-first step removes `graphScent` AND all `source:'graph'` notices. AC13b added (over-bound + cold graph → zero graph notices, counts equal a no-graph baseline). |
-| 3 | **(SHOULD-FIX)** Term validation ran before applicability, so a short query on a graph-less workgroup emitted `no-match` — recreating the notice spam the recorded deviation exists to prevent. | Confirmed. Fixed: existence check first; no graph → silent for any input. AC18 added. |
-| 4 | **(MUST-FIX)** The 600-char bound was not absolute: the trim loop stopped at one pointer, so a single pathological path escaped over-bound. | Confirmed. Fixed: trim to zero; zero pointers → `null` + `no-match`. AC17 added with a single-oversized-pointer fixture. |
-| 5 | **(SHOULD-FIX)** Three ACs materialized weaker than specified: nothing exercised the MATCH expression (restoring the failed `*` prefix would pass silently); AC4 didn't assert which duplicate survived; AC12 lacked the attach assertion and the true tip-over fixture. | Confirmed on all three. Fixed: AC16 (morphological-variant document must NOT match — flips if prefix returns), AC4 asserts the higher-ranked path, AC12 asserts attach + no bound notice, AC12b lands a measured two-channel fixture inside the `(finalChars−600, finalChars]` window with guard assertions. |
+| #   | Finding                                                                                                                                                                                                                                                                   | Verification                                                                                                                                                                                                                                                                                                                                              |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **(MUST-FIX)** Warm mark keyed by workgroup only: survives an index promote (authorizing a query against the freshly promoted cold graph) and survives query failures (retrying a failing graph every turn). AC7 as materialized _required_ the unsafe post-promote path. | Confirmed — `WARM` was a `Set<string>`; nothing tied the mark to the probed file. Fixed: marks are `{ino, mtimeMs}` captured **after** the probe query (a racing promote cannot inherit the old timing); every read revalidates and any mismatch or failure unmarks. AC7 rewritten to demand cold-refusal-then-reprobe; AC7b added for failure unmarking. |
+| 2   | **(MUST-FIX)** Graph notices survive the excerpt-eviction loops: a ~140-byte cold/no-match notice could evict a 900-char archive excerpt, violating invariant 5 structurally.                                                                                             | Confirmed against `enforceFinalBound` — only the field was shed. Fixed: the shed-first step removes `graphScent` AND all `source:'graph'` notices. AC13b added (over-bound + cold graph → zero graph notices, counts equal a no-graph baseline).                                                                                                          |
+| 3   | **(SHOULD-FIX)** Term validation ran before applicability, so a short query on a graph-less workgroup emitted `no-match` — recreating the notice spam the recorded deviation exists to prevent.                                                                           | Confirmed. Fixed: existence check first; no graph → silent for any input. AC18 added.                                                                                                                                                                                                                                                                     |
+| 4   | **(MUST-FIX)** The 600-char bound was not absolute: the trim loop stopped at one pointer, so a single pathological path escaped over-bound.                                                                                                                               | Confirmed. Fixed: trim to zero; zero pointers → `null` + `no-match`. AC17 added with a single-oversized-pointer fixture.                                                                                                                                                                                                                                  |
+| 5   | **(SHOULD-FIX)** Three ACs materialized weaker than specified: nothing exercised the MATCH expression (restoring the failed `*` prefix would pass silently); AC4 didn't assert which duplicate survived; AC12 lacked the attach assertion and the true tip-over fixture.  | Confirmed on all three. Fixed: AC16 (morphological-variant document must NOT match — flips if prefix returns), AC4 asserts the higher-ranked path, AC12 asserts attach + no bound notice, AC12b lands a measured two-channel fixture inside the `(finalChars−600, finalChars]` window with guard assertions.                                              |
 
 No findings rejected. Finding 1 is the standout: the reviewer caught that my own AC
 enshrined the unsafe behavior as the expected result — a test asserting the bug.
@@ -475,13 +475,13 @@ order), `pre-turn-context.ts` (lane-wide shed), tests (AC7 rewrite; AC7b, AC12
 strengthened, AC12b, AC13b, AC16, AC17, AC18 added; AC4 sharpened), `plan.md` AC table
 and §5.4/§5.7 updated first per the contract.
 
-| check (fresh, post-correction) | result |
-|---|---|
-| `graph-scent.test.ts` | 17 passed |
-| `pre-turn-context.test.ts` | 39 passed |
-| `pnpm test` | **246 files, 3,446 passed**, 1 skipped, 1 todo (count moved −13 vs the build run from ANOTHER session's uncommitted test edits in the shared tree; all green) |
-| `pnpm run build` | clean |
-| `bun test src/formatter.test.ts` + container typecheck | 65 passed / clean |
+| check (fresh, post-correction)                         | result                                                                                                                                                        |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `graph-scent.test.ts`                                  | 17 passed                                                                                                                                                     |
+| `pre-turn-context.test.ts`                             | 39 passed                                                                                                                                                     |
+| `pnpm test`                                            | **246 files, 3,446 passed**, 1 skipped, 1 todo (count moved −13 vs the build run from ANOTHER session's uncommitted test edits in the shared tree; all green) |
+| `pnpm run build`                                       | clean                                                                                                                                                         |
+| `bun test src/formatter.test.ts` + container typecheck | 65 passed / clean                                                                                                                                             |
 
 ### Step-0 counter (in passing)
 
@@ -568,11 +568,11 @@ eviction.
 
 ### Verification
 
-| check | result |
-|---|---|
-| `pre-turn-context.test.ts` | 44 passed (B-AC1..4 + 4 seam tests; B-AC1 failed pre-fix as required) |
-| `graph-scent.test.ts` | 17 passed |
-| memory module | 61 passed |
+| check                               | result                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pre-turn-context.test.ts`          | 44 passed (B-AC1..4 + 4 seam tests; B-AC1 failed pre-fix as required)                                                                                                                                                                                                                                                                                                                                      |
+| `graph-scent.test.ts`               | 17 passed                                                                                                                                                                                                                                                                                                                                                                                                  |
+| memory module                       | 61 passed                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `pnpm test` full / `pnpm run build` | **BLOCKED by another session's in-flight edits**, not this change: uncommitted `session-manager.ts/.test.ts` (+119 lines, UNIQUE-constraint bug in their new test), `repo_fence_epoch` column referenced by their session-db change without its migration in fixtures, and a tsc error in their `repo-publication-coordinator.test.ts`. My suites pass isolated; their files are untouched by this commit. |
 
 Deploy note: `dist/` cannot rebuild until the concurrent session's tsc error clears, so
@@ -580,11 +580,11 @@ this fix reaches production on their next green build + restart, not before.
 
 ### Cross-model review — section B
 
-| field | value |
-|---|---|
-| target | Codex `gpt-5.6-sol`, high effort, contract transport, `</dev/null` |
-| outcome | `completed` |
-| raw verdict | `must_fix` — 1 MUST-FIX, 0 SHOULD-FIX |
+| field       | value                                                              |
+| ----------- | ------------------------------------------------------------------ |
+| target      | Codex `gpt-5.6-sol`, high effort, contract transport, `</dev/null` |
+| outcome     | `completed`                                                        |
+| raw verdict | `must_fix` — 1 MUST-FIX, 0 SHOULD-FIX                              |
 
 **Finding (ACCEPTED): the limit-selection matrix was unprotected.** Verified against the
 materialized B-AC4: it asserted only "no-caps row ≤12k" and "caps field exists". The
@@ -625,11 +625,12 @@ recorded). Four tenant-neutral domain cases added to the eval fixture, hash re-p
 `buildCuratorEvaluationPrompt` is a hand-written PROXY prompt with its own category list
 — already drifted (it lacks the people/orgs category shipped 2026-08-06). Gating pillar 0
 on it would be theater. The gate therefore replays through the real `buildCuratorPrompt`
-+ `CURATOR_OUTPUT_SCHEMA` + the production model config (sonnet, medium), one case per
-call; the OLD prompt is reconstructed at runtime by stripping the domain line from the
-pure function's output — no source edits between phases, no race with concurrent
-sessions building `dist`. Harness drift logged for a separate fix; its env list also
-reads only 2 of the fleet's 4 OAuth slots (second latent gap, found below).
+
+- `CURATOR_OUTPUT_SCHEMA` + the production model config (sonnet, medium), one case per
+  call; the OLD prompt is reconstructed at runtime by stripping the domain line from the
+  pure function's output — no source edits between phases, no race with concurrent
+  sessions building `dist`. Harness drift logged for a separate fix; its env list also
+  reads only 2 of the fleet's 4 OAuth slots (second latent gap, found below).
 
 ### Finding: the replay gate cannot land — the OAuth account runs at 100% utilization
 
@@ -666,16 +667,27 @@ accepted follow-up is renaming the misleading log label, on the operator's word,
 Codex `gpt-5.6-sol`, contract transport, `</dev/null`: **`must_fix` — 2 MUST-FIX,
 2 SHOULD-FIX. All four verified and ACCEPTED; none rejected.**
 
-| # | Finding | Disposition |
-|---|---|---|
-| 1 | The expanded fixture's `recordedSelection` still pinned the July corpus hash, so `verifyCuratorEvalFixture` BLOCKS every run and 2 harness tests fail. **Verified: I would have shipped a red suite.** | Hash carried forward with a truthful provenance annotation (selection is 2026-07-26/16-case, carried over the 4-case domain addition, re-selection due with the post-deploy replay). Both tests green. |
-| 2 | The replay gate existed only as session scratch — a repository consumer could not reproduce P0.6 step 4, and the checked-in harness's proxy prompt cannot serve it. | `scripts/run-memory-domain-replay.ts` checked in: derives BOTH variants from the production `buildCuratorPrompt` (old = domain sentences stripped at runtime + whitelist wording reverted), production schema/model, agentic-lane credential policy, old-phase domain misses labeled as baseline rather than failures. |
-| 3 | The `Remember only …` whitelist — the operative filter per our own verdict — still excluded the domain, contradicting the later capture line. | Domain added to the whitelist sentence itself; explanatory line retained; AC7 still asserts carve-out verbatim. |
-| 4 | P0-AC6 could not fail under the realistic regression (ranking the full line instead of marker-stripped text) because no query term lived only in the marker. | AC6 gains a marker-only-vocabulary query that must select nothing. |
+| #   | Finding                                                                                                                                                                                                | Disposition                                                                                                                                                                                                                                                                                                            |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | The expanded fixture's `recordedSelection` still pinned the July corpus hash, so `verifyCuratorEvalFixture` BLOCKS every run and 2 harness tests fail. **Verified: I would have shipped a red suite.** | Hash carried forward with a truthful provenance annotation (selection is 2026-07-26/16-case, carried over the 4-case domain addition, re-selection due with the post-deploy replay). Both tests green.                                                                                                                 |
+| 2   | The replay gate existed only as session scratch — a repository consumer could not reproduce P0.6 step 4, and the checked-in harness's proxy prompt cannot serve it.                                    | `scripts/run-memory-domain-replay.ts` checked in: derives BOTH variants from the production `buildCuratorPrompt` (old = domain sentences stripped at runtime + whitelist wording reverted), production schema/model, agentic-lane credential policy, old-phase domain misses labeled as baseline rather than failures. |
+| 3   | The `Remember only …` whitelist — the operative filter per our own verdict — still excluded the domain, contradicting the later capture line.                                                          | Domain added to the whitelist sentence itself; explanatory line retained; AC7 still asserts carve-out verbatim.                                                                                                                                                                                                        |
+| 4   | P0-AC6 could not fail under the realistic regression (ranking the full line instead of marker-stripped text) because no query term lived only in the marker.                                           | AC6 gains a marker-only-vocabulary query that must select nothing.                                                                                                                                                                                                                                                     |
 
 Post-correction: memory module + both script suites **125 passed**, build clean. The
 `migrate-repo-store-*` failures in the wider suite belong to the concurrent session's
 domain and are untouched by this commit.
+
+### Post-ship observation 2026-08-16: agentic-lane saturation is continuous, not peaked
+
+The replay sentinel exhausted 40 probes over ~17 hours (25-min cadence, agentic lanes,
+single 64-token calls) without one landing — every sampled instant found the per-minute
+buckets drained, day and night alike. The production curator continues to succeed via
+persistent retry, so this changes nothing about capture health, but it upgrades the
+contention picture from "peak windows" to "steady state at current fleet load."
+Sentinel relaunched (60 probes, jittered cadence, two taps per probe to exclude
+sweep-phase alignment). If it exhausts again, the replay realistically needs an
+operator-created window rather than luck.
 
 ### Not done at this stage
 
