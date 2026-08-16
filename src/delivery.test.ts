@@ -1303,3 +1303,367 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     expect(getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Bounded periodic work — delivery sweep change-gate.
+// docs/specs/bounded-periodic-work/plan.md, acceptance criteria A1-A17.
+//
+// The sweep opened ~1,657 session DB pairs a minute to find the ~17 that had
+// changed. These cases pin the gate that stops that, and — more importantly —
+// pin the ways it must refuse to engage. Its failure mode would be a silently
+// undelivered message, so the behavioural cases (A14-A17) assert delivery,
+// not cache state.
+// ---------------------------------------------------------------------------
+import {
+  shouldSkipQuietDelivery,
+  quietDeliveryDeadlineMs,
+  runSweepDeliveryCycle,
+  sweepDeliverSession,
+  peekQuietDeliveryMark,
+  _resetQuietDeliveryCacheForTest,
+  _setQuietDeliveryMarkForTest,
+  QUIET_DELIVERY_BACKOFF_MS,
+} from './delivery.js';
+import { log } from './log.js';
+
+const STAT = { mtimeNs: 1_000n, size: 4096 };
+
+describe('shouldSkipQuietDelivery (A1-A5)', () => {
+  it('A1 skips a quiet session whose outbound.db is unchanged within the time bound', () => {
+    const armedAtMs = 1_000_000;
+    const mark = { ...STAT, armedAtMs };
+    expect(shouldSkipQuietDelivery(mark, STAT, armedAtMs + 60_000, 'sess-a')).toBe(true);
+  });
+
+  it('A2 polls when mtime moved', () => {
+    const armedAtMs = 1_000_000;
+    const mark = { ...STAT, armedAtMs };
+    expect(shouldSkipQuietDelivery(mark, { mtimeNs: 1_001n, size: 4096 }, armedAtMs + 60_000, 'sess-a')).toBe(false);
+  });
+
+  it('A3 polls when size moved', () => {
+    const armedAtMs = 1_000_000;
+    const mark = { ...STAT, armedAtMs };
+    expect(shouldSkipQuietDelivery(mark, { mtimeNs: 1_000n, size: 8192 }, armedAtMs + 60_000, 'sess-a')).toBe(false);
+  });
+
+  it('A4 polls once the time bound elapses even if nothing changed', () => {
+    const armedAtMs = 1_000_000;
+    const mark = { ...STAT, armedAtMs };
+    const past = armedAtMs + QUIET_DELIVERY_BACKOFF_MS + 1;
+    expect(shouldSkipQuietDelivery(mark, STAT, past, 'sess-a')).toBe(false);
+  });
+
+  it('A5 polls when there is no cache entry', () => {
+    expect(shouldSkipQuietDelivery(undefined, STAT, 1_000_000, 'sess-a')).toBe(false);
+  });
+});
+
+describe('quietDeliveryDeadlineMs (A13)', () => {
+  it('A13 staggers forced re-poll deadlines across sessions, within the backoff maximum', () => {
+    const armedAtMs = 1_000_000;
+    const deadlines = ['sess-a', 'sess-b', 'sess-c', 'sess-d', 'sess-e'].map((id) =>
+      quietDeliveryDeadlineMs(id, armedAtMs),
+    );
+    // Not all identical — otherwise the fleet expires in unison and the burst returns.
+    expect(new Set(deadlines).size).toBeGreaterThan(1);
+    for (const d of deadlines) {
+      expect(d).toBeGreaterThanOrEqual(armedAtMs + QUIET_DELIVERY_BACKOFF_MS / 2);
+      expect(d).toBeLessThanOrEqual(armedAtMs + QUIET_DELIVERY_BACKOFF_MS);
+    }
+    // Deterministic: survives a restart.
+    expect(quietDeliveryDeadlineMs('sess-a', armedAtMs)).toBe(deadlines[0]);
+  });
+});
+
+describe('delivery sweep gate — arming rules (A6-A12)', () => {
+  beforeEach(() => {
+    _resetQuietDeliveryCacheForTest();
+    seedAgentAndChannel();
+  });
+
+  it('A6 never arms for a session left holding an undelivered row', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-1');
+    setDeliveryAdapter({
+      async deliver() {
+        throw new Error('adapter down');
+      },
+    });
+
+    await sweepDeliverSession(session, Date.now());
+    expect(peekQuietDeliveryMark(session.id)).toBeUndefined();
+  });
+
+  it('A7 never arms for a session holding a future deliver_after row', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const db = new Database(outboundDbPath('ag-1', session.id));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content, deliver_after)
+       VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', ?, datetime('now', '+1 hour'))`,
+    ).run('out-future', JSON.stringify({ text: 'later' }));
+    db.close();
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-1';
+      },
+    });
+
+    await sweepDeliverSession(session, Date.now());
+    expect(peekQuietDeliveryMark(session.id)).toBeUndefined();
+  });
+
+  it('A8 arms only after a drain that leaves zero undelivered rows', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-1');
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-1';
+      },
+    });
+
+    await sweepDeliverSession(session, Date.now());
+    const mark = peekQuietDeliveryMark(session.id);
+    expect(mark).toBeDefined();
+    // The stored stat is the one taken BEFORE the open, so a commit landing
+    // during the drain is re-polled rather than swallowed.
+    const after = fs.statSync(outboundDbPath('ag-1', session.id), { bigint: true });
+    expect(mark!.mtimeNs).toBeLessThanOrEqual(after.mtimeNs);
+  });
+
+  it('A9 polls a session whose container is running regardless of cache', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-1';
+      },
+    });
+    await sweepDeliverSession(session, Date.now());
+    expect(peekQuietDeliveryMark(session.id)).toBeDefined();
+
+    insertOutbound('ag-1', session.id, 'out-live');
+    const calls: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, _k, content) {
+        calls.push(content);
+        return 'plat-2';
+      },
+    });
+    const running = { ...session, container_status: 'running' as const };
+    const outcome = await sweepDeliverSession(running, Date.now());
+    expect(outcome).not.toBe('skipped');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('A10 polls when a hot journal exists', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-1';
+      },
+    });
+    await sweepDeliverSession(session, Date.now());
+    expect(peekQuietDeliveryMark(session.id)).toBeDefined();
+
+    fs.writeFileSync(`${outboundDbPath('ag-1', session.id)}-journal`, '');
+    const outcome = await sweepDeliverSession(session, Date.now());
+    expect(outcome).not.toBe('skipped');
+  });
+
+  it('A11 does not lose a commit that lands after the pre-open stat', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-1');
+    setDeliveryAdapter({
+      async deliver() {
+        // A row committed by the container while this drain is in flight.
+        insertOutbound('ag-1', session.id, 'out-racing');
+        return 'plat-1';
+      },
+    });
+    await sweepDeliverSession(session, Date.now());
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, _k, content) {
+        delivered.push(content);
+        return 'plat-2';
+      },
+    });
+    const outcome = await sweepDeliverSession(session, Date.now());
+    expect(outcome).not.toBe('skipped');
+    expect(delivered).toHaveLength(1);
+  });
+
+  it('A18 one unreadable session does not abort the cycle for the rest', async () => {
+    // The drain now reads `delivered` for every swept session, not just ones
+    // with due rows, so a legacy/corrupt session DB has a wider blast radius
+    // than before. It must cost that session, not the whole sweep.
+    createMessagingGroup({
+      id: 'mg-2',
+      channel_type: 'telegram',
+      platform_id: 'telegram:456',
+      name: 'Second Chat',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    const { session: broken } = resolveSession('ag-1', 'mg-2', null, 'shared');
+    const { session: healthy } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', healthy.id, 'out-ok');
+    const inDb = new Database(inboundDbPath('ag-1', broken.id));
+    inDb.exec('DROP TABLE delivered');
+    inDb.close();
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, _k, content) {
+        delivered.push(content);
+        return 'plat-1';
+      },
+    });
+
+    const cycle = await runSweepDeliveryCycle(Date.now());
+    expect(delivered).toHaveLength(1);
+    expect(cycle.polled).toBeGreaterThanOrEqual(2);
+    expect(peekQuietDeliveryMark(broken.id)).toBeUndefined();
+  });
+
+  it('A12 records polled and skipped counts every cycle', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-1';
+      },
+    });
+    const spy = vi.spyOn(log, 'info');
+
+    const first = await runSweepDeliveryCycle(Date.now());
+    expect(first.polled).toBeGreaterThanOrEqual(1);
+    expect(first.skipped).toBe(0);
+
+    const second = await runSweepDeliveryCycle(Date.now());
+    expect(second.skipped).toBeGreaterThanOrEqual(1);
+
+    // Emitted every cycle — a fast, skip-heavy cycle must not be silent, or a
+    // stopped sweep looks identical to a healthy one.
+    const timing = spy.mock.calls.filter((c) => c[0] === 'Sweep delivery poll timing');
+    expect(timing.length).toBe(2);
+    expect(timing[1]![1]).toMatchObject({ skipped: expect.any(Number), polled: expect.any(Number) });
+    expect(session.id).toBeDefined();
+    spy.mockRestore();
+  });
+});
+
+describe('delivery sweep gate — delivery is never stranded (A14-A17)', () => {
+  beforeEach(() => {
+    _resetQuietDeliveryCacheForTest();
+    seedAgentAndChannel();
+  });
+
+  it('A14 delivers by the backoff deadline even when the change signal never moves', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    setDeliveryAdapter({
+      async deliver() {
+        return 'plat-1';
+      },
+    });
+    const armedAt = Date.now();
+    await sweepDeliverSession(session, armedAt);
+    const mark = peekQuietDeliveryMark(session.id)!;
+    expect(mark).toBeDefined();
+
+    // A row arrives, but the change signal does not move — the pathological
+    // case the time bound exists for. Forced via the test seam because arming
+    // legitimately requires a clean drain, and utimes cannot restore ns
+    // precision, so this state is unreachable through the public path.
+    const outPath = outboundDbPath('ag-1', session.id);
+    insertOutbound('ag-1', session.id, 'out-stuck');
+    const stale = fs.statSync(outPath, { bigint: true });
+    _setQuietDeliveryMarkForTest(session.id, {
+      mtimeNs: stale.mtimeNs,
+      size: Number(stale.size),
+      armedAtMs: mark.armedAtMs,
+    });
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t, _k, content) {
+        delivered.push(content);
+        return 'plat-2';
+      },
+    });
+
+    // Before the deadline the gate legitimately skips.
+    await sweepDeliverSession(session, armedAt + 1_000);
+    expect(delivered).toHaveLength(0);
+
+    // Past the jittered deadline it must poll regardless of the frozen signal.
+    await sweepDeliverSession(session, quietDeliveryDeadlineMs(session.id, mark.armedAtMs) + 1);
+    expect(delivered).toHaveLength(1);
+  });
+
+  it('A15 delivers a row written between the pre-open stat and arming, on the next sweep', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-1');
+    setDeliveryAdapter({
+      async deliver() {
+        insertOutbound('ag-1', session.id, 'out-racing');
+        return 'plat-1';
+      },
+    });
+    const t = Date.now();
+    await sweepDeliverSession(session, t);
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_c, _p, _t2, _k, content) {
+        delivered.push(content);
+        return 'plat-2';
+      },
+    });
+    // Same instant — not waiting out the backoff. The pre-open stat is what
+    // makes this re-poll.
+    await sweepDeliverSession(session, t);
+    expect(delivered).toHaveLength(1);
+  });
+
+  it('A16 does not arm while pollActive owns the session', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-1');
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    setDeliveryAdapter({
+      async deliver() {
+        await held;
+        return 'plat-1';
+      },
+    });
+
+    const active = deliverSessionMessages(session);
+    const swept = await sweepDeliverSession(session, Date.now());
+    expect(swept).toBe('busy');
+    expect(peekQuietDeliveryMark(session.id)).toBeUndefined();
+    release();
+    await active;
+  });
+
+  it('A17 does not arm when delivery failed this cycle, and retries next sweep', async () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-1');
+    let attempts = 0;
+    setDeliveryAdapter({
+      async deliver() {
+        attempts += 1;
+        if (attempts === 1) throw new Error('transient');
+        return 'plat-1';
+      },
+    });
+
+    const first = await sweepDeliverSession(session, Date.now());
+    expect(first).toBe('error');
+    expect(peekQuietDeliveryMark(session.id)).toBeUndefined();
+
+    await sweepDeliverSession(session, Date.now());
+    expect(attempts).toBe(2);
+  });
+});

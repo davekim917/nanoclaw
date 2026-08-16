@@ -8,6 +8,7 @@
  *   - Never writes to outbound.db — preserves single-writer-per-file invariant
  */
 import type Database from 'better-sqlite3';
+import fs from 'fs';
 
 import {
   bumpLastOutbound,
@@ -39,7 +40,7 @@ import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { archiveMessageAndScheduleMemoryCuration } from './message-archive.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
+import { clearOutbox, openInboundDb, openOutboundDb, outboundDbPath, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
 import { appendRunLog } from './modules/scheduling/run-log.js';
@@ -76,6 +77,97 @@ const MAX_DELIVERY_ATTEMPTS = 3;
 
 /** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
 const deliveryAttempts = new Map<string, number>();
+
+// ── Sweep change-gate (docs/specs/bounded-periodic-work/plan.md) ──
+//
+// The sweep opened both SQLite files for every session active in the last 7
+// days — ~1,657 per cycle — to find the ~17 that had actually changed. Session
+// DBs use journal_mode=DELETE, so every commit lands in the main file and moves
+// its mtime; a stat answers "could this session possibly have work?" for the
+// cost of one syscall. Same shape as `usageRollupMtimeCache` in host-sweep.
+//
+// Two rules keep the failure mode bounded, because a wrong skip here is a
+// silently undelivered chat message rather than an error:
+//
+//   1. Arm only after a drain proves the session has NOTHING outstanding —
+//      not even a future `deliver_after` row, and not after a delivery error.
+//      Retry state lives only in `deliveryAttempts` (in memory), so a failed
+//      delivery never moves the file and would otherwise be skipped forever.
+//   2. Expire the skip on time as well as on the change signal, so a bug in
+//      the signal costs bounded delay instead of permanent silence.
+export const QUIET_DELIVERY_BACKOFF_MS = 10 * 60_000;
+
+export interface QuietDeliveryMark {
+  mtimeNs: bigint;
+  size: number;
+  armedAtMs: number;
+}
+const quietDeliveryCache = new Map<string, QuietDeliveryMark>();
+
+/** Deterministic [0,1) from a session id — stable across restarts (FNV-1a). */
+function sessionJitterFraction(sessionId: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < sessionId.length; i++) {
+    h ^= sessionId.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) % 100_000) / 100_000;
+}
+
+/**
+ * When a quiet session must be polled regardless of its change signal.
+ *
+ * Jittered per session across the second half of the window: sessions armed in
+ * the same cycle would otherwise expire in the same cycle and re-create the
+ * very ~1,657-session burst this gate exists to remove, once every backoff
+ * period.
+ */
+export function quietDeliveryDeadlineMs(sessionId: string, armedAtMs: number): number {
+  const half = QUIET_DELIVERY_BACKOFF_MS / 2;
+  return armedAtMs + half + Math.floor(sessionJitterFraction(sessionId) * half);
+}
+
+/** Pure so the skip decision has one thing to unit-test. */
+export function shouldSkipQuietDelivery(
+  cached: QuietDeliveryMark | undefined,
+  current: { mtimeNs: bigint; size: number },
+  nowMs: number,
+  sessionId: string,
+): boolean {
+  if (!cached) return false;
+  if (cached.mtimeNs !== current.mtimeNs || cached.size !== current.size) return false;
+  return nowMs <= quietDeliveryDeadlineMs(sessionId, cached.armedAtMs);
+}
+
+/** Test seam — the cache is process-local and rebuilt from disk on restart. */
+export function peekQuietDeliveryMark(sessionId: string): QuietDeliveryMark | undefined {
+  return quietDeliveryCache.get(sessionId);
+}
+
+export function _resetQuietDeliveryCacheForTest(): void {
+  quietDeliveryCache.clear();
+}
+
+/**
+ * Test seam: force the cache into a state the public path refuses to produce —
+ * "armed" while the session still has a due row. That is exactly the corrupted
+ * change-signal the time bound exists to survive, and it cannot be reached by
+ * arming legitimately (arming requires a clean drain) or by freezing the file
+ * (utimes has no nanosecond precision).
+ */
+export function _setQuietDeliveryMarkForTest(sessionId: string, mark: QuietDeliveryMark): void {
+  quietDeliveryCache.set(sessionId, mark);
+}
+
+/**
+ * What a drain concluded about the session.
+ *
+ * `clean` is the only outcome that may arm the skip: it means every row in
+ * `messages_out` has a `delivered` row. `busy` exists because a concurrent
+ * `pollActive` drain makes `deliverSessionMessages` a no-op — arming on that
+ * would mark a session quiet without ever having looked at it.
+ */
+export type DrainOutcome = 'busy' | 'clean' | 'pending' | 'error';
 
 /**
  * Per-session tracking of the currently-visible status line. First
@@ -378,31 +470,11 @@ const SWEEP_POLL_ACTIVITY_HORIZON_MS = 7 * 24 * 60 * 60 * 1000;
 
 async function pollSweep(): Promise<void> {
   if (!sweepPolling) return;
-
-  const startedAtMs = Date.now();
-  let polled = 0;
-  try {
-    const sessions = getSessionsActiveSince(new Date(Date.now() - SWEEP_POLL_ACTIVITY_HORIZON_MS).toISOString());
-    for (const session of sessions) {
-      await deliverSessionMessages(session);
-      polled++;
-      // Yield after EVERY session, not every 25 — same correction host-sweep
-      // made for the same reason (host-sweep.ts, "Yield after EVERY swept
-      // session"). Each drain opens two SQLite files synchronously, so a
-      // 25-session batch was one contiguous multi-second event-loop freeze.
-      // The 7-day horizon below stopped bounding this loop once session
-      // volume grew (2350 sessions/cycle observed), and every stall drops
-      // live Discord inbound at the local forward hop.
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-  } catch (err) {
-    log.error('Sweep delivery poll error', { err });
-  }
-  const cycleMs = Date.now() - startedAtMs;
-  if (cycleMs >= 1_000) {
-    log.info('Sweep delivery poll timing', { cycleMs, polled });
-  }
-
+  // The 7-day horizon stopped bounding this loop once session volume grew
+  // (2350 sessions/cycle observed) and every stall drops live Discord inbound
+  // at the local forward hop, so the per-session change-gate inside the cycle
+  // is what keeps the work proportional to what actually changed.
+  await runSweepDeliveryCycle();
   setTimeout(pollSweep, SWEEP_POLL_MS);
 }
 
@@ -431,22 +503,23 @@ function outboundKindTag(msg: { kind: string; content: string }): string {
   return 'chat-sdk:unknown';
 }
 
-export async function deliverSessionMessages(session: Session): Promise<void> {
+export async function deliverSessionMessages(session: Session): Promise<DrainOutcome> {
   // Reject re-entry from a concurrent poll on the same session — see the
-  // comment on inflightDeliveries above.
-  if (inflightDeliveries.has(session.id)) return;
+  // comment on inflightDeliveries above. `busy` rather than a bare return so
+  // the sweep cannot mistake "another poll owns this" for "nothing to do".
+  if (inflightDeliveries.has(session.id)) return 'busy';
   inflightDeliveries.add(session.id);
 
   try {
-    await drainSession(session);
+    return await drainSession(session);
   } finally {
     inflightDeliveries.delete(session.id);
   }
 }
 
-async function drainSession(session: Session): Promise<void> {
+async function drainSession(session: Session): Promise<DrainOutcome> {
   const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) return;
+  if (!agentGroup) return 'pending';
 
   let outDb: Database.Database;
   let inDb: Database.Database;
@@ -454,18 +527,22 @@ async function drainSession(session: Session): Promise<void> {
     outDb = openOutboundDb(agentGroup.id, session.id);
     inDb = openInboundDb(agentGroup.id, session.id);
   } catch {
-    return; // DBs might not exist yet
+    return 'pending'; // DBs might not exist yet
   }
 
   try {
+    // Everything outstanding, not just what is due — a row scheduled for later
+    // sits in a file that may never change again, so it must block arming.
+    const delivered = getDeliveredIds(inDb);
+    const outstanding = (outDb.prepare('SELECT id FROM messages_out').all() as Array<{ id: string }>)
+      .map((r) => r.id)
+      .filter((id) => !delivered.has(id));
+    if (outstanding.length === 0) return 'clean';
+
     // Read all due messages from outbound.db (read-only)
     const allDue = getDueOutboundMessages(outDb);
-    if (allDue.length === 0) return;
-
-    // Filter out already-delivered messages using inbound.db's delivered table
-    const delivered = getDeliveredIds(inDb);
     const undelivered = allDue.filter((m) => !delivered.has(m.id));
-    if (undelivered.length === 0) return;
+    if (undelivered.length === 0) return 'pending';
 
     // Ensure platform_message_id column exists (migration for existing sessions)
     migrateDeliveredTable(inDb);
@@ -493,6 +570,8 @@ async function drainSession(session: Session): Promise<void> {
       }
     }
 
+    let sawError = false;
+    const deliveredNow = new Set<string>();
     for (const msg of undelivered) {
       try {
         const result = await deliverMessage(msg, session, inDb);
@@ -502,6 +581,7 @@ async function drainSession(session: Session): Promise<void> {
         // ahead of the human and silently unblock a gated command.
         if (!result.deferAck) {
           markDelivered(inDb, msg.id, result.platformMsgId ?? null);
+          deliveredNow.add(msg.id);
           // Mirror the outbound timestamp into the central sessions row so
           // the inbox board can compute attention-state without opening
           // every per-session outbound.db. Only bump for messages that
@@ -541,6 +621,7 @@ async function drainSession(session: Session): Promise<void> {
           pauseTypingRefreshAfterDelivery(session.id);
         }
       } catch (err) {
+        sawError = true;
         const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
         deliveryAttempts.set(msg.id, attempts);
         if (attempts >= MAX_DELIVERY_ATTEMPTS) {
@@ -569,10 +650,99 @@ async function drainSession(session: Session): Promise<void> {
         }
       }
     }
+    if (sawError) return 'error';
+    // A `deferAck` handler owns its row's lifecycle and writes `delivered`
+    // later, so those rows are still outstanding and must block arming.
+    return outstanding.every((id) => deliveredNow.has(id)) ? 'clean' : 'pending';
   } finally {
     outDb.close();
     inDb.close();
   }
+}
+
+/**
+ * One session's turn in the sweep: stat, gate, drain, arm.
+ *
+ * The stat is taken BEFORE the DBs are opened and that value is what gets
+ * stored, so a commit landing mid-drain leaves a newer mtime on disk than the
+ * armed one and is re-polled next cycle instead of being swallowed.
+ */
+export async function sweepDeliverSession(session: Session, nowMs: number): Promise<DrainOutcome | 'skipped'> {
+  const outPath = outboundDbPath(session.agent_group_id, session.id);
+
+  // A live container is about to write, and pollActive already drains it every
+  // second — never gate it.
+  const containerLive = session.container_status === 'running' || session.container_status === 'idle';
+
+  let current: { mtimeNs: bigint; size: number } | null = null;
+  if (!containerLive) {
+    try {
+      // A hot journal means a rollback (a write) is still owed on this file —
+      // see recoverHotJournal. Pre-rollback stat state is ambiguous, so poll.
+      if (!fs.existsSync(`${outPath}-journal`)) {
+        const st = fs.statSync(outPath, { bigint: true });
+        current = { mtimeNs: st.mtimeNs, size: Number(st.size) };
+      }
+    } catch {
+      current = null; // no outbound.db yet — fall through and let the drain decide
+    }
+  }
+
+  if (current && shouldSkipQuietDelivery(quietDeliveryCache.get(session.id), current, nowMs, session.id)) {
+    return 'skipped';
+  }
+
+  const outcome = await deliverSessionMessages(session);
+  if (outcome === 'clean' && current) {
+    quietDeliveryCache.set(session.id, { ...current, armedAtMs: nowMs });
+  } else {
+    quietDeliveryCache.delete(session.id);
+  }
+  return outcome;
+}
+
+/**
+ * One sweep cycle over every session in the delivery horizon.
+ *
+ * Exported so the counters are testable without driving the 60s timer chain.
+ */
+export async function runSweepDeliveryCycle(nowMs: number = Date.now()): Promise<{ polled: number; skipped: number }> {
+  const startedAtMs = Date.now();
+  let polled = 0;
+  let skipped = 0;
+  const seen = new Set<string>();
+  try {
+    const sessions = getSessionsActiveSince(new Date(nowMs - SWEEP_POLL_ACTIVITY_HORIZON_MS).toISOString());
+    for (const session of sessions) {
+      seen.add(session.id);
+      // One unreadable session must not abort the cycle for every session
+      // behind it. The drain now touches `delivered` for every swept session,
+      // not just ones with due rows, so a legacy or corrupt session DB has a
+      // wider blast radius than it used to.
+      try {
+        const outcome = await sweepDeliverSession(session, nowMs);
+        if (outcome === 'skipped') skipped++;
+        else polled++;
+      } catch (err) {
+        log.warn('Sweep delivery failed for session', { sessionId: session.id, err });
+        quietDeliveryCache.delete(session.id); // never arm off a failure
+        polled++;
+      }
+      // Yield after EVERY session, not every 25 — same correction host-sweep
+      // made for the same reason. Each drain opens two SQLite files
+      // synchronously, so a batch was one contiguous event-loop freeze.
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    // Bounded to sessions still in the horizon, mirroring host-sweep's
+    // quiet-cache cleanup — otherwise the map grows with every session ever seen.
+    for (const id of quietDeliveryCache.keys()) if (!seen.has(id)) quietDeliveryCache.delete(id);
+  } catch (err) {
+    log.error('Sweep delivery poll error', { err });
+  }
+  // Emitted every cycle, not only slow ones: a fast skip-heavy cycle is the
+  // healthy state, and it must not look identical to a sweep that stopped.
+  log.info('Sweep delivery poll timing', { cycleMs: Date.now() - startedAtMs, polled, skipped });
+  return { polled, skipped };
 }
 
 /**

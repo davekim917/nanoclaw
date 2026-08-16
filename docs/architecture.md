@@ -276,6 +276,29 @@ One-shot and recurring tasks use the same tables — no separate scheduler.
 
 **Active container poll** (~1s) checks the same conditions but only for sessions with running containers.
 
+**Periodic passes must cost what changed, not what exists.** A sweep over sessions is gated on a
+change signal, bounded by time, staggered per session, and records polled/skipped counts. Work
+proportional to population size is a defect: the delivery sweep once opened both SQLite files for
+~1,657 sessions every 60s to find the ~17 that had moved, which burned most of the host's CPU in
+bursts and dropped live inbound at the local forward hop during each stall.
+
+The pattern, and why each part is load-bearing:
+
+- **Change signal** — session DBs use `journal_mode=DELETE`, so every commit lands in the main file
+  and moves its mtime. One `stat` answers "could this session have work?". This would *not* be safe
+  under WAL, where commits land in the sidecar.
+- **Time bound** — a signal that fails silently would otherwise strand a session forever. The
+  deadline caps that at bounded delay. `quietSessions` (host-sweep) and `quietDeliveryCache`
+  (delivery) both do this; `usageRollupMtimeCache` does not, and is the one exception — its failure
+  mode is a missed usage rollup, not an undelivered message.
+- **Stagger** — sessions armed in the same cycle expire in the same cycle, which re-creates the
+  burst once per backoff period. Deadlines are jittered deterministically per session id.
+- **Arm only on a proven-clean pass** — anything unresolved (a pending row, a future `deliver_after`,
+  a delivery error, a concurrent drain) must leave the gate disarmed, so uncertainty costs an extra
+  poll rather than a lost message.
+
+See `docs/specs/bounded-periodic-work/plan.md`.
+
 **Agent-runner creates schedules** by emitting a `messages_out` row with `kind: 'system'` and an `action` (`schedule_task`, `cancel_task`, …) — it cannot write host-owned `inbound.db` directly. The host applies the action during delivery (`src/modules/scheduling/actions.ts`), inserting/updating the `kind: 'task'` `messages_in` row with `process_after` and optionally `recurrence`.
 
 ### messages_in content by kind
