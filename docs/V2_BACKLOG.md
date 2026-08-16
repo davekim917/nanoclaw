@@ -12,9 +12,25 @@ into it. The file is kept as an onboarding reference for future agents.
 
 ---
 
-## 1. `render_diagram` MCP tool ✅
+## 1. `render_diagram` MCP tool ✅ → RETIRED
 
-**SHIPPED** (2026-04-20). Run `./container/build.sh` to install mmdc in the agent image.
+**SHIPPED** (2026-04-20). **RETIRED** (2026-08-16) — do not re-implement.
+
+Every column it owned had a better replacement, so the tool and its skill were
+deleted rather than maintained as a second diagram path:
+
+| It provided | Replaced by |
+|---|---|
+| 5 HTML templates (`architecture`, `flowchart`, …) | the `diagram-design` plugin's 27 visual types — its own SKILL.md already called the templates fallbacks that "look like every other AI-generated architecture diagram" |
+| design principles / taste gate | `diagram-design`'s design system |
+| chromium screenshot | `agent-browser` (CDP), or Playwright — pre-wired to the system chromium |
+| mermaid → PNG | `mmdc -p /app/puppeteer-config.json`, invoked directly |
+| outbox → chat attachment | `send_file`, which has its own content-hash dedup |
+
+mmdc and the `PUPPETEER_*` env stay in the image — they're still the direct
+mermaid path. Agent-facing replacement: `container/CLAUDE.md` → "Diagrams".
+
+<details><summary>Original shipped-item notes</summary>
 
 **What v1 did:** accepted Mermaid / HTML / SVG input, rendered to PNG via
 headless chromium inside the container, delivered via `send_file`.
@@ -38,6 +54,8 @@ into chat today; only affects image-output channels.
    - Deliver via existing `send_file` pattern (30s delivery ack).
 
 **Est:** ~1hr incl. container rebuild.
+
+</details>
 
 ---
 

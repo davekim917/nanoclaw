@@ -342,6 +342,26 @@ Generation takes ~3-4 min PER IMAGE — the #1 cause of "it failed with no file.
 
 Skills that say "open the file in a browser" assume local Claude Code — the container has no display, and `open`/`xdg-open` fail silently. Instead: write the file into your workspace and **send it as a chat attachment** (self-contained single-file HTML is ideal), then tell the user to download and open it. For a playground: you build it → attach it → the user adjusts it locally and pastes the generated prompt back.
 
+### Diagrams
+
+Use the `diagram-design` skill — it is the design system, covering architecture,
+flowcharts, sequence, ER, timelines, org charts, and redraws from `.drawio` or
+Mermaid sources. It writes a self-contained `.html` with inline SVG.
+
+To put one in chat as an image, rasterize then attach — there is no single tool
+that does both:
+
+- **From diagram-design HTML** — screenshot the `<svg>` node (`agent-browser`, or
+  `chromium --headless --screenshot`), then `send_file`. Chromium is at
+  `/usr/bin/chromium`; Playwright is pre-wired to reuse it
+  (`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`), so `pnpm add playwright` in your scratch
+  dir costs no browser download.
+- **Raw Mermaid**, when a plain auto-laid-out graph genuinely is the answer —
+  `mmdc -i d.mmd -o d.png -p /app/puppeteer-config.json`, then `send_file`.
+
+Attaching the `.html` itself is also fine, and keeps the diagram's a11y contract
+(`role="img"`, `<title>`/`<desc>`) that a PNG throws away.
+
 ## Conversation history
 
 The `conversations/` folder holds searchable past transcripts; use it when a request references earlier work. For structured long-lived data, prefer dedicated files (`customers.md`, `preferences.md`); split any file over ~500 lines into a folder with an index.

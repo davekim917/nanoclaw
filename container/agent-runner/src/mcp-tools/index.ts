@@ -17,7 +17,6 @@ import './remote-control.js';
 import './capabilities.js';
 import './permissions.js';
 import './channel-config.js';
-import './render-diagram.js';
 import './design-review/index.js';
 import './backlog.js';
 import './support.js';

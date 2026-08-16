@@ -91,8 +91,8 @@ export function classifyRender(s: RenderSignals): Finding[] {
 
 export interface ViewportRender { viewport: string; pngPath: string; findings: Finding[]; }
 
-// Mirror render-diagram.ts's proven hardened flags: no sandbox escape, no /dev/shm
-// exhaustion, no local file:// cross-origin reads.
+// Hardened chromium flags: no sandbox escape, no /dev/shm exhaustion, no local
+// file:// cross-origin reads.
 //
 // EGRESS ISOLATION (the robust no-egress boundary — verified against the container's
 // chromium 149): --host-resolver-rules fails DNS for every host EXCEPT the declared font
@@ -143,7 +143,7 @@ let measureSeq = 0;
 
 /**
  * Measure layout metrics at `width` by rendering a COPY of the artifact with a tiny
- * measurement script injected (mirrors render-diagram.ts's __NC_DIAG_H__ pattern). The
+ * measurement script injected. The
  * script writes scrollWidth,scrollHeight,textLen into <title>; we read it back via
  * `--dump-dom` (which waits for load). The injected script runs only in this throwaway
  * copy in the sandbox — the artifact under test stays no-JS. Returns null if anything
