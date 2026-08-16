@@ -9,11 +9,15 @@
  * same empty-array shape rather than 404/403 — this endpoint has no route
  * param to gate, just a query string, so there's nothing to 404 on.
  */
+import fs from 'fs';
+import path from 'path';
+
 import { getDb } from '../../db/connection.js';
 import { getContainerConfig } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
+import { GROUPS_DIR } from '../../config.js';
 import { getActiveContainerSessionIds, resolveAssistantName } from '../../container-runner.js';
 import { readContainerConfig, type ContainerConfig } from '../../container-config.js';
 import { readClaims, type BoardClaim } from '../../claims-board.js';
@@ -56,16 +60,67 @@ export interface ObservatoryAgent {
   nextTask: { title: string; at: string } | null;
 }
 
+export interface ReleaseStateItem {
+  id: string;
+  kind: string;
+  title: string;
+  nextMover: 'human' | 'agent' | 'nobody';
+  owner?: string;
+  blocksRelease?: boolean;
+  why?: string;
+  since?: string;
+  url?: string;
+}
+
+export interface ReleaseState {
+  asOf: string;
+  generatedBy?: string;
+  release?: { moratorium?: boolean; holds?: { kind: string; reason?: string; since?: string }[] };
+  items: ReleaseStateItem[];
+}
+
+/**
+ * The release desk's machine artifact, written by the workgroup's own release
+ * watcher every ~30 minutes (see the workgroup runbook + decisions.md
+ * 2026-08-16). The observatory only RENDERS it — one aggregator, one
+ * renderer, so the desk and the dashboard can never tell two stories. Member
+ * folders are scanned because the file lives in the owning group's folder
+ * (siblings reach it via a symlink the host must not depend on); newest
+ * mtime wins. Absent or unparseable → null, and the UI says "no release
+ * desk" rather than inventing one.
+ */
+export function readReleaseState(workgroupId: string, groupsDir: string = GROUPS_DIR): ReleaseState | null {
+  const members = getDb()
+    .prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?')
+    .all(workgroupId) as { folder: string }[];
+
+  let best: { mtime: number; state: ReleaseState } | null = null;
+  for (const { folder } of members) {
+    const file = path.join(groupsDir, folder, 'releases', 'release-state.json');
+    try {
+      const stat = fs.statSync(file);
+      if (best && stat.mtimeMs <= best.mtime) continue;
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as ReleaseState;
+      if (typeof raw.asOf !== 'string' || !Array.isArray(raw.items)) continue;
+      best = { mtime: stat.mtimeMs, state: raw };
+    } catch {
+      continue; // absent or unparseable — never let one folder break the scan
+    }
+  }
+  return best?.state ?? null;
+}
+
 export interface ObservatoryScene {
   workgroupId: string;
   asOf: string;
   rooms: ObservatoryRoom[];
   agents: ObservatoryAgent[];
+  releaseState: ReleaseState | null;
   claims: ObservatoryClaim[];
 }
 
 function emptyScene(workgroupId: string): ObservatoryScene {
-  return { workgroupId, asOf: new Date().toISOString(), rooms: [], agents: [], claims: [] };
+  return { workgroupId, asOf: new Date().toISOString(), rooms: [], agents: [], releaseState: null, claims: [] };
 }
 
 /**
@@ -275,6 +330,8 @@ export interface ObservatoryDeps {
   getActiveContainerSessionIds: () => string[];
   /** Injected claims root for tests; defaults to readClaims' own live claimsBaseDir(). */
   claimsRoot?: string;
+  /** Injected groups dir for tests; defaults to the live GROUPS_DIR. */
+  groupsDir?: string;
   resolveAssistantName: (
     agentGroup: AgentGroup,
     containerConfig: ContainerConfig,
@@ -300,6 +357,7 @@ export async function buildObservatoryScene(
     rooms: buildRooms(workgroupId),
     agents: await buildAgents(workgroupId, claims, deps),
     claims,
+    releaseState: deps.groupsDir !== undefined ? readReleaseState(workgroupId, deps.groupsDir) : readReleaseState(workgroupId),
   };
 }
 

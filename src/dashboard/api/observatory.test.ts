@@ -3,6 +3,7 @@
  *   GET /dashboard/api/observatory?workgroup=<id>
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
@@ -17,7 +18,13 @@ vi.mock('../../config.js', async (importOriginal) => ({
 const TEST_DIR = '/tmp/nanoclaw-observatory-api-test';
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
-import { buildObservatoryScene, observatoryHandler, ownerMatchesAgent, type ObservatoryDeps } from './observatory.js';
+import {
+  buildObservatoryScene,
+  observatoryHandler,
+  ownerMatchesAgent,
+  readReleaseState,
+  type ObservatoryDeps,
+} from './observatory.js';
 import type { AuthedRequestContext } from '../router.js';
 
 function now(): string {
@@ -142,6 +149,54 @@ afterEach(() => {
   closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
   vi.clearAllMocks();
+});
+
+describe('readReleaseState', () => {
+  function groupsDir(files: Record<string, string>): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'obs-groups-'));
+    for (const [rel, body] of Object.entries(files)) {
+      const f = path.join(dir, rel);
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, body);
+    }
+    return dir;
+  }
+
+  it('reads the artifact from a member folder and rides it into the scene', async () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1', 'ava', 'ava-folder');
+    const dir = groupsDir({
+      'ava-folder/releases/release-state.json': JSON.stringify({
+        asOf: '2026-08-16T05:00:00Z',
+        items: [{ id: 'X#1', kind: 'pr', title: 'ship me', nextMover: 'human', owner: 'ava' }],
+      }),
+    });
+
+    const scene = await buildObservatoryScene('wg-1', makeDeps({ groupsDir: dir }));
+
+    expect(scene.releaseState?.asOf).toBe('2026-08-16T05:00:00Z');
+    expect(scene.releaseState?.items[0]).toMatchObject({ id: 'X#1', nextMover: 'human' });
+  });
+
+  it('is null when absent and skips an unparseable file without throwing', () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1', 'ava', 'ava-folder');
+    expect(readReleaseState('wg-1', groupsDir({}))).toBeNull();
+    expect(readReleaseState('wg-1', groupsDir({ 'ava-folder/releases/release-state.json': '{nope' }))).toBeNull();
+  });
+
+  it('prefers the newest artifact when two member folders carry one', () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1', 'ava', 'ava-folder');
+    addGroup('ag-2', 'wg-1', 'kit', 'kit-folder');
+    const dir = groupsDir({
+      'ava-folder/releases/release-state.json': JSON.stringify({ asOf: 'old', items: [] }),
+      'kit-folder/releases/release-state.json': JSON.stringify({ asOf: 'new', items: [] }),
+    });
+    fs.utimesSync(path.join(dir, 'ava-folder/releases/release-state.json'), new Date(0), new Date(0));
+
+    expect(readReleaseState('wg-1', dir)?.asOf).toBe('new');
+  });
 });
 
 describe('ownerMatchesAgent', () => {
