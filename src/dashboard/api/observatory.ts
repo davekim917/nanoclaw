@@ -77,6 +77,14 @@ export interface ReleaseStateItem {
   why?: string;
   since?: string;
   url?: string;
+  /**
+   * Ids of items on this same board that must land first. OMITTING the field
+   * means "nobody checked"; an explicit `[]` means "checked, nothing blocks
+   * it". The dependency view treats those as different states on purpose —
+   * undeclared must never render as independent — so the watcher publishing
+   * `[]` is a real assertion, not a filler value.
+   */
+  dependsOn?: string[];
 }
 
 export interface ReleaseState {
@@ -97,9 +105,9 @@ export interface ReleaseState {
  * desk" rather than inventing one.
  */
 export function readReleaseState(workgroupId: string, groupsDir: string = GROUPS_DIR): ReleaseState | null {
-  const members = getDb()
-    .prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?')
-    .all(workgroupId) as { folder: string }[];
+  const members = getDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
+    folder: string;
+  }[];
 
   let best: { mtime: number; state: ReleaseState } | null = null;
   for (const { folder } of members) {
@@ -191,9 +199,9 @@ interface WiringRow {
  * every platform shows.
  */
 export function observatoryHiddenRooms(workgroupId: string): string[] {
-  const members = getDb()
-    .prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?')
-    .all(workgroupId) as { folder: string }[];
+  const members = getDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
+    folder: string;
+  }[];
   for (const { folder } of members) {
     try {
       const declared = readContainerConfig(folder).observatory?.hideRooms;
@@ -206,9 +214,9 @@ export function observatoryHiddenRooms(workgroupId: string): string[] {
 }
 
 export function observatoryPlatforms(workgroupId: string): string[] | null {
-  const members = getDb()
-    .prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?')
-    .all(workgroupId) as { folder: string }[];
+  const members = getDb().prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?').all(workgroupId) as {
+    folder: string;
+  }[];
   for (const { folder } of members) {
     try {
       const declared = readContainerConfig(folder).observatory?.platforms;
@@ -251,9 +259,10 @@ function buildRooms(workgroupId: string, allowed: string[] | null, hidden: strin
     )
     .all(workgroupId) as WiringRow[];
 
-  const onFloor = (allowed
-    ? wiringRows.filter((r) => allowed.some((p) => r.channel_type === p || r.channel_type.startsWith(`${p}-`)))
-    : wiringRows
+  const onFloor = (
+    allowed
+      ? wiringRows.filter((r) => allowed.some((p) => r.channel_type === p || r.channel_type.startsWith(`${p}-`)))
+      : wiringRows
   ).filter((r) => !isNotARoom(r.platform_id, hidden));
 
   const byPlatformId = new Map<string, RoomAccum>();
@@ -366,22 +375,17 @@ async function buildAgents(
       }
 
       const location =
-        roomMgId && nowMs - roomMs <= LOCATION_WINDOW_MS
-          ? (getMessagingGroup(roomMgId)?.platform_id ?? null)
-          : null;
+        roomMgId && nowMs - roomMs <= LOCATION_WINDOW_MS ? (getMessagingGroup(roomMgId)?.platform_id ?? null) : null;
 
       const provider = getContainerConfig(row.id)?.provider ?? row.agent_provider ?? '';
       const containerConfig = readContainerConfig(row.folder);
       const name = await resolvePersonaName(row, containerConfig, deps);
 
-      const holding = claims
-        .filter((c) => ownerMatchesAgent(c.owner, { name, folder: row.folder }))
-        .map((c) => c.slug);
+      const holding = claims.filter((c) => ownerMatchesAgent(c.owner, { name, folder: row.folder })).map((c) => c.slug);
 
       // The agent's face: its own bot's Slack avatar, found via whichever of
       // its wired channel types carries a registered identity with an image.
-      const lookup =
-        deps.avatarByChannelType ?? ((ct: string) => getKnownSlackBots().get(ct)?.imageUrl ?? null);
+      const lookup = deps.avatarByChannelType ?? ((ct: string) => getKnownSlackBots().get(ct)?.imageUrl ?? null);
       const channelTypes = getDb()
         .prepare(
           `SELECT DISTINCT mg.channel_type FROM messaging_group_agents mga
@@ -476,7 +480,8 @@ export async function buildObservatoryScene(
     ),
     agents: await buildAgents(workgroupId, claims, deps),
     claims,
-    releaseState: deps.groupsDir !== undefined ? readReleaseState(workgroupId, deps.groupsDir) : readReleaseState(workgroupId),
+    releaseState:
+      deps.groupsDir !== undefined ? readReleaseState(workgroupId, deps.groupsDir) : readReleaseState(workgroupId),
   };
 }
 

@@ -510,6 +510,13 @@ export interface ReleaseItem {
   why?: string;
   since?: string;
   url?: string;
+  /**
+   * Ids of items on this board that must land before this one can. OMITTING
+   * this field means "nobody checked"; an explicit `[]` means "checked, nothing
+   * blocks it". The dependency view relies on that distinction — undeclared and
+   * independent must never render alike. See views/release-graph.ts.
+   */
+  dependsOn?: string[];
 }
 
 export interface ReleaseState {

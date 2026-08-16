@@ -19,6 +19,7 @@ import {
 import { relAge } from '../lib/derive.js';
 import { RouteNav, type BoardRoute } from './BoardShell.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
+import { buildReleaseGraph, unblockRanking } from './release-graph.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
 import { DESK_ON, DESK_OFF, COBWEB, COUCH, BLANK_AVATAR, roomDecor, rugTone } from './office-sprites.js';
 
@@ -471,7 +472,7 @@ function ReleaseDesk({
   onClearOwnerFilter?: () => void;
 }) {
   const [filter, setFilter] = useState<ReleaseGroupKey | null>(null);
-  const [view, setView] = useState<'status' | 'agent'>('status');
+  const [view, setView] = useState<'status' | 'agent' | 'graph'>('status');
   const [expandedItem, setExpandedItem] = useState<string | null>(null);
 
   if (!releaseState) {
@@ -518,6 +519,14 @@ function ReleaseDesk({
               onClick={() => setView('agent')}
             >
               By agent
+            </button>
+            <button
+              type="button"
+              className={`nc-obs-release-view ${view === 'graph' ? 'active' : ''}`}
+              aria-pressed={view === 'graph'}
+              onClick={() => setView('graph')}
+            >
+              What unblocks what
             </button>
           </div>
         </div>
@@ -584,6 +593,8 @@ function ReleaseDesk({
         </div>
       )}
 
+      {view === 'graph' && <DependencyView items={items} />}
+
       {view === 'agent' &&
         lanes.map((lane) => (
           <div key={lane.owner} className={`nc-obs-release-lane ${lane.owner === UNOWNED_LANE ? 'unowned' : ''}`}>
@@ -640,6 +651,119 @@ function ReleaseDesk({
         );
       })}
     </section>
+  );
+}
+
+/* ─── Dependency view — "land this and N things move" ────────────────────── */
+
+/**
+ * The ranked list leads and the picture follows, because the ranking is the
+ * answer and the picture is the evidence. A node-link diagram is also the half
+ * that cannot work at 390px, so on a phone the list IS the feature and the
+ * layered columns scroll sideways underneath it.
+ */
+function DependencyView({ items }: { items: ReleaseItem[] }) {
+  const graph = useMemo(() => buildReleaseGraph(items), [items]);
+  const ranked = useMemo(() => unblockRanking(graph), [graph]);
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  return (
+    <div className="nc-obs-dep">
+      {/* Coverage is stated before anything derived from it. A graph built on
+          29% declared data is not wrong, but reading it as if it were complete
+          is, and the reader can only avoid that if we say so first. */}
+      <div className={`nc-obs-dep-coverage ${graph.declaredPct < 100 ? 'partial' : ''}`}>
+        <strong>{graph.declaredPct}%</strong> of items have declared what blocks them
+        {graph.undeclaredCount > 0 && (
+          <span className="nc-obs-dep-coverage-gap">
+            {' '}
+            — {graph.undeclaredCount} {graph.undeclaredCount === 1 ? 'item has' : 'items have'} not said, so
+            anything below is a partial picture
+          </span>
+        )}
+      </div>
+
+      {graph.cycles.length > 0 && (
+        <div className="nc-obs-dep-cycle">
+          {graph.cycles.length} items block each other in a loop — nothing in it can go first:{' '}
+          {graph.cycles.join(', ')}
+        </div>
+      )}
+
+      {ranked.length === 0 ? (
+        <div className="nc-obs-dep-empty">
+          nothing on this board unblocks anything else yet — either the work is genuinely independent, or the
+          dependencies have not been declared
+        </div>
+      ) : (
+        <ol className="nc-obs-dep-rank">
+          {ranked.map((n) => (
+            <li key={n.item.id} className="nc-obs-dep-rank-row">
+              <button
+                type="button"
+                className="nc-obs-dep-rank-btn"
+                aria-expanded={expanded === n.item.id}
+                onClick={() => setExpanded((p) => (p === n.item.id ? null : n.item.id))}
+              >
+                <span className="nc-obs-dep-rank-n">{n.unblocks}</span>
+                <span className="nc-obs-dep-rank-l">
+                  {n.unblocks === 1 ? 'item moves' : 'items move'} if{' '}
+                  <span className="nc-obs-dep-rank-id">{n.item.id}</span> lands
+                </span>
+                {n.item.blocksRelease && <span className="nc-obs-dep-flag">blocks release</span>}
+              </button>
+              {expanded === n.item.id && (
+                <div className="nc-obs-dep-rank-detail">
+                  <div>{n.item.title}</div>
+                  {n.item.owner && <div className="nc-obs-dep-meta">owner: {n.item.owner}</div>}
+                  {n.item.url && <OutLink href={n.item.url}>{itemLinkLabel(n.item.kind)}</OutLink>}
+                </div>
+              )}
+            </li>
+          ))}
+        </ol>
+      )}
+
+      <div className="nc-obs-dep-plan" role="img" aria-label="Dependency layers, earliest work on the left">
+        {graph.layers.map((layer, i) => (
+          <div key={i} className="nc-obs-dep-layer">
+            <div className="nc-obs-dep-layer-head">{i === 0 ? 'can start now' : `after ${i}`}</div>
+            {layer.map((n) => (
+              <a
+                key={n.item.id}
+                className={[
+                  'nc-obs-dep-node',
+                  n.item.blocksRelease ? 'blocks' : '',
+                  n.depsKnown ? '' : 'undeclared',
+                  n.inCycle ? 'cycle' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ')}
+                href={n.item.url ?? undefined}
+                target={n.item.url ? '_blank' : undefined}
+                rel={n.item.url ? 'noopener noreferrer' : undefined}
+                data-node-id={n.item.id}
+                title={n.item.title}
+              >
+                <span className="nc-obs-dep-node-id">{n.item.id}</span>
+                <span className="nc-obs-dep-node-title">{n.item.title}</span>
+                {/* The whole point: an undeclared node must not read as a root. */}
+                {!n.depsKnown && <span className="nc-obs-dep-node-tag">deps not declared</span>}
+                {n.inCycle && <span className="nc-obs-dep-node-tag cycle">in a loop</span>}
+              </a>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {graph.danglingRefs.length > 0 && (
+        <div className="nc-obs-dep-dangling">
+          {graph.danglingRefs.length} declared {graph.danglingRefs.length === 1 ? 'dependency names' : 'dependencies name'}{' '}
+          something not on this board (closed, another repo, or a typo):{' '}
+          {graph.danglingRefs.map((d) => `${d.from} → ${d.to}`).join(', ')}
+        </div>
+      )}
+    </div>
   );
 }
 

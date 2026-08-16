@@ -1742,6 +1742,92 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-obs-release-lane-sum { font-size: 11px; color: #efdcbb; }
 
+/* ─── Dependency view ────────────────────────────────────────────────────── */
+
+.nc-of .nc-obs-dep { display: flex; flex-direction: column; gap: 10px; }
+
+/* Coverage leads. A partial graph is fine; a partial graph read as complete is
+   not, and this line is the only thing standing between the two. */
+.nc-of .nc-obs-dep-coverage {
+  background: var(--of-paper); border: 3px solid var(--of-ink-2);
+  box-shadow: var(--of-drop); padding: 8px 12px; font-size: 12px; color: var(--of-ink);
+}
+.nc-of .nc-obs-dep-coverage.partial { border-color: var(--of-warn, #c8922e); }
+.nc-of .nc-obs-dep-coverage-gap { color: var(--of-ink-2); }
+
+.nc-of .nc-obs-dep-cycle,
+.nc-of .nc-obs-dep-dangling {
+  background: var(--of-paper); border: 3px solid var(--of-alert);
+  box-shadow: var(--of-drop); padding: 8px 12px; font-size: 11.5px; color: var(--of-ink);
+}
+.nc-of .nc-obs-dep-dangling { border-color: var(--of-ink-2); color: var(--of-ink-2); }
+.nc-of .nc-obs-dep-empty {
+  background: var(--of-paper); border: 3px solid var(--of-ink-2); box-shadow: var(--of-drop);
+  padding: 10px 12px; font-size: 12px; color: var(--of-ink-2); font-style: italic;
+}
+
+/* The ranking is the answer, so it gets the big numerals and works at 390px. */
+.nc-of .nc-obs-dep-rank { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.nc-of .nc-obs-dep-rank-row {
+  background: var(--of-paper); border: 3px solid var(--of-ink-2); box-shadow: var(--of-drop);
+}
+.nc-of .nc-obs-dep-rank-btn {
+  appearance: none; background: none; border: 0; margin: 0; width: 100%;
+  padding: 8px 12px; min-height: 44px; cursor: pointer; text-align: left;
+  display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; font: inherit; color: var(--of-ink);
+}
+.nc-of .nc-obs-dep-rank-btn:focus-visible { outline: 3px solid var(--of-ink); outline-offset: -3px; }
+.nc-of .nc-obs-dep-rank-n {
+  font-family: var(--font-mono); font-size: 22px; font-weight: 700; line-height: 1; color: var(--of-ink);
+}
+.nc-of .nc-obs-dep-rank-l { font-size: 12.5px; }
+.nc-of .nc-obs-dep-rank-id { font-family: var(--font-mono); font-weight: 600; }
+.nc-of .nc-obs-dep-flag {
+  margin-left: auto; background: var(--of-alert); color: #fff; border: 2px solid var(--of-ink-2);
+  padding: 0 6px; font-family: var(--font-mono); font-size: 10px;
+}
+.nc-of .nc-obs-dep-rank-detail { padding: 0 12px 10px; font-size: 12px; color: var(--of-ink); }
+.nc-of .nc-obs-dep-meta { font-size: 11px; color: var(--of-ink-2); }
+
+/* The layered plan: columns left to right, earliest work first. Scrolls
+   sideways rather than reflowing — a dependency order that rewraps by viewport
+   width is not a dependency order any more. */
+.nc-of .nc-obs-dep-plan {
+  display: flex; gap: 12px; align-items: flex-start;
+  overflow-x: auto; padding-bottom: 6px;
+}
+.nc-of .nc-obs-dep-layer {
+  display: flex; flex-direction: column; gap: 6px; min-width: 190px; max-width: 240px; flex: none;
+}
+.nc-of .nc-obs-dep-layer-head {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+  letter-spacing: 0.12em; text-transform: uppercase; color: var(--of-cream);
+  text-shadow: 1px 1px 0 rgb(0 0 0 / 0.3);
+}
+.nc-of .nc-obs-dep-node {
+  display: flex; flex-direction: column; gap: 2px;
+  background: var(--of-paper); color: var(--of-ink); text-decoration: none;
+  border: 3px solid var(--of-ink-2); box-shadow: var(--of-drop); padding: 7px 9px; min-height: 44px;
+}
+.nc-of .nc-obs-dep-node.blocks { border-color: var(--of-alert); }
+.nc-of .nc-obs-dep-node.cycle { border-color: var(--of-alert); border-style: double; border-width: 5px; }
+/* Undeclared is DASHED and tagged — never the same solid box as a node that
+   actually declared it has no blockers. This is the whole honesty argument. */
+.nc-of .nc-obs-dep-node.undeclared {
+  border-style: dashed; background: repeating-linear-gradient(
+    45deg, var(--of-paper), var(--of-paper) 6px, rgb(0 0 0 / 0.04) 6px, rgb(0 0 0 / 0.04) 12px);
+}
+.nc-of .nc-obs-dep-node-id { font-family: var(--font-mono); font-size: 11px; font-weight: 700; }
+.nc-of .nc-obs-dep-node-title {
+  font-size: 11.5px; color: var(--of-ink-2);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.nc-of .nc-obs-dep-node-tag {
+  align-self: flex-start; border: 2px solid var(--of-ink-2); padding: 0 4px;
+  font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.06em; color: var(--of-ink-2);
+}
+.nc-of .nc-obs-dep-node-tag.cycle { border-color: var(--of-alert); color: var(--of-alert); }
+
 .nc-of .nc-obs-release-group { display: flex; flex-direction: column; gap: 8px; }
 .nc-of .nc-obs-release-group.blockers { border-left: 0; padding-left: 0; }
 .nc-of .nc-obs-release-group-label {

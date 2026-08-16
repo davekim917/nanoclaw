@@ -646,6 +646,39 @@ describe('Observatory', () => {
       expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('2 automated');
     });
 
+    it('the dependency view states coverage first and marks undeclared items as not-independent', async () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'A1', dependsOn: [], title: 'declared independent' }),
+              releaseItem({ id: 'A2', dependsOn: ['A1'], title: 'blocked by A1' }),
+              releaseItem({ id: 'A3', title: 'never declared' }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const tab = Array.from(container.querySelectorAll('.nc-obs-release-view')).find(
+        (b) => b.textContent === 'What unblocks what',
+      )!;
+      await userEvent.click(tab);
+
+      expect(container.querySelector('.nc-obs-dep-coverage')!.textContent).toContain('67%');
+      expect(container.querySelector('.nc-obs-dep-coverage')!.className).toContain('partial');
+
+      // A1 and A3 are both layer 0; only A3 may carry the undeclared treatment,
+      // which is the distinction the whole view exists to preserve.
+      const a1 = container.querySelector('.nc-obs-dep-node[data-node-id="A1"]')!;
+      const a3 = container.querySelector('.nc-obs-dep-node[data-node-id="A3"]')!;
+      expect(a1.className).not.toContain('undeclared');
+      expect(a3.className).toContain('undeclared');
+      expect(a3.textContent).toContain('deps not declared');
+
+      // and the ranking answers the actual question
+      expect(container.querySelector('.nc-obs-dep-rank-row')!.textContent).toContain('A1');
+    });
+
     it('blockers group renders first and dedupes a blocksRelease item out of its mover group', () => {
       mockData(
         snapshot({
