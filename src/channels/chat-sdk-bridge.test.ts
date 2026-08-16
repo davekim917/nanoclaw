@@ -282,7 +282,7 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
         {
           id: 'in-1',
           text: 'assignment',
-          sender: 'Argus',
+          sender: 'Beacon',
           userId: 'U-DINESH',
           iso: '2026-05-03T12:00:00Z',
         },

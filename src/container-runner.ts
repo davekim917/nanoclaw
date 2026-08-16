@@ -3239,7 +3239,8 @@ async function buildContainerArgs(
     });
     // Self identity — same dual-registry lookup. The channel-facing display
     // name is deliberately distinct from assistantName: an operator may call
-    // this agent "ollie" while Slack routes it as @illie-codex. Supplying
+    // this agent by a shorthand nickname while Slack routes it as a different
+    // bot handle (say `@beacon-codex`). Supplying
     // both aliases prevents the model from treating its own platform mention
     // as a request for a sibling.
     const selfMg = getMessagingGroup(sessionMessagingGroupId);

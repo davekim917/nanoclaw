@@ -5,8 +5,8 @@
  * intentionally distinct for separate adapters because a channel type is
  * also the delivery route. It becomes too strict when multiple NanoClaw
  * Slack apps are installed in one Slack workspace: the same human then
- * arrives as, for example, both `slack-illysium:U123` and
- * `slack-illysium-codex:U123`.
+ * arrives as, for example, both `slack-example:U123` and
+ * `slack-example-codex:U123`.
  *
  * Role checks may treat those forms as one principal only when both adapter
  * instances have registered the *same Slack teamId*. This deliberately does

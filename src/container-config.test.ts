@@ -96,8 +96,8 @@ describe('workgroup and capability config', () => {
 
 describe('readContainerConfigStrict', () => {
   it('returns the same normalized snapshot for a valid regular file', () => {
-    writeGroupConfig('test-strict-valid', { workgroup_id: 'illysium' });
-    expect(readContainerConfigStrict('test-strict-valid').workgroup_id).toBe('illysium');
+    writeGroupConfig('test-strict-valid', { workgroup_id: 'workgroup-a' });
+    expect(readContainerConfigStrict('test-strict-valid').workgroup_id).toBe('workgroup-a');
   });
 
   it('rejects a missing config instead of falling back to empty defaults', () => {

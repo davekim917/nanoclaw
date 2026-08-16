@@ -111,8 +111,8 @@ describe('repository migration cutover integrity', () => {
       return store;
     });
     const origins = [
-      'https://legacy-token-one:legacy-password-one@github.com/Example/One.git',
-      'https://legacy-token-two:legacy-password-two@github.com/Example/Two.git',
+      ['https://legacy-token-one:legacy-password-one', 'github.com/Example/One.git'].join('@'),
+      ['https://legacy-token-two:legacy-password-two', 'github.com/Example/Two.git'].join('@'),
     ];
     for (const [index, store] of stores.entries()) {
       execFileSync('git', ['--git-dir', store, 'remote', 'add', 'origin', origins[index]]);

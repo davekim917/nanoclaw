@@ -16,7 +16,7 @@ describe('legacy repository identity coalescing', () => {
 
   it('classifies URL userinfo, query, and fragment as credentials and derives only a clean GitHub origin', () => {
     for (const origin of [
-      'https://user:pass@github.com/Owner/Repo.git',
+      ['https://user:pass', 'github.com/Owner/Repo.git'].join('@'),
       'https://github.com/Owner/Repo.git?access_token=QUERY_SYNTHETIC_SECRET',
       'https://github.com/Owner/Repo.git#FRAGMENT_SYNTHETIC_SECRET',
     ]) {
@@ -30,12 +30,12 @@ describe('legacy repository identity coalescing', () => {
   it('coalesces snapshots and a unique case-only missing-admin alias into the largest anchored repository', () => {
     const plan = planLegacyRepositoryCoalescing([
       {
-        key: 'wg\0XZO-ANALYTICS',
+        key: 'wg\0APP-ANALYTICS',
         workgroupId: 'wg',
-        repo: 'XZO-ANALYTICS',
+        repo: 'APP-ANALYTICS',
         physicalCount: 78,
         objectStoreCount: 1,
-        observedOrigins: ['https://github.com/Example/XZO-ANALYTICS'],
+        observedOrigins: ['https://github.com/Example/APP-ANALYTICS'],
       },
       {
         key: 'wg\0snapshot-106',
@@ -43,19 +43,19 @@ describe('legacy repository identity coalescing', () => {
         repo: 'snapshot-106',
         physicalCount: 0,
         objectStoreCount: 1,
-        observedOrigins: ['https://github.com/example/xzo-analytics.git'],
+        observedOrigins: ['https://github.com/example/app-analytics.git'],
       },
       {
-        key: 'wg\0xzo-analytics',
+        key: 'wg\0app-analytics',
         workgroupId: 'wg',
-        repo: 'xzo-analytics',
+        repo: 'app-analytics',
         physicalCount: 1,
         objectStoreCount: 0,
         observedOrigins: [],
       },
     ]);
-    expect(plan.get('wg\0snapshot-106')).toBe('wg\0XZO-ANALYTICS');
-    expect(plan.get('wg\0xzo-analytics')).toBe('wg\0XZO-ANALYTICS');
+    expect(plan.get('wg\0snapshot-106')).toBe('wg\0APP-ANALYTICS');
+    expect(plan.get('wg\0app-analytics')).toBe('wg\0APP-ANALYTICS');
   });
 
   it('does not merge a conflicting or ambiguous originless alias', () => {
@@ -85,67 +85,67 @@ describe('legacy repository identity coalescing', () => {
     const plan = planLegacyRepositoryCoalescing(
       [
         {
-          key: 'illysium\0XZO',
-          workgroupId: 'illysium',
-          repo: 'XZO',
+          key: 'workgroup-a\0APP',
+          workgroupId: 'workgroup-a',
+          repo: 'APP',
           physicalCount: 1,
           objectStoreCount: 1,
-          observedOrigins: ['https://github.com/example/XZO'],
+          observedOrigins: ['https://github.com/example/APP'],
         },
         {
-          key: 'illysium\0snapshot-XZO',
-          workgroupId: 'illysium',
-          repo: 'snapshot-XZO',
+          key: 'workgroup-a\0snapshot-APP',
+          workgroupId: 'workgroup-a',
+          repo: 'snapshot-APP',
           physicalCount: 10,
           objectStoreCount: 1,
-          observedOrigins: ['https://github.com/example/xzo.git'],
+          observedOrigins: ['https://github.com/example/app.git'],
         },
         {
-          key: 'illysium\0XZO-BACKEND',
-          workgroupId: 'illysium',
-          repo: 'XZO-BACKEND',
+          key: 'workgroup-a\0APP-BACKEND',
+          workgroupId: 'workgroup-a',
+          repo: 'APP-BACKEND',
           physicalCount: 3,
           objectStoreCount: 0,
           observedOrigins: [],
         },
       ],
-      [{ workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'XZO' }],
+      [{ workgroupId: 'workgroup-a', sourceRepo: 'APP-BACKEND', destinationRepo: 'APP' }],
     );
-    expect(plan.get('illysium\0XZO-BACKEND')).toBe('illysium\0XZO');
-    expect(plan.get('illysium\0snapshot-XZO')).toBe('illysium\0XZO');
+    expect(plan.get('workgroup-a\0APP-BACKEND')).toBe('workgroup-a\0APP');
+    expect(plan.get('workgroup-a\0snapshot-APP')).toBe('workgroup-a\0APP');
   });
 
   it('pins an origin-unreadable reviewed destination ahead of a larger same-origin snapshot', () => {
     const plan = planLegacyRepositoryCoalescing(
       [
         {
-          key: 'illysium\0XZO',
-          workgroupId: 'illysium',
-          repo: 'XZO',
+          key: 'workgroup-a\0APP',
+          workgroupId: 'workgroup-a',
+          repo: 'APP',
           physicalCount: 1,
           objectStoreCount: 0,
           observedOrigins: [],
         },
         {
-          key: 'illysium\0snapshot-XZO',
-          workgroupId: 'illysium',
-          repo: 'snapshot-XZO',
+          key: 'workgroup-a\0snapshot-APP',
+          workgroupId: 'workgroup-a',
+          repo: 'snapshot-APP',
           physicalCount: 10,
           objectStoreCount: 1,
-          observedOrigins: ['https://github.com/example/xzo.git'],
+          observedOrigins: ['https://github.com/example/app.git'],
         },
         {
-          key: 'illysium\0XZO-BACKEND',
-          workgroupId: 'illysium',
-          repo: 'XZO-BACKEND',
+          key: 'workgroup-a\0APP-BACKEND',
+          workgroupId: 'workgroup-a',
+          repo: 'APP-BACKEND',
           physicalCount: 3,
           objectStoreCount: 0,
           observedOrigins: [],
         },
       ],
-      [{ workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'XZO' }],
+      [{ workgroupId: 'workgroup-a', sourceRepo: 'APP-BACKEND', destinationRepo: 'APP' }],
     );
-    expect([...plan.values()]).toEqual(['illysium\0XZO', 'illysium\0XZO', 'illysium\0XZO']);
+    expect([...plan.values()]).toEqual(['workgroup-a\0APP', 'workgroup-a\0APP', 'workgroup-a\0APP']);
   });
 
   it('rejects reviewed aliases with absent destinations and cycles', () => {

@@ -9,7 +9,7 @@ Status: approved; implementation in progress
 - Same-topic sibling agents share that worktree.
 - Different topics receive different checkout paths, branches, HEADs, indexes,
   and Git administration directories.
-- Illysium claims remain optional coordination inside a shared topic worktree;
+- Per-workgroup claims remain optional coordination inside a shared topic worktree;
   they are not the isolation mechanism.
 - Preserve all existing Git-visible work through cleanup and migration.
 
@@ -154,9 +154,9 @@ Extend `create_worktree` with optional `continueFromThreadId`.
   branch, record the original name and assign unique work-unit branches because
   Git forbids one branch in two worktrees.
 - Convert dirty canonicals into named rescue worktrees before cleaning the host
-  canonical. Convert normal legacy clones in place. For Illysium, import mirror
-  and standalone refs into the validated normal snapshot before selecting it as
-  canonical.
+  canonical. Convert normal legacy clones in place. For mirror-backed
+  workgroups, import mirror and standalone refs into the validated normal
+  snapshot before selecting it as canonical.
 - For each checkout, rename the old directory aside, create the correct linked
   worktree, restore exact HEAD/index/worktree state, and verify status/hashes.
 - Keep the entire renamed old topology through offline audit and live canaries.
@@ -177,8 +177,8 @@ The offline audit must prove:
   and status matches its manifest; and
 - cross-workgroup paths and mounts fail closed.
 
-Activate a temporary-worktree-built host distribution. Canary Madison Reed,
-Illysium, and one formerly legacy workgroup before releasing the fleet. Verify
+Activate a temporary-worktree-built host distribution. Canary two active
+workgroups and one formerly legacy workgroup before releasing the fleet. Verify
 mounts, preserved statuses, same-topic sharing, cross-topic isolation, host
 cleanup visibility, Graphify scoping, container spawns, and logs. Rollback
 restores the prior distribution and renamed topology while the service remains
@@ -217,5 +217,5 @@ offline audit, and live canaries must all pass.
   user.
 - Ignored build caches are intentionally excluded; all Git-visible work is
   preserved.
-- Claims remain Illysium-only coordination inside a shared topic worktree.
+- Claims remain single-workgroup coordination inside a shared topic worktree.
 - Source-checkout writer freezing is separate from the final fleet outage.

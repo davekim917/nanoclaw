@@ -72,7 +72,7 @@ describe('reviewed repository recovery decisions', () => {
         {
           checkoutPath,
           workgroupId: 'wg-a',
-          repo: 'xzo',
+          repo: 'app',
           action: 'restore-visible-state',
           selection: 'exact-git-admin',
           selectedGitDir,
@@ -187,17 +187,17 @@ describe('reviewed repository recovery decisions', () => {
       version: 2,
       checkouts: [],
       origins: [],
-      repositoryAliases: [{ workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'XZO' }],
+      repositoryAliases: [{ workgroupId: 'workgroup-a', sourceRepo: 'APP-BACKEND', destinationRepo: 'APP' }],
     });
     expect(loadReviewedRecoveryDecisions(file)?.repositoryAliases).toEqual([
-      { workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'XZO' },
+      { workgroupId: 'workgroup-a', sourceRepo: 'APP-BACKEND', destinationRepo: 'APP' },
     ]);
 
     for (const repositoryAliases of [
-      [{ workgroupId: 'illysium', sourceRepo: '../XZO-BACKEND', destinationRepo: 'XZO' }],
+      [{ workgroupId: 'workgroup-a', sourceRepo: '../APP-BACKEND', destinationRepo: 'APP' }],
       [
-        { workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'XZO' },
-        { workgroupId: 'illysium', sourceRepo: 'XZO-BACKEND', destinationRepo: 'OTHER' },
+        { workgroupId: 'workgroup-a', sourceRepo: 'APP-BACKEND', destinationRepo: 'APP' },
+        { workgroupId: 'workgroup-a', sourceRepo: 'APP-BACKEND', destinationRepo: 'OTHER' },
       ],
     ]) {
       fs.writeFileSync(file, `${JSON.stringify({ version: 2, checkouts: [], origins: [], repositoryAliases })}\n`, {

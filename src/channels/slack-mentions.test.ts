@@ -702,12 +702,12 @@ describe('resolveInboundSlackIds', () => {
     registerSlackBot('slack-test-inbound-real-name', {
       userId: 'U-CLAW',
       username: 'claw',
-      realName: 'illie',
+      realName: 'Beacon',
       teamId: 'T-INBOUND-REAL-NAME',
     });
     try {
       expect(resolveInboundSlackIds('<@U-CLAW> please take this', 'slack-test-inbound-real-name')).toBe(
-        '@illie please take this',
+        '@Beacon please take this',
       );
     } finally {
       registerSlackBot('slack-test-inbound-real-name', {
@@ -724,12 +724,12 @@ describe('getSlackBotSenderName', () => {
     registerSlackBot('slack-sender-self', {
       userId: 'U-SELF-SENDER',
       username: 'self-old',
-      realName: 'illie',
+      realName: 'Beacon',
       teamId: 'T-SENDER',
     });
     registerSlackBot('slack-sender-peer', {
       userId: 'U-PEER-SENDER',
-      username: 'argus',
+      username: 'peer-old',
       realName: 'Dinesh',
       teamId: 'T-SENDER',
     });

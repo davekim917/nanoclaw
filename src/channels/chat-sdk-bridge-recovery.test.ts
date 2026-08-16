@@ -226,8 +226,8 @@ describe('Chat SDK bridge missed-message recovery', () => {
         text: 'assignment',
         isBot: true,
         authorUserId: 'U-DINESH',
-        authorUserName: 'argus',
-        authorFullName: 'Argus',
+        authorUserName: 'beacon',
+        authorFullName: 'Beacon',
       }),
     ];
     const bridge = createChatSdkBridge({
@@ -271,7 +271,7 @@ describe('Chat SDK bridge missed-message recovery', () => {
             fetchMessage: async () => ({
               id: 'quoted-peer',
               text: 'original assignment',
-              author: { userId: 'U-DINESH', userName: 'argus', fullName: 'Argus' },
+              author: { userId: 'U-DINESH', userName: 'beacon', fullName: 'Beacon' },
             }),
           },
         ] as ChatMessage['links'],
