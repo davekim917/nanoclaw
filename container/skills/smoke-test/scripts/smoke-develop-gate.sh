@@ -396,6 +396,19 @@ active_run_is_live() {
 # campaign that never routed through the gate must never call it. Release with
 # `release`, which clears the slot and nothing else.
 if [ "$COMMAND" = "claim" ]; then
+  # In freeze-handoff mode every campaign — scheduled OR chat-requested — runs
+  # against an immutable preview, never against shared dev: dev moves ~50
+  # merges/day and a campaign on it is voided by the next merge (the exact
+  # failure this deployment migrated away from). Refusing here makes that a
+  # property of the gate, not of anyone remembering the rule. The requested-
+  # campaign flow is: cut a freeze PR with the freeze helper, wait for the PR
+  # gate's `check <pr>` to report settled:true, then claim/progress/finish on
+  # the PR gate. `check` stays available here for build facts.
+  if [ "$FREEZE_HANDOFF" = true ]; then
+    jq -cn '{ok:false,error:"claim is disabled in freeze-handoff mode — shared dev is not a campaign environment. Cut a freeze PR (smoke-freeze-pr.sh <target-sha>), wait for the PR gate check to settle, and claim there.",
+      requestedCampaignFlow:["smoke-freeze-pr.sh <target-sha>","smoke-pr-gate.sh check <pr> (until settled:true)","smoke-pr-gate.sh claim <run-id> <pr> <sha>","... progress/finish on the PR gate"]}'
+    exit 0
+  fi
   RUN_ID="${2:-}"
   SHA="${3:-}"
   MERGE_HOLD="${4:-true}"

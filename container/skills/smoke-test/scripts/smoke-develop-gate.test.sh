@@ -736,4 +736,19 @@ bash "$GATE" poll | jq -e --arg sha "$CD_SECOND" '
   .data.trigger == "develop_freeze_opened" and .data.targetSha == $sha
 ' >/dev/null
 
+# --- 35. Handoff mode disables develop-gate claim: shared dev is not a
+# campaign environment once campaigns run on previews. Chat-requested
+# campaigns must route through the freeze flow; the refusal names it.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+CLAIM_SHA="$(printf 'b%.0s' $(seq 40))"
+bash "$GATE" claim manual-run "$CLAIM_SHA" | jq -e '
+  .ok == false and (.error | test("freeze")) and (.requestedCampaignFlow | length > 0)
+' >/dev/null
+# Refused before any state write: no state file at all, or no active run.
+[ ! -s "$STATE_DIR2/develop-state.json" ] || jq -e '.activeRunId == null' "$STATE_DIR2/develop-state.json" >/dev/null
+# Off-mode: claim still works exactly as before.
+export SMOKE_GATE_FREEZE_HANDOFF=false
+bash "$GATE" claim manual-run "$CLAIM_SHA" | jq -e '.ok == true and .runId == "manual-run"' >/dev/null
+
 echo "smoke develop gate tests passed"

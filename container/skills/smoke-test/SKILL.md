@@ -834,7 +834,7 @@ step. A settled SHA while a handoff is open queues like any other
 `queued_behind_active_run` (one freeze at a time); a freeze PR closed with no
 verdict ever recorded wakes `develop_freeze_abandoned` once and frees the
 slot; a failing helper wakes `develop_freeze_failed`, throttled like a
-failing preflight command.
+failing preflight command. In handoff mode the develop gate also refuses `claim`: chat-requested campaigns cut a freeze PR (`smoke-freeze-pr.sh`) and claim on the PR gate — shared dev is never a campaign environment.
 
 The other half lives in `smoke-pr-gate.sh`'s `finish`: `SMOKE_GATE_PUBLISH_FILE`
 / `SMOKE_GATE_HOLD_FILE` / `SMOKE_GATE_HANDOFF_LEDGER` (all no-ops unless set,
