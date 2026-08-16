@@ -1744,6 +1744,12 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 
 /* ─── Dependency view ────────────────────────────────────────────────────── */
 
+.nc-of .nc-obs-hover-steer {
+  display: inline-block; margin-top: 4px; min-height: 32px; line-height: 32px;
+  color: var(--of-ink); font-weight: 600; text-decoration: underline;
+}
+.nc-of .nc-obs-hover-nosession { margin-top: 4px; color: var(--of-ink-2); font-style: italic; }
+
 .nc-of .nc-obs-dep { display: flex; flex-direction: column; gap: 10px; }
 
 /* Coverage leads. A partial graph is fine; a partial graph read as complete is

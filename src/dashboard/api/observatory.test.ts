@@ -440,6 +440,29 @@ describe('buildObservatoryScene', () => {
     expect(byId['ag-2'].provider).toBe('claude'); // falls back to agent_groups.agent_provider
   });
 
+  it('lastSessionId follows the newest outbound, including a room-less task session', async () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1');
+    addMessagingGroup('mg-1', 'slack', 'slack:C0EXAMPLE2');
+    // The room session spoke earlier; the task session (no room) spoke last.
+    // location must stay on the room, but a steer belongs in the newest
+    // conversation — the two trackers deliberately disagree here.
+    addSession('sess-room', 'ag-1', { messagingGroupId: 'mg-1', lastOutboundAt: '2026-08-16T10:00:00Z' });
+    addSession('sess-task', 'ag-1', { messagingGroupId: null, lastOutboundAt: '2026-08-16T10:30:00Z' });
+
+    const scene = await buildObservatoryScene('wg-1', makeDeps());
+    expect(scene.agents[0].lastSessionId).toBe('sess-task');
+    expect(scene.agents[0].location).toBe('slack:C0EXAMPLE2');
+  });
+
+  it('lastSessionId is null when the agent has never produced outbound', async () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1');
+    addSession('sess-quiet', 'ag-1', { lastOutboundAt: null });
+    const scene = await buildObservatoryScene('wg-1', makeDeps());
+    expect(scene.agents[0].lastSessionId).toBeNull();
+  });
+
   it('nextTask is always null (no cheap titled read exists yet)', async () => {
     addWorkgroup('wg-1');
     addGroup('ag-1', 'wg-1');

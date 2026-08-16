@@ -907,6 +907,16 @@ function AgentChip({
           <div>{agent.lastSeenAt ? `last seen ${relAge(agent.lastSeenAt)} ago` : 'never seen'}</div>
           <div>{agent.holding.length > 0 ? `holding: ${agent.holding.join(', ')}` : 'holding nothing'}</div>
           <div>{agent.nextTask ? `next: ${agent.nextTask.title} (${relTime(agent.nextTask.at)})` : 'no upcoming task'}</div>
+          {/* Steering opens the session rather than composing here: a message
+              sent without the transcript in front of you is a guess, and the
+              session view already has both. One click, no blind steer. */}
+          {agent.lastSessionId ? (
+            <a className="nc-obs-hover-steer" href={`#/session/${agent.lastSessionId}`}>
+              open session to steer →
+            </a>
+          ) : (
+            <div className="nc-obs-hover-nosession">no session to steer — it has never spoken</div>
+          )}
         </div>
       )}
     </div>

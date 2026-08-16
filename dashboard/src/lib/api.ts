@@ -469,6 +469,8 @@ export interface ObservatoryAgent {
   awake: boolean;
   location: string | null;
   lastSeenAt: string | null;
+  /** Session this agent last spoke in — where a steer should land. Null if none. */
+  lastSessionId: string | null;
   holding: string[];
   nextTask: { title: string; at: string } | null;
   /** Bot's real Slack avatar (public slack-edge CDN URL), null when none. */

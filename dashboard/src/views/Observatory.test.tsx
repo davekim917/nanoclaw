@@ -74,6 +74,7 @@ function agent(overrides: Partial<ObservatoryAgent> = {}): ObservatoryAgent {
     awake: true,
     location: null,
     lastSeenAt: new Date().toISOString(),
+    lastSessionId: null,
     holding: [],
     nextTask: null,
     avatarUrl: null,
@@ -677,6 +678,26 @@ describe('Observatory', () => {
 
       // and the ranking answers the actual question
       expect(container.querySelector('.nc-obs-dep-rank-row')!.textContent).toContain('A1');
+    });
+
+    it('an agent popover offers its session to steer, and says so when there is none', async () => {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1' })],
+          agents: [
+            agent({ id: 'ava', name: 'ava', location: 'r1', lastSessionId: 'sess-9' }),
+            agent({ id: 'kit', name: 'kit', location: null, lastSessionId: null }),
+          ],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+
+      await userEvent.click(container.querySelector('.nc-obs-chip[data-agent-id="ava"]')!);
+      expect(container.querySelector('.nc-obs-hover-steer')!.getAttribute('href')).toBe('#/session/sess-9');
+
+      await userEvent.click(container.querySelector('.nc-obs-chip[data-agent-id="kit"]')!);
+      expect(container.querySelector('.nc-obs-hover-nosession')).toBeTruthy();
+      expect(container.querySelector('.nc-obs-hover-steer')).toBeNull();
     });
 
     it('blockers group renders first and dedupes a blocksRelease item out of its mover group', () => {

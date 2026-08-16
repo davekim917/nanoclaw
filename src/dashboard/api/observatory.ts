@@ -58,6 +58,14 @@ export interface ObservatoryAgent {
   awake: boolean;
   location: string | null;
   lastSeenAt: string | null;
+  /**
+   * The session this agent most recently spoke in — the one a steer should
+   * land in. Null when it has never produced outbound. Deliberately tracks
+   * `lastSeenAt`, not `location`: steering follows the conversation the agent
+   * is actually in, including a room-less task session, whereas location is a
+   * PLACE and only counts sessions with a room.
+   */
+  lastSessionId: string | null;
   holding: string[];
   // ponytail: no cheap source for a task's display title exists yet — the
   // scheduled-board snapshot deliberately keeps prompt/script text server-side
@@ -358,6 +366,7 @@ async function buildAgents(
       // its desk while its real in-room activity is minutes old (observed live:
       // a 01:25 task outbound shadowing a 00:54 #dispatch post).
       let mostRecentAt: string | null = null;
+      let mostRecentSessionId: string | null = null;
       let mostRecentMs = -Infinity;
       let roomMs = -Infinity;
       let roomMgId: string | null = null;
@@ -367,6 +376,7 @@ async function buildAgents(
         if (ms > mostRecentMs) {
           mostRecentMs = ms;
           mostRecentAt = s.last_outbound_at ?? null;
+          mostRecentSessionId = s.id;
         }
         if (s.messaging_group_id && ms > roomMs) {
           roomMs = ms;
@@ -409,6 +419,7 @@ async function buildAgents(
         awake,
         location,
         lastSeenAt: mostRecentAt,
+        lastSessionId: mostRecentSessionId,
         holding,
         nextTask: null,
       };
