@@ -1148,11 +1148,6 @@ function Zone({
     <div
       className={`nc-obs-room nc-of-zone rug-${rugTone(room.key)} ${cls} ${hasOpenPanel ? 'has-open-popover' : ''}`}
       data-room-key={room.key}
-      // Occupancy sets the footprint (layout law 4). Absent members still take
-      // a seat — they belong to this channel and their empty desk is part of
-      // what the room is — but a dead channel with nobody at all stays small
-      // instead of becoming a big colour slab with one desk in the middle.
-      style={{ ['--seats' as string]: String(Math.min(bodies.length + Math.min(absentMembers.length, 2) * 0.5, 3.5)) }}
     >
       <button
         type="button"

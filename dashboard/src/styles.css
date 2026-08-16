@@ -2150,12 +2150,17 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* The lounge is a room, not a footer rule across the whole floor. */
 .nc-of .nc-of-bullpen { max-width: 420px; }
 
-/* Occupancy sets the footprint: layout law 4, "a room's size is its occupancy".
-   --seats is set per room from its body count; an empty channel gets a small
-   room instead of a colour slab with a desk marooned in the middle. */
+/* Room footprints are FIXED, not sized by occupancy.
+   Sizing by occupancy was the previous rule here and it is wrong twice over.
+   In a real place rooms are fixed and occupancy varies — that is exactly what
+   makes an empty room legible AS empty. And a plan whose room widths change
+   every poll reshuffles the whole floor, destroying the spatial memory that is
+   the only reason a map beats a list. A treemap wearing a house costume is
+   still a treemap. Occupancy shows in the FURNITURE and the people, never in
+   the walls. */
 .nc-of .nc-obs-room {
   flex: 0 1 auto;
-  width: calc(126px + (var(--seats, 0) * 84px));
+  width: 268px;
   max-width: 100%;
 }
 @media (min-width: 900px) {
