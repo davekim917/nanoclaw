@@ -1797,6 +1797,38 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   }
 }
 
+/* ─── The office map card ────────────────────────────────────────────────── */
+/* The floor is the vendored <office-map> element. Its chrome is deliberately
+   quiet — the map is the only illustrated surface, its container is not. */
+.nc-of .nc-of-mapcard{
+  background:#fff; border:1px solid rgba(35,32,27,.10); border-radius:10px; overflow:hidden;
+  box-shadow:0 1px 2px rgba(35,32,27,.05); margin-bottom:12px;
+}
+.nc-of .nc-of-mapcard-head{
+  display:flex; align-items:center; gap:10px; padding:10px 12px;
+  border-bottom:1px solid rgba(35,32,27,.09);
+}
+.nc-of .nc-of-mapcard-title{font-size:12.5px; font-weight:600; color:#23201b}
+.nc-of .nc-of-mapcard-hint{font-size:12px; color:rgba(35,32,27,.45)}
+.nc-of .nc-of-mapcard-head .nc-of-chip{margin-left:auto}
+.nc-of .nc-of-teleport{
+  display:flex; gap:7px; padding:9px 12px; border-top:1px solid rgba(35,32,27,.09);
+  overflow-x:auto; align-items:center;
+}
+.nc-of .nc-of-chip{
+  appearance:none; display:inline-flex; align-items:center; gap:6px; flex:none;
+  height:28px; padding:0 10px; border-radius:7px; cursor:pointer;
+  border:1px solid rgba(35,32,27,.14); background:#fff; color:#23201b;
+  font:500 11.5px/1 inherit; white-space:nowrap;
+}
+.nc-of .nc-of-chip:hover{background:rgba(35,32,27,.04)}
+.nc-of .nc-of-chip.on{background:#23201b; color:#faf7f2; border-color:#23201b}
+.nc-of .nc-of-sd{width:6px; height:6px; border-radius:50%; flex:none; background:#8f8b82}
+.nc-of .nc-of-sd.blocked{background:#c1554a}
+.nc-of .nc-of-sd.waiting{background:#c08a2e}
+.nc-of .nc-of-sd.working{background:#4a7c59}
+.nc-of .nc-of-overflow{font-size:11.5px; color:rgba(35,32,27,.45); flex:none}
+
 /* ─── Commitment strip + ledger ──────────────────────────────────────────── */
 
 .nc-of .nc-of-commit-strip{

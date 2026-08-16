@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
 import {
   listWorkgroups,
@@ -7,7 +7,6 @@ import {
   type AuthMe,
   type ObservatorySnapshot,
   type ObservatoryRoom,
-  type ObservatoryAgent,
   type ObservatoryClaim,
   type ObservatoryClaimState,
   type ReleaseState,
@@ -21,8 +20,10 @@ import { RouteNav, type BoardRoute } from './BoardShell.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildReleaseGraph, unblockRanking } from './release-graph.js';
 import { buildLedger, dueLabel, type Commitment } from './commitments.js';
+import { OfficeMap } from './OfficeMap.js';
+import { buildOfficeData } from './office-data.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
-import { DESK_ON, DESK_OFF, COBWEB, COUCH, BLANK_AVATAR, roomDecor, rugTone } from './office-sprites.js';
+
 
 /**
  * Observatory — a top-down pixel-art OPEN-PLAN office floor you look down into.
@@ -84,78 +85,46 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
     { refreshInterval: POLL_MS },
   );
 
-  const [highlightedAgentId, setHighlightedAgentId] = useState<string | null>(null);
   // Shared across the fold: the strip sits above the office, the board below it.
   const [releaseFilter, setReleaseFilter] = useState<ReleaseGroupKey | null>(null);
+  const [selectedRoom, setSelectedRoom] = useState<string>('');
+  const [teleportTo, setTeleportTo] = useState<string | null>(null);
   const [expandedClaim, setExpandedClaim] = useState<string | null>(null);
-  const [openZone, setOpenZone] = useState<string | null>(null);
-
-  // Which agent's popover is open, and whether a click pinned it there (vs. a
-  // hover that closes on mouseleave). Single piece of state — one popover can
-  // ever be open, whatever chip it came from.
-  const [popover, setPopover] = useState<{ id: string; pinned: boolean } | null>(null);
-
-  // Outside click closes whatever is open. A click ON a chip (or inside its own
-  // popover, nested in the same div) is handled by the chip's own handlers, and
-  // the same holds for a zone and its panel — this only fires for clicks that
-  // land nowhere near either.
-  useEffect(() => {
-    if (!popover && !openZone) return;
-    function onDocClick(e: MouseEvent) {
-      const el = e.target as Element | null;
-      if (!el?.closest?.('.nc-obs-chip')) setPopover(null);
-      if (!el?.closest?.('.nc-obs-room')) setOpenZone(null);
-    }
-    document.addEventListener('click', onDocClick);
-    return () => document.removeEventListener('click', onDocClick);
-  }, [popover, openZone]);
-
-  function bindPopover(id: string) {
-    return {
-      isOpen: popover?.id === id,
-      pinned: popover?.id === id && popover.pinned,
-      onEnter: () =>
-        setPopover((prev) =>
-          prev?.pinned && prev.id !== id ? prev : { id, pinned: prev?.id === id ? prev.pinned : false },
-        ),
-      onLeave: () => setPopover((prev) => (prev?.id === id && !prev.pinned ? null : prev)),
-      // A mouse click always fires mouseenter first, which already opened this
-      // chip unpinned — so a click on an already-open-but-unpinned chip PINS
-      // it rather than closing it. Only a click on an already-PINNED chip
-      // closes it. This is what makes click "toggle" rather than "always
-      // close what hover just opened".
-      // Clicking someone is also how you ask "what is on THEIR desk" — the same
-      // click that pins their card narrows the job board to their lane, and
-      // un-pinning restores everyone. The office earns its keep by being a
-      // control surface, not a picture.
-      onToggle: () =>
-        setPopover((prev) => {
-          const next = !prev || prev.id !== id ? { id, pinned: true } : prev.pinned ? null : { id, pinned: true };
-          setHighlightedAgentId(next ? id : null);
-          return next;
-        }),
-      onClose: () => setPopover(null),
-    };
-  }
 
   const rooms = useMemo(() => sortRooms(snapshot?.rooms ?? []), [snapshot]);
   const agents = snapshot?.agents ?? [];
   const claims = useMemo(() => sortClaims(snapshot?.claims ?? []), [snapshot]);
-  const deskAgents = agents.filter((a) => a.location === null);
-  const agentsById = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
   const awakeCount = agents.filter((a) => a.awake).length;
 
   // The strip above the floor must count the same set the board below shows,
   // so the owner filter is applied once, here, and handed to both.
-  const ownerFilter = highlightedAgentId ? (agentsById.get(highlightedAgentId)?.name ?? null) : null;
   const allItems = snapshot?.releaseState?.items ?? [];
-  const ownerFilteredItems = ownerFilter ? allItems.filter((i) => i.owner === ownerFilter) : allItems;
+
+  // Selecting a room filters the queue to the people IN that room.
+  //
+  // Filtering by the room itself is what the design intends, but no release
+  // item carries the channel it belongs to (checked 2026-08-16: zero of 71),
+  // so there is nothing to match on. Whose desk the work is on IS derivable,
+  // and it answers the same question — "what is going on in there" — without
+  // inventing a field. It becomes a true room filter the day the watcher
+  // publishes `channel`.
+  const roomOwners = useMemo(() => {
+    if (!selectedRoom) return null;
+    const room = officeDataRef.current?.rooms.find((r) => r.slot === selectedRoom);
+    return room ? new Set(room.agents.map((a) => a.name)) : null;
+  }, [selectedRoom, snapshot]);
+
+  const ownerFilter = roomOwners ? [...roomOwners].join(', ') : null;
+  const ownerFilteredItems = roomOwners
+    ? allItems.filter((i) => i.owner && roomOwners.has(i.owner))
+    : allItems;
 
   const ledgerCounts = useMemo(() => buildLedger(ownerFilteredItems).counts, [ownerFilteredItems]);
+  const officeData = useMemo(() => buildOfficeData(rooms, agents, allItems), [rooms, agents, allItems]);
+  const officeDataRef = useRef(officeData);
+  officeDataRef.current = officeData;
 
   const claimClicked = (claim: ObservatoryClaim) => {
-    const match = agents.find((a) => a.id === claim.owner || a.name === claim.owner);
-    setHighlightedAgentId((prev) => (match && prev === match.id ? null : match?.id ?? null));
     setExpandedClaim((prev) => (prev === claim.slug ? null : claim.slug));
   };
 
@@ -195,39 +164,49 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
             />
 
             <div className="nc-obs-main">
-              <div className="nc-of-floor">
-                <div className="nc-obs-rooms">
-                  {rooms.map((room) => (
-                    <Zone
-                      key={room.key}
-                      room={room}
-                      bodies={agents.filter((a) => a.location === room.key)}
-                      agentsById={agentsById}
-                      highlightedAgentId={highlightedAgentId}
-                      openAgentId={popover?.id ?? null}
-                      bindPopover={bindPopover}
-                      panelOpen={openZone === room.key}
-                      onToggle={() => {
-                        setPopover(null);
-                        setOpenZone((prev) => (prev === room.key ? null : room.key));
+              {/* The floor is the vendored <office-map> custom element: a
+                  tile-based, hand-authored plan with real furniture, pan, and
+                  teleport. Geometry is FIXED; only who is in which room comes
+                  from data. Replaces the CSS-rectangle floor entirely. */}
+              <section className="nc-of-mapcard">
+                <div className="nc-of-mapcard-head">
+                  <span className="nc-of-mapcard-title">The office</span>
+                  <span className="nc-of-mapcard-hint">tap a room to filter the queue</span>
+                  {selectedRoom && (
+                    <button type="button" className="nc-of-chip" onClick={() => setSelectedRoom('')}>
+                      All rooms
+                    </button>
+                  )}
+                </div>
+                <OfficeMap
+                  data={officeData}
+                  selected={selectedRoom}
+                  onSelect={(k) => setSelectedRoom((prev) => (prev === k ? '' : k))}
+                  teleportTo={teleportTo}
+                />
+                <div className="nc-of-teleport">
+                  {officeData.rooms.map((r) => (
+                    <button
+                      key={r.slot}
+                      type="button"
+                      className={`nc-of-chip ${selectedRoom === r.slot ? 'on' : ''}`}
+                      onClick={() => {
+                        setTeleportTo(r.slot);
+                        setSelectedRoom((prev) => (prev === r.slot ? '' : r.slot));
                       }}
-                      onClosePanel={() => setOpenZone(null)}
-                    />
+                    >
+                      <i className={`nc-of-sd ${r.state}`} />
+                      {r.label}
+                    </button>
                   ))}
-                  {rooms.length === 0 && <div className="nc-empty">no channels wired for this workgroup</div>}
+                  {officeData.overflow.length > 0 && (
+                    <span className="nc-of-overflow">
+                      {officeData.overflow.length} more {officeData.overflow.length === 1 ? 'channel has' : 'channels have'}{' '}
+                      no room on this floor
+                    </span>
+                  )}
                 </div>
-
-                <div className="nc-obs-desks nc-of-bullpen">
-                  <div className="nc-obs-desks-label">Lounge</div>
-                  <img className="nc-of-sprite nc-of-lounge-couch" src={COUCH} alt="" aria-hidden="true" />
-                  <div className="nc-obs-desks-row">
-                    {deskAgents.length === 0 && <span className="nc-obs-desks-empty">no one home</span>}
-                    {deskAgents.map((a) => (
-                      <AgentChip key={a.id} agent={a} highlighted={a.id === highlightedAgentId} {...bindPopover(a.id)} />
-                    ))}
-                  </div>
-                </div>
-              </div>
+              </section>
 
               <details className="nc-of-board" open>
                 <summary className="nc-of-board-summary">
@@ -246,7 +225,7 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
                 <ReleaseDesk
                   releaseState={snapshot.releaseState}
                   ownerFilter={ownerFilter}
-                  onClearOwnerFilter={() => setHighlightedAgentId(null)}
+                  onClearOwnerFilter={() => setSelectedRoom('')}
                   filter={releaseFilter}
                 />
               </details>
@@ -299,10 +278,6 @@ export function roomActivityClass(lastActivityAt: string | null, now = Date.now(
   return 'dusty';
 }
 
-function initials(name: string): string {
-  const parts = name.split(/\s+/).filter(Boolean);
-  return parts.slice(0, 2).map((w) => w[0]!.toUpperCase()).join('') || '?';
-}
 
 // Magnitude of an ms duration, bucketed the same way relAge buckets an
 // elapsed-time ISO string — fed a synthesized timestamp so the two never
@@ -1014,211 +989,6 @@ function ScheduledSection({ agentGroupIds }: { agentGroupIds: string[] }) {
       )}
       {open && <ScheduledDrawer rowKey={open} onClose={() => setOpenKey(null)} onMutated={() => void mutate()} />}
     </section>
-  );
-}
-
-/* ─── Agent at a desk — one agent's ONE body ─────────────────────────────── */
-
-interface PopoverBinding {
-  isOpen: boolean;
-  pinned: boolean;
-  onEnter: () => void;
-  onLeave: () => void;
-  onToggle: () => void;
-  onClose: () => void;
-}
-
-function AgentChip({
-  agent,
-  highlighted,
-  isOpen,
-  pinned,
-  onEnter,
-  onLeave,
-  onToggle,
-  onClose,
-}: { agent: ObservatoryAgent; highlighted: boolean } & PopoverBinding) {
-  return (
-    <div
-      className={`nc-obs-chip ${agent.awake ? 'awake' : 'asleep'} ${highlighted ? 'highlighted' : ''}`}
-      data-agent-id={agent.id}
-      role="button"
-      tabIndex={0}
-      aria-expanded={isOpen}
-      onMouseEnter={onEnter}
-      onMouseLeave={onLeave}
-      onClick={onToggle}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          onToggle();
-        }
-      }}
-    >
-      {/* Avatar first in DOM so it sits on top of the desk and is the chip's
-          first <img>; CSS, not source order, does the overlap. */}
-      <div className="nc-of-station">
-        {agent.avatarUrl ? (
-          <img
-            className={`nc-obs-avatar pixelated${agent.awake ? '' : ' asleep'}`}
-            src={agent.avatarUrl}
-            alt={agent.name}
-            loading="lazy"
-            referrerPolicy="no-referrer"
-          />
-        ) : (
-          <span className="nc-of-blank">
-            <img
-              className={`nc-obs-avatar pixelated blank${agent.awake ? '' : ' asleep'}`}
-              src={BLANK_AVATAR}
-              alt=""
-              aria-hidden="true"
-            />
-            <span className="nc-of-blank-initials">{initials(agent.name)}</span>
-          </span>
-        )}
-        <img className="nc-of-sprite nc-of-desk" src={agent.awake ? DESK_ON : DESK_OFF} alt="" aria-hidden="true" />
-      </div>
-      <span className="nc-obs-chip-glyph" aria-hidden="true">
-        {agent.awake ? '●' : '💤'}
-      </span>
-      <span className="nc-obs-chip-name">{agent.name}</span>
-      {isOpen && (
-        // Stops a click inside the popover (including the close button) from
-        // bubbling to the chip's own onClick and immediately re-opening it.
-        <div className={`nc-obs-hover ${pinned ? 'pinned' : ''}`} onClick={(e) => e.stopPropagation()}>
-          <button type="button" className="nc-obs-hover-close" aria-label="close" onClick={onClose}>
-            ✕
-          </button>
-          <div className="nc-obs-hover-canonical">{agent.canonicalName}</div>
-          <div>{agent.awake ? 'awake' : 'asleep'}</div>
-          <div>{agent.lastSeenAt ? `last seen ${relAge(agent.lastSeenAt)} ago` : 'never seen'}</div>
-          <div>{agent.holding.length > 0 ? `holding: ${agent.holding.join(', ')}` : 'holding nothing'}</div>
-          <div>{agent.nextTask ? `next: ${agent.nextTask.title} (${relTime(agent.nextTask.at)})` : 'no upcoming task'}</div>
-          {/* Steering opens the session rather than composing here: a message
-              sent without the transcript in front of you is a guess, and the
-              session view already has both. One click, no blind steer. */}
-          {agent.lastSessionId ? (
-            <a className="nc-obs-hover-steer" href={`#/session/${agent.lastSessionId}`}>
-              open session to steer →
-            </a>
-          ) : (
-            <div className="nc-obs-hover-nosession">no session to steer — it has never spoken</div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ─── Zone — a rug, a hanging sign and a desk cluster on the open floor ──── */
-
-function Zone({
-  room,
-  bodies,
-  agentsById,
-  highlightedAgentId,
-  openAgentId,
-  bindPopover,
-  panelOpen,
-  onToggle,
-  onClosePanel,
-}: {
-  room: ObservatoryRoom;
-  bodies: ObservatoryAgent[];
-  agentsById: Map<string, ObservatoryAgent>;
-  highlightedAgentId: string | null;
-  openAgentId: string | null;
-  bindPopover: (id: string) => PopoverBinding;
-  panelOpen: boolean;
-  onToggle: () => void;
-  onClosePanel: () => void;
-}) {
-  const cls = roomActivityClass(room.lastActivityAt);
-  const presentIds = new Set(bodies.map((a) => a.id));
-  const absentMembers = room.memberAgentIds.filter((id) => !presentIds.has(id));
-  const decor = roomDecor(room.key);
-  // A dusty zone's filtered sprites create their own stacking context, which
-  // can trap an open panel below zones later in the grid. Elevating the zone
-  // itself (grid items honor z-index without needing position:relative) lifts
-  // anything open inside it above every sibling.
-  const hasOpenPanel = panelOpen || bodies.some((a) => a.id === openAgentId);
-
-  return (
-    <div
-      className={`nc-obs-room nc-of-zone rug-${rugTone(room.key)} ${cls} ${hasOpenPanel ? 'has-open-popover' : ''}`}
-      data-room-key={room.key}
-    >
-      <button
-        type="button"
-        className="nc-obs-room-head nc-of-sign"
-        aria-expanded={panelOpen}
-        onClick={onToggle}
-      >
-        <span className="nc-obs-room-name">{room.name}</span>
-      </button>
-
-      {cls === 'dusty' && (
-        <img className="nc-obs-room-cobweb" src={COBWEB} alt="" aria-hidden="true" title="quiet for a while" />
-      )}
-
-      <div className="nc-of-decor" aria-hidden="true">
-        {decor.map((d) => (
-          <img key={d.name} className={`nc-of-sprite nc-of-decor-${d.name}`} src={d.src} alt="" data-decor={d.name} />
-        ))}
-      </div>
-
-      <div className="nc-obs-room-bodies">
-        {bodies.map((a) => (
-          <AgentChip key={a.id} agent={a} highlighted={a.id === highlightedAgentId} {...bindPopover(a.id)} />
-        ))}
-        {bodies.length === 0 && (
-          <div className="nc-of-empty-desks" aria-hidden="true">
-            <img className="nc-of-sprite nc-of-desk" src={DESK_OFF} alt="" />
-            <img className="nc-of-sprite nc-of-desk" src={DESK_OFF} alt="" />
-          </div>
-        )}
-        {absentMembers.length > 0 && (
-          <div className="nc-of-absent-row">
-            {absentMembers.map((id) => {
-              const known = agentsById.get(id);
-              return known?.avatarUrl ? (
-                <img
-                  key={id}
-                  className="nc-obs-avatar-sm pixelated"
-                  src={known.avatarUrl}
-                  alt={known.name}
-                  title={known.name}
-                  loading="lazy"
-                  referrerPolicy="no-referrer"
-                />
-              ) : (
-                <span key={id} className="nc-obs-room-absent" title={known?.name ?? id}>
-                  {initials(known?.name ?? id)}
-                </span>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      {panelOpen && (
-        <div className="nc-obs-hover pinned nc-of-zone-panel" onClick={(e) => e.stopPropagation()}>
-          <button type="button" className="nc-obs-hover-close" aria-label="close" onClick={onClosePanel}>
-            ✕
-          </button>
-          <div className="nc-of-zone-panel-name">{room.name}</div>
-          <div className="nc-obs-hover-canonical">{room.platform}</div>
-          <div>
-            {bodies.length > 0 ? `here now: ${bodies.map((a) => a.name).join(', ')}` : 'nobody at these desks'}
-          </div>
-          <div>
-            {room.lastActivityAt ? `last active ${relAge(room.lastActivityAt)} ago` : 'no activity on record'}
-          </div>
-          {room.permalink && <OutLink href={room.permalink}>open channel</OutLink>}
-        </div>
-      )}
-    </div>
   );
 }
 

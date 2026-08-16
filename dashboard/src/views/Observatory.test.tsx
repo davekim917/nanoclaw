@@ -23,7 +23,6 @@ vi.mock('./ScheduledDrawer.js', () => ({
 import {
   Observatory,
   sortRooms,
-  roomActivityClass,
   sortClaims,
   claimAgeLabel,
   groupReleaseItems,
@@ -33,7 +32,6 @@ import {
   upcomingScheduled,
 } from './Observatory.js';
 import { RouteNav } from './BoardShell.js';
-import { roomDecor, rugTone, RUG_TONES, COBWEB, BLANK_AVATAR, DESK_ON, DESK_OFF } from './office-sprites.js';
 import useSWR from 'swr';
 import type {
   ObservatoryRoom,
@@ -189,76 +187,6 @@ describe('Observatory', () => {
     vi.unstubAllGlobals();
   });
 
-  it('renders rooms in stable platform/name order regardless of payload order', () => {
-    mockData(
-      snapshot({
-        rooms: [
-          room({ key: 'z', name: 'zeta', platform: 'discord', lastActivityAt: new Date().toISOString() }),
-          room({ key: 'a', name: 'alpha', platform: 'discord', lastActivityAt: null }),
-          room({ key: 'b', name: 'bravo', platform: 'slack', lastActivityAt: null }),
-        ],
-      }),
-    );
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const keys = Array.from(container.querySelectorAll('.nc-obs-room')).map((el) => el.getAttribute('data-room-key'));
-    // discord (alpha, zeta) before slack (bravo); within discord, alpha before zeta.
-    expect(keys).toEqual(['a', 'z', 'b']);
-  });
-
-  it('roomActivityClass: dusty for >7d or null, lit for today', () => {
-    const now = Date.parse('2026-08-14T12:00:00Z');
-    expect(roomActivityClass(null, now)).toBe('dusty');
-    expect(roomActivityClass('2026-08-01T00:00:00Z', now)).toBe('dusty');
-    expect(roomActivityClass('2026-08-14T09:00:00Z', now)).toBe('lit');
-  });
-
-  it('applies the dusty class to a stale room and not to an active-today room', () => {
-    mockData(
-      snapshot({
-        rooms: [
-          room({ key: 'fresh', lastActivityAt: new Date().toISOString() }),
-          room({ key: 'old', lastActivityAt: '2020-01-01T00:00:00Z' }),
-        ],
-      }),
-    );
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    expect(container.querySelector('.nc-obs-room[data-room-key="fresh"]')!.className).not.toContain('dusty');
-    expect(container.querySelector('.nc-obs-room[data-room-key="old"]')!.className).toContain('dusty');
-  });
-
-  it('renders an awake agent bright in its located room, and an asleep agent with 💤 in the desks strip', () => {
-    mockData(
-      snapshot({
-        rooms: [room({ key: 'r1' })],
-        agents: [
-          agent({ id: 'ava', name: 'ava', location: 'r1', awake: true }),
-          agent({ id: 'kit', name: 'kit', location: null, awake: false }),
-        ],
-      }),
-    );
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const roomChip = container.querySelector('.nc-obs-room[data-room-key="r1"] .nc-obs-chip')!;
-    expect(roomChip.className).toContain('awake');
-    const deskChip = container.querySelector('.nc-obs-desks .nc-obs-chip')!;
-    expect(deskChip.className).toContain('asleep');
-    expect(deskChip.textContent).toContain('💤');
-  });
-
-  it('renders wired-but-absent members as faint initials', () => {
-    mockData(
-      snapshot({
-        rooms: [room({ key: 'r1', memberAgentIds: ['ava', 'ghost'] })],
-        agents: [agent({ id: 'ava', name: 'ava', location: 'r1' })],
-      }),
-    );
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    // ava is present as a body chip, not an absent initial.
-    expect(container.querySelector('.nc-obs-room-bodies .nc-obs-chip')).toBeTruthy();
-    const absent = container.querySelectorAll('.nc-obs-room-absent');
-    expect(absent.length).toBe(1);
-    expect(absent[0]!.textContent).toBe('G');
-  });
-
   it('claims wall groups by state stale → parked → expiring → live, parked shows "needs an owner"', () => {
     mockData(
       snapshot({
@@ -302,63 +230,6 @@ describe('Observatory', () => {
     mockData(undefined, new Error('404'));
     const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
     expect(container.querySelector('.nc-obs-offline')!.textContent).toContain('observatory offline');
-  });
-
-  it('hover card on an agent chip shows holding and nextTask', async () => {
-    mockData(
-      snapshot({
-        agents: [
-          agent({
-            id: 'ava',
-            name: 'ava',
-            canonicalName: 'ava-agent',
-            location: null,
-            holding: ['claim-slug-1'],
-            nextTask: { title: 'send digest', at: new Date(Date.now() + 3600_000).toISOString() },
-          }),
-        ],
-      }),
-    );
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const chip = container.querySelector('.nc-obs-chip')! as HTMLElement;
-    await userEvent.hover(chip);
-    const hoverCard = container.querySelector('.nc-obs-hover')!;
-    expect(hoverCard.textContent).toContain('claim-slug-1');
-    expect(hoverCard.textContent).toContain('send digest');
-    expect(hoverCard.textContent).toContain('ava-agent');
-  });
-
-  it('opens a popover on click and closes it on outside click', async () => {
-    mockData(snapshot({ agents: [agent({ id: 'ava', name: 'ava', location: null })] }));
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const chip = container.querySelector('.nc-obs-chip[data-agent-id="ava"]')! as HTMLElement;
-    expect(container.querySelector('.nc-obs-hover')).toBeFalsy();
-
-    await userEvent.click(chip);
-    expect(container.querySelector('.nc-obs-hover')).toBeTruthy();
-
-    // Outside click (the frame itself, not any chip) closes it.
-    await userEvent.click(container.querySelector('.nc-frame')!);
-    expect(container.querySelector('.nc-obs-hover')).toBeFalsy();
-  });
-
-  it('only one popover is open at a time — clicking a second chip closes the first', async () => {
-    mockData(
-      snapshot({
-        agents: [agent({ id: 'ava', name: 'ava', location: null }), agent({ id: 'kit', name: 'kit', location: null })],
-      }),
-    );
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const avaChip = container.querySelector('.nc-obs-chip[data-agent-id="ava"]')! as HTMLElement;
-    const kitChip = container.querySelector('.nc-obs-chip[data-agent-id="kit"]')! as HTMLElement;
-
-    await userEvent.click(avaChip);
-    expect(avaChip.querySelector('.nc-obs-hover')).toBeTruthy();
-
-    await userEvent.click(kitChip);
-    expect(avaChip.querySelector('.nc-obs-hover')).toBeFalsy();
-    expect(kitChip.querySelector('.nc-obs-hover')).toBeTruthy();
-    expect(container.querySelectorAll('.nc-obs-hover').length).toBe(1);
   });
 
   it('claim group subtitles render the exact operator-facing language for every state', () => {
@@ -438,9 +309,11 @@ describe('Observatory', () => {
     const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
     const main = container.querySelector('.nc-obs-main')!;
     const kids = Array.from(main.children);
-    // The floor is the FIRST thing in the main column — the whole complaint
-    // was scrolling past ten pages of board to reach it.
-    expect(kids[0]!.className).toContain('nc-of-floor');
+    // The office is the FIRST thing in the main column — the whole complaint
+    // was scrolling past ten pages of board to reach it. It is now the
+    // <office-map> card rather than the old CSS floor.
+    expect(kids[0]!.className).toContain('nc-of-mapcard');
+    expect(container.querySelector('office-map')).toBeTruthy();
     const boards = Array.from(container.querySelectorAll('details.nc-of-board')) as HTMLDetailsElement[];
     expect(boards).toHaveLength(4);
     // "Needs attention" is deliberately the ONE board that opens itself. A
@@ -455,131 +328,11 @@ describe('Observatory', () => {
   });
 
   describe('avatar faces', () => {
-    it('renders a pixelated avatar image on the chip when avatarUrl is present', () => {
-      mockData(
-        snapshot({
-          agents: [agent({ id: 'ava', name: 'ava', avatarUrl: 'https://avatars.slack-edge.com/ava.png', awake: true })],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const img = container.querySelector('.nc-obs-chip[data-agent-id="ava"] img')! as HTMLImageElement;
-      expect(img).toBeTruthy();
-      expect(img.className).toContain('pixelated');
-      expect(img.getAttribute('src')).toBe('https://avatars.slack-edge.com/ava.png');
-    });
+  
 
-    it('falls back to dashed initials for the wired-member marker when avatarUrl is null', () => {
-      mockData(
-        snapshot({
-          rooms: [room({ key: 'r1', memberAgentIds: ['kit'] })],
-          agents: [agent({ id: 'kit', name: 'kit', location: null, avatarUrl: null })],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const absent = container.querySelector('.nc-obs-room-absent')!;
-      expect(absent.textContent).toBe('K');
-      // No avatar face for the absent member — the room's own furniture and
-      // empty-desk sprites live in the same row, so assert on the avatar.
-      expect(container.querySelector('.nc-obs-room-bodies .nc-obs-avatar')).toBeFalsy();
-    });
+  
 
-    it('applies the grayscale "asleep" class to the avatar image when the agent is asleep', () => {
-      mockData(
-        snapshot({
-          agents: [agent({ id: 'ava', name: 'ava', avatarUrl: 'https://avatars.slack-edge.com/ava.png', awake: false })],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const img = container.querySelector('.nc-obs-chip[data-agent-id="ava"] img')!;
-      expect(img.className).toContain('asleep');
-    });
-  });
-
-  describe('the office floor', () => {
-    const decorOf = (container: HTMLElement, key: string) =>
-      Array.from(container.querySelectorAll(`.nc-obs-room[data-room-key="${key}"] .nc-of-decor img`)).map((el) =>
-        el.getAttribute('data-decor'),
-      );
-
-    it('room furniture is deterministic per room key, not random per render', () => {
-      // Pure helper first — same key in, same furniture out.
-      expect(roomDecor('slack:C123').map((d) => d.name)).toEqual(roomDecor('slack:C123').map((d) => d.name));
-
-      mockData(snapshot({ rooms: [room({ key: 'slack:C123' }), room({ key: 'slack:C999', name: 'other' })] }));
-      const first = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-
-      const a = decorOf(first.container, 'slack:C123');
-      expect(a.length).toBeGreaterThan(0);
-      expect(a).toEqual(decorOf(second.container, 'slack:C123'));
-      expect(decorOf(first.container, 'slack:C999')).toEqual(decorOf(second.container, 'slack:C999'));
-      // Every piece comes from the sprite set, never an empty/undefined src.
-      for (const img of Array.from(first.container.querySelectorAll('.nc-of-decor img'))) {
-        expect(img.getAttribute('src')).toMatch(/^data:image\/svg\+xml,/);
-      }
-    });
-
-    it('an abandoned room is marked dusty and gets a cobweb sprite; a live room gets neither', () => {
-      mockData(
-        snapshot({
-          rooms: [
-            room({ key: 'old', lastActivityAt: '2020-01-01T00:00:00Z' }),
-            room({ key: 'fresh', lastActivityAt: new Date().toISOString() }),
-          ],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const old = container.querySelector('.nc-obs-room[data-room-key="old"]')!;
-      expect(old.className).toContain('dusty');
-      expect(old.querySelector('.nc-obs-room-cobweb')!.getAttribute('src')).toBe(COBWEB);
-
-      const fresh = container.querySelector('.nc-obs-room[data-room-key="fresh"]')!;
-      expect(fresh.className).not.toContain('dusty');
-      expect(fresh.querySelector('.nc-obs-room-cobweb')).toBeFalsy();
-    });
-
-    it('the bullpen holds exactly the agents with no location', () => {
-      mockData(
-        snapshot({
-          rooms: [room({ key: 'r1' })],
-          agents: [
-            agent({ id: 'ava', name: 'ava', location: 'r1' }),
-            agent({ id: 'kit', name: 'kit', location: null }),
-            agent({ id: 'zed', name: 'zed', location: null }),
-          ],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const inPen = Array.from(container.querySelectorAll('.nc-of-bullpen .nc-obs-chip')).map((el) =>
-        el.getAttribute('data-agent-id'),
-      );
-      expect(inPen).toEqual(['kit', 'zed']);
-      // and the bullpen is part of the floor, not a strip above it.
-      expect(container.querySelector('.nc-of-floor > .nc-of-bullpen')).toBeTruthy();
-    });
-
-    it('an agent with no avatarUrl gets the blank-avatar sprite with initials over it', () => {
-      mockData(snapshot({ agents: [agent({ id: 'zed', name: 'zed rivera', avatarUrl: null })] }));
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const blank = container.querySelector('.nc-obs-chip[data-agent-id="zed"] .nc-of-blank')!;
-      const img = blank.querySelector('img')!;
-      expect(img.getAttribute('src')).toBe(BLANK_AVATAR);
-      expect(img.className).toContain('pixelated');
-      expect(blank.querySelector('.nc-of-blank-initials')!.textContent).toBe('ZR');
-    });
-
-    it('an awake agent sits at a lit desk, an asleep agent at a dark one', () => {
-      mockData(
-        snapshot({
-          agents: [agent({ id: 'ava', name: 'ava', awake: true }), agent({ id: 'kit', name: 'kit', awake: false })],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const deskOf = (id: string) =>
-        container.querySelector(`.nc-obs-chip[data-agent-id="${id}"] .nc-of-desk`)!.getAttribute('src');
-      expect(deskOf('ava')).toBe(DESK_ON);
-      expect(deskOf('kit')).toBe(DESK_OFF);
-    });
+  
   });
 
   describe('Release Desk', () => {
@@ -650,34 +403,7 @@ describe('Observatory', () => {
       expect(container.querySelector('.nc-obs-release-group')).toBeNull();
     });
 
-    it('clicking an agent on the floor narrows the board to their desk, counts included', async () => {
-      mockData(
-        snapshot({
-          rooms: [room({ key: 'r1' })],
-          agents: [agent({ id: 'ava', name: 'ava', location: 'r1' })],
-          releaseState: releaseState({
-            items: [
-              releaseItem({ id: 'A1', owner: 'ava', nextMover: 'agent', title: 'ava item' }),
-              releaseItem({ id: 'K1', owner: 'kit', nextMover: 'agent', title: 'kit item' }),
-            ],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('2 automated');
-
-      await userEvent.click(container.querySelector('.nc-obs-room[data-room-key="r1"] .nc-obs-chip')!);
-      expect(container.querySelector('.nc-obs-release-owner-filter')!.textContent).toContain('ava');
-      expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('1 automated');
-      const ids = Array.from(container.querySelectorAll('.nc-obs-release-row')).map((e) =>
-        e.getAttribute('data-item-id'),
-      );
-      expect(ids).toEqual(['A1']);
-
-      await userEvent.click(container.querySelector('.nc-obs-release-owner-clear')!);
-      expect(container.querySelector('.nc-obs-release-owner-filter')).toBeNull();
-      expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('2 automated');
-    });
+  
 
     it('the dependency view states coverage first and marks undeclared items as not-independent', async () => {
       mockData(
@@ -712,25 +438,7 @@ describe('Observatory', () => {
       expect(container.querySelector('.nc-obs-dep-rank-row')!.textContent).toContain('A1');
     });
 
-    it('an agent popover offers its session to steer, and says so when there is none', async () => {
-      mockData(
-        snapshot({
-          rooms: [room({ key: 'r1' })],
-          agents: [
-            agent({ id: 'ava', name: 'ava', location: 'r1', lastSessionId: 'sess-9' }),
-            agent({ id: 'kit', name: 'kit', location: null, lastSessionId: null }),
-          ],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-
-      await userEvent.click(container.querySelector('.nc-obs-chip[data-agent-id="ava"]')!);
-      expect(container.querySelector('.nc-obs-hover-steer')!.getAttribute('href')).toBe('#/session/sess-9');
-
-      await userEvent.click(container.querySelector('.nc-obs-chip[data-agent-id="kit"]')!);
-      expect(container.querySelector('.nc-obs-hover-nosession')).toBeTruthy();
-      expect(container.querySelector('.nc-obs-hover-steer')).toBeNull();
-    });
+  
 
     it('blockers group renders first and dedupes a blocksRelease item out of its mover group', () => {
       mockData(
@@ -932,65 +640,18 @@ describe('Observatory', () => {
   });
 
   describe('open floor plan', () => {
-    it('rugTone is stable per zone key and stays inside the tone set', () => {
-      expect(rugTone('slack:C123')).toBe(rugTone('slack:C123'));
-      for (const key of ['slack:C1', 'discord:D2', 'slack:C999', 'x']) {
-        expect(rugTone(key)).toBeGreaterThanOrEqual(0);
-        expect(rugTone(key)).toBeLessThan(RUG_TONES);
-      }
-    });
+  
 
     // Renamed from "…with no wall styling left". Rooms ARE walled now: the
     // office-16 amendment adopted enclosure after three independent critics
     // read the unwalled version as a colour-block chart rather than a floor
     // plan. The name asserted a contract the body never checked; the body's
     // real subject is the zone class, its rug tone and its hanging sign.
-    it('a zone carries a rug tone and a hanging sign that names the channel', () => {
-      mockData(snapshot({ rooms: [room({ key: 'r1', name: 'general' })] }));
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const zone = container.querySelector('.nc-obs-room[data-room-key="r1"]')!;
-      expect(zone.className).toContain('nc-of-zone');
-      expect(zone.className).toMatch(/rug-[0-5]/);
-      const sign = zone.querySelector('.nc-of-sign')!;
-      expect(sign.tagName).toBe('BUTTON');
-      expect(sign.textContent).toContain('general');
-    });
+  
 
-    it('clicking a zone opens a detail panel with who is there, last activity and a channel link', async () => {
-      const lastActivityAt = new Date(Date.now() - 3600_000).toISOString();
-      mockData(
-        snapshot({
-          rooms: [room({ key: 'r1', name: 'general', lastActivityAt, permalink: 'https://example.com/c/general' })],
-          agents: [agent({ id: 'ava', name: 'ava', location: 'r1' })],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const zone = container.querySelector('.nc-obs-room[data-room-key="r1"]')!;
-      expect(zone.querySelector('.nc-of-zone-panel')).toBeFalsy();
+  
 
-      await userEvent.click(zone.querySelector('.nc-of-sign')! as HTMLElement);
-      const panel = zone.querySelector('.nc-of-zone-panel')!;
-      expect(panel.textContent).toContain('general');
-      expect(panel.textContent).toContain('ava');
-      expect(panel.textContent).toContain('last active');
-      const link = panel.querySelector('a.nc-of-link')!;
-      expect(link.getAttribute('href')).toBe('https://example.com/c/general');
-      expect(link.getAttribute('target')).toBe('_blank');
-      expect(link.textContent).toContain('open channel');
-
-      // Same button toggles it shut again.
-      await userEvent.click(zone.querySelector('.nc-of-sign')! as HTMLElement);
-      expect(zone.querySelector('.nc-of-zone-panel')).toBeFalsy();
-    });
-
-    it('a zone with no permalink shows no link affordance', async () => {
-      mockData(snapshot({ rooms: [room({ key: 'r1', permalink: null })] }));
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const zone = container.querySelector('.nc-obs-room[data-room-key="r1"]')!;
-      await userEvent.click(zone.querySelector('.nc-of-sign')! as HTMLElement);
-      expect(zone.querySelector('.nc-of-zone-panel')).toBeTruthy();
-      expect(zone.querySelector('.nc-of-zone-panel a')).toBeFalsy();
-    });
+  
   });
 
   describe('claim rows', () => {
@@ -1022,17 +683,7 @@ describe('Observatory', () => {
       expect(row.querySelector('.nc-obs-claim-detail a')).toBeFalsy();
     });
 
-    it('clicking a claim still highlights the agent that owns it', async () => {
-      mockData(
-        snapshot({
-          claims: [claim({ slug: 'c1', owner: 'ava' })],
-          agents: [agent({ id: 'ava', name: 'ava', location: null })],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await userEvent.click(container.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
-      expect(container.querySelector('.nc-obs-chip[data-agent-id="ava"]')!.className).toContain('highlighted');
-    });
+  
   });
 
   describe("what's scheduled", () => {
@@ -1117,12 +768,7 @@ describe('Observatory', () => {
       expect(container.querySelector('.nc-of-sched-empty')!.textContent).toBe('nothing scheduled');
     });
 
-    it('degrades quietly when the scheduled call fails, leaving the rest of the page intact', () => {
-      mockData(snapshot({ rooms: [room({ key: 'r1' })] }), undefined, { error: new Error('500') });
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelector('.nc-of-sched-empty')!.textContent).toBe("couldn't load scheduled work");
-      expect(container.querySelector('.nc-obs-room[data-room-key="r1"]')).toBeTruthy();
-    });
+  
   });
 
   describe('RouteNav', () => {
