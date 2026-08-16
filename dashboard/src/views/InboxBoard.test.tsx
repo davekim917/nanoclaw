@@ -183,15 +183,15 @@ describe('InboxBoard', () => {
     expect(vi.mocked(archiveSession)).toHaveBeenCalledWith('sess-arch');
   });
 
-  it('clicking the Scheduled nav button fires onRouteChange', async () => {
+  it('clicking the Observatory nav button fires onRouteChange', async () => {
     vi.mocked(useSWR).mockReturnValue({
       data: { sessions: [] },
       mutate: vi.fn(),
     } as unknown as ReturnType<typeof useSWR>);
     const onRouteChange = vi.fn();
     render(<InboxBoard authMe={mockAuthMe} route="inbox" onRouteChange={onRouteChange} />);
-    // The primary RouteNav renders "Inbox" + "Scheduled" + "Workgroup" on both layouts.
-    await userEvent.click(screen.getByRole('button', { name: /^Scheduled$/i }));
-    expect(onRouteChange).toHaveBeenCalledWith('scheduled');
+    // The Observatory is the RouteNav's only destination on both layouts.
+    await userEvent.click(screen.getByRole('button', { name: /^Observatory$/i }));
+    expect(onRouteChange).toHaveBeenCalledWith('observatory');
   });
 });

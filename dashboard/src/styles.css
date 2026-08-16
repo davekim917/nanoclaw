@@ -1830,9 +1830,16 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-sched-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .nc-of .nc-of-sched-row {
   background: var(--of-paper); border: 3px solid var(--of-ink-2);
-  box-shadow: 3px 3px 0 rgb(0 0 0 / 0.22); padding: 8px 12px; min-height: 44px;
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; color: var(--of-ink);
+  box-shadow: 3px 3px 0 rgb(0 0 0 / 0.22); color: var(--of-ink);
 }
+/* The whole row is the hit target — 44px min so it stays tappable on a phone. */
+.nc-of .nc-of-sched-open {
+  appearance: none; background: none; border: 0; margin: 0; font: inherit; color: inherit;
+  width: 100%; padding: 8px 12px; min-height: 44px; text-align: left; cursor: pointer;
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
+}
+.nc-of .nc-of-sched-open:hover { background: var(--of-paper-2, rgb(0 0 0 / 0.05)); }
+.nc-of .nc-of-sched-open:focus-visible { outline: 3px solid var(--of-ink); outline-offset: -3px; }
 .nc-of .nc-of-sched-who {
   font-family: var(--font-mono); font-size: 11.5px; font-weight: 600;
   letter-spacing: 0.08em; text-transform: uppercase; color: var(--of-ink);

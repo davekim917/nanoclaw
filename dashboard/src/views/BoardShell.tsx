@@ -10,7 +10,7 @@ import type { GroupFilter } from '../lib/use-group-filter.js';
  * across routes; each view differs only in what it puts inside the frame.
  */
 
-export type BoardRoute = 'inbox' | 'scheduled' | 'workgroup' | 'observatory';
+export type BoardRoute = 'inbox' | 'workgroup' | 'observatory';
 
 const MOBILE_QUERY = '(max-width: 899px)';
 
@@ -63,13 +63,15 @@ export function BoardBrand({
 }
 
 /**
- * Primary nav (Scheduled / Observatory) for the pulse header — rendered on
- * both mobile and desktop. Active-route highlighting drives off `route === ...`
- * so the component is layout-agnostic; positioning is up to the consumer.
+ * Primary nav for the pulse header — rendered on both mobile and desktop.
+ * Active-route highlighting drives off `route === ...` so the component is
+ * layout-agnostic; positioning is up to the consumer.
  *
- * The inbox and workgroup routes are deliberately absent from the nav: their
- * components and `#/inbox` / `#/workgroup` hashes still work for anyone
- * holding an old link, they just aren't offered as a destination any more.
+ * The Observatory is the only destination left. Inbox, workgroup and the
+ * scheduled board are gone from the nav: the first two still render for anyone
+ * holding an old `#/inbox` / `#/workgroup` link, while `#/scheduled` now
+ * redirects — scheduled work lives in the Observatory's own section, which
+ * opens the same detail drawer the standalone board used to.
  */
 export function RouteNav({
   route,
@@ -80,12 +82,6 @@ export function RouteNav({
 }) {
   return (
     <nav className="nc-pulse-actions">
-      <button
-        className={`nav-link ${route === 'scheduled' ? 'active' : ''}`}
-        onClick={() => onRouteChange('scheduled')}
-      >
-        Scheduled
-      </button>
       <button
         className={`nav-link ${route === 'observatory' ? 'active' : ''}`}
         onClick={() => onRouteChange('observatory')}

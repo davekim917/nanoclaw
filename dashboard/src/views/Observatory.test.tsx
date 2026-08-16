@@ -14,6 +14,12 @@ vi.mock('../lib/api.js', () => ({
   listScheduled: vi.fn(),
 }));
 
+// The drawer is exercised by its own suite; here we only care that the floor
+// opens it with the right row key.
+vi.mock('./ScheduledDrawer.js', () => ({
+  ScheduledDrawer: ({ rowKey }: { rowKey: string }) => <div data-testid="sched-drawer">drawer:{rowKey}</div>,
+}));
+
 import {
   Observatory,
   sortRooms,
@@ -907,6 +913,27 @@ describe('Observatory', () => {
       expect(row.textContent).toContain('general');
     });
 
+    it('opens the detail drawer for a row — the capability the deleted Scheduled tab used to own', async () => {
+      mockData(snapshot({ agents: [agent({ id: 'ava', name: 'ava' })] }), undefined, {
+        data: {
+          rows: [
+            schedRow({
+              key: 'mine',
+              agent_group_id: 'ava',
+              next_fire_utc: new Date(Date.now() + 600_000).toISOString(),
+            }),
+          ],
+          degraded: false,
+          counts: {},
+          assembled_at: '',
+        },
+      });
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('[data-testid="sched-drawer"]')).toBeNull();
+      await userEvent.click(container.querySelector('.nc-of-sched-row .nc-of-sched-open')!);
+      expect(container.querySelector('[data-testid="sched-drawer"]')!.textContent).toBe('drawer:mine');
+    });
+
     it('shows the empty state when nothing on this floor is scheduled', () => {
       mockData(snapshot({ agents: [agent({ id: 'ava' })] }), undefined, {
         data: {
@@ -929,10 +956,10 @@ describe('Observatory', () => {
   });
 
   describe('RouteNav', () => {
-    it('no longer offers the inbox or workgroup destinations', () => {
+    it('offers the Observatory only — inbox, workgroup and the scheduled board are gone', () => {
       const { container } = render(<RouteNav route="observatory" onRouteChange={noop} />);
       const labels = Array.from(container.querySelectorAll('button')).map((b) => b.textContent);
-      expect(labels).toEqual(['Scheduled', 'Observatory']);
+      expect(labels).toEqual(['Observatory']);
     });
   });
 });

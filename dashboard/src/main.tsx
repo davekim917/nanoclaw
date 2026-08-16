@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { AuthGate } from './auth/AuthGate.js';
 import { InboxBoard } from './views/InboxBoard.js';
-import { ScheduledBoard } from './views/ScheduledBoard.js';
 import { WorkgroupDashboard } from './views/WorkgroupDashboard.js';
 import { Observatory } from './views/Observatory.js';
 import { SessionDetail } from './views/SessionDetail.js';
@@ -17,14 +16,14 @@ import './styles.css';
 const TWEAK_CLASS = 'tw-no-heat tw-no-grid';
 
 function parseHash(): { route: BoardRoute | 'session'; sessionId?: string } {
-  const hash = location.hash.slice(1) || '/inbox';
+  const hash = location.hash.slice(1) || '/observatory';
   if (hash.startsWith('/session/')) return { route: 'session', sessionId: hash.slice(9) };
-  if (hash === '/scheduled') return { route: 'scheduled' };
+  if (hash === '/inbox') return { route: 'inbox' };
   if (hash === '/workgroup') return { route: 'workgroup' };
-  if (hash === '/observatory') return { route: 'observatory' };
-  // Any other/stale hash (including the removed /board and /task/:id routes)
-  // falls back to the inbox rather than rendering nothing.
-  return { route: 'inbox' };
+  // Any other/stale hash (including the removed /board, /scheduled and
+  // /task/:id routes) falls back to the Observatory rather than rendering
+  // nothing. Scheduled work is a section of the floor now.
+  return { route: 'observatory' };
 }
 
 function App() {
@@ -71,8 +70,7 @@ function App() {
   }, []);
 
   const navigate = useCallback((r: BoardRoute) => {
-    location.hash =
-      r === 'scheduled' ? '#/scheduled' : r === 'workgroup' ? '#/workgroup' : r === 'observatory' ? '#/observatory' : '#/inbox';
+    location.hash = r === 'workgroup' ? '#/workgroup' : r === 'inbox' ? '#/inbox' : '#/observatory';
   }, []);
 
   if (authState === 'loading') {
@@ -105,9 +103,6 @@ function App() {
   return (
     <div className={TWEAK_CLASS} style={{ minHeight: '100vh' }}>
       {hashState.route === 'inbox' && me && <InboxBoard authMe={me} route="inbox" onRouteChange={navigate} />}
-      {hashState.route === 'scheduled' && me && (
-        <ScheduledBoard authMe={me} route="scheduled" onRouteChange={navigate} />
-      )}
       {hashState.route === 'workgroup' && me && (
         <WorkgroupDashboard authMe={me} route="workgroup" onRouteChange={navigate} />
       )}

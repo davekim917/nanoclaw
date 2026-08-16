@@ -18,6 +18,7 @@ import {
 } from '../lib/api.js';
 import { relAge } from '../lib/derive.js';
 import { RouteNav, type BoardRoute } from './BoardShell.js';
+import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
 import { DESK_ON, DESK_OFF, COBWEB, COUCH, BLANK_AVATAR, roomDecor, rugTone } from './office-sprites.js';
 
@@ -537,10 +538,15 @@ export function upcomingScheduled(rows: ScheduledRow[], agentGroupIds: string[],
 }
 
 function ScheduledSection({ agentGroupIds }: { agentGroupIds: string[] }) {
-  const { data, error } = useSWR<ScheduledSnapshot>('/dashboard/api/scheduled', () => listScheduled(), {
+  const { data, error, mutate } = useSWR<ScheduledSnapshot>('/dashboard/api/scheduled', () => listScheduled(), {
     refreshInterval: POLL_MS,
   });
+  const [openKey, setOpenKey] = useState<string | null>(null);
   const rows = upcomingScheduled(data?.rows ?? [], agentGroupIds);
+  // A key whose row has dropped out of the window (it fired, or was cancelled
+  // from another tab) must not hold a drawer open over a series that is no
+  // longer on this floor.
+  const open = rows.some((r) => r.key === openKey) ? openKey : null;
 
   return (
     <section className="nc-of-sched">
@@ -551,15 +557,23 @@ function ScheduledSection({ agentGroupIds }: { agentGroupIds: string[] }) {
         <ul className="nc-of-sched-list">
           {rows.map((r) => (
             <li key={r.key} className="nc-of-sched-row" data-sched-key={r.key}>
-              <span className="nc-of-sched-who">{r.agent_group_name}</span>
-              <span className="nc-of-sched-what">{SCHED_KIND_LABEL[r.kind] ?? 'job'}</span>
-              <span className="nc-of-sched-when">{relTime(r.next_fire_utc!)}</span>
-              {r.channel_name && <span className="nc-of-sched-where">in {r.channel_name}</span>}
-              <span className="nc-of-sched-id">{r.series_id}</span>
+              <button
+                type="button"
+                className="nc-of-sched-open"
+                onClick={() => setOpenKey(r.key)}
+                aria-label={`Open scheduled job ${r.series_id}`}
+              >
+                <span className="nc-of-sched-who">{r.agent_group_name}</span>
+                <span className="nc-of-sched-what">{SCHED_KIND_LABEL[r.kind] ?? 'job'}</span>
+                <span className="nc-of-sched-when">{relTime(r.next_fire_utc!)}</span>
+                {r.channel_name && <span className="nc-of-sched-where">in {r.channel_name}</span>}
+                <span className="nc-of-sched-id">{r.series_id}</span>
+              </button>
             </li>
           ))}
         </ul>
       )}
+      {open && <ScheduledDrawer rowKey={open} onClose={() => setOpenKey(null)} onMutated={() => void mutate()} />}
     </section>
   );
 }
