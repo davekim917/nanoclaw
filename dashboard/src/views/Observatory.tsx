@@ -727,6 +727,13 @@ function ReleaseDesk({
  * it holds rotted three days ago. These three numbers measure FLOW instead:
  * what has already failed its promise, what a person owes, and what is moving.
  */
+/**
+ * ONE canonical name per state, shared by this strip, the ledger rows and the
+ * job-board tallies. "Waiting on a person" and "need a person" were the same
+ * state under two names, stacked vertically on one screen.
+ */
+export const STATE_WORDS = { stalled: 'stalled', person: 'need a person', moving: 'moving' } as const;
+
 export function CommitmentStrip({ items }: { items: ReleaseItem[] }) {
   const { counts } = useMemo(() => buildLedger(items), [items]);
   if (items.length === 0) return null;
@@ -734,15 +741,15 @@ export function CommitmentStrip({ items }: { items: ReleaseItem[] }) {
     <div className="nc-of-commit-strip">
       <div className="nc-of-commit stop">
         <span className="n">{counts.breached}</span>
-        <span className="l">past its promise or unowned</span>
+        <span className="l">stalled</span>
       </div>
       <div className="nc-of-commit warn">
         <span className="n">{counts.person}</span>
-        <span className="l">waiting on a person</span>
+        <span className="l">need a person</span>
       </div>
       <div className="nc-of-commit go">
         <span className="n">{counts.onTrack}</span>
-        <span className="l">moving on its own</span>
+        <span className="l">moving</span>
       </div>
     </div>
   );
