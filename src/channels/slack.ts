@@ -238,6 +238,53 @@ export async function discoverSlackRecoveryTargets(
  * The reverse direction at channel-auto-wire/index.ts:67 already maps
  * `-` → `_` when building env-var lookups, so the round-trip is stable.
  */
+
+/**
+ * Human-facing name for a Slack conversation, for `messaging_groups.name`:
+ * `#name` for channels and group DMs, the counterpart's profile name for a
+ * 1:1 DM. Null whenever the API cannot say — callers keep the wiring and fall
+ * back to the platform id, so a lookup failure must never throw.
+ *
+ * This is the fleet's only implementation of the adapter's optional
+ * `resolveChannelName`: the router names every auto-wired conversation
+ * through it, and until it existed every auto-wired Slack DM stayed nameless
+ * forever and rendered as a raw `slack:D…` id on human surfaces.
+ */
+export async function slackChannelDisplayName(
+  client: {
+    conversations: {
+      info(args: { channel: string }): Promise<{
+        ok?: boolean;
+        channel?: { name?: string; is_im?: boolean; user?: string };
+      }>;
+    };
+    users?: {
+      info(args: { user: string }): Promise<{
+        ok?: boolean;
+        user?: { name?: string; real_name?: string; profile?: { display_name?: string; real_name?: string } };
+      }>;
+    };
+  },
+  platformId: string,
+): Promise<string | null> {
+  try {
+    const id = extractSlackChannelId(platformId);
+    const info = await client.conversations.info({ channel: id });
+    if (!info.ok || !info.channel) return null;
+    const ch = info.channel;
+
+    if (ch.is_im && ch.user && client.users) {
+      const res = await client.users.info({ user: ch.user });
+      if (!res.ok || !res.user) return null;
+      const u = res.user;
+      return u.profile?.display_name || u.profile?.real_name || u.real_name || u.name || null;
+    }
+    return ch.name ? `#${ch.name}` : null;
+  } catch {
+    return null;
+  }
+}
+
 export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspace[] {
   const bySuffix = new Map<string, { botToken?: string; signingSecret?: string }>();
 
@@ -462,6 +509,7 @@ for (const ws of workspaces) {
         discoverRecoveryTargets: (request) => discoverSlackRecoveryTargets(client, request),
         classifyRecoveryError: classifySlackRecoveryError,
       });
+      bridge.resolveChannelName = (platformId) => slackChannelDisplayName(client, platformId);
       bridge.permalink = (platformId, threadId) => slackPermalink(ws.channelType, platformId, threadId);
       bridge.postParent = (platformId, text) => slackPostParent(client, platformId, text);
       bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>

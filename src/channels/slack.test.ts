@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   extractSlackChannelId,
+  slackChannelDisplayName,
   parseSlackWorkspaces,
   slackPostParent,
   slackCreateThread,
@@ -309,5 +310,39 @@ describe('slackCreateThread', () => {
       thread_ts: 'parent-ts',
       text: 'first',
     });
+  });
+});
+
+describe('slackChannelDisplayName', () => {
+  const channelInfo = (channel: Record<string, unknown> | undefined, ok = true) => ({
+    conversations: { info: async () => ({ ok, channel }) },
+  });
+
+  it('names a channel with a # prefix', async () => {
+    await expect(slackChannelDisplayName(channelInfo({ name: 'dispatch' }), 'slack:C1')).resolves.toBe('#dispatch');
+  });
+
+  it('names a 1:1 DM after the counterpart, preferring display name', async () => {
+    const client = {
+      ...channelInfo({ is_im: true, user: 'U9' }),
+      users: {
+        info: async () => ({ ok: true, user: { name: 'jdoe', real_name: 'J. Doe', profile: { display_name: 'Jay' } } }),
+      },
+    };
+    await expect(slackChannelDisplayName(client, 'slack:D1')).resolves.toBe('Jay');
+  });
+
+  it('falls back through real_name when the display name is empty', async () => {
+    const client = {
+      ...channelInfo({ is_im: true, user: 'U9' }),
+      users: { info: async () => ({ ok: true, user: { name: 'jdoe', profile: { display_name: '', real_name: 'J. Doe' } } }) },
+    };
+    await expect(slackChannelDisplayName(client, 'slack:D1')).resolves.toBe('J. Doe');
+  });
+
+  it('returns null on an API refusal or a throw — never raises', async () => {
+    await expect(slackChannelDisplayName(channelInfo(undefined, false), 'slack:C1')).resolves.toBeNull();
+    const throwing = { conversations: { info: async () => { throw new Error('boom'); } } };
+    await expect(slackChannelDisplayName(throwing, 'slack:C1')).resolves.toBeNull();
   });
 });
