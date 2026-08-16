@@ -107,7 +107,9 @@ function addGroup(id: string, workgroupId: string, name = id, folder = id): void
 
 function addMessagingGroup(id: string, channelType: string, platformId: string, name: string | null = null): void {
   getDb()
-    .prepare("INSERT INTO messaging_groups (id, channel_type, platform_id, name, created_at) VALUES (?, ?, ?, ?, datetime('now'))")
+    .prepare(
+      "INSERT INTO messaging_groups (id, channel_type, platform_id, name, created_at) VALUES (?, ?, ?, ?, datetime('now'))",
+    )
     .run(id, channelType, platformId, name);
 }
 
@@ -154,13 +156,13 @@ afterEach(() => {
 
 describe('isNotARoom', () => {
   it('treats Slack DMs as private lines, not rooms', () => {
-    expect(isNotARoom('slack:D0AK1BR5J92', [])).toBe(true);
-    expect(isNotARoom('slack:C0AJA89MN2E', [])).toBe(false);
+    expect(isNotARoom('slack:D0EXAMPLE1', [])).toBe(true);
+    expect(isNotARoom('slack:C0EXAMPLE2', [])).toBe(false);
   });
 
   it('honours an explicit hide list — the canvas the API calls a channel', () => {
-    expect(isNotARoom('slack:C0BM8D4NEP5', ['slack:C0BM8D4NEP5'])).toBe(true);
-    expect(isNotARoom('slack:C0BM8D4NEP5', [])).toBe(false);
+    expect(isNotARoom('slack:C0EXAMPLE3', ['slack:C0EXAMPLE3'])).toBe(true);
+    expect(isNotARoom('slack:C0EXAMPLE3', [])).toBe(false);
   });
 
   it('leaves non-Slack platforms alone (a D there means nothing)', () => {
@@ -386,10 +388,7 @@ describe('buildObservatoryScene', () => {
     addGroup('ag-1', 'wg-1', 'wg1-alpha', 'wg1-alpha');
     writeClaim('wg-1', 'seam-1', { owner: 'ava', claimed_at: now(), ttl_hours: 4 });
 
-    const scene = await buildObservatoryScene(
-      'wg-1',
-      makeDeps({ resolveAssistantName: async () => 'ava' }),
-    );
+    const scene = await buildObservatoryScene('wg-1', makeDeps({ resolveAssistantName: async () => 'ava' }));
     expect(scene.agents[0].name).toBe('ava');
     expect(scene.agents[0].canonicalName).toBe('wg1-alpha');
     expect(scene.agents[0].holding).toEqual(['seam-1']);
@@ -418,10 +417,7 @@ describe('buildObservatoryScene', () => {
     writeClaim('wg-1', 'live-one', { owner: 'zed', claimed_at: now(), ttl_hours: 4 });
     writeClaim('wg-1', 'parked-one', { owner: 'cy', status: 'parked', parked_at: now(), note: 'handoff' });
 
-    const scene = await buildObservatoryScene(
-      'wg-1',
-      makeDeps({ claimsRoot: path.join(TEST_DIR, 'workgroups') }),
-    );
+    const scene = await buildObservatoryScene('wg-1', makeDeps({ claimsRoot: path.join(TEST_DIR, 'workgroups') }));
     const byState = Object.fromEntries(scene.claims.map((c) => [c.slug, c.state]));
     expect(byState['stale-one']).toBe('stale');
     expect(byState['live-one']).toBe('live');
@@ -454,7 +450,11 @@ describe('buildObservatoryScene', () => {
 
 describe('observatoryHandler', () => {
   it('missing workgroup param → 200 empty scene', async () => {
-    const res = (await observatoryHandler(makeReq('http://localhost/dashboard/api/observatory'), {}, makeCtx({ no_filter: true })))!;
+    const res = (await observatoryHandler(
+      makeReq('http://localhost/dashboard/api/observatory'),
+      {},
+      makeCtx({ no_filter: true }),
+    ))!;
     expect(res.status).toBe(200);
     const body = (await res.json()) as { rooms: unknown[]; agents: unknown[]; claims: unknown[] };
     expect(body.rooms).toEqual([]);
