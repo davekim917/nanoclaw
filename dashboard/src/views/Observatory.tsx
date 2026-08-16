@@ -120,10 +120,15 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
       // it rather than closing it. Only a click on an already-PINNED chip
       // closes it. This is what makes click "toggle" rather than "always
       // close what hover just opened".
+      // Clicking someone is also how you ask "what is on THEIR desk" — the same
+      // click that pins their card narrows the job board to their lane, and
+      // un-pinning restores everyone. The office earns its keep by being a
+      // control surface, not a picture.
       onToggle: () =>
         setPopover((prev) => {
-          if (!prev || prev.id !== id) return { id, pinned: true };
-          return prev.pinned ? null : { id, pinned: true };
+          const next = !prev || prev.id !== id ? { id, pinned: true } : prev.pinned ? null : { id, pinned: true };
+          setHighlightedAgentId(next ? id : null);
+          return next;
         }),
       onClose: () => setPopover(null),
     };
@@ -165,7 +170,11 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
 
         {snapshot && (
           <>
-            <ReleaseDesk releaseState={snapshot.releaseState} />
+            <ReleaseDesk
+              releaseState={snapshot.releaseState}
+              ownerFilter={highlightedAgentId ? (agentsById.get(highlightedAgentId)?.name ?? null) : null}
+              onClearOwnerFilter={() => setHighlightedAgentId(null)}
+            />
 
             <div className="nc-obs-main">
               <ClaimsWall claims={claims} expandedSlug={expandedClaim} onClaimClick={claimClicked} />
@@ -354,6 +363,58 @@ export function releaseCounts(items: ReleaseItem[]): string {
     .join(' · ');
 }
 
+/** The label an ownerless item files under. Not a real owner — see the sort. */
+export const UNOWNED_LANE = 'Nobody has this';
+
+/**
+ * The same items grouped by WHOSE DESK they are on rather than by what has to
+ * happen next. Both reads are useful and it is one dataset, so the board
+ * toggles between them instead of shipping a second board.
+ *
+ * Lanes sort by urgency, not alphabetically: whoever holds a blocker comes
+ * first, then by how much they are carrying. The ownerless lane is pinned last
+ * however big it is — it is a backlog, not a person, and letting it win the
+ * sort would bury every real assignee under it.
+ */
+export function groupReleaseItemsByOwner(items: ReleaseItem[]): { owner: string; items: ReleaseItem[] }[] {
+  const lanes = new Map<string, ReleaseItem[]>();
+  for (const item of items) {
+    const owner = item.owner?.trim() || UNOWNED_LANE;
+    const lane = lanes.get(owner);
+    if (lane) lane.push(item);
+    else lanes.set(owner, [item]);
+  }
+
+  // Within a lane: blockers first, then being-worked, waiting, unowned — the
+  // "now / next / stuck" read, without nesting three more headings per person.
+  const moverRank: Record<ReleaseNextMover, number> = { agent: 0, human: 1, nobody: 2 };
+  for (const lane of lanes.values()) {
+    // Boolean() before Number(): blocksRelease is optional, and Number(undefined)
+    // is NaN, which makes the whole comparator return NaN and sort nothing.
+    lane.sort(
+      (a, b) =>
+        Number(Boolean(b.blocksRelease)) - Number(Boolean(a.blocksRelease)) ||
+        moverRank[a.nextMover] - moverRank[b.nextMover],
+    );
+  }
+
+  return [...lanes.entries()]
+    .map(([owner, laneItems]) => ({ owner, items: laneItems }))
+    .sort((a, b) => {
+      const aUnowned = a.owner === UNOWNED_LANE;
+      const bUnowned = b.owner === UNOWNED_LANE;
+      if (aUnowned !== bUnowned) return aUnowned ? 1 : -1;
+      const aBlocks = a.items.filter((i) => i.blocksRelease).length;
+      const bBlocks = b.items.filter((i) => i.blocksRelease).length;
+      return bBlocks - aBlocks || b.items.length - a.items.length || a.owner.localeCompare(b.owner);
+    });
+}
+
+/** "2 blocking · 3 automated" for one lane's own strip. */
+export function laneSummary(items: ReleaseItem[]): string {
+  return releaseCounts(items) || 'nothing open';
+}
+
 function ReleaseRow({
   item,
   moverTag,
@@ -399,8 +460,18 @@ function ReleaseRow({
   );
 }
 
-function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
+function ReleaseDesk({
+  releaseState,
+  ownerFilter,
+  onClearOwnerFilter,
+}: {
+  releaseState: ReleaseState | null;
+  /** Set by clicking someone on the floor. Matched against `item.owner`. */
+  ownerFilter?: string | null;
+  onClearOwnerFilter?: () => void;
+}) {
   const [filter, setFilter] = useState<ReleaseGroupKey | null>(null);
+  const [view, setView] = useState<'status' | 'agent'>('status');
   const [expandedItem, setExpandedItem] = useState<string | null>(null);
 
   if (!releaseState) {
@@ -414,9 +485,14 @@ function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
     );
   }
 
-  const { items, release, asOf } = releaseState;
+  const { release, asOf } = releaseState;
+  // Clicking someone on the floor narrows the WHOLE board to their desk, in
+  // either view — the counts included, so the tallies never describe a set the
+  // rows below aren't showing.
+  const items = ownerFilter ? releaseState.items.filter((i) => i.owner === ownerFilter) : releaseState.items;
   const groups = groupReleaseItems(items);
   const parts = releaseCountParts(items);
+  const lanes = groupReleaseItemsByOwner(items);
   const shows = (key: ReleaseGroupKey) => filter === null || filter === key;
   const toggleItem = (id: string) => setExpandedItem((prev) => (prev === id ? null : id));
 
@@ -426,6 +502,24 @@ function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
         <div>
           <span className="nc-obs-release-title">Job Board</span>
           <span className="nc-obs-release-fresh"> — updated {relAge(asOf)} ago by the release watcher</span>
+          <div className="nc-obs-release-views" role="group" aria-label="Group the board by">
+            <button
+              type="button"
+              className={`nc-obs-release-view ${view === 'status' ? 'active' : ''}`}
+              aria-pressed={view === 'status'}
+              onClick={() => setView('status')}
+            >
+              By status
+            </button>
+            <button
+              type="button"
+              className={`nc-obs-release-view ${view === 'agent' ? 'active' : ''}`}
+              aria-pressed={view === 'agent'}
+              onClick={() => setView('agent')}
+            >
+              By agent
+            </button>
+          </div>
         </div>
         {parts.length > 0 && (
           <div className="nc-of-tally-row">
@@ -473,11 +567,43 @@ function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
         </div>
       )}
 
-      {items.length === 0 && (
-        <div className="nc-obs-release-empty">nothing open — clear to ship pending the usual gates</div>
+      {ownerFilter && (
+        <div className="nc-obs-release-owner-filter">
+          <span>
+            showing only <strong>{ownerFilter}</strong>&apos;s desk
+          </span>
+          <button type="button" className="nc-obs-release-owner-clear" onClick={onClearOwnerFilter}>
+            show everyone
+          </button>
+        </div>
       )}
 
-      {groups.blockers.length > 0 && shows('blockers') && (
+      {items.length === 0 && (
+        <div className="nc-obs-release-empty">
+          {ownerFilter ? `nothing open on ${ownerFilter}'s desk` : 'nothing open — clear to ship pending the usual gates'}
+        </div>
+      )}
+
+      {view === 'agent' &&
+        lanes.map((lane) => (
+          <div key={lane.owner} className={`nc-obs-release-lane ${lane.owner === UNOWNED_LANE ? 'unowned' : ''}`}>
+            <div className="nc-obs-release-lane-head">
+              <span className="nc-obs-release-lane-owner">{lane.owner}</span>
+              <span className="nc-obs-release-lane-sum">{laneSummary(lane.items)}</span>
+            </div>
+            {lane.items.map((item) => (
+              <ReleaseRow
+                key={item.id}
+                item={item}
+                moverTag={MOVER_TAG[item.nextMover]}
+                expanded={expandedItem === item.id}
+                onToggle={() => toggleItem(item.id)}
+              />
+            ))}
+          </div>
+        ))}
+
+      {view === 'status' && groups.blockers.length > 0 && shows('blockers') && (
         <div className="nc-obs-release-group blockers">
           <div className="nc-obs-release-group-label">Blocking the release</div>
           <div className="nc-obs-release-group-sub">nothing ships until these are cleared</div>
@@ -493,7 +619,8 @@ function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
         </div>
       )}
 
-      {MOVER_ORDER.map((mover) => {
+      {view === 'status' &&
+        MOVER_ORDER.map((mover) => {
         const rows = groups[mover];
         if (rows.length === 0 || !shows(mover)) return null;
         return (

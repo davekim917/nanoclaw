@@ -27,6 +27,8 @@ import {
   sortClaims,
   claimAgeLabel,
   groupReleaseItems,
+  groupReleaseItemsByOwner,
+  UNOWNED_LANE,
   releaseCounts,
   upcomingScheduled,
 } from './Observatory.js';
@@ -565,6 +567,83 @@ describe('Observatory', () => {
           releaseItem({ id: 'A2', nextMover: 'agent' }),
         ]),
       ).toBe('1 blocking · 2 automated');
+    });
+
+    it('groupReleaseItemsByOwner: whoever holds a blocker leads, and the ownerless lane is pinned last', () => {
+      const lanes = groupReleaseItemsByOwner([
+        releaseItem({ id: 'U1', nextMover: 'nobody' }),
+        releaseItem({ id: 'U2', nextMover: 'nobody' }),
+        releaseItem({ id: 'U3', nextMover: 'nobody' }),
+        releaseItem({ id: 'A1', owner: 'ava', nextMover: 'agent' }),
+        releaseItem({ id: 'A2', owner: 'ava', nextMover: 'agent' }),
+        releaseItem({ id: 'K1', owner: 'kit', nextMover: 'human', blocksRelease: true }),
+      ]);
+      // kit holds the only blocker so leads despite carrying least; the three
+      // ownerless items lose the count tiebreak because they are a backlog.
+      expect(lanes.map((l) => l.owner)).toEqual(['kit', 'ava', UNOWNED_LANE]);
+    });
+
+    it('groupReleaseItemsByOwner: a lane reads now → next → stuck, blockers above all', () => {
+      const [lane] = groupReleaseItemsByOwner([
+        releaseItem({ id: 'N1', owner: 'ava', nextMover: 'nobody' }),
+        releaseItem({ id: 'H1', owner: 'ava', nextMover: 'human' }),
+        releaseItem({ id: 'A1', owner: 'ava', nextMover: 'agent' }),
+        releaseItem({ id: 'B1', owner: 'ava', nextMover: 'nobody', blocksRelease: true }),
+      ]);
+      expect(lane!.items.map((i) => i.id)).toEqual(['B1', 'A1', 'H1', 'N1']);
+    });
+
+    it('by-agent view groups the same items into per-owner lanes', async () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'A1', owner: 'ava', nextMover: 'agent', title: 'ava item' }),
+              releaseItem({ id: 'K1', owner: 'kit', nextMover: 'human', title: 'kit item' }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelectorAll('.nc-obs-release-lane')).toHaveLength(0);
+
+      const byAgent = Array.from(container.querySelectorAll('.nc-obs-release-view')).find(
+        (b) => b.textContent === 'By agent',
+      )!;
+      await userEvent.click(byAgent);
+      const lanes = Array.from(container.querySelectorAll('.nc-obs-release-lane-owner')).map((e) => e.textContent);
+      expect(lanes).toEqual(['ava', 'kit']);
+      // the status-view headings are gone, not merely hidden
+      expect(container.querySelector('.nc-obs-release-group')).toBeNull();
+    });
+
+    it('clicking an agent on the floor narrows the board to their desk, counts included', async () => {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1' })],
+          agents: [agent({ id: 'ava', name: 'ava', location: 'r1' })],
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'A1', owner: 'ava', nextMover: 'agent', title: 'ava item' }),
+              releaseItem({ id: 'K1', owner: 'kit', nextMover: 'agent', title: 'kit item' }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('2 automated');
+
+      await userEvent.click(container.querySelector('.nc-obs-room[data-room-key="r1"] .nc-obs-chip')!);
+      expect(container.querySelector('.nc-obs-release-owner-filter')!.textContent).toContain('ava');
+      expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('1 automated');
+      const ids = Array.from(container.querySelectorAll('.nc-obs-release-row')).map((e) =>
+        e.getAttribute('data-item-id'),
+      );
+      expect(ids).toEqual(['A1']);
+
+      await userEvent.click(container.querySelector('.nc-obs-release-owner-clear')!);
+      expect(container.querySelector('.nc-obs-release-owner-filter')).toBeNull();
+      expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('2 automated');
     });
 
     it('blockers group renders first and dedupes a blocksRelease item out of its mover group', () => {

@@ -1699,6 +1699,49 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   border-radius: 0; padding: 3px 9px;
   font-family: var(--font-mono); font-size: 10.5px;
 }
+/* By status ⇄ by agent. Same items, two reads — a segmented pair of tabs, not
+   two boards. Sits under the title so the tallies keep the head's right edge. */
+.nc-of .nc-obs-release-views { display: inline-flex; margin-top: 6px; }
+.nc-of .nc-obs-release-view {
+  appearance: none; background: var(--of-paper); color: var(--of-ink);
+  border: 3px solid var(--of-ink-2); border-right-width: 0; margin: 0;
+  padding: 4px 11px; min-height: 32px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+  letter-spacing: 0.1em; text-transform: uppercase;
+}
+.nc-of .nc-obs-release-view:last-child { border-right-width: 3px; }
+.nc-of .nc-obs-release-view.active { background: var(--of-ink-2); color: var(--of-cream); }
+.nc-of .nc-obs-release-view:focus-visible { outline: 3px solid var(--of-cream); outline-offset: -3px; }
+
+/* "You are looking at one desk" — stated, with the way back in the same box.
+   A filtered board that doesn't say it is filtered reads as a data outage. */
+.nc-of .nc-obs-release-owner-filter {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  background: var(--of-paper); border: 3px solid var(--of-ink-2);
+  box-shadow: var(--of-drop); padding: 7px 12px; font-size: 12px; color: var(--of-ink);
+}
+.nc-of .nc-obs-release-owner-clear {
+  appearance: none; background: none; border: 0; margin: 0; padding: 0;
+  color: var(--of-ink-2); cursor: pointer; text-decoration: underline;
+  font: inherit; min-height: 32px;
+}
+
+/* One person's desk. The rule down the left is what makes it read as a lane. */
+.nc-of .nc-obs-release-lane {
+  display: flex; flex-direction: column; gap: 8px;
+  border-left: 4px solid var(--of-cream); padding-left: 10px;
+}
+.nc-of .nc-obs-release-lane.unowned { border-left-color: var(--of-ink-2); }
+.nc-of .nc-obs-release-lane-head {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 9px;
+}
+.nc-of .nc-obs-release-lane-owner {
+  font-family: var(--font-mono); font-size: 12px; font-weight: 700;
+  letter-spacing: 0.12em; text-transform: uppercase; color: var(--of-cream);
+  text-shadow: 1px 1px 0 rgb(0 0 0 / 0.3);
+}
+.nc-of .nc-obs-release-lane-sum { font-size: 11px; color: #efdcbb; }
+
 .nc-of .nc-obs-release-group { display: flex; flex-direction: column; gap: 8px; }
 .nc-of .nc-obs-release-group.blockers { border-left: 0; padding-left: 0; }
 .nc-of .nc-obs-release-group-label {
