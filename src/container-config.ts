@@ -351,6 +351,8 @@ export interface ContainerConfig {
    */
   observatory?: {
     platforms?: string[];
+    /** Platform ids to keep off the office floor (a canvas the API reports as a channel, a bot-only room). */
+    hideRooms?: string[];
   };
 
   /**

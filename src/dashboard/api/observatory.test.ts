@@ -22,6 +22,7 @@ import {
   buildObservatoryScene,
   observatoryHandler,
   ownerMatchesAgent,
+  isNotARoom,
   readReleaseState,
   type ObservatoryDeps,
 } from './observatory.js';
@@ -151,6 +152,22 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe('isNotARoom', () => {
+  it('treats Slack DMs as private lines, not rooms', () => {
+    expect(isNotARoom('slack:D0AK1BR5J92', [])).toBe(true);
+    expect(isNotARoom('slack:C0AJA89MN2E', [])).toBe(false);
+  });
+
+  it('honours an explicit hide list — the canvas the API calls a channel', () => {
+    expect(isNotARoom('slack:C0BM8D4NEP5', ['slack:C0BM8D4NEP5'])).toBe(true);
+    expect(isNotARoom('slack:C0BM8D4NEP5', [])).toBe(false);
+  });
+
+  it('leaves non-Slack platforms alone (a D there means nothing)', () => {
+    expect(isNotARoom('discord:123:D456', [])).toBe(false);
+  });
+});
+
 describe('platform allow-list and claim thread links', () => {
   it('hides rooms on platforms the workgroup did not allow-list', async () => {
     addWorkgroup('wg-1');
@@ -167,6 +184,19 @@ describe('platform allow-list and claim thread links', () => {
     // wiring survives, only the floor hides it.
     const filtered = await buildObservatoryScene('wg-1', makeDeps({ platforms: ['slack'] }));
     expect(filtered.rooms.map((r) => r.key)).toEqual(['slack:C1']);
+  });
+
+  it('keeps DMs and explicitly hidden rooms off the floor entirely', async () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1', 'ava', 'ava-folder');
+    addMessagingGroup('mg-c', 'slack-ava', 'slack:C1', '#build');
+    addMessagingGroup('mg-dm', 'slack-ava', 'slack:D9', 'Someone');
+    addMessagingGroup('mg-hid', 'slack-ava', 'slack:C9', 'A canvas the API calls a channel');
+    for (const mg of ['mg-c', 'mg-dm', 'mg-hid']) wire(mg, 'ag-1');
+
+    const scene = await buildObservatoryScene('wg-1', makeDeps({ hiddenRooms: ['slack:C9'] }));
+
+    expect(scene.rooms.map((r) => r.key)).toEqual(['slack:C1']);
   });
 
   it('resolves a thread url for every claim that recorded a thread', async () => {

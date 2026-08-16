@@ -190,6 +190,21 @@ interface WiringRow {
  * Slack hide dormant wiring on another platform without un-wiring it. Absent =
  * every platform shows.
  */
+export function observatoryHiddenRooms(workgroupId: string): string[] {
+  const members = getDb()
+    .prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?')
+    .all(workgroupId) as { folder: string }[];
+  for (const { folder } of members) {
+    try {
+      const declared = readContainerConfig(folder).observatory?.hideRooms;
+      if (Array.isArray(declared) && declared.length > 0) return declared;
+    } catch {
+      continue;
+    }
+  }
+  return [];
+}
+
 export function observatoryPlatforms(workgroupId: string): string[] | null {
   const members = getDb()
     .prepare('SELECT folder FROM agent_groups WHERE workgroup_id = ?')
@@ -205,7 +220,26 @@ export function observatoryPlatforms(workgroupId: string): string[] | null {
   return null;
 }
 
-function buildRooms(workgroupId: string, allowed: string[] | null): ObservatoryRoom[] {
+/**
+ * Rooms are WORKING ROOMS. Two things get filtered off the floor:
+ *
+ * - **Direct messages.** A 1:1 conversation is not a place the team works; it
+ *   is a private line. Slack DM ids carry a `D` in the channel segment, which
+ *   is how the platform itself distinguishes them.
+ * - **Anything explicitly hidden** via `observatory.hideRooms`. The live case
+ *   is a Slack CANVAS whose backing object the API reports as
+ *   `is_channel: true` (with no member count) — it renders as a tab inside
+ *   another channel, so it looks like a room to the API and like a document
+ *   to the humans. Trust the humans.
+ */
+export function isNotARoom(platformId: string, hidden: string[]): boolean {
+  if (hidden.includes(platformId)) return true;
+  const parts = platformId.split(':');
+  const channel = parts.length > 1 ? parts[1] : parts[0];
+  return platformId.startsWith('slack:') && /^D/.test(channel ?? '');
+}
+
+function buildRooms(workgroupId: string, allowed: string[] | null, hidden: string[] = []): ObservatoryRoom[] {
   const wiringRows = getDb()
     .prepare(
       `SELECT mg.id AS messaging_group_id, mg.platform_id AS platform_id, mg.channel_type AS channel_type,
@@ -217,9 +251,10 @@ function buildRooms(workgroupId: string, allowed: string[] | null): ObservatoryR
     )
     .all(workgroupId) as WiringRow[];
 
-  const onFloor = allowed
+  const onFloor = (allowed
     ? wiringRows.filter((r) => allowed.some((p) => r.channel_type === p || r.channel_type.startsWith(`${p}-`)))
-    : wiringRows;
+    : wiringRows
+  ).filter((r) => !isNotARoom(r.platform_id, hidden));
 
   const byPlatformId = new Map<string, RoomAccum>();
   for (const row of onFloor) {
@@ -394,6 +429,8 @@ export interface ObservatoryDeps {
   resolveThreadUrl?: (threadId: string) => string | null;
   /** Platform allow-list override for tests; defaults to the workgroup's declared observatory.platforms. */
   platforms?: string[] | null;
+  /** Explicitly hidden room ids; defaults to the workgroup's declared observatory.hideRooms. */
+  hiddenRooms?: string[];
 }
 
 const defaultDeps: ObservatoryDeps = { getActiveContainerSessionIds, resolveAssistantName };
@@ -432,7 +469,11 @@ export async function buildObservatoryScene(
   return {
     workgroupId,
     asOf: new Date().toISOString(),
-    rooms: buildRooms(workgroupId, deps.platforms !== undefined ? deps.platforms : observatoryPlatforms(workgroupId)),
+    rooms: buildRooms(
+      workgroupId,
+      deps.platforms !== undefined ? deps.platforms : observatoryPlatforms(workgroupId),
+      deps.hiddenRooms ?? observatoryHiddenRooms(workgroupId),
+    ),
     agents: await buildAgents(workgroupId, claims, deps),
     claims,
     releaseState: deps.groupsDir !== undefined ? readReleaseState(workgroupId, deps.groupsDir) : readReleaseState(workgroupId),
