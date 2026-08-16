@@ -29,6 +29,24 @@ import type { ReleaseItem, ReleaseNextMover } from '../lib/api.js';
 
 export type CommitmentState = 'unowned' | 'breached' | 'undated' | 'due-soon' | 'on-track';
 
+/**
+ * The destructive class, quoted from the runbook's merge gate: data loss or
+ * corruption; money computed, moved or reported wrong; tenant or scope
+ * isolation breached; auth or permission bypass; credentials exposed; a
+ * migration whose undo does not exist.
+ *
+ * That rule already binds merges. It was never wired to `blocksRelease`, so
+ * every finding published `false` — including an auth bypass that sat unowned
+ * for eight days. Until QA's `release-blocking` label exists in the data, we
+ * do NOT guess a finding into the class from its prose: guessing would be the
+ * same fiction as inventing a dependency edge. What we can do honestly is
+ * count the gap, so it is visible that nothing has been classified at all.
+ */
+export function looksSecurityCritical(item: ReleaseItem): boolean {
+  const sev = (item as { meta?: { severity?: string } }).meta?.severity;
+  return item.kind === 'finding' && sev === 'p1';
+}
+
 /** Inside this window a commitment is "due soon" rather than "on track". */
 export const DUE_SOON_MS = 4 * 60 * 60 * 1000;
 
@@ -86,6 +104,12 @@ export interface Ledger {
   /** Percentage of owned commitments that carry a deadline at all (0-100). */
   datedPct: number;
   undatedCount: number;
+  /**
+   * p1 findings NOT marked as blocking the release. Not a claim that each one
+   * should be — a claim that nothing has classified them either way, which is
+   * the actual state and the reason a p1 auth bypass did not gate a promote.
+   */
+  unclassifiedP1: number;
 }
 
 export function buildLedger(items: ReleaseItem[], now = Date.now()): Ledger {
@@ -98,6 +122,13 @@ export function buildLedger(items: ReleaseItem[], now = Date.now()): Ledger {
     // Breaches win outright, before any other consideration. Checking the
     // person-priority first (as this did originally) let a human's on-track
     // item outrank an already-failed promise, which inverts the whole point.
+    // A release blocker leads the board outright. Tenant isolation and auth
+    // bypass are the loudest class we have; an older ordinary breach does not
+    // get to sit above one.
+    const aBlocks = Boolean(a.item.blocksRelease);
+    const bBlocks = Boolean(b.item.blocksRelease);
+    if (aBlocks !== bBlocks) return aBlocks ? -1 : 1;
+
     const aBreach = ra === 0;
     const bBreach = rb === 0;
     if (aBreach !== bBreach) return aBreach ? -1 : 1;
@@ -125,6 +156,7 @@ export function buildLedger(items: ReleaseItem[], now = Date.now()): Ledger {
     counts: { breached, person, onTrack: rows.length - breached - person },
     datedPct: owned.length === 0 ? 100 : Math.round((dated / owned.length) * 100),
     undatedCount: owned.length - dated,
+    unclassifiedP1: items.filter((i) => looksSecurityCritical(i) && !i.blocksRelease).length,
   };
 }
 

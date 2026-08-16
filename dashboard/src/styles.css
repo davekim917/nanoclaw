@@ -1831,6 +1831,15 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   background:var(--of-paper); border:3px solid var(--of-ink-2); box-shadow:var(--of-drop);
   padding:10px 12px; font-size:12.5px; color:var(--of-ink-2); font-style:italic;
 }
+.nc-of .nc-obs-ledger-sec{
+  background:var(--of-alert); color:#fff; border:3px solid var(--of-ink-2); box-shadow:var(--of-drop);
+  padding:9px 12px; font-size:12.5px;
+}
+.nc-of .nc-obs-ledger-row.blocks{border-left-color:var(--of-alert); border-left-width:11px}
+.nc-of .nc-obs-ledger-blocks{
+  font-family:var(--font-mono); font-size:10px; font-weight:700; flex:none;
+  background:var(--of-alert); color:#fff; border:2px solid var(--of-ink-2); padding:0 5px;
+}
 .nc-of .nc-obs-ledger-rows{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px}
 .nc-of .nc-obs-ledger-row{
   background:var(--of-paper); border:3px solid var(--of-ink-2); box-shadow:var(--of-drop);

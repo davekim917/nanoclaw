@@ -95,6 +95,31 @@ describe('buildLedger', () => {
     expect(l.undatedCount).toBe(1);
   });
 
+  it('a release blocker leads the board, above an older ordinary breach', () => {
+    const l = buildLedger(
+      [
+        item('ancient-breach', { dueAt: at(-5 * HOUR), since: at(-29 * 24 * HOUR) }),
+        item('sec', { kind: 'finding', blocksRelease: true, dueAt: at(-1 * HOUR), since: at(-1 * HOUR) }),
+      ],
+      NOW,
+    );
+    expect(l.rows.map((r) => r.item.id)).toEqual(['sec', 'ancient-breach']);
+  });
+
+  it('counts p1 findings nobody has classified as release-blocking either way', () => {
+    // exactOptionalPropertyTypes: the key is omitted rather than set to
+    // undefined, which is also the shape the watcher actually publishes.
+    const p1 = (id: string, blocks?: boolean) =>
+      ({
+        ...item(id, blocks === undefined ? { kind: 'finding' } : { kind: 'finding', blocksRelease: blocks }),
+        meta: { severity: 'p1' },
+      }) as ReleaseItem;
+    const l = buildLedger([p1('a'), p1('b'), p1('c', true), item('not-a-finding')], NOW);
+    // c is classified, so it is not part of the gap; the plain item is not a
+    // finding and cannot be.
+    expect(l.unclassifiedP1).toBe(2);
+  });
+
   it('reports full coverage for an empty board rather than dividing by zero', () => {
     const l = buildLedger([], NOW);
     expect(l.datedPct).toBe(100);

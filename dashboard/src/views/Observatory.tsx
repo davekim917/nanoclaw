@@ -785,12 +785,24 @@ function LedgerBoard({ items, now = Date.now() }: { items: ReleaseItem[]; now?: 
         )}
       </div>
 
+      {ledger.unclassifiedP1 > 0 && (
+        <div className="nc-obs-ledger-sec">
+          <strong>{ledger.unclassifiedP1}</strong> p1 {ledger.unclassifiedP1 === 1 ? 'finding is' : 'findings are'} not
+          classified as release-blocking either way. Tenant isolation and auth bypass block the release by rule; until
+          QA applies the label, nothing computes it and they ship.
+        </div>
+      )}
+
       {shown.length === 0 ? (
         <div className="nc-obs-ledger-empty">every open commitment is on track</div>
       ) : (
         <ul className="nc-obs-ledger-rows">
           {shown.map((c) => (
-            <li key={c.item.id} className={`nc-obs-ledger-row ${c.state}`} data-ledger-id={c.item.id}>
+            <li
+              key={c.item.id}
+              className={`nc-obs-ledger-row ${c.state} ${c.item.blocksRelease ? 'blocks' : ''}`}
+              data-ledger-id={c.item.id}
+            >
               <button
                 type="button"
                 className="nc-obs-ledger-btn"
@@ -799,6 +811,7 @@ function LedgerBoard({ items, now = Date.now() }: { items: ReleaseItem[]; now?: 
               >
                 <span className={`nc-obs-ledger-due ${c.state}`}>{dueLabel(c)}</span>
                 <span className="nc-obs-ledger-title">{c.item.title}</span>
+                {c.item.blocksRelease && <span className="nc-obs-ledger-blocks">blocks release</span>}
                 {c.item.kind === 'finding' && <span className="nc-obs-ledger-kind">finding</span>}
                 <span className="nc-obs-ledger-owner">{c.item.owner ?? LEDGER_STATE_LABEL[c.state]}</span>
                 {c.ageMs !== null && <span className="nc-obs-ledger-age">{magnitude(c.ageMs, now + c.ageMs)}</span>}
