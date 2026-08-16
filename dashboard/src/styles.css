@@ -1579,11 +1579,22 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-obs-desks-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .nc-obs-desks-empty { font-size: 12px; color: var(--fg-4); font-style: italic; }
 
-.nc-obs-main { display: grid; grid-template-columns: 1fr 300px; gap: 16px; align-items: start; }
+/* Mobile-first: single column, normal document flow — the wall is a second
+   grid column only once there's room for it, and it always scrolls with the
+   page (no fixed/sticky position, no independent scroll region, no fixed
+   height). */
+.nc-obs-main { display: grid; grid-template-columns: 1fr; gap: 16px; align-items: start; }
 
 /* Rooms — position STABLE (sorted platform, name), never reordered by activity. */
-.nc-obs-rooms {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px;
+.nc-obs-rooms { display: grid; grid-template-columns: 1fr; gap: 14px; }
+
+@media (min-width: 640px) {
+  .nc-obs-rooms { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (min-width: 1000px) {
+  .nc-obs-rooms { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+  .nc-obs-main { grid-template-columns: 1fr 340px; }
 }
 
 .nc-obs-room {
@@ -1595,6 +1606,10 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-obs-room.lit   { opacity: 1;    filter: saturate(1); }
 .nc-obs-room.dim   { opacity: 0.72; filter: saturate(0.75); }
 .nc-obs-room.dusty { opacity: 0.45; filter: saturate(0.35); }
+/* dim/dusty's opacity < 1 creates a stacking context that would otherwise
+   trap an open popover below later sibling room cards; z-index applies to
+   grid items without needing position:relative. */
+.nc-obs-room.has-open-popover { z-index: 5; }
 
 .nc-obs-room-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .nc-obs-room-name { font-weight: 600; color: var(--fg); font-size: 13.5px; }
@@ -1618,14 +1633,15 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   border: 1px dashed var(--line-2); opacity: 0.55;
 }
 
-/* Agent chip — one body per agent. */
+/* Agent chip — one body per agent. Tap-toggled popover, so it's a real
+   control now: comfortable tap target, keyboard-focusable. */
 .nc-obs-chip {
   position: relative;
   display: inline-flex; align-items: center; gap: 5px;
-  padding: 4px 9px; border-radius: 14px;
+  padding: 4px 9px; min-height: 44px; border-radius: 14px;
   font-size: 12px; font-family: var(--font-sans); color: var(--fg);
   background: var(--bg-card-2); border: 1px solid var(--line-2);
-  cursor: default;
+  cursor: pointer;
 }
 .nc-obs-chip.awake  { background: var(--bg-card-2); border-color: var(--brand); }
 .nc-obs-chip.asleep { opacity: 0.55; }
@@ -1633,17 +1649,39 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-obs-chip-glyph { font-size: 9px; color: var(--brand); }
 .nc-obs-chip.asleep .nc-obs-chip-glyph { font-size: 11px; }
 
+/* z-index comfortably above every other .nc-obs-* element (all unset/auto,
+   or 5 on an elevated room) so it never renders under a sibling card. */
 .nc-obs-hover {
-  position: absolute; top: calc(100% + 6px); left: 0; z-index: 20;
-  min-width: 180px; padding: 8px 10px; border-radius: 6px;
+  position: absolute; top: calc(100% + 6px); left: 0; z-index: 50;
+  min-width: 180px; padding: 8px 26px 8px 10px; border-radius: 6px;
   background: var(--bg-inset); border: 1px solid var(--line-2);
   box-shadow: 0 4px 14px oklch(0 0 0 / 0.35);
   font-family: var(--font-mono); font-size: 11px; color: var(--fg-2);
   display: flex; flex-direction: column; gap: 3px;
+  cursor: default;
 }
 .nc-obs-hover-canonical { color: var(--fg-4); font-style: italic; }
+.nc-obs-hover-close {
+  position: absolute; top: 4px; right: 4px; width: 20px; height: 20px;
+  border: none; border-radius: 50%; background: transparent; color: var(--fg-3);
+  font-size: 11px; line-height: 1; cursor: pointer;
+}
+.nc-obs-hover-close:hover { color: var(--fg); background: var(--bg-card-2); }
 
-/* Claims wall — "Who's on what". */
+/* Small screens: a bottom sheet instead of a positioned card, so there's no
+   viewport-clamping math to get wrong. */
+@media (max-width: 639px) {
+  .nc-obs-hover {
+    position: fixed; top: auto; left: 0; right: 0; bottom: 0; z-index: 200;
+    width: auto; min-width: 0; max-height: 70vh; overflow-y: auto;
+    border-radius: 12px 12px 0 0; padding: 16px 16px 20px;
+    box-shadow: 0 -4px 20px oklch(0 0 0 / 0.4);
+  }
+}
+
+/* Claims wall — "Who's on what". Normal document flow: no fixed/sticky
+   position, no independent scroll region, no fixed height — it's a plain
+   grid column that scrolls with the rest of the page. */
 .nc-obs-claims {
   border: 1px solid var(--line); border-radius: 8px; background: var(--bg-panel);
   padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
@@ -1654,15 +1692,20 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-obs-claim-group-label {
   font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em;
-  text-transform: uppercase; color: var(--fg-4); margin-bottom: 4px;
+  text-transform: uppercase; color: var(--fg-4);
+}
+.nc-obs-claim-group-sub {
+  font-size: 11px; color: var(--fg-4); margin-bottom: 6px;
 }
 .nc-obs-claim-row {
-  border-radius: 6px; padding: 7px 9px; margin-bottom: 4px;
+  border-radius: 6px; padding: 7px 9px; margin-bottom: 4px; min-height: 44px;
   background: var(--bg-card); border: 1px solid var(--line); cursor: pointer;
 }
 .nc-obs-claim-row:hover { border-color: var(--line-2); }
 .nc-obs-claim-row.stale { border-left: 2px solid var(--st-failed); }
 .nc-obs-claim-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.nc-obs-claim-escalated { font-size: 11px; color: var(--fg-4); margin-top: 3px; }
+.nc-obs-claim-age { font-size: 11px; color: var(--fg-3); margin-top: 2px; }
 .nc-obs-claim-slug {
   font-family: var(--font-mono); font-size: 11.5px; color: var(--fg); font-weight: 600;
 }
@@ -1675,7 +1718,3 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   text-transform: uppercase; color: var(--fg-4);
 }
 .nc-obs-stale { color: var(--st-needs); }
-
-@media (max-width: 899px) {
-  .nc-obs-main { grid-template-columns: 1fr; }
-}

@@ -64,6 +64,47 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
 
   const [highlightedAgentId, setHighlightedAgentId] = useState<string | null>(null);
 
+  // Which agent's popover is open, and whether a click pinned it there (vs. a
+  // hover that closes on mouseleave). Single piece of state — one popover can
+  // ever be open, whatever chip it came from.
+  const [popover, setPopover] = useState<{ id: string; pinned: boolean } | null>(null);
+
+  // Outside click closes the popover. A click ON a chip (or inside its own
+  // popover, nested in the same div) is handled by the chip's own handlers —
+  // this only fires for clicks that land nowhere near a chip.
+  useEffect(() => {
+    if (!popover) return;
+    function onDocClick(e: MouseEvent) {
+      const el = e.target as Element | null;
+      if (!el?.closest?.('.nc-obs-chip')) setPopover(null);
+    }
+    document.addEventListener('click', onDocClick);
+    return () => document.removeEventListener('click', onDocClick);
+  }, [popover]);
+
+  function bindPopover(id: string) {
+    return {
+      isOpen: popover?.id === id,
+      pinned: popover?.id === id && popover.pinned,
+      onEnter: () =>
+        setPopover((prev) =>
+          prev?.pinned && prev.id !== id ? prev : { id, pinned: prev?.id === id ? prev.pinned : false },
+        ),
+      onLeave: () => setPopover((prev) => (prev?.id === id && !prev.pinned ? null : prev)),
+      // A mouse click always fires mouseenter first, which already opened this
+      // chip unpinned — so a click on an already-open-but-unpinned chip PINS
+      // it rather than closing it. Only a click on an already-PINNED chip
+      // closes it. This is what makes click "toggle" rather than "always
+      // close what hover just opened".
+      onToggle: () =>
+        setPopover((prev) => {
+          if (!prev || prev.id !== id) return { id, pinned: true };
+          return prev.pinned ? null : { id, pinned: true };
+        }),
+      onClose: () => setPopover(null),
+    };
+  }
+
   const rooms = useMemo(() => sortRooms(snapshot?.rooms ?? []), [snapshot]);
   const agents = snapshot?.agents ?? [];
   const claims = useMemo(() => sortClaims(snapshot?.claims ?? []), [snapshot]);
@@ -98,7 +139,7 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
               <div className="nc-obs-desks-row">
                 {deskAgents.length === 0 && <span className="nc-obs-desks-empty">no one home</span>}
                 {deskAgents.map((a) => (
-                  <AgentChip key={a.id} agent={a} highlighted={a.id === highlightedAgentId} />
+                  <AgentChip key={a.id} agent={a} highlighted={a.id === highlightedAgentId} {...bindPopover(a.id)} />
                 ))}
               </div>
             </div>
@@ -112,6 +153,8 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
                     bodies={agents.filter((a) => a.location === room.key)}
                     agentsById={agentsById}
                     highlightedAgentId={highlightedAgentId}
+                    openAgentId={popover?.id ?? null}
+                    bindPopover={bindPopover}
                   />
                 ))}
                 {rooms.length === 0 && <div className="nc-empty">no rooms wired for this workgroup</div>}
@@ -160,31 +203,76 @@ function initials(name: string): string {
   return parts.slice(0, 2).map((w) => w[0]!.toUpperCase()).join('') || '?';
 }
 
-// Signed relative time ("in 5m" / "3h ago") — reuses relAge's magnitude
-// bucketing by feeding it a synthesized elapsed-time ISO string.
+// Magnitude of an ms duration, bucketed the same way relAge buckets an
+// elapsed-time ISO string — fed a synthesized timestamp so the two never
+// drift apart on what "3h" means.
+function magnitude(ms: number, now = Date.now()): string {
+  return relAge(new Date(now - Math.abs(ms)).toISOString(), now);
+}
+
+// Signed relative time ("in 5m" / "3h ago").
 function relTime(iso: string, now = Date.now()): string {
   const ms = new Date(iso).getTime() - now;
-  const mag = relAge(new Date(now - Math.abs(ms)).toISOString(), now);
-  return ms >= 0 ? `in ${mag}` : `${mag} ago`;
+  return ms >= 0 ? `in ${magnitude(ms, now)}` : `${magnitude(ms, now)} ago`;
+}
+
+/** Claim row age line — phrasing depends on state, magnitude from staleMs. */
+export function claimAgeLabel(c: ObservatoryClaim, now = Date.now()): string {
+  const mag = magnitude(c.staleMs, now);
+  if (c.state === 'live') return `${mag} left`;
+  if (c.state === 'parked') return `parked ${mag} ago`;
+  return `${mag} past deadline`;
 }
 
 /* ─── Agent chip — one agent's ONE body ──────────────────────────────────── */
 
-function AgentChip({ agent, highlighted }: { agent: ObservatoryAgent; highlighted: boolean }) {
-  const [hover, setHover] = useState(false);
+interface PopoverBinding {
+  isOpen: boolean;
+  pinned: boolean;
+  onEnter: () => void;
+  onLeave: () => void;
+  onToggle: () => void;
+  onClose: () => void;
+}
+
+function AgentChip({
+  agent,
+  highlighted,
+  isOpen,
+  pinned,
+  onEnter,
+  onLeave,
+  onToggle,
+  onClose,
+}: { agent: ObservatoryAgent; highlighted: boolean } & PopoverBinding) {
   return (
     <div
       className={`nc-obs-chip ${agent.awake ? 'awake' : 'asleep'} ${highlighted ? 'highlighted' : ''}`}
       data-agent-id={agent.id}
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
+      role="button"
+      tabIndex={0}
+      aria-expanded={isOpen}
+      onMouseEnter={onEnter}
+      onMouseLeave={onLeave}
+      onClick={onToggle}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onToggle();
+        }
+      }}
     >
       <span className="nc-obs-chip-glyph" aria-hidden="true">
         {agent.awake ? '●' : '💤'}
       </span>
       <span className="nc-obs-chip-name">{agent.name}</span>
-      {hover && (
-        <div className="nc-obs-hover">
+      {isOpen && (
+        // Stops a click inside the popover (including the close button) from
+        // bubbling to the chip's own onClick and immediately re-opening it.
+        <div className={`nc-obs-hover ${pinned ? 'pinned' : ''}`} onClick={(e) => e.stopPropagation()}>
+          <button type="button" className="nc-obs-hover-close" aria-label="close" onClick={onClose}>
+            ✕
+          </button>
           <div className="nc-obs-hover-canonical">{agent.canonicalName}</div>
           <div>{agent.awake ? 'awake' : 'asleep'}</div>
           <div>{agent.lastSeenAt ? `last seen ${relAge(agent.lastSeenAt)} ago` : 'never seen'}</div>
@@ -203,18 +291,27 @@ function RoomCard({
   bodies,
   agentsById,
   highlightedAgentId,
+  openAgentId,
+  bindPopover,
 }: {
   room: ObservatoryRoom;
   bodies: ObservatoryAgent[];
   agentsById: Map<string, ObservatoryAgent>;
   highlightedAgentId: string | null;
+  openAgentId: string | null;
+  bindPopover: (id: string) => PopoverBinding;
 }) {
   const cls = roomActivityClass(room.lastActivityAt);
   const presentIds = new Set(bodies.map((a) => a.id));
   const absentMembers = room.memberAgentIds.filter((id) => !presentIds.has(id));
+  // A dim/dusty room's opacity creates its own stacking context, trapping any
+  // popover rendered inside it below sibling room cards later in the grid.
+  // Elevating the room itself (grid items honor z-index without needing
+  // position:relative) lifts the trapped popover above every sibling.
+  const hasOpenPopover = bodies.some((a) => a.id === openAgentId);
 
   return (
-    <div className={`nc-obs-room ${cls}`} data-room-key={room.key}>
+    <div className={`nc-obs-room ${cls} ${hasOpenPopover ? 'has-open-popover' : ''}`} data-room-key={room.key}>
       <div className="nc-obs-room-head">
         <span className="nc-obs-room-name">{room.name}</span>
         {cls === 'dusty' && (
@@ -226,7 +323,7 @@ function RoomCard({
       <div className="nc-obs-room-platform">{room.platform}</div>
       <div className="nc-obs-room-bodies">
         {bodies.map((a) => (
-          <AgentChip key={a.id} agent={a} highlighted={a.id === highlightedAgentId} />
+          <AgentChip key={a.id} agent={a} highlighted={a.id === highlightedAgentId} {...bindPopover(a.id)} />
         ))}
         {absentMembers.map((id) => {
           const known = agentsById.get(id);
@@ -255,6 +352,13 @@ const CLAIM_GROUP_LABELS: Record<ObservatoryClaimState, string> = {
   live: 'Live',
 };
 
+const CLAIM_GROUP_SUBTITLES: Record<ObservatoryClaimState, string> = {
+  stale: 'abandoned — past its deadline, nobody is coming back',
+  parked: 'deliberately handed off — free for anyone to take',
+  expiring: 'past its deadline but inside the grace window',
+  live: 'actively held — leave it alone',
+};
+
 function ClaimsWall({
   claims,
   onClaimClick,
@@ -272,6 +376,7 @@ function ClaimsWall({
         return (
           <div key={state} className="nc-obs-claim-group">
             <div className="nc-obs-claim-group-label">{CLAIM_GROUP_LABELS[state]}</div>
+            <div className="nc-obs-claim-group-sub">{CLAIM_GROUP_SUBTITLES[state]}</div>
             {rows.map((c) => (
               <div
                 key={c.slug}
@@ -281,13 +386,18 @@ function ClaimsWall({
               >
                 <div className="nc-obs-claim-top">
                   <span className="nc-obs-claim-slug">{c.slug}</span>
-                  {c.escalated && <span className="nc-pill failed">escalated</span>}
                   {!c.escalated && c.state === 'stale' && <span className="nc-pill failed">stale</span>}
                   {c.state === 'parked' && <span className="nc-pill needs">🅿️ needs an owner</span>}
                   {c.state === 'live' && <span className="nc-pill done">live</span>}
                   {c.state === 'expiring' && <span className="nc-pill pending">expiring</span>}
                 </div>
-                <div className="nc-obs-claim-owner">{c.owner ?? '—'}</div>
+                {c.escalated && (
+                  <div className="nc-obs-claim-escalated">escalated · already announced in channel</div>
+                )}
+                <div className="nc-obs-claim-owner">
+                  {c.owner && c.owner !== 'unknown' ? c.owner : <em>owner unknown</em>}
+                </div>
+                <div className="nc-obs-claim-age">{claimAgeLabel(c)}</div>
                 {c.note && <div className="nc-obs-claim-note">{c.note}</div>}
               </div>
             ))}

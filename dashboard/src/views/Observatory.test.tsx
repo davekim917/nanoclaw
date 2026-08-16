@@ -13,7 +13,7 @@ vi.mock('../lib/api.js', () => ({
   getObservatory: vi.fn(),
 }));
 
-import { Observatory, sortRooms, roomActivityClass, sortClaims } from './Observatory.js';
+import { Observatory, sortRooms, roomActivityClass, sortClaims, claimAgeLabel } from './Observatory.js';
 import useSWR from 'swr';
 import type { ObservatoryRoom, ObservatoryAgent, ObservatoryClaim, ObservatorySnapshot } from '../lib/api.js';
 
@@ -147,7 +147,7 @@ describe('Observatory', () => {
       snapshot({
         rooms: [room({ key: 'r1' })],
         agents: [
-          agent({ id: 'bo', name: 'bo', location: 'r1', awake: true }),
+          agent({ id: 'ava', name: 'ava', location: 'r1', awake: true }),
           agent({ id: 'kit', name: 'kit', location: null, awake: false }),
         ],
       }),
@@ -242,5 +242,99 @@ describe('Observatory', () => {
     expect(hoverCard.textContent).toContain('claim-slug-1');
     expect(hoverCard.textContent).toContain('send digest');
     expect(hoverCard.textContent).toContain('ava-agent');
+  });
+
+  it('opens a popover on click and closes it on outside click', async () => {
+    mockData(snapshot({ agents: [agent({ id: 'ava', name: 'ava', location: null })] }));
+    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    const chip = container.querySelector('.nc-obs-chip[data-agent-id="ava"]')! as HTMLElement;
+    expect(container.querySelector('.nc-obs-hover')).toBeFalsy();
+
+    await userEvent.click(chip);
+    expect(container.querySelector('.nc-obs-hover')).toBeTruthy();
+
+    // Outside click (the frame itself, not any chip) closes it.
+    await userEvent.click(container.querySelector('.nc-frame')!);
+    expect(container.querySelector('.nc-obs-hover')).toBeFalsy();
+  });
+
+  it('only one popover is open at a time — clicking a second chip closes the first', async () => {
+    mockData(
+      snapshot({
+        agents: [agent({ id: 'ava', name: 'ava', location: null }), agent({ id: 'kit', name: 'kit', location: null })],
+      }),
+    );
+    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    const avaChip = container.querySelector('.nc-obs-chip[data-agent-id="ava"]')! as HTMLElement;
+    const kitChip = container.querySelector('.nc-obs-chip[data-agent-id="kit"]')! as HTMLElement;
+
+    await userEvent.click(avaChip);
+    expect(avaChip.querySelector('.nc-obs-hover')).toBeTruthy();
+
+    await userEvent.click(kitChip);
+    expect(avaChip.querySelector('.nc-obs-hover')).toBeFalsy();
+    expect(kitChip.querySelector('.nc-obs-hover')).toBeTruthy();
+    expect(container.querySelectorAll('.nc-obs-hover').length).toBe(1);
+  });
+
+  it('claim group subtitles render the exact operator-facing language for every state', () => {
+    mockData(
+      snapshot({
+        claims: [
+          claim({ slug: 'live-1', state: 'live' }),
+          claim({ slug: 'stale-1', state: 'stale' }),
+          claim({ slug: 'parked-1', state: 'parked' }),
+          claim({ slug: 'expiring-1', state: 'expiring' }),
+        ],
+      }),
+    );
+    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    const subs = Array.from(container.querySelectorAll('.nc-obs-claim-group-sub')).map((el) => el.textContent);
+    expect(subs).toContain('abandoned — past its deadline, nobody is coming back');
+    expect(subs).toContain('deliberately handed off — free for anyone to take');
+    expect(subs).toContain('past its deadline but inside the grace window');
+    expect(subs).toContain('actively held — leave it alone');
+  });
+
+  it('renders an age line for each claim state', () => {
+    mockData(
+      snapshot({
+        claims: [
+          claim({ slug: 'live-1', state: 'live', staleMs: -3_600_000 }),
+          claim({ slug: 'stale-1', state: 'stale', staleMs: 7_200_000 }),
+          claim({ slug: 'expiring-1', state: 'expiring', staleMs: 1_800_000 }),
+          claim({ slug: 'parked-1', state: 'parked', staleMs: 5_400_000 }),
+        ],
+      }),
+    );
+    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    const ageFor = (slug: string) => container.querySelector(`.nc-obs-claim-row[data-slug="${slug}"] .nc-obs-claim-age`)!.textContent;
+    expect(ageFor('live-1')).toContain('left');
+    expect(ageFor('stale-1')).toContain('past deadline');
+    expect(ageFor('expiring-1')).toContain('past deadline');
+    expect(ageFor('parked-1')).toBe('parked 1h ago');
+  });
+
+  it('claimAgeLabel: pure helper matches the per-state phrasing', () => {
+    const now = Date.parse('2026-08-14T12:00:00Z');
+    expect(claimAgeLabel(claim({ state: 'live', staleMs: -3_600_000 }), now)).toBe('1h left');
+    expect(claimAgeLabel(claim({ state: 'stale', staleMs: 7_200_000 }), now)).toBe('2h past deadline');
+    expect(claimAgeLabel(claim({ state: 'parked', staleMs: 1_800_000 }), now)).toBe('parked 30m ago');
+  });
+
+  it('renders "owner unknown" in italics when the owner is unresolved, not a literal name', () => {
+    mockData(snapshot({ claims: [claim({ slug: 'c1', state: 'live', owner: 'unknown' })] }));
+    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    const ownerEl = container.querySelector('.nc-obs-claim-owner')!;
+    expect(ownerEl.querySelector('em')!.textContent).toBe('owner unknown');
+    expect(ownerEl.textContent).not.toBe('unknown');
+  });
+
+  it('the claims wall carries no fixed/sticky positioning class and lives inside the main grid', () => {
+    mockData(snapshot({ claims: [claim({ slug: 'c1' })] }));
+    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    const wall = container.querySelector('.nc-obs-claims')!;
+    expect(wall.className).not.toMatch(/fixed|sticky/);
+    expect(container.querySelector('.nc-obs-main > .nc-obs-claims')).toBeTruthy();
   });
 });
