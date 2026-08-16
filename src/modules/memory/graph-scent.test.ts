@@ -286,6 +286,44 @@ describe('graph scent warm gating (AC8, AC9, AC10)', () => {
   });
 });
 
+describe('large-graph re-warm bar (watch-item lever, fired 2026-08-16)', () => {
+  it('a large graph needs consecutive clean probes to warm; one is not enough', () => {
+    const graphsRoot = makeGraphsRoot();
+    seedGraph(graphsRoot, 'wg-big', [{ relativePath: 'workgroup/repo/a.md', text: 'forecast pipeline snowflake' }]);
+    // Treat ANY graph as large so the fixture exercises the bar.
+    _setGraphScentTestHooks({ graphsRoot, largeGraphBytes: 1 });
+    probeGraphScentWarmth('wg-big');
+    const notices: ContextNotice[] = [];
+    expect(readGraphScent('wg-big', QUERY, notices)).toBeNull();
+    expect(notices.some((n) => n.code === 'graph-scent-cold')).toBe(true);
+    probeGraphScentWarmth('wg-big');
+    probeGraphScentWarmth('wg-big');
+    expect(readGraphScent('wg-big', QUERY, [])).not.toBeNull();
+  });
+
+  it('an over-budget probe resets the streak', () => {
+    const graphsRoot = makeGraphsRoot();
+    seedGraph(graphsRoot, 'wg-big', [{ relativePath: 'workgroup/repo/a.md', text: 'forecast pipeline snowflake' }]);
+    _setGraphScentTestHooks({ graphsRoot, largeGraphBytes: 1 });
+    probeGraphScentWarmth('wg-big');
+    probeGraphScentWarmth('wg-big');
+    const ticks = [0, 900];
+    _setGraphScentTestHooks({ graphsRoot, largeGraphBytes: 1, clock: () => ticks.shift() ?? 900 });
+    probeGraphScentWarmth('wg-big'); // slow — streak dies
+    _setGraphScentTestHooks({ graphsRoot, largeGraphBytes: 1 });
+    probeGraphScentWarmth('wg-big'); // clean again, streak = 1 of 3
+    expect(readGraphScent('wg-big', QUERY, [])).toBeNull();
+  });
+
+  it('small graphs keep the single-probe bar', () => {
+    const graphsRoot = makeGraphsRoot();
+    seedGraph(graphsRoot, 'wg-small', [{ relativePath: 'workgroup/repo/a.md', text: 'forecast pipeline snowflake' }]);
+    _setGraphScentTestHooks({ graphsRoot });
+    probeGraphScentWarmth('wg-small');
+    expect(readGraphScent('wg-small', QUERY, [])).not.toBeNull();
+  });
+});
+
 describe('sweep probe rotation', () => {
   it('probes one workgroup per call, round-robin', () => {
     const graphsRoot = makeGraphsRoot();

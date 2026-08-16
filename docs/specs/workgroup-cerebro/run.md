@@ -689,6 +689,28 @@ Sentinel relaunched (60 probes, jittered cadence, two taps per probe to exclude
 sweep-phase alignment). If it exhausts again, the replay realistically needs an
 operator-created window rather than luck.
 
+### 2026-08-16 (post-restart review) — pillar 0 producing; scent watch item FIRED and lever built
+
+**Pillar 0 live and capturing.** Within ~3.5h of the 17:22Z restart: 133 reason-bearing
+facts in the stores, **16 `domain_knowledge`** among them (largest workgroup), quality on
+target — metric semantics, product rules, an operator standing ruling, a rewritten
+publish flow. The `reason=` share is now directly countable, replacing the keyword
+estimate forever. (A `reason='SUSPENDED...'` grep hit was prose inside a fact quoting
+code, not a marker defect.)
+
+**Scent watch item fired.** 19 turn queries >3s since deploy (8 in the 3.5h after the
+restart), worst **26.9s**, all on the two multi-GB graphs — deploy churn evicts their
+page cache and a single lucky probe re-warmed them into a stall. The pre-named lever is
+built: `largeGraphBytes` (1 GiB) / `largeGraphCleanProbes` (3) — a large index needs
+three CONSECUTIVE clean probes to re-warm; any failed/slow probe resets the streak;
+small graphs keep the single-probe bar. Cost: a big graph re-warms ~36 min after churn
+instead of ~12 — acceptable for an advisory lane whose worst case was a 27s host stall.
+Tests: 3 new cases (single probe insufficient, streak reset, small-graph unchanged);
+memory module 123 passed; build clean.
+
+**Replay gate still starved:** sentinel run 2 underway; run 1's 40 probes over ~17h all
+found drained buckets.
+
 ### Not done at this stage
 
 No production code written; planning is artifact-only. No tests materialized — per the

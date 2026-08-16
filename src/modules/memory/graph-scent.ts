@@ -45,6 +45,14 @@ export const GRAPH_SCENT_BOUNDS = Object.freeze({
   chars: 600,
   /** Fail fast rather than stall a turn behind a WAL checkpoint. */
   busyTimeoutMs: 250,
+  /**
+   * Watch-item lever, fired 2026-08-16 (19 stalls >3s, worst 26.9s, all on
+   * multi-GB graphs after deploy churn evicted their page cache): an index
+   * larger than this needs largeGraphCleanProbes CONSECUTIVE clean probes to
+   * re-warm, so one lucky probe on a cold giant cannot authorize a turn query.
+   */
+  largeGraphBytes: 1_073_741_824,
+  largeGraphCleanProbes: 3,
 });
 
 export interface GraphScentPointer {
@@ -117,6 +125,8 @@ interface GraphScentHooks {
   open?: (dbPath: string) => Database.Database;
   clock?: () => number;
   forceWarm?: string[];
+  /** Test override: byte size above which a graph counts as large. */
+  largeGraphBytes?: number;
 }
 
 const DEFAULT_GRAPHS_ROOT = path.join(DATA_DIR, 'graphify', 'workgroups');
@@ -137,11 +147,14 @@ interface WarmMark {
   mtimeMs: number;
 }
 const WARM = new Map<string, WarmMark>();
+/** Consecutive clean probes per workgroup; large graphs need several to warm. */
+const PROBE_STREAK = new Map<string, number>();
+let largeGraphBytes: number = GRAPH_SCENT_BOUNDS.largeGraphBytes;
 
-function currentIndexIdentity(workgroupId: string): WarmMark | null {
+function currentIndexIdentity(workgroupId: string): (WarmMark & { size: number }) | null {
   try {
     const stat = fs.statSync(graphPath(workgroupId));
-    return { ino: stat.ino, mtimeMs: stat.mtimeMs };
+    return { ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size };
   } catch {
     return null;
   }
@@ -153,6 +166,7 @@ export function _setGraphScentTestHooks(hooks: GraphScentHooks): void {
   if (hooks.graphsRoot !== undefined) graphsRoot = hooks.graphsRoot;
   openGraph = hooks.open ?? ((dbPath) => new Database(dbPath, { readonly: true, fileMustExist: true }));
   clock = hooks.clock ?? (() => Date.now());
+  largeGraphBytes = hooks.largeGraphBytes ?? GRAPH_SCENT_BOUNDS.largeGraphBytes;
   for (const workgroupId of hooks.forceWarm ?? []) WARM.set(workgroupId, { ino: -1, mtimeMs: -1 });
 }
 
@@ -160,7 +174,9 @@ export function _resetGraphScentForTest(): void {
   graphsRoot = DEFAULT_GRAPHS_ROOT;
   openGraph = (dbPath) => new Database(dbPath, { readonly: true, fileMustExist: true });
   clock = () => Date.now();
+  largeGraphBytes = GRAPH_SCENT_BOUNDS.largeGraphBytes;
   WARM.clear();
+  PROBE_STREAK.clear();
   probeCursor = 0;
 }
 
@@ -321,6 +337,7 @@ export function probeGraphScentWarmth(workgroupId: string): number {
   try {
     queryPointers(workgroupId, PROBE_TERMS);
   } catch {
+    PROBE_STREAK.delete(workgroupId);
     WARM.delete(workgroupId);
     return clock() - started;
   }
@@ -329,7 +346,19 @@ export function probeGraphScentWarmth(workgroupId: string): number {
   // stamp the new file with the old file's timing. A stat failure here means
   // the index vanished mid-probe: stay unmarked.
   const identity = elapsedMs <= GRAPH_SCENT_BOUNDS.budgetMs ? currentIndexIdentity(workgroupId) : null;
-  if (identity !== null) WARM.set(workgroupId, identity);
+  if (identity === null) {
+    PROBE_STREAK.delete(workgroupId);
+    WARM.delete(workgroupId);
+    return elapsedMs;
+  }
+  // Large graphs must prove themselves repeatedly: one lucky probe on a
+  // page-cache-cold giant authorized the 26.9s turn stall this bar exists to
+  // prevent. Small graphs keep the single-probe bar — their cold cost is the
+  // sub-second envelope the design already tolerates.
+  const streak = (PROBE_STREAK.get(workgroupId) ?? 0) + 1;
+  PROBE_STREAK.set(workgroupId, streak);
+  const required = identity.size > largeGraphBytes ? GRAPH_SCENT_BOUNDS.largeGraphCleanProbes : 1;
+  if (streak >= required) WARM.set(workgroupId, { ino: identity.ino, mtimeMs: identity.mtimeMs });
   else WARM.delete(workgroupId);
   return elapsedMs;
 }
