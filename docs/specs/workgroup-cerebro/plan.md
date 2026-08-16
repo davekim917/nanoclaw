@@ -313,6 +313,21 @@ answer was that one already exists.
 
 ### P0.6 Implementation path
 
+**VERDICT (2026-08-15, sample 3,631 decisions): P0.2's blamed mechanism is falsified.**
+`code_derived` fired **0 times in 3,631 logged decisions** while every other reason code
+fired at least once (even `sensitive`, once). The "recoverable from code/Graphify"
+prohibition is not the operative filter; the line-416 whitelist rejects domain content
+before the prohibition is ever consulted, surfacing as `insufficient_evidence` (895) and
+`transient` (747). Consequences, in force for the build below:
+
+- **(b) the whitelist capture line is the fix** and proceeds.
+- **(c) the prohibition scoping is NOT built up front.** The counter cannot prove the
+  prohibition won't start blocking once the whitelist admits domain content — it never
+  got that far — so (c) is demoted to a contingency: **the step-4 replay gate decides.**
+  If domain episodes flip to capture in replay without touching the prohibition, (c) is
+  dead work and stays unbuilt. If they still noop, (c) is built and the gate re-run.
+- The formal day-7 read is superseded by this verdict at 18x the sample.
+
 **Step 0 is a decision point, not a formality.**
 
 0. **Log the reason code and look at it before building the rest.** P0.3(e) only —

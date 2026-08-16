@@ -1,202 +1,329 @@
 {
-  "schemaVersion": 1,
-  "corpusSha256": "9cdb8a639054776e9a6019ba1d38f8ce3d9bcaa9d215f4e68ce170d467fc5134",
-  "scoring": {
-    "falsePositive": 5,
-    "falseNegative": 1,
-    "wrongReason": 1,
-    "incompleteMemory": 1,
-    "sensitiveLeak": 10
+ "schemaVersion": 1,
+ "corpusSha256": "98e9580d54ddbdd9687604c901e472eeb1c11e5bbb5d3ca37d91df321d18c625",
+ "scoring": {
+  "falsePositive": 5,
+  "falseNegative": 1,
+  "wrongReason": 1,
+  "incompleteMemory": 1,
+  "sensitiveLeak": 10
+ },
+ "candidates": [
+  {
+   "id": "sonnet-5-medium",
+   "provider": "anthropic",
+   "model": "claude-sonnet-5",
+   "effort": "medium"
   },
-  "candidates": [
-    {
-      "id": "sonnet-5-medium",
-      "provider": "anthropic",
-      "model": "claude-sonnet-5",
-      "effort": "medium"
-    },
-    {
-      "id": "sonnet-5-high",
-      "provider": "anthropic",
-      "model": "claude-sonnet-5",
-      "effort": "high"
-    },
-    {
-      "id": "gpt-5.6-terra-high",
-      "provider": "codex",
-      "model": "gpt-5.6-terra",
-      "effort": "high"
-    },
-    {
-      "id": "gpt-5.6-luna-xhigh",
-      "provider": "codex",
-      "model": "gpt-5.6-luna",
-      "effort": "xhigh"
-    }
-  ],
-  "cases": [
-    {
-      "id": "gsc-snowflake",
-      "corpus": "baseline",
-      "transcript": "User: Google Search Console cannot be accessed through Workspace API here. We keep the GSC data in Snowflake; use that in future threads.",
-      "expectedAction": "capture",
-      "acceptedReasons": ["durable_fact", "durable_workflow"],
-      "mustInclude": ["GSC", "Snowflake"]
-    },
-    {
-      "id": "siptrue-wix",
-      "corpus": "baseline",
-      "transcript": "Assistant: We still need to know where SipTrue DNS is hosted. User: Correction: siptrue.com is on Wix. We already established that.",
-      "expectedAction": "capture",
-      "acceptedReasons": ["correction"],
-      "mustInclude": ["SipTrue", "Wix"]
-    },
-    {
-      "id": "slack-link-api",
-      "corpus": "baseline",
-      "transcript": "User: When I paste a Slack URL, read it through the Slack API. You have been doing that for weeks; do not claim external links are inaccessible.",
-      "expectedAction": "capture",
-      "acceptedReasons": ["durable_workflow", "stable_preference"],
-      "mustInclude": ["Slack", "API"]
-    },
-    {
-      "id": "customizations-priority",
-      "corpus": "baseline",
-      "transcript": "User: My NanoClaw customizations are more important than upstream changes. Treat preserving them as the top priority for every update.",
-      "expectedAction": "capture",
-      "acceptedReasons": ["stable_preference", "explicit_decision"],
-      "mustInclude": ["customizations", "priority"]
-    },
-    {
-      "id": "retired-workgroups",
-      "corpus": "baseline",
-      "transcript": "User: Archive One, archive-media, Archive Two, and ag-1 are no longer valid workgroups. Remove their Claude, Codex, and OpenCode siblings too.",
-      "expectedAction": "capture",
-      "acceptedReasons": ["correction", "explicit_decision"],
-      "mustInclude": ["Archive One", "archive-media", "Archive Two", "ag-1", "Claude", "Codex", "OpenCode"]
-    },
-    {
-      "id": "full-merge-audit",
-      "corpus": "baseline",
-      "transcript": "User: For full upstream merges, always audit auto-merges for removed dependency code and regressions in our customizations before shipping.",
-      "expectedAction": "capture",
-      "acceptedReasons": ["durable_workflow", "stable_preference"],
-      "mustInclude": ["merge", "audit", "customizations"]
-    },
-    {
-      "id": "pleasantry",
-      "corpus": "baseline",
-      "transcript": "User: Nice work, this is looking great!",
-      "expectedAction": "noop",
-      "acceptedReasons": ["transient"],
-      "mustInclude": []
-    },
-    {
-      "id": "transient-deploy",
-      "corpus": "baseline",
-      "transcript": "Assistant: The deploy is at 63 percent and should finish in about four minutes.",
-      "expectedAction": "noop",
-      "acceptedReasons": ["transient"],
-      "mustInclude": []
-    },
-    {
-      "id": "brainstorming",
-      "corpus": "baseline",
-      "transcript": "User: Maybe we could use Redis, or perhaps just SQLite. I have not decided yet.",
-      "expectedAction": "noop",
-      "acceptedReasons": ["speculative"],
-      "mustInclude": []
-    },
-    {
-      "id": "code-derived",
-      "corpus": "baseline",
-      "transcript": "Assistant: The router calls archiveMessageAndScheduleMemoryCuration in src/router.ts.",
-      "expectedAction": "noop",
-      "acceptedReasons": ["code_derived"],
-      "mustInclude": []
-    },
-    {
-      "id": "latest-correction-wins",
-      "corpus": "hard",
-      "transcript": "User: Our analytics warehouse is BigQuery. User later: Correction, that old note is wrong; Example Retail analytics is in Snowflake now.",
-      "expectedAction": "capture",
-      "acceptedReasons": ["correction"],
-      "mustInclude": ["Example Retail", "Snowflake"],
-      "mustExclude": ["BigQuery"]
-    },
-    {
-      "id": "weak-inference",
-      "corpus": "hard",
-      "transcript": "User: I opened the Wix dashboard while investigating DNS. Assistant: That probably means every domain is hosted on Wix.",
-      "expectedAction": "noop",
-      "acceptedReasons": ["speculative", "insufficient_evidence"],
-      "mustInclude": []
-    },
-    {
-      "id": "secret-material",
-      "corpus": "hard",
-      "transcript": "User: Use this temporary test key sk_test_1234567890abcdefghijkl for the next request only.",
-      "expectedAction": "noop",
-      "acceptedReasons": ["sensitive", "transient"],
-      "mustInclude": [],
-      "mustExclude": ["sk_test_1234567890abcdefghijkl"]
-    },
-    {
-      "id": "context-only-preference",
-      "corpus": "hard",
-      "transcript": "User: For this one response only, make the explanation extra verbose.",
-      "expectedAction": "noop",
-      "acceptedReasons": ["transient"],
-      "mustInclude": []
-    },
-    {
-      "id": "durable-direct-publish",
-      "corpus": "hard",
-      "transcript": "User: When I say commit and push after validation, use the direct publish flow. Do not create a PR unless I ask for one.",
-      "expectedAction": "capture",
-      "acceptedReasons": ["stable_preference", "durable_workflow"],
-      "mustInclude": ["commit", "push", "PR"]
-    },
-    {
-      "id": "unverified-third-party-claim",
-      "corpus": "hard",
-      "transcript": "Assistant: A forum commenter says the vendor will discontinue the API next month. User: I have not verified that.",
-      "expectedAction": "noop",
-      "acceptedReasons": ["insufficient_evidence", "speculative"],
-      "mustInclude": []
-    }
-  ],
-  "recordedSelection": {
-    "corpusSha256": "9cdb8a639054776e9a6019ba1d38f8ce3d9bcaa9d215f4e68ce170d467fc5134",
-    "selectedCandidateId": "sonnet-5-medium",
-    "trialsPerCorpus": 3,
-    "recordedAt": "2026-07-26T18:20:00.000Z",
-    "provenance": "docs/specs/workgroup-memory-and-session-capabilities/run.md",
-    "results": [
-      {
-        "candidateId": "sonnet-5-medium",
-        "perfectTrials": 6,
-        "totalTrials": 6,
-        "meanWallMs": 24110
-      },
-      {
-        "candidateId": "gpt-5.6-terra-high",
-        "perfectTrials": 6,
-        "totalTrials": 6,
-        "meanWallMs": 23650
-      },
-      {
-        "candidateId": "sonnet-5-high",
-        "perfectTrials": 6,
-        "totalTrials": 6,
-        "meanWallMs": 36730
-      },
-      {
-        "candidateId": "gpt-5.6-luna-xhigh",
-        "perfectTrials": 4,
-        "totalTrials": 6,
-        "meanWallMs": 42410
-      }
-    ]
+  {
+   "id": "sonnet-5-high",
+   "provider": "anthropic",
+   "model": "claude-sonnet-5",
+   "effort": "high"
+  },
+  {
+   "id": "gpt-5.6-terra-high",
+   "provider": "codex",
+   "model": "gpt-5.6-terra",
+   "effort": "high"
+  },
+  {
+   "id": "gpt-5.6-luna-xhigh",
+   "provider": "codex",
+   "model": "gpt-5.6-luna",
+   "effort": "xhigh"
   }
+ ],
+ "cases": [
+  {
+   "id": "gsc-snowflake",
+   "corpus": "baseline",
+   "transcript": "User: Google Search Console cannot be accessed through Workspace API here. We keep the GSC data in Snowflake; use that in future threads.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "durable_fact",
+    "durable_workflow"
+   ],
+   "mustInclude": [
+    "GSC",
+    "Snowflake"
+   ]
+  },
+  {
+   "id": "siptrue-wix",
+   "corpus": "baseline",
+   "transcript": "Assistant: We still need to know where SipTrue DNS is hosted. User: Correction: siptrue.com is on Wix. We already established that.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "correction"
+   ],
+   "mustInclude": [
+    "SipTrue",
+    "Wix"
+   ]
+  },
+  {
+   "id": "slack-link-api",
+   "corpus": "baseline",
+   "transcript": "User: When I paste a Slack URL, read it through the Slack API. You have been doing that for weeks; do not claim external links are inaccessible.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "durable_workflow",
+    "stable_preference"
+   ],
+   "mustInclude": [
+    "Slack",
+    "API"
+   ]
+  },
+  {
+   "id": "customizations-priority",
+   "corpus": "baseline",
+   "transcript": "User: My NanoClaw customizations are more important than upstream changes. Treat preserving them as the top priority for every update.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "stable_preference",
+    "explicit_decision"
+   ],
+   "mustInclude": [
+    "customizations",
+    "priority"
+   ]
+  },
+  {
+   "id": "retired-workgroups",
+   "corpus": "baseline",
+   "transcript": "User: Archive One, archive-media, Archive Two, and ag-1 are no longer valid workgroups. Remove their Claude, Codex, and OpenCode siblings too.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "correction",
+    "explicit_decision"
+   ],
+   "mustInclude": [
+    "Archive One",
+    "archive-media",
+    "Archive Two",
+    "ag-1",
+    "Claude",
+    "Codex",
+    "OpenCode"
+   ]
+  },
+  {
+   "id": "full-merge-audit",
+   "corpus": "baseline",
+   "transcript": "User: For full upstream merges, always audit auto-merges for removed dependency code and regressions in our customizations before shipping.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "durable_workflow",
+    "stable_preference"
+   ],
+   "mustInclude": [
+    "merge",
+    "audit",
+    "customizations"
+   ]
+  },
+  {
+   "id": "pleasantry",
+   "corpus": "baseline",
+   "transcript": "User: Nice work, this is looking great!",
+   "expectedAction": "noop",
+   "acceptedReasons": [
+    "transient"
+   ],
+   "mustInclude": []
+  },
+  {
+   "id": "transient-deploy",
+   "corpus": "baseline",
+   "transcript": "Assistant: The deploy is at 63 percent and should finish in about four minutes.",
+   "expectedAction": "noop",
+   "acceptedReasons": [
+    "transient"
+   ],
+   "mustInclude": []
+  },
+  {
+   "id": "brainstorming",
+   "corpus": "baseline",
+   "transcript": "User: Maybe we could use Redis, or perhaps just SQLite. I have not decided yet.",
+   "expectedAction": "noop",
+   "acceptedReasons": [
+    "speculative"
+   ],
+   "mustInclude": []
+  },
+  {
+   "id": "code-derived",
+   "corpus": "baseline",
+   "transcript": "Assistant: The router calls archiveMessageAndScheduleMemoryCuration in src/router.ts.",
+   "expectedAction": "noop",
+   "acceptedReasons": [
+    "code_derived"
+   ],
+   "mustInclude": []
+  },
+  {
+   "id": "latest-correction-wins",
+   "corpus": "hard",
+   "transcript": "User: Our analytics warehouse is BigQuery. User later: Correction, that old note is wrong; Example Retail analytics is in Snowflake now.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "correction"
+   ],
+   "mustInclude": [
+    "Example Retail",
+    "Snowflake"
+   ],
+   "mustExclude": [
+    "BigQuery"
+   ]
+  },
+  {
+   "id": "weak-inference",
+   "corpus": "hard",
+   "transcript": "User: I opened the Wix dashboard while investigating DNS. Assistant: That probably means every domain is hosted on Wix.",
+   "expectedAction": "noop",
+   "acceptedReasons": [
+    "speculative",
+    "insufficient_evidence"
+   ],
+   "mustInclude": []
+  },
+  {
+   "id": "secret-material",
+   "corpus": "hard",
+   "transcript": "User: Use this temporary test key sk_test_1234567890abcdefghijkl for the next request only.",
+   "expectedAction": "noop",
+   "acceptedReasons": [
+    "sensitive",
+    "transient"
+   ],
+   "mustInclude": [],
+   "mustExclude": [
+    "sk_test_1234567890abcdefghijkl"
+   ]
+  },
+  {
+   "id": "context-only-preference",
+   "corpus": "hard",
+   "transcript": "User: For this one response only, make the explanation extra verbose.",
+   "expectedAction": "noop",
+   "acceptedReasons": [
+    "transient"
+   ],
+   "mustInclude": []
+  },
+  {
+   "id": "durable-direct-publish",
+   "corpus": "hard",
+   "transcript": "User: When I say commit and push after validation, use the direct publish flow. Do not create a PR unless I ask for one.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "stable_preference",
+    "durable_workflow"
+   ],
+   "mustInclude": [
+    "commit",
+    "push",
+    "PR"
+   ]
+  },
+  {
+   "id": "unverified-third-party-claim",
+   "corpus": "hard",
+   "transcript": "Assistant: A forum commenter says the vendor will discontinue the API next month. User: I have not verified that.",
+   "expectedAction": "noop",
+   "acceptedReasons": [
+    "insufficient_evidence",
+    "speculative"
+   ],
+   "mustInclude": []
+  },
+  {
+   "id": "domain-metric-meaning",
+   "corpus": "baseline",
+   "transcript": "User: Reminder for everyone \u2014 in our reporting, 'volume' always means sell-in cases shipped to distributors, never sell-through at retail. People keep misreading the dashboards because of this.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "domain_knowledge"
+   ],
+   "mustInclude": [
+    "volume",
+    "sell-in"
+   ]
+  },
+  {
+   "id": "domain-architecture-why",
+   "corpus": "baseline",
+   "transcript": "User: For context on the platform: the cache database is only a fast projection for reads \u2014 the warehouse is the source of truth. We built it that way because tenant queries were timing out against the warehouse directly. Never design anything that treats the cache as authoritative.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "domain_knowledge"
+   ],
+   "mustInclude": [
+    "cache",
+    "source of truth"
+   ]
+  },
+  {
+   "id": "domain-tradeoff-accepted",
+   "corpus": "baseline",
+   "transcript": "User: We decided to accept slower nightly loads in exchange for exact dedupe on the partner feed \u2014 approximate matching kept corrupting partner rows. That tradeoff stands unless the partners change their file format.",
+   "expectedAction": "capture",
+   "acceptedReasons": [
+    "domain_knowledge",
+    "explicit_decision"
+   ],
+   "mustInclude": [
+    "dedupe"
+   ]
+  },
+  {
+   "id": "domain-transient-guard",
+   "corpus": "baseline",
+   "transcript": "User: this week's volume number looks a bit low, probably the holiday, should bounce back next week.",
+   "expectedAction": "noop",
+   "acceptedReasons": [
+    "transient",
+    "speculative",
+    "insufficient_evidence"
+   ],
+   "mustInclude": []
+  }
+ ],
+ "recordedSelection": {
+  "corpusSha256": "98e9580d54ddbdd9687604c901e472eeb1c11e5bbb5d3ca37d91df321d18c625",
+  "selectedCandidateId": "sonnet-5-medium",
+  "trialsPerCorpus": 3,
+  "recordedAt": "2026-07-26T18:20:00.000Z",
+  "provenance": "docs/specs/workgroup-memory-and-session-capabilities/run.md | selection performed 2026-07-26 on the 16-case corpus (sha 9cdb8a63...); carried forward unchanged over the 2026-08-15 addition of 4 domain-capture cases; re-selection due with the post-deploy domain replay (docs/specs/workgroup-cerebro/run.md)",
+  "results": [
+   {
+    "candidateId": "sonnet-5-medium",
+    "perfectTrials": 6,
+    "totalTrials": 6,
+    "meanWallMs": 24110
+   },
+   {
+    "candidateId": "gpt-5.6-terra-high",
+    "perfectTrials": 6,
+    "totalTrials": 6,
+    "meanWallMs": 23650
+   },
+   {
+    "candidateId": "sonnet-5-high",
+    "perfectTrials": 6,
+    "totalTrials": 6,
+    "meanWallMs": 36730
+   },
+   {
+    "candidateId": "gpt-5.6-luna-xhigh",
+    "perfectTrials": 4,
+    "totalTrials": 6,
+    "meanWallMs": 42410
+   }
+  ]
+ }
 }

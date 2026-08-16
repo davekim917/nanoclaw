@@ -599,6 +599,84 @@ absent caps trims at 12k; exact-link selects 16k (and provably not 12k); an EMPT
 capability snapshot still gets 22k with zero eviction; bootstrap+exact-link takes
 max = 22k. Memory module after correction: **114 passed**.
 
+---
+
+## 2026-08-15/16 — pillar 0 narrowed build + the replay gate's supply-chain saga
+
+Operator asked whether to proceed early; the counter answered: **`code_derived` 0 of
+3,631 decisions** with every other code ≥1 (even `sensitive`, once). Verdict recorded in
+the plan; prohibition scoping demoted to a replay-gate contingency (the counter proves
+it is not the CURRENT filter; it cannot prove it won't obstruct once the whitelist
+opens — only the replay can).
+
+### Built (tests first; memory module 121 + curator-contract 17 + audit guard 1, all green)
+
+`domain_knowledge` in both enums/schema/validation (P0-AC1); `reason=` persisted in the
+marker, non-capturing, between `id` and `evidence` (P0-AC2–AC4); splitting-audit
+compatibility pinned by a new `scripts/audit-memory-splitting.test.ts` (P0-AC5); ranking
+neutrality (P0-AC6); domain capture line + carve-out-verbatim assertion (P0-AC7). The
+deterministic-render contract test updated to the new marker shape — a plan-driven
+contract change, not a silent retarget. REASON_PATTERN from P0.3(d) was NOT added:
+nothing in the write path reads the reason and the measurement is a store grep (YAGNI,
+recorded). Four tenant-neutral domain cases added to the eval fixture, hash re-pinned.
+
+### Finding: the eval harness never used the production prompt
+
+`buildCuratorEvaluationPrompt` is a hand-written PROXY prompt with its own category list
+— already drifted (it lacks the people/orgs category shipped 2026-08-06). Gating pillar 0
+on it would be theater. The gate therefore replays through the real `buildCuratorPrompt`
++ `CURATOR_OUTPUT_SCHEMA` + the production model config (sonnet, medium), one case per
+call; the OLD prompt is reconstructed at runtime by stripping the domain line from the
+pure function's output — no source edits between phases, no race with concurrent
+sessions building `dist`. Harness drift logged for a separate fix; its env list also
+reads only 2 of the fleet's 4 OAuth slots (second latent gap, found below).
+
+### Finding: the replay gate cannot land — the OAuth account runs at 100% utilization
+
+~90 paced attempts over ~3 hours, across all four OAuth slots, all 429 (live Anthropic
+request ids). Meanwhile the production curator lands a call roughly every minute on the
+same account: the fleet's ~1.7 decisions/min steady state consumes the subscription's
+whole throughput, and any external marginal caller starves. Instrumented, not assumed:
+single 64-token probes 429 identically. The gateway-vault escape hatch (Anthropic API
+key, separate limits) 401s from this shell — its gateway agent does not carry the
+Anthropic secret (correct per design; model traffic bypasses the gateway).
+
+State: a sentinel probes every 25 min and fires the two-phase gate on the first open
+window. Two operator-owned unblocks exist if the saturation never breaks: assign the
+vault Anthropic key to this workstream's gateway agent, or briefly disable
+`NANOCLAW_MEMORY_CURATOR_ENABLED` to free the account for ten minutes.
+
+### Operator decision 2026-08-16: SHIP AHEAD OF THE GATE
+
+Operator: "Ship it." The replay gate converts from pre-deploy requirement to post-deploy
+evidence: the sentinel keeps probing and the old-vs-new table attaches here when a
+rate-bucket window opens. Grounds: the change is additive and prompt-level; its
+failure mode is capturing wanted facts under a countable label before efficacy proof;
+retreat is deleting one prompt line. The shared worktree also meant the change could
+leak into `dist` on any concurrent build regardless of when we committed.
+
+Also recorded from the credential investigation (full detail above): the fleet's 429s
+were per-minute rate-bucket contention, NOT usage-window exhaustion; "all credentials
+unavailable" is worker cooldown bookkeeping; failover to slots 3/4 is deliberate
+resilience (restriction proposed once, REJECTED); API-key migration REJECTED. The one
+accepted follow-up is renaming the misleading log label, on the operator's word, separately.
+
+### Cross-model review — pillar 0 (pre-ship)
+
+Codex `gpt-5.6-sol`, contract transport, `</dev/null`: **`must_fix` — 2 MUST-FIX,
+2 SHOULD-FIX. All four verified and ACCEPTED; none rejected.**
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | The expanded fixture's `recordedSelection` still pinned the July corpus hash, so `verifyCuratorEvalFixture` BLOCKS every run and 2 harness tests fail. **Verified: I would have shipped a red suite.** | Hash carried forward with a truthful provenance annotation (selection is 2026-07-26/16-case, carried over the 4-case domain addition, re-selection due with the post-deploy replay). Both tests green. |
+| 2 | The replay gate existed only as session scratch — a repository consumer could not reproduce P0.6 step 4, and the checked-in harness's proxy prompt cannot serve it. | `scripts/run-memory-domain-replay.ts` checked in: derives BOTH variants from the production `buildCuratorPrompt` (old = domain sentences stripped at runtime + whitelist wording reverted), production schema/model, agentic-lane credential policy, old-phase domain misses labeled as baseline rather than failures. |
+| 3 | The `Remember only …` whitelist — the operative filter per our own verdict — still excluded the domain, contradicting the later capture line. | Domain added to the whitelist sentence itself; explanatory line retained; AC7 still asserts carve-out verbatim. |
+| 4 | P0-AC6 could not fail under the realistic regression (ranking the full line instead of marker-stripped text) because no query term lived only in the marker. | AC6 gains a marker-only-vocabulary query that must select nothing. |
+
+Post-correction: memory module + both script suites **125 passed**, build clean. The
+`migrate-repo-store-*` failures in the wider suite belong to the concurrent session's
+domain and are untouched by this commit.
+
 ### Not done at this stage
 
 No production code written; planning is artifact-only. No tests materialized — per the

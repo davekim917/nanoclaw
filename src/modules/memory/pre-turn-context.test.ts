@@ -1206,6 +1206,51 @@ describe('per-person preference recall', () => {
   });
 });
 
+describe('fact marker reason field (P0-AC6)', () => {
+  it('the reason field does not affect ranking or selection', () => {
+    const fact = (n: number, reason: string) =>
+      `- Forecast pipeline volume fact number ${n} with distinct detail ${'x'.repeat(30 * n)}. <!-- nanoclaw-memory:id=mem_${String(n).repeat(16)};${reason}evidence=ev-${n};captured=2026-08-0${n}T00:00:00.000Z -->`;
+    const stripMarker = (text: string) => text.slice(0, text.indexOf('<!--')).trimEnd();
+    const input = {
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1 as const,
+      normalizedContent: JSON.stringify({ text: 'What is the forecast pipeline volume detail?' }),
+      includeBootstrap: false,
+    };
+
+    memoryFile(
+      'generated/memory.md',
+      `# Generated workgroup memory\n\n${[1, 2, 3].map((n) => fact(n, '')).join('\n')}\n`,
+    );
+    const legacy = buildPreTurnContext(input);
+
+    memoryFile(
+      'generated/memory.md',
+      `# Generated workgroup memory\n\n${[1, 2, 3].map((n) => fact(n, 'reason=domain_knowledge;')).join('\n')}\n`,
+    );
+    const reasoned = buildPreTurnContext(input);
+
+    const shape = (context: typeof legacy) =>
+      context.memoryEvidence.excerpts.map((row) => `${row.path}|${stripMarker(row.text)}`);
+    // Same facts selected, same order, identical marker-stripped text. Do NOT
+    // compare raw bytes: delivered text keeps the marker by design, so the
+    // reason field itself differs.
+    expect(shape(reasoned)).toEqual(shape(legacy));
+
+    // Review-hardened half: a query whose terms appear ONLY inside the marker
+    // (the reason token and marker vocabulary) must select nothing. If a
+    // regression ever ranks the full line instead of the marker-stripped
+    // searchable text, this query starts matching and fails here.
+    const markerOnly = buildPreTurnContext({
+      ...input,
+      normalizedContent: JSON.stringify({ text: 'nanoclaw-memory domain_knowledge captured evidence' }),
+    });
+    expect(markerOnly.memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
+  });
+});
+
 describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
   const ASK = 'Can you help me build a practice app about losophe?';
 

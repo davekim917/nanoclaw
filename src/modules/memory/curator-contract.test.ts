@@ -54,9 +54,88 @@ describe('background memory curator contract', () => {
     });
     if (decision.action !== 'replace_generated_memory') throw new Error('expected replacement');
     expect(decision.content).toMatch(
-      /^# Generated workgroup memory\n\n- GSC data is in Snowflake\. <!-- nanoclaw-memory:id=mem_[a-f0-9]{16};evidence=msg-1,msg-2;captured=2026-07-26T00:01:00\.000Z -->\n$/,
+      /^# Generated workgroup memory\n\n- GSC data is in Snowflake\. <!-- nanoclaw-memory:id=mem_[a-f0-9]{16};reason=durable_fact;evidence=msg-1,msg-2;captured=2026-07-26T00:01:00\.000Z -->\n$/,
     );
     expect(parseGeneratedMemoryFacts(decision.content)).toHaveLength(1);
+  });
+
+  // P0-AC1: domain_knowledge is a valid CAPTURE reason — including on a
+  // replacement carrying supersedes ids, the path that hard-rejects non-capture
+  // codes. The pre-pillar-0 contract rejected this decision outright.
+  it('accepts domain_knowledge as a capture reason code', () => {
+    const decision = validateCuratorDecision(
+      {
+        action: 'replace_generated_memory',
+        reasonCode: 'domain_knowledge',
+        supersedesMemoryIds: ['mem_aaaaaaaaaaaaaaaa'],
+        memories: [{ text: 'The volume metric means sell-in units, not sell-through.', evidenceIds: ['msg-1'] }],
+      },
+      context(oldContent),
+    );
+    expect(decision.action).toBe('replace_generated_memory');
+    expect(decision.reasonCode).toBe('domain_knowledge');
+    expect((CURATOR_CAPTURE_REASON_CODES as readonly string[]).includes('domain_knowledge')).toBe(true);
+    expect(CURATOR_OUTPUT_SCHEMA.properties.reasonCode.enum).toContain('domain_knowledge');
+  });
+
+  // P0-AC2: the capture reason is persisted in the provenance marker, BETWEEN
+  // id and evidence — the only placement both marker parsers tolerate.
+  it('writes the reason between id and evidence in the marker', () => {
+    const decision = validateCuratorDecision(
+      {
+        action: 'replace_generated_memory',
+        reasonCode: 'domain_knowledge',
+        supersedesMemoryIds: [],
+        memories: [{ text: 'Forecast grain is store-week for the streets tenant.', evidenceIds: ['msg-1'] }],
+      },
+      context(),
+    );
+    if (decision.action !== 'replace_generated_memory') throw new Error('expected replacement');
+    expect(decision.content).toMatch(
+      /<!-- nanoclaw-memory:id=mem_[a-f0-9]{16};reason=domain_knowledge;evidence=msg-1;captured=/,
+    );
+  });
+
+  // P0-AC3: legacy markers (no reason=) parse unchanged — the no-migration guard.
+  it('parseGeneratedMemoryFacts reads a legacy marker unchanged', () => {
+    const facts = parseGeneratedMemoryFacts(oldContent);
+    expect(facts).toHaveLength(1);
+    expect(facts[0]).toMatchObject({
+      id: 'mem_aaaaaaaaaaaaaaaa',
+      evidenceIds: ['old-1'],
+      capturedAt: '2026-07-20T00:00:00.000Z',
+    });
+  });
+
+  // P0-AC4: a reason-bearing marker parses with UNSHIFTED groups. This fails
+  // with "invalid timestamp" if the reason group is ever made capturing.
+  it('parseGeneratedMemoryFacts is unshifted by a reason-bearing marker', () => {
+    const line =
+      '- Fact. <!-- nanoclaw-memory:id=mem_bbbbbbbbbbbbbbbb;reason=domain_knowledge;evidence=ev-1,ev-2;captured=2026-08-15T00:00:00.000Z -->';
+    const facts = parseGeneratedMemoryFacts(`# Generated workgroup memory\n\n${line}\n`);
+    expect(facts).toHaveLength(1);
+    expect(facts[0]).toMatchObject({
+      id: 'mem_bbbbbbbbbbbbbbbb',
+      evidenceIds: ['ev-1', 'ev-2'],
+      capturedAt: '2026-08-15T00:00:00.000Z',
+    });
+  });
+
+  // P0-AC7: the prompt is the deliverable — the domain category must be stated
+  // and the correction carve-out must survive verbatim (P0-I3).
+  it('states the domain capture category without narrowing the correction carve-out', () => {
+    const prompt = buildCuratorPrompt({
+      workgroupId: 'wg-a',
+      generatedMemory: '',
+      relevantManualMemory: [],
+      messages: [],
+      boundary: 'B',
+    }).system;
+    expect(prompt).toContain('product and business domain');
+    expect(prompt).toContain('Capture the meaning and the reasoning, not the implementation');
+    expect(prompt).toContain(
+      "When a person corrects an agent's wrong assumption about how a system works, capture the corrected fact even if it looks recoverable from code",
+    );
   });
 
   it('canonicalizes an unambiguous raw platform evidence id to its archived provider namespace', () => {

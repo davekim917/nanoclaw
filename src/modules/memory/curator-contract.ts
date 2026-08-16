@@ -62,6 +62,7 @@ export const CURATOR_REASON_CODES = [
   'correction',
   'stable_preference',
   'durable_workflow',
+  'domain_knowledge',
 ] as const;
 
 export type CuratorReasonCode = (typeof CURATOR_REASON_CODES)[number];
@@ -76,6 +77,7 @@ export const CURATOR_CAPTURE_REASON_CODES = [
   'correction',
   'stable_preference',
   'durable_workflow',
+  'domain_knowledge',
 ] as const satisfies readonly CuratorReasonCode[];
 
 export type CuratorDecision =
@@ -116,8 +118,13 @@ export interface GeneratedMemoryFact {
   capturedAt: string;
 }
 
+// The optional reason group sits BETWEEN id and evidence — the only placement
+// both marker parsers tolerate (this one needs captured= last; the splitting
+// audit's needs captured= adjacent to evidence=) — and it is NON-capturing:
+// parseGeneratedMemoryFacts reads match[1..3] positionally, and a capturing
+// group here shifts evidence into the Date.parse slot and fails every write.
 const MEMORY_MARKER =
-  /<!--\s*nanoclaw-memory:id=(mem_[a-f0-9]{16});evidence=([A-Za-z0-9_.:@/-]+(?:,[A-Za-z0-9_.:@/-]+)*);captured=([^;\s]+)\s*-->/g;
+  /<!--\s*nanoclaw-memory:id=(mem_[a-f0-9]{16})(?:;reason=[a-z_]+)?;evidence=([A-Za-z0-9_.:@/-]+(?:,[A-Za-z0-9_.:@/-]+)*);captured=([^;\s]+)\s*-->/g;
 const GENERATED_MEMORY_HEADING = '# Generated workgroup memory';
 const MEMORY_EVIDENCE_ID = /^[A-Za-z0-9_.:@/-]+$/;
 
@@ -362,7 +369,7 @@ export function validateCuratorDecision(value: unknown, context: CuratorValidati
     activeIds.add(id);
     for (const evidenceId of evidenceIds) decisionEvidence.add(evidenceId);
     newLines.push(
-      `- ${text} <!-- nanoclaw-memory:id=${id};evidence=${evidenceIds.join(',')};captured=${capturedAt} -->`,
+      `- ${text} <!-- nanoclaw-memory:id=${id};reason=${decision.reasonCode};evidence=${evidenceIds.join(',')};captured=${capturedAt} -->`,
     );
   }
   const content = renderGeneratedMemory([...preservedLines, ...newLines]);
@@ -413,8 +420,9 @@ export function buildCuratorPrompt(input: CuratorPromptInput): { system: string;
   const system = [
     'You are NanoClaw background memory curator.',
     'Default to noop. False or noisy memory is worse than an omission.',
-    'Remember only explicit durable decisions, corrections, stable cross-task preferences, verified outcomes, durable workflows, and durable facts about people, organizations, and external systems: who they are, their role and contact points, what they own or are responsible for, and how to route work to them.',
+    'Remember only explicit durable decisions, corrections, stable cross-task preferences, verified outcomes, durable workflows, durable product and business-domain facts, and durable facts about people, organizations, and external systems: who they are, their role and contact points, what they own or are responsible for, and how to route work to them.',
     'A stated role or ownership ("X is our liaison to Y", "Z owns the nightly feed") is durable and capturable even when it arrives in passing rather than as a decision.',
+    'Durable facts about the product and business domain are capturable: what a system, dataset, or metric represents in business terms; how a metric is defined; why an architecture, model, or tradeoff was chosen and what was accepted in exchange; who the product serves and what they need. Capture the meaning and the reasoning, not the implementation that can be read from the code.',
     'A worked method that succeeded — a query pattern, an API sequence, a debugging technique — is a durable workflow, not raw output: capture the approach and its key pattern, not the output that surrounded it.',
     "When a person corrects an agent's wrong assumption about how a system works, capture the corrected fact even if it looks recoverable from code — the correction is proof that recovery from code failed in practice.",
     'Never remember secrets, capability availability, transient status, jokes, speculation, raw output, third-party uncertainty, or facts recoverable from code/Graphify.',
