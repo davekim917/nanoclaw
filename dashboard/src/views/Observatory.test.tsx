@@ -22,6 +22,7 @@ import {
   groupReleaseItems,
   releaseCounts,
 } from './Observatory.js';
+import { roomDecor, COBWEB, BLANK_AVATAR, DESK_ON, DESK_OFF } from './office-sprites.js';
 import useSWR from 'swr';
 import type {
   ObservatoryRoom,
@@ -397,7 +398,9 @@ describe('Observatory', () => {
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       const absent = container.querySelector('.nc-obs-room-absent')!;
       expect(absent.textContent).toBe('K');
-      expect(container.querySelector('.nc-obs-room-bodies img')).toBeFalsy();
+      // No avatar face for the absent member — the room's own furniture and
+      // empty-desk sprites live in the same row, so assert on the avatar.
+      expect(container.querySelector('.nc-obs-room-bodies .nc-obs-avatar')).toBeFalsy();
     });
 
     it('applies the grayscale "asleep" class to the avatar image when the agent is asleep', () => {
@@ -409,6 +412,93 @@ describe('Observatory', () => {
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       const img = container.querySelector('.nc-obs-chip[data-agent-id="ava"] img')!;
       expect(img.className).toContain('asleep');
+    });
+  });
+
+  describe('the office floor', () => {
+    const decorOf = (container: HTMLElement, key: string) =>
+      Array.from(container.querySelectorAll(`.nc-obs-room[data-room-key="${key}"] .nc-of-decor img`)).map((el) =>
+        el.getAttribute('data-decor'),
+      );
+
+    it('room furniture is deterministic per room key, not random per render', () => {
+      // Pure helper first — same key in, same furniture out.
+      expect(roomDecor('slack:C123').map((d) => d.name)).toEqual(roomDecor('slack:C123').map((d) => d.name));
+
+      mockData(snapshot({ rooms: [room({ key: 'slack:C123' }), room({ key: 'slack:C999', name: 'other' })] }));
+      const first = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+
+      const a = decorOf(first.container, 'slack:C123');
+      expect(a.length).toBeGreaterThan(0);
+      expect(a).toEqual(decorOf(second.container, 'slack:C123'));
+      expect(decorOf(first.container, 'slack:C999')).toEqual(decorOf(second.container, 'slack:C999'));
+      // Every piece comes from the sprite set, never an empty/undefined src.
+      for (const img of Array.from(first.container.querySelectorAll('.nc-of-decor img'))) {
+        expect(img.getAttribute('src')).toMatch(/^data:image\/svg\+xml,/);
+      }
+    });
+
+    it('an abandoned room is marked dusty and gets a cobweb sprite; a live room gets neither', () => {
+      mockData(
+        snapshot({
+          rooms: [
+            room({ key: 'old', lastActivityAt: '2020-01-01T00:00:00Z' }),
+            room({ key: 'fresh', lastActivityAt: new Date().toISOString() }),
+          ],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const old = container.querySelector('.nc-obs-room[data-room-key="old"]')!;
+      expect(old.className).toContain('dusty');
+      expect(old.querySelector('.nc-obs-room-cobweb')!.getAttribute('src')).toBe(COBWEB);
+
+      const fresh = container.querySelector('.nc-obs-room[data-room-key="fresh"]')!;
+      expect(fresh.className).not.toContain('dusty');
+      expect(fresh.querySelector('.nc-obs-room-cobweb')).toBeFalsy();
+    });
+
+    it('the bullpen holds exactly the agents with no location', () => {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1' })],
+          agents: [
+            agent({ id: 'ava', name: 'ava', location: 'r1' }),
+            agent({ id: 'kit', name: 'kit', location: null }),
+            agent({ id: 'zed', name: 'zed', location: null }),
+          ],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const inPen = Array.from(container.querySelectorAll('.nc-of-bullpen .nc-obs-chip')).map((el) =>
+        el.getAttribute('data-agent-id'),
+      );
+      expect(inPen).toEqual(['kit', 'zed']);
+      // and the bullpen is part of the floor, not a strip above it.
+      expect(container.querySelector('.nc-of-floor > .nc-of-bullpen')).toBeTruthy();
+    });
+
+    it('an agent with no avatarUrl gets the blank-avatar sprite with initials over it', () => {
+      mockData(snapshot({ agents: [agent({ id: 'zed', name: 'zed rivera', avatarUrl: null })] }));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const blank = container.querySelector('.nc-obs-chip[data-agent-id="zed"] .nc-of-blank')!;
+      const img = blank.querySelector('img')!;
+      expect(img.getAttribute('src')).toBe(BLANK_AVATAR);
+      expect(img.className).toContain('pixelated');
+      expect(blank.querySelector('.nc-of-blank-initials')!.textContent).toBe('ZR');
+    });
+
+    it('an awake agent sits at a lit desk, an asleep agent at a dark one', () => {
+      mockData(
+        snapshot({
+          agents: [agent({ id: 'ava', name: 'ava', awake: true }), agent({ id: 'kit', name: 'kit', awake: false })],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const deskOf = (id: string) =>
+        container.querySelector(`.nc-obs-chip[data-agent-id="${id}"] .nc-of-desk`)!.getAttribute('src');
+      expect(deskOf('ava')).toBe(DESK_ON);
+      expect(deskOf('kit')).toBe(DESK_OFF);
     });
   });
 

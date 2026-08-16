@@ -16,17 +16,24 @@ import {
 import { relAge } from '../lib/derive.js';
 import { RouteNav, type BoardRoute } from './BoardShell.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
+import { DESK_ON, DESK_OFF, COBWEB, BLANK_AVATAR, roomDecor } from './office-sprites.js';
 
 /**
- * Observatory — an ambient "who is where, doing what" view for the human
- * operator. Concept: each workgroup channel is a ROOM, each agent has ONE
- * body. Not a game — no avatars walking, no animation beyond CSS
- * transitions, no interactivity beyond hover and click-through.
+ * Observatory — a top-down pixel-art office floor you look down into. Each
+ * workgroup channel is a walled ROOM on a tiled floor, each agent has ONE body
+ * sitting at a desk, and agents with no room stand in the BULLPEN at the
+ * bottom. Above the floor sit the two boards the operator actually acts on:
+ * the corkboard JOB BOARD (release desk) and the WHITEBOARD (claims).
  *
- * Polls GET /dashboard/api/observatory?workgroup=:id every 15s (no SSE —
- * this is a slow-moving status board, not a live chat feed). Room CARD
- * POSITION is stable (sorted platform, then name) regardless of activity —
- * spatial memory is the point. Activity is conveyed by brightness only.
+ * Deliberately bright and warm — the rest of the dashboard is a dark control
+ * surface; this is a lit room with people in it. No animation, no canvas, no
+ * images: everything is CSS plus inline-SVG data URIs from office-sprites.ts.
+ *
+ * Polls GET /dashboard/api/observatory?workgroup=:id every 15s (no SSE — this
+ * is a slow-moving status board, not a live chat feed). Room POSITION is
+ * stable (sorted platform, then name) regardless of activity, and each room's
+ * furniture is hashed from its key — spatial memory is the point. Activity is
+ * conveyed by lighting only.
  */
 
 const POLL_MS = 15_000;
@@ -113,6 +120,7 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
   const claims = useMemo(() => sortClaims(snapshot?.claims ?? []), [snapshot]);
   const deskAgents = agents.filter((a) => a.location === null);
   const agentsById = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
+  const awakeCount = agents.filter((a) => a.awake).length;
 
   const claimClicked = (claim: ObservatoryClaim) => {
     const match = agents.find((a) => a.id === claim.owner || a.name === claim.owner);
@@ -120,13 +128,18 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
   };
 
   return (
-    <div className="nc-frame">
-      <header className="nc-pulse">
+    <div className="nc-frame nc-of">
+      <header className="nc-pulse nc-of-topbar">
         <div className="nc-pulse-top">
           <div className="nc-brand">
             <span className="mark" aria-hidden="true"></span>
             <WorkgroupPicker workgroups={workgroups} selectedId={selectedId} onChange={selectWorkgroup} />
           </div>
+          {snapshot && (
+            <div className="nc-of-headcount">
+              {awakeCount} awake <span aria-hidden="true">·</span> {rooms.length} rooms
+            </div>
+          )}
           <RouteNav route={route} onRouteChange={onRouteChange} />
         </div>
       </header>
@@ -137,35 +150,37 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
 
         {snapshot && (
           <>
-            <div className="nc-obs-desks">
-              <div className="nc-obs-desks-label">Desks</div>
-              <div className="nc-obs-desks-row">
-                {deskAgents.length === 0 && <span className="nc-obs-desks-empty">no one home</span>}
-                {deskAgents.map((a) => (
-                  <AgentChip key={a.id} agent={a} highlighted={a.id === highlightedAgentId} {...bindPopover(a.id)} />
-                ))}
-              </div>
-            </div>
-
             <ReleaseDesk releaseState={snapshot.releaseState} />
 
             <div className="nc-obs-main">
-              <div className="nc-obs-rooms">
-                {rooms.map((room) => (
-                  <RoomCard
-                    key={room.key}
-                    room={room}
-                    bodies={agents.filter((a) => a.location === room.key)}
-                    agentsById={agentsById}
-                    highlightedAgentId={highlightedAgentId}
-                    openAgentId={popover?.id ?? null}
-                    bindPopover={bindPopover}
-                  />
-                ))}
-                {rooms.length === 0 && <div className="nc-empty">no rooms wired for this workgroup</div>}
-              </div>
-
               <ClaimsWall claims={claims} onClaimClick={claimClicked} />
+
+              <div className="nc-of-floor">
+                <div className="nc-obs-rooms">
+                  {rooms.map((room) => (
+                    <RoomCard
+                      key={room.key}
+                      room={room}
+                      bodies={agents.filter((a) => a.location === room.key)}
+                      agentsById={agentsById}
+                      highlightedAgentId={highlightedAgentId}
+                      openAgentId={popover?.id ?? null}
+                      bindPopover={bindPopover}
+                    />
+                  ))}
+                  {rooms.length === 0 && <div className="nc-empty">no rooms wired for this workgroup</div>}
+                </div>
+
+                <div className="nc-obs-desks nc-of-bullpen">
+                  <div className="nc-obs-desks-label">Bullpen</div>
+                  <div className="nc-obs-desks-row">
+                    {deskAgents.length === 0 && <span className="nc-obs-desks-empty">no one home</span>}
+                    {deskAgents.map((a) => (
+                      <AgentChip key={a.id} agent={a} highlighted={a.id === highlightedAgentId} {...bindPopover(a.id)} />
+                    ))}
+                  </div>
+                </div>
+              </div>
             </div>
           </>
         )}
@@ -194,7 +209,7 @@ export function sortClaims(claims: ObservatoryClaim[]): ObservatoryClaim[] {
   return [...claims].sort((a, b) => CLAIM_ORDER.indexOf(a.state) - CLAIM_ORDER.indexOf(b.state));
 }
 
-/** Room-card light level, driven by lastActivityAt: today lit, 1-7d dim, else dusty. */
+/** Room light level, driven by lastActivityAt: today lit, 1-7d dim, else dusty. */
 export function roomActivityClass(lastActivityAt: string | null, now = Date.now()): 'lit' | 'dim' | 'dusty' {
   if (!lastActivityAt) return 'dusty';
   const days = (now - new Date(lastActivityAt).getTime()) / 86_400_000;
@@ -229,7 +244,7 @@ export function claimAgeLabel(c: ObservatoryClaim, now = Date.now()): string {
   return `${mag} past deadline`;
 }
 
-/* ─── Release Desk — "can we ship, what's in the way, whose move" ───────── */
+/* ─── Job board — "can we ship, what's in the way, whose move" ───────────── */
 
 const MOVER_ORDER: ReleaseNextMover[] = ['human', 'agent', 'nobody'];
 
@@ -273,16 +288,25 @@ export function groupReleaseItems(items: ReleaseItem[]): {
   };
 }
 
-/** "2 holding release · 3 your move · 5 in flight · 4 at risk" — zero terms omitted. */
-export function releaseCounts(items: ReleaseItem[]): string {
+/**
+ * The four tallies, zero terms dropped. Rendered as big chunky numbers on the
+ * corkboard; the joined form is `releaseCounts`, and the two must stay in
+ * lockstep — the counts line is a contract, not decoration.
+ */
+export function releaseCountParts(items: ReleaseItem[]): { n: number; label: string }[] {
   const g = groupReleaseItems(items);
   return [
-    g.blockers.length > 0 ? `${g.blockers.length} holding release` : null,
-    g.human.length > 0 ? `${g.human.length} your move` : null,
-    g.agent.length > 0 ? `${g.agent.length} in flight` : null,
-    g.nobody.length > 0 ? `${g.nobody.length} at risk` : null,
-  ]
-    .filter((s): s is string => s !== null)
+    { n: g.blockers.length, label: 'holding release' },
+    { n: g.human.length, label: 'your move' },
+    { n: g.agent.length, label: 'in flight' },
+    { n: g.nobody.length, label: 'at risk' },
+  ].filter((p) => p.n > 0);
+}
+
+/** "2 holding release · 3 your move · 5 in flight · 4 at risk" — zero terms omitted. */
+export function releaseCounts(items: ReleaseItem[]): string {
+  return releaseCountParts(items)
+    .map((p) => `${p.n} ${p.label}`)
     .join(' · ');
 }
 
@@ -321,8 +345,8 @@ function ReleaseRow({
 function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
   if (!releaseState) {
     return (
-      <section className="nc-obs-release">
-        <div className="nc-obs-release-title">Release Desk</div>
+      <section className="nc-obs-release nc-of-corkboard">
+        <div className="nc-obs-release-title">Job Board</div>
         <div className="nc-obs-release-empty">
           no release desk — the release watcher has not published release-state.json yet
         </div>
@@ -332,16 +356,28 @@ function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
 
   const { items, release, asOf } = releaseState;
   const groups = groupReleaseItems(items);
-  const counts = releaseCounts(items);
+  const parts = releaseCountParts(items);
 
   return (
-    <section className="nc-obs-release">
+    <section className="nc-obs-release nc-of-corkboard">
       <div className="nc-obs-release-head">
         <div>
-          <span className="nc-obs-release-title">Release Desk</span>
+          <span className="nc-obs-release-title">Job Board</span>
           <span className="nc-obs-release-fresh"> — updated {relAge(asOf)} ago by the release watcher</span>
         </div>
-        {counts && <div className="nc-obs-release-counts">{counts}</div>}
+        {parts.length > 0 && (
+          // textContent stays exactly "1 holding release · 2 in flight" — the
+          // spans only give CSS something to make the numbers big.
+          <div className="nc-obs-release-counts">
+            {parts.map((p, i) => (
+              <span key={p.label} className="nc-of-tally">
+                {i > 0 && <span className="nc-of-tally-sep">{' · '}</span>}
+                <span className="nc-of-tally-n">{p.n}</span>
+                <span className="nc-of-tally-l">{' ' + p.label}</span>
+              </span>
+            ))}
+          </div>
+        )}
       </div>
 
       {release?.moratorium && <div className="nc-obs-release-moratorium">release-day moratorium active</div>}
@@ -388,7 +424,7 @@ function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
   );
 }
 
-/* ─── Agent chip — one agent's ONE body ──────────────────────────────────── */
+/* ─── Agent at a desk — one agent's ONE body ─────────────────────────────── */
 
 interface PopoverBinding {
   isOpen: boolean;
@@ -426,15 +462,30 @@ function AgentChip({
         }
       }}
     >
-      {agent.avatarUrl && (
-        <img
-          className={`nc-obs-avatar pixelated${agent.awake ? '' : ' asleep'}`}
-          src={agent.avatarUrl}
-          alt={agent.name}
-          loading="lazy"
-          referrerPolicy="no-referrer"
-        />
-      )}
+      {/* Avatar first in DOM so it sits on top of the desk and is the chip's
+          first <img>; CSS, not source order, does the overlap. */}
+      <div className="nc-of-station">
+        {agent.avatarUrl ? (
+          <img
+            className={`nc-obs-avatar pixelated${agent.awake ? '' : ' asleep'}`}
+            src={agent.avatarUrl}
+            alt={agent.name}
+            loading="lazy"
+            referrerPolicy="no-referrer"
+          />
+        ) : (
+          <span className="nc-of-blank">
+            <img
+              className={`nc-obs-avatar pixelated blank${agent.awake ? '' : ' asleep'}`}
+              src={BLANK_AVATAR}
+              alt=""
+              aria-hidden="true"
+            />
+            <span className="nc-of-blank-initials">{initials(agent.name)}</span>
+          </span>
+        )}
+        <img className="nc-of-sprite nc-of-desk" src={agent.awake ? DESK_ON : DESK_OFF} alt="" aria-hidden="true" />
+      </div>
       <span className="nc-obs-chip-glyph" aria-hidden="true">
         {agent.awake ? '●' : '💤'}
       </span>
@@ -457,7 +508,7 @@ function AgentChip({
   );
 }
 
-/* ─── Room card ───────────────────────────────────────────────────────────── */
+/* ─── Room — a walled area on the floor ──────────────────────────────────── */
 
 function RoomCard({
   room,
@@ -477,6 +528,7 @@ function RoomCard({
   const cls = roomActivityClass(room.lastActivityAt);
   const presentIds = new Set(bodies.map((a) => a.id));
   const absentMembers = room.memberAgentIds.filter((id) => !presentIds.has(id));
+  const decor = roomDecor(room.key);
   // A dim/dusty room's opacity creates its own stacking context, trapping any
   // popover rendered inside it below sibling room cards later in the grid.
   // Elevating the room itself (grid items honor z-index without needing
@@ -487,17 +539,29 @@ function RoomCard({
     <div className={`nc-obs-room ${cls} ${hasOpenPopover ? 'has-open-popover' : ''}`} data-room-key={room.key}>
       <div className="nc-obs-room-head">
         <span className="nc-obs-room-name">{room.name}</span>
-        {cls === 'dusty' && (
-          <span className="nc-obs-room-cobweb" aria-hidden="true" title="quiet for a while">
-            🕸️
-          </span>
-        )}
       </div>
       <div className="nc-obs-room-platform">{room.platform}</div>
+
+      {cls === 'dusty' && (
+        <img className="nc-obs-room-cobweb" src={COBWEB} alt="" aria-hidden="true" title="quiet for a while" />
+      )}
+
+      <div className="nc-of-decor" aria-hidden="true">
+        {decor.map((d) => (
+          <img key={d.name} className={`nc-of-sprite nc-of-decor-${d.name}`} src={d.src} alt="" data-decor={d.name} />
+        ))}
+      </div>
+
       <div className="nc-obs-room-bodies">
         {bodies.map((a) => (
           <AgentChip key={a.id} agent={a} highlighted={a.id === highlightedAgentId} {...bindPopover(a.id)} />
         ))}
+        {bodies.length === 0 && (
+          <div className="nc-of-empty-desks" aria-hidden="true">
+            <img className="nc-of-sprite nc-of-desk" src={DESK_OFF} alt="" />
+            <img className="nc-of-sprite nc-of-desk" src={DESK_OFF} alt="" />
+          </div>
+        )}
         {absentMembers.map((id) => {
           const known = agentsById.get(id);
           return known?.avatarUrl ? (
@@ -517,6 +581,7 @@ function RoomCard({
           );
         })}
       </div>
+
       {room.permalink && (
         <a className="nc-obs-room-link" href={room.permalink} target="_blank" rel="noreferrer">
           open ↗
@@ -526,7 +591,7 @@ function RoomCard({
   );
 }
 
-/* ─── Claims wall — "Who's on what" ──────────────────────────────────────── */
+/* ─── Whiteboard — "Who's on what" ───────────────────────────────────────── */
 
 const CLAIM_GROUP_LABELS: Record<ObservatoryClaimState, string> = {
   stale: 'Stale',
@@ -550,7 +615,7 @@ function ClaimsWall({
   onClaimClick: (claim: ObservatoryClaim) => void;
 }) {
   return (
-    <aside className="nc-obs-claims">
+    <aside className="nc-obs-claims nc-of-whiteboard">
       <div className="nc-obs-claims-title">Who&apos;s on what</div>
       {claims.length === 0 && <div className="nc-empty">no claims</div>}
       {CLAIM_ORDER.map((state) => {
