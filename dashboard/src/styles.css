@@ -1679,6 +1679,66 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   }
 }
 
+/* Release Desk — full-width, above the rooms grid: pre-release the most
+   important thing on the page. "Can we ship, what's in the way, whose move." */
+.nc-obs-release {
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg-panel);
+  padding: 14px 16px; margin-bottom: 16px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.nc-obs-release-head {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px;
+}
+.nc-obs-release-title {
+  font-family: var(--font-mono); font-size: 13px; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg);
+}
+.nc-obs-release-fresh { font-size: 11px; color: var(--fg-4); }
+.nc-obs-release-counts {
+  font-family: var(--font-mono); font-size: 11px; color: var(--fg-3); letter-spacing: 0.02em;
+}
+.nc-obs-release-empty { font-size: 12px; color: var(--fg-4); font-style: italic; }
+.nc-obs-release-moratorium {
+  align-self: flex-start;
+  background: var(--st-failed-bg); color: var(--st-failed); border: 1px solid var(--st-failed);
+  border-radius: 999px; padding: 4px 10px;
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase;
+}
+.nc-obs-release-holds { display: flex; flex-wrap: wrap; gap: 6px; }
+.nc-obs-release-hold {
+  background: var(--st-failed-bg); color: var(--st-failed); border: 1px solid var(--st-failed);
+  border-radius: 999px; padding: 3px 9px;
+  font-family: var(--font-mono); font-size: 10.5px;
+}
+.nc-obs-release-group { display: flex; flex-direction: column; gap: 4px; }
+.nc-obs-release-group.blockers { border-left: 2px solid var(--st-failed); padding-left: 10px; }
+.nc-obs-release-group-label {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--fg-4);
+}
+.nc-obs-release-group-sub { font-size: 11px; color: var(--fg-4); margin-bottom: 4px; }
+.nc-obs-release-row {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
+  min-height: 44px; padding: 7px 9px; border-radius: 6px;
+  background: var(--bg-card); border: 1px solid var(--line);
+}
+.nc-obs-release-row-kind { font-size: 12px; }
+.nc-obs-release-row-id {
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--fg); font-weight: 600;
+}
+a.nc-obs-release-row-id:hover { color: var(--st-running); }
+.nc-obs-release-row-title { font-size: 12.5px; color: var(--fg-2); }
+.nc-obs-release-row-tag {
+  font-family: var(--font-mono); font-size: 10px; color: var(--fg-3);
+  border: 1px solid var(--line-2); border-radius: 999px; padding: 1px 7px;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.nc-obs-release-row-owner { font-size: 11px; color: var(--fg-3); }
+.nc-obs-release-row-owner strong { color: var(--fg); font-weight: 600; }
+.nc-obs-release-row-why { flex-basis: 100%; font-size: 11px; color: var(--fg-4); line-height: 1.4; }
+.nc-obs-release-row-age { margin-left: auto; font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-3); }
+
 /* Claims wall — "Who's on what". Normal document flow: no fixed/sticky
    position, no independent scroll region, no fixed height — it's a plain
    grid column that scrolls with the rest of the page. */

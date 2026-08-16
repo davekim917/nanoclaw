@@ -9,6 +9,9 @@ import {
   type ObservatoryAgent,
   type ObservatoryClaim,
   type ObservatoryClaimState,
+  type ReleaseState,
+  type ReleaseItem,
+  type ReleaseNextMover,
 } from '../lib/api.js';
 import { relAge } from '../lib/derive.js';
 import { RouteNav, type BoardRoute } from './BoardShell.js';
@@ -144,6 +147,8 @@ export function Observatory({ route, onRouteChange }: ObservatoryProps) {
               </div>
             </div>
 
+            <ReleaseDesk releaseState={snapshot.releaseState} />
+
             <div className="nc-obs-main">
               <div className="nc-obs-rooms">
                 {rooms.map((room) => (
@@ -222,6 +227,165 @@ export function claimAgeLabel(c: ObservatoryClaim, now = Date.now()): string {
   if (c.state === 'live') return `${mag} left`;
   if (c.state === 'parked') return `parked ${mag} ago`;
   return `${mag} past deadline`;
+}
+
+/* ─── Release Desk — "can we ship, what's in the way, whose move" ───────── */
+
+const MOVER_ORDER: ReleaseNextMover[] = ['human', 'agent', 'nobody'];
+
+const MOVER_GROUP_LABELS: Record<ReleaseNextMover, string> = {
+  human: 'Your move',
+  agent: "In agents' hands",
+  nobody: "Nobody's — at risk",
+};
+
+const MOVER_GROUP_SUBTITLES: Record<ReleaseNextMover, string> = {
+  human: 'waiting on a person; nothing proceeds until they act',
+  agent: "autonomously handled; watch, don't touch",
+  nobody: 'no owner and no motion; these rot unless someone takes them',
+};
+
+const MOVER_TAG: Record<ReleaseNextMover, string> = { human: 'your move', agent: 'agents', nobody: 'unowned' };
+
+const KIND_GLYPH: Record<string, string> = { pr: '🔀', finding: '🐞', decision: '⚖️', claim: '📌', ops: '🧰' };
+function kindGlyph(kind: string): string {
+  return KIND_GLYPH[kind] ?? '•';
+}
+
+/**
+ * Split items into the blockers group plus the three mover groups, with a
+ * blocksRelease item appearing ONLY in blockers — never duplicated into its
+ * mover group too.
+ */
+export function groupReleaseItems(items: ReleaseItem[]): {
+  blockers: ReleaseItem[];
+  human: ReleaseItem[];
+  agent: ReleaseItem[];
+  nobody: ReleaseItem[];
+} {
+  const blockers = items.filter((i) => i.blocksRelease);
+  const rest = items.filter((i) => !i.blocksRelease);
+  return {
+    blockers,
+    human: rest.filter((i) => i.nextMover === 'human'),
+    agent: rest.filter((i) => i.nextMover === 'agent'),
+    nobody: rest.filter((i) => i.nextMover === 'nobody'),
+  };
+}
+
+/** "2 holding release · 3 your move · 5 in flight · 4 at risk" — zero terms omitted. */
+export function releaseCounts(items: ReleaseItem[]): string {
+  const g = groupReleaseItems(items);
+  return [
+    g.blockers.length > 0 ? `${g.blockers.length} holding release` : null,
+    g.human.length > 0 ? `${g.human.length} your move` : null,
+    g.agent.length > 0 ? `${g.agent.length} in flight` : null,
+    g.nobody.length > 0 ? `${g.nobody.length} at risk` : null,
+  ]
+    .filter((s): s is string => s !== null)
+    .join(' · ');
+}
+
+function ReleaseRow({
+  item,
+  moverTag,
+  boldOwner,
+}: {
+  item: ReleaseItem;
+  moverTag?: string;
+  boldOwner?: boolean;
+}) {
+  return (
+    <div className="nc-obs-release-row" data-item-id={item.id}>
+      <span className="nc-obs-release-row-kind" aria-hidden="true">
+        {kindGlyph(item.kind)}
+      </span>
+      {item.url ? (
+        <a className="nc-obs-release-row-id" href={item.url} target="_blank" rel="noreferrer">
+          {item.id}
+        </a>
+      ) : (
+        <span className="nc-obs-release-row-id">{item.id}</span>
+      )}
+      <span className="nc-obs-release-row-title">{item.title}</span>
+      {moverTag && <span className="nc-obs-release-row-tag">{moverTag}</span>}
+      {item.owner && (
+        <span className="nc-obs-release-row-owner">{boldOwner ? <strong>{item.owner}</strong> : item.owner}</span>
+      )}
+      {item.since && <span className="nc-obs-release-row-age">{relAge(item.since)}</span>}
+      {item.why && <div className="nc-obs-release-row-why">{item.why}</div>}
+    </div>
+  );
+}
+
+function ReleaseDesk({ releaseState }: { releaseState: ReleaseState | null }) {
+  if (!releaseState) {
+    return (
+      <section className="nc-obs-release">
+        <div className="nc-obs-release-title">Release Desk</div>
+        <div className="nc-obs-release-empty">
+          no release desk — the release watcher has not published release-state.json yet
+        </div>
+      </section>
+    );
+  }
+
+  const { items, release, asOf } = releaseState;
+  const groups = groupReleaseItems(items);
+  const counts = releaseCounts(items);
+
+  return (
+    <section className="nc-obs-release">
+      <div className="nc-obs-release-head">
+        <div>
+          <span className="nc-obs-release-title">Release Desk</span>
+          <span className="nc-obs-release-fresh"> — updated {relAge(asOf)} ago by the release watcher</span>
+        </div>
+        {counts && <div className="nc-obs-release-counts">{counts}</div>}
+      </div>
+
+      {release?.moratorium && <div className="nc-obs-release-moratorium">release-day moratorium active</div>}
+
+      {release?.holds && release.holds.length > 0 && (
+        <div className="nc-obs-release-holds">
+          {release.holds.map((h, i) => (
+            <span key={i} className="nc-obs-release-hold">
+              {h.kind}
+              {h.reason ? `: ${h.reason}` : ''}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {items.length === 0 && (
+        <div className="nc-obs-release-empty">nothing open — clear to ship pending the usual gates</div>
+      )}
+
+      {groups.blockers.length > 0 && (
+        <div className="nc-obs-release-group blockers">
+          <div className="nc-obs-release-group-label">Holding the release</div>
+          <div className="nc-obs-release-group-sub">these decide whether develop promotes to main</div>
+          {groups.blockers.map((item) => (
+            <ReleaseRow key={item.id} item={item} moverTag={MOVER_TAG[item.nextMover]} />
+          ))}
+        </div>
+      )}
+
+      {MOVER_ORDER.map((mover) => {
+        const rows = groups[mover];
+        if (rows.length === 0) return null;
+        return (
+          <div key={mover} className="nc-obs-release-group">
+            <div className="nc-obs-release-group-label">{MOVER_GROUP_LABELS[mover]}</div>
+            <div className="nc-obs-release-group-sub">{MOVER_GROUP_SUBTITLES[mover]}</div>
+            {rows.map((item) => (
+              <ReleaseRow key={item.id} item={item} boldOwner={mover === 'human'} />
+            ))}
+          </div>
+        );
+      })}
+    </section>
+  );
 }
 
 /* ─── Agent chip — one agent's ONE body ──────────────────────────────────── */

@@ -485,12 +485,45 @@ export interface ObservatoryClaim {
   escalated: boolean;
 }
 
+/** Who moves an open release-blocking item forward next. */
+export type ReleaseNextMover = 'human' | 'agent' | 'nobody';
+
+export interface ReleaseHold {
+  kind: string;
+  reason?: string;
+  since?: string;
+}
+
+export interface ReleaseItem {
+  /** e.g. "XZO#860" */
+  id: string;
+  /** pr | finding | decision | claim | ops | anything else the watcher emits */
+  kind: string;
+  title: string;
+  nextMover: ReleaseNextMover;
+  owner?: string;
+  blocksRelease?: boolean;
+  why?: string;
+  since?: string;
+  url?: string;
+}
+
+export interface ReleaseState {
+  /** When the release watcher generated this snapshot. */
+  asOf: string;
+  generatedBy?: string;
+  release?: { moratorium?: boolean; holds?: ReleaseHold[] };
+  items: ReleaseItem[];
+}
+
 export interface ObservatorySnapshot {
   workgroupId: string;
   asOf: string;
   rooms: ObservatoryRoom[];
   agents: ObservatoryAgent[];
   claims: ObservatoryClaim[];
+  /** Null until the release watcher has published release-state.json. */
+  releaseState: ReleaseState | null;
 }
 
 export async function getObservatory(workgroupId: string): Promise<ObservatorySnapshot> {

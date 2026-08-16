@@ -13,9 +13,24 @@ vi.mock('../lib/api.js', () => ({
   getObservatory: vi.fn(),
 }));
 
-import { Observatory, sortRooms, roomActivityClass, sortClaims, claimAgeLabel } from './Observatory.js';
+import {
+  Observatory,
+  sortRooms,
+  roomActivityClass,
+  sortClaims,
+  claimAgeLabel,
+  groupReleaseItems,
+  releaseCounts,
+} from './Observatory.js';
 import useSWR from 'swr';
-import type { ObservatoryRoom, ObservatoryAgent, ObservatoryClaim, ObservatorySnapshot } from '../lib/api.js';
+import type {
+  ObservatoryRoom,
+  ObservatoryAgent,
+  ObservatoryClaim,
+  ObservatorySnapshot,
+  ReleaseItem,
+  ReleaseState,
+} from '../lib/api.js';
 
 const mockAuthMe = {
   user_id: 'u1',
@@ -71,6 +86,25 @@ function snapshot(overrides: Partial<ObservatorySnapshot> = {}): ObservatorySnap
     rooms: [],
     agents: [],
     claims: [],
+    releaseState: null,
+    ...overrides,
+  };
+}
+
+function releaseItem(overrides: Partial<ReleaseItem> = {}): ReleaseItem {
+  return {
+    id: 'XZO#1',
+    kind: 'pr',
+    title: 'some pr',
+    nextMover: 'human',
+    ...overrides,
+  };
+}
+
+function releaseState(overrides: Partial<ReleaseState> = {}): ReleaseState {
+  return {
+    asOf: new Date().toISOString(),
+    items: [],
     ...overrides,
   };
 }
@@ -336,5 +370,152 @@ describe('Observatory', () => {
     const wall = container.querySelector('.nc-obs-claims')!;
     expect(wall.className).not.toMatch(/fixed|sticky/);
     expect(container.querySelector('.nc-obs-main > .nc-obs-claims')).toBeTruthy();
+  });
+
+  describe('Release Desk', () => {
+    it('groupReleaseItems: dedupes a blocksRelease item out of its mover group', () => {
+      const g = groupReleaseItems([
+        releaseItem({ id: 'B1', nextMover: 'human', blocksRelease: true }),
+        releaseItem({ id: 'H1', nextMover: 'human' }),
+      ]);
+      expect(g.blockers.map((i) => i.id)).toEqual(['B1']);
+      expect(g.human.map((i) => i.id)).toEqual(['H1']);
+    });
+
+    it('releaseCounts: omits zero terms', () => {
+      expect(
+        releaseCounts([
+          releaseItem({ id: 'B1', nextMover: 'agent', blocksRelease: true }),
+          releaseItem({ id: 'A1', nextMover: 'agent' }),
+          releaseItem({ id: 'A2', nextMover: 'agent' }),
+        ]),
+      ).toBe('1 holding release · 2 in flight');
+    });
+
+    it('blockers group renders first and dedupes a blocksRelease item out of its mover group', () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'B1', nextMover: 'human', blocksRelease: true, title: 'blocked pr' }),
+              releaseItem({ id: 'H1', nextMover: 'human', title: 'human item' }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const groups = Array.from(container.querySelectorAll('.nc-obs-release-group'));
+      expect(groups[0]!.className).toContain('blockers');
+      const b1Rows = container.querySelectorAll('[data-item-id="B1"]');
+      expect(b1Rows.length).toBe(1);
+      expect(groups[0]!.contains(b1Rows[0]!)).toBe(true);
+    });
+
+    it('renders the three mover groups in order with the exact subtitles', () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'N1', nextMover: 'nobody' }),
+              releaseItem({ id: 'A1', nextMover: 'agent' }),
+              releaseItem({ id: 'H1', nextMover: 'human' }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const labels = Array.from(
+        container.querySelectorAll('.nc-obs-release-group:not(.blockers) .nc-obs-release-group-label'),
+      ).map((el) => el.textContent);
+      expect(labels).toEqual(['Your move', "In agents' hands", "Nobody's — at risk"]);
+      const subs = Array.from(
+        container.querySelectorAll('.nc-obs-release-group:not(.blockers) .nc-obs-release-group-sub'),
+      ).map((el) => el.textContent);
+      expect(subs).toEqual([
+        'waiting on a person; nothing proceeds until they act',
+        "autonomously handled; watch, don't touch",
+        'no owner and no motion; these rot unless someone takes them',
+      ]);
+    });
+
+    it('bolds the owner in the "Your move" group', () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({ items: [releaseItem({ id: 'H1', nextMover: 'human', owner: 'kit' })] }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const row = container.querySelector('[data-item-id="H1"]')!;
+      expect(row.querySelector('strong')!.textContent).toBe('kit');
+    });
+
+    it('renders the moratorium banner and hold chips', () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            release: { moratorium: true, holds: [{ kind: 'freeze', reason: 'release day' }] },
+            items: [],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('.nc-obs-release-moratorium')!.textContent).toContain(
+        'release-day moratorium active',
+      );
+      const hold = container.querySelector('.nc-obs-release-hold')!;
+      expect(hold.textContent).toContain('freeze');
+      expect(hold.textContent).toContain('release day');
+    });
+
+    it('shows the no-desk line when releaseState is null', () => {
+      mockData(snapshot({ releaseState: null }));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('.nc-obs-release-empty')!.textContent).toBe(
+        'no release desk — the release watcher has not published release-state.json yet',
+      );
+    });
+
+    it('shows the clear-to-ship line when items is empty', () => {
+      mockData(snapshot({ releaseState: releaseState({ items: [] }) }));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('.nc-obs-release-empty')!.textContent).toBe(
+        'nothing open — clear to ship pending the usual gates',
+      );
+    });
+
+    it('counts line is correct and omits zero terms', () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'B1', nextMover: 'agent', blocksRelease: true }),
+              releaseItem({ id: 'A1', nextMover: 'agent' }),
+              releaseItem({ id: 'A2', nextMover: 'agent' }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('1 holding release · 2 in flight');
+    });
+
+    it('renders a link for items with a url, plain text for items without', () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'H1', nextMover: 'human', url: 'https://example.com/pr/1' }),
+              releaseItem({ id: 'H2', nextMover: 'human' }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const linked = container.querySelector('[data-item-id="H1"] .nc-obs-release-row-id')!;
+      expect(linked.tagName).toBe('A');
+      expect(linked.getAttribute('href')).toBe('https://example.com/pr/1');
+      const unlinked = container.querySelector('[data-item-id="H2"] .nc-obs-release-row-id')!;
+      expect(unlinked.tagName).toBe('SPAN');
+    });
   });
 });
