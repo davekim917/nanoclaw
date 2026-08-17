@@ -1981,19 +1981,8 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   margin:0; padding:0 12px 10px; font-size:11.5px; color:var(--ink-3);
 }
 
-/* Two columns once there is room for both: the floor holds still while the
-   queue it filters scrolls beside it. Below this the page is one column and
-   the floor is still the first thing under the headline. */
-/* 1600, not 1180: at 1440 the split cut every queue title mid-sentence, and
-   the title is the content. The map already pans, so it loses far less from a
-   narrow column than the list does. */
-@media (min-width:1600px){
-  .nc-of .nc-obs-main{
-    display:grid; grid-template-columns:minmax(0,38%) minmax(0,62%); gap:14px; align-items:start;
-  }
-  .nc-of .nc-of-left{position:sticky; top:12px}
-  .nc-of .nc-of-mapcard{margin-bottom:12px}
-}
+/* One column at every width: the floor is full-bleed above the queue it
+   filters. A wide split squeezed the map into a narrow column and clipped it. */
 .nc-of .nc-of-chip{
   appearance:none; display:inline-flex; align-items:center; gap:6px; flex:none;
   height:28px; padding:0 10px; border-radius:7px; cursor:pointer;
