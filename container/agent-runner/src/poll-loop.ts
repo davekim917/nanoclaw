@@ -1398,20 +1398,37 @@ export async function processQuery(
     if (suppress) onContinuationPaused?.(continuationId);
   };
 
+  // Whether the provider is between turns. A `result` event says it is; every
+  // push into the stream says it isn't. This is the launch gate the ledger
+  // below cannot be: when the SDK MERGES a mid-turn push into the running turn
+  // it emits ONE result for TWO ledger entries, so `archivePrompts` over-counts
+  // from then on and its "FIFO is empty" gate never opens again. Observed in
+  // production 2026-08-16 — a queued continuation sat stranded for 52 minutes
+  // until the idle ceiling killed the container.
+  let turnIdle = false;
+  const pushToQuery = (message: string): void => {
+    turnIdle = false;
+    query.push(message);
+  };
+
   const pauseAnsweredPrompt = (): void => {
     requeueLedgerHead(true);
     archivePrompts.shift();
   };
 
-  const completeDeliveredPrompt = (): void => {
-    const answered = archivePrompts.shift();
-    if (answered?.continuationId) clearWorkContinuationIfMatches(answered.continuationId);
-
+  /**
+   * Launch the queued durable continuation, if any. `ignoreLedger` is set by
+   * the poll tick, which has already established provider idleness first-hand
+   * (turnIdle) and confirmed it had no real inbound of its own to admit.
+   * Double-launch is impossible either way: markWorkContinuationRunning is a
+   * transactional single-flight claim on the record id.
+   */
+  const maybeLaunchContinuation = (ignoreLedger: boolean): void => {
     // Real inbounds already queued in the stream take priority. Their result
     // will revisit this function; only launch durable work when the prompt FIFO
     // is otherwise empty. This lets an explicit user stop cancel the record
     // before its prompt is ever pushed.
-    if (archivePrompts.length > 0) return;
+    if (!ignoreLedger && archivePrompts.length > 0) return;
     if (getActiveRepositoryMountBarrier() !== null) return;
     const queued = getWorkContinuation();
     if (!queued || !isWorkContinuationRunnable(queued, runnerId)) return;
@@ -1424,8 +1441,14 @@ export async function processQuery(
     }
     const prompt = buildWorkContinuationPrompt(running.task);
     log(`Starting durable continuation: ${running.task.slice(0, 120)}`);
-    query.push(prompt);
+    pushToQuery(prompt);
     archivePrompts.push({ prompt, continuationId: running.id });
+  };
+
+  const completeDeliveredPrompt = (): void => {
+    const answered = archivePrompts.shift();
+    if (answered?.continuationId) clearWorkContinuationIfMatches(answered.continuationId);
+    maybeLaunchContinuation(false);
   };
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
@@ -1448,6 +1471,11 @@ export async function processQuery(
     pollInFlight = true;
 
     void (async () => {
+      // Set when this tick pushed a real inbound (which outranks durable work)
+      // and when it failed outright — both suppress the continuation launch at
+      // the bottom.
+      let admittedInbound = false;
+      let pollFailed = false;
       try {
         const repositoryBarrier = getActiveRepositoryMountBarrier();
         if (repositoryBarrier !== null) {
@@ -1608,10 +1636,12 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
-        query.push(prompt);
+        pushToQuery(prompt);
         archivePrompts.push({ prompt });
+        admittedInbound = true;
         markCompleted(keptIds);
       } catch (err) {
+        pollFailed = true;
         // Without this catch the rejection escapes the void IIFE and Node
         // terminates the container on unhandled-rejection. The initial-batch
         // path is wrapped by processQuery's outer try/catch; the follow-up
@@ -1644,6 +1674,13 @@ export async function processQuery(
           corruptionStreak = 0;
         }
       } finally {
+        // Second launch site for durable continuations, reached from every
+        // early return above (the tick found nothing admissible). It gates on
+        // observed provider idleness rather than the prompt ledger, which a
+        // merged mid-turn push permanently corrupts — see `turnIdle`.
+        if (!admittedInbound && !pollFailed && turnIdle && !done && !endedForCommand) {
+          maybeLaunchContinuation(true);
+        }
         pollInFlight = false;
       }
     })();
@@ -1685,6 +1722,10 @@ export async function processQuery(
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
         sawResult = true; // the SDK produced output → any prior api_retry recovered
+        // The provider is between turns as of right now. Set before the
+        // handling below, so any push it makes (nudge, continuation launch)
+        // clears the flag again and leaves it truthful on exit.
+        turnIdle = true;
         // Fleet Hardening Phase 0.1: one turn_usage row per completed turn,
         // written here because every provider's query converges on this
         // event regardless of which one ran. Whatever the provider didn't
@@ -1770,7 +1811,7 @@ export async function processQuery(
               unwrappedNudged = true;
               const destinations = getAllDestinations();
               const names = destinations.map((d) => d.name).join(', ');
-              query.push(
+              pushToQuery(
                 `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
                   `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
                   `Your destinations: ${names}. ` +
@@ -1782,7 +1823,7 @@ export async function processQuery(
               const names = getAllDestinations()
                 .map((d) => d.name)
                 .join(', ');
-              query.push(buildTaskBlockNudge(taskBlocks, names));
+              pushToQuery(buildTaskBlockNudge(taskBlocks, names));
             }
             // The wrapping-retry result answers the SAME user prompt — keep it
             // queued so the retry archives against it, not the nudge text.
@@ -1810,7 +1851,7 @@ export async function processQuery(
             ` Reminder: you have ${destinations.length} destinations (${names}). ` +
             'Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.';
         }
-        query.push(ensureFreshContextBootstrap(reminder));
+        pushToQuery(ensureFreshContextBootstrap(reminder));
       } else if (event.type === 'file') {
         dispatchFileAttachment(event, routing);
       }

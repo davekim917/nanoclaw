@@ -67,7 +67,11 @@ describe('poll loop — /upload-trace command', () => {
 
 async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
   return Promise.race([
-    runPollLoop({ provider, providerName: 'mock', cwd: '/tmp' }),
+    // The signal must reach the LOOP, not just the race below — without it the
+    // loop survives the test as a zombie poller on the shared connection and
+    // steals other files' pending rows (found 2026-08-17: it deterministically
+    // starved poll-loop.test.ts's merge-scenario tests 30s each).
+    runPollLoop({ provider, providerName: 'mock', cwd: '/tmp', signal }),
     new Promise<void>((_, reject) => {
       signal.addEventListener('abort', () => reject(new Error('aborted')));
     }),

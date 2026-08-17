@@ -2232,6 +2232,128 @@ describe('durable continuation wiring', () => {
     expect(getWorkContinuation()).toMatchObject({ id: queued.continuation.id, phase: 'queued' });
   });
 
+  // A mid-turn push the SDK MERGES into the running turn yields ONE result for
+  // TWO ledger entries, so `archivePrompts` over-counts from then on and the
+  // result-path gate never opens again. The poll tick launches on observed
+  // provider idleness instead. Pre-fix these two stranded the continuation
+  // until the 30-min idle ceiling killed the container.
+  describe('merged mid-turn push (ledger over-counts)', () => {
+    const deferred = (): { promise: Promise<void>; resolve: () => void } => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => {
+        resolve = r;
+      });
+      return { promise, resolve };
+    };
+
+    it('launches the queued continuation from the poll tick', async () => {
+      queueWorkContinuation('finish the migration');
+      insertMessage('m-follow', 'chat', { sender: 'Operator', text: 'also check the logs' });
+      const followUpPushed = deferred();
+      const continuationPushed = deferred();
+      const pushes: string[] = [];
+
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 'sess-1' };
+        await followUpPushed.promise;
+        // One result answering both the initial prompt and the merged follow-up.
+        yield { type: 'result', text: '<message to="chan-1">both handled</message>' };
+        await Promise.race([continuationPushed.promise, Bun.sleep(5000)]);
+      }
+      const query: AgentQuery = {
+        push: (m) => {
+          pushes.push(m);
+          if (m.includes('also check the logs')) followUpPushed.resolve();
+          if (m.includes('finish the migration')) continuationPushed.resolve();
+        },
+        end: () => {},
+        abort: () => {},
+        events: events(),
+      };
+
+      // ultracode/fast must match the query's creation values or the follow-up
+      // admission path treats the batch as a mid-turn settings change and ends.
+      await processQuery(
+        query,
+        ERR_ROUTING,
+        ['m1'],
+        'claude',
+        undefined,
+        'prompt',
+        undefined,
+        { ultracode: false, fast: false },
+        'runner-a',
+      );
+
+      expect(pushes).toHaveLength(2);
+      expect(pushes[0]).toContain('also check the logs');
+      expect(pushes[1]).toContain('finish the migration');
+    }, 30_000);
+
+    it('lets a real inbound win the tick that would otherwise launch it', async () => {
+      queueWorkContinuation('finish the migration');
+      insertMessage('m-follow', 'chat', { sender: 'Operator', text: 'also check the logs' });
+      const followUpPushed = deferred();
+      const secondPushed = deferred();
+      const pushes: string[] = [];
+
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 'sess-1' };
+        await followUpPushed.promise;
+        yield { type: 'result', text: '<message to="chan-1">both handled</message>' };
+        insertMessage('m-second', 'chat', { sender: 'Operator', text: 'and the second thing' });
+        await Promise.race([secondPushed.promise, Bun.sleep(5000)]);
+      }
+      const query: AgentQuery = {
+        push: (m) => {
+          pushes.push(m);
+          if (m.includes('also check the logs')) followUpPushed.resolve();
+          if (m.includes('and the second thing')) secondPushed.resolve();
+        },
+        end: () => {},
+        abort: () => {},
+        events: events(),
+      };
+
+      await processQuery(
+        query,
+        ERR_ROUTING,
+        ['m1'],
+        'claude',
+        undefined,
+        'prompt',
+        undefined,
+        { ultracode: false, fast: false },
+        'runner-a',
+      );
+
+      expect(pushes).toHaveLength(2);
+      expect(pushes[1]).toContain('and the second thing');
+      expect(getWorkContinuation()).toMatchObject({ task: 'finish the migration', phase: 'queued' });
+    }, 30_000);
+
+    it('launches exactly once when both call sites are live', async () => {
+      const queued = queueWorkContinuation('single launch only');
+      if (!queued.accepted) throw new Error('expected continuation');
+      const pushes: string[] = [];
+
+      async function* events(): AsyncGenerator<ProviderEvent> {
+        yield { type: 'init', continuation: 'sess-1' };
+        // Ledger is empty here, so the result path launches; the ticks below
+        // must not launch it a second time.
+        yield { type: 'result', text: '<message to="chan-1">done</message>' };
+        await Bun.sleep(1600); // ≥3 poll ticks
+      }
+      const query: AgentQuery = { push: (m) => pushes.push(m), end: () => {}, abort: () => {}, events: events() };
+
+      await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined, {}, 'runner-a');
+
+      expect(pushes.filter((p) => p.includes('single launch only'))).toHaveLength(1);
+      // Single-flight claim: the record can never be handed out twice.
+      expect(markWorkContinuationRunning(queued.continuation.id, 'runner-a')).toBeUndefined();
+    }, 30_000);
+  });
+
   it('explicit cancellation is idempotent', () => {
     queueWorkContinuation('cancel me');
     expect(cancelWorkContinuation()).toBe(true);

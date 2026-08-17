@@ -40,8 +40,13 @@ export const continueWork: McpToolDefinition = {
   async handler(args) {
     if (Object.keys(args).some((key) => key !== 'task')) return err('unknown input field');
     const task = typeof args.task === 'string' ? args.task.trim() : '';
-    if (!task || task.length > WORK_CONTINUATION_TASK_MAX_CHARS) {
-      return err(`task is required (max ${WORK_CONTINUATION_TASK_MAX_CHARS} chars)`);
+    if (!task) return err(`task is required (1-${WORK_CONTINUATION_TASK_MAX_CHARS} chars after trimming)`);
+    // Report the received length — a bare "max N chars" made an agent burn
+    // three calls binary-searching the cap (observed 2026-08-16).
+    if (task.length > WORK_CONTINUATION_TASK_MAX_CHARS) {
+      return err(
+        `task is ${task.length} chars after trimming; max is ${WORK_CONTINUATION_TASK_MAX_CHARS} — shorten it and retry`,
+      );
     }
     const queued = queueWorkContinuation(task, getCurrentInReplyTo());
     if (!queued.accepted) {

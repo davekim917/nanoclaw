@@ -33,7 +33,11 @@ describe('work continuation tools', () => {
 
   it('rejects empty, oversized, and unknown input without writing', async () => {
     expect((await continueWork.handler({ task: '   ' })).isError).toBe(true);
-    expect((await continueWork.handler({ task: 'x'.repeat(501) })).isError).toBe(true);
+    const oversized = await continueWork.handler({ task: 'x'.repeat(501) });
+    expect(oversized.isError).toBe(true);
+    // Report the received length so the agent doesn't binary-search the cap.
+    expect(oversized.content[0].text).toContain('501 chars');
+    expect(oversized.content[0].text).toContain('max is 500');
     expect((await continueWork.handler({ task: 'ok', surprise: true })).isError).toBe(true);
     expect(getOutboundDb().prepare("SELECT 1 FROM session_state WHERE key = 'work_continuation'").get()).toBeNull();
   });
