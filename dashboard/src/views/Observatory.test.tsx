@@ -26,10 +26,10 @@ import {
   sortRooms,
   sortClaims,
   claimAgeLabel,
+  claimSummary,
   groupReleaseItems,
-  groupReleaseItemsByOwner,
-  UNOWNED_LANE,
   releaseCounts,
+  jobTabItems,
   upcomingScheduled,
 } from './Observatory.js';
 import { RouteNav } from './BoardShell.js';
@@ -171,6 +171,11 @@ function mockData(
   });
 }
 
+/** Click a segment of the top-bar control — the only way to a non-default view. */
+async function segment(c: HTMLElement, view: 'overview' | 'board' | 'claims' | 'schedule') {
+  await userEvent.click(c.querySelector(`.nc-of-seg-btn[data-view="${view}"]`)! as HTMLElement);
+}
+
 describe('Observatory', () => {
   beforeEach(() => {
     vi.stubGlobal('matchMedia', (query: string) => ({
@@ -189,151 +194,369 @@ describe('Observatory', () => {
     vi.unstubAllGlobals();
   });
 
-  it('claims wall groups by state stale → parked → expiring → live, parked shows "needs an owner"', () => {
-    mockData(
-      snapshot({
-        claims: [
-          claim({ slug: 'live-1', state: 'live' }),
-          claim({ slug: 'stale-1', state: 'stale' }),
-          claim({ slug: 'parked-1', state: 'parked' }),
-          claim({ slug: 'expiring-1', state: 'expiring' }),
-        ],
-      }),
-    );
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const rows = Array.from(container.querySelectorAll('.nc-obs-claim-row'));
-    expect(rows.map((r) => r.getAttribute('data-slug'))).toEqual(['stale-1', 'parked-1', 'expiring-1', 'live-1']);
-    const parkedRow = container.querySelector('.nc-obs-claim-row[data-slug="parked-1"]')!;
-    expect(parkedRow.textContent).toContain('needs an owner');
+  describe('the segmented views', () => {
+    const full = () =>
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1' })],
+          claims: [claim({ slug: 'c1' })],
+          releaseState: releaseState({ items: [releaseItem({ id: 'A1', nextMover: 'nobody' })] }),
+        }),
+      );
+
+    it('opens on the overview: the headline, the office, and the queue', () => {
+      full();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('.nc-of-seg-btn[data-view="overview"]')!.getAttribute('aria-pressed')).toBe('true');
+      expect(container.querySelector('.nc-of-head')).toBeTruthy();
+      expect(container.querySelector('office-map')).toBeTruthy();
+      expect(container.querySelector('[data-section="queue"]')).toBeTruthy();
+      expect(container.querySelector('[data-section="board"]')).toBeFalsy();
+    });
+
+    it('the office and the headline survive every segment — only the region below swaps', async () => {
+      full();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      for (const [view, section] of [
+        ['board', 'board'],
+        ['claims', 'claims'],
+        ['schedule', 'schedule'],
+      ] as const) {
+        await segment(container, view);
+        expect(container.querySelector('office-map')).toBeTruthy();
+        expect(container.querySelector('.nc-of-head')).toBeTruthy();
+        expect(container.querySelector(`[data-section="${section}"]`)).toBeTruthy();
+        expect(container.querySelector('[data-section="queue"]')).toBeFalsy();
+      }
+    });
+
+    it('the job board carries the claims and schedule cards beneath it, two up', async () => {
+      full();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await segment(container, 'board');
+      const twoup = container.querySelector('.nc-of-twoup')!;
+      expect(twoup.querySelector('[data-section="claims"]')).toBeTruthy();
+      expect(twoup.querySelector('[data-section="schedule"]')).toBeTruthy();
+      // and the table is above them
+      const table = container.querySelector('[data-section="board"]')!;
+      expect(table.compareDocumentPosition(twoup) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it('the office comes before the content region in document order, on every view', async () => {
+      full();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const main = container.querySelector('.nc-obs-main')!;
+      const map = container.querySelector('.nc-of-mapcard')!;
+      expect(main.contains(map)).toBe(true);
+      await segment(container, 'board');
+      const board = container.querySelector('[data-section="board"]')!;
+      expect(map.compareDocumentPosition(board) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it('the bar states the context of the view you are on', async () => {
+      full();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const meta = () => container.querySelector('.nc-of-bar-count')!.textContent;
+      expect(meta()).toBe('0 agents · 1 channels');
+      await segment(container, 'board');
+      expect(meta()).toBe('1 unowned');
+      await segment(container, 'claims');
+      expect(meta()).toBe('1 held');
+    });
   });
 
-  it('sortClaims: pure ordering helper matches the group order', () => {
-    const out = sortClaims([claim({ slug: 'a', state: 'live' }), claim({ slug: 'b', state: 'stale' })]);
-    expect(out.map((c) => c.slug)).toEqual(['b', 'a']);
+  describe('work claims', () => {
+    const withClaims = (claims: ObservatoryClaim[]) => {
+      mockData(snapshot({ claims }));
+      return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    };
+    const openClaims = async (c: HTMLElement) => segment(c, 'claims');
+
+    it('orders stale → parked → expiring → live, and says which need an owner', async () => {
+      const { container } = withClaims([
+        claim({ slug: 'live-1', state: 'live' }),
+        claim({ slug: 'stale-1', state: 'stale' }),
+        claim({ slug: 'parked-1', state: 'parked' }),
+        claim({ slug: 'expiring-1', state: 'expiring' }),
+      ]);
+      await openClaims(container);
+      const rows = Array.from(container.querySelectorAll('.nc-obs-claim-row'));
+      expect(rows.map((r) => r.getAttribute('data-slug'))).toEqual(['stale-1', 'parked-1', 'expiring-1', 'live-1']);
+      const parkedRow = container.querySelector('.nc-obs-claim-row[data-slug="parked-1"]')!;
+      expect(parkedRow.textContent).toContain('needs an owner');
+    });
+
+    it('the card head counts the states in operator language', async () => {
+      const { container } = withClaims([
+        claim({ slug: 'live-1', state: 'live' }),
+        claim({ slug: 'stale-1', state: 'stale' }),
+        claim({ slug: 'parked-1', state: 'parked' }),
+      ]);
+      await openClaims(container);
+      expect(container.querySelector('[data-section="claims"] .nc-of-card-meta')!.textContent).toBe(
+        '1 abandoned · 1 needs an owner · 1 held',
+      );
+    });
+
+    it('claimSummary: pure helper omits zero terms', () => {
+      expect(claimSummary([claim({ state: 'live' }), claim({ slug: 'b', state: 'live' })])).toBe('2 held');
+      expect(claimSummary([])).toBe('nothing claimed');
+    });
+
+    it('renders an age line for each claim state, red once the deadline is gone', async () => {
+      const { container } = withClaims([
+        claim({ slug: 'live-1', state: 'live', staleMs: -3_600_000 }),
+        claim({ slug: 'stale-1', state: 'stale', staleMs: 7_200_000 }),
+        claim({ slug: 'expiring-1', state: 'expiring', staleMs: 1_800_000 }),
+        claim({ slug: 'parked-1', state: 'parked', staleMs: 5_400_000 }),
+      ]);
+      await openClaims(container);
+      const age = (slug: string) =>
+        container.querySelector(`.nc-obs-claim-row[data-slug="${slug}"] .nc-obs-claim-age`)!;
+      expect(age('live-1').textContent).toContain('left');
+      expect(age('stale-1').textContent).toContain('past deadline');
+      expect(age('expiring-1').textContent).toContain('past deadline');
+      expect(age('parked-1').textContent).toBe('parked 1h ago');
+      expect(age('stale-1').className).toContain('stop');
+      expect(age('expiring-1').className).toContain('warn');
+      expect(age('live-1').className).not.toContain('stop');
+    });
+
+    it('claimAgeLabel: pure helper matches the per-state phrasing', () => {
+      const now = Date.parse('2026-08-14T12:00:00Z');
+      expect(claimAgeLabel(claim({ state: 'live', staleMs: -3_600_000 }), now)).toBe('1h left');
+      expect(claimAgeLabel(claim({ state: 'stale', staleMs: 7_200_000 }), now)).toBe('2h past deadline');
+      expect(claimAgeLabel(claim({ state: 'parked', staleMs: 1_800_000 }), now)).toBe('parked 30m ago');
+    });
+
+    it('renders "owner unknown" in italics when the owner is unresolved, not a literal name', async () => {
+      const { container } = withClaims([claim({ slug: 'c1', state: 'live', owner: 'unknown' })]);
+      await openClaims(container);
+      const ownerEl = container.querySelector('.nc-obs-claim-owner')!;
+      expect(ownerEl.querySelector('em')!.textContent).toBe('owner unknown');
+      expect(ownerEl.textContent).not.toBe('unknown');
+    });
+
+    it('the claims card stays in normal flow inside the main column, never a fixed rail', async () => {
+      const { container } = withClaims([claim({ slug: 'c1' })]);
+      await openClaims(container);
+      const card = container.querySelector('[data-section="claims"]')!;
+      expect(card.className).not.toMatch(/fixed|sticky/);
+      expect(container.querySelector('.nc-obs-main [data-section="claims"]')).toBeTruthy();
+    });
+
+    it('expanding a claim reveals its note and a thread link when threadUrl is present', async () => {
+      const { container } = withClaims([
+        claim({ slug: 'c1', note: 'holding the migration', threadUrl: 'https://example.com/t/1' }),
+      ]);
+      await openClaims(container);
+      const row = container.querySelector('.nc-obs-claim-row[data-slug="c1"]')!;
+      expect(row.querySelector('.nc-obs-claim-detail')).toBeFalsy();
+
+      await userEvent.click(row.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-claim-note')!.textContent).toBe('holding the migration');
+      const link = row.querySelector('.nc-obs-claim-detail a')!;
+      expect(link.getAttribute('href')).toBe('https://example.com/t/1');
+      expect(link.getAttribute('target')).toBe('_blank');
+      expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+      expect(link.textContent).toContain('open thread');
+    });
+
+    it('a claim with no threadUrl expands without any link', async () => {
+      const { container } = withClaims([claim({ slug: 'c1', threadUrl: null })]);
+      await openClaims(container);
+      const row = container.querySelector('.nc-obs-claim-row[data-slug="c1"]')!;
+      await userEvent.click(row.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-claim-detail')).toBeTruthy();
+      expect(row.querySelector('.nc-obs-claim-detail a')).toBeFalsy();
+    });
+
+    it('sortClaims: pure ordering helper matches the row order', () => {
+      const out = sortClaims([claim({ slug: 'a', state: 'live' }), claim({ slug: 'b', state: 'stale' })]);
+      expect(out.map((c) => c.slug)).toEqual(['b', 'a']);
+    });
   });
 
-  it('sortRooms: pure ordering helper sorts by platform then name', () => {
-    const out = sortRooms([
-      room({ key: 'z', platform: 'discord', name: 'zeta' }),
-      room({ key: 'a', platform: 'discord', name: 'alpha' }),
-    ]);
-    expect(out.map((r) => r.key)).toEqual(['a', 'z']);
+  describe('page chrome', () => {
+    it('sortRooms: pure ordering helper sorts by platform then name', () => {
+      const out = sortRooms([
+        room({ key: 'z', platform: 'discord', name: 'zeta' }),
+        room({ key: 'a', platform: 'discord', name: 'alpha' }),
+      ]);
+      expect(out.map((r) => r.key)).toEqual(['a', 'z']);
+    });
+
+    it('flips the footer to the stale warning when a poll fails but stale data remains', () => {
+      const snap = snapshot({ asOf: '2026-08-14T00:00:00Z' });
+      mockData(snap, new Error('network error'));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('.nc-obs-stale')).toBeTruthy();
+      expect(container.querySelector('.nc-obs-footer')!.textContent).toContain('stale since');
+    });
+
+    it('shows the calm "observatory offline" placeholder when there is no data and the poll fails', () => {
+      mockData(undefined, new Error('404'));
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('.nc-obs-offline')!.textContent).toContain('observatory offline');
+    });
   });
 
-  it('flips the footer to the stale warning when a poll fails but stale data remains', () => {
-    const snap = snapshot({ asOf: '2026-08-14T00:00:00Z' });
-    mockData(snap, new Error('network error'));
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    expect(container.querySelector('.nc-obs-stale')).toBeTruthy();
-    expect(container.querySelector('.nc-obs-footer')!.textContent).toContain('stale since');
-  });
+  describe('the job board', () => {
+    const board = async (items: ReleaseItem[], rs: Partial<ReleaseState> | null = {}) => {
+      mockData(snapshot({ releaseState: rs === null ? null : releaseState({ items, ...rs }) }));
+      const out = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await segment(out.container, 'board');
+      return out;
+    };
+    const ts = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
 
-  it('shows the calm "observatory offline" placeholder when there is no data and the poll fails', () => {
-    mockData(undefined, new Error('404'));
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    expect(container.querySelector('.nc-obs-offline')!.textContent).toContain('observatory offline');
-  });
+    it('jobTabItems: queue is whoever is not an agent, in flight is the agent, blockers cross both', () => {
+      const items = [
+        releaseItem({ id: 'H1', nextMover: 'human' }),
+        releaseItem({ id: 'N1', nextMover: 'nobody' }),
+        releaseItem({ id: 'A1', nextMover: 'agent' }),
+        releaseItem({ id: 'B1', nextMover: 'agent', blocksRelease: true }),
+      ];
+      expect(jobTabItems(items, 'queue').map((i) => i.id)).toEqual(['H1', 'N1']);
+      expect(jobTabItems(items, 'flight').map((i) => i.id)).toEqual(['A1', 'B1']);
+      expect(jobTabItems(items, 'blocking').map((i) => i.id)).toEqual(['B1']);
+    });
 
-  it('claim group subtitles render the exact operator-facing language for every state', () => {
-    mockData(
-      snapshot({
-        claims: [
-          claim({ slug: 'live-1', state: 'live' }),
-          claim({ slug: 'stale-1', state: 'stale' }),
-          claim({ slug: 'parked-1', state: 'parked' }),
-          claim({ slug: 'expiring-1', state: 'expiring' }),
-        ],
-      }),
-    );
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const subs = Array.from(container.querySelectorAll('.nc-obs-claim-group-sub')).map((el) => el.textContent);
-    expect(subs).toContain('abandoned — past its deadline, nobody is coming back');
-    expect(subs).toContain('deliberately handed off — free for anyone to take');
-    expect(subs).toContain('past its deadline but inside the grace window');
-    expect(subs).toContain('actively held — leave it alone');
-  });
+    it('jobTabItems: newest promise first', () => {
+      const items = [
+        releaseItem({ id: 'OLD', nextMover: 'human', since: ts(48) }),
+        releaseItem({ id: 'NEW', nextMover: 'human', since: ts(1) }),
+        releaseItem({ id: 'MID', nextMover: 'human', since: ts(9) }),
+      ];
+      expect(jobTabItems(items, 'queue').map((i) => i.id)).toEqual(['NEW', 'MID', 'OLD']);
+    });
 
-  it('renders an age line for each claim state', () => {
-    mockData(
-      snapshot({
-        claims: [
-          claim({ slug: 'live-1', state: 'live', staleMs: -3_600_000 }),
-          claim({ slug: 'stale-1', state: 'stale', staleMs: 7_200_000 }),
-          claim({ slug: 'expiring-1', state: 'expiring', staleMs: 1_800_000 }),
-          claim({ slug: 'parked-1', state: 'parked', staleMs: 5_400_000 }),
-        ],
-      }),
-    );
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const ageFor = (slug: string) => container.querySelector(`.nc-obs-claim-row[data-slug="${slug}"] .nc-obs-claim-age`)!.textContent;
-    expect(ageFor('live-1')).toContain('left');
-    expect(ageFor('stale-1')).toContain('past deadline');
-    expect(ageFor('expiring-1')).toContain('past deadline');
-    expect(ageFor('parked-1')).toBe('parked 1h ago');
-  });
+    it('the tabs carry their own counts and each names what it is showing', async () => {
+      const { container } = await board([
+        releaseItem({ id: 'H1', nextMover: 'human' }),
+        releaseItem({ id: 'N1', nextMover: 'nobody' }),
+        releaseItem({ id: 'A1', nextMover: 'agent' }),
+        releaseItem({ id: 'B1', nextMover: 'agent', blocksRelease: true }),
+      ]);
+      const tab = (k: string) => container.querySelector(`.nc-of-tab[data-tab="${k}"]`)!;
+      expect(tab('queue').textContent).toBe('Queue 2');
+      expect(tab('flight').textContent).toBe('In flight 2');
+      expect(tab('blocking').textContent).toBe('Blocks release 1');
+      expect(container.querySelector('.nc-of-tab-hint')!.textContent).toBe(
+        'unclaimed and claimed work, newest promise first',
+      );
+    });
 
-  it('claimAgeLabel: pure helper matches the per-state phrasing', () => {
-    const now = Date.parse('2026-08-14T12:00:00Z');
-    expect(claimAgeLabel(claim({ state: 'live', staleMs: -3_600_000 }), now)).toBe('1h left');
-    expect(claimAgeLabel(claim({ state: 'stale', staleMs: 7_200_000 }), now)).toBe('2h past deadline');
-    expect(claimAgeLabel(claim({ state: 'parked', staleMs: 1_800_000 }), now)).toBe('parked 30m ago');
-  });
+    it('picking a tab swaps the rows and the sentence under the count', async () => {
+      const { container } = await board([
+        releaseItem({ id: 'H1', nextMover: 'human', title: 'a person owes this' }),
+        releaseItem({ id: 'A1', nextMover: 'agent', title: 'an agent is on it' }),
+      ]);
+      const ids = () =>
+        Array.from(container.querySelectorAll('.nc-obs-ledger-row')).map((r) => r.getAttribute('data-ledger-id'));
+      expect(ids()).toEqual(['H1']);
 
-  it('renders "owner unknown" in italics when the owner is unresolved, not a literal name', () => {
-    mockData(snapshot({ claims: [claim({ slug: 'c1', state: 'live', owner: 'unknown' })] }));
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const ownerEl = container.querySelector('.nc-obs-claim-owner')!;
-    expect(ownerEl.querySelector('em')!.textContent).toBe('owner unknown');
-    expect(ownerEl.textContent).not.toBe('unknown');
-  });
+      await userEvent.click(container.querySelector('.nc-of-tab[data-tab="flight"]')! as HTMLElement);
+      expect(ids()).toEqual(['A1']);
+      expect(container.querySelector('.nc-of-tab-hint')!.textContent).toBe('items an agent is actively moving');
+      expect(container.querySelector('.nc-of-tab[data-tab="flight"]')!.getAttribute('aria-pressed')).toBe('true');
+    });
 
-  it('the claims wall carries no fixed/sticky positioning class and stays in normal flow', () => {
-    mockData(snapshot({ claims: [claim({ slug: 'c1' })] }));
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const wall = container.querySelector('.nc-obs-claims')!;
-    expect(wall.className).not.toMatch(/fixed|sticky/);
-    // Was `.nc-obs-main > .nc-obs-claims`. The wall now sits one level deeper,
-    // inside its collapsed <details>, so the direct-child selector no longer
-    // holds. The CONTRACT it protected is unchanged and still asserted: this
-    // panel is in normal document flow inside the main column, never a fixed
-    // side rail that ignores page scroll.
-    expect(container.querySelector('.nc-obs-main .nc-obs-claims')).toBeTruthy();
-  });
+    it('every row carries the same six columns, so the table reads down', async () => {
+      const { container } = await board([
+        releaseItem({
+          id: 'XZO#9',
+          title: 'a thing',
+          owner: 'ava',
+          kind: 'finding',
+          nextMover: 'nobody',
+          channel: '#qa-room',
+          blocksRelease: true,
+        }),
+      ]);
+      const btn = container.querySelector('.nc-obs-ledger-btn')!;
+      expect(btn.querySelector('.nc-obs-ledger-id')!.textContent).toBe('XZO#9');
+      expect(btn.querySelector('.nc-obs-ledger-title .nc-obs-ledger-blocks')!.textContent).toBe('blocks release');
+      expect(btn.querySelector('.nc-obs-ledger-title')!.textContent).toContain('a thing');
+      // The state cell is a dot plus the ledger's own word for the state.
+      expect(btn.querySelector('.nc-obs-ledger-state')!.textContent).toBe('nobody owns this');
+      expect(btn.querySelector('.nc-obs-ledger-state .nc-obs-dot')).toBeTruthy();
+      expect(btn.querySelector('.nc-obs-ledger-state')!.className).toContain('unowned');
+      expect(btn.querySelector('.nc-obs-ledger-owner')!.textContent).toBe('ava');
+      expect(btn.querySelector('.nc-obs-ledger-room')!.textContent).toBe('#qa-room');
+      expect(btn.querySelector('.nc-obs-ledger-age')).toBeTruthy();
+      // and the header names those columns in the same order
+      expect(
+        Array.from(container.querySelectorAll('.nc-obs-ledger-head > span')).map((s) => s.textContent),
+      ).toEqual(['Id', 'Title', 'State', 'Owner', 'Room', 'Age']);
+    });
 
-  it('puts the office above the boards, and leaves every board closed', () => {
-    mockData(
-      snapshot({
-        rooms: [room({ key: 'r1' })],
-        claims: [claim({ slug: 'c1' })],
-        releaseState: releaseState({ items: [releaseItem({ id: 'A1' })] }),
-      }),
-    );
-    const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-    const main = container.querySelector('.nc-obs-main')!;
-    // The office comes BEFORE every board in document order — the whole
-    // complaint was scrolling past ten pages of board to reach it. Asserted on
-    // order rather than on being the first child, because on a wide screen the
-    // floor and the boards are two columns.
-    const map = container.querySelector('.nc-of-mapcard')!;
-    const firstBoard = container.querySelector('details.nc-of-board')!;
-    expect(main.contains(map)).toBe(true);
-    expect(map.compareDocumentPosition(firstBoard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(container.querySelector('office-map')).toBeTruthy();
-    const boards = Array.from(container.querySelectorAll('details.nc-of-board')) as HTMLDetailsElement[];
-    expect(boards).toHaveLength(4);
-    // "Needs attention" is deliberately the ONE board that opens itself. A
-    // breach list behind a disclosure is a dead end with a chevron on it —
-    // the whole point is that it cannot be not-seen. Everything else stays
-    // closed so the office is still reachable without scrolling.
-    expect(boards[0]!.querySelector('summary')!.textContent).toContain('Needs attention');
-    expect(boards[0]!.open).toBe(true);
-    expect(boards.slice(1).every((d) => !d.open)).toBe(true);
-    // and the summary strip is above the floor, outside the main column
-    expect(container.querySelector('.nc-of-tally-strip')).toBeTruthy();
-  });
+    it('an ownerless, roomless row shows an em dash rather than collapsing its columns', async () => {
+      const { container } = await board([releaseItem({ nextMover: 'nobody' })]);
+      const btn = container.querySelector('.nc-obs-ledger-btn')!;
+      expect(btn.querySelector('.nc-obs-ledger-owner')!.textContent).toBe('—');
+      expect(btn.querySelector('.nc-obs-ledger-room')!.textContent).toBe('—');
+      expect(btn.querySelector('.nc-obs-ledger-blocks')).toBeFalsy();
+    });
 
+    it('expanding a row reveals its why and a labelled link out', async () => {
+      const { container } = await board([
+        releaseItem({
+          id: 'N1',
+          kind: 'pr',
+          nextMover: 'nobody',
+          why: 'waiting on a second approval',
+          url: 'https://example.com/pr/1',
+        }),
+      ]);
+      const row = container.querySelector('[data-ledger-id="N1"]')!;
+      expect(row.querySelector('.nc-obs-ledger-detail')).toBeFalsy();
 
-  describe('Release Desk', () => {
+      await userEvent.click(row.querySelector('.nc-obs-ledger-btn')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-ledger-detail')!.textContent).toContain('waiting on a second approval');
+      const out = row.querySelector('.nc-obs-ledger-detail .nc-of-link')!;
+      expect(out.textContent).toContain('open PR');
+      expect(out.getAttribute('target')).toBe('_blank');
+      expect(out.getAttribute('rel')).toBe('noopener noreferrer');
+    });
+
+    it('renders the moratorium banner and hold chips', async () => {
+      const { container } = await board([], { release: { moratorium: true, holds: [{ kind: 'freeze', reason: 'release day' }] } });
+      expect(container.querySelector('.nc-obs-release-moratorium')!.textContent).toContain(
+        'release-day moratorium active',
+      );
+      const hold = container.querySelector('.nc-obs-release-hold')!;
+      expect(hold.textContent).toContain('freeze');
+      expect(hold.textContent).toContain('release day');
+    });
+
+    it('an absent release desk and an empty one say different things', async () => {
+      const absent = await board([], null);
+      expect(absent.container.querySelector('.nc-obs-ledger-empty')!.textContent).toBe(
+        'no release desk — the release watcher has not published release-state.json yet',
+      );
+      absent.unmount();
+
+      const empty = await board([]);
+      expect(empty.container.querySelector('.nc-obs-ledger-empty')!.textContent).toBe(
+        'nothing open — clear to ship pending the usual gates',
+      );
+    });
+
+    it('pages exactly like the queue, and a new tab starts folded again', async () => {
+      const { container } = await board([
+        ...Array.from({ length: 20 }, (_, i) => releaseItem({ id: `Q#${i}`, nextMover: 'nobody' })),
+        ...Array.from({ length: 20 }, (_, i) => releaseItem({ id: `F#${i}`, nextMover: 'agent' })),
+      ]);
+      const rows = () => container.querySelectorAll('.nc-obs-ledger-row').length;
+      expect(rows()).toBe(15);
+      await userEvent.click(container.querySelector('.nc-obs-ledger-more')! as HTMLElement);
+      expect(rows()).toBe(20);
+
+      await userEvent.click(container.querySelector('.nc-of-tab[data-tab="flight"]')! as HTMLElement);
+      expect(rows()).toBe(15);
+    });
+
     it('groupReleaseItems: dedupes a blocksRelease item out of its mover group', () => {
       const g = groupReleaseItems([
         releaseItem({ id: 'B1', nextMover: 'human', blocksRelease: true }),
@@ -352,291 +575,7 @@ describe('Observatory', () => {
         ]),
       ).toBe('1 blocking · 2 automated');
     });
-
-    it('groupReleaseItemsByOwner: whoever holds a blocker leads, and the ownerless lane is pinned last', () => {
-      const lanes = groupReleaseItemsByOwner([
-        releaseItem({ id: 'U1', nextMover: 'nobody' }),
-        releaseItem({ id: 'U2', nextMover: 'nobody' }),
-        releaseItem({ id: 'U3', nextMover: 'nobody' }),
-        releaseItem({ id: 'A1', owner: 'ava', nextMover: 'agent' }),
-        releaseItem({ id: 'A2', owner: 'ava', nextMover: 'agent' }),
-        releaseItem({ id: 'K1', owner: 'kit', nextMover: 'human', blocksRelease: true }),
-      ]);
-      // kit holds the only blocker so leads despite carrying least; the three
-      // ownerless items lose the count tiebreak because they are a backlog.
-      expect(lanes.map((l) => l.owner)).toEqual(['kit', 'ava', UNOWNED_LANE]);
-    });
-
-    it('groupReleaseItemsByOwner: a lane reads now → next → stuck, blockers above all', () => {
-      const [lane] = groupReleaseItemsByOwner([
-        releaseItem({ id: 'N1', owner: 'ava', nextMover: 'nobody' }),
-        releaseItem({ id: 'H1', owner: 'ava', nextMover: 'human' }),
-        releaseItem({ id: 'A1', owner: 'ava', nextMover: 'agent' }),
-        releaseItem({ id: 'B1', owner: 'ava', nextMover: 'nobody', blocksRelease: true }),
-      ]);
-      expect(lane!.items.map((i) => i.id)).toEqual(['B1', 'A1', 'H1', 'N1']);
-    });
-
-    it('by-agent view groups the same items into per-owner lanes', async () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            items: [
-              releaseItem({ id: 'A1', owner: 'ava', nextMover: 'agent', title: 'ava item' }),
-              releaseItem({ id: 'K1', owner: 'kit', nextMover: 'human', title: 'kit item' }),
-            ],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelectorAll('.nc-obs-release-lane')).toHaveLength(0);
-
-      const byAgent = Array.from(container.querySelectorAll('.nc-obs-release-view')).find(
-        (b) => b.textContent === 'By agent',
-      )!;
-      await userEvent.click(byAgent);
-      const lanes = Array.from(container.querySelectorAll('.nc-obs-release-lane-owner')).map((e) => e.textContent);
-      expect(lanes).toEqual(['ava', 'kit']);
-      // the status-view headings are gone, not merely hidden
-      expect(container.querySelector('.nc-obs-release-group')).toBeNull();
-    });
-
-  
-
-    it('the dependency view states coverage first and marks undeclared items as not-independent', async () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            items: [
-              releaseItem({ id: 'A1', dependsOn: [], title: 'declared independent' }),
-              releaseItem({ id: 'A2', dependsOn: ['A1'], title: 'blocked by A1' }),
-              releaseItem({ id: 'A3', title: 'never declared' }),
-            ],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const tab = Array.from(container.querySelectorAll('.nc-obs-release-view')).find(
-        (b) => b.textContent === 'What unblocks what',
-      )!;
-      await userEvent.click(tab);
-
-      expect(container.querySelector('.nc-obs-dep-coverage')!.textContent).toContain('67%');
-      expect(container.querySelector('.nc-obs-dep-coverage')!.className).toContain('partial');
-
-      // A1 and A3 are both layer 0; only A3 may carry the undeclared treatment,
-      // which is the distinction the whole view exists to preserve.
-      const a1 = container.querySelector('.nc-obs-dep-node[data-node-id="A1"]')!;
-      const a3 = container.querySelector('.nc-obs-dep-node[data-node-id="A3"]')!;
-      expect(a1.className).not.toContain('undeclared');
-      expect(a3.className).toContain('undeclared');
-      expect(a3.textContent).toContain('deps not declared');
-
-      // and the ranking answers the actual question
-      expect(container.querySelector('.nc-obs-dep-rank-row')!.textContent).toContain('A1');
-    });
-
-  
-
-    it('blockers group renders first and dedupes a blocksRelease item out of its mover group', () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            items: [
-              releaseItem({ id: 'B1', nextMover: 'human', blocksRelease: true, title: 'blocked pr' }),
-              releaseItem({ id: 'H1', nextMover: 'human', title: 'human item' }),
-            ],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const groups = Array.from(container.querySelectorAll('.nc-obs-release-group'));
-      expect(groups[0]!.className).toContain('blockers');
-      const b1Rows = container.querySelectorAll('[data-item-id="B1"]');
-      expect(b1Rows.length).toBe(1);
-      expect(groups[0]!.contains(b1Rows[0]!)).toBe(true);
-    });
-
-    it('renders the three mover groups in order with the exact subtitles', () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            items: [
-              releaseItem({ id: 'N1', nextMover: 'nobody' }),
-              releaseItem({ id: 'A1', nextMover: 'agent' }),
-              releaseItem({ id: 'H1', nextMover: 'human' }),
-            ],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const labels = Array.from(
-        container.querySelectorAll('.nc-obs-release-group:not(.blockers) .nc-obs-release-group-label'),
-      ).map((el) => el.textContent);
-      expect(labels).toEqual(['Waiting on a person', 'Agents are handling it', 'Nobody is on this']);
-      const subs = Array.from(
-        container.querySelectorAll('.nc-obs-release-group:not(.blockers) .nc-obs-release-group-sub'),
-      ).map((el) => el.textContent);
-      expect(subs).toEqual([
-        'nothing moves until someone decides or approves',
-        'being worked automatically right now',
-        'no owner, no progress — it stays stuck until someone picks it up',
-      ]);
-    });
-
-    it('bolds the owner in the "Your move" group', () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({ items: [releaseItem({ id: 'H1', nextMover: 'human', owner: 'kit' })] }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const row = container.querySelector('[data-item-id="H1"]')!;
-      expect(row.querySelector('strong')!.textContent).toBe('kit');
-    });
-
-    it('renders the moratorium banner and hold chips', () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            release: { moratorium: true, holds: [{ kind: 'freeze', reason: 'release day' }] },
-            items: [],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelector('.nc-obs-release-moratorium')!.textContent).toContain(
-        'release-day moratorium active',
-      );
-      const hold = container.querySelector('.nc-obs-release-hold')!;
-      expect(hold.textContent).toContain('freeze');
-      expect(hold.textContent).toContain('release day');
-    });
-
-    it('shows the no-desk line when releaseState is null', () => {
-      mockData(snapshot({ releaseState: null }));
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelector('.nc-obs-release-empty')!.textContent).toBe(
-        'no release desk — the release watcher has not published release-state.json yet',
-      );
-    });
-
-    it('shows the clear-to-ship line when items is empty', () => {
-      mockData(snapshot({ releaseState: releaseState({ items: [] }) }));
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelector('.nc-obs-release-empty')!.textContent).toBe(
-        'nothing open — clear to ship pending the usual gates',
-      );
-    });
-
-    it('counts line is correct and omits zero terms', () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            items: [
-              releaseItem({ id: 'B1', nextMover: 'agent', blocksRelease: true }),
-              releaseItem({ id: 'A1', nextMover: 'agent' }),
-              releaseItem({ id: 'A2', nextMover: 'agent' }),
-            ],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelector('.nc-obs-release-counts')!.textContent).toBe('1 blocking · 2 automated');
-    });
-
-    it('renders a link for items with a url, plain text for items without', () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            items: [
-              releaseItem({ id: 'H1', nextMover: 'human', url: 'https://example.com/pr/1' }),
-              releaseItem({ id: 'H2', nextMover: 'human' }),
-            ],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const linked = container.querySelector('[data-item-id="H1"] .nc-obs-release-row-id')!;
-      expect(linked.tagName).toBe('A');
-      expect(linked.getAttribute('href')).toBe('https://example.com/pr/1');
-      const unlinked = container.querySelector('[data-item-id="H2"] .nc-obs-release-row-id')!;
-      expect(unlinked.tagName).toBe('SPAN');
-    });
-
-    it('clicking a tally filters the board to that group, clicking it again clears', async () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            items: [
-              releaseItem({ id: 'H1', nextMover: 'human' }),
-              releaseItem({ id: 'A1', nextMover: 'agent' }),
-            ],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const humanTally = container.querySelector('[data-tally="human"]')! as HTMLElement;
-      expect(container.querySelectorAll('.nc-obs-release-group').length).toBe(2);
-
-      await userEvent.click(humanTally);
-      expect(humanTally.getAttribute('aria-pressed')).toBe('true');
-      expect(container.querySelector('[data-item-id="H1"]')).toBeTruthy();
-      expect(container.querySelector('[data-item-id="A1"]')).toBeFalsy();
-
-      await userEvent.click(humanTally);
-      expect(humanTally.getAttribute('aria-pressed')).toBe('false');
-      expect(container.querySelector('[data-item-id="A1"]')).toBeTruthy();
-    });
-
-    it('the ALL reset clears an active tally filter', async () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            items: [
-              releaseItem({ id: 'H1', nextMover: 'human' }),
-              releaseItem({ id: 'A1', nextMover: 'agent' }),
-            ],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await userEvent.click(container.querySelector('[data-tally="human"]')! as HTMLElement);
-      expect(container.querySelector('[data-item-id="A1"]')).toBeFalsy();
-
-      await userEvent.click(container.querySelector('.nc-of-tally-all')! as HTMLElement);
-      expect(container.querySelector('[data-item-id="A1"]')).toBeTruthy();
-    });
-
-    it('expanding an item row reveals its full why and a labelled link out', async () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            items: [
-              releaseItem({
-                id: 'H1',
-                kind: 'pr',
-                nextMover: 'human',
-                why: 'waiting on a second approval',
-                url: 'https://example.com/pr/1',
-              }),
-            ],
-          }),
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const row = container.querySelector('[data-item-id="H1"]')!;
-      expect(row.querySelector('.nc-obs-release-row-why')).toBeFalsy();
-
-      await userEvent.click(row.querySelector('.nc-obs-release-row-toggle')! as HTMLElement);
-      expect(row.querySelector('.nc-obs-release-row-why')!.textContent).toBe('waiting on a second approval');
-      const out = row.querySelector('.nc-obs-release-row-detail .nc-of-link')!;
-      expect(out.textContent).toContain('open PR');
-      expect(out.getAttribute('target')).toBe('_blank');
-      expect(out.getAttribute('rel')).toBe('noopener noreferrer');
-    });
   });
-
 
   describe('the queue', () => {
     // 62 rows rendered at once is the wall of list the floor exists to replace.
@@ -662,33 +601,13 @@ describe('Observatory', () => {
       expect(container.querySelector('.nc-obs-ledger-more')).toBeFalsy();
     });
 
-    it('carries the same five columns on every row, so the list reads down', () => {
-      mockData(
-        snapshot({
-          releaseState: releaseState({
-            items: [releaseItem({ id: 'XZO#9', title: 'a thing', owner: 'ava', kind: 'finding', blocksRelease: true })],
-          }),
-        }),
-      );
+    it('is the same table as the job board, with no column header of its own', () => {
+      mockData(snapshot({ releaseState: releaseState({ items: many(2) }) }));
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const btn = container.querySelector('.nc-obs-ledger-btn')!;
-      // The lead column holds exactly one token on every row; "blocks release"
-      // is an orthogonal fact and rides the title line.
-      expect(btn.querySelector('.nc-obs-ledger-lead')!.children).toHaveLength(1);
-      expect(btn.querySelector('.nc-obs-ledger-due')).toBeTruthy();
-      expect(btn.querySelector('.nc-obs-ledger-title .nc-obs-ledger-blocks')!.textContent).toBe('blocks release');
-      expect(btn.querySelector('.nc-obs-ledger-title')!.textContent).toContain('a thing');
-      expect(btn.querySelector('.nc-obs-ledger-owner')!.textContent).toBe('ava');
-      expect(btn.querySelector('.nc-obs-ledger-kind')!.textContent).toBe('finding');
-      expect(btn.querySelector('.nc-obs-ledger-age')).toBeTruthy();
-    });
-
-    it('renders an ownerless row without collapsing its columns', () => {
-      mockData(snapshot({ releaseState: releaseState({ items: [releaseItem()] }) }));
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const btn = container.querySelector('.nc-obs-ledger-btn')!;
-      expect(btn.querySelector('.nc-obs-ledger-owner')!.textContent).toBe('—');
-      expect(btn.querySelector('.nc-obs-ledger-blocks')).toBeFalsy();
+      expect(container.querySelector('.nc-obs-ledger-btn .nc-obs-ledger-state')).toBeTruthy();
+      // The card is titled "Needs attention"; a second row of column names on
+      // top of that reads as two headings for one list.
+      expect(container.querySelector('.nc-obs-ledger-head')).toBeFalsy();
     });
   });
 
@@ -714,11 +633,11 @@ describe('Observatory', () => {
       expect(titles(container)).toEqual(['unowned one', 'unowned two', 'a person owes this']);
     });
 
-    it('narrows the queue to the slice that was clicked, and names it in the header', async () => {
+    it('narrows the queue to the slice that was clicked, and names it in the card head', async () => {
       const { container } = view();
       await userEvent.click(container.querySelector('.nc-of-slice')! as HTMLElement);
       expect(titles(container)).toEqual(['a person owes this']);
-      expect(container.querySelector('.nc-of-board-n')!.textContent).toBe('need a person · 1 of 4');
+      expect(container.querySelector('.nc-of-card-meta')!.textContent).toBe('need a person · 1 of 4');
     });
 
     it('picking "moving" WIDENS the queue — that slice is hidden by default', async () => {
@@ -742,16 +661,16 @@ describe('Observatory', () => {
       expect(titles(container)).toHaveLength(3);
     });
 
-    it('clearing the filter does not collapse the board it filters', async () => {
+    it('the slice filters the job board too — one filter, one denominator', async () => {
       const { container } = view();
-      await userEvent.click(container.querySelector('.nc-of-hero')! as HTMLElement);
-      const board = container.querySelector('details.nc-of-board') as HTMLDetailsElement;
-      await userEvent.click(container.querySelector('.nc-of-clearfilter')! as HTMLElement);
-      expect(board.open).toBe(true);
+      await userEvent.click(container.querySelector('.nc-of-slice')! as HTMLElement);
+      await segment(container, 'board');
+      // "need a person" narrows the whole page to the human-mover item.
+      expect(container.querySelector('.nc-of-tab[data-tab="queue"]')!.textContent).toBe('Queue 3');
     });
   });
 
-  describe('assigning from the queue', () => {
+  describe('assigning from a row', () => {
     const mockAssign = vi.mocked(assignItem);
 
     const boardWithChannel = () =>
@@ -762,6 +681,7 @@ describe('Observatory', () => {
             items: [
               releaseItem({ id: 'X#1', title: 'routable', nextMover: 'nobody', channel: '#general' }),
               releaseItem({ id: 'X#2', title: 'unroutable', nextMover: 'nobody' }),
+              releaseItem({ id: 'X#3', title: 'yours', nextMover: 'human', owner: 'kit', channel: '#dispatch' }),
             ],
           }),
         }),
@@ -777,6 +697,16 @@ describe('Observatory', () => {
       await expandRow(container, 'X#2');
       // v2 routes by the item's channel or not at all — no channel, no control.
       expect(container.querySelector('.nc-obs-assign')).toBeFalsy();
+    });
+
+    it('an item a PERSON owes says where to answer it instead of offering to route it away', async () => {
+      boardWithChannel();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await expandRow(container, 'X#3');
+      expect(container.querySelector('.nc-obs-assign')).toBeFalsy();
+      expect(container.querySelector('.nc-obs-needsyou')!.textContent).toBe(
+        'this needs you — answer in #dispatch →',
+      );
     });
 
     it('a member never sees the control — the server is the gate, this is the hint', async () => {
@@ -892,39 +822,18 @@ describe('Observatory', () => {
     });
   });
 
-  describe('claim rows', () => {
-    it('expanding a claim reveals its note and a thread link when threadUrl is present', async () => {
-      mockData(
-        snapshot({
-          claims: [claim({ slug: 'c1', note: 'holding the migration', threadUrl: 'https://example.com/t/1' })],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const row = container.querySelector('.nc-obs-claim-row[data-slug="c1"]')!;
-      expect(row.querySelector('.nc-obs-claim-detail')).toBeFalsy();
+  describe('scheduled jobs', () => {
+    const withRows = async (rows: ScheduledRow[], schedError?: unknown) => {
+      mockData(snapshot({ agents: [agent({ id: 'ava', name: 'ava' })] }), undefined, {
+        ...(schedError
+          ? { error: schedError }
+          : { data: { rows, degraded: false, counts: {}, assembled_at: '' } }),
+      });
+      const out = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await segment(out.container, 'schedule');
+      return out;
+    };
 
-      await userEvent.click(row.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
-      expect(row.querySelector('.nc-obs-claim-note')!.textContent).toBe('holding the migration');
-      const link = row.querySelector('.nc-obs-claim-detail a')!;
-      expect(link.getAttribute('href')).toBe('https://example.com/t/1');
-      expect(link.getAttribute('target')).toBe('_blank');
-      expect(link.getAttribute('rel')).toBe('noopener noreferrer');
-      expect(link.textContent).toContain('open thread');
-    });
-
-    it('a claim with no threadUrl expands without any link', async () => {
-      mockData(snapshot({ claims: [claim({ slug: 'c1', threadUrl: null })] }));
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const row = container.querySelector('.nc-obs-claim-row[data-slug="c1"]')!;
-      await userEvent.click(row.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
-      expect(row.querySelector('.nc-obs-claim-detail')).toBeTruthy();
-      expect(row.querySelector('.nc-obs-claim-detail a')).toBeFalsy();
-    });
-
-  
-  });
-
-  describe("what's scheduled", () => {
     it('upcomingScheduled: keeps only this floor\'s agent groups, soonest first, capped', () => {
       const t = (mins: number) => new Date(Date.now() + mins * 60_000).toISOString();
       const rows = [
@@ -937,76 +846,60 @@ describe('Observatory', () => {
       expect(upcomingScheduled(rows, ['ava', 'kit'], 1).map((r) => r.key)).toEqual(['a']);
     });
 
-    it('renders only rows for agent groups on this floor', () => {
-      mockData(
-        snapshot({ agents: [agent({ id: 'ava', name: 'ava' })] }),
-        undefined,
-        {
-          data: {
-            rows: [
-              // 90m out, so the "1h" bucket holds however long the render takes.
-              schedRow({
-                key: 'mine',
-                agent_group_id: 'ava',
-                agent_group_name: 'ava',
-                channel_name: 'general',
-                next_fire_utc: new Date(Date.now() + 90 * 60_000).toISOString(),
-              }),
-              schedRow({ key: 'theirs', agent_group_id: 'outsider', agent_group_name: 'outsider' }),
-            ],
-            degraded: false,
-            counts: {},
-            assembled_at: '',
-          },
-        },
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    it('renders only rows for agent groups on this floor: name, cron, next fire', async () => {
+      const { container } = await withRows([
+        // 90m out, so the "1h" bucket holds however long the render takes.
+        schedRow({
+          key: 'mine',
+          series_id: 'task-nightly-smoke',
+          agent_group_id: 'ava',
+          agent_group_name: 'ava',
+          channel_name: 'general',
+          next_fire_utc: new Date(Date.now() + 90 * 60_000).toISOString(),
+        }),
+        schedRow({ key: 'theirs', agent_group_id: 'outsider', agent_group_name: 'outsider' }),
+      ]);
       const keys = Array.from(container.querySelectorAll('.nc-of-sched-row')).map((el) =>
         el.getAttribute('data-sched-key'),
       );
       expect(keys).toEqual(['mine']);
       const row = container.querySelector('.nc-of-sched-row[data-sched-key="mine"]')!;
-      expect(row.textContent).toContain('ava');
-      expect(row.textContent).toContain('repeating job');
-      expect(row.textContent).toContain('in 1h');
-      expect(row.textContent).toContain('general');
+      expect(row.querySelector('.nc-of-sched-id')!.textContent).toBe('task-nightly-smoke');
+      expect(row.querySelector('.nc-of-sched-who')!.textContent).toBe('ava in general');
+      expect(row.querySelector('.nc-of-sched-cron')!.textContent).toBe('0 9 * * *');
+      expect(row.querySelector('.nc-of-sched-when')!.textContent).toBe('in 1h');
+    });
+
+    it('a series with no cron says what kind of job it is — monospace stays for the cron', async () => {
+      const { container } = await withRows([
+        schedRow({ key: 'mine', agent_group_id: 'ava', kind: 'one_off', cron: null }),
+      ]);
+      const cron = container.querySelector('.nc-of-sched-cron')!;
+      expect(cron.textContent).toBe('one-time job');
+      expect(cron.className).not.toContain('mono');
     });
 
     it('opens the detail drawer for a row — the capability the deleted Scheduled tab used to own', async () => {
-      mockData(snapshot({ agents: [agent({ id: 'ava', name: 'ava' })] }), undefined, {
-        data: {
-          rows: [
-            schedRow({
-              key: 'mine',
-              agent_group_id: 'ava',
-              next_fire_utc: new Date(Date.now() + 600_000).toISOString(),
-            }),
-          ],
-          degraded: false,
-          counts: {},
-          assembled_at: '',
-        },
-      });
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const { container } = await withRows([
+        schedRow({ key: 'mine', agent_group_id: 'ava', next_fire_utc: new Date(Date.now() + 600_000).toISOString() }),
+      ]);
       expect(container.querySelector('[data-testid="sched-drawer"]')).toBeNull();
       await userEvent.click(container.querySelector('.nc-of-sched-row .nc-of-sched-open')!);
       expect(container.querySelector('[data-testid="sched-drawer"]')!.textContent).toBe('drawer:mine');
     });
 
-    it('shows the empty state when nothing on this floor is scheduled', () => {
-      mockData(snapshot({ agents: [agent({ id: 'ava' })] }), undefined, {
-        data: {
-          rows: [schedRow({ key: 'theirs', agent_group_id: 'outsider' })],
-          degraded: false,
-          counts: {},
-          assembled_at: '',
-        },
-      });
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelector('.nc-of-sched-empty')!.textContent).toBe('nothing scheduled');
+    it('shows the empty state when nothing on this floor is scheduled', async () => {
+      const { container } = await withRows([schedRow({ key: 'theirs', agent_group_id: 'outsider' })]);
+      expect(container.querySelector('.nc-obs-ledger-empty')!.textContent).toBe('nothing scheduled');
+      expect(container.querySelector('[data-section="schedule"] .nc-of-card-meta')!.textContent).toBe(
+        'nothing scheduled',
+      );
     });
 
-  
+    it('says so when the endpoint itself failed, rather than claiming nothing is scheduled', async () => {
+      const { container } = await withRows([], new Error('boom'));
+      expect(container.querySelector('.nc-obs-ledger-empty')!.textContent).toBe("couldn't load scheduled work");
+    });
   });
 
   describe('RouteNav', () => {

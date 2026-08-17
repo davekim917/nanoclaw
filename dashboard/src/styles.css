@@ -1481,352 +1481,157 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sched-badge.quiet  { background: var(--bg-card-2); color: var(--fg-3); }
 
 /* ─── Drawer ─── */
+/* The scheduled-series drawer. Its only caller is the Observatory, so it wears
+   the atrium chrome: light panel, hairline rules, sentence case, monospace on
+   the cron/prompt/ids and nothing else. */
+
 .nc-sched-drawer {
   position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 92vw);
-  background: var(--bg-panel); border-left: 1px solid var(--line-2);
-  box-shadow: -8px 0 28px oklch(0 0 0 / 0.4);
+  background: var(--card-2, #fff); border-left: 1px solid var(--line, rgba(35,32,27,.10));
+  box-shadow: -18px 0 40px -24px rgba(35, 32, 27, 0.5);
   display: flex; flex-direction: column; z-index: 40;
-  overflow: hidden;
+  overflow: hidden; color: var(--ink, #23201b);
+  font-family: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif; font-size: 13px;
 }
 .nc-sched-drawer-head {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 16px 18px; border-bottom: 1px solid var(--line);
+  padding: 13px 16px; border-bottom: 1px solid var(--line);
 }
-.nc-sched-drawer-head h3 { margin: 0; font-size: 15px; font-family: var(--font-mono); }
+.nc-sched-drawer-head h3 {
+  margin: 0; font-size: 13.5px; font-weight: 600; letter-spacing: -0.008em;
+  font-family: 'IBM Plex Mono', ui-monospace, monospace; overflow-wrap: anywhere;
+}
 .nc-sched-drawer-close {
-  background: none; border: none; color: var(--fg-3); font-size: 22px; cursor: pointer; line-height: 1;
+  background: none; border: 0; color: var(--ink-3); font-size: 18px; line-height: 1;
+  width: 32px; height: 32px; border-radius: 6px; cursor: pointer; flex: none;
 }
-.nc-sched-drawer-close:hover { color: var(--fg); }
-.nc-sched-drawer-body { overflow-y: auto; padding: 16px 18px; }
+.nc-sched-drawer-close:hover { background: rgba(35, 32, 27, 0.05); color: var(--ink); }
+.nc-sched-drawer-body { overflow-y: auto; padding: 14px 16px 20px; }
 
-.nc-sched-drawer-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; margin-bottom: 16px; }
-.nc-sched-field { display: flex; flex-direction: column; gap: 2px; }
-.nc-sched-field .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-4); }
-.nc-sched-field .v { font-size: 12px; color: var(--fg); font-family: var(--font-mono); word-break: break-word; }
+.nc-sched-drawer-meta {
+  display: grid; grid-template-columns: 84px 1fr; gap: 7px 14px;
+  padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--line);
+}
+.nc-sched-field { display: contents; }
+.nc-sched-field .k { font-size: 12.5px; color: var(--ink-3); }
+.nc-sched-field .v { font-size: 12.5px; color: var(--ink); word-break: break-word; }
 
 .nc-sched-overrides, .nc-sched-prompt, .nc-sched-history, .nc-sched-audit { margin-bottom: 16px; }
 .nc-sched-drawer-body h4 {
-  margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-3);
+  margin: 0 0 7px; font-size: 12.5px; font-weight: 600; color: var(--ink);
+  letter-spacing: 0; text-transform: none;
 }
+.nc-sched-overrides .ovr { font-size: 12px; color: var(--ink-2); }
 .nc-sched-prompt pre {
-  background: var(--bg-inset); border: 1px solid var(--line); border-radius: 5px;
-  padding: 9px 11px; font-family: var(--font-mono); font-size: 12px; color: var(--fg-2);
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 12px; color: var(--ink-2);
   white-space: pre-wrap; word-break: break-word; margin: 0 0 10px;
 }
 .nc-sched-history ul, .nc-sched-audit ul { list-style: none; margin: 0; padding: 0; }
 .nc-sched-history li, .nc-sched-audit li {
-  display: flex; gap: 10px; align-items: baseline; padding: 4px 0;
-  border-bottom: 1px solid var(--line); font-size: 12px;
+  display: flex; gap: 12px; align-items: baseline; padding: 6px 0;
+  border-bottom: 1px solid var(--line); font-size: 12.5px;
 }
-.nc-sched-history .ts, .nc-sched-audit .ts { font-family: var(--font-mono); color: var(--fg-3); font-size: 11px; }
-.nc-sched-history .outcome.ok    { color: var(--st-done); }
-.nc-sched-history .outcome.bad   { color: var(--st-failed); }
-.nc-sched-history .outcome.muted { color: var(--fg-3); }
+.nc-sched-history .ts, .nc-sched-audit .ts {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace; color: var(--ink-3); font-size: 11.5px;
+}
+.nc-sched-history .outcome.ok    { color: var(--go); }
+.nc-sched-history .outcome.bad   { color: var(--stop); }
+.nc-sched-history .outcome.muted { color: var(--ink-3); }
 
-/* Verb buttons */
-.nc-sched-verbs { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
-.nc-sched-verb {
-  padding: 7px 13px; border-radius: 5px; cursor: pointer;
-  border: 1px solid var(--line-2); background: var(--bg-card); color: var(--fg);
-  font-size: 13px;
+/* Verb buttons — quiet chips; only the destructive one carries colour. */
+.nc-sched-verbs {
+  display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0;
+  padding-top: 14px; border-top: 1px solid var(--line);
 }
-.nc-sched-verb:hover:not(:disabled) { border-color: var(--brand); }
-.nc-sched-verb.cancel:not(:disabled) { border-color: var(--st-failed); color: var(--st-failed); }
+.nc-sched-verb {
+  padding: 0 12px; min-height: 34px; border-radius: 7px; cursor: pointer;
+  border: 1px solid var(--line-2); background: var(--card-2); color: var(--ink);
+  font: 500 12.5px/1 inherit;
+}
+.nc-sched-verb:hover:not(:disabled) { background: rgba(35, 32, 27, 0.04); }
+.nc-sched-verb.cancel:not(:disabled) { border-color: rgba(176, 80, 63, 0.45); color: var(--stop); }
 .nc-sched-verb:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Confirm / form panes */
 .nc-sched-confirm, .nc-sched-move-confirm, .nc-sched-edit-form, .nc-sched-move-form {
-  border: 1px solid var(--line-2); border-radius: 6px; background: var(--bg-inset);
+  border: 1px solid var(--line); border-radius: var(--r, 10px); background: var(--card);
   padding: 14px; margin-top: 8px;
 }
-.nc-sched-confirm h4, .nc-sched-move-confirm h4 { color: var(--fg); font-size: 13px; text-transform: none; }
-.nc-sched-confirm p { font-size: 13px; color: var(--fg-2); margin: 6px 0 12px; }
+.nc-sched-confirm h4, .nc-sched-move-confirm h4 { font-size: 13px; }
+.nc-sched-confirm p { font-size: 12.5px; color: var(--ink-2); margin: 6px 0 12px; line-height: 1.5; }
 .nc-sched-edit-form label, .nc-sched-move-form label {
-  display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px;
-  font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-3);
+  display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px;
+  font-size: 12.5px; letter-spacing: 0; text-transform: none; color: var(--ink-2);
 }
 .nc-sched-edit-form textarea, .nc-sched-edit-form input,
 .nc-sched-move-form input {
-  background: var(--bg-card); border: 1px solid var(--line); border-radius: 5px;
-  padding: 7px 9px; color: var(--fg); font-family: var(--font-mono); font-size: 12px;
+  background: var(--card-2); border: 1px solid var(--line-2); border-radius: 7px;
+  padding: 7px 9px; color: var(--ink);
+  font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 12px;
 }
 .nc-sched-form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
 .nc-sched-form-actions button {
-  padding: 6px 14px; border-radius: 5px; cursor: pointer;
-  border: 1px solid var(--line-2); background: var(--bg-card); color: var(--fg); font-size: 13px;
+  padding: 0 13px; min-height: 34px; border-radius: 7px; cursor: pointer;
+  border: 1px solid var(--line-2); background: var(--card-2); color: var(--ink);
+  font: 500 12.5px/1 inherit;
 }
-.nc-sched-form-actions button.danger { border-color: var(--st-failed); color: var(--st-failed); }
+.nc-sched-form-actions button.danger { border-color: rgba(176, 80, 63, 0.45); color: var(--stop); }
 .nc-sched-form-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 .nc-sched-reseed-warning {
-  border: 1px solid var(--st-pending); background: var(--st-pending-bg);
-  color: var(--st-pending); border-radius: 5px; padding: 9px 11px; font-size: 12px; margin-bottom: 10px;
+  border: 1px solid rgba(179, 134, 44, 0.4); background: rgba(179, 134, 44, 0.08);
+  color: var(--ink); border-radius: 8px; padding: 9px 11px; font-size: 12px;
+  line-height: 1.5; margin-bottom: 10px;
 }
 .nc-sched-delta { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 10px 0; }
-.nc-sched-delta .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-4); display: block; }
+.nc-sched-delta .lbl { font-size: 12px; color: var(--ink-3); display: block; }
 .nc-sched-delta ul { list-style: none; margin: 4px 0 0; padding: 0; }
-.nc-sched-delta li { font-family: var(--font-mono); font-size: 12px; padding: 2px 0; }
-.nc-sched-delta .gains li  { color: var(--st-done); }
-.nc-sched-delta .losses li { color: var(--st-failed); }
-.nc-sched-delta .none { font-size: 12px; color: var(--fg-3); }
-.nc-sched-caveat { font-size: 12px; color: var(--fg-2); margin: 8px 0; line-height: 1.45; }
+.nc-sched-delta li {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 12px; padding: 2px 0;
+}
+.nc-sched-delta .gains li  { color: var(--go); }
+.nc-sched-delta .losses li { color: var(--stop); }
+.nc-sched-delta .none { font-size: 12px; color: var(--ink-3); }
+.nc-sched-caveat { font-size: 12px; color: var(--ink-2); margin: 8px 0; line-height: 1.5; }
 .nc-sched-drawer-error {
-  border: 1px solid var(--st-failed); background: var(--st-failed-bg); color: var(--st-failed);
-  border-radius: 5px; padding: 8px 10px; font-size: 12px; margin: 8px 0;
+  border: 1px solid rgba(176, 80, 63, 0.4); background: rgba(176, 80, 63, 0.07);
+  color: var(--stop); border-radius: 8px; padding: 8px 10px; font-size: 12px; margin: 8px 0;
 }
 
 @media (max-width: 899px) {
   .nc-sched-drawer { width: 100vw; }
-  .nc-sched-drawer-meta { grid-template-columns: 1fr; }
   .nc-sched-delta { grid-template-columns: 1fr; }
 }
 
-/* ─── Observatory — a top-down pixel-art office floor ────────────────────────
-   Everything below is scoped to `.nc-of` and defines its own --of-* palette,
-   so the rest of the dashboard's dark tokens are untouched. This view is
-   deliberately BRIGHT: the board is a control surface at night, the office is
-   a lit room you're looking down into.
-
-   House rules for this view: hard edges only (0-blur shadows), an open floor
-   plan (rugs and hanging signs, never walls), no animation, no images —
-   sprites are inline-SVG data URIs from office-sprites.ts, upscaled with
-   image-rendering: pixelated. */
-
-.nc-pill.done    { background: var(--st-done-bg);    color: var(--st-done); }
-.nc-pill.pending { background: var(--st-pending-bg); color: var(--st-pending); }
+/* ─── Observatory — the office page ──────────────────────────────────────────
+   Scoped to `.nc-of`. The floor is the vendored <office-map> custom element,
+   which carries its own palette; everything AROUND it is the atrium light
+   chrome defined further down. The CSS pixel-art floor this section used to
+   hold, and the painted-wall header that framed it, are gone with it. */
 
 .nc-frame.nc-of {
-  --of-floor-a: #e8d5b7;
-  --of-floor-b: #dcc6a4;
-  --of-wall: #8b6f47;
-  --of-wall-hi: #a68a5f;
-  --of-wall-sh: #6b5335;
-  --of-room: #f5ead6;
-  --of-room-dim: #ece0c8;
-  --of-room-dead: #c9c2b6;
-  --of-screen: #6fd3ff;
-  --of-screen-off: #4a5568;
-  --of-ink: #2b2416;
-  --of-ink-2: #6b5f4a;
-  --of-alert: #c8503c;
-  --of-ok: #5a9c4a;
-  --of-note: #e0a83c;
-  --of-cork: #b8874f;
-  --of-paper: #fdf6e3;
-  --of-cream: #fff4e0;
-  --of-drop: 4px 4px 0 rgb(0 0 0 / 0.18);
-
   background: #f6f4f0;
-  color: var(--of-ink);
-}
-
-/* Header — a painted wall strip with a chunky nameplate feel. */
-.nc-of .nc-of-topbar {
-  background: linear-gradient(180deg, var(--of-wall-hi), var(--of-wall));
-  border-bottom: 4px solid var(--of-wall-sh);
-  color: var(--of-cream);
-}
-.nc-of .nc-of-topbar .nc-pulse-top { margin-bottom: 0; gap: 12px; flex-wrap: wrap; }
-.nc-of .nc-of-topbar .nc-brand,
-.nc-of .nc-of-topbar .nc-group-title-trigger,
-.nc-of .nc-of-topbar .nc-group-title-static { color: var(--of-cream); }
-.nc-of .nc-of-topbar .nav-link {
-  color: #f0e0c4; text-transform: uppercase; letter-spacing: 0.12em; font-weight: 600;
-}
-.nc-of .nc-of-topbar .nav-link.active,
-.nc-of .nc-of-topbar .nav-link:hover { color: #fff; }
-.nc-of-headcount {
-  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
-  letter-spacing: 0.16em; text-transform: uppercase; color: var(--of-cream);
-  text-shadow: 1px 1px 0 var(--of-wall-sh);
+  color: var(--ink);
 }
 
 .nc-of .nc-obs-body { max-width: 1200px; margin: 0 auto; padding: 16px; }
-.nc-of .nc-empty { color: var(--of-ink-2); }
+.nc-of .nc-empty { color: var(--ink-3); font-size: 12.5px; }
 
 .nc-of .nc-obs-offline {
   margin: 40px auto; max-width: 320px; padding: 24px;
-  border: 4px solid var(--of-wall); background: var(--of-paper);
-  box-shadow: var(--of-drop);
-  font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.12em;
-  text-transform: uppercase; color: var(--of-ink-2); text-align: center;
+  border: 1px solid var(--line); border-radius: var(--r); background: var(--card-2);
+  font-size: 12.5px; color: var(--ink-3); text-align: center;
 }
 
-/* Single column top to bottom: job board, whiteboard, what's scheduled, then
-   the floor. The claims wall stays a direct child of .nc-obs-main and in
-   normal document flow — no fixed/sticky position, no independent scroll
-   region. */
+/* Single column top to bottom: the floor, then whichever card the segmented
+   control is pointing at. Every card stays in normal document flow — no
+   fixed/sticky position, no independent scroll region. */
 /* minmax(0,1fr), not 1fr: a bare `1fr` track has an AUTO minimum, so the
    widest min-content inside it (the map's own intrinsic width) set the column
    width and pushed the whole page past a 390px viewport. */
 .nc-of .nc-obs-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; align-items: start; }
-
-/* ─── JOB BOARD — a corkboard with pinned notes ──────────────────────────── */
-
-.nc-of .nc-obs-release {
-  border: 6px solid var(--of-wall-sh); border-radius: 0;
-  background:
-    repeating-linear-gradient(45deg, rgb(0 0 0 / 0.05) 0 2px, transparent 2px 5px),
-    var(--of-cork);
-  box-shadow: inset 0 4px 0 rgb(255 255 255 / 0.14), var(--of-drop);
-  padding: 16px; margin-bottom: 18px;
-  display: flex; flex-direction: column; gap: 12px;
-}
-.nc-of .nc-obs-release-head {
-  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 10px;
-}
-.nc-of .nc-obs-release-title {
-  font-family: var(--font-mono); font-size: 16px; font-weight: 600;
-  letter-spacing: 0.18em; text-transform: uppercase; color: var(--of-cream);
-  text-shadow: 2px 2px 0 rgb(0 0 0 / 0.3);
-}
-.nc-of .nc-obs-release-fresh { font-size: 11px; color: #f0e0c4; }
-.nc-of-tally-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
-.nc-of .nc-obs-release-counts { display: flex; flex-wrap: wrap; align-items: baseline; }
-.nc-of-tally { display: inline-flex; align-items: baseline; }
-/* Each tally is a filter switch — chunky enough to hit, flat until selected. */
-.nc-of-tally-btn {
-  display: inline-flex; align-items: baseline; gap: 0;
-  min-height: 44px; padding: 4px 8px; border: 3px solid transparent; border-radius: 0;
-  background: transparent; cursor: pointer;
-}
-.nc-of-tally-btn:hover { border-color: rgb(255 255 255 / 0.4); }
-.nc-of-tally-btn.active {
-  background: var(--of-paper); border-color: var(--of-ink); box-shadow: 3px 3px 0 rgb(0 0 0 / 0.25);
-}
-.nc-of-tally-btn.active .nc-of-tally-n { color: var(--of-ink); text-shadow: none; }
-.nc-of-tally-btn.active .nc-of-tally-l { color: var(--of-ink-2); }
-.nc-of-tally-all {
-  min-height: 44px; padding: 4px 14px; border-radius: 0;
-  border: 3px solid var(--of-wall-sh); background: var(--of-cork); cursor: pointer;
-  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
-  letter-spacing: 0.14em; text-transform: uppercase; color: var(--of-cream);
-}
-.nc-of-tally-all.active { background: var(--of-paper); color: var(--of-ink); box-shadow: 3px 3px 0 rgb(0 0 0 / 0.25); }
-.nc-of-tally-n {
-  font-family: var(--font-mono); font-size: 26px; font-weight: 600; line-height: 1;
-  color: var(--of-cream); text-shadow: 2px 2px 0 rgb(0 0 0 / 0.35);
-}
-/* The flex container blockifies these, which strips the leading space in the
-   label's text node — the gap has to come from padding, not the markup. */
-.nc-of-tally-l {
-  padding-left: 6px;
-  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
-  letter-spacing: 0.14em; text-transform: uppercase; color: #f0e0c4;
-}
-.nc-of-tally-sep { color: #e4cfa8; padding: 0 6px; }
-.nc-of .nc-obs-release-empty {
-  background: var(--of-paper); border: 3px solid var(--of-ink-2);
-  box-shadow: var(--of-drop); padding: 10px 12px;
-  font-size: 12px; color: var(--of-ink-2); font-style: italic;
-}
-.nc-of .nc-obs-release-moratorium {
-  align-self: flex-start; border-radius: 0;
-  background: var(--of-alert); color: #fff; border: 3px solid #8f331f;
-  box-shadow: var(--of-drop); padding: 5px 12px;
-  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
-  letter-spacing: 0.12em; text-transform: uppercase;
-}
-.nc-of .nc-obs-release-holds { display: flex; flex-wrap: wrap; gap: 8px; }
-.nc-of .nc-obs-release-hold {
-  background: var(--of-paper); color: var(--of-alert); border: 2px solid var(--of-alert);
-  border-radius: 0; padding: 3px 9px;
-  font-family: var(--font-mono); font-size: 10.5px;
-}
-/* By status ⇄ by agent. Same items, two reads — a segmented pair of tabs, not
-   two boards. Sits under the title so the tallies keep the head's right edge. */
-.nc-of .nc-obs-release-views { display: inline-flex; margin-top: 6px; }
-.nc-of .nc-obs-release-view {
-  appearance: none; background: var(--of-paper); color: var(--of-ink);
-  border: 3px solid var(--of-ink-2); border-right-width: 0; margin: 0;
-  padding: 4px 11px; min-height: 32px; cursor: pointer;
-  font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
-  letter-spacing: 0.1em; text-transform: uppercase;
-}
-.nc-of .nc-obs-release-view:last-child { border-right-width: 3px; }
-.nc-of .nc-obs-release-view.active { background: var(--of-ink-2); color: var(--of-cream); }
-.nc-of .nc-obs-release-view:focus-visible { outline: 3px solid var(--of-cream); outline-offset: -3px; }
-
-/* "You are looking at one desk" — stated, with the way back in the same box.
-   A filtered board that doesn't say it is filtered reads as a data outage. */
-.nc-of .nc-obs-release-owner-filter {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
-  background: var(--of-paper); border: 3px solid var(--of-ink-2);
-  box-shadow: var(--of-drop); padding: 7px 12px; font-size: 12px; color: var(--of-ink);
-}
-.nc-of .nc-obs-release-owner-clear {
-  appearance: none; background: none; border: 0; margin: 0; padding: 0;
-  color: var(--of-ink-2); cursor: pointer; text-decoration: underline;
-  font: inherit; min-height: 32px;
-}
-
-/* One person's desk. The rule down the left is what makes it read as a lane. */
-.nc-of .nc-obs-release-lane {
-  display: flex; flex-direction: column; gap: 8px;
-  border-left: 4px solid var(--of-cream); padding-left: 10px;
-}
-.nc-of .nc-obs-release-lane.unowned { border-left-color: var(--of-ink-2); }
-.nc-of .nc-obs-release-lane-head {
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 9px;
-}
-.nc-of .nc-obs-release-lane-owner {
-  font-family: var(--font-mono); font-size: 12px; font-weight: 700;
-  letter-spacing: 0.12em; text-transform: uppercase; color: var(--of-cream);
-  text-shadow: 1px 1px 0 rgb(0 0 0 / 0.3);
-}
-.nc-of .nc-obs-release-lane-sum { font-size: 11px; color: #efdcbb; }
-
-/* Collapsed boards. Native <details> — progressive disclosure with no JS, and
-   the summary is the affordance. These sit BELOW the office deliberately.
-   Atrium chrome: hairline card, sentence case. The uppercase-letterspaced-mono
-   summary this replaced was costume on the wrong layer — the map is the only
-   illustrated surface in the product. */
-.nc-of .nc-of-board{
-  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r); overflow:hidden;
-}
-.nc-of .nc-of-board + .nc-of-board{margin-top:10px}
-.nc-of .nc-of-board-summary{
-  cursor:pointer; list-style:none; padding:12px 14px; min-height:44px;
-  display:flex; align-items:center; gap:9px; font-size:13px; font-weight:600; color:var(--ink);
-}
-.nc-of .nc-of-board-summary::-webkit-details-marker{display:none}
-.nc-of .nc-of-board-summary::after{content:'\25B8'; margin-left:auto; color:var(--ink-3); font-size:10px}
-.nc-of .nc-of-board[open] > .nc-of-board-summary::after{content:'\25BE'}
-.nc-of .nc-of-board[open] > .nc-of-board-summary{border-bottom:1px solid var(--line)}
-.nc-of .nc-of-board-summary:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
-.nc-of .nc-of-board-n{
-  font-size:11.5px; font-weight:500; color:var(--ink-3); font-variant-numeric:tabular-nums;
-}
-.nc-of .nc-of-board > *:not(.nc-of-board-summary){padding:12px 14px}
-
-/* The job board's own filter control. It is the board's, not the page's — the
-   headline above already answers "how much"; these four choose what to list. */
-.nc-of .nc-of-tally-strip{margin-bottom:12px}
-.nc-of .nc-of-tally-strip .nc-of-tally-n{
-  color:var(--ink); text-shadow:none; font-size:17px; font-weight:600;
-  font-family:'IBM Plex Mono',ui-monospace,monospace; font-variant-numeric:tabular-nums;
-}
-.nc-of .nc-of-tally-strip .nc-of-tally-l{
-  color:var(--ink-3); font-size:11.5px; letter-spacing:0; text-transform:none;
-}
-.nc-of .nc-of-tally-strip .nc-of-tally-sep{display:none}
-.nc-of .nc-of-tally-strip .nc-of-tally-btn{
-  border:1px solid var(--line); border-radius:8px; background:var(--card);
-  padding:6px 10px; min-height:44px;
-}
-.nc-of .nc-of-tally-strip .nc-of-tally-btn:hover{border-color:var(--line-2)}
-.nc-of .nc-of-tally-strip .nc-of-tally-btn.active{
-  background:var(--card-2); border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent);
-}
-.nc-of .nc-of-tally-strip .nc-of-tally-btn.active .nc-of-tally-n,
-.nc-of .nc-of-tally-strip .nc-of-tally-btn.active .nc-of-tally-l{color:var(--accent)}
-.nc-of .nc-of-tally-strip .nc-of-tally-all{margin-left:auto}
-@media (max-width:700px){
-  .nc-of .nc-of-tally-strip{display:grid; grid-template-columns:1fr 1fr; gap:6px}
-  .nc-of .nc-of-tally-strip .nc-obs-release-counts{display:contents}
-  .nc-of .nc-of-tally-strip .nc-of-tally{display:flex; align-items:baseline}
-  .nc-of .nc-of-tally-strip .nc-of-tally-all{grid-column:1 / -1; margin-left:0; justify-self:stretch}
-}
 
 /* ─── atrium: the light chrome ───────────────────────────────────────────── */
 /* One system across every surface. The map is the only illustrated thing in
@@ -1851,10 +1656,30 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   background:var(--card-2); border-bottom:1px solid var(--line);
 }
 .nc-of .nc-of-bar-title{font-size:14.5px; font-weight:600; letter-spacing:-.01em}
-.nc-of .nc-of-mapcard-title,.nc-of .nc-of-board-summary{font-size:15px; letter-spacing:-.008em}
+.nc-of .nc-of-mapcard-title,.nc-of .nc-of-card-title{font-size:15px; letter-spacing:-.008em}
 .nc-of .nc-of-bar-meta{
   margin-left:auto; display:flex; align-items:center; gap:14px;
   font-size:12px; color:var(--ink-3);
+}
+
+/* The segmented control. It switches what sits UNDER the office; the headline
+   and the map are on every view, so the control belongs in the chrome and not
+   at the top of the region it swaps. Pressed is a raised white plate — the
+   accent is reserved for links and focus. */
+.nc-of .nc-of-seg{
+  display:flex; gap:2px; padding:2px; border-radius:9px; background:rgba(35,32,27,.05);
+  overflow-x:auto; scrollbar-width:none;
+}
+.nc-of .nc-of-seg::-webkit-scrollbar{display:none}
+.nc-of .nc-of-seg-btn{
+  appearance:none; border:0; background:none; cursor:pointer; white-space:nowrap;
+  font:500 12.5px/1 inherit; color:var(--ink-2); padding:0 12px; height:30px; border-radius:7px;
+}
+.nc-of .nc-of-seg-btn:hover{color:var(--ink)}
+.nc-of .nc-of-seg-btn:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+.nc-of .nc-of-seg-btn.on{
+  background:var(--card-2); color:var(--ink);
+  box-shadow:0 1px 2px rgba(35,32,27,.10), inset 0 0 0 1px var(--line);
 }
 .nc-of .nc-of-live{display:inline-flex; align-items:center; gap:6px}
 .nc-of .nc-of-live i{width:6px; height:6px; border-radius:50%; background:var(--idle)}
@@ -2009,75 +1834,106 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   .nc-of .nc-of-teleport{padding:9px 12px 9px 12px}
 }
 
-/* ─── Commitment strip + ledger ──────────────────────────────────────────── */
+/* ─── The card, and the one table inside it ──────────────────────────────── */
+/* Every section below the office is the SAME card: hairline border, one head
+   line, hairline row dividers, no nested boxes. */
+.nc-of .nc-of-card{
+  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r);
+  overflow:hidden; margin-bottom:12px;
+}
+.nc-of .nc-of-card-head{
+  display:flex; align-items:baseline; gap:10px; padding:11px 14px;
+  border-bottom:1px solid var(--line);
+}
+.nc-of .nc-of-card-title{font-size:13px; font-weight:600; color:var(--ink)}
+.nc-of .nc-of-card-meta{
+  font-size:12px; color:var(--ink-3); font-variant-numeric:tabular-nums;
+  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.nc-of .nc-of-card-head .nc-of-clearfilter{margin-left:auto; flex:none}
 
-.nc-of .nc-of-commit-strip{
-  display:flex; margin-bottom:10px; overflow:hidden;
-  background:var(--of-paper); border:3px solid var(--of-ink-2); box-shadow:var(--of-drop);
-}
-.nc-of .nc-of-commit{flex:1; padding:9px 13px; display:flex; align-items:baseline; gap:8px}
-.nc-of .nc-of-commit + .nc-of-commit{border-left:3px solid var(--of-ink-2)}
-.nc-of .nc-of-commit .n{
-  font-family:var(--font-mono); font-size:24px; font-weight:700; line-height:1;
-  font-variant-numeric:tabular-nums;
-}
-.nc-of .nc-of-commit .l{font-size:11.5px; color:var(--of-ink-2)}
-.nc-of .nc-of-commit.stop .n{color:var(--of-alert)}
-.nc-of .nc-of-commit.warn .n{color:#b5822c}
-.nc-of .nc-of-commit.go .n{color:#3f7d54}
-@media (max-width:700px){
-  .nc-of .nc-of-commit-strip{flex-direction:column}
-  .nc-of .nc-of-commit + .nc-of-commit{border-left:0; border-top:3px solid var(--of-ink-2)}
-  .nc-of .nc-of-commit{padding:7px 11px}
-  .nc-of .nc-of-commit .n{font-size:20px}
+/* Claims and schedule sit side by side under the job table, and stack the
+   moment either one would have to squeeze its own columns. */
+.nc-of .nc-of-twoup{display:grid; grid-template-columns:minmax(0,1fr); gap:12px}
+@media (min-width:1100px){
+  .nc-of .nc-of-twoup{grid-template-columns:minmax(0,1fr) minmax(0,470px)}
+  .nc-of .nc-of-twoup > *{margin-bottom:0}
 }
 
-/* ─── The queue ──────────────────────────────────────────────────────────── */
-/* ONE card with hairline dividers, not a stack of individually bordered boxes.
-   Fixed grammar across every row — lead | title | owner | type | age — so the
-   columns share an edge and the list reads down as well as across. */
-.nc-of .nc-obs-ledger{display:flex; flex-direction:column; gap:10px}
-.nc-of .nc-obs-ledger-cov,.nc-of .nc-obs-ledger-sec,.nc-of .nc-obs-ledger-empty{
-  display:flex; gap:9px; align-items:baseline; font-size:12.5px; color:var(--ink-2);
-  padding:9px 14px; background:var(--card-2); border:1px solid var(--line); border-radius:var(--r);
+/* The job board's slice control: a tab row, with the slice's own sentence
+   right-aligned on the same line so the count never has to explain itself. */
+.nc-of .nc-of-tabs{
+  display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+  padding:11px 14px 0; border-bottom:1px solid var(--line);
 }
-.nc-of .nc-obs-ledger-cov.partial{border-color:rgba(179,134,44,.4)}
-.nc-of .nc-obs-ledger-sec{border-color:rgba(176,80,63,.4); color:var(--stop)}
-.nc-of .nc-obs-ledger-empty{font-style:italic; color:var(--ink-3)}
-.nc-of .nc-obs-ledger-gap{color:var(--ink-3)}
+.nc-of .nc-of-tab{
+  appearance:none; border:0; background:none; cursor:pointer; font:500 13px/1 inherit;
+  color:var(--ink-2); padding:0 0 10px; margin-bottom:-1px;
+  border-bottom:2px solid transparent; white-space:nowrap;
+}
+.nc-of .nc-of-tab:hover{color:var(--ink)}
+.nc-of .nc-of-tab:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+.nc-of .nc-of-tab.on{color:var(--ink); border-bottom-color:var(--accent)}
+.nc-of .nc-of-tab-n{color:var(--ink-3); font-variant-numeric:tabular-nums}
+.nc-of .nc-of-tab-hint{margin-left:auto; padding-bottom:10px; font-size:12px; color:var(--ink-3)}
+/* A freeze, and whatever is holding it, stated on the board itself. */
+.nc-of .nc-obs-release-moratorium{
+  padding:9px 14px; border-bottom:1px solid var(--line);
+  font-size:12.5px; font-weight:600; color:var(--stop);
+}
+.nc-of .nc-obs-release-holds{
+  display:flex; flex-wrap:wrap; gap:8px; padding:9px 14px; border-bottom:1px solid var(--line);
+}
+.nc-of .nc-obs-release-hold{
+  font-size:11.5px; color:var(--ink-2); background:rgba(35,32,27,.06);
+  border-radius:4px; padding:2px 7px;
+}
 
-.nc-of .nc-obs-ledger-rows{
-  list-style:none; margin:0; padding:0;
-  background:var(--card-2); border:1px solid var(--line); border-radius:var(--r); overflow:hidden;
+/* ONE grammar on every row, in both the queue and the job board:
+   id | title | state | owner | room | age. The columns share an edge so the
+   list reads down as well as across. */
+.nc-of .nc-obs-ledger{display:flex; flex-direction:column}
+.nc-of .nc-obs-ledger-empty{
+  font-size:12.5px; color:var(--ink-3); font-style:italic; padding:12px 14px;
 }
+
+.nc-of .nc-obs-ledger-head,.nc-of .nc-obs-ledger-btn{
+  display:grid; grid-template-columns:116px minmax(0,1fr) 124px 92px 108px 46px;
+  gap:12px; align-items:center;
+}
+.nc-of .nc-obs-ledger-head{
+  padding:9px 14px; border-bottom:1px solid var(--line);
+  font-size:11.5px; color:var(--ink-3);
+}
+.nc-of .nc-obs-ledger-head > *:last-child{text-align:right}
+.nc-of .nc-obs-ledger-rows{list-style:none; margin:0; padding:0}
 .nc-of .nc-obs-ledger-row + .nc-obs-ledger-row{border-top:1px solid var(--line)}
 .nc-of .nc-obs-ledger-btn{
   appearance:none; background:none; border:0; margin:0; width:100%; font:inherit; color:var(--ink);
   padding:10px 14px; min-height:44px; text-align:left; cursor:pointer;
-  display:grid; grid-template-columns:112px minmax(0,1fr) 84px 70px 46px;
-  gap:12px; align-items:center;
 }
 .nc-of .nc-obs-ledger-btn:hover{background:rgba(35,32,27,.03)}
 .nc-of .nc-obs-ledger-btn:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
-.nc-of .nc-obs-ledger-lead{
-  display:flex; flex-direction:column; align-items:flex-start; justify-content:center;
-  gap:3px; min-width:0; min-height:34px;
+.nc-of .nc-obs-ledger-id{
+  font-size:12px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
 /* Every cell must be allowed to shrink, or one long title sets the row's
    min-content width and the whole board grows past the viewport. */
 .nc-of .nc-obs-ledger-btn > *{min-width:0}
 .nc-of .nc-obs-ledger-title{overflow-wrap:anywhere; font-weight:500}
-/* The due chip is the ONLY urgency encoding on the row — no bar, no row tint,
+/* The state dot is the ONLY urgency encoding on the row — no bar, no row tint,
    no coloured title stacked on top of it. */
-.nc-of .nc-obs-ledger-due{
-  font-size:11.5px; font-weight:500; color:var(--ink-2); white-space:nowrap;
+.nc-of .nc-obs-ledger-state{
+  display:inline-flex; align-items:center; gap:6px; min-width:0;
+  font-size:12px; color:var(--ink-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
 }
-.nc-of .nc-obs-ledger-due.breached,.nc-of .nc-obs-ledger-due.unowned{color:var(--stop)}
-.nc-of .nc-obs-ledger-due.due-soon{color:var(--warn)}
-.nc-of .nc-obs-ledger-due.on-track{color:var(--go)}
-.nc-of .nc-obs-ledger-due.undated{color:var(--ink-3)}
+.nc-of .nc-obs-dot{width:6px; height:6px; border-radius:50%; flex:none; background:currentColor}
+.nc-of .nc-obs-ledger-state.breached,.nc-of .nc-obs-ledger-state.unowned{color:var(--stop)}
+.nc-of .nc-obs-ledger-state.due-soon{color:var(--warn)}
+.nc-of .nc-obs-ledger-state.on-track{color:var(--go)}
+.nc-of .nc-obs-ledger-state.undated{color:var(--ink-3)}
 /* Rides the title line, not the state column: it is an orthogonal fact, and
-   the lead column has to hold one shape on every row or the list loses its
+   the state column has to hold one shape on every row or the list loses its
    beat between the rows that carry it and the rows that do not. */
 .nc-of .nc-obs-ledger-blocks{
   font-size:10px; font-weight:600; letter-spacing:.01em; white-space:nowrap;
@@ -2091,16 +1947,19 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   font-size:13px; min-width:0; line-height:1.35;
   display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;
 }
-.nc-of .nc-obs-ledger-owner,.nc-of .nc-obs-ledger-kind,.nc-of .nc-obs-ledger-age{
+.nc-of .nc-obs-ledger-owner,.nc-of .nc-obs-ledger-room,.nc-of .nc-obs-ledger-age{
   font-size:11.5px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
 .nc-of .nc-obs-ledger-age{text-align:right; font-variant-numeric:tabular-nums}
 .nc-of .nc-obs-ledger-detail{padding:0 14px 12px; font-size:12.5px; color:var(--ink-2)}
 .nc-of .nc-obs-ledger-next{font-weight:600; color:var(--ink); margin-bottom:3px}
 .nc-of .nc-obs-ledger-meta{font-size:11.5px; color:var(--ink-3); margin-top:3px}
+/* The one thing a person's own item offers: where to answer it. No control —
+   routing it to an agent is the move this row exists to say is wrong. */
+.nc-of .nc-obs-needsyou{margin-top:9px; font-size:12.5px; color:var(--ink-2)}
 .nc-of .nc-obs-ledger-more{
   appearance:none; background:none; border:0; cursor:pointer; font:inherit; color:var(--accent);
-  font-size:12.5px; font-weight:600; padding:10px 0; min-height:44px; text-align:left; align-self:flex-start;
+  font-size:12.5px; font-weight:600; padding:10px 14px; min-height:44px; text-align:left; align-self:flex-start;
 }
 .nc-of .nc-obs-ledger-more:hover{text-decoration:underline}
 
@@ -2119,11 +1978,65 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-assign button:not(:disabled):hover{filter:brightness(1.08)}
 .nc-of .nc-obs-assign-err{font-size:12px; color:var(--stop)}
 .nc-of .nc-obs-assign-done{margin-top:9px; font-size:12.5px; font-weight:600; color:var(--go)}
-/* Inside a board the queue is the board's content, not a second card sitting
-   inside the first — full bleed, no border of its own. */
-.nc-of .nc-of-board > .nc-obs-ledger{padding:0}
-.nc-of .nc-of-board .nc-obs-ledger-rows{border:0; border-radius:0; background:none}
-.nc-of .nc-of-board .nc-obs-ledger-more{padding:10px 14px}
+
+/* Anything that leaves the page. Sentence case, accent, 44px tall — the
+   uppercase-letterspaced-mono version this replaced shouted louder than the
+   rows it sat under. */
+.nc-of .nc-of-link{
+  display:inline-flex; align-items:center; min-height:44px; padding:4px 0;
+  font-size:12.5px; font-weight:500; color:var(--accent); text-decoration:none;
+}
+.nc-of .nc-of-link:hover{text-decoration:underline}
+
+/* ─── Work claims ────────────────────────────────────────────────────────── */
+/* Same card, same dividers, same right-edge age column as the job table. */
+.nc-of .nc-obs-claim-rows{list-style:none; margin:0; padding:0}
+.nc-of .nc-obs-claim-row + .nc-obs-claim-row{border-top:1px solid var(--line)}
+.nc-of .nc-obs-claim-toggle{
+  appearance:none; background:none; border:0; margin:0; width:100%; font:inherit; color:var(--ink);
+  padding:10px 14px; min-height:44px; text-align:left; cursor:pointer;
+  display:grid; grid-template-columns:minmax(0,1fr) 92px 116px; gap:12px; align-items:center;
+}
+.nc-of .nc-obs-claim-toggle > *{min-width:0}
+.nc-of .nc-obs-claim-toggle:hover{background:rgba(35,32,27,.03)}
+.nc-of .nc-obs-claim-toggle:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+.nc-of .nc-obs-claim-title{display:flex; align-items:center; gap:7px; min-width:0; flex-wrap:wrap}
+.nc-of .nc-obs-claim-slug{font-size:12.5px; overflow-wrap:anywhere}
+.nc-of .nc-obs-claim-tag{
+  font-size:10px; font-weight:600; white-space:nowrap; color:var(--ink-2);
+  background:rgba(35,32,27,.06); border-radius:4px; padding:1px 5px;
+}
+.nc-of .nc-obs-claim-owner,.nc-of .nc-obs-claim-age{
+  font-size:11.5px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.nc-of .nc-obs-claim-age{text-align:right; font-variant-numeric:tabular-nums}
+.nc-of .nc-obs-claim-age.stop{color:var(--stop)}
+.nc-of .nc-obs-claim-age.warn{color:var(--warn)}
+.nc-of .nc-obs-claim-detail{padding:0 14px 12px; font-size:12.5px; color:var(--ink-2)}
+.nc-of .nc-obs-claim-note{line-height:1.5}
+
+/* ─── Scheduled jobs ─────────────────────────────────────────────────────── */
+/* name · cron · next fire. Monospace on the two identifiers only. */
+.nc-of .nc-of-sched-rows{list-style:none; margin:0; padding:0}
+.nc-of .nc-of-sched-row + .nc-of-sched-row{border-top:1px solid var(--line)}
+.nc-of .nc-of-sched-open{
+  appearance:none; background:none; border:0; margin:0; width:100%; font:inherit; color:var(--ink);
+  padding:10px 14px; min-height:44px; text-align:left; cursor:pointer;
+  display:grid; grid-template-columns:minmax(0,1fr) auto 66px; gap:12px; align-items:center;
+}
+.nc-of .nc-of-sched-open > *{min-width:0}
+.nc-of .nc-of-sched-open:hover{background:rgba(35,32,27,.03)}
+.nc-of .nc-of-sched-open:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
+.nc-of .nc-of-sched-name{display:flex; flex-direction:column; gap:2px; min-width:0}
+.nc-of .nc-of-sched-id{font-size:12.5px; overflow-wrap:anywhere}
+.nc-of .nc-of-sched-who{font-size:11.5px; color:var(--ink-3)}
+.nc-of .nc-of-sched-cron{
+  font-size:12px; color:var(--ink-2); white-space:nowrap;
+}
+.nc-of .nc-of-sched-when{
+  font-size:11.5px; color:var(--ink-3); text-align:right; font-variant-numeric:tabular-nums;
+  white-space:nowrap;
+}
 
 /* The workgroup picker reads as chrome here, not as a tiny mono caption. */
 .nc-of .nc-group-title-trigger{
@@ -2135,14 +2048,22 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-group-title-chev{color:var(--ink-3); font-size:9px}
 /* Phone: the metadata columns fold under the title rather than crushing it. */
 @media (max-width:720px){
+  /* Six columns do not fit a phone. The row folds into three lines — id+age,
+     title, then state+owner — and the column header, which only makes sense
+     over aligned columns, drops out entirely. */
+  .nc-of .nc-obs-ledger-head{display:none}
   .nc-of .nc-obs-ledger-btn{grid-template-columns:minmax(0,1fr) auto; gap:4px 10px; padding:11px 14px}
-  /* justify-content is the CROSS axis once this flips to a row — left, not
-     centred, or the state chip drifts into the middle of the row. */
-  .nc-of .nc-obs-ledger-lead{grid-column:1; flex-direction:row; align-items:center; justify-content:flex-start}
+  .nc-of .nc-obs-ledger-id{grid-column:1; grid-row:1}
   .nc-of .nc-obs-ledger-age{grid-column:2; grid-row:1}
   .nc-of .nc-obs-ledger-title{grid-column:1 / -1; white-space:normal}
-  .nc-of .nc-obs-ledger-owner{grid-column:1}
-  .nc-of .nc-obs-ledger-kind{grid-column:2; text-align:right}
+  .nc-of .nc-obs-ledger-state{grid-column:1}
+  .nc-of .nc-obs-ledger-owner{grid-column:2; text-align:right}
+  .nc-of .nc-obs-ledger-room{grid-column:1 / -1}
+  .nc-of .nc-obs-claim-toggle,.nc-of .nc-of-sched-open{
+    grid-template-columns:minmax(0,1fr) auto; gap:4px 10px;
+  }
+  .nc-of .nc-obs-claim-title{grid-column:1 / -1}
+  .nc-of .nc-of-sched-name{grid-column:1 / -1}
 }
 
 /* ─── The room sheet ─────────────────────────────────────────────────────── */
@@ -2190,531 +2111,12 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    would then float the name into the middle of it. */
 .nc-of .nc-of-sheet-list li:has(.nc-of-sheet-held){align-items:flex-start}
 
-/* ─── Dependency view ────────────────────────────────────────────────────── */
-
-.nc-of .nc-obs-hover-steer {
-  display: inline-block; margin-top: 4px; min-height: 32px; line-height: 32px;
-  color: var(--of-ink); font-weight: 600; text-decoration: underline;
-}
-.nc-of .nc-obs-hover-nosession { margin-top: 4px; color: var(--of-ink-2); font-style: italic; }
-
-.nc-of .nc-obs-dep { display: flex; flex-direction: column; gap: 10px; }
-
-/* Coverage leads. A partial graph is fine; a partial graph read as complete is
-   not, and this line is the only thing standing between the two. */
-.nc-of .nc-obs-dep-coverage {
-  background: var(--of-paper); border: 3px solid var(--of-ink-2);
-  box-shadow: var(--of-drop); padding: 8px 12px; font-size: 12px; color: var(--of-ink);
-}
-.nc-of .nc-obs-dep-coverage.partial { border-color: var(--of-warn, #c8922e); }
-.nc-of .nc-obs-dep-coverage-gap { color: var(--of-ink-2); }
-
-.nc-of .nc-obs-dep-cycle,
-.nc-of .nc-obs-dep-dangling {
-  background: var(--of-paper); border: 3px solid var(--of-alert);
-  box-shadow: var(--of-drop); padding: 8px 12px; font-size: 11.5px; color: var(--of-ink);
-}
-.nc-of .nc-obs-dep-dangling { border-color: var(--of-ink-2); color: var(--of-ink-2); }
-.nc-of .nc-obs-dep-empty {
-  background: var(--of-paper); border: 3px solid var(--of-ink-2); box-shadow: var(--of-drop);
-  padding: 10px 12px; font-size: 12px; color: var(--of-ink-2); font-style: italic;
-}
-
-/* The ranking is the answer, so it gets the big numerals and works at 390px. */
-.nc-of .nc-obs-dep-rank { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.nc-of .nc-obs-dep-rank-row {
-  background: var(--of-paper); border: 3px solid var(--of-ink-2); box-shadow: var(--of-drop);
-}
-.nc-of .nc-obs-dep-rank-btn {
-  appearance: none; background: none; border: 0; margin: 0; width: 100%;
-  padding: 8px 12px; min-height: 44px; cursor: pointer; text-align: left;
-  display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; font: inherit; color: var(--of-ink);
-}
-.nc-of .nc-obs-dep-rank-btn:focus-visible { outline: 3px solid var(--of-ink); outline-offset: -3px; }
-.nc-of .nc-obs-dep-rank-n {
-  font-family: var(--font-mono); font-size: 22px; font-weight: 700; line-height: 1; color: var(--of-ink);
-}
-.nc-of .nc-obs-dep-rank-l { font-size: 12.5px; }
-.nc-of .nc-obs-dep-rank-id { font-family: var(--font-mono); font-weight: 600; }
-.nc-of .nc-obs-dep-flag {
-  margin-left: auto; background: var(--of-alert); color: #fff; border: 2px solid var(--of-ink-2);
-  padding: 0 6px; font-family: var(--font-mono); font-size: 10px;
-}
-.nc-of .nc-obs-dep-rank-detail { padding: 0 12px 10px; font-size: 12px; color: var(--of-ink); }
-.nc-of .nc-obs-dep-meta { font-size: 11px; color: var(--of-ink-2); }
-
-/* The layered plan: columns left to right, earliest work first. Scrolls
-   sideways rather than reflowing — a dependency order that rewraps by viewport
-   width is not a dependency order any more. */
-.nc-of .nc-obs-dep-plan {
-  display: flex; gap: 12px; align-items: flex-start;
-  overflow-x: auto; padding-bottom: 6px;
-}
-.nc-of .nc-obs-dep-layer {
-  display: flex; flex-direction: column; gap: 6px; min-width: 190px; max-width: 240px; flex: none;
-}
-.nc-of .nc-obs-dep-layer-head {
-  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
-  letter-spacing: 0.12em; text-transform: uppercase; color: var(--of-cream);
-  text-shadow: 1px 1px 0 rgb(0 0 0 / 0.3);
-}
-.nc-of .nc-obs-dep-node {
-  display: flex; flex-direction: column; gap: 2px;
-  background: var(--of-paper); color: var(--of-ink); text-decoration: none;
-  border: 3px solid var(--of-ink-2); box-shadow: var(--of-drop); padding: 7px 9px; min-height: 44px;
-}
-.nc-of .nc-obs-dep-node.blocks { border-color: var(--of-alert); }
-.nc-of .nc-obs-dep-node.cycle { border-color: var(--of-alert); border-style: double; border-width: 5px; }
-/* Undeclared is DASHED and tagged — never the same solid box as a node that
-   actually declared it has no blockers. This is the whole honesty argument. */
-.nc-of .nc-obs-dep-node.undeclared {
-  border-style: dashed; background: repeating-linear-gradient(
-    45deg, var(--of-paper), var(--of-paper) 6px, rgb(0 0 0 / 0.04) 6px, rgb(0 0 0 / 0.04) 12px);
-}
-.nc-of .nc-obs-dep-node-id { font-family: var(--font-mono); font-size: 11px; font-weight: 700; }
-.nc-of .nc-obs-dep-node-title {
-  font-size: 11.5px; color: var(--of-ink-2);
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
-}
-.nc-of .nc-obs-dep-node-tag {
-  align-self: flex-start; border: 2px solid var(--of-ink-2); padding: 0 4px;
-  font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.06em; color: var(--of-ink-2);
-}
-.nc-of .nc-obs-dep-node-tag.cycle { border-color: var(--of-alert); color: var(--of-alert); }
-
-.nc-of .nc-obs-release-group { display: flex; flex-direction: column; gap: 8px; }
-.nc-of .nc-obs-release-group.blockers { border-left: 0; padding-left: 0; }
-.nc-of .nc-obs-release-group-label {
-  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
-  letter-spacing: 0.14em; text-transform: uppercase; color: var(--of-cream);
-  text-shadow: 1px 1px 0 rgb(0 0 0 / 0.3);
-}
-.nc-of .nc-obs-release-group-sub { font-size: 11px; color: #efdcbb; margin: -6px 0 2px; }
-
-/* Every item is a note pinned to the board; blockers are bigger and red-pinned. */
-.nc-of .nc-obs-release-row {
-  position: relative; border-radius: 0;
-  background: var(--of-paper); border: 3px solid var(--of-ink-2);
-  box-shadow: 3px 3px 0 rgb(0 0 0 / 0.22);
-  padding: 8px 12px 8px 26px; min-height: 44px;
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; color: var(--of-ink);
-}
-.nc-of .nc-obs-release-row::before {
-  content: ''; position: absolute; left: 8px; top: 9px; width: 8px; height: 8px;
-  background: var(--of-note); box-shadow: inset 0 2px 0 rgb(255 255 255 / 0.55), 2px 2px 0 rgb(0 0 0 / 0.28);
-}
-.nc-of .nc-obs-release-group.blockers .nc-obs-release-row {
-  border-color: var(--of-alert); background: #fff2e2; padding-top: 11px; padding-bottom: 11px;
-}
-.nc-of .nc-obs-release-group.blockers .nc-obs-release-row::before { background: var(--of-alert); }
-.nc-of .nc-obs-release-row-kind { font-size: 12px; }
-.nc-of .nc-obs-release-row-id {
-  font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; color: var(--of-ink);
-}
-.nc-of a.nc-obs-release-row-id { text-decoration: underline; }
-.nc-of a.nc-obs-release-row-id:hover { color: var(--of-alert); }
-.nc-of .nc-obs-release-row-title { font-size: 12.5px; color: var(--of-ink); }
-.nc-of .nc-obs-release-row-tag {
-  font-family: var(--font-mono); font-size: 10px; color: var(--of-ink-2);
-  border: 2px solid var(--of-ink-2); border-radius: 0; padding: 0 6px;
-  text-transform: uppercase; letter-spacing: 0.08em;
-}
-.nc-of .nc-obs-release-row-owner { font-size: 11px; color: var(--of-ink-2); }
-.nc-of .nc-obs-release-row-owner strong { color: var(--of-ink); font-weight: 600; }
-.nc-of .nc-obs-release-row-why { font-size: 11px; color: var(--of-ink-2); line-height: 1.45; }
-.nc-of .nc-obs-release-row-age {
-  margin-left: auto; font-family: var(--font-mono); font-size: 10.5px; color: var(--of-ink-2);
-}
-/* The row body is the expander; the id stays a real link beside it. */
-.nc-of .nc-obs-release-row-toggle {
-  flex: 1 1 200px; min-height: 44px; padding: 0; border: none; border-radius: 0;
-  background: transparent; cursor: pointer; text-align: left; color: var(--of-ink);
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px;
-}
-.nc-of .nc-obs-release-row-toggle:hover .nc-obs-release-row-title { text-decoration: underline; }
-.nc-of .nc-obs-release-row-detail {
-  flex-basis: 100%; margin-top: 6px; padding-top: 8px; border-top: 2px dashed var(--of-ink-2);
-  display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
-}
-.nc-of .nc-obs-release-row-meta { font-size: 11px; color: var(--of-ink-2); }
-.nc-of .nc-of-link {
-  display: inline-flex; align-items: center; min-height: 44px; padding: 4px 0;
-  font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--of-ink); text-decoration: underline;
-}
-.nc-of .nc-of-link:hover { color: var(--of-alert); }
-
-/* ─── WHITEBOARD — "Who's on what" ───────────────────────────────────────── */
-
-.nc-of .nc-obs-claims {
-  border: 6px solid var(--of-wall); border-radius: 0; background: #fbfaf4;
-  box-shadow: inset 0 4px 0 var(--of-wall-hi), inset 0 -4px 0 var(--of-wall-sh), var(--of-drop);
-  padding: 14px 16px 18px; margin-bottom: 18px;
-  display: flex; flex-direction: column; gap: 10px;
-}
-.nc-of .nc-obs-claims-title {
-  font-family: var(--font-mono); font-size: 13px; font-weight: 600;
-  letter-spacing: 0.18em; text-transform: uppercase; color: var(--of-ink);
-}
-.nc-of .nc-obs-claim-group-label {
-  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
-  letter-spacing: 0.12em; text-transform: uppercase; color: var(--of-ink-2);
-}
-.nc-of .nc-obs-claim-group-sub { font-size: 11px; color: var(--of-ink-2); margin-bottom: 6px; }
-.nc-of .nc-obs-claim-row {
-  border-radius: 0; padding: 8px 10px; margin-bottom: 6px; min-height: 44px;
-  background: #fff; border: 3px solid var(--of-ink-2); box-shadow: 3px 3px 0 rgb(0 0 0 / 0.14);
-  color: var(--of-ink);
-}
-.nc-of .nc-obs-claim-row:hover { border-color: var(--of-ink); }
-.nc-of .nc-obs-claim-toggle {
-  display: block; width: 100%; min-height: 44px; padding: 0; border: none; border-radius: 0;
-  background: transparent; cursor: pointer; text-align: left; color: inherit; font: inherit;
-}
-.nc-of .nc-obs-claim-toggle:hover .nc-obs-claim-slug { text-decoration: underline; }
-.nc-of .nc-obs-claim-detail {
-  margin-top: 8px; padding-top: 8px; border-top: 2px dashed var(--of-ink-2);
-  display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
-}
-.nc-of .nc-obs-claim-row.stale { border-left: 8px solid var(--of-alert); }
-.nc-of .nc-obs-claim-row.parked { border-left: 8px solid var(--of-note); }
-.nc-of .nc-obs-claim-row.live { border-left: 8px solid var(--of-ok); }
-.nc-of .nc-obs-claim-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.nc-of .nc-obs-claim-escalated { display: block; font-size: 11px; color: var(--of-ink-2); margin-top: 3px; }
-.nc-of .nc-obs-claim-age { display: block; font-size: 11px; color: var(--of-ink-2); margin-top: 2px; }
-.nc-of .nc-obs-claim-slug {
-  font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; color: var(--of-ink);
-}
-.nc-of .nc-obs-claim-owner { display: block; font-size: 11px; color: var(--of-ink-2); margin-top: 2px; }
-.nc-of .nc-obs-claim-note { font-size: 11.5px; color: var(--of-ink); line-height: 1.45; }
-.nc-of .nc-pill { border-radius: 0; border: 2px solid currentColor; }
-
-/* ─── WHAT'S SCHEDULED — same paper-on-a-board family as the job board ───── */
-
-.nc-of .nc-of-sched {
-  border: 6px solid var(--of-wall-sh); border-radius: 0;
-  background:
-    repeating-linear-gradient(45deg, rgb(0 0 0 / 0.05) 0 2px, transparent 2px 5px),
-    var(--of-cork);
-  box-shadow: inset 0 4px 0 rgb(255 255 255 / 0.14), var(--of-drop);
-  padding: 14px 16px 16px; margin-bottom: 18px;
-  display: flex; flex-direction: column; gap: 10px;
-}
-.nc-of .nc-of-sched-title {
-  font-family: var(--font-mono); font-size: 13px; font-weight: 600;
-  letter-spacing: 0.18em; text-transform: uppercase; color: var(--of-cream);
-  text-shadow: 2px 2px 0 rgb(0 0 0 / 0.3);
-}
-.nc-of .nc-of-sched-empty {
-  background: var(--of-paper); border: 3px solid var(--of-ink-2);
-  box-shadow: var(--of-drop); padding: 10px 12px;
-  font-size: 12px; color: var(--of-ink-2); font-style: italic;
-}
-.nc-of .nc-of-sched-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.nc-of .nc-of-sched-row {
-  background: var(--of-paper); border: 3px solid var(--of-ink-2);
-  box-shadow: 3px 3px 0 rgb(0 0 0 / 0.22); color: var(--of-ink);
-}
-/* The whole row is the hit target — 44px min so it stays tappable on a phone. */
-.nc-of .nc-of-sched-open {
-  appearance: none; background: none; border: 0; margin: 0; font: inherit; color: inherit;
-  width: 100%; padding: 8px 12px; min-height: 44px; text-align: left; cursor: pointer;
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
-}
-.nc-of .nc-of-sched-open:hover { background: var(--of-paper-2, rgb(0 0 0 / 0.05)); }
-.nc-of .nc-of-sched-open:focus-visible { outline: 3px solid var(--of-ink); outline-offset: -3px; }
-.nc-of .nc-of-sched-who {
-  font-family: var(--font-mono); font-size: 11.5px; font-weight: 600;
-  letter-spacing: 0.08em; text-transform: uppercase; color: var(--of-ink);
-}
-.nc-of .nc-of-sched-what { font-size: 12.5px; color: var(--of-ink); }
-.nc-of .nc-of-sched-when {
-  font-family: var(--font-mono); font-size: 11px; color: var(--of-ink);
-  border: 2px solid var(--of-ink-2); padding: 0 6px;
-}
-.nc-of .nc-of-sched-where { font-size: 11px; color: var(--of-ink-2); }
-.nc-of .nc-of-sched-id {
-  margin-left: auto; font-family: var(--font-mono); font-size: 10px; color: var(--of-ink-2);
-}
-
-/* ─── THE FLOOR ──────────────────────────────────────────────────────────── */
-
-/* 16px checkerboard tiles — a repeating-conic-gradient, not an image. */
-.nc-of-floor {
-  position: relative; padding: 18px;
-  border: 4px solid var(--of-wall-sh);
-  background: repeating-conic-gradient(var(--of-floor-a) 0% 25%, var(--of-floor-b) 0% 50%) 0 0 / 32px 32px;
-  box-shadow: var(--of-drop);
-}
-
-/* Zones — desk clusters standing on rugs, NOT walled rooms. Position is
-   STABLE (sorted platform, name), never reordered by activity; each zone's
-   rug tone and furniture are hashed from its key. What separates one cluster
-   from the next is aisle space and furniture, so the gaps are load-bearing. */
-/* NOT a uniform grid — "equal-sized cards in a uniform grid (reads as cubicles,
-   not an office)" is anti-pattern 1 of the office-16 system, and a two-column
-   auto-fill grid is exactly that. Rooms flow at sizes derived from occupancy
-   (see --seats below) and wrap into an open floor, so room size varies, rows
-   break unevenly, and the aisle space between clusters is real space rather
-   than grid gutter. Position stays STABLE because the source order is sorted
-   (platform, name) and nothing here reorders. */
-.nc-of .nc-obs-rooms {
-  display: flex; flex-wrap: wrap; align-items: flex-start;
-  gap: 46px 30px;
-}
-/* The lounge is a room, not a footer rule across the whole floor. */
-.nc-of .nc-of-bullpen { max-width: 420px; }
-
-/* Room footprints are FIXED, not sized by occupancy.
-   Sizing by occupancy was the previous rule here and it is wrong twice over.
-   In a real place rooms are fixed and occupancy varies — that is exactly what
-   makes an empty room legible AS empty. And a plan whose room widths change
-   every poll reshuffles the whole floor, destroying the spatial memory that is
-   the only reason a map beats a list. A treemap wearing a house costume is
-   still a treemap. Occupancy shows in the FURNITURE and the people, never in
-   the walls. */
-.nc-of .nc-obs-room {
-  flex: 0 1 auto;
-  width: 268px;
-  max-width: 100%;
-}
-@media (min-width: 900px) {
-  .nc-of .nc-obs-room { min-width: 208px; }
-}
-
-/* The rug, ENCLOSED. The original rule said zones are told apart by rug colour
-   "never by borders", and three rounds of independent critique read that as a
-   colour-block chart rather than a floor plan. The amended rule: the rug still
-   names the zone, the wall gives it extent. What stays banned is the thing the
-   original was protecting against — a hairline box border used as a card edge.
-   This is 10px of drawn masonry with a lit cap, not a 1px outline. */
-.nc-of .nc-obs-room {
-  --rug: var(--of-room);
-  position: relative; border-radius: 0;
-  margin-top: 34px; padding: 26px 16px 16px; min-height: 150px;
-  background: var(--rug);
-  border: 10px solid var(--of-wall, #7c5f3e);
-  border-top-width: 22px;
-  box-shadow:
-    inset 0 0 0 2px rgb(43 36 22 / 0.30),
-    inset 5px 5px 0 rgb(43 36 22 / 0.16),
-    0 0 0 2px rgb(43 36 22 / 0.5),
-    5px 5px 0 rgb(0 0 0 / 0.18);
-  transition: none;
-}
-/* Four rug tones so neighbouring zones read as separate areas of one floor. */
-/* Six distinct hues, desaturated-warm — the office-16 zone palette. These were
-   four shades of the same cream, which made the rug carry no identity at all:
-   a reader could not tell one zone from another by colour, which is the ONLY
-   job the rug has. None of them is a state colour (green/amber/red/grey stay
-   reserved for working / waiting / blocking / stale). */
-.nc-of .nc-obs-room.rug-0 { --rug: #c9a3cf; }
-.nc-of .nc-obs-room.rug-1 { --rug: #8fb8d8; }
-.nc-of .nc-obs-room.rug-2 { --rug: #93b5b0; }
-.nc-of .nc-obs-room.rug-3 { --rug: #e0a87c; }
-.nc-of .nc-obs-room.rug-4 { --rug: #d8c98a; }
-.nc-of .nc-obs-room.rug-5 { --rug: #b7cdd4; }
-/* Lighting is colour, never opacity/filter on the zone itself — both create a
-   stacking context that traps an open panel (and breaks the mobile
-   position:fixed sheet) inside the zone. */
-.nc-of .nc-obs-room.dim   { --rug: var(--of-room-dim); }
-.nc-of .nc-obs-room.dusty {
-  --rug: var(--of-room-dead);
-  box-shadow: 0 0 0 3px rgb(43 36 22 / 0.14), 5px 5px 0 rgb(0 0 0 / 0.08);
-}
-.nc-of .nc-obs-room.dusty .nc-of-sprite,
-.nc-of .nc-obs-room.dusty .nc-obs-avatar { filter: grayscale(0.85) brightness(0.88); }
-.nc-of .nc-obs-room.dusty .nc-of-sign { background: #9b8a72; border-color: #6f6250; }
-.nc-of .nc-obs-room.dusty .nc-obs-room-name { color: #ece4d4; }
-.nc-of .nc-obs-room.has-open-popover { z-index: 5; }
-
-/* Hanging sign — a plaque on two chains, suspended over the cluster. */
-.nc-of .nc-of-sign {
-  position: absolute; top: -30px; left: 50%; transform: translateX(-50%);
-  max-width: calc(100% - 16px); min-height: 44px; z-index: 2;
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
-  background: var(--of-wall-hi); border: 3px solid var(--of-wall-sh); border-radius: 0;
-  box-shadow: 3px 3px 0 rgb(0 0 0 / 0.18);
-  padding: 4px 14px; cursor: pointer;
-}
-.nc-of .nc-of-sign:hover { background: var(--of-wall); }
-/* The two chains, drawn as a pair of hard gradient strips above the plaque. */
-.nc-of .nc-of-sign::before {
-  content: ''; position: absolute; left: 12px; right: 12px; top: -14px; height: 14px;
-  background:
-    linear-gradient(var(--of-wall-sh), var(--of-wall-sh)) left top / 3px 100% no-repeat,
-    linear-gradient(var(--of-wall-sh), var(--of-wall-sh)) right top / 3px 100% no-repeat;
-}
-.nc-of .nc-obs-room-name {
-  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
-  letter-spacing: 0.14em; text-transform: uppercase; color: var(--of-cream);
-  text-shadow: 1px 1px 0 var(--of-wall-sh);
-  max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.nc-of .nc-obs-room-platform {
-  font-family: var(--font-mono); font-size: 9px; letter-spacing: 0.14em;
-  text-transform: uppercase; color: #f0e0c4;
-}
-
-.nc-of .nc-obs-room-cobweb {
-  position: absolute; top: 0; right: 0; width: 36px; height: 36px;
-  image-rendering: pixelated; transform: scaleX(-1);
-}
-
-.nc-of-sprite { image-rendering: pixelated; display: block; }
-/* Furniture sits at the rug's edge, spilling into the aisle — that overlap is
-   what makes one cluster feel bounded without a wall. */
-.nc-of-decor {
-  position: absolute; right: -12px; bottom: -10px;
-  display: flex; align-items: flex-end; gap: 10px; pointer-events: none;
-}
-.nc-of-decor-plant      { width: 36px; height: 48px; }
-.nc-of-decor-whiteboard { width: 48px; height: 36px; }
-.nc-of-decor-couch      { width: 48px; height: 30px; }
-.nc-of-decor-cooler     { width: 30px; height: 48px; }
-
-/* Desk cluster — two stations across, wrapping. */
-.nc-of .nc-obs-room-bodies {
-  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;
-  justify-items: center; align-items: end;
-  min-height: 60px; position: relative; z-index: 1;
-}
-.nc-of .nc-obs-room-bodies > .nc-of-empty-desks,
-.nc-of .nc-of-absent-row { grid-column: 1 / -1; }
-.nc-of-empty-desks { display: flex; gap: 10px; align-items: flex-end; opacity: 0.85; }
-.nc-of-empty-desks .nc-of-desk { width: 56px; height: 42px; }
-.nc-of .nc-of-absent-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-
-/* The zone panel opens under the sign — same paper card as an agent popover. */
-.nc-of .nc-of-zone-panel { top: calc(100% + 4px); left: 8px; right: 8px; }
-.nc-of .nc-of-zone-panel-name {
-  font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
-}
-
-/* Wired-but-absent members: an empty chair marker, not a body. */
-.nc-of .nc-obs-room-absent {
-  width: 26px; height: 26px; border-radius: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  font-family: var(--font-mono); font-size: 9px; color: var(--of-ink-2);
-  border: 2px dashed var(--of-ink-2); background: rgb(255 255 255 / 0.35);
-}
-.nc-of .nc-obs-avatar-sm {
-  width: 20px; height: 20px; border-radius: 0; image-rendering: pixelated;
-  filter: grayscale(1); box-shadow: 0 0 0 2px var(--of-ink-2);
-}
-
-/* ─── An agent at their desk ─────────────────────────────────────────────── */
-
-.nc-of .nc-obs-chip {
-  position: relative;
-  display: flex; flex-direction: column; align-items: center; gap: 4px;
-  padding: 2px; min-height: 44px; border: none; border-radius: 0;
-  background: transparent; cursor: pointer; color: var(--of-ink);
-}
-.nc-of-station { position: relative; width: 76px; height: 58px; }
-.nc-of-station .nc-of-desk {
-  position: absolute; right: 0; bottom: 0; width: 64px; height: 48px;
-}
-.nc-of .nc-obs-avatar {
-  position: absolute; left: 0; bottom: 18px; z-index: 2;
-  width: 32px; height: 32px; border-radius: 0; flex-shrink: 0;
-  image-rendering: pixelated;
-  box-shadow: 0 0 0 2px var(--of-ink);
-}
-.nc-of .nc-obs-avatar.asleep { filter: grayscale(1) brightness(0.75); }
-.nc-of-blank { position: absolute; left: 0; bottom: 18px; z-index: 2; width: 32px; height: 32px; }
-.nc-of-blank .nc-obs-avatar { left: 0; bottom: 0; }
-/* Initials sit on a small plate over the blank bust — plain text on the
-   sprite is unreadable once the asleep grayscale lands on it. */
-.nc-of-blank-initials {
-  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 3;
-  padding: 0 3px; background: var(--of-cream); border: 2px solid var(--of-ink);
-  font-family: var(--font-mono); font-size: 11px; font-weight: 600; line-height: 1.3;
-  letter-spacing: 0.04em; color: var(--of-ink);
-}
-.nc-of .nc-obs-chip-glyph {
-  position: absolute; top: 0; right: 0; z-index: 4; font-size: 10px; color: var(--of-ok);
-}
-.nc-of .nc-obs-chip.asleep .nc-obs-chip-glyph { font-size: 12px; color: var(--of-ink-2); }
-.nc-of .nc-obs-chip-name {
-  max-width: 88px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  background: var(--of-paper); border: 2px solid var(--of-ink-2); padding: 1px 5px;
-  font-family: var(--font-mono); font-size: 9px; font-weight: 600;
-  letter-spacing: 0.1em; text-transform: uppercase; color: var(--of-ink); text-align: center;
-}
-.nc-of .nc-obs-chip.asleep .nc-obs-chip-name { color: var(--of-ink-2); }
-.nc-of .nc-obs-chip.highlighted .nc-obs-chip-name { background: var(--of-note); border-color: var(--of-ink); }
-.nc-of .nc-obs-chip.highlighted .nc-obs-avatar { box-shadow: 0 0 0 3px var(--of-alert); }
-
-/* Popover — a paper panel with a hard drop shadow. z-index sits above every
-   other .nc-of element (all unset/auto, or 5 on an elevated room). */
-.nc-of .nc-obs-hover {
-  position: absolute; top: calc(100% + 6px); left: 0; z-index: 50;
-  min-width: 190px; padding: 10px 30px 10px 12px; border-radius: 0;
-  background: var(--of-paper); border: 3px solid var(--of-ink);
-  box-shadow: 5px 5px 0 rgb(0 0 0 / 0.25);
-  font-family: var(--font-mono); font-size: 11px; color: var(--of-ink);
-  display: flex; flex-direction: column; gap: 3px; text-align: left;
-  cursor: default; text-transform: none; letter-spacing: 0;
-}
-.nc-of .nc-obs-hover-canonical { color: var(--of-ink-2); font-style: italic; }
-.nc-of .nc-obs-hover-close {
-  position: absolute; top: 4px; right: 4px; width: 22px; height: 22px;
-  border: none; border-radius: 0; background: transparent; color: var(--of-ink-2);
-  font-size: 12px; line-height: 1; cursor: pointer;
-}
-.nc-of .nc-obs-hover-close:hover { color: var(--of-ink); background: rgb(0 0 0 / 0.08); }
-
-/* ─── The lounge — another rug on the same floor, for unplaced agents ────── */
-
-.nc-of .nc-obs-desks {
-  position: relative; margin: 52px 0 0; border-radius: 0;
-  border: 0; background: #ecdfc6;
-  box-shadow: 0 0 0 3px rgb(43 36 22 / 0.22), 5px 5px 0 rgb(0 0 0 / 0.12);
-  padding: 18px 12px 12px;
-}
-.nc-of .nc-obs-desks-label {
-  position: absolute; top: -30px; left: 24px;
-  background: var(--of-wall-hi); border: 3px solid var(--of-wall-sh);
-  box-shadow: 3px 3px 0 rgb(0 0 0 / 0.18);
-  padding: 8px 14px; margin: 0; min-height: 44px;
-  display: flex; align-items: center;
-  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
-  letter-spacing: 0.14em; text-transform: uppercase; color: var(--of-cream);
-  text-shadow: 1px 1px 0 var(--of-wall-sh);
-}
-.nc-of .nc-obs-desks-label::before {
-  content: ''; position: absolute; left: 12px; right: 12px; top: -14px; height: 14px;
-  background:
-    linear-gradient(var(--of-wall-sh), var(--of-wall-sh)) left top / 3px 100% no-repeat,
-    linear-gradient(var(--of-wall-sh), var(--of-wall-sh)) right top / 3px 100% no-repeat;
-}
-.nc-of .nc-of-lounge-couch {
-  position: absolute; right: -12px; bottom: -8px; width: 64px; height: 40px; pointer-events: none;
-}
-.nc-of .nc-obs-desks-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
-.nc-of .nc-obs-desks-empty { font-size: 12px; color: var(--of-ink-2); font-style: italic; }
-
+/* The provenance line. It is a footnote about where the numbers came from, so
+   it reads as one — quiet sentence case, not a stamped uppercase banner. */
 .nc-of .nc-obs-footer {
-  padding: 12px 16px 20px; text-align: center;
-  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.1em;
-  text-transform: uppercase; color: var(--of-ink-2);
+  padding: 12px 16px 20px; text-align: center; font-size: 11.5px; color: var(--ink-3);
 }
-.nc-of .nc-obs-stale { color: var(--of-alert); }
-
-/* Small screens: zones are already a single column; the popover becomes a
-   bottom sheet so there's no viewport-clamping math to get wrong. */
-@media (max-width: 639px) {
-  .nc-of-floor { padding: 10px; }
-  .nc-of .nc-obs-room { padding: 14px 10px 10px; }
-  .nc-of-decor { opacity: 0.9; right: -6px; }
-  .nc-of .nc-obs-hover {
-    position: fixed; top: auto; left: 0; right: 0; bottom: 0; z-index: 200;
-    width: auto; min-width: 0; max-height: 70vh; overflow-y: auto;
-    border-radius: 0; padding: 16px 16px 20px;
-    box-shadow: 0 -4px 0 rgb(0 0 0 / 0.25);
-  }
-}
+.nc-of .nc-obs-stale { color: var(--stop); }
 
 /* ─── The session page: the steer destination ────────────────────────────── */
 /* Reached from the Observatory's room sheet, so it inherits `.nc-of`'s atrium
