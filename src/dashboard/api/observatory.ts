@@ -85,6 +85,14 @@ export interface ReleaseStateItem {
   why?: string;
   since?: string;
   url?: string;
+  /** ISO deadline the current mover promised the next transition by. */
+  dueAt?: string | null;
+  /** One line: what the current mover does next. */
+  nextAction?: string;
+  /** Slack channel the work lives in, e.g. '#qa-room' — how the floor and
+   *  the assign path route an item to its room. Emitted 73/73 as of the
+   *  2026-08-17 board wake. */
+  channel?: string;
   /**
    * Ids of items on this same board that must land first. OMITTING the field
    * means "nobody checked"; an explicit `[]` means "checked, nothing blocks

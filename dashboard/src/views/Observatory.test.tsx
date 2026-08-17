@@ -12,6 +12,7 @@ vi.mock('../lib/api.js', () => ({
   listWorkgroups: vi.fn(),
   getObservatory: vi.fn(),
   listScheduled: vi.fn(),
+  assignItem: vi.fn(),
 }));
 
 // The drawer is exercised by its own suite; here we only care that the floor
@@ -33,6 +34,7 @@ import {
 } from './Observatory.js';
 import { RouteNav } from './BoardShell.js';
 import useSWR from 'swr';
+import { assignItem } from '../lib/api.js';
 import type {
   ObservatoryRoom,
   ObservatoryAgent,
@@ -746,6 +748,67 @@ describe('Observatory', () => {
       const board = container.querySelector('details.nc-of-board') as HTMLDetailsElement;
       await userEvent.click(container.querySelector('.nc-of-clearfilter')! as HTMLElement);
       expect(board.open).toBe(true);
+    });
+  });
+
+  describe('assigning from the queue', () => {
+    const mockAssign = vi.mocked(assignItem);
+
+    const boardWithChannel = () =>
+      mockData(
+        snapshot({
+          agents: [agent({ id: 'ag-ava', name: 'ava' })],
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'X#1', title: 'routable', nextMover: 'nobody', channel: '#general' }),
+              releaseItem({ id: 'X#2', title: 'unroutable', nextMover: 'nobody' }),
+            ],
+          }),
+        }),
+      );
+    const expandRow = async (c: HTMLElement, id: string) =>
+      userEvent.click(c.querySelector(`[data-ledger-id="${id}"] .nc-obs-ledger-btn`)! as HTMLElement);
+
+    it('an owner sees the control on a channel-bearing row, and not on one without', async () => {
+      boardWithChannel();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await expandRow(container, 'X#1');
+      expect(container.querySelector('.nc-obs-assign')).toBeTruthy();
+      await expandRow(container, 'X#2');
+      // v2 routes by the item's channel or not at all — no channel, no control.
+      expect(container.querySelector('.nc-obs-assign')).toBeFalsy();
+    });
+
+    it('a member never sees the control — the server is the gate, this is the hint', async () => {
+      boardWithChannel();
+      const memberMe = { user_id: 'u2', scopes: { role: 'member', allowed_group_ids: [], no_filter: false } };
+      const { container } = render(<Observatory authMe={memberMe} route="observatory" onRouteChange={noop} />);
+      await expandRow(container, 'X#1');
+      expect(container.querySelector('.nc-obs-assign')).toBeFalsy();
+    });
+
+    it('sends ids only, and reports where the work was tasked', async () => {
+      boardWithChannel();
+      mockAssign.mockResolvedValue({ ok: true, seriesId: 's1', channel: '#general', agent: 'ava' });
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await expandRow(container, 'X#1');
+      await userEvent.selectOptions(container.querySelector('.nc-obs-assign select')! as HTMLElement, 'ag-ava');
+      await userEvent.click(container.querySelector('.nc-obs-assign button')! as HTMLElement);
+
+      expect(mockAssign).toHaveBeenCalledWith('wg-1', 'X#1', 'ag-ava');
+      expect(container.querySelector('.nc-obs-assign-done')!.textContent).toBe(
+        'assigned — ava was tasked in #general',
+      );
+    });
+
+    it('a wiring rejection explains itself instead of failing mute', async () => {
+      boardWithChannel();
+      mockAssign.mockRejectedValue({ status: 409, error: 'agent_not_wired_to_channel' });
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await expandRow(container, 'X#1');
+      await userEvent.selectOptions(container.querySelector('.nc-obs-assign select')! as HTMLElement, 'ag-ava');
+      await userEvent.click(container.querySelector('.nc-obs-assign button')! as HTMLElement);
+      expect(container.querySelector('.nc-obs-assign-err')!.textContent).toContain('not wired to #general');
     });
   });
 

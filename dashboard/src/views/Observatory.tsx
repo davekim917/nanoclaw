@@ -20,6 +20,7 @@ import { type BoardRoute } from './BoardShell.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildReleaseGraph, unblockRanking } from './release-graph.js';
 import { buildLedger, dueLabel, type Commitment } from './commitments.js';
+import { assignItem } from '../lib/api.js';
 import { OfficeMap } from './OfficeMap.js';
 import { buildOfficeData } from './office-data.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
@@ -59,7 +60,7 @@ interface ObservatoryProps {
 // Props are the shell's routing contract, kept so main.tsx and the legacy
 // boards stay uniform. The Observatory itself no longer navigates: it is the
 // only destination, and detail opens over the floor rather than away from it.
-export function Observatory(_props: ObservatoryProps) {
+export function Observatory({ authMe }: ObservatoryProps) {
   const { data: wgData } = useSWR('/dashboard/api/workgroups', () => listWorkgroups(), { refreshInterval: 0 });
   const workgroups = wgData?.workgroups ?? [];
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -321,7 +322,18 @@ export function Observatory(_props: ObservatoryProps) {
                   )}
                 </summary>
                 <div className="inner">
-                  <LedgerBoard items={ownerFilteredItems} slice={flowFilter} />
+                  <LedgerBoard
+                    items={ownerFilteredItems}
+                    slice={flowFilter}
+                    {...(authMe.scopes.role !== 'member' && selectedId
+                      ? {
+                          assign: {
+                            workgroupId: selectedId,
+                            agents: agents.map((a) => ({ id: a.id, name: a.name })),
+                          },
+                        }
+                      : {})}
+                  />
                 </div>
               </details>
 
@@ -950,15 +962,76 @@ const LEDGER_STATE_LABEL: Record<Commitment['state'], string> = {
 /** Rows on the first screen. The rest expand on demand. */
 const LEDGER_FIRST_PAGE = 15;
 
+interface AssignWiring {
+  workgroupId: string;
+  agents: { id: string; name: string }[];
+}
+
+/**
+ * The assign control on one expanded row. Sends three ids; the server owns the
+ * prompt, the role gate and the wiring check — a rejection comes back as its
+ * error name so the operator learns WHY (not wired, no channel), not just "no".
+ */
+function AssignControl({ item, wiring }: { item: ReleaseItem; wiring: AssignWiring }) {
+  const [agentId, setAgentId] = useState('');
+  const [state, setState] = useState<{ phase: 'idle' | 'busy' | 'done' | 'error'; note?: string }>({ phase: 'idle' });
+
+  if (!item.channel) return null;
+  if (state.phase === 'done') return <div className="nc-obs-assign-done">{state.note}</div>;
+
+  const go = async () => {
+    if (!agentId) return;
+    setState({ phase: 'busy' });
+    try {
+      const r = await assignItem(wiring.workgroupId, item.id, agentId);
+      setState({ phase: 'done', note: `assigned — ${r.agent} was tasked in ${r.channel}` });
+    } catch (e) {
+      const err = e as { error?: string; status?: number };
+      const why =
+        err.error === 'agent_not_wired_to_channel'
+          ? `that agent is not wired to ${item.channel}`
+          : err.error === 'recently_assigned'
+            ? 'already assigned in the last few minutes'
+            : (err.error ?? 'failed');
+      setState({ phase: 'error', note: why });
+    }
+  };
+
+  return (
+    <div className="nc-obs-assign">
+      <select
+        aria-label="Assign to agent"
+        value={agentId}
+        onChange={(e) => setAgentId(e.target.value)}
+        disabled={state.phase === 'busy'}
+      >
+        <option value="">assign to…</option>
+        {wiring.agents.map((a) => (
+          <option key={a.id} value={a.id}>
+            {a.name}
+          </option>
+        ))}
+      </select>
+      <button type="button" onClick={go} disabled={!agentId || state.phase === 'busy'}>
+        {state.phase === 'busy' ? 'assigning…' : `task it in ${item.channel}`}
+      </button>
+      {state.phase === 'error' && <span className="nc-obs-assign-err">{state.note}</span>}
+    </div>
+  );
+}
+
 function LedgerBoard({
   items,
   now = Date.now(),
   slice = null,
+  assign,
 }: {
   items: ReleaseItem[];
   now?: number;
   /** Headline slice the queue is filtered to, or null for everything open. */
   slice?: FlowSlice | null;
+  /** Present only for roles that may assign; absent hides the control. */
+  assign?: AssignWiring;
 }) {
   const ledger = useMemo(() => buildLedger(items, now), [items, now]);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -1023,6 +1096,7 @@ function LedgerBoard({
                     {c.item.owner ? ` · ${c.item.owner}` : ''}
                   </div>
                   {c.item.url && <OutLink href={c.item.url}>{itemLinkLabel(c.item.kind)}</OutLink>}
+                  {assign && <AssignControl item={c.item} wiring={assign} />}
                 </div>
               )}
             </li>

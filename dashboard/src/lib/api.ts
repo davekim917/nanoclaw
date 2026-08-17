@@ -528,6 +528,8 @@ export interface ReleaseItem {
   dueAt?: string;
   /** What the mover has promised to do next, one line. Shown on the row. */
   nextAction?: string;
+  /** Slack channel the work lives in, e.g. '#qa-room'. Routes assignment. */
+  channel?: string;
 }
 
 export interface ReleaseState {
@@ -546,6 +548,20 @@ export interface ObservatorySnapshot {
   claims: ObservatoryClaim[];
   /** Null until the release watcher has published release-state.json. */
   releaseState: ReleaseState | null;
+}
+
+/** Assign a board item to an agent: creates a one-shot task in the item's own
+ *  channel. The server composes the prompt from the board — this sends ids only. */
+export async function assignItem(
+  workgroupId: string,
+  itemId: string,
+  agentGroupId: string,
+): Promise<{ ok: boolean; seriesId: string | null; channel: string; agent: string }> {
+  return apiFetch('/dashboard/api/observatory/assign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workgroupId, itemId, agentGroupId }),
+  });
 }
 
 export async function getObservatory(workgroupId: string): Promise<ObservatorySnapshot> {
