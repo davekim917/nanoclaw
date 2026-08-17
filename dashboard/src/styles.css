@@ -2174,9 +2174,21 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-sd.waiting{background:var(--warn)}
 .nc-of .nc-of-sd.working{background:var(--go)}
 .nc-of .nc-of-sheet-holding{color:var(--ink-3); flex:1 1 160px; min-width:0}
-.nc-of .nc-of-sheet-steer{color:var(--accent); text-decoration:none; font-weight:600}
-.nc-of .nc-of-sheet-steer:hover{text-decoration:underline}
-.nc-of .nc-of-sheet-nosession{color:var(--ink-3); font-style:italic}
+
+/* obs.3 — steer the work, not the worker: one row per held claim. The old
+   per-agent steer link (.nc-of-sheet-steer / .nc-of-sheet-nosession) is gone;
+   these replace it. Divs, not a nested <ul>, so the sheet's own
+   `.nc-of-sheet-list li` rules don't bleed onto each held row. */
+.nc-of .nc-of-sheet-held{flex:1 1 220px; min-width:0; display:flex; flex-direction:column}
+/* Every row is one 44px tap target whether or not it carries a link — .nc-of-link
+   already sets that floor, and matching it keeps the stack evenly spaced instead
+   of clumping the linkless rows together. */
+.nc-of .nc-of-sheet-held-row{display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; min-height:44px}
+.nc-of .nc-of-sheet-held-slug{min-width:0; overflow-wrap:anywhere}
+.nc-of .nc-of-sheet-nothread{color:var(--ink-3); font-style:italic}
+/* A holder's stack can run ten rows tall; the row's inherited align-items:center
+   would then float the name into the middle of it. */
+.nc-of .nc-of-sheet-list li:has(.nc-of-sheet-held){align-items:flex-start}
 
 /* ─── Dependency view ────────────────────────────────────────────────────── */
 

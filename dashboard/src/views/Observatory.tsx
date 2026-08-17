@@ -124,6 +124,9 @@ export function Observatory({ authMe }: ObservatoryProps) {
     const room = officeData.rooms[idx];
     const src = idx >= 0 ? rooms[idx] : undefined;
     if (!room || !src) return null;
+    // You steer WORK, not a worker. `holding` is claim slugs, so join it back
+    // to the claims to get the thread each piece of work actually lives in.
+    const bySlug = new Map(claims.map((c) => [c.slug, c]));
     return {
       label: room.label,
       agents: agents
@@ -131,12 +134,11 @@ export function Observatory({ authMe }: ObservatoryProps) {
         .map((a) => ({
           id: a.id,
           name: a.name,
-          holding: a.holding,
-          lastSessionId: a.lastSessionId,
+          held: a.holding.map((slug) => ({ slug, threadUrl: bySlug.get(slug)?.threadUrl ?? null })),
           state: room.agents.find((x) => x.name === a.name)?.status ?? 'idle',
         })),
     };
-  }, [selectedRoom, officeData, rooms, agents]);
+  }, [selectedRoom, officeData, rooms, agents, claims]);
 
   const roomOwners = useMemo(
     () => (selectedRoomAgents ? new Set(selectedRoomAgents.agents.map((a) => a.name)) : null),
@@ -271,18 +273,25 @@ export function Observatory({ authMe }: ObservatoryProps) {
                             <i className={`nc-of-sd ${a.state}`} />
                             {a.name}
                           </span>
-                          <span className="nc-of-sheet-holding">
-                            {a.holding.length > 0 ? `holding ${a.holding.join(', ')}` : 'holding nothing'}
-                          </span>
-                          {/* Steer lived on the old agent popover. It links to
-                              the session rather than embedding a composer: a
-                              steer written without the transcript is a guess. */}
-                          {a.lastSessionId ? (
-                            <a className="nc-of-sheet-steer" href={`#/session/${a.lastSessionId}`}>
-                              open session to steer →
-                            </a>
+                          {/* Steer is per PIECE OF WORK, not per agent: one row
+                              per held claim, each linking into the thread that
+                              work lives in. An agent holding nothing gets no
+                              affordance — there is nothing to steer. */}
+                          {a.held.length === 0 ? (
+                            <span className="nc-of-sheet-holding">holding nothing</span>
                           ) : (
-                            <span className="nc-of-sheet-nosession">no session — it has never spoken</span>
+                            <div className="nc-of-sheet-held">
+                              {a.held.map((h) => (
+                                <div className="nc-of-sheet-held-row" key={h.slug}>
+                                  <span className="nc-of-sheet-held-slug">{h.slug}</span>
+                                  {h.threadUrl ? (
+                                    <OutLink href={h.threadUrl}>steer in thread</OutLink>
+                                  ) : (
+                                    <span className="nc-of-sheet-nothread">no thread recorded</span>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
                           )}
                         </li>
                       ))}

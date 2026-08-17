@@ -819,10 +819,14 @@ describe('Observatory', () => {
       mockData(
         snapshot({
           rooms: [room({ key: 'r1', name: 'general' }), room({ key: 'r2', name: 'quiet' })],
+          claims: [
+            claim({ slug: 'migration', owner: 'ava', threadUrl: 'https://example.com/thread/1' }),
+            claim({ slug: 'orphan', owner: 'ava', threadUrl: null }),
+          ],
           agents: [
-            agent({ id: 'ava', name: 'ava', location: 'r1', holding: ['#12'], lastSessionId: 's-1' }),
-            agent({ id: 'kit', name: 'kit', location: 'r1', lastSessionId: null }),
-            agent({ id: 'zed', name: 'zed', location: 'r2', lastSessionId: 's-3' }),
+            agent({ id: 'ava', name: 'ava', location: 'r1', holding: ['migration', 'orphan'] }),
+            agent({ id: 'kit', name: 'kit', location: 'r1', holding: [] }),
+            agent({ id: 'zed', name: 'zed', location: 'r2', holding: [] }),
           ],
         }),
       );
@@ -840,21 +844,43 @@ describe('Observatory', () => {
       expect(container.querySelector('.nc-of-sheet')).toBeFalsy();
     });
 
-    it('lists only that room\'s occupants, with what each is holding', async () => {
+    it('lists only that room\'s occupants, one row per thing each is holding', async () => {
       const { container } = floor();
       await open(container, '#general');
       const who = Array.from(container.querySelectorAll('.nc-of-sheet-who')).map((e) => e.textContent);
       expect(who).toEqual(['ava', 'kit']);
-      expect(container.querySelector('.nc-of-sheet-holding')!.textContent).toBe('holding #12');
+      const held = Array.from(container.querySelectorAll('.nc-of-sheet-held-slug')).map((e) => e.textContent);
+      expect(held).toEqual(['migration', 'orphan']);
     });
 
-    it('offers steer as a session link, and says so plainly when there is no session', async () => {
+    it('steers the work: each held claim links into its own thread', async () => {
       const { container } = floor();
       await open(container, '#general');
       const rows = container.querySelectorAll('.nc-of-sheet-list li');
-      expect(rows[0]!.querySelector('a')!.getAttribute('href')).toBe('#/session/s-1');
-      expect(rows[1]!.querySelector('a')).toBeFalsy();
-      expect(rows[1]!.querySelector('.nc-of-sheet-nosession')).toBeTruthy();
+      const held = rows[0]!.querySelectorAll('.nc-of-sheet-held-row');
+      const link = held[0]!.querySelector('a')!;
+      expect(link.getAttribute('href')).toBe('https://example.com/thread/1');
+      expect(link.getAttribute('target')).toBe('_blank');
+      expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+      expect(link.textContent).toContain('steer in thread');
+    });
+
+    it('a held claim with no thread says so instead of offering a dead link', async () => {
+      const { container } = floor();
+      await open(container, '#general');
+      const held = container.querySelectorAll('.nc-of-sheet-list li')[0]!.querySelectorAll('.nc-of-sheet-held-row');
+      expect(held[1]!.querySelector('a')).toBeFalsy();
+      expect(held[1]!.querySelector('.nc-of-sheet-nothread')!.textContent).toBe('no thread recorded');
+    });
+
+    it('an occupant holding nothing gets no steer affordance at all', async () => {
+      const { container } = floor();
+      await open(container, '#general');
+      const idle = container.querySelectorAll('.nc-of-sheet-list li')[1]!;
+      expect(idle.querySelector('.nc-of-sheet-who')!.textContent).toBe('kit');
+      expect(idle.textContent).toContain('holding nothing');
+      expect(idle.querySelector('a')).toBeFalsy();
+      expect(idle.querySelector('.nc-of-sheet-held')).toBeFalsy();
     });
 
     it('closes on the sheet\'s own control, which also clears the queue filter', async () => {
