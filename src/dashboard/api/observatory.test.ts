@@ -403,6 +403,61 @@ describe('buildObservatoryScene', () => {
     expect(byId['ag-2'].lastSeenAt).toBe(old); // lastSeenAt is unconditional; location is the 8h-gated one
   });
 
+  // The live report: an agent whose container was up and whose seat was still
+  // (correctly) in #room rendered as pulsing/working there, four hours after
+  // its last word in that room.
+  it('active needs RECENT room outbound — a seat inside the 8h window is not a pulse', async () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-now', 'wg-1');
+    addGroup('ag-stale', 'wg-1');
+    addMessagingGroup('mg-1', 'slack', 'C123');
+    const justNow = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    const hoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+    addSession('sess-now', 'ag-now', { messagingGroupId: 'mg-1', lastOutboundAt: justNow });
+    addSession('sess-stale', 'ag-stale', { messagingGroupId: 'mg-1', lastOutboundAt: hoursAgo });
+
+    const scene = await buildObservatoryScene(
+      'wg-1',
+      makeDeps({ getActiveContainerSessionIds: () => ['sess-now', 'sess-stale'] }),
+    );
+    const byId = Object.fromEntries(scene.agents.map((a) => [a.id, a]));
+    // Both are awake and both are still SEATED in the room — only one is working.
+    expect(byId['ag-now'].awake).toBe(true);
+    expect(byId['ag-stale'].awake).toBe(true);
+    expect(byId['ag-now'].location).toBe('C123');
+    expect(byId['ag-stale'].location).toBe('C123');
+    expect(byId['ag-now'].active).toBe(true);
+    expect(byId['ag-stale'].active).toBe(false);
+  });
+
+  it('active is false for an asleep container however fresh the room outbound', async () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1');
+    addMessagingGroup('mg-1', 'slack', 'C123');
+    addSession('sess-1', 'ag-1', {
+      messagingGroupId: 'mg-1',
+      lastOutboundAt: new Date(Date.now() - 30 * 1000).toISOString(),
+    });
+
+    const scene = await buildObservatoryScene('wg-1', makeDeps({ getActiveContainerSessionIds: () => [] }));
+    expect(scene.agents[0].active).toBe(false);
+  });
+
+  it('a busy task session does not make an agent active in a room it has not spoken in', async () => {
+    addWorkgroup('wg-1');
+    addGroup('ag-1', 'wg-1');
+    addMessagingGroup('mg-1', 'slack', 'C123');
+    addSession('sess-room', 'ag-1', {
+      messagingGroupId: 'mg-1',
+      lastOutboundAt: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+    });
+    addSession('sess-task', 'ag-1', { lastOutboundAt: new Date(Date.now() - 30 * 1000).toISOString() });
+
+    const scene = await buildObservatoryScene('wg-1', makeDeps({ getActiveContainerSessionIds: () => ['sess-task'] }));
+    expect(scene.agents[0].location).toBe('C123');
+    expect(scene.agents[0].active).toBe(false);
+  });
+
   it('a newer room-less task session never pulls an agent off its real room', async () => {
     addWorkgroup('wg-1');
     addGroup('ag-1', 'wg-1');

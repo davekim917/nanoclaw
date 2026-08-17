@@ -56,6 +56,21 @@ export interface ObservatoryAgent {
   /** The bot's real Slack avatar (public slack-edge URL) — the UI pixelates it client-side. Null when no wired bot has one. */
   avatarUrl: string | null;
   awake: boolean;
+  /**
+   * Doing something HERE, right now — the floor's pulse.
+   *
+   * `awake` is container liveness across every session the agent owns, and an
+   * agent whose task container is merely up reads as awake for as long as it
+   * runs. Combined with `location`'s deliberately sticky 8h window that made a
+   * seat pulse hours after its last word in the room (observed live: an agent
+   * whose newest #room outbound was 4h50m old, drawn working). Where an agent
+   * SITS is allowed to be sticky; whether it PULSES is not.
+   *
+   * So: awake AND the seated room session spoke within WORKING_WINDOW_MS. Same
+   * session `location` and `liveSession` already picked — this only adds the
+   * recency gate, so an agent is never "working" in a room it isn't standing in.
+   */
+  active: boolean;
   location: string | null;
   lastSeenAt: string | null;
   /**
@@ -240,6 +255,21 @@ function parseUtcMs(s: string | null | undefined): number | null {
 }
 
 const LOCATION_WINDOW_MS = 8 * 60 * 60 * 1000;
+
+/**
+ * How recently a room session must have spoken for the agent to read as
+ * WORKING there — see ObservatoryAgent.active.
+ *
+ * Picked off the live cadence, not a round number: inside a session that is
+ * genuinely mid-turn, consecutive `messages_out` rows land seconds to ~2
+ * minutes apart (status narration plus chat), so 10 minutes is five times the
+ * observed live gap and never blinks an agent off mid-task. It is also
+ * strictly tighter than the host's own two "this is over" clocks —
+ * CHAT_IDLE_REAP_MS (15m) and ABSOLUTE_CEILING_MS (30m) — so the floor can
+ * never claim someone is working in a room the host is about to reap them out
+ * of.
+ */
+export const WORKING_WINDOW_MS = 10 * 60 * 1000;
 
 /** Case-insensitive match of a claim owner against an agent's channel-facing name OR folder. */
 export function ownerMatchesAgent(owner: string, agent: { name: string; folder: string }): boolean {
@@ -527,6 +557,7 @@ async function buildAgents(
 
       const location =
         roomMgId && nowMs - roomMs <= LOCATION_WINDOW_MS ? (getMessagingGroup(roomMgId)?.platform_id ?? null) : null;
+      const active = awake && location !== null && nowMs - roomMs <= WORKING_WINDOW_MS;
 
       // Same window and same winning session as `location` — this just also
       // carries the thread link, so a caller doesn't have to re-derive it.
@@ -571,6 +602,7 @@ async function buildAgents(
         folder: row.folder,
         provider,
         awake,
+        active,
         location,
         lastSeenAt: mostRecentAt,
         lastSessionId: mostRecentSessionId,

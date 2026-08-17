@@ -480,6 +480,10 @@ export interface ObservatoryAgent {
   folder: string;
   provider: string;
   awake: boolean;
+  /** Doing something in `location` right now (awake AND that room spoke inside
+   *  the server's tight working window). `awake` alone is container liveness
+   *  anywhere, which is why it must never drive the pulse. */
+  active: boolean;
   location: string | null;
   lastSeenAt: string | null;
   /** Session this agent last spoke in — where a steer should land. Null if none. */

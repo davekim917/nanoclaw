@@ -88,6 +88,7 @@ function agent(overrides: Partial<ObservatoryAgent> = {}): ObservatoryAgent {
     folder: 'ava',
     provider: 'claude',
     awake: true,
+    active: true,
     location: null,
     lastSeenAt: new Date().toISOString(),
     lastSessionId: null,
@@ -1541,7 +1542,7 @@ describe('Observatory', () => {
     // shape (matching messaging_groups.platform_id) because that is also
     // what a claim's threadId encodes, and the room-attribution match is a
     // literal string comparison between the two.
-    function drawerFloor() {
+    function drawerFloor(ava: Partial<ObservatoryAgent> = {}) {
       mockData(
         snapshot({
           rooms: [
@@ -1580,8 +1581,9 @@ describe('Observatory', () => {
                 threadUrl: 'https://example.com/live-thread',
                 lastOutboundAt: new Date().toISOString(),
               },
+              ...ava,
             }),
-            agent({ id: 'kit', name: 'kit', location: null, holding: [], awake: false }),
+            agent({ id: 'kit', name: 'kit', location: null, holding: [], awake: false, active: false }),
           ],
           releaseState: releaseState({
             items: [
@@ -1650,6 +1652,17 @@ describe('Observatory', () => {
       const elsewhere = drawer.querySelector('[data-section="elsewhere"]')!;
       expect(elsewhere.querySelector('summary')!.textContent).toBe('elsewhere (1)');
       expect(elsewhere.textContent).toContain('no-thread-claim');
+    });
+
+    // The live report was the floor, but the drawer told the same lie in
+    // words: a seat whose last word was hours old still read "live here".
+    it('a stale seat says it is stale, and still links the thread', async () => {
+      const { container } = drawerFloor({ active: false });
+      await clickAgent(container, 'ava');
+      const live = container.querySelector('.nc-agent-drawer-live')!;
+      expect(live.textContent).toContain('last spoke here');
+      expect(live.textContent).not.toContain('live here');
+      expect(live.querySelector('a')!.getAttribute('href')).toBe('https://example.com/live-thread');
     });
 
     it('clicked in a DIFFERENT room she is wired to: an honest empty view, not her global ledger', async () => {

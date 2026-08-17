@@ -7,7 +7,7 @@ function room(key: string, name = key): ObservatoryRoom {
 }
 function agent(id: string, o: Partial<ObservatoryAgent> = {}): ObservatoryAgent {
   return {
-    id, name: id, canonicalName: id, folder: id, provider: 'claude', awake: true,
+    id, name: id, canonicalName: id, folder: id, provider: 'claude', awake: true, active: true,
     location: null, lastSeenAt: null, lastSessionId: null, holding: [], nextTask: null, avatarUrl: null,
     liveSession: null, ...o,
   };
@@ -168,12 +168,22 @@ describe('agentState', () => {
   it('blocked outranks awake — an agent holding failed work is the thing being looked for', () => {
     expect(agentState(agent('ava', { awake: true, location: 'r1' }), new Set(['ava']), 'r1')).toBe('blocked');
   });
-  it('awake AND located here is working; awake elsewhere is idle', () => {
-    expect(agentState(agent('ava', { awake: true, location: 'r1' }), new Set(), 'r1')).toBe('working');
-    expect(agentState(agent('ava', { awake: true, location: 'r1' }), new Set(), 'r2')).toBe('idle');
+  it('active AND located here is working; active elsewhere is idle', () => {
+    expect(agentState(agent('ava', { active: true, location: 'r1' }), new Set(), 'r1')).toBe('working');
+    expect(agentState(agent('ava', { active: true, location: 'r1' }), new Set(), 'r2')).toBe('idle');
   });
   it('asleep is idle regardless of location', () => {
-    expect(agentState(agent('ava', { awake: false, location: 'r1' }), new Set(), 'r1')).toBe('idle');
+    expect(agentState(agent('ava', { awake: false, active: false, location: 'r1' }), new Set(), 'r1')).toBe('idle');
+  });
+  // The live report: an agent whose container was up but whose last word in the
+  // room was hours old was drawn pulsing at that desk. Seated, not working.
+  it('awake but not active is idle — a container being up is not working', () => {
+    expect(agentState(agent('ava', { awake: true, active: false, location: 'r1' }), new Set(), 'r1')).toBe('idle');
+  });
+  it('blocked still outranks a stale seat', () => {
+    expect(agentState(agent('ava', { awake: true, active: false, location: 'r1' }), new Set(['ava']), 'r1')).toBe(
+      'blocked',
+    );
   });
 });
 

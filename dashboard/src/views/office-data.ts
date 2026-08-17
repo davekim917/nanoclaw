@@ -99,15 +99,20 @@ export function agentLook(id: string): Omit<OfficeAgent, 'name' | 'status'> {
  * — a breach stays loud in every room the agent is seated in.
  *
  * Otherwise the agent is `working` only in the ONE room matching its live
- * session (`location === roomKey`) while awake; every other seat it holds is
+ * session (`location === roomKey`) while `active`; every other seat it holds is
  * `idle`, even though it's awake elsewhere. An agent can be seated in several
  * rooms (see buildOfficeData) but is only ever doing something in one of them.
  * We deliberately do NOT infer `waiting` for an agent — waiting is a property
  * of an ITEM (it needs a person), never of the agent sitting next to it.
+ *
+ * `active`, NOT `awake`: awake is container liveness anywhere, so an agent
+ * whose task container happened to be up pulsed in a room it had not spoken in
+ * for hours. The seat is sticky by design (8h); the pulse is not (10m). The
+ * server owns both windows — see ObservatoryAgent.active.
  */
 export function agentState(agent: ObservatoryAgent, breachedOwners: Set<string>, roomKey: string): OfficeState {
   if (breachedOwners.has(agent.name)) return 'blocked';
-  return agent.location === roomKey && agent.awake ? 'working' : 'idle';
+  return agent.location === roomKey && agent.active ? 'working' : 'idle';
 }
 
 /** The worst state present in a room, which is the state the room shows. */

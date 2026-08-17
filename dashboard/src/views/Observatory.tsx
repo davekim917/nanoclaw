@@ -2059,14 +2059,21 @@ function AgentDrawer({
           {room ? (
             <>
               <div className="nc-agent-drawer-live">
+                {/* "live here" is a claim about NOW, so it follows the same
+                    recency gate the pulse does. A stale thread is still worth
+                    linking — it just isn't live. */}
                 {liveHere ? (
-                  liveHere.threadUrl ? (
-                    <>
-                      live here — <OutLink href={liveHere.threadUrl}>open the thread</OutLink>
-                    </>
-                  ) : (
-                    'live here — no thread recorded'
-                  )
+                  <>
+                    {agent.active ? 'live here' : 'last spoke here'}
+                    {liveHere.threadUrl ? (
+                      <>
+                        {' — '}
+                        <OutLink href={liveHere.threadUrl}>open the thread</OutLink>
+                      </>
+                    ) : (
+                      ' — no thread recorded'
+                    )}
+                  </>
                 ) : (
                   'no live thread here'
                 )}
