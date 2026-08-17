@@ -173,7 +173,7 @@ function mockData(
 }
 
 /** Click a segment of the top-bar control — the only way to a non-default view. */
-async function segment(c: HTMLElement, view: 'overview' | 'board' | 'claims' | 'schedule') {
+async function segment(c: HTMLElement, view: 'overview' | 'board') {
   await userEvent.click(c.querySelector(`.nc-of-seg-btn[data-view="${view}"]`)! as HTMLElement);
 }
 
@@ -218,17 +218,11 @@ describe('Observatory', () => {
     it('the office and the headline survive every segment — only the region below swaps', async () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      for (const [view, section] of [
-        ['board', 'board'],
-        ['claims', 'claims'],
-        ['schedule', 'schedule'],
-      ] as const) {
-        await segment(container, view);
-        expect(container.querySelector('office-map')).toBeTruthy();
-        expect(container.querySelector('.nc-of-head')).toBeTruthy();
-        expect(container.querySelector(`[data-section="${section}"]`)).toBeTruthy();
-        expect(container.querySelector('[data-section="queue"]')).toBeFalsy();
-      }
+      await segment(container, 'board');
+      expect(container.querySelector('office-map')).toBeTruthy();
+      expect(container.querySelector('.nc-of-head')).toBeTruthy();
+      expect(container.querySelector('[data-section="board"]')).toBeTruthy();
+      expect(container.querySelector('[data-section="queue"]')).toBeFalsy();
     });
 
     it('the job board carries the claims and schedule cards beneath it, two up', async () => {
@@ -254,6 +248,20 @@ describe('Observatory', () => {
       expect(map.compareDocumentPosition(board) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     });
 
+    // obs.C.12 — Claims and Schedule were segments that showed one card the job
+    // board already carries. Two segments now; nothing they owned is gone.
+    it('offers exactly two segments, and the job board still carries both cards', async () => {
+      full();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(Array.from(container.querySelectorAll('.nc-of-seg-btn')).map((b) => b.getAttribute('data-view'))).toEqual([
+        'overview',
+        'board',
+      ]);
+      await segment(container, 'board');
+      expect(container.querySelector('[data-section="claims"]')).toBeTruthy();
+      expect(container.querySelector('[data-section="schedule"]')).toBeTruthy();
+    });
+
     it('the bar states the context of the view you are on', async () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
@@ -261,8 +269,6 @@ describe('Observatory', () => {
       expect(meta()).toBe('0 agents · 1 channels');
       await segment(container, 'board');
       expect(meta()).toBe('1 unowned');
-      await segment(container, 'claims');
-      expect(meta()).toBe('1 held');
     });
   });
 
@@ -271,7 +277,9 @@ describe('Observatory', () => {
       mockData(snapshot({ claims }));
       return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
     };
-    const openClaims = async (c: HTMLElement) => segment(c, 'claims');
+    // obs.C.12 — the claims card lives under the job board now; the Claims
+    // segment that used to show it alone is gone.
+    const openClaims = async (c: HTMLElement) => segment(c, 'board');
 
     it('orders stale → parked → expiring → live, and says which need an owner', async () => {
       const { container } = withClaims([
@@ -399,7 +407,7 @@ describe('Observatory', () => {
     const open = async (me = mockAuthMe) => {
       stalledBoard();
       const { container } = render(<Observatory authMe={me} route="observatory" onRouteChange={noop} />);
-      await segment(container, 'claims');
+      await segment(container, 'board');
       return container;
     };
     const expand = async (c: HTMLElement, slug: string) => {
@@ -965,7 +973,7 @@ describe('Observatory', () => {
           : { data: { rows, degraded: false, counts: {}, assembled_at: '' } }),
       });
       const out = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await segment(out.container, 'schedule');
+      await segment(out.container, 'board');
       return out;
     };
 
@@ -1035,7 +1043,10 @@ describe('Observatory', () => {
 
     it('shows the empty state when nothing on this floor is scheduled', async () => {
       const { container } = await withRows([schedRow({ key: 'theirs', agent_group_id: 'outsider' })]);
-      expect(container.querySelector('.nc-obs-ledger-empty')!.textContent).toBe('nothing scheduled');
+      // Scoped: the job board above carries its own empty line now.
+      expect(container.querySelector('[data-section="schedule"] .nc-obs-ledger-empty')!.textContent).toBe(
+        'nothing scheduled',
+      );
       expect(container.querySelector('[data-section="schedule"] .nc-of-card-meta')!.textContent).toBe(
         'nothing scheduled',
       );
@@ -1043,7 +1054,9 @@ describe('Observatory', () => {
 
     it('says so when the endpoint itself failed, rather than claiming nothing is scheduled', async () => {
       const { container } = await withRows([], new Error('boom'));
-      expect(container.querySelector('.nc-obs-ledger-empty')!.textContent).toBe("couldn't load scheduled work");
+      expect(container.querySelector('[data-section="schedule"] .nc-obs-ledger-empty')!.textContent).toBe(
+        "couldn't load scheduled work",
+      );
     });
   });
 

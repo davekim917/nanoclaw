@@ -38,7 +38,8 @@ import { WorkgroupPicker } from './WorkgroupDashboard.js';
  *      it last worked in. Geometry is FIXED; only occupancy comes from data.
  *      Picking a room opens the room sheet and filters what is below;
  *   3. ONE content region, chosen by the segmented control in the top bar:
- *      overview (the needs-attention queue), job board, claims, schedule.
+ *      overview (the needs-attention queue) or the job board, which carries the
+ *      claims and schedule cards beneath it.
  *
  * The map is on every view on purpose — it is the product's identity, and the
  * thing the segments switch is what sits UNDER it. The segments are local
@@ -56,12 +57,18 @@ import { WorkgroupPicker } from './WorkgroupDashboard.js';
 
 const POLL_MS = 15_000;
 
-/** The segmented control. Local state — the Observatory has exactly one URL. */
+/**
+ * The segmented control. Local state — the Observatory has exactly one URL.
+ *
+ * Two segments, not four. "Claims" and "Schedule" each showed exactly the card
+ * the job board already carries beneath its table, so picking them swapped a
+ * three-card view for a one-card one and called it a different place. The cards
+ * themselves are untouched — they live under Job board, where the work they
+ * describe is.
+ */
 const VIEWS = [
   { key: 'overview', label: 'Overview' },
   { key: 'board', label: 'Job board' },
-  { key: 'claims', label: 'Claims' },
-  { key: 'schedule', label: 'Schedule' },
 ] as const;
 
 export type ObsView = (typeof VIEWS)[number]['key'];
@@ -233,11 +240,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
   const barMeta =
     view === 'board'
       ? releaseCounts(ownerFilteredItems) || 'nothing open'
-      : view === 'claims'
-        ? claimSummary(claims)
-        : view === 'schedule'
-          ? scheduleSummary(schedRows)
-          : `${agents.length} agents · ${rooms.length} channels`;
+      : `${agents.length} agents · ${rooms.length} channels`;
 
   return (
     <div className="nc-frame nc-of">
@@ -428,24 +431,6 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       />
                     </div>
                   </>
-                )}
-
-                {view === 'claims' && (
-                  <ClaimsCard
-                    claims={claims}
-                    expandedSlug={expandedClaim}
-                    onClaimClick={claimClicked}
-                    {...(assign ? { assign } : {})}
-                  />
-                )}
-
-                {view === 'schedule' && (
-                  <ScheduleCard
-                    rows={schedRows}
-                    names={personaById}
-                    failed={Boolean(schedError) && !schedData}
-                    onMutated={() => void schedMutate()}
-                  />
                 )}
               </div>
             </div>
