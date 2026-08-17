@@ -43,6 +43,10 @@ export interface OfficeAgent {
 
 export interface OfficeRoomData {
   slot: Slot;
+  /** The snapshot room this slot is showing (ObservatoryRoom.key). Carried so a
+   *  caller can join a picked SLOT back to its room; the two lists are not
+   *  index-parallel — an overflow room is skipped here but not upstream. */
+  key: string;
   label: string;
   open: number;
   state: OfficeState;
@@ -191,7 +195,7 @@ export function buildOfficeData(
       // nowhere to sit, so they stay in the list rather than overlapping.
       .slice(0, 2)
       .map((a) => ({ name: a.name, status: agentState(a, breachedOwners), avatarUrl: a.avatarUrl, ...agentLook(a.id) }));
-    out.push({ slot, label: room.name.startsWith('#') ? room.name : `#${room.name}`, open: 0, state: roomState(here, 0), agents: here });
+    out.push({ slot, key: room.key, label: room.name.startsWith('#') ? room.name : `#${room.name}`, open: 0, state: roomState(here, 0), agents: here });
   });
 
   return { rooms: out, overflow };

@@ -132,6 +132,8 @@ export function Observatory({ authMe }: ObservatoryProps) {
   const rooms = useMemo(() => sortRooms(snapshot?.rooms ?? []), [snapshot]);
   const agents = snapshot?.agents ?? [];
   const claims = useMemo(() => sortClaims(snapshot?.claims ?? []), [snapshot]);
+  // "answer in #dispatch" is only worth an anchor when #dispatch has a URL.
+  const roomLinks = useMemo(() => roomLinkIndex(rooms), [rooms]);
   const awakeCount = agents.filter((a) => a.awake).length;
 
   // The strip above the floor must count the same set every view below shows,
@@ -162,25 +164,28 @@ export function Observatory({ authMe }: ObservatoryProps) {
   // occupant would under-report the room.
   const selectedRoomAgents = useMemo(() => {
     if (!selectedRoom) return null;
-    const idx = officeData.rooms.findIndex((r) => r.slot === selectedRoom);
-    const room = officeData.rooms[idx];
-    const src = idx >= 0 ? rooms[idx] : undefined;
-    if (!room || !src) return null;
+    // Joined by room KEY, not by list position: officeData.rooms drops the
+    // overflow rooms, so the two lists stop being index-parallel the moment a
+    // floor runs out of slots — and the sheet would then show a different
+    // room's people (and their claims) under the picked room's name.
+    const room = officeData.rooms.find((r) => r.slot === selectedRoom);
+    if (!room) return null;
     // You steer WORK, not a worker. `holding` is claim slugs, so join it back
     // to the claims to get the thread each piece of work actually lives in.
     const bySlug = new Map(claims.map((c) => [c.slug, c]));
     return {
       label: room.label,
       agents: agents
-        .filter((a) => a.location === src.key)
+        .filter((a) => a.location === room.key)
         .map((a) => ({
           id: a.id,
           name: a.name,
+          avatarUrl: a.avatarUrl,
           held: a.holding.map((slug) => ({ slug, threadUrl: bySlug.get(slug)?.threadUrl ?? null })),
           state: room.agents.find((x) => x.name === a.name)?.status ?? 'idle',
         })),
     };
-  }, [selectedRoom, officeData, rooms, agents, claims]);
+  }, [selectedRoom, officeData, agents, claims]);
 
   const roomOwners = useMemo(
     () => (selectedRoomAgents ? new Set(selectedRoomAgents.agents.map((a) => a.name)) : null),
@@ -353,6 +358,13 @@ export function Observatory({ authMe }: ObservatoryProps) {
                         <li key={a.id} className={a.name === focusAgent ? 'on' : ''} data-agent={a.name}>
                           <span className="nc-of-sheet-who">
                             <i className={`nc-of-sd ${a.state}`} />
+                            {/* The same face the floor shows, so the person you
+                                clicked on the map is recognisably the person in
+                                the sheet. Absent when the bot has no avatar —
+                                a face is never invented. */}
+                            {a.avatarUrl && (
+                              <img className="nc-of-sheet-face" src={a.avatarUrl} alt="" width={20} height={20} />
+                            )}
                             {a.name}
                           </span>
                           {/* Steer is per PIECE OF WORK, not per agent: one row
@@ -403,7 +415,12 @@ export function Observatory({ authMe }: ObservatoryProps) {
                         </button>
                       )}
                     </header>
-                    <LedgerBoard items={ownerFilteredItems} slice={flowFilter} {...(assign ? { assign } : {})} />
+                    <LedgerBoard
+                      items={ownerFilteredItems}
+                      slice={flowFilter}
+                      roomLinks={roomLinks}
+                      {...(assign ? { assign } : {})}
+                    />
                   </section>
                 )}
 
@@ -414,6 +431,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       tab={jobTab}
                       onTab={setJobTab}
                       releaseState={snapshot.releaseState}
+                      roomLinks={roomLinks}
                       {...(assign ? { assign } : {})}
                     />
                     <div className="nc-of-twoup">
@@ -490,6 +508,19 @@ export function claimAgeLabel(c: ObservatoryClaim, now = Date.now()): string {
   if (c.state === 'live') return `${mag} left`;
   if (c.state === 'parked') return `parked ${mag} ago`;
   return `${mag} past deadline`;
+}
+
+/**
+ * Channel name (as release items write it, e.g. `#dispatch`) → that room's own
+ * permalink. Only rooms that HAVE one are in the index, so a lookup miss is the
+ * honest "there is nowhere to send them" and the row stays plain text.
+ */
+export function roomLinkIndex(rooms: ObservatoryRoom[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const r of rooms) {
+    if (r.permalink) out.set(r.name.replace(/^#/, '').toLowerCase(), r.permalink);
+  }
+  return out;
 }
 
 /** Link that always leaves the page safely. */
@@ -587,11 +618,13 @@ function JobBoard({
   onTab,
   releaseState,
   assign,
+  roomLinks,
   now = Date.now(),
 }: {
   items: ReleaseItem[];
   tab: JobTabKey;
   onTab: (t: JobTabKey) => void;
+  roomLinks?: Map<string, string>;
   /** Null until the watcher has published — an empty board and an ABSENT one
    *  are different facts and must never render the same sentence. */
   releaseState: ReleaseState | null;
@@ -642,7 +675,7 @@ function JobBoard({
       ) : (
         // A tab change is a new list, so the table remounts: the fold and any
         // open row belong to the slice they were opened in.
-        <ItemTable key={tab} rows={rows} now={now} {...(assign ? { assign } : {})} />
+        <ItemTable key={tab} rows={rows} now={now} {...(assign ? { assign } : {})} {...(roomLinks ? { roomLinks } : {})} />
       )}
     </section>
   );
@@ -844,14 +877,18 @@ function ItemRow({
   expanded,
   onToggle,
   assign,
+  roomLinks,
 }: {
   c: Commitment;
   now: number;
   expanded: boolean;
   onToggle: () => void;
   assign?: AssignWiring;
+  /** Channel name → room permalink; see roomLinkIndex. */
+  roomLinks?: Map<string, string>;
 }) {
   const item = c.item;
+  const roomLink = item.channel ? roomLinks?.get(item.channel.replace(/^#/, '').toLowerCase()) : undefined;
   return (
     <li
       className={`nc-obs-ledger-row ${c.state} ${item.blocksRelease ? 'blocks' : ''}`}
@@ -884,10 +921,22 @@ function ItemRow({
           {item.url && <OutLink href={item.url}>{itemLinkLabel(item.kind)}</OutLink>}
           {/* Handing a person's own item to an agent is not the move — the
               whole point of this row is that a PERSON has to answer it. It
-              says where, instead of offering to route it away. */}
+              says where, instead of offering to route it away — and takes them
+              there when the room has a permalink. The arrow belongs to the
+              link: dead text pointing nowhere is worse than a plain sentence. */}
           {item.nextMover === 'human' ? (
             <div className="nc-obs-needsyou">
-              this needs you{item.channel ? ` — answer in ${item.channel} →` : ''}
+              this needs you
+              {item.channel && roomLink ? (
+                <>
+                  {' — '}
+                  <OutLink href={roomLink}>{`answer in ${item.channel}`}</OutLink>
+                </>
+              ) : item.channel ? (
+                ` — answer in ${item.channel}`
+              ) : (
+                ''
+              )}
             </div>
           ) : (
             assign && <AssignControl item={item} wiring={assign} />
@@ -910,11 +959,13 @@ function ItemTable({
   rows,
   now,
   assign,
+  roomLinks,
   head = true,
 }: {
   rows: Commitment[];
   now: number;
   assign?: AssignWiring;
+  roomLinks?: Map<string, string>;
   /** The column header. On by default; the queue is titled by its card. */
   head?: boolean;
 }) {
@@ -943,6 +994,7 @@ function ItemTable({
             expanded={expanded === c.item.id}
             onToggle={() => setExpanded((p) => (p === c.item.id ? null : c.item.id))}
             {...(assign ? { assign } : {})}
+            {...(roomLinks ? { roomLinks } : {})}
           />
         ))}
       </ul>
@@ -967,9 +1019,11 @@ function LedgerBoard({
   now = Date.now(),
   slice = null,
   assign,
+  roomLinks,
 }: {
   items: ReleaseItem[];
   now?: number;
+  roomLinks?: Map<string, string>;
   /** Headline slice the queue is filtered to, or null for everything open. */
   slice?: FlowSlice | null;
   /** Present only for roles that may assign; absent hides the control. */
@@ -994,7 +1048,9 @@ function LedgerBoard({
       </div>
     );
   }
-  return <ItemTable rows={all} now={now} head={false} {...(assign ? { assign } : {})} />;
+  return (
+    <ItemTable rows={all} now={now} head={false} {...(assign ? { assign } : {})} {...(roomLinks ? { roomLinks } : {})} />
+  );
 }
 
 /* ─── Work claims ────────────────────────────────────────────────────────── */

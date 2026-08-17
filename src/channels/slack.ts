@@ -42,6 +42,7 @@ import {
   registerSlackWorkspaceHumans,
   slackMentionOutsideCode,
   slackPermalink,
+  slackChannelPermalink,
   normalizeSlackOrderedListContinuations,
   resolveInboundSlackIds,
   resolveSlackMentions,
@@ -511,6 +512,7 @@ for (const ws of workspaces) {
       });
       bridge.resolveChannelName = (platformId) => slackChannelDisplayName(client, platformId);
       bridge.permalink = (platformId, threadId) => slackPermalink(ws.channelType, platformId, threadId);
+      bridge.channelPermalink = (platformId) => slackChannelPermalink(ws.channelType, platformId);
       bridge.postParent = (platformId, text) => slackPostParent(client, platformId, text);
       bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>
         slackCreateThread(client, platformId, parentMessageId, title, firstMessage);

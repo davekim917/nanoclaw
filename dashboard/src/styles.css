@@ -1571,6 +1571,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   padding: 7px 9px; color: var(--ink);
   font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 12px;
 }
+.nc-sched-edit-form textarea.prompt { min-height: 40vh; resize: vertical; }
 .nc-sched-form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
 .nc-sched-form-actions button {
   padding: 0 13px; min-height: 34px; border-radius: 7px; cursor: pointer;
@@ -2103,6 +2104,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    still owns state. */
 .nc-of .nc-of-sheet-list li.on{background:rgba(35,32,27,.05); box-shadow:inset 2px 0 0 var(--accent)}
 .nc-of .nc-of-sheet-who{display:inline-flex; align-items:center; gap:7px; font-weight:600; min-width:120px}
+/* obs.C.4 — the same face the floor draws, at name scale. Round and hairlined
+   like every other avatar on the page; `flex:none` so a slow image can't shove
+   the name around as it loads. */
+.nc-of .nc-of-sheet-face{
+  width:20px; height:20px; border-radius:50%; flex:none;
+  object-fit:cover; background:var(--line); border:1px solid var(--line);
+}
 .nc-of .nc-of-sd{width:7px; height:7px; border-radius:50%; background:var(--idle); flex:none}
 .nc-of .nc-of-sd.blocked{background:var(--stop)}
 .nc-of .nc-of-sd.waiting{background:var(--warn)}

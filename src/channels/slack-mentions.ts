@@ -109,6 +109,23 @@ export function slackPermalink(channelType: string, platformId: string, threadId
   return `${base.replace(/\/+$/, '')}/archives/${channel}/p${ts.replace('.', '')}`;
 }
 
+/**
+ * Link to a Slack CHANNEL — the room itself, not a thread in it:
+ * `https://acme.slack.com/archives/C0AAA`.
+ *
+ * Separate from `slackPermalink` on purpose. That one is a THREAD link and
+ * declines a null thread id by contract; asking it for a room link therefore
+ * always returned null, which is what left the observatory's "answer in
+ * #dispatch" pointing nowhere. Same decline-rather-than-guess rule: an
+ * unregistered workspace or an unparseable platform id yields null.
+ */
+export function slackChannelPermalink(channelType: string, platformId: string): string | null {
+  const base = knownSlackBots.get(channelType)?.workspaceUrl;
+  const channel = platformId.split(':').pop();
+  if (!base || !channel) return null;
+  return `${base.replace(/\/+$/, '')}/archives/${channel}`;
+}
+
 export function getKnownSlackHumans(): ReadonlyMap<string, SlackBotIdentity[]> {
   return knownSlackHumans;
 }

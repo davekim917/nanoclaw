@@ -270,6 +270,14 @@ export interface ChannelAdapter {
   permalink?(platformId: string, threadId: string | null): string | null;
 
   /**
+   * Human-clickable URL for the CHANNEL itself, or null when one can't be
+   * built. Same rules as `permalink`, different subject: `permalink` addresses
+   * a thread and is free to decline every thread-less call, so a caller that
+   * wants the room — "answer in #dispatch" — has to ask for the room.
+   */
+  channelPermalink?(platformId: string): string | null;
+
+  /**
    * Subscribe the bot to a thread so follow-up messages route via the
    * platform's "subscribed message" path (onSubscribedMessage in Chat SDK).
    * Called by the router when a mention-sticky wiring first engages in a

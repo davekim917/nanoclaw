@@ -303,12 +303,18 @@ export function isNotARoom(platformId: string, hidden: string[]): boolean {
 
 /**
  * Channel-level permalink for a room, resolved through the adapter that owns
- * its platform. Null when the adapter is absent or has no permalink() — an
- * adapter must never fail the caller, and a fabricated URL is worse than none.
+ * its platform. Null when the adapter is absent or has no channelPermalink() —
+ * an adapter must never fail the caller, and a fabricated URL is worse than
+ * none.
+ *
+ * `channelPermalink`, NOT `permalink(platformId, null)`: `permalink` addresses
+ * a THREAD and declines a null thread id by contract (slackPermalink's own
+ * test asserts it), so asking it for a room link returned null on every room
+ * of every floor — which is why "answer in #dispatch" rendered as dead text.
  */
 export function roomPermalink(platform: string, platformId: string): string | null {
   try {
-    return getChannelAdapter(platform)?.permalink?.(platformId, null) ?? null;
+    return getChannelAdapter(platform)?.channelPermalink?.(platformId) ?? null;
   } catch {
     return null;
   }

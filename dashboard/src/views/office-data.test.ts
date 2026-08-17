@@ -26,6 +26,15 @@ describe('buildOfficeData', () => {
     expect(d.overflow).toEqual([`r${SLOTS.length}`, `r${SLOTS.length + 1}`]);
   });
 
+  it('carries each seated room its own key, so callers never join by list position', () => {
+    // Overflow is exactly when the two lists stop being index-parallel: the
+    // room at index i here is NOT the room at index i in the source list once
+    // anything has been dropped. The key is what makes the join survive it.
+    const many = Array.from({ length: SLOTS.length + 2 }, (_, i) => room(`r${i}`));
+    const d = buildOfficeData(many, []);
+    expect(d.rooms.map((r) => r.key)).toEqual(many.slice(0, SLOTS.length).map((r) => r.key));
+  });
+
   it('does not prefix a channel name that already carries its #', () => {
     expect(buildOfficeData([room('k', '#already')], []).rooms[0]!.label).toBe('#already');
   });

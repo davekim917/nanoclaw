@@ -10,6 +10,7 @@ import {
   resolveSlackMentions,
   slackMentionOutsideCode,
   slackPermalink,
+  slackChannelPermalink,
   upgradeSlackBotProfile,
   type SlackBotIdentity,
 } from './slack-mentions.js';
@@ -1013,5 +1014,27 @@ describe('slackPermalink', () => {
     expect(slackPermalink('slack-unregistered', 'slack:C0AAA', 'slack:C0AAA:1786621514.008659')).toBeNull();
     expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', null)).toBeNull();
     expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', 'slack:C0AAA:not-a-timestamp')).toBeNull();
+  });
+});
+
+describe('slackChannelPermalink', () => {
+  const CHANNEL_TYPE = 'slack-channel-permalink-test';
+
+  it('links the ROOM, which the thread builder is contractually unable to do', () => {
+    registerSlackBot(CHANNEL_TYPE, {
+      userId: 'U1',
+      username: 'bot',
+      teamId: 'T1',
+      workspaceUrl: 'https://acme.slack.com/',
+    });
+
+    expect(slackChannelPermalink(CHANNEL_TYPE, 'slack:C0AAA')).toBe('https://acme.slack.com/archives/C0AAA');
+    // The reason this function exists: asking for a room link through the
+    // thread builder returns null on every room, forever.
+    expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', null)).toBeNull();
+  });
+
+  it('declines rather than guessing when the workspace is unknown', () => {
+    expect(slackChannelPermalink('slack-never-registered', 'slack:C0AAA')).toBeNull();
   });
 });

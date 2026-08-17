@@ -31,6 +31,7 @@ import {
   groupReleaseItems,
   releaseCounts,
   jobTabItems,
+  roomLinkIndex,
   upcomingScheduled,
 } from './Observatory.js';
 import { RouteNav } from './BoardShell.js';
@@ -193,6 +194,21 @@ describe('Observatory', () => {
   afterEach(() => {
     vi.clearAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  describe('roomLinkIndex', () => {
+    it('keys rooms by bare channel name and skips the ones with nowhere to go', () => {
+      const idx = roomLinkIndex([
+        room({ key: 'r1', name: '#Dispatch', permalink: 'https://acme.slack.com/archives/C0AAA' }),
+        room({ key: 'r2', name: 'lounge', permalink: 'https://acme.slack.com/archives/C0BBB' }),
+        room({ key: 'r3', name: '#quiet', permalink: null }),
+      ]);
+      // Items write '#dispatch'; rooms may or may not carry the '#'. Both
+      // sides normalise so the join is on the name, not on its punctuation.
+      expect(idx.get('dispatch')).toBe('https://acme.slack.com/archives/C0AAA');
+      expect(idx.get('lounge')).toBe('https://acme.slack.com/archives/C0BBB');
+      expect(idx.has('quiet')).toBe(false);
+    });
   });
 
   describe('the segmented views', () => {
@@ -788,9 +804,30 @@ describe('Observatory', () => {
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       await expandRow(container, 'X#3');
       expect(container.querySelector('.nc-obs-assign')).toBeFalsy();
-      expect(container.querySelector('.nc-obs-needsyou')!.textContent).toBe(
-        'this needs you — answer in #dispatch →',
+      // No room on this floor carries a permalink, so it stays a sentence —
+      // and loses the arrow, which now belongs to the link that has somewhere
+      // to go. Dead text wearing a "→" is the thing this fixed.
+      const needsYou = container.querySelector('.nc-obs-needsyou')!;
+      expect(needsYou.textContent).toBe('this needs you — answer in #dispatch');
+      expect(needsYou.querySelector('a')).toBeFalsy();
+    });
+
+    it('and takes you there when that room has a permalink', async () => {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r9', name: '#dispatch', permalink: 'https://acme.slack.com/archives/C0AAA' })],
+          agents: [agent({ id: 'ag-ava', name: 'ava' })],
+          releaseState: releaseState({
+            items: [releaseItem({ id: 'X#3', title: 'yours', nextMover: 'human', owner: 'kit', channel: '#dispatch' })],
+          }),
+        }),
       );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await expandRow(container, 'X#3');
+      const link = container.querySelector('.nc-obs-needsyou a')!;
+      expect(link.getAttribute('href')).toBe('https://acme.slack.com/archives/C0AAA');
+      expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+      expect(link.textContent).toContain('answer in #dispatch');
     });
 
     it('a member never sees the control — the server is the gate, this is the hint', async () => {
@@ -885,6 +922,23 @@ describe('Observatory', () => {
       const held = container.querySelectorAll('.nc-of-sheet-list li')[0]!.querySelectorAll('.nc-of-sheet-held-row');
       expect(held[1]!.querySelector('a')).toBeFalsy();
       expect(held[1]!.querySelector('.nc-of-sheet-nothread')!.textContent).toBe('no thread recorded');
+    });
+
+    it('shows each occupant the face the floor draws them with, and invents none', async () => {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1', name: 'general' })],
+          agents: [
+            agent({ id: 'ava', name: 'ava', location: 'r1', avatarUrl: 'https://cdn.example/ava_192.png' }),
+            agent({ id: 'kit', name: 'kit', location: 'r1' }),
+          ],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await open(container, '#general');
+      const who = container.querySelectorAll('.nc-of-sheet-who');
+      expect(who[0]!.querySelector('img')!.getAttribute('src')).toBe('https://cdn.example/ava_192.png');
+      expect(who[1]!.querySelector('img')).toBeFalsy();
     });
 
     it('an occupant holding nothing gets no steer affordance at all', async () => {
