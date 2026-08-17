@@ -1007,6 +1007,163 @@ function ItemTable({
   );
 }
 
+/* ─── The queue's own filters ────────────────────────────────────────────── */
+
+/**
+ * The two commitment states worth a chip. Five states exist; the other three
+ * (undated, due-soon, on-track) describe work behaving itself, and a chip per
+ * enum value turns a filter into a legend — the same choice the claims card
+ * made in picking two of four.
+ */
+export const QUEUE_FILTERS: { key: Commitment['state']; label: string; empty: string }[] = [
+  { key: 'breached', label: 'past its promise', empty: 'is past its promise' },
+  { key: 'unowned', label: 'nobody owns it', empty: 'is unowned' },
+];
+
+export type QueueSort = 'oldest' | 'newest';
+
+/** Distinct owners on these rows, sorted — the vocabulary of the owner select. */
+export function queueOwners(rows: Commitment[]): string[] {
+  const named = rows.map((r) => r.item.owner).filter((o): o is string => !!o);
+  return [...new Set(named)].sort((a, b) => a.localeCompare(b));
+}
+
+/** Distinct rooms on these rows, sorted — the vocabulary of the room select. */
+export function queueRooms(rows: Commitment[]): string[] {
+  const named = rows.map((r) => r.item.channel).filter((c): c is string => !!c);
+  return [...new Set(named)].sort((a, b) => a.localeCompare(b));
+}
+
+export interface QueueFilter {
+  state: Commitment['state'] | null;
+  owner: string | null;
+  room: string | null;
+}
+
+/**
+ * Rows narrowed by state, owner and room. All three COMPOSE — the answer to
+ * "what has ava let slip in #dispatch" is one list, not three unioned ones.
+ * A null on any axis means "don't narrow on this".
+ */
+export function filterQueue(rows: Commitment[], f: QueueFilter): Commitment[] {
+  const key = (s: string) => s.trim().toLowerCase().replace(/^#/, '');
+  return rows.filter(
+    (r) =>
+      (!f.state || r.state === f.state) &&
+      (!f.owner || (r.item.owner ? key(r.item.owner) === key(f.owner) : false)) &&
+      (!f.room || (r.item.channel ? key(r.item.channel) === key(f.room) : false)),
+  );
+}
+
+/**
+ * By age, oldest or newest first. Rows whose age is UNKNOWN sort last either
+ * way: an item with no `since` has no place on a time axis, and defaulting it
+ * to zero would park every undated row at one end and call that an ordering.
+ */
+export function sortQueue(rows: Commitment[], order: QueueSort): Commitment[] {
+  return [...rows].sort((a, b) => {
+    if (a.ageMs === null || b.ageMs === null) return (a.ageMs === null ? 1 : 0) - (b.ageMs === null ? 1 : 0);
+    return order === 'oldest' ? b.ageMs - a.ageMs : a.ageMs - b.ageMs;
+  });
+}
+
+/** What the queue narrowed to, in words, for the empty state. */
+export function queueFilterPhrase(f: QueueFilter): string {
+  const parts = [
+    f.state ? (QUEUE_FILTERS.find((q) => q.key === f.state)?.empty ?? `is ${f.state}`) : null,
+    f.owner ? `is owned by ${f.owner}` : null,
+    f.room ? `lives in ${f.room}` : null,
+  ].filter((p): p is string => p !== null);
+  return parts.length === 0 ? 'to show' : parts.join(' and ');
+}
+
+/** The queue's filter row — Fix C's grammar, one more select and a sort toggle. */
+function QueueFilterBar({
+  filter,
+  onFilter,
+  owners,
+  rooms,
+  sort,
+  onSort,
+}: {
+  filter: QueueFilter;
+  onFilter: (f: QueueFilter) => void;
+  owners: string[];
+  rooms: string[];
+  sort: QueueSort | null;
+  onSort: (s: QueueSort | null) => void;
+}) {
+  const active = filter.state || filter.owner || filter.room || sort;
+  return (
+    <div className="nc-of-filters" role="group" aria-label="Filter the queue">
+      {QUEUE_FILTERS.map((q) => (
+        <button
+          key={q.key}
+          type="button"
+          className={`nc-of-chip ${filter.state === q.key ? 'on' : ''}`}
+          data-queue-filter={q.key}
+          aria-pressed={filter.state === q.key}
+          onClick={() => onFilter({ ...filter, state: filter.state === q.key ? null : q.key })}
+        >
+          {q.label}
+        </button>
+      ))}
+      {owners.length > 0 && (
+        <select
+          aria-label="Filter the queue by owner"
+          value={filter.owner ?? ''}
+          onChange={(e) => onFilter({ ...filter, owner: e.target.value || null })}
+        >
+          <option value="">any owner</option>
+          {owners.map((o) => (
+            <option key={o} value={o}>
+              {o}
+            </option>
+          ))}
+        </select>
+      )}
+      {rooms.length > 0 && (
+        <select
+          aria-label="Filter the queue by room"
+          value={filter.room ?? ''}
+          onChange={(e) => onFilter({ ...filter, room: e.target.value || null })}
+        >
+          <option value="">any room</option>
+          {rooms.map((r) => (
+            <option key={r} value={r}>
+              {r}
+            </option>
+          ))}
+        </select>
+      )}
+      {/* Off by default: the ledger's own ranking — worst first, oldest failure
+          leading — is the answer to "what is stuck", and a sort that overrides
+          it is a deliberate question about time, not a default view. */}
+      <button
+        type="button"
+        className={`nc-of-chip ${sort ? 'on' : ''}`}
+        data-queue-sort={sort ?? 'off'}
+        aria-pressed={sort !== null}
+        onClick={() => onSort(sort === null ? 'oldest' : sort === 'oldest' ? 'newest' : null)}
+      >
+        {sort === 'oldest' ? 'oldest first' : sort === 'newest' ? 'newest first' : 'by age'}
+      </button>
+      {active && (
+        <button
+          type="button"
+          className="nc-of-clearfilter"
+          onClick={() => {
+            onFilter({ state: null, owner: null, room: null });
+            onSort(null);
+          }}
+        >
+          show all
+        </button>
+      )}
+    </div>
+  );
+}
+
 /**
  * The queue. Every open item as a commitment, ordered so that anything that
  * has already failed its promise is first and the oldest failure leads.
@@ -1029,6 +1186,8 @@ function LedgerBoard({
   /** Present only for roles that may assign; absent hides the control. */
   assign?: AssignWiring;
 }) {
+  const [filter, setFilter] = useState<QueueFilter>({ state: null, owner: null, room: null });
+  const [sort, setSort] = useState<QueueSort | null>(null);
   const ledger = useMemo(() => buildLedger(items, now), [items, now]);
   // Unfiltered, the queue is everything NOT moving on its own; picking
   // "moving" is the one case that widens it rather than narrowing it.
@@ -1038,6 +1197,23 @@ function LedgerBoard({
   // headline had already counted under "moving", so the board's own "62 of 70"
   // could disagree with the number of rows under it.
   const all = ledger.rows.filter((r) => (slice ? flowSlice(r) === slice : flowSlice(r) !== 'moving'));
+  // The selects offer what is in THIS slice, so a filter can never name a
+  // vocabulary the rows in front of you don't have.
+  const owners = queueOwners(all);
+  const rooms = queueRooms(all);
+  const narrowed = filterQueue(all, filter);
+  const shown = sort ? sortQueue(narrowed, sort) : narrowed;
+
+  const bar = (
+    <QueueFilterBar
+      filter={filter}
+      onFilter={setFilter}
+      owners={owners}
+      rooms={rooms}
+      sort={sort}
+      onSort={setSort}
+    />
+  );
 
   // The two coverage gaps are stated ONCE, in the headline above. Repeating
   // them here read as two separate warnings about two separate problems.
@@ -1049,7 +1225,23 @@ function LedgerBoard({
     );
   }
   return (
-    <ItemTable rows={all} now={now} head={false} {...(assign ? { assign } : {})} {...(roomLinks ? { roomLinks } : {})} />
+    <>
+      {bar}
+      {shown.length === 0 ? (
+        <div className="nc-obs-ledger-empty">{`nothing here ${queueFilterPhrase(filter)}`}</div>
+      ) : (
+        <ItemTable
+          // A filter change is a different list; the fold and any open row
+          // belong to the list they were opened in.
+          key={`${filter.state}|${filter.owner}|${filter.room}|${sort}`}
+          rows={shown}
+          now={now}
+          head={false}
+          {...(assign ? { assign } : {})}
+          {...(roomLinks ? { roomLinks } : {})}
+        />
+      )}
+    </>
   );
 }
 

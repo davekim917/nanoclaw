@@ -35,8 +35,14 @@ import {
   claimOwners,
   filterClaims,
   activeFilterPhrase,
+  queueOwners,
+  queueRooms,
+  filterQueue,
+  sortQueue,
+  queueFilterPhrase,
   upcomingScheduled,
 } from './Observatory.js';
+import type { Commitment } from './commitments.js';
 import { RouteNav } from './BoardShell.js';
 import useSWR from 'swr';
 import { assignItem, nudgeClaim } from '../lib/api.js';
@@ -245,6 +251,55 @@ describe('Observatory', () => {
       expect(activeFilterPhrase('parked', 'ava')).toBe('ava holds needs an owner');
       expect(activeFilterPhrase('stale', 'ava')).toBe('ava holds is abandoned');
       expect(activeFilterPhrase(null, null)).toBe('to show');
+    });
+  });
+
+  describe('filtering and sorting the queue', () => {
+    const row = (o: Partial<ReleaseItem>, state: Commitment['state'], ageMs: number | null): Commitment => ({
+      item: releaseItem(o),
+      state,
+      mover: o.nextMover ?? 'human',
+      msToDue: null,
+      ageMs,
+    });
+    const rows = [
+      row({ id: '1', owner: 'ava', channel: '#dispatch' }, 'breached', 300),
+      row({ id: '2', owner: 'ava', channel: '#lounge' }, 'unowned', 100),
+      row({ id: '3', owner: 'kit', channel: '#dispatch' }, 'breached', 200),
+      row({ id: '4' }, 'undated', null),
+    ];
+    const none = { state: null, owner: null, room: null };
+    const ids = (r: Commitment[]) => r.map((c) => c.item.id);
+
+    it('offers only the owners and rooms these rows actually have', () => {
+      expect(queueOwners(rows)).toEqual(['ava', 'kit']);
+      expect(queueRooms(rows)).toEqual(['#dispatch', '#lounge']);
+    });
+
+    it('composes all three axes rather than unioning them', () => {
+      expect(ids(filterQueue(rows, { ...none, state: 'breached' }))).toEqual(['1', '3']);
+      expect(ids(filterQueue(rows, { ...none, owner: 'ava' }))).toEqual(['1', '2']);
+      expect(ids(filterQueue(rows, { ...none, room: '#dispatch' }))).toEqual(['1', '3']);
+      expect(ids(filterQueue(rows, { state: 'breached', owner: 'ava', room: '#dispatch' }))).toEqual(['1']);
+      expect(filterQueue(rows, none)).toHaveLength(4);
+    });
+
+    it('matches a room with or without its hash, and an owner in any case', () => {
+      expect(ids(filterQueue(rows, { ...none, room: 'dispatch' }))).toEqual(['1', '3']);
+      expect(ids(filterQueue(rows, { ...none, owner: 'AVA' }))).toEqual(['1', '2']);
+    });
+
+    it('sorts by age both ways, and parks the ageless rows at the end either way', () => {
+      expect(ids(sortQueue(rows, 'oldest'))).toEqual(['1', '3', '2', '4']);
+      expect(ids(sortQueue(rows, 'newest'))).toEqual(['2', '3', '1', '4']);
+    });
+
+    it('names every active filter in the empty state', () => {
+      expect(queueFilterPhrase(none)).toBe('to show');
+      expect(queueFilterPhrase({ ...none, state: 'unowned' })).toBe('is unowned');
+      expect(queueFilterPhrase({ state: 'breached', owner: 'ava', room: '#dispatch' })).toBe(
+        'is past its promise and is owned by ava and lives in #dispatch',
+      );
     });
   });
 
@@ -766,6 +821,70 @@ describe('Observatory', () => {
       await userEvent.click(more as HTMLElement);
       expect(container.querySelectorAll('.nc-obs-ledger-row')).toHaveLength(20);
       expect(container.querySelector('.nc-obs-ledger-more')).toBeFalsy();
+    });
+
+    // obs.C.10 — the bar over the ranked list. The ordering itself stays the
+    // ledger's until somebody asks a question about time.
+    it('narrows to a room and back, and names the filter when nothing matches', async () => {
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'A', nextMover: 'nobody', channel: '#dispatch' }),
+              releaseItem({ id: 'B', nextMover: 'nobody', channel: '#lounge' }),
+              releaseItem({ id: 'C', nextMover: 'human', owner: 'kit', channel: '#lounge' }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const queue = container.querySelector('[data-section="queue"]')!;
+      const ids = () => Array.from(queue.querySelectorAll('.nc-obs-ledger-row')).map((r) => r.getAttribute('data-ledger-id'));
+      expect(ids()).toHaveLength(3);
+
+      await userEvent.selectOptions(queue.querySelector('[aria-label="Filter the queue by room"]')!, '#lounge');
+      expect(ids()).toEqual(['B', 'C']);
+
+      // Composed with the state chip: kit's row is not unowned, so it drops.
+      await userEvent.click(queue.querySelector('[data-queue-filter="unowned"]')! as HTMLElement);
+      expect(ids()).toEqual(['B']);
+
+      await userEvent.selectOptions(queue.querySelector('[aria-label="Filter the queue by owner"]')!, 'kit');
+      expect(queue.querySelector('.nc-obs-ledger-empty')!.textContent).toBe(
+        'nothing here is unowned and is owned by kit and lives in #lounge',
+      );
+
+      await userEvent.click(queue.querySelector('.nc-of-filters .nc-of-clearfilter')! as HTMLElement);
+      expect(ids()).toHaveLength(3);
+    });
+
+    it('the age toggle cycles oldest → newest → back to the ledger ranking', async () => {
+      const hours = (n: number) => new Date(Date.now() - n * 3600_000).toISOString();
+      mockData(
+        snapshot({
+          releaseState: releaseState({
+            items: [
+              releaseItem({ id: 'mid', nextMover: 'nobody', since: hours(5) }),
+              releaseItem({ id: 'old', nextMover: 'nobody', since: hours(9) }),
+              releaseItem({ id: 'new', nextMover: 'nobody', since: hours(1) }),
+            ],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const queue = container.querySelector('[data-section="queue"]')!;
+      const toggle = () => queue.querySelector('[data-queue-sort]')! as HTMLElement;
+      const ids = () => Array.from(queue.querySelectorAll('.nc-obs-ledger-row')).map((r) => r.getAttribute('data-ledger-id'));
+
+      expect(toggle().textContent).toBe('by age');
+      await userEvent.click(toggle());
+      expect(toggle().textContent).toBe('oldest first');
+      expect(ids()).toEqual(['old', 'mid', 'new']);
+      await userEvent.click(toggle());
+      expect(toggle().textContent).toBe('newest first');
+      expect(ids()).toEqual(['new', 'mid', 'old']);
+      await userEvent.click(toggle());
+      expect(toggle().textContent).toBe('by age');
     });
 
     it('offers no fold when the whole queue already fits', () => {
