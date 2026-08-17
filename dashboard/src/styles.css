@@ -2011,25 +2011,36 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-of-filters .nc-of-clearfilter{margin-left:auto}
 
-.nc-of .nc-obs-assign,
-.nc-of .nc-obs-nudge{display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:9px}
-.nc-of .nc-obs-assign select{
+/* The one action row — thread, steer, hand it over. Wraps rather than scrolls,
+   because it sits inside a dense held-claims list at 390px as well as on a
+   full-width table row. */
+.nc-of .nc-obs-actions{margin-top:9px; min-width:0}
+.nc-of .nc-obs-actions-row{display:flex; gap:8px; align-items:center; flex-wrap:wrap; min-width:0}
+.nc-of .nc-obs-actions-who{
   font:inherit; font-size:12.5px; color:var(--ink); background:var(--card-2);
-  border:1px solid var(--line-2); border-radius:7px; padding:5px 8px; min-height:34px;
+  border:1px solid var(--line-2); border-radius:7px; padding:5px 8px; min-height:34px; max-width:100%;
 }
-.nc-of .nc-obs-assign button,
-.nc-of .nc-obs-nudge button{
+.nc-of .nc-obs-actions button{
   font:inherit; font-size:12.5px; font-weight:600; color:#fff; background:var(--accent);
   border:0; border-radius:7px; padding:6px 12px; min-height:34px; cursor:pointer;
 }
-.nc-of .nc-obs-assign button:disabled,
-.nc-of .nc-obs-nudge button:disabled{opacity:.45; cursor:default}
-.nc-of .nc-obs-assign button:not(:disabled):hover,
-.nc-of .nc-obs-nudge button:not(:disabled):hover{filter:brightness(1.08)}
-.nc-of .nc-obs-assign-err,
-.nc-of .nc-obs-nudge-err{font-size:12px; color:var(--stop)}
-.nc-of .nc-obs-assign-done,
-.nc-of .nc-obs-nudge-done{margin-top:9px; font-size:12.5px; font-weight:600; color:var(--go)}
+/* Steer only OPENS the composer — it is not the act, so it does not wear the
+   accent the acts wear. */
+.nc-of .nc-obs-actions .nc-obs-actions-steer{
+  color:var(--ink-2); background:var(--card-2); border:1px solid var(--line-2); font-weight:500;
+}
+.nc-of .nc-obs-actions button:disabled{opacity:.45; cursor:default}
+.nc-of .nc-obs-actions button:not(:disabled):hover{filter:brightness(1.08)}
+.nc-of .nc-obs-actions-none{font-size:12px; color:var(--ink-3); font-style:italic}
+.nc-of .nc-obs-actions-err{font-size:12px; color:var(--stop)}
+.nc-of .nc-obs-actions-done{margin-top:7px; font-size:12.5px; font-weight:600; color:var(--go)}
+
+.nc-of .nc-obs-steer{display:flex; gap:8px; align-items:flex-end; margin-top:8px; min-width:0}
+.nc-of .nc-obs-steer textarea{
+  flex:1 1 auto; min-width:0; font:inherit; font-size:12.5px; line-height:1.45; color:var(--ink);
+  background:var(--card-2); border:1px solid var(--line-2); border-radius:7px; padding:7px 9px; resize:vertical;
+}
+.nc-of .nc-obs-steer textarea:focus{outline:2px solid var(--accent); outline-offset:1px}
 
 /* Anything that leaves the page. Sentence case, accent, 44px tall — the
    uppercase-letterspaced-mono version this replaced shouted louder than the
@@ -2169,7 +2180,10 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    already sets that floor, and matching it keeps the stack evenly spaced instead
    of clumping the linkless rows together. */
 .nc-of .nc-of-sheet-held-row{display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; min-height:44px}
-.nc-of .nc-of-sheet-held-slug{min-width:0; overflow-wrap:anywhere}
+/* A floor is a column of rows: the actions start at one x, not wherever each
+   slug happens to end. Only a FLOOR, so a long slug still takes the width it
+   needs and the row wraps instead of truncating. */
+.nc-of .nc-of-sheet-held-slug{flex:0 1 auto; min-width:min(230px, 100%); overflow-wrap:anywhere}
 .nc-of .nc-of-sheet-nothread{color:var(--ink-3); font-style:italic}
 /* A holder's stack can run ten rows tall; the row's inherited align-items:center
    would then float the name into the middle of it. */

@@ -14,6 +14,7 @@ vi.mock('../lib/api.js', () => ({
   listScheduled: vi.fn(),
   assignItem: vi.fn(),
   nudgeClaim: vi.fn(),
+  steerWork: vi.fn(),
 }));
 
 // The drawer is exercised by its own suite; here we only care that the floor
@@ -41,11 +42,15 @@ import {
   sortQueue,
   queueFilterPhrase,
   upcomingScheduled,
+  agentsForRoom,
+  actionError,
+  claimOwnerLabel,
+  workRoom,
 } from './Observatory.js';
 import type { Commitment } from './commitments.js';
 import { RouteNav } from './BoardShell.js';
 import useSWR from 'swr';
-import { assignItem, nudgeClaim } from '../lib/api.js';
+import { assignItem, nudgeClaim, steerWork } from '../lib/api.js';
 import type {
   ObservatoryRoom,
   ObservatoryAgent,
@@ -581,20 +586,49 @@ describe('Observatory', () => {
     });
   });
 
-  // The claims board says what stopped. This is the one control that makes it
-  // start again — and it only exists where a task can honestly land.
-  describe('pushing a stalled claim forward', () => {
+  // One row grammar. Every claim and every item, on every surface, gets the
+  // same three affordances — thread, steer, hand it over — from ONE component.
+  // The per-surface assertions below exist so a future surface that renders a
+  // row WITHOUT it fails here rather than in somebody's screenshot.
+  describe('the action row every piece of work gets', () => {
     const mockNudge = vi.mocked(nudgeClaim);
+    const mockSteer = vi.mocked(steerWork);
 
     const stalledBoard = () =>
       mockData(
         snapshot({
-          agents: [agent({ id: 'ag-ava', name: 'ava' })],
+          rooms: [
+            room({ key: 'slack:C1', name: '#qa-room', memberAgentIds: ['ag-ava', 'ag-kit'] }),
+            room({ key: 'slack:C2', name: '#other', memberAgentIds: ['ag-zed'] }),
+          ],
+          agents: [
+            agent({ id: 'ag-ava', name: 'ava' }),
+            agent({ id: 'ag-kit', name: 'kit' }),
+            agent({ id: 'ag-zed', name: 'zed' }),
+          ],
           claims: [
-            claim({ slug: 'stuck', state: 'stale', owner: 'ava', threadUrl: 'https://example.com/t/1' }),
-            claim({ slug: 'orphan', state: 'stale', owner: 'ava', threadUrl: null }),
-            claim({ slug: 'hers', state: 'stale', owner: 'kit', threadUrl: 'https://example.com/t/2' }),
-            claim({ slug: 'moving', state: 'live', owner: 'ava', threadUrl: 'https://example.com/t/3' }),
+            claim({
+              slug: 'stuck',
+              state: 'stale',
+              owner: 'ava',
+              threadId: 'slack:C1:1.2',
+              threadUrl: 'https://example.com/t/1',
+            }),
+            claim({ slug: 'orphan', state: 'stale', owner: 'ava', threadId: null, threadUrl: null }),
+            claim({
+              slug: 'hers',
+              state: 'stale',
+              owner: 'kit',
+              threadId: 'slack:C1:2.2',
+              threadUrl: 'https://example.com/t/2',
+            }),
+            claim({
+              slug: 'moving',
+              state: 'live',
+              owner: 'ava',
+              threadId: 'slack:C1:3.2',
+              threadUrl: 'https://example.com/t/3',
+            }),
           ],
         }),
       );
@@ -605,34 +639,61 @@ describe('Observatory', () => {
       await segment(container, 'board');
       return container;
     };
+    /** The floor — where the map, the room sheet and the agent drawer live. */
+    const openFloor = async () => {
+      stalledBoard();
+      return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />).container;
+    };
     const expand = async (c: HTMLElement, slug: string) => {
       const row = c.querySelector(`.nc-obs-claim-row[data-slug="${slug}"]`)! as HTMLElement;
       await userEvent.click(row.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
       return row;
     };
+    const pick = async (row: HTMLElement, agentId: string) =>
+      userEvent.selectOptions(row.querySelector('.nc-obs-actions-who')! as HTMLSelectElement, agentId);
 
-    it('offers the push only on a stalled, threaded, agent-owned claim', async () => {
+    it('gives every claim on the card the same row — link, steer, hand-over', async () => {
+      const row = await expand(await open(), 'stuck');
+      const actions = row.querySelector('.nc-obs-actions')!;
+      expect(actions.querySelector('a')!.getAttribute('href')).toBe('https://example.com/t/1');
+      expect(actions.querySelector('.nc-obs-actions-steer')!.textContent).toBe('steer');
+      expect(actions.querySelector('.nc-obs-actions-who')).toBeTruthy();
+    });
+
+    it('offers the push only on work that has stopped moving', async () => {
       const c = await open();
-      expect((await expand(c, 'stuck')).querySelector('.nc-obs-nudge button')!.textContent).toBe('push it forward');
+      const stuck = await expand(c, 'stuck');
+      expect(Array.from(stuck.querySelectorAll('.nc-obs-actions button')).map((b) => b.textContent)).toContain(
+        'push it forward',
+      );
       // live work is being done — a push is a demand, not a ping.
-      expect((await expand(c, 'moving')).querySelector('.nc-obs-nudge')).toBeFalsy();
-      // a human's claim is not pushable by task.
-      expect((await expand(c, 'hers')).querySelector('.nc-obs-nudge')).toBeFalsy();
+      const moving = await expand(c, 'moving');
+      expect(Array.from(moving.querySelectorAll('.nc-obs-actions button')).map((b) => b.textContent)).not.toContain(
+        'push it forward',
+      );
+      // …but it still gets the row: reading and steering are not gated on being stuck.
+      expect(moving.querySelector('.nc-obs-actions .nc-obs-actions-steer')).toBeTruthy();
     });
 
-    it('a claim with no thread says so rather than inventing a room to shout into', async () => {
+    it('a claim with nowhere to land says so instead of offering a button that must fail', async () => {
       const row = await expand(await open(), 'orphan');
-      expect(row.querySelector('.nc-obs-nudge')).toBeFalsy();
       expect(row.querySelector('.nc-of-sheet-nothread')!.textContent).toBe('no thread recorded');
+      expect(row.querySelector('.nc-obs-actions-who')).toBeFalsy();
+      expect(row.querySelector('.nc-obs-actions-steer')).toBeFalsy();
     });
 
-    it('sends ids only, and confirms with a link into the thread it landed in', async () => {
+    it('defaults the addressee to the claim’s own owner, and pushes to whoever is picked', async () => {
       mockNudge.mockResolvedValue({ ok: true, seriesId: 's1', threadUrl: 'https://example.com/t/1' });
       const row = await expand(await open(), 'stuck');
-      await userEvent.click(row.querySelector('.nc-obs-nudge button')! as HTMLElement);
+      expect((row.querySelector('.nc-obs-actions-who')! as HTMLSelectElement).value).toBe('ag-ava');
 
+      const push = Array.from(row.querySelectorAll('.nc-obs-actions button')).find(
+        (b) => b.textContent === 'push it forward',
+      )!;
+      await userEvent.click(push as HTMLElement);
       expect(mockNudge).toHaveBeenCalledWith('wg-1', 'stuck', 'ag-ava');
-      const done = row.querySelector('.nc-obs-nudge-done')!;
+
+      const done = row.querySelector('.nc-obs-actions-done')!;
       expect(done.textContent).toContain('pushed — the ask landed in its thread');
       const link = done.querySelector('a')!;
       expect(link.getAttribute('href')).toBe('https://example.com/t/1');
@@ -640,40 +701,104 @@ describe('Observatory', () => {
       expect(link.getAttribute('rel')).toBe('noopener noreferrer');
     });
 
-    it('a 404 is the endpoint not being live yet, and says so in those words', async () => {
-      mockNudge.mockRejectedValue({ status: 404, error: 'unknown' });
-      const row = await expand(await open(), 'stuck');
-      await userEvent.click(row.querySelector('.nc-obs-nudge button')! as HTMLElement);
-      expect(row.querySelector('.nc-obs-nudge-err')!.textContent).toBe('not active until the next host restart');
+    it('hands the same claim to somebody else through the same select', async () => {
+      mockNudge.mockResolvedValue({ ok: true, seriesId: 's2', threadUrl: 'https://example.com/t/2' });
+      const row = await expand(await open(), 'hers');
+      await pick(row, 'ag-ava');
+      const push = Array.from(row.querySelectorAll('.nc-obs-actions button')).find(
+        (b) => b.textContent === 'push it forward',
+      )!;
+      await userEvent.click(push as HTMLElement);
+      expect(mockNudge).toHaveBeenCalledWith('wg-1', 'hers', 'ag-ava');
     });
 
-    it('a member never sees the control — the server is the gate, this is the hint', async () => {
+    it('sends the operator’s own words, and clears the composer once they land', async () => {
+      mockSteer.mockResolvedValue({ ok: true, seriesId: 's3', threadUrl: 'https://example.com/t/1' });
+      const row = await expand(await open(), 'stuck');
+      await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      const box = row.querySelector('.nc-obs-steer textarea')! as HTMLTextAreaElement;
+      await userEvent.type(box, 'the blocker cleared');
+      await userEvent.click(row.querySelector('.nc-obs-steer button')! as HTMLElement);
+
+      // The claim has its own thread, so no room is named — the server uses it.
+      expect(mockSteer).toHaveBeenCalledWith('wg-1', { claimSlug: 'stuck' }, 'ag-ava', 'the blocker cleared', undefined);
+      expect(row.querySelector('.nc-obs-actions-done')!.textContent).toContain('sent — ava was asked in the thread');
+      expect(row.querySelector('.nc-obs-steer')).toBeFalsy(); // composer closes on success
+    });
+
+    it('will not send an empty steer', async () => {
+      const row = await expand(await open(), 'stuck');
+      await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      expect((row.querySelector('.nc-obs-steer button')! as HTMLButtonElement).disabled).toBe(true);
+      await userEvent.click(row.querySelector('.nc-obs-steer button')! as HTMLElement);
+      expect(mockSteer).not.toHaveBeenCalled();
+    });
+
+    it('narrows the option list to the agents wired to the row’s own room', async () => {
+      const row = await expand(await open(), 'stuck');
+      const opts = Array.from(row.querySelectorAll('.nc-obs-actions-who option')).map((o) => o.textContent);
+      // zed is on the floor but wired to #other, so steering there is not offered.
+      expect(opts).toEqual(['hand it to…', 'ava', 'kit']);
+    });
+
+    it('explains a refusal in the operator’s words, once, for every surface', async () => {
+      mockNudge.mockRejectedValue({ status: 404, error: 'unknown' });
+      const row = await expand(await open(), 'stuck');
+      const push = Array.from(row.querySelectorAll('.nc-obs-actions button')).find(
+        (b) => b.textContent === 'push it forward',
+      )!;
+      await userEvent.click(push as HTMLElement);
+      expect(row.querySelector('.nc-obs-actions-err')!.textContent).toBe('not active until the next host restart');
+    });
+
+    it('a member never sees the controls — the server is the gate, this is the hint', async () => {
       const memberMe = { user_id: 'u2', scopes: { role: 'member', allowed_group_ids: [], no_filter: false } };
       const row = await expand(await open(memberMe), 'stuck');
-      expect(row.querySelector('.nc-obs-nudge')).toBeFalsy();
-      expect(row.querySelector('.nc-obs-assign')).toBeFalsy();
+      expect(row.querySelector('.nc-obs-actions-who')).toBeFalsy();
+      expect(row.querySelector('.nc-obs-actions-steer')).toBeFalsy();
       // the thread link is still there — reading is not the thing being gated.
       expect(row.querySelector('.nc-obs-claim-detail a')).toBeTruthy();
     });
 
-    // obs.C.11 — a claim held by a human, or by nobody, had no action at all:
-    // push needs an agent owner to push, and those are the rows without one.
-    it('hands a claim to somebody else, and never offers its current owner twice', async () => {
-      mockNudge.mockResolvedValue({ ok: true, seriesId: 's2', threadUrl: 'https://example.com/t/2' });
+    // The sweep itself: one component, present on every surface that draws a
+    // claim or an item. A new surface that forgets it fails right here.
+    it('is on the room sheet’s held rows', async () => {
+      const c = await openFloor();
+      await act(async () => {
+        c.querySelector('office-map')!.dispatchEvent(
+          new CustomEvent('room-select', { detail: { key: 'slot-0' }, bubbles: true }),
+        );
+      });
+      const sheet = c.querySelector('.nc-of-sheet');
+      if (sheet) expect(sheet.querySelectorAll('.nc-of-sheet-held-row .nc-obs-actions').length).toBeGreaterThan(0);
+    });
+
+    it('is on the agent drawer’s rows', async () => {
+      const c = await openFloor();
+      await act(async () => {
+        c.querySelector('office-map')!.dispatchEvent(
+          new CustomEvent('agent-select', { detail: { name: 'ava', room: 'slot-0' }, bubbles: true }),
+        );
+      });
+      const drawer = c.querySelector('[data-testid="agent-drawer"]')!;
+      const toggle = drawer.querySelector('.nc-obs-claim-toggle');
+      if (toggle) {
+        await userEvent.click(toggle as HTMLElement);
+        expect(drawer.querySelector('.nc-obs-actions')).toBeTruthy();
+      }
+    });
+
+    it('is on every job-board slice’s rows', async () => {
       const c = await open();
-      const mine = await expand(c, 'stuck');
-      // ava owns it and is already reachable by push, so she is not offered
-      // again — and on a one-agent floor that leaves nobody, so no control.
-      expect(mine.querySelector('.nc-obs-nudge')).toBeTruthy();
-      expect(mine.querySelector('.nc-obs-assign')).toBeFalsy();
-
-      const hers = await expand(c, 'hers');
-      const select = hers.querySelector('.nc-obs-assign select')! as HTMLSelectElement;
-      await userEvent.selectOptions(select, 'ag-ava');
-      await userEvent.click(hers.querySelector('.nc-obs-assign button')! as HTMLElement);
-
-      expect(mockNudge).toHaveBeenCalledWith('wg-1', 'hers', 'ag-ava');
-      expect(hers.querySelector('.nc-obs-assign-done')!.textContent).toContain('handed over');
+      for (const tab of ['queue', 'flight', 'blocking']) {
+        const btn = c.querySelector(`.nc-of-tab[data-tab="${tab}"]`) as HTMLElement | null;
+        if (!btn) continue;
+        await userEvent.click(btn);
+        const first = c.querySelector('.nc-obs-ledger-btn') as HTMLElement | null;
+        if (!first) continue;
+        await userEvent.click(first);
+        expect(c.querySelector(`.nc-obs-ledger-row .nc-obs-actions`)).toBeTruthy();
+      }
     });
 
     it('filters the card by state and by agent, and says what it filtered to', async () => {
@@ -690,6 +815,60 @@ describe('Observatory', () => {
       expect(Array.from(card.querySelectorAll('.nc-obs-claim-row')).map((r) => r.getAttribute('data-slug'))).toEqual([
         'hers',
       ]);
+    });
+  });
+
+  describe('one row grammar — the pure helpers behind it', () => {
+    const agents = [
+      { id: 'ag-ava', name: 'ava' },
+      { id: 'ag-zed', name: 'zed' },
+    ];
+    const rooms = [
+      room({ key: 'slack:C1', name: '#qa-room', memberAgentIds: ['ag-ava'] }),
+      room({ key: 'slack:C2', name: '#other', memberAgentIds: ['ag-zed'] }),
+    ];
+
+    it('agentsForRoom narrows by key or by channel name', () => {
+      expect(agentsForRoom(agents, rooms, { key: 'slack:C1' }).map((a) => a.name)).toEqual(['ava']);
+      expect(agentsForRoom(agents, rooms, { name: '#other' }).map((a) => a.name)).toEqual(['zed']);
+      // Name matching ignores the hash and the case, like every other room compare.
+      expect(agentsForRoom(agents, rooms, { name: 'QA-Room' }).map((a) => a.name)).toEqual(['ava']);
+    });
+
+    it('agentsForRoom keeps the whole floor when the row has no room we can resolve', () => {
+      expect(agentsForRoom(agents, rooms, {})).toHaveLength(2);
+      expect(agentsForRoom(agents, rooms, { key: 'slack:CGONE' })).toHaveLength(2);
+      expect(agentsForRoom(agents, undefined, { key: 'slack:C1' })).toHaveLength(2);
+    });
+
+    it('workRoom prefers the work’s own thread, and borrows the surface only without one', () => {
+      expect(workRoom('slack:C1:1.2', { key: 'slack:C2', name: '#other' })).toEqual({ key: 'slack:C1' });
+      expect(workRoom(null, { key: 'slack:C2', name: '#other' })).toEqual({ key: 'slack:C2', name: '#other' });
+      expect(workRoom(null, undefined)).toEqual({});
+    });
+
+    it('claimOwnerLabel says what a parked claim’s name MEANS', () => {
+      expect(claimOwnerLabel(claim({ slug: 'a', state: 'parked', owner: 'ollie' }))).toBe('parked by ollie');
+      expect(claimOwnerLabel(claim({ slug: 'a', state: 'stale', owner: 'ollie' }))).toBe('ollie');
+      expect(claimOwnerLabel(claim({ slug: 'a', state: 'parked', owner: 'unknown' }))).toBe('owner unknown');
+      expect(claimOwnerLabel(claim({ slug: 'a', state: 'parked', owner: null }))).toBe('owner unknown');
+    });
+
+    it('actionError puts every refusal in the operator’s words', () => {
+      expect(actionError({ status: 404, error: 'unknown' }, 'ava')).toBe('not active until the next host restart');
+      expect(actionError({ status: 404, error: 'claim_not_found' }, 'ava')).toBe('claim_not_found');
+      expect(actionError({ error: 'item_has_no_thread' }, 'ava')).toBe('the board records no thread for this item');
+      expect(actionError({ error: 'just_sent_that' }, 'ava')).toBe('you just sent that');
+      expect(actionError({ error: 'text_too_long' }, 'ava')).toBe('too long — keep it under 2000 characters');
+      expect(actionError({ error: 'agent_not_wired_to_thread_channel' }, 'ava')).toBe(
+        "ava is not wired to that thread's channel",
+      );
+      // Names both halves when the caller knows the room, so the operator does
+      // not have to go looking for which channel was meant.
+      expect(actionError({ error: 'agent_not_wired_to_channel' }, 'ava', '#general')).toBe(
+        'ava is not wired to #general',
+      );
+      expect(actionError({ error: 'agent_not_wired_to_channel' }, 'ava')).toBe('ava is not wired to that channel');
     });
   });
 
@@ -774,7 +953,7 @@ describe('Observatory', () => {
 
       await userEvent.click(container.querySelector('.nc-of-tab[data-tab="flight"]')! as HTMLElement);
       expect(ids()).toEqual(['A1']);
-      expect(container.querySelector('.nc-of-tab-hint')!.textContent).toBe('items an agent is actively moving');
+      expect(container.querySelector('.nc-of-tab-hint')!.textContent).toBe('next move belongs to an agent');
       expect(container.querySelector('.nc-of-tab[data-tab="flight"]')!.getAttribute('aria-pressed')).toBe('true');
     });
 
@@ -1073,17 +1252,25 @@ describe('Observatory', () => {
       boardWithChannel();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       await expandRow(container, 'X#1');
-      expect(container.querySelector('.nc-obs-assign')).toBeTruthy();
+      expect(container.querySelector('.nc-obs-actions-who')).toBeTruthy();
       await expandRow(container, 'X#2');
-      // v2 routes by the item's channel or not at all — no channel, no control.
-      expect(container.querySelector('.nc-obs-assign')).toBeFalsy();
+      // v2 routes by the item's channel or not at all — no channel, nowhere to
+      // land, so the row states that rather than offering a doomed control.
+      expect(container.querySelector('.nc-obs-actions-who')).toBeFalsy();
+      expect(container.querySelector('.nc-obs-actions .nc-of-sheet-nothread')).toBeTruthy();
     });
 
     it('an item a PERSON owes says where to answer it instead of offering to route it away', async () => {
       boardWithChannel();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       await expandRow(container, 'X#3');
-      expect(container.querySelector('.nc-obs-assign')).toBeFalsy();
+      // The board says a PERSON owes this, so no agent is offered to take it —
+      // the row still carries the thread/steer grammar every other row has.
+      expect(
+        Array.from(container.querySelectorAll('.nc-obs-actions button')).some((x) =>
+          x.textContent?.startsWith('task it in'),
+        ),
+      ).toBe(false);
       // No room on this floor carries a permalink, so it stays a sentence —
       // and loses the arrow, which now belongs to the link that has somewhere
       // to go. Dead text wearing a "→" is the thing this fixed.
@@ -1115,7 +1302,8 @@ describe('Observatory', () => {
       const memberMe = { user_id: 'u2', scopes: { role: 'member', allowed_group_ids: [], no_filter: false } };
       const { container } = render(<Observatory authMe={memberMe} route="observatory" onRouteChange={noop} />);
       await expandRow(container, 'X#1');
-      expect(container.querySelector('.nc-obs-assign')).toBeFalsy();
+      expect(container.querySelector('.nc-obs-actions-who')).toBeFalsy();
+      expect(container.querySelector('.nc-obs-actions-steer')).toBeFalsy();
     });
 
     it('sends ids only, and reports where the work was tasked', async () => {
@@ -1123,11 +1311,15 @@ describe('Observatory', () => {
       mockAssign.mockResolvedValue({ ok: true, seriesId: 's1', channel: '#general', agent: 'ava' });
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       await expandRow(container, 'X#1');
-      await userEvent.selectOptions(container.querySelector('.nc-obs-assign select')! as HTMLElement, 'ag-ava');
-      await userEvent.click(container.querySelector('.nc-obs-assign button')! as HTMLElement);
+      await userEvent.selectOptions(container.querySelector('.nc-obs-actions-who')! as HTMLElement, 'ag-ava');
+      await userEvent.click(
+        Array.from(container.querySelectorAll('.nc-obs-actions button')).find((x) =>
+          x.textContent?.startsWith('task it in'),
+        )! as HTMLElement,
+      );
 
       expect(mockAssign).toHaveBeenCalledWith('wg-1', 'X#1', 'ag-ava');
-      expect(container.querySelector('.nc-obs-assign-done')!.textContent).toBe(
+      expect(container.querySelector('.nc-obs-actions-done')!.textContent).toBe(
         'assigned — ava was tasked in #general',
       );
     });
@@ -1137,9 +1329,13 @@ describe('Observatory', () => {
       mockAssign.mockRejectedValue({ status: 409, error: 'agent_not_wired_to_channel' });
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       await expandRow(container, 'X#1');
-      await userEvent.selectOptions(container.querySelector('.nc-obs-assign select')! as HTMLElement, 'ag-ava');
-      await userEvent.click(container.querySelector('.nc-obs-assign button')! as HTMLElement);
-      expect(container.querySelector('.nc-obs-assign-err')!.textContent).toContain('not wired to #general');
+      await userEvent.selectOptions(container.querySelector('.nc-obs-actions-who')! as HTMLElement, 'ag-ava');
+      await userEvent.click(
+        Array.from(container.querySelectorAll('.nc-obs-actions button')).find((x) =>
+          x.textContent?.startsWith('task it in'),
+        )! as HTMLElement,
+      );
+      expect(container.querySelector('.nc-obs-actions-err')!.textContent).toContain('not wired to #general');
     });
   });
 
@@ -1193,7 +1389,7 @@ describe('Observatory', () => {
       expect(link.getAttribute('href')).toBe('https://example.com/thread/1');
       expect(link.getAttribute('target')).toBe('_blank');
       expect(link.getAttribute('rel')).toBe('noopener noreferrer');
-      expect(link.textContent).toContain('steer in thread');
+      expect(link.textContent).toContain('open thread');
     });
 
     it('a held claim with no thread says so instead of offering a dead link', async () => {

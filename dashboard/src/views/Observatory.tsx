@@ -20,7 +20,7 @@ import { relAge } from '../lib/derive.js';
 import { type BoardRoute } from './BoardShell.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildLedger, classify, dueLabel, type Commitment } from './commitments.js';
-import { assignItem, nudgeClaim } from '../lib/api.js';
+import { assignItem, nudgeClaim, steerWork } from '../lib/api.js';
 import { OfficeMap } from './OfficeMap.js';
 import { buildOfficeData, agentState } from './office-data.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
@@ -216,13 +216,18 @@ export function Observatory({ authMe }: ObservatoryProps) {
     const bySlug = new Map(claims.map((c) => [c.slug, c]));
     return {
       label: room.label,
+      key: room.key,
       agents: agents
         .filter((a) => a.location === room.key)
         .map((a) => ({
           id: a.id,
           name: a.name,
           avatarUrl: a.avatarUrl,
-          held: a.holding.map((slug) => ({ slug, threadUrl: bySlug.get(slug)?.threadUrl ?? null })),
+          held: a.holding.map((slug) => ({
+            slug,
+            threadId: bySlug.get(slug)?.threadId ?? null,
+            threadUrl: bySlug.get(slug)?.threadUrl ?? null,
+          })),
           state: room.agents.find((x) => x.name === a.name)?.status ?? 'idle',
         })),
     };
@@ -289,7 +294,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
 
   const assign =
     authMe.scopes.role !== 'member' && selectedId
-      ? { workgroupId: selectedId, agents: agents.map((a) => ({ id: a.id, name: a.name })) }
+      ? { workgroupId: selectedId, agents: agents.map((a) => ({ id: a.id, name: a.name })), rooms }
       : undefined;
 
   // The right of the bar states the context of the view you are ON, not a
@@ -498,7 +503,18 @@ export function Observatory({ authMe }: ObservatoryProps) {
                           ) : (
                             <div className="nc-of-sheet-held">
                               {a.held.map((h) => (
-                                <HeldRow key={h.slug} slug={h.slug} threadUrl={h.threadUrl} />
+                                <HeldRow
+                                  key={h.slug}
+                                  slug={h.slug}
+                                  threadId={h.threadId}
+                                  threadUrl={h.threadUrl}
+                                  ownerAgent={a.id}
+                                  room={{
+                                    key: selectedRoomAgents.key,
+                                    name: selectedRoomAgents.label,
+                                  }}
+                                  {...(assign ? { assign } : {})}
+                                />
                               ))}
                             </div>
                           )}
@@ -665,19 +681,37 @@ function OutLink({ href, children }: { href: string; children: string }) {
 }
 
 /**
- * One held-claim row: slug, and a link into its thread when there is one.
- * Shared by the room sheet and the agent drawer — the answer to "what is
- * this piece of work and where do I steer it" never changes shape.
+ * One held-claim row: slug, then the same action row every other claim gets.
+ * Shared by the room sheet and the agent drawer — the answer to "what is this
+ * piece of work and where do I steer it" never changes shape, and a claim
+ * being HEALTHY is not a reason to be able to do less to it than a stuck one.
  */
-function HeldRow({ slug, threadUrl }: { slug: string; threadUrl: string | null }) {
+function HeldRow({
+  slug,
+  threadId,
+  threadUrl,
+  ownerAgent,
+  room,
+  assign,
+}: {
+  slug: string;
+  threadId: string | null;
+  threadUrl: string | null;
+  ownerAgent: string | null;
+  /** The room this row is being VIEWED in — see workRoom. */
+  room?: { key?: string | null; name?: string | null };
+  assign?: AssignWiring;
+}) {
   return (
     <div className="nc-of-sheet-held-row">
       <span className="nc-of-sheet-held-slug">{slug}</span>
-      {threadUrl ? (
-        <OutLink href={threadUrl}>steer in thread</OutLink>
-      ) : (
-        <span className="nc-of-sheet-nothread">no thread recorded</span>
-      )}
+      <WorkActions
+        target={{ kind: 'claim', slug, stuck: false }}
+        threadUrl={threadUrl}
+        room={workRoom(threadId, room)}
+        ownerAgent={ownerAgent}
+        {...(assign ? { wiring: assign } : {})}
+      />
     </div>
   );
 }
@@ -742,7 +776,7 @@ export type JobTabKey = 'queue' | 'flight' | 'blocking';
  */
 export const JOB_TABS: { key: JobTabKey; label: string; hint: string }[] = [
   { key: 'queue', label: 'Queue', hint: 'unclaimed and claimed work, newest promise first' },
-  { key: 'flight', label: 'In flight', hint: 'items an agent is actively moving' },
+  { key: 'flight', label: 'In flight', hint: 'next move belongs to an agent' },
   { key: 'blocking', label: 'Blocks release', hint: 'nothing ships past these' },
 ];
 
@@ -961,57 +995,245 @@ const LEDGER_FIRST_PAGE = 15;
 interface AssignWiring {
   workgroupId: string;
   agents: { id: string; name: string }[];
+  /** The floor's rooms — narrows a row's option list to the agents wired there. */
+  rooms?: ObservatoryRoom[];
+}
+
+/* ─── One row grammar — thread, steer, hand it over ──────────────────────── */
+
+/**
+ * The agents that can act on a row, narrowed to the ROOM the row belongs to.
+ *
+ * Offering the whole floor on every row was offering to make an agent speak
+ * somewhere it isn't wired — the server refuses that, so the option should
+ * never have been there. A row whose room we cannot resolve (a claim with no
+ * thread, an item with no channel, a channel not on this floor) keeps the full
+ * list: narrowing on a guess would hide the only agent that can help.
+ */
+export function agentsForRoom(
+  agents: { id: string; name: string }[],
+  rooms: ObservatoryRoom[] | undefined,
+  room: { key?: string | null; name?: string | null },
+): { id: string; name: string }[] {
+  if (!rooms || rooms.length === 0) return agents;
+  const hit = room.key
+    ? rooms.find((r) => r.key === room.key)
+    : room.name
+      ? rooms.find((r) => roomNameKey(r.name) === roomNameKey(room.name!))
+      : undefined;
+  if (!hit) return agents;
+  const wired = new Set(hit.memberAgentIds);
+  return agents.filter((a) => wired.has(a.id));
 }
 
 /**
- * The assign control on one expanded row. Sends three ids; the server owns the
- * prompt, the role gate and the wiring check — a rejection comes back as its
- * error name so the operator learns WHY (not wired, no channel), not just "no".
+ * Why an action was refused, in the operator's words. Shared by every surface,
+ * because they all hit the same two endpoints — two rows must never explain the
+ * same refusal two different ways.
  */
-function AssignControl({ item, wiring }: { item: ReleaseItem; wiring: AssignWiring }) {
-  const [agentId, setAgentId] = useState('');
-  const [state, setState] = useState<{ phase: 'idle' | 'busy' | 'done' | 'error'; note?: string }>({ phase: 'idle' });
+export function actionError(e: unknown, who: string, where?: string): string {
+  const err = e as { error?: string; status?: number };
+  // These endpoints ship restart-gated: until the host restarts they simply
+  // aren't routed, and "unknown" would read as a bug in the work.
+  if (err.status === 404 && err.error !== 'claim_not_found' && err.error !== 'item_not_on_board') {
+    return 'not active until the next host restart';
+  }
+  if (err.error === 'claim_has_no_thread') return 'that claim has no thread recorded yet';
+  if (err.error === 'item_has_no_thread') return 'the board records no thread for this item';
+  if (err.error === 'recently_nudged') return 'already pushed in the last few minutes';
+  if (err.error === 'recently_assigned') return 'already assigned in the last few minutes';
+  if (err.error === 'just_sent_that') return 'you just sent that';
+  if (err.error === 'empty_text') return 'say something first';
+  if (err.error === 'text_too_long') return 'too long — keep it under 2000 characters';
+  if (err.error === 'agent_not_wired_to_thread_channel') return `${who} is not wired to that thread's channel`;
+  if (err.error === 'agent_not_wired_to_channel') return `${who} is not wired to ${where ?? 'that channel'}`;
+  return err.error ?? 'failed';
+}
 
-  if (!item.channel) return null;
-  if (state.phase === 'done') return <div className="nc-obs-assign-done">{state.note}</div>;
+/**
+ * Which room a claim's actions belong to.
+ *
+ * Its OWN thread wins whenever it has one — that is where the work actually
+ * lives, and it is the only attribution a claim file carries. A claim with no
+ * thread has no room of its own, so it borrows the one it is being LOOKED at
+ * in: steering a thread-less claim from a room opens its thread in that room,
+ * which is a human's decision about where the work belongs rather than a guess
+ * the server made. Viewed somewhere with no room either (the claims card), it
+ * stays roomless and the server refuses rather than picking.
+ */
+export function workRoom(
+  threadId: string | null,
+  surface?: { key?: string | null; name?: string | null },
+): { key?: string | null; name?: string | null } {
+  const own = claimChannelKey(threadId);
+  return own ? { key: own } : (surface ?? {});
+}
 
-  const go = async () => {
-    if (!agentId) return;
+/** What a row IS, for the one component that acts on all of them. */
+export type WorkTarget =
+  | {
+      kind: 'claim';
+      slug: string;
+      /** Only work that has stopped moving is pushable — a live claim is being done. */
+      stuck: boolean;
+    }
+  | { kind: 'item'; id: string; channel?: string | undefined; assignable: boolean };
+
+/**
+ * The action row every claim and every item gets, everywhere it renders: the
+ * link back to its thread, a composer for saying something into that thread,
+ * and the select that hands it to somebody.
+ *
+ * ONE component on purpose. These affordances used to be three near-identical
+ * controls bolted onto whichever surface last needed them, so the claims card
+ * could push work forward and the room sheet could only link at it. A row is a
+ * row wherever it is drawn.
+ *
+ * The composer is collapsed until asked for, which is what lets the same
+ * component sit in a dense held-claims list and on a full-width table row
+ * without two layouts.
+ */
+function WorkActions({
+  target,
+  threadUrl,
+  wiring,
+  room,
+  ownerAgent,
+}: {
+  target: WorkTarget;
+  threadUrl: string | null;
+  wiring?: AssignWiring;
+  /** The room this row belongs to — narrows the option list. Both fields may be null. */
+  room: { key?: string | null; name?: string | null };
+  /** The current owner as an agent id — the default addressee. Null when a human holds it. */
+  ownerAgent: string | null;
+}) {
+  const choices = wiring ? agentsForRoom(wiring.agents, wiring.rooms, room) : [];
+  const [agentId, setAgentId] = useState(
+    ownerAgent && choices.some((a) => a.id === ownerAgent) ? ownerAgent : '',
+  );
+  const [composing, setComposing] = useState(false);
+  const [text, setText] = useState('');
+  const [state, setState] = useState<{ phase: 'idle' | 'busy' | 'done' | 'error'; note?: string; url?: string }>({
+    phase: 'idle',
+  });
+
+  const who = choices.find((a) => a.id === agentId)?.name ?? 'that agent';
+  const busy = state.phase === 'busy';
+
+  // Somewhere for the ask to LAND: the work's own thread, or a room named by
+  // the surface it is being viewed in (which is what lets the server open one).
+  // Neither means no action is offered at all — a button whose only outcome is
+  // the server refusing it is worse than the honest empty state beside it.
+  const canLand = Boolean(threadUrl) || Boolean(room.name);
+
+  const primary =
+    target.kind === 'claim'
+      ? target.stuck
+        ? { label: 'push it forward', busyLabel: 'pushing…' }
+        : null
+      : target.assignable && target.channel
+        ? { label: `task it in ${target.channel}`, busyLabel: 'assigning…' }
+        : null;
+
+  const runPrimary = async () => {
+    if (!wiring || !agentId) return;
     setState({ phase: 'busy' });
     try {
-      const r = await assignItem(wiring.workgroupId, item.id, agentId);
-      setState({ phase: 'done', note: `assigned — ${r.agent} was tasked in ${r.channel}` });
+      if (target.kind === 'claim') {
+        const r = await nudgeClaim(wiring.workgroupId, target.slug, agentId);
+        setState({ phase: 'done', note: 'pushed — the ask landed in its thread', ...(r.threadUrl ? { url: r.threadUrl } : {}) });
+      } else {
+        const r = await assignItem(wiring.workgroupId, target.id, agentId);
+        setState({ phase: 'done', note: `assigned — ${r.agent} was tasked in ${r.channel}` });
+      }
     } catch (e) {
-      const err = e as { error?: string; status?: number };
-      const why =
-        err.error === 'agent_not_wired_to_channel'
-          ? `that agent is not wired to ${item.channel}`
-          : err.error === 'recently_assigned'
-            ? 'already assigned in the last few minutes'
-            : (err.error ?? 'failed');
-      setState({ phase: 'error', note: why });
+      setState({ phase: 'error', note: actionError(e, who, target.kind === 'item' ? target.channel : undefined) });
+    }
+  };
+
+  const send = async () => {
+    if (!wiring || !agentId || !text.trim()) return;
+    setState({ phase: 'busy' });
+    try {
+      const where = target.kind === 'claim' ? { claimSlug: target.slug } : { itemId: target.id };
+      const r = await steerWork(wiring.workgroupId, where, agentId, text.trim(), room.name ?? undefined);
+      setText('');
+      setComposing(false);
+      setState({ phase: 'done', note: `sent — ${who} was asked in the thread`, ...(r.threadUrl ? { url: r.threadUrl } : {}) });
+    } catch (e) {
+      setState({ phase: 'error', note: actionError(e, who, room.name ?? undefined) });
     }
   };
 
   return (
-    <div className="nc-obs-assign">
-      <select
-        aria-label="Assign to agent"
-        value={agentId}
-        onChange={(e) => setAgentId(e.target.value)}
-        disabled={state.phase === 'busy'}
-      >
-        <option value="">assign to…</option>
-        {wiring.agents.map((a) => (
-          <option key={a.id} value={a.id}>
-            {a.name}
-          </option>
-        ))}
-      </select>
-      <button type="button" onClick={go} disabled={!agentId || state.phase === 'busy'}>
-        {state.phase === 'busy' ? 'assigning…' : `task it in ${item.channel}`}
-      </button>
-      {state.phase === 'error' && <span className="nc-obs-assign-err">{state.note}</span>}
+    <div className="nc-obs-actions" data-actions={target.kind}>
+      <div className="nc-obs-actions-row">
+        {threadUrl ? (
+          <OutLink href={threadUrl}>open thread</OutLink>
+        ) : (
+          <span className="nc-of-sheet-nothread">no thread recorded</span>
+        )}
+        {wiring &&
+          canLand &&
+          (choices.length === 0 ? (
+            <span className="nc-obs-actions-none">no agent is wired to this room</span>
+          ) : (
+            <>
+              <select
+                aria-label="Agent for this work"
+                className="nc-obs-actions-who"
+                value={agentId}
+                onChange={(e) => setAgentId(e.target.value)}
+                disabled={busy}
+              >
+                <option value="">hand it to…</option>
+                {choices.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="nc-obs-actions-steer"
+                aria-expanded={composing}
+                onClick={() => setComposing((c) => !c)}
+                disabled={!agentId || busy}
+              >
+                steer
+              </button>
+              {primary && (
+                <button type="button" onClick={runPrimary} disabled={!agentId || busy}>
+                  {busy ? primary.busyLabel : primary.label}
+                </button>
+              )}
+            </>
+          ))}
+      </div>
+      {composing && (
+        <div className="nc-obs-steer">
+          <textarea
+            aria-label="Steer message"
+            rows={2}
+            maxLength={2000}
+            placeholder={`say something to ${who}…`}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            disabled={busy}
+          />
+          <button type="button" onClick={send} disabled={!text.trim() || busy}>
+            {busy ? 'sending…' : 'send'}
+          </button>
+        </div>
+      )}
+      {state.phase === 'done' && (
+        <div className="nc-obs-actions-done">
+          {state.note}
+          {state.url ? <> — <OutLink href={state.url}>open thread</OutLink></> : null}
+        </div>
+      )}
+      {state.phase === 'error' && <span className="nc-obs-actions-err">{state.note}</span>}
     </div>
   );
 }
@@ -1074,7 +1296,7 @@ function ItemRow({
               says where, instead of offering to route it away — and takes them
               there when the room has a permalink. The arrow belongs to the
               link: dead text pointing nowhere is worse than a plain sentence. */}
-          {item.nextMover === 'human' ? (
+          {item.nextMover === 'human' && (
             <div className="nc-obs-needsyou">
               this needs you
               {item.channel && roomLink ? (
@@ -1088,9 +1310,22 @@ function ItemRow({
                 ''
               )}
             </div>
-          ) : (
-            assign && <AssignControl item={item} wiring={assign} />
           )}
+          {/* The same actions every other row gets. An item the board says a
+              PERSON must answer still gets a thread link and a composer — it
+              just isn't offered an agent to route it away to. */}
+          <WorkActions
+            target={{
+              kind: 'item',
+              id: item.id,
+              channel: item.channel,
+              assignable: item.nextMover !== 'human',
+            }}
+            threadUrl={null}
+            room={{ name: item.channel ?? null }}
+            ownerAgent={null}
+            {...(assign ? { wiring: assign } : {})}
+          />
         </div>
       )}
     </li>
@@ -1527,140 +1762,17 @@ function claimTone(c: ObservatoryClaim): string {
 }
 
 /**
- * The push control on one expanded claim. Sends three ids; the server composes
- * the demand from the claim file and routes it into the claim's OWN thread.
- *
- * Rendered only for a claim that has stopped moving, has a thread to push into,
- * and is owned by an agent — a human's claim is not pushable by task, and a
- * claim with no thread has nowhere honest to land (the cure is `claim.sh
- * thread`, upstream).
+ * The owner cell. A parked claim carries the name of whoever PUT IT DOWN, not
+ * of anyone currently working it — and the row already says "needs an owner"
+ * a few pixels away. A bare name in that position read as the current owner
+ * and flatly contradicted the tag beside it, so say what the name means.
  */
-/**
- * Why the push was refused, in the operator's words. Shared by both controls on
- * a claim row — they hit the same endpoint, so they must never explain the same
- * refusal two different ways.
- */
-function nudgeError(e: unknown, who: string): string {
-  const err = e as { error?: string; status?: number };
-  // The endpoint ships restart-gated: until the host restarts it simply
-  // isn't routed, and "unknown" would read as a bug in the claim.
-  if (err.status === 404 && err.error !== 'claim_not_found') return 'not active until the next host restart';
-  if (err.error === 'claim_has_no_thread') return 'that claim has no thread recorded yet';
-  if (err.error === 'recently_nudged') return 'already pushed in the last few minutes';
-  if (err.error === 'agent_not_wired_to_thread_channel') return `${who} is not wired to that thread's channel`;
-  return err.error ?? 'failed';
+export function claimOwnerLabel(c: ObservatoryClaim): string {
+  const named = c.owner && c.owner !== 'unknown' ? c.owner : null;
+  if (!named) return 'owner unknown';
+  return c.state === 'parked' ? `parked by ${named}` : named;
 }
 
-function NudgeControl({
-  claim,
-  workgroupId,
-  agentGroupId,
-}: {
-  claim: ObservatoryClaim;
-  workgroupId: string;
-  agentGroupId: string;
-}) {
-  const [state, setState] = useState<{ phase: 'idle' | 'busy' | 'done' | 'error'; note?: string; url?: string }>({
-    phase: 'idle',
-  });
-
-  if (state.phase === 'done') {
-    return (
-      <div className="nc-obs-nudge-done">
-        pushed — the ask landed in its thread →{' '}
-        {state.url ? <OutLink href={state.url}>open thread</OutLink> : null}
-      </div>
-    );
-  }
-
-  const go = async () => {
-    setState({ phase: 'busy' });
-    try {
-      const r = await nudgeClaim(workgroupId, claim.slug, agentGroupId);
-      setState({ phase: 'done', ...(r.threadUrl ? { url: r.threadUrl } : {}) });
-    } catch (e) {
-      setState({ phase: 'error', note: nudgeError(e, claim.owner ?? 'that agent') });
-    }
-  };
-
-  return (
-    <div className="nc-obs-nudge">
-      <button type="button" onClick={go} disabled={state.phase === 'busy'}>
-        {state.phase === 'busy' ? 'pushing…' : 'push it forward'}
-      </button>
-      {state.phase === 'error' && <span className="nc-obs-nudge-err">{state.note}</span>}
-    </div>
-  );
-}
-
-/**
- * Hand a claim to an agent that is NOT its current owner.
- *
- * Same endpoint as the push button, because handing work over and demanding it
- * move are the same act with a different addressee — the server composes the
- * demand from the claim file either way, and the client still sends nothing but
- * three ids. This is the only control a claim owned by a HUMAN, or by nobody,
- * has ever had: push-it-forward needs an agent owner to push, and those rows
- * are exactly the ones with no owner to push.
- */
-function ClaimAssignControl({
-  claim,
-  wiring,
-  exclude,
-}: {
-  claim: ObservatoryClaim;
-  wiring: AssignWiring;
-  /** The current owner's agent id — already reachable via push, so not offered twice. */
-  exclude: string | null;
-}) {
-  const [agentId, setAgentId] = useState('');
-  const [state, setState] = useState<{ phase: 'idle' | 'busy' | 'done' | 'error'; note?: string; url?: string }>({
-    phase: 'idle',
-  });
-
-  const choices = wiring.agents.filter((a) => a.id !== exclude);
-  if (choices.length === 0) return null;
-  if (state.phase === 'done') {
-    return (
-      <div className="nc-obs-assign-done">
-        handed over — the ask landed in its thread {state.url ? <OutLink href={state.url}>open thread</OutLink> : null}
-      </div>
-    );
-  }
-
-  const go = async () => {
-    if (!agentId) return;
-    setState({ phase: 'busy' });
-    try {
-      const r = await nudgeClaim(wiring.workgroupId, claim.slug, agentId);
-      setState({ phase: 'done', ...(r.threadUrl ? { url: r.threadUrl } : {}) });
-    } catch (e) {
-      setState({ phase: 'error', note: nudgeError(e, choices.find((a) => a.id === agentId)?.name ?? 'that agent') });
-    }
-  };
-
-  return (
-    <div className="nc-obs-assign">
-      <select
-        aria-label="Hand this claim to an agent"
-        value={agentId}
-        onChange={(e) => setAgentId(e.target.value)}
-        disabled={state.phase === 'busy'}
-      >
-        <option value="">hand it to…</option>
-        {choices.map((a) => (
-          <option key={a.id} value={a.id}>
-            {a.name}
-          </option>
-        ))}
-      </select>
-      <button type="button" onClick={go} disabled={!agentId || state.phase === 'busy'}>
-        {state.phase === 'busy' ? 'handing over…' : 'ask them in the thread'}
-      </button>
-      {state.phase === 'error' && <span className="nc-obs-assign-err">{state.note}</span>}
-    </div>
-  );
-}
 
 /** The claim's owner, as an agent id — null when a human (or nobody known) holds it. */
 function ownerAgentId(claim: ObservatoryClaim, agents: { id: string; name: string }[]): string | null {
@@ -1679,11 +1791,14 @@ function ClaimRow({
   c,
   expanded,
   onToggle,
+  room,
   assign,
 }: {
   c: ObservatoryClaim;
   expanded: boolean;
   onToggle: () => void;
+  /** The room this row is being VIEWED in — see workRoom. */
+  room?: { key?: string | null; name?: string | null };
   assign?: AssignWiring;
 }) {
   // Only work that has stopped moving is pushable — a live claim is being
@@ -1699,27 +1814,20 @@ function ClaimRow({
           {c.escalated && <span className="nc-obs-claim-tag">escalated in channel</span>}
         </span>
         <span className="nc-obs-claim-owner">
-          {c.owner && c.owner !== 'unknown' ? c.owner : <em>owner unknown</em>}
+          {c.owner && c.owner !== 'unknown' ? claimOwnerLabel(c) : <em>owner unknown</em>}
         </span>
         <span className={`nc-obs-claim-age ${claimTone(c)}`}>{claimAgeLabel(c)}</span>
       </button>
       {expanded && (
         <div className="nc-obs-claim-detail">
           {c.note && <div className="nc-obs-claim-note">{c.note}</div>}
-          {c.threadUrl ? (
-            <OutLink href={c.threadUrl}>open thread</OutLink>
-          ) : (
-            <span className="nc-of-sheet-nothread">no thread recorded</span>
-          )}
-          {/* Push demands the CURRENT owner move it; hand-over asks somebody
-              else to. Both need a thread — the server has nowhere honest to
-              land the ask without one. */}
-          {assign && stuck && c.threadUrl && (
-            <>
-              {ownerAgent && <NudgeControl claim={c} workgroupId={assign.workgroupId} agentGroupId={ownerAgent} />}
-              <ClaimAssignControl claim={c} wiring={assign} exclude={ownerAgent} />
-            </>
-          )}
+          <WorkActions
+            target={{ kind: 'claim', slug: c.slug, stuck }}
+            threadUrl={c.threadUrl}
+            room={workRoom(c.threadId, room)}
+            ownerAgent={ownerAgent}
+            {...(assign ? { wiring: assign } : {})}
+          />
         </div>
       )}
     </li>
@@ -1862,7 +1970,10 @@ function AgentDrawer({
   const room = rooms.find((r) => r.key === roomKey) ?? null;
   const roomName = room ? (room.name.startsWith('#') ? room.name : `#${room.name}`) : null;
   const roomLink = room ? roomLinks.get(roomNameKey(room.name)) : undefined;
-  const status = agentState(agent, breachedOwners);
+  // Room-scoped, like everything else in this drawer: an agent is only
+  // "working" in the one room its live session points at. No room resolved →
+  // not seated on the floor, which agentState reads as idle unless blocked.
+  const status = agentState(agent, breachedOwners, roomKey ?? '');
 
   // The agent's actual live activity in THIS room — null the moment it
   // points anywhere else, however active that elsewhere is.
@@ -1956,7 +2067,15 @@ function AgentDrawer({
               {healthyHere.length > 0 && (
                 <div className="nc-of-sheet-held">
                   {healthyHere.map((c) => (
-                    <HeldRow key={c.slug} slug={c.slug} threadUrl={c.threadUrl} />
+                    <HeldRow
+                      key={c.slug}
+                      slug={c.slug}
+                      threadId={c.threadId}
+                      threadUrl={c.threadUrl}
+                      ownerAgent={agent.id}
+                      room={{ key: roomKey, name: room?.name ?? null }}
+                      {...(assign ? { assign } : {})}
+                    />
                   ))}
                 </div>
               )}
@@ -1980,6 +2099,7 @@ function AgentDrawer({
                       c={c}
                       expanded={expandedSlug === c.slug}
                       onToggle={() => setExpandedSlug((p) => (p === c.slug ? null : c.slug))}
+                      room={{ key: roomKey, name: room?.name ?? null }}
                       {...(assign ? { assign } : {})}
                     />
                   ))}
@@ -2002,7 +2122,15 @@ function AgentDrawer({
             {healthyElsewhere.length > 0 && (
               <div className="nc-of-sheet-held">
                 {healthyElsewhere.map((c) => (
-                  <HeldRow key={c.slug} slug={c.slug} threadUrl={c.threadUrl} />
+                  <HeldRow
+                    key={c.slug}
+                    slug={c.slug}
+                    threadId={c.threadId}
+                    threadUrl={c.threadUrl}
+                    ownerAgent={agent.id}
+                    room={{ key: roomKey, name: room?.name ?? null }}
+                    {...(assign ? { assign } : {})}
+                  />
                 ))}
               </div>
             )}
@@ -2014,6 +2142,7 @@ function AgentDrawer({
                     c={c}
                     expanded={expandedSlug === c.slug}
                     onToggle={() => setExpandedSlug((p) => (p === c.slug ? null : c.slug))}
+                    room={{ key: roomKey, name: room?.name ?? null }}
                     {...(assign ? { assign } : {})}
                   />
                 ))}

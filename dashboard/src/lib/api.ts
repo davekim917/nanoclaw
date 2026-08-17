@@ -603,6 +603,29 @@ export async function nudgeClaim(
   });
 }
 
+/**
+ * Say something, in the operator's own words, into the thread a piece of work
+ * lives in. Nudge's inverse: nudge sends ids only and the server writes the
+ * ask, steer carries TEXT the person typed. Everything else is nudge's shape —
+ * one-shot task, the work's own thread, the same role gate.
+ *
+ * `channel` is only read when a claim has no thread yet, and only then does the
+ * server open one; without it that case is refused rather than guessed at.
+ */
+export async function steerWork(
+  workgroupId: string,
+  target: { claimSlug: string } | { itemId: string },
+  agentGroupId: string,
+  text: string,
+  channel?: string,
+): Promise<{ ok: boolean; seriesId: string | null; threadUrl: string | null; threadCreated?: boolean }> {
+  return apiFetch('/dashboard/api/observatory/steer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workgroupId, agentGroupId, text, ...target, ...(channel ? { channel } : {}) }),
+  });
+}
+
 export async function getObservatory(workgroupId: string): Promise<ObservatorySnapshot> {
   return apiFetch<ObservatorySnapshot>(
     `/dashboard/api/observatory?workgroup=${encodeURIComponent(workgroupId)}`,
