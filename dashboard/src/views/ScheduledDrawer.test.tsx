@@ -156,6 +156,17 @@ describe('ScheduledDrawer', () => {
     expect(screen.queryByTestId('reseed-warning')).toBeNull();
   });
 
+  it('clicking Edit scrolls the edit panel into view', async () => {
+    const scrollIntoView = vi.fn();
+    // jsdom has no layout engine, so Element.scrollIntoView doesn't exist by
+    // default — stub it to observe the panel calling it on mount.
+    Element.prototype.scrollIntoView = scrollIntoView;
+    await renderDrawer(detail({}, { available_verbs: ['edit'] }));
+    await userEvent.click(verbButton('edit'));
+    await screen.findByTestId('sched-edit-form');
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'nearest' });
+  });
+
   // ─── E4 — run-now near-slot residual confirm (F3) ───
 
   it('test_runnow_near_slot_confirm: a row needing force prompts the residual confirm; confirming sends force:true', async () => {

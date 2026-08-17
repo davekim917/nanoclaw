@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import useSWR from 'swr';
 import {
   cancelScheduled,
@@ -356,8 +356,18 @@ function EditForm({
   const [c, setC] = useState(row.cron ?? '');
   const isModule = row.module_owner != null;
 
+  // Edit is opened by clicking the "Edit" verb button, which is well above
+  // this panel once the prompt/history/audit sections have rendered — scroll
+  // it into view on mount so opening Edit doesn't leave the user staring at
+  // the unchanged top of the drawer.
+  const formRef = useRef<HTMLFormElement>(null);
+  useEffect(() => {
+    formRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' });
+  }, []);
+
   return (
     <form
+      ref={formRef}
       className="nc-sched-edit-form"
       data-testid="sched-edit-form"
       onSubmit={(e) => {
@@ -379,7 +389,7 @@ function EditForm({
       )}
       <label>
         Prompt
-        <textarea value={p} onChange={(e) => setP(e.target.value)} rows={4} />
+        <textarea className="prompt" value={p} onChange={(e) => setP(e.target.value)} rows={16} />
       </label>
       <label>
         Pre-task script
