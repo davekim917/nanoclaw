@@ -1515,6 +1515,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sched-field { display: contents; }
 .nc-sched-field .k { font-size: 12.5px; color: var(--ink-3); }
 .nc-sched-field .v { font-size: 12.5px; color: var(--ink); word-break: break-word; }
+.nc-sched-field .sub { grid-column: 1 / -1; font-size: 11px; color: var(--ink-3); margin-top: -2px; }
 
 .nc-sched-overrides, .nc-sched-prompt, .nc-sched-history, .nc-sched-audit { margin-bottom: 16px; }
 .nc-sched-drawer-body h4 {
@@ -1572,6 +1573,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 12px;
 }
 .nc-sched-edit-form textarea.prompt { min-height: 40vh; resize: vertical; }
+.nc-sched-cron-sub { font-size: 11px; color: var(--ink-3); font-family: inherit; text-transform: none; }
 .nc-sched-form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
 .nc-sched-form-actions button {
   padding: 0 13px; min-height: 34px; border-radius: 7px; cursor: pointer;
@@ -1774,6 +1776,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-mapcard-head{
   display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid var(--line);
 }
+/* obs.C.7 — folded away, the card is just its own header, so the rule under it
+   would be a hairline hanging off nothing. */
+.nc-of .nc-of-mapcard.collapsed .nc-of-mapcard-head{border-bottom:0}
+/* The FIRST chip takes the auto margin and carries the rest of the group to
+   the right edge with it; a second auto would split the gap and strand the two
+   controls at opposite ends of the header. */
+.nc-of .nc-of-mapcard-head .nc-of-chip + .nc-of-chip{margin-left:0}
 .nc-of .nc-of-mapcard-title{font-size:12.5px; font-weight:600; color:var(--ink)}
 .nc-of .nc-of-mapcard-hint{font-size:12px; color:var(--ink-3)}
 .nc-of .nc-of-mapcard-head .nc-of-chip{margin-left:auto}

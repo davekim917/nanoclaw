@@ -57,6 +57,9 @@ import { WorkgroupPicker } from './WorkgroupDashboard.js';
 
 const POLL_MS = 15_000;
 
+/** Whether the floor is unfolded. Absent means expanded — the default view. */
+const MAP_OPEN_KEY = 'nc-obs-map-open';
+
 /**
  * The segmented control. Local state — the Observatory has exactly one URL.
  *
@@ -120,6 +123,13 @@ export function Observatory({ authMe }: ObservatoryProps) {
   );
 
   const [view, setView] = useState<ObsView>('overview');
+  // Folding the floor away is a lasting preference, not a per-visit mood: an
+  // operator who works from the rows should not re-hide a full screen of
+  // illustration every time they open the page. Expanded unless they said so.
+  const [mapOpen, setMapOpen] = useState(() => localStorage.getItem(MAP_OPEN_KEY) !== 'false');
+  useEffect(() => {
+    localStorage.setItem(MAP_OPEN_KEY, String(mapOpen));
+  }, [mapOpen]);
   const [jobTab, setJobTab] = useState<JobTabKey>('queue');
   const [selectedRoom, setSelectedRoom] = useState<string>('');
   const [flowFilter, setFlowFilter] = useState<FlowSlice | null>(null);
@@ -295,52 +305,74 @@ export function Observatory({ authMe }: ObservatoryProps) {
                   teleport. Geometry is FIXED; only who is in which room comes
                   from data. */}
               <div className="nc-of-left">
-              <section className="nc-of-mapcard">
+              {/* Overview only. The floor is the answer to "what is going on",
+                  which is the overview's question; on the job board it was a
+                  full screen of illustration between the reader and the rows
+                  they came for. The room FILTER it sets outlives it — the sheet
+                  stays, so a board narrowed to a room still says which one. */}
+              {view === 'overview' && (
+              <section className={`nc-of-mapcard ${mapOpen ? '' : 'collapsed'}`}>
                 <div className="nc-of-mapcard-head">
                   <span className="nc-of-mapcard-title">The office</span>
-                  <span className="nc-of-mapcard-hint">drag to pan · tap a room to filter what is below</span>
-                  {selectedRoom && (
+                  {mapOpen && (
+                    <span className="nc-of-mapcard-hint">drag to pan · tap a room to filter what is below</span>
+                  )}
+                  {mapOpen && selectedRoom && (
                     <button type="button" className="nc-of-chip" onClick={closeRoom}>
                       All rooms
                     </button>
                   )}
+                  <button
+                    type="button"
+                    className="nc-of-chip nc-of-mapfold"
+                    data-map-open={mapOpen}
+                    aria-expanded={mapOpen}
+                    onClick={() => setMapOpen(!mapOpen)}
+                  >
+                    {mapOpen ? 'hide the floor' : 'show the floor'}
+                  </button>
                 </div>
-                <OfficeMap
-                  data={officeData}
-                  {...(startSlot ? { start: startSlot } : {})}
-                  selected={selectedRoom}
-                  onSelect={pickRoom}
-                  onAgentSelect={({ name, room }) => {
-                    setSelectedRoom(room);
-                    setFocusAgent(name);
-                  }}
-                  teleportTo={teleportTo}
-                />
-                <div className="nc-of-teleport">
-                  {officeData.rooms.map((r) => (
-                    <button
-                      key={r.slot}
-                      type="button"
-                      className={`nc-of-chip ${selectedRoom === r.slot ? 'on' : ''}`}
-                      onClick={() => {
-                        setTeleportTo(r.slot);
-                        pickRoom(r.slot);
+                {mapOpen && (
+                  <>
+                    <OfficeMap
+                      data={officeData}
+                      {...(startSlot ? { start: startSlot } : {})}
+                      selected={selectedRoom}
+                      onSelect={pickRoom}
+                      onAgentSelect={({ name, room }) => {
+                        setSelectedRoom(room);
+                        setFocusAgent(name);
                       }}
-                    >
-                      <i className={`nc-of-sd ${r.state}`} />
-                      {r.label}
-                    </button>
-                  ))}
-                </div>
-                {officeData.overflow.length > 0 && (
-                  // Its own line: inside the chip row this dead-end sentence sat
-                  // on the same baseline as five controls and read as one.
-                  <p className="nc-of-overflow">
-                    {officeData.overflow.length} more{' '}
-                    {officeData.overflow.length === 1 ? 'channel has' : 'channels have'} no room on this floor
-                  </p>
+                      teleportTo={teleportTo}
+                    />
+                    <div className="nc-of-teleport">
+                      {officeData.rooms.map((r) => (
+                        <button
+                          key={r.slot}
+                          type="button"
+                          className={`nc-of-chip ${selectedRoom === r.slot ? 'on' : ''}`}
+                          onClick={() => {
+                            setTeleportTo(r.slot);
+                            pickRoom(r.slot);
+                          }}
+                        >
+                          <i className={`nc-of-sd ${r.state}`} />
+                          {r.label}
+                        </button>
+                      ))}
+                    </div>
+                    {officeData.overflow.length > 0 && (
+                      // Its own line: inside the chip row this dead-end sentence sat
+                      // on the same baseline as five controls and read as one.
+                      <p className="nc-of-overflow">
+                        {officeData.overflow.length} more{' '}
+                        {officeData.overflow.length === 1 ? 'channel has' : 'channels have'} no room on this floor
+                      </p>
+                    )}
+                  </>
                 )}
               </section>
+              )}
 
               {selectedRoomAgents && (
                 <aside className="nc-of-sheet">

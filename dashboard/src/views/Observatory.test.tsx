@@ -323,14 +323,21 @@ describe('Observatory', () => {
       expect(container.querySelector('[data-section="board"]')).toBeFalsy();
     });
 
-    it('the office and the headline survive every segment — only the region below swaps', async () => {
+    // obs.C.7 — the headline is the page's fixed answer and stays. The FLOOR is
+    // the overview's own answer to "what is going on", and on the job board it
+    // was a screen of illustration between the reader and the rows.
+    it('the headline survives every segment; the office belongs to the overview', async () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       await segment(container, 'board');
-      expect(container.querySelector('office-map')).toBeTruthy();
+      expect(container.querySelector('office-map')).toBeFalsy();
+      expect(container.querySelector('.nc-of-mapcard')).toBeFalsy();
       expect(container.querySelector('.nc-of-head')).toBeTruthy();
       expect(container.querySelector('[data-section="board"]')).toBeTruthy();
       expect(container.querySelector('[data-section="queue"]')).toBeFalsy();
+
+      await segment(container, 'overview');
+      expect(container.querySelector('office-map')).toBeTruthy();
     });
 
     it('the job board carries the claims and schedule cards beneath it, two up', async () => {
@@ -345,15 +352,42 @@ describe('Observatory', () => {
       expect(table.compareDocumentPosition(twoup) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     });
 
-    it('the office comes before the content region in document order, on every view', async () => {
+    it('the office comes before the content region in document order', () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       const main = container.querySelector('.nc-obs-main')!;
       const map = container.querySelector('.nc-of-mapcard')!;
       expect(main.contains(map)).toBe(true);
-      await segment(container, 'board');
-      const board = container.querySelector('[data-section="board"]')!;
-      expect(map.compareDocumentPosition(board) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      const queue = container.querySelector('[data-section="queue"]')!;
+      expect(map.compareDocumentPosition(queue) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it('folds the floor away and remembers it, on this visit and the next', async () => {
+      full();
+      const first = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const fold = (c: HTMLElement) => c.querySelector('.nc-of-mapfold')! as HTMLElement;
+      expect(fold(first.container).textContent).toBe('hide the floor');
+
+      await userEvent.click(fold(first.container));
+      // The map and its teleport chips go together — chips that teleport a map
+      // nobody can see are controls for nothing.
+      expect(first.container.querySelector('office-map')).toBeFalsy();
+      expect(first.container.querySelector('.nc-of-teleport')).toBeFalsy();
+      // The card itself stays, so there is something left to click.
+      expect(first.container.querySelector('.nc-of-mapcard')).toBeTruthy();
+      expect(fold(first.container).textContent).toBe('show the floor');
+      first.unmount();
+
+      const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(second.container.querySelector('office-map')).toBeFalsy();
+      await userEvent.click(fold(second.container));
+      expect(second.container.querySelector('office-map')).toBeTruthy();
+      second.unmount();
+
+      // Expanded is the default a fresh browser gets.
+      localStorage.clear();
+      const third = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(third.container.querySelector('office-map')).toBeTruthy();
     });
 
     // obs.C.12 — Claims and Schedule were segments that showed one card the job
