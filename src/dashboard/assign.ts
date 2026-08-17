@@ -38,7 +38,12 @@ export function _resetAssignDedupeForTesting(): void {
   recentAssigns.clear();
 }
 
-function canAssign(userId: string, agentGroupId: string): { ok: boolean; reason?: string } {
+/**
+ * The role gate for every Observatory write that makes an agent act. Exported so
+ * nudge.ts draws the SAME line — one definition, so the two buttons can never
+ * disagree about who may point an agent at work.
+ */
+export function canAssign(userId: string, agentGroupId: string): { ok: boolean; reason?: string } {
   if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
     return { ok: true };
   }

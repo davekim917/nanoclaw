@@ -276,6 +276,27 @@ export function roomPermalink(platform: string, platformId: string): string | nu
   }
 }
 
+/**
+ * Permalink for a claim's thread. A claim's `thread_id` already encodes its
+ * channel type + channel + ts, so the adapter that owns that platform resolves
+ * it — one hop, no extra state. Exported: the claims board and the nudge write
+ * path must link to the same place.
+ */
+export function threadPermalink(threadId: string): string | null {
+  const adapter = getChannelAdapter(threadId.split(':')[0] ?? '');
+  if (!adapter?.permalink) return null;
+  try {
+    return adapter.permalink(threadPlatformId(threadId), threadId);
+  } catch {
+    return null;
+  }
+}
+
+/** '<channelType>:<channel>:<ts>' → '<channelType>:<channel>', the messaging_groups.platform_id key. */
+export function threadPlatformId(threadId: string): string {
+  return threadId.split(':').slice(0, 2).join(':');
+}
+
 function buildRooms(workgroupId: string, allowed: string[] | null, hidden: string[] = []): ObservatoryRoom[] {
   const wiringRows = getDb()
     .prepare(
@@ -485,19 +506,7 @@ export async function buildObservatoryScene(
   // Every claim carries a link back to the thread it was worked in. A claim's
   // thread_id already encodes its channel type + channel + ts, so the adapter
   // that owns that platform resolves it — one hop, no extra state.
-  const linkFor =
-    deps.resolveThreadUrl ??
-    ((threadId: string): string | null => {
-      const channelType = threadId.split(':')[0] ?? '';
-      const adapter = getChannelAdapter(channelType);
-      if (!adapter?.permalink) return null;
-      const platformId = threadId.split(':').slice(0, 2).join(':');
-      try {
-        return adapter.permalink(platformId, threadId);
-      } catch {
-        return null;
-      }
-    });
+  const linkFor = deps.resolveThreadUrl ?? threadPermalink;
   const claims: ObservatoryClaim[] = rawClaims.map((c) => ({
     ...c,
     threadUrl: c.threadId ? linkFor(c.threadId) : null,
