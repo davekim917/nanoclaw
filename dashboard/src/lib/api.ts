@@ -488,6 +488,14 @@ export interface ObservatoryAgent {
   nextTask: { title: string; at: string } | null;
   /** Bot's real Slack avatar (public slack-edge CDN URL), null when none. */
   avatarUrl: string | null;
+  /**
+   * The agent's most-recent session that carries a room — same source as
+   * `location`, but carrying a session id and thread link. Null when the
+   * agent has no room-scoped session inside the location window. A caller
+   * asking about a specific room must compare `channelKey` against it —
+   * this is not a per-room map, just "where do I currently point".
+   */
+  liveSession: { channelKey: string; sessionId: string; threadUrl: string | null; lastOutboundAt: string | null } | null;
 }
 
 export type ObservatoryClaimState = 'live' | 'expiring' | 'stale' | 'parked';

@@ -128,13 +128,13 @@ function wire(mgId: string, agentGroupId: string): void {
 function addSession(
   id: string,
   agentGroupId: string,
-  opts: { messagingGroupId?: string | null; lastOutboundAt?: string | null } = {},
+  opts: { messagingGroupId?: string | null; lastOutboundAt?: string | null; threadId?: string | null } = {},
 ): void {
   getDb()
     .prepare(
-      "INSERT INTO sessions (id, agent_group_id, messaging_group_id, status, last_outbound_at, created_at) VALUES (?, ?, ?, 'active', ?, datetime('now'))",
+      "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, last_outbound_at, created_at) VALUES (?, ?, ?, ?, 'active', ?, datetime('now'))",
     )
-    .run(id, agentGroupId, opts.messagingGroupId ?? null, opts.lastOutboundAt ?? null);
+    .run(id, agentGroupId, opts.messagingGroupId ?? null, opts.threadId ?? null, opts.lastOutboundAt ?? null);
 }
 
 function claimsDir(workgroupId: string): string {
@@ -505,6 +505,69 @@ describe('buildObservatoryScene', () => {
     addSession('sess-quiet', 'ag-1', { lastOutboundAt: null });
     const scene = await buildObservatoryScene('wg-1', makeDeps());
     expect(scene.agents[0].lastSessionId).toBeNull();
+  });
+
+  describe('liveSession', () => {
+    it('carries the same winning session as location, plus its thread link', async () => {
+      addWorkgroup('wg-1');
+      addGroup('ag-1', 'wg-1');
+      addMessagingGroup('mg-1', 'slack', 'slack:C123');
+      const recent = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // 1h ago
+      addSession('sess-room', 'ag-1', {
+        messagingGroupId: 'mg-1',
+        lastOutboundAt: recent,
+        threadId: 'slack:C123:1.2',
+      });
+
+      const scene = await buildObservatoryScene(
+        'wg-1',
+        makeDeps({ resolveThreadUrl: (t) => `https://acme.slack.com/${t}` }),
+      );
+      expect(scene.agents[0].location).toBe('slack:C123');
+      expect(scene.agents[0].liveSession).toEqual({
+        channelKey: 'slack:C123',
+        sessionId: 'sess-room',
+        threadUrl: 'https://acme.slack.com/slack:C123:1.2',
+        lastOutboundAt: recent,
+      });
+    });
+
+    it('is null outside the 8h location window, in lockstep with location', async () => {
+      addWorkgroup('wg-1');
+      addGroup('ag-1', 'wg-1');
+      addMessagingGroup('mg-1', 'slack', 'slack:C123');
+      const old = new Date(Date.now() - 20 * 60 * 60 * 1000).toISOString(); // 20h ago
+      addSession('sess-room', 'ag-1', { messagingGroupId: 'mg-1', lastOutboundAt: old, threadId: 'slack:C123:1.2' });
+
+      const scene = await buildObservatoryScene('wg-1', makeDeps());
+      expect(scene.agents[0].location).toBeNull();
+      expect(scene.agents[0].liveSession).toBeNull();
+    });
+
+    it('threadUrl is null when the session carries no thread id, without dropping the session itself', async () => {
+      addWorkgroup('wg-1');
+      addGroup('ag-1', 'wg-1');
+      addMessagingGroup('mg-1', 'slack', 'slack:C123');
+      const recent = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      // Channel-level (shared-mode) session — no thread_id.
+      addSession('sess-room', 'ag-1', { messagingGroupId: 'mg-1', lastOutboundAt: recent, threadId: null });
+
+      const scene = await buildObservatoryScene('wg-1', makeDeps());
+      expect(scene.agents[0].liveSession).toEqual({
+        channelKey: 'slack:C123',
+        sessionId: 'sess-room',
+        threadUrl: null,
+        lastOutboundAt: recent,
+      });
+    });
+
+    it('is null when the agent has never produced outbound in any room', async () => {
+      addWorkgroup('wg-1');
+      addGroup('ag-1', 'wg-1');
+      addSession('sess-quiet', 'ag-1', { lastOutboundAt: null });
+      const scene = await buildObservatoryScene('wg-1', makeDeps());
+      expect(scene.agents[0].liveSession).toBeNull();
+    });
   });
 
   it('nextTask is always null (no cheap titled read exists yet)', async () => {

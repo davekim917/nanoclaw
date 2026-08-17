@@ -8,7 +8,8 @@ function room(key: string, name = key): ObservatoryRoom {
 function agent(id: string, o: Partial<ObservatoryAgent> = {}): ObservatoryAgent {
   return {
     id, name: id, canonicalName: id, folder: id, provider: 'claude', awake: true,
-    location: null, lastSeenAt: null, lastSessionId: null, holding: [], nextTask: null, avatarUrl: null, ...o,
+    location: null, lastSeenAt: null, lastSessionId: null, holding: [], nextTask: null, avatarUrl: null,
+    liveSession: null, ...o,
   };
 }
 

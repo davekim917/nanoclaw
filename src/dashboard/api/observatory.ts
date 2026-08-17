@@ -73,6 +73,24 @@ export interface ObservatoryAgent {
   // wire"), and reading it back out would mean opening every agent's session
   // inbound.db on every observatory poll. Wire it once a titled read exists.
   nextTask: { title: string; at: string } | null;
+  /**
+   * The agent's most-recent session that carries a room — same source and
+   * same LOCATION_WINDOW_MS gate as `location`, but carrying enough to link
+   * to the actual live thread rather than just naming the channel. Null when
+   * the agent has no room-scoped session inside the window.
+   *
+   * This is a single "where do I currently point" value, not a per-room map:
+   * a caller that wants a ROOM-SCOPED drawer must compare
+   * `liveSession.channelKey` against the room it is asking about and treat a
+   * mismatch as "no live thread here" — an agent live in #ops has no live
+   * session to show in #dispatch, however active #ops is.
+   */
+  liveSession: {
+    channelKey: string;
+    sessionId: string;
+    threadUrl: string | null;
+    lastOutboundAt: string | null;
+  } | null;
 }
 
 export interface ReleaseStateItem {
@@ -457,6 +475,9 @@ async function buildAgents(
       let mostRecentMs = -Infinity;
       let roomMs = -Infinity;
       let roomMgId: string | null = null;
+      let roomSessionId: string | null = null;
+      let roomThreadId: string | null = null;
+      let roomAt: string | null = null;
       for (const s of sessions) {
         const ms = parseUtcMs(s.last_outbound_at);
         if (ms === null) continue;
@@ -468,11 +489,27 @@ async function buildAgents(
         if (s.messaging_group_id && ms > roomMs) {
           roomMs = ms;
           roomMgId = s.messaging_group_id;
+          roomSessionId = s.id;
+          roomThreadId = s.thread_id ?? null;
+          roomAt = s.last_outbound_at ?? null;
         }
       }
 
       const location =
         roomMgId && nowMs - roomMs <= LOCATION_WINDOW_MS ? (getMessagingGroup(roomMgId)?.platform_id ?? null) : null;
+
+      // Same window and same winning session as `location` — this just also
+      // carries the thread link, so a caller doesn't have to re-derive it.
+      const linkForThread = deps.resolveThreadUrl ?? threadPermalink;
+      const liveSession =
+        location && roomSessionId
+          ? {
+              channelKey: location,
+              sessionId: roomSessionId,
+              threadUrl: roomThreadId ? linkForThread(roomThreadId) : null,
+              lastOutboundAt: roomAt,
+            }
+          : null;
 
       const provider = getContainerConfig(row.id)?.provider ?? row.agent_provider ?? '';
       const containerConfig = readContainerConfig(row.folder);
@@ -509,6 +546,7 @@ async function buildAgents(
         lastSessionId: mostRecentSessionId,
         holding,
         nextTask: null,
+        liveSession,
       };
     }),
   );
