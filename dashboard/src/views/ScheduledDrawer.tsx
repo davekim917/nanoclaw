@@ -4,6 +4,8 @@ import {
   cancelScheduled,
   editScheduled,
   getScheduledDetail,
+  listGroups,
+  listMessagingGroups,
   moveScheduled,
   moveScheduledPreview,
   pauseScheduled,
@@ -412,28 +414,47 @@ function MoveForm({
 }) {
   const [ag, setAg] = useState('');
   const [mg, setMg] = useState('');
+  // The move target must be a REAL agent group / messaging group id (§4.5 —
+  // the API 404s on an unknown one), so the SPA offers the actual options
+  // instead of free text.
+  const { data: groups } = useSWR('/dashboard/api/groups', () => listGroups());
+  const { data: messagingGroups } = useSWR('/dashboard/api/messaging-groups', () => listMessagingGroups());
   return (
     <form
       className="nc-sched-move-form"
       onSubmit={(e) => {
         e.preventDefault();
-        onPreview(ag.trim(), mg.trim());
+        onPreview(ag, mg);
       }}
     >
       <label>
         Target agent group
-        <input value={ag} onChange={(e) => setAg(e.target.value)} aria-label="Target agent group" />
+        <select value={ag} onChange={(e) => setAg(e.target.value)} aria-label="Target agent group">
+          <option value="">Select an agent group…</option>
+          {groups?.groups.map((g) => (
+            <option key={g.id} value={g.id}>
+              {g.name}
+            </option>
+          ))}
+        </select>
       </label>
       <label>
         Target messaging group
-        <input value={mg} onChange={(e) => setMg(e.target.value)} aria-label="Target messaging group" />
+        <select value={mg} onChange={(e) => setMg(e.target.value)} aria-label="Target messaging group">
+          <option value="">Select a messaging group…</option>
+          {messagingGroups?.messaging_groups.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.name}
+            </option>
+          ))}
+        </select>
       </label>
       {error && <div className="nc-sched-drawer-error" role="alert">{error}</div>}
       <div className="nc-sched-form-actions">
         <button type="button" onClick={onCancel} disabled={busy}>
           Cancel
         </button>
-        <button type="submit" disabled={busy || !ag.trim() || !mg.trim()}>
+        <button type="submit" disabled={busy || !ag || !mg}>
           Preview
         </button>
       </div>

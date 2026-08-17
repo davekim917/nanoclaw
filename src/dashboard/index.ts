@@ -19,6 +19,7 @@ function redirectTo(target: string) {
 }
 import { sessionsHandler, sessionsDetailHandler } from './api/sessions.js';
 import { groupsListHandler } from './api/groups.js';
+import { messagingGroupsListHandler } from './api/messaging-groups.js';
 import { sessionMessageHandler } from './steer.js';
 import { sessionArchiveHandler, sessionUnarchiveHandler } from './archive.js';
 import { scheduledListHandler, scheduledDetailHandler, scheduledSearchHandler } from './api/scheduled-read.js';
@@ -63,6 +64,7 @@ export function startDashboard(): void {
   register('GET', '/dashboard/api/sessions', requireAuth(sessionsHandler));
   register('GET', '/dashboard/api/sessions/:id', requireAuth(sessionsDetailHandler));
   register('GET', '/dashboard/api/groups', requireAuth(groupsListHandler));
+  register('GET', '/dashboard/api/messaging-groups', requireAuth(messagingGroupsListHandler));
   register('POST', '/dashboard/api/sessions/:id/message', requireAuth(sessionMessageHandler));
   register('POST', '/dashboard/api/sessions/:id/archive', requireAuth(sessionArchiveHandler));
   register('POST', '/dashboard/api/sessions/:id/unarchive', requireAuth(sessionUnarchiveHandler));

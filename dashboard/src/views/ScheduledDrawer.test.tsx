@@ -11,6 +11,18 @@ vi.mock('../lib/api.js', () => ({
   cancelScheduled: vi.fn().mockResolvedValue({ cancelled: true }),
   moveScheduledPreview: vi.fn(),
   moveScheduled: vi.fn().mockResolvedValue({ moved: true }),
+  listGroups: vi.fn().mockResolvedValue({
+    groups: [
+      { id: 'ag-1', name: 'Example Agent' },
+      { id: 'ag-2', name: 'Other Agent' },
+    ],
+  }),
+  listMessagingGroups: vi.fn().mockResolvedValue({
+    messaging_groups: [
+      { id: 'mg-1', name: '#general' },
+      { id: 'mg-9', name: '#other' },
+    ],
+  }),
 }));
 
 import { ScheduledDrawer } from './ScheduledDrawer.js';
@@ -171,9 +183,11 @@ describe('ScheduledDrawer', () => {
     const { rowKey } = await renderDrawer(detail({}, { available_verbs: ['move'], health: 'paused' }));
     await userEvent.click(verbButton('move'));
 
-    // Fill the move target form and request the preview.
-    await userEvent.type(screen.getByLabelText(/target agent group/i), 'ag-2');
-    await userEvent.type(screen.getByLabelText(/target messaging group/i), 'mg-9');
+    // Target pickers are dropdowns of the real agent/messaging groups, not
+    // free text — wait for the option lists to load, then select from them.
+    await screen.findByRole('option', { name: 'Other Agent' });
+    await userEvent.selectOptions(screen.getByLabelText(/target agent group/i), 'ag-2');
+    await userEvent.selectOptions(screen.getByLabelText(/target messaging group/i), 'mg-9');
     await userEvent.click(screen.getByRole('button', { name: /preview/i }));
 
     const confirm = await screen.findByTestId('move-confirm');
@@ -190,6 +204,26 @@ describe('ScheduledDrawer', () => {
       targetMessagingGroupId: 'mg-9',
       confirmedDeltaHash: 'HASH-1',
     });
+  });
+
+  it('test_move_targets_are_dropdowns: options come from the API and Preview stays disabled until both are picked', async () => {
+    await renderDrawer(detail({}, { available_verbs: ['move'] }));
+    await userEvent.click(verbButton('move'));
+
+    const agSelect = screen.getByLabelText(/target agent group/i);
+    const mgSelect = screen.getByLabelText(/target messaging group/i);
+    expect(agSelect.tagName).toBe('SELECT');
+    expect(mgSelect.tagName).toBe('SELECT');
+    await screen.findByRole('option', { name: 'Other Agent' });
+    expect(screen.getByRole('option', { name: '#other' })).toBeTruthy();
+
+    const preview = screen.getByRole('button', { name: /preview/i });
+    expect(preview).toBeDisabled();
+
+    await userEvent.selectOptions(agSelect, 'ag-2');
+    expect(preview).toBeDisabled(); // still missing the messaging group
+    await userEvent.selectOptions(mgSelect, 'mg-9');
+    expect(preview).not.toBeDisabled();
   });
 
   // ─── E4 — cancel end-series confirm ───

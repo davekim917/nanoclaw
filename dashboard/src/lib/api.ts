@@ -109,6 +109,19 @@ export async function listGroups(): Promise<GroupListResponse> {
   return apiFetch<GroupListResponse>('/dashboard/api/groups');
 }
 
+export interface MessagingGroupSummary {
+  id: string;
+  name: string;
+}
+
+export interface MessagingGroupListResponse {
+  messaging_groups: MessagingGroupSummary[];
+}
+
+export async function listMessagingGroups(): Promise<MessagingGroupListResponse> {
+  return apiFetch<MessagingGroupListResponse>('/dashboard/api/messaging-groups');
+}
+
 export async function getSessionDetail(sessionId: string): Promise<SessionDetailResponse> {
   return apiFetch<SessionDetailResponse>(`/dashboard/api/sessions/${encodeURIComponent(sessionId)}`);
 }
