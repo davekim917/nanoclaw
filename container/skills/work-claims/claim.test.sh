@@ -200,4 +200,31 @@ bash "$CLAIM" park acme-advertised needs an owner from the start --source "opera
 jq -e '.source == "operator, #build"' "$CLAIMS_DIR/acme-advertised.json" >/dev/null \
   || fail "park --source not recorded"
 
+# 26. A claim taken with no thread (relayer / task session) gets one backfilled
+#     from the environment, overwritten by a later explicit id, and refuses
+#     when there is neither an argument nor a variable to read.
+NANOCLAW_THREAD_ID= bash "$CLAIM" take acme-backfill 4 claimed by a relayer >/dev/null
+jq -e 'has("thread_id") | not' "$CLAIMS_DIR/acme-backfill.json" >/dev/null \
+  || fail "backfill fixture started with a thread_id"
+bash "$CLAIM" thread acme-backfill >/dev/null
+jq -e '.thread_id == "slack:C0AAA:1786621514.008659"' "$CLAIMS_DIR/acme-backfill.json" >/dev/null \
+  || fail "thread did not backfill from the environment"
+tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
+  .event == "thread" and .slug == "acme-backfill" and .owner == "ava" and
+  .thread_id == "slack:C0AAA:1786621514.008659" and .note == "claimed by a relayer"
+' >/dev/null || fail "thread did not write a ledger line"
+bash "$CLAIM" thread acme-backfill discord:987:654 >/dev/null
+jq -e '.thread_id == "discord:987:654" and .note == "claimed by a relayer" and .ttl_hours == 4' \
+  "$CLAIMS_DIR/acme-backfill.json" >/dev/null || fail "second thread call did not overwrite in place"
+NANOCLAW_THREAD_ID= bash "$CLAIM" thread acme-backfill >/dev/null 2>&1 \
+  && fail "accepted a thread call with no id and no environment"
+
+# 27. thread only touches your own claim, and a slug with no claim is an error.
+NANOCLAW_THREAD_ID= NANOCLAW_ASSISTANT_NAME=bo bash "$CLAIM" take acme-thread-sib 4 bo owns this >/dev/null
+[ "$(bash "$CLAIM" thread acme-thread-sib >/dev/null 2>&1; echo $?)" = 3 ] \
+  || fail "thread on a sibling's claim did not exit 3"
+jq -e 'has("thread_id") | not' "$CLAIMS_DIR/acme-thread-sib.json" >/dev/null \
+  || fail "refused thread still wrote"
+bash "$CLAIM" thread never-claimed >/dev/null 2>&1 && fail "threaded a slug with no claim"
+
 echo "all claim.sh tests passed"

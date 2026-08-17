@@ -43,7 +43,8 @@ Claim shape:
 your environment. Write it unedited and omit the field when the variable is
 empty (a channel-level session has no thread). It is what lets an abandoned-
 claim alert link a human back to where the work was happening; `session_id` is
-a local nickname and cannot. Never hand-assemble one.
+a local nickname and cannot. Never hand-assemble one. If the claim already
+exists without it, `claim.sh thread` backfills it — see Mechanics.
 
 ## Rules
 
@@ -77,6 +78,7 @@ CLAIM=/app/skills/work-claims/claim.sh
 bash $CLAIM check   acme-pr-733
 bash $CLAIM take    acme-pr-733 4 "publish-gate seam, PR #733" --source "QA hand-off run r123"
 bash $CLAIM park    acme-pr-733 "not done: schema done, handlers TODO"
+bash $CLAIM thread  acme-pr-733            # or: thread acme-pr-733 <thread-id>
 bash $CLAIM release acme-pr-733
 bash $CLAIM list
 ```
@@ -84,6 +86,20 @@ bash $CLAIM list
 `--source` (optional, on `take` and `park`) records where the assignment came
 from — a QA hand-off, a human in a channel, a review thread. Everything else
 you might want to record (PR, branch, files) belongs in the note as prose.
+
+**When you begin working a claim in a thread and the claim carries no
+`thread_id`, run `bash $CLAIM thread <slug>` as part of your first post in that
+thread.** `take` can only stamp the thread it was itself run from, so a claim
+made by a relayer on your behalf, or from a task session (an Observatory
+assignment, a scheduled job), arrives with the field missing and nothing ever
+backfills it. The Observatory renders "steer in thread" off that field: a claim
+without it is an ownership record no operator can reach — they see the work,
+they see you own it, and they have nowhere to say "stop". With no argument the
+verb uses your own `$NANOCLAW_THREAD_ID`; pass an explicit id only when you are
+recording a thread that is not the one you are running in. It overwrites, so
+re-running it when the work moves threads is correct, and it appends a `thread`
+line to the ledger. Same ownership rule as `park` and `release` — your own
+claim only.
 
 **Do not assemble a claim with `jq` yourself.** The fields are not a shape to
 remember — `owner`, `session_id` and `thread_id` all come from your environment,
@@ -130,7 +146,7 @@ anyone reading the directory. If you're stopping without finishing, that's
 `park`, not a note left on a claim you keep — see states above.
 
 `claims/ledger.ndjson` is append-only history: one JSON line per `released`,
-`parked`, or `cleared_merged` event, each carrying the full note at that
+`parked`, `thread`, or `cleared_merged` event, each carrying the full note at that
 moment. Read it ad hoc with `jq` (e.g. `jq 'select(.slug=="acme-pr-733")' claims/ledger.ndjson`
 for one slug's history) — never edit it, and it never shows up in `list`.
 

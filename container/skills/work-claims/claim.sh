@@ -30,6 +30,7 @@ usage:
   claim.sh check   <slug>
   claim.sh take    <slug> <ttl_hours> <note...>   [--takeover] [--source <where this came from>]
   claim.sh park    <slug> <note...>               [--source <where this came from>]
+  claim.sh thread  <slug> [<thread-id>]           (defaults to $NANOCLAW_THREAD_ID)
   claim.sh release <slug> [--merged-pr <n>]
   claim.sh list
 
@@ -289,6 +290,40 @@ cmd_park() {
   echo "parked $slug"
 }
 
+# take records thread_id once, at claim time, and only if the claiming session
+# had one. A relayer claiming on someone else's behalf, or a task session, has
+# no thread — and the agent that later works the claim IN a thread had no way to
+# say so. The Observatory renders a "steer in thread" link off this field, so a
+# claim without it is an ownership record nobody can reach. Hence: set it after
+# the fact, from wherever the work actually ended up.
+cmd_thread() {
+  local slug="${1:-}"; shift || usage
+  [ -n "$slug" ] || usage
+  [ $# -le 1 ] || usage
+  local tid="${1:-${NANOCLAW_THREAD_ID:-}}"
+  [ -n "$tid" ] || die "no thread id — pass one, or run this from a thread session where NANOCLAW_THREAD_ID is set"
+
+  require_workgroup
+  local f owner note claimed_at
+  f="$(file_for "$slug")"
+  [ -f "$f" ] || die "no claim at $slug — take it first, then record its thread"
+  owner="$(jq -r '.owner // "unknown"' "$f")"
+  if [ "$owner" != "$(me)" ]; then
+    echo "REFUSED — $slug belongs to $owner. Record the thread on your own claim." >&2
+    exit 3
+  fi
+  note="$(jq -r '.note // ""' "$f")"
+  claimed_at="$(jq -r '.claimed_at // empty' "$f")"
+
+  local tmp
+  tmp="$(mktemp "$CLAIMS_DIR/.tmp.XXXXXX")"
+  jq --arg tid "$tid" '.thread_id = $tid' "$f" > "$tmp"
+  ledger_append thread "$slug" "$owner" "$note" "$claimed_at" "$tid" ""
+  mv "$tmp" "$f"   # same-directory rename: no reader ever sees a partial file
+
+  echo "recorded thread $tid on $slug"
+}
+
 cmd_list() {
   require_workgroup
   local any=0 f slug state owner note
@@ -306,6 +341,7 @@ case "${1:-}" in
   check)   shift; cmd_check "$@" ;;
   take)    shift; cmd_take "$@" ;;
   park)    shift; cmd_park "$@" ;;
+  thread)  shift; cmd_thread "$@" ;;
   release) shift; cmd_release "$@" ;;
   list)    shift; cmd_list "$@" ;;
   *)       usage ;;
