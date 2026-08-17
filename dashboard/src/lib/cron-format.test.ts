@@ -31,6 +31,34 @@ describe('cronToEnglish', () => {
   it('every N hours', () => {
     expect(cronToEnglish('0 */2 * * *')).toBe('every 2 hours');
   });
+
+  it('minute list, every hour', () => {
+    expect(cronToEnglish('15,45 * * * *')).toBe('every hour at :15 and :45');
+  });
+
+  it('minute list, three values uses Oxford comma', () => {
+    expect(cronToEnglish('0,20,40 * * * *')).toBe('every hour at :00, :20, and :40');
+  });
+
+  it('hour list, daily', () => {
+    expect(cronToEnglish('0 9,17 * * *')).toBe('daily at 9:00 AM and 5:00 PM');
+  });
+
+  it('weekday list', () => {
+    expect(cronToEnglish('0 12 * * 1,4')).toBe('Mondays and Thursdays at 12:00 PM');
+  });
+
+  it('minute step with an hour range', () => {
+    expect(cronToEnglish('*/10 8-18 * * *')).toBe('every 10 minutes, 8 AM–6 PM');
+  });
+
+  it('falls back to null on an out-of-range hour list', () => {
+    expect(cronToEnglish('0 9,25 * * *')).toBeNull();
+  });
+
+  it('falls back to null on an invalid hour range', () => {
+    expect(cronToEnglish('*/10 18-8 * * *')).toBeNull();
+  });
 });
 
 describe('formatEasternTime', () => {

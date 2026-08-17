@@ -299,11 +299,14 @@ describe('ScheduledDrawer', () => {
     expect(drawer.textContent).toContain('5:00 AM ET');
   });
 
-  it('shows nothing extra for an irregular cron the formatter does not cover', async () => {
+  it('falls back to the Eastern-time line alone when English cannot render the shape', async () => {
+    // '1-5' weekday range defeats every covered shape, but the row still has
+    // a real next_fire_utc — a saved schedule must never show zero subtext.
     await renderDrawer(detail({}, { cron: '0 8,13,22 * * 1-5' }));
     const drawer = screen.getByTestId('sched-drawer');
     expect(drawer.textContent).not.toContain('daily at');
     expect(drawer.textContent).not.toContain('weekly at');
+    expect(drawer.textContent).toContain('5:00 AM ET');
   });
 
   it('the edit form live-updates the plain-English subtext as the cron field changes', async () => {

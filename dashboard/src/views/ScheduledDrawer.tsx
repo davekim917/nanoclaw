@@ -349,7 +349,9 @@ function cronSubtext(cron: string | null, nextFireUtc?: string | null): string |
   const english = cronToEnglish(cron);
   const et = nextFireUtc !== undefined ? formatEasternTime(nextFireUtc) : null;
   if (english && et) return `${english} · ${et}`;
-  return english;
+  // A saved schedule always has a next fire — if English can't render this
+  // shape, still show the ET half rather than nothing.
+  return english ?? et;
 }
 
 function EditForm({
