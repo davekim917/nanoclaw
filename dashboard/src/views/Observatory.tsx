@@ -144,7 +144,10 @@ export function Observatory({ authMe }: ObservatoryProps) {
   // and it answers the same question — "what is going on in there" — without
   // inventing a field. It becomes a true room filter the day the watcher
   // publishes `channel`.
-  const officeData = useMemo(() => buildOfficeData(rooms, agents, allItems), [rooms, agents, allItems]);
+  const officeData = useMemo(
+    () => buildOfficeData(rooms, agents, allItems, snapshot?.themedSlots),
+    [rooms, agents, allItems, snapshot?.themedSlots],
+  );
 
   // The occupants of the selected room, with the live fields the sheet needs
   // (holding, session) that the map's plan data does not carry. Uncapped, on

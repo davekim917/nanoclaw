@@ -18,7 +18,7 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { getKnownSlackBots } from '../../channels/slack-mentions.js';
-import { GROUPS_DIR } from '../../config.js';
+import { GROUPS_DIR, REPO_ROOT } from '../../config.js';
 import { getActiveContainerSessionIds, resolveAssistantName } from '../../container-runner.js';
 import { readContainerConfig, type ContainerConfig } from '../../container-config.js';
 import { readClaims, type BoardClaim } from '../../claims-board.js';
@@ -148,10 +148,48 @@ export interface ObservatoryScene {
   agents: ObservatoryAgent[];
   releaseState: ReleaseState | null;
   claims: ObservatoryClaim[];
+  /** Themed-floor slot bindings — see readOfficeThemes. Undefined = no themes configured. */
+  themedSlots?: Record<string, string>;
 }
 
 function emptyScene(workgroupId: string): ObservatoryScene {
   return { workgroupId, asOf: new Date().toISOString(), rooms: [], agents: [], releaseState: null, claims: [] };
+}
+
+let themeConfigWarned = false;
+
+/**
+ * Themed-floor slot bindings (normalized channel name → office-map.js slot),
+ * install config only — see office-data.ts's buildOfficeData. A channel name
+ * is install identity, which `check:public-boundary` rightly refuses to let
+ * live in trunk source, so the real mapping is the operator's own untracked
+ * `.nanoclaw/office-themes.json`, resolved the same repo-root-relative way
+ * the boundary checker resolves its own identifier file. Missing or
+ * unparseable → undefined, logged once (not every 15s poll) rather than on
+ * every call, and the scene must never blank over it — the floor just falls
+ * back to plain order-fill.
+ */
+export function readOfficeThemes(repoRoot: string = REPO_ROOT): Record<string, string> | undefined {
+  const file = path.join(repoRoot, '.nanoclaw', 'office-themes.json');
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('office-themes.json is not an object');
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === 'string') out[k] = v;
+    }
+    return out;
+  } catch (err) {
+    if (!themeConfigWarned) {
+      themeConfigWarned = true;
+      const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
+      log[missing ? 'debug' : 'warn']('observatory: .nanoclaw/office-themes.json unreadable, themed floor disabled', {
+        file,
+        err,
+      });
+    }
+    return undefined;
+  }
 }
 
 /**
@@ -489,6 +527,8 @@ export interface ObservatoryDeps {
   platforms?: string[] | null;
   /** Explicitly hidden room ids; defaults to the workgroup's declared observatory.hideRooms. */
   hiddenRooms?: string[];
+  /** Themed-floor slot bindings, injected for tests; defaults to the live readOfficeThemes(). */
+  themedSlots?: Record<string, string>;
 }
 
 const defaultDeps: ObservatoryDeps = { getActiveContainerSessionIds, resolveAssistantName };
@@ -524,6 +564,7 @@ export async function buildObservatoryScene(
     claims,
     releaseState:
       deps.groupsDir !== undefined ? readReleaseState(workgroupId, deps.groupsDir) : readReleaseState(workgroupId),
+    themedSlots: deps.themedSlots !== undefined ? deps.themedSlots : readOfficeThemes(),
   };
 }
 

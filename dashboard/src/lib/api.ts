@@ -548,6 +548,10 @@ export interface ObservatorySnapshot {
   claims: ObservatoryClaim[];
   /** Null until the release watcher has published release-state.json. */
   releaseState: ReleaseState | null;
+  /** Themed-floor slot bindings (normalized channel name → office-map.js
+   *  slot) — install config, absent when the operator hasn't set any. See
+   *  office-data.ts's buildOfficeData. */
+  themedSlots?: Record<string, string>;
 }
 
 /** Assign a board item to an agent: creates a one-shot task in the item's own

@@ -24,6 +24,7 @@ import {
   ownerMatchesAgent,
   isNotARoom,
   readReleaseState,
+  readOfficeThemes,
   type ObservatoryDeps,
 } from './observatory.js';
 import type { AuthedRequestContext } from '../router.js';
@@ -39,6 +40,9 @@ function makeDeps(overrides: Partial<ObservatoryDeps> = {}): ObservatoryDeps {
   return {
     getActiveContainerSessionIds: () => [],
     resolveAssistantName: async (agentGroup) => agentGroup.name,
+    // Isolate from whatever the live repo checkout's own .nanoclaw/office-themes.json
+    // happens to contain — install config must never leak into a unit test's result.
+    themedSlots: {},
     ...overrides,
   };
 }
@@ -282,6 +286,41 @@ describe('readReleaseState', () => {
     fs.utimesSync(path.join(dir, 'ava-folder/releases/release-state.json'), new Date(0), new Date(0));
 
     expect(readReleaseState('wg-1', dir)?.asOf).toBe('new');
+  });
+});
+
+describe('readOfficeThemes', () => {
+  // Fake, anonymous slot/channel names throughout — see office-data.test.ts
+  // for why: this is install config, and real channel names never belong in
+  // tracked source, fixtures included.
+  function repoRoot(themesFile?: string): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'obs-themes-'));
+    if (themesFile !== undefined) {
+      const nanoclawDir = path.join(dir, '.nanoclaw');
+      fs.mkdirSync(nanoclawDir, { recursive: true });
+      fs.writeFileSync(path.join(nanoclawDir, 'office-themes.json'), themesFile);
+    }
+    return dir;
+  }
+
+  it('is undefined when the file is absent', () => {
+    expect(readOfficeThemes(repoRoot())).toBeUndefined();
+  });
+
+  it('parses a valid mapping', () => {
+    expect(readOfficeThemes(repoRoot(JSON.stringify({ grill: 'kitchen', lobby: 'westFront' })))).toEqual({
+      grill: 'kitchen',
+      lobby: 'westFront',
+    });
+  });
+
+  it('is undefined, not throwing, on unparseable JSON or a non-object shape', () => {
+    expect(readOfficeThemes(repoRoot('{nope'))).toBeUndefined();
+    expect(readOfficeThemes(repoRoot('[1,2,3]'))).toBeUndefined();
+  });
+
+  it('drops non-string values rather than passing them through', () => {
+    expect(readOfficeThemes(repoRoot(JSON.stringify({ grill: 'kitchen', lobby: 42 })))).toEqual({ grill: 'kitchen' });
   });
 });
 

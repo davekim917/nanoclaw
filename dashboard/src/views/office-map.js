@@ -62,6 +62,67 @@
     } else if (kind === 'carpet') {
       s += r(X, Y, W, H, P.carpet);
       for (let j = 0; j < H; j += 3) for (let i = ((j / 3) % 2 ? 2 : 0); i < W; i += 4) s += r(X + i, Y + j, 1, 1, P.carpetDot);
+    } else if (kind === 'carpetWarm' || kind === 'carpetSlate') {
+      /* nanoclaw: two more carpets. The call floor and mission control sat
+       * two hex steps apart and read as the same room from above; a call floor
+       * should feel warm and an ops floor should feel dark. */
+      const warm = kind === 'carpetWarm';
+      s += r(X, Y, W, H, warm ? '#c9b6a4' : '#8d939e');
+      const dot = warm ? '#bda897' : '#828892';
+      for (let j = 0; j < H; j += 3) for (let i = ((j / 3) % 2 ? 2 : 0); i < W; i += 4) s += r(X + i, Y + j, 1, 1, dot);
+    } else if (kind === 'factory') {
+      /* nanoclaw: oil-stained concrete with a painted walkway lane. The three east
+       * wing rooms sampled within 4 hex points of each other — same slab, three
+       * labels. The lane is what says "this is a shop floor". */
+      s += r(X, Y, W, H, '#bab6ad');
+      for (let i = 0; i < W; i += 48) s += r(X + i, Y, 1, H, '#aaa69d');
+      for (let i = 0; i < 26; i++) {
+        const ox = Math.floor(hash(i, x + y, 21) * (W - 10)), oy = Math.floor(hash(i, x - y, 23) * (H - 6));
+        s += r(X + ox, Y + oy, 6 + Math.floor(hash(i, 3, 5) * 5), 3, '#a29d93') + r(X + ox + 2, Y + oy + 1, 4, 1, '#948f86');
+      }
+      // painted walkway, parked mid-room where the grid leaves a clear aisle
+      const ly = Math.floor(H * 0.47);
+      s += r(X, Y + ly, W, 2, '#d8c264') + r(X, Y + ly, W, 1, '#e8d67f');
+      s += r(X, Y + ly + 7, W, 2, '#d8c264') + r(X, Y + ly + 7, W, 1, '#e8d67f');
+    } else if (kind === 'raised') {
+      // nanoclaw: raised access floor — big panels on visible seams (a data hall floor)
+      s += r(X, Y, W, H, '#c2c4c1');
+      for (let i = 0; i <= W; i += 32) s += r(X + i, Y, 2, H, '#a9aca8') + r(X + i, Y, 1, H, '#d2d4d1');
+      for (let j = 0; j <= H; j += 32) s += r(X, Y + j, W, 2, '#a9aca8') + r(X, Y + j, W, 1, '#d2d4d1');
+      for (let j = 0; j < H; j += 32) for (let i = 0; i < W; i += 32) {
+        s += r(X + i + 4, Y + j + 4, 2, 2, '#9ea19d') + r(X + i + 26, Y + j + 26, 2, 2, '#9ea19d');
+      }
+    } else if (kind === 'epoxy') {
+      // nanoclaw: pale epoxy — deliberately the lightest floor so scorch marks pop
+      s += r(X, Y, W, H, '#dcd9cf');
+      for (let i = 0; i < 30; i++) s += r(X + Math.floor(hash(i, x + y, 31) * (W - 6)), Y + Math.floor(hash(i, x - y, 37) * (H - 3)), 5, 2, '#d2cec3');
+      for (let j = 0; j <= H; j += 64) s += r(X, Y + j, W, 1, '#cbc7bb');
+    } else if (kind === 'noc') {
+      // nanoclaw: dark anti-static tile — the NOC annex reads dim, not like a garage
+      s += r(X, Y, W, H, '#8f918e');
+      for (let i = 0; i <= W; i += 16) s += r(X + i, Y, 1, H, '#7f817e');
+      for (let j = 0; j <= H; j += 16) s += r(X, Y + j, W, 1, '#7f817e');
+      for (let j = 0; j < H; j += 32) for (let i = 0; i < W; i += 32) s += r(X + i + 6, Y + j + 6, 4, 4, '#989a97');
+    } else if (kind === 'bays') {
+      /* nanoclaw: concrete with faded painted parking bays. Floor paint only — the
+       * garage is the designed dead room and gets no furniture. */
+      s += floorFill('concrete', x, y, w, h);
+      const bw = Math.floor(W / 2), pl = '#c8bd9f';
+      for (let i = 0; i < 2; i++) {
+        const bx = X + 6 + i * bw;
+        s += r(bx, Y + 8, 1, H - 24, pl) + r(bx + bw - 12, Y + 8, 1, H - 24, pl) + r(bx, Y + 8, bw - 11, 1, pl);
+      }
+      return s;
+    } else if (kind === 'quarry') {
+      /* nanoclaw: quarry tile — the BBQ room's floor. `tile` is so pale that pale
+       * counters and steel vanish into it; this is dark and warm, so the room's
+       * own material carries the identity and everything standing on it reads. */
+      s += r(X, Y, W, H, '#ad8a6f');
+      for (let i = 0; i <= W; i += 16) s += r(X + i, Y, 1, H, '#8f6e58');
+      for (let j = 0; j <= H; j += 16) s += r(X, Y + j, W, 1, '#8f6e58');
+      for (let j = 0; j < H; j += 16) for (let i = 0; i < W; i += 16) {
+        if (hash(i, j + x + y, 17) > 0.7) s += r(X + i + 1, Y + j + 1, 15, 15, '#a17f66');
+      }
     } else if (kind === 'brick') {
       s += r(X, Y, W, H, P.brick);
       for (let j = 0; j < H; j += 8) {
@@ -76,10 +137,11 @@
     return s;
   }
 
-  function rugFill(x, y, w, h, base, accent) {
+  function rugFill(x, y, w, h, base, accent, flat) {
     const X = x * T, Y = y * T, W = w * T, H = h * T;
     let s = r(X, Y, W, H, base);
-    for (let i = 4; i < W - 4; i += 10) s += r(X + i, Y + 4, 5, H - 8, accent);
+    // nanoclaw: `flat` skips the stripes — on a wood floor they read as decking
+    if (!flat) for (let i = 4; i < W - 4; i += 10) s += r(X + i, Y + 4, 5, H - 8, accent);
     s += r(X, Y, W, 3, accent) + r(X, Y + H - 3, W, 3, accent) + r(X, Y, 3, H, accent) + r(X + W - 3, Y, 3, H, accent);
     s += r(X + 4, Y + 4, W - 8, 1, base) + r(X + 4, Y + H - 5, W - 8, 1, base);
     return s;
@@ -182,6 +244,384 @@
       case 'd': { let s = ''; for (let i = 0; i < 9; i++) s += r(X + Math.floor(hash(X + i, Y, 3) * 13), Y + Math.floor(hash(X, Y + i, 6) * 13), 3, 2, '#b6b1a6'); return s; }
       case 'S': // dust-sheeted furniture
         return r(X, Y + 2, 16, 12, '#ded9cb') + r(X, Y + 2, 16, 2, '#ece8dc') + r(X, Y + 13, 16, 1, '#c4bead') + r(X + 3, Y + 14, 2, 2, '#b8b2a0') + r(X + 11, Y + 14, 2, 2, '#b8b2a0');
+
+      /* nanoclaw: themed-floor sprite vocabulary. Same rules as the set above —
+       * no black outlines (edges are darker shades of the sprite's own fill),
+       * integer coordinates only, origin = tile top-left. */
+
+      case 'P': { // nanoclaw: call-centre desk run — fabric partition at the back, desk phone, headset parked
+        let s = r(X, Y + 4, 16, 10, P.deskTop) + r(X, Y + 4, 16, 2, P.deskHi) + r(X, Y + 13, 16, 1, P.deskEdge);
+        if (capL) s += r(X, Y + 4, 1, 10, P.deskEdge) + r(X + 1, Y + 14, 2, 2, P.deskLeg);
+        if (capR) s += r(X + 15, Y + 4, 1, 10, P.deskEdge) + r(X + 13, Y + 14, 2, 2, P.deskLeg);
+        s += r(X, Y, 16, 4, '#c3cdd4') + r(X, Y, 16, 1, '#dae1e6') + r(X, Y + 3, 16, 1, '#a2adb5'); // partition
+        /* nanoclaw: the HEADSET is the one prop that says "call floor", so it hangs on the
+         * partition at full size rather than lying flat on the desk where it was 3px of grey:
+         * arched headband, two dark earcups, and a boom mic swinging off the near cup. */
+        s += r(X + 3, Y + 1, 6, 1, '#3f454c') + r(X + 2, Y + 2, 1, 2, '#3f454c') + r(X + 9, Y + 2, 1, 2, '#3f454c'); // band
+        s += r(X + 1, Y + 3, 3, 4, '#4d545c') + r(X + 1, Y + 3, 3, 1, '#6a727a'); // far earcup
+        s += r(X + 8, Y + 3, 3, 4, '#4d545c') + r(X + 8, Y + 3, 3, 1, '#6a727a'); // near earcup
+        s += r(X + 4, Y + 6, 4, 1, '#5f676f') + r(X + 3, Y + 7, 2, 1, '#8a929b'); // boom mic
+        s += r(X + 12, Y + 1, 3, 2, k > 0.5 ? '#e7d7a8' : '#d9c8dd'); // pinned note
+        s += r(X + 1, Y + 8, 5, 4, P.mon) + r(X + 2, Y + 9, 3, 2, k > 0.5 ? P.screen : P.screenDk); // small monitor
+        s += r(X + 8, Y + 6, 6, 5, '#e4e0d5') + r(X + 8, Y + 6, 6, 1, '#f2efe6') + r(X + 8, Y + 10, 6, 1, '#c2bdb0'); // phone base
+        s += r(X + 7, Y + 5, 8, 1, '#9aa2a9') + r(X + 9, Y + 8, 4, 1, '#8f979e'); // handset in its cradle
+        s += r(X + 12, Y + 8, 2, 2, '#c8624f') + r(X + 12, Y + 8, 2, 1, '#e07f6c'); // lit line button
+        return s;
+      }
+      case 'M': { // nanoclaw: the smoker (hero) — chunky barrel, firebox + chimney at the left cap, gauge at the right
+        /* OFFSET smoker, drawn as an ELEVATION. Two shape rules keep it from
+         * reading as another counter run: the barrel is ROUNDED (stepped ends
+         * top and bottom, so the silhouette is never a rectangle) and it is
+         * TALLER than the counters, overhanging into the row below, which the
+         * grid keeps clear. The firebox is a separate squat drum bolted to the
+         * left end, at a different height from the barrel — that offset is the
+         * whole point of the form.
+         * Deliberately drawn COLD: no ember, no glow. Heat is state, and state
+         * belongs to the fx overlay, not the static world. */
+        const lid = '#7c6c5d', bod = '#54493f', dk = '#332c27', rim = '#8d7c6c', brass = '#9a7f52', bolt = '#b09b83';
+        /* Barrel body, y+2..y+22. The run is deliberately only THREE tiles wide:
+         * at four it was 64x20, a 3:1 slab that read as exactly what the pale
+         * counters beside it are. Ends are stepped in two steps so the silhouette
+         * is a rounded drum from any distance, never a rectangle. */
+        // crown steps in twice at the top so the roofline is a curve, not the flat
+        // straight edge every counter run in this tileset has
+        let s = r(X + 3, Y, 10, 1, rim) + r(X + 1, Y + 1, 14, 1, rim) + r(X, Y + 2, 16, 2, rim);
+        s += r(X, Y + 4, 16, 6, lid) + r(X, Y + 4, 16, 1, '#9c8a78');
+        s += r(X, Y + 9, 16, 1, '#6b5d4f') + r(X, Y + 10, 16, 1, brass); // lid seam, two-tone
+        s += r(X, Y + 11, 16, 9, bod) + r(X, Y + 20, 16, 2, dk);
+        for (let i = 2; i < 16; i += 5) s += r(X + i, Y + 5, 1, 1, bolt) + r(X + i, Y + 18, 1, 1, bolt); // rivets
+        if (capL) {
+          s += r(X, Y + 2, 4, 2, dk) + r(X, Y + 4, 2, 2, dk) + r(X, Y + 18, 2, 2, dk) + r(X, Y + 20, 4, 2, dk); // stepped end
+          s += r(X + 2, Y + 6, 1, 12, dk);
+          // chimney: base plate overlaps the lid so the stack visibly MEETS the body
+          s += r(X + 3, Y + 1, 8, 4, bod) + r(X + 3, Y + 1, 8, 1, rim);
+          s += r(X + 4, Y - 13, 6, 15, bod) + r(X + 4, Y - 13, 2, 15, lid) + r(X + 9, Y - 13, 1, 15, dk);
+          s += r(X + 3, Y - 15, 8, 3, brass) + r(X + 3, Y - 15, 8, 1, bolt); // stack cap
+          s += r(X + 3, Y + 22, 3, 5, dk); // leg
+        } else if (capR) {
+          s += r(X + 12, Y + 2, 4, 2, dk) + r(X + 14, Y + 4, 2, 2, dk) + r(X + 14, Y + 18, 2, 2, dk) + r(X + 12, Y + 20, 4, 2, dk);
+          s += r(X + 13, Y + 6, 1, 12, dk);
+          /* offset FIREBOX: a squat drum bolted to the end, hanging BELOW the
+           * barrel line. That height difference is the offset-smoker read, and
+           * it is what breaks the flat counter silhouette. Drawn COLD. */
+          s += r(X + 8, Y + 13, 10, 13, '#463d36') + r(X + 8, Y + 13, 10, 2, '#5c5148') + r(X + 8, Y + 25, 10, 1, '#241f1b');
+          s += r(X + 8, Y + 12, 10, 1, brass);
+          s += r(X + 11, Y + 17, 5, 5, '#2b2522') + r(X + 11, Y + 17, 5, 1, '#3d3531'); // cold door
+          s += r(X + 12, Y + 19, 3, 2, '#6d665e') + r(X + 12, Y + 19, 3, 1, '#857d73'); // grey ash, unlit
+          s += r(X + 9, Y + 26, 2, 3, dk) + r(X + 15, Y + 26, 2, 3, dk); // firebox legs
+          s += r(X + 9, Y + 5, 5, 5, P.steel) + r(X + 10, Y + 6, 3, 3, '#e6e2d7') + r(X + 11, Y + 7, 1, 1, '#b8574a'); // temp gauge
+        } else {
+          s += r(X + 3, Y + 6, 10, 3, rim) + r(X + 3, Y + 6, 10, 1, '#a08e7b'); // lid highlight
+          s += r(X + 5, Y + 13, 6, 4, brass) + r(X + 5, Y + 13, 6, 1, bolt); // latch
+          s += r(X + 6, Y + 22, 4, 5, dk); // leg
+        }
+        return s;
+      }
+      case 'm': { // nanoclaw: meat rack — a real rail on posts, S-hooks, slabs of differing length
+        const meat = ['#7c3c2d', '#8e4834', '#6a3125'];
+        // rail: two end posts plus a bar, so it hangs rather than standing on the floor
+        let s = r(X, Y + 1, 16, 3, '#7d7163') + r(X, Y + 1, 16, 1, '#9c8d7b') + r(X, Y + 3, 16, 1, '#5f564b');
+        if (capL) s += r(X, Y, 2, 7, '#6d6255');
+        if (capR) s += r(X + 14, Y, 2, 7, '#6d6255');
+        for (let i = 0; i < 3; i++) {
+          const mx = X + 1 + i * 5, mh = 5 + Math.floor(hash(X + i * 7, Y, seed) * 7); // varied lengths
+          s += r(mx + 1, Y + 4, 1, 3, '#c6bba6') + r(mx + 2, Y + 4, 1, 1, '#c6bba6'); // S-hook
+          const col = meat[Math.floor(hash(X + i * 3, Y + 2, seed) * 3)];
+          s += r(mx, Y + 7, 4, mh, col) + r(mx, Y + 7, 4, 1, '#a55f47') + r(mx + 3, Y + 8, 1, mh - 2, '#4f2419');
+          s += r(mx + 1, Y + 6 + mh, 2, 1, '#4f2419'); // rounded tip
+        }
+        return s;
+      }
+      case 'u': { // nanoclaw: wooden stool — prep seating; a swivel chair has no business in the BBQ room
+        return r(X + 3, Y + 4, 10, 5, P.wood) + r(X + 3, Y + 4, 10, 1, P.woodHi) + r(X + 3, Y + 8, 10, 1, P.woodDk) +
+          r(X + 4, Y + 9, 2, 5, P.woodDk) + r(X + 10, Y + 9, 2, 5, P.woodDk) + r(X + 4, Y + 11, 8, 1, P.woodDk);
+      }
+      case 'h': { // nanoclaw: wood-top workbench run — tools, vise, NO monitor (that was the office kit leaking in)
+        let s = r(X, Y + 4, 16, 10, '#9a7448') + r(X, Y + 4, 16, 2, '#b08a5c') + r(X, Y + 13, 16, 1, '#75542f');
+        if (capL) s += r(X, Y + 4, 1, 10, '#75542f') + r(X + 1, Y + 14, 2, 3, '#5e4426');
+        if (capR) s += r(X + 15, Y + 4, 1, 10, '#75542f') + r(X + 13, Y + 14, 2, 3, '#5e4426');
+        s += r(X, Y, 16, 4, '#8b9198') + r(X, Y, 16, 1, '#a3a9b0'); // pegboard back
+        for (let i = 1; i < 15; i += 4) { // hanging tools
+          const t = hash(X + i, Y, seed);
+          if (t > 0.66) s += r(X + i, Y + 1, 1, 3, '#5f666d') + r(X + i - 1, Y + 1, 3, 1, '#7d848b');
+          else if (t > 0.33) s += r(X + i, Y + 1, 2, 2, '#b8574a') + r(X + i, Y + 3, 1, 1, '#8f4038');
+          else s += r(X + i, Y + 1, 1, 2, '#c9a068') + r(X + i - 1, Y + 3, 3, 1, '#5f666d');
+        }
+        if (k > 0.6) s += r(X + 3, Y + 7, 6, 4, '#6f767c') + r(X + 3, Y + 7, 6, 1, '#8b9198'); // vise
+        else if (k > 0.3) s += r(X + 4, Y + 8, 7, 3, '#c9a068') + r(X + 4, Y + 8, 7, 1, '#dcb87f'); // stock
+        s += r(X + 11, Y + 9, 4, 2, '#7d848b'); // wrench
+        return s;
+      }
+      case '&': { // nanoclaw: artist's worktable — paint tubes, brushes in a jar, spatter.
+        // Same silhouette family as the factory bench `h`, but the surface says studio.
+        let s = r(X, Y + 3, 16, 11, '#c9a877') + r(X, Y + 3, 16, 2, '#dcc094') + r(X, Y + 13, 16, 1, '#a1804f');
+        if (capL) s += r(X, Y + 3, 1, 11, '#a1804f') + r(X + 1, Y + 14, 2, 3, '#7f6339');
+        if (capR) s += r(X + 15, Y + 3, 1, 11, '#a1804f') + r(X + 13, Y + 14, 2, 3, '#7f6339');
+        const inks = ['#c8624f', '#5b86ad', '#7f9c5c', '#c08a2e', '#8c6ea0'];
+        for (let i = 0; i < 4; i++) { // paint spatter on the surface
+          const sx = X + 1 + Math.floor(hash(X + i * 3, Y, seed) * 13), sy = Y + 5 + Math.floor(hash(X, Y + i * 3, seed) * 7);
+          s += r(sx, sy, 2, 1, inks[Math.floor(hash(X + i, Y + i, seed) * inks.length)]);
+        }
+        if (k > 0.5) { // paint tubes
+          for (let i = 0; i < 3; i++) s += r(X + 2 + i * 3, Y + 6, 2, 5, inks[Math.floor(hash(X + i * 7, Y, seed) * inks.length)]) + r(X + 2 + i * 3, Y + 6, 2, 1, '#e0dbcd');
+        } else { // jar of brushes
+          s += r(X + 4, Y + 7, 5, 5, '#cfd8dc') + r(X + 4, Y + 7, 5, 1, '#e6ecee');
+          for (let i = 0; i < 3; i++) s += r(X + 5 + i, Y + 3, 1, 4, P.woodDk) + r(X + 5 + i, Y + 3, 1, 1, inks[Math.floor(hash(X + i * 5, Y + 2, seed) * inks.length)]);
+        }
+        s += r(X + 11, Y + 8, 4, 3, '#e8e2d2') + r(X + 11, Y + 8, 4, 1, P.white); // rag / palette paper
+        return s;
+      }
+      case 'Y': { // nanoclaw: control console run — sloped desk of dials and readouts, not an office desk
+        let s = r(X, Y + 6, 16, 9, '#8d939a') + r(X, Y + 6, 16, 1, '#a7adb4') + r(X, Y + 14, 16, 1, '#6d737a');
+        if (capL) s += r(X, Y + 6, 1, 9, '#6d737a');
+        if (capR) s += r(X + 15, Y + 6, 1, 9, '#6d737a');
+        s += r(X, Y + 2, 16, 4, '#5f666d') + r(X, Y + 2, 16, 1, '#767d85'); // sloped readout panel
+        for (let i = 0; i < 3; i++) {
+          const gx = X + 1 + i * 5, kk = hash(gx, Y, seed);
+          s += r(gx, Y + 3, 4, 2, kk > 0.5 ? '#5a9ab5' : '#57917d') + r(gx, Y + 3, 4, 1, kk > 0.5 ? '#8fc8de' : '#9ad8c0');
+          s += r(gx + 1, Y + 8, 3, 3, '#e8e4d8') + r(gx + 2, Y + 9, 1, 1, '#b8574a'); // dial
+        }
+        s += r(X + 11, Y + 8, 4, 4, '#3f4a54') + r(X + 12, Y + 9, 2, 2, '#7fb2cf');
+        return s;
+      }
+      case 'q': { // nanoclaw: wall queue board — the call floor's one unmistakable cue: waiting/handled counters
+        let s = r(X, Y, 16, 13, '#2f343b') + r(X, Y, 16, 1, '#464d56') + r(X, Y + 12, 16, 1, '#23272c');
+        s += r(X + 1, Y + 1, 14, 11, '#1f3a4a');
+        for (let row = 0; row < 3; row++) {
+          const ry = Y + 2 + row * 3;
+          s += r(X + 2, ry, 5, 2, '#4d7f96'); // label bar
+          const n = Math.floor(hash(X + row * 5, Y, seed) * 3);
+          for (let d = 0; d <= n; d++) s += r(X + 9 + d * 2, ry, 1, 2, row === 0 ? '#e0b35a' : row === 1 ? '#6fd68f' : '#d97b6a');
+        }
+        return s;
+      }
+      case 'X': { // nanoclaw: credenza — low closed cabinet for the boardroom wall
+        let s = r(X, Y + 3, 16, 10, '#8a6440') + r(X, Y + 3, 16, 2, '#a37d52') + r(X, Y + 12, 16, 1, '#67492c');
+        s += r(X + 1, Y + 6, 6, 5, '#75542f') + r(X + 9, Y + 6, 6, 5, '#75542f');
+        s += r(X + 3, Y + 8, 2, 1, '#c9b48f') + r(X + 11, Y + 8, 2, 1, '#c9b48f'); // handles
+        return s;
+      }
+      case 'H': { // nanoclaw: wall chart — an actual bar-and-trend chart, not a blank whiteboard
+        let s = r(X, Y, 16, 12, '#cfc9ba') + r(X + 1, Y + 1, 14, 9, P.white);
+        s += r(X + 2, Y + 9, 12, 1, '#a8a294') + r(X + 2, Y + 2, 1, 8, '#a8a294'); // axes
+        for (let i = 0; i < 5; i++) { // bars
+          const bh = 1 + Math.floor(hash(X + i * 3, Y, seed) * 6);
+          s += r(X + 4 + i * 2, Y + 9 - bh, 1, bh, i % 2 ? '#5b86ad' : '#7f9c5c');
+        }
+        for (let i = 0; i < 5; i++) s += r(X + 4 + i * 2, Y + 6 - Math.floor(hash(X + i, Y + 3, seed) * 3), 2, 1, '#c8624f'); // trend
+        s += r(X, Y + 11, 16, 2, '#b9b2a2');
+        return s;
+      }
+      case 'y': { // nanoclaw: print rack — leaning boards of work, the studio's working mass
+        const inks = ['#c8624f', '#5b86ad', '#7f9c5c', '#c08a2e', '#8c6ea0'];
+        let s = r(X + 1, Y + 12, 14, 2, P.woodDk) + r(X + 1, Y + 14, 2, 2, P.woodDk) + r(X + 12, Y + 14, 2, 2, P.woodDk);
+        for (let i = 0; i < 4; i++) {
+          const bx = X + 2 + i * 3;
+          s += r(bx, Y + 2 + i, 3, 11 - i, inks[Math.floor(hash(bx, Y + i, seed) * inks.length)]);
+          s += r(bx, Y + 2 + i, 3, 1, P.paper);
+        }
+        return s;
+      }
+      case ',': { // nanoclaw: poster stack leaning on the floor
+        const inks = ['#c8624f', '#5b86ad', '#7f9c5c', '#c08a2e'];
+        let s = '';
+        for (let i = 0; i < 3; i++) {
+          s += r(X + 2 + i, Y + 6 + i * 2, 11 - i * 2, 8 - i * 2, inks[Math.floor(hash(X + i * 5, Y, seed) * inks.length)]);
+          s += r(X + 2 + i, Y + 6 + i * 2, 11 - i * 2, 1, P.paper);
+        }
+        return s;
+      }
+      case '!': { // nanoclaw: copier bank — gives the bare hallway one thing to be
+        let s = r(X + 1, Y + 2, 14, 12, '#b6bbc0') + r(X + 1, Y + 2, 14, 2, '#ced3d7') + r(X + 1, Y + 13, 14, 1, '#8f959a');
+        s += r(X + 2, Y + 5, 12, 3, '#6f767c') + r(X + 3, Y + 6, 10, 1, '#8f959a'); // output tray
+        s += r(X + 3, Y + 9, 5, 3, '#e8e4d8') + r(X + 3, Y + 9, 5, 1, P.white); // paper
+        s += r(X + 10, Y + 9, 3, 2, '#3f4a54') + r(X + 11, Y + 9, 1, 1, '#6fd68f');
+        return s;
+      }
+      case '+': { // nanoclaw: pipe junction — flanged elbow box where a header meets a riser
+        const pb = '#9fa8ae', ph = '#bec6cb', pd = '#7b838a';
+        let s = r(X, Y + 4, 16, 7, pb) + r(X, Y + 4, 16, 2, ph) + r(X, Y + 10, 16, 1, pd); // through the header
+        s += r(X + 4, Y, 7, 16, pb) + r(X + 4, Y, 2, 16, ph) + r(X + 10, Y, 1, 16, pd);   // through the riser
+        s += r(X + 2, Y + 2, 11, 11, pb) + r(X + 2, Y + 2, 11, 1, ph) + r(X + 2, Y + 12, 11, 1, pd); // elbow body
+        s += r(X + 1, Y + 1, 13, 2, pd) + r(X + 1, Y + 13, 13, 2, pd); // bolt flanges
+        for (let i = 2; i < 13; i += 4) s += r(X + i, Y + 1, 1, 1, '#d6dbdf') + r(X + i, Y + 14, 1, 1, '#d6dbdf');
+        return s;
+      }
+      case 'R': { // nanoclaw: shop robot — HUMAN-scale (matches the 20x22 agent sprite, drawn up out
+        // of its tile) and warm-painted, so it reads as a character rather than a filing cabinet.
+        const bd = '#c2814f', bh = '#d99c68', bk = '#96603a', st = '#8f959b';
+        let s = r(X + 3, Y + 15, 10, 4, st) + r(X + 3, Y + 15, 10, 1, '#adb3b8') + r(X + 3, Y + 19, 10, 1, '#6d737a'); // tracked base
+        s += r(X + 4, Y + 5, 8, 10, bd) + r(X + 4, Y + 5, 8, 1, bh) + r(X + 4, Y + 14, 8, 1, bk); // torso
+        s += r(X + 1, Y + 6, 3, 7, bd) + r(X + 1, Y + 6, 3, 1, bh) + r(X + 12, Y + 6, 3, 7, bd) + r(X + 12, Y + 6, 3, 1, bh); // arms
+        s += r(X + 1, Y + 12, 3, 2, st) + r(X + 12, Y + 12, 3, 2, st); // grippers
+        s += r(X + 4, Y - 3, 8, 7, bd) + r(X + 4, Y - 3, 8, 1, bh) + r(X + 4, Y + 3, 8, 1, bk); // head
+        s += r(X + 5, Y - 1, 6, 3, '#2f343b') + r(X + 6, Y, 2, 1, '#5fbfd6') + r(X + 9, Y, 1, 1, '#5fbfd6'); // visor
+        s += r(X + 6, Y - 5, 4, 2, st) + r(X + 7, Y - 6, 2, 1, '#b8574a'); // antenna
+        s += r(X + 6, Y + 8, 4, 3, '#4a5058') + r(X + 7, Y + 9, 2, 1, '#e8e4d8'); // chest panel
+        return s;
+      }
+      case 'V': { // nanoclaw: mission-control monitor wall — one continuous bank, screen contents vary by hash
+        const fr = '#2f343b', frHi = '#454c55';
+        let s = r(X, Y, 16, 13, fr) + r(X, Y, 16, 1, frHi) + r(X, Y + 12, 16, 1, '#23272c');
+        for (let row = 0; row < 2; row++) {
+          const sy = Y + 1 + row * 6, gx = X + (capL ? 1 : 0), gw = 16 - (capL ? 1 : 0) - (capR ? 1 : 0);
+          const kk = hash(X, Y + row * 7, seed);
+          s += r(gx, sy, gw, 5, kk > 0.66 ? '#33506b' : kk > 0.33 ? '#2f5c5a' : '#3d4a63');
+          if (kk > 0.66) {
+            for (let i = 0; i < 4; i++) { const bh = 1 + Math.floor(hash(X + i, sy, seed) * 4); s += r(X + 1 + i * 4, sy + 5 - bh, 3, bh, '#79b6d8'); }
+          } else if (kk > 0.33) {
+            s += r(X + 2, sy + 1, 6, 3, '#57917d') + r(X + 9, sy + 2, 4, 2, '#57917d') + r(X + 4, sy + 2, 2, 1, '#9ad8c0');
+          } else {
+            s += r(gx, sy + 3, gw, 1, '#6f8fc4') + r(X + 3, sy + 2, 4, 1, '#9db6e0') + r(X + 10, sy + 1, 3, 1, '#9db6e0');
+          }
+        }
+        if (capL) s += r(X, Y, 1, 13, frHi);
+        if (capR) s += r(X + 15, Y, 1, 13, frHi);
+        return s;
+      }
+      case 'z': { // nanoclaw: bean bag — blocky squashed square with a SIT-DENT; the dent is what says "seat"
+        const pal = [['#b08a6f', '#c4a087', '#8f6d55'], ['#8a95a3', '#a1acb8', '#6f7987'], ['#9aa585', '#b1bc9c', '#7d876b']][Math.floor(k * 3) % 3];
+        let s = r(X + 2, Y + 5, 12, 9, pal[0]) + r(X + 3, Y + 4, 10, 1, pal[0]) + r(X + 1, Y + 7, 1, 5, pal[0]) + r(X + 14, Y + 7, 1, 5, pal[0]);
+        s += r(X + 3, Y + 5, 10, 1, pal[1]) + r(X + 2, Y + 6, 2, 4, pal[1]); // highlight
+        s += r(X + 5, Y + 7, 6, 3, pal[2]) + r(X + 6, Y + 6, 4, 1, pal[2]); // sit-dent
+        s += r(X + 2, Y + 13, 12, 1, pal[2]) + r(X + 4, Y + 14, 8, 1, pal[2]);
+        return s;
+      }
+      case 'A': { // nanoclaw: conveyor run — belt over rollers, legs at the caps, parts riding it
+        const fr = '#8d939a', frHi = '#a7adb4', frDk = '#6d737a', belt = '#4e545b';
+        let s = r(X, Y + 3, 16, 11, fr) + r(X, Y + 3, 16, 1, frHi) + r(X, Y + 13, 16, 1, frDk);
+        s += r(X, Y + 5, 16, 7, belt) + r(X, Y + 5, 16, 1, '#61686f');
+        for (let i = 0; i < 4; i++) s += r(X + 1 + i * 4, Y + 5, 1, 7, '#3f454c');
+        // nanoclaw: the line has to be driven by something — motor housing on each end
+        if (capL) s += r(X, Y + 2, 4, 13, '#6a7078') + r(X, Y + 2, 4, 1, '#868d95') + r(X + 1, Y + 6, 2, 4, '#4a5058') + r(X + 1, Y + 15, 2, 2, frDk);
+        if (capR) s += r(X + 12, Y + 2, 4, 13, '#6a7078') + r(X + 12, Y + 2, 4, 1, '#868d95') + r(X + 13, Y + 6, 2, 4, '#4a5058') + r(X + 13, Y + 15, 2, 2, frDk);
+        if (k > 0.55) s += r(X + 5, Y + 6, 6, 5, P.box) + r(X + 5, Y + 6, 6, 1, P.boxHi) + r(X + 5, Y + 10, 6, 1, P.boxDk);
+        else if (k > 0.28) s += r(X + 6, Y + 7, 4, 3, '#b08a52') + r(X + 6, Y + 7, 4, 1, '#c9a068');
+        return s;
+      }
+      case 'I': { // nanoclaw: process pipe run along a top/bottom wall, flanged at each joint
+        const pb = '#9fa8ae', ph = '#bec6cb', pd = '#7b838a';
+        let s = r(X, Y + 4, 16, 7, pb) + r(X, Y + 4, 16, 2, ph) + r(X, Y + 10, 16, 1, pd);
+        s += r(X + 7, Y + 3, 2, 9, pd) + r(X + 7, Y + 3, 2, 1, ph);
+        // nanoclaw: a run has to END somewhere — cap it with a bolted blind flange, not a raw cut
+        if (capL) s += r(X, Y + 2, 3, 11, pd) + r(X, Y + 2, 3, 1, ph) + r(X + 1, Y + 4, 1, 1, '#d6dbdf') + r(X + 1, Y + 9, 1, 1, '#d6dbdf');
+        if (capR) s += r(X + 13, Y + 2, 3, 11, pd) + r(X + 13, Y + 2, 3, 1, ph) + r(X + 14, Y + 4, 1, 1, '#d6dbdf') + r(X + 14, Y + 9, 1, 1, '#d6dbdf');
+        return s;
+      }
+      case 'i': { // nanoclaw: process pipe run down a side wall
+        const pb = '#9fa8ae', ph = '#bec6cb', pd = '#7b838a';
+        return r(X + 4, Y, 7, 16, pb) + r(X + 4, Y, 2, 16, ph) + r(X + 10, Y, 1, 16, pd) +
+          r(X + 3, Y + 7, 9, 2, pd) + r(X + 3, Y + 7, 1, 2, ph);
+      }
+      case 'v': { // nanoclaw: inline valve — pipe segment with a red handwheel
+        const pb = '#9fa8ae', ph = '#bec6cb', pd = '#7b838a';
+        let s = r(X, Y + 4, 16, 7, pb) + r(X, Y + 4, 16, 2, ph) + r(X, Y + 10, 16, 1, pd);
+        s += r(X + 5, Y + 2, 6, 9, pd) + r(X + 5, Y + 2, 6, 1, ph);
+        s += r(X + 4, Y, 8, 3, '#b8574a') + r(X + 4, Y, 8, 1, '#cd6d5f') + r(X + 7, Y + 2, 2, 3, '#8f4038');
+        return s;
+      }
+      case 'N': { // nanoclaw: process tank — WIDE banded cylinder, riveted seams, face gauge, on legs
+        const tb = '#aeb4b9', th = '#cfd5d9', td = '#848b91', tk = '#6d747a';
+        let s = r(X + 7, Y - 5, 2, 5, td) + r(X + 6, Y - 6, 4, 2, '#b8574a') + r(X + 6, Y - 6, 4, 1, '#cd6d5f'); // top valve
+        s += r(X + 3, Y - 1, 10, 2, tb) + r(X + 3, Y - 1, 10, 1, th) + r(X + 1, Y + 1, 14, 2, tb) + r(X + 1, Y + 1, 4, 2, th); // wide dome
+        s += r(X, Y + 3, 16, 11, tb) + r(X + 1, Y + 3, 4, 11, th) + r(X + 13, Y + 3, 3, 11, td); // full-width shell
+        s += r(X, Y + 5, 16, 2, td) + r(X, Y + 6, 16, 1, tk) + r(X, Y + 10, 16, 2, td) + r(X, Y + 11, 16, 1, tk); // hoop bands
+        for (let i = 1; i < 16; i += 3) s += r(X + i, Y + 5, 1, 1, '#dde2e5') + r(X + i, Y + 10, 1, 1, '#dde2e5'); // rivets
+        s += r(X + 6, Y + 7, 4, 3, '#3f6d84') + r(X + 6, Y + 8, 4, 2, '#5a9ab5') + r(X + 6, Y + 8, 4, 1, '#8fc8de'); // sight glass
+        s += r(X + 11, Y + 7, 4, 4, '#e8e4d8') + r(X + 11, Y + 7, 4, 1, '#f3f0e6') + r(X + 12, Y + 8, 2, 2, '#b8574a'); // face gauge
+        s += r(X, Y + 14, 16, 1, tk) + r(X + 2, Y + 15, 3, 1, tk) + r(X + 11, Y + 15, 3, 1, tk); // legs
+        return s;
+      }
+      case 'G': { // nanoclaw: gauge panel — three dials over a readout strip
+        let s = r(X, Y, 16, 12, '#8b9095') + r(X, Y, 16, 1, '#a5aaaf') + r(X, Y + 11, 16, 1, '#6d7276');
+        for (let i = 0; i < 3; i++) {
+          const gx = X + 1 + i * 5;
+          s += r(gx, Y + 2, 4, 4, '#e8e4d8') + r(gx, Y + 2, 4, 1, '#f3f0e6') + r(gx + 1, Y + 3, 2, 2, hash(gx, Y, seed) > 0.5 ? '#c8624f' : '#5b86ad');
+        }
+        s += r(X + 1, Y + 7, 14, 3, '#3f4a54') + r(X + 2, Y + 8, 5, 1, '#7fb2cf') + r(X + 9, Y + 8, 3, 1, '#6f9c5a');
+        return s;
+      }
+      case 'Z': { // nanoclaw: test rig — OPEN gantry (the hollow middle is what keeps it from reading as a cabinet)
+        const fb = '#8f959b', fh = '#b3b9be', fd = '#666c72';
+        let s = r(X + 1, Y + 1, 14, 3, fb) + r(X + 1, Y + 1, 14, 1, fh) + r(X + 1, Y + 3, 14, 1, fd); // crossbeam
+        s += r(X + 1, Y + 4, 3, 10, fb) + r(X + 1, Y + 4, 1, 10, fh) + r(X + 3, Y + 4, 1, 10, fd);
+        s += r(X + 12, Y + 4, 3, 10, fb) + r(X + 12, Y + 4, 1, 10, fh) + r(X + 14, Y + 4, 1, 10, fd);
+        s += r(X, Y + 14, 5, 2, fd) + r(X + 11, Y + 14, 5, 2, fd); // feet
+        s += r(X + 7, Y + 4, 1, 4, '#7e848a'); // cable
+        const pc = k > 0.5 ? ['#c08a2e', '#d7a44b', '#96691f'] : ['#b8574a', '#cd6d5f', '#8f4038'];
+        s += r(X + 5, Y + 8, 6, 5, pc[0]) + r(X + 5, Y + 8, 6, 1, pc[1]) + r(X + 5, Y + 12, 6, 1, pc[2]);
+        return s;
+      }
+      case 'Q': { // nanoclaw: crash-test dummy — hazard-striped body, blank head
+        let s = r(X + 6, Y + 12, 4, 3, '#6f757b') + r(X + 5, Y + 15, 6, 1, '#5b6167');
+        s += r(X + 5, Y + 5, 6, 8, '#e0c05a') + r(X + 5, Y + 5, 6, 1, '#f0d478') + r(X + 5, Y + 12, 6, 1, '#a98d34');
+        for (let i = 0; i < 3; i++) s += r(X + 5, Y + 6 + i * 3, 6, 1, '#4a4237');
+        s += r(X + 3, Y + 6, 2, 5, '#e0c05a') + r(X + 11, Y + 6, 2, 5, '#e0c05a');
+        s += r(X + 6, Y + 1, 5, 5, '#ded8c8') + r(X + 6, Y + 1, 5, 1, '#efe9da') + r(X + 6, Y + 5, 5, 1, '#b8b2a0');
+        s += r(X + 7, Y + 3, 1, 1, '#4a3a2e') + r(X + 9, Y + 3, 1, 1, '#4a3a2e');
+        return s;
+      }
+      case '%': { // nanoclaw: scorch stain. Two flat dark tones only — an outline or a
+        // lighter centre turned it into a rock/gear; a burn has no rim and no highlight.
+        // Stepped and irregular per tile so no two burns are the same stamp.
+        const a = '#b3aa9d', b2 = '#948b7f';
+        const w1 = 6 + Math.floor(hash(X, Y, seed) * 4), w2 = 3 + Math.floor(hash(X + 5, Y, seed) * 3);
+        const ox = Math.floor(hash(X, Y + 3, seed) * 3), oy = Math.floor(hash(X + 3, Y, seed) * 3);
+        let s = r(X + 2 + ox, Y + 5 + oy, w1 + 3, 4, a) + r(X + 4 + ox, Y + 3 + oy, w1, 8, a) + r(X + 3 + ox, Y + 4 + oy, w1 + 1, 6, a);
+        s += r(X + 4 + ox, Y + 6 + oy, w2 + 2, 3, b2) + r(X + 5 + ox, Y + 5 + oy, w2, 5, b2);
+        for (let i = 0; i < 3; i++) s += r(X + 1 + Math.floor(hash(X + i, Y, seed) * 12), Y + 2 + Math.floor(hash(X, Y + i, seed) * 12), 2, 1, a);
+        return s;
+      }
+      case 'E': { // nanoclaw: easel — splayed legs, canvas with a work in progress
+        let s = r(X + 2, Y + 11, 2, 5, P.woodDk) + r(X + 12, Y + 11, 2, 5, P.woodDk) + r(X + 7, Y + 12, 2, 4, P.wood);
+        s += r(X + 2, Y + 2, 12, 10, P.wood) + r(X + 2, Y + 2, 12, 1, P.woodHi) + r(X + 2, Y + 11, 12, 1, P.woodDk);
+        s += r(X + 3, Y + 3, 10, 8, P.paper) + r(X + 3, Y + 3, 10, 1, P.white);
+        const inks = ['#c8624f', '#5b86ad', '#7f9c5c', '#c08a2e', '#8c6ea0'];
+        for (let i = 0; i < 3; i++) {
+          s += r(X + 4 + Math.floor(hash(X + i, Y, seed) * 4), Y + 4 + i * 2, 3 + Math.floor(hash(X, Y + i, seed) * 4), 2, inks[Math.floor(hash(X + i * 5, Y + i, seed) * inks.length)]);
+        }
+        return s;
+      }
+      case 'U': { // nanoclaw: poster wall — a run of pinned prints, colours vary by hash
+        const inks = ['#c8624f', '#5b86ad', '#7f9c5c', '#c08a2e', '#8c6ea0', '#4a8f8a'];
+        let s = r(X, Y, 16, 12, '#cfc6b2') + r(X, Y, 16, 1, '#e0d8c6') + r(X, Y + 11, 16, 1, '#b5ab96');
+        for (let i = 0; i < 2; i++) {
+          const px0 = X + 1 + i * 8, kk = hash(X + i * 3, Y, seed);
+          s += r(px0, Y + 1, 6, 9, inks[Math.floor(kk * inks.length)]);
+          s += r(px0, Y + 1, 6, 1, P.paper) + r(px0 + 1, Y + 3, 4, 2, P.paper) + r(px0 + 1, Y + 7, 3, 1, P.paper);
+        }
+        return s;
+      }
+      case 'n': { // nanoclaw: raven on a perch
+        const fe = '#2f333a', fh = '#474d57';
+        let s = r(X + 6, Y + 11, 3, 5, P.woodDk) + r(X + 2, Y + 9, 12, 2, P.wood) + r(X + 2, Y + 9, 12, 1, P.woodHi);
+        s += r(X + 5, Y + 4, 7, 5, fe) + r(X + 5, Y + 4, 7, 1, fh) + r(X + 10, Y + 5, 4, 4, fe) + r(X + 10, Y + 5, 4, 1, fh);
+        s += r(X + 5, Y + 1, 4, 4, fe) + r(X + 5, Y + 1, 4, 1, fh);
+        s += r(X + 2, Y + 3, 3, 2, '#8f8a7c') + r(X + 2, Y + 3, 3, 1, '#aaa496');
+        s += r(X + 7, Y + 2, 1, 1, '#dcd6c7');
+        s += r(X + 6, Y + 9, 1, 2, '#8a8378') + r(X + 9, Y + 9, 1, 2, '#8a8378');
+        return s;
+      }
+      case 'J': { // nanoclaw: boardroom table run — dark wood top, papers and cups vary by hash
+        let s = r(X, Y - 1, 16, 18, '#7d5738') + r(X, Y - 1, 16, 3, '#9c7149') + r(X, Y + 14, 16, 3, '#5f4029');
+        if (capL) s += r(X, Y - 1, 2, 18, '#5f4029') + r(X + 1, Y + 17, 3, 1, '#4e3521');
+        if (capR) s += r(X + 14, Y - 1, 2, 18, '#5f4029') + r(X + 12, Y + 17, 3, 1, '#4e3521');
+        if (k > 0.6) s += r(X + 3, Y + 4, 6, 4, P.paper) + r(X + 3, Y + 4, 6, 1, P.white) + r(X + 4, Y + 6, 4, 1, '#cfcabb');
+        if (k > 0.4) s += r(X + 11, Y + 5, 3, 3, P.white) + r(X + 11, Y + 5, 3, 1, '#e8e3d6');
+        if (k < 0.3) s += r(X + 5, Y + 9, 5, 3, '#5b86ad') + r(X + 5, Y + 9, 5, 1, '#7099c0');
+        return s;
+      }
+      case 'F': { // nanoclaw: server rack — slotted chassis with link LEDs
+        const cb = '#3d434a', ch = '#555d65', cd = '#2b3036';
+        let s = r(X + 1, Y, 14, 15, cb) + r(X + 1, Y, 14, 1, ch) + r(X + 1, Y + 14, 14, 1, cd);
+        for (let j = 0; j < 5; j++) {
+          const sy = Y + 1 + j * 3;
+          s += r(X + 2, sy, 12, 2, '#4d545c') + r(X + 2, sy, 12, 1, '#5e666f');
+          s += r(X + 3, sy, 1, 1, hash(X, sy, seed) > 0.4 ? '#6fd68f' : '#c08a2e');
+          s += r(X + 5, sy, 1, 1, hash(X + 3, sy, seed) > 0.6 ? '#7fb2cf' : '#4d545c');
+        }
+        return s;
+      }
       default: return '';
     }
   }
@@ -258,22 +698,28 @@
    * The grids are hand-authored and must NOT be generated per-poll — a plan
    * that reshuffles destroys the spatial memory that is the whole point. */
   const ROOMS = {
+    /* nanoclaw: THEMED — the call floor. Three runs of phone/headset desks,
+     * whiteboards and queue displays on the top wall, carpet so it reads
+     * soft against the factory/plant concrete. */
     westFront: {
-      label: 'room one', floor: 'wood', open: 22, state: 'blocked', wall: '#a9b79a',
+      label: 'room one', floor: 'carpetWarm', open: 22, state: 'blocked', wall: '#9ab6c4',
       grid: [
-        'wwww.bb..wwww.p',
-        'TTTT.TT..TTTT..',
-        '..1....2...c...',
-        'B.............B',
-        'O............x.',
-        'p..c...c...c..e',
-        'TTTT..TTTTT..pp',
+        'qq.wwww.qq.ww.p',
+        'PPPPPPPP.PPPPP.',
+        '..1..2...c.c.c.',
+        'W.PPPPPP.PPPP.B',
+        'p.cccccc.cccc.p',
+        'W.c..c...c..c.e',
+        'PPPPPP.PPPPPP.p',
       ],
       agents: [
         { name: 'one', status: 'blocked', shirt: '#5b86ad', shirtHi: '#6f9bc2', hair: '#3a2e26', hairHi: '#4b3c31' },
         { name: 'two', status: 'working', shirt: '#7f9c5c', shirtHi: '#93b06d', hair: '#7a4f2c', hairHi: '#8f6038', skin: '#f0cfa8' },
       ],
     },
+    /* nanoclaw: GENERIC — deliberately untouched. Unthemed and brand-new
+     * channels land here, so it has to keep looking like the plain office the
+     * whole floor used to be. */
     eastFront: {
       label: 'room two', floor: 'wood', open: 9, state: 'waiting', wall: '#a6a9cd',
       grid: [
@@ -286,14 +732,20 @@
       ],
       agents: [{ name: 'three', status: 'waiting', shirt: '#c39a4e', shirtHi: '#d6ad60', hair: '#4a3728', skin: '#d9a97e' }],
     },
+    /* nanoclaw: THEMED — the BBQ room, played straight. The smoker is the
+     * hero: a four-tile barrel on the top wall whose chimney pokes through the
+     * roofline, with the meat rack next to it and prep counters either side.
+     * `fx.at` is that chimney tile — the smoke plume hangs off it. */
     kitchen: {
-      label: 'room three', floor: 'tile', open: 31, state: 'blocked', wall: '#92a7b3',
+      label: 'room three', floor: 'quarry', open: 31, state: 'blocked', wall: '#b08a6a',
+      // nanoclaw: `at` = the chimney tile (run's left cap), `ember` = the firebox drum on the right cap
+      fx: { kind: 'smoke', at: [0, 0], ember: [2, 0] },
       grid: [
-        'kkksfkk..ww.p',
-        '.....1....2..',
-        '......c....xB',
-        'O.....c.c...B',
-        'O...........e',
+        'MMM..mmm.kkk.',
+        '...R..2....u.',
+        'f.1.kkkk...xB',
+        'f...uuuu...pB',
+        'p...mmm....xs',
         'p.kkkkkk..ppx',
       ],
       agents: [
@@ -301,36 +753,49 @@
         { name: 'five', status: 'idle', shirt: '#4f5560', shirtHi: '#626875', hair: '#1f1a16' },
       ],
     },
+    /* nanoclaw: THEMED — mission control. The whole top wall is one
+     * continuous monitor bank, a console arc faces it, and the command desk sits
+     * dead centre with its seat looking straight up at the wall. `fx.at` covers
+     * the monitor run so the glow lights exactly those tiles. */
     westBack: {
-      label: 'room four', floor: 'carpet', open: 6, state: 'working', wall: '#c49a86',
+      label: 'room four', floor: 'carpetSlate', open: 6, state: 'working', wall: '#8fa0bd',
+      fx: { kind: 'glow', at: [0, 0, 13, 1] },
       grid: [
-        'ww.bb..ww..bb.p',
-        'TTT.TT.TTT.TT..',
-        '..1...c...c....',
-        'B.............B',
-        'O............x.',
-        'p..c...c...c..e',
-        'TTTT..TTTT..TT.',
+        'VVVVVVVVVVVVV.p',
+        'YYYYY.YYYYY.YY.',
+        'cc2cc.ccccc.cc.',
+        'F.............F',
+        '..YYYYYYYYYYY..',
+        '..ccccc1ccccc..',
+        'W.....H.......e',
       ],
       agents: [{ name: 'six', status: 'working', shirt: '#6f9b6a', shirtHi: '#82b07c', hair: '#241c17', skin: '#e8c091' }],
     },
+    /* nanoclaw: THEMED — the intern library, a study room that softens into a
+     * lounge: shelf wall and two study tables up top, then couches, bean bags
+     * and lamps over a rug. Wood floor, warm parchment walls. */
     eastBack: {
       label: 'room five', floor: 'wood', open: 0, state: 'idle', wall: '#cbbfa2',
+      /* nanoclaw: muted dusty blue. rugFill lays vertical accent stripes, so ANY
+       * warm rug on a wood floor reads as more floorboards — clay failed for
+       * exactly the reason the teal did. It has to be a cool tone to read as a
+       * rug at all; this one sits with the carpet/steel end of the palette. */
+      rug: [2, 4, 9, 2, '#93a0ad', '#7b8896', true],
       grid: [
-        'wwww.bbb..ww.',
-        'TTTT.TTT.TTT.',
-        '.c..c..c..c..',
-        'B...........B',
-        'O...........e',
-        'p..c....c...p',
-        'pTTTT..TTTT.p',
+        'bbbb.bbb.bb.p',
+        '..JJ...JJ....',
+        '..1.....2...B',
+        'O.........L.B',
+        'O...z.z.z...p',
+        'O..z..z..z..B',
+        'p.oo.bbb.oo.p',
       ],
       agents: [],
     },
     garage: {
       // nanoclaw: open 2 -> 0. Only the five SLOT rooms take live counts, so the
       // garage kept the authored demo number and rendered it as if it were real.
-      label: 'garage', floor: 'concrete', open: 0, state: 'idle', dead: true, wall: '#b3aea4',
+      label: 'garage', floor: 'bays', open: 0, state: 'idle', dead: true, wall: '#b3aea4',
       grid: [
         'CbbbS..ww.xC',
         'gg.S...d...x',
@@ -347,84 +812,107 @@
      * ten live channels, so half the workgroup — including its busiest rooms —
      * had nowhere to stand and fell into the overflow line. Geometry stays
      * hand-authored and fixed; only the count grew. */
+    /* nanoclaw: THEMED — the factory floor, an actual factory interior. Two
+     * conveyor runs cross the floor, workbenches sit between them, crates
+     * stack in the corners, concrete underfoot. */
     eastWingN: {
-      label: 'room six', floor: 'wood', open: 0, state: 'idle', wall: '#b0a98f',
+      label: 'room six', floor: 'factory', open: 0, state: 'idle', wall: '#b6a37f',
       grid: [
-        'ww.bb..ww..bb.p',
-        'TTT.TT.TTT.TT..',
-        '..1...c...c....',
-        'B.............B',
-        'O............x.',
-        'p..c...c...c..e',
-        'TTTT..TTTT..TT.',
+        'hhhh..ee..hhhh.',
+        'AAAAAAAAAAAAAAA',
+        '..1......2...x.',
+        'x...........xx.',
+        'x..hhhh..hhhh.x',
+        'p..AAAAAAAAAAAA',
+        'xx.........xxxp',
       ],
       agents: [],
     },
+    /* nanoclaw: THEMED — the plant room. Data pipelines drawn as literal
+     * pipelines. The plumbing has to close: headers run the top and
+     * bottom walls, a riser joins them down the left wall through `+` elbow
+     * junctions at both corners, and the far ends are blind-flanged rather than
+     * just stopping. Tank farm on the floor, gauge panel and console by the door. */
     eastWingM: {
-      label: 'room seven', floor: 'carpet', open: 0, state: 'idle', wall: '#9db3a4',
+      label: 'room seven', floor: 'raised', open: 0, state: 'idle', wall: '#9db3a4',
       grid: [
-        'wwww.bbb..ww..p',
-        'TTTT.TTT.TTT...',
-        '..1....2...c...',
-        'B.............B',
-        'O.............e',
-        'p..c...c...c..x',
-        'TTTT..TTTTT..pp',
+        '+IvIIIIvIIII.GG',
+        'i.YYY.N...YYYY.',
+        'i.2.......1.c..',
+        'i...N...N...N..',
+        'i.............x',
+        'i...N...N.NNN..',
+        '+IIvIIIIIIII.p.',
       ],
       agents: [],
     },
+    /* nanoclaw: THEMED — the proving ground. Gantry rigs top and
+     * bottom, crash dummies standing around between them, scorch marks burnt
+     * into bare concrete, telemetry displays on the walls. */
     eastWingS: {
-      label: 'room eight', floor: 'tile', open: 0, state: 'idle', wall: '#b3a2a8',
+      label: 'room eight', floor: 'epoxy', open: 0, state: 'idle', wall: '#b3a2a8',
       grid: [
-        'kkksfk..ww..bb.',
-        '.....1....2....',
-        'B.....c....c..B',
-        'O.............e',
-        'O............x.',
-        'p.kkkk..TTTT.pp',
+        'ee..ZZZZ..ee.x.',
+        '...%1%.2%.....x',
+        'W..%.%Q%......x',
+        'W.ZZZ...ZZZ...x',
+        'x.%%%Q.%%%%Q..e',
+        'x..%..hhhh.%..x',
       ],
       agents: [],
     },
+    /* nanoclaw: THEMED — the studio, a creative space. Poster walls top and
+     * bottom, easels facing them with the seats at the easel, a worktable run
+     * across the middle, and the raven on its perch by the right wall. */
     southWest: {
-      label: 'room nine', floor: 'wood', open: 0, state: 'idle', wall: '#c0b394',
+      // nanoclaw: no rug. The centre slab read as a swimming pool; the studio's own
+      // working mass — worktable run, print rack, poster stacks — owns the middle instead.
+      label: 'room nine', floor: 'wood', open: 0, state: 'idle', wall: '#b8a2bd',
       grid: [
-        'ww.bb..wwww.bb.',
-        'TTT.TT.TTTT.TT.',
-        '..1...c....c...',
-        'B.............B',
-        'O............x.',
-        'p..c...c...c..e',
-        'TTTT..TTTT..TT.',
+        'UUUUU..UUUU..p.',
+        '..E...E....E...',
+        '..1...2......y.',
+        'W..&&&&&&&...y.',
+        'O..u.uu..u.u..n',
+        'p.,.E.,,..E.,.x',
+        'p..UUUU..UUU.pp',
       ],
       agents: [],
     },
+    /* nanoclaw: THEMED — the boardroom. One long table run with chairs down
+     * both sides, wall charts and displays above it, plants, and nothing
+     * else: the emptiness is the point of a boardroom. */
     southMid: {
       label: 'room ten', floor: 'carpet', open: 0, state: 'idle', wall: '#a8aec2',
       grid: [
-        'ww.bbb..ww.p.',
-        'TTT.TT.TTTT..',
-        '..1...c...c..',
-        'O...........B',
-        'O.....c.c...B',
-        'p..TTTTTT..px',
+        'HH..ee..HH.p.',
+        '.ccccccccc...',
+        '.JJJJJJJJJ...',
+        '.1cccc2cc....',
+        'W..........pB',
+        'p.XXX..XXX.pp',
       ],
       agents: [],
     },
+    /* nanoclaw: THEMED — the NOC annex, a small ops room off the boardroom.
+     * Wall of displays, two short desk runs, server racks down the left wall. */
     southEast: {
-      label: 'room eleven', floor: 'concrete', open: 0, state: 'idle', wall: '#aeb0ab',
+      label: 'room eleven', floor: 'noc', open: 0, state: 'idle', wall: '#9fa8ab',
       grid: [
-        'ww..bb..ww.p.',
-        'TTT.TT.TTTT..',
-        '..1...c...c..',
-        'B...........B',
-        'O.....c.c...e',
-        'p..TTTTTT..xp',
+        'eeee..eee.FF.',
+        'YYYY..YYY....',
+        'cc1c..cc2....',
+        'F..........pW',
+        'F.cccc.cccc.p',
+        'p.YYYY.YYYY.p',
       ],
       agents: [],
     },
     hall: {
       label: 'hallway', floor: 'brick', open: 0, state: 'idle', quiet: true,
-      grid: ['p...x.....b...p', '...............', 'B....p.....x..B'],
+      // nanoclaw: a copier bank and a bench in the middle, so the corridor is a place
+      // rather than a bare brick band the eye slides off.
+      grid: ['p...x..!!.b...p', '..x....oo...p..', 'B....p.....x..B'],
       agents: [],
     },
   };
@@ -445,13 +933,22 @@
         southWest: [7, 30], southMid: [23, 30], southEast: [37, 30],
         garage: [62, 4],
       },
+      /* nanoclaw: TRUNK BUG. Doors are painted AFTER the room floors, so a door
+       * rect that overlaps a room paints a brick slab across that room's floor.
+       * `[43,26,2,3]` and `[51,24,4,1]` both reached into eastWingS and had been
+       * doing so since the wing was added. Moved clear of the room rectangle;
+       * both still land on the yard path they connect to. Path rects that
+       * overlap rooms are harmless — paths are drawn BEFORE room floors — so
+       * those are deliberately left alone. Verified by scripts/decorcheck. */
       doors: [
         [13, 11, 2, 1], [13, 16, 2, 1], [22, 12, 1, 2], [22, 6, 1, 2], [22, 19, 1, 2],
-        [37, 8, 3, 1], [37, 16, 3, 1], [40, 11, 1, 2], [40, 20, 1, 2],
-        [57, 8, 4, 1], [13, 26, 2, 3], [29, 26, 2, 3], [43, 26, 2, 3], [51, 24, 4, 1],
+        [37, 8, 4, 1], [37, 16, 4, 1], [40, 11, 1, 2], [40, 20, 1, 2],
+        [57, 8, 4, 1], [13, 26, 2, 3], [29, 26, 2, 3], [43, 28, 2, 2], [56, 24, 2, 2],
       ],
+      /* nanoclaw: the two east-wing bridges stopped one tile short of the wall
+       * they lead to, leaving a grass gap mid-crossing. Widened 3 -> 4. */
       paths: [
-        [37, 8, 3, 1], [37, 16, 3, 1], [57, 8, 4, 1],
+        [37, 8, 4, 1], [37, 16, 4, 1], [57, 8, 4, 1],
         [13, 26, 2, 3], [29, 26, 2, 3], [43, 26, 2, 3],
         [12, 27, 32, 2], [58, 12, 3, 16], [51, 24, 8, 2], [53, 28, 16, 2], [61, 13, 4, 2],
       ],
@@ -461,10 +958,14 @@
         ['tree', 77, 4], ['palm', 76, 15], ['palm', 77, 30], ['bush', 38, 40], ['bush', 16, 41],
         ['tree', 25, 0], ['bush', 46, 0], ['palm', 33, 0], ['palm', 59, 0],
         ['lounger', 58, 37], ['lounger', 61, 37], ['umbrella', 64, 36], ['table', 70, 31],
-        ['bench', 16, 26], ['bench', 44, 26], ['car', 66, 14], ['hoop', 71, 24],
+        ['bench', 16, 26], ['bench', 34, 26], ['car', 66, 14], ['hoop', 71, 24],
         ['bush', 74, 39], ['bush', 8, 0], ['bush', 52, 40], ['tree', 2, 40], ['bush', 20, 40],
-        ['palm', 53, 5], ['palm', 55, 27], ['tree', 71, 40], ['bush', 70, 20], ['bush', 30, 41],
-        ['bush', 0, 33], ['palm', 2, 33], ['palm', 72, 6], ['tree', 59, 0], ['bush', 46, 41],
+        /* nanoclaw: TRUNK BUG. Four props were placed inside building footprints —
+         * three palms and a bench growing through the factory, the testing bay and
+         * the garage roof. Relocated to verified lawn, clear of buildings, pool and
+         * paths. `bench` came out of the same sweep, not the original report. */
+        ['palm', 63, 20], ['palm', 63, 26], ['tree', 71, 40], ['bush', 70, 20], ['bush', 30, 41],
+        ['bush', 0, 33], ['palm', 2, 33], ['palm', 74, 16], ['tree', 59, 0], ['bush', 46, 41],
       ],
     },
     compound: {
@@ -474,7 +975,8 @@
       doors: [[13, 14, 2, 1], [31, 11, 2, 1], [31, 19, 2, 1], [48, 13, 2, 1], [13, 27, 2, 1], [29, 34, 2, 1], [22, 8, 1, 2]],
       paths: [[13, 14, 3, 4], [13, 17, 18, 2], [30, 19, 3, 6], [13, 27, 18, 2], [48, 13, 3, 10], [31, 21, 18, 2], [29, 34, 3, 2]],
       pool: [41, 24, 12, 7],
-      decor: [['palm', 22, 3], ['palm', 22, 15], ['tree', 1, 8], ['bush', 3, 15], ['tree', 57, 16], ['palm', 39, 6], ['palm', 39, 31], ['bush', 20, 33], ['bush', 34, 21], ['lounger', 41, 32], ['lounger', 44, 32], ['umbrella', 47, 31], ['table', 34, 15], ['bench', 18, 30], ['car', 51, 25], ['bush', 56, 4], ['tree', 1, 30], ['palm', 56, 33], ['bush', 40, 22], ['hoop', 19, 5]],
+      decor: [['palm', 22, 3], ['palm', 22, 15], ['tree', 1, 8], ['bush', 3, 15], ['tree', 57, 16], ['palm', 39, 6], ['palm', 39, 31], ['bush', 20, 33], ['bush', 34, 21], ['lounger', 41, 32], ['lounger', 44, 32], ['umbrella', 47, 31], ['table', 34, 21], ['bench', 18, 30], ['car', 51, 25], ['bush', 56, 4], ['tree', 1, 30], ['palm', 56, 33], ['bush', 40, 22], ['hoop', 1, 3]],
+      // nanoclaw: same sweep — the compound plan had a table and a hoop inside buildings too.
     },
   };
 
@@ -540,7 +1042,7 @@
       const w = R.grid[0].length, h = R.grid.length;
       rooms.push({ key, R, rx, ry, w, h });
       s += floorFill(R.floor, rx, ry, w, h);
-      if (R.rug) s += rugFill(rx + R.rug[0], ry + R.rug[1], R.rug[2], R.rug[3], R.rug[4], R.rug[5]);
+      if (R.rug) s += rugFill(rx + R.rug[0], ry + R.rug[1], R.rug[2], R.rug[3], R.rug[4], R.rug[5], R.rug[6]);
       const wc = R.wall || '#c6c1b6', X = rx * T, Y = ry * T, WW = w * T, HH = h * T;
       s += r(X - 5, Y - 5, WW + 10, 5, wc) + r(X - 5, Y + HH, WW + 10, 5, wc) + r(X - 5, Y - 5, 5, HH + 10, wc) + r(X + WW, Y - 5, 5, HH + 10, wc);
       s += r(X - 5, Y - 5, WW + 10, 2, '#ffffff') + r(X - 5, Y - 5, 2, HH + 10, 'rgba(255,255,255,.45)');
@@ -577,6 +1079,14 @@
 .world{position:absolute;left:0;top:0;transform-origin:0 0}
 .art{image-rendering:pixelated;user-select:none;-webkit-user-drag:none;pointer-events:none}
 .ov{position:absolute;inset:0}
+/* nanoclaw: keep every text chrome element on its own compositing layer. The
+   overlay gains and loses layers as rooms start and stop working (fx divs
+   appear, idle agents stop bobbing), and Blink was flipping ALL the labels
+   between subpixel and greyscale antialiasing when that happened — one room
+   starting to cook visibly re-rendered every room name in the building.
+   Pinning the layer pins the AA mode. (-webkit-font-smoothing is a no-op
+   outside macOS, so it cannot be used for this.) */
+.room,.pill,.bub,.sign,.badge{backface-visibility:hidden}
 .hit{position:absolute;cursor:pointer;border:0;padding:0;background:transparent}
 .hit:focus-visible{outline:2px solid #3f68c9;outline-offset:2px}
 /* nanoclaw: the PEOPLE are clickable too, not just the rooms. The visual is
@@ -593,6 +1103,12 @@
 .pill.below:after{top:-3px;bottom:auto}
 .pill{display:flex;align-items:center;gap:5px;background:#2c2822;color:#fbf8f2;font:500 11px/1 ui-sans-serif,system-ui,-apple-system,sans-serif;padding:4px 7px;border-radius:6px;white-space:nowrap;box-shadow:0 2px 4px rgba(40,32,20,.28);pointer-events:none}
 .pill:after{content:"";position:absolute;left:50%;bottom:-3px;width:6px;height:6px;background:#2c2822;transform:translateX(-50%) rotate(45deg)}
+/* nanoclaw: the pill hangs INSIDE the room, off its BOTTOM-left. Hanging it over
+   the TOP edge parked every label on the NEIGHBOUR's floor (the BBQ room's label
+   covered a desk row in the room above). Anchoring it inside the top-left instead
+   just traded that for covering the room's own agent pills, which cluster in the
+   upper rows — so it goes to the bottom edge, where the grids only ever put wall
+   furniture and never a seat. Same bottom-anchored trick the sign mode uses. */
 .room{position:absolute;transform:translate(0,-100%);display:flex;align-items:center;gap:6px;background:#2c2822;color:#fbf8f2;font:500 11.5px/1 ui-sans-serif,system-ui,sans-serif;padding:5px 8px;border-radius:6px;white-space:nowrap;box-shadow:0 2px 4px rgba(40,32,20,.25);pointer-events:none}
 .room .n{font-variant-numeric:tabular-nums;font-weight:600;background:rgba(255,255,255,.16);border-radius:4px;padding:1px 5px}
 .bub{position:absolute;transform:translate(-50%,-100%);background:#fbfaf6;border-radius:8px;padding:4px 6px;display:flex;gap:3px;align-items:center;box-shadow:0 2px 4px rgba(40,32,20,.25);pointer-events:none}
@@ -610,7 +1126,45 @@
 .sign{position:absolute;transform:translate(0,-100%);background:rgba(253,251,246,.95);border-radius:5px;padding:4px 8px;font:500 11px/1 ui-sans-serif,system-ui,sans-serif;color:#453e33;box-shadow:0 2px 4px rgba(40,32,20,.22);display:flex;align-items:center;gap:6px;white-space:nowrap;pointer-events:none}
 .sel{position:absolute;border:2px solid #2f2a24;border-radius:4px;box-shadow:0 0 0 4px rgba(255,255,255,.45);pointer-events:none}
 .mute{opacity:.5}
-@media (prefers-reduced-motion:reduce){.ag,.bub i{animation:none}}
+/* nanoclaw: the two keyed effects. Both are pointer-transparent, both mute with
+   everything else when another room is selected, and both stop dead under
+   prefers-reduced-motion — the room still reads without them. */
+.fx{position:absolute;pointer-events:none}
+/* Hard-edged discs, NOT blurred blobs: a gaussian smudge over a crisp-edge
+   pixel world reads as a rendering fault. Dense opaque core + a lighter ring
+   (the ring is a lighter shade of the puff's own fill) keeps it in the
+   tileset's shading language and makes it survive at 1:1 map scale, where the
+   earlier translucent version measured ~2/255 against the floor. */
+.fx.smoke i{position:absolute;left:50%;bottom:0;display:block;width:calc(11px * var(--s,1));height:calc(11px * var(--s,1));margin-left:calc(-5.5px * var(--s,1));border-radius:50%;background:#6f685c;box-shadow:0 0 0 calc(1.5px * var(--s,1)) #a8a091 inset;opacity:0;animation:puff 2.2s linear infinite}
+/* negative delays: the three puffs start already spread across the loop, so the
+   plume is continuous from the first painted frame instead of empty for a second */
+.fx.smoke i:nth-child(1){animation-delay:-.2s}
+.fx.smoke i:nth-child(2){animation-delay:-.93s}
+.fx.smoke i:nth-child(3){animation-delay:-1.66s}
+/* The small leftward drift is DELIBERATE, not slop: straight up would stack the
+   plume on the room label, and drifting left carries it over the corridor and the
+   corner of #general rather than across that room's desks. Kept to -1.5px so it
+   still reads as leaving the stack mouth. */
+@keyframes puff{
+  0%{opacity:0;transform:translate(0,0) scale(.5)}
+  12%{opacity:1}
+  66%{opacity:.92}
+  100%{opacity:0;transform:translate(calc(-1.5px * var(--s,1)),calc(-27px * var(--s,1))) scale(2.3)}
+}
+/* the lit firebox, and the warm light it throws on the floor around the pit */
+.fx.ember{border-radius:1px;background:#f5b45e;box-shadow:0 0 0 2px #d97b28 inset;animation:emberpulse 1.7s ease-in-out infinite}
+.fx.bounce{border-radius:50%;background:radial-gradient(circle at 50% 50%,rgba(240,160,66,.5),rgba(240,160,66,.2) 55%,rgba(240,160,66,0) 78%);animation:emberpulse 1.7s ease-in-out infinite}
+@keyframes emberpulse{0%,100%{opacity:.72}50%{opacity:1}}
+/* Screens only — the frame is a physical object and never changes.
+   NO mix-blend-mode anywhere in here: a blended element forces its whole
+   stacking context to re-rasterize, which silently flipped every room label
+   from subpixel to greyscale antialiasing the moment any room started working.
+   Plain alpha over a dark wall lifts it just as well and the diff stays clean. */
+.fx.glow{overflow:hidden}
+.fx.glow i{position:absolute;left:0;right:0;display:block;background:rgba(150,214,246,.62);animation:wallwake 3.6s ease-in-out -1.2s infinite}
+.fx.bleed{background:linear-gradient(to bottom,rgba(150,214,246,.4),rgba(150,214,246,0));animation:wallwake 3.6s ease-in-out -1.2s infinite}
+@keyframes wallwake{0%,100%{opacity:.6}50%{opacity:1}}
+@media (prefers-reduced-motion:reduce){.ag,.bub i,.fx.smoke i,.fx.glow i,.fx.bleed,.fx.ember,.fx.bounce{animation:none}.fx.smoke i{opacity:.7}}
 `;
 
   class OfficeMap extends HTMLElement {
@@ -674,12 +1228,47 @@
         const isSel = selected === m.key, col = STATUS[m.R.state];
         ov += `<button class="hit" data-room="${m.key}" aria-label="${m.R.label}" style="left:${px(L)};top:${px(Tp)};width:${px(Wr)};height:${px(Hr)}"></button>`;
         if (isSel) ov += `<div class="sel" style="left:${px(L)};top:${px(Tp)};width:${px(Wr)};height:${px(Hr)}"></div>`;
+        /* nanoclaw: state-driven fx. A themed room declares an anchor in tile
+         * coordinates; the overlay only exists while one of that room's LIVE
+         * occupants is `working`. Asleep is not cooking, and decorative-by-
+         * default is explicitly out — an empty floor has no smoke and no lit
+         * wall. Lives in the DOM layer like the pills, so it can animate over
+         * the static world SVG. `--s` carries the zoom into the keyframes so a
+         * puff stays the same size on screen at any scale. */
+        const fx = m.R.fx;
+        if (fx && (m.R.agents || []).some((a) => a && a.status === 'working')) {
+          const fxL = (m.rx + fx.at[0]) * T, fxT = (m.ry + fx.at[1]) * T, mu = selected && !isSel ? ' mute' : '';
+          if (fx.kind === 'smoke') {
+            /* Everything that says "this thing is COOKING" lives here, because all
+             * of it is state. The world SVG draws the smoker cold — dark firebox,
+             * grey ash — so with nobody working there is no ember, no bounce light
+             * and no plume, and the room honestly reads as a cold pit.
+             * Offsets follow the `M` sprite's own geometry: the stack mouth sits
+             * 14px above the anchor tile, and the firebox drum is on the run's far
+             * cap (`fx.ember`), 12px down from its tile top. */
+            ov += `<div class="fx smoke${mu}" style="--s:${s};left:${px(fxL - 1)};top:${px(fxT - 42)};width:${px(14)};height:${px(29)}"><i></i><i></i><i></i></div>`;
+            if (fx.ember) {
+              const eL = (m.rx + fx.ember[0]) * T, eT = (m.ry + fx.ember[1]) * T;
+              ov += `<div class="fx bounce${mu}" style="left:${px(eL - 4)};top:${px(eT + 10)};width:${px(32)};height:${px(30)}"></div>`;
+              ov += `<div class="fx ember${mu}" style="left:${px(eL + 12)};top:${px(eT + 18)};width:${px(3)};height:${px(3)}"></div>`;
+            }
+          } else if (fx.kind === 'glow') {
+            /* Only the SCREENS light. The frame, bezels and mullions are physical
+             * objects and stay exactly as painted — a wash over the whole run just
+             * reads as someone nudging a brightness slider. The two bands match the
+             * screen rows the `V` sprite draws (y 1..6 and 7..12 of each 16px tile);
+             * `bleed` is the light the wall throws onto the floor under it. */
+            const gw = fx.at[2] * T, gh = fx.at[3] * T;
+            ov += `<div class="fx glow${mu}" style="left:${px(fxL)};top:${px(fxT)};width:${px(gw)};height:${px(gh)}"><i style="top:${100 / 16}%;height:${500 / 16}%"></i><i style="top:${700 / 16}%;height:${500 / 16}%"></i></div>`;
+            ov += `<div class="fx bleed${mu}" style="left:${px(fxL)};top:${px(fxT + gh - 2)};width:${px(gw)};height:${px(14)}"></div>`;
+          }
+        }
         if (!m.R.label) return; // nanoclaw: an unassigned slot draws furniture, no chrome
         if (labels === 'pill') {
-          ov += `<div class="room${selected && !isSel ? ' mute' : ''}" style="left:${px(L + 8)};top:${px(Tp - 3)}"><span class="dot" style="background:${col}"></span>${m.R.label}${m.R.open ? `<span class="n">${m.R.open}</span>` : ''}</div>`;
+          ov += `<div class="room${selected && !isSel ? ' mute' : ''}" style="left:${px(L + 8)};top:${px(Tp + Hr - 6)}"><span class="dot" style="background:${col}"></span>${m.R.label}${m.R.open ? `<span class="n">${m.R.open}</span>` : ''}</div>`;
         } else if (labels === 'badge') {
           ov += `<div class="badge" style="--bc:${col};left:${px(L + Wr / 2)};top:${px(Tp + Hr / 2)}">${m.R.open}</div>`;
-          if (isSel) ov += `<div class="room" style="left:${px(L + 8)};top:${px(Tp - 3)}"><span class="dot" style="background:${col}"></span>${m.R.label}</div>`;
+          if (isSel) ov += `<div class="room" style="left:${px(L + 8)};top:${px(Tp + Hr - 6)}"><span class="dot" style="background:${col}"></span>${m.R.label}</div>`;
         } else {
           ov += `<div class="sign" style="left:${px(L + 8)};top:${px(Tp + Hr - 6)}"><span class="dot" style="background:${col}"></span>${m.R.label}${m.R.open ? `<b style="font-variant-numeric:tabular-nums">${m.R.open}</b>` : ''}</div>`;
         }

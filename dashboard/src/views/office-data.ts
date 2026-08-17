@@ -20,6 +20,10 @@ export const SLOTS = [
 ] as const;
 export type Slot = (typeof SLOTS)[number];
 
+function isSlot(value: string): value is Slot {
+  return (SLOTS as readonly string[]).includes(value);
+}
+
 export type OfficeState = 'blocked' | 'waiting' | 'working' | 'idle';
 
 export interface OfficeAgent {
@@ -115,11 +119,23 @@ export function roomState(agents: OfficeAgent[], open: number): OfficeState {
  * `open` counts stay 0 until release items carry the channel they belong to:
  * as of 2026-08-16 not one of 71 items does, so there is nothing to count. The
  * map shows no number rather than a made-up one.
+ *
+ * `themed` (normalized channel name → slot) binds a room to a slot by name
+ * instead of arrival order — a themed room should always host the same
+ * channel, because the point of a themed floor is spatial memory, and a
+ * room that could land anywhere on any given poll defeats that the moment a
+ * channel is added or removed elsewhere. It is INSTALL CONFIG, never trunk
+ * source: a channel name is install identity (`check:public-boundary` rightly
+ * flags it), so the real mapping lives in the operator's untracked
+ * `.nanoclaw/office-themes.json` and arrives here from the observatory
+ * snapshot. No config (the default) → every room falls through to plain
+ * order-fill, byte-identical to before themes existed.
  */
 export function buildOfficeData(
   rooms: ObservatoryRoom[],
   agents: ObservatoryAgent[],
   items: ReleaseItem[] = [],
+  themed: Record<string, string> = {},
   now = Date.now(),
 ): OfficeData {
   const breachedOwners = new Set(
@@ -129,17 +145,44 @@ export function buildOfficeData(
       .filter((o): o is string => typeof o === 'string' && o.length > 0),
   );
 
-  const placed = rooms.slice(0, SLOTS.length);
-  const out: OfficeRoomData[] = placed.map((room, i) => {
-    const slot = SLOTS[i]!;
+  // Pass 1: a themed room claims its slot by name, not by arrival order.
+  // First claimant wins; a themed name that repeats (or names a slot already
+  // taken) falls through to pass 2 below. `themed` is operator-written JSON,
+  // so an entry naming something that isn't a real slot is ignored rather
+  // than trusted.
+  const slotOf = new Map<number, Slot>(); // room index -> assigned slot
+  const claimedSlots = new Set<Slot>();
+  rooms.forEach((room, i) => {
+    const themedSlot = themed[room.name.replace(/^#/, '').toLowerCase()];
+    if (themedSlot && isSlot(themedSlot) && !claimedSlots.has(themedSlot)) {
+      slotOf.set(i, themedSlot);
+      claimedSlots.add(themedSlot);
+    }
+  });
+
+  // Pass 2: everything that didn't claim a themed slot fills what's left, in
+  // SLOTS order — this is exactly the old order-fill, so an install with no
+  // themed channel names behaves byte-identically to before.
+  const remainingSlots = SLOTS.filter((s) => !claimedSlots.has(s));
+  let nextSlot = 0;
+  rooms.forEach((_room, i) => {
+    if (slotOf.has(i)) return;
+    if (nextSlot < remainingSlots.length) slotOf.set(i, remainingSlots[nextSlot++]!);
+  });
+
+  const out: OfficeRoomData[] = [];
+  const overflow: string[] = [];
+  rooms.forEach((room, i) => {
+    const slot = slotOf.get(i);
+    if (!slot) { overflow.push(room.name); return; }
     const here: OfficeAgent[] = agents
       .filter((a) => a.location === room.key)
       // The plan seats a bounded number per room; extra occupants would have
       // nowhere to sit, so they stay in the list rather than overlapping.
       .slice(0, 2)
       .map((a) => ({ name: a.name, status: agentState(a, breachedOwners), avatarUrl: a.avatarUrl, ...agentLook(a.id) }));
-    return { slot, label: room.name.startsWith('#') ? room.name : `#${room.name}`, open: 0, state: roomState(here, 0), agents: here };
+    out.push({ slot, label: room.name.startsWith('#') ? room.name : `#${room.name}`, open: 0, state: roomState(here, 0), agents: here });
   });
 
-  return { rooms: out, overflow: rooms.slice(SLOTS.length).map((r) => r.name) };
+  return { rooms: out, overflow };
 }

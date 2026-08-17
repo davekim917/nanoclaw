@@ -56,6 +56,46 @@ describe('buildOfficeData', () => {
     const items: ReleaseItem[] = [{ id: 'X#1', kind: 'pr', title: 't', nextMover: 'nobody' }];
     expect(buildOfficeData([room('r1')], [], items).rooms[0]!.open).toBe(0);
   });
+
+  // `themed` is install config (see office-data.ts) — these fixtures use
+  // anonymous, made-up channel names, never real ones, same reason the comp
+  // harness keeps its demo names anonymous.
+  it('a themed channel lands on its slot regardless of where it arrives', () => {
+    const themed = { grill: 'kitchen' };
+    const d = buildOfficeData([room('a'), room('b'), room('grill')], [], [], themed);
+    expect(d.rooms.find((r) => r.label === '#grill')!.slot).toBe('kitchen');
+  });
+
+  it('normalizes both a leading # and a bare (no #) form to bind', () => {
+    const themed = { grill: 'kitchen', studio: 'southWest' };
+    const d = buildOfficeData([room('gr', '#Grill'), room('st', 'studio')], [], [], themed);
+    expect(d.rooms.find((r) => r.label === '#Grill')!.slot).toBe('kitchen');
+    expect(d.rooms.find((r) => r.label === '#studio')!.slot).toBe('southWest');
+  });
+
+  it('unthemed channels skip claimed slots but keep filling in order', () => {
+    const themed = { grill: 'kitchen' };
+    const d = buildOfficeData([room('grill'), room('a'), room('b')], [], [], themed);
+    expect(d.rooms.find((r) => r.label === '#grill')!.slot).toBe('kitchen');
+    const rest = SLOTS.filter((s) => s !== 'kitchen');
+    expect(d.rooms.find((r) => r.label === '#a')!.slot).toBe(rest[0]);
+    expect(d.rooms.find((r) => r.label === '#b')!.slot).toBe(rest[1]);
+  });
+
+  it('a duplicate themed name falls through to generic fill, not dropped', () => {
+    const themed = { lobby: 'westFront' };
+    const d = buildOfficeData([room('s1', 'lobby'), room('s2', 'lobby')], [], [], themed);
+    expect(d.rooms).toHaveLength(2);
+    expect(d.rooms.find((r) => r.label === '#lobby' && r.slot === 'westFront')).toBeTruthy();
+    const other = d.rooms.find((r) => r.slot !== 'westFront');
+    expect(other!.slot).not.toBe('westFront');
+  });
+
+  it('ignores a themed entry naming something that is not a real slot', () => {
+    const themed = { grill: 'not-a-real-slot' };
+    const d = buildOfficeData([room('grill')], [], [], themed);
+    expect(d.rooms[0]!.slot).toBe(SLOTS[0]);
+  });
 });
 
 describe('agentState', () => {
