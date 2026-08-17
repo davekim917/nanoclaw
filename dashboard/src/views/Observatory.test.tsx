@@ -906,6 +906,42 @@ describe('Observatory', () => {
       expect(rows.filter((r) => r.className.includes('on')).map((r) => r.getAttribute('data-agent'))).toEqual(['kit']);
     });
 
+    /* obs.C.3 — the test above hand-dispatches `agent-select`, so it stayed
+     * green while a click on the person reached nothing at all. This one goes
+     * through the map's own shadow DOM: the face-bearing label over an agent's
+     * head is the part that reads as "the person", and clicking it has to pick
+     * them, not fall through to the floor. */
+    it('a click on the face label over an agent picks that agent', async () => {
+      // the floor seats a room's WIRED members, so this fixture wires them
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1', name: 'general', memberAgentIds: ['ava', 'kit'] })],
+          agents: [agent({ id: 'ava', name: 'ava', location: 'r1' }), agent({ id: 'kit', name: 'kit', location: 'r1' })],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const map = container.querySelector('office-map') as HTMLElement;
+      // the element defers its first paint to idle/intersection; nudge it.
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+      const sr = map.shadowRoot!;
+      const pads = Array.from(sr.querySelectorAll('.ahit'));
+      expect(pads.length).toBe(2);
+      const labels = Array.from(sr.querySelectorAll('.bub[data-agent]')) as HTMLElement[];
+      expect(labels.map((l) => l.dataset.agent)).toEqual(['ava', 'kit']);
+
+      let detail: { name: string; room: string } | null = null;
+      map.addEventListener('agent-select', (e) => {
+        detail = (e as CustomEvent<{ name: string; room: string }>).detail;
+      });
+      const label = labels[1]!;
+      (label.querySelector('.face') ?? label).dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true }));
+      expect(detail).toEqual({ name: 'kit', room: label.dataset.room });
+      // the generous budget is the map's FIRST paint: it concatenates and
+      // percent-encodes the whole world SVG, which costs ~15s under jsdom.
+    }, 45000);
+
     it('picking a room by hand carries no agent emphasis', async () => {
       const { container } = floor();
       await open(container, '#general');

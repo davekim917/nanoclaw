@@ -1097,7 +1097,11 @@
 .hit:focus-visible{outline:2px solid #3f68c9;outline-offset:2px}
 /* nanoclaw: the PEOPLE are clickable too, not just the rooms. The visual is
    still the 20x22 sprite; only the hit target is padded, to a fixed 40px box
-   centred on the sprite so a finger can land on it at any zoom. */
+   centred on the sprite so a finger can land on it at any zoom.
+   The pad covers the sprite ONLY — the pill/bubble hovering over the head sits
+   clear above it, and that chrome carries the agent's FACE, which is the part
+   that actually reads as "the person". So it takes clicks too (see .pill/.bub
+   below); both carry data-agent and the handler matches on that, not on .ahit. */
 .ahit{position:absolute;cursor:pointer;border:0;padding:0;background:transparent}
 .ahit:focus-visible{outline:2px solid #3f68c9;outline-offset:2px}
 .ag{position:absolute;image-rendering:pixelated;background-repeat:no-repeat;background-size:100% 100%;pointer-events:none;animation:bob 3.2s ease-in-out infinite}
@@ -1107,7 +1111,7 @@
 .pill{position:absolute;transform:translate(-50%,-100%);}
 .pill.below{transform:translate(-50%,0)}
 .pill.below:after{top:-3px;bottom:auto}
-.pill{display:flex;align-items:center;gap:5px;background:#2c2822;color:#fbf8f2;font:500 11px/1 ui-sans-serif,system-ui,-apple-system,sans-serif;padding:4px 7px;border-radius:6px;white-space:nowrap;box-shadow:0 2px 4px rgba(40,32,20,.28);pointer-events:none}
+.pill{display:flex;align-items:center;gap:5px;background:#2c2822;color:#fbf8f2;font:500 11px/1 ui-sans-serif,system-ui,-apple-system,sans-serif;padding:4px 7px;border-radius:6px;white-space:nowrap;box-shadow:0 2px 4px rgba(40,32,20,.28);pointer-events:auto;cursor:pointer}
 .pill:after{content:"";position:absolute;left:50%;bottom:-3px;width:6px;height:6px;background:#2c2822;transform:translateX(-50%) rotate(45deg)}
 /* nanoclaw: the pill hangs INSIDE the room, off its BOTTOM-left. Hanging it over
    the TOP edge parked every label on the NEIGHBOUR's floor (the BBQ room's label
@@ -1117,7 +1121,7 @@
    furniture and never a seat. Same bottom-anchored trick the sign mode uses. */
 .room{position:absolute;transform:translate(0,-100%);display:flex;align-items:center;gap:6px;background:#2c2822;color:#fbf8f2;font:500 11.5px/1 ui-sans-serif,system-ui,sans-serif;padding:5px 8px;border-radius:6px;white-space:nowrap;box-shadow:0 2px 4px rgba(40,32,20,.25);pointer-events:none}
 .room .n{font-variant-numeric:tabular-nums;font-weight:600;background:rgba(255,255,255,.16);border-radius:4px;padding:1px 5px}
-.bub{position:absolute;transform:translate(-50%,-100%);background:#fbfaf6;border-radius:8px;padding:4px 6px;display:flex;gap:3px;align-items:center;box-shadow:0 2px 4px rgba(40,32,20,.25);pointer-events:none}
+.bub{position:absolute;transform:translate(-50%,-100%);background:#fbfaf6;border-radius:8px;padding:4px 6px;display:flex;gap:3px;align-items:center;box-shadow:0 2px 4px rgba(40,32,20,.25);pointer-events:auto;cursor:pointer}
 .bub i{width:4px;height:4px;border-radius:50%;background:#8a857c;animation:blink 1.4s infinite}
 .bub i:nth-child(2){animation-delay:.2s}.bub i:nth-child(3){animation-delay:.4s}
 .bub.z{font:600 10px/1 ui-sans-serif,system-ui,sans-serif;color:#8a857c;padding:3px 6px}
@@ -1287,16 +1291,20 @@
          * on top of the name. No avatar → the label is exactly what it was. */
         const src = faceSrc(p.a.avatarUrl);
         const face = src ? `<img class="face${st === 'idle' ? ' i' : ''}" src="${src}" alt="" style="width:${px(20)};height:${px(20)}">` : '';
+        /* nanoclaw: everything that IS this person carries the same identity —
+         * the sprite's hit pad and the face-bearing label over their head. The
+         * click handler matches on data-agent, so both routes pick the person. */
+        const who = ` data-agent="${p.a.name}" data-room="${p.room}"`;
         ov += `<div class="ag ${st === 'working' ? 'w' : st === 'idle' ? 'i' : ''}${mute ? ' mute' : ''}" style="left:${px(p.x)};top:${px(p.y)};width:${px(20)};height:${px(22)};background-image:url('${agentSvg(p.a)}')"></div>`;
-        if (agentMode === 'pill') ov += `<div class="pill${p.nearTop ? ' below' : ''}${mute ? ' mute' : ''}" style="left:${px(p.x + 10)};top:${px(p.y + (p.nearTop ? 24 : 0))};margin-top:${p.nearTop ? 0 : -lift}px">${face}<span class="dot" style="width:5px;height:5px;background:${STATUS[st]}"></span>${p.a.name}</div>`;
+        if (agentMode === 'pill') ov += `<div class="pill${p.nearTop ? ' below' : ''}${mute ? ' mute' : ''}"${who} style="left:${px(p.x + 10)};top:${px(p.y + (p.nearTop ? 24 : 0))};margin-top:${p.nearTop ? 0 : -lift}px">${face}<span class="dot" style="width:5px;height:5px;background:${STATUS[st]}"></span>${p.a.name}</div>`;
         else if (!mute) {
-          if (st === 'working') ov += `<div class="bub" style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}<i></i><i></i><i></i></div>`;
-          else if (st === 'idle') ov += `<div class="bub z" style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}z z</div>`;
-          else ov += `<div class="bub" style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}<span class="dot" style="background:${STATUS[st]}"></span></div>`;
+          if (st === 'working') ov += `<div class="bub"${who} style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}<i></i><i></i><i></i></div>`;
+          else if (st === 'idle') ov += `<div class="bub z"${who} style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}z z</div>`;
+          else ov += `<div class="bub"${who} style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}<span class="dot" style="background:${STATUS[st]}"></span></div>`;
         }
         /* nanoclaw: drawn LAST so it sits over the room's own hit area —
          * clicking a person picks the person, never the room under them. */
-        ov += `<button class="ahit" data-agent="${p.a.name}" data-room="${p.room}" aria-label="${p.a.name}" style="left:calc(${px(p.x + 10)} - 20px);top:calc(${px(p.y + 11)} - 20px);width:40px;height:40px"></button>`;
+        ov += `<button class="ahit"${who} aria-label="${p.a.name}" style="left:calc(${px(p.x + 10)} - 20px);top:calc(${px(p.y + 11)} - 20px);width:40px;height:40px"></button>`;
       });
       this.shadowRoot.innerHTML = `<style>${css}</style><div class="vp"><div class="stage" style="width:${built.W * s}px;height:${built.H * s}px"><div class="world" style="width:${built.W}px;height:${built.H}px;transform:scale(${s})">${built.svg}</div><div class="ov">${ov}</div></div></div>`;
       const vp = this.shadowRoot.querySelector('.vp');
@@ -1307,7 +1315,10 @@
          * The pointer handler below already measures the drag; 5px of travel
          * is the line between a tap and a grab. */
         if (moved > 5) return;
-        const a = e.target.closest('.ahit');
+        /* nanoclaw: match on data-agent, not on `.ahit` — the sprite's hit pad
+         * and the face-bearing pill/bubble over the head both carry it, and a
+         * click on either is a click on that person. */
+        const a = e.target.closest('[data-agent]');
         if (a) {
           e.stopPropagation();
           this.dispatchEvent(new CustomEvent('agent-select', { detail: { name: a.dataset.agent, room: a.dataset.room }, bubbles: true, composed: true }));
