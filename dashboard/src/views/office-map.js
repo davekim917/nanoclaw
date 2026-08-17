@@ -1336,9 +1336,42 @@
       });
       const up = () => { down = false; vp.classList.remove('drag'); };
       vp.addEventListener('pointerup', up); vp.addEventListener('pointerleave', up); vp.addEventListener('pointercancel', up);
+      /* nanoclaw: ctrl/cmd+wheel zoom. `scale` is a controlled attribute (the
+       * caller owns it, see the `set scale` comment above), so this can't just
+       * call setScale() — that would stick until the caller's next render
+       * overwrote it with its own stale value. Ask upward instead, same as
+       * agent-select/room-select, and let the restore block below do the
+       * anchoring once the new scale attribute lands. */
+      vp.addEventListener('wheel', (e) => {
+        if (!(e.ctrlKey || e.metaKey)) return;
+        e.preventDefault();
+        const cur = this.scale;
+        const next = Math.max(0.6, Math.min(3, +(cur - e.deltaY * 0.0015).toFixed(2)));
+        if (next !== cur) this.dispatchEvent(new CustomEvent('scale-change', { detail: { scale: next }, bubbles: true, composed: true }));
+      }, { passive: false });
       if (this._pending) { const k = this._pending; this._pending = null; requestAnimationFrame(() => this.teleport(k)); }
-      else if (this._restore) { vp.scrollLeft = this._restore.l; vp.scrollTop = this._restore.t; }
-      vp.addEventListener('scroll', () => { this._restore = { l: vp.scrollLeft, t: vp.scrollTop }; });
+      else if (this._restore) {
+        /* nanoclaw: zoom must anchor the viewport CENTER, not the scroll
+         * corner. `_restore` used to be reapplied as raw absolute pixels, so a
+         * scale change teleported the view — the center you were looking at
+         * (in world coordinates) landed at a different screen position because
+         * the world grew or shrank under a fixed top-left. Convert through the
+         * old scale's center point and back through the new scale instead. */
+        const prevS = this._restore.s;
+        if (prevS != null && prevS !== s && vp.clientWidth) {
+          const ratio = s / prevS;
+          const cx = this._restore.l + vp.clientWidth / 2;
+          const cy = this._restore.t + vp.clientHeight / 2;
+          const newL = Math.max(0, cx * ratio - vp.clientWidth / 2);
+          const newT = Math.max(0, cy * ratio - vp.clientHeight / 2);
+          vp.scrollLeft = newL; vp.scrollTop = newT;
+          this._restore = { l: newL, t: newT, s };
+        } else {
+          vp.scrollLeft = this._restore.l; vp.scrollTop = this._restore.t;
+          this._restore.s = s;
+        }
+      }
+      vp.addEventListener('scroll', () => { this._restore = { l: vp.scrollLeft, t: vp.scrollTop, s }; });
       if (!this._restore && !this._pending && this.hasAttribute('start')) requestAnimationFrame(() => this.teleport(this.getAttribute('start')));
     }
   }

@@ -36,6 +36,7 @@ export function OfficeMap({
   selected,
   onSelect,
   onAgentSelect,
+  onScaleChange,
   start,
   scale = '1.15',
   labels = 'sign',
@@ -47,6 +48,10 @@ export function OfficeMap({
   onSelect: (key: string) => void;
   /** A seated agent was clicked. `room` is the slot key the pin belongs to. */
   onAgentSelect?: (detail: { name: string; room: string }) => void;
+  /** ctrl/cmd+wheel on the viewport asked for a new zoom level. `scale` is a
+      controlled prop, so the element can't just apply it — it asks up here,
+      the same way room-select and agent-select do. */
+  onScaleChange?: (scale: number) => void;
   /** Slot to centre on when the map first appears. Without it the viewport
       opens at the plan's top-left corner, which on a phone is all lawn. */
   start?: string;
@@ -88,6 +93,17 @@ export function OfficeMap({
   useEffect(() => {
     if (teleportTo && ref.current?.teleport) ref.current.teleport(teleportTo);
   }, [teleportTo]);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !onScaleChange) return;
+    const handler = (e: Event) => {
+      const s = (e as CustomEvent<{ scale: number }>).detail?.scale;
+      if (typeof s === 'number') onScaleChange(s);
+    };
+    el.addEventListener('scale-change', handler);
+    return () => el.removeEventListener('scale-change', handler);
+  }, [onScaleChange]);
 
   return (
     <office-map

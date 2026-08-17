@@ -1792,13 +1792,15 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* obs.C.7 — folded away, the card is just its own header, so the rule under it
    would be a hairline hanging off nothing. */
 .nc-of .nc-of-mapcard.collapsed .nc-of-mapcard-head{border-bottom:0}
-/* The FIRST chip takes the auto margin and carries the rest of the group to
-   the right edge with it; a second auto would split the gap and strand the two
-   controls at opposite ends of the header. */
-.nc-of .nc-of-mapcard-head .nc-of-chip + .nc-of-chip{margin-left:0}
 .nc-of .nc-of-mapcard-title{font-size:12.5px; font-weight:600; color:var(--ink)}
 .nc-of .nc-of-mapcard-hint{font-size:12px; color:var(--ink-3)}
-.nc-of .nc-of-mapcard-head .nc-of-chip{margin-left:auto}
+/* obs.C.15 — one flex unit carries every trailing control (All rooms, zoom,
+   fold) to the right edge together, and wraps as a cluster on a narrow header
+   instead of each chip claiming its own margin-left:auto and splitting the
+   line wherever the first one ran out of room. */
+.nc-of .nc-of-mapcard-actions{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; margin-left:auto;
+}
 /* The plan is larger than any viewport, so the bottom edge always cuts through
    furniture. The fade reads as "there is more below"; a hard edge read as the
    illustration running out. */
@@ -1839,6 +1841,11 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-of-chip:hover{background:rgba(35,32,27,.04)}
 .nc-of .nc-of-chip.on{background:var(--ink); color:var(--card); border-color:var(--ink)}
+.nc-of .nc-of-chip:disabled{opacity:.4; cursor:default; pointer-events:none}
+/* obs.C.15 — the −/Reset/+ trio sits with the fold chip; − and + are a single
+   glyph each, so a fixed min-width keeps all three from jittering in size as
+   the percentage changes on the buttons around them. */
+.nc-of .nc-of-chip.nc-of-zoom{min-width:26px; justify-content:center; padding:0 8px; font-variant-numeric:tabular-nums}
 .nc-of .nc-of-sd{width:6px; height:6px; border-radius:50%; flex:none; background:var(--idle)}
 .nc-of .nc-of-sd.blocked{background:var(--stop)}
 .nc-of .nc-of-sd.waiting{background:var(--warn)}

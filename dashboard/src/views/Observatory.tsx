@@ -61,6 +61,17 @@ const POLL_MS = 15_000;
 /** Whether the floor is unfolded. Absent means expanded — the default view. */
 const MAP_OPEN_KEY = 'nc-obs-map-open';
 
+/** Map zoom: persisted like the fold state, same reasoning — an operator who
+    picks a zoom level should not have to pick it again on every visit. */
+const MAP_SCALE_KEY = 'nc-obs-map-scale';
+const MAP_SCALE_MIN = 0.6;
+const MAP_SCALE_MAX = 3;
+const MAP_SCALE_STEP = 0.2;
+/* obs.C.15 — default view zoomed in enough that a room reads at a glance
+   without the floor plan vanishing to a postage stamp. */
+const MAP_SCALE_DEFAULT = 1.7;
+const clampMapScale = (v: number) => Math.min(MAP_SCALE_MAX, Math.max(MAP_SCALE_MIN, +v.toFixed(2)));
+
 /**
  * The segmented control. Local state — the Observatory has exactly one URL.
  *
@@ -131,6 +142,15 @@ export function Observatory({ authMe }: ObservatoryProps) {
   useEffect(() => {
     localStorage.setItem(MAP_OPEN_KEY, String(mapOpen));
   }, [mapOpen]);
+  const [mapScale, setMapScale] = useState(() => {
+    const saved = Number(localStorage.getItem(MAP_SCALE_KEY));
+    return Number.isFinite(saved) && saved > 0 ? clampMapScale(saved) : MAP_SCALE_DEFAULT;
+  });
+  useEffect(() => {
+    localStorage.setItem(MAP_SCALE_KEY, String(mapScale));
+  }, [mapScale]);
+  const zoomMapBy = (delta: number) => setMapScale((s) => clampMapScale(s + delta));
+  const resetMapScale = () => setMapScale(MAP_SCALE_DEFAULT);
   const [jobTab, setJobTab] = useState<JobTabKey>('queue');
   const [selectedRoom, setSelectedRoom] = useState<string>('');
   const [flowFilter, setFlowFilter] = useState<FlowSlice | null>(null);
@@ -140,6 +160,15 @@ export function Observatory({ authMe }: ObservatoryProps) {
   // view is showing. Independent of selectedRoom: picking a room and picking
   // a person are two different questions now.
   const [agentDrawerId, setAgentDrawerId] = useState<string | null>(null);
+  // Which room the agent was clicked IN — the drawer answers about
+  // (agent, room), not the agent's global ledger, so this travels with
+  // agentDrawerId rather than being re-derived from the agent's own
+  // (possibly different) current location.
+  const [agentDrawerRoomKey, setAgentDrawerRoomKey] = useState<string | null>(null);
+  const closeAgentDrawer = () => {
+    setAgentDrawerId(null);
+    setAgentDrawerRoomKey(null);
+  };
 
   const rooms = useMemo(() => sortRooms(snapshot?.rooms ?? []), [snapshot]);
   const agents = snapshot?.agents ?? [];
@@ -330,20 +359,60 @@ export function Observatory({ authMe }: ObservatoryProps) {
                   {mapOpen && (
                     <span className="nc-of-mapcard-hint">drag to pan · tap a room to filter what is below</span>
                   )}
-                  {mapOpen && selectedRoom && (
-                    <button type="button" className="nc-of-chip" onClick={closeRoom}>
-                      All rooms
+                  {/* obs.C.15 — one flex unit, not four independent chips. Each
+                      chip carrying its own margin-left:auto meant flex-wrap
+                      broke the line after whichever chip claimed the push,
+                      stranding it alone; grouping them lets the whole cluster
+                      wrap together on a narrow header. */}
+                  <div className="nc-of-mapcard-actions">
+                    {mapOpen && selectedRoom && (
+                      <button type="button" className="nc-of-chip" onClick={closeRoom}>
+                        All rooms
+                      </button>
+                    )}
+                    {mapOpen && (
+                      <>
+                        <button
+                          type="button"
+                          className="nc-of-chip nc-of-zoom"
+                          onClick={() => zoomMapBy(-MAP_SCALE_STEP)}
+                          disabled={mapScale <= MAP_SCALE_MIN}
+                          aria-label="Zoom out"
+                          title="Zoom out"
+                        >
+                          −
+                        </button>
+                        <button
+                          type="button"
+                          className="nc-of-chip nc-of-zoom"
+                          onClick={resetMapScale}
+                          aria-label="Reset zoom"
+                          title="Reset zoom"
+                        >
+                          Reset
+                        </button>
+                        <button
+                          type="button"
+                          className="nc-of-chip nc-of-zoom"
+                          onClick={() => zoomMapBy(MAP_SCALE_STEP)}
+                          disabled={mapScale >= MAP_SCALE_MAX}
+                          aria-label="Zoom in"
+                          title="Zoom in"
+                        >
+                          +
+                        </button>
+                      </>
+                    )}
+                    <button
+                      type="button"
+                      className="nc-of-chip nc-of-mapfold"
+                      data-map-open={mapOpen}
+                      aria-expanded={mapOpen}
+                      onClick={() => setMapOpen(!mapOpen)}
+                    >
+                      {mapOpen ? 'hide the floor' : 'show the floor'}
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    className="nc-of-chip nc-of-mapfold"
-                    data-map-open={mapOpen}
-                    aria-expanded={mapOpen}
-                    onClick={() => setMapOpen(!mapOpen)}
-                  >
-                    {mapOpen ? 'hide the floor' : 'show the floor'}
-                  </button>
+                  </div>
                 </div>
                 {mapOpen && (
                   <>
@@ -352,14 +421,19 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       {...(startSlot ? { start: startSlot } : {})}
                       selected={selectedRoom}
                       onSelect={pickRoom}
-                      onAgentSelect={({ name }) => {
-                        // The drawer answers about the PERSON, not the room
-                        // they happen to be standing in — picking a room stays
-                        // its own, independent action.
+                      onAgentSelect={({ name, room: slot }) => {
+                        // The drawer answers about (agent, room): who they
+                        // are AND which room they were clicked in — picking a
+                        // room on its own stays its own, independent action.
                         const a = agents.find((x) => x.name === name);
-                        if (a) setAgentDrawerId(a.id);
+                        if (a) {
+                          setAgentDrawerId(a.id);
+                          setAgentDrawerRoomKey(officeData.rooms.find((r) => r.slot === slot)?.key ?? null);
+                        }
                       }}
                       teleportTo={teleportTo}
+                      scale={String(mapScale)}
+                      onScaleChange={(s) => setMapScale(clampMapScale(s))}
                     />
                     <div className="nc-of-teleport">
                       {officeData.rooms.map((r) => (
@@ -500,13 +574,14 @@ export function Observatory({ authMe }: ObservatoryProps) {
             {agentDrawerAgent && (
               <AgentDrawer
                 agent={agentDrawerAgent}
+                roomKey={agentDrawerRoomKey}
                 rooms={rooms}
                 claims={claims}
                 items={allItems}
                 roomLinks={roomLinks}
                 breachedOwners={breachedOwners}
                 {...(assign ? { assign } : {})}
-                onClose={() => setAgentDrawerId(null)}
+                onClose={closeAgentDrawer}
               />
             )}
           </>
@@ -1709,11 +1784,32 @@ function ClaimsCard({
 /* ─── Agent drawer — one person's day ─────────────────────────────────────── */
 
 /**
- * Opened by a click on a person on the floor. Answers two questions about
- * ONE agent: what are they actively moving right now, and what — of theirs —
- * needs a human. Reuses the same rows and controls the claims card and the
- * queue already have; this is a person-scoped filter over the same data, not
- * a new surface with its own rules.
+ * A claim's `threadId` already encodes its channel — same two-segment
+ * derivation the host's `threadPlatformId` uses server-side to resolve a
+ * permalink. Reading it off the claim directly means the drawer never has to
+ * invent room attribution claims don't carry: no thread id (a channel-level
+ * claim, or one written before thread ids existed) means "unknown room",
+ * honestly, not "this room".
+ */
+export function claimChannelKey(threadId: string | null): string | null {
+  if (!threadId) return null;
+  const parts = threadId.split(':');
+  return parts.length >= 2 ? parts.slice(0, 2).join(':') : null;
+}
+
+/** Normalize a channel name for comparison — same rule `filterQueue` uses. */
+function roomNameKey(s: string): string {
+  return s.trim().toLowerCase().replace(/^#/, '');
+}
+
+/**
+ * Opened by a click on a person on the floor, for the ROOM they were clicked
+ * in — the drawer answers about (agent, room), not the agent's global
+ * ledger. "Working on now" leads with the agent's actual live thread in this
+ * room when there is one; held claims and needs-a-human items attributable to
+ * this room's channel render in the main sections, everything else folds
+ * into one "elsewhere" group so a global ledger is still reachable without
+ * being the default view.
  *
  * A fixed slide-over, independent of the segmented view underneath it (the
  * click that opens it only happens on Overview, but the drawer itself does
@@ -1723,6 +1819,7 @@ function ClaimsCard({
  */
 function AgentDrawer({
   agent,
+  roomKey,
   rooms,
   claims,
   items,
@@ -1732,9 +1829,12 @@ function AgentDrawer({
   onClose,
 }: {
   agent: ObservatoryAgent;
+  /** The room this drawer was opened FOR — the slot-resolved channel key, or
+   *  null when it couldn't be resolved. Not the agent's own `location`. */
+  roomKey: string | null;
   rooms: ObservatoryRoom[];
   claims: ObservatoryClaim[];
-  /** Full board, unfiltered by room — the drawer answers about a PERSON. */
+  /** Full board, unfiltered by room — split into here/elsewhere below. */
   items: ReleaseItem[];
   roomLinks: Map<string, string>;
   breachedOwners: Set<string>;
@@ -1759,25 +1859,38 @@ function AgentDrawer({
     };
   }, [onClose]);
 
-  const room = rooms.find((r) => r.key === agent.location) ?? null;
+  const room = rooms.find((r) => r.key === roomKey) ?? null;
   const roomName = room ? (room.name.startsWith('#') ? room.name : `#${room.name}`) : null;
-  const roomLink = room ? roomLinks.get(room.name.replace(/^#/, '').toLowerCase()) : undefined;
+  const roomLink = room ? roomLinks.get(roomNameKey(room.name)) : undefined;
   const status = agentState(agent, breachedOwners);
+
+  // The agent's actual live activity in THIS room — null the moment it
+  // points anywhere else, however active that elsewhere is.
+  const liveHere = roomKey && agent.liveSession?.channelKey === roomKey ? agent.liveSession : null;
 
   const held = claims.filter((c) => agent.holding.includes(c.slug));
   // Same predicate ClaimsCard uses to decide whether a claim is pushable —
   // stopped moving, or already escalated in its channel.
   const healthy = held.filter((c) => c.state === 'live' && !c.escalated);
   const troubled = held.filter((c) => c.state !== 'live' || c.escalated);
+  const inRoom = (c: ObservatoryClaim) => Boolean(roomKey) && claimChannelKey(c.threadId) === roomKey;
+  const healthyHere = healthy.filter(inRoom);
+  const healthyElsewhere = healthy.filter((c) => !inRoom(c));
+  const troubledHere = troubled.filter(inRoom);
+  const troubledElsewhere = troubled.filter((c) => !inRoom(c));
 
   const ledgerRows = useMemo(() => buildLedger(items).rows, [items]);
   const stalledOwned = useMemo(
     () => ledgerRows.filter((r) => r.item.owner === agent.name && (r.state === 'breached' || r.state === 'unowned')),
     [ledgerRows, agent.name],
   );
+  const itemInRoom = (r: Commitment) =>
+    Boolean(room) && Boolean(r.item.channel) && roomNameKey(r.item.channel!) === roomNameKey(room!.name);
+  const stalledHere = stalledOwned.filter(itemInRoom);
+  const stalledElsewhere = stalledOwned.filter((r) => !itemInRoom(r));
 
-  const workingEmpty = !agent.nextTask && healthy.length === 0;
-  const attentionEmpty = troubled.length === 0 && stalledOwned.length === 0;
+  const attentionEmpty = troubledHere.length === 0 && stalledHere.length === 0;
+  const elsewhereCount = healthyElsewhere.length + troubledElsewhere.length + stalledElsewhere.length;
 
   return (
     <aside
@@ -1792,7 +1905,7 @@ function AgentDrawer({
           {agent.avatarUrl && (
             <img className="nc-of-sheet-face" src={agent.avatarUrl} alt="" width={24} height={24} />
           )}
-          <h3>{agent.name}</h3>
+          <h3>{roomName ? `${agent.name} in ${roomName}` : agent.name}</h3>
           <span className={`nc-agent-drawer-state ${status}`}>
             <i className={`nc-of-sd ${status}`} />
             {status}
@@ -1820,23 +1933,36 @@ function AgentDrawer({
 
         <section className="nc-agent-drawer-section" data-section="working-now">
           <h4>Working on now</h4>
-          {workingEmpty ? (
-            <div className="nc-obs-ledger-empty">nothing queued right now</div>
-          ) : (
+          {room ? (
             <>
+              <div className="nc-agent-drawer-live">
+                {liveHere ? (
+                  liveHere.threadUrl ? (
+                    <>
+                      live here — <OutLink href={liveHere.threadUrl}>open the thread</OutLink>
+                    </>
+                  ) : (
+                    'live here — no thread recorded'
+                  )
+                ) : (
+                  'no live thread here'
+                )}
+              </div>
               {agent.nextTask && (
                 <div className="nc-agent-drawer-next">
                   next: {agent.nextTask.title} — {relTime(agent.nextTask.at)}
                 </div>
               )}
-              {healthy.length > 0 && (
+              {healthyHere.length > 0 && (
                 <div className="nc-of-sheet-held">
-                  {healthy.map((c) => (
+                  {healthyHere.map((c) => (
                     <HeldRow key={c.slug} slug={c.slug} threadUrl={c.threadUrl} />
                   ))}
                 </div>
               )}
             </>
+          ) : (
+            <div className="nc-obs-ledger-empty">nothing queued right now</div>
           )}
         </section>
 
@@ -1846,9 +1972,9 @@ function AgentDrawer({
             <div className="nc-obs-ledger-empty">nothing needs a human right now</div>
           ) : (
             <>
-              {troubled.length > 0 && (
+              {troubledHere.length > 0 && (
                 <ul className="nc-obs-claim-rows">
-                  {troubled.map((c) => (
+                  {troubledHere.map((c) => (
                     <ClaimRow
                       key={c.slug}
                       c={c}
@@ -1859,12 +1985,45 @@ function AgentDrawer({
                   ))}
                 </ul>
               )}
-              {stalledOwned.length > 0 && (
-                <ItemTable rows={stalledOwned} now={Date.now()} head={false} roomLinks={roomLinks} {...(assign ? { assign } : {})} />
+              {stalledHere.length > 0 && (
+                <ItemTable rows={stalledHere} now={Date.now()} head={false} roomLinks={roomLinks} {...(assign ? { assign } : {})} />
               )}
             </>
           )}
         </section>
+
+        {/* Everything true about this agent that isn't attributable to THIS
+            room — a global ledger stays reachable, it just isn't the default
+            view a room click opens onto. Native <details>: no open/close
+            state to wire up for a fold nobody needs to persist. */}
+        {elsewhereCount > 0 && (
+          <details className="nc-agent-drawer-section nc-agent-drawer-elsewhere" data-section="elsewhere">
+            <summary>elsewhere ({elsewhereCount})</summary>
+            {healthyElsewhere.length > 0 && (
+              <div className="nc-of-sheet-held">
+                {healthyElsewhere.map((c) => (
+                  <HeldRow key={c.slug} slug={c.slug} threadUrl={c.threadUrl} />
+                ))}
+              </div>
+            )}
+            {troubledElsewhere.length > 0 && (
+              <ul className="nc-obs-claim-rows">
+                {troubledElsewhere.map((c) => (
+                  <ClaimRow
+                    key={c.slug}
+                    c={c}
+                    expanded={expandedSlug === c.slug}
+                    onToggle={() => setExpandedSlug((p) => (p === c.slug ? null : c.slug))}
+                    {...(assign ? { assign } : {})}
+                  />
+                ))}
+              </ul>
+            )}
+            {stalledElsewhere.length > 0 && (
+              <ItemTable rows={stalledElsewhere} now={Date.now()} head={false} roomLinks={roomLinks} {...(assign ? { assign } : {})} />
+            )}
+          </details>
+        )}
       </div>
     </aside>
   );

@@ -89,6 +89,7 @@ function agent(overrides: Partial<ObservatoryAgent> = {}): ObservatoryAgent {
     holding: [],
     nextTask: null,
     avatarUrl: null,
+    liveSession: null,
     ...overrides,
   };
 }
@@ -388,6 +389,58 @@ describe('Observatory', () => {
       localStorage.clear();
       const third = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       expect(third.container.querySelector('office-map')).toBeTruthy();
+    });
+
+    // obs.C.15 — the default view was zoomed out enough that a room was
+    // unreadable; 1.7 is the picked-by-eye default that keeps a room legible
+    // without losing the floor.
+    it('opens zoomed in past the old 1.15 default', () => {
+      localStorage.clear();
+      full();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const map = container.querySelector('office-map')!;
+      expect(map.getAttribute('scale')).toBe('1.7');
+    });
+
+    it('offers zoom controls next to the fold control, and they move the scale attribute', async () => {
+      localStorage.clear();
+      full();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const map = container.querySelector('office-map')!;
+      const actions = container.querySelector('.nc-of-mapcard-actions')!;
+      const zoomIn = actions.querySelector('[aria-label="Zoom in"]')! as HTMLElement;
+      const zoomOut = actions.querySelector('[aria-label="Zoom out"]')! as HTMLElement;
+      const reset = actions.querySelector('[aria-label="Reset zoom"]')! as HTMLElement;
+      // grouped with the fold control, in the same action cluster
+      expect(actions.querySelector('.nc-of-mapfold')).toBeTruthy();
+
+      await userEvent.click(zoomIn);
+      expect(map.getAttribute('scale')).toBe('1.9');
+      await userEvent.click(zoomOut);
+      await userEvent.click(zoomOut);
+      expect(map.getAttribute('scale')).toBe('1.5');
+      await userEvent.click(reset);
+      expect(map.getAttribute('scale')).toBe('1.7');
+    });
+
+    it('remembers the chosen zoom across visits, and forgets on a clean slate', async () => {
+      localStorage.clear();
+      full();
+      const first = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const zoomIn = () =>
+        first.container.querySelector('.nc-of-mapcard-actions [aria-label="Zoom in"]')! as HTMLElement;
+      await userEvent.click(zoomIn());
+      await userEvent.click(zoomIn());
+      expect(first.container.querySelector('office-map')!.getAttribute('scale')).toBe('2.1');
+      first.unmount();
+
+      const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(second.container.querySelector('office-map')!.getAttribute('scale')).toBe('2.1');
+      second.unmount();
+
+      localStorage.clear();
+      const third = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(third.container.querySelector('office-map')!.getAttribute('scale')).toBe('1.7');
     });
 
     // obs.C.12 — Claims and Schedule were segments that showed one card the job
@@ -1245,21 +1298,51 @@ describe('Observatory', () => {
   });
 
   describe('the agent drawer', () => {
+    // Two rooms so the suite can exercise "clicked in her own room" against
+    // "clicked in a room she is wired to but isn't live in" — the whole
+    // point of obs.C.17. Keys use the real two-segment channelType:channel
+    // shape (matching messaging_groups.platform_id) because that is also
+    // what a claim's threadId encodes, and the room-attribution match is a
+    // literal string comparison between the two.
     function drawerFloor() {
       mockData(
         snapshot({
-          rooms: [room({ key: 'r1', name: 'general', permalink: 'https://acme.slack.com/archives/C0AAA' })],
+          rooms: [
+            room({ key: 'slack:C0AAA', name: 'general', permalink: 'https://acme.slack.com/archives/C0AAA' }),
+            room({ key: 'slack:C0BBB', name: 'ops', permalink: 'https://acme.slack.com/archives/C0BBB' }),
+          ],
           claims: [
-            claim({ slug: 'migration', owner: 'ava', state: 'live', threadUrl: 'https://example.com/thread/1' }),
-            claim({ slug: 'stuck-one', owner: 'ava', state: 'parked', threadUrl: 'https://example.com/thread/2' }),
+            claim({
+              slug: 'migration',
+              owner: 'ava',
+              state: 'live',
+              threadId: 'slack:C0AAA:1.1',
+              threadUrl: 'https://example.com/thread/1',
+            }),
+            claim({
+              slug: 'stuck-one',
+              owner: 'ava',
+              state: 'parked',
+              threadId: 'slack:C0AAA:1.2',
+              threadUrl: 'https://example.com/thread/2',
+            }),
+            // No thread recorded at all — genuinely unattributable to any
+            // room, so it must always land in "elsewhere", not "general".
+            claim({ slug: 'no-thread-claim', owner: 'ava', state: 'live', threadId: null, threadUrl: null }),
           ],
           agents: [
             agent({
               id: 'ava',
               name: 'ava',
-              location: 'r1',
-              holding: ['migration', 'stuck-one'],
+              location: 'slack:C0AAA',
+              holding: ['migration', 'stuck-one', 'no-thread-claim'],
               nextTask: { title: 'ship the release notes', at: new Date(Date.now() + 3_600_000).toISOString() },
+              liveSession: {
+                channelKey: 'slack:C0AAA',
+                sessionId: 'sess-1',
+                threadUrl: 'https://example.com/live-thread',
+                lastOutboundAt: new Date().toISOString(),
+              },
             }),
             agent({ id: 'kit', name: 'kit', location: null, holding: [], awake: false }),
           ],
@@ -1279,52 +1362,108 @@ describe('Observatory', () => {
       return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
     }
 
-    const clickAgent = async (container: HTMLElement, name: string) => {
+    // office-data.ts fills slots in arrival order, so the fixture's first
+    // room ('general') lands on 'westFront' and the second ('ops') on
+    // 'eastFront' — SLOTS[0] and SLOTS[1].
+    const clickAgentIn = async (container: HTMLElement, name: string, slot: string) => {
       const map = container.querySelector('office-map')!;
       await act(async () => {
-        map.dispatchEvent(new CustomEvent('agent-select', { detail: { name, room: 'westFront' }, bubbles: true }));
+        map.dispatchEvent(new CustomEvent('agent-select', { detail: { name, room: slot }, bubbles: true }));
       });
     };
+    const clickAgent = (container: HTMLElement, name: string) => clickAgentIn(container, name, 'westFront');
 
     it('is closed until a person is picked', () => {
       const { container } = drawerFloor();
       expect(container.querySelector('[data-testid="agent-drawer"]')).toBeFalsy();
     });
 
-    it('shows what a working agent is holding, and what needs a human', async () => {
+    it('clicked in her own room: live thread first, then what is actually hers here', async () => {
       const { container } = drawerFloor();
-      await clickAgent(container, 'ava');
+      await clickAgent(container, 'ava'); // westFront → #general, where ava is live
       const drawer = container.querySelector('[data-testid="agent-drawer"]')!;
-      expect(drawer.querySelector('h3')!.textContent).toBe('ava');
+      expect(drawer.querySelector('h3')!.textContent).toBe('ava in #general');
       // ava owns a breached item, which outranks "awake" in the office's own
       // state vocabulary — the header agrees with the "needs a human" section.
       expect(drawer.querySelector('.nc-agent-drawer-state')!.textContent).toContain('blocked');
       // standing in its room, linked via the room's own permalink
       const roomLink = drawer.querySelector('.nc-agent-drawer-where a')! as HTMLAnchorElement;
       expect(roomLink.getAttribute('href')).toBe('https://acme.slack.com/archives/C0AAA');
-      expect(drawer.textContent).toContain('general');
-      // working on now: the next task, plus the healthy (live) claim only
+
+      // working on now: the live thread leads, then the next task, then the
+      // healthy claim that is actually attributable to THIS room
       const working = drawer.querySelector('[data-section="working-now"]')!;
+      const liveLink = working.querySelector('.nc-agent-drawer-live a')! as HTMLAnchorElement;
+      expect(liveLink.getAttribute('href')).toBe('https://example.com/live-thread');
       expect(working.textContent).toContain('ship the release notes');
       expect(working.querySelector('.nc-of-sheet-held-slug')!.textContent).toBe('migration');
       expect(working.textContent).not.toContain('stuck-one');
-      // needs a human: the parked claim and the agent's own breached item
+      expect(working.textContent).not.toContain('no-thread-claim');
+
+      // needs a human: the parked claim (same room) and the agent's own
+      // breached item (#general) — not the thread-less claim, which has no
+      // room to attribute to.
       const attention = drawer.querySelector('[data-section="needs-human"]')!;
       expect(attention.textContent).toContain('stuck-one');
       expect(attention.textContent).toContain('XZO#1');
+      expect(attention.textContent).not.toContain('no-thread-claim');
+
+      // elsewhere: only the thread-less claim — everything else was hers,
+      // here.
+      const elsewhere = drawer.querySelector('[data-section="elsewhere"]')!;
+      expect(elsewhere.querySelector('summary')!.textContent).toBe('elsewhere (1)');
+      expect(elsewhere.textContent).toContain('no-thread-claim');
     });
 
-    it('an idle agent holding nothing shows honest empties', async () => {
+    it('clicked in a DIFFERENT room she is wired to: an honest empty view, not her global ledger', async () => {
       const { container } = drawerFloor();
-      await clickAgent(container, 'kit');
+      await clickAgentIn(container, 'ava', 'eastFront'); // → #ops, where ava has never worked
       const drawer = container.querySelector('[data-testid="agent-drawer"]')!;
-      expect(drawer.querySelector('h3')!.textContent).toBe('kit');
-      expect(drawer.querySelector('.nc-agent-drawer-state')!.textContent).toContain('idle');
-      expect(drawer.textContent).toContain('not seated on the floor');
-      expect(drawer.querySelector('[data-section="working-now"]')!.textContent).toContain('nothing queued right now');
+      expect(drawer.querySelector('h3')!.textContent).toBe('ava in #ops');
+
+      const working = drawer.querySelector('[data-section="working-now"]')!;
+      expect(working.textContent).toContain('no live thread here');
+      expect(working.textContent).not.toContain('migration');
+
+      // nothing of ava's attributes to #ops — the section says so honestly
+      // rather than falling back to her global "needs a human" list.
       expect(drawer.querySelector('[data-section="needs-human"]')!.textContent).toContain(
         'nothing needs a human right now',
       );
+
+      // every real piece of her work is still reachable, just folded away —
+      // migration + stuck-one + no-thread-claim + XZO#1.
+      const elsewhere = drawer.querySelector('[data-section="elsewhere"]')!;
+      expect(elsewhere.querySelector('summary')!.textContent).toBe('elsewhere (4)');
+      expect(elsewhere.textContent).toContain('migration');
+      expect(elsewhere.textContent).toContain('stuck-one');
+      expect(elsewhere.textContent).toContain('XZO#1');
+    });
+
+    it('an idle agent shows an honest empty room view, not the old global fallback text', async () => {
+      const { container } = drawerFloor();
+      await clickAgent(container, 'kit'); // westFront → #general — kit has never been there
+      const drawer = container.querySelector('[data-testid="agent-drawer"]')!;
+      expect(drawer.querySelector('h3')!.textContent).toBe('kit in #general');
+      expect(drawer.querySelector('.nc-agent-drawer-state')!.textContent).toContain('idle');
+      expect(drawer.querySelector('[data-section="working-now"]')!.textContent).toContain('no live thread here');
+      expect(drawer.querySelector('[data-section="needs-human"]')!.textContent).toContain(
+        'nothing needs a human right now',
+      );
+      // kit holds and owns nothing anywhere, so there is nothing to fold away.
+      expect(drawer.querySelector('[data-section="elsewhere"]')).toBeFalsy();
+    });
+
+    it('a room that fails to resolve falls back to the agent-only view', async () => {
+      const { container } = drawerFloor();
+      // 'kitchen' is a real slot, but drawerFloor only seats two rooms
+      // (westFront, eastFront) — nothing occupies it, so officeData has no
+      // room to hand back and roomKey stays null.
+      await clickAgentIn(container, 'ava', 'kitchen');
+      const drawer = container.querySelector('[data-testid="agent-drawer"]')!;
+      expect(drawer.querySelector('h3')!.textContent).toBe('ava');
+      expect(drawer.textContent).toContain('not seated on the floor');
+      expect(drawer.querySelector('[data-section="working-now"]')!.textContent).toContain('nothing queued right now');
     });
 
     it('closes on its own ✕', async () => {
