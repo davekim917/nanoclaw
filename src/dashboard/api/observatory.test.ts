@@ -447,8 +447,13 @@ describe('buildObservatoryScene', () => {
     // The room session spoke earlier; the task session (no room) spoke last.
     // location must stay on the room, but a steer belongs in the newest
     // conversation — the two trackers deliberately disagree here.
-    addSession('sess-room', 'ag-1', { messagingGroupId: 'mg-1', lastOutboundAt: '2026-08-16T10:00:00Z' });
-    addSession('sess-task', 'ag-1', { messagingGroupId: null, lastOutboundAt: '2026-08-16T10:30:00Z' });
+    // Relative, not absolute: location expires after LOCATION_WINDOW_MS (8h),
+    // so a hard-coded date passes on the day it is written and fails forever
+    // after — which is exactly how this test broke.
+    const roomAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2h ago
+    const taskAt = new Date(Date.now() - 90 * 60 * 1000).toISOString(); // 1.5h ago, newer
+    addSession('sess-room', 'ag-1', { messagingGroupId: 'mg-1', lastOutboundAt: roomAt });
+    addSession('sess-task', 'ag-1', { messagingGroupId: null, lastOutboundAt: taskAt });
 
     const scene = await buildObservatoryScene('wg-1', makeDeps());
     expect(scene.agents[0].lastSessionId).toBe('sess-task');
