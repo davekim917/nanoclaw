@@ -9,6 +9,14 @@ import { register, requireAuth, registerCookieVerifier } from './router.js';
 import { ensureServerStarted } from '../webhook-server.js';
 import { startSSEFeed, stopSSEFeed, eventsHandler } from './api/events.js';
 import { indexHtmlHandler, staticHandler } from './static.js';
+
+/** 301 preserving the query string — the token link rides `?token=`. */
+function redirectTo(target: string) {
+  return async (req: Request): Promise<Response> => {
+    const q = new URL(req.url).search;
+    return new Response(null, { status: 301, headers: { Location: target + q } });
+  };
+}
 import { sessionsHandler, sessionsDetailHandler } from './api/sessions.js';
 import { groupsListHandler } from './api/groups.js';
 import { sessionMessageHandler } from './steer.js';
@@ -89,7 +97,16 @@ export function startDashboard(): void {
   register('POST', '/dashboard/api/scheduled/:key/move', requireAuth(moveExecuteHandler));
 
   // Static assets — public, no auth (design §6). Splat must be LAST.
-  register('GET', '/dashboard/', indexHtmlHandler);
+  //
+  // /observatory is the canonical page URL (the product is the Observatory;
+  // "dashboard" was the scaffolding's name). The API namespace stays
+  // /dashboard/api/* — it is invisible to the address bar, the SPA and the
+  // token flow both speak it, and renaming it buys nothing but churn. The old
+  // page URLs 301 so every stored link and the chat token flow keep working.
+  register('GET', '/observatory', redirectTo('/observatory/'));
+  register('GET', '/observatory/', indexHtmlHandler);
+  register('GET', '/dashboard', redirectTo('/observatory/'));
+  register('GET', '/dashboard/', redirectTo('/observatory/'));
   register('GET', '/dashboard/static/*tail', staticHandler);
 
   ensureServerStarted();

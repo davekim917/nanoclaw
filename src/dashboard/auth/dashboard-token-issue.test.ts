@@ -127,7 +127,7 @@ describe('dashboardTokenIssue', () => {
     // One clickable link carrying the token in the FRAGMENT. The fragment is
     // never sent to the server, so a live token cannot reach an access or
     // proxy log; a query param would, which is why that form stays banned.
-    expect(deliveredContent.text).toMatch(/https?:\/\/[^/]+\/dashboard\/#token=[0-9a-f]{64}/);
+    expect(deliveredContent.text).toMatch(/https?:\/\/[^/]+\/observatory\/#token=[0-9a-f]{64}/);
     expect(deliveredContent.text).not.toMatch(/\?token=/);
   });
 

@@ -33,11 +33,11 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
   // when terminating TLS upstream (Cloudflare Tunnel, Caddy, nginx, Tailscale Funnel, etc.).
   const dashboardUrl = (() => {
     const fullUrl = process.env.NANOCLAW_DASHBOARD_URL;
-    if (fullUrl) return fullUrl.replace(/\/+$/, '') + '/dashboard/';
+    if (fullUrl) return fullUrl.replace(/\/+$/, '') + '/observatory/';
     const host = process.env.NANOCLAW_DASHBOARD_HOST ?? 'localhost';
     const port = process.env.WEBHOOK_PORT ?? '3000';
     const protocol = process.env.NANOCLAW_DASHBOARD_PROTOCOL ?? 'http';
-    return `${protocol}://${host}:${port}/dashboard/`;
+    return `${protocol}://${host}:${port}/observatory/`;
   })();
 
   const adapter = getDeliveryAdapter();
