@@ -39,6 +39,14 @@ describe('buildOfficeData', () => {
     expect(d.rooms[1]!.agents.map((a) => a.name)).toEqual(['kit']);
   });
 
+  it('carries each seated agent its real avatar, and null when it has none', () => {
+    const d = buildOfficeData(
+      [room('r1')],
+      [agent('ava', { location: 'r1', avatarUrl: 'https://cdn.example/ava_192.png' }), agent('kit', { location: 'r1' })],
+    );
+    expect(d.rooms[0]!.agents.map((a) => a.avatarUrl)).toEqual(['https://cdn.example/ava_192.png', null]);
+  });
+
   it('caps occupants at the seats the plan actually draws', () => {
     const crowd = ['a', 'b', 'c', 'd'].map((n) => agent(n, { location: 'r1' }));
     expect(buildOfficeData([room('r1')], crowd).rooms[0]!.agents).toHaveLength(2);

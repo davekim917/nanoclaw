@@ -29,6 +29,12 @@ export interface OfficeAgent {
   shirtHi: string;
   hair: string;
   skin?: string;
+  /** The agent's real platform avatar, shown as a pixelated face token above
+   *  its seat. Null for an agent with no wiring — it keeps the sprite alone,
+   *  and a face is never invented. Rendered in office-map.js's DOM overlay,
+   *  NOT in the world SVG: that SVG ships as a data URI and a data-URI SVG
+   *  cannot load an external image. */
+  avatarUrl?: string | null;
 }
 
 export interface OfficeRoomData {
@@ -131,7 +137,7 @@ export function buildOfficeData(
       // The plan seats a bounded number per room; extra occupants would have
       // nowhere to sit, so they stay in the list rather than overlapping.
       .slice(0, 2)
-      .map((a) => ({ name: a.name, status: agentState(a, breachedOwners), ...agentLook(a.id) }));
+      .map((a) => ({ name: a.name, status: agentState(a, breachedOwners), avatarUrl: a.avatarUrl, ...agentLook(a.id) }));
     return { slot, label: room.name.startsWith('#') ? room.name : `#${room.name}`, open: 0, state: roomState(here, 0), agents: here };
   });
 

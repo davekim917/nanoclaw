@@ -201,6 +201,22 @@
     return 'data:image/svg+xml,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="20" height="22" shape-rendering="crispEdges">${s}</svg>`);
   }
 
+  /* nanoclaw: the agent's REAL platform avatar, as a pixel token.
+   *
+   * It lives in the HTML overlay, never in the world SVG — that SVG is served
+   * as a data URI and a data-URI SVG may not load an external image, so a face
+   * referenced from inside it would silently never appear.
+   *
+   * Slack serves each avatar at a fixed set of sizes (`…_192.png`); asking for
+   * the 48px original instead of downscaling a 192px one is what keeps the
+   * face a real pixel grid rather than a smudged thumbnail. A URL that is not
+   * that shape is used as-is. Anything that is not a plain https/data image
+   * URL is dropped rather than interpolated into markup. */
+  function faceSrc(u) {
+    if (typeof u !== 'string' || !/^(https:\/\/|data:image\/)[^"'<>\s]+$/.test(u)) return '';
+    return u.replace(/_\d+\.(png|jpe?g|gif|webp)$/i, '_48.$1');
+  }
+
   /* ── outdoor ────────────────────────────────────────────────────────── */
   function outdoor(kind, x, y) {
     const X = x * T, Y = y * T;
@@ -578,6 +594,11 @@
 .bub i{width:4px;height:4px;border-radius:50%;background:#8a857c;animation:blink 1.4s infinite}
 .bub i:nth-child(2){animation-delay:.2s}.bub i:nth-child(3){animation-delay:.4s}
 .bub.z{font:600 10px/1 ui-sans-serif,system-ui,sans-serif;color:#8a857c;padding:3px 6px}
+/* nanoclaw: the real avatar, kept chunky — same crisp-edge read as the floor.
+   Asleep goes grey so the awake/asleep contrast survives the photo. */
+.face{display:block;flex:none;image-rendering:pixelated;border-radius:2px;background:#d9d4c8;box-shadow:0 0 0 1px rgba(44,40,34,.18)}
+.face.i{filter:grayscale(1)}
+.pill .face{border-radius:3px;box-shadow:none}
 @keyframes blink{0%,60%,100%{opacity:.35}30%{opacity:1}}
 .dot{width:6px;height:6px;border-radius:50%;flex:none}
 .badge{position:absolute;transform:translate(-50%,-50%);display:flex;align-items:center;justify-content:center;min-width:24px;height:24px;padding:0 7px;border-radius:12px;background:#fdfbf6;color:#2c2822;font:600 12.5px/1 ui-sans-serif,system-ui,sans-serif;font-variant-numeric:tabular-nums;box-shadow:0 2px 5px rgba(40,32,20,.28);border:2px solid var(--bc,#8f8b82);pointer-events:none}
@@ -661,12 +682,17 @@
       built.agentPins.forEach((p, pi) => {
         const mute = selected && selected !== p.room, st = p.a.status;
         const lift = pi % 2 ? -15 : 6;
+        /* nanoclaw: the face rides in the label that already hovers over the
+         * agent's head, so it needs no placement of its own and can never sit
+         * on top of the name. No avatar → the label is exactly what it was. */
+        const src = faceSrc(p.a.avatarUrl);
+        const face = src ? `<img class="face${st === 'idle' ? ' i' : ''}" src="${src}" alt="" style="width:${px(20)};height:${px(20)}">` : '';
         ov += `<div class="ag ${st === 'working' ? 'w' : st === 'idle' ? 'i' : ''}${mute ? ' mute' : ''}" style="left:${px(p.x)};top:${px(p.y)};width:${px(20)};height:${px(22)};background-image:url('${agentSvg(p.a)}')"></div>`;
-        if (agentMode === 'pill') ov += `<div class="pill${p.nearTop ? ' below' : ''}${mute ? ' mute' : ''}" style="left:${px(p.x + 10)};top:${px(p.y + (p.nearTop ? 24 : 0))};margin-top:${p.nearTop ? 0 : -lift}px"><span class="dot" style="width:5px;height:5px;background:${STATUS[st]}"></span>${p.a.name}</div>`;
+        if (agentMode === 'pill') ov += `<div class="pill${p.nearTop ? ' below' : ''}${mute ? ' mute' : ''}" style="left:${px(p.x + 10)};top:${px(p.y + (p.nearTop ? 24 : 0))};margin-top:${p.nearTop ? 0 : -lift}px">${face}<span class="dot" style="width:5px;height:5px;background:${STATUS[st]}"></span>${p.a.name}</div>`;
         else if (!mute) {
-          if (st === 'working') ov += `<div class="bub" style="left:${px(p.x + 10)};top:${px(p.y - 4)}"><i></i><i></i><i></i></div>`;
-          else if (st === 'idle') ov += `<div class="bub z" style="left:${px(p.x + 10)};top:${px(p.y - 4)}">z z</div>`;
-          else ov += `<div class="bub" style="left:${px(p.x + 10)};top:${px(p.y - 4)}"><span class="dot" style="background:${STATUS[st]}"></span></div>`;
+          if (st === 'working') ov += `<div class="bub" style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}<i></i><i></i><i></i></div>`;
+          else if (st === 'idle') ov += `<div class="bub z" style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}z z</div>`;
+          else ov += `<div class="bub" style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}<span class="dot" style="background:${STATUS[st]}"></span></div>`;
         }
       });
       this.shadowRoot.innerHTML = `<style>${css}</style><div class="vp"><div class="stage" style="width:${built.W * s}px;height:${built.H * s}px"><div class="world" style="width:${built.W}px;height:${built.H}px;transform:scale(${s})">${built.svg}</div><div class="ov">${ov}</div></div></div>`;
