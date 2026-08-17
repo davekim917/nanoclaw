@@ -89,8 +89,16 @@ export function getKnownSlackBots(): ReadonlyMap<string, SlackBotIdentity> {
  * A thread id already carries both halves Slack needs — channel and the
  * parent message `ts` (`slack:C0AAA:1786621514.008659`) — and the workspace
  * base URL rides along on the identity captured at adapter init. Slack's own
- * link form drops the dot from the ts:
- * `https://acme.slack.com/archives/C0AAA/p1786621514008659`.
+ * link form drops the dot from the ts and names the thread in the query:
+ * `https://acme.slack.com/archives/C0AAA/p1786621514008659?thread_ts=1786621514.008659&cid=C0AAA`.
+ *
+ * The query half is what makes it a THREAD link. `/archives/<C>/p<ts>` alone
+ * addresses a message, and Slack opens the CHANNEL scrolled to it — which is
+ * exactly what operators saw when every "open thread" on the observatory
+ * dropped them in the room instead of the thread pane. `thread_ts` (the
+ * top-level ts) plus `cid` is the shape chat.getPermalink itself returns for a
+ * threaded message, and the ids here are the thread PARENT, so both the path
+ * and the query carry the same ts.
  *
  * Returns null rather than guessing. A link that 404s is worse than no link,
  * so an unregistered workspace, a channel-level (unthreaded) destination, or
@@ -106,7 +114,7 @@ export function slackPermalink(channelType: string, platformId: string, threadId
   const channel = parts.length >= 2 ? parts[parts.length - 2] : platformId.split(':').pop();
   if (!channel || !/^\d+\.\d+$/.test(ts)) return null;
 
-  return `${base.replace(/\/+$/, '')}/archives/${channel}/p${ts.replace('.', '')}`;
+  return `${base.replace(/\/+$/, '')}/archives/${channel}/p${ts.replace('.', '')}?thread_ts=${ts}&cid=${channel}`;
 }
 
 /**

@@ -982,15 +982,28 @@ describe('slackPermalink', () => {
     register('https://acme.slack.com/');
 
     expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', 'slack:C0AAA:1786621514.008659')).toBe(
-      'https://acme.slack.com/archives/C0AAA/p1786621514008659',
+      'https://acme.slack.com/archives/C0AAA/p1786621514008659?thread_ts=1786621514.008659&cid=C0AAA',
     );
+  });
+
+  // The whole point of the link. Without `thread_ts` Slack treats it as a plain
+  // message address and opens the CHANNEL at that message; operators clicking
+  // "open thread" landed in the room. The query must name the top-level ts and
+  // the channel, which is the shape chat.getPermalink returns for a thread.
+  it('names the thread in the query, not just the message in the path', () => {
+    register('https://acme.slack.com/');
+
+    const url = new URL(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', 'slack:C0AAA:1786621514.008659')!);
+    expect(url.pathname).toBe('/archives/C0AAA/p1786621514008659');
+    expect(url.searchParams.get('thread_ts')).toBe('1786621514.008659');
+    expect(url.searchParams.get('cid')).toBe('C0AAA');
   });
 
   it('tolerates a workspace url with no trailing slash', () => {
     register('https://acme.slack.com');
 
     expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', 'slack:C0AAA:1786621514.008659')).toBe(
-      'https://acme.slack.com/archives/C0AAA/p1786621514008659',
+      'https://acme.slack.com/archives/C0AAA/p1786621514008659?thread_ts=1786621514.008659&cid=C0AAA',
     );
   });
 
@@ -998,7 +1011,7 @@ describe('slackPermalink', () => {
     register('https://acme.slack.com/');
 
     expect(slackPermalink(CHANNEL_TYPE, 'slack:C0AAA', '1786621514.008659')).toBe(
-      'https://acme.slack.com/archives/C0AAA/p1786621514008659',
+      'https://acme.slack.com/archives/C0AAA/p1786621514008659?thread_ts=1786621514.008659&cid=C0AAA',
     );
   });
 
