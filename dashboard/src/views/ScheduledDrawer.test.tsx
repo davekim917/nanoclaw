@@ -289,6 +289,36 @@ describe('ScheduledDrawer', () => {
     expect(screen.getByTestId('sched-audit-tail')).toBeTruthy();
   });
 
+  // ─── cron subtext — plain English + Eastern time ───
+
+  it('shows a plain-English + Eastern-time subtext under the read-only Cron field', async () => {
+    // default row: cron '0 9 * * *', next_fire_utc '2026-06-14T09:00:00Z' (EDT).
+    await renderDrawer(detail());
+    const drawer = screen.getByTestId('sched-drawer');
+    expect(drawer.textContent).toContain('daily at 9:00 AM');
+    expect(drawer.textContent).toContain('5:00 AM ET');
+  });
+
+  it('shows nothing extra for an irregular cron the formatter does not cover', async () => {
+    await renderDrawer(detail({}, { cron: '0 8,13,22 * * 1-5' }));
+    const drawer = screen.getByTestId('sched-drawer');
+    expect(drawer.textContent).not.toContain('daily at');
+    expect(drawer.textContent).not.toContain('weekly at');
+  });
+
+  it('the edit form live-updates the plain-English subtext as the cron field changes', async () => {
+    await renderDrawer(detail({}, { available_verbs: ['edit'] }));
+    await userEvent.click(verbButton('edit'));
+    const form = await screen.findByTestId('sched-edit-form');
+    expect(form.textContent).toContain('daily at 9:00 AM');
+
+    const cronInput = within(form).getByLabelText('Cron');
+    await userEvent.clear(cronInput);
+    await userEvent.type(cronInput, '*/15 * * * *');
+    expect(form.textContent).toContain('every 15 minutes');
+    expect(form.textContent).not.toContain('daily at');
+  });
+
   // ─── edit form: cron is omitted for a one-off (row.cron === null) ───
   // A one-off row has no cron → the cron field is empty → submitting cron:'' would
   // hit the backend's empty-cron guard (400 bad_cron) and block the prompt/script

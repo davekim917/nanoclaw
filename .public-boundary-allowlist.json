@@ -24,6 +24,16 @@
       "path": "README_zh.md",
       "value": "1470188214710046894",
       "reason": "Published NanoClaw community Discord server identifier"
+    },
+    {
+      "path": "dashboard/src/lib/cron-format.ts",
+      "value": "sunday",
+      "reason": "Generic day-of-week word in the cron-to-English weekday table; coincidentally matches an unrelated install-private identifier in this install's registry"
+    },
+    {
+      "path": ".public-boundary-allowlist.json",
+      "value": "sunday",
+      "reason": "This file's own entry above for cron-format.ts serializes the same generic word literally, which the private-identifier scan also runs against this file"
     }
   ]
 }

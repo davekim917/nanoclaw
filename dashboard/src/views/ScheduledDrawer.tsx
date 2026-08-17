@@ -15,6 +15,7 @@ import {
   type ScheduledDetail,
   type ScheduledVerb,
 } from '../lib/api.js';
+import { cronToEnglish, formatEasternTime } from '../lib/cron-format.js';
 import { useIsMobile } from './BoardShell.js';
 
 /**
@@ -159,7 +160,7 @@ export const ScheduledDrawer: React.FC<ScheduledDrawerProps> = ({ rowKey, groupN
         <div className="nc-sched-drawer-meta">
           <Field label="Group" value={groupName ?? row.agent_group_name} />
           <Field label="Channel" value={`${row.channel_name ?? '—'}${row.thread_id ? ` · ${row.thread_id}` : ''}`} />
-          <Field label="Cron" value={row.cron ?? '—'} />
+          <Field label="Cron" value={row.cron ?? '—'} sub={cronSubtext(row.cron, row.next_fire_utc)} />
           <Field label="Next (UTC)" value={row.next_fire_utc ?? '—'} />
           <Field label="Next (local)" value={row.next_fire_local ?? '—'} />
           <Field label="Health" value={row.health} />
@@ -330,13 +331,25 @@ function DrawerHeader({ title, onClose }: { title: string; onClose: () => void }
   );
 }
 
-function Field({ label, value }: { label: string; value: string }) {
+function Field({ label, value, sub }: { label: string; value: string; sub?: string | null }) {
   return (
     <div className="nc-sched-field">
       <span className="k">{label}</span>
       <span className="v">{value}</span>
+      {sub != null && <span className="sub">{sub}</span>}
     </div>
   );
+}
+
+/** "daily at 12:00 PM · 8:00 AM ET" — or just the English half, or nothing,
+ *  depending on what's known. Shared by the read-only meta field and the
+ *  live cron-input subtext in EditForm. */
+function cronSubtext(cron: string | null, nextFireUtc?: string | null): string | null {
+  if (!cron) return null;
+  const english = cronToEnglish(cron);
+  const et = nextFireUtc !== undefined ? formatEasternTime(nextFireUtc) : null;
+  if (english && et) return `${english} · ${et}`;
+  return english;
 }
 
 function EditForm({
@@ -355,6 +368,7 @@ function EditForm({
   const [s, setS] = useState(script ?? '');
   const [c, setC] = useState(row.cron ?? '');
   const isModule = row.module_owner != null;
+  const cronEnglishLive = cronToEnglish(c);
 
   // Edit is opened by clicking the "Edit" verb button, which is well above
   // this panel once the prompt/history/audit sections have rendered — scroll
@@ -397,7 +411,13 @@ function EditForm({
       </label>
       <label>
         Cron
-        <input value={c} onChange={(e) => setC(e.target.value)} />
+        {/* aria-label decouples the accessible name from the sibling subtext
+            below, which changes as the user types. */}
+        <input aria-label="Cron" value={c} onChange={(e) => setC(e.target.value)} />
+        {/* Live as the user types — no next-fire exists yet for an unsaved
+            edit, so only the plain-English half renders here (the ET half
+            needs a real instant, shown read-only above instead). */}
+        {cronEnglishLive != null && <span className="nc-sched-cron-sub">{cronEnglishLive}</span>}
       </label>
       <div className="nc-sched-form-actions">
         <button type="button" onClick={onCancel} disabled={busy}>
