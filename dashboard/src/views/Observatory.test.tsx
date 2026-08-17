@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { render } from '@testing-library/react';
+import { render, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 vi.mock('swr', () => {
@@ -813,6 +813,29 @@ describe('Observatory', () => {
       expect(idle.querySelector('.nc-of-sheet-held')).toBeFalsy();
     });
 
+    // obs.10 — the people on the floor are clickable, not just the rooms they
+    // stand in. The element emits `agent-select`; the page turns that into the
+    // room sheet, opened on that agent's row.
+    it('a click on an agent opens their room and emphasises their row', async () => {
+      const { container } = floor();
+      const map = container.querySelector('office-map')!;
+      await act(async () => {
+        map.dispatchEvent(
+          new CustomEvent('agent-select', { detail: { name: 'kit', room: 'westFront' }, bubbles: true }),
+        );
+      });
+      expect(container.querySelector('.nc-of-sheet-title')!.textContent).toBe('#general');
+      const rows = Array.from(container.querySelectorAll('.nc-of-sheet-list li'));
+      expect(rows.map((r) => r.getAttribute('data-agent'))).toEqual(['ava', 'kit']);
+      expect(rows.filter((r) => r.className.includes('on')).map((r) => r.getAttribute('data-agent'))).toEqual(['kit']);
+    });
+
+    it('picking a room by hand carries no agent emphasis', async () => {
+      const { container } = floor();
+      await open(container, '#general');
+      expect(container.querySelector('.nc-of-sheet-list li.on')).toBeFalsy();
+    });
+
     it('closes on the sheet\'s own control, which also clears the queue filter', async () => {
       const { container } = floor();
       await open(container, '#general');
@@ -868,6 +891,16 @@ describe('Observatory', () => {
       expect(row.querySelector('.nc-of-sched-who')!.textContent).toBe('ava in general');
       expect(row.querySelector('.nc-of-sched-cron')!.textContent).toBe('0 9 * * *');
       expect(row.querySelector('.nc-of-sched-when')!.textContent).toBe('in 1h');
+    });
+
+    // obs.10 — the API row carries the agent group's CODE name; the snapshot
+    // knows the persona. Same id on both sides, so the row says the name the
+    // operator uses.
+    it('names the persona, not the group code name, when the id is on this floor', async () => {
+      const { container } = await withRows([
+        schedRow({ key: 'mine', agent_group_id: 'ava', agent_group_name: 'ava-agent' }),
+      ]);
+      expect(container.querySelector('.nc-of-sched-who')!.textContent).toBe('ava in general');
     });
 
     it('a series with no cron says what kind of job it is — monospace stays for the cron', async () => {

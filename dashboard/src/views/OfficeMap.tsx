@@ -35,6 +35,7 @@ export function OfficeMap({
   data,
   selected,
   onSelect,
+  onAgentSelect,
   start,
   scale = '1.15',
   labels = 'sign',
@@ -44,6 +45,8 @@ export function OfficeMap({
   data: OfficeData;
   selected: string;
   onSelect: (key: string) => void;
+  /** A seated agent was clicked. `room` is the slot key the pin belongs to. */
+  onAgentSelect?: (detail: { name: string; room: string }) => void;
   /** Slot to centre on when the map first appears. Without it the viewport
       opens at the plan's top-left corner, which on a phone is all lawn. */
   start?: string;
@@ -70,6 +73,17 @@ export function OfficeMap({
     el.addEventListener('room-select', handler);
     return () => el.removeEventListener('room-select', handler);
   }, [onSelect]);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !onAgentSelect) return;
+    const handler = (e: Event) => {
+      const d = (e as CustomEvent<{ name: string; room: string }>).detail;
+      if (d?.name && d.room) onAgentSelect(d);
+    };
+    el.addEventListener('agent-select', handler);
+    return () => el.removeEventListener('agent-select', handler);
+  }, [onAgentSelect]);
 
   useEffect(() => {
     if (teleportTo && ref.current?.teleport) ref.current.teleport(teleportTo);

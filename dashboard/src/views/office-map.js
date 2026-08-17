@@ -579,6 +579,11 @@
 .ov{position:absolute;inset:0}
 .hit{position:absolute;cursor:pointer;border:0;padding:0;background:transparent}
 .hit:focus-visible{outline:2px solid #3f68c9;outline-offset:2px}
+/* nanoclaw: the PEOPLE are clickable too, not just the rooms. The visual is
+   still the 20x22 sprite; only the hit target is padded, to a fixed 40px box
+   centred on the sprite so a finger can land on it at any zoom. */
+.ahit{position:absolute;cursor:pointer;border:0;padding:0;background:transparent}
+.ahit:focus-visible{outline:2px solid #3f68c9;outline-offset:2px}
 .ag{position:absolute;image-rendering:pixelated;background-repeat:no-repeat;background-size:100% 100%;pointer-events:none;animation:bob 3.2s ease-in-out infinite}
 .ag.w{animation-duration:1.9s}
 .ag.i{animation:none;filter:saturate(.55) brightness(1.02)}
@@ -694,15 +699,28 @@
           else if (st === 'idle') ov += `<div class="bub z" style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}z z</div>`;
           else ov += `<div class="bub" style="left:${px(p.x + 10)};top:${px(p.y - 4)}">${face}<span class="dot" style="background:${STATUS[st]}"></span></div>`;
         }
+        /* nanoclaw: drawn LAST so it sits over the room's own hit area —
+         * clicking a person picks the person, never the room under them. */
+        ov += `<button class="ahit" data-agent="${p.a.name}" data-room="${p.room}" aria-label="${p.a.name}" style="left:calc(${px(p.x + 10)} - 20px);top:calc(${px(p.y + 11)} - 20px);width:40px;height:40px"></button>`;
       });
       this.shadowRoot.innerHTML = `<style>${css}</style><div class="vp"><div class="stage" style="width:${built.W * s}px;height:${built.H * s}px"><div class="world" style="width:${built.W}px;height:${built.H}px;transform:scale(${s})">${built.svg}</div><div class="ov">${ov}</div></div></div>`;
       const vp = this.shadowRoot.querySelector('.vp');
       this._vp = vp;
+      let down = false, sx = 0, sy = 0, l = 0, t = 0, moved = 0;
       vp.addEventListener('click', (e) => {
+        /* nanoclaw: a pan that happens to end over something is not a click.
+         * The pointer handler below already measures the drag; 5px of travel
+         * is the line between a tap and a grab. */
+        if (moved > 5) return;
+        const a = e.target.closest('.ahit');
+        if (a) {
+          e.stopPropagation();
+          this.dispatchEvent(new CustomEvent('agent-select', { detail: { name: a.dataset.agent, room: a.dataset.room }, bubbles: true, composed: true }));
+          return;
+        }
         const b = e.target.closest('.hit');
         if (b) this.dispatchEvent(new CustomEvent('room-select', { detail: { key: b.dataset.room }, bubbles: true, composed: true }));
       });
-      let down = false, sx = 0, sy = 0, l = 0, t = 0, moved = 0;
       vp.addEventListener('pointerdown', (e) => { down = true; moved = 0; sx = e.clientX; sy = e.clientY; l = vp.scrollLeft; t = vp.scrollTop; vp.classList.add('drag'); });
       vp.addEventListener('pointermove', (e) => {
         if (!down) return;

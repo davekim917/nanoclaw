@@ -2089,6 +2089,11 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   padding:10px 14px; min-height:44px; font-size:12.5px;
 }
 .nc-of .nc-of-sheet-list li + li{border-top:1px solid var(--line)}
+/* obs.10 — you clicked a PERSON, so the sheet says which one. The same quiet
+   ink wash the rest of the chrome hovers with, plus the accent rule that marks
+   interaction everywhere else. No new colour, and no status colour: the dot
+   still owns state. */
+.nc-of .nc-of-sheet-list li.on{background:rgba(35,32,27,.05); box-shadow:inset 2px 0 0 var(--accent)}
 .nc-of .nc-of-sheet-who{display:inline-flex; align-items:center; gap:7px; font-weight:600; min-width:120px}
 .nc-of .nc-of-sd{width:7px; height:7px; border-radius:50%; background:var(--idle); flex:none}
 .nc-of .nc-of-sd.blocked{background:var(--stop)}

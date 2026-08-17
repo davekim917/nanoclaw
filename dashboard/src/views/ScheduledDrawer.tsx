@@ -43,6 +43,10 @@ import { useIsMobile } from './BoardShell.js';
 
 interface ScheduledDrawerProps {
   rowKey: string;
+  /** The persona name for this row's agent group, when the caller knows one —
+   *  the fetched row carries the group's code name, which is not what the
+   *  operator calls it. Null falls back to that code name. */
+  groupName?: string | null;
   onClose: () => void;
   onMutated: () => void;
 }
@@ -66,7 +70,7 @@ type Pane =
   | { kind: 'move-form' }
   | { kind: 'move-confirm'; preview: MovePreviewResult; targetAgentGroupId: string; targetMessagingGroupId: string };
 
-export const ScheduledDrawer: React.FC<ScheduledDrawerProps> = ({ rowKey, onClose, onMutated }) => {
+export const ScheduledDrawer: React.FC<ScheduledDrawerProps> = ({ rowKey, groupName = null, onClose, onMutated }) => {
   const isMobile = useIsMobile();
   const { data, mutate } = useSWR<ScheduledDetail>(
     ['/dashboard/api/scheduled', rowKey],
@@ -151,7 +155,7 @@ export const ScheduledDrawer: React.FC<ScheduledDrawerProps> = ({ rowKey, onClos
 
       <div className="nc-sched-drawer-body">
         <div className="nc-sched-drawer-meta">
-          <Field label="Group" value={row.agent_group_name} />
+          <Field label="Group" value={groupName ?? row.agent_group_name} />
           <Field label="Channel" value={`${row.channel_name ?? '—'}${row.thread_id ? ` · ${row.thread_id}` : ''}`} />
           <Field label="Cron" value={row.cron ?? '—'} />
           <Field label="Next (UTC)" value={row.next_fire_utc ?? '—'} />

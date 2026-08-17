@@ -118,6 +118,9 @@ export function Observatory({ authMe }: ObservatoryProps) {
   const [flowFilter, setFlowFilter] = useState<FlowSlice | null>(null);
   const [teleportTo, setTeleportTo] = useState<string | null>(null);
   const [expandedClaim, setExpandedClaim] = useState<string | null>(null);
+  // The agent whose pin opened the sheet, emphasised in it so a click on a
+  // person lands you on that person's row and not just in their room.
+  const [focusAgent, setFocusAgent] = useState<string | null>(null);
 
   const rooms = useMemo(() => sortRooms(snapshot?.rooms ?? []), [snapshot]);
   const agents = snapshot?.agents ?? [];
@@ -197,6 +200,22 @@ export function Observatory({ authMe }: ObservatoryProps) {
     )[0]?.slot;
   }, [officeData]);
 
+  // Picking a room from anywhere but a pin drops the emphasis: it belongs to
+  // the click that opened the sheet, not to the room.
+  const pickRoom = (k: string) => {
+    setFocusAgent(null);
+    setSelectedRoom((prev) => (prev === k ? '' : k));
+  };
+  const closeRoom = () => {
+    setFocusAgent(null);
+    setSelectedRoom('');
+  };
+
+  // Scheduled rows carry the agent group's CODE name; the snapshot carries the
+  // persona the operator actually knows. Same id on both sides, so map it —
+  // and fall back to whatever the row said rather than to nothing.
+  const personaById = useMemo(() => new Map(agents.map((a) => [a.id, a.name])), [agents]);
+
   const claimClicked = (claim: ObservatoryClaim) => {
     setExpandedClaim((prev) => (prev === claim.slug ? null : claim.slug));
   };
@@ -270,7 +289,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                   <span className="nc-of-mapcard-title">The office</span>
                   <span className="nc-of-mapcard-hint">drag to pan · tap a room to filter what is below</span>
                   {selectedRoom && (
-                    <button type="button" className="nc-of-chip" onClick={() => setSelectedRoom('')}>
+                    <button type="button" className="nc-of-chip" onClick={closeRoom}>
                       All rooms
                     </button>
                   )}
@@ -279,7 +298,11 @@ export function Observatory({ authMe }: ObservatoryProps) {
                   data={officeData}
                   {...(startSlot ? { start: startSlot } : {})}
                   selected={selectedRoom}
-                  onSelect={(k) => setSelectedRoom((prev) => (prev === k ? '' : k))}
+                  onSelect={pickRoom}
+                  onAgentSelect={({ name, room }) => {
+                    setSelectedRoom(room);
+                    setFocusAgent(name);
+                  }}
                   teleportTo={teleportTo}
                 />
                 <div className="nc-of-teleport">
@@ -290,7 +313,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       className={`nc-of-chip ${selectedRoom === r.slot ? 'on' : ''}`}
                       onClick={() => {
                         setTeleportTo(r.slot);
-                        setSelectedRoom((prev) => (prev === r.slot ? '' : r.slot));
+                        pickRoom(r.slot);
                       }}
                     >
                       <i className={`nc-of-sd ${r.state}`} />
@@ -312,7 +335,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                 <aside className="nc-of-sheet">
                   <header>
                     <span className="nc-of-sheet-title">{selectedRoomAgents.label}</span>
-                    <button type="button" className="nc-of-sheet-x" onClick={() => setSelectedRoom('')} aria-label="Close">
+                    <button type="button" className="nc-of-sheet-x" onClick={closeRoom} aria-label="Close">
                       ✕
                     </button>
                   </header>
@@ -321,7 +344,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                   ) : (
                     <ul className="nc-of-sheet-list">
                       {selectedRoomAgents.agents.map((a) => (
-                        <li key={a.id}>
+                        <li key={a.id} className={a.name === focusAgent ? 'on' : ''} data-agent={a.name}>
                           <span className="nc-of-sheet-who">
                             <i className={`nc-of-sd ${a.state}`} />
                             {a.name}
@@ -391,6 +414,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       <ClaimsCard claims={claims} expandedSlug={expandedClaim} onClaimClick={claimClicked} />
                       <ScheduleCard
                         rows={schedRows}
+                        names={personaById}
                         failed={Boolean(schedError) && !schedData}
                         onMutated={() => void schedMutate()}
                       />
@@ -405,6 +429,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                 {view === 'schedule' && (
                   <ScheduleCard
                     rows={schedRows}
+                    names={personaById}
                     failed={Boolean(schedError) && !schedData}
                     onMutated={() => void schedMutate()}
                   />
@@ -1091,10 +1116,14 @@ export function scheduleSummary(rows: ScheduledRow[], now = Date.now()): string 
 
 function ScheduleCard({
   rows,
+  names,
   failed,
   onMutated,
 }: {
   rows: ScheduledRow[];
+  /** agent_group_id → the persona name the operator knows it by. A row whose
+   *  id is not on this floor keeps whatever name the API gave it. */
+  names: Map<string, string>;
   /** The endpoint failed and there is nothing cached to show. */
   failed: boolean;
   onMutated: () => void;
@@ -1126,7 +1155,7 @@ function ScheduleCard({
                 <span className="nc-of-sched-name">
                   <span className="nc-of-sched-id mono">{r.series_id}</span>
                   <span className="nc-of-sched-who">
-                    {r.agent_group_name}
+                    {names.get(r.agent_group_id) ?? r.agent_group_name}
                     {r.channel_name ? ` in ${r.channel_name}` : ''}
                   </span>
                 </span>
@@ -1143,7 +1172,16 @@ function ScheduleCard({
           ))}
         </ul>
       )}
-      {open && <ScheduledDrawer rowKey={open} onClose={() => setOpenKey(null)} onMutated={onMutated} />}
+      {open && (
+        <ScheduledDrawer
+          rowKey={open}
+          // The drawer fetches its own row, which carries the code name; the
+          // persona is only known out here, so it is handed down.
+          groupName={names.get(rows.find((r) => r.key === open)!.agent_group_id) ?? null}
+          onClose={() => setOpenKey(null)}
+          onMutated={onMutated}
+        />
+      )}
     </section>
   );
 }
