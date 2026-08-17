@@ -612,9 +612,19 @@ function writeCeilingRespawn(
   reason: 'continuation' | 'tool',
   recoveryKey: string,
   heartbeatAgeMs: number,
+  workContinuation: HostWorkContinuation | null,
 ): void {
   const idleMinutes = Math.round(ABSOLUTE_CEILING_MS / 60_000);
   const silentMinutes = Math.round(heartbeatAgeMs / 60_000);
+  // Name the saved task. Without it the agent reads a generic "you were
+  // killed" notice, cannot tell the wake IS its own continuation, and burns a
+  // turn re-deriving whether the promised work ran (observed 2026-08-16).
+  const savedWork =
+    reason === 'continuation' && workContinuation
+      ? ` Your saved continuation (${workContinuation.id}) is still queued and resumes automatically right after ` +
+        `this message — do NOT re-queue it with continue_work, and do not redo it if you find it already done. ` +
+        `The saved task is: ${workContinuation.task}`
+      : '';
   const text =
     `[system] Your previous container was killed by the ${idleMinutes}-minute idle ceiling ` +
     `(no active turn for ~${silentMinutes} min). If work was in flight: check your durable checkpoints, ` +
@@ -622,7 +632,7 @@ function writeCeilingRespawn(
     `Re-check any work claims in claims/ before resuming a seam — a sibling may have taken it over while you were down. ` +
     `In-container background tasks, sleeps, and /tmp do not survive a restart; before going idle with ` +
     `work in flight, checkpoint to a durable path and call continue_work, or use wait for a real time delay. ` +
-    `If nothing was in flight, say so in one line.`;
+    `If nothing was in flight, say so in one line.${savedWork}`;
   insertDeferredMessageWithContextIfNew(inDb, {
     id: `${CEILING_RESPAWN_ID_PREFIX}${recoveryKey}`,
     kind: 'chat',
@@ -662,7 +672,7 @@ function applyCeilingFollowUp(
       followUp.reason === 'continuation'
         ? `continuation-${workContinuation!.id}-${workContinuation!.recovery_episode}-${workContinuation!.resume_attempts}`
         : `tool-${encodeURIComponent(containerState?.tool_started_at ?? 'unknown')}`;
-    writeCeilingRespawn(inDb, session, followUp.reason, recoveryKey, heartbeatAgeMs);
+    writeCeilingRespawn(inDb, session, followUp.reason, recoveryKey, heartbeatAgeMs, workContinuation);
     log.info('Queued ceiling-kill accountability wake', { sessionId: session.id, reason: followUp.reason });
   }
   return followUp;

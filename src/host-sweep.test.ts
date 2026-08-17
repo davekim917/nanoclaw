@@ -522,6 +522,10 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
     expect(content._system.kind).toBe('agent_ceiling_respawn');
     expect(content._system.reason).toBe('continuation');
     expect(content.text).toContain('idle ceiling');
+    // The wake must name the saved task, or the agent can't tell this wake IS
+    // its continuation and re-derives (or redoes) the promised work.
+    expect(content.text).toContain('write the dbt tests');
+    expect(content.text).toContain('cont-1');
     const recall = inDb
       .prepare("SELECT trigger, on_wake, content FROM messages_in WHERE id LIKE 'recall-ceiling-respawn-%'")
       .get() as { trigger: number; on_wake: number; content: string };
@@ -552,7 +556,10 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
       HB_AGE,
     );
     expect(res).toEqual({ action: 'wake-accountable', reason: 'tool' });
-    expect(respawnRows(inDb)).toHaveLength(1);
+    const rows = respawnRows(inDb);
+    expect(rows).toHaveLength(1);
+    // A tool-only wake has no saved task to name.
+    expect(JSON.parse(rows[0].content).text).not.toContain('saved continuation');
   });
 
   it('does not fire for a quiet idle container', () => {
