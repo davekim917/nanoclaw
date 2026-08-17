@@ -36,7 +36,7 @@ export function OfficeMap({
   selected,
   onSelect,
   start,
-  scale = '1.35',
+  scale = '1.15',
   labels = 'sign',
   agents = 'bubble',
   teleportTo,

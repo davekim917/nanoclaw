@@ -327,6 +327,85 @@
       ],
       agents: [],
     },
+    /* nanoclaw: east wing + south annex. The floor had five live slots against
+     * ten live channels, so half the workgroup — including its busiest rooms —
+     * had nowhere to stand and fell into the overflow line. Geometry stays
+     * hand-authored and fixed; only the count grew. */
+    eastWingN: {
+      label: 'room six', floor: 'wood', open: 0, state: 'idle', wall: '#b0a98f',
+      grid: [
+        'ww.bb..ww..bb.p',
+        'TTT.TT.TTT.TT..',
+        '..1...c...c....',
+        'B.............B',
+        'O............x.',
+        'p..c...c...c..e',
+        'TTTT..TTTT..TT.',
+      ],
+      agents: [],
+    },
+    eastWingM: {
+      label: 'room seven', floor: 'carpet', open: 0, state: 'idle', wall: '#9db3a4',
+      grid: [
+        'wwww.bbb..ww..p',
+        'TTTT.TTT.TTT...',
+        '..1....2...c...',
+        'B.............B',
+        'O.............e',
+        'p..c...c...c..x',
+        'TTTT..TTTTT..pp',
+      ],
+      agents: [],
+    },
+    eastWingS: {
+      label: 'room eight', floor: 'tile', open: 0, state: 'idle', wall: '#b3a2a8',
+      grid: [
+        'kkksfk..ww..bb.',
+        '.....1....2....',
+        'B.....c....c..B',
+        'O.............e',
+        'O............x.',
+        'p.kkkk..TTTT.pp',
+      ],
+      agents: [],
+    },
+    southWest: {
+      label: 'room nine', floor: 'wood', open: 0, state: 'idle', wall: '#c0b394',
+      grid: [
+        'ww.bb..wwww.bb.',
+        'TTT.TT.TTTT.TT.',
+        '..1...c....c...',
+        'B.............B',
+        'O............x.',
+        'p..c...c...c..e',
+        'TTTT..TTTT..TT.',
+      ],
+      agents: [],
+    },
+    southMid: {
+      label: 'room ten', floor: 'carpet', open: 0, state: 'idle', wall: '#a8aec2',
+      grid: [
+        'ww.bbb..ww.p.',
+        'TTT.TT.TTTT..',
+        '..1...c...c..',
+        'O...........B',
+        'O.....c.c...B',
+        'p..TTTTTT..px',
+      ],
+      agents: [],
+    },
+    southEast: {
+      label: 'room eleven', floor: 'concrete', open: 0, state: 'idle', wall: '#aeb0ab',
+      grid: [
+        'ww..bb..ww.p.',
+        'TTT.TT.TTTT..',
+        '..1...c...c..',
+        'B...........B',
+        'O.....c.c...e',
+        'p..TTTTTT..xp',
+      ],
+      agents: [],
+    },
     hall: {
       label: 'hallway', floor: 'brick', open: 0, state: 'idle', quiet: true,
       grid: ['p...x.....b...p', '...............', 'B....p.....x..B'],
@@ -336,14 +415,41 @@
 
   /* ── plans ──────────────────────────────────────────────────────────── */
   const PLANS = {
+    /* nanoclaw: grown from five live rooms to eleven. The five original rooms
+     * keep their exact coordinates — a plan that moves rooms destroys the
+     * spatial memory the floor exists for — and the new ones are an east wing
+     * and a south annex around the same yard. */
     house: {
-      world: [56, 31],
-      buildings: [[6, 3, 31, 21], [39, 3, 13, 10]],
-      place: { westFront: [7, 4], eastFront: [23, 4], kitchen: [23, 11], eastBack: [23, 18], hall: [7, 12], westBack: [7, 17], garage: [40, 4] },
-      doors: [[13, 11, 2, 1], [13, 16, 2, 1], [22, 12, 1, 2], [22, 6, 1, 2], [36, 20, 1, 2], [40, 12, 4, 1], [22, 19, 1, 2]],
-      paths: [[40, 12, 5, 16], [37, 20, 5, 2], [12, 25, 3, 3], [12, 27, 29, 2], [42, 17, 8, 2]],
-      pool: [42, 19, 9, 5],
-      decor: [['palm', 1, 5], ['palm', 2, 18], ['tree', 0, 25], ['bush', 4, 11], ['bush', 4, 22], ['tree', 53, 4], ['palm', 52, 13], ['palm', 53, 24], ['bush', 38, 27], ['bush', 16, 27], ['tree', 25, 0], ['bush', 46, 0], ['palm', 33, 0], ['lounger', 42, 25], ['lounger', 45, 25], ['umbrella', 48, 24], ['table', 37, 18], ['bench', 16, 25], ['car', 45, 14], ['hoop', 49, 26], ['bush', 51, 28], ['bush', 8, 0], ['bush', 30, 26], ['tree', 4, 27], ['bush', 20, 26], ['palm', 8, 25]],
+      world: [76, 43],
+      buildings: [[6, 3, 31, 22], [40, 3, 18, 29], [61, 3, 13, 10], [6, 29, 46, 10]],
+      place: {
+        westFront: [7, 4], eastFront: [23, 4], kitchen: [23, 11], eastBack: [23, 18],
+        hall: [7, 12], westBack: [7, 17],
+        eastWingN: [41, 4], eastWingM: [41, 13], eastWingS: [41, 22],
+        southWest: [7, 30], southMid: [23, 30], southEast: [37, 30],
+        garage: [62, 4],
+      },
+      doors: [
+        [13, 11, 2, 1], [13, 16, 2, 1], [22, 12, 1, 2], [22, 6, 1, 2], [22, 19, 1, 2],
+        [37, 8, 3, 1], [37, 16, 3, 1], [40, 11, 1, 2], [40, 20, 1, 2],
+        [57, 8, 4, 1], [13, 26, 2, 3], [29, 26, 2, 3], [43, 26, 2, 3], [51, 24, 4, 1],
+      ],
+      paths: [
+        [37, 8, 3, 1], [37, 16, 3, 1], [57, 8, 4, 1],
+        [13, 26, 2, 3], [29, 26, 2, 3], [43, 26, 2, 3],
+        [12, 27, 32, 2], [58, 12, 3, 16], [51, 24, 8, 2], [53, 28, 16, 2], [61, 13, 4, 2],
+      ],
+      pool: [58, 30, 11, 6],
+      decor: [
+        ['palm', 1, 5], ['palm', 2, 18], ['tree', 0, 25], ['bush', 4, 11], ['bush', 4, 22],
+        ['tree', 77, 4], ['palm', 76, 15], ['palm', 77, 30], ['bush', 38, 40], ['bush', 16, 41],
+        ['tree', 25, 0], ['bush', 46, 0], ['palm', 33, 0], ['palm', 59, 0],
+        ['lounger', 58, 37], ['lounger', 61, 37], ['umbrella', 64, 36], ['table', 70, 31],
+        ['bench', 16, 26], ['bench', 44, 26], ['car', 66, 14], ['hoop', 71, 24],
+        ['bush', 74, 39], ['bush', 8, 0], ['bush', 52, 40], ['tree', 2, 40], ['bush', 20, 40],
+        ['palm', 53, 5], ['palm', 55, 27], ['tree', 71, 40], ['bush', 70, 20], ['bush', 30, 41],
+        ['bush', 0, 33], ['palm', 2, 33], ['palm', 72, 6], ['tree', 59, 0], ['bush', 46, 41],
+      ],
     },
     compound: {
       world: [60, 36],
@@ -363,7 +469,11 @@
    * The slots a live workgroup's channels are assigned to, in the
    * order they are filled. `hall` is circulation and `garage` is where quiet
    * channels go, so neither takes a live channel from the front of the list. */
-  const SLOTS = ['westFront', 'eastFront', 'kitchen', 'westBack', 'eastBack'];
+  const SLOTS = [
+    'westFront', 'eastFront', 'kitchen', 'westBack', 'eastBack',
+    'eastWingN', 'eastWingM', 'eastWingS',
+    'southWest', 'southMid', 'southEast',
+  ];
 
   /* ── build ──────────────────────────────────────────────────────────── */
   const CACHE = {};

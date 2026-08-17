@@ -13,7 +13,11 @@ import { buildLedger } from './commitments.js';
  */
 
 /** Slots the plan offers, in fill order. Mirrors SLOTS in office-map.js. */
-export const SLOTS = ['westFront', 'eastFront', 'kitchen', 'westBack', 'eastBack'] as const;
+export const SLOTS = [
+  'westFront', 'eastFront', 'kitchen', 'westBack', 'eastBack',
+  'eastWingN', 'eastWingM', 'eastWingS',
+  'southWest', 'southMid', 'southEast',
+] as const;
 export type Slot = (typeof SLOTS)[number];
 
 export type OfficeState = 'blocked' | 'waiting' | 'working' | 'idle';
