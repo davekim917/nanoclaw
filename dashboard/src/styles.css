@@ -1959,7 +1959,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    illustrated surface in the product was the most space-starved thing on the
    page; the fade is deep enough now to read as a viewport edge, not a clip. */
 .nc-of office-map{
-  display:block; height:clamp(340px,48vh,560px);
+  display:block; height:clamp(460px,66vh,900px);
   -webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 40px),transparent);
   mask-image:linear-gradient(to bottom,#000 calc(100% - 40px),transparent);
 }
