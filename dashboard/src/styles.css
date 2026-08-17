@@ -1965,19 +1965,27 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 
 /* Assign: one select, one verb. The button names the destination because the
    destination is the decision — work starts in the item's own room. */
-.nc-of .nc-obs-assign{display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:9px}
+/* The claims-board push shares assign's visual language exactly — same accent
+   button, same inline done/error line. It is the same act, one row over. */
+.nc-of .nc-obs-assign,
+.nc-of .nc-obs-nudge{display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:9px}
 .nc-of .nc-obs-assign select{
   font:inherit; font-size:12.5px; color:var(--ink); background:var(--card-2);
   border:1px solid var(--line-2); border-radius:7px; padding:5px 8px; min-height:34px;
 }
-.nc-of .nc-obs-assign button{
+.nc-of .nc-obs-assign button,
+.nc-of .nc-obs-nudge button{
   font:inherit; font-size:12.5px; font-weight:600; color:#fff; background:var(--accent);
   border:0; border-radius:7px; padding:6px 12px; min-height:34px; cursor:pointer;
 }
-.nc-of .nc-obs-assign button:disabled{opacity:.45; cursor:default}
-.nc-of .nc-obs-assign button:not(:disabled):hover{filter:brightness(1.08)}
-.nc-of .nc-obs-assign-err{font-size:12px; color:var(--stop)}
-.nc-of .nc-obs-assign-done{margin-top:9px; font-size:12.5px; font-weight:600; color:var(--go)}
+.nc-of .nc-obs-assign button:disabled,
+.nc-of .nc-obs-nudge button:disabled{opacity:.45; cursor:default}
+.nc-of .nc-obs-assign button:not(:disabled):hover,
+.nc-of .nc-obs-nudge button:not(:disabled):hover{filter:brightness(1.08)}
+.nc-of .nc-obs-assign-err,
+.nc-of .nc-obs-nudge-err{font-size:12px; color:var(--stop)}
+.nc-of .nc-obs-assign-done,
+.nc-of .nc-obs-nudge-done{margin-top:9px; font-size:12.5px; font-weight:600; color:var(--go)}
 
 /* Anything that leaves the page. Sentence case, accent, 44px tall — the
    uppercase-letterspaced-mono version this replaced shouted louder than the

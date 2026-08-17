@@ -564,6 +564,20 @@ export async function assignItem(
   });
 }
 
+/** Push a stalled claim forward: creates a one-shot task in the claim's OWN
+ *  thread. The server composes the prompt from the claim file — ids only. */
+export async function nudgeClaim(
+  workgroupId: string,
+  claimSlug: string,
+  agentGroupId: string,
+): Promise<{ ok: boolean; seriesId: string | null; threadUrl: string | null }> {
+  return apiFetch('/dashboard/api/observatory/nudge', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workgroupId, claimSlug, agentGroupId }),
+  });
+}
+
 export async function getObservatory(workgroupId: string): Promise<ObservatorySnapshot> {
   return apiFetch<ObservatorySnapshot>(
     `/dashboard/api/observatory?workgroup=${encodeURIComponent(workgroupId)}`,

@@ -19,7 +19,7 @@ import { relAge } from '../lib/derive.js';
 import { type BoardRoute } from './BoardShell.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildLedger, classify, dueLabel, type Commitment } from './commitments.js';
-import { assignItem } from '../lib/api.js';
+import { assignItem, nudgeClaim } from '../lib/api.js';
 import { OfficeMap } from './OfficeMap.js';
 import { buildOfficeData } from './office-data.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
@@ -411,7 +411,12 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       {...(assign ? { assign } : {})}
                     />
                     <div className="nc-of-twoup">
-                      <ClaimsCard claims={claims} expandedSlug={expandedClaim} onClaimClick={claimClicked} />
+                      <ClaimsCard
+                        claims={claims}
+                        expandedSlug={expandedClaim}
+                        onClaimClick={claimClicked}
+                        {...(assign ? { assign } : {})}
+                      />
                       <ScheduleCard
                         rows={schedRows}
                         names={personaById}
@@ -423,7 +428,12 @@ export function Observatory({ authMe }: ObservatoryProps) {
                 )}
 
                 {view === 'claims' && (
-                  <ClaimsCard claims={claims} expandedSlug={expandedClaim} onClaimClick={claimClicked} />
+                  <ClaimsCard
+                    claims={claims}
+                    expandedSlug={expandedClaim}
+                    onClaimClick={claimClicked}
+                    {...(assign ? { assign } : {})}
+                  />
                 )}
 
                 {view === 'schedule' && (
@@ -1024,14 +1034,87 @@ function claimTone(c: ObservatoryClaim): string {
   return '';
 }
 
+/**
+ * The push control on one expanded claim. Sends three ids; the server composes
+ * the demand from the claim file and routes it into the claim's OWN thread.
+ *
+ * Rendered only for a claim that has stopped moving, has a thread to push into,
+ * and is owned by an agent — a human's claim is not pushable by task, and a
+ * claim with no thread has nowhere honest to land (the cure is `claim.sh
+ * thread`, upstream).
+ */
+function NudgeControl({
+  claim,
+  workgroupId,
+  agentGroupId,
+}: {
+  claim: ObservatoryClaim;
+  workgroupId: string;
+  agentGroupId: string;
+}) {
+  const [state, setState] = useState<{ phase: 'idle' | 'busy' | 'done' | 'error'; note?: string; url?: string }>({
+    phase: 'idle',
+  });
+
+  if (state.phase === 'done') {
+    return (
+      <div className="nc-obs-nudge-done">
+        pushed — the ask landed in its thread →{' '}
+        {state.url ? <OutLink href={state.url}>open thread</OutLink> : null}
+      </div>
+    );
+  }
+
+  const go = async () => {
+    setState({ phase: 'busy' });
+    try {
+      const r = await nudgeClaim(workgroupId, claim.slug, agentGroupId);
+      setState({ phase: 'done', ...(r.threadUrl ? { url: r.threadUrl } : {}) });
+    } catch (e) {
+      const err = e as { error?: string; status?: number };
+      const why =
+        // The endpoint ships restart-gated: until the host restarts it simply
+        // isn't routed, and "unknown" would read as a bug in the claim.
+        err.status === 404 && err.error !== 'claim_not_found'
+          ? 'not active until the next host restart'
+          : err.error === 'claim_has_no_thread'
+            ? 'that claim has no thread recorded yet'
+            : err.error === 'recently_nudged'
+              ? 'already pushed in the last few minutes'
+              : err.error === 'agent_not_wired_to_thread_channel'
+                ? `${claim.owner} is not wired to that thread's channel`
+                : (err.error ?? 'failed');
+      setState({ phase: 'error', note: why });
+    }
+  };
+
+  return (
+    <div className="nc-obs-nudge">
+      <button type="button" onClick={go} disabled={state.phase === 'busy'}>
+        {state.phase === 'busy' ? 'pushing…' : 'push it forward'}
+      </button>
+      {state.phase === 'error' && <span className="nc-obs-nudge-err">{state.note}</span>}
+    </div>
+  );
+}
+
+/** The claim's owner, as an agent id — null when a human (or nobody known) holds it. */
+function ownerAgentId(claim: ObservatoryClaim, agents: { id: string; name: string }[]): string | null {
+  const owner = claim.owner?.trim().toLowerCase();
+  if (!owner || owner === 'unknown') return null;
+  return agents.find((a) => a.name.trim().toLowerCase() === owner)?.id ?? null;
+}
+
 function ClaimsCard({
   claims,
   expandedSlug,
   onClaimClick,
+  assign,
 }: {
   claims: ObservatoryClaim[];
   expandedSlug: string | null;
   onClaimClick: (claim: ObservatoryClaim) => void;
+  assign?: AssignWiring;
 }) {
   return (
     <section className="nc-of-card" data-section="claims">
@@ -1045,6 +1128,10 @@ function ClaimsCard({
         <ul className="nc-obs-claim-rows">
           {claims.map((c) => {
             const expanded = expandedSlug === c.slug;
+            // Only work that has stopped moving is pushable — a live claim is
+            // being done, and a push is a demand for an answer, not a ping.
+            const stuck = c.state !== 'live' || c.escalated;
+            const ownerAgent = assign ? ownerAgentId(c, assign.agents) : null;
             return (
               <li key={c.slug} className={`nc-obs-claim-row ${c.state}`} data-slug={c.slug}>
                 <button
@@ -1066,7 +1153,14 @@ function ClaimsCard({
                 {expanded && (
                   <div className="nc-obs-claim-detail">
                     {c.note && <div className="nc-obs-claim-note">{c.note}</div>}
-                    {c.threadUrl && <OutLink href={c.threadUrl}>open thread</OutLink>}
+                    {c.threadUrl ? (
+                      <OutLink href={c.threadUrl}>open thread</OutLink>
+                    ) : (
+                      <span className="nc-of-sheet-nothread">no thread recorded</span>
+                    )}
+                    {assign && ownerAgent && stuck && c.threadUrl && (
+                      <NudgeControl claim={c} workgroupId={assign.workgroupId} agentGroupId={ownerAgent} />
+                    )}
                   </div>
                 )}
               </li>

@@ -13,6 +13,7 @@ vi.mock('../lib/api.js', () => ({
   getObservatory: vi.fn(),
   listScheduled: vi.fn(),
   assignItem: vi.fn(),
+  nudgeClaim: vi.fn(),
 }));
 
 // The drawer is exercised by its own suite; here we only care that the floor
@@ -34,7 +35,7 @@ import {
 } from './Observatory.js';
 import { RouteNav } from './BoardShell.js';
 import useSWR from 'swr';
-import { assignItem } from '../lib/api.js';
+import { assignItem, nudgeClaim } from '../lib/api.js';
 import type {
   ObservatoryRoom,
   ObservatoryAgent,
@@ -374,6 +375,81 @@ describe('Observatory', () => {
     it('sortClaims: pure ordering helper matches the row order', () => {
       const out = sortClaims([claim({ slug: 'a', state: 'live' }), claim({ slug: 'b', state: 'stale' })]);
       expect(out.map((c) => c.slug)).toEqual(['b', 'a']);
+    });
+  });
+
+  // The claims board says what stopped. This is the one control that makes it
+  // start again — and it only exists where a task can honestly land.
+  describe('pushing a stalled claim forward', () => {
+    const mockNudge = vi.mocked(nudgeClaim);
+
+    const stalledBoard = () =>
+      mockData(
+        snapshot({
+          agents: [agent({ id: 'ag-ava', name: 'ava' })],
+          claims: [
+            claim({ slug: 'stuck', state: 'stale', owner: 'ava', threadUrl: 'https://example.com/t/1' }),
+            claim({ slug: 'orphan', state: 'stale', owner: 'ava', threadUrl: null }),
+            claim({ slug: 'hers', state: 'stale', owner: 'kit', threadUrl: 'https://example.com/t/2' }),
+            claim({ slug: 'moving', state: 'live', owner: 'ava', threadUrl: 'https://example.com/t/3' }),
+          ],
+        }),
+      );
+
+    const open = async (me = mockAuthMe) => {
+      stalledBoard();
+      const { container } = render(<Observatory authMe={me} route="observatory" onRouteChange={noop} />);
+      await segment(container, 'claims');
+      return container;
+    };
+    const expand = async (c: HTMLElement, slug: string) => {
+      const row = c.querySelector(`.nc-obs-claim-row[data-slug="${slug}"]`)! as HTMLElement;
+      await userEvent.click(row.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
+      return row;
+    };
+
+    it('offers the push only on a stalled, threaded, agent-owned claim', async () => {
+      const c = await open();
+      expect((await expand(c, 'stuck')).querySelector('.nc-obs-nudge button')!.textContent).toBe('push it forward');
+      // live work is being done — a push is a demand, not a ping.
+      expect((await expand(c, 'moving')).querySelector('.nc-obs-nudge')).toBeFalsy();
+      // a human's claim is not pushable by task.
+      expect((await expand(c, 'hers')).querySelector('.nc-obs-nudge')).toBeFalsy();
+    });
+
+    it('a claim with no thread says so rather than inventing a room to shout into', async () => {
+      const row = await expand(await open(), 'orphan');
+      expect(row.querySelector('.nc-obs-nudge')).toBeFalsy();
+      expect(row.querySelector('.nc-of-sheet-nothread')!.textContent).toBe('no thread recorded');
+    });
+
+    it('sends ids only, and confirms with a link into the thread it landed in', async () => {
+      mockNudge.mockResolvedValue({ ok: true, seriesId: 's1', threadUrl: 'https://example.com/t/1' });
+      const row = await expand(await open(), 'stuck');
+      await userEvent.click(row.querySelector('.nc-obs-nudge button')! as HTMLElement);
+
+      expect(mockNudge).toHaveBeenCalledWith('wg-1', 'stuck', 'ag-ava');
+      const done = row.querySelector('.nc-obs-nudge-done')!;
+      expect(done.textContent).toContain('pushed — the ask landed in its thread');
+      const link = done.querySelector('a')!;
+      expect(link.getAttribute('href')).toBe('https://example.com/t/1');
+      expect(link.getAttribute('target')).toBe('_blank');
+      expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+    });
+
+    it('a 404 is the endpoint not being live yet, and says so in those words', async () => {
+      mockNudge.mockRejectedValue({ status: 404, error: 'unknown' });
+      const row = await expand(await open(), 'stuck');
+      await userEvent.click(row.querySelector('.nc-obs-nudge button')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-nudge-err')!.textContent).toBe('not active until the next host restart');
+    });
+
+    it('a member never sees the control — the server is the gate, this is the hint', async () => {
+      const memberMe = { user_id: 'u2', scopes: { role: 'member', allowed_group_ids: [], no_filter: false } };
+      const row = await expand(await open(memberMe), 'stuck');
+      expect(row.querySelector('.nc-obs-nudge')).toBeFalsy();
+      // the thread link is still there — reading is not the thing being gated.
+      expect(row.querySelector('.nc-obs-claim-detail a')).toBeTruthy();
     });
   });
 
