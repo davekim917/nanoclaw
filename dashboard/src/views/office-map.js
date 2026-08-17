@@ -952,12 +952,18 @@
         [13, 26, 2, 3], [29, 26, 2, 3], [43, 26, 2, 3],
         [12, 27, 32, 2], [58, 12, 3, 16], [51, 24, 8, 2], [53, 28, 16, 2], [61, 13, 4, 2],
       ],
-      pool: [58, 30, 11, 6],
+      /* nanoclaw: TRUNK BUG. Pool sat at x=58, flush against the east wing's
+       * tile boundary — the building's shell (drawn 6px past its footprint)
+       * and the pool's deck (extends 12px past its footprint) overlapped by
+       * 18px at the corner, so the wall band cut across the deck. Nudged east
+       * to x=61 (deck now clears the shell by ~30px of grass); decor below
+       * shifted +3 tiles with it to keep the patio composition intact. */
+      pool: [61, 30, 11, 6],
       decor: [
         ['palm', 1, 5], ['palm', 2, 18], ['tree', 0, 25], ['bush', 4, 11], ['bush', 4, 22],
         ['tree', 77, 4], ['palm', 76, 15], ['palm', 77, 30], ['bush', 38, 40], ['bush', 16, 41],
         ['tree', 25, 0], ['bush', 46, 0], ['palm', 33, 0], ['palm', 59, 0],
-        ['lounger', 58, 37], ['lounger', 61, 37], ['umbrella', 64, 36], ['table', 70, 31],
+        ['lounger', 61, 37], ['lounger', 64, 37], ['umbrella', 67, 36], ['table', 73, 31],
         ['bench', 16, 26], ['bench', 34, 26], ['car', 66, 14], ['hoop', 71, 24],
         ['bush', 74, 39], ['bush', 8, 0], ['bush', 52, 40], ['tree', 2, 40], ['bush', 20, 40],
         /* nanoclaw: TRUNK BUG. Four props were placed inside building footprints —
