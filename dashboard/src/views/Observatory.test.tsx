@@ -1178,10 +1178,10 @@ describe('Observatory', () => {
       expect(idle.querySelector('.nc-of-sheet-held')).toBeFalsy();
     });
 
-    // obs.10 — the people on the floor are clickable, not just the rooms they
-    // stand in. The element emits `agent-select`; the page turns that into the
-    // room sheet, opened on that agent's row.
-    it('a click on an agent opens their room and emphasises their row', async () => {
+    // obs.10 established that clicking a person on the floor picks the person,
+    // not the room. obs.C.14 changed WHAT that opens: the agent drawer, not
+    // the room sheet — so a person click must leave the sheet untouched.
+    it('a click on an agent opens the agent drawer, not the room sheet', async () => {
       const { container } = floor();
       const map = container.querySelector('office-map')!;
       await act(async () => {
@@ -1189,10 +1189,8 @@ describe('Observatory', () => {
           new CustomEvent('agent-select', { detail: { name: 'kit', room: 'westFront' }, bubbles: true }),
         );
       });
-      expect(container.querySelector('.nc-of-sheet-title')!.textContent).toBe('#general');
-      const rows = Array.from(container.querySelectorAll('.nc-of-sheet-list li'));
-      expect(rows.map((r) => r.getAttribute('data-agent'))).toEqual(['ava', 'kit']);
-      expect(rows.filter((r) => r.className.includes('on')).map((r) => r.getAttribute('data-agent'))).toEqual(['kit']);
+      expect(container.querySelector('[data-testid="agent-drawer"]')).toBeTruthy();
+      expect(container.querySelector('.nc-of-sheet')).toBeFalsy();
     });
 
     /* obs.C.3 — the test above hand-dispatches `agent-select`, so it stayed
@@ -1243,6 +1241,136 @@ describe('Observatory', () => {
       await userEvent.click(container.querySelector('.nc-of-sheet-x')! as HTMLElement);
       expect(container.querySelector('.nc-of-sheet')).toBeFalsy();
       expect(container.querySelector('.nc-of-chip.on')).toBeFalsy();
+    });
+  });
+
+  describe('the agent drawer', () => {
+    function drawerFloor() {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1', name: 'general', permalink: 'https://acme.slack.com/archives/C0AAA' })],
+          claims: [
+            claim({ slug: 'migration', owner: 'ava', state: 'live', threadUrl: 'https://example.com/thread/1' }),
+            claim({ slug: 'stuck-one', owner: 'ava', state: 'parked', threadUrl: 'https://example.com/thread/2' }),
+          ],
+          agents: [
+            agent({
+              id: 'ava',
+              name: 'ava',
+              location: 'r1',
+              holding: ['migration', 'stuck-one'],
+              nextTask: { title: 'ship the release notes', at: new Date(Date.now() + 3_600_000).toISOString() },
+            }),
+            agent({ id: 'kit', name: 'kit', location: null, holding: [], awake: false }),
+          ],
+          releaseState: releaseState({
+            items: [
+              releaseItem({
+                id: 'XZO#1',
+                owner: 'ava',
+                nextMover: 'agent',
+                dueAt: new Date(Date.now() - 3_600_000).toISOString(),
+                channel: '#general',
+              }),
+            ],
+          }),
+        }),
+      );
+      return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    }
+
+    const clickAgent = async (container: HTMLElement, name: string) => {
+      const map = container.querySelector('office-map')!;
+      await act(async () => {
+        map.dispatchEvent(new CustomEvent('agent-select', { detail: { name, room: 'westFront' }, bubbles: true }));
+      });
+    };
+
+    it('is closed until a person is picked', () => {
+      const { container } = drawerFloor();
+      expect(container.querySelector('[data-testid="agent-drawer"]')).toBeFalsy();
+    });
+
+    it('shows what a working agent is holding, and what needs a human', async () => {
+      const { container } = drawerFloor();
+      await clickAgent(container, 'ava');
+      const drawer = container.querySelector('[data-testid="agent-drawer"]')!;
+      expect(drawer.querySelector('h3')!.textContent).toBe('ava');
+      // ava owns a breached item, which outranks "awake" in the office's own
+      // state vocabulary — the header agrees with the "needs a human" section.
+      expect(drawer.querySelector('.nc-agent-drawer-state')!.textContent).toContain('blocked');
+      // standing in its room, linked via the room's own permalink
+      const roomLink = drawer.querySelector('.nc-agent-drawer-where a')! as HTMLAnchorElement;
+      expect(roomLink.getAttribute('href')).toBe('https://acme.slack.com/archives/C0AAA');
+      expect(drawer.textContent).toContain('general');
+      // working on now: the next task, plus the healthy (live) claim only
+      const working = drawer.querySelector('[data-section="working-now"]')!;
+      expect(working.textContent).toContain('ship the release notes');
+      expect(working.querySelector('.nc-of-sheet-held-slug')!.textContent).toBe('migration');
+      expect(working.textContent).not.toContain('stuck-one');
+      // needs a human: the parked claim and the agent's own breached item
+      const attention = drawer.querySelector('[data-section="needs-human"]')!;
+      expect(attention.textContent).toContain('stuck-one');
+      expect(attention.textContent).toContain('XZO#1');
+    });
+
+    it('an idle agent holding nothing shows honest empties', async () => {
+      const { container } = drawerFloor();
+      await clickAgent(container, 'kit');
+      const drawer = container.querySelector('[data-testid="agent-drawer"]')!;
+      expect(drawer.querySelector('h3')!.textContent).toBe('kit');
+      expect(drawer.querySelector('.nc-agent-drawer-state')!.textContent).toContain('idle');
+      expect(drawer.textContent).toContain('not seated on the floor');
+      expect(drawer.querySelector('[data-section="working-now"]')!.textContent).toContain('nothing queued right now');
+      expect(drawer.querySelector('[data-section="needs-human"]')!.textContent).toContain(
+        'nothing needs a human right now',
+      );
+    });
+
+    it('closes on its own ✕', async () => {
+      const { container } = drawerFloor();
+      await clickAgent(container, 'ava');
+      await userEvent.click(container.querySelector('[data-testid="agent-drawer"] .nc-sched-drawer-close')! as HTMLElement);
+      expect(container.querySelector('[data-testid="agent-drawer"]')).toBeFalsy();
+    });
+
+    it('closes on Escape', async () => {
+      const { container } = drawerFloor();
+      await clickAgent(container, 'ava');
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+      });
+      expect(container.querySelector('[data-testid="agent-drawer"]')).toBeFalsy();
+    });
+
+    it('closes on a click outside', async () => {
+      const { container } = drawerFloor();
+      await clickAgent(container, 'ava');
+      await act(async () => {
+        document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      });
+      expect(container.querySelector('[data-testid="agent-drawer"]')).toBeFalsy();
+    });
+
+    it('the drawer and the room sheet track independently', async () => {
+      const { container } = drawerFloor();
+      const chip = Array.from(container.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
+        b.textContent?.includes('#general'),
+      );
+      await userEvent.click(chip! as HTMLElement);
+      expect(container.querySelector('.nc-of-sheet')).toBeTruthy();
+      // opening the drawer over it (a programmatic agent-select, not a real
+      // click, so it never triggers the drawer's own click-outside close)
+      // leaves the room sheet exactly as it was
+      await clickAgent(container, 'ava');
+      expect(container.querySelector('[data-testid="agent-drawer"]')).toBeTruthy();
+      expect(container.querySelector('.nc-of-sheet')).toBeTruthy();
+      // closing the drawer on its own control never touches the room sheet
+      await userEvent.click(
+        container.querySelector('[data-testid="agent-drawer"] .nc-sched-drawer-close')! as HTMLElement,
+      );
+      expect(container.querySelector('[data-testid="agent-drawer"]')).toBeFalsy();
+      expect(container.querySelector('.nc-of-sheet')).toBeTruthy();
     });
   });
 

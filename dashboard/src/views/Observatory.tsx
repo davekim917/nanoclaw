@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
 import {
   listWorkgroups,
@@ -7,6 +7,7 @@ import {
   type AuthMe,
   type ObservatorySnapshot,
   type ObservatoryRoom,
+  type ObservatoryAgent,
   type ObservatoryClaim,
   type ObservatoryClaimState,
   type ReleaseItem,
@@ -21,7 +22,7 @@ import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildLedger, classify, dueLabel, type Commitment } from './commitments.js';
 import { assignItem, nudgeClaim } from '../lib/api.js';
 import { OfficeMap } from './OfficeMap.js';
-import { buildOfficeData } from './office-data.js';
+import { buildOfficeData, agentState } from './office-data.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
 
 
@@ -135,9 +136,10 @@ export function Observatory({ authMe }: ObservatoryProps) {
   const [flowFilter, setFlowFilter] = useState<FlowSlice | null>(null);
   const [teleportTo, setTeleportTo] = useState<string | null>(null);
   const [expandedClaim, setExpandedClaim] = useState<string | null>(null);
-  // The agent whose pin opened the sheet, emphasised in it so a click on a
-  // person lands you on that person's row and not just in their room.
-  const [focusAgent, setFocusAgent] = useState<string | null>(null);
+  // The agent whose pin was clicked — opens the agent drawer over whatever
+  // view is showing. Independent of selectedRoom: picking a room and picking
+  // a person are two different questions now.
+  const [agentDrawerId, setAgentDrawerId] = useState<string | null>(null);
 
   const rooms = useMemo(() => sortRooms(snapshot?.rooms ?? []), [snapshot]);
   const agents = snapshot?.agents ?? [];
@@ -207,6 +209,21 @@ export function Observatory({ authMe }: ObservatoryProps) {
     : allItems;
 
   const ledgerCounts = useMemo(() => buildLedger(ownerFilteredItems).counts, [ownerFilteredItems]);
+
+  // The office map's own notion of "in trouble" (office-data.ts's
+  // agentState), recomputed here off the FULL board rather than the
+  // room-filtered one — the drawer answers about one agent, not one room.
+  const breachedOwners = useMemo(
+    () =>
+      new Set(
+        buildLedger(allItems)
+          .rows.filter((r) => r.state === 'breached' || r.state === 'unowned')
+          .map((r) => r.item.owner)
+          .filter((o): o is string => typeof o === 'string' && o.length > 0),
+      ),
+    [allItems],
+  );
+  const agentDrawerAgent = agents.find((a) => a.id === agentDrawerId) ?? null;
   const flowCount = flowFilter
     ? flowFilter === 'stalled'
       ? ledgerCounts.breached
@@ -225,14 +242,10 @@ export function Observatory({ authMe }: ObservatoryProps) {
     )[0]?.slot;
   }, [officeData]);
 
-  // Picking a room from anywhere but a pin drops the emphasis: it belongs to
-  // the click that opened the sheet, not to the room.
   const pickRoom = (k: string) => {
-    setFocusAgent(null);
     setSelectedRoom((prev) => (prev === k ? '' : k));
   };
   const closeRoom = () => {
-    setFocusAgent(null);
     setSelectedRoom('');
   };
 
@@ -339,9 +352,12 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       {...(startSlot ? { start: startSlot } : {})}
                       selected={selectedRoom}
                       onSelect={pickRoom}
-                      onAgentSelect={({ name, room }) => {
-                        setSelectedRoom(room);
-                        setFocusAgent(name);
+                      onAgentSelect={({ name }) => {
+                        // The drawer answers about the PERSON, not the room
+                        // they happen to be standing in — picking a room stays
+                        // its own, independent action.
+                        const a = agents.find((x) => x.name === name);
+                        if (a) setAgentDrawerId(a.id);
                       }}
                       teleportTo={teleportTo}
                     />
@@ -387,7 +403,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                   ) : (
                     <ul className="nc-of-sheet-list">
                       {selectedRoomAgents.agents.map((a) => (
-                        <li key={a.id} className={a.name === focusAgent ? 'on' : ''} data-agent={a.name}>
+                        <li key={a.id} data-agent={a.name}>
                           <span className="nc-of-sheet-who">
                             <i className={`nc-of-sd ${a.state}`} />
                             {/* The same face the floor shows, so the person you
@@ -408,14 +424,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                           ) : (
                             <div className="nc-of-sheet-held">
                               {a.held.map((h) => (
-                                <div className="nc-of-sheet-held-row" key={h.slug}>
-                                  <span className="nc-of-sheet-held-slug">{h.slug}</span>
-                                  {h.threadUrl ? (
-                                    <OutLink href={h.threadUrl}>steer in thread</OutLink>
-                                  ) : (
-                                    <span className="nc-of-sheet-nothread">no thread recorded</span>
-                                  )}
-                                </div>
+                                <HeldRow key={h.slug} slug={h.slug} threadUrl={h.threadUrl} />
                               ))}
                             </div>
                           )}
@@ -484,6 +493,22 @@ export function Observatory({ authMe }: ObservatoryProps) {
                 )}
               </div>
             </div>
+
+            {/* Fixed overlay, independent of the segmented view — a click on a
+                person opens the same drawer whichever screen they were seen
+                on, and switching screens under it does not close it. */}
+            {agentDrawerAgent && (
+              <AgentDrawer
+                agent={agentDrawerAgent}
+                rooms={rooms}
+                claims={claims}
+                items={allItems}
+                roomLinks={roomLinks}
+                breachedOwners={breachedOwners}
+                {...(assign ? { assign } : {})}
+                onClose={() => setAgentDrawerId(null)}
+              />
+            )}
           </>
         )}
       </div>
@@ -561,6 +586,24 @@ function OutLink({ href, children }: { href: string; children: string }) {
     <a className="nc-of-link" href={href} target="_blank" rel="noopener noreferrer">
       {children} ↗
     </a>
+  );
+}
+
+/**
+ * One held-claim row: slug, and a link into its thread when there is one.
+ * Shared by the room sheet and the agent drawer — the answer to "what is
+ * this piece of work and where do I steer it" never changes shape.
+ */
+function HeldRow({ slug, threadUrl }: { slug: string; threadUrl: string | null }) {
+  return (
+    <div className="nc-of-sheet-held-row">
+      <span className="nc-of-sheet-held-slug">{slug}</span>
+      {threadUrl ? (
+        <OutLink href={threadUrl}>steer in thread</OutLink>
+      ) : (
+        <span className="nc-of-sheet-nothread">no thread recorded</span>
+      )}
+    </div>
   );
 }
 
@@ -1551,6 +1594,63 @@ function ownerAgentId(claim: ObservatoryClaim, agents: { id: string; name: strin
   return agents.find((a) => a.name.trim().toLowerCase() === owner)?.id ?? null;
 }
 
+/**
+ * One claim row: title/owner/age, expanding to the note, thread link, and
+ * (when it has stopped moving) push-forward / hand-over controls. Shared by
+ * the claims card and the agent drawer's "needs a human" section — same row,
+ * same controls, wherever a claim is stuck enough to need one.
+ */
+function ClaimRow({
+  c,
+  expanded,
+  onToggle,
+  assign,
+}: {
+  c: ObservatoryClaim;
+  expanded: boolean;
+  onToggle: () => void;
+  assign?: AssignWiring;
+}) {
+  // Only work that has stopped moving is pushable — a live claim is being
+  // done, and a push is a demand for an answer, not a ping.
+  const stuck = c.state !== 'live' || c.escalated;
+  const ownerAgent = assign ? ownerAgentId(c, assign.agents) : null;
+  return (
+    <li className={`nc-obs-claim-row ${c.state}`} data-slug={c.slug}>
+      <button type="button" className="nc-obs-claim-toggle" aria-expanded={expanded} onClick={onToggle}>
+        <span className="nc-obs-claim-title">
+          <span className="nc-obs-claim-slug mono">{c.slug}</span>
+          {c.state === 'parked' && <span className="nc-obs-claim-tag">needs an owner</span>}
+          {c.escalated && <span className="nc-obs-claim-tag">escalated in channel</span>}
+        </span>
+        <span className="nc-obs-claim-owner">
+          {c.owner && c.owner !== 'unknown' ? c.owner : <em>owner unknown</em>}
+        </span>
+        <span className={`nc-obs-claim-age ${claimTone(c)}`}>{claimAgeLabel(c)}</span>
+      </button>
+      {expanded && (
+        <div className="nc-obs-claim-detail">
+          {c.note && <div className="nc-obs-claim-note">{c.note}</div>}
+          {c.threadUrl ? (
+            <OutLink href={c.threadUrl}>open thread</OutLink>
+          ) : (
+            <span className="nc-of-sheet-nothread">no thread recorded</span>
+          )}
+          {/* Push demands the CURRENT owner move it; hand-over asks somebody
+              else to. Both need a thread — the server has nowhere honest to
+              land the ask without one. */}
+          {assign && stuck && c.threadUrl && (
+            <>
+              {ownerAgent && <NudgeControl claim={c} workgroupId={assign.workgroupId} agentGroupId={ownerAgent} />}
+              <ClaimAssignControl claim={c} wiring={assign} exclude={ownerAgent} />
+            </>
+          )}
+        </div>
+      )}
+    </li>
+  );
+}
+
 function ClaimsCard({
   claims,
   expandedSlug,
@@ -1591,57 +1691,182 @@ function ClaimsCard({
         <div className="nc-obs-ledger-empty">{`nothing ${activeFilterPhrase(stateFilter, owner)}`}</div>
       ) : (
         <ul className="nc-obs-claim-rows">
-          {shown.map((c) => {
-            const expanded = expandedSlug === c.slug;
-            // Only work that has stopped moving is pushable — a live claim is
-            // being done, and a push is a demand for an answer, not a ping.
-            const stuck = c.state !== 'live' || c.escalated;
-            const ownerAgent = assign ? ownerAgentId(c, assign.agents) : null;
-            return (
-              <li key={c.slug} className={`nc-obs-claim-row ${c.state}`} data-slug={c.slug}>
-                <button
-                  type="button"
-                  className="nc-obs-claim-toggle"
-                  aria-expanded={expanded}
-                  onClick={() => onClaimClick(c)}
-                >
-                  <span className="nc-obs-claim-title">
-                    <span className="nc-obs-claim-slug mono">{c.slug}</span>
-                    {c.state === 'parked' && <span className="nc-obs-claim-tag">needs an owner</span>}
-                    {c.escalated && <span className="nc-obs-claim-tag">escalated in channel</span>}
-                  </span>
-                  <span className="nc-obs-claim-owner">
-                    {c.owner && c.owner !== 'unknown' ? c.owner : <em>owner unknown</em>}
-                  </span>
-                  <span className={`nc-obs-claim-age ${claimTone(c)}`}>{claimAgeLabel(c)}</span>
-                </button>
-                {expanded && (
-                  <div className="nc-obs-claim-detail">
-                    {c.note && <div className="nc-obs-claim-note">{c.note}</div>}
-                    {c.threadUrl ? (
-                      <OutLink href={c.threadUrl}>open thread</OutLink>
-                    ) : (
-                      <span className="nc-of-sheet-nothread">no thread recorded</span>
-                    )}
-                    {/* Push demands the CURRENT owner move it; hand-over asks
-                        somebody else to. Both need a thread — the server has
-                        nowhere honest to land the ask without one. */}
-                    {assign && stuck && c.threadUrl && (
-                      <>
-                        {ownerAgent && (
-                          <NudgeControl claim={c} workgroupId={assign.workgroupId} agentGroupId={ownerAgent} />
-                        )}
-                        <ClaimAssignControl claim={c} wiring={assign} exclude={ownerAgent} />
-                      </>
-                    )}
-                  </div>
-                )}
-              </li>
-            );
-          })}
+          {shown.map((c) => (
+            <ClaimRow
+              key={c.slug}
+              c={c}
+              expanded={expandedSlug === c.slug}
+              onToggle={() => onClaimClick(c)}
+              {...(assign ? { assign } : {})}
+            />
+          ))}
         </ul>
       )}
     </section>
+  );
+}
+
+/* ─── Agent drawer — one person's day ─────────────────────────────────────── */
+
+/**
+ * Opened by a click on a person on the floor. Answers two questions about
+ * ONE agent: what are they actively moving right now, and what — of theirs —
+ * needs a human. Reuses the same rows and controls the claims card and the
+ * queue already have; this is a person-scoped filter over the same data, not
+ * a new surface with its own rules.
+ *
+ * A fixed slide-over, independent of the segmented view underneath it (the
+ * click that opens it only happens on Overview, but the drawer itself does
+ * not care which segment is showing). Closes on its own ✕, Esc, or a click
+ * outside — same convention as GroupTitle's menu and the scheduled-series
+ * drawer.
+ */
+function AgentDrawer({
+  agent,
+  rooms,
+  claims,
+  items,
+  roomLinks,
+  breachedOwners,
+  assign,
+  onClose,
+}: {
+  agent: ObservatoryAgent;
+  rooms: ObservatoryRoom[];
+  claims: ObservatoryClaim[];
+  /** Full board, unfiltered by room — the drawer answers about a PERSON. */
+  items: ReleaseItem[];
+  roomLinks: Map<string, string>;
+  breachedOwners: Set<string>;
+  assign?: AssignWiring;
+  onClose: () => void;
+}) {
+  const rootRef = useRef<HTMLElement>(null);
+  const [expandedSlug, setExpandedSlug] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    const onDocClick = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) onClose();
+    };
+    document.addEventListener('keydown', onEsc);
+    document.addEventListener('mousedown', onDocClick);
+    return () => {
+      document.removeEventListener('keydown', onEsc);
+      document.removeEventListener('mousedown', onDocClick);
+    };
+  }, [onClose]);
+
+  const room = rooms.find((r) => r.key === agent.location) ?? null;
+  const roomName = room ? (room.name.startsWith('#') ? room.name : `#${room.name}`) : null;
+  const roomLink = room ? roomLinks.get(room.name.replace(/^#/, '').toLowerCase()) : undefined;
+  const status = agentState(agent, breachedOwners);
+
+  const held = claims.filter((c) => agent.holding.includes(c.slug));
+  // Same predicate ClaimsCard uses to decide whether a claim is pushable —
+  // stopped moving, or already escalated in its channel.
+  const healthy = held.filter((c) => c.state === 'live' && !c.escalated);
+  const troubled = held.filter((c) => c.state !== 'live' || c.escalated);
+
+  const ledgerRows = useMemo(() => buildLedger(items).rows, [items]);
+  const stalledOwned = useMemo(
+    () => ledgerRows.filter((r) => r.item.owner === agent.name && (r.state === 'breached' || r.state === 'unowned')),
+    [ledgerRows, agent.name],
+  );
+
+  const workingEmpty = !agent.nextTask && healthy.length === 0;
+  const attentionEmpty = troubled.length === 0 && stalledOwned.length === 0;
+
+  return (
+    <aside
+      className="nc-sched-drawer nc-agent-drawer"
+      role="dialog"
+      aria-label={`${agent.name}'s work`}
+      data-testid="agent-drawer"
+      ref={rootRef}
+    >
+      <header className="nc-sched-drawer-head">
+        <span className="nc-agent-drawer-who">
+          {agent.avatarUrl && (
+            <img className="nc-of-sheet-face" src={agent.avatarUrl} alt="" width={24} height={24} />
+          )}
+          <h3>{agent.name}</h3>
+          <span className={`nc-agent-drawer-state ${status}`}>
+            <i className={`nc-of-sd ${status}`} />
+            {status}
+          </span>
+        </span>
+        <button type="button" className="nc-sched-drawer-close" aria-label="Close" onClick={onClose}>
+          ×
+        </button>
+      </header>
+
+      <div className="nc-sched-drawer-body">
+        <p className="nc-agent-drawer-where">
+          {roomName ? (
+            roomLink ? (
+              <>
+                standing in <OutLink href={roomLink}>{roomName}</OutLink>
+              </>
+            ) : (
+              `standing in ${roomName}`
+            )
+          ) : (
+            'not seated on the floor'
+          )}
+        </p>
+
+        <section className="nc-agent-drawer-section" data-section="working-now">
+          <h4>Working on now</h4>
+          {workingEmpty ? (
+            <div className="nc-obs-ledger-empty">nothing queued right now</div>
+          ) : (
+            <>
+              {agent.nextTask && (
+                <div className="nc-agent-drawer-next">
+                  next: {agent.nextTask.title} — {relTime(agent.nextTask.at)}
+                </div>
+              )}
+              {healthy.length > 0 && (
+                <div className="nc-of-sheet-held">
+                  {healthy.map((c) => (
+                    <HeldRow key={c.slug} slug={c.slug} threadUrl={c.threadUrl} />
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </section>
+
+        <section className="nc-agent-drawer-section" data-section="needs-human">
+          <h4>Needs a human</h4>
+          {attentionEmpty ? (
+            <div className="nc-obs-ledger-empty">nothing needs a human right now</div>
+          ) : (
+            <>
+              {troubled.length > 0 && (
+                <ul className="nc-obs-claim-rows">
+                  {troubled.map((c) => (
+                    <ClaimRow
+                      key={c.slug}
+                      c={c}
+                      expanded={expandedSlug === c.slug}
+                      onToggle={() => setExpandedSlug((p) => (p === c.slug ? null : c.slug))}
+                      {...(assign ? { assign } : {})}
+                    />
+                  ))}
+                </ul>
+              )}
+              {stalledOwned.length > 0 && (
+                <ItemTable rows={stalledOwned} now={Date.now()} head={false} roomLinks={roomLinks} {...(assign ? { assign } : {})} />
+              )}
+            </>
+          )}
+        </section>
+      </div>
+    </aside>
   );
 }
 
