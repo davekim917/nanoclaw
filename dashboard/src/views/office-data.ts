@@ -91,17 +91,23 @@ export function agentLook(id: string): Omit<OfficeAgent, 'name' | 'status'> {
 }
 
 /**
- * An agent's state on the floor.
+ * An agent's state IN A GIVEN ROOM.
  *
- * `blocked` outranks everything: an agent holding work that has already failed
- * its promise is the thing the operator is looking for, and it must not be
- * hidden behind "awake". Otherwise awake is `working` and asleep is `idle`.
+ * `blocked` outranks everything and is NOT room-scoped: an agent holding work
+ * that has already failed its promise is the thing the operator is looking
+ * for, and it must not be hidden behind "awake" in some rooms but not others
+ * — a breach stays loud in every room the agent is seated in.
+ *
+ * Otherwise the agent is `working` only in the ONE room matching its live
+ * session (`location === roomKey`) while awake; every other seat it holds is
+ * `idle`, even though it's awake elsewhere. An agent can be seated in several
+ * rooms (see buildOfficeData) but is only ever doing something in one of them.
  * We deliberately do NOT infer `waiting` for an agent — waiting is a property
  * of an ITEM (it needs a person), never of the agent sitting next to it.
  */
-export function agentState(agent: ObservatoryAgent, breachedOwners: Set<string>): OfficeState {
+export function agentState(agent: ObservatoryAgent, breachedOwners: Set<string>, roomKey: string): OfficeState {
   if (breachedOwners.has(agent.name)) return 'blocked';
-  return agent.awake ? 'working' : 'idle';
+  return agent.location === roomKey && agent.awake ? 'working' : 'idle';
 }
 
 /** The worst state present in a room, which is the state the room shows. */
@@ -182,7 +188,9 @@ export function buildOfficeData(
     // A room always seats its WIRED members — an idle one sits there asleep
     // rather than vanishing. Agents actually working here (location === this
     // room) sort first so the seat cap favors what's live; ties break by name
-    // for a stable floor.
+    // for a stable floor. There is no per-room recency signal available on the
+    // client (agent objects don't carry it), so this is the honest v1 tiebreak
+    // rather than invented data — with 6 seats per room it rarely bites.
     const memberIds = new Set(room.memberAgentIds);
     const here: OfficeAgent[] = agents
       .filter((a) => memberIds.has(a.id))
@@ -191,10 +199,15 @@ export function buildOfficeData(
         const bHere = b.location === room.key ? 0 : 1;
         return aHere - bHere || a.name.localeCompare(b.name);
       })
-      // The plan seats a bounded number per room; extra occupants would have
-      // nowhere to sit, so they stay in the list rather than overlapping.
-      .slice(0, 2)
-      .map((a) => ({ name: a.name, status: agentState(a, breachedOwners), avatarUrl: a.avatarUrl, ...agentLook(a.id) }));
+      // The plan seats up to 6 per room (see office-map.js grids); extra
+      // occupants would have nowhere to sit, so they stay in the list rather
+      // than overlapping. A handful of themed rooms draw fewer than 6 seats
+      // where their furniture doesn't sensibly hold more (eastFront: 5;
+      // eastWingM/eastWingS: 4) — the map already drops agents beyond the
+      // seats it actually draws, so the cap here is a safe upper bound, not a
+      // per-room exact count.
+      .slice(0, 6)
+      .map((a) => ({ name: a.name, status: agentState(a, breachedOwners, room.key), avatarUrl: a.avatarUrl, ...agentLook(a.id) }));
     out.push({ slot, key: room.key, label: room.name.startsWith('#') ? room.name : `#${room.name}`, open: 0, state: roomState(here, 0), agents: here });
   });
 

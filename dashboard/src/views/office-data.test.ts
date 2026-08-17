@@ -58,17 +58,17 @@ describe('buildOfficeData', () => {
     expect(d.rooms[0]!.agents[0]!.status).toBe('idle');
   });
 
-  it('a working member sorts before an idle member when the seat cap bites', () => {
-    const r1 = { ...room('r1'), memberAgentIds: ['ava', 'kit', 'zed'] };
+  it('a member located here sorts before members who are not, when the seat cap bites', () => {
+    const names = ['ava', 'zed', 'bo', 'cy', 'dee', 'eli', 'kit'];
+    const r1 = { ...room('r1'), memberAgentIds: names };
     const d = buildOfficeData(
       [r1],
-      [
-        agent('ava', { awake: false, location: null }),
-        agent('kit', { awake: true, location: 'r1' }),
-        agent('zed', { awake: false, location: null }),
-      ],
+      names.map((n) => (n === 'kit' ? agent(n, { location: 'r1' }) : agent(n, { location: null }))),
     );
-    expect(d.rooms[0]!.agents.map((a) => a.name)).toEqual(['kit', 'ava']);
+    // 'kit' is the only one actually here, so it sorts first; the rest fill
+    // the remaining 5 seats in name order and 'zed' (7th alphabetically among
+    // the not-here agents) is the one bumped by the 6-seat cap.
+    expect(d.rooms[0]!.agents.map((a) => a.name)).toEqual(['kit', 'ava', 'bo', 'cy', 'dee', 'eli']);
   });
 
   it('an agent wired to two rooms appears in both', () => {
@@ -77,6 +77,23 @@ describe('buildOfficeData', () => {
     const d = buildOfficeData([r1, r2], [agent('ava', { location: 'r1' })]);
     expect(d.rooms[0]!.agents.map((a) => a.name)).toEqual(['ava']);
     expect(d.rooms[1]!.agents.map((a) => a.name)).toEqual(['ava']);
+  });
+
+  it('an awake agent is `working` only in the room its live session is in, `idle` in every other room it is seated', () => {
+    const r1 = { ...room('r1'), memberAgentIds: ['ava'] };
+    const r2 = { ...room('r2'), memberAgentIds: ['ava'] };
+    const d = buildOfficeData([r1, r2], [agent('ava', { awake: true, location: 'r1' })]);
+    expect(d.rooms[0]!.agents[0]!.status).toBe('working');
+    expect(d.rooms[1]!.agents[0]!.status).toBe('idle');
+  });
+
+  it('a blocked agent stays `blocked` in every room it is seated — a breach must not be hideable', () => {
+    const r1 = { ...room('r1'), memberAgentIds: ['ava'] };
+    const r2 = { ...room('r2'), memberAgentIds: ['ava'] };
+    const items: ReleaseItem[] = [{ id: 'X#1', kind: 'pr', title: 't', nextMover: 'agent', owner: 'ava', dueAt: '2000-01-01T00:00:00.000Z' }];
+    const d = buildOfficeData([r1, r2], [agent('ava', { awake: true, location: 'r1' })], items);
+    expect(d.rooms[0]!.agents[0]!.status).toBe('blocked');
+    expect(d.rooms[1]!.agents[0]!.status).toBe('blocked');
   });
 
   it('carries each seated agent its real avatar, and null when it has none', () => {
@@ -88,10 +105,17 @@ describe('buildOfficeData', () => {
     expect(d.rooms[0]!.agents.map((a) => a.avatarUrl)).toEqual(['https://cdn.example/ava_192.png', null]);
   });
 
-  it('caps occupants at the seats the plan actually draws', () => {
+  it('every wired agent shows up to the cap — a 4-person crew all seat, not just 2', () => {
     const r1 = { ...room('r1'), memberAgentIds: ['a', 'b', 'c', 'd'] };
     const crowd = ['a', 'b', 'c', 'd'].map((n) => agent(n, { location: 'r1' }));
-    expect(buildOfficeData([r1], crowd).rooms[0]!.agents).toHaveLength(2);
+    expect(buildOfficeData([r1], crowd).rooms[0]!.agents.map((a) => a.name)).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  it('caps occupants at the 6 seats the plan actually draws', () => {
+    const names = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+    const r1 = { ...room('r1'), memberAgentIds: names };
+    const crowd = names.map((n) => agent(n, { location: 'r1' }));
+    expect(buildOfficeData([r1], crowd).rooms[0]!.agents).toHaveLength(6);
   });
 
   it('publishes no open count while items carry no channel — an invented number is worse than none', () => {
@@ -142,11 +166,14 @@ describe('buildOfficeData', () => {
 
 describe('agentState', () => {
   it('blocked outranks awake — an agent holding failed work is the thing being looked for', () => {
-    expect(agentState(agent('ava', { awake: true }), new Set(['ava']))).toBe('blocked');
+    expect(agentState(agent('ava', { awake: true, location: 'r1' }), new Set(['ava']), 'r1')).toBe('blocked');
   });
-  it('awake is working, asleep is idle', () => {
-    expect(agentState(agent('ava', { awake: true }), new Set())).toBe('working');
-    expect(agentState(agent('ava', { awake: false }), new Set())).toBe('idle');
+  it('awake AND located here is working; awake elsewhere is idle', () => {
+    expect(agentState(agent('ava', { awake: true, location: 'r1' }), new Set(), 'r1')).toBe('working');
+    expect(agentState(agent('ava', { awake: true, location: 'r1' }), new Set(), 'r2')).toBe('idle');
+  });
+  it('asleep is idle regardless of location', () => {
+    expect(agentState(agent('ava', { awake: false, location: 'r1' }), new Set(), 'r1')).toBe('idle');
   });
 });
 
