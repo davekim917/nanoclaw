@@ -32,6 +32,9 @@ import {
   releaseCounts,
   jobTabItems,
   roomLinkIndex,
+  claimOwners,
+  filterClaims,
+  activeFilterPhrase,
   upcomingScheduled,
 } from './Observatory.js';
 import { RouteNav } from './BoardShell.js';
@@ -208,6 +211,40 @@ describe('Observatory', () => {
       expect(idx.get('dispatch')).toBe('https://acme.slack.com/archives/C0AAA');
       expect(idx.get('lounge')).toBe('https://acme.slack.com/archives/C0BBB');
       expect(idx.has('quiet')).toBe(false);
+    });
+  });
+
+  describe('filtering work claims', () => {
+    const board = [
+      claim({ slug: 'a', state: 'stale', owner: 'ava' }),
+      claim({ slug: 'b', state: 'parked', owner: 'ava' }),
+      claim({ slug: 'c', state: 'parked', owner: 'kit' }),
+      claim({ slug: 'd', state: 'live', owner: 'kit' }),
+      claim({ slug: 'e', state: 'live', owner: 'unknown' }),
+    ];
+
+    it('offers every named owner once, sorted, and never "unknown"', () => {
+      expect(claimOwners(board)).toEqual(['ava', 'kit']);
+    });
+
+    it('narrows by state, by owner, and by both together', () => {
+      expect(filterClaims(board, 'parked', null).map((c) => c.slug)).toEqual(['b', 'c']);
+      expect(filterClaims(board, null, 'kit').map((c) => c.slug)).toEqual(['c', 'd']);
+      // Composed, not unioned: kit's parked work is one row, not three.
+      expect(filterClaims(board, 'parked', 'kit').map((c) => c.slug)).toEqual(['c']);
+      expect(filterClaims(board, null, null)).toHaveLength(5);
+    });
+
+    it('matches an owner regardless of case, the way the nudge gate does', () => {
+      expect(filterClaims(board, null, 'AVA').map((c) => c.slug)).toEqual(['a', 'b']);
+    });
+
+    it('names the active filters in the empty state instead of a bare "nothing"', () => {
+      expect(activeFilterPhrase('stale', null)).toBe('is abandoned');
+      expect(activeFilterPhrase(null, 'ava')).toBe('is held by ava');
+      expect(activeFilterPhrase('parked', 'ava')).toBe('ava holds needs an owner');
+      expect(activeFilterPhrase('stale', 'ava')).toBe('ava holds is abandoned');
+      expect(activeFilterPhrase(null, null)).toBe('to show');
     });
   });
 
@@ -472,8 +509,45 @@ describe('Observatory', () => {
       const memberMe = { user_id: 'u2', scopes: { role: 'member', allowed_group_ids: [], no_filter: false } };
       const row = await expand(await open(memberMe), 'stuck');
       expect(row.querySelector('.nc-obs-nudge')).toBeFalsy();
+      expect(row.querySelector('.nc-obs-assign')).toBeFalsy();
       // the thread link is still there — reading is not the thing being gated.
       expect(row.querySelector('.nc-obs-claim-detail a')).toBeTruthy();
+    });
+
+    // obs.C.11 — a claim held by a human, or by nobody, had no action at all:
+    // push needs an agent owner to push, and those are the rows without one.
+    it('hands a claim to somebody else, and never offers its current owner twice', async () => {
+      mockNudge.mockResolvedValue({ ok: true, seriesId: 's2', threadUrl: 'https://example.com/t/2' });
+      const c = await open();
+      const mine = await expand(c, 'stuck');
+      // ava owns it and is already reachable by push, so she is not offered
+      // again — and on a one-agent floor that leaves nobody, so no control.
+      expect(mine.querySelector('.nc-obs-nudge')).toBeTruthy();
+      expect(mine.querySelector('.nc-obs-assign')).toBeFalsy();
+
+      const hers = await expand(c, 'hers');
+      const select = hers.querySelector('.nc-obs-assign select')! as HTMLSelectElement;
+      await userEvent.selectOptions(select, 'ag-ava');
+      await userEvent.click(hers.querySelector('.nc-obs-assign button')! as HTMLElement);
+
+      expect(mockNudge).toHaveBeenCalledWith('wg-1', 'hers', 'ag-ava');
+      expect(hers.querySelector('.nc-obs-assign-done')!.textContent).toContain('handed over');
+    });
+
+    it('filters the card by state and by agent, and says what it filtered to', async () => {
+      const c = await open();
+      const card = c.querySelector('[data-section="claims"]')!;
+      expect(card.querySelectorAll('.nc-obs-claim-row')).toHaveLength(4);
+
+      await userEvent.click(card.querySelector('[data-claim-filter="parked"]')! as HTMLElement);
+      // Nothing on this board is parked, and the empty state says which filter.
+      expect(card.querySelector('.nc-obs-ledger-empty')!.textContent).toBe('nothing needs an owner');
+
+      await userEvent.click(card.querySelector('[data-claim-filter="parked"]')! as HTMLElement);
+      await userEvent.selectOptions(card.querySelector('.nc-of-filters select')! as HTMLSelectElement, 'kit');
+      expect(Array.from(card.querySelectorAll('.nc-obs-claim-row')).map((r) => r.getAttribute('data-slug'))).toEqual([
+        'hers',
+      ]);
     });
   });
 

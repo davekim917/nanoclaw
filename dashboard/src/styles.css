@@ -1968,6 +1968,20 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    destination is the decision — work starts in the item's own room. */
 /* The claims-board push shares assign's visual language exactly — same accent
    button, same inline done/error line. It is the same act, one row over. */
+/* obs.C.11 / obs.C.10 — ONE filter grammar, on the claims card and on the
+   queue: chips narrow by a fixed vocabulary, a native select narrows by a name
+   the data supplies. Same chip as the teleport row, so a control that filters
+   looks the same everywhere on this page. */
+.nc-of .nc-of-filters{
+  display:flex; gap:7px; align-items:center; flex-wrap:wrap;
+  padding:9px 14px; border-bottom:1px solid var(--line);
+}
+.nc-of .nc-of-filters select{
+  font:inherit; font-size:11.5px; color:var(--ink); background:var(--card-2);
+  border:1px solid var(--line-2); border-radius:7px; padding:0 8px; height:28px;
+}
+.nc-of .nc-of-filters .nc-of-clearfilter{margin-left:auto}
+
 .nc-of .nc-obs-assign,
 .nc-of .nc-obs-nudge{display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:9px}
 .nc-of .nc-obs-assign select{

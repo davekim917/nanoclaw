@@ -1071,6 +1071,112 @@ export function claimSummary(claims: ObservatoryClaim[]): string {
   return parts.length === 0 ? 'nothing claimed' : parts.join(' · ');
 }
 
+/**
+ * The claims filter — the same grammar the queue uses (Fix D): chips for the
+ * states worth singling out, a native select for "whose". Two chips, not four:
+ * `expiring` and `live` are the claims working AS INTENDED, and a chip per
+ * enum value would have turned a filter into a legend.
+ */
+export const CLAIM_FILTERS: { key: ObservatoryClaimState; label: string; empty: string }[] = [
+  // `empty` is the chip label bent into a sentence — "nothing is abandoned"
+  // works, "nothing is needs an owner" does not, so each chip carries its own
+  // fragment rather than the empty state gluing "is" onto whatever it finds.
+  { key: 'stale', label: 'abandoned', empty: 'is abandoned' },
+  { key: 'parked', label: 'needs an owner', empty: 'needs an owner' },
+];
+
+/** Distinct claim owners, sorted — the vocabulary of the "by agent" select. */
+export function claimOwners(claims: ObservatoryClaim[]): string[] {
+  const named = claims.map((c) => c.owner).filter((o): o is string => !!o && o !== 'unknown');
+  return [...new Set(named)].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * Claims narrowed by state and/or owner. Both filters COMPOSE — picking
+ * "abandoned" and then an owner asks for that owner's abandoned work, not for
+ * the union. A null on either side means "don't narrow on this".
+ */
+export function filterClaims(
+  claims: ObservatoryClaim[],
+  state: ObservatoryClaimState | null,
+  owner: string | null,
+): ObservatoryClaim[] {
+  return claims.filter(
+    (c) =>
+      (!state || c.state === state) &&
+      (!owner || c.owner?.trim().toLowerCase() === owner.trim().toLowerCase()),
+  );
+}
+
+/**
+ * What the operator asked for, in words, for the empty state. A board that
+ * answers a narrowed question with a bare "nothing here" makes them re-derive
+ * their own filters to understand the emptiness.
+ */
+export function activeFilterPhrase(state: ObservatoryClaimState | null, owner: string | null): string {
+  const frag = state ? (CLAIM_FILTERS.find((f) => f.key === state)?.empty ?? `is ${state}`) : null;
+  if (frag && owner) return `${owner} holds ${frag}`;
+  if (frag) return frag;
+  if (owner) return `is held by ${owner}`;
+  return 'to show';
+}
+
+/**
+ * The filter row: chips for state, a native select for whose. One grammar,
+ * shared with the queue — chips narrow by a fixed vocabulary, the select
+ * narrows by a name the data supplies. Native controls throughout; a custom
+ * dropdown here would be a worse <select> that also has to be maintained.
+ */
+function ClaimFilterBar({
+  state,
+  onState,
+  owner,
+  owners,
+  onOwner,
+}: {
+  state: ObservatoryClaimState | null;
+  onState: (s: ObservatoryClaimState | null) => void;
+  owner: string | null;
+  owners: string[];
+  onOwner: (o: string | null) => void;
+}) {
+  return (
+    <div className="nc-of-filters" role="group" aria-label="Filter work claims">
+      {CLAIM_FILTERS.map((f) => (
+        <button
+          key={f.key}
+          type="button"
+          className={`nc-of-chip ${state === f.key ? 'on' : ''}`}
+          data-claim-filter={f.key}
+          aria-pressed={state === f.key}
+          onClick={() => onState(state === f.key ? null : f.key)}
+        >
+          {f.label}
+        </button>
+      ))}
+      {owners.length > 0 && (
+        <select
+          aria-label="Filter claims by agent"
+          value={owner ?? ''}
+          onChange={(e) => onOwner(e.target.value || null)}
+        >
+          <option value="">any agent</option>
+          {owners.map((o) => (
+            <option key={o} value={o}>
+              {o}
+            </option>
+          ))}
+        </select>
+      )}
+      {(state || owner) && (
+        <button type="button" className="nc-of-clearfilter" onClick={() => { onState(null); onOwner(null); }}>
+          show all
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** Red once the deadline has passed or the claim was announced; amber inside the grace window. */
 function claimTone(c: ObservatoryClaim): string {
   if (c.state === 'stale' || c.escalated) return 'stop';
@@ -1087,6 +1193,22 @@ function claimTone(c: ObservatoryClaim): string {
  * claim with no thread has nowhere honest to land (the cure is `claim.sh
  * thread`, upstream).
  */
+/**
+ * Why the push was refused, in the operator's words. Shared by both controls on
+ * a claim row — they hit the same endpoint, so they must never explain the same
+ * refusal two different ways.
+ */
+function nudgeError(e: unknown, who: string): string {
+  const err = e as { error?: string; status?: number };
+  // The endpoint ships restart-gated: until the host restarts it simply
+  // isn't routed, and "unknown" would read as a bug in the claim.
+  if (err.status === 404 && err.error !== 'claim_not_found') return 'not active until the next host restart';
+  if (err.error === 'claim_has_no_thread') return 'that claim has no thread recorded yet';
+  if (err.error === 'recently_nudged') return 'already pushed in the last few minutes';
+  if (err.error === 'agent_not_wired_to_thread_channel') return `${who} is not wired to that thread's channel`;
+  return err.error ?? 'failed';
+}
+
 function NudgeControl({
   claim,
   workgroupId,
@@ -1115,20 +1237,7 @@ function NudgeControl({
       const r = await nudgeClaim(workgroupId, claim.slug, agentGroupId);
       setState({ phase: 'done', ...(r.threadUrl ? { url: r.threadUrl } : {}) });
     } catch (e) {
-      const err = e as { error?: string; status?: number };
-      const why =
-        // The endpoint ships restart-gated: until the host restarts it simply
-        // isn't routed, and "unknown" would read as a bug in the claim.
-        err.status === 404 && err.error !== 'claim_not_found'
-          ? 'not active until the next host restart'
-          : err.error === 'claim_has_no_thread'
-            ? 'that claim has no thread recorded yet'
-            : err.error === 'recently_nudged'
-              ? 'already pushed in the last few minutes'
-              : err.error === 'agent_not_wired_to_thread_channel'
-                ? `${claim.owner} is not wired to that thread's channel`
-                : (err.error ?? 'failed');
-      setState({ phase: 'error', note: why });
+      setState({ phase: 'error', note: nudgeError(e, claim.owner ?? 'that agent') });
     }
   };
 
@@ -1138,6 +1247,75 @@ function NudgeControl({
         {state.phase === 'busy' ? 'pushing…' : 'push it forward'}
       </button>
       {state.phase === 'error' && <span className="nc-obs-nudge-err">{state.note}</span>}
+    </div>
+  );
+}
+
+/**
+ * Hand a claim to an agent that is NOT its current owner.
+ *
+ * Same endpoint as the push button, because handing work over and demanding it
+ * move are the same act with a different addressee — the server composes the
+ * demand from the claim file either way, and the client still sends nothing but
+ * three ids. This is the only control a claim owned by a HUMAN, or by nobody,
+ * has ever had: push-it-forward needs an agent owner to push, and those rows
+ * are exactly the ones with no owner to push.
+ */
+function ClaimAssignControl({
+  claim,
+  wiring,
+  exclude,
+}: {
+  claim: ObservatoryClaim;
+  wiring: AssignWiring;
+  /** The current owner's agent id — already reachable via push, so not offered twice. */
+  exclude: string | null;
+}) {
+  const [agentId, setAgentId] = useState('');
+  const [state, setState] = useState<{ phase: 'idle' | 'busy' | 'done' | 'error'; note?: string; url?: string }>({
+    phase: 'idle',
+  });
+
+  const choices = wiring.agents.filter((a) => a.id !== exclude);
+  if (choices.length === 0) return null;
+  if (state.phase === 'done') {
+    return (
+      <div className="nc-obs-assign-done">
+        handed over — the ask landed in its thread {state.url ? <OutLink href={state.url}>open thread</OutLink> : null}
+      </div>
+    );
+  }
+
+  const go = async () => {
+    if (!agentId) return;
+    setState({ phase: 'busy' });
+    try {
+      const r = await nudgeClaim(wiring.workgroupId, claim.slug, agentId);
+      setState({ phase: 'done', ...(r.threadUrl ? { url: r.threadUrl } : {}) });
+    } catch (e) {
+      setState({ phase: 'error', note: nudgeError(e, choices.find((a) => a.id === agentId)?.name ?? 'that agent') });
+    }
+  };
+
+  return (
+    <div className="nc-obs-assign">
+      <select
+        aria-label="Hand this claim to an agent"
+        value={agentId}
+        onChange={(e) => setAgentId(e.target.value)}
+        disabled={state.phase === 'busy'}
+      >
+        <option value="">hand it to…</option>
+        {choices.map((a) => (
+          <option key={a.id} value={a.id}>
+            {a.name}
+          </option>
+        ))}
+      </select>
+      <button type="button" onClick={go} disabled={!agentId || state.phase === 'busy'}>
+        {state.phase === 'busy' ? 'handing over…' : 'ask them in the thread'}
+      </button>
+      {state.phase === 'error' && <span className="nc-obs-assign-err">{state.note}</span>}
     </div>
   );
 }
@@ -1160,17 +1338,36 @@ function ClaimsCard({
   onClaimClick: (claim: ObservatoryClaim) => void;
   assign?: AssignWiring;
 }) {
+  const [stateFilter, setStateFilter] = useState<ObservatoryClaimState | null>(null);
+  const [ownerFilter, setOwnerFilter] = useState<string | null>(null);
+  const owners = useMemo(() => claimOwners(claims), [claims]);
+  const shown = useMemo(() => filterClaims(claims, stateFilter, ownerFilter), [claims, stateFilter, ownerFilter]);
+  // An owner who has dropped off the board must not keep filtering the card
+  // down to nothing from a select that no longer offers them.
+  const owner = ownerFilter && owners.includes(ownerFilter) ? ownerFilter : null;
+
   return (
     <section className="nc-of-card" data-section="claims">
       <header className="nc-of-card-head">
         <span className="nc-of-card-title">Work claims</span>
         <span className="nc-of-card-meta">{claimSummary(claims)}</span>
       </header>
+      {claims.length > 0 && (
+        <ClaimFilterBar
+          state={stateFilter}
+          onState={setStateFilter}
+          owner={owner}
+          owners={owners}
+          onOwner={setOwnerFilter}
+        />
+      )}
       {claims.length === 0 ? (
         <div className="nc-obs-ledger-empty">nobody has picked anything up</div>
+      ) : shown.length === 0 ? (
+        <div className="nc-obs-ledger-empty">{`nothing ${activeFilterPhrase(stateFilter, owner)}`}</div>
       ) : (
         <ul className="nc-obs-claim-rows">
-          {claims.map((c) => {
+          {shown.map((c) => {
             const expanded = expandedSlug === c.slug;
             // Only work that has stopped moving is pushable — a live claim is
             // being done, and a push is a demand for an answer, not a ping.
@@ -1202,8 +1399,16 @@ function ClaimsCard({
                     ) : (
                       <span className="nc-of-sheet-nothread">no thread recorded</span>
                     )}
-                    {assign && ownerAgent && stuck && c.threadUrl && (
-                      <NudgeControl claim={c} workgroupId={assign.workgroupId} agentGroupId={ownerAgent} />
+                    {/* Push demands the CURRENT owner move it; hand-over asks
+                        somebody else to. Both need a thread — the server has
+                        nowhere honest to land the ask without one. */}
+                    {assign && stuck && c.threadUrl && (
+                      <>
+                        {ownerAgent && (
+                          <NudgeControl claim={c} workgroupId={assign.workgroupId} agentGroupId={ownerAgent} />
+                        )}
+                        <ClaimAssignControl claim={c} wiring={assign} exclude={ownerAgent} />
+                      </>
                     )}
                   </div>
                 )}
