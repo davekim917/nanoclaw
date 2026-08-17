@@ -90,12 +90,10 @@ function TranscriptRow({ entry }: { entry: NormalizedEntry }) {
   return (
     <li className={`nc-transcript-row ${isInbound ? 'inbound' : 'outbound'}`}>
       <div className="nc-transcript-meta">
-        <span className="nc-pill">{isInbound ? '→ in' : '← out'}</span>
-        {entry.source && (
-          <span style={{ color: 'var(--fg-3)', fontSize: 11 }}>{entry.source}</span>
-        )}
-        <span style={{ color: 'var(--fg-3)', fontSize: 11 }}>{entry.kind}</span>
-        <span style={{ color: 'var(--fg-3)', fontSize: 11 }}>{relAge(entry.timestamp)} ago</span>
+        <span className="nc-transcript-dir">{isInbound ? '→ in' : '← out'}</span>
+        {entry.source && <span className="nc-transcript-tag">{entry.source}</span>}
+        <span className="nc-transcript-tag">{entry.kind}</span>
+        <span className="nc-transcript-tag">{relAge(entry.timestamp)} ago</span>
       </div>
       {isLong ? (
         <details className="nc-transcript-expand">
@@ -121,15 +119,15 @@ function ThinkingGroupRow({ entries }: { entries: NormalizedEntry[] }) {
     <li className="nc-transcript-row outbound nc-transcript-thinking">
       <details>
         <summary>
-          <span className="nc-pill">💭 {label}</span>
-          <span style={{ color: 'var(--fg-3)', fontSize: 11 }}>
+          <span className="nc-transcript-dir">💭 {label}</span>
+          <span className="nc-transcript-tag">
             {relAge(entries[entries.length - 1]!.timestamp)} → {relAge(entries[0]!.timestamp)} ago
           </span>
         </summary>
         <div className="nc-thinking-list">
           {entries.map((e) => (
             <div key={e.key} className="nc-thinking-entry">
-              <div style={{ color: 'var(--fg-3)', fontSize: 11, marginBottom: 4 }}>
+              <div className="nc-transcript-tag" style={{ marginBottom: 4 }}>
                 {relAge(e.timestamp)} ago
               </div>
               <div className="nc-transcript-text nc-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(e.text) }} />

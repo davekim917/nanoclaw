@@ -1,12 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import useSWR from 'swr';
-import {
-  getSessionDetail,
-  postSessionMessage,
-  archiveSession,
-  unarchiveSession,
-  type AuthMe,
-} from '../lib/api.js';
+import { getSessionDetail, postSessionMessage, type AuthMe } from '../lib/api.js';
 import { subscribe } from '../lib/sse.ts';
 import { relAge } from '../lib/derive.js';
 import { TranscriptList, normalizeSessionEntry } from './TranscriptList.js';
@@ -20,11 +14,14 @@ interface SessionDetailProps {
 const MAX_CHARS = MAX_STEER_CHARS;
 
 /**
- * Per-session detail page mirroring TaskDetail's shape: header with key
- * meta + steer composer + recent transcript. Lives at `#/session/:id`,
- * navigated from the inbox board's session cards. Direct-conversation
- * sessions (no attached task) only have this route — they don't slot into
- * the TaskDetail flow.
+ * The steer destination. Reached from the Observatory's room sheet
+ * ("open session to steer"), so it wears the same atrium chrome and does
+ * exactly one job: show this conversation and let the operator answer it.
+ *
+ * Deliberately NOT here: dismiss/archive and any link back into the legacy
+ * inbox board. Those actions still exist on the inbox itself; on the steer
+ * page they were escape hatches into a UI the operator does not use. The
+ * only way out of this page is back to the Observatory.
  *
  * Steer composer posts to `POST /dashboard/api/sessions/:id/message` via
  * `postSessionMessage`. The C5 generalized steer handler does the rest:
@@ -88,101 +85,65 @@ export const SessionDetail: React.FC<SessionDetailProps> = ({ authMe: _authMe, s
     }
   };
 
-  const onBack = () => {
-    location.hash = '#/inbox';
-  };
+  const back = (
+    <a className="nc-sd-back" href="#/observatory">
+      ← back to the Observatory
+    </a>
+  );
 
   if (!data) {
     return (
-      <div className="nc-frame">
-        <header className="nc-pulse">
-          <div className="nc-pulse-top">
-            <div className="nc-brand">
-              <span className="mark" aria-hidden="true"></span>
-              <button type="button" className="nav-link" onClick={onBack}>
-                ← Inbox
-              </button>
-            </div>
-          </div>
-        </header>
+      <div className="nc-frame nc-of nc-sd">
+        <header className="nc-of-bar">{back}</header>
         <div className="nc-empty">loading session…</div>
       </div>
     );
   }
 
   const s = data.session;
-  const isArchived = s.archived_at != null;
+  // Same four-state vocabulary the office floor uses, so a dot means the same
+  // thing here as it did on the map the operator arrived from.
+  const state = {
+    needs_me: { dot: 'blocked', word: 'waiting on you' },
+    active: { dot: 'working', word: 'working' },
+    stale: { dot: 'waiting', word: 'gone quiet' },
+    idle: { dot: 'idle', word: 'idle' },
+  }[s.attention_state ?? 'idle'];
 
   return (
-    <div className="nc-frame">
-      <header className="nc-pulse">
-        <div className="nc-pulse-top">
-          <div className="nc-brand">
-            <span className="mark" aria-hidden="true"></span>
-            <button type="button" className="nav-link" onClick={onBack}>
-              ← Inbox
-            </button>
-          </div>
-          <nav className="nc-pulse-actions">
-            {isArchived ? (
-              <button
-                type="button"
-                className="nav-link"
-                onClick={async () => {
-                  await unarchiveSession(sessionId);
-                  void mutate();
-                }}
-              >
-                ↩ Unarchive
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="nav-link"
-                onClick={async () => {
-                  await archiveSession(sessionId);
-                  void mutate();
-                }}
-              >
-                Dismiss
-              </button>
-            )}
-          </nav>
-        </div>
+    <div className="nc-frame nc-of nc-sd">
+      <header className="nc-of-bar">
+        {back}
+        <span className="nc-of-bar-meta">
+          <span className="nc-of-live">
+            <i className={`nc-of-sd ${state.dot}`} />
+            {state.word}
+          </span>
+        </span>
       </header>
 
-      <div className="nc-task-detail">
-        <h2>{s.title ?? s.session_id}</h2>
-        <div className="nc-meta-row">
-          <span className="nc-pill">{s.attention_state ?? 'idle'}</span>
-          <span className="nc-pill">container · {s.container_status}</span>
-          <span className="nc-pill">{s.agent_group_id}</span>
-          {s.has_pending_recurrence && <span className="nc-pill">⏰ scheduled</span>}
-          {s.attached_task_id && (
-            <button
-              type="button"
-              className="nc-pill"
-              onClick={() => {
-                location.hash = `#/task/${s.attached_task_id}`;
-              }}
-              title="Open attached task"
-            >
-              task · {s.attached_task_status ?? 'attached'}
-            </button>
-          )}
-        </div>
-        <div className="nc-meta-row" style={{ color: 'var(--fg-3)', fontSize: 12 }}>
-          {s.last_inbound_at && <span>last inbound {relAge(s.last_inbound_at)} ago</span>}
-          {s.last_outbound_at && (
-            <span>
-              · last outbound {relAge(s.last_outbound_at)} ago
-              {s.last_outbound_kind?.startsWith('chat-sdk:') ? ` (${s.last_outbound_kind.slice(9)})` : ''}
-            </span>
-          )}
-        </div>
+      <div className="nc-sd-body">
+        <section className="nc-sd-head">
+          <h1>{s.title ?? 'Conversation'}</h1>
+          <p className="nc-sd-who">
+            <b>{s.agent_group_id}</b>
+            {s.messaging_group_id && <> in <span className="mono">{s.messaging_group_id}</span></>}
+            {s.thread_id && <> · thread <span className="mono">{s.thread_id}</span></>}
+          </p>
+          <p className="nc-sd-facts">
+            <span className="mono">{s.session_id}</span>
+            <span>container {s.container_status}</span>
+            {s.attached_task_id && <span>on a task ({s.attached_task_status ?? 'attached'})</span>}
+            {s.has_pending_recurrence && <span>has scheduled work</span>}
+            {s.last_inbound_at && <span>heard {relAge(s.last_inbound_at)} ago</span>}
+            {s.last_outbound_at && <span>spoke {relAge(s.last_outbound_at)} ago</span>}
+          </p>
+        </section>
 
-        <h3 style={{ marginTop: 24 }}>Recent messages</h3>
-        <TranscriptList entries={data.transcript.map(normalizeSessionEntry)} />
+        <section className="nc-sd-convo">
+          <h2>The conversation</h2>
+          <TranscriptList entries={data.transcript.map(normalizeSessionEntry)} />
+        </section>
       </div>
 
       <SteerComposer
@@ -193,11 +154,10 @@ export const SessionDetail: React.FC<SessionDetailProps> = ({ authMe: _authMe, s
         canSubmit={canSubmit}
         tooLong={tooLong}
         submitError={submitError}
-        placeholder="Send a message to this session… (⌘↵ to send)"
-        sendLabel="↪ Send"
+        placeholder="Say something to this agent… (⌘↵ to send)"
+        sendLabel="Send"
         ariaLabel="Send a message to this session"
       />
     </div>
   );
 };
-
