@@ -711,6 +711,24 @@ memory module 123 passed; build clean.
 **Replay gate still starved:** sentinel run 2 underway; run 1's 40 probes over ~17h all
 found drained buckets.
 
+### 2026-08-17 — replay gate CLOSED by production evidence; prohibition contingency DEAD
+
+The synthetic replay never landed: two sentinel campaigns (100 probes over ~34h) found
+the agentic lanes' per-minute buckets drained at every sampled instant. It is no longer
+needed — production answered both of its questions with stronger evidence:
+
+- **Old prompt suppressed domain capture:** 0 `domain_knowledge`-class captures in 3,631
+  old-prompt decisions (the code did not exist and the whitelist excluded the class).
+- **New prompt captures, and the prohibition does not obstruct:** 26 `domain_knowledge`
+  facts in the first ~19h across two workgroups (12.4% of new reason-bearing captures),
+  quality spot-checked (metric semantics, product rules, operator rulings, rewritten
+  flows — meaning and rationale, not call sites), and `code_derived` remains **zero**
+  even with the whitelist open — the P0.3(c) prohibition-scoping contingency is dead,
+  permanently unbuilt.
+
+`scripts/run-memory-domain-replay.ts` stays in-tree for future prompt changes, where a
+pre-deploy comparison will again be the right tool under less saturated conditions.
+
 ### Not done at this stage
 
 No production code written; planning is artifact-only. No tests materialized — per the
