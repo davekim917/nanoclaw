@@ -34,6 +34,7 @@ import {
 import { observatoryHandler } from './api/observatory.js';
 import { observatoryAssignHandler } from './assign.js';
 import { observatoryNudgeHandler } from './nudge.js';
+import { observatorySteerHandler } from './observatory-steer.js';
 
 // Side-effect imports — these files register their routes/handlers at module load
 import './auth/exchange.js'; // POST /dashboard/api/auth/exchange
@@ -80,6 +81,7 @@ export function startDashboard(): void {
   register('GET', '/dashboard/api/observatory', requireAuth(observatoryHandler));
   register('POST', '/dashboard/api/observatory/assign', requireAuth(observatoryAssignHandler));
   register('POST', '/dashboard/api/observatory/nudge', requireAuth(observatoryNudgeHandler));
+  register('POST', '/dashboard/api/observatory/steer', requireAuth(observatorySteerHandler));
 
   // Scheduled Tasks Board — 10 routes (design §3b + prompt/title search). The
   // `scheduled` namespace is distinct from `tasks` (the spawn board owns that).
