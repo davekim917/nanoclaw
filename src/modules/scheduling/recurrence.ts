@@ -18,6 +18,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { TIMEZONE } from '../../config.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
+import { insertDeferredMessageWithContextIfNew } from '../../db/session-db.js';
 import { clearRecurrence, getCompletedRecurring, insertRecurrence, trailingFailedRuns } from './db.js';
 import { appendRunLog } from './run-log.js';
 
@@ -29,6 +30,50 @@ import { appendRunLog } from './run-log.js';
 // doubling, MAX_TRIES → failed): fail loud, don't spin.
 const SCRIPT_FAIL_PAUSE_CAP = 8;
 const SCRIPT_BACKOFF_CAP_MIN = 60;
+
+/**
+ * Auto-pause used to terminate in a run-log line and a host warning, and
+ * nothing read either. A paused series is an ABSORBING STATE: it stops firing,
+ * so it stops being the reason anyone looks at it, and it stays dead until a
+ * human happens to run `ncl tasks get`. Measured 2026-08-17: two series paused
+ * this way, one for 15 days, and the failing script in one of them had since
+ * started working — it would never have run again.
+ *
+ * So the pause now owes someone an action. The note is DUE IMMEDIATELY rather
+ * than on-wake: an on-wake note is only read when something else wakes the
+ * container, and for a group whose only wake source was the series that just
+ * paused, that is never. A due row makes the sweep wake it (host-sweep.ts's
+ * `dueCount > 0` branch), so the obligation lands even on an otherwise idle
+ * agent. Dedup id is the series, so one pause raises one note.
+ */
+function notifyOwnerOfPause(inDb: Database.Database, session: Session, seriesId: string, scriptFails: number): void {
+  try {
+    insertDeferredMessageWithContextIfNew(inDb, {
+      id: `task-paused-${seriesId}`,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: session.agent_group_id,
+      channelType: 'agent',
+      threadId: null,
+      content: JSON.stringify({
+        text:
+          `[system] Scheduled series \`${seriesId}\` auto-paused after ${scriptFails} consecutive ` +
+          `script failures and is NOT running. Diagnose the script, then either fix it and run ` +
+          `\`ncl tasks resume ${seriesId}\`, or post once to the humans who depend on it naming what ` +
+          `you need. Do not leave it paused silently — while it is paused, whatever it watches is unwatched.`,
+        sender: 'system',
+        senderId: 'system',
+        _system: { kind: 'task-auto-paused', seriesId, scriptFails },
+      }),
+      processAfter: new Date().toISOString(),
+      recurrence: null,
+      onWake: 0,
+    });
+  } catch (err) {
+    // Same rule as the run-log note: the sweep must not crash over a notice.
+    log.warn('Could not write auto-pause notice', { seriesId, err });
+  }
+}
 
 /** 2, 4, 8, 16, 32, 60, 60… minutes for fails = 1, 2, 3… */
 export function scriptBackoffMinutes(fails: number): number {
@@ -78,6 +123,7 @@ export async function handleRecurrence(inDb: Database.Database, session: Session
           msg.series_id,
           `auto-paused after ${scriptFails} consecutive script failures (host); fix the script, then \`ncl tasks resume ${msg.series_id}\``,
         );
+        notifyOwnerOfPause(inDb, session, msg.series_id ?? msg.id, scriptFails);
         log.warn('Task series auto-paused: script keeps failing', {
           seriesId: msg.series_id,
           scriptFails,

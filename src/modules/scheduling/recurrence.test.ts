@@ -210,4 +210,41 @@ describe('handleRecurrence — script-failure backoff (streak derived from faile
     expect(content).toContain('ncl tasks resume task-s-0');
     expect(content).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — /m); // appendRunLog's local-time stamp
   });
+
+  // A paused series is an absorbing state: it stops firing, so it stops being
+  // the reason anyone looks at it. The run-log line above is written where
+  // nobody reads it, which is exactly how one series sat dead for 15 days.
+  it('leaves the owning agent an obligation, due now rather than on-wake', async () => {
+    const db = freshDb();
+    seedFailedStreak(db, 8);
+    await handleRecurrence(db, fakeSession());
+
+    const note = db.prepare(`SELECT * FROM messages_in WHERE id = ?`).get('task-paused-task-s-0') as
+      | { content: string; process_after: string | null; on_wake: number; kind: string }
+      | undefined;
+    expect(note).toBeTruthy();
+    // Due immediately: an on-wake note is only read when something ELSE wakes
+    // the container, and the series that just paused may have been the only
+    // thing that ever did.
+    expect(note!.on_wake).toBe(0);
+    expect(note!.process_after).toBeTruthy();
+    expect(new Date(note!.process_after!).getTime()).toBeLessThanOrEqual(Date.now() + 1000);
+
+    const text = JSON.parse(note!.content).text as string;
+    expect(text).toContain('task-s-0');
+    expect(text).toContain('ncl tasks resume task-s-0');
+    expect(text).toContain('is NOT running');
+  });
+
+  it('raises one notice per pause, not one per sweep', async () => {
+    const db = freshDb();
+    seedFailedStreak(db, 8);
+    await handleRecurrence(db, fakeSession());
+    await handleRecurrence(db, fakeSession());
+
+    const n = db.prepare(`SELECT COUNT(*) c FROM messages_in WHERE id = ?`).get('task-paused-task-s-0') as {
+      c: number;
+    };
+    expect(n.c).toBe(1);
+  });
 });
