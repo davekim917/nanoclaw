@@ -21,7 +21,8 @@ import { log } from '../log.js';
 import { dispatch } from '../cli/dispatch.js';
 import { isOwner, isGlobalAdmin, isAdminOfAgentGroup } from '../modules/permissions/db/user-roles.js';
 import { isMember } from '../modules/permissions/db/agent-group-members.js';
-import { readReleaseState } from './api/observatory.js';
+import { readReleaseState, personaName, roomPermalink } from './api/observatory.js';
+import type { AgentGroup } from '../types.js';
 import type { AuthHandler } from './router.js';
 
 const json = (status: number, body: unknown): Response =>
@@ -64,8 +65,8 @@ export const observatoryAssignHandler: AuthHandler = async (req, _params, ctx) =
   if (!role.ok) return json(role.reason === 'not_found' ? 404 : 403, { error: role.reason });
 
   const agent = getDb()
-    .prepare(`SELECT id, name, folder FROM agent_groups WHERE id = ? AND workgroup_id = ?`)
-    .get(agentGroupId, workgroupId) as { id: string; name: string; folder: string } | undefined;
+    .prepare(`SELECT * FROM agent_groups WHERE id = ? AND workgroup_id = ?`)
+    .get(agentGroupId, workgroupId) as AgentGroup | undefined;
   if (!agent) return json(404, { error: 'agent_group_not_in_workgroup' });
 
   const state = readReleaseState(workgroupId);
@@ -81,12 +82,12 @@ export const observatoryAssignHandler: AuthHandler = async (req, _params, ctx) =
   // the floor itself is built from, so "assignable" and "on the map" agree.
   const mg = getDb()
     .prepare(
-      `SELECT mg.id, mg.name
+      `SELECT mg.id, mg.name, mg.platform_id, mg.channel_type
          FROM messaging_group_agents mga
          JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
         WHERE mga.agent_group_id = ?`,
     )
-    .all(agentGroupId) as { id: string; name: string }[];
+    .all(agentGroupId) as { id: string; name: string; platform_id: string; channel_type: string }[];
   const target = mg.find((m) => channelKey(m.name) === channelKey(item.channel!));
   if (!target) return json(409, { error: 'agent_not_wired_to_channel', channel: item.channel });
 
@@ -104,9 +105,10 @@ export const observatoryAssignHandler: AuthHandler = async (req, _params, ctx) =
     (item.url ? ` · ${item.url}` : '') +
     ` · current owner: ${item.owner ?? 'nobody'}` +
     (item.nextAction ? `\nnext action on the board: ${item.nextAction}` : '') +
-    `\n\n1. Claim it first: \`bash /app/skills/work-claims/claim.sh take ${slug} 8 "<one-line note>" --source observatory-assign\` — and check for a twin before your first commit.\n` +
-    `2. Do the work, or the named next action if one is stated.\n` +
-    `3. Report the outcome in this channel. If you cannot take it, say so HERE naming exactly what blocks you and who owns that blocker — an assignment that ends in silence is the failure this button exists to end.`;
+    `\n\n1. REQUIRED: your FIRST message in this channel must open with exactly this line, before anything else you say: "Assigned by ${who} via the Observatory —". Everyone in the room should know where this came from without asking.\n` +
+    `2. Claim it: \`bash /app/skills/work-claims/claim.sh take ${slug} 8 "<one-line note>" --source observatory-assign\` — and check for a twin before your first commit.\n` +
+    `3. Do the work, or the named next action if one is stated.\n` +
+    `4. Report the outcome in this channel. If you cannot take it, say so HERE naming exactly what blocks you and who owns that blocker — an assignment that ends in silence is the failure this button exists to end.`;
 
   const res = await dispatch(
     {
@@ -137,5 +139,15 @@ export const observatoryAssignHandler: AuthHandler = async (req, _params, ctx) =
     channel: target.name,
     seriesId,
   });
-  return json(200, { ok: true, seriesId, channel: target.name, agent: agent.name });
+  return json(200, {
+    ok: true,
+    seriesId,
+    channel: target.name,
+    // The name the room knows this agent by, not the infrastructure one — the
+    // confirmation should echo the agent the operator actually picked.
+    agent: await personaName(agent),
+    channelUrl: roomPermalink(target.channel_type, target.platform_id),
+    // Sweep admits within ~60s, plus container boot. Deliberately coarse.
+    etaSeconds: 120,
+  });
 };

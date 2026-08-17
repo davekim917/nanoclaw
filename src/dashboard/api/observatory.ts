@@ -263,6 +263,19 @@ export function isNotARoom(platformId: string, hidden: string[]): boolean {
   return platformId.startsWith('slack:') && /^D/.test(channel ?? '');
 }
 
+/**
+ * Channel-level permalink for a room, resolved through the adapter that owns
+ * its platform. Null when the adapter is absent or has no permalink() — an
+ * adapter must never fail the caller, and a fabricated URL is worse than none.
+ */
+export function roomPermalink(platform: string, platformId: string): string | null {
+  try {
+    return getChannelAdapter(platform)?.permalink?.(platformId, null) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function buildRooms(workgroupId: string, allowed: string[] | null, hidden: string[] = []): ObservatoryRoom[] {
   const wiringRows = getDb()
     .prepare(
@@ -307,20 +320,13 @@ function buildRooms(workgroupId: string, allowed: string[] | null, hidden: strin
       .prepare(`SELECT MAX(last_outbound_at) AS last FROM sessions WHERE messaging_group_id IN (${placeholders})`)
       .get(...mgIds) as { last: string | null } | undefined;
 
-    let permalink: string | null = null;
-    try {
-      permalink = getChannelAdapter(room.platform)?.permalink?.(room.key, null) ?? null;
-    } catch {
-      permalink = null; // an adapter's permalink() must never fail the whole scene
-    }
-
     rooms.push({
       key: room.key,
       name: room.name ?? room.key,
       platform: room.platform,
       memberAgentIds: [...room.memberAgentIds],
       lastActivityAt: activityRow?.last ?? null,
-      permalink,
+      permalink: roomPermalink(room.platform, room.key),
     });
   }
   return rooms;
@@ -348,6 +354,14 @@ async function resolvePersonaName(
     });
     return agentGroup.name;
   }
+}
+
+/**
+ * Persona name for an agent group with nothing pre-loaded — same resolution
+ * the scene uses, for callers (the assign endpoint) that hold only the DB row.
+ */
+export async function personaName(agentGroup: AgentGroup): Promise<string> {
+  return resolvePersonaName(agentGroup, readContainerConfig(agentGroup.folder), defaultDeps);
 }
 
 async function buildAgents(

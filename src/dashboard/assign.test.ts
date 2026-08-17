@@ -14,7 +14,12 @@ const mockReadReleaseState = vi.mocked(_rrsRaw);
 // pins is everything in front of it: who may assign, which items and channels
 // are reachable, and that the prompt is composed from the board, not the body.
 vi.mock('../cli/dispatch.js', () => ({ dispatch: vi.fn() }));
-vi.mock('./api/observatory.js', () => ({ readReleaseState: vi.fn() }));
+// Only the board read is stubbed — persona resolution and permalink building
+// run for real, so what the response promises is what the live helpers return.
+vi.mock('./api/observatory.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./api/observatory.js')>()),
+  readReleaseState: vi.fn(),
+}));
 
 const OWNER = 'u-owner';
 const MEMBER = 'u-member';
@@ -92,7 +97,18 @@ describe('observatoryAssignHandler', () => {
     boardWith([ITEM]);
     const res = (await assign())!;
     expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ ok: true, channel: '#qa-room', agent: 'ava' });
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      channel: '#qa-room',
+      // Persona name. The fixture has no persona source — no groups/ava/container.json
+      // and no bot identity — so resolveAssistantName falls back to agent_groups.name.
+      // An install with a persona set returns that instead; this pins the fallback.
+      agent: 'ava',
+      // No channel adapter is registered in this suite, so the permalink is
+      // honestly null rather than a guessed URL.
+      channelUrl: null,
+      etaSeconds: 120,
+    });
 
     expect(mockDispatch).toHaveBeenCalledTimes(1);
     const [frame, callerCtx] = mockDispatch.mock.calls[0]!;
@@ -107,6 +123,25 @@ describe('observatoryAssignHandler', () => {
     expect(prompt).toContain('a real finding');
     expect(prompt).toContain('claim.sh take xzo-900');
     expect(prompt).toContain('assigned from the Observatory by Olive Owner');
+  });
+
+  it('requires the agent to sign its first message with who assigned it', async () => {
+    boardWith([ITEM]);
+    expect((await assign())!.status).toBe(200);
+    const prompt = mockDispatch.mock.calls[0]![0].args.prompt as string;
+    // The exact line the room will see, quoting the assigner's display name.
+    expect(prompt).toContain('"Assigned by Olive Owner via the Observatory —"');
+    // ...and it must be the FIRST thing said, not a footnote further down.
+    expect(prompt).toMatch(/FIRST message in this channel must open with/);
+    expect(prompt.indexOf('Assigned by Olive Owner')).toBeLessThan(prompt.indexOf('claim.sh take'));
+  });
+
+  it('falls back to the user id when the assigner has no display name', async () => {
+    boardWith([ITEM]);
+    getDb().prepare(`INSERT INTO user_roles (user_id, role, agent_group_id) VALUES ('u-noname','owner',NULL)`).run();
+    expect((await assign('u-noname'))!.status).toBe(200);
+    const prompt = mockDispatch.mock.calls[0]![0].args.prompt as string;
+    expect(prompt).toContain('"Assigned by u-noname via the Observatory —"');
   });
 
   it('a member cannot assign — same line steer draws', async () => {
