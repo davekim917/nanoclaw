@@ -39,7 +39,6 @@ export function OfficeMap({
   scale = '1.35',
   labels = 'sign',
   agents = 'bubble',
-  height = 392,
   teleportTo,
 }: {
   data: OfficeData;
@@ -51,7 +50,6 @@ export function OfficeMap({
   scale?: string;
   labels?: string;
   agents?: string;
-  height?: number;
   /** Slot key to centre the viewport on. Changing it re-centres. */
   teleportTo?: string | null;
 }) {
@@ -86,7 +84,6 @@ export function OfficeMap({
       agents={agents}
       selected={selected}
       {...(start ? { start } : {})}
-      style={{ display: 'block', height: `${height}px` }}
     />
   );
 }

@@ -1585,7 +1585,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   --of-cream: #fff4e0;
   --of-drop: 4px 4px 0 rgb(0 0 0 / 0.18);
 
-  background: #efe3cd;
+  background: #f6f4f0;
   color: var(--of-ink);
 }
 
@@ -1805,7 +1805,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
      ~3.0:1 — quiet by near-invisibility rather than by rank. */
   --ink:#23201b; --ink-2:rgba(35,32,27,.78); --ink-3:rgba(35,32,27,.66);
   --line:rgba(35,32,27,.10); --line-2:rgba(35,32,27,.16);
-  --page:#efece5; --card:#faf7f2; --card-2:#fff;
+  --page:#f6f4f0; --card:#faf8f5; --card-2:#fff;
   --accent:#3f68c9;
   --stop:#b0503f; --warn:#b3862c; --go:#4a7c59; --idle:#8f8b82;
   --r:10px;
@@ -1836,7 +1836,28 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   border-radius:var(--r);
 }
 .nc-of .nc-of-head-main{flex:1; min-width:0}
-.nc-of .nc-of-hero{display:flex; align-items:baseline; gap:13px}
+/* The three numbers are the queue's filter. They read as one control each:
+   pressed state is a tinted plate, not a border, so the headline stays a
+   headline and does not turn into a toolbar. */
+.nc-of .nc-of-hero{
+  display:flex; align-items:baseline; gap:13px; appearance:none; border:0; background:none;
+  font:inherit; color:inherit; text-align:left; cursor:pointer; padding:6px 8px; margin:-6px -8px;
+  border-radius:8px;
+}
+.nc-of .nc-of-hero:hover,.nc-of .nc-of-slice:hover{background:rgba(35,32,27,.04)}
+.nc-of .nc-of-hero.on,.nc-of .nc-of-slice.on{background:rgba(63,104,201,.09)}
+.nc-of .nc-of-hero:focus-visible,.nc-of .nc-of-slice:focus-visible{
+  outline:2px solid var(--accent); outline-offset:1px;
+}
+.nc-of .nc-of-slice{
+  appearance:none; border:0; background:none; font:inherit; color:var(--ink-2); cursor:pointer;
+  padding:5px 8px; margin:-5px -8px; border-radius:8px; min-height:34px;
+}
+.nc-of .nc-of-clearfilter{
+  appearance:none; border:0; background:none; cursor:pointer; font:inherit;
+  font-size:12px; font-weight:500; color:var(--accent); padding:4px 6px; border-radius:6px;
+}
+.nc-of .nc-of-clearfilter:hover{background:rgba(63,104,201,.08)}
 .nc-of .nc-of-hero-n{
   font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:60px; font-weight:600;
   color:var(--stop); line-height:.86; letter-spacing:-.03em; font-variant-numeric:tabular-nums;
@@ -1852,7 +1873,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   margin-right:6px; font-variant-numeric:tabular-nums;
 }
 .nc-of .nc-of-sub b.warn{color:var(--warn)} .nc-of .nc-of-sub b.go{color:var(--go)}
-.nc-of .nc-of-sub-total{margin-left:auto; color:var(--ink-3)}
+.nc-of .nc-of-sub-total{margin-left:auto; text-align:right; color:var(--ink-3)}
 .nc-of .nc-of-notes{
   width:400px; max-width:100%; display:flex; flex-direction:column; gap:10px;
   justify-content:center; border-left:1px solid var(--line); padding-left:20px;
@@ -1860,13 +1881,30 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-notes p{margin:0; display:flex; gap:9px; align-items:flex-start; font-size:12.5px; line-height:1.45}
 .nc-of .nc-of-notes i{width:6px; height:6px; border-radius:50%; margin-top:5px; flex:none}
 .nc-of .nc-of-notes i.warn{background:var(--warn)} .nc-of .nc-of-notes i.stop{background:var(--stop)}
-.nc-of .nc-of-notes b{font-weight:600}
+.nc-of .nc-of-notes b{font-weight:600; font-size:12.5px}
+.nc-of .nc-of-notes p{max-width:46ch}
 .nc-of .nc-of-notes span{color:var(--ink-2)}
 .nc-of .nc-of-notes b + span,.nc-of .nc-of-notes span b{color:var(--ink)}
 @media (max-width:900px){
   .nc-of .nc-of-head{flex-direction:column; gap:14px}
   .nc-of .nc-of-notes{width:auto; border-left:0; border-top:1px solid var(--line); padding-left:0; padding-top:12px}
   .nc-of .nc-of-hero-n{font-size:46px}
+}
+/* Phone: the headline has to fit in roughly a third of the screen or the
+   office — the thing this page exists to show — starts below the fold. The
+   three slices go on ONE row, so nothing is dropped; only the air is. */
+@media (max-width:700px){
+  .nc-of .nc-of-head{padding:12px 14px 11px; gap:10px; margin-bottom:10px}
+  .nc-of .nc-of-hero{gap:9px; padding:4px 6px; margin:-4px -6px}
+  .nc-of .nc-of-hero-n{font-size:38px}
+  .nc-of .nc-of-hero-l{font-size:13.5px}
+  .nc-of .nc-of-hero-l span{font-size:12px}
+  .nc-of .nc-of-sub{margin-top:9px; padding-top:9px; gap:6px 14px; font-size:12px}
+  .nc-of .nc-of-sub b{font-size:16px; margin-right:4px}
+  .nc-of .nc-of-slice{padding:4px 6px; margin:-4px -6px; min-height:30px}
+  .nc-of .nc-of-sub-total{flex:0 0 100%; margin-left:0; text-align:left; font-size:11.5px}
+  .nc-of .nc-of-notes{gap:6px; padding-top:9px}
+  .nc-of .nc-of-notes p{font-size:12px; line-height:1.4}
 }
 
 /* ─── The office map card ────────────────────────────────────────────────── */
@@ -1885,19 +1923,29 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* The plan is larger than any viewport, so the bottom edge always cuts through
    furniture. The fade reads as "there is more below"; a hard edge read as the
    illustration running out. */
+.nc-of .nc-of-mapcard-head{border-bottom:1px solid var(--line)}
+/* Height is CSS-owned so it can answer the viewport. At 385px the one
+   illustrated surface in the product was the most space-starved thing on the
+   page; the fade is deep enough now to read as a viewport edge, not a clip. */
 .nc-of office-map{
-  -webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 24px),transparent);
-  mask-image:linear-gradient(to bottom,#000 calc(100% - 24px),transparent);
+  display:block; height:clamp(340px,48vh,560px);
+  -webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 40px),transparent);
+  mask-image:linear-gradient(to bottom,#000 calc(100% - 40px),transparent);
 }
 /* The plan is bigger than any viewport, so the bottom edge is a cut through
    furniture. The fade says "there is more, drag it" instead of "the image ran
    out"; the hint says it in words for anyone who reads before dragging. */
 .nc-of .nc-of-teleport{
   display:flex; gap:7px; padding:9px 12px 11px; border-top:1px solid var(--line);
-  overflow-x:auto; align-items:center;
-  /* The row scrolls; without the fade the last chip reads as clipped-broken. */
-  mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);
+  overflow-x:auto; align-items:center; scrollbar-width:none;
+  /* The row scrolls; without the fade the last chip reads as clipped-broken.
+     The fade is wide enough that a chip is always cut mid-chip, never flush
+     with the card edge, which is what made it read as broken rather than as
+     "there is more this way". */
+  -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 40px),transparent);
+  mask-image:linear-gradient(to right,#000 calc(100% - 40px),transparent);
 }
+.nc-of .nc-of-teleport::-webkit-scrollbar{display:none}
 .nc-of .nc-of-overflow{
   margin:0; padding:0 12px 10px; font-size:11.5px; color:var(--ink-3);
 }
@@ -1931,9 +1979,6 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    agent/channel counts are reference, not signal, and pushed the live dot off
    the right edge — nothing may be wider than the viewport but the map. */
 @media (max-width:700px){
-  /* The claim survives; only the elaboration folds. The block was 150px tall
-     and pushed the office below the fold — the exact failure the floor is for. */
-  .nc-of .nc-of-note-more{display:none}
   .nc-of .nc-of-bar{gap:10px; padding:11px 14px}
   /* Below ~420px the two-word title and the hint each wrapped mid-phrase. */
   .nc-of .nc-of-bar-title{white-space:nowrap; font-size:13.5px}
@@ -2001,19 +2046,23 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* Every cell must be allowed to shrink, or one long title sets the row's
    min-content width and the whole board grows past the viewport. */
 .nc-of .nc-obs-ledger-btn > *{min-width:0}
-.nc-of .nc-obs-ledger-title{overflow-wrap:anywhere}
+.nc-of .nc-obs-ledger-title{overflow-wrap:anywhere; font-weight:500}
 /* The due chip is the ONLY urgency encoding on the row — no bar, no row tint,
    no coloured title stacked on top of it. */
 .nc-of .nc-obs-ledger-due{
-  font-size:11.5px; font-weight:600; color:var(--ink-2); white-space:nowrap;
+  font-size:11.5px; font-weight:500; color:var(--ink-2); white-space:nowrap;
 }
 .nc-of .nc-obs-ledger-due.breached,.nc-of .nc-obs-ledger-due.unowned{color:var(--stop)}
 .nc-of .nc-obs-ledger-due.due-soon{color:var(--warn)}
 .nc-of .nc-obs-ledger-due.on-track{color:var(--go)}
 .nc-of .nc-obs-ledger-due.undated{color:var(--ink-3)}
+/* Rides the title line, not the state column: it is an orthogonal fact, and
+   the lead column has to hold one shape on every row or the list loses its
+   beat between the rows that carry it and the rows that do not. */
 .nc-of .nc-obs-ledger-blocks{
   font-size:10px; font-weight:600; letter-spacing:.01em; white-space:nowrap;
   background:rgba(176,80,63,.13); color:var(--stop); border-radius:4px; padding:1px 5px;
+  margin-right:7px;
 }
 /* Two lines before it truncates. The title is the content; ellipsing it at one
    line to protect a fixed metadata column that is empty on most rows was the

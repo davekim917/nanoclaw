@@ -90,6 +90,7 @@ export function Observatory(_props: ObservatoryProps) {
   // Shared across the fold: the strip sits above the office, the board below it.
   const [releaseFilter, setReleaseFilter] = useState<ReleaseGroupKey | null>(null);
   const [selectedRoom, setSelectedRoom] = useState<string>('');
+  const [flowFilter, setFlowFilter] = useState<FlowSlice | null>(null);
   const [teleportTo, setTeleportTo] = useState<string | null>(null);
   const [expandedClaim, setExpandedClaim] = useState<string | null>(null);
 
@@ -147,6 +148,23 @@ export function Observatory(_props: ObservatoryProps) {
     : allItems;
 
   const ledgerCounts = useMemo(() => buildLedger(ownerFilteredItems).counts, [ownerFilteredItems]);
+  const flowCount = flowFilter
+    ? flowFilter === 'stalled'
+      ? ledgerCounts.breached
+      : flowFilter === 'person'
+        ? ledgerCounts.person
+        : ledgerCounts.onTrack
+    : 0;
+
+  // Where the camera opens. The plan's first slot is at its left edge, so
+  // defaulting there spent the first screen on lawn. Open on the room that
+  // most needs looking at — worst state first, then most occupied.
+  const startSlot = useMemo(() => {
+    const rank: Record<string, number> = { blocked: 0, waiting: 1, working: 2, idle: 3 };
+    return [...officeData.rooms].sort(
+      (a, b) => (rank[a.state] ?? 9) - (rank[b.state] ?? 9) || b.agents.length - a.agents.length,
+    )[0]?.slot;
+  }, [officeData]);
 
   const claimClicked = (claim: ObservatoryClaim) => {
     setExpandedClaim((prev) => (prev === claim.slug ? null : claim.slug));
@@ -180,7 +198,7 @@ export function Observatory(_props: ObservatoryProps) {
                 boards — below the fold and closed. Before this, the job board
                 rendered first and fully expanded, which put the floor ten
                 pages down and made the office a footnote to its own page. */}
-            <CommitmentStrip items={ownerFilteredItems} />
+            <CommitmentStrip items={ownerFilteredItems} slice={flowFilter} onSlice={setFlowFilter} />
 
             <div className="nc-obs-main">
               {/* The floor is the vendored <office-map> custom element: a
@@ -203,7 +221,7 @@ export function Observatory(_props: ObservatoryProps) {
                 </div>
                 <OfficeMap
                   data={officeData}
-                  {...(officeData.rooms[0] ? { start: officeData.rooms[0].slot } : {})}
+                  {...(startSlot ? { start: startSlot } : {})}
                   selected={selectedRoom}
                   onSelect={(k) => setSelectedRoom((prev) => (prev === k ? '' : k))}
                   teleportTo={teleportTo}
@@ -282,11 +300,28 @@ export function Observatory(_props: ObservatoryProps) {
                       denominator it is obviously the two slices that are not
                       moving on their own. */}
                   <span className="nc-of-board-n">
-                    {ledgerCounts.breached + ledgerCounts.person} of {ownerFilteredItems.length}
+                    {flowFilter
+                      ? `${FLOW_LABEL[flowFilter]} · ${flowCount} of ${ownerFilteredItems.length}`
+                      : `${ledgerCounts.breached + ledgerCounts.person} of ${ownerFilteredItems.length}`}
                   </span>
+                  {flowFilter && (
+                    <button
+                      type="button"
+                      className="nc-of-clearfilter"
+                      onClick={(e) => {
+                        // The summary is a disclosure; clearing the filter must
+                        // not also collapse the list it filters.
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setFlowFilter(null);
+                      }}
+                    >
+                      show all
+                    </button>
+                  )}
                 </summary>
                 <div className="inner">
-                  <LedgerBoard items={ownerFilteredItems} />
+                  <LedgerBoard items={ownerFilteredItems} slice={flowFilter} />
                 </div>
               </details>
 
@@ -787,31 +822,74 @@ function ReleaseDesk({
  * job-board tallies. "Waiting on a person" and "need a person" were the same
  * state under two names, stacked vertically on one screen.
  */
+/** Header wording for a filtered queue. */
+const FLOW_LABEL: Record<FlowSlice, string> = {
+  stalled: 'stalled',
+  person: 'need a person',
+  moving: 'moving on their own',
+};
+
 export const STATE_WORDS = { stalled: 'stalled', person: 'need a person', moving: 'moving' } as const;
 
-export function CommitmentStrip({ items }: { items: ReleaseItem[] }) {
+/** Which slice of the headline the queue is showing. */
+export type FlowSlice = 'stalled' | 'person' | 'moving';
+
+/** The slice a commitment belongs to. Every row is in exactly one. */
+export function flowSlice(c: Commitment): FlowSlice {
+  if (c.state === 'breached' || c.state === 'unowned') return 'stalled';
+  return c.mover === 'human' ? 'person' : 'moving';
+}
+
+export function CommitmentStrip({
+  items,
+  slice,
+  onSlice,
+}: {
+  items: ReleaseItem[];
+  slice?: FlowSlice | null;
+  onSlice?: (s: FlowSlice | null) => void;
+}) {
   const ledger = useMemo(() => buildLedger(items), [items]);
   const { counts } = ledger;
   if (items.length === 0) return null;
+  // The numbers ARE the way into the queue. Reading "30 need a person" and
+  // having no way to see which thirty was the gap: the most decision-relevant
+  // slice had no entry point.
+  const pick = (s: FlowSlice) => () => onSlice?.(slice === s ? null : s);
   return (
     <section className="nc-of-head">
       <div className="nc-of-head-main">
         {/* ONE dominant number. Three equal ones made the reader choose which
             to care about; the ten-second read has to answer that for them. */}
-        <div className="nc-of-hero">
+        <button
+          type="button"
+          className={`nc-of-hero ${slice === 'stalled' ? 'on' : ''}`}
+          aria-pressed={slice === 'stalled'}
+          onClick={pick('stalled')}
+        >
           <span className="nc-of-hero-n">{counts.breached}</span>
           <span className="nc-of-hero-l">
             items are stalled
             <span>past a promised deadline, or owned by nobody</span>
           </span>
-        </div>
+        </button>
         <div className="nc-of-sub">
-          <span>
+          <button
+            type="button"
+            className={`nc-of-slice ${slice === 'person' ? 'on' : ''}`}
+            aria-pressed={slice === 'person'}
+            onClick={pick('person')}
+          >
             <b className="warn">{counts.person}</b> need a person
-          </span>
-          <span>
+          </button>
+          <button
+            type="button"
+            className={`nc-of-slice ${slice === 'moving' ? 'on' : ''}`}
+            aria-pressed={slice === 'moving'}
+            onClick={pick('moving')}
+          >
             <b className="go">{counts.onTrack}</b> moving on their own
-          </span>
+          </button>
           {/* The three numbers are DISJOINT slices of one denominator: every
               commitment is in exactly one. Without saying so, a reader reads
               30 and 8 as subsets of 32 and finds an arithmetic contradiction
@@ -872,11 +950,27 @@ const LEDGER_STATE_LABEL: Record<Commitment['state'], string> = {
 /** Rows on the first screen. The rest expand on demand. */
 const LEDGER_FIRST_PAGE = 15;
 
-function LedgerBoard({ items, now = Date.now() }: { items: ReleaseItem[]; now?: number }) {
+function LedgerBoard({
+  items,
+  now = Date.now(),
+  slice = null,
+}: {
+  items: ReleaseItem[];
+  now?: number;
+  /** Headline slice the queue is filtered to, or null for everything open. */
+  slice?: FlowSlice | null;
+}) {
   const ledger = useMemo(() => buildLedger(items, now), [items, now]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
-  const all = ledger.rows.filter((r) => r.state !== 'on-track');
+  // Unfiltered, the queue is everything NOT moving on its own; picking
+  // "moving" is the one case that widens it rather than narrowing it.
+  //
+  // Filtered on the SAME slices the headline counts, deliberately. The old
+  // default (state !== 'on-track') admitted agent-owned undated rows that the
+  // headline had already counted under "moving", so the board's own "62 of 70"
+  // could disagree with the number of rows under it.
+  const all = ledger.rows.filter((r) => (slice ? flowSlice(r) === slice : flowSlice(r) !== 'moving'));
   // The queue is ranked, so the first screen is the answer. 62 rows rendered
   // at once is the wall of list the operator asked us to get out from under —
   // the rest is one tap away, and the count says how much is behind it.
@@ -887,7 +981,9 @@ function LedgerBoard({ items, now = Date.now() }: { items: ReleaseItem[]; now?: 
       {/* The two coverage gaps are stated ONCE, in the headline above. Repeating
           them here read as two separate warnings about two separate problems. */}
       {shown.length === 0 ? (
-        <div className="nc-obs-ledger-empty">every open commitment is on track</div>
+        <div className="nc-obs-ledger-empty">
+          {slice ? 'nothing in this slice' : 'every open commitment is on track'}
+        </div>
       ) : (
         <ul className="nc-obs-ledger-rows">
           {shown.map((c) => (
@@ -907,9 +1003,11 @@ function LedgerBoard({ items, now = Date.now() }: { items: ReleaseItem[]; now?: 
                     top to bottom rather than ragged. */}
                 <span className="nc-obs-ledger-lead">
                   <span className={`nc-obs-ledger-due ${c.state}`}>{dueLabel(c)}</span>
-                  {c.item.blocksRelease && <span className="nc-obs-ledger-blocks">blocks release</span>}
                 </span>
-                <span className="nc-obs-ledger-title">{c.item.title}</span>
+                <span className="nc-obs-ledger-title">
+                  {c.item.blocksRelease && <span className="nc-obs-ledger-blocks">blocks release</span>}
+                  {c.item.title}
+                </span>
                 <span className="nc-obs-ledger-owner">{c.item.owner ?? '—'}</span>
                 <span className="nc-obs-ledger-kind">{c.item.kind}</span>
                 <span className="nc-obs-ledger-age num">

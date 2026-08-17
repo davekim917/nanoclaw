@@ -670,9 +670,12 @@ describe('Observatory', () => {
       );
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       const btn = container.querySelector('.nc-obs-ledger-btn')!;
+      // The lead column holds exactly one token on every row; "blocks release"
+      // is an orthogonal fact and rides the title line.
+      expect(btn.querySelector('.nc-obs-ledger-lead')!.children).toHaveLength(1);
       expect(btn.querySelector('.nc-obs-ledger-due')).toBeTruthy();
-      expect(btn.querySelector('.nc-obs-ledger-blocks')!.textContent).toBe('blocks release');
-      expect(btn.querySelector('.nc-obs-ledger-title')!.textContent).toBe('a thing');
+      expect(btn.querySelector('.nc-obs-ledger-title .nc-obs-ledger-blocks')!.textContent).toBe('blocks release');
+      expect(btn.querySelector('.nc-obs-ledger-title')!.textContent).toContain('a thing');
       expect(btn.querySelector('.nc-obs-ledger-owner')!.textContent).toBe('ava');
       expect(btn.querySelector('.nc-obs-ledger-kind')!.textContent).toBe('finding');
       expect(btn.querySelector('.nc-obs-ledger-age')).toBeTruthy();
@@ -684,6 +687,65 @@ describe('Observatory', () => {
       const btn = container.querySelector('.nc-obs-ledger-btn')!;
       expect(btn.querySelector('.nc-obs-ledger-owner')!.textContent).toBe('—');
       expect(btn.querySelector('.nc-obs-ledger-blocks')).toBeFalsy();
+    });
+  });
+
+  describe('the headline as the queue filter', () => {
+    // "30 need a person" with no way to see WHICH thirty was the gap: the most
+    // decision-relevant slice had no entry point into the list.
+    const mixed = () => [
+      // unowned is nextMover 'nobody' — NOT merely a missing owner.
+      releaseItem({ id: 'U1', title: 'unowned one', nextMover: 'nobody' }),
+      releaseItem({ id: 'U2', title: 'unowned two', nextMover: 'nobody' }),
+      releaseItem({ id: 'P1', title: 'a person owes this', owner: 'kit', nextMover: 'human' }),
+      releaseItem({ id: 'M1', title: 'an agent is on it', owner: 'ava', nextMover: 'agent' }),
+    ];
+    const view = () => {
+      mockData(snapshot({ releaseState: releaseState({ items: mixed() }) }));
+      return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    };
+    const titles = (c: HTMLElement) =>
+      Array.from(c.querySelectorAll('.nc-obs-ledger-title')).map((e) => e.textContent);
+
+    it('lists everything that is not moving on its own until a slice is picked', () => {
+      const { container } = view();
+      expect(titles(container)).toEqual(['unowned one', 'unowned two', 'a person owes this']);
+    });
+
+    it('narrows the queue to the slice that was clicked, and names it in the header', async () => {
+      const { container } = view();
+      await userEvent.click(container.querySelector('.nc-of-slice')! as HTMLElement);
+      expect(titles(container)).toEqual(['a person owes this']);
+      expect(container.querySelector('.nc-of-board-n')!.textContent).toBe('need a person · 1 of 4');
+    });
+
+    it('picking "moving" WIDENS the queue — that slice is hidden by default', async () => {
+      const { container } = view();
+      const moving = container.querySelectorAll('.nc-of-slice')[1]!;
+      await userEvent.click(moving as HTMLElement);
+      expect(titles(container)).toEqual(['an agent is on it']);
+    });
+
+    it('clicking the same slice again clears it, and so does "show all"', async () => {
+      const { container } = view();
+      const person = container.querySelector('.nc-of-slice')! as HTMLElement;
+      await userEvent.click(person);
+      expect(person.getAttribute('aria-pressed')).toBe('true');
+      await userEvent.click(person);
+      expect(titles(container)).toHaveLength(3);
+
+      await userEvent.click(container.querySelector('.nc-of-hero')! as HTMLElement);
+      expect(titles(container)).toEqual(['unowned one', 'unowned two']);
+      await userEvent.click(container.querySelector('.nc-of-clearfilter')! as HTMLElement);
+      expect(titles(container)).toHaveLength(3);
+    });
+
+    it('clearing the filter does not collapse the board it filters', async () => {
+      const { container } = view();
+      await userEvent.click(container.querySelector('.nc-of-hero')! as HTMLElement);
+      const board = container.querySelector('details.nc-of-board') as HTMLDetailsElement;
+      await userEvent.click(container.querySelector('.nc-of-clearfilter')! as HTMLElement);
+      expect(board.open).toBe(true);
     });
   });
 
