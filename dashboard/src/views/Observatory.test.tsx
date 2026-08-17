@@ -308,11 +308,14 @@ describe('Observatory', () => {
     );
     const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
     const main = container.querySelector('.nc-obs-main')!;
-    const kids = Array.from(main.children);
-    // The office is the FIRST thing in the main column — the whole complaint
-    // was scrolling past ten pages of board to reach it. It is now the
-    // <office-map> card rather than the old CSS floor.
-    expect(kids[0]!.className).toContain('nc-of-mapcard');
+    // The office comes BEFORE every board in document order — the whole
+    // complaint was scrolling past ten pages of board to reach it. Asserted on
+    // order rather than on being the first child, because on a wide screen the
+    // floor and the boards are two columns.
+    const map = container.querySelector('.nc-of-mapcard')!;
+    const firstBoard = container.querySelector('details.nc-of-board')!;
+    expect(main.contains(map)).toBe(true);
+    expect(map.compareDocumentPosition(firstBoard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(container.querySelector('office-map')).toBeTruthy();
     const boards = Array.from(container.querySelectorAll('details.nc-of-board')) as HTMLDetailsElement[];
     expect(boards).toHaveLength(4);

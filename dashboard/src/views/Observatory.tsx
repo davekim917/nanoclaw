@@ -187,10 +187,14 @@ export function Observatory(_props: ObservatoryProps) {
                   tile-based, hand-authored plan with real furniture, pan, and
                   teleport. Geometry is FIXED; only who is in which room comes
                   from data. Replaces the CSS-rectangle floor entirely. */}
+              {/* The floor and the sheet that describes the room you picked are
+                  one thing; on a wide screen they hold still while the queue
+                  they filter scrolls beside them. */}
+              <div className="nc-of-left">
               <section className="nc-of-mapcard">
                 <div className="nc-of-mapcard-head">
                   <span className="nc-of-mapcard-title">The office</span>
-                  <span className="nc-of-mapcard-hint">tap a room to filter the queue</span>
+                  <span className="nc-of-mapcard-hint">drag to pan · tap a room to filter the queue</span>
                   {selectedRoom && (
                     <button type="button" className="nc-of-chip" onClick={() => setSelectedRoom('')}>
                       All rooms
@@ -219,13 +223,15 @@ export function Observatory(_props: ObservatoryProps) {
                       {r.label}
                     </button>
                   ))}
-                  {officeData.overflow.length > 0 && (
-                    <span className="nc-of-overflow">
-                      {officeData.overflow.length} more {officeData.overflow.length === 1 ? 'channel has' : 'channels have'}{' '}
-                      no room on this floor
-                    </span>
-                  )}
                 </div>
+                {officeData.overflow.length > 0 && (
+                  // Its own line: inside the chip row this dead-end sentence sat
+                  // on the same baseline as five controls and read as one.
+                  <p className="nc-of-overflow">
+                    {officeData.overflow.length} more{' '}
+                    {officeData.overflow.length === 1 ? 'channel has' : 'channels have'} no room on this floor
+                  </p>
+                )}
               </section>
 
               {selectedRoomAgents && (
@@ -266,10 +272,18 @@ export function Observatory(_props: ObservatoryProps) {
                 </aside>
               )}
 
+              </div>
+
+              <div className="nc-of-right">
               <details className="nc-of-board" open>
                 <summary className="nc-of-board-summary">
                   Needs attention{' '}
-                  <span className="nc-of-board-n">{ledgerCounts.breached + ledgerCounts.person}</span>
+                  {/* "62" alone read as a fourth, unexplained total. Against the
+                      denominator it is obviously the two slices that are not
+                      moving on their own. */}
+                  <span className="nc-of-board-n">
+                    {ledgerCounts.breached + ledgerCounts.person} of {ownerFilteredItems.length}
+                  </span>
                 </summary>
                 <div className="inner">
                   <LedgerBoard items={ownerFilteredItems} />
@@ -278,7 +292,7 @@ export function Observatory(_props: ObservatoryProps) {
 
               <details className="nc-of-board">
                 <summary className="nc-of-board-summary">
-                  Job Board <span className="nc-of-board-n">{ownerFilteredItems.length}</span>
+                  Job board <span className="nc-of-board-n">{ownerFilteredItems.length}</span>
                 </summary>
                 <div className="inner">
                   <ReleaseTallies
@@ -306,6 +320,7 @@ export function Observatory(_props: ObservatoryProps) {
                 <summary className="nc-of-board-summary">What&apos;s scheduled</summary>
                 <ScheduledSection agentGroupIds={agents.map((a) => a.id)} />
               </details>
+              </div>
             </div>
           </>
         )}
@@ -797,18 +812,27 @@ export function CommitmentStrip({ items }: { items: ReleaseItem[] }) {
           <span>
             <b className="go">{counts.onTrack}</b> moving on their own
           </span>
-          <span className="nc-of-sub-total">of {items.length} open commitments</span>
+          {/* The three numbers are DISJOINT slices of one denominator: every
+              commitment is in exactly one. Without saying so, a reader reads
+              30 and 8 as subsets of 32 and finds an arithmetic contradiction
+              where there is none. */}
+          <span className="nc-of-sub-total">{items.length} open commitments, split three ways</span>
         </div>
       </div>
-      {/* The gaps in the data, as one line each. They were full-bleed tinted
-          prose blocks; a lot of coloured surface spent above the list it
-          describes. */}
+      {/* The gaps in the data, one line each. These are never hidden — they
+          report that the numbers above are incomplete, and a collapsed
+          disclosure would soften exactly the thing that must not soften. On a
+          phone only the ELABORATION drops, so the claim still reads in full
+          while the block stops pushing the office below the fold. */}
       <div className="nc-of-notes">
         <p>
           <i className="warn" />
           <span>
-            <b>{ledger.datedPct}% of owned work has a deadline.</b> Nothing here can be measured as late, so
-            &ldquo;stalled&rdquo; undercounts.
+            <b>{ledger.datedPct}% of owned work has a deadline.</b>
+            <span className="nc-of-note-more">
+              {' '}
+              Nothing here can be measured as late, so &ldquo;stalled&rdquo; undercounts.
+            </span>
           </span>
         </p>
         {ledger.unclassifiedP1 > 0 && (
@@ -818,8 +842,8 @@ export function CommitmentStrip({ items }: { items: ReleaseItem[] }) {
               <b>
                 {ledger.unclassifiedP1} p1 security {ledger.unclassifiedP1 === 1 ? 'finding is' : 'findings are'} not
                 classified as release-blocking either way.
-              </b>{' '}
-              A person has to decide.
+              </b>
+              <span className="nc-of-note-more"> A person has to decide.</span>
             </span>
           </p>
         )}

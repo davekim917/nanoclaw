@@ -312,7 +312,9 @@
       agents: [],
     },
     garage: {
-      label: 'garage', floor: 'concrete', open: 2, state: 'idle', dead: true, wall: '#b3aea4',
+      // nanoclaw: open 2 -> 0. Only the five SLOT rooms take live counts, so the
+      // garage kept the authored demo number and rendered it as if it were real.
+      label: 'garage', floor: 'concrete', open: 0, state: 'idle', dead: true, wall: '#b3aea4',
       grid: [
         'CbbbS..ww.xC',
         'gg.S...d...x',

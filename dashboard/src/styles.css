@@ -1625,7 +1625,10 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    the floor. The claims wall stays a direct child of .nc-obs-main and in
    normal document flow — no fixed/sticky position, no independent scroll
    region. */
-.nc-of .nc-obs-main { display: grid; grid-template-columns: 1fr; gap: 0; align-items: start; }
+/* minmax(0,1fr), not 1fr: a bare `1fr` track has an AUTO minimum, so the
+   widest min-content inside it (the map's own intrinsic width) set the column
+   width and pushed the whole page past a 390px viewport. */
+.nc-of .nc-obs-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; align-items: start; }
 
 /* ─── JOB BOARD — a corkboard with pinned notes ──────────────────────────── */
 
@@ -1798,7 +1801,9 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* One system across every surface. The map is the only illustrated thing in
    the product; its container, and everything around it, is quiet light UI. */
 .nc-of{
-  --ink:#23201b; --ink-2:rgba(35,32,27,.62); --ink-3:rgba(35,32,27,.45);
+  /* Both muted tiers clear 4.5:1 on --card-2. The old --ink-3 (.45) measured
+     ~3.0:1 — quiet by near-invisibility rather than by rank. */
+  --ink:#23201b; --ink-2:rgba(35,32,27,.78); --ink-3:rgba(35,32,27,.66);
   --line:rgba(35,32,27,.10); --line-2:rgba(35,32,27,.16);
   --page:#efece5; --card:#faf7f2; --card-2:#fff;
   --accent:#3f68c9;
@@ -1815,6 +1820,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   background:var(--card-2); border-bottom:1px solid var(--line);
 }
 .nc-of .nc-of-bar-title{font-size:14.5px; font-weight:600; letter-spacing:-.01em}
+.nc-of .nc-of-mapcard-title,.nc-of .nc-of-board-summary{font-size:15px; letter-spacing:-.008em}
 .nc-of .nc-of-bar-meta{
   margin-left:auto; display:flex; align-items:center; gap:14px;
   font-size:12px; color:var(--ink-3);
@@ -1848,8 +1854,8 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-sub b.warn{color:var(--warn)} .nc-of .nc-of-sub b.go{color:var(--go)}
 .nc-of .nc-of-sub-total{margin-left:auto; color:var(--ink-3)}
 .nc-of .nc-of-notes{
-  width:430px; max-width:100%; display:flex; flex-direction:column; gap:10px;
-  border-left:1px solid var(--line); padding-left:20px;
+  width:400px; max-width:100%; display:flex; flex-direction:column; gap:10px;
+  justify-content:center; border-left:1px solid var(--line); padding-left:20px;
 }
 .nc-of .nc-of-notes p{margin:0; display:flex; gap:9px; align-items:flex-start; font-size:12.5px; line-height:1.45}
 .nc-of .nc-of-notes i{width:6px; height:6px; border-radius:50%; margin-top:5px; flex:none}
@@ -1876,9 +1882,38 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-mapcard-title{font-size:12.5px; font-weight:600; color:var(--ink)}
 .nc-of .nc-of-mapcard-hint{font-size:12px; color:var(--ink-3)}
 .nc-of .nc-of-mapcard-head .nc-of-chip{margin-left:auto}
+/* The plan is larger than any viewport, so the bottom edge always cuts through
+   furniture. The fade reads as "there is more below"; a hard edge read as the
+   illustration running out. */
+.nc-of office-map{
+  -webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 24px),transparent);
+  mask-image:linear-gradient(to bottom,#000 calc(100% - 24px),transparent);
+}
+/* The plan is bigger than any viewport, so the bottom edge is a cut through
+   furniture. The fade says "there is more, drag it" instead of "the image ran
+   out"; the hint says it in words for anyone who reads before dragging. */
 .nc-of .nc-of-teleport{
-  display:flex; gap:7px; padding:9px 12px; border-top:1px solid var(--line);
+  display:flex; gap:7px; padding:9px 12px 11px; border-top:1px solid var(--line);
   overflow-x:auto; align-items:center;
+  /* The row scrolls; without the fade the last chip reads as clipped-broken. */
+  mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);
+}
+.nc-of .nc-of-overflow{
+  margin:0; padding:0 12px 10px; font-size:11.5px; color:var(--ink-3);
+}
+
+/* Two columns once there is room for both: the floor holds still while the
+   queue it filters scrolls beside it. Below this the page is one column and
+   the floor is still the first thing under the headline. */
+/* 1600, not 1180: at 1440 the split cut every queue title mid-sentence, and
+   the title is the content. The map already pans, so it loses far less from a
+   narrow column than the list does. */
+@media (min-width:1600px){
+  .nc-of .nc-obs-main{
+    display:grid; grid-template-columns:minmax(0,38%) minmax(0,62%); gap:14px; align-items:start;
+  }
+  .nc-of .nc-of-left{position:sticky; top:12px}
+  .nc-of .nc-of-mapcard{margin-bottom:12px}
 }
 .nc-of .nc-of-chip{
   appearance:none; display:inline-flex; align-items:center; gap:6px; flex:none;
@@ -1892,12 +1927,18 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-sd.blocked{background:var(--stop)}
 .nc-of .nc-of-sd.waiting{background:var(--warn)}
 .nc-of .nc-of-sd.working{background:var(--go)}
-.nc-of .nc-of-overflow{font-size:11.5px; color:var(--ink-3); flex:none}
 /* Phone: the bar carries the title, the picker and the one live number. The
    agent/channel counts are reference, not signal, and pushed the live dot off
    the right edge — nothing may be wider than the viewport but the map. */
 @media (max-width:700px){
+  /* The claim survives; only the elaboration folds. The block was 150px tall
+     and pushed the office below the fold — the exact failure the floor is for. */
+  .nc-of .nc-of-note-more{display:none}
   .nc-of .nc-of-bar{gap:10px; padding:11px 14px}
+  /* Below ~420px the two-word title and the hint each wrapped mid-phrase. */
+  .nc-of .nc-of-bar-title{white-space:nowrap; font-size:13.5px}
+  .nc-of .nc-of-mapcard-head{flex-wrap:wrap; row-gap:2px}
+  .nc-of .nc-of-mapcard-title{flex:0 0 100%}
   .nc-of .nc-of-bar-meta{gap:10px; flex:none}
   .nc-of .nc-of-bar-count{display:none}
   .nc-of .nc-of-teleport{padding:9px 12px 9px 12px}
@@ -1948,12 +1989,19 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-ledger-btn{
   appearance:none; background:none; border:0; margin:0; width:100%; font:inherit; color:var(--ink);
   padding:10px 14px; min-height:44px; text-align:left; cursor:pointer;
-  display:grid; grid-template-columns:112px minmax(0,1fr) 104px 86px 52px;
+  display:grid; grid-template-columns:112px minmax(0,1fr) 84px 70px 46px;
   gap:12px; align-items:center;
 }
 .nc-of .nc-obs-ledger-btn:hover{background:rgba(35,32,27,.03)}
 .nc-of .nc-obs-ledger-btn:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
-.nc-of .nc-obs-ledger-lead{display:flex; flex-direction:column; align-items:flex-start; gap:3px; min-width:0}
+.nc-of .nc-obs-ledger-lead{
+  display:flex; flex-direction:column; align-items:flex-start; justify-content:center;
+  gap:3px; min-width:0; min-height:34px;
+}
+/* Every cell must be allowed to shrink, or one long title sets the row's
+   min-content width and the whole board grows past the viewport. */
+.nc-of .nc-obs-ledger-btn > *{min-width:0}
+.nc-of .nc-obs-ledger-title{overflow-wrap:anywhere}
 /* The due chip is the ONLY urgency encoding on the row — no bar, no row tint,
    no coloured title stacked on top of it. */
 .nc-of .nc-obs-ledger-due{
@@ -1965,10 +2013,14 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-ledger-due.undated{color:var(--ink-3)}
 .nc-of .nc-obs-ledger-blocks{
   font-size:10px; font-weight:600; letter-spacing:.01em; white-space:nowrap;
-  background:var(--stop); color:#fff; border-radius:4px; padding:1px 5px;
+  background:rgba(176,80,63,.13); color:var(--stop); border-radius:4px; padding:1px 5px;
 }
+/* Two lines before it truncates. The title is the content; ellipsing it at one
+   line to protect a fixed metadata column that is empty on most rows was the
+   wrong trade, and it is what made the narrow column unreadable. */
 .nc-of .nc-obs-ledger-title{
-  font-size:13px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  font-size:13px; min-width:0; line-height:1.35;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;
 }
 .nc-of .nc-obs-ledger-owner,.nc-of .nc-obs-ledger-kind,.nc-of .nc-obs-ledger-age{
   font-size:11.5px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
@@ -1999,7 +2051,9 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* Phone: the metadata columns fold under the title rather than crushing it. */
 @media (max-width:720px){
   .nc-of .nc-obs-ledger-btn{grid-template-columns:minmax(0,1fr) auto; gap:4px 10px; padding:11px 14px}
-  .nc-of .nc-obs-ledger-lead{grid-column:1; flex-direction:row; align-items:center}
+  /* justify-content is the CROSS axis once this flips to a row — left, not
+     centred, or the state chip drifts into the middle of the row. */
+  .nc-of .nc-obs-ledger-lead{grid-column:1; flex-direction:row; align-items:center; justify-content:flex-start}
   .nc-of .nc-obs-ledger-age{grid-column:2; grid-row:1}
   .nc-of .nc-obs-ledger-title{grid-column:1 / -1; white-space:normal}
   .nc-of .nc-obs-ledger-owner{grid-column:1}
