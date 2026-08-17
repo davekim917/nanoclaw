@@ -284,19 +284,75 @@ describe('observatorySteerHandler — a claim with no thread', () => {
 });
 
 describe('observatorySteerHandler — release-board items', () => {
-  it('declines rather than inventing a thread the board never published', async () => {
-    mockReleaseState.mockReturnValue({
-      asOf: '',
-      items: [{ id: 'XZ#1', kind: 'pr', title: 't', nextMover: 'agent' }],
-    } as never);
+  const itemsAre = (items: object[]) => mockReleaseState.mockReturnValue({ asOf: '', items } as never);
+
+  it('opens a thread in the room the BOARD gives the item, and steers into it', async () => {
+    const postParent = vi.fn().mockResolvedValue({ messageId: '1712999999.000100' });
+    const createThread = vi.fn().mockResolvedValue({ threadId: '1712999999.000100', messageId: '1713000000.000200' });
+    mockGetAdapter.mockReturnValue({ postParent, createThread } as never);
+    itemsAre([{ id: 'XZ#912', kind: 'pr', title: 'money writes', nextMover: 'agent', channel: '#qa-room' }]);
+
+    const res = (await steer(OWNER, {
+      workgroupId: 'wg-1',
+      itemId: 'XZ#912',
+      agentGroupId: 'ag-1',
+      text: 'ship it once CI is green',
+    }))!;
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      threadId: 'slack:C0EXAMPLE1:1712999999.000100',
+      threadCreated: true,
+    });
+    expect(postParent).toHaveBeenCalledWith('slack:C0EXAMPLE1', expect.stringContaining('XZ#912'));
+    expect(createThread).toHaveBeenCalledWith(
+      'slack:C0EXAMPLE1',
+      '1712999999.000100',
+      'XZ#912',
+      'ship it once CI is green',
+    );
+    expect(mockDispatch.mock.calls[0]![0].args.thread_id).toBe('slack:C0EXAMPLE1:1712999999.000100');
+    expect(mockDispatch.mock.calls[0]![0].args.prompt).toContain('XZ#912');
+  });
+
+  it('takes the room from the board, NOT from the request — a browser cannot redirect the post', async () => {
+    const postParent = vi.fn().mockResolvedValue({ messageId: '1.1' });
+    const createThread = vi.fn().mockResolvedValue({ threadId: '1.1', messageId: '1.2' });
+    mockGetAdapter.mockReturnValue({ postParent, createThread } as never);
+    itemsAre([{ id: 'XZ#912', kind: 'pr', title: 't', nextMover: 'agent', channel: '#qa-room' }]);
+
+    const res = (await steer(OWNER, {
+      workgroupId: 'wg-1',
+      itemId: 'XZ#912',
+      agentGroupId: 'ag-1',
+      text: 'x',
+      channel: '#somewhere-the-operator-typed',
+    }))!;
+
+    expect(res.status).toBe(200);
+    // #qa-room is the board's channel; the request's channel is ignored outright.
+    expect(postParent).toHaveBeenCalledWith('slack:C0EXAMPLE1', expect.anything());
+  });
+
+  it('reports an item with no room rather than picking one', async () => {
+    itemsAre([{ id: 'XZ#1', kind: 'pr', title: 't', nextMover: 'agent' }]);
     const res = (await steer(OWNER, { workgroupId: 'wg-1', itemId: 'XZ#1', agentGroupId: 'ag-1', text: 'ship it' }))!;
     expect(res.status).toBe(409);
-    expect(await res.json()).toMatchObject({ error: 'item_has_no_thread' });
+    expect(await res.json()).toMatchObject({ error: 'item_has_no_room' });
+    expect(mockDispatch).not.toHaveBeenCalled();
+  });
+
+  it('refuses a room this agent is not wired to', async () => {
+    itemsAre([{ id: 'XZ#2', kind: 'pr', title: 't', nextMover: 'agent', channel: '#not-wired' }]);
+    const res = (await steer(OWNER, { workgroupId: 'wg-1', itemId: 'XZ#2', agentGroupId: 'ag-1', text: 'x' }))!;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: 'agent_not_wired_to_channel' });
     expect(mockDispatch).not.toHaveBeenCalled();
   });
 
   it('404s an item that is not on the board at all', async () => {
-    mockReleaseState.mockReturnValue({ asOf: '', items: [] } as never);
+    itemsAre([]);
     const res = (await steer(OWNER, { workgroupId: 'wg-1', itemId: 'XZ#9', agentGroupId: 'ag-1', text: 'ship it' }))!;
     expect(res.status).toBe(404);
     expect(await res.json()).toMatchObject({ error: 'item_not_on_board' });

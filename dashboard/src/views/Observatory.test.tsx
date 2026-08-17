@@ -726,6 +726,47 @@ describe('Observatory', () => {
       expect(row.querySelector('.nc-obs-steer')).toBeFalsy(); // composer closes on success
     });
 
+    it('names the room a steer will OPEN a thread in, before it is sent', async () => {
+      // Viewed from the claims card a thread-less claim has no room, so it gets
+      // no composer at all; a claim WITH a thread says it continues that one.
+      const row = await expand(await open(), 'stuck');
+      await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-steer-target')!.textContent).toBe('goes into the existing thread');
+    });
+
+    it('steers a board item into the room the BOARD gives it', async () => {
+      mockSteer.mockResolvedValue({ ok: true, seriesId: 's4', threadUrl: 'https://example.com/t/9', threadCreated: true });
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'slack:C1', name: '#qa-room', memberAgentIds: ['ag-ava'] })],
+          agents: [agent({ id: 'ag-ava', name: 'ava' })],
+          releaseState: releaseState({
+            items: [releaseItem({ id: 'X#912', title: 'money writes', nextMover: 'agent', channel: '#qa-room' })],
+          }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      // The In-flight slice of the job board, where these rows actually live.
+      await segment(container, 'board');
+      await userEvent.click(container.querySelector('.nc-of-tab[data-tab="flight"]')! as HTMLElement);
+      await userEvent.click(container.querySelector('[data-ledger-id="X#912"] .nc-obs-ledger-btn')! as HTMLElement);
+
+      const actions = container.querySelector('.nc-obs-ledger-row .nc-obs-actions')! as HTMLElement;
+      await userEvent.selectOptions(actions.querySelector('.nc-obs-actions-who')! as HTMLSelectElement, 'ag-ava');
+      await userEvent.click(actions.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      // An item never has a thread yet, so the composer states the room it opens in.
+      expect(actions.querySelector('.nc-obs-steer-target')!.textContent).toBe('opens a new thread in #qa-room');
+
+      await userEvent.type(actions.querySelector('.nc-obs-steer textarea')! as HTMLElement, 'ship it');
+      await userEvent.click(actions.querySelector('.nc-obs-steer button')! as HTMLElement);
+      expect(mockSteer).toHaveBeenCalledWith('wg-1', { itemId: 'X#912' }, 'ag-ava', 'ship it', '#qa-room');
+
+      // The thread it opened is not persisted anywhere, so the row hands the
+      // operator the link rather than pretending it will still be there later.
+      const done = actions.querySelector('.nc-obs-actions-done')!;
+      expect(done.querySelector('a')!.getAttribute('href')).toBe('https://example.com/t/9');
+    });
+
     it('will not send an empty steer', async () => {
       const row = await expand(await open(), 'stuck');
       await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);

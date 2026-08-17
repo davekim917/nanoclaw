@@ -1069,6 +1069,9 @@ export function workRoom(
   return own ? { key: own } : (surface ?? {});
 }
 
+/** Room names arrive with and without the hash depending on the surface. */
+const hashed = (name?: string | null): string => (!name ? 'its room' : name.startsWith('#') ? name : `#${name}`);
+
 /** What a row IS, for the one component that acts on all of them. */
 export type WorkTarget =
   | {
@@ -1212,20 +1215,29 @@ function WorkActions({
           ))}
       </div>
       {composing && (
-        <div className="nc-obs-steer">
-          <textarea
-            aria-label="Steer message"
-            rows={2}
-            maxLength={2000}
-            placeholder={`say something to ${who}…`}
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            disabled={busy}
-          />
-          <button type="button" onClick={send} disabled={!text.trim() || busy}>
-            {busy ? 'sending…' : 'send'}
-          </button>
-        </div>
+        <>
+          {/* Where this is about to land, stated before it is sent. With no
+              thread yet the send OPENS one, and the room it opens in is the
+              thing an operator must be able to see and change their mind
+              about — the server is never the one choosing it. */}
+          <p className="nc-obs-steer-target">
+            {threadUrl ? 'goes into the existing thread' : `opens a new thread in ${hashed(room.name)}`}
+          </p>
+          <div className="nc-obs-steer">
+            <textarea
+              aria-label="Steer message"
+              rows={2}
+              maxLength={2000}
+              placeholder={`say something to ${who}…`}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              disabled={busy}
+            />
+            <button type="button" onClick={send} disabled={!text.trim() || busy}>
+              {busy ? 'sending…' : 'send'}
+            </button>
+          </div>
+        </>
       )}
       {state.phase === 'done' && (
         <div className="nc-obs-actions-done">

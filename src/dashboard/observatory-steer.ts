@@ -15,19 +15,24 @@
  * an attributed instruction from a named person rather than pasted as if the
  * system said it.
  *
- * Three thread outcomes, matching what each surface can honestly know:
+ * Nothing here ever GUESSES a room — nudge's barge-in doctrine holds — but a
+ * room that is already data is not a guess, and both callers have one:
  *
  * - **Claim with a thread** → post into it.
- * - **Claim with no thread** → the operator must NAME the room (`channel`).
- *   The server never picks one: nudge's comment is right that guessing a wired
- *   channel is a barge-in, and a claim file carries no channel of its own. A
- *   named room is a human decision, not a guess, so that case anchors a real
- *   parent + thread (support-threads' postParent → createThread precedent) and
- *   RECORDS the new `thread_id` back onto the claim file — the next steer, the
- *   next nudge and the board's own link all find it.
- * - **Release-board item** → 409 unless the board itself carries a thread.
- *   Items have no thread provenance at all (`ReleaseStateItem` has none, and
- *   the live board emits none), and inventing one is the barge-in again.
+ * - **Claim with no thread** → the operator NAMES the room (`channel`), because
+ *   a claim file carries no channel of its own. That anchors a real parent +
+ *   thread (support-threads' postParent → createThread precedent) and RECORDS
+ *   the new `thread_id` back onto the claim file, so the next steer, the next
+ *   nudge and the board's own link all continue the same conversation.
+ * - **Release-board item** → its room comes off the BOARD (`item.channel`,
+ *   the same field assign routes by and the queue renders as its Room column),
+ *   never off the request: the operator confirms the target in the composer,
+ *   but a browser can never redirect the post. Only an item with no channel at
+ *   all has nothing to aim at, and that is the one 409.
+ *
+ * The asymmetry that remains is honest and deliberate: an item has no file to
+ * write a thread id back to, so its thread is returned in the response and not
+ * persisted. See the `ponytail:` note at that branch.
  */
 import fs from 'fs';
 import path from 'path';
@@ -96,6 +101,54 @@ export function recordClaimThread(
   }
 }
 
+/**
+ * Anchor a real thread in one of this agent's wired rooms and return its
+ * encoded id — the support-threads postParent → createThread precedent.
+ *
+ * One implementation for both callers on purpose: a claim opening its first
+ * thread and a board item opening one differ only in what they call the thing,
+ * and two copies of this would drift on the wiring check that keeps an agent
+ * from being made to speak where it doesn't belong.
+ */
+async function openThreadFor(
+  agentGroupId: string,
+  channel: string,
+  announcement: string,
+  title: string,
+  firstMessage: string,
+): Promise<{ threadId: string; messagingGroupId: string } | { error: Response }> {
+  const wired = getDb()
+    .prepare(
+      `SELECT mg.id, mg.name, mg.platform_id, mg.channel_type
+         FROM messaging_group_agents mga
+         JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+        WHERE mga.agent_group_id = ?`,
+    )
+    .all(agentGroupId) as { id: string; name: string; platform_id: string; channel_type: string }[];
+  const target = wired.find((m) => channelKey(m.name) === channelKey(channel));
+  if (!target) return { error: json(409, { error: 'agent_not_wired_to_channel', channel }) };
+
+  const adapter = getChannelAdapter(target.channel_type);
+  if (!adapter || typeof adapter.postParent !== 'function' || typeof adapter.createThread !== 'function') {
+    return { error: json(409, { error: 'channel_cannot_open_threads', channel: target.name }) };
+  }
+
+  try {
+    const { messageId } = await adapter.postParent(target.platform_id, announcement);
+    const created = await adapter.createThread(target.platform_id, messageId, title.slice(0, 80), firstMessage);
+    // chat-sdk routes on the ENCODED thread id (`<platform_id>:<thread>`);
+    // createThread returns the bare one. Same normalization as
+    // orchestrator-dispatch and support-threads.
+    return {
+      threadId: created.threadId.includes(':') ? created.threadId : `${target.platform_id}:${created.threadId}`,
+      messagingGroupId: target.id,
+    };
+  } catch (err) {
+    log.warn('observatory steer: could not open a thread', { channel: target.name, err });
+    return { error: json(502, { error: 'thread_create_failed', channel: target.name }) };
+  }
+}
+
 interface SteerBody {
   workgroupId?: string;
   agentGroupId?: string;
@@ -137,6 +190,8 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
   const last = recentSends.get(dedupeKey);
   if (last && Date.now() - last < SEND_DEDUPE_MS) return json(429, { error: 'just_sent_that' });
 
+  const who = ctx.user.display_name ?? ctx.user.id;
+
   // ── Resolve the thread this steer lands in ────────────────────────────────
   let threadId: string;
   let messagingGroupId: string;
@@ -147,76 +202,75 @@ export const observatorySteerHandler: AuthHandler = async (req, _params, ctx) =>
   if (itemId) {
     const item = readReleaseState(workgroupId)?.items.find((i) => i.id === itemId);
     if (!item) return json(404, { error: 'item_not_on_board' });
-    // The release board is the item's only thread provenance and it publishes
-    // none. Assign is how an item gets a thread; steer will find it next time.
-    return json(409, {
-      error: 'item_has_no_thread',
-      hint: 'release-board items carry no thread — assign it to an agent first, then steer the claim it opens',
-    });
-  }
+    // The item's room comes off the BOARD, not off the request — the operator
+    // confirms it in the composer, but a browser can never redirect the post.
+    // No channel is the one case with nothing to aim at.
+    if (!item.channel) {
+      return json(409, {
+        error: 'item_has_no_room',
+        hint: 'the board records no room for this item — nothing to open a thread in',
+      });
+    }
+    subject = `the board item ${item.id} — "${item.title}"`;
+    const opened = await openThreadFor(
+      agentGroupId,
+      item.channel,
+      `${item.id} — steered from the Observatory by ${who}`,
+      item.id,
+      text,
+    );
+    if ('error' in opened) return opened.error;
+    threadId = opened.threadId;
+    messagingGroupId = opened.messagingGroupId;
+    threadCreated = true;
+    // ponytail: an item has no file to write a thread_id back to, so a later
+    // steer opens ANOTHER thread rather than continuing this one. The response
+    // carries the link so the operator at least keeps it. Upgrade path: the
+    // release watcher persisting `threadId` on the item it publishes — that is
+    // its file to own, not ours.
+  } else {
+    const claim = readClaims(workgroupId, Date.now()).find((c) => c.slug === claimSlug);
+    if (!claim) return json(404, { error: 'claim_not_found' });
+    subject = `the claim \`${claim.slug}\` (owner: ${claim.owner})`;
 
-  const claim = readClaims(workgroupId, Date.now()).find((c) => c.slug === claimSlug);
-  if (!claim) return json(404, { error: 'claim_not_found' });
-  subject = `the claim \`${claim.slug}\` (owner: ${claim.owner})`;
-
-  if (claim.threadId) {
-    // Same rule as nudge: an agent can only be made to speak where it belongs.
-    const target = getDb()
-      .prepare(
-        `SELECT mg.id, mg.name
+    if (claim.threadId) {
+      // Same rule as nudge: an agent can only be made to speak where it belongs.
+      const target = getDb()
+        .prepare(
+          `SELECT mg.id, mg.name
            FROM messaging_group_agents mga
            JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
           WHERE mga.agent_group_id = ? AND mg.platform_id = ?`,
-      )
-      .get(agentGroupId, threadPlatformId(claim.threadId)) as { id: string; name: string } | undefined;
-    if (!target) return json(409, { error: 'agent_not_wired_to_thread_channel' });
-    threadId = claim.threadId;
-    messagingGroupId = target.id;
-  } else {
-    if (!body.channel) {
-      return json(409, {
-        error: 'claim_has_no_thread',
-        hint: 'name the room to open one — the server will not pick a channel for you',
-      });
-    }
-    const wired = getDb()
-      .prepare(
-        `SELECT mg.id, mg.name, mg.platform_id, mg.channel_type
-           FROM messaging_group_agents mga
-           JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
-          WHERE mga.agent_group_id = ?`,
-      )
-      .all(agentGroupId) as { id: string; name: string; platform_id: string; channel_type: string }[];
-    const target = wired.find((m) => channelKey(m.name) === channelKey(body.channel!));
-    if (!target) return json(409, { error: 'agent_not_wired_to_channel', channel: body.channel });
-
-    const adapter = getChannelAdapter(target.channel_type);
-    if (!adapter || typeof adapter.postParent !== 'function' || typeof adapter.createThread !== 'function') {
-      return json(409, { error: 'channel_cannot_open_threads', channel: target.name });
-    }
-
-    const who = ctx.user.display_name ?? ctx.user.id;
-    try {
-      const { messageId } = await adapter.postParent(
-        target.platform_id,
+        )
+        .get(agentGroupId, threadPlatformId(claim.threadId)) as { id: string; name: string } | undefined;
+      if (!target) return json(409, { error: 'agent_not_wired_to_thread_channel' });
+      threadId = claim.threadId;
+      messagingGroupId = target.id;
+    } else {
+      if (!body.channel) {
+        return json(409, {
+          error: 'claim_has_no_thread',
+          hint: 'name the room to open one — the server will not pick a channel for you',
+        });
+      }
+      const opened = await openThreadFor(
+        agentGroupId,
+        body.channel,
         `${claim.slug} — steered from the Observatory by ${who}`,
+        claim.slug,
+        text,
       );
-      const created = await adapter.createThread(target.platform_id, messageId, claim.slug.slice(0, 80), text);
-      // chat-sdk routes on the ENCODED thread id (`<platform_id>:<thread>`);
-      // createThread returns the bare one. Same normalization as
-      // orchestrator-dispatch and support-threads.
-      threadId = created.threadId.includes(':') ? created.threadId : `${target.platform_id}:${created.threadId}`;
-    } catch (err) {
-      log.warn('observatory steer: could not open a thread', { claimSlug, channel: target.name, err });
-      return json(502, { error: 'thread_create_failed', channel: target.name });
+      if ('error' in opened) return opened.error;
+      threadId = opened.threadId;
+      messagingGroupId = opened.messagingGroupId;
+      threadCreated = true;
+      // Unlike an item, a claim HAS a file — so the thread we just opened becomes
+      // its thread, and the next steer continues the conversation.
+      recordedOnClaim = recordClaimThread(workgroupId, claim.slug, threadId);
     }
-    messagingGroupId = target.id;
-    threadCreated = true;
-    recordedOnClaim = recordClaimThread(workgroupId, claim.slug, threadId);
   }
 
   // ── The steer itself ──────────────────────────────────────────────────────
-  const who = ctx.user.display_name ?? ctx.user.id;
   const prompt =
     `${who} steered this from the Observatory — on ${subject}.\n\n` +
     `They said, verbatim:\n"""\n${text}\n"""\n\n` +
