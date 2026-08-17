@@ -175,8 +175,18 @@ export function buildOfficeData(
   rooms.forEach((room, i) => {
     const slot = slotOf.get(i);
     if (!slot) { overflow.push(room.name); return; }
+    // A room always seats its WIRED members — an idle one sits there asleep
+    // rather than vanishing. Agents actually working here (location === this
+    // room) sort first so the seat cap favors what's live; ties break by name
+    // for a stable floor.
+    const memberIds = new Set(room.memberAgentIds);
     const here: OfficeAgent[] = agents
-      .filter((a) => a.location === room.key)
+      .filter((a) => memberIds.has(a.id))
+      .sort((a, b) => {
+        const aHere = a.location === room.key ? 0 : 1;
+        const bHere = b.location === room.key ? 0 : 1;
+        return aHere - bHere || a.name.localeCompare(b.name);
+      })
       // The plan seats a bounded number per room; extra occupants would have
       // nowhere to sit, so they stay in the list rather than overlapping.
       .slice(0, 2)

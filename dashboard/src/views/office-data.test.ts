@@ -30,26 +30,58 @@ describe('buildOfficeData', () => {
     expect(buildOfficeData([room('k', '#already')], []).rooms[0]!.label).toBe('#already');
   });
 
-  it('seats agents in the room they are located in, and nobody in rooms they are not', () => {
+  it('seats a room its wired members, not agents merely located there', () => {
+    const r1 = { ...room('r1'), memberAgentIds: ['ava'] };
+    const r2 = { ...room('r2'), memberAgentIds: ['kit'] };
     const d = buildOfficeData(
-      [room('r1'), room('r2')],
+      [r1, r2],
       [agent('ava', { location: 'r1' }), agent('kit', { location: 'r2' }), agent('zed', { location: null })],
     );
     expect(d.rooms[0]!.agents.map((a) => a.name)).toEqual(['ava']);
     expect(d.rooms[1]!.agents.map((a) => a.name)).toEqual(['kit']);
   });
 
-  it('carries each seated agent its real avatar, and null when it has none', () => {
+  it('a wired member who is not doing anything still sits in the room, asleep', () => {
+    const r1 = { ...room('r1'), memberAgentIds: ['ava'] };
+    const d = buildOfficeData([r1], [agent('ava', { awake: false, location: null })]);
+    expect(d.rooms[0]!.agents.map((a) => a.name)).toEqual(['ava']);
+    expect(d.rooms[0]!.agents[0]!.status).toBe('idle');
+  });
+
+  it('a working member sorts before an idle member when the seat cap bites', () => {
+    const r1 = { ...room('r1'), memberAgentIds: ['ava', 'kit', 'zed'] };
     const d = buildOfficeData(
-      [room('r1')],
+      [r1],
+      [
+        agent('ava', { awake: false, location: null }),
+        agent('kit', { awake: true, location: 'r1' }),
+        agent('zed', { awake: false, location: null }),
+      ],
+    );
+    expect(d.rooms[0]!.agents.map((a) => a.name)).toEqual(['kit', 'ava']);
+  });
+
+  it('an agent wired to two rooms appears in both', () => {
+    const r1 = { ...room('r1'), memberAgentIds: ['ava'] };
+    const r2 = { ...room('r2'), memberAgentIds: ['ava'] };
+    const d = buildOfficeData([r1, r2], [agent('ava', { location: 'r1' })]);
+    expect(d.rooms[0]!.agents.map((a) => a.name)).toEqual(['ava']);
+    expect(d.rooms[1]!.agents.map((a) => a.name)).toEqual(['ava']);
+  });
+
+  it('carries each seated agent its real avatar, and null when it has none', () => {
+    const r1 = { ...room('r1'), memberAgentIds: ['ava', 'kit'] };
+    const d = buildOfficeData(
+      [r1],
       [agent('ava', { location: 'r1', avatarUrl: 'https://cdn.example/ava_192.png' }), agent('kit', { location: 'r1' })],
     );
     expect(d.rooms[0]!.agents.map((a) => a.avatarUrl)).toEqual(['https://cdn.example/ava_192.png', null]);
   });
 
   it('caps occupants at the seats the plan actually draws', () => {
+    const r1 = { ...room('r1'), memberAgentIds: ['a', 'b', 'c', 'd'] };
     const crowd = ['a', 'b', 'c', 'd'].map((n) => agent(n, { location: 'r1' }));
-    expect(buildOfficeData([room('r1')], crowd).rooms[0]!.agents).toHaveLength(2);
+    expect(buildOfficeData([r1], crowd).rooms[0]!.agents).toHaveLength(2);
   });
 
   it('publishes no open count while items carry no channel — an invented number is worse than none', () => {
