@@ -339,19 +339,49 @@ export function roomPermalink(platform: string, platformId: string): string | nu
 }
 
 /**
- * Permalink for a claim's thread. A claim's `thread_id` already encodes its
- * channel type + channel + ts, so the adapter that owns that platform resolves
- * it — one hop, no extra state. Exported: the claims board and the nudge write
- * path must link to the same place.
+ * Channel types that could own this thread, best first.
+ *
+ * A thread id's prefix is the bare PLATFORM (`slack:C0AAA:171…`), which is a
+ * registered adapter key only in a single-workspace install. This install
+ * registers per-workspace types (`slack-acme`, `slack-acme-support`, …), so
+ * the bare prefix matched nothing and every genuine Slack thread resolved
+ * to null. `messaging_groups` already carries the mapping — the
+ * thread's channel is one row's `platform_id` — so ask it, and keep the bare
+ * prefix as the last candidate for installs where it IS the key.
+ *
+ * All rows for one `platform_id` are the same workspace (channel ids don't
+ * collide across workspaces), so which sibling type wins doesn't change the
+ * resulting link — only whether the owning adapter happens to be online.
+ */
+function threadChannelTypes(threadId: string): string[] {
+  const prefix = threadId.split(':')[0] ?? '';
+  try {
+    const rows = getDb()
+      .prepare(`SELECT DISTINCT channel_type FROM messaging_groups WHERE platform_id = ? ORDER BY channel_type`)
+      .all(threadPlatformId(threadId)) as { channel_type: string }[];
+    return [...rows.map((r) => r.channel_type), prefix];
+  } catch {
+    // No DB (early boot, unit tests) — the bare prefix is the only candidate.
+    return [prefix];
+  }
+}
+
+/**
+ * Permalink for a claim's thread, or null when no online adapter can build one
+ * exactly. Exported: the claims board and the nudge write path must link to the
+ * same place. Never throws — a dead link is worse than none, and a blank scene
+ * is worse than both.
  */
 export function threadPermalink(threadId: string): string | null {
-  const adapter = getChannelAdapter(threadId.split(':')[0] ?? '');
-  if (!adapter?.permalink) return null;
-  try {
-    return adapter.permalink(threadPlatformId(threadId), threadId);
-  } catch {
-    return null;
+  for (const channelType of threadChannelTypes(threadId)) {
+    try {
+      const link = getChannelAdapter(channelType)?.permalink?.(threadPlatformId(threadId), threadId);
+      if (link) return link;
+    } catch {
+      continue;
+    }
   }
+  return null;
 }
 
 /** '<channelType>:<channel>:<ts>' → '<channelType>:<channel>', the messaging_groups.platform_id key. */

@@ -15,9 +15,18 @@ vi.mock('../../config.js', async (importOriginal) => ({
   DATA_DIR: '/tmp/nanoclaw-observatory-api-test',
 }));
 
+// The registry's live adapter map has no injection seam (adapters self-register
+// on import and are instantiated by initChannelAdapters), so permalink
+// resolution is exercised through a mocked lookup. Default: nothing registered,
+// which is exactly what every pre-existing test in this file already saw.
+vi.mock('../../channels/channel-registry.js', () => ({
+  getChannelAdapter: vi.fn(() => undefined),
+}));
+
 const TEST_DIR = '/tmp/nanoclaw-observatory-api-test';
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
+import { getChannelAdapter } from '../../channels/channel-registry.js';
 import {
   buildObservatoryScene,
   observatoryHandler,
@@ -25,6 +34,7 @@ import {
   isNotARoom,
   readReleaseState,
   readOfficeThemes,
+  threadPermalink,
   type ObservatoryDeps,
 } from './observatory.js';
 import type { AuthedRequestContext } from '../router.js';
@@ -617,5 +627,92 @@ describe('observatoryHandler', () => {
     const body = (await res.json()) as { workgroupId: string; agents: { id: string }[] };
     expect(body.workgroupId).toBe('wg-1');
     expect(body.agents.map((a) => a.id)).toEqual(['ag-1']);
+  });
+});
+
+describe('threadPermalink — multi-workspace adapter resolution', () => {
+  /** Registers adapters under EXACT channel-type keys, the way a live install does. */
+  function registerAdapters(byChannelType: Record<string, { permalink?: (p: string, t: string) => string | null }>) {
+    vi.mocked(getChannelAdapter).mockImplementation(
+      (key: string) => byChannelType[key] as ReturnType<typeof getChannelAdapter>,
+    );
+  }
+
+  beforeEach(() => {
+    vi.mocked(getChannelAdapter).mockImplementation(() => undefined);
+  });
+
+  it('resolves through the workspace-specific channel_type the thread’s channel is wired to', () => {
+    addMessagingGroup('mg-a', 'slack-acme-support', 'slack:C0AAA', '#dispatch');
+
+    // Only the workspace-specific key is registered — the bare "slack" prefix
+    // is not an adapter key in a multi-workspace install. This is the bug:
+    // before the mg lookup, every genuine Slack thread resolved to null here.
+    registerAdapters({
+      'slack-acme-support': { permalink: (p, t) => `https://acme.slack.com/archives/${p}/${t}` },
+    });
+
+    expect(threadPermalink('slack:C0AAA:1786901676.029669')).toBe(
+      'https://acme.slack.com/archives/slack:C0AAA/slack:C0AAA:1786901676.029669',
+    );
+  });
+
+  it('falls back to the bare platform prefix for a single-workspace install', () => {
+    // No messaging_groups row for this channel at all — the prefix IS the key.
+    registerAdapters({ slack: { permalink: () => 'https://one.slack.com/archives/C0BBB/p1786901676029669' } });
+
+    expect(threadPermalink('slack:C0BBB:1786901676.029669')).toBe(
+      'https://one.slack.com/archives/C0BBB/p1786901676029669',
+    );
+  });
+
+  it('skips a sibling type whose adapter is offline and keeps trying the rest', () => {
+    addMessagingGroup('mg-b1', 'slack-acme-alpha', 'slack:C0CCC', '#dispatch');
+    addMessagingGroup('mg-b2', 'slack-acme-beta', 'slack:C0CCC', '#dispatch');
+
+    // alpha sorts first but is not registered; beta must still answer.
+    registerAdapters({ 'slack-acme-beta': { permalink: () => 'https://acme.slack.com/archives/C0CCC/p1' } });
+
+    expect(threadPermalink('slack:C0CCC:1786901676.029669')).toBe('https://acme.slack.com/archives/C0CCC/p1');
+  });
+
+  it('returns null for a platform no adapter owns — including non-channel thread ids', () => {
+    registerAdapters({ 'slack-acme-support': { permalink: () => 'https://acme.slack.com/archives/x/p1' } });
+
+    // A task thread id ('system:tasks:<slug>') is not a channel and must not
+    // be talked into one.
+    expect(threadPermalink('system:tasks:nightly-sweep-f2ee')).toBeNull();
+    expect(threadPermalink('teams:19:meeting')).toBeNull();
+  });
+
+  it('never throws when the owning adapter does', () => {
+    addMessagingGroup('mg-c', 'slack-acme-support', 'slack:C0DDD', '#dispatch');
+    registerAdapters({
+      'slack-acme-support': {
+        permalink: () => {
+          throw new Error('adapter exploded');
+        },
+      },
+    });
+
+    expect(threadPermalink('slack:C0DDD:1786901676.029669')).toBeNull();
+  });
+
+  it('carries the resolved link onto every claim on the board', async () => {
+    addWorkgroup('wg-tp');
+    addGroup('ag-tp', 'wg-tp', 'ava', 'ava-folder');
+    addMessagingGroup('mg-tp', 'slack-acme-support', 'slack:C0EEE', '#dispatch');
+    wire('mg-tp', 'ag-tp');
+    registerAdapters({ 'slack-acme-support': { permalink: () => 'https://acme.slack.com/archives/C0EEE/p1' } });
+    writeClaim('wg-tp', 'money', {
+      slug: 'money',
+      owner: 'ava',
+      state: 'active',
+      thread_id: 'slack:C0EEE:1786901676.029669',
+      claimed_at: new Date().toISOString(),
+    });
+
+    const scene = await buildObservatoryScene('wg-tp', makeDeps());
+    expect(scene.claims.map((c) => c.threadUrl)).toEqual(['https://acme.slack.com/archives/C0EEE/p1']);
   });
 });
