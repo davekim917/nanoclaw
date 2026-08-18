@@ -33,6 +33,7 @@ import {
 } from './api/workgroups.js';
 import { observatoryHandler } from './api/observatory.js';
 import { observatoryAssignHandler } from './assign.js';
+import { observatoryIssueBriefHandler } from './issue-brief.js';
 import { observatoryNudgeHandler } from './nudge.js';
 import { observatorySteerHandler } from './observatory-steer.js';
 
@@ -40,6 +41,7 @@ import { observatorySteerHandler } from './observatory-steer.js';
 import './auth/exchange.js'; // POST /dashboard/api/auth/exchange
 import './api/auth-me.js'; // GET /dashboard/api/auth/me
 import './auth/dashboard-token-issue.js'; // registers 'dashboard_token_issue' intercept handler
+import './auth/dashboard-token-slash-command.js'; // registers native '/dashboard-token' slash-command handler
 
 let started = false;
 
@@ -82,6 +84,7 @@ export function startDashboard(): void {
   register('POST', '/dashboard/api/observatory/assign', requireAuth(observatoryAssignHandler));
   register('POST', '/dashboard/api/observatory/nudge', requireAuth(observatoryNudgeHandler));
   register('POST', '/dashboard/api/observatory/steer', requireAuth(observatorySteerHandler));
+  register('GET', '/dashboard/api/observatory/issue-brief', requireAuth(observatoryIssueBriefHandler));
 
   // Scheduled Tasks Board — 10 routes (design §3b + prompt/title search). The
   // `scheduled` namespace is distinct from `tasks` (the spawn board owns that).

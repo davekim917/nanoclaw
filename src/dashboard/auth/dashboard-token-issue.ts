@@ -7,13 +7,14 @@ import { registerInterceptHandler } from '../../command-gate.js';
 import type { InterceptContext } from '../../command-gate.js';
 import { log } from '../../log.js';
 
-export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> {
-  const mg = getMessagingGroup(ctx.replyMessagingGroupId);
-  if (!mg) {
-    log.error('dashboardTokenIssue: messaging group not found', { replyMessagingGroupId: ctx.replyMessagingGroupId });
-    return;
-  }
-
+/**
+ * Mint a fresh dashboard token for `userId` and build its one-shot login URL.
+ * Shared by every entry point that can issue a dashboard link — the chat
+ * intercept command below and the native Slack slash-command handler
+ * (`../../channels/slash-commands.ts`) — so the token/HMAC/URL logic exists
+ * exactly once.
+ */
+export function mintDashboardTokenUrl(userId: string): { url: string; ttlHours: number } {
   const rawToken = crypto.randomBytes(32).toString('hex');
   const serverKey = resolveServerKey();
   const tokenHmac = crypto.createHmac('sha256', serverKey).update(rawToken).digest('hex');
@@ -22,7 +23,7 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
   // server-side cookie expiry and client-side cookie deletion end at the
   // same wall-clock time — both read from `dashboardSessionTtlHours()`.
   const ttlHours = dashboardSessionTtlHours();
-  issueDashboardToken(ctx.userId, tokenHmac, ttlHours);
+  issueDashboardToken(userId, tokenHmac, ttlHours);
 
   // Build the URL to send to the user. Three env vars give precise control:
   //   NANOCLAW_DASHBOARD_URL      — full URL (e.g. https://dash.example.com); takes precedence
@@ -40,6 +41,22 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
     return `${protocol}://${host}:${port}/observatory/`;
   })();
 
+  // The token rides in the URL FRAGMENT, which browsers never send to the
+  // server, so it cannot land in an access or proxy log on the way in; the
+  // SPA reads it, exchanges it, and scrubs it from the address bar and
+  // history. Single-use and TTL-bound either way.
+  return { url: `${dashboardUrl}#token=${rawToken}`, ttlHours };
+}
+
+export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> {
+  const mg = getMessagingGroup(ctx.replyMessagingGroupId);
+  if (!mg) {
+    log.error('dashboardTokenIssue: messaging group not found', { replyMessagingGroupId: ctx.replyMessagingGroupId });
+    return;
+  }
+
+  const { url, ttlHours } = mintDashboardTokenUrl(ctx.userId);
+
   const adapter = getDeliveryAdapter();
   if (adapter) {
     await adapter.deliver(
@@ -48,12 +65,8 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
       null,
       'chat',
       JSON.stringify({
-        // One clickable link, not a token to copy by hand. The token rides in
-        // the URL FRAGMENT, which browsers never send to the server, so it
-        // cannot land in an access or proxy log on the way in; the SPA reads
-        // it, exchanges it, and scrubs it from the address bar and history.
-        // Single-use and TTL-bound either way.
-        text: `Open your dashboard (valid ${formatTtl(ttlHours)}, works once):\n${dashboardUrl}#token=${rawToken}`,
+        // One clickable link, not a token to copy by hand.
+        text: `Open your dashboard (valid ${formatTtl(ttlHours)}, works once):\n${url}`,
       }),
     );
   } else {
@@ -61,7 +74,7 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
   }
 }
 
-function formatTtl(hours: number): string {
+export function formatTtl(hours: number): string {
   if (hours >= 24 && hours % 24 === 0) {
     const days = hours / 24;
     return days === 1 ? '1 day' : `${days} days`;

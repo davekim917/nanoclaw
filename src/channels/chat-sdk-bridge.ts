@@ -17,6 +17,7 @@ import {
   type Adapter,
   type ConcurrencyStrategy,
   type Message as ChatMessage,
+  type SlashCommandEvent,
   toPlainText,
   getNodeChildren,
   isListNode,
@@ -51,6 +52,27 @@ export interface ReplyContext {
   text: string;
   sender: string;
   senderId?: string;
+}
+
+/**
+ * Registry for native platform slash-command handlers (e.g. Slack's
+ * registered `/dashboard-token`) — the same decoupling shape as
+ * `command-gate.ts`'s INTERCEPT_COMMANDS registry, so this generic bridge
+ * never has to import a specific feature's handler directly. Every Chat SDK
+ * adapter dispatches through the one shared map below; a command with no
+ * registered handler is silently ignored (harmless for adapters — e.g.
+ * Discord — that never emit `SlashCommandEvent` at all).
+ */
+export type SlashCommandHandler = (event: SlashCommandEvent) => Promise<void>;
+
+const slashCommandHandlers = new Map<string, SlashCommandHandler>();
+
+export function registerSlashCommandHandler(command: string, handler: SlashCommandHandler): void {
+  slashCommandHandlers.set(command, handler);
+}
+
+export function clearSlashCommandHandlers(): void {
+  slashCommandHandlers.clear();
 }
 
 /** Extract reply context from a platform-specific raw message. Return null if no reply. */
@@ -1098,6 +1120,25 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         }
 
         setupConfig.onAction(questionId, selectedOption, userId);
+      });
+
+      // Native slash commands (e.g. Slack's registered `/dashboard-token`,
+      // once added to the app manifest — see docs/slack-slash-commands.md).
+      // The SDK acks the platform request before this handler runs (see
+      // @chat-adapter/slack's handleSlashCommand/routeSocketEvent), so a slow
+      // handler never risks Slack's 3s ack timeout.
+      chat.onSlashCommand(async (event) => {
+        const handler = slashCommandHandlers.get(event.command);
+        if (!handler) return;
+        try {
+          await handler(event);
+        } catch (err) {
+          log.error('Slash command handler threw', {
+            command: event.command,
+            adapter: adapter.name,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
       });
 
       await chat.initialize();
