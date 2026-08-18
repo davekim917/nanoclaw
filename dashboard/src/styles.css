@@ -2024,7 +2024,9 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    full-width table row. */
 .nc-of .nc-obs-actions{margin-top:9px; min-width:0}
 .nc-of .nc-obs-actions-row{display:flex; gap:8px; align-items:center; flex-wrap:wrap; min-width:0}
-.nc-of .nc-obs-actions-who{
+/* One control grammar for both selects on the row — which room, then who. */
+.nc-of .nc-obs-actions-who,
+.nc-of .nc-obs-actions-room{
   font:inherit; font-size:12.5px; color:var(--ink); background:var(--card-2);
   border:1px solid var(--line-2); border-radius:7px; padding:5px 8px; min-height:34px; max-width:100%;
 }

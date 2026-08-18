@@ -1276,20 +1276,43 @@ function WorkActions({
    */
   decide?: { prefill: string };
 }) {
-  const choices = wiring ? agentsForRoom(wiring.agents, wiring.rooms, room) : [];
-  // Somewhere for the ask to LAND: the work's own thread, or a room named by
-  // the surface it is being viewed in (which is what lets the server open one).
-  // Neither means no action is offered at all — a button whose only outcome is
-  // the server refusing it is worse than the honest empty state beside it.
-  const canLand = Boolean(threadUrl) || Boolean(room.name);
+  // The thread this row knows about. `threadUrl` is what the snapshot said;
+  // `opened` is what a send just created — a steer that OPENS a thread hands it
+  // back in the response, and the row must not keep claiming it has none for
+  // the fifteen seconds until the next poll agrees.
+  const [opened, setOpened] = useState<string | null>(null);
+  const liveThreadUrl = threadUrl ?? opened;
+
+  // A claim with no thread has no room of its own, and no surface to borrow one
+  // from when it is looked at on the claims card. That used to end the row: no
+  // room, no controls. But "which room does this open in" is a human's decision
+  // the server has always been willing to take (steer's `channel`), so the row
+  // ASKS instead of going quiet. Only offered where there is genuinely nothing
+  // else to aim at — a row with a thread, or viewed inside a room, never sees it.
+  const [pickedRoom, setPickedRoom] = useState('');
+  const roomChoices = wiring?.rooms ?? [];
+  const needsRoom = !liveThreadUrl && !room.name && roomChoices.length > 0;
+  const land = needsRoom && pickedRoom ? { name: pickedRoom } : room;
+
+  const choices = wiring ? agentsForRoom(wiring.agents, wiring.rooms, land) : [];
+  // Somewhere for the ask to LAND: the work's own thread, or a room — named by
+  // the surface it is being viewed in, or picked above (either lets the server
+  // open one). Neither means no action is offered at all — a button whose only
+  // outcome is the server refusing it is worse than the honest empty state.
+  const canLand = Boolean(liveThreadUrl) || Boolean(land.name);
   // Whether this row can send AT ALL. The Decisions view opens the composer on
   // expand, so this gate matters: a member, or a row with nowhere to land,
   // would otherwise get a prefilled box whose send can only ever be refused.
   const canSteer = Boolean(wiring) && canLand && choices.length > 0;
 
-  const [agentId, setAgentId] = useState(
+  const [rawAgentId, setAgentId] = useState(
     ownerAgent && choices.some((a) => a.id === ownerAgent) ? ownerAgent : '',
   );
+  // Picking a room re-narrows the addressees, so an agent chosen against the
+  // PREVIOUS room can fall out of the list. The select would render blank while
+  // the state still held them — and the send would then go to somebody the
+  // operator can no longer see. Nobody is the honest reading of that.
+  const agentId = choices.some((a) => a.id === rawAgentId) ? rawAgentId : '';
   const [composing, setComposing] = useState(Boolean(decide) && canSteer);
   const [text, setText] = useState(decide?.prefill ?? '');
   const box = useRef<HTMLTextAreaElement>(null);
@@ -1341,23 +1364,47 @@ function WorkActions({
     if (!wiring || !agentId || !text.trim()) return;
     setState({ phase: 'busy' });
     try {
-      const where = target.kind === 'claim' ? { claimSlug: target.slug } : { itemId: target.id };
-      const r = await steerWork(wiring.workgroupId, where, agentId, text.trim(), room.name ?? undefined);
+      const what = target.kind === 'claim' ? { claimSlug: target.slug } : { itemId: target.id };
+      const r = await steerWork(wiring.workgroupId, what, agentId, text.trim(), land.name ?? undefined);
       setText('');
       setComposing(false);
+      // The thread the server just opened is this row's thread from now on —
+      // for a claim the server also records it back onto the claim file, so
+      // the next poll agrees. Until then, this is what stops the row from
+      // offering to open a SECOND one.
+      if (r.threadUrl) setOpened(r.threadUrl);
       setState({ phase: 'done', note: `sent — ${who} was asked in the thread`, ...(r.threadUrl ? { url: r.threadUrl } : {}) });
     } catch (e) {
-      setState({ phase: 'error', note: actionError(e, who, room.name ?? undefined) });
+      setState({ phase: 'error', note: actionError(e, who, land.name ?? undefined) });
     }
   };
 
   return (
     <div className="nc-obs-actions" data-actions={target.kind}>
       <div className="nc-obs-actions-row">
-        {threadUrl ? (
-          <OutLink href={threadUrl}>open thread</OutLink>
+        {liveThreadUrl ? (
+          <OutLink href={liveThreadUrl}>open thread</OutLink>
         ) : (
           <span className="nc-of-sheet-nothread">no thread recorded</span>
+        )}
+        {/* The one question this row cannot answer for itself. Nothing is
+            offered downstream of it until it is answered — picking a room is
+            what gives the ask somewhere to land. */}
+        {wiring && needsRoom && (
+          <select
+            aria-label="Room to open this in"
+            className="nc-obs-actions-room"
+            value={pickedRoom}
+            onChange={(e) => setPickedRoom(e.target.value)}
+            disabled={busy}
+          >
+            <option value="">open it in…</option>
+            {roomChoices.map((r) => (
+              <option key={r.key} value={r.name}>
+                {hashed(r.name)}
+              </option>
+            ))}
+          </select>
         )}
         {wiring &&
           canLand &&
@@ -1403,7 +1450,7 @@ function WorkActions({
               thing an operator must be able to see and change their mind
               about — the server is never the one choosing it. */}
           <p className="nc-obs-steer-target">
-            {threadUrl ? 'goes into the existing thread' : `opens a new thread in ${hashed(room.name)}`}
+            {liveThreadUrl ? 'goes into the existing thread' : `opens a new thread in ${hashed(land.name)}`}
           </p>
           <ThreadPane sessionId={sessionId ?? null} />
           {decide && (

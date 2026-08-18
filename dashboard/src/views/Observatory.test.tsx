@@ -669,11 +669,75 @@ describe('Observatory', () => {
       expect(moving.querySelector('.nc-obs-actions .nc-obs-actions-steer')).toBeTruthy();
     });
 
-    it('a claim with nowhere to land says so instead of offering a button that must fail', async () => {
+    /* obs.C.29 — a claim with no thread used to end the row: no room, no
+     * controls. But "which room does this open in" is a decision the server
+     * has always been willing to take from a human (steer's `channel`), so
+     * the row asks instead of going quiet. Nothing downstream is offered
+     * until it is answered. */
+    it('a claim with nowhere to land asks WHERE, and offers nothing until it is told', async () => {
       const row = await expand(await open(), 'orphan');
       expect(row.querySelector('.nc-of-sheet-nothread')!.textContent).toBe('no thread recorded');
+      const picker = row.querySelector('.nc-obs-actions-room')! as HTMLSelectElement;
+      // The floor's own stable order (sortRooms: platform, then name), so the
+      // list reads the same on every poll.
+      expect(Array.from(picker.options).map((o) => o.textContent)).toEqual(['open it in…', '#other', '#qa-room']);
+      // nothing else, yet
       expect(row.querySelector('.nc-obs-actions-who')).toBeFalsy();
       expect(row.querySelector('.nc-obs-actions-steer')).toBeFalsy();
+
+      await userEvent.selectOptions(picker, '#qa-room');
+      // …and now the full row, narrowed to the agents wired to the room PICKED.
+      expect(Array.from(row.querySelectorAll('.nc-obs-actions-who option')).map((o) => o.textContent)).toEqual([
+        'hand it to…',
+        'ava',
+        'kit',
+      ]);
+      await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-steer-target')!.textContent).toBe('opens a new thread in #qa-room');
+    });
+
+    it('re-picking the room drops an addressee who is not wired to the new one', async () => {
+      const row = await expand(await open(), 'orphan');
+      const picker = row.querySelector('.nc-obs-actions-room')! as HTMLSelectElement;
+      await userEvent.selectOptions(picker, '#qa-room');
+      await pick(row, 'ag-ava');
+      expect((row.querySelector('.nc-obs-actions-who')! as HTMLSelectElement).value).toBe('ag-ava');
+      // #other is zed's room; ava is not wired there, so nobody is selected and
+      // the steer that would have gone to her is disabled rather than silent.
+      await userEvent.selectOptions(picker, '#other');
+      expect((row.querySelector('.nc-obs-actions-who')! as HTMLSelectElement).value).toBe('');
+      expect((row.querySelector('.nc-obs-actions-steer')! as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it('the first steer opens the thread, and the row keeps it', async () => {
+      mockSteer.mockResolvedValue({
+        ok: true,
+        seriesId: 's9',
+        threadUrl: 'https://example.com/t/new',
+        threadCreated: true,
+      });
+      const row = await expand(await open(), 'orphan');
+      await userEvent.selectOptions(row.querySelector('.nc-obs-actions-room')! as HTMLSelectElement, '#qa-room');
+      await pick(row, 'ag-ava');
+      await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      await userEvent.type(row.querySelector('.nc-obs-steer textarea')! as HTMLElement, 'pick this back up');
+      await userEvent.click(row.querySelector('.nc-obs-steer button')! as HTMLElement);
+
+      // The room the operator picked is what the server is told to open in.
+      expect(mockSteer).toHaveBeenCalledWith(
+        'wg-1',
+        { claimSlug: 'orphan' },
+        'ag-ava',
+        'pick this back up',
+        '#qa-room',
+      );
+      // The row now HAS a thread: it links into it, stops asking where, and no
+      // longer offers to open a second one.
+      expect(row.querySelector('.nc-obs-actions-room')).toBeFalsy();
+      expect(row.querySelector('.nc-of-sheet-nothread')).toBeFalsy();
+      expect(row.querySelector('.nc-obs-actions-row a')!.getAttribute('href')).toBe('https://example.com/t/new');
+      await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-steer-target')!.textContent).toBe('goes into the existing thread');
     });
 
     it('defaults the addressee to the claim’s own owner, and pushes to whoever is picked', async () => {
@@ -721,8 +785,8 @@ describe('Observatory', () => {
     });
 
     it('names the room a steer will OPEN a thread in, before it is sent', async () => {
-      // Viewed from the claims card a thread-less claim has no room, so it gets
-      // no composer at all; a claim WITH a thread says it continues that one.
+      // A claim WITH a thread says it continues that one; the thread-less case
+      // (where the room is picked on the row) is covered above.
       const row = await expand(await open(), 'stuck');
       await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
       expect(row.querySelector('.nc-obs-steer-target')!.textContent).toBe('goes into the existing thread');
