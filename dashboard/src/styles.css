@@ -1892,14 +1892,25 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    agent/channel counts are reference, not signal, and pushed the live dot off
    the right edge — nothing may be wider than the viewport but the map. */
 @media (max-width:700px){
-  .nc-of .nc-of-bar{gap:10px; padding:11px 14px}
+  .nc-of .nc-of-bar{gap:10px; padding:11px 14px; flex-wrap:wrap}
   /* Below ~420px the two-word title and the hint each wrapped mid-phrase. */
   .nc-of .nc-of-bar-title{white-space:nowrap; font-size:13.5px}
   .nc-of .nc-of-mapcard-head{flex-wrap:wrap; row-gap:2px}
   .nc-of .nc-of-mapcard-title{flex:0 0 100%}
-  .nc-of .nc-of-bar-meta{gap:10px; flex:none}
+  /* order:1 keeps the live count on the title/picker row (its own
+     margin-left:auto still pushes it to that row's right edge); the
+     segmented control gets order:2 and a forced 100% width below it. */
+  .nc-of .nc-of-bar-meta{gap:10px; flex:none; order:1}
   .nc-of .nc-of-bar-count{display:none}
   .nc-of .nc-of-teleport{padding:9px 12px 9px 12px}
+  /* obs.C.36 — the segmented control used to share the title's row and
+     shrink into whatever space was left, so it scrolled internally rather
+     than growing; Decisions and Job board were reachable only by finding a
+     horizontal scrollbar. Its own full-width row and equal thirds put all
+     three tabs on screen without any scrolling — visible navigation beats
+     hidden navigation. */
+  .nc-of .nc-of-seg{order:2; flex:0 0 100%; width:100%; overflow-x:visible}
+  .nc-of .nc-of-seg-btn{flex:1; min-width:0; padding:0 4px; font-size:11.5px}
 }
 
 /* ─── The card, and the one table inside it ──────────────────────────────── */
