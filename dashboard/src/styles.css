@@ -2041,6 +2041,17 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-obs-actions button:disabled{opacity:.45; cursor:default}
 .nc-of .nc-obs-actions button:not(:disabled):hover{filter:brightness(1.08)}
+/* An item already shipped states the fact, not another button. The escape
+   hatch beside it is deliberately quiet — it is the rarer move. */
+.nc-of .nc-obs-ship-sent{
+  display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap;
+  font-size:12.5px; font-weight:600; color:var(--go);
+}
+.nc-of .nc-obs-decide-line .nc-obs-ship-again{
+  font:inherit; font-size:12px; font-weight:500; color:var(--ink-2); background:var(--card-2);
+  border:1px solid var(--line-2); border-radius:7px; padding:3px 9px; cursor:pointer;
+}
+.nc-of .nc-obs-decide-line .nc-obs-ship-again:disabled{opacity:.45; cursor:default}
 .nc-of .nc-obs-actions-none{font-size:12px; color:var(--ink-3); font-style:italic}
 .nc-of .nc-obs-actions-err{font-size:12px; color:var(--stop)}
 .nc-of .nc-obs-actions-done{margin-top:7px; font-size:12.5px; font-weight:600; color:var(--go)}

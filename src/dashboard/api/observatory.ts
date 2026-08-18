@@ -141,6 +141,21 @@ export interface ReleaseStateItem {
    * `[]` is a real assertion, not a filler value.
    */
   dependsOn?: string[];
+  /**
+   * The thread somebody already steered this item into, decorated onto the
+   * board at read time from `observatory_item_threads` — the board's own memory
+   * of a one-click ship. Null when nobody has. Never published by the watcher:
+   * this is host state about an item, not a fact about the work.
+   */
+  steeredThread?: SteeredThread | null;
+}
+
+export interface SteeredThread {
+  threadId: string;
+  threadUrl: string | null;
+  at: string;
+  /** Display name of whoever fired it, resolved at read time so a rename shows. */
+  by: string;
 }
 
 export interface ReleaseState {
@@ -179,6 +194,60 @@ export function readReleaseState(workgroupId: string, groupsDir: string = GROUPS
     }
   }
   return best?.state ?? null;
+}
+
+/**
+ * Decorate a board with the threads its items have already been steered into.
+ *
+ * One query per poll, not one per item, and a LEFT JOIN for the name so a user
+ * row that has since been deleted degrades to the raw id rather than dropping
+ * the whole decoration — knowing a thread exists matters more than knowing who
+ * opened it.
+ *
+ * Read-time resolution on purpose: `observatory_item_threads` stores a
+ * `users.id`, so a display-name change is never frozen into the table.
+ */
+export function decorateSteeredThreads(
+  workgroupId: string,
+  state: ReleaseState | null,
+  linkFor: (threadId: string) => string | null = threadPermalink,
+): ReleaseState | null {
+  if (!state || state.items.length === 0) return state;
+  let rows: { item_id: string; thread_id: string; created_at: string; by: string | null }[];
+  try {
+    rows = getDb()
+      .prepare(
+        `SELECT t.item_id, t.thread_id, t.created_at, u.display_name AS by
+           FROM observatory_item_threads t
+           LEFT JOIN users u ON u.id = t.created_by
+          WHERE t.workgroup_id = ?`,
+      )
+      .all(workgroupId) as typeof rows;
+  } catch (err) {
+    // The table arrives with migration 050; a host running an older schema must
+    // still render its board rather than blanking the scene.
+    log.warn('observatory: could not read steered item threads', { workgroupId, err });
+    return state;
+  }
+  if (rows.length === 0) return state;
+
+  const byItem = new Map(rows.map((r) => [r.item_id, r]));
+  return {
+    ...state,
+    items: state.items.map((i) => {
+      const hit = byItem.get(i.id);
+      if (!hit) return i;
+      return {
+        ...i,
+        steeredThread: {
+          threadId: hit.thread_id,
+          threadUrl: linkFor(hit.thread_id),
+          at: hit.created_at,
+          by: hit.by ?? 'someone',
+        },
+      };
+    }),
+  };
 }
 
 export interface ObservatoryScene {
@@ -728,8 +797,11 @@ export async function buildObservatoryScene(
     ),
     agents,
     claims,
-    releaseState:
+    releaseState: decorateSteeredThreads(
+      workgroupId,
       deps.groupsDir !== undefined ? readReleaseState(workgroupId, deps.groupsDir) : readReleaseState(workgroupId),
+      linkFor,
+    ),
     themedSlots: deps.themedSlots !== undefined ? deps.themedSlots : readOfficeThemes(),
   };
 }

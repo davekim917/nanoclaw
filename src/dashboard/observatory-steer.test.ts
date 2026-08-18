@@ -104,6 +104,12 @@ beforeEach(() => {
     CREATE TABLE messaging_group_agents (
       id TEXT PRIMARY KEY, messaging_group_id TEXT NOT NULL, agent_group_id TEXT NOT NULL, created_at TEXT NOT NULL
     );
+    -- migration 050: the item's missing "file", one thread per item.
+    CREATE TABLE observatory_item_threads (
+      workgroup_id TEXT NOT NULL, item_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+      created_at TEXT NOT NULL, created_by TEXT NOT NULL,
+      PRIMARY KEY (workgroup_id, item_id)
+    );
     INSERT INTO workgroups VALUES ('wg-1', datetime('now'));
     INSERT INTO agent_groups VALUES ('ag-1', 'ava', 'ava', 'claude', 'wg-1', datetime('now'));
     INSERT INTO user_roles (user_id, role, agent_group_id) VALUES ('${OWNER}', 'owner', NULL);
@@ -356,6 +362,95 @@ describe('observatorySteerHandler — release-board items', () => {
     const res = (await steer(OWNER, { workgroupId: 'wg-1', itemId: 'XZ#9', agentGroupId: 'ag-1', text: 'ship it' }))!;
     expect(res.status).toBe(404);
     expect(await res.json()).toMatchObject({ error: 'item_not_on_board' });
+  });
+
+  /* obs.C.33 — an item has no file to write a thread id back to (a claim does),
+   * so the board was stateless about ships: a second press opened a SECOND
+   * thread for the same work and the agent got the same ask twice in two
+   * places. `observatory_item_threads` is that missing file. */
+  describe('one item, one thread', () => {
+    const threading = () => {
+      const postParent = vi.fn().mockResolvedValue({ messageId: '1.1' });
+      const createThread = vi
+        .fn()
+        .mockImplementation((_p, parent: string) => Promise.resolve({ threadId: parent, messageId: '1.2' }));
+      mockGetAdapter.mockReturnValue({ postParent, createThread } as never);
+      itemsAre([{ id: 'XZ#912', kind: 'pr', title: 'money writes', nextMover: 'agent', channel: '#qa-room' }]);
+      return { postParent, createThread };
+    };
+    const rows = () =>
+      getDb().prepare('SELECT workgroup_id, item_id, thread_id, created_by FROM observatory_item_threads').all();
+    const ship = (text: string) => steer(OWNER, { workgroupId: 'wg-1', itemId: 'XZ#912', agentGroupId: 'ag-1', text });
+
+    it('records the thread the first steer opened, against the item and the operator', async () => {
+      threading();
+      const res = (await ship('ship it'))!;
+      expect(await res.json()).toMatchObject({ threadCreated: true });
+      expect(rows()).toEqual([
+        { workgroup_id: 'wg-1', item_id: 'XZ#912', thread_id: 'slack:C0EXAMPLE1:1.1', created_by: OWNER },
+      ]);
+    });
+
+    it('a second steer continues that thread instead of opening another', async () => {
+      const { postParent } = threading();
+      await ship('ship it');
+      expect(postParent).toHaveBeenCalledTimes(1);
+
+      const res = (await ship('actually, hold for CI'))!;
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        threadId: 'slack:C0EXAMPLE1:1.1',
+        threadCreated: false,
+        existing: true,
+      });
+      // No parent post, no new thread, and the ask still landed in the first one.
+      expect(postParent).toHaveBeenCalledTimes(1);
+      expect(rows()).toHaveLength(1);
+      expect(mockDispatch.mock.calls[1]![0].args.thread_id).toBe('slack:C0EXAMPLE1:1.1');
+    });
+
+    it('two concurrent steers open exactly one thread, and both land in it', async () => {
+      const { postParent } = threading();
+      // Distinct text: the text-keyed double-click guard must not be what
+      // saves this — the point is that two genuine sends still share a thread.
+      const [a, b] = await Promise.all([ship('ship it'), ship('and watch the promote')]);
+
+      expect(postParent).toHaveBeenCalledTimes(1);
+      expect(rows()).toHaveLength(1);
+      const bodies = (await Promise.all([a!.json(), b!.json()])) as {
+        threadId: string;
+        threadCreated: boolean;
+        existing?: boolean;
+      }[];
+      expect(bodies.map((r) => r.threadId)).toEqual(['slack:C0EXAMPLE1:1.1', 'slack:C0EXAMPLE1:1.1']);
+      // Exactly one of them created it; the other says it continued one.
+      expect(bodies.filter((r) => r.threadCreated)).toHaveLength(1);
+      expect(bodies.filter((r) => r.existing)).toHaveLength(1);
+    });
+
+    it('refuses to continue a recorded thread the agent is not wired to', async () => {
+      threading();
+      getDb()
+        .prepare(
+          `INSERT INTO observatory_item_threads VALUES ('wg-1', 'XZ#912', 'slack:C0OTHERROOM:9.9', '2026-08-18T00:00:00.000Z', '${OWNER}')`,
+        )
+        .run();
+      const res = (await ship('ship it'))!;
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ error: 'agent_not_wired_to_thread_channel' });
+      expect(mockDispatch).not.toHaveBeenCalled();
+    });
+
+    it("scopes the memory to the workgroup — another workgroup's XZ#912 is not this one", async () => {
+      threading();
+      getDb()
+        .prepare(
+          `INSERT INTO observatory_item_threads VALUES ('wg-other', 'XZ#912', 'slack:C0OTHERROOM:9.9', '2026-08-18T00:00:00.000Z', '${OWNER}')`,
+        )
+        .run();
+      const res = (await ship('ship it'))!;
+      expect(await res.json()).toMatchObject({ threadId: 'slack:C0EXAMPLE1:1.1', threadCreated: true });
+    });
   });
 });
 

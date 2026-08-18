@@ -368,6 +368,70 @@ describe('Observatory — actions and sheets', () => {
       expect(composer(container)).toBeFalsy();
     });
 
+    /* obs.C.33 — the board REMEMBERS the ship now. It used to be stateless, so
+     * a second press (by anyone, on any browser) opened a SECOND thread for the
+     * same work and the agent got the same ask twice in two places. */
+    describe('an item that has already been shipped', () => {
+      const shipped = (over: Partial<ReleaseItem['steeredThread']> = {}) =>
+        releaseItem({
+          id: 'XZO#912',
+          title: 'ready to ship',
+          nextMover: 'human',
+          owner: 'kit',
+          channel: '#dispatch',
+          nextAction: 'kit or robin records @ava ship 912 -- ready, ships on a human word',
+          steeredThread: {
+            threadId: 'slack:C1:1.1',
+            threadUrl: 'https://example.com/t/first',
+            at: new Date(Date.now() - 3 * 3600_000).toISOString(),
+            by: 'Olive Owner',
+            ...over,
+          },
+        });
+      const sent = (c: HTMLElement) => c.querySelector('[data-ledger-id="XZO#912"] .nc-obs-ship-sent');
+      const again = (c: HTMLElement) =>
+        c.querySelector('[data-ledger-id="XZO#912"] .nc-obs-ship-again') as HTMLElement | null;
+
+      it('says who sent it and when, links the thread, and offers no fresh fire', async () => {
+        const { container } = await open([shipped()]);
+        expect(shipBtn(container, 'XZO#912')).toBeFalsy();
+        expect(sent(container)!.textContent).toContain('sent 3h ago by Olive Owner');
+        expect(sent(container)!.querySelector('a')!.getAttribute('href')).toBe('https://example.com/t/first');
+      });
+
+      it('"send anyway" posts into the SAME thread — the server never opens a second', async () => {
+        mockSteer.mockResolvedValue({
+          ok: true,
+          seriesId: 's8',
+          threadUrl: 'https://example.com/t/first',
+          existing: true,
+        });
+        const { container } = await open([shipped()]);
+        await userEvent.click(again(container)!);
+        expect(mockSteer).toHaveBeenCalledWith('wg-1', { itemId: 'XZO#912' }, 'ag-ava', '@ava ship 912', '#dispatch');
+        // The row says which of the two things happened, rather than reporting
+        // a continuation as a fresh send.
+        expect(container.querySelector('[data-ledger-id="XZO#912"] .nc-obs-actions-done')!.textContent).toContain(
+          'sent — ava was asked in the thread this item already had',
+        );
+      });
+
+      it('the row itself opens onto that thread, so the composer continues it', async () => {
+        const { container } = await open([shipped()]);
+        await expandRow(container, 'XZO#912');
+        const actions = container.querySelector('[data-ledger-id="XZO#912"] .nc-obs-actions')!;
+        expect(actions.querySelector('a')!.getAttribute('href')).toBe('https://example.com/t/first');
+        expect(actions.querySelector('.nc-obs-steer-target')!.textContent).toBe('goes into the existing thread');
+      });
+
+      it('an unresolvable permalink still states the send, without a dead link', async () => {
+        const { container } = await open([shipped({ threadUrl: null })]);
+        expect(sent(container)!.textContent).toContain('by Olive Owner');
+        expect(sent(container)!.querySelector('a')).toBeFalsy();
+        expect(again(container)).toBeTruthy();
+      });
+    });
+
     it('a failed send says so on the row and keeps the button for a retry', async () => {
       mockSteer.mockRejectedValue(new Error('boom'));
       const { container } = await open();

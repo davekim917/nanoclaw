@@ -104,6 +104,15 @@ function setupDb(): void {
       packages_apt TEXT NOT NULL DEFAULT '[]', packages_npm TEXT NOT NULL DEFAULT '[]',
       additional_mounts TEXT NOT NULL DEFAULT '[]', updated_at TEXT NOT NULL
     );
+    CREATE TABLE users (
+      id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT, created_at TEXT NOT NULL
+    );
+    -- migration 050: which thread an item has already been steered into.
+    CREATE TABLE observatory_item_threads (
+      workgroup_id TEXT NOT NULL, item_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+      created_at TEXT NOT NULL, created_by TEXT NOT NULL,
+      PRIMARY KEY (workgroup_id, item_id)
+    );
   `);
 }
 
@@ -296,6 +305,80 @@ describe('readReleaseState', () => {
     fs.utimesSync(path.join(dir, 'ava-folder/releases/release-state.json'), new Date(0), new Date(0));
 
     expect(readReleaseState('wg-1', dir)?.asOf).toBe('new');
+  });
+
+  /* obs.C.33 — an item carries no thread of its own, so the board could not
+   * tell it had already been shipped and a second press opened a rival thread.
+   * The host remembers instead, and the memory rides onto the item at read
+   * time — never into the watcher's own artifact. */
+  describe('steeredThread decoration', () => {
+    const board = (items: object[]) =>
+      groupsDir({
+        'ava-folder/releases/release-state.json': JSON.stringify({ asOf: '2026-08-18T00:00:00Z', items }),
+      });
+    const remember = (wg: string, item: string, thread: string, by: string) =>
+      getDb()
+        .prepare('INSERT INTO observatory_item_threads VALUES (?, ?, ?, ?, ?)')
+        .run(wg, item, thread, '2026-08-18T01:00:00.000Z', by);
+
+    const scene = async (dir: string) =>
+      buildObservatoryScene('wg-1', makeDeps({ groupsDir: dir, resolveThreadUrl: (t) => `https://example.test/${t}` }));
+
+    beforeEach(() => {
+      addWorkgroup('wg-1');
+      addGroup('ag-1', 'wg-1', 'ava', 'ava-folder');
+    });
+
+    it('names the thread, when it happened, and who fired it — by display name', async () => {
+      getDb().prepare("INSERT INTO users VALUES ('u-dash', 'email', 'Olive Owner', datetime('now'))").run();
+      remember('wg-1', 'X#1', 'slack:C1:1.1', 'u-dash');
+      const dir = board([
+        { id: 'X#1', kind: 'pr', title: 'shipped once', nextMover: 'human' },
+        { id: 'X#2', kind: 'pr', title: 'never shipped', nextMover: 'human' },
+      ]);
+
+      const s = await scene(dir);
+      expect(s.releaseState?.items[0]?.steeredThread).toEqual({
+        threadId: 'slack:C1:1.1',
+        threadUrl: 'https://example.test/slack:C1:1.1',
+        at: '2026-08-18T01:00:00.000Z',
+        by: 'Olive Owner',
+      });
+      // An item nobody has steered stays exactly as the watcher published it.
+      expect(s.releaseState?.items[1]).not.toHaveProperty('steeredThread');
+    });
+
+    it('resolves the name at READ time, so a rename shows on the next poll', async () => {
+      getDb().prepare("INSERT INTO users VALUES ('u-dash', 'email', 'Olive', datetime('now'))").run();
+      remember('wg-1', 'X#1', 'slack:C1:1.1', 'u-dash');
+      const dir = board([{ id: 'X#1', kind: 'pr', title: 't', nextMover: 'human' }]);
+      expect((await scene(dir)).releaseState?.items[0]?.steeredThread?.by).toBe('Olive');
+
+      getDb().prepare("UPDATE users SET display_name = 'Olive Renamed' WHERE id = 'u-dash'").run();
+      expect((await scene(dir)).releaseState?.items[0]?.steeredThread?.by).toBe('Olive Renamed');
+    });
+
+    it('still reports the thread when the user row is gone — the thread is the point', async () => {
+      remember('wg-1', 'X#1', 'slack:C1:1.1', 'u-deleted');
+      const dir = board([{ id: 'X#1', kind: 'pr', title: 't', nextMover: 'human' }]);
+      const t = (await scene(dir)).releaseState?.items[0]?.steeredThread;
+      expect(t?.threadId).toBe('slack:C1:1.1');
+      expect(t?.by).toBe('someone');
+    });
+
+    it("never decorates another workgroup's item of the same id", async () => {
+      remember('wg-other', 'X#1', 'slack:C9:9.9', 'u-dash');
+      const dir = board([{ id: 'X#1', kind: 'pr', title: 't', nextMover: 'human' }]);
+      expect((await scene(dir)).releaseState?.items[0]).not.toHaveProperty('steeredThread');
+    });
+
+    it('renders the board rather than blanking it when the table is missing', async () => {
+      getDb().exec('DROP TABLE observatory_item_threads');
+      const dir = board([{ id: 'X#1', kind: 'pr', title: 't', nextMover: 'human' }]);
+      const s = await scene(dir);
+      expect(s.releaseState?.items).toHaveLength(1);
+      expect(s.releaseState?.items[0]).not.toHaveProperty('steeredThread');
+    });
   });
 });
 

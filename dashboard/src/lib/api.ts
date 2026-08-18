@@ -557,6 +557,19 @@ export interface ReleaseItem {
   nextAction?: string;
   /** Slack channel the work lives in, e.g. '#qa-room'. Routes assignment. */
   channel?: string;
+  /**
+   * The thread this item has ALREADY been steered into, if anyone has. An item
+   * carries no thread of its own — the host remembers the first one that was
+   * opened for it (`observatory_item_threads`) so the second press of a ship
+   * button continues that conversation instead of starting a rival one.
+   */
+  steeredThread?: {
+    threadId: string;
+    threadUrl: string | null;
+    at: string;
+    /** Display name of whoever fired the first steer. */
+    by: string;
+  } | null;
 }
 
 export interface ReleaseState {
@@ -617,6 +630,9 @@ export async function nudgeClaim(
  *
  * `channel` is only read when a claim has no thread yet, and only then does the
  * server open one; without it that case is refused rather than guessed at.
+ *
+ * `existing: true` means the server posted into a thread this ITEM already had
+ * rather than opening one — first steer wins, every later one continues it.
  */
 export async function steerWork(
   workgroupId: string,
@@ -624,7 +640,14 @@ export async function steerWork(
   agentGroupId: string,
   text: string,
   channel?: string,
-): Promise<{ ok: boolean; seriesId: string | null; threadUrl: string | null; threadCreated?: boolean }> {
+): Promise<{
+  ok: boolean;
+  seriesId: string | null;
+  threadId?: string;
+  threadUrl: string | null;
+  threadCreated?: boolean;
+  existing?: boolean;
+}> {
   return apiFetch('/dashboard/api/observatory/steer', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

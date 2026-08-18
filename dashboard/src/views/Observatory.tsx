@@ -1601,6 +1601,9 @@ function ItemRow({
 }) {
   const item = c.item;
   const roomLink = item.channel ? roomLinks?.get(item.channel.replace(/^#/, '').toLowerCase()) : undefined;
+  // The thread this item has already been steered into, if any — the board's
+  // own memory, decorated onto the snapshot server-side.
+  const steered = item.steeredThread ?? null;
   const ship = decide ? shipInstruction(item.nextAction) : null;
   const shipTo = ship ? shipAddressee(ship, assign?.agents ?? []) : null;
   const [shipState, setShipState] = useState<{ phase: 'idle' | 'busy' | 'done' | 'error'; note?: string; url?: string }>(
@@ -1618,7 +1621,17 @@ function ItemRow({
     const who = assign.agents.find((a) => a.id === shipTo)?.name ?? 'that agent';
     try {
       const r = await steerWork(assign.workgroupId, { itemId: item.id }, shipTo, ship, item.channel ?? undefined);
-      setShipState({ phase: 'done', note: `sent — ${who} was asked in the thread`, ...(r.threadUrl ? { url: r.threadUrl } : {}) });
+      setShipState({
+        phase: 'done',
+        // The server refuses to open a second thread for one item, so say which
+        // of the two things just happened rather than reporting both as a fresh
+        // send — "sent" over a thread that has been open since yesterday reads
+        // as a new conversation the operator will go looking for.
+        note: r.existing
+          ? `sent — ${who} was asked in the thread this item already had`
+          : `sent — ${who} was asked in the thread`,
+        ...(r.threadUrl ? { url: r.threadUrl } : {}),
+      });
     } catch (e) {
       setShipState({ phase: 'error', note: actionError(e, who, item.channel ?? undefined) });
     }
@@ -1657,20 +1670,46 @@ function ItemRow({
               that ignored text the operator had edited would be worse than
               either. An instruction whose handle matches nobody on this floor
               falls back to opening the row, never to a guessed addressee. */}
-          {ship && assign && !expanded && shipState.phase !== 'done' && (
-            <button
-              type="button"
-              className="nc-obs-ship"
-              data-ship={ship}
-              title={shipTo ? 'sends into the work’s thread as you' : 'opens the row to pick who this goes to'}
-              onClick={shipTo ? fireShip : onToggle}
-              disabled={shipState.phase === 'busy'}
-            >
-              {shipState.phase === 'busy' ? 'sending…' : (
-                <>send: <span className="mono">{ship}</span></>
-              )}
-            </button>
-          )}
+          {ship &&
+            assign &&
+            !expanded &&
+            shipState.phase !== 'done' &&
+            /* obs.C.33 — the board REMEMBERS the ship. It used to be stateless,
+               so a second press (by anyone, on any browser) opened a second
+               thread for the same work and the agent got the same ask twice in
+               two places. An item that has already been sent says so, and
+               offers to say more into the SAME thread rather than firing again
+               as if nothing had happened. */
+            (steered ? (
+              <span className="nc-obs-ship-sent" data-sent-by={steered.by}>
+                sent {relAge(steered.at)} ago by {steered.by}
+                {steered.threadUrl ? <> — <OutLink href={steered.threadUrl}>open thread</OutLink></> : null}
+                {shipTo && (
+                  <button
+                    type="button"
+                    className="nc-obs-ship-again"
+                    title="posts into the thread this item already has — never a new one"
+                    onClick={fireShip}
+                    disabled={shipState.phase === 'busy'}
+                  >
+                    {shipState.phase === 'busy' ? 'sending…' : 'send anyway'}
+                  </button>
+                )}
+              </span>
+            ) : (
+              <button
+                type="button"
+                className="nc-obs-ship"
+                data-ship={ship}
+                title={shipTo ? 'sends into the work’s thread as you' : 'opens the row to pick who this goes to'}
+                onClick={shipTo ? fireShip : onToggle}
+                disabled={shipState.phase === 'busy'}
+              >
+                {shipState.phase === 'busy' ? 'sending…' : (
+                  <>send: <span className="mono">{ship}</span></>
+                )}
+              </button>
+            ))}
           {shipState.phase === 'done' && (
             <div className="nc-obs-actions-done">
               {shipState.note}
@@ -1723,7 +1762,10 @@ function ItemRow({
               channel: item.channel,
               assignable: item.nextMover !== 'human',
             }}
-            threadUrl={null}
+            // An item has no thread of its own, but it HAS the one a steer
+            // opened for it — so the row links into that conversation and its
+            // composer continues it, instead of offering to start a rival.
+            threadUrl={steered?.threadUrl ?? null}
             room={{ name: item.channel ?? null }}
             // The instruction names who must act, so the confirm opens with
             // them already selected. Every other surface still defaults to
