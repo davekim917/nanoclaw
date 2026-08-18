@@ -238,12 +238,19 @@ export function Observatory({ authMe }: ObservatoryProps) {
           id: a.id,
           name: a.name,
           avatarUrl: a.avatarUrl,
-          held: a.holding.map((slug) => ({
-            slug,
-            threadId: bySlug.get(slug)?.threadId ?? null,
-            threadUrl: bySlug.get(slug)?.threadUrl ?? null,
-            sessionId: bySlug.get(slug)?.sessionId ?? null,
-          })),
+          held: a.holding.map((slug) => {
+            const c = bySlug.get(slug);
+            return {
+              slug,
+              // Read off the claim, never assumed: the sheet used to hardcode
+              // "not pushable" and so offered strictly less than the claims
+              // card on the same piece of work.
+              pushable: c ? claimPushable(c) : false,
+              threadId: c?.threadId ?? null,
+              threadUrl: c?.threadUrl ?? null,
+              sessionId: c?.sessionId ?? null,
+            };
+          }),
           state: room.agents.find((x) => x.name === a.name)?.status ?? 'idle',
         })),
     };
@@ -545,6 +552,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                                 <HeldRow
                                   key={h.slug}
                                   slug={h.slug}
+                                  pushable={h.pushable}
                                   threadId={h.threadId}
                                   threadUrl={h.threadUrl}
                                   sessionId={h.sessionId}
@@ -736,6 +744,7 @@ function OutLink({ href, children }: { href: string; children: string }) {
  */
 function HeldRow({
   slug,
+  pushable,
   threadId,
   threadUrl,
   sessionId,
@@ -744,6 +753,8 @@ function HeldRow({
   assign,
 }: {
   slug: string;
+  /** See claimPushable — the caller reads it off the claim, never assumes it. */
+  pushable: boolean;
   threadId: string | null;
   threadUrl: string | null;
   sessionId: string | null;
@@ -756,7 +767,7 @@ function HeldRow({
     <div className="nc-of-sheet-held-row">
       <span className="nc-of-sheet-held-slug">{slug}</span>
       <WorkActions
-        target={{ kind: 'claim', slug, stuck: false }}
+        target={{ kind: 'claim', slug, pushable }}
         threadUrl={threadUrl}
         sessionId={sessionId}
         room={workRoom(threadId, room)}
@@ -1130,10 +1141,31 @@ export type WorkTarget =
   | {
       kind: 'claim';
       slug: string;
-      /** Only work that has stopped moving is pushable — a live claim is being done. */
-      stuck: boolean;
+      /** Whether the push-forward button is offered at all — see claimPushable. */
+      pushable: boolean;
     }
   | { kind: 'item'; id: string; channel?: string | undefined; assignable: boolean };
+
+/**
+ * Whether a claim can be pushed forward.
+ *
+ * Two conditions, and BOTH are the server's, not a UI preference:
+ *
+ * - it has stopped moving (or was already escalated). A live claim is being
+ *   done, and a push is a demand for an answer, not a ping;
+ * - it has a thread. `POST /observatory/nudge` composes the demand into the
+ *   claim's OWN thread and 409s `claim_has_no_thread` when there is none — it
+ *   deliberately has no named-room fallback (steer's is a different doctrine:
+ *   see nudge.ts's header). A button whose only outcome is that 409 is worse
+ *   than no button.
+ *
+ * Read off the claim by every surface that draws one, so the room sheet, the
+ * agent drawer and the claims card can never disagree about which work is
+ * pushable — the room sheet used to hardcode "no" and silently offered less.
+ */
+export function claimPushable(c: Pick<ObservatoryClaim, 'state' | 'escalated' | 'threadId'>): boolean {
+  return (c.state !== 'live' || c.escalated) && Boolean(c.threadId);
+}
 
 /**
  * Transcripts already fetched this page-load, keyed by session.
@@ -1282,7 +1314,7 @@ function WorkActions({
 
   const primary =
     target.kind === 'claim'
-      ? target.stuck
+      ? target.pushable
         ? { label: 'push it forward', busyLabel: 'pushing…' }
         : null
       : target.assignable && target.channel
@@ -2244,9 +2276,6 @@ function ClaimRow({
   room?: { key?: string | null; name?: string | null };
   assign?: AssignWiring;
 }) {
-  // Only work that has stopped moving is pushable — a live claim is being
-  // done, and a push is a demand for an answer, not a ping.
-  const stuck = c.state !== 'live' || c.escalated;
   const ownerAgent = assign ? ownerAgentId(c, assign.agents) : null;
   return (
     <li className={`nc-obs-claim-row ${c.state}`} data-slug={c.slug}>
@@ -2265,7 +2294,7 @@ function ClaimRow({
         <div className="nc-obs-claim-detail">
           {c.note && <div className="nc-obs-claim-note">{c.note}</div>}
           <WorkActions
-            target={{ kind: 'claim', slug: c.slug, stuck }}
+            target={{ kind: 'claim', slug: c.slug, pushable: claimPushable(c) }}
             threadUrl={c.threadUrl}
             sessionId={c.sessionId}
             room={workRoom(c.threadId, room)}
@@ -2424,8 +2453,9 @@ function AgentDrawer({
   const liveHere = roomKey && agent.liveSession?.channelKey === roomKey ? agent.liveSession : null;
 
   const held = claims.filter((c) => agent.holding.includes(c.slug));
-  // Same predicate ClaimsCard uses to decide whether a claim is pushable —
-  // stopped moving, or already escalated in its channel.
+  // Which SECTION a held claim belongs in — has it stopped moving, or been
+  // escalated in its channel. Whether it can be PUSHED is a stricter question
+  // (it also needs a thread); see claimPushable, which every row asks itself.
   const healthy = held.filter((c) => c.state === 'live' && !c.escalated);
   const troubled = held.filter((c) => c.state !== 'live' || c.escalated);
   const inRoom = (c: ObservatoryClaim) => Boolean(roomKey) && claimChannelKey(c.threadId) === roomKey;
@@ -2521,6 +2551,7 @@ function AgentDrawer({
                     <HeldRow
                       key={c.slug}
                       slug={c.slug}
+                      pushable={claimPushable(c)}
                       threadId={c.threadId}
                       threadUrl={c.threadUrl}
                       sessionId={c.sessionId}
@@ -2577,6 +2608,7 @@ function AgentDrawer({
                   <HeldRow
                     key={c.slug}
                     slug={c.slug}
+                    pushable={claimPushable(c)}
                     threadId={c.threadId}
                     threadUrl={c.threadUrl}
                     sessionId={c.sessionId}

@@ -36,7 +36,7 @@ import {
 import { buildLedger } from './commitments.js';
 import { RouteNav } from './BoardShell.js';
 import useSWR from 'swr';
-import { assignItem, getIssueBrief, getSessionDetail, steerWork } from '../lib/api.js';
+import { assignItem, getIssueBrief, getSessionDetail, nudgeClaim, steerWork } from '../lib/api.js';
 import type {
   ObservatoryRoom,
   ObservatoryAgent,
@@ -703,6 +703,63 @@ describe('Observatory — actions and sheets', () => {
       expect(idle.textContent).toContain('holding nothing');
       expect(idle.querySelector('a')).toBeFalsy();
       expect(idle.querySelector('.nc-of-sheet-held')).toBeFalsy();
+    });
+
+    /* obs.C.28 — the sheet rendered the SHARED actions row but hardcoded the
+     * claim as un-pushable, so the one surface you reach by clicking a room
+     * could do strictly less to a stalled claim than the claims card could.
+     * The flag is read off the claim now, by the same predicate everywhere. */
+    const pushFloor = (claims: ObservatoryClaim[]) => {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'slack:C1', name: 'general', memberAgentIds: ['ava'] })],
+          claims,
+          agents: [agent({ id: 'ava', name: 'ava', location: 'slack:C1', holding: claims.map((c) => c.slug) })],
+        }),
+      );
+      return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    };
+    const pushLabels = (held: Element) =>
+      Array.from(held.querySelectorAll('.nc-obs-actions button')).map((b) => b.textContent);
+
+    it('pushes a stalled held claim forward, same button the claims card has', async () => {
+      vi.mocked(nudgeClaim).mockResolvedValue({ ok: true, seriesId: 's1', threadUrl: 'https://example.com/t/1' });
+      const { container } = pushFloor([
+        claim({
+          slug: 'stalled',
+          state: 'stale',
+          owner: 'ava',
+          threadId: 'slack:C1:1.2',
+          threadUrl: 'https://example.com/t/1',
+        }),
+      ]);
+      await open(container, '#general');
+      const held = container.querySelector('.nc-of-sheet-held-row')!;
+      const push = Array.from(held.querySelectorAll('.nc-obs-actions button')).find(
+        (b) => b.textContent === 'push it forward',
+      )!;
+      expect(push).toBeTruthy();
+      await userEvent.selectOptions(held.querySelector('.nc-obs-actions-who')! as HTMLSelectElement, 'ava');
+      await userEvent.click(push as HTMLElement);
+      expect(nudgeClaim).toHaveBeenCalledWith('wg-1', 'stalled', 'ava');
+      expect(held.querySelector('.nc-obs-actions-done')!.textContent).toContain('pushed');
+    });
+
+    it('offers no push on work that is still moving, or that has no thread to push into', async () => {
+      const { container } = pushFloor([
+        claim({ slug: 'moving', state: 'live', owner: 'ava', threadId: 'slack:C1:2.2', threadUrl: 'https://x/2' }),
+        // Stalled, but the nudge endpoint composes into the claim's OWN thread
+        // and 409s without one — a button that can only ever fail is not one.
+        claim({ slug: 'threadless', state: 'stale', owner: 'ava', threadId: null, threadUrl: null }),
+      ]);
+      await open(container, '#general');
+      const held = container.querySelectorAll('.nc-of-sheet-held-row');
+      expect(pushLabels(held[0]!)).not.toContain('push it forward');
+      expect(pushLabels(held[1]!)).not.toContain('push it forward');
+      // …and both still get the rest of the row — reading and steering are not
+      // gated on being stuck.
+      expect(held[0]!.querySelector('.nc-obs-actions-steer')).toBeTruthy();
+      expect(held[1]!.querySelector('.nc-obs-actions-steer')).toBeTruthy();
     });
 
     // obs.10 established that clicking a person on the floor picks the person,
