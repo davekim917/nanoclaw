@@ -115,13 +115,20 @@ function TranscriptRow({ entry }: { entry: NormalizedEntry }) {
 
 function ThinkingGroupRow({ entries }: { entries: NormalizedEntry[] }) {
   const label = entries.length === 1 ? '1 agent step' : `${entries.length} agent steps`;
+  // The span reads oldest → newest whichever way the caller ordered the list:
+  // SessionDetail renders newest-first, the Observatory's inline pane
+  // oldest-first, and "5h → 2h ago" must not become "2h → 5h ago".
+  const first = entries[0]!;
+  const last = entries[entries.length - 1]!;
+  const forward = Date.parse(first.timestamp) <= Date.parse(last.timestamp);
+  const [older, newer] = forward ? [first, last] : [last, first];
   return (
     <li className="nc-transcript-row outbound nc-transcript-thinking">
       <details>
         <summary>
           <span className="nc-transcript-dir">💭 {label}</span>
           <span className="nc-transcript-tag">
-            {relAge(entries[entries.length - 1]!.timestamp)} → {relAge(entries[0]!.timestamp)} ago
+            {relAge(older.timestamp)} → {relAge(newer.timestamp)} ago
           </span>
         </summary>
         <div className="nc-thinking-list">

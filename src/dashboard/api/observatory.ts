@@ -34,6 +34,13 @@ export type ObservatoryClaim = BoardClaim & {
   /** Resolved permalink to the thread the work was claimed in — every row on the
    *  board links back to where it actually happened. Null when unresolvable. */
   threadUrl: string | null;
+  /**
+   * The session whose transcript IS this claim's conversation — what a slug
+   * like `xzo-whats-new-817` actually MEANS, readable without leaving the
+   * board. Null when the claim has no thread, or no session on it. See
+   * {@link attachClaimSessions} for which session wins when siblings share one.
+   */
+  sessionId: string | null;
 };
 
 export interface ObservatoryRoom {
@@ -614,6 +621,55 @@ async function buildAgents(
   );
 }
 
+/**
+ * Fill in each claim's `sessionId` in place, once the agents are known.
+ *
+ * A claim records a THREAD; sessions are keyed by (agent_group,
+ * messaging_group, thread), so a thread names more than one session whenever
+ * siblings sit in the same room. The OWNER's session wins — that is the
+ * conversation the claim is a claim on. Failing that (owner unresolved, or
+ * holding nothing on this thread) the session that most recently SPOKE there
+ * stands in: reading a sibling's copy of the room beats reading nothing, and
+ * the one that said the last thing holds the most of the room. Same
+ * `last_outbound_at` recency `location` and `liveSession` are picked by.
+ *
+ * Mutates rather than re-maps because `buildAgents` already consumed the claim
+ * array to compute `holding`, and that join is exactly what names the owner.
+ */
+function attachClaimSessions(workgroupId: string, claims: ObservatoryClaim[], agents: ObservatoryAgent[]): void {
+  if (!claims.some((c) => c.threadId)) return;
+  const rows = getDb()
+    .prepare(
+      `SELECT s.id, s.agent_group_id, s.thread_id, s.last_outbound_at
+         FROM sessions s
+         JOIN agent_groups g ON g.id = s.agent_group_id
+        WHERE g.workgroup_id = ? AND s.thread_id IS NOT NULL AND s.status = 'active'`,
+    )
+    .all(workgroupId) as { id: string; agent_group_id: string; thread_id: string; last_outbound_at: string | null }[];
+  if (rows.length === 0) return;
+
+  const byThread = new Map<string, typeof rows>();
+  for (const r of rows) {
+    const list = byThread.get(r.thread_id);
+    if (list) list.push(r);
+    else byThread.set(r.thread_id, [r]);
+  }
+  const ownerOfSlug = new Map<string, string>();
+  for (const a of agents) for (const slug of a.holding) ownerOfSlug.set(slug, a.id);
+
+  for (const c of claims) {
+    if (!c.threadId) continue;
+    const onThread = byThread.get(c.threadId);
+    if (!onThread) continue;
+    const owner = ownerOfSlug.get(c.slug);
+    const mine = owner ? onThread.find((r) => r.agent_group_id === owner) : undefined;
+    const newest = onThread.reduce((a, b) =>
+      (parseUtcMs(b.last_outbound_at) ?? -Infinity) > (parseUtcMs(a.last_outbound_at) ?? -Infinity) ? b : a,
+    );
+    c.sessionId = (mine ?? newest).id;
+  }
+}
+
 export interface ObservatoryDeps {
   getActiveContainerSessionIds: () => string[];
   /** Injected claims root for tests; defaults to readClaims' own live claimsBaseDir(). */
@@ -656,7 +712,11 @@ export async function buildObservatoryScene(
   const claims: ObservatoryClaim[] = rawClaims.map((c) => ({
     ...c,
     threadUrl: c.threadId ? linkFor(c.threadId) : null,
+    sessionId: null,
   }));
+
+  const agents = await buildAgents(workgroupId, claims, deps);
+  attachClaimSessions(workgroupId, claims, agents);
 
   return {
     workgroupId,
@@ -666,7 +726,7 @@ export async function buildObservatoryScene(
       deps.platforms !== undefined ? deps.platforms : observatoryPlatforms(workgroupId),
       deps.hiddenRooms ?? observatoryHiddenRooms(workgroupId),
     ),
-    agents: await buildAgents(workgroupId, claims, deps),
+    agents,
     claims,
     releaseState:
       deps.groupsDir !== undefined ? readReleaseState(workgroupId, deps.groupsDir) : readReleaseState(workgroupId),

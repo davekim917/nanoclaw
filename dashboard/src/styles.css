@@ -2053,6 +2053,15 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   height:28px; min-height:0; padding:0 10px; font-weight:500;
   color:var(--ink); background:var(--card-2); border:1px solid var(--line-2);
 }
+/* The conversation, above the box. Capped and scrollable so a long thread
+   cannot push send off the screen — the pane is context, the composer is the
+   point. Bottom-anchored by the component; the cap is what makes that scroll. */
+.nc-of .nc-obs-steer-thread{
+  max-height:40vh; overflow-y:auto; overscroll-behavior:contain;
+  margin-top:7px; padding:8px 9px;
+  background:var(--card-2); border:1px solid var(--line-2); border-radius:7px;
+}
+.nc-of .nc-obs-steer-nopane{margin:7px 0 0; font-size:12px; font-style:italic; color:var(--ink-3)}
 .nc-of .nc-obs-steer{display:flex; gap:8px; align-items:flex-end; margin-top:6px; min-width:0}
 .nc-of .nc-obs-steer textarea{
   flex:1 1 auto; min-width:0; font:inherit; font-size:12.5px; line-height:1.45; color:var(--ink);
@@ -2257,42 +2266,46 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   letter-spacing:0; text-transform:none;
 }
 
-/* Transcript, relit. Rows are hairline-separated on the card, not a stack of
-   individually bordered dark boxes; the side rule is the only direction cue. */
-.nc-sd .nc-transcript{gap:0}
-.nc-sd .nc-transcript-row{
+/* Transcript, relit for paper — shared by the session page and by the
+   Observatory's inline steer pane. The base rules above paint a dark plate
+   (they date from the dark board) and are invisible on either light surface,
+   so both scopes carry the same overrides: one thread, one look, two places.
+   Rows are hairline-separated on the card, not a stack of individually
+   bordered dark boxes; the side rule is the only direction cue. */
+.nc-sd .nc-transcript, .nc-obs-steer-thread .nc-transcript{gap:0}
+.nc-sd .nc-transcript-row, .nc-obs-steer-thread .nc-transcript-row{
   background:none; border:0; border-radius:0; border-left:2px solid var(--line-2);
   padding:9px 0 9px 12px;
 }
-.nc-sd .nc-transcript-row + .nc-transcript-row{border-top:1px solid var(--line)}
-.nc-sd .nc-transcript-row.inbound{border-left-color:var(--accent)}
-.nc-sd .nc-transcript-row.outbound{border-left-color:var(--line-2)}
-.nc-sd .nc-transcript-dir{
+.nc-sd .nc-transcript-row + .nc-transcript-row, .nc-obs-steer-thread .nc-transcript-row + .nc-transcript-row{border-top:1px solid var(--line)}
+.nc-sd .nc-transcript-row.inbound, .nc-obs-steer-thread .nc-transcript-row.inbound{border-left-color:var(--accent)}
+.nc-sd .nc-transcript-row.outbound, .nc-obs-steer-thread .nc-transcript-row.outbound{border-left-color:var(--line-2)}
+.nc-sd .nc-transcript-dir, .nc-obs-steer-thread .nc-transcript-dir{
   font-size:11px; font-weight:600; color:var(--ink-2);
   display:inline-flex; align-items:center; gap:4px;
 }
-.nc-sd .nc-transcript-tag{font-size:11px; color:var(--ink-3)}
-.nc-sd .nc-transcript-text{color:var(--ink); font-size:13px; line-height:1.5}
-.nc-sd .nc-transcript-more{
+.nc-sd .nc-transcript-tag, .nc-obs-steer-thread .nc-transcript-tag{font-size:11px; color:var(--ink-3)}
+.nc-sd .nc-transcript-text, .nc-obs-steer-thread .nc-transcript-text{color:var(--ink); font-size:13px; line-height:1.5}
+.nc-sd .nc-transcript-more, .nc-obs-steer-thread .nc-transcript-more{
   color:var(--accent); font-family:inherit; font-size:11.5px; font-weight:600;
 }
-.nc-sd .nc-truncate-ellipsis{color:var(--ink-3)}
-.nc-sd .nc-transcript-thinking summary::before{color:var(--ink-3); font-family:inherit}
-.nc-sd .nc-thinking-list{border-left:1px solid var(--line)}
-.nc-sd .nc-empty{
+.nc-sd .nc-truncate-ellipsis, .nc-obs-steer-thread .nc-truncate-ellipsis{color:var(--ink-3)}
+.nc-sd .nc-transcript-thinking summary::before, .nc-obs-steer-thread .nc-transcript-thinking summary::before{color:var(--ink-3); font-family:inherit}
+.nc-sd .nc-thinking-list, .nc-obs-steer-thread .nc-thinking-list{border-left:1px solid var(--line)}
+.nc-sd .nc-empty, .nc-obs-steer-thread .nc-empty{
   border:1px dashed var(--line-2); border-radius:8px; color:var(--ink-3);
   font-family:inherit; font-size:12.5px; letter-spacing:0; text-transform:none; margin:0;
 }
 
 /* Markdown bodies: the dark-board rules paint near-black plates on paper. */
-.nc-sd .nc-md code{background:rgba(35,32,27,.06); color:var(--ink)}
-.nc-sd .nc-md pre{background:var(--page); border:1px solid var(--line)}
-.nc-sd .nc-md a{color:var(--accent)}
-.nc-sd .nc-md blockquote{border-left-color:var(--line-2); color:var(--ink-2)}
-.nc-sd .nc-md thead{background:var(--page)}
-.nc-sd .nc-md th,.nc-sd .nc-md td{border-color:var(--line)}
-.nc-sd .nc-md tbody tr:nth-child(even){background:rgba(35,32,27,.03)}
-.nc-sd .nc-md hr{border-top-color:var(--line)}
+.nc-sd .nc-md code, .nc-obs-steer-thread .nc-md code{background:rgba(35,32,27,.06); color:var(--ink)}
+.nc-sd .nc-md pre, .nc-obs-steer-thread .nc-md pre{background:var(--page); border:1px solid var(--line)}
+.nc-sd .nc-md a, .nc-obs-steer-thread .nc-md a{color:var(--accent)}
+.nc-sd .nc-md blockquote, .nc-obs-steer-thread .nc-md blockquote{border-left-color:var(--line-2); color:var(--ink-2)}
+.nc-sd .nc-md thead, .nc-obs-steer-thread .nc-md thead{background:var(--page)}
+.nc-sd .nc-md th, .nc-sd .nc-md td, .nc-obs-steer-thread .nc-md th, .nc-obs-steer-thread .nc-md td{border-color:var(--line)}
+.nc-sd .nc-md tbody tr:nth-child(even), .nc-obs-steer-thread .nc-md tbody tr:nth-child(even){background:rgba(35,32,27,.03)}
+.nc-sd .nc-md hr, .nc-obs-steer-thread .nc-md hr{border-top-color:var(--line)}
 
 /* The composer is the page's other half — it sits on paper, not on a dark
    gradient, and its counter/button stop shouting in uppercase mono. */
@@ -2333,3 +2346,16 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   .nc-sd .nc-sd-facts{gap:3px 12px}
   .nc-sd .nc-composer{padding:12px 12px}
 }
+
+/* ── Issue brief (Decisions view expanded row) ─────────────────────────── */
+.nc-of .nc-obs-brief{margin-top:10px; padding:10px 12px; border:1px solid var(--nc-line, #e4e1da); border-radius:8px; display:flex; flex-direction:column; gap:8px}
+.nc-of .nc-obs-brief-empty{margin-top:10px; font-size:12.5px; color:var(--nc-ink-3, #8a8578); font-style:italic}
+.nc-of .nc-obs-brief-labels{display:flex; flex-wrap:wrap; gap:6px; align-items:center}
+.nc-of .nc-obs-brief-state{font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:1px 7px; border-radius:99px; border:1px solid var(--nc-line, #e4e1da); color:var(--nc-ink-2, #5d594e)}
+.nc-of .nc-obs-brief-state.open{color:#3a7d44; border-color:#3a7d4433}
+.nc-of .nc-obs-brief-label{font-size:11px; padding:1px 7px; border-radius:99px; background:var(--nc-wash, #f4f2ec); color:var(--nc-ink-2, #5d594e)}
+.nc-of .nc-obs-brief-body{font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; max-height:180px; overflow-y:auto; color:var(--nc-ink-2, #5d594e)}
+.nc-of .nc-obs-brief-comments{display:flex; flex-direction:column; gap:6px; border-top:1px dashed var(--nc-line, #e4e1da); padding-top:8px}
+.nc-of .nc-obs-brief-more{font-size:11px; color:var(--nc-ink-3, #8a8578)}
+.nc-of .nc-obs-brief-comment p{margin:2px 0 0; font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; max-height:120px; overflow-y:auto}
+.nc-of .nc-obs-brief-author{font-size:11px; font-weight:600; color:var(--nc-ink-3, #8a8578)}

@@ -513,6 +513,8 @@ export interface ObservatoryClaim {
   threadId: string | null;
   /** Permalink to the thread the work was claimed in — null when unresolvable. */
   threadUrl: string | null;
+  /** The session whose transcript is this claim's conversation — null when there is none. */
+  sessionId: string | null;
   escalated: boolean;
 }
 
@@ -628,6 +630,24 @@ export async function steerWork(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ workgroupId, agentGroupId, text, ...target, ...(channel ? { channel } : {}) }),
   });
+}
+
+export interface IssueBrief {
+  state: string;
+  labels: string[];
+  body: string;
+  bodyTruncated: boolean;
+  comments: { author: string; at: string; body: string }[];
+  commentCount: number;
+  fetchedAt: string;
+}
+
+/** Live read of the linked GitHub issue/PR for a board item — body, labels,
+ *  latest comments. Server resolves the URL from release-state; ids only. */
+export async function getIssueBrief(workgroupId: string, itemId: string): Promise<IssueBrief> {
+  return apiFetch<IssueBrief>(
+    `/dashboard/api/observatory/issue-brief?workgroup=${encodeURIComponent(workgroupId)}&item=${encodeURIComponent(itemId)}`,
+  );
 }
 
 export async function getObservatory(workgroupId: string): Promise<ObservatorySnapshot> {

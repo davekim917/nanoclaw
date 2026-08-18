@@ -460,6 +460,24 @@ describe('sessionsDetailHandler', () => {
     expect(body.error).toBe('session_not_found');
   });
 
+  // obs.C.26 put this endpoint behind every steer composer on the Observatory,
+  // so a scoped admin now reads transcripts through it constantly. The refusal
+  // case was covered; the ALLOW case was not, and that is the one that would
+  // silently turn the new inline pane into "couldn't load the conversation"
+  // for everyone who isn't an owner.
+  it('a scoped admin reads a session inside their own groups', async () => {
+    insertSession('sess-mine', 'ag-1');
+    const ctx = makeCtx('u2', { allowed_group_ids: ['ag-1'] });
+    const resp = await sessionsDetailHandler(
+      makeReq('http://localhost/dashboard/api/sessions/sess-mine'),
+      { id: 'sess-mine' },
+      ctx,
+    );
+    expect(resp!.status).toBe(200);
+    const body = (await resp!.json()) as { session: { session_id: string } };
+    expect(body.session.session_id).toBe('sess-mine');
+  });
+
   it('§2a — out-of-scope session returns 404, same body as nonexistent', async () => {
     insertSession('sess-other-group', 'ag-2');
     const ctx = makeCtx('u1', { allowed_group_ids: ['ag-1'] });

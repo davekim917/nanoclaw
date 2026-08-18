@@ -528,6 +528,72 @@ describe('buildObservatoryScene', () => {
     expect(byState['parked-one']).toBe('parked');
   });
 
+  // obs.C.26 — a claim slug is a code name, so the board carries the session
+  // whose transcript explains it. Which session, when siblings share a thread,
+  // is the whole question.
+  describe('claim → sessionId', () => {
+    const claimsRoot = () => path.join(TEST_DIR, 'workgroups');
+    const thread = 'slack:C1:1.2';
+
+    it('picks the OWNER’s session when siblings sit on the same thread', async () => {
+      addWorkgroup('wg-1');
+      addGroup('ag-ava', 'wg-1', 'ava');
+      addGroup('ag-sib', 'wg-1', 'sib');
+      // The sibling spoke more recently, and still does not win: the claim is
+      // ava's, so ava's side of the thread is the one that explains it.
+      addSession('sess-ava', 'ag-ava', {
+        threadId: thread,
+        lastOutboundAt: new Date(Date.now() - 60_000).toISOString(),
+      });
+      addSession('sess-sib', 'ag-sib', { threadId: thread, lastOutboundAt: now() });
+      writeClaim('wg-1', 'mine', { owner: 'ava', claimed_at: now(), ttl_hours: 4, thread_id: thread });
+
+      const scene = await buildObservatoryScene('wg-1', makeDeps({ claimsRoot: claimsRoot() }));
+      expect(scene.claims[0].sessionId).toBe('sess-ava');
+    });
+
+    it('falls back to whoever spoke there last when the owner is not an agent here', async () => {
+      addWorkgroup('wg-1');
+      addGroup('ag-a', 'wg-1', 'a');
+      addGroup('ag-b', 'wg-1', 'b');
+      addSession('sess-old', 'ag-a', {
+        threadId: thread,
+        lastOutboundAt: new Date(Date.now() - 3600_000).toISOString(),
+      });
+      addSession('sess-new', 'ag-b', { threadId: thread, lastOutboundAt: now() });
+      // A human holds it — no agent's `holding` names this slug.
+      writeClaim('wg-1', 'a-persons', { owner: 'Robin', claimed_at: now(), ttl_hours: 4, thread_id: thread });
+
+      const scene = await buildObservatoryScene('wg-1', makeDeps({ claimsRoot: claimsRoot() }));
+      expect(scene.claims[0].sessionId).toBe('sess-new');
+    });
+
+    it('stays null for a claim with no thread, and for a thread nobody has a session on', async () => {
+      addWorkgroup('wg-1');
+      addGroup('ag-a', 'wg-1', 'a');
+      addSession('sess-elsewhere', 'ag-a', { threadId: 'slack:C9:9.9', lastOutboundAt: now() });
+      writeClaim('wg-1', 'no-thread', { owner: 'a', claimed_at: now(), ttl_hours: 4 });
+      writeClaim('wg-1', 'no-session', { owner: 'a', claimed_at: now(), ttl_hours: 4, thread_id: thread });
+
+      const scene = await buildObservatoryScene('wg-1', makeDeps({ claimsRoot: claimsRoot() }));
+      const bySlug = Object.fromEntries(scene.claims.map((c) => [c.slug, c.sessionId]));
+      expect(bySlug['no-thread']).toBeNull();
+      expect(bySlug['no-session']).toBeNull();
+    });
+
+    it('never reaches outside the workgroup, however the thread is shared', async () => {
+      addWorkgroup('wg-1');
+      addWorkgroup('wg-2');
+      addGroup('ag-mine', 'wg-1', 'mine');
+      addGroup('ag-theirs', 'wg-2', 'theirs');
+      addSession('sess-theirs', 'ag-theirs', { threadId: thread, lastOutboundAt: now() });
+      writeClaim('wg-1', 'ours', { owner: 'mine', claimed_at: now(), ttl_hours: 4, thread_id: thread });
+
+      const scene = await buildObservatoryScene('wg-1', makeDeps({ claimsRoot: claimsRoot() }));
+      expect(scene.claims[0].sessionId).toBeNull();
+    });
+  });
+
   it('provider comes from container_configs when present, else agent_groups.agent_provider', async () => {
     addWorkgroup('wg-1');
     addGroup('ag-1', 'wg-1');

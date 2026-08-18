@@ -15,6 +15,8 @@ vi.mock('../lib/api.js', () => ({
   assignItem: vi.fn(),
   nudgeClaim: vi.fn(),
   steerWork: vi.fn(),
+  getIssueBrief: vi.fn(),
+  getSessionDetail: vi.fn(),
 }));
 
 // The drawer is exercised by its own suite; here we only care that the floor
@@ -106,6 +108,7 @@ function claim(overrides: Partial<ObservatoryClaim> = {}): ObservatoryClaim {
     staleMs: 0,
     threadId: null,
     threadUrl: null,
+    sessionId: null,
     escalated: false,
     ...overrides,
   };
