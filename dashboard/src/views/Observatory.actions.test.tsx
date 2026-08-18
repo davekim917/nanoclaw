@@ -15,6 +15,7 @@ vi.mock('../lib/api.js', () => ({
   assignItem: vi.fn(),
   nudgeClaim: vi.fn(),
   steerWork: vi.fn(),
+  getSessionDetail: vi.fn(),
 }));
 
 // The drawer is exercised by its own suite; here we only care that the floor
@@ -33,7 +34,7 @@ import {
 import { buildLedger } from './commitments.js';
 import { RouteNav } from './BoardShell.js';
 import useSWR from 'swr';
-import { assignItem, steerWork } from '../lib/api.js';
+import { assignItem, getSessionDetail, steerWork } from '../lib/api.js';
 import type {
   ObservatoryRoom,
   ObservatoryAgent,
@@ -43,6 +44,7 @@ import type {
   ReleaseState,
   ScheduledRow,
   ScheduledSnapshot,
+  SessionDetailResponse,
 } from '../lib/api.js';
 
 const mockAuthMe = {
@@ -92,6 +94,7 @@ function claim(overrides: Partial<ObservatoryClaim> = {}): ObservatoryClaim {
     staleMs: 0,
     threadId: null,
     threadUrl: null,
+    sessionId: null,
     escalated: false,
     ...overrides,
   };
@@ -332,8 +335,11 @@ describe('Observatory — actions and sheets', () => {
       expect(shipInstruction(undefined)).toBeNull();
     });
 
-    // obs.D.2 — the last inch: the board named an exact instruction, so the
-    // row offers it as one tap. To the CONFIRM, never past it.
+    // obs.D.2 → obs.D.4 — the board named an exact instruction, so the row
+    // offers it as ONE CLICK that sends (operator ruling, 2026-08-18: "clicking
+    // should be 1 click instead of it opening up the row and having to click
+    // send again"). The addressee must resolve for the button to fire; an
+    // unresolvable handle opens the row instead.
     const shipBtn = (c: HTMLElement, id: string) =>
       c.querySelector(`[data-ledger-id="${id}"] .nc-obs-ship`) as HTMLElement | null;
 
@@ -344,26 +350,42 @@ describe('Observatory — actions and sheets', () => {
       expect(shipBtn(container, 'XZO#804')).toBeFalsy();
     });
 
-    it('one tap opens the confirm with the exact text, the addressee and where it lands', async () => {
+    it('one click sends ids and the exact text through the same steer endpoint', async () => {
+      mockSteer.mockResolvedValue({ ok: true, seriesId: 's7', threadUrl: 'https://example.com/t/1' });
       const { container } = await open();
       await userEvent.click(shipBtn(container, 'XZO#912')!);
-      expect(composer(container)!.value).toBe('@ava ship 912');
-      expect((container.querySelector('.nc-obs-actions-who') as HTMLSelectElement).value).toBe('ag-ava');
-      expect(container.querySelector('.nc-obs-steer-target')!.textContent).toBe('opens a new thread in #dispatch');
-      // Opening the confirm is not sending, and the button is gone once its
-      // composer owns the text.
-      expect(mockSteer).not.toHaveBeenCalled();
+      expect(mockSteer).toHaveBeenCalledWith('wg-1', { itemId: 'XZO#912' }, 'ag-ava', '@ava ship 912', '#dispatch');
+      // The click reports its result in place — sent note + thread link — and
+      // the button is gone so it cannot double-fire.
+      expect(container.querySelector('[data-ledger-id="XZO#912"] .nc-obs-actions-done')!.textContent).toContain(
+        'sent — ava was asked in the thread',
+      );
       expect(shipBtn(container, 'XZO#912')).toBeFalsy();
+      // One click means SENT, not opened: no composer appeared.
+      expect(composer(container)).toBeFalsy();
     });
 
-    it('and the confirm sends ids and the text through the same steer endpoint', async () => {
-      mockSteer.mockResolvedValue({ ok: true, seriesId: 's7', threadUrl: null });
+    it('a failed send says so on the row and keeps the button for a retry', async () => {
+      mockSteer.mockRejectedValue(new Error('boom'));
       const { container } = await open();
       await userEvent.click(shipBtn(container, 'XZO#912')!);
-      await userEvent.click(
-        Array.from(container.querySelectorAll('.nc-obs-steer button')).find((x) => x.textContent === 'send')! as HTMLElement,
-      );
-      expect(mockSteer).toHaveBeenCalledWith('wg-1', { itemId: 'XZO#912' }, 'ag-ava', '@ava ship 912', '#dispatch');
+      expect(container.querySelector('[data-ledger-id="XZO#912"] .nc-obs-actions-err')).toBeTruthy();
+      expect(shipBtn(container, 'XZO#912')).toBeTruthy();
+    });
+
+    it('an instruction addressed to nobody on this floor opens the row instead of firing', async () => {
+      const { container } = await open([
+        releaseItem({
+          id: 'XZO#913',
+          nextMover: 'human',
+          owner: 'kit',
+          channel: '#dispatch',
+          nextAction: 'kit records @nova ship 913 -- nova is not on this floor',
+        }),
+      ]);
+      await userEvent.click(shipBtn(container, 'XZO#913')!);
+      expect(mockSteer).not.toHaveBeenCalled();
+      expect(composer(container)).toBeTruthy();
     });
 
     it('a member is offered no button — same gate as every other control', async () => {
@@ -1011,6 +1033,139 @@ describe('Observatory — actions and sheets', () => {
       expect(container.querySelector('[data-section="schedule"] .nc-obs-ledger-empty')!.textContent).toBe(
         "couldn't load scheduled work",
       );
+    });
+  });
+
+  /* obs.C.26 — a claim slug is a code name. Opening the composer opens the
+   * conversation with it, so an operator reads what happened before answering
+   * it. One component, so every surface that steers gets the pane. */
+  describe('the thread in view when you steer', () => {
+    const mockDetail = vi.mocked(getSessionDetail);
+    const detail = (texts: string[]): SessionDetailResponse =>
+      ({
+        session: {},
+        // The endpoint returns newest-first; the pane must show oldest-first.
+        transcript: texts.map((text, i) => ({
+          direction: i % 2 === 0 ? 'out' : 'in',
+          kind: 'chat',
+          seq: texts.length - i,
+          timestamp: new Date(Date.now() - i * 60_000).toISOString(),
+          text,
+        })),
+      }) as unknown as SessionDetailResponse;
+
+    /** The claims card, with one claim per session id the test needs. */
+    const card = async (claims: ObservatoryClaim[]) => {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'slack:C1', name: '#qa-room', memberAgentIds: ['ag-ava'] })],
+          agents: [agent({ id: 'ag-ava', name: 'ava', holding: claims.map((c) => c.slug) })],
+          claims,
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await segment(container, 'board');
+      return container;
+    };
+    const stale = (over: Partial<ObservatoryClaim>) =>
+      claim({ state: 'stale', owner: 'ava', threadId: 'slack:C1:1.2', threadUrl: 'https://x/t', ...over });
+
+    /** Expand the row, pick the agent, press steer — the real path to the box. */
+    const steerOpen = async (c: HTMLElement, slug: string) => {
+      const row = c.querySelector(`.nc-obs-claim-row[data-slug="${slug}"]`)! as HTMLElement;
+      await userEvent.click(row.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
+      await userEvent.selectOptions(row.querySelector('.nc-obs-actions-who')! as HTMLSelectElement, 'ag-ava');
+      await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      return row;
+    };
+
+    it('shows the conversation above the box, oldest last-said at the bottom', async () => {
+      mockDetail.mockResolvedValue(detail(['and here is the answer', 'what is the state of this?']));
+      const c = await card([stale({ slug: 'sc-1', sessionId: 'sess-card' })]);
+      const row = await steerOpen(c, 'sc-1');
+      const pane = row.querySelector('.nc-obs-steer-thread')!;
+      expect(pane).toBeTruthy();
+      expect(Array.from(pane.querySelectorAll('.nc-transcript-text')).map((e) => e.textContent?.trim())).toEqual([
+        'what is the state of this?',
+        'and here is the answer',
+      ]);
+      // The box it is above is still the same composer.
+      expect(row.querySelector('.nc-obs-steer textarea')).toBeTruthy();
+    });
+
+    it('fetches nothing until the composer is asked for, and not again when it re-opens', async () => {
+      mockDetail.mockResolvedValue(detail(['hello']));
+      const c = await card([stale({ slug: 'sc-2', sessionId: 'sess-reopen' })]);
+      const row = c.querySelector('.nc-obs-claim-row[data-slug="sc-2"]')! as HTMLElement;
+      await userEvent.click(row.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
+      // The row is open and the thread has NOT been read.
+      expect(mockDetail).not.toHaveBeenCalled();
+
+      await userEvent.selectOptions(row.querySelector('.nc-obs-actions-who')! as HTMLSelectElement, 'ag-ava');
+      await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      expect(mockDetail).toHaveBeenCalledTimes(1);
+      expect(mockDetail).toHaveBeenCalledWith('sess-reopen');
+
+      // Collapse and re-open: same pane, no second read.
+      await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-steer-thread')).toBeFalsy();
+      await userEvent.click(row.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      expect(row.querySelector('.nc-obs-steer-thread')).toBeTruthy();
+      expect(mockDetail).toHaveBeenCalledTimes(1);
+    });
+
+    it('says it could not read the thread rather than showing an empty one', async () => {
+      mockDetail.mockRejectedValue({ status: 404, error: 'session_not_found' });
+      const c = await card([stale({ slug: 'sc-3', sessionId: 'sess-err' })]);
+      const row = await steerOpen(c, 'sc-3');
+      expect(row.querySelector('.nc-obs-steer-thread')).toBeFalsy();
+      expect(row.querySelector('.nc-obs-steer-nopane')!.textContent).toBe('couldn’t load the conversation');
+    });
+
+    /** The room sheet — the other surface the same component renders on. */
+    const sheet = async (claims: ObservatoryClaim[]) => {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'r1', name: 'general', memberAgentIds: ['ava'] })],
+          claims,
+          agents: [agent({ id: 'ava', name: 'ava', location: 'r1', holding: claims.map((c) => c.slug) })],
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await userEvent.click(
+        Array.from(container.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
+          b.textContent?.includes('#general'),
+        )! as HTMLElement,
+      );
+      return container;
+    };
+
+    it('a claim with no conversation yet says so, and still lets you open one', async () => {
+      // No thread, viewed in a room — the send OPENS the first thread there,
+      // so there is nothing to preview and the row must say that, not sit blank.
+      const c = await sheet([claim({ slug: 'fresh', owner: 'ava', threadId: null, threadUrl: null, sessionId: null })]);
+      const held = c.querySelector('.nc-of-sheet-held-row')! as HTMLElement;
+      await userEvent.selectOptions(held.querySelector('.nc-obs-actions-who')! as HTMLSelectElement, 'ava');
+      await userEvent.click(held.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      expect(mockDetail).not.toHaveBeenCalled();
+      expect(held.querySelector('.nc-obs-steer-thread')).toBeFalsy();
+      expect(held.querySelector('.nc-obs-steer-nopane')!.textContent).toBe(
+        'no conversation yet — this opens the first one',
+      );
+      expect(held.querySelector('.nc-obs-steer-target')!.textContent).toBe('opens a new thread in #general');
+      expect(held.querySelector('.nc-obs-steer textarea')).toBeTruthy();
+    });
+
+    it('the room sheet gets the same pane — it is the same component', async () => {
+      mockDetail.mockResolvedValue(detail(['in the room']));
+      const container = await sheet([
+        claim({ slug: 'migration', owner: 'ava', threadUrl: 'https://x/t', sessionId: 'sess-sheet' }),
+      ]);
+      const held = container.querySelector('.nc-of-sheet-held-row')! as HTMLElement;
+      await userEvent.selectOptions(held.querySelector('.nc-obs-actions-who')! as HTMLSelectElement, 'ava');
+      await userEvent.click(held.querySelector('.nc-obs-actions-steer')! as HTMLElement);
+      expect(mockDetail).toHaveBeenCalledWith('sess-sheet');
+      expect(held.querySelector('.nc-obs-steer-thread .nc-transcript-text')!.textContent!.trim()).toBe('in the room');
     });
   });
 

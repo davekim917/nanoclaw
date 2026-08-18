@@ -20,7 +20,8 @@ import { relAge } from '../lib/derive.js';
 import { type BoardRoute } from './BoardShell.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildLedger, classify, dueLabel, type Commitment } from './commitments.js';
-import { assignItem, nudgeClaim, steerWork } from '../lib/api.js';
+import { assignItem, getSessionDetail, nudgeClaim, steerWork, type SessionTranscriptEntry } from '../lib/api.js';
+import { TranscriptList, normalizeSessionEntry } from './TranscriptList.js';
 import { OfficeMap } from './OfficeMap.js';
 import { buildOfficeData, agentState } from './office-data.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
@@ -233,6 +234,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
             slug,
             threadId: bySlug.get(slug)?.threadId ?? null,
             threadUrl: bySlug.get(slug)?.threadUrl ?? null,
+            sessionId: bySlug.get(slug)?.sessionId ?? null,
           })),
           state: room.agents.find((x) => x.name === a.name)?.status ?? 'idle',
         })),
@@ -526,6 +528,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                                   slug={h.slug}
                                   threadId={h.threadId}
                                   threadUrl={h.threadUrl}
+                                  sessionId={h.sessionId}
                                   ownerAgent={a.id}
                                   room={{
                                     key: selectedRoomAgents.key,
@@ -716,6 +719,7 @@ function HeldRow({
   slug,
   threadId,
   threadUrl,
+  sessionId,
   ownerAgent,
   room,
   assign,
@@ -723,6 +727,7 @@ function HeldRow({
   slug: string;
   threadId: string | null;
   threadUrl: string | null;
+  sessionId: string | null;
   ownerAgent: string | null;
   /** The room this row is being VIEWED in — see workRoom. */
   room?: { key?: string | null; name?: string | null };
@@ -734,6 +739,7 @@ function HeldRow({
       <WorkActions
         target={{ kind: 'claim', slug, stuck: false }}
         threadUrl={threadUrl}
+        sessionId={sessionId}
         room={workRoom(threadId, room)}
         ownerAgent={ownerAgent}
         {...(assign ? { wiring: assign } : {})}
@@ -1111,6 +1117,72 @@ export type WorkTarget =
   | { kind: 'item'; id: string; channel?: string | undefined; assignable: boolean };
 
 /**
+ * Transcripts already fetched this page-load, keyed by session.
+ *
+ * ponytail: no invalidation and no SSE subscription — the pane is "what was
+ * just said, so you know what you are answering", and re-opening a composer
+ * must not re-hit the API. Subscribe it to `session_event` the way
+ * SessionDetail does if a steer's own reply ever needs to land here live.
+ */
+const threadCache = new Map<string, SessionTranscriptEntry[]>();
+
+/**
+ * The conversation, inline, above the box you are about to type in.
+ *
+ * The legacy dashboard made you leave the board to read a thread; a claim slug
+ * is a code name, so steering one meant steering work you could not identify.
+ * Same renderer the session page uses ({@link TranscriptList}) — a thread must
+ * not read two different ways in two places — but ordered oldest-first and
+ * pinned to the bottom, because what you are answering is the LAST thing said.
+ */
+function ThreadPane({ sessionId }: { sessionId: string | null }) {
+  const [entries, setEntries] = useState<SessionTranscriptEntry[] | null>(
+    sessionId ? (threadCache.get(sessionId) ?? null) : null,
+  );
+  const [failed, setFailed] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!sessionId) {
+      setEntries(null);
+      return;
+    }
+    const hit = threadCache.get(sessionId);
+    if (hit) {
+      setEntries(hit);
+      return;
+    }
+    let live = true;
+    setFailed(false);
+    void getSessionDetail(sessionId)
+      .then((d) => {
+        threadCache.set(sessionId, d.transcript);
+        if (live) setEntries(d.transcript);
+      })
+      .catch(() => {
+        if (live) setFailed(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
+    const el = box.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [entries]);
+
+  if (!sessionId) return <p className="nc-obs-steer-nopane">no conversation yet — this opens the first one</p>;
+  if (failed) return <p className="nc-obs-steer-nopane">couldn’t load the conversation</p>;
+  if (!entries) return <p className="nc-obs-steer-nopane">reading the thread…</p>;
+  return (
+    <div className="nc-obs-steer-thread" ref={box} data-thread={sessionId}>
+      <TranscriptList entries={[...entries].reverse().map(normalizeSessionEntry)} />
+    </div>
+  );
+}
+
+/**
  * The action row every claim and every item gets, everywhere it renders: the
  * link back to its thread, a composer for saying something into that thread,
  * and the select that hands it to somebody.
@@ -1127,6 +1199,7 @@ export type WorkTarget =
 function WorkActions({
   target,
   threadUrl,
+  sessionId,
   wiring,
   room,
   ownerAgent,
@@ -1134,6 +1207,12 @@ function WorkActions({
 }: {
   target: WorkTarget;
   threadUrl: string | null;
+  /**
+   * The conversation behind this row, when there is one. A claim slug is a
+   * coded name — you cannot know what `xzo-whats-new-817` is about without
+   * reading its thread, so opening the composer opens the thread WITH it.
+   */
+  sessionId?: string | null;
   wiring?: AssignWiring;
   /** The room this row belongs to — narrows the option list. Both fields may be null. */
   room: { key?: string | null; name?: string | null };
@@ -1275,6 +1354,7 @@ function WorkActions({
           <p className="nc-obs-steer-target">
             {threadUrl ? 'goes into the existing thread' : `opens a new thread in ${hashed(room.name)}`}
           </p>
+          <ThreadPane sessionId={sessionId ?? null} />
           {decide && (
             <div className="nc-obs-steer-chips" role="group" aria-label="One-tap answers">
               {DECISION_CHIPS.map((c) => (
@@ -1346,6 +1426,27 @@ function ItemRow({
   const item = c.item;
   const roomLink = item.channel ? roomLinks?.get(item.channel.replace(/^#/, '').toLowerCase()) : undefined;
   const ship = decide ? shipInstruction(item.nextAction) : null;
+  const shipTo = ship ? shipAddressee(ship, assign?.agents ?? []) : null;
+  const [shipState, setShipState] = useState<{ phase: 'idle' | 'busy' | 'done' | 'error'; note?: string; url?: string }>(
+    { phase: 'idle' },
+  );
+  // One click fires the send (operator ruling,
+  // 2026-08-18: "clicking should be 1 click instead of it opening up the row
+  // and having to click send again"). The
+  // button only renders when the instruction names an addressee on this
+  // floor, so the one click can never land on a dead composer; an
+  // unresolvable handle keeps the old open-the-row behavior instead.
+  const fireShip = async () => {
+    if (!assign || !ship || !shipTo) return;
+    setShipState({ phase: 'busy' });
+    const who = assign.agents.find((a) => a.id === shipTo)?.name ?? 'that agent';
+    try {
+      const r = await steerWork(assign.workgroupId, { itemId: item.id }, shipTo, ship, item.channel ?? undefined);
+      setShipState({ phase: 'done', note: `sent — ${who} was asked in the thread`, ...(r.threadUrl ? { url: r.threadUrl } : {}) });
+    } catch (e) {
+      setShipState({ phase: 'error', note: actionError(e, who, item.channel ?? undefined) });
+    }
+  };
   return (
     <li
       className={`nc-obs-ledger-row ${c.state} ${item.blocksRelease ? 'blocks' : ''}`}
@@ -1373,24 +1474,34 @@ function ItemRow({
       {decide && (item.nextAction || ship) && (
         <div className="nc-obs-decide-line">
           {item.nextAction && <p className="nc-obs-decide-ask">{item.nextAction}</p>}
-          {/* One tap to the confirm, never past it. The board named an exact
-              instruction, so the button IS that instruction — it opens the row
-              with the composer already holding it and the addressee already
-              picked, and the same send every other steer goes through is still
-              a separate, deliberate press. Collapsed rows only: once the box is
-              open it is the surface, and a button that silently disagreed with
-              text the operator had edited would be the worst of both. */}
-          {ship && assign && !expanded && (
+          {/* The board named an exact instruction, so the button IS that
+              instruction — one click sends it as you (operator ruling, 2026-08-18;
+              this replaced the earlier open-the-confirm step). Collapsed rows
+              only: once the composer is open it is the surface, and a button
+              that ignored text the operator had edited would be worse than
+              either. An instruction whose handle matches nobody on this floor
+              falls back to opening the row, never to a guessed addressee. */}
+          {ship && assign && !expanded && shipState.phase !== 'done' && (
             <button
               type="button"
               className="nc-obs-ship"
               data-ship={ship}
-              title="posts in the work's thread as you"
-              onClick={onToggle}
+              title={shipTo ? 'sends into the work’s thread as you' : 'opens the row to pick who this goes to'}
+              onClick={shipTo ? fireShip : onToggle}
+              disabled={shipState.phase === 'busy'}
             >
-              send: <span className="mono">{ship}</span>
+              {shipState.phase === 'busy' ? 'sending…' : (
+                <>send: <span className="mono">{ship}</span></>
+              )}
             </button>
           )}
+          {shipState.phase === 'done' && (
+            <div className="nc-obs-actions-done">
+              {shipState.note}
+              {shipState.url ? <> — <OutLink href={shipState.url}>open thread</OutLink></> : null}
+            </div>
+          )}
+          {shipState.phase === 'error' && <span className="nc-obs-actions-err">{shipState.note}</span>}
         </div>
       )}
       {expanded && (
@@ -2064,6 +2175,7 @@ function ClaimRow({
           <WorkActions
             target={{ kind: 'claim', slug: c.slug, stuck }}
             threadUrl={c.threadUrl}
+            sessionId={c.sessionId}
             room={workRoom(c.threadId, room)}
             ownerAgent={ownerAgent}
             {...(assign ? { wiring: assign } : {})}
@@ -2319,6 +2431,7 @@ function AgentDrawer({
                       slug={c.slug}
                       threadId={c.threadId}
                       threadUrl={c.threadUrl}
+                      sessionId={c.sessionId}
                       ownerAgent={agent.id}
                       room={{ key: roomKey, name: room?.name ?? null }}
                       {...(assign ? { assign } : {})}
@@ -2374,6 +2487,7 @@ function AgentDrawer({
                     slug={c.slug}
                     threadId={c.threadId}
                     threadUrl={c.threadUrl}
+                    sessionId={c.sessionId}
                     ownerAgent={agent.id}
                     room={{ key: roomKey, name: room?.name ?? null }}
                     {...(assign ? { assign } : {})}
