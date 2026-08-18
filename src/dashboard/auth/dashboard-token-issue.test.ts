@@ -8,6 +8,10 @@ vi.mock('../../db/messaging-groups.js', () => ({
   getMessagingGroup: vi.fn(),
 }));
 
+vi.mock('../../modules/permissions/user-dm.js', () => ({
+  ensureUserDm: vi.fn(),
+}));
+
 vi.mock('../db/dashboard-tokens.js', () => ({
   issueDashboardToken: vi.fn(),
 }));
@@ -31,6 +35,7 @@ vi.mock('../../command-gate.js', () => ({
 import { dashboardTokenIssue } from './dashboard-token-issue.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { ensureUserDm } from '../../modules/permissions/user-dm.js';
 import { issueDashboardToken } from '../db/dashboard-tokens.js';
 import type { MessagingGroup } from '../../types.js';
 import crypto from 'crypto';
@@ -53,6 +58,32 @@ function makeSlackMg(): MessagingGroup {
     name: null,
     is_group: 0,
     unknown_sender_policy: 'public',
+    denied_at: null,
+    created_at: new Date().toISOString(),
+  };
+}
+
+function makeSlackChannelMg(): MessagingGroup {
+  return {
+    id: 'mg-channel-1',
+    channel_type: 'slack-test',
+    platform_id: 'channel-platform-1',
+    name: '#shared-channel',
+    is_group: 1,
+    unknown_sender_policy: 'public',
+    denied_at: null,
+    created_at: new Date().toISOString(),
+  };
+}
+
+function makeSlackDmMg(): MessagingGroup {
+  return {
+    id: 'mg-dm-1',
+    channel_type: 'slack-test',
+    platform_id: 'dm-platform-1',
+    name: null,
+    is_group: 0,
+    unknown_sender_policy: 'strict',
     denied_at: null,
     created_at: new Date().toISOString(),
   };
@@ -167,5 +198,87 @@ describe('dashboardTokenIssue', () => {
     // Must NOT call issueDashboardToken (no orphan token rows)
     expect(issueDashboardToken).not.toHaveBeenCalled();
     expect(deliverMock).not.toHaveBeenCalled();
+  });
+
+  it('test_dashboardTokenIssue_group_routes_link_to_dm_not_channel', async () => {
+    const deliverMock = vi.fn().mockResolvedValue('msg-id');
+    vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
+    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackChannelMg());
+    vi.mocked(ensureUserDm).mockResolvedValue(makeSlackDmMg());
+    vi.mocked(issueDashboardToken).mockReturnValue({
+      id: 1,
+      user_id: 'u1',
+      token_hmac: 'hmac',
+      issued_at: new Date().toISOString(),
+      expires_at: new Date().toISOString(),
+      used_at: null,
+    });
+
+    await dashboardTokenIssue(makeCtx());
+
+    expect(ensureUserDm).toHaveBeenCalledWith('u1');
+    expect(issueDashboardToken).toHaveBeenCalledOnce();
+    expect(deliverMock).toHaveBeenCalledTimes(2);
+
+    // First deliver: the DM, carrying the token.
+    const dmCall = deliverMock.mock.calls[0];
+    expect(dmCall[0]).toBe('slack-test');
+    expect(dmCall[1]).toBe('dm-platform-1'); // the DM's platform_id, NOT the channel's
+    const dmContent = JSON.parse(dmCall[4] as string) as { text: string };
+    expect(dmContent.text).toMatch(/#token=[0-9a-f]{64}/);
+
+    // Second deliver: the channel, credential-free.
+    const channelCall = deliverMock.mock.calls[1];
+    expect(channelCall[0]).toBe('slack-test');
+    expect(channelCall[1]).toBe('channel-platform-1'); // back to the original channel
+    const channelContent = JSON.parse(channelCall[4] as string) as { text: string };
+    expect(channelContent.text).not.toMatch(/token=/);
+    expect(channelContent.text).not.toMatch(/[0-9a-f]{64}/);
+    expect(channelContent.text).not.toMatch(/https?:\/\//);
+  });
+
+  it('test_dashboardTokenIssue_group_no_dm_path_fails_closed', async () => {
+    const deliverMock = vi.fn().mockResolvedValue('msg-id');
+    vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
+    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackChannelMg());
+    vi.mocked(ensureUserDm).mockResolvedValue(null); // platform has no DM capability, or openDM threw
+
+    await dashboardTokenIssue(makeCtx());
+
+    // No credential minted when there's nowhere private to put it.
+    expect(issueDashboardToken).not.toHaveBeenCalled();
+
+    // Exactly one message, and it carries no URL, no token, no hint that a
+    // credential exists.
+    expect(deliverMock).toHaveBeenCalledOnce();
+    const call = deliverMock.mock.calls[0];
+    expect(call[0]).toBe('slack-test');
+    expect(call[1]).toBe('channel-platform-1');
+    const content = JSON.parse(call[4] as string) as { text: string };
+    expect(content.text).not.toMatch(/token=/);
+    expect(content.text).not.toMatch(/[0-9a-f]{64}/);
+    expect(content.text).not.toMatch(/https?:\/\//);
+  });
+
+  it('test_dashboardTokenIssue_dm_invocation_never_calls_ensureUserDm', async () => {
+    // Regression: a DM invocation is already private — must not pay the
+    // extra openDM round trip, and must reply in the same conversation.
+    const deliverMock = vi.fn().mockResolvedValue('msg-id');
+    vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverMock } as never);
+    vi.mocked(getMessagingGroup).mockReturnValue(makeSlackMg());
+    vi.mocked(issueDashboardToken).mockReturnValue({
+      id: 1,
+      user_id: 'u1',
+      token_hmac: 'hmac',
+      issued_at: new Date().toISOString(),
+      expires_at: new Date().toISOString(),
+      used_at: null,
+    });
+
+    await dashboardTokenIssue(makeCtx());
+
+    expect(ensureUserDm).not.toHaveBeenCalled();
+    expect(deliverMock).toHaveBeenCalledOnce();
+    expect(deliverMock.mock.calls[0][1]).toBe('platform-1');
   });
 });

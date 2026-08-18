@@ -5,6 +5,7 @@ import { issueDashboardToken } from '../db/dashboard-tokens.js';
 import { dashboardSessionTtlHours, resolveServerKey } from './cookie.js';
 import { registerInterceptHandler } from '../../command-gate.js';
 import type { InterceptContext } from '../../command-gate.js';
+import { ensureUserDm } from '../../modules/permissions/user-dm.js';
 import { log } from '../../log.js';
 
 /**
@@ -48,6 +49,12 @@ export function mintDashboardTokenUrl(userId: string): { url: string; ttlHours: 
   return { url: `${dashboardUrl}#token=${rawToken}`, ttlHours };
 }
 
+/** Login-link text, shared by the DM-direct and DM-redirect paths below. */
+function loginLinkText(url: string, ttlHours: number): string {
+  // One clickable link, not a token to copy by hand.
+  return `Open your dashboard (valid ${formatTtl(ttlHours)}, works once):\n${url}`;
+}
+
 export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> {
   const mg = getMessagingGroup(ctx.replyMessagingGroupId);
   if (!mg) {
@@ -55,22 +62,58 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
     return;
   }
 
-  const { url, ttlHours } = mintDashboardTokenUrl(ctx.userId);
-
   const adapter = getDeliveryAdapter();
-  if (adapter) {
+  if (!adapter) {
+    log.warn('dashboardTokenIssue: no delivery adapter available');
+    return;
+  }
+
+  // The token is a bearer credential: whoever loads the URL first
+  // authenticates as `ctx.userId`, no matter who actually clicked it. A DM
+  // is safe (only the invoker is present). A group/channel is NOT — every
+  // member sees the message, so the token must never be posted there. Route
+  // it to the invoker's DM instead, opening one lazily if needed (same
+  // primitive approvals/host notifications already use to cold-DM a user).
+  const deliveryMg = mg.is_group ? await ensureUserDm(ctx.userId) : mg;
+
+  if (!deliveryMg) {
+    // No DM path on this platform (no adapter openDM support, or it threw —
+    // e.g. the user has DMs closed). Fail closed: mint nothing, and say
+    // nothing that reveals a credential exists to mint.
+    log.warn('dashboardTokenIssue: no private delivery path, refusing to mint', {
+      userId: ctx.userId,
+      channelType: mg.channel_type,
+    });
     await adapter.deliver(
       mg.channel_type,
       mg.platform_id,
       null,
       'chat',
-      JSON.stringify({
-        // One clickable link, not a token to copy by hand.
-        text: `Open your dashboard (valid ${formatTtl(ttlHours)}, works once):\n${url}`,
-      }),
+      JSON.stringify({ text: "I can't send that privately here. DM me and run it again." }),
     );
-  } else {
-    log.warn('dashboardTokenIssue: no delivery adapter available');
+    return;
+  }
+
+  const { url, ttlHours } = mintDashboardTokenUrl(ctx.userId);
+  await adapter.deliver(
+    deliveryMg.channel_type,
+    deliveryMg.platform_id,
+    null,
+    'chat',
+    JSON.stringify({ text: loginLinkText(url, ttlHours) }),
+  );
+
+  // Redirected to a DM from a group — leave a credential-free breadcrumb in
+  // the channel so the invoker knows to check DMs instead of assuming the
+  // command silently failed.
+  if (deliveryMg.id !== mg.id) {
+    await adapter.deliver(
+      mg.channel_type,
+      mg.platform_id,
+      null,
+      'chat',
+      JSON.stringify({ text: 'Sent you a DM with your dashboard link.' }),
+    );
   }
 }
 
