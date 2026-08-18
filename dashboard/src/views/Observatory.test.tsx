@@ -46,8 +46,10 @@ import {
   actionError,
   claimOwnerLabel,
   workRoom,
+  decisionRows,
+  shipInstruction,
 } from './Observatory.js';
-import type { Commitment } from './commitments.js';
+import { buildLedger, type Commitment } from './commitments.js';
 import { RouteNav } from './BoardShell.js';
 import useSWR from 'swr';
 import { assignItem, nudgeClaim, steerWork } from '../lib/api.js';
@@ -190,7 +192,7 @@ function mockData(
 }
 
 /** Click a segment of the top-bar control — the only way to a non-default view. */
-async function segment(c: HTMLElement, view: 'overview' | 'board') {
+async function segment(c: HTMLElement, view: 'overview' | 'decisions' | 'board') {
   await userEvent.click(c.querySelector(`.nc-of-seg-btn[data-view="${view}"]`)! as HTMLElement);
 }
 
@@ -450,12 +452,14 @@ describe('Observatory', () => {
     });
 
     // obs.C.12 — Claims and Schedule were segments that showed one card the job
-    // board already carries. Two segments now; nothing they owned is gone.
-    it('offers exactly two segments, and the job board still carries both cards', async () => {
+    // board already carries, and are gone. obs.D.1 added Decisions, which is
+    // the opposite case: a question no card on this page answered.
+    it('offers exactly three segments, and the job board still carries both cards', async () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       expect(Array.from(container.querySelectorAll('.nc-of-seg-btn')).map((b) => b.getAttribute('data-view'))).toEqual([
         'overview',
+        'decisions',
         'board',
       ]);
       await segment(container, 'board');
@@ -1268,6 +1272,152 @@ describe('Observatory', () => {
       await segment(container, 'board');
       // "need a person" narrows the whole page to the human-mover item.
       expect(container.querySelector('.nc-of-tab[data-tab="queue"]')!.textContent).toBe('Queue 3');
+    });
+  });
+
+  // obs.D.1 — the ranked queue of what awaits a HUMAN, with the answer already
+  // in the box. No new transport: the same steer endpoint every other row uses.
+  describe('the decisions view', () => {
+    const mockSteer = vi.mocked(steerWork);
+
+    // One of each shape the real board publishes: a release blocker, an
+    // ordinary ship instruction, a prose-only ask, and an item no person owes.
+    const decisions = () => [
+      releaseItem({
+        id: 'XZO#912',
+        title: 'ready to ship',
+        nextMover: 'human',
+        owner: 'kit',
+        channel: '#dispatch',
+        nextAction: 'kit or robin records @nova ship 912 -- ready, ships on a human word',
+      }),
+      releaseItem({
+        id: 'XZO#804',
+        title: 'the blocker',
+        nextMover: 'human',
+        owner: 'robin',
+        channel: '#dispatch',
+        blocksRelease: true,
+        nextAction: 'robin picks accept-as-is vs. authenticated-endpoint -- stalled 21h',
+      }),
+      releaseItem({ id: 'XZO#7', title: 'an agent is on it', nextMover: 'agent', owner: 'ava', channel: '#dispatch' }),
+    ];
+    const open = async (items: ReleaseItem[] = decisions()) => {
+      mockData(
+        snapshot({
+          agents: [agent({ id: 'ag-ava', name: 'ava' })],
+          releaseState: releaseState({ items }),
+        }),
+      );
+      const r = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await segment(r.container, 'decisions');
+      return r;
+    };
+    const ids = (c: HTMLElement) =>
+      Array.from(c.querySelectorAll('[data-section="decisions"] .nc-obs-ledger-row')).map((r) =>
+        r.getAttribute('data-ledger-id'),
+      );
+    const expandRow = async (c: HTMLElement, id: string) =>
+      userEvent.click(c.querySelector(`[data-ledger-id="${id}"] .nc-obs-ledger-btn`)! as HTMLElement);
+    const composer = (c: HTMLElement) => c.querySelector('.nc-obs-steer textarea') as HTMLTextAreaElement | null;
+
+    it('shows only human-mover items, in the ledger order — the blocker leads', async () => {
+      const { container } = await open();
+      expect(ids(container)).toEqual(['XZO#804', 'XZO#912']);
+      // The segment states the same count it is showing.
+      expect(container.querySelector('.nc-of-seg-btn[data-view="decisions"] .nc-of-tab-n')!.textContent).toBe('2');
+      expect(container.querySelector('.nc-of-bar-count')!.textContent).toBe('2 awaiting a person');
+    });
+
+    it('states the ask on the row, before anything is expanded', async () => {
+      const { container } = await open();
+      expect(
+        Array.from(container.querySelectorAll('.nc-obs-decide-ask')).map((e) => e.textContent),
+      ).toEqual([
+        'robin picks accept-as-is vs. authenticated-endpoint -- stalled 21h',
+        'kit or robin records @nova ship 912 -- ready, ships on a human word',
+      ]);
+      // And is not then repeated inside the row it already sits above.
+      await expandRow(container, 'XZO#912');
+      expect(container.querySelector('.nc-obs-ledger-next')).toBeFalsy();
+    });
+
+    it('expanding prefills the composer with the instruction alone, not the prose around it', async () => {
+      const { container } = await open();
+      await expandRow(container, 'XZO#912');
+      expect(composer(container)!.value).toBe('@nova ship 912');
+    });
+
+    it('an ask with no instruction to relay opens an empty box rather than a paraphrase', async () => {
+      const { container } = await open();
+      await expandRow(container, 'XZO#804');
+      expect(composer(container)!.value).toBe('');
+    });
+
+    it('a chip fills the box and nothing else — the send is still a separate press', async () => {
+      mockSteer.mockResolvedValue({ ok: true, seriesId: 's7', threadUrl: null });
+      const { container } = await open();
+      await expandRow(container, 'XZO#804');
+      await userEvent.click(container.querySelector('[data-chip="approve as proposed"]')! as HTMLElement);
+      expect(composer(container)!.value).toBe('approve as proposed');
+      expect(mockSteer).not.toHaveBeenCalled();
+
+      // "no" is left mid-sentence for the operator to finish.
+      await userEvent.click(container.querySelector('[data-chip="no — …"]')! as HTMLElement);
+      expect(composer(container)!.value).toBe('no — ');
+
+      await userEvent.selectOptions(container.querySelector('.nc-obs-actions-who')! as HTMLElement, 'ag-ava');
+      await userEvent.click(
+        Array.from(container.querySelectorAll('.nc-obs-steer button')).find((x) => x.textContent === 'send')! as HTMLElement,
+      );
+      expect(mockSteer).toHaveBeenCalledWith('wg-1', { itemId: 'XZO#804' }, 'ag-ava', 'no —', '#dispatch');
+    });
+
+    it('a member gets the row and no prefilled box — the composer is still gated', async () => {
+      mockData(
+        snapshot({
+          agents: [agent({ id: 'ag-ava', name: 'ava' })],
+          releaseState: releaseState({ items: decisions() }),
+        }),
+      );
+      const memberMe = { user_id: 'u2', scopes: { role: 'member', allowed_group_ids: [], no_filter: false } };
+      const { container } = render(<Observatory authMe={memberMe} route="observatory" onRouteChange={noop} />);
+      await segment(container, 'decisions');
+      await expandRow(container, 'XZO#912');
+      expect(container.querySelector('.nc-obs-decide-ask')).toBeTruthy();
+      expect(composer(container)).toBeFalsy();
+    });
+
+    it('says so plainly when nothing is waiting on a person', async () => {
+      const { container } = await open([
+        releaseItem({ id: 'XZO#7', title: 'an agent is on it', nextMover: 'agent', owner: 'ava' }),
+      ]);
+      expect(container.querySelector('[data-section="decisions"] .nc-obs-ledger-empty')!.textContent).toBe(
+        'nothing needs a human right now',
+      );
+      expect(container.querySelector('.nc-of-seg-btn[data-view="decisions"] .nc-of-tab-n')!.textContent).toBe('0');
+    });
+
+    it('shipInstruction: the relayable words only, across the shapes the board writes', () => {
+      expect(shipInstruction('kit/robin record @nova ship 869; ava presses the merge')).toBe('@nova ship 869');
+      expect(shipInstruction('robin records @nova ship pipeline 23 -- mechanically ready')).toBe(
+        '@nova ship pipeline 23',
+      );
+      expect(shipInstruction('robin or kit answers/acts -- see why')).toBeNull();
+      expect(shipInstruction(undefined)).toBeNull();
+    });
+
+    it('decisionRows: keeps a BREACHED decision, which the headline slice drops', () => {
+      const overdue = releaseItem({
+        id: 'XZO#1',
+        nextMover: 'human',
+        owner: 'robin',
+        dueAt: new Date(Date.now() - 86_400_000).toISOString(),
+      });
+      const onTrack = releaseItem({ id: 'XZO#2', nextMover: 'human', owner: 'robin' });
+      const rows = decisionRows([onTrack, overdue]);
+      expect(rows.map((r) => r.item.id)).toEqual(['XZO#1', 'XZO#2']);
+      expect(buildLedger([onTrack, overdue]).counts.person).toBe(1);
     });
   });
 

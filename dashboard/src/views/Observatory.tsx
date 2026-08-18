@@ -75,14 +75,20 @@ const clampMapScale = (v: number) => Math.min(MAP_SCALE_MAX, Math.max(MAP_SCALE_
 /**
  * The segmented control. Local state — the Observatory has exactly one URL.
  *
- * Two segments, not four. "Claims" and "Schedule" each showed exactly the card
- * the job board already carries beneath its table, so picking them swapped a
- * three-card view for a one-card one and called it a different place. The cards
- * themselves are untouched — they live under Job board, where the work they
- * describe is.
+ * Three segments, not five. "Claims" and "Schedule" each showed exactly the
+ * card the job board already carries beneath its table, so picking them swapped
+ * a three-card view for a one-card one and called it a different place. The
+ * cards themselves are untouched — they live under Job board, where the work
+ * they describe is.
+ *
+ * "Decisions" earns its place on the opposite argument: it is not a card that
+ * exists somewhere else. It is the one question a two-person shop opens this
+ * page to ask — what is waiting on ME — and answering it from Overview meant
+ * reading past a floor plan, a filter bar and every row an agent already owns.
  */
 const VIEWS = [
   { key: 'overview', label: 'Overview' },
+  { key: 'decisions', label: 'Decisions' },
   { key: 'board', label: 'Job board' },
 ] as const;
 
@@ -244,6 +250,13 @@ export function Observatory({ authMe }: ObservatoryProps) {
 
   const ledgerCounts = useMemo(() => buildLedger(ownerFilteredItems).counts, [ownerFilteredItems]);
 
+  // The Decisions badge counts EVERY item whose next mover is a person,
+  // breached ones included — a decision that has already slipped its deadline
+  // is still a decision, and it is the one you want at the top of the list.
+  // Deliberately not the headline's "need a person" tile, which excludes the
+  // breach tier; see the note on that tile.
+  const decisionCount = ownerFilteredItems.filter((i) => i.nextMover === 'human').length;
+
   // The office map's own notion of "in trouble" (office-data.ts's
   // agentState), recomputed here off the FULL board rather than the
   // room-filtered one — the drawer answers about one agent, not one room.
@@ -302,7 +315,9 @@ export function Observatory({ authMe }: ObservatoryProps) {
   const barMeta =
     view === 'board'
       ? releaseCounts(ownerFilteredItems) || 'nothing open'
-      : `${agents.length} agents · ${rooms.length} channels`;
+      : view === 'decisions'
+        ? `${decisionCount} awaiting a person`
+        : `${agents.length} agents · ${rooms.length} channels`;
 
   return (
     <div className="nc-frame nc-of">
@@ -320,6 +335,9 @@ export function Observatory({ authMe }: ObservatoryProps) {
               onClick={() => setView(v.key)}
             >
               {v.label}
+              {/* Same count grammar the job-board tabs use — a number beside
+                  the label, never a badge with its own colour. */}
+              {v.key === 'decisions' && <> <span className="nc-of-tab-n">{decisionCount}</span></>}
             </button>
           ))}
         </nav>
@@ -553,6 +571,14 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       {...(assign ? { assign } : {})}
                     />
                   </section>
+                )}
+
+                {view === 'decisions' && (
+                  <DecisionsCard
+                    items={ownerFilteredItems}
+                    roomLinks={roomLinks}
+                    {...(assign ? { assign } : {})}
+                  />
                 )}
 
                 {view === 'board' && (
@@ -1104,6 +1130,7 @@ function WorkActions({
   wiring,
   room,
   ownerAgent,
+  decide,
 }: {
   target: WorkTarget;
   threadUrl: string | null;
@@ -1112,13 +1139,30 @@ function WorkActions({
   room: { key?: string | null; name?: string | null };
   /** The current owner as an agent id — the default addressee. Null when a human holds it. */
   ownerAgent: string | null;
+  /**
+   * Decisions view only: open the composer already, with the ask in the box.
+   * The composer, the confirm line and the send are the SAME ones every other
+   * row gets — this only decides what is in the box when it opens.
+   */
+  decide?: { prefill: string };
 }) {
   const choices = wiring ? agentsForRoom(wiring.agents, wiring.rooms, room) : [];
+  // Somewhere for the ask to LAND: the work's own thread, or a room named by
+  // the surface it is being viewed in (which is what lets the server open one).
+  // Neither means no action is offered at all — a button whose only outcome is
+  // the server refusing it is worse than the honest empty state beside it.
+  const canLand = Boolean(threadUrl) || Boolean(room.name);
+  // Whether this row can send AT ALL. The Decisions view opens the composer on
+  // expand, so this gate matters: a member, or a row with nowhere to land,
+  // would otherwise get a prefilled box whose send can only ever be refused.
+  const canSteer = Boolean(wiring) && canLand && choices.length > 0;
+
   const [agentId, setAgentId] = useState(
     ownerAgent && choices.some((a) => a.id === ownerAgent) ? ownerAgent : '',
   );
-  const [composing, setComposing] = useState(false);
-  const [text, setText] = useState('');
+  const [composing, setComposing] = useState(Boolean(decide) && canSteer);
+  const [text, setText] = useState(decide?.prefill ?? '');
+  const box = useRef<HTMLTextAreaElement>(null);
   const [state, setState] = useState<{ phase: 'idle' | 'busy' | 'done' | 'error'; note?: string; url?: string }>({
     phase: 'idle',
   });
@@ -1126,11 +1170,17 @@ function WorkActions({
   const who = choices.find((a) => a.id === agentId)?.name ?? 'that agent';
   const busy = state.phase === 'busy';
 
-  // Somewhere for the ask to LAND: the work's own thread, or a room named by
-  // the surface it is being viewed in (which is what lets the server open one).
-  // Neither means no action is offered at all — a button whose only outcome is
-  // the server refusing it is worse than the honest empty state beside it.
-  const canLand = Boolean(threadUrl) || Boolean(room.name);
+  // A chip only fills the box. Sending is still the operator reading what is
+  // about to go out and pressing send — a one-tap chip that also SENT would be
+  // a one-tap way to say "no" to the wrong piece of work.
+  const tap = (t: string) => {
+    setText(t);
+    const el = box.current;
+    if (el) {
+      el.focus();
+      el.setSelectionRange(t.length, t.length);
+    }
+  };
 
   const primary =
     target.kind === 'claim'
@@ -1225,8 +1275,25 @@ function WorkActions({
           <p className="nc-obs-steer-target">
             {threadUrl ? 'goes into the existing thread' : `opens a new thread in ${hashed(room.name)}`}
           </p>
+          {decide && (
+            <div className="nc-obs-steer-chips" role="group" aria-label="One-tap answers">
+              {DECISION_CHIPS.map((c) => (
+                <button
+                  key={c.label}
+                  type="button"
+                  className="nc-of-chip"
+                  data-chip={c.label}
+                  onClick={() => tap(c.text)}
+                  disabled={busy}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="nc-obs-steer">
             <textarea
+              ref={box}
               aria-label="Steer message"
               rows={2}
               maxLength={2000}
@@ -1264,6 +1331,7 @@ function ItemRow({
   onToggle,
   assign,
   roomLinks,
+  decide = false,
 }: {
   c: Commitment;
   now: number;
@@ -1272,6 +1340,8 @@ function ItemRow({
   assign?: AssignWiring;
   /** Channel name → room permalink; see roomLinkIndex. */
   roomLinks?: Map<string, string>;
+  /** Decisions view: the ask reads on the row, and the composer opens with it. */
+  decide?: boolean;
 }) {
   const item = c.item;
   const roomLink = item.channel ? roomLinks?.get(item.channel.replace(/^#/, '').toLowerCase()) : undefined;
@@ -1296,9 +1366,14 @@ function ItemRow({
         <span className="nc-obs-ledger-room">{item.channel ?? '—'}</span>
         <span className="nc-obs-ledger-age">{c.ageMs !== null ? magnitude(c.ageMs, now + c.ageMs) : '—'}</span>
       </button>
+      {/* On the Decisions view the ask is the point of the row, so it reads
+          BEFORE the row is opened — a ranked list you have to expand item by
+          item to find out what is being asked is not one pass. */}
+      {decide && item.nextAction && <p className="nc-obs-decide-ask">{item.nextAction}</p>}
       {expanded && (
         <div className="nc-obs-ledger-detail">
-          {item.nextAction && <div className="nc-obs-ledger-next">next: {item.nextAction}</div>}
+          {/* Not repeated when the row already states it above. */}
+          {item.nextAction && !decide && <div className="nc-obs-ledger-next">next: {item.nextAction}</div>}
           {item.why && <div>{item.why}</div>}
           <div className="nc-obs-ledger-meta">
             {LEDGER_STATE_LABEL[c.state]}
@@ -1339,6 +1414,7 @@ function ItemRow({
             room={{ name: item.channel ?? null }}
             ownerAgent={null}
             {...(assign ? { wiring: assign } : {})}
+            {...(decide ? { decide: { prefill: shipInstruction(item.nextAction) ?? '' } } : {})}
           />
         </div>
       )}
@@ -1360,6 +1436,7 @@ function ItemTable({
   assign,
   roomLinks,
   head = true,
+  decide = false,
 }: {
   rows: Commitment[];
   now: number;
@@ -1367,6 +1444,8 @@ function ItemTable({
   roomLinks?: Map<string, string>;
   /** The column header. On by default; the queue is titled by its card. */
   head?: boolean;
+  /** Passed straight down — see ItemRow. */
+  decide?: boolean;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
@@ -1392,6 +1471,7 @@ function ItemTable({
             now={now}
             expanded={expanded === c.item.id}
             onToggle={() => setExpanded((p) => (p === c.item.id ? null : c.item.id))}
+            decide={decide}
             {...(assign ? { assign } : {})}
             {...(roomLinks ? { roomLinks } : {})}
           />
@@ -1641,6 +1721,94 @@ function LedgerBoard({
         />
       )}
     </>
+  );
+}
+
+/* ─── Decisions — what is waiting on a person ────────────────────────────── */
+
+/**
+ * Every item whose next mover is a PERSON, in the ledger's own order.
+ *
+ * Not `flowSlice(r) === 'person'`, deliberately: that slice drops anything in
+ * the breach tier, and a decision that has already blown its deadline is the
+ * first one you want to see, not the one that vanishes. Ranking is
+ * `buildLedger`'s — release blockers outright first, then the oldest breach —
+ * so this view and the queue never disagree about which item is worst.
+ */
+export function decisionRows(items: ReleaseItem[], now = Date.now()): Commitment[] {
+  return buildLedger(items, now).rows.filter((r) => r.item.nextMover === 'human');
+}
+
+/**
+ * The relayable instruction inside an ask, if there is one.
+ *
+ * Real asks read "<person> record @<bot> ship 869; <someone> or a human
+ * presses the merge -- self-authored -- stalled 28h". The decision is a
+ * sentence of context, but the ACTION is the four words in the middle, and
+ * those are the words that have to reach the agent. Everything else is prose
+ * for the human and would be noise in the agent's thread — so the box gets the
+ * instruction alone, and prose-only asks get an empty box rather than a
+ * paraphrase this function invented.
+ */
+export function shipInstruction(nextAction?: string): string | null {
+  return nextAction?.match(/@[\w-]+\s+ship\s+[\w-]+(?:\s+\d+)?/i)?.[0] ?? null;
+}
+
+/**
+ * The one-tap answers. Chips SET the box and nothing else — the send is still
+ * the operator reading what is about to go out. "no" is left mid-sentence on
+ * purpose: a refusal with no reason is the one answer that always costs
+ * another round trip.
+ */
+const DECISION_CHIPS: { label: string; text: string }[] = [
+  { label: 'approve as proposed', text: 'approve as proposed' },
+  { label: 'hold — need more info', text: 'hold — need more info' },
+  { label: 'no — …', text: 'no — ' },
+];
+
+/**
+ * The Decisions view: the ranked queue of what awaits a human, each row
+ * carrying its ask and a composer already holding the answer.
+ *
+ * It builds nothing new. The rows are the ledger's, the row grammar is
+ * `ItemRow`'s, the composer and its confirm line are `WorkActions`', and the
+ * send is the same `POST /observatory/steer` every other steer uses. What is
+ * new is only that they arrive together, filtered to the one question a
+ * two-person shop actually opens this page to ask.
+ */
+function DecisionsCard({
+  items,
+  now = Date.now(),
+  assign,
+  roomLinks,
+}: {
+  items: ReleaseItem[];
+  now?: number;
+  assign?: AssignWiring;
+  roomLinks?: Map<string, string>;
+}) {
+  const rows = useMemo(() => decisionRows(items, now), [items, now]);
+  return (
+    <section className="nc-of-card" data-section="decisions">
+      <header className="nc-of-card-head">
+        <span className="nc-of-card-title">Waiting on you</span>
+        <span className="nc-of-card-meta">
+          {rows.length === 0 ? 'nothing open' : `${rows.length} of ${items.length} · worst first`}
+        </span>
+      </header>
+      {rows.length === 0 ? (
+        <div className="nc-obs-ledger-empty">nothing needs a human right now</div>
+      ) : (
+        <ItemTable
+          rows={rows}
+          now={now}
+          head={false}
+          decide
+          {...(assign ? { assign } : {})}
+          {...(roomLinks ? { roomLinks } : {})}
+        />
+      )}
+    </section>
   );
 }
 
