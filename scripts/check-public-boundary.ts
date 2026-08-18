@@ -57,6 +57,11 @@ const GENERIC_IDENTIFIERS = new Set([
   'agent',
   'claude',
   'codex',
+  // Same shape as 'dispatch' below: a Slack channel named "#commercial" put a
+  // common English word in the registry-derived set, where it matched ordinary
+  // prose in long-committed vendored design docs and blocked every commit. The
+  // channel's platform ID stays banned.
+  'commercial',
   'dbt cloud',
   'discord',
   // Common orchestration term (src/modules/orchestrator-dispatch/ and

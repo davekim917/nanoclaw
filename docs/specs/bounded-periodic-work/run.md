@@ -236,3 +236,146 @@ journal (A10), plus the lead's source trace that `delivered` rows are never revo
 **`clear`** — no verified MUST-FIX remains after one bounded correction batch. Known risks carried
 forward: R-1 (a gate bug costs ≤10 min of delay, not loss), R-2 (~1,657 stats/min), and D-3's
 pre-existing 7-day-horizon hole, which this change neither causes nor fixes.
+
+---
+
+## Phase 3 spike — Graphify unconditional full reconcile (2026-08-18)
+
+**Verdict: the premise is wrong. Do not build a change-gate for the 6h full reconcile yet.**
+
+The spike asked whether the 6-hourly unconditional rebuild (`daemon.ts:718-723` → `markDirty`)
+can be made change-driven. It cannot, because the change signal it would gate on is already
+broken — and while investigating that, the daemon was found wedged.
+
+### Live state, measured
+
+```
+graphify daemon           up since 2026-08-15 16:28, CPU 10h37m, RSS 3.6G (MemoryHigh 4G), swap 494M
+workgroup-A    reconciling=true  lastStartedAt 2026-08-17T01:39:52Z   → still running 28.5h later
+workgroup-B dirty=true  reconciling=false  lastCompletedAt 2026-08-17T01:39:52Z
+main         dirty=true  reconciling=false  lastCompletedAt 2026-08-16T22:29:18Z  lagMs 31.8h
+workgroup-C     dirty=true  reconciling=false  lastCompletedAt 2026-08-16T22:29:47Z  lagMs 31.8h
+workgroup-A/workgroup-B     watcherDegraded=true, lastFailure = ENOSPC inotify watch limit
+workgroup-A full-scan input  data/workgroups/<workgroup-A> = 30 GB (canonical repo clones add <0.5 GB)
+workgroup-A index.db         6.9 GB
+inotify watches, system   1,038,202 / 1,048,576  (99.0%)
+  cursor-server 571,722 · graphify 414,173 · host 18,419
+cgroup io.max             8:0 rbps=8000000  (drop-in added 2026-08-13 22:48)
+observed read rate        7.64 MB/s sustained — pinned exactly at the cap
+memory.events             high 908,426  (continuous reclaim against MemoryHigh=4G)
+```
+
+### Causal chain (each link verified in source and on the box)
+
+1. **inotify is exhausted system-wide.** Watch registration fails with ENOSPC, so change events for
+   those paths are never delivered. The code already documents this exact failure
+   (`daemon.ts:563-567`: "without a sticky flag the daemon forgets it is half-blind and keeps
+   serving stale reads as fresh") — `watcherDegraded` is set, reported in `status`, and **acted on
+   nowhere**.
+2. **A broken watcher forces full scans.** `canReconcileIncrementally` (`daemon.ts:911`) requires
+   `pendingFilesystemChanges.size > 0`; watchers are what populate that map. No events → no
+   incremental path → every reconcile is a full scan. The 6h timer is therefore not waste, it is
+   the *compensating control* for the broken signal.
+3. **The 8 MB/s read cap plus MemoryHigh=4G makes a large workgroup's service time exceed its
+   arrival rate.** Page cache counts toward the cgroup, so a working set above `MemoryHigh` is
+   continuously reclaimed and re-read — at 8 MB/s (`memory.events high=908,426`). Mid-run the
+   worker thread sat in `folio_wait_bit_common`, state `D`, on an `etilqs_*` SQLite temp file while
+   the main thread idled in `ep_poll`.
+
+   **Corrected against the outcome:** this is *not* a permanent livelock. workgroup-A's reconcile
+   completed unassisted at 2026-08-18T14:57:14Z — 13 minutes **before** the cgroup properties were
+   changed at 15:10:47Z. The measured shape is:
+
+   ```
+   workgroup-A      2026-08-17T01:39:52Z → 2026-08-18T14:57:14Z   37.3 hours
+   workgroup-B  (2.7 GB index, fits under MemoryHigh)           6 minutes
+   fullReconcileMs timer                                          6 hours
+   ```
+
+   Service time 37.3h against a 6h arrival rate on a strictly serial runner: the backlog is
+   unbounded by construction. That, not a hang, is why main and workgroup-C sat 31.8 hours stale.
+4. **The background runner is strictly serial and reconciles are non-preemptible.** `drain()`
+   (`background-runner.ts:269-275`) awaits one job at a time, and `queueReconcile` passes
+   `preemptActive: false` (`daemon.ts:1254`). One stuck workgroup starves every other one
+   indefinitely — which is why main and workgroup-C have been dirty and idle for 31.8 hours.
+5. The 6h timer re-marks everything dirty on schedule, so this state can never converge.
+6. **Admission requires global fleet quiescence — the dominant mechanism.** `execute()` returns
+   `preempted` whenever `scanInteractivePressure` (`background-runner.ts:103`) finds *any* session
+   in the fleet with a pending/processing trigger chat message lacking a terminal ack. Sampled on
+   the live install every 10s for two minutes: **pressure=true in 11 of 12 samples (92%)**, each
+   scan costing ~820 ms and opening session DB pairs. Background indexing therefore only starts in
+   a fleet-wide quiet moment, and quiet moments get rarer as the fleet grows — the wrong direction.
+
+### Post-change state (2026-08-18T15:11 restart, cap removed, MemoryHigh 12G)
+
+```
+memory.events high        0          (was 908,426 — the memory half of the diagnosis holds)
+read rate                 0 MB/s     (nothing admitted)
+all four workgroups       dirty=true, reconciling=false
+watcherDegraded           true again within 60s of boot — ENOSPC on first watch sync
+```
+
+Removing the resource caps was necessary but not sufficient. With the caps gone the daemon still
+indexes nothing, because admission is blocked 92% of the time and nothing acts on the degraded
+watcher.
+
+**Net effect: the whole fleet was served ~30-hour-stale graphs from 2026-08-17 to 2026-08-18.**
+
+### What this means for D-2
+
+- **Not buildable as scoped.** Gating a rebuild on "did anything change" requires a trustworthy
+  change signal. The watcher is the signal, it is degraded, and nothing in the daemon reacts to
+  that. Fix observation before optimizing the compensating full scan.
+- **The IO cap is not benign defense-in-depth.** The plan's non-goals list assumed it stays
+  "regardless of what phase 3 concludes". That was wrong: an absolute bandwidth ceiling interacting
+  with `MemoryHigh` converted a bounded 40-minute burst into an unbounded stall. `IOWeight=10` was
+  already in the unit since 2026-07-29 and is the correct proportional mechanism.
+- **Fairness is a separate, real defect.** Serial + non-preemptible + one 7 GB workgroup = global
+  starvation, independent of watchers or the IO cap.
+
+### Recommended sequence (operational actions need the user; none taken)
+
+1. Drop the absolute read cap (`IOReadBandwidthMax=`), keep `IOWeight=10`.
+2. Raise `MemoryHigh` above the largest index working set (workgroup-A 6.9 GB → 12G / MemoryMax 16G).
+   Box has 46 GB with 22 GB available.
+3. Restart the daemon to clear the wedged reconcile; confirm workgroup-A completes and the other
+   workgroups drain.
+4. Then, as its own planned change: act on `watcherDegraded` (raise `fs.inotify.max_user_watches`,
+   and/or reduce graphify's 414k watch footprint), and give the background runner per-workgroup
+   fairness so one large index cannot monopolize it.
+5. Only after 4 is a change-gate on the 6h rebuild worth designing.
+
+
+### Outcome after the approved operational batch (2026-08-18)
+
+Applied, in order: cleared `IOReadBandwidthMax` (keeping `IOWeight=10`), raised `MemoryHigh` 4G→12G
+and `MemoryMax` 6G→16G, restarted; then raised `fs.inotify.max_user_watches` 1,048,576 → 2,097,152
+(persisted at `/etc/sysctl.d/60-inotify.conf`) and restarted again so watchers re-register — the
+watcher thread skips roots already in its map, so a raised limit is inert without a restart.
+
+```
+                          before                    after
+inotify watches           1,038,202 / 1,048,576     1,058,168 / 2,097,152   (99% → 50%)
+watcherDegraded           true (both large workgroups)       false (all)
+memory.events high        908,426                   0
+io.max                    8 MB/s absolute           none (IOWeight=10 only)
+fleet graph staleness     ~31.8 h                   < 2 h
+workgroup-A reconcile        37.3 h (2026-08-17→18)    completed 18:06:49Z; new run in progress
+workgroup-C reconcile        stalled 31.8 h            0.6 min (19:51:19 → 19:51:53)
+workgroup-A indexed sources  254,537                   272,548
+```
+
+All four workgroups reconciled between 17:59Z and 19:51Z — the first successful pass since
+2026-08-16. Duration attribution inside that window is partly unresolved: the runner is serial, and
+`lastStartedAt` is overwritten by the next run, so only workgroup-C's 0.6 min is a directly measured
+start→complete pair.
+
+**Not fixed by any of this — the two that need a design change, not a knob:**
+
+1. Admission requires global fleet quiescence (`scanInteractivePressure`, measured 92% blocked).
+   Scales inversely with fleet size.
+2. The background runner is serial and reconciles are non-preemptible, so one large workgroup can
+   still monopolize it once admitted.
+
+D-2 remains **not buildable as scoped**: a change-gate on the 6h rebuild is only worth designing
+after 1 and 2, since until then the constraint is admission and fairness, not redundant work.
