@@ -28,6 +28,7 @@ import {
   upcomingScheduled,
   decisionRows,
   shipInstruction,
+  shipAddressee,
 } from './Observatory.js';
 import { buildLedger } from './commitments.js';
 import { RouteNav } from './BoardShell.js';
@@ -213,7 +214,7 @@ describe('Observatory — actions and sheets', () => {
         nextMover: 'human',
         owner: 'kit',
         channel: '#dispatch',
-        nextAction: 'kit or robin records @nova ship 912 -- ready, ships on a human word',
+        nextAction: 'kit or robin records @ava ship 912 -- ready, ships on a human word',
       }),
       releaseItem({
         id: 'XZO#804',
@@ -259,7 +260,7 @@ describe('Observatory — actions and sheets', () => {
         Array.from(container.querySelectorAll('.nc-obs-decide-ask')).map((e) => e.textContent),
       ).toEqual([
         'robin picks accept-as-is vs. authenticated-endpoint -- stalled 21h',
-        'kit or robin records @nova ship 912 -- ready, ships on a human word',
+        'kit or robin records @ava ship 912 -- ready, ships on a human word',
       ]);
       // And is not then repeated inside the row it already sits above.
       await expandRow(container, 'XZO#912');
@@ -269,7 +270,7 @@ describe('Observatory — actions and sheets', () => {
     it('expanding prefills the composer with the instruction alone, not the prose around it', async () => {
       const { container } = await open();
       await expandRow(container, 'XZO#912');
-      expect(composer(container)!.value).toBe('@nova ship 912');
+      expect(composer(container)!.value).toBe('@ava ship 912');
     });
 
     it('an ask with no instruction to relay opens an empty box rather than a paraphrase', async () => {
@@ -329,6 +330,61 @@ describe('Observatory — actions and sheets', () => {
       );
       expect(shipInstruction('robin or kit answers/acts -- see why')).toBeNull();
       expect(shipInstruction(undefined)).toBeNull();
+    });
+
+    // obs.D.2 — the last inch: the board named an exact instruction, so the
+    // row offers it as one tap. To the CONFIRM, never past it.
+    const shipBtn = (c: HTMLElement, id: string) =>
+      c.querySelector(`[data-ledger-id="${id}"] .nc-obs-ship`) as HTMLElement | null;
+
+    it('offers the instruction as a button, and only where one parses', async () => {
+      const { container } = await open();
+      expect(shipBtn(container, 'XZO#912')!.textContent).toBe('send: @ava ship 912');
+      // Prose-only ask — nothing to relay, so nothing to one-tap.
+      expect(shipBtn(container, 'XZO#804')).toBeFalsy();
+    });
+
+    it('one tap opens the confirm with the exact text, the addressee and where it lands', async () => {
+      const { container } = await open();
+      await userEvent.click(shipBtn(container, 'XZO#912')!);
+      expect(composer(container)!.value).toBe('@ava ship 912');
+      expect((container.querySelector('.nc-obs-actions-who') as HTMLSelectElement).value).toBe('ag-ava');
+      expect(container.querySelector('.nc-obs-steer-target')!.textContent).toBe('opens a new thread in #dispatch');
+      // Opening the confirm is not sending, and the button is gone once its
+      // composer owns the text.
+      expect(mockSteer).not.toHaveBeenCalled();
+      expect(shipBtn(container, 'XZO#912')).toBeFalsy();
+    });
+
+    it('and the confirm sends ids and the text through the same steer endpoint', async () => {
+      mockSteer.mockResolvedValue({ ok: true, seriesId: 's7', threadUrl: null });
+      const { container } = await open();
+      await userEvent.click(shipBtn(container, 'XZO#912')!);
+      await userEvent.click(
+        Array.from(container.querySelectorAll('.nc-obs-steer button')).find((x) => x.textContent === 'send')! as HTMLElement,
+      );
+      expect(mockSteer).toHaveBeenCalledWith('wg-1', { itemId: 'XZO#912' }, 'ag-ava', '@ava ship 912', '#dispatch');
+    });
+
+    it('a member is offered no button — same gate as every other control', async () => {
+      mockData(
+        snapshot({
+          agents: [agent({ id: 'ag-ava', name: 'ava' })],
+          releaseState: releaseState({ items: decisions() }),
+        }),
+      );
+      const memberMe = { user_id: 'u2', scopes: { role: 'member', allowed_group_ids: [], no_filter: false } };
+      const { container } = render(<Observatory authMe={memberMe} route="observatory" onRouteChange={noop} />);
+      await segment(container, 'decisions');
+      expect(container.querySelector('.nc-obs-decide-ask')).toBeTruthy();
+      expect(container.querySelector('.nc-obs-ship')).toBeFalsy();
+    });
+
+    it('shipAddressee: a handle nobody on this floor answers to picks nobody', () => {
+      const agents = [{ id: 'ag-ava', name: 'ava' }];
+      expect(shipAddressee('@ava ship 912', agents)).toBe('ag-ava');
+      expect(shipAddressee('@nova ship 912', agents)).toBeNull();
+      expect(shipAddressee(null, agents)).toBeNull();
     });
 
     it('decisionRows: keeps a BREACHED decision, which the headline slice drops', () => {

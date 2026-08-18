@@ -1972,11 +1972,23 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    inside its grid so a whole sentence may wrap without a column setting the
    board's min width. Weighted, not coloured — the state dot is still the only
    urgency encoding on a row. */
-.nc-of .nc-obs-decide-ask{
+.nc-of .nc-obs-decide-line{
   /* 14 padding + 116 id column + 12 gap — the ask starts where the title does. */
-  margin:0; padding:0 14px 11px 142px; font-size:12.5px; font-weight:500;
+  display:flex; gap:12px; align-items:flex-start; padding:0 14px 11px 142px;
+}
+.nc-of .nc-obs-decide-ask{
+  margin:0; font-size:12.5px; font-weight:500;
   line-height:1.45; color:var(--ink); overflow-wrap:anywhere;
 }
+/* The ship button. Accent, because it IS the act — the same weight `send`
+   wears inside the composer it opens. Mono for the instruction only. */
+.nc-of .nc-obs-ship{
+  flex:none; margin-left:auto; font:inherit; font-size:12px; font-weight:600;
+  color:#fff; background:var(--accent); border:0; border-radius:7px;
+  padding:5px 10px; min-height:28px; cursor:pointer; white-space:nowrap;
+}
+.nc-of .nc-obs-ship:hover{filter:brightness(1.08)}
+.nc-of .nc-obs-ship:focus-visible{outline:2px solid var(--ink); outline-offset:1px}
 .nc-of .nc-obs-ledger-detail{padding:0 14px 12px; font-size:12.5px; color:var(--ink-2)}
 .nc-of .nc-obs-ledger-next{font-weight:600; color:var(--ink); margin-bottom:3px}
 .nc-of .nc-obs-ledger-meta{font-size:11.5px; color:var(--ink-3); margin-top:3px}
@@ -2122,8 +2134,9 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
      over aligned columns, drops out entirely. */
   .nc-of .nc-obs-ledger-head{display:none}
   .nc-of .nc-obs-ledger-btn{grid-template-columns:minmax(0,1fr) auto; gap:4px 10px; padding:11px 14px}
-  /* No id column to hang off once the row stacks. */
-  .nc-of .nc-obs-decide-ask{padding-left:14px}
+  /* No id column to hang off once the row stacks, and no room beside the ask
+     for the button — it drops to its own line rather than squeezing both. */
+  .nc-of .nc-obs-decide-line{padding-left:14px; flex-wrap:wrap; gap:8px}
   .nc-of .nc-obs-ledger-id{grid-column:1; grid-row:1}
   .nc-of .nc-obs-ledger-age{grid-column:2; grid-row:1}
   .nc-of .nc-obs-ledger-title{grid-column:1 / -1; white-space:normal}

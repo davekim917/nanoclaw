@@ -1345,6 +1345,7 @@ function ItemRow({
 }) {
   const item = c.item;
   const roomLink = item.channel ? roomLinks?.get(item.channel.replace(/^#/, '').toLowerCase()) : undefined;
+  const ship = decide ? shipInstruction(item.nextAction) : null;
   return (
     <li
       className={`nc-obs-ledger-row ${c.state} ${item.blocksRelease ? 'blocks' : ''}`}
@@ -1369,7 +1370,29 @@ function ItemRow({
       {/* On the Decisions view the ask is the point of the row, so it reads
           BEFORE the row is opened — a ranked list you have to expand item by
           item to find out what is being asked is not one pass. */}
-      {decide && item.nextAction && <p className="nc-obs-decide-ask">{item.nextAction}</p>}
+      {decide && (item.nextAction || ship) && (
+        <div className="nc-obs-decide-line">
+          {item.nextAction && <p className="nc-obs-decide-ask">{item.nextAction}</p>}
+          {/* One tap to the confirm, never past it. The board named an exact
+              instruction, so the button IS that instruction — it opens the row
+              with the composer already holding it and the addressee already
+              picked, and the same send every other steer goes through is still
+              a separate, deliberate press. Collapsed rows only: once the box is
+              open it is the surface, and a button that silently disagreed with
+              text the operator had edited would be the worst of both. */}
+          {ship && assign && !expanded && (
+            <button
+              type="button"
+              className="nc-obs-ship"
+              data-ship={ship}
+              title="posts in the work's thread as you"
+              onClick={onToggle}
+            >
+              send: <span className="mono">{ship}</span>
+            </button>
+          )}
+        </div>
+      )}
       {expanded && (
         <div className="nc-obs-ledger-detail">
           {/* Not repeated when the row already states it above. */}
@@ -1412,9 +1435,12 @@ function ItemRow({
             }}
             threadUrl={null}
             room={{ name: item.channel ?? null }}
-            ownerAgent={null}
+            // The instruction names who must act, so the confirm opens with
+            // them already selected. Every other surface still defaults to
+            // nobody — there is no addressee to read off an ordinary row.
+            ownerAgent={shipAddressee(ship, assign?.agents ?? [])}
             {...(assign ? { wiring: assign } : {})}
-            {...(decide ? { decide: { prefill: shipInstruction(item.nextAction) ?? '' } } : {})}
+            {...(decide ? { decide: { prefill: ship ?? '' } } : {})}
           />
         </div>
       )}
@@ -1752,6 +1778,19 @@ export function decisionRows(items: ReleaseItem[], now = Date.now()): Commitment
  */
 export function shipInstruction(nextAction?: string): string | null {
   return nextAction?.match(/@[\w-]+\s+ship\s+[\w-]+(?:\s+\d+)?/i)?.[0] ?? null;
+}
+
+/**
+ * The agent an instruction is ADDRESSED to — "@nova ship 912" names nova.
+ *
+ * Only ever a lookup: a handle matching no agent on this floor resolves to
+ * null and the operator picks from the select as before. The ship button needs
+ * this or its one tap lands on a confirm whose send is disabled, which is not
+ * a confirm, it is a dead end.
+ */
+export function shipAddressee(instruction: string | null, agents: { id: string; name: string }[]): string | null {
+  const handle = instruction?.match(/^@([\w-]+)/)?.[1]?.toLowerCase();
+  return (handle && agents.find((a) => a.name.trim().toLowerCase() === handle)?.id) || null;
 }
 
 /**
