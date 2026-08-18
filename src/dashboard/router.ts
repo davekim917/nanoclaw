@@ -172,10 +172,15 @@ export function requireAuth(handler: AuthHandler): Handler {
     const { computeScopes } = await import('./auth/compute-scopes.js');
     const scopes = computeScopes(payload.user_id);
 
+    // Same lazy-import reason as computeScopes above: db/connection can't load
+    // before initDb runs. Resolves the real display_name so every ctx.user.display_name
+    // consumer — nudge, steer, assign, observatory-steer — stops falling back to the
+    // raw id; getUser() returning undefined (never provisioned) is the only null case.
+    const { getUser } = await import('../modules/permissions/db/users.js');
     const user: User = {
       id: payload.user_id,
       kind: 'dashboard',
-      display_name: null,
+      display_name: getUser(payload.user_id)?.display_name ?? null,
       created_at: new Date().toISOString(),
     };
 

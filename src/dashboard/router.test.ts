@@ -12,8 +12,15 @@ vi.mock('./auth/compute-scopes.js', () => ({
   })),
 }));
 
+// requireAuth resolves the real display_name for ctx.user via getUser (a DB call) —
+// stub it same as computeScopes so these tests don't need a live DB.
+vi.mock('../modules/permissions/db/users.js', () => ({
+  getUser: vi.fn(() => undefined),
+}));
+
 import { pathMatch, register, requireAuth, dispatch, registerCookieVerifier, clearCookieVerifier } from './router.js';
 import * as scopesMod from './auth/compute-scopes.js';
+import * as usersMod from '../modules/permissions/db/users.js';
 
 function makeNodeReq(overrides: Partial<http.IncomingMessage> = {}): http.IncomingMessage {
   return {
@@ -44,6 +51,8 @@ beforeEach(() => {
     allowed_group_ids: [],
     no_filter: true,
   });
+  vi.mocked(usersMod.getUser).mockReset();
+  vi.mocked(usersMod.getUser).mockReturnValue(undefined);
 });
 
 describe('pathMatch', () => {
@@ -142,6 +151,47 @@ describe('requireAuth and dispatch', () => {
     expect(result).not.toBeNull();
     expect(result!.status).toBe(200);
     expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it('test_requireAuth_populates_display_name_from_users_table', async () => {
+    registerCookieVerifier(() => ({ user_id: 'test-channel:UFIXTUREUSER1', expires_at: '2099-01-01T00:00:00Z' }));
+    vi.mocked(usersMod.getUser).mockReturnValue({
+      id: 'test-channel:UFIXTUREUSER1',
+      kind: 'test-channel',
+      display_name: 'Fixture Person',
+      created_at: '2026-01-01T00:00:00Z',
+    });
+
+    let seenUser: { id: string; display_name: string | null } | undefined;
+    const handler = vi.fn().mockImplementation(async (_req, _params, ctx) => {
+      seenUser = ctx.user;
+      return new Response('ok');
+    });
+    register('GET', '/test-display-name', requireAuth(handler));
+
+    const req = makeWebRequest('/test-display-name');
+    const nodeReq = makeNodeReq({ method: 'GET', url: '/test-display-name' });
+    await dispatch(req, nodeReq, makeNodeRes());
+
+    expect(seenUser).toMatchObject({ id: 'test-channel:UFIXTUREUSER1', display_name: 'Fixture Person' });
+  });
+
+  it('test_requireAuth_falls_back_to_id_when_user_has_no_display_name', async () => {
+    registerCookieVerifier(() => ({ user_id: 'test-channel:UFIXTUREUSER1', expires_at: '2099-01-01T00:00:00Z' }));
+    // getUser mock already returns undefined via beforeEach default
+
+    let seenUser: { id: string; display_name: string | null } | undefined;
+    const handler = vi.fn().mockImplementation(async (_req, _params, ctx) => {
+      seenUser = ctx.user;
+      return new Response('ok');
+    });
+    register('GET', '/test-no-display-name', requireAuth(handler));
+
+    const req = makeWebRequest('/test-no-display-name');
+    const nodeReq = makeNodeReq({ method: 'GET', url: '/test-no-display-name' });
+    await dispatch(req, nodeReq, makeNodeRes());
+
+    expect(seenUser?.display_name).toBeNull();
   });
 
   it('test_dispatch_null_return_skips_fromWebResponse', async () => {
