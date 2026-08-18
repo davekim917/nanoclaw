@@ -1762,7 +1762,26 @@ function LedgerBoard({
  * so this view and the queue never disagree about which item is worst.
  */
 export function decisionRows(items: ReleaseItem[], now = Date.now()): Commitment[] {
-  return buildLedger(items, now).rows.filter((r) => r.item.nextMover === 'human');
+  const rows = buildLedger(items, now).rows.filter((r) => r.item.nextMover === 'human');
+  // Within a severity tier, the ask that names its exact instruction leads its
+  // peers: it is the cheapest row on the page to clear (one tap), and ship
+  // instructions are usually undated, so ledger order alone buried the ship
+  // button below the first page behind older prose asks. Tiers still win —
+  // a release blocker or a breach never drops below an on-track one-tap, so
+  // the tier key mirrors everything the ledger sort ranks above age.
+  const tier = (r: Commitment) => `${Boolean(r.item.blocksRelease)}|${r.state}`;
+  const out: Commitment[] = [];
+  for (let i = 0; i < rows.length; ) {
+    let j = i;
+    while (j < rows.length && tier(rows[j]) === tier(rows[i])) j++;
+    const run = rows.slice(i, j);
+    out.push(
+      ...run.filter((r) => shipInstruction(r.item.nextAction)),
+      ...run.filter((r) => !shipInstruction(r.item.nextAction)),
+    );
+    i = j;
+  }
+  return out;
 }
 
 /**

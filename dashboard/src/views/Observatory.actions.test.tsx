@@ -399,6 +399,32 @@ describe('Observatory — actions and sheets', () => {
       expect(rows.map((r) => r.item.id)).toEqual(['XZO#1', 'XZO#2']);
       expect(buildLedger([onTrack, overdue]).counts.person).toBe(1);
     });
+
+    it('decisionRows: a ship-bearing ask leads its tier, but never outranks a breach', () => {
+      // The real-data shape that buried the button: the ship ask is undated,
+      // and OLDER undated prose asks sat ahead of it, pushing it off page one.
+      const mk = (id: string, ageH: number, nextAction?: string) =>
+        releaseItem({
+          id,
+          nextMover: 'human',
+          owner: 'robin',
+          ...(nextAction ? { nextAction } : {}),
+          since: new Date(Date.now() - ageH * 3_600_000).toISOString(),
+        });
+      const breached = releaseItem({
+        id: 'XZO#0',
+        nextMover: 'human',
+        owner: 'robin',
+        dueAt: new Date(Date.now() - 86_400_000).toISOString(),
+      });
+      const rows = decisionRows([
+        mk('XZO#1', 200, 'kit or robin answers/acts -- see why'),
+        mk('XZO#2', 100, 'robin picks a colour'),
+        breached,
+        mk('XZO#3', 55, 'robin records @ava ship pipeline 23 -- mechanically ready'),
+      ]);
+      expect(rows.map((r) => r.item.id)).toEqual(['XZO#0', 'XZO#3', 'XZO#1', 'XZO#2']);
+    });
   });
 
   describe('assigning from a row', () => {
