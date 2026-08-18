@@ -14,8 +14,8 @@ import { hasAnyMembership } from './modules/permissions/db/agent-group-members.j
 export type GateResult =
   | { action: 'pass' }
   | { action: 'filter' }
-  | { action: 'deny'; command: string }
-  | { action: 'intercept'; handlerName: string; command: string; args: string };
+  | { action: 'deny'; command: string; leadingMention?: boolean }
+  | { action: 'intercept'; handlerName: string; command: string; args: string; leadingMention?: boolean };
 
 export type InterceptHandler = (ctx: InterceptContext) => Promise<void>;
 
@@ -98,7 +98,13 @@ export function preFanoutGate(content: string, userId: string): GateResult {
   }
 
   text = extractUserMessage(text);
+  const beforeMentionStrip = text;
   text = stripLeadingMentions(text);
+  // Did the raw text explicitly name a bot (any bot, formal or bare @mention)
+  // before the command? Used by the router to tell "addressed to nobody" —
+  // safe to pick a fallback responder — apart from "addressed to a specific
+  // OTHER sibling bot" — never our command to answer.
+  const leadingMention = text !== beforeMentionStrip;
 
   if (!text.startsWith('/')) return { action: 'pass' };
 
@@ -115,9 +121,9 @@ export function preFanoutGate(content: string, userId: string): GateResult {
       // their own read-only login link — they just can't mint one for anyone
       // else (the token binds to ctx.userId). A user with neither an admin
       // role nor any agent_group_members row still gets denied.
-      if (!isAnyAdmin(userId) && !hasAnyMembership(userId)) return { action: 'deny', command };
+      if (!isAnyAdmin(userId) && !hasAnyMembership(userId)) return { action: 'deny', command, leadingMention };
     }
-    return { action: 'intercept', handlerName: intercept.handlerName, command, args };
+    return { action: 'intercept', handlerName: intercept.handlerName, command, args, leadingMention };
   }
 
   return { action: 'pass' };

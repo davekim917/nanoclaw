@@ -23,6 +23,7 @@ import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/chan
 import { gateCommand, preFanoutGate, getInterceptHandler } from './command-gate.js';
 import type { InterceptContext } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { getDeliveryAdapter } from './delivery.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
   createMessagingGroup,
@@ -174,6 +175,56 @@ function inheritedAgentGroupFor(mg: MessagingGroup): { id: string; sourceMessagi
     return null;
   }
   return { id: rows[0].agent_group_id, sourceMessagingGroupId: rows[0].messaging_group_id };
+}
+
+/**
+ * Decide whether THIS messaging group's sibling bot is the one that should
+ * act on an intercepted command (Bug: fan-out duplication — see routeInboundClaimed
+ * section 2b). Sibling agents in one workgroup each run their own bot user /
+ * channel_type "instance" (docs/workgroups.md), so a single Slack message
+ * reaches the router once PER sibling as a separate InboundEvent/mg — there is
+ * no single fan-out loop across them to dedupe within.
+ *
+ *  - Addressed straight at this bot (platform-confirmed mention, or a DM/1:1
+ *    context) — always eligible; reuses the same `isMention` signal the
+ *    fan-out loop's evaluateEngage() uses for engage_mode='mention', no
+ *    second mention parser.
+ *  - The raw text named a bot but not this one (`leadingMention` true and we
+ *    weren't the addressee) — not our command to answer.
+ *  - Nobody was named (bare "/command" that every sibling bot in the channel
+ *    receives its own copy of) — exactly one sibling answers so the user
+ *    isn't left on read: the wiring with the highest `priority` across every
+ *    sibling messaging_group sharing this platform_id and workgroup, tied
+ *    broken by channel_type then messaging_group id (stable, no clock).
+ */
+function isSoleInterceptResponder(mg: MessagingGroup, isMention: boolean, leadingMention: boolean): boolean {
+  if (isMention || mg.is_group === 0) return true;
+  if (leadingMention) return false;
+
+  const winner = getDb()
+    .prepare(
+      `WITH my_wg AS (
+         SELECT DISTINCT COALESCE(ag.workgroup_id, ag.folder) AS wg
+         FROM messaging_group_agents mga
+         JOIN agent_groups ag ON ag.id = mga.agent_group_id
+        WHERE mga.messaging_group_id = ?
+       )
+       SELECT mg2.id AS mg_id
+         FROM messaging_groups mg2
+         JOIN messaging_group_agents mga2 ON mga2.messaging_group_id = mg2.id
+         JOIN agent_groups ag2 ON ag2.id = mga2.agent_group_id
+        WHERE mg2.platform_id = ?
+          AND COALESCE(ag2.workgroup_id, ag2.folder) IN (SELECT wg FROM my_wg)
+        GROUP BY mg2.id
+        ORDER BY MAX(mga2.priority) DESC, mg2.channel_type ASC, mg2.id ASC
+        LIMIT 1`,
+    )
+    .get(mg.id, mg.platform_id) as { mg_id: string } | undefined;
+
+  // No workgroup context to disambiguate against (standalone install, or the
+  // wiring/agent-group rows raced) — fail open so the request still gets
+  // answered rather than silently dropped by every candidate.
+  return winner === undefined || winner.mg_id === mg.id;
 }
 
 function generateId(): string {
@@ -695,6 +746,21 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
   //     FILTERED commands are dropped. Unknown/ADMIN commands fall through.
   if (userId !== null && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     const preGate = preFanoutGate(event.message.content, userId);
+    if (preGate.action === 'intercept' || preGate.action === 'deny') {
+      // Sibling bots (separate channel_type/instance per bot user — see
+      // docs/workgroups.md) each get their OWN inbound event for the same
+      // underlying platform message, so this "runs once per inbound" gate
+      // still runs once per SIBLING. Without this check every sibling wired
+      // into the channel would intercept/deny the same command (observed:
+      // three bots each minted a dashboard token for one `/dashboard-token`).
+      if (!isSoleInterceptResponder(mg, isMention, preGate.leadingMention === true)) {
+        log.debug('Pre-fanout intercept skipped — not the addressed or deterministic sibling', {
+          command: preGate.command,
+          messagingGroupId: mg.id,
+        });
+        return;
+      }
+    }
     if (preGate.action === 'intercept') {
       const handler = getInterceptHandler(preGate.handlerName);
       if (handler) {
@@ -732,6 +798,24 @@ async function routeInboundClaimed(event: InboundEvent, markReplayPending: () =>
     }
     if (preGate.action === 'deny') {
       log.info('Pre-fanout intercept denied (not admin)', { command: preGate.command, userId });
+      // Real incident: a user typed an intercept command before they had any
+      // role/membership and got no response at all — reads as the product
+      // being broken. Reply with a short, non-leaky refusal (no role/permission
+      // internals) through the same delivery path the intercept handlers use.
+      const deliveryAdapter = getDeliveryAdapter();
+      if (deliveryAdapter) {
+        await deliveryAdapter
+          .deliver(
+            mg.channel_type,
+            mg.platform_id,
+            event.threadId,
+            'chat',
+            JSON.stringify({ text: `You don't have access to run ${preGate.command}. Ask an admin to add you.` }),
+          )
+          .catch((err) => {
+            log.warn('Pre-fanout deny reply failed to deliver', { command: preGate.command, err: String(err) });
+          });
+      }
       return;
     }
     // 'pass' — fall through to fan-out

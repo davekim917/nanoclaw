@@ -111,6 +111,14 @@ vi.mock('./modules/permissions/db/user-roles.js', () => ({
   isAnyAdmin: vi.fn(() => false),
 }));
 
+vi.mock('./modules/permissions/db/agent-group-members.js', () => ({
+  hasAnyMembership: vi.fn(() => false),
+}));
+
+vi.mock('./delivery.js', () => ({
+  getDeliveryAdapter: vi.fn(() => null),
+}));
+
 // ── Imports after mocks ──
 
 import {
@@ -135,6 +143,7 @@ import { getSession } from './db/sessions.js';
 import { isAnyAdmin } from './modules/permissions/db/user-roles.js';
 import { claimChannelIngress, completeChannelIngress } from './db/channel-ingress-receipts.js';
 import { registerInterceptHandler, clearInterceptHandlers } from './command-gate.js';
+import { getDeliveryAdapter } from './delivery.js';
 import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 import type { MessagingGroup, MessagingGroupAgent } from './types.js';
 
@@ -186,6 +195,18 @@ function makeChatEvent(text: string, overrides: Partial<InboundEvent> = {}): Inb
     },
     ...overrides,
   };
+}
+
+/** Stub getDb() for the sole-intercept-responder tiebreak query in router.ts —
+ *  it runs a single `prepare(...).get(mgId, platformId)` and expects
+ *  `{ mg_id }` (the deterministic winner) or undefined. */
+function mockInterceptTiebreakWinner(winnerMgId: string | undefined): void {
+  vi.mocked(getDb).mockReturnValue({
+    prepare: vi.fn(() => ({
+      get: vi.fn(() => (winnerMgId === undefined ? undefined : { mg_id: winnerMgId })),
+    })),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any);
 }
 
 beforeEach(() => {
@@ -658,5 +679,162 @@ describe('workspace-trust auto-wire inherits voice', () => {
     expect(createMessagingGroupAgent).toHaveBeenCalledWith(
       expect.objectContaining({ default_model: null, default_effort: null }),
     );
+  });
+});
+
+describe('34: pre-fanout intercept fan-out dedup + denial reply', () => {
+  it('always intercepts in a DM even without a platform-confirmed mention', async () => {
+    const mg = makeMg({ id: 'mg-1', is_group: 0 });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    const handlerSpy = vi.fn().mockResolvedValue(undefined);
+    registerInterceptHandler('dashboard_token_issue', handlerSpy);
+
+    const text = '/dashboard-token';
+    const event = makeChatEvent(text, { isDM: true, message: { ...makeChatEvent(text).message, isMention: false } });
+    await routeInbound(event);
+
+    expect(handlerSpy).toHaveBeenCalledOnce();
+  });
+
+  it('skips interception when the raw text names a different bot (not addressed to me)', async () => {
+    const mg = makeMg({ id: 'mg-1', is_group: 1 });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    const handlerSpy = vi.fn().mockResolvedValue(undefined);
+    registerInterceptHandler('dashboard_token_issue', handlerSpy);
+
+    // Platform-confirmed isMention is false for THIS bot (only some other bot
+    // was actually @-mentioned) — my own inbound event never claims isMention.
+    const text = '<@OTHERBOT> /dashboard-token';
+    const event = makeChatEvent(text, { isDM: false, message: { ...makeChatEvent(text).message, isMention: false } });
+    await routeInbound(event);
+
+    expect(handlerSpy).not.toHaveBeenCalled();
+    expect(getDeliveryAdapter).not.toHaveBeenCalled();
+  });
+
+  it('a bare unmentioned command in a group picks itself when it wins the deterministic tiebreak', async () => {
+    const mg = makeMg({ id: 'mg-1', is_group: 1 });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    mockInterceptTiebreakWinner('mg-1');
+    const handlerSpy = vi.fn().mockResolvedValue(undefined);
+    registerInterceptHandler('dashboard_token_issue', handlerSpy);
+
+    const text = '/dashboard-token';
+    const event = makeChatEvent(text, { isDM: false, message: { ...makeChatEvent(text).message, isMention: false } });
+    await routeInbound(event);
+
+    expect(handlerSpy).toHaveBeenCalledOnce();
+  });
+
+  it('a bare unmentioned command stays silent when a sibling wiring wins the tiebreak', async () => {
+    const mg = makeMg({ id: 'mg-1', is_group: 1 });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    mockInterceptTiebreakWinner('mg-sibling-wins');
+    const handlerSpy = vi.fn().mockResolvedValue(undefined);
+    registerInterceptHandler('dashboard_token_issue', handlerSpy);
+
+    const text = '/dashboard-token';
+    const event = makeChatEvent(text, { isDM: false, message: { ...makeChatEvent(text).message, isMention: false } });
+    await routeInbound(event);
+
+    expect(handlerSpy).not.toHaveBeenCalled();
+  });
+
+  it('fails open (still answers) when the tiebreak query finds no sibling candidates', async () => {
+    const mg = makeMg({ id: 'mg-1', is_group: 1 });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    mockInterceptTiebreakWinner(undefined);
+    const handlerSpy = vi.fn().mockResolvedValue(undefined);
+    registerInterceptHandler('dashboard_token_issue', handlerSpy);
+
+    const text = '/dashboard-token';
+    const event = makeChatEvent(text, { isDM: false, message: { ...makeChatEvent(text).message, isMention: false } });
+    await routeInbound(event);
+
+    expect(handlerSpy).toHaveBeenCalledOnce();
+  });
+
+  it('replies with a safe, non-leaky denial exactly once when the addressed agent denies', async () => {
+    vi.mocked(isAnyAdmin).mockReturnValue(false);
+    const mg = makeMg({ id: 'mg-1', channel_type: 'slack-test', platform_id: 'platform-1', is_group: 0 });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const deliverSpy = vi.fn().mockResolvedValue(undefined) as any;
+    vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverSpy });
+
+    await routeInbound(makeChatEvent('/dashboard-token'));
+
+    expect(deliverSpy).toHaveBeenCalledOnce();
+    const [channelType, platformId, , kind, content] = deliverSpy.mock.calls[0];
+    expect(channelType).toBe('slack-test');
+    expect(platformId).toBe('platform-1');
+    expect(kind).toBe('chat');
+    const parsed = JSON.parse(content as string);
+    expect(parsed.text).toBe("You don't have access to run /dashboard-token. Ask an admin to add you.");
+    // No credential value, internal role-table name, or user-id leakage.
+    expect(parsed.text.toLowerCase()).not.toMatch(/owner|scoped|user_role|\bu1\b/);
+    expect(writeOutboundDirect).not.toHaveBeenCalled();
+  });
+
+  it('does not send a duplicate denial from a non-responding sibling', async () => {
+    vi.mocked(isAnyAdmin).mockReturnValue(false);
+    const mg = makeMg({ id: 'mg-1', is_group: 1 });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent()]);
+    mockInterceptTiebreakWinner('mg-sibling-wins');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const deliverSpy = vi.fn().mockResolvedValue(undefined) as any;
+    vi.mocked(getDeliveryAdapter).mockReturnValue({ deliver: deliverSpy });
+
+    const text = '/dashboard-token';
+    const event = makeChatEvent(text, { isDM: false, message: { ...makeChatEvent(text).message, isMention: false } });
+    await routeInbound(event);
+
+    expect(deliverSpy).not.toHaveBeenCalled();
+  });
+
+  it('regression: non-command messages still fan out normally regardless of addressing', async () => {
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    const mg = makeMg({ id: 'mg-1', is_group: 1 });
+    // pattern engage_mode with isMention:false — proves the new sole-responder
+    // gate (intercept/deny only) never touches ordinary engage evaluation.
+    const agent = makeAgent({ engage_mode: 'pattern', engage_pattern: '.' });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([agent]);
+    vi.mocked(getAgentGroup).mockReturnValue({
+      id: 'ag-1',
+      name: 'Test Agent',
+      folder: 'test',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    const session = {
+      id: 's-1',
+      agent_group_id: 'ag-1',
+      messaging_group_id: 'mg-1',
+      thread_id: null,
+      agent_provider: null,
+      status: 'active' as const,
+      container_status: 'idle' as const,
+      last_active: null,
+      created_at: new Date().toISOString(),
+    };
+    vi.mocked(resolveSession).mockReturnValue({ session, created: true });
+    vi.mocked(getSession).mockReturnValue(session);
+    vi.mocked(wakeContainer).mockResolvedValue(false);
+
+    // No mention, group chat, plain text — the sole-responder gate must never
+    // touch ordinary (non-intercept-command) fan-out.
+    const text = 'hello world';
+    const event = makeChatEvent(text, { isDM: false, message: { ...makeChatEvent(text).message, isMention: false } });
+    await routeInbound(event);
+
+    expect(writeSessionMessageIfNew).toHaveBeenCalledOnce();
   });
 });

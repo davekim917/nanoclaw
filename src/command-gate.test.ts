@@ -67,13 +67,14 @@ describe('preFanoutGate', () => {
       handlerName: 'dashboard_token_issue',
       command: '/dashboard-token',
       args: '',
+      leadingMention: false,
     });
   });
 
   it('test_preFanoutGate_intercept_non_admin_denies', () => {
     insertUser('u2');
     const result = preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u2');
-    expect(result).toEqual({ action: 'deny', command: '/dashboard-token' });
+    expect(result).toEqual({ action: 'deny', command: '/dashboard-token', leadingMention: false });
   });
 
   it('test_preFanoutGate_intercept_dashboard_token_member_allowed', () => {
@@ -85,13 +86,14 @@ describe('preFanoutGate', () => {
       handlerName: 'dashboard_token_issue',
       command: '/dashboard-token',
       args: '',
+      leadingMention: false,
     });
   });
 
   it('test_preFanoutGate_intercept_dashboard_token_no_role_no_membership_denies', () => {
     insertUser('u4');
     const result = preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u4');
-    expect(result).toEqual({ action: 'deny', command: '/dashboard-token' });
+    expect(result).toEqual({ action: 'deny', command: '/dashboard-token', leadingMention: false });
   });
 
   it('test_preFanoutGate_filtered_drops', () => {
@@ -151,6 +153,7 @@ describe('stripLeadingMentions integration via preFanoutGate', () => {
       handlerName: 'dashboard_token_issue',
       command: '/dashboard-token',
       args: '',
+      leadingMention: true,
     });
   });
 
@@ -165,6 +168,7 @@ describe('stripLeadingMentions integration via preFanoutGate', () => {
       handlerName: 'dashboard_token_issue',
       command: '/dashboard-token',
       args: '',
+      leadingMention: true,
     });
   });
 
@@ -179,6 +183,7 @@ describe('stripLeadingMentions integration via preFanoutGate', () => {
       handlerName: 'dashboard_token_issue',
       command: '/dashboard-token',
       args: '',
+      leadingMention: true,
     });
   });
 });
@@ -197,6 +202,7 @@ describe('threaded inbound — extractUserMessage', () => {
       handlerName: 'dashboard_token_issue',
       command: '/dashboard-token',
       args: '',
+      leadingMention: true,
     });
   });
 
