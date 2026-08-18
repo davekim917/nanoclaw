@@ -9,6 +9,7 @@
  * - Normal messages: pass through unchanged
  */
 import { hasAdminPrivilege, isAnyAdmin } from './modules/permissions/db/user-roles.js';
+import { hasAnyMembership } from './modules/permissions/db/agent-group-members.js';
 
 export type GateResult =
   | { action: 'pass' }
@@ -110,7 +111,11 @@ export function preFanoutGate(content: string, userId: string): GateResult {
   const intercept = INTERCEPT_COMMANDS.get(command);
   if (intercept) {
     if (intercept.requiresAuth === 'admin') {
-      if (!isAnyAdmin(userId)) return { action: 'deny', command };
+      // Despite the flag name, /dashboard-token also allows members to mint
+      // their own read-only login link — they just can't mint one for anyone
+      // else (the token binds to ctx.userId). A user with neither an admin
+      // role nor any agent_group_members row still gets denied.
+      if (!isAnyAdmin(userId) && !hasAnyMembership(userId)) return { action: 'deny', command };
     }
     return { action: 'intercept', handlerName: intercept.handlerName, command, args };
   }

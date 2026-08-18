@@ -9,6 +9,7 @@ import { preFanoutGate, gateCommand, clearInterceptHandlers } from './command-ga
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { createUser } from './modules/permissions/db/users.js';
 import { grantRole } from './modules/permissions/db/user-roles.js';
+import { addMember } from './modules/permissions/db/agent-group-members.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -72,6 +73,24 @@ describe('preFanoutGate', () => {
   it('test_preFanoutGate_intercept_non_admin_denies', () => {
     insertUser('u2');
     const result = preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u2');
+    expect(result).toEqual({ action: 'deny', command: '/dashboard-token' });
+  });
+
+  it('test_preFanoutGate_intercept_dashboard_token_member_allowed', () => {
+    insertUser('u3');
+    addMember({ user_id: 'u3', agent_group_id: 'ag-1', added_by: null, added_at: now() });
+    const result = preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u3');
+    expect(result).toEqual({
+      action: 'intercept',
+      handlerName: 'dashboard_token_issue',
+      command: '/dashboard-token',
+      args: '',
+    });
+  });
+
+  it('test_preFanoutGate_intercept_dashboard_token_no_role_no_membership_denies', () => {
+    insertUser('u4');
+    const result = preFanoutGate(JSON.stringify({ text: '/dashboard-token' }), 'u4');
     expect(result).toEqual({ action: 'deny', command: '/dashboard-token' });
   });
 

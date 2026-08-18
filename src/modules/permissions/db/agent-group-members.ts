@@ -1,5 +1,6 @@
 import type { AgentGroupMember } from '../../../types.js';
 import { getDb } from '../../../db/connection.js';
+import { equivalentSlackUserIds } from '../../../slack-user-identity.js';
 import { isAdminOfAgentGroup, isGlobalAdmin, isOwner } from './user-roles.js';
 
 export function addMember(row: AgentGroupMember): void {
@@ -41,4 +42,26 @@ export function hasMembershipRow(userId: string, agentGroupId: string): boolean 
     .prepare('SELECT 1 FROM agent_group_members WHERE user_id = ? AND agent_group_id = ? LIMIT 1')
     .get(userId, agentGroupId);
   return !!row;
+}
+
+/**
+ * Every agent group the user is a member of, resolving same-workspace Slack
+ * sibling identities (see slack-user-identity.ts) so a member who messages
+ * from a sibling adapter is not locked out of their own membership.
+ */
+export function getMembershipGroupIds(userId: string): string[] {
+  const ids = equivalentSlackUserIds(userId);
+  const placeholders = ids.map(() => '?').join(', ');
+  const rows = getDb()
+    .prepare(`SELECT DISTINCT agent_group_id FROM agent_group_members WHERE user_id IN (${placeholders})`)
+    .all(...ids) as { agent_group_id: string }[];
+  return rows.map((r) => r.agent_group_id);
+}
+
+/** True if the user (or an equivalent same-workspace identity) has any membership row. */
+export function hasAnyMembership(userId: string): boolean {
+  return equivalentSlackUserIds(userId).some((candidate) => {
+    const row = getDb().prepare('SELECT 1 FROM agent_group_members WHERE user_id = ? LIMIT 1').get(candidate);
+    return !!row;
+  });
 }

@@ -1,4 +1,5 @@
 import { getDb } from '../../db/connection.js';
+import { getMembershipGroupIds } from '../../modules/permissions/db/agent-group-members.js';
 import type { GroupScope } from '../router.js';
 
 interface UserRoleRow {
@@ -49,10 +50,13 @@ export function computeScopes(userId: string): UserScopes {
     return { role: 'admin_of_group', allowed_group_ids: scopedAdminGroups, no_filter: false };
   }
 
-  const memberGroups = rows
+  // The 'member' role in user_roles is legacy/unused in practice — the real
+  // membership grant is `agent_group_members` (see ncl members add). Union
+  // both so either mechanism unlocks the same read-only scope.
+  const roleMemberGroups = rows
     .filter((r) => r.role === 'member' && r.agent_group_id !== null)
-    .map((r) => r.agent_group_id as string)
-    .sort();
+    .map((r) => r.agent_group_id as string);
+  const memberGroups = [...new Set([...roleMemberGroups, ...getMembershipGroupIds(userId)])].sort();
 
   return { role: 'member', allowed_group_ids: memberGroups, no_filter: false };
 }
