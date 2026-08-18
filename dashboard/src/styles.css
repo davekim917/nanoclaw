@@ -1837,6 +1837,57 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-sd.blocked{background:var(--stop)}
 .nc-of .nc-of-sd.waiting{background:var(--warn)}
 .nc-of .nc-of-sd.working{background:var(--go)}
+.nc-of .nc-of-viewtoggle{display:flex; gap:4px}
+
+/* obs.C.35 — Tiles: the pre-map reading, a full sibling of the floor rather
+   than a fallback. No SVG, no pan; a responsive card grid that degrades to one
+   column on its own once a card's ~260px minimum stops fitting two abreast —
+   the same trick the grid already does, no extra breakpoint needed. */
+.nc-of .nc-of-roomgrid{
+  display:grid; grid-template-columns:repeat(auto-fill, minmax(260px,1fr)); gap:10px; padding:12px;
+}
+.nc-of .nc-of-roomcard{
+  display:flex; flex-direction:column; gap:8px; padding:10px 12px;
+  border:1px solid var(--line-2); border-radius:8px; background:var(--card-2); cursor:pointer;
+}
+.nc-of .nc-of-roomcard:hover{background:rgba(35,32,27,.03)}
+.nc-of .nc-of-roomcard.on{background:rgba(63,104,201,.09); border-color:var(--accent)}
+.nc-of .nc-of-roomcard:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
+.nc-of .nc-of-roomcard-head{display:flex; align-items:center; gap:7px; font:600 12.5px/1 inherit; color:var(--ink)}
+.nc-of .nc-of-roomcard-name{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.nc-of .nc-of-roomcard-n{
+  margin-left:auto; font-variant-numeric:tabular-nums; font:600 11px/1 inherit; color:var(--ink-3);
+  background:rgba(35,32,27,.06); border-radius:8px; padding:2px 6px;
+}
+.nc-of .nc-of-roomcard-agents{display:flex; flex-wrap:wrap; gap:6px}
+.nc-of .nc-of-roomcard-empty{font-size:11.5px; color:var(--ink-3)}
+/* The agent chip nests inside the card's own click target on purpose (see the
+   stopPropagation in Observatory.tsx) — clicking a person opens the drawer
+   without also picking the room out from under them. */
+.nc-of .nc-of-facechip{
+  appearance:none; border:1px solid var(--line-2); background:var(--card); cursor:pointer;
+  display:inline-flex; align-items:center; gap:5px; padding:3px 7px 3px 3px; border-radius:14px;
+  font:500 11px/1 inherit; color:var(--ink-2);
+}
+.nc-of .nc-of-facechip:hover{background:rgba(35,32,27,.05)}
+.nc-of .nc-of-facechip.working{border-color:var(--go); color:var(--ink)}
+.nc-of .nc-of-facechip.blocked{border-color:var(--stop)}
+/* Same crisp-edge read as the map's own face token. */
+.nc-of .nc-of-facechip-face{
+  display:block; flex:none; width:20px; height:20px; border-radius:50%;
+  image-rendering:pixelated; background:#d9d4c8; box-shadow:0 0 0 1px rgba(44,40,34,.18);
+}
+.nc-of .nc-of-facechip-face.i{filter:grayscale(1)}
+.nc-of .nc-of-facechip-fallback{
+  display:flex; align-items:center; justify-content:center; background:var(--line-2); color:var(--ink-2);
+  font:600 10px/1 inherit;
+}
+.nc-of .nc-of-facechip-pulse{
+  width:6px; height:6px; border-radius:50%; background:var(--go); flex:none;
+  animation:nc-pulse 1.6s ease-in-out infinite;
+}
+.nc-of .nc-of-facechip-z{font-size:9.5px; color:var(--ink-3); letter-spacing:.02em}
+
 /* Phone: the bar carries the title, the picker and the one live number. The
    agent/channel counts are reference, not signal, and pushed the live dot off
    the right edge — nothing may be wider than the viewport but the map. */

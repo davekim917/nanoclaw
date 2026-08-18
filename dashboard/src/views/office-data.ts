@@ -53,10 +53,16 @@ export interface OfficeRoomData {
   agents: OfficeAgent[];
 }
 
+/** A seated, fully-computed room that has no fixed slot on the floor plan. */
+export type OfficeOverflowRoom = Omit<OfficeRoomData, 'slot'>;
+
 export interface OfficeData {
   rooms: OfficeRoomData[];
   /** Rooms that had no slot left. Named so the UI can say so out loud. */
   overflow: string[];
+  /** Same rooms as `overflow`, but seated — the map has nowhere to put them,
+   *  but the tile view has no fixed floor plan, so it can show them anyway. */
+  overflowRooms: OfficeOverflowRoom[];
 }
 
 /** FNV-1a — stable across renders, so an agent always looks like itself. */
@@ -88,6 +94,19 @@ export function agentLook(id: string): Omit<OfficeAgent, 'name' | 'status'> {
   const h = hashKey(id);
   const [shirt, shirtHi] = SHIRTS[h % SHIRTS.length]!;
   return { shirt, shirtHi, hair: HAIRS[(h >>> 8) % HAIRS.length]!, skin: SKINS[(h >>> 16) % SKINS.length]! };
+}
+
+/**
+ * The agent's real platform avatar, as a pixel token — same rule office-map.js's
+ * own `faceSrc` uses, kept in sync by hand since one lives in a vendored custom
+ * element (no external image in a data-URI SVG) and the other in a plain React
+ * tile. Slack serves fixed sizes; asking for the 48px original keeps the face a
+ * real pixel grid rather than a downscaled smudge. Anything not a plain
+ * https/data image URL is dropped rather than interpolated into markup.
+ */
+export function faceSrc(u?: string | null): string {
+  if (typeof u !== 'string' || !/^(https:\/\/|data:image\/)[^"'<>\s]+$/.test(u)) return '';
+  return u.replace(/_\d+\.(png|jpe?g|gif|webp)$/i, '_48.$1');
 }
 
 /**
@@ -185,17 +204,17 @@ export function buildOfficeData(
     if (nextSlot < remainingSlots.length) slotOf.set(i, remainingSlots[nextSlot++]!);
   });
 
-  const out: OfficeRoomData[] = [];
-  const overflow: string[] = [];
-  rooms.forEach((room, i) => {
-    const slot = slotOf.get(i);
-    if (!slot) { overflow.push(room.name); return; }
-    // A room always seats its WIRED members — an idle one sits there asleep
-    // rather than vanishing. Agents actually working here (location === this
-    // room) sort first so the seat cap favors what's live; ties break by name
-    // for a stable floor. There is no per-room recency signal available on the
-    // client (agent objects don't carry it), so this is the honest v1 tiebreak
-    // rather than invented data — with 6 seats per room it rarely bites.
+  // A room always seats its WIRED members — an idle one sits there asleep
+  // rather than vanishing. Agents actually working here (location === this
+  // room) sort first so the seat cap favors what's live; ties break by name
+  // for a stable floor. There is no per-room recency signal available on the
+  // client (agent objects don't carry it), so this is the honest v1 tiebreak
+  // rather than invented data — with 6 seats per room it rarely bites.
+  //
+  // Used for EVERY room, slotted or not: the seating rule is one rule, and a
+  // channel the floor plan has no slot for (overflow) still gets it, because
+  // the tile view has no fixed plan to run out of.
+  function seatRoom(room: ObservatoryRoom): OfficeOverflowRoom {
     const memberIds = new Set(room.memberAgentIds);
     const here: OfficeAgent[] = agents
       .filter((a) => memberIds.has(a.id))
@@ -213,8 +232,21 @@ export function buildOfficeData(
       // per-room exact count.
       .slice(0, 6)
       .map((a) => ({ name: a.name, status: agentState(a, breachedOwners, room.key), avatarUrl: a.avatarUrl, ...agentLook(a.id) }));
-    out.push({ slot, key: room.key, label: room.name.startsWith('#') ? room.name : `#${room.name}`, open: 0, state: roomState(here, 0), agents: here });
+    return { key: room.key, label: room.name.startsWith('#') ? room.name : `#${room.name}`, open: 0, state: roomState(here, 0), agents: here };
+  }
+
+  const out: OfficeRoomData[] = [];
+  const overflow: string[] = [];
+  const overflowRooms: OfficeOverflowRoom[] = [];
+  rooms.forEach((room, i) => {
+    const slot = slotOf.get(i);
+    if (!slot) {
+      overflow.push(room.name);
+      overflowRooms.push(seatRoom(room));
+      return;
+    }
+    out.push({ slot, ...seatRoom(room) });
   });
 
-  return { rooms: out, overflow };
+  return { rooms: out, overflow, overflowRooms };
 }

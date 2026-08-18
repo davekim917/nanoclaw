@@ -49,6 +49,7 @@ import {
   workRoom,
 } from './Observatory.js';
 import { type Commitment } from './commitments.js';
+import { SLOTS } from './office-data.js';
 import useSWR from 'swr';
 import { nudgeClaim, steerWork } from '../lib/api.js';
 import type {
@@ -168,6 +169,12 @@ function mockData(
 /** Click a segment of the top-bar control — the only way to a non-default view. */
 async function segment(c: HTMLElement, view: 'overview' | 'decisions' | 'board') {
   await userEvent.click(c.querySelector(`.nc-of-seg-btn[data-view="${view}"]`)! as HTMLElement);
+}
+
+/** Switch the floor from its default (Tiles) to Map — the only way to reach
+ *  the `<office-map>` element and its zoom/fold/teleport behavior in a test. */
+async function toMap(c: HTMLElement) {
+  await userEvent.click(c.querySelector('[data-obs-view="map"]')! as HTMLElement);
 }
 
 describe('Observatory', () => {
@@ -296,12 +303,15 @@ describe('Observatory', () => {
         }),
       );
 
-    it('opens on the overview: the office, the headline, and the queue', () => {
+    it('opens on the overview: the office (tiles by default), the headline, and the queue', () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       expect(container.querySelector('.nc-of-seg-btn[data-view="overview"]')!.getAttribute('aria-pressed')).toBe('true');
       expect(container.querySelector('.nc-of-head')).toBeTruthy();
-      expect(container.querySelector('office-map')).toBeTruthy();
+      // Tiles, not the map — obs.C.35: Tiles is the default, and the map stays
+      // unmounted (not just hidden) while it isn't the active view.
+      expect(container.querySelector('.nc-of-roomgrid')).toBeTruthy();
+      expect(container.querySelector('office-map')).toBeFalsy();
       expect(container.querySelector('[data-section="queue"]')).toBeTruthy();
       expect(container.querySelector('[data-section="board"]')).toBeFalsy();
     });
@@ -324,7 +334,7 @@ describe('Observatory', () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       await segment(container, 'board');
-      expect(container.querySelector('office-map')).toBeFalsy();
+      expect(container.querySelector('.nc-of-roomgrid')).toBeFalsy();
       expect(container.querySelector('.nc-of-mapcard')).toBeFalsy();
       expect(container.querySelector('.nc-of-head')).toBeFalsy();
       expect(container.querySelector('[data-section="board"]')).toBeTruthy();
@@ -334,7 +344,7 @@ describe('Observatory', () => {
       expect(container.querySelector('.nc-of-head')).toBeFalsy();
 
       await segment(container, 'overview');
-      expect(container.querySelector('office-map')).toBeTruthy();
+      expect(container.querySelector('.nc-of-roomgrid')).toBeTruthy();
       expect(container.querySelector('.nc-of-head')).toBeTruthy();
     });
 
@@ -367,34 +377,44 @@ describe('Observatory', () => {
       expect(fold(first.container).textContent).toBe('hide the floor');
 
       await userEvent.click(fold(first.container));
-      // The map and its teleport chips go together — chips that teleport a map
-      // nobody can see are controls for nothing.
-      expect(first.container.querySelector('office-map')).toBeFalsy();
-      expect(first.container.querySelector('.nc-of-teleport')).toBeFalsy();
+      // Folding applies to whichever view is active — tiles by default here.
+      expect(first.container.querySelector('.nc-of-roomgrid')).toBeFalsy();
       // The card itself stays, so there is something left to click.
       expect(first.container.querySelector('.nc-of-mapcard')).toBeTruthy();
       expect(fold(first.container).textContent).toBe('show the floor');
       first.unmount();
 
       const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(second.container.querySelector('office-map')).toBeFalsy();
+      expect(second.container.querySelector('.nc-of-roomgrid')).toBeFalsy();
       await userEvent.click(fold(second.container));
-      expect(second.container.querySelector('office-map')).toBeTruthy();
+      expect(second.container.querySelector('.nc-of-roomgrid')).toBeTruthy();
       second.unmount();
 
       // Expanded is the default a fresh browser gets.
       localStorage.clear();
       const third = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(third.container.querySelector('office-map')).toBeTruthy();
+      expect(third.container.querySelector('.nc-of-roomgrid')).toBeTruthy();
+    });
+
+    it('folding the map away hides its teleport chips too — chips that teleport a map nobody can see are controls for nothing', async () => {
+      full();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await toMap(container);
+      expect(container.querySelector('office-map')).toBeTruthy();
+      expect(container.querySelector('.nc-of-teleport')).toBeTruthy();
+      await userEvent.click(container.querySelector('.nc-of-mapfold')! as HTMLElement);
+      expect(container.querySelector('office-map')).toBeFalsy();
+      expect(container.querySelector('.nc-of-teleport')).toBeFalsy();
     });
 
     // obs.C.15 — the default view was zoomed out enough that a room was
     // unreadable; 1.7 is the picked-by-eye default that keeps a room legible
     // without losing the floor.
-    it('opens zoomed in past the old 1.15 default', () => {
+    it('opens zoomed in past the old 1.15 default', async () => {
       localStorage.clear();
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await toMap(container);
       const map = container.querySelector('office-map')!;
       expect(map.getAttribute('scale')).toBe('1.7');
     });
@@ -403,6 +423,7 @@ describe('Observatory', () => {
       localStorage.clear();
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await toMap(container);
       const map = container.querySelector('office-map')!;
       const actions = container.querySelector('.nc-of-mapcard-actions')!;
       const zoomIn = actions.querySelector('[aria-label="Zoom in"]')! as HTMLElement;
@@ -424,6 +445,7 @@ describe('Observatory', () => {
       localStorage.clear();
       full();
       const first = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await toMap(first.container);
       const zoomIn = () =>
         first.container.querySelector('.nc-of-mapcard-actions [aria-label="Zoom in"]')! as HTMLElement;
       await userEvent.click(zoomIn());
@@ -431,12 +453,15 @@ describe('Observatory', () => {
       expect(first.container.querySelector('office-map')!.getAttribute('scale')).toBe('2.1');
       first.unmount();
 
+      // The view choice itself persisted 'map' from the click above, so this
+      // visit already opens on the map — the scale is what is under test here.
       const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       expect(second.container.querySelector('office-map')!.getAttribute('scale')).toBe('2.1');
       second.unmount();
 
       localStorage.clear();
       const third = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await toMap(third.container);
       expect(third.container.querySelector('office-map')!.getAttribute('scale')).toBe('1.7');
     });
 
@@ -463,6 +488,126 @@ describe('Observatory', () => {
       expect(meta()).toBe('0 agents · 1 channels');
       await segment(container, 'board');
       expect(meta()).toBe('1 unowned');
+    });
+  });
+
+  describe('the tile view (obs.C.35)', () => {
+    // One slotted room ('#dispatch', with an active and an idle agent) plus
+    // enough filler rooms to run the floor's 11 slots out, plus one more
+    // channel ('#lounge') that lands in overflow — tiles have no fixed plan,
+    // so it still needs to show up somewhere.
+    const tilesFixture = () =>
+      mockData(
+        snapshot({
+          rooms: [
+            room({ key: 'r0', name: 'dispatch', memberAgentIds: ['ag-ava', 'ag-kit'] }),
+            ...Array.from({ length: SLOTS.length - 1 }, (_, i) => room({ key: `filler${i}`, name: `filler${i}` })),
+            room({ key: 'lounge', name: 'lounge', memberAgentIds: ['ag-zed'] }),
+          ],
+          agents: [
+            agent({
+              id: 'ag-ava',
+              name: 'ava',
+              location: 'r0',
+              active: true,
+              awake: true,
+              avatarUrl: 'https://cdn.example/ava_192.png',
+            }),
+            agent({ id: 'ag-kit', name: 'kit', location: null, active: false, awake: true }),
+            agent({ id: 'ag-zed', name: 'zed', location: 'lounge', active: true, awake: true }),
+          ],
+        }),
+      );
+
+    it('is the default view, and the map stays unmounted rather than merely hidden', () => {
+      localStorage.clear();
+      tilesFixture();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(container.querySelector('[data-obs-view="tiles"]')!.getAttribute('aria-pressed')).toBe('true');
+      expect(container.querySelector('.nc-of-roomgrid')).toBeTruthy();
+      expect(container.querySelector('office-map')).toBeFalsy();
+    });
+
+    it('switches to Map and remembers the choice on the next visit; forgets on a clean slate', async () => {
+      tilesFixture();
+      const first = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await toMap(first.container);
+      expect(first.container.querySelector('office-map')).toBeTruthy();
+      expect(first.container.querySelector('.nc-of-roomgrid')).toBeFalsy();
+      first.unmount();
+
+      const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(second.container.querySelector('[data-obs-view="map"]')!.getAttribute('aria-pressed')).toBe('true');
+      expect(second.container.querySelector('office-map')).toBeTruthy();
+      second.unmount();
+
+      localStorage.clear();
+      const third = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      expect(third.container.querySelector('.nc-of-roomgrid')).toBeTruthy();
+    });
+
+    it('renders a channel the map has no slot left for as a tile too', () => {
+      localStorage.clear();
+      tilesFixture();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const names = Array.from(container.querySelectorAll('.nc-of-roomcard-name')).map((n) => n.textContent);
+      expect(names).toContain('#dispatch');
+      expect(names).toContain('#lounge');
+    });
+
+    it('clicking a tile selects the room — the sections below filter identically to a map click, even for an overflow channel', async () => {
+      localStorage.clear();
+      tilesFixture();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const tileFor = (name: string) =>
+        Array.from(container.querySelectorAll('.nc-of-roomcard')).find(
+          (t) => t.querySelector('.nc-of-roomcard-name')!.textContent === name,
+        )! as HTMLElement;
+
+      await userEvent.click(tileFor('#dispatch'));
+      expect(tileFor('#dispatch').className).toContain('on');
+      expect(container.querySelector('.nc-of-sheet-title')!.textContent).toBe('#dispatch');
+
+      // Picking the overflow channel works the same way — this is the gap a
+      // slot-only selection scheme would have left.
+      await userEvent.click(tileFor('#lounge'));
+      expect(container.querySelector('.nc-of-sheet-title')!.textContent).toBe('#lounge');
+    });
+
+    it('clicking an avatar chip opens that agent’s drawer, without also selecting the room', async () => {
+      localStorage.clear();
+      tilesFixture();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const chip = Array.from(container.querySelectorAll('.nc-of-facechip')).find(
+        (c) => c.querySelector('.nc-of-facechip-name')!.textContent === 'ava',
+      )! as HTMLElement;
+      await userEvent.click(chip);
+      expect(container.querySelector('[data-testid="agent-drawer"]')).toBeTruthy();
+      expect(container.querySelector('.nc-of-sheet-title')).toBeFalsy();
+    });
+
+    it('an active agent renders lit and full colour; everyone else gets the z z affordance and a desaturated face', () => {
+      localStorage.clear();
+      tilesFixture();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const chipFor = (name: string) =>
+        Array.from(container.querySelectorAll('.nc-of-facechip')).find(
+          (c) => c.querySelector('.nc-of-facechip-name')!.textContent === name,
+        )!;
+
+      const ava = chipFor('ava');
+      expect(ava.className).toContain('working');
+      expect(ava.querySelector('.nc-of-facechip-pulse')).toBeTruthy();
+      expect(ava.querySelector('.nc-of-facechip-z')).toBeFalsy();
+      expect(ava.querySelector('.nc-of-facechip-face')!.className.trim().split(/\s+/)).not.toContain('i');
+
+      const kit = chipFor('kit');
+      expect(kit.className).toContain('idle');
+      expect(kit.querySelector('.nc-of-facechip-z')!.textContent).toBe('z z');
+      expect(kit.querySelector('.nc-of-facechip-pulse')).toBeFalsy();
+      // kit has no avatarUrl, so it falls back to its initial rather than an
+      // invented face — but it is still visibly desaturated-treated.
+      expect(kit.querySelector('.nc-of-facechip-fallback')!.textContent).toBe('K');
     });
   });
 
@@ -633,10 +778,15 @@ describe('Observatory', () => {
       await segment(container, 'board');
       return container;
     };
-    /** The floor — where the map, the room sheet and the agent drawer live. */
+    /** The floor — where the map, the room sheet and the agent drawer live.
+     *  Switches to Map: these tests dispatch `office-map`'s own DOM events,
+     *  which needs the element mounted, not the tiles view that is now the
+     *  default. */
     const openFloor = async () => {
       stalledBoard();
-      return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />).container;
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await toMap(container);
+      return container;
     };
     const expand = async (c: HTMLElement, slug: string) => {
       const row = c.querySelector(`.nc-obs-claim-row[data-slug="${slug}"]`)! as HTMLElement;

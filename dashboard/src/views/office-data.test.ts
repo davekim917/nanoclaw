@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildOfficeData, agentLook, agentState, roomState, SLOTS } from './office-data.js';
+import { buildOfficeData, agentLook, agentState, roomState, faceSrc, SLOTS } from './office-data.js';
 import type { ObservatoryRoom, ObservatoryAgent, ReleaseItem } from '../lib/api.js';
 
 function room(key: string, name = key): ObservatoryRoom {
@@ -161,6 +161,40 @@ describe('buildOfficeData', () => {
     const themed = { grill: 'not-a-real-slot' };
     const d = buildOfficeData([room('grill')], [], [], themed);
     expect(d.rooms[0]!.slot).toBe(SLOTS[0]);
+  });
+
+  // Tiles have no fixed floor plan, so a channel the map has nowhere to put
+  // can still be shown — but it must go through the exact same seating rule
+  // as every slotted room, not a second one written just for overflow.
+  it('overflow channels are fully seated too, the same way a slotted room is', () => {
+    const many = Array.from({ length: SLOTS.length + 1 }, (_, i) => room(`r${i}`));
+    const overflowRoom = { ...many[SLOTS.length]!, memberAgentIds: ['ava'] };
+    const d = buildOfficeData(
+      [...many.slice(0, SLOTS.length), overflowRoom],
+      [agent('ava', { location: overflowRoom.key })],
+    );
+    expect(d.overflowRooms).toHaveLength(1);
+    expect(d.overflowRooms[0]!.key).toBe(overflowRoom.key);
+    expect(d.overflowRooms[0]!.label).toBe(`#${overflowRoom.key}`);
+    expect(d.overflowRooms[0]!.agents.map((a) => a.name)).toEqual(['ava']);
+    expect(d.overflowRooms[0]!.agents[0]!.status).toBe('working');
+    expect(d.overflowRooms[0]!.state).toBe('working');
+    // No slot property at all — there is no floor-plan seat for it.
+    expect((d.overflowRooms[0] as { slot?: unknown }).slot).toBeUndefined();
+  });
+});
+
+describe('faceSrc', () => {
+  it('accepts a plain https or data image URL and downsizes a sized Slack URL to 48px', () => {
+    expect(faceSrc('https://cdn.example/ava_192.png')).toBe('https://cdn.example/ava_48.png');
+    expect(faceSrc('https://cdn.example/ava.png')).toBe('https://cdn.example/ava.png');
+    expect(faceSrc('data:image/png;base64,abc')).toBe('data:image/png;base64,abc');
+  });
+  it('drops anything that is not a plain https/data image URL, and a missing avatar', () => {
+    expect(faceSrc(null)).toBe('');
+    expect(faceSrc(undefined)).toBe('');
+    expect(faceSrc('javascript:alert(1)')).toBe('');
+    expect(faceSrc('"><img src=x>')).toBe('');
   });
 });
 

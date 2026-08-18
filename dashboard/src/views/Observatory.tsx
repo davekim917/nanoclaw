@@ -31,7 +31,7 @@ import {
 } from '../lib/api.js';
 import { TranscriptList, normalizeSessionEntry } from './TranscriptList.js';
 import { OfficeMap } from './OfficeMap.js';
-import { buildOfficeData, agentState } from './office-data.js';
+import { buildOfficeData, agentState, faceSrc, type OfficeRoomData, type OfficeOverflowRoom } from './office-data.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
 
 
@@ -69,6 +69,11 @@ const POLL_MS = 15_000;
 
 /** Whether the floor is unfolded. Absent means expanded — the default view. */
 const MAP_OPEN_KEY = 'nc-obs-map-open';
+
+/** Tiles or Map. Tiles is the default — the map is more fun than functional
+ *  right now (too busy, rooms too big), and that gets fixed on its own time;
+ *  tiles is the reading that was there before the map. */
+const OBS_VIEW_KEY = 'nc-obs-view';
 
 /** Map zoom: persisted like the fold state, same reasoning — an operator who
     picks a zoom level should not have to pick it again on every visit. */
@@ -157,6 +162,15 @@ export function Observatory({ authMe }: ObservatoryProps) {
   useEffect(() => {
     localStorage.setItem(MAP_OPEN_KEY, String(mapOpen));
   }, [mapOpen]);
+  // Tiles is the default for a fresh browser; only an explicit 'map' switches
+  // it. The map stays unmounted while tiles is showing — it builds a large
+  // SVG, and a hidden-but-mounted map is not free.
+  const [obsView, setObsView] = useState<'tiles' | 'map'>(() =>
+    localStorage.getItem(OBS_VIEW_KEY) === 'map' ? 'map' : 'tiles',
+  );
+  useEffect(() => {
+    localStorage.setItem(OBS_VIEW_KEY, obsView);
+  }, [obsView]);
   const [mapScale, setMapScale] = useState(() => {
     const saved = Number(localStorage.getItem(MAP_SCALE_KEY));
     return Number.isFinite(saved) && saved > 0 ? clampMapScale(saved) : MAP_SCALE_DEFAULT;
@@ -220,7 +234,15 @@ export function Observatory({ authMe }: ObservatoryProps) {
     // overflow rooms, so the two lists stop being index-parallel the moment a
     // floor runs out of slots — and the sheet would then show a different
     // room's people (and their claims) under the picked room's name.
-    const room = officeData.rooms.find((r) => r.slot === selectedRoom);
+    //
+    // A slotted room is picked by its SLOT (what the map and its teleport
+    // chips use); an overflow room has none, so the tile view picks it by its
+    // own KEY instead — see OfficeTiles' `tileKey`. Both are searched here so
+    // a tile click on an overflow channel filters the page exactly like a
+    // click on a slotted one does.
+    const room =
+      officeData.rooms.find((r) => r.slot === selectedRoom) ??
+      officeData.overflowRooms.find((r) => r.key === selectedRoom);
     if (!room) return null;
     // You steer WORK, not a worker. `holding` is claim slugs, so join it back
     // to the claims to get the thread each piece of work actually lives in.
@@ -321,6 +343,18 @@ export function Observatory({ authMe }: ObservatoryProps) {
     setSelectedRoom('');
   };
 
+  // The drawer answers about (agent, room): who they are AND which room they
+  // were clicked in — picking a room on its own stays its own, independent
+  // action. Shared by the map's pin click and the tile view's avatar chip
+  // click, so the two surfaces open the same drawer the same way.
+  const selectAgentInRoom = (name: string, roomKey: string | null) => {
+    const a = agents.find((x) => x.name === name);
+    if (a) {
+      setAgentDrawerId(a.id);
+      setAgentDrawerRoomKey(roomKey);
+    }
+  };
+
   // Scheduled rows carry the agent group's CODE name; the snapshot carries the
   // persona the operator actually knows. Same id on both sides, so map it —
   // and fall back to whatever the row said rather than to nothing.
@@ -408,7 +442,11 @@ export function Observatory({ authMe }: ObservatoryProps) {
                 <div className="nc-of-mapcard-head">
                   <span className="nc-of-mapcard-title">The office</span>
                   {mapOpen && (
-                    <span className="nc-of-mapcard-hint">drag to pan · tap a room to filter what is below</span>
+                    <span className="nc-of-mapcard-hint">
+                      {obsView === 'map'
+                        ? 'drag to pan · tap a room to filter what is below'
+                        : 'tap a room to filter what is below'}
+                    </span>
                   )}
                   {/* obs.C.15 — one flex unit, not four independent chips. Each
                       chip carrying its own margin-left:auto meant flex-wrap
@@ -416,12 +454,36 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       stranding it alone; grouping them lets the whole cluster
                       wrap together on a narrow header. */}
                   <div className="nc-of-mapcard-actions">
+                    {/* obs.C.35 — Tiles is the pre-map reading and stays the
+                        default; Map is more fun than functional right now
+                        (too busy, rooms too big) and is being left alone on
+                        purpose while that gets fixed separately. */}
+                    <div className="nc-of-viewtoggle" role="group" aria-label="Floor view">
+                      <button
+                        type="button"
+                        className={`nc-of-chip ${obsView === 'tiles' ? 'on' : ''}`}
+                        data-obs-view="tiles"
+                        aria-pressed={obsView === 'tiles'}
+                        onClick={() => setObsView('tiles')}
+                      >
+                        Tiles
+                      </button>
+                      <button
+                        type="button"
+                        className={`nc-of-chip ${obsView === 'map' ? 'on' : ''}`}
+                        data-obs-view="map"
+                        aria-pressed={obsView === 'map'}
+                        onClick={() => setObsView('map')}
+                      >
+                        Map
+                      </button>
+                    </div>
                     {mapOpen && selectedRoom && (
                       <button type="button" className="nc-of-chip" onClick={closeRoom}>
                         All rooms
                       </button>
                     )}
-                    {mapOpen && (
+                    {mapOpen && obsView === 'map' && (
                       <>
                         <button
                           type="button"
@@ -465,23 +527,25 @@ export function Observatory({ authMe }: ObservatoryProps) {
                     </button>
                   </div>
                 </div>
-                {mapOpen && (
+                {mapOpen && obsView === 'tiles' && (
+                  <OfficeTiles
+                    rooms={officeData.rooms}
+                    overflowRooms={officeData.overflowRooms}
+                    selected={selectedRoom}
+                    onSelect={pickRoom}
+                    onAgentSelect={selectAgentInRoom}
+                  />
+                )}
+                {mapOpen && obsView === 'map' && (
                   <>
                     <OfficeMap
                       data={officeData}
                       {...(startSlot ? { start: startSlot } : {})}
                       selected={selectedRoom}
                       onSelect={pickRoom}
-                      onAgentSelect={({ name, room: slot }) => {
-                        // The drawer answers about (agent, room): who they
-                        // are AND which room they were clicked in — picking a
-                        // room on its own stays its own, independent action.
-                        const a = agents.find((x) => x.name === name);
-                        if (a) {
-                          setAgentDrawerId(a.id);
-                          setAgentDrawerRoomKey(officeData.rooms.find((r) => r.slot === slot)?.key ?? null);
-                        }
-                      }}
+                      onAgentSelect={({ name, room: slot }) =>
+                        selectAgentInRoom(name, officeData.rooms.find((r) => r.slot === slot)?.key ?? null)
+                      }
                       teleportTo={teleportTo}
                       scale={String(mapScale)}
                       onScaleChange={(s) => setMapScale(clampMapScale(s))}
@@ -1048,6 +1112,107 @@ export function CommitmentStrip({
         )}
       </div>
     </section>
+  );
+}
+
+/**
+ * The office as channel cards — the pre-map reading, kept as a full sibling
+ * rather than folded away behind "too busy". No SVG, no pan: a
+ * responsive grid, one card per channel, real Slack avatars lighting up for
+ * whoever is actually working right now and desaturated + "z z" for everyone
+ * else — same read the map gives, without the illustration.
+ *
+ * Takes BOTH `rooms` (slotted, what the map can show) and `overflowRooms`
+ * (channels the floor's 11 slots have no room for) — tiles have no fixed plan
+ * to run out of, so a channel that never gets a room on the map still gets a
+ * card here. Both arrays are already fully seated by office-data.ts's one
+ * seating rule; this component only renders what it is handed.
+ */
+function OfficeTiles({
+  rooms,
+  overflowRooms,
+  selected,
+  onSelect,
+  onAgentSelect,
+}: {
+  rooms: OfficeRoomData[];
+  overflowRooms: OfficeOverflowRoom[];
+  selected: string;
+  onSelect: (key: string) => void;
+  onAgentSelect: (name: string, roomKey: string) => void;
+}) {
+  // A slotted room is selected/teleported-to by its SLOT (what the map uses);
+  // an overflow room has none, so it is selected by its own key instead. Both
+  // are just "the room's tile key" from here down.
+  const cards = [
+    ...rooms.map((r) => ({ ...r, tileKey: r.slot as string })),
+    ...overflowRooms.map((r) => ({ ...r, tileKey: r.key })),
+  ];
+  return (
+    <div className="nc-of-roomgrid">
+      {cards.map((r) => (
+        <div
+          key={r.key}
+          className={`nc-of-roomcard ${r.state} ${selected === r.tileKey ? 'on' : ''}`}
+          role="button"
+          tabIndex={0}
+          onClick={() => onSelect(r.tileKey)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              onSelect(r.tileKey);
+            }
+          }}
+        >
+          <div className="nc-of-roomcard-head">
+            <i className={`nc-of-sd ${r.state}`} />
+            <span className="nc-of-roomcard-name">{r.label}</span>
+            {r.open > 0 && <span className="nc-of-roomcard-n">{r.open}</span>}
+          </div>
+          <div className="nc-of-roomcard-agents">
+            {r.agents.length === 0 ? (
+              <span className="nc-of-roomcard-empty">nobody wired here</span>
+            ) : (
+              r.agents.map((a) => {
+                const src = faceSrc(a.avatarUrl);
+                const lit = a.status === 'working';
+                return (
+                  <button
+                    key={a.name}
+                    type="button"
+                    className={`nc-of-facechip ${a.status}`}
+                    // The chip nests inside the tile's own click target; stop
+                    // the click there so picking a person does not also pick
+                    // the room out from under it.
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onAgentSelect(a.name, r.key);
+                    }}
+                    title={a.name}
+                  >
+                    {src ? (
+                      <img
+                        className={`nc-of-facechip-face ${lit ? '' : 'i'}`}
+                        src={src}
+                        alt=""
+                        width={20}
+                        height={20}
+                      />
+                    ) : (
+                      <span className="nc-of-facechip-face nc-of-facechip-fallback">
+                        {a.name.charAt(0).toUpperCase()}
+                      </span>
+                    )}
+                    <span className="nc-of-facechip-name">{a.name}</span>
+                    {lit ? <i className="nc-of-facechip-pulse" /> : <span className="nc-of-facechip-z">z z</span>}
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 

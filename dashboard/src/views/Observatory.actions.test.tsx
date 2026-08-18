@@ -182,6 +182,14 @@ async function segment(c: HTMLElement, view: 'overview' | 'decisions' | 'board')
   await userEvent.click(c.querySelector(`.nc-of-seg-btn[data-view="${view}"]`)! as HTMLElement);
 }
 
+/** Switch the floor from its default (Tiles) to Map — this file's tests reach
+ *  rooms/agents through the map's own teleport chips and DOM events, which
+ *  only exist once Map is the active view (obs.C.35: Tiles is the default and
+ *  the map is unmounted, not just hidden, while it isn't active). */
+async function toMap(c: HTMLElement) {
+  await userEvent.click(c.querySelector('[data-obs-view="map"]')! as HTMLElement);
+}
+
 
 // ── Split from Observatory.test.tsx on 2026-08-18 ────────────────────────────
 // One file's ~119 full-page jsdom renders outgrew a single vitest worker's
@@ -702,6 +710,7 @@ describe('Observatory — actions and sheets', () => {
       return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
     }
     const open = async (c: HTMLElement, label: string) => {
+      await toMap(c);
       const chip = Array.from(c.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
         b.textContent?.includes(label),
       );
@@ -831,6 +840,7 @@ describe('Observatory — actions and sheets', () => {
     // the room sheet — so a person click must leave the sheet untouched.
     it('a click on an agent opens the agent drawer, not the room sheet', async () => {
       const { container } = floor();
+      await toMap(container);
       const map = container.querySelector('office-map')!;
       await act(async () => {
         map.dispatchEvent(
@@ -855,6 +865,7 @@ describe('Observatory — actions and sheets', () => {
         }),
       );
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await toMap(container);
       const map = container.querySelector('office-map') as HTMLElement;
       // the element defers its first paint to idle/intersection; nudge it.
       await act(async () => {
@@ -888,7 +899,10 @@ describe('Observatory — actions and sheets', () => {
       await open(container, '#general');
       await userEvent.click(container.querySelector('.nc-of-sheet-x')! as HTMLElement);
       expect(container.querySelector('.nc-of-sheet')).toBeFalsy();
-      expect(container.querySelector('.nc-of-chip.on')).toBeFalsy();
+      // Scoped to the teleport row, not `.nc-of-chip.on` generally — the
+      // Tiles/Map view toggle is also a `.nc-of-chip` and rightly stays "on"
+      // for whichever view is active; only the picked-room chip must clear.
+      expect(container.querySelector('.nc-of-teleport .nc-of-chip.on')).toBeFalsy();
     });
   });
 
@@ -962,6 +976,7 @@ describe('Observatory — actions and sheets', () => {
     // room ('general') lands on 'westFront' and the second ('ops') on
     // 'eastFront' — SLOTS[0] and SLOTS[1].
     const clickAgentIn = async (container: HTMLElement, name: string, slot: string) => {
+      await toMap(container);
       const map = container.querySelector('office-map')!;
       await act(async () => {
         map.dispatchEvent(new CustomEvent('agent-select', { detail: { name, room: slot }, bubbles: true }));
@@ -1100,6 +1115,7 @@ describe('Observatory — actions and sheets', () => {
 
     it('the drawer and the room sheet track independently', async () => {
       const { container } = drawerFloor();
+      await toMap(container);
       const chip = Array.from(container.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
         b.textContent?.includes('#general'),
       );
@@ -1311,6 +1327,7 @@ describe('Observatory — actions and sheets', () => {
         }),
       );
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await toMap(container);
       await userEvent.click(
         Array.from(container.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
           b.textContent?.includes('#general'),
@@ -1381,12 +1398,14 @@ describe('Observatory — actions and sheets', () => {
       );
       return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
     };
-    const open = async (c: HTMLElement, label: string) =>
-      userEvent.click(
+    const open = async (c: HTMLElement, label: string) => {
+      await toMap(c);
+      await userEvent.click(
         Array.from(c.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
           b.textContent?.includes(label),
         )! as HTMLElement,
       );
+    };
     const tiles = (c: HTMLElement) => Array.from(c.querySelectorAll('.nc-of-tile-n')).map((e) => e.textContent);
     const rows = (c: HTMLElement) => c.querySelectorAll('[data-section="queue"] .nc-obs-ledger-row').length;
 
