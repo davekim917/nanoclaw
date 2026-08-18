@@ -119,13 +119,18 @@ function seedCentralScope(): void {
        (id,agent_group_id,messaging_group_id,thread_id,agent_provider,status,container_status,last_active,created_at)
      VALUES (?,?,?,?,?,?,?,?,?)`,
   );
+  // Three sessions share one (agent, mg, thread) triple — a rotation
+  // lineage. Migration 049 allows only ONE active row per triple, and in
+  // production rotation closes the predecessor, so the superseded pair is
+  // seeded 'closed'. The memory module addresses sessions by id and never
+  // reads status, so turn behavior is unchanged.
   insertSession.run(
     'first-wake',
     'ag-a',
     'mg-discord',
     'discord:111:222:333',
     'claude',
-    'active',
+    'closed',
     'stopped',
     null,
     NOW,
@@ -136,7 +141,7 @@ function seedCentralScope(): void {
     'mg-discord',
     'discord:111:222:333',
     'claude',
-    'active',
+    'closed',
     'stopped',
     null,
     NOW,

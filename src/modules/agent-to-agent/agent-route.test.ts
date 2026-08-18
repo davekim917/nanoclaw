@@ -132,7 +132,11 @@ describe('routeAgentMessage return-path', () => {
       id: 'sess-A-old',
       agent_group_id: A,
       messaging_group_id: null,
-      thread_id: null,
+      // Distinct non-system thread: migration 049 folds NULLs, so a second
+      // active NULL/NULL session on A would be rejected at insert. A named
+      // thread keeps S1 eligible for findSessionByAgentGroup's newest-first
+      // lookup (it only excludes 'system:%' threads), which these tests need.
+      thread_id: 'thr-A-old',
       agent_provider: null,
       status: 'active',
       container_status: 'stopped',

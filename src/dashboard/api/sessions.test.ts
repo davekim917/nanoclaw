@@ -67,9 +67,12 @@ function seedAgentGroup(id: string): void {
 function insertSession(sessId: string, agId: string, mgId: string | null = null): void {
   getDb()
     .prepare(
-      "INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, status, created_at) VALUES (?, ?, ?, 'active', ?)",
+      // Distinct thread per session, mirroring real task sessions
+      // (`system:tasks:<seriesId>`) — migration 049 folds NULLs, so two
+      // active NULL/NULL rows per agent group is a shape production never has.
+      "INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
     )
-    .run(sessId, agId, mgId, now());
+    .run(sessId, agId, mgId, `system:tasks:${sessId}`, now());
 }
 
 function setSessionFields(

@@ -66,12 +66,14 @@ describe('destinations CLI custom ops project to inbound.db (#2465)', () => {
     // Two active sessions for the source agent — both must receive the
     // projected destination row. Fixing only the "newest" session is a
     // common regression shape, so the second session catches that.
+    // Distinct threads per session: migration 049 folds NULLs, so two
+    // active NULL/NULL rows on one agent group would be rejected at insert.
     for (const sid of [SESSION_A, SESSION_B]) {
       createSession({
         id: sid,
         agent_group_id: SOURCE,
         messaging_group_id: null,
-        thread_id: null,
+        thread_id: `thr-${sid}`,
         agent_provider: null,
         status: 'active',
         container_status: 'stopped',

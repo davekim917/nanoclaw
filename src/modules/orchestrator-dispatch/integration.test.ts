@@ -443,10 +443,13 @@ describe('F1: e2e idempotency replay', () => {
     const { getChannelAdapter } = await import('../../channels/channel-registry.js');
     vi.mocked(getChannelAdapter).mockReturnValue(undefined);
 
-    // Insert a pre-existing running task to fill the cap (child session lives in same group)
+    // Insert a pre-existing running task to fill the cap (child session lives
+    // in same group). Distinct thread: migration 049 folds NULLs, so a second
+    // active NULL/NULL row on ag-orch would be OR-IGNOREd away and the task
+    // insert below would FK-fail against the missing session.
     getDb()
-      .prepare(`INSERT OR IGNORE INTO sessions (id, agent_group_id, created_at) VALUES (?, ?, ?)`)
-      .run('some-child-sess', 'ag-orch', ts());
+      .prepare(`INSERT OR IGNORE INTO sessions (id, agent_group_id, thread_id, created_at) VALUES (?, ?, ?, ?)`)
+      .run('some-child-sess', 'ag-orch', 'system:tasks:some-child', ts());
 
     const replayHash = computeRequestHash('Do X', null);
     insertTaskAtomic({

@@ -809,7 +809,9 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       id: legacySessionId,
       agent_group_id: AG,
       messaging_group_id: null,
-      thread_id: null,
+      // Distinct thread: the beforeEach already seeded an active NULL/NULL
+      // session on AG, and migration 049 folds NULLs into the unique triple.
+      thread_id: 'thr-legacy-upgrade',
       agent_provider: null,
       status: 'active',
       container_status: 'stopped',
