@@ -15,6 +15,7 @@ vi.mock('../lib/api.js', () => ({
   assignItem: vi.fn(),
   nudgeClaim: vi.fn(),
   steerWork: vi.fn(),
+  getIssueBrief: vi.fn(),
   getSessionDetail: vi.fn(),
 }));
 
@@ -30,11 +31,12 @@ import {
   decisionRows,
   shipInstruction,
   shipAddressee,
+  _resetBriefCacheForTesting,
 } from './Observatory.js';
 import { buildLedger } from './commitments.js';
 import { RouteNav } from './BoardShell.js';
 import useSWR from 'swr';
-import { assignItem, getSessionDetail, steerWork } from '../lib/api.js';
+import { assignItem, getIssueBrief, getSessionDetail, steerWork } from '../lib/api.js';
 import type {
   ObservatoryRoom,
   ObservatoryAgent,
@@ -203,6 +205,7 @@ describe('Observatory — actions and sheets', () => {
   afterEach(() => {
     vi.clearAllMocks();
     vi.unstubAllGlobals();
+    _resetBriefCacheForTesting();
   });
 
   describe('the decisions view', () => {
@@ -371,6 +374,61 @@ describe('Observatory — actions and sheets', () => {
       await userEvent.click(shipBtn(container, 'XZO#912')!);
       expect(container.querySelector('[data-ledger-id="XZO#912"] .nc-obs-actions-err')).toBeTruthy();
       expect(shipBtn(container, 'XZO#912')).toBeTruthy();
+    });
+
+    it('expanding a row reads the linked issue: body, labels, and the latest comments', async () => {
+      vi.mocked(getIssueBrief).mockResolvedValue({
+        state: 'open',
+        labels: ['needs-product-decision', 'p2'],
+        body: 'QA saw Brand Executive read as national. Expected: tier from tenant config, not display name.',
+        bodyTruncated: false,
+        comments: [{ author: 'desk', at: new Date().toISOString(), body: 'proposed default: derive from tenant tier' }],
+        commentCount: 4,
+        fetchedAt: new Date().toISOString(),
+      });
+      const { container } = await open([
+        releaseItem({
+          id: 'XZO#803',
+          nextMover: 'human',
+          owner: 'robin',
+          channel: '#dispatch',
+          url: 'https://github.com/example-org/example-repo/issues/803',
+          nextAction: 'robin answers/acts -- see why',
+        }),
+      ]);
+      await expandRow(container, 'XZO#803');
+      await act(async () => {});
+      expect(vi.mocked(getIssueBrief)).toHaveBeenCalledWith('wg-1', 'XZO#803');
+      const brief = container.querySelector('.nc-obs-brief')!;
+      expect(brief.textContent).toContain('Expected: tier from tenant config');
+      expect(brief.textContent).toContain('needs-product-decision');
+      expect(brief.textContent).toContain('proposed default: derive from tenant tier');
+      // 4 total, 1 shown — the pane says what it is hiding.
+      expect(brief.textContent).toContain('3 earlier — latest 1 shown');
+    });
+
+    it('a brief that cannot be read degrades to the issue link, never a broken pane', async () => {
+      vi.mocked(getIssueBrief).mockRejectedValue(new Error('502'));
+      const { container } = await open([
+        releaseItem({
+          id: 'XZO#803',
+          nextMover: 'human',
+          owner: 'robin',
+          channel: '#dispatch',
+          url: 'https://github.com/example-org/example-repo/issues/803',
+        }),
+      ]);
+      await expandRow(container, 'XZO#803');
+      await act(async () => {});
+      expect(container.querySelector('.nc-obs-brief-empty')!.textContent).toContain('couldn’t read the issue');
+    });
+
+    it('an item with no url gets no brief pane — nothing to read', async () => {
+      const { container } = await open();
+      await expandRow(container, 'XZO#912');
+      await act(async () => {});
+      expect(vi.mocked(getIssueBrief)).not.toHaveBeenCalled();
+      expect(container.querySelector('.nc-obs-brief, .nc-obs-brief-empty')).toBeFalsy();
     });
 
     it('an instruction addressed to nobody on this floor opens the row instead of firing', async () => {

@@ -20,7 +20,15 @@ import { relAge } from '../lib/derive.js';
 import { type BoardRoute } from './BoardShell.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildLedger, classify, dueLabel, type Commitment } from './commitments.js';
-import { assignItem, getSessionDetail, nudgeClaim, steerWork, type SessionTranscriptEntry } from '../lib/api.js';
+import {
+  assignItem,
+  getIssueBrief,
+  getSessionDetail,
+  nudgeClaim,
+  steerWork,
+  type IssueBrief,
+  type SessionTranscriptEntry,
+} from '../lib/api.js';
 import { TranscriptList, normalizeSessionEntry } from './TranscriptList.js';
 import { OfficeMap } from './OfficeMap.js';
 import { buildOfficeData, agentState } from './office-data.js';
@@ -1400,6 +1408,76 @@ function WorkActions({
 }
 
 /**
+ * What the linked issue actually says, fetched live when the row opens. A
+ * person deciding needs the body QA wrote and the latest comments (where a
+ * proposed default and its do-by live) — without leaving the page. Ids-only
+ * to the server; the module cache means re-expanding a row costs nothing.
+ */
+const briefCache = new Map<string, IssueBrief>();
+
+/** Test-only — the cache is module-level and would bleed between tests. */
+export function _resetBriefCacheForTesting(): void {
+  briefCache.clear();
+}
+
+function IssueBriefPane({ workgroupId, itemId }: { workgroupId: string; itemId: string }) {
+  const [brief, setBrief] = useState<IssueBrief | null>(briefCache.get(`${workgroupId}:${itemId}`) ?? null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (brief) return;
+    let gone = false;
+    getIssueBrief(workgroupId, itemId)
+      .then((b) => {
+        briefCache.set(`${workgroupId}:${itemId}`, b);
+        if (!gone) setBrief(b);
+      })
+      .catch(() => {
+        if (!gone) setFailed(true);
+      });
+    return () => {
+      gone = true;
+    };
+  }, [workgroupId, itemId, brief]);
+
+  if (failed) return <div className="nc-obs-brief-empty">couldn’t read the issue — use the link above</div>;
+  if (!brief) return <div className="nc-obs-brief-empty">reading the issue…</div>;
+  const now = Date.now();
+  return (
+    <div className="nc-obs-brief">
+      <div className="nc-obs-brief-labels">
+        <span className={`nc-obs-brief-state ${brief.state}`}>{brief.state}</span>
+        {brief.labels.map((l) => (
+          <span key={l} className="nc-obs-brief-label">{l}</span>
+        ))}
+      </div>
+      {brief.body && (
+        <div className="nc-obs-brief-body">
+          {brief.body}
+          {brief.bodyTruncated && '…'}
+        </div>
+      )}
+      {brief.comments.length > 0 && (
+        <div className="nc-obs-brief-comments">
+          {brief.commentCount > brief.comments.length && (
+            <div className="nc-obs-brief-more">
+              {brief.commentCount - brief.comments.length} earlier — latest {brief.comments.length} shown
+            </div>
+          )}
+          {brief.comments.map((c) => (
+            <div key={c.at} className="nc-obs-brief-comment">
+              <span className="nc-obs-brief-author">
+                {c.author} · {magnitude(now - Date.parse(c.at), now)} ago
+              </span>
+              <p>{c.body}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * One row, one grammar: id · title · state · owner · room · age. The same row
  * renders in the needs-attention queue and on the job board — two filters over
  * one table, never two tables.
@@ -1514,6 +1592,9 @@ function ItemRow({
             {item.owner ? ` · ${item.owner}` : ''}
           </div>
           {item.url && <OutLink href={item.url}>{itemLinkLabel(item.kind)}</OutLink>}
+          {/* The decision needs what the ISSUE says, not just the board's one
+              line — body, labels, latest comments, fetched live on open. */}
+          {decide && assign && item.url && <IssueBriefPane workgroupId={assign.workgroupId} itemId={item.id} />}
           {/* Handing a person's own item to an agent is not the move — the
               whole point of this row is that a PERSON has to answer it. It
               says where, instead of offering to route it away — and takes them
