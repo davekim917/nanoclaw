@@ -368,11 +368,14 @@ export function Observatory({ authMe }: ObservatoryProps) {
 
         {snapshot && (
           <>
-            {/* Layout law 1: one-line summary, then the OFFICE, then whatever
-                the segmented control is pointing at. The headline and the
-                floor do not move when the segment changes — only the region
-                below them does. */}
-            <CommitmentStrip items={ownerFilteredItems} slice={flowFilter} onSlice={setFlowFilter} />
+            {/* Layout law 1: the OFFICE first, then the commitments it
+                explains, then whatever the segmented control is pointing at.
+                The tiles used to sit ABOVE the floor on every segment, which
+                put a screen of numbers between the reader and the product's
+                own picture — and repeated a summary of the queue on two views
+                (Decisions, Job board) that already state their own totals in
+                the bar. They belong to the Overview, under the floor whose
+                rooms they are counting. */}
 
             <div className="nc-obs-main">
               {/* The floor is the vendored <office-map> custom element: a
@@ -495,6 +498,14 @@ export function Observatory({ authMe }: ObservatoryProps) {
                   </>
                 )}
               </section>
+              )}
+
+              {/* The commitments the floor above is standing on. Overview
+                  only, and BELOW the map: the picture answers "what is going
+                  on", these three numbers qualify it, and the queue under
+                  them is what the numbers open into. */}
+              {view === 'overview' && (
+                <CommitmentStrip items={ownerFilteredItems} slice={flowFilter} onSlice={setFlowFilter} />
               )}
 
               {selectedRoomAgents && (

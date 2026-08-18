@@ -296,7 +296,7 @@ describe('Observatory', () => {
         }),
       );
 
-    it('opens on the overview: the headline, the office, and the queue', () => {
+    it('opens on the overview: the office, the headline, and the queue', () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       expect(container.querySelector('.nc-of-seg-btn[data-view="overview"]')!.getAttribute('aria-pressed')).toBe('true');
@@ -306,21 +306,36 @@ describe('Observatory', () => {
       expect(container.querySelector('[data-section="board"]')).toBeFalsy();
     });
 
-    // obs.C.7 — the headline is the page's fixed answer and stays. The FLOOR is
-    // the overview's own answer to "what is going on", and on the job board it
-    // was a screen of illustration between the reader and the rows.
-    it('the headline survives every segment; the office belongs to the overview', async () => {
+    // obs.C.27 — the tiles FOLLOW the floor rather than leading it: the map is
+    // the answer to "what is going on" and the three numbers qualify it.
+    it('the headline sits below the map card, not above it', () => {
+      full();
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      const map = container.querySelector('.nc-of-mapcard')!;
+      const head = container.querySelector('.nc-of-head')!;
+      expect(map.compareDocumentPosition(head) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    // obs.C.7 established the floor as the overview's own answer. obs.C.27
+    // moved the headline onto the same footing: Decisions and the job board
+    // each state their own totals in the top bar, so a second summary of the
+    // same queue above them was one number too many.
+    it('both the headline and the office belong to the overview', async () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       await segment(container, 'board');
       expect(container.querySelector('office-map')).toBeFalsy();
       expect(container.querySelector('.nc-of-mapcard')).toBeFalsy();
-      expect(container.querySelector('.nc-of-head')).toBeTruthy();
+      expect(container.querySelector('.nc-of-head')).toBeFalsy();
       expect(container.querySelector('[data-section="board"]')).toBeTruthy();
       expect(container.querySelector('[data-section="queue"]')).toBeFalsy();
 
+      await segment(container, 'decisions');
+      expect(container.querySelector('.nc-of-head')).toBeFalsy();
+
       await segment(container, 'overview');
       expect(container.querySelector('office-map')).toBeTruthy();
+      expect(container.querySelector('.nc-of-head')).toBeTruthy();
     });
 
     it('the job board carries the claims and schedule cards beneath it, two up', async () => {
