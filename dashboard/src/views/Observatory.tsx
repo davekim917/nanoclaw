@@ -32,8 +32,8 @@ import { WorkgroupPicker } from './WorkgroupDashboard.js';
  *
  * The page is FIXED at the top and switched at the bottom:
  *
- *   1. the headline — one dominant number (stalled), two secondary, and the
- *      coverage gaps that qualify them, stated once;
+ *   1. the headline — three equal stats (stalled, need a person, moving on
+ *      their own) and the coverage gaps that qualify them, stated once;
  *   2. the office — the vendored <office-map> custom element, a hand-authored
  *      tile plan where each channel is a room and each agent sits in the room
  *      it last worked in. Geometry is FIXED; only occupancy comes from data.
@@ -908,43 +908,45 @@ export function CommitmentStrip({
   return (
     <section className="nc-of-head">
       <div className="nc-of-head-main">
-        {/* ONE dominant number. Three equal ones made the reader choose which
-            to care about; the ten-second read has to answer that for them. */}
-        <button
-          type="button"
-          className={`nc-of-hero ${slice === 'stalled' ? 'on' : ''}`}
-          aria-pressed={slice === 'stalled'}
-          onClick={pick('stalled')}
-        >
-          <span className="nc-of-hero-n">{counts.breached}</span>
-          <span className="nc-of-hero-l">
-            items are stalled
-            <span>past a promised deadline, or owned by nobody</span>
-          </span>
-        </button>
-        <div className="nc-of-sub">
+        {/* Three equal tiles, one grammar: number over label. Disjoint slices
+            of one denominator — no tile outranks another. */}
+        <div className="nc-of-tiles">
           <button
             type="button"
-            className={`nc-of-slice ${slice === 'person' ? 'on' : ''}`}
+            className={`nc-of-tile nc-of-hero ${slice === 'stalled' ? 'on' : ''}`}
+            aria-pressed={slice === 'stalled'}
+            onClick={pick('stalled')}
+          >
+            <span className="nc-of-tile-n stop">{counts.breached}</span>
+            <span className="nc-of-tile-l">
+              stalled
+              <span className="nc-of-tile-sub">past a promised deadline, or owned by nobody</span>
+            </span>
+          </button>
+          <button
+            type="button"
+            className={`nc-of-tile nc-of-slice ${slice === 'person' ? 'on' : ''}`}
             aria-pressed={slice === 'person'}
             onClick={pick('person')}
           >
-            <b className="warn">{counts.person}</b> need a person
+            <span className="nc-of-tile-n warn">{counts.person}</span>
+            <span className="nc-of-tile-l">need a person</span>
           </button>
           <button
             type="button"
-            className={`nc-of-slice ${slice === 'moving' ? 'on' : ''}`}
+            className={`nc-of-tile nc-of-slice ${slice === 'moving' ? 'on' : ''}`}
             aria-pressed={slice === 'moving'}
             onClick={pick('moving')}
           >
-            <b className="go">{counts.onTrack}</b> moving on their own
+            <span className="nc-of-tile-n go">{counts.onTrack}</span>
+            <span className="nc-of-tile-l">moving on their own</span>
           </button>
-          {/* The three numbers are DISJOINT slices of one denominator: every
-              commitment is in exactly one. Without saying so, a reader reads
-              30 and 8 as subsets of 32 and finds an arithmetic contradiction
-              where there is none. */}
-          <span className="nc-of-sub-total">{items.length} open commitments, split three ways</span>
         </div>
+        {/* The three numbers are DISJOINT slices of one denominator: every
+            commitment is in exactly one. Without saying so, a reader reads
+            30 and 8 as subsets of 32 and finds an arithmetic contradiction
+            where there is none. */}
+        <span className="nc-of-sub-total">{items.length} open commitments, split three ways</span>
       </div>
       {/* The gaps in the data, one line each. These are never hidden — they
           report that the numbers above are incomplete, and a collapsed

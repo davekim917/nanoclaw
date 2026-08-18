@@ -1701,7 +1701,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-live i{width:6px; height:6px; border-radius:50%; background:var(--idle)}
 .nc-of .nc-of-live i.on{background:var(--go)}
 
-/* Headline: one dominant number, two secondary, the data gaps beside them. */
+/* Headline: three equal stat tiles, the data gaps beside them. */
 .nc-of .nc-of-head{
   display:flex; gap:20px; align-items:stretch; padding:18px 20px 16px;
   border-bottom:1px solid var(--line); background:var(--card-2); margin-bottom:12px;
@@ -1711,41 +1711,29 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* The three numbers are the queue's filter. They read as one control each:
    pressed state is a tinted plate, not a border, so the headline stays a
    headline and does not turn into a toolbar. */
-.nc-of .nc-of-hero{
-  display:flex; align-items:baseline; gap:13px; appearance:none; border:0; background:none;
-  font:inherit; color:inherit; text-align:left; cursor:pointer; padding:6px 8px; margin:-6px -8px;
-  border-radius:8px;
+.nc-of .nc-of-tiles{display:flex; gap:10px; align-items:stretch}
+.nc-of .nc-of-tile{
+  flex:1; display:flex; flex-direction:column; gap:4px; appearance:none; border:0; background:none;
+  font:inherit; color:inherit; text-align:left; cursor:pointer; padding:10px 12px; border-radius:8px;
 }
-.nc-of .nc-of-hero:hover,.nc-of .nc-of-slice:hover{background:rgba(35,32,27,.04)}
-.nc-of .nc-of-hero.on,.nc-of .nc-of-slice.on{background:rgba(63,104,201,.09)}
-.nc-of .nc-of-hero:focus-visible,.nc-of .nc-of-slice:focus-visible{
-  outline:2px solid var(--accent); outline-offset:1px;
-}
-.nc-of .nc-of-slice{
-  appearance:none; border:0; background:none; font:inherit; color:var(--ink-2); cursor:pointer;
-  padding:5px 8px; margin:-5px -8px; border-radius:8px; min-height:34px;
-}
+.nc-of .nc-of-tile:hover{background:rgba(35,32,27,.04)}
+.nc-of .nc-of-tile.on{background:rgba(63,104,201,.09)}
+.nc-of .nc-of-tile:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
 .nc-of .nc-of-clearfilter{
   appearance:none; border:0; background:none; cursor:pointer; font:inherit;
   font-size:12px; font-weight:500; color:var(--accent); padding:4px 6px; border-radius:6px;
 }
 .nc-of .nc-of-clearfilter:hover{background:rgba(63,104,201,.08)}
-.nc-of .nc-of-hero-n{
-  font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:60px; font-weight:600;
-  color:var(--stop); line-height:.86; letter-spacing:-.03em; font-variant-numeric:tabular-nums;
+.nc-of .nc-of-tile-n{
+  font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:36px; font-weight:600;
+  line-height:.86; letter-spacing:-.03em; font-variant-numeric:tabular-nums;
 }
-.nc-of .nc-of-hero-l{font-size:14.5px; line-height:1.35}
-.nc-of .nc-of-hero-l span{display:block; color:var(--ink-2); font-size:12.5px}
-.nc-of .nc-of-sub{
-  display:flex; gap:26px; margin-top:16px; padding-top:13px; border-top:1px solid var(--line);
-  font-size:12.5px; color:var(--ink-2); align-items:baseline; flex-wrap:wrap;
-}
-.nc-of .nc-of-sub b{
-  font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:19px; font-weight:600;
-  margin-right:6px; font-variant-numeric:tabular-nums;
-}
-.nc-of .nc-of-sub b.warn{color:var(--warn)} .nc-of .nc-of-sub b.go{color:var(--go)}
-.nc-of .nc-of-sub-total{margin-left:auto; text-align:right; color:var(--ink-3)}
+.nc-of .nc-of-tile-n.stop{color:var(--stop)}
+.nc-of .nc-of-tile-n.warn{color:var(--warn)}
+.nc-of .nc-of-tile-n.go{color:var(--go)}
+.nc-of .nc-of-tile-l{font-size:13px; color:var(--ink-2)}
+.nc-of .nc-of-tile-sub{display:block; font-size:11.5px; margin-top:2px}
+.nc-of .nc-of-sub-total{display:block; margin-top:12px; padding-top:12px; border-top:1px solid var(--line); font-size:12.5px; color:var(--ink-3)}
 .nc-of .nc-of-notes{
   width:400px; max-width:100%; display:flex; flex-direction:column; gap:10px;
   justify-content:center; border-left:1px solid var(--line); padding-left:20px;
@@ -1760,21 +1748,20 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 @media (max-width:900px){
   .nc-of .nc-of-head{flex-direction:column; gap:14px}
   .nc-of .nc-of-notes{width:auto; border-left:0; border-top:1px solid var(--line); padding-left:0; padding-top:12px}
-  .nc-of .nc-of-hero-n{font-size:46px}
+  .nc-of .nc-of-tile-n{font-size:32px}
 }
 /* Phone: the headline has to fit in roughly a third of the screen or the
    office — the thing this page exists to show — starts below the fold. The
-   three slices go on ONE row, so nothing is dropped; only the air is. */
+   three tiles stay on ONE row, compressed, so nothing is dropped; only the
+   air is. */
 @media (max-width:700px){
   .nc-of .nc-of-head{padding:12px 14px 11px; gap:10px; margin-bottom:10px}
-  .nc-of .nc-of-hero{gap:9px; padding:4px 6px; margin:-4px -6px}
-  .nc-of .nc-of-hero-n{font-size:38px}
-  .nc-of .nc-of-hero-l{font-size:13.5px}
-  .nc-of .nc-of-hero-l span{font-size:12px}
-  .nc-of .nc-of-sub{margin-top:9px; padding-top:9px; gap:6px 14px; font-size:12px}
-  .nc-of .nc-of-sub b{font-size:16px; margin-right:4px}
-  .nc-of .nc-of-slice{padding:4px 6px; margin:-4px -6px; min-height:30px}
-  .nc-of .nc-of-sub-total{flex:0 0 100%; margin-left:0; text-align:left; font-size:11.5px}
+  .nc-of .nc-of-tiles{gap:6px}
+  .nc-of .nc-of-tile{padding:7px 8px; gap:2px}
+  .nc-of .nc-of-tile-n{font-size:24px}
+  .nc-of .nc-of-tile-l{font-size:11.5px}
+  .nc-of .nc-of-tile-sub{display:none}
+  .nc-of .nc-of-sub-total{margin-top:9px; padding-top:9px; font-size:11.5px}
   .nc-of .nc-of-notes{gap:6px; padding-top:9px}
   .nc-of .nc-of-notes p{font-size:12px; line-height:1.4}
 }
