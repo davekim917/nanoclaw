@@ -1284,6 +1284,101 @@ describe('Observatory — actions and sheets', () => {
     });
   });
 
+  /* obs.C.30 — the tiles used to slice by OWNER (the items owned by the people
+   * standing in the room) while the rows below sliced by the item's own room.
+   * An unowned item has no owner to match, so picking a room read "0 stalled"
+   * over tens of visibly stalled rows. One attribution now, for both. */
+  describe('a selected room narrows the tiles and the table the same way', () => {
+    const stalled = (id: string, channel: string) =>
+      releaseItem({ id, channel, nextMover: 'nobody', since: new Date(Date.now() - 86_400_000).toISOString() });
+
+    const floor = () => {
+      mockData(
+        snapshot({
+          rooms: [
+            room({ key: 'slack:C1', name: 'qa-room', memberAgentIds: ['ag-ava'] }),
+            room({ key: 'slack:C2', name: 'other', memberAgentIds: ['ag-kit'] }),
+          ],
+          agents: [
+            agent({ id: 'ag-ava', name: 'ava', location: 'slack:C1' }),
+            agent({ id: 'ag-kit', name: 'kit', location: 'slack:C2' }),
+          ],
+          releaseState: releaseState({
+            items: [
+              // Nobody in #qa-room owns any of these — two have no owner at
+              // all, which is exactly the row the owner slice used to lose.
+              stalled('X#1', '#qa-room'),
+              stalled('X#2', '#qa-room'),
+              releaseItem({ id: 'X#3', channel: '#qa-room', nextMover: 'human', owner: 'robin' }),
+              releaseItem({ id: 'X#4', channel: '#other', nextMover: 'human', owner: 'kit' }),
+            ],
+          }),
+        }),
+      );
+      return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+    };
+    const open = async (c: HTMLElement, label: string) =>
+      userEvent.click(
+        Array.from(c.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
+          b.textContent?.includes(label),
+        )! as HTMLElement,
+      );
+    const tiles = (c: HTMLElement) => Array.from(c.querySelectorAll('.nc-of-tile-n')).map((e) => e.textContent);
+    const rows = (c: HTMLElement) => c.querySelectorAll('[data-section="queue"] .nc-obs-ledger-row').length;
+
+    it('counts a room\'s UNOWNED work as stalled rather than losing it', async () => {
+      const { container } = floor();
+      expect(tiles(container)).toEqual(['2', '2', '0']); // whole floor
+      await open(container, '#qa-room');
+      // Two unowned + one awaiting a person, all of them #qa-room's.
+      expect(tiles(container)).toEqual(['2', '1', '0']);
+      expect(container.querySelector('.nc-of-sub-total')!.textContent).toBe('3 open commitments, split three ways');
+    });
+
+    it('the tile total is the number of rows the table under it shows', async () => {
+      const { container } = floor();
+      await open(container, '#qa-room');
+      // The queue is everything not moving on its own — here, all three.
+      expect(rows(container)).toBe(3);
+      expect(container.querySelector('.nc-of-card-meta')!.textContent).toBe('3 of 3');
+
+      await open(container, '#other');
+      expect(tiles(container)).toEqual(['0', '1', '0']);
+      expect(rows(container)).toBe(1);
+    });
+
+    it('a room that holds no work says so, rather than calling nothing on track', async () => {
+      mockData(
+        snapshot({
+          rooms: [
+            room({ key: 'slack:C1', name: 'qa-room', memberAgentIds: ['ag-ava'] }),
+            room({ key: 'slack:C2', name: 'other', memberAgentIds: ['ag-ava'] }),
+          ],
+          agents: [agent({ id: 'ag-ava', name: 'ava', location: 'slack:C1' })],
+          releaseState: releaseState({ items: [stalled('X#1', '#qa-room')] }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await open(container, '#other');
+      expect(rows(container)).toBe(0);
+      expect(container.querySelector('.nc-obs-ledger-empty')!.textContent).toBe('nothing open here');
+    });
+
+    it('matches the room name with or without its hash, same rule the table uses', async () => {
+      mockData(
+        snapshot({
+          rooms: [room({ key: 'slack:C1', name: '#Qa-room', memberAgentIds: ['ag-ava'] })],
+          agents: [agent({ id: 'ag-ava', name: 'ava', location: 'slack:C1' })],
+          releaseState: releaseState({ items: [stalled('X#1', 'qa-room')] }),
+        }),
+      );
+      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
+      await open(container, '#Qa-room');
+      expect(tiles(container)).toEqual(['1', '0', '0']);
+      expect(rows(container)).toBe(1);
+    });
+  });
+
   describe('RouteNav', () => {
     it('offers the Observatory only — inbox, workgroup and the scheduled board are gone', () => {
       const { container } = render(<RouteNav route="observatory" onRouteChange={noop} />);

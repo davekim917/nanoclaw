@@ -192,8 +192,8 @@ export function Observatory({ authMe }: ObservatoryProps) {
   const roomLinks = useMemo(() => roomLinkIndex(rooms), [rooms]);
   const awakeCount = agents.filter((a) => a.awake).length;
 
-  // The strip above the floor must count the same set every view below shows,
-  // so the owner filter is applied once, here, and handed to all of them.
+  // The tiles must count the same set the rows under them show, so the room
+  // filter is applied once, here, and handed to all of them.
   const allItems = snapshot?.releaseState?.items ?? [];
 
   const schedRows = useMemo(
@@ -201,14 +201,10 @@ export function Observatory({ authMe }: ObservatoryProps) {
     [schedData, agents],
   );
 
-  // Selecting a room filters what is below to the people IN that room.
-  //
-  // Filtering by the room itself is what the design intends, but no release
-  // item carries the channel it belongs to (checked 2026-08-16: zero of 71),
-  // so there is nothing to match on. Whose desk the work is on IS derivable,
-  // and it answers the same question — "what is going on in there" — without
-  // inventing a field. It becomes a true room filter the day the watcher
-  // publishes `channel`.
+  // Selecting a room filters what is below to the work that LIVES in it — see
+  // roomFilteredItems. (Until the watcher started publishing `item.channel` the
+  // filter had to stand on whose desk the work was on instead; obs.C.30 retired
+  // that stand-in, which had stopped agreeing with the rows it counted.)
   const officeData = useMemo(
     () => buildOfficeData(rooms, agents, allItems, snapshot?.themedSlots),
     [rooms, agents, allItems, snapshot?.themedSlots],
@@ -256,23 +252,35 @@ export function Observatory({ authMe }: ObservatoryProps) {
     };
   }, [selectedRoom, officeData, agents, claims]);
 
-  const roomOwners = useMemo(
-    () => (selectedRoomAgents ? new Set(selectedRoomAgents.agents.map((a) => a.name)) : null),
-    [selectedRoomAgents],
-  );
+  /**
+   * What a selected room narrows the page to.
+   *
+   * By the ITEM'S OWN ROOM — `item.channel`, normalized exactly the way the
+   * table's own room filter normalizes it (`roomNameKey`, leading-# tolerant),
+   * because the tiles and the rows under them must count one set.
+   *
+   * This used to slice by OWNER (the items owned by the people standing in the
+   * room), which was the honest read back when no item carried a channel. It
+   * has been wrong since the watcher started publishing one, and wrong in the
+   * loudest possible way: an UNOWNED item has no owner to match, so picking a
+   * room dropped every unowned row from the tiles while the table below still
+   * listed them — "0 stalled" over tens of visibly stalled rows.
+   */
+  const roomFilteredItems = useMemo(() => {
+    const label = selectedRoomAgents?.label;
+    if (!label) return allItems;
+    const key = roomNameKey(label);
+    return allItems.filter((i) => i.channel && roomNameKey(i.channel) === key);
+  }, [allItems, selectedRoomAgents]);
 
-  const ownerFilteredItems = roomOwners
-    ? allItems.filter((i) => i.owner && roomOwners.has(i.owner))
-    : allItems;
-
-  const ledgerCounts = useMemo(() => buildLedger(ownerFilteredItems).counts, [ownerFilteredItems]);
+  const ledgerCounts = useMemo(() => buildLedger(roomFilteredItems).counts, [roomFilteredItems]);
 
   // The Decisions badge counts EVERY item whose next mover is a person,
   // breached ones included — a decision that has already slipped its deadline
   // is still a decision, and it is the one you want at the top of the list.
   // Deliberately not the headline's "need a person" tile, which excludes the
   // breach tier; see the note on that tile.
-  const decisionCount = ownerFilteredItems.filter((i) => i.nextMover === 'human').length;
+  const decisionCount = roomFilteredItems.filter((i) => i.nextMover === 'human').length;
 
   // The office map's own notion of "in trouble" (office-data.ts's
   // agentState), recomputed here off the FULL board rather than the
@@ -331,7 +339,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
   // fixed headcount — the same slot the comp gives to "18 jobs today".
   const barMeta =
     view === 'board'
-      ? releaseCounts(ownerFilteredItems) || 'nothing open'
+      ? releaseCounts(roomFilteredItems) || 'nothing open'
       : view === 'decisions'
         ? `${decisionCount} awaiting a person`
         : `${agents.length} agents · ${rooms.length} channels`;
@@ -512,7 +520,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                   on", these three numbers qualify it, and the queue under
                   them is what the numbers open into. */}
               {view === 'overview' && (
-                <CommitmentStrip items={ownerFilteredItems} slice={flowFilter} onSlice={setFlowFilter} />
+                <CommitmentStrip items={roomFilteredItems} slice={flowFilter} onSlice={setFlowFilter} />
               )}
 
               {selectedRoomAgents && (
@@ -585,8 +593,8 @@ export function Observatory({ authMe }: ObservatoryProps) {
                           not moving on their own. */}
                       <span className="nc-of-card-meta">
                         {flowFilter
-                          ? `${FLOW_LABEL[flowFilter]} · ${flowCount} of ${ownerFilteredItems.length}`
-                          : `${ledgerCounts.breached + ledgerCounts.person} of ${ownerFilteredItems.length}`}
+                          ? `${FLOW_LABEL[flowFilter]} · ${flowCount} of ${roomFilteredItems.length}`
+                          : `${ledgerCounts.breached + ledgerCounts.person} of ${roomFilteredItems.length}`}
                       </span>
                       {flowFilter && (
                         <button type="button" className="nc-of-clearfilter" onClick={() => setFlowFilter(null)}>
@@ -595,7 +603,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       )}
                     </header>
                     <LedgerBoard
-                      items={ownerFilteredItems}
+                      items={roomFilteredItems}
                       slice={flowFilter}
                       roomLinks={roomLinks}
                       {...(assign ? { assign } : {})}
@@ -605,7 +613,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
 
                 {view === 'decisions' && (
                   <DecisionsCard
-                    items={ownerFilteredItems}
+                    items={roomFilteredItems}
                     roomLinks={roomLinks}
                     {...(assign ? { assign } : {})}
                   />
@@ -614,7 +622,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                 {view === 'board' && (
                   <>
                     <JobBoard
-                      items={ownerFilteredItems}
+                      items={roomFilteredItems}
                       tab={jobTab}
                       onTab={setJobTab}
                       releaseState={snapshot.releaseState}
@@ -2007,7 +2015,15 @@ function LedgerBoard({
   if (all.length === 0) {
     return (
       <div className="nc-obs-ledger-empty">
-        {slice ? 'nothing in this slice' : 'every open commitment is on track'}
+        {/* Three different facts. "On track" is a claim about commitments that
+            EXIST — said over a room that holds none (now reachable, since the
+            room filter narrows by the item's own channel) it congratulates the
+            reader on nothing. */}
+        {items.length === 0
+          ? 'nothing open here'
+          : slice
+            ? 'nothing in this slice'
+            : 'every open commitment is on track'}
       </div>
     );
   }
