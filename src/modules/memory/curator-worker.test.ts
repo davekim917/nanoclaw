@@ -109,6 +109,54 @@ describe('memory curator worker', () => {
     expect(d.finishCall).toHaveBeenCalledWith(expect.any(String), 'noop');
   });
 
+  it('skips the model call for a solo Slack bot message the agent never answered', async () => {
+    const botMessage: MemoryCurationArchiveRow = {
+      ...message(1, 'msg-1', 'Snowflake alert: query failed'),
+      channelType: 'slack',
+      senderId: 'B0EXAMPLE001',
+    };
+    const d = deps({ messages: () => [botMessage] });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toMatchObject({
+      action: 'noop',
+      reasonCode: 'insufficient_evidence',
+      messageCount: 1,
+      workgroupId: 'wg-a',
+    });
+    expect(d.curate).not.toHaveBeenCalled();
+    expect(d.writeGenerated).not.toHaveBeenCalled();
+    expect(d.complete).toHaveBeenCalledWith(expect.objectContaining({ claimedThroughRowid: 1 }), 1000);
+  });
+
+  it('skips the model call for a workspace-suffixed Slack channel type + prefixed sender id', async () => {
+    // channelType carries a per-workspace/per-sibling-bot suffix in production
+    // (`slack-acme`, `slack-acme-codex`, ...) — bare 'slack' alone
+    // would miss every real fleet row. senderId is also stored as
+    // `${channelType}:${platformUserId}` in production (verified against
+    // data/archive.db), not the bare platform id.
+    const botMessage: MemoryCurationArchiveRow = {
+      ...message(1, 'msg-1', 'Snowflake alert: query failed'),
+      channelType: 'slack-acme',
+      senderId: 'slack-acme:B0EXAMPLE001',
+    };
+    const d = deps({ messages: () => [botMessage] });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toMatchObject({ action: 'noop', reasonCode: 'insufficient_evidence', messageCount: 1 });
+    expect(d.curate).not.toHaveBeenCalled();
+  });
+
+  it('does NOT skip a solo Slack message from a human sender (U-prefixed id)', async () => {
+    const humanMessage: MemoryCurationArchiveRow = {
+      ...message(1, 'msg-1', 'Remember GSC is in Snowflake.'),
+      channelType: 'slack',
+      senderId: 'U0EXAMPLE002',
+    };
+    const d = deps({ messages: () => [humanMessage] });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(d.curate).toHaveBeenCalled();
+    expect(report).toMatchObject({ action: 'noop', workgroupId: 'wg-a', messageCount: 1 });
+  });
+
   // P0-AC8. The curator computes a reason for every decision, including each noop, and
   // the value was dropped on the floor: the run report carried `action` only, so
   // `code_derived` — the machine-readable footprint of the "recoverable from code"

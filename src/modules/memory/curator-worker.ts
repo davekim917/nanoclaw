@@ -169,6 +169,28 @@ function normalizeDuplicateKey(message: MemoryCurationArchiveRow): string {
   return `${message.role}\0${message.sentAt}\0${message.text.replace(/\s+/g, ' ').trim()}`;
 }
 
+/**
+ * True for a message the agent never replied to (role isn't 'assistant' —
+ * always true for a solo message in this flow, since an agent reply would
+ * be a second archived row) whose sender is a Slack bot user. Slack's own ID
+ * namespace prefixes bot users with `B` (vs `U` for humans) — see
+ * https://api.slack.com/changelog/2016-08-11-user-id-format-changes — so
+ * this is a platform convention, not an invented heuristic. `channelType`
+ * carries a per-workspace/per-sibling-bot suffix (`slack-acme-codex`,
+ * etc — see `isSlackChannelType` in router.ts), so match on prefix, not
+ * equality. `senderId` is stored as `${channelType}:${platformUserId}`
+ * (confirmed against data/archive.db), so the bot-id check runs on the
+ * segment after the last colon, not the whole field. Scoped to Slack only:
+ * other channels don't share the prefix and are left untouched.
+ */
+export function isUnansweredSoloBotMessage(message: MemoryCurationArchiveRow): boolean {
+  if (message.role === 'assistant') return false;
+  if (message.channelType !== 'slack' && !message.channelType.startsWith('slack-')) return false;
+  const senderId = message.senderId ?? '';
+  const platformUserId = senderId.slice(senderId.lastIndexOf(':') + 1);
+  return /^B[A-Z0-9]+$/.test(platformUserId);
+}
+
 export function boundEpisodeMessages(raw: MemoryCurationArchiveRow[]): {
   messages: MemoryCurationArchiveRow[];
   handledThroughRowid: number;
@@ -404,6 +426,25 @@ export class MemoryCuratorWorker {
       }
       const bounded = boundEpisodeMessages(raw);
       const handledEpisode = { ...episode, claimedThroughRowid: bounded.handledThroughRowid };
+      // Cheap pre-model gate: a one-message episode that is a Slack bot
+      // notification (Snowflake alerts, Linear notifications, etc.) posted
+      // into a `mention`-mode channel the agent never replied to has nothing
+      // to curate — every such episode observed in the fleet logs decides
+      // noop anyway. Skip the Sonnet call entirely rather than pay for a
+      // decision that's already known. Real conversations (>1 message, or a
+      // human sender) are untouched — this never fires for them.
+      if (bounded.messages.length === 1 && isUnansweredSoloBotMessage(bounded.messages[0]!)) {
+        if (!this.deps.complete(handledEpisode, nowMs)) throw new Error('memory curator lost its episode lease');
+        return {
+          workgroupId: episode.workgroupId,
+          episodeKey: episode.episodeKey,
+          action: 'noop',
+          reasonCode: 'insufficient_evidence',
+          messageCount: bounded.messages.length,
+          transcriptChars: bounded.transcriptChars,
+          elapsedMs: Date.now() - started,
+        };
+      }
       const generated = this.deps.readGenerated(episode.workgroupId);
       const query = bounded.messages.map((message) => message.text).join('\n');
       const generatedPrompt = selectGeneratedMemoryForPrompt(generated.content, query);
