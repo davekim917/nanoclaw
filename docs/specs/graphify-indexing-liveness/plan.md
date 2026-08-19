@@ -111,11 +111,24 @@ and still worth acting on: **one workgroup's pass costs ~69 minutes and every ot
 costs seconds**, and that workgroup re-queues as soon as it finishes. It therefore consumes most of
 the lane — which is tolerable, since the others are cheap and get their turn promptly.
 
-This sharpens rather than removes the case for phase 3. If those 69-minute passes are the
-timer-driven full scans, four a day is ~4.6 h of lane time that phase 3 cuts to ~1.2 h. If they are
-change-driven incremental passes over a 30 GB tree, phase 3 does nothing for them and the lever is
-elsewhere. **Phase 2's record is what distinguishes those two, and no design should be chosen before
-it does.** Fairness stays a non-goal; its trigger did not in fact fire.
+This sharpens rather than removes the case for phase 3 — but **the question is not binary, and an
+earlier draft of this plan framed it that way.** There are three classes of pass, not two:
+
+1. **Timer-driven full scans.** Four a day at ~69 min each is ~4.6 h of lane time; phase 3 cuts it
+   to ~1.2 h.
+2. **Change-driven incremental passes.** Phase 3 does nothing for these.
+3. **Change-driven *full* scans by escalation.** `reconcileFilesystemChanges` abandons the
+   incremental path and calls `reconcile()` outright on an unknown root (`:1663-1668`), on any
+   changed file whose discovered state is not `pending`/`indexed` (`:1683-1690`), and on a
+   preprocess failure (`:1696-1702`) — each setting `fullScanRequired` first. A watcher overflow
+   past `MAX_INCREMENTAL_FILESYSTEM_CHANGES` does the same (`:756-758`), as does any descriptor
+   change on the 60 s catalog refresh (`:644-651`). On a 30 GB tree under active write these are
+   plausibly the dominant load.
+
+Class 3 is why the phase-2 record must log **which branch actually ran**. Without it, an escalated
+full scan landing off-tick reads as "change-driven incremental → phase 3 is useless" — a wrong
+conclusion baked into the very telemetry built to prevent wrong conclusions. That would be this
+feature's fourth. Fairness stays a non-goal; its trigger did not in fact fire.
 
 ## Outcome
 
@@ -183,14 +196,45 @@ Each carries the trigger that reopens it, so cutting it is a decision rather tha
   idle workgroup would breach roughly 22 h a day. The predicate is:
 
   ```
-  breach if   unreachable
-           or any watcherDegraded
-           or (any dirty && nothing reconciling && max lag > GRAPH_LAG_MAX_MS)
-           or max lag > GRAPH_LAG_CEILING_MS          # catastrophic backstop, default 26h
+  breach if   unreachable                                    # transport dead
+           or any watcherDegraded                            # signal untrustworthy
+           or (any dirty && nothing reconciling              # scheduler dead or pressure-pinned
+               && max lag > GRAPH_LAG_MAX_MS
+               && held on two consecutive runs)
+           or (max lag > GRAPH_LAG_CEILING_MS                # something runs forever, never finishes
+               && not (never-completed && reconciling))
   ```
 
-  The third clause is the 31.8-hour outage's exact signature: work pending, nothing running. The
-  fourth catches the case where something reconciles forever and never completes.
+  **Each clause must carry what it catches, because an earlier draft got this wrong and a future
+  tune would have deleted the wrong one.** Clause 3 was documented as "the 31.8-hour outage's exact
+  signature". It is not: during that outage one workgroup was `reconciling: true` for the whole
+  37.3 hours, so "nothing reconciling" was **false throughout** and clause 3 would never have fired.
+  What would have caught it is clause 2 — `watcherDegraded` went true within 60 s of boot — and
+  clause 4 at the 26-hour mark. Clause 3's real catch is the pressure-pinned or dead-scheduler case,
+  which is worth keeping on its own merits.
+
+  Three further defects, each verified:
+
+  - **Clause 3 false-fires in the gap between passes.** Live-observed at 21:35:04→21:37:09: nothing
+    reconciling, three workgroups dirty at 3.5-5 h lag, fleet entirely healthy. Those gaps recur
+    every pass cycle, and a 15-minute sentinel will land in one. Requiring the condition to hold on
+    **two consecutive runs** removes it, using the state file the script already keeps
+    (`health-sentinel.sh:51`). The same two-run rule applies to S7's zero-byte reply, which is
+    live-verified to occur under ordinary load and would otherwise be a recurring false DM.
+  - **Clause 4 collides with phase 3's floor.** The 24 h floor is only tested on the 6 h tick, so a
+    quiet workgroup at 23.9 h elapsed is skipped and next scans at ~29.9 h — peak lag above 30 h on
+    a **healthy** workgroup, breaching a 26 h ceiling once per cycle forever. Invariant to pin:
+    `ceiling >= floor + tick + longest pass + slack` (~32 h), or drop the floor to 18 h. Harmless
+    under phase 1 alone (6 h cadence → peak lag ~7 h); it must land with phase 3.
+  - **Clause 4 fires instantly on a brand-new workgroup.** `lagMs` is `Number.MAX_SAFE_INTEGER` when
+    nothing has ever completed (`daemon.ts:1074-1077`), and new workgroups are routine (the
+    `clone-as-*` skills create them). Carve-out: skip the ceiling when there is no `lastCompletedAt`
+    **and** the workgroup is currently reconciling.
+
+  Stated as an intended consequence, not an oversight: `watcherDegraded` is sticky and cleared only
+  by a restart (`:563-570`), so clause 2 nags at the cooldown rate until the daemon is restarted.
+  That is correct — coverage genuinely is incomplete until then — but it is a decision, and restart
+  is the documented cure.
 - **R2** — A failure to reach the daemon is itself reported, and can never abort the sentinel and
   take the other seven vitals down with it.
 - **R3** — The daemon emits a status record every `STATUS_LOG_MS` carrying enough to decide the
@@ -317,10 +361,18 @@ the rest of this plan depends on. So the two failure shapes are distinguished: `
 `unknown workgroup` is a **skip** (stale directory), while a connect failure, a timeout, or
 unparseable output is a **breach**. That is S6.
 
-Using the directory listing at all is a deliberate trade: the control socket has no "list
-workgroups" command (`control-server.ts` `COMMANDS`), and reaching into `data/v2.db` would add a
-dependency to a script whose job is to still work when things are broken. Skipping unknown ids
-costs one comparison and keeps the script self-contained.
+Using the directory listing at all is a deliberate trade, but **not for the reason an earlier draft
+gave.** That draft justified it as avoiding a central-DB dependency; the script already has one —
+the breach path resolves the owner's DM target with
+`pnpm exec tsx scripts/q.ts "$NANOCLAW_DIR/data/v2.db"` (`health-sentinel.sh:160`). Reading the
+workgroup list from `v2.db` would delete the orphan special case (S6) outright and would additionally
+catch a workgroup that has **never** indexed — which a directory listing can never see, because the
+directory is created by the first index. The honest trade is: directory enumeration is simpler and
+adds no query, at the cost of one skip rule and one blind spot. Either is defensible; the blind spot
+should be stated.
+
+Related, worth fixing while in the file: that DM query uses `pnpm exec tsx`, and nested `pnpm exec`
+costs roughly 80 s of CPU on this install. `node_modules/.bin/tsx` is the in-tree convention.
 
 **Speak to the socket with `python3`, not `nc`.** The script already shells to `python3` for its
 state file (`:51,126`) and needs no other new binary; `nc` is not guaranteed present, and a script
@@ -336,16 +388,34 @@ A `logSink?: (record: object) => void` option defaulting to
 workgroup:
 
 ```
-per workgroup : { level, at, workgroupId, dirty, reconciling, reconcilingForMs, queuedForMs,
-                  lagMs, watcherDegraded }
+per workgroup : { level, at, workgroupId, operation, dirty, fullScanRequired, pendingChanges,
+                  reconciling, reconcilingForMs, queuedForMs, lagMs, watcherDegraded }
 per daemon    : { level, at, workgroups, queueDepth, laneHolder, laneHeldForMs,
                   admitted, pressurePreempted, memoryDeferred }
 ```
 
-`queueDepth`, `laneHolder`, `laneHeldForMs` and `queuedForMs` are the four fields that decide the
-open question: a single `laneHolder` persisting with a non-empty `queueDepth` means occupancy;
-`pressurePreempted` climbing with `queueDepth` empty means admission. The daemon record is emitted
-even when `workgroups` is 0, so an empty log is never ambiguous between healthy and dead.
+`operation` is `full | incremental | archive` — the same `ranFullScan` branch flag phase 3 needs
+anyway — and with `fullScanRequired` and `pendingChanges` it is what separates the three pass
+classes above. Without it the record cannot answer the question the phase-3 hold depends on.
+
+`queueDepth`, `laneHolder`, `laneHeldForMs` and `queuedForMs` decide the occupancy-vs-admission
+question: a single `laneHolder` persisting with a non-empty `queueDepth` means occupancy;
+`pressurePreempted` climbing with `queueDepth` empty means admission. Three implementation traps,
+each verified in source:
+
+- **`queuedForMs` must survive preempt-retry cycles.** On preemption `backgroundQueued` flips false
+  and `queueReconcile` re-queues 5 s later (`:1257-1260`), so a timestamp stamped at queue time
+  resets every cycle and reads ~0-5 s forever — masking the exact admission-starvation signature it
+  exists to reveal. This is the same trap that sank revision 1's `reconcileQueuedSinceMs`.
+- **`laneHolder` must come from the runner, not from `state.reconciling`.** `waitForFreshness`
+  dispatches reconciles *outside* the background runner (`:880-892` calls `trackReconciliation`
+  directly, never `background.run`), so two workgroups can be reconciling at once and
+  `state.reconciling` does not identify the lane's occupant.
+- **`queueDepth` must be per priority class.** Code enrichment shares the lane at the default
+  `enrichment` priority, so a scalar depth conflates the two things the record is meant to separate.
+
+The daemon record is emitted even when `workgroups` is 0, so an empty log is never ambiguous between
+healthy and dead.
 
 `level` is `warn` when `watcherDegraded` is true or `lagMs > STATUS_WARN_LAG_MS` (2h), else `info`.
 stdout is already wired to `logs/graphify-daemon.log`; no unit change is needed.
@@ -356,7 +426,13 @@ what the deferred fairness trigger reads.
 The runner gains three counters and a `counters()` getter (B1). Nothing about admission behaviour
 changes in this phase.
 
-Volume: ~10 workgroups every 5 minutes at ~200 bytes ≈ 1.7 MB/year.
+**Volume, corrected — an earlier draft was out by ~136x.** Eleven records (10 workgroups + 1
+daemon) × ~200 B × 288 ticks/day ≈ **633 KB/day, ~230 MB/year**, not the 1.7 MB/year first claimed.
+`StandardOutput=append:` never rotates and there is no `nanoclaw` entry in `/etc/logrotate.d/`
+(checked), so that grows unbounded on the live box. Either add a logrotate entry as part of this
+phase, or emit per-workgroup records only on `warn` or on a state change, keeping the 5-minute
+daemon heartbeat unconditional. **Preference: the latter** — it is smaller, needs no new system
+file, and a record every 5 minutes for a workgroup that has not changed is not information.
 
 ### Phase 3 — stop doing four full scans a day
 

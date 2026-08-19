@@ -156,3 +156,32 @@ The residual, narrower fact still stands: one workgroup's pass costs ~69 minutes
 costs seconds, and it re-queues immediately on completion. Whether those passes are timer-driven
 full scans (phase 3 cuts them 4×) or change-driven incrementals (phase 3 does nothing) is exactly
 what phase 2's record decides.
+
+
+### Second opinion — Fable, on revision 3 (2026-08-19)
+
+Requested by the user as an independent read against the lead's ship/hold recommendation. Read both
+plan/run pairs, `daemon.ts` in full, `background-runner.ts`, `health-sentinel.sh`,
+`control-server.ts`, and `src/graphify-daemon/index.ts`.
+
+**Agreed with the recommendation** — ship phases 1+2, hold phase 3, leave the 2 h threshold alone —
+with one material sharpening and eight findings. Every load-bearing claim was re-verified against
+source before acceptance; all of them held.
+
+| # | Finding | Verified how | Disposition |
+|---|---|---|---|
+| F1 | The phase-3 hold rests on a question phase 2 as specced **cannot answer**: the record omits which branch a pass took, and there is a third pass class the plan framed away — change-driven **full** scans by escalation | Confirmed: three `await this.reconcile(state, signal); return;` sites inside `reconcileFilesystemChanges` (`:1663-1668`, `:1683-1690`, `:1696-1702`), each setting `fullScanRequired` first, plus watcher overflow (`:756-758`) and catalog descriptor change (`:644-651`) | **ACCEPTED.** The most valuable finding. `operation`, `fullScanRequired` and `pendingChanges` added to the record; the binary framing replaced with three classes |
+| F2 | Log volume math off by ~136× and no rotation exists | Arithmetic: 11 records × 200 B × 288 ticks/day ≈ 633 KB/day ≈ 230 MB/year, not 1.7 MB. `/etc/logrotate.d/` has no `nanoclaw` entry | **ACCEPTED.** Design switched to per-workgroup records on warn/state-change with an unconditional daemon heartbeat |
+| F3 | `queuedForMs` resets every preempt-retry, masking the signature it exists to reveal | `backgroundQueued` flips false in `.then()` and re-queues 5 s later (`:1257-1260`) | **ACCEPTED.** Same trap that sank revision 1's `reconcileQueuedSinceMs` |
+| F4 | `laneHolder` cannot be inferred from `state.reconciling` — reconciles also run **outside** the runner | Confirmed: `waitForFreshness` (`:880-892`) builds the operation and calls `trackReconciliation` directly, never `background.run` | **ACCEPTED.** The runner must report the holder |
+| F5 | Predicate clause 3 would **not** have caught the outage it was documented as catching — one workgroup was `reconciling: true` for the full 37.3 hours, so "nothing reconciling" was false throughout | Confirmed against this session's own probe of the outage state | **ACCEPTED.** Clause 3 kept for the pressure-pinned/dead-scheduler case; each clause now carries what it catches |
+| F6 | Clause 3 false-fires in the gap between passes; clause 4's 26 h ceiling collides with phase 3's 24 h floor (peak healthy lag ~30 h); clause 4 fires instantly on a new workgroup | Gap live-observed at 21:35:04→21:37:09. Floor tested only on the 6 h tick → 23.9 h skip → ~29.9 h. `lagMs` is `Number.MAX_SAFE_INTEGER` with no `lastCompletedAt` (`:1074-1077`) | **ACCEPTED.** Two-consecutive-runs rule, a pinned `ceiling >= floor + tick + pass + slack` invariant, and a never-indexed carve-out |
+| F7 | Phase 1's "no central-DB dependency" rationale is already false | Confirmed: `health-sentinel.sh:160` runs `pnpm exec tsx scripts/q.ts …/data/v2.db` on the breach path | **ACCEPTED.** Rationale rewritten to the honest trade, and the blind spot (a never-indexed workgroup has no directory) stated. Also noted: that call uses nested `pnpm exec`, ~80 s CPU on this install |
+| F8 | A smaller phase 3 exists: `DEFAULT_FULL_RECONCILE_MS` 6h→24h + degrade→`markDirty` + handler unification, ~10 lines, deleting the entire `lastFullScanAt` apparatus and R-5/R-7/D5-D11 — at the cost of R6 (a degraded workgroup scans daily, not 6-hourly) | — | **CARRIED to the user as an option**, not adopted. It trades a correctness guarantee for a large simplification, which is the user's call, and either variant waits on phase 2's data regardless |
+
+Fable also independently confirmed the rejected two-timer design, the path-independence of the
+single `ranFullScan` stamp (so D11 is a pin rather than a fix), the admission demotion, and the
+orphan-skip evidence.
+
+**Net effect on the recommendation: unchanged, and better founded.** F1 is the one that mattered —
+without it the phase-3 hold would have waited on telemetry incapable of ending it.
