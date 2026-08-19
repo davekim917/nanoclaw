@@ -1,11 +1,12 @@
-# Workgroup cerebro — Pillar 0 (domain capture) and Pillar 1 (graph scent lane)
+# Workgroup cerebro — Pillars 0–2
 
-**Status:** proposed, revision 2, awaiting approval
-**Approval state:** NOT approved. Revision 1 (pillar 1 only) was never approved and is
-superseded; pillar 0 was added after evidence that the capture side is the binding
-constraint. Approval of revision 1 would not carry to this revision.
-**Stage:** `/team-plan`
-**Behavior-changing:** yes — executable acceptance criteria apply.
+**Status:** pillars 0 and 1 and Section B approved, built, shipped, and verified in
+production (2026-08). Pillar 2 (§P2) proposed 2026-08-19, revision 2 after plan-stage
+review — awaiting approval.
+**Approval state:** P2 NOT approved. Approval of the pillar-0/1 revision does not carry
+to §P2.
+**Stage:** `/team-plan` (pillar 2)
+**Behavior-changing:** yes — executable acceptance criteria apply (§P2.6).
 
 **Build order: pillar 0, then pillar 1.** Pillar 1 is a retrieval fix; pillar 0 is a
 capture fix. The measured defect (P0.1) is on the capture side, so shipping retrieval
@@ -17,16 +18,16 @@ Pillar 0 sections are numbered `P0.n`; pillar 1 keeps `§n`.
 
 ## 1. Outcome
 
-**Pillar 0.** The shared store must accumulate what the product *means* and *why it is
-the way it is* — not only how the fleet operates. Today it accumulates almost only the
+**Pillar 0.** The shared store must accumulate what the product _means_ and _why it is
+the way it is_ — not only how the fleet operates. Today it accumulates almost only the
 latter (P0.1), so judgment calls that need domain knowledge are made without it.
 
-**Pillar 1.** An agent that is *confidently wrong* about its own workgroup should be told,
+**Pillar 1.** An agent that is _confidently wrong_ about its own workgroup should be told,
 before it answers, that the knowledge graph holds material on the topic it is about to
 answer from.
 
 These are the two halves of one failure. The reference incident — an agent proposing a
-Postgres-only fix while the two-store architecture sat in indexed source — needed *both*:
+Postgres-only fix while the two-store architecture sat in indexed source — needed _both_:
 the architecture had never been captured as a domain fact (pillar 0), and nothing pointed
 the agent at the source that held it (pillar 1).
 
@@ -37,7 +38,7 @@ to look.
 Pillar 1 adds a **scent**, not an answer: a short, bounded list of canonical file
 pointers the graph considers most relevant to the current turn, delivered in the same
 pre-turn context row that already carries memory and archive evidence. It tells the agent
-*where to look*, and costs the agent nothing if it decides the pointers are irrelevant.
+_where to look_, and costs the agent nothing if it decides the pointers are irrelevant.
 
 This deliberately preserves the operator's stated requirement (2026-08-06): the agent
 must not be locked down to strict rules — it needs enough freedom to reason and be
@@ -68,7 +69,7 @@ curiosity. A mandatory query gate would be the rule-lock.
   from here on and does not distil the existing archive. Stated because it is the
   obvious next question and the answer is no.
 - Any change to Graphify's schema, extractors, daemon, or node types.
-- Any *mandatory* graph query, tool call, or gate before the agent answers.
+- Any _mandatory_ graph query, tool call, or gate before the agent answers.
 - A total match count (see §4.1 — measured unaffordable).
 - Pillars 2–4 (§9). This plan does not design them.
 - Rewriting or reclassifying existing facts. Markers stay backward compatible; old facts
@@ -80,11 +81,11 @@ curiosity. A mandatory query gate would be the rule-lock.
 
 Classifying all 2,505 facts in the largest live store by content:
 
-| class | share |
-|---|---|
-| process-leaning (PRs, deploys, gates, tests, containers, routing) | **47.8%** |
+| class                                                                       | share     |
+| --------------------------------------------------------------------------- | --------- |
+| process-leaning (PRs, deploys, gates, tests, containers, routing)           | **47.8%** |
 | product/domain-leaning (customers, forecasting, pricing, volume, inventory) | **11.9%** |
-| both or neither | 40.3% |
+| both or neither                                                             | 40.3%     |
 
 A 4:1 bias against the product. `memory/methods/` — 90 files, 279 KB, procedural by
 construction — is the fastest-growing part of the tree, so the imbalance is widening. The
@@ -100,17 +101,17 @@ countable afterwards so this estimate never has to be repeated.
 The curator system prompt (`src/modules/memory/curator-contract.ts:414-421`) is explicit
 about what is capturable:
 
-- **Line 416** enumerates the categories: *"explicit durable decisions, corrections,
+- **Line 416** enumerates the categories: _"explicit durable decisions, corrections,
   stable cross-task preferences, verified outcomes, durable workflows, and durable facts
-  about people, organizations, and external systems"*. The product and business domain
+  about people, organizations, and external systems"_. The product and business domain
   are **not** in that list. People/organizations/systems were added 2026-08-06 (the supporting roles line is :417);
   the domain never was.
-- **Line 420** prohibits *"facts recoverable from code/Graphify"*. Product structure —
+- **Line 420** prohibits _"facts recoverable from code/Graphify"_. Product structure —
   what a dataset represents, how a metric is defined, what a pipeline does — reads as
   recoverable from code, so this rule preferentially discards exactly this class.
-- **Line 419** is the single carve-out: *"When a person corrects an agent's wrong
+- **Line 419** is the single carve-out: _"When a person corrects an agent's wrong
   assumption about how a system works, capture the corrected fact even if it looks
-  recoverable from code."*
+  recoverable from code."_
 
 So domain knowledge is capturable **only after a human catches an agent being wrong.**
 That is precisely how the two-store architecture finally landed: as a correction, after
@@ -157,12 +158,12 @@ mix must be countable (P0.1 had to be estimated by keyword because it is not).
 
 The final clause is what makes this coexist with the prohibition rather than fight it.
 
-**(c) Scope the prohibition** (line 420) from *"facts recoverable from code/Graphify"* to
-*"implementation details recoverable from code/Graphify"*, with one added sentence: *"What
-code means in business terms, and why it was chosen, is not recoverable from code."*
+**(c) Scope the prohibition** (line 420) from _"facts recoverable from code/Graphify"_ to
+_"implementation details recoverable from code/Graphify"_, with one added sentence: _"What
+code means in business terms, and why it was chosen, is not recoverable from code."_
 
-This is a scoping, not a deletion. Code answers *what*; it does not answer *what this
-means to the business* or *why this over the alternative*. The existing correction
+This is a scoping, not a deletion. Code answers _what_; it does not answer _what this
+means to the business_ or _why this over the alternative_. The existing correction
 carve-out (line 419) stays as-is.
 
 **(d) Persist the reason in the provenance marker.** Today
@@ -174,10 +175,10 @@ carve-out (line 419) stays as-is.
 
 **Field order is load-bearing** — two regexes pin it:
 
-| parser | pattern | constraint |
-|---|---|---|
-| `curator-contract.ts:120` | `id=(...);evidence=(...);captured=([^;\s]+)\s*-->` | `captured` must stay **last**, or `\s*-->` fails |
-| `scripts/audit-memory-splitting.ts:38` | `evidence=([^;]+);captured=([^\s]+?)\s*-->` | `captured` must stay **immediately after** `evidence` |
+| parser                                 | pattern                                            | constraint                                            |
+| -------------------------------------- | -------------------------------------------------- | ----------------------------------------------------- |
+| `curator-contract.ts:120`              | `id=(...);evidence=(...);captured=([^;\s]+)\s*-->` | `captured` must stay **last**, or `\s*-->` fails      |
+| `scripts/audit-memory-splitting.ts:38` | `evidence=([^;]+);captured=([^\s]+?)\s*-->`        | `captured` must stay **immediately after** `evidence` |
 
 Between `id` and `evidence` satisfies both. (Before `id=` also would; the chosen
 placement keeps the id first, which is how every existing marker reads.)
@@ -225,14 +226,14 @@ facts behind it (P0.7).
 
 **(e) Log the reason code on every curator decision.** `MemoryCuratorRunReport`
 (`curator-worker.ts:54`) carries `action` but not `reasonCode`, so the curator computes a
-reason for every decision — *including each noop* — and the value is discarded
+reason for every decision — _including each noop_ — and the value is discarded
 (`curator-worker.ts:460-470`). Confirmed: zero occurrences of any noop reason code in the
 live logs.
 
 This matters more than it looks. `code_derived` is one of the noop codes, and it is the
 machine-readable footprint of the exact prohibition P0.2 blames. Surfacing it turns
 P0.1's keyword estimate into a **direct count of the suppression as it happens**, and
-gives a genuine pre/post baseline. It also makes the premise falsifiable *before* the
+gives a genuine pre/post baseline. It also makes the premise falsifiable _before_ the
 prompt change ships: if `code_derived` noops turn out to be rare, the causal story in
 P0.2 is wrong and pillar 0 needs rethinking rather than building. Two lines.
 
@@ -248,22 +249,22 @@ marker costs a few characters of prose budget only on facts that were already ov
 - P0-I3. The correction carve-out (line 419) keeps working; scoping the prohibition
   must not narrow what corrections can capture.
 - P0-I4. The prohibition still blocks secrets, transient status, speculation, and raw
-  output. Only the *"recoverable from code"* clause is scoped.
+  output. Only the _"recoverable from code"_ clause is scoped.
 
 ### P0.5 Acceptance criteria
 
 In `src/modules/memory/curator-contract.test.ts` unless noted.
 
-| # | Test name | Assertion |
-|---|---|---|
-| P0-AC1 | `curator-contract > accepts domain_knowledge as a capture reason code` | A decision with `reasonCode: 'domain_knowledge'` and `supersedesMemoryIds` validates; the pre-fix contract rejected it. |
-| P0-AC2 | `curator-contract > writes the reason between id and evidence` | A rendered fact line matches `id=<id>;reason=domain_knowledge;evidence=`. |
-| P0-AC3 | `curator-contract > parseGeneratedMemoryFacts reads a legacy marker unchanged` | Assert against the **consumer**, not the regex: `parseGeneratedMemoryFacts` on a marker with no `reason=` returns the correct `id`, `evidenceIds`, and `capturedAt`. Backward-compat guard for P0-I1. |
-| P0-AC4 | `curator-contract > parseGeneratedMemoryFacts is unshifted by a reason-bearing marker` | Same function on a `reason=`-bearing marker returns the same three fields correctly. This is the group-index regression guard — it fails with `invalid timestamp` if the new group is ever made capturing. |
-| P0-AC5 | `audit-memory-splitting > still parses reason-bearing markers` (in `scripts/audit-memory-splitting.test.ts`) | Its `MARKER` regex extracts evidence and captured from a reason-bearing line unchanged. The field-order regression guard. |
-| P0-AC6 | `pre-turn-context > the reason field does not affect ranking` (in `pre-turn-context.test.ts`) | Two fact stores differing only by `reason=` produce **the same excerpts in the same order** — compare the ranked `path` sequence and each excerpt's text **with the marker stripped**. Guards P0-I2. **Do not assert byte-identical excerpt text**: the delivered text deliberately keeps the marker (`boundedFactLine`, `pre-turn-context.ts:962`, docstring at `:735-744`), so a byte comparison is unsatisfiable and would fail a correct implementation. |
-| P0-AC7 | `curator-contract > the system prompt states the domain capture category` | The composed system prompt contains the domain line and the scoped prohibition, and still contains the correction carve-out verbatim. Guards P0-I3; the prompt is the deliverable, so it is asserted directly. |
-| P0-AC8 | `curator-worker > the run report carries the reason code` | A noop decision with `reasonCode: 'code_derived'` produces a `MemoryCuratorRunReport` whose `reasonCode` is `code_derived`. Guards P0.3(e); today the field does not exist. |
+| #      | Test name                                                                                                    | Assertion                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------ | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| P0-AC1 | `curator-contract > accepts domain_knowledge as a capture reason code`                                       | A decision with `reasonCode: 'domain_knowledge'` and `supersedesMemoryIds` validates; the pre-fix contract rejected it.                                                                                                                                                                                                                                                                                                                                      |
+| P0-AC2 | `curator-contract > writes the reason between id and evidence`                                               | A rendered fact line matches `id=<id>;reason=domain_knowledge;evidence=`.                                                                                                                                                                                                                                                                                                                                                                                    |
+| P0-AC3 | `curator-contract > parseGeneratedMemoryFacts reads a legacy marker unchanged`                               | Assert against the **consumer**, not the regex: `parseGeneratedMemoryFacts` on a marker with no `reason=` returns the correct `id`, `evidenceIds`, and `capturedAt`. Backward-compat guard for P0-I1.                                                                                                                                                                                                                                                        |
+| P0-AC4 | `curator-contract > parseGeneratedMemoryFacts is unshifted by a reason-bearing marker`                       | Same function on a `reason=`-bearing marker returns the same three fields correctly. This is the group-index regression guard — it fails with `invalid timestamp` if the new group is ever made capturing.                                                                                                                                                                                                                                                   |
+| P0-AC5 | `audit-memory-splitting > still parses reason-bearing markers` (in `scripts/audit-memory-splitting.test.ts`) | Its `MARKER` regex extracts evidence and captured from a reason-bearing line unchanged. The field-order regression guard.                                                                                                                                                                                                                                                                                                                                    |
+| P0-AC6 | `pre-turn-context > the reason field does not affect ranking` (in `pre-turn-context.test.ts`)                | Two fact stores differing only by `reason=` produce **the same excerpts in the same order** — compare the ranked `path` sequence and each excerpt's text **with the marker stripped**. Guards P0-I2. **Do not assert byte-identical excerpt text**: the delivered text deliberately keeps the marker (`boundedFactLine`, `pre-turn-context.ts:962`, docstring at `:735-744`), so a byte comparison is unsatisfiable and would fail a correct implementation. |
+| P0-AC7 | `curator-contract > the system prompt states the domain capture category`                                    | The composed system prompt contains the domain line and the scoped prohibition, and still contains the correction carve-out verbatim. Guards P0-I3; the prompt is the deliverable, so it is asserted directly.                                                                                                                                                                                                                                               |
+| P0-AC8 | `curator-worker > the run report carries the reason code`                                                    | A noop decision with `reasonCode: 'code_derived'` produces a `MemoryCuratorRunReport` whose `reasonCode` is `code_derived`. Guards P0.3(e); today the field does not exist.                                                                                                                                                                                                                                                                                  |
 
 **What these criteria do NOT prove — stated because the reviewer was right to press it.**
 Every case above locks strings, marker shape, index stability, and ranking neutrality.
@@ -302,13 +303,13 @@ That makes step 4 a real two-sided boundary test rather than a one-way check:
 If scoping the prohibition over-widens, the second half fails and says so before deploy.
 A one-sided eval could not have caught that.
 
-This is *mechanism* evidence: the prompt change flips real capture decisions. It is not
-*outcome* evidence — replay cannot say how much domain content will actually flow through
+This is _mechanism_ evidence: the prompt change flips real capture decisions. It is not
+_outcome_ evidence — replay cannot say how much domain content will actually flow through
 future episodes (P0.7). Both are needed; neither substitutes for the other, and P0-AC7's
 string assertion is neither.
 
 Credit where due: this harness was found by following a reviewer's explicitly
-unverified pointer. Both reviewers proposed *building* an eval; the smallest correct
+unverified pointer. Both reviewers proposed _building_ an eval; the smallest correct
 answer was that one already exists.
 
 ### P0.6 Implementation path
@@ -357,14 +358,14 @@ before the prohibition is ever consulted, surfacing as `insufficient_evidence` (
 
 ### P0.7 Risks
 
-| Risk | Assessment |
-|---|---|
-| The category produces noise instead of domain knowledge | The real risk. `Default to noop` (`curator-contract.ts:415`) still governs, and the people/roles precedent produced 33 facts with no observed noise complaint. If it does go noisy the retreat is deleting one prompt line. |
-| Scoping the prohibition re-admits code trivia | Mitigated by the "meaning and reasoning, not implementation" clause, and now countable: a rising `domain_knowledge` share that reads as restated code is visible in a way it was not before. |
-| **A curator model ignores the new category — the top risk** | An earlier draft argued the required enum *prevents* the premise-ledger failure. **Withdrawn: the enum delivers detection, not prevention.** `Default to noop` (`curator-contract.ts:415`) is the standing instruction and a noop on domain content is schema-valid, so nothing structural forces capture. Two outcomes, and they are not the same failure: **(a)** the curator noops domain content — a real failure, and the share stays flat; **(b)** it captures the fact but labels it `durable_fact` — **the intervention succeeded** and only the counter missed it, since agents get the fact at recall time regardless of its label. So the `domain_knowledge` share is a **lower bound on domain capture, not the outcome itself**; a flat reading at day 7 must be spot-checked against the actual new facts before concluding failure. What genuinely supports "capture will change" is the people/roles precedent — same prompt, same seam, same edit type, measurable in 3 days — which is **empirical evidence, not a structural guarantee**, plus the replay in P0.5. |
-| The 7-day readout is confounded by episode mix | P0.1 measured the **store** mix, not the **discard** mix. If little domain content flows through chat, the share moves slowly however good the prompt is. P0.3(e) addresses this directly by measuring the discard side, which is the other half of the picture and the reason step 0 comes first. |
-| 7 days is too short to judge | Possible. The people/roles category was legible in 3. If the signal is ambiguous at 7 days the answer is to wait, not to tune. |
-| The premise in P0.2 is wrong | Newly *checkable* thanks to P0.3(e): if `code_derived` noops are rare once logged, the suppression story is wrong. Cheapest de-risking available — land P0.3(e) first, look at a few days of counts, and only then decide whether the prompt change is worth making. |
+| Risk                                                        | Assessment                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The category produces noise instead of domain knowledge     | The real risk. `Default to noop` (`curator-contract.ts:415`) still governs, and the people/roles precedent produced 33 facts with no observed noise complaint. If it does go noisy the retreat is deleting one prompt line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Scoping the prohibition re-admits code trivia               | Mitigated by the "meaning and reasoning, not implementation" clause, and now countable: a rising `domain_knowledge` share that reads as restated code is visible in a way it was not before.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| **A curator model ignores the new category — the top risk** | An earlier draft argued the required enum _prevents_ the premise-ledger failure. **Withdrawn: the enum delivers detection, not prevention.** `Default to noop` (`curator-contract.ts:415`) is the standing instruction and a noop on domain content is schema-valid, so nothing structural forces capture. Two outcomes, and they are not the same failure: **(a)** the curator noops domain content — a real failure, and the share stays flat; **(b)** it captures the fact but labels it `durable_fact` — **the intervention succeeded** and only the counter missed it, since agents get the fact at recall time regardless of its label. So the `domain_knowledge` share is a **lower bound on domain capture, not the outcome itself**; a flat reading at day 7 must be spot-checked against the actual new facts before concluding failure. What genuinely supports "capture will change" is the people/roles precedent — same prompt, same seam, same edit type, measurable in 3 days — which is **empirical evidence, not a structural guarantee**, plus the replay in P0.5. |
+| The 7-day readout is confounded by episode mix              | P0.1 measured the **store** mix, not the **discard** mix. If little domain content flows through chat, the share moves slowly however good the prompt is. P0.3(e) addresses this directly by measuring the discard side, which is the other half of the picture and the reason step 0 comes first.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| 7 days is too short to judge                                | Possible. The people/roles category was legible in 3. If the signal is ambiguous at 7 days the answer is to wait, not to tune.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| The premise in P0.2 is wrong                                | Newly _checkable_ thanks to P0.3(e): if `code_derived` noops are rare once logged, the suppression story is wrong. Cheapest de-risking available — land P0.3(e) first, look at a few days of counts, and only then decide whether the prompt change is worth making.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 ## 3. Current architecture (source evidence) — pillar 1
 
@@ -418,12 +419,12 @@ Source prefixes: `agents/` 117,928 · `workgroup/` 18,734 · `conversations/` 5,
 
 ### 4.1 A match count is unaffordable — the recorded scope is wrong here
 
-| query shape | latency |
-|---|---|
-| `count(*)` on one common term (`postgres`, 23,700 hits) | **48,405 ms** |
-| `count(*)` on an OR of three terms (50,267 hits) | **25,494 ms** |
-| `count(*)` on one rare term (3,687 hits) | 4,277 ms |
-| same query, `LIMIT 8`, no count | **0–1 ms** warm |
+| query shape                                             | latency         |
+| ------------------------------------------------------- | --------------- |
+| `count(*)` on one common term (`postgres`, 23,700 hits) | **48,405 ms**   |
+| `count(*)` on an OR of three terms (50,267 hits)        | **25,494 ms**   |
+| `count(*)` on one rare term (3,687 hits)                | 4,277 ms        |
+| same query, `LIMIT 8`, no count                         | **0–1 ms** warm |
 
 FTS5 can stop early for a bounded query and cannot for a count. The recorded pillar-1
 scope said "match count + top node/file titles". **The count must be dropped.** The
@@ -433,13 +434,13 @@ scope said "match count + top node/file titles". **The count must be dropped.** 
 This is not a downgrade. A count is a weak signal anyway — every broad query matches
 thousands of chunks. The pointers are the signal.
 
-### 4.2 Ordering choice is a 125× latency difference *and* a relevance difference
+### 4.2 Ordering choice is a 125× latency difference _and_ a relevance difference
 
-| shape | latency (workgroup A, a four-term architecture query) |
-|---|---|
-| `ORDER BY node_fts.node_id` + join (what `store.query` does) | **92,232 ms** |
-| `ORDER BY rank` (bm25) | **737 ms** cold |
-| `ORDER BY rank` + `relative_path LIKE 'workgroup/%'` | **132 ms** cold, 118 ms warm |
+| shape                                                        | latency (workgroup A, a four-term architecture query) |
+| ------------------------------------------------------------ | ----------------------------------------------------- |
+| `ORDER BY node_fts.node_id` + join (what `store.query` does) | **92,232 ms**                                         |
+| `ORDER BY rank` (bm25)                                       | **737 ms** cold                                       |
+| `ORDER BY rank` + `relative_path LIKE 'workgroup/%'`         | **132 ms** cold, 118 ms warm                          |
 
 `store.query` (`src/graphify/store.ts:499`) orders by `node_fts.node_id`, which for a
 broad term forces reading the whole match set. **Pillar 1 must not reuse `store.query`.**
@@ -458,11 +459,11 @@ point at what the other lanes cannot reach.
 
 With `LIKE 'workgroup/%'`, sampled results are legible and on-target:
 
-| query | top canonical pointers |
-|---|---|
-| people | a hand-written client-liaison roster `.md`, several `linear-*.md`, a deployment-source reference `.md` |
-| release | two release shell scripts and two cutover runbook `.md` files |
-| feature | the two interface files that define that feature's result type |
+| query   | top canonical pointers                                                                                 |
+| ------- | ------------------------------------------------------------------------------------------------------ |
+| people  | a hand-written client-liaison roster `.md`, several `linear-*.md`, a deployment-source reference `.md` |
+| release | two release shell scripts and two cutover runbook `.md` files                                          |
+| feature | the two interface files that define that feature's result type                                         |
 
 ### 4.4 Cross-workgroup latency envelope
 
@@ -480,13 +481,13 @@ lane must not quietly hand that back.
 `node_fts` is declared with no `tokenize=` clause (`src/graphify/store.ts:935`), so it
 uses the default `unicode61` — **no stemming**.
 
-`canonicalToken` (`pre-turn-context.ts:281`) *does* stem: `materialized` → `materializ`,
+`canonicalToken` (`pre-turn-context.ts:281`) _does_ stem: `materialized` → `materializ`,
 `columns` → `column`, and it collapses `manages`/`managed`/`managing` **and**
 `host`/`hosts`/`hosted` to the single token `host`.
 
 **Consequence:** feeding `tokenizeForRecall` output to FTS would (a) miss, because
 `materializ` is not a term in an unstemmed index, and (b) semantically drift, because
-"who *manages* the pipeline" becomes a search for `host`. The scent lane must build its
+"who _manages_ the pipeline" becomes a search for `host`. The scent lane must build its
 own terms from the raw query — reusing `STOP_WORDS` but not `canonicalToken` — and use
 FTS prefix matching (`"term"*`) to recover morphological variants.
 
@@ -519,11 +520,7 @@ export interface GraphScent {
 }
 
 /** Sync, bounded, never throws. Returns null when cold, unavailable, or empty. */
-export function readGraphScent(
-  workgroupId: string,
-  query: string,
-  notices: ContextNotice[],
-): GraphScent | null;
+export function readGraphScent(workgroupId: string, query: string, notices: ContextNotice[]): GraphScent | null;
 
 /**
  * Called off the hot path (host sweep). Runs one bounded probe query and marks the
@@ -548,14 +545,14 @@ came in at warm p50 643 ms / p95 2,519 ms — the §4.4 probe queries had used 3
 and eight OR'd prefixes force bm25 to score a vastly larger match union. Variants
 measured on the same 40 queries, same graph:
 
-| variant | p50 | p95 | max | hit rate |
-|---|---|---|---|---|
-| 8 prefix OR (original design) | 199 | 749 | 774 | 40/40 |
-| 4 prefix OR | 245 | 584 | 685 | 40/40 |
-| **4 exact OR (chosen)** | **78** | **231** | **716** | **40/40** |
-| 8 exact OR | 169 | 545 | 676 | 40/40 |
-| 3 prefix OR | 84 | 480 | 807 | 40/40 |
-| 2×2 AND-of-pairs | 67 | 1,427 | 1,838 | 36/40 |
+| variant                       | p50    | p95     | max     | hit rate  |
+| ----------------------------- | ------ | ------- | ------- | --------- |
+| 8 prefix OR (original design) | 199    | 749     | 774     | 40/40     |
+| 4 prefix OR                   | 245    | 584     | 685     | 40/40     |
+| **4 exact OR (chosen)**       | **78** | **231** | **716** | **40/40** |
+| 8 exact OR                    | 169    | 545     | 676     | 40/40     |
+| 3 prefix OR                   | 84     | 480     | 807     | 40/40     |
+| 2×2 AND-of-pairs              | 67     | 1,427   | 1,838   | 36/40     |
 
 Prefix expansion — not term count — is the dominant cost, and the identical hit rate
 shows the advisory lane does not need the morphological recall prefixes were buying.
@@ -635,12 +632,12 @@ question. Dropped.
 
 Every failure path returns `null` plus one notice, never throws:
 
-| condition | notice code | status |
-|---|---|---|
+| condition                                     | notice code               | status     |
+| --------------------------------------------- | ------------------------- | ---------- |
 | `index.db` absent (incl. mid-rename `ENOENT`) | `graph-scent-unavailable` | `degraded` |
-| open or query threw | `graph-scent-read-failed` | `degraded` |
-| workgroup not warm (§5.4) | `graph-scent-cold` | `degraded` |
-| fewer than 2 usable terms, or 0 pointers | `graph-scent-no-match` | `no-match` |
+| open or query threw                           | `graph-scent-read-failed` | `degraded` |
+| workgroup not warm (§5.4)                     | `graph-scent-cold`        | `degraded` |
+| fewer than 2 usable terms, or 0 pointers      | `graph-scent-no-match`    | `no-match` |
 
 `ContextNotice['source']` gains `'graph'`.
 
@@ -669,8 +666,8 @@ The container renders the recall row's `subtype: 'recall_context'` in
    That constant is a closed three-key list, and `isComplete` requires every key be
    present (`formatter.ts:567`). Adding a fourth key makes every recall row written
    before the change — including rows already sitting in session inbound DBs — fail the
-   completeness check and render as *"malformed structured payload / No capability state
-   was accepted from this row"* (`formatter.ts:569-577`), silently dropping trusted
+   completeness check and render as _"malformed structured payload / No capability state
+   was accepted from this row"_ (`formatter.ts:569-577`), silently dropping trusted
    capability delivery for in-flight rows. `graphScent` is rendered **when present** and
    is never part of completeness.
 2. It is rendered inside the existing untrusted-evidence envelope, as terms plus pointer
@@ -698,29 +695,29 @@ The container renders the recall row's `subtype: 'recall_context'` in
 New file `src/modules/memory/graph-scent.test.ts` unless noted. Fixtures build a small
 real graph with `WorkgroupGraphStore` (writable) then read it back — no mocking of SQLite.
 
-| # | Test name | Assertion |
-|---|---|---|
-| AC1 | `graph-scent > builds unstemmed exact terms from the raw query` | `graphScentTerms('Which columns does the materialized view expose?')` returns terms containing `materialized` and `columns` verbatim (not `materializ`/`column`), excludes `which`/`does`/`the`. At most 4 terms, emitted exact (no `*` — see §5.2 measurement). |
-| AC2 | `graph-scent > returns fewer than two terms as null` | `readGraphScent(wg, 'the a is', notices)` is `null`; notices contain `graph-scent-no-match`. |
-| AC3 | `graph-scent > orders pointers by bm25 rank` | Fixture where one source repeats the term far more; that source's path is `pointers[0].path`. |
-| AC4 | `graph-scent > deduplicates by basename, keeping the highest ranked` | Fixture with `workgroup/a/x.ts` and `workgroup/b/x.ts` both matching; exactly one pointer whose basename is `x.ts`. |
-| AC5 | `graph-scent > excludes agents/ and conversations/ sources` | Fixture with one matching source under each of `agents/`, `conversations/`, `workgroup/`; result contains only the `workgroup/` path. |
-| AC6 | `graph-scent > returns null and a degraded notice when the graph is absent` | Call against a workgroup with no `index.db`: returns `null`, does not throw, notices contain `graph-scent-unavailable` with status `degraded`. |
-| AC7 | `graph-scent > treats a promoted index as cold until reprobed, then serves it` | Warm the workgroup, query graph A, rename a differently-populated graph B over `index.db`, query again with the identical string: the call REFUSES (`graph-scent-cold`) — the warm mark was earned against A's file identity and must not authorize a query of cold B (review finding; the original AC required exactly that unsafe path). After a fresh probe, the same query returns B's pointers. Identical terms also expose any result cache. |
-| AC7b | `graph-scent > unmarks warmth when a query fails, so failures do not repeat per turn` | Injected opener throws a non-ENOENT error: first call emits `graph-scent-read-failed` (one open), second call emits `graph-scent-cold` with ZERO opens. |
-| AC8 | `graph-scent > does not query a cold workgroup` | Without a warmth probe, `readGraphScent` performs **zero** graph opens (counted via injected opener), returns `null`, and emits `graph-scent-cold`. |
-| AC9 | `graph-scent > a probe inside budget marks the workgroup warm` | `probeGraphScentWarmth` with an injected clock reporting 100 ms → the next `readGraphScent` queries and returns pointers. |
-| AC10 | `graph-scent > a probe over budget leaves the workgroup cold` | Injected clock reports 900 ms (over `GRAPH_SCENT_BUDGET_MS`) → the next `readGraphScent` performs zero opens and emits `graph-scent-cold`. A previously warm workgroup that probes over budget is unmarked. |
-| AC11 | `pre-turn-context > attaches the graph scent within its char bound` (in `pre-turn-context.test.ts`) | `JSON.stringify(context.graphScent).length <= PRE_TURN_BOUNDS.graphScentChars`. |
-| AC12 | `pre-turn-context > the graph scent never displaces memory or archive excerpts` (in `pre-turn-context.test.ts`) | Fixture (a), every lane filled but under `finalChars`: the scent **attaches** (`graphScent` defined, no `final-context-limit` notice — asserted, per review finding: without this a lane that never attaches passes trivially) and excerpt counts equal the cold baseline. |
-| AC12b | `pre-turn-context > a scent that alone tips the context over the bound is shed, displacing nothing` | Measured two-channel fixture lands the cold baseline INSIDE `(finalChars - graphScentChars, finalChars]` — guard-asserted — so attaching the scent alone crosses the bound. Result: `graphScent` undefined, excerpt counts equal the baseline. This is the exact boundary the pre-review eviction order failed. |
-| AC13 | `pre-turn-context > sheds the graph scent before any other lane` (in `pre-turn-context.test.ts`) | Fixture pushed over `finalChars`: `graphScent` is `undefined` while every conversation and memory excerpt from the no-scent baseline survives. |
-| AC13b | `pre-turn-context > sheds graph notices with the lane at the bound` | Over-bound fixture with a present-but-COLD graph: the final context contains **no `source: 'graph'` notice**, and excerpt counts equal a no-graph baseline. Guards the review finding that a ~140-byte advisory notice could otherwise evict a 900-char archive excerpt. |
-| AC16 | `graph-scent > matches exactly, not by prefix` | A document whose every content token is a morphological variant of a query token (`forecasting pipelines …` vs `forecast pipeline …`) yields `null`/`no-match`. Restoring the failed 8-prefix design flips this test — the regression guard the review found missing. |
-| AC17 | `graph-scent > returns null rather than an over-bound scent when the only pointer exceeds the budget` | Single source whose path serializes past `graphScentChars`: `null` + `no-match`, never an over-bound field. |
-| AC18 | `graph-scent > stays completely silent for a workgroup with no graph, whatever the input` | No graph on disk: zero notices for both a short and a full query. |
-| AC14 | `formatter > renders graphScent when present` (in `container/agent-runner/src/formatter.test.ts`, `bun:test`) | A `recall_context` payload carrying `graphScent` renders its terms and pointer paths inside the untrusted-evidence envelope. |
-| AC15 | `formatter > a recall row without graphScent still renders complete` (same file) | A payload with only the three legacy evidence keys renders the normal complete output — **not** the `malformed structured payload` branch. This is the in-flight-row regression guard for §5.8(1). |
+| #     | Test name                                                                                                       | Assertion                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ----- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AC1   | `graph-scent > builds unstemmed exact terms from the raw query`                                                 | `graphScentTerms('Which columns does the materialized view expose?')` returns terms containing `materialized` and `columns` verbatim (not `materializ`/`column`), excludes `which`/`does`/`the`. At most 4 terms, emitted exact (no `*` — see §5.2 measurement).                                                                                                                                                                                   |
+| AC2   | `graph-scent > returns fewer than two terms as null`                                                            | `readGraphScent(wg, 'the a is', notices)` is `null`; notices contain `graph-scent-no-match`.                                                                                                                                                                                                                                                                                                                                                       |
+| AC3   | `graph-scent > orders pointers by bm25 rank`                                                                    | Fixture where one source repeats the term far more; that source's path is `pointers[0].path`.                                                                                                                                                                                                                                                                                                                                                      |
+| AC4   | `graph-scent > deduplicates by basename, keeping the highest ranked`                                            | Fixture with `workgroup/a/x.ts` and `workgroup/b/x.ts` both matching; exactly one pointer whose basename is `x.ts`.                                                                                                                                                                                                                                                                                                                                |
+| AC5   | `graph-scent > excludes agents/ and conversations/ sources`                                                     | Fixture with one matching source under each of `agents/`, `conversations/`, `workgroup/`; result contains only the `workgroup/` path.                                                                                                                                                                                                                                                                                                              |
+| AC6   | `graph-scent > returns null and a degraded notice when the graph is absent`                                     | Call against a workgroup with no `index.db`: returns `null`, does not throw, notices contain `graph-scent-unavailable` with status `degraded`.                                                                                                                                                                                                                                                                                                     |
+| AC7   | `graph-scent > treats a promoted index as cold until reprobed, then serves it`                                  | Warm the workgroup, query graph A, rename a differently-populated graph B over `index.db`, query again with the identical string: the call REFUSES (`graph-scent-cold`) — the warm mark was earned against A's file identity and must not authorize a query of cold B (review finding; the original AC required exactly that unsafe path). After a fresh probe, the same query returns B's pointers. Identical terms also expose any result cache. |
+| AC7b  | `graph-scent > unmarks warmth when a query fails, so failures do not repeat per turn`                           | Injected opener throws a non-ENOENT error: first call emits `graph-scent-read-failed` (one open), second call emits `graph-scent-cold` with ZERO opens.                                                                                                                                                                                                                                                                                            |
+| AC8   | `graph-scent > does not query a cold workgroup`                                                                 | Without a warmth probe, `readGraphScent` performs **zero** graph opens (counted via injected opener), returns `null`, and emits `graph-scent-cold`.                                                                                                                                                                                                                                                                                                |
+| AC9   | `graph-scent > a probe inside budget marks the workgroup warm`                                                  | `probeGraphScentWarmth` with an injected clock reporting 100 ms → the next `readGraphScent` queries and returns pointers.                                                                                                                                                                                                                                                                                                                          |
+| AC10  | `graph-scent > a probe over budget leaves the workgroup cold`                                                   | Injected clock reports 900 ms (over `GRAPH_SCENT_BUDGET_MS`) → the next `readGraphScent` performs zero opens and emits `graph-scent-cold`. A previously warm workgroup that probes over budget is unmarked.                                                                                                                                                                                                                                        |
+| AC11  | `pre-turn-context > attaches the graph scent within its char bound` (in `pre-turn-context.test.ts`)             | `JSON.stringify(context.graphScent).length <= PRE_TURN_BOUNDS.graphScentChars`.                                                                                                                                                                                                                                                                                                                                                                    |
+| AC12  | `pre-turn-context > the graph scent never displaces memory or archive excerpts` (in `pre-turn-context.test.ts`) | Fixture (a), every lane filled but under `finalChars`: the scent **attaches** (`graphScent` defined, no `final-context-limit` notice — asserted, per review finding: without this a lane that never attaches passes trivially) and excerpt counts equal the cold baseline.                                                                                                                                                                         |
+| AC12b | `pre-turn-context > a scent that alone tips the context over the bound is shed, displacing nothing`             | Measured two-channel fixture lands the cold baseline INSIDE `(finalChars - graphScentChars, finalChars]` — guard-asserted — so attaching the scent alone crosses the bound. Result: `graphScent` undefined, excerpt counts equal the baseline. This is the exact boundary the pre-review eviction order failed.                                                                                                                                    |
+| AC13  | `pre-turn-context > sheds the graph scent before any other lane` (in `pre-turn-context.test.ts`)                | Fixture pushed over `finalChars`: `graphScent` is `undefined` while every conversation and memory excerpt from the no-scent baseline survives.                                                                                                                                                                                                                                                                                                     |
+| AC13b | `pre-turn-context > sheds graph notices with the lane at the bound`                                             | Over-bound fixture with a present-but-COLD graph: the final context contains **no `source: 'graph'` notice**, and excerpt counts equal a no-graph baseline. Guards the review finding that a ~140-byte advisory notice could otherwise evict a 900-char archive excerpt.                                                                                                                                                                           |
+| AC16  | `graph-scent > matches exactly, not by prefix`                                                                  | A document whose every content token is a morphological variant of a query token (`forecasting pipelines …` vs `forecast pipeline …`) yields `null`/`no-match`. Restoring the failed 8-prefix design flips this test — the regression guard the review found missing.                                                                                                                                                                              |
+| AC17  | `graph-scent > returns null rather than an over-bound scent when the only pointer exceeds the budget`           | Single source whose path serializes past `graphScentChars`: `null` + `no-match`, never an over-bound field.                                                                                                                                                                                                                                                                                                                                        |
+| AC18  | `graph-scent > stays completely silent for a workgroup with no graph, whatever the input`                       | No graph on disk: zero notices for both a short and a full query.                                                                                                                                                                                                                                                                                                                                                                                  |
+| AC14  | `formatter > renders graphScent when present` (in `container/agent-runner/src/formatter.test.ts`, `bun:test`)   | A `recall_context` payload carrying `graphScent` renders its terms and pointer paths inside the untrusted-evidence envelope.                                                                                                                                                                                                                                                                                                                       |
+| AC15  | `formatter > a recall row without graphScent still renders complete` (same file)                                | A payload with only the three legacy evidence keys renders the normal complete output — **not** the `malformed structured payload` branch. This is the in-flight-row regression guard for §5.8(1).                                                                                                                                                                                                                                                 |
 
 ## 8. Implementation path
 
@@ -778,10 +775,10 @@ impression of every new thread is currently its most amnesiac moment.
 Measured fleet-wide by building every active group's live snapshot:
 
 | group family | raw snapshot | services |
-|---|---|---|
-| largest | **9,508** | 18 |
-| second | 6,313 | 9 |
-| median band | 2,900–4,400 | 6–12 |
+| ------------ | ------------ | -------- |
+| largest      | **9,508**    | 18       |
+| second       | 6,313        | 9        |
+| median band  | 2,900–4,400  | 6–12     |
 
 Three conclusions:
 
@@ -803,7 +800,7 @@ Three conclusions:
   corrections are worth recording. A first-draft 18,000 re-created the incident
   in the worst-case fixture (mandatory payload had grown with the cap raise).
   The next draft summed every bootstrap cap (24,500) — and fixture arithmetic
-  showed that number is *unreachable*: the per-lane caps already bound the row
+  showed that number is _unreachable_: the per-lane caps already bound the row
   below it, so the final bound would have become dead code. 22,000 keeps it a
   live safety net: the capability block is the one bootstrap-only payload large
   enough to displace recall, the core index rides in the ordinary envelope's
@@ -820,17 +817,269 @@ Three conclusions:
 
 In `pre-turn-context.test.ts`:
 
-| # | Test name | Assertion |
-|---|---|---|
+| #     | Test name                                                       | Assertion                                                                                                                                                                                                                       |
+| ----- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | B-AC1 | `bootstrap turns keep recall alongside a full capability block` | The incident's shape: full capability block + core + injected preference file + matching facts and archive rows. Delivered row retains ≥1 archive excerpt AND ≥1 ranked memory excerpt. This fixture fails on the pre-fix code. |
-| B-AC2 | `ordinary turns keep the 12k bound` | Non-bootstrap over-budget fixture still bounds to `finalChars`. |
-| B-AC3 | `a 10k capability block keeps all services` | 18-service snapshot totalling ~9.5k serialized survives `boundedCapabilities` intact; at the old 8k cap it lost services. |
-| B-AC4 | `bootstrap bound applies only with capabilities present` | Same content minus `trustedCapabilities` bounds at 12k. |
+| B-AC2 | `ordinary turns keep the 12k bound`                             | Non-bootstrap over-budget fixture still bounds to `finalChars`.                                                                                                                                                                 |
+| B-AC3 | `a 10k capability block keeps all services`                     | 18-service snapshot totalling ~9.5k serialized survives `boundedCapabilities` intact; at the old 8k cap it lost services.                                                                                                       |
+| B-AC4 | `bootstrap bound applies only with capabilities present`        | Same content minus `trustedCapabilities` bounds at 12k.                                                                                                                                                                         |
 
 ### B.5 Verification beyond tests
 
 Post-deploy: re-ask the incident's question in a fresh thread; the recall row must carry
 the project evidence. This doubles as §11's first live efficacy case.
+
+## P2 — Pillar 2: semantic consolidation
+
+Planned 2026-08-19; entry criteria met. Corrected the same day against a 15-finding
+plan-stage review — see `run.md`.
+
+### P2.1 Entry evidence and the design input that reshaped it
+
+- **Domain capture criterion: met.** `domain_knowledge` = 235 facts, **18.5% of new
+  reason-bearing captures** (counted from markers, not estimated), across two
+  workgroups, three days after pillar 0 deployed.
+- **Scent pointer-following: null result, and it matters.** 270 scent deliveries with
+  pointers were sampled against the archive: **zero** agent replies cited a pointed file
+  within 30 minutes. Lower bound (silent follows are unmeasurable — container
+  transcripts do not survive), but the excerpt lanes demonstrably DO change behavior
+  (the bootstrap-fix replay). **Therefore topic files are designed for the file-excerpt
+  lane — short, dense, one entity per file — not for scent pointability.**
+
+### P2.2 What consolidation is
+
+The episodic ledger (`generated/memory.md`) is append-only truth, now 2,500+ facts in
+the largest store. Recall delivers at most 3 facts + 3 file excerpts per turn, each fact
+an isolated line. Consolidation maintains **derived entity views**: curator-written
+topic files under `people/`, `domain/`, and `systems/` that merge everything the ledger
+knows about one entity into one short document, ranked and excerpted by the existing
+file lane. **The delivery unit is the 900-char excerpt, not the whole file** — nothing
+in the recall path guarantees full-file delivery (only three ranked files survive per
+turn and the fs walk caps at 256 entries), so topic files must lead with dense,
+self-contained summary lines that still carry the entity's core facts if the excerpt
+window cuts the rest. The ledger is never modified by this pass; topic files are
+regenerable projections. A human-authored liaison-roster file already proved the shape
+ranks #1 for people queries.
+
+### P2.3 Current architecture (source evidence)
+
+- **The hook is already a no-op with full lease machinery.**
+  `MemoryCuratorWorker.runMaintenance` (`curator-worker.ts`) claims via
+  `claimMaintenanceJob`, reads the store, completes — body deliberately empty,
+  returning `maintenance_noop`. `MemoryCuratorRunReport.action` already includes
+  `maintenance_written`. **But it runs outside the lifecycle machinery**:
+  `runOne` calls `runMaintenance` before admission/credential checks
+  (`curator-worker.ts:389`) and passes it no abort signal (`curator-worker.ts:549`) —
+  wiring this in is part of this build, not a given (P2.4 step 6).
+- **Scheduling fires for new updates, not for backlog.** `maintenance_pending` is set
+  on every 50th accepted update (`MEMORY_MAINTENANCE_UPDATE_THRESHOLD`,
+  `message-archive.ts:225`, insert/upsert at `message-archive.ts:634-657`) and on size
+  pressure. `completeMemoryMaintenance` (`message-archive.ts:700`) unconditionally
+  zeroes the counter and `maintenance_pending` on success — no partial-tail bookkeeping
+  exists today, and nothing enqueues an _existing_ backlog (a quiet workgroup with
+  2,500 already-captured facts has no pending row until its 51st new update). Both are
+  fixed in P2.4.
+- **The CAS writer is already general but requires the parent directory to exist
+  first.** The Bun helper's `resolveMemoryPath` calls `fs.realpathSync(parent)` and
+  throws `relative_path parent directory does not exist` otherwise
+  (`memory-write.ts:150-170`). Host setup creates only `generated/` — `people/`,
+  `domain/`, `systems/` are not guaranteed to exist, so the topic-file writer must
+  create its own directories, not assume them.
+- **Recall needs zero changes.** Files under `people/ domain/ systems/` are ordinary
+  memory markdown: listed, ranked, and excerpted by the existing file lane.
+  (`preferences/` remains its own deterministic lane and is out of bounds here.)
+- **The model transport is hardcoded to the episode schema.**
+  `MemoryCuratorBackend.curate()` fixes both `CURATOR_OUTPUT_SCHEMA` and
+  `CuratorModelDecision` (`curator-backend.ts:35-47`); there is no generic call path.
+  A new `consolidate()` method is required, not a call-site reuse of `curate()`.
+- **Supersession leaves no lineage.** Superseded lines are dropped entirely;
+  replacement facts get new marker ids and their own `captured=` stamp from
+  current-episode evidence (`curator-contract.ts:341-372`). A consolidation pass sees
+  the new fact but has no pointer to which topic sentence it replaces.
+
+### P2.4 Design
+
+**One new model pass inside `runMaintenance`, one thin write wrapper, one consolidated-fact
+set — no cursor column.**
+
+The original design used a `captured=`-stamp cursor. Rejected on review: the stamp comes
+from cited-message time, not processing order, so a late-arriving or older-timestamped
+episode can land at or behind the cursor and be skipped forever, and a strict `>` compare
+can split ties at the batch boundary. Replaced with an **order-independent membership set**,
+which sidesteps both problems and gets supersession handling for free.
+
+1. **Consolidated-fact set, not a cursor.** New central-DB table
+   `memory_consolidated_facts (workgroup_id TEXT NOT NULL, fact_id TEXT NOT NULL,
+PRIMARY KEY (workgroup_id, fact_id))`. The **tail** is every fact currently in the
+   ledger whose marker `id` is not in the set for that workgroup — computed fresh each
+   pass by reading the ledger, so ordering and timestamps are irrelevant. Late-arriving
+   episodes and equal `captured=` stamps are non-issues by construction. Supersession
+   replacements get new ids (P2.3), so they land in the tail again automatically — no
+   lineage tracking needed. A pass takes the first `CONSOLIDATION_MAX_FACTS` (150)
+   tail facts in ledger order (deterministic, no timestamp reliance) and, **only on
+   full pass success**, inserts their ids into the set.
+2. **Catch-up.** `completeMemoryMaintenance` (`message-archive.ts:700`) changes to
+   **subtract the job's snapshot `acceptedUpdates`** (captured on claim,
+   `MemoryMaintenanceJob.acceptedUpdates`, `message-archive.ts:259`) from the counter,
+   floored at 0, instead of zeroing it — updates accepted while the lease was held are
+   no longer erased. After a successful pass that leaves the tail non-empty (more than
+   150 facts were pending), the worker **re-asserts `maintenance_pending = 1`** so the
+   next sweep round continues the backlog rather than waiting for 50 more updates.
+   Failure keeps the existing default 6-hour backoff (`failMemoryMaintenance`,
+   `message-archive.ts:716-722`) — the retry is not "next sweep."
+3. **Backfill.** The migration that creates `memory_consolidated_facts` also sets
+   `maintenance_pending = 1` for every workgroup whose ledger is non-empty — a
+   one-time enqueue so existing stores are not stuck waiting for 50 new updates before
+   their first pass. Combined with the 150-per-round catch-up rule, a 2,500-fact store
+   drains over multiple sweep rounds at ≤150 facts each; the fleet-wide claim/lease
+   serialization (one job claimed per sweep tick) means the backfill enqueue does not
+   storm — it bounds to one pass per sweep round per workgroup.
+4. **Regenerability.** Operator reset is workgroup-granular:
+   `DELETE FROM memory_consolidated_facts WHERE workgroup_id = ?` (optionally also
+   deleting the topic files) makes the entire ledger tail again on the next pass, and
+   topic files rebuild from truth. Deleting a single topic file without also resetting
+   its workgroup's set is **not** independently recoverable — the facts that built it
+   are already marked consolidated and will not reappear in any future tail. This
+   replaces the load-bearing claim in the original P2-I2 (a single-file delete is
+   trivially recoverable), which review found false under tail-only reconstruction: the
+   only full-ledger reader supplies just the tail, not the whole store.
+5. **Prompt.** System prompt states: topic files are **rewritten views** — the model
+   replaces stale statements contradicted by newer facts; "never delete or contradict"
+   is the **ledger's** invariant (host-guaranteed, P2-I1), not a prohibition on
+   correcting topic prose. Unresolvable conflicts are stated with both dates. Merge is
+   **not idempotent** — a failed pass marks nothing consolidated, and the retry
+   re-presents the same facts against the file's now-current content (which may already
+   carry a partial write from the failed attempt); the prompt instructs
+   merge-without-duplication, and duplication is auditable via the generated header
+   (below), not structurally prevented. This is convergent by re-presentation, which is
+   the honest claim — "idempotent" is dropped.
+6. **Input scope, ownership, and caps.** Only **curator-owned** topic files — those
+   whose first line matches the consolidation header pattern — are presented as
+   updatable and accepted as write targets; the model may create new files freely
+   within the path allowlist. Human-authored files under `people/ domain/ systems/`
+   (no header) are presented **read-only** — path plus content, so the model doesn't
+   duplicate them — but the host rejects their paths as write targets regardless of
+   what the model returns. Input caps, enforced before the model call: per-file read
+   `CONSOLIDATION_INPUT_FILE_MAX_BYTES` (16 KiB); total presented topic content
+   `CONSOLIDATION_INPUT_TOTAL_MAX_BYTES` (256 KiB). Over-cap files are excluded from
+   the prompt, logged, and **locked** — not writable that pass — so the model never
+   blind-overwrites content it did not see.
+7. **Output schema and validation.** Output: `{ files: [{ path, content }] }`,
+   constrained decoding against a new `CONSOLIDATION_OUTPUT_SCHEMA`. Host-side
+   validation (not model-trusted): path matches
+   `^(people|domain|systems)/[a-z0-9][a-z0-9-]*\.md$`; final serialized content
+   (model output **plus** the generated header — the header is appended before this
+   check, not after) ≤ `CONSOLIDATION_FILE_MAX_BYTES` (8,192); at most
+   `CONSOLIDATION_MAX_FILES` (12) per pass; every file gets header
+   `<!-- consolidated: facts=<n> -->` as its first line — this is both the audit trail
+   and the ownership marker checked in step 6. **`{files: []}` on a non-empty tail is
+   valid success**, not a failure and not a no-tail noop: the tail's facts are marked
+   consolidated, the report action is `maintenance_written` with `fileCount: 0`
+   (distinct from the empty-tail case, which makes no model call), and the event is
+   logged — a tail can legitimately need no topic-file changes (already reflected, or
+   non-entity facts), and failing that case would loop forever. The risk this creates
+   (a lazy model claiming "nothing to update" on real content) is not structurally
+   prevented — see P2.8.
+8. **Write.** `writeMemoryTopicFile(workgroupId, relativePath, content,
+expectedSha256)` in `curator-write.ts`: creates the topic directory first if absent
+   (same symlink checks as `ensureGeneratedDirectory`), enforces the ownership check
+   from step 6, then the existing CAS path (sha captured when the file was read for the
+   prompt; conflict fails the job). Files write sequentially; a mid-batch conflict
+   leaves earlier files written and marks **nothing** consolidated — the next pass
+   re-presents the same tail against whatever partial state exists on disk.
+9. **Lifecycle wiring.** `runMaintenance` moves inside the same admission/credential/
+   failover/abort machinery episode calls already use: it runs through
+   `runModelWithFailover`, receives the abort signal, and consumes `recordCall`/
+   `finishCall` accounting like an episode. `MemoryCuratorBackend.consolidate()` — new
+   method, parallel to `curate()`, passing `CONSOLIDATION_OUTPUT_SCHEMA` — is the
+   transport.
+10. **Report.** `maintenance_noop` only for the empty-tail case (no model call);
+    `maintenance_written` with `fileCount` otherwise — including `fileCount: 0` for the
+    zero-files-on-nonempty-tail case, with its distinct log line (step 7). Calls
+    consume the admission budget like episodes.
+
+**Rejected alternatives.** Full-store rewrite per pass (store no longer fits one
+context window; tail+merge is incremental by construction). A separate consolidation
+worker (the lease, scheduling, backend, and budget all exist on the curator worker —
+a second worker is pure duplication). Entity extraction via Graphify (pillar 4's job;
+P2 discovers entities lexically from what the model reads, which is the evidence P4
+is waiting for).
+
+### P2.5 Invariants
+
+- P2-I1. The episodic ledger is never modified by consolidation — byte-identical
+  before/after every pass.
+- P2-I2. Topic files are regenerable derived views. Recovery is a workgroup-granular
+  reset — `DELETE FROM memory_consolidated_facts WHERE workgroup_id = ?`, optionally
+  also deleting topic files — which replays the whole ledger as tail and rebuilds from
+  truth. Deleting a single topic file in isolation, without resetting its workgroup's
+  set, is not recoverable (P2.4 item 4).
+- P2-I3. Only `people/ domain/ systems/` paths are writable by this pass; `generated/`,
+  `preferences/`, `system/`, and traversal shapes are rejected host-side.
+- P2-I4. A fact's id is inserted into `memory_consolidated_facts` only on a fully
+  successful pass.
+- P2-I5. No recall-side behavior changes; delivery happens through the existing lanes.
+- P2-I6. Consolidation never overwrites a file it does not own — ownership is the
+  header-pattern check in P2.4 item 6; a human-authored or unmarked file is never a
+  write target regardless of what the model returns.
+
+### P2.6 Acceptance criteria (exact cases for /team-build)
+
+In `curator-worker.test.ts` unless noted; mocked backend, real temp store files.
+
+| #       | Test name                                                                                                                                                  | Assertion                                                                                                                                                                                                                                                                                                                                                             |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P2-AC1  | `maintenance creates topic directories on first run and consolidates the tail`                                                                             | Memory root starts with only `generated/`; store has 3 unconsolidated facts; mocked model returns two valid files. Both directories are created, both files exist with the consolidation header, report is `maintenance_written` with `fileCount: 2`, both fact ids land in `memory_consolidated_facts`.                                                              |
+| P2-AC2  | `consolidation input is scoped to the unconsolidated tail, owned files as writable, human-authored files as read-only context`                             | Mock captures the prompt: already-consolidated facts absent; owned `people/x.md` present as writable current content; an unmarked `people/roster.md` present as read-only context only, never offered as a write target.                                                                                                                                              |
+| P2-AC3  | `writeMemoryTopicFile rejects each forbidden path class independently`                                                                                     | Seven separate write attempts — traversal (`../escape.md`), `generated/memory.md`, `preferences/p.md`, `system/x.md`, a nested subdirectory (`people/a/b.md`), an absolute path, and a malformed slug (`People/X.md`) — each individually asserted rejected, nothing written for any. Guards against a batch test where only the first violation is actually checked. |
+| P2-AC4  | `oversize or over-count file sets are rejected, measured on the final serialized file`                                                                     | A file whose model content plus the generated header exceeds 8,192 bytes is rejected (content alone under 8,192 is not sufficient to prove this); a 13-file set is rejected. Nothing written in either case.                                                                                                                                                          |
+| P2-AC5  | `the ledger is byte-identical after a pass`                                                                                                                | sha256(`generated/memory.md`) unchanged across a successful pass. Guards P2-I1.                                                                                                                                                                                                                                                                                       |
+| P2-AC6  | `a mid-batch CAS conflict marks nothing consolidated and the next pass re-presents the same tail`                                                          | Mocked CAS conflict on file 2: job failed, `memory_consolidated_facts` unchanged, file 1 remains written (documented partial), the next pass's prompt shows file 1's already-updated content for the same tail. Guards against the "merge-idempotent" claim review found unproven.                                                                                    |
+| P2-AC7  | `tail-emptiness and a model choosing zero files are distinct outcomes`                                                                                     | (a) No unconsolidated facts → `maintenance_noop`, zero model calls. (b) A non-empty tail with a mocked `{files: []}` response → `maintenance_written` with `fileCount: 0`, the tail's fact ids ARE inserted into `memory_consolidated_facts`, and a distinct log line fires. Guards P2.4 item 7.                                                                      |
+| P2-AC8  | `topic files reach recall through the file lane, across all three directories` (in `pre-turn-context.test.ts`)                                             | Seed one matching file each under `people/ domain/ systems/`; each appears as a ranked excerpt whose text contains the file's leading summary line. Does not assert full-file delivery (P2.2). Guards P2-I5 by construction.                                                                                                                                          |
+| P2-AC9  | `the consolidation prompt states rewrite-not-delete, ownership, and the untrusted boundary`                                                                | String assertions on the composed prompt: topic files are rewritten views, "never delete or contradict" applies to the ledger not topic prose, merge-without-duplication (not "idempotent"), and the untrusted-payload boundary.                                                                                                                                      |
+| P2-AC10 | `writeMemoryTopicFile refuses to overwrite a file lacking the ownership header`                                                                            | An existing `people/roster.md` with no header line: a model-proposed write to that path fails host-side, nothing written; a model-proposed write to a _new_ path in the same directory succeeds. Guards P2-I6.                                                                                                                                                        |
+| P2-AC11 | `over-cap presented topic files are excluded, logged, and locked for that pass`                                                                            | A `people/` file over 16 KiB, and a topic-content total over 256 KiB across several files: the over-cap file(s) are absent from the prompt, a log line records the exclusion, and a model-proposed write to a locked path is rejected even though the path itself is otherwise valid.                                                                                 |
+| P2-AC12 | `MemoryCuratorBackend.consolidate passes the consolidation schema to the structured-call layer` (in `curator-backend.test.ts`, non-mocked schema-contract) | Calling `consolidate()` with a fake `CuratorModelCall` asserts the request's `schema` is `CONSOLIDATION_OUTPUT_SCHEMA`, not `CURATOR_OUTPUT_SCHEMA`. Guards against a mocked worker test passing while production constrained decoding still requires the episode schema.                                                                                             |
+| P2-AC13 | `the maintenance call is admission-accounted and abort-propagated`                                                                                         | Mocked admission/credential/abort dependencies: a maintenance job only proceeds after admission passes, `recordCall`/`finishCall` are invoked around it like an episode call, and an aborted signal cancels an in-flight maintenance call. Guards P2.3's "outside the lifecycle machinery" finding.                                                                   |
+| P2-AC14 | `the migration enqueues maintenance for every workgroup with a non-empty ledger` (migration test)                                                          | Two workgroups, one with a non-empty `generated/memory.md` and one empty: after migration, only the non-empty one has `maintenance_pending = 1`. Guards P2.4 item 3.                                                                                                                                                                                                  |
+| P2-AC15 | `completeMemoryMaintenance subtracts the job's snapshot count and reasserts pending on a remaining tail` (in `message-archive.test.ts`)                    | A job claimed with `acceptedUpdates: 30`; 10 more updates accepted while the lease is held; completion subtracts 30 (floor 0), leaving 10, not 0. Separately: a successful pass that leaves the tail non-empty results in `maintenance_pending = 1` being reasserted rather than left at 0. Guards P2.4 item 2.                                                       |
+
+### P2.7 Implementation path
+
+1. Migration: `memory_consolidated_facts` table, tail-computation and mark-consolidated
+   helpers, backfill enqueue for non-empty ledgers. Satisfies P2-AC14.
+   Check: migration test.
+2. `completeMemoryMaintenance` catch-up fix (subtract snapshot, floor 0; reassert
+   pending on a remaining tail) in `message-archive.ts`. Satisfies P2-AC7(a), AC15.
+3. `writeMemoryTopicFile` — directory creation, ownership check, path/size validation
+   on the final serialized file, generated header — in `curator-write.ts`. Satisfies
+   P2-AC1, AC3, AC4, AC10.
+4. Consolidation prompt, `CONSOLIDATION_OUTPUT_SCHEMA`, and its validator in
+   `curator-contract.ts`, including input-cap enforcement and the read-only/writable
+   split. Satisfies P2-AC2, AC9, AC11.
+5. `MemoryCuratorBackend.consolidate()` in `curator-backend.ts`. Satisfies P2-AC12.
+6. Move `runMaintenance` inside the admission/credential/failover/abort machinery in
+   `curator-worker.ts`. Satisfies P2-AC13.
+7. `runMaintenance` body: tail selection (ledger order, first 150 unconsolidated),
+   model call via `consolidate()`, host validation, sequential CAS writes, mark
+   consolidated only on full success. Satisfies P2-AC1, AC5, AC6, AC7.
+8. Recall lane check across all three directories (P2-AC8).
+9. Full suites, container typecheck untouched (host-only change), boundary check.
+10. Post-deploy: first passes observed in `maintenance_written` logs; spot-read topic
+    files for quality; watch the backfill drain a large backlog at ≤150 facts per
+    workgroup per sweep round; splitting-audit unaffected.
+
+### P2.8 Risks
+
+| Risk                                                                               | Assessment                                                                                                                                                                                                                                                                                                                                                       |
+| ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Consolidation-model hallucination into topic files                                 | Bounded: derived views only, ledger untouched, every file carries the ownership header and the ledger retains every source fact for cross-checking; retreat = delete files and reset the workgroup's consolidated set (P2-I2), they regenerate from truth.                                                                                                       |
+| Mixed-quality tail (18.5% domain, rest process) produces process-heavy topic files | `systems/` is the legitimate home for durable process knowledge; the prompt routes by entity type rather than filtering; the reason codes in the input let the model weight domain facts for `domain/`. Measured after a week via file spot-reads.                                                                                                               |
+| Workgroup lock contention with agent writes                                        | Same lock the fleet already shares for every memory write; passes are one lock per file, seconds apart.                                                                                                                                                                                                                                                          |
+| Model laziness on the `{files: []}` success path                                   | The real risk introduced by P2.4 item 7: a lazy model can mark a real change "nothing to update" and its facts are still consolidated. Not structurally prevented — audited via the distinct `fileCount: 0` log line (P2-AC7(b)) and post-deploy spot-reads; retreat is tightening the prompt if the log shows a genuine pattern of misses.                      |
+| Topic-file count growth vs. the recall traversal ceiling and the prompt input cap  | As topic files accumulate, both the recall lane's 256-entry fs-walk cap and the consolidation input's 256 KiB total-content cap can start excluding files. The per-pass 12-file/8,192-byte output caps keep growth bounded and the over-cap lock (P2.4 item 6) makes exclusion visible via logs; not solved further here — a recurrence is pillar 3/4 territory. |
+| Catch-up storm after the backfill enqueue                                          | Every non-empty-ledger workgroup goes pending at once on migration. Bounded by the existing claim/lease serialization (one job claimed per sweep tick) plus the 150-fact-per-round cap, so the fleet drains gradually rather than storming — one pass per sweep round per workgroup, not a burst.                                                                |
 
 ## 9. Pillars 2–4 — sequenced, deliberately not designed here
 
@@ -853,31 +1102,31 @@ store, and completes — the body is a deliberate no-op returning `maintenance_n
 Consolidation fills that body, reusing the existing lease, CAS writer, and per-file recall
 lane. A human-authored client-liaison roster file already in one workgroup tree proved the
 file shape, and §4.3 shows it already ranks top for people queries.
-*Entry criteria:* pillar 0 deployed and the domain share measurably above its 11.9%
+_Entry criteria:_ pillar 0 deployed and the domain share measurably above its 11.9%
 baseline; pillar 1 deployed two weeks with evidence that pointers are being followed.
 
 **Pillar 3 — structured-source ingestion.** Snowflake schema, dbt lineage, Linear, feed
 schedules into the same topic files on a schedule.
-*Entry criteria:* pillar 2's topic-file shape stable.
+_Entry criteria:_ pillar 2's topic-file shape stable.
 
 **Pillar 4 — entity layer in Graphify.** Person/system/concept node types. The graph has
 none today — only chunks, files, and symbols (§4.3 sample), which is why a person query
-returns zero *nodes* while FTS matches exist. This is a Graphify schema and extractor
+returns zero _nodes_ while FTS matches exist. This is a Graphify schema and extractor
 change, the largest of the four.
-*Entry criteria:* pillar 2 has shown which entities actually recur.
+_Entry criteria:_ pillar 2 has shown which entities actually recur.
 
 ## 10. Risks and open items
 
-| Risk | Assessment |
-|---|---|
-| A cold graph costs ~800 ms | Measured. Resolved by construction: the cold cost is paid by the sweep probe, never on the message-write path (§5.4). The residual is up to ~800 ms added to one 60 s sweep, for one workgroup, once per cycle. |
-| `better-sqlite3` cannot be interrupted | Accepted ceiling, stated in code. It is why warm-gating replaces a breaker: an uninterruptible query must be prevented from starting, not stopped once running. |
-| Warmth is a proxy, not a guarantee | Confirmed by the step-6 gate failure, not just predicted: probe-term page residency did not cover real-query terms, and the original term shape overran 8×. Now bounded two ways: exact-term construction (§5.2 table) and self-healing warmth — a turn query over `budgetMs` unmarks the workgroup until a probe re-verifies, so a slow tail costs one turn per probe cycle, not every turn. |
-| Warmth converges at one workgroup per minute after restart | The lane is silent for the first minutes on a multi-workgroup host. Accepted for an advisory lane; the alternative is probing every workgroup per sweep, which is the ~8 s stall this design exists to avoid. |
-| Pointers are noise for conversational turns | Every warm turn runs the lane, including "thanks". Mitigated by the ≥2-term floor and bm25 ranking; if it proves noisy in practice the fix is a relevance floor on `rank`, not more machinery. Not pre-built. |
-| Agent ignores the scent entirely | The real failure mode, and unmeasurable from the host. §11 defines what would count as evidence. |
-| Basename dedupe hides genuinely distinct files | Two different `index.ts` files collapse to one pointer. Accepted: the pointer is a lead, not an answer. |
-| `workgroup/%` prefix assumed universal | Verified present on all four sampled graphs (§4.4). A workgroup with no `workgroup/` sources yields an empty scent and a `no-match` notice — degrades correctly. |
+| Risk                                                       | Assessment                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A cold graph costs ~800 ms                                 | Measured. Resolved by construction: the cold cost is paid by the sweep probe, never on the message-write path (§5.4). The residual is up to ~800 ms added to one 60 s sweep, for one workgroup, once per cycle.                                                                                                                                                                               |
+| `better-sqlite3` cannot be interrupted                     | Accepted ceiling, stated in code. It is why warm-gating replaces a breaker: an uninterruptible query must be prevented from starting, not stopped once running.                                                                                                                                                                                                                               |
+| Warmth is a proxy, not a guarantee                         | Confirmed by the step-6 gate failure, not just predicted: probe-term page residency did not cover real-query terms, and the original term shape overran 8×. Now bounded two ways: exact-term construction (§5.2 table) and self-healing warmth — a turn query over `budgetMs` unmarks the workgroup until a probe re-verifies, so a slow tail costs one turn per probe cycle, not every turn. |
+| Warmth converges at one workgroup per minute after restart | The lane is silent for the first minutes on a multi-workgroup host. Accepted for an advisory lane; the alternative is probing every workgroup per sweep, which is the ~8 s stall this design exists to avoid.                                                                                                                                                                                 |
+| Pointers are noise for conversational turns                | Every warm turn runs the lane, including "thanks". Mitigated by the ≥2-term floor and bm25 ranking; if it proves noisy in practice the fix is a relevance floor on `rank`, not more machinery. Not pre-built.                                                                                                                                                                                 |
+| Agent ignores the scent entirely                           | The real failure mode, and unmeasurable from the host. §11 defines what would count as evidence.                                                                                                                                                                                                                                                                                              |
+| Basename dedupe hides genuinely distinct files             | Two different `index.ts` files collapse to one pointer. Accepted: the pointer is a lead, not an answer.                                                                                                                                                                                                                                                                                       |
+| `workgroup/%` prefix assumed universal                     | Verified present on all four sampled graphs (§4.4). A workgroup with no `workgroup/` sources yields an empty scent and a `no-match` notice — degrades correctly.                                                                                                                                                                                                                              |
 
 **Unresolved user decisions**
 

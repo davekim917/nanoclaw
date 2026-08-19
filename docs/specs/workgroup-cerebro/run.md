@@ -740,3 +740,98 @@ approval, so a rejected plan leaves no trace in the product repository.
 Listed in `plan.md` §10. The two the operator must weigh: this plan builds pillar 1 and
 sequences pillars 2–4 rather than designing all four, and no efficacy eval exists for the
 memory system as a whole — the outstanding A/B remains unbuilt and is out of scope here.
+
+## Pillar 2 planning — 2026-08-19
+
+### Entry evidence (measured today, not estimated)
+
+- `domain_knowledge` captures: **235 facts, 18.5% of new reason-bearing captures** across
+  two workgroups, three days after pillar 0 deployed — the pillar-2 entry criterion
+  ("domain facts are flowing") is met.
+- Scent pointer-following: **0 explicit citations in 270 sampled scent deliveries**
+  (30-minute reply window against the archive). Lower bound — silent follows are
+  unmeasurable — but the excerpt lanes demonstrably do change behavior (bootstrap-fix
+  replay). Design consequence adopted into P2: topic files target the file-excerpt
+  lane (short, dense, one entity per file), not scent pointability.
+
+### Grounding reads (source evidence for P2.3)
+
+- `curator-worker.ts` `runMaintenance`: deliberate no-op with full lease machinery
+  (claim/complete/fail) and `maintenance_written` already in the report union.
+- `message-archive.ts`: `maintenance_pending` set at 50 accepted updates or 6 MiB
+  (:225, :230, :640-657), claimed at :674, reset at :706.
+- `memory-write.ts:337-345`: the shared CAS write core reserves only
+  `generated/memory.md`; arbitrary memory-relative paths flow through the same
+  lock/CAS machinery — the topic-file writer is a thin wrapper, not new machinery.
+- Recall: `people/ domain/ systems/` markdown is ordinary file-lane input; zero
+  recall-side changes required. `preferences/` untouched.
+
+### Plan written
+
+`plan.md` §P2: cursor column (`consolidated_through`, captured-stamp based — survives
+supersession rewrites where a line-count cursor breaks), tail-bounded consolidation
+pass (≤150 facts) inside `runMaintenance`, host-side path/size validation
+(`^(people|domain|systems)/[a-z0-9][a-z0-9-]*\.md$`, ≤8 KiB, ≤12 files), per-file CAS
+via a `writeMemoryTopicFile` wrapper, ledger byte-identical invariant (P2-I1),
+P2-AC1..AC10. Rejected: full-store rewrite (store exceeds one context window),
+separate worker (duplication), Graphify entity extraction (pillar 4's job).
+
+### Plan-stage review (2026-08-19) — Codex gpt-5.6-sol, high reasoning
+
+Operator-directed review lane (not the default `/team-plan` reviewer set). 15 findings,
+13 MUST-FIX and 2 SHOULD, all verified against source and accepted. Disposition below,
+one line per finding; full P2 rewrite is in `plan.md` §P2.
+
+1. **MUST-FIX, cursor not monotone/tie-safe.** Cursor design dropped entirely — replaced
+   with an order-independent `memory_consolidated_facts` id-set (P2.4 item 1).
+2. **MUST-FIX, supersession stability incomplete, no lineage.** Moot under the id-set:
+   replacements get new ids and re-enter the tail automatically (P2.4 item 1); prompt
+   reworded to state topic files are rewritten views, not lineage-tracked (P2.4 item 5).
+3. **MUST-FIX, 150-fact continuation incompatible with unconditional counter reset.**
+   `completeMemoryMaintenance` now subtracts the job's snapshot count (floor 0) instead
+   of zeroing, and reasserts `maintenance_pending` when a tail remains (P2.4 item 2,
+   P2-AC15).
+4. **MUST-FIX, bounded tail doesn't bound the backlog.** Migration backfill enqueues
+   every non-empty-ledger workgroup; combined with item 3's reassert, backlog drains at
+   ≤150 facts per workgroup per sweep round (P2.4 items 2–3, P2-AC14).
+5. **MUST-FIX, P2-I2 false under tail-only reconstruction.** P2-I2 reworded: recovery is
+   a workgroup-granular reset of the id-set (optionally plus topic files), which replays
+   the whole ledger as tail; a lone file delete without a set reset is explicitly not
+   recoverable (P2.4 item 4, P2-I2).
+6. **MUST-FIX, mid-batch writes not proven merge-idempotent.** "Idempotent" dropped from
+   the plan; a failed pass marks nothing consolidated and the retry re-presents the same
+   tail against current (possibly partial) file state — convergent by re-presentation,
+   duplication auditable via the header, not structurally prevented (P2.4 item 5,
+   P2-AC6).
+7. **MUST-FIX, production transport hardcoded to the episode schema.** New
+   `MemoryCuratorBackend.consolidate()` method with its own `CONSOLIDATION_OUTPUT_SCHEMA`,
+   plus a non-mocked schema-contract AC (P2.4 item 9, P2-AC12).
+8. **MUST-FIX, maintenance outside lifecycle wiring.** `runMaintenance` moves inside the
+   same admission/credential/failover/abort machinery as episode calls, with an AC
+   asserting admission-accounting and abort-propagation under mocks (P2.4 item 9,
+   P2-AC13).
+9. **MUST-FIX, first-run topic dirs don't exist.** `writeMemoryTopicFile` creates its
+   topic directory first; P2-AC1 now starts from a memory root containing only
+   `generated/` (P2.4 item 8, P2-AC1).
+10. **MUST-FIX, nothing schedules an initial pass.** Migration backfill sets
+    `maintenance_pending = 1` for every workgroup with a non-empty ledger (P2.4 item 3,
+    P2-AC14).
+11. **MUST-FIX, `{files: []}` on a non-empty tail undefined.** Defined as valid success:
+    tail facts marked consolidated, `maintenance_written` with `fileCount: 0`, logged
+    distinctly; risk of model laziness on this path recorded in P2.8, not structurally
+    prevented (P2.4 item 7, P2-AC7).
+12. **MUST-FIX, unbounded model input from "every current topic file."** Input caps
+    added: 16 KiB per presented file, 256 KiB total; over-cap files excluded, logged,
+    and locked from writes that pass (P2.4 item 6, P2-AC11).
+13. **MUST-FIX, allowlist permits overwriting human-authored memory.** Ownership
+    restricted to files carrying the consolidation header; unmarked files are read-only
+    context and host-rejected as write targets even if the model returns their path
+    (P2.4 item 6, new invariant P2-I6, P2-AC10).
+14. **SHOULD, recall claim eligible-but-not-guaranteed, "whole file" untested.** P2.2
+    reworded: the 900-char excerpt is the delivery unit, not full-file delivery; recall
+    AC now covers all three directories and asserts excerpt content, dropping the
+    "delivered whole" claim (P2.2, P2-AC8).
+15. **SHOULD, validation ACs pass while the contract stays broken.** Path-rejection AC
+    split into seven independently asserted forbidden classes; size-cap AC now measures
+    the final serialized file including the generated header, not model output alone
+    (P2-AC3, P2-AC4).
