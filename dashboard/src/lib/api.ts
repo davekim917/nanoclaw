@@ -600,6 +600,21 @@ export interface ObservatorySnapshot {
    *  slot) — install config, absent when the operator hasn't set any. See
    *  office-data.ts's buildOfficeData. */
   themedSlots?: Record<string, string>;
+  /**
+   * Per-room live-state indicators — install config, absent when the operator
+   * has bound none. `active` is always stated for a bound room, so "quiet" and
+   * "not bound" never render the same. A room key nothing on this floor
+   * matches is ignored rather than drawn somewhere arbitrary.
+   */
+  signals?: ObservatorySignal[];
+}
+
+export interface ObservatorySignal {
+  /** An ObservatoryRoom.key. */
+  room: string;
+  /** Which indicator to draw. 'smoke' is the only one that exists today. */
+  vignette: string;
+  active: boolean;
 }
 
 /** Assign a board item to an agent: creates a one-shot task in the item's own

@@ -234,6 +234,45 @@ describe('the exception feed', () => {
   });
 });
 
+describe('room signals on the floor', () => {
+  const floorWith = (signals?: ObservatorySnapshot['signals']) =>
+    mockData(
+      snapshot({
+        rooms: [room({ key: 'r1', name: 'one' }), room({ key: 'r2', name: 'two' })],
+        ...(signals ? { signals } : {}),
+      }),
+    );
+
+  it('draws smoke in the room whose signal is live, and nowhere else', () => {
+    floorWith([
+      { room: 'r2', vignette: 'smoke', active: true },
+      { room: 'r1', vignette: 'smoke', active: false },
+    ]);
+    const { container } = view();
+    expect(container.querySelectorAll('[data-vignette="smoke"]')).toHaveLength(1);
+    expect(container.querySelector('[data-room="r2"] [data-vignette="smoke"]')).toBeTruthy();
+    expect(container.querySelector('[data-room="r1"] [data-vignette="smoke"]')).toBeNull();
+  });
+
+  it('draws nothing when every bound room is quiet, and nothing when nothing is bound', () => {
+    floorWith([{ room: 'r2', vignette: 'smoke', active: false }]);
+    const quiet = view();
+    expect(quiet.container.querySelectorAll('[data-vignette="smoke"]')).toHaveLength(0);
+    quiet.unmount();
+
+    floorWith();
+    const unbound = view();
+    expect(unbound.container.querySelectorAll('[data-vignette="smoke"]')).toHaveLength(0);
+  });
+
+  it('ignores a live signal naming a room this floor does not have', () => {
+    floorWith([{ room: 'not-a-room-here', vignette: 'smoke', active: true }]);
+    const { container } = view();
+    expect(container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
+    expect(container.querySelectorAll('[data-vignette="smoke"]')).toHaveLength(0);
+  });
+});
+
 describe('the shell nav', () => {
   const populated = () =>
     mockData(

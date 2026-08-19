@@ -34,6 +34,7 @@ import {
   isNotARoom,
   readReleaseState,
   readOfficeThemes,
+  readWorkgroupSignals,
   threadPermalink,
   type ObservatoryDeps,
 } from './observatory.js';
@@ -50,9 +51,12 @@ function makeDeps(overrides: Partial<ObservatoryDeps> = {}): ObservatoryDeps {
   return {
     getActiveContainerSessionIds: () => [],
     resolveAssistantName: async (agentGroup) => agentGroup.name,
-    // Isolate from whatever the live repo checkout's own .nanoclaw/office-themes.json
-    // happens to contain — install config must never leak into a unit test's result.
+    // Isolate from whatever the live repo checkout's own .nanoclaw/*.json
+    // happens to contain — install config must never leak into a unit test's
+    // result. `signals: undefined` is a real injection: the scene checks for
+    // the KEY, so this pins "no signals configured" rather than reading disk.
     themedSlots: {},
+    signals: undefined,
     ...overrides,
   };
 }
@@ -918,5 +922,235 @@ describe('threadPermalink — multi-workspace adapter resolution', () => {
 
     const scene = await buildObservatoryScene('wg-tp', makeDeps());
     expect(scene.claims.map((c) => c.threadUrl)).toEqual(['https://acme.slack.com/archives/C0EEE/p1']);
+  });
+});
+
+/**
+ * Room signals — the read-side that lets the floor draw a live indicator for a
+ * room whose producer says something is happening in it right now.
+ *
+ * The contract these pin is TOTAL: the reader is called on every 15s poll and
+ * must never throw, never blank the scene, and never claim a room is live on
+ * anything softer than a fresh timestamp inside the workgroup's own directory.
+ */
+describe('readWorkgroupSignals', () => {
+  const SIG_ROOT = path.join(os.tmpdir(), 'nanoclaw-observatory-signals-test');
+  // Fixed clock. Nothing here is allowed to depend on how long the suite takes.
+  const NOW = Date.parse('2026-08-19T12:00:00.000Z');
+  const minutesAgo = (m: number) => new Date(NOW - m * 60_000).toISOString();
+
+  const repoRoot = () => path.join(SIG_ROOT, 'repo');
+  const dataDir = () => path.join(SIG_ROOT, 'data');
+  const wgDir = (wg = 'wg-1') => path.join(dataDir(), 'workgroups', wg);
+
+  function writeConfig(value: unknown | string): void {
+    const dir = path.join(repoRoot(), '.nanoclaw');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'office-signals.json'), typeof value === 'string' ? value : JSON.stringify(value));
+  }
+
+  function writeState(relative: string, body: unknown | string, wg = 'wg-1'): string {
+    const file = path.join(wgDir(wg), relative);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, typeof body === 'string' ? body : JSON.stringify(body));
+    return file;
+  }
+
+  /** The producer-shaped binding the live install uses. */
+  const binding = (over: Record<string, unknown> = {}) => ({
+    room: 'slack:C0FEED',
+    file: 'runner/run-active.json',
+    freshKey: 'progressAt',
+    maxAgeSeconds: 1800,
+    vignette: 'smoke',
+    ...over,
+  });
+
+  const read = (wg = 'wg-1') => readWorkgroupSignals(wg, NOW, repoRoot(), dataDir());
+
+  beforeEach(() => {
+    fs.rmSync(SIG_ROOT, { recursive: true, force: true });
+    fs.mkdirSync(wgDir(), { recursive: true });
+  });
+  afterEach(() => {
+    fs.rmSync(SIG_ROOT, { recursive: true, force: true });
+  });
+
+  it('reports a room live when its producer stamped progress inside the window', () => {
+    writeConfig([binding()]);
+    writeState('runner/run-active.json', { progressAt: minutesAgo(5), runId: 'r-1' });
+    expect(read()).toEqual([{ room: 'slack:C0FEED', vignette: 'smoke', active: true }]);
+  });
+
+  it('reports it quiet once the stamp is older than the producer’s own staleness limit', () => {
+    writeConfig([binding()]);
+    // 1800s == 30m. At exactly the limit the producer already calls it stale.
+    writeState('runner/run-active.json', { progressAt: minutesAgo(30) });
+    expect(read()).toEqual([{ room: 'slack:C0FEED', vignette: 'smoke', active: false }]);
+
+    writeState('runner/run-active.json', { progressAt: minutesAgo(29) });
+    expect(read()![0]!.active).toBe(true);
+  });
+
+  it('still emits the entry when the state file is missing, unreadable or not JSON', () => {
+    writeConfig([binding()]);
+    // Never written at all — the campaign has simply never run.
+    expect(read()).toEqual([{ room: 'slack:C0FEED', vignette: 'smoke', active: false }]);
+
+    writeState('runner/run-active.json', 'not json at all');
+    expect(read()).toEqual([{ room: 'slack:C0FEED', vignette: 'smoke', active: false }]);
+
+    // A directory where a file was expected — readFileSync throws EISDIR.
+    fs.rmSync(path.join(wgDir(), 'runner', 'run-active.json'));
+    fs.mkdirSync(path.join(wgDir(), 'runner', 'run-active.json'));
+    expect(read()).toEqual([{ room: 'slack:C0FEED', vignette: 'smoke', active: false }]);
+  });
+
+  it('refuses a timestamp that is absent, not a string, or not a date', () => {
+    writeConfig([binding()]);
+    for (const body of [{}, { progressAt: 12345 }, { progressAt: 'whenever' }, { progressAt: null }, []]) {
+      writeState('runner/run-active.json', body);
+      expect(read()![0]!.active).toBe(false);
+    }
+  });
+
+  it('tolerates a little clock skew and refuses a stamp from the future', () => {
+    writeConfig([binding()]);
+    writeState('runner/run-active.json', { progressAt: new Date(NOW + 30_000).toISOString() });
+    expect(read()![0]!.active).toBe(true);
+
+    writeState('runner/run-active.json', { progressAt: new Date(NOW + 120_000).toISOString() });
+    expect(read()![0]!.active).toBe(false);
+  });
+
+  it('ships no signals field at all when there is no config, or the config is not a JSON array', () => {
+    expect(read()).toBeUndefined(); // no file
+
+    writeConfig('{ this is not json');
+    expect(read()).toBeUndefined();
+
+    writeConfig({ room: 'slack:C0FEED' }); // an object, not an array
+    expect(read()).toBeUndefined();
+  });
+
+  it('rejects the ENTRY, not the file, when a binding fails the closed schema', () => {
+    const good = binding({ room: 'slack:GOOD' });
+    writeState('runner/run-active.json', { progressAt: minutesAgo(1) });
+    // Deliberately untyped: half of these are not objects at all, which is
+    // exactly the case the reader has to survive.
+    const bad: unknown[] = [
+      binding({ room: 'a', vignette: 'fireworks' }), // not a vignette this build draws
+      binding({ room: 'b', maxAgeSeconds: 0 }),
+      binding({ room: 'c', maxAgeSeconds: -60 }),
+      binding({ room: 'd', maxAgeSeconds: 12.5 }),
+      binding({ room: 'e', maxAgeSeconds: '1800' }),
+      binding({ room: 'f', freshKey: '' }),
+      binding({ room: 'g', file: '' }),
+      binding({ room: '' }),
+      { ...binding({ room: 'h' }), extra: 'a key this build does not implement' },
+      { room: 'i', file: 'x.json', freshKey: 'at', maxAgeSeconds: 60 }, // no vignette
+      'not an object',
+      null,
+      ['nested'],
+    ];
+    writeConfig([...bad, good]);
+    expect(read()).toEqual([{ room: 'slack:GOOD', vignette: 'smoke', active: true }]);
+  });
+
+  it('keeps the first binding for a room and drops the rest', () => {
+    writeState('runner/run-active.json', { progressAt: minutesAgo(1) });
+    writeState('other.json', { progressAt: minutesAgo(1) });
+    writeConfig([binding(), binding({ file: 'other.json', maxAgeSeconds: 60 })]);
+    const out = read()!;
+    expect(out).toHaveLength(1);
+    expect(out[0]).toEqual({ room: 'slack:C0FEED', vignette: 'smoke', active: true });
+  });
+
+  it('rejects a file that escapes the workgroup directory, by any route', () => {
+    // A real, fresh file OUTSIDE the workgroup dir — so a reader that followed
+    // the escape would report `active: true` and be caught by it.
+    const outside = path.join(SIG_ROOT, 'outside.json');
+    fs.writeFileSync(outside, JSON.stringify({ progressAt: minutesAgo(1) }));
+
+    writeConfig([binding({ file: outside })]); // absolute
+    expect(read()).toEqual([]);
+
+    writeConfig([binding({ file: '../../outside.json' })]); // traversal
+    expect(read()).toEqual([]);
+
+    writeConfig([binding({ file: './nested/../../../outside.json' })]); // dressed-up traversal
+    expect(read()).toEqual([]);
+
+    // Symlinked directory inside the workgroup dir, pointing out of it. Every
+    // textual check passes; only the realpath catches it.
+    fs.symlinkSync(SIG_ROOT, path.join(wgDir(), 'escape'), 'dir');
+    writeConfig([binding({ file: 'escape/outside.json' })]);
+    expect(read()).toEqual([]);
+  });
+
+  it('reads the workgroup’s own directory, not a neighbour’s', () => {
+    writeConfig([binding()]);
+    writeState('runner/run-active.json', { progressAt: minutesAgo(1) }, 'wg-1');
+    expect(read('wg-1')![0]!.active).toBe(true);
+    expect(read('wg-2')![0]!.active).toBe(false);
+  });
+
+  it('reads nothing for a workgroup id that is not a single safe path segment', () => {
+    writeConfig([binding()]);
+    expect(read('../escape')).toBeUndefined();
+  });
+});
+
+describe('the scene carries signals additively', () => {
+  const SIG_ROOT = path.join(os.tmpdir(), 'nanoclaw-observatory-signals-scene-test');
+  const repoRoot = path.join(SIG_ROOT, 'repo');
+
+  beforeEach(() => {
+    fs.rmSync(SIG_ROOT, { recursive: true, force: true });
+    addWorkgroup('wg-sig');
+    addGroup('ag-sig', 'wg-sig', 'ava', 'ava-folder');
+  });
+  afterEach(() => {
+    fs.rmSync(SIG_ROOT, { recursive: true, force: true });
+  });
+
+  it('is byte-identical to the pre-change shape when nothing is configured', async () => {
+    const scene = await buildObservatoryScene('wg-sig', makeDeps());
+    expect(scene.signals).toBeUndefined();
+    // The wire is what matters: an undefined optional must not put a key on it.
+    const wireKeys = Object.keys(JSON.parse(JSON.stringify(scene))).sort();
+    expect(wireKeys).not.toContain('signals');
+    expect(wireKeys).toEqual([
+      'agents',
+      'asOf',
+      'claims',
+      'releaseState',
+      'rooms',
+      // Injected as `{}` by makeDeps, so it serializes; the live no-config
+      // reader returns undefined and it drops off the wire the same way
+      // `signals` does.
+      'themedSlots',
+      'workgroupId',
+    ]);
+  });
+
+  it('adds the field and changes nothing else when signals ARE configured', async () => {
+    const before = await buildObservatoryScene('wg-sig', makeDeps());
+    const after = await buildObservatoryScene(
+      'wg-sig',
+      makeDeps({ signals: [{ room: 'slack:C0FEED', vignette: 'smoke', active: true }] }),
+    );
+    expect(after.signals).toEqual([{ room: 'slack:C0FEED', vignette: 'smoke', active: true }]);
+    // Everything except asOf (a clock) and the new field is untouched.
+    const strip = (s: typeof before) => ({ ...s, asOf: '', signals: undefined });
+    expect(strip(after)).toEqual(strip(before));
+  });
+
+  it('never throws the poll when the config on disk is nonsense', async () => {
+    fs.mkdirSync(path.join(repoRoot, '.nanoclaw'), { recursive: true });
+    fs.writeFileSync(path.join(repoRoot, '.nanoclaw', 'office-signals.json'), '}{');
+    expect(readWorkgroupSignals('wg-sig', Date.now(), repoRoot, TEST_DIR)).toBeUndefined();
+    const scene = await buildObservatoryScene('wg-sig', makeDeps());
+    expect(scene.rooms).toBeDefined();
   });
 });

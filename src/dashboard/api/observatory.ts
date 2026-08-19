@@ -18,10 +18,11 @@ import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getSessionsByAgentGroup } from '../../db/sessions.js';
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { getKnownSlackBots } from '../../channels/slack-mentions.js';
-import { GROUPS_DIR, REPO_ROOT } from '../../config.js';
+import { DATA_DIR, GROUPS_DIR, REPO_ROOT } from '../../config.js';
 import { getActiveContainerSessionIds, resolveAssistantName } from '../../container-runner.js';
 import { readContainerConfig, type ContainerConfig } from '../../container-config.js';
 import { readClaims, type BoardClaim } from '../../claims-board.js';
+import { workgroupLegacyRoot } from '../../repository-activation.js';
 import { log } from '../../log.js';
 import type { AgentGroup } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
@@ -250,6 +251,17 @@ export function decorateSteeredThreads(
   };
 }
 
+/**
+ * One room's live-state indicator. `active` is always stated: a bound room that
+ * is quiet is a different fact from a room nobody bound, and the UI must be
+ * able to tell them apart without inferring anything.
+ */
+export interface ObservatorySignal {
+  room: string;
+  vignette: string;
+  active: boolean;
+}
+
 export interface ObservatoryScene {
   workgroupId: string;
   asOf: string;
@@ -259,6 +271,8 @@ export interface ObservatoryScene {
   claims: ObservatoryClaim[];
   /** Themed-floor slot bindings — see readOfficeThemes. Undefined = no themes configured. */
   themedSlots?: Record<string, string>;
+  /** Per-room live-state indicators — see readWorkgroupSignals. Undefined = no signals configured. */
+  signals?: ObservatorySignal[];
 }
 
 function emptyScene(workgroupId: string): ObservatoryScene {
@@ -299,6 +313,163 @@ export function readOfficeThemes(repoRoot: string = REPO_ROOT): Record<string, s
     }
     return undefined;
   }
+}
+
+let signalConfigWarned = false;
+
+/** Clock skew a producer's timestamp is allowed to be ahead by. */
+const SIGNAL_FUTURE_SKEW_MS = 60_000;
+
+/** The closed entry schema. An entry carrying anything else is not this shape. */
+const SIGNAL_KEYS = new Set(['room', 'file', 'freshKey', 'maxAgeSeconds', 'vignette']);
+const SIGNAL_VIGNETTES = new Set(['smoke']);
+
+interface SignalBinding {
+  room: string;
+  file: string;
+  freshKey: string;
+  maxAgeSeconds: number;
+  vignette: string;
+}
+
+/**
+ * A binding entry, or null if it is not one. CLOSED on purpose: a key this
+ * doesn't know is a config written against a contract this build does not
+ * implement, and quietly ignoring it would render a room's state from a rule
+ * nobody applied.
+ */
+function parseSignalBinding(raw: unknown): SignalBinding | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  for (const k of Object.keys(o)) if (!SIGNAL_KEYS.has(k)) return null;
+  const { room, file, freshKey, maxAgeSeconds, vignette } = o;
+  if (typeof room !== 'string' || room.length === 0) return null;
+  if (typeof file !== 'string' || file.length === 0) return null;
+  if (typeof freshKey !== 'string' || freshKey.length === 0) return null;
+  if (typeof maxAgeSeconds !== 'number' || !Number.isInteger(maxAgeSeconds) || maxAgeSeconds <= 0) return null;
+  if (typeof vignette !== 'string' || !SIGNAL_VIGNETTES.has(vignette)) return null;
+  return { room, file, freshKey, maxAgeSeconds, vignette };
+}
+
+/**
+ * The state file this binding names, resolved inside the workgroup directory —
+ * or null if it escapes.
+ *
+ * REALPATH, not string prefixing: `..` and an absolute path are the obvious
+ * escapes, but a symlink planted inside the workgroup directory pointing at
+ * `/etc` passes every textual check. The parent is resolved rather than the
+ * file itself because the file legitimately may not exist yet (a campaign that
+ * has never run), and an absent file is inactive, not rejected.
+ */
+function containedStatePath(workgroupDir: string, file: string): string | null {
+  if (path.isAbsolute(file)) return null;
+  const target = path.resolve(workgroupDir, file);
+  const rel = path.relative(workgroupDir, target);
+  if (rel.startsWith('..') || path.isAbsolute(rel) || rel.length === 0) return null;
+  try {
+    const realRoot = fs.realpathSync(workgroupDir);
+    const realParent = fs.realpathSync(path.dirname(target));
+    const realRel = path.relative(realRoot, realParent);
+    if (realRel.startsWith('..') || path.isAbsolute(realRel)) return null;
+    return path.join(realParent, path.basename(target));
+  } catch {
+    // The workgroup dir (or the file's directory) does not exist. Nothing can
+    // escape a directory that isn't there, and the read below will simply
+    // report the signal inactive.
+    return target;
+  }
+}
+
+/** Whether the producer's own freshness stamp says this signal is live NOW. */
+function signalIsFresh(statePath: string, freshKey: string, maxAgeSeconds: number, now: number): boolean {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  } catch {
+    // Absent, unreadable, or not JSON. All three mean "not running", which is
+    // the honest reading of a liveness marker that isn't there.
+    return false;
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const stamp = (raw as Record<string, unknown>)[freshKey];
+  if (typeof stamp !== 'string') return false;
+  const at = Date.parse(stamp);
+  if (!Number.isFinite(at)) return false;
+  // Open at the old end, closed at the new: exactly at the age limit the
+  // producer itself calls stale, so does this. A stamp in the future is a clock
+  // that disagrees, tolerated only as far as the skew window.
+  return at > now - maxAgeSeconds * 1000 && at <= now + SIGNAL_FUTURE_SKEW_MS;
+}
+
+/**
+ * Per-room live-state indicators, install config only.
+ *
+ * A room name and the file a producer writes are both install identity, which
+ * `check:public-boundary` rightly refuses to let live in trunk source — so the
+ * binding is the operator's own untracked `.nanoclaw/office-signals.json`,
+ * resolved the same repo-root-relative way `readOfficeThemes` resolves its own.
+ *
+ * The contract is TOTAL, and every branch of it matters:
+ *
+ * - no config file, unreadable, malformed JSON, or not an array → `undefined`,
+ *   and the scene ships without a `signals` key at all — byte-identical to
+ *   before this existed;
+ * - an entry that fails the closed schema is dropped, the rest still render;
+ * - a duplicate `room` is dropped, first binding wins;
+ * - a `file` that escapes the workgroup directory by any route — absolute,
+ *   `..`, or a symlink — drops the ENTRY rather than reading it;
+ * - every surviving entry ALWAYS emits `{room, vignette, active}`. A missing,
+ *   unreadable, or unparseable state file is `active: false`, never a throw and
+ *   never a dropped entry: a bound room that is quiet is a fact, and it is a
+ *   different fact from a room nobody bound.
+ */
+export function readWorkgroupSignals(
+  workgroupId: string,
+  now = Date.now(),
+  repoRoot: string = REPO_ROOT,
+  dataDir: string = DATA_DIR,
+): ObservatorySignal[] | undefined {
+  const configFile = path.join(repoRoot, '.nanoclaw', 'office-signals.json');
+  let raw: unknown;
+  try {
+    raw = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+  } catch (err) {
+    if (!signalConfigWarned) {
+      signalConfigWarned = true;
+      const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
+      log[missing ? 'debug' : 'warn']('observatory: .nanoclaw/office-signals.json unreadable, room signals disabled', {
+        file: configFile,
+        err,
+      });
+    }
+    return undefined;
+  }
+  if (!Array.isArray(raw)) return undefined;
+
+  let workgroupDir: string;
+  try {
+    workgroupDir = workgroupLegacyRoot(workgroupId, dataDir);
+  } catch {
+    // An id that is not a single safe path segment never reaches a real
+    // workgroup directory, so there is nothing to read for it.
+    return undefined;
+  }
+
+  const out: ObservatorySignal[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    const binding = parseSignalBinding(entry);
+    if (!binding || seen.has(binding.room)) continue;
+    const statePath = containedStatePath(workgroupDir, binding.file);
+    if (statePath === null) continue;
+    seen.add(binding.room);
+    out.push({
+      room: binding.room,
+      vignette: binding.vignette,
+      active: signalIsFresh(statePath, binding.freshKey, binding.maxAgeSeconds, now),
+    });
+  }
+  return out;
 }
 
 /**
@@ -760,6 +931,8 @@ export interface ObservatoryDeps {
   hiddenRooms?: string[];
   /** Themed-floor slot bindings, injected for tests; defaults to the live readOfficeThemes(). */
   themedSlots?: Record<string, string>;
+  /** Room signals, injected for tests; defaults to the live readWorkgroupSignals(). */
+  signals?: ObservatorySignal[] | undefined;
 }
 
 const defaultDeps: ObservatoryDeps = { getActiveContainerSessionIds, resolveAssistantName };
@@ -803,6 +976,7 @@ export async function buildObservatoryScene(
       linkFor,
     ),
     themedSlots: deps.themedSlots !== undefined ? deps.themedSlots : readOfficeThemes(),
+    signals: 'signals' in deps ? deps.signals : readWorkgroupSignals(workgroupId),
   };
 }
 

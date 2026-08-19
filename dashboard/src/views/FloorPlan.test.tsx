@@ -256,3 +256,69 @@ describe('RoomStrip', () => {
     for (const chip of chips) expect(chip.className).toContain('tm-tap');
   });
 });
+
+describe('the vignette, under reduced motion', () => {
+  /**
+   * R6's rule, and the one thing about this component that is easy to get
+   * backwards: the smoke is INFORMATION and the drift is only its
+   * presentation. Under `reduce` the wisps must stay exactly where they are —
+   * removing them would delete a fact from the screen to honour a preference
+   * about movement.
+   *
+   * jsdom applies no stylesheet, so the media query itself cannot be asserted
+   * here; what is asserted is that the component takes no part in the decision
+   * (it renders the same DOM either way), which is what makes the CSS the
+   * single place the rule lives. The resolved `animation-name: none` is
+   * measured for real in the browser gate.
+   */
+  const withMotionPreference = (reduce: boolean) => {
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: reduce && query.includes('prefers-reduced-motion'),
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+  };
+
+  const draw = (vignettes: Set<string>) => {
+    const { rooms, agents } = floor(3);
+    return render(
+      <FloorPlan
+        data={buildOfficeData(rooms, agents, [], {}, NOW)}
+        selected=""
+        onSelect={noop}
+        onAgentSelect={noop}
+        alertRooms={new Set()}
+        vignettes={vignettes}
+      />,
+    );
+  };
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('keeps an ACTIVE vignette present, with all three wisps, when motion is reduced', () => {
+    withMotionPreference(true);
+    const { container } = draw(new Set(['r2']));
+    const vignette = container.querySelector('[data-room="r2"] [data-vignette="smoke"]')!;
+    expect(vignette).toBeTruthy();
+    expect(vignette.querySelectorAll('.tm-smoke-wisp')).toHaveLength(3);
+    // No JS-side motion gate: the wisps carry exactly the class the stylesheet
+    // keys its `prefers-reduced-motion: no-preference` animation off, so the
+    // preference is honoured in CSS and nowhere else.
+    expect(container.querySelector('.tm-smoke-wisp')!.getAttribute('class')).toBe('tm-smoke-wisp');
+  });
+
+  it('draws nothing at all in an INACTIVE room, reduced motion or not', () => {
+    for (const reduce of [true, false]) {
+      withMotionPreference(reduce);
+      const { container, unmount } = draw(new Set());
+      expect(container.querySelectorAll('[data-vignette="smoke"]')).toHaveLength(0);
+      expect(container.querySelectorAll('.tm-smoke-wisp')).toHaveLength(0);
+      unmount();
+    }
+  });
+});

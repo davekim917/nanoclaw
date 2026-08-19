@@ -383,6 +383,13 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
     () => new Set(exceptions.map((e) => e.roomKey).filter((k): k is string => typeof k === 'string')),
     [exceptions],
   );
+  // A vignette is drawn iff its room's bound signal is live RIGHT NOW. An
+  // inactive signal draws nothing at all — the absence is the information — and
+  // a room key nothing on this floor matches is simply never looked up.
+  const activeVignettes = useMemo(
+    () => new Set((snapshot?.signals ?? []).filter((s) => s.active).map((s) => s.room)),
+    [snapshot?.signals],
+  );
 
   // The shell's four destinations. Three are bands of this page (it is one long
   // page on a phone, and jumping to a band is what a tab bar is for); the
@@ -621,6 +628,7 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
                           onSelect={pickRoom}
                           onAgentSelect={selectAgentInRoom}
                           alertRooms={alertRooms}
+                          vignettes={activeVignettes}
                         />
                         {officeData.overflowRooms.length > 0 && (
                           // The plan has eleven zones and this floor has more
