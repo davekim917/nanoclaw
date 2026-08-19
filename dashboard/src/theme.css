@@ -440,6 +440,207 @@
   .tm-avatar-dot.waiting { background: var(--sev-decision); }
   .tm-avatar-dot.idle { background: var(--muted-foreground); }
 
+  /* ── Floor plan ────────────────────────────────────────────────────────── */
+  .tm-floorplan {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--card);
+  }
+  .tm-blueprint-line {
+    stroke: var(--border);
+    stroke-width: 1;
+    opacity: 0.08;
+  }
+  .tm-floor-building {
+    fill: var(--card);
+    stroke: var(--foreground);
+    stroke-width: 3;
+  }
+  .tm-floor-corridor {
+    stroke: var(--border-soft);
+    stroke-width: 1.5;
+    stroke-dasharray: 5 5;
+  }
+  .tm-zone-shell {
+    fill: var(--card);
+    stroke: var(--border);
+    stroke-width: 2;
+  }
+  /* A zone the floor has nothing to put in stays drawn — the plan must not
+     reshuffle because a channel went quiet. */
+  .tm-zone.is-vacant .tm-zone-shell {
+    fill: none;
+    stroke-dasharray: 4 6;
+    opacity: 0.55;
+  }
+  .tm-zone[data-alert='true'] .tm-zone-shell {
+    stroke: var(--accent);
+    stroke-width: 3;
+  }
+  .tm-zone.is-selected .tm-zone-shell {
+    fill: var(--accent-soft);
+  }
+  .tm-zone[role='button'] {
+    cursor: pointer;
+  }
+  .tm-zone:focus-visible {
+    outline: 2px solid var(--accent);
+  }
+  .tm-zone-label {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    fill: var(--foreground);
+  }
+  .tm-zone-empty {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 1px;
+    fill: var(--muted-foreground);
+  }
+  .tm-zone-chip {
+    cursor: pointer;
+  }
+  .tm-zone-chip-mark {
+    fill: var(--muted);
+    stroke: var(--border-soft);
+    stroke-width: 1;
+  }
+  .tm-zone-chip-initial {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 700;
+    fill: var(--muted-foreground);
+  }
+  .tm-zone-dot {
+    stroke: var(--card);
+    stroke-width: 2;
+  }
+  .tm-zone-dot.working { fill: var(--sev-working); }
+  .tm-zone-dot.blocked { fill: var(--sev-hands); }
+  .tm-zone-dot.waiting { fill: var(--sev-decision); }
+  .tm-zone-dot.idle { fill: var(--muted-foreground); }
+
+  /* The vignette: present iff the room's signal is live. */
+  .tm-vignette-body,
+  .tm-vignette-stack {
+    fill: var(--card);
+    stroke: var(--fg-2);
+    stroke-width: 1.5;
+  }
+  .tm-vignette-seam {
+    stroke: var(--fg-2);
+    stroke-width: 1;
+  }
+  .tm-smoke-wisp {
+    fill: none;
+    stroke: var(--muted-foreground);
+    stroke-width: 2;
+    stroke-linecap: round;
+    /* Never fully transparent: a single-frame capture must show real smoke,
+       not catch the cycle at zero. */
+    opacity: 0.3;
+  }
+  /* Motion is presentation; the smoke itself is information. Under `reduce`
+     the wisps stay exactly where they are and stop drifting. */
+  @media (prefers-reduced-motion: no-preference) {
+    .tm-smoke-wisp {
+      animation: tm-smoke-drift 3s ease-in-out infinite;
+      transform-box: fill-box;
+      transform-origin: bottom center;
+    }
+    .tm-smoke-wisp:nth-of-type(2) { animation-delay: -1s; }
+    .tm-smoke-wisp:nth-of-type(3) { animation-delay: -2s; }
+  }
+  @keyframes tm-smoke-drift {
+    0% { opacity: 0.22; transform: translateY(4px); }
+    50% { opacity: 0.5; transform: translateY(-8px); }
+    100% { opacity: 0.22; transform: translateY(4px); }
+  }
+
+  /* Rooms the eleven zones have no place for. Listed, never dropped. */
+  .tm-overflow {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .tm-overflow ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  /* ── Room strip (phone) ────────────────────────────────────────────────── */
+  .tm-strip {
+    display: flex;
+    gap: 10px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    -webkit-overflow-scrolling: touch;
+  }
+  .tm-room {
+    flex: 0 0 auto;
+    width: 148px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    box-shadow: var(--tm-shadow-soft);
+    cursor: pointer;
+  }
+  .tm-room[data-alert='true'] {
+    border-color: var(--accent);
+  }
+  .tm-room.is-selected {
+    background: var(--accent-soft);
+  }
+  .tm-room:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .tm-room-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--foreground);
+  }
+  .tm-room-avatars {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .tm-room-occupant {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+  }
+  .tm-room-occupant:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .tm-room-empty {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+  }
+
   /* ── Fleet ─────────────────────────────────────────────────────────────── */
   .tm-fleet {
     padding: 24px 16px;

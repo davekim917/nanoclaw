@@ -33,8 +33,10 @@ import {
 } from '../lib/api.js';
 import { TranscriptList, normalizeSessionEntry } from './TranscriptList.js';
 import { OfficeMap } from './OfficeMap.js';
-import { buildOfficeData, agentState, faceSrc, type OfficeRoomData, type OfficeOverflowRoom } from './office-data.js';
+import { buildOfficeData, agentState } from './office-data.js';
 import { AgentAvatar } from './AgentAvatar.js';
+import { FloorPlan } from './FloorPlan.js';
+import { RoomStrip } from './RoomStrip.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
 
 
@@ -73,9 +75,12 @@ const POLL_MS = 15_000;
 /** Whether the floor is unfolded. Absent means expanded — the default view. */
 const MAP_OPEN_KEY = 'nc-obs-map-open';
 
-/** Tiles or Map. Tiles is the default — the map is more fun than functional
- *  right now (too busy, rooms too big), and that gets fixed on its own time;
- *  tiles is the reading that was there before the map. */
+/** Plan or Map. The schematic plan is the floor now — outlined zones on a
+ *  blueprint grid, findable twice, glanceable at a fixed scale. `map` is the
+ *  legacy pixel renderer, still reachable and still unmounted unless it is
+ *  explicitly picked; it goes away with its own commit once the visual gate has
+ *  passed on the plan. A stored `tiles` (the renderer the plan replaced) falls
+ *  through to `plan`, which is what it was showing anyway. */
 const OBS_VIEW_KEY = 'nc-obs-view';
 
 /** Map zoom: persisted like the fold state, same reasoning — an operator who
@@ -165,11 +170,11 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
   useEffect(() => {
     localStorage.setItem(MAP_OPEN_KEY, String(mapOpen));
   }, [mapOpen]);
-  // Tiles is the default for a fresh browser; only an explicit 'map' switches
-  // it. The map stays unmounted while tiles is showing — it builds a large
-  // SVG, and a hidden-but-mounted map is not free.
-  const [obsView, setObsView] = useState<'tiles' | 'map'>(() =>
-    localStorage.getItem(OBS_VIEW_KEY) === 'map' ? 'map' : 'tiles',
+  // The plan is the default for a fresh browser; only an explicit 'map'
+  // switches it. The legacy map stays unmounted while the plan is showing — it
+  // builds a large SVG, and a hidden-but-mounted map is not free.
+  const [obsView, setObsView] = useState<'plan' | 'map'>(() =>
+    localStorage.getItem(OBS_VIEW_KEY) === 'map' ? 'map' : 'plan',
   );
   useEffect(() => {
     localStorage.setItem(OBS_VIEW_KEY, obsView);
@@ -371,6 +376,13 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
   // — a room is outlined only if the feed above it says something is wrong in
   // there, and the two must never be derived twice.
   const exceptions = useMemo(() => (snapshot ? deriveExceptions(snapshot) : []), [snapshot]);
+  // A room is outlined only because the feed above it says something is wrong
+  // in there. Exceptions the wire could not attribute to a room carry no key
+  // and so accent nothing — a guessed room would be worse than none.
+  const alertRooms = useMemo(
+    () => new Set(exceptions.map((e) => e.roomKey).filter((k): k is string => typeof k === 'string')),
+    [exceptions],
+  );
 
   // The shell's four destinations. Three are bands of this page (it is one long
   // page on a phone, and jumping to a band is what a tab bar is for); the
@@ -514,19 +526,19 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
                       stranding it alone; grouping them lets the whole cluster
                       wrap together on a narrow header. */}
                   <div className="nc-of-mapcard-actions">
-                    {/* obs.C.35 — Tiles is the pre-map reading and stays the
-                        default; Map is more fun than functional right now
-                        (too busy, rooms too big) and is being left alone on
-                        purpose while that gets fixed separately. */}
+                    {/* The schematic plan is the floor; Map is the legacy pixel
+                        renderer, kept reachable only until the visual gate has
+                        passed on the plan — it and this chip go together in
+                        their own commit. */}
                     <div className="nc-of-viewtoggle" role="group" aria-label="Floor view">
                       <button
                         type="button"
-                        className={`nc-of-chip ${obsView === 'tiles' ? 'on' : ''}`}
-                        data-obs-view="tiles"
-                        aria-pressed={obsView === 'tiles'}
-                        onClick={() => setObsView('tiles')}
+                        className={`nc-of-chip ${obsView === 'plan' ? 'on' : ''}`}
+                        data-obs-view="plan"
+                        aria-pressed={obsView === 'plan'}
+                        onClick={() => setObsView('plan')}
                       >
-                        Tiles
+                        Plan
                       </button>
                       <button
                         type="button"
@@ -587,14 +599,60 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
                     </button>
                   </div>
                 </div>
-                {mapOpen && obsView === 'tiles' && (
-                  <OfficeTiles
-                    rooms={officeData.rooms}
-                    overflowRooms={officeData.overflowRooms}
-                    selected={selectedRoom}
-                    onSelect={pickRoom}
-                    onAgentSelect={selectAgentInRoom}
-                  />
+                {mapOpen && obsView === 'plan' && (
+                  <>
+                    {/* One floor, two presentations. A phone gets the strip —
+                        a fixed eleven-zone plan is unreadable at 390px — and
+                        every room is in it, overflow included, so no channel
+                        is reachable on one form factor and not the other. */}
+                    {isMobile ? (
+                      <RoomStrip
+                        data={officeData}
+                        selected={selectedRoom}
+                        onSelect={pickRoom}
+                        onAgentSelect={selectAgentInRoom}
+                        alertRooms={alertRooms}
+                      />
+                    ) : (
+                      <>
+                        <FloorPlan
+                          data={officeData}
+                          selected={selectedRoom}
+                          onSelect={pickRoom}
+                          onAgentSelect={selectAgentInRoom}
+                          alertRooms={alertRooms}
+                        />
+                        {officeData.overflowRooms.length > 0 && (
+                          // The plan has eleven zones and this floor has more
+                          // channels than that. They are listed beside it
+                          // rather than dropped — a room with no zone is still
+                          // a room you can pick.
+                          <div className="tm-overflow" data-testid="overflow-list">
+                            <span className="tm-eyebrow">
+                              {officeData.overflowRooms.length} more{' '}
+                              {officeData.overflowRooms.length === 1 ? 'channel has' : 'channels have'} no zone on
+                              this floor
+                            </span>
+                            <ul>
+                              {officeData.overflowRooms.map((r) => (
+                                <li key={r.key}>
+                                  <button
+                                    type="button"
+                                    className={`nc-of-chip tm-tap ${selectedRoom === r.key ? 'on' : ''}`}
+                                    data-overflow-room={r.key}
+                                    onClick={() => pickRoom(r.key)}
+                                  >
+                                    <i className={`nc-of-sd ${r.state}`} />
+                                    {r.label}
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </>
                 )}
                 {mapOpen && obsView === 'map' && (
                   <>
@@ -1395,107 +1453,6 @@ function FleetList({
         </ul>
       )}
     </section>
-  );
-}
-
-/**
- * The office as channel cards — the pre-map reading, kept as a full sibling
- * rather than folded away behind "too busy". No SVG, no pan: a
- * responsive grid, one card per channel, real Slack avatars lighting up for
- * whoever is actually working right now and desaturated + "z z" for everyone
- * else — same read the map gives, without the illustration.
- *
- * Takes BOTH `rooms` (slotted, what the map can show) and `overflowRooms`
- * (channels the floor's 11 slots have no room for) — tiles have no fixed plan
- * to run out of, so a channel that never gets a room on the map still gets a
- * card here. Both arrays are already fully seated by office-data.ts's one
- * seating rule; this component only renders what it is handed.
- */
-function OfficeTiles({
-  rooms,
-  overflowRooms,
-  selected,
-  onSelect,
-  onAgentSelect,
-}: {
-  rooms: OfficeRoomData[];
-  overflowRooms: OfficeOverflowRoom[];
-  selected: string;
-  onSelect: (key: string) => void;
-  onAgentSelect: (name: string, roomKey: string) => void;
-}) {
-  // A slotted room is selected/teleported-to by its SLOT (what the map uses);
-  // an overflow room has none, so it is selected by its own key instead. Both
-  // are just "the room's tile key" from here down.
-  const cards = [
-    ...rooms.map((r) => ({ ...r, tileKey: r.slot as string })),
-    ...overflowRooms.map((r) => ({ ...r, tileKey: r.key })),
-  ];
-  return (
-    <div className="nc-of-roomgrid">
-      {cards.map((r) => (
-        <div
-          key={r.key}
-          className={`nc-of-roomcard ${r.state} ${selected === r.tileKey ? 'on' : ''}`}
-          role="button"
-          tabIndex={0}
-          onClick={() => onSelect(r.tileKey)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              onSelect(r.tileKey);
-            }
-          }}
-        >
-          <div className="nc-of-roomcard-head">
-            <i className={`nc-of-sd ${r.state}`} />
-            <span className="nc-of-roomcard-name">{r.label}</span>
-            {r.open > 0 && <span className="nc-of-roomcard-n">{r.open}</span>}
-          </div>
-          <div className="nc-of-roomcard-agents">
-            {r.agents.length === 0 ? (
-              <span className="nc-of-roomcard-empty">nobody wired here</span>
-            ) : (
-              r.agents.map((a) => {
-                const src = faceSrc(a.avatarUrl);
-                const lit = a.status === 'working';
-                return (
-                  <button
-                    key={a.name}
-                    type="button"
-                    className={`nc-of-facechip ${a.status}`}
-                    // The chip nests inside the tile's own click target; stop
-                    // the click there so picking a person does not also pick
-                    // the room out from under it.
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onAgentSelect(a.name, r.key);
-                    }}
-                    title={a.name}
-                  >
-                    {src ? (
-                      <img
-                        className={`nc-of-facechip-face ${lit ? '' : 'i'}`}
-                        src={src}
-                        alt=""
-                        width={20}
-                        height={20}
-                      />
-                    ) : (
-                      <span className="nc-of-facechip-face nc-of-facechip-fallback">
-                        {a.name.charAt(0).toUpperCase()}
-                      </span>
-                    )}
-                    <span className="nc-of-facechip-name">{a.name}</span>
-                    {lit ? <i className="nc-of-facechip-pulse" /> : <span className="nc-of-facechip-z">z z</span>}
-                  </button>
-                );
-              })
-            )}
-          </div>
-        </div>
-      ))}
-    </div>
   );
 }
 

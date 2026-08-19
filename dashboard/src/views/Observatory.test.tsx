@@ -303,14 +303,14 @@ describe('Observatory', () => {
         }),
       );
 
-    it('opens on the overview: the office (tiles by default), the headline, and the queue', () => {
+    it('opens on the overview: the office (the plan by default), the headline, and the queue', () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       expect(container.querySelector('.nc-of-seg-btn[data-view="overview"]')!.getAttribute('aria-pressed')).toBe('true');
       expect(container.querySelector('.nc-of-head')).toBeTruthy();
-      // Tiles, not the map — obs.C.35: Tiles is the default, and the map stays
-      // unmounted (not just hidden) while it isn't the active view.
-      expect(container.querySelector('.nc-of-roomgrid')).toBeTruthy();
+      // The plan, not the map: the schematic floor is the default, and the
+      // legacy map stays unmounted (not just hidden) while it isn't active.
+      expect(container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
       expect(container.querySelector('office-map')).toBeFalsy();
       expect(container.querySelector('[data-section="queue"]')).toBeTruthy();
       expect(container.querySelector('[data-section="board"]')).toBeFalsy();
@@ -334,7 +334,7 @@ describe('Observatory', () => {
       full();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       await segment(container, 'board');
-      expect(container.querySelector('.nc-of-roomgrid')).toBeFalsy();
+      expect(container.querySelector('[data-testid="floor-plan"]')).toBeFalsy();
       expect(container.querySelector('.nc-of-mapcard')).toBeFalsy();
       expect(container.querySelector('.nc-of-head')).toBeFalsy();
       expect(container.querySelector('[data-section="board"]')).toBeTruthy();
@@ -344,7 +344,7 @@ describe('Observatory', () => {
       expect(container.querySelector('.nc-of-head')).toBeFalsy();
 
       await segment(container, 'overview');
-      expect(container.querySelector('.nc-of-roomgrid')).toBeTruthy();
+      expect(container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
       expect(container.querySelector('.nc-of-head')).toBeTruthy();
     });
 
@@ -377,23 +377,23 @@ describe('Observatory', () => {
       expect(fold(first.container).textContent).toBe('hide the floor');
 
       await userEvent.click(fold(first.container));
-      // Folding applies to whichever view is active — tiles by default here.
-      expect(first.container.querySelector('.nc-of-roomgrid')).toBeFalsy();
+      // Folding applies to whichever view is active — the plan by default here.
+      expect(first.container.querySelector('[data-testid="floor-plan"]')).toBeFalsy();
       // The card itself stays, so there is something left to click.
       expect(first.container.querySelector('.nc-of-mapcard')).toBeTruthy();
       expect(fold(first.container).textContent).toBe('show the floor');
       first.unmount();
 
       const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(second.container.querySelector('.nc-of-roomgrid')).toBeFalsy();
+      expect(second.container.querySelector('[data-testid="floor-plan"]')).toBeFalsy();
       await userEvent.click(fold(second.container));
-      expect(second.container.querySelector('.nc-of-roomgrid')).toBeTruthy();
+      expect(second.container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
       second.unmount();
 
       // Expanded is the default a fresh browser gets.
       localStorage.clear();
       const third = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(third.container.querySelector('.nc-of-roomgrid')).toBeTruthy();
+      expect(third.container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
     });
 
     it('folding the map away hides its teleport chips too — chips that teleport a map nobody can see are controls for nothing', async () => {
@@ -491,11 +491,11 @@ describe('Observatory', () => {
     });
   });
 
-  describe('the tile view (obs.C.35)', () => {
+  describe('the floor (the schematic plan)', () => {
     // One slotted room ('#dispatch', with an active and an idle agent) plus
-    // enough filler rooms to run the floor's 11 slots out, plus one more
-    // channel ('#lounge') that lands in overflow — tiles have no fixed plan,
-    // so it still needs to show up somewhere.
+    // enough filler rooms to run the floor's 11 zones out, plus one more
+    // channel ('#lounge') that lands in overflow — every room stays reachable,
+    // so it still has to show up somewhere.
     const tilesFixture = () =>
       mockData(
         snapshot({
@@ -523,8 +523,8 @@ describe('Observatory', () => {
       localStorage.clear();
       tilesFixture();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelector('[data-obs-view="tiles"]')!.getAttribute('aria-pressed')).toBe('true');
-      expect(container.querySelector('.nc-of-roomgrid')).toBeTruthy();
+      expect(container.querySelector('[data-obs-view="plan"]')!.getAttribute('aria-pressed')).toBe('true');
+      expect(container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
       expect(container.querySelector('office-map')).toBeFalsy();
     });
 
@@ -533,7 +533,7 @@ describe('Observatory', () => {
       const first = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
       await toMap(first.container);
       expect(first.container.querySelector('office-map')).toBeTruthy();
-      expect(first.container.querySelector('.nc-of-roomgrid')).toBeFalsy();
+      expect(first.container.querySelector('[data-testid="floor-plan"]')).toBeFalsy();
       first.unmount();
 
       const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
@@ -543,71 +543,62 @@ describe('Observatory', () => {
 
       localStorage.clear();
       const third = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(third.container.querySelector('.nc-of-roomgrid')).toBeTruthy();
+      expect(third.container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
     });
 
-    it('renders a channel the map has no slot left for as a tile too', () => {
+    it('renders a channel the plan has no zone left for beside it, rather than dropping it', () => {
       localStorage.clear();
       tilesFixture();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const names = Array.from(container.querySelectorAll('.nc-of-roomcard-name')).map((n) => n.textContent);
-      expect(names).toContain('#dispatch');
-      expect(names).toContain('#lounge');
+      const zoned = Array.from(container.querySelectorAll('.tm-zone-label')).map((n) => n.textContent);
+      expect(zoned).toContain('DISPATCH');
+      const overflow = Array.from(container.querySelectorAll('[data-overflow-room]')).map((n) => n.textContent);
+      expect(overflow).toContain('#lounge');
     });
 
-    it('clicking a tile selects the room — the sections below filter identically to a map click, even for an overflow channel', async () => {
+    it('clicking a room selects it — the sections below filter identically to a map click, even for an overflow channel', async () => {
       localStorage.clear();
       tilesFixture();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const tileFor = (name: string) =>
-        Array.from(container.querySelectorAll('.nc-of-roomcard')).find(
-          (t) => t.querySelector('.nc-of-roomcard-name')!.textContent === name,
-        )! as HTMLElement;
 
-      await userEvent.click(tileFor('#dispatch'));
-      expect(tileFor('#dispatch').className).toContain('on');
+      await userEvent.click(container.querySelector('[data-room="r0"]')! as unknown as Element);
+      expect(container.querySelector('[data-room="r0"]')!.getAttribute('class')).toContain('is-selected');
       expect(container.querySelector('.nc-of-sheet-title')!.textContent).toBe('#dispatch');
 
       // Picking the overflow channel works the same way — this is the gap a
       // slot-only selection scheme would have left.
-      await userEvent.click(tileFor('#lounge'));
+      await userEvent.click(container.querySelector('[data-overflow-room="lounge"]')!);
       expect(container.querySelector('.nc-of-sheet-title')!.textContent).toBe('#lounge');
     });
 
-    it('clicking an avatar chip opens that agent’s drawer, without also selecting the room', async () => {
+    it('clicking an occupant opens that agent’s drawer, without also selecting the room', async () => {
       localStorage.clear();
       tilesFixture();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const chip = Array.from(container.querySelectorAll('.nc-of-facechip')).find(
-        (c) => c.querySelector('.nc-of-facechip-name')!.textContent === 'ava',
-      )! as HTMLElement;
-      await userEvent.click(chip);
+      await userEvent.click(container.querySelector('[data-occupant="ava"]')!);
       expect(container.querySelector('[data-testid="agent-drawer"]')).toBeTruthy();
       expect(container.querySelector('.nc-of-sheet-title')).toBeFalsy();
     });
 
-    it('an active agent renders lit and full colour; everyone else gets the z z affordance and a desaturated face', () => {
+    it('marks who is working and who is not, and invents no face for an agent that has none', () => {
       localStorage.clear();
       tilesFixture();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      const chipFor = (name: string) =>
-        Array.from(container.querySelectorAll('.nc-of-facechip')).find(
-          (c) => c.querySelector('.nc-of-facechip-name')!.textContent === name,
-        )!;
+      const chipFor = (name: string) => container.querySelector(`[data-occupant="${name}"]`)!;
 
+      // ava is seated here and active, so she is working — and she has a real
+      // platform avatar, which renders as an image and not as a letter.
       const ava = chipFor('ava');
-      expect(ava.className).toContain('working');
-      expect(ava.querySelector('.nc-of-facechip-pulse')).toBeTruthy();
-      expect(ava.querySelector('.nc-of-facechip-z')).toBeFalsy();
-      expect(ava.querySelector('.nc-of-facechip-face')!.className.trim().split(/\s+/)).not.toContain('i');
+      expect(ava.querySelector('.tm-zone-dot')!.getAttribute('class')).toContain('working');
+      expect(ava.querySelector('image')!.getAttribute('href')).toBe('https://cdn.example/ava_48.png');
+      expect(ava.querySelector('.tm-zone-chip-initial')).toBeFalsy();
 
+      // kit is not working here, and has no avatarUrl — so it falls back to
+      // its initial rather than to an invented face.
       const kit = chipFor('kit');
-      expect(kit.className).toContain('idle');
-      expect(kit.querySelector('.nc-of-facechip-z')!.textContent).toBe('z z');
-      expect(kit.querySelector('.nc-of-facechip-pulse')).toBeFalsy();
-      // kit has no avatarUrl, so it falls back to its initial rather than an
-      // invented face — but it is still visibly desaturated-treated.
-      expect(kit.querySelector('.nc-of-facechip-fallback')!.textContent).toBe('K');
+      expect(kit.querySelector('.tm-zone-dot')!.getAttribute('class')).toContain('idle');
+      expect(kit.querySelector('image')).toBeFalsy();
+      expect(kit.querySelector('.tm-zone-chip-initial')!.textContent).toBe('K');
     });
   });
 
