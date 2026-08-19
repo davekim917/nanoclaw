@@ -26,3 +26,38 @@ export function consolidatedFactIds(workgroupId: string): Set<string> {
     .all(workgroupId) as Array<{ fact_id: string }>;
   return new Set(rows.map((row) => row.fact_id));
 }
+
+/**
+ * Drops every consolidated-fact row for `workgroupId` whose id is no longer
+ * in the live ledger (supersession removed the line, so its old marker id
+ * will never appear again). Without this, an A→B→A revert — B superseding A,
+ * then a later fact reintroducing A's exact text — gets a NEW marker id (the
+ * id is a content hash) that lands in the tail correctly, but a stale row
+ * for the OLD id just sits here forever; harmless for correctness, but it
+ * means this table only ever grows even though the ledger doesn't. Call at
+ * the start of every consolidation pass, before tail computation, so a
+ * pruned id is immediately tail-eligible again on the same pass. Side
+ * benefit: this keeps the table bounded by ledger size instead of by
+ * cumulative history.
+ *
+ * Uses a temp table rather than a parameterized `NOT IN (?,?,...)` list —
+ * `liveIds` can run to thousands of entries for a large store, well past a
+ * safe SQLite bound-parameter count.
+ */
+export function pruneConsolidatedFacts(workgroupId: string, liveIds: ReadonlySet<string>): void {
+  const db = getDb();
+  db.transaction(() => {
+    db.exec('CREATE TEMP TABLE _prune_live_ids (fact_id TEXT PRIMARY KEY)');
+    try {
+      const insert = db.prepare('INSERT INTO _prune_live_ids (fact_id) VALUES (?)');
+      for (const id of liveIds) insert.run(id);
+      db.prepare(
+        `DELETE FROM memory_consolidated_facts
+          WHERE workgroup_id = ?
+            AND fact_id NOT IN (SELECT fact_id FROM _prune_live_ids)`,
+      ).run(workgroupId);
+    } finally {
+      db.exec('DROP TABLE _prune_live_ids');
+    }
+  })();
+}

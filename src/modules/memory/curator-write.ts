@@ -132,14 +132,23 @@ export function readGeneratedMemory(workgroupId: string): { content: string; sha
   }
 }
 
-/** Read a topic file (people/domain/systems) for ownership and CAS checks. */
+/**
+ * Read a topic file (people/domain/systems) for ownership and CAS checks.
+ * `maxBytes` defaults to the generous generated-memory ceiling, NOT the
+ * consolidation input cap — the write path's CAS/ownership read must still
+ * be able to see enough of an oversized existing file to correctly REFUSE
+ * it (an over-cap file is locked, not simply invisible). The scanner passes
+ * CONSOLIDATION_INPUT_FILE_MAX_BYTES explicitly for the prompt-input read,
+ * where over-cap really does mean "exclude, do not read".
+ */
 export function readMemoryTopicFile(
   workgroupId: string,
   relativePath: string,
+  maxBytes?: number,
 ): { content: string; sha256: string | null } {
   const target = path.join(workgroupMemoryDir(workgroupId), relativePath);
   try {
-    const content = readTrustedBoundedFile(target, workgroupMemoryDir(workgroupId));
+    const content = readTrustedBoundedFile(target, workgroupMemoryDir(workgroupId), maxBytes);
     return { content, sha256: generatedMemorySha(content) };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { content: '', sha256: null };

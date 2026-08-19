@@ -13,12 +13,15 @@ vi.mock('../../config.js', async (importOriginal) => ({
   DATA_DIR: TEST_ROOT,
 }));
 
+import { closeDb, initTestDb, runMigrations } from '../../db/index.js';
+import { consolidatedFactIds, markFactsConsolidated } from '../../db/memory-consolidated-facts.js';
 import { log } from '../../log.js';
 import type { MemoryCurationArchiveRow, MemoryCurationEpisode } from '../../message-archive.js';
 import type { ConsolidationBackendResult, CuratorBackendResult } from './curator-backend.js';
 import {
   CONSOLIDATION_FILE_MAX_BYTES,
   CONSOLIDATION_HEADER_PATTERN,
+  CONSOLIDATION_INPUT_FILE_MAX_BYTES,
   CONSOLIDATION_MAX_FACTS,
   CURATOR_MAX_MEMORY_TEXT_CHARS,
   parseGeneratedMemoryFacts,
@@ -34,6 +37,7 @@ import {
   computeConsolidationTail,
   isMemoryCuratorEnabled,
   MemoryCuratorWorker,
+  scanTopicFiles,
   selectGeneratedMemoryForPrompt,
 } from './curator-worker.js';
 import type { MemoryCuratorWorkerDependencies } from './curator-worker.js';
@@ -157,6 +161,20 @@ function realConsolidationTail(consolidated: ReadonlySet<string> = new Set()) {
     computeConsolidationTail(
       parseGeneratedMemoryFacts(readGeneratedMemory(workgroupId).content),
       consolidated,
+      CONSOLIDATION_MAX_FACTS,
+    );
+}
+
+/** Same as realConsolidationTail, but reads the consolidated set from a REAL
+ *  central DB (via consolidatedFactIds) instead of an in-test stand-in —
+ *  matches actualDependencies() wiring minus the prune step, which has its
+ *  own dedicated test. Used where the AC cares whether rows actually land in
+ *  memory_consolidated_facts (F8), not just whether a mock was called. */
+function dbConsolidationTail() {
+  return (workgroupId: string) =>
+    computeConsolidationTail(
+      parseGeneratedMemoryFacts(readGeneratedMemory(workgroupId).content),
+      consolidatedFactIds(workgroupId),
       CONSOLIDATION_MAX_FACTS,
     );
 }
@@ -574,6 +592,18 @@ describe('memory curator worker', () => {
 // dependency-injected, matching how episode tests already mock the DB-backed
 // lease/admission machinery while exercising real content logic.
 describe('pillar-2 semantic consolidation', () => {
+  // F8: AC1, AC6, and AC7(b) below assert against a REAL central DB (the
+  // migration test's own pattern) rather than a markConsolidated spy, so a
+  // regression that writes files but never actually inserts the
+  // memory_consolidated_facts rows (or inserts the wrong ids) fails these
+  // tests even though a spy would have been satisfied by any call at all.
+  beforeEach(() => {
+    runMigrations(initTestDb());
+  });
+  afterEach(() => {
+    closeDb();
+  });
+
   it('maintenance creates topic directories on first run and consolidates the tail', async () => {
     seedLedger(
       [
@@ -587,8 +617,9 @@ describe('pillar-2 semantic consolidation', () => {
     );
     const d = deps({
       claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 3, leaseOwner: 'worker' }),
-      consolidationTail: realConsolidationTail(),
+      consolidationTail: dbConsolidationTail(),
       writeTopicFile: writeMemoryTopicFile,
+      markConsolidated: markFactsConsolidated,
       consolidate: vi.fn(
         async (_system, _user, credentialSlot): Promise<ConsolidationBackendResult> => ({
           decision: {
@@ -613,11 +644,9 @@ describe('pillar-2 semantic consolidation', () => {
     expect(readMemoryTopicFile(TEST_WORKGROUP, 'domain/acme-pricing.md').content.split('\n')[0]).toMatch(
       CONSOLIDATION_HEADER_PATTERN,
     );
-    expect(d.markConsolidated).toHaveBeenCalledWith(TEST_WORKGROUP, [
-      'mem_aaaaaaaaaaaaaaaa',
-      'mem_bbbbbbbbbbbbbbbb',
-      'mem_cccccccccccccccc',
-    ]);
+    expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(
+      new Set(['mem_aaaaaaaaaaaaaaaa', 'mem_bbbbbbbbbbbbbbbb', 'mem_cccccccccccccccc']),
+    );
   });
 
   it('consolidation input is scoped to the unconsolidated tail, owned files as writable, human-authored files as read-only context', async () => {
@@ -662,6 +691,10 @@ describe('pillar-2 semantic consolidation', () => {
     expect(capturedUser).toContain('Human-authored roster entry.');
     expect(capturedUser).toContain('"owned":true');
     expect(capturedUser).toContain('"owned":false');
+    // F6: capturedAt must actually reach the payload — the prompt instructs
+    // dating an unresolved conflict, which is only followable if a date is
+    // present to cite.
+    expect(capturedUser).toContain('2026-08-19T00:00:00.000Z');
   });
 
   // P2-AC4. Both halves: content alone under the cap is not sufficient proof
@@ -754,14 +787,13 @@ describe('pillar-2 semantic consolidation', () => {
         return writeMemoryTopicFile(workgroupId, relativePath, content, expectedSha256, factsCount);
       },
     );
-    const markConsolidated = vi.fn();
     const failMaintenance = vi.fn(() => true);
     const completeMaintenance = vi.fn(() => true);
     const d = deps({
       claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
-      consolidationTail: realConsolidationTail(),
+      consolidationTail: dbConsolidationTail(),
       writeTopicFile,
-      markConsolidated,
+      markConsolidated: markFactsConsolidated,
       failMaintenance,
       completeMaintenance,
       consolidate: vi.fn(
@@ -781,14 +813,14 @@ describe('pillar-2 semantic consolidation', () => {
     const report = await new MemoryCuratorWorker(d).runOne(1000);
     expect(report).toBeNull();
     expect(failMaintenance).toHaveBeenCalledOnce();
-    expect(markConsolidated).not.toHaveBeenCalled();
+    expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set());
     expect(completeMaintenance).not.toHaveBeenCalled();
     expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/one.md').content).toContain('First file.');
 
     let capturedUser = '';
     const retryDeps = deps({
       claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
-      consolidationTail: realConsolidationTail(),
+      consolidationTail: dbConsolidationTail(),
       scanTopicFiles: () => ({
         files: [
           {
@@ -827,12 +859,11 @@ describe('pillar-2 semantic consolidation', () => {
     expect(consolidate).not.toHaveBeenCalled();
 
     seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
-    const markConsolidated = vi.fn();
     const logSpy = vi.spyOn(log, 'info');
     const zeroFilesDeps = deps({
       claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
-      consolidationTail: realConsolidationTail(),
-      markConsolidated,
+      consolidationTail: dbConsolidationTail(),
+      markConsolidated: markFactsConsolidated,
       consolidate: vi.fn(
         async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
           decision: { files: [] },
@@ -844,7 +875,7 @@ describe('pillar-2 semantic consolidation', () => {
     });
     const writtenReport = await new MemoryCuratorWorker(zeroFilesDeps).runOne(1000);
     expect(writtenReport).toMatchObject({ action: 'maintenance_written', fileCount: 0 });
-    expect(markConsolidated).toHaveBeenCalledWith(TEST_WORKGROUP, ['mem_aaaaaaaaaaaaaaaa']);
+    expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set(['mem_aaaaaaaaaaaaaaaa']));
     expect(logSpy).toHaveBeenCalledWith(
       'memory-curator: consolidation pass wrote zero files for a non-empty tail',
       expect.objectContaining({ workgroupId: TEST_WORKGROUP }),
@@ -886,6 +917,65 @@ describe('pillar-2 semantic consolidation', () => {
     warnSpy.mockRestore();
   });
 
+  // F5. Before this fix, lockedPaths only carried over-cap excludedPaths — a
+  // presented owned:false (human-authored, read-only) path that was UNDER
+  // cap was never locked, so a model write targeting it fell through to
+  // writeTopicFile. If that path had also vanished from disk between scan
+  // and write, writeTopicFile's ownership check (which only fires against an
+  // EXISTING file) would have nothing to refuse against and the write would
+  // succeed as a "new file" — the exact violation this closes.
+  it('refuses a model write to a path presented as human-authored, even if it vanishes from disk mid-pass', async () => {
+    seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+    const writeTopicFile = vi.fn(
+      async (): Promise<CuratorWriteResult> => ({
+        status: 'success',
+        relative_path: 'people/roster.md',
+        sha256: 'a'.repeat(64),
+      }),
+    );
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      writeTopicFile,
+      // Presented as read-only context, and deliberately absent from disk —
+      // scanTopicFiles is not re-invoked between scan and write, so this is
+      // exactly what "vanished mid-pass" looks like from the write step.
+      scanTopicFiles: () => ({
+        files: [{ path: 'people/roster.md', content: '# Roster\n\nHuman-authored.\n', owned: false }],
+        excludedPaths: [],
+      }),
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: [{ path: 'people/roster.md', content: '# Roster\n\nModel-proposed overwrite.\n' }] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toBeNull();
+    expect(writeTopicFile).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(memoryDir(), 'people', 'roster.md'))).toBe(false);
+  });
+
+  // F4. Real fs, no scanner mock: an already-oversized file on disk must be
+  // excluded and locked, never presented to the model as content.
+  it('scanTopicFiles excludes and locks an oversized topic file instead of reading it', () => {
+    const peopleDir = path.join(memoryDir(), 'people');
+    fs.mkdirSync(peopleDir, { recursive: true });
+    fs.writeFileSync(path.join(peopleDir, 'small.md'), '# Small\n\nUnder the cap.\n');
+    fs.writeFileSync(
+      path.join(peopleDir, 'huge.md'),
+      `<!-- consolidated: facts=1 -->\n# Huge\n\n${'x'.repeat(CONSOLIDATION_INPUT_FILE_MAX_BYTES + 1)}\n`,
+    );
+    const scan = scanTopicFiles(TEST_WORKGROUP);
+    expect(scan.excludedPaths).toEqual(['people/huge.md']);
+    expect(scan.files.map((file) => file.path)).toEqual(['people/small.md']);
+    // The oversized file's content must never have been read into memory.
+    expect(scan.files.some((file) => file.content.includes('Huge'))).toBe(false);
+  });
+
   it('the maintenance call is admission-accounted and abort-propagated', async () => {
     seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
 
@@ -922,5 +1012,53 @@ describe('pillar-2 semantic consolidation', () => {
     expect(report).toBeNull();
     expect(recordCall).toHaveBeenCalledOnce();
     expect(finishCall).toHaveBeenCalledWith(expect.any(String), 'timeout');
+
+    // F7: the signal must be re-checked past the model call, not only while
+    // it is in flight — an abort that lands between two sequential writes
+    // must stop the SECOND write from ever running.
+    seedLedger(
+      [
+        '# Generated workgroup memory',
+        '',
+        factLine('mem_aaaaaaaaaaaaaaaa', 'Fact one.'),
+        factLine('mem_bbbbbbbbbbbbbbbb', 'Fact two.'),
+        '',
+      ].join('\n'),
+    );
+    const writeController = new AbortController();
+    let write2Called = false;
+    const markConsolidated = vi.fn();
+    const completeMaintenance = vi.fn(() => true);
+    const writeTopicFile = vi.fn(async (_workgroupId: string, relativePath: string): Promise<CuratorWriteResult> => {
+      if (relativePath === 'people/two.md') write2Called = true;
+      else writeController.abort(); // flip mid-batch, from inside write 1
+      return { status: 'success', relative_path: relativePath, sha256: 'a'.repeat(64) };
+    });
+    const writeAbortDeps = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 2, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      writeTopicFile,
+      markConsolidated,
+      completeMaintenance,
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: {
+            files: [
+              { path: 'people/one.md', content: '# One\n' },
+              { path: 'people/two.md', content: '# Two\n' },
+            ],
+          },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const writeAbortReport = await new MemoryCuratorWorker(writeAbortDeps).runOne(1000, writeController.signal);
+    expect(writeAbortReport).toBeNull();
+    expect(writeTopicFile).toHaveBeenCalledOnce(); // write 1 ran; write 2 never did
+    expect(write2Called).toBe(false);
+    expect(markConsolidated).not.toHaveBeenCalled();
+    expect(completeMaintenance).not.toHaveBeenCalled();
   });
 });

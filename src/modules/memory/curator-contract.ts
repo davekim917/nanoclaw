@@ -560,6 +560,10 @@ export function validateConsolidationFiles(value: unknown, factsCount: number): 
 export interface ConsolidationTailFact {
   id: string;
   text: string;
+  /** ISO-8601 capture stamp, from the ledger marker. The prompt instructs
+   *  stating both dates on an unresolved conflict (P2.4 item 5) — that is
+   *  only followable if a date is actually in the payload. */
+  capturedAt: string;
 }
 
 export interface ConsolidationTopicFile {
@@ -583,7 +587,11 @@ export interface ConsolidationPromptInput {
  * instructions.
  */
 export function buildConsolidationPrompt(input: ConsolidationPromptInput): { system: string; user: string } {
-  const safeTail = input.tail.map((fact) => ({ id: fact.id, text: scrubSecrets(fact.text) }));
+  const safeTail = input.tail.map((fact) => ({
+    id: fact.id,
+    text: scrubSecrets(fact.text),
+    capturedAt: fact.capturedAt,
+  }));
   const safeTopicFiles = input.topicFiles.map((file) => ({
     path: file.path,
     owned: file.owned,
