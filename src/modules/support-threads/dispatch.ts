@@ -327,7 +327,7 @@ async function dispatchSupportIssue(
     if (issueSession) {
       touchSupportThread(gmailThreadId, now, lastMessageId);
     } else {
-      rebindSupportThreadSession(gmailThreadId, target.id, now);
+      rebindSupportThreadSession(gmailThreadId, target.id);
       touchSupportThread(gmailThreadId, now, lastMessageId);
       log.info('dispatch_support_issue: rebound thread to a fresh session', {
         gmailThreadId,

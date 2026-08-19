@@ -1427,7 +1427,7 @@ describe('session migration pass preserves the idle clock', () => {
     fs.utimesSync(target, bumped, bumped);
 
     const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
-    expect(replayUpgradeMtimeManifest(DATA_DIR)).toBe(1);
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(1);
     expect(fs.statSync(target).mtimeMs).toBe(OLD_SECONDS * 1000);
     expect(fs.existsSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'))).toBe(false);
     expect(stat.mtimeMs).toBeGreaterThan(0);
@@ -1450,8 +1450,114 @@ describe('session migration pass preserves the idle clock', () => {
     fs.utimesSync(target, recent, recent);
 
     const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
-    expect(replayUpgradeMtimeManifest(DATA_DIR)).toBe(0);
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(0);
     expect(fs.statSync(target).mtimeMs).toBeGreaterThan(OLD_SECONDS * 1000);
+  });
+
+  it('keeps the manifest when the pass throws after real DDL', async () => {
+    // Fault injected where it actually hurts: DDL has run for this session and
+    // its mtime is bumped, but the pass dies before the inline restore. The
+    // manifest is then the ONLY record that this file's clock is a lie.
+    const sessionId = 'sess-throws-after-ddl';
+    seedSession(sessionId);
+    const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    const legacy = new Database(legacyPath);
+    legacy.exec(`CREATE TABLE messages_in (
+      id TEXT PRIMARY KEY, seq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL,
+      timestamp TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+      platform_id TEXT, channel_type TEXT, thread_id TEXT, content TEXT NOT NULL,
+      process_after TEXT, recurrence TEXT
+    )`);
+    legacy
+      .prepare(
+        `INSERT INTO messages_in (id,seq,kind,timestamp,status,platform_id,channel_type,thread_id,content)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        'legacy-pending',
+        2,
+        'chat-sdk',
+        '2026-04-01T00:00:00.000Z',
+        'pending',
+        'slack:C1',
+        'slack',
+        'slack:C1:T1',
+        JSON.stringify({ text: 'admit me after the schema upgrade' }),
+      );
+    // Admission inserts the recall row; this makes that insert — and only that
+    // insert — fail, so migrateMessagesInTable's DDL has already landed.
+    legacy.exec("CREATE TRIGGER boom BEFORE INSERT ON messages_in BEGIN SELECT RAISE(ABORT, 'injected'); END");
+    legacy.close();
+    const memoryRoot = path.join(DATA_DIR, 'workgroups', 'mtime', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nadmitted context');
+    fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh context');
+    const before = ageInbound(sessionId);
+
+    expect(() => reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toThrow();
+
+    const manifestPath = path.join(DATA_DIR, 'pending-upgrade-mtimes.json');
+    expect(fs.existsSync(manifestPath)).toBe(true);
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as {
+      entries: Array<{ sessionId: string; mtimeMs: number }>;
+    };
+    expect(manifest.entries.map((e) => e.sessionId)).toEqual([sessionId]);
+    expect(fs.statSync(legacyPath).mtimeMs).toBeGreaterThan(before);
+
+    // …and the next startup's replay is what puts it back.
+    const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(1);
+    expect(fs.statSync(legacyPath).mtimeMs).toBe(before);
+    expect(fs.existsSync(manifestPath)).toBe(false);
+  });
+
+  it('leaves a session alone when untouched evidence shows work inside the replay window', async () => {
+    const sessionId = 'sess-traffic-in-window';
+    seedSession(sessionId);
+    initSessionFolder(MIGRATION_AG, sessionId);
+    const target = inboundDbPath(MIGRATION_AG, sessionId);
+    const writtenAtMs = Date.now();
+    fs.writeFileSync(
+      path.join(DATA_DIR, 'pending-upgrade-mtimes.json'),
+      JSON.stringify({
+        writtenAtMs,
+        entries: [{ path: target, sessionId, atimeMs: OLD_SECONDS * 1000, mtimeMs: OLD_SECONDS * 1000 }],
+      }),
+    );
+    // Bumped INSIDE the window — indistinguishable from the pass by mtime alone.
+    const bumped = (writtenAtMs + 120_000) / 1000;
+    fs.utimesSync(target, bumped, bumped);
+    // But outbound.db moved too, and the migration pass never writes that.
+    const outbound = outboundDbPath(MIGRATION_AG, sessionId);
+    fs.utimesSync(outbound, bumped, bumped);
+
+    const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(0);
+    expect(fs.statSync(target).mtimeMs).toBe(bumped * 1000);
+  });
+
+  it('tolerates filesystem rounding on the low edge of the replay window', async () => {
+    const sessionId = 'sess-rounding-edge';
+    seedSession(sessionId);
+    initSessionFolder(MIGRATION_AG, sessionId);
+    const target = inboundDbPath(MIGRATION_AG, sessionId);
+    const writtenAtMs = Date.now();
+    fs.writeFileSync(
+      path.join(DATA_DIR, 'pending-upgrade-mtimes.json'),
+      JSON.stringify({
+        writtenAtMs,
+        entries: [{ path: target, sessionId, atimeMs: OLD_SECONDS * 1000, mtimeMs: OLD_SECONDS * 1000 }],
+      }),
+    );
+    // Stamped 1.5s BEFORE the manifest's clock — a rounding artifact, not a
+    // different event. Outside the tolerance this session stayed broken.
+    const bumped = (writtenAtMs - 1500) / 1000;
+    fs.utimesSync(target, bumped, bumped);
+
+    const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
+    expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(1);
+    expect(fs.statSync(target).mtimeMs).toBe(OLD_SECONDS * 1000);
   });
 
   it('keeps the new mtime for a session whose pass admitted real work', () => {

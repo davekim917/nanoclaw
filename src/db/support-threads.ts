@@ -128,7 +128,8 @@ export function touchSupportThread(gmailThreadId: string, now: string, lastGmail
 }
 
 /**
- * Rebind a thread to a fresh session, and ONLY that.
+ * Rebind a thread to a fresh session, and ONLY that — one column. Status and
+ * activity belong to `touchSupportThread`, which the caller runs anyway.
  *
  * A support thread outlives its session: reclaim archives the session dir and
  * closes the row, but the Slack thread, the Linear ticket and the customer's
@@ -136,16 +137,10 @@ export function touchSupportThread(gmailThreadId: string, now: string, lastGmail
  * upsert path) would mint a new Slack thread and a duplicate announcement for
  * what is, to everyone involved, an ongoing conversation.
  */
-export function rebindSupportThreadSession(gmailThreadId: string, sessionId: string, now: string): void {
+export function rebindSupportThreadSession(gmailThreadId: string, sessionId: string): void {
   getDb()
-    .prepare(
-      `UPDATE support_threads
-          SET session_id = @sessionId,
-              status = 'open',
-              last_activity_at = @now
-        WHERE gmail_thread_id = @gmailThreadId`,
-    )
-    .run({ gmailThreadId, sessionId, now });
+    .prepare('UPDATE support_threads SET session_id = @sessionId WHERE gmail_thread_id = @gmailThreadId')
+    .run({ gmailThreadId, sessionId });
 }
 
 export function closeSupportThread(gmailThreadId: string, now: string): void {

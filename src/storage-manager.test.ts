@@ -55,15 +55,26 @@ interface CentralSessionSeed {
   agent_group_id?: string;
 }
 
-function installCentralDb(seeds: CentralSessionSeed[]): Database.Database {
+function installCentralDb(
+  seeds: CentralSessionSeed[],
+  options: { activeTripleIndex?: boolean } = {},
+): Database.Database {
   const db = new Database(':memory:');
   db.exec(`CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
     agent_group_id TEXT NOT NULL DEFAULT 'ag-1',
+    messaging_group_id TEXT,
+    thread_id TEXT,
     status TEXT DEFAULT 'active',
     last_active TEXT,
     created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z'
   )`);
+  if (options.activeTripleIndex) {
+    // Migration 049, verbatim: the constraint releaseArchivingRow can hit.
+    db.exec(`CREATE UNIQUE INDEX idx_sessions_active_triple
+      ON sessions(agent_group_id, COALESCE(messaging_group_id, ''), COALESCE(thread_id, ''))
+      WHERE status = 'active'`);
+  }
   const insert = db.prepare(
     'INSERT INTO sessions (id, agent_group_id, status, last_active) VALUES (@id, @agent_group_id, @status, @last_active)',
   );
@@ -765,12 +776,12 @@ describe('storage-manager session archival lifecycle', () => {
     );
     db.prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-old'").run();
 
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toEqual({ released: 0, finished: 1 });
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 0, finished: 1 });
     expect(sessionStatus(db, 'sess-old')).toBe('closed');
     expect(fs.existsSync(dir)).toBe(false);
 
     // Idempotent: a second startup finds nothing left to do.
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toEqual({ released: 0, finished: 0 });
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 0, finished: 0 });
   });
 
   it('returns an archiving row with an intact dir to active and clears the temp archive', () => {
@@ -781,7 +792,7 @@ describe('storage-manager session archival lifecycle', () => {
     fs.writeFileSync(tempPath, 'half-written');
     db.prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-old'").run();
 
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toEqual({ released: 1, finished: 0 });
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 1, finished: 0 });
     expect(sessionStatus(db, 'sess-old')).toBe('active');
     expect(fs.existsSync(dir)).toBe(true);
     expect(fs.existsSync(tempPath)).toBe(false);
@@ -792,7 +803,7 @@ describe('storage-manager session archival lifecycle', () => {
     const db = centralDbMock.current!.db;
     db.prepare("UPDATE sessions SET status = 'closed' WHERE id = 'sess-old'").run();
 
-    expect(finishInterruptedSessionArchivals(sessionsRoot)).toEqual({ released: 0, finished: 0 });
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 0, finished: 0 });
     expect(fs.existsSync(dir)).toBe(true);
   });
 
@@ -805,6 +816,173 @@ describe('storage-manager session archival lifecycle', () => {
 
     expect(report.actions.filter((a) => a.kind === 'archive-session')).toEqual([]);
     expect(fs.existsSync(dir)).toBe(true);
+  });
+
+  it('keeps the dir when the closing CAS finds the row is no longer ours', () => {
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    mockExecFileSync.mockImplementation((cmd: string, cmdArgs?: unknown) => {
+      if (cmd === 'tar' && (cmdArgs as string[]).includes('-cf')) {
+        // Something reclaimed the row while the tar ran.
+        db.prepare("UPDATE sessions SET status = 'active' WHERE id = 'sess-old'").run();
+      }
+      return tarAwareExecFileSync(cmd, cmdArgs);
+    });
+
+    const report = runApply();
+
+    expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('skipped');
+    expect(fs.existsSync(path.join(dir, 'notes.md'))).toBe(true);
+    expect(sessionStatus(db, 'sess-old')).toBe('active');
+  });
+
+  it('does not treat an unlistable archive as published', () => {
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    fs.mkdirSync(rescuesDir, { recursive: true });
+    const rescuePath = path.join(rescuesDir, 'ag-1__sess-old-2026-06-30T00-00-00-000Z.tar.zst');
+    fs.writeFileSync(rescuePath, 'truncated');
+    fs.writeFileSync(
+      path.join(rescuesDir, 'reclaim-journal.jsonl'),
+      `${JSON.stringify({
+        ts: '2026-06-30T00:00:00.000Z',
+        session_id: 'sess-old',
+        agent_group_id: 'ag-1',
+        prior_status: 'active',
+        rescue_path: rescuePath,
+      })}\n`,
+    );
+    db.prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-old'").run();
+    // tar -tf fails on this archive, so it cannot license removing the dir.
+    mockExecFileSync.mockImplementation((cmd: string, cmdArgs?: unknown) => {
+      if (cmd === 'tar' && (cmdArgs as string[]).includes('-tf')) throw new Error('unexpected end of file');
+      return tarAwareExecFileSync(cmd, cmdArgs);
+    });
+
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 1, finished: 0 });
+    expect(sessionStatus(db, 'sess-old')).toBe('active');
+    expect(fs.existsSync(dir)).toBe(true);
+  });
+
+  it('re-archives an orphan closed dir through the ordinary walk instead of a journal-driven delete', () => {
+    // A crash between the closing CAS and the rm leaves this shape. There is
+    // no journal-gated deletion pass any more; the normal reclaim path is the
+    // recovery, which means a stale journal line can never authorize a delete.
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    fs.mkdirSync(rescuesDir, { recursive: true });
+    const rescuePath = path.join(rescuesDir, 'ag-1__sess-old-2026-06-30T00-00-00-000Z.tar.zst');
+    fs.writeFileSync(rescuePath, 'fake-zstd-archive');
+    fs.writeFileSync(
+      path.join(rescuesDir, 'reclaim-journal.jsonl'),
+      `${JSON.stringify({
+        ts: '2026-06-30T00:00:00.000Z',
+        session_id: 'sess-old',
+        agent_group_id: 'ag-1',
+        prior_status: 'active',
+        rescue_path: rescuePath,
+      })}\n`,
+    );
+    db.prepare("UPDATE sessions SET status = 'closed' WHERE id = 'sess-old'").run();
+
+    // Startup does nothing to it…
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ finished: 0, lost: 0, failed: 0 });
+    expect(fs.existsSync(dir)).toBe(true);
+
+    // …and the next maintenance tick reclaims it as an ordinary closed dir.
+    const report = runApply();
+    expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it('closes an archiving row whose triple a newer session already claimed', () => {
+    const dir = seedOne();
+    const db = installCentralDb(
+      [
+        { id: 'sess-old', status: 'archiving', last_active: new Date(now - 40 * DAY).toISOString() },
+        { id: 'sess-new', status: 'active', last_active: new Date(now).toISOString() },
+      ],
+      { activeTripleIndex: true },
+    );
+
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ released: 1, failed: 0 });
+    expect(sessionStatus(db, 'sess-old')).toBe('closed');
+    expect(sessionStatus(db, 'sess-new')).toBe('active');
+    expect(fs.existsSync(dir)).toBe(true);
+  });
+
+  it('leaves an archiving row alone when the write fails for any other reason', () => {
+    const dir = seedOne();
+    // A read-only central DB fails the UPDATE with SQLITE_READONLY — not a
+    // constraint, so it must NOT be laundered into a silent close.
+    const dbPath = path.join(tmpRoot, 'central.sqlite');
+    const seed = new Database(dbPath);
+    seed.exec('CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_group_id TEXT, status TEXT, last_active TEXT)');
+    seed.prepare("INSERT INTO sessions VALUES ('sess-old', 'ag-1', 'archiving', NULL)").run();
+    seed.close();
+    closeCentralDb();
+    centralDbMock.current = { db: new Database(dbPath, { readonly: true }) };
+
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ failed: 1, released: 0, lost: 0 });
+    expect(sessionStatus(centralDbMock.current!.db, 'sess-old')).toBe('archiving');
+    expect(fs.existsSync(dir)).toBe(true);
+  });
+
+  it('reports a lost session rather than counting it as finished', () => {
+    seedOne();
+    const db = centralDbMock.current!.db;
+    db.prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-old'").run();
+    fs.rmSync(path.join(sessionsRoot, 'ag-1', 'sess-old'), { recursive: true, force: true });
+
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toMatchObject({ lost: 1, finished: 0, released: 0 });
+    expect(sessionStatus(db, 'sess-old')).toBe('closed');
+    expect(vi.mocked(log.error).mock.calls.some((c) => String(c[0]).includes('lost with no readable rescue'))).toBe(
+      true,
+    );
+  });
+
+  // T2c (plan Rollback) — the documented restore is mechanical, and it refuses
+  // to guess when a newer session has taken the triple.
+  it('restores an archived session from its journal line and resumes', () => {
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    expect(runApply().actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
+    expect(fs.existsSync(dir)).toBe(false);
+
+    const entry = readReclaimJournal(rescuesDir).get('sess-old')!;
+    expect(entry.prior_status).toBe('active');
+    expect(fs.existsSync(entry.rescue_path)).toBe(true);
+
+    // The documented procedure: re-create the dir from the rescue archive, put
+    // the row back to the journalled prior status.
+    makeSessionDir(sessionsRoot, 'ag-1', 'sess-old', now - 1 * DAY);
+    db.prepare('UPDATE sessions SET status = ? WHERE id = ?').run(entry.prior_status, 'sess-old');
+
+    expect(sessionStatus(db, 'sess-old')).toBe('active');
+    // Fresh enough to be off the reclaim path again, and readable.
+    const resumed = runApply();
+    expect(resumed.actions.filter((a) => a.kind === 'archive-session')).toEqual([]);
+    expect(fs.existsSync(path.join(sessionsRoot, 'ag-1', 'sess-old', 'inbound.db'))).toBe(true);
+  });
+
+  it('refuses to guess when a newer session already owns the restored triple', () => {
+    const db = installCentralDb(
+      [
+        { id: 'sess-old', status: 'closed', last_active: new Date(now - 40 * DAY).toISOString() },
+        { id: 'sess-new', status: 'active', last_active: new Date(now).toISOString() },
+      ],
+      { activeTripleIndex: true },
+    );
+    makeSessionDir(sessionsRoot, 'ag-1', 'sess-old', now - 1 * DAY);
+
+    // Restoring the old row to 'active' collides — both artifacts survive and
+    // the conflict surfaces instead of one silently winning.
+    expect(() => db.prepare("UPDATE sessions SET status = 'active' WHERE id = 'sess-old'").run()).toThrow(
+      /UNIQUE constraint/,
+    );
+    expect(sessionStatus(db, 'sess-old')).toBe('closed');
+    expect(sessionStatus(db, 'sess-new')).toBe('active');
+    expect(fs.existsSync(path.join(sessionsRoot, 'ag-1', 'sess-old', 'inbound.db'))).toBe(true);
   });
 
   it('skips a session touched by a write between collection and apply', () => {
@@ -922,6 +1100,54 @@ describe('storage-manager session reclaim budget and selection', () => {
     const outer = runApply();
 
     expect(archivedInner.length + archivedIds(outer).length).toBe(50);
+  }, 60_000);
+
+  it('does not hand a second budget to a sequential force pass inside the same epoch', () => {
+    vi.stubEnv('NANOCLAW_SESSION_RECLAIM_PER_TICK', '50');
+    seedAgedSessions(120, 150);
+
+    const first = runApply();
+    // No throttle reset: a second pass minutes later is the SAME lease.
+    const second = getStorageReport({
+      mode: 'apply',
+      now: now + 60_000,
+      sessionsRoot,
+      threadsRoot: path.join(tmpRoot, 'no-threads'),
+      includeDocker: false,
+      force: true,
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 1 * DAY, worktreeReclaimMs: 30 * DAY },
+    });
+
+    expect(archivedIds(first).length + archivedIds(second).length).toBe(50);
+  }, 60_000);
+
+  it('draws the exported prune entry point from the same epoch budget', () => {
+    vi.stubEnv('NANOCLAW_SESSION_RECLAIM_PER_TICK', '50');
+    seedAgedSessions(120, 150);
+
+    const first = runApply();
+    const before = fs.readdirSync(path.join(sessionsRoot, 'ag-1')).length;
+    pruneIdleSessionArtifacts(now + 60_000, sessionsRoot, () => false);
+    const after = fs.readdirSync(path.join(sessionsRoot, 'ag-1')).length;
+
+    expect(archivedIds(first).length).toBe(50);
+    expect(before - after).toBe(0);
+  }, 60_000);
+
+  it('opens a fresh budget once the epoch has elapsed', () => {
+    vi.stubEnv('NANOCLAW_SESSION_RECLAIM_PER_TICK', '50');
+    const ids = seedAgedSessions(120, 150);
+
+    expect(archivedIds(runApply()).length).toBe(50);
+    const later = getStorageReport({
+      mode: 'apply',
+      now: now + 46 * 60 * 1000,
+      sessionsRoot,
+      threadsRoot: path.join(tmpRoot, 'no-threads'),
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 1 * DAY, worktreeReclaimMs: 30 * DAY },
+    });
+    expect(archivedIds(later)).toEqual(ids.slice(50, 100).sort());
   }, 60_000);
 
   it('uses the session-specific reclaim knob without moving thread worktrees', () => {

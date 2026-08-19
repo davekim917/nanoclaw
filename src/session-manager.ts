@@ -978,7 +978,42 @@ const UPGRADE_MTIME_REPLAY_WINDOW_MS = 10 * 60 * 1000;
 
 interface UpgradeMtimeManifest {
   writtenAtMs: number;
-  entries: Array<{ path: string; atimeMs: number; mtimeMs: number }>;
+  entries: Array<{ path: string; sessionId?: string; atimeMs: number; mtimeMs: number }>;
+}
+
+/** Filesystem timestamps round; the manifest's clock and the file's need slack. */
+const UPGRADE_MTIME_EDGE_TOLERANCE_MS = 2000;
+/** Signals this pass never writes — if one moved after the manifest, work happened. */
+const UNTOUCHED_ACTIVITY_FILES = ['outbound.db', 'archive.db', '.heartbeat'];
+
+/**
+ * Did anything that ISN'T the migration pass record activity for this session
+ * after the manifest was written? The bumped-mtime window alone cannot tell a
+ * DDL write from a message that landed two minutes later; these can.
+ */
+function sawRealActivityAfter(
+  inboundPath: string,
+  sinceMs: number,
+  sessionId: string | undefined,
+  centralDb: Database.Database | undefined,
+): boolean {
+  const dir = path.dirname(inboundPath);
+  for (const name of UNTOUCHED_ACTIVITY_FILES) {
+    try {
+      if (fs.statSync(path.join(dir, name)).mtimeMs > sinceMs) return true;
+    } catch {
+      // Absent signal file.
+    }
+  }
+  if (!centralDb || !sessionId) return false;
+  try {
+    const row = centralDb.prepare('SELECT last_active FROM sessions WHERE id = ?').get(sessionId) as
+      | { last_active: string | null }
+      | undefined;
+    return row?.last_active ? Date.parse(row.last_active) > sinceMs : false;
+  } catch {
+    return false;
+  }
 }
 
 function upgradeMtimeManifestPath(dataDir: string): string {
@@ -1003,7 +1038,7 @@ function writeUpgradeMtimeManifest(dataDir: string, manifest: UpgradeMtimeManife
  * manifest recorded was never touched, and a file bumped past the replay
  * window saw real traffic after the pass — neither is restored.
  */
-export function replayUpgradeMtimeManifest(dataDir = DATA_DIR): number {
+export function replayUpgradeMtimeManifest(dataDir = DATA_DIR, centralDb?: Database.Database): number {
   const manifestPath = upgradeMtimeManifestPath(dataDir);
   let manifest: UpgradeMtimeManifest;
   try {
@@ -1016,8 +1051,12 @@ export function replayUpgradeMtimeManifest(dataDir = DATA_DIR): number {
     try {
       const current = fs.statSync(entry.path);
       if (current.mtimeMs <= entry.mtimeMs) continue;
-      if (current.mtimeMs < manifest.writtenAtMs) continue;
+      if (current.mtimeMs < manifest.writtenAtMs - UPGRADE_MTIME_EDGE_TOLERANCE_MS) continue;
       if (current.mtimeMs > manifest.writtenAtMs + UPGRADE_MTIME_REPLAY_WINDOW_MS) continue;
+      // The window says "this could be the pass". Untouched evidence says
+      // whether it actually was — a message that landed inside the window is
+      // real activity and its clock is not ours to rewind.
+      if (sawRealActivityAfter(entry.path, manifest.writtenAtMs, entry.sessionId, centralDb)) continue;
       fs.utimesSync(entry.path, entry.atimeMs / 1000, entry.mtimeMs / 1000);
       restored += 1;
     } catch {
@@ -1046,7 +1085,7 @@ export function reconcilePendingUpgradeContexts(
   workgroupIds: string[],
   dataDir = DATA_DIR,
 ): { sessions: number; admitted: number; mtimesRestored: number } {
-  replayUpgradeMtimeManifest(dataDir);
+  replayUpgradeMtimeManifest(dataDir, centralDb);
 
   const targets: Array<{ id: string; agentGroupId: string; inboundPath: string; stat: fs.Stats }> = [];
   for (const workgroupId of [...new Set(workgroupIds)].sort()) {
@@ -1078,6 +1117,7 @@ export function reconcilePendingUpgradeContexts(
     writtenAtMs: Date.now(),
     entries: targets.map((target) => ({
       path: target.inboundPath,
+      sessionId: target.id,
       atimeMs: target.stat.atimeMs,
       mtimeMs: target.stat.mtimeMs,
     })),
@@ -1086,30 +1126,30 @@ export function reconcilePendingUpgradeContexts(
   let sessions = 0;
   let admitted = 0;
   let mtimesRestored = 0;
-  try {
-    for (const target of targets) {
-      const inbound = openInboundDbRaw(target.inboundPath);
-      let admittedHere = 0;
-      try {
-        migrateMessagesInTable(inbound);
-        sessions++;
-        admittedHere = admitPendingUpgradeContexts(inbound, target.agentGroupId, target.id);
-        admitted += admittedHere;
-      } finally {
-        inbound.close();
-      }
-      if (admittedHere > 0) continue;
-      try {
-        if (fs.statSync(target.inboundPath).mtimeMs === target.stat.mtimeMs) continue;
-        fs.utimesSync(target.inboundPath, target.stat.atimeMs / 1000, target.stat.mtimeMs / 1000);
-        mtimesRestored += 1;
-      } catch {
-        // Session removed underneath the pass.
-      }
+  for (const target of targets) {
+    const inbound = openInboundDbRaw(target.inboundPath);
+    let admittedHere = 0;
+    try {
+      migrateMessagesInTable(inbound);
+      sessions++;
+      admittedHere = admitPendingUpgradeContexts(inbound, target.agentGroupId, target.id);
+      admitted += admittedHere;
+    } finally {
+      inbound.close();
     }
-  } finally {
-    fs.rmSync(upgradeMtimeManifestPath(dataDir), { force: true });
+    if (admittedHere > 0) continue;
+    try {
+      if (fs.statSync(target.inboundPath).mtimeMs === target.stat.mtimeMs) continue;
+      fs.utimesSync(target.inboundPath, target.stat.atimeMs / 1000, target.stat.mtimeMs / 1000);
+      mtimesRestored += 1;
+    } catch {
+      // Session removed underneath the pass.
+    }
   }
+  // Deleted ONLY on full success. An exception here escapes to startup, which
+  // exits; the manifest is then the only record of what this pass bumped, so a
+  // `finally` that removes it would destroy the recovery it exists for.
+  fs.rmSync(upgradeMtimeManifestPath(dataDir), { force: true });
   if (mtimesRestored > 0) {
     log.info('Session migration pass left the idle clock untouched', { sessions, mtimesRestored });
   }

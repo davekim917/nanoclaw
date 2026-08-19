@@ -282,13 +282,13 @@ describe('handleDispatchSupportIssue — archived session binding', () => {
     const after = getSupportThread('gthread-A')!;
     expect(after.session_id).not.toBe(archivedId);
     expect(getSession(after.session_id!)!.status).toBe('active');
-    // Thread identity and every other field survive the rebinding.
-    expect(after.slack_thread_id).toBe(before.slack_thread_id);
-    expect(after.slack_parent_msg_id).toBe(before.slack_parent_msg_id);
-    expect(after.subject).toBe(before.subject);
-    expect(after.sender).toBe(before.sender);
-    expect(after.linear_issue).toBe(before.linear_issue);
-    expect(after.created_at).toBe(before.created_at);
+    // session_id is the ONLY column the rebinding owns. Everything else on the
+    // row is either untouched or moved by touchSupportThread, as before.
+    const { session_id: _newSession, last_activity_at: _newActivity, ...afterRest } = after;
+    const { session_id: _oldSession, last_activity_at: _oldActivity, ...beforeRest } = before;
+    expect(afterRest).toEqual(beforeRest);
+    expect(after.status).toBe('open');
+    expect(Date.parse(after.last_activity_at)).toBeGreaterThanOrEqual(Date.parse(before.last_activity_at));
     // No second announcement or thread for one ongoing conversation.
     expect(postParent).toHaveBeenCalledTimes(1);
     expect(createThread).toHaveBeenCalledTimes(1);

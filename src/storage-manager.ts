@@ -811,9 +811,19 @@ function isRealDirectory(dirPath: string): boolean {
 // file under the sessions root — the call sites do not change.
 let reclaimPassDepth = 0;
 let reclaimBudgetRemaining = 0;
+let reclaimEpochStartMs = 0;
 
-function beginReclaimPass(perTick: number): void {
-  if (reclaimPassDepth === 0) reclaimBudgetRemaining = Math.max(0, perTick);
+// The budget is a lease on a stretch of time, not a per-call allowance. Under
+// the hourly scan cadence each tick opens a new epoch; anything that fires in
+// between — a pressure bypass, a force prune, a second call a minute later —
+// draws from the epoch already open instead of minting itself a fresh 50.
+const RECLAIM_BUDGET_EPOCH_MS = 45 * 60 * 1000;
+
+function beginReclaimPass(perTick: number, now: number): void {
+  if (reclaimPassDepth === 0 && now - reclaimEpochStartMs >= RECLAIM_BUDGET_EPOCH_MS) {
+    reclaimEpochStartMs = now;
+    reclaimBudgetRemaining = Math.max(0, perTick);
+  }
   reclaimPassDepth += 1;
 }
 
@@ -873,6 +883,22 @@ function reclaimJournalPath(rescuesDir: string): string {
  * finished from it at startup, and an operator restore reads the rescue path
  * and the status to put back.
  */
+function fsyncDir(dirPath: string): void {
+  let fd: number;
+  try {
+    fd = fs.openSync(dirPath, fs.constants.O_RDONLY);
+  } catch {
+    return;
+  }
+  try {
+    fs.fsyncSync(fd);
+  } catch {
+    // Some filesystems refuse fsync on a directory; the rename still landed.
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function appendReclaimJournal(rescuesDir: string, entry: SessionReclaimJournalEntry): void {
   fs.mkdirSync(rescuesDir, { recursive: true });
   const fd = fs.openSync(reclaimJournalPath(rescuesDir), 'a');
@@ -882,6 +908,8 @@ function appendReclaimJournal(rescuesDir: string, entry: SessionReclaimJournalEn
   } finally {
     fs.closeSync(fd);
   }
+  // The line is durable but its directory entry may not be on first create.
+  fsyncDir(rescuesDir);
 }
 
 export function readReclaimJournal(rescuesDir: string): Map<string, SessionReclaimJournalEntry> {
@@ -906,10 +934,20 @@ export function readReclaimJournal(rescuesDir: string): Map<string, SessionRecla
   return entries;
 }
 
+/**
+ * A published rescue archive is one we can still LIST, not merely one that
+ * exists with bytes in it. Recovery uses this to decide whether a session dir
+ * may be removed, and a truncated zstd stream is a non-empty file.
+ */
 function isPublishedArchive(archivePath: string): boolean {
   try {
     const st = fs.statSync(archivePath);
-    return st.isFile() && st.size > 0;
+    if (!st.isFile() || st.size === 0) return false;
+    execFileSync('tar', ['-I', 'zstd -T0', '-tf', archivePath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 10 * 60 * 1000,
+    });
+    return true;
   } catch {
     return false;
   }
@@ -921,12 +959,33 @@ function isPublishedArchive(archivePath: string): boolean {
  * while it was 'archiving', reviving it as 'active' would violate that index —
  * the old row is history at that point and closes instead.
  */
-function releaseArchivingRow(sessionId: string): void {
+function isConstraintViolation(err: unknown): boolean {
+  return (
+    typeof (err as { code?: unknown })?.code === 'string' &&
+    (err as { code: string }).code.startsWith('SQLITE_CONSTRAINT')
+  );
+}
+
+function releaseArchivingRow(sessionId: string): 'active' | 'closed' | 'failed' {
   try {
     getDb().prepare("UPDATE sessions SET status = 'active' WHERE id = ? AND status = 'archiving'").run(sessionId);
+    return 'active';
   } catch (err) {
-    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(sessionId);
-    log.warn('storage-manager: archiving row could not return to active, closed instead', { sessionId, err });
+    // The ONLY expected failure: a fresh session claimed this row's active
+    // triple while it was archiving (migration 049). That row is history now.
+    if (isConstraintViolation(err)) {
+      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(sessionId);
+      log.warn('storage-manager: archiving row lost its triple to a newer session, closed instead', { sessionId });
+      return 'closed';
+    }
+    // Anything else (locked DB, disk full) must NOT become a silent close —
+    // that would hide an intact session dir from every sweep forever. Leave it
+    // in 'archiving' and let the next startup finisher retry, loudly.
+    log.error('storage-manager: could not release an archiving session row; left for startup recovery', {
+      sessionId,
+      err,
+    });
+    return 'failed';
   }
 }
 
@@ -1039,8 +1098,18 @@ function createArchiveSessionAction(args: {
             stdio: ['pipe', 'pipe', 'pipe'],
             timeout: 60 * 60 * 1000,
           });
+          // tar exited, but its bytes may still be page cache. The rename is
+          // durable; the CONTENT has to be too, or a crash publishes an empty
+          // archive that then licenses deleting the only copy.
+          const tempFd = fs.openSync(tempPath, fs.constants.O_RDONLY);
+          try {
+            fs.fsyncSync(tempFd);
+          } finally {
+            fs.closeSync(tempFd);
+          }
           // Publish atomically — a rescue path only ever exists complete.
           fs.renameSync(tempPath, archivePath);
+          fsyncDir(args.rescuesDir);
         } catch (err) {
           fs.rmSync(tempPath, { force: true });
           if (args.sessionStatus === 'active') releaseArchivingRow(args.sessionId);
@@ -1055,9 +1124,20 @@ function createArchiveSessionAction(args: {
           rescue_path: archivePath,
         });
         if (args.sessionStatus === 'active') {
-          getDb()
+          const closed = getDb()
             .prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'")
-            .run(args.sessionId);
+            .run(args.sessionId).changes;
+          // The row stopped being ours between the claim and here. The archive
+          // is published and journalled, so nothing is lost — but the dir now
+          // belongs to whoever moved the row, and removing it is not our call.
+          if (closed !== 1) {
+            log.error('storage-manager: archiving row changed under an archival; dir kept', {
+              sessionId: args.sessionId,
+              rescuePath: archivePath,
+            });
+            acted = false;
+            return;
+          }
         }
         fs.rmSync(args.sessPath, { recursive: true, force: true });
       });
@@ -1075,15 +1155,12 @@ function createArchiveSessionAction(args: {
 export function finishInterruptedSessionArchivals(sessionsRoot: string = sessionsBaseDir()): {
   released: number;
   finished: number;
+  lost: number;
+  failed: number;
 } {
   const rescuesDir = path.join(path.dirname(sessionsRoot), SESSION_RESCUES_DIRNAME);
   const journal = readReclaimJournal(rescuesDir);
-  let released = 0;
-  let finished = 0;
-
-  const removeDir = (sessPath: string): void => {
-    if (fs.existsSync(sessPath)) fs.rmSync(sessPath, { recursive: true, force: true });
-  };
+  const result = { released: 0, finished: 0, lost: 0, failed: 0 };
 
   let archiving: Array<{ id: string; agent_group_id: string }>;
   try {
@@ -1092,45 +1169,43 @@ export function finishInterruptedSessionArchivals(sessionsRoot: string = session
       .all() as typeof archiving;
   } catch (err) {
     log.warn('storage-manager: could not read interrupted archivals', { err });
-    return { released, finished };
+    return result;
   }
 
   for (const row of archiving) {
     const sessPath = path.join(sessionsRoot, row.agent_group_id, row.id);
     const entry = journal.get(row.id);
+    // 'archiving' is a state only this module writes, so a journal line for a
+    // row still in it names THIS attempt — no stale-line ambiguity. The
+    // archive is re-listed here rather than trusted from its size.
     if (entry && isPublishedArchive(entry.rescue_path)) {
-      // Crashed between publishing the archive and closing the row.
-      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(row.id);
-      removeDir(sessPath);
-      finished += 1;
+      const closed = getDb()
+        .prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'")
+        .run(row.id).changes;
+      if (closed !== 1) {
+        result.failed += 1;
+        continue;
+      }
+      if (fs.existsSync(sessPath)) fs.rmSync(sessPath, { recursive: true, force: true });
+      result.finished += 1;
       continue;
     }
     if (!fs.existsSync(sessPath)) {
-      // Dir already gone with no archive to point at: the row cannot go back
-      // to active, and leaving it 'archiving' hides it from every sweep.
+      // Dir gone with no readable archive behind it. Closing the row is the
+      // only honest state — the session cannot run — but this is data loss and
+      // it gets said out loud rather than counted as a success.
       getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(row.id);
-      finished += 1;
+      log.error('storage-manager: session directory lost with no readable rescue archive', {
+        sessionId: row.id,
+        agentGroupId: row.agent_group_id,
+        rescuePath: entry?.rescue_path ?? null,
+      });
+      result.lost += 1;
       continue;
     }
-    releaseArchivingRow(row.id);
-    released += 1;
-  }
-
-  for (const [sessionId, entry] of journal) {
-    const sessPath = path.join(sessionsRoot, entry.agent_group_id, sessionId);
-    if (!fs.existsSync(sessPath)) continue;
-    if (!isPublishedArchive(entry.rescue_path)) continue;
-    let status: string | undefined;
-    try {
-      status = (
-        getDb().prepare('SELECT status FROM sessions WHERE id = ?').get(sessionId) as { status: string } | undefined
-      )?.status;
-    } catch {
-      continue;
-    }
-    if (status !== undefined && status !== 'closed') continue;
-    removeDir(sessPath);
-    finished += 1;
+    const outcome = releaseArchivingRow(row.id);
+    if (outcome === 'failed') result.failed += 1;
+    else result.released += 1;
   }
 
   // Temp archives never became a rescue path; nothing references them.
@@ -1142,10 +1217,15 @@ export function finishInterruptedSessionArchivals(sessionsRoot: string = session
     // No rescues dir yet.
   }
 
-  if (released > 0 || finished > 0) {
-    log.info('storage-manager: resolved interrupted session archivals', { released, finished });
+  // ponytail: there is deliberately NO "closed row with a journal line, remove
+  // its dir" pass. A crash between the close and the rm leaves an orphan dir on
+  // a closed row, which the ordinary reclaim walk already re-archives on its
+  // next tick. Adding the pass back would mean a journal line from an OLD
+  // archival could authorize deleting a dir an operator has since restored.
+  if (result.released + result.finished + result.lost + result.failed > 0) {
+    log.info('storage-manager: resolved interrupted session archivals', result);
   }
-  return { released, finished };
+  return result;
 }
 
 interface SessionReclaimCandidate {
@@ -2016,7 +2096,7 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
   // re-enters storage maintenance while this is open draws from the same
   // budget instead of opening a second one.
   const passPolicy = resolveStoragePolicy(options.policy);
-  beginReclaimPass(passPolicy.sessionReclaimPerTick);
+  beginReclaimPass(passPolicy.sessionReclaimPerTick, options.now ?? Date.now());
   try {
     return runStorageReportPass(options, passPolicy);
   } finally {
@@ -2248,6 +2328,7 @@ export function _resetStorageManagerThrottleForTesting(): void {
   lastEmergencyDockerAttemptMs = 0;
   reclaimPassDepth = 0;
   reclaimBudgetRemaining = 0;
+  reclaimEpochStartMs = 0;
   warnedInvalidKnobs.clear();
   loggedSessionReclaimConfig = false;
 }

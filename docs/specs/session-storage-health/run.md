@@ -406,3 +406,150 @@ form. The next step is the lead's: ship + restart + verify a bounded live tick
   those did not recur here — load flakes, not a regression.
 - Commits: `dfa6e3db` (C1), `1e567527` (C2), C3 = this commit.
 - Zero pushes, zero `pnpm run build`, zero restarts, zero `--execute`.
+
+## 2026-08-19 — implementation review (lead)
+
+- Lead verification: 122/122 new tests fresh; 3 commits confirmed
+  (dfa6e3db/1e567527/3d5eb3b7); dry-run manifest sane (5,015 selected,
+  provenance split verified, disk re-measured unchanged).
+- Builder deviations disposed: D1 wakeContainer guard → GO as C6 via
+  surgical-index staging; D2 literal SR5 kept as built; D3 cleanup-claim
+  accepted as the cross-process serializer equivalent; D4 honest T6 note
+  accepted. Recovery will run BOTH burst windows (20:21±10, 16:26±5).
+- Cross-model review (Codex, same transport, bundle = plan rev 2 + branch
+  diff + run.md): verdict `must_fix` — 8 MUST + 3 SHOULD, all provisionally
+  accepted (preimage-overwrite finding confirmed directly by the lead;
+  builder instructed to verify each and reject-with-evidence any
+  non-reproducing premise). Batch dispatched as C4/C5/C6: manifest
+  lifecycle on exception, replay newer-activity evidence + rounding
+  tolerance, time-epoch budget lease, fsync ordering + CAS changes===1
+  before rm, journal attempt tokens + recovery re-validation,
+  releaseArchivingRow totality, immutable preimage paths, script path
+  containment (O_NOFOLLOW/futimes), per-window activity binding,
+  session_id-only rebinding, T2c restore/resume test.
+- Also this round: live checkout found left on the feature branch (shared
+  repo hazard) — 7 blocking dirty files verified byte-identical to main's
+  committed versions; classifier blocked the lead's git restore; exact
+  one-paste command handed to the operator to return HEAD to main.
+
+## 2026-08-19 — correction batch (C4: storage + session)
+
+Every finding was traced to source before being applied. Dispositions below;
+"reproduces" means I read the code path and it does what the finding says.
+
+### 1. SR1 manifest lifecycle — ACCEPTED, with a narrower blast radius than stated
+
+Reproduces: the `finally` deleted `pending-upgrade-mtimes.json` unconditionally,
+and `src/index.ts:221` turns an exception here into `process.exit(1)` — so the
+one start that could recover would find no manifest.
+
+Correction to the finding's framing, from writing the test: the pass restores
+each session's mtime INLINE at the end of its own iteration, so a mid-pass
+throw leaves at most ONE session bumped (the one being processed), not every
+session migrated so far. The manifest is still that session's only record, so
+the fix stands — deletion moved to the success path, no `finally`.
+
+Fault injection is through `reconcilePendingUpgradeContexts` as asked: a legacy
+inbound.db plus `CREATE TRIGGER boom BEFORE INSERT ON messages_in … RAISE(ABORT)`,
+which lets `migrateMessagesInTable`'s DDL land and then fails the admission
+INSERT. My first attempt (a corrupt second session) proved nothing — it threw
+before that session's DDL, and the first session had already been restored
+inline. Test asserts: throws · manifest survives with the entry · mtime still
+bumped · replay restores it · manifest then gone.
+
+### 2. SR1 replay discrimination — ACCEPTED
+
+Reproduces: mtime-in-window was the only signal, so a message landing two
+minutes after the manifest write was indistinguishable from the pass and got
+rewound. `sawRealActivityAfter()` now consults evidence the pass never writes —
+`outbound.db` / `archive.db` / `.heartbeat` mtimes and the central row's
+`last_active` — and skips the entry if any of them moved after the manifest
+write. Manifest entries now carry `sessionId` so the central lookup is possible
+(absent on an older manifest → file signals still apply).
+`UPGRADE_MTIME_EDGE_TOLERANCE_MS = 2000` on the low edge for fs rounding.
+Tests: traffic inside the window skipped · 1.5s-early stamp still restored ·
+touch after 10min not restored (pre-existing).
+
+### 3. SR2 budget epoch — ACCEPTED
+
+Reproduces: `beginReclaimPass` reset the budget whenever depth hit 0, so two
+sequential calls took 50 each. (Not reachable in production today —
+`pruneIdleSessionArtifacts` has zero production callers and both live entry
+points are cadence-throttled — but SR2's text says "rapid repeated invocations
+cannot multiply it", which is the reading I flagged as ambiguous in C1 and the
+lead has now settled.)
+
+Budget is a time lease: `RECLAIM_BUDGET_EPOCH_MS = 45 * 60 * 1000`, reset only
+when `now - reclaimEpochStartMs >= epoch`. Under the hourly scan cadence each
+tick opens a fresh epoch; anything in between draws from the open one. `now` is
+threaded from `options.now` so tests drive it. Tests: sequential force pass
+inside the epoch → 50 total · `pruneIdleSessionArtifacts` archives 0 after a
+full pass · a pass 46min later gets the next 50.
+
+### 4. SR2b durability ordering — ACCEPTED, all four parts
+
+`fsyncSync` on the completed temp tar before the rename (tar exits with its
+bytes possibly still in page cache — the rename is durable, the content was
+not); `fsyncDir` on the rescues dir after the rename and after the journal
+append; and the closing `archiving→closed` CAS now checks `changes === 1` —
+on 0 it logs an error and ABORTS the rm, because the archive is safely
+published but the row is no longer ours to act on. Test flips the row from
+inside the tar mock and asserts the dir survives.
+
+### 5. SR2b attempt binding — PARTIALLY ACCEPTED; the root cause is removed instead
+
+The corrupt-tar half reproduces and is fixed: `isPublishedArchive` now runs
+`tar -tf` rather than trusting `size > 0`, so a truncated stream can never
+license a delete. Test: unlistable archive → the row is released, dir kept.
+
+The stale-journal half is REJECTED AS SPECIFIED, and its cause deleted instead.
+The hazard needed the "closed row + journal line → remove its dir" recovery
+pass, and that pass is redundant: a crash between the closing CAS and the rm
+leaves an orphan dir on a closed row, which the ordinary reclaim walk already
+picks up on its next tick (`sessionStatus: 'closed'`) and re-archives normally.
+So the pass is gone. No attempt token, no schema column, no second consistency
+mechanism to keep correct — and a journal line from an old archival now has no
+path at all to authorizing a delete. The `archiving` branch that remains cannot
+suffer the same confusion: only this module ever writes `archiving`, so a
+journal line for a row still in it names the current attempt by construction.
+Test proves the self-heal end to end (startup does nothing; the next tick
+archives it).
+
+### 6. releaseArchivingRow totality — ACCEPTED
+
+Reproduces: `catch {}` turned every failure into a close. Now the unique-triple
+conflict (migration 049) is distinguished by `SQLITE_CONSTRAINT*` and closes
+with a warning; anything else logs `log.error` and leaves the row in
+`archiving` for the next startup to retry. The finisher's result grew from
+`{released, finished}` to `{released, finished, lost, failed}` — a dir gone with
+no readable archive is now `lost` with a `log.error`, not counted as `finished`.
+Tests: read-only central DB → `failed: 1`, row stays `archiving` · competing
+active triple → `closed` · missing dir + no archive → `lost: 1` + error logged.
+
+### 10. rebindSupportThreadSession — ACCEPTED
+
+It set `status` and `last_activity_at` too. Now one column. Behaviorally a
+no-op — the caller runs `touchSupportThread` immediately after, which owns both
+— but it makes the function match its name and its contract. T6 now asserts the
+whole row minus `session_id`/`last_activity_at` is byte-identical.
+
+### 11. T2c — ACCEPTED, written without inventing an unused API
+
+The plan's Rollback promises "one test proves a restored session resumes
+cleanly" and that a triple conflict "preserves both and reports for manual
+resolution rather than guessing". Both are properties of the DOCUMENTED manual
+procedure, so the tests exercise that procedure with existing primitives
+(re-create the dir, set the row back to the journal's `prior_status`) rather
+than adding a `restoreArchivedSession()` nobody calls. Test 1: archive → read
+the journal line → restore → session resumes and is off the reclaim path. Test
+2: a newer session owns the triple → the restore UPDATE raises the UNIQUE
+constraint, both artifacts survive, neither row silently wins.
+
+### Verification (C4)
+
+- `vitest run src/storage-manager.test.ts` → **68 passed** (was 57)
+- `vitest run src/session-manager.test.ts` → **49 passed** (was 46)
+- `vitest run src/modules/support-threads/` → **11 passed** (needs
+  `--testTimeout=30000` on this box: load average was 17-40 with 9 concurrent
+  vitest processes from other agents, and these tests run ~1s idle / ~6s loaded)
+- `tsc --noEmit` clean.
