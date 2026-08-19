@@ -657,30 +657,6 @@ export function recordAcceptedGeneratedMemory(
     .run(workgroupId, sizePending, now, now, MEMORY_MAINTENANCE_UPDATE_THRESHOLD, sizePending);
 }
 
-/**
- * One-time backlog enqueue, called from the `memory_consolidated_facts`
- * migration for every workgroup whose ledger is non-empty at migration time
- * (docs/specs/workgroup-cerebro/plan.md §P2.4 item 3). Distinct from
- * `recordAcceptedGeneratedMemory`: it must not touch
- * `accepted_updates_since_maintenance`, which tracks new writes since the
- * last pass and is unrelated to a one-time backfill of pre-existing content.
- */
-export function enqueueMemoryMaintenanceBacklog(workgroupId: string, options: { nowMs?: number } = {}): void {
-  const now = new Date(options.nowMs ?? Date.now()).toISOString();
-  openDb()
-    .prepare(
-      `INSERT INTO memory_curation_state
-         (workgroup_id, accepted_updates_since_maintenance, maintenance_pending,
-          not_before, lease_owner, lease_expires_at, updated_at)
-       VALUES (?, 0, 1, ?, NULL, NULL, ?)
-       ON CONFLICT(workgroup_id) DO UPDATE SET
-         maintenance_pending = 1,
-         not_before = excluded.not_before,
-         updated_at = excluded.updated_at`,
-    )
-    .run(workgroupId, now, now);
-}
-
 export function claimMemoryMaintenance(
   owner: string,
   options: { nowMs?: number; leaseMs?: number } = {},
