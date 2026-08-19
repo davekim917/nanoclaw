@@ -1628,8 +1628,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    hold, and the painted-wall header that framed it, are gone with it. */
 
 .nc-frame.nc-of {
-  background: #f6f4f0;
+  background: var(--page);
   color: var(--ink);
+  /* The blueprint grid is the canvas's own atmosphere — see theme.css. */
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 30px 30px;
 }
 
 .nc-of .nc-obs-body { max-width: 1200px; margin: 0 auto; padding: 16px; }
@@ -1652,20 +1657,25 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* ─── atrium: the light chrome ───────────────────────────────────────────── */
 /* One system across every surface. The map is the only illustrated thing in
    the product; its container, and everything around it, is quiet light UI. */
+/* The atrium's semantic names, re-pointed at the tom-modern palette. Every
+   `.nc-of` rule below reads these, so one block re-skins the whole page: the
+   canvas goes neutral near-white, ink goes to #27272a, the accent becomes the
+   single vermillion, radii go to zero, and the type pairing becomes Geist.
+   The four state colours are the comp's calibrated severity set — stop is
+   "hands needed", warn is "decision needed", go is "working". */
 .nc-of{
-  /* Both muted tiers clear 4.5:1 on --card-2. The old --ink-3 (.45) measured
-     ~3.0:1 — quiet by near-invisibility rather than by rank. */
-  --ink:#23201b; --ink-2:rgba(35,32,27,.78); --ink-3:rgba(35,32,27,.66);
-  --line:rgba(35,32,27,.10); --line-2:rgba(35,32,27,.16);
-  --page:#f6f4f0; --card:#faf8f5; --card-2:#fff;
-  --accent:#3f68c9;
-  --stop:#b0503f; --warn:#b3862c; --go:#4a7c59; --idle:#8f8b82;
-  --r:10px;
+  --ink:#27272a; --ink-2:#52525b; --ink-3:#71717a;
+  --line:#d4d4d8; --line-2:#969696;
+  --page:#fafafa; --card:#ffffff; --card-2:#ffffff;
+  --accent:#ff5a00;
+  --stop:#c81e1e; --warn:#8c6400; --go:#1f7a4d; --idle:#71717a;
+  /* Sharp corners are the brand. */
+  --r:0px;
   background:var(--page); color:var(--ink);
-  font-family:'Instrument Sans',ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
-  font-size:13px; -webkit-font-smoothing:antialiased;
+  font-family:'Geist Variable',system-ui,-apple-system,'Segoe UI',sans-serif;
+  font-size:14px; -webkit-font-smoothing:antialiased;
 }
-.nc-of .num,.nc-of .mono{font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+.nc-of .num,.nc-of .mono{font-family:'Geist Mono Variable',ui-monospace,SFMono-Regular,Menlo,monospace}
 
 .nc-of .nc-of-bar{
   display:flex; align-items:center; gap:16px; padding:13px 20px;
@@ -1683,13 +1693,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    at the top of the region it swaps. Pressed is a raised white plate — the
    accent is reserved for links and focus. */
 .nc-of .nc-of-seg{
-  display:flex; gap:2px; padding:2px; border-radius:9px; background:rgba(35,32,27,.05);
+  display:flex; gap:2px; padding:2px; border-radius:0; background:rgba(35,32,27,.05);
   overflow-x:auto; scrollbar-width:none;
 }
 .nc-of .nc-of-seg::-webkit-scrollbar{display:none}
 .nc-of .nc-of-seg-btn{
   appearance:none; border:0; background:none; cursor:pointer; white-space:nowrap;
-  font:500 12.5px/1 inherit; color:var(--ink-2); padding:0 12px; height:30px; border-radius:7px;
+  font:500 12.5px/1 inherit; color:var(--ink-2); padding:0 12px; height:30px; border-radius:0;
 }
 .nc-of .nc-of-seg-btn:hover{color:var(--ink)}
 .nc-of .nc-of-seg-btn:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
@@ -1714,16 +1724,16 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-tiles{display:flex; gap:10px; align-items:stretch}
 .nc-of .nc-of-tile{
   flex:1; display:flex; flex-direction:column; gap:4px; appearance:none; border:0; background:none;
-  font:inherit; color:inherit; text-align:left; cursor:pointer; padding:10px 12px; border-radius:8px;
+  font:inherit; color:inherit; text-align:left; cursor:pointer; padding:10px 12px; border-radius:0;
 }
 .nc-of .nc-of-tile:hover{background:rgba(35,32,27,.04)}
-.nc-of .nc-of-tile.on{background:rgba(63,104,201,.09)}
+.nc-of .nc-of-tile.on{background:rgba(255,90,0,.9)}
 .nc-of .nc-of-tile:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
 .nc-of .nc-of-clearfilter{
   appearance:none; border:0; background:none; cursor:pointer; font:inherit;
-  font-size:12px; font-weight:500; color:var(--accent); padding:4px 6px; border-radius:6px;
+  font-size:12px; font-weight:500; color:var(--accent); padding:4px 6px; border-radius:0;
 }
-.nc-of .nc-of-clearfilter:hover{background:rgba(63,104,201,.08)}
+.nc-of .nc-of-clearfilter:hover{background:rgba(255,90,0,.8)}
 .nc-of .nc-of-tile-n{
   font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:36px; font-weight:600;
   line-height:.86; letter-spacing:-.03em; font-variant-numeric:tabular-nums;
@@ -1822,7 +1832,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    filters. A wide split squeezed the map into a narrow column and clipped it. */
 .nc-of .nc-of-chip{
   appearance:none; display:inline-flex; align-items:center; gap:6px; flex:none;
-  height:28px; padding:0 10px; border-radius:7px; cursor:pointer;
+  height:28px; padding:0 10px; border-radius:0; cursor:pointer;
   border:1px solid var(--line-2); background:var(--card-2); color:var(--ink);
   font:500 11.5px/1 inherit; white-space:nowrap;
 }
@@ -1848,16 +1858,16 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-of-roomcard{
   display:flex; flex-direction:column; gap:8px; padding:10px 12px;
-  border:1px solid var(--line-2); border-radius:8px; background:var(--card-2); cursor:pointer;
+  border:1px solid var(--line-2); border-radius:0; background:var(--card-2); cursor:pointer;
 }
 .nc-of .nc-of-roomcard:hover{background:rgba(35,32,27,.03)}
-.nc-of .nc-of-roomcard.on{background:rgba(63,104,201,.09); border-color:var(--accent)}
+.nc-of .nc-of-roomcard.on{background:rgba(255,90,0,.9); border-color:var(--accent)}
 .nc-of .nc-of-roomcard:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
 .nc-of .nc-of-roomcard-head{display:flex; align-items:center; gap:7px; font:600 12.5px/1 inherit; color:var(--ink)}
 .nc-of .nc-of-roomcard-name{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .nc-of .nc-of-roomcard-n{
   margin-left:auto; font-variant-numeric:tabular-nums; font:600 11px/1 inherit; color:var(--ink-3);
-  background:rgba(35,32,27,.06); border-radius:8px; padding:2px 6px;
+  background:rgba(35,32,27,.06); border-radius:0; padding:2px 6px;
 }
 .nc-of .nc-of-roomcard-agents{display:flex; flex-wrap:wrap; gap:6px}
 .nc-of .nc-of-roomcard-empty{font-size:11.5px; color:var(--ink-3)}
@@ -1866,7 +1876,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    without also picking the room out from under them. */
 .nc-of .nc-of-facechip{
   appearance:none; border:1px solid var(--line-2); background:var(--card); cursor:pointer;
-  display:inline-flex; align-items:center; gap:5px; padding:3px 7px 3px 3px; border-radius:14px;
+  display:inline-flex; align-items:center; gap:5px; padding:3px 7px 3px 3px; border-radius:0;
   font:500 11px/1 inherit; color:var(--ink-2);
 }
 .nc-of .nc-of-facechip:hover{background:rgba(35,32,27,.05)}
@@ -1965,7 +1975,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-obs-release-hold{
   font-size:11.5px; color:var(--ink-2); background:rgba(35,32,27,.06);
-  border-radius:4px; padding:2px 7px;
+  border-radius:0; padding:2px 7px;
 }
 
 /* ONE grammar on every row, in both the queue and the job board:
@@ -2016,7 +2026,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    beat between the rows that carry it and the rows that do not. */
 .nc-of .nc-obs-ledger-blocks{
   font-size:10px; font-weight:600; letter-spacing:.01em; white-space:nowrap;
-  background:rgba(176,80,63,.13); color:var(--stop); border-radius:4px; padding:1px 5px;
+  background:rgba(176,80,63,.13); color:var(--stop); border-radius:0; padding:1px 5px;
   margin-right:7px;
 }
 /* Two lines before it truncates. The title is the content; ellipsing it at one
@@ -2046,7 +2056,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    wears inside the composer it opens. Mono for the instruction only. */
 .nc-of .nc-obs-ship{
   flex:none; margin-left:auto; font:inherit; font-size:12px; font-weight:600;
-  color:#fff; background:var(--accent); border:0; border-radius:7px;
+  color:#fff; background:var(--accent); border:0; border-radius:0;
   padding:5px 10px; min-height:28px; cursor:pointer; white-space:nowrap;
 }
 .nc-of .nc-obs-ship:hover{filter:brightness(1.08)}
@@ -2077,7 +2087,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-of-filters select{
   font:inherit; font-size:11.5px; color:var(--ink); background:var(--card-2);
-  border:1px solid var(--line-2); border-radius:7px; padding:0 8px; height:28px;
+  border:1px solid var(--line-2); border-radius:0; padding:0 8px; height:28px;
 }
 .nc-of .nc-of-filters .nc-of-clearfilter{margin-left:auto}
 
@@ -2090,11 +2100,11 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-actions-who,
 .nc-of .nc-obs-actions-room{
   font:inherit; font-size:12.5px; color:var(--ink); background:var(--card-2);
-  border:1px solid var(--line-2); border-radius:7px; padding:5px 8px; min-height:34px; max-width:100%;
+  border:1px solid var(--line-2); border-radius:0; padding:5px 8px; min-height:34px; max-width:100%;
 }
 .nc-of .nc-obs-actions button{
   font:inherit; font-size:12.5px; font-weight:600; color:#fff; background:var(--accent);
-  border:0; border-radius:7px; padding:6px 12px; min-height:34px; cursor:pointer;
+  border:0; border-radius:0; padding:6px 12px; min-height:34px; cursor:pointer;
 }
 /* Steer only OPENS the composer — it is not the act, so it does not wear the
    accent the acts wear. */
@@ -2111,7 +2121,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-obs-decide-line .nc-obs-ship-again{
   font:inherit; font-size:12px; font-weight:500; color:var(--ink-2); background:var(--card-2);
-  border:1px solid var(--line-2); border-radius:7px; padding:3px 9px; cursor:pointer;
+  border:1px solid var(--line-2); border-radius:0; padding:3px 9px; cursor:pointer;
 }
 .nc-of .nc-obs-decide-line .nc-obs-ship-again:disabled{opacity:.45; cursor:default}
 .nc-of .nc-obs-actions-none{font-size:12px; color:var(--ink-3); font-style:italic}
@@ -2134,13 +2144,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-steer-thread{
   max-height:40vh; overflow-y:auto; overscroll-behavior:contain;
   margin-top:7px; padding:8px 9px;
-  background:var(--card-2); border:1px solid var(--line-2); border-radius:7px;
+  background:var(--card-2); border:1px solid var(--line-2); border-radius:0;
 }
 .nc-of .nc-obs-steer-nopane{margin:7px 0 0; font-size:12px; font-style:italic; color:var(--ink-3)}
 .nc-of .nc-obs-steer{display:flex; gap:8px; align-items:flex-end; margin-top:6px; min-width:0}
 .nc-of .nc-obs-steer textarea{
   flex:1 1 auto; min-width:0; font:inherit; font-size:12.5px; line-height:1.45; color:var(--ink);
-  background:var(--card-2); border:1px solid var(--line-2); border-radius:7px; padding:7px 9px; resize:vertical;
+  background:var(--card-2); border:1px solid var(--line-2); border-radius:0; padding:7px 9px; resize:vertical;
 }
 .nc-of .nc-obs-steer textarea:focus{outline:2px solid var(--accent); outline-offset:1px}
 
@@ -2169,7 +2179,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-claim-slug{font-size:12.5px; overflow-wrap:anywhere}
 .nc-of .nc-obs-claim-tag{
   font-size:10px; font-weight:600; white-space:nowrap; color:var(--ink-2);
-  background:rgba(35,32,27,.06); border-radius:4px; padding:1px 5px;
+  background:rgba(35,32,27,.06); border-radius:0; padding:1px 5px;
 }
 .nc-of .nc-obs-claim-owner,.nc-of .nc-obs-claim-age{
   font-size:11.5px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
@@ -2206,7 +2216,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* The workgroup picker reads as chrome here, not as a tiny mono caption. */
 .nc-of .nc-group-title-trigger{
   font-family:inherit; font-size:12.5px; letter-spacing:0; text-transform:none;
-  color:var(--ink-2); background:none; border:1px solid var(--line); border-radius:7px;
+  color:var(--ink-2); background:none; border:1px solid var(--line); border-radius:0;
   padding:4px 9px; min-height:32px; cursor:pointer; display:inline-flex; align-items:center; gap:6px;
 }
 .nc-of .nc-group-title-trigger:hover{border-color:var(--line-2); color:var(--ink)}
@@ -2247,7 +2257,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-sheet-title{font-size:13px; font-weight:600}
 .nc-of .nc-of-sheet-x{
   margin-left:auto; appearance:none; background:none; border:0; cursor:pointer;
-  color:var(--ink-3); font-size:13px; width:32px; height:32px; border-radius:6px;
+  color:var(--ink-3); font-size:13px; width:32px; height:32px; border-radius:0;
 }
 .nc-of .nc-of-sheet-x:hover{background:rgba(35,32,27,.05); color:var(--ink)}
 .nc-of .nc-of-sheet-empty{margin:0; padding:12px 14px; font-size:12.5px; color:var(--ink-3); font-style:italic}

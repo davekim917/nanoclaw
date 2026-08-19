@@ -154,4 +154,267 @@
     text-transform: uppercase;
     color: var(--muted-foreground);
   }
+
+  /* The phone-first floor for every interactive target. Applied at the
+     component, not per screen: a target that is too small to hit is too small
+     on a desktop trackpad too, it is only forgiving there. */
+  .tm-tap {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  .tm-wordmark {
+    font-family: var(--font-sans);
+    font-weight: 700;
+    font-size: 19px;
+    letter-spacing: -0.04em;
+    color: var(--foreground);
+  }
+
+  /* ── Shell: bottom tab bar (phone) ─────────────────────────────────────── */
+  .tm-tabbar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    display: flex;
+    height: 62px;
+    background: var(--card);
+    border-top: 1px solid var(--border-soft);
+  }
+  .tm-tabbar-item {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    appearance: none;
+    border: 0;
+    border-top: 2px solid transparent;
+    background: none;
+    cursor: pointer;
+    color: var(--muted-foreground);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .tm-tabbar-item.is-active {
+    color: var(--accent);
+    border-top-color: var(--accent);
+  }
+  .tm-tabbar-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  /* The bar is fixed, so the page has to end above it. */
+  .tm-has-tabbar {
+    padding-bottom: 76px;
+  }
+
+  /* ── Shell: sidebar (desktop) ──────────────────────────────────────────── */
+  .tm-shell {
+    display: flex;
+    align-items: flex-start;
+    min-height: 100vh;
+  }
+  .tm-shell-main {
+    flex: 1;
+    min-width: 0;
+  }
+  .tm-sidebar {
+    display: flex;
+    flex-direction: column;
+    width: 220px;
+    flex-shrink: 0;
+    align-self: stretch;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    padding: 24px 20px;
+    background: var(--card);
+    border-right: 1px solid var(--border-soft);
+  }
+  .tm-sidebar-scope,
+  .tm-sidebar-foot {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted-foreground);
+  }
+  .tm-sidebar-scope {
+    margin-bottom: 28px;
+  }
+  .tm-sidebar-foot {
+    margin-top: auto;
+    font-size: 10px;
+  }
+  .tm-sidebar nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .tm-sidebar-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    appearance: none;
+    background: none;
+    border: 0;
+    border-left: 3px solid transparent;
+    padding: 10px 10px 10px 12px;
+    cursor: pointer;
+    text-align: left;
+    color: var(--fg-2);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .tm-sidebar-item:hover {
+    color: var(--foreground);
+  }
+  .tm-sidebar-item.is-active {
+    color: var(--foreground);
+    border-left-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .tm-sidebar-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  /* ── The exception feed ────────────────────────────────────────────────── */
+  .tm-feed {
+    padding: 24px 16px;
+  }
+  .tm-feed-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .tm-feed-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .tm-exc {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    /* Severity is a rule along the top edge, never a tint on the surface. */
+    border-top: 4px solid var(--sev-color, var(--border));
+    box-shadow: var(--tm-shadow-hard);
+  }
+  .tm-exc[data-severity='hands'] { --sev-color: var(--sev-hands); }
+  .tm-exc[data-severity='decision'] { --sev-color: var(--sev-decision); }
+  .tm-exc[data-severity='parked'] { --sev-color: var(--sev-parked); }
+  .tm-exc-sev {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--sev-color, var(--foreground));
+  }
+  .tm-exc-swatch {
+    width: 8px;
+    height: 8px;
+    flex-shrink: 0;
+    background: var(--sev-color, var(--foreground));
+  }
+  .tm-exc-title {
+    margin: 0;
+    font-family: var(--font-sans);
+    font-weight: 700;
+    font-size: 16px;
+    line-height: 1.35;
+    color: var(--foreground);
+  }
+  .tm-exc-meta {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted-foreground);
+  }
+  .tm-exc-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .tm-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+    padding: 10px;
+    appearance: none;
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-align: center;
+    text-decoration: none;
+  }
+  .tm-btn-primary {
+    background: var(--foreground);
+    color: var(--accent-foreground);
+    border: 1px solid var(--foreground);
+  }
+  .tm-btn-secondary {
+    background: transparent;
+    color: var(--foreground);
+    border: 1px solid var(--border);
+  }
+  .tm-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  .tm-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  /* An empty feed is a real answer and says so. */
+  .tm-allclear {
+    padding: 24px 16px;
+    background: var(--card);
+    border: 1px solid var(--border-soft);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+    text-align: center;
+  }
+
+  @media (min-width: 980px) {
+    .tm-feed {
+      padding: 20px 32px;
+    }
+    .tm-feed-stack {
+      flex-direction: row;
+    }
+    .tm-exc {
+      flex: 1;
+      padding: 14px;
+      gap: 8px;
+    }
+    .tm-exc-title {
+      font-size: 14px;
+      line-height: 1.3;
+    }
+  }
 }

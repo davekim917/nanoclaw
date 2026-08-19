@@ -17,7 +17,9 @@ import {
   type ScheduledSnapshot,
 } from '../lib/api.js';
 import { relAge } from '../lib/derive.js';
-import { type BoardRoute } from './BoardShell.js';
+import { useIsMobile, type BoardRoute } from './BoardShell.js';
+import { AppNav, type NavKey } from './AppNav.js';
+import { deriveExceptions, SEVERITY_LABEL, type ExceptionItem } from './exceptions.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildLedger, classify, dueLabel, type Commitment } from './commitments.js';
 import {
@@ -115,9 +117,9 @@ interface ObservatoryProps {
 }
 
 // Props are the shell's routing contract, kept so main.tsx and the legacy
-// boards stay uniform. The Observatory itself no longer navigates: it is the
-// only destination, and detail opens over the floor rather than away from it.
-export function Observatory({ authMe }: ObservatoryProps) {
+// boards stay uniform. The one destination the Observatory navigates AWAY to is
+// the inbox, from the shell nav; everything else opens over the floor.
+export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
   const { data: wgData } = useSWR('/dashboard/api/workgroups', () => listWorkgroups(), { refreshInterval: 0 });
   const workgroups = wgData?.workgroups ?? [];
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -364,6 +366,37 @@ export function Observatory({ authMe }: ObservatoryProps) {
     setExpandedClaim((prev) => (prev === claim.slug ? null : claim.slug));
   };
 
+  // What needs a person, computed once and read by both the feed and the floor
+  // — a room is outlined only if the feed above it says something is wrong in
+  // there, and the two must never be derived twice.
+  const exceptions = useMemo(() => (snapshot ? deriveExceptions(snapshot) : []), [snapshot]);
+
+  // The shell's four destinations. Three are bands of this page (it is one long
+  // page on a phone, and jumping to a band is what a tab bar is for); the
+  // fourth leaves for the inbox route, which still exists.
+  const isMobile = useIsMobile();
+  const [navKey, setNavKey] = useState<NavKey>('overview');
+  const officeRef = useRef<HTMLDivElement>(null);
+  const scheduleRef = useRef<HTMLDivElement>(null);
+  const navigateTo = (key: NavKey) => {
+    if (key === 'inbox') {
+      onRouteChange('inbox');
+      return;
+    }
+    setNavKey(key);
+    if (key === 'scheduled') setView('board');
+    else setView('overview');
+    // The band may not be mounted until the view switch has rendered.
+    const target = key === 'office' ? officeRef : key === 'scheduled' ? scheduleRef : null;
+    requestAnimationFrame(() => {
+      if (!target?.current) {
+        window.scrollTo({ top: 0 });
+        return;
+      }
+      target.current.scrollIntoView({ block: 'start' });
+    });
+  };
+
   const assign =
     authMe.scopes.role !== 'member' && selectedId
       ? { workgroupId: selectedId, agents: agents.map((a) => ({ id: a.id, name: a.name })), rooms }
@@ -379,7 +412,17 @@ export function Observatory({ authMe }: ObservatoryProps) {
         : `${agents.length} agents · ${rooms.length} channels`;
 
   return (
-    <div className="nc-frame nc-of">
+    <div className={`nc-frame nc-of tm-shell ${isMobile ? 'tm-has-tabbar' : ''}`}>
+      {!isMobile && (
+        <AppNav
+          active={navKey}
+          isMobile={false}
+          onSelect={navigateTo}
+          scope={workgroups.find((w) => w.id === selectedId)?.name}
+          foot={snapshot ? `Fleet · ${agents.length} agents` : undefined}
+        />
+      )}
+      <div className="tm-shell-main">
       <header className="nc-of-bar">
         <span className="nc-of-bar-title">The Observatory</span>
         <WorkgroupPicker workgroups={workgroups} selectedId={selectedId} onChange={selectWorkgroup} />
@@ -426,12 +469,28 @@ export function Observatory({ authMe }: ObservatoryProps) {
                 the bar. They belong to the Overview, under the floor whose
                 rooms they are counting. */}
 
+            {/* Layout law 0: what needs a person is the FIRST thing on the
+                page, above the floor. Everything below it explains or qualifies
+                it; nothing below it is more urgent than it. */}
+            {view === 'overview' && (
+              <ExceptionFeed
+                exceptions={exceptions}
+                claims={claims}
+                items={allItems}
+                onAgent={(agentId, roomKey) => {
+                  setAgentDrawerId(agentId);
+                  setAgentDrawerRoomKey(roomKey);
+                }}
+                {...(assign ? { assign } : {})}
+              />
+            )}
+
             <div className="nc-obs-main">
               {/* The floor is the vendored <office-map> custom element: a
                   tile-based, hand-authored plan with real furniture, pan, and
                   teleport. Geometry is FIXED; only who is in which room comes
                   from data. */}
-              <div className="nc-of-left">
+              <div className="nc-of-left" ref={officeRef}>
               {/* Overview only. The floor is the answer to "what is going on",
                   which is the overview's question; on the job board it was a
                   full screen of illustration between the reader and the rows
@@ -693,7 +752,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       roomLinks={roomLinks}
                       {...(assign ? { assign } : {})}
                     />
-                    <div className="nc-of-twoup">
+                    <div className="nc-of-twoup" ref={scheduleRef}>
                       <ClaimsCard
                         claims={claims}
                         expandedSlug={expandedClaim}
@@ -737,6 +796,8 @@ export function Observatory({ authMe }: ObservatoryProps) {
         {snapshot && error && <span className="nc-obs-stale">stale since {relAge(snapshot.asOf)} ago</span>}
         {!snapshot && !error && <span>—</span>}
       </footer>
+      </div>
+      {isMobile && <AppNav active={navKey} isMobile onSelect={navigateTo} />}
     </div>
   );
 }
@@ -1111,6 +1172,123 @@ export function CommitmentStrip({
           </p>
         )}
       </div>
+    </section>
+  );
+}
+
+/* ─── The exception feed — the front door ────────────────────────────────── */
+
+/**
+ * What needs a person, worst first, above everything else on the page.
+ *
+ * The derivation is `deriveExceptions` (views/exceptions.ts) and is tested on
+ * its own; this component only draws it. The actions are not new: an item and a
+ * claim each get {@link WorkActions}, the same row they get on every other
+ * surface, so the feed can never offer more or less than the board does about
+ * the same piece of work. A blocked agent gets the one affordance an agent has
+ * — open its drawer, where its actual work rows live — disabled with a reason
+ * when it has no live session to steer into.
+ */
+function ExceptionFeed({
+  exceptions,
+  claims,
+  items,
+  assign,
+  onAgent,
+  now = Date.now(),
+}: {
+  exceptions: ExceptionItem[];
+  claims: ObservatoryClaim[];
+  items: ReleaseItem[];
+  assign?: AssignWiring;
+  onAgent: (agentId: string, roomKey: string | null) => void;
+  now?: number;
+}) {
+  const claimBySlug = useMemo(() => new Map(claims.map((c) => [c.slug, c])), [claims]);
+  const itemById = useMemo(() => new Map(items.map((i) => [i.id, i])), [items]);
+
+  return (
+    <section className="tm-feed" data-section="exceptions">
+      <div className="tm-feed-head">
+        <span className="tm-eyebrow">Needs attention ({exceptions.length})</span>
+      </div>
+      {exceptions.length === 0 ? (
+        // An empty feed is an answer, not an absence of one.
+        <p className="tm-allclear" data-testid="exceptions-all-clear">
+          All clear — nothing needs a person
+        </p>
+      ) : (
+        <div className="tm-feed-stack">
+          {exceptions.map((e) => (
+            <article key={e.key} className="tm-exc" data-severity={e.severity} data-exception={e.key}>
+              <span className="tm-exc-sev">
+                <i className="tm-exc-swatch" />
+                {SEVERITY_LABEL[e.severity]}
+              </span>
+              <p className="tm-exc-title">{e.title}</p>
+              {/* An age nobody measured renders as an em dash, never as "0m". */}
+              <p className="tm-exc-meta">{e.ageMs === null ? '—' : `waiting ${magnitude(e.ageMs, now + e.ageMs)}`}</p>
+              <div className="tm-exc-actions">
+                {e.actions.map((a) => {
+                  if (a.kind === 'open') {
+                    return (
+                      <a
+                        key="open"
+                        className="tm-btn tm-btn-primary tm-tap"
+                        href={a.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Open
+                      </a>
+                    );
+                  }
+                  if (a.kind === 'steer') {
+                    return (
+                      <button
+                        key="steer"
+                        type="button"
+                        className="tm-btn tm-btn-primary tm-tap"
+                        data-action="steer"
+                        disabled={!a.sessionId}
+                        title={a.sessionId ? 'open this agent’s work' : 'no live session to steer into'}
+                        onClick={() => onAgent(a.agentId, e.roomKey)}
+                      >
+                        Steer
+                      </button>
+                    );
+                  }
+                  if (a.kind === 'assign') {
+                    const item = itemById.get(a.itemId);
+                    return (
+                      <WorkActions
+                        key="assign"
+                        target={{ kind: 'item', id: a.itemId, channel: a.channel ?? undefined, assignable: true }}
+                        threadUrl={item?.steeredThread?.threadUrl ?? null}
+                        room={{ name: a.channel }}
+                        ownerAgent={null}
+                        {...(assign ? { wiring: assign } : {})}
+                      />
+                    );
+                  }
+                  const claim = claimBySlug.get(a.slug);
+                  return (
+                    <WorkActions
+                      key="nudge"
+                      target={{ kind: 'claim', slug: a.slug, pushable: claim ? claimPushable(claim) : false }}
+                      threadUrl={claim?.threadUrl ?? null}
+                      sessionId={claim?.sessionId ?? null}
+                      room={workRoom(a.threadId)}
+                      ownerAgent={null}
+                      {...(assign ? { wiring: assign } : {})}
+                    />
+                  );
+                })}
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
     </section>
   );
 }

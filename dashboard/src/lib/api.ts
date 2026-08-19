@@ -558,6 +558,14 @@ export interface ReleaseItem {
   /** Slack channel the work lives in, e.g. '#qa-room'. Routes assignment. */
   channel?: string;
   /**
+   * The watcher's own classification of the item, passed through verbatim by
+   * the host. Only `bucket` is read here — `decision` and `escalated` are what
+   * the exception feed sorts on (see views/exceptions.ts). Everything else in
+   * the object is the watcher's business, so the shape stays open rather than
+   * pretending this client knows the full vocabulary.
+   */
+  meta?: { bucket?: string; [key: string]: unknown };
+  /**
    * The thread this item has ALREADY been steered into, if anyone has. An item
    * carries no thread of its own — the host remembers the first one that was
    * opened for it (`observatory_item_threads`) so the second press of a ship
