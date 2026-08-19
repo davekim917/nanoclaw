@@ -32,7 +32,6 @@ import {
   type SessionTranscriptEntry,
 } from '../lib/api.js';
 import { TranscriptList, normalizeSessionEntry } from './TranscriptList.js';
-import { OfficeMap } from './OfficeMap.js';
 import { buildOfficeData, agentState } from './office-data.js';
 import { AgentAvatar } from './AgentAvatar.js';
 import { FloorPlan } from './FloorPlan.js';
@@ -48,10 +47,10 @@ import { WorkgroupPicker } from './WorkgroupDashboard.js';
  *
  *   1. the headline — three equal stats (stalled, need a person, moving on
  *      their own) and the coverage gaps that qualify them, stated once;
- *   2. the office — the vendored <office-map> custom element, a hand-authored
- *      tile plan where each channel is a room and each agent sits in the room
- *      it last worked in. Geometry is FIXED; only occupancy comes from data.
- *      Picking a room opens the room sheet and filters what is below;
+ *   2. the office — a schematic floor plan (a room strip on a phone) where
+ *      each channel is a room and each agent sits in the room it last worked
+ *      in. Geometry is FIXED; only occupancy comes from data. Picking a room
+ *      opens the room sheet and filters what is below;
  *   3. ONE content region, chosen by the segmented control in the top bar:
  *      overview (the needs-attention queue) or the job board, which carries the
  *      claims and schedule cards beneath it.
@@ -75,24 +74,6 @@ const POLL_MS = 15_000;
 /** Whether the floor is unfolded. Absent means expanded — the default view. */
 const MAP_OPEN_KEY = 'nc-obs-map-open';
 
-/** Plan or Map. The schematic plan is the floor now — outlined zones on a
- *  blueprint grid, findable twice, glanceable at a fixed scale. `map` is the
- *  legacy pixel renderer, still reachable and still unmounted unless it is
- *  explicitly picked; it goes away with its own commit once the visual gate has
- *  passed on the plan. A stored `tiles` (the renderer the plan replaced) falls
- *  through to `plan`, which is what it was showing anyway. */
-const OBS_VIEW_KEY = 'nc-obs-view';
-
-/** Map zoom: persisted like the fold state, same reasoning — an operator who
-    picks a zoom level should not have to pick it again on every visit. */
-const MAP_SCALE_KEY = 'nc-obs-map-scale';
-const MAP_SCALE_MIN = 0.6;
-const MAP_SCALE_MAX = 3;
-const MAP_SCALE_STEP = 0.2;
-/* obs.C.15 — default view zoomed in enough that a room reads at a glance
-   without the floor plan vanishing to a postage stamp. */
-const MAP_SCALE_DEFAULT = 1.7;
-const clampMapScale = (v: number) => Math.min(MAP_SCALE_MAX, Math.max(MAP_SCALE_MIN, +v.toFixed(2)));
 
 /**
  * The segmented control. Local state — the Observatory has exactly one URL.
@@ -170,28 +151,9 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
   useEffect(() => {
     localStorage.setItem(MAP_OPEN_KEY, String(mapOpen));
   }, [mapOpen]);
-  // The plan is the default for a fresh browser; only an explicit 'map'
-  // switches it. The legacy map stays unmounted while the plan is showing — it
-  // builds a large SVG, and a hidden-but-mounted map is not free.
-  const [obsView, setObsView] = useState<'plan' | 'map'>(() =>
-    localStorage.getItem(OBS_VIEW_KEY) === 'map' ? 'map' : 'plan',
-  );
-  useEffect(() => {
-    localStorage.setItem(OBS_VIEW_KEY, obsView);
-  }, [obsView]);
-  const [mapScale, setMapScale] = useState(() => {
-    const saved = Number(localStorage.getItem(MAP_SCALE_KEY));
-    return Number.isFinite(saved) && saved > 0 ? clampMapScale(saved) : MAP_SCALE_DEFAULT;
-  });
-  useEffect(() => {
-    localStorage.setItem(MAP_SCALE_KEY, String(mapScale));
-  }, [mapScale]);
-  const zoomMapBy = (delta: number) => setMapScale((s) => clampMapScale(s + delta));
-  const resetMapScale = () => setMapScale(MAP_SCALE_DEFAULT);
   const [jobTab, setJobTab] = useState<JobTabKey>('queue');
   const [selectedRoom, setSelectedRoom] = useState<string>('');
   const [flowFilter, setFlowFilter] = useState<FlowSlice | null>(null);
-  const [teleportTo, setTeleportTo] = useState<string | null>(null);
   const [expandedClaim, setExpandedClaim] = useState<string | null>(null);
   // The agent whose pin was clicked — opens the agent drawer over whatever
   // view is showing. Independent of selectedRoom: picking a room and picking
@@ -243,11 +205,10 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
     // floor runs out of slots — and the sheet would then show a different
     // room's people (and their claims) under the picked room's name.
     //
-    // A slotted room is picked by its SLOT (what the map and its teleport
-    // chips use); an overflow room has none, so the tile view picks it by its
-    // own KEY instead — see OfficeTiles' `tileKey`. Both are searched here so
-    // a tile click on an overflow channel filters the page exactly like a
-    // click on a slotted one does.
+    // A slotted room is picked by its SLOT (what the floor plan uses); an
+    // overflow room has none, so it is picked by its own KEY instead. Both are
+    // searched here so picking an overflow channel filters the page exactly
+    // like picking a zoned one does.
     const room =
       officeData.rooms.find((r) => r.slot === selectedRoom) ??
       officeData.overflowRooms.find((r) => r.key === selectedRoom);
@@ -334,15 +295,6 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
         : ledgerCounts.onTrack
     : 0;
 
-  // Where the camera opens. The plan's first slot is at its left edge, so
-  // defaulting there spent the first screen on lawn. Open on the room that
-  // most needs looking at — worst state first, then most occupied.
-  const startSlot = useMemo(() => {
-    const rank: Record<string, number> = { blocked: 0, waiting: 1, working: 2, idle: 3 };
-    return [...officeData.rooms].sort(
-      (a, b) => (rank[a.state] ?? 9) - (rank[b.state] ?? 9) || b.agents.length - a.agents.length,
-    )[0]?.slot;
-  }, [officeData]);
 
   const pickRoom = (k: string) => {
     setSelectedRoom((prev) => (prev === k ? '' : k));
@@ -506,10 +458,9 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
             )}
 
             <div className="nc-obs-main">
-              {/* The floor is the vendored <office-map> custom element: a
-                  tile-based, hand-authored plan with real furniture, pan, and
-                  teleport. Geometry is FIXED; only who is in which room comes
-                  from data. */}
+              {/* The floor: eleven fixed zones on a blueprint grid, or the
+                  room strip on a phone. Geometry is FIXED; only who is in
+                  which room comes from data. */}
               <div className="nc-of-left" ref={officeRef}>
               {/* Overview only. The floor is the answer to "what is going on",
                   which is the overview's question; on the job board it was a
@@ -522,9 +473,7 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
                   <span className="nc-of-mapcard-title">The office</span>
                   {mapOpen && (
                     <span className="nc-of-mapcard-hint">
-                      {obsView === 'map'
-                        ? 'drag to pan · tap a room to filter what is below'
-                        : 'tap a room to filter what is below'}
+                      tap a room to filter what is below
                     </span>
                   )}
                   {/* obs.C.15 — one flex unit, not four independent chips. Each
@@ -533,67 +482,10 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
                       stranding it alone; grouping them lets the whole cluster
                       wrap together on a narrow header. */}
                   <div className="nc-of-mapcard-actions">
-                    {/* The schematic plan is the floor; Map is the legacy pixel
-                        renderer, kept reachable only until the visual gate has
-                        passed on the plan — it and this chip go together in
-                        their own commit. */}
-                    <div className="nc-of-viewtoggle" role="group" aria-label="Floor view">
-                      <button
-                        type="button"
-                        className={`nc-of-chip ${obsView === 'plan' ? 'on' : ''}`}
-                        data-obs-view="plan"
-                        aria-pressed={obsView === 'plan'}
-                        onClick={() => setObsView('plan')}
-                      >
-                        Plan
-                      </button>
-                      <button
-                        type="button"
-                        className={`nc-of-chip ${obsView === 'map' ? 'on' : ''}`}
-                        data-obs-view="map"
-                        aria-pressed={obsView === 'map'}
-                        onClick={() => setObsView('map')}
-                      >
-                        Map
-                      </button>
-                    </div>
                     {mapOpen && selectedRoom && (
                       <button type="button" className="nc-of-chip" onClick={closeRoom}>
                         All rooms
                       </button>
-                    )}
-                    {mapOpen && obsView === 'map' && (
-                      <>
-                        <button
-                          type="button"
-                          className="nc-of-chip nc-of-zoom"
-                          onClick={() => zoomMapBy(-MAP_SCALE_STEP)}
-                          disabled={mapScale <= MAP_SCALE_MIN}
-                          aria-label="Zoom out"
-                          title="Zoom out"
-                        >
-                          −
-                        </button>
-                        <button
-                          type="button"
-                          className="nc-of-chip nc-of-zoom"
-                          onClick={resetMapScale}
-                          aria-label="Reset zoom"
-                          title="Reset zoom"
-                        >
-                          Reset
-                        </button>
-                        <button
-                          type="button"
-                          className="nc-of-chip nc-of-zoom"
-                          onClick={() => zoomMapBy(MAP_SCALE_STEP)}
-                          disabled={mapScale >= MAP_SCALE_MAX}
-                          aria-label="Zoom in"
-                          title="Zoom in"
-                        >
-                          +
-                        </button>
-                      </>
                     )}
                     <button
                       type="button"
@@ -606,7 +498,7 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
                     </button>
                   </div>
                 </div>
-                {mapOpen && obsView === 'plan' && (
+                {mapOpen && (
                   <>
                     {/* One floor, two presentations. A phone gets the strip —
                         a fixed eleven-zone plan is unreadable at 390px — and
@@ -659,46 +551,6 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
                           </div>
                         )}
                       </>
-                    )}
-                  </>
-                )}
-                {mapOpen && obsView === 'map' && (
-                  <>
-                    <OfficeMap
-                      data={officeData}
-                      {...(startSlot ? { start: startSlot } : {})}
-                      selected={selectedRoom}
-                      onSelect={pickRoom}
-                      onAgentSelect={({ name, room: slot }) =>
-                        selectAgentInRoom(name, officeData.rooms.find((r) => r.slot === slot)?.key ?? null)
-                      }
-                      teleportTo={teleportTo}
-                      scale={String(mapScale)}
-                      onScaleChange={(s) => setMapScale(clampMapScale(s))}
-                    />
-                    <div className="nc-of-teleport">
-                      {officeData.rooms.map((r) => (
-                        <button
-                          key={r.slot}
-                          type="button"
-                          className={`nc-of-chip ${selectedRoom === r.slot ? 'on' : ''}`}
-                          onClick={() => {
-                            setTeleportTo(r.slot);
-                            pickRoom(r.slot);
-                          }}
-                        >
-                          <i className={`nc-of-sd ${r.state}`} />
-                          {r.label}
-                        </button>
-                      ))}
-                    </div>
-                    {officeData.overflow.length > 0 && (
-                      // Its own line: inside the chip row this dead-end sentence sat
-                      // on the same baseline as five controls and read as one.
-                      <p className="nc-of-overflow">
-                        {officeData.overflow.length} more{' '}
-                        {officeData.overflow.length === 1 ? 'channel has' : 'channels have'} no room on this floor
-                      </p>
                     )}
                   </>
                 )}

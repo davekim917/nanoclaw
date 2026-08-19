@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { render, act } from '@testing-library/react';
+import { render } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 vi.mock('swr', () => {
@@ -171,12 +171,6 @@ async function segment(c: HTMLElement, view: 'overview' | 'decisions' | 'board')
   await userEvent.click(c.querySelector(`.nc-of-seg-btn[data-view="${view}"]`)! as HTMLElement);
 }
 
-/** Switch the floor from its default (Tiles) to Map — the only way to reach
- *  the `<office-map>` element and its zoom/fold/teleport behavior in a test. */
-async function toMap(c: HTMLElement) {
-  await userEvent.click(c.querySelector('[data-obs-view="map"]')! as HTMLElement);
-}
-
 describe('Observatory', () => {
   beforeEach(() => {
     vi.stubGlobal('matchMedia', (query: string) => ({
@@ -311,7 +305,6 @@ describe('Observatory', () => {
       // The plan, not the map: the schematic floor is the default, and the
       // legacy map stays unmounted (not just hidden) while it isn't active.
       expect(container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
-      expect(container.querySelector('office-map')).toBeFalsy();
       expect(container.querySelector('[data-section="queue"]')).toBeTruthy();
       expect(container.querySelector('[data-section="board"]')).toBeFalsy();
     });
@@ -396,75 +389,6 @@ describe('Observatory', () => {
       expect(third.container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
     });
 
-    it('folding the map away hides its teleport chips too — chips that teleport a map nobody can see are controls for nothing', async () => {
-      full();
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await toMap(container);
-      expect(container.querySelector('office-map')).toBeTruthy();
-      expect(container.querySelector('.nc-of-teleport')).toBeTruthy();
-      await userEvent.click(container.querySelector('.nc-of-mapfold')! as HTMLElement);
-      expect(container.querySelector('office-map')).toBeFalsy();
-      expect(container.querySelector('.nc-of-teleport')).toBeFalsy();
-    });
-
-    // obs.C.15 — the default view was zoomed out enough that a room was
-    // unreadable; 1.7 is the picked-by-eye default that keeps a room legible
-    // without losing the floor.
-    it('opens zoomed in past the old 1.15 default', async () => {
-      localStorage.clear();
-      full();
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await toMap(container);
-      const map = container.querySelector('office-map')!;
-      expect(map.getAttribute('scale')).toBe('1.7');
-    });
-
-    it('offers zoom controls next to the fold control, and they move the scale attribute', async () => {
-      localStorage.clear();
-      full();
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await toMap(container);
-      const map = container.querySelector('office-map')!;
-      const actions = container.querySelector('.nc-of-mapcard-actions')!;
-      const zoomIn = actions.querySelector('[aria-label="Zoom in"]')! as HTMLElement;
-      const zoomOut = actions.querySelector('[aria-label="Zoom out"]')! as HTMLElement;
-      const reset = actions.querySelector('[aria-label="Reset zoom"]')! as HTMLElement;
-      // grouped with the fold control, in the same action cluster
-      expect(actions.querySelector('.nc-of-mapfold')).toBeTruthy();
-
-      await userEvent.click(zoomIn);
-      expect(map.getAttribute('scale')).toBe('1.9');
-      await userEvent.click(zoomOut);
-      await userEvent.click(zoomOut);
-      expect(map.getAttribute('scale')).toBe('1.5');
-      await userEvent.click(reset);
-      expect(map.getAttribute('scale')).toBe('1.7');
-    });
-
-    it('remembers the chosen zoom across visits, and forgets on a clean slate', async () => {
-      localStorage.clear();
-      full();
-      const first = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await toMap(first.container);
-      const zoomIn = () =>
-        first.container.querySelector('.nc-of-mapcard-actions [aria-label="Zoom in"]')! as HTMLElement;
-      await userEvent.click(zoomIn());
-      await userEvent.click(zoomIn());
-      expect(first.container.querySelector('office-map')!.getAttribute('scale')).toBe('2.1');
-      first.unmount();
-
-      // The view choice itself persisted 'map' from the click above, so this
-      // visit already opens on the map — the scale is what is under test here.
-      const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(second.container.querySelector('office-map')!.getAttribute('scale')).toBe('2.1');
-      second.unmount();
-
-      localStorage.clear();
-      const third = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await toMap(third.container);
-      expect(third.container.querySelector('office-map')!.getAttribute('scale')).toBe('1.7');
-    });
-
     // obs.C.12 — Claims and Schedule were segments that showed one card the job
     // board already carries, and are gone. obs.D.1 added Decisions, which is
     // the opposite case: a question no card on this page answered.
@@ -518,33 +442,6 @@ describe('Observatory', () => {
           ],
         }),
       );
-
-    it('is the default view, and the map stays unmounted rather than merely hidden', () => {
-      localStorage.clear();
-      tilesFixture();
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(container.querySelector('[data-obs-view="plan"]')!.getAttribute('aria-pressed')).toBe('true');
-      expect(container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
-      expect(container.querySelector('office-map')).toBeFalsy();
-    });
-
-    it('switches to Map and remembers the choice on the next visit; forgets on a clean slate', async () => {
-      tilesFixture();
-      const first = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await toMap(first.container);
-      expect(first.container.querySelector('office-map')).toBeTruthy();
-      expect(first.container.querySelector('[data-testid="floor-plan"]')).toBeFalsy();
-      first.unmount();
-
-      const second = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(second.container.querySelector('[data-obs-view="map"]')!.getAttribute('aria-pressed')).toBe('true');
-      expect(second.container.querySelector('office-map')).toBeTruthy();
-      second.unmount();
-
-      localStorage.clear();
-      const third = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      expect(third.container.querySelector('[data-testid="floor-plan"]')).toBeTruthy();
-    });
 
     it('renders a channel the plan has no zone left for beside it, rather than dropping it', () => {
       localStorage.clear();
@@ -732,9 +629,9 @@ describe('Observatory', () => {
             room({ key: 'slack:C2', name: '#other', memberAgentIds: ['ag-zed'] }),
           ],
           agents: [
-            agent({ id: 'ag-ava', name: 'ava' }),
-            agent({ id: 'ag-kit', name: 'kit' }),
-            agent({ id: 'ag-zed', name: 'zed' }),
+            agent({ id: 'ag-ava', name: 'ava', location: 'slack:C1', holding: ['stuck', 'orphan', 'moving'] }),
+            agent({ id: 'ag-kit', name: 'kit', location: 'slack:C1', holding: ['hers'] }),
+            agent({ id: 'ag-zed', name: 'zed', location: 'slack:C2' }),
           ],
           claims: [
             claim({
@@ -769,14 +666,10 @@ describe('Observatory', () => {
       await segment(container, 'board');
       return container;
     };
-    /** The floor — where the map, the room sheet and the agent drawer live.
-     *  Switches to Map: these tests dispatch `office-map`'s own DOM events,
-     *  which needs the element mounted, not the tiles view that is now the
-     *  default. */
-    const openFloor = async () => {
+    /** The floor — where the room sheet and the agent drawer are opened from. */
+    const openFloor = () => {
       stalledBoard();
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await toMap(container);
       return container;
     };
     const expand = async (c: HTMLElement, slug: string) => {
@@ -1003,29 +896,18 @@ describe('Observatory', () => {
     // The sweep itself: one component, present on every surface that draws a
     // claim or an item. A new surface that forgets it fails right here.
     it('is on the room sheet’s held rows', async () => {
-      const c = await openFloor();
-      await act(async () => {
-        c.querySelector('office-map')!.dispatchEvent(
-          new CustomEvent('room-select', { detail: { key: 'slot-0' }, bubbles: true }),
-        );
-      });
-      const sheet = c.querySelector('.nc-of-sheet');
-      if (sheet) expect(sheet.querySelectorAll('.nc-of-sheet-held-row .nc-obs-actions').length).toBeGreaterThan(0);
+      const c = openFloor();
+      await userEvent.click(c.querySelector('[data-room="slack:C1"]')! as unknown as Element);
+      const sheet = c.querySelector('.nc-of-sheet')!;
+      expect(sheet.querySelectorAll('.nc-of-sheet-held-row .nc-obs-actions').length).toBeGreaterThan(0);
     });
 
     it('is on the agent drawer’s rows', async () => {
-      const c = await openFloor();
-      await act(async () => {
-        c.querySelector('office-map')!.dispatchEvent(
-          new CustomEvent('agent-select', { detail: { name: 'ava', room: 'slot-0' }, bubbles: true }),
-        );
-      });
+      const c = openFloor();
+      await userEvent.click(c.querySelector('[data-occupant="ava"]')! as unknown as Element);
       const drawer = c.querySelector('[data-testid="agent-drawer"]')!;
-      const toggle = drawer.querySelector('.nc-obs-claim-toggle');
-      if (toggle) {
-        await userEvent.click(toggle as HTMLElement);
-        expect(drawer.querySelector('.nc-obs-actions')).toBeTruthy();
-      }
+      await userEvent.click(drawer.querySelector('.nc-obs-claim-toggle')! as HTMLElement);
+      expect(drawer.querySelector('.nc-obs-actions')).toBeTruthy();
     });
 
     it('is on every job-board slice’s rows', async () => {

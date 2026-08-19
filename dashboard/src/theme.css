@@ -75,6 +75,9 @@
     --fg-2: #52525b;
     --card: #ffffff;
     --card-foreground: #27272a;
+    /* tom-modern's own name for the same white. Declared separately so the
+       older `.nc-of` vocabulary can alias onto it without a self-reference. */
+    --surface: #ffffff;
     --popover: #ffffff;
     --popover-foreground: #27272a;
     --muted: #f4f4f5;

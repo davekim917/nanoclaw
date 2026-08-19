@@ -1,38 +1,9 @@
-/* ── Web fonts ────────────────────────────────────────────────────────────
-   Self-hosted, not a CDN: the dashboard sits behind auth and should not make
-   a request to a third party on every load, and a blocked CDN would silently
-   drop the type the atrium system specifies. Latin subset only; any glyph the
-   file lacks (CJK in a channel name, say) falls through the family stack the
-   way it always did. Instrument Sans ships as one variable file covering the
-   400-600 range we use.
-   ──────────────────────────────────────────────────────────────────────── */
-@font-face {
-  font-family: 'Instrument Sans';
-  src: url('./fonts/instrument-sans-var.woff2') format('woff2-variations');
-  font-weight: 400 700;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'IBM Plex Mono';
-  src: url('./fonts/ibm-plex-mono-400.woff2') format('woff2');
-  font-weight: 400; font-style: normal; font-display: swap;
-}
-@font-face {
-  font-family: 'IBM Plex Mono';
-  src: url('./fonts/ibm-plex-mono-500.woff2') format('woff2');
-  font-weight: 500; font-style: normal; font-display: swap;
-}
-@font-face {
-  font-family: 'IBM Plex Mono';
-  src: url('./fonts/ibm-plex-mono-600.woff2') format('woff2');
-  font-weight: 600; font-style: normal; font-display: swap;
-}
-
 /* ────────────────────────────────────────────────────────────
-   Agent Board — orchestration control surface
-   Warm near-black palette, status as the only colour carrier.
-   IBM Plex Sans body / JetBrains Mono labels & numbers.
+   Agent Board — orchestration control surface.
+
+   The tokens below are the tom-modern light theme (see theme.css, which owns
+   the values and the type). This sheet is the legacy chrome that reads them,
+   and it shrinks as surfaces migrate onto the component layer.
 
    Tweak wrappers (applied at root by main.tsx):
      .tw-statusbar   — add left status accent bar to cards
@@ -1624,10 +1595,9 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-agent-drawer-section { margin-bottom: 18px; }
 
 /* ─── Observatory — the office page ──────────────────────────────────────────
-   Scoped to `.nc-of`. The floor is the vendored <office-map> custom element,
-   which carries its own palette; everything AROUND it is the atrium light
-   chrome defined further down. The CSS pixel-art floor this section used to
-   hold, and the painted-wall header that framed it, are gone with it. */
+   Scoped to `.nc-of`. The floor itself is drawn by FloorPlan.tsx and styled in
+   theme.css alongside the rest of the component layer; what lives here is the
+   chrome around it, and it shrinks as surfaces move across. */
 
 .nc-frame.nc-of {
   background: var(--page);
@@ -1656,24 +1626,22 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    width and pushed the whole page past a 390px viewport. */
 .nc-of .nc-obs-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; align-items: start; }
 
-/* ─── atrium: the light chrome ───────────────────────────────────────────── */
-/* One system across every surface. The map is the only illustrated thing in
-   the product; its container, and everything around it, is quiet light UI. */
-/* The atrium's semantic names, re-pointed at the tom-modern palette. Every
-   `.nc-of` rule below reads these, so one block re-skins the whole page: the
-   canvas goes neutral near-white, ink goes to #27272a, the accent becomes the
-   single vermillion, radii go to zero, and the type pairing becomes Geist.
-   The four state colours are the comp's calibrated severity set — stop is
-   "hands needed", warn is "decision needed", go is "working". */
+/* ─── The Observatory's own token names ──────────────────────────────────── */
+/* ALIASES ONLY. This block used to be a second palette — a light one, defined
+   in hex, sitting alongside a dark one at :root, with nothing switching
+   between them. There is one palette now, its values live in theme.css, and
+   every name below simply points at it. Nothing here may take a literal
+   colour: two places to change a colour is how the two palettes drifted apart
+   in the first place.
+   The names themselves stay because ~400 rules under this line read them, and
+   renaming those buys nothing a reader can see. */
 .nc-of{
-  --ink:#27272a; --ink-2:#52525b; --ink-3:#71717a;
-  --line:#d4d4d8; --line-2:#969696;
-  --page:#fafafa; --card:#ffffff; --card-2:#ffffff;
-  --accent:#ff5a00;
-  /* The accent, darkened until 12-13px text on white clears AA. Fills, rules
-     and outlines keep --accent; only TEXT uses this. */
-  --accent-text:#c24500;
-  --stop:#c81e1e; --warn:#8c6400; --go:#1f7a4d; --idle:#71717a;
+  --ink:var(--foreground); --ink-2:var(--fg-2); --ink-3:var(--muted-foreground);
+  --line:var(--border-soft); --line-2:var(--border);
+  --page:var(--background); --card:var(--surface); --card-2:var(--surface);
+  /* --accent and --accent-text are theme.css's; only the state names below
+     need mapping onto this sheet's older vocabulary. */
+  --stop:var(--sev-hands); --warn:var(--sev-decision); --go:var(--sev-working); --idle:var(--muted-foreground);
   /* Sharp corners are the brand. */
   --r:0px;
   background:var(--page); color:var(--ink);
@@ -1740,7 +1708,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-of-clearfilter:hover{background:rgba(255,90,0,.8)}
 .nc-of .nc-of-tile-n{
-  font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:36px; font-weight:600;
+  font-family:var(--font-mono); font-size:36px; font-weight:600;
   line-height:.86; letter-spacing:-.03em; font-variant-numeric:tabular-nums;
 }
 .nc-of .nc-of-tile-n.stop{color:var(--stop)}
@@ -1781,9 +1749,8 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   .nc-of .nc-of-notes p{font-size:12px; line-height:1.4}
 }
 
-/* ─── The office map card ────────────────────────────────────────────────── */
-/* The floor is the vendored <office-map> element. Its chrome is deliberately
-   quiet — the map is the only illustrated surface, its container is not. */
+/* ─── The office card ────────────────────────────────────────────────────── */
+/* The floor is the only drawn surface in the product; its container is not. */
 .nc-of .nc-of-mapcard{
   background:var(--card-2); border:1px solid var(--line); border-radius:var(--r); overflow:hidden;
   box-shadow:0 1px 2px rgba(35,32,27,.05); margin-bottom:12px;
@@ -1796,45 +1763,16 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-mapcard.collapsed .nc-of-mapcard-head{border-bottom:0}
 .nc-of .nc-of-mapcard-title{font-size:12.5px; font-weight:600; color:var(--ink)}
 .nc-of .nc-of-mapcard-hint{font-size:12px; color:var(--ink-3)}
-/* obs.C.15 — one flex unit carries every trailing control (All rooms, zoom,
-   fold) to the right edge together, and wraps as a cluster on a narrow header
-   instead of each chip claiming its own margin-left:auto and splitting the
-   line wherever the first one ran out of room. */
+/* obs.C.15 — one flex unit carries every trailing control (All rooms, fold) to
+   the right edge together, and wraps as a cluster on a narrow header instead of
+   each chip claiming its own margin-left:auto and splitting the line wherever
+   the first one ran out of room. */
 .nc-of .nc-of-mapcard-actions{
   display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; margin-left:auto;
 }
-/* The plan is larger than any viewport, so the bottom edge always cuts through
-   furniture. The fade reads as "there is more below"; a hard edge read as the
-   illustration running out. */
 .nc-of .nc-of-mapcard-head{border-bottom:1px solid var(--line)}
-/* Height is CSS-owned so it can answer the viewport. At 385px the one
-   illustrated surface in the product was the most space-starved thing on the
-   page; the fade is deep enough now to read as a viewport edge, not a clip. */
-.nc-of office-map{
-  display:block; height:clamp(460px,66vh,900px);
-  -webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 40px),transparent);
-  mask-image:linear-gradient(to bottom,#000 calc(100% - 40px),transparent);
-}
-/* The plan is bigger than any viewport, so the bottom edge is a cut through
-   furniture. The fade says "there is more, drag it" instead of "the image ran
-   out"; the hint says it in words for anyone who reads before dragging. */
-.nc-of .nc-of-teleport{
-  display:flex; gap:7px; padding:9px 12px 11px; border-top:1px solid var(--line);
-  overflow-x:auto; align-items:center; scrollbar-width:none;
-  /* The row scrolls; without the fade the last chip reads as clipped-broken.
-     The fade is wide enough that a chip is always cut mid-chip, never flush
-     with the card edge, which is what made it read as broken rather than as
-     "there is more this way". */
-  -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 40px),transparent);
-  mask-image:linear-gradient(to right,#000 calc(100% - 40px),transparent);
-}
-.nc-of .nc-of-teleport::-webkit-scrollbar{display:none}
-.nc-of .nc-of-overflow{
-  margin:0; padding:0 12px 10px; font-size:11.5px; color:var(--ink-3);
-}
-
-/* One column at every width: the floor is full-bleed above the queue it
-   filters. A wide split squeezed the map into a narrow column and clipped it. */
+/* The plan is drawn to fit — no fade, no clip, no drag. It is glanceable at a
+   fixed scale, which is what a schematic buys over an illustration. */
 .nc-of .nc-of-chip{
   appearance:none; display:inline-flex; align-items:center; gap:6px; flex:none;
   min-height:44px; padding:0 12px; border-radius:0; cursor:pointer;
@@ -1844,69 +1782,18 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-chip:hover{background:rgba(35,32,27,.04)}
 .nc-of .nc-of-chip.on{background:var(--ink); color:var(--card); border-color:var(--ink)}
 .nc-of .nc-of-chip:disabled{opacity:.4; cursor:default; pointer-events:none}
-/* obs.C.15 — the −/Reset/+ trio sits with the fold chip; − and + are a single
-   glyph each, so a fixed min-width keeps all three from jittering in size as
-   the percentage changes on the buttons around them. */
-.nc-of .nc-of-chip.nc-of-zoom{min-width:44px; justify-content:center; padding:0 8px; font-variant-numeric:tabular-nums}
 .nc-of .nc-of-sd{width:6px; height:6px; border-radius:50%; flex:none; background:var(--idle)}
 .nc-of .nc-of-sd.blocked{background:var(--stop)}
 .nc-of .nc-of-sd.waiting{background:var(--warn)}
 .nc-of .nc-of-sd.working{background:var(--go)}
-.nc-of .nc-of-viewtoggle{display:flex; gap:4px}
-
-/* obs.C.35 — Tiles: the pre-map reading, a full sibling of the floor rather
-   than a fallback. No SVG, no pan; a responsive card grid that degrades to one
-   column on its own once a card's ~260px minimum stops fitting two abreast —
-   the same trick the grid already does, no extra breakpoint needed. */
-.nc-of .nc-of-roomgrid{
-  display:grid; grid-template-columns:repeat(auto-fill, minmax(260px,1fr)); gap:10px; padding:12px;
-}
-.nc-of .nc-of-roomcard{
-  display:flex; flex-direction:column; gap:8px; padding:10px 12px;
-  border:1px solid var(--line-2); border-radius:0; background:var(--card-2); cursor:pointer;
-}
-.nc-of .nc-of-roomcard:hover{background:rgba(35,32,27,.03)}
-.nc-of .nc-of-roomcard.on{background:rgba(255,90,0,.9); border-color:var(--accent)}
-.nc-of .nc-of-roomcard:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
-.nc-of .nc-of-roomcard-head{display:flex; align-items:center; gap:7px; font:600 12.5px/1 inherit; color:var(--ink)}
-.nc-of .nc-of-roomcard-name{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
-.nc-of .nc-of-roomcard-n{
-  margin-left:auto; font-variant-numeric:tabular-nums; font:600 11px/1 inherit; color:var(--ink-3);
-  background:rgba(35,32,27,.06); border-radius:0; padding:2px 6px;
-}
-.nc-of .nc-of-roomcard-agents{display:flex; flex-wrap:wrap; gap:6px}
-.nc-of .nc-of-roomcard-empty{font-size:11.5px; color:var(--ink-3)}
-/* The agent chip nests inside the card's own click target on purpose (see the
-   stopPropagation in Observatory.tsx) — clicking a person opens the drawer
-   without also picking the room out from under them. */
-.nc-of .nc-of-facechip{
-  appearance:none; border:1px solid var(--line-2); background:var(--card); cursor:pointer;
-  display:inline-flex; align-items:center; gap:5px; padding:3px 7px 3px 3px; border-radius:0;
-  font:500 11px/1 inherit; color:var(--ink-2);
-}
-.nc-of .nc-of-facechip:hover{background:rgba(35,32,27,.05)}
-.nc-of .nc-of-facechip.working{border-color:var(--go); color:var(--ink)}
-.nc-of .nc-of-facechip.blocked{border-color:var(--stop)}
-/* Same crisp-edge read as the map's own face token. */
-.nc-of .nc-of-facechip-face{
-  display:block; flex:none; width:20px; height:20px; border-radius:50%;
-  image-rendering:pixelated; background:#d9d4c8; box-shadow:0 0 0 1px rgba(44,40,34,.18);
-}
-.nc-of .nc-of-facechip-face.i{filter:grayscale(1)}
-.nc-of .nc-of-facechip-fallback{
-  display:flex; align-items:center; justify-content:center; background:var(--line-2); color:var(--ink-2);
-  font:600 10px/1 inherit;
-}
-.nc-of .nc-of-facechip-pulse{
-  width:6px; height:6px; border-radius:50%; background:var(--go); flex:none;
-  animation:nc-pulse 1.6s ease-in-out infinite;
-}
-.nc-of .nc-of-facechip-z{font-size:9.5px; color:var(--ink-3); letter-spacing:.02em}
 
 /* Phone: the bar carries the title, the picker and the one live number. The
    agent/channel counts are reference, not signal, and pushed the live dot off
-   the right edge — nothing may be wider than the viewport but the map. */
+   the right edge — nothing on this page may be wider than the viewport. */
 @media (max-width:700px){
+  /* flex-wrap is load-bearing: the segmented control below takes `order:2` and
+     a forced 100% width, and without a wrap it has no line of its own to take
+     — it just runs off the right edge instead. */
   .nc-of .nc-of-bar{gap:10px; padding:11px 14px; flex-wrap:wrap}
   /* Below ~420px the two-word title and the hint each wrapped mid-phrase. */
   .nc-of .nc-of-bar-title{white-space:nowrap; font-size:13.5px}
@@ -1917,7 +1804,6 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
      segmented control gets order:2 and a forced 100% width below it. */
   .nc-of .nc-of-bar-meta{gap:10px; flex:none; order:1}
   .nc-of .nc-of-bar-count{display:none}
-  .nc-of .nc-of-teleport{padding:9px 12px 9px 12px}
   /* obs.C.36 — the segmented control used to share the title's row and
      shrink into whatever space was left, so it scrolled internally rather
      than growing; Decisions and Job board were reachable only by finding a
@@ -2084,7 +1970,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    button, same inline done/error line. It is the same act, one row over. */
 /* obs.C.11 / obs.C.10 — ONE filter grammar, on the claims card and on the
    queue: chips narrow by a fixed vocabulary, a native select narrows by a name
-   the data supplies. Same chip as the teleport row, so a control that filters
+   the data supplies. Same chip the floor's own controls use, so a filter
    looks the same everywhere on this page. */
 .nc-of .nc-of-filters{
   display:flex; gap:7px; align-items:center; flex-wrap:wrap;
@@ -2327,7 +2213,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   display:inline-flex; align-items:center; min-height:32px;
 }
 .nc-sd .nc-sd-back:hover{color:var(--accent); text-decoration:underline}
-.nc-sd .mono{font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+.nc-sd .mono{font-family:var(--font-mono)}
 .nc-sd .nc-of-bar-meta .nc-of-live{text-transform:none}
 
 .nc-sd .nc-sd-body{max-width:880px; margin:0 auto; padding:14px 16px 24px}
@@ -2415,7 +2301,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sd .nc-composer textarea{color:var(--ink); font-family:inherit}
 .nc-sd .nc-composer textarea::placeholder{color:var(--ink-3)}
 .nc-sd .nc-composer .row{
-  font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:11px;
+  font-family:var(--font-mono); font-size:11px;
   letter-spacing:0; text-transform:none; color:var(--ink-3);
 }
 .nc-sd .nc-composer .row .over{color:var(--stop)}
