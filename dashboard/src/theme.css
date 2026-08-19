@@ -1,0 +1,157 @@
+/* Tom Modern — the dashboard's one theme.
+ *
+ * Light-first and single: there is no dark palette here on purpose. The old
+ * stylesheet carried two hard-coded palettes (a dark `:root` and a light
+ * `.nc-of` block) with no toggle between them; this file replaces the token
+ * layer for both with one editorial-technical system — near-white canvas, ink
+ * text, a single vermillion accent, 0px radius, hard offset shadows.
+ *
+ * Structure, not colour, is what makes a later dark mode cheap: every surface
+ * reads a token, so a `.dark` block can define the same names again. Shipping
+ * shadcn's stock dark values would have been a second, uncalibrated palette
+ * nothing in this design was drawn against, so it is not here.
+ *
+ * Palette source: design-artifact-loop's `tom-modern` design system, plus the
+ * four severity colours calibrated on the approved comp.
+ */
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: 'Geist Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-mono: 'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-border-soft: var(--border-soft);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    /* Severity is the one place this design spends colour. Each maps to exactly
+       one real state, never to decoration. */
+    --color-sev-hands: var(--sev-hands);
+    --color-sev-decision: var(--sev-decision);
+    --color-sev-parked: var(--sev-parked);
+    --color-sev-working: var(--sev-working);
+    --shadow-hard: var(--tm-shadow-hard);
+    --shadow-soft: var(--tm-shadow-soft);
+    --radius-sm: var(--radius);
+    --radius-md: var(--radius);
+    --radius-lg: var(--radius);
+    --radius-xl: var(--radius);
+    --radius-2xl: var(--radius);
+    --radius-3xl: var(--radius);
+    --radius-4xl: var(--radius);
+}
+
+:root {
+    /* ── tom-modern surfaces / ink / borders ─────────────────────────────── */
+    --background: #fafafa;
+    --foreground: #27272a;
+    --fg-2: #52525b;
+    --card: #ffffff;
+    --card-foreground: #27272a;
+    --popover: #ffffff;
+    --popover-foreground: #27272a;
+    --muted: #f4f4f5;
+    --muted-foreground: #71717a;
+    --border: #969696;
+    --border-soft: #d4d4d8;
+    --input: #969696;
+
+    /* ── the single accent ───────────────────────────────────────────────── */
+    --accent: #ff5a00;
+    --accent-foreground: #ffffff;
+    --accent-hover: #e85200;
+    --accent-soft: rgba(255, 90, 0, 0.08);
+    --ring: #ff5a00;
+
+    /* Primary is INK, not the accent: tom-modern's primary button is a dark
+       fill and the vermillion stays reserved for emphasis. */
+    --primary: #27272a;
+    --primary-foreground: #ffffff;
+    --secondary: #ffffff;
+    --secondary-foreground: #27272a;
+    --destructive: #c81e1e;
+
+    --sidebar: #ffffff;
+    --sidebar-foreground: #27272a;
+    --sidebar-primary: #ff5a00;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: rgba(255, 90, 0, 0.08);
+    --sidebar-accent-foreground: #27272a;
+    --sidebar-border: #d4d4d8;
+    --sidebar-ring: #ff5a00;
+
+    /* Sharp corners are the brand — never raise this. */
+    --radius: 0px;
+
+    /* ── elevation: hard offsets, never soft blur ────────────────────────── */
+    --tm-shadow-hard: 8px 8px 0 rgba(150, 150, 150, 0.12);
+    --tm-shadow-soft: 4px 4px 0 rgba(150, 150, 150, 0.1);
+
+    /* ── blueprint grid ──────────────────────────────────────────────────── */
+    --grid-line: rgba(150, 150, 150, 0.05);
+
+    /* ── severity, calibrated on the comp ────────────────────────────────── */
+    --sev-hands: #c81e1e;    /* hands needed / blocked — vermillion-family red */
+    --sev-decision: #8c6400; /* decision needed — gold, hue clear of the accent */
+    --sev-parked: #5b4b8a;   /* parked — ink violet */
+    --sev-working: #1f7a4d;  /* working — restrained green */
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+
+@layer components {
+  /* The page's own atmosphere: a 30px blueprint grid over the canvas. */
+  .tm-grid {
+    background-image:
+      linear-gradient(var(--grid-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+    background-size: 30px 30px;
+  }
+
+  /* Uppercase mono label — section eyebrows, metadata, button text. */
+  .tm-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+  }
+}
