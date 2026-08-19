@@ -1,4 +1,5 @@
 import { AgentAvatar } from './AgentAvatar.js';
+import { SmokeMark } from './SmokeMark.js';
 import type { OfficeData } from './office-data.js';
 
 /**
@@ -18,12 +19,15 @@ export function RoomStrip({
   onSelect,
   onAgentSelect,
   alertRooms,
+  vignettes,
 }: {
   data: OfficeData;
   selected: string;
   onSelect: (key: string) => void;
   onAgentSelect: (name: string, roomKey: string) => void;
   alertRooms: Set<string>;
+  /** Room keys whose bound signal is live right now. Unknown keys are ignored. */
+  vignettes?: Set<string> | undefined;
 }) {
   // A slotted room is picked by its SLOT (what the plan and the page filter
   // use); an overflow room has none, so it is picked by its own key.
@@ -40,20 +44,24 @@ export function RoomStrip({
           className={`tm-room ${selected === r.tileKey ? 'is-selected' : ''}`}
           data-room={r.key}
           data-alert={alertRooms.has(r.key) ? 'true' : 'false'}
-          role="button"
-          tabIndex={0}
-          onClick={() => onSelect(r.tileKey)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              onSelect(r.tileKey);
-            }
-          }}
         >
-          <span className="tm-room-label">{r.label.replace(/^#/, '')}</span>
-          {r.agents.length === 0 ? (
-            <span className="tm-room-empty">Empty</span>
-          ) : (
+          {/* The card is a plain container and the room is a real <button>
+              inside it, NOT the other way round. A role="button" wrapper around
+              the occupant buttons is invalid nesting, and Enter on an occupant
+              bubbled to the wrapper — opening the room sheet AND the agent
+              drawer from one keypress. The button owns the label and the empty
+              state, so it is still most of the card to tap. */}
+          <button
+            type="button"
+            className="tm-room-pick tm-tap"
+            data-room-pick={r.key}
+            onClick={() => onSelect(r.tileKey)}
+          >
+            <span className="tm-room-label">{r.label.replace(/^#/, '')}</span>
+            {r.agents.length === 0 && <span className="tm-room-empty">Empty</span>}
+          </button>
+          {vignettes?.has(r.key) && <SmokeMark />}
+          {r.agents.length > 0 && (
             <div className="tm-room-avatars">
               {r.agents.map((a) => (
                 <button
@@ -63,13 +71,7 @@ export function RoomStrip({
                   data-occupant={a.name}
                   title={a.name}
                   aria-label={a.name}
-                  // The chip nests inside the card's own click target; stop the
-                  // click here so picking a person does not also pick the room
-                  // out from under it.
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onAgentSelect(a.name, r.key);
-                  }}
+                  onClick={() => onAgentSelect(a.name, r.key)}
                 >
                   <AgentAvatar name={a.name} avatarUrl={a.avatarUrl} status={a.status} size={30} />
                 </button>

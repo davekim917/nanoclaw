@@ -120,11 +120,15 @@ export function deriveExceptions(scene: ObservatorySnapshot, now = Date.now()): 
     });
   }
 
-  // A claim that has stopped moving. `staleMs` is the only age a claim carries
-  // on this wire — the board's own "how long past the deadline" — so it is what
-  // the card shows, rather than a claimed-at the snapshot does not ship.
+  // A claim that has stopped moving: gone stale on its own, or PARKED by the
+  // fleet. Parked is not the milder case — somebody put the work down on
+  // purpose and nobody picked it back up — so both classes land here.
+  //
+  // `staleMs` is the only age a claim carries on this wire (the board's own
+  // "how long past the deadline"), so it is what the card shows, rather than a
+  // claimed-at the snapshot does not ship.
   for (const claim of scene.claims) {
-    if (claim.state !== 'stale' || out.has(claim.slug)) continue;
+    if ((claim.state !== 'stale' && claim.state !== 'parked') || out.has(claim.slug)) continue;
     out.set(claim.slug, {
       key: claim.slug,
       source: 'claim',

@@ -360,6 +360,11 @@ function parseSignalBinding(raw: unknown): SignalBinding | null {
  * `/etc` passes every textual check. The parent is resolved rather than the
  * file itself because the file legitimately may not exist yet (a campaign that
  * has never run), and an absent file is inactive, not rejected.
+ *
+ * This covers the DIRECTORY chain only. The final component is the other half,
+ * and it is handled at read time with `O_NOFOLLOW` — see readContainedState.
+ * Splitting it that way is what lets an absent file stay inactive rather than
+ * rejected while a symlinked one is refused outright.
  */
 function containedStatePath(workgroupDir: string, file: string): string | null {
   if (path.isAbsolute(file)) return null;
@@ -380,19 +385,72 @@ function containedStatePath(workgroupDir: string, file: string): string | null {
   }
 }
 
+/**
+ * Exactly what `Date.prototype.toISOString` emits, and nothing else.
+ *
+ * `Date.parse` is far more forgiving than R7's contract: it accepts
+ * "12/25/2026", "Dec 25 2026 10:00", and a pile of other shapes whose meaning
+ * is engine- and locale-dependent. A liveness stamp that only PARSES is not a
+ * timestamp a room's state may be asserted from.
+ */
+const ISO_STAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+
+/**
+ * Read the state file WITHOUT ever following a symlink on its final component.
+ *
+ * `containedStatePath` proves the file's directory chain resolves inside the
+ * workgroup; this closes the other half. A state file that is ITSELF a symlink
+ * pointing out of the workgroup passes every parent check — `readFileSync`
+ * would happily follow it and read whatever it aimed at. `O_NOFOLLOW` makes the
+ * kernel refuse (ELOOP) instead, `fstat` on the descriptor rejects anything
+ * that is not a regular file (a fifo would block the poll; a directory is not
+ * state), and the read comes FROM THE DESCRIPTOR — so nothing can be swapped
+ * underneath between the check and the read.
+ *
+ * Returns null for absent, unreadable, not-a-regular-file, symlinked, or
+ * oversized. Every one of those means "not running", which is the honest
+ * reading of a liveness marker that is not simply there.
+ */
+function readContainedState(statePath: string): string | null {
+  let fd: number | undefined;
+  try {
+    // O_NONBLOCK matters as much as O_NOFOLLOW: opening a FIFO for reading
+    // BLOCKS until a writer shows up, and that open happens before fstat can
+    // reject it — so without this a fifo in the state path hangs the poll
+    // itself, not just this read. On a regular file it is a no-op.
+    fd = fs.openSync(statePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return null;
+    // A liveness marker is a few hundred bytes. Anything else is not one, and
+    // the poll must not be made to read it.
+    if (st.size > 1_000_000) return null;
+    return fs.readFileSync(fd, 'utf8');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+}
+
 /** Whether the producer's own freshness stamp says this signal is live NOW. */
 function signalIsFresh(statePath: string, freshKey: string, maxAgeSeconds: number, now: number): boolean {
+  const text = readContainedState(statePath);
+  if (text === null) return false;
   let raw: unknown;
   try {
-    raw = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    raw = JSON.parse(text);
   } catch {
-    // Absent, unreadable, or not JSON. All three mean "not running", which is
-    // the honest reading of a liveness marker that isn't there.
     return false;
   }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
   const stamp = (raw as Record<string, unknown>)[freshKey];
-  if (typeof stamp !== 'string') return false;
+  if (typeof stamp !== 'string' || !ISO_STAMP.test(stamp)) return false;
   const at = Date.parse(stamp);
   if (!Number.isFinite(at)) return false;
   // Open at the old end, closed at the new: exactly at the age limit the

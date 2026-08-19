@@ -36,6 +36,7 @@ import { buildOfficeData, agentState } from './office-data.js';
 import { AgentAvatar } from './AgentAvatar.js';
 import { FloorPlan } from './FloorPlan.js';
 import { RoomStrip } from './RoomStrip.js';
+import { SmokeMark } from './SmokeMark.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
 
 
@@ -511,6 +512,7 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
                         onSelect={pickRoom}
                         onAgentSelect={selectAgentInRoom}
                         alertRooms={alertRooms}
+                        vignettes={activeVignettes}
                       />
                     ) : (
                       <>
@@ -544,6 +546,9 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
                                   >
                                     <i className={`nc-of-sd ${r.state}`} />
                                     {r.label}
+                                    {/* A room with no zone still says when a
+                                        run is live in it. */}
+                                    {activeVignettes.has(r.key) && <SmokeMark />}
                                   </button>
                                 </li>
                               ))}

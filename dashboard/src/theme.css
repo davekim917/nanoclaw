@@ -9,14 +9,15 @@
  * Structure, not colour, is what makes a later dark mode cheap: every surface
  * reads a token, so a `.dark` block can define the same names again. Shipping
  * shadcn's stock dark values would have been a second, uncalibrated palette
- * nothing in this design was drawn against, so it is not here.
+ * nothing in this design was drawn against, so it is not here. Its base
+ * stylesheet went the same way: no shadcn component is vendored, so it styled
+ * nothing. `components.json` stays, so `pnpm dlx shadcn@4.18.0 add <x>` still
+ * works the day one earns its place.
  *
  * Palette source: design-artifact-loop's `tom-modern` design system, plus the
  * four severity colours calibrated on the approved comp.
  */
 @import "tailwindcss";
-@import "tw-animate-css";
-@import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
 @import "@fontsource-variable/geist-mono";
 
@@ -615,6 +616,10 @@
     flex-direction: column;
     gap: 8px;
   }
+  .tm-overflow .tm-smokemark {
+    position: static;
+    margin-left: 2px;
+  }
   .tm-overflow ul {
     margin: 0;
     padding: 0;
@@ -633,6 +638,7 @@
     -webkit-overflow-scrolling: touch;
   }
   .tm-room {
+    position: relative;
     flex: 0 0 auto;
     width: 148px;
     display: flex;
@@ -642,17 +648,12 @@
     background: var(--card);
     border: 1px solid var(--border);
     box-shadow: var(--tm-shadow-soft);
-    cursor: pointer;
   }
   .tm-room[data-alert='true'] {
     border-color: var(--accent);
   }
   .tm-room.is-selected {
     background: var(--accent-soft);
-  }
-  .tm-room:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
   }
   .tm-room-label {
     font-family: var(--font-mono);
@@ -678,6 +679,46 @@
     cursor: pointer;
   }
   .tm-room-occupant:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  /* The room-card / overflow form of the vignette. The wisps carry the same
+     class as the floor plan's, so the reduced-motion rule covers both. */
+  .tm-smokemark {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: inline-flex;
+    pointer-events: none;
+  }
+  .tm-sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+  /* The room button is most of the card, and the card owns the framing. */
+  .tm-room-pick {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    width: 100%;
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+  }
+  .tm-room-pick:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }

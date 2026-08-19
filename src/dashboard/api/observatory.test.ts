@@ -7,6 +7,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
+import { execFileSync } from 'child_process';
 
 // Config is mocked to a test-only root because claims-board.ts reads
 // DATA_DIR/workgroups/*/claims/*.json directly via claimsBaseDir().
@@ -1086,6 +1087,65 @@ describe('readWorkgroupSignals', () => {
     fs.symlinkSync(SIG_ROOT, path.join(wgDir(), 'escape'), 'dir');
     writeConfig([binding({ file: 'escape/outside.json' })]);
     expect(read()).toEqual([]);
+  });
+
+  it('refuses a state file that is ITSELF a symlink pointing out of the workgroup', () => {
+    // The parent chain is entirely legitimate here — only the final component
+    // is the escape, which is exactly what a parent-only realpath check misses.
+    const outside = path.join(SIG_ROOT, 'outside.json');
+    fs.writeFileSync(outside, JSON.stringify({ progressAt: minutesAgo(1) }));
+    fs.mkdirSync(path.join(wgDir(), 'runner'), { recursive: true });
+    fs.symlinkSync(outside, path.join(wgDir(), 'runner', 'run-active.json'));
+    writeConfig([binding()]);
+
+    // The entry is still emitted (it is a bound room), but it reports quiet —
+    // and, the part that matters, the file outside was never read. A reader
+    // that followed the link would have found a 1-minute-old stamp and said
+    // `active: true`.
+    expect(read()).toEqual([{ room: 'slack:C0FEED', vignette: 'smoke', active: false }]);
+  });
+
+  it('refuses a state file that is not a regular file, rather than blocking the poll on it', () => {
+    writeConfig([binding()]);
+    fs.mkdirSync(path.join(wgDir(), 'runner'), { recursive: true });
+
+    // A directory is the easy case — the read would throw EISDIR regardless.
+    fs.mkdirSync(path.join(wgDir(), 'runner', 'run-active.json'));
+    expect(read()![0]!.active).toBe(false);
+    fs.rmdirSync(path.join(wgDir(), 'runner', 'run-active.json'));
+
+    // A FIFO is the case O_NONBLOCK exists for: opening one for reading BLOCKS
+    // until a writer shows up, and that open happens before fstat can reject
+    // it — so without the flag this assertion does not fail, it hangs the
+    // suite, exactly as it would hang the 15s observatory poll. The fstat
+    // regular-file check beside it is defence in depth: with the flag, the
+    // size cap and JSON.parse already refuse everything it refuses.
+    execFileSync('mkfifo', [path.join(wgDir(), 'runner', 'run-active.json')]);
+    expect(read()![0]!.active).toBe(false);
+  });
+
+  it('refuses a timestamp that parses but is not the ISO shape R7 names', () => {
+    writeConfig([binding()]);
+    // Every one of these is accepted by Date.parse and none is an ISO instant:
+    // their meaning is engine- and locale-dependent, which is not something a
+    // room's live state may be asserted from.
+    for (const stamp of [
+      'December 25, 2026 10:00:00',
+      '12/25/2026',
+      '2026-08-19 12:00:00',
+      '2026-08-19T12:00:00',
+      '2026-08-19T12:00:00+00:00',
+      String(NOW),
+    ]) {
+      writeState('runner/run-active.json', { progressAt: stamp });
+      expect(read()![0]!.active).toBe(false);
+    }
+    // …while the shape toISOString actually emits is accepted, with or
+    // without the milliseconds.
+    writeState('runner/run-active.json', { progressAt: new Date(NOW - 60_000).toISOString() });
+    expect(read()![0]!.active).toBe(true);
+    writeState('runner/run-active.json', { progressAt: '2026-08-19T11:59:00Z' });
+    expect(read()![0]!.active).toBe(true);
   });
 
   it('reads the workgroup’s own directory, not a neighbour’s', () => {

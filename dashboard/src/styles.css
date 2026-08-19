@@ -1700,13 +1700,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   font:inherit; color:inherit; text-align:left; cursor:pointer; padding:10px 12px; border-radius:0;
 }
 .nc-of .nc-of-tile:hover{background:rgba(35,32,27,.04)}
-.nc-of .nc-of-tile.on{background:rgba(255,90,0,.9)}
+.nc-of .nc-of-tile.on{background:var(--accent-soft)}
 .nc-of .nc-of-tile:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
 .nc-of .nc-of-clearfilter{
   appearance:none; border:0; background:none; cursor:pointer; font:inherit;
   font-size:12px; font-weight:500; color:var(--accent-text); padding:4px 6px; min-height:44px; border-radius:0;
 }
-.nc-of .nc-of-clearfilter:hover{background:rgba(255,90,0,.8)}
+.nc-of .nc-of-clearfilter:hover{background:var(--accent-soft)}
 .nc-of .nc-of-tile-n{
   font-family:var(--font-mono); font-size:36px; font-weight:600;
   line-height:.86; letter-spacing:-.03em; font-variant-numeric:tabular-nums;
@@ -2324,14 +2324,14 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 
 /* ── Issue brief (Decisions view expanded row) ─────────────────────────── */
-.nc-of .nc-obs-brief{margin-top:10px; padding:10px 12px; border:1px solid var(--nc-line, #e4e1da); border-radius:0; display:flex; flex-direction:column; gap:8px}
-.nc-of .nc-obs-brief-empty{margin-top:10px; font-size:12.5px; color:var(--nc-ink-3, #8a8578); font-style:italic}
+.nc-of .nc-obs-brief{margin-top:10px; padding:10px 12px; border:1px solid var(--line); border-radius:0; display:flex; flex-direction:column; gap:8px}
+.nc-of .nc-obs-brief-empty{margin-top:10px; font-size:12.5px; color:var(--ink-3); font-style:italic}
 .nc-of .nc-obs-brief-labels{display:flex; flex-wrap:wrap; gap:6px; align-items:center}
-.nc-of .nc-obs-brief-state{font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:1px 7px; border-radius:0; border:1px solid var(--nc-line, #e4e1da); color:var(--nc-ink-2, #5d594e)}
-.nc-of .nc-obs-brief-state.open{color:#3a7d44; border-color:#3a7d4433}
-.nc-of .nc-obs-brief-label{font-size:11px; padding:1px 7px; border-radius:0; background:var(--nc-wash, #f4f2ec); color:var(--nc-ink-2, #5d594e)}
-.nc-of .nc-obs-brief-body{font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; max-height:180px; overflow-y:auto; color:var(--nc-ink-2, #5d594e)}
-.nc-of .nc-obs-brief-comments{display:flex; flex-direction:column; gap:6px; border-top:1px dashed var(--nc-line, #e4e1da); padding-top:8px}
-.nc-of .nc-obs-brief-more{font-size:11px; color:var(--nc-ink-3, #8a8578)}
+.nc-of .nc-obs-brief-state{font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:1px 7px; border-radius:0; border:1px solid var(--line); color:var(--ink-2)}
+.nc-of .nc-obs-brief-state.open{color:var(--go); border-color:var(--go)}
+.nc-of .nc-obs-brief-label{font-size:11px; padding:1px 7px; border-radius:0; background:var(--bg-inset); color:var(--ink-2)}
+.nc-of .nc-obs-brief-body{font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; max-height:180px; overflow-y:auto; color:var(--ink-2)}
+.nc-of .nc-obs-brief-comments{display:flex; flex-direction:column; gap:6px; border-top:1px dashed var(--line); padding-top:8px}
+.nc-of .nc-obs-brief-more{font-size:11px; color:var(--ink-3)}
 .nc-of .nc-obs-brief-comment p{margin:2px 0 0; font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; max-height:120px; overflow-y:auto}
-.nc-of .nc-obs-brief-author{font-size:11px; font-weight:600; color:var(--nc-ink-3, #8a8578)}
+.nc-of .nc-obs-brief-author{font-size:11px; font-weight:600; color:var(--ink-3)}

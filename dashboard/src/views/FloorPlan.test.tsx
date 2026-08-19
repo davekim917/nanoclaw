@@ -225,7 +225,7 @@ describe('RoomStrip', () => {
     expect(onAgentSelect).toHaveBeenCalledWith('Agent2', 'r2');
     expect(onSelect).not.toHaveBeenCalled();
 
-    await userEvent.click(container.querySelector('[data-room="r2"]')!);
+    await userEvent.click(container.querySelector('[data-room="r2"] .tm-room-pick')!);
     // Slotted rooms are picked by their SLOT, the same key the page filters on.
     expect(onSelect).toHaveBeenCalledWith('eastFront');
   });
@@ -242,7 +242,7 @@ describe('RoomStrip', () => {
         alertRooms={new Set()}
       />,
     );
-    await userEvent.click(container.querySelector('[data-room="r12"]')!);
+    await userEvent.click(container.querySelector('[data-room="r12"] .tm-room-pick')!);
     expect(onSelect).toHaveBeenCalledWith('r12');
   });
 
@@ -320,5 +320,71 @@ describe('the vignette, under reduced motion', () => {
       expect(container.querySelectorAll('.tm-smoke-wisp')).toHaveLength(0);
       unmount();
     }
+  });
+});
+
+describe('RoomStrip signals and keyboard', () => {
+  const strip = (props: Partial<Parameters<typeof RoomStrip>[0]> = {}) => {
+    const { rooms, agents } = floor(3);
+    return render(
+      <RoomStrip
+        data={buildOfficeData(rooms, agents, [], {}, NOW)}
+        selected=""
+        onSelect={noop}
+        onAgentSelect={noop}
+        alertRooms={new Set()}
+        {...props}
+      />,
+    );
+  };
+
+  it('shows the smoke mark on the live room only — a phone is the only floor it gets', () => {
+    const { container } = strip({ vignettes: new Set(['r2']) });
+    expect(container.querySelectorAll('[data-vignette="smoke"]')).toHaveLength(1);
+    expect(container.querySelector('[data-room="r2"] [data-vignette="smoke"]')).toBeTruthy();
+    // Same class the floor plan's wisps carry, so the one reduced-motion rule
+    // in the stylesheet covers both presentations.
+    expect(container.querySelectorAll('[data-room="r2"] .tm-smoke-wisp')).toHaveLength(3);
+  });
+
+  it('shows nothing when the signal is quiet, absent, or names a room this floor lacks', () => {
+    for (const v of [undefined, new Set<string>(), new Set(['not-a-room'])]) {
+      const { container, unmount } = strip(v === undefined ? {} : { vignettes: v });
+      expect(container.querySelectorAll('[data-vignette="smoke"]')).toHaveLength(0);
+      unmount();
+    }
+  });
+
+  it('nests no interactive element inside another', () => {
+    const { container } = strip();
+    for (const el of Array.from(container.querySelectorAll('button, [role="button"]'))) {
+      expect(el.querySelector('button, [role="button"]')).toBeNull();
+    }
+  });
+
+  it('fires ONLY onAgentSelect for Enter and Space on an occupant', async () => {
+    for (const key of ['{Enter}', ' ']) {
+      const onSelect = vi.fn();
+      const onAgentSelect = vi.fn();
+      const { container, unmount } = strip({ onSelect, onAgentSelect });
+      const chip = container.querySelector('[data-occupant="Agent2"]') as HTMLElement;
+      chip.focus();
+      await userEvent.keyboard(key);
+      expect(onAgentSelect).toHaveBeenCalledWith('Agent2', 'r2');
+      expect(onSelect).not.toHaveBeenCalled();
+      unmount();
+    }
+  });
+
+  it('still picks the room from its own button, by keyboard and by pointer', async () => {
+    const onSelect = vi.fn();
+    const { container } = strip({ onSelect });
+    const pick = container.querySelector('[data-room="r2"] .tm-room-pick') as HTMLElement;
+    pick.focus();
+    await userEvent.keyboard('{Enter}');
+    expect(onSelect).toHaveBeenCalledWith('eastFront');
+    onSelect.mockClear();
+    await userEvent.click(pick);
+    expect(onSelect).toHaveBeenCalledWith('eastFront');
   });
 });

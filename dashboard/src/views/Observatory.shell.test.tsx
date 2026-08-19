@@ -265,6 +265,31 @@ describe('room signals on the floor', () => {
     expect(unbound.container.querySelectorAll('[data-vignette="smoke"]')).toHaveLength(0);
   });
 
+  it('draws the live room on the PHONE too — the strip is the only floor it gets', () => {
+    viewport(true);
+    floorWith([{ room: 'r2', vignette: 'smoke', active: true }, { room: 'r1', vignette: 'smoke', active: false }]);
+    const { container } = view();
+    expect(container.querySelector('[data-testid="room-strip"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="floor-plan"]')).toBeNull();
+    expect(container.querySelectorAll('[data-vignette="smoke"]')).toHaveLength(1);
+    expect(container.querySelector('[data-room="r2"] [data-vignette="smoke"]')).toBeTruthy();
+  });
+
+  it('draws the live room in the desktop overflow list, where the plan has no zone for it', () => {
+    // Twelve rooms: eleven take the plan's zones, the twelfth overflows — and
+    // the overflow entry has to carry the signal like any other room.
+    const rooms = Array.from({ length: 12 }, (_, i) =>
+      room({ key: `k${String(i).padStart(2, '0')}`, name: `room-${String(i).padStart(2, '0')}` }),
+    );
+    mockData(snapshot({ rooms, signals: [{ room: 'k11', vignette: 'smoke', active: true }] }));
+    const { container } = view();
+    const overflow = container.querySelector('[data-testid="overflow-list"]')!;
+    expect(overflow).toBeTruthy();
+    expect(overflow.querySelector('[data-overflow-room="k11"] [data-vignette="smoke"]')).toBeTruthy();
+    // …and it is the only one drawn anywhere on the page.
+    expect(container.querySelectorAll('[data-vignette="smoke"]')).toHaveLength(1);
+  });
+
   it('ignores a live signal naming a room this floor does not have', () => {
     floorWith([{ room: 'not-a-room-here', vignette: 'smoke', active: true }]);
     const { container } = view();

@@ -158,6 +158,25 @@ describe('deriveExceptions', () => {
     expect(out[3]!.ageMs).toBeNull();
   });
 
+  it('treats a PARKED claim as parked too — put down on purpose is not milder', () => {
+    const out = deriveExceptions(
+      scene({
+        claims: [
+          claim({ slug: 'went-stale', state: 'stale', staleMs: 4 * 3_600_000 }),
+          claim({ slug: 'put-down', state: 'parked', staleMs: 30 * 3_600_000 }),
+          claim({ slug: 'still-live', state: 'live', staleMs: 0 }),
+          claim({ slug: 'expiring-soon', state: 'expiring', staleMs: 1 }),
+        ],
+      }),
+      NOW,
+    );
+    expect(out.map((e) => [e.severity, e.key])).toEqual([
+      ['parked', 'put-down'],
+      ['parked', 'went-stale'],
+    ]);
+    expect(out[0]!.actions).toEqual([{ kind: 'nudge', slug: 'put-down', threadId: 'slack:C1:1700' }]);
+  });
+
   it('is stable: reordering the input does not reorder the feed', () => {
     const a = item({ id: 'B#1', nextMover: 'human', since: hoursAgo(3) });
     const b = item({ id: 'B#2', nextMover: 'human', since: hoursAgo(3) });
