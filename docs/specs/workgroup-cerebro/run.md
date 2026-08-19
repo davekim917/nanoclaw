@@ -910,3 +910,15 @@ owned:false lock union) and independently re-ran the full host suite: 279 files 
 3,986 tests, zero failures. Membership assertions now hit the real
 `memory_consolidated_facts` table on a migrated temp DB. No verified MUST-FIX remains;
 implementation review returns **clear**.
+
+### Integration — 2026-08-19
+
+The orphaned curator-worker bot-gate change was committed by the operator (6fd669e9);
+P2 branch merged --no-ff on top. git auto-merged `curator-worker.ts` (bot-gate and P2
+touch different regions of `runOne`); merged-main verification: build clean, both
+features present, P2-touched suites 27 files / 250 tests green, full suite 4,013
+passed with 9 failures confined to `migrate-repo-store` — pre-existing environmental
+flake in this working tree (independently reported by a sibling session BEFORE the
+merge with a drifting count; the same suite passes 47/47 on identical code in the
+clean worktree). Deployed to dist by the verification build; activates on next host
+restart.
