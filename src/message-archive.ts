@@ -657,6 +657,30 @@ export function recordAcceptedGeneratedMemory(
     .run(workgroupId, sizePending, now, now, MEMORY_MAINTENANCE_UPDATE_THRESHOLD, sizePending);
 }
 
+/**
+ * One-time backlog enqueue, called from the `memory_consolidated_facts`
+ * migration for every workgroup whose ledger is non-empty at migration time
+ * (docs/specs/workgroup-cerebro/plan.md §P2.4 item 3). Distinct from
+ * `recordAcceptedGeneratedMemory`: it must not touch
+ * `accepted_updates_since_maintenance`, which tracks new writes since the
+ * last pass and is unrelated to a one-time backfill of pre-existing content.
+ */
+export function enqueueMemoryMaintenanceBacklog(workgroupId: string, options: { nowMs?: number } = {}): void {
+  const now = new Date(options.nowMs ?? Date.now()).toISOString();
+  openDb()
+    .prepare(
+      `INSERT INTO memory_curation_state
+         (workgroup_id, accepted_updates_since_maintenance, maintenance_pending,
+          not_before, lease_owner, lease_expires_at, updated_at)
+       VALUES (?, 0, 1, ?, NULL, NULL, ?)
+       ON CONFLICT(workgroup_id) DO UPDATE SET
+         maintenance_pending = 1,
+         not_before = excluded.not_before,
+         updated_at = excluded.updated_at`,
+    )
+    .run(workgroupId, now, now);
+}
+
 export function claimMemoryMaintenance(
   owner: string,
   options: { nowMs?: number; leaseMs?: number } = {},
@@ -697,19 +721,29 @@ export function claimMemoryMaintenance(
   })();
 }
 
-export function completeMemoryMaintenance(job: MemoryMaintenanceJob, options: { nowMs?: number } = {}): boolean {
+export function completeMemoryMaintenance(
+  job: MemoryMaintenanceJob,
+  options: { nowMs?: number; reassertPending?: boolean } = {},
+): boolean {
   const now = new Date(options.nowMs ?? Date.now()).toISOString();
   const result = openDb()
     .prepare(
       `UPDATE memory_curation_state
-          SET accepted_updates_since_maintenance = 0,
-              maintenance_pending = 0,
+          SET accepted_updates_since_maintenance =
+                MAX(0, accepted_updates_since_maintenance - ?),
+              maintenance_pending = ?,
               lease_owner = NULL,
               lease_expires_at = NULL,
               updated_at = ?
         WHERE workgroup_id = ? AND lease_owner = ?`,
     )
-    .run(now, job.workgroupId, job.leaseOwner);
+    // Subtracts the job's CLAIM-TIME snapshot, not the live counter — updates
+    // accepted while the lease was held (a sibling curator write mid-pass)
+    // must survive completion, not be zeroed with it. Floored at 0 by MAX().
+    // `reassertPending` lets a pass that leaves the consolidation tail
+    // non-empty (more than CONSOLIDATION_MAX_FACTS were pending) re-arm
+    // immediately instead of waiting for 50 more updates to accrue.
+    .run(job.acceptedUpdates, options.reassertPending ? 1 : 0, now, job.workgroupId, job.leaseOwner);
   return result.changes === 1;
 }
 
