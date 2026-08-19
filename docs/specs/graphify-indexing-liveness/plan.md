@@ -92,10 +92,30 @@ Two mechanisms could produce this and **the daemon emits nothing that distinguis
    is busy.
 
 Distinguishing them requires knowing queue depth, which workgroup holds the lane and for how long,
-and how long each queued workgroup has waited. **None of that is observable today.** Designing a
-fairness mechanism now would be picking a fix for an unmeasured cause — the exact move this whole
-line of work exists to stop. So phase 2 is extended to emit precisely the fields that decide it, and
-fairness stays a non-goal with a trigger that is now **live rather than hypothetical**.
+and how long each queued workgroup has waited. **None of that is observable today.**
+
+**Resolved by waiting, three hours later (2026-08-19T01:41Z) — the lane rotates.** It was neither
+mechanism: it was the tail of one long pass.
+
+```
+workgroup-B  23:22:10 → 23:33:31   11 min
+main         23:33:34 → 23:33:48   14 s
+workgroup-D  23:33:49 → 23:34:02   13 s
+workgroup-C  23:41:15 → 23:41:19    4 s
+workgroup-A  00:24:30 → 01:33:42   69 min
+```
+
+Everyone drained in FIFO order the moment the long pass ended, so the runner's queue is fair and the
+"monopolisation" reading was a snapshot mistaken for a steady state. The residual fact is narrower
+and still worth acting on: **one workgroup's pass costs ~69 minutes and every other workgroup's
+costs seconds**, and that workgroup re-queues as soon as it finishes. It therefore consumes most of
+the lane — which is tolerable, since the others are cheap and get their turn promptly.
+
+This sharpens rather than removes the case for phase 3. If those 69-minute passes are the
+timer-driven full scans, four a day is ~4.6 h of lane time that phase 3 cuts to ~1.2 h. If they are
+change-driven incremental passes over a 30 GB tree, phase 3 does nothing for them and the lever is
+elsewhere. **Phase 2's record is what distinguishes those two, and no design should be chosen before
+it does.** Fairness stays a non-goal; its trigger did not in fact fire.
 
 ## Outcome
 

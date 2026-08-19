@@ -136,3 +136,23 @@ its trigger is live rather than hypothetical.
 with one partial rejection recorded above. Cross-model coverage was obtained (`kimi-k3`), so the
 plan gate is **not** degraded. Revision 3 has not been re-reviewed; the changes are
 specification-level and each is pinned by an acceptance criterion.
+
+
+### Follow-up: the live symptom resolved itself (2026-08-19T01:41Z)
+
+The "one workgroup has held the lane since 19:52Z" reading was **wrong as a steady state** and is
+corrected in `plan.md`. Re-probed three hours later: every workgroup drained in FIFO order the
+moment the long pass ended (11 min, 14 s, 13 s, 4 s in sequence), then the large workgroup ran again
+for 69 minutes. The runner's queue is fair; the 22:58Z snapshot caught the tail of one long pass and
+read it as monopolisation.
+
+Lesson worth keeping: a single sample of a queue says nothing about fairness. This is the third time
+in this feature that a point probe of a time-varying signal produced a confident wrong conclusion —
+the first two were revision 1's 11-of-12 pressure reading and revision 2's 0-sessions reading. All
+three would have been settled by the telemetry phase 2 adds, which is the strongest argument for
+shipping phases 1 and 2 before choosing any behavioural fix.
+
+The residual, narrower fact still stands: one workgroup's pass costs ~69 minutes while every other
+costs seconds, and it re-queues immediately on completion. Whether those passes are timer-driven
+full scans (phase 3 cuts them 4×) or change-driven incrementals (phase 3 does nothing) is exactly
+what phase 2's record decides.
