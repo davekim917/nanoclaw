@@ -296,6 +296,31 @@ describe('repository mount reconciliation', () => {
     await releaseRepositoryMountQuiescence(quiescence);
   });
 
+  it('stops barrier-observing containers when the drain wait fails', async () => {
+    // A container that observed the barrier has ended its query input stream
+    // for good. Leaving it running after a failed quiescence turned every
+    // later tool call into a cancellation the agent read as revoked access.
+    const session = makeSession('s1', 'g1');
+    const running = new Set(['s1']);
+    autoAcknowledgeBarrier = false;
+    mockIsContainerRunning.mockImplementation((id) => running.has(id));
+    mockKillContainer.mockImplementation((id) => {
+      running.delete(id);
+    });
+
+    const error = await quiesceSessionsForRepositoryMounts([session] as never, 'repository-publish:req-stuck', 20).then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+
+    expect(error).toBeInstanceOf(RepositoryMountQuiescenceError);
+    const recovery = error as RepositoryMountQuiescenceError;
+    expect(recovery.message).toMatch(/timed out waiting for container poll admission/);
+    expect(recovery.barriersReleased).toBe(true);
+    expect(mockKillContainer).toHaveBeenCalledWith('s1', 'repository mount quiescence failed', undefined);
+    expect(activeEpochs.get('s1')?.state).toBe('released');
+  });
+
   it('attaches the exact stopped/due recovery set when post-kill stop proof times out', async () => {
     const first = makeSession('s1', 'g1');
     const stuck = makeSession('s2', 'g1');

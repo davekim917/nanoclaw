@@ -257,6 +257,21 @@ export async function quiesceSessionsForRepositoryMounts(
     );
     return quiescence;
   } catch (error) {
+    // Every container that observed the barrier has permanently ended its SDK
+    // query input stream, so it can never do useful work again. Leaving one
+    // alive surfaces as cancelled tool calls the agent misreads as revoked
+    // permissions. Kill failures are logged, never allowed to mask `error` or
+    // skip the barrier release below.
+    for (const session of affected) {
+      try {
+        if (isContainerRunning(session.id)) killContainer(session.id, 'repository mount quiescence failed');
+      } catch (killError) {
+        log.warn('Failed to stop container after repository mount quiescence failure', {
+          sessionId: session.id,
+          error: killError instanceof Error ? killError.message : String(killError),
+        });
+      }
+    }
     try {
       const releaseWakeSessions = await releaseRepositoryMountQuiescence(quiescence);
       throw new RepositoryMountQuiescenceError(error, quiescence, releaseWakeSessions, true);
@@ -272,7 +287,6 @@ export async function quiesceSessionsForRepositoryMounts(
         false,
       );
     }
-    throw error;
   }
 }
 
