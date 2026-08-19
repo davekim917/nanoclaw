@@ -34,6 +34,7 @@ import {
 import { TranscriptList, normalizeSessionEntry } from './TranscriptList.js';
 import { OfficeMap } from './OfficeMap.js';
 import { buildOfficeData, agentState, faceSrc, type OfficeRoomData, type OfficeOverflowRoom } from './office-data.js';
+import { AgentAvatar } from './AgentAvatar.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
 
 
@@ -644,6 +645,19 @@ export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
                   them is what the numbers open into. */}
               {view === 'overview' && (
                 <CommitmentStrip items={roomFilteredItems} slice={flowFilter} onSlice={setFlowFilter} />
+              )}
+
+              {/* Who is on this floor, under the picture of where they are. */}
+              {view === 'overview' && (
+                <FleetList
+                  agents={agents}
+                  rooms={rooms}
+                  breachedOwners={breachedOwners}
+                  onAgent={(agentId, roomKey) => {
+                    setAgentDrawerId(agentId);
+                    setAgentDrawerRoomKey(roomKey);
+                  }}
+                />
               )}
 
               {selectedRoomAgents && (
@@ -1288,6 +1302,97 @@ function ExceptionFeed({
             </article>
           ))}
         </div>
+      )}
+    </section>
+  );
+}
+
+/* ─── The fleet ──────────────────────────────────────────────────────────── */
+
+/**
+ * What one agent is doing, in the fewest true words.
+ *
+ * `holding` first, because a claim is a piece of work somebody promised to
+ * finish and it outranks a conversation; then the live thread, which is
+ * activity but not necessarily a commitment; then the honest nothing. An agent
+ * is never described as busy on the strength of its container being up.
+ */
+export function agentActivityLine(agent: ObservatoryAgent, roomName: (key: string) => string | null): string {
+  if (agent.holding.length > 0) {
+    const [first, ...rest] = agent.holding;
+    return rest.length > 0 ? `holding ${first} +${rest.length} more` : `holding ${first}`;
+  }
+  const live = agent.liveSession;
+  if (live) {
+    const where = roomName(live.channelKey);
+    const verb = agent.active ? 'live in' : 'last spoke in';
+    return where ? `${verb} ${where}` : agent.active ? 'live in a thread' : 'last spoke in a thread';
+  }
+  return 'no active task';
+}
+
+/**
+ * The fleet, avatar-led: who exists, what state they are in, what they are on.
+ *
+ * The visible label is the agent's PERSONA name — what it is called in the
+ * channel the operator talks to it in. `canonicalName` is infrastructure
+ * identity and does not render here at all; an operator who knows an agent as
+ * "Nova" should not have to learn its folder name to find it.
+ */
+function FleetList({
+  agents,
+  rooms,
+  breachedOwners,
+  onAgent,
+}: {
+  agents: ObservatoryAgent[];
+  rooms: ObservatoryRoom[];
+  breachedOwners: Set<string>;
+  onAgent: (agentId: string, roomKey: string | null) => void;
+}) {
+  const roomName = useMemo(() => {
+    const byKey = new Map(rooms.map((r) => [r.key, r.name.startsWith('#') ? r.name : `#${r.name}`]));
+    return (key: string) => byKey.get(key) ?? null;
+  }, [rooms]);
+  const activeCount = agents.filter((a) => a.active).length;
+
+  return (
+    <section className="tm-fleet" data-section="fleet">
+      <div className="tm-feed-head">
+        <span className="tm-eyebrow">
+          Fleet — {agents.length} {agents.length === 1 ? 'agent' : 'agents'} · {activeCount} active
+        </span>
+      </div>
+      {agents.length === 0 ? (
+        <p className="tm-allclear">No agents on this floor</p>
+      ) : (
+        <ul className="tm-fleet-list">
+          {agents.map((a) => {
+            const status = agentState(a, breachedOwners, a.location ?? '');
+            return (
+              <li key={a.id} className="tm-fleet-row" data-agent={a.id}>
+                <button
+                  type="button"
+                  className="tm-fleet-open tm-tap"
+                  onClick={() => onAgent(a.id, a.location)}
+                  aria-label={`Open ${a.name}'s work`}
+                >
+                  <AgentAvatar name={a.name} avatarUrl={a.avatarUrl} status={status} />
+                  <span className="tm-fleet-content">
+                    <span className="tm-fleet-top">
+                      <span className="tm-fleet-name-status">
+                        <span className="tm-fleet-name">{a.name}</span>
+                        <span className={`tm-fleet-status ${status}`}>{status}</span>
+                      </span>
+                      <span className="tm-fleet-time mono">{a.lastSeenAt ? relAge(a.lastSeenAt) : '—'}</span>
+                    </span>
+                    <span className="tm-fleet-task">{agentActivityLine(a, roomName)}</span>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
       )}
     </section>
   );

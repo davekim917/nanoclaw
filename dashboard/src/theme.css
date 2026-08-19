@@ -400,7 +400,138 @@
     text-align: center;
   }
 
+  /* ── Avatars ───────────────────────────────────────────────────────────── */
+  .tm-avatar {
+    position: relative;
+    display: inline-flex;
+    flex-shrink: 0;
+  }
+  .tm-avatar-face {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 1px solid var(--border-soft);
+    object-fit: cover;
+  }
+  /* The neutral mark an agent with no platform avatar gets. Neutral on
+     purpose: a per-agent colour would be a status the data does not carry. */
+  .tm-avatar-mark {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--muted);
+    color: var(--muted-foreground);
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 12px;
+    line-height: 1;
+  }
+  .tm-avatar-dot {
+    position: absolute;
+    right: -3px;
+    bottom: -3px;
+    width: 11px;
+    height: 11px;
+    box-sizing: border-box;
+    border: 2px solid var(--card);
+  }
+  .tm-avatar-dot.working { background: var(--sev-working); }
+  .tm-avatar-dot.blocked { background: var(--sev-hands); }
+  .tm-avatar-dot.waiting { background: var(--sev-decision); }
+  .tm-avatar-dot.idle { background: var(--muted-foreground); }
+
+  /* ── Fleet ─────────────────────────────────────────────────────────────── */
+  .tm-fleet {
+    padding: 24px 16px;
+  }
+  .tm-fleet-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    border-top: 1px solid var(--border-soft);
+  }
+  .tm-fleet-row {
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .tm-fleet-open {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    width: 100%;
+    padding: 14px 0;
+    appearance: none;
+    background: none;
+    border: 0;
+    cursor: pointer;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+  }
+  .tm-fleet-open:hover {
+    background: var(--accent-soft);
+  }
+  .tm-fleet-open:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .tm-fleet-content {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .tm-fleet-top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .tm-fleet-name-status {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+  .tm-fleet-name {
+    font-family: var(--font-sans);
+    font-weight: 700;
+    font-size: 14px;
+    color: var(--foreground);
+  }
+  .tm-fleet-status {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+  }
+  .tm-fleet-status.working { color: var(--sev-working); }
+  .tm-fleet-status.blocked { color: var(--sev-hands); }
+  .tm-fleet-status.waiting { color: var(--sev-decision); }
+  .tm-fleet-time {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted-foreground);
+    white-space: nowrap;
+  }
+  .tm-fleet-task {
+    font-size: 13px;
+    color: var(--fg-2);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   @media (min-width: 980px) {
+    .tm-fleet {
+      padding: 20px 32px;
+    }
+    .tm-fleet-task {
+      white-space: normal;
+    }
     .tm-feed {
       padding: 20px 32px;
     }
