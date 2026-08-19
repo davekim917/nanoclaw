@@ -367,6 +367,65 @@ describe('runSessionTitleSweep', () => {
     expect(row.title_generated_at).toBeTruthy(); // stamped → won't clog next tick
   });
 
+  it('skips a session that has never woken the agent (trigger=0 only — bot-spam thread)', async () => {
+    // mention-mode channel: a bot message lands with trigger=0 ("accumulate
+    // as context only" — never wakes a container). It has real content, so
+    // pre-fix this would burn a Haiku call every tick. Post-fix it's treated
+    // like an empty session: stamped and skipped, no backend call.
+    seedSession('sess-unwoken', 'ag-1');
+    const dir = path.join(TMP_DIR, 'v2-sessions', 'ag-1', 'sess-unwoken');
+    fs.mkdirSync(dir, { recursive: true });
+    const db = new Database(path.join(dir, 'inbound.db'));
+    db.exec(
+      `CREATE TABLE messages_in (id TEXT PRIMARY KEY, seq INTEGER, kind TEXT, timestamp TEXT, status TEXT, content TEXT, trigger INTEGER NOT NULL DEFAULT 1);`,
+    );
+    db.prepare(`INSERT INTO messages_in VALUES ('m1', 2, 'chat', ?, 'pending', ?, 0)`).run(
+      now(),
+      JSON.stringify({ text: 'Snowflake alert: query failed' }),
+    );
+    db.close();
+
+    const backend = vi.fn(async () => 'unused');
+    setTitleBackendForTest(backend);
+
+    const result = await runSessionTitleSweep();
+    expect(result.generated).toBe(0);
+    expect(backend).not.toHaveBeenCalled();
+    const row = getDb().prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?').get('sess-unwoken') as {
+      title: string | null;
+      title_generated_at: string | null;
+    };
+    expect(row.title).toBeNull();
+    expect(row.title_generated_at).toBeTruthy(); // stamped → won't clog next tick
+  });
+
+  it('titles a session once a real wake (trigger=1) arrives after bot-only traffic', async () => {
+    seedSession('sess-later-woken', 'ag-1');
+    const dir = path.join(TMP_DIR, 'v2-sessions', 'ag-1', 'sess-later-woken');
+    fs.mkdirSync(dir, { recursive: true });
+    const db = new Database(path.join(dir, 'inbound.db'));
+    db.exec(
+      `CREATE TABLE messages_in (id TEXT PRIMARY KEY, seq INTEGER, kind TEXT, timestamp TEXT, status TEXT, content TEXT, trigger INTEGER NOT NULL DEFAULT 1);`,
+    );
+    db.prepare(`INSERT INTO messages_in VALUES ('m1', 2, 'chat', ?, 'pending', ?, 0)`).run(
+      now(),
+      JSON.stringify({ text: 'Snowflake alert: query failed' }),
+    );
+    db.prepare(`INSERT INTO messages_in VALUES ('m2', 4, 'chat', ?, 'pending', ?, 1)`).run(
+      now(),
+      JSON.stringify({ text: '@bot please look into this' }),
+    );
+    db.close();
+
+    setTitleBackendForTest(async () => 'Snowflake failure triage');
+    const result = await runSessionTitleSweep();
+    expect(result.generated).toBe(1);
+    const row = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-later-woken') as {
+      title: string | null;
+    };
+    expect(row.title).toBe('Snowflake failure triage');
+  });
+
   it('a backlog of empty shells does NOT starve a real recently-active session (clog fix)', async () => {
     // 15 empty shells, seeded FIRST (lowest rowids) and marked long-inactive.
     // Pre-fix the candidate query (oldest-rowid-first, LIMIT cap*4=12) returned

@@ -243,6 +243,19 @@ function pickCandidates(cap: number): CandidateRow[] {
 interface SliceResult {
   text: string;
   maxSeq: number;
+  /**
+   * True when every inbound row for this session has `trigger = 0`
+   * ("accumulate as context only" — see messages_in.trigger in
+   * db/session-db.ts). A session with no `trigger = 1` row was never woken:
+   * `engage_mode` never let it spawn a container or produce an agent
+   * response, so there is nothing for Haiku to summarize even though the
+   * content column is non-empty. This is the bot-spam-thread case
+   * (Snowflake/Linear notifications into a `mention`-mode channel) — the
+   * sweep treats it the same as an empty slice rather than burning a Haiku
+   * call on a transcript with no agent side. A later real wake (trigger=1)
+   * flips this back to false and the session re-enters titling normally.
+   */
+  neverWoken: boolean;
 }
 
 /**
@@ -261,6 +274,7 @@ function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult 
 
   let inboundLines: Array<{ seq: number; content: string; kind: string }> = [];
   let outboundLines: Array<{ seq: number; content: string; kind: string }> = [];
+  let neverWoken = false;
 
   if (fs.existsSync(inboundPath)) {
     let db: Database.Database | null = null;
@@ -275,6 +289,17 @@ function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult 
             LIMIT ?`,
         )
         .all(MAX_MESSAGES_PER_SLICE) as typeof inboundLines;
+      // `trigger` was added after the initial schema (LEGACY-COMPAT in
+      // db/session-db.ts backfills existing rows to 1). A missing column on
+      // an old/test DB is caught separately so it fails closed to "has
+      // woken" — never suppresses a real title, and never triggers the
+      // "read failed" warning below for what is otherwise a clean read.
+      try {
+        const woke = db.prepare(`SELECT 1 FROM messages_in WHERE trigger = 1 LIMIT 1`).get();
+        neverWoken = woke === undefined;
+      } catch {
+        neverWoken = false;
+      }
     } catch (err) {
       log.warn('session-title: inbound.db read failed', {
         sessionId,
@@ -310,7 +335,7 @@ function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult 
 
   // Merge by seq ascending and trim to a window.
   const merged = [...inboundLines, ...outboundLines].sort((a, b) => a.seq - b.seq);
-  if (merged.length === 0) return { text: '', maxSeq: -1 };
+  if (merged.length === 0) return { text: '', maxSeq: -1, neverWoken };
 
   const tail = merged.slice(-MAX_MESSAGES_PER_SLICE);
   const lines: string[] = [];
@@ -326,7 +351,7 @@ function readSessionSlice(agentGroupId: string, sessionId: string): SliceResult 
     const prefix = row.kind === 'chat-sdk' || row.kind === 'system' ? 'agent: ' : 'user: ';
     lines.push(prefix + text.slice(0, 200));
   }
-  return { text: lines.join('\n'), maxSeq: tail[tail.length - 1]!.seq };
+  return { text: lines.join('\n'), maxSeq: tail[tail.length - 1]!.seq, neverWoken };
 }
 
 function persistTitle(sessionId: string, title: string, basisSeq: number, generatedAt: string): void {
@@ -424,13 +449,15 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
   for (const row of candidates) {
     if (tasks.length >= CONCURRENCY_CAP) break;
     const slice = readSessionSlice(row.agent_group_id, row.id);
-    // Empty / no-usable-content session: nothing to summarize. STAMP a backoff
-    // so it exits the candidate pool rather than re-entering every tick. Without
-    // this, a backlog of empty NULL-title shells permanently occupies the LIMIT
-    // and starves real sessions (the sweep skips all N and generates 0 forever
-    // — the clog this fix targets). A stamped shell that later gains content
-    // re-enters after the cooldown ages out and gets titled then.
-    if (slice.maxSeq < 0 || !slice.text) {
+    // Empty / no-usable-content session, OR a session that has never woken the
+    // agent (bot-spam threads under engage_mode=mention — see `neverWoken`
+    // above): nothing to summarize. STAMP a backoff so it exits the candidate
+    // pool rather than re-entering every tick. Without this, a backlog of
+    // empty/unwoken NULL-title shells permanently occupies the LIMIT and
+    // starves real sessions (the sweep skips all N and generates 0 forever —
+    // the clog this fix targets). A stamped shell that later gains content or
+    // a real wake re-enters after the cooldown ages out and gets titled then.
+    if (slice.maxSeq < 0 || !slice.text || slice.neverWoken) {
       try {
         stampFailureBackoff(row.id);
       } catch {
