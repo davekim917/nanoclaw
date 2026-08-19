@@ -1505,7 +1505,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-sched-drawer-close {
   background: none; border: 0; color: var(--ink-3); font-size: 18px; line-height: 1;
-  width: 32px; height: 32px; border-radius:0; cursor: pointer; flex: none;
+  width: 44px; height: 44px; border-radius:0; cursor: pointer; flex: none;
 }
 .nc-sched-drawer-close:hover { background: rgba(35, 32, 27, 0.05); color: var(--ink); }
 .nc-sched-drawer-body { overflow-y: auto; padding: 14px 16px 20px; }
@@ -1670,6 +1670,9 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   --line:#d4d4d8; --line-2:#969696;
   --page:#fafafa; --card:#ffffff; --card-2:#ffffff;
   --accent:#ff5a00;
+  /* The accent, darkened until 12-13px text on white clears AA. Fills, rules
+     and outlines keep --accent; only TEXT uses this. */
+  --accent-text:#c24500;
   --stop:#c81e1e; --warn:#8c6400; --go:#1f7a4d; --idle:#71717a;
   /* Sharp corners are the brand. */
   --r:0px;
@@ -1701,7 +1704,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-seg::-webkit-scrollbar{display:none}
 .nc-of .nc-of-seg-btn{
   appearance:none; border:0; background:none; cursor:pointer; white-space:nowrap;
-  font:500 12.5px/1 inherit; color:var(--ink-2); padding:0 12px; height:30px; border-radius:0;
+  font:500 12.5px/1 inherit; color:var(--ink-2); padding:0 12px; min-height:44px; border-radius:0;
 }
 .nc-of .nc-of-seg-btn:hover{color:var(--ink)}
 .nc-of .nc-of-seg-btn:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
@@ -1733,7 +1736,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-tile:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
 .nc-of .nc-of-clearfilter{
   appearance:none; border:0; background:none; cursor:pointer; font:inherit;
-  font-size:12px; font-weight:500; color:var(--accent); padding:4px 6px; border-radius:0;
+  font-size:12px; font-weight:500; color:var(--accent-text); padding:4px 6px; min-height:44px; border-radius:0;
 }
 .nc-of .nc-of-clearfilter:hover{background:rgba(255,90,0,.8)}
 .nc-of .nc-of-tile-n{
@@ -1834,7 +1837,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    filters. A wide split squeezed the map into a narrow column and clipped it. */
 .nc-of .nc-of-chip{
   appearance:none; display:inline-flex; align-items:center; gap:6px; flex:none;
-  height:28px; padding:0 10px; border-radius:0; cursor:pointer;
+  min-height:44px; padding:0 12px; border-radius:0; cursor:pointer;
   border:1px solid var(--line-2); background:var(--card-2); color:var(--ink);
   font:500 11.5px/1 inherit; white-space:nowrap;
 }
@@ -1844,7 +1847,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* obs.C.15 — the −/Reset/+ trio sits with the fold chip; − and + are a single
    glyph each, so a fixed min-width keeps all three from jittering in size as
    the percentage changes on the buttons around them. */
-.nc-of .nc-of-chip.nc-of-zoom{min-width:26px; justify-content:center; padding:0 8px; font-variant-numeric:tabular-nums}
+.nc-of .nc-of-chip.nc-of-zoom{min-width:44px; justify-content:center; padding:0 8px; font-variant-numeric:tabular-nums}
 .nc-of .nc-of-sd{width:6px; height:6px; border-radius:50%; flex:none; background:var(--idle)}
 .nc-of .nc-of-sd.blocked{background:var(--stop)}
 .nc-of .nc-of-sd.waiting{background:var(--warn)}
@@ -2089,7 +2092,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-of-filters select{
   font:inherit; font-size:11.5px; color:var(--ink); background:var(--card-2);
-  border:1px solid var(--line-2); border-radius:0; padding:0 8px; height:28px;
+  border:1px solid var(--line-2); border-radius:0; padding:0 8px; min-height:44px;
 }
 .nc-of .nc-of-filters .nc-of-clearfilter{margin-left:auto}
 
@@ -2102,11 +2105,11 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-actions-who,
 .nc-of .nc-obs-actions-room{
   font:inherit; font-size:12.5px; color:var(--ink); background:var(--card-2);
-  border:1px solid var(--line-2); border-radius:0; padding:5px 8px; min-height:34px; max-width:100%;
+  border:1px solid var(--line-2); border-radius:0; padding:5px 8px; min-height:44px; max-width:100%;
 }
 .nc-of .nc-obs-actions button{
-  font:inherit; font-size:12.5px; font-weight:600; color:#fff; background:var(--accent);
-  border:0; border-radius:0; padding:6px 12px; min-height:34px; cursor:pointer;
+  font:inherit; font-size:12.5px; font-weight:600; color:var(--card); background:var(--ink);
+  border:1px solid var(--ink); border-radius:0; padding:6px 12px; min-height:44px; cursor:pointer;
 }
 /* Steer only OPENS the composer — it is not the act, so it does not wear the
    accent the acts wear. */
@@ -2161,7 +2164,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    rows it sat under. */
 .nc-of .nc-of-link{
   display:inline-flex; align-items:center; min-height:44px; padding:4px 0;
-  font-size:12.5px; font-weight:500; color:var(--accent); text-decoration:none;
+  font-size:12.5px; font-weight:500; color:var(--accent-text); text-decoration:underline;
 }
 .nc-of .nc-of-link:hover{text-decoration:underline}
 

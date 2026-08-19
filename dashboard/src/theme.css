@@ -87,6 +87,9 @@
     --accent: #ff5a00;
     --accent-foreground: #ffffff;
     --accent-hover: #e85200;
+    /* The accent, darkened until small text on white clears AA. Fills, rules
+       and outlines keep --accent; only TEXT uses this. */
+    --accent-text: #c24500;
     --accent-soft: rgba(255, 90, 0, 0.08);
     --ring: #ff5a00;
 
@@ -136,7 +139,11 @@
     }
 }
 
-@layer components {
+/* NOT in @layer components, deliberately: styles.css is unlayered, and an
+   unlayered rule beats a layered one no matter how specific the layered one is
+   — `a { color: … }` silently won over `.tm-btn-primary`'s white and painted a
+   primary button dark-grey-on-ink. These compete on specificity instead. */
+
   /* The page's own atmosphere: a 30px blueprint grid over the canvas. */
   .tm-grid {
     background-image:
@@ -380,12 +387,50 @@
   }
   .tm-btn:disabled {
     cursor: not-allowed;
-    opacity: 0.5;
+    background: transparent;
+    color: var(--muted-foreground);
+    border-color: var(--border-soft);
   }
   .tm-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
+  /* WorkActions, worn as an exception card's action row. Styling only: the
+     controls, the verbs and the eligibility rules are the shared component's. */
+  .tm-exc .nc-obs-actions {
+    margin-top: 0;
+    width: 100%;
+  }
+  .tm-exc .nc-obs-actions-row {
+    gap: 8px;
+  }
+  .tm-exc .nc-obs-actions-who,
+  .tm-exc .nc-obs-actions-room {
+    flex: 1 1 100%;
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .tm-exc .nc-obs-actions button {
+    flex: 1 1 0;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    /* "TASK IT IN #SOMEWHERE" is as long as the channel name it names, so it
+       has to be allowed to break rather than run past its own border. */
+    overflow-wrap: anywhere;
+  }
+  /* The thread line is context, not an action — it reads above the row. */
+  .tm-exc .nc-of-link,
+  .tm-exc .nc-of-sheet-nothread {
+    flex: 1 1 100%;
+    min-height: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+
   /* An empty feed is a real answer and says so. */
   .tm-allclear {
     padding: 24px 16px;
@@ -420,7 +465,7 @@
     align-items: center;
     justify-content: center;
     background: var(--muted);
-    color: var(--muted-foreground);
+    color: var(--fg-2);
     font-family: var(--font-mono);
     font-weight: 700;
     font-size: 12px;
@@ -727,6 +772,9 @@
   }
 
   @media (min-width: 980px) {
+    .nc-of .nc-of-bar-title {
+      display: none;
+    }
     .tm-fleet {
       padding: 20px 32px;
     }
@@ -738,15 +786,27 @@
     }
     .tm-feed-stack {
       flex-direction: row;
+      /* Six exceptions do not become six unreadable slivers: past four across
+         they wrap to a second row instead. */
+      flex-wrap: wrap;
     }
     .tm-exc {
-      flex: 1;
+      flex: 1 1 240px;
       padding: 14px;
       gap: 8px;
+    }
+    /* A wide card holds its whole action row on one or two lines. Three
+       stacked full-width controls per card pushed the floor below the fold,
+       which is the one thing the feed must not do to the picture under it. */
+    .tm-exc .nc-obs-actions-who,
+    .tm-exc .nc-obs-actions-room {
+      flex: 1 1 130px;
+    }
+    .tm-exc .nc-obs-actions button {
+      flex: 0 1 auto;
     }
     .tm-exc-title {
       font-size: 14px;
       line-height: 1.3;
     }
   }
-}
