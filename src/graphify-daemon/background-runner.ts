@@ -181,6 +181,7 @@ export type BackgroundResult<T> =
 export interface BackgroundGraphRunnerOptions {
   sessionsRoot: string;
   freeMemory?: () => number;
+  now?: () => number;
   minimumFreeBytes?: number;
   pollMs?: number;
   pressure?: () => boolean | Promise<boolean>;
@@ -191,6 +192,24 @@ export interface BackgroundJobOptions {
   preemptActive?: boolean;
   /** Freshness runs before queued enrichment and may preempt active enrichment. Defaults to enrichment. */
   priority?: 'freshness' | 'normal' | 'enrichment';
+  /**
+   * Reported by laneHolder(). The lane is serial, so "who is in it and for how
+   * long" is the difference between one workgroup monopolising indexing and a
+   * queue that is simply busy — and it cannot be read from daemon state,
+   * because reconciles also run outside this runner.
+   */
+  label?: string;
+}
+
+export interface BackgroundRunnerCounters {
+  admitted: number;
+  pressurePreempted: number;
+  memoryDeferred: number;
+}
+
+export interface BackgroundLaneHolder {
+  label?: string;
+  heldForMs: number;
 }
 
 interface QueuedBackgroundJob {
@@ -214,9 +233,15 @@ export class BackgroundGraphRunner {
   private readonly minimumFreeBytes: number;
   private readonly pressure: () => boolean | Promise<boolean>;
   private readonly isolatedPressure?: IsolatedPressureScanner;
+  private readonly now: () => number;
+  private admitted = 0;
+  private pressurePreempted = 0;
+  private memoryDeferred = 0;
+  private holder?: { label?: string; startedAtMs: number };
 
   constructor(options: BackgroundGraphRunnerOptions) {
     this.freeMemory = options.freeMemory ?? availableMemoryBytes;
+    this.now = options.now ?? Date.now;
     this.pollMs = Math.min(2_000, Math.max(10, options.pollMs ?? 2_000));
     this.minimumFreeBytes = options.minimumFreeBytes ?? 6 * 1024 ** 3;
     if (options.pressure) this.pressure = options.pressure;
@@ -227,6 +252,30 @@ export class BackgroundGraphRunner {
       this.isolatedPressure = new IsolatedPressureScanner(options.sessionsRoot);
       this.pressure = () => this.isolatedPressure!.scan();
     }
+  }
+
+  /** Admission outcomes since start. Distinguishes "blocked" from "idle". */
+  counters(): BackgroundRunnerCounters {
+    return {
+      admitted: this.admitted,
+      pressurePreempted: this.pressurePreempted,
+      memoryDeferred: this.memoryDeferred,
+    };
+  }
+
+  /** The job currently occupying the serial lane, if any. */
+  laneHolder(): BackgroundLaneHolder | undefined {
+    if (!this.holder) return undefined;
+    return { label: this.holder.label, heldForMs: Math.max(0, this.now() - this.holder.startedAtMs) };
+  }
+
+  /** Waiting jobs per priority class. A scalar would conflate indexing with enrichment. */
+  queueDepth(): Record<'freshness' | 'normal' | 'enrichment', number> {
+    return {
+      freshness: this.queues.freshness.length,
+      normal: this.queues.normal.length,
+      enrichment: this.queues.enrichment.length,
+    };
   }
 
   run<T>(job: (signal: AbortSignal) => Promise<T>, options: BackgroundJobOptions = {}): Promise<BackgroundResult<T>> {
@@ -303,7 +352,10 @@ export class BackgroundGraphRunner {
     this.active.set(controller, options);
     let admitted = false;
     try {
-      if (this.freeMemory() < this.minimumFreeBytes) return { status: 'deferred', reason: 'memory' };
+      if (this.freeMemory() < this.minimumFreeBytes) {
+        this.memoryDeferred += 1;
+        return { status: 'deferred', reason: 'memory' };
+      }
       // The pressure probe is a worker thread and can reject (worker error, exit,
       // or a failed scan). Letting that escape means `drain()` throws after
       // shifting the job off its queue, so the job's promise never settles — the
@@ -315,9 +367,14 @@ export class BackgroundGraphRunner {
       } catch {
         return { status: 'preempted' };
       }
-      if (pressured) return { status: 'preempted' };
+      if (pressured) {
+        this.pressurePreempted += 1;
+        return { status: 'preempted' };
+      }
       if (this.stopped || controller.signal.aborted) return { status: 'preempted' };
       admitted = true;
+      this.admitted += 1;
+      this.holder = { label: options.label, startedAtMs: this.now() };
     } finally {
       if (!admitted) this.active.delete(controller);
     }
@@ -349,6 +406,7 @@ export class BackgroundGraphRunner {
     } finally {
       if (timer) clearInterval(timer);
       this.active.delete(controller);
+      this.holder = undefined;
     }
   }
 }

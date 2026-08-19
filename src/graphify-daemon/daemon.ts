@@ -55,6 +55,8 @@ import type {
 import { acquireStorageActivityLease, type StorageActivityLease } from '../storage-activity.js';
 
 export const DEFAULT_FULL_RECONCILE_MS = 6 * 60 * 60_000;
+export const DEFAULT_STATUS_LOG_MS = 5 * 60_000;
+export const DEFAULT_STATUS_WARN_LAG_MS = 2 * 60 * 60_000;
 export const DEFAULT_CATALOG_REFRESH_MS = 60_000;
 const MAX_RECONCILE_BATCH_SOURCES = 25;
 const MAX_RECONCILE_BATCH_CONTRIBUTIONS = 500;
@@ -93,14 +95,29 @@ interface WorkgroupState {
   fullScanVersion: number;
   /** Sticky: a watcher hit ENOSPC, so filesystem coverage is incomplete. */
   watcherDegraded?: boolean;
+  /** Which branch the last reconcile actually took. The three pass classes cost
+   *  wildly different amounts, and nothing else in the record distinguishes an
+   *  escalated full scan from an ordinary incremental one. */
+  lastOperation?: 'full' | 'incremental' | 'archive';
+  /** When this workgroup first queued work that has not yet settled. Must
+   *  survive preempt-retry cycles, which re-queue every 5s — a naive
+   *  stamped-at-queue value reads ~0 forever and hides starvation. */
+  queuedSinceMs?: number;
 }
 
 interface BackgroundRunnerLike {
   run<T>(
     job: (signal: AbortSignal) => Promise<T>,
-    options?: { preemptActive?: boolean; priority?: 'freshness' | 'normal' | 'enrichment' },
+    options?: {
+      preemptActive?: boolean;
+      priority?: 'freshness' | 'normal' | 'enrichment';
+      label?: string;
+    },
   ): Promise<BackgroundResult<T>>;
   stop?(): Promise<void> | void;
+  counters?(): { admitted: number; pressurePreempted: number; memoryDeferred: number };
+  laneHolder?(): { label?: string; heldForMs: number } | undefined;
+  queueDepth?(): Record<'freshness' | 'normal' | 'enrichment', number>;
 }
 
 interface SemanticBackendLike {
@@ -210,6 +227,12 @@ export interface WorkgroupGraphDaemonOptions {
   catalogRefreshMs?: number;
   reconcileStoreFactory?: ReconcileStoreFactory;
   isolateReconcile?: boolean;
+  /** Where status records go. Defaults to stdout, which systemd appends to
+   *  logs/graphify-daemon.log. The daemon emitted nothing at all before this. */
+  logSink?: (record: Record<string, unknown>) => void;
+  statusLogMs?: number;
+  statusWarnLagMs?: number;
+  now?: () => number;
   scheduleEnrichmentAfterReconcile?: boolean;
   watchFilesystem?: boolean;
   repositorySnapshots?: GraphifyRepositorySnapshotAdapter;
@@ -519,6 +542,11 @@ export class WorkgroupGraphDaemon {
   private readonly states = new Map<string, WorkgroupState>();
   private readonly enrichmentRepository: EnrichmentRepository;
   private readonly reconcileStoreFactory: ReconcileStoreFactory;
+  private readonly logSink: (record: Record<string, unknown>) => void;
+  private readonly statusLogMs: number;
+  private readonly statusWarnLagMs: number;
+  private readonly now: () => number;
+  private readonly statusSignatures = new Map<string, string>();
   private readonly isolateReconcile: boolean;
   private readonly scheduleEnrichmentAfterReconcile: boolean;
   private readonly watchFilesystem: boolean;
@@ -547,6 +575,14 @@ export class WorkgroupGraphDaemon {
     this.threadWorktrees = options.threadWorktrees ?? process.env.NANOCLAW_THREAD_WORKTREES === '1';
     this.enrichmentRepository = new EnrichmentRepository(join(options.dataDir, 'graphify', 'enrichment.db'));
     this.reconcileStoreFactory = options.reconcileStoreFactory ?? createReconcileStore;
+    this.logSink =
+      options.logSink ??
+      ((record) => {
+        process.stdout.write(`${JSON.stringify(record)}\n`);
+      });
+    this.statusLogMs = options.statusLogMs ?? DEFAULT_STATUS_LOG_MS;
+    this.statusWarnLagMs = options.statusWarnLagMs ?? DEFAULT_STATUS_WARN_LAG_MS;
+    this.now = options.now ?? Date.now;
     this.isolateReconcile = options.isolateReconcile ?? !import.meta.url.endsWith('.ts');
     this.scheduleEnrichmentAfterReconcile = options.scheduleEnrichmentAfterReconcile ?? true;
     this.watchFilesystem = options.watchFilesystem ?? true;
@@ -723,6 +759,11 @@ export class WorkgroupGraphDaemon {
     }, this.options.fullReconcileMs ?? DEFAULT_FULL_RECONCILE_MS);
     full.unref();
     this.timers.push(full);
+    const status = setInterval(() => {
+      this.logStatus();
+    }, this.statusLogMs);
+    status.unref();
+    this.timers.push(status);
     const catalog = setInterval(() => {
       void this.refreshCatalog()
         .then(async (current) => {
@@ -1223,10 +1264,85 @@ export class WorkgroupGraphDaemon {
     }
   }
 
+  /**
+   * One record per changed-or-unhealthy workgroup, plus an unconditional daemon
+   * heartbeat. Unchanged healthy workgroups are skipped deliberately: eleven
+   * records every five minutes is ~230 MB/year into a file systemd never
+   * rotates, and a record for a workgroup that has not moved is not
+   * information. The heartbeat is unconditional so an empty log can never be
+   * ambiguous between "healthy" and "dead" — which is exactly the ambiguity
+   * that let a 31.8-hour outage go unnoticed.
+   */
+  logStatus(): void {
+    const at = new Date(this.now()).toISOString();
+    for (const [id, state] of this.states) {
+      const lagMs = state.lastCompletedAt
+        ? Math.max(0, this.now() - Date.parse(state.lastCompletedAt))
+        : Number.MAX_SAFE_INTEGER;
+      const degraded = Boolean(state.watcherDegraded);
+      // A workgroup whose first index is still running has no lag signal yet —
+      // MAX_SAFE_INTEGER there means "not measured", not "stale". Same carve-out
+      // the health sentinel makes, for the same reason.
+      const measurable = Boolean(state.lastCompletedAt) || !state.reconciling;
+      const level = degraded || (measurable && lagMs > this.statusWarnLagMs) ? 'warn' : 'info';
+      const record: Record<string, unknown> = {
+        level,
+        at,
+        workgroupId: id,
+        operation: state.lastOperation ?? null,
+        dirty: Boolean(state.dirty || state.archiveDirty || state.fullReindexRequested),
+        fullScanRequired: Boolean(state.fullScanRequired),
+        pendingChanges: state.pendingFilesystemChanges.size,
+        reconciling: Boolean(state.reconciling),
+        reconcilingForMs:
+          state.reconciling && state.lastStartedAt ? Math.max(0, this.now() - Date.parse(state.lastStartedAt)) : null,
+        queuedForMs: state.queuedSinceMs === undefined ? null : Math.max(0, this.now() - state.queuedSinceMs),
+        lagMs,
+        watcherDegraded: degraded,
+      };
+      // Time-varying fields are excluded from the signature; otherwise every
+      // tick "changes" and the suppression buys nothing.
+      const signature = JSON.stringify([
+        level,
+        record.operation,
+        record.dirty,
+        record.fullScanRequired,
+        record.pendingChanges,
+        record.reconciling,
+        degraded,
+      ]);
+      if (level === 'warn' || this.statusSignatures.get(id) !== signature) {
+        this.statusSignatures.set(id, signature);
+        this.logSink(record);
+      }
+    }
+    for (const id of [...this.statusSignatures.keys()]) if (!this.states.has(id)) this.statusSignatures.delete(id);
+    const holder = this.background.laneHolder?.();
+    const counters = this.background.counters?.() ?? {
+      admitted: 0,
+      pressurePreempted: 0,
+      memoryDeferred: 0,
+    };
+    this.logSink({
+      level: 'info',
+      at,
+      workgroups: this.states.size,
+      queueDepth: this.background.queueDepth?.() ?? null,
+      laneHolder: holder?.label ?? null,
+      laneHeldForMs: holder?.heldForMs ?? null,
+      ...counters,
+    });
+  }
+
   private queueReconcile(workgroupId: string): void {
     const state = this.requireState(workgroupId);
     if (state.backgroundQueued || this.closing) return;
     state.backgroundQueued = true;
+    // Set once and cleared only when the workgroup settles clean. A preempted
+    // job re-queues through here every 5s, so stamping unconditionally would
+    // reset the wait on every retry and report ~0 forever — hiding the exact
+    // starvation this field exists to expose.
+    state.queuedSinceMs ??= this.now();
     void this.background
       .run(
         async (signal) => {
@@ -1251,10 +1367,16 @@ export class WorkgroupGraphDaemon {
         // atomic baseline must finish or a busy workgroup can discard hours
         // of progress forever. OS/cgroup priority keeps it subordinate; only
         // manual pause, shutdown, and preemptible Docker/Codex jobs abort.
-        { preemptActive: false, priority: 'freshness' },
+        { preemptActive: false, priority: 'freshness', label: workgroupId },
       )
       .then((result) => {
         state.backgroundQueued = false;
+        // Arm-only-on-clean: a pass that completes with work still outstanding
+        // has not ended the wait, and an archive-only pass says nothing about
+        // pending filesystem work.
+        if (result.status === 'completed' && !state.dirty && !state.archiveDirty && !state.fullReindexRequested) {
+          state.queuedSinceMs = undefined;
+        }
         if ((result.status === 'preempted' || result.status === 'deferred') && !this.closing) {
           const timer = setTimeout(() => this.queueReconcile(workgroupId), this.options.preemptRetryMs ?? 5_000);
           timer.unref();
@@ -1311,6 +1433,7 @@ export class WorkgroupGraphDaemon {
   }
 
   private async reconcile(state: WorkgroupState, signal?: AbortSignal): Promise<void> {
+    state.lastOperation = 'full';
     if (this.options.repositorySnapshots) {
       for (;;) {
         if (signal?.aborted) throw new Error('Graphify reconcile aborted before catalog pin');
@@ -1642,6 +1765,7 @@ export class WorkgroupGraphDaemon {
 
   /** Apply ordinary watcher changes transactionally without rebuilding the corpus. */
   private async reconcileFilesystemChanges(state: WorkgroupState, signal?: AbortSignal): Promise<void> {
+    state.lastOperation = 'incremental';
     const livePath = this.graphPath(state.descriptor.id);
     if (!existsSync(livePath)) {
       state.fullScanRequired = true;
@@ -1783,6 +1907,7 @@ export class WorkgroupGraphDaemon {
 
   /** Atomically update only changed archive-backed sources without scanning or copying roots. */
   private async reconcileArchive(state: WorkgroupState, signal?: AbortSignal): Promise<void> {
+    state.lastOperation = 'archive';
     const directory = join(this.options.dataDir, 'graphify', 'workgroups', state.descriptor.id);
     const livePath = join(directory, 'index.db');
     if (!existsSync(livePath)) {

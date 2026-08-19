@@ -178,3 +178,86 @@ describe('BackgroundGraphRunner shutdown', () => {
     expect((await result).status).toBe('preempted');
   });
 });
+
+describe('BackgroundGraphRunner counters', () => {
+  it('counts admissions, pressure preemptions and memory deferrals', async () => {
+    let pressured = false;
+    let memory = 10_000_000_000;
+    const runner = new BackgroundGraphRunner({
+      sessionsRoot: '/nonexistent',
+      pressure: () => pressured,
+      freeMemory: () => memory,
+      pollMs: 10,
+    });
+
+    expect(await runner.run(async () => 'ok')).toEqual({ status: 'completed', value: 'ok' });
+
+    pressured = true;
+    expect(await runner.run(async () => 'never')).toEqual({ status: 'preempted' });
+
+    pressured = false;
+    memory = 1;
+    expect(await runner.run(async () => 'never')).toEqual({ status: 'deferred', reason: 'memory' });
+
+    expect(runner.counters()).toEqual({ admitted: 1, pressurePreempted: 1, memoryDeferred: 1 });
+    await runner.stop();
+  });
+
+  it('reports which job currently holds the lane', async () => {
+    const runner = new BackgroundGraphRunner({
+      sessionsRoot: '/nonexistent',
+      pressure: () => false,
+      freeMemory: () => 10_000_000_000,
+      pollMs: 10,
+    });
+    expect(runner.laneHolder()).toBeUndefined();
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const running = runner.run(async () => held, { label: 'workgroup-a' });
+    await waitFor(() => runner.laneHolder()?.label === 'workgroup-a');
+    expect(runner.laneHolder()!.heldForMs).toBeGreaterThanOrEqual(0);
+
+    release();
+    await running;
+    await waitFor(() => runner.laneHolder() === undefined);
+    await runner.stop();
+  });
+
+  it('reports queue depth per priority class', async () => {
+    const runner = new BackgroundGraphRunner({
+      sessionsRoot: '/nonexistent',
+      pressure: () => false,
+      freeMemory: () => 10_000_000_000,
+      pollMs: 10,
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const first = runner.run(async () => held, { label: 'holder' });
+    await waitFor(() => runner.laneHolder() !== undefined);
+
+    const queued = [
+      runner.run(async () => undefined, { priority: 'freshness', preemptActive: false }),
+      runner.run(async () => undefined, { priority: 'enrichment', preemptActive: false }),
+      runner.run(async () => undefined, { priority: 'enrichment', preemptActive: false }),
+    ];
+    await waitFor(() => runner.queueDepth().enrichment === 2);
+    expect(runner.queueDepth()).toEqual({ freshness: 1, normal: 0, enrichment: 2 });
+
+    release();
+    await Promise.all([first, ...queued]);
+    await runner.stop();
+  });
+});
+
+async function waitFor(check: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const started = Date.now();
+  while (!check()) {
+    if (Date.now() - started > timeoutMs) throw new Error('timed out waiting for condition');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}

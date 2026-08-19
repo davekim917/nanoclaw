@@ -1841,3 +1841,151 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 });
+
+describe('WorkgroupGraphDaemon status logging', () => {
+  function daemonWithSink(f: ReturnType<typeof fixture>, options: Record<string, unknown> = {}) {
+    const records: Array<Record<string, unknown>> = [];
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+      logSink: (record: Record<string, unknown>) => records.push(record),
+      ...options,
+    });
+    return { daemon, records };
+  }
+
+  it('logs one status record per workgroup with lag, state and watcher health', async () => {
+    const f = fixture();
+    const { daemon, records } = daemonWithSink(f);
+    await daemon.refreshCatalog();
+    daemon.logStatus();
+    const workgroup = records.find((record) => record.workgroupId === 'madison');
+    expect(workgroup).toBeDefined();
+    expect(Object.keys(workgroup!)).toEqual(
+      expect.arrayContaining([
+        'level',
+        'at',
+        'workgroupId',
+        'operation',
+        'dirty',
+        'fullScanRequired',
+        'pendingChanges',
+        'reconciling',
+        'reconcilingForMs',
+        'queuedForMs',
+        'lagMs',
+        'watcherDegraded',
+      ]),
+    );
+    await daemon.close();
+  });
+
+  it('logs a warning record when a watcher is degraded', async () => {
+    const f = fixture();
+    const { daemon, records } = daemonWithSink(f);
+    await daemon.refreshCatalog();
+    daemon.logStatus();
+    records.length = 0;
+    (daemon as unknown as { states: Map<string, { watcherDegraded?: boolean }> }).states.get(
+      'madison',
+    )!.watcherDegraded = true;
+    daemon.logStatus();
+    const workgroup = records.find((record) => record.workgroupId === 'madison');
+    expect(workgroup?.level).toBe('warn');
+    expect(workgroup?.watcherDegraded).toBe(true);
+    await daemon.close();
+  });
+
+  it('logs a warning record when a workgroup exceeds the lag threshold', async () => {
+    const f = fixture();
+    const { daemon, records } = daemonWithSink(f, { statusWarnLagMs: 1 });
+    await daemon.refreshCatalog();
+    daemon.logStatus();
+    expect(records.find((record) => record.workgroupId === 'madison')?.level).toBe('warn');
+    await daemon.close();
+  });
+
+  it('logs runner counters and lane state on the daemon record', async () => {
+    const f = fixture();
+    const { daemon, records } = daemonWithSink(f);
+    await daemon.refreshCatalog();
+    daemon.logStatus();
+    const summary = records.find((record) => record.workgroups !== undefined);
+    expect(summary).toBeDefined();
+    expect(summary).toMatchObject({
+      workgroups: 1,
+      admitted: expect.any(Number),
+      pressurePreempted: expect.any(Number),
+      memoryDeferred: expect.any(Number),
+    });
+    expect(summary!.queueDepth).toBeDefined();
+    await daemon.close();
+  });
+
+  it('emits a heartbeat record with zero workgroups', async () => {
+    const f = fixture();
+    const { daemon, records } = daemonWithSink(f);
+    daemon.logStatus();
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ workgroups: 0 });
+    await daemon.close();
+  });
+
+  it('records which branch the last reconcile took', async () => {
+    const f = fixture();
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'branch label');
+    const { daemon, records } = daemonWithSink(f);
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    daemon.logStatus();
+    expect(records.find((record) => record.workgroupId === 'madison')?.operation).toBe('full');
+    await daemon.close();
+  });
+
+  it('does not reset queuedForMs across a preempt-retry cycle', async () => {
+    const f = fixture();
+    let clock = 1_000_000;
+    const start = clock;
+    // Preempt every admission, advancing the clock each time — this is the live
+    // shape: pressure rejects the job, queueReconcile re-queues 5s later, over
+    // and over. If the queued-since mark is restamped on each re-queue it reads
+    // ~0 forever and starvation is invisible.
+    const runner = {
+      run: async () => {
+        clock += 60_000;
+        return { status: 'preempted' as const };
+      },
+    };
+    const { daemon, records } = daemonWithSink(f, {
+      backgroundRunner: runner,
+      now: () => clock,
+      preemptRetryMs: 1,
+    });
+    await daemon.refreshCatalog();
+    await daemon.reindex('madison', false);
+    await waitUntil(() => clock - start >= 180_000, 3_000);
+    records.length = 0;
+    daemon.logStatus();
+    const queued = records.find((record) => record.workgroupId === 'madison')?.queuedForMs;
+    expect(typeof queued).toBe('number');
+    expect(queued as number).toBeGreaterThanOrEqual(180_000);
+    await daemon.close();
+  });
+
+  it('repeats the daemon heartbeat but not an unchanged healthy workgroup record', async () => {
+    const f = fixture();
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'suppression baseline');
+    const { daemon, records } = daemonWithSink(f);
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    daemon.logStatus();
+    expect(records.some((record) => record.workgroupId === 'madison')).toBe(true);
+    records.length = 0;
+    daemon.logStatus();
+    expect(records.some((record) => record.workgroups !== undefined)).toBe(true);
+    expect(records.some((record) => record.workgroupId === 'madison')).toBe(false);
+    await daemon.close();
+  });
+});
