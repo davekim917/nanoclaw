@@ -48,6 +48,7 @@ import { getSession } from '../../db/sessions.js';
 import {
   getSupportThread,
   getSupportThreadBySession,
+  rebindSupportThreadSession,
   setSupportThreadTicket,
   touchSupportThread,
   upsertSupportThread,
@@ -221,7 +222,31 @@ function followupText(
   );
 }
 
-export async function handleDispatchSupportIssue(
+/**
+ * One in-flight dispatch per Gmail thread. Two follow-ups arriving together
+ * used to race: both read the same stale binding, both opened a thread and a
+ * session, and the second upsert overwrote the first — one orphaned session,
+ * one duplicate Slack thread, one message delivered where nobody was reading.
+ * The host is a single Node process, so a promise chain per thread id is the
+ * whole lock.
+ */
+const dispatchChains = new Map<string, Promise<unknown>>();
+
+function withSupportThreadLock<T>(gmailThreadId: string, run: () => Promise<T>): Promise<T> {
+  const prior = dispatchChains.get(gmailThreadId) ?? Promise.resolve();
+  const next = prior.then(run, run);
+  const settled = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  dispatchChains.set(gmailThreadId, settled);
+  void settled.then(() => {
+    if (dispatchChains.get(gmailThreadId) === settled) dispatchChains.delete(gmailThreadId);
+  });
+  return next;
+}
+
+export function handleDispatchSupportIssue(
   content: Record<string, unknown>,
   session: Session,
   inDb: Database.Database,
@@ -229,8 +254,17 @@ export async function handleDispatchSupportIssue(
   const gmailThreadId = str(content.gmailThreadId);
   if (!gmailThreadId) {
     log.warn('dispatch_support_issue: rejected — missing gmailThreadId', { sessionId: session.id });
-    return;
+    return Promise.resolve();
   }
+  return withSupportThreadLock(gmailThreadId, () => dispatchSupportIssue(gmailThreadId, content, session, inDb));
+}
+
+async function dispatchSupportIssue(
+  gmailThreadId: string,
+  content: Record<string, unknown>,
+  session: Session,
+  inDb: Database.Database,
+): Promise<void> {
   const taskContext = getSupportTaskContext(session, inDb);
   const mg = session.messaging_group_id
     ? getMessagingGroup(session.messaging_group_id)
@@ -259,36 +293,56 @@ export async function handleDispatchSupportIssue(
   const linearTeam = existing?.linear_team ?? str(content.linearTeam);
   const ticketPolicy = supportTicketPolicy(session.agent_group_id);
 
-  // ── Follow-up: an open issue with a live session already exists ──
-  if (existing && existing.session_id && existing.slack_thread_id) {
-    const issueSession = getSession(existing.session_id);
+  // ── Follow-up: an open issue with a live Slack thread already exists ──
+  if (existing && existing.slack_thread_id) {
+    const bound = existing.session_id ? getSession(existing.session_id) : undefined;
+    // Reclaim only CLOSES a session row, it never deletes it, so `getSession`
+    // still answers for an archived session. Without the status filter the
+    // follow-up wrote into (and spawned a container for) a status='closed'
+    // row — permanently invisible to host-sweep's stuck/heartbeat machinery.
+    const issueSession = bound?.status === 'active' ? bound : undefined;
+    const followup = {
+      id: randomUUID(),
+      kind: 'chat' as const,
+      timestamp: now,
+      channelType: mg.channel_type,
+      platformId: mg.platform_id,
+      threadId: existing.slack_thread_id,
+      content: JSON.stringify({
+        text: followupText(subject, sender, date, content.bodyText, linearIssue, ticketPolicy),
+        sender: 'system',
+        senderId: 'system',
+        ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
+      }),
+    };
+
+    // The Slack thread, the Linear ticket and the customer's Gmail thread all
+    // outlive the session. A reclaimed session is re-provisioned in place —
+    // same thread, same ticket, ONLY session_id changes — instead of opening a
+    // second announcement for one ongoing conversation.
+    const target =
+      issueSession ?? resolveSession(existing.agent_group_id, mg.id, existing.slack_thread_id, 'per-thread').session;
+
+    await writeSessionMessage(target.agent_group_id, target.id, followup);
     if (issueSession) {
-      await writeSessionMessage(issueSession.agent_group_id, issueSession.id, {
-        id: randomUUID(),
-        kind: 'chat',
-        timestamp: now,
-        channelType: mg.channel_type,
-        platformId: mg.platform_id,
-        threadId: existing.slack_thread_id,
-        content: JSON.stringify({
-          text: followupText(subject, sender, date, content.bodyText, linearIssue, ticketPolicy),
-          sender: 'system',
-          senderId: 'system',
-          ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
-        }),
-      });
       touchSupportThread(gmailThreadId, now, lastMessageId);
-      void wakeContainer(issueSession).catch((err) =>
-        log.warn('dispatch_support_issue: wake (follow-up) failed', { gmailThreadId, err }),
-      );
-      log.info('dispatch_support_issue: routed follow-up into existing thread', {
+    } else {
+      rebindSupportThreadSession(gmailThreadId, target.id, now);
+      touchSupportThread(gmailThreadId, now, lastMessageId);
+      log.info('dispatch_support_issue: rebound thread to a fresh session', {
         gmailThreadId,
-        sessionId: issueSession.id,
+        previousSessionId: existing.session_id,
+        sessionId: target.id,
       });
-      return;
     }
-    // The session was archived/pruned — fall through and open a fresh thread+session.
-    log.info('dispatch_support_issue: existing mapping had no live session, reopening', { gmailThreadId });
+    void wakeContainer(target).catch((err) =>
+      log.warn('dispatch_support_issue: wake (follow-up) failed', { gmailThreadId, err }),
+    );
+    log.info('dispatch_support_issue: routed follow-up into existing thread', {
+      gmailThreadId,
+      sessionId: target.id,
+    });
+    return;
   }
 
   // ── New issue (or seeded/orphaned row): announcement → thread → session → seed → wake ──

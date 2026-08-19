@@ -127,6 +127,27 @@ export function touchSupportThread(gmailThreadId: string, now: string, lastGmail
     .run({ gmailThreadId, now, lastGmailMessageId: lastGmailMessageId ?? null });
 }
 
+/**
+ * Rebind a thread to a fresh session, and ONLY that.
+ *
+ * A support thread outlives its session: reclaim archives the session dir and
+ * closes the row, but the Slack thread, the Linear ticket and the customer's
+ * Gmail thread are all still the same issue. Replacing the whole row (the
+ * upsert path) would mint a new Slack thread and a duplicate announcement for
+ * what is, to everyone involved, an ongoing conversation.
+ */
+export function rebindSupportThreadSession(gmailThreadId: string, sessionId: string, now: string): void {
+  getDb()
+    .prepare(
+      `UPDATE support_threads
+          SET session_id = @sessionId,
+              status = 'open',
+              last_activity_at = @now
+        WHERE gmail_thread_id = @gmailThreadId`,
+    )
+    .run({ gmailThreadId, sessionId, now });
+}
+
 export function closeSupportThread(gmailThreadId: string, now: string): void {
   getDb()
     .prepare("UPDATE support_threads SET status = 'closed', last_activity_at = ? WHERE gmail_thread_id = ?")

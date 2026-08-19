@@ -263,6 +263,106 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
   });
 });
 
+// T6 (SR6) — a support thread outlives the session bound to it.
+describe('handleDispatchSupportIssue — archived session binding', () => {
+  it('never writes to or wakes a closed session, and replaces ONLY session_id', async () => {
+    seed();
+    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller, {} as never);
+    const before = getSupportThread('gthread-A')!;
+    const archivedId = before.session_id!;
+    // Reclaim closes the row and removes the dir; the row itself survives, so
+    // a bare getSession still answers for it.
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(archivedId);
+    fs.rmSync(`${TEST_DIR}/v2-sessions/ag-1/${archivedId}`, { recursive: true, force: true });
+    vi.mocked(wakeContainer).mockClear();
+
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller, {} as never);
+
+    const after = getSupportThread('gthread-A')!;
+    expect(after.session_id).not.toBe(archivedId);
+    expect(getSession(after.session_id!)!.status).toBe('active');
+    // Thread identity and every other field survive the rebinding.
+    expect(after.slack_thread_id).toBe(before.slack_thread_id);
+    expect(after.slack_parent_msg_id).toBe(before.slack_parent_msg_id);
+    expect(after.subject).toBe(before.subject);
+    expect(after.sender).toBe(before.sender);
+    expect(after.linear_issue).toBe(before.linear_issue);
+    expect(after.created_at).toBe(before.created_at);
+    // No second announcement or thread for one ongoing conversation.
+    expect(postParent).toHaveBeenCalledTimes(1);
+    expect(createThread).toHaveBeenCalledTimes(1);
+    // The closed session was never written to or spawned.
+    expect(fs.existsSync(`${TEST_DIR}/v2-sessions/ag-1/${archivedId}`)).toBe(false);
+    expect(vi.mocked(wakeContainer).mock.calls.map((call) => call[0]!.id)).toEqual([after.session_id]);
+    const delivered = inboundOf(after.session_id!);
+    expect(delivered.map((m) => m.content).join('\n')).toContain('customer replied');
+  });
+
+  it('gives two concurrent follow-ups exactly one new session, and delivers both', async () => {
+    seed();
+    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller, {} as never);
+    const archivedId = getSupportThread('gthread-A')!.session_id!;
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(archivedId);
+    fs.rmSync(`${TEST_DIR}/v2-sessions/ag-1/${archivedId}`, { recursive: true, force: true });
+    vi.mocked(wakeContainer).mockClear();
+
+    await Promise.all([
+      handleDispatchSupportIssue(dispatchContent('gthread-A', 'reply one'), poller, {} as never),
+      handleDispatchSupportIssue(dispatchContent('gthread-A', 'reply two'), poller, {} as never),
+    ]);
+
+    const after = getSupportThread('gthread-A')!;
+    const activeIds = (
+      getDb().prepare("SELECT id FROM sessions WHERE status = 'active'").all() as Array<{ id: string }>
+    ).map((r) => r.id);
+    // poller + exactly one replacement issue session.
+    expect(activeIds.sort()).toEqual([poller.id, after.session_id].sort());
+    expect(vi.mocked(wakeContainer).mock.calls.map((call) => call[0]!.id)).toEqual([
+      after.session_id,
+      after.session_id,
+    ]);
+    const bodies = inboundOf(after.session_id!).map((m) => m.content);
+    expect(bodies.some((b) => b.includes('reply one'))).toBe(true);
+    expect(bodies.some((b) => b.includes('reply two'))).toBe(true);
+    expect(postParent).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens exactly one thread when two emails for a NEW issue arrive together', async () => {
+    seed();
+    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    // The new-issue branch awaits postParent BEFORE recording the row, so
+    // without per-thread serialization the second dispatch reads "no such
+    // thread" and announces the same issue a second time.
+    await Promise.all([
+      handleDispatchSupportIssue(dispatchContent('gthread-N', 'first email'), poller, {} as never),
+      handleDispatchSupportIssue(dispatchContent('gthread-N', 'same issue again'), poller, {} as never),
+    ]);
+
+    expect(postParent).toHaveBeenCalledTimes(1);
+    expect(createThread).toHaveBeenCalledTimes(1);
+    const row = getSupportThread('gthread-N')!;
+    const bodies = inboundOf(row.session_id!).map((m) => m.content);
+    expect(bodies).toHaveLength(2);
+    expect(bodies.some((b) => b.includes('first email'))).toBe(true);
+    expect(bodies.some((b) => b.includes('same issue again'))).toBe(true);
+  });
+
+  it('leaves an active binding on its original session', async () => {
+    seed();
+    const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'first email'), poller, {} as never);
+    const sessionId = getSupportThread('gthread-A')!.session_id!;
+
+    await handleDispatchSupportIssue(dispatchContent('gthread-A', 'customer replied'), poller, {} as never);
+
+    expect(getSupportThread('gthread-A')!.session_id).toBe(sessionId);
+    expect(inboundOf(sessionId)).toHaveLength(2);
+  });
+});
+
 describe('handleUpdateSupportTicket', () => {
   it('records the ticket by calling-session and edits the announcement', async () => {
     seed();

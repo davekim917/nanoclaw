@@ -180,3 +180,111 @@ narrow reading would archive, and all 24 are `trigger=0` accumulated context.
 Not a re-outage (94% still drain), and the content survives in the rescue tar
 either way. Narrowing later is one predicate in `sessionHasOpenWork`. Flagged,
 not improvised.
+
+## 2026-08-19 — build stage (C2)
+
+### SR6 — support-threads is status-aware, rebinds in place, serialized per thread
+
+`src/modules/support-threads/dispatch.ts`:
+
+- The follow-up branch now requires `status === 'active'`. Reclaim only CLOSES
+  a session row (it never deletes it), so the old bare `getSession` kept
+  answering for archived sessions and the code's own comment — "The session was
+  archived/pruned — fall through" — was reasoning from a premise that was false
+  for the archival path. That produced the zombie: a write into a
+  re-provisioned dir plus a spawned container on a `status='closed'` row, which
+  `getActiveSessions()` never returns, so host-sweep's stuck detection,
+  heartbeat ceiling and claim tolerance all skipped it for as long as it ran.
+- A stale binding no longer falls through to the new-issue branch. That branch
+  posts a fresh announcement and opens a second Slack thread — for a customer
+  and a Linear ticket that are still the same issue. It now re-resolves a
+  session on the SAME `slack_thread_id` and calls the new
+  `rebindSupportThreadSession()`, which touches `session_id` (+ status/activity)
+  and nothing else. T6 asserts `slack_thread_id`, `slack_parent_msg_id`,
+  `subject`, `sender`, `linear_issue` and `created_at` all survive.
+- `withSupportThreadLock` chains dispatches per Gmail thread id.
+
+### T6 — and what each case actually proves
+
+| Case | Verdict |
+|---|---|
+| closed binding → no write/wake on the closed row, only `session_id` replaced | **fails without the status filter** (`expected 'sess-…' not to be 'sess-…'`) |
+| two concurrent follow-ups on an archived binding → one new session, both delivered | **fails without the status filter**; passes with or without the lock |
+| two concurrent emails for a NEW issue → one announcement | **fails without the lock** (`expected vi.fn() to be called 1 times, but got 2`) |
+| active binding → unchanged behavior | passes before and after |
+
+Being straight about the second row: the reviewer's concurrency concern is real
+but is NOT reachable through the archived-binding path today. `resolveSession`
+is a synchronous find-then-create and migration 049's partial unique index on
+the active `(agent_group, messaging_group, thread)` triple already forces two
+racers onto one session. The lock earns its place on the NEW-issue path, where
+`await adapter.postParent(...)` happens BEFORE the row is recorded — proven by
+the third row above. It also carries the same durability argument migration 049
+documents for itself: it survives a refactor that puts an `await` inside
+`resolveSession`.
+
+### Raw-session-id consumer enumeration (SR6's second half)
+
+`grep -rn "getSession(" src/ --include=*.ts | grep -v test` → 40 call sites,
+classified by whether they can wake or write the resolved session.
+
+**A. Self-refresh of the session already running this turn — cannot be archived.**
+`router.ts:1348`, `container-restart.ts:351`, `modules/self-mod/apply.ts:81,131,223`,
+`modules/provider-fallback/handler.ts:92`, `modules/approvals/primitive.ts:220`,
+`modules/agent-to-agent/create-agent.ts:39`, `modules/agent-to-agent/agent-route.ts:450`,
+`cli/dispatch.ts:131`, `cli/resources/groups.ts:306`, `cli/resources/tasks.ts:263,388`.
+*Proof:* collection skips `isContainerRunning` (`storage-manager.ts` session walk),
+apply re-validates it (C1), and `wakeContainer` holds a storage-activity lease on
+the session dir (`container-runner.ts:625`) that is mutually exclusive with the
+archival's cleanup claim (`storage-activity.ts:107`).
+
+**B. Read-only — no write, no wake, status irrelevant.**
+`cli/dispatch.ts:96` (cross-group existence oracle guard), `cli/resources/tasks.ts:128`
+(scope check), `dashboard/archive.ts:37`, `host-restart-warn.ts:154`,
+`session-manager.ts:645` (provider name), `session-manager.ts:1604` (SSE emit).
+
+**C. Already filters status — no change needed.**
+`modules/agent-to-agent/agent-route.ts:250` — `candidate.status === 'active'`.
+
+**D. `observatory_item_threads` — RESOLVED, and it is not a session-id consumer at all.**
+Flagged "unverified" in the grounding. Traced both consumers: the table stores
+`(workgroup_id, item_id) → thread_id` and there is no `getSession` anywhere in
+`dashboard/observatory-steer.ts` or `dashboard/api/observatory.ts`.
+`decorateSteeredThreads` (`observatory.ts:210`) is display-only, and the steer
+path resolves through `resolveSession` on the thread, which filters
+`status='active'` via `findSessionForAgent`. **Proof, no fix.**
+
+**E. FIXED in C2.** `modules/support-threads/dispatch.ts:264`.
+
+**F. Same pattern, NOT fixed here — writes/wakes a STORED session id with no status filter.**
+
+| Path | Stored id source |
+|---|---|
+| `dashboard/steer.ts:354` (`applySessionSteer`) + `:249` (child steer wake) | dashboard request / steer exec |
+| `dashboard/api/scheduled-mutations.ts:483` (run-now wake) | `tasks.session_id` |
+| `modules/interactive/index.ts:25` | `pending_questions.session_id` |
+| `modules/approvals/response-handler.ts:115,207`, `reason-capture.ts:139,165` | `pending_approvals.session_id` |
+| `modules/orchestrator-dispatch/completion.ts:42,95`, `cancellation.ts:62,85`, `dispatch.ts:493`, `host-sweep.ts:1638` | `tasks.parent_session_id` / `child_session_id` |
+
+All of these are live code (`src/modules/index.ts:30` imports orchestrator-dispatch;
+`src/index.ts:115` runs its startup reconciler). Their WRITE half is already
+covered by C1 — `writeSessionMessageInternal` throws on an `archiving` row — so
+the residual exposure is a session that is `closed`, i.e. already archived.
+Each of them can then wake a closed row into the same zombie state SR6 just
+removed from support-threads.
+
+**Not fixed in C2, deliberately, and this is the one thing the lead must decide:**
+SR6's scope is support-threads, and the lazy root-cause fix for this whole class
+is ONE guard — `wakeContainer` refusing a row whose status is not `'active'`,
+which every path above funnels through. That is a ~3-line change in
+`src/container-runner.ts`, and **that file carries another session's uncommitted
+work** (the Slack owner-safety subject change), so exact-path staging forbids
+touching it in this branch. Recommend it as a separate one-commit follow-up once
+that file is free; the alternative (extending the C1 write guard from
+`archiving` to `closed`) is broader and would need its own pass over legitimate
+writes to closed sessions.
+
+### Verification (C2)
+
+- `vitest run src/modules/support-threads/ src/dashboard/steer.test.ts` → **17 passed**
+- `tsc --noEmit -p tsconfig.json` → clean · `eslint` on both changed sources → 0 errors
