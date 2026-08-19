@@ -403,6 +403,41 @@ describe('createChatSdkBridge — outbound transform path', () => {
     expect(posts).toHaveLength(1);
     expect(posts[0].body).toEqual({ raw: 'TEXT-WINS' });
   });
+
+  it('status-kind narration does not resolve into a live mention (2026-08-18 incident)', async () => {
+    // Stand-in for resolveSlackMentions: rewrites @Barry -> <@UBARRY> the
+    // same way the real Slack/Discord rewriter would, so this test fails if
+    // the zero-width neutralization stops happening.
+    const mentionRewriter = (t: string): string => t.replace(/@Barry\b/g, '<@UBARRY>');
+    const { bridge, posts } = recordingBridge({ transformOutboundMarkdown: mentionRewriter });
+
+    await bridge.deliver('thread-1', null, {
+      kind: 'status',
+      content: { text: "drafting the post... keeping it concise without mentioning @Barry" },
+    } as never);
+
+    expect(posts).toHaveLength(1);
+    const delivered = posts[0].body.markdown as string;
+    expect(delivered).not.toContain('<@UBARRY>');
+    // Zero-width space breaks the rewriter's match but reads identically —
+    // strip it and the original prose is untouched.
+    expect(delivered.replace(/\u200b/g, '')).toBe(
+      "drafting the post... keeping it concise without mentioning @Barry",
+    );
+  });
+
+  it('chat-kind mentions still resolve normally (real addressing keeps working)', async () => {
+    const mentionRewriter = (t: string): string => t.replace(/@ollie\b/g, '<@UOLLIE>');
+    const { bridge, posts } = recordingBridge({ transformOutboundMarkdown: mentionRewriter });
+
+    await bridge.deliver('thread-1', null, {
+      kind: 'chat',
+      content: { text: '@ollie can you take this one?' },
+    } as never);
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0].body.markdown).toBe('<@UOLLIE> can you take this one?');
+  });
 });
 
 describe('createChatSdkBridge.deliver — ask_question cards', () => {
