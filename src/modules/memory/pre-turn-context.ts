@@ -695,6 +695,63 @@ function listMarkdownFiles(root: string, notices: ContextNotice[]): string[] {
   return files.sort();
 }
 
+/**
+ * Direct, non-recursive listing of preferences/ stems — independent of
+ * listMarkdownFiles' capped walk. The preference lane is a deterministic
+ * direct-path lookup keyed by sender slug, so it must not silently go empty
+ * just because unrelated directories sorting earlier exhausted the walk's
+ * shared visited-entry cap.
+ */
+function listPreferenceStems(root: string, notices: ContextNotice[]): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(path.join(root, PREFERENCES_DIR), { withFileTypes: true });
+  } catch (error) {
+    if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  const stems: string[] = [];
+  let skippedSymlinks = 0;
+  for (const entry of entries.sort((a, b) => compareCodepoint(a.name, b.name))) {
+    if (entry.isSymbolicLink()) {
+      skippedSymlinks++;
+      continue;
+    }
+    if (!entry.isFile() || !entry.name.toLocaleLowerCase('en-US').endsWith('.md')) continue;
+    const stem = entry.name.slice(0, -'.md'.length);
+    if (stem.length > 0) stems.push(stem);
+  }
+  if (skippedSymlinks > 0) {
+    notices.push({
+      source: 'markdown',
+      status: 'degraded',
+      code: 'markdown-symlink-skipped',
+      detail: `skipped ${skippedSymlinks} symbolic link${skippedSymlinks === 1 ? '' : 's'} in ${PREFERENCES_DIR}`,
+    });
+  }
+  return stems;
+}
+
+/**
+ * generated/memory.md's read-first priority (scanOrder below) depends on it
+ * being present in the scan list. A tree large enough to exhaust
+ * listMarkdownFiles' shared walk cap before reaching `generated/` would
+ * otherwise silently drop the whole fact store from recall. Returns the
+ * relative path to splice in only when the walk missed it AND the file is
+ * really there — matching the walk's own symlink-skip discipline via lstat
+ * rather than trusting a followed stat.
+ */
+function missingGeneratedMemoryPath(root: string, allFiles: readonly string[]): string | null {
+  if (allFiles.includes(GENERATED_MEMORY_RELATIVE_PATH)) return null;
+  try {
+    return fs.lstatSync(path.join(root, GENERATED_MEMORY_RELATIVE_PATH)).isFile()
+      ? GENERATED_MEMORY_RELATIVE_PATH
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 interface SearchableCandidate {
   path: string;
   headings: string[];
@@ -795,10 +852,7 @@ function readMemoryEvidence(
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
   if (involvedSenderNames.length > 0) {
     const senderSlugs = [...new Set(involvedSenderNames.map(preferenceSlug))].filter((slug) => slug.length > 0);
-    const preferenceStems = allFiles
-      .filter((relative) => relative.startsWith(PREFERENCES_DIR))
-      .map((relative) => relative.slice(PREFERENCES_DIR.length, -'.md'.length))
-      .filter((stem) => stem.length > 0 && !stem.includes('/'));
+    const preferenceStems = listPreferenceStems(root, notices);
     // ONE file per sender: exact slug match wins outright; otherwise the
     // longest prefix-compatible stem. Injecting every prefix match would let
     // `alex.md` ride along with `alex-stone.md` for the same person.
@@ -854,7 +908,8 @@ function readMemoryEvidence(
     }
   }
 
-  const scanOrder = allFiles.sort(
+  const missingGeneratedMemory = missingGeneratedMemoryPath(root, allFiles);
+  const scanOrder = (missingGeneratedMemory ? [...allFiles, missingGeneratedMemory] : allFiles).sort(
     (a, b) => Number(b === GENERATED_MEMORY_RELATIVE_PATH) - Number(a === GENERATED_MEMORY_RELATIVE_PATH),
   );
   for (const relative of scanOrder) {

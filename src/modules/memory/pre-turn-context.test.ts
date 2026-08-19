@@ -1206,6 +1206,59 @@ describe('per-person preference recall', () => {
   });
 });
 
+// Root cause: listMarkdownFiles walks BFS with a PRE_TURN_BOUNDS.markdownFiles
+// (256) visited-entry cap. `concepts/` sorts before both `preferences/` and
+// `generated/`, so a tree with enough concepts files exhausts the cap before
+// either directory is ever enumerated. Both lanes below are deterministic,
+// direct-path lookups and must not depend on the ranked walk's output.
+describe('recall lanes survive file-walk cap starvation', () => {
+  function seedOverCapTree(): void {
+    for (let index = 0; index < 300; index++) {
+      memoryFile(`concepts/note-${String(index).padStart(3, '0')}.md`, `# Note ${index}\nFiller content ${index}.`);
+    }
+  }
+
+  it('preference lane survives a memory tree larger than the file-walk cap', () => {
+    seedOverCapTree();
+    memoryFile('preferences/alex.md', '# Alex\nProduct altitude always. No file paths or code identifiers.');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'what shipped this week?', sender: 'Alex Stone' }),
+    });
+
+    expect(result.notices.some((notice) => notice.code === 'markdown-file-limit')).toBe(true);
+    const preference = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md');
+    expect(preference).toBeDefined();
+    expect(preference?.text).toContain('Product altitude always');
+    expect(result.notices.some((notice) => notice.code === 'preference-recall')).toBe(true);
+  });
+
+  it('the fact store survives a memory tree larger than the file-walk cap', () => {
+    seedOverCapTree();
+    const fact = (n: number) =>
+      `- Forecast pipeline volume fact number ${n} with distinct detail ${'x'.repeat(30 * n)}. <!-- nanoclaw-memory:id=mem_${String(n).repeat(16)};evidence=ev-${n};captured=2026-08-0${n}T00:00:00.000Z -->`;
+    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${[1, 2, 3].map(fact).join('\n')}\n`);
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'What is the forecast pipeline volume detail?' }),
+      includeBootstrap: false,
+    });
+
+    expect(result.notices.some((notice) => notice.code === 'markdown-file-limit')).toBe(true);
+    const facts = result.memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md');
+    expect(facts.length).toBeGreaterThan(0);
+    expect(facts[0]?.text).toContain('Forecast pipeline volume fact');
+  });
+});
+
 describe('fact marker reason field (P0-AC6)', () => {
   it('the reason field does not affect ranking or selection', () => {
     const fact = (n: number, reason: string) =>
