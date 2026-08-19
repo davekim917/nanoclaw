@@ -237,7 +237,13 @@ export interface Session {
   messaging_group_id: string | null;
   thread_id: string | null;
   agent_provider: string | null;
-  status: 'active' | 'closed';
+  /**
+   * 'archiving' is the in-flight reclaim state: the storage manager holds the
+   * row there from the moment it commits to archiving until the rescue archive
+   * is published. It is deliberately not 'active', so every status='active'
+   * lookup (routing, the sweep, the unique active-triple index) skips it.
+   */
+  status: 'active' | 'closed' | 'archiving';
   container_status: 'running' | 'idle' | 'stopped';
   last_active: string | null;
   last_outbound_at?: string | null;

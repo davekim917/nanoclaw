@@ -860,7 +860,11 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nlegacy upgrade context');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh legacy context');
 
-    expect(reconcilePendingUpgradeContexts(getDb(), ['reset'])).toEqual({ sessions: 1, admitted: 1 });
+    expect(reconcilePendingUpgradeContexts(getDb(), ['reset'])).toEqual({
+      sessions: 1,
+      admitted: 1,
+      mtimesRestored: 0,
+    });
 
     const verified = new Database(legacyPath, { readonly: true });
     try {
@@ -1292,6 +1296,214 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     } finally {
       db.close();
     }
+  });
+});
+
+// T1 (SR1) — a schema migration is bookkeeping, not session activity. The idle
+// clock the reaper reads must survive it, including across a crash mid-pass.
+describe('session migration pass preserves the idle clock', () => {
+  const MIGRATION_AG = 'ag-mtime';
+  const DATA_DIR = '/tmp/nanoclaw-test-write-outbound';
+  const OLD_SECONDS = Date.parse('2026-04-01T00:00:00.000Z') / 1000;
+
+  beforeEach(() => {
+    fs.rmSync(path.join(DATA_DIR, 'v2-sessions', MIGRATION_AG), { recursive: true, force: true });
+    fs.rmSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'), { force: true });
+    const db = initTestDb();
+    runMigrations(db);
+    createAgentGroup({
+      id: MIGRATION_AG,
+      name: 'Mtime',
+      folder: 'mtime',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    getDb()
+      .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('mtime','Mtime',?)`)
+      .run(new Date().toISOString());
+    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'mtime' WHERE id = ?`).run(MIGRATION_AG);
+  });
+
+  afterEach(() => {
+    closeDb();
+  });
+
+  function seedSession(sessionId: string): void {
+    createSession({
+      id: sessionId,
+      agent_group_id: MIGRATION_AG,
+      messaging_group_id: null,
+      thread_id: `thr-${sessionId}`,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-04-01T00:00:00.000Z',
+    });
+  }
+
+  function ageInbound(sessionId: string): number {
+    const target = inboundDbPath(MIGRATION_AG, sessionId);
+    fs.utimesSync(target, OLD_SECONDS, OLD_SECONDS);
+    return fs.statSync(target).mtimeMs;
+  }
+
+  it('leaves a schema-current inbound.db untouched', () => {
+    const sessionId = 'sess-current-schema';
+    seedSession(sessionId);
+    initSessionFolder(MIGRATION_AG, sessionId);
+    const before = ageInbound(sessionId);
+
+    expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toMatchObject({ sessions: 1, mtimesRestored: 0 });
+    expect(fs.statSync(inboundDbPath(MIGRATION_AG, sessionId)).mtimeMs).toBe(before);
+  });
+
+  it('restores the pre-pass mtime after real DDL runs', () => {
+    const sessionId = 'sess-legacy-schema';
+    seedSession(sessionId);
+    const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    const legacy = new Database(legacyPath);
+    legacy.exec(`
+      CREATE TABLE messages_in (
+        id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        platform_id TEXT,
+        channel_type TEXT,
+        thread_id TEXT,
+        content TEXT NOT NULL,
+        process_after TEXT,
+        recurrence TEXT
+      )
+    `);
+    legacy.close();
+    const before = ageInbound(sessionId);
+
+    expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toMatchObject({
+      sessions: 1,
+      admitted: 0,
+      mtimesRestored: 1,
+    });
+    expect(fs.statSync(legacyPath).mtimeMs).toBe(before);
+
+    const verified = new Database(legacyPath, { readonly: true });
+    const columns = new Set(
+      (verified.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    verified.close();
+    expect(columns.has('series_id')).toBe(true);
+    expect(columns.has('repo_fence_epoch')).toBe(true);
+  });
+
+  it('deletes the intent manifest when the pass completes', () => {
+    const sessionId = 'sess-manifest-clean';
+    seedSession(sessionId);
+    initSessionFolder(MIGRATION_AG, sessionId);
+
+    reconcilePendingUpgradeContexts(getDb(), ['mtime']);
+
+    expect(fs.existsSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'))).toBe(false);
+  });
+
+  it('replays an interrupted pass from the fsynced manifest at startup', async () => {
+    const sessionId = 'sess-crashed-pass';
+    seedSession(sessionId);
+    initSessionFolder(MIGRATION_AG, sessionId);
+    const target = inboundDbPath(MIGRATION_AG, sessionId);
+    const stat = fs.statSync(target);
+    // The pass wrote its manifest, ran DDL, and died before restoring.
+    const writtenAtMs = Date.now();
+    fs.writeFileSync(
+      path.join(DATA_DIR, 'pending-upgrade-mtimes.json'),
+      JSON.stringify({
+        writtenAtMs,
+        entries: [{ path: target, atimeMs: OLD_SECONDS * 1000, mtimeMs: OLD_SECONDS * 1000 }],
+      }),
+    );
+    const bumped = (writtenAtMs + 1000) / 1000;
+    fs.utimesSync(target, bumped, bumped);
+
+    const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
+    expect(replayUpgradeMtimeManifest(DATA_DIR)).toBe(1);
+    expect(fs.statSync(target).mtimeMs).toBe(OLD_SECONDS * 1000);
+    expect(fs.existsSync(path.join(DATA_DIR, 'pending-upgrade-mtimes.json'))).toBe(false);
+    expect(stat.mtimeMs).toBeGreaterThan(0);
+  });
+
+  it('leaves a session that saw real traffic after the crashed pass alone', async () => {
+    const sessionId = 'sess-real-traffic';
+    seedSession(sessionId);
+    initSessionFolder(MIGRATION_AG, sessionId);
+    const target = inboundDbPath(MIGRATION_AG, sessionId);
+    const writtenAtMs = Date.now() - 60 * 60 * 1000;
+    fs.writeFileSync(
+      path.join(DATA_DIR, 'pending-upgrade-mtimes.json'),
+      JSON.stringify({
+        writtenAtMs,
+        entries: [{ path: target, atimeMs: OLD_SECONDS * 1000, mtimeMs: OLD_SECONDS * 1000 }],
+      }),
+    );
+    const recent = Date.now() / 1000;
+    fs.utimesSync(target, recent, recent);
+
+    const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
+    expect(replayUpgradeMtimeManifest(DATA_DIR)).toBe(0);
+    expect(fs.statSync(target).mtimeMs).toBeGreaterThan(OLD_SECONDS * 1000);
+  });
+
+  it('keeps the new mtime for a session whose pass admitted real work', () => {
+    const sessionId = 'sess-admits-work';
+    seedSession(sessionId);
+    const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    const legacy = new Database(legacyPath);
+    legacy.exec(`
+      CREATE TABLE messages_in (
+        id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        platform_id TEXT,
+        channel_type TEXT,
+        thread_id TEXT,
+        content TEXT NOT NULL,
+        process_after TEXT,
+        recurrence TEXT
+      )
+    `);
+    legacy
+      .prepare(
+        `INSERT INTO messages_in (id,seq,kind,timestamp,status,platform_id,channel_type,thread_id,content)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        'legacy-pending',
+        2,
+        'chat-sdk',
+        '2026-04-01T00:00:00.000Z',
+        'pending',
+        'slack:C1',
+        'slack',
+        'slack:C1:T1',
+        JSON.stringify({ text: 'admit me after the schema upgrade' }),
+      );
+    legacy.close();
+    const memoryRoot = path.join(DATA_DIR, 'workgroups', 'mtime', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nadmitted context');
+    fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh context');
+    const before = ageInbound(sessionId);
+
+    expect(reconcilePendingUpgradeContexts(getDb(), ['mtime'])).toEqual({
+      sessions: 1,
+      admitted: 1,
+      mtimesRestored: 0,
+    });
+    expect(fs.statSync(legacyPath).mtimeMs).toBeGreaterThan(before);
   });
 });
 

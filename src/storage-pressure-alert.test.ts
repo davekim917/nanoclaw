@@ -38,6 +38,9 @@ function report(usagePct: number): StorageReport {
       admissionRefusePct: 90,
       idleArtifactMs: 1,
       worktreeReclaimMs: 1,
+      sessionReclaimMs: 1,
+      sessionReclaimPerTick: 50,
+      sessionActiveCap: 0,
       scanCadenceMs: 1,
       dockerPruneCadenceMs: 21_600_000,
       dockerBuildCacheUnusedFor: '168h',
@@ -91,6 +94,7 @@ function report(usagePct: number): StorageReport {
       freshThreads: 0,
       unreadableSessions: 0,
       noActivitySessions: 0,
+      budgetDeferredSessions: 0,
     },
     warnings: [],
   };

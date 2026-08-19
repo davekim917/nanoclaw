@@ -12,27 +12,14 @@ vi.mock('child_process', () => ({
 }));
 
 // Default: central DB unavailable (throws) — proves the manager works without
-// it and that session reclaim fails closed. Tests that exercise reclaim set
-// mocks.centralDb to a row map; UPDATEd session ids land in centralDb.updates.
-const centralDbMock = vi.hoisted(() => ({
-  current: null as null | {
-    rows: Record<string, { status: string; last_activity: string | null }>;
-    updates: string[];
-  },
-}));
+// it and that session reclaim fails closed. Tests that exercise reclaim install
+// a real in-memory sessions table, so status CAS (active -> archiving ->
+// closed) is exercised against actual SQL rather than a hand-rolled fake.
+const centralDbMock = vi.hoisted(() => ({ current: null as null | { db: Database.Database } }));
 vi.mock('./db/connection.js', () => ({
   getDb: () => {
     if (!centralDbMock.current) throw new Error('central db unavailable in storage-manager unit test');
-    const db = centralDbMock.current;
-    return {
-      prepare: (sql: string) => ({
-        get: (id: string) => db.rows[id],
-        run: (id: string) => {
-          if (sql.includes('UPDATE sessions')) db.updates.push(id);
-        },
-        all: () => [],
-      }),
-    };
+    return centralDbMock.current.db;
   },
 }));
 
@@ -49,12 +36,130 @@ import {
   _resetStorageManagerThrottleForTesting,
   assertStorageAdmission,
   classifyDockerImage,
+  finishInterruptedSessionArchivals,
   getStorageReport,
   pruneIdleSessionArtifacts,
+  readReclaimJournal,
   type DockerImageInventory,
 } from './storage-manager.js';
 import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
+import { log } from './log.js';
+
+// ── Shared session-reclaim fixtures ──────────────────────────────────────────
+
+interface CentralSessionSeed {
+  id: string;
+  status: string;
+  last_active: string | null;
+  agent_group_id?: string;
+}
+
+function installCentralDb(seeds: CentralSessionSeed[]): Database.Database {
+  const db = new Database(':memory:');
+  db.exec(`CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    agent_group_id TEXT NOT NULL DEFAULT 'ag-1',
+    status TEXT DEFAULT 'active',
+    last_active TEXT,
+    created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z'
+  )`);
+  const insert = db.prepare(
+    'INSERT INTO sessions (id, agent_group_id, status, last_active) VALUES (@id, @agent_group_id, @status, @last_active)',
+  );
+  for (const seed of seeds) {
+    insert.run({ agent_group_id: 'ag-1', ...seed });
+  }
+  centralDbMock.current = { db };
+  return db;
+}
+
+function closeCentralDb(): void {
+  try {
+    centralDbMock.current?.db.close();
+  } catch {
+    // Already closed by the test.
+  }
+  centralDbMock.current = null;
+}
+
+function sessionStatus(db: Database.Database, id: string): string | undefined {
+  return (db.prepare('SELECT status FROM sessions WHERE id = ?').get(id) as { status: string } | undefined)?.status;
+}
+
+/** `tar -cf` writes a stub archive; `tar -tf` lists it. Anything else throws. */
+function tarAwareExecFileSync(cmd: string, cmdArgs?: unknown): string {
+  if (cmd === 'df') {
+    return 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 900 100 90% /\n';
+  }
+  if (cmd === 'tar') {
+    const argv = cmdArgs as string[];
+    const create = argv.indexOf('-cf');
+    if (create >= 0) {
+      fs.writeFileSync(argv[create + 1]!, 'fake-zstd-archive');
+      return '';
+    }
+    const list = argv.indexOf('-tf');
+    if (list >= 0) {
+      const target = argv[list + 1]!;
+      if (!fs.existsSync(target)) throw new Error(`tar -tf: no such archive ${target}`);
+      return 'session/\n';
+    }
+  }
+  throw new Error(`unexpected command ${cmd}`);
+}
+
+interface SessionDirOptions {
+  /** Rows written into messages_in (defaults to none). */
+  pending?: Array<{ status: string; trigger: number; process_after?: string | null }>;
+  processingAck?: boolean;
+  /** Raw session_state.work_continuation value. */
+  workContinuation?: string;
+}
+
+function makeSessionDir(
+  sessionsRoot: string,
+  group: string,
+  id: string,
+  activityMs: number,
+  options: SessionDirOptions = {},
+): string {
+  const dir = path.join(sessionsRoot, group, id);
+  fs.mkdirSync(path.join(dir, 'creds'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'creds', 'secret.json'), 'secret-material');
+  fs.writeFileSync(path.join(dir, 'notes.md'), 'human work');
+
+  const inbound = new Database(path.join(dir, 'inbound.db'));
+  inbound.exec(
+    "CREATE TABLE messages_in (status TEXT NOT NULL DEFAULT 'completed', trigger INTEGER, process_after TEXT)",
+  );
+  for (const row of options.pending ?? []) {
+    inbound
+      .prepare('INSERT INTO messages_in (status, trigger, process_after) VALUES (?, ?, ?)')
+      .run(row.status, row.trigger, row.process_after ?? null);
+  }
+  inbound.close();
+
+  if (options.processingAck || options.workContinuation !== undefined) {
+    const outbound = new Database(path.join(dir, 'outbound.db'));
+    outbound.exec('CREATE TABLE processing_ack (message_id TEXT, status TEXT)');
+    outbound.exec('CREATE TABLE session_state (key TEXT PRIMARY KEY, value TEXT)');
+    if (options.processingAck) {
+      outbound.prepare("INSERT INTO processing_ack VALUES ('m-1', 'processing')").run();
+    }
+    if (options.workContinuation !== undefined) {
+      outbound.prepare("INSERT INTO session_state VALUES ('work_continuation', ?)").run(options.workContinuation);
+    }
+    outbound.close();
+  }
+
+  const seconds = activityMs / 1000;
+  for (const name of ['inbound.db', 'outbound.db']) {
+    const target = path.join(dir, name);
+    if (fs.existsSync(target)) fs.utimesSync(target, seconds, seconds);
+  }
+  return dir;
+}
 
 describe('storage-manager cache cleanup', () => {
   let tmpRoot: string;
@@ -313,7 +418,10 @@ describe('storage-manager cache cleanup', () => {
     expect(fs.existsSync(path.join(idleDir, 'archive.db'))).toBe(true);
   });
 
-  it('treats only due triggered work as busy', () => {
+  // Contract change (SR5, session-storage-health): this used to read
+  // "treats only due triggered work as busy". A future-dated recurrence and an
+  // unconsumed accumulated row are both real work a reclaim must not race.
+  it('treats any unconsumed inbound row as busy, due or not', () => {
     const chatterDir = makeSession({ id: 'sess-chatter', pending: true, trigger: 0 });
     const futureDir = makeSession({
       id: 'sess-future',
@@ -338,10 +446,10 @@ describe('storage-manager cache cleanup', () => {
     });
 
     const plannedPaths = report.actions.map((action) => action.path);
-    expect(plannedPaths).toContain(path.join(chatterDir, 'worktrees', 'repo', '.turbo'));
-    expect(plannedPaths).toContain(path.join(futureDir, 'worktrees', 'repo', '.turbo'));
+    expect(plannedPaths).not.toContain(path.join(chatterDir, 'worktrees', 'repo', '.turbo'));
+    expect(plannedPaths).not.toContain(path.join(futureDir, 'worktrees', 'repo', '.turbo'));
     expect(plannedPaths).not.toContain(path.join(dueDir, 'worktrees', 'repo', '.turbo'));
-    expect(report.skipped.busySessions).toBe(1);
+    expect(report.skipped.busySessions).toBe(3);
   });
 
   it('protects sessions with inbound processing or an active processing acknowledgement', () => {
@@ -363,13 +471,14 @@ describe('storage-manager cache cleanup', () => {
     expect(report.skipped.busySessions).toBe(2);
   });
 
-  it('fails closed when a legacy session database lacks the scheduling columns', () => {
-    const legacyDir = makeSession({ id: 'sess-legacy-schema' });
+  // A legacy DB missing only the scheduling columns is now fully evaluable —
+  // the blocker predicate reads `status` alone — so fail-closed is reserved
+  // for a session whose inbound DB genuinely cannot be read.
+  it('fails closed when a session inbound database cannot be read', () => {
+    const legacyDir = makeSession({ id: 'sess-unreadable' });
     const inboundPath = path.join(legacyDir, 'inbound.db');
     fs.rmSync(inboundPath);
-    const legacyDb = new Database(inboundPath);
-    legacyDb.exec("CREATE TABLE messages_in (status TEXT NOT NULL DEFAULT 'completed')");
-    legacyDb.close();
+    fs.writeFileSync(inboundPath, 'this is not a sqlite database');
 
     const report = getStorageReport({
       mode: 'dry-run',
@@ -395,37 +504,18 @@ describe('storage-manager session archive-then-reclaim', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     _resetStorageManagerThrottleForTesting();
-    centralDbMock.current = null;
+    closeCentralDb();
     tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-sess-reclaim-'));
-    mockExecFileSync.mockImplementation((cmd: string, cmdArgs?: unknown) => {
-      if (cmd === 'df') {
-        return 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 900 100 90% /\n';
-      }
-      if (cmd === 'tar') {
-        const argv = cmdArgs as string[];
-        fs.writeFileSync(argv[argv.indexOf('-cf') + 1]!, 'fake-zstd-archive');
-        return '';
-      }
-      throw new Error(`unexpected command ${cmd}`);
-    });
+    mockExecFileSync.mockImplementation(tarAwareExecFileSync);
   });
 
   afterEach(() => {
-    centralDbMock.current = null;
+    closeCentralDb();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
   function makeIdleSession(id: string, idleMs: number): string {
-    const dir = path.join(tmpRoot, 'v2-sessions', 'ag-1', id);
-    fs.mkdirSync(path.join(dir, 'creds'), { recursive: true });
-    fs.writeFileSync(path.join(dir, 'creds', 'secret.json'), 'secret-material');
-    fs.writeFileSync(path.join(dir, 'notes.md'), 'human work');
-    const db = new Database(path.join(dir, 'inbound.db'));
-    db.exec("CREATE TABLE messages_in (status TEXT NOT NULL DEFAULT 'completed', trigger INTEGER, process_after TEXT)");
-    db.close();
-    const mtime = (now - idleMs) / 1000;
-    fs.utimesSync(path.join(dir, 'inbound.db'), mtime, mtime);
-    return dir;
+    return makeSessionDir(path.join(tmpRoot, 'v2-sessions'), 'ag-1', id, now - idleMs);
   }
 
   function runApply() {
@@ -445,16 +535,13 @@ describe('storage-manager session archive-then-reclaim', () => {
 
   it('archives a 30d-idle session, closes its row, and excludes creds from the rescue', () => {
     const dir = makeIdleSession('sess-old', 31 * DAY);
-    centralDbMock.current = {
-      rows: { 'sess-old': { status: 'active', last_activity: iso(31 * DAY) } },
-      updates: [],
-    };
+    const db = installCentralDb([{ id: 'sess-old', status: 'active', last_active: iso(31 * DAY) }]);
 
     const report = runApply();
 
     const action = report.actions.find((a) => a.kind === 'archive-session');
     expect(action?.status).toBe('applied');
-    expect(centralDbMock.current.updates).toEqual(['sess-old']);
+    expect(sessionStatus(db, 'sess-old')).toBe('closed');
     expect(fs.existsSync(dir)).toBe(false);
     const rescues = fs.readdirSync(path.join(tmpRoot, 'session-rescues'));
     expect(rescues.some((f) => f.startsWith('ag-1__sess-old-') && f.endsWith('.tar.zst'))).toBe(true);
@@ -464,15 +551,12 @@ describe('storage-manager session archive-then-reclaim', () => {
 
   it('holds a session whose central row shows fresh activity, whatever the dir mtime says', () => {
     const dir = makeIdleSession('sess-db-fresh', 31 * DAY);
-    centralDbMock.current = {
-      rows: { 'sess-db-fresh': { status: 'active', last_activity: iso(1 * DAY) } },
-      updates: [],
-    };
+    const db = installCentralDb([{ id: 'sess-db-fresh', status: 'active', last_active: iso(1 * DAY) }]);
 
     const report = runApply();
 
     expect(report.actions.filter((a) => a.kind === 'archive-session')).toEqual([]);
-    expect(centralDbMock.current.updates).toEqual([]);
+    expect(sessionStatus(db, 'sess-db-fresh')).toBe('active');
     expect(fs.existsSync(path.join(dir, 'notes.md'))).toBe(true);
   });
 
@@ -487,14 +571,452 @@ describe('storage-manager session archive-then-reclaim', () => {
 
   it('reclaims an orphan dir with no central row without touching the DB', () => {
     const dir = makeIdleSession('sess-orphan', 40 * DAY);
-    centralDbMock.current = { rows: {}, updates: [] };
+    installCentralDb([]);
 
     const report = runApply();
 
     const action = report.actions.find((a) => a.kind === 'archive-session');
     expect(action?.status).toBe('applied');
-    expect(centralDbMock.current.updates).toEqual([]);
     expect(fs.existsSync(dir)).toBe(false);
+  });
+});
+
+// T5 (SR5) — the two blocker gaps the reaper plan closes, plus the literal
+// "ANY pending row" reading recorded in run.md.
+describe('storage-manager session open-work blockers', () => {
+  let tmpRoot: string;
+  const now = Date.parse('2026-06-30T00:00:00.000Z');
+  const DAY = 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetStorageManagerThrottleForTesting();
+    closeCentralDb();
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-open-work-'));
+    mockExecFileSync.mockImplementation(tarAwareExecFileSync);
+  });
+
+  afterEach(() => {
+    closeCentralDb();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function runApply() {
+    return getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot: path.join(tmpRoot, 'v2-sessions'),
+      threadsRoot: path.join(tmpRoot, 'no-threads'),
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 1 * DAY, worktreeReclaimMs: 30 * DAY },
+    });
+  }
+
+  function seed(id: string, options: SessionDirOptions): string {
+    const dir = makeSessionDir(path.join(tmpRoot, 'v2-sessions'), 'ag-1', id, now - 40 * DAY, options);
+    installCentralDb([{ id, status: 'active', last_active: new Date(now - 40 * DAY).toISOString() }]);
+    return dir;
+  }
+
+  it('blocks a session whose only pending trigger row is scheduled in the future', () => {
+    const dir = seed('sess-future', {
+      pending: [{ status: 'pending', trigger: 1, process_after: new Date(now + 7 * DAY).toISOString() }],
+    });
+
+    const report = runApply();
+
+    expect(report.actions.filter((a) => a.kind === 'archive-session')).toEqual([]);
+    expect(fs.existsSync(dir)).toBe(true);
+    expect(report.skipped.busySessions).toBe(1);
+  });
+
+  it('blocks a session holding a live work_continuation promise', () => {
+    const dir = seed('sess-continuation', {
+      workContinuation: JSON.stringify({ id: 'wc-1', task: 'finish the migration', phase: 'queued', chain: 1 }),
+    });
+
+    const report = runApply();
+
+    expect(report.actions.filter((a) => a.kind === 'archive-session')).toEqual([]);
+    expect(fs.existsSync(dir)).toBe(true);
+    expect(report.skipped.busySessions).toBe(1);
+  });
+
+  it('blocks a session with an unconsumed non-triggering inbound row', () => {
+    const dir = seed('sess-accumulated', { pending: [{ status: 'pending', trigger: 0 }] });
+
+    const report = runApply();
+
+    expect(report.actions.filter((a) => a.kind === 'archive-session')).toEqual([]);
+    expect(fs.existsSync(dir)).toBe(true);
+  });
+
+  it('archives an idle session with no pending rows and no continuation', () => {
+    const dir = seed('sess-clean', { workContinuation: '' });
+
+    const report = runApply();
+
+    expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+});
+
+// T2b (SR2b) — the archival lifecycle is crash-safe and re-validates inside apply.
+describe('storage-manager session archival lifecycle', () => {
+  let tmpRoot: string;
+  let sessionsRoot: string;
+  let rescuesDir: string;
+  const now = Date.parse('2026-06-30T00:00:00.000Z');
+  const DAY = 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetStorageManagerThrottleForTesting();
+    closeCentralDb();
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-lifecycle-'));
+    sessionsRoot = path.join(tmpRoot, 'v2-sessions');
+    rescuesDir = path.join(tmpRoot, 'session-rescues');
+    mockExecFileSync.mockImplementation(tarAwareExecFileSync);
+  });
+
+  afterEach(() => {
+    closeCentralDb();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function seedOne(id = 'sess-old'): string {
+    const dir = makeSessionDir(sessionsRoot, 'ag-1', id, now - 40 * DAY);
+    installCentralDb([{ id, status: 'active', last_active: new Date(now - 40 * DAY).toISOString() }]);
+    return dir;
+  }
+
+  function runApply(isContainerRunning?: (sessionId: string) => boolean) {
+    return getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(tmpRoot, 'no-threads'),
+      includeDocker: false,
+      ...(isContainerRunning ? { isContainerRunning } : {}),
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 1 * DAY, worktreeReclaimMs: 30 * DAY },
+    });
+  }
+
+  it('leaves the session active and the dir intact when the archive cannot be produced', () => {
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    mockExecFileSync.mockImplementation((cmd: string, cmdArgs?: unknown) => {
+      if (cmd === 'tar' && (cmdArgs as string[]).includes('-cf')) throw new Error('zstd: no space left on device');
+      return tarAwareExecFileSync(cmd, cmdArgs);
+    });
+
+    const report = runApply();
+
+    expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('failed');
+    expect(sessionStatus(db, 'sess-old')).toBe('active');
+    expect(fs.existsSync(path.join(dir, 'notes.md'))).toBe(true);
+    const leftovers = fs.existsSync(rescuesDir) ? fs.readdirSync(rescuesDir) : [];
+    expect(leftovers.filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('skips a session whose container starts between collection and apply', () => {
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    let calls = 0;
+    const report = runApply(() => {
+      calls += 1;
+      return calls > 1; // idle during collection, running by the time apply revalidates
+    });
+
+    expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('skipped');
+    expect(sessionStatus(db, 'sess-old')).toBe('active');
+    expect(fs.existsSync(path.join(dir, 'notes.md'))).toBe(true);
+  });
+
+  it('journals every archival with its prior status and rescue path', () => {
+    seedOne();
+
+    expect(runApply().actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
+
+    const journal = readReclaimJournal(rescuesDir);
+    const entry = journal.get('sess-old');
+    expect(entry).toMatchObject({ session_id: 'sess-old', agent_group_id: 'ag-1', prior_status: 'active' });
+    expect(fs.existsSync(entry!.rescue_path)).toBe(true);
+    expect(entry!.rescue_path.endsWith('.tar.zst')).toBe(true);
+  });
+
+  it('finishes an archival interrupted after publish, exactly once', () => {
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    // Reproduce the crash window: archive published and journalled, row still
+    // 'archiving', dir not yet removed.
+    fs.mkdirSync(rescuesDir, { recursive: true });
+    const rescuePath = path.join(rescuesDir, 'ag-1__sess-old-2026-06-30T00-00-00-000Z.tar.zst');
+    fs.writeFileSync(rescuePath, 'fake-zstd-archive');
+    fs.writeFileSync(
+      path.join(rescuesDir, 'reclaim-journal.jsonl'),
+      `${JSON.stringify({
+        ts: '2026-06-30T00:00:00.000Z',
+        session_id: 'sess-old',
+        agent_group_id: 'ag-1',
+        prior_status: 'active',
+        rescue_path: rescuePath,
+      })}\n`,
+    );
+    db.prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-old'").run();
+
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toEqual({ released: 0, finished: 1 });
+    expect(sessionStatus(db, 'sess-old')).toBe('closed');
+    expect(fs.existsSync(dir)).toBe(false);
+
+    // Idempotent: a second startup finds nothing left to do.
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toEqual({ released: 0, finished: 0 });
+  });
+
+  it('returns an archiving row with an intact dir to active and clears the temp archive', () => {
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    fs.mkdirSync(rescuesDir, { recursive: true });
+    const tempPath = path.join(rescuesDir, 'ag-1__sess-old-2026-06-30T00-00-00-000Z.tar.zst.tmp');
+    fs.writeFileSync(tempPath, 'half-written');
+    db.prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-old'").run();
+
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toEqual({ released: 1, finished: 0 });
+    expect(sessionStatus(db, 'sess-old')).toBe('active');
+    expect(fs.existsSync(dir)).toBe(true);
+    expect(fs.existsSync(tempPath)).toBe(false);
+  });
+
+  it('never removes a closed session dir the journal does not vouch for', () => {
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    db.prepare("UPDATE sessions SET status = 'closed' WHERE id = 'sess-old'").run();
+
+    expect(finishInterruptedSessionArchivals(sessionsRoot)).toEqual({ released: 0, finished: 0 });
+    expect(fs.existsSync(dir)).toBe(true);
+  });
+
+  it('skips a session the collection pass saw as already archiving', () => {
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    db.prepare("UPDATE sessions SET status = 'archiving' WHERE id = 'sess-old'").run();
+
+    const report = runApply();
+
+    expect(report.actions.filter((a) => a.kind === 'archive-session')).toEqual([]);
+    expect(fs.existsSync(dir)).toBe(true);
+  });
+
+  it('skips a session touched by a write between collection and apply', () => {
+    const dir = seedOne();
+    const db = centralDbMock.current!.db;
+    let calls = 0;
+    const report = runApply(() => {
+      calls += 1;
+      if (calls > 1) {
+        const fresh = now / 1000;
+        fs.utimesSync(path.join(dir, 'inbound.db'), fresh, fresh);
+      }
+      return false;
+    });
+
+    expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('skipped');
+    expect(sessionStatus(db, 'sess-old')).toBe('active');
+    expect(fs.existsSync(path.join(dir, 'notes.md'))).toBe(true);
+  });
+});
+
+// T2 (SR2) + T3 (SR3) + T4 (SR4/SR4b) — the reclaim budget, the session-specific
+// age knob, and the count-cap union selection.
+describe('storage-manager session reclaim budget and selection', () => {
+  let tmpRoot: string;
+  let sessionsRoot: string;
+  const now = Date.parse('2026-06-30T00:00:00.000Z');
+  const DAY = 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetStorageManagerThrottleForTesting();
+    closeCentralDb();
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-budget-'));
+    sessionsRoot = path.join(tmpRoot, 'v2-sessions');
+    mockExecFileSync.mockImplementation(tarAwareExecFileSync);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    closeCentralDb();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  /** `count` sessions, sess-000 oldest. Returns their ids, oldest first. */
+  function seedAgedSessions(count: number, oldestDays: number, options: SessionDirOptions = {}): string[] {
+    const ids: string[] = [];
+    const seeds: CentralSessionSeed[] = [];
+    for (let i = 0; i < count; i++) {
+      const id = `sess-${String(i).padStart(3, '0')}`;
+      const ageMs = (oldestDays - i) * DAY;
+      makeSessionDir(sessionsRoot, 'ag-1', id, now - ageMs, options);
+      seeds.push({ id, status: 'active', last_active: new Date(now - ageMs).toISOString() });
+      ids.push(id);
+    }
+    installCentralDb(seeds);
+    return ids;
+  }
+
+  function runApply(policy: Record<string, number> = {}) {
+    return getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(tmpRoot, 'no-threads'),
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 1 * DAY, worktreeReclaimMs: 30 * DAY, ...policy },
+    });
+  }
+
+  function archivedIds(report: ReturnType<typeof getStorageReport>): string[] {
+    return report.actions
+      .filter((a) => a.kind === 'archive-session' && a.status === 'applied')
+      .map((a) => path.basename(a.path!))
+      .sort();
+  }
+
+  it('archives at most the per-tick budget, oldest-idle first, and drains the rest next pass', () => {
+    vi.stubEnv('NANOCLAW_SESSION_RECLAIM_PER_TICK', '50');
+    const ids = seedAgedSessions(120, 150);
+
+    const first = runApply();
+    expect(archivedIds(first)).toEqual(ids.slice(0, 50).sort());
+
+    _resetStorageManagerThrottleForTesting();
+    const second = runApply();
+    expect(archivedIds(second)).toEqual(ids.slice(50, 100).sort());
+  }, 60_000);
+
+  it('shares one budget across overlapping maintenance and force entry points', () => {
+    vi.stubEnv('NANOCLAW_SESSION_RECLAIM_PER_TICK', '50');
+    seedAgedSessions(120, 150);
+
+    let reentered = false;
+    const archivedInner: string[] = [];
+    mockExecFileSync.mockImplementation((cmd: string, cmdArgs?: unknown) => {
+      if (cmd === 'df' && !reentered) {
+        reentered = true;
+        // A second pass starting while this one is open must not get a second
+        // budget — the force entry point shares the same module-level pool.
+        const inner = getStorageReport({
+          mode: 'apply',
+          now,
+          sessionsRoot,
+          threadsRoot: path.join(tmpRoot, 'no-threads'),
+          includeDocker: false,
+          force: true,
+          policy: { filesystemPath: tmpRoot, idleArtifactMs: 1 * DAY, worktreeReclaimMs: 30 * DAY },
+        });
+        archivedInner.push(...archivedIds(inner));
+      }
+      return tarAwareExecFileSync(cmd, cmdArgs);
+    });
+
+    const outer = runApply();
+
+    expect(archivedInner.length + archivedIds(outer).length).toBe(50);
+  }, 60_000);
+
+  it('uses the session-specific reclaim knob without moving thread worktrees', () => {
+    vi.stubEnv('NANOCLAW_SESSION_RECLAIM_DAYS', '14');
+    seedAgedSessions(1, 20);
+    const threadDir = path.join(tmpRoot, 'v2-threads', 'thread-a');
+    fs.mkdirSync(path.join(threadDir, 'worktrees', 'repo'), { recursive: true });
+    fs.writeFileSync(path.join(threadDir, 'worktrees', 'repo', 'notes.md'), 'human work');
+    const threadMtime = (now - 20 * DAY) / 1000;
+    fs.utimesSync(path.join(threadDir, 'worktrees'), threadMtime, threadMtime);
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(tmpRoot, 'v2-threads'),
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 1 * DAY, worktreeReclaimMs: 30 * DAY },
+    });
+
+    expect(archivedIds(report)).toEqual(['sess-000']);
+    expect(report.actions.filter((a) => a.kind === 'archive-thread-worktree')).toEqual([]);
+    expect(fs.existsSync(path.join(threadDir, 'worktrees', 'repo', 'notes.md'))).toBe(true);
+  });
+
+  it('falls back to the shared worktree knob when the session knob is unset', () => {
+    seedAgedSessions(1, 20);
+
+    expect(archivedIds(runApply())).toEqual([]);
+  });
+
+  it('archives only the count-cap overflow, oldest-idle first, when nothing is age-eligible', () => {
+    vi.stubEnv('NANOCLAW_SESSION_ACTIVE_CAP', '5');
+    const ids = seedAgedSessions(8, 10);
+
+    expect(archivedIds(runApply())).toEqual(ids.slice(0, 3).sort());
+  });
+
+  it('lets the next-oldest take an overflow slot a blocked session cannot use', () => {
+    vi.stubEnv('NANOCLAW_SESSION_ACTIVE_CAP', '7');
+    const ids = seedAgedSessions(8, 10);
+    // Re-seed the oldest with open work so it is skipped before selection.
+    fs.rmSync(path.join(sessionsRoot, 'ag-1', ids[0]!), { recursive: true, force: true });
+    makeSessionDir(sessionsRoot, 'ag-1', ids[0]!, now - 10 * DAY, {
+      pending: [{ status: 'pending', trigger: 1 }],
+    });
+
+    expect(archivedIds(runApply())).toEqual([ids[1]!]);
+  });
+
+  it('disables the count cap at zero', () => {
+    vi.stubEnv('NANOCLAW_SESSION_ACTIVE_CAP', '0');
+    seedAgedSessions(8, 10);
+
+    expect(archivedIds(runApply())).toEqual([]);
+  });
+
+  it('dedupes age-eligible and overflow candidates into one oldest-first selection', () => {
+    vi.stubEnv('NANOCLAW_SESSION_ACTIVE_CAP', '6');
+    vi.stubEnv('NANOCLAW_SESSION_RECLAIM_DAYS', '30');
+    // sess-000/001 are 40d and 39d idle (age-eligible); the rest are young.
+    const ids: string[] = [];
+    const seeds: CentralSessionSeed[] = [];
+    const ages = [40, 39, 10, 9, 8, 7, 6, 5];
+    ages.forEach((days, i) => {
+      const id = `sess-${String(i).padStart(3, '0')}`;
+      makeSessionDir(sessionsRoot, 'ag-1', id, now - days * DAY);
+      seeds.push({ id, status: 'active', last_active: new Date(now - days * DAY).toISOString() });
+      ids.push(id);
+    });
+    installCentralDb(seeds);
+
+    // 8 active - cap 6 = 2 overflow slots, plus the 2 age-eligible rows.
+    expect(archivedIds(runApply())).toEqual(ids.slice(0, 4).sort());
+  });
+
+  it('falls back to knob defaults with one warning and logs the resolved config once', () => {
+    vi.stubEnv('NANOCLAW_SESSION_RECLAIM_PER_TICK', 'not-a-number');
+    vi.stubEnv('NANOCLAW_SESSION_ACTIVE_CAP', '-4');
+    seedAgedSessions(2, 150);
+
+    const report = runApply();
+
+    expect(archivedIds(report).length).toBe(2);
+    const warned = vi
+      .mocked(log.warn)
+      .mock.calls.filter((call) => String(call[0]).includes('invalid session reclaim knob'));
+    expect(warned.map((call) => (call[1] as { knob: string }).knob).sort()).toEqual([
+      'NANOCLAW_SESSION_ACTIVE_CAP',
+      'NANOCLAW_SESSION_RECLAIM_PER_TICK',
+    ]);
+    const configLines = vi
+      .mocked(log.info)
+      .mock.calls.filter((call) => String(call[0]).includes('session reclaim config'));
+    expect(configLines).toHaveLength(1);
   });
 });
 

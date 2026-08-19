@@ -777,6 +777,15 @@ async function writeSessionMessageInternal(
   message: SessionMessageInput,
   ignoreDuplicateId: boolean,
 ): Promise<boolean> {
+  // A session mid-archival is about to lose its directory. Re-provisioning it
+  // below would resurrect the dir seconds before the reclaim removes it, and
+  // the message would vanish with it. Ordinary routing never gets here —
+  // findSessionForAgent filters status='active' — so this only fires on a
+  // raw-session-id path, and it must be loud rather than silent.
+  if (getSession(sessionId)?.status === 'archiving') {
+    throw new Error(`session ${sessionId} is being archived; route this message to a fresh session`);
+  }
+
   // Documented reset: operators `rm -rf` a session folder to clear a stuck
   // session. The sessions row survives, so the next message takes the
   // existing-session path and lands here with a missing inbound.db — the open
@@ -956,13 +965,90 @@ export function admitPendingUpgradeContexts(db: Database.Database, agentGroupId:
   return admitted;
 }
 
+/**
+ * Crash-replay record for the startup migration pass. Written and fsynced
+ * BEFORE any DDL runs, deleted once the pass restores what it touched.
+ */
+export const UPGRADE_MTIME_MANIFEST = 'pending-upgrade-mtimes.json';
+/**
+ * How long after the manifest was written a bumped mtime is still attributable
+ * to that pass. Anything later is real traffic and keeps its clock.
+ */
+const UPGRADE_MTIME_REPLAY_WINDOW_MS = 10 * 60 * 1000;
+
+interface UpgradeMtimeManifest {
+  writtenAtMs: number;
+  entries: Array<{ path: string; atimeMs: number; mtimeMs: number }>;
+}
+
+function upgradeMtimeManifestPath(dataDir: string): string {
+  return path.join(dataDir, UPGRADE_MTIME_MANIFEST);
+}
+
+function writeUpgradeMtimeManifest(dataDir: string, manifest: UpgradeMtimeManifest): void {
+  fs.mkdirSync(dataDir, { recursive: true });
+  const fd = fs.openSync(upgradeMtimeManifestPath(dataDir), 'w');
+  try {
+    fs.writeFileSync(fd, JSON.stringify(manifest));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Restore mtimes a previous, interrupted migration pass bumped.
+ *
+ * Deliberately conservative on both ends: a file whose mtime is still what the
+ * manifest recorded was never touched, and a file bumped past the replay
+ * window saw real traffic after the pass — neither is restored.
+ */
+export function replayUpgradeMtimeManifest(dataDir = DATA_DIR): number {
+  const manifestPath = upgradeMtimeManifestPath(dataDir);
+  let manifest: UpgradeMtimeManifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as UpgradeMtimeManifest;
+  } catch {
+    return 0;
+  }
+  let restored = 0;
+  for (const entry of manifest.entries ?? []) {
+    try {
+      const current = fs.statSync(entry.path);
+      if (current.mtimeMs <= entry.mtimeMs) continue;
+      if (current.mtimeMs < manifest.writtenAtMs) continue;
+      if (current.mtimeMs > manifest.writtenAtMs + UPGRADE_MTIME_REPLAY_WINDOW_MS) continue;
+      fs.utimesSync(entry.path, entry.atimeMs / 1000, entry.mtimeMs / 1000);
+      restored += 1;
+    } catch {
+      // Session archived or removed since the manifest was written.
+    }
+  }
+  fs.rmSync(manifestPath, { force: true });
+  if (restored > 0) log.info('Restored session mtimes from an interrupted migration pass', { restored });
+  return restored;
+}
+
+/**
+ * Run the lazy session-DB migration over every session of the given
+ * workgroups, and admit any pending pre-turn contexts.
+ *
+ * The mtime bookkeeping is load-bearing, not cosmetic. Session reclaim reads
+ * `max(newest file mtime, central last_active)` as the idle clock, so the DDL
+ * this pass runs once per schema-adding deploy used to reset the clock for
+ * EVERY session at once — 5,027 files in 90 seconds on 2026-08-15, which froze
+ * archival fleet-wide until the whole cohort aged out together. A migration is
+ * bookkeeping, not session activity: the pre-pass mtime is restored afterward.
+ * A session that ADMITS work here is genuinely active and keeps its new clock.
+ */
 export function reconcilePendingUpgradeContexts(
   centralDb: Database.Database,
   workgroupIds: string[],
   dataDir = DATA_DIR,
-): { sessions: number; admitted: number } {
-  let sessions = 0;
-  let admitted = 0;
+): { sessions: number; admitted: number; mtimesRestored: number } {
+  replayUpgradeMtimeManifest(dataDir);
+
+  const targets: Array<{ id: string; agentGroupId: string; inboundPath: string; stat: fs.Stats }> = [];
   for (const workgroupId of [...new Set(workgroupIds)].sort()) {
     const rows = centralDb
       .prepare(
@@ -975,18 +1061,59 @@ export function reconcilePendingUpgradeContexts(
       .all(workgroupId) as Array<{ id: string; agent_group_id: string }>;
     for (const row of rows) {
       const inboundPath = path.join(dataDir, 'v2-sessions', row.agent_group_id, row.id, 'inbound.db');
-      if (!fs.existsSync(inboundPath)) continue;
-      const inbound = openInboundDbRaw(inboundPath);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(inboundPath);
+      } catch {
+        continue;
+      }
+      targets.push({ id: row.id, agentGroupId: row.agent_group_id, inboundPath, stat });
+    }
+  }
+  if (targets.length === 0) return { sessions: 0, admitted: 0, mtimesRestored: 0 };
+
+  // One fsync for the whole pass, before the first ALTER TABLE. A crash any
+  // time after this point is recoverable on the next start.
+  writeUpgradeMtimeManifest(dataDir, {
+    writtenAtMs: Date.now(),
+    entries: targets.map((target) => ({
+      path: target.inboundPath,
+      atimeMs: target.stat.atimeMs,
+      mtimeMs: target.stat.mtimeMs,
+    })),
+  });
+
+  let sessions = 0;
+  let admitted = 0;
+  let mtimesRestored = 0;
+  try {
+    for (const target of targets) {
+      const inbound = openInboundDbRaw(target.inboundPath);
+      let admittedHere = 0;
       try {
         migrateMessagesInTable(inbound);
         sessions++;
-        admitted += admitPendingUpgradeContexts(inbound, row.agent_group_id, row.id);
+        admittedHere = admitPendingUpgradeContexts(inbound, target.agentGroupId, target.id);
+        admitted += admittedHere;
       } finally {
         inbound.close();
       }
+      if (admittedHere > 0) continue;
+      try {
+        if (fs.statSync(target.inboundPath).mtimeMs === target.stat.mtimeMs) continue;
+        fs.utimesSync(target.inboundPath, target.stat.atimeMs / 1000, target.stat.mtimeMs / 1000);
+        mtimesRestored += 1;
+      } catch {
+        // Session removed underneath the pass.
+      }
     }
+  } finally {
+    fs.rmSync(upgradeMtimeManifestPath(dataDir), { force: true });
   }
-  return { sessions, admitted };
+  if (mtimesRestored > 0) {
+    log.info('Session migration pass left the idle clock untouched', { sessions, mtimesRestored });
+  }
+  return { sessions, admitted, mtimesRestored };
 }
 
 /**

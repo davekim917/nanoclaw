@@ -48,7 +48,16 @@ const DEFAULT_LEGACY_IMAGE_GRACE_HOURS = 168;
 // Owner-approved policy 2026-08-05; 47GB of never-reclaimed checkouts
 // (oldest from May) motivated it.
 const DEFAULT_WORKTREE_RECLAIM_DAYS = 30;
+// Session archival is bounded per pass. Without a cap, one cohort of sessions
+// crossing the age threshold together is a single-tick tar+rm stampede (1,041
+// archives on 2026-08-05 was exactly that).
+const DEFAULT_SESSION_RECLAIM_PER_TICK = 50;
+// 0 disables the count cap. Non-zero makes the oldest-idle sessions above the
+// cap eligible regardless of age.
+const DEFAULT_SESSION_ACTIVE_CAP = 0;
 export const THREAD_RESCUES_DIRNAME = 'thread-rescues';
+/** Append-only record of every completed archival; the restore/finish authority. */
+export const SESSION_RECLAIM_JOURNAL_FILENAME = 'reclaim-journal.jsonl';
 // Regenerable trees excluded from rescue archives — pure reinstallable weight.
 const ARCHIVE_EXCLUDED_DIR_NAMES = [
   'node_modules',
@@ -93,6 +102,16 @@ export interface StoragePolicy {
   idleArtifactMs: number;
   /** Archive-then-reclaim threshold for whole thread worktree dirs. */
   worktreeReclaimMs: number;
+  /**
+   * Archive-then-reclaim threshold for whole SESSION dirs. Its own knob, so
+   * sessions and thread worktrees can age out on different clocks; unset it
+   * falls back to `worktreeReclaimMs` (the pre-split behavior).
+   */
+  sessionReclaimMs: number;
+  /** Ceiling on session archivals per maintenance pass. */
+  sessionReclaimPerTick: number;
+  /** Target ceiling on active sessions; 0 disables the count cap. */
+  sessionActiveCap: number;
   scanCadenceMs: number;
   dockerPruneCadenceMs: number;
   dockerBuildCacheUnusedFor: string;
@@ -271,6 +290,8 @@ export interface StorageReport {
     freshThreads: number;
     unreadableSessions: number;
     noActivitySessions: number;
+    /** Eligible sessions left for a later pass by the per-tick budget. */
+    budgetDeferredSessions: number;
   };
   warnings: string[];
 }
@@ -308,6 +329,29 @@ function parsePositiveNumber(value: string | undefined, fallback: number): numbe
 function parsePositiveInt(value: string | undefined, fallback: number): number {
   const parsed = parsePositiveNumber(value, fallback);
   return Math.floor(parsed);
+}
+
+const warnedInvalidKnobs = new Set<string>();
+let loggedSessionReclaimConfig = false;
+
+/**
+ * Session-reclaim knobs are integers with a hard floor. An unparseable or
+ * out-of-range value falls back to the default and warns exactly once per
+ * process, so a typo degrades to the documented behavior instead of silently
+ * disabling (or unbounding) reclaim.
+ */
+function parseSessionKnob(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < min) {
+    if (!warnedInvalidKnobs.has(name)) {
+      warnedInvalidKnobs.add(name);
+      log.warn('storage-manager: invalid session reclaim knob, using default', { knob: name, value: raw, fallback });
+    }
+    return fallback;
+  }
+  return parsed;
 }
 
 function parseNonNegativeNumber(value: string | undefined, fallback: number): number {
@@ -348,7 +392,17 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     ),
   );
 
-  return {
+  const sessionReclaimDays = process.env.NANOCLAW_SESSION_RECLAIM_DAYS?.trim()
+    ? parseSessionKnob('NANOCLAW_SESSION_RECLAIM_DAYS', 0, 1)
+    : 0;
+  const sessionReclaimPerTick = parseSessionKnob(
+    'NANOCLAW_SESSION_RECLAIM_PER_TICK',
+    DEFAULT_SESSION_RECLAIM_PER_TICK,
+    1,
+  );
+  const sessionActiveCap = parseSessionKnob('NANOCLAW_SESSION_ACTIVE_CAP', DEFAULT_SESSION_ACTIVE_CAP, 0);
+
+  const policy: StoragePolicy = {
     enabled: process.env.NANOCLAW_STORAGE_MANAGER_ENABLED !== '0',
     filesystemPath: DATA_DIR,
     cleanupThresholdPct: cleanupThreshold,
@@ -360,6 +414,9 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
       60 *
       60 *
       1000,
+    sessionReclaimMs: sessionReclaimDays * 24 * 60 * 60 * 1000,
+    sessionReclaimPerTick,
+    sessionActiveCap,
     scanCadenceMs: scanHours * 60 * 60 * 1000,
     dockerPruneCadenceMs: dockerPruneHours * 60 * 60 * 1000,
     dockerBuildCacheUnusedFor:
@@ -377,6 +434,25 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     ),
     ...overrides,
   };
+
+  // Compatibility default: an install that never sets the session knob keeps
+  // ageing sessions on the shared worktree clock exactly as before the split.
+  if (overrides.sessionReclaimMs === undefined && sessionReclaimDays === 0) {
+    policy.sessionReclaimMs = policy.worktreeReclaimMs;
+  }
+
+  if (!loggedSessionReclaimConfig) {
+    loggedSessionReclaimConfig = true;
+    log.info('storage-manager: session reclaim config', {
+      sessionReclaimDays: policy.sessionReclaimMs / 86400000,
+      sessionReclaimPerTick: policy.sessionReclaimPerTick,
+      sessionActiveCap: policy.sessionActiveCap,
+      worktreeReclaimDays: policy.worktreeReclaimMs / 86400000,
+      sessionKnobSet: sessionReclaimDays > 0,
+    });
+  }
+
+  return policy;
 }
 
 function parseDfOutput(output: string, targetPath: string): FilesystemUsage | null {
@@ -528,32 +604,53 @@ function dbHasRows(dbPath: string, sql: string, params: unknown[] = []): boolean
   }
 }
 
-function sessionHasOpenWork(agentGroupId: string, sessionId: string, now: number, sessPath?: string): boolean | null {
+/**
+ * Is this session unsafe to reclaim?
+ *
+ * `null` means "could not tell" (unreadable DB) and callers treat it exactly
+ * like `true` — reclaim fails closed.
+ *
+ * Any UNCONSUMED inbound row counts, including a `process_after` in the
+ * future: a monthly recurrence is real pending work even though the session
+ * has looked idle for weeks, and the due-only predicate this replaced could
+ * not see it. Durable follow-up promises (`work_continuation`, and its legacy
+ * `pending_next` spelling) live in outbound `session_state` and are checked
+ * too — a container between turns owes that work even with no live claim.
+ */
+function sessionHasOpenWork(agentGroupId: string, sessionId: string, sessPath?: string): boolean | null {
   const inbound = dbHasRows(
     sessPath ? path.join(sessPath, 'inbound.db') : inboundDbPath(agentGroupId, sessionId),
     `SELECT 1 AS found
        FROM messages_in
-      WHERE status = 'processing'
-         OR (
-           status = 'pending'
-           AND trigger = 1
-           AND (process_after IS NULL OR datetime(process_after) <= datetime(?))
-         )
+      WHERE status IN ('processing', 'pending')
       LIMIT 1`,
-    [new Date(now).toISOString()],
   );
   if (inbound === null || inbound) return inbound;
 
-  const outbound = dbHasRows(
-    sessPath ? path.join(sessPath, 'outbound.db') : outboundDbPath(agentGroupId, sessionId),
-    "SELECT 1 AS found FROM processing_ack WHERE status = 'processing' LIMIT 1",
+  const outboundPath = sessPath ? path.join(sessPath, 'outbound.db') : outboundDbPath(agentGroupId, sessionId);
+  const claimed = dbHasRows(outboundPath, "SELECT 1 AS found FROM processing_ack WHERE status = 'processing' LIMIT 1");
+  if (claimed === null || claimed) return claimed;
+
+  // session_state is absent from older outbound DBs; a missing table reads as
+  // null (unreadable) from dbHasRows, which would block every legacy session.
+  if (!sessionStateTableExists(outboundPath)) return false;
+  return dbHasRows(
+    outboundPath,
+    `SELECT 1 AS found
+       FROM session_state
+      WHERE key IN ('work_continuation', 'pending_next')
+        AND value IS NOT NULL
+        AND trim(value) NOT IN ('', 'null')
+      LIMIT 1`,
   );
-  return outbound;
+}
+
+function sessionStateTableExists(dbPath: string): boolean {
+  return isReadableSqliteDatabase(dbPath, 'session_state');
 }
 
 export function collectThreadWorktreeActivity(
   isContainerRunning: (sessionId: string) => boolean,
-  now = Date.now(),
 ): Map<string, ThreadWorktreeActivity> {
   const activity = new Map<string, ThreadWorktreeActivity>();
   let rows: Array<{
@@ -594,7 +691,7 @@ export function collectThreadWorktreeActivity(
     if (isContainerRunning(row.id)) {
       current.hasRunningContainer = true;
     }
-    const openWork = sessionHasOpenWork(row.agent_group_id, row.id, now);
+    const openWork = sessionHasOpenWork(row.agent_group_id, row.id);
     if (openWork !== false) {
       current.hasBusySession = true;
     }
@@ -704,6 +801,33 @@ function isRealDirectory(dirPath: string): boolean {
   }
 }
 
+// ── Reclaim serializer ───────────────────────────────────────────────────────
+// Every production reclaim entry point (hourly maintenance, pressure
+// admission, force prune) lands in the single storage worker thread of a
+// single-process host, so one module-level budget IS the serializer: whoever
+// opens the pass sets the budget, anything that starts while it is open draws
+// from the same pool instead of getting a second one.
+// ponytail: if reclaim ever runs in more than one process, this becomes a lock
+// file under the sessions root — the call sites do not change.
+let reclaimPassDepth = 0;
+let reclaimBudgetRemaining = 0;
+
+function beginReclaimPass(perTick: number): void {
+  if (reclaimPassDepth === 0) reclaimBudgetRemaining = Math.max(0, perTick);
+  reclaimPassDepth += 1;
+}
+
+function endReclaimPass(): void {
+  reclaimPassDepth = Math.max(0, reclaimPassDepth - 1);
+}
+
+/** Reserve up to `want` archivals from the open pass; returns what was granted. */
+function takeReclaimBudget(want: number): number {
+  const granted = Math.max(0, Math.min(want, reclaimBudgetRemaining));
+  reclaimBudgetRemaining -= granted;
+  return granted;
+}
+
 export const SESSION_RESCUES_DIRNAME = 'session-rescues';
 // Secret material and per-spawn regenerables never enter a rescue archive:
 // creds/ is re-materialized on every spawn; the graphify dirs are caches.
@@ -731,24 +855,108 @@ function centralSessionRow(sessionId: string): CentralSessionRow | null | 'unava
   }
 }
 
+export interface SessionReclaimJournalEntry {
+  ts: string;
+  session_id: string;
+  agent_group_id: string;
+  prior_status: 'active' | 'closed' | 'orphan';
+  rescue_path: string;
+}
+
+function reclaimJournalPath(rescuesDir: string): string {
+  return path.join(rescuesDir, SESSION_RECLAIM_JOURNAL_FILENAME);
+}
+
 /**
- * Archive-then-reclaim one whole session dir, closing the central session row
- * first. findSessionForAgent only matches status='active', so the next
- * inbound for the same thread creates a FRESH session with a fresh dir
- * (initSessionFolder is idempotent) — conversation history stays in the
- * canonical data/archive.db and Graphify. The rescue archive preserves the
- * session DBs, provider continuity files, and any worktree content minus
- * regenerable trees and creds.
+ * Record one archival durably BEFORE the dir is removed. This line is what
+ * makes both recovery directions mechanical: a crash between publish and rm is
+ * finished from it at startup, and an operator restore reads the rescue path
+ * and the status to put back.
+ */
+function appendReclaimJournal(rescuesDir: string, entry: SessionReclaimJournalEntry): void {
+  fs.mkdirSync(rescuesDir, { recursive: true });
+  const fd = fs.openSync(reclaimJournalPath(rescuesDir), 'a');
+  try {
+    fs.writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+export function readReclaimJournal(rescuesDir: string): Map<string, SessionReclaimJournalEntry> {
+  const entries = new Map<string, SessionReclaimJournalEntry>();
+  let raw: string;
+  try {
+    raw = fs.readFileSync(reclaimJournalPath(rescuesDir), 'utf-8');
+  } catch {
+    return entries;
+  }
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue;
+    try {
+      const entry = JSON.parse(line) as SessionReclaimJournalEntry;
+      if (typeof entry.session_id === 'string' && typeof entry.rescue_path === 'string') {
+        entries.set(entry.session_id, entry);
+      }
+    } catch {
+      // A torn final line from a crash mid-append: ignore, keep the rest.
+    }
+  }
+  return entries;
+}
+
+function isPublishedArchive(archivePath: string): boolean {
+  try {
+    const st = fs.statSync(archivePath);
+    return st.isFile() && st.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Put an interrupted archival's row back. The active triple is uniquely
+ * indexed (migration 049), so if a fresh session claimed this session's triple
+ * while it was 'archiving', reviving it as 'active' would violate that index —
+ * the old row is history at that point and closes instead.
+ */
+function releaseArchivingRow(sessionId: string): void {
+  try {
+    getDb().prepare("UPDATE sessions SET status = 'active' WHERE id = ? AND status = 'archiving'").run(sessionId);
+  } catch (err) {
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(sessionId);
+    log.warn('storage-manager: archiving row could not return to active, closed instead', { sessionId, err });
+  }
+}
+
+/**
+ * Archive-then-reclaim one whole session dir. findSessionForAgent only matches
+ * status='active', so the next inbound for the same thread creates a FRESH
+ * session with a fresh dir (initSessionFolder is idempotent) — conversation
+ * history stays in the canonical data/archive.db and Graphify. The rescue
+ * archive preserves the session DBs, provider continuity files, and any
+ * worktree content minus regenerable trees and creds.
+ *
+ * The lifecycle is ordered so no crash can lose the dir without a readable
+ * archive standing in for it:
+ *   revalidate → CAS active→archiving → temp tar → validate → atomic publish
+ *   → journal → CAS archiving→closed → rm
+ * `archiving` is a real, sweep-invisible state; `finishInterruptedSessionArchivals`
+ * resolves whatever a crash left behind.
  */
 function createArchiveSessionAction(args: {
   id: string;
   sessionId: string;
+  agentGroupId: string;
   sessionStatus: 'active' | 'closed' | 'orphan';
   sessPath: string;
   sessionsRoot: string;
   rescuesDir: string;
   estimatedBytes: number;
   reason: string;
+  collectedActivityMs: number;
+  isContainerRunning: (sessionId: string) => boolean;
 }): StorageAction {
   return {
     id: args.id,
@@ -758,10 +966,11 @@ function createArchiveSessionAction(args: {
     estimatedBytes: args.estimatedBytes,
     reason: args.reason,
     safety:
-      'Whole long-idle session dir; DBs and worktree content preserved in a zstd rescue archive before removal (creds and regenerable trees excluded). Session row closed first so the next inbound message creates a fresh session.',
+      'Whole long-idle session dir; DBs and worktree content preserved in a zstd rescue archive before removal (creds and regenerable trees excluded). Re-validated immediately before acting, and the row is held in "archiving" until the archive is published so the next inbound message creates a fresh session.',
     status: 'planned',
     apply: () => {
-      return tryRunWithStorageCleanupClaim(args.sessPath, () => {
+      let acted = true;
+      const claimed = tryRunWithStorageCleanupClaim(args.sessPath, () => {
         if (!isPathInside(args.sessionsRoot, args.sessPath)) {
           throw new Error(`refusing to archive path outside sessions root: ${args.sessPath}`);
         }
@@ -769,38 +978,223 @@ function createArchiveSessionAction(args: {
         if (!st.isDirectory() || st.isSymbolicLink()) {
           throw new Error(`refusing to archive non-directory or symlink: ${args.sessPath}`);
         }
-        // Close the row BEFORE removal so an inbound racing this reclaim
-        // routes to a fresh session instead of writing into a dying dir.
-        // An 'unavailable' DB at apply time aborts (dir kept).
-        if (args.sessionStatus === 'active') {
-          getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(args.sessionId);
+
+        // Collection and apply are separated by the rest of the pass, which
+        // can be minutes of tar work. Anything that made this session live in
+        // between wins; the next pass will reconsider it.
+        if (args.isContainerRunning(args.sessionId)) {
+          acted = false;
+          return;
         }
+        if (sessionHasOpenWork(args.agentGroupId, args.sessionId, args.sessPath) !== false) {
+          acted = false;
+          return;
+        }
+        if (sessionLastActivityMs(args.sessPath) !== args.collectedActivityMs) {
+          acted = false;
+          return;
+        }
+
+        // Claim the row before touching the disk. An 'unavailable' DB throws
+        // out of here and the dir is kept (fail closed).
+        if (args.sessionStatus === 'active') {
+          const claimedRow = getDb()
+            .prepare("UPDATE sessions SET status = 'archiving' WHERE id = ? AND status = 'active'")
+            .run(args.sessionId).changes;
+          if (claimedRow !== 1) {
+            acted = false;
+            return;
+          }
+        }
+
         fs.mkdirSync(args.rescuesDir, { recursive: true });
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
         const archiveName = `${args.sessPath.slice(args.sessionsRoot.length + 1).replace(/[/\\]/g, '__')}-${stamp}.tar.zst`;
         const archivePath = path.join(args.rescuesDir, archiveName);
-        execFileSync(
-          'tar',
-          [
-            '-I',
-            'zstd -T0',
-            ...ARCHIVE_EXCLUDED_DIR_NAMES.map((name) => `--exclude=${name}`),
-            ...SESSION_ARCHIVE_EXTRA_EXCLUDES.map((name) => `--exclude=${name}`),
-            '-cf',
-            archivePath,
-            '-C',
-            path.dirname(args.sessPath),
-            path.basename(args.sessPath),
-          ],
-          { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60 * 60 * 1000 },
-        );
-        const archiveSt = fs.statSync(archivePath);
-        if (!archiveSt.isFile() || archiveSt.size === 0) {
-          throw new Error(`rescue archive missing or empty: ${archivePath}`);
+        const tempPath = `${archivePath}.tmp`;
+        try {
+          fs.rmSync(tempPath, { force: true });
+          execFileSync(
+            'tar',
+            [
+              '-I',
+              'zstd -T0',
+              ...ARCHIVE_EXCLUDED_DIR_NAMES.map((name) => `--exclude=${name}`),
+              ...SESSION_ARCHIVE_EXTRA_EXCLUDES.map((name) => `--exclude=${name}`),
+              '-cf',
+              tempPath,
+              '-C',
+              path.dirname(args.sessPath),
+              path.basename(args.sessPath),
+            ],
+            { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60 * 60 * 1000 },
+          );
+          const archiveSt = fs.statSync(tempPath);
+          if (!archiveSt.isFile() || archiveSt.size === 0) {
+            throw new Error(`rescue archive missing or empty: ${tempPath}`);
+          }
+          // Readable, not merely present: a truncated zstd stream is a file
+          // with bytes in it and would still license the delete.
+          execFileSync('tar', ['-I', 'zstd -T0', '-tf', tempPath], {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            timeout: 60 * 60 * 1000,
+          });
+          // Publish atomically — a rescue path only ever exists complete.
+          fs.renameSync(tempPath, archivePath);
+        } catch (err) {
+          fs.rmSync(tempPath, { force: true });
+          if (args.sessionStatus === 'active') releaseArchivingRow(args.sessionId);
+          throw err;
+        }
+
+        appendReclaimJournal(args.rescuesDir, {
+          ts: new Date().toISOString(),
+          session_id: args.sessionId,
+          agent_group_id: args.agentGroupId,
+          prior_status: args.sessionStatus,
+          rescue_path: archivePath,
+        });
+        if (args.sessionStatus === 'active') {
+          getDb()
+            .prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'")
+            .run(args.sessionId);
         }
         fs.rmSync(args.sessPath, { recursive: true, force: true });
       });
+      return claimed && acted;
     },
+  };
+}
+
+/**
+ * Startup finisher for archivals a host stop interrupted. Idempotent, and
+ * deliberately journal-gated: a `closed` session dir is only removed when a
+ * journal line names a published archive for it, so the ~1,200 sessions closed
+ * by ordinary session-close paths are never touched.
+ */
+export function finishInterruptedSessionArchivals(sessionsRoot: string = sessionsBaseDir()): {
+  released: number;
+  finished: number;
+} {
+  const rescuesDir = path.join(path.dirname(sessionsRoot), SESSION_RESCUES_DIRNAME);
+  const journal = readReclaimJournal(rescuesDir);
+  let released = 0;
+  let finished = 0;
+
+  const removeDir = (sessPath: string): void => {
+    if (fs.existsSync(sessPath)) fs.rmSync(sessPath, { recursive: true, force: true });
+  };
+
+  let archiving: Array<{ id: string; agent_group_id: string }>;
+  try {
+    archiving = getDb()
+      .prepare("SELECT id, agent_group_id FROM sessions WHERE status = 'archiving'")
+      .all() as typeof archiving;
+  } catch (err) {
+    log.warn('storage-manager: could not read interrupted archivals', { err });
+    return { released, finished };
+  }
+
+  for (const row of archiving) {
+    const sessPath = path.join(sessionsRoot, row.agent_group_id, row.id);
+    const entry = journal.get(row.id);
+    if (entry && isPublishedArchive(entry.rescue_path)) {
+      // Crashed between publishing the archive and closing the row.
+      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(row.id);
+      removeDir(sessPath);
+      finished += 1;
+      continue;
+    }
+    if (!fs.existsSync(sessPath)) {
+      // Dir already gone with no archive to point at: the row cannot go back
+      // to active, and leaving it 'archiving' hides it from every sweep.
+      getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ? AND status = 'archiving'").run(row.id);
+      finished += 1;
+      continue;
+    }
+    releaseArchivingRow(row.id);
+    released += 1;
+  }
+
+  for (const [sessionId, entry] of journal) {
+    const sessPath = path.join(sessionsRoot, entry.agent_group_id, sessionId);
+    if (!fs.existsSync(sessPath)) continue;
+    if (!isPublishedArchive(entry.rescue_path)) continue;
+    let status: string | undefined;
+    try {
+      status = (
+        getDb().prepare('SELECT status FROM sessions WHERE id = ?').get(sessionId) as { status: string } | undefined
+      )?.status;
+    } catch {
+      continue;
+    }
+    if (status !== undefined && status !== 'closed') continue;
+    removeDir(sessPath);
+    finished += 1;
+  }
+
+  // Temp archives never became a rescue path; nothing references them.
+  try {
+    for (const name of fs.readdirSync(rescuesDir)) {
+      if (name.endsWith('.tar.zst.tmp')) fs.rmSync(path.join(rescuesDir, name), { force: true });
+    }
+  } catch {
+    // No rescues dir yet.
+  }
+
+  if (released > 0 || finished > 0) {
+    log.info('storage-manager: resolved interrupted session archivals', { released, finished });
+  }
+  return { released, finished };
+}
+
+interface SessionReclaimCandidate {
+  groupName: string;
+  sessionId: string;
+  sessPath: string;
+  sessionStatus: 'active' | 'closed' | 'orphan';
+  newestActivityMs: number;
+  ageEligible: boolean;
+}
+
+/** Active-row count for the count cap; null means "cannot tell" — cap disabled. */
+function activeSessionCount(): number | null {
+  try {
+    const row = getDb().prepare("SELECT COUNT(*) AS n FROM sessions WHERE status = 'active'").get() as
+      | { n: number }
+      | undefined;
+    return typeof row?.n === 'number' ? row.n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One union pass over the reclaim candidates: age-eligible ∪ count-overflow,
+ * oldest-idle first, bounded by the pass budget. Blocked sessions never reach
+ * here, so a blocked old session cannot consume an overflow slot — the
+ * next-oldest unblocked one does, and the cap stays a target rather than a
+ * promise.
+ */
+function selectSessionsToArchive(
+  candidates: SessionReclaimCandidate[],
+  policy: StoragePolicy,
+): { selected: Set<string>; deferred: number } {
+  const ageEligible = candidates.filter((candidate) => candidate.ageEligible);
+  const cap = policy.sessionActiveCap;
+  const activeCount = cap > 0 ? activeSessionCount() : null;
+  const deficit = cap > 0 && activeCount !== null ? Math.max(0, activeCount - cap) : 0;
+  const overflowPool =
+    deficit > 0 ? candidates.filter((candidate) => !candidate.ageEligible && candidate.sessionStatus === 'active') : [];
+
+  const want = ageEligible.length + Math.min(deficit, overflowPool.length);
+  if (want === 0) return { selected: new Set(), deferred: 0 };
+
+  const granted = takeReclaimBudget(Math.min(want, policy.sessionReclaimPerTick));
+  const union = [...ageEligible, ...overflowPool].sort((a, b) => a.newestActivityMs - b.newestActivityMs);
+  return {
+    selected: new Set(union.slice(0, granted).map((candidate) => candidate.sessPath)),
+    deferred: want - granted,
   };
 }
 
@@ -820,6 +1214,13 @@ function collectSessionCacheActions(args: {
   const rescuesDir = path.join(dataRoot, SESSION_RESCUES_DIRNAME);
   let warnedArchiveSourceUnavailable = false;
   let warnedCentralSourceUnavailable = false;
+
+  // Pass 1: everything that survives the blocker checks, with the reclaim
+  // classification attached. Selection needs the whole population (the count
+  // cap is a fleet-level fact), so no dir is archived during the walk.
+  const candidates: SessionReclaimCandidate[] = [];
+  const cacheOnly: Array<{ groupName: string; sessionId: string; sessPath: string }> = [];
+
   for (const groupDirent of safeReaddirDirents(args.root)) {
     if (!groupDirent.isDirectory() || groupDirent.isSymbolicLink()) continue;
     const groupPath = path.join(args.root, groupDirent.name);
@@ -835,7 +1236,7 @@ function collectSessionCacheActions(args: {
       }
 
       const sessPath = path.join(groupPath, sessionId);
-      const busy = sessionHasOpenWork(groupDirent.name, sessionId, args.now, sessPath);
+      const busy = sessionHasOpenWork(groupDirent.name, sessionId, sessPath);
       if (busy !== false) {
         if (busy === null) args.skipped.unreadableSessions += 1;
         else args.skipped.busySessions += 1;
@@ -852,121 +1253,143 @@ function collectSessionCacheActions(args: {
         continue;
       }
 
-      // Long-idle: archive the whole session dir and reclaim it. Requires
-      // BOTH the on-disk signal and the central-DB row (when one exists) to
-      // agree the session has been quiet past the reclaim threshold; an
-      // unreadable central DB disables reclaim entirely (fail closed) while
-      // the ordinary cache pruning below continues to work.
+      // Reclaim requires BOTH the on-disk signal and the central-DB row (when
+      // one exists) to agree the session has been quiet; an unreadable central
+      // DB disables reclaim entirely (fail closed) while the ordinary cache
+      // pruning below continues to work.
       const row = centralSessionRow(sessionId);
-      if (row !== 'unavailable') {
-        const dbActivityMs = row ? parseSqliteUtc(row.last_activity ?? '') : NaN;
-        const newestActivity = Number.isFinite(dbActivityMs) ? Math.max(lastActivity, dbActivityMs) : lastActivity;
-        if (args.now - newestActivity >= args.policy.worktreeReclaimMs) {
-          const sessionStatus: 'active' | 'closed' | 'orphan' =
-            row === null ? 'orphan' : row.status === 'closed' ? 'closed' : 'active';
-          actions.push(
-            createArchiveSessionAction({
-              id: `session-reclaim:${groupDirent.name}:${sessionId}`,
-              sessionId,
-              sessionStatus,
-              sessPath,
-              sessionsRoot: args.root,
-              rescuesDir,
-              estimatedBytes: dirSizeBytes(sessPath),
-              reason: `session ${sessionStatus === 'active' ? 'idle' : sessionStatus} for at least ${Math.round(args.policy.worktreeReclaimMs / 86400000)}d — archived to ${SESSION_RESCUES_DIRNAME}/ then reclaimed`,
-            }),
-          );
-          continue;
-        }
+      if (row === 'unavailable' || row?.status === 'archiving') {
+        cacheOnly.push({ groupName: groupDirent.name, sessionId, sessPath });
+        continue;
       }
+      const dbActivityMs = row ? parseSqliteUtc(row.last_activity ?? '') : NaN;
+      const newestActivity = Number.isFinite(dbActivityMs) ? Math.max(lastActivity, dbActivityMs) : lastActivity;
+      candidates.push({
+        groupName: groupDirent.name,
+        sessionId,
+        sessPath,
+        sessionStatus: row === null ? 'orphan' : row.status === 'closed' ? 'closed' : 'active',
+        newestActivityMs: newestActivity,
+        ageEligible: args.now - newestActivity >= args.policy.sessionReclaimMs,
+      });
+    }
+  }
 
-      for (const target of findPrunableArtifactDirs(sessPath)) {
-        const estimatedBytes = dirSizeBytes(target);
+  // Pass 2: bounded, oldest-first selection; everything not selected falls
+  // through to ordinary cache pruning as it always did.
+  const { selected, deferred } = selectSessionsToArchive(candidates, args.policy);
+  args.skipped.budgetDeferredSessions += deferred;
+
+  for (const candidate of candidates) {
+    if (!selected.has(candidate.sessPath)) {
+      cacheOnly.push(candidate);
+      continue;
+    }
+    actions.push(
+      createArchiveSessionAction({
+        id: `session-reclaim:${candidate.groupName}:${candidate.sessionId}`,
+        sessionId: candidate.sessionId,
+        agentGroupId: candidate.groupName,
+        sessionStatus: candidate.sessionStatus,
+        sessPath: candidate.sessPath,
+        sessionsRoot: args.root,
+        rescuesDir,
+        estimatedBytes: dirSizeBytes(candidate.sessPath),
+        reason: `session ${candidate.sessionStatus === 'active' ? 'idle' : candidate.sessionStatus} for at least ${Math.round(args.policy.sessionReclaimMs / 86400000)}d — archived to ${SESSION_RESCUES_DIRNAME}/ then reclaimed`,
+        collectedActivityMs: sessionLastActivityMs(candidate.sessPath),
+        isContainerRunning: args.isContainerRunning,
+      }),
+    );
+  }
+
+  for (const { groupName, sessionId, sessPath } of cacheOnly) {
+    for (const target of findPrunableArtifactDirs(sessPath)) {
+      const estimatedBytes = dirSizeBytes(target);
+      actions.push(
+        createDeleteArtifactAction({
+          id: `session-cache:${groupName}:${sessionId}:${path.relative(sessPath, target)}`,
+          pool: 'session-cache',
+          target,
+          root: sessPath,
+          estimatedBytes,
+          reason: `session has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`,
+          targetType: 'directory',
+          safety: 'Regenerable cache directory under an idle NanoClaw-owned session subtree.',
+        }),
+      );
+    }
+
+    // This exact path is intentionally separate from findPrunableArtifactDirs:
+    // a generic "plugins" directory could be source content, while this one
+    // is Codex's session-local cache and is recreated on every spawn.
+    const codexPluginCache = path.join(sessPath, 'codex', 'plugins');
+    if (isRealDirectory(codexPluginCache)) {
+      actions.push(
+        createDeleteArtifactAction({
+          id: `session-cache:${groupName}:${sessionId}:codex/plugins`,
+          pool: 'session-cache',
+          target: codexPluginCache,
+          root: sessPath,
+          estimatedBytes: dirSizeBytes(codexPluginCache),
+          reason: `session has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`,
+          targetType: 'directory',
+          safety: 'Codex session plugin cache only; recreated from mounted /workspace/plugins on container spawn.',
+        }),
+      );
+    }
+
+    const projectionReason = `session has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`;
+    const archiveProjection = path.join(sessPath, 'archive.db');
+    const archiveProjectionBytes = regularFileSize(archiveProjection);
+    if (archiveProjectionBytes !== null) {
+      if (args.projectionSources.archiveReady) {
         actions.push(
           createDeleteArtifactAction({
-            id: `session-cache:${groupDirent.name}:${sessionId}:${path.relative(sessPath, target)}`,
+            id: `session-projection:${groupName}:${sessionId}:archive.db`,
             pool: 'session-cache',
-            target,
+            target: archiveProjection,
             root: sessPath,
-            estimatedBytes,
-            reason: `session has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`,
-            targetType: 'directory',
-            safety: 'Regenerable cache directory under an idle NanoClaw-owned session subtree.',
+            estimatedBytes: archiveProjectionBytes,
+            reason: projectionReason,
+            targetType: 'file',
+            safety:
+              'Per-session archive projection only; rebuilt from the readable canonical data/archive.db on container spawn.',
+            canApply: () => isReadableSqliteDatabase(canonicalArchive, 'messages_archive'),
           }),
         );
+      } else if (!warnedArchiveSourceUnavailable) {
+        args.warnings.push(
+          'session archive projections retained: canonical data/archive.db is unavailable or unreadable',
+        );
+        warnedArchiveSourceUnavailable = true;
       }
+    }
 
-      // This exact path is intentionally separate from findPrunableArtifactDirs:
-      // a generic "plugins" directory could be source content, while this one
-      // is Codex's session-local cache and is recreated on every spawn.
-      const codexPluginCache = path.join(sessPath, 'codex', 'plugins');
-      if (isRealDirectory(codexPluginCache)) {
+    const centralProjection = path.join(sessPath, 'central.db');
+    const centralProjectionBytes = regularFileSize(centralProjection);
+    if (centralProjectionBytes !== null) {
+      if (args.projectionSources.centralReady) {
         actions.push(
           createDeleteArtifactAction({
-            id: `session-cache:${groupDirent.name}:${sessionId}:codex/plugins`,
+            id: `session-projection:${groupName}:${sessionId}:central.db`,
             pool: 'session-cache',
-            target: codexPluginCache,
+            target: centralProjection,
             root: sessPath,
-            estimatedBytes: dirSizeBytes(codexPluginCache),
-            reason: `session has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`,
-            targetType: 'directory',
-            safety: 'Codex session plugin cache only; recreated from mounted /workspace/plugins on container spawn.',
+            estimatedBytes: centralProjectionBytes,
+            reason: projectionReason,
+            targetType: 'file',
+            safety:
+              'Per-session central projection only; rebuilt from the readable canonical data/v2.db on container spawn.',
+            canApply: () => isReadableSqliteDatabase(canonicalCentral),
           }),
         );
-      }
-
-      const projectionReason = `session has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`;
-      const archiveProjection = path.join(sessPath, 'archive.db');
-      const archiveProjectionBytes = regularFileSize(archiveProjection);
-      if (archiveProjectionBytes !== null) {
-        if (args.projectionSources.archiveReady) {
-          actions.push(
-            createDeleteArtifactAction({
-              id: `session-projection:${groupDirent.name}:${sessionId}:archive.db`,
-              pool: 'session-cache',
-              target: archiveProjection,
-              root: sessPath,
-              estimatedBytes: archiveProjectionBytes,
-              reason: projectionReason,
-              targetType: 'file',
-              safety:
-                'Per-session archive projection only; rebuilt from the readable canonical data/archive.db on container spawn.',
-              canApply: () => isReadableSqliteDatabase(canonicalArchive, 'messages_archive'),
-            }),
-          );
-        } else if (!warnedArchiveSourceUnavailable) {
-          args.warnings.push(
-            'session archive projections retained: canonical data/archive.db is unavailable or unreadable',
-          );
-          warnedArchiveSourceUnavailable = true;
-        }
-      }
-
-      const centralProjection = path.join(sessPath, 'central.db');
-      const centralProjectionBytes = regularFileSize(centralProjection);
-      if (centralProjectionBytes !== null) {
-        if (args.projectionSources.centralReady) {
-          actions.push(
-            createDeleteArtifactAction({
-              id: `session-projection:${groupDirent.name}:${sessionId}:central.db`,
-              pool: 'session-cache',
-              target: centralProjection,
-              root: sessPath,
-              estimatedBytes: centralProjectionBytes,
-              reason: projectionReason,
-              targetType: 'file',
-              safety:
-                'Per-session central projection only; rebuilt from the readable canonical data/v2.db on container spawn.',
-              canApply: () => isReadableSqliteDatabase(canonicalCentral),
-            }),
-          );
-        } else if (!warnedCentralSourceUnavailable) {
-          args.warnings.push('session central projections retained: canonical data/v2.db is unavailable or unreadable');
-          warnedCentralSourceUnavailable = true;
-        }
+      } else if (!warnedCentralSourceUnavailable) {
+        args.warnings.push('session central projections retained: canonical data/v2.db is unavailable or unreadable');
+        warnedCentralSourceUnavailable = true;
       }
     }
   }
+
   return actions;
 }
 
@@ -1530,6 +1953,7 @@ function emptySkipped(): StorageReport['skipped'] {
     freshThreads: 0,
     unreadableSessions: 0,
     noActivitySessions: 0,
+    budgetDeferredSessions: 0,
   };
 }
 
@@ -1588,9 +2012,21 @@ export function createStorageStatusReport(
 }
 
 export function getStorageReport(options: StorageReportOptions = {}): StorageReport {
+  // The whole pass — collection AND apply — is one reclaim pass. Anything that
+  // re-enters storage maintenance while this is open draws from the same
+  // budget instead of opening a second one.
+  const passPolicy = resolveStoragePolicy(options.policy);
+  beginReclaimPass(passPolicy.sessionReclaimPerTick);
+  try {
+    return runStorageReportPass(options, passPolicy);
+  } finally {
+    endReclaimPass();
+  }
+}
+
+function runStorageReportPass(options: StorageReportOptions, policy: StoragePolicy): StorageReport {
   const mode = options.mode ?? 'dry-run';
   const now = options.now ?? Date.now();
-  const policy = resolveStoragePolicy(options.policy);
   const warnings: string[] = [];
   const usageBefore = getFilesystemUsage(policy.filesystemPath);
   const skipped = emptySkipped();
@@ -1656,9 +2092,7 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
       now,
       root: threadsRoot,
       policy,
-      activityByWorktreeDir: fs.existsSync(threadsRoot)
-        ? collectThreadWorktreeActivity(isContainerRunning, now)
-        : new Map(),
+      activityByWorktreeDir: fs.existsSync(threadsRoot) ? collectThreadWorktreeActivity(isContainerRunning) : new Map(),
       skipped,
     }),
     ...dockerCollection.actions,
@@ -1812,4 +2246,8 @@ export function _resetStorageManagerThrottleForTesting(): void {
   lastStorageMaintenanceMs = 0;
   lastDockerPruneAttemptMs = 0;
   lastEmergencyDockerAttemptMs = 0;
+  reclaimPassDepth = 0;
+  reclaimBudgetRemaining = 0;
+  warnedInvalidKnobs.clear();
+  loggedSessionReclaimConfig = false;
 }

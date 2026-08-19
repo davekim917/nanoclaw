@@ -31,6 +31,7 @@ import {
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { stopStorageMaintenanceWorker } from './storage-maintenance-worker.js';
 import { resetStorageActivityState } from './storage-activity.js';
+import { finishInterruptedSessionArchivals } from './storage-manager.js';
 import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
 import { startRepoFreshness, stopRepoFreshness } from './repo-freshness.js';
 import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
@@ -253,6 +254,14 @@ export async function main(): Promise<void> {
   // 2. Container runtime was already proved available/quiescent before the
   // canonical memory reconciliation above.
   resetStorageActivityState();
+
+  // 2-bis. Resolve any session archival a previous stop interrupted, before
+  // the sweep can hand out work to a row still parked in 'archiving'.
+  try {
+    finishInterruptedSessionArchivals();
+  } catch (err) {
+    log.error('Interrupted session archival recovery failed', { err });
+  }
 
   // 2a. Surface agent-runner deps drift at boot, not when an agent silently
   // stops responding. Non-fatal — the hard gate lives in spawnContainer, this
