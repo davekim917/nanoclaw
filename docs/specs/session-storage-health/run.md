@@ -553,3 +553,63 @@ constraint, both artifacts survive, neither row silently wins.
   `--testTimeout=30000` on this box: load average was 17-40 with 9 concurrent
   vitest processes from other agents, and these tests run ~1s idle / ~6s loaded)
 - `tsc --noEmit` clean.
+
+## 2026-08-19 — correction batch (C5: recovery script)
+
+### 7. Preimage immutability — ACCEPTED (confirmed by the lead, and by the code)
+
+`preimagePath` was `manifestPath.replace(/\.json$/,'') + '.preimage.json'`, so a
+rerun rewrote it — and on a rerun `actionable` is empty, so the rewrite was an
+`entries: []` file replacing the real record of what the first run overwrote.
+Now: `…preimage.<Date.now()>.json`, unique per execution, opened `wx` so an
+existing file is a hard error rather than a silent truncation. Tests: rerun
+leaves the first preimage byte-identical and takes a different path · an
+explicit path that already exists throws and the file is untouched.
+
+### 8. Script containment — ACCEPTED
+
+`entry.inboundPath` was used verbatim, `statSync` follows symlinks, and
+`utimesSync` was a second lookup after the check. Now `resolveEntryPath()`
+rebuilds the path from `agentGroupId`/`sessionId` validated against
+`/^[A-Za-z0-9][A-Za-z0-9._-]*$/` under the manifest's own `dataDir`, realpaths
+the session dir and requires it to stay under `v2-sessions`, then `lstat`
+rejects a symlink or non-file. The write is `openSync(O_RDONLY|O_NOFOLLOW)` +
+`fstatSync` + `futimesSync` on that one descriptor, so the pin check and the
+write cannot be separated. New `unsafePath` counter in the result.
+
+One correction the test caught: a session archived between the dry-run and the
+execute made `realpathSync` throw ENOENT, which my first version classed as
+`unsafePath`. ENOENT now falls through to the normal `missing` path — absent is
+not the same as hostile.
+
+### 9. Per-window central-activity binding — ACCEPTED
+
+`burstStartMs = Math.min(...)` compared every session against the EARLIEST
+window's start. With the two windows we will actually run, a session in the
+20:21 burst whose last activity was 17:00 would be rejected for "activity after
+the burst" even though 17:00 predates its own window by three hours. The bound
+is now per-window via `matchWindow()`. Direction of the old bug was
+over-conservative (dropped valid sessions), never unsafe. Disjoint two-window
+test added.
+
+### Fresh live `--dry-run`, both windows (read-only, nothing executed)
+
+```
+windows: 2026-08-15T20:21:00.000Z±10m, 2026-08-15T16:26:00.000Z±5m
+selected: 5156
+  provenance central:last_active: 4321
+  provenance outbound.db:          661
+  provenance .heartbeat:           174
+skipped: 17
+  open-work:                        16
+  central-activity-after-burst:      1
+restored-clock range: 2026-04-23T04:13:38.909Z .. 2026-08-15T18:32:08.486Z
+```
+
++141 selected versus the single-window run (5,015 → 5,156), which is the
+earlier 16:25–16:27Z cluster now included. Both manifests are in the scratchpad.
+
+### Verification (C5)
+
+- `vitest run scripts/restore-session-mtimes.test.ts` → **13 passed** (was 8)
+- `tsc --noEmit` clean · `eslint` 0 errors

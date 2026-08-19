@@ -97,8 +97,9 @@ export function parseWindow(spec: string): BurstWindow {
   return { label: `${iso}±${radiusMinutes}m`, startMs: centerMs - radiusMs, endMs: centerMs + radiusMs };
 }
 
-function inAnyWindow(mtimeMs: number, windows: BurstWindow[]): boolean {
-  return windows.some((window) => mtimeMs >= window.startMs && mtimeMs <= window.endMs);
+/** The window this mtime falls in, or null. Each window carries its own bound. */
+function matchWindow(mtimeMs: number, windows: BurstWindow[]): BurstWindow | null {
+  return windows.find((window) => mtimeMs >= window.startMs && mtimeMs <= window.endMs) ?? null;
 }
 
 function parseSqliteUtc(value: string): number {
@@ -152,7 +153,6 @@ export function planRestore(options: {
   const sessionsRoot = path.join(dataDir, 'v2-sessions');
   const entries: RestoreEntry[] = [];
   const skipped: RestoreManifest['skipped'] = [];
-  const burstStartMs = Math.min(...options.windows.map((window) => window.startMs));
   const centralRow = options.centralDb.prepare(
     'SELECT status, COALESCE(last_active, created_at) AS last_activity FROM sessions WHERE id = ?',
   );
@@ -187,7 +187,11 @@ export function planRestore(options: {
       } catch {
         continue;
       }
-      if (!inAnyWindow(stat.mtimeMs, options.windows)) continue;
+      // Bound against THIS mtime's own window. With two disjoint windows a
+      // shared minimum would reject a session whose activity predates its own
+      // burst but follows the earlier one.
+      const window = matchWindow(stat.mtimeMs, options.windows);
+      if (!window) continue;
 
       const row = centralRow.get(sessionId) as { status: string; last_activity: string | null } | undefined;
       if (!row) {
@@ -198,7 +202,7 @@ export function planRestore(options: {
       // The whole premise: the central DB says this session was already idle
       // BEFORE the burst, so the bumped file mtime is the migration's, not the
       // session's.
-      if (!Number.isFinite(centralActivityMs) || centralActivityMs >= burstStartMs) {
+      if (!Number.isFinite(centralActivityMs) || centralActivityMs >= window.startMs) {
         skipped.push({ sessionId, reason: 'central-activity-after-burst' });
         continue;
       }
@@ -237,9 +241,56 @@ export function planRestore(options: {
   return { generatedAt: new Date().toISOString(), dataDir, windows: options.windows, entries, skipped };
 }
 
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Rebuild the path from validated components under the manifest's own data
+ * root, then require it to still be that path after realpath. A manifest is an
+ * editable JSON file on disk; its `inboundPath` string is a hint, not authority.
+ */
+export function resolveEntryPath(dataDir: string, entry: RestoreEntry): string | null {
+  if (!SAFE_ID.test(entry.agentGroupId) || !SAFE_ID.test(entry.sessionId)) return null;
+  const sessPath = path.join(dataDir, 'v2-sessions', entry.agentGroupId, entry.sessionId);
+  const inboundPath = path.join(sessPath, 'inbound.db');
+  let realSessions: string;
+  let realSess: string;
+  try {
+    realSessions = fs.realpathSync(path.join(dataDir, 'v2-sessions'));
+    realSess = fs.realpathSync(sessPath);
+  } catch (err) {
+    // A session archived between the dry-run and now is absent, not unsafe —
+    // the caller's lstat reports it as missing.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return inboundPath;
+    return null;
+  }
+  const relative = path.relative(realSessions, realSess);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
+  return inboundPath;
+}
+
 function writeJsonFsynced(target: string, value: unknown): void {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   const fd = fs.openSync(target, 'w');
+  try {
+    fs.writeFileSync(fd, JSON.stringify(value, null, 2));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** Never overwrite an existing preimage — it is somebody's only way back. */
+function writeNewJsonFsynced(target: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  let fd: number;
+  try {
+    fd = fs.openSync(target, 'wx');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error(`refusing to overwrite an existing preimage manifest: ${target}`, { cause: err });
+    }
+    throw err;
+  }
   try {
     fs.writeFileSync(fd, JSON.stringify(value, null, 2));
     fs.fsyncSync(fd);
@@ -258,6 +309,7 @@ export interface ExecuteResult {
   changed: number;
   missing: number;
   claimBusy: number;
+  unsafePath: number;
   preimagePath: string;
 }
 
@@ -270,22 +322,34 @@ export interface ExecuteResult {
  */
 export function executeRestore(manifestPath: string, preimagePath?: string): ExecuteResult {
   const manifest = readManifest(manifestPath);
-  const actionable: RestoreEntry[] = [];
+  const actionable: Array<{ entry: RestoreEntry; path: string }> = [];
   const result: ExecuteResult = {
     restored: 0,
     alreadyRestored: 0,
     changed: 0,
     missing: 0,
     claimBusy: 0,
-    preimagePath: preimagePath ?? `${manifestPath.replace(/\.json$/, '')}.preimage.json`,
+    unsafePath: 0,
+    // A preimage is the record of what a PARTICULAR run overwrote. Deriving it
+    // from the manifest name meant a rerun truncated the real one.
+    preimagePath: preimagePath ?? `${manifestPath.replace(/\.json$/, '')}.preimage.${Date.now()}.json`,
   };
 
   for (const entry of manifest.entries) {
+    const safePath = resolveEntryPath(manifest.dataDir, entry);
+    if (!safePath) {
+      result.unsafePath += 1;
+      continue;
+    }
     let stat: fs.Stats;
     try {
-      stat = fs.statSync(entry.inboundPath);
+      stat = fs.lstatSync(safePath);
     } catch {
       result.missing += 1;
+      continue;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      result.unsafePath += 1;
       continue;
     }
     if (stat.mtimeMs === entry.restoreMtimeMs) {
@@ -296,33 +360,45 @@ export function executeRestore(manifestPath: string, preimagePath?: string): Exe
       result.changed += 1;
       continue;
     }
-    actionable.push(entry);
+    actionable.push({ entry, path: safePath });
   }
 
   // Preimage BEFORE the first utimes — the exact restoration path back.
   const preimage: PreimageManifest = {
     appliedAt: new Date().toISOString(),
     sourceManifest: path.resolve(manifestPath),
-    entries: actionable.map((entry) => ({
+    entries: actionable.map(({ entry }) => ({
       sessionId: entry.sessionId,
       inboundPath: entry.inboundPath,
       inode: entry.inode,
       mtimeMs: entry.currentMtimeMs,
     })),
   };
-  writeJsonFsynced(result.preimagePath, preimage);
+  writeNewJsonFsynced(result.preimagePath, preimage);
 
-  for (const entry of actionable) {
-    const sessPath = path.dirname(entry.inboundPath);
-    const claimed = tryRunWithStorageCleanupClaim(sessPath, () => {
-      const current = fs.statSync(entry.inboundPath);
-      if (current.ino !== entry.inode || current.mtimeMs !== entry.currentMtimeMs) {
-        result.changed += 1;
+  for (const { entry, path: inboundPath } of actionable) {
+    const claimed = tryRunWithStorageCleanupClaim(path.dirname(inboundPath), () => {
+      // O_NOFOLLOW + futimes: the check and the write land on the same inode,
+      // so nothing can swap a symlink in between them.
+      let fd: number;
+      try {
+        fd = fs.openSync(inboundPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      } catch {
+        result.unsafePath += 1;
         return;
       }
-      const seconds = entry.restoreMtimeMs / 1000;
-      fs.utimesSync(entry.inboundPath, seconds, seconds);
-      result.restored += 1;
+      try {
+        const current = fs.fstatSync(fd);
+        if (current.ino !== entry.inode || current.mtimeMs !== entry.currentMtimeMs) {
+          result.changed += 1;
+          return;
+        }
+        const seconds = entry.restoreMtimeMs / 1000;
+        fs.futimesSync(fd, seconds, seconds);
+        result.restored += 1;
+      } finally {
+        fs.closeSync(fd);
+      }
     });
     if (!claimed) result.claimBusy += 1;
   }

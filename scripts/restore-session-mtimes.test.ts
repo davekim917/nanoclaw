@@ -192,6 +192,7 @@ describe('restore-session-mtimes', () => {
     const result = executeRestore(manifestPath);
 
     expect(result).toMatchObject({ restored: 1, changed: 0, missing: 0, alreadyRestored: 0, claimBusy: 0 });
+    expect(result.preimagePath).not.toBe(manifestPath);
     expect(fs.statSync(path.join(dir, 'inbound.db')).mtimeMs).toBe(JUNE);
 
     const preimage = JSON.parse(fs.readFileSync(result.preimagePath, 'utf-8')) as {
@@ -208,6 +209,92 @@ describe('restore-session-mtimes', () => {
     const seconds = preimage.entries[0]!.mtimeMs / 1000;
     fs.utimesSync(path.join(dir, 'inbound.db'), seconds, seconds);
     expect(fs.statSync(path.join(dir, 'inbound.db')).mtimeMs).toBe(BURST_CENTER);
+  });
+
+  it('writes a fresh immutable preimage per execution and never truncates one', () => {
+    const dir = makeSession('sess-burst', { inboundMtimeMs: BURST_CENTER, outboundMtimeMs: JUNE });
+    const manifestPath = path.join(tmpRoot, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify(plan(), null, 2));
+
+    const first = executeRestore(manifestPath);
+    const firstPreimage = fs.readFileSync(first.preimagePath, 'utf-8');
+    expect(JSON.parse(firstPreimage).entries).toHaveLength(1);
+
+    // A rerun has nothing to do; the original record must still be intact and
+    // must not have been overwritten with an empty one.
+    const second = executeRestore(manifestPath);
+    expect(second).toMatchObject({ restored: 0, alreadyRestored: 1 });
+    expect(second.preimagePath).not.toBe(first.preimagePath);
+    expect(fs.readFileSync(first.preimagePath, 'utf-8')).toBe(firstPreimage);
+    expect(JSON.parse(fs.readFileSync(first.preimagePath, 'utf-8')).entries[0]).toMatchObject({
+      sessionId: 'sess-burst',
+      mtimeMs: BURST_CENTER,
+    });
+    expect(fs.statSync(path.join(dir, 'inbound.db')).mtimeMs).toBe(JUNE);
+  });
+
+  it('refuses an explicit preimage path that already exists', () => {
+    makeSession('sess-burst', { inboundMtimeMs: BURST_CENTER, outboundMtimeMs: JUNE });
+    const manifestPath = path.join(tmpRoot, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify(plan(), null, 2));
+    const taken = path.join(tmpRoot, 'preimage.json');
+    fs.writeFileSync(taken, '{"entries":["precious"]}');
+
+    expect(() => executeRestore(manifestPath, taken)).toThrow(/refusing to overwrite/);
+    expect(fs.readFileSync(taken, 'utf-8')).toBe('{"entries":["precious"]}');
+  });
+
+  it('acts on the path it derives, not the one the manifest claims', () => {
+    const victim = path.join(tmpRoot, 'outside.db');
+    fs.writeFileSync(victim, 'not a session file');
+    const victimBefore = fs.statSync(victim).mtimeMs;
+    const dir = makeSession('sess-burst', { inboundMtimeMs: BURST_CENTER, outboundMtimeMs: JUNE });
+    const manifest = plan();
+    // A tampered manifest points somewhere else entirely.
+    manifest.entries[0]!.inboundPath = victim;
+    const manifestPath = path.join(tmpRoot, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+    const result = executeRestore(manifestPath);
+
+    // The derived path is the real session file, so the entry still applies —
+    // and the file the manifest named is untouched.
+    expect(result).toMatchObject({ restored: 1 });
+    expect(fs.statSync(victim).mtimeMs).toBe(victimBefore);
+    expect(fs.statSync(path.join(dir, 'inbound.db')).mtimeMs).toBe(JUNE);
+  });
+
+  it('rejects an entry whose identifiers are not plain path segments', () => {
+    makeSession('sess-burst', { inboundMtimeMs: BURST_CENTER, outboundMtimeMs: JUNE });
+    const manifest = plan();
+    manifest.entries[0]!.agentGroupId = '../../etc';
+    const manifestPath = path.join(tmpRoot, 'manifest.json');
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+
+    expect(executeRestore(manifestPath)).toMatchObject({ restored: 0, unsafePath: 1 });
+  });
+
+  it('binds central activity to the window each mtime falls in', () => {
+    const earlier = parseWindow('2026-08-15T16:26:00.000Z±5');
+    const twoWindows = [earlier, parseWindow('2026-08-15T20:21:00.000Z±10')];
+    // Idle since 17:00 — after the EARLIER window, before the later one. A
+    // shared minimum bound would wrongly reject it.
+    makeSession('sess-late-burst', {
+      inboundMtimeMs: BURST_CENTER,
+      outboundMtimeMs: JUNE,
+      lastActive: '2026-08-15T17:00:00.000Z',
+    });
+    // In the earlier window, and its activity postdates that window's start.
+    makeSession('sess-early-burst', {
+      inboundMtimeMs: Date.parse('2026-08-15T16:26:00.000Z'),
+      outboundMtimeMs: JUNE,
+      lastActive: '2026-08-15T16:24:00.000Z',
+    });
+
+    const manifest = planRestore({ dataDir: tmpRoot, windows: twoWindows, centralDb });
+
+    expect(manifest.entries.map((e) => e.sessionId)).toEqual(['sess-late-burst']);
+    expect(skipReason(manifest, 'sess-early-burst')).toBe('central-activity-after-burst');
   });
 
   it('skips an entry whose mtime or inode moved since the manifest', () => {
