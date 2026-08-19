@@ -288,3 +288,121 @@ writes to closed sessions.
 
 - `vitest run src/modules/support-threads/ src/dashboard/steer.test.ts` → **17 passed**
 - `tsc --noEmit -p tsconfig.json` → clean · `eslint` on both changed sources → 0 errors
+
+## 2026-08-19 — build stage (C3, script only — NOT executed)
+
+`scripts/restore-session-mtimes.ts` + `scripts/restore-session-mtimes.test.ts`.
+`sessionHasOpenWork` is now exported from `src/storage-manager.ts` so the script
+uses the SAME blocker predicate the reaper does rather than a second copy.
+
+### Burst window, calibrated against live data before it was hard-coded
+
+Install TZ is UTC, and the burst is exactly where the root-cause doc put it:
+
+```
+top inbound.db mtime minutes (UTC): 2026-08-15T20:22Z 2925 · 2026-08-15T20:21Z 2102
+                                    2026-08-19T21:14Z 234 · 2026-08-15T16:27Z 111
+in 2026-08-15T20:21Z ±10min: 5031 files (of 6927 session dirs)
+```
+
+Default window `2026-08-15T20:21:00.000Z±10`. Note the smaller 2026-08-15T16:25–16:27Z
+cluster (~142 files, matching the grounding's `disk_newest 2026-08-15T16:27:19Z`
+example) is a SEPARATE earlier pass and is deliberately NOT in the default —
+pass `--window 2026-08-15T16:26:00Z±5` to include it.
+
+### Selection and safety
+
+`--dry-run`: inbound.db mtime inside a window AND central
+`COALESCE(last_active, created_at)` strictly before the window start, skipping
+a session with a live storage-activity marker (`container-active`), open work
+(`open-work`, via the shared predicate), an unreadable DB, a missing central
+row, or no signal older than the bumped mtime. The restore target is the NEWEST
+surviving signal — `outbound.db`/`archive.db`/`central.db`/`.heartbeat` mtimes
+or the central row — never the oldest: reclaim must not act on a clock claiming
+more idleness than the session can prove. Provenance is recorded per entry.
+
+`--execute --manifest <path>`: pins every entry by inode AND mtime (changed →
+counted, not acted on), writes the fsynced preimage manifest BEFORE the first
+`utimes`, re-checks the pin inside the claim, and reports `alreadyRestored` on
+rerun so a second pass is a no-op.
+
+**Deviation, recorded:** SR7 says execute runs "while the reclaim serializer is
+held". That serializer is in-process state inside the host's storage worker
+thread and a standalone script cannot hold it. The faithful cross-process
+equivalent is the exclusive cleanup claim the archiver itself takes, so each
+`utimes` runs inside `tryRunWithStorageCleanupClaim(sessPath, …)` — an archival
+of that session cannot interleave, and a claim held elsewhere is reported as
+`claimBusy` rather than forced.
+
+### T7 — `vitest run scripts/restore-session-mtimes.test.ts` → 8 passed
+
+Window parsing · burst+pre-burst selection · skips for live marker / open work /
+orphan row · provenance per source · `created_at` fallback when `last_active` is
+null · never choosing a target newer than the bumped mtime · execute + preimage +
+no-op rerun + preimage round-trip · inode/mtime pin rejecting a moved entry.
+
+The inode-pin case tampers with the manifest's recorded inode rather than
+recreating the file: ext4 reuses freed inodes, so "delete and rewrite" is not a
+reliable way to change one and the test was flaky asserting it that way.
+
+### Live `--dry-run` (read-only, run once, nothing executed)
+
+```
+windows: 2026-08-15T20:21:00.000Z±10m
+selected: 5015
+  provenance .heartbeat: 136
+  provenance central:last_active: 4276
+  provenance outbound.db: 603
+skipped: 16
+  central-activity-after-burst: 1
+  open-work: 15
+restored-clock range: 2026-04-28T14:42:24.355Z .. 2026-08-15T18:32:08.486Z
+```
+
+Re-measured after the dry-run: still 5,031 inbound.db files in the burst window,
+i.e. the dry-run changed nothing on disk. Every restored clock lands before the
+burst, as it must.
+
+Projected drain once executed (post-ship), from the manifest:
+
+```
+age buckets of the restored clocks: >90d 347 · 30-90d 548 · 14-30d 1668 · <14d 2452
+immediately eligible at RECLAIM_DAYS=14: 2563
+```
+
+At 50/tick hourly that is ~52 ticks (~2.2 days) for the age-eligible set alone.
+With `ACTIVE_CAP=2000` the cap dominates (6,857 active − 2,000 = 4,857 deficit),
+so every tick runs a full 50 until the active count reaches the cap — roughly 97
+ticks, ~4 days. Bounded either way; no stampede.
+
+Full output: `scratchpad/restore-dry-run.txt`; manifest:
+`scratchpad/restore-manifest.json` (both session-local, not in the repo).
+
+### .env
+
+Appended (inert until the host restarts; `.env` is gitignored):
+
+```
+NANOCLAW_SESSION_RECLAIM_DAYS=14
+NANOCLAW_SESSION_RECLAIM_PER_TICK=50
+NANOCLAW_SESSION_ACTIVE_CAP=2000
+```
+
+### Not done, by instruction
+
+No `pnpm run build`, no service restart, no push, and no `--execute` in any
+form. The next step is the lead's: ship + restart + verify a bounded live tick
+(`storage-manager: session reclaim config` line, then `session-reclaim` actions
+≤50), and only then `--execute --manifest`.
+
+### Branch-level verification (all three commits)
+
+- `tsc --noEmit -p tsconfig.json` → **clean**
+- `vitest run src/ scripts/` → **3,849 passed, 1 failed, 1 skipped, 1 todo** (254 files).
+  The single failure is `src/message-archive.test.ts` hitting the 5s per-test
+  timeout under parallel load; it passes in isolation (17 passed, 5.7s) and
+  imports nothing from the reclaim path. An earlier full run flaked the same way
+  on `src/migrate-repo-store*.test.ts` (also green in isolation, 54 passed) and
+  those did not recur here — load flakes, not a regression.
+- Commits: `dfa6e3db` (C1), `1e567527` (C2), C3 = this commit.
+- Zero pushes, zero `pnpm run build`, zero restarts, zero `--execute`.

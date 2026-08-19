@@ -617,7 +617,7 @@ function dbHasRows(dbPath: string, sql: string, params: unknown[] = []): boolean
  * `pending_next` spelling) live in outbound `session_state` and are checked
  * too — a container between turns owes that work even with no live claim.
  */
-function sessionHasOpenWork(agentGroupId: string, sessionId: string, sessPath?: string): boolean | null {
+export function sessionHasOpenWork(agentGroupId: string, sessionId: string, sessPath?: string): boolean | null {
   const inbound = dbHasRows(
     sessPath ? path.join(sessPath, 'inbound.db') : inboundDbPath(agentGroupId, sessionId),
     `SELECT 1 AS found
