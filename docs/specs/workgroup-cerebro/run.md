@@ -835,3 +835,78 @@ one line per finding; full P2 rewrite is in `plan.md` §P2.
     split into seven independently asserted forbidden classes; size-cap AC now measures
     the final serialized file including the generated header, not model output alone
     (P2-AC3, P2-AC4).
+
+## Pillar 2 build — 2026-08-19
+
+Approved plan: `plan.md` §P2 at commit 871c8507; operator approval given explicitly
+2026-08-19 ("approved"). Build start recorded here. Builder: one cohesive worker
+(write sets across message-archive/curator-\* overlap too much for parallel builders);
+lead reviews the diff and runs fresh checks before `/team-review --implementation`.
+
+## Pillar 2 implementation — 2026-08-19
+
+### Build
+
+One cohesive worker built §P2.7 steps 1–10 on an isolated worktree branched from
+871c8507 (the live tree carried another session's uncommitted curator-worker change;
+isolation chosen so neither session's work could clobber the other's). All 15 AC test
+titles materialized verbatim. Builder deviations accepted by the lead: three ACs placed
+in module-local test files (precedented), additive `GeneratedMemoryFact.text`,
+`MEMORY_CONSOLIDATOR_MAX_TOKENS = 32,768` (plan gap — the episode output budget cannot
+fit the plan's own 12×8,192-byte ceiling), header `facts=<n>` = pass-tail count,
+locked-path writes fail the whole pass (conservative), reset lever deliberately not
+shipped as code.
+
+### Lead verification catches
+
+Fresh full-suite run by the lead found 4 test SUITES broken (green at base) that the
+builder's self-report missed — suite-level failures masked by a clean test-level count.
+Root cause: migration 051 imported application modules (message-archive, curator-write/
+contract), transitively pulling `secret-scrubber.ts`'s import-time `setLogScrubber`
+side effect into every DB-touching test's module graph, crashing suites that
+partial-mock `log.js`. Fix: migration rewritten fully self-contained (frozen logic —
+inline ledger check, inline upsert, deliberate duplication documented in place), the
+now-caller-less helper removed, and a new shape guard
+(`src/db/migrations/import-allowlist.test.ts`) pins the class: migration imports must
+resolve to node builtins, better-sqlite3, sibling files, or verified-safe utility
+modules. Allowlist deliberately wider than the lead's literal directive — the narrow
+version would have retroactively failed three shipped migrations; widening to
+verified-safe reality accepted. After fix: 278/278 suites, 3,980 tests.
+
+### Implementation review (2026-08-19) — cross-model, high reasoning
+
+8 findings (7 MUST-FIX, 1 SHOULD); lead traced all 8 to source; all 8 accepted with
+lead-adjusted fixes (one bounded correction batch):
+
+1. Ids could be marked consolidated after lease loss → reorder: owner-conditioned
+   `completeMaintenance` BEFORE `markConsolidated`; failure direction becomes
+   re-present (merge-safe), never skip. Lead note: reviewer's stated harm was
+   overdrawn (written facts leaving the tail is mostly correct) but the ordering fix
+   is right and cheap.
+2. Completion clobbered `maintenance_pending` set by mid-pass accrual with a stale
+   `hasMore` → completion recomputes: reassert OR post-subtraction counter ≥ threshold.
+3. Insert-only membership rows suppressed A→B→A semantic reversion (deterministic
+   text-hash ids) → prune rows absent from the live ledger at pass start; table now
+   bounded by ledger size.
+4. Input-cap TOCTOU (lstat-then-read; read used the 8 MiB bound) → post-read re-check
+   against the 16 KiB/256 KiB caps + bounded read in the scanner.
+5. Presented-as-human paths not durably locked (delete-mid-pass let the model claim
+   the path create-only) → all `owned:false` paths join the locked set.
+6. Prompt instructed date-aware conflict handling but the payload carried no dates →
+   `capturedAt` added to the tail payload.
+7. Abort signal reached only the model call → `throwIfAborted` after the call, before
+   each write, and before completion; AC13 strengthened to abort mid-write.
+8. (SHOULD) AC1/6/7 membership assertions were spy-only → rewired to the real
+   `memory_consolidated_facts` table on a temp DB.
+
+Reviewer's own verification: 138/138 on the focused seven-file suite, tsc clean.
+
+### Correction batch closed — verdict: clear
+
+All 8 findings fixed in one batch (worktree commit `0d7934ac`). Lead spot-verified the
+three subtlest fixes in source (completion-before-mark ordering with abort checks at
+the model return, each write, and pre-completion; the counter-aware pending CASE; the
+owned:false lock union) and independently re-ran the full host suite: 279 files /
+3,986 tests, zero failures. Membership assertions now hit the real
+`memory_consolidated_facts` table on a migrated temp DB. No verified MUST-FIX remains;
+implementation review returns **clear**.
