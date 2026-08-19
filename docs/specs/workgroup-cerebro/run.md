@@ -922,3 +922,24 @@ flake in this working tree (independently reported by a sibling session BEFORE t
 merge with a drifting count; the same suite passes 47/47 on identical code in the
 clean worktree). Deployed to dist by the verification build; activates on next host
 restart.
+
+## Recall-lane cap starvation — found by the fleet, fixed same day (2026-08-19)
+
+A fleet probe (two agents coordinating over their own recall blocks) proved the
+per-person `preferences/` lane never fires in the largest workgroup: the lane filtered
+the output of `listMarkdownFiles`, whose 256-visited-entry BFS cap exhausts before
+`preferences/` is enumerated at 338 files. Lead verified the diagnosis in source and
+found the same latent class one level deeper: `generated/memory.md`'s read-first
+priority also depended on walk enumeration — a large enough tree would silently drop
+the whole fact store from recall. This is P2.8's "traversal ceiling" risk, already
+tripped in production before P2's topic files add pressure (`domain/` sorts before
+`generated/`; `systems/` after `preferences/`).
+
+Fix (7a0edf5f): deterministic direct-path lanes decoupled from the capped walk —
+`preferences/` listed by its own non-recursive readdir; the ledger spliced into scan
+order behind an lstat existence guard. Red-first tests reproduce the starvation with a
+300-file tree. Walk, cap, and ranking untouched; the ranked lexical lane still lives
+under the cap and still announces truncation. Other-lanes audit: CORE_PATHS, exact-link,
+archive, and graph-scent lanes all independent of the walk — class closed. The
+workgroup's `index.md` workaround bullet ("preferences not reaching you") should be
+retired after the restart activates this fix.
