@@ -1,4 +1,14 @@
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it, beforeEach, vi } from 'vitest';
+
+// Only the wake-admission block below needs this; nothing else in the file
+// asserts on logs. The refusal's log line is the ONLY observable difference —
+// an unguarded wakeContainer also resolves false here, by throwing on the
+// uninitialized DB and being caught, so asserting the return value alone
+// passes whether or not the guard exists.
+vi.mock('./log.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./log.js')>();
+  return { ...actual, log: { ...actual.log, warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } };
+});
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -25,10 +35,13 @@ import {
   persistResolvedWorkgroupAtSpawn,
   resolveWorkgroupIdAtSpawn,
   stripEnvEntry,
+  wakeContainer,
 } from './container-runner.js';
 import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
 import { getProviderContainerConfig } from './providers/provider-container-registry.js';
+import { log } from './log.js';
+import type { Session } from './types.js';
 
 describe('resolveProviderName', () => {
   it('prefers session over container config', () => {
@@ -1274,5 +1287,50 @@ describe('Claude Bash timeout policy (structural)', () => {
     const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
     expect(src).toContain("args.push('-e', 'BASH_MAX_TIMEOUT_MS=3600000')");
     expect(src).not.toMatch(/args\.push\('-e', 'BASH_DEFAULT_TIMEOUT_MS=/);
+  });
+});
+
+// The one guard that covers every by-id wake caller at once. It sits above any
+// DB or Docker work in wakeContainer, so it is reachable without a host.
+describe('wakeContainer session-status admission', () => {
+  function session(status: 'active' | 'closed' | 'archiving'): Session {
+    return {
+      id: `sess-${status}`,
+      agent_group_id: 'ag-1',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status,
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-08-19T00:00:00.000Z',
+    };
+  }
+
+  function refusals(): string[] {
+    return vi
+      .mocked(log.warn)
+      .mock.calls.filter((call) => String(call[0]).includes('Container wake refused'))
+      .map((call) => (call[1] as { status: string }).status);
+  }
+
+  beforeEach(() => {
+    vi.mocked(log.warn).mockClear();
+  });
+
+  it('refuses a closed session — the archived-session zombie', async () => {
+    await expect(wakeContainer(session('closed'))).resolves.toBe(false);
+    expect(refusals()).toEqual(['closed']);
+  });
+
+  it('refuses a session mid-archival', async () => {
+    await expect(wakeContainer(session('archiving'))).resolves.toBe(false);
+    expect(refusals()).toEqual(['archiving']);
+  });
+
+  it('lets an active session through the guard to the normal admission path', async () => {
+    await expect(wakeContainer(session('active'))).resolves.toBe(false);
+    // Refused for a real reason (no host DB in a unit test), not by the guard.
+    expect(refusals()).toEqual([]);
   });
 });

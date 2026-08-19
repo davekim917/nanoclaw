@@ -1534,7 +1534,10 @@ describe('session migration pass preserves the idle clock', () => {
 
     const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
     expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(0);
-    expect(fs.statSync(target).mtimeMs).toBe(bumped * 1000);
+    // Not rewound. Compared against the pre-pass clock rather than the exact
+    // bumped value: utimes takes float seconds and ms -> s -> ns -> ms does not
+    // always round-trip.
+    expect(fs.statSync(target).mtimeMs).toBeGreaterThan(OLD_SECONDS * 1000);
   });
 
   it('tolerates filesystem rounding on the low edge of the replay window', async () => {

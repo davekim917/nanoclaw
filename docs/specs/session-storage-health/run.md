@@ -613,3 +613,83 @@ earlier 16:25–16:27Z cluster now included. Both manifests are in the scratchpa
 
 - `vitest run scripts/restore-session-mtimes.test.ts` → **13 passed** (was 8)
 - `tsc --noEmit` clean · `eslint` 0 errors
+
+## 2026-08-19 — correction batch (C6: the D1 follow-up, green-lit)
+
+`wakeContainer` (`src/container-runner.ts`) now refuses a session whose status
+is not `'active'`, logs one warning, and leaves the inbound row pending. The
+guard sits after the shutdown / already-running / wake-in-flight checks and
+above every DB and Docker call, so a live container still reports honestly and
+only NEW spawns are refused.
+
+This is the single fix for all nine class-F paths enumerated in C2 — support
+threads, approvals, reason capture, pending questions, dashboard steer,
+scheduled run-now, and the four orchestrator-dispatch task paths — because
+every one of them funnels through this function. 13 lines, one place.
+
+### Staging
+
+`src/container-runner.ts` carries another session's uncommitted Slack
+owner-safety work. Staged with the surgical-index pattern: take the HEAD blob,
+replay only my hunk into it, diff HEAD → HEAD+mine, `git apply --cached`. The
+worktree keeps everyone's changes. Verified before committing —
+`git diff --cached src/container-runner.ts | grep -c slackSafety` → **0**, while
+`git diff src/container-runner.ts | grep -cE '^\+.*slackSafetyMessagingGroupId'`
+→ **9** (theirs, intact and unstaged). Patch kept at
+`scratchpad/container-runner-guard.patch`.
+
+### Test — and why the obvious version of it was worthless
+
+`src/container-runner.test.ts` is unmodified by anyone else, so it takes the
+test directly. My first version asserted only `resolves.toBe(false)` and passed
+WITH AND WITHOUT the guard: an unguarded `wakeContainer` reaches
+`checkStorageAdmission`, throws `Database not initialized`, and `trackWake`
+catches it and returns false. Same value, opposite reason.
+
+The refusal's log line is the only observable difference, so the file now mocks
+`./log.js` (nothing else in it asserts on logs) and the tests assert the
+`Container wake refused` warning and its status. Verified by flipping the guard
+to `if (false as boolean)`:
+
+```
+WITHOUT the guard: × refuses a closed session   AssertionError: expected [] to deeply equal [ 'closed' ]
+                   × refuses a session mid-archival  AssertionError: expected [] to deeply equal [ 'archiving' ]
+WITH the guard:    3 passed
+```
+
+A third case asserts an ACTIVE session passes the guard and is refused further
+down for a real reason — so the guard cannot silently start rejecting everything.
+
+### Verification (C6)
+
+- `vitest run src/container-runner.test.ts` → **88 passed** (was 87)
+- `tsc --noEmit` clean
+
+### Branch-level verification after the correction batch
+
+- `tsc --noEmit -p tsconfig.json` → **clean**
+- `vitest run src/ scripts/ --testTimeout=30000` → **254 files passed, 3,872
+  passed, 1 skipped, 1 todo, ZERO failures** (172s). The two flakes seen in the
+  C1/C3 runs (`migrate-repo-store*`, `message-archive`) were the 5s default
+  timeout under a box at load average 17-40 with nine concurrent vitest
+  processes from other agents; at 30s the whole suite is green.
+- Per-suite: storage-manager **68** · session-manager **49** ·
+  support-threads **11** · restore-session-mtimes **13** · container-runner **88**.
+- One test-only fix folded into this commit: C4's "work inside the replay
+  window" case compared the exact bumped mtime, which is fragile because
+  `utimesSync` takes float seconds and ms → s → ns → ms does not always
+  round-trip (`expected 1787177353517.999 to be 1787177353518`). It now asserts
+  the clock was not rewound, which is what the test is about.
+
+### Commits
+
+| | SHA | Scope |
+|---|---|---|
+| C1 | `dfa6e3db` | SR1-SR5 |
+| C2 | `1e567527` | SR6 + raw-id enumeration |
+| C3 | `3d5eb3b7` | SR7 recovery script |
+| C4 | `88c56e2b` | findings 1,2,3,4,5,6,10,11 |
+| C5 | `5688bfae` | findings 7,8,9 |
+| C6 | this commit | D1 wakeContainer guard |
+
+Zero pushes, zero `pnpm run build`, zero restarts, zero `--execute`.

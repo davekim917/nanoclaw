@@ -398,6 +398,19 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
+  // Reclaim closes a session row (it never deletes it) and removes its dir, so
+  // every by-id caller — support threads, approvals, pending questions,
+  // dashboard steer, task completion — can still hand us an archived session.
+  // Spawning on one produces a container getActiveSessions() will never
+  // return: no stuck detection, no heartbeat ceiling, no claim tolerance, for
+  // as long as it runs. The inbound row stays pending for a live session.
+  if (session.status !== 'active') {
+    log.warn('Container wake refused — session is not active', {
+      sessionId: session.id,
+      status: session.status,
+    });
+    return Promise.resolve(false);
+  }
 
   return trackWake(session.id, async () => {
     if (!(await checkStorageAdmission(session, false))) return false;
