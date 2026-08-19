@@ -1,11 +1,37 @@
-import { describe, expect, it, vi } from 'vitest';
+import fs from 'fs';
+import path from 'path';
 
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { TEST_ROOT, TEST_WORKGROUP } = vi.hoisted(() => ({
+  TEST_ROOT: `/tmp/nanoclaw-curator-worker-test-${process.pid}`,
+  TEST_WORKGROUP: 'wg-a',
+}));
+
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  DATA_DIR: TEST_ROOT,
+}));
+
+import { log } from '../../log.js';
 import type { MemoryCurationArchiveRow, MemoryCurationEpisode } from '../../message-archive.js';
-import type { CuratorBackendResult } from './curator-backend.js';
-import { CURATOR_MAX_MEMORY_TEXT_CHARS } from './curator-contract.js';
-import type { CuratorWriteResult } from './curator-write.js';
+import type { ConsolidationBackendResult, CuratorBackendResult } from './curator-backend.js';
+import {
+  CONSOLIDATION_FILE_MAX_BYTES,
+  CONSOLIDATION_HEADER_PATTERN,
+  CONSOLIDATION_MAX_FACTS,
+  CURATOR_MAX_MEMORY_TEXT_CHARS,
+  parseGeneratedMemoryFacts,
+} from './curator-contract.js';
+import {
+  readGeneratedMemory,
+  readMemoryTopicFile,
+  writeMemoryTopicFile,
+  type CuratorWriteResult,
+} from './curator-write.js';
 import {
   boundEpisodeMessages,
+  computeConsolidationTail,
   isMemoryCuratorEnabled,
   MemoryCuratorWorker,
   selectGeneratedMemoryForPrompt,
@@ -87,10 +113,62 @@ function deps(overrides: Partial<MemoryCuratorWorkerDependencies> = {}): MemoryC
         usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
       }),
     ),
+    consolidationTail: () => ({ facts: [], hasMore: false }),
+    scanTopicFiles: () => ({ files: [], excludedPaths: [] }),
+    markConsolidated: vi.fn(),
+    writeTopicFile: vi.fn(
+      async (): Promise<CuratorWriteResult> => ({
+        status: 'success',
+        relative_path: 'people/x.md',
+        sha256: 'a'.repeat(64),
+      }),
+    ),
+    consolidate: vi.fn(
+      async (_system, _user, credentialSlot): Promise<ConsolidationBackendResult> => ({
+        decision: { files: [] },
+        model: 'claude-sonnet-5',
+        credentialSlot,
+        usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      }),
+    ),
     uuid: vi.fn(() => '00000000-0000-0000-0000-000000000001'),
     ...overrides,
   };
 }
+
+function memoryDir(): string {
+  return path.join(TEST_ROOT, 'workgroups', TEST_WORKGROUP, 'memory');
+}
+
+function seedLedger(content: string): void {
+  const dir = path.join(memoryDir(), 'generated');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'memory.md'), content, 'utf8');
+}
+
+function factLine(id: string, text: string, evidence = 'msg-1', capturedAt = '2026-08-19T00:00:00.000Z'): string {
+  return `- ${text} <!-- nanoclaw-memory:id=${id};evidence=${evidence};captured=${capturedAt} -->`;
+}
+
+/** Real ledger-file tail computation, backed by the temp fs (not a mock),
+ *  against an in-test `memory_consolidated_facts` stand-in. */
+function realConsolidationTail(consolidated: ReadonlySet<string> = new Set()) {
+  return (workgroupId: string) =>
+    computeConsolidationTail(
+      parseGeneratedMemoryFacts(readGeneratedMemory(workgroupId).content),
+      consolidated,
+      CONSOLIDATION_MAX_FACTS,
+    );
+}
+
+beforeEach(() => {
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+  fs.mkdirSync(path.join(memoryDir(), 'generated'), { recursive: true });
+});
+
+afterEach(() => {
+  fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+});
 
 describe('memory curator worker', () => {
   it('defaults disabled and accepts explicit activation values only', () => {
@@ -471,28 +549,378 @@ describe('memory curator worker', () => {
     expect(selected).toMatch(/^# Generated workgroup memory\n\n/);
   });
 
-  it('retires thresholded maintenance deterministically without another model-authored document', async () => {
-    const current = [
-      '# Generated workgroup memory',
-      '',
-      '- Fact. <!-- nanoclaw-memory:id=mem_aaaaaaaaaaaaaaaa;evidence=msg-1;captured=2026-07-26T00:00:00.000Z -->',
-      '',
-    ].join('\n');
+  // Superseded by P2-AC13 below: runMaintenance moved INSIDE the admission
+  // gate (docs/specs/workgroup-cerebro/plan.md §P2.4 item 9), so an
+  // admission-exhausted sweep tick must not even CLAIM a pending maintenance
+  // job — the pre-P2 behavior this test used to assert (maintenance runs
+  // regardless of admission) is the exact gap P2 closes.
+  it('does not claim a pending maintenance job when admission is exhausted', async () => {
     const d = deps({
       admission: () => ({ allowed: false, hourly: 120, daily: 120, hourlyLimit: 120, dailyLimit: 3000 }),
-      selectCredential: () => ({
-        slot: null,
-        retryAt: '2026-07-26T00:15:00.000Z',
-        unavailableSlots: ['oauth:primary', 'oauth:2'],
-      }),
       claim: vi.fn(() => null),
-      claimMaintenance: () => ({ workgroupId: 'wg-a', acceptedUpdates: 50, leaseOwner: 'worker' }),
-      readGenerated: () => ({ content: current, sha256: 'a'.repeat(64) }),
+      claimMaintenance: vi.fn(() => ({ workgroupId: 'wg-a', acceptedUpdates: 50, leaseOwner: 'worker' })),
     });
-    expect(await new MemoryCuratorWorker(d).runOne(1000)).toMatchObject({ action: 'maintenance_noop' });
+    expect(await new MemoryCuratorWorker(d).runOne(1000)).toBeNull();
+    expect(d.claimMaintenance).not.toHaveBeenCalled();
     expect(d.claim).not.toHaveBeenCalled();
-    expect(d.writeGenerated).not.toHaveBeenCalled();
-    expect(d.recordCall).not.toHaveBeenCalled();
-    expect(d.completeMaintenance).toHaveBeenCalledOnce();
+  });
+});
+
+// Pillar-2 semantic consolidation (docs/specs/workgroup-cerebro/plan.md §P2).
+// "real temp store files": the ledger and topic-file reads/writes run for
+// real against a temp workgroup memory dir (DATA_DIR mocked above); only the
+// model backend (`consolidate`) and the memory_consolidated_facts DB table
+// (`consolidationTail`'s consolidated-id input, `markConsolidated`) are
+// dependency-injected, matching how episode tests already mock the DB-backed
+// lease/admission machinery while exercising real content logic.
+describe('pillar-2 semantic consolidation', () => {
+  it('maintenance creates topic directories on first run and consolidates the tail', async () => {
+    seedLedger(
+      [
+        '# Generated workgroup memory',
+        '',
+        factLine('mem_aaaaaaaaaaaaaaaa', 'Maya Chen is the Acme liaison.'),
+        factLine('mem_bbbbbbbbbbbbbbbb', 'Acme pricing is usage-based.'),
+        factLine('mem_cccccccccccccccc', 'The nightly pipeline loads Acme data.'),
+        '',
+      ].join('\n'),
+    );
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 3, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      writeTopicFile: writeMemoryTopicFile,
+      consolidate: vi.fn(
+        async (_system, _user, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: {
+            files: [
+              { path: 'people/maya-chen.md', content: '# Maya Chen\n\nLiaison for Acme.\n' },
+              { path: 'domain/acme-pricing.md', content: '# Acme pricing\n\nUsage-based.\n' },
+            ],
+          },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 2 });
+    expect(fs.lstatSync(path.join(memoryDir(), 'people')).isDirectory()).toBe(true);
+    expect(fs.lstatSync(path.join(memoryDir(), 'domain')).isDirectory()).toBe(true);
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/maya-chen.md').content.split('\n')[0]).toMatch(
+      CONSOLIDATION_HEADER_PATTERN,
+    );
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'domain/acme-pricing.md').content.split('\n')[0]).toMatch(
+      CONSOLIDATION_HEADER_PATTERN,
+    );
+    expect(d.markConsolidated).toHaveBeenCalledWith(TEST_WORKGROUP, [
+      'mem_aaaaaaaaaaaaaaaa',
+      'mem_bbbbbbbbbbbbbbbb',
+      'mem_cccccccccccccccc',
+    ]);
+  });
+
+  it('consolidation input is scoped to the unconsolidated tail, owned files as writable, human-authored files as read-only context', async () => {
+    seedLedger(
+      [
+        '# Generated workgroup memory',
+        '',
+        factLine('mem_aaaaaaaaaaaaaaaa', 'Already consolidated fact.'),
+        factLine('mem_bbbbbbbbbbbbbbbb', 'A fresh fact about Acme.'),
+        '',
+      ].join('\n'),
+    );
+    let capturedUser = '';
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(new Set(['mem_aaaaaaaaaaaaaaaa'])),
+      scanTopicFiles: () => ({
+        files: [
+          {
+            path: 'people/x.md',
+            content: '<!-- consolidated: facts=1 -->\n# X\n\nOwned current content.\n',
+            owned: true,
+          },
+          { path: 'people/roster.md', content: '# Roster\n\nHuman-authored roster entry.\n', owned: false },
+        ],
+        excludedPaths: [],
+      }),
+      consolidate: vi.fn(async (_system, user, credentialSlot): Promise<ConsolidationBackendResult> => {
+        capturedUser = user;
+        return {
+          decision: { files: [] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        };
+      }),
+    });
+    await new MemoryCuratorWorker(d).runOne(1000);
+    expect(capturedUser).toContain('A fresh fact about Acme.');
+    expect(capturedUser).not.toContain('Already consolidated fact.');
+    expect(capturedUser).toContain('Owned current content.');
+    expect(capturedUser).toContain('Human-authored roster entry.');
+    expect(capturedUser).toContain('"owned":true');
+    expect(capturedUser).toContain('"owned":false');
+  });
+
+  // P2-AC4. Both halves: content alone under the cap is not sufficient proof
+  // (the header must push it over), and a 13-file set trips the max-count
+  // cap. Nothing written in either case.
+  it('oversize or over-count file sets are rejected, measured on the final serialized file', async () => {
+    seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+    const writeTopicFile = vi.fn(
+      async (): Promise<CuratorWriteResult> => ({
+        status: 'success',
+        relative_path: 'people/x.md',
+        sha256: 'a'.repeat(64),
+      }),
+    );
+
+    const nearCapContent = `# X\n\n${'y'.repeat(CONSOLIDATION_FILE_MAX_BYTES - 10)}\n`;
+    expect(Buffer.byteLength(nearCapContent, 'utf8')).toBeLessThan(CONSOLIDATION_FILE_MAX_BYTES);
+    const oversize = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      writeTopicFile,
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: [{ path: 'people/big.md', content: nearCapContent }] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    expect(await new MemoryCuratorWorker(oversize).runOne(1000)).toBeNull();
+    expect(writeTopicFile).not.toHaveBeenCalled();
+    expect(oversize.markConsolidated).not.toHaveBeenCalled();
+
+    const manyFiles = Array.from({ length: 13 }, (_, i) => ({ path: `domain/topic-${i}.md`, content: `# T${i}\n` }));
+    const overcount = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      writeTopicFile,
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: manyFiles },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    expect(await new MemoryCuratorWorker(overcount).runOne(1000)).toBeNull();
+    expect(writeTopicFile).not.toHaveBeenCalled();
+    expect(overcount.markConsolidated).not.toHaveBeenCalled();
+  });
+
+  it('the ledger is byte-identical after a pass', async () => {
+    const ledger = ['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n');
+    seedLedger(ledger);
+    const before = fs.readFileSync(path.join(memoryDir(), 'generated', 'memory.md'), 'utf8');
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      writeTopicFile: writeMemoryTopicFile,
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: [{ path: 'people/x.md', content: '# X\n\nSomething.\n' }] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 1 });
+    const after = fs.readFileSync(path.join(memoryDir(), 'generated', 'memory.md'), 'utf8');
+    expect(after).toBe(before);
+  });
+
+  it('a mid-batch CAS conflict marks nothing consolidated and the next pass re-presents the same tail', async () => {
+    seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+    const writeTopicFile = vi.fn(
+      async (
+        workgroupId: string,
+        relativePath: string,
+        content: string,
+        expectedSha256: string | null,
+        factsCount: number,
+      ): Promise<CuratorWriteResult> => {
+        if (relativePath === 'domain/two.md') {
+          return { status: 'conflict', relative_path: relativePath, error: 'expected_sha256 does not match' };
+        }
+        return writeMemoryTopicFile(workgroupId, relativePath, content, expectedSha256, factsCount);
+      },
+    );
+    const markConsolidated = vi.fn();
+    const failMaintenance = vi.fn(() => true);
+    const completeMaintenance = vi.fn(() => true);
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      writeTopicFile,
+      markConsolidated,
+      failMaintenance,
+      completeMaintenance,
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: {
+            files: [
+              { path: 'people/one.md', content: '# One\n\nFirst file.\n' },
+              { path: 'domain/two.md', content: '# Two\n\nSecond file.\n' },
+            ],
+          },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toBeNull();
+    expect(failMaintenance).toHaveBeenCalledOnce();
+    expect(markConsolidated).not.toHaveBeenCalled();
+    expect(completeMaintenance).not.toHaveBeenCalled();
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/one.md').content).toContain('First file.');
+
+    let capturedUser = '';
+    const retryDeps = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      scanTopicFiles: () => ({
+        files: [
+          {
+            path: 'people/one.md',
+            content: readMemoryTopicFile(TEST_WORKGROUP, 'people/one.md').content,
+            owned: true,
+          },
+        ],
+        excludedPaths: [],
+      }),
+      consolidate: vi.fn(async (_s, user, credentialSlot): Promise<ConsolidationBackendResult> => {
+        capturedUser = user;
+        return {
+          decision: { files: [] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        };
+      }),
+    });
+    await new MemoryCuratorWorker(retryDeps).runOne(1000);
+    expect(capturedUser).toContain('A fact.');
+    expect(capturedUser).toContain('First file.');
+  });
+
+  it('tail-emptiness and a model choosing zero files are distinct outcomes', async () => {
+    seedLedger('# Generated workgroup memory\n\n');
+    const consolidate = vi.fn();
+    const emptyTailDeps = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 0, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      consolidate,
+    });
+    const noopReport = await new MemoryCuratorWorker(emptyTailDeps).runOne(1000);
+    expect(noopReport).toMatchObject({ action: 'maintenance_noop' });
+    expect(consolidate).not.toHaveBeenCalled();
+
+    seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+    const markConsolidated = vi.fn();
+    const logSpy = vi.spyOn(log, 'info');
+    const zeroFilesDeps = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      markConsolidated,
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: [] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const writtenReport = await new MemoryCuratorWorker(zeroFilesDeps).runOne(1000);
+    expect(writtenReport).toMatchObject({ action: 'maintenance_written', fileCount: 0 });
+    expect(markConsolidated).toHaveBeenCalledWith(TEST_WORKGROUP, ['mem_aaaaaaaaaaaaaaaa']);
+    expect(logSpy).toHaveBeenCalledWith(
+      'memory-curator: consolidation pass wrote zero files for a non-empty tail',
+      expect.objectContaining({ workgroupId: TEST_WORKGROUP }),
+    );
+    logSpy.mockRestore();
+  });
+
+  it('over-cap presented topic files are excluded, logged, and locked for that pass', async () => {
+    seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+    const writeTopicFile = vi.fn(
+      async (): Promise<CuratorWriteResult> => ({
+        status: 'success',
+        relative_path: 'people/over.md',
+        sha256: 'a'.repeat(64),
+      }),
+    );
+    const warnSpy = vi.spyOn(log, 'warn');
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      scanTopicFiles: () => ({ files: [], excludedPaths: ['people/over.md', 'domain/also-over.md'] }),
+      writeTopicFile,
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: [{ path: 'people/over.md', content: '# Over\n' }] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toBeNull();
+    expect(writeTopicFile).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      'memory-curator: over-cap topic files excluded and locked for this pass',
+      expect.objectContaining({ excludedPaths: ['people/over.md', 'domain/also-over.md'] }),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it('the maintenance call is admission-accounted and abort-propagated', async () => {
+    seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+
+    const gatedDeps = deps({
+      admission: () => ({ allowed: false, hourly: 120, daily: 120, hourlyLimit: 120, dailyLimit: 3000 }),
+      claimMaintenance: vi.fn(() => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' })),
+    });
+    expect(await new MemoryCuratorWorker(gatedDeps).runOne(1000)).toBeNull();
+    expect(gatedDeps.claimMaintenance).not.toHaveBeenCalled();
+
+    const recordCall = vi.fn(() => true);
+    const finishCall = vi.fn();
+    const controller = new AbortController();
+    let capturedSignal: AbortSignal | undefined;
+    const runningDeps = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: realConsolidationTail(),
+      recordCall,
+      finishCall,
+      consolidate: vi.fn(async (_s, _u, credentialSlot, signal): Promise<ConsolidationBackendResult> => {
+        capturedSignal = signal;
+        if (signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        return {
+          decision: { files: [] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        };
+      }),
+    });
+    controller.abort();
+    const report = await new MemoryCuratorWorker(runningDeps).runOne(1000, controller.signal);
+    expect(capturedSignal).toBe(controller.signal);
+    expect(report).toBeNull();
+    expect(recordCall).toHaveBeenCalledOnce();
+    expect(finishCall).toHaveBeenCalledWith(expect.any(String), 'timeout');
   });
 });
