@@ -697,19 +697,47 @@ export function claimMemoryMaintenance(
   })();
 }
 
-export function completeMemoryMaintenance(job: MemoryMaintenanceJob, options: { nowMs?: number } = {}): boolean {
+export function completeMemoryMaintenance(
+  job: MemoryMaintenanceJob,
+  options: { nowMs?: number; reassertPending?: boolean } = {},
+): boolean {
   const now = new Date(options.nowMs ?? Date.now()).toISOString();
   const result = openDb()
     .prepare(
       `UPDATE memory_curation_state
-          SET accepted_updates_since_maintenance = 0,
-              maintenance_pending = 0,
+          SET accepted_updates_since_maintenance =
+                MAX(0, accepted_updates_since_maintenance - ?),
+              maintenance_pending = CASE
+                WHEN ? = 1 THEN 1
+                WHEN MAX(0, accepted_updates_since_maintenance - ?) >= ? THEN 1
+                ELSE 0
+              END,
               lease_owner = NULL,
               lease_expires_at = NULL,
               updated_at = ?
         WHERE workgroup_id = ? AND lease_owner = ?`,
     )
-    .run(now, job.workgroupId, job.leaseOwner);
+    // Subtracts the job's CLAIM-TIME snapshot, not the live counter — updates
+    // accepted while the lease was held (a sibling curator write mid-pass)
+    // must survive completion, not be zeroed with it. Floored at 0 by MAX().
+    //
+    // `reassertPending` (explicit true) re-arms immediately when the
+    // consolidation tail is not fully drained — but a FALSE reassert must
+    // not clobber a re-arm the mid-pass accrual itself already earned: if
+    // updates accepted while the lease was held push the floored counter
+    // back over MEMORY_MAINTENANCE_UPDATE_THRESHOLD, pending stays 1 on that
+    // basis even though this pass's own tail was fully drained. Both checks
+    // read the SAME floored value the counter column is being set to, so
+    // there is no window where the flag and the persisted counter disagree.
+    .run(
+      job.acceptedUpdates,
+      options.reassertPending ? 1 : 0,
+      job.acceptedUpdates,
+      MEMORY_MAINTENANCE_UPDATE_THRESHOLD,
+      now,
+      job.workgroupId,
+      job.leaseOwner,
+    );
   return result.changes === 1;
 }
 

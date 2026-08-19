@@ -3,6 +3,11 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 
 import { getDb } from '../../db/connection.js';
+import {
+  consolidatedFactIds,
+  markFactsConsolidated,
+  pruneConsolidatedFacts,
+} from '../../db/memory-consolidated-facts.js';
 import { listClaudeStructuredCredentialSlots, type ClaudeCredentialSlot } from '../../llm.js';
 import { log } from '../../log.js';
 import {
@@ -27,18 +32,39 @@ import {
 } from '../../message-archive.js';
 import { tokenizeForRecall } from './pre-turn-context.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
-import { MemoryCuratorBackend, MEMORY_CURATOR_EFFORT, type CuratorBackendResult } from './curator-backend.js';
 import {
+  MemoryCuratorBackend,
+  MEMORY_CURATOR_EFFORT,
+  type ConsolidationBackendResult,
+  type CuratorBackendResult,
+} from './curator-backend.js';
+import {
+  buildConsolidationPrompt,
   buildCuratorPrompt,
+  CONSOLIDATION_HEADER_PATTERN,
+  CONSOLIDATION_INPUT_FILE_MAX_BYTES,
+  CONSOLIDATION_INPUT_TOTAL_MAX_BYTES,
+  CONSOLIDATION_MAX_FACTS,
   CURATOR_CAPTURE_REASON_CODES,
   CURATOR_MAX_MEMORY_TEXT_CHARS,
+  generatedMemorySha,
   GENERATED_MEMORY_MAX_BYTES,
   GENERATED_MEMORY_WARN_BYTES,
   parseGeneratedMemoryFacts,
+  TOPIC_FILE_PATH_PATTERN,
+  validateConsolidationFiles,
   validateCuratorDecision,
+  type ConsolidationTailFact,
+  type ConsolidationTopicFile,
   type CuratorDecision,
 } from './curator-contract.js';
-import { readGeneratedMemory, writeGeneratedMemory, type CuratorWriteResult } from './curator-write.js';
+import {
+  readGeneratedMemory,
+  readMemoryTopicFile,
+  writeGeneratedMemory,
+  writeMemoryTopicFile,
+  type CuratorWriteResult,
+} from './curator-write.js';
 
 const MAX_RAW_MESSAGES = 80;
 const MAX_EPISODE_MESSAGES = 80;
@@ -68,6 +94,9 @@ export interface MemoryCuratorRunReport {
    * adding the field is what makes the refusal countable.
    */
   reasonCode?: CuratorDecision['reasonCode'];
+  /** Topic files written by a consolidation pass. 0 is a valid, distinct
+   *  outcome from the empty-tail maintenance_noop (P2.4 item 7). */
+  fileCount?: number;
   messageCount: number;
   transcriptChars: number;
   model?: string;
@@ -100,7 +129,7 @@ export interface MemoryCuratorWorkerDependencies {
   messages: (episode: MemoryCurationEpisode, members: string[]) => MemoryCurationArchiveRow[];
   complete: (episode: MemoryCurationEpisode, nowMs: number) => boolean;
   fail: (episode: MemoryCurationEpisode, errorClass: string, nowMs: number) => boolean;
-  completeMaintenance: (job: MemoryMaintenanceJob, nowMs: number) => boolean;
+  completeMaintenance: (job: MemoryMaintenanceJob, nowMs: number, reassertPending: boolean) => boolean;
   failMaintenance: (job: MemoryMaintenanceJob, nowMs: number) => boolean;
   recordCall: (id: string, workgroupId: string, credentialSlot: ClaudeCredentialSlot, nowMs: number) => boolean;
   finishCall: (id: string, outcome: string) => void;
@@ -119,6 +148,27 @@ export interface MemoryCuratorWorkerDependencies {
     credentialSlot: ClaudeCredentialSlot,
     signal?: AbortSignal,
   ) => Promise<CuratorBackendResult>;
+  /** Every ledger fact not yet in memory_consolidated_facts, ledger order,
+   *  capped to CONSOLIDATION_MAX_FACTS. `hasMore` is whether the UNCAPPED
+   *  unconsolidated set is larger than the capped tail returned. */
+  consolidationTail: (workgroupId: string) => { facts: ConsolidationTailFact[]; hasMore: boolean };
+  /** Real topic files under people/domain/systems, capped per-file and in
+   *  total (P2.4 item 6); over-cap paths come back separately as locked. */
+  scanTopicFiles: (workgroupId: string) => { files: ConsolidationTopicFile[]; excludedPaths: string[] };
+  markConsolidated: (workgroupId: string, factIds: string[]) => void;
+  writeTopicFile: (
+    workgroupId: string,
+    relativePath: string,
+    content: string,
+    expectedSha256: string | null,
+    factsCount: number,
+  ) => Promise<CuratorWriteResult>;
+  consolidate: (
+    system: string,
+    user: string,
+    credentialSlot: ClaudeCredentialSlot,
+    signal?: AbortSignal,
+  ) => Promise<ConsolidationBackendResult>;
   uuid: () => string;
 }
 
@@ -137,7 +187,7 @@ function actualDependencies(): MemoryCuratorWorkerDependencies {
     messages: (episode, members) => readMemoryCurationEpisodeMessages(episode, members, MAX_RAW_MESSAGES),
     complete: (episode, nowMs) => completeMemoryCurationEpisode(episode, { nowMs }),
     fail: (episode, errorClass, nowMs) => failMemoryCurationEpisode(episode, errorClass, { nowMs }),
-    completeMaintenance: (job, nowMs) => completeMemoryMaintenance(job, { nowMs }),
+    completeMaintenance: (job, nowMs, reassertPending) => completeMemoryMaintenance(job, { nowMs, reassertPending }),
     failMaintenance: (job, nowMs) => failMemoryMaintenance(job, { nowMs }),
     recordCall: (id, workgroupId, credentialSlot, nowMs) =>
       recordMemoryCurationCall(id, workgroupId, { nowMs, credentialSlot }),
@@ -149,6 +199,22 @@ function actualDependencies(): MemoryCuratorWorkerDependencies {
       recordAcceptedGeneratedMemory(workgroupId, contentBytes, { nowMs }),
     manualMemory: readRelevantManualMemory,
     curate: (system, user, credentialSlot, signal) => backend.curate(system, user, credentialSlot, signal),
+    consolidationTail: (workgroupId) => {
+      const ledgerFacts = parseGeneratedMemoryFacts(readGeneratedMemory(workgroupId).content);
+      // Prune BEFORE computing the tail (P2.4 item 1 correction, F3): a
+      // superseded fact's row must die with it, or an A→B→A revert — B
+      // superseding A, then a later fact re-stating A's exact text — gets a
+      // fresh content-hash id that's correctly tail-eligible, but the STALE
+      // row for the old id sits forever, and the table stops tracking ledger
+      // size. Pruning first means a fact that comes back this same pass is
+      // immediately eligible, not next pass.
+      pruneConsolidatedFacts(workgroupId, new Set(ledgerFacts.map((fact) => fact.id)));
+      return computeConsolidationTail(ledgerFacts, consolidatedFactIds(workgroupId), CONSOLIDATION_MAX_FACTS);
+    },
+    scanTopicFiles,
+    markConsolidated: markFactsConsolidated,
+    writeTopicFile: writeMemoryTopicFile,
+    consolidate: (system, user, credentialSlot, signal) => backend.consolidate(system, user, credentialSlot, signal),
     uuid: randomUUID,
   };
 }
@@ -217,6 +283,98 @@ export function boundEpisodeMessages(raw: MemoryCurationArchiveRow[]): {
     transcriptChars += text.length;
   }
   return { messages, handledThroughRowid, transcriptChars };
+}
+
+/**
+ * The order-independent tail (docs/specs/workgroup-cerebro/plan.md §P2.4
+ * item 1): every ledger fact whose id is absent from `consolidated`, in
+ * ledger order, capped to `limit`. Pure — no timestamp comparison, so a
+ * late-arriving or equal-`captured=` episode is never skipped.
+ */
+export function computeConsolidationTail(
+  ledgerFacts: readonly { id: string; text: string; capturedAt: string }[],
+  consolidated: ReadonlySet<string>,
+  limit: number,
+): { facts: ConsolidationTailFact[]; hasMore: boolean } {
+  const unconsolidated = ledgerFacts.filter((fact) => !consolidated.has(fact.id));
+  return {
+    facts: unconsolidated
+      .slice(0, limit)
+      .map((fact) => ({ id: fact.id, text: fact.text, capturedAt: fact.capturedAt })),
+    hasMore: unconsolidated.length > limit,
+  };
+}
+
+/**
+ * Real topic files under people/domain/systems (flat, one level — matches
+ * TOPIC_FILE_PATH_PATTERN). Applies the per-file and total input caps (P2.4
+ * item 6): an over-cap file is excluded and reported back as locked, so the
+ * caller can refuse any model-proposed write to it — the model never
+ * blind-overwrites content it did not see.
+ */
+export function scanTopicFiles(workgroupId: string): {
+  files: ConsolidationTopicFile[];
+  excludedPaths: string[];
+} {
+  const root = workgroupMemoryDir(workgroupId);
+  const files: ConsolidationTopicFile[] = [];
+  const excludedPaths: string[] = [];
+  let totalBytes = 0;
+  for (const dir of ['people', 'domain', 'systems'] as const) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs
+        .readdirSync(path.join(root, dir), { withFileTypes: true })
+        .sort((a, b) => a.name.localeCompare(b.name));
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue;
+      const relative = `${dir}/${entry.name}`;
+      if (!TOPIC_FILE_PATH_PATTERN.test(relative)) continue;
+      let size: number;
+      try {
+        size = fs.lstatSync(path.join(root, relative)).size;
+      } catch {
+        continue;
+      }
+      if (size > CONSOLIDATION_INPUT_FILE_MAX_BYTES || totalBytes + size > CONSOLIDATION_INPUT_TOTAL_MAX_BYTES) {
+        excludedPaths.push(relative);
+        continue;
+      }
+      // Pass the input cap straight to the read (not the default 8 MiB
+      // generated-memory ceiling) so a file that grows between the lstat
+      // above and this open cannot be slurped whole — readMemoryTopicFile
+      // throws rather than reading past maxBytes.
+      let current: { content: string; sha256: string | null };
+      try {
+        current = readMemoryTopicFile(workgroupId, relative, CONSOLIDATION_INPUT_FILE_MAX_BYTES);
+      } catch {
+        excludedPaths.push(relative); // grew past the cap between lstat and open
+        continue;
+      }
+      if (current.sha256 === null) continue; // vanished between listing and read
+      // Re-check the ACTUAL bytes read against both caps: the lstat size and
+      // the open-time bound can't see the running total from files already
+      // accumulated earlier in this same scan.
+      const contentBytes = Buffer.byteLength(current.content, 'utf8');
+      if (
+        contentBytes > CONSOLIDATION_INPUT_FILE_MAX_BYTES ||
+        totalBytes + contentBytes > CONSOLIDATION_INPUT_TOTAL_MAX_BYTES
+      ) {
+        excludedPaths.push(relative);
+        continue;
+      }
+      totalBytes += contentBytes;
+      files.push({
+        path: relative,
+        content: current.content,
+        owned: CONSOLIDATION_HEADER_PATTERN.test(current.content.split('\n', 1)[0] ?? ''),
+      });
+    }
+  }
+  return { files, excludedPaths };
 }
 
 export function selectGeneratedMemoryForPrompt(content: string, query: string): string {
@@ -388,8 +546,11 @@ export class MemoryCuratorWorker {
 
   async runOne(nowMs = Date.now(), signal?: AbortSignal): Promise<MemoryCuratorRunReport | null> {
     const owner = `memory-curator-${this.deps.uuid()}`;
-    const maintenance = await this.runMaintenance(owner, nowMs);
-    if (maintenance !== undefined) return maintenance;
+    // Admission and credential selection gate maintenance the same way they
+    // gate episodes (P2-AC13) — a maintenance job's model call is otherwise
+    // unaccounted and unabortable, which is exactly the gap P2.4 item 9
+    // closes. A tail that turns out empty still makes zero model calls
+    // either way, same as an episode whose claimed messages turn out empty.
     const admission = this.deps.admission(nowMs);
     if (!admission.allowed) {
       logAdmissionExhausted(nowMs, admission);
@@ -405,6 +566,8 @@ export class MemoryCuratorWorker {
       });
       return null;
     }
+    const maintenanceJob = this.deps.claimMaintenance(owner, nowMs);
+    if (maintenanceJob) return this.runMaintenanceJob(maintenanceJob, nowMs, credentials, signal);
     const episode = this.deps.claim(owner, nowMs);
     if (!episode) return null;
     const started = Date.now();
@@ -546,19 +709,146 @@ export class MemoryCuratorWorker {
     }
   }
 
-  private async runMaintenance(owner: string, nowMs: number): Promise<MemoryCuratorRunReport | null | undefined> {
-    const job = this.deps.claimMaintenance(owner, nowMs);
-    if (!job) return undefined;
+  /**
+   * P2.4 items 1, 7, 8, 9: the consolidation pass. Runs through the same
+   * admission/credential/failover/abort machinery episodes use — the caller
+   * (runOne) has already gated admission and credential selection before
+   * claiming this job. An empty tail is a real maintenance_noop with zero
+   * model calls; a non-empty tail always calls the model, even when it ends
+   * up proposing zero files (P2-AC7 — those are distinct outcomes).
+   */
+  private async runMaintenanceJob(
+    job: MemoryMaintenanceJob,
+    nowMs: number,
+    credentials: ClaudeCredentialSlot[],
+    signal?: AbortSignal,
+  ): Promise<MemoryCuratorRunReport | null> {
     const started = Date.now();
+    let callId: string | null = null;
+    let outcome = 'failed';
     try {
-      const generated = this.deps.readGenerated(job.workgroupId);
-      if (!this.deps.completeMaintenance(job, nowMs)) throw new Error('memory maintenance lost its lease');
+      const tail = this.deps.consolidationTail(job.workgroupId);
+      if (tail.facts.length === 0) {
+        if (!this.deps.completeMaintenance(job, nowMs, false)) throw new Error('memory maintenance lost its lease');
+        return {
+          workgroupId: job.workgroupId,
+          episodeKey: 'maintenance',
+          action: 'maintenance_noop',
+          messageCount: 0,
+          transcriptChars: 0,
+          elapsedMs: Date.now() - started,
+        };
+      }
+      const scan = this.deps.scanTopicFiles(job.workgroupId);
+      if (scan.excludedPaths.length > 0) {
+        log.warn('memory-curator: over-cap topic files excluded and locked for this pass', {
+          workgroupId: job.workgroupId,
+          excludedPaths: scan.excludedPaths,
+        });
+      }
+      const prompt = buildConsolidationPrompt({
+        workgroupId: job.workgroupId,
+        tail: tail.facts,
+        topicFiles: scan.files,
+        boundary: this.deps.uuid().replaceAll('-', ''),
+      });
+      const attempt = await this.runModelWithFailover(
+        'memory-consolidator',
+        job.workgroupId,
+        credentials,
+        nowMs,
+        (slot) => this.deps.consolidate(prompt.system, prompt.user, slot, signal),
+      );
+      callId = attempt.callId;
+      // The failover loop only checks the signal WHILE a model call is in
+      // flight (a rejecting consolidate() call); nothing downstream of a
+      // successful return re-checks it. Re-check at each further step that
+      // does real work, so an abort after the model responds still stops
+      // writes rather than completing them anyway.
+      signal?.throwIfAborted();
+      // Batch-level validation (path, per-file size on header+content, max
+      // file count) BEFORE any write — a rejected batch writes nothing.
+      const validated = validateConsolidationFiles(attempt.result.decision, tail.facts.length);
+      // Locked = over-cap (never read) UNION presented-but-not-owned (read as
+      // context only). The latter matters even if the file vanishes from
+      // disk mid-pass: the model was TOLD it was human-authored and must
+      // still be refused, not silently allowed once there's nothing left on
+      // disk to fail an ownership-header check against.
+      const lockedPaths = new Set([
+        ...scan.excludedPaths,
+        ...scan.files.filter((file) => !file.owned).map((file) => file.path),
+      ]);
+      const ownedByPath = new Map(scan.files.filter((file) => file.owned).map((file) => [file.path, file]));
+      for (const file of validated) {
+        if (lockedPaths.has(file.path)) {
+          throw new Error(`memory consolidation attempted to write a locked topic file: ${file.path}`);
+        }
+      }
+      for (const file of validated) {
+        signal?.throwIfAborted();
+        // A brand-new path has no prior content → create-only (null). An
+        // owned existing path's expected hash is the content this pass
+        // actually read, so a sibling write mid-pass surfaces as a conflict
+        // rather than silently overwriting it.
+        const priorContent = ownedByPath.get(file.path)?.content;
+        const expectedSha256 = priorContent === undefined ? null : generatedMemorySha(priorContent);
+        const write = await this.deps.writeTopicFile(
+          job.workgroupId,
+          file.path,
+          file.content,
+          expectedSha256,
+          tail.facts.length,
+        );
+        if (write.status !== 'success') {
+          throw new Error(`memory topic write ${write.status}: ${write.error ?? 'unknown'}`);
+        }
+      }
+      // completeMaintenance is the owner-conditioned atomic check (its SQL
+      // is `WHERE workgroup_id = ? AND lease_owner = ?`), so it MUST run
+      // before markConsolidated: if the lease was lost mid-pass — another
+      // worker reclaimed after ours expired — completeMaintenance returns
+      // false and this throws without ever marking anything consolidated.
+      // Ids can never be marked against a lease this worker no longer owns.
+      // (failMaintenance in the catch below is then a harmless no-op — its
+      // SQL is equally owner-conditioned, so it can't touch a lease someone
+      // else now holds.)
+      //
+      // Crash window: if the process dies between completeMaintenance
+      // succeeding and markConsolidated running below, the facts are WRITTEN
+      // but never MARKED. That is the safe direction — at-least-once, not
+      // at-most-once: the same facts are simply re-presented as the tail on
+      // the next trigger, the model reads topic files that already reflect
+      // them (the writes were CAS'd against their own current content, so
+      // nothing double-applies), and a correct model converges to
+      // `files: []` — which itself marks the tail on that next pass.
+      signal?.throwIfAborted();
+      if (!this.deps.completeMaintenance(job, nowMs, tail.hasMore)) {
+        throw new Error('memory maintenance lost its lease');
+      }
+      this.deps.markConsolidated(
+        job.workgroupId,
+        tail.facts.map((fact) => fact.id),
+      );
+      outcome = 'maintenance_written';
+      if (validated.length === 0) {
+        // Distinct from the empty-tail noop above: real facts were
+        // consolidated, the model just judged no topic file needed a change.
+        log.info('memory-curator: consolidation pass wrote zero files for a non-empty tail', {
+          workgroupId: job.workgroupId,
+          factCount: tail.facts.length,
+        });
+      }
       return {
         workgroupId: job.workgroupId,
         episodeKey: 'maintenance',
-        action: 'maintenance_noop',
+        action: 'maintenance_written',
+        fileCount: validated.length,
         messageCount: 0,
-        transcriptChars: generated.content.length,
+        transcriptChars: 0,
+        model: attempt.result.model,
+        effort: MEMORY_CURATOR_EFFORT,
+        credentialSlot: attempt.result.credentialSlot,
+        usage: attempt.result.usage,
         elapsedMs: Date.now() - started,
       };
     } catch (error) {
@@ -569,6 +859,8 @@ export class MemoryCuratorWorker {
         error: error instanceof Error ? error.message : String(error),
       });
       return null;
+    } finally {
+      if (callId) this.deps.finishCall(callId, outcome);
     }
   }
 

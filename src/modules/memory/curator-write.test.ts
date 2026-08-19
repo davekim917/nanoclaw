@@ -22,9 +22,11 @@ vi.mock('../../config.js', async (importOriginal) => ({
 import {
   listGeneratedMemorySnapshots,
   readGeneratedMemory,
+  readMemoryTopicFile,
   resolveBunBinary,
   restoreGeneratedMemorySnapshot,
   writeGeneratedMemory,
+  writeMemoryTopicFile,
 } from './curator-write.js';
 import { GENERATED_MEMORY_MAX_BYTES } from './curator-contract.js';
 
@@ -209,5 +211,77 @@ describe('host generated-memory writer', () => {
     expect(declared).not.toBeNull();
     const helperBytes = Number(declared![1]!.replace(/_/g, '')) * 1024;
     expect(helperBytes).toBeGreaterThanOrEqual(GENERATED_MEMORY_MAX_BYTES + 16 * 1024);
+  });
+});
+
+describe('host topic-file writer', () => {
+  // P2-AC3. Each forbidden path class asserted independently — a batch test
+  // that only checks the first violation would miss a regression on any
+  // later case.
+  it('writeMemoryTopicFile rejects each forbidden path class independently', async () => {
+    const forbidden = [
+      '../escape.md',
+      'generated/memory.md',
+      'preferences/p.md',
+      'system/x.md',
+      'people/a/b.md',
+      '/people/absolute.md',
+      'People/X.md',
+    ];
+    for (const relativePath of forbidden) {
+      const result = await writeMemoryTopicFile(TEST_WORKGROUP, relativePath, '# X\n', null, 1);
+      expect(result.status).toBe('error');
+    }
+    expect(fs.readdirSync(path.join(TEST_ROOT, 'workgroups', TEST_WORKGROUP, 'memory'))).toEqual(['generated']);
+  });
+
+  // P2-AC10. Ownership is the header-pattern check (P2-I6): an existing file
+  // with no header is never a write target, but a new path in the same
+  // directory is unaffected.
+  it('writeMemoryTopicFile refuses to overwrite a file lacking the ownership header', async () => {
+    const peopleDir = path.join(TEST_ROOT, 'workgroups', TEST_WORKGROUP, 'memory', 'people');
+    fs.mkdirSync(peopleDir, { recursive: true });
+    fs.writeFileSync(path.join(peopleDir, 'roster.md'), '# Human-authored roster\n\nMaya - liaison.\n');
+
+    const overwrite = await writeMemoryTopicFile(TEST_WORKGROUP, 'people/roster.md', '# Roster\n', null, 1);
+    expect(overwrite.status).toBe('error');
+    expect(fs.readFileSync(path.join(peopleDir, 'roster.md'), 'utf8')).toBe(
+      '# Human-authored roster\n\nMaya - liaison.\n',
+    );
+
+    const created = await writeMemoryTopicFile(TEST_WORKGROUP, 'people/new-entity.md', '# New\n', null, 1);
+    expect(created.status).toBe('success');
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/new-entity.md').content).toBe(
+      '<!-- consolidated: facts=1 -->\n# New\n',
+    );
+  });
+
+  it('creates the topic directory on first write and stamps the consolidation header', async () => {
+    expect(fs.existsSync(path.join(TEST_ROOT, 'workgroups', TEST_WORKGROUP, 'memory', 'domain'))).toBe(false);
+    const created = await writeMemoryTopicFile(TEST_WORKGROUP, 'domain/pricing.md', '# Pricing\n', null, 3);
+    expect(created.status).toBe('success');
+    const domainDir = path.join(TEST_ROOT, 'workgroups', TEST_WORKGROUP, 'memory', 'domain');
+    expect(fs.lstatSync(domainDir).isDirectory()).toBe(true);
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'domain/pricing.md').content).toBe(
+      '<!-- consolidated: facts=3 -->\n# Pricing\n',
+    );
+  });
+
+  it('CAS-protects an owned topic file update the same way as generated memory', async () => {
+    await writeMemoryTopicFile(TEST_WORKGROUP, 'systems/pipeline.md', '# Pipeline v1\n', null, 1);
+    const current = readMemoryTopicFile(TEST_WORKGROUP, 'systems/pipeline.md');
+    const stale = await writeMemoryTopicFile(TEST_WORKGROUP, 'systems/pipeline.md', '# Pipeline stale\n', null, 2);
+    expect(stale.status).toBe('conflict');
+    const updated = await writeMemoryTopicFile(
+      TEST_WORKGROUP,
+      'systems/pipeline.md',
+      '# Pipeline v2\n',
+      current.sha256,
+      2,
+    );
+    expect(updated.status).toBe('success');
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'systems/pipeline.md').content).toBe(
+      '<!-- consolidated: facts=2 -->\n# Pipeline v2\n',
+    );
   });
 });

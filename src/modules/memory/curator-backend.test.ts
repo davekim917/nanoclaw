@@ -10,7 +10,7 @@ import {
   listClaudeStructuredCredentialSlots,
   type ClaudeCliExecFile,
 } from '../../llm.js';
-import { CURATOR_OUTPUT_SCHEMA } from './curator-contract.js';
+import { CONSOLIDATION_OUTPUT_SCHEMA, CURATOR_OUTPUT_SCHEMA } from './curator-contract.js';
 import {
   type CuratorModelCall,
   MEMORY_CURATOR_EFFORT,
@@ -45,6 +45,32 @@ describe('memory curator backend', () => {
     });
     expect(call.mock.calls[0]![1]).toEqual({ credentialSlot: 'oauth:primary' });
     expect(result.decision.action).toBe('noop');
+  });
+
+  // P2-AC12: production constrained decoding must request the CONSOLIDATION
+  // schema, not the episode schema — a mocked worker test alone cannot catch
+  // this, since it never touches the real request object this asserts on.
+  it('MemoryCuratorBackend.consolidate passes the consolidation schema to the structured-call layer', async () => {
+    const call = vi.fn(async (request, _options?: { credentialSlot?: string }) => ({
+      value: { files: [] },
+      model: request.model,
+      credentialSlot: 'oauth:2' as const,
+      usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    }));
+    const result = await new MemoryCuratorBackend(call as unknown as CuratorModelCall).consolidate(
+      'system',
+      'user',
+      'oauth:primary',
+    );
+    expect(call).toHaveBeenCalledOnce();
+    expect(call.mock.calls[0]![0]).toMatchObject({
+      model: MEMORY_CURATOR_MODEL,
+      effort: MEMORY_CURATOR_EFFORT,
+      schema: CONSOLIDATION_OUTPUT_SCHEMA,
+    });
+    expect(call.mock.calls[0]![0].schema).not.toBe(CURATOR_OUTPUT_SCHEMA);
+    expect(call.mock.calls[0]![1]).toEqual({ credentialSlot: 'oauth:primary' });
+    expect(result.decision.files).toEqual([]);
   });
 
   it('discovers ordered unique OAuth slots without mixing in API billing', () => {

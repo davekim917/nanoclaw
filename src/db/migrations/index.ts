@@ -53,6 +53,7 @@ import { migration047 } from './047-usage-daily.js';
 import { migration048 } from './048-task-thread-anchors.js';
 import { migration049 } from './049-unique-active-session-triple.js';
 import { migration050 } from './050-observatory-item-threads.js';
+import { migration051 } from './051-memory-consolidated-facts.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -124,6 +125,7 @@ export const migrations: Migration[] = [
   migration048,
   migration049,
   migration050,
+  migration051,
   containerConfigs,
   cliScope,
   messagingGroupInstance,

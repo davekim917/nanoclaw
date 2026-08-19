@@ -1251,6 +1251,46 @@ describe('fact marker reason field (P0-AC6)', () => {
   });
 });
 
+// P2-AC8. Topic files under people/domain/systems are ordinary memory
+// Markdown with no recall-path code change (P2-I5) — this test is the
+// guard-by-construction proof. Does not assert full-file delivery: only
+// three ranked file excerpts survive per turn (PRE_TURN_BOUNDS.markdownExcerpts).
+describe('topic-file recall (P2-AC8)', () => {
+  it('topic files reach recall through the file lane, across all three directories', () => {
+    memoryFile(
+      'people/maya-chen.md',
+      '<!-- consolidated: facts=1 -->\n# Maya Chen\n\nMaya Chen is the client liaison for Acme.\n',
+    );
+    memoryFile(
+      'domain/acme-pricing.md',
+      '<!-- consolidated: facts=1 -->\n# Acme pricing\n\nAcme pricing tiers follow usage-based billing.\n',
+    );
+    memoryFile(
+      'systems/nightly-pipeline.md',
+      '<!-- consolidated: facts=1 -->\n# Nightly pipeline\n\nThe nightly pipeline loads Acme data into Snowflake.\n',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({
+        text: 'Maya Chen Acme pricing tiers usage-based billing nightly pipeline Snowflake',
+      }),
+      includeBootstrap: false,
+    });
+
+    const byPath = new Map(result.memoryEvidence.excerpts.map((row) => [row.path, row.text]));
+    expect([...byPath.keys()]).toEqual(
+      expect.arrayContaining(['people/maya-chen.md', 'domain/acme-pricing.md', 'systems/nightly-pipeline.md']),
+    );
+    expect(byPath.get('people/maya-chen.md')).toContain('Maya Chen is the client liaison for Acme.');
+    expect(byPath.get('domain/acme-pricing.md')).toContain('Acme pricing tiers follow usage-based billing.');
+    expect(byPath.get('systems/nightly-pipeline.md')).toContain('The nightly pipeline loads Acme data into Snowflake.');
+  });
+});
+
 describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
   const ASK = 'Can you help me build a practice app about losophe?';
 

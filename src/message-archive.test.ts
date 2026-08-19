@@ -431,6 +431,57 @@ describe('memory curation episode queue', () => {
     expect(claimMemoryMaintenance('done', { nowMs: now + 2000 })).toBeNull();
   });
 
+  // P2-AC15. completeMemoryMaintenance used to zero the counter unconditionally,
+  // erasing updates accepted while the lease was held. It now subtracts the
+  // job's claim-time snapshot (floored at 0), and a caller can reassert
+  // maintenance_pending immediately when a pass leaves the consolidation tail
+  // non-empty, instead of waiting for MEMORY_MAINTENANCE_UPDATE_THRESHOLD more
+  // updates to accrue.
+  it("completeMemoryMaintenance subtracts the job's snapshot count and reasserts pending on a remaining tail", () => {
+    const now = Date.parse('2026-07-26T12:00:00.000Z');
+    for (let i = 0; i < 29; i++) recordAcceptedGeneratedMemory('wg-a', 10, { nowMs: now });
+    // 30th call forces maintenance_pending via the size branch (well under the
+    // 50-update threshold) so the counter lands on exactly 30, matching the AC.
+    recordAcceptedGeneratedMemory('wg-a', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now });
+    const job = claimMemoryMaintenance('worker-1', { nowMs: now });
+    expect(job).toMatchObject({ workgroupId: 'wg-a', acceptedUpdates: 30 });
+    for (let i = 0; i < 10; i++) recordAcceptedGeneratedMemory('wg-a', 10, { nowMs: now + 1 });
+    expect(completeMemoryMaintenance(job!, { nowMs: now + 2 })).toBe(true);
+
+    // Floor-not-zero: 30 subtracted from (30 + 10) leaves 10, not 0. Read it
+    // back by forcing the workgroup pending again (size-threshold branch, which
+    // also increments the counter by one) and re-claiming.
+    recordAcceptedGeneratedMemory('wg-a', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now + 3 });
+    const after = claimMemoryMaintenance('worker-2', { nowMs: now + 3 });
+    expect(after).toMatchObject({ workgroupId: 'wg-a', acceptedUpdates: 11 });
+    expect(completeMemoryMaintenance(after!, { nowMs: now + 4 })).toBe(true);
+
+    // Reassert: a pass that leaves the tail non-empty re-arms immediately,
+    // without waiting for the threshold.
+    recordAcceptedGeneratedMemory('wg-b', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now });
+    const jobB = claimMemoryMaintenance('worker-3', { nowMs: now });
+    expect(completeMemoryMaintenance(jobB!, { nowMs: now + 1, reassertPending: true })).toBe(true);
+    expect(claimMemoryMaintenance('worker-4', { nowMs: now + 1 })).toMatchObject({ workgroupId: 'wg-b' });
+
+    // F1 finding: a stale `reassertPending: false` (this pass's own tail WAS
+    // fully drained) must not clobber a re-arm mid-pass accrual independently
+    // earned. Claim with a 30-update snapshot, accrue 60 more while the lease
+    // is held (90 total), complete with reassertPending: false — the floored
+    // counter is 90 - 30 = 60, which is >= MEMORY_MAINTENANCE_UPDATE_THRESHOLD
+    // (50), so pending must still be 1, and the persisted counter must read
+    // 60 (not 0, not 90).
+    recordAcceptedGeneratedMemory('wg-c', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now });
+    for (let i = 0; i < 29; i++) recordAcceptedGeneratedMemory('wg-c', 10, { nowMs: now });
+    const jobC = claimMemoryMaintenance('worker-5', { nowMs: now });
+    expect(jobC).toMatchObject({ workgroupId: 'wg-c', acceptedUpdates: 30 });
+    for (let i = 0; i < 60; i++) recordAcceptedGeneratedMemory('wg-c', 10, { nowMs: now + 1 });
+    expect(completeMemoryMaintenance(jobC!, { nowMs: now + 2, reassertPending: false })).toBe(true);
+    expect(claimMemoryMaintenance('worker-6', { nowMs: now + 2 })).toMatchObject({
+      workgroupId: 'wg-c',
+      acceptedUpdates: 60,
+    });
+  });
+
   it('keeps the maintenance size threshold mirrored on the generated-memory warn line', async () => {
     // The constant is hand-mirrored because importing curator-contract here
     // would close a runtime cycle. Left stale it fires every sweep for any
