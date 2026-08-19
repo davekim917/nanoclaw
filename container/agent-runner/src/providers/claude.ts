@@ -1901,6 +1901,13 @@ export class ClaudeProvider implements AgentProvider {
       // and SDKResultError carry usage/total_cost_usd/modelUsage — the
       // existing narrow-cast pattern below (`m = message as {...}`) already
       // sidesteps the subtype union for `result`/`is_error`; this reuses it.
+      type ResultModelUsage = {
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadInputTokens?: number;
+        cacheCreationInputTokens?: number;
+        costUSD?: number;
+      };
       function extractUsage(m: {
         usage?: {
           input_tokens?: number | null;
@@ -1909,14 +1916,26 @@ export class ClaudeProvider implements AgentProvider {
           cache_read_input_tokens?: number | null;
         };
         total_cost_usd?: number;
-        modelUsage?: Record<string, unknown>;
-      }): TurnUsageInfo {
-        const modelKeys = m.modelUsage ? Object.keys(m.modelUsage) : [];
+        modelUsage?: Record<string, ResultModelUsage>;
+      }): TurnUsageInfo | TurnUsageInfo[] {
+        const modelEntries = m.modelUsage ? Object.entries(m.modelUsage) : [];
+        // modelUsage is keyed by model and carries its own per-model
+        // tokens/cost — a turn spanning multiple models (Opus parent +
+        // Sonnet subagents) gets one attributed row per model instead of
+        // being collapsed under a NULL model (Fleet Hardening Phase 0.1
+        // follow-up: this used to hide $718/$393 of daily spend).
+        if (modelEntries.length > 1) {
+          return modelEntries.map(([model, u]) => ({
+            model,
+            inputTokens: u.inputTokens ?? null,
+            outputTokens: u.outputTokens ?? null,
+            cacheReadTokens: u.cacheReadInputTokens ?? null,
+            cacheWriteTokens: u.cacheCreationInputTokens ?? null,
+            costUsd: typeof u.costUSD === 'number' ? u.costUSD : null,
+          }));
+        }
         return {
-          // modelUsage is keyed by model; only trust it when the turn used
-          // exactly one — a subagent turn spanning multiple models has no
-          // single "the model" to report, so leave it NULL rather than guess.
-          model: modelKeys.length === 1 ? modelKeys[0] : null,
+          model: modelEntries.length === 1 ? modelEntries[0][0] : null,
           inputTokens: m.usage?.input_tokens ?? null,
           outputTokens: m.usage?.output_tokens ?? null,
           cacheReadTokens: m.usage?.cache_read_input_tokens ?? null,
@@ -1978,7 +1997,7 @@ export class ClaudeProvider implements AgentProvider {
               cache_read_input_tokens?: number | null;
             };
             total_cost_usd?: number;
-            modelUsage?: Record<string, unknown>;
+            modelUsage?: Record<string, ResultModelUsage>;
           };
           const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
           // Retry-path guards run FIRST — these turn error text into a throw so

@@ -84,6 +84,28 @@ describe('turn_usage — insert helper', () => {
     const rows = getTurnUsageRows();
     expect(rows.map((r) => r.input_tokens)).toEqual([1, 2, 3]);
   });
+
+  it('a two-model turn (mirroring poll-loop dispatching a TurnUsageInfo[]) writes one attributed row per model summing to the turn total', () => {
+    // Mirrors poll-loop.ts's `for (const usage of Array.isArray(...) ? ... : [...])`
+    // dispatch for a Claude turn whose modelUsage had >1 key (Opus parent +
+    // Sonnet subagent) — each model gets its own row instead of collapsing
+    // under a NULL model.
+    const usageByModel = [
+      { model: 'claude-opus-5', inputTokens: 1000, outputTokens: 200, cacheReadTokens: 50, cacheWriteTokens: 10, costUsd: 0.5 },
+      { model: 'claude-sonnet-5', inputTokens: 3000, outputTokens: 800, cacheReadTokens: 20, cacheWriteTokens: 5, costUsd: 0.3 },
+    ];
+    for (const usage of usageByModel) recordTurnUsage('claude', usage);
+
+    const rows = getTurnUsageRows();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.model)).toEqual(['claude-opus-5', 'claude-sonnet-5']);
+    expect(rows.every((r) => r.model !== null)).toBe(true);
+
+    const sum = (key: 'input_tokens' | 'output_tokens' | 'cost_usd') => rows.reduce((acc, r) => acc + (r[key] ?? 0), 0);
+    expect(sum('input_tokens')).toBe(4000);
+    expect(sum('output_tokens')).toBe(1000);
+    expect(sum('cost_usd')).toBeCloseTo(0.8, 10);
+  });
 });
 
 describe('turn_usage — table creation (real files, not the in-memory test mode)', () => {

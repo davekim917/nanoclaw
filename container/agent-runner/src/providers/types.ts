@@ -285,9 +285,11 @@ export type ProviderEvent =
    * poll-loop uses it to surface the result text to the user instead of
    * dropping it as un-wrapped scratchpad, and to skip the re-wrap nudge.
    * `usage` carries whatever token/cost accounting the provider exposed for
-   * this turn — see TurnUsageInfo.
+   * this turn — see TurnUsageInfo. An array means the turn spanned multiple
+   * models (e.g. Opus parent + Sonnet subagents) — one entry per model,
+   * each attributed separately rather than collapsed under a NULL model.
    */
-  | { type: 'result'; text: string | null; isError?: boolean; usage?: TurnUsageInfo }
+  | { type: 'result'; text: string | null; isError?: boolean; usage?: TurnUsageInfo | TurnUsageInfo[] }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**
