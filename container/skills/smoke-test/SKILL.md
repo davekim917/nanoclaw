@@ -455,12 +455,18 @@ When the deployment configures an issue tracker, each confirmed finding gets one
 issue there and the tracker — not a chat thread — is the cross-run record. Three
 rules make it consistent with the lifecycle above:
 
-- **The coordinator closes the issue, and only at `verified`.** A fix PR
-  references the issue (`Refs #N`), never with a closing keyword: auto-close on
-  merge records `fixed` as `verified` and lets the implementer certify its own
-  work, which this skill forbids. Tracker state then needs no status labels —
-  open with no linked PR means unfixed, open with a merged PR means awaiting
-  re-verification, closed means verified on a deployed build.
+- **A merged fix closes the issue; the coordinator verifies afterwards and
+  reopens failures.** The fix PR carries a closing keyword (`Closes #N`, one per
+  issue — a comma-joined list closes only the first), so the merge closes the
+  finding. That close means `fixed`, never `verified`: the coordinator re-runs
+  the recorded reproduction on the deployed build, records the evidence on the
+  issue and marks it verified, or reopens it with the evidence when it still
+  reproduces. **The implementer never certifies their own work** — that rule is
+  unchanged; it binds who VERIFIES rather than who closes. Tracker state then
+  needs no status labels — open means unfixed, closed-and-unmarked means fixed
+  and awaiting verification, closed-and-marked-after-that-close means verified
+  on a deployed build. Every close carries a pending verification, so a closed
+  issue is never a silently erased defect.
 - **Classify regression versus gap at filing time.** A regression has evidence
   of prior working behavior and may be fixed autonomously. A gap — behavior
   never specified — is a product decision: mark it as such and do not hand it
