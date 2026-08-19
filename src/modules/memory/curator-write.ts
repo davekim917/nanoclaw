@@ -5,7 +5,15 @@ import { fileURLToPath } from 'url';
 
 import { DATA_DIR } from '../../config.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
-import { GENERATED_MEMORY_MAX_BYTES, GENERATED_MEMORY_RELATIVE_PATH, generatedMemorySha } from './curator-contract.js';
+import {
+  CONSOLIDATION_FILE_MAX_BYTES,
+  CONSOLIDATION_HEADER_PATTERN,
+  consolidationHeader,
+  GENERATED_MEMORY_MAX_BYTES,
+  GENERATED_MEMORY_RELATIVE_PATH,
+  generatedMemorySha,
+  TOPIC_FILE_PATH_PATTERN,
+} from './curator-contract.js';
 
 const HELPER_PATH = fileURLToPath(
   new URL('../../../container/agent-runner/src/mcp-tools/memory-write-process-helper.ts', import.meta.url),
@@ -50,7 +58,13 @@ function generatedPath(workgroupId: string): string {
   return path.join(workgroupMemoryDir(workgroupId), GENERATED_MEMORY_RELATIVE_PATH);
 }
 
-function ensureGeneratedDirectory(workgroupId: string): void {
+/**
+ * Create `<memory root>/<subdirRelative first segment>` if absent, with the
+ * same symlink/canonical-path discipline `generated/` has always used.
+ * Shared by the generated-memory writer and the topic-file writer (P2.7 step
+ * 3: "same symlink checks as ensureGeneratedDirectory").
+ */
+function ensureMemorySubdirectory(workgroupId: string, subdirRelative: string): void {
   const memoryRoot = workgroupMemoryDir(workgroupId);
   const workgroupRoot = path.dirname(memoryRoot);
   const memoryStat = fs.lstatSync(memoryRoot);
@@ -61,45 +75,45 @@ function ensureGeneratedDirectory(workgroupId: string): void {
     workgroupStat.isSymbolicLink() ||
     !workgroupStat.isDirectory()
   ) {
-    throw new Error('generated memory requires an ordinary canonical workgroup memory directory');
+    throw new Error('memory write requires an ordinary canonical workgroup memory directory');
   }
   const canonicalWorkgroupRoot = fs.realpathSync(workgroupRoot);
   const canonicalMemoryRoot = fs.realpathSync(memoryRoot);
   if (path.dirname(canonicalMemoryRoot) !== canonicalWorkgroupRoot) {
-    throw new Error('generated memory root escapes the canonical workgroup directory');
+    throw new Error('memory root escapes the canonical workgroup directory');
   }
 
-  const generatedDir = path.join(memoryRoot, path.dirname(GENERATED_MEMORY_RELATIVE_PATH));
+  const subdir = path.join(memoryRoot, path.dirname(subdirRelative));
   try {
-    fs.mkdirSync(generatedDir, { mode: 0o700 });
+    fs.mkdirSync(subdir, { mode: 0o700 });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
-  const generatedStat = fs.lstatSync(generatedDir);
-  if (generatedStat.isSymbolicLink() || !generatedStat.isDirectory()) {
-    throw new Error('generated memory parent must be an ordinary directory');
+  const subdirStat = fs.lstatSync(subdir);
+  if (subdirStat.isSymbolicLink() || !subdirStat.isDirectory()) {
+    throw new Error('memory write parent must be an ordinary directory');
   }
-  if (path.dirname(fs.realpathSync(generatedDir)) !== canonicalMemoryRoot) {
-    throw new Error('generated memory parent escapes the canonical memory root');
+  if (path.dirname(fs.realpathSync(subdir)) !== canonicalMemoryRoot) {
+    throw new Error('memory write parent escapes the canonical memory root');
   }
 }
 
-function readTrustedBoundedFile(target: string, trustedRoot: string): string {
+function readTrustedBoundedFile(target: string, trustedRoot: string, maxBytes = GENERATED_MEMORY_MAX_BYTES): string {
   const canonicalRoot = fs.realpathSync(trustedRoot);
   const fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   try {
     const opened = fs.fstatSync(fd);
-    if (!opened.isFile() || opened.size > GENERATED_MEMORY_MAX_BYTES) {
-      throw new Error('generated memory must be a bounded regular file');
+    if (!opened.isFile() || opened.size > maxBytes) {
+      throw new Error('memory file must be a bounded regular file');
     }
     const resolved = fs.realpathSync(target);
     const relative = path.relative(canonicalRoot, resolved);
     if (relative.startsWith('..') || path.isAbsolute(relative)) {
-      throw new Error('generated memory escapes its trusted root');
+      throw new Error('memory file escapes its trusted root');
     }
     const resolvedStat = fs.statSync(resolved);
     if (opened.dev !== resolvedStat.dev || opened.ino !== resolvedStat.ino) {
-      throw new Error('generated memory changed while it was opened');
+      throw new Error('memory file changed while it was opened');
     }
     return fs.readFileSync(fd, 'utf8');
   } finally {
@@ -116,6 +130,70 @@ export function readGeneratedMemory(workgroupId: string): { content: string; sha
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { content: '', sha256: null };
     throw error;
   }
+}
+
+/** Read a topic file (people/domain/systems) for ownership and CAS checks. */
+export function readMemoryTopicFile(
+  workgroupId: string,
+  relativePath: string,
+): { content: string; sha256: string | null } {
+  const target = path.join(workgroupMemoryDir(workgroupId), relativePath);
+  try {
+    const content = readTrustedBoundedFile(target, workgroupMemoryDir(workgroupId));
+    return { content, sha256: generatedMemorySha(content) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { content: '', sha256: null };
+    throw error;
+  }
+}
+
+/**
+ * Writes ONE curator-owned topic file (people/domain/systems). Host-side
+ * validation the model is never trusted to have honored itself: the path
+ * must match TOPIC_FILE_PATH_PATTERN, and the final serialized content —
+ * `content` header-prepended, since the header is appended BEFORE this check
+ * (P2.4 item 7) — must fit CONSOLIDATION_FILE_MAX_BYTES. Refuses to overwrite
+ * any existing file whose first line does not carry the consolidation header
+ * (P2-I6): a human-authored or unmarked file is never a write target no
+ * matter what the model returned. `factsCount` is this pass's tail size,
+ * stamped into the header as its own audit trail.
+ */
+export async function writeMemoryTopicFile(
+  workgroupId: string,
+  relativePath: string,
+  content: string,
+  expectedSha256: string | null,
+  factsCount: number,
+): Promise<CuratorWriteResult> {
+  if (!TOPIC_FILE_PATH_PATTERN.test(relativePath)) {
+    return { status: 'error', relative_path: relativePath, error: 'topic file path is not allowed' };
+  }
+  const finalContent = `${consolidationHeader(factsCount)}\n${content}`;
+  if (Buffer.byteLength(finalContent, 'utf8') > CONSOLIDATION_FILE_MAX_BYTES) {
+    return {
+      status: 'error',
+      relative_path: relativePath,
+      error: `topic file exceeds ${CONSOLIDATION_FILE_MAX_BYTES} bytes`,
+    };
+  }
+  ensureMemorySubdirectory(workgroupId, relativePath);
+  const current = readMemoryTopicFile(workgroupId, relativePath);
+  if (current.sha256 !== null && !CONSOLIDATION_HEADER_PATTERN.test(current.content.split('\n', 1)[0] ?? '')) {
+    return { status: 'error', relative_path: relativePath, error: 'topic file is not owned by consolidation' };
+  }
+  if (current.sha256 !== expectedSha256) {
+    return {
+      status: 'conflict',
+      relative_path: relativePath,
+      error: 'expected_sha256 does not match the current file',
+    };
+  }
+  return await invokeHelper({
+    rootDir: workgroupMemoryDir(workgroupId),
+    relativePath,
+    content: finalContent,
+    expectedSha256,
+  });
 }
 
 function historyDir(workgroupId: string): string {
@@ -210,7 +288,7 @@ export async function writeGeneratedMemory(
   if (Buffer.byteLength(content, 'utf8') > GENERATED_MEMORY_MAX_BYTES) {
     throw new Error(`generated memory exceeds ${GENERATED_MEMORY_MAX_BYTES} bytes`);
   }
-  ensureGeneratedDirectory(workgroupId);
+  ensureMemorySubdirectory(workgroupId, GENERATED_MEMORY_RELATIVE_PATH);
   const current = readGeneratedMemory(workgroupId);
   if (current.sha256 !== expectedSha256) {
     return {
