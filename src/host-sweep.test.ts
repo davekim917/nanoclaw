@@ -21,8 +21,16 @@ import {
   SESSION_ARTIFACT_IDLE_MS,
   SPAWN_GRACE_MS,
   WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+  PROVIDER_HEAL_COOLDOWN_MS,
+  PROVIDER_HEAL_MAX_ATTEMPTS,
   _applyCeilingFollowUpForTesting,
   _hasWorkContinuationForTesting,
+  _resetProviderHealTicksForTesting,
+  _sweepProviderHealForTesting,
+  countProviderHealAttemptsSinceRealInbound,
+  decideProviderHeal,
+  notifyProviderHealParked,
+  observeProviderStatus,
   _notifyKillCeilingForTesting,
   _prepareDueWakeForTesting,
   _resetStuckProcessingRowsForTesting,
@@ -58,6 +66,44 @@ import type { Session } from './types.js';
 // These mocks are hoisted and only affect tests that use them. The existing
 // decideStuckAction / resetStuckProcessingRows tests are pure and don't invoke
 // these imports, so they are unaffected.
+
+// Shadow-mode flag. host-sweep captures SELF_HEAL_ENABLED as a module-level
+// const, so the mock exposes it as a getter over a mutable box that individual
+// tests flip via armSelfHeal().
+const selfHeal = vi.hoisted(() => ({ enabled: false }));
+vi.mock('./config.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./config.js')>();
+  return {
+    ...real,
+    get SELF_HEAL_ENABLED() {
+      return selfHeal.enabled;
+    },
+  };
+});
+
+function armSelfHeal(enabled: boolean): void {
+  selfHeal.enabled = enabled;
+}
+
+const mockKillContainer = vi.fn();
+const mockReadContainerConfig = vi.fn();
+const mockMarkProviderUnavailable = vi.fn();
+
+vi.mock('./container-config.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./container-config.js')>();
+  return {
+    ...real,
+    readContainerConfig: (...args: unknown[]) => mockReadContainerConfig(...args),
+  };
+});
+
+vi.mock('./db/provider-health.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./db/provider-health.js')>();
+  return {
+    ...real,
+    markProviderUnavailable: (...args: unknown[]) => mockMarkProviderUnavailable(...args),
+  };
+});
 
 const mockGetActiveTasks = vi.fn();
 const mockTransitionToTerminal = vi.fn();
@@ -110,6 +156,7 @@ vi.mock('./container-runner.js', async (importOriginal) => {
     isContainerRunning: (...args: unknown[]) => mockIsContainerRunning(...args),
     hasContainerEverRun: (...args: unknown[]) => mockHasContainerEverRun(...args),
     wakeContainer: (...args: unknown[]) => mockWakeContainer(...args),
+    killContainer: (...args: unknown[]) => mockKillContainer(...args),
   };
 });
 
@@ -450,12 +497,73 @@ describe('decideCeilingFollowUp', () => {
     ).toEqual({ action: 'none' });
   });
 
-  it('rejects stale, future, and malformed tool timestamps', () => {
-    for (const toolStartedAt of [
-      new Date(NOW - ABSOLUTE_CEILING_MS - 1).toISOString(),
-      new Date(NOW + 1).toISOString(),
-      'not-a-time',
-    ]) {
+  // Contract change (owner-approved): the bound is the ceiling that actually
+  // fired plus one sweep interval, not ABSOLUTE_CEILING_MS flat. Starting a
+  // tool emits a provider event which touches the heartbeat, so at kill time
+  // the tool is always at LEAST as old as the heartbeat age that just crossed
+  // the ceiling — the old bound made this branch unreachable and every wedged
+  // tool went dark with no accountability wake.
+  it('wakes for a tool wedged since exactly the ceiling that fired', () => {
+    expect(
+      decideCeilingFollowUp({
+        hasContinuation: false,
+        currentTool: 'Bash',
+        toolStartedAt: new Date(NOW - ABSOLUTE_CEILING_MS - 1).toISOString(),
+        priorToolAttempts: 0,
+        now: NOW,
+        ceilingMs: ABSOLUTE_CEILING_MS,
+      }),
+    ).toEqual({ action: 'wake-accountable', reason: 'tool' });
+  });
+
+  // The sweep-lag slack belongs to the kill path only. host-restart-warn asks
+  // "is a tool in flight right now" against live state and omits ceilingMs, so
+  // it must keep the plain ABSOLUTE_CEILING_MS freshness window.
+  it('keeps the un-widened freshness window when no ceiling is supplied', () => {
+    expect(
+      decideCeilingFollowUp({
+        hasContinuation: false,
+        currentTool: 'Bash',
+        toolStartedAt: new Date(NOW - ABSOLUTE_CEILING_MS - 1).toISOString(),
+        priorToolAttempts: 0,
+        now: NOW,
+      }),
+    ).toEqual({ action: 'none' });
+  });
+
+  it('honors a ceiling widened by the tool’s own declared timeout', () => {
+    const widened = 60 * 60 * 1000;
+    const args = {
+      hasContinuation: false,
+      currentTool: 'Bash' as const,
+      // Detected one sweep tick after a 60-min ceiling elapsed.
+      toolStartedAt: new Date(NOW - widened - 30_000).toISOString(),
+      priorToolAttempts: 0,
+      now: NOW,
+    };
+    expect(decideCeilingFollowUp({ ...args, ceilingMs: widened })).toEqual({
+      action: 'wake-accountable',
+      reason: 'tool',
+    });
+    // Without the widened ceiling the same tool reads as stale garbage.
+    expect(decideCeilingFollowUp(args)).toEqual({ action: 'none' });
+  });
+
+  it('still rejects a tool older than the ceiling plus one sweep interval', () => {
+    expect(
+      decideCeilingFollowUp({
+        hasContinuation: false,
+        currentTool: 'Bash',
+        toolStartedAt: new Date(NOW - ABSOLUTE_CEILING_MS - 60_000 - 1).toISOString(),
+        priorToolAttempts: 0,
+        now: NOW,
+        ceilingMs: ABSOLUTE_CEILING_MS,
+      }),
+    ).toEqual({ action: 'none' });
+  });
+
+  it('rejects future and malformed tool timestamps', () => {
+    for (const toolStartedAt of [new Date(NOW + 1).toISOString(), 'not-a-time']) {
       expect(
         decideCeilingFollowUp({
           hasContinuation: false,
@@ -466,6 +574,19 @@ describe('decideCeilingFollowUp', () => {
         }),
       ).toEqual({ action: 'none' });
     }
+  });
+
+  it('caps a wedged tool at the ceiling once the attempt budget is spent', () => {
+    expect(
+      decideCeilingFollowUp({
+        hasContinuation: false,
+        currentTool: 'Bash',
+        toolStartedAt: new Date(NOW - ABSOLUTE_CEILING_MS - 1).toISOString(),
+        priorToolAttempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+        now: NOW,
+        ceilingMs: ABSOLUTE_CEILING_MS,
+      }),
+    ).toEqual({ action: 'none' });
   });
 
   it('caps tool-only recovery after two attempts without real inbound', () => {
@@ -483,6 +604,9 @@ describe('decideCeilingFollowUp', () => {
 
 describe('applyCeilingFollowUp — accountability wake rows', () => {
   const HB_AGE = 35 * 60 * 1000;
+
+  beforeEach(() => armSelfHeal(false));
+  afterEach(() => armSelfHeal(false));
 
   function respawnRows(inDb: Database.Database) {
     return inDb
@@ -547,6 +671,7 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
   });
 
   it('wakes on a fresh in-flight-tool signal', () => {
+    armSelfHeal(true);
     const { inDb } = makeSessionDbs();
     const res = _applyCeilingFollowUpForTesting(
       inDb,
@@ -562,11 +687,318 @@ describe('applyCeilingFollowUp — accountability wake rows', () => {
     expect(JSON.parse(rows[0].content).text).not.toContain('saved continuation');
   });
 
+  // Class 2's accountability artifact: a container killed at the ceiling with a
+  // wedged tool must leave behind an on_wake row that respawns it.
+  it('writes the wedged-tool accountability artifact for a tool stuck since the ceiling', () => {
+    armSelfHeal(true);
+    const { inDb } = makeSessionDbs();
+    const res = _applyCeilingFollowUpForTesting(
+      inDb,
+      fakeSession(),
+      {
+        current_tool: 'Bash',
+        tool_started_at: new Date(Date.now() - ABSOLUTE_CEILING_MS - 1_000).toISOString(),
+      } as ContainerState,
+      null,
+      HB_AGE,
+    );
+    expect(res).toEqual({ action: 'wake-accountable', reason: 'tool' });
+    const rows = respawnRows(inDb);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].on_wake).toBe(1);
+    const content = JSON.parse(rows[0].content);
+    expect(content._system.kind).toBe('agent_ceiling_respawn');
+    expect(content._system.reason).toBe('tool');
+    expect(content.text).toContain('done / lost / next');
+  });
+
+  it('shadow mode logs but writes nothing for the wedged-tool wake', () => {
+    armSelfHeal(false);
+    const { inDb } = makeSessionDbs();
+    const res = _applyCeilingFollowUpForTesting(
+      inDb,
+      fakeSession(),
+      { current_tool: 'Bash', tool_started_at: new Date().toISOString() } as ContainerState,
+      null,
+      HB_AGE,
+    );
+    expect(res).toEqual({ action: 'none' });
+    expect(respawnRows(inDb)).toHaveLength(0);
+  });
+
+  it('shadow mode never withholds the long-shipped continuation wake', () => {
+    armSelfHeal(false);
+    const { inDb } = makeSessionDbs();
+    const res = _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, continuation, HB_AGE);
+    expect(res).toEqual({ action: 'wake-accountable', reason: 'continuation' });
+    expect(respawnRows(inDb)).toHaveLength(1);
+  });
+
   it('does not fire for a quiet idle container', () => {
     const { inDb } = makeSessionDbs();
     const res = _applyCeilingFollowUpForTesting(inDb, fakeSession(), null, null, HB_AGE);
     expect(res).toEqual({ action: 'none' });
     expect(respawnRows(inDb)).toHaveLength(0);
+  });
+});
+
+// ─── Class 1: failed-provider self-heal ──────────────────────────────────────
+
+describe('decideProviderHeal', () => {
+  const base = {
+    alive: true,
+    providerStatus: 'failed' as string | null,
+    consecutiveFailedTicks: 2,
+    priorAttempts: 0,
+    msSinceLastAttempt: null as number | null,
+  };
+
+  it('ignores containers that are not alive', () => {
+    expect(decideProviderHeal({ ...base, alive: false })).toBe('none');
+  });
+
+  it('ignores every provider status other than failed', () => {
+    for (const providerStatus of ['active', 'healthy', 'idle', 'suspect', 'recovering', null, undefined]) {
+      expect(decideProviderHeal({ ...base, providerStatus })).toBe('none');
+    }
+  });
+
+  it('waits on the first failed tick and acts on the second', () => {
+    expect(decideProviderHeal({ ...base, consecutiveFailedTicks: 1 })).toBe('wait');
+    expect(decideProviderHeal({ ...base, consecutiveFailedTicks: 2 })).toBe('heal');
+  });
+
+  it('waits inside the cooldown and heals once it elapses', () => {
+    expect(decideProviderHeal({ ...base, priorAttempts: 1, msSinceLastAttempt: PROVIDER_HEAL_COOLDOWN_MS - 1 })).toBe(
+      'wait',
+    );
+    expect(decideProviderHeal({ ...base, priorAttempts: 1, msSinceLastAttempt: PROVIDER_HEAL_COOLDOWN_MS })).toBe(
+      'heal',
+    );
+  });
+
+  it('parks once the attempt budget is spent, cooldown notwithstanding', () => {
+    expect(decideProviderHeal({ ...base, priorAttempts: PROVIDER_HEAL_MAX_ATTEMPTS, msSinceLastAttempt: 0 })).toBe(
+      'park',
+    );
+  });
+});
+
+describe('observeProviderStatus — two-tick debounce', () => {
+  beforeEach(() => _resetProviderHealTicksForTesting());
+
+  it('counts consecutive failed ticks', () => {
+    expect(observeProviderStatus('s1', 'failed')).toBe(1);
+    expect(observeProviderStatus('s1', 'failed')).toBe(2);
+  });
+
+  it('cancels the debounce on any healthy write in between', () => {
+    for (const healthy of ['active', 'healthy', 'idle']) {
+      _resetProviderHealTicksForTesting();
+      expect(observeProviderStatus('s1', 'failed')).toBe(1);
+      expect(observeProviderStatus('s1', healthy)).toBe(0);
+      expect(observeProviderStatus('s1', 'failed')).toBe(1);
+    }
+  });
+
+  it('tracks sessions independently', () => {
+    expect(observeProviderStatus('s1', 'failed')).toBe(1);
+    expect(observeProviderStatus('s2', 'failed')).toBe(1);
+    expect(observeProviderStatus('s1', 'failed')).toBe(2);
+  });
+});
+
+describe('sweepProviderHeal — bounds, actions, and accountability', () => {
+  const FAILED = { provider_status: 'failed', provider_failure_reason: 'stream closed' } as unknown as ContainerState;
+
+  function healRows(inDb: Database.Database) {
+    return inDb
+      .prepare("SELECT id, on_wake, content FROM messages_in WHERE id LIKE 'provider-heal-%' ORDER BY seq")
+      .all() as Array<{ id: string; on_wake: number; content: string }>;
+  }
+
+  /** Backdate every marker row so the 10-minute cooldown does not block. */
+  function agePastCooldown(inDb: Database.Database) {
+    inDb
+      .prepare("UPDATE messages_in SET timestamp = ? WHERE id LIKE 'provider-heal-%'")
+      .run(new Date(Date.now() - PROVIDER_HEAL_COOLDOWN_MS - 1_000).toISOString());
+  }
+
+  /**
+   * The production writer opens the real outbound.db by path; these tests hold
+   * an in-memory one, so inject a writer that lands in it.
+   */
+  function intoOutDb(outDb: Database.Database) {
+    return (message: {
+      id: string;
+      kind: string;
+      platformId: string | null;
+      channelType: string | null;
+      threadId: string | null;
+      content: string;
+    }) => {
+      outDb
+        .prepare(
+          `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, content)
+           VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), ?, ?, ?)`,
+        )
+        .run(message.id, new Date().toISOString(), message.kind, message.content);
+    };
+  }
+
+  /** Two failed ticks — the first only arms the debounce. */
+  function twoFailedTicks(inDb: Database.Database, outDb: Database.Database, state = FAILED): boolean {
+    _sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', state, intoOutDb(outDb));
+    return _sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', state, intoOutDb(outDb));
+  }
+
+  beforeEach(() => {
+    // resolveSpawnProvider consults provider_health in the central DB.
+    const db = initTestDb();
+    runMigrations(db);
+    armSelfHeal(true);
+    _resetProviderHealTicksForTesting();
+    mockKillContainer.mockReset();
+    mockMarkProviderUnavailable.mockReset();
+    mockReadContainerConfig.mockReset().mockReturnValue({ provider: 'codex' });
+    mockGetSession.mockReset().mockReturnValue(fakeSession());
+    mockWakeContainer.mockReset();
+  });
+  afterEach(() => {
+    armSelfHeal(false);
+    closeDb();
+  });
+
+  it('does nothing on the first failed tick, heals on the second', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    expect(_sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', FAILED)).toBe(false);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(healRows(inDb)).toHaveLength(0);
+
+    expect(_sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', FAILED)).toBe(true);
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal', expect.any(Function));
+  });
+
+  it('cancels the debounce when a healthy status lands in between', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    _sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', FAILED);
+    _sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', {
+      provider_status: 'active',
+    } as unknown as ContainerState);
+    expect(_sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', FAILED)).toBe(false);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+  });
+
+  it('writes the accountability artifact that respawns the container', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    expect(twoFailedTicks(inDb, outDb)).toBe(true);
+
+    const rows = healRows(inDb);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].on_wake).toBe(1);
+    const content = JSON.parse(rows[0].content);
+    expect(content.sender).toBe('system');
+    expect(content._system.kind).toBe('agent_provider_heal');
+    expect(content._system.failure_reason).toBe('stream closed');
+    expect(content.text).toContain('done / lost / next');
+
+    // The kill's onExit is what actually respawns the session.
+    const onExit = mockKillContainer.mock.calls[0][2] as () => void;
+    onExit();
+    expect(mockWakeContainer).toHaveBeenCalledOnce();
+  });
+
+  it('routes to the declared fallback by recording a health window first', () => {
+    mockReadContainerConfig.mockReturnValue({ provider: 'codex', providerFallback: { provider: 'claude' } });
+    const { inDb, outDb } = makeSessionDbs();
+    twoFailedTicks(inDb, outDb);
+    expect(mockMarkProviderUnavailable).toHaveBeenCalledWith('ag-test', 'codex', 'unavailable', {
+      message: 'stream closed',
+    });
+  });
+
+  it('respawns on the primary and records no health window without a declared fallback', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    twoFailedTicks(inDb, outDb);
+    expect(mockMarkProviderUnavailable).not.toHaveBeenCalled();
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal', expect.any(Function));
+  });
+
+  it('holds off inside the 10-minute cooldown', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    twoFailedTicks(inDb, outDb);
+    expect(healRows(inDb)).toHaveLength(1);
+
+    mockKillContainer.mockClear();
+    expect(_sweepProviderHealForTesting(inDb, outDb, fakeSession(), 'group-folder', FAILED)).toBe(false);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(healRows(inDb)).toHaveLength(1);
+  });
+
+  it('parks with one notice after the attempt budget is spent', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    inDb.prepare("INSERT INTO session_routing VALUES (1, 'slack', 'C123', 'thread-1')").run();
+
+    for (let i = 0; i < PROVIDER_HEAL_MAX_ATTEMPTS; i++) {
+      _resetProviderHealTicksForTesting();
+      expect(twoFailedTicks(inDb, outDb)).toBe(true);
+      agePastCooldown(inDb);
+    }
+    expect(healRows(inDb)).toHaveLength(PROVIDER_HEAL_MAX_ATTEMPTS);
+    expect(countProviderHealAttemptsSinceRealInbound(inDb)).toBe(PROVIDER_HEAL_MAX_ATTEMPTS);
+
+    mockKillContainer.mockClear();
+    _resetProviderHealTicksForTesting();
+    expect(twoFailedTicks(inDb, outDb)).toBe(true);
+    // Parked: killed but NOT respawned, and no further marker row written.
+    expect(mockKillContainer).toHaveBeenCalledWith('sess-test', 'provider-failed-selfheal-parked');
+    expect(healRows(inDb)).toHaveLength(PROVIDER_HEAL_MAX_ATTEMPTS);
+
+    const notices = outDb
+      .prepare("SELECT content FROM messages_out WHERE id LIKE 'provider-heal-parked-%'")
+      .all() as Array<{ content: string }>;
+    expect(notices).toHaveLength(1);
+    expect(JSON.parse(notices[0].content)._system.kind).toContain('provider_heal_parked:');
+
+    // Idempotent across later ticks.
+    _resetProviderHealTicksForTesting();
+    twoFailedTicks(inDb, outDb);
+    expect(
+      outDb.prepare("SELECT COUNT(*) AS c FROM messages_out WHERE id LIKE 'provider-heal-parked-%'").get(),
+    ).toEqual({ c: 1 });
+  });
+
+  it('resets the attempt budget after a real inbound message', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    twoFailedTicks(inDb, outDb);
+    agePastCooldown(inDb);
+    expect(countProviderHealAttemptsSinceRealInbound(inDb)).toBe(1);
+
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, trigger, content)
+         VALUES ('user-1', 900, 'chat', ?, 'pending', 1, ?)`,
+      )
+      .run(new Date().toISOString(), JSON.stringify({ text: 'hello', senderId: 'U1' }));
+    expect(countProviderHealAttemptsSinceRealInbound(inDb)).toBe(0);
+  });
+
+  it('shadow mode detects and logs without killing, respawning, or writing', () => {
+    armSelfHeal(false);
+    const { inDb, outDb } = makeSessionDbs();
+    inDb.prepare("INSERT INTO session_routing VALUES (1, 'slack', 'C123', 'thread-1')").run();
+
+    expect(twoFailedTicks(inDb, outDb)).toBe(false);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+    expect(mockMarkProviderUnavailable).not.toHaveBeenCalled();
+    expect(healRows(inDb)).toHaveLength(0);
+    expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
+  });
+
+  it('stays silent when the session has no routing to post into', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    expect(notifyProviderHealParked(inDb, outDb, fakeSession(), 'boom')).toBe(false);
   });
 });
 

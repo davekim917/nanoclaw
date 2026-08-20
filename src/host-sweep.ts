@@ -32,8 +32,11 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { SELF_HEAL_ENABLED } from './config.js';
 import { ensureEgressNetwork } from './egress-lockdown.js';
 import { readContainerConfig } from './container-config.js';
+import { markProviderUnavailable } from './db/provider-health.js';
+import { resolveSpawnProvider } from './provider-fallback.js';
 import { resolveContainerResources } from './container-resources.js';
 import { getActiveSessions, getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -103,7 +106,7 @@ import { OomKillObserver } from './resource-oom-observer.js';
 import { pruneChannelIngressReceipts } from './db/channel-ingress-receipts.js';
 import { runMemoryCurationInBackground, stopMemoryCurationInBackground } from './modules/memory/curator-worker.js';
 import { probeNextGraphScentWorkgroup } from './modules/memory/graph-scent.js';
-import { sweepClaimsEscalation } from './modules/claims/escalation.js';
+import { sweepClaimsSelfHeal } from './modules/claims/self-heal.js';
 
 const oomKillObserver = new OomKillObserver();
 
@@ -498,7 +501,7 @@ export function hasDueRecoveryWake(inDb: Database.Database, nowIso: string): boo
          WHERE status = 'pending'
            AND trigger = 1
            AND (process_after IS NULL OR datetime(process_after) <= datetime(?))
-           AND (id LIKE 'ceiling-respawn-%' OR id LIKE 'host-restart-%')
+           AND (id LIKE 'ceiling-respawn-%' OR id LIKE 'host-restart-%' OR id LIKE 'provider-heal-%')
          LIMIT 1`,
       )
       .get(nowIso),
@@ -513,7 +516,7 @@ export function parkDueRecoveryWakes(inDb: Database.Database, nowIso: string): n
        WHERE status = 'pending'
          AND trigger = 1
          AND (process_after IS NULL OR datetime(process_after) <= datetime(?))
-         AND (id LIKE 'ceiling-respawn-%' OR id LIKE 'host-restart-%')`,
+         AND (id LIKE 'ceiling-respawn-%' OR id LIKE 'host-restart-%' OR id LIKE 'provider-heal-%')`,
     )
     .run(nowIso).changes;
 }
@@ -571,11 +574,31 @@ export function decideCeilingFollowUp(args: {
   toolStartedAt: string | null;
   priorToolAttempts: number;
   now: number;
+  /**
+   * The ceiling that actually fired for this kill (decideStuckAction's
+   * `ceilingMs`, itself widened by a declared Bash/CodexItem timeout). Supply
+   * it ONLY from the kill path: it buys the tool-freshness bound one extra
+   * sweep interval of detection lag. Callers that ask "is a tool in flight
+   * right now" rather than "what did this kill interrupt" — host-restart-warn
+   * runs against live state with no sweep lag — omit it and keep the plain
+   * ABSOLUTE_CEILING_MS freshness window.
+   */
+  ceilingMs?: number;
 }): CeilingFollowUp {
   if (args.hasContinuation) return { action: 'wake-accountable', reason: 'continuation' };
   if (!args.currentTool || !args.toolStartedAt) return { action: 'none' };
   const startedAt = parseSqliteUtc(args.toolStartedAt);
-  if (!Number.isFinite(startedAt) || startedAt > args.now || args.now - startedAt > ABSOLUTE_CEILING_MS) {
+  // Bound against the ceiling that actually fired, plus one sweep interval of
+  // detection lag. Bounding against ABSOLUTE_CEILING_MS made this branch
+  // unreachable: starting a tool emits a provider event, which touches the
+  // heartbeat (poll-loop.ts:1712), so at kill time the tool's age is always at
+  // least the heartbeat age that just exceeded the ceiling. Every genuinely
+  // wedged tool was killed and then went dark with no accountability wake.
+  const maxToolAgeMs =
+    args.ceilingMs === undefined
+      ? ABSOLUTE_CEILING_MS
+      : Math.max(args.ceilingMs, ABSOLUTE_CEILING_MS) + SWEEP_INTERVAL_MS;
+  if (!Number.isFinite(startedAt) || startedAt > args.now || args.now - startedAt > maxToolAgeMs) {
     return { action: 'none' };
   }
   if (args.priorToolAttempts >= WORK_CONTINUATION_RESUME_MAX_ATTEMPTS) return { action: 'none' };
@@ -584,11 +607,16 @@ export function decideCeilingFollowUp(args: {
 
 const CEILING_RESPAWN_ID_PREFIX = 'ceiling-respawn-';
 
-export function countToolRecoveryAttemptsSinceRealInbound(inDb: Database.Database): number {
+/**
+ * How many self-heal marker rows carrying `idPrefix` were written since the
+ * last genuine (non-system) inbound message. Real user input is what resets a
+ * recovery budget, so the cap is expressed against it rather than a wall clock.
+ */
+function countRecoveryAttemptsSinceRealInbound(inDb: Database.Database, idPrefix: string): number {
   const row = inDb
     .prepare(
       `SELECT COUNT(*) AS count FROM messages_in
-       WHERE id LIKE '${CEILING_RESPAWN_ID_PREFIX}tool-%'
+       WHERE id LIKE ?
          AND datetime(timestamp) > COALESCE((
            SELECT MAX(datetime(timestamp)) FROM messages_in
            WHERE kind != 'system'
@@ -602,8 +630,38 @@ export function countToolRecoveryAttemptsSinceRealInbound(inDb: Database.Databas
              ) != 'system'
          ), datetime('0001-01-01T00:00:00.000Z'))`,
     )
-    .get() as { count: number };
+    .get(`${idPrefix}%`) as { count: number };
   return row.count;
+}
+
+export function countToolRecoveryAttemptsSinceRealInbound(inDb: Database.Database): number {
+  return countRecoveryAttemptsSinceRealInbound(inDb, `${CEILING_RESPAWN_ID_PREFIX}tool-`);
+}
+
+/**
+ * Write one deferred, on-wake accountability row (plus its inert recall marker)
+ * into the host-owned inbound DB. The row id doubles as the durable marker the
+ * per-class attempt caps count, so every self-heal action goes through here.
+ */
+function writeSystemWake(
+  inDb: Database.Database,
+  session: Session,
+  id: string,
+  text: string,
+  system: Record<string, unknown>,
+): void {
+  insertDeferredMessageWithContextIfNew(inDb, {
+    id,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: session.agent_group_id,
+    channelType: 'agent',
+    threadId: null,
+    content: JSON.stringify({ text, sender: 'system', senderId: 'system', _system: system }),
+    processAfter: null,
+    recurrence: null,
+    onWake: 1,
+  });
 }
 
 function writeCeilingRespawn(
@@ -613,8 +671,9 @@ function writeCeilingRespawn(
   recoveryKey: string,
   heartbeatAgeMs: number,
   workContinuation: HostWorkContinuation | null,
+  ceilingMs: number = ABSOLUTE_CEILING_MS,
 ): void {
-  const idleMinutes = Math.round(ABSOLUTE_CEILING_MS / 60_000);
+  const idleMinutes = Math.round(Math.max(ceilingMs, ABSOLUTE_CEILING_MS) / 60_000);
   const silentMinutes = Math.round(heartbeatAgeMs / 60_000);
   // Name the saved task. Without it the agent reads a generic "you were
   // killed" notice, cannot tell the wake IS its own continuation, and burns a
@@ -633,22 +692,10 @@ function writeCeilingRespawn(
     `In-container background tasks, sleeps, and /tmp do not survive a restart; before going idle with ` +
     `work in flight, checkpoint to a durable path and call continue_work, or use wait for a real time delay. ` +
     `If nothing was in flight, say so in one line.${savedWork}`;
-  insertDeferredMessageWithContextIfNew(inDb, {
-    id: `${CEILING_RESPAWN_ID_PREFIX}${recoveryKey}`,
-    kind: 'chat',
-    timestamp: new Date().toISOString(),
-    platformId: session.agent_group_id,
-    channelType: 'agent',
-    threadId: null,
-    content: JSON.stringify({
-      text,
-      sender: 'system',
-      senderId: 'system',
-      _system: { kind: 'agent_ceiling_respawn', reason, heartbeat_age_ms: heartbeatAgeMs },
-    }),
-    processAfter: null,
-    recurrence: null,
-    onWake: 1,
+  writeSystemWake(inDb, session, `${CEILING_RESPAWN_ID_PREFIX}${recoveryKey}`, text, {
+    kind: 'agent_ceiling_respawn',
+    reason,
+    heartbeat_age_ms: heartbeatAgeMs,
   });
 }
 
@@ -659,22 +706,42 @@ function applyCeilingFollowUp(
   containerState: ContainerState | null,
   workContinuation: HostWorkContinuation | null,
   heartbeatAgeMs: number,
+  ceilingMs: number = ABSOLUTE_CEILING_MS,
 ): CeilingFollowUp {
+  const priorToolAttempts = countToolRecoveryAttemptsSinceRealInbound(inDb);
   const followUp = decideCeilingFollowUp({
     hasContinuation: workContinuation !== null && canAttemptContinuationRecovery(workContinuation),
     currentTool: containerState?.current_tool ?? null,
     toolStartedAt: containerState?.tool_started_at ?? null,
-    priorToolAttempts: countToolRecoveryAttemptsSinceRealInbound(inDb),
+    priorToolAttempts,
     now: Date.now(),
+    ceilingMs,
   });
-  if (followUp.action === 'wake-accountable') {
-    const recoveryKey =
-      followUp.reason === 'continuation'
-        ? `continuation-${workContinuation!.id}-${workContinuation!.recovery_episode}-${workContinuation!.resume_attempts}`
-        : `tool-${encodeURIComponent(containerState?.tool_started_at ?? 'unknown')}`;
-    writeCeilingRespawn(inDb, session, followUp.reason, recoveryKey, heartbeatAgeMs, workContinuation);
-    log.info('Queued ceiling-kill accountability wake', { sessionId: session.id, reason: followUp.reason });
+  if (followUp.action !== 'wake-accountable') return followUp;
+
+  // Shadow mode gates the wedged-tool wake only. The continuation wake is
+  // long-shipped behaviour on a path this change did not touch, so flipping the
+  // flag must never take it away.
+  if (followUp.reason === 'tool' && !SELF_HEAL_ENABLED) {
+    log.info('self-heal: would queue wedged-tool accountability wake', {
+      class: 'wedged-tool',
+      sessionId: session.id,
+      currentTool: containerState?.current_tool ?? null,
+      toolStartedAt: containerState?.tool_started_at ?? null,
+      heartbeatAgeMs,
+      ceilingMs,
+      priorToolAttempts,
+      maxAttempts: WORK_CONTINUATION_RESUME_MAX_ATTEMPTS,
+    });
+    return { action: 'none' };
   }
+
+  const recoveryKey =
+    followUp.reason === 'continuation'
+      ? `continuation-${workContinuation!.id}-${workContinuation!.recovery_episode}-${workContinuation!.resume_attempts}`
+      : `tool-${encodeURIComponent(containerState?.tool_started_at ?? 'unknown')}`;
+  writeCeilingRespawn(inDb, session, followUp.reason, recoveryKey, heartbeatAgeMs, workContinuation, ceilingMs);
+  log.info('Queued ceiling-kill accountability wake', { sessionId: session.id, reason: followUp.reason });
   return followUp;
 }
 
@@ -685,8 +752,275 @@ export function _applyCeilingFollowUpForTesting(
   containerState: ContainerState | null,
   workContinuation: HostWorkContinuation | null,
   heartbeatAgeMs: number,
+  ceilingMs: number = ABSOLUTE_CEILING_MS,
 ): CeilingFollowUp {
-  return applyCeilingFollowUp(inDb, session, containerState, workContinuation, heartbeatAgeMs);
+  return applyCeilingFollowUp(inDb, session, containerState, workContinuation, heartbeatAgeMs, ceilingMs);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Failed-provider self-heal.
+//
+// A container whose provider has given up writes provider_status='failed' and
+// then sits alive-but-useless until a human notices. Nothing reaps it: it holds
+// a claim so the idle reapers pass, and the absolute ceiling only fires after
+// 30 more silent minutes and then leaves the session dead until the next ping.
+//
+// Detection keys on provider_status because it is the only column carrying the
+// provider's own "I am done" verdict. Today only the Codex provider ever writes
+// it (container/agent-runner/src/providers/codex.ts) — Claude and OpenCode
+// never do — so this heals Codex sessions only until they follow. It is
+// deliberately NOT built on provider_executing, which has no writer anywhere.
+//
+// Two consecutive sweep ticks are required so a transition the container
+// recovers from on its own never costs it a kill.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Consecutive `failed` observations required before acting. */
+export const PROVIDER_HEAL_CONSECUTIVE_TICKS = 2;
+export const PROVIDER_HEAL_MAX_ATTEMPTS = 2;
+export const PROVIDER_HEAL_COOLDOWN_MS = 10 * 60 * 1000;
+const PROVIDER_HEAL_ID_PREFIX = 'provider-heal-';
+
+// sessionId → consecutive ticks observed with provider_status === 'failed'.
+// Mirrors the quietSessions cache above: module-level, host-lifetime, cleared
+// by any observation that is not 'failed' (including the container going away,
+// so a fresh container never inherits a half-finished debounce).
+const providerFailedTicks = new Map<string, number>();
+
+export type ProviderHealDecision = 'none' | 'wait' | 'heal' | 'park';
+
+export function decideProviderHeal(args: {
+  alive: boolean;
+  providerStatus: string | null | undefined;
+  consecutiveFailedTicks: number;
+  priorAttempts: number;
+  /** Age of the newest provider-heal marker row, or null when there is none. */
+  msSinceLastAttempt: number | null;
+}): ProviderHealDecision {
+  if (!args.alive || args.providerStatus !== 'failed') return 'none';
+  if (args.consecutiveFailedTicks < PROVIDER_HEAL_CONSECUTIVE_TICKS) return 'wait';
+  if (args.priorAttempts >= PROVIDER_HEAL_MAX_ATTEMPTS) return 'park';
+  if (args.msSinceLastAttempt !== null && args.msSinceLastAttempt < PROVIDER_HEAL_COOLDOWN_MS) return 'wait';
+  return 'heal';
+}
+
+/** Advance (or reset) the two-tick debounce. Returns the new consecutive count. */
+export function observeProviderStatus(sessionId: string, providerStatus: string | null | undefined): number {
+  if (providerStatus !== 'failed') {
+    providerFailedTicks.delete(sessionId);
+    return 0;
+  }
+  const ticks = (providerFailedTicks.get(sessionId) ?? 0) + 1;
+  providerFailedTicks.set(sessionId, ticks);
+  return ticks;
+}
+
+export function countProviderHealAttemptsSinceRealInbound(inDb: Database.Database): number {
+  return countRecoveryAttemptsSinceRealInbound(inDb, PROVIDER_HEAL_ID_PREFIX);
+}
+
+/** Age of the newest provider-heal marker row, or null when there is none. */
+export function providerHealLastAttemptAgeMs(inDb: Database.Database, now: number): number | null {
+  const row = inDb
+    .prepare('SELECT MAX(timestamp) AS ts FROM messages_in WHERE id LIKE ?')
+    .get(`${PROVIDER_HEAL_ID_PREFIX}%`) as { ts: string | null } | undefined;
+  if (!row?.ts) return null;
+  const at = parseSqliteUtc(row.ts);
+  return Number.isFinite(at) ? Math.max(0, now - at) : null;
+}
+
+/** Newest provider-heal marker id — the per-episode idempotency key for the parked notice. */
+function providerHealLastAttemptId(inDb: Database.Database): string | null {
+  const row = inDb
+    .prepare('SELECT MAX(id) AS id FROM messages_in WHERE id LIKE ?')
+    .get(`${PROVIDER_HEAL_ID_PREFIX}%`) as { id: string | null } | undefined;
+  return row?.id ?? null;
+}
+
+/**
+ * Kill the failed container and queue the accountability wake that respawns it.
+ * The wake row is written BEFORE the kill so the attempt is durably counted
+ * even if the kill fizzles; on_wake rows are only consumed by a fresh
+ * container's first poll, so the dying one cannot steal it.
+ */
+function applyProviderHeal(
+  inDb: Database.Database,
+  session: Session,
+  agentGroupFolder: string,
+  containerState: ContainerState | null,
+): void {
+  const failureReason = containerState?.provider_failure_reason ?? null;
+  let primaryProvider: string | null = null;
+  let routedTo: string | null = null;
+  try {
+    const containerConfig = readContainerConfig(agentGroupFolder);
+    const resolveArgs = {
+      agentGroupId: session.agent_group_id,
+      sessionProvider: session.agent_provider,
+      containerConfig,
+    };
+    primaryProvider = resolveSpawnProvider(resolveArgs).primaryProvider;
+    // A group with no declared fallback has nowhere to route, so recording a
+    // health window would only delay the honest error an operator needs to see.
+    // Owner-approved: respawn on the primary anyway, under the same cap.
+    if (containerConfig.providerFallback?.provider && failureReason) {
+      markProviderUnavailable(session.agent_group_id, primaryProvider, 'unavailable', { message: failureReason });
+    }
+    routedTo = resolveSpawnProvider(resolveArgs).provider;
+  } catch (err) {
+    log.warn('self-heal: provider routing lookup failed — respawning as configured', { sessionId: session.id, err });
+  }
+
+  const routedNote =
+    routedTo && primaryProvider && routedTo !== primaryProvider ? `; this session is now running on ${routedTo}` : '';
+  writeSystemWake(
+    inDb,
+    session,
+    `${PROVIDER_HEAL_ID_PREFIX}${Date.now()}`,
+    `[system] Your previous container was restarted because its provider reported a hard failure` +
+      `${failureReason ? ` (${failureReason})` : ''}${routedNote}. Anything in flight was lost. ` +
+      `Check your durable checkpoints, resume what is safely resumable, and post ONE message accounting for ` +
+      `state — done / lost / next. Re-check any work claims in claims/ before resuming a seam. ` +
+      `If nothing was in flight, say so in one line.`,
+    { kind: 'agent_provider_heal', provider: primaryProvider, routed_to: routedTo, failure_reason: failureReason },
+  );
+
+  log.warn('self-heal: restarting container on failed provider', {
+    class: 'failed-provider',
+    sessionId: session.id,
+    provider: primaryProvider,
+    routedTo,
+    failureReason,
+  });
+  killContainer(session.id, 'provider-failed-selfheal', () => {
+    const fresh = getSession(session.id);
+    if (fresh) void wakeContainer(fresh);
+  });
+}
+
+/**
+ * One visible notice when the attempt budget is spent, shaped like
+ * notifyContinuationParked. Idempotent per heal episode: the key is the newest
+ * marker row's id, which only changes when a fresh heal runs, and real inbound
+ * resets the whole budget.
+ */
+export function notifyProviderHealParked(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  session: Session,
+  failureReason: string | null,
+  writeMessage: (message: {
+    id: string;
+    kind: string;
+    platformId: string | null;
+    channelType: string | null;
+    threadId: string | null;
+    content: string;
+  }) => void = (message) => writeOutboundDirect(session.agent_group_id, session.id, message),
+): boolean {
+  const episode = providerHealLastAttemptId(inDb) ?? 'unknown';
+  const marker = `provider_heal_parked:${episode}`;
+  if (outDb.prepare('SELECT 1 FROM messages_out WHERE content LIKE ? LIMIT 1').get(`%${marker}%`)) return false;
+  const routing = readSessionRouting(inDb);
+  if (!routing) return false;
+  writeMessage({
+    id: `provider-heal-parked-${episode}`,
+    kind: 'chat',
+    platformId: routing.platform_id,
+    channelType: routing.channel_type,
+    threadId: routing.thread_id,
+    content: JSON.stringify({
+      text:
+        `⚠️ My agent provider keeps failing${failureReason ? ` (${failureReason})` : ''} and ${PROVIDER_HEAL_MAX_ATTEMPTS} ` +
+        `automatic restarts did not fix it. I have stopped retrying. Reply in this thread and I will try again.`,
+      _system: { kind: marker, failure_reason: failureReason },
+    }),
+  });
+  return true;
+}
+
+/**
+ * Detection + action for one alive session. Always advances the debounce;
+ * acts only when NANOCLAW_SELF_HEAL is armed. Returns true when the container
+ * was killed, so the caller skips the reap/SLA checks for this tick.
+ */
+function sweepProviderHeal(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  session: Session,
+  agentGroupFolder: string,
+  containerState: ContainerState | null,
+  writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[4],
+): boolean {
+  const providerStatus = containerState?.provider_status ?? null;
+  const consecutiveFailedTicks = observeProviderStatus(session.id, providerStatus);
+  const priorAttempts = countProviderHealAttemptsSinceRealInbound(inDb);
+  const msSinceLastAttempt = providerHealLastAttemptAgeMs(inDb, Date.now());
+  const decision = decideProviderHeal({
+    alive: true,
+    providerStatus,
+    consecutiveFailedTicks,
+    priorAttempts,
+    msSinceLastAttempt,
+  });
+  if (decision === 'none' || decision === 'wait') return false;
+
+  const bounds = {
+    class: 'failed-provider',
+    sessionId: session.id,
+    providerStatus,
+    consecutiveFailedTicks,
+    priorAttempts,
+    maxAttempts: PROVIDER_HEAL_MAX_ATTEMPTS,
+    msSinceLastAttempt,
+    cooldownMs: PROVIDER_HEAL_COOLDOWN_MS,
+    failureReason: containerState?.provider_failure_reason ?? null,
+  };
+  if (!SELF_HEAL_ENABLED) {
+    log.info(`self-heal: would ${decision} failed provider`, bounds);
+    return false;
+  }
+
+  if (decision === 'park') {
+    // Kill first, then post: outbound.db has exactly one writer, and the
+    // container must be confirmed stopped before the host writes to it (same
+    // ordering as the kill-ceiling notice). No onExit — parked means no
+    // respawn until real inbound resets the budget.
+    log.warn('self-heal: provider heal budget exhausted — parking', bounds);
+    killContainer(session.id, 'provider-failed-selfheal-parked');
+    try {
+      notifyProviderHealParked(
+        inDb,
+        outDb,
+        session,
+        containerState?.provider_failure_reason ?? null,
+        writeParkedMessage,
+      );
+    } catch (err) {
+      log.warn('self-heal: parked notice failed', { sessionId: session.id, err });
+    }
+    return true;
+  }
+
+  applyProviderHeal(inDb, session, agentGroupFolder, containerState);
+  return true;
+}
+
+/** Test-only re-export with injected session-DB handles. */
+export function _sweepProviderHealForTesting(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  session: Session,
+  agentGroupFolder: string,
+  containerState: ContainerState | null,
+  writeParkedMessage?: Parameters<typeof notifyProviderHealParked>[4],
+): boolean {
+  return sweepProviderHeal(inDb, outDb, session, agentGroupFolder, containerState, writeParkedMessage);
+}
+
+/** Test-only: clear the module-level two-tick debounce between cases. */
+export function _resetProviderHealTicksForTesting(): void {
+  providerFailedTicks.clear();
 }
 
 let running = false;
@@ -864,14 +1198,14 @@ async function sweep(): Promise<void> {
     log.warn('Usage rollup sweep step failed', { err });
   }
 
-  // Fleet-hardening Phase 2.2: escalate work-claims stale past their grace
-  // window that no sibling ever took over — see
-  // src/modules/claims/escalation.ts. Throttled internally to once per 10
-  // minutes; isolated so a scan failure never blocks the rest of the tick.
+  // Self-heal class 3: nudge (then, if armed, offer takeover of) stale work
+  // claims — see src/modules/claims/self-heal.ts. Throttled internally to
+  // once per 10 minutes; isolated so a scan failure never blocks the rest of
+  // the tick.
   try {
-    sweepClaimsEscalation();
+    await sweepClaimsSelfHeal();
   } catch (err) {
-    log.warn('Claims escalation sweep step failed', { err });
+    log.warn('Claims self-heal sweep step failed', { err });
   }
 
   const sweepMs = Date.now() - sweepStartedAtMs;
@@ -1399,7 +1733,14 @@ async function sweepSession(session: Session): Promise<number | null> {
     if (alive && outDb && !justWoke) {
       const containerState = getContainerState(outDb);
       const processingClaimCount = getProcessingClaims(outDb).length;
-      if (
+      // 5a. Failed-provider self-heal. Runs first: a container whose provider
+      // has given up is not idle and not merely stuck, and healing it beats
+      // both reaping it as idle and waiting out the 30-minute ceiling. Returns
+      // true only when it killed the container, in which case the reap/SLA
+      // checks below have nothing left to decide this tick.
+      if (sweepProviderHeal(inDb, outDb, session, agentGroup.folder, containerState)) {
+        log.debug('Provider self-heal handled this tick — skipping reap/SLA checks', { sessionId: session.id });
+      } else if (
         shouldReapIdleTaskContainer(
           session.thread_id,
           dueCount,
@@ -1438,6 +1779,10 @@ async function sweepSession(session: Session): Promise<number | null> {
     if (!alive && outDb) {
       resetStuckProcessingRows(inDb, outDb, session, 'container not running');
     }
+    // A container that is gone cannot be mid-failure. Clearing here stops a
+    // fresh container from inheriting the dead one's half-finished debounce and
+    // being killed on its first 'failed' observation.
+    if (!alive) providerFailedTicks.delete(session.id);
 
     // 7. Recurrence fanout for completed recurring tasks.
     // MODULE-HOOK:scheduling-recurrence:start
@@ -1780,7 +2125,14 @@ function enforceRunningContainerSla(
     // dead until the next human ping. Best-effort — a failure here must
     // not break the sweep's kill path.
     try {
-      applyCeilingFollowUp(inDb, session, containerState, workContinuation, decision.heartbeatAgeMs);
+      applyCeilingFollowUp(
+        inDb,
+        session,
+        containerState,
+        workContinuation,
+        decision.heartbeatAgeMs,
+        decision.ceilingMs,
+      );
     } catch (err) {
       log.warn('ceiling-kill follow-up failed', { sessionId: session.id, err });
     }
