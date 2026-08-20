@@ -48,9 +48,15 @@ export interface ScanOptions {
   index: boolean;
   portable: boolean;
   dbPath?: string;
-  identifiersPath: string;
+  // Undefined means "not explicitly requested" — run() resolves the default
+  // local path, falling back to the main checkout when the worktree has none.
+  // An explicit --identifiers value always wins over that fallback.
+  identifiersPath?: string;
   allowlistPath: string;
 }
+
+const DEFAULT_DB_RELATIVE = path.join('data', 'v2.db');
+const DEFAULT_IDENTIFIERS_RELATIVE = path.join('.nanoclaw', 'public-boundary-identifiers');
 
 const GENERIC_IDENTIFIERS = new Set([
   'admin',
@@ -135,9 +141,7 @@ const STRUCTURAL_RULES: Array<{
     category: 'slack-identifier',
     pattern: /\b(?=[CDGUWT][A-Z0-9]{8,}\b)(?=[A-Z0-9]*\d)[CDGUWT][A-Z0-9]+\b/g,
     synthetic: (value) =>
-      /ALLOWED|CHANNEL|COLLIDE|DEST|EXAMPLE|FIXTURE|OTHER|PROJECT|TARGET|TEAM|TEST|UNKNOWN|USER|WORKSPACE/i.test(
-        value,
-      ),
+      /ALLOWED|CHANNEL|COLLIDE|DEST|EXAMPLE|FIXTURE|OTHER|PROJECT|TARGET|TEAM|TEST|UNKNOWN|USER|WORKSPACE/i.test(value),
   },
   {
     category: 'discord-identifier',
@@ -186,10 +190,7 @@ function normalizedIdentifierPattern(value: string): RegExp | null {
   if (normalizedLength < 6) {
     return new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(value)}(?=$|[^A-Za-z0-9])`, 'i');
   }
-  return new RegExp(
-    `(^|[^A-Za-z0-9])${tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}')}(?=$|[^A-Za-z0-9])`,
-    'i',
-  );
+  return new RegExp(`(^|[^A-Za-z0-9])${tokens.map(escapeRegex).join('[^A-Za-z0-9]{0,4}')}(?=$|[^A-Za-z0-9])`, 'i');
 }
 
 function addIdentifier(target: Set<string>, value: unknown): void {
@@ -290,10 +291,7 @@ function isAllowed(file: string, value: string, allowlist: AllowlistEntry[]): bo
 }
 
 function isSerializedAllowlistValue(file: string, value: string, allowlist: AllowlistEntry[]): boolean {
-  return (
-    path.basename(file) === '.public-boundary-allowlist.json' &&
-    allowlist.some((entry) => entry.value === value)
-  );
+  return path.basename(file) === '.public-boundary-allowlist.json' && allowlist.some((entry) => entry.value === value);
 }
 
 function lineNumber(content: string, offset: number): number {
@@ -308,9 +306,7 @@ function addFinding(target: Finding[], finding: Finding): void {
   if (
     !target.some(
       (existing) =>
-        existing.file === finding.file &&
-        existing.line === finding.line &&
-        existing.category === finding.category,
+        existing.file === finding.file && existing.line === finding.line && existing.category === finding.category,
     )
   ) {
     target.push(finding);
@@ -369,9 +365,7 @@ export function scanInputs(
 }
 
 function trackedInputs(root: string, index: boolean): ScanInput[] {
-  const files = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' })
-    .split('\0')
-    .filter(Boolean);
+  const files = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean);
   const inputs: ScanInput[] = [];
   for (const file of files) {
     try {
@@ -391,7 +385,6 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     root: cwd,
     index: false,
     portable: false,
-    identifiersPath: '.nanoclaw/public-boundary-identifiers',
     allowlistPath: '.public-boundary-allowlist.json',
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -407,36 +400,137 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
   }
   if (!options.root) throw new Error('--root requires a path');
   options.root = path.resolve(options.root);
-  options.identifiersPath = path.resolve(options.root, options.identifiersPath);
+  if (options.identifiersPath !== undefined)
+    options.identifiersPath = path.resolve(options.root, options.identifiersPath);
   options.allowlistPath = path.resolve(options.root, options.allowlistPath);
   if (options.dbPath) options.dbPath = path.resolve(options.root, options.dbPath);
   return options;
 }
 
-export function run(options: ScanOptions): Finding[] {
-  const installMarker = fs.existsSync(path.join(options.root, 'data', 'v2.db'));
-  const installAware = !options.portable && (options.dbPath !== undefined || installMarker);
-  const privateIdentifiers = new Set<string>();
-  if (installAware) {
-    const dbPath = options.dbPath ?? path.join(options.root, 'data', 'v2.db');
-    for (const value of loadRegistryIdentifiers(dbPath)) privateIdentifiers.add(value);
-    for (const value of loadLocalIdentifiers(options.identifiersPath)) privateIdentifiers.add(value);
+type IdentifierOrigin = 'explicit' | 'local' | 'main-checkout' | 'none';
+
+// A linked worktree shares the main checkout's git dir, so `--git-common-dir`
+// finds it with no configuration. Returns null (never throws) whenever that
+// can't be established — git failure, or this root already IS the main
+// checkout — so callers fall back to today's local-only behaviour.
+function findMainCheckoutRoot(root: string): string | null {
+  let commonDir: string;
+  try {
+    commonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: root, encoding: 'utf8' }).trim();
+  } catch {
+    return null;
   }
-  return scanInputs(trackedInputs(options.root, options.index), privateIdentifiers, loadAllowlist(options.allowlistPath));
+  const candidateRoot = path.dirname(path.resolve(root, commonDir));
+  return candidateRoot === path.resolve(root) ? null : candidateRoot;
+}
+
+// Explicit path wins outright (and stays fail-closed: a bad explicit path
+// throws, same as before). Otherwise try the local default, then the main
+// checkout's copy of that same default. An unusable/missing source at any
+// step is a soft miss, not an error, so a broken local file can't block
+// resolution reaching the fallback.
+function resolveIdentifierSet(
+  explicitPath: string | undefined,
+  root: string,
+  mainCheckoutRoot: string | null,
+  defaultRelative: string,
+  loader: (resolvedPath: string) => Set<string>,
+): { identifiers: Set<string>; origin: IdentifierOrigin } {
+  if (explicitPath !== undefined) return { identifiers: loader(explicitPath), origin: 'explicit' };
+  try {
+    return { identifiers: loader(path.join(root, defaultRelative)), origin: 'local' };
+  } catch {
+    // fall through to the main-checkout fallback below
+  }
+  if (mainCheckoutRoot) {
+    try {
+      return { identifiers: loader(path.join(mainCheckoutRoot, defaultRelative)), origin: 'main-checkout' };
+    } catch {
+      // fall through to "none"
+    }
+  }
+  return { identifiers: new Set(), origin: 'none' };
+}
+
+export interface RunReport {
+  findings: Finding[];
+  mode: 'portable' | 'install-aware' | 'structural-fallback';
+  registryOrigin: IdentifierOrigin | 'skipped';
+  identifiersOrigin: IdentifierOrigin | 'skipped';
+}
+
+export function runReport(options: ScanOptions): RunReport {
+  const privateIdentifiers = new Set<string>();
+  let registryOrigin: IdentifierOrigin | 'skipped' = 'skipped';
+  let identifiersOrigin: IdentifierOrigin | 'skipped' = 'skipped';
+
+  if (!options.portable) {
+    const mainCheckoutRoot = findMainCheckoutRoot(options.root);
+    const registry = resolveIdentifierSet(
+      options.dbPath,
+      options.root,
+      mainCheckoutRoot,
+      DEFAULT_DB_RELATIVE,
+      loadRegistryIdentifiers,
+    );
+    registryOrigin = registry.origin;
+    for (const value of registry.identifiers) privateIdentifiers.add(value);
+
+    const identifiers = resolveIdentifierSet(
+      options.identifiersPath,
+      options.root,
+      mainCheckoutRoot,
+      DEFAULT_IDENTIFIERS_RELATIVE,
+      loadLocalIdentifiers,
+    );
+    identifiersOrigin = identifiers.origin;
+    for (const value of identifiers.identifiers) privateIdentifiers.add(value);
+  }
+
+  const mode: RunReport['mode'] = options.portable
+    ? 'portable'
+    : registryOrigin === 'none' && identifiersOrigin === 'none'
+      ? 'structural-fallback'
+      : 'install-aware';
+
+  const findings = scanInputs(
+    trackedInputs(options.root, options.index),
+    privateIdentifiers,
+    loadAllowlist(options.allowlistPath),
+  );
+  return { findings, mode, registryOrigin, identifiersOrigin };
+}
+
+export function run(options: ScanOptions): Finding[] {
+  return runReport(options).findings;
+}
+
+function describeMode(report: RunReport): string {
+  if (report.mode === 'portable') return 'portable — structural patterns only';
+  if (report.mode === 'structural-fallback') return 'structural patterns only — no identifier registry found';
+  const usedFallback = report.registryOrigin === 'main-checkout' || report.identifiersOrigin === 'main-checkout';
+  return usedFallback ? 'identifiers from main checkout' : 'identifiers from local install';
 }
 
 export function main(argv = process.argv.slice(2)): number {
   try {
     const options = resolveOptions(argv);
-    const findings = run(options);
+    const report = runReport(options);
+    const { findings } = report;
+    if (report.mode === 'structural-fallback') {
+      process.stderr.write(
+        'WARNING: no identifier registry found (locally or in the main checkout) — running structural-pattern checks only; real names and tenant identifiers will NOT be caught\n',
+      );
+    }
+    const surface = `${options.index ? 'index' : 'worktree'}, ${describeMode(report)}`;
     if (findings.length === 0) {
-      process.stdout.write(`public boundary check passed (${options.index ? 'index' : 'worktree'})\n`);
+      process.stdout.write(`public boundary check passed (${surface})\n`);
       return 0;
     }
     for (const finding of findings) {
       process.stderr.write(`${finding.file}:${finding.line} ${finding.category}\n`);
     }
-    process.stderr.write(`public boundary check failed with ${findings.length} redacted finding(s)\n`);
+    process.stderr.write(`public boundary check failed with ${findings.length} redacted finding(s) (${surface})\n`);
     return 1;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'unknown checker error';

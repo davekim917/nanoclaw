@@ -12,6 +12,7 @@ import {
   main,
   resolveOptions,
   run,
+  runReport,
   scanInputs,
 } from './check-public-boundary.js';
 
@@ -33,6 +34,33 @@ function initRepo(): string {
 
 function input(file: string, text: string): { file: string; content: Buffer } {
   return { file, content: Buffer.from(text) };
+}
+
+// A "main checkout": a committed repo carrying the gitignored install state
+// (data/v2.db + .nanoclaw/public-boundary-identifiers) that a linked worktree
+// never gets a copy of, since both are gitignored.
+function initInstallRepo(registryIdentifier: string, localIdentifier: string): string {
+  const root = initRepo();
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: root });
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+  const db = new Database(path.join(root, 'data', 'v2.db'));
+  db.exec(`
+    CREATE TABLE workgroups (id TEXT, display_name TEXT);
+    CREATE TABLE agent_groups (id TEXT, name TEXT, folder TEXT, workgroup_id TEXT);
+    CREATE TABLE messaging_groups (id TEXT, platform_id TEXT, instance TEXT, name TEXT);
+    CREATE TABLE users (id TEXT, display_name TEXT);
+  `);
+  db.prepare('INSERT INTO workgroups (id, display_name) VALUES (?, ?)').run('main-house', registryIdentifier);
+  db.close();
+  fs.mkdirSync(path.join(root, '.nanoclaw'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.nanoclaw', 'public-boundary-identifiers'), `${localIdentifier}\n`);
+  return root;
+}
+
+function addLinkedWorktree(mainRoot: string): string {
+  const worktreeRoot = tempRoot();
+  execFileSync('git', ['worktree', 'add', '--detach', '-q', worktreeRoot], { cwd: mainRoot });
+  return worktreeRoot;
 }
 
 afterEach(() => {
@@ -62,10 +90,7 @@ describe('scanInputs', () => {
 
   it('detects short private identifiers only in installation-specific context', () => {
     const findings = scanInputs(
-      [
-        input('private.ts', 'const adapter = "slack-mr";'),
-        input('unrelated.md', 'Historical recommendation [MR-R9].'),
-      ],
+      [input('private.ts', 'const adapter = "slack-mr";'), input('unrelated.md', 'Historical recommendation [MR-R9].')],
       new Set(['mr']),
       [],
     );
@@ -104,12 +129,7 @@ describe('scanInputs', () => {
   it('does not mistake scoped package versions for email addresses', () => {
     expect(
       scanInputs(
-        [
-          input(
-            'package.json',
-            '"@chat-adapter/discord@4.29.0": "patches/@chat-adapter__discord@4.29.0.patch"',
-          ),
-        ],
+        [input('package.json', '"@chat-adapter/discord@4.29.0": "patches/@chat-adapter__discord@4.29.0.patch"')],
         new Set(),
         [],
       ),
@@ -165,17 +185,12 @@ describe('scanInputs', () => {
     expect(scanInputs([input('.public-boundary-allowlist.json', serialized)], new Set(), allowlist)).toEqual([]);
     expect(
       scanInputs([input('.public-boundary-allowlist.json', serialized)], new Set([privateName]), allowlist),
-    ).toEqual([
-      { file: '.public-boundary-allowlist.json', line: 10, category: 'private-identifier' },
-    ]);
+    ).toEqual([{ file: '.public-boundary-allowlist.json', line: 10, category: 'private-identifier' }]);
   });
 
   it('rejects forbidden artifact paths', () => {
     const findings = scanInputs(
-      [
-        input('.context/specs/old.md', 'clean'),
-        input('docs/specs/feature/qa-evidence/run.jsonl', 'clean'),
-      ],
+      [input('.context/specs/old.md', 'clean'), input('docs/specs/feature/qa-evidence/run.jsonl', 'clean')],
       new Set(),
       [],
     );
@@ -255,14 +270,80 @@ describe('Git surfaces and modes', () => {
     expect(run({ ...options, index: false })).toEqual([]);
   });
 
-  it('auto-detects an install and fails closed when its inventory is missing', () => {
+  it('treats an unusable install DB as absent and degrades to structural-only instead of hard-failing', () => {
+    // A 0-byte data/v2.db stub (e.g. a partially-initialized worktree) used to
+    // flip the install-marker check true, then throw out of
+    // loadRegistryIdentifiers — exit 2, meaning the pre-commit hook could not
+    // run the gate at all. It must now fall through to whatever fallback is
+    // available (here: none, since this repo is not a linked worktree) and
+    // still complete the scan.
     const root = initRepo();
     fs.mkdirSync(path.join(root, 'data'), { recursive: true });
     fs.writeFileSync(path.join(root, 'data', 'v2.db'), '');
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const code = main(['--root', root]);
-    expect(code).toBe(2);
-    expect(stderr.mock.calls.flat().join('')).toContain('install registry');
+    expect(code).toBe(0);
+    expect(stderr.mock.calls.flat().join('')).toContain('no identifier registry found');
+    expect(stdout.mock.calls.flat().join('')).toContain('structural patterns only — no identifier registry found');
+  });
+
+  it('resolves identifiers from the main checkout when run inside a linked worktree', () => {
+    const mainRoot = initInstallRepo('Acme Registry Corp', 'Acme Local Team');
+    const worktreeRoot = addLinkedWorktree(mainRoot);
+    fs.writeFileSync(
+      path.join(worktreeRoot, 'leak.md'),
+      'From the registry: Acme Registry Corp\nFrom the local file: Acme Local Team\n',
+    );
+    execFileSync('git', ['add', 'leak.md'], { cwd: worktreeRoot });
+
+    const options = resolveOptions(['--root', worktreeRoot], worktreeRoot);
+    const report = runReport(options);
+    expect(report.mode).toBe('install-aware');
+    expect(report.registryOrigin).toBe('main-checkout');
+    expect(report.identifiersOrigin).toBe('main-checkout');
+    expect(report.findings.map((f) => f.category)).toEqual(['private-identifier', 'private-identifier']);
+  });
+
+  it('falls back past a 0-byte install-DB stub left in a worktree to the main checkout', () => {
+    const mainRoot = initInstallRepo('Contoso Registry Ltd', 'Contoso Local Ltd');
+    const worktreeRoot = addLinkedWorktree(mainRoot);
+    fs.mkdirSync(path.join(worktreeRoot, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(worktreeRoot, 'data', 'v2.db'), '');
+    fs.writeFileSync(path.join(worktreeRoot, 'clean.md'), 'nothing private here\n');
+    execFileSync('git', ['add', 'clean.md'], { cwd: worktreeRoot });
+
+    const report = runReport(resolveOptions(['--root', worktreeRoot], worktreeRoot));
+    expect(report.mode).toBe('install-aware');
+    expect(report.registryOrigin).toBe('main-checkout');
+    expect(report.findings).toEqual([]);
+
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    expect(main(['--root', worktreeRoot])).toBe(0);
+    expect(stdout.mock.calls.flat().join('')).toContain('identifiers from main checkout');
+  });
+
+  it('explicit --db/--identifiers win over the main-checkout fallback even inside a worktree', () => {
+    const mainRoot = initInstallRepo('Umbrella Registry Inc', 'Umbrella Local Inc');
+    const worktreeRoot = addLinkedWorktree(mainRoot);
+    const localDb = path.join(worktreeRoot, 'local.db');
+    const db = new Database(localDb);
+    db.exec('CREATE TABLE workgroups (id TEXT, display_name TEXT);');
+    db.prepare('INSERT INTO workgroups (id, display_name) VALUES (?, ?)').run('local-house', 'Locally Scoped House');
+    db.close();
+    fs.writeFileSync(path.join(worktreeRoot, 'local-ids'), 'Locally Scoped Team\n');
+    fs.writeFileSync(
+      path.join(worktreeRoot, 'leak.md'),
+      'Umbrella Registry Inc appears here but should not be flagged.\n',
+    );
+    execFileSync('git', ['add', 'leak.md'], { cwd: worktreeRoot });
+
+    const report = runReport(
+      resolveOptions(['--root', worktreeRoot, '--db', 'local.db', '--identifiers', 'local-ids'], worktreeRoot),
+    );
+    expect(report.registryOrigin).toBe('explicit');
+    expect(report.identifiersOrigin).toBe('explicit');
+    expect(report.findings).toEqual([]);
   });
 
   it('portable mode works without install state', () => {
