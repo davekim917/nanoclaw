@@ -302,6 +302,7 @@ CREATE TABLE IF NOT EXISTS container_state (
   memory_max_bytes         INTEGER,
   memory_oom_events        INTEGER,
   memory_oom_kill_events   INTEGER,
+  memory_max_events        INTEGER,
   memory_telemetry_at      TEXT,
   updated_at               TEXT NOT NULL
 );

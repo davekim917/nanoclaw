@@ -12,6 +12,8 @@ silently picking one.
 
 Your container is **killed after ~30 minutes without an active turn**, and `/tmp` plus every in-container background task, sleep, and timer dies with it — only durable paths survive. Never park work and go quiet; see Container lifecycle below for what to do instead.
 
+Every process in this container shares **one memory limit** (`cat /sys/fs/cgroup/memory.max` for the number). Exceeding it does not fail cleanly: the kernel SIGKILLs individual child processes while the container keeps running, so what you see is a command exiting with no output, a browser or MCP tool vanishing mid-run, or a block of unexplained test failures. Suspect this before concluding a tool is broken or the infrastructure is unstable, and don't retry the same command unchanged. `jest`/`vitest` default their worker count to CPU count − 1 and will blow the limit on a large suite — pass `--maxWorkers=2` (vitest: `poolOptions.maxThreads`), never run concurrent `npm ci`/`pnpm install`, and close browser sessions when you're done with them.
+
 ## Communication Style
 
 **Be honest, not agreeable.** Tell users when their ideas are flawed — a wrong answer delivered confidently is worse than "I'm not sure, let me check."

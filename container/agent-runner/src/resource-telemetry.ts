@@ -10,6 +10,11 @@ export interface CgroupMemorySnapshot {
   maxBytes: number | null;
   oomEvents: number;
   oomKillEvents: number;
+  /**
+   * memory.events:max — times the cgroup hit its ceiling and had to reclaim.
+   * Fires BEFORE anything is killed, so it is the only pre-kill signal here.
+   */
+  maxEvents: number;
 }
 
 function readInteger(filePath: string, optional = false): number | null {
@@ -49,6 +54,7 @@ export function readCgroupMemorySnapshot(cgroupRoot = '/sys/fs/cgroup'): CgroupM
       maxBytes,
       oomEvents: events.get('oom') ?? 0,
       oomKillEvents: events.get('oom_kill') ?? 0,
+      maxEvents: events.get('max') ?? 0,
     };
   } catch {
     return null;
@@ -61,14 +67,16 @@ export function writeResourceTelemetry(snapshot: CgroupMemorySnapshot, outbound:
     .prepare(
       `INSERT INTO container_state (
          id, memory_current_bytes, memory_peak_bytes, memory_max_bytes,
-         memory_oom_events, memory_oom_kill_events, memory_telemetry_at, updated_at
-       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+         memory_oom_events, memory_oom_kill_events, memory_max_events,
+         memory_telemetry_at, updated_at
+       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          memory_current_bytes = excluded.memory_current_bytes,
          memory_peak_bytes = excluded.memory_peak_bytes,
          memory_max_bytes = excluded.memory_max_bytes,
          memory_oom_events = excluded.memory_oom_events,
          memory_oom_kill_events = excluded.memory_oom_kill_events,
+         memory_max_events = excluded.memory_max_events,
          memory_telemetry_at = excluded.memory_telemetry_at,
          updated_at = excluded.updated_at`,
     )
@@ -78,6 +86,7 @@ export function writeResourceTelemetry(snapshot: CgroupMemorySnapshot, outbound:
       snapshot.maxBytes,
       snapshot.oomEvents,
       snapshot.oomKillEvents,
+      snapshot.maxEvents,
       now,
       now,
     );

@@ -712,6 +712,8 @@ export interface ContainerState {
   memory_max_bytes?: number | null;
   memory_oom_events?: number | null;
   memory_oom_kill_events?: number | null;
+  /** memory.events:max — ceiling hits that forced reclaim (pre-kill signal). */
+  memory_max_events?: number | null;
   memory_telemetry_at?: string | null;
 }
 
@@ -722,46 +724,37 @@ export interface ContainerState {
  * declared Bash operation or a bounded native Codex item is in flight.
  */
 export function getContainerState(outDb: Database.Database): ContainerState | null {
-  try {
-    const row = outDb
-      .prepare(
-        `SELECT current_tool, tool_declared_timeout_ms, tool_started_at,
-                provider_status, provider_executing, provider_last_event_at, provider_last_probe_at,
-                provider_probe_failures, provider_recovery_attempts, provider_failure_reason,
-                memory_current_bytes, memory_peak_bytes, memory_max_bytes,
-                memory_oom_events, memory_oom_kill_events, memory_telemetry_at
-           FROM container_state WHERE id = 1`,
-      )
-      .get() as ContainerState | undefined;
-    return row ?? null;
-  } catch {
-    // Older DBs may have provider-health but not resource telemetry columns.
+  // Widest column set first, narrowing on each failure. Session DBs are
+  // migrated forward by the CONTAINER (connection.ts forwardColumns), so a
+  // session whose container has not respawned since a column was added still
+  // has the older shape — dropping straight to the tool-only tier would
+  // silently take resource telemetry away from every such session.
+  for (const columns of CONTAINER_STATE_COLUMN_TIERS) {
     try {
-      const row = outDb
-        .prepare(
-          `SELECT current_tool, tool_declared_timeout_ms, tool_started_at,
-                  provider_status, provider_executing, provider_last_event_at, provider_last_probe_at,
-                  provider_probe_failures, provider_recovery_attempts, provider_failure_reason
-             FROM container_state WHERE id = 1`,
-        )
-        .get() as ContainerState | undefined;
+      const row = outDb.prepare(`SELECT ${columns} FROM container_state WHERE id = 1`).get() as
+        | ContainerState
+        | undefined;
       return row ?? null;
     } catch {
-      // Preserve the legacy tool timeout instead of discarding the whole row.
-      try {
-        const row = outDb
-          .prepare(
-            `SELECT current_tool, tool_declared_timeout_ms, tool_started_at
-               FROM container_state WHERE id = 1`,
-          )
-          .get() as ContainerState | undefined;
-        return row ?? null;
-      } catch {
-        return null;
-      }
+      // Try the next-narrower tier.
     }
   }
+  return null;
 }
+
+const CONTAINER_STATE_TOOL_COLUMNS = 'current_tool, tool_declared_timeout_ms, tool_started_at';
+const CONTAINER_STATE_PROVIDER_COLUMNS =
+  `${CONTAINER_STATE_TOOL_COLUMNS}, provider_status, provider_executing, provider_last_event_at, ` +
+  'provider_last_probe_at, provider_probe_failures, provider_recovery_attempts, provider_failure_reason';
+const CONTAINER_STATE_MEMORY_COLUMNS =
+  `${CONTAINER_STATE_PROVIDER_COLUMNS}, memory_current_bytes, memory_peak_bytes, memory_max_bytes, ` +
+  'memory_oom_events, memory_oom_kill_events, memory_telemetry_at';
+const CONTAINER_STATE_COLUMN_TIERS = [
+  `${CONTAINER_STATE_MEMORY_COLUMNS}, memory_max_events`,
+  CONTAINER_STATE_MEMORY_COLUMNS,
+  CONTAINER_STATE_PROVIDER_COLUMNS,
+  CONTAINER_STATE_TOOL_COLUMNS,
+];
 
 // ---------------------------------------------------------------------------
 // messages_out (read-only from host)

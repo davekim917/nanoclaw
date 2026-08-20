@@ -649,8 +649,14 @@ function writeSystemWake(
   id: string,
   text: string,
   system: Record<string, unknown>,
-): void {
-  insertDeferredMessageWithContextIfNew(inDb, {
+  /**
+   * 1 = only the NEXT fresh container's first poll sees it (the dying-container
+   * accountability case). 0 = the container that is running RIGHT NOW picks it
+   * up on its next poll — what a live-container notice such as OOM needs.
+   */
+  onWake: 0 | 1 = 1,
+): boolean {
+  return insertDeferredMessageWithContextIfNew(inDb, {
     id,
     kind: 'chat',
     timestamp: new Date().toISOString(),
@@ -660,7 +666,7 @@ function writeSystemWake(
     content: JSON.stringify({ text, sender: 'system', senderId: 'system', _system: system }),
     processAfter: null,
     recurrence: null,
-    onWake: 1,
+    onWake,
   });
 }
 
@@ -2089,7 +2095,7 @@ function enforceRunningContainerSla(
   agentGroupFolder: string,
 ): void {
   const containerState = getContainerState(outDb);
-  reportContainerOomTelemetry(session, agentGroupFolder, containerState);
+  reportContainerOomTelemetry(inDb, session, agentGroupFolder, containerState);
   const decision = decideStuckAction({
     now: Date.now(),
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
@@ -2149,12 +2155,35 @@ function enforceRunningContainerSla(
   resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
 }
 
-function reportContainerOomTelemetry(session: Session, agentGroupFolder: string, state: ContainerState | null): void {
-  const count = state?.memory_oom_kill_events;
-  if (typeof count !== 'number') return;
+/**
+ * Turn cgroup memory telemetry into something the AGENT can act on.
+ *
+ * The kernel kills children inside the cgroup, never PID 1, so the container
+ * survives and nothing surfaces: agents read an OOM-killed chromium as "the
+ * browser crashed", an OOM-killed `npm ci` as "probably buffering", and
+ * vanished MCP servers as "infrastructure instability". Reconstructed
+ * transcripts show they diagnose it correctly the moment they are TOLD — so
+ * the notice below is the whole fix; the detection already worked and just
+ * ended in a log file nobody in the container can read.
+ *
+ * The row is onWake=0 (the container is alive — this path only runs for
+ * running containers) and trigger=0 via insertDeferredMessageWithContextIfNew,
+ * so it can never wake a dead container; it rides along with the next real
+ * message or the next turn.
+ */
+function reportContainerOomTelemetry(
+  inDb: Database.Database,
+  session: Session,
+  agentGroupFolder: string,
+  state: ContainerState | null,
+): void {
+  if (typeof state?.memory_oom_kill_events !== 'number' && typeof state?.memory_max_events !== 'number') return;
   const spawnedAtMs = getContainerSpawnedAt(session.id);
-  const delta = oomKillObserver.observe(session.id, spawnedAtMs, count);
-  if (delta <= 0) return;
+  const decision = oomKillObserver.observe(session.id, spawnedAtMs, {
+    oomKillCount: state.memory_oom_kill_events,
+    pressureCount: state.memory_max_events,
+    now: Date.now(),
+  });
 
   let configuredLimitMb: number | null = null;
   try {
@@ -2163,20 +2192,73 @@ function reportContainerOomTelemetry(session: Session, agentGroupFolder: string,
     // Resource validation already fails closed in the spawn path. Keep OOM
     // diagnostics available even if an operator edits the file mid-run.
   }
-  log.warn('Container cgroup OOM kill observed', {
-    sessionId: session.id,
-    agentGroup: agentGroupFolder,
-    newOomKills: delta,
-    oomKillCount: count,
-    oomEventCount: state?.memory_oom_events ?? null,
-    configuredLimitMb,
-    cgroupMaxMb: typeof state?.memory_max_bytes === 'number' ? Math.round(state.memory_max_bytes / 1024 / 1024) : null,
-    peakMb: typeof state?.memory_peak_bytes === 'number' ? Math.round(state.memory_peak_bytes / 1024 / 1024) : null,
-    currentMb:
-      typeof state?.memory_current_bytes === 'number' ? Math.round(state.memory_current_bytes / 1024 / 1024) : null,
-    telemetryAt: state?.memory_telemetry_at ?? null,
-  });
+  const cgroupMaxMb =
+    typeof state.memory_max_bytes === 'number' ? Math.round(state.memory_max_bytes / 1024 / 1024) : null;
+  const limitMb = configuredLimitMb ?? cgroupMaxMb;
+  const limitText = limitMb === null ? 'its memory limit' : `its ${limitMb} MB memory limit`;
+
+  if (decision.killDelta > 0) {
+    log.warn('Container cgroup OOM kill observed', {
+      sessionId: session.id,
+      agentGroup: agentGroupFolder,
+      newOomKills: decision.killDelta,
+      oomKillCount: decision.killCount,
+      oomEventCount: state.memory_oom_events ?? null,
+      memoryPressureEvents: decision.pressureCount,
+      notifiedAgent: decision.notifyKills,
+      configuredLimitMb,
+      cgroupMaxMb,
+      peakMb: typeof state.memory_peak_bytes === 'number' ? Math.round(state.memory_peak_bytes / 1024 / 1024) : null,
+      currentMb:
+        typeof state.memory_current_bytes === 'number' ? Math.round(state.memory_current_bytes / 1024 / 1024) : null,
+      telemetryAt: state.memory_telemetry_at ?? null,
+    });
+  }
+
+  if (decision.notifyKills) {
+    const plural = decision.killCount === 1 ? 'process' : 'processes';
+    writeSystemWake(
+      inDb,
+      session,
+      `oom-kill-${spawnedAtMs}-${decision.killCount}`,
+      `[system] The Linux kernel has killed ${decision.killCount} ${plural} inside this container for exceeding ` +
+        `${limitText}, which is shared by EVERY process here — your agent, MCP servers, browsers, test runners, ` +
+        `builds. Your container itself survived, so nothing reported an error to you. The cgroup exposes only a ` +
+        `counter, so the names of the killed processes are not available. Symptoms this explains: a command exiting ` +
+        `with no output or a bare non-zero status, npm/pnpm installs dying silently, a browser or MCP server ` +
+        `disappearing mid-run, test failures that do not reproduce. Remedy: cut in-container parallelism ` +
+        `(jest --maxWorkers=2, vitest poolOptions.maxThreads, make -j2), do not run installs or suites concurrently, ` +
+        `close browser sessions when done, and write large output to a file instead of buffering it. Do NOT retry ` +
+        `the same command unchanged — it will be killed again.`,
+      { kind: 'agent_container_oom', oom_kill_count: decision.killCount, memory_limit_mb: limitMb },
+      0,
+    );
+    return;
+  }
+
+  if (decision.notifyPressure) {
+    log.warn('Container memory pressure without kills', {
+      sessionId: session.id,
+      agentGroup: agentGroupFolder,
+      memoryPressureEvents: decision.pressureCount,
+      configuredLimitMb,
+      cgroupMaxMb,
+    });
+    writeSystemWake(
+      inDb,
+      session,
+      `oom-pressure-${spawnedAtMs}`,
+      `[system] This container has hit ${limitText} ${decision.pressureCount} times and had to reclaim memory to ` +
+        `stay under it. Nothing has been killed yet — this is the warning before that. The limit is shared by every ` +
+        `process here. If you are about to run something memory-heavy (a full test suite, a build, a browser, a ` +
+        `large install), reduce its parallelism now rather than after the kernel starts killing processes.`,
+      { kind: 'agent_container_memory_pressure', memory_pressure_events: decision.pressureCount },
+      0,
+    );
+  }
 }
+
+export { reportContainerOomTelemetry as _reportContainerOomTelemetryForTesting };
 
 export function _resetStuckProcessingRowsForTesting(
   inDb: Database.Database,

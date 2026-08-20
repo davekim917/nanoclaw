@@ -129,6 +129,7 @@ export function configureOutboundDb(outbound: Database): void {
         memory_max_bytes         INTEGER,
         memory_oom_events        INTEGER,
         memory_oom_kill_events   INTEGER,
+        memory_max_events        INTEGER,
         memory_telemetry_at      TEXT,
         updated_at               TEXT NOT NULL
       );
@@ -155,6 +156,7 @@ export function configureOutboundDb(outbound: Database): void {
     ['memory_max_bytes', 'INTEGER'],
     ['memory_oom_events', 'INTEGER'],
     ['memory_oom_kill_events', 'INTEGER'],
+    ['memory_max_events', 'INTEGER'],
     ['memory_telemetry_at', 'TEXT'],
     // Added to CREATE TABLE without a backfill entry — any outbound.db older
     // than the column made every INSERT throw at boot, so the session
@@ -417,6 +419,7 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       memory_max_bytes         INTEGER,
       memory_oom_events        INTEGER,
       memory_oom_kill_events   INTEGER,
+      memory_max_events        INTEGER,
       memory_telemetry_at      TEXT,
       updated_at               TEXT NOT NULL
     );

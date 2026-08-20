@@ -12,7 +12,12 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
-import { deleteOrphanProcessingClaims, getProcessingClaims, type ContainerState } from './db/session-db.js';
+import {
+  countDueMessages,
+  deleteOrphanProcessingClaims,
+  getProcessingClaims,
+  type ContainerState,
+} from './db/session-db.js';
 import { closeDb, initTestDb, runMigrations } from './db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
@@ -32,6 +37,7 @@ import {
   notifyProviderHealParked,
   observeProviderStatus,
   _notifyKillCeilingForTesting,
+  _reportContainerOomTelemetryForTesting,
   _prepareDueWakeForTesting,
   _resetStuckProcessingRowsForTesting,
   _sweepTaskWatchdogForTesting,
@@ -2921,5 +2927,102 @@ describe('shouldSkipUsageRollup', () => {
 
   it('does not skip a session never seen before (no cache entry)', () => {
     expect(shouldSkipUsageRollup(undefined, 1000)).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Container OOM notices — detection already worked; these cover the half that
+// puts it where the AGENT can read it, without waking anything.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('reportContainerOomTelemetry', () => {
+  function oomSession(id: string): Session {
+    return { ...fakeSession(), id };
+  }
+  function noticeRows(
+    inDb: Database.Database,
+  ): Array<{ id: string; trigger: number; on_wake: number; content: string }> {
+    return inDb
+      .prepare("SELECT id, trigger, on_wake, content FROM messages_in WHERE kind = 'chat' ORDER BY id")
+      .all() as Array<{ id: string; trigger: number; on_wake: number; content: string }>;
+  }
+  function state(overrides: Partial<ContainerState>): ContainerState {
+    return {
+      current_tool: null,
+      tool_declared_timeout_ms: null,
+      tool_started_at: null,
+      ...overrides,
+    } as ContainerState;
+  }
+
+  it('writes ONE notice for a burst of kills, carrying the cumulative count', () => {
+    const { inDb } = makeNotifyTestDbs();
+    const session = oomSession('oom-burst');
+
+    for (let i = 1; i <= 346; i++) {
+      _reportContainerOomTelemetryForTesting(inDb, session, 'ag-test', state({ memory_oom_kill_events: i }));
+    }
+
+    const rows = noticeRows(inDb);
+    expect(rows).toHaveLength(1);
+    // Cumulative, not per-kill: the count in the text is the count at notice
+    // time, and no later kill adds a message inside the interval.
+    expect(JSON.parse(rows[0].content).text).toContain('killed 1 process');
+    expect(JSON.parse(rows[0].content)._system.kind).toBe('agent_container_oom');
+  });
+
+  it('never wakes a container — notices are trigger=0 and on_wake=0', () => {
+    const { inDb } = makeNotifyTestDbs();
+
+    _reportContainerOomTelemetryForTesting(
+      inDb,
+      oomSession('oom-nowake'),
+      'ag-test',
+      state({ memory_oom_kill_events: 7 }),
+    );
+
+    const rows = noticeRows(inDb);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].trigger).toBe(0);
+    expect(rows[0].on_wake).toBe(0);
+    // countDueMessages only counts trigger=1, so this row cannot spawn a
+    // container — it rides along with the next real turn instead.
+    expect(countDueMessages(inDb)).toBe(0);
+  });
+
+  it('writes nothing when there are no kills and no pressure', () => {
+    const { inDb } = makeNotifyTestDbs();
+
+    for (let i = 0; i < 10; i++) {
+      _reportContainerOomTelemetryForTesting(
+        inDb,
+        oomSession('oom-quiet'),
+        'ag-test',
+        state({ memory_oom_kill_events: 0, memory_max_events: 4 }),
+      );
+    }
+
+    expect(noticeRows(inDb)).toHaveLength(0);
+  });
+
+  it('writes the quieter pressure notice when the cgroup thrashes with no kills', () => {
+    const { inDb } = makeNotifyTestDbs();
+    const session = oomSession('oom-pressure');
+
+    for (let i = 0; i < 5; i++) {
+      _reportContainerOomTelemetryForTesting(
+        inDb,
+        session,
+        'ag-test',
+        state({ memory_oom_kill_events: 0, memory_max_events: 760 + i }),
+      );
+    }
+
+    const rows = noticeRows(inDb);
+    expect(rows).toHaveLength(1);
+    const content = JSON.parse(rows[0].content);
+    expect(content._system.kind).toBe('agent_container_memory_pressure');
+    expect(content.text).toContain('Nothing has been killed yet');
+    expect(rows[0].trigger).toBe(0);
   });
 });

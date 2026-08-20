@@ -32,6 +32,7 @@ describe('cgroup resource telemetry', () => {
       maxBytes: 5368709120,
       oomEvents: 2,
       oomKillEvents: 1,
+      maxEvents: 3,
     });
   });
 
@@ -47,7 +48,19 @@ describe('cgroup resource telemetry', () => {
       maxBytes: null,
       oomEvents: 0,
       oomKillEvents: 0,
+      maxEvents: 0,
     });
+  });
+
+  it('test_read_cgroup_snapshot_captures_pre_kill_pressure', () => {
+    // The live shape that started this: thrashing at the ceiling with
+    // nothing killed yet. `max` is the only column that sees it.
+    const dir = tempCgroup();
+    fs.writeFileSync(path.join(dir, 'memory.current'), '5300000000\n');
+    fs.writeFileSync(path.join(dir, 'memory.max'), '5368709120\n');
+    fs.writeFileSync(path.join(dir, 'memory.events'), 'low 0\nhigh 0\nmax 760\noom 0\noom_kill 0\n');
+
+    expect(readCgroupMemorySnapshot(dir)).toMatchObject({ maxEvents: 760, oomEvents: 0, oomKillEvents: 0 });
   });
 
   it('test_write_resource_telemetry_persists_host_visible_state', () => {
@@ -60,6 +73,7 @@ describe('cgroup resource telemetry', () => {
         memory_max_bytes INTEGER,
         memory_oom_events INTEGER,
         memory_oom_kill_events INTEGER,
+        memory_max_events INTEGER,
         memory_telemetry_at TEXT,
         updated_at TEXT NOT NULL
       )
@@ -72,6 +86,7 @@ describe('cgroup resource telemetry', () => {
         maxBytes: 30,
         oomEvents: 2,
         oomKillEvents: 1,
+        maxEvents: 760,
       },
       db,
     );
@@ -82,6 +97,7 @@ describe('cgroup resource telemetry', () => {
       memory_max_bytes: 30,
       memory_oom_events: 2,
       memory_oom_kill_events: 1,
+      memory_max_events: 760,
     });
     db.close();
   });

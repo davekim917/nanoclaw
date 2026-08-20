@@ -116,6 +116,7 @@ describe('outbound DB initialization', () => {
     expect(columns.has('memory_max_bytes')).toBe(true);
     expect(columns.has('memory_oom_events')).toBe(true);
     expect(columns.has('memory_oom_kill_events')).toBe(true);
+    expect(columns.has('memory_max_events')).toBe(true);
     expect(columns.has('memory_telemetry_at')).toBe(true);
     db.close();
   });
