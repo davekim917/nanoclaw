@@ -11,11 +11,12 @@ import {
   type ThreadTranscriptEntry,
 } from '../../lib/api.js';
 import { subscribe } from '../../lib/sse.ts';
-import { relAge } from '../../lib/derive.js';
 import { useGroupFilter } from '../../lib/use-group-filter.js';
-import { AgentAvatar } from '../AgentAvatar.js';
+import { closeThread, setSnoozed } from './actions.js';
+import { ThreadDetail } from './ThreadDetail.js';
 import { ThreadRow, type ThreadPreview } from './ThreadRow.js';
-import { LANE_ORDER, STATE_PRESENTATION, initials, urgencyRank } from './thread-state.js';
+import { TriagePanel } from './TriagePanel.js';
+import { LANE_ORDER, STATE_PRESENTATION, urgencyRank } from './thread-state.js';
 
 /**
  * The Observatory console — `#/console`.
@@ -41,7 +42,13 @@ import { LANE_ORDER, STATE_PRESENTATION, initials, urgencyRank } from './thread-
  */
 const PREVIEW_BUDGET = 8;
 
-type Lane = ThreadState | 'all';
+/**
+ * `snoozed` is a pseudo-lane, NOT an eighth state: a snooze is this operator's
+ * own view decision and a thread can be snoozed while it is running. It is a
+ * lane rather than a silent filter so a snoozed thread is always reachable —
+ * hiding work with no way back is how a queue starts lying.
+ */
+type Lane = ThreadState | 'all' | 'snoozed';
 type ThemeChoice = 'system' | 'light' | 'dark';
 const THEME_KEY = 'ncc-theme';
 const THEME_CYCLE: ThemeChoice[] = ['system', 'dark', 'light'];
@@ -56,6 +63,9 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
   const [channel, setChannel] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [focusComposer, setFocusComposer] = useState(0);
+  const [triage, setTriage] = useState<ThreadSummary[] | null>(null);
+  const [notice, setNotice] = useState('');
   const theme = useThemeChoice();
 
   const { data, mutate } = useSWR(
@@ -93,6 +103,8 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
     return [...byKey.values()].sort((a, b) => b.attention - a.attention || b.total - a.total);
   }, [threads]);
 
+  const snoozedCount = useMemo(() => threads.filter((t) => t.snoozed).length, [threads]);
+
   const attentionCount = useMemo(
     () => threads.filter((t) => STATE_PRESENTATION[t.state].wantsAttention).length,
     [threads],
@@ -101,7 +113,8 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return threads
-      .filter((t) => lane === 'all' || t.state === lane)
+      .filter((t) => (lane === 'snoozed' ? t.snoozed : !t.snoozed))
+      .filter((t) => lane === 'all' || lane === 'snoozed' || t.state === lane)
       .filter((t) => channel === null || t.channel_key === channel)
       .filter(
         (t) =>
@@ -143,8 +156,63 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
     next.focus();
   }, []);
 
-  const laneLabel = lane === 'all' ? 'All threads' : STATE_PRESENTATION[lane].label;
+  const laneLabel = lane === 'all' ? 'All threads' : lane === 'snoozed' ? 'Snoozed' : STATE_PRESENTATION[lane].label;
   const selected = visible.find((t) => t.thread_id === selectedId) ?? null;
+
+  /**
+   * The row's ONE verb (§5). Exactly two of the seven have a backing endpoint
+   * today — `compose` (Answer / Steer, through the session-message path) and
+   * `close` (archive every session on the thread). The other three render
+   * inert with their reason; `STATE_PRESENTATION` owns that decision, and the
+   * row never calls this for them.
+   */
+  const onVerb = useCallback(
+    (t: ThreadSummary) => {
+      const action = STATE_PRESENTATION[t.state].action;
+      if (action === 'compose') {
+        setSelectedId(t.thread_id);
+        setFocusComposer((n) => n + 1);
+        return;
+      }
+      if (action === 'close') {
+        setNotice(`Closing ${t.title ?? 'thread'}…`);
+        closeThread(t)
+          .then(() => {
+            setNotice(`Closed ${t.title ?? 'thread'}.`);
+            void mutate();
+          })
+          .catch((err: { error?: string }) => setNotice(`Could not close — ${err.error ?? 'request failed'}.`));
+      }
+    },
+    [mutate],
+  );
+
+  const onToggleSnooze = useCallback(
+    (t: ThreadSummary) => {
+      setSnoozed(t.thread_id, !t.snoozed)
+        .then(() => {
+          setNotice(t.snoozed ? 'Un-snoozed.' : 'Snoozed until it moves.');
+          void mutate();
+        })
+        .catch((err: { error?: string }) => setNotice(`Could not snooze — ${err.error ?? 'request failed'}.`));
+    },
+    [mutate],
+  );
+
+  /**
+   * Triage is a mode over the CURRENT FILTERED LIST (§11), so entering it
+   * freezes `visible` — the same rows, the same order — and leaving it puts the
+   * operator back exactly where they were, scroll position included.
+   */
+  const savedScroll = useRef(0);
+  const enterTriage = useCallback(() => {
+    savedScroll.current = listRef.current?.scrollTop ?? 0;
+    setTriage(visible);
+  }, [visible]);
+  const exitTriage = useCallback(() => setTriage(null), []);
+  useEffect(() => {
+    if (triage === null && listRef.current) listRef.current.scrollTop = savedScroll.current;
+  }, [triage]);
 
   return (
     <div className="ncc">
@@ -177,6 +245,15 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
         <span className="ncc-attn-chip" aria-live="polite">
           Needs you <span className="ncc-mono">{attentionCount}</span>
         </span>
+        {/* §11: triage is entered FROM the list and is never the home screen. */}
+        <button
+          type="button"
+          className="ncc-solid-btn"
+          onClick={enterTriage}
+          disabled={visible.length === 0 || triage !== null}
+        >
+          Triage <span className="ncc-mono">{visible.length}</span>
+        </button>
         <button
           type="button"
           className="ncc-solid-btn"
@@ -190,7 +267,12 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
       <div className="ncc-body">
         <nav className="ncc-side" aria-label="Queue and channels">
           <h2 className="ncc-side-head">Queue</h2>
-          <LaneButton label="All threads" count={threads.length} active={lane === 'all'} onClick={() => setLane('all')} />
+          <LaneButton
+            label="All threads"
+            count={threads.length}
+            active={lane === 'all'}
+            onClick={() => setLane('all')}
+          />
           {LANE_ORDER.map((state) => (
             <LaneButton
               key={state}
@@ -202,12 +284,26 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
             />
           ))}
 
+          {snoozedCount > 0 && (
+            <LaneButton
+              label="Snoozed"
+              count={snoozedCount}
+              active={lane === 'snoozed'}
+              onClick={() => setLane('snoozed')}
+            />
+          )}
+
           <div className="ncc-side-gap" />
           <h2 className="ncc-side-head">
             <span className="lbl">Channels</span>
             <span className="ncc-mono">{channels.length}</span>
           </h2>
-          <LaneButton label="All channels" count={threads.length} active={channel === null} onClick={() => setChannel(null)} />
+          <LaneButton
+            label="All channels"
+            count={threads.length}
+            active={channel === null}
+            onClick={() => setChannel(null)}
+          />
           {channels.map((c) => (
             <button
               key={c.key}
@@ -238,7 +334,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
           </a>
         </nav>
 
-        <section className="ncc-list-pane" aria-label="Threads">
+        <section className="ncc-list-pane" aria-label="Threads" hidden={triage !== null}>
           <div className="ncc-list-head">
             <h2>{laneLabel}</h2>
             <span className="count">{visible.length}</span>
@@ -252,14 +348,38 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
                 thread={t}
                 withPreview={previewIds.has(t.thread_id)}
                 selected={t.thread_id === selectedId}
-                onSelect={(x) => setSelectedId(x.thread_id)}
+                onSelect={(x) => {
+                  setSelectedId(x.thread_id);
+                  // Opening a thread must not steal the cursor; only a verb
+                  // asks for the composer. See ReplyComposer's focus effect.
+                  setFocusComposer(0);
+                }}
+                onVerb={onVerb}
               />
             ))}
           </ul>
           {visible.length === 0 && <div className="ncc-empty">no threads in view</div>}
+          {/* Every mutating action reports here, once, for screen readers and
+              for anyone who did not watch the row change under the cursor. */}
+          <div className="ncc-notice" role="status" aria-live="polite">
+            {notice}
+          </div>
         </section>
 
-        <ThreadDetail thread={selected} />
+        {triage ? (
+          <TriagePanel snapshot={triage} threads={threads} onExit={exitTriage} onChanged={() => void mutate()} />
+        ) : (
+          <div className="ncc-detail-wrap">
+            {selected && (
+              <div className="ncc-detail-actions">
+                <button type="button" className="ncc-verb" onClick={() => onToggleSnooze(selected)}>
+                  {selected.snoozed ? 'un-snooze' : 'snooze'}
+                </button>
+              </div>
+            )}
+            <ThreadDetail thread={selected} focusComposer={focusComposer} onSent={() => void mutate()} />
+          </div>
+        )}
       </div>
     </div>
   );
@@ -295,11 +415,13 @@ function ConnectedRow({
   withPreview,
   selected,
   onSelect,
+  onVerb,
 }: {
   thread: ThreadSummary;
   withPreview: boolean;
   selected: boolean;
   onSelect: (t: ThreadSummary) => void;
+  onVerb: (t: ThreadSummary) => void;
 }) {
   // Keyed on `last_activity_at` as well as the id: SWR then reuses the cached
   // preview across every list refresh in which the thread did not actually move,
@@ -311,7 +433,13 @@ function ConnectedRow({
     { refreshInterval: 0, revalidateOnFocus: false },
   );
   return (
-    <ThreadRow thread={thread} preview={lastMessagePreview(data?.transcript)} selected={selected} onSelect={onSelect} />
+    <ThreadRow
+      thread={thread}
+      preview={lastMessagePreview(data?.transcript)}
+      selected={selected}
+      onSelect={onSelect}
+      onVerb={onVerb}
+    />
   );
 }
 
@@ -328,76 +456,6 @@ export function lastMessagePreview(transcript: ThreadTranscriptEntry[] | undefin
     speaker: last.direction === 'out' ? last.agent_name : '',
     excerpt: text.length > EXCERPT_CHARS ? `${text.slice(0, EXCERPT_CHARS)}…` : text,
   };
-}
-
-/* ─── Detail pane (§10.1 — merged transcript) ──────────────────────────── */
-
-function ThreadDetail({ thread }: { thread: ThreadSummary | null }) {
-  const { data } = useSWR(
-    thread ? ['thread-detail', thread.thread_id, thread.last_activity_at] : null,
-    () => getThreadDetail(thread!.thread_id),
-    { refreshInterval: 0 },
-  );
-
-  if (!thread) {
-    return (
-      <section className="ncc-detail" aria-label="Thread detail">
-        <div className="ncc-empty">select a thread</div>
-      </section>
-    );
-  }
-
-  const presentation = STATE_PRESENTATION[thread.state];
-  const sessionCount = thread.session_ids.length;
-
-  return (
-    <section className="ncc-detail" aria-label="Thread detail">
-      <div className="ncc-detail-head">
-        <span className="ncc-faces">
-          {thread.participants.slice(0, 3).map((p) => (
-            <span className="ncc-face" key={p.agent_group_id} title={p.name}>
-              <AgentAvatar name={p.name} initials={initials(p.name)} avatarUrl={p.avatarUrl} size={25} />
-            </span>
-          ))}
-        </span>
-        <div style={{ flexGrow: 1, minWidth: 0 }}>
-          <h2 className="ncc-detail-title">{thread.title ?? 'Untitled thread'}</h2>
-          <div className="ncc-detail-meta">
-            <span>{thread.channel_name}</span>
-            <span aria-hidden="true">·</span>
-            <span>{thread.participants.map((p) => p.name).join(', ') || 'no owner'}</span>
-            <span aria-hidden="true">·</span>
-            <span>{thread.last_activity_at ? `${relAge(thread.last_activity_at)} ago` : 'no activity'}</span>
-          </div>
-        </div>
-        <span className={`ncc-state ${presentation.tone}`}>{presentation.label}</span>
-      </div>
-
-      {/* §10.1: a thread's messages are split across one DB pair per agent, so
-          the merge is a real transformation the operator should know about. */}
-      <div className="ncc-detail-note">
-        Merged from {sessionCount} agent session{sessionCount === 1 ? '' : 's'} on this thread, in timestamp order.
-      </div>
-
-      <div className="ncc-transcript">
-        {(data?.transcript ?? []).map((m) => (
-          <div className={`ncc-msg ${m.direction}`} key={`${m.session_id}:${m.seq}`}>
-            <span className="ncc-face">
-              <AgentAvatar name={m.agent_name} initials={initials(m.agent_name)} avatarUrl={null} size={24} />
-            </span>
-            <div className="ncc-msg-body">
-              <div className="ncc-msg-who">
-                <span className="name">{m.direction === 'out' ? m.agent_name : 'Inbound'}</span>
-                <span className="at">{relAge(m.timestamp)} ago</span>
-              </div>
-              <div className="ncc-msg-text">{m.text}</div>
-            </div>
-          </div>
-        ))}
-        {data && data.transcript.length === 0 && <div className="ncc-empty">no messages on this thread</div>}
-      </div>
-    </section>
-  );
 }
 
 /* ─── Plumbing ─────────────────────────────────────────────────────────── */

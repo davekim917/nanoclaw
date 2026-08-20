@@ -56,6 +56,7 @@ import { migration050 } from './050-observatory-item-threads.js';
 import { migration051 } from './051-memory-consolidated-facts.js';
 import { migration052 } from './052-sessions-engaged-at.js';
 import { migration053 } from './053-normalize-naive-timestamps.js';
+import { migration054 } from './054-thread-snoozes.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -129,6 +130,11 @@ export const migrations: Migration[] = [
   migration050,
   migration051,
   migration052,
+  // Runs before 053 below, which is fine and deliberate: 053 normalizes an
+  // explicit table/column allowlist that does not include thread_snoozes and
+  // never will, so position cannot rescue a naive value here. 054 therefore
+  // writes ISO at the write site instead of relying on a later sweep.
+  migration054,
   containerConfigs,
   cliScope,
   messagingGroupInstance,

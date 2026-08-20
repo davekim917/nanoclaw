@@ -9,6 +9,7 @@ import {
   buildThreadList,
   deriveThreadState,
   mergeThreadTranscript,
+  replyTargetSessionId,
   threadChannelKey,
   UNKNOWN_CHANNEL_KEY,
   type ThreadListDeps,
@@ -420,6 +421,168 @@ describe('buildThreadList — grouping', () => {
     const scoped = makeCtx({ no_filter: false, allowed_group_ids: ['ag-1'] });
     const { threads } = await buildThreadList(scoped, LIST_OPTS, deps());
     expect(threads.map((t) => t.session_ids)).toEqual([['s-1']]);
+  });
+});
+
+// ── §10.3 reply targeting + snooze ───────────────────────────────────────────
+
+/**
+ * A thread is N sessions and the steer path writes into exactly ONE inbound
+ * queue, so the console has to name a session before it can send anything.
+ * These tests pin the default it names — "the agent whose state drove the row's
+ * urgency" — because the tempting shortcut is `session_ids[0]`, which routinely
+ * addresses an agent that never asked the question.
+ */
+describe('replyTargetSessionId (§10.3)', () => {
+  const rows = [{ id: 's-fresh' }, { id: 's-asked' }, { id: 's-old' }];
+  const asked = (r: { id: string }): boolean => r.id === 's-asked';
+  const nobody = (): boolean => false;
+
+  it('names the session actually sitting on the question, not the freshest', () => {
+    expect(replyTargetSessionId('needs_you', rows, { needsOperator: asked, pickedSessionId: null })).toBe('s-asked');
+  });
+
+  it('names the session whose container_state the row is rendering when it stalled', () => {
+    expect(replyTargetSessionId('stalled', rows, { needsOperator: nobody, pickedSessionId: 's-old' })).toBe('s-old');
+    expect(replyTargetSessionId('running', rows, { needsOperator: nobody, pickedSessionId: 's-old' })).toBe('s-old');
+  });
+
+  it('falls back to the most recently active session for every other state', () => {
+    for (const state of ['parked', 'done', 'idle', 'unassigned'] as const) {
+      expect(replyTargetSessionId(state, rows, { needsOperator: asked, pickedSessionId: 's-old' })).toBe('s-fresh');
+    }
+    // …and also when the state's own driver cannot be identified.
+    expect(replyTargetSessionId('needs_you', rows, { needsOperator: nobody, pickedSessionId: null })).toBe('s-fresh');
+    expect(replyTargetSessionId('stalled', rows, { needsOperator: nobody, pickedSessionId: null })).toBe('s-fresh');
+  });
+
+  it('returns null rather than inventing a target for a thread with no sessions', () => {
+    expect(replyTargetSessionId('unassigned', [], { needsOperator: nobody, pickedSessionId: null })).toBeNull();
+  });
+});
+
+describe('buildThreadList — reply target and snooze', () => {
+  beforeEach(() => {
+    closeDb();
+    setupDb();
+  });
+
+  it('gives every participant the session a reply to THEM lands in', async () => {
+    seedAgentGroup('ag-1');
+    seedAgentGroup('ag-2');
+    const thread = 'slack:CTESTCHAN01:1700000000.11';
+    insertSession({
+      id: 's-1',
+      agentGroupId: 'ag-1',
+      threadId: thread,
+      lastOutboundAt: iso(600_000),
+      lastActive: iso(600_000),
+    });
+    insertSession({
+      id: 's-2',
+      agentGroupId: 'ag-2',
+      threadId: thread,
+      lastOutboundAt: iso(60_000),
+      lastActive: iso(60_000),
+    });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.participants.map((p) => [p.agent_group_id, p.session_id])).toEqual([
+      ['ag-2', 's-2'],
+      ['ag-1', 's-1'],
+    ]);
+    // Nothing is asking and nothing is live, so the default is the freshest.
+    expect(threads[0]!.reply_target_session_id).toBe('s-2');
+  });
+
+  it('aims at the session that asked, even when another agent spoke more recently', async () => {
+    seedAgentGroup('ag-1');
+    seedAgentGroup('ag-2');
+    const thread = 'slack:CTESTCHAN01:1700000000.11';
+    insertSession({
+      id: 's-asked',
+      agentGroupId: 'ag-1',
+      threadId: thread,
+      lastOutboundAt: iso(600_000),
+      lastActive: iso(900_000),
+    });
+    insertSession({
+      id: 's-chatty',
+      agentGroupId: 'ag-2',
+      threadId: thread,
+      lastOutboundAt: iso(60_000),
+      lastActive: iso(60_000),
+    });
+    // An unanswered `ask_question`: the outbound is newer than the last inbound.
+    getDb()
+      .prepare(`UPDATE sessions SET last_outbound_kind = 'chat-sdk:ask_question', last_active = ? WHERE id = ?`)
+      .run(iso(900_000), 's-asked');
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.state).toBe('needs_you');
+    expect(threads[0]!.reply_target_session_id).toBe('s-asked');
+  });
+
+  it('aims at the session whose container_state it is rendering when the row is stalled', async () => {
+    seedAgentGroup('ag-1');
+    seedAgentGroup('ag-2');
+    const thread = 'slack:CTESTCHAN01:1700000000.11';
+    // Both sessions last spoke BEFORE the tool started — that is what makes the
+    // 30-minute stall rule fire (§5): a newer output would mean it un-wedged.
+    insertSession({
+      id: 's-wedged',
+      agentGroupId: 'ag-1',
+      threadId: thread,
+      lastOutboundAt: iso(90 * 60_000),
+      lastActive: iso(90 * 60_000),
+    });
+    insertSession({
+      id: 's-fine',
+      agentGroupId: 'ag-2',
+      threadId: thread,
+      lastOutboundAt: iso(50 * 60_000),
+      lastActive: iso(50 * 60_000),
+    });
+
+    const { threads } = await buildThreadList(
+      makeCtx(),
+      LIST_OPTS,
+      deps({
+        activeContainerSessionIds: () => ['s-wedged'],
+        containerState: (_ag, id) =>
+          id === 's-wedged'
+            ? ({ current_tool: 'Bash', tool_started_at: iso(45 * 60_000), provider_status: 'active' } as never)
+            : null,
+      }),
+    );
+    expect(threads[0]!.state).toBe('stalled');
+    expect(threads[0]!.reply_target_session_id).toBe('s-wedged');
+  });
+
+  it('reports no snooze by default', async () => {
+    seedAgentGroup('ag-1');
+    insertSession({ id: 's-1', agentGroupId: 'ag-1', threadId: 'slack:CTESTCHAN01:1700000000.11' });
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.snoozed).toBe(false);
+  });
+
+  it('reports the caller’s own snooze, and drops it once the thread moves', async () => {
+    seedAgentGroup('ag-1');
+    const thread = 'slack:CTESTCHAN01:1700000000.11';
+    insertSession({ id: 's-1', agentGroupId: 'ag-1', threadId: thread, lastOutboundAt: iso(60_000) });
+    getDb()
+      .prepare(`INSERT INTO thread_snoozes (thread_id, user_id, snoozed_at_activity, created_at) VALUES (?, ?, ?, ?)`)
+      .run(thread, 'u1', iso(60_000), iso(0));
+
+    expect((await buildThreadList(makeCtx(), LIST_OPTS, deps())).threads[0]!.snoozed).toBe(true);
+    // Another operator sees the thread untouched — a snooze is one queue's view.
+    const other = makeCtx();
+    other.user.id = 'u2';
+    expect((await buildThreadList(other, LIST_OPTS, deps())).threads[0]!.snoozed).toBe(false);
+
+    // The thread speaks again: the same row stops hiding it, with no sweep.
+    getDb().prepare('UPDATE sessions SET last_outbound_at = ? WHERE id = ?').run(iso(0), 's-1');
+    expect((await buildThreadList(makeCtx(), LIST_OPTS, deps())).threads[0]!.snoozed).toBe(false);
   });
 });
 

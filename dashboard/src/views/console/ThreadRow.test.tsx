@@ -29,8 +29,8 @@ function thread(over: Partial<ThreadSummary> = {}): ThreadSummary {
     channel_name: '#example-eng',
     title: 'Waiting: which OAuth flow for the retry path?',
     participants: [
-      { agent_group_id: 'ag-1', name: 'Alpha', avatarUrl: null, provider: 'claude' },
-      { agent_group_id: 'ag-2', name: 'Bravo', avatarUrl: null, provider: 'codex' },
+      { agent_group_id: 'ag-1', name: 'Alpha', session_id: 's-1', avatarUrl: null, provider: 'claude' },
+      { agent_group_id: 'ag-2', name: 'Bravo', session_id: 's-2', avatarUrl: null, provider: 'codex' },
     ],
     last_activity_at: '2026-08-20T09:00:00.000Z',
     state: 'needs_you',
@@ -39,6 +39,8 @@ function thread(over: Partial<ThreadSummary> = {}): ThreadSummary {
     provider_status: null,
     current_tool: null,
     tool_started_at: null,
+    reply_target_session_id: 's-1',
+    snoozed: false,
     ...over,
   };
 }
@@ -74,6 +76,54 @@ describe('all seven states render', () => {
       if (s === 'idle') expect(verb).toBeNull();
       else expect(verb!.split(/\s/)).toHaveLength(1);
     }
+  });
+
+  /**
+   * §1 says every row ends in a verb, and three of the seven verbs have no
+   * backing endpoint today. Hiding those buttons would quietly rewrite the
+   * contract; rendering them inert WITH THE REASON is the honest shape, and
+   * these tests exist because "just hide it" is the tempting simplification.
+   */
+  describe('verbs with no backing endpoint render inert, not hidden', () => {
+    it.each(['stalled', 'unassigned', 'parked'] as ThreadState[])('%s carries a reason on the button', (state) => {
+      const onVerb = vi.fn();
+      const { row } = renderRow({ state }, { onVerb });
+      const verb = row.querySelector('.ncc-verb')!;
+      expect(verb.textContent).toBe(STATE_PRESENTATION[state].verb);
+      expect(verb.getAttribute('aria-disabled')).toBe('true');
+      expect(verb.getAttribute('title')).toBe(STATE_PRESENTATION[state].inertReason);
+      // Focusable on purpose: a real `disabled` button cannot be reached by
+      // keyboard, and the explanation would be unreachable with it.
+      expect(verb.hasAttribute('disabled')).toBe(false);
+      expect(verb.getAttribute('aria-label')).toContain('unavailable');
+    });
+
+    it.each(['stalled', 'unassigned', 'parked'] as ThreadState[])('%s does nothing when pressed', async (state) => {
+      const onVerb = vi.fn();
+      const { row } = renderRow({ state }, { onVerb });
+      await userEvent.click(row.querySelector('.ncc-verb') as HTMLElement);
+      expect(onVerb).not.toHaveBeenCalled();
+    });
+
+    it.each(['needs_you', 'running', 'done'] as ThreadState[])('%s is live and fires its verb', async (state) => {
+      const onVerb = vi.fn();
+      const { row } = renderRow({ state }, { onVerb });
+      const verb = row.querySelector('.ncc-verb')!;
+      expect(verb.getAttribute('aria-disabled')).toBeNull();
+      expect(verb.getAttribute('title')).toBeNull();
+      await userEvent.click(verb as HTMLElement);
+      expect(onVerb).toHaveBeenCalledTimes(1);
+    });
+
+    it('every inert reason names what is missing rather than just saying no', () => {
+      for (const state of ALL_STATES) {
+        const { inertReason, action } = STATE_PRESENTATION[state];
+        // A verb is either wired or explained — never silently dead.
+        if (STATE_PRESENTATION[state].verb === null) continue;
+        expect(action === null).toBe(inertReason !== null);
+        if (inertReason) expect(inertReason.length).toBeGreaterThan(40);
+      }
+    });
   });
 
   it('paints the status bar only when the row wants something (§4)', () => {
@@ -175,6 +225,7 @@ describe('avatar stack (§4)', () => {
     Array.from({ length: n }, (_, i) => ({
       agent_group_id: `ag-${i}`,
       name: `Agent ${i}`,
+      session_id: `s-${i}`,
       avatarUrl: null,
       provider: 'claude',
     }));
@@ -193,8 +244,14 @@ describe('avatar stack (§4)', () => {
   it('uses the real avatar when one exists, and initials when it does not', () => {
     const { row } = renderRow({
       participants: [
-        { agent_group_id: 'ag-1', name: 'Alpha', avatarUrl: 'https://example.invalid/a_72.png', provider: 'claude' },
-        { agent_group_id: 'ag-2', name: 'Bravo', avatarUrl: null, provider: 'claude' },
+        {
+          agent_group_id: 'ag-1',
+          name: 'Alpha',
+          session_id: 's-1',
+          avatarUrl: 'https://example.invalid/a_72.png',
+          provider: 'claude',
+        },
+        { agent_group_id: 'ag-2', name: 'Bravo', session_id: 's-2', avatarUrl: null, provider: 'claude' },
       ],
     });
     const faces = row.querySelectorAll('.ncc-face');

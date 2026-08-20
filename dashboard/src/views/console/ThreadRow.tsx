@@ -32,9 +32,9 @@ export interface ThreadRowProps {
   now?: number;
   onSelect: (thread: ThreadSummary) => void;
   /**
-   * The row's ONE verb (§1: every row ends in a verb). Phase 2 hands it back
-   * to the console, which opens the thread — the real Answer/Kill/Assign
-   * actions land in Phase 3 once DESIGN §10.3 reconciles the two steer paths.
+   * The row's ONE verb (§1: every row ends in a verb). Called only for verbs
+   * that have a backing endpoint — `STATE_PRESENTATION[state].inertReason`
+   * names the ones that do not, and those render as an explained no-op.
    */
   onVerb?: (thread: ThreadSummary) => void;
 }
@@ -46,6 +46,7 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
   const shown = thread.participants.slice(0, MAX_FACES);
   const overflow = thread.participants.length - shown.length;
   const live = showsLiveLine(thread);
+  const inert = presentation.inertReason !== null;
   const agentCount = thread.participants.length;
   const age = thread.last_activity_at ? relAge(thread.last_activity_at, now) : '—';
 
@@ -120,7 +121,30 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
             {/* §5: `idle` is the one state whose verb column reads `—`. It gets
                 no button; the row body above is still the way in. */}
             {presentation.verb && (
-              <button type="button" className="ncc-verb" onClick={() => (onVerb ?? onSelect)(thread)}>
+              /*
+               * A verb with no backing endpoint renders INERT, never hidden:
+               * §1's "every row ends in a verb" is the contract, and dropping
+               * the button would quietly rewrite it. The reason is the button's
+               * `title`.
+               *
+               * `aria-disabled` rather than `disabled` on purpose — a real
+               * `disabled` button is not focusable, so a keyboard or
+               * screen-reader user could never reach the explanation, which is
+               * the entire point of rendering it. The reason therefore also
+               * rides in the accessible name, since `title` alone is not
+               * reliably announced.
+               */
+              <button
+                type="button"
+                className="ncc-verb"
+                aria-disabled={inert ? true : undefined}
+                {...(inert ? { title: presentation.inertReason ?? '' } : {})}
+                {...(inert ? { 'aria-label': `${presentation.verb} — unavailable. ${presentation.inertReason}` } : {})}
+                onClick={() => {
+                  if (inert) return;
+                  (onVerb ?? onSelect)(thread);
+                }}
+              >
                 {presentation.verb}
               </button>
             )}
@@ -155,7 +179,10 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
 export function LivenessRule({ running }: { running: boolean }) {
   return (
     <div className="ncc-track" aria-hidden="true">
-      <div className={running ? 'ncc-seg ncc-seg-live' : 'ncc-seg ncc-seg-still'} data-motion={running ? 'live' : 'still'} />
+      <div
+        className={running ? 'ncc-seg ncc-seg-live' : 'ncc-seg ncc-seg-still'}
+        data-motion={running ? 'live' : 'still'}
+      />
     </div>
   );
 }

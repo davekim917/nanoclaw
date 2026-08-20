@@ -42,6 +42,7 @@ import { log } from '../../log.js';
 import type { AgentGroup } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import { parseUtcMs } from './observatory.js';
+import { isSnoozed, readThreadSnoozes } from '../thread-snooze.js';
 import {
   deriveContainerStatus,
   readSessionTranscript,
@@ -201,6 +202,22 @@ export function deriveThreadState(input: ThreadStateInput): ThreadState {
 export interface ThreadParticipant {
   agent_group_id: string;
   name: string;
+  /**
+   * The session a reply addressed to THIS participant lands in — its most
+   * recent session on the thread (§10.3).
+   *
+   * A thread is N sessions, one per participating agent, and the steer path
+   * (`POST /dashboard/api/sessions/:id/message`) writes into exactly one
+   * inbound queue. So "reply to this thread" is not a well-formed request until
+   * an agent is named: this field is what makes naming one possible, and
+   * {@link ThreadSummary.reply_target_session_id} is the default choice.
+   *
+   * Usually one session per agent per thread, but `sessions` is keyed on
+   * `(agent_group_id, messaging_group_id, thread_id)` — a sibling bot wired
+   * through two messaging groups can hold two. The freshest wins, since the
+   * participant list is already ordered most-recent-first.
+   */
+  session_id: string;
   avatarUrl: string | null;
   /**
    * Resolved through `resolveProviderName` (session → container config →
@@ -238,6 +255,25 @@ export interface ThreadSummary {
   current_tool: string | null;
   /** ISO-8601 UTC, normalized — see {@link ThreadSummary.last_activity_at}. */
   tool_started_at: string | null;
+  /**
+   * Which session the console's Answer / Steer composer aims at by default
+   * (§10.3). The rule is "the agent whose state drove this row's urgency":
+   *
+   * - `needs_you` → the session actually sitting on the unanswered question,
+   * - `stalled` / `running` → the session whose `container_state` was picked,
+   * - anything else → the most recently active session.
+   *
+   * A DEFAULT, never a lock: the operator can retarget any participant, and
+   * the send always names the session explicitly. Null only when the thread
+   * somehow has no sessions, which the list path cannot currently produce.
+   */
+  reply_target_session_id: string | null;
+  /**
+   * This caller's own snooze is still in force — the thread has not moved since
+   * they took it. Per-user view state, not a state in §5's sense: a thread can
+   * be snoozed while it is running. See `thread-snooze.ts`.
+   */
+  snoozed: boolean;
 }
 
 /** Anything that leaves this module as a timestamp goes out as ISO-8601 UTC. */
@@ -605,6 +641,33 @@ function sessionNeedsOperator(row: ThreadSessionRow): boolean {
   );
 }
 
+/**
+ * Which session a reply to this thread should land in by default (§10.3).
+ *
+ * Pure and exported because this is the seam the whole action bar hangs off:
+ * a thread is N inbound queues and the steer path writes to exactly one, so
+ * picking the wrong one sends the operator's answer to an agent that never
+ * asked. "The agent whose state drove the row's urgency" is the rule; the
+ * fallback is the most recently active session, which is `ordered[0]` because
+ * the caller already sorted by activity.
+ *
+ * `pickedSessionId` is the session whose `container_state` the row is
+ * rendering — the failed one, or the one holding a tool. It is null whenever
+ * no session was probed.
+ */
+export function replyTargetSessionId<T extends { id: string }>(
+  state: ThreadState,
+  ordered: T[],
+  opts: { needsOperator: (row: T) => boolean; pickedSessionId: string | null },
+): string | null {
+  if (state === 'needs_you') {
+    const asked = ordered.find((r) => opts.needsOperator(r));
+    if (asked) return asked.id;
+  }
+  if ((state === 'stalled' || state === 'running') && opts.pickedSessionId) return opts.pickedSessionId;
+  return ordered[0]?.id ?? null;
+}
+
 interface ThreadAccum {
   threadId: string;
   synthetic: boolean;
@@ -664,6 +727,12 @@ export async function buildThreadList(
     })),
     avatarLookup,
   );
+  // One query for the whole page's snoozes, never one per row. Per-user by
+  // construction — see thread-snooze.ts on why this is not archive.
+  const snoozes = readThreadSnoozes(
+    ctx.user.id,
+    grouped.map((t) => t.threadId),
+  );
 
   const threads: ThreadSummary[] = grouped.map((thread) => {
     const ordered = [...thread.rows].sort((a, b) => activityMs(b) - activityMs(a));
@@ -683,6 +752,9 @@ export async function buildThreadList(
       participants.push({
         agent_group_id: row.agent_group_id,
         name: id?.name ?? row.agent_group_id,
+        // `ordered` is activity-desc and this loop takes the first row per
+        // agent, so this is that agent's freshest session on the thread.
+        session_id: row.id,
         avatarUrl: id?.avatarUrl ?? null,
         provider: id?.provider ?? resolveProviderName(row.agent_provider, null),
       });
@@ -712,13 +784,33 @@ export async function buildThreadList(
     // The most interesting container_state across the thread: a failed provider
     // outranks a tool in flight, which outranks anything idle.
     let picked: ContainerState | null = null;
+    // Which session `picked` came from — the Kill/Steer target when this row is
+    // stalled or running (§10.3). Tracked alongside rather than re-derived,
+    // because "the container_state we rendered" and "the session that owns it"
+    // must never disagree.
+    let pickedSessionId: string | null = null;
     for (const row of ordered) {
       const s = states.get(row.id);
       if (!s) continue;
-      if (!picked) picked = s;
-      else if (s.provider_status === 'failed') picked = s;
-      else if (picked.provider_status !== 'failed' && !picked.tool_started_at && s.tool_started_at) picked = s;
+      if (!picked) {
+        picked = s;
+        pickedSessionId = row.id;
+      } else if (s.provider_status === 'failed') {
+        picked = s;
+        pickedSessionId = row.id;
+      } else if (picked.provider_status !== 'failed' && !picked.tool_started_at && s.tool_started_at) {
+        picked = s;
+        pickedSessionId = row.id;
+      }
     }
+
+    // Hoisted out of the return literal: TypeScript's control-flow analysis
+    // narrows `picked` to `never` when it is read after the arrow functions
+    // below, and reading it once here is clearer than three `?.` chains anyway.
+    const providerStatus: string | null = picked?.provider_status ?? null;
+    const currentTool: string | null = picked?.current_tool ?? null;
+    const toolStartedAt: string | null = isoOrNull(picked?.tool_started_at);
+    const toolStartedAtMs: number | null = parseUtcMs(picked?.tool_started_at);
 
     const lastOutputAtMs = ordered.reduce<number | null>((acc, row) => {
       const ms = parseUtcMs(row.last_outbound_at);
@@ -730,6 +822,20 @@ export async function buildThreadList(
     const claim = claims.get(thread.threadId) ?? null;
     const channelKey = threadChannelKey(thread.synthetic ? null : thread.threadId, known);
 
+    const state = deriveThreadState({
+      sessionCount: ordered.length,
+      allArchived: ordered.every((r) => r.archived_at !== null),
+      claimState: claim?.state ?? null,
+      claimNote: claim?.note ?? '',
+      needsOperator: ordered.some(sessionNeedsOperator),
+      containerStatus,
+      providerStatus,
+      toolStartedAtMs,
+      lastOutputAtMs,
+      now,
+    });
+    const lastActivityAt = isoOrNull(lastActivity);
+
     return {
       thread_id: thread.threadId,
       synthetic: thread.synthetic,
@@ -737,24 +843,18 @@ export async function buildThreadList(
       channel_name: names.get(channelKey) ?? channelKeyLabel(channelKey),
       title,
       participants,
-      last_activity_at: isoOrNull(lastActivity),
-      state: deriveThreadState({
-        sessionCount: ordered.length,
-        allArchived: ordered.every((r) => r.archived_at !== null),
-        claimState: claim?.state ?? null,
-        claimNote: claim?.note ?? '',
-        needsOperator: ordered.some(sessionNeedsOperator),
-        containerStatus,
-        providerStatus: picked?.provider_status ?? null,
-        toolStartedAtMs: parseUtcMs(picked?.tool_started_at),
-        lastOutputAtMs,
-        now,
-      }),
+      last_activity_at: lastActivityAt,
+      state,
       session_ids: ordered.map((r) => r.id),
       container_status: containerStatus,
-      provider_status: picked?.provider_status ?? null,
-      current_tool: picked?.current_tool ?? null,
-      tool_started_at: isoOrNull(picked?.tool_started_at),
+      provider_status: providerStatus,
+      current_tool: currentTool,
+      tool_started_at: toolStartedAt,
+      reply_target_session_id: replyTargetSessionId(state, ordered, {
+        needsOperator: sessionNeedsOperator,
+        pickedSessionId,
+      }),
+      snoozed: snoozes.has(thread.threadId) && isSnoozed(snoozes.get(thread.threadId), lastActivityAt),
     };
   });
 
