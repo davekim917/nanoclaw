@@ -144,6 +144,9 @@ describe('sessionsHandler — D4', () => {
     insertSession('sess-1', 'ag-1');
     insertSession('sess-2', 'ag-1');
     insertSession('sess-3', 'ag-2');
+    setSessionFields('sess-1', { last_outbound_at: now() });
+    setSessionFields('sess-2', { last_outbound_at: now() });
+    setSessionFields('sess-3', { last_outbound_at: now() });
     const ctx = makeCtx('u1', { no_filter: true });
     const resp = await sessionsHandler(makeReq(), {}, ctx);
     expect(resp!.status).toBe(200);
@@ -154,9 +157,12 @@ describe('sessionsHandler — D4', () => {
   it('test_sessions_scoped_admin', async () => {
     insertSession('sess-1', 'ag-1');
     insertSession('sess-2', 'ag-2');
+    setSessionFields('sess-1', { last_outbound_at: now() });
+    setSessionFields('sess-2', { last_outbound_at: now() });
     const ctx = makeCtx('u1', { allowed_group_ids: ['ag-1'] });
     const resp = await sessionsHandler(makeReq(), {}, ctx);
     const body = (await resp!.json()) as { sessions: Array<{ agent_group_id: string }> };
+    expect(body.sessions.length).toBeGreaterThan(0);
     expect(body.sessions.every((s) => s.agent_group_id === 'ag-1')).toBe(true);
   });
 
@@ -165,6 +171,14 @@ describe('sessionsHandler — D4', () => {
     insertSession('sess-idle', 'ag-1');
     insertSession('sess-stale', 'ag-1');
     insertSession('sess-unknown', 'ag-1');
+
+    // Heartbeat status is independent of the engaged-only filter (which
+    // reads the persisted DB column, not the live heartbeat file), so mark
+    // all four sessions engaged to keep this test focused on heartbeat →
+    // container_status derivation.
+    for (const id of ['sess-running', 'sess-idle', 'sess-stale', 'sess-unknown']) {
+      setSessionFields(id, { last_outbound_at: now() });
+    }
 
     const nowMs = Date.now();
     vi.mocked(fs.statSync).mockImplementation((p) => {
@@ -189,6 +203,8 @@ describe('sessionsHandler — D4', () => {
   it('test_sessions_member_only_returns_member_groups', async () => {
     insertSession('sess-1', 'ag-1');
     insertSession('sess-2', 'ag-2');
+    setSessionFields('sess-1', { last_outbound_at: now() });
+    setSessionFields('sess-2', { last_outbound_at: now() });
     const ctx = makeCtx('u1', { allowed_group_ids: ['ag-1'] });
     const resp = await sessionsHandler(makeReq(), {}, ctx);
     const body = (await resp!.json()) as { sessions: unknown[] };
@@ -198,6 +214,8 @@ describe('sessionsHandler — D4', () => {
   it('group_id filter narrows to one agent group', async () => {
     insertSession('sess-1', 'ag-1');
     insertSession('sess-2', 'ag-2');
+    setSessionFields('sess-1', { last_outbound_at: now() });
+    setSessionFields('sess-2', { last_outbound_at: now() });
     const ctx = makeCtx('u1', { no_filter: true });
     const resp = await sessionsHandler(makeReq('http://localhost/dashboard/api/sessions?group_id=ag-2'), {}, ctx);
     const body = (await resp!.json()) as { sessions: Array<{ agent_group_id: string }> };
@@ -217,7 +235,8 @@ describe('sessionsHandler — D4', () => {
   it('archived sessions hidden by default, surfaced with include_archived=1', async () => {
     insertSession('sess-live', 'ag-1');
     insertSession('sess-old', 'ag-1');
-    setSessionFields('sess-old', { archived_at: now() });
+    setSessionFields('sess-live', { last_outbound_at: now() });
+    setSessionFields('sess-old', { archived_at: now(), last_outbound_at: now() });
     const ctx = makeCtx('u1', { no_filter: true });
 
     const respHidden = await sessionsHandler(makeReq(), {}, ctx);
@@ -264,6 +283,10 @@ describe('sessionsHandler — D4', () => {
       agentGroupId: 'ag-1',
       status: 'completed',
     });
+    // A terminal task doesn't count as an in-flight "attached" task for the
+    // engaged-only filter (only pending/running do) — the completed task
+    // still delivered output at some point, so mark it engaged directly.
+    setSessionFields('child-sess-old', { last_outbound_at: now() });
     const ctx = makeCtx('u1', { no_filter: true });
     const resp = await sessionsHandler(makeReq('http://localhost/dashboard/api/sessions?group_id=ag-1'), {}, ctx);
     const body = (await resp!.json()) as {
@@ -356,7 +379,11 @@ describe('sessionsHandler — D4', () => {
     // `idle`, not `stale`. Before Q4 fix, last_active=NULL → ageMs=Infinity
     // → stale immediately on the first inbox refresh.
     insertSession('sess-fresh', 'ag-1');
-    // last_active stays NULL by default
+    // last_active stays NULL by default; mark engaged via a *past* outbound
+    // (outside the 5-min active window) so the engaged-only filter doesn't
+    // swallow the row, without also tripping the "active" fallback this
+    // test is specifically checking doesn't apply.
+    setSessionFields('sess-fresh', { last_outbound_at: new Date(Date.now() - 10 * 60_000).toISOString() });
     vi.mocked(fs.statSync).mockImplementation(() => {
       throw new Error('ENOENT');
     });
@@ -409,6 +436,58 @@ describe('sessionsHandler — D4', () => {
     expect(row.title).toBe('EXAMPLE-71 — rollout fix');
     expect(row.last_outbound_at).toBe('2026-05-13T12:00:00Z');
     expect(row.last_outbound_kind).toBe('chat-sdk:chat_message');
+  });
+
+  describe('engaged-only filter', () => {
+    it('never-engaged session (inbound arrived, agent never woke) is excluded', async () => {
+      // Plain insertSession: no last_outbound_at, container_status default
+      // 'stopped', no attached task — mirrors an unknown-sender/unmatched
+      // engage-mode Slack alert that correctly never woke the agent.
+      insertSession('sess-never-engaged', 'ag-1');
+      const ctx = makeCtx('u1', { no_filter: true });
+      const resp = await sessionsHandler(makeReq(), {}, ctx);
+      const body = (await resp!.json()) as { sessions: Array<{ session_id: string }> };
+      expect(body.sessions.map((s) => s.session_id)).not.toContain('sess-never-engaged');
+    });
+
+    it('engaged session (has produced an outbound reply) is included', async () => {
+      insertSession('sess-engaged', 'ag-1');
+      setSessionFields('sess-engaged', { last_outbound_at: now() });
+      const ctx = makeCtx('u1', { no_filter: true });
+      const resp = await sessionsHandler(makeReq(), {}, ctx);
+      const body = (await resp!.json()) as { sessions: Array<{ session_id: string }> };
+      expect(body.sessions.map((s) => s.session_id)).toContain('sess-engaged');
+    });
+
+    it('a session appears the moment it becomes engaged (first outbound reply)', async () => {
+      insertSession('sess-becomes-engaged', 'ag-1');
+      const ctx = makeCtx('u1', { no_filter: true });
+
+      const respBefore = await sessionsHandler(makeReq(), {}, ctx);
+      const bodyBefore = (await respBefore!.json()) as { sessions: Array<{ session_id: string }> };
+      expect(bodyBefore.sessions.map((s) => s.session_id)).not.toContain('sess-becomes-engaged');
+
+      setSessionFields('sess-becomes-engaged', { last_outbound_at: now() });
+      const respAfter = await sessionsHandler(makeReq(), {}, ctx);
+      const bodyAfter = (await respAfter!.json()) as { sessions: Array<{ session_id: string }> };
+      expect(bodyAfter.sessions.map((s) => s.session_id)).toContain('sess-becomes-engaged');
+    });
+
+    it('a session with an in-flight (pending/running) task is included even with no outbound yet', async () => {
+      insertSession('parent-inflight', 'ag-1');
+      insertSession('child-inflight', 'ag-1');
+      insertAttachedTask({
+        taskId: 'task-inflight',
+        childSessId: 'child-inflight',
+        parentSessId: 'parent-inflight',
+        agentGroupId: 'ag-1',
+        status: 'running',
+      });
+      const ctx = makeCtx('u1', { no_filter: true });
+      const resp = await sessionsHandler(makeReq('http://localhost/dashboard/api/sessions?group_id=ag-1'), {}, ctx);
+      const body = (await resp!.json()) as { sessions: Array<{ session_id: string }> };
+      expect(body.sessions.map((s) => s.session_id)).toContain('child-inflight');
+    });
   });
 });
 

@@ -41,6 +41,10 @@
  *                         Default: hide them.
  *   - limit             — page cap; default 100, max 500.
  *
+ * Never-engaged sessions (inbound arrived, but nothing ever woke the agent)
+ * are always excluded — see the WHERE-clause comment below for the signal.
+ * Unlike include_archived there is no toggle to surface them.
+ *
  * Scheduled-recurrence is only checked for sessions that would otherwise
  * fall into the `stale` bucket — opening per-session inbound.db files is
  * expensive, and the check is purely a stale-false-positive guard.
@@ -229,6 +233,23 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
   if (!includeArchived) {
     conditions.push('s.archived_at IS NULL');
   }
+
+  // Never-engaged sessions (an inbound message arrived but nothing ever
+  // woke the agent — e.g. an unknown-sender or unmatched-engage-mode Slack
+  // alert) still mint a session row and otherwise clutter the idle lane
+  // forever. A session counts as engaged the moment ANY of these persist:
+  //   - last_outbound_at   — an operator-visible reply was ever sent
+  //                          (bumpLastOutbound in delivery.ts).
+  //   - container_status   — the container is running/idle right now, so a
+  //                          mid-first-turn session isn't hidden before it
+  //                          has had a chance to reply.
+  //   - t.task_id          — an in-flight (pending/running) task is
+  //                          attached, mirroring the `active` attention
+  //                          state's own definition of "doing something".
+  // All three are already-selected central-DB columns — no per-session
+  // file I/O, unlike the recurrence probe below. This is unconditional
+  // (no toggle): the lane is meant to show real work only.
+  conditions.push("(s.last_outbound_at IS NOT NULL OR s.container_status <> 'stopped' OR t.task_id IS NOT NULL)");
 
   values.push(limit);
 
