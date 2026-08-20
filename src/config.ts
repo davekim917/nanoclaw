@@ -13,6 +13,8 @@ const envConfig = readEnvFile([
   'ONECLI_API_KEY',
   'TZ',
   'NANOCLAW_WORKGROUP_SHARED_FS',
+  'NANOCLAW_SELF_HEAL',
+  'NANOCLAW_SELF_HEAL_TAKEOVER',
   'CONTAINER_CPU_LIMIT',
   'CONTAINER_MEMORY_LIMIT',
   'CONTAINER_MEMORY_RESERVATION',
@@ -75,6 +77,21 @@ export const REPO_ROOT = PROJECT_ROOT;
 // process.env, or the flag silently reads false. See docs/specs/workgroup-shared-fs.md.
 export const WORKGROUP_SHARED_FS =
   (process.env.NANOCLAW_WORKGROUP_SHARED_FS ?? envConfig.NANOCLAW_WORKGROUP_SHARED_FS) === '1';
+// Feature flag: when '1', the host sweep ACTS on its self-heal detections
+// (wedged-tool accountability wakes, failed-provider respawns). Default OFF —
+// detection and the `self-heal: would …` log line always run; kills, respawns,
+// and chat notices need the flag. Same env-then-.env read as
+// WORKGROUP_SHARED_FS above, and for the same reason: these consts are captured
+// at import time, before index.ts calls loadEnvIntoProcess().
+export const SELF_HEAL_ENABLED = (process.env.NANOCLAW_SELF_HEAL ?? envConfig.NANOCLAW_SELF_HEAL) === '1';
+// Feature flag: arms ONLY the stale-claim ladder's last rung — a sibling agent
+// group being handed another agent's abandoned claim. Deliberately independent
+// of SELF_HEAL_ENABLED (both must be '1' for a takeover to fire): it is the one
+// self-heal action where an agent takes work from another agent with no human
+// in the loop, and a misfire recreates the duplicate work claims exist to
+// prevent. Nudges prove themselves first. See modules/claims/self-heal.ts.
+export const SELF_HEAL_TAKEOVER_ENABLED =
+  (process.env.NANOCLAW_SELF_HEAL_TAKEOVER ?? envConfig.NANOCLAW_SELF_HEAL_TAKEOVER) === '1';
 // Local agent-template library. Committed but ships empty (+ README). Resolved
 // once at load. Override to another LOCAL path via NANOCLAW_TEMPLATES_DIR; never
 // a remote URL, never an ncl flag, never runtime-mutable.

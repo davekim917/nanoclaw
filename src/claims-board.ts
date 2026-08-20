@@ -8,9 +8,10 @@
  *
  * This is the read side. It deliberately owns no I/O beyond the directory scan
  * and no staleness rule of its own: `isStalePastGrace` and
- * `ESCALATION_GRACE_MS` come from the escalation sweep, so the board and the
- * alert can never disagree about what "stale" means. A third definition living
- * here is exactly how a board starts lying.
+ * `ESCALATION_GRACE_MS` come from `modules/claims/escalation.ts`, so the board
+ * and the dashboard's `escalated` badge (`dashboard/api/workgroups.ts`) can
+ * never disagree about what "stale" means. A third definition living here is
+ * exactly how a board starts lying.
  *
  * Rendered into the existing channel canvas rather than a canvas of its own.
  * The board answers "what work exists"; claims answer "who has it". Those are

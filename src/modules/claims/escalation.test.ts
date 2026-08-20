@@ -1,25 +1,9 @@
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import { describe, expect, it } from 'vitest';
 
-import { describe, expect, it, vi } from 'vitest';
-
-import {
-  declaresItselfFinished,
-  ESCALATION_GRACE_MS,
-  escalateClaim,
-  findEscalationCandidates,
-  isQuietHours,
-  isStalePastGrace,
-  shouldEscalate,
-  shouldSkipClaimsScan,
-  type EscalationCandidate,
-  type EscalationDeliveryDeps,
-} from './escalation.js';
+import { declaresItselfFinished, ESCALATION_GRACE_MS, isStalePastGrace, shouldEscalate } from './escalation.js';
 
 const HOUR_MS = 60 * 60 * 1000;
-const NOW = Date.parse('2026-08-10T12:00:00.000Z'); // noon UTC — outside any US quiet window
-const TZ = 'America/New_York'; // UTC-4 in August (EDT)
+const NOW = Date.parse('2026-08-10T12:00:00.000Z'); // noon UTC
 
 function iso(msAgo: number): string {
   return new Date(NOW - msAgo).toISOString();
@@ -55,33 +39,6 @@ describe('isStalePastGrace', () => {
   it('treats unparseable claimed_at or non-finite ttl as not stale', () => {
     expect(isStalePastGrace('not-a-date', 4, NOW).stale).toBe(false);
     expect(isStalePastGrace(iso(8 * HOUR_MS), Number.NaN, NOW).stale).toBe(false);
-  });
-});
-
-describe('isQuietHours', () => {
-  it('true at the start of the window (2:00am local, inclusive)', () => {
-    expect(isQuietHours(Date.parse('2026-08-10T06:00:00.000Z'), TZ)).toBe(true); // 2:00am EDT
-  });
-
-  it('true mid-window (3:00am local)', () => {
-    expect(isQuietHours(Date.parse('2026-08-10T07:00:00.000Z'), TZ)).toBe(true); // 3:00am EDT
-  });
-
-  it('false at the end of the window (6:00am local, exclusive)', () => {
-    expect(isQuietHours(Date.parse('2026-08-10T10:00:00.000Z'), TZ)).toBe(false); // 6:00am EDT
-  });
-
-  it('false just before the window (1:59am local)', () => {
-    expect(isQuietHours(Date.parse('2026-08-10T05:59:00.000Z'), TZ)).toBe(false); // 1:59am EDT
-  });
-
-  it('false outside the window entirely', () => {
-    expect(isQuietHours(NOW, TZ)).toBe(false); // 8:00am EDT
-  });
-
-  it('respects the given timezone rather than a hardcoded offset', () => {
-    // 2026-08-10T06:00:00Z is 2am in New York but 3pm in Tokyo.
-    expect(isQuietHours(Date.parse('2026-08-10T06:00:00.000Z'), 'Asia/Tokyo')).toBe(false);
   });
 });
 
@@ -127,7 +84,7 @@ describe('shouldEscalate', () => {
    * Both fixtures are real claims from 2026-08-13 that carried released_at and
    * status:"released" over genuinely open work — one an open do-not-merge PR
    * with 8 unresolved review threads. Filtering these was the bug: unowned
-   * open work is the exact state the escalation exists to surface.
+   * open work is the exact state this badge exists to surface.
    */
   describe('a claim whose note contradicts its own released flag still escalates', () => {
     for (const note of [
@@ -138,7 +95,14 @@ describe('shouldEscalate', () => {
       it(`escalates: ${note.slice(0, 34)}…`, () => {
         expect(
           shouldEscalate(
-            { owner: 'ava', claimed_at: iso(9 * HOUR_MS), ttl_hours: 4, released_at: '2026-08-12T01:40:00Z', status: 'released', note },
+            {
+              owner: 'ava',
+              claimed_at: iso(9 * HOUR_MS),
+              ttl_hours: 4,
+              released_at: '2026-08-12T01:40:00Z',
+              status: 'released',
+              note,
+            },
             NOW,
           ),
         ).toBe(true);
@@ -148,7 +112,13 @@ describe('shouldEscalate', () => {
     it('still treats an uncontradicted release as finished', () => {
       expect(
         shouldEscalate(
-          { owner: 'ava', claimed_at: iso(9 * HOUR_MS), ttl_hours: 4, status: 'released', note: 'RELEASED — merged as abc1234.' },
+          {
+            owner: 'ava',
+            claimed_at: iso(9 * HOUR_MS),
+            ttl_hours: 4,
+            status: 'released',
+            note: 'RELEASED — merged as abc1234.',
+          },
           NOW,
         ),
       ).toBe(false);
@@ -205,329 +175,9 @@ describe('shouldEscalate', () => {
     });
 
     it('is not treated as finished by declaresItselfFinished', () => {
-      // Parked is neither the abandonment state (escalation) nor the
-      // completion state (board filter) — it must not collapse into either.
+      // Parked is neither the abandonment state (badge) nor the completion
+      // state (board filter) — it must not collapse into either.
       expect(declaresItselfFinished({ status: 'parked' })).toBe(false);
     });
-  });
-
-  it('is time-of-day agnostic — the dashboard claim board reads this directly and must not flip on the clock', () => {
-    // Quiet hours gate POSTING (findEscalationCandidates), not escalation-worthiness.
-    // If this function started returning false during 2am-6am, the dashboard's
-    // `escalated: stale && !shouldEscalate(...)` would misreport un-posted
-    // stale claims as already escalated during the window.
-    const quietNow = Date.parse('2026-08-10T07:00:00.000Z'); // 3:00am EDT
-    const staleClaim = { claimed_at: new Date(quietNow - 8 * HOUR_MS).toISOString(), ttl_hours: 4 };
-    expect(shouldEscalate(staleClaim, quietNow)).toBe(true);
-  });
-});
-
-describe('shouldSkipClaimsScan', () => {
-  it('skips inside the 10-minute window', () => {
-    expect(shouldSkipClaimsScan(NOW, NOW + 5 * 60_000)).toBe(true);
-  });
-
-  it('runs once at least 10 minutes have elapsed', () => {
-    expect(shouldSkipClaimsScan(NOW, NOW + 10 * 60_000)).toBe(false);
-  });
-
-  it('always runs on the very first tick (lastRan=0)', () => {
-    expect(shouldSkipClaimsScan(0, NOW)).toBe(false);
-  });
-});
-
-function writeClaim(dir: string, slug: string, claim: Record<string, unknown>): string {
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `${slug}.json`);
-  fs.writeFileSync(file, JSON.stringify(claim));
-  return file;
-}
-
-function writeDest(root: string, workgroupId: string): void {
-  fs.mkdirSync(path.join(root, workgroupId), { recursive: true });
-  fs.writeFileSync(
-    path.join(root, workgroupId, 'escalation.json'),
-    JSON.stringify({ channelType: 'slack', platformId: 'C000TEST' }),
-  );
-}
-
-describe('findEscalationCandidates', () => {
-  it('skips a workgroup with no configured escalation destination', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    writeClaim(path.join(root, 'unknown-workgroup', 'claims'), 'seam-a', {
-      owner: 'ava',
-      claimed_at: iso(8 * HOUR_MS),
-      ttl_hours: 4,
-    });
-    expect(findEscalationCandidates(root, NOW)).toEqual([]);
-  });
-
-  it('skips and logs unparseable claim JSON without throwing', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    const dir = path.join(root, 'wg-a', 'claims');
-    writeDest(root, 'wg-a');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'broken.json'), '{ not valid json');
-    expect(() => findEscalationCandidates(root, NOW)).not.toThrow();
-    expect(findEscalationCandidates(root, NOW)).toEqual([]);
-  });
-
-  it('excludes a fresh claim and a stale-but-inside-grace claim', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    const dir = path.join(root, 'wg-a', 'claims');
-    writeDest(root, 'wg-a');
-    writeClaim(dir, 'fresh', { owner: 'ava', claimed_at: iso(1 * HOUR_MS), ttl_hours: 4 });
-    writeClaim(dir, 'inside-grace', { owner: 'ava', claimed_at: iso(5 * HOUR_MS), ttl_hours: 4 });
-    expect(findEscalationCandidates(root, NOW)).toEqual([]);
-  });
-
-  it('includes a claim stale past grace, with the right slug and workgroup', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    const dir = path.join(root, 'wg-a', 'claims');
-    writeDest(root, 'wg-a');
-    writeClaim(dir, 'seam-publish-gate', { owner: 'ava', claimed_at: iso(8 * HOUR_MS), ttl_hours: 4 });
-    const candidates = findEscalationCandidates(root, NOW);
-    expect(candidates).toHaveLength(1);
-    expect(candidates[0]).toMatchObject({ workgroupId: 'wg-a', slug: 'seam-publish-gate', staleMs: 4 * HOUR_MS });
-  });
-
-  it('a directory with no claims subdir at all is silently skipped', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    fs.mkdirSync(path.join(root, 'wg-a'), { recursive: true }); // no claims/ subdir
-    writeDest(root, 'wg-a');
-    expect(() => findEscalationCandidates(root, NOW)).not.toThrow();
-    expect(findEscalationCandidates(root, NOW)).toEqual([]);
-  });
-
-  describe('quiet hours', () => {
-    const quietNow = Date.parse('2026-08-10T07:00:00.000Z'); // 3:00am EDT
-    const afterWindowNow = Date.parse('2026-08-10T11:00:00.000Z'); // 7:00am EDT, just past the window
-
-    it('a stale-past-grace claim is not a candidate during quiet hours', () => {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-      const dir = path.join(root, 'wg-a', 'claims');
-      writeDest(root, 'wg-a');
-      writeClaim(dir, 'seam-a', {
-        owner: 'ava',
-        claimed_at: new Date(quietNow - 8 * HOUR_MS).toISOString(),
-        ttl_hours: 4,
-      });
-
-      expect(findEscalationCandidates(root, quietNow, TZ)).toEqual([]);
-    });
-
-    it('the same claim becomes a candidate once quiet hours end, and was never stamped while deferred', () => {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-      const dir = path.join(root, 'wg-a', 'claims');
-      writeDest(root, 'wg-a');
-      const file = writeClaim(dir, 'seam-a', {
-        owner: 'ava',
-        claimed_at: new Date(quietNow - 8 * HOUR_MS).toISOString(),
-        ttl_hours: 4,
-      });
-
-      expect(findEscalationCandidates(root, quietNow, TZ)).toEqual([]); // deferred
-      expect(findEscalationCandidates(root, afterWindowNow, TZ)).toHaveLength(1); // posted after window
-
-      // crash-safe: finding it as a candidate never stamps escalated_at — only
-      // escalateClaim (actual delivery) does that.
-      const stamped = JSON.parse(fs.readFileSync(file, 'utf8')) as { escalated_at?: string };
-      expect(stamped.escalated_at).toBeUndefined();
-    });
-
-    it('a claim resolved (released) during the quiet window never posts', () => {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-      const dir = path.join(root, 'wg-a', 'claims');
-      writeDest(root, 'wg-a');
-      const file = writeClaim(dir, 'seam-a', {
-        owner: 'ava',
-        claimed_at: new Date(quietNow - 8 * HOUR_MS).toISOString(),
-        ttl_hours: 4,
-      });
-
-      expect(findEscalationCandidates(root, quietNow, TZ)).toEqual([]); // deferred, would have alerted
-
-      fs.unlinkSync(file); // released during the window
-
-      expect(findEscalationCandidates(root, afterWindowNow, TZ)).toEqual([]); // never alerts
-    });
-  });
-});
-
-function candidate(overrides: Partial<EscalationCandidate> = {}, file: string): EscalationCandidate {
-  return {
-    file,
-    workgroupId: 'wg-a',
-    slug: 'seam-publish-gate',
-    claim: { owner: 'ava', claimed_at: iso(8 * HOUR_MS), ttl_hours: 4 },
-    staleMs: 4 * HOUR_MS,
-    dest: { channelType: 'slack', platformId: 'C000TEST' },
-    ...overrides,
-  };
-}
-
-describe('escalateClaim', () => {
-  function deps(overrides: Partial<EscalationDeliveryDeps> = {}): EscalationDeliveryDeps {
-    return {
-      resolveMessagingGroup: vi.fn(() => ({ id: 'mg-dispatch' })),
-      resolveSession: vi.fn(() => ({ agent_group_id: 'ag-1', id: 'sess-1' })),
-      hasOutbound: vi.fn(() => true),
-      writeMessage: vi.fn(),
-      resolvePermalink: vi.fn(() => null),
-      ...overrides,
-    };
-  }
-
-  it('delivers via writeMessage and stamps escalated_at on success', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    const dir = path.join(root, 'wg-a', 'claims');
-    const file = writeClaim(dir, 'seam-publish-gate', { owner: 'ava', claimed_at: iso(8 * HOUR_MS), ttl_hours: 4 });
-    const d = deps();
-
-    const result = escalateClaim(candidate({}, file), NOW, d);
-
-    expect(result).toBe(true);
-    expect(d.writeMessage).toHaveBeenCalledTimes(1);
-    const [agentGroupId, sessionId, message] = (d.writeMessage as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(agentGroupId).toBe('ag-1');
-    expect(sessionId).toBe('sess-1');
-    expect(message.channelType).toBe('slack');
-    expect(message.platformId).toBe('C000TEST');
-    expect(message.threadId).toBeNull();
-    const body = JSON.parse(message.content) as { text: string };
-    expect(body.text).toContain('seam-publish-gate');
-    expect(body.text).toContain('ava');
-
-    const stamped = JSON.parse(fs.readFileSync(file, 'utf8')) as { escalated_at?: string };
-    expect(stamped.escalated_at).toBe(new Date(NOW).toISOString());
-  });
-
-  it('log-and-skip when no messaging group resolves for the destination', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    const dir = path.join(root, 'wg-a', 'claims');
-    const file = writeClaim(dir, 'seam-publish-gate', {});
-    const d = deps({ resolveMessagingGroup: vi.fn(() => undefined) });
-
-    expect(escalateClaim(candidate({}, file), NOW, d)).toBe(false);
-    expect(d.writeMessage).not.toHaveBeenCalled();
-  });
-
-  it('log-and-skip when no live session exists for the escalation channel', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    const dir = path.join(root, 'wg-a', 'claims');
-    const file = writeClaim(dir, 'seam-publish-gate', {});
-    const d = deps({ resolveSession: vi.fn(() => undefined) });
-
-    expect(escalateClaim(candidate({}, file), NOW, d)).toBe(false);
-    expect(d.writeMessage).not.toHaveBeenCalled();
-  });
-
-  it('log-and-skip when the resolved session has no outbound.db yet', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    const dir = path.join(root, 'wg-a', 'claims');
-    const file = writeClaim(dir, 'seam-publish-gate', {});
-    const d = deps({ hasOutbound: vi.fn(() => false) });
-
-    expect(escalateClaim(candidate({}, file), NOW, d)).toBe(false);
-    expect(d.writeMessage).not.toHaveBeenCalled();
-  });
-
-  /**
-   * The alert renders one fact per line and carries only the note's first
-   * sentence. Notes routinely run several hundred characters of handoff
-   * detail, and the whole point of the summary is that a human can act on the
-   * alert without reading a paragraph in a notification.
-   */
-  function textFor(claim: Record<string, unknown>, overrides: Partial<EscalationDeliveryDeps> = {}): string {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    const file = writeClaim(path.join(root, 'wg-a', 'claims'), 'seam-publish-gate', claim);
-    const d = deps(overrides);
-    escalateClaim(candidate({ claim }, file), NOW, d);
-    const [, , message] = (d.writeMessage as ReturnType<typeof vi.fn>).mock.calls[0];
-    return (JSON.parse(message.content) as { text: string }).text;
-  }
-
-  it('renders owner, staleness and next step on their own lines', () => {
-    const text = textFor({ owner: 'ava', claimed_at: iso(8 * HOUR_MS), ttl_hours: 4, note: 'Wallet tie-out.' });
-
-    expect(text.split('\n')).toEqual([
-      '⚠️ **Abandoned work claim** — `seam-publish-gate`',
-      'Wallet tie-out.',
-      '',
-      '- **Owner:** ava',
-      '- **Stale:** 4.0h past grace, on a 4h TTL',
-      '- **Next:** nothing happens automatically — ava releases it, or anyone takes it over.',
-    ]);
-  });
-
-  it('carries only the first sentence of a long note, marked as truncated', () => {
-    const text = textFor({
-      owner: 'ava',
-      note: 'Dev activation verified already live, no change made.\nOPEN: UI screenshots, saved-id migration decision (owner unassigned). DO NOT flip prod.',
-    });
-
-    expect(text).toContain('Dev activation verified already live, no change made. …');
-    expect(text).not.toContain('DO NOT flip prod');
-  });
-
-  it('caps a first sentence that is itself enormous', () => {
-    const text = textFor({ owner: 'ava', note: `${'x'.repeat(400)}. tail` });
-    const summary = text.split('\n')[1];
-
-    expect(summary.endsWith(' …')).toBe(true);
-    expect(summary.length).toBeLessThanOrEqual(201);
-  });
-
-  it('links the thread the claim was worked in when it recorded one', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
-    const claim = { owner: 'ava', note: 'Wallet tie-out.', thread_id: 'slack:C0AAA:1786621514.008659' };
-    const file = writeClaim(path.join(root, 'wg-a', 'claims'), 'seam-publish-gate', claim);
-    const d = deps({ resolvePermalink: vi.fn(() => 'https://acme.slack.com/archives/C0AAA/p1786621514008659') });
-
-    escalateClaim(candidate({ claim }, file), NOW, d);
-
-    expect(d.resolvePermalink).toHaveBeenCalledWith('slack', 'C000TEST', 'slack:C0AAA:1786621514.008659');
-    const [, , message] = (d.writeMessage as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect((JSON.parse(message.content) as { text: string }).text).toContain(
-      '- **Worked in:** https://acme.slack.com/archives/C0AAA/p1786621514008659',
-    );
-  });
-
-  it('omits the link line for a claim written before thread ids were recorded', () => {
-    const resolvePermalink = vi.fn(() => 'https://acme.slack.com/archives/C0AAA/p1');
-    const text = textFor({ owner: 'ava', note: 'Legacy claim.' }, { resolvePermalink });
-
-    expect(resolvePermalink).not.toHaveBeenCalled();
-    expect(text).not.toContain('Worked in');
-  });
-
-  it('still alerts when the adapter cannot build a link', () => {
-    const text = textFor(
-      { owner: 'ava', note: 'Unlinkable.', thread_id: 'slack:C0AAA:1786621514.008659' },
-      { resolvePermalink: vi.fn(() => null) },
-    );
-
-    expect(text).not.toContain('Worked in');
-    expect(text).toContain('- **Owner:** ava');
-  });
-
-  it('alerts without a link when permalink resolution throws', () => {
-    const text = textFor(
-      { owner: 'ava', note: 'Adapter blew up.', thread_id: 'slack:C0AAA:1786621514.008659' },
-      {
-        resolvePermalink: vi.fn(() => {
-          throw new Error('adapter gone');
-        }),
-      },
-    );
-
-    expect(text).not.toContain('Worked in');
-    expect(text).toContain('- **Owner:** ava');
-  });
-
-  it('omits the TTL clause when the claim carries no ttl_hours', () => {
-    const text = textFor({ owner: 'ava', note: 'Untimed claim.' });
-
-    expect(text.split('\n')).toContain('- **Stale:** 4.0h past grace');
   });
 });
