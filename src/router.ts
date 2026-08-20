@@ -42,7 +42,8 @@ import {
   releaseChannelIngress,
   type ChannelIngressReceiptKey,
 } from './db/channel-ingress-receipts.js';
-import { findSessionForAgent } from './db/sessions.js';
+import { findSessionForAgent, markSessionEngaged } from './db/sessions.js';
+import { buildThreadContextBlock, withThreadContext } from './thread-context.js';
 import { cancelPendingGatesForSession, sessionHasActiveGates } from './modules/bash-gate/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -362,7 +363,15 @@ export function setChannelRequestGate(fn: ChannelRequestGateFn): void {
   channelRequestGate = fn;
 }
 
-function safeParseContent(raw: string): { text?: string; sender?: string; senderId?: string } {
+interface ParsedContent {
+  text?: string;
+  sender?: string;
+  senderId?: string;
+  /** Present when chat-sdk-bridge downloaded files with the message. */
+  attachments?: unknown[];
+}
+
+function safeParseContent(raw: string): ParsedContent {
   try {
     return JSON.parse(raw);
   } catch {
@@ -422,14 +431,6 @@ function effectiveThreadIdForAgent(
   const rootDmThreadIds = new Set<string | null>([null, '', event.platformId, `${event.platformId}:`]);
   if (!rootDmThreadIds.has(event.threadId)) return event.threadId;
   return `${event.platformId}:${event.message.id}`;
-}
-
-function parseUtcTimestampMs(value: string | null | undefined): number | null {
-  if (!value) return null;
-  let normalized = value.includes('T') ? value : value.replace(' ', 'T');
-  if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(normalized)) normalized += 'Z';
-  const ms = Date.parse(normalized);
-  return Number.isNaN(ms) ? null : ms;
 }
 
 /**
@@ -1026,12 +1027,96 @@ function evaluateEngage(
       // the sticky session. Non-threaded adapters (Telegram group chat etc.)
       // always have threadId=null; for them, session-existence IS the stick.
       if (adapterSupportsThreads && threadId === null) return false;
+      // The stick is ENGAGEMENT, not session existence. Reading existence was
+      // the original mistake: it made a session row — a storage detail any
+      // path can create — carry a behavioral meaning, which is precisely what
+      // forced the non-engaged skip below to exempt mention-sticky wirings.
+      // `engaged_at` states the fact outright (migration 052), so a thread the
+      // agent has never engaged in does not stick, whether or not a row exists.
       const existing = findSessionForAgent(agent.agent_group_id, mg.id, threadId);
-      return existing !== undefined;
+      return existing?.engaged_at != null;
     }
     default:
       return false;
   }
+}
+
+/**
+ * Mirror an inbound user message into archive.db for future-wake thread
+ * context replay. Scoped per-agent-group to match the archive's PK slicing;
+ * assistant replies are archived on delivery.ts's path.
+ *
+ * Called from both delivery paths — the normal one after the session row is
+ * written, and the non-engaged skip below, which never resolves a session.
+ * The insert is an upsert keyed on the per-agent message id, so calling it
+ * twice for one message is a no-op rewrite.
+ *
+ * Returns whether a row was actually written. The skip path treats that
+ * boolean as a precondition, not as diagnostics — see the guard.
+ */
+function archiveInboundUserMessage(
+  agent: MessagingGroupAgent,
+  agentGroup: AgentGroup,
+  mg: MessagingGroup,
+  event: InboundEvent,
+  userId: string | null,
+  parsedContent: ParsedContent,
+  effectiveThreadId: string | null,
+): boolean {
+  if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') return false;
+  if (!parsedContent.text) return false;
+  try {
+    archiveMessageAndScheduleMemoryCuration(
+      {
+        id: messageIdForAgent(event.message.id, agent.agent_group_id),
+        agentGroupId: agent.agent_group_id,
+        messagingGroupId: mg.id,
+        channelType: event.channelType,
+        channelName: mg.name ?? null,
+        platformId: event.platformId,
+        threadId: effectiveThreadId,
+        role: 'user',
+        senderId: userId,
+        senderName: parsedContent.sender ?? null,
+        text: parsedContent.text,
+        sentAt: event.message.timestamp,
+      },
+      agentGroup.workgroup_id ?? agentGroup.folder,
+    );
+    return true;
+  } catch (err) {
+    log.warn('Failed to archive inbound user message', {
+      agentGroupId: agent.agent_group_id,
+      platformMessageId: event.message.id,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+/**
+ * Whose non-engaged messages are eligible for the session skip below.
+ *
+ * THIS IS THE SCOPE LINE. It exists as its own predicate so the
+ * bot-versus-human question is one auditable, revertible place rather than a
+ * clause buried in a nine-term condition.
+ *
+ * Currently: everyone. The operator widened it from bot-only deliberately —
+ * "we don't need to retain history of chatter without any agent engagement".
+ * The model, not the disk, is the point: a session should not exist until an
+ * agent is engaged. (`sessionActiveCap` was 2000 against 6,812 active
+ * sessions, the large majority of them threads no agent ever touched.)
+ *
+ * To narrow back to bots only, this is the one function to change — and when
+ * you do, do NOT identify bots by platform-id prefix (`U…` vs `B…`). Slack
+ * puts a `U`-prefixed `event.user` on bot events, so the prefix is not a bot
+ * test. The two reliable signals are the platform's own `isBot` flag on the
+ * serialized author, and the install's known sibling-bot id set
+ * (`isSiblingBotSender` / `setSiblingBotIdsProvider` in
+ * `src/modules/permissions/`).
+ */
+function skipEligibleSender(_parsedContent: ParsedContent, _userId: string | null): boolean {
+  return true;
 }
 
 async function deliverToAgent(
@@ -1043,7 +1128,7 @@ async function deliverToAgent(
   threadsEnabled: boolean,
   effectiveThreadId: string | null,
   wake: boolean,
-  parsedContent: { text?: string; sender?: string; senderId?: string },
+  parsedContent: ParsedContent,
   adapter: ReturnType<typeof getChannelAdapter>,
 ): Promise<void> {
   // Apply the resolved thread policy (wiring override AND channel declaration
@@ -1063,6 +1148,76 @@ async function deliverToAgent(
   // effectiveThreadId === event.threadId, so the event view is current.
   if (threadsEnabled) {
     effectiveThreadId = effectiveThreadIdForAgent(event, true, effectiveSessionMode);
+  }
+
+  // ── A non-waking message does not get to mint a per-thread session. ──
+  //
+  // A session is supposed to mean "an agent is engaged in this thread". It had
+  // drifted into meaning "a message once landed here": a `mention`-mode agent
+  // wired to a busy channel minted a per-thread session for every notification
+  // and every passing human remark, none of which would ever wake. Those rows
+  // are what `sessionActiveCap` has been fighting.
+  //
+  // Skipping is only sound where the wake path can reconstruct what an
+  // accumulate would have provided, so this condition is the deliberate mirror
+  // of the thread-context backfill below — same message kinds, same thread
+  // policy, same adapter capability. When someone does engage in this thread,
+  // `engaged_at` is still NULL at that moment, so `buildThreadContextBlock`
+  // replays the whole thread and the skipped messages come back as context.
+  // That recovery is keyed on the SESSION's engagement state, not on whether
+  // this particular call created the row, so it holds no matter which path
+  // (mention, agent-to-agent, anything later) brings the session into being.
+  //
+  // Two things are deliberately NOT skipped. Messages carrying attachments:
+  // `fetchThreadHistory` returns `{sender, text, timestamp, isAnchor?}` and
+  // reconstructs no files, so a replay genuinely cannot recover them (see
+  // `src/channels/adapter.ts`). And anything the archive refused —
+  //
+  // *** The `archiveInboundUserMessage(...)` call below is the thing the skip
+  // DEPENDS ON, not a side effect on the way out. *** Skipping writes no
+  // session row, so the archive row is the message's only remaining copy: it
+  // is what `messages_archive` retrieval and memory curation read, and what
+  // the Graphify daemon indexes as conversation history
+  // (`src/graphify-daemon/daemon.ts`). If the archive throws and we skip
+  // anyway, the message ceases to exist — no row, no retry, no error anyone
+  // sees. So it is evaluated LAST, and a `false` return falls through to
+  // ordinary session creation, where the message is at least durable. Do not
+  // "simplify" this into a fire-and-forget call before the `if`.
+  //
+  // ── Accepted costs, so the tradeoff is legible where it is taken ──
+  // Replay is not a lossless substitute for the stream, and these three gaps
+  // were accepted deliberately rather than overlooked:
+  //   1. The replay is capped at THREAD_CONTEXT_LIMIT (50) messages, and
+  //      effectively 49 — the triggering mention consumes one via
+  //      `excludeMessageId`. A longer thread loses its oldest messages.
+  //   2. Slack's `conversations.replies` is called once, no cursor,
+  //      `direction: backward`. Past roughly 200 messages it returns a stale
+  //      EARLY window, so a very long thread replays its beginning, not its
+  //      tail.
+  //   3. Replay reflects the platform's CURRENT state, so edits and deletes
+  //      show as they now stand — the streamed copy accumulate would have kept
+  //      is gone.
+  // The right response to any of these is a bigger cap or cursoring in the
+  // adapter, not reinstating a session row per un-engaged thread.
+  if (
+    !wake &&
+    skipEligibleSender(parsedContent, userId) &&
+    !parsedContent.attachments?.length &&
+    (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') &&
+    threadsEnabled &&
+    effectiveSessionMode === 'per-thread' &&
+    effectiveThreadId !== null &&
+    typeof adapter?.fetchThreadHistory === 'function' &&
+    findSessionForAgent(agent.agent_group_id, mg.id, effectiveThreadId) === undefined &&
+    archiveInboundUserMessage(agent, agentGroup, mg, event, userId, parsedContent, effectiveThreadId)
+  ) {
+    log.debug('Skipped session creation for non-engaged thread message', {
+      agentGroupId: agent.agent_group_id,
+      messagingGroupId: mg.id,
+      threadId: effectiveThreadId,
+      platformMessageId: event.message.id,
+    });
+    return;
   }
 
   const { session, created } = resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, effectiveSessionMode);
@@ -1203,13 +1358,12 @@ async function deliverToAgent(
     }
   }
 
-  // Thread-context parity with v1: on engaged mentions inside a thread,
-  // fetch recent thread history from the platform (covers messages from
-  // other bots and plain user messages that never engaged us) and prepend
-  // it to the trigger. First wake: include everything (up to 50). Later
-  // wakes: only messages newer than the last delivered response — the agent's
-  // own prior turns are already in the SDK continuation, so re-prepending
-  // them would just bloat context.
+  // Thread-context parity with v1: on engaged mentions inside a thread, fetch
+  // recent thread history from the platform (covers messages from other bots,
+  // plain user messages that never engaged us, and anything the skip above
+  // declined to store) and prepend it to the trigger. The cutoff rule lives in
+  // `src/thread-context.ts` because the agent-to-agent wake path has to apply
+  // the identical rule — see that file.
   let contentForWrite = persistedContent;
   if (flagIntent || flagCleanedText !== null) {
     const parsed = JSON.parse(contentForWrite) as Record<string, unknown>;
@@ -1221,40 +1375,21 @@ async function deliverToAgent(
     wake &&
     threadsEnabled &&
     effectiveThreadId !== null &&
-    adapter?.fetchThreadHistory &&
     (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')
   ) {
-    try {
-      const history = await adapter.fetchThreadHistory(effectiveThreadId, {
-        limit: 50,
+    // `session` was read before `markSessionEngaged` runs below, so its
+    // `engaged_at` still describes the state BEFORE this wake — which is the
+    // question the backfill asks. Text is already flag- and mention-free here
+    // (the flag parser ran above), so prepending is a straight concat.
+    contentForWrite = withThreadContext(
+      contentForWrite,
+      await buildThreadContextBlock({
+        session,
+        adapter,
+        threadId: effectiveThreadId,
         excludeMessageId: event.message.id,
-      });
-      const sinceMs = created ? null : parseUtcTimestampMs(session.last_outbound_at ?? session.last_active);
-      const relevant =
-        sinceMs === null
-          ? history
-          : history.filter((m) => {
-              const messageMs = parseUtcTimestampMs(m.timestamp);
-              return messageMs === null || messageMs > sinceMs;
-            });
-      if (relevant.length > 0) {
-        const header = created ? 'Thread context' : 'New in thread since last response';
-        const transcript = relevant.map((m) => `${m.sender}: ${m.text}`).join('\n');
-        const parsed = JSON.parse(contentForWrite) as Record<string, unknown>;
-        const originalText = typeof parsed.text === 'string' ? parsed.text : '';
-        // Text is already flag- and mention-free at this point (flag parser
-        // ran above, cleanedText replaces content.text). Prepending the
-        // thread-context block is a straight string concat; no preservation
-        // hack needed.
-        parsed.text = `[${header}]\n${transcript}\n[Latest message]\n${originalText}`;
-        contentForWrite = JSON.stringify(parsed);
-      }
-    } catch (err) {
-      log.warn('Thread-context fetch failed — proceeding without context', {
-        sessionId: session.id,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
+      }),
+    );
   }
 
   // Start typing indicator before writeSessionMessage so recall injection
@@ -1291,35 +1426,12 @@ async function deliverToAgent(
     return;
   }
 
-  // Mirror inbound user messages into archive.db for future-wake thread
-  // context replay. Scoped per-agent-group to match the archive's PK
-  // slicing; assistant replies are archived on delivery.ts's path.
-  if ((event.message.kind === 'chat' || event.message.kind === 'chat-sdk') && parsedContent.text) {
-    try {
-      archiveMessageAndScheduleMemoryCuration(
-        {
-          id: messageIdForAgent(event.message.id, agent.agent_group_id),
-          agentGroupId: agent.agent_group_id,
-          messagingGroupId: mg.id,
-          channelType: event.channelType,
-          channelName: mg.name ?? null,
-          platformId: event.platformId,
-          threadId: effectiveThreadId,
-          role: 'user',
-          senderId: userId,
-          senderName: parsedContent.sender ?? null,
-          text: parsedContent.text,
-          sentAt: event.message.timestamp,
-        },
-        agentGroup.workgroup_id ?? agentGroup.folder,
-      );
-    } catch (err) {
-      log.warn('Failed to archive inbound user message', {
-        sessionId: session.id,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+  archiveInboundUserMessage(agent, agentGroup, mg, event, userId, parsedContent, effectiveThreadId);
+
+  // The message is durable and this wiring engaged — record the fact. Stamped
+  // AFTER the backfill read above, which needs the pre-wake state, and after
+  // the write, so a duplicate or a failed insert never claims engagement.
+  if (wake) markSessionEngaged(session.id);
 
   log.info('Message routed', {
     sessionId: session.id,

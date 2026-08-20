@@ -1546,8 +1546,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // sits outside `fetchMessages(threadId)` (which only sees in-thread
       // messages). The hook may return up to two messages — M0 (the message
       // the mention replied to) and M1 (the mention itself) — chronologically
-      // ordered. Both are tagged isAnchor so the router exempts them from
-      // the last_active filter on follow-up wakes.
+      // ordered, and tagged isAnchor.
+      //
+      // The tag is descriptive, NOT an exemption. An earlier router revision
+      // did exempt anchors from the recency cutoff; 993e4bee removed that,
+      // because an anchor predates the entire thread by construction and the
+      // exemption re-prepended the same parent message on every follow-up
+      // wake. Anchors reach the agent on the engagement that matters — an
+      // unengaged session replays with no cutoff at all — and are filtered
+      // like anything else afterwards. See src/thread-context.ts.
       //
       // De-dupe on (sender, text) against the in-thread set — for forum
       // threads the anchor is already the first in-thread message, and

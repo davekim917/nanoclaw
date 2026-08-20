@@ -45,6 +45,7 @@ vi.mock('./db/dropped-messages.js', () => ({
 vi.mock('./db/sessions.js', () => ({
   findSessionForAgent: vi.fn(() => undefined),
   getSession: vi.fn(() => null),
+  markSessionEngaged: vi.fn(),
 }));
 
 vi.mock('./channels/channel-registry.js', () => ({
@@ -556,6 +557,11 @@ describe('thread context fetch', () => {
         container_status: 'idle',
         last_active: '2026-06-28T22:36:57.000Z',
         last_outbound_at: '2026-06-28 22:39:40',
+        // A session that has posted an outbound is engaged by definition —
+        // migration 052 backfills exactly this for pre-existing rows. Without
+        // it the fixture would describe a state that cannot occur, and the
+        // backfill would (correctly) replay the thread from the top.
+        engaged_at: '2026-06-28T22:36:57.000Z',
         created_at: new Date().toISOString(),
       },
       created: false,

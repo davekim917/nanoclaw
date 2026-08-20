@@ -49,6 +49,14 @@ const COLUMNS: Array<[table: string, column: string]> = [
   // Writer fixed in 2994587f (it now binds one ISO value for both the
   // expires_at comparison and this write), so the residue is safe to convert.
   ['dashboard_tokens', 'used_at'],
+  // Added when 052 merged. That migration creates engaged_at and backfills it
+  // from COALESCE(last_outbound_at, last_active, created_at) — copying whatever
+  // shape those columns happen to hold — so the column is born carrying naive
+  // residue even though its only writer, markSessionEngaged, emits ISO. This
+  // migration runs last by design, after 052 has populated it, which is exactly
+  // the case the "last on purpose" note in the array refers to. Without this
+  // entry, engaged_at would be the one naive column left in a normalized table.
+  ['sessions', 'engaged_at'],
 ];
 
 export const migration053: Migration = {

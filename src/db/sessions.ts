@@ -272,6 +272,28 @@ export function bumpLastOutbound(id: string, kind: string): void {
     .run(new Date().toISOString(), kind, id);
 }
 
+/**
+ * Record that an agent actually engaged in this session — a mention, a wake,
+ * or an inbound agent-to-agent message. THE authority for "is this thread
+ * engaged"; `mention-sticky` and the thread-history backfill both read it, so
+ * every entry point that wakes a session must call this rather than inventing
+ * its own notion of engagement.
+ *
+ * First-write-wins (`WHERE engaged_at IS NULL`): the column answers "when did
+ * this thread first engage", which is a stable auditable fact, and both
+ * readers only care about set-versus-NULL. Re-stamping on every turn would
+ * turn it into a second `last_active` and cost a write per turn for nothing.
+ *
+ * Call it AFTER reading `engaged_at` for backfill purposes on the same wake —
+ * the backfill's whole question is what the session looked like before this
+ * engagement.
+ */
+export function markSessionEngaged(id: string): void {
+  getDb()
+    .prepare(`UPDATE sessions SET engaged_at = ? WHERE id = ? AND engaged_at IS NULL`)
+    .run(new Date().toISOString(), id);
+}
+
 // ── Pending Questions ──
 
 /**
