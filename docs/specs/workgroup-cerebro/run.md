@@ -943,3 +943,39 @@ under the cap and still announces truncation. Other-lanes audit: CORE_PATHS, exa
 archive, and graph-scent lanes all independent of the walk — class closed. The
 workgroup's `index.md` workaround bullet ("preferences not reaching you") should be
 retired after the restart activates this fix.
+
+## Post-deploy: consolidation was failing on every large workgroup (2026-08-20)
+
+Verification after the first P2 restart found the mechanism working for small stores
+(25 topic files across four workgroups, all header-stamped and coherent) and failing
+for every large one — the two largest workgroups had consolidated **zero** facts ever.
+
+**Root cause: the consolidation call was killed by its own timeout.** `consolidate()`
+was given 4x the episode output budget (`MEMORY_CONSOLIDATOR_MAX_TOKENS` 32,768 vs
+8,192) but the unchanged `MEMORY_CURATOR_TIMEOUT_MS` of 120s. The stale comment stated
+the wrong invariant out loud — "Same model/effort/timeout as episodes; only the output
+budget differs" — and lead review approved it without catching that a 4x budget on an
+unchanged clock is incoherent. Node SIGTERMs the CLI at 120s; exit 143 surfaces as
+`structured Claude CLI call failed with exit 143`; 85 such failures logged. The
+"successes" were already grazing the ceiling: 101.2s and 101.6s on the two largest stores that did finish.
+
+**Second bug, found while diagnosing: the failure backoff was defeated.**
+`recordAcceptedGeneratedMemory` set `not_before = excluded.not_before` (= now) in its
+conflict branch, so every accepted episode write wiped the 6-hour backoff
+`failMemoryMaintenance` had just set. the busiest workgroup retried an impossible call ~60x/day
+instead of ~4 — roughly two hours of blocked curation pump per day, ~22k input tokens
+per doomed attempt, and (because maintenance is claimed before episodes) episode
+curation starved behind it. a quiet workgroup with zero accepted writes that day was the
+natural control: its backoff held at clean ~6h intervals.
+
+Fix (002e5fb5): `MEMORY_CONSOLIDATOR_TIMEOUT_MS = 480_000` scaled to the output budget;
+`not_before = MAX(existing, now)` so an accepted write cannot clear a backoff (verified
+NULL-safe — column is NOT NULL and both operands are always bound ISO strings, so
+scalar MAX cannot propagate NULL). Red-first tests for both. Deliberately deferred
+pending observation: smaller cold-start `CONSOLIDATION_MAX_FACTS`, exit-143 error
+reclassification, graduated maintenance backoff — the timeout fix likely moots them,
+and adding knobs before measuring is how this gets worse.
+
+Projected drain once live: the largest store, 5,784 facts / 150 per pass = 39 passes at ~120s
+each ≈ 78 minutes, during which episode curation is starved (maintenance claims first,
+unconditionally) — watch for that.
