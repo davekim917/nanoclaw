@@ -176,9 +176,9 @@ async function fireDigests(): Promise<void> {
         includeBacklog,
       });
       // isEmpty() above tests the DATA; the include* flags can still strip every
-      // section from a non-empty summary (illysium runs all three off now that
-      // its board lives in Linear + the canvas). Posting the bare "📋 Daily
-      // Summary" header every morning is worse than posting nothing.
+      // section from a non-empty summary (a workgroup may run all three off
+      // when its board lives in an external tracker). Posting the bare
+      // "📋 Daily Summary" header every morning is worse than posting nothing.
       if (!backlogThread && parent.trim().split('\n').length <= 1) {
         log.info('Daily summary: every section disabled for this workgroup — skipping', { workgroupId });
         continue;

@@ -77,7 +77,7 @@ you cannot proceed until they reply — `park` it right away rather than
 sitting on it live:
 
 ```bash
-bash $CLAIM park acme-pr-733 "waiting on Dave: which OAuth flow for the retry path?"
+bash $CLAIM park acme-pr-733 "waiting on the operator: which OAuth flow for the retry path?"
 ```
 
 Use the note shape `waiting on <person>: <what you asked>` — it lets a
