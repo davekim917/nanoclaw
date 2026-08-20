@@ -1,6 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { extractRepo, formatDigest, formatDigestParts, isCommitScanEntry, rankBacklog } from './daily-summary.js';
+import { splitForLimit } from './channels/chat-sdk-bridge.js';
+import {
+  deliverBacklogThread,
+  extractRepo,
+  formatDigest,
+  formatDigestParts,
+  isCommitScanEntry,
+  rankBacklog,
+} from './daily-summary.js';
 import type { ShipLogEntry, BacklogItem } from './db/backlog.js';
 
 function shipEntry(over: Partial<ShipLogEntry> = {}): ShipLogEntry {
@@ -282,5 +290,64 @@ describe('formatDigest', () => {
     expect(out).not.toContain('🛠 **Other commits**');
     expect(out).not.toContain('✅ **Resolved**');
     expect(out).not.toContain('📌 **Open Backlog**');
+  });
+});
+
+describe('deliverBacklogThread', () => {
+  it('creates a real thread from the parent message when the adapter supports it (Discord shape)', async () => {
+    const createThread = vi.fn().mockResolvedValue({ threadId: '999888777', messageId: 'm1' });
+    const deliver = vi.fn().mockResolvedValue('m2');
+
+    await deliverBacklogThread({ deliver, createThread }, 'discord', 'discord:guild:chan', 'parent-msg-id', 'short list');
+
+    // Regression guard for the 404 "Unknown Channel" bug: a Discord thread id
+    // is a real channel that must come from createThread, never a bare
+    // `<platform_id>:<parentMessageId>` string built by hand.
+    expect(createThread).toHaveBeenCalledWith('discord', 'discord:guild:chan', 'parent-msg-id', 'Open Backlog', 'short list');
+    expect(deliver).not.toHaveBeenCalled(); // single chunk — no remainder to send
+  });
+
+  it('sends remaining chunks into the created thread when the list exceeds one message', async () => {
+    const createThread = vi.fn().mockResolvedValue({ threadId: 'thread-1', messageId: 'm1' });
+    const deliver = vi.fn().mockResolvedValue('m2');
+    // Real production lists run this long (a 60-item workgroup's ranked
+    // backlog is ~14k chars) — split() at THREAD_MESSAGE_LIMIT (1900)
+    // guarantees more than one chunk here.
+    const longList = Array.from({ length: 400 }, (_, i) => `item ${i} some description text`).join('\n');
+    const expectedChunks = splitForLimit(longList, 1900);
+    expect(expectedChunks.length).toBeGreaterThan(1); // sanity: the fixture actually needs multiple messages
+
+    await deliverBacklogThread({ deliver, createThread }, 'discord', 'discord:guild:chan', 'parent-msg-id', longList);
+
+    expect(createThread).toHaveBeenCalledTimes(1);
+    expect(createThread).toHaveBeenCalledWith('discord', 'discord:guild:chan', 'parent-msg-id', 'Open Backlog', expectedChunks[0]);
+    expect(deliver).toHaveBeenCalledTimes(expectedChunks.length - 1);
+    for (const [i, call] of deliver.mock.calls.entries()) {
+      expect(call).toEqual([
+        'discord',
+        'discord:guild:chan',
+        'discord:guild:chan:thread-1',
+        'chat',
+        JSON.stringify({ text: expectedChunks[i + 1] }),
+      ]);
+    }
+  });
+
+  it('falls back to a flat thread_ts post when the adapter has no createThread (Slack-only-deliver shape)', async () => {
+    const deliver = vi.fn().mockResolvedValue('m2');
+
+    await deliverBacklogThread({ deliver }, 'slack', 'slack:T1:C1', 'parent-ts', 'short list');
+
+    expect(deliver).toHaveBeenCalledWith('slack', 'slack:T1:C1', 'slack:T1:C1:parent-ts', 'chat', JSON.stringify({ text: 'short list' }));
+  });
+
+  it('falls back to a channel-root post when the parent post returned no id', async () => {
+    const createThread = vi.fn().mockResolvedValue({ threadId: 'thread-1', messageId: 'm1' });
+    const deliver = vi.fn().mockResolvedValue('m2');
+
+    await deliverBacklogThread({ deliver, createThread }, 'discord', 'discord:guild:chan', undefined, 'short list');
+
+    expect(createThread).not.toHaveBeenCalled();
+    expect(deliver).toHaveBeenCalledWith('discord', 'discord:guild:chan', null, 'chat', JSON.stringify({ text: 'short list' }));
   });
 });

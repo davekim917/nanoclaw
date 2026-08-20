@@ -70,6 +70,32 @@ variant of `claimed` that anyone may take over; `parked` overrides TTL
 entirely — a parked claim is never stale, it just sits there until someone
 takes it.
 
+## Park when you're the one blocked on a human
+
+If your last action on a claimed unit was a question or handoff to a human —
+you cannot proceed until they reply — `park` it right away rather than
+sitting on it live:
+
+```bash
+bash $CLAIM park acme-pr-733 "waiting on Dave: which OAuth flow for the retry path?"
+```
+
+Use the note shape `waiting on <person>: <what you asked>` — it lets a
+sibling or the digest see who owes an answer without opening the thread.
+Re-`take` the claim the moment the human replies.
+
+**This applies only to waits on a human.** Waiting on another agent, on CI,
+or on any autonomous process stays live on the normal TTL clock — do not park
+those. A sibling taking over genuinely stalled autonomous work is what rule 4
+is for; parking it early would hide it from that take-over path instead of
+enabling it.
+
+A parked claim never fires a TTL alert (see states above), and this is
+deliberate, not a hole: `PARK_GRACE_MS` (`src/claims-board.ts:150`, 24h) decays
+a parked claim to `stale` on the workgroup board if nobody takes it over
+within a day, so a forgotten park still surfaces there — it's a board-visible
+backstop, not a Slack alert.
+
 ## Mechanics — always the script, never hand-rolled JSON
 
 ```bash

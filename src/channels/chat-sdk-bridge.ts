@@ -639,6 +639,20 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     if (config.transformOutboundMarkdown) return config.transformOutboundMarkdown(t);
     return t;
   };
+  // Status (kind='status') messages are narration/thought-balloon text, not
+  // an address to anyone — but the outbound mention rewriters
+  // (resolveSlackMentions / resolveDiscordMentions) can't tell "@Barry" used
+  // as a live address from "@Barry" appearing inside prose ABOUT not
+  // mentioning Barry. Live incident 2026-08-18: Dinesh's status text "...
+  // without mentioning @Barry" got rewritten to a real `<@U…>` mention,
+  // waking Barry off narration despite mention-gating working correctly
+  // everywhere else. Status content has no legitimate need to ping anyone,
+  // so break the mention regexes (which require `@` immediately followed by
+  // a word/letter char) with a zero-width space — invisible on delivery,
+  // renders identically to the reader, but no rewriter matches it.
+  const neutralizeMentions = (t: string): string => t.replace(/@(?=[\w\p{L}])/gu, '@\u200b');
+  const transformStatusOrText = (t: string, kind: string): string =>
+    transformText(kind === 'status' ? neutralizeMentions(t) : t);
   // Native-syntax transforms (e.g. Telegram mrkdwn) round-trip as `raw` so
   // the adapter doesn't re-parse them as CommonMark and mangle links.
   // Markdown-preserving transforms keep `markdown` delivery so adapter
@@ -1222,7 +1236,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const content = message.content as Record<string, unknown>;
 
       if (content.operation === 'edit' && content.messageId) {
-        const editText = transformText((content.text as string) || (content.markdown as string) || '');
+        const editText = transformStatusOrText(
+          (content.text as string) || (content.markdown as string) || '',
+          message.kind,
+        );
         // Edit path is status post-then-edit only — chat replies post fresh
         // (commit 897a5d0), so the morph-into-long-final-answer case the
         // prior chunked-edit logic justified no longer exists. If the status
@@ -1358,7 +1375,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
       // Normal message
       const rawText = (content.markdown as string) || (content.text as string);
-      const text = rawText ? transformText(rawText) : rawText;
+      const text = rawText ? transformStatusOrText(rawText, message.kind) : rawText;
       if (text) {
         // Attach files if present (FileUpload format: { data, filename })
         const fileUploads = message.files?.map((f: { data: Buffer; filename: string }) => ({

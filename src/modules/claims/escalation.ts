@@ -22,11 +22,12 @@ import fs from 'fs';
 import path from 'path';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
-import { DATA_DIR } from '../../config.js';
+import { DATA_DIR, TIMEZONE } from '../../config.js';
 import { getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import { findAnySessionForMessagingGroup } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { outboundDbPath, writeOutboundDirect } from '../../session-manager.js';
+import { resolveTimezone } from '../../timezone.js';
 
 interface Claim {
   owner?: unknown;
@@ -135,7 +136,36 @@ export function isStalePastGrace(
   return { stale: staleMs > ESCALATION_GRACE_MS, staleMs };
 }
 
-/** Pure — should this claim be (re-)escalated right now? */
+const QUIET_HOURS_START = 2; // 2am install-local
+const QUIET_HOURS_END = 6; // 6am install-local, exclusive
+
+/**
+ * Pure — true when `now` falls inside the 2am–6am quiet window in `timezone`.
+ * 82% of escalation alerts landed 8pm–7am ET because agents don't park claims
+ * while waiting on a human reply and the sweep had no time awareness. Claims
+ * still go stale on schedule (claims-board.ts state logic is untouched) —
+ * this only gates the human-facing Slack post.
+ */
+export function isQuietHours(now: number, timezone: string = TIMEZONE): boolean {
+  const hour = Number(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: resolveTimezone(timezone),
+      hourCycle: 'h23',
+      hour: 'numeric',
+    }).format(new Date(now)),
+  );
+  return hour >= QUIET_HOURS_START && hour < QUIET_HOURS_END;
+}
+
+/**
+ * Pure — should this claim be (re-)escalated right now, ignoring time of day?
+ * This is the escalation-worthiness test — stale, unfinished, unparked, not
+ * already posted for the current claim period. The dashboard
+ * (dashboard/api/workgroups.ts) also reads this directly to compute a claim's
+ * `escalated` badge, so it must answer "is this claim due" independent of
+ * quiet hours — the quiet-hours *posting* gate lives one layer up, in
+ * `findEscalationCandidates`, so it never leaks into that read-only view.
+ */
 export function shouldEscalate(claim: Claim, now: number): boolean {
   if (typeof claim.claimed_at !== 'string' || typeof claim.ttl_hours !== 'number') return false;
   // Parking is a deliberate handoff, not abandonment — the board surfaces it, the alert must not.
@@ -190,8 +220,19 @@ export interface EscalationCandidate {
  * Scan every workgroup with a configured escalation destination for claims
  * due to escalate. Pure filesystem read — no DB, no delivery. Unparseable
  * claim JSON is logged and skipped, never thrown.
+ *
+ * Quiet hours (2am–6am install-local) return no candidates at all: this
+ * defers the human-facing post without ever calling `escalateClaim`, so
+ * `escalated_at` stays unstamped and the first scan after 6am finds the same
+ * claim stale-past-grace again and posts then (deferred alerts clump around
+ * 6am — acceptable, no separate queue). A claim resolved (released/re-taken)
+ * during the window is simply gone or fresh by the next scan, so it correctly
+ * never alerts. This gate lives here, not in `shouldEscalate`, because that
+ * function is also read directly by the dashboard's claim board (see its
+ * docstring) and must answer escalation-worthiness independent of time of day.
  */
-export function findEscalationCandidates(root: string, now: number): EscalationCandidate[] {
+export function findEscalationCandidates(root: string, now: number, timezone: string = TIMEZONE): EscalationCandidate[] {
+  if (isQuietHours(now, timezone)) return [];
   const candidates: EscalationCandidate[] = [];
   for (const workgroupId of listDirs(root)) {
     const dest = readEscalationDestination(root, workgroupId);
@@ -370,10 +411,14 @@ export function escalateClaim(
 let lastScanAtMs = 0;
 
 /** Sweep entry point — call once per host-sweep tick; throttled internally to SCAN_INTERVAL_MS. */
-export function sweepClaimsEscalation(now: number = Date.now(), root: string = claimsBaseDir()): void {
+export function sweepClaimsEscalation(
+  now: number = Date.now(),
+  root: string = claimsBaseDir(),
+  timezone: string = TIMEZONE,
+): void {
   if (shouldSkipClaimsScan(lastScanAtMs, now)) return;
   lastScanAtMs = now;
-  for (const candidate of findEscalationCandidates(root, now)) {
+  for (const candidate of findEscalationCandidates(root, now, timezone)) {
     try {
       escalateClaim(candidate, now);
     } catch (err) {

@@ -33,12 +33,14 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
+import { splitForLimit } from './channels/chat-sdk-bridge.js';
 import { readContainerConfig } from './container-config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { getBacklog, getBacklogResolvedSince, getShipLogSince } from './db/backlog.js';
 import type { BacklogItem, ShipLogEntry } from './db/backlog.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getDeliveryAdapter } from './delivery.js';
+import type { ChannelDeliveryAdapter } from './delivery.js';
 import { log } from './log.js';
 import type { AgentGroup, MessagingGroup } from './types.js';
 
@@ -48,6 +50,11 @@ const STATE_PATH = path.join(DATA_DIR, 'daily-summary-state.json');
 
 const DEFAULT_HOUR = 8;
 const DEFAULT_TZ = 'America/New_York';
+
+// Discord's per-message cap (config.maxTextLength in discord.ts) is the
+// tightest of the wired platforms; splitting the backlog thread to this size
+// keeps every chunk postable everywhere without needing per-adapter limits.
+const THREAD_MESSAGE_LIMIT = 1900;
 
 let timer: NodeJS.Timeout | null = null;
 
@@ -69,6 +76,50 @@ export function stopDailySummary(): void {
 /** Exposed for tests — runs one tick synchronously and returns. */
 export async function _tickForTest(): Promise<void> {
   await runTick();
+}
+
+/**
+ * Post the ranked backlog list as a reply to the parent digest message.
+ *
+ * Slack accepts any message id as a `thread_ts` — no explicit thread object
+ * exists to create. Discord does: posting straight to
+ * `<platform_id>:<parentId>` 404s ("Unknown Channel") because a message id is
+ * not a channel id; a thread must be created from the parent message via the
+ * platform's REST thread-create call first. `adapter.createThread` is the
+ * platform-appropriate way to do this for both — a thin `thread_ts` wrapper
+ * on Slack, a real thread-create call on Discord (see slack.ts / discord.ts).
+ * Falls back to a flat post if the adapter has no thread support or the
+ * parent post didn't return an id.
+ *
+ * The backlog list can run well past a single message's length (60-item
+ * workgroups regularly exceed 10k chars), so it's split with the same
+ * chunker the normal chat-delivery path uses; the first chunk becomes the
+ * thread's opening message, the rest are posted into the resulting thread.
+ *
+ * Exported for testing — fireDigests()'s DB/adapter wiring would otherwise
+ * require mocking the whole delivery + container-config + backlog stack just
+ * to exercise this branch.
+ */
+export async function deliverBacklogThread(
+  adapter: Pick<ChannelDeliveryAdapter, 'deliver' | 'createThread'>,
+  channelType: string,
+  platformId: string,
+  parentId: string | undefined,
+  backlogThread: string,
+): Promise<void> {
+  const chunks = splitForLimit(backlogThread, THREAD_MESSAGE_LIMIT);
+  if (parentId && typeof adapter.createThread === 'function') {
+    const created = await adapter.createThread(channelType, platformId, parentId, 'Open Backlog', chunks[0]);
+    const threadId = created.threadId.includes(':') ? created.threadId : `${platformId}:${created.threadId}`;
+    for (const chunk of chunks.slice(1)) {
+      await adapter.deliver(channelType, platformId, threadId, 'chat', JSON.stringify({ text: chunk }));
+    }
+    return;
+  }
+  const threadId = parentId ? `${platformId}:${parentId}` : null;
+  for (const chunk of chunks) {
+    await adapter.deliver(channelType, platformId, threadId, 'chat', JSON.stringify({ text: chunk }));
+  }
 }
 
 async function runTick(): Promise<void> {
@@ -140,19 +191,8 @@ async function fireDigests(): Promise<void> {
         JSON.stringify({ text: parent }),
       );
       if (backlogThread) {
-        // Long backlog lists live in the parent's thread so the channel
-        // shows one compact line. Thread id shape matches the router's
-        // (`<platform_id>:<message ts>` — see slack.ts targets). No message
-        // id (platform can't thread) → second channel message instead.
-        const threadId = parentId ? `${target.platform_id}:${parentId}` : null;
         const sendThread = () =>
-          adapter.deliver(
-            target.channel_type,
-            target.platform_id,
-            threadId,
-            'chat',
-            JSON.stringify({ text: backlogThread }),
-          );
+          deliverBacklogThread(adapter, target.channel_type, target.platform_id, parentId, backlogThread);
         try {
           await sendThread();
         } catch (firstErr) {
@@ -226,7 +266,7 @@ function buildSummary(members: AgentGroup[], since: string): Summary {
     openBacklog.push(...getBacklog(m.id, 'in_progress'), ...getBacklog(m.id, 'open'));
   }
 
-  const dedupedShipped = dedupeBy(shipped, (e) => e.pr_url || `${e.title} ${e.shipped_at}`);
+  const dedupedShipped = dedupeBy(shipped, (e) => e.pr_url || `${e.title} ${e.shipped_at}`);
   const dedupedResolved = dedupeBy(resolved, (i) => i.id);
   const dedupedOpen = dedupeBy(openBacklog, (i) => i.id);
 

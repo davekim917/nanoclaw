@@ -1729,8 +1729,12 @@ export async function processQuery(
         // Fleet Hardening Phase 0.1: one turn_usage row per completed turn,
         // written here because every provider's query converges on this
         // event regardless of which one ran. Whatever the provider didn't
-        // expose comes through as NULL — see TurnUsageInfo.
-        recordTurnUsage(providerName, event.usage);
+        // expose comes through as NULL — see TurnUsageInfo. A turn spanning
+        // multiple models (event.usage as an array) writes one row per model
+        // so each is attributed separately instead of collapsing to NULL.
+        for (const usage of Array.isArray(event.usage) ? event.usage : [event.usage]) {
+          recordTurnUsage(providerName, usage);
+        }
         // A `result` event signals the assistant's turn is complete, but the
         // provider's events generator stays open for follow-up `push()` calls
         // (see container/agent-runner/src/providers/claude.ts:1080 — the

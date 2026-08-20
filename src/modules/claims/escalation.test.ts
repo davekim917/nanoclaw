@@ -9,6 +9,7 @@ import {
   ESCALATION_GRACE_MS,
   escalateClaim,
   findEscalationCandidates,
+  isQuietHours,
   isStalePastGrace,
   shouldEscalate,
   shouldSkipClaimsScan,
@@ -17,7 +18,8 @@ import {
 } from './escalation.js';
 
 const HOUR_MS = 60 * 60 * 1000;
-const NOW = Date.parse('2026-08-10T12:00:00.000Z');
+const NOW = Date.parse('2026-08-10T12:00:00.000Z'); // noon UTC — outside any US quiet window
+const TZ = 'America/New_York'; // UTC-4 in August (EDT)
 
 function iso(msAgo: number): string {
   return new Date(NOW - msAgo).toISOString();
@@ -53,6 +55,33 @@ describe('isStalePastGrace', () => {
   it('treats unparseable claimed_at or non-finite ttl as not stale', () => {
     expect(isStalePastGrace('not-a-date', 4, NOW).stale).toBe(false);
     expect(isStalePastGrace(iso(8 * HOUR_MS), Number.NaN, NOW).stale).toBe(false);
+  });
+});
+
+describe('isQuietHours', () => {
+  it('true at the start of the window (2:00am local, inclusive)', () => {
+    expect(isQuietHours(Date.parse('2026-08-10T06:00:00.000Z'), TZ)).toBe(true); // 2:00am EDT
+  });
+
+  it('true mid-window (3:00am local)', () => {
+    expect(isQuietHours(Date.parse('2026-08-10T07:00:00.000Z'), TZ)).toBe(true); // 3:00am EDT
+  });
+
+  it('false at the end of the window (6:00am local, exclusive)', () => {
+    expect(isQuietHours(Date.parse('2026-08-10T10:00:00.000Z'), TZ)).toBe(false); // 6:00am EDT
+  });
+
+  it('false just before the window (1:59am local)', () => {
+    expect(isQuietHours(Date.parse('2026-08-10T05:59:00.000Z'), TZ)).toBe(false); // 1:59am EDT
+  });
+
+  it('false outside the window entirely', () => {
+    expect(isQuietHours(NOW, TZ)).toBe(false); // 8:00am EDT
+  });
+
+  it('respects the given timezone rather than a hardcoded offset', () => {
+    // 2026-08-10T06:00:00Z is 2am in New York but 3pm in Tokyo.
+    expect(isQuietHours(Date.parse('2026-08-10T06:00:00.000Z'), 'Asia/Tokyo')).toBe(false);
   });
 });
 
@@ -181,6 +210,16 @@ describe('shouldEscalate', () => {
       expect(declaresItselfFinished({ status: 'parked' })).toBe(false);
     });
   });
+
+  it('is time-of-day agnostic — the dashboard claim board reads this directly and must not flip on the clock', () => {
+    // Quiet hours gate POSTING (findEscalationCandidates), not escalation-worthiness.
+    // If this function started returning false during 2am-6am, the dashboard's
+    // `escalated: stale && !shouldEscalate(...)` would misreport un-posted
+    // stale claims as already escalated during the window.
+    const quietNow = Date.parse('2026-08-10T07:00:00.000Z'); // 3:00am EDT
+    const staleClaim = { claimed_at: new Date(quietNow - 8 * HOUR_MS).toISOString(), ttl_hours: 4 };
+    expect(shouldEscalate(staleClaim, quietNow)).toBe(true);
+  });
 });
 
 describe('shouldSkipClaimsScan', () => {
@@ -258,6 +297,60 @@ describe('findEscalationCandidates', () => {
     writeDest(root, 'wg-a');
     expect(() => findEscalationCandidates(root, NOW)).not.toThrow();
     expect(findEscalationCandidates(root, NOW)).toEqual([]);
+  });
+
+  describe('quiet hours', () => {
+    const quietNow = Date.parse('2026-08-10T07:00:00.000Z'); // 3:00am EDT
+    const afterWindowNow = Date.parse('2026-08-10T11:00:00.000Z'); // 7:00am EDT, just past the window
+
+    it('a stale-past-grace claim is not a candidate during quiet hours', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
+      const dir = path.join(root, 'wg-a', 'claims');
+      writeDest(root, 'wg-a');
+      writeClaim(dir, 'seam-a', {
+        owner: 'ava',
+        claimed_at: new Date(quietNow - 8 * HOUR_MS).toISOString(),
+        ttl_hours: 4,
+      });
+
+      expect(findEscalationCandidates(root, quietNow, TZ)).toEqual([]);
+    });
+
+    it('the same claim becomes a candidate once quiet hours end, and was never stamped while deferred', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
+      const dir = path.join(root, 'wg-a', 'claims');
+      writeDest(root, 'wg-a');
+      const file = writeClaim(dir, 'seam-a', {
+        owner: 'ava',
+        claimed_at: new Date(quietNow - 8 * HOUR_MS).toISOString(),
+        ttl_hours: 4,
+      });
+
+      expect(findEscalationCandidates(root, quietNow, TZ)).toEqual([]); // deferred
+      expect(findEscalationCandidates(root, afterWindowNow, TZ)).toHaveLength(1); // posted after window
+
+      // crash-safe: finding it as a candidate never stamps escalated_at — only
+      // escalateClaim (actual delivery) does that.
+      const stamped = JSON.parse(fs.readFileSync(file, 'utf8')) as { escalated_at?: string };
+      expect(stamped.escalated_at).toBeUndefined();
+    });
+
+    it('a claim resolved (released) during the quiet window never posts', () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claims-escalation-'));
+      const dir = path.join(root, 'wg-a', 'claims');
+      writeDest(root, 'wg-a');
+      const file = writeClaim(dir, 'seam-a', {
+        owner: 'ava',
+        claimed_at: new Date(quietNow - 8 * HOUR_MS).toISOString(),
+        ttl_hours: 4,
+      });
+
+      expect(findEscalationCandidates(root, quietNow, TZ)).toEqual([]); // deferred, would have alerted
+
+      fs.unlinkSync(file); // released during the window
+
+      expect(findEscalationCandidates(root, afterWindowNow, TZ)).toEqual([]); // never alerts
+    });
   });
 });
 
