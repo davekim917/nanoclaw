@@ -13,9 +13,13 @@ export const MEMORY_CURATOR_TIMEOUT_MS = 120_000;
 // A consolidation pass can legitimately return up to CONSOLIDATION_MAX_FILES
 // (12) files at up to CONSOLIDATION_FILE_MAX_BYTES (8,192) each — a ceiling
 // the episode budget (8,192 output tokens total) cannot fit even once
-// content is well under a quarter of that ceiling. Same model/effort/timeout
-// as episodes; only the output budget differs.
+// content is well under a quarter of that ceiling. Same model/effort as
+// episodes, but the timeout must scale with the output budget: observed
+// successful consolidation passes already ran ~101s at a THIRD of this
+// 32,768 ceiling, so the unscaled 120s episode timeout was killing every
+// large-workgroup pass (execFile SIGTERM, exit 143) before it could finish.
 export const MEMORY_CONSOLIDATOR_MAX_TOKENS = 32_768;
+export const MEMORY_CONSOLIDATOR_TIMEOUT_MS = 480_000;
 
 export type CuratorModelCall = <T>(
   request: {
@@ -92,7 +96,7 @@ export class MemoryCuratorBackend {
         user,
         schema: CONSOLIDATION_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
         maxTokens: MEMORY_CONSOLIDATOR_MAX_TOKENS,
-        timeoutMs: MEMORY_CURATOR_TIMEOUT_MS,
+        timeoutMs: MEMORY_CONSOLIDATOR_TIMEOUT_MS,
         signal,
       },
       { credentialSlot },

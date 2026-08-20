@@ -651,7 +651,16 @@ export function recordAcceptedGeneratedMemory(
            WHEN memory_curation_state.accepted_updates_since_maintenance + 1 >= ?
              OR ? = 1
            THEN 1 ELSE memory_curation_state.maintenance_pending END,
-         not_before = excluded.not_before,
+         -- An accepted write must not clear a maintenance failure backoff:
+         -- failMemoryMaintenance sets not_before ~6h into the future on
+         -- failure, and this row upserts on every accepted episode. Moving
+         -- not_before to "now" here would wipe that backoff and let the next
+         -- sweep retry a permanently-failing pass immediately. MAX (the
+         -- scalar function, not the aggregate) only ever advances the retry
+         -- floor forward; ISO-8601 UTC strings compare correctly
+         -- lexicographically, and the column is NOT NULL on both branches so
+         -- scalar MAX's NULL-propagation never applies.
+         not_before = MAX(memory_curation_state.not_before, excluded.not_before),
          updated_at = excluded.updated_at`,
     )
     .run(workgroupId, sizePending, now, now, MEMORY_MAINTENANCE_UPDATE_THRESHOLD, sizePending);

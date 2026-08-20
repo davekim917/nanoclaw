@@ -13,8 +13,10 @@ import {
 import { CONSOLIDATION_OUTPUT_SCHEMA, CURATOR_OUTPUT_SCHEMA } from './curator-contract.js';
 import {
   type CuratorModelCall,
+  MEMORY_CONSOLIDATOR_TIMEOUT_MS,
   MEMORY_CURATOR_EFFORT,
   MEMORY_CURATOR_MODEL,
+  MEMORY_CURATOR_TIMEOUT_MS,
   MemoryCuratorBackend,
 } from './curator-backend.js';
 
@@ -71,6 +73,40 @@ describe('memory curator backend', () => {
     expect(call.mock.calls[0]![0].schema).not.toBe(CURATOR_OUTPUT_SCHEMA);
     expect(call.mock.calls[0]![1]).toEqual({ credentialSlot: 'oauth:primary' });
     expect(result.decision.files).toEqual([]);
+  });
+
+  // Bug: consolidate() gets 4x the episode output budget (32,768 vs 8,192
+  // MEMORY_CURATOR_MAX_TOKENS) but was passed the SAME MEMORY_CURATOR_TIMEOUT_MS
+  // (120s) as episodes. Measured successful consolidation passes already ran
+  // ~101s at a third of that output ceiling, so every large-workgroup pass hit
+  // the 120s execFile timeout and died with exit 143. The timeout must scale
+  // with the output budget, and episodes must be untouched.
+  it('MemoryCuratorBackend.consolidate passes the larger consolidator timeout, not the episode timeout', async () => {
+    const call = vi.fn(async (request, _options?: { credentialSlot?: string }) => ({
+      value: { files: [] },
+      model: request.model,
+      credentialSlot: 'oauth:2' as const,
+      usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    }));
+    await new MemoryCuratorBackend(call as unknown as CuratorModelCall).consolidate('system', 'user', 'oauth:primary');
+    expect(call.mock.calls[0]![0]).toMatchObject({ timeoutMs: MEMORY_CONSOLIDATOR_TIMEOUT_MS });
+    expect(MEMORY_CONSOLIDATOR_TIMEOUT_MS).toBeGreaterThan(MEMORY_CURATOR_TIMEOUT_MS);
+  });
+
+  it('MemoryCuratorBackend.curate still passes the unchanged episode timeout', async () => {
+    const call = vi.fn(async (request, _options?: { credentialSlot?: string }) => ({
+      value: {
+        action: 'noop',
+        reasonCode: 'transient',
+        supersedesMemoryIds: [],
+        memories: [],
+      } as const,
+      model: request.model,
+      credentialSlot: 'oauth:2' as const,
+      usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    }));
+    await new MemoryCuratorBackend(call as unknown as CuratorModelCall).curate('system', 'user', 'oauth:primary');
+    expect(call.mock.calls[0]![0]).toMatchObject({ timeoutMs: MEMORY_CURATOR_TIMEOUT_MS });
   });
 
   it('discovers ordered unique OAuth slots without mixing in API billing', () => {

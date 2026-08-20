@@ -431,6 +431,39 @@ describe('memory curation episode queue', () => {
     expect(claimMemoryMaintenance('done', { nowMs: now + 2000 })).toBeNull();
   });
 
+  // Bug: recordAcceptedGeneratedMemory's ON CONFLICT branch unconditionally set
+  // not_before = excluded.not_before (= now of the accepted write), wiping out
+  // any future not_before a prior failMemoryMaintenance had set. That let a
+  // permanently-failing maintenance pass get retried on every subsequent
+  // accepted episode write instead of waiting out the 6h backoff.
+  it('an accepted generated-memory write does not pull a future not_before backoff backwards', () => {
+    const now = Date.parse('2026-07-26T12:00:00.000Z');
+    recordAcceptedGeneratedMemory('wg-a', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now });
+    const job = claimMemoryMaintenance('worker-1', { nowMs: now });
+    expect(job).toMatchObject({ workgroupId: 'wg-a', acceptedUpdates: 1 });
+    const retryMs = 6 * 60 * 60_000;
+    expect(failMemoryMaintenance(job!, { nowMs: now, retryMs })).toBe(true);
+    const notBefore = now + retryMs;
+
+    // An accepted episode write lands well inside the 6h backoff window.
+    recordAcceptedGeneratedMemory('wg-a', 10, { nowMs: now + 1000 });
+
+    // The backoff must still hold: one ms before the ORIGINAL not_before still
+    // yields nothing...
+    expect(claimMemoryMaintenance('too-early', { nowMs: notBefore - 1 })).toBeNull();
+    // ...and claiming exactly at it succeeds, with acceptedUpdates reflecting
+    // the accepted write in between — the counter increment must keep working
+    // even though the backoff timestamp itself is protected.
+    const retried = claimMemoryMaintenance('worker-2', { nowMs: notBefore });
+    expect(retried).toMatchObject({ workgroupId: 'wg-a', acceptedUpdates: 2 });
+  });
+
+  it('a fresh workgroup INSERT still seeds not_before to now, so maintenance is immediately claimable', () => {
+    const now = Date.parse('2026-07-26T12:00:00.000Z');
+    recordAcceptedGeneratedMemory('wg-fresh', MEMORY_MAINTENANCE_SIZE_THRESHOLD + 1, { nowMs: now });
+    expect(claimMemoryMaintenance('worker', { nowMs: now })).toMatchObject({ workgroupId: 'wg-fresh' });
+  });
+
   // P2-AC15. completeMemoryMaintenance used to zero the counter unconditionally,
   // erasing updates accepted while the lease was held. It now subtracts the
   // job's claim-time snapshot (floored at 0), and a caller can reassert
