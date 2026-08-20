@@ -9,7 +9,8 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 
 import { backfillContainerConfigs } from './backfill-container-configs.js';
-import { DATA_DIR } from './config.js';
+import { formatBuildInfoLog, readBuildInfo } from './build-info.js';
+import { DATA_DIR, REPO_ROOT } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
@@ -151,6 +152,14 @@ export function runWorkgroupMemoryStartupGate(
 
 export async function main(): Promise<void> {
   log.info('NanoClaw starting');
+
+  const buildInfo = readBuildInfo(REPO_ROOT);
+  if (buildInfo) {
+    const { msg, data } = formatBuildInfoLog(buildInfo);
+    log[buildInfo.dirty ? 'warn' : 'info'](msg, data);
+  } else {
+    log.warn('dist/BUILD_INFO.json missing — cannot report build provenance (older dist, or a dev run)');
+  }
 
   // 0. Circuit breaker — backoff on rapid restarts
   await enforceStartupBackoff();
