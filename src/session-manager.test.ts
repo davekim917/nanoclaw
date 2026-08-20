@@ -1665,7 +1665,7 @@ describe('threadWorktreeDir — workgroup namespace', () => {
   });
 });
 
-describe('shared-transcript copy is deferred to container spawn', () => {
+describe('the shared-transcript migration is gone', () => {
   const TEST_DIR = '/tmp/nanoclaw-test-write-outbound';
   const LAZY_AG = 'ag-lazy';
   const LAZY_SESS = 'sess-lazy';
@@ -1698,25 +1698,37 @@ describe('shared-transcript copy is deferred to container spawn', () => {
     expect(fs.readdirSync(sessionDir(LAZY_AG, LAZY_SESS)).sort()).toEqual(['inbound.db', 'outbound.db', 'outbox']);
   });
 
-  it('the spawn path copies the shared transcripts on first container start', () => {
+  it('the spawn path creates the projects dir and copies nothing into it', () => {
     initSessionFolder(LAZY_AG, LAZY_SESS);
     spawn();
 
-    expect(fs.readdirSync(projectsDir()).sort()).toEqual(['old-a.jsonl', 'old-b.jsonl', 'sessions-index.json']);
+    expect(fs.existsSync(projectsDir())).toBe(true);
+    expect(fs.readdirSync(projectsDir())).toEqual([]);
   });
 
-  it('a second spawn does not re-copy — transcripts written by the agent survive', () => {
+  it('leaves the group-shared dir untouched', () => {
     initSessionFolder(LAZY_AG, LAZY_SESS);
     spawn();
-    // The agent rewrote its own transcript; a re-copy would clobber it, and a
-    // transcript deleted in-session must not reappear.
-    fs.writeFileSync(path.join(projectsDir(), 'old-a.jsonl'), '{"a":"agent-turn"}\n');
-    fs.rmSync(path.join(projectsDir(), 'old-b.jsonl'));
-    fs.writeFileSync(path.join(sharedProjects, 'old-c.jsonl'), '{"c":1}\n');
+    spawn();
+
+    // `memory` is the group-shared memory dir prepareSessionClaudeDir creates;
+    // nothing else in the shared pile moved or vanished.
+    expect(fs.readdirSync(sharedProjects).sort()).toEqual([
+      'memory',
+      'old-a.jsonl',
+      'old-b.jsonl',
+      'sessions-index.json',
+    ]);
+  });
+
+  it('does not clobber transcripts the agent wrote in a previous turn', () => {
+    initSessionFolder(LAZY_AG, LAZY_SESS);
+    spawn();
+    fs.writeFileSync(path.join(projectsDir(), 'live.jsonl'), '{"a":"agent-turn"}\n');
 
     spawn();
 
-    expect(fs.readFileSync(path.join(projectsDir(), 'old-a.jsonl'), 'utf-8')).toBe('{"a":"agent-turn"}\n');
-    expect(fs.readdirSync(projectsDir()).sort()).toEqual(['old-a.jsonl', 'sessions-index.json']);
+    expect(fs.readdirSync(projectsDir())).toEqual(['live.jsonl']);
+    expect(fs.readFileSync(path.join(projectsDir(), 'live.jsonl'), 'utf-8')).toBe('{"a":"agent-turn"}\n');
   });
 });

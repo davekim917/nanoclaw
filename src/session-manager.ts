@@ -257,65 +257,26 @@ export function groupClaudeMemoryDir(agentGroupId: string): string {
  */
 export function prepareSessionClaudeDir(agentGroupId: string, sessionId: string): void {
   const projectsDir = sessionClaudeProjectsDir(agentGroupId, sessionId);
-  const alreadyExisted = fs.existsSync(projectsDir);
   fs.mkdirSync(projectsDir, { recursive: true });
   const memoryDir = groupClaudeMemoryDir(agentGroupId);
   fs.mkdirSync(memoryDir, { recursive: true });
 
-  // One-time migration from the pre-per-session layout. Older sessions
-  // wrote their transcripts into the group-shared
-  // `.claude-shared/projects/<hash>/` dir alongside every other session's
-  // files. The per-session overlay can't see those unless we copy them
-  // forward — otherwise the first wake on the new layout loses all prior
-  // thread context and the agent appears to have amnesia.
+  // Creates dirs and copies NOTHING. Do not reintroduce a copy from the
+  // group-shared `.claude-shared/projects/<hash>/` dir.
   //
-  // Heuristic: only migrate on first creation of the per-session dir (when
-  // `alreadyExisted` is false). We copy the single `<sessionId>.jsonl` and
-  // the full `sessions-index.json` from the group-shared projects dir;
-  // side-tables like `shell-snapshots` can rebuild themselves. If there's
-  // no group-shared transcript for this session_id, migrate is a no-op.
-  if (!alreadyExisted) {
-    try {
-      const sharedProjects = path.join(
-        DATA_DIR,
-        'v2-sessions',
-        agentGroupId,
-        '.claude-shared',
-        'projects',
-        CLAUDE_CODE_PROJECTS_DIR,
-      );
-      if (fs.existsSync(sharedProjects)) {
-        // Best-effort copy — any .jsonl that exists in shared lands in the
-        // per-session dir. We don't filter by session_id because the SDK's
-        // sdk_session_id in outbound.db may not match the on-disk filename
-        // after compact-boundary rotations; copying all jsonls for this
-        // agent group is safe since only the session's own resume id will
-        // be passed as `resume`.
-        for (const entry of fs.readdirSync(sharedProjects)) {
-          if (!entry.endsWith('.jsonl')) continue;
-          const src = path.join(sharedProjects, entry);
-          const dst = path.join(projectsDir, entry);
-          if (fs.existsSync(dst)) continue;
-          fs.copyFileSync(src, dst);
-        }
-        const idxSrc = path.join(sharedProjects, 'sessions-index.json');
-        const idxDst = path.join(projectsDir, 'sessions-index.json');
-        if (fs.existsSync(idxSrc) && !fs.existsSync(idxDst)) {
-          fs.copyFileSync(idxSrc, idxDst);
-        }
-        log.info('Migrated session transcripts from shared .claude dir', {
-          agentGroupId,
-          sessionId,
-        });
-      }
-    } catch (err) {
-      log.warn('Shared-to-per-session .claude migration failed — session may start without prior context', {
-        agentGroupId,
-        sessionId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+  // Until 2026-08-20 this function migrated forward from the pre-per-session
+  // layout, where every session in a group wrote its transcripts into that one
+  // shared dir. The copy was deliberately unfiltered — session ownership of a
+  // given `.jsonl` cannot be recovered from the filename, because the SDK's
+  // sdk_session_id diverges from the on-disk name after compact-boundary
+  // rotations — and that is the detail that made it look load-bearing at a
+  // glance and kept it alive this long.
+  //
+  // It was dead. The shared dirs stopped being written on 2026-04-21, and zero
+  // sessions in the central DB were created before that date, so the migration
+  // had no beneficiaries left and the source can never be replenished. What it
+  // did have was a cost: ~9MB of transcripts no session owned, copied into
+  // every session that ever spawned, ~23GB across this install.
 
   try {
     fs.chownSync(projectsDir, 1001, 1001);
