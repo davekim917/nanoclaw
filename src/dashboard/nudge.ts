@@ -21,6 +21,7 @@ import { readClaims } from '../claims-board.js';
 import { dispatch } from '../cli/dispatch.js';
 import { getDb } from '../db/index.js';
 import { log } from '../log.js';
+import { buildNudgePrompt, NUDGE_TASK_QUIET_ARGS } from '../modules/claims/self-heal.js';
 import { canAssign } from './assign.js';
 import { threadPermalink, threadPlatformId } from './api/observatory.js';
 import type { AgentGroup } from '../types.js';
@@ -86,21 +87,12 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
   if (!target) return json(409, { error: 'agent_not_wired_to_thread_channel' });
 
   // Composed entirely from the claim file — nothing client-authored reaches it.
+  // The contract itself lives in buildNudgePrompt so the operator-clicked nudge
+  // and the autonomous one (modules/claims/self-heal.ts) cannot drift; this used
+  // to be a second copy of the same text, and it drifted the moment the
+  // announce-what-you-did clause was removed from one of them.
   const who = ctx.user.display_name ?? ctx.user.id;
-  const hours = Math.max(0, Math.round(claim.staleMs / 3600000));
-  const prompt =
-    `Pushed forward by ${who} via the Observatory — the claim \`${claim.slug}\` has stopped moving.\n` +
-    // staleMs means "since parked" for a parked claim and "past TTL" otherwise —
-    // label it honestly rather than telling a parked claim it is overdue.
-    `state: ${claim.state} · ${hours}h ${claim.state === 'parked' ? 'since parked' : 'past due'} · owner: ${claim.owner}` +
-    (claim.escalated ? ' · already escalated once' : '') +
-    (claim.note ? `\nnote on the claim: ${claim.note}` : '') +
-    `\n\nDo ONE of these three, in this thread, before this task ends — there is no fourth option:\n` +
-    `1. Finish it, and say so here.\n` +
-    `2. Release it — \`bash /app/skills/work-claims/claim.sh release ${claim.slug}\`, or ` +
-    `\`park ${claim.slug} "<what a successor needs to know>"\` if it needs a new owner — then say here that it is free.\n` +
-    `3. Post what BLOCKS you, naming the human who owns that blocker.\n\n` +
-    `An item neither moved nor released by the end of this task is the failure this button exists to end.`;
+  const prompt = buildNudgePrompt(claim, `Pushed forward by ${who} via the Observatory`);
 
   const res = await dispatch(
     {
@@ -113,6 +105,7 @@ export const observatoryNudgeHandler: AuthHandler = async (req, _params, ctx) =>
         process_after: new Date().toISOString(),
         messaging_group: target.id,
         thread_id: claim.threadId,
+        ...NUDGE_TASK_QUIET_ARGS,
       },
     },
     { caller: 'host' },

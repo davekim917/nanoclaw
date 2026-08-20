@@ -20,6 +20,18 @@
  *   2. A claim with no `thread_id` is never nudged. There is no honest room to
  *      nudge in — the same reason dashboard/nudge.ts 409s rather than guessing.
  *   3. A claim that says it finished is not stalled work (declaresItselfFinished).
+ *   4. A claim already `parked` WITH a handoff note (isHandedOffPark). Parking
+ *      on the record IS the action a nudge would ask for; PARK_GRACE_MS decay
+ *      making it stale-eligible again is a board-visibility rule, not a reason
+ *      to re-ask. All three nudge options are no-ops for such a claim.
+ *
+ * A nudge is meant to produce WORK, not chat. Moving the claim — finishing,
+ * releasing, parking — is a silent state change: the claims board and the
+ * Observatory already render claim state, and the agents' own instructions
+ * forbid announcing completion. The single sanctioned post is "a human owes me
+ * a decision", which is the one fact no board can show. That is enforced twice:
+ * the prompt says it, and NUDGE_TASK_QUIET_ARGS caps the task at one chat send
+ * with no streaming status.
  *
  * The ladder is deliberately slow and deliberately short: nudge the owner, nudge
  * it once more a day later, and only then — behind its own separate flag —
@@ -28,9 +40,10 @@
  * duplicate-work problem claims exist to prevent, so it arms separately from
  * everything else here. After that the claim is left alone, red, forever.
  *
- * Nothing here is silent. Every action stamps the claim file and logs a
- * structured line; with the flag off, the same detection runs and logs
- * `self-heal: would …` while spawning nothing.
+ * Nothing here is unaccounted for: every action stamps the claim file and logs a
+ * structured line (that is the audit trail — deliberately NOT a chat post); with
+ * the flag off, the same detection runs and logs `self-heal: would …` while
+ * spawning nothing.
  */
 import fs from 'fs';
 import path from 'path';
@@ -60,6 +73,36 @@ export const SELF_HEAL_MAX_NUDGES = 2;
  */
 export function isWaitingOnHuman(note: string): boolean {
   return /^\s*waiting on\b/i.test(note);
+}
+
+/**
+ * How much note a park has to carry to count as a handoff rather than a walk-away.
+ *
+ * `claim.sh park` REFUSES an empty note, so "has a note" is not a signal — every
+ * script-written park has one. What separates "schema done, handlers TODO" from
+ * "parked" / "wip" / "not done" is that the first names both the state and what
+ * is needed next, and two facts do not fit in three words.
+ */
+// ponytail: word count, not meaning. Upgrade path if junk notes get wordier is
+// the same one the board would need — a note-quality check the skill enforces
+// at write time, in claim.sh, not a classifier here.
+export const HANDOFF_NOTE_MIN_WORDS = 4;
+
+/**
+ * A park that told a successor what they need is a COMPLETED action, not a
+ * stall — the whole point of `park` is stepping off work on the record. It
+ * decays to `stale` on the board after PARK_GRACE_MS (claims-board.ts) so a
+ * human still sees it, and that is the right amount of pressure. Nudging it
+ * asks the agent to redo the thing it already did: all three options below are
+ * no-ops for a claim that is already parked with a note.
+ *
+ * A park with a throwaway note is the genuine abandonment case, and it keeps
+ * the 24h decay.
+ */
+export function isHandedOffPark(raw: { status?: unknown; note?: unknown }): boolean {
+  if (typeof raw.status !== 'string' || raw.status.trim().toLowerCase() !== 'parked') return false;
+  const words = typeof raw.note === 'string' ? raw.note.trim().split(/\s+/).filter(Boolean) : [];
+  return words.length >= HANDOFF_NOTE_MIN_WORDS;
 }
 
 /** Ladder state, as stamped on the claim file. No new schema. */
@@ -111,6 +154,7 @@ export function decideSelfHeal(
   if (claim.state !== 'stale') return { action: 'none', reason: 'not-stale' };
   const note = typeof raw.note === 'string' ? raw.note : '';
   if (isWaitingOnHuman(note)) return { action: 'none', reason: 'waiting-on-human' };
+  if (isHandedOffPark(raw)) return { action: 'none', reason: 'parked-with-handoff' };
   if (!claim.threadId) return { action: 'none', reason: 'no-thread' };
   if (declaresItselfFinished(raw)) return { action: 'none', reason: 'declares-finished' };
 
@@ -146,36 +190,73 @@ function claimStateLine(claim: BoardClaim): string {
  * an item neither moved nor released by the end of the task is the failure this
  * exists to end, and "name the human who blocks you" is the exit that stops a
  * nudge loop on genuinely blocked work.
+ *
+ * Moving the claim is SILENT. The first version of this prompt made options 1
+ * and 2 announce themselves ("then say here that it is free"), and the result
+ * was the measurable failure: 22 nudges in a day produced 22 channel posts, of
+ * which ~half of one channel's traffic was agents narrating a state change the
+ * claims board and the Observatory already render. It also contradicted the
+ * agents' own standing instruction never to announce completion. The one thing
+ * a board cannot show is a human who owes a decision, so that is the one thing
+ * that posts.
  */
 export function buildNudgePrompt(claim: BoardClaim, origin: string): string {
+  const claimSh = 'bash /app/skills/work-claims/claim.sh';
   return (
     `${origin} — the claim \`${claim.slug}\` has stopped moving.\n` +
     `${claimStateLine(claim)}\n\n` +
-    `Do ONE of these three, in this thread, before this task ends — there is no fourth option:\n` +
-    `1. Finish it, and say so here.\n` +
-    `2. Release it — \`bash /app/skills/work-claims/claim.sh release ${claim.slug}\`, or ` +
-    `\`park ${claim.slug} "<what a successor needs to know>"\` if it needs a new owner — then say here that it is free.\n` +
-    `3. Post what BLOCKS you, naming the human who owns that blocker.\n\n` +
-    `An item neither moved nor released by the end of this task is the failure this button exists to end.`
+    `MOVE the claim before this task ends — there is no fourth option:\n` +
+    `1. Finish the work, then \`${claimSh} release ${claim.slug}\`.\n` +
+    `2. Stopping without finishing: \`${claimSh} park ${claim.slug} "<what a successor needs to know>"\`. ` +
+    `Dead or superseded: \`${claimSh} release ${claim.slug}\`.\n` +
+    `3. A HUMAN owes you a decision or an action you cannot proceed without: ` +
+    `\`${claimSh} park ${claim.slug} "waiting on <person>: <what you asked>"\`, AND post ONE message naming the human ` +
+    `who owns that blocker. Write it to stand alone — say which claim, what is blocked, and who owes the answer; ` +
+    `it may land at the top of a channel rather than in the thread you are reading this in.\n\n` +
+    `Post NOTHING for 1 or 2. The claims board and the Observatory already show claim state, so announcing a finish, ` +
+    `a release or a park duplicates what a human can already see — and your standing instructions forbid it. Option 3 ` +
+    `is the ONLY sanctioned post here, because a blocked human is the one thing no board can show. Do not hedge by ` +
+    `posting anyway.\n` +
+    `A claim neither moved nor released by the end of this task is the failure this exists to end.`
   );
 }
+
+/**
+ * Task-create args every nudge is spawned with, on both paths.
+ *
+ * The prompt above is instruction; this is the enforcement, and it exists
+ * because instructions demonstrably do not hold on their own. `quiet_status`
+ * drops the streaming 💭 progress writes — those carry the task row's routing
+ * and land in the channel whatever the prompt says. `chat_limit: 1` caps the
+ * turn at a single chat send at the agent-runner's write layer
+ * (`container/agent-runner/src/db/messages-out.ts`), which is exactly the one
+ * post option 3 is allowed. Not `mute_chat`: that would make option 3
+ * impossible, and a silently blocked agent is the outcome this whole ladder is
+ * trying to prevent.
+ */
+export const NUDGE_TASK_QUIET_ARGS = { quiet_status: true, chat_limit: 1 } as const;
 
 /**
  * Takeover has a different contract from a nudge: the agent being addressed is
  * not the owner, so "finish it" is not one of its options until it has actually
  * taken the claim. Declining is a first-class answer — a sibling that says why
  * it is not the right owner has still moved the claim out of silence.
+ *
+ * Same posting rule as the nudge: taking the claim rewrites the owner on the
+ * board, so announcing it is duplication. Declining is not visible anywhere,
+ * so declining is what posts.
  */
 export function buildTakeoverPrompt(claim: BoardClaim): string {
+  const claimSh = 'bash /app/skills/work-claims/claim.sh';
   return (
     `Self-heal takeover — the claim \`${claim.slug}\`, owned by ${claim.owner}, has been stale through two ` +
     `automatic nudges with no movement. Work-claims rule 4: a claim past its TTL may be taken over by anyone.\n` +
     `${claimStateLine(claim)}\n\n` +
-    `Do ONE of these two, in this thread, before this task ends:\n` +
-    `1. Take it over — \`bash /app/skills/work-claims/claim.sh take ${claim.slug} <hours> "<takeover: what you are picking up>"\` ` +
-    `— then work it, and say here that you own it now.\n` +
-    `2. Say here why this should NOT be taken over (already done, superseded, blocked on a human) — and if it is done, ` +
-    `release it: \`bash /app/skills/work-claims/claim.sh release ${claim.slug}\`.\n\n` +
+    `Do ONE of these two before this task ends:\n` +
+    `1. Take it over — \`${claimSh} take ${claim.slug} <hours> "<takeover: what you are picking up>"\` — then work it. ` +
+    `Post nothing: the take rewrites the owner on the board, which is where anyone looking will read it.\n` +
+    `2. Post ONE message saying why this should NOT be taken over (already done, superseded, blocked on a named human) ` +
+    `— that reason is the one thing the board cannot show. If it is done, also release it: \`${claimSh} release ${claim.slug}\`.\n\n` +
     `Do not silently leave it: this is the last automatic step, and after it the claim just sits red on the board.`
   );
 }
@@ -351,6 +432,7 @@ async function defaultCreateTask(input: SelfHealTaskInput): Promise<boolean> {
         process_after: new Date().toISOString(),
         messaging_group: input.target.messagingGroupId,
         thread_id: input.claim.threadId,
+        ...NUDGE_TASK_QUIET_ARGS,
       },
     },
     { caller: 'host' },

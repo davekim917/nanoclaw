@@ -6,6 +6,7 @@ import type { AuthedRequestContext } from './router.js';
 
 import { dispatch as _dispatchRaw } from '../cli/dispatch.js';
 import { readClaims as _readClaimsRaw } from '../claims-board.js';
+import { buildNudgePrompt } from '../modules/claims/self-heal.js';
 
 const mockDispatch = vi.mocked(_dispatchRaw);
 const mockReadClaims = vi.mocked(_readClaimsRaw);
@@ -109,6 +110,19 @@ describe('observatoryNudgeHandler', () => {
     expect(frame.args.messaging_group).toBe('mg-1'); // resolved from the thread id's platform prefix
     expect(frame.args.thread_id).toBe(CLAIM.threadId);
     expect(frame.args.recurrence).toBeUndefined(); // one-shot, never a series
+    // Anti-noise enforcement, not just prompt text: no streaming 💭 writes, and
+    // at most the ONE post option 3 is allowed to make.
+    expect(frame.args.quiet_status).toBe(true);
+    expect(frame.args.chat_limit).toBe(1);
+  });
+
+  it('sends the same silent contract the autonomous nudge sends', async () => {
+    claimsAre([CLAIM]);
+    expect((await nudge())!.status).toBe(200);
+    const prompt = mockDispatch.mock.calls[0]![0].args.prompt as string;
+    expect(prompt).toBe(buildNudgePrompt(CLAIM, 'Pushed forward by Olive Owner via the Observatory'));
+    expect(prompt).toContain('Post NOTHING for 1 or 2');
+    expect(prompt).not.toContain('say here');
   });
 
   it('opens with provenance and demands one of exactly three outcomes', async () => {

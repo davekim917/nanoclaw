@@ -7,7 +7,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildNudgePrompt,
   buildTakeoverPrompt,
+  isHandedOffPark,
   isWaitingOnHuman,
+  NUDGE_TASK_QUIET_ARGS,
   SELF_HEAL_COOLDOWN_MS,
   SELF_HEAL_SCAN_INTERVAL_MS,
   shouldSkipSelfHealScan,
@@ -15,6 +17,10 @@ import {
   type SelfHealDeps,
   type SelfHealTaskInput,
 } from './self-heal.js';
+
+// Only needed by the one test that exercises the REAL createTask path; the rest
+// inject a recording createTask and never reach dispatch.
+vi.mock('../../cli/dispatch.js', () => ({ dispatch: vi.fn() }));
 
 const HOUR = 60 * 60 * 1000;
 const NOW = Date.parse('2026-08-20T12:00:00Z');
@@ -47,6 +53,17 @@ function readClaimFile(dir: string, slug: string): Record<string, unknown> {
     unknown
   >;
 }
+
+/** A board row in the state the prompt builders are asked about. */
+const BOARD_CLAIM = {
+  slug: 'seam',
+  owner: 'ava',
+  note: 'wallet tie-out',
+  threadId: 'slack:C0AAA:1',
+  state: 'stale' as const,
+  staleMs: 30 * HOUR,
+  escalated: false,
+};
 
 const OWNER = { agentGroupId: 'ag-owner', messagingGroupId: 'mg-1', name: 'ava' };
 const SIBLING = { agentGroupId: 'ag-sib', messagingGroupId: 'mg-1', name: 'bo' };
@@ -101,6 +118,48 @@ describe('exclusions — the claims self-heal must never touch', () => {
     expect(isWaitingOnHuman('waiting on the owner: pick a flow')).toBe(true);
     expect(isWaitingOnHuman('  Waiting On Dana')).toBe(true);
     expect(isWaitingOnHuman('rewrote the parser while waiting on CI')).toBe(false);
+  });
+
+  it('never nudges a claim already parked WITH a handoff note, however far past PARK_GRACE_MS', async () => {
+    const dir = root({
+      handed: claim(80, {
+        status: 'parked',
+        parked_at: new Date(NOW - 40 * HOUR).toISOString(),
+        note: 'not done: schema landed, handlers still TODO — start at src/wallet/tieout.ts',
+      }),
+    });
+    const d = deps(dir);
+
+    expect(await sweepClaimsSelfHeal(NOW, d)).toEqual([]);
+    expect(d.sent).toEqual([]);
+    expect(readClaimFile(dir, 'handed').auto_nudge_count).toBeUndefined();
+  });
+
+  it('still nudges a park whose note says nothing — that is abandonment, not a handoff', async () => {
+    const dir = root({
+      dumped: claim(80, {
+        status: 'parked',
+        parked_at: new Date(NOW - 40 * HOUR).toISOString(),
+        note: 'parked',
+      }),
+    });
+    const d = deps(dir);
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+    expect(outcome).toMatchObject({ slug: 'dumped', action: 'nudge', applied: true });
+    expect(d.sent).toHaveLength(1);
+  });
+
+  it('separates a handoff note from a walk-away by whether it names state AND next step', () => {
+    expect(isHandedOffPark({ status: 'parked', note: 'not done: schema done, handlers TODO' })).toBe(true);
+    expect(isHandedOffPark({ status: 'Parked', note: 'publish-gate seam, PR #733' })).toBe(true);
+    expect(isHandedOffPark({ status: 'parked', note: 'parked' })).toBe(false);
+    expect(isHandedOffPark({ status: 'parked', note: 'not done' })).toBe(false);
+    expect(isHandedOffPark({ status: 'parked', note: '   ' })).toBe(false);
+    expect(isHandedOffPark({ status: 'parked' })).toBe(false);
+    // Only a PARKED claim gets the exemption — a live claim with a long note is
+    // still just a claim someone stopped working.
+    expect(isHandedOffPark({ note: 'schema done, handlers still TODO, start here' })).toBe(false);
   });
 
   it('never nudges a claim with no thread_id — there is no honest room to guess', async () => {
@@ -289,16 +348,70 @@ describe('accountability', () => {
   });
 });
 
+describe('anti-noise — a nudge must produce work, not chat', () => {
+  it('tells the agent to post NOTHING when it finishes, releases or parks', () => {
+    const prompt = buildNudgePrompt(BOARD_CLAIM, 'x');
+
+    expect(prompt).toContain('Post NOTHING for 1 or 2');
+    // The clause that produced 22 channel posts in a day.
+    expect(prompt).not.toContain('say here');
+    expect(prompt).not.toContain('say so here');
+    expect(prompt).not.toContain('and say so');
+  });
+
+  it('keeps naming a human blocker as the ONE sanctioned post, self-contained', () => {
+    const prompt = buildNudgePrompt(BOARD_CLAIM, 'x');
+
+    expect(prompt).toContain('post ONE message naming the human');
+    expect(prompt).toContain('ONLY sanctioned post');
+    // The delivery caveat: a nudge task's post lands top-level in a channel, so
+    // the message has to carry its own context.
+    expect(prompt).toContain('stand alone');
+    expect(prompt).toContain('which claim');
+    // And it must not leave the agent room to hedge by posting anyway.
+    expect(prompt).toContain('Do not hedge');
+  });
+
+  it('never tells a takeover to announce that it took the claim', () => {
+    const prompt = buildTakeoverPrompt(BOARD_CLAIM);
+
+    expect(prompt).toContain('Post nothing: the take rewrites the owner on the board');
+    expect(prompt).toContain('Post ONE message saying why this should NOT be taken over');
+    expect(prompt).not.toContain('say here that you own it now');
+  });
+
+  it('enforces it at the write layer too — one chat send, no streaming status', () => {
+    // Instructions demonstrably do not hold on their own; these are the
+    // agent-runner-side caps the nudge task is actually created with.
+    expect(NUDGE_TASK_QUIET_ARGS).toEqual({ quiet_status: true, chat_limit: 1 });
+    // NOT mute_chat — that would silence the human-blocker post too.
+    expect(NUDGE_TASK_QUIET_ARGS).not.toHaveProperty('mute_chat');
+  });
+
+  it('the REAL task-create path carries those caps into tasks-create', async () => {
+    const { dispatch } = await import('../../cli/dispatch.js');
+    vi.mocked(dispatch).mockResolvedValue({ id: 'x', ok: true, data: { series_id: 's' } } as never);
+    const dir = root({ seam: claim(30) });
+
+    // No createTask override — this exercises defaultCreateTask.
+    await sweepClaimsSelfHeal(NOW, {
+      root: dir,
+      enabled: true,
+      resolveOwner: async () => OWNER,
+      resolveSibling: async () => SIBLING,
+    });
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(dispatch).mock.calls[0]![0].args).toMatchObject({
+      group: 'ag-owner',
+      quiet_status: true,
+      chat_limit: 1,
+    });
+  });
+});
+
 describe('prompt builders', () => {
-  const board = {
-    slug: 'seam',
-    owner: 'ava',
-    note: 'wallet tie-out',
-    threadId: 'slack:C0AAA:1',
-    state: 'stale' as const,
-    staleMs: 30 * HOUR,
-    escalated: false,
-  };
+  const board = BOARD_CLAIM;
 
   it('shares one contract between the human and autonomous nudge paths', () => {
     const human = buildNudgePrompt(board, 'Pushed forward by an operator via the Observatory');
