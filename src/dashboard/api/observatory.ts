@@ -24,6 +24,7 @@ import { readContainerConfig, type ContainerConfig } from '../../container-confi
 import { readClaims, type BoardClaim } from '../../claims-board.js';
 import { workgroupLegacyRoot } from '../../repository-activation.js';
 import { log } from '../../log.js';
+import { parseUtcTimestampMs } from '../../thread-context.js';
 import type { AgentGroup } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 
@@ -554,19 +555,6 @@ function hasWorkgroupAccess(workgroupId: string, ctx: AuthedRequestContext): boo
   return !!hit;
 }
 
-/**
- * Normalize a SQLite TIMESTAMP (naive `YYYY-MM-DD HH:MM:SS`, no zone marker —
- * see `bumpLastOutbound`) to epoch ms as UTC. Same fix scheduled-assembly.ts
- * applies to the same column family: without it, `Date.parse` reads the
- * string as local time.
- */
-export function parseUtcMs(s: string | null | undefined): number | null {
-  if (!s) return null;
-  const normalized = /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : `${s.includes('T') ? s : s.replace(' ', 'T')}Z`;
-  const ms = Date.parse(normalized);
-  return Number.isNaN(ms) ? null : ms;
-}
-
 const LOCATION_WINDOW_MS = 8 * 60 * 60 * 1000;
 
 /**
@@ -866,7 +854,7 @@ async function buildAgents(
       let roomThreadId: string | null = null;
       let roomAt: string | null = null;
       for (const s of sessions) {
-        const ms = parseUtcMs(s.last_outbound_at);
+        const ms = parseUtcTimestampMs(s.last_outbound_at);
         if (ms === null) continue;
         if (ms > mostRecentMs) {
           mostRecentMs = ms;
@@ -984,7 +972,9 @@ function attachClaimSessions(workgroupId: string, claims: ObservatoryClaim[], ag
     const owner = ownerOfSlug.get(c.slug);
     const mine = owner ? onThread.find((r) => r.agent_group_id === owner) : undefined;
     const newest = onThread.reduce((a, b) =>
-      (parseUtcMs(b.last_outbound_at) ?? -Infinity) > (parseUtcMs(a.last_outbound_at) ?? -Infinity) ? b : a,
+      (parseUtcTimestampMs(b.last_outbound_at) ?? -Infinity) > (parseUtcTimestampMs(a.last_outbound_at) ?? -Infinity)
+        ? b
+        : a,
     );
     c.sessionId = (mine ?? newest).id;
   }

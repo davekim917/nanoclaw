@@ -271,3 +271,87 @@ describe('message text renders as formatted markdown', () => {
     expect(details.querySelector('summary')!.textContent).toContain('show full message');
   });
 });
+
+/* ─── Stale selection ──────────────────────────────────────────────────────── */
+
+/**
+ * The composer holds an `agent_group_id` across live refreshes of the thread
+ * row. An agent can leave `participants` (its session archived) and a chip can
+ * preset an assignable the next refresh no longer wires to this channel. The
+ * legacy Observatory learned this the hard way: the select renders blank while
+ * the state still holds the old choice, "and the send would then go to somebody
+ * the operator can no longer see. Nobody is the honest reading of that."
+ */
+describe('a selection that goes stale falls to nobody, never to a silent substitute', () => {
+  const rerenderWith = (t: ThreadSummary) =>
+    render(
+      <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
+        <ThreadDetail thread={t} />
+      </SWRConfig>,
+    );
+
+  it('blanks the selector when the chosen agent is no longer reachable', async () => {
+    // The chip path: an assignable is chosen, then it stops being wired.
+    const before = thread({ assignable_agents: [{ agent_group_id: 'ag-3', name: 'Charlie' }] });
+    const { rerender } = rerenderWith(before);
+    const select = await target();
+    await userEvent.selectOptions(select, 'ag-3');
+    expect(select.value).toBe('ag-3');
+
+    rerender(
+      <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
+        <ThreadDetail thread={thread({ assignable_agents: [] })} />
+      </SWRConfig>,
+    );
+    const after = (await target()) as HTMLSelectElement;
+    expect(after.value).toBe('');
+    expect(screen.getByText('pick who this goes to')).toBeTruthy();
+  });
+
+  it('refuses to send while nobody is selected', async () => {
+    const { rerender } = rerenderWith(thread({ assignable_agents: [{ agent_group_id: 'ag-3', name: 'Charlie' }] }));
+    await userEvent.selectOptions(await target(), 'ag-3');
+    await userEvent.type(screen.getByLabelText('Message text'), 'ship it');
+
+    rerender(
+      <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
+        <ThreadDetail thread={thread({ assignable_agents: [] })} />
+      </SWRConfig>,
+    );
+    const send = screen.getByRole('button', { name: /^send$/i }) as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+    await userEvent.click(send);
+    expect(postThreadMessage).not.toHaveBeenCalled();
+  });
+
+  it('leaves a still-valid choice alone across a refresh', async () => {
+    const { rerender } = rerenderWith(thread());
+    await userEvent.selectOptions(await target(), 'ag-1');
+    rerender(
+      <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
+        <ThreadDetail thread={thread({ last_activity_at: '2026-08-20T10:00:00.000Z' })} />
+      </SWRConfig>,
+    );
+    expect((await target()).value).toBe('ag-1');
+  });
+});
+
+/* ─── Shared refusal wording ───────────────────────────────────────────────── */
+
+describe('a refused send is explained in the operator’s words', () => {
+  it('translates the wire code rather than printing it', async () => {
+    postThreadMessage.mockRejectedValue({ status: 429, error: 'rate_limit_exceeded', retry_after: 9 });
+    renderDetail(thread());
+    await userEvent.type(await screen.findByLabelText('Message text'), 'go');
+    await userEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await waitFor(() => expect(screen.getByText(/too fast — try again in 9s/)).toBeTruthy());
+  });
+
+  it('reads an unrouted endpoint as a pending restart, not as a bug in the work', async () => {
+    postThreadMessage.mockRejectedValue({ status: 404, error: 'unknown' });
+    renderDetail(thread());
+    await userEvent.type(await screen.findByLabelText('Message text'), 'go');
+    await userEvent.click(screen.getByRole('button', { name: /^send$/i }));
+    await waitFor(() => expect(screen.getByText(/not active until the next host restart/)).toBeTruthy());
+  });
+});

@@ -13,24 +13,27 @@ import {
 import { stripMarkdown } from '../../lib/markdown.js';
 import { subscribe } from '../../lib/sse.ts';
 import { useGroupFilter } from '../../lib/use-group-filter.js';
+import { actionError } from './action-error.js';
 import { closeThread, setSnoozed } from './actions.js';
+import { ScheduleLens } from './ScheduleLens.js';
 import { ThreadDetail } from './ThreadDetail.js';
 import { ThreadRow, type ThreadPreview } from './ThreadRow.js';
 import { TriagePanel } from './TriagePanel.js';
-import { LANE_ORDER, STATE_PRESENTATION, urgencyRank } from './thread-state.js';
+import { LANE_ORDER, STATE_PRESENTATION, compareThreads, emptyQueueMessage, type Lane } from './thread-state.js';
 
 /**
- * The Observatory console — `#/console`.
+ * The Observatory console — `#/console`, and now the only surface.
  *
- * Lives ALONGSIDE the legacy Observatory / inbox / workgroup routes; retiring
- * those is Phase 4. Backed entirely by `GET /dashboard/api/threads`, whose row
- * is a thread rather than a session (DESIGN.md §3.1).
+ * The legacy Observatory / inbox / workgroup / session routes are deleted; this
+ * shell carries the thread queue and the Schedule lens. Backed entirely by
+ * `GET /dashboard/api/threads`, whose row is a thread rather than a session
+ * (DESIGN.md §3.1).
  *
  * Refresh is push-only. There is no polling loop here and must not be one: the
  * host already emits `session_event` over SSE for every inbound write, outbound
  * delivery and container-state transition, so a timer would only add cost. The
- * debounce below is the same trailing-edge pattern InboxBoard uses, for the same
- * reason — a streaming burst emits dozens of frames per turn.
+ * debounce below is the trailing-edge pattern the retired inbox board used, for
+ * the same reason — a streaming burst emits dozens of frames per turn.
  */
 
 /**
@@ -43,13 +46,6 @@ import { LANE_ORDER, STATE_PRESENTATION, urgencyRank } from './thread-state.js';
  */
 const PREVIEW_BUDGET = 8;
 
-/**
- * `snoozed` is a pseudo-lane, NOT an eighth state: a snooze is this operator's
- * own view decision and a thread can be snoozed while it is running. It is a
- * lane rather than a silent filter so a snoozed thread is always reachable —
- * hiding work with no way back is how a queue starts lying.
- */
-type Lane = ThreadState | 'all' | 'snoozed';
 type ThemeChoice = 'system' | 'light' | 'dark';
 const THEME_KEY = 'ncc-theme';
 const THEME_CYCLE: ThemeChoice[] = ['system', 'dark', 'light'];
@@ -61,13 +57,14 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
     authMe.scopes.no_filter,
   );
   const [lane, setLane] = useState<Lane>('all');
-  const [channel, setChannel] = useState<string | null>(null);
+  const [rawChannel, setChannel] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [focusComposer, setFocusComposer] = useState(0);
   const [triage, setTriage] = useState<ThreadSummary[] | null>(null);
   const [notice, setNotice] = useState('');
   const theme = useThemeChoice();
+  const lens = useHashLens();
 
   const { data, mutate } = useSWR(
     ['/dashboard/api/threads', groupFilter],
@@ -104,6 +101,22 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
     return [...byKey.values()].sort((a, b) => b.attention - a.attention || b.total - a.total);
   }, [threads]);
 
+  /**
+   * The channel filter, validated against the channels that actually exist —
+   * the same guard `use-group-filter.ts` applies to a stored group id, for the
+   * same reason. `channels` is derived from the CURRENT window, so a channel
+   * whose last thread aged out simply stops being listed; without this the
+   * sidebar would show "All channels" pressed while an invisible filter kept
+   * the queue empty, and the operator would be reading a lie.
+   */
+  const channel = channels.some((c) => c.key === rawChannel) ? rawChannel : null;
+  const channelName = channels.find((c) => c.key === channel)?.name ?? null;
+  useEffect(() => {
+    // Only once there is a window to validate against: an empty fetch is not
+    // evidence that the operator's channel is gone.
+    if (rawChannel !== null && threads.length > 0 && !channels.some((c) => c.key === rawChannel)) setChannel(null);
+  }, [rawChannel, channels, threads.length]);
+
   const snoozedCount = useMemo(() => threads.filter((t) => t.snoozed).length, [threads]);
 
   const attentionCount = useMemo(
@@ -123,11 +136,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
           (t.title ?? '').toLowerCase().includes(needle) ||
           t.channel_name.toLowerCase().includes(needle),
       )
-      .sort(
-        (a, b) =>
-          urgencyRank(a.state) - urgencyRank(b.state) ||
-          activityMs(b.last_activity_at) - activityMs(a.last_activity_at),
-      );
+      .sort(compareThreads);
   }, [threads, lane, channel, query]);
 
   // Which rows are allowed to spend a preview fetch — the first PREVIEW_BUDGET
@@ -180,7 +189,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
           setNotice(`Closed ${t.title ?? 'thread'}.`);
           void mutate();
         })
-        .catch((err: { error?: string }) => setNotice(`Could not close — ${err.error ?? 'request failed'}.`));
+        .catch((err: unknown) => setNotice(`Could not close — ${actionError(err)}.`));
     },
     [mutate],
   );
@@ -192,7 +201,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
           setNotice(t.snoozed ? 'Un-snoozed.' : 'Snoozed until it moves.');
           void mutate();
         })
-        .catch((err: { error?: string }) => setNotice(`Could not snooze — ${err.error ?? 'request failed'}.`));
+        .catch((err: unknown) => setNotice(`Could not snooze — ${actionError(err)}.`));
     },
     [mutate],
   );
@@ -321,67 +330,81 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
 
           <div className="ncc-side-gap" />
           <h2 className="ncc-side-head">Lenses</h2>
-          {/* §11: the floor plan and the schedule are LENSES, not destinations.
-              Phase 2 points them at the surfaces that already render them;
-              folding them into this shell is later work. */}
-          <a className="ncc-side-item" href="#/observatory">
-            <span className="lbl">Floor plan</span>
+          {/* §11: the schedule is a LENS, not a destination — same shell, same
+              group filter, a different thing to look at. The floor-plan lens is
+              gone with the floor plan itself; a lens with no target is worse
+              than no lens. */}
+          <a className="ncc-side-item" href="#/console" aria-current={lens === 'threads' ? 'page' : undefined}>
+            <span className="lbl">Threads</span>
           </a>
-          <a className="ncc-side-item" href="#/observatory">
+          <a className="ncc-side-item" href="#/scheduled" aria-current={lens === 'schedule' ? 'page' : undefined}>
             <span className="lbl">Schedule</span>
           </a>
         </nav>
 
-        <section className="ncc-list-pane" aria-label="Threads" hidden={triage !== null}>
-          <div className="ncc-list-head">
-            <h2>{laneLabel}</h2>
-            <span className="count">{visible.length}</span>
-            <span className="ncc-spacer" />
-            <span className="count">sort:urgency</span>
-          </div>
-          <ul className="ncc-list" ref={listRef} onKeyDown={onListKeyDown}>
-            {visible.map((t) => (
-              <ConnectedRow
-                key={t.thread_id}
-                thread={t}
-                withPreview={previewIds.has(t.thread_id)}
-                selected={t.thread_id === selectedId}
-                onSelect={(x) => {
-                  setSelectedId(x.thread_id);
-                  // Opening a thread must not steal the cursor; only a verb
-                  // asks for the composer. See ReplyComposer's focus effect.
-                  setFocusComposer(0);
-                }}
-                onVerb={onVerb}
-              />
-            ))}
-          </ul>
-          {visible.length === 0 && <div className="ncc-empty">no threads in view</div>}
-          {/* Every mutating action reports here, once, for screen readers and
-              for anyone who did not watch the row change under the cursor. */}
-          <div className="ncc-notice" role="status" aria-live="polite">
-            {notice}
-          </div>
-        </section>
-
-        {triage ? (
-          <TriagePanel snapshot={triage} threads={threads} onExit={exitTriage} onChanged={() => void mutate()} />
+        {lens === 'schedule' ? (
+          <ScheduleLens groupFilter={groupFilter} groups={groups} />
         ) : (
-          <div className="ncc-detail-wrap">
-            {selected && (
-              /* The two actions that are not a message. Everything else on this
+          <>
+            <section className="ncc-list-pane" aria-label="Threads" hidden={triage !== null}>
+              <div className="ncc-list-head">
+                <h2>{laneLabel}</h2>
+                <span className="count">{visible.length}</span>
+                <span className="ncc-spacer" />
+                <span className="count">sort:urgency</span>
+              </div>
+              <ul className="ncc-list" ref={listRef} onKeyDown={onListKeyDown}>
+                {visible.map((t) => (
+                  <ConnectedRow
+                    key={t.thread_id}
+                    thread={t}
+                    withPreview={previewIds.has(t.thread_id)}
+                    selected={t.thread_id === selectedId}
+                    onSelect={(x) => {
+                      setSelectedId(x.thread_id);
+                      // Opening a thread must not steal the cursor; only a verb
+                      // asks for the composer. See ReplyComposer's focus effect.
+                      setFocusComposer(0);
+                    }}
+                    onVerb={onVerb}
+                  />
+                ))}
+              </ul>
+              {/* Four different facts, four different sentences — see
+              `emptyQueueMessage`. A clear attention lane is good news and says
+              so; a narrowed question gets its narrowing spoken back. */}
+              {visible.length === 0 && (
+                <div className="ncc-empty">
+                  {emptyQueueMessage({ total: threads.length, lane, channelName, query })}
+                </div>
+              )}
+              {/* Every mutating action reports here, once, for screen readers and
+              for anyone who did not watch the row change under the cursor. */}
+              <div className="ncc-notice" role="status" aria-live="polite">
+                {notice}
+              </div>
+            </section>
+
+            {triage ? (
+              <TriagePanel snapshot={triage} threads={threads} onExit={exitTriage} onChanged={() => void mutate()} />
+            ) : (
+              <div className="ncc-detail-wrap">
+                {selected && (
+                  /* The two actions that are not a message. Everything else on this
                  screen is the composer below. */
-              <div className="ncc-detail-actions">
-                <button type="button" className="ncc-verb" onClick={() => onToggleSnooze(selected)}>
-                  {selected.snoozed ? 'un-snooze' : 'snooze'}
-                </button>
-                <button type="button" className="ncc-verb" onClick={() => onClose(selected)}>
-                  close
-                </button>
+                  <div className="ncc-detail-actions">
+                    <button type="button" className="ncc-verb" onClick={() => onToggleSnooze(selected)}>
+                      {selected.snoozed ? 'un-snooze' : 'snooze'}
+                    </button>
+                    <button type="button" className="ncc-verb" onClick={() => onClose(selected)}>
+                      close
+                    </button>
+                  </div>
+                )}
+                <ThreadDetail thread={selected} focusComposer={focusComposer} onSent={() => void mutate()} />
               </div>
             )}
-            <ThreadDetail thread={selected} focusComposer={focusComposer} onSent={() => void mutate()} />
-          </div>
+          </>
         )}
       </div>
     </div>
@@ -473,8 +496,28 @@ export function lastMessagePreview(transcript: ThreadTranscriptEntry[] | undefin
 
 /* ─── Plumbing ─────────────────────────────────────────────────────────── */
 
-function activityMs(iso: string | null): number {
-  return iso ? new Date(iso).getTime() : 0;
+/**
+ * Which lens the hash selects.
+ *
+ * `#/scheduled` is a REAL route again rather than a redirect: it used to bounce
+ * to the legacy Observatory, whose floor carried the schedule section, and that
+ * indirection is what made the schedule invisible the moment the Observatory
+ * was deleted. Every OTHER hash — including the retired `#/observatory`,
+ * `#/inbox`, `#/workgroup` and `#/session/:id` bookmarks — still lands on the
+ * thread queue rather than rendering nothing.
+ */
+export function lensForHash(hash: string): 'threads' | 'schedule' {
+  return hash.replace(/^#/, '') === '/scheduled' ? 'schedule' : 'threads';
+}
+
+function useHashLens(): 'threads' | 'schedule' {
+  const [lens, setLens] = useState(() => lensForHash(location.hash));
+  useEffect(() => {
+    const handler = () => setLens(lensForHash(location.hash));
+    window.addEventListener('hashchange', handler);
+    return () => window.removeEventListener('hashchange', handler);
+  }, []);
+  return lens;
 }
 
 /** Trailing-edge debounce on `session_event`. No polling — see the file header. */

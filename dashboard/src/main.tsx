@@ -1,45 +1,32 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { AuthGate } from './auth/AuthGate.js';
-import { InboxBoard } from './views/InboxBoard.js';
-import { WorkgroupDashboard } from './views/WorkgroupDashboard.js';
-import { Observatory } from './views/Observatory.js';
 import { ThreadConsole } from './views/console/ThreadConsole.js';
-import { SessionDetail } from './views/SessionDetail.js';
 import { authMe as fetchAuthMe, exchangeToken } from './lib/api.js';
 import { startSSE } from './lib/sse.ts';
 import { takeUrlToken } from './lib/url-token.js';
 import type { AuthMe } from './lib/api.js';
-import type { BoardRoute } from './views/BoardShell.js';
 // theme.css FIRST: its tokens and Tailwind's base layer are the substrate, and
 // styles.css (unlayered) is still allowed to win while it is being retired.
 import './theme.css';
 import './styles.css';
-// The Observatory console's own token layer. Everything in it is scoped under
-// `.ncc`, so it cannot reach the legacy surfaces above; it is the only
-// stylesheet here with a dark palette.
+// The console's own token layer, scoped under `.ncc`.
 import './views/console/console.css';
 
 // Design-tool tweak variant. Switchable classes documented in styles.css.
 const TWEAK_CLASS = 'tw-no-heat tw-no-grid';
 
-function parseHash(): { route: BoardRoute | 'session' | 'console'; sessionId?: string } {
-  const hash = location.hash.slice(1) || '/observatory';
-  if (hash.startsWith('/session/')) return { route: 'session', sessionId: hash.slice(9) };
-  // The rebuilt console, alongside the legacy routes. Retiring them is Phase 4.
-  if (hash === '/console') return { route: 'console' };
-  if (hash === '/inbox') return { route: 'inbox' };
-  if (hash === '/workgroup') return { route: 'workgroup' };
-  // Any other/stale hash (including the removed /board, /scheduled and
-  // /task/:id routes) falls back to the Observatory rather than rendering
-  // nothing. Scheduled work is a section of the floor now.
-  return { route: 'observatory' };
-}
+/**
+ * One surface. The legacy `#/observatory`, `#/inbox`, `#/workgroup` and
+ * `#/session/:id` routes are gone with the views behind them, so every hash —
+ * including a bookmark to one of those — lands on the console rather than
+ * rendering nothing. There is nothing left to route BETWEEN, which is why this
+ * no longer returns a route at all.
+ */
 
 function App() {
   const [authState, setAuthState] = useState<'loading' | 'unauthenticated' | 'authenticated'>('loading');
   const [me, setMe] = useState<AuthMe | null>(null);
-  const [hashState, setHashState] = useState(parseHash);
   const [linkFailed, setLinkFailed] = useState(false);
 
   useEffect(() => {
@@ -67,21 +54,11 @@ function App() {
       });
   }, []);
 
-  useEffect(() => {
-    const handler = () => setHashState(parseHash());
-    window.addEventListener('hashchange', handler);
-    return () => window.removeEventListener('hashchange', handler);
-  }, []);
-
-  const handleAuthenticated = useCallback((m: AuthMe) => {
+  const handleAuthenticated = (m: AuthMe) => {
     setMe(m);
     setAuthState('authenticated');
     startSSE();
-  }, []);
-
-  const navigate = useCallback((r: BoardRoute) => {
-    location.hash = r === 'workgroup' ? '#/workgroup' : r === 'inbox' ? '#/inbox' : '#/observatory';
-  }, []);
+  };
 
   if (authState === 'loading') {
     return (
@@ -112,17 +89,7 @@ function App() {
 
   return (
     <div className={TWEAK_CLASS} style={{ minHeight: '100vh' }}>
-      {hashState.route === 'inbox' && me && <InboxBoard authMe={me} route="inbox" onRouteChange={navigate} />}
-      {hashState.route === 'workgroup' && me && (
-        <WorkgroupDashboard authMe={me} route="workgroup" onRouteChange={navigate} />
-      )}
-      {hashState.route === 'observatory' && me && (
-        <Observatory authMe={me} route="observatory" onRouteChange={navigate} />
-      )}
-      {hashState.route === 'console' && me && <ThreadConsole authMe={me} />}
-      {hashState.route === 'session' && hashState.sessionId && me && (
-        <SessionDetail authMe={me} sessionId={hashState.sessionId} />
-      )}
+      {me && <ThreadConsole authMe={me} />}
     </div>
   );
 }

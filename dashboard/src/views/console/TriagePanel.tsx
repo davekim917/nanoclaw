@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import type { ThreadSummary } from '../../lib/api.js';
+import { actionError } from './action-error.js';
 import { closeThread, setSnoozed } from './actions.js';
 import { ThreadDetail } from './ThreadDetail.js';
 import { STATE_PRESENTATION } from './thread-state.js';
@@ -104,7 +105,7 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
         onChanged();
         advance(kind === 'snooze' ? 'Snoozed until it moves.' : 'Closed out.');
       } catch (err) {
-        setAnnouncement(`Could not ${kind} — ${(err as { error?: string }).error ?? 'request failed'}.`);
+        setAnnouncement(`Could not ${kind} — ${actionError(err)}.`);
       } finally {
         setBusy(false);
       }

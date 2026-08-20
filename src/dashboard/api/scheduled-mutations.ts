@@ -27,6 +27,7 @@ import { cancelSeriesWithStrandClear, pauseTask, resumeTask, updateTask } from '
 import { wakeContainer } from '../../container-runner.js';
 import { admitDueTaskContexts } from '../../session-manager.js';
 import { log } from '../../log.js';
+import { parseUtcTimestampMs } from '../../thread-context.js';
 import { emitDashboardEvent } from './events.js';
 import { verbVerdict, type HealthState, type SeriesKind } from './scheduled-board-matrix.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
@@ -61,13 +62,6 @@ function json(body: unknown, status = 200): Response {
 }
 
 // ── Shared resolve + gate + live-row read ────────────────────────────────────────
-
-function parseUtcMs(s: string | null): number | null {
-  if (!s) return null;
-  const normalized = /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : (s.includes('T') ? s : s.replace(' ', 'T')) + 'Z';
-  const ms = Date.parse(normalized);
-  return Number.isNaN(ms) ? null : ms;
-}
 
 interface LiveRow {
   id: string;
@@ -149,7 +143,7 @@ function resolveTarget(
 
   // Claim state from outbound.db. Absent/unreadable outbound + overdue → unknown
   // (never silently not-claimed — F6).
-  const processAfterMs = parseUtcMs(live.process_after);
+  const processAfterMs = parseUtcTimestampMs(live.process_after);
   const overdue = processAfterMs !== null && processAfterMs <= nowMs;
   let claimed = false;
   let outboundReadable = false;

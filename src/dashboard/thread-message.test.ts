@@ -33,7 +33,8 @@ vi.mock('../container-runner.js', () => ({
   resolveAssistantName: (group: { name: string }) => Promise.resolve(`persona:${group.name}`),
 }));
 
-const { sendThreadMessage, composeReleaseNote } = await import('./thread-message.js');
+const { sendThreadMessage, composeReleaseNote, composeClaimContext, composeOperatorMessage, MAX_OPERATOR_TEXT } =
+  await import('./thread-message.js');
 
 const NOW = Date.parse('2026-08-20T12:00:00.000Z');
 const iso = (msAgo = 0): string => new Date(NOW - msAgo).toISOString();
@@ -148,7 +149,10 @@ describe('a chosen agent already on the thread is an ordinary send', () => {
     expect(applySessionSteer).toHaveBeenCalledTimes(1);
     const [sessionId, payload] = applySessionSteer.mock.calls[0]!;
     expect(sessionId).toBe('s-alpha');
-    expect(payload.text).toBe('push it forward');
+    // The operator's words go out QUOTED and attributed, not bare — see
+    // `composeOperatorMessage` and its own describe block below.
+    expect(payload.text).toContain('push it forward');
+    expect(payload.text).toContain('Dana');
     // No new session row — an agent already here is steered, never re-assigned.
     expect(getDb().prepare('SELECT COUNT(*) AS n FROM sessions').get()).toEqual({ n: 1 });
   });
@@ -269,7 +273,8 @@ describe('hand-over notifies both sides', () => {
     writeClaim({ slug: 'acme-pr-733', owner: 'ag-alpha', ttlHours: 4, claimedAgoMs: 60_000 });
     const res = await send({ agent_group_id: 'ag-alpha', idempotency_key: 'k1', text: 'keep going' });
     expect(applySessionSteer).toHaveBeenCalledTimes(1);
-    expect(applySessionSteer.mock.calls[0]![1].text).toBe('keep going');
+    expect(applySessionSteer.mock.calls[0]![1].text).toContain('keep going');
+    expect(applySessionSteer.mock.calls[0]![1].text).not.toContain('--takeover');
     expect(res.body['handoff']).toBeNull();
   });
 
@@ -312,9 +317,68 @@ describe('input', () => {
     wire('ag-alpha');
     seedSession('s-alpha', 'ag-alpha');
     expect((await send({ agent_group_id: 'ag-alpha', idempotency_key: 'k1', text: '   ' })).status).toBe(400);
-    const long = await send({ agent_group_id: 'ag-alpha', idempotency_key: 'k1', text: 'x'.repeat(3501) });
+    const long = await send({
+      agent_group_id: 'ag-alpha',
+      idempotency_key: 'k1',
+      text: 'x'.repeat(MAX_OPERATOR_TEXT + 1),
+    });
     expect(long.status).toBe(400);
     expect(long.body['error']).toBe('message_too_long');
     expect(applySessionSteer).not.toHaveBeenCalled();
+  });
+});
+
+// ── Attribution and the no-silence clause ────────────────────────────────────
+
+/**
+ * Ported from `nudge.ts` / `observatory-steer.ts` / `assign.ts`. The console
+ * used to post the operator's bare text: no name on it, and no obligation to
+ * answer. Both halves are load-bearing and both are asserted here.
+ */
+describe('the operator\u2019s words are wrapped, never replaced', () => {
+  const wrapped = composeOperatorMessage({ who: 'Dana', text: 'drop it, ship the other one' });
+
+  it('quotes the operator verbatim rather than paraphrasing them', () => {
+    expect(wrapped).toContain('drop it, ship the other one');
+    expect(wrapped).toContain('verbatim');
+    // Inside a fenced block, so the agent can tell the instruction from the
+    // frame around it.
+    expect(wrapped).toMatch(/"""\ndrop it, ship the other one\n"""/);
+  });
+
+  it('attributes it to a named person, on the way in AND in the reply', () => {
+    // assign.ts:113 — everyone in the room should know where this came from
+    // without asking, which means the AGENT has to say it, not just receive it.
+    expect(wrapped).toContain('Dana sent this from the Observatory');
+    expect(wrapped).toContain('"Dana asked, via the Observatory');
+  });
+
+  it('closes with the no-silence clause', () => {
+    expect(wrapped).toContain('If you cannot act on it, say so here and name what blocks you');
+    expect(wrapped).toContain('ends in silence is the failure this button exists to end');
+  });
+
+  it('keeps the hand-over context between the quote and the closing obligation', () => {
+    const withClaim = composeOperatorMessage({
+      who: 'Dana',
+      text: 'take this over',
+      claimContext: '\n\n---\nCLAIM CONTEXT HERE',
+    });
+    expect(withClaim.indexOf('take this over')).toBeLessThan(withClaim.indexOf('CLAIM CONTEXT HERE'));
+    expect(withClaim.indexOf('CLAIM CONTEXT HERE')).toBeLessThan(withClaim.indexOf('ends in silence'));
+  });
+
+  it('leaves the worst case inside the executor\u2019s own 4000-character cap', () => {
+    // The reason MAX_OPERATOR_TEXT is derived rather than hand-picked: a text
+    // this endpoint ACCEPTS must never fail downstream with a length error the
+    // operator cannot account for.
+    const long = 'x'.repeat(120);
+    const worst = composeOperatorMessage({
+      who: long,
+      text: 'x'.repeat(MAX_OPERATOR_TEXT),
+      claimContext: composeClaimContext({ who: long, claimSlug: long, holder: long }),
+    });
+    expect(MAX_OPERATOR_TEXT).toBeGreaterThan(1000);
+    expect(worst.length).toBeLessThanOrEqual(4000);
   });
 });

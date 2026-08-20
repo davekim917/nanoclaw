@@ -5,6 +5,7 @@ import { relAge } from '../../lib/derive.js';
 import { renderMarkdown } from '../../lib/markdown.js';
 import { AgentAvatar } from '../AgentAvatar.js';
 import { prefillChips, type PrefillChip } from '../ship-prefill.js';
+import { actionError } from './action-error.js';
 import { sendToAgent } from './actions.js';
 import { STATE_PRESENTATION, initials, replyTarget } from './thread-state.js';
 
@@ -128,8 +129,8 @@ export function ThreadDetail({ thread, focusComposer = 0, nextAction, onSent }: 
 
 /**
  * How long a message gets before it collapses behind a `<details>`.
- * TranscriptList's own number — one transcript's reading rhythm should not
- * depend on which surface renders it.
+ * Inherited from the retired session page's transcript list — one transcript's
+ * reading rhythm should not depend on which surface renders it.
  */
 const TRUNCATE_AT = 800;
 
@@ -143,8 +144,7 @@ const TRUNCATE_AT = 800;
  * passthrough, and do not swap the renderer for one that permits inline HTML.
  *
  * The SOURCE is sliced and parsed twice, never the rendered HTML — slicing HTML
- * shreds tags and leaves unclosed elements. Same pattern as
- * `TranscriptList.tsx`, deliberately.
+ * shreds tags and leaves unclosed elements.
  */
 export function MessageText({ text }: { text: string }) {
   const { previewHtml, fullHtml } = useMemo(() => {
@@ -183,7 +183,14 @@ export function ReplyComposer({
   onSent?: (thread: ThreadSummary) => void;
 }) {
   const fallback = useMemo(() => replyTarget(thread), [thread]);
-  const [agentId, setAgentId] = useState<string>(fallback?.agent_group_id ?? '');
+  // The server's default is a PARTICIPANT. A thread nobody has spoken in has
+  // none, and leaving the selector empty there showed the first wired agent
+  // while the send silently refused — so an assignable is the honest default
+  // when there is nothing else to aim at. This is the initial value only; a
+  // choice that later goes stale falls to nobody, not back to the first row.
+  const [rawAgentId, setAgentId] = useState<string>(
+    fallback?.agent_group_id ?? thread.assignable_agents[0]?.agent_group_id ?? '',
+  );
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string>('');
@@ -221,6 +228,19 @@ export function ReplyComposer({
     );
   }
 
+  /**
+   * The chosen agent, re-validated against the agents this thread STILL offers.
+   *
+   * `reachable` is derived from a live thread row: an agent can leave the
+   * participants list (its session archived), and a chip can preset an
+   * assignable that the next refresh no longer wires to this channel. The select
+   * would render blank while the state still held them, and the send would then
+   * go to somebody the operator can no longer see. Nobody is the honest reading
+   * of that — same guard `use-group-filter.ts` puts on a stored group id, and
+   * the same one the legacy composer put on its room-narrowed addressee.
+   */
+  const agentId = reachable.some((a) => a.id === rawAgentId) ? rawAgentId : '';
+
   const assigning = thread.assignable_agents.some((a) => a.agent_group_id === agentId);
   const chosen = reachable.find((a) => a.id === agentId);
 
@@ -254,7 +274,7 @@ export function ReplyComposer({
       setStatus(parts.join(' '));
       onSent?.(thread);
     } catch (err) {
-      setStatus(`Could not send — ${(err as { error?: string }).error ?? 'request failed'}.`);
+      setStatus(`Could not send — ${actionError(err, chosen?.name)}.`);
     } finally {
       setBusy(false);
     }
@@ -274,6 +294,10 @@ export function ReplyComposer({
           {/* `optgroup` rather than a styled divider: the split — already here
               vs. would be handed the thread — has to survive a screen reader,
               and the platform already announces group labels. */}
+          {/* Only while nothing valid is chosen — an addressee that aged out of
+              `reachable` leaves the select genuinely empty, and it must SAY so
+              rather than silently showing whichever option happens to be first. */}
+          {!agentId && <option value="">— pick an agent —</option>}
           {thread.participants.length > 0 && (
             <optgroup label="On this thread">
               {thread.participants.map((p) => (
@@ -294,7 +318,11 @@ export function ReplyComposer({
           )}
         </select>
         <span className="ncc-composer-hint">
-          {assigning ? 'this opens its queue on the thread' : 'only this agent receives it'}
+          {!agentId
+            ? 'pick who this goes to'
+            : assigning
+              ? 'this opens its queue on the thread'
+              : 'only this agent receives it'}
         </span>
       </div>
 
@@ -326,7 +354,12 @@ export function ReplyComposer({
             }
           }}
         />
-        <button type="button" className="ncc-solid-btn" disabled={busy || !text.trim()} onClick={() => void send()}>
+        <button
+          type="button"
+          className="ncc-solid-btn"
+          disabled={busy || !text.trim() || !agentId}
+          onClick={() => void send()}
+        >
           {busy ? 'sending' : 'send'}
         </button>
       </div>

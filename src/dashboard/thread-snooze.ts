@@ -32,7 +32,7 @@
 import { getDb } from '../db/index.js';
 import { log } from '../log.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';
-import { parseUtcMs } from './api/observatory.js';
+import { parseUtcTimestampMs } from '../thread-context.js';
 import type { AuthHandler, AuthedRequestContext } from './router.js';
 
 const json = (status: number, body: unknown): Response =>
@@ -51,8 +51,8 @@ export interface ThreadSnoozeRow {
  * taken on a thread with no activity at all (null) holds until it has any.
  */
 export function isSnoozed(snoozedAtActivity: string | null | undefined, lastActivityAt: string | null): boolean {
-  const s = parseUtcMs(snoozedAtActivity);
-  const a = parseUtcMs(lastActivityAt);
+  const s = parseUtcTimestampMs(snoozedAtActivity);
+  const a = parseUtcTimestampMs(lastActivityAt);
   if (s === null) return a === null;
   return a === null || a <= s;
 }
@@ -116,7 +116,7 @@ function loadThreadForSnooze(threadId: string, ctx: AuthedRequestContext): { las
 
   let bestMs = -Infinity;
   for (const r of visible) {
-    const ms = parseUtcMs(r.last_outbound_at ?? r.last_active ?? r.created_at);
+    const ms = parseUtcTimestampMs(r.last_outbound_at ?? r.last_active ?? r.created_at);
     if (ms !== null && ms > bestMs) bestMs = ms;
   }
   // NORMALIZED, never stored verbatim. `sessions.last_outbound_at` is written

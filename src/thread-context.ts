@@ -177,6 +177,14 @@ export async function prependThreadContext(text: string, opts: ThreadContextOpti
  *
  * Moved here verbatim from a private definition in `router.ts` — it sits on
  * both sides of the cutoff comparison above, and it had no other home.
+ *
+ * **This is the ONLY parser for this job.** It had grown four independent
+ * copies — one exported from `dashboard/api/observatory.ts` as `parseUtcMs`, and
+ * private clones in `scheduled-mutations.ts` and `scheduled-move.ts` — all
+ * solving the same problem with the same regex and none of them carrying the
+ * paragraph above. Four copies is four chances to "clean up" the tolerance in a
+ * file where the consequence is invisible. Add a caller here; do not add a
+ * fifth definition.
  */
 export function parseUtcTimestampMs(value: string | null | undefined): number | null {
   if (!value) return null;

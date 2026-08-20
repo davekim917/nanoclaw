@@ -29,28 +29,49 @@ export interface StatePresentation {
   verb: string;
   tone: 'attention' | 'live' | 'quiet';
   wantsAttention: boolean;
+  /**
+   * How this lane reads in an empty state, as a predicate: "nothing here
+   * ${emptyPhrase}". The legacy board carried the same field on its filter
+   * chips — a narrowed question deserves its narrowing spoken back, and the
+   * label alone ("nothing here Needs you") does not read as English.
+   */
+  emptyPhrase: string;
 }
 
 export const STATE_PRESENTATION: Record<ThreadState, StatePresentation> = {
-  needs_you: { label: 'Needs you', verb: 'Answer', tone: 'attention', wantsAttention: true },
+  needs_you: { label: 'Needs you', verb: 'Answer', tone: 'attention', wantsAttention: true, emptyPhrase: 'needs you' },
   // Not `Kill`. A stalled container has an operator with something to say to it
   // and no reason to destroy the context to say it — push it forward instead.
-  stalled: { label: 'Stalled', verb: 'Push', tone: 'attention', wantsAttention: true },
+  stalled: { label: 'Stalled', verb: 'Push', tone: 'attention', wantsAttention: true, emptyPhrase: 'is stalled' },
   // Assign is the same send aimed at an agent with no session on the thread;
   // the composer's selector spans every wired agent, so this needs no endpoint
   // of its own.
-  unassigned: { label: 'Unassigned', verb: 'Assign', tone: 'attention', wantsAttention: true },
-  running: { label: 'Running', verb: 'Steer', tone: 'live', wantsAttention: false },
+  unassigned: {
+    label: 'Unassigned',
+    verb: 'Assign',
+    tone: 'attention',
+    wantsAttention: true,
+    emptyPhrase: 'is unassigned',
+  },
+  running: { label: 'Running', verb: 'Steer', tone: 'live', wantsAttention: false, emptyPhrase: 'is running' },
   // Parked work is work that needs an owner, and handing it over is a message
   // to whoever should take it — plus a composed note to the incumbent.
-  parked: { label: 'Parked', verb: 'Hand to…', tone: 'quiet', wantsAttention: false },
-  done: { label: 'Done', verb: 'Steer', tone: 'quiet', wantsAttention: false },
+  parked: { label: 'Parked', verb: 'Hand to…', tone: 'quiet', wantsAttention: false, emptyPhrase: 'is parked' },
+  done: { label: 'Done', verb: 'Steer', tone: 'quiet', wantsAttention: false, emptyPhrase: 'is done' },
   // §5's seventh state and the COMMON case — 57 of 63 threads in a live 24h
   // window. It used to be the one row with no button, on the theory that a
   // thread nobody is waiting on wants nothing done to it. That was backwards:
   // an idle thread is exactly where an operator arrives with a new instruction.
-  idle: { label: 'Idle', verb: 'Steer', tone: 'quiet', wantsAttention: false },
+  idle: { label: 'Idle', verb: 'Steer', tone: 'quiet', wantsAttention: false, emptyPhrase: 'is idle' },
 };
+
+/**
+ * `snoozed` is a pseudo-lane, NOT an eighth state: a snooze is this operator's
+ * own view decision and a thread can be snoozed while it is running. It is a
+ * lane rather than a silent filter so a snoozed thread is always reachable —
+ * hiding work with no way back is how a queue starts lying.
+ */
+export type Lane = ThreadState | 'all' | 'snoozed';
 
 /**
  * Which session a reply to this thread lands in, and which participant that is.
@@ -81,6 +102,115 @@ export const LANE_ORDER: ThreadState[] = ['needs_you', 'stalled', 'unassigned', 
 export function urgencyRank(state: ThreadState): number {
   const i = LANE_ORDER.indexOf(state);
   return i === -1 ? LANE_ORDER.length : i;
+}
+
+/**
+ * The lanes where the OLDEST row leads.
+ *
+ * Ported from `commitments.ts`: anything that has already failed its promise
+ * comes first, oldest first, because the oldest breach is the one the system has
+ * been lying about longest. An unassigned thread is breached at birth, so it
+ * sorts with the breaches rather than into a tidy backlog of its own.
+ *
+ * Everything else stays newest-first: `running`, `idle` and `done` are not
+ * promises anyone is waiting on, and there the freshest row is the interesting
+ * one.
+ *
+ * Written out rather than read off `wantsAttention` on purpose — that flag is a
+ * COST control (§4.1's preview budget) and the two would drift the first time
+ * one of them changed for its own reason.
+ */
+const OLDEST_FIRST: ReadonlySet<ThreadState> = new Set<ThreadState>(['needs_you', 'stalled', 'unassigned']);
+
+export function leadsWithOldest(state: ThreadState): boolean {
+  return OLDEST_FIRST.has(state);
+}
+
+/**
+ * An ISO instant as epoch ms, or `null` when there is no instant.
+ *
+ * `null`, never `0`. See `compareByActivity` — the whole point is that "unknown"
+ * is not a position on a time axis.
+ */
+export function activityMs(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const ms = new Date(iso).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * Compare two rows by age, in the direction the lane asks for — with UNKNOWN
+ * age sorting last EITHER WAY.
+ *
+ * That null term is explicit and load-bearing (`exceptions.ts:165-172`): an item
+ * with no timestamp has no place on a time axis, and defaulting it to zero would
+ * park every undated row at one end and call that an ordering. It used to land
+ * last here only by accident — `0` is smaller than every real instant, so a
+ * DESCENDING comparator happened to push it down. Flipping any lane to ascending
+ * silently inverts that accident and floats every undated row to the top of the
+ * lane the operator is meant to trust most.
+ */
+export function compareByActivity(a: string | null, b: string | null, oldestFirst: boolean): number {
+  const am = activityMs(a);
+  const bm = activityMs(b);
+  if (am === null || bm === null) return (am === null ? 1 : 0) - (bm === null ? 1 : 0);
+  return oldestFirst ? am - bm : bm - am;
+}
+
+/** The queue's full ordering: urgency lane first, then age in that lane's direction. */
+export function compareThreads(
+  a: Pick<ThreadSummary, 'state' | 'last_activity_at'>,
+  b: Pick<ThreadSummary, 'state' | 'last_activity_at'>,
+): number {
+  const rank = urgencyRank(a.state) - urgencyRank(b.state);
+  if (rank !== 0) return rank;
+  return compareByActivity(a.last_activity_at, b.last_activity_at, leadsWithOldest(a.state));
+}
+
+/** What the queue narrowed to, in words. Empty string means "not narrowed at all". */
+export function queueFilterPhrase(o: { lane: Lane; channelName: string | null; query: string }): string {
+  const parts = [
+    o.lane === 'all' ? null : o.lane === 'snoozed' ? 'is snoozed' : STATE_PRESENTATION[o.lane].emptyPhrase,
+    o.channelName ? `lives in ${o.channelName}` : null,
+    o.query.trim() ? `matches “${o.query.trim()}”` : null,
+  ].filter(Boolean);
+  return parts.join(' and ');
+}
+
+/**
+ * What an empty queue says — four different facts, four different sentences.
+ *
+ * The legacy board learned this twice (`Observatory.tsx`'s ledger-empty and its
+ * claims card) and the console shipped with one `no threads in view` covering
+ * all of them:
+ *
+ * 1. **Nothing exists at all.** Not a filter result. Saying "all clear" over an
+ *    empty window congratulates the reader on nothing.
+ * 2. **A lane is genuinely clear.** That is GOOD NEWS and has to say so — an
+ *    empty attention feed is an answer, not an absence of one.
+ * 3. **A channel filter with no hits**, and
+ * 4. **a search miss** — both get the narrowing spoken back, because a board
+ *    that answers a narrowed question with a bare "nothing here" makes the
+ *    operator re-derive their own filters to understand the emptiness.
+ */
+export function emptyQueueMessage(o: {
+  /** Threads in the window at all, before any filter. */
+  total: number;
+  lane: Lane;
+  /** The display name of the active channel filter, or null for all channels. */
+  channelName: string | null;
+  query: string;
+}): string {
+  if (o.total === 0) return 'no threads in this window yet';
+
+  const narrowedByHand = Boolean(o.channelName) || o.query.trim() !== '';
+  if (!narrowedByHand) {
+    if (o.lane === 'all') return 'nothing un-snoozed here';
+    if (o.lane === 'snoozed') return 'nothing is snoozed';
+    // The good news case, said as good news.
+    return `All clear — nothing ${STATE_PRESENTATION[o.lane].emptyPhrase}`;
+  }
+  return `nothing here ${queueFilterPhrase(o)}`;
 }
 
 /**

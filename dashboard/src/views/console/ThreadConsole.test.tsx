@@ -432,7 +432,94 @@ describe('triage is a mode over the filtered list (§11)', () => {
   it('cannot be entered on an empty queue', async () => {
     listThreads.mockResolvedValue({ threads: [] });
     mount();
-    await waitFor(() => expect(screen.getByText('no threads in view')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('no threads in this window yet')).toBeTruthy());
     expect((screen.getByRole('button', { name: /triage/i }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+/* ─── Ordering (§1) ────────────────────────────────────────────────────────── */
+
+const threadIds = (container: HTMLElement) =>
+  Array.from(container.querySelectorAll('.ncc-row')).map((r) => (r as HTMLElement).dataset['threadId']);
+
+describe('the queue leads with the oldest breach', () => {
+  it('sorts needs_you oldest-first and idle newest-first, in the same list', async () => {
+    listThreads.mockResolvedValue({
+      threads: [
+        thread('needs-new', { state: 'needs_you', last_activity_at: '2026-08-20T09:00:00.000Z' }),
+        thread('needs-old', { state: 'needs_you', last_activity_at: '2026-08-01T09:00:00.000Z' }),
+        thread('idle-old', { state: 'idle', last_activity_at: '2026-08-01T09:00:00.000Z' }),
+        thread('idle-new', { state: 'idle', last_activity_at: '2026-08-19T09:00:00.000Z' }),
+      ],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(4));
+    expect(threadIds(container)).toEqual(['needs-old', 'needs-new', 'idle-new', 'idle-old']);
+  });
+
+  it('puts a thread with no activity timestamp last, even in an oldest-first lane', async () => {
+    listThreads.mockResolvedValue({
+      threads: [
+        thread('undated', { state: 'needs_you', last_activity_at: null }),
+        thread('dated', { state: 'needs_you', last_activity_at: '2026-08-01T09:00:00.000Z' }),
+      ],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(2));
+    expect(threadIds(container)).toEqual(['dated', 'undated']);
+  });
+});
+
+/* ─── Empty states ─────────────────────────────────────────────────────────── */
+
+describe('an empty queue says WHICH emptiness it is', () => {
+  it('calls a clear attention lane good news', async () => {
+    listThreads.mockResolvedValue({ threads: [thread('t-1', { state: 'idle' })] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+    await userEvent.click(screen.getByRole('button', { name: /^Needs you0/ }));
+    expect(screen.getByText('All clear — nothing needs you')).toBeTruthy();
+  });
+
+  it('speaks a search back rather than answering "nothing here"', async () => {
+    listThreads.mockResolvedValue({ threads: [thread('t-1')] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+    await userEvent.type(screen.getByLabelText('Search threads'), 'zzz');
+    await waitFor(() => expect(screen.getByText('nothing here matches \u201Czzz\u201D')).toBeTruthy());
+  });
+
+  it('says the window is empty, not that a lane is clear, when nothing exists', async () => {
+    listThreads.mockResolvedValue({ threads: [] });
+    mount();
+    await waitFor(() => expect(screen.getByText('no threads in this window yet')).toBeTruthy());
+  });
+});
+
+/* ─── Stale channel filter (the same guard use-group-filter applies) ───────── */
+
+describe('a channel filter is never left invisibly in force', () => {
+  it('drops the filter when the channel ages out of the window', async () => {
+    listThreads.mockResolvedValue({
+      threads: [
+        thread('t-1', { channel_key: 'slack:CROOM', channel_name: '#one' }),
+        thread('t-2', { channel_key: 'slack:CTWO', channel_name: '#two' }),
+      ],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(2));
+    await userEvent.click(screen.getByRole('button', { name: /^#two/ }));
+    await waitFor(() => expect(threadIds(container)).toEqual(['t-2']));
+
+    // #two's last thread goes; the sidebar stops listing it. Without the guard
+    // the queue would stay filtered to a channel with no button to un-press —
+    // an empty board and no visible reason for it.
+    listThreads.mockResolvedValue({ threads: [thread('t-1', { channel_key: 'slack:CROOM', channel_name: '#one' })] });
+    const [, invalidate] = subscribe.mock.calls.at(-1) as unknown as [string, () => void];
+    invalidate();
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: /^#two/ })).toBeNull());
+    await waitFor(() => expect(threadIds(container)).toEqual(['t-1']));
+    expect(screen.getByRole('button', { name: /^All channels/ }).getAttribute('aria-pressed')).toBe('true');
   });
 });

@@ -1,4 +1,22 @@
-import { faceSrc, type OfficeState } from './office-data.js';
+/**
+ * Whether the agent is blocked, waiting on someone, working, or idle — the four
+ * states the status dot draws. Moved here from `office-data.ts` with `faceSrc`
+ * when the legacy office surfaces were retired; this component is the only
+ * remaining reader of either.
+ */
+export type OfficeState = 'blocked' | 'waiting' | 'working' | 'idle';
+
+/**
+ * The agent's real platform avatar. One rule, one place: every surface that
+ * draws a face resolves it through here. Slack serves fixed sizes; asking for
+ * the 48px original keeps the face crisp rather than a downscaled smudge.
+ * Anything not a plain https/data image URL is dropped rather than interpolated
+ * into markup.
+ */
+export function faceSrc(u?: string | null): string {
+  if (typeof u !== 'string' || !/^(https:\/\/|data:image\/)[^"'<>\s]+$/.test(u)) return '';
+  return u.replace(/_\d+\.(png|jpe?g|gif|webp)$/i, '_48.$1');
+}
 
 /**
  * An agent's face, wherever one is drawn — fleet row, room card, floor plan.
