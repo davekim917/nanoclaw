@@ -33,8 +33,10 @@ export interface OfficeAgent {
   shirtHi: string;
   hair: string;
   skin?: string;
-  /** The agent's real platform avatar, shown as a pixelated face token above
-   *  its seat. Null for an agent with no wiring — it keeps the sprite alone,
+  /** The agent's real platform avatar, shown UNMODIFIED as a face token above
+   *  its seat (DESIGN.md §11 — real faces; the "pixelated" this comment used to
+   *  claim was never implemented anywhere in the tree).
+   *  Null for an agent with no wiring — it keeps the sprite alone,
    *  and a face is never invented. Drawn as an <image> inside the plan's own
    *  inline SVG — which is exactly what dropping the data-URI world bought:
    *  a data-URI SVG could not load an external image at all. */

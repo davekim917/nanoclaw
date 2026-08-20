@@ -119,14 +119,14 @@ export function threadChannelKey(threadId: string | null | undefined, known?: Re
 /* ─── State (§5) ───────────────────────────────────────────────────────────── */
 
 /**
- * DESIGN.md §5's six states, plus `idle`.
+ * DESIGN.md §5's seven states.
  *
- * `idle` is NOT in the design contract and is reported back as a gap: the six
- * named states do not partition the space. A thread whose container is not
- * running, that holds no claim, that is not archived and whose last tool call
- * finished normally matches none of them — and that is the majority of the 24h
- * working set. Rendering those as `done` would be a lie and dropping them would
- * hide real work, so they get an honest residual label.
+ * `idle` was reported back as a gap during this build and §5 now carries it:
+ * the six named states did not partition the space. A thread whose container is
+ * not running, that holds no claim, that is not archived and whose last tool
+ * call finished normally matches none of the others — 57 of 63 threads in a
+ * live 24h window. Rendering those as `done` would be a lie and dropping them
+ * would hide real work, so they get an honest residual label, and no verb.
  */
 export type ThreadState = 'unassigned' | 'needs_you' | 'stalled' | 'running' | 'parked' | 'done' | 'idle';
 
@@ -157,7 +157,7 @@ export interface ThreadStateInput {
 const WAITING_ON_NOTE = /\bwaiting on\b/i;
 
 /**
- * Which of the six states a thread is in. Pure — every input is resolved by
+ * Which of the seven states a thread is in. Pure — every input is resolved by
  * the caller so this is directly testable and so the release board can feed
  * ownerless items through the same function once §10.3 lands.
  *
@@ -538,7 +538,7 @@ async function resolveIdentities(
 /**
  * Claims for every workgroup the page touches, indexed by thread.
  *
- * Three of the six states (`needs_you`, `parked`, and half of `done`) are
+ * Three of the states (`needs_you`, `parked`, and half of `done`) are
  * claim-derived, and claims are per-workgroup files rather than DB rows. One
  * directory scan per workgroup — a handful — not one per thread.
  */

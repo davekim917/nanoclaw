@@ -61,7 +61,15 @@ export interface ObservatoryAgent {
   canonicalName: string;
   folder: string;
   provider: string;
-  /** The bot's real Slack avatar (public slack-edge URL) — the UI pixelates it client-side. Null when no wired bot has one. */
+  /**
+   * The bot's real Slack avatar (public slack-edge URL), drawn UNMODIFIED.
+   * Null when no wired bot has one — a face is never invented; the UI falls
+   * back to initials.
+   *
+   * An earlier note here said the UI pixelated it client-side. It does not, and
+   * no code ever in this tree did: the comment was the last trace of a retired
+   * treatment, and DESIGN.md §11 rules it out for good — real faces.
+   */
   avatarUrl: string | null;
   awake: boolean;
   /**
