@@ -740,7 +740,15 @@ async function spawnContainer(
   // Snapshot host capabilities into the session dir so the container can
   // read a static JSON (Phase 5.3). Refreshed every spawn so newly-mounted
   // credentials / plugins / channel registrations appear immediately.
-  writeCapabilitiesSnapshot(agentGroup.id, session.id, session.messaging_group_id);
+  // Subject for the Slack owner-safety gate. Identical to
+  // session.messaging_group_id for chat sessions; for a task session (which has
+  // none by construction) this resolves the series' delivery destination so the
+  // gate judges WHERE THE TASK POSTS instead of fail-closing on null. See
+  // resolveSlackSafetyMessagingGroupId.
+  const { resolveSlackSafetyMessagingGroupId } = await import('./modules/permissions/task-slack-subject.js');
+  const slackSafetyMessagingGroupId = resolveSlackSafetyMessagingGroupId(session);
+
+  writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
 
   // The config was read once at the reserved-spawn boundary and is threaded
   // through workgroup reconciliation, provider resolution, mounts, and args.
@@ -906,6 +914,7 @@ async function spawnContainer(
     providerDecision.fallbackApplied,
     session.thread_id ?? null,
     repositoryWorkUnit,
+    slackSafetyMessagingGroupId,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -3022,6 +3031,14 @@ async function buildContainerArgs(
    */
   sessionThreadId?: string | null,
   repositoryWorkUnit?: RepositoryWorkUnit,
+  /**
+   * Messaging group the Slack owner-safety gate judges for this session.
+   * Equals `sessionMessagingGroupId` for chat sessions; for a task session it
+   * is the series' delivery destination. Kept SEPARATE from
+   * `sessionMessagingGroupId` on purpose — a task session is still not "in"
+   * that channel for assistant-name, channel-peer, or routing purposes.
+   */
+  slackSafetyMessagingGroupId?: string | null,
 ): Promise<string[]> {
   // --init: tini as PID 1 reaps orphaned children (esbuild/gh corpses were
   // accumulating as zombies under bun, which doesn't reap as PID 1) and still
@@ -3528,7 +3545,7 @@ async function buildContainerArgs(
         const ownerSafe = isOwnerSafeSlackSession(
           getDb(),
           agentGroup.id,
-          sessionMessagingGroupId ?? null,
+          slackSafetyMessagingGroupId ?? null,
           containerConfig.slack_user_token?.also_allowed_in,
         );
         if (!ownerSafe) {
@@ -3537,6 +3554,7 @@ async function buildContainerArgs(
           log.info('Slack user-token secret withheld for non-owner-safe session', {
             folder: agentGroup.folder,
             sessionMessagingGroupId: sessionMessagingGroupId ?? null,
+            slackSafetyMessagingGroupId: slackSafetyMessagingGroupId ?? null,
             withheld: slackSecrets,
             identity,
           });
@@ -3824,7 +3842,9 @@ async function buildContainerArgs(
   }
   if (canInject('pocket')) {
     // Auth header injected by the OneCLI gateway proxy at request time
-    // (vault entry "Pocket" → public.heypocketai.com).
+    // (vault entry "Pocket" → public.heypocketai.com). Universal — the
+    // operator's physical meeting-recorder device, available to every group
+    // by default.
     mcpServers.pocket = {
       type: 'http',
       url: 'https://public.heypocketai.com/mcp',
@@ -3971,7 +3991,7 @@ async function buildContainerArgs(
     slackUserTokenAllowed = canUseSlackUserToken(
       getDb(),
       agentGroup.id,
-      sessionMessagingGroupId ?? null,
+      slackSafetyMessagingGroupId ?? null,
       containerConfig.slack_user_token,
     );
   }
@@ -4004,8 +4024,9 @@ async function buildContainerArgs(
     if (containerConfig.slack_user_token?.enabled) {
       log.info('slack-user-token MCP gated off for this session', {
         sessionMessagingGroupId: sessionMessagingGroupId ?? null,
+        slackSafetyMessagingGroupId: slackSafetyMessagingGroupId ?? null,
         folder: agentGroup.folder,
-        reason: sessionMessagingGroupId == null ? 'no_messaging_group' : 'not_owner_dm_and_not_in_allowlist',
+        reason: slackSafetyMessagingGroupId == null ? 'no_messaging_group' : 'not_owner_dm_and_not_in_allowlist',
       });
     }
   }

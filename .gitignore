@@ -99,3 +99,7 @@ forks.md
 !.design-artifact-loop/*/
 .design-artifact-loop/*/*
 !.design-artifact-loop/*/DESIGN.md
+
+# runtime/build artifacts
+/.lock
+dashboard/tsconfig.tsbuildinfo
