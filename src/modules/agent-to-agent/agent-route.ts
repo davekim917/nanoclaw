@@ -24,14 +24,20 @@ import path from 'path';
 
 import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { ensureContainedInboxDir, isPathInside } from '../../inbox-safety.js';
+import { getChannelAdapter } from '../../channels/channel-registry.js';
+import { gateCommand } from '../../command-gate.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getInboundSourceSessionId, getMostRecentPeerSourceSessionId } from '../../db/session-db.js';
-import { getSession } from '../../db/sessions.js';
+import { getSession, markSessionEngaged } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { GuardDenyError, guard } from '../../guard/index.js';
 import { log } from '../../log.js';
+import { upsertArchiveMessage } from '../../message-archive.js';
+import { scrubSecrets } from '../../secret-scrubber.js';
 import { openInboundDb, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import { prependThreadContext } from '../../thread-context.js';
 import type { PendingApproval, Session, SessionMode } from '../../types.js';
 import { requestApproval } from '../approvals/index.js';
 import { A2A_MESSAGE_GATE_ACTION, a2aSend } from './guard.js';
@@ -230,7 +236,7 @@ function resolveTargetSession(
   sourceSession: Session,
   targetAgentGroupId: string,
   fallback: SessionFallback,
-): Session {
+): { session: Session; created: boolean } {
   const srcDb = openInboundDb(sourceSession.agent_group_id, sourceSession.id);
   let originSessionId: string | null = null;
   try {
@@ -261,11 +267,11 @@ function resolveTargetSession(
       // fallback.mgId is null). The originating-session semantic wins;
       // any cross-mg context already crossed at the original send.
       if (fallback.mgId === null || candidate.messaging_group_id === fallback.mgId) {
-        return candidate;
+        return { session: candidate, created: false };
       }
     }
   }
-  return resolveSession(targetAgentGroupId, fallback.mgId, fallback.threadId, fallback.mode).session;
+  return resolveSession(targetAgentGroupId, fallback.mgId, fallback.threadId, fallback.mode);
 }
 
 export async function routeAgentMessage(
@@ -294,6 +300,25 @@ export async function routeAgentMessage(
     });
     return;
   }
+
+  // Slash-command parity with the channel path (router.ts → `gateCommand`).
+  // `/clear`, `/compact`, `/files` and friends are admin-only for humans; a
+  // peer agent is not a user and can never hold admin privilege, so it must
+  // not be able to wipe or reconfigure another agent's session by putting one
+  // in a message. Dropped rather than denied — there is no human to explain a
+  // refusal to, and the sending agent has no ack channel for send_message.
+  const commandGate = gateCommand(msg.content, null, targetAgentGroupId);
+  if (commandGate.action !== 'pass') {
+    log.warn('agent-route: dropping privileged slash command from a peer agent', {
+      from: sourceAgentGroupId,
+      to: targetAgentGroupId,
+      msgId: msg.id,
+      action: commandGate.action,
+      command: commandGate.action === 'deny' ? commandGate.command : undefined,
+    });
+    return;
+  }
+
   const decision = guard(a2aSend, {
     actor: { kind: 'agent', agentGroupId: sourceAgentGroupId, sessionId: session.id },
     resource: { from: sourceAgentGroupId, to: targetAgentGroupId },
@@ -415,7 +440,7 @@ async function performAgentRoute(
   // Return-path lookup (in_reply_to → source_session_id) takes precedence
   // when the candidate session matches the caller's effective mg context;
   // otherwise we fall through to the threading-aware resolveSession.
-  const targetSession = resolveTargetSession(msg, session, targetAgentGroupId, {
+  const { session: targetSession } = resolveTargetSession(msg, session, targetAgentGroupId, {
     mgId: effectiveMgId,
     threadId: effectiveThreadId,
     mode: targetMode,
@@ -423,12 +448,34 @@ async function performAgentRoute(
 
   const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+  // Every channel delivery scrubs registered secret values before the text
+  // leaves the host (delivery.ts, `scrubbedContent`). The a2a branch returns
+  // before that point, so scrub here too: without it a token the sending
+  // agent echoed lands verbatim in the peer's inbound DB — and, below, in the
+  // workgroup-wide archive. Secret scoping is per agent group (onecliSecrets),
+  // so "both ends are our agents" is not a reason to skip it.
+  const scrubbed = scrubSecrets(msg.content);
+
   // If the source message references files (via `send_file`), forward the
   // bytes from the source's outbox into the target's inbox so the target
   // agent can actually see and re-send them. Without this, agent-to-agent
   // file attachments look like they arrive but the target has no way to
   // read the bytes — they live in a session dir it doesn't mount.
-  const forwardedContent = forwardFileAttachments(msg, a2aMsgId, session, targetAgentGroupId, targetSession.id);
+  const forwardedContent = forwardFileAttachments(
+    { ...msg, content: scrubbed },
+    a2aMsgId,
+    session,
+    targetAgentGroupId,
+    targetSession.id,
+  );
+
+  // Thread-history backfill, matching what a platform @mention wake gets
+  // (router.ts). An a2a hand-off can land in a thread the target has never
+  // spoken in, and nothing else would ever give it that context.
+  // `targetSession` was read before `markSessionEngaged` runs below, so its
+  // `engaged_at` still describes the state BEFORE this wake — the question the
+  // backfill asks.
+  const contentForWrite = await addThreadContext(forwardedContent, effectiveMgId, effectiveThreadId, targetSession);
 
   await writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: a2aMsgId,
@@ -437,9 +484,16 @@ async function performAgentRoute(
     platformId: session.agent_group_id,
     channelType: 'agent',
     threadId: null,
-    content: forwardedContent,
+    content: contentForWrite,
     sourceSessionId: session.id,
   });
+  // Archived only once the row is durable, and from `scrubbed` rather than
+  // `contentForWrite` — the archive holds the message the peer actually sent,
+  // not the thread transcript we wrapped around it.
+  archiveRoutedMessage(scrubbed, a2aMsgId, session.agent_group_id, targetAgentGroupId, targetSession);
+  // An a2a message is one of the three engagement events, so the target
+  // session is engaged from here — the row is durable and the wake follows.
+  markSessionEngaged(targetSession.id);
   log.info('Agent message routed', {
     from: session.agent_group_id,
     to: targetAgentGroupId,
@@ -449,6 +503,75 @@ async function performAgentRoute(
   });
   const fresh = getSession(targetSession.id);
   if (fresh) await wakeContainer(fresh);
+}
+
+/**
+ * Mirror the routed message into the central archive, the way router.ts
+ * mirrors channel inbound. Graphify and the pre-turn recall lane index the
+ * archive, not the per-session DBs, so without this an agent-to-agent
+ * hand-off is unfindable through the whole retrieval layer.
+ *
+ * One row, not two: this is a single message, and the archive is scoped by
+ * workgroup member set — a same-workgroup sender finds the target's row.
+ * Attributed to the receiving agent group with the sender named, mirroring
+ * how an inbound user message is archived.
+ */
+function archiveRoutedMessage(
+  content: string,
+  a2aMsgId: string,
+  sourceAgentGroupId: string,
+  targetAgentGroupId: string,
+  targetSession: Session,
+): void {
+  const { text } = parseMessageContent(content);
+  if (!text) return;
+  const sourceName = getAgentGroup(sourceAgentGroupId)?.name ?? sourceAgentGroupId;
+  upsertArchiveMessage({
+    id: a2aMsgId,
+    agentGroupId: targetAgentGroupId,
+    messagingGroupId: targetSession.messaging_group_id,
+    channelType: 'agent',
+    channelName: sourceName,
+    platformId: sourceAgentGroupId,
+    threadId: targetSession.thread_id,
+    role: 'user',
+    senderId: sourceAgentGroupId,
+    senderName: sourceName,
+    text,
+    sentAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Prepend the platform thread's recent history when the target session is
+ * bound to a real chat thread. No-op for agent-shared targets (no chat
+ * surface to read) and for adapters without the hook.
+ */
+async function addThreadContext(
+  content: string,
+  mgId: string | null,
+  threadId: string | null,
+  target: Session,
+): Promise<string> {
+  if (!mgId || !threadId) return content;
+  const mg = getMessagingGroup(mgId);
+  if (!mg) return content;
+  const adapter = getChannelAdapter(mg.instance ?? mg.channel_type);
+  if (!adapter?.fetchThreadHistory) return content;
+
+  // Not `withThreadContext`: a2a content is only USUALLY a JSON body, and a
+  // peer that sent plain text must still route. The parse stays tolerant here.
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(content) as Record<string, unknown>;
+  } catch {
+    return content;
+  }
+  const original = typeof parsed.text === 'string' ? parsed.text : '';
+  const withContext = await prependThreadContext(original, { session: target, adapter, threadId });
+  if (withContext === original) return content;
+  parsed.text = withContext;
+  return JSON.stringify(parsed);
 }
 
 /**
