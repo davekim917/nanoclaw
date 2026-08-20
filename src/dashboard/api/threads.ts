@@ -39,7 +39,7 @@ import { readContainerConfig } from '../../container-config.js';
 import { getKnownSlackBots } from '../../channels/slack-mentions.js';
 import { readClaims, type BoardClaim } from '../../claims-board.js';
 import { log } from '../../log.js';
-import type { AgentGroup } from '../../types.js';
+import type { AgentGroup, SessionMode } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import { parseUtcMs } from './observatory.js';
 import { isSnoozed, readThreadSnoozes } from '../thread-snooze.js';
@@ -175,7 +175,8 @@ export function deriveThreadState(input: ThreadStateInput): ThreadState {
   // §5.1: this must NOT depend on `current_tool` being readable. Codex reports
   // the generic `CodexItem` and roughly half the fleet is non-Claude, so the
   // rule is age-only. `provider_status = 'failed'` is the same operator
-  // situation reached a different way — a container that needs killing.
+  // situation reached a different way — a thread that has stopped moving and
+  // needs a push.
   if (input.providerStatus === 'failed') return 'stalled';
   if (
     input.toolStartedAtMs !== null &&
@@ -228,6 +229,12 @@ export interface ThreadParticipant {
   provider: string;
 }
 
+/** An agent the thread can be handed to — see {@link ThreadSummary.assignable_agents}. */
+export interface ThreadAgentOption {
+  agent_group_id: string;
+  name: string;
+}
+
 export interface ThreadSummary {
   /** Durable identity (§3.1). Synthetic `session:<id>` when the session has no thread. */
   thread_id: string;
@@ -239,6 +246,21 @@ export interface ThreadSummary {
   title: string | null;
   /** Most-recent speaker first. */
   participants: ThreadParticipant[];
+  /**
+   * Every other agent wired to this thread's channel — the ones the operator
+   * can HAND the thread to.
+   *
+   * The console has one primitive, "send a message to a chosen agent", and the
+   * only difference between steering and assigning is whether the chosen agent
+   * is already on the thread. So the selector needs both lists, and they arrive
+   * separately rather than merged: the split is what tells the operator that
+   * picking from the lower group will open a session that does not exist yet.
+   *
+   * Scope-filtered like everything else on this wire, and empty for a thread
+   * whose channel no wiring names (a synthetic `session:<id>` key, a legacy
+   * bare-timestamp thread) — those genuinely have no room to assign into.
+   */
+  assignable_agents: ThreadAgentOption[];
   /**
    * ISO-8601 UTC, ALWAYS — normalized on the way out.
    * `sessions.last_outbound_at` is stored naive (`YYYY-MM-DD HH:MM:SS`), and a
@@ -378,7 +400,7 @@ function selectScopedSessions(
 }
 
 /** `messaging_groups.platform_id` → friendly name, and the key set §3.2 parses against. */
-function readChannelDirectory(): { known: Set<string>; names: Map<string, string> } {
+export function readChannelDirectory(): { known: Set<string>; names: Map<string, string> } {
   const known = new Set<string>();
   const names = new Map<string, string>();
   try {
@@ -400,6 +422,72 @@ function readChannelDirectory(): { known: Set<string>; names: Map<string, string
 function channelKeyLabel(key: string): string {
   const segments = key.split(':');
   return segments[segments.length - 1] || key;
+}
+
+/**
+ * Every agent wired to a channel, indexed by `messaging_groups.platform_id` —
+ * which is exactly what {@link threadChannelKey} resolves a thread id to.
+ *
+ * This is the whole answer to "which agents can this thread be handed to". An
+ * agent not wired to the room cannot be made to speak in it (the rule
+ * `observatory-steer.ts` already enforces per-send), so the assign selector and
+ * the assign write path both read this one function rather than each deciding
+ * what "wired" means.
+ *
+ * One query over the wiring table — tens to low hundreds of rows on a real
+ * install, not one query per thread.
+ */
+export interface WiredAgent {
+  agent_group_id: string;
+  /** `agent_groups.name` — the infrastructure name. Display names resolve separately. */
+  name: string;
+  folder: string;
+  messaging_group_id: string;
+  session_mode: SessionMode;
+}
+
+export function wiredAgentsByChannel(): Map<string, WiredAgent[]> {
+  const byChannel = new Map<string, WiredAgent[]>();
+  let rows: (WiredAgent & { platform_id: string })[];
+  try {
+    rows = getDb()
+      .prepare(
+        // `session_mode` is per WIRING (messaging_group_agents), not per
+        // channel, and the COALESCE default is `per-thread` — the operational
+        // default `getMessagingGroupAgents` hydrates to, not the stale `shared`
+        // in the CREATE TABLE. Reading it off `messaging_groups` would not even
+        // compile against the real schema.
+        `SELECT mg.platform_id                          AS platform_id,
+                mg.id                                   AS messaging_group_id,
+                COALESCE(mga.session_mode,'per-thread') AS session_mode,
+                ag.id                                   AS agent_group_id,
+                ag.name                                 AS name,
+                ag.folder                               AS folder
+           FROM messaging_group_agents mga
+           JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+           JOIN agent_groups     ag ON ag.id = mga.agent_group_id`,
+      )
+      .all() as (WiredAgent & { platform_id: string })[];
+  } catch (err) {
+    log.warn('threads: wiring lookup failed', { err });
+    return byChannel;
+  }
+  for (const r of rows) {
+    const list = byChannel.get(r.platform_id) ?? [];
+    // A sibling bot can be wired to one channel through two messaging groups;
+    // the first one wins so the selector never lists the same agent twice.
+    if (!list.some((a) => a.agent_group_id === r.agent_group_id)) {
+      list.push({
+        agent_group_id: r.agent_group_id,
+        name: r.name,
+        folder: r.folder,
+        messaging_group_id: r.messaging_group_id,
+        session_mode: r.session_mode,
+      });
+    }
+    byChannel.set(r.platform_id, list);
+  }
+  return byChannel;
 }
 
 /* ─── Per-session probes ───────────────────────────────────────────────────── */
@@ -446,8 +534,8 @@ function readContainerState(agentGroupId: string, sessionId: string): ContainerS
  * on freshness and the only rows you would ever probe are the healthy ones.
  *
  * A session with no live container cannot be `running` and cannot be `stalled`
- * either — there is nothing left for the Kill verb to kill, and its
- * `container_state` row is a fossil from a container that already exited.
+ * either — its `container_state` row is a fossil from a container that already
+ * exited, and a message to that agent wakes a fresh one regardless.
  *
  * Working set on the live install: tens of live containers against ~1,900
  * sessions in the 7d window, so this opens roughly 1% of the files a naive
@@ -578,7 +666,7 @@ async function resolveIdentities(
  * claim-derived, and claims are per-workgroup files rather than DB rows. One
  * directory scan per workgroup — a handful — not one per thread.
  */
-function readClaimsByThread(agentGroupIds: string[], now: number, claimsRoot?: string): Map<string, BoardClaim> {
+export function readClaimsByThread(agentGroupIds: string[], now: number, claimsRoot?: string): Map<string, BoardClaim> {
   const byThread = new Map<string, BoardClaim>();
   if (agentGroupIds.length === 0) return byThread;
   let workgroupIds: string[];
@@ -622,6 +710,8 @@ export interface ThreadListDeps {
   /** Injected claims root for tests; defaults to readClaims' own live base dir. */
   claimsRoot?: string;
   avatarByChannelType?: (channelType: string) => string | null;
+  /** Wiring lookup for the assign selector; defaults to {@link wiredAgentsByChannel}. */
+  wiredAgents?: () => Map<string, WiredAgent[]>;
 }
 
 function activityMs(row: ThreadSessionRow): number {
@@ -719,12 +809,34 @@ export async function buildThreadList(
   const liveIds = new Set((deps.activeContainerSessionIds ?? getActiveContainerSessionIds)());
   const states = liveContainerState(pagedRows, liveIds, probeState);
   const claims = readClaimsByThread([...new Set(pagedRows.map((r) => r.agent_group_id))], now, deps.claimsRoot);
+
+  // Channel keys are needed BEFORE identity resolution now, because the wired
+  // agents a thread can be handed to are resolved for display through the same
+  // memo as its participants — one pass, not two conventions for a bot's name.
+  const channelKeys = new Map(
+    grouped.map((t) => [t.threadId, threadChannelKey(t.synthetic ? null : t.threadId, known)] as const),
+  );
+  const wiredByChannel = (deps.wiredAgents ?? wiredAgentsByChannel)();
+  const inScope = (agentGroupId: string): boolean =>
+    ctx.scopes.no_filter || ctx.scopes.allowed_group_ids.includes(agentGroupId);
+
   const identities = await resolveIdentities(
-    pagedRows.map((r) => ({
-      agentGroupId: r.agent_group_id,
-      messagingGroupId: r.messaging_group_id,
-      sessionProvider: r.agent_provider,
-    })),
+    [
+      ...pagedRows.map((r) => ({
+        agentGroupId: r.agent_group_id,
+        messagingGroupId: r.messaging_group_id,
+        sessionProvider: r.agent_provider,
+      })),
+      ...[...new Set(channelKeys.values())].flatMap((key) =>
+        (wiredByChannel.get(key) ?? [])
+          .filter((a) => inScope(a.agent_group_id))
+          .map((a) => ({
+            agentGroupId: a.agent_group_id,
+            messagingGroupId: a.messaging_group_id,
+            sessionProvider: null,
+          })),
+      ),
+    ],
     avatarLookup,
   );
   // One query for the whole page's snoozes, never one per row. Per-user by
@@ -820,7 +932,23 @@ export async function buildThreadList(
       ? (ordered[0].last_outbound_at ?? ordered[0].last_active ?? ordered[0].created_at)
       : null;
     const claim = claims.get(thread.threadId) ?? null;
-    const channelKey = threadChannelKey(thread.synthetic ? null : thread.threadId, known);
+    const channelKey = channelKeys.get(thread.threadId) ?? UNKNOWN_CHANNEL_KEY;
+
+    const onThread = new Set(participants.map((p) => p.agent_group_id));
+    const assignableAgents: ThreadAgentOption[] = (wiredByChannel.get(channelKey) ?? [])
+      .filter((a) => !onThread.has(a.agent_group_id) && inScope(a.agent_group_id))
+      .map((a) => ({
+        agent_group_id: a.agent_group_id,
+        name:
+          identities.get(
+            identityKey({
+              agentGroupId: a.agent_group_id,
+              messagingGroupId: a.messaging_group_id,
+              sessionProvider: null,
+            }),
+          )?.name ?? a.name,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
 
     const state = deriveThreadState({
       sessionCount: ordered.length,
@@ -843,6 +971,7 @@ export async function buildThreadList(
       channel_name: names.get(channelKey) ?? channelKeyLabel(channelKey),
       title,
       participants,
+      assignable_agents: assignableAgents,
       last_activity_at: lastActivityAt,
       state,
       session_ids: ordered.map((r) => r.id),

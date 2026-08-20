@@ -86,7 +86,13 @@ export function _resetRateLimitForTesting(): void {
 
 // ── Role check ────────────────────────────────────────────────────────────────
 
-function canSteer(userId: string, agentGroupId: string): { ok: boolean; reason?: string } {
+/**
+ * Exported for `thread-message.ts`, which must run this BEFORE it resolves a
+ * session: assigning to an agent that has never spoken on the thread CREATES a
+ * session row, and creating one is a side effect a caller who cannot steer must
+ * never be able to cause. It is the same gate, run earlier — not a second one.
+ */
+export function canSteer(userId: string, agentGroupId: string): { ok: boolean; reason?: string } {
   if (isOwner(userId) || isGlobalAdmin(userId) || isAdminOfAgentGroup(userId, agentGroupId)) {
     return { ok: true };
   }

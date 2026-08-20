@@ -19,7 +19,7 @@ const getThreadDetail = vi.fn();
 const archiveSession = vi.fn().mockResolvedValue({});
 const snoozeThread = vi.fn().mockResolvedValue({});
 const unsnoozeThread = vi.fn().mockResolvedValue({});
-const postSessionMessage = vi.fn().mockResolvedValue({});
+const postThreadMessage = vi.fn().mockResolvedValue({ created_session: false, handoff: null });
 vi.mock('../../lib/api.js', () => ({
   listThreads,
   listGroups,
@@ -27,7 +27,7 @@ vi.mock('../../lib/api.js', () => ({
   archiveSession,
   snoozeThread,
   unsnoozeThread,
-  postSessionMessage,
+  postThreadMessage,
 }));
 
 const { ThreadConsole, lastMessagePreview } = await import('./ThreadConsole.js');
@@ -42,6 +42,7 @@ function thread(id: string, over: Partial<ThreadSummary> = {}): ThreadSummary {
     channel_name: '#example-eng',
     title: `Thread ${id}`,
     participants: [{ agent_group_id: 'ag-1', name: 'Alpha', session_id: 's-1', avatarUrl: null, provider: 'claude' }],
+    assignable_agents: [],
     last_activity_at: '2026-08-20T09:00:00.000Z',
     state: 'idle' as ThreadState,
     session_ids: [`s-${id}`],
@@ -285,6 +286,27 @@ describe('lastMessagePreview', () => {
     expect(lastMessagePreview([{ ...base, direction: 'in', text: 'ping' }])!.speaker).toBe('');
   });
 
+  /**
+   * The hybrid line is a ONE-LINE cell with an ellipsis. Rendering markdown
+   * into it would inject `<p>` / `<ul>` / `<pre>` and break the row; leaving it
+   * raw would show the operator `**ship it**`. So it is stripped to prose.
+   */
+  it('strips markdown to plain prose rather than rendering or leaking it', () => {
+    const base: Omit<ThreadTranscriptEntry, 'direction' | 'text'> = {
+      session_id: 's',
+      agent_group_id: 'ag',
+      agent_name: 'Alpha',
+      kind: 'chat',
+      seq: 1,
+      timestamp: '',
+    };
+    const preview = lastMessagePreview([
+      { ...base, direction: 'out', text: '## Status\n\n- **done**: the `publish` gate\n- see [PR 733](https://x.test/733)' },
+    ])!;
+    expect(preview.excerpt).toBe('Status done: the publish gate see PR 733');
+    expect(preview.excerpt).not.toMatch(/[\n*`[\]]|<\w/);
+  });
+
   it('returns null rather than an empty quote', () => {
     expect(lastMessagePreview(undefined)).toBeNull();
     expect(lastMessagePreview([])).toBeNull();
@@ -310,36 +332,48 @@ describe('lastMessagePreview', () => {
  * snooze lane that keeps snoozed work reachable, and triage as a mode entered
  * FROM the list (§11) that hands the list back exactly as it was.
  */
-describe('verbs', () => {
-  it('Close archives every session on the thread', async () => {
+describe('the ONE action, and the two that are not messages', () => {
+  /**
+   * Every state's verb opens the composer on the thread. `idle` is in here on
+   * purpose — it used to be the one row with no button at all, and `stalled`
+   * used to render an inert `Kill`. Both are gone.
+   */
+  it.each(['needs_you', 'stalled', 'unassigned', 'running', 'parked', 'done', 'idle'] as ThreadState[])(
+    '%s: the verb focuses the composer rather than sending blind',
+    async (state) => {
+      const user = userEvent.setup();
+      listThreads.mockResolvedValue({ threads: [thread(`t-${state}`, { state })] });
+      const { container } = mount();
+      await waitFor(() => expect(container.querySelector('.ncc-verb')).toBeTruthy());
+      const verb = container.querySelector('.ncc-verb') as HTMLElement;
+      expect(verb.getAttribute('aria-disabled')).toBeNull();
+      await user.click(verb);
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Message text')));
+      expect(postThreadMessage).not.toHaveBeenCalled();
+      expect(archiveSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it('no row anywhere offers a kill', async () => {
+    listThreads.mockResolvedValue({
+      threads: [thread('t-stall', { state: 'stalled' }), thread('t-run', { state: 'running' })],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(2));
+    expect(container.textContent!.toLowerCase()).not.toContain('kill');
+  });
+
+  /** Close is not a verb on the row any more — it is one of the two non-message
+      actions, and it lives on the detail pane beside snooze. */
+  it('Close archives every session on the thread, from the detail pane', async () => {
     const user = userEvent.setup();
     listThreads.mockResolvedValue({ threads: [thread('t-done', { state: 'done', session_ids: ['s-x', 's-y'] })] });
     const { container } = mount();
-    await waitFor(() => expect(container.querySelector('.ncc-verb')).toBeTruthy());
-    await user.click(container.querySelector('.ncc-verb') as HTMLElement);
+    await waitFor(() => expect(container.querySelector('.ncc-row-main')).toBeTruthy());
+    await user.click(container.querySelector('.ncc-row-main') as HTMLElement);
+    await user.click(await screen.findByRole('button', { name: 'close' }));
     await waitFor(() => expect(archiveSession).toHaveBeenCalledTimes(2));
     expect(archiveSession.mock.calls.map((c) => c[0])).toEqual(['s-x', 's-y']);
-  });
-
-  it('Answer opens the composer on the thread instead of sending blind', async () => {
-    const user = userEvent.setup();
-    listThreads.mockResolvedValue({ threads: [thread('t-ask', { state: 'needs_you' })] });
-    const { container } = mount();
-    await waitFor(() => expect(container.querySelector('.ncc-verb')).toBeTruthy());
-    await user.click(container.querySelector('.ncc-verb') as HTMLElement);
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Reply text')));
-    expect(postSessionMessage).not.toHaveBeenCalled();
-  });
-
-  it('Kill stays inert — no dashboard-reachable kill path exists', async () => {
-    const user = userEvent.setup();
-    listThreads.mockResolvedValue({ threads: [thread('t-stall', { state: 'stalled' })] });
-    const { container } = mount();
-    await waitFor(() => expect(container.querySelector('.ncc-verb')).toBeTruthy());
-    const verb = container.querySelector('.ncc-verb') as HTMLElement;
-    expect(verb.getAttribute('aria-disabled')).toBe('true');
-    await user.click(verb);
-    expect(container.querySelector('.ncc-detail')).toBeTruthy();
   });
 });
 

@@ -1,43 +1,47 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 /**
- * Each live verb must hit the endpoint DESIGN §10.3 says it hits, with the
- * payload that endpoint actually accepts. These are the assertions that catch
- * the two ways this goes wrong silently: a reply routed through the
- * `observatory/steer` task-spawner (which cannot address a thread at all), and
- * a Close that archives one session out of six and so never changes the state.
+ * The console has ONE message primitive, and these tests bind the ways that
+ * goes wrong silently: a send routed through the `observatory/steer`
+ * task-spawner (which cannot address a thread at all), a send that names a
+ * session instead of an agent (so Assign becomes unreachable), and a Close that
+ * archives one session out of six and so never changes the state.
  */
 
-const postSessionMessage = vi.fn().mockResolvedValue({});
+const postThreadMessage = vi.fn().mockResolvedValue({});
 const archiveSession = vi.fn().mockResolvedValue({});
 const snoozeThread = vi.fn().mockResolvedValue({});
 const unsnoozeThread = vi.fn().mockResolvedValue({});
-vi.mock('../../lib/api.js', () => ({ postSessionMessage, archiveSession, snoozeThread, unsnoozeThread }));
+vi.mock('../../lib/api.js', () => ({ postThreadMessage, archiveSession, snoozeThread, unsnoozeThread }));
 
-const { closeThread, newIdempotencyKey, sendReply, setSnoozed } = await import('./actions.js');
+const actions = await import('./actions.js');
+const { closeThread, newIdempotencyKey, sendToAgent, setSnoozed } = actions;
 
 beforeEach(() => {
-  postSessionMessage.mockClear();
+  postThreadMessage.mockClear();
   archiveSession.mockClear();
   snoozeThread.mockClear();
   unsnoozeThread.mockClear();
 });
 
-describe('sendReply — Answer and Steer are the same call', () => {
-  it('posts to the NAMED session with a fresh idempotency key', async () => {
-    await sendReply('sess-alpha', 'ship the other one');
-    expect(postSessionMessage).toHaveBeenCalledTimes(1);
-    const [sessionId, body] = postSessionMessage.mock.calls[0]!;
-    expect(sessionId).toBe('sess-alpha');
+describe('sendToAgent — steer, push, ship, assign and reassign are ONE call', () => {
+  it('posts to the thread endpoint naming the chosen AGENT, with a fresh key', async () => {
+    await sendToAgent('slack:CROOM:1700000000.11', 'ag-alpha', 'ship the other one');
+    expect(postThreadMessage).toHaveBeenCalledTimes(1);
+    const [threadId, body] = postThreadMessage.mock.calls[0]!;
+    expect(threadId).toBe('slack:CROOM:1700000000.11');
+    // The agent, not a session: an agent with no session on the thread is a
+    // valid choice and is exactly what Assign is.
+    expect(body.agent_group_id).toBe('ag-alpha');
     expect(body.text).toBe('ship the other one');
     expect(body.idempotency_key).toBeTruthy();
   });
 
   it('never reuses an idempotency key across two sends', async () => {
-    await sendReply('sess-alpha', 'one');
-    await sendReply('sess-alpha', 'two');
-    const first = postSessionMessage.mock.calls[0]![1].idempotency_key;
-    const second = postSessionMessage.mock.calls[1]![1].idempotency_key;
+    await sendToAgent('slack:CROOM:1700000000.11', 'ag-alpha', 'one');
+    await sendToAgent('slack:CROOM:1700000000.11', 'ag-alpha', 'two');
+    const first = postThreadMessage.mock.calls[0]![1].idempotency_key;
+    const second = postThreadMessage.mock.calls[1]![1].idempotency_key;
     expect(first).not.toBe(second);
   });
 
@@ -49,6 +53,13 @@ describe('sendReply — Answer and Steer are the same call', () => {
     } finally {
       Object.defineProperty(globalThis, 'crypto', { value: real, configurable: true });
     }
+  });
+});
+
+/** Kill was a verb here once. It is gone, not disabled — nothing exports it. */
+describe('there is no kill action', () => {
+  it('the actions module exposes exactly the message primitive, close and snooze', () => {
+    expect(Object.keys(actions).sort()).toEqual(['closeThread', 'newIdempotencyKey', 'sendToAgent', 'setSnoozed']);
   });
 });
 

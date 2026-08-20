@@ -34,6 +34,9 @@ import {
 import { TranscriptList, normalizeSessionEntry } from './TranscriptList.js';
 import { buildOfficeData, agentState } from './office-data.js';
 import { AgentAvatar } from './AgentAvatar.js';
+import { DECISION_CHIPS, shipAddressee, shipInstruction } from './ship-prefill.js';
+
+export { shipAddressee, shipInstruction };
 import { FloorPlan } from './FloorPlan.js';
 import { RoomStrip } from './RoomStrip.js';
 import { SmokeMark } from './SmokeMark.js';
@@ -2394,45 +2397,13 @@ export function decisionRows(items: ReleaseItem[], now = Date.now()): Commitment
   return out;
 }
 
-/**
- * The relayable instruction inside an ask, if there is one.
- *
- * Real asks read "<person> record @<bot> ship 869; <someone> or a human
- * presses the merge -- self-authored -- stalled 28h". The decision is a
- * sentence of context, but the ACTION is the four words in the middle, and
- * those are the words that have to reach the agent. Everything else is prose
- * for the human and would be noise in the agent's thread — so the box gets the
- * instruction alone, and prose-only asks get an empty box rather than a
- * paraphrase this function invented.
+/*
+ * `shipInstruction`, `shipAddressee` and `DECISION_CHIPS` moved to
+ * `./ship-prefill.js` when the thread console grew the same composer. They are
+ * re-exported here because the two regexes are one contract, and a second copy
+ * would be improved on one side only. See that file for why ship is a prefill
+ * rather than a verb.
  */
-export function shipInstruction(nextAction?: string): string | null {
-  return nextAction?.match(/@[\w-]+\s+ship\s+[\w-]+(?:\s+\d+)?/i)?.[0] ?? null;
-}
-
-/**
- * The agent an instruction is ADDRESSED to — "@nova ship 912" names nova.
- *
- * Only ever a lookup: a handle matching no agent on this floor resolves to
- * null and the operator picks from the select as before. The ship button needs
- * this or its one tap lands on a confirm whose send is disabled, which is not
- * a confirm, it is a dead end.
- */
-export function shipAddressee(instruction: string | null, agents: { id: string; name: string }[]): string | null {
-  const handle = instruction?.match(/^@([\w-]+)/)?.[1]?.toLowerCase();
-  return (handle && agents.find((a) => a.name.trim().toLowerCase() === handle)?.id) || null;
-}
-
-/**
- * The one-tap answers. Chips SET the box and nothing else — the send is still
- * the operator reading what is about to go out. "no" is left mid-sentence on
- * purpose: a refusal with no reason is the one answer that always costs
- * another round trip.
- */
-const DECISION_CHIPS: { label: string; text: string }[] = [
-  { label: 'approve as proposed', text: 'approve as proposed' },
-  { label: 'hold — need more info', text: 'hold — need more info' },
-  { label: 'no — …', text: 'no — ' },
-];
 
 /**
  * The Decisions view: the ranked queue of what awaits a human, each row

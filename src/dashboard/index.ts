@@ -23,6 +23,7 @@ import { groupsListHandler } from './api/groups.js';
 import { messagingGroupsListHandler } from './api/messaging-groups.js';
 import { sessionMessageHandler } from './steer.js';
 import { sessionArchiveHandler, sessionUnarchiveHandler } from './archive.js';
+import { threadMessageHandler } from './thread-message.js';
 import { threadSnoozeHandler, threadUnsnoozeHandler } from './thread-snooze.js';
 import { scheduledListHandler, scheduledDetailHandler, scheduledSearchHandler } from './api/scheduled-read.js';
 import { editHandler, pauseHandler, resumeHandler, runNowHandler, cancelHandler } from './api/scheduled-mutations.js';
@@ -74,6 +75,10 @@ export function startDashboard(): void {
   register('GET', '/dashboard/api/threads/:id', requireAuth(threadsDetailHandler));
   // Triage's `S` verdict. Per-user view state, gated on visibility rather than
   // the admin gate the mutating verbs use — see thread-snooze.ts.
+  // The console's one primitive: send a message to a chosen agent on this
+  // thread. Assign is the same call with an agent that has no session yet — the
+  // gate, rate limit and echo are `steer.ts`'s, unchanged (thread-message.ts).
+  register('POST', '/dashboard/api/threads/:id/message', requireAuth(threadMessageHandler));
   register('POST', '/dashboard/api/threads/:id/snooze', requireAuth(threadSnoozeHandler));
   register('POST', '/dashboard/api/threads/:id/unsnooze', requireAuth(threadUnsnoozeHandler));
   register('GET', '/dashboard/api/groups', requireAuth(groupsListHandler));

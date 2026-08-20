@@ -18,13 +18,13 @@ const getThreadDetail = vi.fn();
 const snoozeThread = vi.fn().mockResolvedValue({});
 const unsnoozeThread = vi.fn().mockResolvedValue({});
 const archiveSession = vi.fn().mockResolvedValue({});
-const postSessionMessage = vi.fn().mockResolvedValue({});
+const postThreadMessage = vi.fn().mockResolvedValue({});
 vi.mock('../../lib/api.js', () => ({
   getThreadDetail,
   snoozeThread,
   unsnoozeThread,
   archiveSession,
-  postSessionMessage,
+  postThreadMessage,
 }));
 
 const { TriagePanel } = await import('./TriagePanel.js');
@@ -39,6 +39,7 @@ function thread(n: number, over: Partial<ThreadSummary> = {}): ThreadSummary {
     participants: [
       { agent_group_id: 'ag-1', name: 'Alpha', session_id: `s-${n}`, avatarUrl: null, provider: 'claude' },
     ],
+    assignable_agents: [],
     last_activity_at: '2026-08-20T09:00:00.000Z',
     state: 'needs_you',
     session_ids: [`s-${n}`],
@@ -68,7 +69,7 @@ const panel = (): HTMLElement => screen.getByLabelText('Triage');
 beforeEach(() => {
   snoozeThread.mockClear();
   archiveSession.mockClear();
-  postSessionMessage.mockClear();
+  postThreadMessage.mockClear();
   getThreadDetail.mockImplementation((id: string) =>
     Promise.resolve({ thread: thread(1, { thread_id: id }), transcript: [] }),
   );
@@ -124,10 +125,10 @@ describe('verdicts advance by exactly one', () => {
     renderTriage([thread(1), thread(2)]);
     panel().focus();
     await user.keyboard('a');
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Reply text')));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Message text')));
     expect(screen.getByText('1 / 2')).toBeTruthy();
 
-    await user.type(screen.getByLabelText('Reply text'), 'answered');
+    await user.type(screen.getByLabelText('Message text'), 'answered');
     await user.click(screen.getByRole('button', { name: 'send' }));
     await waitFor(() => expect(screen.getByText('2 / 2')).toBeTruthy());
   });
@@ -168,7 +169,7 @@ describe('the keyboard rules that ship broken silently', () => {
   it('does not turn typing into a verdict', async () => {
     const user = userEvent.setup();
     renderTriage([thread(1), thread(2)]);
-    await user.type(await screen.findByLabelText('Reply text'), 'ship the aes patch');
+    await user.type(await screen.findByLabelText('Message text'), 'ship the aes patch');
     expect(snoozeThread).not.toHaveBeenCalled();
     expect(archiveSession).not.toHaveBeenCalled();
     expect(screen.getByText('1 / 2')).toBeTruthy();
@@ -177,7 +178,7 @@ describe('the keyboard rules that ship broken silently', () => {
   it('Escape leaves the mode, even from inside the composer', async () => {
     const user = userEvent.setup();
     const { onExit } = renderTriage([thread(1)]);
-    (await screen.findByLabelText('Reply text')).focus();
+    (await screen.findByLabelText('Message text')).focus();
     await user.keyboard('{Escape}');
     expect(onExit).toHaveBeenCalledTimes(1);
   });

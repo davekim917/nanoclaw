@@ -1,8 +1,18 @@
 import type { ThreadSummary, ThreadState } from '../../lib/api.js';
 
 /**
- * How each of DESIGN.md §5's states renders: its label, its ONE verb, its
- * urgency tone, and whether it wants the operator's attention.
+ * How each of DESIGN.md §5's states renders: its label, the WORD on its verb
+ * button, its urgency tone, and whether it wants the operator's attention.
+ *
+ * **There is one primitive: send a message to a chosen agent.** Two parameters,
+ * which agent and what text. Steer, push-forward, ship, assign and reassign are
+ * all that same action — the only difference is whether the chosen agent is
+ * already on the thread, and that difference is the selector's, not a verb's.
+ *
+ * So `verb` below is a LABEL over one mechanism, not a switch between seven.
+ * Every state has one, `idle` included, and none of them is ever inert: a
+ * stalled thread gets a message, not a kill. There is deliberately no `action`
+ * field and no `inertReason` — nothing left for either to discriminate.
  *
  * `wantsAttention` is the switch DESIGN §4.1 hangs the hybrid line on, and it
  * is a COST control, not a styling choice: message bodies live in each
@@ -12,98 +22,34 @@ import type { ThreadSummary, ThreadState } from '../../lib/api.js';
 export interface StatePresentation {
   label: string;
   /**
-   * §5: exactly one primary verb per state. NULL only for `idle`, whose row of
-   * the table reads `—` — the one state §1's "every row ends in a verb" does
-   * not reach, because a thread nobody is waiting on wants nothing done to it.
-   * Such a row is still openable; it simply carries no button.
+   * The word on the button. Different words, one action — what changes between
+   * `Answer` and `Push` is what the operator is likely to type, never what
+   * pressing it does.
    */
-  verb: string | null;
+  verb: string;
   tone: 'attention' | 'live' | 'quiet';
   wantsAttention: boolean;
-  /**
-   * What pressing the verb actually does, or null when nothing today can do it.
-   *
-   * - `compose` — open the reply composer on the thread's target session and
-   *   send through `POST /dashboard/api/sessions/:id/message`. This is the ONE
-   *   steer path that works on an arbitrary thread (DESIGN §10.3); the
-   *   `observatory/steer|nudge|assign` trio spawns a one-shot task and accepts
-   *   only claims or release-board items, so it cannot reach a thread row.
-   * - `close` — archive every session on the thread
-   *   (`POST /dashboard/api/sessions/:id/archive`), which is exactly what sets
-   *   the `archived_at` that §5 computes `done` from.
-   */
-  action: 'compose' | 'close' | null;
-  /**
-   * Why the verb is inert, rendered verbatim as the disabled button's `title`.
-   *
-   * §1 says every row ends in a verb, and hiding an affordance because its
-   * backend is missing quietly turns that into a lie. A disabled button that
-   * says WHY is the honest rendering: the operator learns the capability is
-   * named but not built, instead of wondering where the button went.
-   */
-  inertReason: string | null;
 }
 
-const KILL_INERT =
-  'No dashboard-reachable kill path exists. killContainer() is host-internal and every caller is a ' +
-  'host-side sweep or the ncl socket CLI; exposing it over HTTP needs a guarded action in src/guard/, ' +
-  'which is a privileged surface nobody has approved. Kill it with `ncl groups restart` for now.';
-
-const ASSIGN_INERT =
-  'Assign turns an unowned work item into a thread, and POST /observatory/assign takes a release-board ' +
-  'item id. A row in this queue is derived from sessions, so it already HAS a thread and there is no ' +
-  'item to assign. §5 says this state is unreachable until the release-board join lands.';
-
-const REASSIGN_INERT =
-  'Nothing can change a claim’s owner. Claims are per-workgroup JSON files written by the owning ' +
-  'agent; the dashboard reads them and the assign/nudge/steer endpoints all address items or claims by ' +
-  'slug without ever rewriting `owner`. Steer the agent instead, or hand the claim over in the thread.';
-
 export const STATE_PRESENTATION: Record<ThreadState, StatePresentation> = {
-  needs_you: {
-    label: 'Needs you',
-    verb: 'Answer',
-    tone: 'attention',
-    wantsAttention: true,
-    action: 'compose',
-    inertReason: null,
-  },
-  stalled: {
-    label: 'Stalled',
-    verb: 'Kill',
-    tone: 'attention',
-    wantsAttention: true,
-    action: null,
-    inertReason: KILL_INERT,
-  },
-  unassigned: {
-    label: 'Unassigned',
-    verb: 'Assign',
-    tone: 'attention',
-    wantsAttention: true,
-    action: null,
-    inertReason: ASSIGN_INERT,
-  },
-  running: {
-    label: 'Running',
-    verb: 'Steer',
-    tone: 'live',
-    wantsAttention: false,
-    action: 'compose',
-    inertReason: null,
-  },
-  parked: {
-    label: 'Parked',
-    verb: 'Reassign',
-    tone: 'quiet',
-    wantsAttention: false,
-    action: null,
-    inertReason: REASSIGN_INERT,
-  },
-  done: { label: 'Done', verb: 'Close', tone: 'quiet', wantsAttention: false, action: 'close', inertReason: null },
-  // §5: the seventh state, and the COMMON case — 57 of 63 threads in a live
-  // 24h window. Verb is `—` in the table, so this row carries none.
-  idle: { label: 'Idle', verb: null, tone: 'quiet', wantsAttention: false, action: null, inertReason: null },
+  needs_you: { label: 'Needs you', verb: 'Answer', tone: 'attention', wantsAttention: true },
+  // Not `Kill`. A stalled container has an operator with something to say to it
+  // and no reason to destroy the context to say it — push it forward instead.
+  stalled: { label: 'Stalled', verb: 'Push', tone: 'attention', wantsAttention: true },
+  // Assign is the same send aimed at an agent with no session on the thread;
+  // the composer's selector spans every wired agent, so this needs no endpoint
+  // of its own.
+  unassigned: { label: 'Unassigned', verb: 'Assign', tone: 'attention', wantsAttention: true },
+  running: { label: 'Running', verb: 'Steer', tone: 'live', wantsAttention: false },
+  // Parked work is work that needs an owner, and handing it over is a message
+  // to whoever should take it — plus a composed note to the incumbent.
+  parked: { label: 'Parked', verb: 'Hand to…', tone: 'quiet', wantsAttention: false },
+  done: { label: 'Done', verb: 'Steer', tone: 'quiet', wantsAttention: false },
+  // §5's seventh state and the COMMON case — 57 of 63 threads in a live 24h
+  // window. It used to be the one row with no button, on the theory that a
+  // thread nobody is waiting on wants nothing done to it. That was backwards:
+  // an idle thread is exactly where an operator arrives with a new instruction.
+  idle: { label: 'Idle', verb: 'Steer', tone: 'quiet', wantsAttention: false },
 };
 
 /**

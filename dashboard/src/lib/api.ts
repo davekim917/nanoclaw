@@ -706,6 +706,16 @@ export interface ThreadParticipant {
   provider: string;
 }
 
+/**
+ * An agent the thread can be HANDED to — wired to its channel, no session on it
+ * yet. Choosing one is Assign, which is the same send with a session resolved
+ * first. See `src/dashboard/thread-message.ts`.
+ */
+export interface ThreadAgentOption {
+  agent_group_id: string;
+  name: string;
+}
+
 export interface ThreadSummary {
   thread_id: string;
   synthetic: boolean;
@@ -713,6 +723,7 @@ export interface ThreadSummary {
   channel_name: string;
   title: string | null;
   participants: ThreadParticipant[];
+  assignable_agents: ThreadAgentOption[];
   last_activity_at: string | null;
   state: ThreadState;
   session_ids: string[];
@@ -758,6 +769,43 @@ export async function listThreads(filter?: {
 
 export async function getThreadDetail(threadId: string): Promise<ThreadDetailResponse> {
   return apiFetch<ThreadDetailResponse>(`/dashboard/api/threads/${encodeURIComponent(threadId)}`);
+}
+
+/** What a hand-over did, when the send was one. Null on an ordinary send. */
+export interface ThreadHandoff {
+  claim_slug: string;
+  claim_owner: string;
+  holder_agent_group_id: string | null;
+  /** The composed release note reached the incumbent. False means it did not — say so. */
+  notified: boolean;
+}
+
+export interface ThreadMessageResponse extends SteerResponse {
+  thread_id: string;
+  agent_group_id: string;
+  session_id: string;
+  /** This send is what brought the agent onto the thread — i.e. it was an Assign. */
+  created_session: boolean;
+  handoff: ThreadHandoff | null;
+}
+
+/**
+ * The console's ONE primitive: send a message to a chosen agent on this thread.
+ *
+ * Steer, push, ship, assign and reassign are all this call. When the agent has
+ * no session on the thread the server resolves one first (that is Assign); when
+ * a live claim is held by someone else it also sends the incumbent a
+ * server-composed release note (that is the hand-over).
+ */
+export async function postThreadMessage(
+  threadId: string,
+  body: { agent_group_id: string; idempotency_key: string; text: string },
+): Promise<ThreadMessageResponse> {
+  return apiFetch<ThreadMessageResponse>(`/dashboard/api/threads/${encodeURIComponent(threadId)}/message`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
 
 /**

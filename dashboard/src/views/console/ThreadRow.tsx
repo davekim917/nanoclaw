@@ -32,9 +32,9 @@ export interface ThreadRowProps {
   now?: number;
   onSelect: (thread: ThreadSummary) => void;
   /**
-   * The row's ONE verb (§1: every row ends in a verb). Called only for verbs
-   * that have a backing endpoint — `STATE_PRESENTATION[state].inertReason`
-   * names the ones that do not, and those render as an explained no-op.
+   * The row's ONE verb (§1: every row ends in a verb). Every state has one and
+   * every one of them does the same thing — open the composer on this thread.
+   * The word differs, the action does not.
    */
   onVerb?: (thread: ThreadSummary) => void;
 }
@@ -46,7 +46,6 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
   const shown = thread.participants.slice(0, MAX_FACES);
   const overflow = thread.participants.length - shown.length;
   const live = showsLiveLine(thread);
-  const inert = presentation.inertReason !== null;
   const agentCount = thread.participants.length;
   const age = thread.last_activity_at ? relAge(thread.last_activity_at, now) : '—';
 
@@ -118,36 +117,23 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
 
           <div className="ncc-row-side">
             <span className={`ncc-state ${presentation.tone}`}>{presentation.label}</span>
-            {/* §5: `idle` is the one state whose verb column reads `—`. It gets
-                no button; the row body above is still the way in. */}
-            {presentation.verb && (
-              /*
-               * A verb with no backing endpoint renders INERT, never hidden:
-               * §1's "every row ends in a verb" is the contract, and dropping
-               * the button would quietly rewrite it. The reason is the button's
-               * `title`.
-               *
-               * `aria-disabled` rather than `disabled` on purpose — a real
-               * `disabled` button is not focusable, so a keyboard or
-               * screen-reader user could never reach the explanation, which is
-               * the entire point of rendering it. The reason therefore also
-               * rides in the accessible name, since `title` alone is not
-               * reliably announced.
-               */
-              <button
-                type="button"
-                className="ncc-verb"
-                aria-disabled={inert ? true : undefined}
-                {...(inert ? { title: presentation.inertReason ?? '' } : {})}
-                {...(inert ? { 'aria-label': `${presentation.verb} — unavailable. ${presentation.inertReason}` } : {})}
-                onClick={() => {
-                  if (inert) return;
-                  (onVerb ?? onSelect)(thread);
-                }}
-              >
-                {presentation.verb}
-              </button>
-            )}
+            {/*
+             * Every row, every state, one live verb. There is no inert branch
+             * any more and there must not be one again: the word is a label
+             * over the single send primitive, so a state that could render a
+             * word can always perform the action behind it.
+             *
+             * The accessible name carries the thread's title because "Steer" on
+             * its own, forty times down a list, names nothing.
+             */}
+            <button
+              type="button"
+              className="ncc-verb"
+              aria-label={`${presentation.verb} — ${thread.title ?? 'Untitled thread'}`}
+              onClick={() => (onVerb ?? onSelect)(thread)}
+            >
+              {presentation.verb}
+            </button>
           </div>
         </div>
 

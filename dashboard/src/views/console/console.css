@@ -452,10 +452,10 @@
   min-height: 24px;
   cursor: pointer;
 }
-/* An inert verb is still rendered and still focusable (§1: every row ends in a
-   verb, and the `title` explaining WHY it cannot fire has to be reachable by
-   keyboard). It just reads as unavailable and does nothing. */
-.ncc-verb[aria-disabled='true'],
+/* No verb on a queue row is ever inert now — the word is a label over the ONE
+   send primitive, so a state that can render a word can always perform the
+   action behind it. This rule survives for the triage panel's verdict buttons,
+   which disable while a verdict is in flight. */
 .ncc-verb:disabled {
   color: var(--ncc-secondary);
   background: transparent;
@@ -578,8 +578,76 @@
 .ncc-msg-who { display: flex; align-items: baseline; gap: 7px; }
 .ncc-msg-who .name { font-size: 12.5px; font-weight: 600; color: var(--ncc-ink); }
 .ncc-msg-who .at { font-family: var(--ncc-font-mono); font-size: 11px; color: var(--ncc-muted); }
-.ncc-msg-text { font-size: 13px; line-height: 1.55; color: var(--ncc-secondary); white-space: pre-wrap; overflow-wrap: anywhere; }
+/* NOT `white-space: pre-wrap` — the body is rendered markdown now, and `marked`
+   runs with `breaks: true`, so newlines are already `<br>`. Keeping pre-wrap
+   would double every line break. */
+.ncc-msg-text { font-size: 13px; line-height: 1.55; color: var(--ncc-secondary); overflow-wrap: anywhere; }
 .ncc-msg.out .ncc-msg-text { color: var(--ncc-ink); }
+
+/* A long message collapses behind its own preview, TranscriptList's shape. */
+.ncc-msg-expand > summary { cursor: pointer; list-style: none; }
+.ncc-msg-expand > summary::-webkit-details-marker { display: none; }
+.ncc-msg-expand[open] > summary { display: none; }
+.ncc-msg-more {
+  display: inline-block;
+  margin-top: 4px;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-secondary);
+  text-decoration: underline;
+}
+
+/* ── Rendered markdown (§7 tokens, not the legacy `nc-md` palette) ────────
+ *
+ * `.nc-md` in styles.css is styled with the legacy Observatory's tokens
+ * (`--st-running`, `--bg-card-2`, `--bd-2`) which have no value inside `.ncc`
+ * and no dark variant. So the console carries its own class rather than
+ * borrowing that one, and every rule here reads a `--ncc-*` token, which means
+ * both palettes get it for free.
+ */
+.ncc-md > *:first-child { margin-top: 0; }
+.ncc-md > *:last-child { margin-bottom: 0; }
+.ncc-md p { margin: 0 0 8px; }
+.ncc-md ul, .ncc-md ol { margin: 0 0 8px; padding-left: 20px; }
+.ncc-md li { margin: 2px 0; }
+.ncc-md li::marker { color: var(--ncc-muted); }
+.ncc-md h1, .ncc-md h2, .ncc-md h3, .ncc-md h4, .ncc-md h5, .ncc-md h6 {
+  margin: 12px 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ncc-ink);
+}
+.ncc-md strong { color: var(--ncc-ink); font-weight: 700; }
+.ncc-md code {
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  background: var(--ncc-chip);
+  color: var(--ncc-ink);
+  padding: 1px 4px;
+}
+/* Code blocks scroll INSIDE their own box. Without `min-width: 0` on the
+   flex-child ancestors a wide `<pre>` widens the whole detail pane instead. */
+.ncc-md pre {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  background: var(--ncc-topbar);
+  border: 1px solid var(--ncc-border);
+  overflow-x: auto;
+  max-width: 100%;
+}
+.ncc-md pre code { background: transparent; padding: 0; white-space: pre; }
+.ncc-md blockquote {
+  margin: 0 0 8px;
+  padding-left: 10px;
+  border-left: 2px solid var(--ncc-border);
+  color: var(--ncc-muted);
+}
+.ncc-md a { color: var(--ncc-ink); text-decoration: underline; text-underline-offset: 2px; }
+.ncc-md hr { border: 0; border-top: 1px solid var(--ncc-divider); margin: 10px 0; }
+.ncc-md table { border-collapse: collapse; margin: 0 0 8px; font-size: 12px; display: block; overflow-x: auto; }
+.ncc-md th, .ncc-md td { border: 1px solid var(--ncc-border); padding: 4px 7px; text-align: left; }
+.ncc-md thead { background: var(--ncc-topbar); }
+.ncc-md img { max-width: 100%; height: auto; }
 
 /* ── Mobile — 390px is the primary viewport (§8) ───────────────────────── */
 
@@ -642,6 +710,24 @@
 }
 .ncc-composer-hint { font-family: var(--ncc-font-mono); font-size: 11px; color: var(--ncc-muted); }
 .ncc-composer-note { font-size: 12px; color: var(--ncc-secondary); }
+
+/* Prefill chips. A chip SETS the box — it never sends — so it reads as an
+   outline, not as the filled send button beside it. 44px because a chip is a
+   real tap target and there is no smaller variant of "the operator meant it". */
+.ncc-composer-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.ncc-chip {
+  font-family: var(--ncc-font-sans);
+  font-size: 12px;
+  color: var(--ncc-ink);
+  background: transparent;
+  border: 1px solid var(--ncc-border);
+  border-radius: 0;
+  padding: 6px 10px;
+  min-height: 44px;
+  cursor: pointer;
+}
+.ncc-chip:hover { border-color: var(--ncc-solid); }
+.ncc-chip:disabled { color: var(--ncc-muted); cursor: not-allowed; }
 .ncc-composer-row { display: flex; align-items: flex-end; gap: 8px; }
 .ncc-composer-box {
   flex-grow: 1;

@@ -10,6 +10,7 @@ import {
   type ThreadSummary,
   type ThreadTranscriptEntry,
 } from '../../lib/api.js';
+import { stripMarkdown } from '../../lib/markdown.js';
 import { subscribe } from '../../lib/sse.ts';
 import { useGroupFilter } from '../../lib/use-group-filter.js';
 import { closeThread, setSnoozed } from './actions.js';
@@ -160,29 +161,26 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
   const selected = visible.find((t) => t.thread_id === selectedId) ?? null;
 
   /**
-   * The row's ONE verb (§5). Exactly two of the seven have a backing endpoint
-   * today — `compose` (Answer / Steer, through the session-message path) and
-   * `close` (archive every session on the thread). The other three render
-   * inert with their reason; `STATE_PRESENTATION` owns that decision, and the
-   * row never calls this for them.
+   * The row's ONE verb, and it is one verb for every state now: open the
+   * composer on this thread. Answer / Push / Steer / Assign / Hand to… are
+   * words, not branches — `STATE_PRESENTATION` picks the word and this picks
+   * nothing. Close and Snooze are the two actions that are NOT a message, and
+   * they live on the detail pane rather than in the queue's verb column.
    */
-  const onVerb = useCallback(
+  const onVerb = useCallback((t: ThreadSummary) => {
+    setSelectedId(t.thread_id);
+    setFocusComposer((n) => n + 1);
+  }, []);
+
+  const onClose = useCallback(
     (t: ThreadSummary) => {
-      const action = STATE_PRESENTATION[t.state].action;
-      if (action === 'compose') {
-        setSelectedId(t.thread_id);
-        setFocusComposer((n) => n + 1);
-        return;
-      }
-      if (action === 'close') {
-        setNotice(`Closing ${t.title ?? 'thread'}…`);
-        closeThread(t)
-          .then(() => {
-            setNotice(`Closed ${t.title ?? 'thread'}.`);
-            void mutate();
-          })
-          .catch((err: { error?: string }) => setNotice(`Could not close — ${err.error ?? 'request failed'}.`));
-      }
+      setNotice(`Closing ${t.title ?? 'thread'}…`);
+      closeThread(t)
+        .then(() => {
+          setNotice(`Closed ${t.title ?? 'thread'}.`);
+          void mutate();
+        })
+        .catch((err: { error?: string }) => setNotice(`Could not close — ${err.error ?? 'request failed'}.`));
     },
     [mutate],
   );
@@ -371,9 +369,14 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
         ) : (
           <div className="ncc-detail-wrap">
             {selected && (
+              /* The two actions that are not a message. Everything else on this
+                 screen is the composer below. */
               <div className="ncc-detail-actions">
                 <button type="button" className="ncc-verb" onClick={() => onToggleSnooze(selected)}>
                   {selected.snoozed ? 'un-snooze' : 'snooze'}
+                </button>
+                <button type="button" className="ncc-verb" onClick={() => onClose(selected)}>
+                  close
                 </button>
               </div>
             )}
@@ -445,11 +448,21 @@ function ConnectedRow({
 
 const EXCERPT_CHARS = 140;
 
-/** The actual last message as `Speaker: excerpt` (§4). */
+/**
+ * The actual last message as `Speaker: excerpt` (§4).
+ *
+ * Markdown is STRIPPED here, never rendered: this lands in a one-line flex cell
+ * with an ellipsis, and rendering would inject `<p>` / `<ul>` / `<pre>` into it
+ * and break the row. Leaving it raw is the other failure — the operator would
+ * read `**ship it**`. `stripMarkdown` is a preview flattener and not a security
+ * boundary; the excerpt is rendered as a text node, so there is nothing to
+ * sanitise.
+ */
 export function lastMessagePreview(transcript: ThreadTranscriptEntry[] | undefined): ThreadPreview | null {
   const last = transcript?.[transcript.length - 1];
   if (!last || !last.text.trim()) return null;
-  const text = last.text.replace(/\s+/g, ' ').trim();
+  const text = stripMarkdown(last.text);
+  if (!text) return null;
   return {
     // Inbound carries no author on the wire — the transcript records a
     // direction, not a human. Naming one would be an invention.
