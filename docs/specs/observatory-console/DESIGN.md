@@ -118,7 +118,7 @@ Fixed order, top to bottom, left to right:
 | Live line | Monospace. Current tool + elapsed. Rows with a tool in flight — **running or stalled**. A stalled row must show it, holding still (§6); an earlier revision said "running rows only" and contradicted §6. |
 | Meta line | `channel · N agents · age`. Always present. |
 | State label | One of the six states in §5. |
-| Verb | Exactly one primary verb per state (§5), visible on desktop. **`Idle` is the single exception and carries none** — §1's "every row ends in a verb" holds for every state that wants something, which is the claim that matters. On mobile (§8) the verb renders only on rows wanting attention. |
+| Verb | The message action, labelled per state (§5), visible on desktop. **Every row carries one, `idle` included** — the one mechanism is available everywhere, so §1's "every row ends in a verb" now holds without exception rather than with one. On mobile (§8) the verb renders only on rows wanting attention; elsewhere the row is tappable. |
 
 ### 4.1 The hybrid line exists to control cost
 
@@ -143,15 +143,48 @@ not fetch previews for all rows.
 Each state names what computes it. A state that cannot be computed does not
 exist.
 
-| State | Computed from | Verb |
+**There is ONE action: send a message to a chosen agent.** Two parameters — which
+agent, and what you say. The per-state entries below are *labels over that one
+mechanism*, not seven mechanisms. An earlier revision specified them as distinct
+verbs, three of which had no backing mechanism at all; the operator replaced that
+model and this section follows him.
+
+| State | Computed from | Label |
 |---|---|---|
 | **Unassigned** | Work item with no session at all | Assign |
 | **Needs you** | Claim parked with a `waiting on <human>` note, **or** the existing `needs_me` signal (task `needs_input`, unanswered `ask_question`) | Answer |
-| **Stalled** | `container_state.tool_started_at` older than 30m with no newer output, **or** `provider_status = 'failed'` | Kill |
+| **Stalled** | `container_state.tool_started_at` older than 30m with no newer output, **or** `provider_status = 'failed'` | Push |
 | **Running** | A live container process for the session | Steer |
-| **Parked** | Claim in `parked` state | Reassign |
-| **Done** | `archived_at` is set | Close |
-| **Idle** | None of the above | — |
+| **Parked** | Claim in `parked` state | Hand to… |
+| **Done** | `archived_at` is set | Steer |
+| **Idle** | None of the above | Steer |
+
+**There is no Kill.** An earlier revision gave `stalled` a Kill verb. A stalled
+thread does not need killing, it needs a message — and exposing `killContainer`
+over HTTP would have meant minting a new guarded privileged surface to do
+something the operator does not want. Removed, not disabled.
+
+**Assign and reassign are the same action as steer**, differing only in whether
+the chosen agent already has a session on the thread. The selector therefore
+spans every wired agent, not just current participants; choosing one without a
+session creates it and delivers.
+
+**Reassign does not need to write an owner.** An earlier revision recorded that
+"nothing writes an owner back to a claim file" as a blocking gap. It is not one —
+the dashboard was never the right place to move a claim. You hand the work to
+another agent and the agents settle the claim between themselves through the
+work-claims convention.
+
+That convention is what makes the handoff a two-message action rather than one:
+`take` REFUSES a live claim held by someone else (exit 3), a *parked* claim may
+be taken by anyone, and `--takeover` exists but "records an override; it does
+not make one correct." So when the chosen agent is not the current live-claim
+holder, the console also sends the holder a **server-composed** note asking it to
+park or release. Without that, the receiving agent meets a locked door or reaches
+for the override. The note is never free text.
+
+Close and Snooze remain the two non-message actions — "get it out of my queue"
+is not something you say to an agent.
 
 Four corrections against an earlier revision, each found by implementing it:
 
