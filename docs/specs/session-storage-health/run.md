@@ -693,3 +693,21 @@ down for a real reason — so the guard cannot silently start rejecting everythi
 | C6 | this commit | D1 wakeContainer guard |
 
 Zero pushes, zero `pnpm run build`, zero restarts, zero `--execute`.
+
+## 2026-08-19 — review verdict (lead)
+
+- C4/C5/C6 re-verified fresh by the lead: 229/229 across the five affected
+  suites; full host suite 3,872/0 per builder (first fully green run);
+  C6 surgical staging independently confirmed (0 foreign lines staged, the
+  other session's unstaged work intact).
+- Dispositions: findings 1-4, 6-11 fixed with evidence (several with
+  premise corrections honestly recorded); finding 5's stale-journal half
+  resolved by DELETING the redundant recovery pass rather than adding an
+  attempt-token column — accepted (the orphan-dir-on-closed-row case is
+  covered by the ordinary reclaim walk; an old journal line now has no
+  path to authorizing any delete). No C7. SR5 stays literal as ruled.
+- **Implementation review verdict: CLEAR.** Coverage: full. Ship gate
+  next (combined with observatory-tom-modern): merge both branches →
+  push → signals binding → build+restart (quiet-window requirement is
+  OBSOLETE — the 50/tick cap makes the first pass safe at any hour) →
+  verify bounded tick → two-window recovery execute.
