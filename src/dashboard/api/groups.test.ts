@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { closeDb, createAgentGroup, initTestDb, runMigrations } from '../../db/index.js';
+import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { groupsListHandler } from './groups.js';
 import type { AuthedRequestContext } from '../router.js';
 
@@ -73,7 +73,23 @@ describe('groupsListHandler', () => {
   it('member with single group sees only that one', async () => {
     const res: Response = (await groupsListHandler(makeReq(), {}, makeCtx({ allowed_group_ids: ['ag-2'] })))!;
     const body = (await res.json()) as { groups: { id: string; name: string }[] };
-    expect(body.groups).toEqual([{ id: 'ag-2', name: 'example-dev' }]);
+    expect(body.groups).toEqual([{ id: 'ag-2', name: 'example-dev', workgroup_id: null }]);
+  });
+
+  // The console resolves a selected workgroup to its siblings client-side off
+  // this column; without it the Schedule lens (keyed on agent_group_id) cannot
+  // honour the workgroup filter.
+  it('carries workgroup_id so the SPA can map a workgroup to its siblings', async () => {
+    getDb().prepare(`INSERT INTO workgroups (id, created_at) VALUES ('example-labs', ?)`).run(now());
+    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'example-labs' WHERE id IN ('ag-1', 'ag-2')`).run();
+
+    const res: Response = (await groupsListHandler(makeReq(), {}, makeCtx({ no_filter: true })))!;
+    const body = (await res.json()) as { groups: { id: string; workgroup_id: string | null }[] };
+    expect(Object.fromEntries(body.groups.map((g) => [g.id, g.workgroup_id]))).toEqual({
+      'ag-1': 'example-labs',
+      'ag-2': 'example-labs',
+      'ag-3': null,
+    });
   });
 
   it('user with no allowed groups gets empty array (no leak)', async () => {

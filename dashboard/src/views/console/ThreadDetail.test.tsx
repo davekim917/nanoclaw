@@ -1,8 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { SWRConfig } from 'swr';
 import userEvent from '@testing-library/user-event';
-import type { ThreadSummary } from '../../lib/api.js';
+import type { ThreadSummary, ThreadTranscriptEntry } from '../../lib/api.js';
 
 /**
  * The composer is the console's ONE action, so these tests bind the four things
@@ -353,5 +353,120 @@ describe('a refused send is explained in the operator’s words', () => {
     await userEvent.type(await screen.findByLabelText('Message text'), 'go');
     await userEvent.click(screen.getByRole('button', { name: /^send$/i }));
     await waitFor(() => expect(screen.getByText(/not active until the next host restart/)).toBeTruthy());
+  });
+});
+
+/* ─── The transcript opens at its newest message ───────────────────────────── */
+
+/**
+ * jsdom lays nothing out — `scrollHeight` and `clientHeight` are both 0 — so
+ * the anchor's arithmetic has no room to be either right or wrong. These give
+ * it one: a 1000px transcript in a 300px window, where "at the bottom" is a
+ * `scrollTop` of 700 and the newest message is at 1000.
+ */
+const SCROLL_H = 1000;
+const CLIENT_H = 300;
+const AT_BOTTOM = SCROLL_H - CLIENT_H;
+
+function entry(seq: number): ThreadTranscriptEntry {
+  return {
+    session_id: 's-alpha',
+    agent_group_id: 'ag-1',
+    agent_name: 'Alpha',
+    direction: 'out',
+    kind: 'chat',
+    seq,
+    timestamp: '2026-08-20T09:00:00.000Z',
+    text: `message ${seq}`,
+  };
+}
+
+// One stable config object, so a `rerender` keeps the SWR cache it mounted with
+// rather than starting a fresh one and refetching everything.
+const swr = { provider: () => new Map(), dedupingInterval: 0 };
+const mountDetail = (t: ThreadSummary) =>
+  render(
+    <SWRConfig value={swr}>
+      <ThreadDetail thread={t} />
+    </SWRConfig>,
+  );
+const remount = (view: ReturnType<typeof mountDetail>, t: ThreadSummary) =>
+  view.rerender(
+    <SWRConfig value={swr}>
+      <ThreadDetail thread={t} />
+    </SWRConfig>,
+  );
+
+describe('the transcript opens at its newest message', () => {
+  const restore: Array<() => void> = [];
+  beforeEach(() => {
+    for (const [prop, value] of [
+      ['scrollHeight', SCROLL_H],
+      ['clientHeight', CLIENT_H],
+    ] as const) {
+      const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, prop);
+      Object.defineProperty(HTMLElement.prototype, prop, { configurable: true, value });
+      restore.push(() => {
+        if (original) Object.defineProperty(HTMLElement.prototype, prop, original);
+      });
+    }
+    getThreadDetail.mockResolvedValue({ thread: thread(), transcript: [entry(1), entry(2)] });
+  });
+  afterEach(() => {
+    while (restore.length) restore.pop()!();
+  });
+
+  const box = (c: HTMLElement) => c.querySelector('.ncc-transcript') as HTMLElement;
+
+  it('lands on the newest message, not at the top of the history', async () => {
+    const view = mountDetail(thread());
+    await screen.findByText('message 2');
+    await waitFor(() => expect(box(view.container).scrollTop).toBe(SCROLL_H));
+  });
+
+  it('re-anchors on a thread switch, wherever the previous thread was left', async () => {
+    const view = mountDetail(thread());
+    const el = box(view.container);
+    await waitFor(() => expect(el.scrollTop).toBe(SCROLL_H));
+
+    // Scrolled up to read history in THIS thread…
+    el.scrollTop = 0;
+    fireEvent.scroll(el);
+    expect(el.scrollTop).toBe(0);
+
+    // …and opening a DIFFERENT thread is an open, not a continuation of that.
+    getThreadDetail.mockResolvedValue({ thread: thread(), transcript: [entry(9)] });
+    remount(view, thread({ thread_id: 'slack:CTESTCHAN01:1700000999.22' }));
+    await waitFor(() => expect(el.scrollTop).toBe(SCROLL_H));
+  });
+
+  it('follows a new message when the operator is already at the bottom', async () => {
+    const view = mountDetail(thread());
+    const el = box(view.container);
+    await waitFor(() => expect(el.scrollTop).toBe(SCROLL_H));
+
+    el.scrollTop = AT_BOTTOM;
+    fireEvent.scroll(el);
+
+    getThreadDetail.mockResolvedValue({ thread: thread(), transcript: [entry(1), entry(2), entry(3)] });
+    remount(view, thread({ last_activity_at: '2026-08-20T09:05:00.000Z' }));
+    await screen.findByText('message 3');
+    await waitFor(() => expect(el.scrollTop).toBe(SCROLL_H));
+  });
+
+  it('does NOT yank the operator down when they have scrolled up to read history', async () => {
+    const view = mountDetail(thread());
+    const el = box(view.container);
+    await waitFor(() => expect(el.scrollTop).toBe(SCROLL_H));
+
+    // 1000 − 120 − 300 = 580px from the bottom. Reading, not following.
+    el.scrollTop = 120;
+    fireEvent.scroll(el);
+
+    getThreadDetail.mockResolvedValue({ thread: thread(), transcript: [entry(1), entry(2), entry(3)] });
+    remount(view, thread({ last_activity_at: '2026-08-20T09:05:00.000Z' }));
+    await screen.findByText('message 3');
+    // The difference between a chat pane and an annoying one.
+    expect(el.scrollTop).toBe(120);
   });
 });

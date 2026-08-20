@@ -22,7 +22,7 @@ import { STATE_PRESENTATION } from './thread-state.js';
  *
  *   A — answer and advance (focus the composer; the advance follows the send)
  *   S — snooze until it moves
- *   E — close it out
+ *   E — dismiss it from the queue
  *
  * Keyboard rules that are easy to get wrong and are tested:
  *
@@ -34,7 +34,13 @@ import { STATE_PRESENTATION } from './thread-state.js';
  *   snooze the thread.
  */
 
-export type TriageVerdict = 'answer' | 'snooze' | 'close';
+/**
+ * The three verdicts. `dismiss` is the word for what `closeThread` does — it
+ * sets `archived_at` and stops nothing, so "close" read as "end the work" and
+ * was pressed expecting that. The `E` binding and the archive call are both
+ * unchanged; only the word is.
+ */
+export type TriageVerdict = 'answer' | 'snooze' | 'dismiss';
 
 export interface TriagePanelProps {
   /** The filtered queue, frozen at entry. Order is fixed for the pass. */
@@ -103,7 +109,7 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
         if (kind === 'snooze') await setSnoozed(thread.thread_id, true);
         else await closeThread(thread);
         onChanged();
-        advance(kind === 'snooze' ? 'Snoozed until it moves.' : 'Closed out.');
+        advance(kind === 'snooze' ? 'Snoozed until it moves.' : 'Dismissed — out of your queue.');
       } catch (err) {
         setAnnouncement(`Could not ${kind} — ${actionError(err)}.`);
       } finally {
@@ -127,7 +133,7 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
       const key = e.key.toLowerCase();
       if (key === 'a' || key === 's' || key === 'e') {
         e.preventDefault();
-        void verdict(key === 'a' ? 'answer' : key === 's' ? 'snooze' : 'close');
+        void verdict(key === 'a' ? 'answer' : key === 's' ? 'snooze' : 'dismiss');
         return;
       }
       if (key === 'arrowdown' || key === 'arrowright') {
@@ -167,7 +173,7 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
           ))}
         </span>
         <span className="ncc-spacer" />
-        <span className="ncc-triage-keys ncc-mono">A answer · S snooze · E close · Esc exit</span>
+        <span className="ncc-triage-keys ncc-mono">A answer · S snooze · E dismiss · Esc exit</span>
         <button type="button" className="ncc-solid-btn" onClick={onExit}>
           exit
         </button>
@@ -180,8 +186,14 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
         <button type="button" className="ncc-verb" disabled={!thread || busy} onClick={() => void verdict('snooze')}>
           S · snooze
         </button>
-        <button type="button" className="ncc-verb" disabled={!thread || busy} onClick={() => void verdict('close')}>
-          E · close
+        <button
+          type="button"
+          className="ncc-verb"
+          title="Removes the thread from your queue. The agent is not stopped and its work continues."
+          disabled={!thread || busy}
+          onClick={() => void verdict('dismiss')}
+        >
+          E · dismiss
         </button>
         {presentation && <span className={`ncc-state ${presentation.tone}`}>{presentation.label}</span>}
       </div>

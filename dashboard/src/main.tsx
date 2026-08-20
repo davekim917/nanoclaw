@@ -88,9 +88,10 @@ function App() {
   }
 
   return (
-    <div className={TWEAK_CLASS} style={{ minHeight: '100vh' }}>
-      {me && <ThreadConsole authMe={me} />}
-    </div>
+    /* No `minHeight: 100vh` here: the console owns its own height (`100dvh`,
+       see console.css) and a 100vh wrapper around a 100dvh shell is exactly the
+       browser-chrome-sized page scroll that height is there to remove. */
+    <div className={TWEAK_CLASS}>{me && <ThreadConsole authMe={me} />}</div>
   );
 }
 

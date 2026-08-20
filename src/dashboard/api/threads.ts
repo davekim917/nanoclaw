@@ -345,7 +345,13 @@ const MAX_LIMIT = 1000;
  */
 function selectScopedSessions(
   ctx: AuthedRequestContext,
-  opts: { groupId: string | null; includeArchived: boolean; sinceHours: number; threadId?: string | null },
+  opts: {
+    workgroupId?: string | null;
+    groupId: string | null;
+    includeArchived: boolean;
+    sinceHours: number;
+    threadId?: string | null;
+  },
 ): ThreadSessionRow[] {
   const conditions: string[] = ["s.status = 'active'"];
   const values: unknown[] = [];
@@ -356,8 +362,22 @@ function selectScopedSessions(
     conditions.push(`s.agent_group_id IN (${ids.map(() => '?').join(', ')})`);
     values.push(...ids);
   }
+  if (opts.workgroupId) {
+    // The PRIMARY axis. Siblings share a workgroup, so filtering by agent group
+    // forced the operator to pick one sibling and hid the rest of the thread's
+    // participants — see CLAUDE.md "Siblings share a workgroup".
+    //
+    // This can never WIDEN scope. The clause above is a separate AND term, so a
+    // caller allowed two siblings of a six-sibling workgroup still sees exactly
+    // those two; the workgroup only ever subtracts. Same rule as §2a for
+    // `group_id`: an out-of-scope or unknown workgroup yields zero rows, not a
+    // 403.
+    conditions.push('s.agent_group_id IN (SELECT id FROM agent_groups WHERE workgroup_id = ?)');
+    values.push(opts.workgroupId);
+  }
   if (opts.groupId) {
-    // §2a: an out-of-scope group_id yields zero rows rather than a 403.
+    // §2a: an out-of-scope group_id yields zero rows rather than a 403. Still
+    // supported, and now a NARROWING term inside the selected workgroup.
     conditions.push('s.agent_group_id = ?');
     values.push(opts.groupId);
   }
@@ -783,6 +803,8 @@ function groupByThread(rows: ThreadSessionRow[]): ThreadAccum[] {
 export async function buildThreadList(
   ctx: AuthedRequestContext,
   opts: {
+    /** Primary axis — every agent group carrying this `workgroup_id`, intersected with scope. */
+    workgroupId?: string | null;
     groupId: string | null;
     includeArchived: boolean;
     sinceHours: number;
@@ -1000,6 +1022,7 @@ export const threadsHandler: AuthHandler = async (req, _params, ctx) => {
   const includeArchivedRaw = url.searchParams.get('include_archived');
   try {
     const body = await buildThreadList(ctx, {
+      workgroupId: url.searchParams.get('workgroup'),
       groupId: url.searchParams.get('group_id'),
       includeArchived: includeArchivedRaw === '1' || includeArchivedRaw === 'true',
       sinceHours,

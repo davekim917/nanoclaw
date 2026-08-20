@@ -229,6 +229,26 @@ describe('workgroupsListHandler', () => {
     expect(body.workgroups.map((w) => w.id)).toEqual(['wg-1']);
   });
 
+  /**
+   * This endpoint is the console's PRIMARY selector, so its scope rule is now
+   * load-bearing for the whole surface: a workgroup the caller is allowed no
+   * sibling in must not be offered at all, and one they are allowed SOME
+   * siblings in must be offered exactly once (not once per sibling).
+   */
+  it('offers a partially-permitted workgroup once, and omits one with no permitted sibling', async () => {
+    addGroup('ag-1b', 'wg-1');
+    addGroup('ag-1c', 'wg-1');
+    addGroup('ag-2b', 'wg-2');
+
+    const res = (await workgroupsListHandler(
+      makeReq('http://localhost/dashboard/api/workgroups'),
+      {},
+      makeCtx({ allowed_group_ids: ['ag-1b'] }),
+    ))!;
+    const body = (await res.json()) as { workgroups: { id: string }[] };
+    expect(body.workgroups.map((w) => w.id)).toEqual(['wg-1']);
+  });
+
   it('caller with no allowed groups gets an empty list (no leak)', async () => {
     const res = (await workgroupsListHandler(
       makeReq('http://localhost/dashboard/api/workgroups'),

@@ -99,6 +99,8 @@ export async function exchangeToken(token: string): Promise<ExchangeResponse> {
 export interface GroupSummary {
   id: string;
   name: string;
+  /** Which workgroup this sibling belongs to — null for an unassigned group. */
+  workgroup_id: string | null;
 }
 
 export interface GroupListResponse {
@@ -753,12 +755,16 @@ export interface ThreadDetailResponse {
 }
 
 export async function listThreads(filter?: {
+  /** Primary axis: every sibling in the workgroup, intersected with the caller's scope. */
+  workgroup?: string;
+  /** Still supported, and narrows WITHIN `workgroup` when both are given. */
   group_id?: string;
   include_archived?: boolean;
   since_hours?: number;
   limit?: number;
 }): Promise<ThreadListResponse> {
   const params = new URLSearchParams();
+  if (filter?.workgroup) params.append('workgroup', filter.workgroup);
   if (filter?.group_id) params.append('group_id', filter.group_id);
   if (filter?.include_archived) params.append('include_archived', '1');
   if (filter?.since_hours) params.append('since_hours', String(filter.since_hours));
