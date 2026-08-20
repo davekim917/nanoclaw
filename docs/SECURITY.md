@@ -206,15 +206,16 @@ also reserves each container's declared memory request before spawn and queues
 wakes in FIFO order when admitting another container would exceed the host
 memory budget.
 
-| Env                            | Default                   | Meaning                                                                        |
-| ------------------------------ | ------------------------- | ------------------------------------------------------------------------------ |
-| `CONTAINER_CPU_LIMIT`          | _(empty — unbounded)_     | Passed to `--cpus` when set (e.g. `2`).                                        |
-| `CONTAINER_MEMORY_LIMIT`       | `3g`                      | Install-wide `--memory` fallback.                                              |
-| `CONTAINER_MEMORY_RESERVATION` | same as memory limit      | Install-wide admission request and `--memory-reservation` fallback.            |
-| `CONTAINER_MEMORY_SWAP_LIMIT`  | same as memory limit      | Docker RAM-plus-swap total. Equal to the memory limit disables container swap. |
-| `CONTAINER_MEMORY_BUDGET`      | 80% of Docker-visible RAM | Maximum sum of active and in-flight container memory requests.                 |
-| `CONTAINER_PIDS_LIMIT`         | `1024`                    | Per-container PID ceiling.                                                     |
-| `MAX_CONCURRENT_CONTAINERS`    | `24`                      | Secondary container-count ceiling. `0` disables only this count cap.           |
+| Env                            | Default                   | Meaning                                                                         |
+| ------------------------------ | ------------------------- | ------------------------------------------------------------------------------- |
+| `CONTAINER_CPU_LIMIT`          | _(empty — unbounded)_     | Passed to `--cpus` when set (e.g. `2`). Hard CFS quota — a ceiling.             |
+| `CONTAINER_CPU_SHARES`         | _(empty — Docker's 1024)_ | Passed to `--cpu-shares` when set (e.g. `512`). Relative weight, not a ceiling. |
+| `CONTAINER_MEMORY_LIMIT`       | `3g`                      | Install-wide `--memory` fallback.                                               |
+| `CONTAINER_MEMORY_RESERVATION` | same as memory limit      | Install-wide admission request and `--memory-reservation` fallback.             |
+| `CONTAINER_MEMORY_SWAP_LIMIT`  | same as memory limit      | Docker RAM-plus-swap total. Equal to the memory limit disables container swap.  |
+| `CONTAINER_MEMORY_BUDGET`      | 80% of Docker-visible RAM | Maximum sum of active and in-flight container memory requests.                  |
+| `CONTAINER_PIDS_LIMIT`         | `1024`                    | Per-container PID ceiling.                                                      |
+| `MAX_CONCURRENT_CONTAINERS`    | `24`                      | Secondary container-count ceiling. `0` disables only this count cap.            |
 
 Per-group overrides are file-canonical in `groups/<folder>/container.json`:
 
@@ -227,6 +228,7 @@ Per-group overrides are file-canonical in `groups/<folder>/container.json`:
       "memorySwapLimitMb": 5120
     },
     "cpus": 2,
+    "cpuShares": 512,
     "pidsLimit": 1024
   }
 }
@@ -248,9 +250,16 @@ provider cap without removing the container safety boundary:
 
 `ncl groups config update` exposes the same fields through
 `--memory-request-mb`, `--memory-limit-mb`, `--memory-swap-limit-mb`,
-`--cpus`, and `--pids-limit`. Changes take effect on the next container spawn.
+`--cpus`, `--cpu-shares`, and `--pids-limit`. Changes take effect on the next container spawn.
 Each session container consumes its own request, even when several sessions
 belong to the same agent group.
+
+`CONTAINER_CPU_LIMIT` and `CONTAINER_CPU_SHARES` do different jobs and compose:
+the cap is a ceiling that applies even on an idle host, while shares only
+matter when containers actually contend — a lone container still bursts to its
+cap. `1024` shares is Docker's default (cgroup v2 `cpu.weight` 100), so leaving
+`CONTAINER_CPU_SHARES` unset changes nothing; set it below 1024 to make agent
+containers yield to host processes under load.
 
 ## Security Architecture Diagram
 

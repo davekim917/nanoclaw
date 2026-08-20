@@ -1,5 +1,6 @@
 import {
   CONTAINER_CPU_LIMIT,
+  CONTAINER_CPU_SHARES,
   CONTAINER_MEMORY_LIMIT,
   CONTAINER_MEMORY_RESERVATION,
   CONTAINER_MEMORY_SWAP_LIMIT,
@@ -16,6 +17,8 @@ export interface ContainerMemoryResources {
 export interface ContainerResources {
   memory?: ContainerMemoryResources;
   cpus?: number;
+  /** Docker --cpu-shares: relative CPU weight under contention, not a ceiling. */
+  cpuShares?: number;
   pidsLimit?: number;
 }
 
@@ -26,6 +29,7 @@ export interface EffectiveContainerResources {
     memorySwapLimitMb: number;
   };
   cpus: number | undefined;
+  cpuShares: number | undefined;
   pidsLimit: number;
 }
 
@@ -34,6 +38,7 @@ export interface ContainerResourceDefaults {
   memoryReservation: string;
   memorySwapLimit: string;
   cpuLimit: string;
+  cpuShares: string;
   pidsLimit: number;
 }
 
@@ -43,6 +48,7 @@ export function installContainerResourceDefaults(): ContainerResourceDefaults {
     memoryReservation: CONTAINER_MEMORY_RESERVATION,
     memorySwapLimit: CONTAINER_MEMORY_SWAP_LIMIT,
     cpuLimit: CONTAINER_CPU_LIMIT,
+    cpuShares: CONTAINER_CPU_SHARES,
     pidsLimit: CONTAINER_PIDS_LIMIT,
   };
 }
@@ -93,6 +99,14 @@ function positiveNumber(value: unknown, field: string): number {
   return value;
 }
 
+// Docker rejects anything outside this range, and a rejected flag fails every
+// spawn — catch a bad .env/container.json value here rather than at run time.
+function cpuSharesValue(value: unknown, field: string): number {
+  const shares = positiveInteger(value, field);
+  if (shares < 2 || shares > 262144) throw new Error(`${field} must be between 2 and 262144`);
+  return shares;
+}
+
 export function resolveContainerResources(
   declared?: ContainerResources,
   defaults: ContainerResourceDefaults = installContainerResourceDefaults(),
@@ -129,6 +143,13 @@ export function resolveContainerResources(
         ? positiveNumber(Number(defaultCpu), 'CONTAINER_CPU_LIMIT')
         : undefined
       : positiveNumber(declared.cpus, 'resources.cpus');
+  const defaultCpuShares = defaults.cpuShares.trim();
+  const cpuShares =
+    declared?.cpuShares === undefined
+      ? defaultCpuShares
+        ? cpuSharesValue(Number(defaultCpuShares), 'CONTAINER_CPU_SHARES')
+        : undefined
+      : cpuSharesValue(declared.cpuShares, 'resources.cpuShares');
   const pidsLimit =
     declared?.pidsLimit === undefined
       ? positiveInteger(defaults.pidsLimit, 'CONTAINER_PIDS_LIMIT')
@@ -137,6 +158,7 @@ export function resolveContainerResources(
   return {
     memory: { requestMb, limitMb, memorySwapLimitMb },
     cpus,
+    cpuShares,
     pidsLimit,
   };
 }

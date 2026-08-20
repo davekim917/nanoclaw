@@ -334,7 +334,7 @@ registerResource({
       description:
         'Update container config fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
         'Use --id <group-id> and scalar flags, or resource flags: --memory-request-mb, --memory-limit-mb, ' +
-        '--memory-swap-limit-mb, --cpus, --pids-limit.',
+        '--memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
@@ -368,17 +368,19 @@ registerResource({
         const memoryLimitMb = optionalIntegerArg(args, 'memory-limit-mb', 'memory_limit_mb');
         const memorySwapLimitMb = optionalIntegerArg(args, 'memory-swap-limit-mb', 'memory_swap_limit_mb');
         const cpus = optionalNumberArg(args, 'cpus');
+        const cpuShares = optionalIntegerArg(args, 'cpu-shares', 'cpu_shares');
         const pidsLimit = optionalIntegerArg(args, 'pids-limit', 'pids_limit');
         const hasResourceUpdate =
           memoryRequestMb !== undefined ||
           memoryLimitMb !== undefined ||
           memorySwapLimitMb !== undefined ||
           cpus !== undefined ||
+          cpuShares !== undefined ||
           pidsLimit !== undefined;
 
         if (Object.keys(updates).length === 0 && !hasResourceUpdate) {
           throw new Error(
-            'Nothing to update — provide a scalar config flag or one of: --memory-request-mb, --memory-limit-mb, --memory-swap-limit-mb, --cpus, --pids-limit',
+            'Nothing to update — provide a scalar config flag or one of: --memory-request-mb, --memory-limit-mb, --memory-swap-limit-mb, --cpus, --cpu-shares, --pids-limit',
           );
         }
 
@@ -439,6 +441,7 @@ registerResource({
             if (memoryLimitMb !== undefined) resources.memory!.limitMb = memoryLimitMb;
             if (memorySwapLimitMb !== undefined) resources.memory!.memorySwapLimitMb = memorySwapLimitMb;
             if (cpus !== undefined) resources.cpus = cpus;
+            if (cpuShares !== undefined) resources.cpuShares = cpuShares;
             if (pidsLimit !== undefined) resources.pidsLimit = pidsLimit;
             resolveContainerResources(resources);
             config.resources = resources;

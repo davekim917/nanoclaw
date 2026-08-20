@@ -16,6 +16,7 @@ const envConfig = readEnvFile([
   'NANOCLAW_SELF_HEAL',
   'NANOCLAW_SELF_HEAL_TAKEOVER',
   'CONTAINER_CPU_LIMIT',
+  'CONTAINER_CPU_SHARES',
   'CONTAINER_MEMORY_LIMIT',
   'CONTAINER_MEMORY_RESERVATION',
   'CONTAINER_MEMORY_SWAP_LIMIT',
@@ -146,6 +147,14 @@ export const MAX_CONCURRENT_CONTAINERS =
 // no flag added (memory/pids limits above already bound each container).
 // Operators opt in: CONTAINER_CPU_LIMIT=2.
 export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || envConfig.CONTAINER_CPU_LIMIT || '';
+// Per-container CPU *weight*, passed through to `docker run --cpu-shares`.
+// Relative share of contended CPU, not a ceiling: an idle host still lets a
+// single container burst up to CONTAINER_CPU_LIMIT, while a busy host slices
+// proportionally instead of thrashing. Default empty = no flag added; Docker's
+// own default is 1024, which maps to the cgroup v2 default `cpu.weight` 100,
+// so leaving this unset is a true no-op. Operators opt in:
+// CONTAINER_CPU_SHARES=512.
+export const CONTAINER_CPU_SHARES = process.env.CONTAINER_CPU_SHARES || envConfig.CONTAINER_CPU_SHARES || '';
 
 // Egress lockdown — force all agent traffic through the OneCLI gateway on a
 // no-internet Docker network. Off by default; consumed by src/egress-lockdown.ts.

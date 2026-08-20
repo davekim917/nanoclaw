@@ -13,6 +13,7 @@ const defaults: ContainerResourceDefaults = {
   memoryReservation: '3g',
   memorySwapLimit: '3g',
   cpuLimit: '',
+  cpuShares: '',
   pidsLimit: 512,
 };
 
@@ -29,6 +30,7 @@ describe('container resource resolution', () => {
         memorySwapLimitMb: 3072,
       },
       cpus: undefined,
+      cpuShares: undefined,
       pidsLimit: 512,
     });
   });
@@ -48,8 +50,23 @@ describe('container resource resolution', () => {
         memorySwapLimitMb: 5120,
       },
       cpus: undefined,
+      cpuShares: undefined,
       pidsLimit: 512,
     });
+  });
+
+  it('test_cpu_shares_default_env_applies_when_no_group_override', () => {
+    expect(resolveContainerResources(undefined, { ...defaults, cpuShares: '512' }).cpuShares).toBe(512);
+  });
+
+  it('test_cpu_shares_group_override_beats_install_default', () => {
+    expect(resolveContainerResources({ cpuShares: 2048 }, { ...defaults, cpuShares: '512' }).cpuShares).toBe(2048);
+  });
+
+  it('test_cpu_shares_rejects_values_docker_would_reject', () => {
+    expect(() => resolveContainerResources({ cpuShares: 1 }, defaults)).toThrow(/between 2 and 262144/);
+    expect(() => resolveContainerResources({ cpuShares: 262145 }, defaults)).toThrow(/between 2 and 262144/);
+    expect(() => resolveContainerResources({ cpuShares: 1.5 }, defaults)).toThrow(/positive integer/);
   });
 
   it('test_resource_validation_rejects_request_above_limit', () => {

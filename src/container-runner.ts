@@ -4061,6 +4061,7 @@ export function dockerResourceLimitArgs(resources?: ContainerResources): string[
     formatMemoryMb(effective.memory.memorySwapLimitMb),
   ];
   if (effective.cpus !== undefined) args.push('--cpus', String(effective.cpus));
+  if (effective.cpuShares !== undefined) args.push('--cpu-shares', String(effective.cpuShares));
   args.push('--pids-limit', String(effective.pidsLimit));
   return args;
 }

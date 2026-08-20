@@ -180,6 +180,7 @@ describe('dockerResourceLimitArgs', () => {
       formatMemoryMb(configured.memory.memorySwapLimitMb),
     ];
     if (configured.cpus !== undefined) expected.push('--cpus', String(configured.cpus));
+    if (configured.cpuShares !== undefined) expected.push('--cpu-shares', String(configured.cpuShares));
     expected.push('--pids-limit', String(configured.pidsLimit));
 
     expect(dockerResourceLimitArgs()).toEqual(expected);
@@ -189,6 +190,7 @@ describe('dockerResourceLimitArgs', () => {
     const args = dockerResourceLimitArgs({
       memory: { requestMb: 5120, limitMb: 5120, memorySwapLimitMb: 5120 },
       cpus: 2,
+      cpuShares: 2048,
       pidsLimit: 768,
     });
 
@@ -201,9 +203,22 @@ describe('dockerResourceLimitArgs', () => {
       '5g',
       '--cpus',
       '2',
+      '--cpu-shares',
+      '2048',
       '--pids-limit',
       '768',
     ]);
+  });
+
+  it('test_docker_resource_args_omit_cpu_shares_when_unset', () => {
+    const args = dockerResourceLimitArgs({
+      memory: { requestMb: 5120, limitMb: 5120, memorySwapLimitMb: 5120 },
+      cpus: 2,
+      pidsLimit: 768,
+    });
+
+    expect(args).not.toContain('--cpu-shares');
+    expect(args.slice(args.indexOf('--cpus'))).toEqual(['--cpus', '2', '--pids-limit', '768']);
   });
 });
 
