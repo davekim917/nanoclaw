@@ -640,3 +640,67 @@ describe('mergeThreadTranscript', () => {
     expect(merged.map((m) => m.text)).toEqual(['aaa', 'zzz']);
   });
 });
+
+// ── The assign selector's data (one primitive: send to a chosen agent) ───────
+
+/**
+ * The console's action model has ONE primitive — send a message to a chosen
+ * agent — and the only difference between steering and assigning is whether the
+ * chosen agent is already on the thread. That makes "which other agents could
+ * hold this thread" part of the row, not a second fetch, and these tests bind
+ * the two ways it lies: including agents already here (so the selector shows
+ * them twice), and including agents wired to a DIFFERENT room.
+ */
+describe('assignable_agents', () => {
+  function wire(mgId: string, platformId: string, agentGroupId: string): void {
+    getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
+         VALUES (?, 'slack-testworkspace', 'testworkspace', ?, '#example-eng', ?)`,
+      )
+      .run(mgId, platformId, iso(0));
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, session_mode, created_at)
+         VALUES (?, ?, ?, 'per-thread', ?)`,
+      )
+      .run(`mga-${mgId}-${agentGroupId}`, mgId, agentGroupId, iso(0));
+  }
+
+  beforeEach(() => {
+    setupDb();
+    for (const id of ['ag-here', 'ag-wired', 'ag-otherroom']) seedAgentGroup(id);
+    wire('mg-1', 'slack:CTESTCHAN01', 'ag-here');
+    wire('mg-1', 'slack:CTESTCHAN01', 'ag-wired');
+    wire('mg-2', 'slack:COTHERCHAN2', 'ag-otherroom');
+    insertSession({
+      id: 's-here',
+      agentGroupId: 'ag-here',
+      threadId: 'slack:CTESTCHAN01:1700000000.11',
+      messagingGroupId: 'mg-1',
+    });
+  });
+
+  it('lists wired agents that are NOT already on the thread, and nobody from another room', async () => {
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.participants.map((p) => p.agent_group_id)).toEqual(['ag-here']);
+    expect(threads[0]!.assignable_agents).toEqual([{ agent_group_id: 'ag-wired', name: 'persona:ag-wired' }]);
+  });
+
+  it('honours the §2a scope filter — an agent out of scope is not offered', async () => {
+    const { threads } = await buildThreadList(
+      makeCtx({ no_filter: false, allowed_group_ids: ['ag-here'] }),
+      LIST_OPTS,
+      deps(),
+    );
+    expect(threads[0]!.assignable_agents).toEqual([]);
+  });
+
+  it('is empty for a thread whose channel nothing names — there is no room to assign into', async () => {
+    insertSession({ id: 's-orphan', agentGroupId: 'ag-here', threadId: null });
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    const synthetic = threads.find((t) => t.synthetic)!;
+    expect(synthetic.channel_key).toBe(UNKNOWN_CHANNEL_KEY);
+    expect(synthetic.assignable_agents).toEqual([]);
+  });
+});

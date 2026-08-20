@@ -1,20 +1,31 @@
-import { archiveSession, postSessionMessage, snoozeThread, unsnoozeThread, type ThreadSummary } from '../../lib/api.js';
+import {
+  archiveSession,
+  postThreadMessage,
+  snoozeThread,
+  unsnoozeThread,
+  type ThreadMessageResponse,
+  type ThreadSummary,
+} from '../../lib/api.js';
 
 /**
- * The console's four live verbs, and nothing else.
+ * The console's three actions: one message primitive, plus close and snooze.
  *
- * DESIGN §10.3 leaves two steer mechanisms in the tree and they are not
- * interchangeable. `POST /dashboard/api/sessions/:id/message` writes into ONE
- * session's inbound queue and echoes into the originating platform thread; it
- * is idempotent, rate-limited per (user, session) and role-gated to
- * owner / global-admin / admin-of-group. `POST /observatory/steer|nudge|assign`
- * spawn a one-shot task and accept only a claim slug or a release-board item
- * id — neither of which a thread row has — so they cannot serve this surface at
- * all. The session path is therefore the whole reply mechanism here, and every
- * send names a session explicitly rather than "the thread".
+ * **There is ONE primitive — send a message to a chosen agent.** Steer, push,
+ * ship, assign and reassign are all `sendToAgent`; what differs between them is
+ * the word on the button and whether the chosen agent already has a session on
+ * the thread. Nothing here kills a container, and there is no verb that does:
+ * a stalled thread gets a message.
  *
- * Nothing in this file widens a permission. Each call lands on an endpoint that
- * already existed with the gate it already had.
+ * `POST /dashboard/api/threads/:id/message` is that call. It resolves the
+ * session (creating one when the agent has never spoken here) and then goes
+ * through the SAME `POST /dashboard/api/sessions/:id/message` executor the
+ * previous shape used — same gate (owner / global-admin / admin-of-group), same
+ * rate limit, same idempotency, same platform echo. Nothing in this file widens
+ * a permission.
+ *
+ * `POST /observatory/steer|nudge|assign` remain what they were: one-shot tasks
+ * that accept a claim slug or a release-board item id, neither of which a thread
+ * row has. They cannot serve this surface and are not used here.
  */
 
 /**
@@ -29,15 +40,20 @@ export function newIdempotencyKey(): string {
 }
 
 /**
- * Answer / Steer — the same call, differing only in which state prompted it.
+ * The one primitive. Two parameters: which agent, what text.
  *
- * `sessionId` is chosen by the operator (defaulting to the thread's
- * `reply_target_session_id`), never inferred here: a thread has N inbound
- * queues and picking silently is how an answer reaches an agent that never
- * asked the question.
+ * The agent is chosen by the operator (defaulting to the thread's
+ * `reply_target_session_id`'s participant), never inferred here: a thread has N
+ * inbound queues and picking silently is how an answer reaches an agent that
+ * never asked the question. An agent with no session on the thread is a valid
+ * choice — that is Assign, and the server opens the queue.
  */
-export async function sendReply(sessionId: string, text: string): Promise<void> {
-  await postSessionMessage(sessionId, { idempotency_key: newIdempotencyKey(), text });
+export async function sendToAgent(
+  threadId: string,
+  agentGroupId: string,
+  text: string,
+): Promise<ThreadMessageResponse> {
+  return postThreadMessage(threadId, { agent_group_id: agentGroupId, idempotency_key: newIdempotencyKey(), text });
 }
 
 /**

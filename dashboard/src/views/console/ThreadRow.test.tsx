@@ -32,6 +32,7 @@ function thread(over: Partial<ThreadSummary> = {}): ThreadSummary {
       { agent_group_id: 'ag-1', name: 'Alpha', session_id: 's-1', avatarUrl: null, provider: 'claude' },
       { agent_group_id: 'ag-2', name: 'Bravo', session_id: 's-2', avatarUrl: null, provider: 'codex' },
     ],
+    assignable_agents: [{ agent_group_id: 'ag-3', name: 'Charlie' }],
     last_activity_at: '2026-08-20T09:00:00.000Z',
     state: 'needs_you',
     session_ids: ['s-1', 's-2'],
@@ -58,72 +59,54 @@ function renderRow(over: Partial<ThreadSummary> = {}, props: Partial<Parameters<
   return { ...utils, row, onSelect };
 }
 
-describe('all seven states render', () => {
+describe('all seven states render, every one with a LIVE verb', () => {
   it.each(ALL_STATES)('%s shows its own label and verb', (state) => {
     const { row } = renderRow({ state });
     const presentation = STATE_PRESENTATION[state];
     expect(row.dataset['state']).toBe(state);
     expect(row.querySelector('.ncc-state')!.textContent).toBe(presentation.label);
-    // §5: `idle`'s verb column reads `—`, so that row carries no button.
-    expect(row.querySelector('.ncc-verb')?.textContent ?? null).toBe(presentation.verb);
-  });
-
-  it('gives every state at most one verb, and no two states share a label', () => {
-    const labels = ALL_STATES.map((s) => STATE_PRESENTATION[s].label);
-    expect(new Set(labels).size).toBe(ALL_STATES.length);
-    for (const s of ALL_STATES) {
-      const verb = STATE_PRESENTATION[s].verb;
-      if (s === 'idle') expect(verb).toBeNull();
-      else expect(verb!.split(/\s/)).toHaveLength(1);
-    }
+    expect(row.querySelector('.ncc-verb')!.textContent).toBe(presentation.verb);
   });
 
   /**
-   * §1 says every row ends in a verb, and three of the seven verbs have no
-   * backing endpoint today. Hiding those buttons would quietly rewrite the
-   * contract; rendering them inert WITH THE REASON is the honest shape, and
-   * these tests exist because "just hide it" is the tempting simplification.
+   * The action model has ONE primitive — send a message to a chosen agent — and
+   * the per-state verb is a LABEL over it. `idle` used to be the one row with
+   * no button and `stalled`/`unassigned`/`parked` rendered inert with a reason;
+   * both of those are gone, and this is the test that keeps them gone.
    */
-  describe('verbs with no backing endpoint render inert, not hidden', () => {
-    it.each(['stalled', 'unassigned', 'parked'] as ThreadState[])('%s carries a reason on the button', (state) => {
-      const onVerb = vi.fn();
-      const { row } = renderRow({ state }, { onVerb });
-      const verb = row.querySelector('.ncc-verb')!;
-      expect(verb.textContent).toBe(STATE_PRESENTATION[state].verb);
-      expect(verb.getAttribute('aria-disabled')).toBe('true');
-      expect(verb.getAttribute('title')).toBe(STATE_PRESENTATION[state].inertReason);
-      // Focusable on purpose: a real `disabled` button cannot be reached by
-      // keyboard, and the explanation would be unreachable with it.
-      expect(verb.hasAttribute('disabled')).toBe(false);
-      expect(verb.getAttribute('aria-label')).toContain('unavailable');
-    });
+  it.each(ALL_STATES)('%s fires its verb — no state is inert', async (state) => {
+    const onVerb = vi.fn();
+    const { row } = renderRow({ state }, { onVerb });
+    const verb = row.querySelector('.ncc-verb') as HTMLElement;
+    expect(verb.getAttribute('aria-disabled')).toBeNull();
+    expect(verb.hasAttribute('disabled')).toBe(false);
+    expect(verb.getAttribute('title')).toBeNull();
+    await userEvent.click(verb);
+    expect(onVerb).toHaveBeenCalledTimes(1);
+  });
 
-    it.each(['stalled', 'unassigned', 'parked'] as ThreadState[])('%s does nothing when pressed', async (state) => {
-      const onVerb = vi.fn();
-      const { row } = renderRow({ state }, { onVerb });
-      await userEvent.click(row.querySelector('.ncc-verb') as HTMLElement);
-      expect(onVerb).not.toHaveBeenCalled();
-    });
+  it('every state names a verb, and no two states share a label', () => {
+    const labels = ALL_STATES.map((s) => STATE_PRESENTATION[s].label);
+    expect(new Set(labels).size).toBe(ALL_STATES.length);
+    for (const s of ALL_STATES) expect(STATE_PRESENTATION[s].verb.trim()).not.toBe('');
+  });
 
-    it.each(['needs_you', 'running', 'done'] as ThreadState[])('%s is live and fires its verb', async (state) => {
-      const onVerb = vi.fn();
-      const { row } = renderRow({ state }, { onVerb });
-      const verb = row.querySelector('.ncc-verb')!;
-      expect(verb.getAttribute('aria-disabled')).toBeNull();
-      expect(verb.getAttribute('title')).toBeNull();
-      await userEvent.click(verb as HTMLElement);
-      expect(onVerb).toHaveBeenCalledTimes(1);
-    });
+  /**
+   * Kill is GONE, not disabled. A stalled thread gets a message, not a kill —
+   * there is no verb, no reason string and no code path left that names one.
+   */
+  it('Kill does not exist anywhere in the presentation table or the row', () => {
+    for (const s of ALL_STATES) {
+      expect(STATE_PRESENTATION[s].verb.toLowerCase()).not.toContain('kill');
+      expect(JSON.stringify(STATE_PRESENTATION[s]).toLowerCase()).not.toContain('kill');
+    }
+    expect(renderRow({ state: 'stalled' }).row.textContent!.toLowerCase()).not.toContain('kill');
+    expect(STATE_PRESENTATION.stalled.verb).toBe('Push');
+  });
 
-    it('every inert reason names what is missing rather than just saying no', () => {
-      for (const state of ALL_STATES) {
-        const { inertReason, action } = STATE_PRESENTATION[state];
-        // A verb is either wired or explained — never silently dead.
-        if (STATE_PRESENTATION[state].verb === null) continue;
-        expect(action === null).toBe(inertReason !== null);
-        if (inertReason) expect(inertReason.length).toBeGreaterThan(40);
-      }
-    });
+  it('the verb names its thread, so forty of them down a list are distinguishable', () => {
+    const { row } = renderRow({ state: 'idle', title: 'the retry path' });
+    expect(row.querySelector('.ncc-verb')!.getAttribute('aria-label')).toBe('Steer — the retry path');
   });
 
   it('paints the status bar only when the row wants something (§4)', () => {

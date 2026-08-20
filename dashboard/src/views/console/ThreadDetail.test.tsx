@@ -5,19 +5,23 @@ import userEvent from '@testing-library/user-event';
 import type { ThreadSummary } from '../../lib/api.js';
 
 /**
- * The reply-target seam (DESIGN §10.3).
+ * The composer is the console's ONE action, so these tests bind the four things
+ * that make it honest:
  *
- * A thread is N sessions and the steer path writes into exactly ONE inbound
- * queue, so these tests bind the two things that make the composer honest:
- * the default target is the agent whose state drove the row's urgency, and the
- * send carries whichever session the operator actually chose.
+ *  - the default target is the agent whose state drove the row's urgency;
+ *  - the selector spans EVERY wired agent, split into on-thread and not, so
+ *    Assign is reachable at all;
+ *  - the send names an agent (never a session), which is what lets the server
+ *    open a queue for one that has none;
+ *  - what actually happened — assigned, handed over — is reported, because
+ *    neither is visible anywhere else on the screen.
  */
 
 const getThreadDetail = vi.fn();
-const postSessionMessage = vi.fn().mockResolvedValue({});
+const postThreadMessage = vi.fn().mockResolvedValue({ created_session: false, handoff: null });
 vi.mock('../../lib/api.js', () => ({
   getThreadDetail,
-  postSessionMessage,
+  postThreadMessage,
   archiveSession: vi.fn(),
   snoozeThread: vi.fn(),
   unsnoozeThread: vi.fn(),
@@ -36,6 +40,8 @@ function thread(over: Partial<ThreadSummary> = {}): ThreadSummary {
       { agent_group_id: 'ag-1', name: 'Alpha', session_id: 's-alpha', avatarUrl: null, provider: 'claude' },
       { agent_group_id: 'ag-2', name: 'Bravo', session_id: 's-bravo', avatarUrl: null, provider: 'codex' },
     ],
+    // Wired to the room, never spoken here. Choosing one of these is Assign.
+    assignable_agents: [{ agent_group_id: 'ag-3', name: 'Charlie' }],
     last_activity_at: '2026-08-20T09:00:00.000Z',
     state: 'needs_you',
     session_ids: ['s-alpha', 's-bravo'],
@@ -60,61 +66,208 @@ function renderDetail(t: ThreadSummary | null, props: Record<string, unknown> = 
   );
 }
 
+const target = () => screen.findByLabelText('Send to') as Promise<HTMLSelectElement>;
+
 beforeEach(() => {
-  postSessionMessage.mockClear();
+  postThreadMessage.mockClear();
+  postThreadMessage.mockResolvedValue({ created_session: false, handoff: null });
   getThreadDetail.mockResolvedValue({ thread: thread(), transcript: [] });
 });
 
-describe('the reply target is the request, not decoration', () => {
+describe('the target is the request, not decoration', () => {
   it('defaults to the agent whose state drove the row', async () => {
     renderDetail(thread());
-    const select = (await screen.findByLabelText('Reply goes to')) as HTMLSelectElement;
-    expect(select.value).toBe('s-bravo');
+    expect((await target()).value).toBe('ag-2');
   });
 
   it('falls back to the most recent participant when the server names no target', async () => {
     renderDetail(thread({ reply_target_session_id: null }));
-    const select = (await screen.findByLabelText('Reply goes to')) as HTMLSelectElement;
-    expect(select.value).toBe('s-alpha');
+    expect((await target()).value).toBe('ag-1');
   });
 
-  it('lists every participant, and no broadcast option', async () => {
-    renderDetail(thread());
-    const select = (await screen.findByLabelText('Reply goes to')) as HTMLSelectElement;
-    expect(Array.from(select.options).map((o) => o.textContent)).toEqual(['Alpha', 'Bravo']);
-  });
-
-  it('sends to the chosen session, not the default one', async () => {
+  it('does not send an empty message', async () => {
     const user = userEvent.setup();
     renderDetail(thread());
-    await user.selectOptions(await screen.findByLabelText('Reply goes to'), 's-alpha');
-    await user.type(screen.getByLabelText('Reply text'), 'use the device flow');
-    await user.click(screen.getByRole('button', { name: 'send' }));
-    await waitFor(() => expect(postSessionMessage).toHaveBeenCalledTimes(1));
-    expect(postSessionMessage.mock.calls[0]![0]).toBe('s-alpha');
-    expect(postSessionMessage.mock.calls[0]![1].text).toBe('use the device flow');
+    await user.type(await screen.findByLabelText('Message text'), '   ');
+    expect((screen.getByRole('button', { name: 'send' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(postThreadMessage).not.toHaveBeenCalled();
   });
 
-  it('fires onSent once the reply lands, so the caller can advance', async () => {
+  it('fires onSent once the send lands, so the caller can advance', async () => {
     const user = userEvent.setup();
     const onSent = vi.fn();
     renderDetail(thread(), { onSent });
-    await user.type(await screen.findByLabelText('Reply text'), 'ack');
+    await user.type(await screen.findByLabelText('Message text'), 'ack');
     await user.click(screen.getByRole('button', { name: 'send' }));
     await waitFor(() => expect(onSent).toHaveBeenCalledTimes(1));
   });
+});
 
-  it('says so rather than offering a queue when no agent is on the thread', async () => {
-    renderDetail(thread({ participants: [], session_ids: [] }));
-    expect(await screen.findByText(/no inbound queue to reply into/i)).toBeTruthy();
-    expect(screen.queryByLabelText('Reply goes to')).toBeNull();
+describe('the selector spans every wired agent, participants first', () => {
+  it('groups on-thread agents above the ones the thread can be handed to', async () => {
+    renderDetail(thread());
+    const select = await target();
+    const groups = Array.from(select.querySelectorAll('optgroup'));
+    expect(groups.map((g) => g.getAttribute('label'))).toEqual([
+      'On this thread',
+      'Hand it to — not on this thread yet',
+    ]);
+    expect(Array.from(groups[0]!.querySelectorAll('option')).map((o) => o.textContent)).toEqual(['Alpha', 'Bravo']);
+    expect(Array.from(groups[1]!.querySelectorAll('option')).map((o) => o.textContent)).toEqual(['Charlie']);
+    // And still no broadcast option — six agents each getting "yes, go ahead"
+    // is six agents acting on it.
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual(['Alpha', 'Bravo', 'Charlie']);
   });
 
-  it('does not send an empty reply', async () => {
+  it('offers the composer when NOBODY is on the thread but an agent is wired to it', async () => {
+    renderDetail(thread({ participants: [], session_ids: [], reply_target_session_id: null }));
+    const select = await target();
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual(['Charlie']);
+    expect(select.querySelectorAll('optgroup')).toHaveLength(1);
+  });
+
+  it('says so only when no agent is wired to the channel at all', async () => {
+    renderDetail(thread({ participants: [], session_ids: [], assignable_agents: [], reply_target_session_id: null }));
+    expect(await screen.findByText(/no agent is wired to this thread’s channel/i)).toBeTruthy();
+    expect(screen.queryByLabelText('Send to')).toBeNull();
+  });
+
+  it('sends to the chosen agent, not the default one', async () => {
     const user = userEvent.setup();
     renderDetail(thread());
-    await user.type(await screen.findByLabelText('Reply text'), '   ');
-    expect((screen.getByRole('button', { name: 'send' }) as HTMLButtonElement).disabled).toBe(true);
-    expect(postSessionMessage).not.toHaveBeenCalled();
+    await user.selectOptions(await target(), 'ag-1');
+    await user.type(screen.getByLabelText('Message text'), 'use the device flow');
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(postThreadMessage).toHaveBeenCalledTimes(1));
+    expect(postThreadMessage.mock.calls[0]![0]).toBe('slack:CTESTCHAN01:1700000000.11');
+    expect(postThreadMessage.mock.calls[0]![1].agent_group_id).toBe('ag-1');
+    expect(postThreadMessage.mock.calls[0]![1].text).toBe('use the device flow');
+  });
+
+  it('assigning an agent with no session says the queue was opened', async () => {
+    const user = userEvent.setup();
+    postThreadMessage.mockResolvedValue({ created_session: true, handoff: null });
+    renderDetail(thread());
+    await user.selectOptions(await target(), 'ag-3');
+    // The hint changes BEFORE the send: the operator should know a queue is
+    // about to be opened, not find out afterwards.
+    expect(screen.getByText(/opens its queue on the thread/i)).toBeTruthy();
+    await user.type(screen.getByLabelText('Message text'), 'you own this now');
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(postThreadMessage).toHaveBeenCalledTimes(1));
+    expect(postThreadMessage.mock.calls[0]![1].agent_group_id).toBe('ag-3');
+    expect(await screen.findByText(/Assigned to Charlie — opened its queue on this thread\./)).toBeTruthy();
+  });
+
+  it('reports the hand-over, including when the incumbent could not be told', async () => {
+    const user = userEvent.setup();
+    postThreadMessage.mockResolvedValue({
+      created_session: true,
+      handoff: { claim_slug: 'acme-pr-733', claim_owner: 'Alpha', holder_agent_group_id: 'ag-1', notified: true },
+    });
+    const { unmount } = renderDetail(thread());
+    await user.type(await screen.findByLabelText('Message text'), 'take it');
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    expect(await screen.findByText(/Alpha was asked to park or release `acme-pr-733`\./)).toBeTruthy();
+    unmount();
+
+    postThreadMessage.mockResolvedValue({
+      created_session: false,
+      handoff: { claim_slug: 'acme-pr-733', claim_owner: 'Alpha', holder_agent_group_id: null, notified: false },
+    });
+    renderDetail(thread());
+    await user.type(await screen.findByLabelText('Message text'), 'take it');
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    expect(await screen.findByText(/Could not notify Alpha.*tell them yourself/)).toBeTruthy();
+  });
+});
+
+describe('prefill chips set the box and nothing else', () => {
+  it('offers the three decision chips and never sends on tap', async () => {
+    const user = userEvent.setup();
+    renderDetail(thread());
+    const chips = await screen.findByRole('group', { name: 'One-tap answers' });
+    expect(Array.from(chips.querySelectorAll('button')).map((b) => b.textContent)).toEqual([
+      'approve as proposed',
+      'hold — need more info',
+      'no — …',
+    ]);
+    await user.click(screen.getByRole('button', { name: 'no — …' }));
+    // Mid-sentence on purpose: a refusal with no reason costs another round trip.
+    expect((screen.getByLabelText('Message text') as HTMLTextAreaElement).value).toBe('no — ');
+    expect(postThreadMessage).not.toHaveBeenCalled();
+  });
+
+  it('a ship instruction becomes a chip that presets the addressee', async () => {
+    const user = userEvent.setup();
+    renderDetail(thread(), { nextAction: 'kit records @charlie ship 869; a human presses the merge' });
+    await user.click(await screen.findByRole('button', { name: '@charlie ship 869' }));
+    expect((screen.getByLabelText('Message text') as HTMLTextAreaElement).value).toBe('@charlie ship 869');
+    // Charlie is not on the thread — the ship chip resolving to it is precisely
+    // the case Assign exists for.
+    expect((await target()).value).toBe('ag-3');
+    expect(postThreadMessage).not.toHaveBeenCalled();
+  });
+
+  it('a handle nobody answers to leaves the selector alone', async () => {
+    const user = userEvent.setup();
+    renderDetail(thread(), { nextAction: 'kit records @nobody ship 912' });
+    await user.click(await screen.findByRole('button', { name: '@nobody ship 912' }));
+    expect((screen.getByLabelText('Message text') as HTMLTextAreaElement).value).toBe('@nobody ship 912');
+    expect((await target()).value).toBe('ag-2');
+  });
+});
+
+describe('message text renders as formatted markdown', () => {
+  const withText = (text: string) =>
+    getThreadDetail.mockResolvedValue({
+      thread: thread(),
+      transcript: [
+        { session_id: 's-alpha', agent_group_id: 'ag-1', agent_name: 'Alpha', kind: 'chat', seq: 1, timestamp: '2026-08-20T09:00:00.000Z', direction: 'out', text },
+      ],
+    });
+
+  it('formats instead of showing the literal asterisks and fences', async () => {
+    withText('**ship it** and `npm run build`\n- one\n- two');
+    const { container } = renderDetail(thread());
+    const body = await waitFor(() => {
+      const el = container.querySelector('.ncc-msg-text');
+      if (!el) throw new Error('transcript not rendered yet');
+      return el;
+    });
+    expect(body.querySelector('strong')!.textContent).toBe('ship it');
+    expect(body.querySelector('code')!.textContent).toBe('npm run build');
+    expect(body.querySelectorAll('li')).toHaveLength(2);
+    expect(body.textContent).not.toContain('**');
+    // The console's own class, not the legacy `nc-md` whose tokens do not
+    // resolve inside `.ncc`.
+    expect(body.className).toContain('ncc-md');
+  });
+
+  it('never lets agent-authored HTML become live markup', async () => {
+    withText('<img src=x onerror="alert(1)"> [click](javascript:alert(2))');
+    const { container } = renderDetail(thread());
+    const body = await waitFor(() => {
+      const el = container.querySelector('.ncc-msg-text');
+      if (!el) throw new Error('transcript not rendered yet');
+      return el;
+    });
+    expect(body.querySelector('img')).toBeNull();
+    expect(body.querySelector('a')).toBeNull();
+    expect(body.textContent).toContain('<img');
+  });
+
+  it('collapses a long message behind its own preview, slicing the SOURCE', async () => {
+    // Slicing rendered HTML would shred the tags; slicing the source and
+    // parsing twice is what keeps the preview well-formed.
+    withText(`**start**\n\n${'x'.repeat(900)}\n\n**end**`);
+    const { container } = renderDetail(thread());
+    const details = await waitFor(() => {
+      const el = container.querySelector('.ncc-msg-expand');
+      if (!el) throw new Error('transcript not rendered yet');
+      return el;
+    });
+    expect(details.querySelector('summary .ncc-msg-text strong')!.textContent).toBe('start');
+    expect(details.querySelector('summary')!.textContent).toContain('show full message');
   });
 });
