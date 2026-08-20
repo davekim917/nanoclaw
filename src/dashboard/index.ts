@@ -18,6 +18,7 @@ function redirectTo(target: string) {
   };
 }
 import { sessionsHandler, sessionsDetailHandler } from './api/sessions.js';
+import { threadsHandler, threadsDetailHandler } from './api/threads.js';
 import { groupsListHandler } from './api/groups.js';
 import { messagingGroupsListHandler } from './api/messaging-groups.js';
 import { sessionMessageHandler } from './steer.js';
@@ -66,6 +67,10 @@ export function startDashboard(): void {
   register('GET', '/dashboard/api/events', requireAuth(eventsHandler));
   register('GET', '/dashboard/api/sessions', requireAuth(sessionsHandler));
   register('GET', '/dashboard/api/sessions/:id', requireAuth(sessionsDetailHandler));
+  // Observatory console (DESIGN.md §3) — thread-keyed, NOT session-keyed. The
+  // `/sessions` pair above is untouched; the inbox board still uses it.
+  register('GET', '/dashboard/api/threads', requireAuth(threadsHandler));
+  register('GET', '/dashboard/api/threads/:id', requireAuth(threadsDetailHandler));
   register('GET', '/dashboard/api/groups', requireAuth(groupsListHandler));
   register('GET', '/dashboard/api/messaging-groups', requireAuth(messagingGroupsListHandler));
   register('POST', '/dashboard/api/sessions/:id/message', requireAuth(sessionMessageHandler));

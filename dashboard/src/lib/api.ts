@@ -701,3 +701,70 @@ export async function getObservatory(workgroupId: string): Promise<ObservatorySn
     `/dashboard/api/observatory?workgroup=${encodeURIComponent(workgroupId)}`,
   );
 }
+
+// ─── Observatory console — thread-keyed queue (DESIGN.md §3, §5) ────────────
+//
+// Types mirror `src/dashboard/api/threads.ts` exactly. A row is a THREAD, never
+// a session (§3.1): `sessions` is keyed on
+// `(agent_group_id, messaging_group_id, thread_id)`, so a session-keyed list
+// renders ~40% duplicate rows.
+
+/** §5's seven states. `idle` is the residual — and the common case. */
+export type ThreadState = 'unassigned' | 'needs_you' | 'stalled' | 'running' | 'parked' | 'done' | 'idle';
+
+export interface ThreadParticipant {
+  agent_group_id: string;
+  name: string;
+  avatarUrl: string | null;
+  provider: string;
+}
+
+export interface ThreadSummary {
+  thread_id: string;
+  synthetic: boolean;
+  channel_key: string;
+  channel_name: string;
+  title: string | null;
+  participants: ThreadParticipant[];
+  last_activity_at: string | null;
+  state: ThreadState;
+  session_ids: string[];
+  container_status: 'idle' | 'running' | 'stale' | 'unknown';
+  provider_status: string | null;
+  current_tool: string | null;
+  tool_started_at: string | null;
+}
+
+export interface ThreadTranscriptEntry extends SessionTranscriptEntry {
+  session_id: string;
+  agent_group_id: string;
+  agent_name: string;
+}
+
+export interface ThreadListResponse {
+  threads: ThreadSummary[];
+}
+
+export interface ThreadDetailResponse {
+  thread: ThreadSummary;
+  transcript: ThreadTranscriptEntry[];
+}
+
+export async function listThreads(filter?: {
+  group_id?: string;
+  include_archived?: boolean;
+  since_hours?: number;
+  limit?: number;
+}): Promise<ThreadListResponse> {
+  const params = new URLSearchParams();
+  if (filter?.group_id) params.append('group_id', filter.group_id);
+  if (filter?.include_archived) params.append('include_archived', '1');
+  if (filter?.since_hours) params.append('since_hours', String(filter.since_hours));
+  if (filter?.limit) params.append('limit', String(filter.limit));
+  const qs = params.toString();
+  return apiFetch<ThreadListResponse>(`/dashboard/api/threads${qs ? `?${qs}` : ''}`);
+}
+
+export async function getThreadDetail(threadId: string): Promise<ThreadDetailResponse> {
+  return apiFetch<ThreadDetailResponse>(`/dashboard/api/threads/${encodeURIComponent(threadId)}`);
+}

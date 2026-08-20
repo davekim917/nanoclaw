@@ -61,7 +61,15 @@ export interface ObservatoryAgent {
   canonicalName: string;
   folder: string;
   provider: string;
-  /** The bot's real Slack avatar (public slack-edge URL) — the UI pixelates it client-side. Null when no wired bot has one. */
+  /**
+   * The bot's real Slack avatar (public slack-edge URL), drawn UNMODIFIED.
+   * Null when no wired bot has one — a face is never invented; the UI falls
+   * back to initials.
+   *
+   * An earlier note here said the UI pixelated it client-side. It does not, and
+   * no code ever in this tree did: the comment was the last trace of a retired
+   * treatment, and DESIGN.md §11 rules it out for good — real faces.
+   */
   avatarUrl: string | null;
   awake: boolean;
   /**
@@ -552,7 +560,7 @@ function hasWorkgroupAccess(workgroupId: string, ctx: AuthedRequestContext): boo
  * applies to the same column family: without it, `Date.parse` reads the
  * string as local time.
  */
-function parseUtcMs(s: string | null | undefined): number | null {
+export function parseUtcMs(s: string | null | undefined): number | null {
   if (!s) return null;
   const normalized = /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : `${s.includes('T') ? s : s.replace(' ', 'T')}Z`;
   const ms = Date.parse(normalized);

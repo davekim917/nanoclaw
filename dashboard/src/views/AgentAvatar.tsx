@@ -14,12 +14,21 @@ export function AgentAvatar({
   avatarUrl,
   status,
   size = 36,
+  initials,
 }: {
   name: string;
   avatarUrl?: string | null | undefined;
   /** Absent means "do not draw a state dot" — a face on its own. */
   status?: OfficeState | undefined;
   size?: number;
+  /**
+   * Override the monogram. The default is one letter, which is right at 36px
+   * in a floor plan and ambiguous in a 25px stack, where every agent sharing a
+   * first letter collapses to one glyph. Callers may pass two — the FALLBACK
+   * RULE (real face, else a monogram on the neutral mark) still lives only
+   * here, which is the part that must not fork.
+   */
+  initials?: string;
 }) {
   const src = faceSrc(avatarUrl);
   return (
@@ -28,7 +37,7 @@ export function AgentAvatar({
         <img className="tm-avatar-face" src={src} alt="" width={size} height={size} />
       ) : (
         <span className="tm-avatar-face tm-avatar-mark" data-fallback="true" aria-hidden="true">
-          {name.trim().charAt(0).toUpperCase() || '·'}
+          {initials?.trim() || name.trim().charAt(0).toUpperCase() || '·'}
         </span>
       )}
       {status && <i className={`tm-avatar-dot ${status}`} data-status={status} />}

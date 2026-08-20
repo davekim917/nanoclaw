@@ -94,7 +94,12 @@ export interface SessionSummary {
 const FIVE_MIN_MS = 5 * 60_000;
 const ONE_DAY_MS = 24 * 60 * 60_000;
 
-function deriveContainerStatus(agentGroupId: string, sessionId: string): ContainerStatus {
+/**
+ * Liveness from the heartbeat file's mtime. Exported because DESIGN.md §3.4
+ * binds every new query to the same rule — `sessions.container_status` lags by
+ * up to the host sweep interval and must not be read.
+ */
+export function deriveContainerStatus(agentGroupId: string, sessionId: string): ContainerStatus {
   const hbPath = heartbeatPath(agentGroupId, sessionId);
   let mtimeMs: number;
   try {
@@ -359,7 +364,7 @@ const TRANSCRIPT_TAIL = 50;
  * conversation. Failures (DB missing, file corrupted) return an empty
  * array — the page renders the meta header either way.
  */
-function readSessionTranscript(agentGroupId: string, sessionId: string): SessionTranscriptEntry[] {
+export function readSessionTranscript(agentGroupId: string, sessionId: string): SessionTranscriptEntry[] {
   const out: SessionTranscriptEntry[] = [];
 
   function readSide(side: 'in' | 'out'): void {

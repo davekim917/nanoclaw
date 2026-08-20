@@ -4,6 +4,7 @@ import { AuthGate } from './auth/AuthGate.js';
 import { InboxBoard } from './views/InboxBoard.js';
 import { WorkgroupDashboard } from './views/WorkgroupDashboard.js';
 import { Observatory } from './views/Observatory.js';
+import { ThreadConsole } from './views/console/ThreadConsole.js';
 import { SessionDetail } from './views/SessionDetail.js';
 import { authMe as fetchAuthMe, exchangeToken } from './lib/api.js';
 import { startSSE } from './lib/sse.ts';
@@ -14,13 +15,19 @@ import type { BoardRoute } from './views/BoardShell.js';
 // styles.css (unlayered) is still allowed to win while it is being retired.
 import './theme.css';
 import './styles.css';
+// The Observatory console's own token layer. Everything in it is scoped under
+// `.ncc`, so it cannot reach the legacy surfaces above; it is the only
+// stylesheet here with a dark palette.
+import './views/console/console.css';
 
 // Design-tool tweak variant. Switchable classes documented in styles.css.
 const TWEAK_CLASS = 'tw-no-heat tw-no-grid';
 
-function parseHash(): { route: BoardRoute | 'session'; sessionId?: string } {
+function parseHash(): { route: BoardRoute | 'session' | 'console'; sessionId?: string } {
   const hash = location.hash.slice(1) || '/observatory';
   if (hash.startsWith('/session/')) return { route: 'session', sessionId: hash.slice(9) };
+  // The rebuilt console, alongside the legacy routes. Retiring them is Phase 4.
+  if (hash === '/console') return { route: 'console' };
   if (hash === '/inbox') return { route: 'inbox' };
   if (hash === '/workgroup') return { route: 'workgroup' };
   // Any other/stale hash (including the removed /board, /scheduled and
@@ -112,6 +119,7 @@ function App() {
       {hashState.route === 'observatory' && me && (
         <Observatory authMe={me} route="observatory" onRouteChange={navigate} />
       )}
+      {hashState.route === 'console' && me && <ThreadConsole authMe={me} />}
       {hashState.route === 'session' && hashState.sessionId && me && (
         <SessionDetail authMe={me} sessionId={hashState.sessionId} />
       )}

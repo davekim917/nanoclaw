@@ -1,0 +1,898 @@
+/**
+ * Observatory console — thread-keyed work list (DESIGN.md §3, §5, §10).
+ *
+ *   GET /dashboard/api/threads        — the queue, one row per THREAD
+ *   GET /dashboard/api/threads/:id    — one thread + its merged transcript
+ *
+ * Why this exists alongside `sessions.ts`: `sessions` is keyed on
+ * `(agent_group_id, messaging_group_id, thread_id)`, so a thread carrying six
+ * agents is six rows and a session-keyed list renders ~40% duplicates (§3.1).
+ * `sessions.ts` still backs the inbox board and is untouched.
+ *
+ * Three rules from the design contract are load-bearing here:
+ *
+ *  - **Group by thread, key channels off `thread_id`** (§3.1/§3.2).
+ *    `messaging_groups` holds one row per sibling bot per channel, so grouping
+ *    on `messaging_group_id` lists the same channel once per wired bot.
+ *  - **Never trust `sessions.container_status`** (§3.4) — liveness is
+ *    recomputed from `.heartbeat` mtime, same as `sessions.ts`.
+ *  - **`container_state.provider_status` must surface** (§5). It is written by
+ *    every provider and, before this endpoint, read by nothing.
+ *
+ * Cost control: `container_state` lives in each session's own `outbound.db`,
+ * so reading it means opening a file per session. We open it ONLY for sessions
+ * the host currently holds a live container process for
+ * (`getActiveContainerSessionIds()`, an in-memory Map — see the comment on
+ * {@link liveContainerState}). Everything else on the row comes from one
+ * central-DB query plus a `statSync` per session.
+ */
+import fs from 'fs';
+
+import Database from 'better-sqlite3';
+
+import { getDb } from '../../db/connection.js';
+import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
+import { getContainerState, openOutboundDb, type ContainerState } from '../../db/session-db.js';
+import { outboundDbPath } from '../../session-manager.js';
+import { getActiveContainerSessionIds, resolveAssistantName } from '../../container-runner.js';
+import { readContainerConfig } from '../../container-config.js';
+import { getKnownSlackBots } from '../../channels/slack-mentions.js';
+import { readClaims, type BoardClaim } from '../../claims-board.js';
+import { log } from '../../log.js';
+import type { AgentGroup } from '../../types.js';
+import type { AuthHandler, AuthedRequestContext } from '../router.js';
+import { parseUtcMs } from './observatory.js';
+import {
+  deriveContainerStatus,
+  readSessionTranscript,
+  type ContainerStatus,
+  type SessionTranscriptEntry,
+} from './sessions.js';
+
+/* ─── Channel key (§3.2) ───────────────────────────────────────────────────── */
+
+/** Bucket for thread ids that carry no recoverable channel — see {@link threadChannelKey}. */
+export const UNKNOWN_CHANNEL_KEY = 'unknown';
+
+/**
+ * Platforms whose channel identity needs more than `<platform>:<channel>`.
+ *
+ * Discord addresses a channel as `<platform>:<guild>:<channel>`, which is also
+ * exactly what `messaging_groups.platform_id` stores for it. DESIGN.md §3.2
+ * states the middle segment is the key; that is true for Slack and false for
+ * Discord, where the middle segment is the GUILD and taking it would collapse
+ * every Discord channel in the install into one bucket.
+ */
+const EXTRA_SEGMENT_PLATFORMS: Record<string, number> = { discord: 3 };
+
+/** Deepest channel key we will ever consider (Discord threads carry four segments). */
+const MAX_KEY_SEGMENTS = 4;
+
+/**
+ * The platform channel a thread belongs to, parsed from its `thread_id`.
+ *
+ * `known` is the set of `messaging_groups.platform_id` values, and it is the
+ * authority when it has an answer: the longest prefix of the thread id that is
+ * a real wired channel wins. It is optional so the parser stays unit-testable
+ * and so an un-wired channel still lands somewhere sensible.
+ *
+ * Shapes handled, all present in the live data:
+ *
+ * | thread_id                        | key                     |
+ * |----------------------------------|-------------------------|
+ * | `slack:CTESTCHAN01:1700000000.44` | `slack:CTESTCHAN01`     |
+ * | `slack:DTESTUSER01`              | `slack:DTESTUSER01`     |
+ * | `slack:DTESTUSER02:`             | `slack:DTESTUSER02`     |
+ * | `discord:<guild>:<ch>:<thread>`  | `discord:<guild>:<ch>`  |
+ * | `system:tasks:example-task-0001`  | `system:tasks`          |
+ * | `spawn-abcdef01…` / `1700000000.22` | `unknown`            |
+ *
+ * Never throws. Anything it cannot read degrades to {@link UNKNOWN_CHANNEL_KEY},
+ * which is a real, stable bucket rather than a per-row singleton — a legacy
+ * bare-timestamp thread genuinely has no channel, and inventing one per row
+ * would fill the sidebar with noise.
+ */
+export function threadChannelKey(threadId: string | null | undefined, known?: ReadonlySet<string>): string {
+  if (typeof threadId !== 'string') return UNKNOWN_CHANNEL_KEY;
+  const segments = threadId.trim().split(':');
+  const platform = segments[0];
+  // A bare id (legacy timestamp, `spawn-<hash>`) or an empty leading segment
+  // names no channel. Both are stable, neither is guessable.
+  if (!platform || segments.length < 2 || !segments[1]) return UNKNOWN_CHANNEL_KEY;
+
+  if (known) {
+    for (let n = Math.min(segments.length, MAX_KEY_SEGMENTS); n >= 2; n--) {
+      const candidate = segments.slice(0, n).join(':');
+      if (known.has(candidate)) return candidate;
+    }
+  }
+
+  const want = EXTRA_SEGMENT_PLATFORMS[platform] ?? 2;
+  const depth = Math.min(want, segments.length);
+  // A `discord:<guild>` with no channel segment is not a channel key; fall back
+  // rather than emit a guild id that would swallow the whole server.
+  if (depth < want && want > 2) return UNKNOWN_CHANNEL_KEY;
+  const key = segments.slice(0, depth).join(':');
+  return segments[depth - 1] ? key : UNKNOWN_CHANNEL_KEY;
+}
+
+/* ─── State (§5) ───────────────────────────────────────────────────────────── */
+
+/**
+ * DESIGN.md §5's seven states.
+ *
+ * `idle` was reported back as a gap during this build and §5 now carries it:
+ * the six named states did not partition the space. A thread whose container is
+ * not running, that holds no claim, that is not archived and whose last tool
+ * call finished normally matches none of the others — 57 of 63 threads in a
+ * live 24h window. Rendering those as `done` would be a lie and dropping them
+ * would hide real work, so they get an honest residual label, and no verb.
+ */
+export type ThreadState = 'unassigned' | 'needs_you' | 'stalled' | 'running' | 'parked' | 'done' | 'idle';
+
+/** §5: a tool that started this long ago with nothing newer out is stuck. */
+export const STALL_AFTER_MS = 30 * 60_000;
+
+export interface ThreadStateInput {
+  /** How many sessions back this work item. Zero = an unowned item with no thread yet. */
+  sessionCount: number;
+  /** Every backing session carries `archived_at`. */
+  allArchived: boolean;
+  /** The claim held on this thread, if any. */
+  claimState: BoardClaim['state'] | null;
+  claimNote: string;
+  /** Any backing session is waiting on a human (task `needs_input`, or an unanswered `ask_question`). */
+  needsOperator: boolean;
+  /** Recomputed from heartbeat mtime — never `sessions.container_status` (§3.4). */
+  containerStatus: ContainerStatus;
+  /** `container_state.provider_status`, or null when we did not probe / it is unset. */
+  providerStatus: string | null;
+  toolStartedAtMs: number | null;
+  /** Newest outbound across the thread's sessions, epoch ms. */
+  lastOutputAtMs: number | null;
+  now: number;
+}
+
+/** §5's "waiting on <human>" park note. */
+const WAITING_ON_NOTE = /\bwaiting on\b/i;
+
+/**
+ * Which of the seven states a thread is in. Pure — every input is resolved by
+ * the caller so this is directly testable and so the release board can feed
+ * ownerless items through the same function once §10.3 lands.
+ *
+ * Priority follows §5's own table order, with `unassigned` hoisted: a work item
+ * with no session cannot have a container, a claim or a transcript, so nothing
+ * below it can compute anyway.
+ */
+export function deriveThreadState(input: ThreadStateInput): ThreadState {
+  if (input.sessionCount === 0) return 'unassigned';
+
+  if (input.claimState === 'parked' && WAITING_ON_NOTE.test(input.claimNote)) return 'needs_you';
+  if (input.needsOperator) return 'needs_you';
+
+  // §5.1: this must NOT depend on `current_tool` being readable. Codex reports
+  // the generic `CodexItem` and roughly half the fleet is non-Claude, so the
+  // rule is age-only. `provider_status = 'failed'` is the same operator
+  // situation reached a different way — a container that needs killing.
+  if (input.providerStatus === 'failed') return 'stalled';
+  if (
+    input.toolStartedAtMs !== null &&
+    input.now - input.toolStartedAtMs > STALL_AFTER_MS &&
+    (input.lastOutputAtMs === null || input.lastOutputAtMs <= input.toolStartedAtMs)
+  ) {
+    return 'stalled';
+  }
+
+  // §5 says "heartbeat fresh AND a tool in flight". Reported as underspecified:
+  // taken literally, a healthy container between tool calls has no state at
+  // all. Liveness is the gate here; whether a tool is in flight rides on
+  // `tool_started_at` / `current_tool`, which is what §6's activity rule
+  // animates from.
+  if (input.containerStatus === 'running' || input.providerStatus === 'active') return 'running';
+
+  if (input.claimState === 'parked') return 'parked';
+  if (input.allArchived) return 'done';
+  return 'idle';
+}
+
+/* ─── Wire shapes ──────────────────────────────────────────────────────────── */
+
+export interface ThreadParticipant {
+  agent_group_id: string;
+  name: string;
+  avatarUrl: string | null;
+  /**
+   * Resolved through `resolveProviderName` (session → container config →
+   * 'claude'). On the wire because §5.1 makes provider a rendering concern:
+   * a Codex row's `current_tool` is the generic `CodexItem`, so the live line
+   * has to know not to promise a readable step name.
+   */
+  provider: string;
+}
+
+export interface ThreadSummary {
+  /** Durable identity (§3.1). Synthetic `session:<id>` when the session has no thread. */
+  thread_id: string;
+  /** True when `thread_id` above is synthetic — the session's `sessions.thread_id` is NULL. */
+  synthetic: boolean;
+  channel_key: string;
+  /** Human channel name resolved from `messaging_groups`; falls back to the key's last segment. */
+  channel_name: string;
+  title: string | null;
+  /** Most-recent speaker first. */
+  participants: ThreadParticipant[];
+  /**
+   * ISO-8601 UTC, ALWAYS — normalized on the way out.
+   * `sessions.last_outbound_at` is stored naive (`YYYY-MM-DD HH:MM:SS`), and a
+   * browser reading that with `new Date()` silently shifts it by the viewer's
+   * offset. Nothing naive is allowed onto this wire.
+   */
+  last_activity_at: string | null;
+  state: ThreadState;
+  session_ids: string[];
+  /** Freshest liveness across the thread's sessions, from heartbeat mtime. */
+  container_status: ContainerStatus;
+  /** `container_state.provider_status` — null when no session was probed or the column is unset. */
+  provider_status: string | null;
+  current_tool: string | null;
+  /** ISO-8601 UTC, normalized — see {@link ThreadSummary.last_activity_at}. */
+  tool_started_at: string | null;
+}
+
+/** Anything that leaves this module as a timestamp goes out as ISO-8601 UTC. */
+function isoOrNull(s: string | null | undefined): string | null {
+  const ms = parseUtcMs(s);
+  return ms === null ? null : new Date(ms).toISOString();
+}
+
+export interface ThreadTranscriptEntry extends SessionTranscriptEntry {
+  session_id: string;
+  agent_group_id: string;
+  agent_name: string;
+}
+
+/* ─── Query ────────────────────────────────────────────────────────────────── */
+
+interface ThreadSessionRow {
+  id: string;
+  agent_group_id: string;
+  messaging_group_id: string | null;
+  thread_id: string | null;
+  agent_provider: string | null;
+  title: string | null;
+  title_generated_at: string | null;
+  last_active: string | null;
+  last_outbound_at: string | null;
+  last_outbound_kind: string | null;
+  archived_at: string | null;
+  created_at: string;
+  attached_task_status: string | null;
+  attached_task_needs_input: number | null;
+}
+
+const DEFAULT_SINCE_HOURS = 168; // 7d — §3.3's stated working set
+const MAX_SINCE_HOURS = 24 * 90;
+const DEFAULT_LIMIT = 200;
+const MAX_LIMIT = 1000;
+
+/**
+ * Every active session in scope whose newest activity is inside the window.
+ *
+ * `datetime()` wraps both sides because the columns are NOT one format:
+ * `last_active` / `created_at` are ISO-8601 with `Z`, while `last_outbound_at`
+ * is written naive by `bumpLastOutbound`. The same mismatch is why ordering
+ * happens in JS below (`parseUtcMs`) rather than in SQL — a string comparison
+ * between the two shapes silently sorts every ISO value above every naive one.
+ */
+function selectScopedSessions(
+  ctx: AuthedRequestContext,
+  opts: { groupId: string | null; includeArchived: boolean; sinceHours: number; threadId?: string | null },
+): ThreadSessionRow[] {
+  const conditions: string[] = ["s.status = 'active'"];
+  const values: unknown[] = [];
+
+  if (!ctx.scopes.no_filter) {
+    const ids = ctx.scopes.allowed_group_ids;
+    if (ids.length === 0) return [];
+    conditions.push(`s.agent_group_id IN (${ids.map(() => '?').join(', ')})`);
+    values.push(...ids);
+  }
+  if (opts.groupId) {
+    // §2a: an out-of-scope group_id yields zero rows rather than a 403.
+    conditions.push('s.agent_group_id = ?');
+    values.push(opts.groupId);
+  }
+  if (!opts.includeArchived) conditions.push('s.archived_at IS NULL');
+
+  if (opts.threadId) {
+    // Detail path: one named thread, no time window. The synthetic key for a
+    // NULL-thread session is built the same way `groupByThread` builds it, so
+    // `session:<id>` addresses that row directly.
+    conditions.push(`COALESCE(s.thread_id, 'session:' || s.id) = ?`);
+    values.push(opts.threadId);
+  } else {
+    conditions.push(`datetime(COALESCE(s.last_outbound_at, s.last_active, s.created_at)) >= datetime(?)`);
+    values.push(new Date(Date.now() - opts.sinceHours * 3_600_000).toISOString());
+  }
+
+  // Same never-engaged filter as sessions.ts: an inbound that never woke an
+  // agent mints a session row and would otherwise clutter the queue forever.
+  conditions.push("(s.last_outbound_at IS NOT NULL OR s.container_status <> 'stopped' OR t.task_id IS NOT NULL)");
+
+  const sql = `
+    SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id, s.agent_provider,
+           s.title, s.title_generated_at, s.last_active, s.last_outbound_at, s.last_outbound_kind,
+           s.archived_at, s.created_at,
+           t.status      AS attached_task_status,
+           t.needs_input AS attached_task_needs_input
+      FROM sessions s
+ LEFT JOIN (
+              SELECT task_id, child_session_id, status, needs_input, admitted_at,
+                     ROW_NUMBER() OVER (PARTITION BY child_session_id ORDER BY admitted_at DESC) AS rn
+                FROM tasks
+               WHERE child_session_id IS NOT NULL
+                 AND status IN ('pending', 'running')
+            ) t ON t.child_session_id = s.id AND t.rn = 1
+     WHERE ${conditions.join(' AND ')}
+  `;
+  return getDb()
+    .prepare(sql)
+    .all(...(values as [])) as ThreadSessionRow[];
+}
+
+/** `messaging_groups.platform_id` → friendly name, and the key set §3.2 parses against. */
+function readChannelDirectory(): { known: Set<string>; names: Map<string, string> } {
+  const known = new Set<string>();
+  const names = new Map<string, string>();
+  try {
+    const rows = getDb().prepare('SELECT platform_id, name FROM messaging_groups').all() as {
+      platform_id: string;
+      name: string | null;
+    }[];
+    for (const r of rows) {
+      known.add(r.platform_id);
+      if (r.name && !names.has(r.platform_id)) names.set(r.platform_id, r.name);
+    }
+  } catch (err) {
+    log.warn('threads: could not read messaging_groups directory', { err });
+  }
+  return { known, names };
+}
+
+/** Last segment of a channel key — the honest fallback when no wiring names it. */
+function channelKeyLabel(key: string): string {
+  const segments = key.split(':');
+  return segments[segments.length - 1] || key;
+}
+
+/* ─── Per-session probes ───────────────────────────────────────────────────── */
+
+/**
+ * `container_state` for one session, or null.
+ *
+ * Callers MUST gate this on the session actually having a live container — see
+ * {@link liveContainerState}. Opening a per-session SQLite file is the single
+ * most expensive thing on this path.
+ */
+function readContainerState(agentGroupId: string, sessionId: string): ContainerState | null {
+  const p = outboundDbPath(agentGroupId, sessionId);
+  if (!fs.existsSync(p)) return null;
+  let db: Database.Database | null = null;
+  try {
+    db = openOutboundDb(p);
+    return getContainerState(db);
+  } catch (err) {
+    log.warn('threads: container_state probe failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
+/**
+ * The bound (§4 of the brief, DESIGN §3.3/§4.1).
+ *
+ * We probe `container_state` only for sessions the host is currently running a
+ * container process for. `getActiveContainerSessionIds()` is an in-memory Map
+ * read in `container-runner.ts` — zero I/O.
+ *
+ * **DO NOT "optimize" this to a fresh-heartbeat gate.** That is the obvious
+ * next narrowing and it silently deletes stall detection. The runner touches
+ * `.heartbeat` once per provider event (`container/agent-runner/src/poll-loop.ts`,
+ * the `touchHeartbeat()` call right after `handleEvent`), so a tool wedged for
+ * 30 minutes emits no events and therefore no touches: **a stalled session's
+ * heartbeat is stale by construction.** `host-sweep.ts` relies on exactly that
+ * — a stale heartbeat is what makes it consult `container_state` at all. Gate
+ * on freshness and the only rows you would ever probe are the healthy ones.
+ *
+ * A session with no live container cannot be `running` and cannot be `stalled`
+ * either — there is nothing left for the Kill verb to kill, and its
+ * `container_state` row is a fossil from a container that already exited.
+ *
+ * Working set on the live install: tens of live containers against ~1,900
+ * sessions in the 7d window, so this opens roughly 1% of the files a naive
+ * implementation would.
+ */
+function liveContainerState(
+  rows: ThreadSessionRow[],
+  liveIds: ReadonlySet<string>,
+  probe: (agentGroupId: string, sessionId: string) => ContainerState | null,
+): Map<string, ContainerState> {
+  const out = new Map<string, ContainerState>();
+  for (const row of rows) {
+    if (!liveIds.has(row.id)) continue;
+    const state = probe(row.agent_group_id, row.id);
+    if (state) out.set(row.id, state);
+  }
+  return out;
+}
+
+/* ─── Agent identity (§10.2) ───────────────────────────────────────────────── */
+
+export interface AgentIdentity {
+  agent_group_id: string;
+  name: string;
+  canonicalName: string;
+  avatarUrl: string | null;
+  provider: string;
+}
+
+interface IdentityKey {
+  agentGroupId: string;
+  messagingGroupId: string | null;
+  sessionProvider: string | null;
+}
+
+const identityKey = (k: IdentityKey): string => `${k.agentGroupId}|${k.messagingGroupId ?? ''}`;
+
+/**
+ * Identity for exactly the agent groups that appear in the page.
+ *
+ * Keyed on `(agent_group_id, messaging_group_id)` because the same agent shows
+ * a different bot display name per channel — resolving with `null` (what
+ * `ObservatoryAgent.name` does) would print the infrastructure name on a row
+ * whose Slack message is signed with the bot's channel display name — the two
+ * routinely differ. There are ~20 agents and a handful of channels each,
+ * so the memo is small and every miss costs one `readContainerConfig` read.
+ */
+async function resolveIdentities(
+  pairs: Array<IdentityKey>,
+  avatarByChannelType: (channelType: string) => string | null,
+): Promise<Map<string, AgentIdentity>> {
+  const wanted = new Map<string, IdentityKey>();
+  for (const p of pairs) wanted.set(identityKey(p), p);
+  if (wanted.size === 0) return new Map();
+
+  const agentIds = [...new Set([...wanted.values()].map((p) => p.agentGroupId))];
+  const groups = new Map(
+    (
+      getDb()
+        .prepare(`SELECT * FROM agent_groups WHERE id IN (${agentIds.map(() => '?').join(', ')})`)
+        .all(...agentIds) as AgentGroup[]
+    ).map((g) => [g.id, g]),
+  );
+
+  // One query for every participating agent's wired channel types, then the
+  // avatar registry lookup — the per-agent query observatory.ts runs would be
+  // ~20 round trips here.
+  const avatars = new Map<string, string | null>();
+  try {
+    const rows = getDb()
+      .prepare(
+        `SELECT mga.agent_group_id AS agent_group_id, mg.channel_type AS channel_type
+           FROM messaging_group_agents mga
+           JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+          WHERE mga.agent_group_id IN (${agentIds.map(() => '?').join(', ')})`,
+      )
+      .all(...agentIds) as { agent_group_id: string; channel_type: string }[];
+    for (const r of rows) {
+      if (avatars.get(r.agent_group_id)) continue;
+      avatars.set(r.agent_group_id, avatarByChannelType(r.channel_type));
+    }
+  } catch (err) {
+    log.warn('threads: avatar lookup failed', { err });
+  }
+
+  const out = new Map<string, AgentIdentity>();
+  await Promise.all(
+    [...wanted.entries()].map(async ([key, pair]) => {
+      const group = groups.get(pair.agentGroupId);
+      if (!group) return;
+      let name = group.name;
+      // `sessions.agent_provider` → `container_configs.provider` → 'claude',
+      // via the one function that owns that precedence. NOT
+      // `agent_groups.agent_provider`, which is @deprecated in types.ts.
+      let provider = resolveProviderName(pair.sessionProvider, getContainerConfig(group.id)?.provider);
+      try {
+        const config = readContainerConfig(group.folder);
+        // container.json is authoritative for the runtime (see CLAUDE.md
+        // "Container Config"), so it wins over the DB projection when set.
+        provider = resolveProviderName(pair.sessionProvider, config.provider ?? provider);
+        name = await resolveAssistantName(group, config, pair.messagingGroupId);
+      } catch (err) {
+        // A missing container.json must never blank a row — the infrastructure
+        // name is always a correct, if less friendly, answer.
+        log.warn('threads: identity resolution fell back to agent_groups.name', {
+          agentGroupId: pair.agentGroupId,
+          err,
+        });
+      }
+      out.set(key, {
+        agent_group_id: group.id,
+        name,
+        canonicalName: group.name,
+        avatarUrl: avatars.get(group.id) ?? null,
+        provider,
+      });
+    }),
+  );
+  return out;
+}
+
+/* ─── Claims (§5) ──────────────────────────────────────────────────────────── */
+
+/**
+ * Claims for every workgroup the page touches, indexed by thread.
+ *
+ * Three of the states (`needs_you`, `parked`, and half of `done`) are
+ * claim-derived, and claims are per-workgroup files rather than DB rows. One
+ * directory scan per workgroup — a handful — not one per thread.
+ */
+function readClaimsByThread(agentGroupIds: string[], now: number, claimsRoot?: string): Map<string, BoardClaim> {
+  const byThread = new Map<string, BoardClaim>();
+  if (agentGroupIds.length === 0) return byThread;
+  let workgroupIds: string[];
+  try {
+    workgroupIds = (
+      getDb()
+        .prepare(
+          `SELECT DISTINCT workgroup_id FROM agent_groups
+            WHERE workgroup_id IS NOT NULL AND id IN (${agentGroupIds.map(() => '?').join(', ')})`,
+        )
+        .all(...agentGroupIds) as { workgroup_id: string }[]
+    ).map((r) => r.workgroup_id);
+  } catch (err) {
+    log.warn('threads: workgroup lookup for claims failed', { err });
+    return byThread;
+  }
+  for (const wg of workgroupIds) {
+    const claims = claimsRoot !== undefined ? readClaims(wg, now, claimsRoot) : readClaims(wg, now);
+    for (const c of claims) {
+      if (!c.threadId) continue;
+      const existing = byThread.get(c.threadId);
+      // Parked outranks a live claim on the same thread: it is the one that
+      // names a state the operator has to act on.
+      if (!existing || (existing.state !== 'parked' && c.state === 'parked')) byThread.set(c.threadId, c);
+    }
+  }
+  return byThread;
+}
+
+/* ─── Assembly ─────────────────────────────────────────────────────────────── */
+
+/** Liveness ordering: the freshest wins when a thread's sessions disagree. */
+const STATUS_RANK: Record<ContainerStatus, number> = { running: 3, idle: 2, stale: 1, unknown: 0 };
+
+export interface ThreadListDeps {
+  now?: number;
+  /** Session ids the host currently holds a container process for. */
+  activeContainerSessionIds?: () => string[];
+  containerStatus?: (agentGroupId: string, sessionId: string) => ContainerStatus;
+  containerState?: (agentGroupId: string, sessionId: string) => ContainerState | null;
+  /** Injected claims root for tests; defaults to readClaims' own live base dir. */
+  claimsRoot?: string;
+  avatarByChannelType?: (channelType: string) => string | null;
+}
+
+function activityMs(row: ThreadSessionRow): number {
+  return Math.max(
+    parseUtcMs(row.last_outbound_at) ?? -Infinity,
+    parseUtcMs(row.last_active) ?? -Infinity,
+    parseUtcMs(row.created_at) ?? -Infinity,
+  );
+}
+
+/** §5 / sessions.ts: this session is sitting on an unanswered question. */
+function sessionNeedsOperator(row: ThreadSessionRow): boolean {
+  if (row.attached_task_needs_input === 1) return true;
+  return (
+    row.last_outbound_kind === 'chat-sdk:ask_question' &&
+    (parseUtcMs(row.last_active) ?? 0) < (parseUtcMs(row.last_outbound_at) ?? 0)
+  );
+}
+
+interface ThreadAccum {
+  threadId: string;
+  synthetic: boolean;
+  rows: ThreadSessionRow[];
+}
+
+/** Group scoped session rows by thread id, folding NULL threads to `session:<id>`. */
+function groupByThread(rows: ThreadSessionRow[]): ThreadAccum[] {
+  const byThread = new Map<string, ThreadAccum>();
+  for (const row of rows) {
+    // A NULL thread_id is real work — a task session that never got a platform
+    // thread — so it gets a synthetic per-session key rather than being dropped
+    // or folded into one giant "no thread" row.
+    const synthetic = !row.thread_id;
+    const key = row.thread_id ?? `session:${row.id}`;
+    const existing = byThread.get(key);
+    if (existing) existing.rows.push(row);
+    else byThread.set(key, { threadId: key, synthetic, rows: [row] });
+  }
+  return [...byThread.values()];
+}
+
+export async function buildThreadList(
+  ctx: AuthedRequestContext,
+  opts: {
+    groupId: string | null;
+    includeArchived: boolean;
+    sinceHours: number;
+    limit: number;
+    threadId?: string | null;
+  },
+  deps: ThreadListDeps = {},
+): Promise<{ threads: ThreadSummary[] }> {
+  const now = deps.now ?? Date.now();
+  const statusOf = deps.containerStatus ?? deriveContainerStatus;
+  const probeState = deps.containerState ?? readContainerState;
+  const avatarLookup = deps.avatarByChannelType ?? ((ct: string) => getKnownSlackBots().get(ct)?.imageUrl ?? null);
+
+  const rows = selectScopedSessions(ctx, opts);
+  if (rows.length === 0) return { threads: [] };
+
+  const { known, names } = readChannelDirectory();
+  const grouped = groupByThread(rows)
+    .map((t) => ({ ...t, activity: Math.max(...t.rows.map(activityMs)) }))
+    .sort((a, b) => b.activity - a.activity)
+    .slice(0, opts.limit);
+
+  const pagedRows = grouped.flatMap((t) => t.rows);
+  const liveIds = new Set((deps.activeContainerSessionIds ?? getActiveContainerSessionIds)());
+  const states = liveContainerState(pagedRows, liveIds, probeState);
+  const claims = readClaimsByThread([...new Set(pagedRows.map((r) => r.agent_group_id))], now, deps.claimsRoot);
+  const identities = await resolveIdentities(
+    pagedRows.map((r) => ({
+      agentGroupId: r.agent_group_id,
+      messagingGroupId: r.messaging_group_id,
+      sessionProvider: r.agent_provider,
+    })),
+    avatarLookup,
+  );
+
+  const threads: ThreadSummary[] = grouped.map((thread) => {
+    const ordered = [...thread.rows].sort((a, b) => activityMs(b) - activityMs(a));
+
+    const participants: ThreadParticipant[] = [];
+    const seenAgents = new Set<string>();
+    for (const row of ordered) {
+      if (seenAgents.has(row.agent_group_id)) continue;
+      seenAgents.add(row.agent_group_id);
+      const id = identities.get(
+        identityKey({
+          agentGroupId: row.agent_group_id,
+          messagingGroupId: row.messaging_group_id,
+          sessionProvider: row.agent_provider,
+        }),
+      );
+      participants.push({
+        agent_group_id: row.agent_group_id,
+        name: id?.name ?? row.agent_group_id,
+        avatarUrl: id?.avatarUrl ?? null,
+        provider: id?.provider ?? resolveProviderName(row.agent_provider, null),
+      });
+    }
+
+    // §4: the title is generated per session, so siblings on one thread each
+    // hold their own. The freshest one wins; `title_generated_at` is the stamp
+    // the title sweep writes, and it falls back to session activity when an
+    // older row predates that column being populated.
+    let title: string | null = null;
+    let titleAt = -Infinity;
+    for (const row of ordered) {
+      if (!row.title) continue;
+      const at = parseUtcMs(row.title_generated_at) ?? activityMs(row);
+      if (at > titleAt) {
+        titleAt = at;
+        title = row.title;
+      }
+    }
+
+    let containerStatus: ContainerStatus = 'unknown';
+    for (const row of ordered) {
+      const s = statusOf(row.agent_group_id, row.id);
+      if (STATUS_RANK[s] > STATUS_RANK[containerStatus]) containerStatus = s;
+    }
+
+    // The most interesting container_state across the thread: a failed provider
+    // outranks a tool in flight, which outranks anything idle.
+    let picked: ContainerState | null = null;
+    for (const row of ordered) {
+      const s = states.get(row.id);
+      if (!s) continue;
+      if (!picked) picked = s;
+      else if (s.provider_status === 'failed') picked = s;
+      else if (picked.provider_status !== 'failed' && !picked.tool_started_at && s.tool_started_at) picked = s;
+    }
+
+    const lastOutputAtMs = ordered.reduce<number | null>((acc, row) => {
+      const ms = parseUtcMs(row.last_outbound_at);
+      return ms !== null && (acc === null || ms > acc) ? ms : acc;
+    }, null);
+    const lastActivity = ordered[0]
+      ? (ordered[0].last_outbound_at ?? ordered[0].last_active ?? ordered[0].created_at)
+      : null;
+    const claim = claims.get(thread.threadId) ?? null;
+    const channelKey = threadChannelKey(thread.synthetic ? null : thread.threadId, known);
+
+    return {
+      thread_id: thread.threadId,
+      synthetic: thread.synthetic,
+      channel_key: channelKey,
+      channel_name: names.get(channelKey) ?? channelKeyLabel(channelKey),
+      title,
+      participants,
+      last_activity_at: isoOrNull(lastActivity),
+      state: deriveThreadState({
+        sessionCount: ordered.length,
+        allArchived: ordered.every((r) => r.archived_at !== null),
+        claimState: claim?.state ?? null,
+        claimNote: claim?.note ?? '',
+        needsOperator: ordered.some(sessionNeedsOperator),
+        containerStatus,
+        providerStatus: picked?.provider_status ?? null,
+        toolStartedAtMs: parseUtcMs(picked?.tool_started_at),
+        lastOutputAtMs,
+        now,
+      }),
+      session_ids: ordered.map((r) => r.id),
+      container_status: containerStatus,
+      provider_status: picked?.provider_status ?? null,
+      current_tool: picked?.current_tool ?? null,
+      tool_started_at: isoOrNull(picked?.tool_started_at),
+    };
+  });
+
+  return { threads };
+}
+
+export const threadsHandler: AuthHandler = async (req, _params, ctx) => {
+  const url = new URL(req.url);
+  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '', 10) || DEFAULT_LIMIT, MAX_LIMIT);
+  const sinceHours = Math.min(
+    parseInt(url.searchParams.get('since_hours') ?? '', 10) || DEFAULT_SINCE_HOURS,
+    MAX_SINCE_HOURS,
+  );
+  const includeArchivedRaw = url.searchParams.get('include_archived');
+  try {
+    const body = await buildThreadList(ctx, {
+      groupId: url.searchParams.get('group_id'),
+      includeArchived: includeArchivedRaw === '1' || includeArchivedRaw === 'true',
+      sinceHours,
+      limit,
+    });
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  } catch (err) {
+    log.warn('threadsHandler: failed', { err });
+    return new Response(JSON.stringify({ error: 'internal_error' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+};
+
+/* ─── Thread detail — merged transcript (§10.1) ────────────────────────────── */
+
+const THREAD_TRANSCRIPT_TAIL = 200;
+
+/**
+ * One thread's transcript, merged across every participating session.
+ *
+ * Ordered by TIMESTAMP, not `seq`: `seq` is unique within a session only, so
+ * two agents on one thread both hold a `seq` 7 that mean different moments.
+ * Ties break on session id then seq purely so the order is deterministic across
+ * requests — two messages sharing a millisecond have no true order.
+ */
+export function mergeThreadTranscript(
+  sessions: Array<{ sessionId: string; agentGroupId: string; agentName: string }>,
+  readOne: (agentGroupId: string, sessionId: string) => SessionTranscriptEntry[] = readSessionTranscript,
+  tail: number = THREAD_TRANSCRIPT_TAIL,
+): ThreadTranscriptEntry[] {
+  const merged: ThreadTranscriptEntry[] = [];
+  for (const s of sessions) {
+    for (const entry of readOne(s.agentGroupId, s.sessionId)) {
+      merged.push({ ...entry, session_id: s.sessionId, agent_group_id: s.agentGroupId, agent_name: s.agentName });
+    }
+  }
+  merged.sort((a, b) => {
+    const at = parseUtcMs(a.timestamp) ?? 0;
+    const bt = parseUtcMs(b.timestamp) ?? 0;
+    if (at !== bt) return at - bt;
+    if (a.session_id !== b.session_id) return a.session_id < b.session_id ? -1 : 1;
+    return a.seq - b.seq;
+  });
+  // Keep the TAIL of the conversation — the newest messages — while returning
+  // it oldest-first, which is the order a transcript reads in.
+  return merged.slice(-tail);
+}
+
+export interface ThreadDetailDeps extends ThreadListDeps {
+  transcript?: (agentGroupId: string, sessionId: string) => SessionTranscriptEntry[];
+}
+
+export async function buildThreadDetail(
+  threadId: string,
+  ctx: AuthedRequestContext,
+  deps: ThreadDetailDeps = {},
+): Promise<{ thread: ThreadSummary; transcript: ThreadTranscriptEntry[] } | null> {
+  // Reuse the list path so the detail header can never disagree with the row
+  // the operator clicked — but scoped to this one thread, so the detail read
+  // never pays for the whole queue. `include_archived` is on: an archived
+  // thread must still be readable by direct link.
+  const { threads } = await buildThreadList(
+    ctx,
+    { groupId: null, includeArchived: true, sinceHours: DEFAULT_SINCE_HOURS, limit: 1, threadId },
+    deps,
+  );
+  const thread = threads[0];
+  if (!thread) return null;
+
+  const byName = new Map(thread.participants.map((p) => [p.agent_group_id, p.name]));
+  const rows = getDb()
+    .prepare(`SELECT id, agent_group_id FROM sessions WHERE id IN (${thread.session_ids.map(() => '?').join(', ')})`)
+    .all(...thread.session_ids) as { id: string; agent_group_id: string }[];
+
+  return {
+    thread,
+    transcript: mergeThreadTranscript(
+      rows.map((r) => ({
+        sessionId: r.id,
+        agentGroupId: r.agent_group_id,
+        agentName: byName.get(r.agent_group_id) ?? r.agent_group_id,
+      })),
+      deps.transcript,
+    ),
+  };
+}
+
+export const threadsDetailHandler: AuthHandler = async (_req, params, ctx) => {
+  // Thread ids carry `:` and `.`, both legal unencoded path characters — but a
+  // client that percent-encodes them must work too.
+  const raw = params['id'] ?? '';
+  let threadId = raw;
+  try {
+    threadId = decodeURIComponent(raw);
+  } catch {
+    /* not percent-encoded — use it verbatim */
+  }
+  if (!threadId) {
+    return new Response(JSON.stringify({ error: 'thread_not_found' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  try {
+    const body = await buildThreadDetail(threadId, ctx);
+    // §2a: nonexistent and out-of-scope collapse to the same 404 — the list
+    // path already applied the scope filter, so a thread the caller may not see
+    // simply is not in it.
+    if (!body) {
+      return new Response(JSON.stringify({ error: 'thread_not_found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  } catch (err) {
+    log.warn('threadsDetailHandler: failed', { threadId, err });
+    return new Response(JSON.stringify({ error: 'internal_error' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+};

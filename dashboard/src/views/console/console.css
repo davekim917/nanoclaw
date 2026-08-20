@@ -1,0 +1,584 @@
+/* Observatory console — "Terminal neutral" (DESIGN.md §7).
+ *
+ * Light-first; dark is a designed palette, not an inversion. Every rule below
+ * is scoped under `.ncc` so this file cannot reach the legacy Observatory /
+ * inbox / workgroup surfaces, which still run on theme.css's single light
+ * theme. Retiring those is Phase 4, not this file's business.
+ *
+ * DARK MODE HAS TWO TRIGGERS AND THEY ARE NOT INTERCHANGEABLE:
+ *
+ *   1. `@media (prefers-color-scheme: dark)`, guarded by
+ *      `:root:not([data-theme="light"])` — the system setting, which an
+ *      explicit LIGHT choice must be able to override.
+ *   2. `:root[data-theme="dark"]` — the explicit toggle, which must win in a
+ *      light system too.
+ *
+ * The FULL light palette is declared once on bare `:root`; the dark blocks
+ * redefine only the tokens that change. A colour whose only definition lives
+ * inside a media query has no value at all when that query does not match.
+ *
+ * Type (DESIGN §7): Public Sans for human prose, JetBrains Mono for every
+ * machine-produced value — timestamps, elapsed, tool names, counts, ids.
+ * Monospace for data is functional: it makes numbers comparable down a column.
+ * Both self-hosted; Inter / Roboto / Arial / Fraunces appear nowhere, fallback
+ * stacks included.
+ */
+@import '@fontsource-variable/public-sans';
+@import '@fontsource-variable/jetbrains-mono';
+
+:root {
+  --ncc-font-sans: 'Public Sans Variable', ui-sans-serif, system-ui, 'Segoe UI', 'Helvetica Neue', sans-serif;
+  --ncc-font-mono: 'JetBrains Mono Variable', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* Surfaces — true zero-hue grey. No warm cast, no blue cast (§7). */
+  --ncc-page: #f7f7f7;
+  --ncc-topbar: #f3f3f3;
+  --ncc-sidebar: #f0f0f0;
+  --ncc-wash: #ffe0da;
+  --ncc-border: #cecece;
+  --ncc-chip: #dedede;
+  --ncc-wash-chip: #eacfca;
+  --ncc-divider: #dfdfdf;
+
+  /* Ink. `--ncc-muted` is the FLOOR: at 4.47:1 on the chip surface it fails AA,
+     so chips carry `--ncc-secondary` and never muted. See §7.2 note below. */
+  --ncc-ink: #141414;
+  --ncc-secondary: #525252;
+  --ncc-muted: #636363;
+
+  /* Two functional signals only (§7.1): one "wants you", one "live". Never a
+     third status hue without amending DESIGN.md. */
+  --ncc-attention: #b32322;
+  --ncc-live: #006c24;
+
+  /* Decorative only — icon strokes. No text-contrast requirement. */
+  --ncc-decor: #808080;
+
+  /* Inverse-filled chip (verb button, triage button). */
+  --ncc-solid: #141414;
+  --ncc-solid-ink: #f7f7f7;
+
+  /* §7.2, THE RULE: text on an ACCENT-filled chip. White clears AA on the
+     light accents (6.16:1 / 6.18:1) and fails hard on the dark ones
+     (2.88:1 / 2.72:1), so dark flips this to near-black. It is a token, not a
+     per-component decision, precisely because it ships broken silently. */
+  --ncc-on-accent: #f7f7f7;
+
+  --ncc-focus: #141414;
+}
+
+/* Trigger 1 — the system setting, yielding to an explicit light choice. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --ncc-page: #0d0d0d;
+    --ncc-topbar: #141414;
+    --ncc-sidebar: #171717;
+    --ncc-wash: #2c110f;
+    --ncc-border: #292929;
+    --ncc-chip: #292929;
+    --ncc-wash-chip: #3a1a17;
+    --ncc-divider: #292929;
+    --ncc-ink: #dedede;
+    --ncc-secondary: #989898;
+    --ncc-muted: #868686;
+    --ncc-attention: #f66e5c;
+    --ncc-live: #45b164;
+    --ncc-solid: #dedede;
+    --ncc-solid-ink: #0d0d0d;
+    --ncc-on-accent: #0d0d0d;
+    --ncc-focus: #dedede;
+  }
+}
+
+/* Trigger 2 — the explicit toggle, which must win in a light system too. */
+:root[data-theme='dark'] {
+  --ncc-page: #0d0d0d;
+  --ncc-topbar: #141414;
+  --ncc-sidebar: #171717;
+  --ncc-wash: #2c110f;
+  --ncc-border: #292929;
+  --ncc-chip: #292929;
+  --ncc-wash-chip: #3a1a17;
+  --ncc-divider: #292929;
+  --ncc-ink: #dedede;
+  --ncc-secondary: #989898;
+  --ncc-muted: #868686;
+  --ncc-attention: #f66e5c;
+  --ncc-live: #45b164;
+  --ncc-solid: #dedede;
+  --ncc-solid-ink: #0d0d0d;
+  --ncc-on-accent: #0d0d0d;
+  --ncc-focus: #dedede;
+}
+
+/* ── Shell ─────────────────────────────────────────────────────────────── */
+
+.ncc {
+  /* index.html pins `color-scheme: light` for the legacy theme's first paint;
+     the console re-declares it on its own root so scrollbars and form controls
+     follow the palette actually on screen. */
+  color-scheme: light;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--ncc-page);
+  color: var(--ncc-ink);
+  font-family: var(--ncc-font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .ncc { color-scheme: dark; }
+}
+:root[data-theme='dark'] .ncc { color-scheme: dark; }
+
+.ncc :focus-visible {
+  outline: 2px solid var(--ncc-focus);
+  outline-offset: 1px;
+}
+
+.ncc-mono {
+  font-family: var(--ncc-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Top bar */
+.ncc-top {
+  flex-shrink: 0;
+  min-height: 44px;
+  border-bottom: 1px solid var(--ncc-border);
+  background: var(--ncc-topbar);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+}
+.ncc-brand {
+  font-size: 13.5px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--ncc-ink);
+}
+.ncc-spacer { flex-grow: 1; }
+
+.ncc-select,
+.ncc-search {
+  font-family: var(--ncc-font-mono);
+  font-size: 12px;
+  color: var(--ncc-secondary);
+  background: var(--ncc-page);
+  border: 1px solid var(--ncc-border);
+  border-radius: 0;
+  padding: 4px 8px;
+  min-height: 28px;
+}
+.ncc-search { width: 214px; }
+.ncc-search::placeholder { color: var(--ncc-muted); }
+
+/* The one inverse-filled chip in the chrome. */
+.ncc-solid-btn {
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ncc-solid-ink);
+  background: var(--ncc-solid);
+  border: 1px solid var(--ncc-solid);
+  border-radius: 0;
+  padding: 5px 10px;
+  min-height: 28px;
+  cursor: pointer;
+}
+
+/* §7.2's filled-accent chip. `--ncc-on-accent` is white in light (6.16:1) and
+   near-black in dark, where white would be 2.88:1 — that flip is the rule. */
+.ncc-attn-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ncc-on-accent);
+  background: var(--ncc-attention);
+  padding: 5px 10px;
+  min-height: 28px;
+}
+
+.ncc-body {
+  flex-grow: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+/* ── Sidebar ───────────────────────────────────────────────────────────── */
+
+.ncc-side {
+  width: 200px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--ncc-border);
+  background: var(--ncc-sidebar);
+  display: flex;
+  flex-direction: column;
+  padding: 13px 0;
+  overflow-y: auto;
+}
+.ncc-side-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--ncc-font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ncc-muted);
+  padding: 4px 14px 5px;
+  margin: 0;
+}
+.ncc-side-head .lbl { flex-grow: 1; }
+.ncc-side-gap { height: 13px; flex-shrink: 0; }
+
+.ncc-side-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 14px;
+  background: transparent;
+  border: 0;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+  text-align: left;
+  font-family: inherit;
+  font-size: 12.5px;
+  color: var(--ncc-ink);
+  cursor: pointer;
+  text-decoration: none;
+}
+.ncc-side-item .lbl {
+  flex-grow: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ncc-side-item.channel .lbl {
+  font-family: var(--ncc-font-mono);
+  color: var(--ncc-secondary);
+}
+.ncc-side-item[aria-pressed='true'],
+.ncc-side-item[aria-current='true'] {
+  background: var(--ncc-page);
+  border-left-color: var(--ncc-ink);
+  font-weight: 650;
+}
+.ncc-side-item .n {
+  flex-shrink: 0;
+  font-family: var(--ncc-font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--ncc-muted);
+  min-width: 26px;
+  text-align: right;
+}
+.ncc-side-item .n.attention { color: var(--ncc-attention); font-weight: 700; min-width: 0; }
+.ncc-side-item .n.live { color: var(--ncc-live); font-weight: 600; }
+
+/* ── List pane ─────────────────────────────────────────────────────────── */
+
+.ncc-list-pane {
+  width: 492px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--ncc-border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+.ncc-list-head {
+  flex-shrink: 0;
+  padding: 13px 15px 11px;
+  border-bottom: 1px solid var(--ncc-border);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.ncc-list-head h2 { font-size: 15px; font-weight: 700; margin: 0; }
+.ncc-list-head .count { font-family: var(--ncc-font-mono); font-size: 11.5px; color: var(--ncc-muted); }
+.ncc-list { flex-grow: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: 0; }
+.ncc-empty {
+  font-family: var(--ncc-font-mono);
+  font-size: 12px;
+  color: var(--ncc-muted);
+  padding: 22px 15px;
+}
+
+/* ── Row (DESIGN §4) ───────────────────────────────────────────────────── */
+
+.ncc-row {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--ncc-divider);
+  background: var(--ncc-page);
+}
+.ncc-row.attention { background: var(--ncc-wash); }
+.ncc-row.selected { box-shadow: inset 0 0 0 1px var(--ncc-border); }
+
+/* Status bar: 3px, full row height, colour = urgency. TRANSPARENT when the row
+   wants nothing (§4) — the artboards paint those grey; DESIGN wins. */
+.ncc-row-bar { width: 3px; flex-shrink: 0; background: transparent; }
+.ncc-row.attention .ncc-row-bar { background: var(--ncc-attention); }
+.ncc-row.live .ncc-row-bar { background: var(--ncc-live); }
+
+.ncc-row-inner { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; }
+.ncc-row-cols { display: flex; align-items: flex-start; gap: 11px; padding: 12px 13px 11px; }
+
+/* The row's body is one real button so the whole row is keyboard-reachable;
+   the verb is a SIBLING button, never nested (nested buttons are invalid and
+   unreachable by keyboard). */
+.ncc-row-main {
+  flex-grow: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  /* §8: mobile tap targets, enforced with an explicit min-height. */
+  min-height: 44px;
+}
+.ncc-row-text { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+
+.ncc-row-title {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.42;
+  color: var(--ncc-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ncc-row-hybrid {
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ncc-row-hybrid .speaker { font-weight: 600; color: var(--ncc-secondary); }
+.ncc-row-hybrid .excerpt { color: var(--ncc-muted); }
+
+.ncc-row-livelinerow { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.ncc-row-livedot { flex-shrink: 0; width: 5px; height: 5px; background: var(--ncc-muted); }
+.ncc-row.attention .ncc-row-livedot { background: var(--ncc-attention); }
+.ncc-row.live .ncc-row-livedot { background: var(--ncc-live); }
+.ncc-row-step {
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  color: var(--ncc-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ncc-row.attention .ncc-row-step { color: var(--ncc-attention); }
+.ncc-row.live .ncc-row-step { color: var(--ncc-live); }
+.ncc-row-elapsed {
+  flex-shrink: 0;
+  font-family: var(--ncc-font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11.5px;
+  color: var(--ncc-muted);
+}
+
+.ncc-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-muted);
+}
+.ncc-row-meta span { white-space: nowrap; }
+
+.ncc-row-side {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+.ncc-state {
+  font-family: var(--ncc-font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  padding: 1px 5px;
+  color: var(--ncc-secondary);
+  border: 1px solid var(--ncc-border);
+}
+.ncc-state.attention { color: var(--ncc-attention); border-color: var(--ncc-attention); }
+.ncc-state.live { color: var(--ncc-live); border-color: var(--ncc-live); }
+.ncc-verb {
+  font-family: var(--ncc-font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--ncc-solid-ink);
+  background: var(--ncc-solid);
+  border: 1px solid var(--ncc-solid);
+  border-radius: 0;
+  padding: 3px 8px;
+  min-height: 24px;
+  cursor: pointer;
+}
+
+/* ── Avatar stack (§4: max 3 faces, 2px ring, −8px overlap, then +N) ────── */
+
+/* The faces are the shared `<AgentAvatar>` — real Slack avatars with its
+ * initials fallback (§11), re-skinned here rather than reimplemented. The
+ * wrapper owns size, ring and overlap; AgentAvatar owns "is there a real face
+ * or a letter", which is the part that must look identical everywhere.
+ * There is no pixelation: §11 removed it and real faces are the point. */
+.ncc-faces { flex-shrink: 0; display: flex; align-items: center; padding-top: 1px; }
+.ncc-face {
+  --ncc-face-size: 25px;
+  width: var(--ncc-face-size);
+  height: var(--ncc-face-size);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: var(--ncc-chip);
+  /* The ring reads as the surface the stack sits on, so an overlap never
+     smears two faces together on either ground. */
+  box-shadow: 0 0 0 2px var(--ncc-page);
+}
+.ncc-row.attention .ncc-face { box-shadow: 0 0 0 2px var(--ncc-wash); }
+.ncc-face + .ncc-face { margin-left: -8px; }
+/* AgentAvatar writes width/height as an inline style, which no class selector
+   can outrank — one documented `!important` beats threading a pixel size
+   through the tree for a breakpoint that changes it by 1px. */
+.ncc-face > .tm-avatar { width: 100% !important; height: 100% !important; }
+.ncc-face .tm-avatar-face { border: 0; }
+/* Initials sit on the CHIP surface, so they take `--ncc-secondary`: muted is
+   4.47:1 there and fails AA in light, 4.00:1 and fails in dark. */
+.ncc-face .tm-avatar-mark {
+  background: var(--ncc-chip);
+  font-family: var(--ncc-font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--ncc-secondary);
+}
+.ncc-face.orphan,
+.ncc-face.orphan .tm-avatar-mark { background: var(--ncc-wash-chip); }
+.ncc-face.more {
+  font-family: var(--ncc-font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--ncc-secondary);
+}
+
+/* ── The liveness rule (DESIGN §6) ─────────────────────────────────────── */
+/*
+ * ACTIVITY INDICATOR, NOT PROGRESS. The travelling segment's WIDTH ENCODES
+ * NOTHING: a tool call has a start time and no expected duration, so any
+ * percentage would be fabricated. An earlier draft shipped invented widths and
+ * they were correctly read as meaningful — that is the failure this avoids.
+ *
+ * Motion means a tool is running right now. A stalled thread's rule holds
+ * perfectly still. Motion = working, stillness = stuck.
+ */
+.ncc-track { position: relative; height: 2px; overflow: hidden; background: var(--ncc-divider); }
+.ncc-seg { position: absolute; top: 0; bottom: 0; left: 0; width: 26%; }
+.ncc-seg-live { animation: ncc-alive 2.4s linear infinite; background: var(--ncc-live); }
+.ncc-seg-still { width: 100%; opacity: 0.3; background: var(--ncc-attention); }
+@keyframes ncc-alive {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(385%); }
+}
+/* Reduced motion degrades to a static dimmed rule — the row keeps its
+   indicator, it simply stops moving. */
+@media (prefers-reduced-motion: reduce) {
+  .ncc-seg-live { animation: none; width: 100%; opacity: 0.3; }
+}
+
+/* ── Detail pane ───────────────────────────────────────────────────────── */
+
+.ncc-detail { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+.ncc-detail-head {
+  flex-shrink: 0;
+  padding: 14px 18px 13px;
+  border-bottom: 1px solid var(--ncc-border);
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+}
+.ncc-detail-title { font-size: 15.5px; font-weight: 700; letter-spacing: -0.01em; line-height: 1.3; margin: 0; }
+.ncc-detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  color: var(--ncc-muted);
+  margin-top: 4px;
+}
+.ncc-detail-note {
+  flex-shrink: 0;
+  padding: 8px 18px;
+  background: var(--ncc-topbar);
+  border-bottom: 1px solid var(--ncc-border);
+  font-size: 11.5px;
+  color: var(--ncc-secondary);
+}
+.ncc-transcript {
+  flex-grow: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+.ncc-msg { display: flex; gap: 10px; }
+.ncc-msg-body { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.ncc-msg-who { display: flex; align-items: baseline; gap: 7px; }
+.ncc-msg-who .name { font-size: 12.5px; font-weight: 600; color: var(--ncc-ink); }
+.ncc-msg-who .at { font-family: var(--ncc-font-mono); font-size: 11px; color: var(--ncc-muted); }
+.ncc-msg-text { font-size: 13px; line-height: 1.55; color: var(--ncc-secondary); white-space: pre-wrap; overflow-wrap: anywhere; }
+.ncc-msg.out .ncc-msg-text { color: var(--ncc-ink); }
+
+/* ── Mobile — 390px is the primary viewport (§8) ───────────────────────── */
+
+@media (max-width: 899px) {
+  .ncc-side,
+  .ncc-detail { display: none; }
+  .ncc-list-pane { width: auto; flex-grow: 1; border-right: 0; }
+  .ncc-face { --ncc-face-size: 24px; }
+  .ncc-row-title { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  /* The always-visible verb does not survive: it stays as a 44px button only on
+     rows that want something. */
+  .ncc-row-side .ncc-verb { min-height: 44px; padding: 6px 12px; }
+  .ncc-row:not(.attention) .ncc-verb { display: none; }
+  .ncc-row-meta .agents { display: none; }
+  .ncc-row-meta .sep-agents { display: none; }
+}
