@@ -54,6 +54,7 @@ import { migration048 } from './048-task-thread-anchors.js';
 import { migration049 } from './049-unique-active-session-triple.js';
 import { migration050 } from './050-observatory-item-threads.js';
 import { migration051 } from './051-memory-consolidated-facts.js';
+import { migration053 } from './053-normalize-naive-timestamps.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -130,6 +131,10 @@ export const migrations: Migration[] = [
   cliScope,
   messagingGroupInstance,
   migration019,
+  // Last on purpose: normalizes whatever naive timestamps every migration
+  // above has left behind (016's messaging_groups recreate copies created_at
+  // through as-is).
+  migration053,
 ];
 
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a

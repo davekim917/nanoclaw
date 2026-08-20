@@ -257,14 +257,19 @@ export function unarchiveSessionById(id: string): void {
  * can distinguish question-prompts from ordinary chat without re-parsing.
  */
 export function bumpLastOutbound(id: string, kind: string): void {
+  // Bound ISO, NOT `datetime('now')`: that yields the naive
+  // `YYYY-MM-DD HH:MM:SS` shape, and SQLite compares it against ISO values as
+  // TEXT — at index 10 'T' (0x54) beats ' ' (0x20), so a naive 11pm row sorts
+  // BELOW an ISO 7am one from the same day and `MAX(last_outbound_at)` (the
+  // observatory's most-recent-activity read) picks the wrong session.
   getDb()
     .prepare(
       `UPDATE sessions
-          SET last_outbound_at = datetime('now'),
+          SET last_outbound_at = ?,
               last_outbound_kind = ?
         WHERE id = ?`,
     )
-    .run(kind, id);
+    .run(new Date().toISOString(), kind, id);
 }
 
 // ── Pending Questions ──
