@@ -16,7 +16,26 @@ import {
   type ScheduledVerb,
 } from '../lib/api.js';
 import { cronToEnglish, formatEasternTime } from '../lib/cron-format.js';
-import { useIsMobile } from './BoardShell.js';
+
+const MOBILE_QUERY = '(max-width: 899px)';
+
+/**
+ * Tracks the viewport breakpoint — this drawer is read-only below it.
+ *
+ * Extracted from `BoardShell.tsx` when the legacy boards were deleted: it was
+ * the one function of that file anything still imported, and a shell nobody
+ * shells is not worth keeping alive for a fourteen-line hook.
+ */
+function useIsMobile(): boolean {
+  const [isMobile, setIsMobile] = useState(() => window.matchMedia(MOBILE_QUERY).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(MOBILE_QUERY);
+    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
+  return isMobile;
+}
 
 /**
  * Right-side detail drawer for a scheduled series. Shows the full prompt +

@@ -4,12 +4,13 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render } from '@testing-library/react';
 
 /**
- * Every routed surface, mounted under the single light theme.
+ * Every routed surface, mounted.
  *
- * The Observatory is the only screen this track redesigns, but re-pointing the
- * base palette touched EVERY surface that reads a token — which is all of them.
- * These are mount checks with a token assertion, not redesign tests: the legacy
- * boards are meant to look correct under the new theme, not to look different.
+ * There are two left — the console and the unauthenticated gate — because the
+ * legacy Observatory / inbox / workgroup / session routes and the views behind
+ * them are deleted. The theme assertions below stay: `styles.css` and
+ * `theme.css` still dress the gate and the scheduled drawer, and the single
+ * light ground is the rule they were written to hold.
  */
 
 vi.mock('swr', () => {
@@ -19,22 +20,10 @@ vi.mock('swr', () => {
 });
 
 vi.mock('../lib/api.js', () => ({
-  listWorkgroups: vi.fn(),
-  listSessions: vi.fn(),
   listGroups: vi.fn(),
-  getObservatory: vi.fn(),
+  listThreads: vi.fn(),
   listScheduled: vi.fn(),
-  getSessionDetail: vi.fn(),
-  postSessionMessage: vi.fn(),
-  archiveSession: vi.fn(),
-  unarchiveSession: vi.fn(),
-  getWorkgroupSummary: vi.fn(),
-  getWorkgroupUsage: vi.fn(),
-  getWorkgroupClaims: vi.fn(),
-  assignItem: vi.fn(),
-  nudgeClaim: vi.fn(),
-  steerWork: vi.fn(),
-  getIssueBrief: vi.fn(),
+  getThreadDetail: vi.fn(),
   authMe: vi.fn(),
   exchangeToken: vi.fn(),
 }));
@@ -42,10 +31,7 @@ vi.mock('../lib/api.js', () => ({
 vi.mock('../lib/sse.ts', () => ({ subscribe: vi.fn(() => () => {}), startSSE: vi.fn(), stopSSE: vi.fn() }));
 vi.mock('./ScheduledDrawer.js', () => ({ ScheduledDrawer: () => <div data-testid="sched-drawer" /> }));
 
-import { Observatory } from './Observatory.js';
-import { InboxBoard } from './InboxBoard.js';
-import { WorkgroupDashboard } from './WorkgroupDashboard.js';
-import { SessionDetail } from './SessionDetail.js';
+import { ThreadConsole, lensForHash } from './console/ThreadConsole.js';
 import { AuthGate } from '../auth/AuthGate.js';
 import useSWR from 'swr';
 
@@ -78,24 +64,26 @@ afterEach(() => {
 });
 
 describe('every route still mounts', () => {
-  it('#/observatory', () => {
-    const { container } = render(<Observatory authMe={authMe} route="observatory" onRouteChange={noop} />);
-    expect(container.querySelector('.nc-frame')).toBeTruthy();
+  it('#/console — and every other hash, which now lands here', () => {
+    const { container } = render(<ThreadConsole authMe={authMe} />);
+    expect(container.querySelector('.ncc')).toBeTruthy();
   });
 
-  it('#/inbox (legacy — kept working, not redesigned)', () => {
-    const { container } = render(<InboxBoard authMe={authMe} route="inbox" onRouteChange={noop} />);
-    expect(container.querySelector('.nc-frame')).toBeTruthy();
+  it('#/scheduled opens the Schedule lens rather than redirecting', () => {
+    // The redirect is what made the schedule invisible when the Observatory —
+    // which carried the only mount point for the drawer — was deleted.
+    location.hash = '#/scheduled';
+    const { container } = render(<ThreadConsole authMe={authMe} />);
+    expect(container.querySelector('[aria-label="Scheduled work"]')).toBeTruthy();
+    expect(container.querySelector('[aria-label="Threads"]')).toBeNull();
+    location.hash = '';
   });
 
-  it('#/workgroup (legacy — kept working, not redesigned)', () => {
-    const { container } = render(<WorkgroupDashboard authMe={authMe} route="workgroup" onRouteChange={noop} />);
-    expect(container.querySelector('.nc-frame')).toBeTruthy();
-  });
-
-  it('#/session/:id', () => {
-    const { container } = render(<SessionDetail authMe={authMe} sessionId="s-1" />);
-    expect(container.textContent).toBeTruthy();
+  it('routes every OTHER hash, retired bookmarks included, to the thread queue', () => {
+    for (const hash of ['', '#/console', '#/observatory', '#/inbox', '#/workgroup', '#/session/s-1', '#/nonsense']) {
+      expect(lensForHash(hash)).toBe('threads');
+    }
+    expect(lensForHash('#/scheduled')).toBe('schedule');
   });
 
   it('the unauthenticated gate', () => {

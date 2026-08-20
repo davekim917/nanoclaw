@@ -39,6 +39,7 @@ import {
 } from '../../modules/scheduling/db.js';
 import { countLiveRowsInSessions } from '../../modules/scheduling/live-count.js';
 import { log } from '../../log.js';
+import { parseUtcTimestampMs } from '../../thread-context.js';
 import { mergeWorkgroupAndGroupSecrets } from '../../onecli-secrets.js';
 import { GUARD_GRACE_MS, verbVerdict, type HealthState } from './scheduled-board-matrix.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
@@ -369,13 +370,6 @@ function moveGuardState(status: string, processAfterMs: number | null, nowMs: nu
   return processAfterMs !== null && processAfterMs <= nowMs ? 'late' : 'healthy';
 }
 
-function parseUtcMs(s: string | null): number | null {
-  if (!s) return null;
-  const normalized = /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : (s.includes('T') ? s : s.replace(' ', 'T')) + 'Z';
-  const ms = Date.parse(normalized);
-  return Number.isNaN(ms) ? null : ms;
-}
-
 /** Build the TaskDef that re-schedules the snapshot into the target session. */
 function taskDefFromSnapshot(
   snapshot: SourceLiveRow,
@@ -483,7 +477,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   if (!snapshot) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
 
   // Step 2a: §4.0 in-flight admission guard (verbVerdict is the ONLY guard source).
-  const processAfterMs = parseUtcMs(snapshot.process_after);
+  const processAfterMs = parseUtcTimestampMs(snapshot.process_after);
   const guardState = moveGuardState(snapshot.status, processAfterMs, nowMs);
   const verdict = verbVerdict('move', {
     state: guardState,

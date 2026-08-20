@@ -65,13 +65,38 @@ import type { AuthHandler, AuthedRequestContext } from './router.js';
 const json = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
+/** `steer.ts:146`'s own cap. Everything this file composes must still fit inside it. */
+const EXECUTOR_TEXT_LIMIT = 4000;
+
 /**
- * Operator text cap. Lower than `steer.ts`'s own 4000 on purpose: a hand-over
- * appends the claim context to this string, and a message that passes here must
+ * How long an interpolated identity is allowed to be — a display name, a claim
+ * slug, a claim holder. None is capped at its source, so the budget is stated
+ * rather than assumed.
+ */
+const IDENTITY_MAX = 120;
+
+/**
+ * Operator text cap. Lower than `steer.ts`'s own 4000 on purpose: the operator's
+ * words are QUOTED into a composed prompt (see `composeOperatorMessage`) and a
+ * hand-over appends the claim context on top, so a message that passes here must
  * still pass there rather than failing with a length error the operator cannot
  * account for.
+ *
+ * MEASURED, not hand-tuned: composing the worst case — every identity slot at
+ * its budget, hand-over context present — is the only way to count the slots
+ * without getting the count wrong. Reword the wrapper and this follows.
  */
-export const MAX_OPERATOR_TEXT = 3500;
+export const MAX_OPERATOR_TEXT =
+  EXECUTOR_TEXT_LIMIT -
+  composeOperatorMessage({
+    who: 'x'.repeat(IDENTITY_MAX),
+    text: '',
+    claimContext: composeClaimContext({
+      who: 'x'.repeat(IDENTITY_MAX),
+      claimSlug: 'x'.repeat(IDENTITY_MAX),
+      holder: 'x'.repeat(IDENTITY_MAX),
+    }),
+  }).length;
 
 interface ThreadMessageBody {
   agent_group_id?: string;
@@ -119,6 +144,39 @@ export function composeReleaseNote(opts: { who: string; newAgentName: string; cl
     `While it stays live their \`take\` refuses with exit 3, and \`--takeover\` only records an override — ` +
     `it does not make one correct.\n\n` +
     `Stop working this thread; ${opts.newAgentName} has it from here.`
+  );
+}
+
+/**
+ * The operator's words, wrapped — attributed on the way in, obliged to produce
+ * an answer on the way out.
+ *
+ * Both halves are ported from the surfaces this one replaces, and neither is
+ * decoration:
+ *
+ * - **Attribution.** `assign.ts:113` requires the agent's first message to name
+ *   who sent it, so everyone in the room knows where an instruction came from
+ *   without asking. Posting the operator's bare text loses that: the agent
+ *   answers, and the room sees an agent that changed course for no visible
+ *   reason.
+ * - **The no-silence clause.** `nudge.ts` and `observatory-steer.ts` both close
+ *   with it — an instruction that ends in silence is the failure the button
+ *   exists to end. An agent that cannot act must say so HERE and name what
+ *   blocks it; going quiet is not one of the options.
+ *
+ * The operator's own words are QUOTED verbatim and attributed to a named person,
+ * exactly as `observatory-steer.ts:12-16` describes. Nothing here paraphrases,
+ * summarises or replaces them — the wrapper is around the text, never over it.
+ */
+export function composeOperatorMessage(opts: { who: string; text: string; claimContext?: string }): string {
+  return (
+    `${opts.who} sent this from the Observatory console — on this thread.\n\n` +
+    `They said, verbatim:\n"""\n${opts.text}\n"""\n` +
+    (opts.claimContext ?? '') +
+    `\n\nAct on that in THIS thread. Open your reply by naming where it came from — ` +
+    `"${opts.who} asked, via the Observatory —" — so nobody in the room has to ask. ` +
+    `If you cannot act on it, say so here and name what blocks you: ` +
+    `a message from the Observatory that ends in silence is the failure this button exists to end.`
   );
 }
 
@@ -196,8 +254,13 @@ export async function sendThreadMessage(
   const handingOver = !!claim && claim.state === 'live' && holder?.agent_group_id !== agentGroupId;
 
   const who = ctx.user.display_name ?? ctx.user.id;
-  const outgoing =
-    handingOver && claim ? text + composeClaimContext({ who, claimSlug: claim.slug, holder: claim.owner }) : text;
+  const outgoing = composeOperatorMessage({
+    who,
+    text,
+    ...(handingOver && claim
+      ? { claimContext: composeClaimContext({ who, claimSlug: claim.slug, holder: claim.owner }) }
+      : {}),
+  });
 
   const result = await applySessionSteer(sessionId, { idempotency_key: idempotencyKey, text: outgoing }, ctx);
   if (result.status !== 202) return result;

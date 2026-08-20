@@ -813,3 +813,45 @@
   .ncc-triage { width: 100%; }
   .ncc-triage .ncc-detail { display: flex; }
 }
+
+/* ── Schedule lens (§11) ───────────────────────────────────────────────────
+   The lens takes the whole body: it is a different thing to look at, not a
+   second column beside the queue. `ScheduledDrawer` is reused UNCHANGED and
+   still carries its own `nc-sched-*` classes from styles.css — restyling it
+   here is a CSS problem, and forking the component to solve it would fork the
+   verb×state contract with it. */
+
+.ncc [aria-label='Scheduled work'].ncc-list-pane {
+  width: auto;
+  flex-grow: 1;
+  border-right: 0;
+  position: relative;
+}
+.ncc-sched-list { padding-bottom: 20px; }
+.ncc-sched-row { border-bottom: 1px solid var(--ncc-divider); }
+.ncc-sched-open {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 11px 15px;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  min-height: 44px;
+}
+.ncc-sched-open:hover { background: var(--ncc-topbar); }
+.ncc-sched-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex-grow: 1; }
+.ncc-sched-who { font-size: 11.5px; color: var(--ncc-muted); }
+.ncc-sched-cron { font-size: 11.5px; color: var(--ncc-secondary); flex-shrink: 0; }
+.ncc-sched-when {
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  color: var(--ncc-muted);
+  flex-shrink: 0;
+  min-width: 72px;
+  text-align: right;
+}

@@ -41,7 +41,7 @@ import { readClaims, type BoardClaim } from '../../claims-board.js';
 import { log } from '../../log.js';
 import type { AgentGroup, SessionMode } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
-import { parseUtcMs } from './observatory.js';
+import { parseUtcTimestampMs } from '../../thread-context.js';
 import { isSnoozed, readThreadSnoozes } from '../thread-snooze.js';
 import {
   deriveContainerStatus,
@@ -300,7 +300,7 @@ export interface ThreadSummary {
 
 /** Anything that leaves this module as a timestamp goes out as ISO-8601 UTC. */
 function isoOrNull(s: string | null | undefined): string | null {
-  const ms = parseUtcMs(s);
+  const ms = parseUtcTimestampMs(s);
   return ms === null ? null : new Date(ms).toISOString();
 }
 
@@ -340,7 +340,7 @@ const MAX_LIMIT = 1000;
  * `datetime()` wraps both sides because the columns are NOT one format:
  * `last_active` / `created_at` are ISO-8601 with `Z`, while `last_outbound_at`
  * is written naive by `bumpLastOutbound`. The same mismatch is why ordering
- * happens in JS below (`parseUtcMs`) rather than in SQL — a string comparison
+ * happens in JS below (`parseUtcTimestampMs`) rather than in SQL — a string comparison
  * between the two shapes silently sorts every ISO value above every naive one.
  */
 function selectScopedSessions(
@@ -716,9 +716,9 @@ export interface ThreadListDeps {
 
 function activityMs(row: ThreadSessionRow): number {
   return Math.max(
-    parseUtcMs(row.last_outbound_at) ?? -Infinity,
-    parseUtcMs(row.last_active) ?? -Infinity,
-    parseUtcMs(row.created_at) ?? -Infinity,
+    parseUtcTimestampMs(row.last_outbound_at) ?? -Infinity,
+    parseUtcTimestampMs(row.last_active) ?? -Infinity,
+    parseUtcTimestampMs(row.created_at) ?? -Infinity,
   );
 }
 
@@ -727,7 +727,7 @@ function sessionNeedsOperator(row: ThreadSessionRow): boolean {
   if (row.attached_task_needs_input === 1) return true;
   return (
     row.last_outbound_kind === 'chat-sdk:ask_question' &&
-    (parseUtcMs(row.last_active) ?? 0) < (parseUtcMs(row.last_outbound_at) ?? 0)
+    (parseUtcTimestampMs(row.last_active) ?? 0) < (parseUtcTimestampMs(row.last_outbound_at) ?? 0)
   );
 }
 
@@ -880,7 +880,7 @@ export async function buildThreadList(
     let titleAt = -Infinity;
     for (const row of ordered) {
       if (!row.title) continue;
-      const at = parseUtcMs(row.title_generated_at) ?? activityMs(row);
+      const at = parseUtcTimestampMs(row.title_generated_at) ?? activityMs(row);
       if (at > titleAt) {
         titleAt = at;
         title = row.title;
@@ -922,10 +922,10 @@ export async function buildThreadList(
     const providerStatus: string | null = picked?.provider_status ?? null;
     const currentTool: string | null = picked?.current_tool ?? null;
     const toolStartedAt: string | null = isoOrNull(picked?.tool_started_at);
-    const toolStartedAtMs: number | null = parseUtcMs(picked?.tool_started_at);
+    const toolStartedAtMs: number | null = parseUtcTimestampMs(picked?.tool_started_at);
 
     const lastOutputAtMs = ordered.reduce<number | null>((acc, row) => {
-      const ms = parseUtcMs(row.last_outbound_at);
+      const ms = parseUtcTimestampMs(row.last_outbound_at);
       return ms !== null && (acc === null || ms > acc) ? ms : acc;
     }, null);
     const lastActivity = ordered[0]
@@ -1039,8 +1039,8 @@ export function mergeThreadTranscript(
     }
   }
   merged.sort((a, b) => {
-    const at = parseUtcMs(a.timestamp) ?? 0;
-    const bt = parseUtcMs(b.timestamp) ?? 0;
+    const at = parseUtcTimestampMs(a.timestamp) ?? 0;
+    const bt = parseUtcTimestampMs(b.timestamp) ?? 0;
     if (at !== bt) return at - bt;
     if (a.session_id !== b.session_id) return a.session_id < b.session_id ? -1 : 1;
     return a.seq - b.seq;

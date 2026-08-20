@@ -194,3 +194,25 @@ describe('the keyboard rules that ship broken silently', () => {
     expect(snoozeThread).not.toHaveBeenCalled();
   });
 });
+
+/* ─── Shared refusal wording ───────────────────────────────────────────────── */
+
+describe('a refused verdict is explained in the operator’s words', () => {
+  it('says the same thing the queue and the composer say about the same refusal', async () => {
+    snoozeThread.mockRejectedValueOnce({ status: 429, error: 'rate_limit_exceeded', retry_after: 4 });
+    renderTriage([thread(1), thread(2)]);
+    await userEvent.click(screen.getByRole('button', { name: /S · snooze/ }));
+    await waitFor(() => expect(screen.getByText(/Could not snooze — too fast — try again in 4s\./)).toBeTruthy());
+    // A refused verdict must not advance — the thread has not been triaged.
+    expect(screen.getByText('1 / 2')).toBeTruthy();
+  });
+
+  it('reads an unrouted endpoint as a pending restart', async () => {
+    archiveSession.mockRejectedValueOnce({ status: 404, error: 'unknown' });
+    renderTriage([thread(1)]);
+    await userEvent.click(screen.getByRole('button', { name: /E · close/ }));
+    await waitFor(() =>
+      expect(screen.getByText(/Could not close — not active until the next host restart\./)).toBeTruthy(),
+    );
+  });
+});
