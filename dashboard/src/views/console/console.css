@@ -118,7 +118,25 @@
      the console re-declares it on its own root so scrollbars and form controls
      follow the palette actually on screen. */
   color-scheme: light;
-  min-height: 100vh;
+  /*
+   * A FIXED-VIEWPORT APP SHELL, NOT A SCROLLING DOCUMENT.
+   *
+   * `min-height` here was the single defect behind three separate complaints —
+   * the sidebar scrolling away, the composer only reachable at the bottom of
+   * the page, and the transcript never sitting at its newest message. A
+   * min-height root grows to its content, so `.ncc-body`'s flex children never
+   * have to shrink, none of their `overflow-y: auto` regions ever engage, and
+   * the whole thing escapes to one page scroll. Every pane below scrolls on its
+   * own only because this is a HARD height.
+   *
+   * `dvh` rather than `vh`: mobile is the primary viewport (§8) and `vh` is
+   * measured against the browser chrome's largest state, so a `vh` shell hangs
+   * its last 60-90px below the fold on a phone. `100vh` stays as the fallback
+   * for anything without `dvh`.
+   */
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   background: var(--ncc-page);
@@ -564,10 +582,17 @@
   font-size: 11.5px;
   color: var(--ncc-secondary);
 }
+/* The scroll box and the content box are deliberately two elements: a
+   ResizeObserver on the scroller itself never fires (its border box is fixed by
+   the shell), so the bottom-anchor in ThreadDetail observes `-inner`, whose
+   height is what actually changes when markdown, images and web fonts settle
+   after the commit. */
 .ncc-transcript {
   flex-grow: 1;
   min-height: 0;
   overflow-y: auto;
+}
+.ncc-transcript-inner {
   padding: 16px 18px;
   display: flex;
   flex-direction: column;
@@ -649,23 +674,6 @@
 .ncc-md thead { background: var(--ncc-topbar); }
 .ncc-md img { max-width: 100%; height: auto; }
 
-/* ── Mobile — 390px is the primary viewport (§8) ───────────────────────── */
-
-@media (max-width: 899px) {
-  .ncc-side,
-  .ncc-detail-wrap,
-  .ncc-detail { display: none; }
-  .ncc-list-pane { width: auto; flex-grow: 1; border-right: 0; }
-  .ncc-face { --ncc-face-size: 24px; }
-  .ncc-row-title { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-  /* The always-visible verb does not survive: it stays as a 44px button only on
-     rows that want something. */
-  .ncc-row-side .ncc-verb { min-height: 44px; padding: 6px 12px; }
-  .ncc-row:not(.attention) .ncc-verb { display: none; }
-  .ncc-row-meta .agents { display: none; }
-  .ncc-row-meta .sep-agents { display: none; }
-}
-
 /* ── Actions: composer, snooze, triage (Phase 3) ────────────────────────── */
 
 .ncc-detail-wrap { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
@@ -676,6 +684,10 @@
   gap: 8px;
   padding: 8px 18px 0;
 }
+/* Desktop shows the list and the thread side by side, so there is nothing to
+   go back to. On mobile (§8) the same tap is a navigation and needs its
+   return. */
+.ncc-back { display: none; margin-right: auto; }
 
 /* The notice line every mutating action reports through. Visible AND
    `aria-live`, so the confirmation is not screen-reader-only. */
@@ -808,12 +820,6 @@
   font-size: 11px;
   color: var(--ncc-secondary);
 }
-/* On mobile the mode is the entire screen — there is no list beside it. */
-@media (max-width: 899px) {
-  .ncc-triage { width: 100%; }
-  .ncc-triage .ncc-detail { display: flex; }
-}
-
 /* ── Schedule lens (§11) ───────────────────────────────────────────────────
    The lens takes the whole body: it is a different thing to look at, not a
    second column beside the queue. `ScheduledDrawer` is reused UNCHANGED and
@@ -854,4 +860,131 @@
   flex-shrink: 0;
   min-width: 72px;
   text-align: right;
+}
+
+/* ── Bottom bar (§8) ───────────────────────────────────────────────────────
+ *
+ * Four destinations, each with a distinct icon, and the phone's only chrome
+ * below the queue. Hidden outright above the breakpoint: on desktop the
+ * sidebar is already on screen and a second copy of the same controls would be
+ * the "three near-identical controls" §12 warns about.
+ */
+.ncc-bottom {
+  display: none;
+  flex-shrink: 0;
+  height: 56px;
+  border-top: 1px solid var(--ncc-border);
+  background: var(--ncc-topbar);
+}
+.ncc-bottom-item {
+  flex: 1 1 0;
+  min-width: 0;
+  /* §7.2: an explicit min-height, not a height that padding happens to reach. */
+  min-height: 56px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  background: none;
+  border: 0;
+  border-top: 2px solid transparent;
+  border-radius: 0;
+  padding: 0;
+  font-family: var(--ncc-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-decoration: none;
+  color: var(--ncc-secondary);
+  cursor: pointer;
+}
+.ncc-bottom-item[aria-current='page'],
+.ncc-bottom-item[aria-expanded='true'] {
+  color: var(--ncc-ink);
+  border-top-color: var(--ncc-ink);
+}
+.ncc-bottom-item:disabled { color: var(--ncc-muted); cursor: not-allowed; }
+
+/* ── Mobile — 390px is the primary viewport (§8) ─────────────────────────────
+ *
+ * LAST IN THE FILE ON PURPOSE. Every rule below has to beat a base rule of the
+ * same specificity (`.ncc-list-pane`, `.ncc-triage`, `.ncc-side`), and at equal
+ * specificity source order decides. The previous revision sat in the middle of
+ * the file and only worked because it used `display: none`, which nothing else
+ * set.
+ *
+ * What it replaces: that revision hid `.ncc-side`, `.ncc-detail-wrap` and
+ * `.ncc-detail` outright, so a narrow window lost the queue lanes, the channel
+ * filter, the lenses AND the thread itself — every control except the list.
+ * This is the mobile-first pass, so nothing is deleted at the breakpoint; it
+ * moves.
+ */
+@media (max-width: 899px) {
+  /* One pane at a time — a phone navigates, it does not sit side by side.
+     `visibility` rather than `display: none` is load-bearing: the list must
+     come back at the scroll offset it left at, and a display-toggled box
+     returns at scrollTop 0. */
+  .ncc-body { position: relative; }
+  .ncc-list-pane,
+  .ncc-detail-wrap,
+  .ncc-triage {
+    position: absolute;
+    inset: 0;
+    width: auto;
+    border-right: 0;
+  }
+  .ncc[data-pane='detail'] .ncc-list-pane { visibility: hidden; }
+  .ncc[data-pane='list'] .ncc-detail-wrap { visibility: hidden; }
+  .ncc-back { display: inline-flex; }
+
+  /* The sidebar becomes a sheet over the queue, opened from the bottom bar.
+     Same `<nav>`, same lane / channel / lens controls, same state — only where
+     it sits changes, so there is exactly one of each control in the DOM. */
+  .ncc-side {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 20;
+    width: auto;
+    max-height: 72%;
+    display: none;
+    border-right: 0;
+    border-top: 1px solid var(--ncc-border);
+  }
+  .ncc[data-nav='open'] .ncc-side { display: flex; }
+  /* §7.2: every tap target ≥ 44px, with an explicit min-height. */
+  .ncc-side-item { min-height: 44px; }
+
+  .ncc-bottom { display: flex; }
+
+  /* The chrome wraps rather than overflowing — a horizontal page scroll is
+     never an acceptable answer at 390px. */
+  .ncc-top { flex-wrap: wrap; padding: 7px 12px; }
+  .ncc-select,
+  .ncc-search,
+  .ncc-solid-btn,
+  .ncc-attn-chip { min-height: 44px; }
+  .ncc-search { width: auto; flex-grow: 1; min-width: 128px; }
+
+  .ncc-face { --ncc-face-size: 24px; }
+  .ncc-row-title { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  /* The always-visible verb does not survive: it stays as a 44px button only on
+     rows that want something. Every other row is tappable, and says so with a
+     chevron rather than leaving a blank column. */
+  .ncc-row-side .ncc-verb { min-height: 44px; padding: 6px 12px; }
+  .ncc-row:not(.attention) .ncc-verb { display: none; }
+  .ncc-row:not(.attention) .ncc-row-side::after {
+    content: '›';
+    font-size: 17px;
+    line-height: 1;
+    color: var(--ncc-muted);
+  }
+  /* §8: the meta line collapses to `channel · age`. */
+  .ncc-row-meta .agents,
+  .ncc-row-meta .sep-agents { display: none; }
+
+  .ncc-triage-verbs { flex-wrap: wrap; }
 }

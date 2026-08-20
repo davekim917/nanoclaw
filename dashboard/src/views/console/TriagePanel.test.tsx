@@ -110,7 +110,7 @@ describe('verdicts advance by exactly one', () => {
     expect(await screen.findByText('Thread 2')).toBeTruthy();
   });
 
-  it('E closes the current thread by archiving every one of its sessions', async () => {
+  it('E dismisses the current thread by archiving every one of its sessions', async () => {
     const user = userEvent.setup();
     renderTriage([thread(1, { session_ids: ['s-1a', 's-1b'] }), thread(2)]);
     panel().focus();
@@ -118,6 +118,19 @@ describe('verdicts advance by exactly one', () => {
     await waitFor(() => expect(archiveSession).toHaveBeenCalledTimes(2));
     expect(archiveSession.mock.calls.map((c) => c[0])).toEqual(['s-1a', 's-1b']);
     expect(screen.getByText('2 / 2')).toBeTruthy();
+  });
+
+  it('says DISMISS, never close — it archives and stops nothing', async () => {
+    renderTriage([thread(1)]);
+    // `find`, not `get`: it lets the detail pane's transcript fetch settle
+    // inside act rather than landing after the test has ended.
+    const dismiss = await screen.findByRole('button', { name: /E · dismiss/ });
+    expect(dismiss.getAttribute('title')).toBe(
+      'Removes the thread from your queue. The agent is not stopped and its work continues.',
+    );
+    expect(screen.queryByRole('button', { name: /E · close/ })).toBeNull();
+    // The key hint carries the same word as the button.
+    expect(screen.getByText(/A answer · S snooze · E dismiss · Esc exit/)).toBeTruthy();
   });
 
   it('A focuses the composer and does NOT advance until the reply lands', async () => {
@@ -210,9 +223,9 @@ describe('a refused verdict is explained in the operator’s words', () => {
   it('reads an unrouted endpoint as a pending restart', async () => {
     archiveSession.mockRejectedValueOnce({ status: 404, error: 'unknown' });
     renderTriage([thread(1)]);
-    await userEvent.click(screen.getByRole('button', { name: /E · close/ }));
+    await userEvent.click(screen.getByRole('button', { name: /E · dismiss/ }));
     await waitFor(() =>
-      expect(screen.getByText(/Could not close — not active until the next host restart\./)).toBeTruthy(),
+      expect(screen.getByText(/Could not dismiss — not active until the next host restart\./)).toBeTruthy(),
     );
   });
 });

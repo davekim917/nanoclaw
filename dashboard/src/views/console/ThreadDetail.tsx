@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
-import { getThreadDetail, type ThreadSummary } from '../../lib/api.js';
+import { getThreadDetail, type ThreadSummary, type ThreadTranscriptEntry } from '../../lib/api.js';
 import { relAge } from '../../lib/derive.js';
 import { renderMarkdown } from '../../lib/markdown.js';
 import { AgentAvatar } from '../AgentAvatar.js';
@@ -49,12 +49,80 @@ export interface ThreadDetailProps {
   onSent?: (thread: ThreadSummary) => void;
 }
 
+/**
+ * How far from the bottom still counts as being AT the bottom, in px.
+ *
+ * Not zero. A fractional `scrollHeight`, a sub-pixel line box, a trackpad's
+ * rubber-band overscroll — any of them leaves a pixel or two of slack, and
+ * reading that as "the operator scrolled up" would silently stop a live thread
+ * from following.
+ */
+const BOTTOM_SLACK = 48;
+
+/**
+ * The transcript opens at its newest message, and keeps following — but only
+ * while the operator is actually reading the bottom of it.
+ *
+ * Three things this has to survive, each of which breaks the naive version:
+ *
+ * 1. **Height is not known at commit time.** The bodies are rendered markdown;
+ *    images and the two web faces settle AFTER paint and every one of them makes
+ *    the transcript taller. Scrolling once on mount therefore lands short, which
+ *    is why a ResizeObserver on the content box re-anchors as it settles. The
+ *    observer watches `.ncc-transcript-inner`, not the scroller: the scroller's
+ *    own border box is pinned by the shell and never resizes at all.
+ * 2. **Switching threads is an open, not a refresh** — it re-anchors from
+ *    scratch regardless of where the previous thread was left.
+ * 3. **Do not yank.** An operator who has scrolled up to read history keeps
+ *    their place when the next message lands. That rule is the whole difference
+ *    between a chat pane and an annoying one, so `stick` is driven by the
+ *    operator's own scrolling and by nothing else.
+ */
+function useBottomAnchor(threadId: string, transcript: ThreadTranscriptEntry[] | undefined) {
+  const scroller = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
+
+  const pin = useCallback(() => {
+    const el = scroller.current;
+    if (!el || !stick.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, []);
+
+  // Declared BEFORE the pin below so that on the render which changes the
+  // thread, the reset has already run by the time the anchor fires.
+  useLayoutEffect(() => {
+    stick.current = true;
+  }, [threadId]);
+
+  useLayoutEffect(pin, [pin, threadId, transcript]);
+
+  useEffect(() => {
+    const box = content.current;
+    // jsdom has no ResizeObserver, and the effect is a progressive improvement
+    // on the layout-effect anchor rather than a replacement for it.
+    if (!box || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(pin);
+    ro.observe(box);
+    return () => ro.disconnect();
+  }, [pin]);
+
+  const onScroll = useCallback(() => {
+    const el = scroller.current;
+    if (!el) return;
+    stick.current = el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK;
+  }, []);
+
+  return { scroller, content, onScroll };
+}
+
 export function ThreadDetail({ thread, focusComposer = 0, nextAction, onSent }: ThreadDetailProps) {
   const { data } = useSWR(
     thread ? ['thread-detail', thread.thread_id, thread.last_activity_at] : null,
     () => getThreadDetail(thread!.thread_id),
     { refreshInterval: 0 },
   );
+  const anchor = useBottomAnchor(thread?.thread_id ?? '', data?.transcript);
 
   if (!thread) {
     return (
@@ -96,22 +164,24 @@ export function ThreadDetail({ thread, focusComposer = 0, nextAction, onSent }: 
         Merged from {sessionCount} agent session{sessionCount === 1 ? '' : 's'} on this thread, in timestamp order.
       </div>
 
-      <div className="ncc-transcript">
-        {(data?.transcript ?? []).map((m) => (
-          <div className={`ncc-msg ${m.direction}`} key={`${m.session_id}:${m.seq}`}>
-            <span className="ncc-face">
-              <AgentAvatar name={m.agent_name} initials={initials(m.agent_name)} avatarUrl={null} size={24} />
-            </span>
-            <div className="ncc-msg-body">
-              <div className="ncc-msg-who">
-                <span className="name">{m.direction === 'out' ? m.agent_name : 'Inbound'}</span>
-                <span className="at">{relAge(m.timestamp)} ago</span>
+      <div className="ncc-transcript" ref={anchor.scroller} onScroll={anchor.onScroll}>
+        <div className="ncc-transcript-inner" ref={anchor.content}>
+          {(data?.transcript ?? []).map((m) => (
+            <div className={`ncc-msg ${m.direction}`} key={`${m.session_id}:${m.seq}`}>
+              <span className="ncc-face">
+                <AgentAvatar name={m.agent_name} initials={initials(m.agent_name)} avatarUrl={null} size={24} />
+              </span>
+              <div className="ncc-msg-body">
+                <div className="ncc-msg-who">
+                  <span className="name">{m.direction === 'out' ? m.agent_name : 'Inbound'}</span>
+                  <span className="at">{relAge(m.timestamp)} ago</span>
+                </div>
+                <MessageText text={m.text} />
               </div>
-              <MessageText text={m.text} />
             </div>
-          </div>
-        ))}
-        {data && data.transcript.length === 0 && <div className="ncc-empty">no messages on this thread</div>}
+          ))}
+          {data && data.transcript.length === 0 && <div className="ncc-empty">no messages on this thread</div>}
+        </div>
       </div>
 
       <ReplyComposer
