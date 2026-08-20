@@ -248,6 +248,13 @@ export interface Session {
   last_active: string | null;
   last_outbound_at?: string | null;
   last_outbound_kind?: string | null;
+  /**
+   * When an agent first genuinely engaged in this session's thread — a
+   * mention, a wake, or an inbound agent-to-agent message. NULL means the row
+   * exists but nobody has engaged, which is what `mention-sticky` engagement
+   * and the thread-history backfill both read. See migration 052.
+   */
+  engaged_at?: string | null;
   created_at: string;
 }
 
