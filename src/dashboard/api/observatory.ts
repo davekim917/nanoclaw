@@ -552,7 +552,7 @@ function hasWorkgroupAccess(workgroupId: string, ctx: AuthedRequestContext): boo
  * applies to the same column family: without it, `Date.parse` reads the
  * string as local time.
  */
-function parseUtcMs(s: string | null | undefined): number | null {
+export function parseUtcMs(s: string | null | undefined): number | null {
   if (!s) return null;
   const normalized = /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : `${s.includes('T') ? s : s.replace(' ', 'T')}Z`;
   const ms = Date.parse(normalized);
