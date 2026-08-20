@@ -60,7 +60,16 @@ beforeEach(() => {
   getThreadDetail.mockResolvedValue({
     thread: thread('t-1'),
     transcript: [
-      { session_id: 's-1', agent_group_id: 'ag-1', agent_name: 'Alpha', direction: 'out', kind: 'chat', seq: 1, timestamp: '2026-08-20T09:00:00.000Z', text: 'two options and I do not think I should default this one' },
+      {
+        session_id: 's-1',
+        agent_group_id: 'ag-1',
+        agent_name: 'Alpha',
+        direction: 'out',
+        kind: 'chat',
+        seq: 1,
+        timestamp: '2026-08-20T09:00:00.000Z',
+        text: 'two options and I do not think I should default this one',
+      },
     ],
   });
   localStorage.clear();
@@ -295,7 +304,6 @@ describe('lastMessagePreview', () => {
     ).toBeNull();
   });
 });
-
 
 /**
  * Phase 3 wiring at the shell level: which verb reaches which endpoint, the

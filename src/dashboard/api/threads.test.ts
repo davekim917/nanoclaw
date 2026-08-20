@@ -571,9 +571,7 @@ describe('buildThreadList — reply target and snooze', () => {
     const thread = 'slack:CTESTCHAN01:1700000000.11';
     insertSession({ id: 's-1', agentGroupId: 'ag-1', threadId: thread, lastOutboundAt: iso(60_000) });
     getDb()
-      .prepare(
-        `INSERT INTO thread_snoozes (thread_id, user_id, snoozed_at_activity, created_at) VALUES (?, ?, ?, ?)`,
-      )
+      .prepare(`INSERT INTO thread_snoozes (thread_id, user_id, snoozed_at_activity, created_at) VALUES (?, ?, ?, ?)`)
       .run(thread, 'u1', iso(60_000), iso(0));
 
     expect((await buildThreadList(makeCtx(), LIST_OPTS, deps())).threads[0]!.snoozed).toBe(true);

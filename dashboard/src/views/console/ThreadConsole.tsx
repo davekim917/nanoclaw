@@ -156,8 +156,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
     next.focus();
   }, []);
 
-  const laneLabel =
-    lane === 'all' ? 'All threads' : lane === 'snoozed' ? 'Snoozed' : STATE_PRESENTATION[lane].label;
+  const laneLabel = lane === 'all' ? 'All threads' : lane === 'snoozed' ? 'Snoozed' : STATE_PRESENTATION[lane].label;
   const selected = visible.find((t) => t.thread_id === selectedId) ?? null;
 
   /**
@@ -268,7 +267,12 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
       <div className="ncc-body">
         <nav className="ncc-side" aria-label="Queue and channels">
           <h2 className="ncc-side-head">Queue</h2>
-          <LaneButton label="All threads" count={threads.length} active={lane === 'all'} onClick={() => setLane('all')} />
+          <LaneButton
+            label="All threads"
+            count={threads.length}
+            active={lane === 'all'}
+            onClick={() => setLane('all')}
+          />
           {LANE_ORDER.map((state) => (
             <LaneButton
               key={state}
@@ -294,7 +298,12 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
             <span className="lbl">Channels</span>
             <span className="ncc-mono">{channels.length}</span>
           </h2>
-          <LaneButton label="All channels" count={threads.length} active={channel === null} onClick={() => setChannel(null)} />
+          <LaneButton
+            label="All channels"
+            count={threads.length}
+            active={channel === null}
+            onClick={() => setChannel(null)}
+          />
           {channels.map((c) => (
             <button
               key={c.key}

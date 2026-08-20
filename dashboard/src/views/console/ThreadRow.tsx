@@ -179,7 +179,10 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
 export function LivenessRule({ running }: { running: boolean }) {
   return (
     <div className="ncc-track" aria-hidden="true">
-      <div className={running ? 'ncc-seg ncc-seg-live' : 'ncc-seg ncc-seg-still'} data-motion={running ? 'live' : 'still'} />
+      <div
+        className={running ? 'ncc-seg ncc-seg-live' : 'ncc-seg ncc-seg-still'}
+        data-motion={running ? 'live' : 'still'}
+      />
     </div>
   );
 }

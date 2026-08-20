@@ -36,7 +36,9 @@ function thread(n: number, over: Partial<ThreadSummary> = {}): ThreadSummary {
     channel_key: 'slack:CTESTCHAN01',
     channel_name: '#example-eng',
     title: `Thread ${n}`,
-    participants: [{ agent_group_id: 'ag-1', name: 'Alpha', session_id: `s-${n}`, avatarUrl: null, provider: 'claude' }],
+    participants: [
+      { agent_group_id: 'ag-1', name: 'Alpha', session_id: `s-${n}`, avatarUrl: null, provider: 'claude' },
+    ],
     last_activity_at: '2026-08-20T09:00:00.000Z',
     state: 'needs_you',
     session_ids: [`s-${n}`],

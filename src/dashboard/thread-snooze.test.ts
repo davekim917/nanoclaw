@@ -90,7 +90,7 @@ describe('the endpoints', () => {
     seedSession('s-1', 'ag-1', 'slack:CTESTCHAN01:1700000000.11', iso(60_000));
     const res = await threadSnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx());
     expect(res!.status).toBe(200);
-    expect((await res!.json() as { snoozed_at_activity: string | null }).snoozed_at_activity).toBe(iso(60_000));
+    expect(((await res!.json()) as { snoozed_at_activity: string | null }).snoozed_at_activity).toBe(iso(60_000));
 
     const map = readThreadSnoozes('u1', ['slack:CTESTCHAN01:1700000000.11']);
     expect(isSnoozed(map.get('slack:CTESTCHAN01:1700000000.11'), iso(60_000))).toBe(true);
@@ -102,7 +102,7 @@ describe('the endpoints', () => {
     seedSession('s-1', 'ag-1', 'slack:CTESTCHAN01:1700000000.11', iso(600_000));
     seedSession('s-2', 'ag-2', 'slack:CTESTCHAN01:1700000000.11', iso(60_000));
     const res = await threadSnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx());
-    expect((await res!.json() as { snoozed_at_activity: string | null }).snoozed_at_activity).toBe(iso(60_000));
+    expect(((await res!.json()) as { snoozed_at_activity: string | null }).snoozed_at_activity).toBe(iso(60_000));
   });
 
   it('re-snoozing an already-moved thread re-arms it at the new mark', async () => {
@@ -120,11 +120,9 @@ describe('the endpoints', () => {
     // Exactly the shape `bumpLastOutbound` writes — no zone marker. Nothing
     // downstream normalizes this table (053 works off an allowlist), so the
     // write site is the only place that can get it right.
-    getDb().prepare('UPDATE sessions SET last_outbound_at = ?, last_active = ? WHERE id = ?').run(
-      '2026-08-20 06:16:56',
-      '2026-08-20 06:00:00',
-      's-1',
-    );
+    getDb()
+      .prepare('UPDATE sessions SET last_outbound_at = ?, last_active = ? WHERE id = ?')
+      .run('2026-08-20 06:16:56', '2026-08-20 06:00:00', 's-1');
     await threadSnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.11' }, ctx());
     const row = getDb().prepare('SELECT snoozed_at_activity, created_at FROM thread_snoozes').get() as {
       snoozed_at_activity: string;
@@ -156,11 +154,7 @@ describe('the endpoints', () => {
 
   it('accepts a percent-encoded thread id', async () => {
     seedSession('s-1', 'ag-1', 'slack:CTESTCHAN01:1700000000.11', iso(60_000));
-    const res = await threadSnoozeHandler(
-      post(),
-      { id: encodeURIComponent('slack:CTESTCHAN01:1700000000.11') },
-      ctx(),
-    );
+    const res = await threadSnoozeHandler(post(), { id: encodeURIComponent('slack:CTESTCHAN01:1700000000.11') }, ctx());
     expect(res!.status).toBe(200);
     expect(readThreadSnoozes('u1', ['slack:CTESTCHAN01:1700000000.11']).size).toBe(1);
   });

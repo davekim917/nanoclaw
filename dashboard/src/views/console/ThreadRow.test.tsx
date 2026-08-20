@@ -244,7 +244,13 @@ describe('avatar stack (§4)', () => {
   it('uses the real avatar when one exists, and initials when it does not', () => {
     const { row } = renderRow({
       participants: [
-        { agent_group_id: 'ag-1', name: 'Alpha', session_id: 's-1', avatarUrl: 'https://example.invalid/a_72.png', provider: 'claude' },
+        {
+          agent_group_id: 'ag-1',
+          name: 'Alpha',
+          session_id: 's-1',
+          avatarUrl: 'https://example.invalid/a_72.png',
+          provider: 'claude',
+        },
         { agent_group_id: 'ag-2', name: 'Bravo', session_id: 's-2', avatarUrl: null, provider: 'claude' },
       ],
     });

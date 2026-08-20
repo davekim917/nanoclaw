@@ -68,7 +68,14 @@ export const STATE_PRESENTATION: Record<ThreadState, StatePresentation> = {
     action: 'compose',
     inertReason: null,
   },
-  stalled: { label: 'Stalled', verb: 'Kill', tone: 'attention', wantsAttention: true, action: null, inertReason: KILL_INERT },
+  stalled: {
+    label: 'Stalled',
+    verb: 'Kill',
+    tone: 'attention',
+    wantsAttention: true,
+    action: null,
+    inertReason: KILL_INERT,
+  },
   unassigned: {
     label: 'Unassigned',
     verb: 'Assign',
@@ -77,7 +84,14 @@ export const STATE_PRESENTATION: Record<ThreadState, StatePresentation> = {
     action: null,
     inertReason: ASSIGN_INERT,
   },
-  running: { label: 'Running', verb: 'Steer', tone: 'live', wantsAttention: false, action: 'compose', inertReason: null },
+  running: {
+    label: 'Running',
+    verb: 'Steer',
+    tone: 'live',
+    wantsAttention: false,
+    action: 'compose',
+    inertReason: null,
+  },
   parked: {
     label: 'Parked',
     verb: 'Reassign',
@@ -170,7 +184,10 @@ export function elapsed(iso: string | null, now: number = Date.now()): string {
 
 /** Two initials for the avatar fallback — a friendly display name, never an id. */
 export function initials(name: string): string {
-  const words = name.trim().split(/[\s_-]+/).filter(Boolean);
+  const words = name
+    .trim()
+    .split(/[\s_-]+/)
+    .filter(Boolean);
   if (words.length === 0) return '·';
   if (words.length === 1) return words[0]!.slice(0, 2).toUpperCase();
   return (words[0]![0]! + words[1]![0]!).toUpperCase();

@@ -64,7 +64,7 @@ export interface ApiError {
 async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, { credentials: 'include', ...init });
   if (!res.ok) {
-    const body = await res.json().catch(() => ({})) as { error?: string; retry_after?: number };
+    const body = (await res.json().catch(() => ({}))) as { error?: string; retry_after?: number };
     const apiErr: ApiError = {
       status: res.status,
       error: body.error ?? 'unknown',
@@ -141,30 +141,26 @@ export async function listSessions(filter?: {
 
 export async function postSessionMessage(
   sessionId: string,
-  body: { idempotency_key: string; text: string }
+  body: { idempotency_key: string; text: string },
 ): Promise<SteerResponse> {
-  return apiFetch<SteerResponse>(
-    `/dashboard/api/sessions/${encodeURIComponent(sessionId)}/message`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }
-  );
+  return apiFetch<SteerResponse>(`/dashboard/api/sessions/${encodeURIComponent(sessionId)}/message`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
 
 export async function archiveSession(sessionId: string): Promise<{ session_id: string; archived_at: string }> {
   return apiFetch<{ session_id: string; archived_at: string }>(
     `/dashboard/api/sessions/${encodeURIComponent(sessionId)}/archive`,
-    { method: 'POST' }
+    { method: 'POST' },
   );
 }
 
 export async function unarchiveSession(sessionId: string): Promise<{ session_id: string }> {
-  return apiFetch<{ session_id: string }>(
-    `/dashboard/api/sessions/${encodeURIComponent(sessionId)}/unarchive`,
-    { method: 'POST' }
-  );
+  return apiFetch<{ session_id: string }>(`/dashboard/api/sessions/${encodeURIComponent(sessionId)}/unarchive`, {
+    method: 'POST',
+  });
 }
 
 // ─── Scheduled-tasks board (Group E) ────────────────────────────────────────
@@ -177,14 +173,7 @@ export async function unarchiveSession(sessionId: string): Promise<{ session_id:
 // arrive computed from the API and are the single source of truth.
 
 /** Health states — derived server-side per design §4.1; never read from `status`. */
-export type HealthState =
-  | 'healthy'
-  | 'late'
-  | 'stalled'
-  | 'paused'
-  | 'processing'
-  | 'unknown'
-  | 'strand';
+export type HealthState = 'healthy' | 'late' | 'stalled' | 'paused' | 'processing' | 'unknown' | 'strand';
 
 /** Series kind — a column-mask AND'd with the health-state cell (matrix §4.0). */
 export type SeriesKind = 'recurring' | 'one_off' | 'thread_loop';
@@ -193,12 +182,7 @@ export type SeriesKind = 'recurring' | 'one_off' | 'thread_loop';
 export type ScheduledVerb = 'edit' | 'pause' | 'resume' | 'run_now' | 'cancel' | 'move';
 
 /** Per-fire history outcome labels (design §4.1; the D16 F-amendment merge). */
-export type FireOutcomeLabel =
-  | 'ran'
-  | 'completed (no chat output)'
-  | 'failed'
-  | 'missed'
-  | 'cancelled';
+export type FireOutcomeLabel = 'ran' | 'completed (no chat output)' | 'failed' | 'missed' | 'cancelled';
 
 export interface FireOutcome {
   /** Live row id / fire id for this entry. */
@@ -326,10 +310,7 @@ export async function resumeScheduled(key: string): Promise<{ resumed?: true }> 
   });
 }
 
-export async function runNowScheduled(
-  key: string,
-  opts?: { force?: boolean },
-): Promise<{ fired: true }> {
+export async function runNowScheduled(key: string, opts?: { force?: boolean }): Promise<{ fired: true }> {
   return apiFetch<{ fired: true }>(`/dashboard/api/scheduled/${encodeURIComponent(key)}/run-now`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -348,14 +329,11 @@ export async function moveScheduledPreview(
   key: string,
   body: { targetAgentGroupId: string; targetMessagingGroupId: string },
 ): Promise<MovePreviewResult> {
-  return apiFetch<MovePreviewResult>(
-    `/dashboard/api/scheduled/${encodeURIComponent(key)}/move/preview`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    },
-  );
+  return apiFetch<MovePreviewResult>(`/dashboard/api/scheduled/${encodeURIComponent(key)}/move/preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
 
 export async function moveScheduled(
@@ -499,7 +477,12 @@ export interface ObservatoryAgent {
    * asking about a specific room must compare `channelKey` against it —
    * this is not a per-room map, just "where do I currently point".
    */
-  liveSession: { channelKey: string; sessionId: string; threadUrl: string | null; lastOutboundAt: string | null } | null;
+  liveSession: {
+    channelKey: string;
+    sessionId: string;
+    threadUrl: string | null;
+    lastOutboundAt: string | null;
+  } | null;
 }
 
 export type ObservatoryClaimState = 'live' | 'expiring' | 'stale' | 'parked';
@@ -697,9 +680,7 @@ export async function getIssueBrief(workgroupId: string, itemId: string): Promis
 }
 
 export async function getObservatory(workgroupId: string): Promise<ObservatorySnapshot> {
-  return apiFetch<ObservatorySnapshot>(
-    `/dashboard/api/observatory?workgroup=${encodeURIComponent(workgroupId)}`,
-  );
+  return apiFetch<ObservatorySnapshot>(`/dashboard/api/observatory?workgroup=${encodeURIComponent(workgroupId)}`);
 }
 
 // ─── Observatory console — thread-keyed queue (DESIGN.md §3, §5) ────────────
