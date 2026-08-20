@@ -979,3 +979,39 @@ and adding knobs before measuring is how this gets worse.
 Projected drain once live: the largest store, 5,784 facts / 150 per pass = 39 passes at ~120s
 each ≈ 78 minutes, during which episode curation is starved (maintenance claims first,
 unconditionally) — watch for that.
+
+## Investigated and cleared: `bounded write request is required` (2026-08-20)
+
+Eight episode-curation write failures appeared post-restart with
+`memory writer helper failed (1): ... bounded write request is required`. Because they
+began the same day pillar 2 changed the shared writer, they were treated as a possible
+P2 regression and investigated on commit-level evidence rather than on the earlier
+review's reasoning.
+
+**Not pillar 2.** The two byte caps that gate this path — `GENERATED_MEMORY_MAX_BYTES`
+and the helper's `MAX_CURATOR_WRITE_REQUEST_BYTES` — were raised together in one commit
+on 2026-08-05, fifteen days before the P2 commits, and remain exactly synced on main
+(8 MiB + 16 KiB = the helper bound). P2's diff to `curator-write.ts` renamed error
+strings and added `ensureMemorySubdirectory` / `readMemoryTopicFile` /
+`writeMemoryTopicFile`; `invokeHelper` and `writeGeneratedMemory` — the failing path —
+are functionally untouched.
+
+**Actual cause: empty stdin under host-reboot load.** The helper's guard collapses two
+conditions into one message (`!raw` OR oversized). The oversized branch was ruled out:
+the real ledger files are well under the cap, the host pre-checks the same bound before
+spawning, and 15 direct helper invocations with the real 5.6 MB payload produced zero
+failures. All eight failures fall inside the window where the **host machine rebooted**
+(16:23:56Z) and the event loop stalled 5–30s repeatedly; the preceding ~16 hours of
+pillar 2 in production produced none. Failing path is the episode ledger, never the
+topic-file lane (topic writes are capped at 8 KiB — nowhere near this size class).
+
+**Impact: none permanent.** Validation-class episode failures retry on exponential
+backoff (5 min · 2^(n-1), flattening to 24h) and are never marked permanently failed;
+all eight remain queued. A live check confirmed the curation pump is healthy — claiming
+and completing episodes every ~60s — so the "retries not firing" observation was queue
+ordering, not a wedge.
+
+**Deferred hardening** (not urgent, deliberately not bundled into the current restart):
+split the helper's ambiguous error message so empty-stdin and oversized-request are
+distinguishable in logs, and attach an `error` listener to the child's stdin in
+`invokeHelper`.
