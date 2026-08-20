@@ -34,6 +34,21 @@ at an earlier stage. It has no thread yet, and **Assign is the verb that creates
 the thread**. Unowned items therefore appear in the *same* queue as live
 threads, never in a separate inbox.
 
+## 2a. An out-of-scope or unknown scoping value resolves to absent, never a 403
+
+Every scope-narrowing parameter — `group_id`, `workgroup`, a thread id in the
+detail path — is applied as an `AND` term intersected with
+`ctx.scopes.allowed_group_ids` (§3.5). A value that names something real but
+out of the caller's scope, and a value that names nothing at all, must produce
+the identical result: zero rows from the list endpoint, a 404 from the detail
+endpoint. Neither ever earns a 403.
+
+A distinguishable 403 would leak that the id exists — an authorization oracle
+— and would fork error handling into a second path that can disagree with the
+scope filter about what the caller is allowed to see. Collapsing "not
+allowed" and "doesn't exist" into one response keeps the query surface a pure
+intersection, not a permission layer bolted on beside it.
+
 ## 3. Data rules
 
 These four are non-negotiable and each one silently produces a wrong UI if
@@ -104,6 +119,58 @@ scale that does not exist.
 The list API recomputes liveness from `.heartbeat` mtime: `<60s` running,
 `<300s` idle, else stale. New queries must do the same rather than reading the
 column.
+
+### 3.5 Workgroup is the primary filter axis; channel is independent; `group_id` only narrows
+
+The workgroup, not the agent group, is the unit an operator filters by. An
+agent group is one sibling bot (`example-labs`, `example-labs-b`, …); a
+workgroup is the whole book of work behind them — one client engagement, one
+product surface. Filtering by agent group instead forces the operator to pick
+one sibling and hides the rest of a thread's participants — §3.1 already put
+35% of threads at more than one agent. Channel is a second, independent axis:
+it narrows by where the thread lives, not by who is on it, and combines with
+the workgroup filter rather than replacing it.
+
+`selectScopedSessions` in `src/dashboard/api/threads.ts` builds every scope
+term as a separate `AND` clause, never a replacement for the one before it:
+
+```sql
+s.agent_group_id IN (<allowed_group_ids>)                                  -- the caller's own ceiling
+AND s.agent_group_id IN (SELECT id FROM agent_groups WHERE workgroup_id=?)  -- workgroup, if set
+AND s.agent_group_id = ?                                                   -- group_id, if set
+```
+
+Each added term can only shrink the row set, never widen past
+`allowed_group_ids` — `group_id` narrows within the selected workgroup, it is
+never a route to an agent group the scope clause alone would have excluded.
+What an out-of-scope value resolves to is §2a.
+
+## 3a. Shell geometry — a fixed viewport, not a scrolling document
+
+The console root is a **fixed-viewport shell**: `height: 100vh; height:
+100dvh; overflow: hidden`. Never `min-height`. A `min-height` root grows to
+fit its content, so no flex child beneath it is ever forced to shrink, no
+descendant `overflow-y: auto` region ever engages, and every scroll on the
+page escapes to one page-level scroll. That one substitution — `min-height`
+for `height` — was the single defect behind three separate complaints: the
+left nav scrolled away with the page, the composer was only reachable at the
+bottom of the page, and the transcript could never anchor to its newest
+message.
+
+Every flex/grid child that contains a scroller needs `min-height: 0`. A flex
+child's automatic minimum size is its content size; without the override it
+refuses to shrink below that content no matter how firm the ancestor's height
+is.
+
+Scrolling belongs to named interior panes, never to the page: `.ncc-side`
+(left nav), `.ncc-list` (thread queue), `.ncc-transcript` (message history).
+Everything else in the shell — top bar, composer, row chrome — is fixed and
+never scrolls.
+
+Nothing outside the console may wrap it in its own height box. `main.tsx`
+previously wrapped the mounted console in a `minHeight: 100vh` div; a `100vh`
+wrapper around a `100dvh` shell reintroduces the exact browser-chrome-sized
+page scroll the shell exists to remove.
 
 ## 4. Row anatomy
 
