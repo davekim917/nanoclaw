@@ -51,8 +51,14 @@ function setupDb(): void {
   runMigrations(db);
 }
 
-function seedAgentGroup(id: string): void {
+function seedAgentGroup(id: string, workgroupId?: string): void {
   createAgentGroup({ id, name: id, folder: id, agent_provider: null, created_at: iso(0) });
+  // `createAgentGroup` does not carry workgroup_id; the reconcile path sets it.
+  if (workgroupId) getDb().prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(workgroupId, id);
+}
+
+function seedWorkgroup(id: string): void {
+  getDb().prepare('INSERT INTO workgroups (id, created_at) VALUES (?, ?)').run(id, iso(0));
 }
 
 function insertSession(opts: {
@@ -421,6 +427,124 @@ describe('buildThreadList — grouping', () => {
     const scoped = makeCtx({ no_filter: false, allowed_group_ids: ['ag-1'] });
     const { threads } = await buildThreadList(scoped, LIST_OPTS, deps());
     expect(threads.map((t) => t.session_ids)).toEqual([['s-1']]);
+  });
+});
+
+// ── The workgroup axis ───────────────────────────────────────────────────────
+
+/**
+ * The console filters by WORKGROUP, not agent group. `example-labs` is six sibling
+ * agent groups sharing one workgroup and most threads are multi-agent, so an
+ * agent-group filter made the operator pick one sibling and hid the rest of the
+ * thread's participants.
+ *
+ * The rule that has to hold under test is that the workgroup only ever
+ * SUBTRACTS: it is resolved against `agent_groups.workgroup_id` and intersected
+ * with `ctx.scopes.allowed_group_ids`, which is agent-group scoped and stays the
+ * ceiling. There is no workgroup permission concept.
+ */
+describe('buildThreadList — workgroup axis', () => {
+  beforeEach(() => {
+    closeDb();
+    setupDb();
+    seedWorkgroup('example-labs');
+    seedWorkgroup('example-dev');
+    seedAgentGroup('ag-lab-1', 'example-labs');
+    seedAgentGroup('ag-lab-2', 'example-labs');
+    seedAgentGroup('ag-lab-3', 'example-labs');
+    seedAgentGroup('ag-dev-1', 'example-dev');
+    // An unassigned group — `workgroup_id` is nullable and a NULL must never
+    // match a named workgroup.
+    seedAgentGroup('ag-orphan');
+  });
+
+  it('resolves a workgroup to EVERY sibling in it', async () => {
+    insertSession({ id: 's-a', agentGroupId: 'ag-lab-1', threadId: 'slack:CTESTCHAN01:1.1' });
+    insertSession({ id: 's-b', agentGroupId: 'ag-lab-2', threadId: 'slack:CTESTCHAN01:2.2' });
+    insertSession({ id: 's-c', agentGroupId: 'ag-lab-3', threadId: 'slack:CTESTCHAN01:3.3' });
+    insertSession({ id: 's-d', agentGroupId: 'ag-dev-1', threadId: 'slack:CTESTCHAN01:4.4' });
+    insertSession({ id: 's-e', agentGroupId: 'ag-orphan', threadId: 'slack:CTESTCHAN01:5.5' });
+
+    const { threads } = await buildThreadList(makeCtx(), { ...LIST_OPTS, workgroupId: 'example-labs' }, deps());
+    expect(threads.flatMap((t) => t.session_ids).sort()).toEqual(['s-a', 's-b', 's-c']);
+  });
+
+  it('keeps a multi-sibling thread whole — one row, every participant', async () => {
+    const thread = 'slack:CTESTCHAN01:9.9';
+    insertSession({ id: 's-a', agentGroupId: 'ag-lab-1', threadId: thread });
+    insertSession({ id: 's-b', agentGroupId: 'ag-lab-2', threadId: thread });
+    insertSession({ id: 's-c', agentGroupId: 'ag-lab-3', threadId: thread });
+
+    const { threads } = await buildThreadList(makeCtx(), { ...LIST_OPTS, workgroupId: 'example-labs' }, deps());
+    expect(threads).toHaveLength(1);
+    expect(threads[0]!.participants.map((p) => p.agent_group_id).sort()).toEqual(['ag-lab-1', 'ag-lab-2', 'ag-lab-3']);
+  });
+
+  it('lets group_id NARROW within the workgroup, never widen out of it', async () => {
+    insertSession({ id: 's-a', agentGroupId: 'ag-lab-1', threadId: 'slack:CTESTCHAN01:1.1' });
+    insertSession({ id: 's-b', agentGroupId: 'ag-lab-2', threadId: 'slack:CTESTCHAN01:2.2' });
+    insertSession({ id: 's-d', agentGroupId: 'ag-dev-1', threadId: 'slack:CTESTCHAN01:4.4' });
+
+    const narrowed = await buildThreadList(
+      makeCtx(),
+      { ...LIST_OPTS, workgroupId: 'example-labs', groupId: 'ag-lab-2' },
+      deps(),
+    );
+    expect(narrowed.threads.flatMap((t) => t.session_ids)).toEqual(['s-b']);
+
+    // A group_id from ANOTHER workgroup is an empty intersection, not an escape.
+    const crossed = await buildThreadList(
+      makeCtx(),
+      { ...LIST_OPTS, workgroupId: 'example-labs', groupId: 'ag-dev-1' },
+      deps(),
+    );
+    expect(crossed.threads).toEqual([]);
+  });
+
+  it('shows a scoped caller ONLY the siblings they are already allowed', async () => {
+    insertSession({ id: 's-a', agentGroupId: 'ag-lab-1', threadId: 'slack:CTESTCHAN01:1.1' });
+    insertSession({ id: 's-b', agentGroupId: 'ag-lab-2', threadId: 'slack:CTESTCHAN01:2.2' });
+    insertSession({ id: 's-c', agentGroupId: 'ag-lab-3', threadId: 'slack:CTESTCHAN01:3.3' });
+
+    // Allowed two of the three siblings. Selecting the workgroup must not
+    // become a back door to the third.
+    const scoped = makeCtx({ no_filter: false, allowed_group_ids: ['ag-lab-1', 'ag-lab-2'] });
+    const { threads } = await buildThreadList(scoped, { ...LIST_OPTS, workgroupId: 'example-labs' }, deps());
+    expect(threads.flatMap((t) => t.session_ids).sort()).toEqual(['s-a', 's-b']);
+  });
+
+  it('shows a scoped caller only their own sibling of a SHARED thread', async () => {
+    const thread = 'slack:CTESTCHAN01:9.9';
+    insertSession({ id: 's-a', agentGroupId: 'ag-lab-1', threadId: thread });
+    insertSession({ id: 's-c', agentGroupId: 'ag-lab-3', threadId: thread });
+
+    const scoped = makeCtx({ no_filter: false, allowed_group_ids: ['ag-lab-1'] });
+    const { threads } = await buildThreadList(scoped, { ...LIST_OPTS, workgroupId: 'example-labs' }, deps());
+    expect(threads).toHaveLength(1);
+    expect(threads[0]!.participants.map((p) => p.agent_group_id)).toEqual(['ag-lab-1']);
+  });
+
+  it('yields zero rows for a workgroup the caller is allowed nothing in — never a 403', async () => {
+    insertSession({ id: 's-d', agentGroupId: 'ag-dev-1', threadId: 'slack:CTESTCHAN01:4.4' });
+
+    const scoped = makeCtx({ no_filter: false, allowed_group_ids: ['ag-lab-1'] });
+    const { threads } = await buildThreadList(scoped, { ...LIST_OPTS, workgroupId: 'example-dev' }, deps());
+    expect(threads).toEqual([]);
+  });
+
+  it('yields zero rows for an unknown workgroup rather than falling open', async () => {
+    insertSession({ id: 's-a', agentGroupId: 'ag-lab-1', threadId: 'slack:CTESTCHAN01:1.1' });
+    const { threads } = await buildThreadList(makeCtx(), { ...LIST_OPTS, workgroupId: 'no-such-wg' }, deps());
+    expect(threads).toEqual([]);
+  });
+
+  it('lists every workgroup when none is named', async () => {
+    insertSession({ id: 's-a', agentGroupId: 'ag-lab-1', threadId: 'slack:CTESTCHAN01:1.1' });
+    insertSession({ id: 's-d', agentGroupId: 'ag-dev-1', threadId: 'slack:CTESTCHAN01:4.4' });
+    insertSession({ id: 's-e', agentGroupId: 'ag-orphan', threadId: 'slack:CTESTCHAN01:5.5' });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads.flatMap((t) => t.session_ids).sort()).toEqual(['s-a', 's-d', 's-e']);
   });
 });
 

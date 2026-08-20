@@ -4,15 +4,17 @@ import {
   getThreadDetail,
   listGroups,
   listThreads,
+  listWorkgroups,
   type AuthMe,
   type GroupSummary,
   type ThreadState,
   type ThreadSummary,
   type ThreadTranscriptEntry,
+  type WorkgroupSummary,
 } from '../../lib/api.js';
 import { stripMarkdown } from '../../lib/markdown.js';
 import { subscribe } from '../../lib/sse.ts';
-import { useGroupFilter } from '../../lib/use-group-filter.js';
+import { useWorkgroupFilter } from '../../lib/use-workgroup-filter.js';
 import { actionError } from './action-error.js';
 import { closeThread, setSnoozed } from './actions.js';
 import { ScheduleLens } from './ScheduleLens.js';
@@ -51,11 +53,21 @@ const THEME_KEY = 'ncc-theme';
 const THEME_CYCLE: ThemeChoice[] = ['system', 'dark', 'light'];
 
 export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
-  const [groupFilter, setGroupFilter] = useGroupFilter(
-    authMe.user_id,
-    authMe.scopes.allowed_group_ids,
-    authMe.scopes.no_filter,
-  );
+  /**
+   * The primary axis is the WORKGROUP (`example-labs`, `example-dev`, …), not the
+   * agent group. Siblings share a workgroup and most threads are multi-agent,
+   * so an agent-group selector listed `example-labs` six times and made the
+   * operator pick one sibling to see a thread all six are on.
+   *
+   * The endpoint has already scope-filtered this list: a workgroup where the
+   * caller is allowed no sibling is simply not in it (workgroups.ts), and the
+   * server intersects the filter with scope again on every query — selecting a
+   * workgroup can only ever subtract.
+   */
+  const { data: workgroupsData } = useSWR('/dashboard/api/workgroups', () => listWorkgroups(), { refreshInterval: 0 });
+  const workgroups: WorkgroupSummary[] = useMemo(() => workgroupsData?.workgroups ?? [], [workgroupsData]);
+  const workgroupIds = useMemo(() => workgroups.map((w) => w.id), [workgroups]);
+  const [workgroupFilter, setWorkgroupFilter] = useWorkgroupFilter(authMe.user_id, workgroupIds);
   const [lane, setLane] = useState<Lane>('all');
   const [rawChannel, setChannel] = useState<string | null>(null);
   const [query, setQuery] = useState('');
@@ -67,14 +79,24 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
   const lens = useHashLens();
 
   const { data, mutate } = useSWR(
-    ['/dashboard/api/threads', groupFilter],
-    () => listThreads(groupFilter === 'all' ? {} : { group_id: groupFilter }),
+    ['/dashboard/api/threads', workgroupFilter],
+    () => listThreads(workgroupFilter === 'all' ? {} : { workgroup: workgroupFilter }),
     { refreshInterval: 0, dedupingInterval: 500 },
   );
   useSseInvalidation(mutate);
 
+  // Agent groups are still fetched — the Schedule lens keys its rows on
+  // `agent_group_id` and needs the workgroup → siblings mapping to honour the
+  // same filter. They are NOT a second selector; see the note on the header.
   const { data: groupsData } = useSWR('/dashboard/api/groups', () => listGroups(), { refreshInterval: 0 });
-  const groups: GroupSummary[] = groupsData?.groups ?? [];
+  const groups: GroupSummary[] = useMemo(() => groupsData?.groups ?? [], [groupsData]);
+  const scheduleAgentGroupIds = useMemo(
+    () =>
+      workgroupFilter === 'all'
+        ? null
+        : new Set(groups.filter((g) => g.workgroup_id === workgroupFilter).map((g) => g.id)),
+    [groups, workgroupFilter],
+  );
 
   const threads = useMemo(() => data?.threads ?? [], [data]);
 
@@ -103,7 +125,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
 
   /**
    * The channel filter, validated against the channels that actually exist —
-   * the same guard `use-group-filter.ts` applies to a stored group id, for the
+   * the same guard `use-workgroup-filter.ts` applies to a stored workgroup, for
    * same reason. `channels` is derived from the CURRENT window, so a channel
    * whose last thread aged out simply stops being listed; without this the
    * sidebar would show "All channels" pressed while an invisible filter kept
@@ -225,16 +247,22 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
     <div className="ncc">
       <header className="ncc-top">
         <span className="ncc-brand">Observatory</span>
+        {/* One selector, one axis. There is deliberately no second
+            narrow-to-one-sibling control: every row already carries the avatar
+            stack of the agents on that thread, which answers "which sibling is
+            on this" without costing the operator a click or a second piece of
+            filter state to reason about. `group_id` is still a supported query
+            parameter for other callers. */}
         <select
           className="ncc-select"
-          aria-label="Agent group"
-          value={groupFilter}
-          onChange={(e) => setGroupFilter(e.target.value)}
+          aria-label="Workgroup"
+          value={workgroupFilter}
+          onChange={(e) => setWorkgroupFilter(e.target.value)}
         >
-          <option value="all">all groups</option>
-          {groups.map((g) => (
-            <option key={g.id} value={g.id}>
-              {g.name}
+          <option value="all">all workgroups</option>
+          {workgroups.map((w) => (
+            <option key={w.id} value={w.id}>
+              {w.name}
             </option>
           ))}
         </select>
@@ -331,7 +359,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
           <div className="ncc-side-gap" />
           <h2 className="ncc-side-head">Lenses</h2>
           {/* §11: the schedule is a LENS, not a destination — same shell, same
-              group filter, a different thing to look at. The floor-plan lens is
+              workgroup filter, a different thing to look at. The floor-plan lens is
               gone with the floor plan itself; a lens with no target is worse
               than no lens. */}
           <a className="ncc-side-item" href="#/console" aria-current={lens === 'threads' ? 'page' : undefined}>
@@ -343,7 +371,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
         </nav>
 
         {lens === 'schedule' ? (
-          <ScheduleLens groupFilter={groupFilter} groups={groups} />
+          <ScheduleLens agentGroupIds={scheduleAgentGroupIds} groups={groups} />
         ) : (
           <>
             <section className="ncc-list-pane" aria-label="Threads" hidden={triage !== null}>

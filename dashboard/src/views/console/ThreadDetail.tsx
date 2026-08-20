@@ -236,7 +236,7 @@ export function ReplyComposer({
    * assignable that the next refresh no longer wires to this channel. The select
    * would render blank while the state still held them, and the send would then
    * go to somebody the operator can no longer see. Nobody is the honest reading
-   * of that — same guard `use-group-filter.ts` puts on a stored group id, and
+   * of that — same guard `use-workgroup-filter.ts` puts on a stored workgroup, and
    * the same one the legacy composer put on its room-narrowed addressee.
    */
   const agentId = reachable.some((a) => a.id === rawAgentId) ? rawAgentId : '';

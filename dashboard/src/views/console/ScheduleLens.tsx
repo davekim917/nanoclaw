@@ -51,9 +51,15 @@ export function relTime(iso: string, now = Date.now()): string {
  * defaulting it to zero parks every undated row at one end and calls that an
  * ordering.
  */
-export function scheduleRows(rows: ScheduledRow[], groupFilter: string): ScheduledRow[] {
+/**
+ * `agentGroupIds` is null for "every workgroup", otherwise the sibling set of
+ * the selected workgroup. Scheduled rows are keyed on `agent_group_id`, so the
+ * console's workgroup axis has to be expanded to its siblings to filter them —
+ * a single id would have shown one sibling's jobs and hidden the other five.
+ */
+export function scheduleRows(rows: ScheduledRow[], agentGroupIds: ReadonlySet<string> | null): ScheduledRow[] {
   return rows
-    .filter((r) => groupFilter === 'all' || r.agent_group_id === groupFilter)
+    .filter((r) => agentGroupIds === null || agentGroupIds.has(r.agent_group_id))
     .slice()
     .sort((a, b) => {
       const at = a.next_fire_utc ? Date.parse(a.next_fire_utc) : null;
@@ -79,12 +85,18 @@ export function scheduleSummary(rows: ScheduledRow[], now = Date.now()): string 
   return `${rows.length} on this floor · ${when}`;
 }
 
-export function ScheduleLens({ groupFilter, groups }: { groupFilter: string; groups: GroupSummary[] }) {
+export function ScheduleLens({
+  agentGroupIds,
+  groups,
+}: {
+  agentGroupIds: ReadonlySet<string> | null;
+  groups: GroupSummary[];
+}) {
   const { data, error, mutate } = useSWR('/dashboard/api/scheduled', () => listScheduled(), { refreshInterval: 0 });
   const [openKey, setOpenKey] = useState<string | null>(null);
 
   const names = useMemo(() => new Map(groups.map((g) => [g.id, g.name])), [groups]);
-  const rows = useMemo(() => scheduleRows(data?.rows ?? [], groupFilter), [data, groupFilter]);
+  const rows = useMemo(() => scheduleRows(data?.rows ?? [], agentGroupIds), [data, agentGroupIds]);
 
   const failed = Boolean(error) && !data;
   // A key whose row has dropped out of the window (it fired, or was cancelled
@@ -105,7 +117,7 @@ export function ScheduleLens({ groupFilter, groups }: { groupFilter: string; gro
       {failed && <div className="ncc-empty">couldn’t load scheduled work</div>}
       {!failed && data && rows.length === 0 && (
         <div className="ncc-empty">
-          {groupFilter === 'all' ? 'nothing scheduled' : 'nothing scheduled for this group'}
+          {agentGroupIds === null ? 'nothing scheduled' : 'nothing scheduled for this workgroup'}
         </div>
       )}
 

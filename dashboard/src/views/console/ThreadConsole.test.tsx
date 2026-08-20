@@ -15,6 +15,7 @@ vi.mock('../../lib/sse.ts', () => ({ subscribe, startSSE: vi.fn(), stopSSE: vi.f
 
 const listThreads = vi.fn();
 const listGroups = vi.fn();
+const listWorkgroups = vi.fn();
 const getThreadDetail = vi.fn();
 const archiveSession = vi.fn().mockResolvedValue({});
 const snoozeThread = vi.fn().mockResolvedValue({});
@@ -23,6 +24,7 @@ const postThreadMessage = vi.fn().mockResolvedValue({ created_session: false, ha
 vi.mock('../../lib/api.js', () => ({
   listThreads,
   listGroups,
+  listWorkgroups,
   getThreadDetail,
   archiveSession,
   snoozeThread,
@@ -57,7 +59,8 @@ function thread(id: string, over: Partial<ThreadSummary> = {}): ThreadSummary {
 }
 
 beforeEach(() => {
-  listGroups.mockResolvedValue({ groups: [{ id: 'ag-1', name: 'example-workgroup' }] });
+  listGroups.mockResolvedValue({ groups: [{ id: 'ag-1', name: 'example-agent', workgroup_id: 'wg-example' }] });
+  listWorkgroups.mockResolvedValue({ workgroups: [{ id: 'wg-example', name: 'Example Workgroup' }] });
   getThreadDetail.mockResolvedValue({
     thread: thread('t-1'),
     transcript: [
@@ -521,5 +524,80 @@ describe('a channel filter is never left invisibly in force', () => {
     await waitFor(() => expect(screen.queryByRole('button', { name: /^#two/ })).toBeNull());
     await waitFor(() => expect(threadIds(container)).toEqual(['t-1']));
     expect(screen.getByRole('button', { name: /^All channels/ }).getAttribute('aria-pressed')).toBe('true');
+  });
+});
+
+/**
+ * The console's primary axis is the WORKGROUP, not the agent group. Siblings
+ * (`example-labs`, `example-labs-b`, `example-labs-c`, …) share one and most
+ * threads are multi-agent, so an agent-group selector listed the same
+ * workgroup six times and made the operator pick one sibling per look.
+ */
+describe('the primary filter axis is the workgroup', () => {
+  it('lists workgroups in the top selector, not agent groups', async () => {
+    listThreads.mockResolvedValue({ threads: [] });
+    listWorkgroups.mockResolvedValue({
+      workgroups: [
+        { id: 'example-labs', name: 'Example Labs' },
+        { id: 'example-dev', name: 'Example Dev' },
+      ],
+    });
+    // Six siblings of ONE workgroup — none of these may reach the selector.
+    listGroups.mockResolvedValue({
+      groups: ['example-labs', 'example-labs-b', 'example-labs-c', 'example-labs-d'].map((id) => ({
+        id,
+        name: id,
+        workgroup_id: 'example-labs',
+      })),
+    });
+    mount();
+
+    const select = await screen.findByRole('combobox', { name: 'Workgroup' });
+    await waitFor(() =>
+      expect(Array.from(select.querySelectorAll('option')).map((o) => o.textContent)).toEqual([
+        'all workgroups',
+        'Example Labs',
+        'Example Dev',
+      ]),
+    );
+  });
+
+  it('asks the endpoint for a workgroup, never a group_id', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({ threads: [] });
+    listWorkgroups.mockResolvedValue({ workgroups: [{ id: 'example-labs', name: 'Example Labs' }] });
+    mount();
+
+    const select = await screen.findByRole('combobox', { name: 'Workgroup' });
+    await waitFor(() => expect(select.querySelectorAll('option')).toHaveLength(2));
+    await user.selectOptions(select, 'example-labs');
+
+    await waitFor(() => expect(listThreads).toHaveBeenCalledWith({ workgroup: 'example-labs' }));
+    expect(listThreads).not.toHaveBeenCalledWith(expect.objectContaining({ group_id: expect.anything() }));
+  });
+
+  // The stale-selection guard `use-workgroup-filter.ts` exists for: a stored
+  // workgroup that is gone must fall back to "all" rather than silently
+  // filtering the queue to nothing.
+  it('falls back to all workgroups when the stored selection is gone', async () => {
+    localStorage.setItem('nc:dash:workgroup_filter:u1', 'retired-workgroup');
+    listThreads.mockResolvedValue({ threads: [thread('t-1')] });
+    listWorkgroups.mockResolvedValue({ workgroups: [{ id: 'example-labs', name: 'Example Labs' }] });
+    const { container } = mount();
+
+    const select = await screen.findByRole('combobox', { name: 'Workgroup' });
+    await waitFor(() => expect((select as HTMLSelectElement).value).toBe('all'));
+    expect(localStorage.getItem('nc:dash:workgroup_filter:u1')).toBeNull();
+    // …and the queue is not empty, which is the failure this guard prevents.
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+  });
+
+  // The judgment call, pinned: no second narrow-to-one-sibling control. The
+  // avatar stack on each row already answers "which sibling is on this".
+  it('offers exactly one selector', async () => {
+    listThreads.mockResolvedValue({ threads: [] });
+    mount();
+    await screen.findByRole('combobox', { name: 'Workgroup' });
+    expect(screen.getAllByRole('combobox')).toHaveLength(1);
   });
 });

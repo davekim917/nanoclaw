@@ -33,7 +33,7 @@ describe('scheduleRows', () => {
   it('sorts soonest fire first', () => {
     const rows = scheduleRows(
       [row({ key: 'later', next_fire_utc: at(3_600_000) }), row({ key: 'soon', next_fire_utc: at(60_000) })],
-      'all',
+      null,
     );
     expect(rows.map((r) => r.key)).toEqual(['soon', 'later']);
   });
@@ -44,22 +44,29 @@ describe('scheduleRows', () => {
     // row hides the work.
     const rows = scheduleRows(
       [row({ key: 'paused', next_fire_utc: null }), row({ key: 'due', next_fire_utc: at(60_000) })],
-      'all',
+      null,
     );
     expect(rows.map((r) => r.key)).toEqual(['due', 'paused']);
   });
 
-  it('narrows to one agent group when the console filter names one', () => {
+  // The console's axis is the workgroup, so the filter is the SIBLING SET, not
+  // one id: a workgroup's jobs are spread across every sibling in it and a
+  // single-id filter would have shown one sibling's and hidden the rest.
+  it('narrows to the selected workgroup\'s siblings, keeping every one of them', () => {
     const rows = scheduleRows(
-      [row({ key: 'mine', agent_group_id: 'ag-1' }), row({ key: 'theirs', agent_group_id: 'ag-2' })],
-      'ag-1',
+      [
+        row({ key: 'sibling-a', agent_group_id: 'ag-lab-1' }),
+        row({ key: 'sibling-b', agent_group_id: 'ag-lab-2' }),
+        row({ key: 'other-wg', agent_group_id: 'ag-dev-1' }),
+      ],
+      new Set(['ag-lab-1', 'ag-lab-2']),
     );
-    expect(rows.map((r) => r.key)).toEqual(['mine']);
+    expect(rows.map((r) => r.key).sort()).toEqual(['sibling-a', 'sibling-b']);
   });
 
   it('does not mutate the array it was handed', () => {
     const input = [row({ key: 'b', next_fire_utc: at(2) }), row({ key: 'a', next_fire_utc: at(1) })];
-    scheduleRows(input, 'all');
+    scheduleRows(input, null);
     expect(input.map((r) => r.key)).toEqual(['b', 'a']);
   });
 });
@@ -86,7 +93,7 @@ describe('scheduleSummary', () => {
   it('reads the soonest fire, not whichever row came first', () => {
     const rows = scheduleRows(
       [row({ key: 'paused', next_fire_utc: null }), row({ key: 'due', next_fire_utc: at(5 * 60_000) })],
-      'all',
+      null,
     );
     expect(scheduleSummary(rows, NOW)).toBe('2 on this floor · next in 5m');
   });
