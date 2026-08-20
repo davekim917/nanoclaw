@@ -393,3 +393,84 @@ Everything else runs on data that already exists.
   the main queue.
 - Triage is a **mode entered from the list**, never the home screen: one thread,
   three verdict keys, auto-advance.
+
+## 12. Doctrine inherited from the retired Observatory
+
+The legacy Observatory was deleted in favour of this console. Most of what it
+knew was ported as code; what follows is the part that was only ever written
+down. Each line below is a bug someone already paid for, quoted from the file
+that carried it, and kept here because the file no longer exists.
+
+**An affordance must be able to succeed.** A nudge composes into a claim's own
+thread and refuses when there is none, so the surfaces that draw the button read
+the same predicate off the claim rather than each deciding for themselves —
+*"a button whose only outcome is that 409 is worse than no button"*, and *"a
+member, or a row with nowhere to land, would otherwise get a prefilled box whose
+send can only ever be refused."* Before that predicate was shared, one surface
+hardcoded "no" and silently offered less than its neighbours. This is why the
+console renders a disabled verb with a reachable explanation instead of a live
+button that cannot work.
+
+**Surface the defect; never smooth it.** Work with no owner is *"breached at
+birth — nobody has promised anything, so there is nothing to be on track for. It
+sorts with the breaches, not into a tidy 'unowned' bucket that reads as a
+backlog."* An owner with no due date is *"undated — a promise with no clock is
+indistinguishable from no promise"*, and is reported as a coverage gap rather
+than assumed fine.
+
+**Count the gap; never guess into it.** A release-blocking rule existed but was
+never wired, so every finding published `false` — *"including an auth bypass that
+sat unowned for eight days."* The response was not to infer the class from prose:
+*"guessing would be the same fiction as inventing a dependency edge. What we can
+do honestly is count the gap, so it is visible that nothing has been classified
+at all."* Coverage gaps therefore ship beside any derived number, uncollapsed,
+because *"a collapsed disclosure would soften exactly the thing that must not
+soften."*
+
+**An unmeasured value is not a zero.** An age nobody measured *"has no place on a
+time axis, and defaulting it to zero would park every undated row at one end and
+call that an ordering."* It renders as an em dash and sorts last within its
+class — in both directions, explicitly, never as a side effect of the comparator
+happening to point one way.
+
+**An invented number is worse than none.** Counts stay absent until the data can
+support them rather than being filled with a plausible figure.
+
+**Undeclared must never read as independent.** An omitted field means nobody
+checked; an explicit empty one means checked and clear. Rendering them alike
+turns missing work into good news.
+
+**A guess is not a decision.** Where an ask should land, when the work has no
+home of its own, is *"a human's decision about where the work belongs rather than
+a guess the server made"* — and where there is no answer, the server refuses
+instead of picking.
+
+**One control, drawn everywhere.** The action row exists once because the
+affordances *"used to be three near-identical controls bolted onto whichever
+surface last needed them"*, so one surface could push work forward and another
+could only link at it. *"A row is a row wherever it is drawn."*
+
+**Not everything should be routed to an agent.** For work that genuinely needs a
+person, the row says where to go rather than offering to hand it off — *"the
+whole point of this row is that a PERSON has to answer it"* — and links only when
+a real destination exists, because *"dead text pointing nowhere is worse than a
+plain sentence."*
+
+**The answer to "what is stuck" is a ranking, not a picture.** It has to work on
+a phone.
+
+**A view must not disagree with its own headline.** A default filter once
+admitted rows the headline had already counted differently, so the board's own
+summary could contradict the rows beneath it. Filter on the same predicate the
+headline counts.
+
+**A side effect that precedes its record needs a lock, not just a constraint.**
+A primary key guarantees one row, but by the time the losing insert is detected
+the loser has already posted to the platform — *"the board stays right while the
+channel collects an orphan thread nobody will ever answer in."* Belt, then
+braces: an in-process lock for the window, the constraint behind it for the
+restart case.
+
+**The thing that notices silence cannot be the thing that went silent.**
+Detection belongs to *"dumb code on a clock — an agent asked to notice its own
+silence is the one actor structurally incapable of it."*
