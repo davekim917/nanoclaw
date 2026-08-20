@@ -51,7 +51,26 @@ const DEFAULT_WORKTREE_RECLAIM_DAYS = 30;
 // Session archival is bounded per pass. Without a cap, one cohort of sessions
 // crossing the age threshold together is a single-tick tar+rm stampede (1,041
 // archives on 2026-08-05 was exactly that).
-const DEFAULT_SESSION_RECLAIM_PER_TICK = 50;
+//
+// Measured 2026-08-19: the 50 archives of one tick applied in 10s (~0.2s each),
+// while the unavoidable scan over all 6,939 session dirs cost ~15s. The count
+// was sized far below what the work justified — the expensive half of a pass
+// happens whether the budget is 50 or 500. Against ~250 sessions created per
+// day, 50/tick × 24 hourly ticks left only 4.8x headroom and a five-day drain
+// on the standing backlog; 500 makes it ~48x and under a day.
+const DEFAULT_SESSION_RECLAIM_PER_TICK = 500;
+// The honest stampede guard is wall-clock, not count: a session tree can be
+// 5MB or 5GB, so N archives is not a bound on anything. Once this much time
+// has gone into archiving in the current pass, remaining archive actions skip
+// and are reconsidered next tick. 0 stops all archiving (test hook), it does
+// not disable the deadline.
+const DEFAULT_SESSION_RECLAIM_MAX_SECONDS = 120;
+// Rescue archives were written from 2026-08-05 onward and never pruned:
+// 1,152 session archives (4.6GB) plus 393 thread archives (1.8GB) by
+// 2026-08-19. Retention is deliberately longer than the reclaim horizons that
+// create them, so a wrongly-reclaimed session stays restorable well past the
+// point anyone would notice it missing.
+const DEFAULT_RESCUE_RETENTION_DAYS = 30;
 // 0 disables the count cap. Non-zero makes the oldest-idle sessions above the
 // cap eligible regardless of age.
 const DEFAULT_SESSION_ACTIVE_CAP = 0;
@@ -110,6 +129,10 @@ export interface StoragePolicy {
   sessionReclaimMs: number;
   /** Ceiling on session archivals per maintenance pass. */
   sessionReclaimPerTick: number;
+  /** Wall-clock ceiling on the archiving portion of one maintenance pass. */
+  sessionReclaimMaxMs: number;
+  /** Age at which a rescue archive is pruned; 0 disables rescue retention. */
+  rescueRetentionMs: number;
   /** Target ceiling on active sessions; 0 disables the count cap. */
   sessionActiveCap: number;
   scanCadenceMs: number;
@@ -401,6 +424,12 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     1,
   );
   const sessionActiveCap = parseSessionKnob('NANOCLAW_SESSION_ACTIVE_CAP', DEFAULT_SESSION_ACTIVE_CAP, 0);
+  const sessionReclaimMaxSeconds = parseSessionKnob(
+    'NANOCLAW_SESSION_RECLAIM_MAX_SECONDS',
+    DEFAULT_SESSION_RECLAIM_MAX_SECONDS,
+    0,
+  );
+  const rescueRetentionDays = parseSessionKnob('NANOCLAW_RESCUE_RETENTION_DAYS', DEFAULT_RESCUE_RETENTION_DAYS, 0);
 
   const policy: StoragePolicy = {
     enabled: process.env.NANOCLAW_STORAGE_MANAGER_ENABLED !== '0',
@@ -416,7 +445,9 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
       1000,
     sessionReclaimMs: sessionReclaimDays * 24 * 60 * 60 * 1000,
     sessionReclaimPerTick,
+    sessionReclaimMaxMs: sessionReclaimMaxSeconds * 1000,
     sessionActiveCap,
+    rescueRetentionMs: rescueRetentionDays * 24 * 60 * 60 * 1000,
     scanCadenceMs: scanHours * 60 * 60 * 1000,
     dockerPruneCadenceMs: dockerPruneHours * 60 * 60 * 1000,
     dockerBuildCacheUnusedFor:
@@ -577,9 +608,25 @@ function safeReaddirDirents(root: string): fs.Dirent[] {
   }
 }
 
-function sessionLastActivityMs(sessPath: string): number {
+const SESSION_ACTIVITY_FILES = ['inbound.db', 'outbound.db', 'archive.db', 'central.db', '.heartbeat'] as const;
+
+// inbound.db is excluded from the long-horizon age signal. Session DBs carry a
+// lazy on-open schema migration (`migrateMessagesInTable`), so one new inbound
+// column rewrites every inbound.db in the fleet: on 2026-08-15 20:21-20:22 UTC
+// it rewrote 5,027 of them in two minutes, resetting the whole fleet's mtime
+// clock and hiding 2,725 genuinely 14-day-idle sessions behind a four-day-old
+// mtime. The age gate had been dead ever since and would die again on the next
+// inbound migration. Dropping it loses nothing: the host writes inbound.db and
+// `sessions.last_active` in the same path, so the central row already carries
+// every real inbound event. The other files stay in — they are container- and
+// host-written and can legitimately outrun the central row — and the full set
+// still drives the 24h freshness gate and the pre-apply revalidation, where a
+// too-new reading is harmless.
+const SESSION_AGE_SIGNAL_FILES = SESSION_ACTIVITY_FILES.filter((name) => name !== 'inbound.db');
+
+function sessionLastActivityMs(sessPath: string, names: readonly string[] = SESSION_ACTIVITY_FILES): number {
   let newest = 0;
-  for (const name of ['inbound.db', 'outbound.db', 'archive.db', 'central.db', '.heartbeat']) {
+  for (const name of names) {
     try {
       const m = fs.statSync(path.join(sessPath, name)).mtimeMs;
       if (m > newest) newest = m;
@@ -812,6 +859,7 @@ function isRealDirectory(dirPath: string): boolean {
 let reclaimPassDepth = 0;
 let reclaimBudgetRemaining = 0;
 let reclaimEpochStartMs = 0;
+let reclaimDeadlineAt = Number.POSITIVE_INFINITY;
 
 // The budget is a lease on a stretch of time, not a per-call allowance. Under
 // the hourly scan cadence each tick opens a new epoch; anything that fires in
@@ -819,16 +867,27 @@ let reclaimEpochStartMs = 0;
 // draws from the epoch already open instead of minting itself a fresh 50.
 const RECLAIM_BUDGET_EPOCH_MS = 45 * 60 * 1000;
 
-function beginReclaimPass(perTick: number, now: number): void {
-  if (reclaimPassDepth === 0 && now - reclaimEpochStartMs >= RECLAIM_BUDGET_EPOCH_MS) {
-    reclaimEpochStartMs = now;
-    reclaimBudgetRemaining = Math.max(0, perTick);
+function beginReclaimPass(perTick: number, maxMs: number, now: number): void {
+  if (reclaimPassDepth === 0) {
+    // Real elapsed time, not the (possibly injected) logical `now`: the
+    // deadline exists to protect a real host from a real long tar.
+    reclaimDeadlineAt = Date.now() + Math.max(0, maxMs);
+    if (now - reclaimEpochStartMs >= RECLAIM_BUDGET_EPOCH_MS) {
+      reclaimEpochStartMs = now;
+      reclaimBudgetRemaining = Math.max(0, perTick);
+    }
   }
   reclaimPassDepth += 1;
 }
 
 function endReclaimPass(): void {
   reclaimPassDepth = Math.max(0, reclaimPassDepth - 1);
+  if (reclaimPassDepth === 0) reclaimDeadlineAt = Number.POSITIVE_INFINITY;
+}
+
+/** True once the pass has spent its archiving time budget. */
+function reclaimDeadlinePassed(): boolean {
+  return Date.now() >= reclaimDeadlineAt;
 }
 
 /** Reserve up to `want` archivals from the open pass; returns what was granted. */
@@ -1028,6 +1087,9 @@ function createArchiveSessionAction(args: {
       'Whole long-idle session dir; DBs and worktree content preserved in a zstd rescue archive before removal (creds and regenerable trees excluded). Re-validated immediately before acting, and the row is held in "archiving" until the archive is published so the next inbound message creates a fresh session.',
     status: 'planned',
     apply: () => {
+      // The pass has spent its archiving time; leave the rest for the next
+      // tick rather than holding the storage worker for an unbounded stretch.
+      if (reclaimDeadlinePassed()) return false;
       let acted = true;
       const claimed = tryRunWithStorageCleanupClaim(args.sessPath, () => {
         if (!isPathInside(args.sessionsRoot, args.sessPath)) {
@@ -1342,8 +1404,12 @@ function collectSessionCacheActions(args: {
         cacheOnly.push({ groupName: groupDirent.name, sessionId, sessPath });
         continue;
       }
+      // A dir with only inbound.db (created, never woken) has no narrowed
+      // signal at all; fall back to the full reading rather than reading 0 as
+      // "infinitely old".
+      const ageSignal = sessionLastActivityMs(sessPath, SESSION_AGE_SIGNAL_FILES) || lastActivity;
       const dbActivityMs = row ? parseSqliteUtc(row.last_activity ?? '') : NaN;
-      const newestActivity = Number.isFinite(dbActivityMs) ? Math.max(lastActivity, dbActivityMs) : lastActivity;
+      const newestActivity = Number.isFinite(dbActivityMs) ? Math.max(ageSignal, dbActivityMs) : ageSignal;
       candidates.push({
         groupName: groupDirent.name,
         sessionId,
@@ -1624,6 +1690,55 @@ function collectThreadCacheActions(args: {
           reason: `thread worktree has been idle for at least ${Math.round(args.policy.idleArtifactMs / 3600000)}h`,
           targetType: 'directory',
           safety: 'Regenerable cache directory under an idle NanoClaw-owned thread worktree subtree.',
+        }),
+      );
+    }
+  }
+  return actions;
+}
+
+/**
+ * Age out rescue archives. Archive-then-reclaim wrote these from 2026-08-05
+ * onward and nothing ever removed them, so the rescue dirs are a monotonically
+ * growing copy of everything the reclaimer has ever taken. Only `.tar.zst`
+ * files are eligible — the reclaim journal beside them is the permanent record
+ * of what was reclaimed and outlives the archives themselves.
+ */
+function collectRescueRetentionActions(args: {
+  now: number;
+  dataRoot: string;
+  policy: StoragePolicy;
+}): StorageAction[] {
+  const actions: StorageAction[] = [];
+  if (args.policy.rescueRetentionMs <= 0) return actions;
+  const retentionDays = Math.round(args.policy.rescueRetentionMs / 86400000);
+
+  for (const [dirName, pool] of [
+    [SESSION_RESCUES_DIRNAME, 'session-cache'],
+    [THREAD_RESCUES_DIRNAME, 'thread-cache'],
+  ] as const) {
+    const dir = path.join(args.dataRoot, dirName);
+    for (const entry of safeReaddirDirents(dir)) {
+      if (!entry.isFile() || entry.isSymbolicLink()) continue;
+      if (!entry.name.endsWith('.tar.zst')) continue;
+      const target = path.join(dir, entry.name);
+      let stats: fs.Stats;
+      try {
+        stats = fs.statSync(target);
+      } catch {
+        continue;
+      }
+      if (args.now - stats.mtimeMs < args.policy.rescueRetentionMs) continue;
+      actions.push(
+        createDeleteArtifactAction({
+          id: `rescue-retention:${dirName}:${entry.name}`,
+          pool,
+          target,
+          root: dir,
+          estimatedBytes: stats.size,
+          reason: `rescue archive older than ${retentionDays}d`,
+          targetType: 'file',
+          safety: `Rescue archive past the ${retentionDays}d retention window; the reclaim journal keeps the permanent record of what it held.`,
         }),
       );
     }
@@ -2096,7 +2211,7 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
   // re-enters storage maintenance while this is open draws from the same
   // budget instead of opening a second one.
   const passPolicy = resolveStoragePolicy(options.policy);
-  beginReclaimPass(passPolicy.sessionReclaimPerTick, options.now ?? Date.now());
+  beginReclaimPass(passPolicy.sessionReclaimPerTick, passPolicy.sessionReclaimMaxMs, options.now ?? Date.now());
   try {
     return runStorageReportPass(options, passPolicy);
   } finally {
@@ -2175,6 +2290,7 @@ function runStorageReportPass(options: StorageReportOptions, policy: StoragePoli
       activityByWorktreeDir: fs.existsSync(threadsRoot) ? collectThreadWorktreeActivity(isContainerRunning) : new Map(),
       skipped,
     }),
+    ...collectRescueRetentionActions({ now, dataRoot: path.dirname(sessionsRoot), policy }),
     ...dockerCollection.actions,
   ];
 
@@ -2329,6 +2445,7 @@ export function _resetStorageManagerThrottleForTesting(): void {
   reclaimPassDepth = 0;
   reclaimBudgetRemaining = 0;
   reclaimEpochStartMs = 0;
+  reclaimDeadlineAt = Number.POSITIVE_INFINITY;
   warnedInvalidKnobs.clear();
   loggedSessionReclaimConfig = false;
 }

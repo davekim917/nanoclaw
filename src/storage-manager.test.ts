@@ -1880,3 +1880,155 @@ describe('storage-manager image protection', () => {
     });
   });
 });
+
+// The three mechanisms that decide whether the reclaimer keeps up with session
+// creation: what counts as "old", how many archivals a pass may do, and what
+// eventually removes the archives it writes.
+describe('storage-manager reclaim throughput', () => {
+  let tmpRoot: string;
+  let sessionsRoot: string;
+  const now = Date.parse('2026-06-30T00:00:00.000Z');
+  const DAY = 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetStorageManagerThrottleForTesting();
+    closeCentralDb();
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-throughput-'));
+    sessionsRoot = path.join(tmpRoot, 'v2-sessions');
+    mockExecFileSync.mockImplementation(tarAwareExecFileSync);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    closeCentralDb();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  /** A session dir with an independently settable mtime per file. */
+  function seedSession(id: string, mtimes: { inbound: number; outbound: number }): string {
+    const dir = makeSessionDir(sessionsRoot, 'ag-1', id, mtimes.inbound, { processingAck: false });
+    const outbound = new Database(path.join(dir, 'outbound.db'));
+    outbound.exec('CREATE TABLE processing_ack (message_id TEXT, status TEXT)');
+    outbound.exec('CREATE TABLE session_state (key TEXT PRIMARY KEY, value TEXT)');
+    outbound.close();
+    fs.utimesSync(path.join(dir, 'outbound.db'), mtimes.outbound / 1000, mtimes.outbound / 1000);
+    fs.utimesSync(path.join(dir, 'inbound.db'), mtimes.inbound / 1000, mtimes.inbound / 1000);
+    return dir;
+  }
+
+  function runApply(policy: Record<string, number> = {}) {
+    return getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(tmpRoot, 'no-threads'),
+      includeDocker: false,
+      policy: {
+        filesystemPath: tmpRoot,
+        idleArtifactMs: 1 * DAY,
+        worktreeReclaimMs: 30 * DAY,
+        sessionReclaimMs: 14 * DAY,
+        ...policy,
+      },
+    });
+  }
+
+  function archivedIds(report: ReturnType<typeof getStorageReport>): string[] {
+    return report.actions
+      .filter((a) => a.kind === 'archive-session' && a.status === 'applied')
+      .map((a) => path.basename(a.path!))
+      .sort();
+  }
+
+  // Regression for the 2026-08-15 fleet-wide inbound.db rewrite: a lazy on-open
+  // schema migration touched 5,027 inbound.db files in two minutes and the age
+  // gate read every one of those sessions as two days old.
+  it('a schema-migration touch on inbound.db does not reset the age clock', () => {
+    seedSession('sess-migrated', { inbound: now - 2 * DAY, outbound: now - 40 * DAY });
+    installCentralDb([{ id: 'sess-migrated', status: 'active', last_active: new Date(now - 40 * DAY).toISOString() }]);
+
+    expect(archivedIds(runApply())).toEqual(['sess-migrated']);
+  });
+
+  // The other half of the same rule: outbound.db and the central row still get
+  // to veto, so a session a container really touched is never reclaimed.
+  it('real container activity still holds a session out of the age gate', () => {
+    seedSession('sess-live', { inbound: now - 40 * DAY, outbound: now - 2 * DAY });
+    installCentralDb([{ id: 'sess-live', status: 'active', last_active: new Date(now - 40 * DAY).toISOString() }]);
+
+    expect(archivedIds(runApply())).toEqual([]);
+    expect(fs.existsSync(path.join(sessionsRoot, 'ag-1', 'sess-live'))).toBe(true);
+  });
+
+  it('a central row newer than every file still holds the session out', () => {
+    seedSession('sess-db-fresh', { inbound: now - 40 * DAY, outbound: now - 40 * DAY });
+    installCentralDb([{ id: 'sess-db-fresh', status: 'active', last_active: new Date(now - 2 * DAY).toISOString() }]);
+
+    expect(archivedIds(runApply())).toEqual([]);
+  });
+
+  it('stops archiving once the pass spends its wall-clock budget', () => {
+    for (let i = 0; i < 3; i++) seedSession(`sess-${i}`, { inbound: now - 40 * DAY, outbound: now - 40 * DAY });
+    installCentralDb(
+      [0, 1, 2].map((i) => ({
+        id: `sess-${i}`,
+        status: 'active',
+        last_active: new Date(now - 40 * DAY).toISOString(),
+      })),
+    );
+
+    // 0ms of archiving time: every archive action is planned and then skipped,
+    // and the dirs survive for the next pass.
+    const report = runApply({ sessionReclaimMaxMs: 0 });
+    const archiveActions = report.actions.filter((a) => a.kind === 'archive-session');
+    expect(archiveActions).toHaveLength(3);
+    expect(archiveActions.every((a) => a.status === 'skipped')).toBe(true);
+    for (let i = 0; i < 3; i++) {
+      expect(fs.existsSync(path.join(sessionsRoot, 'ag-1', `sess-${i}`))).toBe(true);
+    }
+
+    _resetStorageManagerThrottleForTesting();
+    expect(archivedIds(runApply())).toEqual(['sess-0', 'sess-1', 'sess-2']);
+  }, 30_000);
+
+  it('prunes rescue archives past the retention window and keeps the journal', () => {
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+    installCentralDb([]);
+    const files: Array<[string, string, number]> = [
+      ['session-rescues', 'old.tar.zst', now - 40 * DAY],
+      ['session-rescues', 'recent.tar.zst', now - 10 * DAY],
+      ['session-rescues', 'reclaim-journal.jsonl', now - 40 * DAY],
+      ['thread-rescues', 'old-thread.tar.zst', now - 40 * DAY],
+      ['thread-rescues', 'recent-thread.tar.zst', now - 10 * DAY],
+    ];
+    for (const [dir, name, mtime] of files) {
+      fs.mkdirSync(path.join(tmpRoot, dir), { recursive: true });
+      const full = path.join(tmpRoot, dir, name);
+      fs.writeFileSync(full, 'payload');
+      fs.utimesSync(full, mtime / 1000, mtime / 1000);
+    }
+
+    runApply({ rescueRetentionMs: 30 * DAY });
+
+    const survives = (dir: string, name: string) => fs.existsSync(path.join(tmpRoot, dir, name));
+    expect(survives('session-rescues', 'old.tar.zst')).toBe(false);
+    expect(survives('thread-rescues', 'old-thread.tar.zst')).toBe(false);
+    expect(survives('session-rescues', 'recent.tar.zst')).toBe(true);
+    expect(survives('thread-rescues', 'recent-thread.tar.zst')).toBe(true);
+    // The journal outlives the archives — it is the record of what was taken.
+    expect(survives('session-rescues', 'reclaim-journal.jsonl')).toBe(true);
+  });
+
+  it('leaves rescue archives alone when retention is disabled', () => {
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+    installCentralDb([]);
+    fs.mkdirSync(path.join(tmpRoot, 'session-rescues'), { recursive: true });
+    const full = path.join(tmpRoot, 'session-rescues', 'ancient.tar.zst');
+    fs.writeFileSync(full, 'payload');
+    fs.utimesSync(full, (now - 400 * DAY) / 1000, (now - 400 * DAY) / 1000);
+
+    runApply({ rescueRetentionMs: 0 });
+    expect(fs.existsSync(full)).toBe(true);
+  });
+});
