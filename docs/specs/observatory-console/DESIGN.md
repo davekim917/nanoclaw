@@ -58,17 +58,46 @@ can close and reopen under a new id while `thread_id` is unchanged.
 `messaging_groups` holds **one row per sibling bot per channel**. Grouping on
 `messaging_group_id` lists the same channel once per wired bot.
 
-Parse the platform channel from `thread_id`, whose shape is
-`<channel_type>:<channel>:<ts>` — the middle segment is the key. Deduped that
-way the install had **13 distinct channels in 7 days**, carrying 1–8 agents
-each. That is a sidebar, not a search problem.
+Parse the platform channel from `thread_id`. Deduped correctly the install had
+**13 distinct channels in 7 days**, carrying 1–8 agents each. That is a sidebar,
+not a search problem.
+
+**Do not take the middle segment.** An earlier revision of this document said
+the key was the second segment of `<channel_type>:<channel>:<ts>`. That is true
+for Slack and **false for Discord**, whose ids are
+`discord:<guild>:<channel>[:<thread>]` — the middle segment is the *guild*, so
+the rule collapses every wired Discord channel into a single bucket.
+
+Resolve the key by **longest-prefix match against `messaging_groups.platform_id`**,
+which is data-driven and needs no per-platform special-casing, with a shape
+fallback for channels that are not wired. The parser must survive every shape
+present in real data: three-part Slack ids, Discord guild/channel/thread ids,
+the `tasks` pseudo-channel, DM ids beginning `D`, `spawn-<hash>` ids, and legacy
+bare timestamps with no prefix at all. A malformed id degrades to a single
+shared `unknown` bucket — never a per-row bucket, which would fill the sidebar
+with noise — and never throws.
+
+**Known bug, not fixed here:** `threadPlatformId()` in
+`src/dashboard/api/observatory.ts` carries the same two-segment assumption. It
+currently survives only because `threadPermalink` falls through to the bare
+`discord` adapter key. Fix it when that file is next touched.
 
 ### 3.3 Volume is far smaller than the session count implies
 
 Half of all active sessions hold **exactly one message** (median 1, p75 8, p90
-67, p95 162, max 11,428). The real working set is **360 threads in 24h, 1,896 in
-7d**. Virtualization is a nice-to-have, not a requirement. Do not design around
-a scale that does not exist.
+67, p95 162, max 11,428).
+
+Counted as raw threads it is 230 in 24h and 1,177 in 7d. But an inbound message
+that never woke an agent still mints a session row — in a `mention`-mode channel
+that is *every non-mention message* — and §1 says every row ends in a verb, so
+those rows do not belong in the queue. Applying the same engaged-only filter
+`sessions.ts` already uses (`last_outbound_at IS NOT NULL OR container_status <>
+'stopped' OR an in-flight task`), the real working set is **63 threads in 24h
+and 213 in 7d**.
+
+That is roughly four times smaller than an earlier revision of this document
+claimed. Virtualization is emphatically not required. Do not design around a
+scale that does not exist.
 
 ### 3.4 `sessions.container_status` lags — do not trust it
 
@@ -82,24 +111,32 @@ Fixed order, top to bottom, left to right:
 
 | Zone | Rule |
 |---|---|
-| Status bar | 3px, full row height, colour = urgency. Transparent when the row wants nothing. |
+| Status bar | 3px, full row height, colour = urgency. **Transparent when the row wants nothing** — the state label carries the word instead. The artboards paint parked/done grey; this document wins, and the disagreement is recorded here rather than left for someone to rediscover. |
 | Avatar stack | Thread **participants**, not an owner. Max 3 faces, 2px white ring, −8px overlap, then a `+N` pill. |
 | Title | `sessions.title` (generated). Always present. Single line, ellipsis. |
 | Hybrid line | The **actual last message** as `Speaker: excerpt`. Present on any row wanting attention, including stalled. Absent on healthy running, parked and done rows. |
-| Live line | Monospace. Current tool + elapsed. Running rows only. |
+| Live line | Monospace. Current tool + elapsed. Rows with a tool in flight — **running or stalled**. A stalled row must show it, holding still (§6); an earlier revision said "running rows only" and contradicted §6. |
 | Meta line | `channel · N agents · age`. Always present. |
 | State label | One of the six states in §5. |
-| Verb | Exactly one primary verb per state (§5). Always visible on desktop. |
+| Verb | Exactly one primary verb per state (§5), visible on desktop. **`Idle` is the single exception and carries none** — §1's "every row ends in a verb" holds for every state that wants something, which is the claim that matters. On mobile (§8) the verb renders only on rows wanting attention. |
 
 ### 4.1 The hybrid line exists to control cost
 
 Message bodies live in each session's own DB files; there is no central rollup.
 Rendering a preview on *every* row means opening hundreds of files per refresh.
-Rendering it only on attention rows — a handful at a time — costs approximately
-what a title costs, on exactly the rows where it earns its place.
+Rendering it only on attention rows — a handful at a time — is the cheapest
+thing available on exactly the rows where it earns its place.
 
-Do not "improve" this by fetching previews for all rows without first building a
-rollup table.
+**Be honest about what that costs.** The list endpoint carries no last message,
+so the only source is the detail endpoint, which returns a merged transcript per
+call. The implementation caps it at 8 attention rows and keys its cache on
+`(thread_id, last_activity_at)` so a burst on other threads costs a given row
+nothing. That is a mitigation, not free — an earlier revision claimed it "costs
+approximately what a title costs", which is not true.
+
+The fix that would make it true is a `last_message` field on the list row, or
+the rollup this section mentions. Until one exists, do not raise the cap and do
+not fetch previews for all rows.
 
 ## 5. The six states
 
@@ -108,12 +145,43 @@ exist.
 
 | State | Computed from | Verb |
 |---|---|---|
-| **Needs you** | Claim parked with a `waiting on <human>` note | Answer |
-| **Stalled** | `container_state.tool_started_at` older than 30m with no newer output | Kill |
-| **Unassigned** | Work item with no owner and no thread | Assign |
-| **Running** | Heartbeat fresh and a tool in flight | Steer |
+| **Unassigned** | Work item with no session at all | Assign |
+| **Needs you** | Claim parked with a `waiting on <human>` note, **or** the existing `needs_me` signal (task `needs_input`, unanswered `ask_question`) | Answer |
+| **Stalled** | `container_state.tool_started_at` older than 30m with no newer output, **or** `provider_status = 'failed'` | Kill |
+| **Running** | A live container process for the session | Steer |
 | **Parked** | Claim in `parked` state | Reassign |
-| **Done** | Verified and closing | Close |
+| **Done** | `archived_at` is set | Close |
+| **Idle** | None of the above | — |
+
+Four corrections against an earlier revision, each found by implementing it:
+
+- **`Idle` is the seventh state and it is the common case.** A thread that is not
+  running, holds no claim, is not archived, and whose last tool finished normally
+  matches none of the other six — **57 of 63** threads in a live 24h window. The
+  earlier six did not partition the space. Render it as a real state; do not
+  mislabel it `Done` and do not drop the rows.
+- **`Running` is gated on liveness alone**, not on a tool being in flight. Taken
+  literally the old rule left a healthy container *between* tool calls with no
+  state at all. `current_tool` and `tool_started_at` are exposed as their own
+  fields, which is what the activity rule in §6 animates from anyway.
+- **`Done` has exactly one computable source: `archived_at`.** "Verified and
+  closing" named no source, which violated this section's own rule that a state
+  which cannot be computed does not exist. Note the consequence: archived rows
+  are hidden by default, so `Done` is nearly absent from the default list. If it
+  needs to mean more than "archived", it needs a real signal first.
+- **`Unassigned` outranks everything.** A work item with no session cannot have a
+  container, a claim, or a transcript, so it is resolved before the rest.
+
+**This table is derivation precedence, not display order.** The list sorts by
+urgency: `needs_you`, `stalled`, `unassigned`, `running`, `parked`, `idle`,
+`done`. Keep the two concepts separate — a reader who conflates them will
+"correct" one to match the other.
+
+**`Unassigned` is unreachable today and that is expected.** The thread list is
+derived from sessions, so a row always has at least one session and the state
+never fires. It becomes reachable when the release-board/findings join in §10
+lands. The row renders correctly when the data arrives; there is simply no data
+yet. Do not delete the state as dead code.
 
 `container_state.provider_status` (`idle` / `active` / `failed`) is populated,
 cross-provider, and currently read by **zero** dashboard code. `failed` must
@@ -185,13 +253,19 @@ Dark:
 | Role | Value |
 |---|---|
 | page | `#0d0d0d` |
+| top bar | `#141414` |
+| sidebar | `#171717` |
 | attention wash | `#2c110f` |
 | border / chip | `#292929` |
+| wash chip | `#3a1a17` |
 | ink | `#dedede` |
 | secondary | `#989898` |
 | muted | `#868686` |
 | attention | `#f66e5c` |
 | live | `#45b164` |
+
+Top bar, sidebar and wash chip were absent from an earlier revision and had to be
+derived during the build; all three are AA-clear against every ink above.
 
 Decorative only (icon strokes, no text-contrast requirement): `#808080`.
 
@@ -211,6 +285,15 @@ grey. Do not introduce a third status hue without amending this document.
   otherwise.
 - **Mobile tap targets ≥ 44px**, enforced with an explicit `min-height`.
 - Never reuse `#a1a1aa`-class greys for text. They fail AA on white.
+- **`muted` is for page and wash surfaces only — never on a chip.** The palette
+  in §7.1 violates its own contrast rule there: `#636363` on `#dedede` is 4.47:1
+  light, `#868686` on `#292929` is 4.00:1 dark. Chips take `secondary`. A test
+  pins this so nobody simplifies it back.
+- **Known edge:** attention `#b32322` on the light wash chip `#eacfca` is 4.49:1
+  — one hundredth under. No text sits there today. If a filled wash chip ever
+  takes attention-coloured text, retune before shipping it.
+- Contrast is verified by computation over every ink×surface pair in both
+  palettes, not by eye. Keep that test.
 
 ## 8. Mobile — 390px is the primary viewport
 
@@ -238,9 +321,15 @@ Everything else runs on data that already exists.
 1. **Thread-merged transcript.** A thread's messages are split across one DB
    pair per agent; the existing detail endpoint is per-session. The detail pane
    must merge N sessions in timestamp order.
-2. **Agent identity on the thread list.** The thread-list endpoint carries no
-   agent identity; the endpoint that has identity carries no thread list. Only
-   ~20 agents exist, so the client can hold the map — but the join must exist.
+2. **Agent identity on the thread list.** No thread-list endpoint existed at all
+   before this build; `/api/sessions` is session-keyed and carries no agent
+   identity, and the endpoint that has identity carries no list. Only ~20 agents
+   exist, so identity rides inline on each participant in a single round trip.
+
+   Resolve display names per `(agent, messaging_group)`, not per agent. Bot
+   display names differ by channel, so resolving with a null messaging group
+   prints the canonical agent-group id — a row reads `<workgroup>-<role>` where
+   the channel shows the friendly name. §11 requires the friendly name.
 3. **Reconciling two steer paths.** `POST /dashboard/api/sessions/:id/message`
    writes into the session's inbound queue and echoes to the origin thread (this
    one works and stays). `observatory/steer|nudge|assign` instead spawn a
@@ -251,8 +340,19 @@ Everything else runs on data that already exists.
 ## 11. Carried over unchanged
 
 - Real Slack avatars via `getKnownSlackBots()`, through the shared
-  `AgentAvatar` component with its initials fallback. **Remove the client-side
-  pixelation** — real faces.
+  `AgentAvatar` component with its initials fallback.
+
+  **There is no pixelation to remove.** An earlier revision of this document
+  said the UI pixelated avatars client-side and that the console should stop.
+  That was never true — it came from stale comments at
+  `src/dashboard/api/observatory.ts:64` and `dashboard/src/views/office-data.ts:36`;
+  a search for `image-rendering` / `pixelated` / `feMorphology` across both trees
+  finds nothing. Real faces were already shipping. Both comments are corrected.
+
+  The fallback rule lives in `AgentAvatar` and nowhere else. It takes an optional
+  two-letter monogram, because at 25px a one-letter fallback collapses several
+  same-initial agent names to an identical glyph, on a screen whose entire job is
+  telling agents apart.
 - Friendly per-channel display names, never internal IDs.
 - Schematic floor plan, never pixel art. It is a **lens in the sidebar, not a
   destination**.
