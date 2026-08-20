@@ -23,6 +23,7 @@ import { groupsListHandler } from './api/groups.js';
 import { messagingGroupsListHandler } from './api/messaging-groups.js';
 import { sessionMessageHandler } from './steer.js';
 import { sessionArchiveHandler, sessionUnarchiveHandler } from './archive.js';
+import { threadSnoozeHandler, threadUnsnoozeHandler } from './thread-snooze.js';
 import { scheduledListHandler, scheduledDetailHandler, scheduledSearchHandler } from './api/scheduled-read.js';
 import { editHandler, pauseHandler, resumeHandler, runNowHandler, cancelHandler } from './api/scheduled-mutations.js';
 import { movePreviewHandler, moveExecuteHandler } from './api/scheduled-move.js';
@@ -71,6 +72,10 @@ export function startDashboard(): void {
   // `/sessions` pair above is untouched; the inbox board still uses it.
   register('GET', '/dashboard/api/threads', requireAuth(threadsHandler));
   register('GET', '/dashboard/api/threads/:id', requireAuth(threadsDetailHandler));
+  // Triage's `S` verdict. Per-user view state, gated on visibility rather than
+  // the admin gate the mutating verbs use — see thread-snooze.ts.
+  register('POST', '/dashboard/api/threads/:id/snooze', requireAuth(threadSnoozeHandler));
+  register('POST', '/dashboard/api/threads/:id/unsnooze', requireAuth(threadUnsnoozeHandler));
   register('GET', '/dashboard/api/groups', requireAuth(groupsListHandler));
   register('GET', '/dashboard/api/messaging-groups', requireAuth(messagingGroupsListHandler));
   register('POST', '/dashboard/api/sessions/:id/message', requireAuth(sessionMessageHandler));

@@ -715,6 +715,12 @@ export type ThreadState = 'unassigned' | 'needs_you' | 'stalled' | 'running' | '
 export interface ThreadParticipant {
   agent_group_id: string;
   name: string;
+  /**
+   * The session a reply addressed to THIS participant lands in (§10.3). A
+   * thread is N sessions and the steer path writes into exactly one inbound
+   * queue, so the composer always names a session rather than "the thread".
+   */
+  session_id: string;
   avatarUrl: string | null;
   provider: string;
 }
@@ -733,6 +739,10 @@ export interface ThreadSummary {
   provider_status: string | null;
   current_tool: string | null;
   tool_started_at: string | null;
+  /** Default reply target — the session whose state drove this row's urgency (§10.3). */
+  reply_target_session_id: string | null;
+  /** This operator's own snooze is still in force: the thread has not moved since. */
+  snoozed: boolean;
 }
 
 export interface ThreadTranscriptEntry extends SessionTranscriptEntry {
@@ -767,4 +777,20 @@ export async function listThreads(filter?: {
 
 export async function getThreadDetail(threadId: string): Promise<ThreadDetailResponse> {
   return apiFetch<ThreadDetailResponse>(`/dashboard/api/threads/${encodeURIComponent(threadId)}`);
+}
+
+/**
+ * Triage's `S` verdict — hide this thread until it moves. Durable and per-user;
+ * it is NOT archive, which would mean `done` and would never come back.
+ */
+export async function snoozeThread(threadId: string): Promise<{ thread_id: string }> {
+  return apiFetch<{ thread_id: string }>(`/dashboard/api/threads/${encodeURIComponent(threadId)}/snooze`, {
+    method: 'POST',
+  });
+}
+
+export async function unsnoozeThread(threadId: string): Promise<{ thread_id: string }> {
+  return apiFetch<{ thread_id: string }>(`/dashboard/api/threads/${encodeURIComponent(threadId)}/unsnooze`, {
+    method: 'POST',
+  });
 }

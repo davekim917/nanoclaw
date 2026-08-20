@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import { SWRConfig } from 'swr';
 import userEvent from '@testing-library/user-event';
 import type { ThreadState, ThreadSummary, ThreadTranscriptEntry } from '../../lib/api.js';
@@ -16,7 +16,19 @@ vi.mock('../../lib/sse.ts', () => ({ subscribe, startSSE: vi.fn(), stopSSE: vi.f
 const listThreads = vi.fn();
 const listGroups = vi.fn();
 const getThreadDetail = vi.fn();
-vi.mock('../../lib/api.js', () => ({ listThreads, listGroups, getThreadDetail }));
+const archiveSession = vi.fn().mockResolvedValue({});
+const snoozeThread = vi.fn().mockResolvedValue({});
+const unsnoozeThread = vi.fn().mockResolvedValue({});
+const postSessionMessage = vi.fn().mockResolvedValue({});
+vi.mock('../../lib/api.js', () => ({
+  listThreads,
+  listGroups,
+  getThreadDetail,
+  archiveSession,
+  snoozeThread,
+  unsnoozeThread,
+  postSessionMessage,
+}));
 
 const { ThreadConsole, lastMessagePreview } = await import('./ThreadConsole.js');
 
@@ -29,7 +41,7 @@ function thread(id: string, over: Partial<ThreadSummary> = {}): ThreadSummary {
     channel_key: 'slack:CROOM',
     channel_name: '#example-eng',
     title: `Thread ${id}`,
-    participants: [{ agent_group_id: 'ag-1', name: 'Alpha', avatarUrl: null, provider: 'claude' }],
+    participants: [{ agent_group_id: 'ag-1', name: 'Alpha', session_id: 's-1', avatarUrl: null, provider: 'claude' }],
     last_activity_at: '2026-08-20T09:00:00.000Z',
     state: 'idle' as ThreadState,
     session_ids: [`s-${id}`],
@@ -37,6 +49,8 @@ function thread(id: string, over: Partial<ThreadSummary> = {}): ThreadSummary {
     provider_status: null,
     current_tool: null,
     tool_started_at: null,
+    reply_target_session_id: 's-1',
+    snoozed: false,
     ...over,
   };
 }
@@ -279,5 +293,104 @@ describe('lastMessagePreview', () => {
         },
       ]),
     ).toBeNull();
+  });
+});
+
+
+/**
+ * Phase 3 wiring at the shell level: which verb reaches which endpoint, the
+ * snooze lane that keeps snoozed work reachable, and triage as a mode entered
+ * FROM the list (§11) that hands the list back exactly as it was.
+ */
+describe('verbs', () => {
+  it('Close archives every session on the thread', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({ threads: [thread('t-done', { state: 'done', session_ids: ['s-x', 's-y'] })] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelector('.ncc-verb')).toBeTruthy());
+    await user.click(container.querySelector('.ncc-verb') as HTMLElement);
+    await waitFor(() => expect(archiveSession).toHaveBeenCalledTimes(2));
+    expect(archiveSession.mock.calls.map((c) => c[0])).toEqual(['s-x', 's-y']);
+  });
+
+  it('Answer opens the composer on the thread instead of sending blind', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({ threads: [thread('t-ask', { state: 'needs_you' })] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelector('.ncc-verb')).toBeTruthy());
+    await user.click(container.querySelector('.ncc-verb') as HTMLElement);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Reply text')));
+    expect(postSessionMessage).not.toHaveBeenCalled();
+  });
+
+  it('Kill stays inert — no dashboard-reachable kill path exists', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({ threads: [thread('t-stall', { state: 'stalled' })] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelector('.ncc-verb')).toBeTruthy());
+    const verb = container.querySelector('.ncc-verb') as HTMLElement;
+    expect(verb.getAttribute('aria-disabled')).toBe('true');
+    await user.click(verb);
+    expect(container.querySelector('.ncc-detail')).toBeTruthy();
+  });
+});
+
+describe('snooze', () => {
+  it('hides a snoozed thread from the queue but keeps it reachable in its own lane', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({
+      threads: [thread('t-live'), thread('t-hushed', { snoozed: true })],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+    expect(container.querySelector('.ncc-row')!.getAttribute('data-thread-id')).toBe('t-live');
+
+    await user.click(within(container.querySelector('.ncc-side') as HTMLElement).getByText('Snoozed'));
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+    expect(container.querySelector('.ncc-row')!.getAttribute('data-thread-id')).toBe('t-hushed');
+  });
+
+  it('offers no snoozed lane when nothing is snoozed', async () => {
+    listThreads.mockResolvedValue({ threads: [thread('t-live')] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+    expect(within(container.querySelector('.ncc-side') as HTMLElement).queryByText('Snoozed')).toBeNull();
+  });
+});
+
+describe('triage is a mode over the filtered list (§11)', () => {
+  it('is entered from the top bar and covers exactly the filtered rows', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({
+      threads: [thread('t-1'), thread('t-2', { state: 'needs_you' }), thread('t-3')],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(3));
+
+    // Filter first — triage must take the FILTERED set, not the whole queue.
+    await user.click(within(container.querySelector('.ncc-side') as HTMLElement).getByText('Needs you'));
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+    await user.click(screen.getByRole('button', { name: /triage/i }));
+    expect(screen.getByLabelText('Triage')).toBeTruthy();
+    expect(screen.getByText('1 / 1')).toBeTruthy();
+  });
+
+  it('Escape hands the list back', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({ threads: [thread('t-1')] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+    await user.click(screen.getByRole('button', { name: /triage/i }));
+    screen.getByLabelText('Triage').focus();
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByLabelText('Triage')).toBeNull());
+    expect(container.querySelector('.ncc-list-pane')!.hasAttribute('hidden')).toBe(false);
+  });
+
+  it('cannot be entered on an empty queue', async () => {
+    listThreads.mockResolvedValue({ threads: [] });
+    mount();
+    await waitFor(() => expect(screen.getByText('no threads in view')).toBeTruthy());
+    expect((screen.getByRole('button', { name: /triage/i }) as HTMLButtonElement).disabled).toBe(true);
   });
 });

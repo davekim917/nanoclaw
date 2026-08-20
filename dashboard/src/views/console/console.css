@@ -291,6 +291,10 @@
 
 /* ── List pane ─────────────────────────────────────────────────────────── */
 
+/* `display: flex` outranks the `hidden` attribute's UA `display: none`, and
+   triage hides this pane with `hidden` so the list keeps its DOM — which is
+   what makes its scroll position restorable on exit. */
+.ncc-list-pane[hidden] { display: none; }
 .ncc-list-pane {
   width: 492px;
   flex-shrink: 0;
@@ -448,6 +452,16 @@
   min-height: 24px;
   cursor: pointer;
 }
+/* An inert verb is still rendered and still focusable (§1: every row ends in a
+   verb, and the `title` explaining WHY it cannot fire has to be reachable by
+   keyboard). It just reads as unavailable and does nothing. */
+.ncc-verb[aria-disabled='true'],
+.ncc-verb:disabled {
+  color: var(--ncc-secondary);
+  background: transparent;
+  border-color: var(--ncc-border);
+  cursor: not-allowed;
+}
 
 /* ── Avatar stack (§4: max 3 faces, 2px ring, −8px overlap, then +N) ────── */
 
@@ -571,6 +585,7 @@
 
 @media (max-width: 899px) {
   .ncc-side,
+  .ncc-detail-wrap,
   .ncc-detail { display: none; }
   .ncc-list-pane { width: auto; flex-grow: 1; border-right: 0; }
   .ncc-face { --ncc-face-size: 24px; }
@@ -581,4 +596,134 @@
   .ncc-row:not(.attention) .ncc-verb { display: none; }
   .ncc-row-meta .agents { display: none; }
   .ncc-row-meta .sep-agents { display: none; }
+}
+
+/* ── Actions: composer, snooze, triage (Phase 3) ────────────────────────── */
+
+.ncc-detail-wrap { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+.ncc-detail-actions {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 8px 18px 0;
+}
+
+/* The notice line every mutating action reports through. Visible AND
+   `aria-live`, so the confirmation is not screen-reader-only. */
+.ncc-notice {
+  flex-shrink: 0;
+  min-height: 20px;
+  padding: 4px 14px;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-secondary);
+}
+
+/*
+ * The reply composer. §10.3's whole reconciliation is the `select` in here:
+ * a thread is N sessions and the send goes into exactly ONE inbound queue, so
+ * the target is part of the request and is rendered as such.
+ */
+.ncc-composer {
+  flex-shrink: 0;
+  border-top: 1px solid var(--ncc-border);
+  background: var(--ncc-topbar);
+  padding: 10px 18px 12px;
+}
+.ncc-composer-target {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: var(--ncc-secondary);
+  margin-bottom: 8px;
+}
+.ncc-composer-hint { font-family: var(--ncc-font-mono); font-size: 11px; color: var(--ncc-muted); }
+.ncc-composer-note { font-size: 12px; color: var(--ncc-secondary); }
+.ncc-composer-row { display: flex; align-items: flex-end; gap: 8px; }
+.ncc-composer-box {
+  flex-grow: 1;
+  min-width: 0;
+  font-family: var(--ncc-font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ncc-ink);
+  background: var(--ncc-page);
+  border: 1px solid var(--ncc-border);
+  border-radius: 0;
+  padding: 7px 9px;
+  resize: vertical;
+  min-height: 44px;
+}
+.ncc-composer-box::placeholder { color: var(--ncc-muted); }
+.ncc-composer-row .ncc-solid-btn { min-height: 44px; }
+.ncc-composer-row .ncc-solid-btn:disabled {
+  color: var(--ncc-secondary);
+  background: transparent;
+  border-color: var(--ncc-border);
+  cursor: not-allowed;
+}
+.ncc-composer-status {
+  min-height: 16px;
+  margin-top: 5px;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-attention);
+}
+
+/*
+ * Triage — a MODE over the filtered list (§11), one thread at a time. It takes
+ * the list AND the detail pane's width, because the whole point is that there
+ * is exactly one thread on screen.
+ */
+.ncc-triage {
+  flex-grow: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ncc-page);
+}
+.ncc-triage:focus-visible { outline: 2px solid var(--ncc-focus); outline-offset: -2px; }
+.ncc-triage-bar {
+  flex-shrink: 0;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--ncc-border);
+  background: var(--ncc-topbar);
+}
+.ncc-triage-count { font-size: 12px; font-weight: 600; color: var(--ncc-ink); }
+.ncc-triage-keys { font-size: 11px; color: var(--ncc-muted); }
+/* POSITION, not progress: discrete cells, so this can never be misread as
+   §6's liveness rule, whose length deliberately encodes nothing. */
+.ncc-triage-rail { display: flex; align-items: center; gap: 2px; }
+.ncc-triage-dot { width: 6px; height: 6px; background: var(--ncc-chip); }
+.ncc-triage-dot.done { background: var(--ncc-border); }
+.ncc-triage-dot.now { background: var(--ncc-attention); }
+.ncc-triage-verbs {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--ncc-border);
+}
+.ncc-triage-verbs .ncc-verb { min-height: 44px; padding: 6px 12px; }
+.ncc-triage-live {
+  flex-shrink: 0;
+  min-height: 20px;
+  padding: 4px 18px;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-secondary);
+}
+/* On mobile the mode is the entire screen — there is no list beside it. */
+@media (max-width: 899px) {
+  .ncc-triage { width: 100%; }
+  .ncc-triage .ncc-detail { display: flex; }
 }
