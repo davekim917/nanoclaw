@@ -362,7 +362,17 @@ export function setChannelRequestGate(fn: ChannelRequestGateFn): void {
   channelRequestGate = fn;
 }
 
-function safeParseContent(raw: string): { text?: string; sender?: string; senderId?: string } {
+interface ParsedContent {
+  text?: string;
+  sender?: string;
+  senderId?: string;
+  /** chat-sdk adapters serialize the platform author here; `isBot` is the
+   *  platform's own flag, not a heuristic. Native adapters omit it. */
+  author?: { isBot?: boolean };
+  attachments?: unknown[];
+}
+
+function safeParseContent(raw: string): ParsedContent {
   try {
     return JSON.parse(raw);
   } catch {
@@ -1034,6 +1044,54 @@ function evaluateEngage(
   }
 }
 
+/**
+ * Mirror an inbound user message into archive.db for future-wake thread
+ * context replay. Scoped per-agent-group to match the archive's PK slicing;
+ * assistant replies are archived on delivery.ts's path.
+ *
+ * Called from both delivery paths — the normal one after the session row is
+ * written, and the bot-context skip below, which never resolves a session.
+ * The archive insert is an upsert keyed on the per-agent message id, so a
+ * repeated call for the same message is a no-op rewrite.
+ */
+function archiveInboundUserMessage(
+  agent: MessagingGroupAgent,
+  agentGroup: AgentGroup,
+  mg: MessagingGroup,
+  event: InboundEvent,
+  userId: string | null,
+  parsedContent: ParsedContent,
+  effectiveThreadId: string | null,
+): void {
+  if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') return;
+  if (!parsedContent.text) return;
+  try {
+    archiveMessageAndScheduleMemoryCuration(
+      {
+        id: messageIdForAgent(event.message.id, agent.agent_group_id),
+        agentGroupId: agent.agent_group_id,
+        messagingGroupId: mg.id,
+        channelType: event.channelType,
+        channelName: mg.name ?? null,
+        platformId: event.platformId,
+        threadId: effectiveThreadId,
+        role: 'user',
+        senderId: userId,
+        senderName: parsedContent.sender ?? null,
+        text: parsedContent.text,
+        sentAt: event.message.timestamp,
+      },
+      agentGroup.workgroup_id ?? agentGroup.folder,
+    );
+  } catch (err) {
+    log.warn('Failed to archive inbound user message', {
+      agentGroupId: agent.agent_group_id,
+      platformMessageId: event.message.id,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 async function deliverToAgent(
   agent: MessagingGroupAgent,
   agentGroup: AgentGroup,
@@ -1043,7 +1101,7 @@ async function deliverToAgent(
   threadsEnabled: boolean,
   effectiveThreadId: string | null,
   wake: boolean,
-  parsedContent: { text?: string; sender?: string; senderId?: string },
+  parsedContent: ParsedContent,
   adapter: ReturnType<typeof getChannelAdapter>,
 ): Promise<void> {
   // Apply the resolved thread policy (wiring override AND channel declaration
@@ -1063,6 +1121,57 @@ async function deliverToAgent(
   // effectiveThreadId === event.threadId, so the event view is current.
   if (threadsEnabled) {
     effectiveThreadId = effectiveThreadIdForAgent(event, true, effectiveSessionMode);
+  }
+
+  // Non-waking bot chatter does not get to mint a brand-new per-thread
+  // session.
+  //
+  // A `mention`-mode agent wired to an alert channel accumulates every app
+  // notification (Snowflake task failures, Linear issue events) as trigger=0
+  // context. Each Slack notification is its own thread, so each one also
+  // creates a per-thread session that will never wake: over three days on this
+  // install, 1130 of 1274 sessions created were never woken, 434 of them from
+  // app-authored messages in one channel.
+  //
+  // Skipping is only safe where the wake path can reconstruct the context this
+  // accumulate would have provided, so the condition below is the deliberate
+  // mirror of the thread-context backfill further down — same message kinds,
+  // same thread policy, same adapter hook. When someone does engage the agent
+  // in this thread later, the session is created at that moment with
+  // `created=true`, which makes `fetchThreadHistory` prepend the ENTIRE thread
+  // with no since-cursor (adapter.ts: the hook exists precisely to recover
+  // "messages from other bots ... that never reached our own pipeline"). The
+  // skipped notifications come back with it.
+  //
+  // Three things are deliberately NOT skipped. Human senders — their
+  // accumulate is untouched. Messages carrying attachments — a text transcript
+  // cannot reconstruct a file, and the normal path stages those to disk.
+  // And `mention-sticky` wirings — that mode reads session EXISTENCE as "the
+  // agent is already in this thread" (evaluateEngage above), so removing the
+  // session would also change whether the agent engages, not just how many
+  // rows it costs. Session count is the only thing this is allowed to change.
+  //
+  // The message is still archived, exactly as the accumulate path archives it.
+  if (
+    !wake &&
+    parsedContent.author?.isBot === true &&
+    agent.engage_mode !== 'mention-sticky' &&
+    !parsedContent.attachments?.length &&
+    (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') &&
+    threadsEnabled &&
+    effectiveSessionMode === 'per-thread' &&
+    effectiveThreadId !== null &&
+    typeof adapter?.fetchThreadHistory === 'function' &&
+    findSessionForAgent(agent.agent_group_id, mg.id, effectiveThreadId) === undefined
+  ) {
+    archiveInboundUserMessage(agent, agentGroup, mg, event, userId, parsedContent, effectiveThreadId);
+    log.debug('Skipped session creation for non-waking bot message', {
+      agentGroupId: agent.agent_group_id,
+      messagingGroupId: mg.id,
+      threadId: effectiveThreadId,
+      platformMessageId: event.message.id,
+    });
+    return;
   }
 
   const { session, created } = resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, effectiveSessionMode);
@@ -1291,35 +1400,7 @@ async function deliverToAgent(
     return;
   }
 
-  // Mirror inbound user messages into archive.db for future-wake thread
-  // context replay. Scoped per-agent-group to match the archive's PK
-  // slicing; assistant replies are archived on delivery.ts's path.
-  if ((event.message.kind === 'chat' || event.message.kind === 'chat-sdk') && parsedContent.text) {
-    try {
-      archiveMessageAndScheduleMemoryCuration(
-        {
-          id: messageIdForAgent(event.message.id, agent.agent_group_id),
-          agentGroupId: agent.agent_group_id,
-          messagingGroupId: mg.id,
-          channelType: event.channelType,
-          channelName: mg.name ?? null,
-          platformId: event.platformId,
-          threadId: effectiveThreadId,
-          role: 'user',
-          senderId: userId,
-          senderName: parsedContent.sender ?? null,
-          text: parsedContent.text,
-          sentAt: event.message.timestamp,
-        },
-        agentGroup.workgroup_id ?? agentGroup.folder,
-      );
-    } catch (err) {
-      log.warn('Failed to archive inbound user message', {
-        sessionId: session.id,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+  archiveInboundUserMessage(agent, agentGroup, mg, event, userId, parsedContent, effectiveThreadId);
 
   log.info('Message routed', {
     sessionId: session.id,

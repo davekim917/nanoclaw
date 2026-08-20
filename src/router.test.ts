@@ -139,7 +139,7 @@ import {
 import { getDb } from './db/connection.js';
 import { writeSessionMessageIfNew, writeOutboundDirect, resolveSession } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
-import { getSession } from './db/sessions.js';
+import { findSessionForAgent, getSession } from './db/sessions.js';
 import { isAnyAdmin } from './modules/permissions/db/user-roles.js';
 import { claimChannelIngress, completeChannelIngress } from './db/channel-ingress-receipts.js';
 import { registerInterceptHandler, clearInterceptHandlers } from './command-gate.js';
@@ -591,6 +591,232 @@ describe('thread context fetch', () => {
     expect(text).not.toContain('Pocket meetings');
     expect(text).not.toContain('Pocket yes');
     expect(text).not.toContain('old user follow-up');
+  });
+});
+
+// A `mention`-mode agent wired to an alert channel accumulated every app
+// notification, and since each Slack notification is its own thread, every one
+// of them also minted a per-thread session that could never wake. Non-waking
+// bot messages now skip session creation where the wake path can rebuild the
+// same context from thread history.
+describe('bot-authored non-waking messages do not mint sessions', () => {
+  const BOT_CONTENT = JSON.stringify({
+    text: 'A. Example changed issue status to Done in the Example team',
+    sender: 'unknown',
+    senderId: 'BTESTBOT1',
+    author: { userId: 'BTESTBOT1', isBot: true, isMe: false },
+  });
+
+  const HUMAN_CONTENT = JSON.stringify({
+    text: 'shipping the migration tonight',
+    sender: 'Example Human',
+    senderId: 'UTESTUSER1',
+    author: { userId: 'UTESTUSER1', isBot: false, isMe: false },
+  });
+
+  function threadedSlackAdapter(fetchThreadHistory = vi.fn().mockResolvedValue([])): ChannelAdapter {
+    return {
+      name: 'slack-test',
+      channelType: 'slack-test' as ChannelAdapter['channelType'],
+      supportsThreads: true,
+      setup: vi.fn(),
+      teardown: vi.fn(),
+      isConnected: vi.fn(() => true),
+      deliver: vi.fn(),
+      fetchThreadHistory,
+    };
+  }
+
+  /** Alert-channel wiring: mention-mode + accumulate, in a threaded group. */
+  async function routeIntoAlertChannel(content: string, isMention: boolean): Promise<void> {
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({
+      mg: makeMg({ id: 'mg-ops', platform_id: 'slack:C0ATS', is_group: 1 }),
+      agentCount: 1,
+    });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([
+      makeAgent({ agent_group_id: 'ag-ops', engage_mode: 'mention', ignored_message_policy: 'accumulate' }),
+    ]);
+    vi.mocked(getAgentGroup).mockReturnValue({
+      id: 'ag-ops',
+      name: 'ops',
+      folder: 'ops',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    await routeInbound(
+      makeChatEvent('', {
+        channelType: 'slack-test',
+        platformId: 'slack:C0ATS',
+        threadId: 'slack:C0ATS:1787191620.602159',
+        isDM: false,
+        message: {
+          id: 'notif-1',
+          kind: 'chat-sdk',
+          content,
+          timestamp: '2026-08-20T02:07:00.602Z',
+          isMention,
+          isGroup: true,
+        },
+      }),
+    );
+  }
+
+  beforeEach(async () => {
+    const { getChannelAdapter } = await import('./channels/channel-registry.js');
+    vi.mocked(getChannelAdapter).mockReturnValue(threadedSlackAdapter());
+    vi.mocked(findSessionForAgent).mockReturnValue(undefined);
+  });
+
+  it('creates no session for a bot message that would not wake the agent', async () => {
+    const { archiveMessageAndScheduleMemoryCuration } = await import('./message-archive.js');
+    await routeIntoAlertChannel(BOT_CONTENT, false);
+
+    expect(resolveSession).not.toHaveBeenCalled();
+    expect(writeSessionMessageIfNew).not.toHaveBeenCalled();
+    expect(wakeContainer).not.toHaveBeenCalled();
+    // The archive is the retrieval/memory record and must survive the skip.
+    expect(archiveMessageAndScheduleMemoryCuration).toHaveBeenCalledOnce();
+  });
+
+  it('still accumulates a non-waking HUMAN message into a new session', async () => {
+    vi.mocked(resolveSession).mockReturnValue({
+      session: {
+        id: 'sess-human',
+        agent_group_id: 'ag-ops',
+        messaging_group_id: 'mg-ops',
+        thread_id: 'slack:C0ATS:1787191620.602159',
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      created: true,
+    });
+
+    await routeIntoAlertChannel(HUMAN_CONTENT, false);
+
+    expect(resolveSession).toHaveBeenCalledOnce();
+    expect(writeSessionMessageIfNew).toHaveBeenCalledOnce();
+    expect(vi.mocked(writeSessionMessageIfNew).mock.calls[0]![2].trigger).toBe(0);
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('replays the skipped bot messages as thread context on the first real wake', async () => {
+    const fetchThreadHistory = vi.fn().mockResolvedValue([
+      {
+        sender: 'unknown',
+        text: 'Snowflake task DBT_RUN failed',
+        timestamp: '2026-08-20T02:07:00.602Z',
+      },
+      { sender: 'Dinesh', text: 'looking at it', timestamp: '2026-08-20T02:20:00.000Z' },
+    ]);
+    const { getChannelAdapter } = await import('./channels/channel-registry.js');
+    vi.mocked(getChannelAdapter).mockReturnValue(threadedSlackAdapter(fetchThreadHistory));
+    vi.mocked(resolveSession).mockReturnValue({
+      session: {
+        id: 'sess-wake',
+        agent_group_id: 'ag-ops',
+        messaging_group_id: 'mg-ops',
+        thread_id: 'slack:C0ATS:1787191620.602159',
+        agent_provider: null,
+        // A session minted at wake time has no prior activity, so the
+        // since-cursor is null and the WHOLE thread comes back.
+        last_active: null,
+        status: 'active',
+        container_status: 'idle',
+        created_at: new Date().toISOString(),
+      },
+      created: true,
+    });
+
+    await routeIntoAlertChannel(JSON.stringify({ text: '@ops what happened here?', sender: 'Dinesh' }), true);
+
+    expect(fetchThreadHistory).toHaveBeenCalledWith('slack:C0ATS:1787191620.602159', {
+      limit: 50,
+      excludeMessageId: 'notif-1',
+    });
+    const written = vi.mocked(writeSessionMessageIfNew).mock.calls[0]![2];
+    const text = JSON.parse(written.content).text as string;
+    expect(text).toContain('[Thread context]');
+    expect(text).toContain('unknown: Snowflake task DBT_RUN failed');
+    expect(text).toContain('Dinesh: looking at it');
+    expect(text).toContain('[Latest message]\n@ops what happened here?');
+  });
+
+  it('still accumulates for a mention-sticky wiring, which reads session existence as engagement', async () => {
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({
+      mg: makeMg({ id: 'mg-ops', platform_id: 'slack:C0ATS', is_group: 1 }),
+      agentCount: 1,
+    });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([
+      makeAgent({ agent_group_id: 'ag-ops', engage_mode: 'mention-sticky', ignored_message_policy: 'accumulate' }),
+    ]);
+    vi.mocked(getAgentGroup).mockReturnValue({
+      id: 'ag-ops',
+      name: 'ops',
+      folder: 'ops',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(resolveSession).mockReturnValue({
+      session: {
+        id: 'sess-sticky',
+        agent_group_id: 'ag-ops',
+        messaging_group_id: 'mg-ops',
+        thread_id: 'slack:C0ATS:1787191620.602159',
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      created: true,
+    });
+
+    await routeInbound(
+      makeChatEvent('', {
+        channelType: 'slack-test',
+        platformId: 'slack:C0ATS',
+        threadId: 'slack:C0ATS:1787191620.602159',
+        isDM: false,
+        message: {
+          id: 'notif-sticky',
+          kind: 'chat-sdk',
+          content: BOT_CONTENT,
+          timestamp: '2026-08-20T02:07:00.602Z',
+          isMention: false,
+          isGroup: true,
+        },
+      }),
+    );
+
+    expect(resolveSession).toHaveBeenCalledOnce();
+    expect(writeSessionMessageIfNew).toHaveBeenCalledOnce();
+  });
+
+  it('keeps accumulating bot messages into a session that already exists', async () => {
+    const existing = {
+      id: 'sess-existing',
+      agent_group_id: 'ag-ops',
+      messaging_group_id: 'mg-ops',
+      thread_id: 'slack:C0ATS:1787191620.602159',
+      agent_provider: null,
+      status: 'active' as const,
+      container_status: 'idle' as const,
+      last_active: null,
+      created_at: new Date().toISOString(),
+    };
+    vi.mocked(findSessionForAgent).mockReturnValue(existing);
+    vi.mocked(resolveSession).mockReturnValue({ session: existing, created: false });
+
+    await routeIntoAlertChannel(BOT_CONTENT, false);
+
+    expect(resolveSession).toHaveBeenCalledOnce();
+    expect(writeSessionMessageIfNew).toHaveBeenCalledOnce();
+    expect(vi.mocked(writeSessionMessageIfNew).mock.calls[0]![2].trigger).toBe(0);
   });
 });
 
