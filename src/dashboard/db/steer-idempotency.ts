@@ -98,7 +98,7 @@ export function reserveIdempotency(
     .prepare(
       `INSERT INTO steer_idempotency
          (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
-       VALUES (@user_id, @idempotency_key, @target_type, @target_id, @message_id, @text, @request_hash, datetime('now'), 'pending', 0)
+       VALUES (@user_id, @idempotency_key, @target_type, @target_id, @message_id, @text, @request_hash, @reserved_at, 'pending', 0)
        RETURNING id, message_id, status, echo_attempted, text`,
     )
     .get({
@@ -109,6 +109,9 @@ export function reserveIdempotency(
       message_id: messageId,
       text,
       request_hash: requestHash,
+      // ISO, never datetime('now') — the naive shape sorts below ISO as TEXT and
+      // is misparsed as local by `new Date()`. See the CLAUDE.md timestamp rule.
+      reserved_at: new Date().toISOString(),
     }) as { id: number; message_id: string; status: 'pending'; echo_attempted: number; text: string };
 
   return {
@@ -124,13 +127,15 @@ export function applyIdempotency(userId: string, idempotencyKey: string, respons
   getDb()
     .prepare(
       `UPDATE steer_idempotency
-       SET status = 'applied', applied_at = datetime('now'), cached_response = @cached_response
+       SET status = 'applied', applied_at = @applied_at, cached_response = @cached_response
        WHERE user_id = @user_id AND idempotency_key = @idempotency_key AND status != 'applied'`,
     )
     .run({
       user_id: userId,
       idempotency_key: idempotencyKey,
       cached_response: JSON.stringify(response),
+      // ISO, never datetime('now') — see reserveIdempotency above.
+      applied_at: new Date().toISOString(),
     });
 }
 

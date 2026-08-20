@@ -28,17 +28,33 @@ export function issueDashboardToken(userId: string, tokenHmac: string, ttlHours:
 }
 
 export function consumeDashboardToken(tokenHmac: string): DashboardTokenRecord | null {
+  // One bound ISO value for both the comparison and the write. NOT
+  // `datetime('now')`, and NOT `datetime(expires_at) > datetime('now')` either:
+  //
+  // `expires_at` is written as ISO (`...T...Z`) while `datetime('now')` yields
+  // the naive `YYYY-MM-DD HH:MM:SS` shape, and SQLite compares them as TEXT. At
+  // index 10, 'T' (0x54) beats ' ' (0x20), so an ISO timestamp always sorts
+  // above a naive one from the same date — meaning a token that expired at 01:00
+  // still satisfied `expires_at > datetime('now')` at 08:10 the same day. That
+  // was a live auth bypass: expired tokens stayed valid for the remainder of the
+  // UTC day they died on, bounded only by the date rolling over and by
+  // `used_at IS NULL` keeping them single-use.
+  //
+  // Wrapping both sides in `datetime()` would fix the comparison but leave
+  // `used_at` still writing the naive shape, so the same class of bug simply
+  // moves to the next reader of that column. Binding one ISO value fixes both.
+  const nowIso = new Date().toISOString();
   return (
     (getDb()
       .prepare(
         `UPDATE dashboard_tokens
-         SET used_at = datetime('now')
+         SET used_at = @now
          WHERE token_hmac = @token_hmac
            AND used_at IS NULL
-           AND expires_at > datetime('now')
+           AND expires_at > @now
          RETURNING *`,
       )
-      .get({ token_hmac: tokenHmac }) as DashboardTokenRecord | undefined) ?? null
+      .get({ token_hmac: tokenHmac, now: nowIso }) as DashboardTokenRecord | undefined) ?? null
   );
 }
 

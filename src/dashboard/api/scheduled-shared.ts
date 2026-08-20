@@ -157,9 +157,13 @@ export function writeAudit(db: Database.Database, e: AuditEntry): void {
  * already-resolved row is a harmless no-op.
  */
 export function purgeIntentBody(db: Database.Database, correlationId: string): void {
-  db.prepare(
-    "UPDATE scheduled_audit SET detail_json = NULL, resolved_at = datetime('now') WHERE correlation_id = ?",
-  ).run(correlationId);
+  // Explicit ISO, for the same reason the insert above already documents at the
+  // `ts` field — this statement was writing the naive `datetime('now')` shape
+  // into the very same table, contradicting that comment three lines up.
+  db.prepare('UPDATE scheduled_audit SET detail_json = NULL, resolved_at = ? WHERE correlation_id = ?').run(
+    new Date().toISOString(),
+    correlationId,
+  );
 }
 
 // ── Rate limit (run_now + move) ──────────────────────────────────────────────
