@@ -10,6 +10,9 @@ import { startSSE } from './lib/sse.ts';
 import { takeUrlToken } from './lib/url-token.js';
 import type { AuthMe } from './lib/api.js';
 import type { BoardRoute } from './views/BoardShell.js';
+// theme.css FIRST: its tokens and Tailwind's base layer are the substrate, and
+// styles.css (unlayered) is still allowed to win while it is being retired.
+import './theme.css';
 import './styles.css';
 
 // Design-tool tweak variant. Switchable classes documented in styles.css.

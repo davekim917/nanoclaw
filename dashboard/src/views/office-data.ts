@@ -4,7 +4,7 @@ import { buildLedger } from './commitments.js';
 /**
  * Live data → the office map's fixed floor plan.
  *
- * The plan's geometry is hand-authored and FIXED (see office-map.js): the same
+ * The plan's geometry is hand-authored and FIXED (see FloorPlan.tsx): the same
  * slots, the same furniture, in the same places, every render. This module only
  * decides which channel occupies which slot and who is standing in it.
  *
@@ -12,7 +12,7 @@ import { buildLedger } from './commitments.js';
  * the data moves, and a room you cannot find twice is worse than a list.
  */
 
-/** Slots the plan offers, in fill order. Mirrors SLOTS in office-map.js. */
+/** Slots the plan offers, in fill order. FloorPlan.tsx draws one zone each. */
 export const SLOTS = [
   'westFront', 'eastFront', 'kitchen', 'westBack', 'eastBack',
   'eastWingN', 'eastWingM', 'eastWingS',
@@ -35,9 +35,9 @@ export interface OfficeAgent {
   skin?: string;
   /** The agent's real platform avatar, shown as a pixelated face token above
    *  its seat. Null for an agent with no wiring — it keeps the sprite alone,
-   *  and a face is never invented. Rendered in office-map.js's DOM overlay,
-   *  NOT in the world SVG: that SVG ships as a data URI and a data-URI SVG
-   *  cannot load an external image. */
+   *  and a face is never invented. Drawn as an <image> inside the plan's own
+   *  inline SVG — which is exactly what dropping the data-URI world bought:
+   *  a data-URI SVG could not load an external image at all. */
   avatarUrl?: string | null;
 }
 
@@ -97,12 +97,11 @@ export function agentLook(id: string): Omit<OfficeAgent, 'name' | 'status'> {
 }
 
 /**
- * The agent's real platform avatar, as a pixel token — same rule office-map.js's
- * own `faceSrc` uses, kept in sync by hand since one lives in a vendored custom
- * element (no external image in a data-URI SVG) and the other in a plain React
- * tile. Slack serves fixed sizes; asking for the 48px original keeps the face a
- * real pixel grid rather than a downscaled smudge. Anything not a plain
- * https/data image URL is dropped rather than interpolated into markup.
+ * The agent's real platform avatar. One rule, one place: the floor plan, the
+ * room strip and the fleet list all resolve a face through here. Slack serves
+ * fixed sizes; asking for the 48px original keeps the face crisp rather than a
+ * downscaled smudge. Anything not a plain https/data image URL is dropped
+ * rather than interpolated into markup.
  */
 export function faceSrc(u?: string | null): string {
   if (typeof u !== 'string' || !/^(https:\/\/|data:image\/)[^"'<>\s]+$/.test(u)) return '';
@@ -223,13 +222,9 @@ export function buildOfficeData(
         const bHere = b.location === room.key ? 0 : 1;
         return aHere - bHere || a.name.localeCompare(b.name);
       })
-      // The plan seats up to 6 per room (see office-map.js grids); extra
-      // occupants would have nowhere to sit, so they stay in the list rather
-      // than overlapping. A handful of themed rooms draw fewer than 6 seats
-      // where their furniture doesn't sensibly hold more (eastFront: 5;
-      // eastWingM/eastWingS: 4) — the map already drops agents beyond the
-      // seats it actually draws, so the cap here is a safe upper bound, not a
-      // per-room exact count.
+      // Six per room. The plan lays occupant chips out row-major inside a
+      // zone, so more than six would either overflow the zone or shrink every
+      // chip below a readable size; the list keeps them either way.
       .slice(0, 6)
       .map((a) => ({ name: a.name, status: agentState(a, breachedOwners, room.key), avatarUrl: a.avatarUrl, ...agentLook(a.id) }));
     return { key: room.key, label: room.name.startsWith('#') ? room.name : `#${room.name}`, open: 0, state: roomState(here, 0), agents: here };

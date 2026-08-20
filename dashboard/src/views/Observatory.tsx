@@ -17,7 +17,9 @@ import {
   type ScheduledSnapshot,
 } from '../lib/api.js';
 import { relAge } from '../lib/derive.js';
-import { type BoardRoute } from './BoardShell.js';
+import { useIsMobile, type BoardRoute } from './BoardShell.js';
+import { AppNav, type NavKey } from './AppNav.js';
+import { deriveExceptions, SEVERITY_LABEL, type ExceptionItem } from './exceptions.js';
 import { ScheduledDrawer } from './ScheduledDrawer.js';
 import { buildLedger, classify, dueLabel, type Commitment } from './commitments.js';
 import {
@@ -30,8 +32,11 @@ import {
   type SessionTranscriptEntry,
 } from '../lib/api.js';
 import { TranscriptList, normalizeSessionEntry } from './TranscriptList.js';
-import { OfficeMap } from './OfficeMap.js';
-import { buildOfficeData, agentState, faceSrc, type OfficeRoomData, type OfficeOverflowRoom } from './office-data.js';
+import { buildOfficeData, agentState } from './office-data.js';
+import { AgentAvatar } from './AgentAvatar.js';
+import { FloorPlan } from './FloorPlan.js';
+import { RoomStrip } from './RoomStrip.js';
+import { SmokeMark } from './SmokeMark.js';
 import { WorkgroupPicker } from './WorkgroupDashboard.js';
 
 
@@ -43,10 +48,10 @@ import { WorkgroupPicker } from './WorkgroupDashboard.js';
  *
  *   1. the headline — three equal stats (stalled, need a person, moving on
  *      their own) and the coverage gaps that qualify them, stated once;
- *   2. the office — the vendored <office-map> custom element, a hand-authored
- *      tile plan where each channel is a room and each agent sits in the room
- *      it last worked in. Geometry is FIXED; only occupancy comes from data.
- *      Picking a room opens the room sheet and filters what is below;
+ *   2. the office — a schematic floor plan (a room strip on a phone) where
+ *      each channel is a room and each agent sits in the room it last worked
+ *      in. Geometry is FIXED; only occupancy comes from data. Picking a room
+ *      opens the room sheet and filters what is below;
  *   3. ONE content region, chosen by the segmented control in the top bar:
  *      overview (the needs-attention queue) or the job board, which carries the
  *      claims and schedule cards beneath it.
@@ -70,21 +75,6 @@ const POLL_MS = 15_000;
 /** Whether the floor is unfolded. Absent means expanded — the default view. */
 const MAP_OPEN_KEY = 'nc-obs-map-open';
 
-/** Tiles or Map. Tiles is the default — the map is more fun than functional
- *  right now (too busy, rooms too big), and that gets fixed on its own time;
- *  tiles is the reading that was there before the map. */
-const OBS_VIEW_KEY = 'nc-obs-view';
-
-/** Map zoom: persisted like the fold state, same reasoning — an operator who
-    picks a zoom level should not have to pick it again on every visit. */
-const MAP_SCALE_KEY = 'nc-obs-map-scale';
-const MAP_SCALE_MIN = 0.6;
-const MAP_SCALE_MAX = 3;
-const MAP_SCALE_STEP = 0.2;
-/* obs.C.15 — default view zoomed in enough that a room reads at a glance
-   without the floor plan vanishing to a postage stamp. */
-const MAP_SCALE_DEFAULT = 1.7;
-const clampMapScale = (v: number) => Math.min(MAP_SCALE_MAX, Math.max(MAP_SCALE_MIN, +v.toFixed(2)));
 
 /**
  * The segmented control. Local state — the Observatory has exactly one URL.
@@ -115,9 +105,9 @@ interface ObservatoryProps {
 }
 
 // Props are the shell's routing contract, kept so main.tsx and the legacy
-// boards stay uniform. The Observatory itself no longer navigates: it is the
-// only destination, and detail opens over the floor rather than away from it.
-export function Observatory({ authMe }: ObservatoryProps) {
+// boards stay uniform. The one destination the Observatory navigates AWAY to is
+// the inbox, from the shell nav; everything else opens over the floor.
+export function Observatory({ authMe, onRouteChange }: ObservatoryProps) {
   const { data: wgData } = useSWR('/dashboard/api/workgroups', () => listWorkgroups(), { refreshInterval: 0 });
   const workgroups = wgData?.workgroups ?? [];
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -162,28 +152,9 @@ export function Observatory({ authMe }: ObservatoryProps) {
   useEffect(() => {
     localStorage.setItem(MAP_OPEN_KEY, String(mapOpen));
   }, [mapOpen]);
-  // Tiles is the default for a fresh browser; only an explicit 'map' switches
-  // it. The map stays unmounted while tiles is showing — it builds a large
-  // SVG, and a hidden-but-mounted map is not free.
-  const [obsView, setObsView] = useState<'tiles' | 'map'>(() =>
-    localStorage.getItem(OBS_VIEW_KEY) === 'map' ? 'map' : 'tiles',
-  );
-  useEffect(() => {
-    localStorage.setItem(OBS_VIEW_KEY, obsView);
-  }, [obsView]);
-  const [mapScale, setMapScale] = useState(() => {
-    const saved = Number(localStorage.getItem(MAP_SCALE_KEY));
-    return Number.isFinite(saved) && saved > 0 ? clampMapScale(saved) : MAP_SCALE_DEFAULT;
-  });
-  useEffect(() => {
-    localStorage.setItem(MAP_SCALE_KEY, String(mapScale));
-  }, [mapScale]);
-  const zoomMapBy = (delta: number) => setMapScale((s) => clampMapScale(s + delta));
-  const resetMapScale = () => setMapScale(MAP_SCALE_DEFAULT);
   const [jobTab, setJobTab] = useState<JobTabKey>('queue');
   const [selectedRoom, setSelectedRoom] = useState<string>('');
   const [flowFilter, setFlowFilter] = useState<FlowSlice | null>(null);
-  const [teleportTo, setTeleportTo] = useState<string | null>(null);
   const [expandedClaim, setExpandedClaim] = useState<string | null>(null);
   // The agent whose pin was clicked — opens the agent drawer over whatever
   // view is showing. Independent of selectedRoom: picking a room and picking
@@ -235,11 +206,10 @@ export function Observatory({ authMe }: ObservatoryProps) {
     // floor runs out of slots — and the sheet would then show a different
     // room's people (and their claims) under the picked room's name.
     //
-    // A slotted room is picked by its SLOT (what the map and its teleport
-    // chips use); an overflow room has none, so the tile view picks it by its
-    // own KEY instead — see OfficeTiles' `tileKey`. Both are searched here so
-    // a tile click on an overflow channel filters the page exactly like a
-    // click on a slotted one does.
+    // A slotted room is picked by its SLOT (what the floor plan uses); an
+    // overflow room has none, so it is picked by its own KEY instead. Both are
+    // searched here so picking an overflow channel filters the page exactly
+    // like picking a zoned one does.
     const room =
       officeData.rooms.find((r) => r.slot === selectedRoom) ??
       officeData.overflowRooms.find((r) => r.key === selectedRoom);
@@ -326,15 +296,6 @@ export function Observatory({ authMe }: ObservatoryProps) {
         : ledgerCounts.onTrack
     : 0;
 
-  // Where the camera opens. The plan's first slot is at its left edge, so
-  // defaulting there spent the first screen on lawn. Open on the room that
-  // most needs looking at — worst state first, then most occupied.
-  const startSlot = useMemo(() => {
-    const rank: Record<string, number> = { blocked: 0, waiting: 1, working: 2, idle: 3 };
-    return [...officeData.rooms].sort(
-      (a, b) => (rank[a.state] ?? 9) - (rank[b.state] ?? 9) || b.agents.length - a.agents.length,
-    )[0]?.slot;
-  }, [officeData]);
 
   const pickRoom = (k: string) => {
     setSelectedRoom((prev) => (prev === k ? '' : k));
@@ -364,6 +325,51 @@ export function Observatory({ authMe }: ObservatoryProps) {
     setExpandedClaim((prev) => (prev === claim.slug ? null : claim.slug));
   };
 
+  // What needs a person, computed once and read by both the feed and the floor
+  // — a room is outlined only if the feed above it says something is wrong in
+  // there, and the two must never be derived twice.
+  const exceptions = useMemo(() => (snapshot ? deriveExceptions(snapshot) : []), [snapshot]);
+  // A room is outlined only because the feed above it says something is wrong
+  // in there. Exceptions the wire could not attribute to a room carry no key
+  // and so accent nothing — a guessed room would be worse than none.
+  const alertRooms = useMemo(
+    () => new Set(exceptions.map((e) => e.roomKey).filter((k): k is string => typeof k === 'string')),
+    [exceptions],
+  );
+  // A vignette is drawn iff its room's bound signal is live RIGHT NOW. An
+  // inactive signal draws nothing at all — the absence is the information — and
+  // a room key nothing on this floor matches is simply never looked up.
+  const activeVignettes = useMemo(
+    () => new Set((snapshot?.signals ?? []).filter((s) => s.active).map((s) => s.room)),
+    [snapshot?.signals],
+  );
+
+  // The shell's four destinations. Three are bands of this page (it is one long
+  // page on a phone, and jumping to a band is what a tab bar is for); the
+  // fourth leaves for the inbox route, which still exists.
+  const isMobile = useIsMobile();
+  const [navKey, setNavKey] = useState<NavKey>('overview');
+  const officeRef = useRef<HTMLDivElement>(null);
+  const scheduleRef = useRef<HTMLDivElement>(null);
+  const navigateTo = (key: NavKey) => {
+    if (key === 'inbox') {
+      onRouteChange('inbox');
+      return;
+    }
+    setNavKey(key);
+    if (key === 'scheduled') setView('board');
+    else setView('overview');
+    // The band may not be mounted until the view switch has rendered.
+    const target = key === 'office' ? officeRef : key === 'scheduled' ? scheduleRef : null;
+    requestAnimationFrame(() => {
+      if (!target?.current) {
+        window.scrollTo({ top: 0 });
+        return;
+      }
+      target.current.scrollIntoView({ block: 'start' });
+    });
+  };
+
   const assign =
     authMe.scopes.role !== 'member' && selectedId
       ? { workgroupId: selectedId, agents: agents.map((a) => ({ id: a.id, name: a.name })), rooms }
@@ -379,7 +385,17 @@ export function Observatory({ authMe }: ObservatoryProps) {
         : `${agents.length} agents · ${rooms.length} channels`;
 
   return (
-    <div className="nc-frame nc-of">
+    <div className={`nc-frame nc-of tm-shell ${isMobile ? 'tm-has-tabbar' : ''}`}>
+      {!isMobile && (
+        <AppNav
+          active={navKey}
+          isMobile={false}
+          onSelect={navigateTo}
+          scope={workgroups.find((w) => w.id === selectedId)?.name}
+          foot={snapshot ? `Fleet · ${agents.length} agents` : undefined}
+        />
+      )}
+      <div className="tm-shell-main">
       <header className="nc-of-bar">
         <span className="nc-of-bar-title">The Observatory</span>
         <WorkgroupPicker workgroups={workgroups} selectedId={selectedId} onChange={selectWorkgroup} />
@@ -426,12 +442,27 @@ export function Observatory({ authMe }: ObservatoryProps) {
                 the bar. They belong to the Overview, under the floor whose
                 rooms they are counting. */}
 
+            {/* Layout law 0: what needs a person is the FIRST thing on the
+                page, above the floor. Everything below it explains or qualifies
+                it; nothing below it is more urgent than it. */}
+            {view === 'overview' && (
+              <ExceptionFeed
+                exceptions={exceptions}
+                claims={claims}
+                items={allItems}
+                onAgent={(agentId, roomKey) => {
+                  setAgentDrawerId(agentId);
+                  setAgentDrawerRoomKey(roomKey);
+                }}
+                {...(assign ? { assign } : {})}
+              />
+            )}
+
             <div className="nc-obs-main">
-              {/* The floor is the vendored <office-map> custom element: a
-                  tile-based, hand-authored plan with real furniture, pan, and
-                  teleport. Geometry is FIXED; only who is in which room comes
-                  from data. */}
-              <div className="nc-of-left">
+              {/* The floor: eleven fixed zones on a blueprint grid, or the
+                  room strip on a phone. Geometry is FIXED; only who is in
+                  which room comes from data. */}
+              <div className="nc-of-left" ref={officeRef}>
               {/* Overview only. The floor is the answer to "what is going on",
                   which is the overview's question; on the job board it was a
                   full screen of illustration between the reader and the rows
@@ -443,9 +474,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                   <span className="nc-of-mapcard-title">The office</span>
                   {mapOpen && (
                     <span className="nc-of-mapcard-hint">
-                      {obsView === 'map'
-                        ? 'drag to pan · tap a room to filter what is below'
-                        : 'tap a room to filter what is below'}
+                      tap a room to filter what is below
                     </span>
                   )}
                   {/* obs.C.15 — one flex unit, not four independent chips. Each
@@ -454,67 +483,10 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       stranding it alone; grouping them lets the whole cluster
                       wrap together on a narrow header. */}
                   <div className="nc-of-mapcard-actions">
-                    {/* obs.C.35 — Tiles is the pre-map reading and stays the
-                        default; Map is more fun than functional right now
-                        (too busy, rooms too big) and is being left alone on
-                        purpose while that gets fixed separately. */}
-                    <div className="nc-of-viewtoggle" role="group" aria-label="Floor view">
-                      <button
-                        type="button"
-                        className={`nc-of-chip ${obsView === 'tiles' ? 'on' : ''}`}
-                        data-obs-view="tiles"
-                        aria-pressed={obsView === 'tiles'}
-                        onClick={() => setObsView('tiles')}
-                      >
-                        Tiles
-                      </button>
-                      <button
-                        type="button"
-                        className={`nc-of-chip ${obsView === 'map' ? 'on' : ''}`}
-                        data-obs-view="map"
-                        aria-pressed={obsView === 'map'}
-                        onClick={() => setObsView('map')}
-                      >
-                        Map
-                      </button>
-                    </div>
                     {mapOpen && selectedRoom && (
                       <button type="button" className="nc-of-chip" onClick={closeRoom}>
                         All rooms
                       </button>
-                    )}
-                    {mapOpen && obsView === 'map' && (
-                      <>
-                        <button
-                          type="button"
-                          className="nc-of-chip nc-of-zoom"
-                          onClick={() => zoomMapBy(-MAP_SCALE_STEP)}
-                          disabled={mapScale <= MAP_SCALE_MIN}
-                          aria-label="Zoom out"
-                          title="Zoom out"
-                        >
-                          −
-                        </button>
-                        <button
-                          type="button"
-                          className="nc-of-chip nc-of-zoom"
-                          onClick={resetMapScale}
-                          aria-label="Reset zoom"
-                          title="Reset zoom"
-                        >
-                          Reset
-                        </button>
-                        <button
-                          type="button"
-                          className="nc-of-chip nc-of-zoom"
-                          onClick={() => zoomMapBy(MAP_SCALE_STEP)}
-                          disabled={mapScale >= MAP_SCALE_MAX}
-                          aria-label="Zoom in"
-                          title="Zoom in"
-                        >
-                          +
-                        </button>
-                      </>
                     )}
                     <button
                       type="button"
@@ -527,52 +499,63 @@ export function Observatory({ authMe }: ObservatoryProps) {
                     </button>
                   </div>
                 </div>
-                {mapOpen && obsView === 'tiles' && (
-                  <OfficeTiles
-                    rooms={officeData.rooms}
-                    overflowRooms={officeData.overflowRooms}
-                    selected={selectedRoom}
-                    onSelect={pickRoom}
-                    onAgentSelect={selectAgentInRoom}
-                  />
-                )}
-                {mapOpen && obsView === 'map' && (
+                {mapOpen && (
                   <>
-                    <OfficeMap
-                      data={officeData}
-                      {...(startSlot ? { start: startSlot } : {})}
-                      selected={selectedRoom}
-                      onSelect={pickRoom}
-                      onAgentSelect={({ name, room: slot }) =>
-                        selectAgentInRoom(name, officeData.rooms.find((r) => r.slot === slot)?.key ?? null)
-                      }
-                      teleportTo={teleportTo}
-                      scale={String(mapScale)}
-                      onScaleChange={(s) => setMapScale(clampMapScale(s))}
-                    />
-                    <div className="nc-of-teleport">
-                      {officeData.rooms.map((r) => (
-                        <button
-                          key={r.slot}
-                          type="button"
-                          className={`nc-of-chip ${selectedRoom === r.slot ? 'on' : ''}`}
-                          onClick={() => {
-                            setTeleportTo(r.slot);
-                            pickRoom(r.slot);
-                          }}
-                        >
-                          <i className={`nc-of-sd ${r.state}`} />
-                          {r.label}
-                        </button>
-                      ))}
-                    </div>
-                    {officeData.overflow.length > 0 && (
-                      // Its own line: inside the chip row this dead-end sentence sat
-                      // on the same baseline as five controls and read as one.
-                      <p className="nc-of-overflow">
-                        {officeData.overflow.length} more{' '}
-                        {officeData.overflow.length === 1 ? 'channel has' : 'channels have'} no room on this floor
-                      </p>
+                    {/* One floor, two presentations. A phone gets the strip —
+                        a fixed eleven-zone plan is unreadable at 390px — and
+                        every room is in it, overflow included, so no channel
+                        is reachable on one form factor and not the other. */}
+                    {isMobile ? (
+                      <RoomStrip
+                        data={officeData}
+                        selected={selectedRoom}
+                        onSelect={pickRoom}
+                        onAgentSelect={selectAgentInRoom}
+                        alertRooms={alertRooms}
+                        vignettes={activeVignettes}
+                      />
+                    ) : (
+                      <>
+                        <FloorPlan
+                          data={officeData}
+                          selected={selectedRoom}
+                          onSelect={pickRoom}
+                          onAgentSelect={selectAgentInRoom}
+                          alertRooms={alertRooms}
+                          vignettes={activeVignettes}
+                        />
+                        {officeData.overflowRooms.length > 0 && (
+                          // The plan has eleven zones and this floor has more
+                          // channels than that. They are listed beside it
+                          // rather than dropped — a room with no zone is still
+                          // a room you can pick.
+                          <div className="tm-overflow" data-testid="overflow-list">
+                            <span className="tm-eyebrow">
+                              {officeData.overflowRooms.length} more{' '}
+                              {officeData.overflowRooms.length === 1 ? 'channel has' : 'channels have'} no zone on
+                              this floor
+                            </span>
+                            <ul>
+                              {officeData.overflowRooms.map((r) => (
+                                <li key={r.key}>
+                                  <button
+                                    type="button"
+                                    className={`nc-of-chip tm-tap ${selectedRoom === r.key ? 'on' : ''}`}
+                                    data-overflow-room={r.key}
+                                    onClick={() => pickRoom(r.key)}
+                                  >
+                                    <i className={`nc-of-sd ${r.state}`} />
+                                    {r.label}
+                                    {/* A room with no zone still says when a
+                                        run is live in it. */}
+                                    {activeVignettes.has(r.key) && <SmokeMark />}
+                                  </button>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </>
                     )}
                   </>
                 )}
@@ -585,6 +568,19 @@ export function Observatory({ authMe }: ObservatoryProps) {
                   them is what the numbers open into. */}
               {view === 'overview' && (
                 <CommitmentStrip items={roomFilteredItems} slice={flowFilter} onSlice={setFlowFilter} />
+              )}
+
+              {/* Who is on this floor, under the picture of where they are. */}
+              {view === 'overview' && (
+                <FleetList
+                  agents={agents}
+                  rooms={rooms}
+                  breachedOwners={breachedOwners}
+                  onAgent={(agentId, roomKey) => {
+                    setAgentDrawerId(agentId);
+                    setAgentDrawerRoomKey(roomKey);
+                  }}
+                />
               )}
 
               {selectedRoomAgents && (
@@ -693,7 +689,7 @@ export function Observatory({ authMe }: ObservatoryProps) {
                       roomLinks={roomLinks}
                       {...(assign ? { assign } : {})}
                     />
-                    <div className="nc-of-twoup">
+                    <div className="nc-of-twoup" ref={scheduleRef}>
                       <ClaimsCard
                         claims={claims}
                         expandedSlug={expandedClaim}
@@ -737,6 +733,8 @@ export function Observatory({ authMe }: ObservatoryProps) {
         {snapshot && error && <span className="nc-obs-stale">stale since {relAge(snapshot.asOf)} ago</span>}
         {!snapshot && !error && <span>—</span>}
       </footer>
+      </div>
+      {isMobile && <AppNav active={navKey} isMobile onSelect={navigateTo} />}
     </div>
   );
 }
@@ -1115,104 +1113,211 @@ export function CommitmentStrip({
   );
 }
 
+/* ─── The exception feed — the front door ────────────────────────────────── */
+
 /**
- * The office as channel cards — the pre-map reading, kept as a full sibling
- * rather than folded away behind "too busy". No SVG, no pan: a
- * responsive grid, one card per channel, real Slack avatars lighting up for
- * whoever is actually working right now and desaturated + "z z" for everyone
- * else — same read the map gives, without the illustration.
+ * What needs a person, worst first, above everything else on the page.
  *
- * Takes BOTH `rooms` (slotted, what the map can show) and `overflowRooms`
- * (channels the floor's 11 slots have no room for) — tiles have no fixed plan
- * to run out of, so a channel that never gets a room on the map still gets a
- * card here. Both arrays are already fully seated by office-data.ts's one
- * seating rule; this component only renders what it is handed.
+ * The derivation is `deriveExceptions` (views/exceptions.ts) and is tested on
+ * its own; this component only draws it. The actions are not new: an item and a
+ * claim each get {@link WorkActions}, the same row they get on every other
+ * surface, so the feed can never offer more or less than the board does about
+ * the same piece of work. A blocked agent gets the one affordance an agent has
+ * — open its drawer, where its actual work rows live — disabled with a reason
+ * when it has no live session to steer into.
  */
-function OfficeTiles({
-  rooms,
-  overflowRooms,
-  selected,
-  onSelect,
-  onAgentSelect,
+function ExceptionFeed({
+  exceptions,
+  claims,
+  items,
+  assign,
+  onAgent,
+  now = Date.now(),
 }: {
-  rooms: OfficeRoomData[];
-  overflowRooms: OfficeOverflowRoom[];
-  selected: string;
-  onSelect: (key: string) => void;
-  onAgentSelect: (name: string, roomKey: string) => void;
+  exceptions: ExceptionItem[];
+  claims: ObservatoryClaim[];
+  items: ReleaseItem[];
+  assign?: AssignWiring;
+  onAgent: (agentId: string, roomKey: string | null) => void;
+  now?: number;
 }) {
-  // A slotted room is selected/teleported-to by its SLOT (what the map uses);
-  // an overflow room has none, so it is selected by its own key instead. Both
-  // are just "the room's tile key" from here down.
-  const cards = [
-    ...rooms.map((r) => ({ ...r, tileKey: r.slot as string })),
-    ...overflowRooms.map((r) => ({ ...r, tileKey: r.key })),
-  ];
+  const claimBySlug = useMemo(() => new Map(claims.map((c) => [c.slug, c])), [claims]);
+  const itemById = useMemo(() => new Map(items.map((i) => [i.id, i])), [items]);
+
   return (
-    <div className="nc-of-roomgrid">
-      {cards.map((r) => (
-        <div
-          key={r.key}
-          className={`nc-of-roomcard ${r.state} ${selected === r.tileKey ? 'on' : ''}`}
-          role="button"
-          tabIndex={0}
-          onClick={() => onSelect(r.tileKey)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              onSelect(r.tileKey);
-            }
-          }}
-        >
-          <div className="nc-of-roomcard-head">
-            <i className={`nc-of-sd ${r.state}`} />
-            <span className="nc-of-roomcard-name">{r.label}</span>
-            {r.open > 0 && <span className="nc-of-roomcard-n">{r.open}</span>}
-          </div>
-          <div className="nc-of-roomcard-agents">
-            {r.agents.length === 0 ? (
-              <span className="nc-of-roomcard-empty">nobody wired here</span>
-            ) : (
-              r.agents.map((a) => {
-                const src = faceSrc(a.avatarUrl);
-                const lit = a.status === 'working';
-                return (
-                  <button
-                    key={a.name}
-                    type="button"
-                    className={`nc-of-facechip ${a.status}`}
-                    // The chip nests inside the tile's own click target; stop
-                    // the click there so picking a person does not also pick
-                    // the room out from under it.
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onAgentSelect(a.name, r.key);
-                    }}
-                    title={a.name}
-                  >
-                    {src ? (
-                      <img
-                        className={`nc-of-facechip-face ${lit ? '' : 'i'}`}
-                        src={src}
-                        alt=""
-                        width={20}
-                        height={20}
+    <section className="tm-feed" data-section="exceptions">
+      <div className="tm-feed-head">
+        <span className="tm-eyebrow">Needs attention ({exceptions.length})</span>
+      </div>
+      {exceptions.length === 0 ? (
+        // An empty feed is an answer, not an absence of one.
+        <p className="tm-allclear" data-testid="exceptions-all-clear">
+          All clear — nothing needs a person
+        </p>
+      ) : (
+        <div className="tm-feed-stack">
+          {exceptions.map((e) => (
+            <article key={e.key} className="tm-exc" data-severity={e.severity} data-exception={e.key}>
+              <span className="tm-exc-sev">
+                <i className="tm-exc-swatch" />
+                {SEVERITY_LABEL[e.severity]}
+              </span>
+              <p className="tm-exc-title">{e.title}</p>
+              {/* An age nobody measured renders as an em dash, never as "0m". */}
+              <p className="tm-exc-meta">{e.ageMs === null ? '—' : `waiting ${magnitude(e.ageMs, now + e.ageMs)}`}</p>
+              <div className="tm-exc-actions">
+                {e.actions.map((a) => {
+                  if (a.kind === 'open') {
+                    return (
+                      <a
+                        key="open"
+                        className="tm-btn tm-btn-primary tm-tap"
+                        href={a.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        Open
+                      </a>
+                    );
+                  }
+                  if (a.kind === 'steer') {
+                    return (
+                      <button
+                        key="steer"
+                        type="button"
+                        className="tm-btn tm-btn-primary tm-tap"
+                        data-action="steer"
+                        disabled={!a.sessionId}
+                        title={a.sessionId ? 'open this agent’s work' : 'no live session to steer into'}
+                        onClick={() => onAgent(a.agentId, e.roomKey)}
+                      >
+                        Steer
+                      </button>
+                    );
+                  }
+                  if (a.kind === 'assign') {
+                    const item = itemById.get(a.itemId);
+                    return (
+                      <WorkActions
+                        key="assign"
+                        target={{ kind: 'item', id: a.itemId, channel: a.channel ?? undefined, assignable: true }}
+                        threadUrl={item?.steeredThread?.threadUrl ?? null}
+                        room={{ name: a.channel }}
+                        ownerAgent={null}
+                        {...(assign ? { wiring: assign } : {})}
                       />
-                    ) : (
-                      <span className="nc-of-facechip-face nc-of-facechip-fallback">
-                        {a.name.charAt(0).toUpperCase()}
-                      </span>
-                    )}
-                    <span className="nc-of-facechip-name">{a.name}</span>
-                    {lit ? <i className="nc-of-facechip-pulse" /> : <span className="nc-of-facechip-z">z z</span>}
-                  </button>
-                );
-              })
-            )}
-          </div>
+                    );
+                  }
+                  const claim = claimBySlug.get(a.slug);
+                  return (
+                    <WorkActions
+                      key="nudge"
+                      target={{ kind: 'claim', slug: a.slug, pushable: claim ? claimPushable(claim) : false }}
+                      threadUrl={claim?.threadUrl ?? null}
+                      sessionId={claim?.sessionId ?? null}
+                      room={workRoom(a.threadId)}
+                      ownerAgent={null}
+                      {...(assign ? { wiring: assign } : {})}
+                    />
+                  );
+                })}
+              </div>
+            </article>
+          ))}
         </div>
-      ))}
-    </div>
+      )}
+    </section>
+  );
+}
+
+/* ─── The fleet ──────────────────────────────────────────────────────────── */
+
+/**
+ * What one agent is doing, in the fewest true words.
+ *
+ * `holding` first, because a claim is a piece of work somebody promised to
+ * finish and it outranks a conversation; then the live thread, which is
+ * activity but not necessarily a commitment; then the honest nothing. An agent
+ * is never described as busy on the strength of its container being up.
+ */
+export function agentActivityLine(agent: ObservatoryAgent, roomName: (key: string) => string | null): string {
+  if (agent.holding.length > 0) {
+    const [first, ...rest] = agent.holding;
+    return rest.length > 0 ? `holding ${first} +${rest.length} more` : `holding ${first}`;
+  }
+  const live = agent.liveSession;
+  if (live) {
+    const where = roomName(live.channelKey);
+    const verb = agent.active ? 'live in' : 'last spoke in';
+    return where ? `${verb} ${where}` : agent.active ? 'live in a thread' : 'last spoke in a thread';
+  }
+  return 'no active task';
+}
+
+/**
+ * The fleet, avatar-led: who exists, what state they are in, what they are on.
+ *
+ * The visible label is the agent's PERSONA name — what it is called in the
+ * channel the operator talks to it in. `canonicalName` is infrastructure
+ * identity and does not render here at all; an operator who knows an agent as
+ * "Nova" should not have to learn its folder name to find it.
+ */
+function FleetList({
+  agents,
+  rooms,
+  breachedOwners,
+  onAgent,
+}: {
+  agents: ObservatoryAgent[];
+  rooms: ObservatoryRoom[];
+  breachedOwners: Set<string>;
+  onAgent: (agentId: string, roomKey: string | null) => void;
+}) {
+  const roomName = useMemo(() => {
+    const byKey = new Map(rooms.map((r) => [r.key, r.name.startsWith('#') ? r.name : `#${r.name}`]));
+    return (key: string) => byKey.get(key) ?? null;
+  }, [rooms]);
+  const activeCount = agents.filter((a) => a.active).length;
+
+  return (
+    <section className="tm-fleet" data-section="fleet">
+      <div className="tm-feed-head">
+        <span className="tm-eyebrow">
+          Fleet — {agents.length} {agents.length === 1 ? 'agent' : 'agents'} · {activeCount} active
+        </span>
+      </div>
+      {agents.length === 0 ? (
+        <p className="tm-allclear">No agents on this floor</p>
+      ) : (
+        <ul className="tm-fleet-list">
+          {agents.map((a) => {
+            const status = agentState(a, breachedOwners, a.location ?? '');
+            return (
+              <li key={a.id} className="tm-fleet-row" data-agent={a.id}>
+                <button
+                  type="button"
+                  className="tm-fleet-open tm-tap"
+                  onClick={() => onAgent(a.id, a.location)}
+                  aria-label={`Open ${a.name}'s work`}
+                >
+                  <AgentAvatar name={a.name} avatarUrl={a.avatarUrl} status={status} />
+                  <span className="tm-fleet-content">
+                    <span className="tm-fleet-top">
+                      <span className="tm-fleet-name-status">
+                        <span className="tm-fleet-name">{a.name}</span>
+                        <span className={`tm-fleet-status ${status}`}>{status}</span>
+                      </span>
+                      <span className="tm-fleet-time mono">{a.lastSeenAt ? relAge(a.lastSeenAt) : '—'}</span>
+                    </span>
+                    <span className="tm-fleet-task">{agentActivityLine(a, roomName)}</span>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
   );
 }
 

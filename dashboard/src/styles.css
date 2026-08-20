@@ -1,38 +1,9 @@
-/* ── Web fonts ────────────────────────────────────────────────────────────
-   Self-hosted, not a CDN: the dashboard sits behind auth and should not make
-   a request to a third party on every load, and a blocked CDN would silently
-   drop the type the atrium system specifies. Latin subset only; any glyph the
-   file lacks (CJK in a channel name, say) falls through the family stack the
-   way it always did. Instrument Sans ships as one variable file covering the
-   400-600 range we use.
-   ──────────────────────────────────────────────────────────────────────── */
-@font-face {
-  font-family: 'Instrument Sans';
-  src: url('./fonts/instrument-sans-var.woff2') format('woff2-variations');
-  font-weight: 400 700;
-  font-style: normal;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'IBM Plex Mono';
-  src: url('./fonts/ibm-plex-mono-400.woff2') format('woff2');
-  font-weight: 400; font-style: normal; font-display: swap;
-}
-@font-face {
-  font-family: 'IBM Plex Mono';
-  src: url('./fonts/ibm-plex-mono-500.woff2') format('woff2');
-  font-weight: 500; font-style: normal; font-display: swap;
-}
-@font-face {
-  font-family: 'IBM Plex Mono';
-  src: url('./fonts/ibm-plex-mono-600.woff2') format('woff2');
-  font-weight: 600; font-style: normal; font-display: swap;
-}
-
 /* ────────────────────────────────────────────────────────────
-   Agent Board — orchestration control surface
-   Warm near-black palette, status as the only colour carrier.
-   IBM Plex Sans body / JetBrains Mono labels & numbers.
+   Agent Board — orchestration control surface.
+
+   The tokens below are the tom-modern light theme (see theme.css, which owns
+   the values and the type). This sheet is the legacy chrome that reads them,
+   and it shrinks as surfaces migrate onto the component layer.
 
    Tweak wrappers (applied at root by main.tsx):
      .tw-statusbar   — add left status accent bar to cards
@@ -43,49 +14,52 @@
      .tw-accent-{amber|violet|green} — recolor the "live" cyan
    Operator's current variant: .tw-no-heat .tw-no-phasebar .tw-no-grid
    ──────────────────────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 
-  /* Surfaces — warmer near-black than primer */
-  --bg-deep:    oklch(0.16 0.006 60);
-  --bg-panel:   oklch(0.20 0.007 60);
-  --bg-card:    oklch(0.23 0.008 60);
-  --bg-card-2:  oklch(0.27 0.009 60);
-  --bg-inset:   oklch(0.14 0.005 60);
+  /* Surfaces — the tom-modern canvas. One theme; see theme.css for why there
+     is no dark block rather than an uncalibrated one. */
+  --bg-deep:    #fafafa;
+  --bg-panel:   #ffffff;
+  --bg-card:    #ffffff;
+  --bg-card-2:  #fafafa;
+  --bg-inset:   #f4f4f5;
 
-  /* Hair grid */
-  --grid:       oklch(0.27 0.007 60 / 0.5);
+  /* Blueprint grid */
+  --grid:       rgba(150, 150, 150, 0.05);
 
   /* Text */
-  --fg:         oklch(0.96 0.005 80);
-  --fg-2:       oklch(0.78 0.008 70);
-  --fg-3:       oklch(0.58 0.010 65);
-  --fg-4:       oklch(0.42 0.010 60);
+  --fg:         #27272a;
+  --fg-2:       #52525b;
+  --fg-3:       #71717a;
+  --fg-4:       #a1a1aa;
 
   /* Border */
-  --line:       oklch(0.34 0.008 60);
-  --line-2:     oklch(0.45 0.010 60);
+  --line:       #d4d4d8;
+  --line-2:     #969696;
 
-  /* Status — strong, saturated, unmistakable */
-  --st-failed:     oklch(0.68 0.20 25);
-  --st-failed-bg:  oklch(0.68 0.20 25 / 0.14);
-  --st-pending:    oklch(0.78 0.16 80);
-  --st-pending-bg: oklch(0.78 0.16 80 / 0.14);
-  --st-running:    oklch(0.84 0.16 195);
-  --st-running-bg: oklch(0.84 0.16 195 / 0.14);
-  --st-done:       oklch(0.74 0.16 150);
-  --st-done-bg:    oklch(0.74 0.16 150 / 0.12);
-  --st-cancel:     oklch(0.55 0.005 60);
-  --st-cancel-bg:  oklch(0.55 0.005 60 / 0.14);
-  --st-needs:      oklch(0.78 0.18 50);
-  --st-needs-bg:   oklch(0.78 0.18 50 / 0.16);
+  /* Status. The palette is closed, so six states map onto it by MEANING and
+     each colour keeps exactly one: green is working, red is failed, vermillion
+     is needs-you, and the greys are degrees of nothing-happening. A finished
+     task is not an achievement to colour — it is over. */
+  --st-failed:     #c81e1e;
+  --st-failed-bg:  rgba(200, 30, 30, 0.10);
+  --st-pending:    #71717a;
+  --st-pending-bg: rgba(113, 113, 122, 0.10);
+  --st-running:    #1f7a4d;
+  --st-running-bg: rgba(31, 122, 77, 0.10);
+  --st-done:       #52525b;
+  --st-done-bg:    rgba(82, 82, 91, 0.08);
+  --st-cancel:     #a1a1aa;
+  --st-cancel-bg:  rgba(161, 161, 170, 0.10);
+  --st-needs:      #ff5a00;
+  --st-needs-bg:   rgba(255, 90, 0, 0.10);
 
-  --brand:      oklch(0.82 0.16 75);
+  --brand:      #ff5a00;
 
-  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-sans: 'Geist Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
 /* Legacy token aliases — kept so SessionList and any inline-styled
@@ -95,8 +69,8 @@
   --bg-lane: var(--bg-panel);
   --bg-input: var(--bg-inset);
   --bg-message-agent: var(--bg-card);
-  --bg-message-dashboard: oklch(0.22 0.018 240);
-  --bg-message-system: oklch(0.22 0.020 70);
+  --bg-message-dashboard: #eef2f8;
+  --bg-message-system: #faf3e8;
   --text-primary: var(--fg);
   --text-secondary: var(--fg-2);
   --text-muted: var(--fg-3);
@@ -129,9 +103,8 @@ a:hover { color: var(--fg); }
 .nc-frame {
   min-height: 100vh;
   background:
-    linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 100% 32px,
-    linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 32px 100%,
-    radial-gradient(1200px 600px at 50% -200px, oklch(0.26 0.02 75 / 0.35), transparent 70%),
+    linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 100% 30px,
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 30px 100%,
     var(--bg-deep);
 }
 .tw-no-grid .nc-frame { background: var(--bg-deep); }
@@ -140,7 +113,7 @@ a:hover { color: var(--fg); }
 .nc-pulse {
   padding: 14px 16px 12px;
   border-bottom: 1px solid var(--line);
-  background: linear-gradient(180deg, oklch(0.21 0.008 60), oklch(0.18 0.007 60));
+  background: var(--bg-panel);
   position: sticky;
   top: 0;
   z-index: 10;
@@ -168,7 +141,7 @@ a:hover { color: var(--fg); }
 .nc-brand .mark::before {
   content: ""; position: absolute; inset: 0;
   border: 1.5px solid var(--brand);
-  border-radius: 2px;
+  border-radius:0;
   transform: rotate(45deg);
 }
 .nc-brand .mark::after {
@@ -224,8 +197,8 @@ a:hover { color: var(--fg); }
   list-style: none;
   background: var(--bg-card-2);
   border: 1px solid var(--line-2);
-  border-radius: 6px;
-  box-shadow: 0 8px 24px oklch(0% 0 0 / 0.4);
+  border-radius:0;
+  box-shadow: var(--tm-shadow-hard);
 }
 .nc-group-title-menu li {
   display: flex;
@@ -237,7 +210,7 @@ a:hover { color: var(--fg); }
   font-size: 13px;
   color: var(--fg);
   cursor: pointer;
-  border-radius: 4px;
+  border-radius:0;
   letter-spacing: 0;
   text-transform: none;
 }
@@ -332,7 +305,7 @@ a:hover { color: var(--fg); }
 button.nc-pulse-cell {
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius:0;
   padding: 6px 8px;
   cursor: pointer;
   text-align: left;
@@ -341,9 +314,9 @@ button.nc-pulse-cell {
   margin: -6px -8px;
   transition: background 0.12s ease, border-color 0.12s ease;
 }
-button.nc-pulse-cell:hover { background: oklch(0.18 0.005 60); }
+button.nc-pulse-cell:hover { background: var(--bg-card-2); }
 button.nc-pulse-cell.active {
-  background: oklch(0.20 0.008 60);
+  background: var(--bg-card-2);
   border-color: var(--bd-1);
 }
 button.nc-pulse-cell.active.failed  { border-color: var(--st-failed); }
@@ -391,13 +364,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   align-items: center;
   justify-content: flex-end;
   padding-right: 22px;
-  background: oklch(0.30 0.10 25);
-  color: oklch(0.92 0.05 25);
+  background: var(--st-failed-bg);
+  color: var(--st-failed);
   font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  border-radius: 8px;
+  border-radius:0;
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.12s ease;
@@ -426,8 +399,8 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-transcript { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .nc-transcript-row {
-  padding: 8px 10px; border-radius: 6px; border: 1px solid var(--bd-2);
-  background: oklch(0.18 0.005 60);
+  padding: 8px 10px; border-radius:0; border: 1px solid var(--bd-2);
+  background: var(--bg-inset);
 }
 .nc-transcript-row.inbound { border-left: 2px solid var(--st-running); }
 .nc-transcript-row.outbound { border-left: 2px solid var(--fg-3); }
@@ -442,16 +415,16 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-md ul, .nc-md ol { margin: 0 0 8px; padding-left: 22px; }
 .nc-md li { margin: 2px 0; }
 .nc-md code {
-  background: oklch(0.22 0.008 60);
+  background: var(--bg-card-2);
   padding: 1px 5px;
-  border-radius: 3px;
+  border-radius:0;
   font-family: var(--font-mono);
   font-size: 12px;
 }
 .nc-md pre {
-  background: oklch(0.13 0.005 60);
+  background: var(--bg-inset);
   padding: 10px 12px;
-  border-radius: 4px;
+  border-radius:0;
   overflow-x: auto;
   margin: 6px 0;
 }
@@ -478,14 +451,14 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   overflow-x: auto;
   display: block;
 }
-.nc-md thead { background: oklch(0.22 0.008 60); }
+.nc-md thead { background: var(--bg-card-2); }
 .nc-md th, .nc-md td {
   border: 1px solid var(--bd-2);
   padding: 4px 8px;
   text-align: left;
   vertical-align: top;
 }
-.nc-md tbody tr:nth-child(even) { background: oklch(0.17 0.005 60); }
+.nc-md tbody tr:nth-child(even) { background: var(--bg-card-2); }
 .nc-md hr { border: 0; border-top: 1px solid var(--bd-2); margin: 10px 0; }
 
 /* Expand/collapse for long messages. The summary holds the preview; opening
@@ -552,7 +525,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   letter-spacing: 0.08em;
   text-transform: uppercase;
   padding: 6px 10px;
-  border-radius: 999px;
+  border-radius:0;
   border: 1px solid var(--line);
   color: var(--fg-2);
   background: transparent;
@@ -608,7 +581,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   position: relative;
   background: var(--bg-card);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius:0;
   padding: 12px 13px 11px 13px;
   display: flex; flex-direction: column; gap: 7px;
   cursor: pointer;
@@ -640,9 +613,9 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .tw-no-heat .nc-card.heat-hot  { background: var(--bg-card); }
 
 
-.tw-accent-amber  { --st-running: oklch(0.82 0.16 75); --brand: oklch(0.82 0.16 75); }
-.tw-accent-violet { --st-running: oklch(0.78 0.16 295); --brand: oklch(0.78 0.16 295); }
-.tw-accent-green  { --st-running: oklch(0.78 0.16 150); --brand: oklch(0.78 0.16 150); }
+.tw-accent-amber  { --st-running: #8c6400; --brand: #8c6400; }
+.tw-accent-violet { --st-running: #5b4b8a; --brand: #5b4b8a; }
+.tw-accent-green  { --st-running: #1f7a4d; --brand: #1f7a4d; }
 
 .nc-card-head {
   display: flex; align-items: center; gap: 8px;
@@ -693,7 +666,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   font-size: 14px;
   line-height: 1;
   padding: 2px 6px;
-  border-radius: 4px;
+  border-radius:0;
   opacity: 0;
   transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
 }
@@ -780,14 +753,14 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   letter-spacing: 0.08em;
   text-transform: uppercase;
   padding: 3px 7px;
-  border-radius: 3px;
+  border-radius:0;
   display: inline-flex; align-items: center; gap: 4px;
   font-weight: 500;
 }
 .nc-pill.failed { background: var(--st-failed-bg); color: var(--st-failed); }
 .nc-pill.needs  { background: var(--st-needs-bg);  color: var(--st-needs); }
-.nc-pill.phase  { background: oklch(0.30 0.008 60); color: var(--fg-2); }
-.nc-pill.linear { background: oklch(0.30 0.008 60); color: var(--fg); font-weight: 600; letter-spacing: 0.04em; }
+.nc-pill.phase  { background: var(--bg-inset); color: var(--fg-2); }
+.nc-pill.linear { background: var(--bg-inset); color: var(--fg); font-weight: 600; letter-spacing: 0.04em; }
 
 /* Collapsed older section */
 .nc-fold {
@@ -800,7 +773,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   color: var(--fg-3);
   padding: 10px;
   border: 1px dashed var(--line);
-  border-radius: 6px;
+  border-radius:0;
   cursor: pointer;
   background: transparent;
 }
@@ -810,7 +783,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   margin: 14px 12px;
   padding: 14px 12px;
   border: 1px dashed var(--line);
-  border-radius: 6px;
+  border-radius:0;
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--fg-3);
@@ -823,7 +796,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-detail-header {
   padding: 12px 16px 14px;
   border-bottom: 1px solid var(--line);
-  background: linear-gradient(180deg, oklch(0.21 0.008 60), oklch(0.18 0.007 60));
+  background: var(--bg-panel);
 }
 .nc-detail-nav {
   display: flex; align-items: center; gap: 6px;
@@ -858,7 +831,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   border: 1px solid var(--line);
   padding: 1px 6px;
   font-size: 13px;
-  border-radius: 3px;
+  border-radius:0;
   margin-right: 6px;
   letter-spacing: 0.04em;
   vertical-align: 2px;
@@ -873,7 +846,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   text-transform: uppercase;
 }
 .nc-detail-meta .status-chip {
-  padding: 3px 8px; border-radius: 3px;
+  padding: 3px 8px; border-radius:0;
   font-weight: 600;
 }
 .nc-detail-meta .status-chip.running   { background: var(--st-running-bg); color: var(--st-running); }
@@ -889,7 +862,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   letter-spacing: 0.08em;
   text-transform: uppercase;
   padding: 8px 12px;
-  border-radius: 4px;
+  border-radius:0;
   border: 1px solid var(--line);
   background: transparent;
   color: var(--fg);
@@ -963,13 +936,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   background: var(--bg-inset);
   border: 1px solid var(--line);
   padding: 1px 5px;
-  border-radius: 3px;
+  border-radius:0;
   color: var(--fg);
 }
 .md pre {
   background: var(--bg-inset);
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius:0;
   padding: 8px 10px;
   overflow-x: auto;
   font-size: 11.5px;
@@ -1011,7 +984,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   background: var(--bg-inset);
   border: 1px solid var(--line);
   border-left: 3px solid var(--st-done);
-  border-radius: 4px;
+  border-radius:0;
   padding: 12px 14px;
   margin-top: 8px;
 }
@@ -1020,15 +993,15 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* Transcript bubbles */
 .nc-msg {
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius:0;
   padding: 10px 12px;
   margin-bottom: 8px;
   font-size: 12.5px;
   line-height: 1.45;
   background: var(--bg-card);
 }
-.nc-msg.dashboard { background: oklch(0.22 0.018 240); border-color: oklch(0.30 0.030 240); }
-.nc-msg.system    { background: oklch(0.22 0.020 70);  border-color: oklch(0.30 0.040 70); }
+.nc-msg.dashboard { background: var(--bg-message-dashboard); border-color: #c9d6e8; }
+.nc-msg.system    { background: var(--bg-message-system);  border-color: #e6d5b8; }
 .nc-msg .who {
   font-family: var(--font-mono);
   font-size: 10px;
@@ -1040,8 +1013,8 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-msg .who .name { color: var(--fg-2); font-weight: 600; }
 .nc-msg .who .when { margin-left: auto; }
-.nc-msg.dashboard .who .name { color: oklch(0.84 0.10 240); }
-.nc-msg.system .who .name    { color: oklch(0.86 0.14 80); }
+.nc-msg.dashboard .who .name { color: #3a5a8c; }
+.nc-msg.system .who .name    { color: #8c6400; }
 
 /* Steer composer: amber "worker is asking" prompt above the textarea
    when needs_input is set. */
@@ -1050,7 +1023,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   margin-bottom: 10px;
   background: var(--st-needs-bg);
   border: 1px solid var(--st-needs);
-  border-radius: 6px;
+  border-radius:0;
   font-size: 13px;
   color: var(--st-needs);
   line-height: 1.4;
@@ -1075,7 +1048,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-composer .field {
   background: var(--bg-inset);
   border: 1px solid var(--line-2);
-  border-radius: 8px;
+  border-radius:0;
   padding: 10px 12px 8px;
   display: flex; flex-direction: column;
   gap: 6px;
@@ -1108,7 +1081,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   border: 0;
   color: var(--bg-deep);
   padding: 6px 12px;
-  border-radius: 4px;
+  border-radius:0;
   font-family: var(--font-mono);
   font-size: 10.5px;
   letter-spacing: 0.12em;
@@ -1147,7 +1120,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   .nc-desktop-pulse {
     border-right: 1px solid var(--line);
     padding: 20px 22px;
-    background: linear-gradient(180deg, oklch(0.21 0.008 60), oklch(0.18 0.007 60));
+    background: var(--bg-panel);
   }
   .nc-desktop-pulse .nc-brand { margin-bottom: 14px; }
   .nc-desktop-pulse .bigcount {
@@ -1250,7 +1223,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
     padding: 16px 18px 14px;
     border-bottom: 1px solid var(--line);
     display: flex; align-items: center; justify-content: space-between;
-    background: oklch(0.19 0.007 60);
+    background: var(--bg-card-2);
   }
   .nc-col-head .ttl {
     display: flex; align-items: center; gap: 10px;
@@ -1346,7 +1319,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sched-pill {
   display: flex; flex-direction: column; gap: 2px;
   min-width: 64px; padding: 7px 11px;
-  border-radius: 5px;
+  border-radius:0;
   border: 1px solid var(--line);
   background: var(--bg-card);
 }
@@ -1375,7 +1348,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sched-degraded {
   display: inline-flex; align-items: center; gap: 6px; align-self: center;
   margin-left: auto;
-  padding: 5px 10px; border-radius: 5px;
+  padding: 5px 10px; border-radius:0;
   background: var(--st-failed-bg); color: var(--st-failed);
   font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
 }
@@ -1389,7 +1362,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   margin-top: 12px; padding: 10px 12px;
   border: 1px solid var(--st-failed);
   background: var(--st-failed-bg);
-  border-radius: 6px;
+  border-radius:0;
 }
 .nc-sched-stalled-inline .hdr {
   font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--st-failed);
@@ -1398,7 +1371,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sched-stalled-inline ul { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
 .nc-sched-stalled-link {
   display: inline-flex; gap: 6px; align-items: baseline;
-  background: var(--bg-card); border: 1px solid var(--line-2); border-radius: 4px;
+  background: var(--bg-card); border: 1px solid var(--line-2); border-radius:0;
   padding: 4px 8px; cursor: pointer; color: var(--fg);
 }
 .nc-sched-stalled-link:hover { border-color: var(--st-failed); }
@@ -1410,7 +1383,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sched-toolbar select,
 .nc-sched-toolbar input {
   background: var(--bg-inset); color: var(--fg);
-  border: 1px solid var(--line); border-radius: 5px;
+  border: 1px solid var(--line); border-radius:0;
   padding: 6px 9px; font-size: 13px; font-family: var(--font-sans);
 }
 .nc-sched-toolbar input.nc-sched-search { flex: 1; min-width: 180px; }
@@ -1429,13 +1402,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sched-section-head .nm { font-weight: 600; font-size: 14px; }
 .nc-sched-section-head .cnt {
   font-family: var(--font-mono); font-size: 11px; color: var(--fg-3);
-  background: var(--bg-card); border-radius: 10px; padding: 1px 8px;
+  background: var(--bg-card); border-radius:0; padding: 1px 8px;
 }
 .nc-sched-section-body { display: flex; flex-direction: column; gap: 6px; padding-top: 4px; }
 
 /* Row */
 .nc-sched-row {
-  border: 1px solid var(--line); border-left-width: 3px; border-radius: 6px;
+  border: 1px solid var(--line); border-left-width: 3px; border-radius:0;
   background: var(--bg-card); padding: 9px 12px; cursor: pointer;
 }
 .nc-sched-row:hover { border-color: var(--line-2); }
@@ -1461,7 +1434,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* Health pill on the row */
 .nc-sched-healthpill {
   font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
-  padding: 2px 7px; border-radius: 3px; font-weight: 600;
+  padding: 2px 7px; border-radius:0; font-weight: 600;
 }
 .nc-sched-healthpill.stalled,
 .nc-sched-healthpill.strand  { background: var(--st-failed-bg);  color: var(--st-failed); }
@@ -1474,10 +1447,10 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* Badges */
 .nc-sched-badge {
   font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase;
-  padding: 2px 6px; border-radius: 3px; background: oklch(0.30 0.008 60); color: var(--fg-2);
+  padding: 2px 6px; border-radius: 0; background: var(--bg-inset); color: var(--fg-2);
 }
-.nc-sched-badge.module { background: oklch(0.30 0.02 280); color: oklch(0.85 0.08 280); }
-.nc-sched-badge.thread { background: oklch(0.30 0.02 200); color: oklch(0.85 0.08 200); }
+.nc-sched-badge.module { background: rgba(91, 75, 138, 0.10); color: #5b4b8a; }
+.nc-sched-badge.thread { background: var(--bg-inset); color: var(--fg-2); }
 .nc-sched-badge.quiet  { background: var(--bg-card-2); color: var(--fg-3); }
 
 /* ─── Drawer ─── */
@@ -1491,7 +1464,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   box-shadow: -18px 0 40px -24px rgba(35, 32, 27, 0.5);
   display: flex; flex-direction: column; z-index: 40;
   overflow: hidden; color: var(--ink, #23201b);
-  font-family: 'Instrument Sans', ui-sans-serif, system-ui, sans-serif; font-size: 13px;
+  font-family: var(--font-sans); font-size: 13px;
 }
 .nc-sched-drawer-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -1499,11 +1472,11 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-sched-drawer-head h3 {
   margin: 0; font-size: 13.5px; font-weight: 600; letter-spacing: -0.008em;
-  font-family: 'IBM Plex Mono', ui-monospace, monospace; overflow-wrap: anywhere;
+  font-family: var(--font-mono); overflow-wrap: anywhere;
 }
 .nc-sched-drawer-close {
   background: none; border: 0; color: var(--ink-3); font-size: 18px; line-height: 1;
-  width: 32px; height: 32px; border-radius: 6px; cursor: pointer; flex: none;
+  width: 44px; height: 44px; border-radius:0; cursor: pointer; flex: none;
 }
 .nc-sched-drawer-close:hover { background: rgba(35, 32, 27, 0.05); color: var(--ink); }
 .nc-sched-drawer-body { overflow-y: auto; padding: 14px 16px 20px; }
@@ -1524,8 +1497,8 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-sched-overrides .ovr { font-size: 12px; color: var(--ink-2); }
 .nc-sched-prompt pre {
-  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-  padding: 10px 12px; font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  background: var(--card); border: 1px solid var(--line); border-radius:0;
+  padding: 10px 12px; font-family: var(--font-mono);
   font-size: 12px; color: var(--ink-2);
   white-space: pre-wrap; word-break: break-word; margin: 0 0 10px;
 }
@@ -1535,7 +1508,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   border-bottom: 1px solid var(--line); font-size: 12.5px;
 }
 .nc-sched-history .ts, .nc-sched-audit .ts {
-  font-family: 'IBM Plex Mono', ui-monospace, monospace; color: var(--ink-3); font-size: 11.5px;
+  font-family: var(--font-mono); color: var(--ink-3); font-size: 11.5px;
 }
 .nc-sched-history .outcome.ok    { color: var(--go); }
 .nc-sched-history .outcome.bad   { color: var(--stop); }
@@ -1547,7 +1520,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   padding-top: 14px; border-top: 1px solid var(--line);
 }
 .nc-sched-verb {
-  padding: 0 12px; min-height: 34px; border-radius: 7px; cursor: pointer;
+  padding: 0 12px; min-height: 34px; border-radius:0; cursor: pointer;
   border: 1px solid var(--line-2); background: var(--card-2); color: var(--ink);
   font: 500 12.5px/1 inherit;
 }
@@ -1557,7 +1530,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 
 /* Confirm / form panes */
 .nc-sched-confirm, .nc-sched-move-confirm, .nc-sched-edit-form, .nc-sched-move-form {
-  border: 1px solid var(--line); border-radius: var(--r, 10px); background: var(--card);
+  border: 1px solid var(--line); border-radius: var(--r, 0); background: var(--card);
   padding: 14px; margin-top: 8px;
 }
 .nc-sched-confirm h4, .nc-sched-move-confirm h4 { font-size: 13px; }
@@ -1568,15 +1541,15 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-sched-edit-form textarea, .nc-sched-edit-form input,
 .nc-sched-move-form input {
-  background: var(--card-2); border: 1px solid var(--line-2); border-radius: 7px;
+  background: var(--card-2); border: 1px solid var(--line-2); border-radius:0;
   padding: 7px 9px; color: var(--ink);
-  font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 12px;
+  font-family: var(--font-mono); font-size: 12px;
 }
 .nc-sched-edit-form textarea.prompt { min-height: 40vh; resize: vertical; }
 .nc-sched-cron-sub { font-size: 11px; color: var(--ink-3); font-family: inherit; text-transform: none; }
 .nc-sched-form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
 .nc-sched-form-actions button {
-  padding: 0 13px; min-height: 34px; border-radius: 7px; cursor: pointer;
+  padding: 0 13px; min-height: 34px; border-radius:0; cursor: pointer;
   border: 1px solid var(--line-2); background: var(--card-2); color: var(--ink);
   font: 500 12.5px/1 inherit;
 }
@@ -1585,14 +1558,14 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 
 .nc-sched-reseed-warning {
   border: 1px solid rgba(179, 134, 44, 0.4); background: rgba(179, 134, 44, 0.08);
-  color: var(--ink); border-radius: 8px; padding: 9px 11px; font-size: 12px;
+  color: var(--ink); border-radius:0; padding: 9px 11px; font-size: 12px;
   line-height: 1.5; margin-bottom: 10px;
 }
 .nc-sched-delta { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 10px 0; }
 .nc-sched-delta .lbl { font-size: 12px; color: var(--ink-3); display: block; }
 .nc-sched-delta ul { list-style: none; margin: 4px 0 0; padding: 0; }
 .nc-sched-delta li {
-  font-family: 'IBM Plex Mono', ui-monospace, monospace; font-size: 12px; padding: 2px 0;
+  font-family: var(--font-mono); font-size: 12px; padding: 2px 0;
 }
 .nc-sched-delta .gains li  { color: var(--go); }
 .nc-sched-delta .losses li { color: var(--stop); }
@@ -1600,7 +1573,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sched-caveat { font-size: 12px; color: var(--ink-2); margin: 8px 0; line-height: 1.5; }
 .nc-sched-drawer-error {
   border: 1px solid rgba(176, 80, 63, 0.4); background: rgba(176, 80, 63, 0.07);
-  color: var(--stop); border-radius: 8px; padding: 8px 10px; font-size: 12px; margin: 8px 0;
+  color: var(--stop); border-radius:0; padding: 8px 10px; font-size: 12px; margin: 8px 0;
 }
 
 @media (max-width: 899px) {
@@ -1622,14 +1595,18 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-agent-drawer-section { margin-bottom: 18px; }
 
 /* ─── Observatory — the office page ──────────────────────────────────────────
-   Scoped to `.nc-of`. The floor is the vendored <office-map> custom element,
-   which carries its own palette; everything AROUND it is the atrium light
-   chrome defined further down. The CSS pixel-art floor this section used to
-   hold, and the painted-wall header that framed it, are gone with it. */
+   Scoped to `.nc-of`. The floor itself is drawn by FloorPlan.tsx and styled in
+   theme.css alongside the rest of the component layer; what lives here is the
+   chrome around it, and it shrinks as surfaces move across. */
 
 .nc-frame.nc-of {
-  background: #f6f4f0;
+  background: var(--page);
   color: var(--ink);
+  /* The blueprint grid is the canvas's own atmosphere — see theme.css. */
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size: 30px 30px;
 }
 
 .nc-of .nc-obs-body { max-width: 1200px; margin: 0 auto; padding: 16px; }
@@ -1649,23 +1626,29 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    width and pushed the whole page past a 390px viewport. */
 .nc-of .nc-obs-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; align-items: start; }
 
-/* ─── atrium: the light chrome ───────────────────────────────────────────── */
-/* One system across every surface. The map is the only illustrated thing in
-   the product; its container, and everything around it, is quiet light UI. */
+/* ─── The Observatory's own token names ──────────────────────────────────── */
+/* ALIASES ONLY. This block used to be a second palette — a light one, defined
+   in hex, sitting alongside a dark one at :root, with nothing switching
+   between them. There is one palette now, its values live in theme.css, and
+   every name below simply points at it. Nothing here may take a literal
+   colour: two places to change a colour is how the two palettes drifted apart
+   in the first place.
+   The names themselves stay because ~400 rules under this line read them, and
+   renaming those buys nothing a reader can see. */
 .nc-of{
-  /* Both muted tiers clear 4.5:1 on --card-2. The old --ink-3 (.45) measured
-     ~3.0:1 — quiet by near-invisibility rather than by rank. */
-  --ink:#23201b; --ink-2:rgba(35,32,27,.78); --ink-3:rgba(35,32,27,.66);
-  --line:rgba(35,32,27,.10); --line-2:rgba(35,32,27,.16);
-  --page:#f6f4f0; --card:#faf8f5; --card-2:#fff;
-  --accent:#3f68c9;
-  --stop:#b0503f; --warn:#b3862c; --go:#4a7c59; --idle:#8f8b82;
-  --r:10px;
+  --ink:var(--foreground); --ink-2:var(--fg-2); --ink-3:var(--muted-foreground);
+  --line:var(--border-soft); --line-2:var(--border);
+  --page:var(--background); --card:var(--surface); --card-2:var(--surface);
+  /* --accent and --accent-text are theme.css's; only the state names below
+     need mapping onto this sheet's older vocabulary. */
+  --stop:var(--sev-hands); --warn:var(--sev-decision); --go:var(--sev-working); --idle:var(--muted-foreground);
+  /* Sharp corners are the brand. */
+  --r:0px;
   background:var(--page); color:var(--ink);
-  font-family:'Instrument Sans',ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
-  font-size:13px; -webkit-font-smoothing:antialiased;
+  font-family:'Geist Variable',system-ui,-apple-system,'Segoe UI',sans-serif;
+  font-size:14px; -webkit-font-smoothing:antialiased;
 }
-.nc-of .num,.nc-of .mono{font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+.nc-of .num,.nc-of .mono{font-family:'Geist Mono Variable',ui-monospace,SFMono-Regular,Menlo,monospace}
 
 .nc-of .nc-of-bar{
   display:flex; align-items:center; gap:16px; padding:13px 20px;
@@ -1683,13 +1666,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    at the top of the region it swaps. Pressed is a raised white plate — the
    accent is reserved for links and focus. */
 .nc-of .nc-of-seg{
-  display:flex; gap:2px; padding:2px; border-radius:9px; background:rgba(35,32,27,.05);
+  display:flex; gap:2px; padding:2px; border-radius:0; background:rgba(35,32,27,.05);
   overflow-x:auto; scrollbar-width:none;
 }
 .nc-of .nc-of-seg::-webkit-scrollbar{display:none}
 .nc-of .nc-of-seg-btn{
   appearance:none; border:0; background:none; cursor:pointer; white-space:nowrap;
-  font:500 12.5px/1 inherit; color:var(--ink-2); padding:0 12px; height:30px; border-radius:7px;
+  font:500 12.5px/1 inherit; color:var(--ink-2); padding:0 12px; min-height:44px; border-radius:0;
 }
 .nc-of .nc-of-seg-btn:hover{color:var(--ink)}
 .nc-of .nc-of-seg-btn:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
@@ -1714,18 +1697,18 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-tiles{display:flex; gap:10px; align-items:stretch}
 .nc-of .nc-of-tile{
   flex:1; display:flex; flex-direction:column; gap:4px; appearance:none; border:0; background:none;
-  font:inherit; color:inherit; text-align:left; cursor:pointer; padding:10px 12px; border-radius:8px;
+  font:inherit; color:inherit; text-align:left; cursor:pointer; padding:10px 12px; border-radius:0;
 }
 .nc-of .nc-of-tile:hover{background:rgba(35,32,27,.04)}
-.nc-of .nc-of-tile.on{background:rgba(63,104,201,.09)}
+.nc-of .nc-of-tile.on{background:var(--accent-soft)}
 .nc-of .nc-of-tile:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
 .nc-of .nc-of-clearfilter{
   appearance:none; border:0; background:none; cursor:pointer; font:inherit;
-  font-size:12px; font-weight:500; color:var(--accent); padding:4px 6px; border-radius:6px;
+  font-size:12px; font-weight:500; color:var(--accent-text); padding:4px 6px; min-height:44px; border-radius:0;
 }
-.nc-of .nc-of-clearfilter:hover{background:rgba(63,104,201,.08)}
+.nc-of .nc-of-clearfilter:hover{background:var(--accent-soft)}
 .nc-of .nc-of-tile-n{
-  font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:36px; font-weight:600;
+  font-family:var(--font-mono); font-size:36px; font-weight:600;
   line-height:.86; letter-spacing:-.03em; font-variant-numeric:tabular-nums;
 }
 .nc-of .nc-of-tile-n.stop{color:var(--stop)}
@@ -1766,9 +1749,8 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   .nc-of .nc-of-notes p{font-size:12px; line-height:1.4}
 }
 
-/* ─── The office map card ────────────────────────────────────────────────── */
-/* The floor is the vendored <office-map> element. Its chrome is deliberately
-   quiet — the map is the only illustrated surface, its container is not. */
+/* ─── The office card ────────────────────────────────────────────────────── */
+/* The floor is the only drawn surface in the product; its container is not. */
 .nc-of .nc-of-mapcard{
   background:var(--card-2); border:1px solid var(--line); border-radius:var(--r); overflow:hidden;
   box-shadow:0 1px 2px rgba(35,32,27,.05); margin-bottom:12px;
@@ -1781,117 +1763,37 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-mapcard.collapsed .nc-of-mapcard-head{border-bottom:0}
 .nc-of .nc-of-mapcard-title{font-size:12.5px; font-weight:600; color:var(--ink)}
 .nc-of .nc-of-mapcard-hint{font-size:12px; color:var(--ink-3)}
-/* obs.C.15 — one flex unit carries every trailing control (All rooms, zoom,
-   fold) to the right edge together, and wraps as a cluster on a narrow header
-   instead of each chip claiming its own margin-left:auto and splitting the
-   line wherever the first one ran out of room. */
+/* obs.C.15 — one flex unit carries every trailing control (All rooms, fold) to
+   the right edge together, and wraps as a cluster on a narrow header instead of
+   each chip claiming its own margin-left:auto and splitting the line wherever
+   the first one ran out of room. */
 .nc-of .nc-of-mapcard-actions{
   display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; margin-left:auto;
 }
-/* The plan is larger than any viewport, so the bottom edge always cuts through
-   furniture. The fade reads as "there is more below"; a hard edge read as the
-   illustration running out. */
 .nc-of .nc-of-mapcard-head{border-bottom:1px solid var(--line)}
-/* Height is CSS-owned so it can answer the viewport. At 385px the one
-   illustrated surface in the product was the most space-starved thing on the
-   page; the fade is deep enough now to read as a viewport edge, not a clip. */
-.nc-of office-map{
-  display:block; height:clamp(460px,66vh,900px);
-  -webkit-mask-image:linear-gradient(to bottom,#000 calc(100% - 40px),transparent);
-  mask-image:linear-gradient(to bottom,#000 calc(100% - 40px),transparent);
-}
-/* The plan is bigger than any viewport, so the bottom edge is a cut through
-   furniture. The fade says "there is more, drag it" instead of "the image ran
-   out"; the hint says it in words for anyone who reads before dragging. */
-.nc-of .nc-of-teleport{
-  display:flex; gap:7px; padding:9px 12px 11px; border-top:1px solid var(--line);
-  overflow-x:auto; align-items:center; scrollbar-width:none;
-  /* The row scrolls; without the fade the last chip reads as clipped-broken.
-     The fade is wide enough that a chip is always cut mid-chip, never flush
-     with the card edge, which is what made it read as broken rather than as
-     "there is more this way". */
-  -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 40px),transparent);
-  mask-image:linear-gradient(to right,#000 calc(100% - 40px),transparent);
-}
-.nc-of .nc-of-teleport::-webkit-scrollbar{display:none}
-.nc-of .nc-of-overflow{
-  margin:0; padding:0 12px 10px; font-size:11.5px; color:var(--ink-3);
-}
-
-/* One column at every width: the floor is full-bleed above the queue it
-   filters. A wide split squeezed the map into a narrow column and clipped it. */
+/* The plan is drawn to fit — no fade, no clip, no drag. It is glanceable at a
+   fixed scale, which is what a schematic buys over an illustration. */
 .nc-of .nc-of-chip{
   appearance:none; display:inline-flex; align-items:center; gap:6px; flex:none;
-  height:28px; padding:0 10px; border-radius:7px; cursor:pointer;
+  min-height:44px; padding:0 12px; border-radius:0; cursor:pointer;
   border:1px solid var(--line-2); background:var(--card-2); color:var(--ink);
   font:500 11.5px/1 inherit; white-space:nowrap;
 }
 .nc-of .nc-of-chip:hover{background:rgba(35,32,27,.04)}
 .nc-of .nc-of-chip.on{background:var(--ink); color:var(--card); border-color:var(--ink)}
 .nc-of .nc-of-chip:disabled{opacity:.4; cursor:default; pointer-events:none}
-/* obs.C.15 — the −/Reset/+ trio sits with the fold chip; − and + are a single
-   glyph each, so a fixed min-width keeps all three from jittering in size as
-   the percentage changes on the buttons around them. */
-.nc-of .nc-of-chip.nc-of-zoom{min-width:26px; justify-content:center; padding:0 8px; font-variant-numeric:tabular-nums}
 .nc-of .nc-of-sd{width:6px; height:6px; border-radius:50%; flex:none; background:var(--idle)}
 .nc-of .nc-of-sd.blocked{background:var(--stop)}
 .nc-of .nc-of-sd.waiting{background:var(--warn)}
 .nc-of .nc-of-sd.working{background:var(--go)}
-.nc-of .nc-of-viewtoggle{display:flex; gap:4px}
-
-/* obs.C.35 — Tiles: the pre-map reading, a full sibling of the floor rather
-   than a fallback. No SVG, no pan; a responsive card grid that degrades to one
-   column on its own once a card's ~260px minimum stops fitting two abreast —
-   the same trick the grid already does, no extra breakpoint needed. */
-.nc-of .nc-of-roomgrid{
-  display:grid; grid-template-columns:repeat(auto-fill, minmax(260px,1fr)); gap:10px; padding:12px;
-}
-.nc-of .nc-of-roomcard{
-  display:flex; flex-direction:column; gap:8px; padding:10px 12px;
-  border:1px solid var(--line-2); border-radius:8px; background:var(--card-2); cursor:pointer;
-}
-.nc-of .nc-of-roomcard:hover{background:rgba(35,32,27,.03)}
-.nc-of .nc-of-roomcard.on{background:rgba(63,104,201,.09); border-color:var(--accent)}
-.nc-of .nc-of-roomcard:focus-visible{outline:2px solid var(--accent); outline-offset:1px}
-.nc-of .nc-of-roomcard-head{display:flex; align-items:center; gap:7px; font:600 12.5px/1 inherit; color:var(--ink)}
-.nc-of .nc-of-roomcard-name{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
-.nc-of .nc-of-roomcard-n{
-  margin-left:auto; font-variant-numeric:tabular-nums; font:600 11px/1 inherit; color:var(--ink-3);
-  background:rgba(35,32,27,.06); border-radius:8px; padding:2px 6px;
-}
-.nc-of .nc-of-roomcard-agents{display:flex; flex-wrap:wrap; gap:6px}
-.nc-of .nc-of-roomcard-empty{font-size:11.5px; color:var(--ink-3)}
-/* The agent chip nests inside the card's own click target on purpose (see the
-   stopPropagation in Observatory.tsx) — clicking a person opens the drawer
-   without also picking the room out from under them. */
-.nc-of .nc-of-facechip{
-  appearance:none; border:1px solid var(--line-2); background:var(--card); cursor:pointer;
-  display:inline-flex; align-items:center; gap:5px; padding:3px 7px 3px 3px; border-radius:14px;
-  font:500 11px/1 inherit; color:var(--ink-2);
-}
-.nc-of .nc-of-facechip:hover{background:rgba(35,32,27,.05)}
-.nc-of .nc-of-facechip.working{border-color:var(--go); color:var(--ink)}
-.nc-of .nc-of-facechip.blocked{border-color:var(--stop)}
-/* Same crisp-edge read as the map's own face token. */
-.nc-of .nc-of-facechip-face{
-  display:block; flex:none; width:20px; height:20px; border-radius:50%;
-  image-rendering:pixelated; background:#d9d4c8; box-shadow:0 0 0 1px rgba(44,40,34,.18);
-}
-.nc-of .nc-of-facechip-face.i{filter:grayscale(1)}
-.nc-of .nc-of-facechip-fallback{
-  display:flex; align-items:center; justify-content:center; background:var(--line-2); color:var(--ink-2);
-  font:600 10px/1 inherit;
-}
-.nc-of .nc-of-facechip-pulse{
-  width:6px; height:6px; border-radius:50%; background:var(--go); flex:none;
-  animation:nc-pulse 1.6s ease-in-out infinite;
-}
-.nc-of .nc-of-facechip-z{font-size:9.5px; color:var(--ink-3); letter-spacing:.02em}
 
 /* Phone: the bar carries the title, the picker and the one live number. The
    agent/channel counts are reference, not signal, and pushed the live dot off
-   the right edge — nothing may be wider than the viewport but the map. */
+   the right edge — nothing on this page may be wider than the viewport. */
 @media (max-width:700px){
+  /* flex-wrap is load-bearing: the segmented control below takes `order:2` and
+     a forced 100% width, and without a wrap it has no line of its own to take
+     — it just runs off the right edge instead. */
   .nc-of .nc-of-bar{gap:10px; padding:11px 14px; flex-wrap:wrap}
   /* Below ~420px the two-word title and the hint each wrapped mid-phrase. */
   .nc-of .nc-of-bar-title{white-space:nowrap; font-size:13.5px}
@@ -1902,7 +1804,6 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
      segmented control gets order:2 and a forced 100% width below it. */
   .nc-of .nc-of-bar-meta{gap:10px; flex:none; order:1}
   .nc-of .nc-of-bar-count{display:none}
-  .nc-of .nc-of-teleport{padding:9px 12px 9px 12px}
   /* obs.C.36 — the segmented control used to share the title's row and
      shrink into whatever space was left, so it scrolled internally rather
      than growing; Decisions and Job board were reachable only by finding a
@@ -1965,7 +1866,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-obs-release-hold{
   font-size:11.5px; color:var(--ink-2); background:rgba(35,32,27,.06);
-  border-radius:4px; padding:2px 7px;
+  border-radius:0; padding:2px 7px;
 }
 
 /* ONE grammar on every row, in both the queue and the job board:
@@ -2016,7 +1917,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    beat between the rows that carry it and the rows that do not. */
 .nc-of .nc-obs-ledger-blocks{
   font-size:10px; font-weight:600; letter-spacing:.01em; white-space:nowrap;
-  background:rgba(176,80,63,.13); color:var(--stop); border-radius:4px; padding:1px 5px;
+  background:rgba(176,80,63,.13); color:var(--stop); border-radius:0; padding:1px 5px;
   margin-right:7px;
 }
 /* Two lines before it truncates. The title is the content; ellipsing it at one
@@ -2046,7 +1947,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    wears inside the composer it opens. Mono for the instruction only. */
 .nc-of .nc-obs-ship{
   flex:none; margin-left:auto; font:inherit; font-size:12px; font-weight:600;
-  color:#fff; background:var(--accent); border:0; border-radius:7px;
+  color:#fff; background:var(--accent); border:0; border-radius:0;
   padding:5px 10px; min-height:28px; cursor:pointer; white-space:nowrap;
 }
 .nc-of .nc-obs-ship:hover{filter:brightness(1.08)}
@@ -2069,7 +1970,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    button, same inline done/error line. It is the same act, one row over. */
 /* obs.C.11 / obs.C.10 — ONE filter grammar, on the claims card and on the
    queue: chips narrow by a fixed vocabulary, a native select narrows by a name
-   the data supplies. Same chip as the teleport row, so a control that filters
+   the data supplies. Same chip the floor's own controls use, so a filter
    looks the same everywhere on this page. */
 .nc-of .nc-of-filters{
   display:flex; gap:7px; align-items:center; flex-wrap:wrap;
@@ -2077,7 +1978,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-of-filters select{
   font:inherit; font-size:11.5px; color:var(--ink); background:var(--card-2);
-  border:1px solid var(--line-2); border-radius:7px; padding:0 8px; height:28px;
+  border:1px solid var(--line-2); border-radius:0; padding:0 8px; min-height:44px;
 }
 .nc-of .nc-of-filters .nc-of-clearfilter{margin-left:auto}
 
@@ -2090,11 +1991,11 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-actions-who,
 .nc-of .nc-obs-actions-room{
   font:inherit; font-size:12.5px; color:var(--ink); background:var(--card-2);
-  border:1px solid var(--line-2); border-radius:7px; padding:5px 8px; min-height:34px; max-width:100%;
+  border:1px solid var(--line-2); border-radius:0; padding:5px 8px; min-height:44px; max-width:100%;
 }
 .nc-of .nc-obs-actions button{
-  font:inherit; font-size:12.5px; font-weight:600; color:#fff; background:var(--accent);
-  border:0; border-radius:7px; padding:6px 12px; min-height:34px; cursor:pointer;
+  font:inherit; font-size:12.5px; font-weight:600; color:var(--card); background:var(--ink);
+  border:1px solid var(--ink); border-radius:0; padding:6px 12px; min-height:44px; cursor:pointer;
 }
 /* Steer only OPENS the composer — it is not the act, so it does not wear the
    accent the acts wear. */
@@ -2111,7 +2012,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 .nc-of .nc-obs-decide-line .nc-obs-ship-again{
   font:inherit; font-size:12px; font-weight:500; color:var(--ink-2); background:var(--card-2);
-  border:1px solid var(--line-2); border-radius:7px; padding:3px 9px; cursor:pointer;
+  border:1px solid var(--line-2); border-radius:0; padding:3px 9px; cursor:pointer;
 }
 .nc-of .nc-obs-decide-line .nc-obs-ship-again:disabled{opacity:.45; cursor:default}
 .nc-of .nc-obs-actions-none{font-size:12px; color:var(--ink-3); font-style:italic}
@@ -2134,13 +2035,13 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-steer-thread{
   max-height:40vh; overflow-y:auto; overscroll-behavior:contain;
   margin-top:7px; padding:8px 9px;
-  background:var(--card-2); border:1px solid var(--line-2); border-radius:7px;
+  background:var(--card-2); border:1px solid var(--line-2); border-radius:0;
 }
 .nc-of .nc-obs-steer-nopane{margin:7px 0 0; font-size:12px; font-style:italic; color:var(--ink-3)}
 .nc-of .nc-obs-steer{display:flex; gap:8px; align-items:flex-end; margin-top:6px; min-width:0}
 .nc-of .nc-obs-steer textarea{
   flex:1 1 auto; min-width:0; font:inherit; font-size:12.5px; line-height:1.45; color:var(--ink);
-  background:var(--card-2); border:1px solid var(--line-2); border-radius:7px; padding:7px 9px; resize:vertical;
+  background:var(--card-2); border:1px solid var(--line-2); border-radius:0; padding:7px 9px; resize:vertical;
 }
 .nc-of .nc-obs-steer textarea:focus{outline:2px solid var(--accent); outline-offset:1px}
 
@@ -2149,7 +2050,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
    rows it sat under. */
 .nc-of .nc-of-link{
   display:inline-flex; align-items:center; min-height:44px; padding:4px 0;
-  font-size:12.5px; font-weight:500; color:var(--accent); text-decoration:none;
+  font-size:12.5px; font-weight:500; color:var(--accent-text); text-decoration:underline;
 }
 .nc-of .nc-of-link:hover{text-decoration:underline}
 
@@ -2169,7 +2070,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-obs-claim-slug{font-size:12.5px; overflow-wrap:anywhere}
 .nc-of .nc-obs-claim-tag{
   font-size:10px; font-weight:600; white-space:nowrap; color:var(--ink-2);
-  background:rgba(35,32,27,.06); border-radius:4px; padding:1px 5px;
+  background:rgba(35,32,27,.06); border-radius:0; padding:1px 5px;
 }
 .nc-of .nc-obs-claim-owner,.nc-of .nc-obs-claim-age{
   font-size:11.5px; color:var(--ink-3); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
@@ -2206,7 +2107,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 /* The workgroup picker reads as chrome here, not as a tiny mono caption. */
 .nc-of .nc-group-title-trigger{
   font-family:inherit; font-size:12.5px; letter-spacing:0; text-transform:none;
-  color:var(--ink-2); background:none; border:1px solid var(--line); border-radius:7px;
+  color:var(--ink-2); background:none; border:1px solid var(--line); border-radius:0;
   padding:4px 9px; min-height:32px; cursor:pointer; display:inline-flex; align-items:center; gap:6px;
 }
 .nc-of .nc-group-title-trigger:hover{border-color:var(--line-2); color:var(--ink)}
@@ -2247,7 +2148,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-of .nc-of-sheet-title{font-size:13px; font-weight:600}
 .nc-of .nc-of-sheet-x{
   margin-left:auto; appearance:none; background:none; border:0; cursor:pointer;
-  color:var(--ink-3); font-size:13px; width:32px; height:32px; border-radius:6px;
+  color:var(--ink-3); font-size:13px; width:32px; height:32px; border-radius:0;
 }
 .nc-of .nc-of-sheet-x:hover{background:rgba(35,32,27,.05); color:var(--ink)}
 .nc-of .nc-of-sheet-empty{margin:0; padding:12px 14px; font-size:12.5px; color:var(--ink-3); font-style:italic}
@@ -2312,7 +2213,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   display:inline-flex; align-items:center; min-height:32px;
 }
 .nc-sd .nc-sd-back:hover{color:var(--accent); text-decoration:underline}
-.nc-sd .mono{font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+.nc-sd .mono{font-family:var(--font-mono)}
 .nc-sd .nc-of-bar-meta .nc-of-live{text-transform:none}
 
 .nc-sd .nc-sd-body{max-width:880px; margin:0 auto; padding:14px 16px 24px}
@@ -2368,7 +2269,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sd .nc-transcript-thinking summary::before, .nc-obs-steer-thread .nc-transcript-thinking summary::before{color:var(--ink-3); font-family:inherit}
 .nc-sd .nc-thinking-list, .nc-obs-steer-thread .nc-thinking-list{border-left:1px solid var(--line)}
 .nc-sd .nc-empty, .nc-obs-steer-thread .nc-empty{
-  border:1px dashed var(--line-2); border-radius:8px; color:var(--ink-3);
+  border:1px dashed var(--line-2); border-radius:0; color:var(--ink-3);
   font-family:inherit; font-size:12.5px; letter-spacing:0; text-transform:none; margin:0;
 }
 
@@ -2392,7 +2293,7 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   border-top:0; padding:14px 16px 14px;
 }
 .nc-sd .nc-composer .field{
-  background:var(--card-2); border:1px solid var(--line-2); border-radius:9px;
+  background:var(--card-2); border:1px solid var(--line-2); border-radius:0;
 }
 .nc-sd .nc-composer .field:focus-within{border-color:var(--accent)}
 .nc-sd .nc-composer .field.over{border-color:var(--stop)}
@@ -2400,12 +2301,12 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 .nc-sd .nc-composer textarea{color:var(--ink); font-family:inherit}
 .nc-sd .nc-composer textarea::placeholder{color:var(--ink-3)}
 .nc-sd .nc-composer .row{
-  font-family:'IBM Plex Mono',ui-monospace,monospace; font-size:11px;
+  font-family:var(--font-mono); font-size:11px;
   letter-spacing:0; text-transform:none; color:var(--ink-3);
 }
 .nc-sd .nc-composer .row .over{color:var(--stop)}
 .nc-sd .nc-composer .send{
-  background:var(--accent); color:#fff; border-radius:7px; padding:7px 14px; min-height:34px;
+  background:var(--accent); color:#fff; border-radius:0; padding:7px 14px; min-height:34px;
   font-family:inherit; font-size:12.5px; font-weight:600; letter-spacing:0; text-transform:none;
 }
 .nc-sd .nc-composer .send:disabled{opacity:.45}
@@ -2423,14 +2324,14 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
 }
 
 /* ── Issue brief (Decisions view expanded row) ─────────────────────────── */
-.nc-of .nc-obs-brief{margin-top:10px; padding:10px 12px; border:1px solid var(--nc-line, #e4e1da); border-radius:8px; display:flex; flex-direction:column; gap:8px}
-.nc-of .nc-obs-brief-empty{margin-top:10px; font-size:12.5px; color:var(--nc-ink-3, #8a8578); font-style:italic}
+.nc-of .nc-obs-brief{margin-top:10px; padding:10px 12px; border:1px solid var(--line); border-radius:0; display:flex; flex-direction:column; gap:8px}
+.nc-of .nc-obs-brief-empty{margin-top:10px; font-size:12.5px; color:var(--ink-3); font-style:italic}
 .nc-of .nc-obs-brief-labels{display:flex; flex-wrap:wrap; gap:6px; align-items:center}
-.nc-of .nc-obs-brief-state{font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:1px 7px; border-radius:99px; border:1px solid var(--nc-line, #e4e1da); color:var(--nc-ink-2, #5d594e)}
-.nc-of .nc-obs-brief-state.open{color:#3a7d44; border-color:#3a7d4433}
-.nc-of .nc-obs-brief-label{font-size:11px; padding:1px 7px; border-radius:99px; background:var(--nc-wash, #f4f2ec); color:var(--nc-ink-2, #5d594e)}
-.nc-of .nc-obs-brief-body{font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; max-height:180px; overflow-y:auto; color:var(--nc-ink-2, #5d594e)}
-.nc-of .nc-obs-brief-comments{display:flex; flex-direction:column; gap:6px; border-top:1px dashed var(--nc-line, #e4e1da); padding-top:8px}
-.nc-of .nc-obs-brief-more{font-size:11px; color:var(--nc-ink-3, #8a8578)}
+.nc-of .nc-obs-brief-state{font-size:11px; text-transform:uppercase; letter-spacing:.04em; padding:1px 7px; border-radius:0; border:1px solid var(--line); color:var(--ink-2)}
+.nc-of .nc-obs-brief-state.open{color:var(--go); border-color:var(--go)}
+.nc-of .nc-obs-brief-label{font-size:11px; padding:1px 7px; border-radius:0; background:var(--bg-inset); color:var(--ink-2)}
+.nc-of .nc-obs-brief-body{font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; max-height:180px; overflow-y:auto; color:var(--ink-2)}
+.nc-of .nc-obs-brief-comments{display:flex; flex-direction:column; gap:6px; border-top:1px dashed var(--line); padding-top:8px}
+.nc-of .nc-obs-brief-more{font-size:11px; color:var(--ink-3)}
 .nc-of .nc-obs-brief-comment p{margin:2px 0 0; font-size:12.5px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; max-height:120px; overflow-y:auto}
-.nc-of .nc-obs-brief-author{font-size:11px; font-weight:600; color:var(--nc-ink-3, #8a8578)}
+.nc-of .nc-obs-brief-author{font-size:11px; font-weight:600; color:var(--ink-3)}

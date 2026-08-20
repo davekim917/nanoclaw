@@ -182,12 +182,18 @@ async function segment(c: HTMLElement, view: 'overview' | 'decisions' | 'board')
   await userEvent.click(c.querySelector(`.nc-of-seg-btn[data-view="${view}"]`)! as HTMLElement);
 }
 
-/** Switch the floor from its default (Tiles) to Map — this file's tests reach
- *  rooms/agents through the map's own teleport chips and DOM events, which
- *  only exist once Map is the active view (obs.C.35: Tiles is the default and
- *  the map is unmounted, not just hidden, while it isn't active). */
-async function toMap(c: HTMLElement) {
-  await userEvent.click(c.querySelector('[data-obs-view="map"]')! as HTMLElement);
+/** Pick a room on the floor plan, by the label it draws. */
+async function pickRoom(c: HTMLElement, label: string) {
+  const wanted = label.replace(/^#/, '').toUpperCase();
+  const zone = Array.from(c.querySelectorAll('[data-zone][data-room]')).find(
+    (g) => g.querySelector('.tm-zone-label')?.textContent === wanted,
+  );
+  await userEvent.click(zone! as unknown as Element);
+}
+
+/** Pick a person on the floor plan, by name. */
+async function pickOccupant(c: HTMLElement, name: string) {
+  await userEvent.click(c.querySelector(`[data-occupant="${name}"]`)! as unknown as Element);
 }
 
 
@@ -695,7 +701,10 @@ describe('Observatory — actions and sheets', () => {
     function floor() {
       mockData(
         snapshot({
-          rooms: [room({ key: 'r1', name: 'general' }), room({ key: 'r2', name: 'quiet' })],
+          rooms: [
+            room({ key: 'r1', name: 'general', memberAgentIds: ['ava', 'kit'] }),
+            room({ key: 'r2', name: 'quiet', memberAgentIds: ['zed'] }),
+          ],
           claims: [
             claim({ slug: 'migration', owner: 'ava', threadUrl: 'https://example.com/thread/1' }),
             claim({ slug: 'orphan', owner: 'ava', threadUrl: null }),
@@ -710,11 +719,7 @@ describe('Observatory — actions and sheets', () => {
       return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
     }
     const open = async (c: HTMLElement, label: string) => {
-      await toMap(c);
-      const chip = Array.from(c.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
-        b.textContent?.includes(label),
-      );
-      await userEvent.click(chip! as HTMLElement);
+      await pickRoom(c, label);
     };
 
     it('is closed until a room is picked', () => {
@@ -754,7 +759,7 @@ describe('Observatory — actions and sheets', () => {
     it('shows each occupant the face the floor draws them with, and invents none', async () => {
       mockData(
         snapshot({
-          rooms: [room({ key: 'r1', name: 'general' })],
+          rooms: [room({ key: 'r1', name: 'general', memberAgentIds: ['ava', 'kit'] })],
           agents: [
             agent({ id: 'ava', name: 'ava', location: 'r1', avatarUrl: 'https://cdn.example/ava_192.png' }),
             agent({ id: 'kit', name: 'kit', location: 'r1' }),
@@ -840,53 +845,10 @@ describe('Observatory — actions and sheets', () => {
     // the room sheet — so a person click must leave the sheet untouched.
     it('a click on an agent opens the agent drawer, not the room sheet', async () => {
       const { container } = floor();
-      await toMap(container);
-      const map = container.querySelector('office-map')!;
-      await act(async () => {
-        map.dispatchEvent(
-          new CustomEvent('agent-select', { detail: { name: 'kit', room: 'westFront' }, bubbles: true }),
-        );
-      });
+      await pickOccupant(container, 'kit');
       expect(container.querySelector('[data-testid="agent-drawer"]')).toBeTruthy();
       expect(container.querySelector('.nc-of-sheet')).toBeFalsy();
     });
-
-    /* obs.C.3 — the test above hand-dispatches `agent-select`, so it stayed
-     * green while a click on the person reached nothing at all. This one goes
-     * through the map's own shadow DOM: the face-bearing label over an agent's
-     * head is the part that reads as "the person", and clicking it has to pick
-     * them, not fall through to the floor. */
-    it('a click on the face label over an agent picks that agent', async () => {
-      // the floor seats a room's WIRED members, so this fixture wires them
-      mockData(
-        snapshot({
-          rooms: [room({ key: 'r1', name: 'general', memberAgentIds: ['ava', 'kit'] })],
-          agents: [agent({ id: 'ava', name: 'ava', location: 'r1' }), agent({ id: 'kit', name: 'kit', location: 'r1' })],
-        }),
-      );
-      const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await toMap(container);
-      const map = container.querySelector('office-map') as HTMLElement;
-      // the element defers its first paint to idle/intersection; nudge it.
-      await act(async () => {
-        document.dispatchEvent(new Event('visibilitychange'));
-      });
-      const sr = map.shadowRoot!;
-      const pads = Array.from(sr.querySelectorAll('.ahit'));
-      expect(pads.length).toBe(2);
-      const labels = Array.from(sr.querySelectorAll('.bub[data-agent]')) as HTMLElement[];
-      expect(labels.map((l) => l.dataset.agent)).toEqual(['ava', 'kit']);
-
-      let detail: { name: string; room: string } | null = null;
-      map.addEventListener('agent-select', (e) => {
-        detail = (e as CustomEvent<{ name: string; room: string }>).detail;
-      });
-      const label = labels[1]!;
-      (label.querySelector('.face') ?? label).dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true }));
-      expect(detail).toEqual({ name: 'kit', room: label.dataset.room });
-      // the generous budget is the map's FIRST paint: it concatenates and
-      // percent-encodes the whole world SVG, which costs ~15s under jsdom.
-    }, 45000);
 
     it('picking a room by hand carries no agent emphasis', async () => {
       const { container } = floor();
@@ -899,10 +861,8 @@ describe('Observatory — actions and sheets', () => {
       await open(container, '#general');
       await userEvent.click(container.querySelector('.nc-of-sheet-x')! as HTMLElement);
       expect(container.querySelector('.nc-of-sheet')).toBeFalsy();
-      // Scoped to the teleport row, not `.nc-of-chip.on` generally — the
-      // Tiles/Map view toggle is also a `.nc-of-chip` and rightly stays "on"
-      // for whichever view is active; only the picked-room chip must clear.
-      expect(container.querySelector('.nc-of-teleport .nc-of-chip.on')).toBeFalsy();
+      // ...and the room it had picked is no longer selected on the floor.
+      expect(container.querySelector('.tm-zone.is-selected')).toBeFalsy();
     });
   });
 
@@ -917,8 +877,20 @@ describe('Observatory — actions and sheets', () => {
       mockData(
         snapshot({
           rooms: [
-            room({ key: 'slack:C0AAA', name: 'general', permalink: 'https://acme.slack.com/archives/C0AAA' }),
-            room({ key: 'slack:C0BBB', name: 'ops', permalink: 'https://acme.slack.com/archives/C0BBB' }),
+            room({
+              key: 'slack:C0AAA',
+              name: 'general',
+              permalink: 'https://acme.slack.com/archives/C0AAA',
+              memberAgentIds: ['ava', 'kit'],
+            }),
+            // ava is WIRED to ops but never live there — the "clicked in a
+            // different room she is wired to" case this suite exists for.
+            room({
+              key: 'slack:C0BBB',
+              name: 'ops',
+              permalink: 'https://acme.slack.com/archives/C0BBB',
+              memberAgentIds: ['ava'],
+            }),
           ],
           claims: [
             claim({
@@ -975,12 +947,12 @@ describe('Observatory — actions and sheets', () => {
     // office-data.ts fills slots in arrival order, so the fixture's first
     // room ('general') lands on 'westFront' and the second ('ops') on
     // 'eastFront' — SLOTS[0] and SLOTS[1].
+    // The floor plan seats an agent in EVERY room it is wired to, so a name
+    // can appear in two zones — which is exactly what "clicked in a different
+    // room she is wired to" needs. Pick the occurrence inside the named zone.
     const clickAgentIn = async (container: HTMLElement, name: string, slot: string) => {
-      await toMap(container);
-      const map = container.querySelector('office-map')!;
-      await act(async () => {
-        map.dispatchEvent(new CustomEvent('agent-select', { detail: { name, room: slot }, bubbles: true }));
-      });
+      const zone = container.querySelector(`[data-zone="${slot}"]`)!;
+      await userEvent.click(zone.querySelector(`[data-occupant="${name}"]`)! as unknown as Element);
     };
     const clickAgent = (container: HTMLElement, name: string) => clickAgentIn(container, name, 'westFront');
 
@@ -1076,12 +1048,11 @@ describe('Observatory — actions and sheets', () => {
       expect(drawer.querySelector('[data-section="elsewhere"]')).toBeFalsy();
     });
 
-    it('a room that fails to resolve falls back to the agent-only view', async () => {
-      const { container } = drawerFloor();
-      // 'kitchen' is a real slot, but drawerFloor only seats two rooms
-      // (westFront, eastFront) — nothing occupies it, so officeData has no
-      // room to hand back and roomKey stays null.
-      await clickAgentIn(container, 'ava', 'kitchen');
+    it('an agent with no seat falls back to the agent-only view', async () => {
+      // No location at all, so there is no room to resolve — opened from the
+      // fleet row, which is where an unseated agent is still reachable.
+      const { container } = drawerFloor({ location: null });
+      await userEvent.click(container.querySelector('.tm-fleet-row[data-agent="ava"] .tm-fleet-open')!);
       const drawer = container.querySelector('[data-testid="agent-drawer"]')!;
       expect(drawer.querySelector('h3')!.textContent).toBe('ava');
       expect(drawer.textContent).toContain('not seated on the floor');
@@ -1115,11 +1086,7 @@ describe('Observatory — actions and sheets', () => {
 
     it('the drawer and the room sheet track independently', async () => {
       const { container } = drawerFloor();
-      await toMap(container);
-      const chip = Array.from(container.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
-        b.textContent?.includes('#general'),
-      );
-      await userEvent.click(chip! as HTMLElement);
+      await pickRoom(container, '#general');
       expect(container.querySelector('.nc-of-sheet')).toBeTruthy();
       // opening the drawer over it (a programmatic agent-select, not a real
       // click, so it never triggers the drawer's own click-outside close)
@@ -1327,12 +1294,7 @@ describe('Observatory — actions and sheets', () => {
         }),
       );
       const { container } = render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
-      await toMap(container);
-      await userEvent.click(
-        Array.from(container.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
-          b.textContent?.includes('#general'),
-        )! as HTMLElement,
-      );
+      await pickRoom(container, '#general');
       return container;
     };
 
@@ -1399,12 +1361,7 @@ describe('Observatory — actions and sheets', () => {
       return render(<Observatory authMe={mockAuthMe} route="observatory" onRouteChange={noop} />);
     };
     const open = async (c: HTMLElement, label: string) => {
-      await toMap(c);
-      await userEvent.click(
-        Array.from(c.querySelectorAll('.nc-of-teleport .nc-of-chip')).find((b) =>
-          b.textContent?.includes(label),
-        )! as HTMLElement,
-      );
+      await pickRoom(c, label);
     };
     const tiles = (c: HTMLElement) => Array.from(c.querySelectorAll('.nc-of-tile-n')).map((e) => e.textContent);
     const rows = (c: HTMLElement) => c.querySelectorAll('[data-section="queue"] .nc-obs-ledger-row').length;

@@ -558,6 +558,14 @@ export interface ReleaseItem {
   /** Slack channel the work lives in, e.g. '#qa-room'. Routes assignment. */
   channel?: string;
   /**
+   * The watcher's own classification of the item, passed through verbatim by
+   * the host. Only `bucket` is read here — `decision` and `escalated` are what
+   * the exception feed sorts on (see views/exceptions.ts). Everything else in
+   * the object is the watcher's business, so the shape stays open rather than
+   * pretending this client knows the full vocabulary.
+   */
+  meta?: { bucket?: string; [key: string]: unknown };
+  /**
    * The thread this item has ALREADY been steered into, if anyone has. An item
    * carries no thread of its own — the host remembers the first one that was
    * opened for it (`observatory_item_threads`) so the second press of a ship
@@ -588,10 +596,25 @@ export interface ObservatorySnapshot {
   claims: ObservatoryClaim[];
   /** Null until the release watcher has published release-state.json. */
   releaseState: ReleaseState | null;
-  /** Themed-floor slot bindings (normalized channel name → office-map.js
-   *  slot) — install config, absent when the operator hasn't set any. See
+  /** Themed-floor slot bindings (normalized channel name → floor-plan slot)
+   *  — install config, absent when the operator hasn't set any. See
    *  office-data.ts's buildOfficeData. */
   themedSlots?: Record<string, string>;
+  /**
+   * Per-room live-state indicators — install config, absent when the operator
+   * has bound none. `active` is always stated for a bound room, so "quiet" and
+   * "not bound" never render the same. A room key nothing on this floor
+   * matches is ignored rather than drawn somewhere arbitrary.
+   */
+  signals?: ObservatorySignal[];
+}
+
+export interface ObservatorySignal {
+  /** An ObservatoryRoom.key. */
+  room: string;
+  /** Which indicator to draw. 'smoke' is the only one that exists today. */
+  vignette: string;
+  active: boolean;
 }
 
 /** Assign a board item to an agent: creates a one-shot task in the item's own

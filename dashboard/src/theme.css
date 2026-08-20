@@ -1,0 +1,856 @@
+/* Tom Modern — the dashboard's one theme.
+ *
+ * Light-first and single: there is no dark palette here on purpose. The old
+ * stylesheet carried two hard-coded palettes (a dark `:root` and a light
+ * `.nc-of` block) with no toggle between them; this file replaces the token
+ * layer for both with one editorial-technical system — near-white canvas, ink
+ * text, a single vermillion accent, 0px radius, hard offset shadows.
+ *
+ * Structure, not colour, is what makes a later dark mode cheap: every surface
+ * reads a token, so a `.dark` block can define the same names again. Shipping
+ * shadcn's stock dark values would have been a second, uncalibrated palette
+ * nothing in this design was drawn against, so it is not here. Its base
+ * stylesheet went the same way: no shadcn component is vendored, so it styled
+ * nothing. `components.json` stays, so `pnpm dlx shadcn@4.18.0 add <x>` still
+ * works the day one earns its place.
+ *
+ * Palette source: design-artifact-loop's `tom-modern` design system, plus the
+ * four severity colours calibrated on the approved comp.
+ */
+@import "tailwindcss";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: 'Geist Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-mono: 'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-border-soft: var(--border-soft);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    /* Severity is the one place this design spends colour. Each maps to exactly
+       one real state, never to decoration. */
+    --color-sev-hands: var(--sev-hands);
+    --color-sev-decision: var(--sev-decision);
+    --color-sev-parked: var(--sev-parked);
+    --color-sev-working: var(--sev-working);
+    --shadow-hard: var(--tm-shadow-hard);
+    --shadow-soft: var(--tm-shadow-soft);
+    --radius-sm: var(--radius);
+    --radius-md: var(--radius);
+    --radius-lg: var(--radius);
+    --radius-xl: var(--radius);
+    --radius-2xl: var(--radius);
+    --radius-3xl: var(--radius);
+    --radius-4xl: var(--radius);
+}
+
+:root {
+    /* ── tom-modern surfaces / ink / borders ─────────────────────────────── */
+    --background: #fafafa;
+    --foreground: #27272a;
+    --fg-2: #52525b;
+    --card: #ffffff;
+    --card-foreground: #27272a;
+    /* tom-modern's own name for the same white. Declared separately so the
+       older `.nc-of` vocabulary can alias onto it without a self-reference. */
+    --surface: #ffffff;
+    --popover: #ffffff;
+    --popover-foreground: #27272a;
+    --muted: #f4f4f5;
+    --muted-foreground: #71717a;
+    --border: #969696;
+    --border-soft: #d4d4d8;
+    --input: #969696;
+
+    /* ── the single accent ───────────────────────────────────────────────── */
+    --accent: #ff5a00;
+    --accent-foreground: #ffffff;
+    --accent-hover: #e85200;
+    /* The accent, darkened until small text on white clears AA. Fills, rules
+       and outlines keep --accent; only TEXT uses this. */
+    --accent-text: #c24500;
+    --accent-soft: rgba(255, 90, 0, 0.08);
+    --ring: #ff5a00;
+
+    /* Primary is INK, not the accent: tom-modern's primary button is a dark
+       fill and the vermillion stays reserved for emphasis. */
+    --primary: #27272a;
+    --primary-foreground: #ffffff;
+    --secondary: #ffffff;
+    --secondary-foreground: #27272a;
+    --destructive: #c81e1e;
+
+    --sidebar: #ffffff;
+    --sidebar-foreground: #27272a;
+    --sidebar-primary: #ff5a00;
+    --sidebar-primary-foreground: #ffffff;
+    --sidebar-accent: rgba(255, 90, 0, 0.08);
+    --sidebar-accent-foreground: #27272a;
+    --sidebar-border: #d4d4d8;
+    --sidebar-ring: #ff5a00;
+
+    /* Sharp corners are the brand — never raise this. */
+    --radius: 0px;
+
+    /* ── elevation: hard offsets, never soft blur ────────────────────────── */
+    --tm-shadow-hard: 8px 8px 0 rgba(150, 150, 150, 0.12);
+    --tm-shadow-soft: 4px 4px 0 rgba(150, 150, 150, 0.1);
+
+    /* ── blueprint grid ──────────────────────────────────────────────────── */
+    --grid-line: rgba(150, 150, 150, 0.05);
+
+    /* ── severity, calibrated on the comp ────────────────────────────────── */
+    --sev-hands: #c81e1e;    /* hands needed / blocked — vermillion-family red */
+    --sev-decision: #8c6400; /* decision needed — gold, hue clear of the accent */
+    --sev-parked: #5b4b8a;   /* parked — ink violet */
+    --sev-working: #1f7a4d;  /* working — restrained green */
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+
+/* NOT in @layer components, deliberately: styles.css is unlayered, and an
+   unlayered rule beats a layered one no matter how specific the layered one is
+   — `a { color: … }` silently won over `.tm-btn-primary`'s white and painted a
+   primary button dark-grey-on-ink. These compete on specificity instead. */
+
+  /* The page's own atmosphere: a 30px blueprint grid over the canvas. */
+  .tm-grid {
+    background-image:
+      linear-gradient(var(--grid-line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+    background-size: 30px 30px;
+  }
+
+  /* Uppercase mono label — section eyebrows, metadata, button text. */
+  .tm-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+  }
+
+  /* The phone-first floor for every interactive target. Applied at the
+     component, not per screen: a target that is too small to hit is too small
+     on a desktop trackpad too, it is only forgiving there. */
+  .tm-tap {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  .tm-wordmark {
+    font-family: var(--font-sans);
+    font-weight: 700;
+    font-size: 19px;
+    letter-spacing: -0.04em;
+    color: var(--foreground);
+  }
+
+  /* ── Shell: bottom tab bar (phone) ─────────────────────────────────────── */
+  .tm-tabbar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    display: flex;
+    height: 62px;
+    background: var(--card);
+    border-top: 1px solid var(--border-soft);
+  }
+  .tm-tabbar-item {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    appearance: none;
+    border: 0;
+    border-top: 2px solid transparent;
+    background: none;
+    cursor: pointer;
+    color: var(--muted-foreground);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .tm-tabbar-item.is-active {
+    color: var(--accent);
+    border-top-color: var(--accent);
+  }
+  .tm-tabbar-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  /* The bar is fixed, so the page has to end above it. */
+  .tm-has-tabbar {
+    padding-bottom: 76px;
+  }
+
+  /* ── Shell: sidebar (desktop) ──────────────────────────────────────────── */
+  .tm-shell {
+    display: flex;
+    align-items: flex-start;
+    min-height: 100vh;
+  }
+  .tm-shell-main {
+    flex: 1;
+    min-width: 0;
+  }
+  .tm-sidebar {
+    display: flex;
+    flex-direction: column;
+    width: 220px;
+    flex-shrink: 0;
+    align-self: stretch;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    padding: 24px 20px;
+    background: var(--card);
+    border-right: 1px solid var(--border-soft);
+  }
+  .tm-sidebar-scope,
+  .tm-sidebar-foot {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted-foreground);
+  }
+  .tm-sidebar-scope {
+    margin-bottom: 28px;
+  }
+  .tm-sidebar-foot {
+    margin-top: auto;
+    font-size: 10px;
+  }
+  .tm-sidebar nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .tm-sidebar-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    appearance: none;
+    background: none;
+    border: 0;
+    border-left: 3px solid transparent;
+    padding: 10px 10px 10px 12px;
+    cursor: pointer;
+    text-align: left;
+    color: var(--fg-2);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .tm-sidebar-item:hover {
+    color: var(--foreground);
+  }
+  .tm-sidebar-item.is-active {
+    color: var(--foreground);
+    border-left-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .tm-sidebar-item:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  /* ── The exception feed ────────────────────────────────────────────────── */
+  .tm-feed {
+    padding: 24px 16px;
+  }
+  .tm-feed-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .tm-feed-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .tm-exc {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    /* Severity is a rule along the top edge, never a tint on the surface. */
+    border-top: 4px solid var(--sev-color, var(--border));
+    box-shadow: var(--tm-shadow-hard);
+  }
+  .tm-exc[data-severity='hands'] { --sev-color: var(--sev-hands); }
+  .tm-exc[data-severity='decision'] { --sev-color: var(--sev-decision); }
+  .tm-exc[data-severity='parked'] { --sev-color: var(--sev-parked); }
+  .tm-exc-sev {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--sev-color, var(--foreground));
+  }
+  .tm-exc-swatch {
+    width: 8px;
+    height: 8px;
+    flex-shrink: 0;
+    background: var(--sev-color, var(--foreground));
+  }
+  .tm-exc-title {
+    margin: 0;
+    font-family: var(--font-sans);
+    font-weight: 700;
+    font-size: 16px;
+    line-height: 1.35;
+    color: var(--foreground);
+  }
+  .tm-exc-meta {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted-foreground);
+  }
+  .tm-exc-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .tm-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+    padding: 10px;
+    appearance: none;
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-align: center;
+    text-decoration: none;
+  }
+  .tm-btn-primary {
+    background: var(--foreground);
+    color: var(--accent-foreground);
+    border: 1px solid var(--foreground);
+  }
+  .tm-btn-secondary {
+    background: transparent;
+    color: var(--foreground);
+    border: 1px solid var(--border);
+  }
+  .tm-btn:disabled {
+    cursor: not-allowed;
+    background: transparent;
+    color: var(--muted-foreground);
+    border-color: var(--border-soft);
+  }
+  .tm-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  /* WorkActions, worn as an exception card's action row. Styling only: the
+     controls, the verbs and the eligibility rules are the shared component's. */
+  .tm-exc .nc-obs-actions {
+    margin-top: 0;
+    width: 100%;
+  }
+  .tm-exc .nc-obs-actions-row {
+    gap: 8px;
+  }
+  .tm-exc .nc-obs-actions-who,
+  .tm-exc .nc-obs-actions-room {
+    flex: 1 1 100%;
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .tm-exc .nc-obs-actions button {
+    flex: 1 1 0;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    /* "TASK IT IN #SOMEWHERE" is as long as the channel name it names, so it
+       has to be allowed to break rather than run past its own border. */
+    overflow-wrap: anywhere;
+  }
+  /* The thread line is context, not an action — it reads above the row. */
+  .tm-exc .nc-of-link,
+  .tm-exc .nc-of-sheet-nothread {
+    flex: 1 1 100%;
+    min-height: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+
+  /* An empty feed is a real answer and says so. */
+  .tm-allclear {
+    padding: 24px 16px;
+    background: var(--card);
+    border: 1px solid var(--border-soft);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+    text-align: center;
+  }
+
+  /* ── Avatars ───────────────────────────────────────────────────────────── */
+  .tm-avatar {
+    position: relative;
+    display: inline-flex;
+    flex-shrink: 0;
+  }
+  .tm-avatar-face {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 1px solid var(--border-soft);
+    object-fit: cover;
+  }
+  /* The neutral mark an agent with no platform avatar gets. Neutral on
+     purpose: a per-agent colour would be a status the data does not carry. */
+  .tm-avatar-mark {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--muted);
+    color: var(--fg-2);
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 12px;
+    line-height: 1;
+  }
+  .tm-avatar-dot {
+    position: absolute;
+    right: -3px;
+    bottom: -3px;
+    width: 11px;
+    height: 11px;
+    box-sizing: border-box;
+    border: 2px solid var(--card);
+  }
+  .tm-avatar-dot.working { background: var(--sev-working); }
+  .tm-avatar-dot.blocked { background: var(--sev-hands); }
+  .tm-avatar-dot.waiting { background: var(--sev-decision); }
+  .tm-avatar-dot.idle { background: var(--muted-foreground); }
+
+  /* ── Floor plan ────────────────────────────────────────────────────────── */
+  .tm-floorplan {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--card);
+  }
+  .tm-blueprint-line {
+    stroke: var(--border);
+    stroke-width: 1;
+    opacity: 0.08;
+  }
+  .tm-floor-building {
+    fill: var(--card);
+    stroke: var(--foreground);
+    stroke-width: 3;
+  }
+  .tm-floor-corridor {
+    stroke: var(--border-soft);
+    stroke-width: 1.5;
+    stroke-dasharray: 5 5;
+  }
+  .tm-zone-shell {
+    fill: var(--card);
+    stroke: var(--border);
+    stroke-width: 2;
+  }
+  /* A zone the floor has nothing to put in stays drawn — the plan must not
+     reshuffle because a channel went quiet. */
+  .tm-zone.is-vacant .tm-zone-shell {
+    fill: none;
+    stroke-dasharray: 4 6;
+    opacity: 0.55;
+  }
+  .tm-zone[data-alert='true'] .tm-zone-shell {
+    stroke: var(--accent);
+    stroke-width: 3;
+  }
+  .tm-zone.is-selected .tm-zone-shell {
+    fill: var(--accent-soft);
+  }
+  .tm-zone[role='button'] {
+    cursor: pointer;
+  }
+  .tm-zone:focus-visible {
+    outline: 2px solid var(--accent);
+  }
+  .tm-zone-label {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+    fill: var(--foreground);
+  }
+  .tm-zone-empty {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 1px;
+    fill: var(--muted-foreground);
+  }
+  .tm-zone-chip {
+    cursor: pointer;
+  }
+  .tm-zone-chip-mark {
+    fill: var(--muted);
+    stroke: var(--border-soft);
+    stroke-width: 1;
+  }
+  .tm-zone-chip-initial {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 700;
+    fill: var(--muted-foreground);
+  }
+  .tm-zone-dot {
+    stroke: var(--card);
+    stroke-width: 2;
+  }
+  .tm-zone-dot.working { fill: var(--sev-working); }
+  .tm-zone-dot.blocked { fill: var(--sev-hands); }
+  .tm-zone-dot.waiting { fill: var(--sev-decision); }
+  .tm-zone-dot.idle { fill: var(--muted-foreground); }
+
+  /* The vignette: present iff the room's signal is live. */
+  .tm-vignette-body,
+  .tm-vignette-stack {
+    fill: var(--card);
+    stroke: var(--fg-2);
+    stroke-width: 1.5;
+  }
+  .tm-vignette-seam {
+    stroke: var(--fg-2);
+    stroke-width: 1;
+  }
+  .tm-smoke-wisp {
+    fill: none;
+    stroke: var(--muted-foreground);
+    stroke-width: 2;
+    stroke-linecap: round;
+    /* Never fully transparent: a single-frame capture must show real smoke,
+       not catch the cycle at zero. */
+    opacity: 0.3;
+  }
+  /* Motion is presentation; the smoke itself is information. Under `reduce`
+     the wisps stay exactly where they are and stop drifting. */
+  @media (prefers-reduced-motion: no-preference) {
+    .tm-smoke-wisp {
+      animation: tm-smoke-drift 3s ease-in-out infinite;
+      transform-box: fill-box;
+      transform-origin: bottom center;
+    }
+    .tm-smoke-wisp:nth-of-type(2) { animation-delay: -1s; }
+    .tm-smoke-wisp:nth-of-type(3) { animation-delay: -2s; }
+  }
+  @keyframes tm-smoke-drift {
+    0% { opacity: 0.22; transform: translateY(4px); }
+    50% { opacity: 0.5; transform: translateY(-8px); }
+    100% { opacity: 0.22; transform: translateY(4px); }
+  }
+
+  /* Rooms the eleven zones have no place for. Listed, never dropped. */
+  .tm-overflow {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .tm-overflow .tm-smokemark {
+    position: static;
+    margin-left: 2px;
+  }
+  .tm-overflow ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  /* ── Room strip (phone) ────────────────────────────────────────────────── */
+  .tm-strip {
+    display: flex;
+    gap: 10px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    -webkit-overflow-scrolling: touch;
+  }
+  .tm-room {
+    position: relative;
+    flex: 0 0 auto;
+    width: 148px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    box-shadow: var(--tm-shadow-soft);
+  }
+  .tm-room[data-alert='true'] {
+    border-color: var(--accent);
+  }
+  .tm-room.is-selected {
+    background: var(--accent-soft);
+  }
+  .tm-room-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--foreground);
+  }
+  .tm-room-avatars {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .tm-room-occupant {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+  }
+  .tm-room-occupant:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  /* The room-card / overflow form of the vignette. The wisps carry the same
+     class as the floor plan's, so the reduced-motion rule covers both. */
+  .tm-smokemark {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: inline-flex;
+    pointer-events: none;
+  }
+  .tm-sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+  /* The room button is most of the card, and the card owns the framing. */
+  .tm-room-pick {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    width: 100%;
+    appearance: none;
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+  }
+  .tm-room-pick:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .tm-room-empty {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+  }
+
+  /* ── Fleet ─────────────────────────────────────────────────────────────── */
+  .tm-fleet {
+    padding: 24px 16px;
+  }
+  .tm-fleet-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    border-top: 1px solid var(--border-soft);
+  }
+  .tm-fleet-row {
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .tm-fleet-open {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    width: 100%;
+    padding: 14px 0;
+    appearance: none;
+    background: none;
+    border: 0;
+    cursor: pointer;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+  }
+  .tm-fleet-open:hover {
+    background: var(--accent-soft);
+  }
+  .tm-fleet-open:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .tm-fleet-content {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .tm-fleet-top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .tm-fleet-name-status {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+  .tm-fleet-name {
+    font-family: var(--font-sans);
+    font-weight: 700;
+    font-size: 14px;
+    color: var(--foreground);
+  }
+  .tm-fleet-status {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
+  }
+  .tm-fleet-status.working { color: var(--sev-working); }
+  .tm-fleet-status.blocked { color: var(--sev-hands); }
+  .tm-fleet-status.waiting { color: var(--sev-decision); }
+  .tm-fleet-time {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted-foreground);
+    white-space: nowrap;
+  }
+  .tm-fleet-task {
+    font-size: 13px;
+    color: var(--fg-2);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  @media (min-width: 980px) {
+    .nc-of .nc-of-bar-title {
+      display: none;
+    }
+    .tm-fleet {
+      padding: 20px 32px;
+    }
+    .tm-fleet-task {
+      white-space: normal;
+    }
+    .tm-feed {
+      padding: 20px 32px;
+    }
+    .tm-feed-stack {
+      flex-direction: row;
+      /* Six exceptions do not become six unreadable slivers: past four across
+         they wrap to a second row instead. */
+      flex-wrap: wrap;
+    }
+    .tm-exc {
+      flex: 1 1 240px;
+      padding: 14px;
+      gap: 8px;
+    }
+    /* A wide card holds its whole action row on one or two lines. Three
+       stacked full-width controls per card pushed the floor below the fold,
+       which is the one thing the feed must not do to the picture under it. */
+    .tm-exc .nc-obs-actions-who,
+    .tm-exc .nc-obs-actions-room {
+      flex: 1 1 130px;
+    }
+    .tm-exc .nc-obs-actions button {
+      flex: 0 1 auto;
+    }
+    .tm-exc-title {
+      font-size: 14px;
+      line-height: 1.3;
+    }
+  }

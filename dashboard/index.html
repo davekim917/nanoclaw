@@ -5,17 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agent Board</title>
     <!--
-      color-scheme on the root element + the matching background color avoids
-      a white flash before the bundled stylesheet (and React) mount. Browsers
-      use the meta to pick scrollbar / form-control palette; the inline body
-      bg matches the dark token in styles.css so first paint is dark.
+      color-scheme on the root element + the matching background colour avoids
+      a flash of the wrong ground before the bundled stylesheet (and React)
+      mount. Browsers use the meta to pick the scrollbar / form-control
+      palette; the inline values are the tom-modern canvas and ink, so first
+      paint already looks like the app.
+
+      No prefers-color-scheme branch: the app has ONE theme (see theme.css), and
+      a guard that flipped on the system setting would flash a ground the
+      stylesheet then contradicts.
     -->
-    <meta name="color-scheme" content="dark light" />
+    <meta name="color-scheme" content="light" />
     <style>
-      html, body { background: #0e1116; color: #e6edf3; margin: 0; }
-      @media (prefers-color-scheme: light) {
-        html, body { background: #ffffff; color: #1f2328; }
-      }
+      html, body { background: #fafafa; color: #27272a; margin: 0; }
     </style>
   </head>
   <body>
