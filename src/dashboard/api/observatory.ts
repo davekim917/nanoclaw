@@ -772,8 +772,22 @@ function buildRooms(workgroupId: string, allowed: string[] | null, hidden: strin
   for (const room of byPlatformId.values()) {
     const mgIds = [...room.messagingGroupIds];
     const placeholders = mgIds.map(() => '?').join(', ');
+    // Ordered by `datetime(...)`, NOT by `MAX(last_outbound_at)`. The column is
+    // TEXT, so MAX() is a byte comparison: space (0x20) sorts below 'T' (0x54),
+    // which means a naive `2026-08-20 23:00:00` loses to an ISO
+    // `2026-08-20T07:00:00.000Z` — eleven at night ranking below seven in the
+    // morning on the same date. Harmless only while every stored value shares
+    // one shape, which is luck rather than a guarantee: any writer using
+    // `datetime('now')` reintroduces the naive form and silently re-breaks this.
+    // `datetime()` parses both shapes, so this stays correct by construction.
     const activityRow = getDb()
-      .prepare(`SELECT MAX(last_outbound_at) AS last FROM sessions WHERE messaging_group_id IN (${placeholders})`)
+      .prepare(
+        `SELECT last_outbound_at AS last FROM sessions
+          WHERE messaging_group_id IN (${placeholders})
+            AND last_outbound_at IS NOT NULL
+          ORDER BY datetime(last_outbound_at) DESC
+          LIMIT 1`,
+      )
       .get(...mgIds) as { last: string | null } | undefined;
 
     rooms.push({
