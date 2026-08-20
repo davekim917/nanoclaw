@@ -425,7 +425,16 @@ export function resolveTaskSession(agentGroupId: string, seriesId: string): { se
   return { session, created: true };
 }
 
-/** Create the session folder and initialize both DBs. */
+/**
+ * Create the session folder and initialize both DBs.
+ *
+ * Deliberately does NOT call `prepareSessionClaudeDir` — the transcript copy
+ * it performs belongs to the spawn path (`getSessionClaudeMounts`, called from
+ * `buildMounts`), which already runs it before every container start. Sessions
+ * are minted for non-waking accumulate traffic too, and copying the group's
+ * whole shared transcript set into a session that never wakes cost 20GB on one
+ * agent group. Both DBs are small and needed immediately for those writes.
+ */
 export function initSessionFolder(agentGroupId: string, sessionId: string): void {
   const dir = sessionDir(agentGroupId, sessionId);
   fs.mkdirSync(dir, { recursive: true });
@@ -433,11 +442,6 @@ export function initSessionFolder(agentGroupId: string, sessionId: string): void
 
   ensureSchema(inboundDbPath(agentGroupId, sessionId), 'inbound');
   ensureSchema(outboundDbPath(agentGroupId, sessionId), 'outbound');
-
-  // Pre-create per-session Claude Code projects dir with container-uid
-  // ownership. See prepareSessionClaudeDir docstring for why this is
-  // load-bearing.
-  prepareSessionClaudeDir(agentGroupId, sessionId);
 }
 
 /**

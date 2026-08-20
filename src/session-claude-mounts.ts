@@ -47,10 +47,10 @@ import type { AgentGroup, Session } from './types.js';
  * Call this once at mount-list construction; the returned list MUST be
  * spread into `mounts` contiguously so the nested-mount ordering holds.
  *
- * Ensures `prepareSessionClaudeDir` ran for this session — idempotent and
- * cheap, so calling on every wake is fine and also covers sessions that
- * predate the per-session layout (they never went through `initSessionFolder`
- * on the new code path and need their shared-dir transcripts migrated).
+ * This is the ONLY caller of `prepareSessionClaudeDir` — session creation
+ * deliberately skips it so a session that never wakes never receives the
+ * shared-transcript copy. The first spawn therefore does the migration, and
+ * its `alreadyExisted` guard makes every later wake a cheap no-op.
  */
 export function getSessionClaudeMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
   prepareSessionClaudeDir(agentGroup.id, session.id);

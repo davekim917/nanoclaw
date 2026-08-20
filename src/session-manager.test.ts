@@ -44,6 +44,7 @@ import {
   initSessionFolder,
   inboundDbPath,
   outboundDbPath,
+  sessionClaudeProjectsDir,
   sessionDir,
   sessionMessageExists,
   writeOutboundDirect,
@@ -56,7 +57,8 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from './d
 import { createSession } from './db/sessions.js';
 import { insertDeferredMessageWithContextIfNew } from './db/session-db.js';
 import { insertRecurrence, insertTaskRow, type RecurringMessage } from './modules/scheduling/db.js';
-import type { Session } from './types.js';
+import { getSessionClaudeMounts } from './session-claude-mounts.js';
+import type { AgentGroup, Session } from './types.js';
 
 const AG = 'ag-test';
 const SESS = 'sess-test';
@@ -1660,5 +1662,61 @@ describe('threadWorktreeDir — workgroup namespace', () => {
     expect(threadWorktreeDir('slack:CTEST10003', tid)).toBe(
       path.join(threadsBaseDir(), 'slack_CTEST10003_1778800261.935259', 'worktrees'),
     );
+  });
+});
+
+describe('shared-transcript copy is deferred to container spawn', () => {
+  const TEST_DIR = '/tmp/nanoclaw-test-write-outbound';
+  const LAZY_AG = 'ag-lazy';
+  const LAZY_SESS = 'sess-lazy';
+  const sharedProjects = path.join(TEST_DIR, 'v2-sessions', LAZY_AG, '.claude-shared', 'projects', '-workspace-agent');
+
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(sharedProjects, { recursive: true });
+    fs.writeFileSync(path.join(sharedProjects, 'old-a.jsonl'), '{"a":1}\n');
+    fs.writeFileSync(path.join(sharedProjects, 'old-b.jsonl'), '{"b":1}\n');
+    fs.writeFileSync(path.join(sharedProjects, 'sessions-index.json'), '{}');
+  });
+
+  afterEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  function projectsDir(): string {
+    return sessionClaudeProjectsDir(LAZY_AG, LAZY_SESS);
+  }
+
+  function spawn(): void {
+    getSessionClaudeMounts({ id: LAZY_AG } as AgentGroup, { id: LAZY_SESS } as Session);
+  }
+
+  it('session creation writes the DBs and nothing else — no transcripts, no .claude-projects', () => {
+    initSessionFolder(LAZY_AG, LAZY_SESS);
+
+    expect(fs.existsSync(projectsDir())).toBe(false);
+    expect(fs.readdirSync(sessionDir(LAZY_AG, LAZY_SESS)).sort()).toEqual(['inbound.db', 'outbound.db', 'outbox']);
+  });
+
+  it('the spawn path copies the shared transcripts on first container start', () => {
+    initSessionFolder(LAZY_AG, LAZY_SESS);
+    spawn();
+
+    expect(fs.readdirSync(projectsDir()).sort()).toEqual(['old-a.jsonl', 'old-b.jsonl', 'sessions-index.json']);
+  });
+
+  it('a second spawn does not re-copy — transcripts written by the agent survive', () => {
+    initSessionFolder(LAZY_AG, LAZY_SESS);
+    spawn();
+    // The agent rewrote its own transcript; a re-copy would clobber it, and a
+    // transcript deleted in-session must not reappear.
+    fs.writeFileSync(path.join(projectsDir(), 'old-a.jsonl'), '{"a":"agent-turn"}\n');
+    fs.rmSync(path.join(projectsDir(), 'old-b.jsonl'));
+    fs.writeFileSync(path.join(sharedProjects, 'old-c.jsonl'), '{"c":1}\n');
+
+    spawn();
+
+    expect(fs.readFileSync(path.join(projectsDir(), 'old-a.jsonl'), 'utf-8')).toBe('{"a":"agent-turn"}\n');
+    expect(fs.readdirSync(projectsDir()).sort()).toEqual(['old-a.jsonl', 'sessions-index.json']);
   });
 });
