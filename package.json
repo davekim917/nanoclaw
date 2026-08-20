@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "tsc && pnpm run build:spa",
-    "build:spa": "[ -d dashboard/node_modules ] && pnpm --dir dashboard run build || echo 'WARN: dashboard deps not installed — SPA not rebuilt; dist/dashboard-spa may be missing and /dashboard/ will 404'",
+    "build:spa": "[ -d dashboard/node_modules ] || { echo 'WARN: dashboard deps not installed — SPA not rebuilt; run: pnpm --dir dashboard install'; exit 0; }; pnpm --dir dashboard run build",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
