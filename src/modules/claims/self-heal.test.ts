@@ -344,7 +344,7 @@ describe('accountability', () => {
     const prompt = d.sent[0].prompt;
     expect(prompt).toContain('`seam`');
     expect(prompt).toContain('claim.sh release seam');
-    expect(prompt).toContain('naming the human who owns that blocker');
+    expect(prompt).toContain('@-mentions whoever owes it');
   });
 });
 
@@ -359,10 +359,12 @@ describe('anti-noise — a nudge must produce work, not chat', () => {
     expect(prompt).not.toContain('and say so');
   });
 
-  it('keeps naming a human blocker as the ONE sanctioned post, self-contained', () => {
+  it('keeps mentioning a blocker (human or agent) as the ONE sanctioned post, self-contained', () => {
     const prompt = buildNudgePrompt(BOARD_CLAIM, 'x');
 
-    expect(prompt).toContain('post ONE message naming the human');
+    // The mention is the delivery mechanism: notification for a human, wake for an agent.
+    expect(prompt).toContain('post ONE message that @-mentions whoever owes it');
+    expect(prompt).toContain('a human or another agent');
     expect(prompt).toContain('ONLY sanctioned post');
     // The delivery caveat: a nudge task's post lands top-level in a channel, so
     // the message has to carry its own context.

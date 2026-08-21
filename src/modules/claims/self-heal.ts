@@ -209,13 +209,14 @@ export function buildNudgePrompt(claim: BoardClaim, origin: string): string {
     `1. Finish the work, then \`${claimSh} release ${claim.slug}\`.\n` +
     `2. Stopping without finishing: \`${claimSh} park ${claim.slug} "<what a successor needs to know>"\`. ` +
     `Dead or superseded: \`${claimSh} release ${claim.slug}\`.\n` +
-    `3. A HUMAN owes you a decision or an action you cannot proceed without: ` +
-    `\`${claimSh} park ${claim.slug} "waiting on <person>: <what you asked>"\`, AND post ONE message naming the human ` +
-    `who owns that blocker. Write it to stand alone — say which claim, what is blocked, and who owes the answer; ` +
+    `3. SOMEONE ELSE — a human or another agent — owes you a decision or an action you cannot proceed without: ` +
+    `\`${claimSh} park ${claim.slug} "waiting on <person-or-agent>: <what you asked>"\`, AND post ONE message that ` +
+    `@-mentions whoever owes it. The mention is what delivers the ask — a notification to a human, a wake to an agent; ` +
+    `a plain name reaches neither. Write it to stand alone — say which claim, what is blocked, and who owes the answer; ` +
     `it may land at the top of a channel rather than in the thread you are reading this in.\n\n` +
     `Post NOTHING for 1 or 2. The claims board and the Observatory already show claim state, so announcing a finish, ` +
     `a release or a park duplicates what a human can already see — and your standing instructions forbid it. Option 3 ` +
-    `is the ONLY sanctioned post here, because a blocked human is the one thing no board can show. Do not hedge by ` +
+    `is the ONLY sanctioned post here, because a blocked hand-off is the one thing no board can show. Do not hedge by ` +
     `posting anyway.\n` +
     `A claim neither moved nor released by the end of this task is the failure this exists to end.`
   );

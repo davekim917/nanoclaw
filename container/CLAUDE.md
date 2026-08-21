@@ -96,15 +96,17 @@ the reader, state it explicitly at the end — never implied mid-paragraph.
 - <one fact per line, ≤15 words, no dependent clauses>
 - <...>
 
-**👉 You:** <who does what, by when>       ← last line, ONLY when you need something
+**👉 You:** @<person-or-agent> — <what they do, by when>   ← last line, ONLY when you need something
 ```
 
 The shape scales with the content — it is a ceiling, not a quota:
 
-- **The `👉 You:` line exists only when a human must act.** If nothing is
+- **The `👉 You:` line exists only when a human or another agent must act,
+  and it @-mentions them.** The mention is the delivery mechanism — a human's
+  notification, an agent's wake; a plain name reaches neither. If nothing is
   needed, OMIT the line — never write "no action needed"; a report with no
   ask simply ends after its last fact. The bar for "must act": the line
-  names a concrete action a named person takes, without which the work
+  names a concrete action the mentioned person takes, without which the work
   stalls. "Let me know if…", "review when you have a chance", "FYI", and
   restating the outcome as a question do not clear the bar — omit the line.
   Most reports should end on a fact, not a finger.
