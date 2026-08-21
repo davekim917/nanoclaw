@@ -97,6 +97,11 @@ export interface MemoryCuratorRunReport {
   /** Topic files written by a consolidation pass. 0 is a valid, distinct
    *  outcome from the empty-tail maintenance_noop (P2.4 item 7). */
   fileCount?: number;
+  /** Topic files the model proposed but validateConsolidationFiles dropped
+   *  (bad path, oversized once serialized, or beyond the max-file count).
+   *  The tail is still marked consolidated and the pass still succeeds —
+   *  see runMaintenanceJob. */
+  rejectedCount?: number;
   messageCount: number;
   transcriptChars: number;
   model?: string;
@@ -767,8 +772,24 @@ export class MemoryCuratorWorker {
       // writes rather than completing them anyway.
       signal?.throwIfAborted();
       // Batch-level validation (path, per-file size on header+content, max
-      // file count) BEFORE any write — a rejected batch writes nothing.
-      const validated = validateConsolidationFiles(attempt.result.decision, tail.facts.length);
+      // file count) BEFORE any write. Per-file violations are PARTITIONED,
+      // not thrown: a deterministic per-entity rejection here would otherwise
+      // re-present the identical tail to the same model forever (the model
+      // has no memory of the rejection on the next pass), permanently
+      // deadlocking consolidation for every fact behind the bad one. Only
+      // `accepted` files are written; `rejected` ones are logged and the tail
+      // is still marked consolidated below, same as the model choosing not
+      // to touch them.
+      const { accepted, rejected } = validateConsolidationFiles(attempt.result.decision, tail.facts.length);
+      if (rejected.length > 0) {
+        // Named per-path, with reason and byte size where relevant, so an
+        // operator can see WHICH entity is being persistently dropped rather
+        // than just a count.
+        log.warn('memory-curator: consolidation dropped invalid topic files this pass', {
+          workgroupId: job.workgroupId,
+          rejected,
+        });
+      }
       // Locked = over-cap (never read) UNION presented-but-not-owned (read as
       // context only). The latter matters even if the file vanishes from
       // disk mid-pass: the model was TOLD it was human-authored and must
@@ -779,12 +800,12 @@ export class MemoryCuratorWorker {
         ...scan.files.filter((file) => !file.owned).map((file) => file.path),
       ]);
       const ownedByPath = new Map(scan.files.filter((file) => file.owned).map((file) => [file.path, file]));
-      for (const file of validated) {
+      for (const file of accepted) {
         if (lockedPaths.has(file.path)) {
           throw new Error(`memory consolidation attempted to write a locked topic file: ${file.path}`);
         }
       }
-      for (const file of validated) {
+      for (const file of accepted) {
         signal?.throwIfAborted();
         // A brand-new path has no prior content → create-only (null). An
         // owned existing path's expected hash is the content this pass
@@ -830,19 +851,25 @@ export class MemoryCuratorWorker {
         tail.facts.map((fact) => fact.id),
       );
       outcome = 'maintenance_written';
-      if (validated.length === 0) {
+      if (accepted.length === 0) {
         // Distinct from the empty-tail noop above: real facts were
-        // consolidated, the model just judged no topic file needed a change.
+        // consolidated. Either the model judged no topic file needed a
+        // change (rejected.length === 0), or everything it proposed was
+        // invalid (rejected.length > 0, logged above) — either way this is
+        // the same "tail marked, nothing written" shape as the model
+        // returning `files: []`.
         log.info('memory-curator: consolidation pass wrote zero files for a non-empty tail', {
           workgroupId: job.workgroupId,
           factCount: tail.facts.length,
+          rejectedCount: rejected.length,
         });
       }
       return {
         workgroupId: job.workgroupId,
         episodeKey: 'maintenance',
         action: 'maintenance_written',
-        fileCount: validated.length,
+        fileCount: accepted.length,
+        rejectedCount: rejected.length,
         messageCount: 0,
         transcriptChars: 0,
         model: attempt.result.model,
