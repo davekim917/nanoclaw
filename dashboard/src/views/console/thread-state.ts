@@ -256,6 +256,19 @@ export function elapsed(iso: string | null, now: number = Date.now()): string {
   return `${Math.floor(h / 24)}d ${String(h % 24).padStart(2, '0')}h`;
 }
 
+/**
+ * The participant who filed a `done_proposal`, by friendly name (§11: never an
+ * internal id). Falls back to the raw `agent_group_id` only if that agent
+ * somehow is not in `participants` any more — the mirror can lag a real
+ * retraction by up to one sweep tick, so this is a display fallback, not
+ * evidence the proposal is stale.
+ */
+export function proposalAuthorName(thread: Pick<ThreadSummary, 'participants' | 'done_proposal'>): string {
+  const proposal = thread.done_proposal;
+  if (!proposal) return '';
+  return thread.participants.find((p) => p.agent_group_id === proposal.agent_group_id)?.name ?? proposal.agent_group_id;
+}
+
 /** Two initials for the avatar fallback — a friendly display name, never an id. */
 export function initials(name: string): string {
   const words = name
