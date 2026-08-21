@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
-import { CalendarClock, Inbox, ListChecks, SlidersHorizontal } from 'lucide-react';
+import { CalendarClock, Inbox, ListChecks, Menu } from 'lucide-react';
 import useSWR from 'swr';
 import {
   getThreadDetail,
@@ -17,7 +17,7 @@ import { stripMarkdown } from '../../lib/markdown.js';
 import { subscribe } from '../../lib/sse.ts';
 import { useWorkgroupFilter } from '../../lib/use-workgroup-filter.js';
 import { actionError } from './action-error.js';
-import { closeThread, setSnoozed } from './actions.js';
+import { setSnoozed } from './actions.js';
 import { ScheduleLens } from './ScheduleLens.js';
 import { ThreadDetail } from './ThreadDetail.js';
 import { ThreadRow, type ThreadPreview } from './ThreadRow.js';
@@ -85,7 +85,44 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
    */
   const [navOpen, setNavOpen] = useState(false);
   const theme = useThemeChoice();
-  const lens = useHashLens();
+  const { lens, goToQueue } = useHashLens();
+
+  /**
+   * §4's fix: choosing ANY queue filter while the Schedule lens is open must
+   * snap the view back to the queue, with that filter applied. Schedule used to
+   * pin the page — a lane or channel tap still changed state, but the render
+   * branch below kept drawing the lens, so nothing visible happened and the
+   * only way out was a "Threads" link that is now gone. Every filter control
+   * routes through one of these three instead of calling its setter directly.
+   */
+  const applyLaneFilter = useCallback(
+    (next: Lane) => {
+      if (lens === 'schedule') goToQueue();
+      setLane(next);
+    },
+    [lens, goToQueue],
+  );
+  const applyChannelFilter = useCallback(
+    (next: string | null) => {
+      if (lens === 'schedule') goToQueue();
+      setChannel(next);
+    },
+    [lens, goToQueue],
+  );
+  const applyQuery = useCallback(
+    (next: string) => {
+      if (lens === 'schedule') goToQueue();
+      setQuery(next);
+    },
+    [lens, goToQueue],
+  );
+  const applyWorkgroupFilter = useCallback(
+    (next: string) => {
+      if (lens === 'schedule') goToQueue();
+      setWorkgroupFilter(next);
+    },
+    [lens, goToQueue, setWorkgroupFilter],
+  );
 
   const { data, mutate } = useSWR(
     ['/dashboard/api/threads', workgroupFilter],
@@ -150,11 +187,6 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
 
   const snoozedCount = useMemo(() => threads.filter((t) => t.snoozed).length, [threads]);
 
-  const attentionCount = useMemo(
-    () => threads.filter((t) => STATE_PRESENTATION[t.state].wantsAttention).length,
-    [threads],
-  );
-
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return threads
@@ -204,36 +236,19 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
    * The row's ONE verb, and it is one verb for every state now: open the
    * composer on this thread. Answer / Push / Steer / Assign / Hand to… are
    * words, not branches — `STATE_PRESENTATION` picks the word and this picks
-   * nothing. Close and Snooze are the two actions that are NOT a message, and
-   * they live on the detail pane rather than in the queue's verb column.
+   * nothing. Snooze is the one action that is NOT a message, and it lives on
+   * the detail pane rather than in the queue's verb column.
+   *
+   * There used to be a second non-message action here — Dismiss (formerly
+   * Close), which archived every session on the thread. It is gone: archiving
+   * hid the thread from the queue without stopping the agent, so the work kept
+   * running unattended and unwatched. A thread only leaves the queue when it
+   * is actually finished, not when an operator stops looking at it.
    */
   const onVerb = useCallback((t: ThreadSummary) => {
     setSelectedId(t.thread_id);
     setFocusComposer((n) => n + 1);
   }, []);
-
-  /**
-   * DISMISS, not close.
-   *
-   * The word matters and the operator paid for it: this sets `archived_at` and
-   * nothing else. The container keeps running, the inbound queue keeps its
-   * messages, and the agent is never told. "Close" read as "end the work", so
-   * it was pressed expecting exactly that. The mechanism is unchanged —
-   * `closeThread` still archives every session on the thread, which is what
-   * DESIGN §5 computes `done` from — only the word is different.
-   */
-  const onDismiss = useCallback(
-    (t: ThreadSummary) => {
-      setNotice(`Dismissing ${t.title ?? 'thread'}…`);
-      closeThread(t)
-        .then(() => {
-          setNotice(`Dismissed ${t.title ?? 'thread'}.`);
-          void mutate();
-        })
-        .catch((err: unknown) => setNotice(`Could not dismiss — ${actionError(err)}.`));
-    },
-    [mutate],
-  );
 
   const onToggleSnooze = useCallback(
     (t: ThreadSummary) => {
@@ -250,13 +265,17 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
   /**
    * Triage is a mode over the CURRENT FILTERED LIST (§11), so entering it
    * freezes `visible` — the same rows, the same order — and leaving it puts the
-   * operator back exactly where they were, scroll position included.
+   * operator back exactly where they were, scroll position included. Entering
+   * it while Schedule is open has the same trap §4 fixes elsewhere: the panel
+   * lives in the same branch as the queue, so it must snap back to the queue
+   * first or the tap would silently do nothing visible.
    */
   const savedScroll = useRef(0);
   const enterTriage = useCallback(() => {
+    if (lens === 'schedule') goToQueue();
     savedScroll.current = listRef.current?.scrollTop ?? 0;
     setTriage(visible);
-  }, [visible]);
+  }, [lens, goToQueue, visible]);
   const exitTriage = useCallback(() => setTriage(null), []);
   useEffect(() => {
     if (triage === null && listRef.current) listRef.current.scrollTop = savedScroll.current;
@@ -273,6 +292,21 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
   return (
     <div className="ncc" data-pane={pane} data-nav={navOpen ? 'open' : 'closed'}>
       <header className="ncc-top">
+        {/* Mobile only (console.css) — opens the SAME nav as the sheet the
+            bottom bar's Filters tab used to raise. There is no second,
+            mobile-only control set: this button and the desktop sidebar share
+            one `<nav>`, so there is exactly one lane list, one channel list,
+            and one theme toggle in the DOM. */}
+        <button
+          type="button"
+          className="ncc-hamburger"
+          aria-label="Navigation"
+          aria-expanded={navOpen}
+          aria-controls="ncc-side"
+          onClick={() => setNavOpen((open) => !open)}
+        >
+          <Menu size={18} aria-hidden="true" />
+        </button>
         <span className="ncc-brand">Observatory</span>
         {/* One selector, one axis. There is deliberately no second
             narrow-to-one-sibling control: every row already carries the avatar
@@ -284,7 +318,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
           className="ncc-select"
           aria-label="Workgroup"
           value={workgroupFilter}
-          onChange={(e) => setWorkgroupFilter(e.target.value)}
+          onChange={(e) => applyWorkgroupFilter(e.target.value)}
         >
           <option value="all">all workgroups</option>
           {workgroups.map((w) => (
@@ -293,37 +327,21 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
             </option>
           ))}
         </select>
-        <span className="ncc-spacer" />
+        {/* The one row this header is (item 1): brand, workgroup, search — the
+            "Needs you" tally, Triage entry and theme toggle used to live here
+            too, stacked into three rows on a phone. They duplicated the left
+            nav (desktop) and the Filters sheet (mobile), so they are gone from
+            here entirely: the attention count lives on the sidebar's own
+            "Needs you" lane, Triage is a nav entry (§ below), and the theme
+            toggle is the nav's footer item. */}
         <input
           className="ncc-search"
           type="search"
           placeholder="Search threads"
           aria-label="Search threads"
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => applyQuery(e.target.value)}
         />
-        {/* §7.2's filled-accent chip, in the product and not only in the test:
-            its text token flips to near-black in dark mode. */}
-        <span className="ncc-attn-chip" aria-live="polite">
-          Needs you <span className="ncc-mono">{attentionCount}</span>
-        </span>
-        {/* §11: triage is entered FROM the list and is never the home screen. */}
-        <button
-          type="button"
-          className="ncc-solid-btn"
-          onClick={enterTriage}
-          disabled={visible.length === 0 || triage !== null}
-        >
-          Triage <span className="ncc-mono">{visible.length}</span>
-        </button>
-        <button
-          type="button"
-          className="ncc-solid-btn"
-          onClick={theme.cycle}
-          aria-label={`Colour theme: ${theme.choice}. Activate to change.`}
-        >
-          {theme.choice}
-        </button>
       </header>
 
       <div className="ncc-body">
@@ -339,7 +357,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
             label="All threads"
             count={threads.length}
             active={lane === 'all'}
-            onClick={() => setLane('all')}
+            onClick={() => applyLaneFilter('all')}
           />
           {LANE_ORDER.map((state) => (
             <LaneButton
@@ -348,7 +366,11 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
               count={laneCounts[state] ?? 0}
               tone={STATE_PRESENTATION[state].tone}
               active={lane === state}
-              onClick={() => setLane(state)}
+              onClick={() => applyLaneFilter(state)}
+              // The top bar's "Needs you N" chip is gone (item 2) — this lane's
+              // own count is its only home now, so it keeps the chip's
+              // aria-live rather than dropping the announcement on the floor.
+              live={state === 'needs_you'}
             />
           ))}
 
@@ -357,9 +379,19 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
               label="Snoozed"
               count={snoozedCount}
               active={lane === 'snoozed'}
-              onClick={() => setLane('snoozed')}
+              onClick={() => applyLaneFilter('snoozed')}
             />
           )}
+
+          {/* Triage was a top-bar button and a bottom-bar tab; it is now also a
+              Queue-section entry, same shape as a lane, so desktop offers it
+              without a duplicate row of chrome above the list (§2). */}
+          <LaneButton
+            label="Triage"
+            count={visible.length}
+            disabled={visible.length === 0 || triage !== null}
+            onClick={enterTriage}
+          />
 
           <div className="ncc-side-gap" />
           <h2 className="ncc-side-head">
@@ -370,7 +402,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
             label="All channels"
             count={threads.length}
             active={channel === null}
-            onClick={() => setChannel(null)}
+            onClick={() => applyChannelFilter(null)}
           />
           {channels.map((c) => (
             <button
@@ -378,7 +410,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
               type="button"
               className="ncc-side-item channel"
               aria-pressed={channel === c.key}
-              onClick={() => setChannel(channel === c.key ? null : c.key)}
+              onClick={() => applyChannelFilter(channel === c.key ? null : c.key)}
             >
               {/* §11: friendly per-channel display names, never internal ids.
                   `channel_name` is resolved from messaging_groups server-side
@@ -390,17 +422,29 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
           ))}
 
           <div className="ncc-side-gap" />
-          <h2 className="ncc-side-head">Lenses</h2>
           {/* §11: the schedule is a LENS, not a destination — same shell, same
-              workgroup filter, a different thing to look at. The floor-plan lens is
-              gone with the floor plan itself; a lens with no target is worse
-              than no lens. */}
-          <a className="ncc-side-item" href="#/console" aria-current={lens === 'threads' ? 'page' : undefined}>
-            <span className="lbl">Threads</span>
-          </a>
+              workgroup filter, a different thing to look at. The "LENSES"
+              heading and its "Threads" entry are gone (item 4): the queue is
+              the default view, and every filter above already returns to it,
+              so a menu entry whose only job was "go back" had no point. */}
           <a className="ncc-side-item" href="#/scheduled" aria-current={lens === 'schedule' ? 'page' : undefined}>
             <span className="lbl">Schedule</span>
           </a>
+
+          {/* The nav's footer item (item 2) — was a top-bar button, stacking a
+              third row on a phone. Pinned to the bottom of this nav with
+              `margin-top: auto`, which puts it at the foot of the sheet on
+              mobile for free, since it is the same element either way. */}
+          <div className="ncc-side-foot">
+            <button
+              type="button"
+              className="ncc-solid-btn"
+              onClick={theme.cycle}
+              aria-label={`Colour theme: ${theme.choice}. Activate to change.`}
+            >
+              {theme.choice}
+            </button>
+          </div>
         </nav>
 
         {lens === 'schedule' ? (
@@ -451,7 +495,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
             ) : (
               <div className="ncc-detail-wrap">
                 {selected && (
-                  /* The two actions that are not a message. Everything else on this
+                  /* The one action that is not a message. Everything else on this
                  screen is the composer below. */
                   <div className="ncc-detail-actions">
                     {/* On a phone the list and the thread are one pane, so
@@ -463,14 +507,6 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
                     <button type="button" className="ncc-verb" onClick={() => onToggleSnooze(selected)}>
                       {selected.snoozed ? 'un-snooze' : 'snooze'}
                     </button>
-                    <button
-                      type="button"
-                      className="ncc-verb"
-                      title="Removes the thread from your queue. The agent is not stopped and its work continues."
-                      onClick={() => onDismiss(selected)}
-                    >
-                      dismiss
-                    </button>
                   </div>
                 )}
                 <ThreadDetail thread={selected} focusComposer={focusComposer} onSent={() => void mutate()} />
@@ -481,14 +517,14 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
       </div>
 
       {/*
-       * §8's bottom bar: 56px, four destinations, each with a distinct icon.
+       * §8's bottom bar: 56px, three destinations, each with a distinct icon.
        * `display: none` above the breakpoint — on desktop the sidebar already
        * carries all of this, and a second copy would be the near-identical
        * duplicate control §12 warns about.
        *
-       * Queue and Schedule are the two lenses; Filters raises the sidebar sheet,
-       * which is where the queue lanes and the channel list live on a phone;
-       * Triage is the mode entered from the list (§11).
+       * Filters is gone from here (item 2): the header's hamburger raises the
+       * same sidebar sheet now, so the bottom bar is down to the two lenses
+       * plus Triage, the mode entered from the list (§11).
        */}
       <nav className="ncc-bottom" aria-label="Sections">
         <a
@@ -500,16 +536,6 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
           <Inbox size={18} aria-hidden="true" />
           Queue
         </a>
-        <button
-          type="button"
-          className="ncc-bottom-item"
-          aria-expanded={navOpen}
-          aria-controls="ncc-side"
-          onClick={() => setNavOpen((open) => !open)}
-        >
-          <SlidersHorizontal size={18} aria-hidden="true" />
-          Filters
-        </button>
         <a className="ncc-bottom-item" href="#/scheduled" aria-current={lens === 'schedule' ? 'page' : undefined}>
           <CalendarClock size={18} aria-hidden="true" />
           Schedule
@@ -535,18 +561,33 @@ function LaneButton({
   count,
   tone,
   active,
+  disabled,
+  live,
   onClick,
 }: {
   label: string;
   count: number;
   tone?: 'attention' | 'live' | 'quiet';
-  active: boolean;
+  /** Omitted entirely for an action entry (Triage) rather than a filter toggle
+   *  — `aria-pressed="false"` on a button that does not toggle is a worse
+   *  reading than no `aria-pressed` at all. */
+  active?: boolean;
+  disabled?: boolean;
+  /** The top bar's "Needs you N" chip carried `aria-live="polite"` (item 2
+   *  removed it entirely); the Needs-you LANE is now the only place that count
+   *  lives, so it keeps the announcement rather than dropping it. */
+  live?: boolean;
   onClick: () => void;
 }) {
   return (
-    <button type="button" className="ncc-side-item" aria-pressed={active} onClick={onClick}>
+    <button type="button" className="ncc-side-item" aria-pressed={active} disabled={disabled} onClick={onClick}>
       <span className="lbl">{label}</span>
-      <span className={`n${tone === 'attention' ? ' attention' : tone === 'live' ? ' live' : ''}`}>{count}</span>
+      <span
+        className={`n${tone === 'attention' ? ' attention' : tone === 'live' ? ' live' : ''}`}
+        aria-live={live ? 'polite' : undefined}
+      >
+        {count}
+      </span>
     </button>
   );
 }
@@ -627,14 +668,28 @@ export function lensForHash(hash: string): 'threads' | 'schedule' {
   return hash.replace(/^#/, '') === '/scheduled' ? 'schedule' : 'threads';
 }
 
-function useHashLens(): 'threads' | 'schedule' {
+/**
+ * `goToQueue` is item 4's fix for the Schedule trap: it sets BOTH the address
+ * bar (so `#/console` stays the bookmarkable, back-button-honest URL) and the
+ * lens state directly, rather than only writing the hash and waiting on the
+ * `hashchange` listener below to notice. A filter tap needs the queue to
+ * reappear in the SAME render pass it fires in — round-tripping through a
+ * browser event that may not even land synchronously would reintroduce the
+ * silent no-op this exists to fix. External navigation (a Schedule link, the
+ * back button) still goes through the listener exactly as before.
+ */
+function useHashLens(): { lens: 'threads' | 'schedule'; goToQueue: () => void } {
   const [lens, setLens] = useState(() => lensForHash(location.hash));
   useEffect(() => {
     const handler = () => setLens(lensForHash(location.hash));
     window.addEventListener('hashchange', handler);
     return () => window.removeEventListener('hashchange', handler);
   }, []);
-  return lens;
+  const goToQueue = useCallback(() => {
+    location.hash = '#/console';
+    setLens('threads');
+  }, []);
+  return { lens, goToQueue };
 }
 
 /** Trailing-edge debounce on `session_event`. No polling — see the file header. */

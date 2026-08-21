@@ -41,6 +41,32 @@ export interface ThreadRowProps {
 
 const MAX_FACES = 3;
 
+/**
+ * The "scheduled" pill (operator report, 2026-08-20 — DEFECT 1). A scheduled
+ * task's thread has no real channel to sit under (its session never carries a
+ * `messaging_group_id` — see `threads.ts`'s `isScheduledTaskThread`), so it
+ * lands in the `tasks` pseudo-channel bucket rather than disappearing or
+ * inventing one; this is how the row admits that instead of reading as an
+ * ordinary channel thread.
+ *
+ * Matches `.ncc-state`'s own neutral (non-attention, non-live) look byte for
+ * byte — mono caps, outlined, `--ncc-secondary` on `--ncc-border` — rather
+ * than inventing a new visual language (§7: "do not introduce a third status
+ * hue"). Inline because this file does not own console.css; there is nothing
+ * here a shared class would save.
+ */
+const SCHEDULED_PILL_STYLE = {
+  fontFamily: 'var(--ncc-font-mono)',
+  fontSize: '10.5px',
+  fontWeight: 600,
+  letterSpacing: '0.02em',
+  textTransform: 'uppercase',
+  whiteSpace: 'nowrap',
+  padding: '1px 5px',
+  color: 'var(--ncc-secondary)',
+  border: '1px solid var(--ncc-border)',
+} as const;
+
 export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelect, onVerb }: ThreadRowProps) {
   const presentation = STATE_PRESENTATION[thread.state];
   const shown = thread.participants.slice(0, MAX_FACES);
@@ -116,6 +142,11 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
           </button>
 
           <div className="ncc-row-side">
+            {thread.scheduled_task && (
+              <span className="ncc-scheduled-pill" style={SCHEDULED_PILL_STYLE}>
+                scheduled
+              </span>
+            )}
             <span className={`ncc-state ${presentation.tone}`}>{presentation.label}</span>
             {/*
              * Every row, every state, one live verb. There is no inert branch

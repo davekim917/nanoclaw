@@ -1,20 +1,18 @@
-import {
-  archiveSession,
-  postThreadMessage,
-  snoozeThread,
-  unsnoozeThread,
-  type ThreadMessageResponse,
-  type ThreadSummary,
-} from '../../lib/api.js';
+import { postThreadMessage, snoozeThread, unsnoozeThread, type ThreadMessageResponse } from '../../lib/api.js';
 
 /**
- * The console's three actions: one message primitive, plus close and snooze.
+ * The console's two actions: one message primitive, plus snooze.
  *
  * **There is ONE primitive — send a message to a chosen agent.** Steer, push,
  * ship, assign and reassign are all `sendToAgent`; what differs between them is
  * the word on the button and whether the chosen agent already has a session on
  * the thread. Nothing here kills a container, and there is no verb that does:
  * a stalled thread gets a message.
+ *
+ * There used to be a third action, Close/Dismiss, which archived every session
+ * on a thread. It is gone: archiving hides a thread from the queue without
+ * stopping the agent inside it, so the work kept running unattended and
+ * unwatched. A hide-without-stop action is a blindness switch, not a close.
  *
  * `POST /dashboard/api/threads/:id/message` is that call. It resolves the
  * session (creating one when the agent has never spoken here) and then goes
@@ -54,18 +52,6 @@ export async function sendToAgent(
   text: string,
 ): Promise<ThreadMessageResponse> {
   return postThreadMessage(threadId, { agent_group_id: agentGroupId, idempotency_key: newIdempotencyKey(), text });
-}
-
-/**
- * Close — archive every session on the thread.
- *
- * `archived_at` is exactly what DESIGN §5 computes `done` from, so this is the
- * one verb whose effect and whose state are the same fact. All N sessions,
- * because a thread is only `done` when every one of them is (`allArchived`);
- * archiving one of six would leave the row unchanged and read as a dead button.
- */
-export async function closeThread(thread: Pick<ThreadSummary, 'session_ids'>): Promise<void> {
-  await Promise.all(thread.session_ids.map((id) => archiveSession(id)));
 }
 
 /** Snooze — durable, per-user, expires when the thread moves. See thread-snooze.ts. */

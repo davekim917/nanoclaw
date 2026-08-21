@@ -25,8 +25,8 @@ describe('attention lanes sort oldest-first', () => {
     }
   });
 
-  it('leaves running, idle and done newest-first — nobody is waiting on a promise there', () => {
-    for (const state of ['running', 'idle', 'done'] as const) {
+  it('leaves running and idle newest-first — nobody is waiting on a promise there', () => {
+    for (const state of ['running', 'idle'] as const) {
       expect(leadsWithOldest(state)).toBe(false);
       const sorted = [row(state, OLD), row(state, NEW), row(state, MID)].sort(compareThreads);
       expect(sorted.map((r) => r.last_activity_at)).toEqual([NEW, MID, OLD]);

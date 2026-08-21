@@ -17,13 +17,11 @@ import type { ThreadSummary } from '../../lib/api.js';
 const getThreadDetail = vi.fn();
 const snoozeThread = vi.fn().mockResolvedValue({});
 const unsnoozeThread = vi.fn().mockResolvedValue({});
-const archiveSession = vi.fn().mockResolvedValue({});
 const postThreadMessage = vi.fn().mockResolvedValue({});
 vi.mock('../../lib/api.js', () => ({
   getThreadDetail,
   snoozeThread,
   unsnoozeThread,
-  archiveSession,
   postThreadMessage,
 }));
 
@@ -68,7 +66,6 @@ const panel = (): HTMLElement => screen.getByLabelText('Triage');
 
 beforeEach(() => {
   snoozeThread.mockClear();
-  archiveSession.mockClear();
   postThreadMessage.mockClear();
   getThreadDetail.mockImplementation((id: string) =>
     Promise.resolve({ thread: thread(1, { thread_id: id }), transcript: [] }),
@@ -110,27 +107,27 @@ describe('verdicts advance by exactly one', () => {
     expect(await screen.findByText('Thread 2')).toBeTruthy();
   });
 
-  it('E dismisses the current thread by archiving every one of its sessions', async () => {
+  /**
+   * E used to dismiss the thread by archiving every session on it. That verb
+   * is gone — archiving hid a thread without stopping the agent, so the work
+   * kept running unattended.
+   */
+  it('E is not bound to anything — no verdict fires and the position holds', async () => {
     const user = userEvent.setup();
-    renderTriage([thread(1, { session_ids: ['s-1a', 's-1b'] }), thread(2)]);
+    renderTriage([thread(1), thread(2)]);
     panel().focus();
     await user.keyboard('e');
-    await waitFor(() => expect(archiveSession).toHaveBeenCalledTimes(2));
-    expect(archiveSession.mock.calls.map((c) => c[0])).toEqual(['s-1a', 's-1b']);
-    expect(screen.getByText('2 / 2')).toBeTruthy();
+    expect(snoozeThread).not.toHaveBeenCalled();
+    expect(screen.getByText('1 / 2')).toBeTruthy();
   });
 
-  it('says DISMISS, never close — it archives and stops nothing', async () => {
+  it('offers no close/dismiss button, and the key hint carries only answer and snooze', async () => {
     renderTriage([thread(1)]);
     // `find`, not `get`: it lets the detail pane's transcript fetch settle
     // inside act rather than landing after the test has ended.
-    const dismiss = await screen.findByRole('button', { name: /E · dismiss/ });
-    expect(dismiss.getAttribute('title')).toBe(
-      'Removes the thread from your queue. The agent is not stopped and its work continues.',
-    );
-    expect(screen.queryByRole('button', { name: /E · close/ })).toBeNull();
-    // The key hint carries the same word as the button.
-    expect(screen.getByText(/A answer · S snooze · E dismiss · Esc exit/)).toBeTruthy();
+    await screen.findByRole('button', { name: /S · snooze/ });
+    expect(screen.queryByRole('button', { name: /close|dismiss/i })).toBeNull();
+    expect(screen.getByText(/A answer · S snooze · Esc exit/)).toBeTruthy();
   });
 
   it('A focuses the composer and does NOT advance until the reply lands', async () => {
@@ -175,7 +172,6 @@ describe('the keyboard rules that ship broken silently', () => {
     await user.keyboard('{Meta>}e{/Meta}');
     await user.keyboard('{Alt>}a{/Alt}');
     expect(snoozeThread).not.toHaveBeenCalled();
-    expect(archiveSession).not.toHaveBeenCalled();
     expect(screen.getByText('1 / 2')).toBeTruthy();
   });
 
@@ -184,7 +180,6 @@ describe('the keyboard rules that ship broken silently', () => {
     renderTriage([thread(1), thread(2)]);
     await user.type(await screen.findByLabelText('Message text'), 'ship the aes patch');
     expect(snoozeThread).not.toHaveBeenCalled();
-    expect(archiveSession).not.toHaveBeenCalled();
     expect(screen.getByText('1 / 2')).toBeTruthy();
   });
 
@@ -218,14 +213,5 @@ describe('a refused verdict is explained in the operator’s words', () => {
     await waitFor(() => expect(screen.getByText(/Could not snooze — too fast — try again in 4s\./)).toBeTruthy());
     // A refused verdict must not advance — the thread has not been triaged.
     expect(screen.getByText('1 / 2')).toBeTruthy();
-  });
-
-  it('reads an unrouted endpoint as a pending restart', async () => {
-    archiveSession.mockRejectedValueOnce({ status: 404, error: 'unknown' });
-    renderTriage([thread(1)]);
-    await userEvent.click(screen.getByRole('button', { name: /E · dismiss/ }));
-    await waitFor(() =>
-      expect(screen.getByText(/Could not dismiss — not active until the next host restart\./)).toBeTruthy(),
-    );
   });
 });

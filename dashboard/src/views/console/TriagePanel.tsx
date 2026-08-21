@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import type { ThreadSummary } from '../../lib/api.js';
 import { actionError } from './action-error.js';
-import { closeThread, setSnoozed } from './actions.js';
+import { setSnoozed } from './actions.js';
 import { ThreadDetail } from './ThreadDetail.js';
 import { STATE_PRESENTATION } from './thread-state.js';
 
@@ -18,11 +18,16 @@ import { STATE_PRESENTATION } from './thread-state.js';
  * The snapshot row is the fallback for exactly that case: it is the same data,
  * one revalidation stale, not a second source of truth.
  *
- * Three verdict keys, per §11:
+ * Two verdict keys, per §11:
  *
  *   A — answer and advance (focus the composer; the advance follows the send)
  *   S — snooze until it moves
- *   E — dismiss it from the queue
+ *
+ * There used to be a third, E — dismiss it from the queue, which archived
+ * every session on the thread. It is gone: archiving hid the thread without
+ * stopping the agent, so the work kept running unattended. A thread leaves
+ * the queue when it is actually finished, never because an operator triaged
+ * it away.
  *
  * Keyboard rules that are easy to get wrong and are tested:
  *
@@ -34,13 +39,7 @@ import { STATE_PRESENTATION } from './thread-state.js';
  *   snooze the thread.
  */
 
-/**
- * The three verdicts. `dismiss` is the word for what `closeThread` does — it
- * sets `archived_at` and stops nothing, so "close" read as "end the work" and
- * was pressed expecting that. The `E` binding and the archive call are both
- * unchanged; only the word is.
- */
-export type TriageVerdict = 'answer' | 'snooze' | 'dismiss';
+export type TriageVerdict = 'answer' | 'snooze';
 
 export interface TriagePanelProps {
   /** The filtered queue, frozen at entry. Order is fixed for the pass. */
@@ -106,10 +105,9 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
       }
       setBusy(true);
       try {
-        if (kind === 'snooze') await setSnoozed(thread.thread_id, true);
-        else await closeThread(thread);
+        await setSnoozed(thread.thread_id, true);
         onChanged();
-        advance(kind === 'snooze' ? 'Snoozed until it moves.' : 'Dismissed — out of your queue.');
+        advance('Snoozed until it moves.');
       } catch (err) {
         setAnnouncement(`Could not ${kind} — ${actionError(err)}.`);
       } finally {
@@ -131,9 +129,9 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
       }
       if (isTypingTarget(e.target)) return;
       const key = e.key.toLowerCase();
-      if (key === 'a' || key === 's' || key === 'e') {
+      if (key === 'a' || key === 's') {
         e.preventDefault();
-        void verdict(key === 'a' ? 'answer' : key === 's' ? 'snooze' : 'dismiss');
+        void verdict(key === 'a' ? 'answer' : 'snooze');
         return;
       }
       if (key === 'arrowdown' || key === 'arrowright') {
@@ -173,7 +171,7 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
           ))}
         </span>
         <span className="ncc-spacer" />
-        <span className="ncc-triage-keys ncc-mono">A answer · S snooze · E dismiss · Esc exit</span>
+        <span className="ncc-triage-keys ncc-mono">A answer · S snooze · Esc exit</span>
         <button type="button" className="ncc-solid-btn" onClick={onExit}>
           exit
         </button>
@@ -185,15 +183,6 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
         </button>
         <button type="button" className="ncc-verb" disabled={!thread || busy} onClick={() => void verdict('snooze')}>
           S · snooze
-        </button>
-        <button
-          type="button"
-          className="ncc-verb"
-          title="Removes the thread from your queue. The agent is not stopped and its work continues."
-          disabled={!thread || busy}
-          onClick={() => void verdict('dismiss')}
-        >
-          E · dismiss
         </button>
         {presentation && <span className={`ncc-state ${presentation.tone}`}>{presentation.label}</span>}
       </div>

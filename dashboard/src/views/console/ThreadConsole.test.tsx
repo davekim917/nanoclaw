@@ -17,7 +17,6 @@ const listThreads = vi.fn();
 const listGroups = vi.fn();
 const listWorkgroups = vi.fn();
 const getThreadDetail = vi.fn();
-const archiveSession = vi.fn().mockResolvedValue({});
 const snoozeThread = vi.fn().mockResolvedValue({});
 const unsnoozeThread = vi.fn().mockResolvedValue({});
 const postThreadMessage = vi.fn().mockResolvedValue({ created_session: false, handoff: null });
@@ -26,7 +25,6 @@ vi.mock('../../lib/api.js', () => ({
   listGroups,
   listWorkgroups,
   getThreadDetail,
-  archiveSession,
   snoozeThread,
   unsnoozeThread,
   postThreadMessage,
@@ -109,14 +107,21 @@ describe('the queue', () => {
     expect(order).toEqual(['needs_you', 'running', 'idle']);
   });
 
-  it('announces the attention count politely', async () => {
+  /**
+   * The top bar's "Needs you N" chip is gone (item 2) — its `aria-live`
+   * moved onto the sidebar's own "Needs you" lane count, its only home now.
+   */
+  it('announces the needs-you lane count politely, on the sidebar', async () => {
     listThreads.mockResolvedValue({
       threads: [thread('a', { state: 'needs_you' }), thread('b', { state: 'stalled' }), thread('c')],
     });
     const { container } = mount();
-    const chip = container.querySelector('.ncc-attn-chip')!;
-    expect(chip.getAttribute('aria-live')).toBe('polite');
-    await waitFor(() => expect(chip.textContent).toContain('2'));
+    const needsYou = within(container.querySelector('.ncc-side') as HTMLElement).getByRole('button', {
+      name: /^Needs you/,
+    });
+    const count = needsYou.querySelector('.n')!;
+    expect(count.getAttribute('aria-live')).toBe('polite');
+    await waitFor(() => expect(count.textContent).toBe('1'));
   });
 
   it('filters to one lane and back', async () => {
@@ -200,7 +205,10 @@ describe('empty states', () => {
     await waitFor(() => expect(container.querySelector('.ncc-list-pane .ncc-empty')).toBeTruthy());
     expect(container.querySelector('.ncc-list-pane .ncc-empty')!.textContent).toContain('no threads');
     expect(container.querySelector('.ncc-detail .ncc-empty')!.textContent).toContain('select a thread');
-    expect(container.querySelector('.ncc-attn-chip')!.textContent).toContain('0');
+    const needsYou = within(container.querySelector('.ncc-side') as HTMLElement).getByRole('button', {
+      name: /^Needs you/,
+    });
+    expect(needsYou.textContent).toContain('0');
     expect(container.querySelectorAll('.ncc-side-item.channel')).toHaveLength(0);
     expect(getThreadDetail).not.toHaveBeenCalled();
   });
@@ -335,13 +343,13 @@ describe('lastMessagePreview', () => {
  * snooze lane that keeps snoozed work reachable, and triage as a mode entered
  * FROM the list (§11) that hands the list back exactly as it was.
  */
-describe('the ONE action, and the two that are not messages', () => {
+describe('the ONE action, and the one that is not a message', () => {
   /**
    * Every state's verb opens the composer on the thread. `idle` is in here on
    * purpose — it used to be the one row with no button at all, and `stalled`
    * used to render an inert `Kill`. Both are gone.
    */
-  it.each(['needs_you', 'stalled', 'unassigned', 'running', 'parked', 'done', 'idle'] as ThreadState[])(
+  it.each(['needs_you', 'stalled', 'unassigned', 'running', 'parked', 'idle'] as ThreadState[])(
     '%s: the verb focuses the composer rather than sending blind',
     async (state) => {
       const user = userEvent.setup();
@@ -353,7 +361,6 @@ describe('the ONE action, and the two that are not messages', () => {
       await user.click(verb);
       await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Message text')));
       expect(postThreadMessage).not.toHaveBeenCalled();
-      expect(archiveSession).not.toHaveBeenCalled();
     },
   );
 
@@ -366,26 +373,19 @@ describe('the ONE action, and the two that are not messages', () => {
     expect(container.textContent!.toLowerCase()).not.toContain('kill');
   });
 
-  /** Dismiss is not a verb on the row any more — it is one of the two
-      non-message actions, and it lives on the detail pane beside snooze.
-      It is DISMISS rather than close because it only sets `archived_at`: the
-      container keeps running and the inbound queue is untouched. */
-  it('Dismiss archives every session on the thread, from the detail pane', async () => {
+  /**
+   * Close/Dismiss is gone entirely — archiving hid a thread from the queue
+   * without stopping the agent inside it, so the work kept running
+   * unattended. The detail pane now offers only snooze.
+   */
+  it('the detail pane offers no close/dismiss action', async () => {
     const user = userEvent.setup();
-    listThreads.mockResolvedValue({ threads: [thread('t-done', { state: 'done', session_ids: ['s-x', 's-y'] })] });
+    listThreads.mockResolvedValue({ threads: [thread('t-idle', { state: 'idle', session_ids: ['s-x', 's-y'] })] });
     const { container } = mount();
     await waitFor(() => expect(container.querySelector('.ncc-row-main')).toBeTruthy());
     await user.click(container.querySelector('.ncc-row-main') as HTMLElement);
-    const dismiss = await screen.findByRole('button', { name: 'dismiss' });
-    // The word alone would leave "does this stop the agent?" unanswered, which
-    // is the question that got `close` pressed by mistake.
-    expect(dismiss.getAttribute('title')).toBe(
-      'Removes the thread from your queue. The agent is not stopped and its work continues.',
-    );
-    expect(screen.queryByRole('button', { name: 'close' })).toBeNull();
-    await user.click(dismiss);
-    await waitFor(() => expect(archiveSession).toHaveBeenCalledTimes(2));
-    expect(archiveSession.mock.calls.map((c) => c[0])).toEqual(['s-x', 's-y']);
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'snooze' })).toBeTruthy());
+    expect(screen.queryByRole('button', { name: /close|dismiss/i })).toBeNull();
   });
 });
 
@@ -412,13 +412,14 @@ describe('snooze', () => {
   });
 });
 
-/** Triage is reachable from the top bar AND from §8's bottom bar, so a query
- *  for "triage" alone is ambiguous. These name the top bar's. */
-const topTriage = (c: HTMLElement) =>
-  within(c.querySelector('.ncc-top') as HTMLElement).getByRole('button', { name: /triage/i });
+/** Triage is reachable from the nav (item 2 moved it out of the top bar) AND
+ *  from §8's bottom bar, so a query for "triage" alone is ambiguous. These
+ *  name the nav's — the same `<nav>` desktop and the mobile sheet share. */
+const navTriage = (c: HTMLElement) =>
+  within(c.querySelector('.ncc-side') as HTMLElement).getByRole('button', { name: /triage/i });
 
 describe('triage is a mode over the filtered list (§11)', () => {
-  it('is entered from the top bar and covers exactly the filtered rows', async () => {
+  it('is entered from the nav and covers exactly the filtered rows', async () => {
     const user = userEvent.setup();
     listThreads.mockResolvedValue({
       threads: [thread('t-1'), thread('t-2', { state: 'needs_you' }), thread('t-3')],
@@ -429,7 +430,7 @@ describe('triage is a mode over the filtered list (§11)', () => {
     // Filter first — triage must take the FILTERED set, not the whole queue.
     await user.click(within(container.querySelector('.ncc-side') as HTMLElement).getByText('Needs you'));
     await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
-    await user.click(topTriage(container));
+    await user.click(navTriage(container));
     expect(screen.getByLabelText('Triage')).toBeTruthy();
     expect(screen.getByText('1 / 1')).toBeTruthy();
   });
@@ -439,7 +440,7 @@ describe('triage is a mode over the filtered list (§11)', () => {
     listThreads.mockResolvedValue({ threads: [thread('t-1')] });
     const { container } = mount();
     await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
-    await user.click(topTriage(container));
+    await user.click(navTriage(container));
     screen.getByLabelText('Triage').focus();
     await user.keyboard('{Escape}');
     await waitFor(() => expect(screen.queryByLabelText('Triage')).toBeNull());
@@ -631,21 +632,23 @@ describe('the primary filter axis is the workgroup', () => {
  * it applies at is CSS, and `console-mobile.test.ts` reads that.
  */
 describe('every sidebar control stays reachable on a phone (§8)', () => {
-  it('raises the SAME nav as a sheet — lanes, channels and lenses included', async () => {
+  it('raises the SAME nav as a sheet — lanes, channels, Schedule and the theme toggle included', async () => {
     const user = userEvent.setup();
     listThreads.mockResolvedValue({ threads: [thread('t-1'), thread('t-2', { state: 'needs_you' })] });
     const { container } = mount();
     await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(2));
 
     const shell = container.querySelector('.ncc') as HTMLElement;
-    const filters = screen.getByRole('button', { name: /filters/i });
+    // Item 2: the bottom bar's old Filters tab is gone; the header's hamburger
+    // raises the same sheet now.
+    const hamburger = screen.getByRole('button', { name: /navigation/i });
     expect(shell.dataset['nav']).toBe('closed');
-    expect(filters.getAttribute('aria-expanded')).toBe('false');
-    expect(filters.getAttribute('aria-controls')).toBe('ncc-side');
+    expect(hamburger.getAttribute('aria-expanded')).toBe('false');
+    expect(hamburger.getAttribute('aria-controls')).toBe('ncc-side');
 
-    await user.click(filters);
+    await user.click(hamburger);
     expect(shell.dataset['nav']).toBe('open');
-    expect(filters.getAttribute('aria-expanded')).toBe('true');
+    expect(hamburger.getAttribute('aria-expanded')).toBe('true');
 
     // ONE nav, not a mobile-only copy of it — §12's "a row is a row wherever it
     // is drawn", applied to the sidebar.
@@ -655,6 +658,8 @@ describe('every sidebar control stays reachable on a phone (§8)', () => {
     expect(side.getByText('Needs you')).toBeTruthy(); // a queue lane
     expect(side.getByText('#example-eng')).toBeTruthy(); // a channel
     expect(side.getByText('Schedule')).toBeTruthy(); // a lens
+    // Item 2: the theme toggle moved to the nav's footer — same sheet, one copy.
+    expect(side.getByRole('button', { name: /Colour theme/ })).toBeTruthy();
 
     // And it still filters from inside the sheet, which then gets out of the way.
     await user.click(side.getByText('Needs you'));
@@ -662,15 +667,17 @@ describe('every sidebar control stays reachable on a phone (§8)', () => {
     expect(shell.dataset['nav']).toBe('closed');
   });
 
-  it('carries four destinations, each with its own icon', async () => {
+  // Item 2: Filters is gone from the bottom bar — the header's hamburger
+  // raises the sheet now — so this is down to three destinations.
+  it('carries three destinations, each with its own icon', async () => {
     listThreads.mockResolvedValue({ threads: [thread('t-1')] });
     const { container } = mount();
     await waitFor(() => expect(container.querySelector('.ncc-row')).toBeTruthy());
     const items = Array.from(container.querySelectorAll('.ncc-bottom .ncc-bottom-item'));
-    expect(items.map((i) => i.textContent)).toEqual(['Queue', 'Filters', 'Schedule', 'Triage']);
+    expect(items.map((i) => i.textContent)).toEqual(['Queue', 'Schedule', 'Triage']);
     const icons = items.map((i) => i.querySelector('svg')?.innerHTML ?? '');
     expect(icons.every((h) => h.length > 0)).toBe(true);
-    expect(new Set(icons).size).toBe(4);
+    expect(new Set(icons).size).toBe(3);
   });
 
   it('treats opening a thread as a navigation, with a way back to the queue', async () => {
@@ -705,5 +712,68 @@ describe('every sidebar control stays reachable on a phone (§8)', () => {
     });
     await waitFor(() => expect(shell.dataset['pane']).toBe('list'));
     location.hash = '';
+  });
+});
+
+/**
+ * Item 4 — the Schedule lens used to be a trap: once open, clicking a
+ * different channel or lane in the (still-visible) nav changed `lane` /
+ * `channel` state that nothing on screen reflected, because the render branch
+ * kept drawing `<ScheduleLens>` regardless. The only way out was a "Threads"
+ * entry under a "LENSES" heading, which is deleted (item 4's second half) —
+ * so picking ANY queue filter now has to be the way back, or there is none on
+ * desktop at all.
+ */
+describe('choosing a filter while Schedule is open returns to the queue (item 4)', () => {
+  it('snaps back to the queue and applies the channel that was picked', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({
+      threads: [
+        thread('t-1', { channel_key: 'slack:COPS', channel_name: '#ops' }),
+        thread('t-2', { channel_key: 'slack:CENG', channel_name: '#eng' }),
+      ],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(2));
+
+    await user.click(within(container.querySelector('.ncc-side') as HTMLElement).getByText('Schedule'));
+    await waitFor(() => expect(screen.getByLabelText('Scheduled work')).toBeTruthy());
+    expect(container.querySelector('.ncc-list-pane[aria-label="Threads"]')).toBeNull();
+
+    // The nav stays on screen while Schedule is open — that is the whole bug.
+    // Picking a channel from it must both leave Schedule AND land on that
+    // channel, not one without the other.
+    await user.click(within(container.querySelector('.ncc-side') as HTMLElement).getByText('#ops'));
+    await waitFor(() => expect(screen.queryByLabelText('Scheduled work')).toBeNull());
+    expect(container.querySelector('.ncc-list-pane[aria-label="Threads"]')).toBeTruthy();
+    expect(threadIds(container)).toEqual(['t-1']);
+  });
+
+  it('a lane tap returns to the queue too, not only a channel tap', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({ threads: [thread('t-1', { state: 'needs_you' }), thread('t-2')] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(2));
+
+    await user.click(within(container.querySelector('.ncc-side') as HTMLElement).getByText('Schedule'));
+    await waitFor(() => expect(screen.getByLabelText('Scheduled work')).toBeTruthy());
+
+    await user.click(within(container.querySelector('.ncc-side') as HTMLElement).getByText('Needs you'));
+    await waitFor(() => expect(screen.queryByLabelText('Scheduled work')).toBeNull());
+    expect(threadIds(container)).toEqual(['t-1']);
+  });
+
+  it('entering Triage from the nav while Schedule is open returns to the queue first', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({ threads: [thread('t-1')] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+
+    await user.click(within(container.querySelector('.ncc-side') as HTMLElement).getByText('Schedule'));
+    await waitFor(() => expect(screen.getByLabelText('Scheduled work')).toBeTruthy());
+
+    await user.click(navTriage(container));
+    await waitFor(() => expect(screen.queryByLabelText('Scheduled work')).toBeNull());
+    expect(screen.getByLabelText('Triage')).toBeTruthy();
   });
 });

@@ -394,16 +394,55 @@ export function ReplyComposer({
               ? 'this opens its queue on the thread'
               : 'only this agent receives it'}
         </span>
-      </div>
 
-      {/* Chips set the box and nothing else — the send is still the operator
-          reading what is about to go out. See ship-prefill.ts. */}
-      <div className="ncc-composer-chips" role="group" aria-label="One-tap answers">
-        {chips.map((c) => (
-          <button key={c.label} type="button" className="ncc-chip" data-chip={c.label} disabled={busy} onClick={() => tap(c)}>
-            {c.label}
-          </button>
-        ))}
+        {/*
+         * The quick replies (item 3). Both controls below act on the same
+         * `tap`, so there is one mechanism, two presentations, and CSS picks
+         * which is on screen — never a JS breakpoint branch (matches the nav
+         * sheet's own rule). NESTED here, inside the target row, rather than
+         * a sibling below it: that is what puts them on the SAME row as the
+         * agent selector on desktop, and what leaves the mobile row with no
+         * dedicated row of its own to occupy.
+         *
+         * Chips set the box and nothing else — the send is still the operator
+         * reading what is about to go out. See ship-prefill.ts.
+         */}
+        <div className="ncc-composer-chips" role="group" aria-label="One-tap answers">
+          {chips.map((c) => (
+            <button
+              key={c.label}
+              type="button"
+              className="ncc-chip"
+              data-chip={c.label}
+              disabled={busy}
+              onClick={() => tap(c)}
+            >
+              {c.label}
+            </button>
+          ))}
+        </div>
+        {/* The mobile stand-in: a menu rather than a row of buttons. Its value
+            always resets to the placeholder after a pick, so the SAME reply
+            can be chosen twice in a row — a real "change" event has to fire
+            each time, which only happens if the select visibly returns to
+            "quick reply…" between taps. */}
+        <select
+          className="ncc-select ncc-composer-quickmenu"
+          aria-label="Quick reply"
+          value=""
+          disabled={busy}
+          onChange={(e) => {
+            const chip = chips.find((c) => c.label === e.target.value);
+            if (chip) tap(chip);
+          }}
+        >
+          <option value="">quick reply…</option>
+          {chips.map((c) => (
+            <option key={c.label} value={c.label}>
+              {c.label}
+            </option>
+          ))}
+        </select>
       </div>
 
       <div className="ncc-composer-row">

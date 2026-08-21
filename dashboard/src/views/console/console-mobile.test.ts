@@ -130,8 +130,9 @@ describe('the breakpoint moves controls, it does not delete them (§8)', () => {
     expect(block('.ncc-bottom-item')).toMatch(/min-height:\s*56px/);
     for (const sel of ['.ncc-side-item', '.ncc-row-side .ncc-verb'])
       expect(mobile.body, sel).toMatch(new RegExp(`${sel.replace(/[.\s]/g, '\\$&')}\\s*\\{[^}]*min-height:\\s*44px`));
-    // The chrome's own controls are 28px at desktop density.
-    expect(mobile.body).toMatch(/\.ncc-attn-chip\s*\{\s*min-height:\s*44px/);
+    // The chrome's own controls are 28px at desktop density — the hamburger
+    // (item 2's Filters replacement) joins the same group.
+    expect(mobile.body).toMatch(/\.ncc-select,[\s\S]*?\.ncc-hamburger\s*\{\s*min-height:\s*44px/);
   });
 
   it('collapses the row to §8 — 24px faces, two-line title, channel · age', () => {
@@ -147,5 +148,18 @@ describe('the breakpoint moves controls, it does not delete them (§8)', () => {
   it('wraps the top bar rather than letting the page scroll sideways', () => {
     expect(mobile.body).toMatch(/\.ncc-top\s*\{[^}]*flex-wrap:\s*wrap/);
     expect(mobile.body).toMatch(/\.ncc-search\s*\{[^}]*width:\s*auto/);
+    // Item 1: the hamburger appears and the brand drops, so the workgroup
+    // selector — DESIGN §3.5's primary filter axis — always has room.
+    expect(mobile.body).toMatch(/\.ncc-hamburger\s*\{\s*display:\s*inline-flex/);
+    expect(mobile.body).toMatch(/\.ncc-brand\s*\{\s*display:\s*none/);
+  });
+
+  it('swaps the quick-reply row for a dropdown, so it costs no row of its own (item 3)', () => {
+    expect(mobile.body).toMatch(/\.ncc-composer-chips\s*\{\s*display:\s*none/);
+    expect(mobile.body).toMatch(/\.ncc-composer-quickmenu\s*\{\s*display:\s*inline-flex/);
+    // And the desktop default is the reverse — both are always in the DOM
+    // (ThreadDetail.tsx), only the breakpoint decides which is on screen.
+    expect(block('.ncc-composer-chips')).toMatch(/display:\s*flex/);
+    expect(block('.ncc-composer-quickmenu')).toMatch(/display:\s*none/);
   });
 });
