@@ -1015,3 +1015,42 @@ ordering, not a wedge.
 split the helper's ambiguous error message so empty-stdin and oversized-request are
 distinguishable in logs, and attach an `error` listener to the child's stdin in
 `invokeHelper`.
+
+## Timeout fix verified; validation poison loop found and fixed (2026-08-21)
+
+**The timeout fix works.** Zero `exit 143` failures since the restart that deployed it
+(previously 100). Consolidation calls now run to completion.
+
+**Completion exposed the next blocker, and it was a contract defect, not a bug.** The
+first completed call returned one topic file over the 8,192-byte ceiling.
+`validateConsolidationFiles` threw, `runMaintenanceJob` failed the whole pass, nothing
+was marked consolidated, and a 6-hour backoff was booked — after which the identical
+tail would be re-presented to the same model, producing the identical oversized file,
+forever. Zero progress at one wasted model call per six hours, permanently.
+
+Fail-whole-pass is right for a **transport** failure (CAS conflict, lost lease,
+malformed payload) where a retry can succeed. It is wrong for a **deterministic
+validation** failure where a retry cannot. The plan drew no such distinction, and lead
+review approved it: this exact poison-loop shape was predicted in-session before the
+timeout diagnosis arrived, and was not acted on once the diagnosis pointed elsewhere.
+
+**Fix.** `validateConsolidationFiles` now partitions into `{accepted, rejected}`:
+per-file path/size violations are rejections; over-count accepts the first twelve in
+order and rejects the remainder; structural/protocol violations (payload not an object,
+`files` not an array) still throw. `runMaintenanceJob` writes the accepted files, logs
+every rejection at WARN with path, reason and byte size, marks the tail consolidated,
+and reports `fileCount` plus a new `rejectedCount`. The locked-path check deliberately
+stays a hard throw — a model writing to a path it was told is read-only is a protocol
+violation, not an unrepresentable tail. The prompt now states the per-file ceiling and
+that an oversized file is discarded entirely.
+
+**Accepted trade, recorded deliberately.** An entity whose view is persistently too
+large is dropped rather than deadlocking its whole workgroup. Its facts remain in the
+ledger and stay recallable through the ordinary lanes; the WARN names the path so the
+loss is visible and measurable rather than silent. The 8,192-byte cap was NOT raised to
+paper over this — short dense files are what the ~900-char excerpt window can actually
+deliver. If logs show one entity dropping repeatedly, that is the signal to revisit.
+
+`plan.md` §P2.6 P2-AC4 amended accordingly; its original assertion is quoted there so
+the change of contract is legible rather than silent. Full host suite green (289 files,
+4,257 tests).
