@@ -217,6 +217,69 @@ describe('prefill chips set the box and nothing else', () => {
   });
 });
 
+/**
+ * Item 3 — mobile density. The three 44px chip buttons cost a whole row on a
+ * phone, so a compact dropdown does the same job (CSS decides which of the
+ * two is on screen; both are always in the DOM — see console.css). This binds
+ * the mechanism: every chip is reachable through it, it never sends, and it
+ * can fire the SAME reply twice in a row.
+ */
+describe('the quick replies are also reachable through a compact dropdown (item 3)', () => {
+  it('offers every chip, and picking one sets the box without sending', async () => {
+    const user = userEvent.setup();
+    renderDetail(thread());
+    const menu = (await screen.findByRole('combobox', { name: 'Quick reply' })) as HTMLSelectElement;
+    expect(Array.from(menu.options).map((o) => o.textContent)).toEqual([
+      'quick reply…',
+      'approve as proposed',
+      'hold — need more info',
+      'no — …',
+    ]);
+    await user.selectOptions(menu, 'no — …');
+    expect((screen.getByLabelText('Message text') as HTMLTextAreaElement).value).toBe('no — ');
+    expect(postThreadMessage).not.toHaveBeenCalled();
+  });
+
+  it('resets to the placeholder so the SAME reply can be picked again', async () => {
+    const user = userEvent.setup();
+    renderDetail(thread());
+    const menu = (await screen.findByRole('combobox', { name: 'Quick reply' })) as HTMLSelectElement;
+    await user.selectOptions(menu, 'approve as proposed');
+    expect(menu.value).toBe('');
+
+    await user.type(screen.getByLabelText('Message text'), ' — actually');
+    await user.selectOptions(menu, 'approve as proposed');
+    expect((screen.getByLabelText('Message text') as HTMLTextAreaElement).value).toBe('approve as proposed');
+  });
+
+  it('presets the addressee for a ship chip too, same as the button', async () => {
+    const user = userEvent.setup();
+    renderDetail(thread(), { nextAction: 'kit records @charlie ship 869; a human presses the merge' });
+    const menu = await screen.findByRole('combobox', { name: 'Quick reply' });
+    await user.selectOptions(menu, '@charlie ship 869');
+    expect((screen.getByLabelText('Message text') as HTMLTextAreaElement).value).toBe('@charlie ship 869');
+    expect((await target()).value).toBe('ag-3');
+  });
+});
+
+/**
+ * Item 3 — desktop density. The chips sit in the SAME row as the agent
+ * selector now (nested inside `.ncc-composer-target`), rather than a sibling
+ * row below it — the merge is what console-mobile.test.ts's CSS assertions
+ * assume, and this pins the actual markup they assume it on.
+ */
+describe('the chip group sits in the composer-target row, not a row of its own (item 3)', () => {
+  it('nests the chip group inside the same row as "Send to"', async () => {
+    const { container } = renderDetail(thread());
+    await target();
+    const targetRow = container.querySelector('.ncc-composer-target')!;
+    expect(targetRow.querySelector('.ncc-composer-chips')).toBeTruthy();
+    expect(targetRow.querySelector('.ncc-composer-quickmenu')).toBeTruthy();
+    // Not a sibling of `.ncc-composer-target` — that would be a row of its own.
+    expect(container.querySelector('.ncc-composer > .ncc-composer-chips')).toBeNull();
+  });
+});
+
 describe('message text renders as formatted markdown', () => {
   const withText = (text: string) =>
     getThreadDetail.mockResolvedValue({

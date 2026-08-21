@@ -175,8 +175,26 @@
   font-weight: 700;
   letter-spacing: -0.01em;
   color: var(--ncc-ink);
+  white-space: nowrap;
 }
 .ncc-spacer { flex-grow: 1; }
+
+/* Mobile-only (§8 breakpoint below) — opens the same `.ncc-side` sheet the
+   bottom bar's Filters tab used to raise. Hidden on desktop, where the
+   sidebar is already on screen. */
+.ncc-hamburger {
+  display: none;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  min-height: 28px;
+  background: transparent;
+  border: 1px solid var(--ncc-border);
+  border-radius: 0;
+  color: var(--ncc-ink);
+  cursor: pointer;
+}
 
 .ncc-select,
 .ncc-search {
@@ -206,23 +224,6 @@
   padding: 5px 10px;
   min-height: 28px;
   cursor: pointer;
-}
-
-/* §7.2's filled-accent chip. `--ncc-on-accent` is white in light (6.16:1) and
-   near-black in dark, where white would be 2.88:1 — that flip is the rule. */
-.ncc-attn-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-family: var(--ncc-font-mono);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  color: var(--ncc-on-accent);
-  background: var(--ncc-attention);
-  padding: 5px 10px;
-  min-height: 28px;
 }
 
 .ncc-body {
@@ -306,6 +307,22 @@
 }
 .ncc-side-item .n.attention { color: var(--ncc-attention); font-weight: 700; min-width: 0; }
 .ncc-side-item .n.live { color: var(--ncc-live); font-weight: 600; }
+/* Triage, disabled on an empty queue or while already open — same reading as
+   the row verb's disabled state (§4, "no row anywhere offers a kill" applies
+   equally here: an entry that cannot succeed says so, it does not vanish). */
+.ncc-side-item:disabled { color: var(--ncc-muted); cursor: not-allowed; }
+
+/* The nav's footer item — the theme toggle, item 2's move out of the top bar.
+   `margin-top: auto` pins it to the bottom of `.ncc-side`'s column flex
+   whether that is the desktop sidebar or the mobile sheet; the same element
+   either way, per §12. */
+.ncc-side-foot {
+  margin-top: auto;
+  flex-shrink: 0;
+  padding: 10px 14px 0;
+  border-top: 1px solid var(--ncc-border);
+}
+.ncc-side-foot .ncc-solid-btn { width: 100%; }
 
 /* ── List pane ─────────────────────────────────────────────────────────── */
 
@@ -725,8 +742,13 @@
 
 /* Prefill chips. A chip SETS the box — it never sends — so it reads as an
    outline, not as the filled send button beside it. 44px because a chip is a
-   real tap target and there is no smaller variant of "the operator meant it". */
-.ncc-composer-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+   real tap target and there is no smaller variant of "the operator meant it".
+   Nested INSIDE `.ncc-composer-target` now (item 3) rather than a sibling row
+   below it, which is what puts it on the SAME row as the agent selector on
+   desktop — no margin of its own, `.ncc-composer-target`'s own `gap` spaces it
+   from the selector and its `flex-wrap` is what lets a narrow width fold it
+   onto its own line without a dedicated element making that decision. */
+.ncc-composer-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .ncc-chip {
   font-family: var(--ncc-font-sans);
   font-size: 12px;
@@ -740,6 +762,14 @@
 }
 .ncc-chip:hover { border-color: var(--ncc-solid); }
 .ncc-chip:disabled { color: var(--ncc-muted); cursor: not-allowed; }
+
+/* The mobile stand-in for the chip row (item 3): one compact `<select>`
+   instead of three 44px buttons, so the quick replies occupy no row of their
+   own on a phone. Hidden by default; the §8 breakpoint below flips which of
+   the two is shown. Both are always in the DOM — see the mobile block's own
+   note on why that beats a `matchMedia` branch. */
+.ncc-composer-quickmenu { display: none; }
+
 .ncc-composer-row { display: flex; align-items: flex-end; gap: 8px; }
 .ncc-composer-box {
   flex-grow: 1;
@@ -939,9 +969,11 @@
   .ncc[data-pane='list'] .ncc-detail-wrap { visibility: hidden; }
   .ncc-back { display: inline-flex; }
 
-  /* The sidebar becomes a sheet over the queue, opened from the bottom bar.
-     Same `<nav>`, same lane / channel / lens controls, same state — only where
-     it sits changes, so there is exactly one of each control in the DOM. */
+  /* The sidebar becomes a sheet over the queue, opened from the header's
+     hamburger button (item 2 moved this off the bottom bar's old Filters
+     tab). Same `<nav>`, same lane / channel / lens controls, same theme
+     toggle footer, same state — only where it sits changes, so there is
+     exactly one of each control in the DOM. */
   .ncc-side {
     position: absolute;
     left: 0;
@@ -961,13 +993,25 @@
   .ncc-bottom { display: flex; }
 
   /* The chrome wraps rather than overflowing — a horizontal page scroll is
-     never an acceptable answer at 390px. */
+     never an acceptable answer at 390px. In practice this single row (item 1)
+     fits without wrapping at 390px; the rule stays as the safety net for
+     anything narrower. */
   .ncc-top { flex-wrap: wrap; padding: 7px 12px; }
+  .ncc-hamburger { display: inline-flex; }
+  /* The label may drop before the workgroup selector does — that selector is
+     DESIGN §3.5's primary filter axis and must always stay visible; the brand
+     is decoration a phone has no room for once the hamburger is on screen. */
+  .ncc-brand { display: none; }
   .ncc-select,
   .ncc-search,
   .ncc-solid-btn,
-  .ncc-attn-chip { min-height: 44px; }
+  .ncc-hamburger { min-height: 44px; }
   .ncc-search { width: auto; flex-grow: 1; min-width: 128px; }
+
+  /* Item 3: the quick-reply row becomes a single dropdown instead of three
+     44px buttons, so it occupies no row of its own. */
+  .ncc-composer-chips { display: none; }
+  .ncc-composer-quickmenu { display: inline-flex; }
 
   .ncc-face { --ncc-face-size: 24px; }
   .ncc-row-title { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
