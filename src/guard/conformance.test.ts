@@ -18,6 +18,10 @@ import '../cli/commands/index.js';
 import '../modules/index.js';
 import '../cli/delivery-action.js';
 import '../cli/dispatch.js'; // registers the cli_command approval handler
+// Thread close defines its catalog entry at its own module edge. Imported by
+// name (the leaf guard file, not the handler) so the catalog assertion below
+// covers it without dragging the dashboard's route graph into this test.
+import '../dashboard/thread-close-guard.js';
 
 import { commandGuard, listCommands } from '../cli/registry.js';
 import { getApprovalHandler } from '../modules/approvals/primitive.js';
@@ -50,6 +54,7 @@ describe('guard conformance', () => {
       'self_mod.add_mcp_server',
       'senders.admit',
       'channels.register',
+      'threads.close',
     ]) {
       expect(actions.has(expected), `catalog is missing "${expected}"`).toBe(true);
     }

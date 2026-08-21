@@ -24,6 +24,7 @@ import { messagingGroupsListHandler } from './api/messaging-groups.js';
 import { sessionMessageHandler } from './steer.js';
 import { threadMessageHandler } from './thread-message.js';
 import { threadSnoozeHandler, threadUnsnoozeHandler } from './thread-snooze.js';
+import { threadCloseHandler } from './thread-close.js';
 import { scheduledListHandler, scheduledDetailHandler, scheduledSearchHandler } from './api/scheduled-read.js';
 import { editHandler, pauseHandler, resumeHandler, runNowHandler, cancelHandler } from './api/scheduled-mutations.js';
 import { movePreviewHandler, moveExecuteHandler } from './api/scheduled-move.js';
@@ -80,6 +81,9 @@ export function startDashboard(): void {
   register('POST', '/dashboard/api/threads/:id/message', requireAuth(threadMessageHandler));
   register('POST', '/dashboard/api/threads/:id/snooze', requireAuth(threadSnoozeHandler));
   register('POST', '/dashboard/api/threads/:id/unsnooze', requireAuth(threadUnsnoozeHandler));
+  // The only action that ends work. Guarded (`threads.close`), server-counted
+  // confirmations, and never a hide — see thread-close.ts.
+  register('POST', '/dashboard/api/threads/:id/close', requireAuth(threadCloseHandler));
   register('GET', '/dashboard/api/groups', requireAuth(groupsListHandler));
   register('GET', '/dashboard/api/messaging-groups', requireAuth(messagingGroupsListHandler));
   register('POST', '/dashboard/api/sessions/:id/message', requireAuth(sessionMessageHandler));

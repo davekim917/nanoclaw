@@ -44,6 +44,8 @@ import type { AgentGroup, SessionMode } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
 import { isSnoozed, readThreadSnoozes } from '../thread-snooze.js';
+import { readThreadClosures, type ThreadCloseState } from '../thread-close.js';
+import { requiredConfirmations } from '../thread-close-guard.js';
 import {
   deriveContainerStatus,
   readSessionTranscript,
@@ -313,6 +315,57 @@ export interface ThreadSummary {
    * than reading as an ordinary channel thread.
    */
   scheduled_task: boolean;
+  /**
+   * The agent's own `propose_done` record — "I believe this is finished, and
+   * here is why" — or null.
+   *
+   * **A flag, not a state, and that is a decision.** §5's states are mutually
+   * exclusive lanes describing where the WORK is, and a proposal is orthogonal
+   * to all of them: an agent that proposes closing at the end of a turn is
+   * very often still `running`, because its container has not exited yet.
+   * Minting a `proposes_closing` state would push that row out of `running`
+   * and stop the console reporting live work as live — which is precisely the
+   * failure that got the Dismiss action removed. A proposal rides ALONGSIDE
+   * the state instead, so a row can honestly read "running · proposes
+   * closing".
+   *
+   * **Unreachable except by an actual agent.** Its only source is
+   * `sessions.done_proposal`, which is only ever written by the host sweep
+   * copying the container's own `session_state.done_proposal`, which is only
+   * ever written by the `propose_done` MCP tool. No derivation, no default, no
+   * host-side path can produce one — and it is retracted by `continue_work`
+   * and by the next real user message.
+   *
+   * Mirror-sourced, so it lags a live proposal by up to one sweep interval.
+   * The close path does NOT read this — it re-reads the container's own copy
+   * for the one thread it is acting on (`thread-close.ts`).
+   */
+  done_proposal: ThreadDoneProposal | null;
+  /**
+   * An operator-confirmed close is in flight: the wrap-up request has gone to
+   * the agents and the sequence is waiting on them, or finalizing. Not a §5
+   * state either — the work is still whatever it was until it stops.
+   */
+  closing: boolean;
+  /**
+   * How many explicit operator confirmations a close of THIS thread needs
+   * right now — 1 when an agent has proposed, 2 when none has.
+   *
+   * On the wire so the console can label the button honestly before the
+   * operator commits to anything. It is NOT the authority: the server counts
+   * confirmations again in the `threads.close` guard, so a client that renders
+   * one button where two are required gets a 409, never a close.
+   */
+  close_confirmations_required: 1 | 2;
+}
+
+/** {@link ThreadSummary.done_proposal} — the proposal plus who made it. */
+export interface ThreadDoneProposal {
+  reason: string;
+  /** ISO-8601 UTC, as the agent wrote it. */
+  proposed_at: string;
+  agent_group_id: string;
+  session_id: string;
 }
 
 /**
@@ -355,6 +408,8 @@ interface ThreadSessionRow {
   last_outbound_kind: string | null;
   archived_at: string | null;
   created_at: string;
+  /** Mirror of the container's `session_state.done_proposal` — see {@link ThreadSummary.done_proposal}. */
+  done_proposal: string | null;
   attached_task_status: string | null;
   attached_task_needs_input: number | null;
 }
@@ -431,7 +486,7 @@ function selectScopedSessions(
   const sql = `
     SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id, s.agent_provider,
            s.title, s.title_generated_at, s.last_active, s.last_outbound_at, s.last_outbound_kind,
-           s.archived_at, s.created_at,
+           s.archived_at, s.created_at, s.done_proposal,
            t.status      AS attached_task_status,
            t.needs_input AS attached_task_needs_input
       FROM sessions s
@@ -924,6 +979,41 @@ function sessionNeedsOperator(row: ThreadSessionRow): boolean {
 }
 
 /**
+ * The thread's standing close proposal — the freshest one across its sessions.
+ *
+ * Pure and exported so the "only an agent can produce this" rule is directly
+ * testable: the ONLY input is the mirrored `done_proposal` column, an
+ * unparseable or empty value yields null rather than a default, and there is
+ * no branch that constructs one from anything else. A thread with six agents
+ * on it needs one answer, and the newest statement is the current one.
+ */
+export function pickDoneProposal(ordered: ThreadSessionRow[]): ThreadDoneProposal | null {
+  let best: ThreadDoneProposal | null = null;
+  let bestAt = -Infinity;
+  for (const row of ordered) {
+    if (!row.done_proposal) continue;
+    let parsed: { reason?: unknown; proposed_at?: unknown };
+    try {
+      parsed = JSON.parse(row.done_proposal) as { reason?: unknown; proposed_at?: unknown };
+    } catch {
+      continue;
+    }
+    if (typeof parsed.reason !== 'string' || parsed.reason.trim() === '') continue;
+    if (typeof parsed.proposed_at !== 'string') continue;
+    const at = parseUtcTimestampMs(parsed.proposed_at);
+    if (at === null || at <= bestAt) continue;
+    bestAt = at;
+    best = {
+      reason: parsed.reason.trim(),
+      proposed_at: new Date(at).toISOString(),
+      agent_group_id: row.agent_group_id,
+      session_id: row.id,
+    };
+  }
+  return best;
+}
+
+/**
  * Which session a reply to this thread should land in by default (§10.3).
  *
  * Pure and exported because this is the seam the whole action bar hangs off:
@@ -1080,6 +1170,10 @@ export async function buildThreadList(
     ctx.user.id,
     grouped.map((t) => t.threadId),
   );
+  // Same rule: one query for the page's in-flight closes, never one per row.
+  // Fleet-wide (not per-user) — a close is a decision about the WORK, unlike a
+  // snooze, so every operator looking at the row must see that it is closing.
+  const closures: Map<string, ThreadCloseState> = readThreadClosures(grouped.map((t) => t.threadId));
 
   const threads: ThreadSummary[] = grouped.map((thread) => {
     const ordered = [...thread.rows].sort((a, b) => activityMs(b) - activityMs(a));
@@ -1206,6 +1300,8 @@ export async function buildThreadList(
       now,
     });
     const lastActivityAt = isoOrNull(lastActivity);
+    const doneProposal = pickDoneProposal(ordered);
+    const closure = closures.get(thread.threadId);
 
     return {
       thread_id: thread.threadId,
@@ -1228,6 +1324,9 @@ export async function buildThreadList(
       }),
       snoozed: snoozes.has(thread.threadId) && isSnoozed(snoozes.get(thread.threadId), lastActivityAt),
       scheduled_task: isScheduledTaskThread(thread.threadId),
+      done_proposal: doneProposal,
+      closing: closure !== undefined && closure.state !== 'closed',
+      close_confirmations_required: requiredConfirmations(doneProposal !== null),
     };
   });
 
