@@ -1,7 +1,7 @@
 import type { ThreadSummary } from '../../lib/api.js';
 import { AgentAvatar } from '../AgentAvatar.js';
 import { relAge } from '../../lib/derive.js';
-import { STATE_PRESENTATION, elapsed, initials, showsLiveLine, toolLabel } from './thread-state.js';
+import { STATE_PRESENTATION, elapsed, initials, proposalAuthorName, showsLiveLine, toolLabel } from './thread-state.js';
 
 /**
  * One row = one THREAD (DESIGN.md §3.1), never a session.
@@ -67,6 +67,30 @@ const SCHEDULED_PILL_STYLE = {
   border: '1px solid var(--ncc-border)',
 } as const;
 
+/**
+ * The "proposes done" badge (thread-closure contract, item 1). Same shape as
+ * `SCHEDULED_PILL_STYLE` above, for the same reason — a small one-off badge
+ * this file does not need a shared class for — but GREEN (`--ncc-live`), never
+ * `--ncc-secondary`: this is the existing "live"/good-news signal, not a new
+ * third status hue (§7).
+ *
+ * Rendered ALONGSIDE `.ncc-state`, never replacing it (see `ThreadRow` below)
+ * — a proposing agent's container is very often still running, and reporting
+ * live work as anything but running is exactly the failure that got the old
+ * Dismiss action removed.
+ */
+const PROPOSAL_PILL_STYLE = {
+  fontFamily: 'var(--ncc-font-mono)',
+  fontSize: '10.5px',
+  fontWeight: 600,
+  letterSpacing: '0.02em',
+  textTransform: 'uppercase',
+  whiteSpace: 'nowrap',
+  padding: '1px 5px',
+  color: 'var(--ncc-live)',
+  border: '1px solid var(--ncc-live)',
+} as const;
+
 export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelect, onVerb }: ThreadRowProps) {
   const presentation = STATE_PRESENTATION[thread.state];
   const shown = thread.participants.slice(0, MAX_FACES);
@@ -111,6 +135,22 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
               {/* §4: always present, single line, ellipsis. */}
               <span className="ncc-row-title">{thread.title ?? 'Untitled thread'}</span>
 
+              {/*
+               * The proposal's reason, spelled out — not just in the badge's
+               * title tooltip, which a touch screen can never trigger and
+               * 390px is the primary viewport (§8). Rendered whenever there IS
+               * a proposal, regardless of `wantsAttention`: unlike the hybrid
+               * line this costs nothing per row (the proposal already rides on
+               * the list payload — see `ThreadDoneProposal` — no per-session
+               * file open the way a message preview needs).
+               */}
+              {thread.done_proposal && (
+                <span className="ncc-row-proposal" title={thread.done_proposal.reason}>
+                  <span className="who">{proposalAuthorName(thread)} proposes done —</span>{' '}
+                  {thread.done_proposal.reason}
+                </span>
+              )}
+
               {presentation.wantsAttention && preview && (
                 <span className="ncc-row-hybrid">
                   {preview.speaker && <span className="speaker">{preview.speaker}: </span>}
@@ -145,6 +185,16 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
             {thread.scheduled_task && (
               <span className="ncc-scheduled-pill" style={SCHEDULED_PILL_STYLE}>
                 scheduled
+              </span>
+            )}
+            {/* Item 1: ALONGSIDE the state pill below, never replacing it. */}
+            {thread.done_proposal && (
+              <span
+                className="ncc-proposal-pill"
+                style={PROPOSAL_PILL_STYLE}
+                title={`${proposalAuthorName(thread)} proposes done: ${thread.done_proposal.reason}`}
+              >
+                proposes done
               </span>
             )}
             <span className={`ncc-state ${presentation.tone}`}>{presentation.label}</span>

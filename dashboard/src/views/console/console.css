@@ -419,6 +419,20 @@
 .ncc-row-hybrid .speaker { font-weight: 600; color: var(--ncc-secondary); }
 .ncc-row-hybrid .excerpt { color: var(--ncc-muted); }
 
+/* Thread-closure contract, item 1: the proposal's reason, spelled out on the
+   row (not just the badge's title tooltip — 390px is the primary viewport and
+   a touch screen never triggers one). Green, matching the badge and reusing
+   the existing "live" signal rather than a third status hue (§7). */
+.ncc-row-proposal {
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ncc-live);
+}
+.ncc-row-proposal .who { font-weight: 600; }
+
 .ncc-row-livelinerow { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .ncc-row-livedot { flex-shrink: 0; width: 5px; height: 5px; background: var(--ncc-muted); }
 .ncc-row.attention .ncc-row-livedot { background: var(--ncc-attention); }
@@ -697,6 +711,11 @@
 .ncc-detail-actions {
   flex-shrink: 0;
   display: flex;
+  /* `wrap`, not `nowrap`: the close control can grow a Cancel/Confirm pair
+     plus a status line (§ thread-closure contract, item 3), and 390px is the
+     primary viewport (§8) — this is what lets that spill onto its own line
+     instead of forcing a horizontal scroll on the shell. */
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
   padding: 8px 18px 0;
@@ -705,6 +724,21 @@
    go back to. On mobile (§8) the same tap is a navigation and needs its
    return. */
 .ncc-back { display: none; margin-right: auto; }
+
+/* The close control (thread-closure contract, item 2). Its buttons are the
+   same `.ncc-verb` / `.ncc-chip` every other action already uses — no new
+   button style for a destructive-looking action, per §7's "two functional
+   signals only" (there is no third, "danger" hue to spend here). */
+.ncc-close { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ncc-close-status {
+  /* Forces onto its own full-width line whenever the buttons above it do not
+     leave room — never truncated, never a tooltip-only explanation (§8: a
+     touch screen cannot trigger `title`). */
+  flex-basis: 100%;
+  font-family: var(--ncc-font-mono);
+  font-size: 11px;
+  color: var(--ncc-secondary);
+}
 
 /* The notice line every mutating action reports through. Visible AND
    `aria-live`, so the confirmation is not screen-reader-only. */

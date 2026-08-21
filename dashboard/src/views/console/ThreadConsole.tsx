@@ -18,6 +18,7 @@ import { subscribe } from '../../lib/sse.ts';
 import { useWorkgroupFilter } from '../../lib/use-workgroup-filter.js';
 import { actionError } from './action-error.js';
 import { setSnoozed } from './actions.js';
+import { CloseThreadControl } from './CloseControl.js';
 import { ScheduleLens } from './ScheduleLens.js';
 import { ThreadDetail } from './ThreadDetail.js';
 import { ThreadRow, type ThreadPreview } from './ThreadRow.js';
@@ -236,14 +237,19 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
    * The row's ONE verb, and it is one verb for every state now: open the
    * composer on this thread. Answer / Push / Steer / Assign / Hand to… are
    * words, not branches — `STATE_PRESENTATION` picks the word and this picks
-   * nothing. Snooze is the one action that is NOT a message, and it lives on
-   * the detail pane rather than in the queue's verb column.
+   * nothing. Snooze and Close are the two actions that are NOT a message, and
+   * both live on the detail pane rather than in the queue's verb column.
    *
    * There used to be a second non-message action here — Dismiss (formerly
-   * Close), which archived every session on the thread. It is gone: archiving
-   * hid the thread from the queue without stopping the agent, so the work kept
-   * running unattended and unwatched. A thread only leaves the queue when it
-   * is actually finished, not when an operator stops looking at it.
+   * Close), which archived every session on the thread and stopped nothing:
+   * archiving hid the thread from the queue without stopping the agent, so the
+   * work kept running unattended and unwatched. It was removed for that reason,
+   * not brought back — the real `CloseThreadControl` below is a different
+   * thing. It does not hide a thread that is still working; it asks the agent
+   * to wrap up, clears its saved continuation, stops its container, and only
+   * THEN archives it (`src/dashboard/thread-close.ts`). A thread that just gets
+   * hidden from view is exactly the bug this feature fixes, not a shortcut to
+   * bring back.
    */
   const onVerb = useCallback((t: ThreadSummary) => {
     setSelectedId(t.thread_id);
@@ -507,6 +513,13 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
                     <button type="button" className="ncc-verb" onClick={() => onToggleSnooze(selected)}>
                       {selected.snoozed ? 'un-snooze' : 'snooze'}
                     </button>
+                    {/* Close, next to Snooze. The two are independent — see the
+                        note above `onVerb` — so neither gates the other and
+                        `CloseThreadControl` reads only `selected` for its own
+                        state. Keyed on the thread id so switching threads
+                        mid-confirmation resets it rather than carrying an
+                        armed "confirm close" over onto a different thread. */}
+                    <CloseThreadControl key={selected.thread_id} thread={selected} onClosed={() => void mutate()} />
                   </div>
                 )}
                 <ThreadDetail thread={selected} focusComposer={focusComposer} onSent={() => void mutate()} />

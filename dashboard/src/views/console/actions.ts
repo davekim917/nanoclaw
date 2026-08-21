@@ -1,7 +1,14 @@
-import { postThreadMessage, snoozeThread, unsnoozeThread, type ThreadMessageResponse } from '../../lib/api.js';
+import {
+  closeThread as apiCloseThread,
+  postThreadMessage,
+  snoozeThread,
+  unsnoozeThread,
+  type ThreadCloseResponse,
+  type ThreadMessageResponse,
+} from '../../lib/api.js';
 
 /**
- * The console's two actions: one message primitive, plus snooze.
+ * The console's actions: one message primitive, snooze, and close.
  *
  * **There is ONE primitive — send a message to a chosen agent.** Steer, push,
  * ship, assign and reassign are all `sendToAgent`; what differs between them is
@@ -10,9 +17,13 @@ import { postThreadMessage, snoozeThread, unsnoozeThread, type ThreadMessageResp
  * a stalled thread gets a message.
  *
  * There used to be a third action, Close/Dismiss, which archived every session
- * on a thread. It is gone: archiving hides a thread from the queue without
- * stopping the agent inside it, so the work kept running unattended and
- * unwatched. A hide-without-stop action is a blindness switch, not a close.
+ * on a thread and stopped nothing — a hide-without-stop action, not a close.
+ * It was removed for that reason. `closeThread` below is NOT that action come
+ * back: it is a thin pass-through to `POST /dashboard/api/threads/:id/close`
+ * (`src/dashboard/thread-close.ts`), which asks the agent to wrap up, clears
+ * its saved continuation, stops its container, and archives the thread only
+ * once that is true — see `CloseControl.tsx` for the one/two-confirmation UI
+ * this drives.
  *
  * `POST /dashboard/api/threads/:id/message` is that call. It resolves the
  * session (creating one when the agent has never spoken here) and then goes
@@ -57,4 +68,17 @@ export async function sendToAgent(
 /** Snooze — durable, per-user, expires when the thread moves. See thread-snooze.ts. */
 export async function setSnoozed(threadId: string, snoozed: boolean): Promise<void> {
   await (snoozed ? snoozeThread(threadId) : unsnoozeThread(threadId));
+}
+
+/**
+ * Close — the one action that ENDS work instead of sending a message.
+ *
+ * Deliberately a bare pass-through with no local retry/counting logic: the
+ * confirmation count is server-authoritative (`thread-close-guard.ts`), so
+ * this function's only job is to hand the caller's count to the endpoint and
+ * let `CloseControl.tsx` react to whatever comes back — success, or a 409
+ * naming how many confirmations are actually required.
+ */
+export async function closeThread(threadId: string, confirmations: number): Promise<ThreadCloseResponse> {
+  return apiCloseThread(threadId, { confirmations });
 }
