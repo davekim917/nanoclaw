@@ -724,6 +724,13 @@ export interface ThreadSummary {
   reply_target_session_id: string | null;
   /** This operator's own snooze is still in force: the thread has not moved since. */
   snoozed: boolean;
+  /**
+   * A `ncl tasks` execution's own isolated session — never a live channel
+   * thread. Optional (unlike the server's own required field) purely so
+   * fixtures elsewhere in the dashboard that predate this flag do not all need
+   * updating in lockstep; `ThreadRow` treats an absent value as `false`.
+   */
+  scheduled_task?: boolean;
 }
 
 export interface ThreadTranscriptEntry extends SessionTranscriptEntry {

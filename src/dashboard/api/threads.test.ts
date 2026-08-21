@@ -8,6 +8,7 @@ import type { SessionTranscriptEntry } from './sessions.js';
 import {
   buildThreadList,
   deriveThreadState,
+  isScheduledTaskThread,
   mergeThreadTranscript,
   replyTargetSessionId,
   threadChannelKey,
@@ -421,6 +422,312 @@ describe('buildThreadList — grouping', () => {
     const scoped = makeCtx({ no_filter: false, allowed_group_ids: ['ag-1'] });
     const { threads } = await buildThreadList(scoped, LIST_OPTS, deps());
     expect(threads.map((t) => t.session_ids)).toEqual([['s-1']]);
+  });
+});
+
+// ── DEFECT 1 (operator report, 2026-08-20): the fake "tasks" channel + a
+//    synthetic session's recoverable channel ─────────────────────────────────
+
+function insertMessagingGroup(opts: {
+  id: string;
+  platformId: string;
+  name?: string | null;
+  channelType?: string;
+}): void {
+  getDb()
+    .prepare(
+      `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      opts.id,
+      opts.channelType ?? 'slack-test',
+      opts.channelType ?? 'slack-test',
+      opts.platformId,
+      opts.name ?? null,
+      iso(0),
+    );
+}
+
+describe('buildThreadList — synthetic session channel recovery (§3.2 gap, DEFECT 1)', () => {
+  beforeEach(() => {
+    closeDb();
+    setupDb();
+  });
+
+  it('a synthetic (NULL thread_id) session lands in its messaging group channel, not unknown', async () => {
+    seedAgentGroup('ag-1');
+    insertMessagingGroup({ id: 'mg-1', platformId: 'discord:1111:2222', name: 'general' });
+    insertSession({ id: 's-null', agentGroupId: 'ag-1', threadId: null, messagingGroupId: 'mg-1' });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads).toHaveLength(1);
+    expect(threads[0]!.synthetic).toBe(true);
+    // The load-bearing assertion: this FAILS against the prior behavior, which
+    // unconditionally passed `null` to threadChannelKey for every synthetic
+    // thread and always landed on UNKNOWN_CHANNEL_KEY regardless of
+    // messaging_group_id.
+    expect(threads[0]!.channel_key).toBe('discord:1111:2222');
+    expect(threads[0]!.channel_name).toBe('general');
+  });
+
+  it('isScheduledTaskThread: matches the legacy shared session and every per-series session, nothing else', () => {
+    expect(isScheduledTaskThread('system:tasks')).toBe(true);
+    expect(isScheduledTaskThread('system:tasks:example-task-0001')).toBe(true);
+    // No colon after the prefix — a channel that merely starts with the same
+    // letters must never match.
+    expect(isScheduledTaskThread('system:tasksxyz')).toBe(false);
+    expect(isScheduledTaskThread('slack:CTESTCHAN01:1.1')).toBe(false);
+  });
+
+  it('an unanchored system:tasks:<series> thread flags scheduled_task and falls back to the honest "Unrouted tasks" label', async () => {
+    seedAgentGroup('ag-1');
+    // Verified against the live central DB (2026-08-20): a `ncl tasks`
+    // execution's own isolated session never carries a messaging_group_id
+    // (`resolveTaskSession` in session-manager.ts). A task that has never
+    // POSTED (no `task_thread_anchors` row — see the describe block below)
+    // genuinely has no channel to recover into, so it lands in the
+    // `system:tasks` bucket §3.2 already documents — but with an honest label,
+    // not the bare `tasks` that used to read as a peer of real channels.
+    insertSession({ id: 's-task', agentGroupId: 'ag-1', threadId: 'system:tasks:example-task-0001' });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.synthetic).toBe(false);
+    expect(threads[0]!.scheduled_task).toBe(true);
+    expect(threads[0]!.channel_key).toBe('system:tasks');
+    expect(threads[0]!.channel_name).toBe('Unrouted tasks');
+  });
+
+  it('an ordinary channel thread is never flagged scheduled_task', async () => {
+    seedAgentGroup('ag-1');
+    insertSession({ id: 's-1', agentGroupId: 'ag-1', threadId: 'slack:CTESTCHAN01:1.1' });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.scheduled_task).toBe(false);
+  });
+});
+
+// ── DEFECT 1, continued (coordinator follow-up, 2026-08-21): task_thread_anchors ──
+
+function insertTaskAnchor(opts: {
+  sessionId: string;
+  platformId: string;
+  channelType?: string;
+  createdAt: string;
+}): void {
+  getDb()
+    .prepare(
+      `INSERT INTO task_thread_anchors (session_id, channel_type, platform_id, thread_platform_id, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(opts.sessionId, opts.channelType ?? 'slack-test', opts.platformId, 'slack:T1.1', opts.createdAt);
+}
+
+describe('buildThreadList — scheduled tasks resolve to where they actually posted (task_thread_anchors)', () => {
+  beforeEach(() => {
+    closeDb();
+    setupDb();
+  });
+
+  it('an anchored task thread resolves to its real channel and friendly name, not the tasks bucket', async () => {
+    seedAgentGroup('ag-1');
+    insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTDISPATCH1', name: '#example-dispatch' });
+    insertSession({ id: 's-task', agentGroupId: 'ag-1', threadId: 'system:tasks:example-task-0001' });
+    insertTaskAnchor({ sessionId: 's-task', platformId: 'slack:CTESTDISPATCH1', createdAt: iso(60_000) });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    // The load-bearing assertion: against the prior behavior (no anchor
+    // lookup at all) this is `system:tasks` / `Unrouted tasks`, exactly the
+    // fake-channel defect the operator reported.
+    expect(threads[0]!.channel_key).toBe('slack:CTESTDISPATCH1');
+    expect(threads[0]!.channel_name).toBe('#example-dispatch');
+    // The pill survives regardless of which branch resolved the channel —
+    // it is what says "scheduled run", now that the row sits among real
+    // channel threads instead of a segregated fake one.
+    expect(threads[0]!.scheduled_task).toBe(true);
+  });
+
+  it('tie-break: a session re-pointed to a different channel resolves to the MOST RECENT anchor', async () => {
+    seedAgentGroup('ag-1');
+    insertMessagingGroup({ id: 'mg-old', platformId: 'slack:CTESTOLDROOM1', name: '#example-old-room' });
+    insertMessagingGroup({ id: 'mg-new', platformId: 'slack:CTESTNEWROOM2', name: '#example-new-room' });
+    insertSession({ id: 's-task', agentGroupId: 'ag-1', threadId: 'system:tasks:example-task-0002' });
+    // Verified live: a single session can carry two anchor rows because a
+    // recurring series got re-pointed between runs. Inserted out of
+    // chronological order on purpose — the rule keys on `created_at`, not
+    // insertion or row order.
+    insertTaskAnchor({ sessionId: 's-task', platformId: 'slack:CTESTNEWROOM2', createdAt: iso(60_000) });
+    insertTaskAnchor({ sessionId: 's-task', platformId: 'slack:CTESTOLDROOM1', createdAt: iso(600_000) });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.channel_key).toBe('slack:CTESTNEWROOM2');
+    expect(threads[0]!.channel_name).toBe('#example-new-room');
+  });
+
+  it('tie-break across sessions: a thread with two anchored sessions resolves to the more recent one', async () => {
+    // §3.1: nothing in the schema stops two agent groups sharing a series id,
+    // so a task "thread" can in principle carry more than one session even
+    // though today's live data never does. The rule has to be "most recent
+    // anchor across the whole thread", not "the first session's anchor" —
+    // this is the test that pins it against silently reading row order.
+    seedAgentGroup('ag-a');
+    seedAgentGroup('ag-b');
+    insertMessagingGroup({ id: 'mg-a', platformId: 'slack:CTESTROOMA1', name: '#example-room-a' });
+    insertMessagingGroup({ id: 'mg-b', platformId: 'slack:CTESTROOMB2', name: '#example-room-b' });
+    const thread = 'system:tasks:shared-series-0003';
+    insertSession({ id: 's-a', agentGroupId: 'ag-a', threadId: thread });
+    insertSession({ id: 's-b', agentGroupId: 'ag-b', threadId: thread });
+    insertTaskAnchor({ sessionId: 's-a', platformId: 'slack:CTESTROOMA1', createdAt: iso(600_000) });
+    insertTaskAnchor({ sessionId: 's-b', platformId: 'slack:CTESTROOMB2', createdAt: iso(60_000) });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads).toHaveLength(1); // one thread, two sessions (§3.1)
+    expect(threads[0]!.channel_key).toBe('slack:CTESTROOMB2');
+    expect(threads[0]!.channel_name).toBe('#example-room-b');
+  });
+
+  it('an anchor for a DIFFERENT session never leaks onto an unrelated task thread', async () => {
+    seedAgentGroup('ag-1');
+    seedAgentGroup('ag-2');
+    insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTROOMX1', name: '#example-room-x' });
+    insertSession({ id: 's-anchored', agentGroupId: 'ag-1', threadId: 'system:tasks:series-anchored' });
+    insertSession({ id: 's-bare', agentGroupId: 'ag-2', threadId: 'system:tasks:series-bare' });
+    insertTaskAnchor({ sessionId: 's-anchored', platformId: 'slack:CTESTROOMX1', createdAt: iso(60_000) });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    const byThread = new Map(threads.map((t) => [t.thread_id, t]));
+    expect(byThread.get('system:tasks:series-anchored')!.channel_key).toBe('slack:CTESTROOMX1');
+    expect(byThread.get('system:tasks:series-bare')!.channel_key).toBe('system:tasks');
+    expect(byThread.get('system:tasks:series-bare')!.channel_name).toBe('Unrouted tasks');
+  });
+});
+
+// ── DEFECT 2 (operator report, 2026-08-20): one human, two DM channels ───────
+
+describe('buildThreadList — DM dedupe by stable platform user id (DEFECT 2)', () => {
+  beforeEach(() => {
+    closeDb();
+    setupDb();
+  });
+
+  /** Mirrors the live shape: `user_dms.user_id` / `users.id` are instance-scoped
+   *  (`<channel_type>:<raw id>`), one row per sibling bot, but the RAW id after
+   *  the prefix is the same human on every sibling sharing the platform. */
+  function seedDm(opts: {
+    messagingGroupId: string;
+    channelType: string;
+    rawUserId: string;
+    displayName: string;
+  }): void {
+    const userId = `${opts.channelType}:${opts.rawUserId}`;
+    getDb()
+      .prepare(`INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, 'human', ?, ?)`)
+      .run(userId, opts.displayName, iso(0));
+    getDb()
+      .prepare(`INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)`)
+      .run(userId, opts.channelType, opts.messagingGroupId, iso(0));
+  }
+
+  it('collapses two sibling-bot DM rooms for the same human into one channel_key, with both threads addressable through it', async () => {
+    seedAgentGroup('ag-bot-a');
+    seedAgentGroup('ag-bot-b');
+    // Real shape (verified live): `platform_id` carries the bare platform
+    // family ('slack', 'discord') — each bot instance gets its OWN DM
+    // conversation id from the platform, so the id differs per sibling even
+    // though the family segment does not. `channel_type` is what actually
+    // varies per sibling instance ('slack-example' vs 'slack-example-codex'
+    // live); baking the instance into `platform_id` itself (an earlier draft
+    // of this test did that) is not a shape real data ever takes.
+    insertMessagingGroup({
+      id: 'mg-dm-a',
+      platformId: 'slack:D0001',
+      name: 'Example Human',
+      channelType: 'slack-bota',
+    });
+    insertMessagingGroup({
+      id: 'mg-dm-b',
+      platformId: 'slack:D0002',
+      name: 'Example Human',
+      channelType: 'slack-botb',
+    });
+    seedDm({
+      messagingGroupId: 'mg-dm-a',
+      channelType: 'slack-bota',
+      rawUserId: 'U999',
+      displayName: 'Example Human',
+    });
+    seedDm({
+      messagingGroupId: 'mg-dm-b',
+      channelType: 'slack-botb',
+      rawUserId: 'U999',
+      displayName: 'Example Human',
+    });
+    insertSession({
+      id: 's-dm-a',
+      agentGroupId: 'ag-bot-a',
+      threadId: 'slack:D0001:1700000001.11',
+      messagingGroupId: 'mg-dm-a',
+    });
+    insertSession({
+      id: 's-dm-b',
+      agentGroupId: 'ag-bot-b',
+      threadId: 'slack:D0002:1700000002.22',
+      messagingGroupId: 'mg-dm-b',
+    });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads).toHaveLength(2); // still two distinct THREADS — only the channel identity merges.
+
+    const [a, b] = threads;
+    // The load-bearing assertion: against the prior behavior these are
+    // `slack:D0001` and `slack:D0002` — two different keys — which is exactly
+    // the "same human listed twice" defect. A dedupe MUST make them equal.
+    expect(a!.channel_key).toBe(b!.channel_key);
+    expect(a!.channel_key).not.toBe('slack:D0001');
+    expect(a!.channel_key).not.toBe('slack:D0002');
+    expect(a!.channel_name).toBe('Example Human');
+    expect(b!.channel_name).toBe('Example Human');
+
+    // This is the whole mechanism the sidebar (ThreadConsole.tsx) relies on: it
+    // groups strictly by `channel_key`, so an equal key is what makes "both
+    // threads show when the merged entry is selected" and "counts sum" true
+    // without that file needing to know anything about DMs or siblings.
+    const sameKey = threads.filter((t) => t.channel_key === a!.channel_key);
+    expect(sameKey).toHaveLength(2);
+    expect(new Set(sameKey.map((t) => t.thread_id))).toEqual(
+      new Set(['slack:D0001:1700000001.11', 'slack:D0002:1700000002.22']),
+    );
+  });
+
+  it('does NOT dedupe two real, unrelated channels that happen to share a display name', async () => {
+    seedAgentGroup('ag-1');
+    seedAgentGroup('ag-2');
+    // Two ordinary group channels, same name, no user_dms row for either —
+    // there is nothing DM-shaped here at all.
+    insertMessagingGroup({ id: 'mg-a', platformId: 'slack:CTESTROOMA1', name: '#general' });
+    insertMessagingGroup({ id: 'mg-b', platformId: 'slack:CTESTROOMB2', name: '#general' });
+    insertSession({ id: 's-a', agentGroupId: 'ag-1', threadId: 'slack:CTESTROOMA1:1.1', messagingGroupId: 'mg-a' });
+    insertSession({ id: 's-b', agentGroupId: 'ag-2', threadId: 'slack:CTESTROOMB2:2.2', messagingGroupId: 'mg-b' });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    const byThread = new Map(threads.map((t) => [t.thread_id, t]));
+    expect(byThread.get('slack:CTESTROOMA1:1.1')!.channel_key).toBe('slack:CTESTROOMA1');
+    expect(byThread.get('slack:CTESTROOMB2:2.2')!.channel_key).toBe('slack:CTESTROOMB2');
+  });
+
+  it('leaves a DM room untouched when it has no user_dms row (documented gap, not a silent merge)', async () => {
+    seedAgentGroup('ag-1');
+    insertMessagingGroup({ id: 'mg-lonely', platformId: 'slack:D9999', name: 'Some Human', channelType: 'slack-bota' });
+    insertSession({
+      id: 's-lonely',
+      agentGroupId: 'ag-1',
+      threadId: 'slack:D9999:1.1',
+      messagingGroupId: 'mg-lonely',
+    });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.channel_key).toBe('slack:D9999');
+    expect(threads[0]!.channel_name).toBe('Some Human');
   });
 });
 

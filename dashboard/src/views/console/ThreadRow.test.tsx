@@ -42,6 +42,7 @@ function thread(over: Partial<ThreadSummary> = {}): ThreadSummary {
     tool_started_at: null,
     reply_target_session_id: 's-1',
     snoozed: false,
+    scheduled_task: false,
     ...over,
   };
 }
@@ -251,6 +252,19 @@ describe('avatar stack (§4)', () => {
     const { row } = renderRow({ participants: [], state: 'unassigned' });
     expect(row.querySelector('.ncc-face.orphan')).toBeTruthy();
     expect(row.querySelector('.ncc-row-meta')!.textContent).toContain('no owner');
+  });
+});
+
+describe('the scheduled-task pill (operator report 2026-08-20, DEFECT 1)', () => {
+  it('renders when the thread is a scheduled task, and names its channel as the tasks pseudo-channel', () => {
+    const { row } = renderRow({ scheduled_task: true, channel_name: 'tasks' });
+    expect(row.querySelector('.ncc-scheduled-pill')!.textContent).toBe('scheduled');
+    expect(row.querySelector('.ncc-row-meta')!.textContent).toContain('tasks');
+  });
+
+  it('is absent for an ordinary channel thread', () => {
+    const { row } = renderRow({ scheduled_task: false });
+    expect(row.querySelector('.ncc-scheduled-pill')).toBeNull();
   });
 });
 

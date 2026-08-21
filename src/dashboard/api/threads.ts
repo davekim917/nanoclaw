@@ -33,6 +33,7 @@ import Database from 'better-sqlite3';
 import { getDb } from '../../db/connection.js';
 import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
 import { getContainerState, openOutboundDb, type ContainerState } from '../../db/session-db.js';
+import { TASKS_SYSTEM_THREAD_ID } from '../../db/sessions.js';
 import { outboundDbPath } from '../../session-manager.js';
 import { getActiveContainerSessionIds, resolveAssistantName } from '../../container-runner.js';
 import { readContainerConfig } from '../../container-config.js';
@@ -301,6 +302,30 @@ export interface ThreadSummary {
    * be snoozed while it is running. See `thread-snooze.ts`.
    */
   snoozed: boolean;
+  /**
+   * True for a `ncl tasks` execution's own isolated session (DEFECT 1, operator
+   * report 2026-08-20). Its `thread_id` is `system:tasks` or
+   * `system:tasks:<seriesId>` ({@link isScheduledTaskThread}), and it never
+   * carries a `messaging_group_id` (`resolveTaskSession` in
+   * session-manager.ts), so there is no live-room channel to recover it into —
+   * it lands in the `system:tasks` → `tasks` pseudo-channel bucket
+   * (§3.2's own documented shape) and this flag is how the row says so, rather
+   * than reading as an ordinary channel thread.
+   */
+  scheduled_task: boolean;
+}
+
+/**
+ * §5/CLAUDE.md: `ncl tasks` fires in an isolated session whose thread_id is
+ * `TASKS_SYSTEM_THREAD_ID` (the legacy shared session) or
+ * `${TASKS_SYSTEM_THREAD_ID}:<seriesId>` (`resolveTaskSession`, one session per
+ * recurring series). Exported so the row-level pill and its test share one
+ * definition of "this is a scheduled task" with the channel-key parser, which
+ * already treats the same prefix as `system:tasks` (`threadChannelKey`'s
+ * `EXTRA_SEGMENT_PLATFORMS` fallback — this is NOT a second, competing rule).
+ */
+export function isScheduledTaskThread(threadId: string): boolean {
+  return threadId === TASKS_SYSTEM_THREAD_ID || threadId.startsWith(`${TASKS_SYSTEM_THREAD_ID}:`);
 }
 
 /** Anything that leaves this module as a timestamp goes out as ISO-8601 UTC. */
@@ -424,23 +449,95 @@ function selectScopedSessions(
     .all(...(values as [])) as ThreadSessionRow[];
 }
 
+export interface ChannelDirectory {
+  known: Set<string>;
+  names: Map<string, string>;
+  /** `messaging_groups.id` → `platform_id` — the join a synthetic (NULL-thread_id) session needs. */
+  byId: Map<string, string>;
+  /**
+   * `platform_id` of a DM room → a stable cross-instance key for the human on
+   * the other end. See {@link buildThreadList}'s DM-collapse comment for why
+   * this exists and what it deliberately does not cover.
+   */
+  dmDedupeKey: Map<string, string>;
+}
+
 /** `messaging_groups.platform_id` → friendly name, and the key set §3.2 parses against. */
-export function readChannelDirectory(): { known: Set<string>; names: Map<string, string> } {
+export function readChannelDirectory(): ChannelDirectory {
   const known = new Set<string>();
   const names = new Map<string, string>();
+  const byId = new Map<string, string>();
+  const dmDedupeKey = new Map<string, string>();
   try {
-    const rows = getDb().prepare('SELECT platform_id, name FROM messaging_groups').all() as {
+    const rows = getDb().prepare('SELECT id, platform_id, name FROM messaging_groups').all() as {
+      id: string;
       platform_id: string;
       name: string | null;
     }[];
     for (const r of rows) {
       known.add(r.platform_id);
+      byId.set(r.id, r.platform_id);
       if (r.name && !names.has(r.platform_id)) names.set(r.platform_id, r.name);
     }
   } catch (err) {
     log.warn('threads: could not read messaging_groups directory', { err });
   }
-  return { known, names };
+
+  // DEFECT 2 (operator report, 2026-08-20): one human DMing two sibling bots
+  // mints two `messaging_groups` rows with the same `name` but a different
+  // `platform_id` — one DM room per (bot instance, human). `user_dms` already
+  // resolves each DM room back to `(channel_type, raw platform user id)`; the
+  // RAW id is what survives across sibling instances on the same platform (a
+  // Slack workspace's `U…` id, a Discord account id, are shared by every bot
+  // app installed there), even though `user_dms.user_id` and `users.id` are
+  // themselves instance-scoped (`<channel_type>:<raw id>`, one `users` row per
+  // instance — verified live: the same Slack human has SIX `users` rows, one
+  // per sibling bot). So the raw id, not `user_id`, not `users.id`, is the one
+  // thing stable enough to key on, and it is what collapses the DM rooms to
+  // one sidebar entry.
+  //
+  // Deliberately NOT covered: a DM room with no `user_dms` row (12 of 13 live
+  // DM rooms are covered; the remainder — lazily resolved, or older than the
+  // table — pass through unmerged rather than falling back to a bare `name`
+  // match. `messaging_groups.is_group` looks like a candidate discriminator
+  // but is only reliably 0 for rows the router itself created as a DM; the
+  // schema default is also 0, so a name-based fallback keyed on it risks
+  // merging two real, unrelated channels that happen to share a display name
+  // — exactly what the operator said must never happen. There is no live case
+  // that needs the fallback today (zero name collisions among the uncovered
+  // rows), so it is left out rather than built speculatively.
+  try {
+    const dmRows = getDb()
+      .prepare(
+        `SELECT mg.platform_id AS platform_id, ud.channel_type AS channel_type, ud.user_id AS user_id,
+                u.display_name AS display_name
+           FROM user_dms ud
+           JOIN messaging_groups mg ON mg.id = ud.messaging_group_id
+           LEFT JOIN users u ON u.id = ud.user_id`,
+      )
+      .all() as { platform_id: string; channel_type: string; user_id: string; display_name: string | null }[];
+    for (const r of dmRows) {
+      const rawUserId = r.user_id.startsWith(`${r.channel_type}:`)
+        ? r.user_id.slice(r.channel_type.length + 1)
+        : r.user_id;
+      const platformFamily = r.platform_id.split(':')[0] ?? r.channel_type;
+      const key = `dm:${platformFamily}:${rawUserId}`;
+      dmDedupeKey.set(r.platform_id, key);
+      if (r.display_name && !names.has(key)) names.set(key, r.display_name);
+    }
+  } catch (err) {
+    log.warn('threads: could not read user_dms directory', { err });
+  }
+
+  // A scheduled-task thread that never posted anywhere real (no
+  // `task_thread_anchors` row — see `buildThreadList`) falls back to the
+  // `system:tasks` bucket. It used to print the bare last segment, `tasks`,
+  // which read as a peer of real channels; naming it here, through the same
+  // `names` map every other channel resolves through, is the honest label the
+  // operator asked for once anchored tasks stopped needing this bucket at all.
+  if (!names.has(TASKS_SYSTEM_THREAD_ID)) names.set(TASKS_SYSTEM_THREAD_ID, 'Unrouted tasks');
+
+  return { known, names, byId, dmDedupeKey };
 }
 
 /** Last segment of a channel key — the honest fallback when no wiring names it. */
@@ -721,6 +818,76 @@ export function readClaimsByThread(agentGroupIds: string[], now: number, claimsR
   return byThread;
 }
 
+/* ─── Task-thread anchors (DEFECT 1, continued 2026-08-21) ─────────────────── */
+
+/** One session's most-recently-created `task_thread_anchors` row. */
+export interface TaskAnchor {
+  platformId: string;
+  atMs: number;
+}
+
+/**
+ * `task_thread_anchors.session_id → the channel it most recently posted in`
+ * (migration 048). `system:tasks:<seriesId>` carries no `messaging_group_id` —
+ * that is exactly why it fell into the fake `tasks` bucket in the first place
+ * (see the comment on the synthetic-thread branch in `buildThreadList`) — but
+ * a task that has actually POSTED leaves a per-post row here, in real
+ * channel-key shape (`platform_id`), which is the thing that lets it live in
+ * its real channel instead.
+ *
+ * Coverage is partial by construction: verified live (2026-08-21), only 63 of
+ * 135 `system:tasks:*` sessions have ever posted anywhere, because a task that
+ * never ran to a successful delivery genuinely has no channel to belong to —
+ * that is the `system:tasks` fallback bucket's whole reason to still exist,
+ * not a gap to paper over.
+ *
+ * One query for the whole page's session ids — never one per thread, same
+ * rule `liveContainerState` already enforces for `container_state`.
+ */
+function readTaskThreadAnchors(sessionIds: string[]): Map<string, TaskAnchor> {
+  const bySession = new Map<string, TaskAnchor>();
+  if (sessionIds.length === 0) return bySession;
+  let rows: { session_id: string; platform_id: string; created_at: string }[];
+  try {
+    rows = getDb()
+      .prepare(
+        `SELECT session_id, platform_id, created_at FROM task_thread_anchors
+          WHERE session_id IN (${sessionIds.map(() => '?').join(', ')})`,
+      )
+      .all(...sessionIds) as { session_id: string; platform_id: string; created_at: string }[];
+  } catch (err) {
+    log.warn('threads: task_thread_anchors lookup failed', { err });
+    return bySession;
+  }
+  for (const r of rows) {
+    // A single session can carry more than one anchor row — verified live,
+    // two sessions each have two, because a recurring series can get
+    // re-pointed to a different channel between runs. Most recent wins: that
+    // is the channel it is CURRENTLY posting to, which is the question being
+    // asked here, not "everywhere it has ever posted".
+    const atMs = parseUtcTimestampMs(r.created_at) ?? -Infinity;
+    const existing = bySession.get(r.session_id);
+    if (!existing || atMs > existing.atMs) bySession.set(r.session_id, { platformId: r.platform_id, atMs });
+  }
+  return bySession;
+}
+
+/**
+ * The channel a scheduled-task THREAD is currently anchored to, or null when
+ * it has never posted. A thread can in principle carry more than one session
+ * (§3.1 — nothing stops two agent groups sharing a series id), so the
+ * tie-break is the same "most recent wins" rule as within a single session's
+ * anchors, just applied across every session in the thread rather than one.
+ */
+function threadAnchorChannel(rows: ThreadSessionRow[], anchors: ReadonlyMap<string, TaskAnchor>): string | null {
+  let best: TaskAnchor | null = null;
+  for (const row of rows) {
+    const a = anchors.get(row.id);
+    if (a && (!best || a.atMs > best.atMs)) best = a;
+  }
+  return best?.platformId ?? null;
+}
+
 /* ─── Assembly ─────────────────────────────────────────────────────────────── */
 
 /** Liveness ordering: the freshest wins when a thread's sessions disagree. */
@@ -826,7 +993,7 @@ export async function buildThreadList(
   const rows = selectScopedSessions(ctx, opts);
   if (rows.length === 0) return { threads: [] };
 
-  const { known, names } = readChannelDirectory();
+  const { known, names, byId, dmDedupeKey } = readChannelDirectory();
   const grouped = groupByThread(rows)
     .map((t) => ({ ...t, activity: Math.max(...t.rows.map(activityMs)) }))
     .sort((a, b) => b.activity - a.activity)
@@ -836,12 +1003,53 @@ export async function buildThreadList(
   const liveIds = new Set((deps.activeContainerSessionIds ?? getActiveContainerSessionIds)());
   const states = liveContainerState(pagedRows, liveIds, probeState);
   const claims = readClaimsByThread([...new Set(pagedRows.map((r) => r.agent_group_id))], now, deps.claimsRoot);
+  // One query for every task-thread session on the page — never one per
+  // thread. See `readTaskThreadAnchors`.
+  const taskAnchors = readTaskThreadAnchors(
+    pagedRows.filter((r) => r.thread_id && isScheduledTaskThread(r.thread_id)).map((r) => r.id),
+  );
 
   // Channel keys are needed BEFORE identity resolution now, because the wired
   // agents a thread can be handed to are resolved for display through the same
   // memo as its participants — one pass, not two conventions for a bot's name.
+  //
+  // A synthetic thread (§3.1: `sessions.thread_id IS NULL`) has no thread_id
+  // for `threadChannelKey` to parse — there is nothing to parse — so the old
+  // code passed `null` and always landed on UNKNOWN_CHANNEL_KEY even though
+  // the session's own `messaging_group_id` often resolves the same channel a
+  // real thread on that room would (DEFECT 1, operator report 2026-08-20,
+  // verified against the live DB: most of these are old per-agent-group
+  // bootstrap sessions with a real `messaging_group_id`, not `ncl tasks` runs —
+  // see {@link isScheduledTaskThread} below for the actually task-shaped
+  // thread_ids, which carry no messaging_group_id at all and so cannot be
+  // recovered this way). `groupByThread` keys a synthetic accum by
+  // `session:<id>`, so it is always exactly one row.
+  //
+  // This is deliberately NOT a call into `threadChannelKey` with the synthetic
+  // `session:<id>` pseudo-id — that id is not a real platform shape, and
+  // parsing it would mint a per-row bucket, exactly what §3.2 says never to do.
+  //
+  // A scheduled-task thread (DEFECT 1, continued 2026-08-21) is neither of the
+  // above: it has a real thread_id (`system:tasks:<seriesId>`), so
+  // `threadChannelKey` WOULD parse it — straight to the `system:tasks` fake
+  // bucket, since these sessions never carry a `messaging_group_id` either.
+  // `task_thread_anchors` is the one place the real destination survives, so
+  // it is tried FIRST for a task thread, and only falls through to
+  // `threadChannelKey`'s `system:tasks` bucket when the thread has never
+  // posted anywhere (§4.1 doctrine: absent is honest, never invented).
   const channelKeys = new Map(
-    grouped.map((t) => [t.threadId, threadChannelKey(t.synthetic ? null : t.threadId, known)] as const),
+    grouped.map((t) => {
+      if (t.synthetic) {
+        const mgId = t.rows[0]?.messaging_group_id;
+        const platformId = mgId ? byId.get(mgId) : undefined;
+        return [t.threadId, platformId ?? UNKNOWN_CHANNEL_KEY] as const;
+      }
+      if (isScheduledTaskThread(t.threadId)) {
+        const anchored = threadAnchorChannel(t.rows, taskAnchors);
+        if (anchored) return [t.threadId, anchored] as const;
+      }
+      return [t.threadId, threadChannelKey(t.threadId, known)] as const;
+    }),
   );
   const wiredByChannel = (deps.wiredAgents ?? wiredAgentsByChannel)();
   const inScope = (agentGroupId: string): boolean =>
@@ -959,7 +1167,16 @@ export async function buildThreadList(
       ? (ordered[0].last_outbound_at ?? ordered[0].last_active ?? ordered[0].created_at)
       : null;
     const claim = claims.get(thread.threadId) ?? null;
+    // Wiring lookups (assignable_agents, and the identity fan-out above) key
+    // off the RAW platform_id — that is what `messaging_group_agents` is
+    // actually wired against, and DM dedupe (below) must never change which
+    // agents a thread can be handed to.
     const channelKey = channelKeys.get(thread.threadId) ?? UNKNOWN_CHANNEL_KEY;
+    // DEFECT 2 (operator report, 2026-08-20): the WIRE-facing channel identity
+    // collapses two DM rooms with the same human on the other end into one key
+    // — see the comment on `dmDedupeKey` in `readChannelDirectory`. Never used
+    // for wiring lookups, only for what the row and the sidebar display.
+    const displayChannelKey = dmDedupeKey.get(channelKey) ?? channelKey;
 
     const onThread = new Set(participants.map((p) => p.agent_group_id));
     const assignableAgents: ThreadAgentOption[] = (wiredByChannel.get(channelKey) ?? [])
@@ -993,8 +1210,8 @@ export async function buildThreadList(
     return {
       thread_id: thread.threadId,
       synthetic: thread.synthetic,
-      channel_key: channelKey,
-      channel_name: names.get(channelKey) ?? channelKeyLabel(channelKey),
+      channel_key: displayChannelKey,
+      channel_name: names.get(displayChannelKey) ?? channelKeyLabel(displayChannelKey),
       title,
       participants,
       assignable_agents: assignableAgents,
@@ -1010,6 +1227,7 @@ export async function buildThreadList(
         pickedSessionId,
       }),
       snoozed: snoozes.has(thread.threadId) && isSnoozed(snoozes.get(thread.threadId), lastActivityAt),
+      scheduled_task: isScheduledTaskThread(thread.threadId),
     };
   });
 
