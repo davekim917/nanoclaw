@@ -20,6 +20,7 @@ const getThreadDetail = vi.fn();
 const snoozeThread = vi.fn().mockResolvedValue({});
 const unsnoozeThread = vi.fn().mockResolvedValue({});
 const postThreadMessage = vi.fn().mockResolvedValue({ created_session: false, handoff: null });
+const closeThread = vi.fn();
 vi.mock('../../lib/api.js', () => ({
   listThreads,
   listGroups,
@@ -28,6 +29,7 @@ vi.mock('../../lib/api.js', () => ({
   snoozeThread,
   unsnoozeThread,
   postThreadMessage,
+  closeThread,
 }));
 
 const { ThreadConsole, lastMessagePreview } = await import('./ThreadConsole.js');
@@ -373,19 +375,125 @@ describe('the ONE action, and the one that is not a message', () => {
     expect(container.textContent!.toLowerCase()).not.toContain('kill');
   });
 
-  /**
-   * Close/Dismiss is gone entirely — archiving hid a thread from the queue
-   * without stopping the agent inside it, so the work kept running
-   * unattended. The detail pane now offers only snooze.
-   */
-  it('the detail pane offers no close/dismiss action', async () => {
+});
+
+/**
+ * Thread closure. The removed Dismiss archived every session on a thread and
+ * stopped nothing — a hide-without-stop action, which is why it does not
+ * exist any more (`actions.test.ts` and `TriagePanel.test.tsx` each pin that
+ * separately). What follows is a DIFFERENT thing: a real close
+ * (`src/dashboard/thread-close.ts`) that asks the agent to wrap up, clears its
+ * continuation, stops its container, and only then archives it. These tests
+ * exist specifically so a future reader does not read one control as the
+ * other — every one of them exercises the real `POST .../close` call through
+ * the mocked `closeThread`, never a local archive/hide.
+ */
+describe('closing a thread — the real thing, not the old Dismiss', () => {
+  beforeEach(() => closeThread.mockReset());
+
+  // `.ncc-close-status` specifically — the list pane's own `.ncc-notice` ALSO
+  // carries `role="status"`, and both are on screen at once once a thread is
+  // selected, so `getByRole('status')` is ambiguous here.
+  const closeStatus = (container: HTMLElement) => container.querySelector('.ncc-close-status');
+
+  const openDetail = async (t: ThreadSummary) => {
     const user = userEvent.setup();
-    listThreads.mockResolvedValue({ threads: [thread('t-idle', { state: 'idle', session_ids: ['s-x', 's-y'] })] });
+    listThreads.mockResolvedValue({ threads: [t] });
     const { container } = mount();
     await waitFor(() => expect(container.querySelector('.ncc-row-main')).toBeTruthy());
     await user.click(container.querySelector('.ncc-row-main') as HTMLElement);
     await waitFor(() => expect(screen.queryByRole('button', { name: 'snooze' })).toBeTruthy());
-    expect(screen.queryByRole('button', { name: /close|dismiss/i })).toBeNull();
+    return { user, container };
+  };
+
+  it('one deliberate click closes it when the agent already proposed (1 confirmation)', async () => {
+    closeThread.mockResolvedValueOnce({
+      thread_id: 't-idle',
+      session_ids: ['s-x'],
+      wrap_up_delivered: 1,
+      confirm_window_ms: 600_000,
+    });
+    const { user, container } = await openDetail(
+      thread('t-idle', { state: 'idle', session_ids: ['s-x'], close_confirmations_required: 1 }),
+    );
+    await user.click(screen.getByRole('button', { name: 'close thread' }));
+    await waitFor(() => expect(closeThread).toHaveBeenCalledWith('t-idle', { confirmations: 1 }));
+    expect(closeThread).toHaveBeenCalledTimes(1);
+    // Tells the operator the agent has time to land its work — closing is a
+    // request to wrap up, not an instant kill, and the operator would
+    // otherwise think it silently failed.
+    await waitFor(() => expect(closeStatus(container)?.textContent).toMatch(/10 min/));
+    expect(closeStatus(container)?.textContent).toMatch(/asked 1 agent/);
+  });
+
+  it('two GENUINELY SEPARATE acts when no agent proposed — a single click does not close it', async () => {
+    closeThread.mockRejectedValueOnce({ status: 409, error: 'confirmation_required', required_confirmations: 2 });
+    const { user, container } = await openDetail(
+      thread('t-idle', { state: 'idle', session_ids: ['s-x'], close_confirmations_required: 2 }),
+    );
+
+    // Act one: a REAL request, sent with confirmations: 1 — this is what
+    // makes a bug that collapses the two acts fail VISIBLY (a 409, shown on
+    // screen) instead of silently closing the thread.
+    await user.click(screen.getByRole('button', { name: 'close thread' }));
+    await waitFor(() => expect(closeThread).toHaveBeenCalledWith('t-idle', { confirmations: 1 }));
+    expect(closeThread).toHaveBeenCalledTimes(1);
+    // The thread is NOT closed by that one act: no success line, and the
+    // control that would fire the SECOND act is what appears instead —
+    // never an auto-dismissing toast, never something that revalidates the
+    // list as if it were done.
+    await waitFor(() => expect(closeStatus(container)?.textContent).toMatch(/overrides live work/));
+    expect(screen.getByRole('button', { name: 'confirm close' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'cancel' })).toBeTruthy();
+
+    // Act two: a SEPARATE click, sending the count the server actually named.
+    closeThread.mockResolvedValueOnce({
+      thread_id: 't-idle',
+      session_ids: ['s-x'],
+      wrap_up_delivered: 1,
+      confirm_window_ms: 600_000,
+    });
+    await user.click(screen.getByRole('button', { name: 'confirm close' }));
+    await waitFor(() => expect(closeThread).toHaveBeenCalledWith('t-idle', { confirmations: 2 }));
+    expect(closeThread).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(closeStatus(container)?.textContent).toMatch(/asked 1 agent/));
+  });
+
+  it('cancel backs out of the second act without ever sending it', async () => {
+    closeThread.mockRejectedValueOnce({ status: 409, error: 'confirmation_required', required_confirmations: 2 });
+    const { user } = await openDetail(thread('t-idle', { state: 'idle', close_confirmations_required: 2 }));
+    await user.click(screen.getByRole('button', { name: 'close thread' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'cancel' })).toBeTruthy());
+    await user.click(screen.getByRole('button', { name: 'cancel' }));
+    expect(screen.queryByRole('button', { name: 'confirm close' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'close thread' })).toBeTruthy();
+    expect(closeThread).toHaveBeenCalledTimes(1); // only the first act ever reached the server
+  });
+
+  it('while the server says the thread is already closing, the control is disabled and says so', async () => {
+    await openDetail(thread('t-idle', { state: 'idle', closing: true }));
+    const btn = screen.getByRole('button', { name: 'closing…' });
+    expect(btn).toBeDisabled();
+    // Snooze stays independent: `closing` never disables it, and vice versa.
+    expect(screen.getByRole('button', { name: 'snooze' })).not.toBeDisabled();
+    expect(closeThread).not.toHaveBeenCalled();
+  });
+
+  it('close_already_in_progress is explained, not swallowed', async () => {
+    closeThread.mockRejectedValueOnce({ status: 409, error: 'close_already_in_progress' });
+    const { user, container } = await openDetail(thread('t-idle', { state: 'idle' }));
+    await user.click(screen.getByRole('button', { name: 'close thread' }));
+    await waitFor(() => expect(closeStatus(container)?.textContent).toMatch(/already in progress/));
+  });
+
+  it('thread_extends_beyond_your_scope is explained, not a silently disabled button', async () => {
+    closeThread.mockRejectedValueOnce({ status: 409, error: 'thread_extends_beyond_your_scope' });
+    const { user, container } = await openDetail(thread('t-idle', { state: 'idle' }));
+    // The button was reachable and clickable — this is a REACHED explanation,
+    // not a proactive disable with no reason shown (§2a's tension: the console
+    // cannot know a hidden agent's group ahead of the attempt).
+    await user.click(screen.getByRole('button', { name: 'close thread' }));
+    await waitFor(() => expect(closeStatus(container)?.textContent).toMatch(/groups you can't manage/));
   });
 });
 
@@ -678,6 +786,31 @@ describe('every sidebar control stays reachable on a phone (§8)', () => {
     const icons = items.map((i) => i.querySelector('svg')?.innerHTML ?? '');
     expect(icons.every((h) => h.length > 0)).toBe(true);
     expect(new Set(icons).size).toBe(3);
+  });
+
+  /**
+   * Triage is a MODE layered over the 'threads' lens (§11), not a lens of its
+   * own — `lens` alone still reads 'threads' while Triage is open. The bottom
+   * bar's derivation has to know that, or it keeps highlighting Queue while
+   * the operator is actually in Triage.
+   */
+  it('reflects Triage, not Queue, as the active bottom-bar destination while Triage is open', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({ threads: [thread('t-1')] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+
+    const bottom = container.querySelector('.ncc-bottom') as HTMLElement;
+    const queueItem = within(bottom).getByText('Queue').closest('.ncc-bottom-item') as HTMLElement;
+    const triageItem = within(bottom).getByText('Triage').closest('.ncc-bottom-item') as HTMLElement;
+    expect(queueItem.getAttribute('aria-current')).toBe('page');
+    expect(triageItem.getAttribute('aria-current')).toBeNull();
+
+    await user.click(navTriage(container));
+    expect(screen.getByLabelText('Triage')).toBeTruthy();
+
+    expect(triageItem.getAttribute('aria-current')).toBe('page');
+    expect(queueItem.getAttribute('aria-current')).toBeNull();
   });
 
   it('treats opening a thread as a navigation, with a way back to the queue', async () => {

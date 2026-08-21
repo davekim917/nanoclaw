@@ -181,6 +181,30 @@ describe('the selector spans every wired agent, participants first', () => {
   });
 });
 
+/**
+ * The hint beside the selector used to render on every send, including the
+ * common case (an agent already chosen, not assigning) — "only this agent
+ * receives it" consumed a full row's width there for a sentence the operator
+ * does not need, and pushed the quick-reply row onto a line of its own. It
+ * only survives now where it actually says something new: nobody chosen yet,
+ * or picking this agent opens a queue.
+ */
+describe('the steady-state hint is gone, so the row is shared with quick replies', () => {
+  it('renders no hint once an agent is already chosen and it is a plain send', async () => {
+    const { container } = renderDetail(thread());
+    const select = await target();
+    expect(select.value).toBe('ag-2');
+    expect(screen.queryByText(/only this agent receives it/i)).toBeNull();
+    const row = select.closest('.ncc-composer-target') as HTMLElement;
+    expect(row.querySelector('.ncc-composer-hint')).toBeNull();
+    // With the hint gone, the selector and the quick replies are the row's
+    // only real content — siblings in the SAME flex container, not a
+    // hint-only row pushing the replies onto a line of their own.
+    expect(row.contains(row.querySelector('.ncc-composer-chips'))).toBe(true);
+    expect(container.querySelectorAll('.ncc-composer-hint')).toHaveLength(0);
+  });
+});
+
 describe('prefill chips set the box and nothing else', () => {
   it('offers the three decision chips and never sends on tap', async () => {
     const user = userEvent.setup();

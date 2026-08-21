@@ -5,7 +5,9 @@ import userEvent from '@testing-library/user-event';
 import type { ThreadSummary } from '../../lib/api.js';
 
 /**
- * Triage mode (DESIGN §11) — one thread, three verdict keys, auto-advance.
+ * Triage mode (DESIGN §11) — one thread, one verdict key (S), auto-advance.
+ * A and E were both retired keys (see the tests below) — neither one is a
+ * verdict, so removing them is not one either.
  *
  * The failure this file exists to catch is SKIPPING. A verdict removes the
  * thread from the live queue, so a mode that re-indexed against the live list
@@ -121,26 +123,30 @@ describe('verdicts advance by exactly one', () => {
     expect(screen.getByText('1 / 2')).toBeTruthy();
   });
 
-  it('offers no close/dismiss button, and the key hint carries only answer and snooze', async () => {
+  /**
+   * A used to focus the composer and nothing else. It is gone too — same
+   * reading as E above, and for a different reason: a tap on the row (or the
+   * composer itself) already moves focus there, so the button and key never
+   * did anything a click could not already do.
+   */
+  it('A is not bound to anything — no verdict fires, no focus move, and the position holds', async () => {
+    const user = userEvent.setup();
+    renderTriage([thread(1), thread(2)]);
+    panel().focus();
+    await user.keyboard('a');
+    expect(snoozeThread).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(panel());
+    expect(screen.getByText('1 / 2')).toBeTruthy();
+  });
+
+  it('offers no close/dismiss or answer button, and the key hint carries only snooze and exit', async () => {
     renderTriage([thread(1)]);
     // `find`, not `get`: it lets the detail pane's transcript fetch settle
     // inside act rather than landing after the test has ended.
     await screen.findByRole('button', { name: /S · snooze/ });
     expect(screen.queryByRole('button', { name: /close|dismiss/i })).toBeNull();
-    expect(screen.getByText(/A answer · S snooze · Esc exit/)).toBeTruthy();
-  });
-
-  it('A focuses the composer and does NOT advance until the reply lands', async () => {
-    const user = userEvent.setup();
-    renderTriage([thread(1), thread(2)]);
-    panel().focus();
-    await user.keyboard('a');
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Message text')));
-    expect(screen.getByText('1 / 2')).toBeTruthy();
-
-    await user.type(screen.getByLabelText('Message text'), 'answered');
-    await user.click(screen.getByRole('button', { name: 'send' }));
-    await waitFor(() => expect(screen.getByText('2 / 2')).toBeTruthy());
+    expect(screen.queryByRole('button', { name: /answer/i })).toBeNull();
+    expect(screen.getByText('S snooze · Esc exit')).toBeTruthy();
   });
 
   it('reports the end of the queue rather than wrapping', async () => {

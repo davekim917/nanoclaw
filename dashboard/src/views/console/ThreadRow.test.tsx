@@ -268,6 +268,63 @@ describe('the scheduled-task pill (operator report 2026-08-20, DEFECT 1)', () =>
   });
 });
 
+/**
+ * The "proposes done" badge (thread-closure contract, item 1). A FLAG, not a
+ * state: an agent that proposes closing is very often still `running`,
+ * because its container has not exited yet, and reporting live work as
+ * anything else is exactly the failure that got the old Dismiss action
+ * removed. So the load-bearing rule here is ALONGSIDE, never instead of —
+ * `.ncc-state` must keep reading whatever `state` says regardless of whether
+ * a proposal is also on the row.
+ */
+describe('the "proposes done" badge (thread-closure contract, item 1)', () => {
+  const proposal = {
+    reason: 'fixed the retry loop and confirmed the test suite is green',
+    proposed_at: '2026-08-20T11:00:00.000Z',
+    agent_group_id: 'ag-1',
+    session_id: 's-1',
+  };
+
+  it('is absent when the agent has proposed nothing', () => {
+    const { row } = renderRow({ done_proposal: null });
+    expect(row.querySelector('.ncc-proposal-pill')).toBeNull();
+    expect(row.querySelector('.ncc-row-proposal')).toBeNull();
+  });
+
+  it('renders ALONGSIDE the state pill, never in place of it', () => {
+    const { row } = renderRow({ state: 'idle', done_proposal: proposal });
+    expect(row.querySelector('.ncc-proposal-pill')!.textContent).toBe('proposes done');
+    // The state pill is UNCHANGED — same element, same label, still there.
+    expect(row.querySelector('.ncc-state')!.textContent).toBe(STATE_PRESENTATION.idle.label);
+  });
+
+  it('a proposing thread that is still running reads Running, not some seventh "proposed" state', () => {
+    const { row } = renderRow({
+      state: 'running',
+      tool_started_at: '2026-08-20T11:59:00.000Z',
+      done_proposal: proposal,
+    });
+    expect(row.querySelector('.ncc-state')!.textContent).toBe('Running');
+    expect(row.querySelector('.ncc-proposal-pill')).toBeTruthy();
+    // The liveness rule still moves — a proposal never freezes the row's own
+    // live signal, which is a DIFFERENT thing this badge must not shadow.
+    expect(row.querySelector('.ncc-track > div')!.className).toContain('ncc-seg-live');
+  });
+
+  it("shows the agent's own reason, legibly, not just in a tooltip a touch screen can never trigger", () => {
+    const { row } = renderRow({ done_proposal: proposal });
+    const line = row.querySelector('.ncc-row-proposal')!;
+    expect(line.textContent).toContain('fixed the retry loop and confirmed the test suite is green');
+    // Named by the proposing participant, not a generic "agent".
+    expect(line.textContent).toContain('Alpha');
+  });
+
+  it('falls back to the raw agent_group_id if the proposer somehow left the participant list', () => {
+    const { row } = renderRow({ done_proposal: { ...proposal, agent_group_id: 'ag-ghost' } });
+    expect(row.querySelector('.ncc-row-proposal')!.textContent).toContain('ag-ghost');
+  });
+});
+
 describe('interaction', () => {
   it('opens the thread from the row body and from the verb', async () => {
     const user = userEvent.setup();

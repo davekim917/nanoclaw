@@ -59,16 +59,28 @@ export interface ApiError {
   status: number;
   error: string;
   retry_after?: number;
+  /**
+   * `confirmation_required`'s count (`thread-close-guard.ts`'s
+   * `requiredConfirmations`) — the one field the close flow's 409 branch needs
+   * to act on. Every other 409/404 the close endpoint returns carries nothing
+   * else the client needs, so nothing else is threaded through here.
+   */
+  required_confirmations?: number;
 }
 
 async function apiFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, { credentials: 'include', ...init });
   if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string; retry_after?: number };
+    const body = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      retry_after?: number;
+      required_confirmations?: number;
+    };
     const apiErr: ApiError = {
       status: res.status,
       error: body.error ?? 'unknown',
       ...(body.retry_after != null ? { retry_after: body.retry_after } : {}),
+      ...(body.required_confirmations != null ? { required_confirmations: body.required_confirmations } : {}),
     };
     throw apiErr;
   }
@@ -731,6 +743,42 @@ export interface ThreadSummary {
    * updating in lockstep; `ThreadRow` treats an absent value as `false`.
    */
   scheduled_task?: boolean;
+  /**
+   * The agent's own `propose_done` record, or null. A FLAG, not a state: an
+   * agent that proposes closing at the end of a turn is very often still
+   * `running`, because its container has not exited yet — see
+   * `src/dashboard/api/threads.ts`. `ThreadRow` renders this ALONGSIDE the
+   * state pill, never in place of it.
+   *
+   * Optional for the same fixture reason as `scheduled_task` above; an absent
+   * value reads as no proposal.
+   */
+  done_proposal?: ThreadDoneProposal | null;
+  /**
+   * An operator-confirmed close is in flight: the wrap-up went to the
+   * agent(s) and the sequence is waiting on them, or finalizing. Independent
+   * of `snoozed` — a thread can be closing while still (briefly) snoozed, or
+   * vice versa, and neither gates the other.
+   */
+  closing?: boolean;
+  /**
+   * How many explicit operator confirmations closing THIS thread needs right
+   * now — 1 with a standing agent proposal, 2 without. On the wire so the
+   * console can label the control honestly before the operator commits to
+   * anything; NOT the authority — the server re-derives and re-checks this on
+   * every `POST .../close`, so a stale or wrong value here degrades to an
+   * extra round trip (a 409 `confirmation_required`), never a bypass.
+   */
+  close_confirmations_required?: 1 | 2;
+}
+
+/** {@link ThreadSummary.done_proposal} — the proposal plus who made it. */
+export interface ThreadDoneProposal {
+  reason: string;
+  /** ISO-8601 UTC, as the agent wrote it. */
+  proposed_at: string;
+  agent_group_id: string;
+  session_id: string;
 }
 
 export interface ThreadTranscriptEntry extends SessionTranscriptEntry {
@@ -821,5 +869,40 @@ export async function snoozeThread(threadId: string): Promise<{ thread_id: strin
 export async function unsnoozeThread(threadId: string): Promise<{ thread_id: string }> {
   return apiFetch<{ thread_id: string }>(`/dashboard/api/threads/${encodeURIComponent(threadId)}/unsnooze`, {
     method: 'POST',
+  });
+}
+
+/** The 202 body of `POST .../close` — `src/dashboard/thread-close.ts`'s `requestThreadClose`. */
+export interface ThreadCloseResponse {
+  thread_id: string;
+  state: 'awaiting_confirmation';
+  requested_at: string;
+  session_ids: string[];
+  /** How many of `session_ids` actually got the wrap-up request written to their queue. */
+  wrap_up_delivered: number;
+  agent_proposed: boolean;
+  /** ~10 minutes — how long the agent has to answer before the close finalizes anyway. */
+  confirm_window_ms: number;
+}
+
+/**
+ * The console's one action that ENDS work rather than sending a message —
+ * `POST /dashboard/api/threads/:id/close` (`src/dashboard/thread-close.ts`).
+ *
+ * Not Dismiss. The removed Dismiss archived every session on a thread and
+ * stopped nothing; this asks the agent to wrap up, clears its saved
+ * continuation, stops its container, and archives the thread only once that
+ * is true. Confirmations are counted SERVER-SIDE (`thread-close-guard.ts`): a
+ * caller that under-counts gets a 409 `confirmation_required` naming how many
+ * are actually needed, never a silent close.
+ */
+export async function closeThread(
+  threadId: string,
+  body: { confirmations: number; reason?: string },
+): Promise<ThreadCloseResponse> {
+  return apiFetch<ThreadCloseResponse>(`/dashboard/api/threads/${encodeURIComponent(threadId)}/close`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
 }

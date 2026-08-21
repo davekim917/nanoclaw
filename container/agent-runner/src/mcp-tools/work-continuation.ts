@@ -1,6 +1,8 @@
 import {
   cancelWorkContinuation,
+  DONE_PROPOSAL_REASON_MAX_CHARS,
   getCurrentInReplyTo,
+  proposeDone as recordDoneProposal,
   queueWorkContinuation,
   WORK_CONTINUATION_CHAIN_MAX,
   WORK_CONTINUATION_TASK_MAX_CHARS,
@@ -73,4 +75,51 @@ export const cancelContinuation: McpToolDefinition = {
   },
 };
 
-registerTools([continueWork, cancelContinuation]);
+/**
+ * The other end of `continue_work`: the agent's own statement that there is
+ * nothing left.
+ *
+ * It is deliberately a PROPOSAL and not a close. Nothing here stops the agent,
+ * kills anything, or archives anything — the record just becomes visible to an
+ * operator, who is the only one who can actually end the work. That split is
+ * the point: the previous surface let an operator hide a thread without
+ * stopping it, and an agent that could close its own thread would be the same
+ * blindness from the other side.
+ */
+export const proposeDone: McpToolDefinition = {
+  tool: {
+    name: 'propose_done',
+    description:
+      'Tell the operator you believe this thread is finished, with a one-line reason. ' +
+      'This is a PROPOSAL, not a close: nothing stops, and you keep working if more arrives. ' +
+      'Call it when you have delivered the result and hold no continuation. ' +
+      'If the operator asks you to wrap up, finish, cancel_continuation, then call this to confirm.',
+    inputSchema: {
+      type: 'object' as const,
+      additionalProperties: false,
+      properties: {
+        reason: {
+          type: 'string',
+          minLength: 1,
+          maxLength: DONE_PROPOSAL_REASON_MAX_CHARS,
+          description: 'One line on what was finished and how you know — this is what the operator reads.',
+        },
+      },
+      required: ['reason'],
+    },
+  },
+  async handler(args) {
+    if (Object.keys(args).some((key) => key !== 'reason')) return err('unknown input field');
+    const reason = typeof args.reason === 'string' ? args.reason.trim() : '';
+    if (!reason) return err(`reason is required (1-${DONE_PROPOSAL_REASON_MAX_CHARS} chars after trimming)`);
+    if (reason.length > DONE_PROPOSAL_REASON_MAX_CHARS) {
+      return err(
+        `reason is ${reason.length} chars after trimming; max is ${DONE_PROPOSAL_REASON_MAX_CHARS} — shorten it and retry`,
+      );
+    }
+    const proposal = recordDoneProposal(reason);
+    return ok(`Close proposed at ${proposal.proposed_at}. The operator decides; nothing has stopped.`);
+  },
+};
+
+registerTools([continueWork, cancelContinuation, proposeDone]);
