@@ -3,7 +3,6 @@ import type { ThreadSummary } from '../../lib/api.js';
 import { actionError } from './action-error.js';
 import { setSnoozed } from './actions.js';
 import { ThreadDetail } from './ThreadDetail.js';
-import { STATE_PRESENTATION } from './thread-state.js';
 
 /**
  * Triage — a MODE over the current filtered list, never the home screen and
@@ -18,10 +17,15 @@ import { STATE_PRESENTATION } from './thread-state.js';
  * The snapshot row is the fallback for exactly that case: it is the same data,
  * one revalidation stale, not a second source of truth.
  *
- * Two verdict keys, per §11:
+ * One verdict key, per §11:
  *
- *   A — answer and advance (focus the composer; the advance follows the send)
  *   S — snooze until it moves
+ *
+ * There used to be a second, A — answer and advance, which only moved focus
+ * into the composer. The operator called it out as pointless: a tap on the
+ * row (or the composer itself) already does that, so the button and its
+ * keybinding are gone. Sending from the composer still advances the pass —
+ * see `onSent` below — there is simply no verdict button for it any more.
  *
  * There used to be a third, E — dismiss it from the queue, which archived
  * every session on the thread. It is gone: archiving hid the thread without
@@ -38,8 +42,6 @@ import { STATE_PRESENTATION } from './thread-state.js';
  *   composer or any other field, otherwise every "s" typed into a reply would
  *   snooze the thread.
  */
-
-export type TriageVerdict = 'answer' | 'snooze';
 
 export interface TriagePanelProps {
   /** The filtered queue, frozen at entry. Order is fixed for the pass. */
@@ -63,7 +65,6 @@ const MAX_DOTS = 30;
 
 export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePanelProps) {
   const [at, setAt] = useState(0);
-  const [focusComposer, setFocusComposer] = useState(0);
   const [announcement, setAnnouncement] = useState('');
   const [busy, setBusy] = useState(false);
   const root = useRef<HTMLElement>(null);
@@ -94,28 +95,19 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
     [snapshot, total],
   );
 
-  const verdict = useCallback(
-    async (kind: TriageVerdict) => {
-      if (!thread || busy) return;
-      if (kind === 'answer') {
-        // Answer does not advance here — the send does, through onSent below.
-        setFocusComposer((n) => n + 1);
-        setAnnouncement('Composer focused. Send to answer and advance.');
-        return;
-      }
-      setBusy(true);
-      try {
-        await setSnoozed(thread.thread_id, true);
-        onChanged();
-        advance('Snoozed until it moves.');
-      } catch (err) {
-        setAnnouncement(`Could not ${kind} — ${actionError(err)}.`);
-      } finally {
-        setBusy(false);
-      }
-    },
-    [thread, busy, advance, onChanged],
-  );
+  const snooze = useCallback(async () => {
+    if (!thread || busy) return;
+    setBusy(true);
+    try {
+      await setSnoozed(thread.thread_id, true);
+      onChanged();
+      advance('Snoozed until it moves.');
+    } catch (err) {
+      setAnnouncement(`Could not snooze — ${actionError(err)}.`);
+    } finally {
+      setBusy(false);
+    }
+  }, [thread, busy, advance, onChanged]);
 
   const onKeyDown = useCallback(
     (e: KeyboardEvent<HTMLElement>) => {
@@ -129,9 +121,11 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
       }
       if (isTypingTarget(e.target)) return;
       const key = e.key.toLowerCase();
-      if (key === 'a' || key === 's') {
+      // `a` is not bound to anything — same reading as `e` below. It used to
+      // focus the composer; a tap on the row already does that.
+      if (key === 's') {
         e.preventDefault();
-        void verdict(key === 'a' ? 'answer' : 'snooze');
+        void snooze();
         return;
       }
       if (key === 'arrowdown' || key === 'arrowright') {
@@ -144,10 +138,8 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
         setAt((i) => Math.max(i - 1, 0));
       }
     },
-    [onExit, verdict, total],
+    [onExit, snooze, total],
   );
-
-  const presentation = thread ? STATE_PRESENTATION[thread.state] : null;
 
   return (
     <section
@@ -158,33 +150,33 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
       onKeyDown={onKeyDown}
       data-triage-index={at}
     >
+      {/* One row: position, snooze, exit. Used to be three (a progress-bar
+          row, a legend row, a button row with Answer beside Snooze) — too
+          tall on a phone. The thread's own state label already renders in
+          ThreadDetail's head just below, so it is not repeated here. Exit
+          stays a real control in this row rather than a large block: on
+          mobile there is no Esc key, so it is the only way out of triage. */}
       <div className="ncc-triage-bar">
         <span className="ncc-triage-count ncc-mono">
           {Math.min(at + 1, total)} / {total}
         </span>
         {/* The rail is POSITION, and position is a real count — unlike §6's
             liveness rule, which encodes nothing by length. Discrete cells, so
-            the two can never be misread for each other. */}
+            the two can never be misread for each other. Desktop only (§8) —
+            the numeric count alone carries the position on a phone. */}
         <span className="ncc-triage-rail" aria-hidden="true">
           {snapshot.slice(0, MAX_DOTS).map((t, i) => (
             <span key={t.thread_id} className={`ncc-triage-dot${i === at ? ' now' : i < at ? ' done' : ''}`} />
           ))}
         </span>
         <span className="ncc-spacer" />
-        <span className="ncc-triage-keys ncc-mono">A answer · S snooze · Esc exit</span>
+        <span className="ncc-triage-keys ncc-mono">S snooze · Esc exit</span>
+        <button type="button" className="ncc-verb" disabled={!thread || busy} onClick={() => void snooze()}>
+          S · snooze
+        </button>
         <button type="button" className="ncc-solid-btn" onClick={onExit}>
           exit
         </button>
-      </div>
-
-      <div className="ncc-triage-verbs">
-        <button type="button" className="ncc-verb" disabled={!thread || busy} onClick={() => void verdict('answer')}>
-          A · answer
-        </button>
-        <button type="button" className="ncc-verb" disabled={!thread || busy} onClick={() => void verdict('snooze')}>
-          S · snooze
-        </button>
-        {presentation && <span className={`ncc-state ${presentation.tone}`}>{presentation.label}</span>}
       </div>
 
       <div className="ncc-triage-live" role="status" aria-live="polite">
@@ -194,7 +186,6 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
       {thread ? (
         <ThreadDetail
           thread={thread}
-          focusComposer={focusComposer}
           onSent={() => {
             onChanged();
             advance('Answered.');

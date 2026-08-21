@@ -154,6 +154,23 @@ describe('the breakpoint moves controls, it does not delete them (§8)', () => {
     expect(mobile.body).toMatch(/\.ncc-brand\s*\{\s*display:\s*none/);
   });
 
+  it('fills the area under the header — full width, full remaining height, not a partial sheet', () => {
+    // The bug: `bottom: 0` with an auto/capped height left a gap at the TOP of
+    // `.ncc-body` (right under the header) that the queue showed through —
+    // read as a translucent overlay fragment rather than a menu. `inset: 0`
+    // anchors all four edges of `.ncc-body`, whose own top edge sits right
+    // below the header row, so this box now covers exactly that remaining
+    // area with nothing left showing around or behind it.
+    const at = mobile.body.indexOf('.ncc-side {');
+    expect(at, 'the mobile .ncc-side override must exist').toBeGreaterThan(-1);
+    const open = mobile.body.indexOf('{', at);
+    const close = mobile.body.indexOf('}', open);
+    const sheet = mobile.body.slice(open + 1, close);
+    expect(sheet).toMatch(/inset:\s*0/);
+    expect(sheet).not.toMatch(/max-height/);
+    expect(sheet).not.toMatch(/bottom:\s*0/);
+  });
+
   it('swaps the quick-reply row for a dropdown, so it costs no row of its own (item 3)', () => {
     expect(mobile.body).toMatch(/\.ncc-composer-chips\s*\{\s*display:\s*none/);
     expect(mobile.body).toMatch(/\.ncc-composer-quickmenu\s*\{\s*display:\s*inline-flex/);

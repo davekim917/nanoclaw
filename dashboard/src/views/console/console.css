@@ -815,6 +815,11 @@
   background: var(--ncc-page);
 }
 .ncc-triage:focus-visible { outline: 2px solid var(--ncc-focus); outline-offset: -2px; }
+/* One row: position, the snooze control, exit. Used to be three (a progress
+   bar row, a legend row, a button row with Answer beside Snooze) — too tall
+   for a phone. Answer is gone outright (it only jumped focus into the
+   composer; the operator called that pointless), which is most of what made
+   the old button row shrinkable into this one. */
 .ncc-triage-bar {
   flex-shrink: 0;
   min-height: 44px;
@@ -825,7 +830,8 @@
   border-bottom: 1px solid var(--ncc-border);
   background: var(--ncc-topbar);
 }
-.ncc-triage-count { font-size: 12px; font-weight: 600; color: var(--ncc-ink); }
+.ncc-triage-bar .ncc-verb { min-height: 44px; padding: 6px 12px; }
+.ncc-triage-count { flex-shrink: 0; font-size: 12px; font-weight: 600; color: var(--ncc-ink); }
 .ncc-triage-keys { font-size: 11px; color: var(--ncc-muted); }
 /* POSITION, not progress: discrete cells, so this can never be misread as
    §6's liveness rule, whose length deliberately encodes nothing. */
@@ -833,15 +839,6 @@
 .ncc-triage-dot { width: 6px; height: 6px; background: var(--ncc-chip); }
 .ncc-triage-dot.done { background: var(--ncc-border); }
 .ncc-triage-dot.now { background: var(--ncc-attention); }
-.ncc-triage-verbs {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 18px;
-  border-bottom: 1px solid var(--ncc-border);
-}
-.ncc-triage-verbs .ncc-verb { min-height: 44px; padding: 6px 12px; }
 .ncc-triage-live {
   flex-shrink: 0;
   min-height: 20px;
@@ -973,18 +970,21 @@
      hamburger button (item 2 moved this off the bottom bar's old Filters
      tab). Same `<nav>`, same lane / channel / lens controls, same theme
      toggle footer, same state — only where it sits changes, so there is
-     exactly one of each control in the DOM. */
+     exactly one of each control in the DOM.
+
+     `inset: 0` — the FULL area under the top bar, not just a bottom-anchored
+     slice. A `bottom: 0` + `max-height` sheet left a gap at the top of
+     `.ncc-body` the queue showed through, and read as a translucent overlay
+     fragment rather than a menu. This box is opaque (`--ncc-sidebar`,
+     inherited from the base rule) and z-indexed above both the list and the
+     detail pane, so nothing beneath it is visible or reachable while open. */
   .ncc-side {
     position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
+    inset: 0;
     z-index: 20;
     width: auto;
-    max-height: 72%;
     display: none;
     border-right: 0;
-    border-top: 1px solid var(--ncc-border);
   }
   .ncc[data-nav='open'] .ncc-side { display: flex; }
   /* §7.2: every tap target ≥ 44px, with an explicit min-height. */
@@ -1030,5 +1030,9 @@
   .ncc-row-meta .agents,
   .ncc-row-meta .sep-agents { display: none; }
 
-  .ncc-triage-verbs { flex-wrap: wrap; }
+  /* The triage bar keeps only what a phone needs to act: position, snooze,
+     exit. The dot rail is a nicety the numeric count already covers, and the
+     "Esc exit" hint names a key a phone doesn't have. */
+  .ncc-triage-rail,
+  .ncc-triage-keys { display: none; }
 }

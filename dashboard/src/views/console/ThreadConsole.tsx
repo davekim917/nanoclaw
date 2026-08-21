@@ -527,10 +527,15 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
        * plus Triage, the mode entered from the list (§11).
        */}
       <nav className="ncc-bottom" aria-label="Sections">
+        {/* Triage is a MODE layered on top of the 'threads' lens (§11), not a
+            lens of its own — `lens` alone therefore still reads 'threads'
+            while it is open, and Queue's aria-current must say so too or the
+            bottom bar highlights Queue while the operator is actually in
+            Triage. */}
         <a
           className="ncc-bottom-item"
           href="#/console"
-          aria-current={lens === 'threads' ? 'page' : undefined}
+          aria-current={lens === 'threads' && triage === null ? 'page' : undefined}
           onClick={() => setSelectedId(null)}
         >
           <Inbox size={18} aria-hidden="true" />
@@ -543,6 +548,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
         <button
           type="button"
           className="ncc-bottom-item"
+          aria-current={triage !== null ? 'page' : undefined}
           onClick={enterTriage}
           disabled={visible.length === 0 || triage !== null}
         >

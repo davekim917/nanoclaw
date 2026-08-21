@@ -387,13 +387,20 @@ export function ReplyComposer({
             </optgroup>
           )}
         </select>
-        <span className="ncc-composer-hint">
-          {!agentId
-            ? 'pick who this goes to'
-            : assigning
-              ? 'this opens its queue on the thread'
-              : 'only this agent receives it'}
-        </span>
+        {/* No hint in the common case — an agent is chosen and this is a
+            plain send, which is the composer's whole steady state and does
+            not need a sentence beside the selector explaining it. The row
+            still says something when it matters: nobody is chosen yet, or
+            picking this agent is Assign, opening a queue that did not exist.
+            Dropping the steady-state hint is also what leaves this row's
+            width for the quick-reply control below, on the SAME row as the
+            selector, instead of the hint alone forcing it to wrap onto a
+            line of its own. */}
+        {(!agentId || assigning) && (
+          <span className="ncc-composer-hint">
+            {!agentId ? 'pick who this goes to' : 'this opens its queue on the thread'}
+          </span>
+        )}
 
         {/*
          * The quick replies (item 3). Both controls below act on the same

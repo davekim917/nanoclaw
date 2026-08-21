@@ -680,6 +680,31 @@ describe('every sidebar control stays reachable on a phone (§8)', () => {
     expect(new Set(icons).size).toBe(3);
   });
 
+  /**
+   * Triage is a MODE layered over the 'threads' lens (§11), not a lens of its
+   * own — `lens` alone still reads 'threads' while Triage is open. The bottom
+   * bar's derivation has to know that, or it keeps highlighting Queue while
+   * the operator is actually in Triage.
+   */
+  it('reflects Triage, not Queue, as the active bottom-bar destination while Triage is open', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({ threads: [thread('t-1')] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+
+    const bottom = container.querySelector('.ncc-bottom') as HTMLElement;
+    const queueItem = within(bottom).getByText('Queue').closest('.ncc-bottom-item') as HTMLElement;
+    const triageItem = within(bottom).getByText('Triage').closest('.ncc-bottom-item') as HTMLElement;
+    expect(queueItem.getAttribute('aria-current')).toBe('page');
+    expect(triageItem.getAttribute('aria-current')).toBeNull();
+
+    await user.click(navTriage(container));
+    expect(screen.getByLabelText('Triage')).toBeTruthy();
+
+    expect(triageItem.getAttribute('aria-current')).toBe('page');
+    expect(queueItem.getAttribute('aria-current')).toBeNull();
+  });
+
   it('treats opening a thread as a navigation, with a way back to the queue', async () => {
     const user = userEvent.setup();
     listThreads.mockResolvedValue({ threads: [thread('t-1')] });
