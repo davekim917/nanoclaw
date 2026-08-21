@@ -745,10 +745,17 @@ describe('pillar-2 semantic consolidation', () => {
     expect(capturedUser).toContain('2026-08-19T00:00:00.000Z');
   });
 
-  // P2-AC4. Both halves: content alone under the cap is not sufficient proof
-  // (the header must push it over), and a 13-file set trips the max-count
-  // cap. Nothing written in either case.
-  it('oversize or over-count file sets are rejected, measured on the final serialized file', async () => {
+  // P2-AC4, CONVERTED for the deadlock fix (was: "oversize or over-count file
+  // sets are rejected, measured on the final serialized file" — both halves
+  // asserted the whole pass THROWS and nothing is written or marked). A
+  // per-file violation is now a REJECTION, not a throw: retrying an
+  // oversized/over-count violation against the SAME model reproduces the
+  // identical output forever, so failing the whole pass made zero progress
+  // on every trigger. The measurement itself (header pushes content over the
+  // cap) is unchanged — only the outcome of tripping it changed, from "whole
+  // pass fails" to "that file is dropped, the rest of the batch still
+  // lands, and the tail is marked either way."
+  it('oversize or over-count file sets are rejected per-file, measured on the final serialized file', async () => {
     seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
     const writeTopicFile = vi.fn(
       async (): Promise<CuratorWriteResult> => ({
@@ -773,9 +780,19 @@ describe('pillar-2 semantic consolidation', () => {
         }),
       ),
     });
-    expect(await new MemoryCuratorWorker(oversize).runOne(1000)).toBeNull();
+    // CHANGED: was `toBeNull()` (whole pass failed). Now a single all-rejected
+    // file behaves like the model returning `files: []` — the pass succeeds,
+    // writes nothing, and still marks the tail so the next trigger doesn't
+    // re-present the identical fact forever.
+    const oversizeReport = await new MemoryCuratorWorker(oversize).runOne(1000);
+    expect(oversizeReport).toMatchObject({ action: 'maintenance_written', fileCount: 0, rejectedCount: 1 });
     expect(writeTopicFile).not.toHaveBeenCalled();
-    expect(oversize.markConsolidated).not.toHaveBeenCalled();
+    // CHANGED: was `not.toHaveBeenCalled()`. markConsolidated now fires even
+    // when everything proposed was rejected — that's the whole point of the
+    // fix (see curator-worker.test.ts "a batch of entirely invalid files..."
+    // and curator-worker.ts runMaintenanceJob).
+    expect(oversize.markConsolidated).toHaveBeenCalledWith(TEST_WORKGROUP, ['mem_aaaaaaaaaaaaaaaa']);
+    expect(oversize.failMaintenance).not.toHaveBeenCalled();
 
     const manyFiles = Array.from({ length: 13 }, (_, i) => ({ path: `domain/topic-${i}.md`, content: `# T${i}\n` }));
     const overcount = deps({
@@ -791,9 +808,175 @@ describe('pillar-2 semantic consolidation', () => {
         }),
       ),
     });
-    expect(await new MemoryCuratorWorker(overcount).runOne(1000)).toBeNull();
-    expect(writeTopicFile).not.toHaveBeenCalled();
-    expect(overcount.markConsolidated).not.toHaveBeenCalled();
+    // CHANGED: was `toBeNull()` with `writeTopicFile` never called. Now the
+    // first CONSOLIDATION_MAX_FILES (12) of the 13 are accepted and written;
+    // only the 13th is rejected as `too-many-files`.
+    const overcountReport = await new MemoryCuratorWorker(overcount).runOne(1000);
+    expect(overcountReport).toMatchObject({ action: 'maintenance_written', fileCount: 12, rejectedCount: 1 });
+    expect(writeTopicFile).toHaveBeenCalledTimes(12);
+    expect(overcount.markConsolidated).toHaveBeenCalledWith(TEST_WORKGROUP, ['mem_aaaaaaaaaaaaaaaa']);
+    expect(overcount.failMaintenance).not.toHaveBeenCalled();
+  });
+
+  // New dedicated coverage for the deadlock fix (docs/specs/workgroup-cerebro
+  // plan.md §P2.4 item 7, corrected): a per-file violation must not deadlock
+  // consolidation for the entities behind it. All four cases below use the
+  // REAL central DB (dbConsolidationTail / consolidatedFactIds), matching the
+  // established F8 pattern, so a regression that writes files without
+  // actually inserting memory_consolidated_facts rows fails these even
+  // though a markConsolidated spy would have been satisfied by any call.
+  describe('per-file rejection makes progress instead of deadlocking (curator-contract throw -> partition fix)', () => {
+    it('an oversized topic file is dropped while the rest of the pass still lands', async () => {
+      seedLedger(
+        [
+          '# Generated workgroup memory',
+          '',
+          factLine('mem_aaaaaaaaaaaaaaaa', 'Maya Chen is the Acme liaison.'),
+          factLine('mem_bbbbbbbbbbbbbbbb', 'Acme pricing is usage-based.'),
+          factLine('mem_cccccccccccccccc', 'The nightly pipeline loads Acme data.'),
+          '',
+        ].join('\n'),
+      );
+      const oversizeContent = `# Huge\n\n${'z'.repeat(CONSOLIDATION_FILE_MAX_BYTES)}\n`;
+      const warnSpy = vi.spyOn(log, 'warn');
+      const d = deps({
+        claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 3, leaseOwner: 'worker' }),
+        consolidationTail: dbConsolidationTail(),
+        writeTopicFile: writeMemoryTopicFile,
+        markConsolidated: markFactsConsolidated,
+        consolidate: vi.fn(
+          async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+            decision: {
+              files: [
+                { path: 'people/maya-chen.md', content: '# Maya Chen\n\nLiaison for Acme.\n' },
+                { path: 'domain/acme-pricing.md', content: '# Acme pricing\n\nUsage-based.\n' },
+                { path: 'domain/huge.md', content: oversizeContent },
+              ],
+            },
+            model: 'claude-sonnet-5',
+            credentialSlot,
+            usage: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+          }),
+        ),
+      });
+      const report = await new MemoryCuratorWorker(d).runOne(1000);
+      // The pass did NOT fail: the two valid files exist on disk.
+      expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 2, rejectedCount: 1 });
+      expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/maya-chen.md').content).toContain('Liaison for Acme.');
+      expect(readMemoryTopicFile(TEST_WORKGROUP, 'domain/acme-pricing.md').content).toContain('Usage-based.');
+      // The oversized path does NOT exist (readMemoryTopicFile returns a
+      // null sha256 for a missing file rather than throwing).
+      expect(readMemoryTopicFile(TEST_WORKGROUP, 'domain/huge.md').sha256).toBeNull();
+      // The tail's fact ids ARE in memory_consolidated_facts — progress was
+      // made even though one entity's view was dropped this pass.
+      expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(
+        new Set(['mem_aaaaaaaaaaaaaaaa', 'mem_bbbbbbbbbbbbbbbb', 'mem_cccccccccccccccc']),
+      );
+      expect(d.failMaintenance).not.toHaveBeenCalled();
+      // A WARN fired naming the rejected path.
+      expect(warnSpy).toHaveBeenCalledWith(
+        'memory-curator: consolidation dropped invalid topic files this pass',
+        expect.objectContaining({
+          workgroupId: TEST_WORKGROUP,
+          rejected: [expect.objectContaining({ path: 'domain/huge.md', reason: 'too-large' })],
+        }),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it('a batch of entirely invalid files still consolidates the tail and writes nothing', async () => {
+      seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+      const writeTopicFile = vi.fn();
+      const d = deps({
+        claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+        consolidationTail: dbConsolidationTail(),
+        writeTopicFile,
+        markConsolidated: markFactsConsolidated,
+        consolidate: vi.fn(
+          async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+            decision: {
+              files: [
+                { path: 'not/a/topic/dir.md', content: '# Bad path\n' },
+                { path: 'people/also-bad.md', content: `# Y\n\n${'y'.repeat(CONSOLIDATION_FILE_MAX_BYTES)}\n` },
+              ],
+            },
+            model: 'claude-sonnet-5',
+            credentialSlot,
+            usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+          }),
+        ),
+      });
+      const report = await new MemoryCuratorWorker(d).runOne(1000);
+      expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 0, rejectedCount: 2 });
+      expect(writeTopicFile).not.toHaveBeenCalled();
+      expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set(['mem_aaaaaaaaaaaaaaaa']));
+      expect(d.failMaintenance).not.toHaveBeenCalled();
+    });
+
+    it('a malformed model payload still fails the whole pass', async () => {
+      seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+      const writeTopicFile = vi.fn();
+      const failMaintenance = vi.fn(() => true);
+      const d = deps({
+        claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+        consolidationTail: dbConsolidationTail(),
+        writeTopicFile,
+        markConsolidated: markFactsConsolidated,
+        failMaintenance,
+        consolidate: vi.fn(
+          async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+            // `files` is a string, not an array — a structural/protocol
+            // violation, distinct from a per-file content violation.
+            decision: { files: 'not-an-array' } as unknown as ConsolidationBackendResult['decision'],
+            model: 'claude-sonnet-5',
+            credentialSlot,
+            usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+          }),
+        ),
+      });
+      const report = await new MemoryCuratorWorker(d).runOne(1000);
+      expect(report).toBeNull();
+      expect(failMaintenance).toHaveBeenCalledOnce();
+      expect(writeTopicFile).not.toHaveBeenCalled();
+      expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set());
+    });
+
+    it('over-count batches accept the first twelve and reject the remainder', async () => {
+      seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+      const writtenPaths: string[] = [];
+      const writeTopicFile = vi.fn(
+        async (
+          workgroupId: string,
+          relativePath: string,
+          content: string,
+          expectedSha256: string | null,
+          factsCount: number,
+        ): Promise<CuratorWriteResult> => {
+          writtenPaths.push(relativePath);
+          return writeMemoryTopicFile(workgroupId, relativePath, content, expectedSha256, factsCount);
+        },
+      );
+      const manyFiles = Array.from({ length: 14 }, (_, i) => ({ path: `domain/topic-${i}.md`, content: `# T${i}\n` }));
+      const d = deps({
+        claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+        consolidationTail: dbConsolidationTail(),
+        writeTopicFile,
+        markConsolidated: markFactsConsolidated,
+        consolidate: vi.fn(
+          async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+            decision: { files: manyFiles },
+            model: 'claude-sonnet-5',
+            credentialSlot,
+            usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+          }),
+        ),
+      });
+      const report = await new MemoryCuratorWorker(d).runOne(1000);
+      expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 12, rejectedCount: 2 });
+      expect(writtenPaths).toEqual(manyFiles.slice(0, 12).map((file) => file.path));
+      expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set(['mem_aaaaaaaaaaaaaaaa']));
+      expect(d.failMaintenance).not.toHaveBeenCalled();
+    });
   });
 
   it('the ledger is byte-identical after a pass', async () => {

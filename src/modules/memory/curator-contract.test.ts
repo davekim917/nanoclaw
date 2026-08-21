@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildConsolidationPrompt,
   buildCuratorPrompt,
+  CONSOLIDATION_FILE_MAX_BYTES,
   CURATOR_CAPTURE_REASON_CODES,
   CURATOR_MAX_MEMORY_TEXT_CHARS,
   CURATOR_OUTPUT_SCHEMA,
@@ -165,6 +166,22 @@ describe('background memory curator contract', () => {
     // F6: the prompt instructs dating an unresolved conflict, so a date must
     // actually be in the payload for that instruction to be followable.
     expect(prompt.user).toContain('2026-08-15T00:00:00.000Z');
+  });
+
+  // A rejected oversized file is now silently dropped rather than failing
+  // the whole pass (curator-worker.ts runMaintenanceJob) — so the model's
+  // only chance to avoid losing an entity's view is being told the ceiling
+  // up front, in terms it can act on before it writes.
+  it('the consolidation prompt states the per-file byte ceiling', () => {
+    const prompt = buildConsolidationPrompt({
+      workgroupId: 'wg-a',
+      tail: [{ id: 'mem_aaaaaaaaaaaaaaaa', text: 'A fact.', capturedAt: '2026-08-15T00:00:00.000Z' }],
+      topicFiles: [],
+      boundary: 'B',
+    });
+    expect(prompt.system).toContain(CONSOLIDATION_FILE_MAX_BYTES.toLocaleString('en-US'));
+    expect(prompt.system).toMatch(/discarded entirely/);
+    expect(prompt.system).toMatch(/drop the lowest-value detail/);
   });
 
   it('canonicalizes an unambiguous raw platform evidence id to its archived provider namespace', () => {
