@@ -30,6 +30,7 @@ import {
   migrateLegacyContinuation,
   requeueWorkContinuationIfMatches,
   resetWorkContinuationForRealInbound,
+  clearDoneProposal,
   setContinuation,
   setCurrentInReplyTo,
   getStickyModel,
@@ -600,6 +601,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markProcessing(keptIds);
     if (hasRealInbound(keep)) {
       resetWorkContinuationForRealInbound();
+      // Real input means the thread is not finished after all — retract any
+      // standing close proposal so the console never offers a close over work
+      // that has since restarted. System rows (the close wrap-up request, the
+      // ceiling notice) are not real inbound and deliberately leave it alone.
+      clearDoneProposal();
       idleSuppressedContinuationIds.clear();
     }
 
@@ -1619,7 +1625,10 @@ export async function processQuery(
           return;
         }
         markProcessing(keptIds);
-        if (hasRealInbound(keep)) resetWorkContinuationForRealInbound();
+        if (hasRealInbound(keep)) {
+          resetWorkContinuationForRealInbound();
+          clearDoneProposal();
+        }
         if (skipped.length > 0) {
           markScriptSkipped(skipped);
           log(`Pre-task script skipped ${skipped.length} follow-up task(s): ${skipped.map((s) => s.id).join(', ')}`);

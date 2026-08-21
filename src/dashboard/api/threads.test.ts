@@ -10,6 +10,7 @@ import {
   deriveThreadState,
   isScheduledTaskThread,
   mergeThreadTranscript,
+  pickDoneProposal,
   replyTargetSessionId,
   threadChannelKey,
   UNKNOWN_CHANNEL_KEY,
@@ -23,6 +24,11 @@ import {
 vi.mock('../../container-runner.js', () => ({
   getActiveContainerSessionIds: () => [],
   resolveAssistantName: (group: { name: string }) => Promise.resolve(`persona:${group.name}`),
+  // Reached through thread-close.ts's read side, which the list imports for
+  // `readThreadClosures`. Neither is called on this path; stubbed so the module
+  // graph resolves without the spawn path.
+  isContainerRunning: () => false,
+  killContainer: () => {},
 }));
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1127,5 +1133,101 @@ describe('assignable_agents', () => {
     const synthetic = threads.find((t) => t.synthetic)!;
     expect(synthetic.channel_key).toBe(UNKNOWN_CHANNEL_KEY);
     expect(synthetic.assignable_agents).toEqual([]);
+  });
+});
+
+// ── Close proposal + close state on the wire ─────────────────────────────────
+
+describe('pickDoneProposal', () => {
+  const row = (over: Record<string, unknown>) =>
+    ({ id: 's1', agent_group_id: 'ag1', done_proposal: null, ...over }) as never;
+
+  it('is null when no session carries one — there is no default', () => {
+    expect(pickDoneProposal([row({}), row({ id: 's2' })])).toBeNull();
+  });
+
+  it('reads only the mirrored column, and the freshest statement wins', () => {
+    const picked = pickDoneProposal([
+      row({ id: 's-old', done_proposal: JSON.stringify({ reason: 'older', proposed_at: iso(600_000) }) }),
+      row({
+        id: 's-new',
+        agent_group_id: 'ag2',
+        done_proposal: JSON.stringify({ reason: 'newer', proposed_at: iso(60_000) }),
+      }),
+    ]);
+    expect(picked).toEqual({
+      reason: 'newer',
+      proposed_at: new Date(NOW - 60_000).toISOString(),
+      agent_group_id: 'ag2',
+      session_id: 's-new',
+    });
+  });
+
+  it('treats malformed, empty and undated records as absent rather than as a proposal', () => {
+    expect(pickDoneProposal([row({ done_proposal: 'not json' })])).toBeNull();
+    expect(
+      pickDoneProposal([row({ done_proposal: JSON.stringify({ reason: '  ', proposed_at: iso(0) }) })]),
+    ).toBeNull();
+    expect(pickDoneProposal([row({ done_proposal: JSON.stringify({ reason: 'ok' }) })])).toBeNull();
+    expect(pickDoneProposal([row({ done_proposal: JSON.stringify({ proposed_at: iso(0) }) })])).toBeNull();
+  });
+});
+
+describe('close state on the thread payload', () => {
+  beforeEach(() => {
+    setupDb();
+    seedAgentGroup('ag-close');
+  });
+
+  const listOne = async () => (await buildThreadList(makeCtx(), LIST_OPTS, deps())).threads[0]!;
+
+  it('defaults to no proposal and TWO required confirmations', async () => {
+    insertSession({ id: 's-plain', agentGroupId: 'ag-close', threadId: 'slack:C1:1.1' });
+    const t = await listOne();
+    expect(t.done_proposal).toBeNull();
+    expect(t.closing).toBe(false);
+    // Overriding an agent that still believes it has work costs two clicks.
+    expect(t.close_confirmations_required).toBe(2);
+  });
+
+  it('an actual agent proposal surfaces with its reason and drops the count to ONE', async () => {
+    insertSession({ id: 's-prop', agentGroupId: 'ag-close', threadId: 'slack:C1:1.2' });
+    getDb()
+      .prepare('UPDATE sessions SET done_proposal = ? WHERE id = ?')
+      .run(JSON.stringify({ reason: 'shipped; suite green', proposed_at: iso(30_000) }), 's-prop');
+    const t = await listOne();
+    expect(t.done_proposal).toMatchObject({ reason: 'shipped; suite green', session_id: 's-prop' });
+    expect(t.close_confirmations_required).toBe(1);
+  });
+
+  it('proposing does not move the thread out of running — it is a flag, not a state', async () => {
+    insertSession({ id: 's-live', agentGroupId: 'ag-close', threadId: 'slack:C1:1.3' });
+    getDb()
+      .prepare('UPDATE sessions SET done_proposal = ? WHERE id = ?')
+      .run(JSON.stringify({ reason: 'think I am done', proposed_at: iso(30_000) }), 's-live');
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps({ containerStatus: () => 'running' }));
+    // The whole point of not minting a `proposes_closing` state: live work
+    // keeps reading as live.
+    expect(threads[0]!.state).toBe('running');
+    expect(threads[0]!.done_proposal).not.toBeNull();
+  });
+
+  it('an in-flight close sets `closing`; a finished one does not', async () => {
+    insertSession({ id: 's-closing', agentGroupId: 'ag-close', threadId: 'slack:C1:1.4' });
+    const insert = (state: string) =>
+      getDb()
+        .prepare(
+          `INSERT INTO thread_closures (thread_id, requested_by, requested_at, reason, agent_proposed, session_ids, state)
+           VALUES ('slack:C1:1.4', 'u1', ?, NULL, 0, '["s-closing"]', ?)
+           ON CONFLICT(thread_id) DO UPDATE SET state = excluded.state`,
+        )
+        .run(iso(60_000), state);
+
+    insert('awaiting_confirmation');
+    expect((await listOne()).closing).toBe(true);
+    insert('finalizing');
+    expect((await listOne()).closing).toBe(true);
+    insert('closed');
+    expect((await listOne()).closing).toBe(false);
   });
 });

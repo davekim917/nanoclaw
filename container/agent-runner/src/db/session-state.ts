@@ -342,6 +342,11 @@ export function queueWorkContinuation(task: string, sourceMessageId?: string | n
     recovery_episode: 0,
   };
   setValue(WORK_CONTINUATION_KEY, JSON.stringify(continuation));
+  // Taking on more work retracts any standing close proposal — see
+  // clearDoneProposal. Promising a next step and proposing done are
+  // contradictory statements about the same session, and the operator acts on
+  // the proposal, so the newer statement must win.
+  clearDoneProposal();
   return { accepted: true, continuation };
 }
 
@@ -422,6 +427,70 @@ export function shouldPostInfraWarning(text: string): boolean {
   }
   setValue(INFRA_WARNING_KEY, text);
   return true;
+}
+
+/* ─── Done proposal ────────────────────────────────────────────────────────── */
+
+const DONE_PROPOSAL_KEY = 'done_proposal';
+
+export const DONE_PROPOSAL_REASON_MAX_CHARS = 500;
+
+/**
+ * The agent's own "I believe this thread is finished" record.
+ *
+ * Stored exactly the way {@link WorkContinuation} is — one JSON row in
+ * `session_state` on the container-owned outbound.db — because it is the same
+ * kind of thing: a durable statement about work that has to outlive the
+ * container that made it. No second store, no new table, and no outbound
+ * message: proposing is not saying anything to the room.
+ *
+ * **Proposing is not closing.** Nothing in the runner reads this to change what
+ * the agent does. The poll loop, the continuation paths and the ceiling paths
+ * are all untouched by it. The host surfaces it; an operator decides.
+ *
+ * The timestamp is carried IN the record rather than read off
+ * `session_state.updated_at`, because the host compares it against the moment
+ * it asked for a wrap-up, and that comparison IS the confirmation signal — it
+ * must not ride on a column any later write to this key would move.
+ */
+export interface DoneProposal {
+  reason: string;
+  /** ISO-8601 UTC, always — CLAUDE.md's timestamp rule. */
+  proposed_at: string;
+}
+
+export function getDoneProposal(): DoneProposal | undefined {
+  const raw = getValue(DONE_PROPOSAL_KEY);
+  if (raw === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as Partial<DoneProposal>;
+    if (typeof parsed.reason !== 'string' || parsed.reason.trim() === '') return undefined;
+    if (parsed.reason.length > DONE_PROPOSAL_REASON_MAX_CHARS) return undefined;
+    if (typeof parsed.proposed_at !== 'string' || Number.isNaN(Date.parse(parsed.proposed_at))) return undefined;
+    return { reason: parsed.reason.trim(), proposed_at: parsed.proposed_at };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Record (or replace) this session's close proposal. */
+export function proposeDone(reason: string): DoneProposal {
+  const proposal: DoneProposal = { reason: reason.trim(), proposed_at: new Date().toISOString() };
+  setValue(DONE_PROPOSAL_KEY, JSON.stringify(proposal));
+  return proposal;
+}
+
+/**
+ * Drop the proposal. Called when the agent takes on more work
+ * ({@link queueWorkContinuation}) and when real user input arrives (poll-loop's
+ * `hasRealInbound` seam) — both mean "not finished after all", and a stale
+ * proposal would offer the operator a one-confirmation close over work that has
+ * since restarted.
+ */
+export function clearDoneProposal(): boolean {
+  const existed = getValue(DONE_PROPOSAL_KEY) !== undefined;
+  deleteValue(DONE_PROPOSAL_KEY);
+  return existed;
 }
 
 export function resetWorkContinuationForRealInbound(): WorkContinuation | undefined {

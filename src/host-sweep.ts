@@ -60,6 +60,7 @@ import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js
 import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { runHostGatedTaskScripts } from './modules/scheduling/host-script.js';
 import { purgeIntentBody } from './dashboard/api/scheduled-shared.js';
+import { advanceThreadClosures, syncDoneProposalMirror } from './dashboard/thread-close.js';
 import { log } from './log.js';
 import {
   openInboundDb,
@@ -1133,6 +1134,17 @@ async function sweep(): Promise<void> {
   // Runs after per-session sweeps so container state is current.
   runReconcilerSweep();
 
+  // Advance operator-confirmed thread closes: wait for the agent's wrap-up
+  // confirmation, then clear its saved work, stop the container and archive —
+  // in that order (src/dashboard/thread-close.ts). Central-DB scan of the few
+  // in-flight rows, once per tick, after the per-session loop so container
+  // state is current. Nothing here can START a close; only an operator can.
+  try {
+    advanceThreadClosures();
+  } catch (err) {
+    log.warn('thread-close sweep step failed', { err });
+  }
+
   // Prune steer_idempotency rows: applied rows older than 60s, pending rows older than 5min.
   pruneSteerIdempotency();
   pruneChannelIngressReceipts();
@@ -1681,6 +1693,20 @@ async function sweepSession(session: Session): Promise<number | null> {
     // recovery is both throttled and hard-capped per continuation id.
     let justWoke = false;
     const workContinuation = outDb ? readWorkContinuation(outDb) : null;
+
+    // Mirror the container's own `propose_done` record onto the central
+    // `sessions` row so the Observatory list can show "proposes closing"
+    // without opening a per-session SQLite file per row. Free here — the
+    // handle is already open and it is one SELECT — and deliberately NOT the
+    // copy the close path trusts (see thread-close.ts). Isolated: a mirror
+    // failure must never cost this session its sweep.
+    if (outDb) {
+      try {
+        syncDoneProposalMirror(session.id, outDb);
+      } catch (err) {
+        log.warn('done_proposal mirror failed', { sessionId: session.id, err });
+      }
+    }
     if (
       !isContainerRunning(session.id) &&
       workContinuation &&
