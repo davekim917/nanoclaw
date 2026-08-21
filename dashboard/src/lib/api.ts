@@ -152,19 +152,6 @@ export async function postSessionMessage(
   });
 }
 
-export async function archiveSession(sessionId: string): Promise<{ session_id: string; archived_at: string }> {
-  return apiFetch<{ session_id: string; archived_at: string }>(
-    `/dashboard/api/sessions/${encodeURIComponent(sessionId)}/archive`,
-    { method: 'POST' },
-  );
-}
-
-export async function unarchiveSession(sessionId: string): Promise<{ session_id: string }> {
-  return apiFetch<{ session_id: string }>(`/dashboard/api/sessions/${encodeURIComponent(sessionId)}/unarchive`, {
-    method: 'POST',
-  });
-}
-
 // ─── Scheduled-tasks board (Group E) ────────────────────────────────────────
 //
 // Types mirror the host-side frozen contract: the verb×state matrix
@@ -692,8 +679,8 @@ export async function getObservatory(workgroupId: string): Promise<ObservatorySn
 // `(agent_group_id, messaging_group_id, thread_id)`, so a session-keyed list
 // renders ~40% duplicate rows.
 
-/** §5's seven states. `idle` is the residual — and the common case. */
-export type ThreadState = 'unassigned' | 'needs_you' | 'stalled' | 'running' | 'parked' | 'done' | 'idle';
+/** §5's states. `idle` is the residual — and the common case. */
+export type ThreadState = 'unassigned' | 'needs_you' | 'stalled' | 'running' | 'parked' | 'idle';
 
 export interface ThreadParticipant {
   agent_group_id: string;

@@ -17,7 +17,6 @@ const listThreads = vi.fn();
 const listGroups = vi.fn();
 const listWorkgroups = vi.fn();
 const getThreadDetail = vi.fn();
-const archiveSession = vi.fn().mockResolvedValue({});
 const snoozeThread = vi.fn().mockResolvedValue({});
 const unsnoozeThread = vi.fn().mockResolvedValue({});
 const postThreadMessage = vi.fn().mockResolvedValue({ created_session: false, handoff: null });
@@ -26,7 +25,6 @@ vi.mock('../../lib/api.js', () => ({
   listGroups,
   listWorkgroups,
   getThreadDetail,
-  archiveSession,
   snoozeThread,
   unsnoozeThread,
   postThreadMessage,
@@ -335,13 +333,13 @@ describe('lastMessagePreview', () => {
  * snooze lane that keeps snoozed work reachable, and triage as a mode entered
  * FROM the list (§11) that hands the list back exactly as it was.
  */
-describe('the ONE action, and the two that are not messages', () => {
+describe('the ONE action, and the one that is not a message', () => {
   /**
    * Every state's verb opens the composer on the thread. `idle` is in here on
    * purpose — it used to be the one row with no button at all, and `stalled`
    * used to render an inert `Kill`. Both are gone.
    */
-  it.each(['needs_you', 'stalled', 'unassigned', 'running', 'parked', 'done', 'idle'] as ThreadState[])(
+  it.each(['needs_you', 'stalled', 'unassigned', 'running', 'parked', 'idle'] as ThreadState[])(
     '%s: the verb focuses the composer rather than sending blind',
     async (state) => {
       const user = userEvent.setup();
@@ -353,7 +351,6 @@ describe('the ONE action, and the two that are not messages', () => {
       await user.click(verb);
       await waitFor(() => expect(document.activeElement).toBe(screen.getByLabelText('Message text')));
       expect(postThreadMessage).not.toHaveBeenCalled();
-      expect(archiveSession).not.toHaveBeenCalled();
     },
   );
 
@@ -366,26 +363,19 @@ describe('the ONE action, and the two that are not messages', () => {
     expect(container.textContent!.toLowerCase()).not.toContain('kill');
   });
 
-  /** Dismiss is not a verb on the row any more — it is one of the two
-      non-message actions, and it lives on the detail pane beside snooze.
-      It is DISMISS rather than close because it only sets `archived_at`: the
-      container keeps running and the inbound queue is untouched. */
-  it('Dismiss archives every session on the thread, from the detail pane', async () => {
+  /**
+   * Close/Dismiss is gone entirely — archiving hid a thread from the queue
+   * without stopping the agent inside it, so the work kept running
+   * unattended. The detail pane now offers only snooze.
+   */
+  it('the detail pane offers no close/dismiss action', async () => {
     const user = userEvent.setup();
-    listThreads.mockResolvedValue({ threads: [thread('t-done', { state: 'done', session_ids: ['s-x', 's-y'] })] });
+    listThreads.mockResolvedValue({ threads: [thread('t-idle', { state: 'idle', session_ids: ['s-x', 's-y'] })] });
     const { container } = mount();
     await waitFor(() => expect(container.querySelector('.ncc-row-main')).toBeTruthy());
     await user.click(container.querySelector('.ncc-row-main') as HTMLElement);
-    const dismiss = await screen.findByRole('button', { name: 'dismiss' });
-    // The word alone would leave "does this stop the agent?" unanswered, which
-    // is the question that got `close` pressed by mistake.
-    expect(dismiss.getAttribute('title')).toBe(
-      'Removes the thread from your queue. The agent is not stopped and its work continues.',
-    );
-    expect(screen.queryByRole('button', { name: 'close' })).toBeNull();
-    await user.click(dismiss);
-    await waitFor(() => expect(archiveSession).toHaveBeenCalledTimes(2));
-    expect(archiveSession.mock.calls.map((c) => c[0])).toEqual(['s-x', 's-y']);
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'snooze' })).toBeTruthy());
+    expect(screen.queryByRole('button', { name: /close|dismiss/i })).toBeNull();
   });
 });
 

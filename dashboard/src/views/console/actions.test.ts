@@ -3,23 +3,23 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 /**
  * The console has ONE message primitive, and these tests bind the ways that
  * goes wrong silently: a send routed through the `observatory/steer`
- * task-spawner (which cannot address a thread at all), a send that names a
- * session instead of an agent (so Assign becomes unreachable), and a Close that
- * archives one session out of six and so never changes the state.
+ * task-spawner (which cannot address a thread at all), and a send that names a
+ * session instead of an agent (so Assign becomes unreachable).
+ *
+ * There used to be a third action, Close, which archived a thread's sessions.
+ * It is gone — archiving hid a thread without stopping the agent inside it.
  */
 
 const postThreadMessage = vi.fn().mockResolvedValue({});
-const archiveSession = vi.fn().mockResolvedValue({});
 const snoozeThread = vi.fn().mockResolvedValue({});
 const unsnoozeThread = vi.fn().mockResolvedValue({});
-vi.mock('../../lib/api.js', () => ({ postThreadMessage, archiveSession, snoozeThread, unsnoozeThread }));
+vi.mock('../../lib/api.js', () => ({ postThreadMessage, snoozeThread, unsnoozeThread }));
 
 const actions = await import('./actions.js');
-const { closeThread, newIdempotencyKey, sendToAgent, setSnoozed } = actions;
+const { newIdempotencyKey, sendToAgent, setSnoozed } = actions;
 
 beforeEach(() => {
   postThreadMessage.mockClear();
-  archiveSession.mockClear();
   snoozeThread.mockClear();
   unsnoozeThread.mockClear();
 });
@@ -56,25 +56,22 @@ describe('sendToAgent — steer, push, ship, assign and reassign are ONE call', 
   });
 });
 
-/** Kill was a verb here once. It is gone, not disabled — nothing exports it. */
-describe('there is no kill action', () => {
-  it('the actions module exposes exactly the message primitive, close and snooze', () => {
-    expect(Object.keys(actions).sort()).toEqual(['closeThread', 'newIdempotencyKey', 'sendToAgent', 'setSnoozed']);
-  });
-});
-
-describe('closeThread', () => {
-  it('archives EVERY session on the thread — §5 computes `done` from all of them', async () => {
-    await closeThread({ session_ids: ['s-1', 's-2', 's-3'] });
-    expect(archiveSession.mock.calls.map((c) => c[0])).toEqual(['s-1', 's-2', 's-3']);
+/**
+ * Kill was a verb here once. It is gone, not disabled — nothing exports it.
+ * Close/Dismiss was a second one, gone for the same reason a kill would be
+ * wrong for the opposite case: it hid a thread from the queue without
+ * stopping the agent, so the work kept running unattended.
+ */
+describe('there is no kill action, and no close/dismiss action', () => {
+  it('the actions module exposes exactly the message primitive and snooze', () => {
+    expect(Object.keys(actions).sort()).toEqual(['newIdempotencyKey', 'sendToAgent', 'setSnoozed']);
   });
 });
 
 describe('setSnoozed', () => {
-  it('snoozes and un-snoozes through the thread-keyed endpoints, not archive', async () => {
+  it('snoozes and un-snoozes through the thread-keyed endpoints', async () => {
     await setSnoozed('slack:CTESTCHAN01:1700000000.11', true);
     expect(snoozeThread).toHaveBeenCalledWith('slack:CTESTCHAN01:1700000000.11');
-    expect(archiveSession).not.toHaveBeenCalled();
 
     await setSnoozed('slack:CTESTCHAN01:1700000000.11', false);
     expect(unsnoozeThread).toHaveBeenCalledWith('slack:CTESTCHAN01:1700000000.11');

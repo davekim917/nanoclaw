@@ -9,7 +9,7 @@ import type { ThreadSummary, ThreadState } from '../../lib/api.js';
  * all that same action — the only difference is whether the chosen agent is
  * already on the thread, and that difference is the selector's, not a verb's.
  *
- * So `verb` below is a LABEL over one mechanism, not a switch between seven.
+ * So `verb` below is a LABEL over one mechanism, not a switch between six.
  * Every state has one, `idle` included, and none of them is ever inert: a
  * stalled thread gets a message, not a kill. There is deliberately no `action`
  * field and no `inertReason` — nothing left for either to discriminate.
@@ -57,8 +57,7 @@ export const STATE_PRESENTATION: Record<ThreadState, StatePresentation> = {
   // Parked work is work that needs an owner, and handing it over is a message
   // to whoever should take it — plus a composed note to the incumbent.
   parked: { label: 'Parked', verb: 'Hand to…', tone: 'quiet', wantsAttention: false, emptyPhrase: 'is parked' },
-  done: { label: 'Done', verb: 'Steer', tone: 'quiet', wantsAttention: false, emptyPhrase: 'is done' },
-  // §5's seventh state and the COMMON case — 57 of 63 threads in a live 24h
+  // §5's sixth state and the COMMON case — 57 of 63 threads in a live 24h
   // window. It used to be the one row with no button, on the theory that a
   // thread nobody is waiting on wants nothing done to it. That was backwards:
   // an idle thread is exactly where an operator arrives with a new instruction.
@@ -96,7 +95,7 @@ export function replyTarget(
  * no session has no container, claim or transcript to consult), and the server
  * owns it. Display order is urgency: what the operator should look at first.
  */
-export const LANE_ORDER: ThreadState[] = ['needs_you', 'stalled', 'unassigned', 'running', 'parked', 'idle', 'done'];
+export const LANE_ORDER: ThreadState[] = ['needs_you', 'stalled', 'unassigned', 'running', 'parked', 'idle'];
 
 /** Queue sort key: urgency first (DESIGN §1 — status is a sort, never a column). */
 export function urgencyRank(state: ThreadState): number {
@@ -112,9 +111,8 @@ export function urgencyRank(state: ThreadState): number {
  * been lying about longest. An unassigned thread is breached at birth, so it
  * sorts with the breaches rather than into a tidy backlog of its own.
  *
- * Everything else stays newest-first: `running`, `idle` and `done` are not
- * promises anyone is waiting on, and there the freshest row is the interesting
- * one.
+ * Everything else stays newest-first: `running` and `idle` are not promises
+ * anyone is waiting on, and there the freshest row is the interesting one.
  *
  * Written out rather than read off `wantsAttention` on purpose — that flag is a
  * COST control (§4.1's preview budget) and the two would drift the first time

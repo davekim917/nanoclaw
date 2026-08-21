@@ -172,7 +172,6 @@ describe('threadChannelKey', () => {
 describe('deriveThreadState', () => {
   const base: ThreadStateInput = {
     sessionCount: 1,
-    allArchived: false,
     claimState: null,
     claimNote: '',
     needsOperator: false,
@@ -209,10 +208,6 @@ describe('deriveThreadState', () => {
     expect(deriveThreadState({ ...base, claimState: 'parked', claimNote: 'handing this off' })).toBe('parked');
   });
 
-  it('done — every backing session archived', () => {
-    expect(deriveThreadState({ ...base, allArchived: true })).toBe('done');
-  });
-
   it('idle — the residual DESIGN.md does not name', () => {
     expect(deriveThreadState(base)).toBe('idle');
   });
@@ -221,7 +216,6 @@ describe('deriveThreadState', () => {
 describe('the stall rule (§5.1)', () => {
   const stalling: ThreadStateInput = {
     sessionCount: 1,
-    allArchived: false,
     claimState: null,
     claimNote: '',
     needsOperator: false,
@@ -572,7 +566,7 @@ describe('replyTargetSessionId (§10.3)', () => {
   });
 
   it('falls back to the most recently active session for every other state', () => {
-    for (const state of ['parked', 'done', 'idle', 'unassigned'] as const) {
+    for (const state of ['parked', 'idle', 'unassigned'] as const) {
       expect(replyTargetSessionId(state, rows, { needsOperator: asked, pickedSessionId: 's-old' })).toBe('s-fresh');
     }
     // …and also when the state's own driver cannot be identified.

@@ -17,7 +17,7 @@ import { stripMarkdown } from '../../lib/markdown.js';
 import { subscribe } from '../../lib/sse.ts';
 import { useWorkgroupFilter } from '../../lib/use-workgroup-filter.js';
 import { actionError } from './action-error.js';
-import { closeThread, setSnoozed } from './actions.js';
+import { setSnoozed } from './actions.js';
 import { ScheduleLens } from './ScheduleLens.js';
 import { ThreadDetail } from './ThreadDetail.js';
 import { ThreadRow, type ThreadPreview } from './ThreadRow.js';
@@ -204,36 +204,19 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
    * The row's ONE verb, and it is one verb for every state now: open the
    * composer on this thread. Answer / Push / Steer / Assign / Hand to… are
    * words, not branches — `STATE_PRESENTATION` picks the word and this picks
-   * nothing. Close and Snooze are the two actions that are NOT a message, and
-   * they live on the detail pane rather than in the queue's verb column.
+   * nothing. Snooze is the one action that is NOT a message, and it lives on
+   * the detail pane rather than in the queue's verb column.
+   *
+   * There used to be a second non-message action here — Dismiss (formerly
+   * Close), which archived every session on the thread. It is gone: archiving
+   * hid the thread from the queue without stopping the agent, so the work kept
+   * running unattended and unwatched. A thread only leaves the queue when it
+   * is actually finished, not when an operator stops looking at it.
    */
   const onVerb = useCallback((t: ThreadSummary) => {
     setSelectedId(t.thread_id);
     setFocusComposer((n) => n + 1);
   }, []);
-
-  /**
-   * DISMISS, not close.
-   *
-   * The word matters and the operator paid for it: this sets `archived_at` and
-   * nothing else. The container keeps running, the inbound queue keeps its
-   * messages, and the agent is never told. "Close" read as "end the work", so
-   * it was pressed expecting exactly that. The mechanism is unchanged —
-   * `closeThread` still archives every session on the thread, which is what
-   * DESIGN §5 computes `done` from — only the word is different.
-   */
-  const onDismiss = useCallback(
-    (t: ThreadSummary) => {
-      setNotice(`Dismissing ${t.title ?? 'thread'}…`);
-      closeThread(t)
-        .then(() => {
-          setNotice(`Dismissed ${t.title ?? 'thread'}.`);
-          void mutate();
-        })
-        .catch((err: unknown) => setNotice(`Could not dismiss — ${actionError(err)}.`));
-    },
-    [mutate],
-  );
 
   const onToggleSnooze = useCallback(
     (t: ThreadSummary) => {
@@ -451,7 +434,7 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
             ) : (
               <div className="ncc-detail-wrap">
                 {selected && (
-                  /* The two actions that are not a message. Everything else on this
+                  /* The one action that is not a message. Everything else on this
                  screen is the composer below. */
                   <div className="ncc-detail-actions">
                     {/* On a phone the list and the thread are one pane, so
@@ -462,14 +445,6 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
                     </button>
                     <button type="button" className="ncc-verb" onClick={() => onToggleSnooze(selected)}>
                       {selected.snoozed ? 'un-snooze' : 'snooze'}
-                    </button>
-                    <button
-                      type="button"
-                      className="ncc-verb"
-                      title="Removes the thread from your queue. The agent is not stopped and its work continues."
-                      onClick={() => onDismiss(selected)}
-                    >
-                      dismiss
                     </button>
                   </div>
                 )}

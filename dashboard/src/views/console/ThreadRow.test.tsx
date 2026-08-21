@@ -11,7 +11,7 @@ import type { ThreadState, ThreadSummary } from '../../lib/api.js';
  * The row is the whole surface's load-bearing element, so these tests bind the
  * three rules that ship broken silently:
  *
- *  - every one of the seven states renders, with ITS verb and ITS label (§5);
+ *  - every one of the six states renders, with ITS verb and ITS label (§5);
  *  - the hybrid line appears only on rows wanting attention (§4.1 — a COST
  *    control, so "improving" it into a preview for every row is a regression
  *    this test is here to catch);
@@ -46,7 +46,7 @@ function thread(over: Partial<ThreadSummary> = {}): ThreadSummary {
   };
 }
 
-const ALL_STATES: ThreadState[] = ['needs_you', 'stalled', 'unassigned', 'running', 'parked', 'done', 'idle'];
+const ALL_STATES: ThreadState[] = ['needs_you', 'stalled', 'unassigned', 'running', 'parked', 'idle'];
 
 function renderRow(over: Partial<ThreadSummary> = {}, props: Partial<Parameters<typeof ThreadRow>[0]> = {}) {
   const onSelect = vi.fn();
@@ -59,7 +59,7 @@ function renderRow(over: Partial<ThreadSummary> = {}, props: Partial<Parameters<
   return { ...utils, row, onSelect };
 }
 
-describe('all seven states render, every one with a LIVE verb', () => {
+describe('all six states render, every one with a LIVE verb', () => {
   it.each(ALL_STATES)('%s shows its own label and verb', (state) => {
     const { row } = renderRow({ state });
     const presentation = STATE_PRESENTATION[state];
@@ -116,7 +116,7 @@ describe('all seven states render, every one with a LIVE verb', () => {
     expect(renderRow({ state: 'stalled' }).row.className).toContain('attention');
     expect(renderRow({ state: 'unassigned' }).row.className).toContain('attention');
     expect(renderRow({ state: 'running' }).row.className).toContain('live');
-    for (const quiet of ['parked', 'done', 'idle'] as ThreadState[]) {
+    for (const quiet of ['parked', 'idle'] as ThreadState[]) {
       const cls = renderRow({ state: quiet }).row.className;
       expect(cls).toContain('quiet');
       expect(cls).not.toContain('attention');
@@ -145,8 +145,8 @@ describe('the hybrid line is a cost control (§4.1)', () => {
     }
   });
 
-  it('is absent on healthy running, parked, done and idle rows EVEN IF a preview is handed in', () => {
-    for (const state of ['running', 'parked', 'done', 'idle'] as ThreadState[]) {
+  it('is absent on healthy running, parked and idle rows EVEN IF a preview is handed in', () => {
+    for (const state of ['running', 'parked', 'idle'] as ThreadState[]) {
       const { row } = renderRow({ state, tool_started_at: '2026-08-20T11:59:00.000Z' }, { preview });
       expect(row.querySelector('.ncc-row-hybrid')).toBeNull();
     }

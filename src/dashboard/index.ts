@@ -22,7 +22,6 @@ import { threadsHandler, threadsDetailHandler } from './api/threads.js';
 import { groupsListHandler } from './api/groups.js';
 import { messagingGroupsListHandler } from './api/messaging-groups.js';
 import { sessionMessageHandler } from './steer.js';
-import { sessionArchiveHandler, sessionUnarchiveHandler } from './archive.js';
 import { threadMessageHandler } from './thread-message.js';
 import { threadSnoozeHandler, threadUnsnoozeHandler } from './thread-snooze.js';
 import { scheduledListHandler, scheduledDetailHandler, scheduledSearchHandler } from './api/scheduled-read.js';
@@ -84,8 +83,6 @@ export function startDashboard(): void {
   register('GET', '/dashboard/api/groups', requireAuth(groupsListHandler));
   register('GET', '/dashboard/api/messaging-groups', requireAuth(messagingGroupsListHandler));
   register('POST', '/dashboard/api/sessions/:id/message', requireAuth(sessionMessageHandler));
-  register('POST', '/dashboard/api/sessions/:id/archive', requireAuth(sessionArchiveHandler));
-  register('POST', '/dashboard/api/sessions/:id/unarchive', requireAuth(sessionUnarchiveHandler));
 
   // Workgroup dashboard (fleet-hardening Phase 3) — read-only. :id must
   // appear after the other single-segment sub-resources it doesn't collide

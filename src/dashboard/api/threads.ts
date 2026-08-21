@@ -120,16 +120,24 @@ export function threadChannelKey(threadId: string | null | undefined, known?: Re
 /* ─── State (§5) ───────────────────────────────────────────────────────────── */
 
 /**
- * DESIGN.md §5's seven states.
+ * DESIGN.md §5's states.
  *
  * `idle` was reported back as a gap during this build and §5 now carries it:
- * the six named states did not partition the space. A thread whose container is
- * not running, that holds no claim, that is not archived and whose last tool
- * call finished normally matches none of the others — 57 of 63 threads in a
- * live 24h window. Rendering those as `done` would be a lie and dropping them
- * would hide real work, so they get an honest residual label, and no verb.
+ * the named states did not partition the space. A thread whose container is
+ * not running, that holds no claim, and whose last tool call finished
+ * normally matches none of the others — 57 of 63 threads in a live 24h
+ * window. Dropping them would hide real work, so they get an honest residual
+ * label, and no verb.
+ *
+ * There used to be a `done` state, reached only when every backing session
+ * was archived by the operator's own Close/Dismiss action. It is gone along
+ * with that action: `done` was never "the agent finished" — it was "an
+ * operator stopped looking at this" — and a lane that can only be reached by
+ * looking away misreports hidden, possibly still-running work as complete. A
+ * thread whose sessions are archived now falls through to `idle`, which is
+ * the honest read: no container running, nothing claimed.
  */
-export type ThreadState = 'unassigned' | 'needs_you' | 'stalled' | 'running' | 'parked' | 'done' | 'idle';
+export type ThreadState = 'unassigned' | 'needs_you' | 'stalled' | 'running' | 'parked' | 'idle';
 
 /** §5: a tool that started this long ago with nothing newer out is stuck. */
 export const STALL_AFTER_MS = 30 * 60_000;
@@ -137,8 +145,6 @@ export const STALL_AFTER_MS = 30 * 60_000;
 export interface ThreadStateInput {
   /** How many sessions back this work item. Zero = an unowned item with no thread yet. */
   sessionCount: number;
-  /** Every backing session carries `archived_at`. */
-  allArchived: boolean;
   /** The claim held on this thread, if any. */
   claimState: BoardClaim['state'] | null;
   claimNote: string;
@@ -158,7 +164,7 @@ export interface ThreadStateInput {
 const WAITING_ON_NOTE = /\bwaiting on\b/i;
 
 /**
- * Which of the seven states a thread is in. Pure — every input is resolved by
+ * Which state a thread is in. Pure — every input is resolved by
  * the caller so this is directly testable and so the release board can feed
  * ownerless items through the same function once §10.3 lands.
  *
@@ -194,7 +200,6 @@ export function deriveThreadState(input: ThreadStateInput): ThreadState {
   if (input.containerStatus === 'running' || input.providerStatus === 'active') return 'running';
 
   if (input.claimState === 'parked') return 'parked';
-  if (input.allArchived) return 'done';
   return 'idle';
 }
 
@@ -974,7 +979,6 @@ export async function buildThreadList(
 
     const state = deriveThreadState({
       sessionCount: ordered.length,
-      allArchived: ordered.every((r) => r.archived_at !== null),
       claimState: claim?.state ?? null,
       claimNote: claim?.note ?? '',
       needsOperator: ordered.some(sessionNeedsOperator),

@@ -22,7 +22,6 @@ const postThreadMessage = vi.fn().mockResolvedValue({ created_session: false, ha
 vi.mock('../../lib/api.js', () => ({
   getThreadDetail,
   postThreadMessage,
-  archiveSession: vi.fn(),
   snoozeThread: vi.fn(),
   unsnoozeThread: vi.fn(),
 }));
