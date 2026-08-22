@@ -12,11 +12,15 @@
  *
  * Three exclusions are load-bearing, not defensive padding:
  *
- *   1. `waiting on <person>: …` notes are NEVER acted on. That note shape is
- *      the human-blocked discipline from container/skills/work-claims/SKILL.md.
- *      Nudging it tells an agent to move work it already correctly stopped on;
- *      reassigning it moves the block to a second agent. It stays red on the
- *      board, which is where a human is supposed to see it.
+ *   1. `waiting on <person>: …` notes are never NUDGED or reassigned. That note
+ *      shape is the human-blocked discipline from
+ *      container/skills/work-claims/SKILL.md. Nudging it tells an agent to move
+ *      work it already correctly stopped on; reassigning it moves the block to a
+ *      second agent. What it gets instead is silence for PARK_GRACE_MS and then
+ *      exactly one escalation that @-mentions the named human — see
+ *      `decideHumanBlocked`. This used to be an absolute exemption, which meant
+ *      a claim parked on a person could never be spoken about again; "do not nag
+ *      on a timer" is not the same rule as "never speak".
  *   2. A claim with no `thread_id` is never nudged. There is no honest room to
  *      nudge in — the same reason dashboard/nudge.ts 409s rather than guessing.
  *   3. A claim that says it finished is not stalled work (declaresItselfFinished).
@@ -35,7 +39,8 @@
  *
  * The ladder is deliberately slow and deliberately short: nudge the owner, nudge
  * it once more a day later, and only then — behind its own separate flag —
- * offer the work to a sibling. Takeover is the only step where one agent takes
+ * offer the work to a sibling. A human-blocked claim skips the ladder entirely
+ * and gets its own single rung. Takeover is the only step where one agent takes
  * another's work with no human in the loop, and a misfire recreates the
  * duplicate-work problem claims exist to prevent, so it arms separately from
  * everything else here. After that the claim is left alone, red, forever.
@@ -48,7 +53,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { readClaims, type BoardClaim } from '../../claims-board.js';
+import { PARK_GRACE_MS, readClaims, type BoardClaim } from '../../claims-board.js';
 import { SELF_HEAL_ENABLED, SELF_HEAL_TAKEOVER_ENABLED } from '../../config.js';
 import { log } from '../../log.js';
 import { claimsBaseDir, declaresItselfFinished } from './escalation.js';
@@ -115,7 +120,7 @@ export interface SelfHealStamps {
   auto_heal_unresolved_at?: unknown;
 }
 
-export type SelfHealAction = 'nudge' | 'takeover' | 'exhaust';
+export type SelfHealAction = 'nudge' | 'takeover' | 'exhaust' | 'escalate-human';
 
 export interface SelfHealDecision {
   action: SelfHealAction | 'none';
@@ -164,6 +169,58 @@ function inUnresolvedBackoff(stamps: SelfHealStamps, now: number): boolean {
 }
 
 /**
+ * Who the note says owes the answer, out of `waiting on <person>: <what>`.
+ *
+ * Returned verbatim, including "the reviewer or the operator" — the note names whoever
+ * the agent believed was blocking, and narrowing that to one person here would
+ * be the host guessing. Falls back to a generic phrase rather than an empty
+ * mention, because the prompt has to stay readable when the note is malformed.
+ */
+export function namedHuman(note: string): string {
+  const m = /^\s*waiting on\s+([^:\n]{1,80}?)\s*:/i.exec(note);
+  return m ? m[1].trim() : 'whoever you are waiting on';
+}
+
+/**
+ * The human-blocked rung — a suppression WINDOW, not an exemption.
+ *
+ * `waiting on <person>` is the park-when-blocked discipline from the work-claims
+ * skill, and nudging it on a timer tells an agent to move work it correctly
+ * stopped on. That was the reason this returned `none` unconditionally. It
+ * overshot: unconditional means a claim parked on a human is exempt from the
+ * ladder FOREVER, so the one state that genuinely needs a person is the one
+ * state nobody is ever told about. Live proof: two claims sat `parked` on
+ * "waiting on <two people>" for ~40h with no notification ever sent.
+ *
+ * So: silent inside the window, one escalation past it, then never again.
+ *
+ * The window is `PARK_GRACE_MS`, reused rather than re-invented, because that
+ * constant is already the boundary at which the board stops calling a park
+ * healthy and starts rendering it red (claims-board.ts). One constant, one
+ * meaning — a second timeout here would be a second opinion about when a
+ * hand-off has lapsed, and the two would drift.
+ *
+ * Note that for a PARKED claim the window has already elapsed by construction:
+ * `readClaims` only reports `stale` for a park once it is past PARK_GRACE_MS,
+ * and `decideSelfHeal` returns early on anything not `stale`. The check still
+ * runs, because a claim can also carry a `waiting on` note without being parked,
+ * and that one is measured past its own TTL.
+ */
+function decideHumanBlocked(
+  claim: BoardClaim,
+  raw: SelfHealStamps & { note?: unknown },
+  now: number,
+): SelfHealDecision {
+  if (claim.staleMs <= PARK_GRACE_MS) return { action: 'none', reason: 'waiting-on-human' };
+  // Reuses the ladder's own terminal stamp, so one escalation is all there is.
+  if (effectiveState(raw).exhausted) return { action: 'none', reason: 'exhausted' };
+  if (inUnresolvedBackoff(raw, now)) return { action: 'none', reason: 'unresolved-backoff' };
+  if (!claim.threadId) return { action: 'none', reason: 'no-thread' };
+  if (declaresItselfFinished(raw)) return { action: 'none', reason: 'declares-finished' };
+  return { action: 'escalate-human', reason: 'human-blocked-past-window' };
+}
+
+/**
  * Pure — which rung this claim is on right now. `claim` must already be the
  * board's `stale` state; the exclusions are re-checked here so the decision is
  * testable on its own and cannot be bypassed by a future second caller.
@@ -175,7 +232,7 @@ export function decideSelfHeal(
 ): SelfHealDecision {
   if (claim.state !== 'stale') return { action: 'none', reason: 'not-stale' };
   const note = typeof raw.note === 'string' ? raw.note : '';
-  if (isWaitingOnHuman(note)) return { action: 'none', reason: 'waiting-on-human' };
+  if (isWaitingOnHuman(note)) return decideHumanBlocked(claim, raw, now);
   if (isHandedOffPark(raw)) return { action: 'none', reason: 'parked-with-handoff' };
   if (!claim.threadId) return { action: 'none', reason: 'no-thread' };
   if (declaresItselfFinished(raw)) return { action: 'none', reason: 'declares-finished' };
@@ -282,6 +339,46 @@ export function buildTakeoverPrompt(claim: BoardClaim): string {
     `2. Post ONE message saying why this should NOT be taken over (already done, superseded, blocked on a named human) ` +
     `— that reason is the one thing the board cannot show. If it is done, also release it: \`${claimSh} release ${claim.slug}\`.\n\n` +
     `Do not silently leave it: this is the last automatic step, and after it the claim just sits red on the board.`
+  );
+}
+
+/**
+ * The one message a human-blocked claim is allowed to produce, ever.
+ *
+ * It exists because a park that named a person notified nobody. The note shape
+ * `waiting on <person>: <what you asked>` is a record, not a delivery — and the
+ * two live claims that motivated this sat on it for ~40h while the Observatory
+ * rendered them as a human owing a decision that the human had never been told
+ * about.
+ *
+ * So the entire contract is the @-mention. `container/CLAUDE.md` binds the shape
+ * (`👉 @<person> — <what they do, by when>`) and says why: the mention IS the
+ * delivery mechanism — a human's notification, an agent's wake — and there is no
+ * slot for a bare name. A message that says "waiting on the operator" and does not
+ * mention them is this bug all over again, one layer up.
+ *
+ * Unlike a nudge this asks for no work, so it offers no ladder of options: if
+ * the answer already arrived the claim should just move, and if it has not, the
+ * ask has to reach someone. Either way this fires once — `applyDecision` stamps
+ * `auto_heal_exhausted_at` on delivery, and the claim is then left red forever.
+ */
+export function buildHumanEscalationPrompt(claim: BoardClaim): string {
+  const claimSh = 'bash /app/skills/work-claims/claim.sh';
+  const hours = Math.max(0, Math.round(claim.staleMs / 3600000));
+  const who = namedHuman(claim.note);
+  return (
+    `The claim \`${claim.slug}\` has been blocked on a person for ${hours}h and nobody has been told.\n` +
+    `${claimStateLine(claim)}\n\n` +
+    `Its note parks it on: ${who}. A note is a record, not a notification — parking it sent no one anything, ` +
+    `which is why it has sat this long.\n\n` +
+    `FIRST check whether the answer already arrived (the thread, the PR, the issue). If it did, this is not blocked: ` +
+    `finish it or \`${claimSh} release ${claim.slug}\`, and post NOTHING — the board already shows claim state.\n\n` +
+    `If it is genuinely still blocked, post ONE message that @-mentions ${who} and ends with the ask:\n` +
+    `👉 @<person> — <the decision or action you need, and by when>\n` +
+    `The @-mention is the whole point: it is what raises a notification. A plain name reaches nobody, and writing ` +
+    `one is how this claim got here. Write the message to stand alone — name the claim, what is blocked, and what ` +
+    `you need — because it may land at the top of a channel rather than in the thread you are reading this in.\n\n` +
+    `This is the LAST automatic step for this claim. Nothing will ask again.`
   );
 }
 
@@ -754,10 +851,12 @@ async function applyDecision(args: {
   const prompt =
     decision.action === 'takeover'
       ? buildTakeoverPrompt(claim)
-      : buildNudgePrompt(
-          claim,
-          `Automatic nudge ${decision.nudge} of ${SELF_HEAL_MAX_NUDGES} from the host (self-heal)`,
-        );
+      : decision.action === 'escalate-human'
+        ? buildHumanEscalationPrompt(claim)
+        : buildNudgePrompt(
+            claim,
+            `Automatic nudge ${decision.nudge} of ${SELF_HEAL_MAX_NUDGES} from the host (self-heal)`,
+          );
 
   if (!enabled) {
     log.info(`self-heal: would ${decision.action} stale claim`, {
@@ -769,21 +868,28 @@ async function applyDecision(args: {
     return { ...base, applied: false, target: target.agentGroupId };
   }
 
-  const sent = await args.createTask({
-    target,
-    claim,
-    prompt,
-    name: `${decision.action === 'takeover' ? 'take over' : 'push'} ${claim.slug}`,
-  });
+  const verb = { takeover: 'take over', 'escalate-human': 'escalate', nudge: 'push' }[
+    decision.action as 'takeover' | 'escalate-human' | 'nudge'
+  ];
+  const sent = await args.createTask({ target, claim, prompt, name: `${verb} ${claim.slug}` });
   if (!sent) return { ...base, applied: false, reason: 'delivery-failed', target: target.agentGroupId };
 
   // Stamp AFTER delivery: a failed send must not burn a rung. The count is the
   // ladder's whole memory, so takeover writes the value that makes the next
   // decision `exhaust`.
-  stampClaim(file, {
-    auto_nudged_at: new Date(now).toISOString(),
-    auto_nudge_count: decision.action === 'takeover' ? SELF_HEAL_MAX_NUDGES + 1 : (decision.nudge ?? 1),
-  });
+  // `escalate-human` is terminal on delivery, so it stamps the ladder's own
+  // exhausted marker rather than a rung. `auto_nudged_at` goes with it because
+  // `effectiveState` reads exhaustion through that timestamp — without it the
+  // stamp is invisible and the one-shot escalation would repeat every day.
+  stampClaim(
+    file,
+    decision.action === 'escalate-human'
+      ? { auto_nudged_at: new Date(now).toISOString(), auto_heal_exhausted_at: new Date(now).toISOString() }
+      : {
+          auto_nudged_at: new Date(now).toISOString(),
+          auto_nudge_count: decision.action === 'takeover' ? SELF_HEAL_MAX_NUDGES + 1 : (decision.nudge ?? 1),
+        },
+  );
   log.warn(`self-heal: ${decision.action} sent for stale claim`, {
     class: 'stale-claim',
     ...base,
