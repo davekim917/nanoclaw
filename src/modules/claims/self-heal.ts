@@ -536,12 +536,14 @@ async function defaultResolveOwner(workgroupId: string, claim: BoardClaim): Prom
   const rows = await wiredCandidates(workgroupId, claim.threadId);
   if (rows.length === 0) return null;
   const wanted = claim.owner.trim().toLowerCase();
+  const considered: string[] = [];
   const [{ resolveAssistantName }, { readContainerConfig }, { getAgentGroup }] = await Promise.all([
     import('../../container-runner.js'),
     import('../../container-config.js'),
     import('../../db/agent-groups.js'),
   ]);
   for (const row of rows) {
+    considered.push(row.name);
     if (row.name.trim().toLowerCase() === wanted) {
       return {
         agentGroupId: row.agentGroupId,
@@ -559,6 +561,7 @@ async function defaultResolveOwner(workgroupId: string, claim: BoardClaim): Prom
       log.warn('self-heal: assistant-name resolution failed', { agentGroupId: row.agentGroupId, err });
       continue;
     }
+    considered.push(display);
     if (display.trim().toLowerCase() === wanted) {
       return {
         agentGroupId: row.agentGroupId,
@@ -568,6 +571,16 @@ async function defaultResolveOwner(workgroupId: string, claim: BoardClaim): Prom
       };
     }
   }
+  // A miss has to say what it looked at. Without this the caller logs only
+  // "no deliverable target", which is unfalsifiable after the fact: an
+  // investigation into 14 such warnings could rule out every testable cause and
+  // still not name the mechanism, because the candidate set was gone by then.
+  log.warn('self-heal: owner did not match any wired agent on the thread', {
+    slug: claim.slug,
+    wanted,
+    threadId: claim.threadId,
+    considered,
+  });
   return null;
 }
 
