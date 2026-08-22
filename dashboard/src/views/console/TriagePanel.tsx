@@ -17,13 +17,20 @@ import { ThreadDetail } from './ThreadDetail.js';
  * The snapshot row is the fallback for exactly that case: it is the same data,
  * one revalidation stale, not a second source of truth.
  *
- * One verdict key, per §11:
+ * One verdict key, and one non-verdict pass-through, per §11:
  *
  *   S — snooze until it moves
+ *   N — skip: move to the next thread WITHOUT touching this one. No snooze,
+ *       no archive, no request of any kind — the thread is not resolved, so it
+ *       stays in the live queue and reappears on the next triage pass. This
+ *       exists because the queue's default lane scopes Triage to the threads
+ *       actually waiting on a human (`needs_you` / `stalled` / `unassigned`),
+ *       and an operator working that set still wants to move past one entry
+ *       that needs a moment's thought without being forced to snooze or exit.
  *
- * There used to be a second, A — answer and advance, which only moved focus
- * into the composer. The operator called it out as pointless: a tap on the
- * row (or the composer itself) already does that, so the button and its
+ * There used to be a second key, A — answer and advance, which only moved
+ * focus into the composer. The operator called it out as pointless: a tap on
+ * the row (or the composer itself) already does that, so the button and its
  * keybinding are gone. Sending from the composer still advances the pass —
  * see `onSent` below — there is simply no verdict button for it any more.
  *
@@ -109,6 +116,18 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
     }
   }, [thread, busy, advance, onChanged]);
 
+  /**
+   * Skip — NOT a verdict. It touches no server state at all (no snooze, no
+   * archive, no request), so unlike `snooze` it never calls `onChanged`:
+   * nothing changed, so there is nothing to revalidate. The thread is simply
+   * not resolved — it stays exactly where it is in the live queue and will be
+   * offered again on the next triage pass.
+   */
+  const skip = useCallback(() => {
+    if (!thread || busy) return;
+    advance('Skipped.');
+  }, [thread, busy, advance]);
+
   const onKeyDown = useCallback(
     (e: KeyboardEvent<HTMLElement>) => {
       // Never swallow the browser's own bindings, and never turn typing into a
@@ -128,6 +147,11 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
         void snooze();
         return;
       }
+      if (key === 'n') {
+        e.preventDefault();
+        skip();
+        return;
+      }
       if (key === 'arrowdown' || key === 'arrowright') {
         e.preventDefault();
         setAt((i) => Math.min(i + 1, total));
@@ -138,7 +162,7 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
         setAt((i) => Math.max(i - 1, 0));
       }
     },
-    [onExit, snooze, total],
+    [onExit, snooze, skip, total],
   );
 
   return (
@@ -150,12 +174,15 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
       onKeyDown={onKeyDown}
       data-triage-index={at}
     >
-      {/* One row: position, snooze, exit. Used to be three (a progress-bar
-          row, a legend row, a button row with Answer beside Snooze) — too
-          tall on a phone. The thread's own state label already renders in
-          ThreadDetail's head just below, so it is not repeated here. Exit
-          stays a real control in this row rather than a large block: on
-          mobile there is no Esc key, so it is the only way out of triage. */}
+      {/* One row: position, skip, snooze, exit. Used to be three (a
+          progress-bar row, a legend row, a button row with Answer beside
+          Snooze) — too tall on a phone. The thread's own state label already
+          renders in ThreadDetail's head just below, so it is not repeated
+          here. Exit stays a real control in this row rather than a large
+          block: on mobile there is no Esc key, so it is the only way out of
+          triage. Skip reuses the same `.ncc-verb` sizing as Snooze — it adds
+          one more compact button to an already-fitting row rather than a new
+          CSS rule, so the row does not grow taller. */}
       <div className="ncc-triage-bar">
         <span className="ncc-triage-count ncc-mono">
           {Math.min(at + 1, total)} / {total}
@@ -170,7 +197,13 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
           ))}
         </span>
         <span className="ncc-spacer" />
-        <span className="ncc-triage-keys ncc-mono">S snooze · Esc exit</span>
+        <span className="ncc-triage-keys ncc-mono">S snooze · N skip · Esc exit</span>
+        {/* Not a verdict — see the doc comment on `skip` above. Touch-reachable
+            (§8: keyboard alone is not enough on a phone), same row, same
+            height as snooze and exit. */}
+        <button type="button" className="ncc-verb" disabled={!thread || busy} onClick={skip}>
+          N · skip
+        </button>
         <button type="button" className="ncc-verb" disabled={!thread || busy} onClick={() => void snooze()}>
           S · snooze
         </button>

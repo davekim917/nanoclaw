@@ -28,6 +28,7 @@ import {
   findSessionByAgentGroup,
   findSessionForAgent,
   getSession,
+  setTaskRoutingPlatformId,
   taskThreadId,
   updateSession,
 } from './db/sessions.js';
@@ -360,11 +361,43 @@ export function resolveSession(
 }
 
 /** Find or create the per-agent-group session used for scheduled tasks. */
-/** Find or create the isolated session for one task series (thread `system:tasks:<seriesId>`). */
-export function resolveTaskSession(agentGroupId: string, seriesId: string): { session: Session; created: boolean } {
+/**
+ * Find or create the isolated session for one task series (thread
+ * `system:tasks:<seriesId>`).
+ *
+ * `routingPlatformId` is the series' ROUTING STAMP — the
+ * `messaging_groups.platform_id` this task was scheduled against, which the
+ * `ncl tasks` surface documents as "where an unaddressed reply lands". Callers
+ * that hold it (the two sites that write the task's `messages_in` row with the
+ * same `platform_id`: `createTask` in `src/cli/resources/tasks.ts` and
+ * `scheduleTask` in `src/db/scheduled-tasks.ts`) pass it so the console can
+ * show a task in the channel it is routed to instead of an "Unrouted tasks"
+ * bucket. Callers with no routing (`--isolated`, a host caller with no
+ * `--messaging-group`, `createScheduledTask`'s template path) pass nothing and
+ * the column stays NULL — absent is honest.
+ *
+ * `messaging_group_id` stays NULL and MUST stay NULL. It is the discriminator
+ * `src/delivery.ts` uses to recognize a task session (`task_log` run-log
+ * appends, `isTaskSessionPost`); the routing stamp is a separate column
+ * precisely so this one is never tempted into carrying it. See migration 056.
+ */
+export function resolveTaskSession(
+  agentGroupId: string,
+  seriesId: string,
+  routingPlatformId?: string | null,
+): { session: Session; created: boolean } {
   const threadId = taskThreadId(seriesId);
   const existing = findSystemSession(agentGroupId, threadId);
-  if (existing) return { session: existing, created: false };
+  if (existing) {
+    // Re-scheduling an existing series (including `scheduled-move`, which
+    // re-`scheduleTask`s into the target) re-stamps: the column answers "where
+    // is this series routed NOW", not "where was it first routed".
+    if (routingPlatformId != null && existing.task_routing_platform_id !== routingPlatformId) {
+      setTaskRoutingPlatformId(existing.id, routingPlatformId);
+      existing.task_routing_platform_id = routingPlatformId;
+    }
+    return { session: existing, created: false };
+  }
 
   const id = generateId();
   const session: Session = {
@@ -380,8 +413,12 @@ export function resolveTaskSession(agentGroupId: string, seriesId: string): { se
   };
 
   createSession(session);
+  if (routingPlatformId != null) {
+    setTaskRoutingPlatformId(id, routingPlatformId);
+    session.task_routing_platform_id = routingPlatformId;
+  }
   initSessionFolder(agentGroupId, id);
-  log.info('Task session created', { id, agentGroupId, seriesId });
+  log.info('Task session created', { id, agentGroupId, seriesId, routingPlatformId: routingPlatformId ?? null });
 
   return { session, created: true };
 }

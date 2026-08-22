@@ -58,6 +58,7 @@ import { migration052 } from './052-sessions-engaged-at.js';
 import { migration053 } from './053-normalize-naive-timestamps.js';
 import { migration054 } from './054-thread-snoozes.js';
 import { migration055 } from './055-thread-closures.js';
+import { migration056 } from './056-sessions-task-routing-platform-id.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -140,6 +141,9 @@ export const migrations: Migration[] = [
   // written from JS as ISO-8601 UTC at the write site, so 053's allowlisted
   // normalizer has nothing to do here and position does not matter.
   migration055,
+  // Adds a nullable column and writes no timestamp, so 053's position is
+  // irrelevant here — same reasoning as 054/055 above.
+  migration056,
   containerConfigs,
   cliScope,
   messagingGroupInstance,

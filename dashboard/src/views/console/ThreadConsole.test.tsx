@@ -527,7 +527,7 @@ const navTriage = (c: HTMLElement) =>
   within(c.querySelector('.ncc-side') as HTMLElement).getByRole('button', { name: /triage/i });
 
 describe('triage is a mode over the filtered list (§11)', () => {
-  it('is entered from the nav and covers exactly the filtered rows', async () => {
+  it('is entered from the nav and opens on the attention-state rows', async () => {
     const user = userEvent.setup();
     listThreads.mockResolvedValue({
       threads: [thread('t-1'), thread('t-2', { state: 'needs_you' }), thread('t-3')],
@@ -535,7 +535,10 @@ describe('triage is a mode over the filtered list (§11)', () => {
     const { container } = mount();
     await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(3));
 
-    // Filter first — triage must take the FILTERED set, not the whole queue.
+    // Filtering to the Needs you LANE first changes nothing about what Triage
+    // sees — it is already scoped to attention states regardless of lane (see
+    // "triage is scoped to the attention set" below for the case that pins
+    // that on its own, entered straight from the default "all" lane).
     await user.click(within(container.querySelector('.ncc-side') as HTMLElement).getByText('Needs you'));
     await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
     await user.click(navTriage(container));
@@ -545,7 +548,9 @@ describe('triage is a mode over the filtered list (§11)', () => {
 
   it('Escape hands the list back', async () => {
     const user = userEvent.setup();
-    listThreads.mockResolvedValue({ threads: [thread('t-1')] });
+    // Triage is scoped to attention states — a plain idle thread would leave
+    // the entry point disabled, which is not what this test is about.
+    listThreads.mockResolvedValue({ threads: [thread('t-1', { state: 'needs_you' })] });
     const { container } = mount();
     await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
     await user.click(navTriage(container));
@@ -562,6 +567,141 @@ describe('triage is a mode over the filtered list (§11)', () => {
     const entries = screen.getAllByRole('button', { name: /triage/i }) as HTMLButtonElement[];
     expect(entries).toHaveLength(2);
     for (const b of entries) expect(b.disabled).toBe(true);
+  });
+});
+
+/**
+ * THE bug this brief exists to fix: `enterTriage` used to freeze `visible`,
+ * which is the queue's CURRENT LANE result. With the default "All threads"
+ * lane — what an operator sees on first load — that is every thread in the
+ * window, so an operator with 189 threads got 189 triage items and Triage's
+ * only remaining verbs (snooze, exit) left them forced to act on or flee rows
+ * that needed nothing. Triage exists for decisions waiting on a human, so it
+ * is scoped to the ATTENTION states (`wantsAttention` in `thread-state.ts` —
+ * `needs_you` / `stalled` / `unassigned`, matching DESIGN §4.1's "any row
+ * wanting attention") regardless of which lane the queue happens to show,
+ * while still honouring the operator's OTHER filters and never a snoozed row.
+ */
+describe('triage is scoped to the attention set, never the queue lane', () => {
+  it('entering from the default "all" lane yields ONLY attention-state threads', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({
+      threads: [
+        thread('t-idle'), // idle
+        thread('t-run', { state: 'running' }),
+        thread('t-parked', { state: 'parked' }),
+        thread('t-needs', { state: 'needs_you' }),
+        thread('t-stall', { state: 'stalled' }),
+        thread('t-unassigned', { state: 'unassigned', participants: [] }),
+      ],
+    });
+    const { container } = mount();
+    // The queue itself, on the untouched default "All threads" lane, is all 6.
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(6));
+    expect(screen.getByRole('button', { name: /^All threads/ }).getAttribute('aria-pressed')).toBe('true');
+
+    await user.click(navTriage(container));
+    // Triage sees exactly the 3 attention-state rows, not the 6-thread queue.
+    expect(screen.getByText('1 / 3')).toBeTruthy();
+    expect(container.querySelectorAll('.ncc-triage-dot')).toHaveLength(3);
+  });
+
+  it('shows the attention-set count on the Triage entry, not the filtered queue size', async () => {
+    listThreads.mockResolvedValue({
+      threads: [thread('a', { state: 'needs_you' }), thread('b'), thread('c')],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(3));
+    expect(within(navTriage(container)).getByText('1')).toBeTruthy();
+  });
+
+  it('disables the entry point when the attention set is empty, even though the queue is not', async () => {
+    listThreads.mockResolvedValue({
+      threads: [thread('a'), thread('b', { state: 'running' })], // no attention states
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(2));
+    const entries = screen.getAllByRole('button', { name: /triage/i }) as HTMLButtonElement[];
+    expect(entries).toHaveLength(2);
+    for (const b of entries) {
+      expect(b.disabled).toBe(true);
+      // Empty reads as a real state, not a bare disabled control with no
+      // stated reason.
+      expect(b.getAttribute('aria-label')).toMatch(/nothing waiting on you/i);
+    }
+  });
+
+  it('excludes snoozed threads even though they would otherwise qualify', async () => {
+    listThreads.mockResolvedValue({
+      threads: [thread('a', { state: 'needs_you' }), thread('b', { state: 'stalled', snoozed: true })],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+    await userEvent.click(navTriage(container));
+    expect(screen.getByText('1 / 1')).toBeTruthy();
+  });
+
+  it('still honours the channel filter', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({
+      threads: [
+        thread('a', { state: 'needs_you', channel_key: 'slack:COPS', channel_name: '#ops' }),
+        thread('b', { state: 'stalled', channel_key: 'slack:CENG', channel_name: '#eng' }),
+      ],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(2));
+    const ops = Array.from(container.querySelectorAll('.ncc-side-item.channel')).find((n) =>
+      n.textContent?.includes('#ops'),
+    ) as HTMLElement;
+    await user.click(ops);
+    await user.click(navTriage(container));
+    expect(screen.getByText('1 / 1')).toBeTruthy();
+    // Scoped to the triage panel — the queue row behind it also says "Thread
+    // a", so an unscoped query is ambiguous.
+    expect(await within(screen.getByLabelText('Triage')).findByText('Thread a')).toBeTruthy();
+  });
+
+  it('still honours the search query', async () => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({
+      threads: [
+        thread('a', { state: 'needs_you', title: 'billing outage' }),
+        thread('b', { state: 'stalled', title: 'unrelated thing' }),
+      ],
+    });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(2));
+    await user.type(screen.getByLabelText('Search threads'), 'billing');
+    await user.click(navTriage(container));
+    expect(screen.getByText('1 / 1')).toBeTruthy();
+  });
+
+  it('still honours the workgroup filter', async () => {
+    const user = userEvent.setup();
+    listWorkgroups.mockResolvedValue({
+      workgroups: [
+        { id: 'wg-a', name: 'WG A' },
+        { id: 'wg-b', name: 'WG B' },
+      ],
+    });
+    listThreads.mockImplementation((params?: { workgroup?: string }) =>
+      Promise.resolve({
+        threads:
+          params?.workgroup === 'wg-a'
+            ? [thread('a', { state: 'needs_you' })]
+            : [thread('a', { state: 'needs_you' }), thread('b', { state: 'stalled' })],
+      }),
+    );
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(2));
+
+    const select = await screen.findByRole('combobox', { name: 'Workgroup' });
+    await user.selectOptions(select, 'wg-a');
+    await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
+
+    await user.click(navTriage(container));
+    expect(screen.getByText('1 / 1')).toBeTruthy();
   });
 });
 
@@ -796,7 +936,8 @@ describe('every sidebar control stays reachable on a phone (§8)', () => {
    */
   it('reflects Triage, not Queue, as the active bottom-bar destination while Triage is open', async () => {
     const user = userEvent.setup();
-    listThreads.mockResolvedValue({ threads: [thread('t-1')] });
+    // Triage needs an attention-state thread to be enterable at all.
+    listThreads.mockResolvedValue({ threads: [thread('t-1', { state: 'needs_you' })] });
     const { container } = mount();
     await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
 
@@ -898,7 +1039,8 @@ describe('choosing a filter while Schedule is open returns to the queue (item 4)
 
   it('entering Triage from the nav while Schedule is open returns to the queue first', async () => {
     const user = userEvent.setup();
-    listThreads.mockResolvedValue({ threads: [thread('t-1')] });
+    // Triage needs an attention-state thread to be enterable at all.
+    listThreads.mockResolvedValue({ threads: [thread('t-1', { state: 'needs_you' })] });
     const { container } = mount();
     await waitFor(() => expect(container.querySelectorAll('.ncc-row')).toHaveLength(1));
 

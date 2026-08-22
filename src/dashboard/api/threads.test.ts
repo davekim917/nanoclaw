@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import type { AuthedRequestContext } from '../router.js';
@@ -7,6 +10,7 @@ import type { ContainerState } from '../../db/session-db.js';
 import type { SessionTranscriptEntry } from './sessions.js';
 import {
   buildThreadList,
+  deriveNeedsYouReason,
   deriveThreadState,
   isScheduledTaskThread,
   mergeThreadTranscript,
@@ -79,13 +83,17 @@ function insertSession(opts: {
   lastActive?: string | null;
   archivedAt?: string | null;
   agentProvider?: string | null;
+  /** Migration 056's routing stamp — task sessions only. */
+  taskRoutingPlatformId?: string | null;
+  createdAt?: string;
 }): void {
   getDb()
     .prepare(
       `INSERT INTO sessions
          (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status,
-          title, title_generated_at, last_active, last_outbound_at, archived_at, created_at)
-       VALUES (?, ?, ?, ?, ?, 'active', 'stopped', ?, ?, ?, ?, ?, ?)`,
+          title, title_generated_at, last_active, last_outbound_at, archived_at, created_at,
+          task_routing_platform_id)
+       VALUES (?, ?, ?, ?, ?, 'active', 'stopped', ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       opts.id,
@@ -99,7 +107,8 @@ function insertSession(opts: {
       // Non-null so the never-engaged filter (shared with sessions.ts) keeps the row.
       opts.lastOutboundAt ?? iso(60_000),
       opts.archivedAt ?? null,
-      iso(3_600_000),
+      opts.createdAt ?? iso(3_600_000),
+      opts.taskRoutingPlatformId ?? null,
     );
 }
 
@@ -193,6 +202,53 @@ describe('deriveThreadState', () => {
     expect(deriveThreadState({ ...base, sessionCount: 0 })).toBe('unassigned');
   });
 
+  // ── The zero-session item is not automatically unowned ────────────────────
+  //
+  // Claims are keyed by THREAD ID and live in workgroup files, not in
+  // `sessions`, so an item with no session at all can still carry a parked
+  // claim naming the human it waits on. That is why the two needs_you tests
+  // run before the `sessionCount === 0` guard: `unassigned` means "nobody has
+  // picked this up", which is a different and wrong claim about an item a
+  // human owes an answer on.
+
+  it('needs_you — a zero-session item whose parked note says waiting on a human', () => {
+    expect(
+      deriveThreadState({
+        ...base,
+        sessionCount: 0,
+        claimState: 'parked',
+        claimNote: 'waiting on the release owner to approve the release',
+      }),
+    ).toBe('needs_you');
+  });
+
+  it('unassigned — a zero-session item with no claim, or a park note that names no human', () => {
+    expect(deriveThreadState({ ...base, sessionCount: 0, claimState: null, claimNote: '' })).toBe('unassigned');
+    expect(deriveThreadState({ ...base, sessionCount: 0, claimState: 'parked', claimNote: 'handing this off' })).toBe(
+      'unassigned',
+    );
+  });
+
+  it('needs_you — a zero-session item flagged needsOperator', () => {
+    expect(deriveThreadState({ ...base, sessionCount: 0, needsOperator: true })).toBe('needs_you');
+  });
+
+  it('the guard still outranks everything BELOW it — a zero-session item never reads as live work', () => {
+    // Provider status, container liveness, tool timing and the residual park
+    // all need a session to mean anything, so they stay under the guard.
+    expect(
+      deriveThreadState({
+        ...base,
+        sessionCount: 0,
+        containerStatus: 'running',
+        providerStatus: 'active',
+        toolStartedAtMs: NOW - 31 * 60_000,
+        claimState: 'parked',
+        claimNote: 'handing this off',
+      }),
+    ).toBe('unassigned');
+  });
+
   it('needs_you — a parked claim whose note says waiting on a human', () => {
     expect(deriveThreadState({ ...base, claimState: 'parked', claimNote: 'waiting on the operator to answer' })).toBe(
       'needs_you',
@@ -251,6 +307,76 @@ describe('the stall rule (§5.1)', () => {
 
   it('surfaces provider_status = failed, which nothing read before', () => {
     expect(deriveThreadState({ ...stalling, providerStatus: 'failed', toolStartedAtMs: null })).toBe('stalled');
+  });
+});
+
+// ── needs_you_reason (operator report 2026-08-21) ────────────────────────────
+
+describe('deriveNeedsYouReason', () => {
+  const row = (over: Record<string, unknown> = {}) =>
+    ({
+      id: 's1',
+      agent_group_id: 'ag1',
+      last_outbound_kind: null,
+      last_active: null,
+      last_outbound_at: null,
+      attached_task_needs_input: null,
+      attached_task_steer_question: null,
+      ...over,
+    }) as never;
+
+  const noClaim = { state: null, note: '' };
+  const askedRow = row({
+    last_outbound_kind: 'chat-sdk:ask_question',
+    last_outbound_at: iso(600_000),
+    last_active: iso(900_000), // older than the outbound — still unanswered
+  });
+
+  it('a parked "waiting on" claim yields its note as the reason, verbatim', () => {
+    const claim = {
+      state: 'parked' as const,
+      note: 'waiting on the release owner or backup reviewer: PR #956 mechanically ready at 64c1cca1',
+    };
+    expect(deriveNeedsYouReason([row()], claim)).toEqual({
+      cause: 'parked_note',
+      text: 'waiting on the release owner or backup reviewer: PR #956 mechanically ready at 64c1cca1',
+    });
+  });
+
+  it('an unanswered ask_question yields the ask_question cause — honest, not a fabricated question', () => {
+    const reason = deriveNeedsYouReason([askedRow], noClaim);
+    expect(reason).toEqual({
+      cause: 'ask_question',
+      text: 'The agent asked a question and is waiting for a reply.',
+    });
+  });
+
+  it('a task flagged needs_input quotes the worker’s own steer_question when it gave one', () => {
+    const withQuestion = row({ attached_task_needs_input: 1, attached_task_steer_question: 'Repo path A or B?' });
+    expect(deriveNeedsYouReason([withQuestion], noClaim)).toEqual({
+      cause: 'task_needs_input',
+      text: 'Repo path A or B?',
+    });
+  });
+
+  it('a task flagged needs_input with no steer_question falls back to a plain statement, never a guess', () => {
+    const noQuestion = row({ attached_task_needs_input: 1, attached_task_steer_question: null });
+    expect(deriveNeedsYouReason([noQuestion], noClaim)).toEqual({
+      cause: 'task_needs_input',
+      text: 'A running task needs input to continue.',
+    });
+  });
+
+  it('the parked note outranks a session cause on the same thread — mirrors deriveThreadState’s own precedence', () => {
+    const claim = { state: 'parked' as const, note: 'waiting on ops to confirm the rollback' };
+    expect(deriveNeedsYouReason([askedRow], claim)?.cause).toBe('parked_note');
+  });
+
+  it('is null — never a guess — when none of the three causes explains it', () => {
+    // Parked, but the note does not say "waiting on"; no session is asking or
+    // flagged. Nothing here names a cause, so nothing is rendered.
+    expect(deriveNeedsYouReason([row()], { state: 'parked', note: 'handing this off' })).toBeNull();
+    expect(deriveNeedsYouReason([row()], noClaim)).toBeNull();
   });
 });
 
@@ -605,6 +731,125 @@ describe('buildThreadList — scheduled tasks resolve to where they actually pos
     expect(byThread.get('system:tasks:series-anchored')!.channel_key).toBe('slack:CTESTROOMX1');
     expect(byThread.get('system:tasks:series-bare')!.channel_key).toBe('system:tasks');
     expect(byThread.get('system:tasks:series-bare')!.channel_name).toBe('Unrouted tasks');
+  });
+});
+
+// ── Migration 056: the routing stamp, and why it LOSES to an anchor ──────────
+
+describe('buildThreadList — scheduled tasks fall back to their routing stamp (migration 056)', () => {
+  beforeEach(() => {
+    closeDb();
+    setupDb();
+  });
+
+  it('a task session with no anchor but a routing stamp resolves to the stamped channel', async () => {
+    // The 53% of task sessions the anchor table can never cover: the series is
+    // routed to a real channel but has not posted there yet (or posts through a
+    // path that leaves no anchor). Its destination IS knowable at definition
+    // time, so "Unrouted tasks" was a lie, not an absence.
+    seedAgentGroup('ag-1');
+    insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTSWEEP001', name: '#example-sweep' });
+    insertSession({
+      id: 's-task',
+      agentGroupId: 'ag-1',
+      threadId: 'system:tasks:example-task-0010',
+      taskRoutingPlatformId: 'slack:CTESTSWEEP001',
+    });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.channel_key).toBe('slack:CTESTSWEEP001');
+    expect(threads[0]!.channel_name).toBe('#example-sweep');
+    // Still a scheduled run — the pill is orthogonal to which branch resolved
+    // the channel.
+    expect(threads[0]!.scheduled_task).toBe(true);
+  });
+
+  it('PRECEDENCE: an anchor pointing at X beats a routing stamp saying Y', async () => {
+    // The case the precedence exists for, and the reason it must not be
+    // "simplified" into a single lookup. The stamp is only where an
+    // UNADDRESSED reply lands by default; `ncl tasks`' own contract is that
+    // the agent chooses its destination at fire time. A series re-pointed
+    // between runs still carries its original stamp while its anchors have
+    // already moved — the console must show where it is actually posting.
+    seedAgentGroup('ag-1');
+    insertMessagingGroup({ id: 'mg-x', platformId: 'slack:CTESTACTUAL01', name: '#example-actual' });
+    insertMessagingGroup({ id: 'mg-y', platformId: 'slack:CTESTSTAMPED2', name: '#example-stamped' });
+    insertSession({
+      id: 's-task',
+      agentGroupId: 'ag-1',
+      threadId: 'system:tasks:example-task-0011',
+      taskRoutingPlatformId: 'slack:CTESTSTAMPED2',
+    });
+    insertTaskAnchor({ sessionId: 's-task', platformId: 'slack:CTESTACTUAL01', createdAt: iso(60_000) });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.channel_key).toBe('slack:CTESTACTUAL01');
+    expect(threads[0]!.channel_name).toBe('#example-actual');
+  });
+
+  it('a task session with NEITHER an anchor nor a stamp still lands in the labeled fallback', async () => {
+    // No channel is invented. An `--isolated` series, or one scheduled by a
+    // host caller with no --messaging-group, genuinely has no destination.
+    seedAgentGroup('ag-1');
+    insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTCHAN01', name: '#example-chan' });
+    insertSession({ id: 's-task', agentGroupId: 'ag-1', threadId: 'system:tasks:example-task-0012' });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.channel_key).toBe('system:tasks');
+    expect(threads[0]!.channel_name).toBe('Unrouted tasks');
+    expect(threads[0]!.scheduled_task).toBe(true);
+  });
+
+  it("a stamp never leaks onto another task thread, and doesn't touch ordinary channel threads", async () => {
+    seedAgentGroup('ag-1');
+    seedAgentGroup('ag-2');
+    insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTSTAMP001', name: '#example-stamp' });
+    insertSession({
+      id: 's-stamped',
+      agentGroupId: 'ag-1',
+      threadId: 'system:tasks:series-stamped',
+      taskRoutingPlatformId: 'slack:CTESTSTAMP001',
+    });
+    insertSession({ id: 's-bare', agentGroupId: 'ag-2', threadId: 'system:tasks:series-bare' });
+    insertSession({ id: 's-chat', agentGroupId: 'ag-1', threadId: 'slack:CTESTCHAN01:1.1' });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    const byThread = new Map(threads.map((t) => [t.thread_id, t]));
+    expect(byThread.get('system:tasks:series-stamped')!.channel_key).toBe('slack:CTESTSTAMP001');
+    expect(byThread.get('system:tasks:series-bare')!.channel_key).toBe('system:tasks');
+    expect(byThread.get('slack:CTESTCHAN01:1.1')!.channel_key).toBe('slack:CTESTCHAN01');
+    expect(byThread.get('slack:CTESTCHAN01:1.1')!.scheduled_task).toBe(false);
+  });
+
+  it('tie-break across sessions: the most recently created stamped session wins', async () => {
+    // §3.1 allows two agent groups to share a series id. Same "most recent
+    // wins" rule as the anchors, keyed on session created_at because the stamp
+    // itself carries no timestamp — pinned so it never silently becomes
+    // "whichever row the query returned first".
+    seedAgentGroup('ag-a');
+    seedAgentGroup('ag-b');
+    insertMessagingGroup({ id: 'mg-a', platformId: 'slack:CTESTOLDSTMP1', name: '#example-old-stamp' });
+    insertMessagingGroup({ id: 'mg-b', platformId: 'slack:CTESTNEWSTMP2', name: '#example-new-stamp' });
+    const thread = 'system:tasks:shared-series-0013';
+    insertSession({
+      id: 's-a',
+      agentGroupId: 'ag-a',
+      threadId: thread,
+      taskRoutingPlatformId: 'slack:CTESTOLDSTMP1',
+      createdAt: iso(7_200_000),
+    });
+    insertSession({
+      id: 's-b',
+      agentGroupId: 'ag-b',
+      threadId: thread,
+      taskRoutingPlatformId: 'slack:CTESTNEWSTMP2',
+      createdAt: iso(600_000),
+    });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads).toHaveLength(1);
+    expect(threads[0]!.channel_key).toBe('slack:CTESTNEWSTMP2');
+    expect(threads[0]!.channel_name).toBe('#example-new-stamp');
   });
 });
 
@@ -1170,6 +1415,87 @@ describe('pickDoneProposal', () => {
     ).toBeNull();
     expect(pickDoneProposal([row({ done_proposal: JSON.stringify({ reason: 'ok' }) })])).toBeNull();
     expect(pickDoneProposal([row({ done_proposal: JSON.stringify({ proposed_at: iso(0) }) })])).toBeNull();
+  });
+});
+
+describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
+  beforeEach(() => {
+    closeDb();
+    setupDb();
+  });
+
+  it('is absent for a thread that is not needs_you', async () => {
+    seedAgentGroup('ag-plain');
+    insertSession({ id: 's-plain', agentGroupId: 'ag-plain', threadId: 'slack:CTESTCHAN01:1.1' });
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.state).not.toBe('needs_you');
+    expect(threads[0]!.needs_you_reason).toBeNull();
+  });
+
+  it('an ask_question thread carries the ask_question cause on the wire', async () => {
+    seedAgentGroup('ag-ask');
+    const thread = 'slack:CTESTCHAN01:1.2';
+    insertSession({
+      id: 's-asked',
+      agentGroupId: 'ag-ask',
+      threadId: thread,
+      lastOutboundAt: iso(600_000),
+      lastActive: iso(600_000),
+    });
+    // Same "unanswered ask_question" setup as the reply-target test above: the
+    // outbound is newer than the last inbound.
+    getDb()
+      .prepare(`UPDATE sessions SET last_outbound_kind = 'chat-sdk:ask_question', last_active = ? WHERE id = ?`)
+      .run(iso(900_000), 's-asked');
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.state).toBe('needs_you');
+    expect(threads[0]!.needs_you_reason).toEqual({
+      cause: 'ask_question',
+      text: 'The agent asked a question and is waiting for a reply.',
+    });
+  });
+
+  it('a task-needs-input thread carries its own steer_question on the wire', async () => {
+    seedAgentGroup('ag-task');
+    const thread = 'slack:CTESTCHAN01:1.3';
+    insertSession({ id: 's-task', agentGroupId: 'ag-task', threadId: thread });
+    getDb()
+      .prepare(
+        `INSERT INTO tasks
+           (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
+            child_session_id, status, task_content, request_hash, admitted_at, needs_input, steer_question, created_at)
+         VALUES ('task-1', 'k1', 's-task', 'ag-task', 's-task', 'running', 'content', 'hash1', ?, 1, ?, ?)`,
+      )
+      .run(iso(0), 'Repo path A or B?', iso(0));
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.state).toBe('needs_you');
+    expect(threads[0]!.needs_you_reason).toEqual({ cause: 'task_needs_input', text: 'Repo path A or B?' });
+  });
+
+  it('a parked "waiting on" claim carries its note on the wire, from a real claim file', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'threads-claims-'));
+    try {
+      seedWorkgroup('wg-1');
+      seedAgentGroup('ag-parked', 'wg-1');
+      const thread = 'slack:CTESTCHAN01:1787277743.529519';
+      insertSession({ id: 's-parked', agentGroupId: 'ag-parked', threadId: thread });
+      const claimsDir = path.join(dir, 'wg-1', 'claims');
+      fs.mkdirSync(claimsDir, { recursive: true });
+      const note =
+        'waiting on the release owner or backup reviewer: PR #956 mechanically ready at 64c1cca1 but the consequence lane has no recorded human ship';
+      fs.writeFileSync(
+        path.join(claimsDir, 'gh-963.json'),
+        JSON.stringify({ owner: 'ollie', status: 'parked', parked_at: iso(0), note, thread_id: thread }),
+      );
+
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps({ claimsRoot: dir }));
+      expect(threads[0]!.state).toBe('needs_you');
+      expect(threads[0]!.needs_you_reason).toEqual({ cause: 'parked_note', text: note });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

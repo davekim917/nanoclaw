@@ -321,7 +321,11 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   // Each series runs in its own isolated session. Delivery and run-log
   // instructions come from the runtime system prompt, not persisted prompt
   // suffixes; the formatter strips old generated suffixes for compatibility.
-  const { session } = resolveTaskSession(group, id);
+  // `routing.platformId` is stamped onto the session as well as the task row:
+  // same value, two readers. The row is what the fire path uses; the session
+  // column is what the console reads to place a task in the channel it is
+  // routed to (migration 056). NO_ROUTING passes null and stamps nothing.
+  const { session } = resolveTaskSession(group, id, routing.platformId);
 
   const created = withInbound(session, (db) => {
     insertTaskRow(db, {

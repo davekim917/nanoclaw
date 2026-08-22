@@ -188,20 +188,53 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
 
   const snoozedCount = useMemo(() => threads.filter((t) => t.snoozed).length, [threads]);
 
-  const visible = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return threads
-      .filter((t) => (lane === 'snoozed' ? t.snoozed : !t.snoozed))
-      .filter((t) => lane === 'all' || lane === 'snoozed' || t.state === lane)
-      .filter((t) => channel === null || t.channel_key === channel)
-      .filter(
-        (t) =>
-          needle === '' ||
+  /**
+   * Channel + search narrowing, shared between the queue and Triage below —
+   * both must honour the operator's OTHER active filters; only the
+   * lane/state predicate differs between them.
+   */
+  const matchesFilters = useCallback(
+    (t: ThreadSummary) => {
+      const needle = query.trim().toLowerCase();
+      return (
+        (channel === null || t.channel_key === channel) &&
+        (needle === '' ||
           (t.title ?? '').toLowerCase().includes(needle) ||
-          t.channel_name.toLowerCase().includes(needle),
-      )
-      .sort(compareThreads);
-  }, [threads, lane, channel, query]);
+          t.channel_name.toLowerCase().includes(needle))
+      );
+    },
+    [channel, query],
+  );
+
+  const visible = useMemo(
+    () =>
+      threads
+        .filter((t) => (lane === 'snoozed' ? t.snoozed : !t.snoozed))
+        .filter((t) => lane === 'all' || lane === 'snoozed' || t.state === lane)
+        .filter(matchesFilters)
+        .sort(compareThreads),
+    [threads, lane, matchesFilters],
+  );
+
+  /**
+   * Triage's candidate set. THE FIX: this used to be `visible` — whatever lane
+   * the operator happened to be on, and the default "All threads" lane is
+   * every thread in the window. Triage exists for decisions waiting on a
+   * human, so it is scoped to the ATTENTION states (`wantsAttention` —
+   * `needs_you` / `stalled` / `unassigned`, per DESIGN §4.1 and
+   * `thread-state.ts`) regardless of the selected lane, while still honouring
+   * the operator's channel/search/workgroup narrowing (workgroup is already
+   * baked into `threads` at fetch time) and never offering a snoozed thread.
+   */
+  const triageCandidates = useMemo(
+    () =>
+      threads
+        .filter((t) => !t.snoozed)
+        .filter((t) => STATE_PRESENTATION[t.state].wantsAttention)
+        .filter(matchesFilters)
+        .sort(compareThreads),
+    [threads, matchesFilters],
+  );
 
   // Which rows are allowed to spend a preview fetch — the first PREVIEW_BUDGET
   // attention rows in view, nobody else.
@@ -269,19 +302,21 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
   );
 
   /**
-   * Triage is a mode over the CURRENT FILTERED LIST (§11), so entering it
-   * freezes `visible` — the same rows, the same order — and leaving it puts the
-   * operator back exactly where they were, scroll position included. Entering
-   * it while Schedule is open has the same trap §4 fixes elsewhere: the panel
-   * lives in the same branch as the queue, so it must snap back to the queue
-   * first or the tap would silently do nothing visible.
+   * Entering Triage freezes `triageCandidates` — the same rows, the same
+   * order — and leaving it puts the operator back exactly where they were in
+   * the QUEUE (`visible`), scroll position included. Triage is a mode scoped
+   * to the attention states, never the lane the queue happens to be showing —
+   * see `triageCandidates` above. Entering it while Schedule is open has the
+   * same trap §4 fixes elsewhere: the panel lives in the same branch as the
+   * queue, so it must snap back to the queue first or the tap would silently
+   * do nothing visible.
    */
   const savedScroll = useRef(0);
   const enterTriage = useCallback(() => {
     if (lens === 'schedule') goToQueue();
     savedScroll.current = listRef.current?.scrollTop ?? 0;
-    setTriage(visible);
-  }, [lens, goToQueue, visible]);
+    setTriage(triageCandidates);
+  }, [lens, goToQueue, triageCandidates]);
   const exitTriage = useCallback(() => setTriage(null), []);
   useEffect(() => {
     if (triage === null && listRef.current) listRef.current.scrollTop = savedScroll.current;
@@ -391,11 +426,15 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
 
           {/* Triage was a top-bar button and a bottom-bar tab; it is now also a
               Queue-section entry, same shape as a lane, so desktop offers it
-              without a duplicate row of chrome above the list (§2). */}
+              without a duplicate row of chrome above the list (§2). Its count
+              is the ATTENTION set, never `visible.length` — the queue's lane
+              (e.g. "All threads") has nothing to do with what Triage scopes
+              to, and showing the queue's size here is the bug this fixes. */}
           <LaneButton
             label="Triage"
-            count={visible.length}
-            disabled={visible.length === 0 || triage !== null}
+            count={triageCandidates.length}
+            disabled={triageCandidates.length === 0 || triage !== null}
+            ariaLabel={triageCandidates.length === 0 ? 'Triage — nothing waiting on you' : undefined}
             onClick={enterTriage}
           />
 
@@ -562,8 +601,9 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
           type="button"
           className="ncc-bottom-item"
           aria-current={triage !== null ? 'page' : undefined}
+          aria-label={triageCandidates.length === 0 ? 'Triage — nothing waiting on you' : undefined}
           onClick={enterTriage}
-          disabled={visible.length === 0 || triage !== null}
+          disabled={triageCandidates.length === 0 || triage !== null}
         >
           <ListChecks size={18} aria-hidden="true" />
           Triage
@@ -582,6 +622,7 @@ function LaneButton({
   active,
   disabled,
   live,
+  ariaLabel,
   onClick,
 }: {
   label: string;
@@ -596,10 +637,24 @@ function LaneButton({
    *  removed it entirely); the Needs-you LANE is now the only place that count
    *  lives, so it keeps the announcement rather than dropping it. */
   live?: boolean;
+  /**
+   * Overrides the accessible name entirely — for Triage's empty state, so a
+   * "0" next to the label reads as "nothing waiting on you" rather than a
+   * disabled control with no stated reason. Left unset everywhere else, where
+   * the visible label + count already read fine on their own.
+   */
+  ariaLabel?: string | undefined;
   onClick: () => void;
 }) {
   return (
-    <button type="button" className="ncc-side-item" aria-pressed={active} disabled={disabled} onClick={onClick}>
+    <button
+      type="button"
+      className="ncc-side-item"
+      aria-pressed={active}
+      aria-label={ariaLabel}
+      disabled={disabled}
+      onClick={onClick}
+    >
       <span className="lbl">{label}</span>
       <span
         className={`n${tone === 'attention' ? ' attention' : tone === 'live' ? ' live' : ''}`}
