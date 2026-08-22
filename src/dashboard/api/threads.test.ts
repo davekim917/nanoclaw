@@ -1819,6 +1819,34 @@ describe('attention-source rows in the thread list', () => {
     ).toEqual([]);
   });
 
+  it('a caller scoped to ONE sibling sees the whole workgroup’s items — deliberate', async () => {
+    // Every other row on this endpoint gates at AGENT-GROUP level
+    // (`s.agent_group_id IN allowed_group_ids`). Attention items gate at
+    // WORKGROUP level, and that is the decision, not an oversight: the
+    // workgroup is the documented data-pool boundary (docs/workgroups.md —
+    // chat archive, shared files and Graphify retrieval all pool there), and
+    // an attention item is ownerless by construction, so it carries no agent
+    // group to test against. DESIGN.md §10 states the rule.
+    //
+    // The pre-existing test above proves CROSS-workgroup isolation, which is a
+    // different and weaker claim: it passes whether the gate is per-workgroup
+    // or per-agent-group. This one is the discriminating case, so a future
+    // narrowing to agent-group granularity has to break a test that says out
+    // loud it was chosen.
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    const env = { groupsRoot: boardRoot([readyPr()]), claimsRoot: tmp('threads-attn-claims-') };
+    seedAgentGroup('ag-sibling', WG); // a SECOND agent group in the SAME workgroup
+
+    const { threads } = await buildThreadList(
+      makeCtx({ no_filter: false, allowed_group_ids: ['ag-sibling'] }),
+      LIST_OPTS,
+      deps({ attentionEnv: env }),
+    );
+    // Entitled to `ag-sibling` only, yet the workgroup's item is visible —
+    // and nothing about the item names `ag-sibling` or `ag-example`.
+    expect(threads.map((t) => t.thread_id)).toEqual([`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`]);
+  });
+
   it('marks staleness, never hides it: an ancient board still emits its rows', async () => {
     // No suppression threshold exists anywhere in this path, deliberately. An
     // empty feed is indistinguishable from a healthy one, and "nothing is

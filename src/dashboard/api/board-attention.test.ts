@@ -129,8 +129,73 @@ describe('deriveBoardAttentionItems', () => {
     expect(out[0]!.id).toBe('EXAMPLE-ANALYTICS#96');
   });
 
-  it('suppresses a board item when a claim slug encodes the PR number', () => {
-    const claims = [claim({ slug: 'example-956-scope-guards', note: 'working the scope guard rewrite' })];
+  it.each([
+    ['the bare slug', 'gh-956'],
+    ['a trailing description', 'gh-956-scope-guards'],
+    ['a prefix in front of it', 'example-gh-956-scope-guards'],
+    ['a second PR number after it', 'gh-956-964-scope-guards'],
+  ])('suppresses a board item when the claim slug carries gh-<n> with %s', (_label, slug) => {
+    const claims = [claim({ slug, note: 'working the scope guard rewrite' })];
+    const out = deriveBoardAttentionItems(
+      [item({ id: 'EXAMPLE-APP#956', url: 'https://github.com/example-org/example-app/pull/956' })],
+      ASOF,
+      [],
+      claims,
+      BINDING,
+    );
+    expect(out).toEqual([]);
+  });
+
+  it('does not treat gh-<n> as a prefix of a longer number', () => {
+    const claims = [claim({ slug: 'gh-9561-scope-guards', note: 'unrelated' })];
+    const out = deriveBoardAttentionItems(
+      [item({ id: 'EXAMPLE-APP#956', url: 'https://github.com/example-org/example-app/pull/956' })],
+      ASOF,
+      [],
+      claims,
+      BINDING,
+    );
+    expect(out).toHaveLength(1);
+  });
+
+  /**
+   * The rule that replaced a loose `(^|-)<n>-` slug alternative. A claim slug
+   * is an unconstrained filename, so that shape matched any incidental number
+   * anywhere in any slug — every case below is a REAL live claim slug (with
+   * the install's own prefix swapped for `example-`) that would have silently
+   * deleted the named PR from the queue.
+   *
+   * These assert the SAFE direction. Suppressing here would hide real blocked
+   * work with no trace; not suppressing at worst shows one PR twice, which is
+   * visible and self-corrects. A claim on a PR whose slug does not say `gh`
+   * has to name `#<n>` in its note — the case directly below.
+   */
+  it.each([
+    ['1', 'sprint-1-planning'],
+    ['1', 'step-1-of-3'],
+    ['1', 'release-1-notes'],
+    ['7', 'example-7-day-retention'],
+    ['1800', 'example-outreach-deck-proximo-1800-la'],
+    ['216', 'example-216-universe-group-activation'],
+    ['902', 'example-ch-902-01'],
+  ])('does NOT suppress PR #%s on the incidental number in slug %s', (n, slug) => {
+    const claims = [claim({ slug, note: 'unrelated work' })];
+    const out = deriveBoardAttentionItems(
+      [item({ id: `EXAMPLE-APP#${n}`, url: `https://github.com/example-org/example-app/pull/${n}` })],
+      ASOF,
+      [],
+      claims,
+      BINDING,
+    );
+    expect(out.map((i) => i.id)).toEqual([`EXAMPLE-APP#${n}`]);
+  });
+
+  it('a non-gh slug still suppresses when its NOTE names the PR', () => {
+    // The live counterpart of the slugs above: `<prefix>-956-scope-guards`
+    // carries no `gh` token, but its note says `#956`. That note is what
+    // suppression rests on now, and it is a claim the author actually wrote
+    // rather than a number that happened to appear in a filename.
+    const claims = [claim({ slug: 'example-956-scope-guards', note: 'waiting on alice: PR #956 mechanically ready' })];
     const out = deriveBoardAttentionItems(
       [item({ id: 'EXAMPLE-APP#956', url: 'https://github.com/example-org/example-app/pull/956' })],
       ASOF,
@@ -195,7 +260,7 @@ describe('deriveBoardAttentionItems', () => {
       item({ id: 'EXAMPLE-APP#923', url: 'https://github.com/example-org/example-app/pull/923' }),
       item({ id: 'EXAMPLE-APP#956', url: 'https://github.com/example-org/example-app/pull/956' }),
     ];
-    const claims = [claim({ slug: 'example-956-scope-guards', note: 'on it' })];
+    const claims = [claim({ slug: 'example-gh-956-scope-guards', note: 'on it' })];
     const out = deriveBoardAttentionItems(items, ASOF, [], claims, BINDING);
     expect(out.map((i) => i.id)).toEqual(['EXAMPLE-APP#907', 'EXAMPLE-APP#923']);
   });
@@ -277,6 +342,113 @@ describe('readReleaseBoardSource', () => {
       },
     });
     expect(readReleaseBoardSource(DECL, WORKGROUP, Date.now(), env).items).toEqual([]);
+  });
+
+  /**
+   * `isSafeRelativeRoot` rejects `..` in the DECLARATION string, but the
+   * declared root is a directory `container-runner.ts` bind-mounts read-write
+   * into that workgroup's own containers. An agent can therefore replace it
+   * (or any file under it) with a symlink into a SIBLING workgroup's folder,
+   * and a string check cannot see that. These pin the resolved-path check.
+   */
+  describe('symlink containment', () => {
+    /** Two workgroups under one groups root; WG's `releases` is the escape. */
+    function twoWorkgroups(): { groupsRoot: string; victimDir: string; wgDir: string } {
+      const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-'));
+      tmpdirs.push(groupsRoot);
+      const victimDir = path.join(groupsRoot, 'other-workgroup', 'releases');
+      fs.mkdirSync(victimDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(victimDir, 'release-state.json'),
+        JSON.stringify({ asOf: ASOF, items: [item({ title: 'SECRET neighbour board' })] }),
+      );
+      const wgDir = path.join(groupsRoot, WORKGROUP);
+      fs.mkdirSync(wgDir, { recursive: true });
+      return { groupsRoot, victimDir, wgDir };
+    }
+
+    const env = (groupsRoot: string) => ({ groupsRoot, claimsRoot: groupsRoot });
+
+    it('reads nothing when the declared root is a symlink to another workgroup', () => {
+      const { groupsRoot, victimDir, wgDir } = twoWorkgroups();
+      fs.symlinkSync(victimDir, path.join(wgDir, 'releases'), 'dir');
+      expect(readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), env(groupsRoot))).toEqual({
+        asOf: null,
+        items: [],
+      });
+    });
+
+    it('reads nothing when release-state.json itself is the symlink', () => {
+      // Pinning only the root would be a fix that looks complete: the root is
+      // a directory the agent writes into, so the escape is one `ln -s` away.
+      const { groupsRoot, victimDir, wgDir } = twoWorkgroups();
+      const own = path.join(wgDir, 'releases');
+      fs.mkdirSync(own, { recursive: true });
+      fs.symlinkSync(path.join(victimDir, 'release-state.json'), path.join(own, 'release-state.json'));
+      expect(readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), env(groupsRoot))).toEqual({
+        asOf: null,
+        items: [],
+      });
+    });
+
+    it('ignores a gates file that symlinks out, without blanking the feed', () => {
+      const { groupsRoot, victimDir, wgDir } = twoWorkgroups();
+      const own = path.join(wgDir, 'releases');
+      fs.mkdirSync(path.join(own, 'gates'), { recursive: true });
+      fs.writeFileSync(path.join(own, 'release-state.json'), JSON.stringify({ asOf: ASOF, items: [item()] }));
+      fs.writeFileSync(
+        path.join(victimDir, 'ship.jsonl'),
+        JSON.stringify({ action: 'ship', target: 'EXAMPLE-APP#817', ts: '2026-08-22T12:30:00Z' }),
+      );
+      fs.symlinkSync(path.join(victimDir, 'ship.jsonl'), path.join(own, 'gates', '2026-08-22.jsonl'));
+      // The escaping gates file is skipped, so its `ship` record never lands
+      // and the item is still emitted — fail closed on the READ, not on the feed.
+      const read = readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), env(groupsRoot));
+      expect(read.items.map((i) => i.id)).toEqual(['EXAMPLE-APP#817']);
+    });
+
+    it('a sibling directory sharing the workgroup name as a prefix is not "inside" it', () => {
+      // `/groups/example-labs-evil` must not pass a containment check for
+      // `/groups/example-labs` — the reason the test is prefix-plus-separator.
+      const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-'));
+      tmpdirs.push(groupsRoot);
+      const evil = path.join(groupsRoot, `${WORKGROUP}-evil`, 'releases');
+      fs.mkdirSync(evil, { recursive: true });
+      fs.writeFileSync(path.join(evil, 'release-state.json'), JSON.stringify({ asOf: ASOF, items: [item()] }));
+      const wgDir = path.join(groupsRoot, WORKGROUP);
+      fs.mkdirSync(wgDir, { recursive: true });
+      fs.symlinkSync(evil, path.join(wgDir, 'releases'), 'dir');
+      expect(readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), env(groupsRoot))).toEqual({
+        asOf: null,
+        items: [],
+      });
+    });
+
+    it('still reads a legitimate non-symlinked board (the check is not just "deny")', () => {
+      const e = board({ state: { asOf: ASOF, items: [item()] } });
+      const read = readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), e);
+      expect(read.asOf).toBe(ASOF);
+      expect(read.items.map((i) => i.id)).toEqual(['EXAMPLE-APP#817']);
+    });
+
+    it('still reads a board reached through a symlink that stays INSIDE the workgroup', () => {
+      // Containment, not "no symlinks": an install may legitimately symlink
+      // `releases` to another directory in its own workgroup folder.
+      const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-'));
+      tmpdirs.push(groupsRoot);
+      const real = path.join(groupsRoot, WORKGROUP, 'desks', 'ship');
+      fs.mkdirSync(real, { recursive: true });
+      fs.writeFileSync(path.join(real, 'release-state.json'), JSON.stringify({ asOf: ASOF, items: [item()] }));
+      fs.symlinkSync(real, path.join(groupsRoot, WORKGROUP, 'releases'), 'dir');
+      const read = readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), env(groupsRoot));
+      expect(read.items).toHaveLength(1);
+    });
+
+    it('emits nothing rather than throwing when the workgroup folder does not exist', () => {
+      const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-'));
+      tmpdirs.push(groupsRoot);
+      expect(readReleaseBoardSource(DECL, WORKGROUP, Date.now(), env(groupsRoot))).toEqual({ asOf: null, items: [] });
+    });
   });
 
   it('one unparseable gates line does not blank the feed', () => {

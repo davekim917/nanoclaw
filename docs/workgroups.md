@@ -113,6 +113,20 @@ The per-agent projection (built by the host at every container spawn) widens **o
 
 The structural test at `tests/structural/projection-chokepoint.test.ts` enforces this invariant: any future MCP tool query against `messages_archive` must go through the projection's chokepoint, and the agent-scoped tables retain their in-container `WHERE agent_group_id = ?` filters.
 
+### Attention sources pool too — and so do the items they produce
+
+`workgroups.attention_sources` (migration 057) is declared on the **workgroup** row, and the files it points at live under `groups/<workgroup>/<root>`. Both sides of that are workgroup data by the same rule as the shared files around them, so the items read out of it pool as well.
+
+| Table / source                 | Pool to workgroup?                       | Why                                                                     |
+| ------------------------------ | ---------------------------------------- | ----------------------------------------------------------------------- |
+| `workgroups.attention_sources` | **Yes** — the column is on the workgroup | The declared root is a directory in the shared workgroup folder          |
+
+The consequence is worth stating outright, because it is coarser than every other row on the Observatory's thread endpoint: **a caller entitled to any ONE agent group in a workgroup sees every attention item that workgroup declares.** An attention item is ownerless by construction — that is what makes it an attention item — so it carries no `agent_group_id` to filter on, and there is nothing finer to gate against without inventing an owner.
+
+The reader that enforces the other half of this boundary is `readReleaseBoardSource` (`src/dashboard/api/board-attention.ts`): the declared `root` is resolved through symlinks and checked to still be inside `groups/<workgroup>/` before anything is read, because that directory is bind-mounted read-write into the workgroup's own containers. Pooling **within** a workgroup is the design; reading **across** two of them is not.
+
+Full rule and rationale: [observatory-console/DESIGN.md §3.6](specs/observatory-console/DESIGN.md).
+
 ---
 
 ## Pooled archive dedup
