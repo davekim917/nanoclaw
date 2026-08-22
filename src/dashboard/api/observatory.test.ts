@@ -37,6 +37,7 @@ import {
   readOfficeThemes,
   readWorkgroupSignals,
   threadPermalink,
+  threadPlatformId,
   type ObservatoryDeps,
 } from './observatory.js';
 import type { AuthedRequestContext } from '../router.js';
@@ -1212,5 +1213,27 @@ describe('the scene carries signals additively', () => {
     expect(readWorkgroupSignals('wg-sig', Date.now(), repoRoot, TEST_DIR)).toBeUndefined();
     const scene = await buildObservatoryScene('wg-sig', makeDeps());
     expect(scene.rooms).toBeDefined();
+  });
+});
+
+describe('threadPlatformId — the channel key, whatever shape the platform uses', () => {
+  it('resolves a Discord thread to its CHANNEL, not its guild', () => {
+    // Discord keys a channel `discord:<guild>:<channel>` and its threads carry
+    // a fourth segment. A fixed two-segment slice yielded `discord:<guild>`,
+    // which matches no row, so every Discord thread resolved to nothing.
+    addMessagingGroup('mg-d', 'discord', 'discord:guild-1:chan-1');
+    expect(threadPlatformId('discord:guild-1:chan-1:thread-1')).toBe('discord:guild-1:chan-1');
+  });
+
+  it('still resolves a Slack thread to its channel', () => {
+    addMessagingGroup('mg-s', 'slack', 'slack:chan-1');
+    expect(threadPlatformId('slack:chan-1:ts-1')).toBe('slack:chan-1');
+  });
+
+  it('falls back to the two-segment key when nothing matches', () => {
+    // A task session's thread has no channel at all, and callers JOIN on the
+    // result — a miss has to stay a harmless miss rather than throw.
+    expect(threadPlatformId('system:tasks:example-series-0001')).toBe('system:tasks');
+    expect(threadPlatformId('slack:chan-unwired:ts-1')).toBe('slack:chan-unwired');
   });
 });
