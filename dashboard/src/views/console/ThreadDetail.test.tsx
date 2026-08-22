@@ -102,6 +102,26 @@ describe('the target is the request, not decoration', () => {
   });
 });
 
+/**
+ * WHY this thread is `needs_you`, in FULL (operator report 2026-08-21). The
+ * row truncates a long claim note to one line; this pane is where the
+ * operator reads all of it.
+ */
+describe('the needs_you reason, in full (operator report 2026-08-21)', () => {
+  const longNote =
+    'waiting on the release owner or backup reviewer: PR #956 mechanically ready at 64c1cca1 but the consequence lane has no recorded human ship';
+
+  it('is absent when there is no reason', () => {
+    const { container } = renderDetail(thread({ needs_you_reason: null }));
+    expect(container.querySelector('.ncc-detail-reason')).toBeNull();
+  });
+
+  it('renders the full, untruncated text — never just what the row shows', () => {
+    const { container } = renderDetail(thread({ needs_you_reason: { cause: 'parked_note', text: longNote } }));
+    expect(container.querySelector('.ncc-detail-reason')!.textContent).toBe(longNote);
+  });
+});
+
 describe('the selector spans every wired agent, participants first', () => {
   it('groups on-thread agents above the ones the thread can be handed to', async () => {
     renderDetail(thread());

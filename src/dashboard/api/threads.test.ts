@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import type { AuthedRequestContext } from '../router.js';
@@ -7,6 +10,7 @@ import type { ContainerState } from '../../db/session-db.js';
 import type { SessionTranscriptEntry } from './sessions.js';
 import {
   buildThreadList,
+  deriveNeedsYouReason,
   deriveThreadState,
   isScheduledTaskThread,
   mergeThreadTranscript,
@@ -251,6 +255,76 @@ describe('the stall rule (§5.1)', () => {
 
   it('surfaces provider_status = failed, which nothing read before', () => {
     expect(deriveThreadState({ ...stalling, providerStatus: 'failed', toolStartedAtMs: null })).toBe('stalled');
+  });
+});
+
+// ── needs_you_reason (operator report 2026-08-21) ────────────────────────────
+
+describe('deriveNeedsYouReason', () => {
+  const row = (over: Record<string, unknown> = {}) =>
+    ({
+      id: 's1',
+      agent_group_id: 'ag1',
+      last_outbound_kind: null,
+      last_active: null,
+      last_outbound_at: null,
+      attached_task_needs_input: null,
+      attached_task_steer_question: null,
+      ...over,
+    }) as never;
+
+  const noClaim = { state: null, note: '' };
+  const askedRow = row({
+    last_outbound_kind: 'chat-sdk:ask_question',
+    last_outbound_at: iso(600_000),
+    last_active: iso(900_000), // older than the outbound — still unanswered
+  });
+
+  it('a parked "waiting on" claim yields its note as the reason, verbatim', () => {
+    const claim = {
+      state: 'parked' as const,
+      note: 'waiting on the release owner or backup reviewer: PR #956 mechanically ready at 64c1cca1',
+    };
+    expect(deriveNeedsYouReason([row()], claim)).toEqual({
+      cause: 'parked_note',
+      text: 'waiting on the release owner or backup reviewer: PR #956 mechanically ready at 64c1cca1',
+    });
+  });
+
+  it('an unanswered ask_question yields the ask_question cause — honest, not a fabricated question', () => {
+    const reason = deriveNeedsYouReason([askedRow], noClaim);
+    expect(reason).toEqual({
+      cause: 'ask_question',
+      text: 'The agent asked a question and is waiting for a reply.',
+    });
+  });
+
+  it('a task flagged needs_input quotes the worker’s own steer_question when it gave one', () => {
+    const withQuestion = row({ attached_task_needs_input: 1, attached_task_steer_question: 'Repo path A or B?' });
+    expect(deriveNeedsYouReason([withQuestion], noClaim)).toEqual({
+      cause: 'task_needs_input',
+      text: 'Repo path A or B?',
+    });
+  });
+
+  it('a task flagged needs_input with no steer_question falls back to a plain statement, never a guess', () => {
+    const noQuestion = row({ attached_task_needs_input: 1, attached_task_steer_question: null });
+    expect(deriveNeedsYouReason([noQuestion], noClaim)).toEqual({
+      cause: 'task_needs_input',
+      text: 'A running task needs input to continue.',
+    });
+  });
+
+  it('the parked note outranks a session cause on the same thread — mirrors deriveThreadState’s own precedence', () => {
+    const claim = { state: 'parked' as const, note: 'waiting on ops to confirm the rollback' };
+    expect(deriveNeedsYouReason([askedRow], claim)?.cause).toBe('parked_note');
+  });
+
+  it('is null — never a guess — when none of the three causes explains it', () => {
+    // Parked, but the note does not say "waiting on"; no session is asking or
+    // flagged. Nothing here names a cause, so nothing is rendered.
+    expect(deriveNeedsYouReason([row()], { state: 'parked', note: 'handing this off' })).toBeNull();
+    expect(deriveNeedsYouReason([row()], noClaim)).toBeNull();
   });
 });
 
@@ -1170,6 +1244,87 @@ describe('pickDoneProposal', () => {
     ).toBeNull();
     expect(pickDoneProposal([row({ done_proposal: JSON.stringify({ reason: 'ok' }) })])).toBeNull();
     expect(pickDoneProposal([row({ done_proposal: JSON.stringify({ proposed_at: iso(0) }) })])).toBeNull();
+  });
+});
+
+describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
+  beforeEach(() => {
+    closeDb();
+    setupDb();
+  });
+
+  it('is absent for a thread that is not needs_you', async () => {
+    seedAgentGroup('ag-plain');
+    insertSession({ id: 's-plain', agentGroupId: 'ag-plain', threadId: 'slack:CTESTCHAN01:1.1' });
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.state).not.toBe('needs_you');
+    expect(threads[0]!.needs_you_reason).toBeNull();
+  });
+
+  it('an ask_question thread carries the ask_question cause on the wire', async () => {
+    seedAgentGroup('ag-ask');
+    const thread = 'slack:CTESTCHAN01:1.2';
+    insertSession({
+      id: 's-asked',
+      agentGroupId: 'ag-ask',
+      threadId: thread,
+      lastOutboundAt: iso(600_000),
+      lastActive: iso(600_000),
+    });
+    // Same "unanswered ask_question" setup as the reply-target test above: the
+    // outbound is newer than the last inbound.
+    getDb()
+      .prepare(`UPDATE sessions SET last_outbound_kind = 'chat-sdk:ask_question', last_active = ? WHERE id = ?`)
+      .run(iso(900_000), 's-asked');
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.state).toBe('needs_you');
+    expect(threads[0]!.needs_you_reason).toEqual({
+      cause: 'ask_question',
+      text: 'The agent asked a question and is waiting for a reply.',
+    });
+  });
+
+  it('a task-needs-input thread carries its own steer_question on the wire', async () => {
+    seedAgentGroup('ag-task');
+    const thread = 'slack:CTESTCHAN01:1.3';
+    insertSession({ id: 's-task', agentGroupId: 'ag-task', threadId: thread });
+    getDb()
+      .prepare(
+        `INSERT INTO tasks
+           (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
+            child_session_id, status, task_content, request_hash, admitted_at, needs_input, steer_question, created_at)
+         VALUES ('task-1', 'k1', 's-task', 'ag-task', 's-task', 'running', 'content', 'hash1', ?, 1, ?, ?)`,
+      )
+      .run(iso(0), 'Repo path A or B?', iso(0));
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.state).toBe('needs_you');
+    expect(threads[0]!.needs_you_reason).toEqual({ cause: 'task_needs_input', text: 'Repo path A or B?' });
+  });
+
+  it('a parked "waiting on" claim carries its note on the wire, from a real claim file', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'threads-claims-'));
+    try {
+      seedWorkgroup('wg-1');
+      seedAgentGroup('ag-parked', 'wg-1');
+      const thread = 'slack:CTESTCHAN01:1787277743.529519';
+      insertSession({ id: 's-parked', agentGroupId: 'ag-parked', threadId: thread });
+      const claimsDir = path.join(dir, 'wg-1', 'claims');
+      fs.mkdirSync(claimsDir, { recursive: true });
+      const note =
+        'waiting on the release owner or backup reviewer: PR #956 mechanically ready at 64c1cca1 but the consequence lane has no recorded human ship';
+      fs.writeFileSync(
+        path.join(claimsDir, 'gh-963.json'),
+        JSON.stringify({ owner: 'ollie', status: 'parked', parked_at: iso(0), note, thread_id: thread }),
+      );
+
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps({ claimsRoot: dir }));
+      expect(threads[0]!.state).toBe('needs_you');
+      expect(threads[0]!.needs_you_reason).toEqual({ cause: 'parked_note', text: note });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
