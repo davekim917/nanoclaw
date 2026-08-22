@@ -325,6 +325,71 @@ describe('the "proposes done" badge (thread-closure contract, item 1)', () => {
   });
 });
 
+/**
+ * WHY a `needs_you` row is `needs_you` (operator report 2026-08-21). An
+ * operator opened a `needs_you` thread whose newest message was a completion
+ * report and read the flag as a false positive; the actual cause was a parked
+ * claim's note two hops away. The row must say why, as text — same "not just
+ * a tooltip a touch screen can never trigger" rule the proposal line above
+ * already carries.
+ */
+describe('the needs_you reason line (operator report 2026-08-21)', () => {
+  const longNote =
+    'waiting on the release owner or backup reviewer: PR #956 mechanically ready at 64c1cca1 but the consequence lane has no recorded human ship';
+
+  it('is absent when there is no reason', () => {
+    const { row } = renderRow({ needs_you_reason: null });
+    expect(row.querySelector('.ncc-row-reason')).toBeNull();
+  });
+
+  it('renders the reason as visible text, not hidden behind a title attribute', () => {
+    const { row } = renderRow({ needs_you_reason: { cause: 'parked_note', text: longNote } });
+    const line = row.querySelector('.ncc-row-reason')!;
+    // The full text is in the DOM's text content — readable without hover,
+    // which is what a 390px touch screen requires (§8).
+    expect(line.textContent).toBe(longNote);
+    // A `title` may ALSO be present (desktop hover is a bonus, same as the
+    // proposal line), but it is never the ONLY place the text lives.
+    expect(line.textContent!.length).toBeGreaterThan(0);
+  });
+
+  it('renders for the ask_question and task_needs_input causes too', () => {
+    for (const reason of [
+      { cause: 'ask_question' as const, text: 'The agent asked a question and is waiting for a reply.' },
+      { cause: 'task_needs_input' as const, text: 'Repo path A or B?' },
+    ]) {
+      const { row } = renderRow({ needs_you_reason: reason });
+      expect(row.querySelector('.ncc-row-reason')!.textContent).toBe(reason.text);
+    }
+  });
+
+  it('stacks ABOVE the proposal line, never replacing it — a row can carry both', () => {
+    const { row } = renderRow({
+      needs_you_reason: { cause: 'parked_note', text: 'waiting on ops to confirm the rollback' },
+      done_proposal: {
+        reason: 'fixed the retry loop and confirmed the test suite is green',
+        proposed_at: '2026-08-20T11:00:00.000Z',
+        agent_group_id: 'ag-1',
+        session_id: 's-1',
+      },
+    });
+    const reasonLine = row.querySelector('.ncc-row-reason')!;
+    const proposalLine = row.querySelector('.ncc-row-proposal')!;
+    expect(reasonLine.textContent).toContain('waiting on ops to confirm the rollback');
+    expect(proposalLine.textContent).toContain('fixed the retry loop');
+    // Neither line ate the other — both are still their own elements.
+    expect(reasonLine).not.toBe(proposalLine);
+  });
+
+  it('truncates gracefully at 390px: single line, ellipsis overflow, never a title-only reveal', () => {
+    const css = readFileSync(join(process.cwd(), 'src/views/console/console.css'), 'utf8');
+    const block = css.slice(css.indexOf('.ncc-row-reason {'), css.indexOf('.ncc-row-reason {') + 300);
+    expect(block).toContain('white-space: nowrap');
+    expect(block).toContain('overflow: hidden');
+    expect(block).toContain('text-overflow: ellipsis');
+  });
+});
+
 describe('interaction', () => {
   it('opens the thread from the row body and from the verb', async () => {
     const user = userEvent.setup();

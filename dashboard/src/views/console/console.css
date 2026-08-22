@@ -419,6 +419,20 @@
 .ncc-row-hybrid .speaker { font-weight: 600; color: var(--ncc-secondary); }
 .ncc-row-hybrid .excerpt { color: var(--ncc-muted); }
 
+/* WHY this row is `needs_you` (operator report 2026-08-21). Same rule as
+   `.ncc-row-proposal` below (spelled out on the row, not just a `title`
+   tooltip a touch screen can never trigger — 390px is the primary viewport),
+   and the same reuse discipline: attention-red, matching `.ncc-state.attention`
+   and `.ncc-row.attention .ncc-row-step`, never a third status hue (§7). */
+.ncc-row-reason {
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ncc-attention);
+}
+
 /* Thread-closure contract, item 1: the proposal's reason, spelled out on the
    row (not just the badge's title tooltip — 390px is the primary viewport and
    a touch screen never triggers one). Green, matching the badge and reusing
@@ -603,6 +617,16 @@
   font-family: var(--ncc-font-mono);
   font-size: 11.5px;
   color: var(--ncc-muted);
+  margin-top: 4px;
+}
+/* WHY this row is `needs_you`, in FULL — the row truncates a long claim note
+   to one line (`.ncc-row-reason`); this pane is where the operator reads all
+   of it. Wraps rather than clamping, and reuses the same attention-red the
+   row line and `.ncc-state.attention` already carry (§7: no third hue). */
+.ncc-detail-reason {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--ncc-attention);
   margin-top: 4px;
 }
 .ncc-detail-note {

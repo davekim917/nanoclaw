@@ -167,6 +167,15 @@ export interface ThreadStateInput {
 const WAITING_ON_NOTE = /\bwaiting on\b/i;
 
 /**
+ * {@link ThreadSummary.needs_you_reason} — see {@link deriveNeedsYouReason}
+ * for how each variant is produced and why its text is never fabricated.
+ */
+export type NeedsYouReason =
+  | { cause: 'parked_note'; text: string }
+  | { cause: 'ask_question'; text: string }
+  | { cause: 'task_needs_input'; text: string };
+
+/**
  * Which state a thread is in. Pure — every input is resolved by
  * the caller so this is directly testable and so the release board can feed
  * ownerless items through the same function once §10.3 lands.
@@ -277,6 +286,16 @@ export interface ThreadSummary {
    */
   last_activity_at: string | null;
   state: ThreadState;
+  /**
+   * WHY this row is `needs_you` — present ONLY when `state` is `needs_you`,
+   * and null even then if the cause cannot be named (see
+   * {@link deriveNeedsYouReason}). An operator opened a `needs_you` thread
+   * whose newest message was a completion report and read the flag as a false
+   * positive; the actual cause was a parked claim's note two hops away
+   * (operator report 2026-08-21) — this field is the row saying so directly
+   * instead of making the operator go find it.
+   */
+  needs_you_reason: NeedsYouReason | null;
   session_ids: string[];
   /** Freshest liveness across the thread's sessions, from heartbeat mtime. */
   container_status: ContainerStatus;
@@ -412,6 +431,8 @@ interface ThreadSessionRow {
   done_proposal: string | null;
   attached_task_status: string | null;
   attached_task_needs_input: number | null;
+  /** The worker's own free-text question from `spawn_request_steer`, or null when it gave none. */
+  attached_task_steer_question: string | null;
 }
 
 const DEFAULT_SINCE_HOURS = 168; // 7d — §3.3's stated working set
@@ -487,11 +508,12 @@ function selectScopedSessions(
     SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id, s.agent_provider,
            s.title, s.title_generated_at, s.last_active, s.last_outbound_at, s.last_outbound_kind,
            s.archived_at, s.created_at, s.done_proposal,
-           t.status      AS attached_task_status,
-           t.needs_input AS attached_task_needs_input
+           t.status         AS attached_task_status,
+           t.needs_input    AS attached_task_needs_input,
+           t.steer_question AS attached_task_steer_question
       FROM sessions s
  LEFT JOIN (
-              SELECT task_id, child_session_id, status, needs_input, admitted_at,
+              SELECT task_id, child_session_id, status, needs_input, steer_question, admitted_at,
                      ROW_NUMBER() OVER (PARTITION BY child_session_id ORDER BY admitted_at DESC) AS rn
                 FROM tasks
                WHERE child_session_id IS NOT NULL
@@ -969,13 +991,80 @@ function activityMs(row: ThreadSessionRow): number {
   );
 }
 
-/** §5 / sessions.ts: this session is sitting on an unanswered question. */
-function sessionNeedsOperator(row: ThreadSessionRow): boolean {
-  if (row.attached_task_needs_input === 1) return true;
-  return (
+/** Which of §5's two `needsOperator` sub-causes a single session is sitting on, if either. */
+type NeedsOperatorCause = 'task_needs_input' | 'ask_question';
+
+function sessionNeedsOperatorCause(row: ThreadSessionRow): NeedsOperatorCause | null {
+  if (row.attached_task_needs_input === 1) return 'task_needs_input';
+  if (
     row.last_outbound_kind === 'chat-sdk:ask_question' &&
     (parseUtcTimestampMs(row.last_active) ?? 0) < (parseUtcTimestampMs(row.last_outbound_at) ?? 0)
-  );
+  ) {
+    return 'ask_question';
+  }
+  return null;
+}
+
+/**
+ * §5 / sessions.ts: this session is sitting on an unanswered question.
+ *
+ * A thin boolean wrapper around {@link sessionNeedsOperatorCause} — one
+ * predicate, not two copies of it, so `deriveThreadState`'s gate and
+ * `deriveNeedsYouReason`'s cause can never quietly disagree about what counts.
+ */
+function sessionNeedsOperator(row: ThreadSessionRow): boolean {
+  return sessionNeedsOperatorCause(row) !== null;
+}
+
+/** Generic, honest text for the two causes with no per-row content to quote (see {@link deriveNeedsYouReason}). */
+const ASK_QUESTION_REASON_TEXT = 'The agent asked a question and is waiting for a reply.';
+const TASK_NEEDS_INPUT_REASON_TEXT = 'A running task needs input to continue.';
+
+/**
+ * {@link ThreadSummary.needs_you_reason} — WHY a `needs_you` row is `needs_you`.
+ *
+ * An operator opened a `needs_you` thread whose newest message was a
+ * completion report and read the flag as a false positive; the real cause was
+ * a parked claim's note (operator report 2026-08-21). §5 derives `needs_you`
+ * from three distinct causes and this file surfaced none of them — this
+ * function is the fix, and it is deliberately a separate pass over the same
+ * inputs `deriveThreadState` already resolved, not a rider bolted onto that
+ * function's return value, so a caller that only wants the state keeps paying
+ * nothing for the reason.
+ *
+ * Mirrors `deriveThreadState`'s own precedence — claim note first, then
+ * whichever session in activity order actually tripped
+ * {@link sessionNeedsOperatorCause} — so this can only ever explain a
+ * `needs_you` this module actually computed, never a different reading of it.
+ *
+ * **Text is never fabricated.** Cause 1 quotes the claim note verbatim — the
+ * operator (or another agent) wrote it, and it is already a headline
+ * (`noteHeadline`, capped at 200 chars) by the time it reaches here. Cause 3
+ * quotes the worker's own `steer_question` when it gave one — real text it
+ * actually wrote, not invented — and falls back to a plain statement when it
+ * didn't. Cause 2 has no per-row question text available at all: the actual
+ * `ask_question` content lives in the session's own per-agent DB file, and
+ * §4.1 is explicit that opening those per row is a cost this list endpoint
+ * does not pay; the text says only what is actually known, that a question is
+ * pending.
+ *
+ * Returns null when none of the three causes explains it — never a guess.
+ */
+export function deriveNeedsYouReason(
+  ordered: ThreadSessionRow[],
+  claim: { state: BoardClaim['state'] | null; note: string },
+): NeedsYouReason | null {
+  if (claim.state === 'parked' && WAITING_ON_NOTE.test(claim.note)) {
+    return { cause: 'parked_note', text: claim.note };
+  }
+  for (const row of ordered) {
+    const cause = sessionNeedsOperatorCause(row);
+    if (cause === 'task_needs_input') {
+      return { cause, text: row.attached_task_steer_question?.trim() || TASK_NEEDS_INPUT_REASON_TEXT };
+    }
+    if (cause === 'ask_question') return { cause, text: ASK_QUESTION_REASON_TEXT };
+  }
+  return null;
 }
 
 /**
@@ -1302,6 +1391,13 @@ export async function buildThreadList(
     const lastActivityAt = isoOrNull(lastActivity);
     const doneProposal = pickDoneProposal(ordered);
     const closure = closures.get(thread.threadId);
+    // Gated on `state` defensively, in addition to `deriveNeedsYouReason`'s own
+    // same-inputs derivation: a reason must never ride on a row this module
+    // did not itself call `needs_you` (see the field's own doc).
+    const needsYouReason =
+      state === 'needs_you'
+        ? deriveNeedsYouReason(ordered, { state: claim?.state ?? null, note: claim?.note ?? '' })
+        : null;
 
     return {
       thread_id: thread.threadId,
@@ -1313,6 +1409,7 @@ export async function buildThreadList(
       assignable_agents: assignableAgents,
       last_activity_at: lastActivityAt,
       state,
+      needs_you_reason: needsYouReason,
       session_ids: ordered.map((r) => r.id),
       container_status: containerStatus,
       provider_status: providerStatus,

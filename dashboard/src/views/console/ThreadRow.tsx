@@ -136,6 +136,21 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
               <span className="ncc-row-title">{thread.title ?? 'Untitled thread'}</span>
 
               {/*
+               * WHY this row is `needs_you` (operator report 2026-08-21). Same
+               * "spelled out, not just a tooltip" rule as the proposal line
+               * below — 390px is the primary viewport and a touch screen never
+               * triggers a `title`. Stacks ABOVE the proposal line: a row can
+               * carry both (a thread can be needs_you while also carrying a
+               * standing done_proposal), and the reason for needing YOU right
+               * now outranks a flag about the work being finished.
+               */}
+              {thread.needs_you_reason && (
+                <span className="ncc-row-reason" title={thread.needs_you_reason.text}>
+                  {thread.needs_you_reason.text}
+                </span>
+              )}
+
+              {/*
                * The proposal's reason, spelled out — not just in the badge's
                * title tooltip, which a touch screen can never trigger and
                * 390px is the primary viewport (§8). Rendered whenever there IS

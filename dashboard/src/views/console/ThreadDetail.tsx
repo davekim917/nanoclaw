@@ -154,6 +154,11 @@ export function ThreadDetail({ thread, focusComposer = 0, nextAction, onSent }: 
             <span aria-hidden="true">·</span>
             <span>{thread.last_activity_at ? `${relAge(thread.last_activity_at)} ago` : 'no activity'}</span>
           </div>
+          {/* WHY this row is `needs_you` (operator report 2026-08-21), in full —
+              the row itself truncates a long claim note; this pane does not. */}
+          {thread.needs_you_reason && (
+            <div className="ncc-detail-reason">{thread.needs_you_reason.text}</div>
+          )}
         </div>
         <span className={`ncc-state ${presentation.tone}`}>{presentation.label}</span>
       </div>

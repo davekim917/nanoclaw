@@ -727,6 +727,18 @@ export interface ThreadSummary {
   assignable_agents: ThreadAgentOption[];
   last_activity_at: string | null;
   state: ThreadState;
+  /**
+   * WHY this row is `needs_you` — present only when `state` is `needs_you`,
+   * and null even then when the server could not name the cause. Never
+   * fabricated: an operator opened a `needs_you` thread whose newest message
+   * was a completion report and read the flag as a false positive; the real
+   * cause was a parked claim's note (operator report 2026-08-21) — see
+   * `src/dashboard/api/threads.ts`'s `deriveNeedsYouReason`.
+   *
+   * Optional for the same fixture reason as `scheduled_task` below; an absent
+   * value reads as no reason, same as an explicit null.
+   */
+  needs_you_reason?: NeedsYouReason | null;
   session_ids: string[];
   container_status: 'idle' | 'running' | 'stale' | 'unknown';
   provider_status: string | null;
@@ -771,6 +783,12 @@ export interface ThreadSummary {
    */
   close_confirmations_required?: 1 | 2;
 }
+
+/** {@link ThreadSummary.needs_you_reason} — mirrors the host's `NeedsYouReason`. */
+export type NeedsYouReason =
+  | { cause: 'parked_note'; text: string }
+  | { cause: 'ask_question'; text: string }
+  | { cause: 'task_needs_input'; text: string };
 
 /** {@link ThreadSummary.done_proposal} — the proposal plus who made it. */
 export interface ThreadDoneProposal {
