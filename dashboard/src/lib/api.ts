@@ -601,17 +601,29 @@ export interface ObservatorySignal {
   active: boolean;
 }
 
-/** Assign a board item to an agent: creates a one-shot task in the item's own
- *  channel. The server composes the prompt from the board — this sends ids only. */
+/**
+ * Hand an OWNERLESS work item to an agent: a one-shot task in the item's own
+ * channel, which is what opens the conversation the item does not have yet
+ * (DESIGN.md §2 — "Assign is the verb that creates the thread").
+ *
+ * `itemId` is the row's own `thread_id` (`board:<natural>`); the server strips
+ * the stamp. Two ids and nothing else go over the wire — the server re-derives
+ * the item, its room and the agents eligible for it, and composes every word
+ * the agent is told. There is deliberately no text parameter: a row with no
+ * thread has no conversation to say something into, and the item's own
+ * `next_action` is what the agent is pointed at.
+ *
+ * Rows that DO have a thread use `postThreadMessage` instead. See
+ * `views/console/actions.ts`.
+ */
 export async function assignItem(
-  workgroupId: string,
   itemId: string,
   agentGroupId: string,
-): Promise<{ ok: boolean; seriesId: string | null; channel: string; agent: string }> {
+): Promise<{ ok: boolean; seriesId: string | null; channel: string; agent: string; etaSeconds: number }> {
   return apiFetch('/dashboard/api/observatory/assign', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ workgroupId, itemId, agentGroupId }),
+    body: JSON.stringify({ itemId, agentGroupId }),
   });
 }
 
@@ -782,13 +794,68 @@ export interface ThreadSummary {
    * extra round trip (a 409 `confirmation_required`), never a bypass.
    */
   close_confirmations_required?: 1 | 2;
+  /**
+   * Present ONLY on a row produced by a workgroup attention source — an
+   * ownerless work item with no session behind it. Optional for the same
+   * fixture reason as the fields above; absent means "an ordinary thread".
+   */
+  attention_source?: ThreadAttentionSource | null;
 }
 
 /** {@link ThreadSummary.needs_you_reason} — mirrors the host's `NeedsYouReason`. */
 export type NeedsYouReason =
-  | { cause: 'parked_note'; text: string }
+  | {
+      cause: 'parked_note';
+      text: string;
+      /**
+       * How long the claim has been parked, in ms — absent or null when the
+       * claim carries no readable `parked_at`.
+       *
+       * The console never reconciles a claim against reality: releasing a
+       * claim is the claim owner's job, and a display that second-guesses its
+       * own source produces two disagreeing truths. So a stale note still
+       * renders — with its age beside it, which is what makes the staleness
+       * legible without inventing a verdict.
+       */
+      parked_ms?: number | null | undefined;
+    }
   | { cause: 'ask_question'; text: string }
   | { cause: 'task_needs_input'; text: string };
+
+/** {@link ThreadSummary.attention_source} — mirrors the host's `ThreadAttentionSource`. */
+export interface ThreadAttentionSource {
+  kind: string;
+  /**
+   * When the source last regenerated, ISO-8601 UTC, or null when nothing could
+   * be read. Rendered as an AGE marker, never used to suppress the row: an
+   * empty feed is indistinguishable from a healthy one, so a stale feed
+   * showing real work with a visible age is strictly better.
+   */
+  as_of: string | null;
+  url: string | null;
+  next_action: string;
+  /**
+   * Who this item has already been handed to, or null — mirrors the host's
+   * `ThreadItemAssignment`.
+   *
+   * Optional for the same fixture reason as the fields around it; absent reads
+   * as "nobody yet". While it is set the row's Assign control is replaced by a
+   * disabled statement of who has it, which is what stops the operator pressing
+   * again during the couple of minutes before the agent boots and claims the
+   * work. The row's `state` deliberately stays `unassigned` — no session exists
+   * until the agent speaks.
+   */
+  assigned?: ThreadItemAssignment | null;
+}
+
+/** {@link ThreadAttentionSource.assigned}. */
+export interface ThreadItemAssignment {
+  agent_group_id: string;
+  agent_name: string;
+  /** ISO-8601 UTC. */
+  at: string;
+  by: string;
+}
 
 /** {@link ThreadSummary.done_proposal} — the proposal plus who made it. */
 export interface ThreadDoneProposal {

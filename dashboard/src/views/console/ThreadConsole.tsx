@@ -561,7 +561,15 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
                     <CloseThreadControl key={selected.thread_id} thread={selected} onClosed={() => void mutate()} />
                   </div>
                 )}
-                <ThreadDetail thread={selected} focusComposer={focusComposer} onSent={() => void mutate()} />
+                {/* The board join (§10) landed, so a row CAN carry a release
+                    item now — `attention_source.next_action` is the source of
+                    the composer's ship prefill chip. */}
+                <ThreadDetail
+                  thread={selected}
+                  focusComposer={focusComposer}
+                  nextAction={selected?.attention_source?.next_action}
+                  onSent={() => void mutate()}
+                />
               </div>
             )}
           </>

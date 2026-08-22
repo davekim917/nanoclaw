@@ -39,11 +39,21 @@ import { getActiveContainerSessionIds, resolveAssistantName } from '../../contai
 import { readContainerConfig } from '../../container-config.js';
 import { getKnownSlackBots } from '../../channels/slack-mentions.js';
 import { readClaims, type BoardClaim } from '../../claims-board.js';
+import {
+  isAttentionItemId,
+  readAttentionItems,
+  stripAttentionItemPrefix,
+  workgroupIdsForAgentGroups,
+  workgroupIdsWithAttentionSources,
+  type AttentionItem,
+  type AttentionSourceEnv,
+} from '../../attention-sources.js';
 import { log } from '../../log.js';
 import type { AgentGroup, SessionMode } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
 import { isSnoozed, readThreadSnoozes } from '../thread-snooze.js';
+import { assignmentKey, readItemAssignments, readUserDisplayNames } from '../db/item-assignments.js';
 import { readThreadClosures, type ThreadCloseState } from '../thread-close.js';
 import { requiredConfirmations } from '../thread-close-guard.js';
 import {
@@ -98,6 +108,14 @@ const MAX_KEY_SEGMENTS = 4;
  */
 export function threadChannelKey(threadId: string | null | undefined, known?: ReadonlySet<string>): string {
   if (typeof threadId !== 'string') return UNKNOWN_CHANNEL_KEY;
+  // An attention-source item id is a DEDUPE KEY, not a thread id, and it is
+  // `<prefix>:<repo>#<n>` shaped — which this parser would happily read as a
+  // platform plus a channel, minting one fake sidebar bucket PER ITEM. That is
+  // exactly the per-row bucket §3.2 forbids. The item's real channel comes
+  // from the install's declaration and is attached by `buildThreadList`; this
+  // guard is here rather than only at that call site so no future caller can
+  // reintroduce the bug by passing an item id in.
+  if (isAttentionItemId(threadId)) return UNKNOWN_CHANNEL_KEY;
   const segments = threadId.trim().split(':');
   const platform = segments[0];
   // A bare id (legacy timestamp, `spawn-<hash>`) or an empty leading segment
@@ -171,7 +189,27 @@ const WAITING_ON_NOTE = /\bwaiting on\b/i;
  * for how each variant is produced and why its text is never fabricated.
  */
 export type NeedsYouReason =
-  | { cause: 'parked_note'; text: string }
+  | {
+      cause: 'parked_note';
+      text: string;
+      /**
+       * How long the claim has been parked, in ms — or null when the claim
+       * carries no readable `parked_at`.
+       *
+       * **The console never reconciles a claim against reality.** Releasing a
+       * claim is the claim OWNER's job; a display that second-guesses its own
+       * source produces two disagreeing truths, and the one that is wrong is
+       * whichever the operator did not happen to be looking at. So a note
+       * saying a human owes a decision on a PR that merged hours ago still
+       * renders — with its AGE beside it, which is the honest signal and the
+       * one that makes the staleness legible without inventing a verdict.
+       *
+       * Null, never zero: §12 — "an unmeasured value is not a zero", and a
+       * zero here would read as "parked just now", the exact opposite of what
+       * an unreadable timestamp means.
+       */
+      parked_ms: number | null;
+    }
   | { cause: 'ask_question'; text: string }
   | { cause: 'task_needs_input'; text: string };
 
@@ -394,6 +432,67 @@ export interface ThreadSummary {
    * one button where two are required gets a 409, never a close.
    */
   close_confirmations_required: 1 | 2;
+  /**
+   * Present ONLY on a row produced by a workgroup attention source
+   * (`src/attention-sources.ts`) — an ownerless work item that has no session
+   * and therefore no thread yet (§2, §5 `unassigned`). Absent on every row
+   * derived from `sessions`.
+   *
+   * It carries the provenance the operator needs to weigh the row: which kind
+   * of source claimed it, when that source last regenerated, and where a
+   * person goes to act.
+   */
+  attention_source?: ThreadAttentionSource;
+}
+
+/** {@link ThreadSummary.attention_source}. */
+export interface ThreadAttentionSource {
+  /** The declared source kind — `release-board`, etc. */
+  kind: string;
+  /**
+   * When the source last regenerated, ISO-8601 UTC, or null when nothing could
+   * be read at all.
+   *
+   * **On the wire so the row can wear its age — never so anything can suppress
+   * it.** There is no staleness threshold anywhere in this path, deliberately:
+   * a stale feed showing real work with a visible age is strictly better than
+   * an empty feed, because an empty one is indistinguishable from healthy.
+   */
+  as_of: string | null;
+  /** Where a person goes to act on this item, or null. Never invented. */
+  url: string | null;
+  /** What a person has to do, in the source's own words. */
+  next_action: string;
+  /**
+   * Who this ownerless item has already been handed to, or null.
+   *
+   * **The reason the Assign affordance is not a trap.** An attention item is
+   * derived on every poll from a board plus the claims directory, so assigning
+   * one changes nothing an operator can see until the agent boots and claims
+   * the work — minutes later. Without this field the row still reads
+   * `Unassigned` with a live Assign button, and the operator presses it again,
+   * queueing a second task at a second agent for the same work.
+   *
+   * The row's STATE deliberately stays `unassigned`: §5 computes it from "a
+   * work item with no session at all", which is still literally true — no
+   * session exists until the assigned agent speaks. What changes is the verb,
+   * which §12 requires to be a disabled control with a reachable explanation
+   * ("Assigned to X, 2m ago") rather than a live button that can only be
+   * refused. State and verb are separate zones in §4's row anatomy, so the
+   * headline is not contradicted by what sits beside it.
+   */
+  assigned: ThreadItemAssignment | null;
+}
+
+/** {@link ThreadAttentionSource.assigned}. */
+export interface ThreadItemAssignment {
+  agent_group_id: string;
+  /** The name the item's own room knows this agent by, resolved like a participant's. */
+  agent_name: string;
+  /** ISO-8601 UTC. */
+  at: string;
+  /** Display name of whoever assigned it, resolved at read time so a rename shows. */
+  by: string;
 }
 
 /** {@link ThreadSummary.done_proposal} — the proposal plus who made it. */
@@ -1020,6 +1119,63 @@ function threadRoutingChannel(rows: ThreadSessionRow[]): string | null {
   return best?.platformId ?? null;
 }
 
+/* ─── Attention sources (§2, §5 `unassigned`, §10) ─────────────────────────── */
+
+/**
+ * The ownerless work items this caller may see, under this request's filters.
+ *
+ * §5 records `unassigned` as unreachable "until the release-board/findings
+ * join in §10 lands" — this is that join, and it is deliberately the ONLY
+ * place a row enters the queue without a session behind it.
+ *
+ * Every filter here is a NARROWING term intersected with the caller's ceiling,
+ * exactly like `selectScopedSessions` (§2a/§3.5): an unknown or out-of-scope
+ * workgroup yields zero items rather than a 403.
+ *
+ * `group_id` yields nothing at all, and that is correct rather than a gap. An
+ * agent-group filter asks "what is THIS agent on"; an ownerless item is
+ * definitionally on no agent, so including it would answer a question the
+ * operator did not ask. The workgroup axis — §3.5's primary one — is the axis
+ * these items actually have.
+ */
+export function selectScopedAttentionItems(
+  ctx: AuthedRequestContext,
+  opts: { workgroupId?: string | null; groupId: string | null; sinceHours: number; threadId?: string | null },
+  now: number,
+  env: AttentionSourceEnv,
+): AttentionItem[] {
+  const empty: AttentionItem[] = [];
+  if (opts.groupId) return empty;
+
+  let workgroupIds: string[];
+  if (ctx.scopes.no_filter) {
+    workgroupIds = workgroupIdsWithAttentionSources();
+  } else {
+    if (ctx.scopes.allowed_group_ids.length === 0) return empty;
+    workgroupIds = workgroupIdsForAgentGroups(ctx.scopes.allowed_group_ids);
+  }
+  if (opts.workgroupId) workgroupIds = workgroupIds.filter((id) => id === opts.workgroupId);
+  if (workgroupIds.length === 0) return empty;
+
+  const cutoff = opts.threadId ? null : now - opts.sinceHours * 3_600_000;
+  const items: AttentionItem[] = [];
+  for (const wg of workgroupIds) {
+    for (const item of readAttentionItems(wg, now, env).items) {
+      if (opts.threadId) {
+        if (item.id === opts.threadId) items.push(item);
+        continue;
+      }
+      // An unparseable `since` is NOT silently dropped: the item is real work
+      // and the window is a convenience filter, so it stays and sorts last
+      // (§12 — an unmeasured value is not a zero).
+      const since = parseUtcTimestampMs(item.since);
+      if (cutoff !== null && since !== null && since < cutoff) continue;
+      items.push(item);
+    }
+  }
+  return items;
+}
+
 /* ─── Assembly ─────────────────────────────────────────────────────────────── */
 
 /** Liveness ordering: the freshest wins when a thread's sessions disagree. */
@@ -1036,6 +1192,8 @@ export interface ThreadListDeps {
   avatarByChannelType?: (channelType: string) => string | null;
   /** Wiring lookup for the assign selector; defaults to {@link wiredAgentsByChannel}. */
   wiredAgents?: () => Map<string, WiredAgent[]>;
+  /** Injected roots for attention sources (tests); defaults to the live ones. */
+  attentionEnv?: AttentionSourceEnv;
 }
 
 function activityMs(row: ThreadSessionRow): number {
@@ -1107,10 +1265,14 @@ const TASK_NEEDS_INPUT_REASON_TEXT = 'A running task needs input to continue.';
  */
 export function deriveNeedsYouReason(
   ordered: ThreadSessionRow[],
-  claim: { state: BoardClaim['state'] | null; note: string },
+  claim: { state: BoardClaim['state'] | null; note: string; staleMs?: number },
 ): NeedsYouReason | null {
   if (claim.state === 'parked' && WAITING_ON_NOTE.test(claim.note)) {
-    return { cause: 'parked_note', text: claim.note };
+    // `BoardClaim.staleMs` for a PARKED claim is `now - parked_at`
+    // (claims-board.ts), and it is 0 when `parked_at` is missing or
+    // unparseable — which is "unmeasured", not "just now". See the field.
+    const parkedMs = typeof claim.staleMs === 'number' && claim.staleMs > 0 ? claim.staleMs : null;
+    return { cause: 'parked_note', text: claim.note, parked_ms: parkedMs };
   }
   for (const row of ordered) {
     const cause = sessionNeedsOperatorCause(row);
@@ -1252,8 +1414,14 @@ export async function buildThreadList(
   const probeState = deps.containerState ?? readContainerState;
   const avatarLookup = deps.avatarByChannelType ?? ((ct: string) => getKnownSlackBots().get(ct)?.imageUrl ?? null);
 
+  // Ownerless work items (§2, §5 `unassigned`) — read BEFORE the session query
+  // so an install whose only blocked work is on a board still gets a queue.
+  // The reader is memoized (`ATTENTION_MEMO_TTL_MS`); this is not a file open
+  // per poll.
+  const attentionItems = selectScopedAttentionItems(ctx, opts, now, deps.attentionEnv ?? {});
+
   const rows = selectScopedSessions(ctx, opts);
-  if (rows.length === 0) return { threads: [] };
+  if (rows.length === 0 && attentionItems.length === 0) return { threads: [] };
 
   const { known, names, byId, dmDedupeKey } = readChannelDirectory();
   const grouped = groupByThread(rows)
@@ -1332,7 +1500,7 @@ export async function buildThreadList(
         messagingGroupId: r.messaging_group_id,
         sessionProvider: r.agent_provider,
       })),
-      ...[...new Set(channelKeys.values())].flatMap((key) =>
+      ...[...new Set([...channelKeys.values(), ...attentionItems.map((i) => i.channel_key)])].flatMap((key) =>
         (wiredByChannel.get(key) ?? [])
           .filter((a) => inScope(a.agent_group_id))
           .map((a) => ({
@@ -1346,14 +1514,18 @@ export async function buildThreadList(
   );
   // One query for the whole page's snoozes, never one per row. Per-user by
   // construction — see thread-snooze.ts on why this is not archive.
-  const snoozes = readThreadSnoozes(
-    ctx.user.id,
-    grouped.map((t) => t.threadId),
-  );
+  const snoozes = readThreadSnoozes(ctx.user.id, [
+    ...grouped.map((t) => t.threadId),
+    ...attentionItems.map((i) => i.id),
+  ]);
   // Same rule: one query for the page's in-flight closes, never one per row.
   // Fleet-wide (not per-user) — a close is a decision about the WORK, unlike a
   // snooze, so every operator looking at the row must see that it is closing.
   const closures: Map<string, ThreadCloseState> = readThreadClosures(grouped.map((t) => t.threadId));
+  // Same rule again: one query for every attention item on the page. Empty when
+  // there are none, which is every install that declares no attention source.
+  const assignments = readItemAssignments([...new Set(attentionItems.map((i) => i.workgroupId))]);
+  const assignerNames = readUserDisplayNames([...new Set([...assignments.values()].map((a) => a.assignedBy))]);
 
   const threads: ThreadSummary[] = grouped.map((thread) => {
     const ordered = [...thread.rows].sort((a, b) => activityMs(b) - activityMs(a));
@@ -1487,7 +1659,11 @@ export async function buildThreadList(
     // did not itself call `needs_you` (see the field's own doc).
     const needsYouReason =
       state === 'needs_you'
-        ? deriveNeedsYouReason(ordered, { state: claim?.state ?? null, note: claim?.note ?? '' })
+        ? deriveNeedsYouReason(ordered, {
+            state: claim?.state ?? null,
+            note: claim?.note ?? '',
+            staleMs: claim?.staleMs,
+          })
         : null;
 
     return {
@@ -1518,7 +1694,128 @@ export async function buildThreadList(
     };
   });
 
-  return { threads };
+  /**
+   * The standing assignment on one attention item, resolved for display.
+   *
+   * The agent's name comes from the SAME identity memo a participant's does
+   * (per `(agent, messaging_group)`, §10.2) rather than `agent_groups.name` —
+   * a row that said `<workgroup>-<role>` where the room shows a friendly name
+   * would be the exact defect §10.2 records. Falls back to the wiring's own
+   * name, then to the id, so a row never renders blank.
+   */
+  const assignmentOf = (item: AttentionItem): ThreadItemAssignment | null => {
+    const found = assignments.get(assignmentKey(item.workgroupId, stripAttentionItemPrefix(item.id)));
+    if (!found) return null;
+    const wiring = (wiredByChannel.get(item.channel_key) ?? []).find((a) => a.agent_group_id === found.agentGroupId);
+    const identity = wiring
+      ? identities.get(
+          identityKey({
+            agentGroupId: found.agentGroupId,
+            messagingGroupId: wiring.messaging_group_id,
+            sessionProvider: null,
+          }),
+        )
+      : undefined;
+    return {
+      agent_group_id: found.agentGroupId,
+      agent_name: identity?.name ?? wiring?.name ?? found.agentGroupId,
+      at: found.assignedAt,
+      by: assignerNames.get(found.assignedBy) ?? found.assignedBy,
+    };
+  };
+
+  const attentionThreads: ThreadSummary[] = attentionItems.map((item) => {
+    const displayChannelKey = dmDedupeKey.get(item.channel_key) ?? item.channel_key;
+    // §5's ONE action reaches these rows too: every agent wired to the item's
+    // declared channel can be handed the work, and choosing one creates the
+    // session the item does not have yet ("Assign is the verb that creates the
+    // thread" — §2).
+    const assignableAgents: ThreadAgentOption[] = (wiredByChannel.get(item.channel_key) ?? [])
+      .filter((a) => inScope(a.agent_group_id))
+      .map((a) => ({
+        agent_group_id: a.agent_group_id,
+        name:
+          identities.get(
+            identityKey({
+              agentGroupId: a.agent_group_id,
+              messagingGroupId: a.messaging_group_id,
+              sessionProvider: null,
+            }),
+          )?.name ?? a.name,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    // NOT set directly — §5: one function decides what state a row is in, and
+    // a producing surface that sets `state` itself invents its own lane
+    // semantics beside the six. `sessionCount: 0` plus a parked claim whose
+    // note names a human is exactly the input `deriveThreadState`'s hoisted
+    // `needs_you` checks were written for; anything else lands `unassigned`.
+    const state = deriveThreadState({
+      sessionCount: item.sessionCount,
+      claimState: item.claimState,
+      claimNote: item.claimNote ?? '',
+      needsOperator: false,
+      containerStatus: 'unknown',
+      providerStatus: null,
+      toolStartedAtMs: null,
+      lastOutputAtMs: null,
+      now,
+    });
+    const lastActivityAt = isoOrNull(item.since);
+    return {
+      thread_id: item.id,
+      synthetic: false,
+      channel_key: displayChannelKey,
+      channel_name: names.get(displayChannelKey) ?? channelKeyLabel(displayChannelKey),
+      title: item.title,
+      participants: [],
+      assignable_agents: assignableAgents,
+      last_activity_at: lastActivityAt,
+      state,
+      // The claim note this item carries IS the reason, in the source's own
+      // words plus what a person has to do about it. Two real strings joined,
+      // never text this module composed about work it cannot see. No park age:
+      // the item's own age is on the meta line, and there is no claim file
+      // behind it whose `parked_at` could be measured.
+      needs_you_reason:
+        state === 'needs_you' && item.claimNote
+          ? { cause: 'parked_note', text: `${item.claimNote} — next: ${item.nextAction}`, parked_ms: null }
+          : null,
+      session_ids: [],
+      container_status: 'unknown',
+      provider_status: null,
+      current_tool: null,
+      tool_started_at: null,
+      reply_target_session_id: null,
+      snoozed: snoozes.has(item.id) && isSnoozed(snoozes.get(item.id), lastActivityAt),
+      scheduled_task: false,
+      done_proposal: null,
+      closing: false,
+      close_confirmations_required: requiredConfirmations(false),
+      attention_source: {
+        kind: item.sourceKind,
+        as_of: item.sourceAsOf,
+        url: item.url,
+        next_action: item.nextAction,
+        // Keyed on the item's NATURAL id — the `board:` prefix is a rendering
+        // stamp and migration 058 deliberately does not store it.
+        assigned: assignmentOf(item),
+      },
+    };
+  });
+
+  if (attentionThreads.length === 0) return { threads };
+  // Merged into ONE queue, never a separate inbox (§2). Sorted on the same
+  // axis as the session rows — freshest first — and re-capped, so an install
+  // with a busy board cannot push live threads off the page by arriving after
+  // the slice.
+  const merged = [...threads, ...attentionThreads]
+    .sort(
+      (a, b) =>
+        (parseUtcTimestampMs(b.last_activity_at) ?? -Infinity) - (parseUtcTimestampMs(a.last_activity_at) ?? -Infinity),
+    )
+    .slice(0, opts.limit);
+  return { threads: merged };
 }
 
 export const threadsHandler: AuthHandler = async (req, _params, ctx) => {
@@ -1602,6 +1899,13 @@ export async function buildThreadDetail(
   );
   const thread = threads[0];
   if (!thread) return null;
+
+  // An ownerless work item (§2/§5 `unassigned`) has no sessions at all, and
+  // `IN ()` is not valid SQLite — the query below would throw and the detail
+  // pane would 500 on exactly the rows the console just learned to show. Its
+  // transcript is honestly empty: there is no conversation yet, which is the
+  // whole reason the row exists.
+  if (thread.session_ids.length === 0) return { thread, transcript: [] };
 
   const byName = new Map(thread.participants.map((p) => [p.agent_group_id, p.name]));
   const rows = getDb()
