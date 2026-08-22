@@ -42,6 +42,7 @@ import { readClaims, type BoardClaim } from '../../claims-board.js';
 import {
   isAttentionItemId,
   readAttentionItems,
+  stripAttentionItemPrefix,
   workgroupIdsForAgentGroups,
   workgroupIdsWithAttentionSources,
   type AttentionItem,
@@ -52,6 +53,7 @@ import type { AgentGroup, SessionMode } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
 import { isSnoozed, readThreadSnoozes } from '../thread-snooze.js';
+import { assignmentKey, readItemAssignments, readUserDisplayNames } from '../db/item-assignments.js';
 import { readThreadClosures, type ThreadCloseState } from '../thread-close.js';
 import { requiredConfirmations } from '../thread-close-guard.js';
 import {
@@ -461,6 +463,36 @@ export interface ThreadAttentionSource {
   url: string | null;
   /** What a person has to do, in the source's own words. */
   next_action: string;
+  /**
+   * Who this ownerless item has already been handed to, or null.
+   *
+   * **The reason the Assign affordance is not a trap.** An attention item is
+   * derived on every poll from a board plus the claims directory, so assigning
+   * one changes nothing an operator can see until the agent boots and claims
+   * the work — minutes later. Without this field the row still reads
+   * `Unassigned` with a live Assign button, and the operator presses it again,
+   * queueing a second task at a second agent for the same work.
+   *
+   * The row's STATE deliberately stays `unassigned`: §5 computes it from "a
+   * work item with no session at all", which is still literally true — no
+   * session exists until the assigned agent speaks. What changes is the verb,
+   * which §12 requires to be a disabled control with a reachable explanation
+   * ("Assigned to X, 2m ago") rather than a live button that can only be
+   * refused. State and verb are separate zones in §4's row anatomy, so the
+   * headline is not contradicted by what sits beside it.
+   */
+  assigned: ThreadItemAssignment | null;
+}
+
+/** {@link ThreadAttentionSource.assigned}. */
+export interface ThreadItemAssignment {
+  agent_group_id: string;
+  /** The name the item's own room knows this agent by, resolved like a participant's. */
+  agent_name: string;
+  /** ISO-8601 UTC. */
+  at: string;
+  /** Display name of whoever assigned it, resolved at read time so a rename shows. */
+  by: string;
 }
 
 /** {@link ThreadSummary.done_proposal} — the proposal plus who made it. */
@@ -1106,7 +1138,7 @@ function threadRoutingChannel(rows: ThreadSessionRow[]): string | null {
  * operator did not ask. The workgroup axis — §3.5's primary one — is the axis
  * these items actually have.
  */
-function selectScopedAttentionItems(
+export function selectScopedAttentionItems(
   ctx: AuthedRequestContext,
   opts: { workgroupId?: string | null; groupId: string | null; sinceHours: number; threadId?: string | null },
   now: number,
@@ -1490,6 +1522,10 @@ export async function buildThreadList(
   // Fleet-wide (not per-user) — a close is a decision about the WORK, unlike a
   // snooze, so every operator looking at the row must see that it is closing.
   const closures: Map<string, ThreadCloseState> = readThreadClosures(grouped.map((t) => t.threadId));
+  // Same rule again: one query for every attention item on the page. Empty when
+  // there are none, which is every install that declares no attention source.
+  const assignments = readItemAssignments([...new Set(attentionItems.map((i) => i.workgroupId))]);
+  const assignerNames = readUserDisplayNames([...new Set([...assignments.values()].map((a) => a.assignedBy))]);
 
   const threads: ThreadSummary[] = grouped.map((thread) => {
     const ordered = [...thread.rows].sort((a, b) => activityMs(b) - activityMs(a));
@@ -1658,6 +1694,36 @@ export async function buildThreadList(
     };
   });
 
+  /**
+   * The standing assignment on one attention item, resolved for display.
+   *
+   * The agent's name comes from the SAME identity memo a participant's does
+   * (per `(agent, messaging_group)`, §10.2) rather than `agent_groups.name` —
+   * a row that said `<workgroup>-<role>` where the room shows a friendly name
+   * would be the exact defect §10.2 records. Falls back to the wiring's own
+   * name, then to the id, so a row never renders blank.
+   */
+  const assignmentOf = (item: AttentionItem): ThreadItemAssignment | null => {
+    const found = assignments.get(assignmentKey(item.workgroupId, stripAttentionItemPrefix(item.id)));
+    if (!found) return null;
+    const wiring = (wiredByChannel.get(item.channel_key) ?? []).find((a) => a.agent_group_id === found.agentGroupId);
+    const identity = wiring
+      ? identities.get(
+          identityKey({
+            agentGroupId: found.agentGroupId,
+            messagingGroupId: wiring.messaging_group_id,
+            sessionProvider: null,
+          }),
+        )
+      : undefined;
+    return {
+      agent_group_id: found.agentGroupId,
+      agent_name: identity?.name ?? wiring?.name ?? found.agentGroupId,
+      at: found.assignedAt,
+      by: assignerNames.get(found.assignedBy) ?? found.assignedBy,
+    };
+  };
+
   const attentionThreads: ThreadSummary[] = attentionItems.map((item) => {
     const displayChannelKey = dmDedupeKey.get(item.channel_key) ?? item.channel_key;
     // §5's ONE action reaches these rows too: every agent wired to the item's
@@ -1731,6 +1797,9 @@ export async function buildThreadList(
         as_of: item.sourceAsOf,
         url: item.url,
         next_action: item.nextAction,
+        // Keyed on the item's NATURAL id — the `board:` prefix is a rendering
+        // stamp and migration 058 deliberately does not store it.
+        assigned: assignmentOf(item),
       },
     };
   });

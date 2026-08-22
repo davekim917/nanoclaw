@@ -137,7 +137,13 @@ describe('observatoryNudgeHandler', () => {
     expect(prompt).not.toContain('since parked'); // stale claim — "past due" is the honest label
     expect(prompt).toContain(`claim.sh release ${CLAIM.slug}`);
     expect(prompt).toContain('park');
-    expect(prompt).toContain('naming the human who owns that blocker');
+    // The blocked-hand-off branch. `48896b28` rewrote this clause — it now
+    // names "a human or another agent" and requires an @-mention, because a
+    // plain name notifies neither — and this assertion still read the wording
+    // that commit replaced. Pinned on what the shipped prompt actually
+    // demands: who owes it, and the mention that delivers the ask.
+    expect(prompt).toContain('SOMEONE ELSE — a human or another agent');
+    expect(prompt).toContain('@-mentions whoever owes it');
   });
 
   it('labels a parked claim by time since it was parked, not "past due"', async () => {

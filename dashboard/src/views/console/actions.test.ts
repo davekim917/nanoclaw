@@ -20,21 +20,24 @@ const postThreadMessage = vi.fn().mockResolvedValue({});
 const snoozeThread = vi.fn().mockResolvedValue({});
 const unsnoozeThread = vi.fn().mockResolvedValue({});
 const closeThreadApi = vi.fn().mockResolvedValue({});
+const assignItem = vi.fn().mockResolvedValue({});
 vi.mock('../../lib/api.js', () => ({
   postThreadMessage,
   snoozeThread,
   unsnoozeThread,
   closeThread: closeThreadApi,
+  assignItem,
 }));
 
 const actions = await import('./actions.js');
-const { newIdempotencyKey, sendToAgent, setSnoozed, closeThread } = actions;
+const { newIdempotencyKey, sendToAgent, setSnoozed, closeThread, assignOwnerless, isOwnerlessItem } = actions;
 
 beforeEach(() => {
   postThreadMessage.mockClear();
   snoozeThread.mockClear();
   unsnoozeThread.mockClear();
   closeThreadApi.mockClear();
+  assignItem.mockClear();
 });
 
 describe('sendToAgent — steer, push, ship, assign and reassign are ONE call', () => {
@@ -74,9 +77,43 @@ describe('sendToAgent — steer, push, ship, assign and reassign are ONE call', 
  * and no describe block below tests for one.
  */
 describe('there is no kill action', () => {
-  it('the actions module exposes exactly the message primitive, snooze, and close', () => {
-    expect(Object.keys(actions).sort()).toEqual(['closeThread', 'newIdempotencyKey', 'sendToAgent', 'setSnoozed']);
+  it('the actions module exposes exactly the message primitive, assign, snooze, and close', () => {
+    expect(Object.keys(actions).sort()).toEqual([
+      'assignOwnerless',
+      'closeThread',
+      'isOwnerlessItem',
+      'newIdempotencyKey',
+      'sendToAgent',
+      'setSnoozed',
+    ]);
     expect(JSON.stringify(Object.keys(actions)).toLowerCase()).not.toContain('kill');
+  });
+});
+
+/**
+ * Assign is the ONE row type `sendToAgent` structurally cannot serve: an
+ * ownerless row's `thread_id` is a board dedupe key, so the message path parses
+ * no channel out of it and there is no session to write into. These bind the
+ * split — which rows take which path, and that assign carries ids only.
+ */
+describe('assignOwnerless — the ownerless row’s verb, ids only', () => {
+  it('posts the row id and the chosen agent, and never the message endpoint', async () => {
+    await assignOwnerless('board:EXAMPLE-APP#817', 'ag-alpha');
+    expect(assignItem).toHaveBeenCalledWith('board:EXAMPLE-APP#817', 'ag-alpha');
+    expect(postThreadMessage).not.toHaveBeenCalled();
+  });
+
+  it('carries no operator text — the server composes what the agent is told', async () => {
+    await assignOwnerless('board:EXAMPLE-APP#817', 'ag-alpha');
+    expect(assignItem.mock.calls[0]).toHaveLength(2);
+  });
+
+  it('isOwnerlessItem needs BOTH a source and no session', () => {
+    const source = { kind: 'release-board', as_of: null, url: null, next_action: 'x', assigned: null };
+    expect(isOwnerlessItem({ attention_source: source, session_ids: [] })).toBe(true);
+    // A session-backed thread never routes here, whatever it carries.
+    expect(isOwnerlessItem({ attention_source: source, session_ids: ['s-1'] })).toBe(false);
+    expect(isOwnerlessItem({ session_ids: [] })).toBe(false);
   });
 });
 

@@ -22,6 +22,10 @@ import '../cli/dispatch.js'; // registers the cli_command approval handler
 // name (the leaf guard file, not the handler) so the catalog assertion below
 // covers it without dragging the dashboard's route graph into this test.
 import '../dashboard/thread-close-guard.js';
+// Same shape for the assign path — the leaf guard file, not `assign.ts`, so the
+// catalog assertion below covers it without pulling the dashboard's route graph
+// (and the CLI dispatcher behind it) into this test.
+import '../dashboard/observatory-assign-guard.js';
 
 import { commandGuard, listCommands } from '../cli/registry.js';
 import { getApprovalHandler } from '../modules/approvals/primitive.js';
@@ -55,6 +59,7 @@ describe('guard conformance', () => {
       'senders.admit',
       'channels.register',
       'threads.close',
+      'observatory.assign',
     ]) {
       expect(actions.has(expected), `catalog is missing "${expected}"`).toBe(true);
     }
