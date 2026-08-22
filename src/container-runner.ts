@@ -57,6 +57,7 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 // ensureOpus1mSuffix — see its use below.
 import { resolveEffectiveModel, DEFAULT_OPUS_MODEL, DEFAULT_SONNET_MODEL, DEFAULT_HAIKU_MODEL } from './flag-parser.js';
 import { readEnvFileMatching } from './env.js';
+import { GITHUB_APP_SENTINEL, resolveGitHubAppToken } from './github-app-token.js';
 import {
   getAgentGroup,
   getAllAgentGroups,
@@ -1538,12 +1539,24 @@ function writeCapabilitiesSnapshot(
   }
 }
 
-function resolveGitHubToken(folder: string, cfg: ContainerConfig): string | undefined {
+/**
+ * Resolve the GitHub credential for a group: container.json `githubTokenEnv`,
+ * then `GITHUB_TOKEN_<FOLDER_UPPER>`, then `GITHUB_TOKEN`.
+ *
+ * The one special case is the literal `app:github` sentinel, which means
+ * "mint a fresh GitHub App installation token instead". Every other value —
+ * every PAT — passes through byte-for-byte. A failed mint yields `undefined`,
+ * never the sentinel; see resolveGitHubAppToken.
+ */
+export async function resolveGitHubToken(folder: string, cfg: ContainerConfig): Promise<string | undefined> {
+  let value: string | undefined;
   if (cfg.githubTokenEnv) {
     const v = process.env[cfg.githubTokenEnv];
-    if (v) return v;
+    if (v) value = v;
   }
-  return resolveScopedEnv('GITHUB_TOKEN', folder);
+  value ??= resolveScopedEnv('GITHUB_TOKEN', folder);
+  if (value === GITHUB_APP_SENTINEL) return resolveGitHubAppToken();
+  return value;
 }
 
 /**
@@ -3382,7 +3395,7 @@ async function buildContainerArgs(
   // from container.json `githubTokenEnv`, then from
   // `GITHUB_TOKEN_<FOLDER_UPPER>`, then falls back to `GITHUB_TOKEN`.
   // OneCLI's proxy model doesn't fit git auth — we pass the real token.
-  const ghToken = resolveGitHubToken(credentialFolder, containerConfig);
+  const ghToken = await resolveGitHubToken(credentialFolder, containerConfig);
   if (ghToken) {
     args.push('-e', `GH_TOKEN=${ghToken}`);
     args.push('-e', `GITHUB_TOKEN=${ghToken}`);

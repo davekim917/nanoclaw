@@ -2,7 +2,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import Database from 'better-sqlite3';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   buildNudgePrompt,
@@ -14,13 +15,24 @@ import {
   SELF_HEAL_SCAN_INTERVAL_MS,
   shouldSkipSelfHealScan,
   sweepClaimsSelfHeal,
+  wiredCandidates,
   type SelfHealDeps,
   type SelfHealTaskInput,
 } from './self-heal.js';
+import { closeDb, getDb, initTestDb } from '../../db/connection.js';
 
 // Only needed by the one test that exercises the REAL createTask path; the rest
 // inject a recording createTask and never reach dispatch.
 vi.mock('../../cli/dispatch.js', () => ({ dispatch: vi.fn() }));
+
+// The routing-stamp rung reads a per-session inbound DB. Back it with a real
+// in-memory one so the production SQL is what these tests exercise, not a stub.
+const stamp = vi.hoisted(() => ({ db: null as InstanceType<typeof Database> | null, path: '/nonexistent/inbound.db' }));
+vi.mock('../../session-manager.js', () => ({
+  inboundDbPath: () => stamp.path,
+  withInboundDb: <T>(_agentGroupId: string, _sessionId: string, fn: (db: InstanceType<typeof Database>) => T): T =>
+    fn(stamp.db!),
+}));
 
 const HOUR = 60 * 60 * 1000;
 const NOW = Date.parse('2026-08-20T12:00:00Z');
@@ -283,6 +295,56 @@ describe('ladder', () => {
     expect(d.sent).toEqual([]);
     expect(readClaimFile(dir, 'seam').auto_nudge_count).toBeUndefined();
   });
+
+  it('backs an unresolvable claim off for a day instead of re-deciding it every scan', async () => {
+    // The hot loop this closes: 1035 "no deliverable target" warnings from 8
+    // claims in one log, because nothing about a failed resolve was recorded.
+    const dir = root({ seam: claim(30) });
+    const d = deps(dir, { resolveOwner: async () => null });
+
+    await sweepClaimsSelfHeal(NOW, d);
+    expect(readClaimFile(dir, 'seam').auto_heal_unresolved_at).toBe(new Date(NOW).toISOString());
+
+    // Next scan, minutes later: silent.
+    expect(await sweepClaimsSelfHeal(NOW + SELF_HEAL_SCAN_INTERVAL_MS, d)).toEqual([]);
+
+    // A day later it tries again — a backoff, never a giving-up. The rung is
+    // untouched, so it is still the FIRST nudge that is owed.
+    const [retry] = await sweepClaimsSelfHeal(NOW + SELF_HEAL_COOLDOWN_MS + 1, d);
+    expect(retry).toMatchObject({ action: 'nudge', reason: 'owner-unresolved', applied: false });
+    expect(readClaimFile(dir, 'seam').auto_nudge_count).toBeUndefined();
+  });
+
+  it('re-arms immediately when the claim is re-claimed into a thread that may resolve', async () => {
+    const dir = root({
+      seam: claim(30, { auto_heal_unresolved_at: new Date(NOW - HOUR).toISOString() }),
+    });
+    const d = deps(dir);
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+
+    // claimed_at (30h ago) is OLDER than the stamp, so the backoff holds.
+    expect(outcome).toBeUndefined();
+
+    const fresh = root({
+      seam: claim(4, {
+        // Re-claimed AFTER the failed resolve — new work, possibly a new thread.
+        auto_heal_unresolved_at: new Date(NOW - 5 * HOUR).toISOString(),
+        ttl_hours: 0,
+      }),
+    });
+    const [reclaimed] = await sweepClaimsSelfHeal(NOW, deps(fresh));
+    expect(reclaimed).toMatchObject({ action: 'nudge', reason: 'first-nudge', applied: true });
+  });
+
+  it('stamps nothing in shadow mode, so a dry run still reports every scan', async () => {
+    const dir = root({ seam: claim(30) });
+    const d = deps(dir, { resolveOwner: async () => null, enabled: false });
+
+    await sweepClaimsSelfHeal(NOW, d);
+
+    expect(readClaimFile(dir, 'seam').auto_heal_unresolved_at).toBeUndefined();
+  });
 });
 
 describe('flags', () => {
@@ -457,5 +519,148 @@ describe('throttle', () => {
     // to do because of the stamp, not because of the throttle).
     expect((await sweepClaimsSelfHeal(NOW, deps(dir)))[0].applied).toBe(true);
     expect(await sweepClaimsSelfHeal(NOW + 1000, deps(dir))).toEqual([]);
+  });
+});
+
+describe('wiredCandidates — where a claim can actually be reached', () => {
+  beforeEach(() => {
+    const db = initTestDb();
+    db.exec(`
+      CREATE TABLE agent_groups (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
+        agent_provider TEXT, workgroup_id TEXT, created_at TEXT NOT NULL
+      );
+      CREATE TABLE messaging_groups (
+        id TEXT PRIMARY KEY, channel_type TEXT NOT NULL, platform_id TEXT NOT NULL,
+        instance TEXT, name TEXT, created_at TEXT NOT NULL, UNIQUE(channel_type, platform_id)
+      );
+      CREATE TABLE messaging_group_agents (
+        id TEXT PRIMARY KEY, messaging_group_id TEXT NOT NULL, agent_group_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
+        thread_id TEXT, status TEXT DEFAULT 'active', created_at TEXT NOT NULL
+      );
+      CREATE TABLE task_thread_anchors (
+        session_id TEXT NOT NULL, channel_type TEXT NOT NULL, platform_id TEXT NOT NULL,
+        thread_platform_id TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, channel_type, platform_id)
+      );
+      INSERT INTO agent_groups VALUES ('ag-1', 'agent-a', 'agent-a', 'claude', 'wg-a', '2026-08-01T00:00:00Z');
+      INSERT INTO messaging_groups VALUES ('mg-1', 'slack-example', 'slack:C0AAA', NULL, '#channel-a', '2026-08-01T00:00:00Z');
+      INSERT INTO messaging_group_agents VALUES ('w-1', 'mg-1', 'ag-1', '2026-08-01T00:00:00Z');
+      INSERT INTO sessions VALUES ('sess-task', 'ag-1', NULL, 'system:tasks:nightly-sweep-abcd', 'active', '2026-08-01T00:00:00Z');
+    `);
+  });
+
+  afterEach(() => {
+    closeDb();
+    stamp.db?.close();
+    stamp.db = null;
+    stamp.path = '/nonexistent/inbound.db';
+  });
+
+  function anchor(channelType: string, platformId: string, threadPlatformId: string, createdAt: string): void {
+    getDb()
+      .prepare('INSERT INTO task_thread_anchors VALUES (?, ?, ?, ?, ?)')
+      .run('sess-task', channelType, platformId, threadPlatformId, createdAt);
+  }
+
+  it('resolves a scheduled-task claim to the series owner and the room it talks in', async () => {
+    // The 78% case: a `system:tasks:*` thread has no messaging group of its
+    // own, so the channel join returns nothing and the claim was un-nudgeable
+    // forever. The session row IS the owner; the anchor is where it speaks.
+    anchor('slack-example', 'slack:C0AAA', '1787250153.097109', '2026-08-20T18:22:33Z');
+
+    expect(await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd')).toEqual([
+      {
+        agentGroupId: 'ag-1',
+        messagingGroupId: 'mg-1',
+        name: 'agent-a',
+        folder: 'agent-a',
+        deliverThreadId: 'slack:C0AAA:1787250153.097109',
+      },
+    ]);
+  });
+
+  it('picks the newest anchor when a series has spoken in more than one room', async () => {
+    anchor('slack-example', 'slack:C0AAA', '1111.0001', '2026-08-19T00:00:00Z');
+    getDb()
+      .prepare('INSERT INTO messaging_groups VALUES (?, ?, ?, NULL, ?, ?)')
+      .run('mg-2', 'slack-example', 'slack:C0BBB', '#channel-b', '2026-08-01T00:00:00Z');
+    getDb()
+      .prepare('INSERT INTO messaging_group_agents VALUES (?, ?, ?, ?)')
+      .run('w-2', 'mg-2', 'ag-1', '2026-08-01T00:00:00Z');
+    anchor('slack-example', 'slack:C0BBB', '2222.0002', '2026-08-21T00:00:00Z');
+
+    const [row] = await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd');
+    expect(row.deliverThreadId).toBe('slack:C0BBB:2222.0002');
+  });
+
+  /** The series' routing stamp, on a real in-memory `messages_in`. */
+  function stampRouting(platformId: string | null, channelType: string, threadId: string | null): void {
+    const db = new Database(':memory:');
+    db.exec(`CREATE TABLE messages_in (
+      id TEXT PRIMARY KEY, seq INTEGER, kind TEXT, series_id TEXT,
+      platform_id TEXT, channel_type TEXT, thread_id TEXT
+    )`);
+    db.prepare('INSERT INTO messages_in VALUES (?, 1, ?, ?, ?, ?, ?)').run(
+      'row-1',
+      'task',
+      'nightly-sweep-abcd',
+      platformId,
+      channelType,
+      threadId,
+    );
+    stamp.db = db;
+    stamp.path = fs.mkdtempSync(path.join(os.tmpdir(), 'self-heal-inbound-'));
+    fs.writeFileSync((stamp.path = path.join(stamp.path, 'inbound.db')), '');
+  }
+
+  it('prefers where the series LANDED over where its replies are addressed', async () => {
+    // The two are not the same fact: an anchor is where output actually went,
+    // the stamp is only where an unaddressed reply falls back to. Collapsing
+    // them nudges into the default channel for any series that posts elsewhere.
+    anchor('slack-example', 'slack:C0AAA', '1787250153.097109', '2026-08-20T18:22:33Z');
+    stampRouting('slack:C0AAA', 'slack-example', null);
+
+    const [row] = await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd');
+    expect(row.deliverThreadId).toBe('slack:C0AAA:1787250153.097109');
+  });
+
+  it('falls back to the routing stamp when the series never anchored', async () => {
+    stampRouting('slack:C0AAA', 'slack-example', null);
+
+    expect(await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd')).toEqual([
+      {
+        agentGroupId: 'ag-1',
+        messagingGroupId: 'mg-1',
+        name: 'agent-a',
+        folder: 'agent-a',
+        // null, not undefined — the channel, with no thread. Anything that
+        // collapses these two sends the nudge to the claim's task session.
+        deliverThreadId: null,
+      },
+    ]);
+  });
+
+  it('resolves nothing rather than guessing when the series never posted and never routed', async () => {
+    expect(await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd')).toEqual([]);
+  });
+
+  it('resolves nothing for an --isolated series, which stamped no routing on purpose', async () => {
+    stampRouting(null, 'slack-example', null);
+    expect(await wiredCandidates('wg-a', 'system:tasks:nightly-sweep-abcd')).toEqual([]);
+  });
+
+  it('never crosses a workgroup boundary', async () => {
+    anchor('slack-example', 'slack:C0AAA', '1787250153.097109', '2026-08-20T18:22:33Z');
+    expect(await wiredCandidates('wg-other', 'system:tasks:nightly-sweep-abcd')).toEqual([]);
+  });
+
+  it('still resolves an ordinary channel thread through the wiring join', async () => {
+    const rows = await wiredCandidates('wg-a', 'slack:C0AAA:1786621514.008659');
+    expect(rows).toEqual([{ agentGroupId: 'ag-1', messagingGroupId: 'mg-1', name: 'agent-a', folder: 'agent-a' }]);
   });
 });
