@@ -820,6 +820,44 @@ describe('tasks CLI resource', () => {
       expect(
         (r.data as { routed: { channel_type: string; platform_id: string; thread_id: string | null } }).routed,
       ).toEqual({ channel_type: 'slack', platform_id: 'C123', thread_id: null });
+
+      // Migration 056: the same routing lands on the task SESSION as well as
+      // the task row, so the console can place the task in the channel it is
+      // routed to. `messaging_group_id` must stay NULL — it is delivery.ts's
+      // task-session discriminator (`task_log` appends, `isTaskSessionPost`).
+      const session = getDb()
+        .prepare(
+          `SELECT messaging_group_id, task_routing_platform_id FROM sessions
+            WHERE agent_group_id = 'ag-1' AND thread_id LIKE 'system:tasks:%'`,
+        )
+        .get() as { messaging_group_id: string | null; task_routing_platform_id: string | null };
+      expect(session.task_routing_platform_id).toBe('C123');
+      expect(session.messaging_group_id).toBeNull();
+    });
+
+    it('an --isolated task stamps nothing on its session either', async () => {
+      // Absent is honest: an isolated series has no destination, so the console
+      // leaves it in the "Unrouted tasks" bucket rather than inventing one.
+      createMg('mg-1');
+      createMgSession('ag-1', 'chan-iso', 'mg-1');
+      const r = await dispatch(
+        {
+          id: 'r2b',
+          command: 'tasks-create',
+          args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', isolated: true },
+        },
+        agentCtx('ag-1', 'chan-iso'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const session = getDb()
+        .prepare(
+          `SELECT messaging_group_id, task_routing_platform_id FROM sessions
+            WHERE agent_group_id = 'ag-1' AND thread_id LIKE 'system:tasks:%'`,
+        )
+        .get() as { messaging_group_id: string | null; task_routing_platform_id: string | null };
+      expect(session.task_routing_platform_id).toBeNull();
+      expect(session.messaging_group_id).toBeNull();
     });
 
     it("--thread additionally binds the calling session's own thread", async () => {

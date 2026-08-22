@@ -83,13 +83,17 @@ function insertSession(opts: {
   lastActive?: string | null;
   archivedAt?: string | null;
   agentProvider?: string | null;
+  /** Migration 056's routing stamp — task sessions only. */
+  taskRoutingPlatformId?: string | null;
+  createdAt?: string;
 }): void {
   getDb()
     .prepare(
       `INSERT INTO sessions
          (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status,
-          title, title_generated_at, last_active, last_outbound_at, archived_at, created_at)
-       VALUES (?, ?, ?, ?, ?, 'active', 'stopped', ?, ?, ?, ?, ?, ?)`,
+          title, title_generated_at, last_active, last_outbound_at, archived_at, created_at,
+          task_routing_platform_id)
+       VALUES (?, ?, ?, ?, ?, 'active', 'stopped', ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       opts.id,
@@ -103,7 +107,8 @@ function insertSession(opts: {
       // Non-null so the never-engaged filter (shared with sessions.ts) keeps the row.
       opts.lastOutboundAt ?? iso(60_000),
       opts.archivedAt ?? null,
-      iso(3_600_000),
+      opts.createdAt ?? iso(3_600_000),
+      opts.taskRoutingPlatformId ?? null,
     );
 }
 
@@ -679,6 +684,125 @@ describe('buildThreadList — scheduled tasks resolve to where they actually pos
     expect(byThread.get('system:tasks:series-anchored')!.channel_key).toBe('slack:CTESTROOMX1');
     expect(byThread.get('system:tasks:series-bare')!.channel_key).toBe('system:tasks');
     expect(byThread.get('system:tasks:series-bare')!.channel_name).toBe('Unrouted tasks');
+  });
+});
+
+// ── Migration 056: the routing stamp, and why it LOSES to an anchor ──────────
+
+describe('buildThreadList — scheduled tasks fall back to their routing stamp (migration 056)', () => {
+  beforeEach(() => {
+    closeDb();
+    setupDb();
+  });
+
+  it('a task session with no anchor but a routing stamp resolves to the stamped channel', async () => {
+    // The 53% of task sessions the anchor table can never cover: the series is
+    // routed to a real channel but has not posted there yet (or posts through a
+    // path that leaves no anchor). Its destination IS knowable at definition
+    // time, so "Unrouted tasks" was a lie, not an absence.
+    seedAgentGroup('ag-1');
+    insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTSWEEP001', name: '#example-sweep' });
+    insertSession({
+      id: 's-task',
+      agentGroupId: 'ag-1',
+      threadId: 'system:tasks:example-task-0010',
+      taskRoutingPlatformId: 'slack:CTESTSWEEP001',
+    });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.channel_key).toBe('slack:CTESTSWEEP001');
+    expect(threads[0]!.channel_name).toBe('#example-sweep');
+    // Still a scheduled run — the pill is orthogonal to which branch resolved
+    // the channel.
+    expect(threads[0]!.scheduled_task).toBe(true);
+  });
+
+  it('PRECEDENCE: an anchor pointing at X beats a routing stamp saying Y', async () => {
+    // The case the precedence exists for, and the reason it must not be
+    // "simplified" into a single lookup. The stamp is only where an
+    // UNADDRESSED reply lands by default; `ncl tasks`' own contract is that
+    // the agent chooses its destination at fire time. A series re-pointed
+    // between runs still carries its original stamp while its anchors have
+    // already moved — the console must show where it is actually posting.
+    seedAgentGroup('ag-1');
+    insertMessagingGroup({ id: 'mg-x', platformId: 'slack:CTESTACTUAL01', name: '#example-actual' });
+    insertMessagingGroup({ id: 'mg-y', platformId: 'slack:CTESTSTAMPED2', name: '#example-stamped' });
+    insertSession({
+      id: 's-task',
+      agentGroupId: 'ag-1',
+      threadId: 'system:tasks:example-task-0011',
+      taskRoutingPlatformId: 'slack:CTESTSTAMPED2',
+    });
+    insertTaskAnchor({ sessionId: 's-task', platformId: 'slack:CTESTACTUAL01', createdAt: iso(60_000) });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.channel_key).toBe('slack:CTESTACTUAL01');
+    expect(threads[0]!.channel_name).toBe('#example-actual');
+  });
+
+  it('a task session with NEITHER an anchor nor a stamp still lands in the labeled fallback', async () => {
+    // No channel is invented. An `--isolated` series, or one scheduled by a
+    // host caller with no --messaging-group, genuinely has no destination.
+    seedAgentGroup('ag-1');
+    insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTCHAN01', name: '#example-chan' });
+    insertSession({ id: 's-task', agentGroupId: 'ag-1', threadId: 'system:tasks:example-task-0012' });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads[0]!.channel_key).toBe('system:tasks');
+    expect(threads[0]!.channel_name).toBe('Unrouted tasks');
+    expect(threads[0]!.scheduled_task).toBe(true);
+  });
+
+  it("a stamp never leaks onto another task thread, and doesn't touch ordinary channel threads", async () => {
+    seedAgentGroup('ag-1');
+    seedAgentGroup('ag-2');
+    insertMessagingGroup({ id: 'mg-1', platformId: 'slack:CTESTSTAMP001', name: '#example-stamp' });
+    insertSession({
+      id: 's-stamped',
+      agentGroupId: 'ag-1',
+      threadId: 'system:tasks:series-stamped',
+      taskRoutingPlatformId: 'slack:CTESTSTAMP001',
+    });
+    insertSession({ id: 's-bare', agentGroupId: 'ag-2', threadId: 'system:tasks:series-bare' });
+    insertSession({ id: 's-chat', agentGroupId: 'ag-1', threadId: 'slack:CTESTCHAN01:1.1' });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    const byThread = new Map(threads.map((t) => [t.thread_id, t]));
+    expect(byThread.get('system:tasks:series-stamped')!.channel_key).toBe('slack:CTESTSTAMP001');
+    expect(byThread.get('system:tasks:series-bare')!.channel_key).toBe('system:tasks');
+    expect(byThread.get('slack:CTESTCHAN01:1.1')!.channel_key).toBe('slack:CTESTCHAN01');
+    expect(byThread.get('slack:CTESTCHAN01:1.1')!.scheduled_task).toBe(false);
+  });
+
+  it('tie-break across sessions: the most recently created stamped session wins', async () => {
+    // §3.1 allows two agent groups to share a series id. Same "most recent
+    // wins" rule as the anchors, keyed on session created_at because the stamp
+    // itself carries no timestamp — pinned so it never silently becomes
+    // "whichever row the query returned first".
+    seedAgentGroup('ag-a');
+    seedAgentGroup('ag-b');
+    insertMessagingGroup({ id: 'mg-a', platformId: 'slack:CTESTOLDSTMP1', name: '#example-old-stamp' });
+    insertMessagingGroup({ id: 'mg-b', platformId: 'slack:CTESTNEWSTMP2', name: '#example-new-stamp' });
+    const thread = 'system:tasks:shared-series-0013';
+    insertSession({
+      id: 's-a',
+      agentGroupId: 'ag-a',
+      threadId: thread,
+      taskRoutingPlatformId: 'slack:CTESTOLDSTMP1',
+      createdAt: iso(7_200_000),
+    });
+    insertSession({
+      id: 's-b',
+      agentGroupId: 'ag-b',
+      threadId: thread,
+      taskRoutingPlatformId: 'slack:CTESTNEWSTMP2',
+      createdAt: iso(600_000),
+    });
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+    expect(threads).toHaveLength(1);
+    expect(threads[0]!.channel_key).toBe('slack:CTESTNEWSTMP2');
+    expect(threads[0]!.channel_name).toBe('#example-new-stamp');
   });
 });
 

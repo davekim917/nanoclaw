@@ -1181,6 +1181,55 @@ describe('rolling task-thread anchor (fleet-hardening 1.4)', () => {
     expect(anchor).toEqual({ threadPlatformId: 'plat-1', createdAt: expect.any(String) });
   });
 
+  // ── Regression guard for migration 056 ────────────────────────────────────
+  //
+  // `sessions.messaging_group_id === null` is the discriminator BOTH task-only
+  // branches of delivery.ts key on: the `task_log` branch that appends a run's
+  // final text to the series log, and `isTaskSessionPost`, which drives this
+  // whole rolling-anchor block. Migration 056 adds a routing stamp to task
+  // sessions, and the obvious-but-wrong way to ship it would have been to give
+  // the session the `messaging_group_id` it was routed to — which would send
+  // `task_log` rows to the "task_log row outside a task session — ignoring"
+  // else branch and silently stop run-log appends, and would drop this session
+  // out of `isTaskSessionPost` so it never anchors again.
+  //
+  // This test pins that the stamp does NOT do that: a fully routed task session
+  // still has a NULL messaging_group_id, and still behaves as a task-session
+  // post end to end (root post + stored anchor).
+  it('a routing-stamped task session keeps messaging_group_id NULL and still anchors', async () => {
+    seedAgentAndChannel();
+    grantChannelDestination('ag-1', 'mg-1');
+    const { session } = resolveTaskSession('ag-1', 'series-1', 'telegram:123');
+
+    // The stamp landed on its own column, and the discriminator column did not
+    // move — read straight from the DB, not from the in-memory object.
+    const row = getDb()
+      .prepare('SELECT messaging_group_id, task_routing_platform_id FROM sessions WHERE id = ?')
+      .get(session.id) as { messaging_group_id: string | null; task_routing_platform_id: string | null };
+    expect(row.messaging_group_id).toBeNull();
+    expect(row.task_routing_platform_id).toBe('telegram:123');
+    expect(session.messaging_group_id).toBeNull();
+
+    // ...and delivery still treats it as a task-session post: root post, anchor
+    // stored. Both are unreachable once `isTaskSessionPost` goes false.
+    insertTaskChat('ag-1', session.id, 'out-1', '2026-08-10T09:00:00.000Z');
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_ct, _pid, threadId) {
+        calls.push({ threadId });
+        return 'plat-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: null }]);
+    expect(getTaskThreadAnchor(session.id, 'telegram', 'telegram:123')).toEqual({
+      threadPlatformId: 'plat-1',
+      createdAt: expect.any(String),
+    });
+  });
+
   it('second post same UTC day: threads under the stored anchor', async () => {
     seedAgentAndChannel();
     grantChannelDestination('ag-1', 'mg-1');
