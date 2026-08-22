@@ -217,7 +217,7 @@ describe('deriveThreadState', () => {
         ...base,
         sessionCount: 0,
         claimState: 'parked',
-        claimNote: 'waiting on Dave to approve the release',
+        claimNote: 'waiting on the release owner to approve the release',
       }),
     ).toBe('needs_you');
   });
