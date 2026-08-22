@@ -139,14 +139,15 @@ describe('verdicts advance by exactly one', () => {
     expect(screen.getByText('1 / 2')).toBeTruthy();
   });
 
-  it('offers no close/dismiss or answer button, and the key hint carries only snooze and exit', async () => {
+  it('offers no close/dismiss or answer button, and the key hint carries only snooze, skip and exit', async () => {
     renderTriage([thread(1)]);
     // `find`, not `get`: it lets the detail pane's transcript fetch settle
     // inside act rather than landing after the test has ended.
     await screen.findByRole('button', { name: /S · snooze/ });
+    expect(screen.getByRole('button', { name: /N · skip/ })).toBeTruthy();
     expect(screen.queryByRole('button', { name: /close|dismiss/i })).toBeNull();
     expect(screen.queryByRole('button', { name: /answer/i })).toBeNull();
-    expect(screen.getByText('S snooze · Esc exit')).toBeTruthy();
+    expect(screen.getByText('S snooze · N skip · Esc exit')).toBeTruthy();
   });
 
   it('reports the end of the queue rather than wrapping', async () => {
@@ -166,6 +167,59 @@ describe('verdicts advance by exactly one', () => {
     await waitFor(() => expect(live.textContent).toContain('Snoozed'));
     expect(live.getAttribute('aria-live')).toBe('polite');
     expect(live.textContent).toContain('2 of 2');
+  });
+});
+
+/**
+ * Skip — NOT a verdict. It exists so an operator working the (now correctly
+ * scoped) attention set can move past one thread without being forced to
+ * snooze or exit. The failure mode this guards is the same one the ADD SKIP
+ * brief named directly: it must not touch the thread at all.
+ */
+describe('skip moves past a thread without touching it', () => {
+  it('N advances to the next thread and fires no request of any kind', async () => {
+    const user = userEvent.setup();
+    const { onChanged } = renderTriage([thread(1), thread(2), thread(3)]);
+    panel().focus();
+    await user.keyboard('n');
+    // No server state changed — not a snooze, not a send, and no reason to
+    // revalidate the queue either.
+    expect(snoozeThread).not.toHaveBeenCalled();
+    expect(postThreadMessage).not.toHaveBeenCalled();
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(screen.getByText('2 / 3')).toBeTruthy();
+    expect(await screen.findByText('Thread 2')).toBeTruthy();
+  });
+
+  it('the touch-reachable skip button does the same thing as the key', async () => {
+    const { onChanged } = renderTriage([thread(1), thread(2)]);
+    await userEvent.click(await screen.findByRole('button', { name: /N · skip/ }));
+    expect(snoozeThread).not.toHaveBeenCalled();
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(screen.getByText('2 / 2')).toBeTruthy();
+  });
+
+  it('a skipped thread stays in the snapshot — the rail never drops it', async () => {
+    // Skip does not remove anything from `snapshot`: unlike a verdict, there
+    // is no reason the live list would have dropped the thread, so the pass
+    // still has as many entries after a skip as before it.
+    const user = userEvent.setup();
+    const { container } = renderTriage([thread(1), thread(2)]);
+    panel().focus();
+    await user.keyboard('n');
+    expect(screen.getByText('2 / 2')).toBeTruthy();
+    expect(container.querySelectorAll('.ncc-triage-dot')).toHaveLength(2);
+  });
+
+  it('skipping the last item reaches the end of the queue rather than wrapping', async () => {
+    const user = userEvent.setup();
+    renderTriage([thread(1)]);
+    panel().focus();
+    await user.keyboard('n');
+    await waitFor(() => expect(screen.getByText(/queue clear/i)).toBeTruthy());
+    // Same terminal state a verdict reaches — not a silent exit, not a wrap
+    // back to thread 1.
+    expect(screen.queryByText('Thread 1')).toBeNull();
   });
 });
 
