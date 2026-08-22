@@ -70,6 +70,19 @@ export function isAttentionItemId(id: string): boolean {
   return id.startsWith(ATTENTION_ITEM_PREFIX);
 }
 
+/**
+ * The provider's own natural id, with the stamp taken back off.
+ *
+ * Anything that PERSISTS an item — `observatory_item_assignments`, migration
+ * 058 — stores this, never the stamped form: the prefix is a rendering
+ * concern, and a table keyed on it would break the moment a second producer
+ * stamped a different one. Idempotent, so a caller holding either form is
+ * safe.
+ */
+export function stripAttentionItemPrefix(id: string): string {
+  return isAttentionItemId(id) ? id.slice(ATTENTION_ITEM_PREFIX.length) : id;
+}
+
 /** One entry of a workgroup's `attention_sources` JSON array. */
 export interface AttentionSourceDecl {
   /** Selects a provider from {@link PROVIDERS}. Unknown kinds are skipped, never fatal. */

@@ -6,7 +6,7 @@ import { renderMarkdown } from '../../lib/markdown.js';
 import { AgentAvatar } from '../AgentAvatar.js';
 import { prefillChips, type PrefillChip } from '../ship-prefill.js';
 import { actionError } from './action-error.js';
-import { sendToAgent } from './actions.js';
+import { assignOwnerless, isOwnerlessItem, sendToAgent } from './actions.js';
 import { STATE_PRESENTATION, initials, parkAge, replyTarget } from './thread-state.js';
 
 /**
@@ -218,13 +218,25 @@ export function ThreadDetail({ thread, focusComposer = 0, nextAction, onSent }: 
         </div>
       </div>
 
-      <ReplyComposer
-        key={thread.thread_id}
-        thread={thread}
-        focusNonce={focusComposer}
-        {...(nextAction ? { nextAction } : {})}
-        {...(onSent ? { onSent } : {})}
-      />
+      {/* An ownerless item has no session to write into and no conversation for
+          a reply to land in, so the reply composer cannot serve it — see
+          `assignOwnerless` in actions.ts. Assign is its verb. */}
+      {isOwnerlessItem(thread) ? (
+        <AssignComposer
+          key={thread.thread_id}
+          thread={thread}
+          focusNonce={focusComposer}
+          {...(onSent ? { onSent } : {})}
+        />
+      ) : (
+        <ReplyComposer
+          key={thread.thread_id}
+          thread={thread}
+          focusNonce={focusComposer}
+          {...(nextAction ? { nextAction } : {})}
+          {...(onSent ? { onSent } : {})}
+        />
+      )}
     </section>
   );
 }
@@ -270,6 +282,121 @@ export function MessageText({ text }: { text: string }) {
       </summary>
       <div className="ncc-msg-text ncc-md" dangerouslySetInnerHTML={{ __html: fullHtml }} />
     </details>
+  );
+}
+
+/* ─── Assign composer ──────────────────────────────────────────────────────── */
+
+/**
+ * The composer for an OWNERLESS row: one selector, one button, no text box.
+ *
+ * Same markup, same classes and the same shape as `ReplyComposer` — this is not
+ * a second visual language, it is the same control with the half that cannot
+ * apply removed. There is nothing to type because there is no thread to type
+ * into: assign queues a task in the room the item's source declared, and the
+ * agent is pointed at the board's own `next_action`. A text box here would
+ * promise a conversation that does not exist yet.
+ *
+ * **Once assigned, the button is gone and a sentence stands in its place.**
+ * DESIGN.md §12: an affordance must be able to succeed, and a live Assign
+ * button during the couple of minutes before the agent boots can only be
+ * refused — which is exactly how an operator ends up queueing the same work at
+ * three agents. The row keeps its `Unassigned` state (no session exists yet)
+ * and this line says what has already been done about it.
+ */
+export function AssignComposer({
+  thread,
+  focusNonce = 0,
+  onSent,
+}: {
+  thread: ThreadSummary;
+  focusNonce?: number;
+  onSent?: (thread: ThreadSummary) => void;
+}) {
+  const [rawAgentId, setAgentId] = useState<string>(thread.assignable_agents[0]?.agent_group_id ?? '');
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string>('');
+  const picker = useRef<HTMLSelectElement>(null);
+  const assigned = thread.attention_source?.assigned ?? null;
+
+  useEffect(() => {
+    if (focusNonce === 0) return;
+    picker.current?.focus();
+  }, [focusNonce]);
+
+  if (assigned) {
+    return (
+      <div className="ncc-composer">
+        <div className="ncc-composer-note">
+          Assigned to {assigned.agent_name} by {assigned.by}, {relAge(assigned.at)} ago — waiting for it to pick the
+          work up.
+        </div>
+      </div>
+    );
+  }
+
+  if (thread.assignable_agents.length === 0) {
+    return (
+      <div className="ncc-composer">
+        <div className="ncc-composer-note">
+          No agent is wired to {thread.channel_name} — there is nobody here this can be handed to.
+        </div>
+      </div>
+    );
+  }
+
+  // Same re-validation `ReplyComposer` runs: an agent can stop being wired to
+  // the room between renders, and a stale choice must fall to nobody rather
+  // than to whichever option happens to be first.
+  const agentId = thread.assignable_agents.some((a) => a.agent_group_id === rawAgentId) ? rawAgentId : '';
+  const chosen = thread.assignable_agents.find((a) => a.agent_group_id === agentId);
+
+  const submit = async (): Promise<void> => {
+    if (busy || !agentId) return;
+    setBusy(true);
+    setStatus('');
+    try {
+      const res = await assignOwnerless(thread.thread_id, agentId);
+      setStatus(`Assigned to ${res.agent} in ${res.channel}. It should be working within ${res.etaSeconds}s.`);
+      onSent?.(thread);
+    } catch (err) {
+      setStatus(`Could not assign — ${actionError(err, chosen?.name)}.`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="ncc-composer">
+      <div className="ncc-composer-target">
+        <label htmlFor={`ncc-assign-${thread.thread_id}`}>Assign to</label>
+        <select
+          ref={picker}
+          id={`ncc-assign-${thread.thread_id}`}
+          className="ncc-select"
+          value={agentId}
+          onChange={(e) => setAgentId(e.target.value)}
+        >
+          {!agentId && <option value="">— pick an agent —</option>}
+          {thread.assignable_agents.map((a) => (
+            <option key={a.agent_group_id} value={a.agent_group_id}>
+              {a.name}
+            </option>
+          ))}
+        </select>
+        <span className="ncc-composer-hint">
+          {agentId ? `opens a thread in ${thread.channel_name}` : 'pick who takes this'}
+        </span>
+      </div>
+      <div className="ncc-composer-row">
+        <button type="button" className="ncc-solid-btn" disabled={busy || !agentId} onClick={() => void submit()}>
+          {busy ? 'assigning' : 'assign'}
+        </button>
+      </div>
+      <div className="ncc-composer-status" role="status" aria-live="polite">
+        {status}
+      </div>
+    </div>
   );
 }
 

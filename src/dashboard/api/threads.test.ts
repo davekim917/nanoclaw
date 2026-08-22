@@ -1670,6 +1670,9 @@ describe('attention-source rows in the thread list', () => {
       as_of: '2026-08-20T11:30:00.000Z',
       url: 'https://github.com/example-org/example-app/pull/817',
       next_action: '@releasebot ship 817',
+      // Nobody has been handed it yet. Explicitly null rather than absent —
+      // §12: undeclared must never read the same as declared-and-empty.
+      assigned: null,
     });
   });
 
@@ -1874,5 +1877,92 @@ describe('attention-source rows in the thread list', () => {
       (await buildThreadList(makeCtx(), LIST_OPTS, deps({ now: NOW + ATTENTION_MEMO_TTL_MS, attentionEnv: env })))
         .threads,
     ).toEqual([]);
+  });
+
+  /**
+   * The row has to STOP reading as ownerless the moment the work is handed
+   * over. An assignment takes minutes to become visible any other way — the
+   * agent has to boot and claim the work before the board suppresses the item —
+   * and an operator staring at a live Assign button for those minutes presses
+   * it again. See migration 058.
+   */
+  describe('once assigned', () => {
+    function wireAgent(): void {
+      getDb()
+        .prepare(
+          `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
+           VALUES ('mg-example', 'slack-testworkspace', 'testworkspace', ?, '#example-room', ?)`,
+        )
+        .run(CHANNEL_KEY, iso(0));
+      getDb()
+        .prepare(
+          `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, session_mode, created_at)
+           VALUES ('mga-example', 'mg-example', 'ag-example', 'per-thread', ?)`,
+        )
+        .run(iso(0));
+    }
+
+    function record(itemId: string, at = '2026-08-20T12:00:00.000Z'): void {
+      getDb()
+        .prepare(
+          `INSERT INTO observatory_item_assignments
+             (workgroup_id, item_id, agent_group_id, assigned_at, assigned_by)
+           VALUES (?, ?, 'ag-example', ?, 'u-owner')`,
+        )
+        .run(WG, itemId, at);
+    }
+
+    beforeEach(() => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      wireAgent();
+      getDb()
+        .prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES ('u-owner', 'email', 'Olive Owner', ?)`)
+        .run(iso(0));
+    });
+
+    it('carries who has it, resolved through the same identity memo a participant uses', async () => {
+      // The NATURAL id — the `board:` stamp is never stored.
+      record('EXAMPLE-APP#817');
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+      expect(threads[0]!.attention_source!.assigned).toEqual({
+        agent_group_id: 'ag-example',
+        agent_name: 'persona:ag-example',
+        at: '2026-08-20T12:00:00.000Z',
+        by: 'Olive Owner',
+      });
+    });
+
+    it('stays `unassigned` — no session exists until the agent speaks, and the state says only that', async () => {
+      record('EXAMPLE-APP#817');
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+      expect(threads[0]!.session_ids).toEqual([]);
+      expect(threads[0]!.participants).toEqual([]);
+    });
+
+    it('an assignment recorded under the STAMPED id decorates nothing — the key is the natural one', async () => {
+      record(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`);
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+      expect(threads[0]!.attention_source!.assigned).toBeNull();
+    });
+
+    it('falls back to the raw user id when the assigner has no display name', async () => {
+      getDb().prepare(`UPDATE users SET display_name = NULL WHERE id = 'u-owner'`).run();
+      record('EXAMPLE-APP#817');
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+      expect(threads[0]!.attention_source!.assigned!.by).toBe('u-owner');
+    });
+
+    it('another workgroup’s assignment on the same item id never leaks onto this row', async () => {
+      getDb().prepare(`INSERT INTO workgroups (id, created_at) VALUES ('wg-other-example', ?)`).run(iso(0));
+      getDb()
+        .prepare(
+          `INSERT INTO observatory_item_assignments
+             (workgroup_id, item_id, agent_group_id, assigned_at, assigned_by)
+           VALUES ('wg-other-example', 'EXAMPLE-APP#817', 'ag-example', ?, 'u-owner')`,
+        )
+        .run('2026-08-20T12:00:00.000Z');
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+      expect(threads[0]!.attention_source!.assigned).toBeNull();
+    });
   });
 });

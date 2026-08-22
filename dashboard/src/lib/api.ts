@@ -601,17 +601,29 @@ export interface ObservatorySignal {
   active: boolean;
 }
 
-/** Assign a board item to an agent: creates a one-shot task in the item's own
- *  channel. The server composes the prompt from the board — this sends ids only. */
+/**
+ * Hand an OWNERLESS work item to an agent: a one-shot task in the item's own
+ * channel, which is what opens the conversation the item does not have yet
+ * (DESIGN.md §2 — "Assign is the verb that creates the thread").
+ *
+ * `itemId` is the row's own `thread_id` (`board:<natural>`); the server strips
+ * the stamp. Two ids and nothing else go over the wire — the server re-derives
+ * the item, its room and the agents eligible for it, and composes every word
+ * the agent is told. There is deliberately no text parameter: a row with no
+ * thread has no conversation to say something into, and the item's own
+ * `next_action` is what the agent is pointed at.
+ *
+ * Rows that DO have a thread use `postThreadMessage` instead. See
+ * `views/console/actions.ts`.
+ */
 export async function assignItem(
-  workgroupId: string,
   itemId: string,
   agentGroupId: string,
-): Promise<{ ok: boolean; seriesId: string | null; channel: string; agent: string }> {
+): Promise<{ ok: boolean; seriesId: string | null; channel: string; agent: string; etaSeconds: number }> {
   return apiFetch('/dashboard/api/observatory/assign', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ workgroupId, itemId, agentGroupId }),
+    body: JSON.stringify({ itemId, agentGroupId }),
   });
 }
 
@@ -822,6 +834,27 @@ export interface ThreadAttentionSource {
   as_of: string | null;
   url: string | null;
   next_action: string;
+  /**
+   * Who this item has already been handed to, or null — mirrors the host's
+   * `ThreadItemAssignment`.
+   *
+   * Optional for the same fixture reason as the fields around it; absent reads
+   * as "nobody yet". While it is set the row's Assign control is replaced by a
+   * disabled statement of who has it, which is what stops the operator pressing
+   * again during the couple of minutes before the agent boots and claims the
+   * work. The row's `state` deliberately stays `unassigned` — no session exists
+   * until the agent speaks.
+   */
+  assigned?: ThreadItemAssignment | null;
+}
+
+/** {@link ThreadAttentionSource.assigned}. */
+export interface ThreadItemAssignment {
+  agent_group_id: string;
+  agent_name: string;
+  /** ISO-8601 UTC. */
+  at: string;
+  by: string;
 }
 
 /** {@link ThreadSummary.done_proposal} — the proposal plus who made it. */

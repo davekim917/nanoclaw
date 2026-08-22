@@ -60,6 +60,7 @@ import { migration054 } from './054-thread-snoozes.js';
 import { migration055 } from './055-thread-closures.js';
 import { migration056 } from './056-sessions-task-routing-platform-id.js';
 import { migration057 } from './057-workgroups-attention-sources.js';
+import { migration058 } from './058-observatory-item-assignments.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -146,6 +147,9 @@ export const migrations: Migration[] = [
   // irrelevant here — same reasoning as 054/055 above.
   migration056,
   migration057,
+  // Writes ISO-8601 UTC from JS at the write site, so 053's allowlisted
+  // normalizer has nothing to do here — same reasoning as 054/055/056 above.
+  migration058,
   containerConfigs,
   cliScope,
   messagingGroupInstance,

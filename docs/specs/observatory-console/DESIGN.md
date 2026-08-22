@@ -317,6 +317,27 @@ never fires. It becomes reachable when the release-board/findings join in §10
 lands. The row renders correctly when the data arrives; there is simply no data
 yet. Do not delete the state as dead code.
 
+**Update — the join landed, and `unassigned` survives being assigned.**
+`src/attention-sources.ts` is §10's join, so the state now fires on real rows.
+Assigning one queues a one-shot task; the agent then boots, claims the work, and
+only then does the board stop emitting the item — minutes later. Through that
+window the row stays `unassigned`, because §5 computes the state from *a work
+item with no session at all* and that is still literally true: no session exists
+until the assigned agent speaks.
+
+What changes instead is the VERB. §4 gives the state label and the verb separate
+zones, so the row can honestly say "no session here yet" while the control beside
+it says "handed to Charlie two minutes ago". §12 requires exactly that shape — a
+disabled control with a reachable explanation rather than a live button that can
+only be refused — and it is what stops an operator queueing the same work at
+three agents while nothing visibly changes. The record is
+`observatory_item_assignments` (migration 058), surfaced as
+`attention_source.assigned`.
+
+**Do not introduce an eighth state for it.** "Assigned but not yet started" names
+no signal this system can compute beyond the assignment row itself, and §5's own
+rule is that a state which cannot be computed does not exist.
+
 `container_state.provider_status` (`idle` / `active` / `failed`) is populated,
 cross-provider, and currently read by **zero** dashboard code. `failed` must
 surface. This is the cheapest high-value signal available.
@@ -464,11 +485,34 @@ Everything else runs on data that already exists.
    display names differ by channel, so resolving with a null messaging group
    prints the canonical agent-group id — a row reads `<workgroup>-<role>` where
    the channel shows the friendly name. §11 requires the friendly name.
-3. **Reconciling two steer paths.** `POST /dashboard/api/sessions/:id/message`
+3. **Reconciling two steer paths — SETTLED.** `POST /dashboard/api/sessions/:id/message`
    writes into the session's inbound queue and echoes to the origin thread (this
    one works and stays). `observatory/steer|nudge|assign` instead spawn a
-   one-shot task and accept only claims or release-board items. A unified
-   thread action bar has to reconcile them.
+   one-shot task and accept only claims or release-board items.
+
+   They were reconciled by splitting them on **whether a thread exists**, not by
+   merging them:
+
+   - A row that HAS a thread takes `POST /dashboard/api/threads/:id/message`,
+     which resolves the session (opening one when the chosen agent has never
+     spoken here) and goes through the session-message executor. That is the
+     console's one primitive and it covers every state in §5 except one.
+   - An OWNERLESS row takes `POST /dashboard/api/observatory/assign`. It cannot
+     take the other path, and not for a historical reason: an attention item's
+     id is a `board:`-prefixed dedupe key that is explicitly never a thread id,
+     so the message path parses no channel out of it, finds no wiring, and
+     refuses — the affordance was dead until this landed. There is also no
+     session to write into and no conversation for a platform echo to reach.
+     Assign queues a task in the room the item's source declared, which is what
+     opens the thread §2 says the verb creates.
+
+   `observatory/nudge` and `observatory/steer` keep their claim-slug callers and
+   gained none. The assign path itself was rebuilt rather than duplicated: it now
+   resolves its item through the same `selectScopedAttentionItems` producer the
+   row came from (a raw board read admitted items the console never showed), its
+   wiring through the same `wiredAgentsByChannel()` join that produced the row's
+   `assignable_agents`, and its privilege through `guard()` as
+   `observatory.assign`.
 4. **Surfacing `provider_status`.** Written today, read by nothing.
 
 ## 11. Carried over unchanged
