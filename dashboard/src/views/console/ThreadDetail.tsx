@@ -7,7 +7,7 @@ import { AgentAvatar } from '../AgentAvatar.js';
 import { prefillChips, type PrefillChip } from '../ship-prefill.js';
 import { actionError } from './action-error.js';
 import { sendToAgent } from './actions.js';
-import { STATE_PRESENTATION, initials, replyTarget } from './thread-state.js';
+import { STATE_PRESENTATION, initials, parkAge, replyTarget } from './thread-state.js';
 
 /**
  * The thread detail pane — merged transcript (§10.1) plus the composer that
@@ -40,11 +40,12 @@ export interface ThreadDetailProps {
   focusComposer?: number;
   /**
    * The release item's `nextAction`, when this row IS a release item — the
-   * source of the ship prefill chip (see `ship-prefill.ts`). Threads do not
-   * carry release items yet (DESIGN §10's board join is unbuilt), so nothing
-   * passes this today and the composer offers the three decision chips alone.
+   * source of the ship prefill chip (see `ship-prefill.ts`). Fed from
+   * `ThreadSummary.attention_source.next_action` now that §10's board join
+   * exists; an ordinary thread carries no attention source, so it stays
+   * undefined and the composer offers the three decision chips alone.
    */
-  nextAction?: string;
+  nextAction?: string | undefined;
   /** Fired after a send lands, so the caller can revalidate and (in triage) advance. */
   onSent?: (thread: ThreadSummary) => void;
 }
@@ -157,7 +158,35 @@ export function ThreadDetail({ thread, focusComposer = 0, nextAction, onSent }: 
           {/* WHY this row is `needs_you` (operator report 2026-08-21), in full —
               the row itself truncates a long claim note; this pane does not. */}
           {thread.needs_you_reason && (
-            <div className="ncc-detail-reason">{thread.needs_you_reason.text}</div>
+            <div className="ncc-detail-reason">
+              {/* Park age beside the reason — see ThreadRow's `parkAge`. The
+                  console never reconciles a claim against reality; it shows how
+                  old the claim's own statement is and lets the operator judge. */}
+              {parkAge(thread) && <span className="ncc-detail-parkage">parked {parkAge(thread)} ago</span>}
+              {thread.needs_you_reason.text}
+            </div>
+          )}
+          {/* An ownerless board row: where it came from, how old that source
+              is, and where a PERSON goes to act. The link is rendered only when
+              the source named one — §12: dead text pointing nowhere is worse
+              than a plain sentence. */}
+          {thread.attention_source && (
+            <div className="ncc-detail-source">
+              <span className="when">
+                {thread.attention_source.kind}
+                {thread.attention_source.as_of
+                  ? ` · board ${relAge(thread.attention_source.as_of)} old`
+                  : ' · source could not be read'}
+              </span>
+              {' — '}
+              {thread.attention_source.url ? (
+                <a href={thread.attention_source.url} target="_blank" rel="noreferrer">
+                  {thread.attention_source.next_action}
+                </a>
+              ) : (
+                thread.attention_source.next_action
+              )}
+            </div>
           )}
         </div>
         <span className={`ncc-state ${presentation.tone}`}>{presentation.label}</span>

@@ -120,6 +120,61 @@ describe('the needs_you reason, in full (operator report 2026-08-21)', () => {
     const { container } = renderDetail(thread({ needs_you_reason: { cause: 'parked_note', text: longNote } }));
     expect(container.querySelector('.ncc-detail-reason')!.textContent).toBe(longNote);
   });
+
+  it('carries the claim PARK AGE beside the reason', () => {
+    // The console does NOT reconcile a claim against reality — releasing one is
+    // the claim owner's job. Showing how old the claim's own statement is makes
+    // a stale note legible without the console inventing a verdict.
+    const { container } = renderDetail(
+      thread({ needs_you_reason: { cause: 'parked_note', text: longNote, parked_ms: 20 * 3_600_000 } }),
+    );
+    expect(container.querySelector('.ncc-detail-parkage')!.textContent).toBe('parked 20h ago');
+    expect(container.querySelector('.ncc-detail-reason')!.textContent).toContain(longNote);
+  });
+
+  it('renders no age when nothing measured one — never "parked 0s ago"', () => {
+    const { container } = renderDetail(
+      thread({ needs_you_reason: { cause: 'parked_note', text: longNote, parked_ms: 0 } }),
+    );
+    expect(container.querySelector('.ncc-detail-parkage')).toBeNull();
+  });
+});
+
+/** §2/§5: an ownerless work item from a workgroup attention source. */
+describe('attention-source provenance in the detail pane', () => {
+  const source = {
+    kind: 'release-board',
+    as_of: '2026-08-20T09:00:00.000Z',
+    url: 'https://github.com/example-org/example-app/pull/817',
+    next_action: '@releasebot ship 817',
+  };
+
+  it('is absent on an ordinary thread', () => {
+    const { container } = renderDetail(thread());
+    expect(container.querySelector('.ncc-detail-source')).toBeNull();
+  });
+
+  it('names the source, its age, and what a PERSON has to do', () => {
+    const { container } = renderDetail(thread({ attention_source: source }));
+    const line = container.querySelector('.ncc-detail-source')!;
+    expect(line.textContent).toContain('release-board');
+    expect(line.textContent).toContain('old');
+    expect(line.textContent).toContain('@releasebot ship 817');
+  });
+
+  it('links only when the source named a real destination — never dead text pointing nowhere', () => {
+    const linked = renderDetail(thread({ attention_source: source }));
+    expect(linked.container.querySelector('.ncc-detail-source a')!.getAttribute('href')).toBe(source.url);
+
+    const bare = renderDetail(thread({ attention_source: { ...source, url: null } }));
+    expect(bare.container.querySelector('.ncc-detail-source a')).toBeNull();
+    expect(bare.container.querySelector('.ncc-detail-source')!.textContent).toContain('@releasebot ship 817');
+  });
+
+  it('says the source could not be read rather than implying it is fresh', () => {
+    const { container } = renderDetail(thread({ attention_source: { ...source, as_of: null } }));
+    expect(container.querySelector('.ncc-detail-source')!.textContent).toContain('could not be read');
+  });
 });
 
 describe('the selector spans every wired agent, participants first', () => {
@@ -329,7 +384,16 @@ describe('message text renders as formatted markdown', () => {
     getThreadDetail.mockResolvedValue({
       thread: thread(),
       transcript: [
-        { session_id: 's-alpha', agent_group_id: 'ag-1', agent_name: 'Alpha', kind: 'chat', seq: 1, timestamp: '2026-08-20T09:00:00.000Z', direction: 'out', text },
+        {
+          session_id: 's-alpha',
+          agent_group_id: 'ag-1',
+          agent_name: 'Alpha',
+          kind: 'chat',
+          seq: 1,
+          timestamp: '2026-08-20T09:00:00.000Z',
+          direction: 'out',
+          text,
+        },
       ],
     });
 

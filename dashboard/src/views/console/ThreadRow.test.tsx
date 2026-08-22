@@ -390,6 +390,100 @@ describe('the needs_you reason line (operator report 2026-08-21)', () => {
   });
 });
 
+/**
+ * The console does NOT reconcile a claim against reality — releasing a claim is
+ * the claim OWNER's job, and a display that second-guesses its source produces
+ * two disagreeing truths. The park age is what makes a stale note legible
+ * without the console inventing a verdict.
+ */
+describe('claim park age', () => {
+  const staleNote = 'waiting on the release owner: PR #956 mechanically ready';
+
+  it('renders the age beside the reason', () => {
+    const { row } = renderRow({
+      needs_you_reason: { cause: 'parked_note', text: staleNote, parked_ms: 20 * 3_600_000 },
+    });
+    const line = row.querySelector('.ncc-row-reason')!;
+    // Formatted by the ONE duration formatter the meta-line age already uses
+    // (`relDuration`), so an age never reads in two shapes on the same row —
+    // which means it rolls to days past 24h: 40h shows as `1d`, not `40h`.
+    expect(line.querySelector('.ncc-row-parkage')!.textContent).toBe('parked 20h ago');
+    // The note itself is still fully readable — the marker qualifies it, never
+    // replaces it.
+    expect(line.textContent).toContain(staleNote);
+  });
+
+  it('leads with the age so a 390px ellipsis cannot clip it off the end', () => {
+    const { row } = renderRow({
+      needs_you_reason: { cause: 'parked_note', text: staleNote.repeat(4), parked_ms: 40 * 3_600_000 },
+    });
+    expect(row.querySelector('.ncc-row-reason')!.textContent!.startsWith('parked 1d ago')).toBe(true);
+  });
+
+  it('renders NO age when nothing measured one — never "parked 0s ago"', () => {
+    // §12: an unmeasured value is not a zero. `claims-board.ts` writes 0 when
+    // `parked_at` is missing or unparseable, which means unknown, not "now".
+    for (const parked_ms of [null, 0, undefined]) {
+      const { row } = renderRow({ needs_you_reason: { cause: 'parked_note', text: staleNote, parked_ms } });
+      expect(row.querySelector('.ncc-row-parkage')).toBeNull();
+      expect(row.querySelector('.ncc-row-reason')!.textContent).toBe(staleNote);
+    }
+  });
+
+  it('never appears on the other two needs_you causes — neither has a claim behind it', () => {
+    const { row } = renderRow({ needs_you_reason: { cause: 'ask_question', text: 'A question is pending.' } });
+    expect(row.querySelector('.ncc-row-parkage')).toBeNull();
+  });
+});
+
+/**
+ * §2/§5: an ownerless work item from a workgroup attention source. Its age
+ * marker is a PROVENANCE signal, never a suppression one — an empty feed is
+ * indistinguishable from a healthy one.
+ */
+describe('attention-source provenance', () => {
+  const source = {
+    kind: 'release-board',
+    as_of: '2026-08-20T09:00:00.000Z',
+    url: 'https://github.com/example-org/example-app/pull/817',
+    next_action: '@releasebot ship 817',
+  };
+
+  it('is absent on an ordinary thread row', () => {
+    const { row } = renderRow();
+    expect(row.querySelector('.ncc-row-source')).toBeNull();
+  });
+
+  it('names the source and how old it is', () => {
+    const { row } = renderRow({ attention_source: source });
+    expect(row.querySelector('.ncc-row-source')!.textContent).toBe('release-board 3h old');
+  });
+
+  it('says the source could not be read rather than implying it is fresh', () => {
+    const { row } = renderRow({ attention_source: { ...source, as_of: null } });
+    // "No board" and "board says nothing is blocked" must stay distinguishable
+    // all the way to the pixel.
+    expect(row.querySelector('.ncc-row-source')!.textContent).toContain('not read');
+  });
+
+  it('still renders the row when the board is ancient — staleness is marked, never hidden', () => {
+    const { row } = renderRow({
+      attention_source: { ...source, as_of: '2026-01-01T00:00:00.000Z' },
+      participants: [],
+      state: 'unassigned',
+    });
+    expect(row).not.toBeNull();
+    expect(row.querySelector('.ncc-row-source')!.textContent).toContain('231d old');
+    // …and it still ends in a verb (§1), which is the whole point of showing it.
+    expect(row.querySelector('.ncc-verb')).not.toBeNull();
+  });
+
+  it('carries the next action in the hover, so the row says what a PERSON has to do', () => {
+    const { row } = renderRow({ attention_source: source });
+    expect(row.querySelector('.ncc-row-source')!.getAttribute('title')).toContain('@releasebot ship 817');
+  });
+});
+
 describe('interaction', () => {
   it('opens the thread from the row body and from the verb', async () => {
     const user = userEvent.setup();

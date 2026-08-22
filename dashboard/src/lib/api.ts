@@ -782,13 +782,47 @@ export interface ThreadSummary {
    * extra round trip (a 409 `confirmation_required`), never a bypass.
    */
   close_confirmations_required?: 1 | 2;
+  /**
+   * Present ONLY on a row produced by a workgroup attention source — an
+   * ownerless work item with no session behind it. Optional for the same
+   * fixture reason as the fields above; absent means "an ordinary thread".
+   */
+  attention_source?: ThreadAttentionSource | null;
 }
 
 /** {@link ThreadSummary.needs_you_reason} — mirrors the host's `NeedsYouReason`. */
 export type NeedsYouReason =
-  | { cause: 'parked_note'; text: string }
+  | {
+      cause: 'parked_note';
+      text: string;
+      /**
+       * How long the claim has been parked, in ms — absent or null when the
+       * claim carries no readable `parked_at`.
+       *
+       * The console never reconciles a claim against reality: releasing a
+       * claim is the claim owner's job, and a display that second-guesses its
+       * own source produces two disagreeing truths. So a stale note still
+       * renders — with its age beside it, which is what makes the staleness
+       * legible without inventing a verdict.
+       */
+      parked_ms?: number | null | undefined;
+    }
   | { cause: 'ask_question'; text: string }
   | { cause: 'task_needs_input'; text: string };
+
+/** {@link ThreadSummary.attention_source} — mirrors the host's `ThreadAttentionSource`. */
+export interface ThreadAttentionSource {
+  kind: string;
+  /**
+   * When the source last regenerated, ISO-8601 UTC, or null when nothing could
+   * be read. Rendered as an AGE marker, never used to suppress the row: an
+   * empty feed is indistinguishable from a healthy one, so a stale feed
+   * showing real work with a visible age is strictly better.
+   */
+  as_of: string | null;
+  url: string | null;
+  next_action: string;
+}
 
 /** {@link ThreadSummary.done_proposal} — the proposal plus who made it. */
 export interface ThreadDoneProposal {

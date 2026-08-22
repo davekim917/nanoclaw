@@ -219,6 +219,7 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
       {thread ? (
         <ThreadDetail
           thread={thread}
+          nextAction={thread.attention_source?.next_action}
           onSent={() => {
             onChanged();
             advance('Answered.');

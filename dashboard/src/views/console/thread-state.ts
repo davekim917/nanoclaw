@@ -1,4 +1,5 @@
 import type { ThreadSummary, ThreadState } from '../../lib/api.js';
+import { relDuration } from '../../lib/derive.js';
 
 /**
  * How each of DESIGN.md §5's states renders: its label, the WORD on its verb
@@ -267,6 +268,29 @@ export function proposalAuthorName(thread: Pick<ThreadSummary, 'participants' | 
   const proposal = thread.done_proposal;
   if (!proposal) return '';
   return thread.participants.find((p) => p.agent_group_id === proposal.agent_group_id)?.name ?? proposal.agent_group_id;
+}
+
+/**
+ * How long the claim behind a `needs_you` row has been parked, formatted — or
+ * null when nothing measured it.
+ *
+ * **The console does not reconcile a claim against reality.** Releasing a claim
+ * is the claim OWNER's job, and a display that second-guesses its source
+ * produces two disagreeing truths; the one that is wrong is whichever the
+ * operator did not happen to be looking at. Live evidence at the time this was
+ * written: two claims still asserting a human owed a decision on a PR that had
+ * merged hours earlier. So the note still renders — with its AGE beside it,
+ * which is what makes the staleness legible without inventing a verdict.
+ *
+ * Never "0s": DESIGN.md §12 — an unmeasured value is not a zero, and a zero
+ * here would read as "parked just now", the exact opposite of what an
+ * unreadable timestamp means.
+ */
+export function parkAge(thread: Pick<ThreadSummary, 'needs_you_reason'>): string | null {
+  const reason = thread.needs_you_reason;
+  if (!reason || reason.cause !== 'parked_note') return null;
+  const ms = reason.parked_ms;
+  return typeof ms === 'number' && ms > 0 ? relDuration(ms) : null;
 }
 
 /** Two initials for the avatar fallback — a friendly display name, never an id. */

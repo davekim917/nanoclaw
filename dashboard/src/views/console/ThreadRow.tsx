@@ -1,7 +1,15 @@
 import type { ThreadSummary } from '../../lib/api.js';
 import { AgentAvatar } from '../AgentAvatar.js';
 import { relAge } from '../../lib/derive.js';
-import { STATE_PRESENTATION, elapsed, initials, proposalAuthorName, showsLiveLine, toolLabel } from './thread-state.js';
+import {
+  STATE_PRESENTATION,
+  elapsed,
+  initials,
+  parkAge,
+  proposalAuthorName,
+  showsLiveLine,
+  toolLabel,
+} from './thread-state.js';
 
 /**
  * One row = one THREAD (DESIGN.md §3.1), never a session.
@@ -91,6 +99,14 @@ const PROPOSAL_PILL_STYLE = {
   border: '1px solid var(--ncc-live)',
 } as const;
 
+/** The board row's full provenance, for the hover the meta line abbreviates. */
+function sourceTitle(thread: ThreadSummary): string {
+  const source = thread.attention_source;
+  if (!source) return '';
+  const when = source.as_of ? `as of ${source.as_of}` : 'source could not be read';
+  return `${source.kind} — ${when}. Next: ${source.next_action}`;
+}
+
 export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelect, onVerb }: ThreadRowProps) {
   const presentation = STATE_PRESENTATION[thread.state];
   const shown = thread.participants.slice(0, MAX_FACES);
@@ -146,6 +162,24 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
                */}
               {thread.needs_you_reason && (
                 <span className="ncc-row-reason" title={thread.needs_you_reason.text}>
+                  {/*
+                   * PARK AGE, ahead of the reason it qualifies.
+                   *
+                   * A parked claim's note is written once and never revised —
+                   * releasing a claim is the claim OWNER's job, and the console
+                   * deliberately does NOT reconcile one against GitHub, because
+                   * a display that second-guesses its source produces two
+                   * disagreeing truths. Live evidence: two claims still assert
+                   * a human owes a decision on a PR that merged hours earlier.
+                   * The age is what makes that legible without the console
+                   * inventing a verdict — "parked 40h ago" beside the note says
+                   * everything the reconciliation would have, honestly.
+                   *
+                   * First in the flow so it survives the row's single-line
+                   * ellipsis at 390px; a marker clipped off the end is a marker
+                   * that does not exist.
+                   */}
+                  {parkAge(thread) && <span className="ncc-row-parkage">parked {parkAge(thread)} ago</span>}
                   {thread.needs_you_reason.text}
                 </span>
               )}
@@ -192,6 +226,27 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
                 </span>
                 <span aria-hidden="true">·</span>
                 <span className="age">{age}</span>
+                {/*
+                 * Board provenance, and how old the board itself is.
+                 *
+                 * NOT a suppression signal — there is no staleness threshold
+                 * anywhere in this path, on purpose. A stale feed showing real
+                 * work with a visible age is strictly better than an empty
+                 * feed, because an empty feed is indistinguishable from a
+                 * healthy one, and "nothing is blocked on a human" is the one
+                 * lie this row exists to prevent.
+                 */}
+                {thread.attention_source && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="ncc-row-source" title={sourceTitle(thread)}>
+                      {thread.attention_source.kind}
+                      {thread.attention_source.as_of
+                        ? ` ${relAge(thread.attention_source.as_of, now)} old`
+                        : ' · not read'}
+                    </span>
+                  </>
+                )}
               </span>
             </span>
           </button>
