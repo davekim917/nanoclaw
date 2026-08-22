@@ -229,7 +229,12 @@ function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string
 export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<void> {
   const dataDir = _dataDir ?? DATA_DIR;
   resolveAndValidateDestination(def);
-  const { session } = resolveTaskSession(def.agentGroupId, def.seriesId);
+  // Stamp the session with the same destination the `messages_in` row below
+  // carries. `resolveAndValidateDestination` has already proved it names a
+  // real, wired messaging group, so the stamp can never point at a channel the
+  // agent isn't authorized for. A `scheduled-move` re-schedule lands here too
+  // and re-stamps the series' new home (migration 056).
+  const { session } = resolveTaskSession(def.agentGroupId, def.seriesId, def.destination.platformId);
   const inboundDbPath = path.join(dataDir, 'v2-sessions', def.agentGroupId, session.id, 'inbound.db');
 
   const db = new Database(inboundDbPath);

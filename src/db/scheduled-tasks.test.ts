@@ -71,7 +71,10 @@ function setupCentralDb(): void {
       id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL,
       messaging_group_id TEXT, thread_id TEXT, agent_provider TEXT,
       status TEXT DEFAULT 'active', container_status TEXT DEFAULT 'stopped',
-      last_active TEXT, created_at TEXT NOT NULL
+      last_active TEXT, created_at TEXT NOT NULL,
+      -- Migration 056: scheduleTask stamps the destination it validated onto
+      -- the task session so the console can place the task in its channel.
+      task_routing_platform_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_agent_group ON sessions(agent_group_id);
   `);
@@ -421,6 +424,16 @@ describe('test_scheduleTask_inserts_new', () => {
     expect(rows[0].recurrence).toBe('0 3 * * *');
     expect(rows[0].series_id).toBe('s1');
     expect(rows[0].trigger).toBe(0);
+
+    // Migration 056: the validated destination is stamped onto the task
+    // SESSION too, so the console can show the task in the channel it is
+    // routed to instead of an "Unrouted tasks" bucket. `messaging_group_id`
+    // stays NULL — it is delivery.ts's task-session discriminator.
+    const session = getDb()
+      .prepare("SELECT messaging_group_id, task_routing_platform_id FROM sessions WHERE thread_id = 'system:tasks:s1'")
+      .get() as { messaging_group_id: string | null; task_routing_platform_id: string | null };
+    expect(session.task_routing_platform_id).toBe(TEST_PLATFORM_ID);
+    expect(session.messaging_group_id).toBeNull();
   });
 });
 

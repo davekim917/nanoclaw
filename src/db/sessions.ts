@@ -294,6 +294,26 @@ export function markSessionEngaged(id: string): void {
     .run(new Date().toISOString(), id);
 }
 
+/**
+ * Stamp a task session's routing — the `messaging_groups.platform_id` the
+ * series was scheduled against ("where an unaddressed reply lands"), NOT a
+ * claim about where it posts. See migration 056 and `resolveTaskSession`,
+ * which is the only caller.
+ *
+ * Last-write-wins, unlike `markSessionEngaged`: a series re-pointed to another
+ * channel (`scheduled-move` cancels in the source and re-`scheduleTask`s into
+ * the target, which lands back here) must carry its CURRENT stamp, not the one
+ * it was born with.
+ *
+ * Deliberately not folded into `createSession`'s INSERT: that insert is shared
+ * with every ordinary chat session, and adding a named parameter there would
+ * force every `Session` literal in the codebase to carry a field only task
+ * sessions ever use.
+ */
+export function setTaskRoutingPlatformId(id: string, platformId: string): void {
+  getDb().prepare('UPDATE sessions SET task_routing_platform_id = ? WHERE id = ?').run(platformId, id);
+}
+
 // ── Pending Questions ──
 
 /**

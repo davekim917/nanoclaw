@@ -55,7 +55,10 @@ function setupCentralDb(): void {
     CREATE TABLE sessions (
       id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
       thread_id TEXT, agent_provider TEXT, status TEXT DEFAULT 'active',
-      container_status TEXT DEFAULT 'stopped', last_active TEXT, created_at TEXT NOT NULL
+      container_status TEXT DEFAULT 'stopped', last_active TEXT, created_at TEXT NOT NULL,
+      -- Migration 056: a move re-schedules into the target, which re-stamps
+      -- the series' routing through resolveTaskSession.
+      task_routing_platform_id TEXT
     );
     CREATE INDEX idx_sessions_agent_group ON sessions(agent_group_id);
     CREATE UNIQUE INDEX sessions_channel_root_unique ON sessions(agent_group_id, messaging_group_id)

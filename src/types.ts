@@ -255,6 +255,16 @@ export interface Session {
    * and the thread-history backfill both read. See migration 052.
    */
   engaged_at?: string | null;
+  /**
+   * Task sessions only: the `messaging_groups.platform_id` this series was
+   * ROUTED to at definition time — "where an unaddressed reply lands", not
+   * where the task posts. The agent picks its destination at fire time, and
+   * `task_thread_anchors` is what records where a post actually landed. NULL
+   * on every non-task session, and on task sessions scheduled with no routing
+   * (`--isolated`, or a host caller passing no `--messaging-group`). See
+   * migration 056.
+   */
+  task_routing_platform_id?: string | null;
   created_at: string;
 }
 

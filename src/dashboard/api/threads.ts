@@ -180,15 +180,33 @@ export type NeedsYouReason =
  * the caller so this is directly testable and so the release board can feed
  * ownerless items through the same function once §10.3 lands.
  *
- * Priority follows §5's own table order, with `unassigned` hoisted: a work item
- * with no session cannot have a container, a claim or a transcript, so nothing
- * below it can compute anyway.
+ * Priority follows §5's own table order, and the two `needs_you` tests run
+ * BEFORE the `unassigned` guard. That order is deliberate and load-bearing.
+ *
+ * `unassigned` used to be hoisted to the top, justified by "a work item with no
+ * session cannot have a container, a claim or a transcript, so nothing below it
+ * can compute anyway". That reasoning is right about containers and transcripts
+ * and WRONG about claims: claims are keyed by THREAD ID and live in workgroup
+ * files, not in `sessions`, so a zero-session item can perfectly well carry a
+ * parked claim whose note names the human it is waiting on. Hoisting the guard
+ * made every such item report `unassigned` — "nobody has picked this up" — when
+ * the true claim is `needs_you` — "a human owes an answer". Different meaning,
+ * and no error anywhere to notice it.
+ *
+ * The guard still sits above everything else, because every branch below it
+ * (provider status, container liveness, tool timing, the residual park) does
+ * need a session to mean anything.
+ *
+ * This exists so ownerless work items — a ready-but-unshipped PR blocked on a
+ * human, fed in with `sessionCount: 0` and a parked claim — flow through the
+ * SAME state function as everything else, rather than a producing surface
+ * setting `state` directly and inventing its own lane semantics.
  */
 export function deriveThreadState(input: ThreadStateInput): ThreadState {
-  if (input.sessionCount === 0) return 'unassigned';
-
   if (input.claimState === 'parked' && WAITING_ON_NOTE.test(input.claimNote)) return 'needs_you';
   if (input.needsOperator) return 'needs_you';
+
+  if (input.sessionCount === 0) return 'unassigned';
 
   // §5.1: this must NOT depend on `current_tool` being readable. Codex reports
   // the generic `CodexItem` and roughly half the fleet is non-Claude, so the
@@ -419,6 +437,13 @@ interface ThreadSessionRow {
   agent_group_id: string;
   messaging_group_id: string | null;
   thread_id: string | null;
+  /**
+   * Task sessions only: the channel the series is ROUTED to (migration 056).
+   * Rides along on the `sessions` SELECT below — reading it costs zero extra
+   * queries. See {@link threadRoutingChannel} for why it never outranks an
+   * anchor.
+   */
+  task_routing_platform_id: string | null;
   agent_provider: string | null;
   title: string | null;
   title_generated_at: string | null;
@@ -505,7 +530,7 @@ function selectScopedSessions(
   conditions.push("(s.last_outbound_at IS NOT NULL OR s.container_status <> 'stopped' OR t.task_id IS NOT NULL)");
 
   const sql = `
-    SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id, s.agent_provider,
+    SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id, s.task_routing_platform_id, s.agent_provider,
            s.title, s.title_generated_at, s.last_active, s.last_outbound_at, s.last_outbound_kind,
            s.archived_at, s.created_at, s.done_proposal,
            t.status         AS attached_task_status,
@@ -965,6 +990,36 @@ function threadAnchorChannel(rows: ThreadSessionRow[], anchors: ReadonlyMap<stri
   return best?.platformId ?? null;
 }
 
+/**
+ * The channel a scheduled-task thread is ROUTED to — `sessions.task_routing_platform_id`,
+ * stamped at task-definition time (migration 056) — or null when nothing
+ * stamped it.
+ *
+ * **This is not the same question `threadAnchorChannel` answers, and that is
+ * why it loses to it.** `ncl tasks`' own contract is that "the agent chooses
+ * delivery destination at fire time"; the stamp is only the default landing
+ * place for an unaddressed reply. So a series can post somewhere other than
+ * its stamp, and a series that was re-pointed between runs certainly does.
+ * The anchor is a record of where a post ACTUALLY landed, the stamp is a
+ * record of where one would land by default — the record of fact must win, or
+ * the console shows a re-pointed series in the room it has stopped posting to.
+ * Do not "simplify" the precedence by dropping one of the two.
+ *
+ * Costs no query: the column rides along on the `sessions` SELECT the list
+ * already runs. Same cross-session tie-break as the anchors (§3.1 allows a
+ * thread to carry more than one session), keyed on session `created_at` since
+ * the stamp itself carries no timestamp.
+ */
+function threadRoutingChannel(rows: ThreadSessionRow[]): string | null {
+  let best: { platformId: string; atMs: number } | null = null;
+  for (const row of rows) {
+    if (!row.task_routing_platform_id) continue;
+    const atMs = parseUtcTimestampMs(row.created_at) ?? -Infinity;
+    if (!best || atMs > best.atMs) best = { platformId: row.task_routing_platform_id, atMs };
+  }
+  return best?.platformId ?? null;
+}
+
 /* ─── Assembly ─────────────────────────────────────────────────────────────── */
 
 /** Liveness ordering: the freshest wins when a thread's sessions disagree. */
@@ -1151,6 +1206,34 @@ function groupByThread(rows: ThreadSessionRow[]): ThreadAccum[] {
   return [...byThread.values()];
 }
 
+/**
+ * The console's thread queue.
+ *
+ * ## How a scheduled-task thread gets its channel
+ *
+ * A `system:tasks:<seriesId>` session carries no `messaging_group_id` — that
+ * NULL is `src/delivery.ts`'s discriminator for "this is a task session" and
+ * must stay NULL — so the channel is resolved in three steps, most-truthful
+ * first:
+ *
+ *   a. `task_thread_anchors` — where the series MOST RECENTLY POSTED, reduced
+ *      by `created_at` across every session in the thread. A record of fact.
+ *   b. `sessions.task_routing_platform_id` — the routing stamp written at
+ *      task-definition time (migration 056): where an unaddressed reply lands
+ *      by default. A record of intent, and only that: `ncl tasks` lets the
+ *      agent pick a different destination at fire time.
+ *   c. neither — the `system:tasks` bucket, labeled "Unrouted tasks". A task
+ *      that never posted and was scheduled with no routing genuinely has no
+ *      channel, and §4.1 says absent is honest, never invented.
+ *
+ * (a) beating (b) is not cosmetic. A re-pointed series' stamp still names its
+ * old home while its anchors name the new one, and the console must show where
+ * the work is landing now.
+ *
+ * Neither (a) nor (b) costs an extra query per row: the anchors are one
+ * batched lookup for the whole page (`readTaskThreadAnchors`) and the stamp
+ * rides along on the `sessions` SELECT.
+ */
 export async function buildThreadList(
   ctx: AuthedRequestContext,
   opts: {
@@ -1224,8 +1307,16 @@ export async function buildThreadList(
         return [t.threadId, platformId ?? UNKNOWN_CHANNEL_KEY] as const;
       }
       if (isScheduledTaskThread(t.threadId)) {
+        // Precedence is (a) anchor, (b) routing stamp, (c) fallback bucket,
+        // and the ORDER IS LOAD-BEARING — see `threadRoutingChannel`. The
+        // anchor is where a post actually landed; the stamp is only where an
+        // unaddressed reply would land by default, and the agent chooses its
+        // destination at fire time. A series re-pointed between runs must
+        // resolve to where it is actually posting, so fact outranks default.
         const anchored = threadAnchorChannel(t.rows, taskAnchors);
         if (anchored) return [t.threadId, anchored] as const;
+        const routed = threadRoutingChannel(t.rows);
+        if (routed) return [t.threadId, routed] as const;
       }
       return [t.threadId, threadChannelKey(t.threadId, known)] as const;
     }),
