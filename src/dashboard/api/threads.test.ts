@@ -202,6 +202,53 @@ describe('deriveThreadState', () => {
     expect(deriveThreadState({ ...base, sessionCount: 0 })).toBe('unassigned');
   });
 
+  // ── The zero-session item is not automatically unowned ────────────────────
+  //
+  // Claims are keyed by THREAD ID and live in workgroup files, not in
+  // `sessions`, so an item with no session at all can still carry a parked
+  // claim naming the human it waits on. That is why the two needs_you tests
+  // run before the `sessionCount === 0` guard: `unassigned` means "nobody has
+  // picked this up", which is a different and wrong claim about an item a
+  // human owes an answer on.
+
+  it('needs_you — a zero-session item whose parked note says waiting on a human', () => {
+    expect(
+      deriveThreadState({
+        ...base,
+        sessionCount: 0,
+        claimState: 'parked',
+        claimNote: 'waiting on Dave to approve the release',
+      }),
+    ).toBe('needs_you');
+  });
+
+  it('unassigned — a zero-session item with no claim, or a park note that names no human', () => {
+    expect(deriveThreadState({ ...base, sessionCount: 0, claimState: null, claimNote: '' })).toBe('unassigned');
+    expect(deriveThreadState({ ...base, sessionCount: 0, claimState: 'parked', claimNote: 'handing this off' })).toBe(
+      'unassigned',
+    );
+  });
+
+  it('needs_you — a zero-session item flagged needsOperator', () => {
+    expect(deriveThreadState({ ...base, sessionCount: 0, needsOperator: true })).toBe('needs_you');
+  });
+
+  it('the guard still outranks everything BELOW it — a zero-session item never reads as live work', () => {
+    // Provider status, container liveness, tool timing and the residual park
+    // all need a session to mean anything, so they stay under the guard.
+    expect(
+      deriveThreadState({
+        ...base,
+        sessionCount: 0,
+        containerStatus: 'running',
+        providerStatus: 'active',
+        toolStartedAtMs: NOW - 31 * 60_000,
+        claimState: 'parked',
+        claimNote: 'handing this off',
+      }),
+    ).toBe('unassigned');
+  });
+
   it('needs_you — a parked claim whose note says waiting on a human', () => {
     expect(deriveThreadState({ ...base, claimState: 'parked', claimNote: 'waiting on the operator to answer' })).toBe(
       'needs_you',

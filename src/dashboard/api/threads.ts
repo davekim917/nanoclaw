@@ -180,15 +180,33 @@ export type NeedsYouReason =
  * the caller so this is directly testable and so the release board can feed
  * ownerless items through the same function once §10.3 lands.
  *
- * Priority follows §5's own table order, with `unassigned` hoisted: a work item
- * with no session cannot have a container, a claim or a transcript, so nothing
- * below it can compute anyway.
+ * Priority follows §5's own table order, and the two `needs_you` tests run
+ * BEFORE the `unassigned` guard. That order is deliberate and load-bearing.
+ *
+ * `unassigned` used to be hoisted to the top, justified by "a work item with no
+ * session cannot have a container, a claim or a transcript, so nothing below it
+ * can compute anyway". That reasoning is right about containers and transcripts
+ * and WRONG about claims: claims are keyed by THREAD ID and live in workgroup
+ * files, not in `sessions`, so a zero-session item can perfectly well carry a
+ * parked claim whose note names the human it is waiting on. Hoisting the guard
+ * made every such item report `unassigned` — "nobody has picked this up" — when
+ * the true claim is `needs_you` — "a human owes an answer". Different meaning,
+ * and no error anywhere to notice it.
+ *
+ * The guard still sits above everything else, because every branch below it
+ * (provider status, container liveness, tool timing, the residual park) does
+ * need a session to mean anything.
+ *
+ * This exists so ownerless work items — a ready-but-unshipped PR blocked on a
+ * human, fed in with `sessionCount: 0` and a parked claim — flow through the
+ * SAME state function as everything else, rather than a producing surface
+ * setting `state` directly and inventing its own lane semantics.
  */
 export function deriveThreadState(input: ThreadStateInput): ThreadState {
-  if (input.sessionCount === 0) return 'unassigned';
-
   if (input.claimState === 'parked' && WAITING_ON_NOTE.test(input.claimNote)) return 'needs_you';
   if (input.needsOperator) return 'needs_you';
+
+  if (input.sessionCount === 0) return 'unassigned';
 
   // §5.1: this must NOT depend on `current_tool` being readable. Codex reports
   // the generic `CodexItem` and roughly half the fleet is non-Claude, so the
