@@ -432,6 +432,24 @@
   text-overflow: ellipsis;
   color: var(--ncc-attention);
 }
+/* Park age, LEADING the note it qualifies — a marker clipped off the end of a
+   390px ellipsis is a marker that does not exist. Mono because it is a
+   machine-produced value (§7), and `--ncc-secondary` rather than
+   `--ncc-attention`: the note is the alarm, this is the qualifier on it, and §7
+   allows exactly two functional hues. */
+.ncc-row-parkage {
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  color: var(--ncc-secondary);
+  margin-right: 6px;
+}
+/* Which attention source produced an ownerless row, and how old that source is.
+   Sits on the meta line, in the meta line's own colour — provenance, not a
+   status. Never a suppression signal; see ThreadRow.tsx. */
+.ncc-row-source {
+  font-family: var(--ncc-font-mono);
+  white-space: nowrap;
+}
 
 /* Thread-closure contract, item 1: the proposal's reason, spelled out on the
    row (not just the badge's title tooltip — 390px is the primary viewport and
@@ -628,6 +646,26 @@
   line-height: 1.4;
   color: var(--ncc-attention);
   margin-top: 4px;
+}
+/* Same qualifier as `.ncc-row-parkage`, in the pane that wraps rather than
+   clamps. */
+.ncc-detail-parkage {
+  font-family: var(--ncc-font-mono);
+  font-size: 11.5px;
+  color: var(--ncc-secondary);
+  margin-right: 6px;
+}
+/* Board provenance in the detail pane: the source, its age, what to do, and a
+   link when the source named a real destination — never dead text pointing
+   nowhere (§12). */
+.ncc-detail-source {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--ncc-secondary);
+  margin-top: 4px;
+}
+.ncc-detail-source .when {
+  font-family: var(--ncc-font-mono);
 }
 .ncc-detail-note {
   flex-shrink: 0;

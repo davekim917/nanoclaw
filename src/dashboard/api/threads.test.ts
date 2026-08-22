@@ -1,10 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
+import { ATTENTION_ITEM_PREFIX, ATTENTION_MEMO_TTL_MS, clearAttentionMemo } from '../../attention-sources.js';
 import type { AuthedRequestContext } from '../router.js';
 import type { ContainerState } from '../../db/session-db.js';
 import type { SessionTranscriptEntry } from './sessions.js';
@@ -57,6 +58,9 @@ function makeCtx(opts: { no_filter?: boolean; allowed_group_ids?: string[] } = {
 }
 
 function setupDb(): void {
+  // Module-level memo, and vitest keeps module state across files in a worker:
+  // an un-cleared one would serve a previous DB's attention items into this one.
+  clearAttentionMemo();
   const db = initTestDb();
   db.pragma('foreign_keys = ON');
   runMigrations(db);
@@ -340,7 +344,36 @@ describe('deriveNeedsYouReason', () => {
     expect(deriveNeedsYouReason([row()], claim)).toEqual({
       cause: 'parked_note',
       text: 'waiting on the release owner or backup reviewer: PR #956 mechanically ready at 64c1cca1',
+      parked_ms: null,
     });
+  });
+
+  it('carries the claim PARK AGE alongside the note', () => {
+    // The console does NOT reconcile a claim against reality — releasing one is
+    // the claim owner's job, and a display that second-guesses its source
+    // produces two disagreeing truths. Live evidence when this was written: two
+    // claims still asserting a human owed a decision on a PR that had merged
+    // hours earlier. The age is what makes that legible without the console
+    // inventing a verdict.
+    const claim = { state: 'parked' as const, note: 'waiting on a human: PR #956 ready', staleMs: 40 * 3_600_000 };
+    expect(deriveNeedsYouReason([row()], claim)).toEqual({
+      cause: 'parked_note',
+      text: 'waiting on a human: PR #956 ready',
+      parked_ms: 40 * 3_600_000,
+    });
+  });
+
+  it('reports an unmeasured park age as null, never as zero', () => {
+    // `claims-board.ts` writes staleMs = 0 when `parked_at` is missing or
+    // unparseable. §12: an unmeasured value is not a zero — a zero here would
+    // render "parked 0s ago", the exact opposite of what it means.
+    for (const staleMs of [undefined, 0, -5]) {
+      expect(deriveNeedsYouReason([row()], { state: 'parked', note: 'waiting on a human', staleMs })).toEqual({
+        cause: 'parked_note',
+        text: 'waiting on a human',
+        parked_ms: null,
+      });
+    }
   });
 
   it('an unanswered ask_question yields the ask_question cause — honest, not a fabricated question', () => {
@@ -1492,7 +1525,9 @@ describe('needs_you_reason on the wire (operator report 2026-08-21)', () => {
 
       const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps({ claimsRoot: dir }));
       expect(threads[0]!.state).toBe('needs_you');
-      expect(threads[0]!.needs_you_reason).toEqual({ cause: 'parked_note', text: note });
+      // `parked_at` is NOW, so the measured age is 0 — which renders as
+      // "unmeasured", never "parked just now" (§12).
+      expect(threads[0]!.needs_you_reason).toEqual({ cause: 'parked_note', text: note, parked_ms: null });
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -1555,5 +1590,261 @@ describe('close state on the thread payload', () => {
     expect((await listOne()).closing).toBe(true);
     insert('closed');
     expect((await listOne()).closing).toBe(false);
+  });
+});
+
+// ── §2/§5 `unassigned`: ownerless items from a workgroup attention source ────
+
+describe('attention-source rows in the thread list', () => {
+  const WG = 'wg-example';
+  const CHANNEL_KEY = 'slack:CEXAMPLE001';
+  const tmpdirs: string[] = [];
+
+  function tmp(prefix: string): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    tmpdirs.push(dir);
+    return dir;
+  }
+
+  /** A groups root holding one release board for {@link WG}. */
+  function boardRoot(items: unknown[], asOf = '2026-08-20T11:30:00.000Z'): string {
+    const root = tmp('threads-board-');
+    const dir = path.join(root, WG, 'releases');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'release-state.json'), JSON.stringify({ asOf, items }));
+    return root;
+  }
+
+  function readyPr(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      id: 'EXAMPLE-APP#817',
+      kind: 'pr',
+      nextMover: 'human',
+      owner: 'alice',
+      why: 'CI green, mergeable CLEAN',
+      since: iso(3_600_000),
+      url: 'https://github.com/example-org/example-app/pull/817',
+      title: "What's new digest",
+      nextAction: '@releasebot ship 817',
+      ...over,
+    };
+  }
+
+  function declare(value: string | null): void {
+    getDb().prepare(`UPDATE workgroups SET attention_sources = ? WHERE id = ?`).run(value, WG);
+  }
+
+  function attentionDeps(groupsRoot: string, over: Partial<ThreadListDeps> = {}): ThreadListDeps {
+    return deps({ attentionEnv: { groupsRoot, claimsRoot: tmp('threads-attn-claims-') }, ...over });
+  }
+
+  beforeEach(() => {
+    setupDb();
+    seedWorkgroup(WG);
+    seedAgentGroup('ag-example', WG);
+  });
+
+  afterEach(() => {
+    while (tmpdirs.length) fs.rmSync(tmpdirs.pop()!, { recursive: true, force: true });
+  });
+
+  it('a declared source emits an ownerless row with a real channel key, and no sessions', async () => {
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    getDb()
+      .prepare(
+        `INSERT INTO messaging_groups (id, channel_type, instance, platform_id, name, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run('mg-example', 'slack-testworkspace', 'testworkspace', CHANNEL_KEY, '#example-room', iso(0));
+
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+    expect(threads).toHaveLength(1);
+    const row = threads[0]!;
+    expect(row.thread_id).toBe(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`);
+    expect(row.channel_key).toBe(CHANNEL_KEY);
+    expect(row.channel_name).toBe('#example-room');
+    expect(row.participants).toEqual([]);
+    expect(row.session_ids).toEqual([]);
+    expect(row.attention_source).toEqual({
+      kind: 'release-board',
+      as_of: '2026-08-20T11:30:00.000Z',
+      url: 'https://github.com/example-org/example-app/pull/817',
+      next_action: '@releasebot ship 817',
+    });
+  });
+
+  it('emits nothing when the workgroup declares nothing', async () => {
+    declare(null);
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+    expect(threads).toEqual([]);
+  });
+
+  it('emits nothing when the declaration is malformed — never a partial list', async () => {
+    declare('[{"kind":"release-board","root":"releases"}]');
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+    expect(threads).toEqual([]);
+  });
+
+  it('ignores an unknown kind rather than throwing, and still emits the known source', async () => {
+    declare(
+      JSON.stringify([
+        { kind: 'from-a-newer-trunk', root: 'findings', channel_key: CHANNEL_KEY },
+        { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY },
+      ]),
+    );
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+    expect(threads.map((t) => t.thread_id)).toEqual([`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`]);
+  });
+
+  it('a parked waiting-on item reaches needs_you, with the reason and the next action', async () => {
+    // §5: the two `needs_you` checks precede the `sessionCount === 0` guard, so
+    // an ownerless item whose note names a human lands `needs_you` — "a human
+    // owes an answer" — not `unassigned` — "nobody has picked this up".
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+    expect(threads[0]!.state).toBe('needs_you');
+    expect(threads[0]!.needs_you_reason).toEqual({
+      cause: 'parked_note',
+      text: 'waiting on alice: CI green, mergeable CLEAN — next: @releasebot ship 817',
+      // No claim FILE behind a board item, so there is no `parked_at` to
+      // measure. Null, never zero (§12).
+      parked_ms: null,
+    });
+  });
+
+  it('an ownerless item with no waiting-on note reaches unassigned, not needs_you', async () => {
+    // The other half of the same branch. `deriveThreadState` is the ONE
+    // function that decides, and nothing in the attention path sets `state`.
+    expect(
+      deriveThreadState({
+        sessionCount: 0,
+        claimState: null,
+        claimNote: '',
+        needsOperator: false,
+        containerStatus: 'unknown',
+        providerStatus: null,
+        toolStartedAtMs: null,
+        lastOutputAtMs: null,
+        now: NOW,
+      }),
+    ).toBe('unassigned');
+    // …and a parked claim whose note names nobody is likewise not `needs_you`.
+    expect(
+      deriveThreadState({
+        sessionCount: 0,
+        claimState: 'parked',
+        claimNote: 'mechanically ready',
+        needsOperator: false,
+        containerStatus: 'unknown',
+        providerStatus: null,
+        toolStartedAtMs: null,
+        lastOutputAtMs: null,
+        now: NOW,
+      }),
+    ).toBe('unassigned');
+  });
+
+  it('the item id never becomes a channel key', async () => {
+    // `threadChannelKey` would read `board:EXAMPLE-APP#817` as platform `board`
+    // + channel `EXAMPLE-APP#817` and mint one fake sidebar bucket PER ITEM.
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+    expect(threads[0]!.channel_key).toBe(CHANNEL_KEY);
+    expect(threads[0]!.channel_key).not.toContain(ATTENTION_ITEM_PREFIX);
+    // …and the parser itself refuses the id, so no future caller can
+    // reintroduce the bug by passing one in.
+    expect(threadChannelKey(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`)).toBe(UNKNOWN_CHANNEL_KEY);
+  });
+
+  it('merges into the ONE queue, ordered by activity alongside session rows', async () => {
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    insertSession({
+      id: 's-live',
+      agentGroupId: 'ag-example',
+      threadId: 'slack:CTESTCHAN01:1.1',
+      lastOutboundAt: iso(60_000), // fresher than the board item's 1h-old `since`
+    });
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+    expect(threads.map((t) => t.thread_id)).toEqual([
+      'slack:CTESTCHAN01:1.1',
+      `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`,
+    ]);
+  });
+
+  it('a group_id filter yields no attention rows — an ownerless item is on no agent', async () => {
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    const { threads } = await buildThreadList(
+      makeCtx(),
+      { ...LIST_OPTS, groupId: 'ag-example' },
+      attentionDeps(boardRoot([readyPr()])),
+    );
+    expect(threads).toEqual([]);
+  });
+
+  it('a workgroup filter narrows, and an unknown workgroup yields zero rows rather than a 403 (§2a)', async () => {
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    const groupsRoot = boardRoot([readyPr()]);
+    const claimsRoot = tmp('threads-attn-claims-');
+    const env = { groupsRoot, claimsRoot };
+    expect(
+      (await buildThreadList(makeCtx(), { ...LIST_OPTS, workgroupId: WG }, deps({ attentionEnv: env }))).threads,
+    ).toHaveLength(1);
+    expect(
+      (await buildThreadList(makeCtx(), { ...LIST_OPTS, workgroupId: 'wg-nope' }, deps({ attentionEnv: env }))).threads,
+    ).toEqual([]);
+  });
+
+  it('a scoped caller sees an item only through a workgroup one of its own agent groups is in', async () => {
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    const groupsRoot = boardRoot([readyPr()]);
+    const env = { groupsRoot, claimsRoot: tmp('threads-attn-claims-') };
+    seedAgentGroup('ag-elsewhere');
+    expect(
+      (
+        await buildThreadList(
+          makeCtx({ no_filter: false, allowed_group_ids: ['ag-example'] }),
+          LIST_OPTS,
+          deps({ attentionEnv: env }),
+        )
+      ).threads,
+    ).toHaveLength(1);
+    expect(
+      (
+        await buildThreadList(
+          makeCtx({ no_filter: false, allowed_group_ids: ['ag-elsewhere'] }),
+          LIST_OPTS,
+          deps({ attentionEnv: env }),
+        )
+      ).threads,
+    ).toEqual([]);
+  });
+
+  it('marks staleness, never hides it: an ancient board still emits its rows', async () => {
+    // No suppression threshold exists anywhere in this path, deliberately. An
+    // empty feed is indistinguishable from a healthy one, and "nothing is
+    // blocked on a human" is the one lie the feed exists to prevent.
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    const groupsRoot = boardRoot([readyPr()], '2026-01-01T00:00:00.000Z');
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(groupsRoot));
+    expect(threads).toHaveLength(1);
+    expect(threads[0]!.attention_source!.as_of).toBe('2026-01-01T00:00:00.000Z');
+  });
+
+  it('memoizes the reader inside the TTL and re-reads after it', async () => {
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    const groupsRoot = boardRoot([readyPr()]);
+    const env = { groupsRoot, claimsRoot: tmp('threads-attn-claims-') };
+    expect((await buildThreadList(makeCtx(), LIST_OPTS, deps({ attentionEnv: env }))).threads).toHaveLength(1);
+
+    // Delete the board: only the memo can still answer.
+    fs.rmSync(path.join(groupsRoot, WG, 'releases'), { recursive: true, force: true });
+    expect(
+      (await buildThreadList(makeCtx(), LIST_OPTS, deps({ now: NOW + ATTENTION_MEMO_TTL_MS - 1, attentionEnv: env })))
+        .threads,
+    ).toHaveLength(1);
+    expect(
+      (await buildThreadList(makeCtx(), LIST_OPTS, deps({ now: NOW + ATTENTION_MEMO_TTL_MS, attentionEnv: env })))
+        .threads,
+    ).toEqual([]);
   });
 });

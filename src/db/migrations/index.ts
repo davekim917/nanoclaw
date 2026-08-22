@@ -59,6 +59,7 @@ import { migration053 } from './053-normalize-naive-timestamps.js';
 import { migration054 } from './054-thread-snoozes.js';
 import { migration055 } from './055-thread-closures.js';
 import { migration056 } from './056-sessions-task-routing-platform-id.js';
+import { migration057 } from './057-workgroups-attention-sources.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -144,6 +145,7 @@ export const migrations: Migration[] = [
   // Adds a nullable column and writes no timestamp, so 053's position is
   // irrelevant here — same reasoning as 054/055 above.
   migration056,
+  migration057,
   containerConfigs,
   cliScope,
   messagingGroupInstance,
