@@ -111,6 +111,8 @@ export interface SelfHealStamps {
   auto_nudged_at?: unknown;
   auto_nudge_count?: unknown;
   auto_heal_exhausted_at?: unknown;
+  /** Last time no deliverable target could be resolved — a backoff, not a rung. */
+  auto_heal_unresolved_at?: unknown;
 }
 
 export type SelfHealAction = 'nudge' | 'takeover' | 'exhaust';
@@ -142,6 +144,26 @@ function effectiveState(stamps: SelfHealStamps): { count: number; lastAt: number
 }
 
 /**
+ * Backoff after a sweep could not resolve anywhere to deliver.
+ *
+ * Deliberately NOT a spent rung: an unresolvable target says nothing about
+ * whether the owner needs nudging, so re-arming must not cost the claim one of
+ * its two nudges. It is only a "stop asking for a day". Without it the sweep
+ * re-decided `first-nudge`, failed, and re-logged every scan forever — 1035
+ * warnings from 8 claims in one log, the loudest line in the file.
+ *
+ * Same re-claim reset as `effectiveState`: a fresh `claimed_at` is new work,
+ * possibly in a thread that DOES resolve, so it clears the backoff immediately.
+ */
+function inUnresolvedBackoff(stamps: SelfHealStamps, now: number): boolean {
+  const at = typeof stamps.auto_heal_unresolved_at === 'string' ? Date.parse(stamps.auto_heal_unresolved_at) : NaN;
+  if (!Number.isFinite(at)) return false;
+  const claimedAt = typeof stamps.claimed_at === 'string' ? Date.parse(stamps.claimed_at) : NaN;
+  if (Number.isFinite(claimedAt) && claimedAt > at) return false;
+  return now - at < SELF_HEAL_COOLDOWN_MS;
+}
+
+/**
  * Pure — which rung this claim is on right now. `claim` must already be the
  * board's `stale` state; the exclusions are re-checked here so the decision is
  * testable on its own and cannot be bypassed by a future second caller.
@@ -160,6 +182,7 @@ export function decideSelfHeal(
 
   const { count, lastAt, exhausted } = effectiveState(raw);
   if (exhausted) return { action: 'none', reason: 'exhausted' };
+  if (inUnresolvedBackoff(raw, now)) return { action: 'none', reason: 'unresolved-backoff' };
   if (count === 0) return { action: 'nudge', nudge: 1, reason: 'first-nudge' };
   if (Number.isFinite(lastAt) && now - lastAt < SELF_HEAL_COOLDOWN_MS) {
     return { action: 'none', reason: 'cooling-down' };
@@ -268,6 +291,13 @@ export interface SelfHealTarget {
   messagingGroupId: string;
   /** Display name we matched on, for the log line. */
   name: string;
+  /**
+   * Where to deliver, when that is NOT the claim's own thread. Set only for a
+   * `system:tasks:<seriesId>` claim, whose thread is a task session rather than
+   * a real channel thread — see `taskSeriesCandidates`. `null` means the
+   * channel with no thread, which is distinct from `undefined`.
+   */
+  deliverThreadId?: string | null;
 }
 
 export interface SelfHealTaskInput {
@@ -324,6 +354,140 @@ function stampClaim(file: string, patch: Record<string, unknown>): void {
   fs.renameSync(tmp, file);
 }
 
+interface WiredCandidate {
+  agentGroupId: string;
+  messagingGroupId: string;
+  name: string;
+  folder: string;
+  /**
+   * Deliver here instead of the claim's own thread. Set only by task-series
+   * claims, whose thread is a task session and never a real destination.
+   * `null` means the channel with no thread — a legitimate answer, distinct
+   * from `undefined` ("use the claim's thread").
+   */
+  deliverThreadId?: string | null;
+}
+
+/**
+ * A claim taken inside a scheduled task has no channel to nudge into: its
+ * thread is `system:tasks:<seriesId>`, and a task session is deliberately
+ * minted with `messaging_group_id = null` (session-manager `resolveTaskSession`),
+ * so the channel join above matches nothing. Most autonomous work happens in
+ * scheduled tasks, which made that the single biggest hole in this path — 805
+ * of 1035 "no deliverable target" warnings in one log, and self-reinforcing:
+ * a nudge is DELIVERED as a task, so an owner who re-claims while working it
+ * rewrites the claim's thread to that nudge task's own `system:tasks:*` thread
+ * and the claim can never be nudged again.
+ *
+ * WHO is not a guess: the task session row IS the series' owner, a strictly
+ * better signal than reverse-mapping a channel.
+ *
+ * WHERE has two sources that are NOT the same thing, so they are ranked:
+ *
+ *   1. `task_thread_anchors` — where the series' output actually LANDED. First
+ *      choice for a nudge: it is the live context the claim was worked in.
+ *      Only ~46% of task sessions have one (64 of 138 measured), because an
+ *      anchor is written only once a session posts into a thread.
+ *   2. the series' routing STAMP on its `messages_in` row — where an
+ *      unaddressed reply is supposed to land (`ncl tasks` help: "Routing (where
+ *      an unaddressed reply lands)"). It exists from task-definition time
+ *      whether or not the series ever spoke, but the agent picks its real
+ *      destination per fire via `send_message` (tasks.ts:715), so it is second
+ *      choice, never first.
+ *   3. neither — no target. "Unrouted" is the honest answer; the backoff above
+ *      is what keeps it from being a loud one.
+ *
+ * Same precedence the display side uses, deliberately: two answers to "what
+ * channel does a task session belong to" would be worse than either alone.
+ * The wiring join is kept on both so we can still only address a channel the
+ * agent group actually belongs to.
+ */
+async function taskSeriesCandidates(workgroupId: string, threadId: string): Promise<WiredCandidate[]> {
+  const { getDb } = await import('../../db/index.js');
+  const db = getDb();
+  const owner = db
+    .prepare(
+      `SELECT s.id AS sessionId, ag.id AS agentGroupId, ag.name AS name, ag.folder AS folder
+         FROM sessions s
+         JOIN agent_groups ag ON ag.id = s.agent_group_id
+        WHERE s.thread_id = ? AND ag.workgroup_id = ?
+        ORDER BY s.created_at DESC
+        LIMIT 1`,
+    )
+    .get(threadId, workgroupId) as
+    | { sessionId: string; agentGroupId: string; name: string; folder: string }
+    | undefined;
+  if (!owner) return [];
+
+  // Newest anchor wins — a series that has posted in two channels is talking in
+  // the one it spoke in last, and picking arbitrarily is how a nudge lands in a
+  // room nobody is reading.
+  const anchor = db
+    .prepare(
+      `SELECT a.channel_type AS channelType, a.platform_id AS platformId, a.thread_platform_id AS threadPlatformId,
+              mg.id AS messagingGroupId
+         FROM task_thread_anchors a
+         JOIN messaging_groups mg ON mg.platform_id = a.platform_id AND mg.channel_type = a.channel_type
+         JOIN messaging_group_agents mga
+              ON mga.messaging_group_id = mg.id AND mga.agent_group_id = ?
+        WHERE a.session_id = ?
+        ORDER BY a.created_at DESC
+        LIMIT 1`,
+    )
+    .get(owner.agentGroupId, owner.sessionId) as
+    | { channelType: string; platformId: string; threadPlatformId: string; messagingGroupId: string }
+    | undefined;
+  const where = anchor
+    ? { messagingGroupId: anchor.messagingGroupId, deliverThreadId: `${anchor.platformId}:${anchor.threadPlatformId}` }
+    : // `system:tasks:<seriesId>` — the series id is everything after the prefix.
+      await seriesRoutingStamp(db, owner.agentGroupId, owner.sessionId, threadId.split(':').slice(2).join(':'));
+  if (!where) return [];
+
+  return [{ agentGroupId: owner.agentGroupId, name: owner.name, folder: owner.folder, ...where }];
+}
+
+/**
+ * Rung 2 — the series' own routing stamp, read from its task row.
+ *
+ * Reaching here costs a session-DB file open, so it is deliberately lazy: only
+ * `system:tasks:*` claims get here, only after the anchor lookup missed, and
+ * only once per backoff window (a claim that resolves to nothing is stamped and
+ * left alone for a day). No cache — the backoff already is the throttle.
+ */
+async function seriesRoutingStamp(
+  db: import('better-sqlite3').Database,
+  agentGroupId: string,
+  sessionId: string,
+  seriesId: string,
+): Promise<{ messagingGroupId: string; deliverThreadId: string | null } | null> {
+  const { inboundDbPath, withInboundDb } = await import('../../session-manager.js');
+  if (!fs.existsSync(inboundDbPath(agentGroupId, sessionId))) return null;
+
+  const stamp = withInboundDb(agentGroupId, sessionId, (inbound) =>
+    inbound
+      .prepare(
+        `SELECT platform_id AS platformId, channel_type AS channelType, thread_id AS threadId
+           FROM messages_in
+          WHERE kind = 'task' AND series_id = ? AND platform_id IS NOT NULL
+          ORDER BY seq DESC
+          LIMIT 1`,
+      )
+      .get(seriesId),
+  ) as { platformId: string; channelType: string; threadId: string | null } | undefined;
+  if (!stamp) return null; // `--isolated`: stamped no routing on purpose
+
+  const mg = db
+    .prepare(
+      `SELECT mg.id AS messagingGroupId
+         FROM messaging_groups mg
+         JOIN messaging_group_agents mga
+              ON mga.messaging_group_id = mg.id AND mga.agent_group_id = ?
+        WHERE mg.platform_id = ? AND mg.channel_type = ?`,
+    )
+    .get(agentGroupId, stamp.platformId, stamp.channelType) as { messagingGroupId: string } | undefined;
+  return mg ? { messagingGroupId: mg.messagingGroupId, deliverThreadId: stamp.threadId } : null;
+}
+
 /**
  * Agent groups in `workgroupId` wired to the channel the claim's thread lives
  * in — the same join dashboard/nudge.ts uses to refuse a nudge into a channel
@@ -336,16 +500,18 @@ function stampClaim(file: string, patch: Record<string, unknown>): void {
  * group" helper here (the pattern `findAnySessionForMessagingGroup` used to
  * provide, since deleted as dead code): picking whichever is newest would
  * drop delivery into an unrelated thread's container. Route by the DB join
- * above instead.
+ * below instead.
+ *
+ * Exported for its own test: both resolvers funnel through here, so this is the
+ * one place the "which room can we actually reach?" question is answered.
  */
-async function wiredCandidates(
-  workgroupId: string,
-  threadId: string,
-): Promise<Array<{ agentGroupId: string; messagingGroupId: string; name: string; folder: string }>> {
-  const [{ getDb }, { threadPlatformId }] = await Promise.all([
+export async function wiredCandidates(workgroupId: string, threadId: string): Promise<WiredCandidate[]> {
+  const [{ getDb }, { threadPlatformId }, { isTaskThread }] = await Promise.all([
     import('../../db/index.js'),
     import('../../dashboard/api/observatory.js'),
+    import('../../db/sessions.js'),
   ]);
+  if (isTaskThread(threadId)) return taskSeriesCandidates(workgroupId, threadId);
   return getDb()
     .prepare(
       `SELECT ag.id AS agentGroupId, ag.name AS name, ag.folder AS folder, mg.id AS messagingGroupId
@@ -354,12 +520,7 @@ async function wiredCandidates(
          JOIN agent_groups ag ON ag.id = mga.agent_group_id
         WHERE ag.workgroup_id = ? AND mg.platform_id = ?`,
     )
-    .all(workgroupId, threadPlatformId(threadId)) as Array<{
-    agentGroupId: string;
-    messagingGroupId: string;
-    name: string;
-    folder: string;
-  }>;
+    .all(workgroupId, threadPlatformId(threadId)) as WiredCandidate[];
 }
 
 /**
@@ -375,14 +536,21 @@ async function defaultResolveOwner(workgroupId: string, claim: BoardClaim): Prom
   const rows = await wiredCandidates(workgroupId, claim.threadId);
   if (rows.length === 0) return null;
   const wanted = claim.owner.trim().toLowerCase();
+  const considered: string[] = [];
   const [{ resolveAssistantName }, { readContainerConfig }, { getAgentGroup }] = await Promise.all([
     import('../../container-runner.js'),
     import('../../container-config.js'),
     import('../../db/agent-groups.js'),
   ]);
   for (const row of rows) {
+    considered.push(row.name);
     if (row.name.trim().toLowerCase() === wanted) {
-      return { agentGroupId: row.agentGroupId, messagingGroupId: row.messagingGroupId, name: row.name };
+      return {
+        agentGroupId: row.agentGroupId,
+        messagingGroupId: row.messagingGroupId,
+        name: row.name,
+        deliverThreadId: row.deliverThreadId,
+      };
     }
     const group = getAgentGroup(row.agentGroupId);
     if (!group) continue;
@@ -393,10 +561,26 @@ async function defaultResolveOwner(workgroupId: string, claim: BoardClaim): Prom
       log.warn('self-heal: assistant-name resolution failed', { agentGroupId: row.agentGroupId, err });
       continue;
     }
+    considered.push(display);
     if (display.trim().toLowerCase() === wanted) {
-      return { agentGroupId: row.agentGroupId, messagingGroupId: row.messagingGroupId, name: display };
+      return {
+        agentGroupId: row.agentGroupId,
+        messagingGroupId: row.messagingGroupId,
+        name: display,
+        deliverThreadId: row.deliverThreadId,
+      };
     }
   }
+  // A miss has to say what it looked at. Without this the caller logs only
+  // "no deliverable target", which is unfalsifiable after the fact: an
+  // investigation into 14 such warnings could rule out every testable cause and
+  // still not name the mechanism, because the candidate set was gone by then.
+  log.warn('self-heal: owner did not match any wired agent on the thread', {
+    slug: claim.slug,
+    wanted,
+    threadId: claim.threadId,
+    considered,
+  });
   return null;
 }
 
@@ -410,7 +594,14 @@ async function defaultResolveSibling(
   // ponytail: first wired sibling wins. Add a least-loaded pick if a workgroup
   // ever has enough siblings on one channel for the choice to matter.
   const row = rows.find((r) => r.agentGroupId !== exclude);
-  return row ? { agentGroupId: row.agentGroupId, messagingGroupId: row.messagingGroupId, name: row.name } : null;
+  return row
+    ? {
+        agentGroupId: row.agentGroupId,
+        messagingGroupId: row.messagingGroupId,
+        name: row.name,
+        deliverThreadId: row.deliverThreadId,
+      }
+    : null;
 }
 
 /**
@@ -432,7 +623,10 @@ async function defaultCreateTask(input: SelfHealTaskInput): Promise<boolean> {
         prompt: input.prompt,
         process_after: new Date().toISOString(),
         messaging_group: input.target.messagingGroupId,
-        thread_id: input.claim.threadId,
+        // The claim's own thread, except for a task-series claim whose "thread"
+        // is a task session and never a destination — that one carries its own,
+        // and `null` there means "the channel, no thread", not "fall back".
+        thread_id: input.target.deliverThreadId !== undefined ? input.target.deliverThreadId : input.claim.threadId,
         ...NUDGE_TASK_QUIET_ARGS,
       },
     },
@@ -549,6 +743,10 @@ async function applyDecision(args: {
   if (!target) {
     // Never guess a room or an agent: an unresolvable target means the claim
     // stays exactly where it is, visible and red, with one line saying why.
+    // The stamp is what keeps that ONE line from becoming one per scan forever
+    // — it backs the claim off for a day without spending a nudge. Shadow mode
+    // stamps nothing, so a dry run still reports the full picture every scan.
+    if (enabled) stampClaim(file, { auto_heal_unresolved_at: new Date(now).toISOString() });
     log.warn('self-heal: no deliverable target for stale claim', { class: 'stale-claim', ...base });
     return { ...base, applied: false, reason: decision.action === 'takeover' ? 'no-sibling' : 'owner-unresolved' };
   }

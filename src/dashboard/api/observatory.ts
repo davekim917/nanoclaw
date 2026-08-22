@@ -25,6 +25,7 @@ import { readClaims, type BoardClaim } from '../../claims-board.js';
 import { workgroupLegacyRoot } from '../../repository-activation.js';
 import { log } from '../../log.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
+import { threadChannelKey } from './threads.js';
 import type { AgentGroup } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 
@@ -715,9 +716,34 @@ export function threadPermalink(threadId: string): string | null {
   return null;
 }
 
-/** '<channelType>:<channel>:<ts>' → '<channelType>:<channel>', the messaging_groups.platform_id key. */
+/**
+ * A thread id → the `messaging_groups.platform_id` key of the CHANNEL it lives in.
+ *
+ * The old body here was `slice(0, 2)`, which is true for Slack
+ * (`slack:<channel>:<ts>`) and false for Discord, where a channel is
+ * `discord:<guild>:<channel>` and the two-segment slice yields the GUILD.
+ * That matched no row, so every caller below silently resolved a Discord
+ * thread to nothing — 216 of the 1035 "no deliverable target" warnings in one
+ * log were a single Discord claim retrying forever.
+ *
+ * `threadChannelKey` (threads.ts) already answers exactly this question for the
+ * display side, including the `EXTRA_SEGMENT_PLATFORMS` rule DESIGN.md §3.2
+ * documents. Delegate to it rather than keep a second copy: two answers to
+ * "what channel does this thread belong to" is how the board and the delivery
+ * path drift apart, and the display side is where the rule is already tested.
+ * The wired platform ids are the authority it prefers, so pass them in.
+ */
 export function threadPlatformId(threadId: string): string {
-  return threadId.split(':').slice(0, 2).join(':');
+  let known: Set<string> | undefined;
+  try {
+    const rows = getDb().prepare('SELECT DISTINCT platform_id FROM messaging_groups').all() as {
+      platform_id: string;
+    }[];
+    known = new Set(rows.map((r) => r.platform_id));
+  } catch {
+    // No DB (early boot, unit tests) — the parser's own segment rule stands in.
+  }
+  return threadChannelKey(threadId, known);
 }
 
 function buildRooms(workgroupId: string, allowed: string[] | null, hidden: string[] = []): ObservatoryRoom[] {
