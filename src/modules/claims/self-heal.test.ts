@@ -10,6 +10,7 @@ import {
   buildTakeoverPrompt,
   isHandedOffPark,
   isWaitingOnHuman,
+  namedHuman,
   NUDGE_TASK_QUIET_ARGS,
   SELF_HEAL_COOLDOWN_MS,
   SELF_HEAL_SCAN_INTERVAL_MS,
@@ -99,9 +100,11 @@ function deps(dir: string, over: Partial<SelfHealDeps> = {}): SelfHealDeps & { s
 }
 
 describe('exclusions — the claims self-heal must never touch', () => {
-  it('never nudges a "waiting on <person>" claim, however stale', async () => {
+  it('never NUDGES a "waiting on <person>" claim — the ladder is not for human-blocked work', async () => {
+    // 20h claimed on a 4h ttl: stale past grace, but 16h past due — inside the
+    // PARK_GRACE_MS suppression window, so still silent.
     const dir = root({
-      blocked: claim(30, { note: 'waiting on the owner: which OAuth flow for the retry path?' }),
+      blocked: claim(20, { note: 'waiting on the owner: which OAuth flow for the retry path?' }),
     });
     const d = deps(dir);
 
@@ -110,20 +113,6 @@ describe('exclusions — the claims self-heal must never touch', () => {
     expect(outcomes).toEqual([]);
     expect(d.sent).toEqual([]);
     expect(readClaimFile(dir, 'blocked').auto_nudge_count).toBeUndefined();
-  });
-
-  it('excludes a waiting-on note even when it is parked and decayed past PARK_GRACE_MS', async () => {
-    const dir = root({
-      parked: claim(80, {
-        status: 'parked',
-        parked_at: new Date(NOW - 40 * HOUR).toISOString(),
-        note: 'Waiting on the operator: approve the migration window',
-      }),
-    });
-    const d = deps(dir);
-
-    expect(await sweepClaimsSelfHeal(NOW, d)).toEqual([]);
-    expect(d.sent).toEqual([]);
   });
 
   it('only anchors the exclusion at the start — prose that mentions waiting is not the discipline', () => {
@@ -662,5 +651,90 @@ describe('wiredCandidates — where a claim can actually be reached', () => {
   it('still resolves an ordinary channel thread through the wiring join', async () => {
     const rows = await wiredCandidates('wg-a', 'slack:C0AAA:1786621514.008659');
     expect(rows).toEqual([{ agentGroupId: 'ag-1', messagingGroupId: 'mg-1', name: 'agent-a', folder: 'agent-a' }]);
+  });
+});
+
+describe('human-blocked claims — a suppression window, not an exemption', () => {
+  /** Parked `hoursAgo`, on a note that names a person. */
+  function blocked(hoursAgo: number, extra: Record<string, unknown> = {}) {
+    return claim(hoursAgo + 4, {
+      status: 'parked',
+      parked_at: new Date(NOW - hoursAgo * HOUR).toISOString(),
+      note: 'waiting on the operator: approve the migration window before the freeze',
+      ...extra,
+    });
+  }
+
+  it('stays silent inside PARK_GRACE_MS', async () => {
+    const d = deps(root({ held: blocked(20) }));
+
+    expect(await sweepClaimsSelfHeal(NOW, d)).toEqual([]);
+    expect(d.sent).toEqual([]);
+  });
+
+  it('escalates ONCE past the window, then never again', async () => {
+    // The live bug: two claims parked on "waiting on <people>" for ~40h, still
+    // rendering as a human owing a decision, with no notification ever sent.
+    const dir = root({ held: blocked(40) });
+    const d = deps(dir);
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+
+    expect(outcome).toMatchObject({ slug: 'held', action: 'escalate-human', applied: true, target: 'ag-owner' });
+    expect(d.sent).toHaveLength(1);
+    expect(d.sent[0].target).toEqual(OWNER);
+    expect(d.sent[0].name).toBe('escalate held');
+
+    // Stamped terminal on delivery — and stamped in the field effectiveState
+    // actually reads, or the one-shot would repeat every day.
+    const file = readClaimFile(dir, 'held');
+    expect(file.auto_heal_exhausted_at).toBe(new Date(NOW).toISOString());
+    expect(file.auto_nudged_at).toBe(new Date(NOW).toISOString());
+
+    for (const later of [SELF_HEAL_COOLDOWN_MS + 1, 9 * SELF_HEAL_COOLDOWN_MS]) {
+      const again = deps(dir);
+      expect(await sweepClaimsSelfHeal(NOW + later, again)).toEqual([]);
+      expect(again.sent).toEqual([]);
+    }
+  });
+
+  it('demands an @-mention of the named human, because a bare name notifies nobody', async () => {
+    const d = deps(root({ held: blocked(40) }));
+    await sweepClaimsSelfHeal(NOW, d);
+
+    const prompt = d.sent[0].prompt;
+    expect(prompt).toContain('the operator');
+    expect(prompt).toContain('👉 @<person>');
+    expect(prompt).toContain('@-mentions the operator');
+    // It must not read as a nudge: there is no work to push here.
+    expect(prompt).not.toContain('Automatic nudge');
+  });
+
+  it('reads the person straight out of the note, however the note names them', () => {
+    expect(namedHuman('waiting on the operator: approve the window')).toBe('the operator');
+    expect(namedHuman('Waiting On the reviewer or the operator: pick one')).toBe('the reviewer or the operator');
+    expect(namedHuman('waiting on somebody, eventually')).toBe('whoever you are waiting on');
+  });
+
+  it('does not burn the one escalation on a failed delivery', async () => {
+    const dir = root({ held: blocked(40) });
+    const d = deps(dir, { createTask: async () => false });
+
+    expect(await sweepClaimsSelfHeal(NOW, d)).toMatchObject([{ applied: false, reason: 'delivery-failed' }]);
+    expect(readClaimFile(dir, 'held').auto_heal_exhausted_at).toBeUndefined();
+  });
+
+  it('still refuses to guess a room when the claim has no thread', async () => {
+    const d = deps(root({ held: blocked(40, { thread_id: undefined }) }));
+
+    expect(await sweepClaimsSelfHeal(NOW, d)).toEqual([]);
+    expect(d.sent).toEqual([]);
+  });
+
+  it('says nothing about a human-blocked claim that already declared itself finished', async () => {
+    const d = deps(root({ held: blocked(40, { released_at: new Date(NOW - 20 * HOUR).toISOString() }) }));
+
+    expect(await sweepClaimsSelfHeal(NOW, d)).toEqual([]);
+    expect(d.sent).toEqual([]);
   });
 });

@@ -107,6 +107,7 @@ import { OomKillObserver } from './resource-oom-observer.js';
 import { pruneChannelIngressReceipts } from './db/channel-ingress-receipts.js';
 import { runMemoryCurationInBackground, stopMemoryCurationInBackground } from './modules/memory/curator-worker.js';
 import { probeNextGraphScentWorkgroup } from './modules/memory/graph-scent.js';
+import { reconcileMergedClaims } from './modules/claims/reconcile.js';
 import { sweepClaimsSelfHeal } from './modules/claims/self-heal.js';
 
 const oomKillObserver = new OomKillObserver();
@@ -1216,10 +1217,17 @@ async function sweep(): Promise<void> {
     log.warn('Usage rollup sweep step failed', { err });
   }
 
-  // Self-heal class 3: nudge (then, if armed, offer takeover of) stale work
-  // claims — see src/modules/claims/self-heal.ts. Throttled internally to
-  // once per 10 minutes; isolated so a scan failure never blocks the rest of
-  // the tick.
+  // Claim reconciliation, then self-heal. Order is load-bearing: a claim whose
+  // pull request has merged must be CLOSED, not escalated at somebody — the
+  // reconcile pass deletes those files first, so the ladder below never sees
+  // them. Both are throttled internally to once per 10 minutes and each is
+  // isolated, so a GitHub outage cannot take the nudge ladder down with it.
+  try {
+    await reconcileMergedClaims();
+  } catch (err) {
+    log.warn('Claims reconcile sweep step failed', { err });
+  }
+
   try {
     await sweepClaimsSelfHeal();
   } catch (err) {
