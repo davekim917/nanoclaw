@@ -145,6 +145,40 @@ Each added term can only shrink the row set, never widen past
 never a route to an agent group the scope clause alone would have excluded.
 What an out-of-scope value resolves to is §2a.
 
+### 3.6 Attention items are scoped by WORKGROUP, not by agent group
+
+Session-backed rows gate at agent-group granularity — the
+`s.agent_group_id IN (<allowed_group_ids>)` term in §3.5. Attention items
+(§5's `unassigned`, produced by `src/attention-sources.ts`) gate one level
+coarser, at the workgroup, via `workgroupIdsForAgentGroups`.
+
+**The consequence, stated plainly: a caller entitled to ANY one agent group in
+a workgroup sees every attention item that workgroup declares — including
+items nobody would associate with that particular sibling.** A scoped admin
+holding one of three siblings sees the whole workgroup's board feed.
+
+That is the intended behavior, not a gap someone forgot to close, for two
+reasons that both have to hold:
+
+1. **An attention item has no agent group to test against.** It is ownerless by
+   construction — that is the entire definition of `unassigned` — so there is
+   no `agent_group_id` on it and no honest way to synthesise one. A finer gate
+   would have to invent an owner, and inventing one is how a queue starts
+   lying about who is on what.
+2. **The workgroup is already the data-pool boundary.** CLAUDE.md and
+   [docs/workgroups.md](../../workgroups.md) name it as such: the chat archive,
+   shared files, Graphify retrieval and OneCLI secret declarations all pool at
+   the workgroup. A release board sitting in `groups/<workgroup>/releases` is
+   workgroup data by the same rule as everything else in that folder. Gating
+   its items more tightly than the folder they are read from would be a
+   *different* boundary, not a stricter one.
+
+So this is a deliberate coarsening of the ceiling for one row type, and it is
+load-bearing: narrowing it to agent-group granularity would make every
+attention item invisible to everyone, since none of them matches any agent
+group. Pinned by `a caller scoped to ONE sibling sees the whole workgroup's
+items` in `src/dashboard/api/threads.test.ts`.
+
 ## 3a. Shell geometry — a fixed viewport, not a scrolling document
 
 The console root is a **fixed-viewport shell**: `height: 100vh; height:
