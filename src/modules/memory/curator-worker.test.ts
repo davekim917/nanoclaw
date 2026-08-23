@@ -380,6 +380,105 @@ describe('memory curator worker', () => {
     expect(d.fail).not.toHaveBeenCalled();
   });
 
+  // Production bug (147 failures, one workgroup): 86% of platform timestamps
+  // are archived under 2+ agent groups, so the bare-timestamp prefix rescue in
+  // resolveEvidenceIds finds two matches, not one, and throws. Two messages
+  // sharing the raw timestamp '170000' under different agent groups reproduces
+  // that ambiguity exactly.
+  it('repairs an evidence id shortened past its agent-group suffix, without dropping the fact', async () => {
+    const evidenceMessages: MemoryCurationArchiveRow[] = [
+      message(1, '170000:ag-1', 'Alice owns the pipeline.'),
+      message(2, '170000:ag-2', 'Bob owns billing.'),
+    ];
+    const curate = vi
+      .fn()
+      .mockResolvedValueOnce({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          // The model shortened the id to the bare timestamp, dropping the
+          // ":<agent_group_id>" suffix — the exact fidelity failure diagnosed.
+          memories: [{ text: 'Alice owns the pipeline.', evidenceIds: ['170000'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      } satisfies CuratorBackendResult)
+      .mockResolvedValueOnce({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'Alice owns the pipeline.', evidenceIds: ['170000:ag-1'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      } satisfies CuratorBackendResult);
+    const d = deps({ curate, messages: () => evidenceMessages });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+
+    expect(report?.action).toBe('replace_generated_memory');
+    expect(curate).toHaveBeenCalledTimes(2);
+    // The corrective instruction names the exact failure mode: copy verbatim,
+    // suffix included, never shorten to the timestamp.
+    expect(curate.mock.calls[1]?.[0]).toContain('copied verbatim');
+    expect(curate.mock.calls[1]?.[0]).toContain(':<agent_group_id>');
+    expect(curate.mock.calls[1]?.[0]).toContain('never shorten an id to just its timestamp');
+    const written = (d.writeGenerated as ReturnType<typeof vi.fn>).mock.calls[0]![1] as string;
+    expect(written).toContain('Alice owns the pipeline.');
+    expect(written).toContain('evidence=170000:ag-1');
+    expect(d.finishCall).toHaveBeenNthCalledWith(1, expect.any(String), 'validation_retry');
+    expect(d.finishCall).toHaveBeenNthCalledWith(2, expect.any(String), 'memory_written');
+    expect(d.complete).toHaveBeenCalledOnce();
+    expect(d.fail).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the offending evidence id out of band when the repair retry still fails', async () => {
+    const evidenceMessages: MemoryCurationArchiveRow[] = [
+      message(1, '170000:ag-1', 'Alice owns the pipeline.'),
+      message(2, '170000:ag-2', 'Bob owns billing.'),
+    ];
+    // Same bad id on every call — the retry starts from a clean prompt, and a
+    // model that keeps shortening the id fails again the same way.
+    const curate = vi.fn(
+      async (): Promise<CuratorBackendResult> => ({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'Alice owns the pipeline.', evidenceIds: ['170000'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      }),
+    );
+    const warnSpy = vi.spyOn(log, 'warn');
+    const d = deps({ curate, messages: () => evidenceMessages });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+
+    expect(report).toBeNull();
+    expect(curate).toHaveBeenCalledTimes(2);
+    expect(d.complete).not.toHaveBeenCalled();
+    // classifyError still classifies this the same way it did before the
+    // fix — 'validation', unperturbed by the id now riding along on the error.
+    expect(d.fail).toHaveBeenCalledWith(episode, 'validation', 1000);
+    expect(warnSpy).toHaveBeenCalledWith(
+      'memory-curator: episode failed',
+      expect.objectContaining({
+        errorClass: 'validation',
+        // The thrown message stays byte-identical — REPAIRABLE_VIOLATIONS and
+        // classifyError both key off this exact string.
+        error: 'curator returned an unknown evidence id',
+        offendingEvidenceId: '170000',
+        submittedEvidenceIds: ['170000'],
+      }),
+    );
+    warnSpy.mockRestore();
+  });
+
   it('offers splitting as the way out of an unshortenable fact, in the prompt and the repair', async () => {
     // The retry after a failed repair starts from a clean prompt with no memory
     // of the failure, so "shorten it but lose nothing" with no third option is
