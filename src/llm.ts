@@ -386,6 +386,11 @@ export async function callClaudeCliStructured<T>(
     const diagnostic = [typeof envelope?.result === 'string' ? envelope.result : '', result.stderr.slice(0, 1000)]
       .filter(Boolean)
       .join(' ');
+    log.warn('structured Claude CLI nonzero exit', {
+      exitCode: result.exitCode,
+      model: request.model,
+      diagnostic: diagnostic.slice(0, 500),
+    });
     throw new ClaudeStructuredCliError(
       `structured Claude CLI call failed with exit ${result.exitCode}`,
       claudeCliStatus(envelope, diagnostic),
