@@ -155,6 +155,52 @@ describe('deriveDefectRegisterItems', () => {
     }
   });
 
+  it('counts the skipped rows in ONE warning, so a degraded parse is visible', () => {
+    // Non-fatal stays non-fatal — an empty feed reads as "nothing is blocked on
+    // a human" — but a silent partial list is indistinguishable from a clean
+    // one, which is how a broken generator ships unnoticed.
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const text = REGISTER.replace(
+      '- **[#202](https://github.com/example-org/example-app/issues/202)** · p2 · filed 2026-08-14 · A second decision',
+      ['- **[#202]** something the generator has never written', '- **[#204]** and another'].join('\n'),
+    );
+    expect(deriveDefectRegisterItems(text, BINDING).items).toHaveLength(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      'Defect register: skipped unparseable rows in the product-decision bucket',
+      expect.objectContaining({ workgroupId: WORKGROUP, unparseable: 2, emitted: 2 }),
+    );
+  });
+
+  it('says nothing on a clean register — a blank line in the bucket is structure, not a broken row', () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    expect(deriveDefectRegisterItems(REGISTER, BINDING).items).toHaveLength(3);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('ignores a Generated header that appears deep in the body', () => {
+    // The regex is multiline, so any matching line anywhere used to make a
+    // hand-edited file report itself freshly generated. The generator writes
+    // the header in the file's opening lines and nowhere else.
+    const text = [
+      '# Open defect register — Example',
+      '',
+      '**quoting the format below**',
+      '',
+      '## product-decision (1)',
+      '',
+      '- **[#201](https://github.com/example-org/example-app/issues/201)** · p1 · filed 2026-08-08 · A decision is owed',
+      '',
+      'The header this generator writes looks like:',
+      '',
+      `*Generated ${GENERATED} by \`ops/gen-defects.py\`.*`,
+      '',
+    ].join('\n');
+    const read = deriveDefectRegisterItems(text, BINDING);
+    expect(read.asOf).toBeNull();
+    expect(read.items).toHaveLength(1); // still the real work, just no freshness claim
+  });
+
   it('emits nothing from a register whose product-decision bucket is empty', () => {
     const text = ['# Register', '', `*Generated ${GENERATED} by \`gen.py\`.*`, '', '## product-decision (0)', ''].join(
       '\n',
@@ -263,29 +309,138 @@ describe('deriveOpenQuestionItems', () => {
     expect(read.items[0]!.since).toBe('');
   });
 
-  it('keys the id on the heading text, so a reorder does not churn it', () => {
+  it('keeps the heading slug as a readable prefix, with a content digest as the identity', () => {
     const read = deriveOpenQuestionItems(QUESTIONS, MTIME, BINDING);
     expect(read.items.map((i) => i.id)).toEqual([
-      'question:process-authority-how-merges-actually-get-authorized',
-      'question:migration-hygiene',
-      'question:seat-provisioning',
+      expect.stringMatching(/^question:process-authority-how-merges-actually-get-authorized-[0-9a-f]{8}$/),
+      expect.stringMatching(/^question:migration-hygiene-[0-9a-f]{8}$/),
+      expect.stringMatching(/^question:seat-provisioning-[0-9a-f]{8}$/),
     ]);
-  });
-
-  it('disambiguates a repeated heading instead of dropping the second one', () => {
-    const text = ['## Seat provisioning', '', 'first', '', '## Seat provisioning', '', 'second'].join('\n');
-    const read = deriveOpenQuestionItems(text, MTIME, BINDING);
-    expect(read.items.map((i) => i.id)).toEqual(['question:seat-provisioning', 'question:seat-provisioning-2']);
-  });
-
-  it('falls back to a positional id when a heading slugifies to nothing', () => {
-    const read = deriveOpenQuestionItems(['## ———', '', 'body'].join('\n'), MTIME, BINDING);
-    expect(read.items[0]!.id).toBe('question:section-1');
   });
 
   it('emits nothing but still reports asOf when the file has no sections', () => {
     const read = deriveOpenQuestionItems('# Title only\n\nsome prose\n', MTIME, BINDING);
     expect(read).toEqual({ asOf: MTIME, items: [] });
+  });
+
+  /**
+   * `observatory_item_assignments` (migration 058) is keyed on this id and is
+   * the assign path's only memory. An id that churns does not fail loudly — the
+   * assignment stops matching, the item reads ownerless again, and a second
+   * Assign dispatches a duplicate task for work already handed over. So every
+   * edit that is not an edit to the section ITSELF must leave its id alone.
+   */
+  describe('ids are content-derived, so edits elsewhere in the document never churn them', () => {
+    const ALPHA = ['## Alpha question', '', 'The alpha claim.'].join('\n');
+    const BETA = ['## Beta question', '', 'The beta claim.'].join('\n');
+    const GAMMA = ['## Gamma question', '', 'The gamma claim.'].join('\n');
+
+    const idsByTitle = (...parts: string[]) =>
+      new Map(deriveOpenQuestionItems(parts.join('\n\n'), MTIME, BINDING).items.map((i) => [i.title, i.id]));
+
+    const base = idsByTitle(ALPHA, BETA, GAMMA);
+
+    it('a reorder leaves every id alone', () => {
+      expect(idsByTitle(GAMMA, ALPHA, BETA)).toEqual(base);
+    });
+
+    it('an insertion in the middle leaves every surviving id alone', () => {
+      const after = idsByTitle(ALPHA, '## Inserted question\n\nA new claim.', BETA, GAMMA);
+      for (const [title, id] of base) expect(after.get(title)).toBe(id);
+    });
+
+    it('a deletion leaves every surviving id alone', () => {
+      const after = idsByTitle(ALPHA, GAMMA);
+      expect(after.get('Alpha question')).toBe(base.get('Alpha question'));
+      expect(after.get('Gamma question')).toBe(base.get('Gamma question'));
+    });
+
+    it('appending narrative to a section does not churn its id', () => {
+      // This document grows by appending updates and counter-arguments inline
+      // over weeks — the whole reason a unique heading's body is not an input.
+      expect(idsByTitle(`${ALPHA}\n\nA counter-argument appended three weeks later.`, BETA, GAMMA)).toEqual(base);
+    });
+  });
+
+  describe('ids for a heading repeated in one document', () => {
+    const dupIds = (...bodies: string[]) =>
+      deriveOpenQuestionItems(bodies.map((b) => `## Seat provisioning\n\n${b}`).join('\n\n'), MTIME, BINDING).items.map(
+        (i) => i.id,
+      );
+
+    it('keeps both, with distinct ids — dropping the second would be a silent loss', () => {
+      const ids = dupIds('first', 'second');
+      expect(ids).toHaveLength(2);
+      expect(new Set(ids).size).toBe(2);
+    });
+
+    it('reordering two repeated headings moves the ids with their bodies', () => {
+      const [first, second] = dupIds('first', 'second');
+      expect(dupIds('second', 'first')).toEqual([second, first]);
+    });
+
+    it('inserting a THIRD identical heading between them churns neither existing id', () => {
+      // The traced failure: under a document-order occurrence counter the
+      // inserted section took `-2` and the section that already held `-2`
+      // became `-3`, silently orphaning its assignment row.
+      const [first, second] = dupIds('first', 'second');
+      expect(dupIds('first', 'inserted', 'second')).toEqual([first, expect.any(String), second]);
+    });
+
+    it('deleting the first leaves the second’s id alone', () => {
+      // Nothing about the id depends on how many siblings share the heading,
+      // so dropping one does not re-key the other.
+      const [, second] = dupIds('first', 'second');
+      expect(dupIds('second')).toEqual([second]);
+    });
+
+    it('two byte-identical sections still get distinct ids', () => {
+      // Nothing but position tells these apart, so an occurrence counter scoped
+      // to that identical group is the honest answer — and reordering two
+      // byte-identical sections is unobservable.
+      const ids = dupIds('same body', 'same body');
+      expect(new Set(ids).size).toBe(2);
+      expect(ids).toEqual([expect.stringMatching(/-1$/), expect.stringMatching(/-2$/)]);
+    });
+
+    it('a third identical-bodied section does not renumber the first two', () => {
+      expect(dupIds('same body', 'same body', 'same body').slice(0, 2)).toEqual(dupIds('same body', 'same body'));
+    });
+  });
+
+  describe('ids for headings that slugify to nothing', () => {
+    it.each([
+      ['all punctuation', '———'],
+      ['all CJK', '未解決の問題'],
+      ['all emoji', '🚢🔥'],
+    ])('gives a %s heading a stable digest id, never a positional one', (_why, title) => {
+      const id = deriveOpenQuestionItems(`## ${title}\n\nbody`, MTIME, BINDING).items[0]!.id;
+      expect(id).toMatch(/^question:[0-9a-f]{8}$/);
+      // And it is unchanged by anything inserted ahead of it — the positional
+      // `section-<n>` fallback churned on ANY earlier edit.
+      expect(deriveOpenQuestionItems(`## Ahead\n\nx\n\n## ${title}\n\nbody`, MTIME, BINDING).items[1]!.id).toBe(id);
+    });
+
+    it('two different empty-slug headings do not collide', () => {
+      const ids = deriveOpenQuestionItems(
+        ['## ———', '', 'a', '', '## 🚢🔥', '', 'b'].join('\n'),
+        MTIME,
+        BINDING,
+      ).items.map((i) => i.id);
+      expect(new Set(ids).size).toBe(2);
+    });
+  });
+
+  it('two headings that slugify identically get different ids', () => {
+    // `slugify` strips everything outside [a-z0-9], so `A/B` and `A B` produce
+    // one slug. Before the digest they collided into a positional `-2`.
+    const ids = deriveOpenQuestionItems(
+      ['## A/B', '', 'a', '', '## A B', '', 'b'].join('\n'),
+      MTIME,
+      BINDING,
+    ).items.map((i) => i.id);
+    expect(new Set(ids).size).toBe(2);
+    expect(ids.every((id) => id.startsWith('question:a-b-'))).toBe(true);
   });
 
   it('emits ownerless rows', () => {
@@ -487,6 +642,116 @@ describe('readDefectRegisterSource', () => {
     fs.writeFileSync(path.join(real, 'defects.md'), REGISTER);
     fs.symlinkSync(real, path.join(groupsRoot, WORKGROUP, 'releases'), 'dir');
     expect(readDefectRegisterSource(DEFECT_DECL, WORKGROUP, Date.now(), { groupsRoot }).items).toHaveLength(3);
+  });
+
+  it('refuses a file past the read cap, and says so', () => {
+    // The declared root is bind-mounted READ-WRITE into this workgroup's own
+    // containers, so file size is an agent's choice and the read is synchronous
+    // on the request path. 3 MiB is over the 2 MiB cap.
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const groupsRoot = groupsRootWith({ 'defects.md': REGISTER });
+    fs.writeFileSync(path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'), 'x'.repeat(3 * 1024 * 1024));
+    expect(readDefectRegisterSource(DEFECT_DECL, WORKGROUP, Date.now(), { groupsRoot })).toEqual({
+      asOf: null,
+      items: [],
+    });
+    expect(warn).toHaveBeenCalledWith(
+      'Defect register: file is larger than the read cap, emitting nothing',
+      expect.objectContaining({ relative: 'defects.md', cap: 2 * 1024 * 1024 }),
+    );
+  });
+
+  it('still reads a file just under the cap', () => {
+    const groupsRoot = groupsRootWith({ 'defects.md': REGISTER });
+    // Padded to exactly one byte under the cap — BYTES, not UTF-16 units: the
+    // register is full of multi-byte separators.
+    const pad = '\n'.repeat(2 * 1024 * 1024 - 1 - Buffer.byteLength(REGISTER, 'utf8'));
+    fs.writeFileSync(path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'), REGISTER + pad);
+    expect(fs.statSync(path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md')).size).toBe(2 * 1024 * 1024 - 1);
+    expect(readDefectRegisterSource(DEFECT_DECL, WORKGROUP, Date.now(), { groupsRoot }).items).toHaveLength(3);
+  });
+
+  it('refuses a declared `file` that is a directory', () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const groupsRoot = groupsRootWith({});
+    fs.mkdirSync(path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'));
+    expect(readDefectRegisterSource(DEFECT_DECL, WORKGROUP, Date.now(), { groupsRoot })).toEqual({
+      asOf: null,
+      items: [],
+    });
+    expect(warn).toHaveBeenCalledWith(
+      'Defect register: not a regular file, emitting nothing',
+      expect.objectContaining({ relative: 'defects.md' }),
+    );
+  });
+
+  it('a component swapped BETWEEN the open and the check cannot smuggle a sibling workgroup’s file in', () => {
+    // The race a path-based check cannot close. `realpathSync` answers a
+    // question about a PATH at one instant; a separate read re-traverses that
+    // path, so an agent with write access to the declared root can have the
+    // OPEN follow a symlink out of the workgroup and then put the real
+    // directory back before the check looks. The check then passes on a path
+    // that no longer describes the file already held open, and the sibling's
+    // contents are read across the data-pool boundary.
+    //
+    // The swap is driven off `openSync` here, which makes winning the race
+    // deterministic instead of a matter of timing. Only a check that asks the
+    // DESCRIPTOR what it holds survives it.
+    vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-desk-'));
+    tmpdirs.push(groupsRoot);
+
+    // The sibling workgroup's register, distinguishable by its issue numbers.
+    const other = path.join(groupsRoot, 'other-workgroup', 'releases');
+    fs.mkdirSync(other, { recursive: true });
+    fs.writeFileSync(path.join(other, 'defects.md'), REGISTER.replace(/#(\d)0(\d)/g, '#$19$2'));
+
+    const own = path.join(groupsRoot, WORKGROUP, 'releases');
+    fs.mkdirSync(path.join(own, 'inner-real'), { recursive: true });
+    fs.writeFileSync(path.join(own, 'inner-real', 'defects.md'), REGISTER);
+    const link = path.join(own, 'inner');
+    // At open time `inner` points OUT of the workgroup…
+    fs.symlinkSync(other, link, 'dir');
+
+    const realOpen = fs.openSync;
+    vi.spyOn(fs, 'openSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+      const fd = (realOpen as (...a: unknown[]) => number)(p, ...rest);
+      if (String(p).endsWith(path.join('inner', 'defects.md'))) {
+        // …and by the time anything re-resolves the path, it points back in.
+        fs.unlinkSync(link);
+        fs.symlinkSync(path.join(own, 'inner-real'), link, 'dir');
+      }
+      return fd;
+    }) as typeof fs.openSync);
+
+    const read = readDefectRegisterSource({ ...DEFECT_DECL, file: 'inner/defects.md' }, WORKGROUP, Date.now(), {
+      groupsRoot,
+    });
+    expect(read).toEqual({ asOf: null, items: [] });
+    // Belt and braces: whatever else happens, the sibling's rows never appear.
+    expect(read.items.map((i) => i.id).join()).not.toContain('#9');
+  });
+
+  it('reads nothing when an intermediate directory is a symlink out of the workgroup', () => {
+    // The same escape without the race: `containedRealpath` already covered a
+    // symlinked LEAF, and this pins the intermediate component too.
+    vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-desk-'));
+    tmpdirs.push(groupsRoot);
+    const other = path.join(groupsRoot, 'other-workgroup', 'releases');
+    fs.mkdirSync(other, { recursive: true });
+    fs.writeFileSync(path.join(other, 'defects.md'), REGISTER);
+
+    const own = path.join(groupsRoot, WORKGROUP, 'releases');
+    fs.mkdirSync(path.join(own, 'inner'), { recursive: true });
+    fs.writeFileSync(path.join(own, 'inner', 'defects.md'), REGISTER);
+    const nested: AttentionSourceDecl = { ...DEFECT_DECL, file: 'inner/defects.md' };
+    // Contained while `inner` is a real directory.
+    expect(readDefectRegisterSource(nested, WORKGROUP, Date.now(), { groupsRoot }).items).toHaveLength(3);
+
+    fs.rmSync(path.join(own, 'inner'), { recursive: true, force: true });
+    fs.symlinkSync(other, path.join(own, 'inner'), 'dir');
+    expect(readDefectRegisterSource(nested, WORKGROUP, Date.now(), { groupsRoot })).toEqual({ asOf: null, items: [] });
   });
 });
 

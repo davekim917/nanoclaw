@@ -23,7 +23,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
-import { containedRealpath, resolveContainedRoot } from './attention-fs.js';
+import { containedRealpath, readContainedFile, resolveContainedRoot } from './attention-fs.js';
 import { readClaims, type BoardClaim } from '../../claims-board.js';
 import { log } from '../../log.js';
 import type {
@@ -202,11 +202,11 @@ export function deriveBoardAttentionItems(
  * Unreadable or malformed returns `{}`, which filters nothing. The safe
  * direction here is showing a stale row, never hiding a live one.
  */
-function readOpenPrState(releasesDir: string): OpenPrState {
-  const statePath = containedRealpath(releasesDir, path.join(releasesDir, '.pr-open-state.json'));
-  if (statePath === null) return {};
+function readOpenPrState(releasesDir: string, workgroupId: string): OpenPrState {
+  const read = readContainedFile('Release board', releasesDir, '.pr-open-state.json', workgroupId);
+  if (read === null) return {};
   try {
-    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { repos?: unknown };
+    const raw = JSON.parse(read.text) as { repos?: unknown };
     return raw.repos && typeof raw.repos === 'object' ? (raw.repos as OpenPrState) : {};
   } catch {
     // Absent is normal until the watcher has run once since this shipped.
@@ -214,7 +214,7 @@ function readOpenPrState(releasesDir: string): OpenPrState {
   }
 }
 
-function readShipRecords(releasesDir: string): GateShipRecord[] {
+function readShipRecords(releasesDir: string, workgroupId: string): GateShipRecord[] {
   const gatesDir = containedRealpath(releasesDir, path.join(releasesDir, 'gates'));
   if (gatesDir === null) return [];
 
@@ -227,19 +227,13 @@ function readShipRecords(releasesDir: string): GateShipRecord[] {
 
   const shipRecords: GateShipRecord[] = [];
   for (const file of gateFiles) {
-    const gatePath = containedRealpath(gatesDir, path.join(gatesDir, file));
-    if (gatePath === null) {
-      log.warn('Release board: gates file absent or escapes the root, skipping', { file });
-      continue;
-    }
-    let text: string;
-    try {
-      text = fs.readFileSync(gatePath, 'utf8');
-    } catch (err) {
-      log.warn('Release board: unreadable gates file, skipping', { file, err });
-      continue;
-    }
-    for (const line of text.split('\n')) {
+    // Containment, size cap and the read are one operation on one descriptor —
+    // see `readContainedFile`. A gates dir is agent-writable like every other
+    // path here, so a per-file check that a later `readFileSync` could outrun
+    // is not a check.
+    const read = readContainedFile('Release board gates', gatesDir, file, workgroupId);
+    if (read === null) continue;
+    for (const line of read.text.split('\n')) {
       if (!line.trim()) continue;
       let rec: { action?: unknown; target?: unknown; ts?: unknown };
       try {
@@ -289,15 +283,12 @@ export function readReleaseBoardSource(
   const releasesDir = resolveContainedRoot('Release board', env.groupsRoot ?? GROUPS_DIR, workgroupId, decl.root);
   if (releasesDir === null) return { asOf: null, items: [] };
 
-  const statePath = containedRealpath(releasesDir, path.join(releasesDir, 'release-state.json'));
-  if (statePath === null) {
-    log.warn('Release board: release-state.json absent or escapes the root, emitting nothing', { workgroupId });
-    return { asOf: null, items: [] };
-  }
+  const state = readContainedFile('Release board', releasesDir, 'release-state.json', workgroupId);
+  if (state === null) return { asOf: null, items: [] };
 
   let releaseState: { asOf?: string; items?: ReleaseStateItem[] };
   try {
-    releaseState = JSON.parse(fs.readFileSync(statePath, 'utf8')) as {
+    releaseState = JSON.parse(state.text) as {
       asOf?: string;
       items?: ReleaseStateItem[];
     };
@@ -314,8 +305,8 @@ export function readReleaseBoardSource(
     return { asOf: null, items: [] };
   }
 
-  const shipRecords = readShipRecords(releasesDir);
-  const openPrs = readOpenPrState(releasesDir);
+  const shipRecords = readShipRecords(releasesDir, workgroupId);
+  const openPrs = readOpenPrState(releasesDir, workgroupId);
 
   const claims =
     env.claimsRoot !== undefined ? readClaims(workgroupId, now, env.claimsRoot) : readClaims(workgroupId, now);
