@@ -46,9 +46,11 @@
  * the seam's cross-source dedupe can never collide two DIFFERENT objects that
  * merely share a number.
  */
+import crypto from 'crypto';
+
 import { GROUPS_DIR } from '../../config.js';
 import { log } from '../../log.js';
-import { containedMtimeIso, readContainedFile, resolveContainedRoot } from './attention-fs.js';
+import { readContainedFile, resolveContainedRoot } from './attention-fs.js';
 import type {
   AttentionSourceDecl,
   AttentionSourceEnv,
@@ -79,15 +81,14 @@ function readDeclaredFile(
   decl: AttentionSourceDecl,
   workgroupId: string,
   env: AttentionSourceEnv,
-): { text: string; rootDir: string; file: string } | null {
+): { text: string; mtimeIso: string } | null {
   if (!decl.file) {
     log.warn(`${label}: declaration carries no \`file\`, emitting nothing`, { workgroupId, kind: decl.kind });
     return null;
   }
   const rootDir = resolveContainedRoot(label, env.groupsRoot ?? GROUPS_DIR, workgroupId, decl.root);
   if (rootDir === null) return null;
-  const text = readContainedFile(label, rootDir, decl.file, workgroupId);
-  return text === null ? null : { text, rootDir, file: decl.file };
+  return readContainedFile(label, rootDir, decl.file, workgroupId);
 }
 
 /* ─── defect-register ──────────────────────────────────────────────────────── */
@@ -111,6 +112,24 @@ const HUMAN_BUCKET = 'product-decision';
 
 /** `*Generated <ts> by `<script>`. Do not hand-edit — rerun it.*` */
 const GENERATED_HEADER = /^\*Generated\s+(\S+)\s+by\b/m;
+
+/**
+ * How far into the file the generated header is looked for.
+ *
+ * The `m` flag makes {@link GENERATED_HEADER} match at ANY line start, so a
+ * file that merely quotes the header line — an excerpt pasted into a section,
+ * a paragraph documenting the format — would report itself freshly generated
+ * on the strength of prose somebody typed. That is the same false freshness
+ * claim this provider refuses to make from the file's mtime, arriving by a
+ * different door.
+ *
+ * The generator writes the header in the file's opening lines, immediately
+ * after the title, so a small head window costs nothing real and removes the
+ * accidental match. It is NOT a defence against a hostile writer, who can put
+ * the line first — the intended threat here is innocent recurrence, and this
+ * is a staleness display cue, not an authorization input.
+ */
+const GENERATED_HEADER_LINES = 10;
 
 /** `## <bucket> (<n>)` — the count is the generator's, and is not read. */
 const BUCKET_HEADING = /^##\s+(\S[^(]*?)\s*(?:\(\d+\))?\s*$/;
@@ -140,10 +159,11 @@ export function deriveDefectRegisterItems(
   text: string,
   binding: { workgroupId: string; channelKey: string },
 ): ProviderRead {
-  const asOf = validIsoOrNull(GENERATED_HEADER.exec(text)?.[1]);
+  const asOf = validIsoOrNull(GENERATED_HEADER.exec(text.split('\n', GENERATED_HEADER_LINES).join('\n'))?.[1]);
 
   const items: ProvidedAttentionItem[] = [];
   let bucket: string | null = null;
+  let unparseable = 0;
   for (const raw of text.split('\n')) {
     const heading = BUCKET_HEADING.exec(raw);
     if (heading) {
@@ -152,7 +172,15 @@ export function deriveDefectRegisterItems(
     }
     if (bucket !== HUMAN_BUCKET) continue;
     const m = DEFECT_LINE.exec(raw);
-    if (!m) continue;
+    if (!m) {
+      // Skipping stays non-fatal — see the note above — but a degraded parse
+      // must not read identically to a clean one, so the skips are counted and
+      // reported ONCE below. A blank line inside the bucket is structure, not a
+      // broken row, and the generator writes several; counting those would warn
+      // on every healthy read and train the reader to ignore the line.
+      if (raw.trim() !== '') unparseable++;
+      continue;
+    }
 
     const number = m[1]!;
     const url = m[2]!;
@@ -185,6 +213,13 @@ export function deriveDefectRegisterItems(
       nextAction: `Decide #${number}`,
     });
   }
+  if (unparseable > 0) {
+    log.warn(`${DEFECT_LABEL}: skipped unparseable rows in the ${HUMAN_BUCKET} bucket`, {
+      workgroupId: binding.workgroupId,
+      unparseable,
+      emitted: items.length,
+    });
+  }
   return { asOf, items };
 }
 
@@ -209,6 +244,13 @@ const H2 = /^##\s+(\S.*?)\s*$/;
 /** How much of a section's opening paragraph rides along as the note. */
 const EXCERPT_CHARS = 160;
 
+/**
+ * A readable, URL-safe prefix for an id — NOT the id, and never the identity.
+ *
+ * Strips everything outside `[a-z0-9]`, so an all-CJK, all-emoji or
+ * all-punctuation heading legitimately slugifies to the empty string. That is
+ * handled by {@link questionIds}, which never lets the slug be the whole id.
+ */
 function slugify(heading: string): string {
   return heading
     .toLowerCase()
@@ -216,6 +258,11 @@ function slugify(heading: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 64)
     .replace(/-+$/, '');
+}
+
+/** A short, stable digest of a string. Content in, the same 8 hex out, forever. */
+function digest(value: string): string {
+  return crypto.createHash('sha256').update(value, 'utf8').digest('hex').slice(0, 8);
 }
 
 /**
@@ -244,6 +291,8 @@ function slugify(heading: string): string {
  * written, so it is an upper bound — the row understates how long the item has
  * waited rather than inflating it. An unreadable mtime leaves `since` empty,
  * which the console reads as unmeasured and sorts last (§12), never as zero.
+ *
+ * ## Ids are derived from CONTENT, never from position — see {@link questionIds}
  */
 export function deriveOpenQuestionItems(
   text: string,
@@ -251,8 +300,7 @@ export function deriveOpenQuestionItems(
   binding: { workgroupId: string; channelKey: string },
 ): ProviderRead {
   const lines = text.split('\n');
-  const items: ProvidedAttentionItem[] = [];
-  const seen = new Map<string, number>();
+  const sections: { title: string; excerpt: string }[] = [];
 
   for (let i = 0; i < lines.length; i++) {
     const heading = H2.exec(lines[i]!);
@@ -267,37 +315,96 @@ export function deriveOpenQuestionItems(
     for (; j < lines.length && lines[j]!.trim() !== '' && !H2.test(lines[j]!); j++)
       paragraph.push(lines[j]!.trim().replace(/^[-*]\s+/, ''));
 
-    const excerpt = paragraph.join(' ').replace(/[*`]/g, '').replace(/\s+/g, ' ').trim();
-    const note = excerpt.length > EXCERPT_CHARS ? `${excerpt.slice(0, EXCERPT_CHARS).trimEnd()}…` : excerpt;
+    sections.push({ title, excerpt: paragraph.join(' ').replace(/[*`]/g, '').replace(/\s+/g, ' ').trim() });
+  }
 
-    // Keyed on the HEADING, not on position: an assignment record (migration
-    // 058) is stored against the natural id, and an index-keyed id would churn
-    // every time somebody reorders the document. A repeated heading is a defect
-    // in the document, but dropping the second one would be a silent loss, so
-    // it disambiguates in document order instead.
-    const base = slugify(title) || `section-${items.length + 1}`;
-    const n = (seen.get(base) ?? 0) + 1;
-    seen.set(base, n);
-
-    items.push({
-      id: `question:${base}${n > 1 ? `-${n}` : ''}`,
+  const ids = questionIds(sections);
+  const items: ProvidedAttentionItem[] = sections.map((section, index) => {
+    const note =
+      section.excerpt.length > EXCERPT_CHARS
+        ? `${section.excerpt.slice(0, EXCERPT_CHARS).trimEnd()}…`
+        : section.excerpt;
+    return {
+      id: `question:${ids[index]!}`,
       channel_key: binding.channelKey,
-      title,
+      title: section.title,
       // No per-section link exists in the document. Never invented.
       url: null,
       workgroupId: binding.workgroupId,
       claimState: 'parked',
-      claimNote: `waiting on a human: ${note || title}`,
+      claimNote: `waiting on a human: ${note || section.title}`,
       claimOwner: null,
       participants: [],
       sessionCount: 0,
       since: mtimeIso ?? '',
       nextAction: 'Answer this open question',
-    });
-  }
+    };
+  });
   // No section headings at all is a real answer ("nothing is open"), not a
   // failure — but a readable file always has an mtime, so `asOf` still stands.
   return { asOf: mtimeIso, items };
+}
+
+/**
+ * One id per section, derived from what the section SAYS and not from where it
+ * sits in the document.
+ *
+ * ## Why position may not enter into it
+ *
+ * `observatory_item_assignments` (migration 058) is keyed
+ * `(workgroup_id, item_id)` on this id with no prefix. It is the only memory
+ * the assign path has: it is what stops a second press dispatching a second
+ * task, at possibly a second agent, for work already handed over. An id that
+ * changes when the document is edited does not fail loudly — the assignment
+ * row simply stops matching, the item reads ownerless again, and the duplicate
+ * dispatch the table exists to prevent goes out.
+ *
+ * So an id may depend only on that section's own text. Reordering sections,
+ * inserting one, and deleting one must all leave every surviving id alone.
+ *
+ * ## The three cases
+ *
+ *  - **The ordinary case** keys on the heading plus the section's OPENING
+ *    PARAGRAPH: `<slug>-<digest>`. Neither half is optional. `slugify` strips
+ *    everything outside `[a-z0-9]`, so `A/B` and `A B` produce the same slug
+ *    and an all-CJK, all-emoji or all-punctuation heading produces none at all;
+ *    the digest is what keeps those distinct and what gives the empty-slug
+ *    heading a stable id instead of the positional `section-<n>` it used to
+ *    get. The slug survives only so the id stays readable.
+ *  - **A heading repeated with a different opening paragraph** — a defect in
+ *    the document, but the second one must neither be dropped nor collide —
+ *    falls out for free: different paragraph, different digest. No occurrence
+ *    counter, so reordering, inserting and deleting duplicates all leave the
+ *    survivors' ids untouched.
+ *  - **Two sections identical in both heading and opening paragraph** have
+ *    nothing but position telling them apart, so an occurrence counter scoped
+ *    to that exact identical group is the honest answer. Reordering two
+ *    identical sections is unobservable, and a third appends `-3` without
+ *    touching the other two.
+ *
+ * ## What this deliberately does not protect
+ *
+ * Rewriting a section's OPENING PARAGRAPH changes its id. That is the one
+ * accepted churn, and it is the right one to accept: this document grows by
+ * appending updates and counter-arguments BELOW the opening claim, so ordinary
+ * growth does not touch the key, and on the rare occasion the opening claim
+ * itself is rewritten the row's own note visibly changes with it — unlike a
+ * positional id, which churned while the row looked identical.
+ */
+function questionIds(sections: { title: string; excerpt: string }[]): string[] {
+  const total = new Map<string, number>();
+  const key = (s: { title: string; excerpt: string }) => `${s.title}\u0000${s.excerpt}`;
+  for (const s of sections) total.set(key(s), (total.get(key(s)) ?? 0) + 1);
+
+  const nth = new Map<string, number>();
+  return sections.map((s) => {
+    const slug = slugify(s.title);
+    const natural = slug ? `${slug}-${digest(key(s))}` : digest(key(s));
+    if (total.get(key(s)) === 1) return natural;
+    const n = (nth.get(key(s)) ?? 0) + 1;
+    nth.set(key(s), n);
+    return `${natural}-${n}`;
+  });
 }
 
 export function readOpenQuestionsSource(
@@ -308,7 +415,10 @@ export function readOpenQuestionsSource(
 ): ProviderRead {
   const read = readDeclaredFile(QUESTIONS_LABEL, decl, workgroupId, env);
   if (read === null) return EMPTY;
-  return deriveOpenQuestionItems(read.text, containedMtimeIso(read.rootDir, read.file), {
+  // The mtime rides along from the SAME open as the text, so the freshness
+  // claim is about the bytes just read rather than about whatever the path
+  // resolves to a moment later. See `readContainedFile`.
+  return deriveOpenQuestionItems(read.text, read.mtimeIso, {
     workgroupId,
     channelKey: decl.channel_key,
   });

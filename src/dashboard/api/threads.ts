@@ -1818,17 +1818,55 @@ export async function buildThreadList(
   });
 
   if (attentionThreads.length === 0) return { threads };
-  // Merged into ONE queue, never a separate inbox (§2). Sorted on the same
-  // axis as the session rows — freshest first — and re-capped, so an install
-  // with a busy board cannot push live threads off the page by arriving after
-  // the slice.
-  const merged = [...threads, ...attentionThreads]
-    .sort(
-      (a, b) =>
-        (parseUtcTimestampMs(b.last_activity_at) ?? -Infinity) - (parseUtcTimestampMs(a.last_activity_at) ?? -Infinity),
-    )
-    .slice(0, opts.limit);
+  // Merged into ONE queue, never a separate inbox (§2), and sorted on the same
+  // axis as the session rows — freshest first — so the wire order is one order.
+  //
+  // But the two kinds are capped SEPARATELY and the merged list is not re-cut.
+  // A single cap over the merged list would have been a recency cutoff wearing
+  // a different hat: `last_activity_at` on one of these rows is `item.since`,
+  // the moment it STARTED waiting, so the longer an item had been blocked on a
+  // human the further down it sorted and the sooner the cap dropped it — the
+  // most-stalled item is the first to disappear, which is precisely the
+  // invisibility `selectScopedAttentionItems` had its `since_hours` window
+  // lifted to end (two items unclaimed for 21-22 days, operator report
+  // 2026-08-20). Age must decide ORDER and never membership.
+  //
+  // Each kind therefore gets its own budget of `limit`: session threads were
+  // already cut to `limit` above, so a busy board cannot push a live thread off
+  // the page, and a busy workgroup cannot push a stalled item off it either.
+  // The trade is that one page can carry up to 2x `limit` rows — deliberate,
+  // because the alternative is one lane starving the other, which is the bug.
+  const merged = [...threads, ...cappedByAge(attentionThreads, opts.limit)].sort(
+    (a, b) =>
+      (parseUtcTimestampMs(b.last_activity_at) ?? -Infinity) - (parseUtcTimestampMs(a.last_activity_at) ?? -Infinity),
+  );
   return { threads: merged };
+}
+
+/**
+ * At most `limit` attention rows, keeping the OLDEST — the ones that have been
+ * blocked on a human longest.
+ *
+ * The direction is the whole point. These rows are bounded only by files an
+ * agent writes, so some cap has to exist; sorting oldest-first before it means
+ * that if the cap ever bites it drops the freshest arrival rather than the
+ * item nobody has looked at in three weeks.
+ *
+ * A row with no measurable age sorts LAST here and is dropped first, matching
+ * the console's own rule (§12, `compareByActivity`): unmeasured is not a
+ * position on a time axis, and letting `-Infinity` stand in for "oldest" would
+ * float every undated row past real, measured waits.
+ */
+function cappedByAge(rows: ThreadSummary[], limit: number): ThreadSummary[] {
+  if (rows.length <= limit) return rows;
+  return [...rows]
+    .sort((a, b) => {
+      const am = parseUtcTimestampMs(a.last_activity_at);
+      const bm = parseUtcTimestampMs(b.last_activity_at);
+      if (am === null || bm === null) return (am === null ? 1 : 0) - (bm === null ? 1 : 0);
+      return am - bm;
+    })
+    .slice(0, limit);
 }
 
 export const threadsHandler: AuthHandler = async (req, _params, ctx) => {
