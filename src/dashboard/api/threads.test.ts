@@ -1669,6 +1669,10 @@ describe('attention-source rows in the thread list', () => {
     expect(row.attention_source).toEqual({
       kind: 'release-board',
       as_of: '2026-08-20T11:30:00.000Z',
+      // This declaration names no `refresh_hours`, so no staleness claim is
+      // made. Null, never `false`: nobody said what this source's cadence is,
+      // and "we never checked" must not render as a clean bill (§12).
+      stale: null,
       url: 'https://github.com/example-org/example-app/pull/817',
       next_action: '@releasebot ship 817',
       // Nobody has been handed it yet. Explicitly null rather than absent —
@@ -1715,6 +1719,36 @@ describe('attention-source rows in the thread list', () => {
       // measure. Null, never zero (§12).
       parked_ms: null,
     });
+  });
+
+  it('a source past its declared cadence produces its own needs_you row, beside the work it was hiding', async () => {
+    // The self-reporting half: a generator that stopped running is work that
+    // stopped, so it enters the SAME queue as everything else rather than
+    // being a footnote on rows that happen to survive. Emitted by the seam,
+    // never by the provider — §12: "the thing that notices silence cannot be
+    // the thing that went silent."
+    declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: 6 }]));
+    const { threads } = await buildThreadList(
+      makeCtx(),
+      LIST_OPTS,
+      // Board generated a week before `now`, against a 6h declared cadence.
+      attentionDeps(boardRoot([readyPr()], iso(7 * 24 * 3_600_000))),
+    );
+
+    const notice = threads.find((t) => t.thread_id.includes('stale:'))!;
+    expect(notice.thread_id).toBe(`${ATTENTION_ITEM_PREFIX}stale:release-board:releases`);
+    expect(notice.state).toBe('needs_you');
+    expect(notice.needs_you_reason?.cause).toBe('parked_note');
+    expect(notice.needs_you_reason?.text).toMatch(/waiting on a human: release-board last regenerated 7d ago/);
+    // An item id is never a thread id, so it can never mint a sidebar bucket
+    // (§3.2) — it lands in the source's own declared channel instead.
+    expect(notice.channel_key).toBe(CHANNEL_KEY);
+
+    // Mark, never hide: the board's real row is still here, and now wears its
+    // own source's staleness rather than an aggregate over the whole feed.
+    const pr = threads.find((t) => t.thread_id === `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`)!;
+    expect(pr.attention_source?.stale).toBe(true);
+    expect(notice.attention_source?.stale).toBe(true);
   });
 
   it('an ownerless item with no waiting-on note reaches unassigned, not needs_you', async () => {
