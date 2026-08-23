@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { ATTENTION_ITEM_PREFIX, ATTENTION_MEMO_TTL_MS, clearAttentionMemo } from '../../attention-sources.js';
+import { ASSIGN_DEDUPE_MS } from '../db/item-assignments.js';
 import type { AuthedRequestContext } from '../router.js';
 import type { ContainerState } from '../../db/session-db.js';
 import type { SessionTranscriptEntry } from './sessions.js';
@@ -1673,6 +1674,7 @@ describe('attention-source rows in the thread list', () => {
       // Nobody has been handed it yet. Explicitly null rather than absent —
       // §12: undeclared must never read the same as declared-and-empty.
       assigned: null,
+      assigned_expired: null,
     });
   });
 
@@ -2140,6 +2142,30 @@ describe('attention-source rows in the thread list', () => {
         at: '2026-08-20T12:00:00.000Z',
         by: 'Olive Owner',
       });
+    });
+
+    it("a reservation older than the write side's own re-assign window is not presented as assigned", async () => {
+      // The exact same offset `assign.test.ts` uses to prove the WRITE side
+      // allows a re-assign past this point — the read side must agree.
+      const staleAt = new Date(NOW - ASSIGN_DEDUPE_MS - 1000).toISOString();
+      record('EXAMPLE-APP#817', staleAt);
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+      // Not deleted, not silently dropped — moved to `assigned_expired` so the
+      // operator can tell "someone was asked and it did not take" apart from
+      // "nobody has been asked", while the row itself is assignable again.
+      expect(threads[0]!.attention_source!.assigned).toBeNull();
+      expect(threads[0]!.attention_source!.assigned_expired).toEqual({
+        agent_group_id: 'ag-example',
+        agent_name: 'persona:ag-example',
+        at: staleAt,
+        by: 'Olive Owner',
+      });
+      // The row itself never disappears or mutates in the DB — a read must not
+      // clean up what a sweep should own instead.
+      const row = getDb()
+        .prepare(`SELECT assigned_at FROM observatory_item_assignments WHERE item_id = 'EXAMPLE-APP#817'`)
+        .get() as { assigned_at: string };
+      expect(row.assigned_at).toBe(staleAt);
     });
 
     it('stays `unassigned` — no session exists until the agent speaks, and the state says only that', async () => {
