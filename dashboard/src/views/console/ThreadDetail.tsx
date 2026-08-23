@@ -172,7 +172,10 @@ export function ThreadDetail({ thread, focusComposer = 0, nextAction, onSent }: 
               than a plain sentence. */}
           {thread.attention_source && (
             <div className="ncc-detail-source">
-              <span className="when">
+              <span className={`when${thread.attention_source.stale === true ? ' stale' : ''}`}>
+                {/* Only `true` prints. `null` is "no cadence declared" — nobody
+                    checked — and §12 forbids rendering that like a clean bill. */}
+                {thread.attention_source.stale === true && 'stale · '}
                 {thread.attention_source.kind}
                 {thread.attention_source.as_of
                   ? ` · board ${relAge(thread.attention_source.as_of)} old`

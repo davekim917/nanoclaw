@@ -104,7 +104,11 @@ function sourceTitle(thread: ThreadSummary): string {
   const source = thread.attention_source;
   if (!source) return '';
   const when = source.as_of ? `as of ${source.as_of}` : 'source could not be read';
-  return `${source.kind} — ${when}. Next: ${source.next_action}`;
+  // Only `true` says anything. `null`/absent is "no cadence declared", which is
+  // nobody having checked — spelling that out as "fresh" would be exactly the
+  // undeclared-reads-as-independent failure (§12).
+  const fresh = source.stale === true ? ' PAST ITS EXPECTED REFRESH.' : '';
+  return `${source.kind} — ${when}.${fresh} Next: ${source.next_action}`;
 }
 
 export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelect, onVerb }: ThreadRowProps) {
@@ -227,19 +231,33 @@ export function ThreadRow({ thread, preview, selected, now = Date.now(), onSelec
                 <span aria-hidden="true">·</span>
                 <span className="age">{age}</span>
                 {/*
-                 * Board provenance, and how old the board itself is.
+                 * Board provenance, and how old THIS ROW'S OWN source is —
+                 * `as_of` is per source, so a row from a board refreshed
+                 * minutes ago reads that way even when a sibling source on the
+                 * same page has been dead for a week.
                  *
                  * NOT a suppression signal — there is no staleness threshold
                  * anywhere in this path, on purpose. A stale feed showing real
                  * work with a visible age is strictly better than an empty
                  * feed, because an empty feed is indistinguishable from a
                  * healthy one, and "nothing is blocked on a human" is the one
-                 * lie this row exists to prevent.
+                 * lie this row exists to prevent. `stale` therefore only ever
+                 * adds a word; it never removes a row.
+                 *
+                 * The word LEADS, for the same reason the park age does: a
+                 * marker clipped off the end of a 390px ellipsis is a marker
+                 * that does not exist. Only `stale === true` prints — `null`
+                 * means no cadence was declared, and an unmarked row means
+                 * nobody said rather than "checked and fine" (§12).
                  */}
                 {thread.attention_source && (
                   <>
                     <span aria-hidden="true">·</span>
-                    <span className="ncc-row-source" title={sourceTitle(thread)}>
+                    <span
+                      className={`ncc-row-source${thread.attention_source.stale === true ? ' stale' : ''}`}
+                      title={sourceTitle(thread)}
+                    >
+                      {thread.attention_source.stale === true && 'stale · '}
                       {thread.attention_source.kind}
                       {thread.attention_source.as_of
                         ? ` ${relAge(thread.attention_source.as_of, now)} old`

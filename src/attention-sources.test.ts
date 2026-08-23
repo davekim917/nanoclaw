@@ -12,7 +12,10 @@ import {
   isAttentionItemId,
   parseAttentionSources,
   readAttentionItems,
+  sourceStaleness,
+  type AttentionItem,
 } from './attention-sources.js';
+import { threadChannelKey, UNKNOWN_CHANNEL_KEY } from './dashboard/api/threads.js';
 import { closeDb, getDb, initTestDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 
@@ -24,6 +27,13 @@ import { runMigrations } from './db/migrations/index.js';
 const WORKGROUP = 'example-labs';
 const CHANNEL_KEY = 'slack:CEXAMPLE001';
 const ASOF = '2026-08-22T12:01:41Z';
+
+/** "Now" for every staleness test, so no test depends on the wall clock. */
+const NOW = Date.parse('2026-08-23T12:00:00Z');
+/** 90 minutes before {@link NOW} — inside any cadence these tests declare. */
+const FRESH = '2026-08-23T10:30:00Z';
+/** Seven days before {@link NOW} — past every cadence these tests declare. */
+const WEEK_OLD = '2026-08-16T12:00:00Z';
 
 const tmpdirs: string[] = [];
 
@@ -55,6 +65,31 @@ function readyPr(over: Record<string, unknown> = {}): Record<string, unknown> {
     nextAction: '@releasebot ship 817',
     ...over,
   };
+}
+
+/** A defect register generated at `asOf`, carrying one `product-decision` row. */
+function defectRegister(asOf: string): string {
+  return [
+    `*Generated ${asOf} by \`gen.py\`.*`,
+    '',
+    '## product-decision (1)',
+    '',
+    '- **[#201](https://github.com/example-org/example-app/issues/201)** · p1 · filed 2026-08-08 · A decision is owed',
+  ].join('\n');
+}
+
+/** A defect register generated at `asOf` with NO open rows — the silent-generator case. */
+function emptyDefectRegister(asOf: string): string {
+  return [`*Generated ${asOf} by \`gen.py\`.*`, '', '## product-decision (0)', ''].join('\n');
+}
+
+/** Every item this workgroup emits at {@link NOW}, grouped by the source that produced it. */
+function itemsByKind(groupsRoot: string): Map<string, AttentionItem[]> {
+  const out = new Map<string, AttentionItem[]>();
+  for (const item of readAttentionItems(WORKGROUP, NOW, { groupsRoot, claimsRoot: tmp('nc-attn-claims-') }).items) {
+    out.set(item.sourceKind, [...(out.get(item.sourceKind) ?? []), item]);
+  }
+  return out;
 }
 
 function declare(value: string | null): void {
@@ -152,7 +187,6 @@ describe('readAttentionItems', () => {
     declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
     const groupsRoot = boardRoot([readyPr()]);
     const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
-    expect(read.asOf).toBe(ASOF);
     expect(read.items).toHaveLength(1);
     expect(read.items[0]!.channel_key).toBe(CHANNEL_KEY);
     expect(read.items[0]!.sourceKind).toBe('release-board');
@@ -171,7 +205,7 @@ describe('readAttentionItems', () => {
     const debug = vi.spyOn(log, 'debug').mockImplementation(() => {});
     declare(null);
     const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot: boardRoot([readyPr()]) });
-    expect(read).toEqual({ asOf: null, items: [] });
+    expect(read).toEqual({ items: [] });
     expect(debug).toHaveBeenCalledWith('Attention sources: none declared', expect.objectContaining({}));
   });
 
@@ -179,7 +213,7 @@ describe('readAttentionItems', () => {
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
     declare('[{"kind":"release-board","root":"../escape","channel_key":"slack:CEXAMPLE001"}]');
     const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot: boardRoot([readyPr()]) });
-    expect(read).toEqual({ asOf: null, items: [] });
+    expect(read).toEqual({ items: [] });
     expect(warn).toHaveBeenCalledWith(
       'Attention sources: malformed declaration, emitting nothing for this workgroup',
       expect.objectContaining({ workgroupId: WORKGROUP }),
@@ -228,7 +262,7 @@ describe('readAttentionItems', () => {
 
     fs.rmSync(path.join(groupsRoot, WORKGROUP, 'releases'), { recursive: true, force: true });
     const after = readAttentionItems(WORKGROUP, t0 + ATTENTION_MEMO_TTL_MS, { groupsRoot, claimsRoot });
-    expect(after).toEqual({ asOf: null, items: [] });
+    expect(after).toEqual({ items: [] });
   });
 
   it('shows a defect AND the PR that fixes it, even when they share a number', () => {
@@ -263,20 +297,23 @@ describe('readAttentionItems', () => {
     expect(read.items.map((i) => i.sourceKind)).toEqual(['release-board', 'defect-register']);
   });
 
-  it('reports the OLDEST asOf across sources, so a fresh one cannot vouch for a stale one', () => {
-    const groupsRoot = boardRoot([readyPr()]);
-    fs.writeFileSync(
-      path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'),
-      ['*Generated 2026-08-16T14:52:24Z by `gen.py`.*', '', '## product-decision (0)', ''].join('\n'),
-    );
+  it('a stale source never drags a fresh sibling back with it — each row wears its OWN age', () => {
+    // The regression this whole per-source design exists for. One generator
+    // (`defects.md`) last ran a week before the board did; the aggregate this
+    // seam used to return took the OLDEST contributor, so a board refreshed
+    // ninety minutes ago reported as seven days old and no reader could tell
+    // WHICH source had actually died.
+    const groupsRoot = boardRoot([readyPr()], FRESH);
+    fs.writeFileSync(path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'), defectRegister(WEEK_OLD));
     declare(
       JSON.stringify([
         { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY },
         { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
       ]),
     );
-    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
-    expect(read.asOf).toBe('2026-08-16T14:52:24Z');
+    const byKind = itemsByKind(groupsRoot);
+    expect(byKind.get('release-board')!.map((i) => i.sourceAsOf)).toEqual([FRESH]);
+    expect(byKind.get('defect-register')!.map((i) => i.sourceAsOf)).toEqual([WEEK_OLD]);
   });
 
   it('stamps every new provider kind with an id that can never be read as a thread id', () => {
@@ -351,5 +388,233 @@ describe('readAttentionItems', () => {
     // …and well under the ~30-minute regeneration cadence of the source, so
     // freshness stays bounded by the watcher rather than by this cache.
     expect(ATTENTION_MEMO_TTL_MS).toBeLessThan(30 * 60 * 1000 * 0.25);
+  });
+});
+
+/**
+ * Per-source freshness, and the synthetic item a dead source produces.
+ *
+ * The bug these pin: the seam used to collapse every source's freshness into
+ * ONE aggregate by taking the oldest, so a single generator that had stopped
+ * running made the whole feed report as a week stale — a board refreshed ninety
+ * minutes ago included — and no reader could tell which source had died.
+ * "Everything is stale" is the same lie as "nothing is blocked".
+ */
+describe('per-source staleness', () => {
+  /** A groups root with a fresh release board plus a `defects.md` you control. */
+  function twoSources(opts: {
+    defectAsOf: string;
+    refreshHours?: number;
+    register?: (asOf: string) => string;
+  }): string {
+    const groupsRoot = boardRoot([readyPr()], FRESH);
+    fs.writeFileSync(
+      path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'),
+      (opts.register ?? defectRegister)(opts.defectAsOf),
+    );
+    declare(
+      JSON.stringify([
+        // The board declares a cadence too, and meets it — so this fixture also
+        // proves a stale sibling cannot reach across and mark it.
+        { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: 6 },
+        {
+          kind: 'defect-register',
+          root: 'releases',
+          channel_key: CHANNEL_KEY,
+          file: 'defects.md',
+          ...(opts.refreshHours === undefined ? {} : { refresh_hours: opts.refreshHours }),
+        },
+      ]),
+    );
+    return groupsRoot;
+  }
+
+  /** The one synthetic notice among a source's items, or undefined. */
+  function notice(items: AttentionItem[]): AttentionItem | undefined {
+    return items.find((i) => i.id.startsWith(`${ATTENTION_ITEM_PREFIX}stale:`));
+  }
+
+  describe('sourceStaleness', () => {
+    it('is null when no cadence is declared — absence is not evidence of freshness', () => {
+      expect(sourceStaleness(WEEK_OLD, undefined, NOW)).toBeNull();
+    });
+
+    it('is null when the age is unknown — unknown is not stale', () => {
+      expect(sourceStaleness(null, 6, NOW)).toBeNull();
+    });
+
+    it('is null on an unparseable timestamp — a fact about our parser, not about the generator', () => {
+      expect(sourceStaleness('whenever', 6, NOW)).toBeNull();
+    });
+
+    it('is true past the cadence and false inside it, on the boundary the doc states', () => {
+      const at = Date.parse(FRESH);
+      // Strictly greater-than: exactly on the hour is not yet late.
+      expect(sourceStaleness(FRESH, 1.5, at + 1.5 * 3_600_000)).toBe(false);
+      expect(sourceStaleness(FRESH, 1.5, at + 1.5 * 3_600_000 + 1)).toBe(true);
+    });
+  });
+
+  describe('refresh_hours validation', () => {
+    it('carries a well-formed cadence through', () => {
+      expect(
+        parseAttentionSources(
+          `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","refresh_hours":6}]`,
+        ),
+      ).toEqual([{ kind: 'defect-register', root: 'r', channel_key: CHANNEL_KEY, refresh_hours: 6 }]);
+    });
+
+    it('omits it entirely when undeclared, rather than setting it undefined', () => {
+      expect(
+        parseAttentionSources(`[{"kind":"release-board","root":"releases","channel_key":"${CHANNEL_KEY}"}]`)![0]!,
+      ).not.toHaveProperty('refresh_hours');
+    });
+
+    it.each([
+      ['a string cadence', `[{"kind":"d","root":"r","channel_key":"${CHANNEL_KEY}","refresh_hours":"6h"}]`],
+      ['a zero cadence', `[{"kind":"d","root":"r","channel_key":"${CHANNEL_KEY}","refresh_hours":0}]`],
+      ['a negative cadence', `[{"kind":"d","root":"r","channel_key":"${CHANNEL_KEY}","refresh_hours":-1}]`],
+      ['a null cadence', `[{"kind":"d","root":"r","channel_key":"${CHANNEL_KEY}","refresh_hours":null}]`],
+    ])('fails the workgroup closed on %s, exactly like a bad root', (_why, raw) => {
+      // Degrading to "no claim" would be indistinguishable from the operator
+      // having chosen not to declare a cadence, so a typo would silently take
+      // the staleness signal away while looking like a healthy config.
+      expect(parseAttentionSources(raw)).toBeNull();
+    });
+  });
+
+  it('marks ONLY the rows from the stale source; a fresh sibling stays unmarked', () => {
+    const byKind = itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 }));
+    expect(byKind.get('release-board')!.map((i) => i.sourceStale)).toEqual([false]);
+    // The register's own row, plus the synthetic notice about the register.
+    expect(byKind.get('defect-register')!.map((i) => i.sourceStale)).toEqual([true, true]);
+  });
+
+  it('makes NO staleness claim when the source declares no cadence — and emits no notice', () => {
+    // Not "fresh", not "stale". Nobody said. A default here would either invent
+    // a deadline every source is suddenly late for, or vouch for a generator
+    // that died months ago.
+    const items = itemsByKind(twoSources({ defectAsOf: WEEK_OLD })).get('defect-register')!;
+    expect(items.map((i) => i.sourceStale)).toEqual([null]);
+    expect(notice(items)).toBeUndefined();
+  });
+
+  it('emits no notice for a source whose asOf is unknown — unknown is not stale', () => {
+    // A register with its `Generated` header stripped reports `asOf: null`. Its
+    // rows are still real work and still emit; they just carry no claim.
+    const groupsRoot = boardRoot([]);
+    fs.writeFileSync(
+      path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'),
+      defectRegister(WEEK_OLD).split('\n').slice(1).join('\n'),
+    );
+    declare(
+      JSON.stringify([
+        { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md', refresh_hours: 24 },
+      ]),
+    );
+    const items = itemsByKind(groupsRoot).get('defect-register')!;
+    expect(items.map((i) => i.sourceAsOf)).toEqual([null]);
+    expect(items.map((i) => i.sourceStale)).toEqual([null]);
+    expect(notice(items)).toBeUndefined();
+  });
+
+  it('emits EXACTLY ONE notice per stale source, however many rows that source produced', () => {
+    const groupsRoot = boardRoot([]);
+    fs.writeFileSync(
+      path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'),
+      [
+        `*Generated ${WEEK_OLD} by \`gen.py\`.*`,
+        '',
+        '## product-decision (3)',
+        '',
+        '- **[#201](https://github.com/example-org/example-app/issues/201)** · p1 · filed 2026-08-08 · One',
+        '- **[#202](https://github.com/example-org/example-app/issues/202)** · p1 · filed 2026-08-08 · Two',
+        '- **[#203](https://github.com/example-org/example-app/issues/203)** · p2 · filed 2026-08-08 · Three',
+      ].join('\n'),
+    );
+    declare(
+      JSON.stringify([
+        { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md', refresh_hours: 24 },
+      ]),
+    );
+    const items = itemsByKind(groupsRoot).get('defect-register')!;
+    expect(items.filter((i) => i.id.startsWith(`${ATTENTION_ITEM_PREFIX}stale:`))).toHaveLength(1);
+    expect(items).toHaveLength(4);
+  });
+
+  it('emits the notice even when the stale source produced NO rows at all', () => {
+    // The case that matters most: a generator that stopped is at its most
+    // invisible when its last output happened to be empty.
+    const items = itemsByKind(
+      twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24, register: emptyDefectRegister }),
+    ).get('defect-register')!;
+    expect(items).toHaveLength(1);
+    expect(notice(items)).toBeDefined();
+  });
+
+  it('routes the notice into `needs_you`, dates it from when the source went stale, and keeps a stable id', () => {
+    const items = itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 })).get('defect-register')!;
+    const item = notice(items)!;
+
+    // `waiting on` verbatim is the ONLY thing that routes a parked row into
+    // `needs_you` (`WAITING_ON_NOTE` in threads.ts). Without it the notice
+    // lands in `unassigned` and reads as backlog rather than as an alarm.
+    expect(item.claimState).toBe('parked');
+    expect(item.claimNote).toMatch(/\bwaiting on\b/i);
+    expect(item.claimNote).toContain('defect-register');
+    expect(item.claimNote).toContain('7d');
+    // `since` is when it WENT stale, never the read time: the age-fair cap
+    // keeps the OLDEST rows, so `now` would make a long-dead generator the
+    // first row dropped.
+    expect(item.since).toBe(WEEK_OLD);
+    expect(item.sessionCount).toBe(0);
+    expect(item.url).toBeNull();
+    expect(item.channel_key).toBe(CHANNEL_KEY);
+    // Derived from the declaration alone — no clock, no list position — so an
+    // assignment reservation on it still matches on the next poll.
+    expect(item.id).toBe(`${ATTENTION_ITEM_PREFIX}stale:defect-register:releases:defects.md`);
+  });
+
+  it('gives the notice an id that can never become a channel key', () => {
+    const items = itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 })).get('defect-register')!;
+    const item = notice(items)!;
+    // The `board:` stamp is what `threadChannelKey` gates on. Without it the
+    // parser reads `stale:defect-register:...` as platform plus channel and
+    // mints one fake sidebar bucket per dead source — the per-row bucket §3.2
+    // forbids.
+    expect(isAttentionItemId(item.id)).toBe(true);
+    expect(threadChannelKey(item.id)).toBe(UNKNOWN_CHANNEL_KEY);
+  });
+
+  it('gives two sources of the same kind their own notices rather than collapsing them', () => {
+    const groupsRoot = boardRoot([]);
+    const dir = path.join(groupsRoot, WORKGROUP, 'releases');
+    fs.writeFileSync(path.join(dir, 'defects.md'), emptyDefectRegister(WEEK_OLD));
+    fs.writeFileSync(path.join(dir, 'other-defects.md'), emptyDefectRegister(WEEK_OLD));
+    declare(
+      JSON.stringify([
+        { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md', refresh_hours: 24 },
+        {
+          kind: 'defect-register',
+          root: 'releases',
+          channel_key: CHANNEL_KEY,
+          file: 'other-defects.md',
+          refresh_hours: 24,
+        },
+      ]),
+    );
+    expect(
+      itemsByKind(groupsRoot)
+        .get('defect-register')!
+        .map((i) => i.id),
+    ).toEqual([
+      `${ATTENTION_ITEM_PREFIX}stale:defect-register:releases:defects.md`,
+      `${ATTENTION_ITEM_PREFIX}stale:defect-register:releases:other-defects.md`,
+    ]);
+  });
+
+  it('never suppresses a stale source own rows — the rule is mark, never hide', () => {
+    const items = itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 })).get('defect-register')!;
+    expect(items.map((i) => i.id)).toContain(`${ATTENTION_ITEM_PREFIX}defect:example-org/example-app#201`);
   });
 });

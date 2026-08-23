@@ -450,6 +450,17 @@
   font-family: var(--ncc-font-mono);
   white-space: nowrap;
 }
+/* This row's OWN source has missed the cadence its install declared. Reuses
+   the attention hue — the same "wants you" signal as `.ncc-state.attention`
+   and `.ncc-row-reason`, never a third status hue (§7). The marker is a WORD
+   and it leads the span, because at 390px the meta line is the most-clipped
+   thing on the row and a marker lost to an ellipsis is a marker that does not
+   exist (the rule `.ncc-row-parkage` already follows). Nothing here hides the
+   row: the mark is the whole intervention. */
+.ncc-row-source.stale,
+.ncc-detail-source .when.stale {
+  color: var(--ncc-attention);
+}
 
 /* Thread-closure contract, item 1: the proposal's reason, spelled out on the
    row (not just the badge's title tooltip — 390px is the primary viewport and

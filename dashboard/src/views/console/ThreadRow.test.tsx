@@ -478,6 +478,45 @@ describe('attention-source provenance', () => {
     expect(row.querySelector('.ncc-verb')).not.toBeNull();
   });
 
+  it('marks a row whose OWN source is past its declared cadence', () => {
+    const { row } = renderRow({ attention_source: { ...source, stale: true } });
+    const mark = row.querySelector('.ncc-row-source')!;
+    // The word LEADS: a marker clipped off the end of a 390px ellipsis is a
+    // marker that does not exist (the same rule `.ncc-row-parkage` follows).
+    expect(mark.textContent!.startsWith('stale · ')).toBe(true);
+    expect(mark.classList.contains('stale')).toBe(true);
+    expect(mark.getAttribute('title')).toContain('PAST ITS EXPECTED REFRESH');
+  });
+
+  it('leaves a row from a fresh source unmarked', () => {
+    const { row } = renderRow({ attention_source: { ...source, stale: false } });
+    const mark = row.querySelector('.ncc-row-source')!;
+    expect(mark.textContent).toBe('release-board 3h old');
+    expect(mark.classList.contains('stale')).toBe(false);
+  });
+
+  it('leaves a row unmarked when no cadence was declared — nobody said, so nothing is claimed', () => {
+    // `null` must render exactly like `false` does, and must NOT be turned into
+    // a "fresh" word: an unmarked row means nobody checked, and §12 forbids
+    // undeclared reading as verified.
+    const { row } = renderRow({ attention_source: { ...source, stale: null } });
+    const mark = row.querySelector('.ncc-row-source')!;
+    expect(mark.textContent).toBe('release-board 3h old');
+    expect(mark.classList.contains('stale')).toBe(false);
+    expect(mark.getAttribute('title')).not.toContain('PAST ITS EXPECTED REFRESH');
+  });
+
+  it('marks a stale row without hiding it — the work is real either way', () => {
+    const { row } = renderRow({
+      attention_source: { ...source, stale: true, as_of: '2026-01-01T00:00:00.000Z' },
+      participants: [],
+      state: 'unassigned',
+    });
+    expect(row.querySelector('.ncc-row-source')!.textContent).toContain('231d old');
+    // …and it still ends in a verb (§1), which is the whole point of showing it.
+    expect(row.querySelector('.ncc-verb')).not.toBeNull();
+  });
+
   it('carries the next action in the hover, so the row says what a PERSON has to do', () => {
     const { row } = renderRow({ attention_source: source });
     expect(row.querySelector('.ncc-row-source')!.getAttribute('title')).toContain('@releasebot ship 817');
