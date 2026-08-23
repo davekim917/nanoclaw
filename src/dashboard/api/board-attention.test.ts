@@ -9,6 +9,7 @@ import {
   readReleaseBoardSource,
   type GateShipRecord,
   type ReleaseStateItem,
+  type OpenPrState,
 } from './board-attention.js';
 import type { AttentionSourceDecl } from '../../attention-sources.js';
 import type { BoardClaim } from '../../claims-board.js';
@@ -238,14 +239,23 @@ describe('deriveBoardAttentionItems', () => {
     expect(out).toHaveLength(1);
   });
 
-  it('falls back to "unknown" owner when the source item omits it', () => {
-    const out = deriveBoardAttentionItems([item({ owner: undefined })], ASOF, [], [], BINDING);
-    expect(out[0]!.claimOwner).toBe('unknown');
-    expect(out[0]!.claimNote).toMatch(/^waiting on unknown:/);
+  it.each([
+    ['omits owner entirely', undefined],
+    ['carries an explicit null owner — the live shape on XZO#956', null],
+    ['carries whitespace', '   '],
+  ])('says "a human" and leaves claimOwner null when the source item %s', (_label, owner) => {
+    const out = deriveBoardAttentionItems([item({ owner })], ASOF, [], [], BINDING);
+    expect(out[0]!.claimOwner).toBeNull();
+    expect(out[0]!.claimNote).toBe('waiting on a human: CI green, mergeable CLEAN');
   });
 
-  it('every emitted claimNote satisfies the WAITING_ON_NOTE routing regex (/\\bwaiting on\\b/i)', () => {
-    const out = deriveBoardAttentionItems([item()], ASOF, [], [], BINDING);
+  it.each([
+    ['a named owner', 'alice' as string | null],
+    ['no owner', null as string | null],
+  ])('the claimNote satisfies the WAITING_ON_NOTE routing regex (/\\bwaiting on\\b/i) with %s', (_label, owner) => {
+    // That regex is the ONLY thing that puts these rows in the needs_you lane.
+    // A wording change that stops matching it produces rows that land nowhere.
+    const out = deriveBoardAttentionItems([item({ owner })], ASOF, [], [], BINDING);
     expect(out[0]!.claimNote).toMatch(/\bwaiting on\b/i);
   });
 
@@ -457,5 +467,43 @@ describe('readReleaseBoardSource', () => {
       gates: { '2026-08-22.jsonl': ['{ broken', JSON.stringify({ action: 'note', target: 'x', ts: ASOF })].join('\n') },
     });
     expect(readReleaseBoardSource(DECL, WORKGROUP, Date.now(), env).items).toHaveLength(1);
+  });
+});
+
+describe('open-PR gate', () => {
+  const board = [
+    item({ id: 'REPO-A#956', nextMover: 'human', why: 'ready, no recorded ship' }),
+    item({ id: 'REPO-A#1017', nextMover: 'human', why: 'ready, no recorded ship' }),
+  ];
+  const derive = (openPrs: OpenPrState) =>
+    deriveBoardAttentionItems(board, ASOF, [], [], BINDING, openPrs).map((i) => i.id);
+
+  it('drops a PR the watcher says is no longer open', () => {
+    // #956 merged; a complete fetch that omits it is positive evidence.
+    expect(derive({ 'REPO-A': { complete: true, open: [1017] } })).toEqual(['REPO-A#1017']);
+  });
+
+  it('keeps everything when the fetch was INCOMPLETE', () => {
+    // The branch that never runs in normal operation. A short or failed fetch
+    // must remove nothing — otherwise one bad network call silently empties the
+    // queue of real blocked work.
+    expect(derive({ 'REPO-A': { complete: false, open: [1017] } }).sort()).toEqual(['REPO-A#1017', 'REPO-A#956']);
+  });
+
+  it('gates per repo, not globally', () => {
+    // A run can fetch one repo cleanly and fail on another; the clean one may
+    // filter, the failed one may not.
+    const mixed = [...board, item({ id: 'REPO-B#23', nextMover: 'human', why: 'ready' })];
+    const out = deriveBoardAttentionItems(mixed, ASOF, [], [], BINDING, {
+      'REPO-A': { complete: true, open: [1017] },
+      'REPO-B': { complete: false, open: [] },
+    }).map((i) => i.id);
+    expect(out.sort()).toEqual(['REPO-A#1017', 'REPO-B#23']);
+  });
+
+  it('keeps everything when the state is absent or malformed', () => {
+    expect(derive({}).length).toBe(2);
+    expect(derive({ 'REPO-A': undefined }).length).toBe(2);
+    expect(derive({ 'REPO-A': { complete: true } }).length).toBe(2);
   });
 });

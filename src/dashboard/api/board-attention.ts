@@ -109,12 +109,42 @@ function claimCoversPr(claims: BoardClaim[], n: string): boolean {
  * `release-state.json` regeneration, so the item's `nextMover: 'human'` is
  * momentarily stale.
  */
+/**
+ * Open pull requests per repo, as published by the release watcher.
+ *
+ * `complete` is the whole safety margin and it is PER REPO: a watcher run can
+ * fetch one repo cleanly and fail on another, and a repo we could not read is
+ * a repo we know nothing about. Filtering on an incomplete fetch would delete
+ * real blocked work from the queue on the strength of a failed network call —
+ * the same "absence is a fact" mistake that produced this bug in the first
+ * place, pointed the other way.
+ */
+export type OpenPrState = Record<string, { complete?: boolean; open?: number[] } | undefined>;
+
+/**
+ * Is this PR known — not guessed — to be no longer open?
+ *
+ * Only ever true when that repo's fetch was COMPLETE and the number is absent
+ * from it. Missing repo, missing file, incomplete fetch, unparseable number:
+ * all answer false, i.e. keep the row. A board row surviving one cycle too long
+ * is a visible nuisance; a genuinely blocked PR vanishing from the queue is the
+ * failure this whole surface exists to prevent.
+ */
+function isKnownClosed(state: OpenPrState, repo: string, n: string): boolean {
+  const entry = state[repo];
+  if (!entry || entry.complete !== true || !Array.isArray(entry.open)) return false;
+  const num = Number(n);
+  if (!Number.isInteger(num)) return false;
+  return !entry.open.includes(num);
+}
+
 export function deriveBoardAttentionItems(
   items: ReleaseStateItem[],
   asOf: string,
   shipRecords: GateShipRecord[],
   claims: BoardClaim[],
   binding: { workgroupId: string; channelKey: string },
+  openPrs: OpenPrState = {},
 ): ProvidedAttentionItem[] {
   const shippedSinceSnapshot = new Set(shipRecords.filter((r) => r.ts >= asOf).map((r) => r.target));
 
@@ -127,8 +157,14 @@ export function deriveBoardAttentionItems(
     if (!match) continue; // not a "<repo>#<n>" shaped id — nothing to board/dedupe
     const n = match[2]!;
     if (claimCoversPr(claims, n)) continue;
+    if (isKnownClosed(openPrs, match[1]!, n)) continue;
 
-    const owner = item.owner && item.owner.trim() ? item.owner : 'unknown';
+    // No owner is not a person called "unknown", it is an unassigned item — and
+    // that is what a human should read. `claimOwner` stays null, which every
+    // consumer already renders in its own words (`assign.ts`: "owner: nobody").
+    // The note still has to say "waiting on" verbatim or `WAITING_ON_NOTE`
+    // never routes the row into the `needs_you` lane.
+    const owner = item.owner && item.owner.trim() ? item.owner : null;
     out.push({
       id: item.id,
       channel_key: binding.channelKey,
@@ -136,7 +172,7 @@ export function deriveBoardAttentionItems(
       url: item.url,
       workgroupId: binding.workgroupId,
       claimState: 'parked',
-      claimNote: `waiting on ${owner}: ${item.why}`,
+      claimNote: `waiting on ${owner ?? 'a human'}: ${item.why}`,
       claimOwner: owner,
       participants: [],
       sessionCount: 0,
@@ -219,6 +255,29 @@ function containedRealpath(base: string, p: string): string | null {
  * yields `[]` rather than failing the whole read. Each file is containment-
  * checked individually; see {@link containedRealpath}.
  */
+/**
+ * Open pull requests per repo, written by the release watcher every ~30 minutes.
+ *
+ * A FILE, not a network call: providers run inside the thread-list request,
+ * which the console polls continuously from every open dashboard, so a GitHub
+ * call here would block the event loop for every viewer — a memo bounds how
+ * often that happens, not how long it blocks.
+ *
+ * Unreadable or malformed returns `{}`, which filters nothing. The safe
+ * direction here is showing a stale row, never hiding a live one.
+ */
+function readOpenPrState(releasesDir: string): OpenPrState {
+  const statePath = containedRealpath(releasesDir, path.join(releasesDir, '.pr-open-state.json'));
+  if (statePath === null) return {};
+  try {
+    const raw = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { repos?: unknown };
+    return raw.repos && typeof raw.repos === 'object' ? (raw.repos as OpenPrState) : {};
+  } catch {
+    // Absent is normal until the watcher has run once since this shipped.
+    return {};
+  }
+}
+
 function readShipRecords(releasesDir: string): GateShipRecord[] {
   const gatesDir = containedRealpath(releasesDir, path.join(releasesDir, 'gates'));
   if (gatesDir === null) return [];
@@ -320,14 +379,19 @@ export function readReleaseBoardSource(
   }
 
   const shipRecords = readShipRecords(releasesDir);
+  const openPrs = readOpenPrState(releasesDir);
 
   const claims =
     env.claimsRoot !== undefined ? readClaims(workgroupId, now, env.claimsRoot) : readClaims(workgroupId, now);
   return {
     asOf: releaseState.asOf,
-    items: deriveBoardAttentionItems(releaseState.items, releaseState.asOf, shipRecords, claims, {
-      workgroupId,
-      channelKey: decl.channel_key,
-    }),
+    items: deriveBoardAttentionItems(
+      releaseState.items,
+      releaseState.asOf,
+      shipRecords,
+      claims,
+      { workgroupId, channelKey: decl.channel_key },
+      openPrs,
+    ),
   };
 }
