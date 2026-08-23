@@ -542,6 +542,15 @@ const REPAIRABLE_VIOLATIONS = new Map<string, string>([
     'curator replacement needs a capture reason code',
     `A replacement must use one of these reason codes: ${CURATOR_CAPTURE_REASON_CODES.join(', ')}. Keep the same memories and supersedesMemoryIds; only relabel the reason so it describes the new fact. Do not drop a supersession or a durable fact to satisfy this correction.`,
   ],
+  [
+    'curator returned an unknown evidence id',
+    // Measured on production failures: 86% of platform timestamps are archived
+    // under 2+ agent groups, so the id-prefix rescue that saves a bare
+    // timestamp usually cannot find a unique match and this throws instead.
+    // The prompt already shows the correct full id — this is model fidelity,
+    // not a data defect — so the fix is telling the model to stop shortening it.
+    'Every evidenceIds entry must be copied verbatim from the id field of a message in the episode, including its :<agent_group_id> suffix — never shorten an id to just its timestamp. Keep the same memories and evidence; only fix ids that were truncated or altered. Do not drop a fact or its evidence to satisfy this correction.',
+  ],
 ]);
 
 function repairInstructionFor(error: unknown): string | null {
@@ -697,7 +706,12 @@ export class MemoryCuratorWorker {
     } catch (error) {
       const errorClass = classifyError(error);
       this.deps.fail(episode, errorClass, nowMs);
-      const detail = error as { candidateChars?: number; limitChars?: number };
+      const detail = error as {
+        candidateChars?: number;
+        limitChars?: number;
+        offendingEvidenceId?: string;
+        submittedEvidenceIds?: string[];
+      };
       log.warn('memory-curator: episode failed', {
         workgroupId: episode.workgroupId,
         episodeKey: episode.episodeKey,
@@ -708,6 +722,13 @@ export class MemoryCuratorWorker {
         // "tried to write a transcript", and those want opposite responses.
         ...(typeof detail.candidateChars === 'number'
           ? { candidateChars: detail.candidateChars, limitChars: detail.limitChars }
+          : {}),
+        // Only present on an unknown-evidence-id rejection. Without it the
+        // rejection is unattributable — no way to tell which id the model sent,
+        // or whether it was the bare-timestamp truncation the prefix rescue
+        // exists for.
+        ...(typeof detail.offendingEvidenceId === 'string'
+          ? { offendingEvidenceId: detail.offendingEvidenceId, submittedEvidenceIds: detail.submittedEvidenceIds }
           : {}),
       });
       return null;
