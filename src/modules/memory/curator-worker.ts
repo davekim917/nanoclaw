@@ -54,6 +54,8 @@ import {
   TOPIC_FILE_PATH_PATTERN,
   validateConsolidationFiles,
   validateCuratorDecision,
+  type ConsolidationFileCandidate,
+  type ConsolidationFileRejection,
   type ConsolidationTailFact,
   type ConsolidationTopicFile,
   type CuratorDecision,
@@ -780,16 +782,10 @@ export class MemoryCuratorWorker {
       // `accepted` files are written; `rejected` ones are logged and the tail
       // is still marked consolidated below, same as the model choosing not
       // to touch them.
-      const { accepted, rejected } = validateConsolidationFiles(attempt.result.decision, tail.facts.length);
-      if (rejected.length > 0) {
-        // Named per-path, with reason and byte size where relevant, so an
-        // operator can see WHICH entity is being persistently dropped rather
-        // than just a count.
-        log.warn('memory-curator: consolidation dropped invalid topic files this pass', {
-          workgroupId: job.workgroupId,
-          rejected,
-        });
-      }
+      const { accepted: validated, rejected: contentRejections } = validateConsolidationFiles(
+        attempt.result.decision,
+        tail.facts.length,
+      );
       // Locked = over-cap (never read) UNION presented-but-not-owned (read as
       // context only). The latter matters even if the file vanishes from
       // disk mid-pass: the model was TOLD it was human-authored and must
@@ -800,10 +796,32 @@ export class MemoryCuratorWorker {
         ...scan.files.filter((file) => !file.owned).map((file) => file.path),
       ]);
       const ownedByPath = new Map(scan.files.filter((file) => file.owned).map((file) => [file.path, file]));
-      for (const file of accepted) {
+      // A locked-path write is a per-file rejection, exactly like a bad path
+      // or an oversized file — not a thrown protocol violation. The locked
+      // set is deterministic per pass (over-cap files and human-authored
+      // files never change mid-pass), so retrying the whole pass on this
+      // throw could never succeed: it just re-presents the identical tail to
+      // the same model, which proposes the same locked path again, forever
+      // (production poison loop, 6h backoff each cycle). Dropping the file
+      // and letting the rest of the batch land is what makes progress.
+      const accepted: ConsolidationFileCandidate[] = [];
+      const lockedRejections: ConsolidationFileRejection[] = [];
+      for (const file of validated) {
         if (lockedPaths.has(file.path)) {
-          throw new Error(`memory consolidation attempted to write a locked topic file: ${file.path}`);
+          lockedRejections.push({ path: file.path, reason: 'locked-path' });
+          continue;
         }
+        accepted.push(file);
+      }
+      const rejected = [...contentRejections, ...lockedRejections];
+      if (rejected.length > 0) {
+        // Named per-path, with reason and byte size where relevant, so an
+        // operator can see WHICH entity is being persistently dropped rather
+        // than just a count.
+        log.warn('memory-curator: consolidation dropped invalid topic files this pass', {
+          workgroupId: job.workgroupId,
+          rejected,
+        });
       }
       for (const file of accepted) {
         signal?.throwIfAborted();
