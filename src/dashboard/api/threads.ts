@@ -450,8 +450,13 @@ export interface ThreadAttentionSource {
   /** The declared source kind — `release-board`, etc. */
   kind: string;
   /**
-   * When the source last regenerated, ISO-8601 UTC, or null when nothing could
-   * be read at all.
+   * When THIS ROW'S source last regenerated, ISO-8601 UTC, or null when
+   * nothing could be read at all.
+   *
+   * Per source, never an aggregate over the feed. An aggregate here once took
+   * the oldest contributor's timestamp, so one dead generator made every row
+   * on the page — including boards refreshed minutes earlier — report as a
+   * week old, and no reader could tell which source had actually died.
    *
    * **On the wire so the row can wear its age — never so anything can suppress
    * it.** There is no staleness threshold anywhere in this path, deliberately:
@@ -459,6 +464,20 @@ export interface ThreadAttentionSource {
    * an empty feed, because an empty one is indistinguishable from healthy.
    */
   as_of: string | null;
+  /**
+   * Has this row's source missed the cadence the install declared for it?
+   *
+   * Three values, and the third is the point. `null` means NO CLAIM — the
+   * source declared no `refresh_hours`, or its `as_of` could not be read.
+   * DESIGN.md §12: *"undeclared must never read as independent"*, so an
+   * unchecked source renders like any other unmarked row rather than being
+   * vouched for. Computed host-side (`sourceStaleness`) because the cadence is
+   * install config, not something a client should be handed and re-derive.
+   *
+   * A `true` here MARKS the row. It never hides it: the work is real either
+   * way, and a stale source additionally produces its own row saying so.
+   */
+  stale: boolean | null;
   /** Where a person goes to act on this item, or null. Never invented. */
   url: string | null;
   /** What a person has to do, in the source's own words. */
@@ -1850,6 +1869,7 @@ export async function buildThreadList(
       attention_source: {
         kind: item.sourceKind,
         as_of: item.sourceAsOf,
+        stale: item.sourceStale,
         url: item.url,
         next_action: item.nextAction,
         // Keyed on the item's NATURAL id — the `board:` prefix is a rendering

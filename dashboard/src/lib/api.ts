@@ -826,12 +826,27 @@ export type NeedsYouReason =
 export interface ThreadAttentionSource {
   kind: string;
   /**
-   * When the source last regenerated, ISO-8601 UTC, or null when nothing could
-   * be read. Rendered as an AGE marker, never used to suppress the row: an
-   * empty feed is indistinguishable from a healthy one, so a stale feed
-   * showing real work with a visible age is strictly better.
+   * When THIS ROW'S source last regenerated, ISO-8601 UTC, or null when
+   * nothing could be read. Per source — never an aggregate over the feed,
+   * which used to let one dead generator report every row as a week old.
+   *
+   * Rendered as an AGE marker, never used to suppress the row: an empty feed
+   * is indistinguishable from a healthy one, so a stale feed showing real work
+   * with a visible age is strictly better.
    */
   as_of: string | null;
+  /**
+   * Has this row's source missed the cadence the install declared for it?
+   *
+   * `null` is a real third value: no cadence declared, or an unreadable
+   * `as_of`, so no claim is made and the row renders unmarked like any other.
+   * Undeclared must never read as independent — an unmarked row means nobody
+   * said, not "verified fresh".
+   *
+   * Optional for the same fixture reason as the fields around it; absent reads
+   * as no claim.
+   */
+  stale?: boolean | null;
   url: string | null;
   next_action: string;
   /**

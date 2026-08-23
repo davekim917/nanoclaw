@@ -171,6 +171,24 @@ describe('attention-source provenance in the detail pane', () => {
     expect(bare.container.querySelector('.ncc-detail-source')!.textContent).toContain('@releasebot ship 817');
   });
 
+  it('marks a source past its declared cadence, and leaves fresh and undeclared alike unmarked', () => {
+    const stale = renderDetail(thread({ attention_source: { ...source, stale: true } }));
+    const marked = stale.container.querySelector('.ncc-detail-source .when')!;
+    expect(marked.textContent!.startsWith('stale · ')).toBe(true);
+    expect(marked.classList.contains('stale')).toBe(true);
+
+    // `false` (checked, fine) and `null` (nobody declared a cadence) both
+    // render unmarked. They are different facts, but neither is a claim that
+    // anything is wrong, and §12 forbids inventing a "verified fresh" word for
+    // the one nobody checked.
+    for (const value of [false, null]) {
+      const { container } = renderDetail(thread({ attention_source: { ...source, stale: value } }));
+      const when = container.querySelector('.ncc-detail-source .when')!;
+      expect(when.textContent!.startsWith('release-board')).toBe(true);
+      expect(when.classList.contains('stale')).toBe(false);
+    }
+  });
+
   it('says the source could not be read rather than implying it is fresh', () => {
     const { container } = renderDetail(thread({ attention_source: { ...source, as_of: null } }));
     expect(container.querySelector('.ncc-detail-source')!.textContent).toContain('could not be read');
