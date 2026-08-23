@@ -4,6 +4,18 @@ import type { ChildProcess, ExecFileException } from 'child_process';
 
 import { describe, expect, it, vi } from 'vitest';
 
+vi.mock('../../log.js', () => ({
+  log: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    fatal: vi.fn(),
+  },
+  setLogScrubber: vi.fn(),
+}));
+
+import { log } from '../../log.js';
 import {
   callClaudeCliStructured,
   callClaudeStructured,
@@ -267,6 +279,62 @@ describe('memory curator backend', () => {
       message: expect.stringMatching(/Claude CLI call failed/),
       status: 429,
     });
+  });
+
+  // The CLI's stderr/result text was previously discarded on a nonzero exit —
+  // never logged, never attached to the error — leaving this failure class
+  // undiagnosable in production. A log.warn must carry the exit code and the
+  // diagnostic text, and the thrown error's message must stay byte-identical
+  // (curator-worker.ts classifyError regex-matches on it).
+  it('logs a warning with the exit code and diagnostic text, and leaves the thrown message unchanged', async () => {
+    const execFile = vi.fn(((_command: string, _args: string[], _options, callback) => {
+      const child = new EventEmitter() as ChildProcess;
+      child.stdin = new PassThrough();
+      child.kill = vi.fn(() => true);
+      queueMicrotask(() => {
+        callback(
+          Object.assign(new Error('exit 1'), { code: 1 }) as ExecFileException,
+          JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            is_error: true,
+            result: 'diagnostic-marker-please-log-me',
+          }),
+          '',
+        );
+      });
+      return child;
+    }) satisfies ClaudeCliExecFile);
+
+    await expect(
+      callClaudeCliStructured(
+        {
+          model: 'claude-sonnet-5',
+          effort: 'medium',
+          system: 'system',
+          user: 'user',
+          schema: { type: 'object' },
+          maxTokens: 100,
+          timeoutMs: 1000,
+        },
+        {
+          env: { CLAUDE_CODE_OAUTH_TOKEN: 'primary-secret' },
+          credentialSlot: 'oauth:primary',
+          execFile,
+        },
+      ),
+    ).rejects.toMatchObject({
+      message: 'structured Claude CLI call failed with exit 1',
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(
+      'structured Claude CLI nonzero exit',
+      expect.objectContaining({
+        exitCode: 1,
+        model: 'claude-sonnet-5',
+        diagnostic: expect.stringContaining('diagnostic-marker-please-log-me'),
+      }),
+    );
   });
 
   it('sends adaptive thinking plus schema and verifies the returned model', async () => {

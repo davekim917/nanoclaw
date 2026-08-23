@@ -231,7 +231,16 @@ function resolveEvidenceIds(ids: string[], allowed: ReadonlySet<string>): string
     if (allowed.has(id)) return id;
     const namespacedMatches = [...allowed].filter((allowedId) => allowedId.startsWith(`${id}:`));
     if (namespacedMatches.length === 1) return namespacedMatches[0]!;
-    throw new Error('curator returned an unknown evidence id');
+    // Carry the offending id as a property rather than in the message: the
+    // repair table and classifyError both key off the exact message text, and
+    // an embedded id (digits and colons) risks silently matching one of
+    // classifyError's status-code regexes. Without this the rejection is
+    // unattributable — no way to tell which id the model sent, or whether it
+    // was the bare-timestamp truncation this rescue exists for.
+    throw Object.assign(new Error('curator returned an unknown evidence id'), {
+      offendingEvidenceId: id,
+      submittedEvidenceIds: ids,
+    });
   });
 }
 

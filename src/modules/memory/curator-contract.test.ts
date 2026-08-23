@@ -203,8 +203,9 @@ describe('background memory curator contract', () => {
     expect(decision.content).toContain('evidence=platform-message:provider-sibling;');
   });
 
-  it('rejects ambiguous raw platform evidence ids', () => {
-    expect(() =>
+  it('rejects ambiguous raw platform evidence ids, carrying the offending id out of band', () => {
+    let caught: unknown;
+    try {
       validateCuratorDecision(
         {
           action: 'replace_generated_memory',
@@ -220,8 +221,18 @@ describe('background memory curator contract', () => {
             ['msg-1:codex', '2026-07-26T00:00:00.000Z'],
           ]),
         },
-      ),
-    ).toThrow(/unknown evidence/);
+      );
+      throw new Error('expected validateCuratorDecision to throw');
+    } catch (error) {
+      caught = error;
+    }
+    const err = caught as Error & { offendingEvidenceId?: string; submittedEvidenceIds?: string[] };
+    // Byte-identical: REPAIRABLE_VIOLATIONS keys off this exact message, and
+    // classifyError regex-matches it. The id must ride along as a property,
+    // never get folded into the message text.
+    expect(err.message).toBe('curator returned an unknown evidence id');
+    expect(err.offendingEvidenceId).toBe('msg-1');
+    expect(err.submittedEvidenceIds).toEqual(['msg-1']);
   });
 
   it('preserves every active fact automatically while appending a new one', () => {
