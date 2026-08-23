@@ -23,6 +23,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
+import { containedRealpath, resolveContainedRoot } from './attention-fs.js';
 import { readClaims, type BoardClaim } from '../../claims-board.js';
 import { log } from '../../log.js';
 import type {
@@ -184,71 +185,6 @@ export function deriveBoardAttentionItems(
 }
 
 /**
- * The declared root, resolved through symlinks and proven to still be inside
- * the workgroup's own folder — or `null`, meaning read nothing.
- *
- * `isSafeRelativeRoot` (`attention-sources.ts`) rejects `..` and absolute
- * paths, but it is a check on the STRING. The declared root is a directory
- * `container-runner.ts` bind-mounts read-write into that workgroup's own
- * containers, so an agent can replace it with a symlink pointing at a sibling
- * workgroup's folder. A string check cannot see that, and the host reader
- * would happily follow it — a cross-workgroup read primitive out of a
- * boundary CLAUDE.md calls the data-pool boundary.
- *
- * So the check is on the RESOLVED path, with both sides realpath'd (the mount
- * root itself may legitimately be a symlink — `/tmp` on macOS is), and the
- * containment test is prefix-plus-separator, never a bare `startsWith`: a bare
- * one lets `/groups/workgroup-evil` pass a check for `/groups/workgroup`.
- * Equality passes, because `root: "."` is a legal declaration.
- *
- * Fails CLOSED and never throws into the request path: a root that does not
- * exist yet, a root that escapes, and an unreadable root all take the same
- * exit as an absent board — emit nothing, say so in the log.
- */
-function resolveContainedRoot(groupsRoot: string, workgroupId: string, root: string): string | null {
-  let workgroupDir: string;
-  try {
-    workgroupDir = fs.realpathSync(path.resolve(groupsRoot, workgroupId));
-  } catch (err) {
-    // Not-yet-existing is the common case (a declaration written before the
-    // board generates) and is not an error — but it is never silent, because
-    // an empty feed reads as "nothing is blocked on a human".
-    log.warn('Release board: workgroup dir unreadable, emitting nothing', { workgroupId, root, err });
-    return null;
-  }
-  const resolved = containedRealpath(workgroupDir, path.join(workgroupDir, root));
-  if (resolved === null)
-    log.warn('Release board: declared root unreadable or escapes the workgroup', { workgroupId, root });
-  return resolved;
-}
-
-/**
- * `p` realpath'd, if it is still inside `base` — otherwise `null`.
- *
- * Every path this provider reads goes through here, not just the declared
- * root. Checking only the root would be a fix that looks complete: the root is
- * a directory an agent writes into, so once the root is pinned the same escape
- * is one `ln -s` on `release-state.json` or on `gates/` away. Leaves are
- * checked against the resolved ROOT rather than the workgroup dir, which is
- * both sound (the root is already proven inside the workgroup) and stricter.
- *
- * Never throws: a missing path and an escaping path are the same answer here —
- * read nothing.
- */
-function containedRealpath(base: string, p: string): string | null {
-  let resolved: string;
-  try {
-    resolved = fs.realpathSync(p);
-  } catch {
-    return null;
-  }
-  // Prefix-PLUS-SEPARATOR, never a bare `startsWith`: a bare one lets
-  // `/groups/workgroup-evil` pass a check for `/groups/workgroup`. Equality
-  // passes because `root: "."` is a legal declaration.
-  return resolved === base || resolved.startsWith(base + path.sep) ? resolved : null;
-}
-
-/**
  * Every `action: "ship"` record under `<root>/gates/*.jsonl`.
  *
  * An absent gates dir is normal — nothing recorded, nothing to exclude — so it
@@ -350,7 +286,7 @@ export function readReleaseBoardSource(
   now: number,
   env: AttentionSourceEnv = {},
 ): ProviderRead {
-  const releasesDir = resolveContainedRoot(env.groupsRoot ?? GROUPS_DIR, workgroupId, decl.root);
+  const releasesDir = resolveContainedRoot('Release board', env.groupsRoot ?? GROUPS_DIR, workgroupId, decl.root);
   if (releasesDir === null) return { asOf: null, items: [] };
 
   const statePath = containedRealpath(releasesDir, path.join(releasesDir, 'release-state.json'));
