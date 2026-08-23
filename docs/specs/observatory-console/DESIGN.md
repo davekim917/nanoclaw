@@ -632,3 +632,37 @@ restart case.
 **The thing that notices silence cannot be the thing that went silent.**
 Detection belongs to *"dumb code on a clock — an agent asked to notice its own
 silence is the one actor structurally incapable of it."*
+
+**A config error may never reduce the feed to silence.** An earlier revision of
+the attention seam failed CLOSED for the whole workgroup on a malformed
+`attention_sources` declaration, reasoning that a partial list *"is
+indistinguishable from a healthy short one."* The reasoning held; the remedy did
+not. One entry mistyped took down every sibling entry that had parsed perfectly
+— and because the check ran over `refresh_hours` too, a typo in a **display-only
+cadence hint** (`"6h"` for `6`) deleted twenty-eight real work items and left an
+empty queue, which reads as *"nothing is blocked on a human"*: the exact lie the
+queue exists to prevent, reachable from one character.
+
+There are **three** states here, not two — healthy, explicitly-not-declared, and
+misconfigured-and-saying-so — and the rules that follow from that:
+
+- **Failure is per source, never per workgroup.** A malformed declaration
+  disables that declaration; its siblings keep emitting. Subtracting real work
+  to signal a bad field is disproportionate.
+- **A bad `refresh_hours` never removes items.** A cadence names no bytes — it
+  gates a display marker, so it can only ever cost the marker. The source emits
+  its rows normally with **no** staleness claim (`null`; unknown is not fresh).
+  A bad `root`, `file`, `kind` or `channel_key` is different in kind: there is
+  nothing to read or nowhere to route it, and emitting nothing for that source
+  is then correct.
+- **A malformed declaration is itself a `needs_you` row**, one per declaration,
+  emitted from the SEAM — a provider that could not be constructed has no hook
+  to report from, which is the silence rule above applied one step earlier. It
+  names the workgroup, the declaration, the field, and what the error costs. A
+  declaration too broken to name at all still gets a row, by position: an
+  unnameable error is still an error a human must see.
+
+The original concern is preserved rather than discarded: a malformed value must
+never degrade QUIETLY to "no claim", because quiet is indistinguishable from an
+operator deliberately declaring nothing. The answer is to make it **loud**, not
+to make the feed **empty**.

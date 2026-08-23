@@ -22,18 +22,23 @@
  * public and `scripts/check-public-boundary.ts` rejects install identifiers in
  * source, so a hardcoded channel id cannot land at all.
  *
- * ## Three failure rules, and why they differ
+ * ## Failure rules, and why they differ
  *
  * An empty feed reads as "nothing is blocked on a human". That is the one lie
- * this whole feature exists to prevent, so every way of producing an empty
- * feed is logged and none of them is silent.
+ * this whole feature exists to prevent, so **no config error may ever reduce
+ * the feed to silence** — see the invariant stated at
+ * {@link parseAttentionSources}, which is where it is enforced.
  *
  *  - **Absent declaration** — normal, and the state of every workgroup in a
  *    fresh install. Emits nothing, logs at debug. Not an error.
- *  - **Malformed declaration** — FAILS CLOSED for the whole workgroup, warns.
- *    Never a partial list: half a feed is indistinguishable from a healthy
- *    short one, and an operator who mistypes one entry must not silently lose
- *    the others' items while believing they are still watching.
+ *  - **Malformed declaration** — disables THAT DECLARATION only, warns, and
+ *    emits a `misconfigured:` work item naming it. One operator typo must not
+ *    take down the three sibling sources that parsed perfectly; subtracting
+ *    real work to signal a bad field is disproportionate, and an empty queue
+ *    is exactly the lie the queue exists to prevent.
+ *  - **Malformed `refresh_hours` specifically** — the source keeps emitting
+ *    its rows, with NO staleness claim. A cadence is a display marker; it can
+ *    only ever gate the marker. See {@link AttentionSourceDefect}.
  *  - **Unknown `kind`** — skipped with a warning, the rest of the list is
  *    still read. A trunk that has not shipped a provider yet, or an install
  *    that pinned an older trunk, is a version skew, not a broken declaration;
@@ -59,7 +64,7 @@
  * because an empty one is indistinguishable from healthy. `refresh_hours`
  * changes what a row is LABELLED, never whether it is emitted.
  *
- * ## A source that stopped generating is itself blocked work
+ * ## A source that stopped generating — or was never readable — is itself work
  *
  * DESIGN.md §12: *"the thing that notices silence cannot be the thing that
  * went silent."* A generator that stopped running is work that stopped, and a
@@ -68,6 +73,14 @@
  * synthetic item saying so, from the SEAM rather than from any provider: a
  * provider cannot forget to, and a provider whose own code is broken is
  * covered by the same rule that covers a healthy one.
+ *
+ * A MISCONFIGURED declaration is the same argument one step earlier. A provider
+ * that could not be constructed has no hook to report from at all, so the seam
+ * reports for it: one `misconfigured:` item per malformed declaration, saying
+ * which workgroup, which declaration, which field, and what it costs. Same
+ * rules as the stale notice — declaration-derived id, `board:`-stamped so it
+ * can never be read as a thread id, and a `waiting on` note so it lands in
+ * `needs_you` rather than in a backlog nobody reads.
  */
 import path from 'path';
 
@@ -294,67 +307,229 @@ function isSafeRelativeRoot(value: string): boolean {
   return normalized !== '..' && !normalized.startsWith(`..${path.sep}`) && !path.isAbsolute(normalized);
 }
 
+/** `<platform>:<channel>` — the shape `threadChannelKey` resolves to. */
+const CHANNEL_KEY_SHAPE = /^[a-z0-9-]+:.+$/i;
+
+/** A git ref name, kept to that shape so it cannot smuggle a path segment into a key. */
+const BRANCH_SHAPE = /^[\w./-]+$/;
+
+/**
+ * One declaration that could not be used, and what it costs.
+ *
+ * Every field is derived from the declaration alone — no clock, no provider
+ * read — so the same broken config yields byte-identical defects on every poll
+ * and the item minted from one keeps a stable identity (see
+ * {@link misconfiguredSourceItem}).
+ *
+ * The identity fields are captured INDEPENDENTLY of which check failed: a
+ * declaration whose `root` is unusable may still have named a perfectly good
+ * `kind` and `channel_key`, and naming the broken source to its operator is
+ * worth more than reporting fields in a tidy order.
+ */
+export interface AttentionSourceDefect {
+  /**
+   * Position in the declared array — `-1` when the COLUMN itself is unreadable
+   * (not JSON, not an array), so there are no positions at all.
+   *
+   * Used for identity ONLY when nothing else identifies the declaration. A
+   * declaration with no usable `kind` has no other handle, and "position 2"
+   * is still an error an operator can find; the alternative is letting it
+   * vanish, which is the one outcome forbidden here.
+   */
+  index: number;
+  /** The declaration's own fields, when they parsed as strings. `null` when not. */
+  kind: string | null;
+  root: string | null;
+  file: string | null;
+  channelKey: string | null;
+  /** Which field is at fault — `refresh_hours`, `root`, `channel_key`, … */
+  field: string;
+  /** What is wrong with it, in words an operator can act on. */
+  problem: string;
+  /**
+   * Does this defect stop the source being READ?
+   *
+   * The distinction requirement 2 of this seam turns on. A bad `root`, `file`,
+   * `kind` or `channel_key` means there is no readable source and no route for
+   * its rows — emitting nothing for it is correct. A bad `refresh_hours` means
+   * only that a DISPLAY MARKER cannot be computed; the generated file is still
+   * right there, its rows are still real blocked work, and gating them on a
+   * cadence typo would delete work to punish a label.
+   */
+  disablesSource: boolean;
+}
+
+/**
+ * What {@link parseAttentionSources} returns: the declarations that are usable,
+ * plus a record of each one that is not.
+ *
+ * Both halves, always — never one or the other. That shape IS the invariant.
+ */
+export interface AttentionSourceParse {
+  decls: AttentionSourceDecl[];
+  defects: AttentionSourceDefect[];
+}
+
 /**
  * Validate one workgroup's raw column value.
  *
- * Returns the declarations on success, `[]` when nothing is declared, and
- * `null` when the value is malformed — the fail-closed signal. Never a partial
- * list; see this file's header on why.
+ * ## THE INVARIANT: no config error may ever reduce the feed to silence.
+ *
+ * There are THREE states here, not two, and collapsing them is the bug this
+ * function was rewritten to end:
+ *
+ *  1. **Healthy** — declarations parsed, items flow.
+ *  2. **Explicitly not declared** — an absent or empty column. Emits nothing,
+ *     claims nothing. The normal state of a fresh install.
+ *  3. **Misconfigured and SAYING SO** — the good declarations still emit their
+ *     items, and each bad one emits a work item naming itself.
+ *
+ * This used to return `null` for the whole workgroup the moment ANY single
+ * entry failed ANY check — including `refresh_hours`, a display-only cadence
+ * hint. One character (`"6h"` for `6`) therefore deleted every real row the
+ * workgroup had: ready-but-unshipped PRs, decisions waiting on a person,
+ * standing questions. The operator saw an empty queue, which reads as "nothing
+ * is blocked on a human" — the exact lie this whole feature exists to prevent,
+ * reachable from a typo.
+ *
+ * The old justification was sound and is PRESERVED: degrading a malformed
+ * value to "no claim" would be indistinguishable from an operator deliberately
+ * declaring no cadence, so a bad value must never go quiet. The answer is to
+ * make it LOUD, not to make the feed EMPTY — so it returns a defect that
+ * becomes its own visible, human-owed work item, and subtracts nothing.
+ *
+ * Failure is therefore PER SOURCE and never per workgroup: one bad entry
+ * disables that entry, and its three healthy siblings keep working.
  */
-export function parseAttentionSources(raw: string | null | undefined): AttentionSourceDecl[] | null {
-  if (raw === null || raw === undefined || raw.trim() === '') return [];
+export function parseAttentionSources(raw: string | null | undefined): AttentionSourceParse {
+  if (raw === null || raw === undefined || raw.trim() === '') return { decls: [], defects: [] };
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return null;
+    return { decls: [], defects: [columnDefect('the value is not valid JSON')] };
   }
-  if (!Array.isArray(parsed)) return null;
+  if (!Array.isArray(parsed)) {
+    return { decls: [], defects: [columnDefect('the value must be a JSON array of declarations')] };
+  }
 
-  const out: AttentionSourceDecl[] = [];
-  for (const entry of parsed) {
-    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) return null;
-    const { kind, root, channel_key: channelKey } = entry as Record<string, unknown>;
-    if (typeof kind !== 'string' || kind.trim() === '') return null;
-    if (typeof root !== 'string' || !isSafeRelativeRoot(root)) return null;
-    // `<platform>:<channel>` — the shape `threadChannelKey` resolves to. A key
-    // with no platform segment would land the items in a bucket no sidebar
-    // entry can ever match, which is a silent disappearance, not an error.
-    if (typeof channelKey !== 'string' || !/^[a-z0-9-]+:.+$/i.test(channelKey)) return null;
-    // The two optional per-provider fields. ABSENT is fine — most kinds do not
-    // take them. PRESENT-AND-WRONG is malformed and fails the whole workgroup
-    // closed, exactly like a bad `root`: an operator who typed a path wrong
-    // must not silently get a shorter feed that still looks healthy.
-    const { file, branch, refresh_hours: refreshHours } = entry as Record<string, unknown>;
-    if (file !== undefined && (typeof file !== 'string' || !isSafeRelativeRoot(file))) return null;
-    if (branch !== undefined && (typeof branch !== 'string' || !/^[\w./-]+$/.test(branch))) return null;
-    // Same rule again, and for the same reason: a cadence that is present and
-    // unusable must fail the workgroup closed rather than fall back to "no
-    // claim". Silently degrading to no-claim is indistinguishable from the
-    // operator having chosen not to declare one, so a typo'd `"6h"` would take
-    // the staleness signal away while looking exactly like a healthy config.
-    // Zero, negative, NaN and Infinity are all rejected: a cadence has to name
-    // a real interval for `now - asOf > interval` to mean anything.
-    if (
-      refreshHours !== undefined &&
-      (typeof refreshHours !== 'number' || !Number.isFinite(refreshHours) || refreshHours <= 0)
-    ) {
-      return null;
-    }
-    out.push({
-      kind,
-      root,
-      channel_key: channelKey,
-      ...(file === undefined ? {} : { file }),
-      ...(branch === undefined ? {} : { branch }),
-      ...(refreshHours === undefined ? {} : { refresh_hours: refreshHours }),
-    });
-  }
-  return out;
+  const decls: AttentionSourceDecl[] = [];
+  const defects: AttentionSourceDefect[] = [];
+  parsed.forEach((entry, index) => {
+    const { decl, defect } = parseOneDecl(entry, index);
+    if (decl) decls.push(decl);
+    if (defect) defects.push(defect);
+  });
+  return { decls, defects };
 }
 
-/** One workgroup's declarations, straight off the row. `null` = malformed. */
-export function readAttentionSourceDecls(workgroupId: string): AttentionSourceDecl[] | null {
+/** The whole column is unreadable — there are no positions to blame, so `index` is -1. */
+function columnDefect(problem: string): AttentionSourceDefect {
+  return {
+    index: -1,
+    kind: null,
+    root: null,
+    file: null,
+    channelKey: null,
+    field: 'attention_sources',
+    problem,
+    disablesSource: true,
+  };
+}
+
+/**
+ * One entry, validated. At most one defect per declaration — the FIRST
+ * unusable field, so an operator gets one row to fix rather than a pile
+ * restating the same broken entry.
+ */
+function parseOneDecl(
+  entry: unknown,
+  index: number,
+): { decl: AttentionSourceDecl | null; defect: AttentionSourceDefect | null } {
+  const rec =
+    typeof entry === 'object' && entry !== null && !Array.isArray(entry) ? (entry as Record<string, unknown>) : null;
+  // Captured up front, independent of which check fails below, so a defect can
+  // still NAME the source it is about.
+  const kind = typeof rec?.kind === 'string' && rec.kind.trim() !== '' ? rec.kind : null;
+  const root = typeof rec?.root === 'string' ? rec.root : null;
+  const file = typeof rec?.file === 'string' ? rec.file : null;
+  const channelKey =
+    typeof rec?.channel_key === 'string' && CHANNEL_KEY_SHAPE.test(rec.channel_key) ? rec.channel_key : null;
+  const bad = (
+    field: string,
+    problem: string,
+    disablesSource: boolean,
+  ): { decl: null; defect: AttentionSourceDefect } => ({
+    decl: null,
+    defect: { index, kind, root, file, channelKey, field, problem, disablesSource },
+  });
+
+  // Everything below this line is SOURCE-FATAL: without it there is nothing to
+  // read, or nowhere to route what is read. Emitting no items for the source is
+  // then the honest outcome — and the defect above is what keeps it audible.
+  if (rec === null) return bad('declaration', 'a declaration must be a JSON object', true);
+  if (kind === null) return bad('kind', '`kind` must be a non-empty string naming a source kind', true);
+  if (root === null || !isSafeRelativeRoot(root)) {
+    return bad('root', '`root` must be a relative path inside the workgroup folder, with no `..`', true);
+  }
+  // A key with no platform segment would land the items in a bucket no sidebar
+  // entry can ever match, which is a silent disappearance, not an error.
+  if (channelKey === null) return bad('channel_key', '`channel_key` must look like `<platform>:<channel>`', true);
+  // The optional per-provider fields. ABSENT is fine — most kinds do not take
+  // them. PRESENT-AND-WRONG points the provider at bytes that are not there.
+  if (rec.file !== undefined && (file === null || !isSafeRelativeRoot(file))) {
+    return bad('file', '`file` must be a relative path under `root`, with no `..`', true);
+  }
+  if (rec.branch !== undefined && (typeof rec.branch !== 'string' || !BRANCH_SHAPE.test(rec.branch))) {
+    return bad('branch', '`branch` must be a git ref name', true);
+  }
+
+  const decl: AttentionSourceDecl = {
+    kind,
+    root,
+    channel_key: channelKey,
+    ...(rec.file === undefined ? {} : { file: file! }),
+    ...(rec.branch === undefined ? {} : { branch: rec.branch as string }),
+  };
+
+  // `refresh_hours` is the ONE field that is not source-fatal, because it does
+  // not name any bytes: it gates a display marker and nothing else. So a bad
+  // value keeps the declaration — the source emits its rows exactly as before,
+  // with NO staleness claim (`refresh_hours` stays absent, so
+  // `sourceStaleness` returns `null`; unknown, not fresh) — and reports itself
+  // through the defect. Zero, negative, NaN and Infinity are all rejected: a
+  // cadence has to name a real interval for `now - asOf > interval` to mean
+  // anything.
+  const refreshHours = rec.refresh_hours;
+  if (refreshHours === undefined) return { decl, defect: null };
+  if (typeof refreshHours !== 'number' || !Number.isFinite(refreshHours) || refreshHours <= 0) {
+    return {
+      decl,
+      defect: {
+        index,
+        kind,
+        root,
+        file,
+        channelKey,
+        field: 'refresh_hours',
+        problem: '`refresh_hours` must be a positive, finite number of hours',
+        disablesSource: false,
+      },
+    };
+  }
+  decl.refresh_hours = refreshHours;
+  return { decl, defect: null };
+}
+
+/**
+ * One workgroup's declarations, straight off the row.
+ *
+ * A DB read that throws returns the empty parse rather than a defect: that is
+ * an infrastructure failure, not a config error, the operator cannot fix it by
+ * editing a declaration, and a console whose central DB is unreadable has
+ * larger problems than this feed. It still warns.
+ */
+export function readAttentionSourceDecls(workgroupId: string): AttentionSourceParse {
   let row: { attention_sources: string | null } | undefined;
   try {
     row = getDb().prepare(`SELECT attention_sources FROM workgroups WHERE id = ?`).get(workgroupId) as
@@ -362,7 +537,7 @@ export function readAttentionSourceDecls(workgroupId: string): AttentionSourceDe
       | undefined;
   } catch (err) {
     log.warn('Attention sources: workgroup lookup failed, emitting nothing', { workgroupId, err });
-    return null;
+    return { decls: [], defects: [] };
   }
   return parseAttentionSources(row?.attention_sources);
 }
@@ -419,18 +594,36 @@ export function readAttentionItems(workgroupId: string, now: number, env: Attent
 }
 
 function computeAttentionItems(workgroupId: string, now: number, env: AttentionSourceEnv): AttentionRead {
-  const decls = readAttentionSourceDecls(workgroupId);
-  if (decls === null) {
-    log.warn('Attention sources: malformed declaration, emitting nothing for this workgroup', { workgroupId });
-    return EMPTY;
-  }
-  if (decls.length === 0) {
+  const { decls, defects } = readAttentionSourceDecls(workgroupId);
+  if (decls.length === 0 && defects.length === 0) {
     log.debug('Attention sources: none declared', { workgroupId });
     return EMPTY;
   }
 
   const items: AttentionItem[] = [];
   const seen = new Set<string>();
+  /** Stamp the prefix, dedupe on it, and record provenance. See {@link AttentionItem.id}. */
+  const emit = (
+    item: ProvidedAttentionItem,
+    sourceKind: string,
+    sourceAsOf: string | null,
+    stale: boolean | null,
+  ): void => {
+    const id = `${ATTENTION_ITEM_PREFIX}${item.id}`;
+    if (seen.has(id)) return;
+    seen.add(id);
+    items.push({ ...item, id, sourceKind, sourceAsOf, sourceStale: stale });
+  };
+
+  // Config errors LEAD. One row per malformed declaration, minted here because
+  // a provider that could not be constructed has no hook to report from. They
+  // carry no `asOf` and no staleness claim: the seam knows the declaration is
+  // broken, it does not know anything about the bytes behind it.
+  for (const defect of defects) {
+    log.warn('Attention sources: malformed declaration, reporting it as a work item', { workgroupId, ...defect });
+    emit(misconfiguredSourceItem(defect, workgroupId), defect.kind ?? MISCONFIGURED_SOURCE_KIND, null, null);
+  }
+
   for (const decl of decls) {
     const provider = PROVIDERS[decl.kind];
     if (!provider) {
@@ -457,17 +650,11 @@ function computeAttentionItems(workgroupId: string, now: number, env: AttentionS
     // recomputes it and nothing aggregates it.
     const stale = sourceStaleness(read.asOf, decl.refresh_hours, now);
 
-    const push = (item: ProvidedAttentionItem): void => {
-      // The prefix is stamped HERE, not in the provider — see AttentionItem.id.
-      // Deduped on the stamped id because two sources in one workgroup can
-      // legitimately name the same PR, and two rows sharing a thread_id is a
-      // rendering bug (React keys) on top of a duplicate. First source wins,
-      // in declaration order, so the operator's ordering is the tiebreak.
-      const id = `${ATTENTION_ITEM_PREFIX}${item.id}`;
-      if (seen.has(id)) return;
-      seen.add(id);
-      items.push({ ...item, id, sourceKind: decl.kind, sourceAsOf: read.asOf, sourceStale: stale });
-    };
+    // Deduped on the stamped id because two sources in one workgroup can
+    // legitimately name the same PR, and two rows sharing a thread_id is a
+    // rendering bug (React keys) on top of a duplicate. First source wins, in
+    // declaration order, so the operator's ordering is the tiebreak.
+    const push = (item: ProvidedAttentionItem): void => emit(item, decl.kind, read.asOf, stale);
 
     for (const item of read.items) push(item);
     // EXACTLY ONE per stale source, regardless of how many rows it emitted —
@@ -571,6 +758,116 @@ function staleSourceItem(
 /** The declaration in one readable phrase — kind, plus the file when it names one. */
 function describeSource(decl: AttentionSourceDecl): string {
   return decl.file ? `${decl.kind} (${decl.file})` : decl.kind;
+}
+
+/* ─── Misconfiguration, as a work item ─────────────────────────────────────── */
+
+/**
+ * `sourceKind` for a notice about a declaration too broken to name its own kind.
+ *
+ * A row's `sourceKind` is stamped on the wire and rendered; it cannot be null,
+ * and inventing a plausible provider name would be worse than admitting the
+ * declaration never named one.
+ */
+const MISCONFIGURED_SOURCE_KIND = 'attention-source';
+
+/**
+ * Where a notice lands when the declaration's own `channel_key` is unusable.
+ *
+ * Must equal `UNKNOWN_CHANNEL_KEY` in `src/dashboard/api/threads.ts`, which
+ * cannot be imported here — threads.ts imports THIS module, and a cycle in the
+ * seam is worse than a duplicated four-character literal. Pinned equal by
+ * `src/attention-sources.test.ts`.
+ */
+const UNROUTED_CHANNEL_KEY = 'unknown';
+
+/**
+ * `since` for a misconfiguration notice — a SENTINEL, not a measurement.
+ *
+ * There is no "when it broke" timestamp anywhere in this path: a declaration is
+ * config text with no mtime the seam can see, and the fact is "this has been
+ * wrong since somebody typed it", which nothing records. `since` is not
+ * nullable, so some value has to go here, and the two candidates fail
+ * differently:
+ *
+ *  - `now` is a PLAUSIBLE LIE. It re-dates itself on every poll, so the row
+ *    reads as freshly arrived forever — and `cappedByAge` keeps the OLDEST
+ *    rows, so a perpetually-new row is the FIRST one dropped when the cap
+ *    bites. A misconfiguration that hides itself under a cap is the failure
+ *    this item exists to prevent, wearing the fix's clothes.
+ *  - The epoch is IMPLAUSIBLE ON ITS FACE. It renders as an absurd age no
+ *    reader can mistake for a measurement, and it sorts oldest, so the cap can
+ *    never cut it. §12 forbids inventing a number that could pass for real; it
+ *    does not forbid a sentinel that obviously cannot.
+ *
+ * The real timing information an operator needs is in `claimNote`, which says
+ * what is broken and what it costs — not on a time axis that has no honest
+ * value to put on it.
+ */
+const MISCONFIGURED_SINCE = '1970-01-01T00:00:00.000Z';
+
+/**
+ * A declaration that could not be used, as a work item — the other half of this
+ * seam's self-reporting, beside {@link staleSourceItem}.
+ *
+ * Minted by {@link computeAttentionItems} and by nothing else. Unlike a stale
+ * source there is no provider to ask: a declaration whose `kind` or `root` is
+ * unusable never produced a provider at all, so the seam is the only actor with
+ * a hook to report from — the same argument DESIGN.md §12 makes about silence,
+ * one step earlier in the chain.
+ *
+ * The id is derived only from the declaration — never from a clock — so the row
+ * keeps one identity across polls and an `observatory_item_assignments`
+ * reservation on it stays matched. `misconfigured:` is its own namespace beside
+ * `stale:` and the providers' (`defect:`, `question:`, `branch-ci:`), and the
+ * seam stamps {@link ATTENTION_ITEM_PREFIX} on top like every other id, so
+ * `threadChannelKey` refuses it and it can never mint a sidebar channel.
+ */
+function misconfiguredSourceItem(defect: AttentionSourceDefect, workgroupId: string): ProvidedAttentionItem {
+  const label = describeDefect(defect);
+  // A bad cadence costs a marker; anything else costs the source's rows. Saying
+  // which is the difference between "go fix a label" and "you are blind here".
+  const cost = defect.disablesSource
+    ? 'that source is emitting no items at all'
+    : 'its items are still listed, but carry no staleness marker';
+  return {
+    // Every field that distinguishes one declaration from another, plus the
+    // field at fault, so two broken sources cannot collapse into one notice.
+    // Position is the fallback ONLY when the declaration named nothing at all:
+    // an unnameable error is still an error the operator must see.
+    id: `misconfigured:${
+      [defect.kind, defect.root, defect.file].filter(Boolean).join(':') ||
+      (defect.index < 0 ? 'declaration' : `#${defect.index}`)
+    }:${defect.field}`,
+    // Its siblings' room when the declaration named one, so the notice sits
+    // where the missing work would have. `unknown` when it did not — nobody is
+    // wired to nowhere, and pretending otherwise would offer a dead affordance.
+    channel_key: defect.channelKey ?? UNROUTED_CHANNEL_KEY,
+    title: `${label} is misconfigured`,
+    // The seam knows the declaration is wrong; it does not know where the
+    // operator edits it. Never invented (§12).
+    url: null,
+    workgroupId,
+    claimState: 'parked',
+    // `waiting on` verbatim is what routes this into `needs_you`
+    // (`WAITING_ON_NOTE` in `threads.ts`) — the whole point of the item.
+    claimNote:
+      `waiting on a human: workgroup ${workgroupId} declares ${label} with an unusable \`${defect.field}\` — ` +
+      `${defect.problem}. Right now ${cost}, and staleness is not being checked for it`,
+    claimOwner: null,
+    participants: [],
+    sessionCount: 0,
+    since: MISCONFIGURED_SINCE,
+    nextAction: `Fix \`${defect.field}\` in workgroup ${workgroupId}'s attention_sources declaration`,
+  };
+}
+
+/** The broken declaration in one readable phrase, using whatever of it parsed. */
+function describeDefect(defect: AttentionSourceDefect): string {
+  if (defect.kind === null) {
+    return defect.index < 0 ? 'its attention_sources value' : `attention source declaration #${defect.index}`;
+  }
+  return defect.file ? `attention source ${defect.kind} (${defect.file})` : `attention source ${defect.kind}`;
 }
 
 /** `36` → `1d 12h`, `6` → `6h`. Whole units only; this is a headline, not a metric. */
