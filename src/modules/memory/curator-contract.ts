@@ -533,7 +533,11 @@ function parseConsolidationModelDecision(value: unknown): ConsolidationModelDeci
 
 export interface ConsolidationFileRejection {
   path: string;
-  reason: 'invalid-path' | 'too-large' | 'too-many-files';
+  // 'locked-path' is a runtime property (over-cap or human-authored), not a
+  // content property of the file itself, so it is stamped by the caller
+  // (curator-worker.ts runMaintenanceJob) after this function returns —
+  // never produced here.
+  reason: 'invalid-path' | 'too-large' | 'too-many-files' | 'locked-path';
   bytes?: number;
 }
 

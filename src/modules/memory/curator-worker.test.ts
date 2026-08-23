@@ -884,6 +884,74 @@ describe('pillar-2 semantic consolidation', () => {
       warnSpy.mockRestore();
     });
 
+    // Production poison loop (2026-08-20): a locked-path write used to throw
+    // and fail the WHOLE pass. The locked set (over-cap + human-authored
+    // files) is deterministic per pass, so the retry re-presented the
+    // identical tail to the same model, which proposed the same locked path
+    // again — failing identically forever behind a 6h backoff. This is now a
+    // per-file rejection, same shape as an oversized or bad-path file above.
+    it('a write to a locked topic path is dropped while the rest of the pass still lands', async () => {
+      seedLedger(
+        [
+          '# Generated workgroup memory',
+          '',
+          factLine('mem_aaaaaaaaaaaaaaaa', 'Maya Chen is the Acme liaison.'),
+          factLine('mem_bbbbbbbbbbbbbbbb', 'Acme pricing is usage-based.'),
+          factLine('mem_cccccccccccccccc', 'The on-call roster is hand-maintained.'),
+          '',
+        ].join('\n'),
+      );
+      const peopleDir = path.join(memoryDir(), 'people');
+      fs.mkdirSync(peopleDir, { recursive: true });
+      const humanContent = '# Roster\n\nHuman-authored, do not touch.\n';
+      fs.writeFileSync(path.join(peopleDir, 'roster.md'), humanContent, 'utf8');
+      const warnSpy = vi.spyOn(log, 'warn');
+      const d = deps({
+        claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 3, leaseOwner: 'worker' }),
+        consolidationTail: dbConsolidationTail(),
+        scanTopicFiles, // real scan: picks up roster.md from disk as owned:false
+        writeTopicFile: writeMemoryTopicFile,
+        markConsolidated: markFactsConsolidated,
+        consolidate: vi.fn(
+          async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+            decision: {
+              files: [
+                { path: 'people/maya-chen.md', content: '# Maya Chen\n\nLiaison for Acme.\n' },
+                { path: 'domain/acme-pricing.md', content: '# Acme pricing\n\nUsage-based.\n' },
+                { path: 'people/roster.md', content: '# Roster\n\nModel-proposed overwrite.\n' },
+              ],
+            },
+            model: 'claude-sonnet-5',
+            credentialSlot,
+            usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+          }),
+        ),
+      });
+      const report = await new MemoryCuratorWorker(d).runOne(1000);
+      // The pass did NOT fail: the two valid files exist on disk.
+      expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 2, rejectedCount: 1 });
+      expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/maya-chen.md').content).toContain('Liaison for Acme.');
+      expect(readMemoryTopicFile(TEST_WORKGROUP, 'domain/acme-pricing.md').content).toContain('Usage-based.');
+      // The human-authored file is byte-identical: the model's proposed
+      // overwrite never reached writeTopicFile.
+      expect(fs.readFileSync(path.join(peopleDir, 'roster.md'), 'utf8')).toBe(humanContent);
+      // The tail's fact ids ARE marked consolidated even though one entity's
+      // proposed write was refused this pass.
+      expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(
+        new Set(['mem_aaaaaaaaaaaaaaaa', 'mem_bbbbbbbbbbbbbbbb', 'mem_cccccccccccccccc']),
+      );
+      expect(d.failMaintenance).not.toHaveBeenCalled();
+      // A WARN fired naming the locked path and its distinct reason.
+      expect(warnSpy).toHaveBeenCalledWith(
+        'memory-curator: consolidation dropped invalid topic files this pass',
+        expect.objectContaining({
+          workgroupId: TEST_WORKGROUP,
+          rejected: [expect.objectContaining({ path: 'people/roster.md', reason: 'locked-path' })],
+        }),
+      );
+      warnSpy.mockRestore();
+    });
+
     it('a batch of entirely invalid files still consolidates the tail and writes nothing', async () => {
       seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
       const writeTopicFile = vi.fn();
@@ -1114,6 +1182,13 @@ describe('pillar-2 semantic consolidation', () => {
     logSpy.mockRestore();
   });
 
+  // CONVERTED (production poison loop, 2026-08-20): this used to assert the
+  // whole pass THROWS when the model proposes a write to an over-cap locked
+  // path (`report` was `toBeNull()`). The over-cap exclusion warn itself is
+  // unchanged (still fires exactly as before); what changed is what happens
+  // to the model's write attempt against it — now a per-file rejection that
+  // still lets the pass complete and mark the tail, instead of a throw that
+  // deterministically fails the same way every retry.
   it('over-cap presented topic files are excluded, logged, and locked for that pass', async () => {
     seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
     const writeTopicFile = vi.fn(
@@ -1126,9 +1201,10 @@ describe('pillar-2 semantic consolidation', () => {
     const warnSpy = vi.spyOn(log, 'warn');
     const d = deps({
       claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
-      consolidationTail: realConsolidationTail(),
+      consolidationTail: dbConsolidationTail(),
       scanTopicFiles: () => ({ files: [], excludedPaths: ['people/over.md', 'domain/also-over.md'] }),
       writeTopicFile,
+      markConsolidated: markFactsConsolidated,
       consolidate: vi.fn(
         async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
           decision: { files: [{ path: 'people/over.md', content: '# Over\n' }] },
@@ -1139,12 +1215,21 @@ describe('pillar-2 semantic consolidation', () => {
       ),
     });
     const report = await new MemoryCuratorWorker(d).runOne(1000);
-    expect(report).toBeNull();
+    expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 0, rejectedCount: 1 });
     expect(writeTopicFile).not.toHaveBeenCalled();
     expect(warnSpy).toHaveBeenCalledWith(
       'memory-curator: over-cap topic files excluded and locked for this pass',
       expect.objectContaining({ excludedPaths: ['people/over.md', 'domain/also-over.md'] }),
     );
+    expect(warnSpy).toHaveBeenCalledWith(
+      'memory-curator: consolidation dropped invalid topic files this pass',
+      expect.objectContaining({
+        workgroupId: TEST_WORKGROUP,
+        rejected: [expect.objectContaining({ path: 'people/over.md', reason: 'locked-path' })],
+      }),
+    );
+    expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set(['mem_aaaaaaaaaaaaaaaa']));
+    expect(d.failMaintenance).not.toHaveBeenCalled();
     warnSpy.mockRestore();
   });
 
@@ -1155,7 +1240,17 @@ describe('pillar-2 semantic consolidation', () => {
   // and write, writeTopicFile's ownership check (which only fires against an
   // EXISTING file) would have nothing to refuse against and the write would
   // succeed as a "new file" — the exact violation this closes.
-  it('refuses a model write to a path presented as human-authored, even if it vanishes from disk mid-pass', async () => {
+  //
+  // CONVERTED (production poison loop, 2026-08-20): this used to assert the
+  // whole pass THROWS on a locked-path write (`report` was `toBeNull()`,
+  // `markConsolidated`/`completeMaintenance` were implicitly never reached).
+  // A single all-locked file is now the same shape as "a batch of entirely
+  // invalid files" below — the pass succeeds, writes nothing, and marks the
+  // tail — because the locked set is deterministic per pass and a throw here
+  // could never make the retry succeed; it only reproduced the identical
+  // failure every 6h forever. The locked-write refusal itself (writeTopicFile
+  // never called, file absent from disk) is unchanged and still asserted.
+  it('a batch consisting only of locked paths still consolidates the tail', async () => {
     seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
     const writeTopicFile = vi.fn(
       async (): Promise<CuratorWriteResult> => ({
@@ -1164,10 +1259,12 @@ describe('pillar-2 semantic consolidation', () => {
         sha256: 'a'.repeat(64),
       }),
     );
+    const warnSpy = vi.spyOn(log, 'warn');
     const d = deps({
       claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
-      consolidationTail: realConsolidationTail(),
+      consolidationTail: dbConsolidationTail(),
       writeTopicFile,
+      markConsolidated: markFactsConsolidated,
       // Presented as read-only context, and deliberately absent from disk —
       // scanTopicFiles is not re-invoked between scan and write, so this is
       // exactly what "vanished mid-pass" looks like from the write step.
@@ -1185,9 +1282,19 @@ describe('pillar-2 semantic consolidation', () => {
       ),
     });
     const report = await new MemoryCuratorWorker(d).runOne(1000);
-    expect(report).toBeNull();
+    expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 0, rejectedCount: 1 });
     expect(writeTopicFile).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(memoryDir(), 'people', 'roster.md'))).toBe(false);
+    expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set(['mem_aaaaaaaaaaaaaaaa']));
+    expect(d.failMaintenance).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      'memory-curator: consolidation dropped invalid topic files this pass',
+      expect.objectContaining({
+        workgroupId: TEST_WORKGROUP,
+        rejected: [expect.objectContaining({ path: 'people/roster.md', reason: 'locked-path' })],
+      }),
+    );
+    warnSpy.mockRestore();
   });
 
   // F4. Real fs, no scanner mock: an already-oversized file on disk must be
