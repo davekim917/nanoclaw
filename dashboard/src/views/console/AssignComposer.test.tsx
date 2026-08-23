@@ -170,3 +170,40 @@ describe('once assigned, the button does not stay live', () => {
     expect(screen.queryByLabelText('Assign to')).toBeNull();
   });
 });
+
+describe('a reservation that lapsed without being picked up', () => {
+  // The host stops presenting `assigned` once it is older than its own
+  // re-assign window and moves the same record to `assigned_expired` instead —
+  // never both. The row is genuinely assignable again; this only pins that the
+  // operator sees WHY, rather than the note vanishing without a trace.
+  const expired = () =>
+    item({
+      attention_source: {
+        ...item().attention_source!,
+        assigned: null,
+        assigned_expired: {
+          agent_group_id: 'ag-1',
+          agent_name: 'Alpha',
+          at: '2026-08-20T08:00:00.000Z',
+          by: 'Olive Owner',
+        },
+      },
+    });
+
+  it('gets the Assign control back rather than staying a dead end', async () => {
+    renderDetail(expired());
+    expect(await screen.findByLabelText('Assign to')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'assign' })).toBeTruthy();
+  });
+
+  it('says someone was already asked and it did not take — not a silent reset', async () => {
+    renderDetail(expired());
+    expect(await screen.findByText(/Previously assigned to Alpha by Olive Owner/)).toBeTruthy();
+  });
+
+  it('reuses the same note styling as a live assignment — no new visual language', async () => {
+    renderDetail(expired());
+    const note = await screen.findByText(/Previously assigned to Alpha/);
+    expect(note.className).toBe('ncc-composer-note');
+  });
+});

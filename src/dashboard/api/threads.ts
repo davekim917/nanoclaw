@@ -53,7 +53,7 @@ import type { AgentGroup, SessionMode } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
 import { isSnoozed, readThreadSnoozes } from '../thread-snooze.js';
-import { assignmentKey, readItemAssignments, readUserDisplayNames } from '../db/item-assignments.js';
+import { ASSIGN_DEDUPE_MS, assignmentKey, readItemAssignments, readUserDisplayNames } from '../db/item-assignments.js';
 import { readThreadClosures, type ThreadCloseState } from '../thread-close.js';
 import { requiredConfirmations } from '../thread-close-guard.js';
 import {
@@ -464,7 +464,9 @@ export interface ThreadAttentionSource {
   /** What a person has to do, in the source's own words. */
   next_action: string;
   /**
-   * Who this ownerless item has already been handed to, or null.
+   * Who this ownerless item has already been handed to, or null — **only
+   * while the reservation is fresh** (younger than `ASSIGN_DEDUPE_MS`, the
+   * SAME window `reserveItemAssignment`'s write-side `WHERE` already uses).
    *
    * **The reason the Assign affordance is not a trap.** An attention item is
    * derived on every poll from a board plus the claims directory, so assigning
@@ -480,8 +482,28 @@ export interface ThreadAttentionSource {
    * ("Assigned to X, 2m ago") rather than a live button that can only be
    * refused. State and verb are separate zones in §4's row anatomy, so the
    * headline is not contradicted by what sits beside it.
+   *
+   * **Once the window elapses this reverts to null and the row is assignable
+   * again**, matching what the write side already allows: a lapsed
+   * reservation must not go on presenting inert history as live work in
+   * progress (a PR that merged, un-suppressing the item, then reopened days
+   * later must not still say "waiting for it to pick the work up" about an
+   * agent that finished or never started). The row does not lose the fact
+   * someone was already asked — see {@link assigned_expired}.
    */
   assigned: ThreadItemAssignment | null;
+  /**
+   * The SAME reservation as {@link assigned}, surfaced instead of it once the
+   * window has elapsed — never both at once, and null whenever there is no
+   * reservation at all.
+   *
+   * This is the distinction between "nobody has been asked" and "someone was
+   * asked and it did not take": the row is assignable again either way, but
+   * the operator should be able to tell them apart without digging. Reading
+   * the row's own history costs nothing extra — the query already fetched it
+   * — so it is surfaced rather than dropped.
+   */
+  assigned_expired: ThreadItemAssignment | null;
 }
 
 /** {@link ThreadAttentionSource.assigned}. */
@@ -1708,17 +1730,30 @@ export async function buildThreadList(
   });
 
   /**
-   * The standing assignment on one attention item, resolved for display.
+   * The standing assignment on one attention item, resolved for display and
+   * split by freshness.
    *
    * The agent's name comes from the SAME identity memo a participant's does
    * (per `(agent, messaging_group)`, §10.2) rather than `agent_groups.name` —
    * a row that said `<workgroup>-<role>` where the room shows a friendly name
    * would be the exact defect §10.2 records. Falls back to the wiring's own
    * name, then to the id, so a row never renders blank.
+   *
+   * Applies the SAME staleness window the write side already enforces
+   * (`ASSIGN_DEDUPE_MS`, via `reserveItemAssignment`'s upsert `WHERE`): a
+   * reservation older than that is exactly what an assign attempt would
+   * already overwrite, so the read side must agree rather than going on
+   * presenting it as live. This is what stops a merged-then-reopened board
+   * item (nothing deletes the row when the PR merges and the item stops being
+   * emitted) from rendering as still assigned to whoever claimed it, possibly
+   * days earlier, with no fresh dispatch behind it — the row goes back to
+   * `assigned_expired` instead, never deleted, never mutated.
    */
-  const assignmentOf = (item: AttentionItem): ThreadItemAssignment | null => {
+  const assignmentOf = (
+    item: AttentionItem,
+  ): { assigned: ThreadItemAssignment | null; assigned_expired: ThreadItemAssignment | null } => {
     const found = assignments.get(assignmentKey(item.workgroupId, stripAttentionItemPrefix(item.id)));
-    if (!found) return null;
+    if (!found) return { assigned: null, assigned_expired: null };
     const wiring = (wiredByChannel.get(item.channel_key) ?? []).find((a) => a.agent_group_id === found.agentGroupId);
     const identity = wiring
       ? identities.get(
@@ -1729,12 +1764,18 @@ export async function buildThreadList(
           }),
         )
       : undefined;
-    return {
+    const resolved: ThreadItemAssignment = {
       agent_group_id: found.agentGroupId,
       agent_name: identity?.name ?? wiring?.name ?? found.agentGroupId,
       at: found.assignedAt,
       by: assignerNames.get(found.assignedBy) ?? found.assignedBy,
     };
+    const assignedMs = parseUtcTimestampMs(found.assignedAt);
+    // Mirrors the write side's `WHERE assigned_at < staleBefore` exactly: that
+    // upsert succeeds (row is re-assignable) once `now - assignedMs` exceeds
+    // the window, so "fresh" here is the same `<=` the write side implies.
+    const stale = assignedMs === null || now - assignedMs > ASSIGN_DEDUPE_MS;
+    return stale ? { assigned: null, assigned_expired: resolved } : { assigned: resolved, assigned_expired: null };
   };
 
   const attentionThreads: ThreadSummary[] = attentionItems.map((item) => {
@@ -1775,6 +1816,7 @@ export async function buildThreadList(
       now,
     });
     const lastActivityAt = isoOrNull(item.since);
+    const { assigned, assigned_expired } = assignmentOf(item);
     return {
       thread_id: item.id,
       synthetic: false,
@@ -1812,7 +1854,8 @@ export async function buildThreadList(
         next_action: item.nextAction,
         // Keyed on the item's NATURAL id — the `board:` prefix is a rendering
         // stamp and migration 058 deliberately does not store it.
-        assigned: assignmentOf(item),
+        assigned,
+        assigned_expired,
       },
     };
   });

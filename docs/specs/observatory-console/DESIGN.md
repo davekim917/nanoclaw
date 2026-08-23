@@ -338,6 +338,19 @@ three agents while nothing visibly changes. The record is
 no signal this system can compute beyond the assignment row itself, and §5's own
 rule is that a state which cannot be computed does not exist.
 
+**Update — the read side must apply the same staleness window the write side
+already does.** Nothing deletes a reservation when the underlying item stops
+being emitted (a PR merges, the board row disappears, the reservation goes
+inert and harmless). But a board item can come back — a merged PR gets
+reopened — and re-emits under the same id with the OLD reservation still
+sitting in `observatory_item_assignments`. `attention_source.assigned` is only
+populated while that row is younger than `ASSIGN_DEDUPE_MS`; once it is older,
+`assigned` reverts to null (the row is genuinely assignable again, since the
+write side would accept a new reservation on the next click) and the same
+history rides along as `attention_source.assigned_expired` instead, so the
+operator can tell "someone was asked and it did not take" apart from "nobody
+has been asked" without the row ever being mutated or deleted on a read.
+
 `container_state.provider_status` (`idle` / `active` / `failed`) is populated,
 cross-provider, and currently read by **zero** dashboard code. `failed` must
 surface. This is the cheapest high-value signal available.

@@ -303,6 +303,16 @@ export function MessageText({ text }: { text: string }) {
  * refused — which is exactly how an operator ends up queueing the same work at
  * three agents. The row keeps its `Unassigned` state (no session exists yet)
  * and this line says what has already been done about it.
+ *
+ * **A lapsed reservation gets the control back, plus a note.** The host
+ * already stops presenting `assigned` once it is older than the write side's
+ * own re-assign window — the row is genuinely assignable again, since the
+ * host would accept a new reservation on the next click. But dropping the
+ * history silently would read identically to "nobody has been asked", which
+ * is a real distinction an operator can act on differently. So the lapsed
+ * reservation rides along as `assigned_expired` and renders as the SAME note
+ * styling as the live case, sitting above the ordinary selector rather than
+ * replacing it.
  */
 export function AssignComposer({
   thread,
@@ -318,6 +328,7 @@ export function AssignComposer({
   const [status, setStatus] = useState<string>('');
   const picker = useRef<HTMLSelectElement>(null);
   const assigned = thread.attention_source?.assigned ?? null;
+  const assignedExpired = thread.attention_source?.assigned_expired ?? null;
 
   useEffect(() => {
     if (focusNonce === 0) return;
@@ -368,6 +379,12 @@ export function AssignComposer({
 
   return (
     <div className="ncc-composer">
+      {assignedExpired && (
+        <div className="ncc-composer-note">
+          Previously assigned to {assignedExpired.agent_name} by {assignedExpired.by}, {relAge(assignedExpired.at)} ago
+          — it did not pick the work up. Assignable again below.
+        </div>
+      )}
       <div className="ncc-composer-target">
         <label htmlFor={`ncc-assign-${thread.thread_id}`}>Assign to</label>
         <select

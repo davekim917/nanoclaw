@@ -10,6 +10,26 @@
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 
+/**
+ * How long a reservation holds an item against a second assign — and, on the
+ * read side, how long it presents as a live "waiting for it to pick the work
+ * up" rather than a lapsed one.
+ *
+ * Lives here rather than in `assign.ts` for the SAME reason this whole module
+ * does: `assign.ts` (write) and `api/threads.ts` (read) both need it, and they
+ * sit on opposite sides of an import cycle. One constant, so the write side's
+ * upsert `WHERE` and the read side's presentation can never drift out of
+ * agreement about what "stale" means.
+ *
+ * Long enough to cover what an assignment actually takes to become visible any
+ * other way: the sweep admits the task within ~60s, the container boots, the
+ * agent claims the work, and only then does `claimCoversPr` suppress the board
+ * item. Short enough that an agent which never picked the work up does not
+ * strand it — after the window the item is assignable again, to anyone, and
+ * the read side must stop presenting it as assigned at the same moment.
+ */
+export const ASSIGN_DEDUPE_MS = 10 * 60 * 1000;
+
 export interface ItemAssignment {
   agentGroupId: string;
   /** ISO-8601 UTC. */
