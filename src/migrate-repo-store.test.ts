@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -28,6 +28,24 @@ import {
   resolveRepositoryWorkUnit,
   topicWorktreesDir,
 } from './repository-workspaces.js';
+
+// `pnpm exec tsx` needs a local node_modules/.bin/tsx to find — missing in a
+// worktree without its own install, where it exits immediately instead of
+// running. Same fallback as run-migrations.ts's resolveTsx().
+const TSX_BIN = (() => {
+  const local = path.resolve('node_modules/.bin/tsx');
+  if (fs.existsSync(local)) return local;
+  try {
+    return execSync('which tsx', { encoding: 'utf8' }).trim();
+  } catch {
+    return 'npx';
+  }
+})();
+// npx (last-resort fallback) needs the package name as its first arg; a
+// direct tsx binary does not.
+function tsxArgs(args: string[]): string[] {
+  return TSX_BIN.endsWith('npx') ? ['tsx', ...args] : args;
+}
 
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args], {
@@ -1046,7 +1064,7 @@ describe('lossless server-wide repository migration', () => {
     ].join('\n');
     let crashStatus: number | undefined;
     try {
-      execFileSync('pnpm', ['exec', 'tsx', '-e', crashChild], {
+      execFileSync(TSX_BIN, tsxArgs(['-e', crashChild]), {
         cwd: process.cwd(),
         env: {
           ...process.env,
@@ -1099,7 +1117,7 @@ describe('lossless server-wide repository migration', () => {
       'fs.writeFileSync(process.env.DESCRIPTOR_FILE!, `${JSON.stringify(descriptor, null, 2)}\\n`, { mode: 0o600 });',
       'loadMigrationDescriptor(process.env.DESCRIPTOR_FILE!, process.env.MIGRATION_DATA_DIR!);',
     ].join('\n');
-    execFileSync('pnpm', ['exec', 'tsx', '-e', descriptorChild], {
+    execFileSync(TSX_BIN, tsxArgs(['-e', descriptorChild]), {
       cwd: process.cwd(),
       env: {
         ...process.env,
@@ -1427,7 +1445,7 @@ describe('lossless server-wide repository migration', () => {
       ].join('\n');
       let status: number | undefined;
       try {
-        execFileSync('pnpm', ['exec', 'tsx', '-e', child], {
+        execFileSync(TSX_BIN, tsxArgs(['-e', child]), {
           cwd: process.cwd(),
           env: {
             ...process.env,

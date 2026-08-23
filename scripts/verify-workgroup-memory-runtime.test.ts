@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { spawnSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -10,7 +10,18 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { memoryTreeSha256, WORKGROUP_MEMORY_CONTAINER_PATH } from '../src/modules/workgroup/shared-dirs.js';
 
 const SCRIPT = path.resolve('scripts/verify-workgroup-memory-runtime.ts');
-const TSX = path.resolve('node_modules/.bin/tsx');
+// A literal join, not Node's ancestor-walk resolution — silently missing
+// in a worktree without its own install. Same fallback as run-migrations.ts's resolveTsx().
+const localTsx = path.resolve('node_modules/.bin/tsx');
+const TSX = fs.existsSync(localTsx)
+  ? localTsx
+  : (() => {
+      try {
+        return execSync('which tsx', { encoding: 'utf8' }).trim();
+      } catch {
+        return 'npx';
+      }
+    })();
 const roots: string[] = [];
 
 interface CliResult {
@@ -398,8 +409,12 @@ function seedAppliedWorkgroup(
   );
 }
 
+// npx (last-resort TSX fallback) needs the package name as its first arg; a
+// direct tsx binary does not.
+const tsxArgs = (args: string[]) => (TSX.endsWith('npx') ? ['tsx', ...args] : args);
+
 function run(root: string, args: string[]): CliResult {
-  const result = spawnSync(TSX, [SCRIPT, ...args], {
+  const result = spawnSync(TSX, tsxArgs([SCRIPT, ...args]), {
     cwd: root,
     encoding: 'utf8',
     env: { ...process.env },
