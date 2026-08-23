@@ -53,6 +53,11 @@ import path from 'path';
 import { getDb } from './db/connection.js';
 import { log } from './log.js';
 import { readReleaseBoardSource } from './dashboard/api/board-attention.js';
+import {
+  readBranchCiSource,
+  readDefectRegisterSource,
+  readOpenQuestionsSource,
+} from './dashboard/api/desk-attention.js';
 
 /**
  * Every {@link AttentionItem.id} starts with this.
@@ -104,6 +109,24 @@ export interface AttentionSourceDecl {
    * in the declaration instead of a name→id map in trunk source.
    */
   channel_key: string;
+  /**
+   * One file under {@link root}, RELATIVE to it — for the providers whose
+   * source is a single generated file rather than a directory of them.
+   *
+   * Validated with the same relative-and-`..`-free rule as `root`, in the same
+   * place, so there is exactly one path-shape check in this seam rather than
+   * one per provider. Optional: `release-board` reads fixed filenames under its
+   * root and declares none. A provider that REQUIRES it validates its presence
+   * itself and emits nothing (loudly) when it is missing.
+   */
+  file?: string;
+  /**
+   * A branch label — for providers whose item is about one branch.
+   *
+   * Optional for the same reason `file` is. Kept to the shape a git ref
+   * actually has so it cannot smuggle a path segment into a key or a title.
+   */
+  branch?: string;
 }
 
 /**
@@ -200,6 +223,9 @@ export type AttentionProvider = (
  */
 const PROVIDERS: Record<string, AttentionProvider> = {
   'release-board': readReleaseBoardSource,
+  'defect-register': readDefectRegisterSource,
+  'open-questions': readOpenQuestionsSource,
+  'branch-ci': readBranchCiSource,
 };
 
 const EMPTY: AttentionRead = { asOf: null, items: [] };
@@ -237,7 +263,20 @@ export function parseAttentionSources(raw: string | null | undefined): Attention
     // with no platform segment would land the items in a bucket no sidebar
     // entry can ever match, which is a silent disappearance, not an error.
     if (typeof channelKey !== 'string' || !/^[a-z0-9-]+:.+$/i.test(channelKey)) return null;
-    out.push({ kind, root, channel_key: channelKey });
+    // The two optional per-provider fields. ABSENT is fine — most kinds do not
+    // take them. PRESENT-AND-WRONG is malformed and fails the whole workgroup
+    // closed, exactly like a bad `root`: an operator who typed a path wrong
+    // must not silently get a shorter feed that still looks healthy.
+    const { file, branch } = entry as Record<string, unknown>;
+    if (file !== undefined && (typeof file !== 'string' || !isSafeRelativeRoot(file))) return null;
+    if (branch !== undefined && (typeof branch !== 'string' || !/^[\w./-]+$/.test(branch))) return null;
+    out.push({
+      kind,
+      root,
+      channel_key: channelKey,
+      ...(file === undefined ? {} : { file }),
+      ...(branch === undefined ? {} : { branch }),
+    });
   }
   return out;
 }

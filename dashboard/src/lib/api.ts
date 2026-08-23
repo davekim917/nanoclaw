@@ -836,7 +836,9 @@ export interface ThreadAttentionSource {
   next_action: string;
   /**
    * Who this item has already been handed to, or null — mirrors the host's
-   * `ThreadItemAssignment`.
+   * `ThreadItemAssignment`. Only set while the reservation is still fresh; once
+   * it lapses this reverts to null (see {@link assigned_expired}) and the row
+   * is assignable again.
    *
    * Optional for the same fixture reason as the fields around it; absent reads
    * as "nobody yet". While it is set the row's Assign control is replaced by a
@@ -846,6 +848,12 @@ export interface ThreadAttentionSource {
    * until the agent speaks.
    */
   assigned?: ThreadItemAssignment | null;
+  /**
+   * The same reservation as {@link assigned}, once it has lapsed — never both
+   * at once. Lets the composer say "someone was asked and it did not take"
+   * rather than just falling silently back to a plain Assign control.
+   */
+  assigned_expired?: ThreadItemAssignment | null;
 }
 
 /** {@link ThreadAttentionSource.assigned}. */

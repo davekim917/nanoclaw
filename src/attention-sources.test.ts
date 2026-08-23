@@ -105,6 +105,36 @@ describe('parseAttentionSources', () => {
     expect(parseAttentionSources(raw)).toBeNull();
   });
 
+  it('carries the optional per-provider `file` and `branch` through', () => {
+    expect(
+      parseAttentionSources(
+        `[{"kind":"branch-ci","root":"releases","channel_key":"${CHANNEL_KEY}","file":"release-state.json","branch":"develop"}]`,
+      ),
+    ).toEqual([
+      { kind: 'branch-ci', root: 'releases', channel_key: CHANNEL_KEY, file: 'release-state.json', branch: 'develop' },
+    ]);
+  });
+
+  it('omits `file`/`branch` entirely when they are not declared, rather than setting them undefined', () => {
+    expect(
+      parseAttentionSources(`[{"kind":"release-board","root":"releases","channel_key":"${CHANNEL_KEY}"}]`)![0]!,
+    ).not.toHaveProperty('file');
+  });
+
+  it.each([
+    ['an absolute file', `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":"/etc/passwd"}]`],
+    ['a traversing file', `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":"../x.md"}]`],
+    ['a non-string file', `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":7}]`],
+    ['an empty file', `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":""}]`],
+    ['a non-string branch', `[{"kind":"branch-ci","root":"r","channel_key":"${CHANNEL_KEY}","branch":true}]`],
+    ['a branch with a space', `[{"kind":"branch-ci","root":"r","channel_key":"${CHANNEL_KEY}","branch":"de v"}]`],
+  ])('fails closed on %s', (_why, raw) => {
+    // Present-and-wrong is malformed, exactly like a bad `root`: an operator
+    // who typed a path wrong must not silently get a shorter feed that still
+    // looks healthy.
+    expect(parseAttentionSources(raw)).toBeNull();
+  });
+
   it('fails closed on the WHOLE list when only one entry is malformed — never a partial list', () => {
     // A partial feed is indistinguishable from a healthy short one. An operator
     // who mistypes one entry must not silently lose the others' items while
@@ -199,6 +229,116 @@ describe('readAttentionItems', () => {
     fs.rmSync(path.join(groupsRoot, WORKGROUP, 'releases'), { recursive: true, force: true });
     const after = readAttentionItems(WORKGROUP, t0 + ATTENTION_MEMO_TTL_MS, { groupsRoot, claimsRoot });
     expect(after).toEqual({ asOf: null, items: [] });
+  });
+
+  it('shows a defect AND the PR that fixes it, even when they share a number', () => {
+    // Different objects at different stages: the defect asks a human for a
+    // ruling, the PR asks a human for a ship. They are also different GitHub
+    // NAMESPACES, so number-matching one against the other would silently
+    // delete real blocked work — the over-matching bug already fixed once on
+    // the release-board side. The `defect:` namespace makes the collision
+    // structurally impossible rather than relying on the numbers differing.
+    const groupsRoot = boardRoot([readyPr({ id: 'EXAMPLE-APP#201' })]);
+    fs.writeFileSync(
+      path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'),
+      [
+        `*Generated ${ASOF} by \`gen.py\`.*`,
+        '',
+        '## product-decision (1)',
+        '',
+        '- **[#201](https://github.com/example-org/example-app/issues/201)** · p1 · filed 2026-08-08 · A decision is owed',
+      ].join('\n'),
+    );
+    declare(
+      JSON.stringify([
+        { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY },
+        { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
+      ]),
+    );
+    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
+    expect(read.items.map((i) => i.id)).toEqual([
+      `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#201`,
+      `${ATTENTION_ITEM_PREFIX}defect:example-org/example-app#201`,
+    ]);
+    expect(read.items.map((i) => i.sourceKind)).toEqual(['release-board', 'defect-register']);
+  });
+
+  it('reports the OLDEST asOf across sources, so a fresh one cannot vouch for a stale one', () => {
+    const groupsRoot = boardRoot([readyPr()]);
+    fs.writeFileSync(
+      path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'),
+      ['*Generated 2026-08-16T14:52:24Z by `gen.py`.*', '', '## product-decision (0)', ''].join('\n'),
+    );
+    declare(
+      JSON.stringify([
+        { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY },
+        { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
+      ]),
+    );
+    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
+    expect(read.asOf).toBe('2026-08-16T14:52:24Z');
+  });
+
+  it('stamps every new provider kind with an id that can never be read as a thread id', () => {
+    const groupsRoot = boardRoot([]);
+    const dir = path.join(groupsRoot, WORKGROUP, 'releases');
+    fs.writeFileSync(
+      path.join(dir, 'defects.md'),
+      [
+        `*Generated ${ASOF} by \`gen.py\`.*`,
+        '',
+        '## product-decision (1)',
+        '',
+        '- **[#201](https://github.com/example-org/example-app/issues/201)** · p1 · filed 2026-08-08 · A decision is owed',
+      ].join('\n'),
+    );
+    fs.writeFileSync(path.join(dir, 'open-questions.md'), '# Preamble\n\n## A standing argument\n\nbody\n');
+    fs.writeFileSync(path.join(dir, 'ci.json'), JSON.stringify({ asOf: ASOF, develop_ci: 'failure' }));
+    declare(
+      JSON.stringify([
+        { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
+        { kind: 'open-questions', root: 'releases', channel_key: CHANNEL_KEY, file: 'open-questions.md' },
+        { kind: 'branch-ci', root: 'releases', channel_key: CHANNEL_KEY, file: 'ci.json', branch: 'develop' },
+      ]),
+    );
+    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
+    expect(read.items.map((i) => i.sourceKind)).toEqual(['defect-register', 'open-questions', 'branch-ci']);
+    for (const item of read.items) {
+      expect(isAttentionItemId(item.id)).toBe(true);
+      expect(item.sessionCount).toBe(0);
+      expect(item.participants).toEqual([]);
+      expect(item.channel_key).toBe(CHANNEL_KEY);
+      expect(item.claimNote).toMatch(/\bwaiting on\b/i);
+    }
+  });
+
+  it('one source that cannot read its file does not blank the others', () => {
+    // A `branch-ci` declaration pointed at a markdown file: the JSON parse
+    // fails, that source emits nothing and says so, and the sibling source on
+    // the same list is still read in full. Half a feed and no feed are both
+    // indistinguishable from healthy, so neither may happen quietly.
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const groupsRoot = boardRoot([]);
+    const dir = path.join(groupsRoot, WORKGROUP, 'releases');
+    fs.writeFileSync(
+      path.join(dir, 'defects.md'),
+      [
+        `*Generated ${ASOF} by \`gen.py\`.*`,
+        '',
+        '## product-decision (1)',
+        '',
+        '- **[#201](https://github.com/example-org/example-app/issues/201)** · p1 · filed 2026-08-08 · A decision is owed',
+      ].join('\n'),
+    );
+    declare(
+      JSON.stringify([
+        { kind: 'branch-ci', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md', branch: 'develop' },
+        { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
+      ]),
+    );
+    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot, claimsRoot: tmp('nc-attn-claims-') });
+    expect(read.items.map((i) => i.sourceKind)).toEqual(['defect-register']);
+    expect(warn).toHaveBeenCalled();
   });
 
   it('keeps the TTL far below the claim TTL horizon', () => {

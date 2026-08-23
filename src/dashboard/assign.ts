@@ -64,7 +64,7 @@ import { isOwner, isGlobalAdmin, isAdminOfAgentGroup } from '../modules/permissi
 import { isMember } from '../modules/permissions/db/agent-group-members.js';
 import { personaName, roomPermalink } from './api/observatory.js';
 import { selectScopedAttentionItems, wiredAgentsByChannel } from './api/threads.js';
-import { releaseItemAssignment, reserveItemAssignment } from './db/item-assignments.js';
+import { ASSIGN_DEDUPE_MS, releaseItemAssignment, reserveItemAssignment } from './db/item-assignments.js';
 import { observatoryAssign, type ObservatoryAssignPayload } from './observatory-assign-guard.js';
 import type { AgentGroup } from '../types.js';
 import type { AuthHandler, AuthedRequestContext } from './router.js';
@@ -75,13 +75,11 @@ const json = (status: number, body: unknown): Response =>
 /**
  * How long an assignment holds the item against a second assign.
  *
- * Long enough to cover what an assignment actually takes to become visible any
- * other way: the sweep admits the task within ~60s, the container boots, the
- * agent claims the work, and only then does `claimCoversPr` suppress the board
- * item. Short enough that an agent which never picked the work up does not
- * strand it — after the window the item is assignable again, to anyone.
+ * Re-exported from `item-assignments.ts`, which owns the definition so the
+ * write side here and the read side in `api/threads.ts` share exactly one
+ * constant. See that module for why.
  */
-export const ASSIGN_DEDUPE_MS = 10 * 60 * 1000;
+export { ASSIGN_DEDUPE_MS };
 
 /**
  * The role gate for every Observatory write that makes an agent act. Exported so

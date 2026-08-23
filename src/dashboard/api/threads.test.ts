@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { ATTENTION_ITEM_PREFIX, ATTENTION_MEMO_TTL_MS, clearAttentionMemo } from '../../attention-sources.js';
+import { ASSIGN_DEDUPE_MS } from '../db/item-assignments.js';
 import type { AuthedRequestContext } from '../router.js';
 import type { ContainerState } from '../../db/session-db.js';
 import type { SessionTranscriptEntry } from './sessions.js';
@@ -1673,6 +1674,7 @@ describe('attention-source rows in the thread list', () => {
       // Nobody has been handed it yet. Explicitly null rather than absent —
       // §12: undeclared must never read the same as declared-and-empty.
       assigned: null,
+      assigned_expired: null,
     });
   });
 
@@ -1879,6 +1881,216 @@ describe('attention-source rows in the thread list', () => {
     ).toEqual([]);
   });
 
+  // ── §3.3's recency window does NOT apply to these rows ────────────────────
+  //
+  // The bug: `selectScopedAttentionItems` used to run the same `since_hours`
+  // cutoff over ownerless items that it runs over session-backed threads. A
+  // week-old CONVERSATION is stale and belongs out of view; a week-old item
+  // BLOCKED ON A HUMAN is the opposite — the wait is the reason it needs
+  // surfacing. Two production items sat unclaimed 21-22 days before that was
+  // noticed (operator report 2026-08-20), which is exactly the invisibility
+  // this feed exists to prevent. These tests pin the fix: age never excludes
+  // an attention item, at any `since_hours` value, while every other filter
+  // (scope, workgroup, `group_id`, snooze) still applies unchanged.
+  describe('the since_hours window is lifted for these rows', () => {
+    const THIRTY_DAYS = 30 * 24 * 3_600_000;
+
+    it('an attention item older than the window IS returned', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        LIST_OPTS, // sinceHours: 168 (7d) — the item below is 30 days old
+        attentionDeps(boardRoot([readyPr({ since: iso(THIRTY_DAYS) })])),
+      );
+      expect(threads.map((t) => t.thread_id)).toEqual([`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`]);
+    });
+
+    it('a session-backed thread older than the window is STILL excluded — only attention items are exempt', async () => {
+      declare(null); // no attention source — isolates the session-only path
+      insertSession({
+        id: 's-ancient',
+        agentGroupId: 'ag-example',
+        threadId: 'slack:CTESTOLD001:1.1',
+        lastOutboundAt: '2000-01-01T00:00:00.000Z',
+        lastActive: '2000-01-01T00:00:00.000Z',
+        createdAt: '2000-01-01T00:00:00.000Z',
+      });
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+      expect(threads).toEqual([]);
+    });
+
+    it('an explicit since_hours query param does not resurrect the window for attention items', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        { ...LIST_OPTS, sinceHours: 1 }, // an aggressively small explicit window
+        attentionDeps(boardRoot([readyPr({ since: iso(THIRTY_DAYS) })])),
+      );
+      expect(threads.map((t) => t.thread_id)).toEqual([`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`]);
+    });
+
+    it('every other filter still applies: workgroup narrowing still hides an old item from an unknown workgroup', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const env = {
+        groupsRoot: boardRoot([readyPr({ since: iso(THIRTY_DAYS) })]),
+        claimsRoot: tmp('threads-attn-claims-'),
+      };
+      expect(
+        (await buildThreadList(makeCtx(), { ...LIST_OPTS, workgroupId: 'wg-nope' }, deps({ attentionEnv: env })))
+          .threads,
+      ).toEqual([]);
+    });
+
+    it('every other filter still applies: group_id still yields nothing for an old item', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        { ...LIST_OPTS, groupId: 'ag-example' },
+        attentionDeps(boardRoot([readyPr({ since: iso(THIRTY_DAYS) })])),
+      );
+      expect(threads).toEqual([]);
+    });
+
+    it('every other filter still applies: scope still hides an old item from a caller with no agent group in the workgroup', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const env = {
+        groupsRoot: boardRoot([readyPr({ since: iso(THIRTY_DAYS) })]),
+        claimsRoot: tmp('threads-attn-claims-'),
+      };
+      seedAgentGroup('ag-elsewhere');
+      expect(
+        (
+          await buildThreadList(
+            makeCtx({ no_filter: false, allowed_group_ids: ['ag-elsewhere'] }),
+            LIST_OPTS,
+            deps({ attentionEnv: env }),
+          )
+        ).threads,
+      ).toEqual([]);
+    });
+
+    it('every other filter still applies: an old item still carries this caller’s own snooze', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const oldSince = iso(THIRTY_DAYS);
+      const itemId = `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`;
+      getDb()
+        .prepare(`INSERT INTO thread_snoozes (thread_id, user_id, snoozed_at_activity, created_at) VALUES (?, ?, ?, ?)`)
+        .run(itemId, 'u1', oldSince, iso(0));
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        LIST_OPTS,
+        attentionDeps(boardRoot([readyPr({ since: oldSince })])),
+      );
+      expect(threads).toHaveLength(1);
+      expect(threads[0]!.snoozed).toBe(true);
+    });
+  });
+
+  /**
+   * Lifting the `since_hours` CUTOFF is only half the fix: while the merged
+   * list was sorted freshest-first and re-cut to `limit`, an item's age still
+   * decided whether it appeared at all. `last_activity_at` on one of these rows
+   * IS `item.since` — the moment it started waiting — so the longer something
+   * had been blocked on a human, the further down it sorted and the sooner the
+   * cap dropped it. The most-stalled item was the first to vanish, which is the
+   * same harm the cutoff caused, by a different mechanism.
+   */
+  describe('age can never bury an attention item under the page cap', () => {
+    const THIRTY_DAYS = 30 * 24 * 3_600_000;
+
+    /** `n` session threads, all far fresher than the attention item below. */
+    function seedFreshSessions(n: number): void {
+      for (let i = 0; i < n; i++) {
+        insertSession({
+          id: `s-fresh-${i}`,
+          agentGroupId: 'ag-example',
+          threadId: `slack:CEXAMPLEFRESH:${i}.1`,
+          lastOutboundAt: iso(1_000 + i),
+          lastActive: iso(1_000 + i),
+          createdAt: iso(1_000 + i),
+        });
+      }
+    }
+
+    it('a 30-day-old item survives a page already full of fresher session threads', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      seedFreshSessions(4);
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        { ...LIST_OPTS, limit: 4 }, // exactly filled by the session rows
+        attentionDeps(boardRoot([readyPr({ since: iso(THIRTY_DAYS) })])),
+      );
+      expect(threads.map((t) => t.thread_id)).toContain(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`);
+      // And the session rows are not evicted to make room for it either.
+      expect(threads.filter((t) => t.thread_id.startsWith('slack:CEXAMPLEFRESH'))).toHaveLength(4);
+    });
+
+    it('session threads still honour their own cap — the item does not buy them slots', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      seedFreshSessions(6);
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        { ...LIST_OPTS, limit: 2 },
+        attentionDeps(boardRoot([readyPr({ since: iso(THIRTY_DAYS) })])),
+      );
+      expect(threads.filter((t) => t.thread_id.startsWith('slack:CEXAMPLEFRESH'))).toHaveLength(2);
+      expect(threads.map((t) => t.thread_id)).toContain(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`);
+    });
+
+    it('when the attention cap DOES bite it drops the freshest, never the most-stalled', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const items = [
+        readyPr({ id: 'EXAMPLE-APP#1', since: iso(THIRTY_DAYS) }),
+        readyPr({ id: 'EXAMPLE-APP#2', since: iso(2 * 3_600_000) }),
+        readyPr({ id: 'EXAMPLE-APP#3', since: iso(1_000) }),
+      ];
+      const { threads } = await buildThreadList(makeCtx(), { ...LIST_OPTS, limit: 2 }, attentionDeps(boardRoot(items)));
+      const ids = threads.map((t) => t.thread_id);
+      expect(ids).toContain(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#1`);
+      expect(ids).toContain(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#2`);
+      expect(ids).not.toContain(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#3`);
+    });
+
+    it('an item with no measurable age is dropped before one with a real wait', async () => {
+      // §12 / `compareByActivity`: unmeasured is not a position on a time axis,
+      // and must not stand in for "oldest" and outrank a real 30-day wait.
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const items = [
+        readyPr({ id: 'EXAMPLE-APP#9', since: 'not-a-date' }),
+        readyPr({ id: 'EXAMPLE-APP#1', since: iso(THIRTY_DAYS) }),
+      ];
+      const { threads } = await buildThreadList(makeCtx(), { ...LIST_OPTS, limit: 1 }, attentionDeps(boardRoot(items)));
+      expect(threads.map((t) => t.thread_id)).toEqual([`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#1`]);
+    });
+
+    it('the wire order is still freshest-first across both kinds', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      insertSession({
+        id: 's-mid',
+        agentGroupId: 'ag-example',
+        threadId: 'slack:CEXAMPLEFRESH:1.1',
+        lastOutboundAt: iso(3_600_000),
+        lastActive: iso(3_600_000),
+        createdAt: iso(3_600_000),
+      });
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        LIST_OPTS,
+        attentionDeps(
+          boardRoot([
+            readyPr({ id: 'EXAMPLE-APP#801', since: iso(60_000) }),
+            readyPr({ id: 'EXAMPLE-APP#802', since: iso(THIRTY_DAYS) }),
+          ]),
+        ),
+      );
+      expect(threads.map((t) => t.thread_id)).toEqual([
+        `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#801`,
+        'slack:CEXAMPLEFRESH:1.1',
+        `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#802`,
+      ]);
+    });
+  });
+
   /**
    * The row has to STOP reading as ownerless the moment the work is handed
    * over. An assignment takes minutes to become visible any other way — the
@@ -1930,6 +2142,30 @@ describe('attention-source rows in the thread list', () => {
         at: '2026-08-20T12:00:00.000Z',
         by: 'Olive Owner',
       });
+    });
+
+    it("a reservation older than the write side's own re-assign window is not presented as assigned", async () => {
+      // The exact same offset `assign.test.ts` uses to prove the WRITE side
+      // allows a re-assign past this point — the read side must agree.
+      const staleAt = new Date(NOW - ASSIGN_DEDUPE_MS - 1000).toISOString();
+      record('EXAMPLE-APP#817', staleAt);
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+      // Not deleted, not silently dropped — moved to `assigned_expired` so the
+      // operator can tell "someone was asked and it did not take" apart from
+      // "nobody has been asked", while the row itself is assignable again.
+      expect(threads[0]!.attention_source!.assigned).toBeNull();
+      expect(threads[0]!.attention_source!.assigned_expired).toEqual({
+        agent_group_id: 'ag-example',
+        agent_name: 'persona:ag-example',
+        at: staleAt,
+        by: 'Olive Owner',
+      });
+      // The row itself never disappears or mutates in the DB — a read must not
+      // clean up what a sweep should own instead.
+      const row = getDb()
+        .prepare(`SELECT assigned_at FROM observatory_item_assignments WHERE item_id = 'EXAMPLE-APP#817'`)
+        .get() as { assigned_at: string };
+      expect(row.assigned_at).toBe(staleAt);
     });
 
     it('stays `unassigned` — no session exists until the agent speaks, and the state says only that', async () => {

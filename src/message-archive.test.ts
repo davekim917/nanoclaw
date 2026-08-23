@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { spawnSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import path from 'path';
 import { pathToFileURL } from 'url';
 
@@ -282,11 +282,25 @@ describe('memory curation episode queue', () => {
     fs.rmSync(restartRoot, { recursive: true, force: true });
     fs.mkdirSync(restartRoot, { recursive: true });
     const moduleUrl = pathToFileURL(path.resolve('src/message-archive.ts')).href;
-    const tsx = path.resolve('node_modules/.bin/tsx');
+    // A literal join, not Node's ancestor-walk resolution — silently missing
+    // in a worktree without its own install. Same fallback as run-migrations.ts's resolveTsx().
+    const localTsx = path.resolve('node_modules/.bin/tsx');
+    const tsx = fs.existsSync(localTsx)
+      ? localTsx
+      : (() => {
+          try {
+            return execSync('which tsx', { encoding: 'utf8' }).trim();
+          } catch {
+            return 'npx';
+          }
+        })();
+    // npx (last-resort fallback) needs the package name as its first arg; a
+    // direct tsx binary does not.
+    const tsxArgs = (args: string[]) => (tsx.endsWith('npx') ? ['tsx', ...args] : args);
     const start = Date.parse('2026-07-26T00:00:00.000Z');
     const first = spawnSync(
       tsx,
-      [
+      tsxArgs([
         '-e',
         `import {
           archiveMessageAndScheduleMemoryCuration,
@@ -311,7 +325,7 @@ describe('memory curation episode queue', () => {
         const episode = claimMemoryCurationEpisode('first-host', { nowMs: start });
         if (!episode || !failMemoryCurationEpisode(episode, 'quota', { nowMs: start })) process.exit(2);
         console.log(JSON.stringify({ claimedThroughRowid: episode.claimedThroughRowid }));`,
-      ],
+      ]),
       { cwd: restartRoot, encoding: 'utf8' },
     );
     expect(first.status, first.stderr).toBe(0);
@@ -319,7 +333,7 @@ describe('memory curation episode queue', () => {
 
     const second = spawnSync(
       tsx,
-      [
+      tsxArgs([
         '-e',
         `import {
           claimMemoryCurationEpisode,
@@ -333,7 +347,7 @@ describe('memory curation episode queue', () => {
           handledRowid: episode.handledRowid,
           ids: messages.map((message) => message.id)
         }));`,
-      ],
+      ]),
       { cwd: restartRoot, encoding: 'utf8' },
     );
     expect(second.status, second.stderr).toBe(0);

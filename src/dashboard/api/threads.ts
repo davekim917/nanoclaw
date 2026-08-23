@@ -53,7 +53,7 @@ import type { AgentGroup, SessionMode } from '../../types.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
 import { parseUtcTimestampMs } from '../../thread-context.js';
 import { isSnoozed, readThreadSnoozes } from '../thread-snooze.js';
-import { assignmentKey, readItemAssignments, readUserDisplayNames } from '../db/item-assignments.js';
+import { ASSIGN_DEDUPE_MS, assignmentKey, readItemAssignments, readUserDisplayNames } from '../db/item-assignments.js';
 import { readThreadClosures, type ThreadCloseState } from '../thread-close.js';
 import { requiredConfirmations } from '../thread-close-guard.js';
 import {
@@ -464,7 +464,9 @@ export interface ThreadAttentionSource {
   /** What a person has to do, in the source's own words. */
   next_action: string;
   /**
-   * Who this ownerless item has already been handed to, or null.
+   * Who this ownerless item has already been handed to, or null — **only
+   * while the reservation is fresh** (younger than `ASSIGN_DEDUPE_MS`, the
+   * SAME window `reserveItemAssignment`'s write-side `WHERE` already uses).
    *
    * **The reason the Assign affordance is not a trap.** An attention item is
    * derived on every poll from a board plus the claims directory, so assigning
@@ -480,8 +482,28 @@ export interface ThreadAttentionSource {
    * ("Assigned to X, 2m ago") rather than a live button that can only be
    * refused. State and verb are separate zones in §4's row anatomy, so the
    * headline is not contradicted by what sits beside it.
+   *
+   * **Once the window elapses this reverts to null and the row is assignable
+   * again**, matching what the write side already allows: a lapsed
+   * reservation must not go on presenting inert history as live work in
+   * progress (a PR that merged, un-suppressing the item, then reopened days
+   * later must not still say "waiting for it to pick the work up" about an
+   * agent that finished or never started). The row does not lose the fact
+   * someone was already asked — see {@link assigned_expired}.
    */
   assigned: ThreadItemAssignment | null;
+  /**
+   * The SAME reservation as {@link assigned}, surfaced instead of it once the
+   * window has elapsed — never both at once, and null whenever there is no
+   * reservation at all.
+   *
+   * This is the distinction between "nobody has been asked" and "someone was
+   * asked and it did not take": the row is assignable again either way, but
+   * the operator should be able to tell them apart without digging. Reading
+   * the row's own history costs nothing extra — the query already fetched it
+   * — so it is surfaced rather than dropped.
+   */
+  assigned_expired: ThreadItemAssignment | null;
 }
 
 /** {@link ThreadAttentionSource.assigned}. */
@@ -1137,6 +1159,22 @@ function threadRoutingChannel(rows: ThreadSessionRow[]): string | null {
  * definitionally on no agent, so including it would answer a question the
  * operator did not ask. The workgroup axis — §3.5's primary one — is the axis
  * these items actually have.
+ *
+ * **`since_hours` never excludes one of these rows, at any value — not a
+ * generous default, none at all.** That window is a working-set filter for
+ * session-backed threads (§3.3): a conversation nobody has spoken in for a
+ * week is stale and belongs out of view. An ownerless item is the opposite of
+ * stale — it is blocked ON A HUMAN, so the longer it has waited the MORE it
+ * needs surfacing, never less. Two production items sat unclaimed for 21-22
+ * days before that was noticed (operator report 2026-08-20), and that
+ * invisibility was the entire reason this join exists; running the same
+ * recency cutoff over these rows exactly inverts their semantics and would
+ * silently reintroduce the bug this feed was built to fix. So the loop below
+ * never computes a cutoff — an unparseable `since` needs no special case for
+ * that reason either: age decides SORT order only (§12 — an unmeasured value
+ * sorts last, never a zero), and, now, so does every OTHER age. Every other
+ * narrowing above (scope, workgroup, `group_id`, §2a absent-not-403) still
+ * applies unchanged.
  */
 export function selectScopedAttentionItems(
   ctx: AuthedRequestContext,
@@ -1157,19 +1195,16 @@ export function selectScopedAttentionItems(
   if (opts.workgroupId) workgroupIds = workgroupIds.filter((id) => id === opts.workgroupId);
   if (workgroupIds.length === 0) return empty;
 
-  const cutoff = opts.threadId ? null : now - opts.sinceHours * 3_600_000;
   const items: AttentionItem[] = [];
   for (const wg of workgroupIds) {
     for (const item of readAttentionItems(wg, now, env).items) {
+      // `threadId` narrows to that one row (detail/assign path); every other
+      // item is in scope regardless of `since` — see the doc comment above.
+      // `opts.sinceHours` is deliberately never read here.
       if (opts.threadId) {
         if (item.id === opts.threadId) items.push(item);
         continue;
       }
-      // An unparseable `since` is NOT silently dropped: the item is real work
-      // and the window is a convenience filter, so it stays and sorts last
-      // (§12 — an unmeasured value is not a zero).
-      const since = parseUtcTimestampMs(item.since);
-      if (cutoff !== null && since !== null && since < cutoff) continue;
       items.push(item);
     }
   }
@@ -1695,17 +1730,30 @@ export async function buildThreadList(
   });
 
   /**
-   * The standing assignment on one attention item, resolved for display.
+   * The standing assignment on one attention item, resolved for display and
+   * split by freshness.
    *
    * The agent's name comes from the SAME identity memo a participant's does
    * (per `(agent, messaging_group)`, §10.2) rather than `agent_groups.name` —
    * a row that said `<workgroup>-<role>` where the room shows a friendly name
    * would be the exact defect §10.2 records. Falls back to the wiring's own
    * name, then to the id, so a row never renders blank.
+   *
+   * Applies the SAME staleness window the write side already enforces
+   * (`ASSIGN_DEDUPE_MS`, via `reserveItemAssignment`'s upsert `WHERE`): a
+   * reservation older than that is exactly what an assign attempt would
+   * already overwrite, so the read side must agree rather than going on
+   * presenting it as live. This is what stops a merged-then-reopened board
+   * item (nothing deletes the row when the PR merges and the item stops being
+   * emitted) from rendering as still assigned to whoever claimed it, possibly
+   * days earlier, with no fresh dispatch behind it — the row goes back to
+   * `assigned_expired` instead, never deleted, never mutated.
    */
-  const assignmentOf = (item: AttentionItem): ThreadItemAssignment | null => {
+  const assignmentOf = (
+    item: AttentionItem,
+  ): { assigned: ThreadItemAssignment | null; assigned_expired: ThreadItemAssignment | null } => {
     const found = assignments.get(assignmentKey(item.workgroupId, stripAttentionItemPrefix(item.id)));
-    if (!found) return null;
+    if (!found) return { assigned: null, assigned_expired: null };
     const wiring = (wiredByChannel.get(item.channel_key) ?? []).find((a) => a.agent_group_id === found.agentGroupId);
     const identity = wiring
       ? identities.get(
@@ -1716,12 +1764,18 @@ export async function buildThreadList(
           }),
         )
       : undefined;
-    return {
+    const resolved: ThreadItemAssignment = {
       agent_group_id: found.agentGroupId,
       agent_name: identity?.name ?? wiring?.name ?? found.agentGroupId,
       at: found.assignedAt,
       by: assignerNames.get(found.assignedBy) ?? found.assignedBy,
     };
+    const assignedMs = parseUtcTimestampMs(found.assignedAt);
+    // Mirrors the write side's `WHERE assigned_at < staleBefore` exactly: that
+    // upsert succeeds (row is re-assignable) once `now - assignedMs` exceeds
+    // the window, so "fresh" here is the same `<=` the write side implies.
+    const stale = assignedMs === null || now - assignedMs > ASSIGN_DEDUPE_MS;
+    return stale ? { assigned: null, assigned_expired: resolved } : { assigned: resolved, assigned_expired: null };
   };
 
   const attentionThreads: ThreadSummary[] = attentionItems.map((item) => {
@@ -1762,6 +1816,7 @@ export async function buildThreadList(
       now,
     });
     const lastActivityAt = isoOrNull(item.since);
+    const { assigned, assigned_expired } = assignmentOf(item);
     return {
       thread_id: item.id,
       synthetic: false,
@@ -1799,23 +1854,62 @@ export async function buildThreadList(
         next_action: item.nextAction,
         // Keyed on the item's NATURAL id — the `board:` prefix is a rendering
         // stamp and migration 058 deliberately does not store it.
-        assigned: assignmentOf(item),
+        assigned,
+        assigned_expired,
       },
     };
   });
 
   if (attentionThreads.length === 0) return { threads };
-  // Merged into ONE queue, never a separate inbox (§2). Sorted on the same
-  // axis as the session rows — freshest first — and re-capped, so an install
-  // with a busy board cannot push live threads off the page by arriving after
-  // the slice.
-  const merged = [...threads, ...attentionThreads]
-    .sort(
-      (a, b) =>
-        (parseUtcTimestampMs(b.last_activity_at) ?? -Infinity) - (parseUtcTimestampMs(a.last_activity_at) ?? -Infinity),
-    )
-    .slice(0, opts.limit);
+  // Merged into ONE queue, never a separate inbox (§2), and sorted on the same
+  // axis as the session rows — freshest first — so the wire order is one order.
+  //
+  // But the two kinds are capped SEPARATELY and the merged list is not re-cut.
+  // A single cap over the merged list would have been a recency cutoff wearing
+  // a different hat: `last_activity_at` on one of these rows is `item.since`,
+  // the moment it STARTED waiting, so the longer an item had been blocked on a
+  // human the further down it sorted and the sooner the cap dropped it — the
+  // most-stalled item is the first to disappear, which is precisely the
+  // invisibility `selectScopedAttentionItems` had its `since_hours` window
+  // lifted to end (two items unclaimed for 21-22 days, operator report
+  // 2026-08-20). Age must decide ORDER and never membership.
+  //
+  // Each kind therefore gets its own budget of `limit`: session threads were
+  // already cut to `limit` above, so a busy board cannot push a live thread off
+  // the page, and a busy workgroup cannot push a stalled item off it either.
+  // The trade is that one page can carry up to 2x `limit` rows — deliberate,
+  // because the alternative is one lane starving the other, which is the bug.
+  const merged = [...threads, ...cappedByAge(attentionThreads, opts.limit)].sort(
+    (a, b) =>
+      (parseUtcTimestampMs(b.last_activity_at) ?? -Infinity) - (parseUtcTimestampMs(a.last_activity_at) ?? -Infinity),
+  );
   return { threads: merged };
+}
+
+/**
+ * At most `limit` attention rows, keeping the OLDEST — the ones that have been
+ * blocked on a human longest.
+ *
+ * The direction is the whole point. These rows are bounded only by files an
+ * agent writes, so some cap has to exist; sorting oldest-first before it means
+ * that if the cap ever bites it drops the freshest arrival rather than the
+ * item nobody has looked at in three weeks.
+ *
+ * A row with no measurable age sorts LAST here and is dropped first, matching
+ * the console's own rule (§12, `compareByActivity`): unmeasured is not a
+ * position on a time axis, and letting `-Infinity` stand in for "oldest" would
+ * float every undated row past real, measured waits.
+ */
+function cappedByAge(rows: ThreadSummary[], limit: number): ThreadSummary[] {
+  if (rows.length <= limit) return rows;
+  return [...rows]
+    .sort((a, b) => {
+      const am = parseUtcTimestampMs(a.last_activity_at);
+      const bm = parseUtcTimestampMs(b.last_activity_at);
+      if (am === null || bm === null) return (am === null ? 1 : 0) - (bm === null ? 1 : 0);
+      return am - bm;
+    })
+    .slice(0, limit);
 }
 
 export const threadsHandler: AuthHandler = async (req, _params, ctx) => {
