@@ -1879,6 +1879,111 @@ describe('attention-source rows in the thread list', () => {
     ).toEqual([]);
   });
 
+  // ── §3.3's recency window does NOT apply to these rows ────────────────────
+  //
+  // The bug: `selectScopedAttentionItems` used to run the same `since_hours`
+  // cutoff over ownerless items that it runs over session-backed threads. A
+  // week-old CONVERSATION is stale and belongs out of view; a week-old item
+  // BLOCKED ON A HUMAN is the opposite — the wait is the reason it needs
+  // surfacing. Two production items sat unclaimed 21-22 days before that was
+  // noticed (operator report 2026-08-20), which is exactly the invisibility
+  // this feed exists to prevent. These tests pin the fix: age never excludes
+  // an attention item, at any `since_hours` value, while every other filter
+  // (scope, workgroup, `group_id`, snooze) still applies unchanged.
+  describe('the since_hours window is lifted for these rows', () => {
+    const THIRTY_DAYS = 30 * 24 * 3_600_000;
+
+    it('an attention item older than the window IS returned', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        LIST_OPTS, // sinceHours: 168 (7d) — the item below is 30 days old
+        attentionDeps(boardRoot([readyPr({ since: iso(THIRTY_DAYS) })])),
+      );
+      expect(threads.map((t) => t.thread_id)).toEqual([`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`]);
+    });
+
+    it('a session-backed thread older than the window is STILL excluded — only attention items are exempt', async () => {
+      declare(null); // no attention source — isolates the session-only path
+      insertSession({
+        id: 's-ancient',
+        agentGroupId: 'ag-example',
+        threadId: 'slack:CTESTOLD001:1.1',
+        lastOutboundAt: '2000-01-01T00:00:00.000Z',
+        lastActive: '2000-01-01T00:00:00.000Z',
+        createdAt: '2000-01-01T00:00:00.000Z',
+      });
+      const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, deps());
+      expect(threads).toEqual([]);
+    });
+
+    it('an explicit since_hours query param does not resurrect the window for attention items', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        { ...LIST_OPTS, sinceHours: 1 }, // an aggressively small explicit window
+        attentionDeps(boardRoot([readyPr({ since: iso(THIRTY_DAYS) })])),
+      );
+      expect(threads.map((t) => t.thread_id)).toEqual([`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`]);
+    });
+
+    it('every other filter still applies: workgroup narrowing still hides an old item from an unknown workgroup', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const env = {
+        groupsRoot: boardRoot([readyPr({ since: iso(THIRTY_DAYS) })]),
+        claimsRoot: tmp('threads-attn-claims-'),
+      };
+      expect(
+        (await buildThreadList(makeCtx(), { ...LIST_OPTS, workgroupId: 'wg-nope' }, deps({ attentionEnv: env })))
+          .threads,
+      ).toEqual([]);
+    });
+
+    it('every other filter still applies: group_id still yields nothing for an old item', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        { ...LIST_OPTS, groupId: 'ag-example' },
+        attentionDeps(boardRoot([readyPr({ since: iso(THIRTY_DAYS) })])),
+      );
+      expect(threads).toEqual([]);
+    });
+
+    it('every other filter still applies: scope still hides an old item from a caller with no agent group in the workgroup', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const env = {
+        groupsRoot: boardRoot([readyPr({ since: iso(THIRTY_DAYS) })]),
+        claimsRoot: tmp('threads-attn-claims-'),
+      };
+      seedAgentGroup('ag-elsewhere');
+      expect(
+        (
+          await buildThreadList(
+            makeCtx({ no_filter: false, allowed_group_ids: ['ag-elsewhere'] }),
+            LIST_OPTS,
+            deps({ attentionEnv: env }),
+          )
+        ).threads,
+      ).toEqual([]);
+    });
+
+    it('every other filter still applies: an old item still carries this caller’s own snooze', async () => {
+      declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+      const oldSince = iso(THIRTY_DAYS);
+      const itemId = `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`;
+      getDb()
+        .prepare(`INSERT INTO thread_snoozes (thread_id, user_id, snoozed_at_activity, created_at) VALUES (?, ?, ?, ?)`)
+        .run(itemId, 'u1', oldSince, iso(0));
+      const { threads } = await buildThreadList(
+        makeCtx(),
+        LIST_OPTS,
+        attentionDeps(boardRoot([readyPr({ since: oldSince })])),
+      );
+      expect(threads).toHaveLength(1);
+      expect(threads[0]!.snoozed).toBe(true);
+    });
+  });
+
   /**
    * The row has to STOP reading as ownerless the moment the work is handed
    * over. An assignment takes minutes to become visible any other way — the

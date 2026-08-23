@@ -1137,6 +1137,22 @@ function threadRoutingChannel(rows: ThreadSessionRow[]): string | null {
  * definitionally on no agent, so including it would answer a question the
  * operator did not ask. The workgroup axis — §3.5's primary one — is the axis
  * these items actually have.
+ *
+ * **`since_hours` never excludes one of these rows, at any value — not a
+ * generous default, none at all.** That window is a working-set filter for
+ * session-backed threads (§3.3): a conversation nobody has spoken in for a
+ * week is stale and belongs out of view. An ownerless item is the opposite of
+ * stale — it is blocked ON A HUMAN, so the longer it has waited the MORE it
+ * needs surfacing, never less. Two production items sat unclaimed for 21-22
+ * days before that was noticed (operator report 2026-08-20), and that
+ * invisibility was the entire reason this join exists; running the same
+ * recency cutoff over these rows exactly inverts their semantics and would
+ * silently reintroduce the bug this feed was built to fix. So the loop below
+ * never computes a cutoff — an unparseable `since` needs no special case for
+ * that reason either: age decides SORT order only (§12 — an unmeasured value
+ * sorts last, never a zero), and, now, so does every OTHER age. Every other
+ * narrowing above (scope, workgroup, `group_id`, §2a absent-not-403) still
+ * applies unchanged.
  */
 export function selectScopedAttentionItems(
   ctx: AuthedRequestContext,
@@ -1157,19 +1173,16 @@ export function selectScopedAttentionItems(
   if (opts.workgroupId) workgroupIds = workgroupIds.filter((id) => id === opts.workgroupId);
   if (workgroupIds.length === 0) return empty;
 
-  const cutoff = opts.threadId ? null : now - opts.sinceHours * 3_600_000;
   const items: AttentionItem[] = [];
   for (const wg of workgroupIds) {
     for (const item of readAttentionItems(wg, now, env).items) {
+      // `threadId` narrows to that one row (detail/assign path); every other
+      // item is in scope regardless of `since` — see the doc comment above.
+      // `opts.sinceHours` is deliberately never read here.
       if (opts.threadId) {
         if (item.id === opts.threadId) items.push(item);
         continue;
       }
-      // An unparseable `since` is NOT silently dropped: the item is real work
-      // and the window is a convenience filter, so it stays and sorts last
-      // (§12 — an unmeasured value is not a zero).
-      const since = parseUtcTimestampMs(item.since);
-      if (cutoff !== null && since !== null && since < cutoff) continue;
       items.push(item);
     }
   }
