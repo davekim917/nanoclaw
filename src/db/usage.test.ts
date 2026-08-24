@@ -225,6 +225,34 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     });
   });
 
+  it('two turn_usage rows sharing one turn_id (a multi-model turn) roll up into two central rows carrying that SAME turn_id', () => {
+    // The regression this whole fix targets: usage_daily's turns column
+    // counts rows, and a multi-model turn writes N of them. Once turn_id
+    // survives the rollup unmolested, COUNT(DISTINCT turn_id) against the
+    // central table recovers the real turn count (1) instead of the
+    // over-counted row count (2) usage_daily would report.
+    const outDb = makeOutboundDbWithTurnMeta();
+    outDb
+      .prepare(
+        `INSERT INTO turn_usage (ts, provider, model, turn_id, input_tokens) VALUES
+           ('2026-08-10T01:00:00.000Z', 'claude', 'claude-opus-5', 'shared-turn-id', 1000),
+           ('2026-08-10T01:00:00.000Z', 'claude', 'claude-sonnet-5', 'shared-turn-id', 3000)`,
+      )
+      .run();
+
+    expect(rollupSessionUsage(outDb, GID, SESSION_DIR)).toBe(2);
+
+    const centralRows = getDb().prepare('SELECT turn_id FROM turn_usage ORDER BY id ASC').all() as Array<{
+      turn_id: string | null;
+    }>;
+    expect(centralRows).toHaveLength(2);
+    expect(centralRows[0].turn_id).toBe('shared-turn-id');
+    expect(centralRows[1].turn_id).toBe('shared-turn-id');
+
+    const distinct = getDb().prepare('SELECT COUNT(DISTINCT turn_id) AS n FROM turn_usage').get() as { n: number };
+    expect(distinct.n).toBe(1);
+  });
+
   it('an old-shape turn_usage row (missing steps/duration_ms/trigger/rate_limit_*/turn_id columns) rolls up without throwing, central row is NULL', () => {
     const outDb = makeOutboundDb(); // the pre-Phase-0.1-follow-up fixture, no new columns at all
     insertTurn(outDb, { ts: '2026-08-10T01:00:00.000Z' });

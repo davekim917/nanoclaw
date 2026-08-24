@@ -22,6 +22,17 @@
  * turn's own delta, measured at 1.3-5.2x inflation. Nothing here corrects
  * that retroactively; treat usage_daily/turn_usage rows from before that fix
  * as directional only, not exact.
+ *
+ * NOTE ON usage_daily.turns (turn-correlation fix, migration 061): a turn
+ * spanning multiple models writes one turn_usage row per model, so
+ * usage_daily's row-counting `turns = turns + 1` (below) over-counts by
+ * exactly that factor — measured ~1.35x fleet-wide, up to 1.62x for the
+ * heaviest group. `turn_id` (mirrored into the central turn_usage row below)
+ * is shared by every row one turn writes, so the true count is
+ * `COUNT(DISTINCT turn_id)` against the central table. usage_daily itself is
+ * deliberately left alone here — `ncl usage`/the dashboard depend on its
+ * current (wrong) behavior, and fixing both at once would make this
+ * regression un-diagnosable.
  */
 import type Database from 'better-sqlite3';
 
