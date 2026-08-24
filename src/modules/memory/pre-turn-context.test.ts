@@ -1210,17 +1210,29 @@ describe('per-person preference recall', () => {
   });
 });
 
+/**
+ * Exhaust the walk's visited-ENTRY guard inside one directory.
+ *
+ * Derived from the bound, so raising the guard cannot quietly stop exercising
+ * the starvation path the direct-lister lanes exist for. The filler is
+ * deliberately NOT Markdown: `listMarkdownFiles` counts every entry it visits
+ * but collects only `.md`, so non-Markdown spends the budget exactly like a
+ * document would while costing nothing to read, tokenize or rank — which keeps
+ * a bound-sized seed cheap enough to stay in the suite.
+ */
+function seedOverCapEntries(dir: string): void {
+  for (let index = 0; index < PRE_TURN_BOUNDS.markdownFiles + 8; index++) {
+    memoryFile(`${dir}/filler-${String(index).padStart(5, '0')}.txt`, '');
+  }
+}
+
 // Root cause: listMarkdownFiles walks BFS with a PRE_TURN_BOUNDS.markdownFiles
-// (256) visited-entry cap. `concepts/` sorts before both `preferences/` and
-// `generated/`, so a tree with enough concepts files exhausts the cap before
+// visited-entry cap. `concepts/` sorts before both `preferences/` and
+// `generated/`, so a tree with enough concepts entries exhausts the cap before
 // either directory is ever enumerated. Both lanes below are deterministic,
 // direct-path lookups and must not depend on the ranked walk's output.
 describe('recall lanes survive file-walk cap starvation', () => {
-  function seedOverCapTree(): void {
-    for (let index = 0; index < 300; index++) {
-      memoryFile(`concepts/note-${String(index).padStart(3, '0')}.md`, `# Note ${index}\nFiller content ${index}.`);
-    }
-  }
+  const seedOverCapTree = (): void => seedOverCapEntries('concepts');
 
   it('preference lane survives a memory tree larger than the file-walk cap', () => {
     seedOverCapTree();
@@ -1798,9 +1810,7 @@ describe('recall token cache survives a working set larger than the old 8,192-en
 // 40 consolidation-produced topic views structurally invisible to recall.
 describe('curator topic directories always reach recall', () => {
   it('delivers people/, domain/ and systems/ files past the file-walk cap', () => {
-    for (let index = 0; index < 300; index++) {
-      memoryFile(`domain/topic-${String(index).padStart(3, '0')}.md`, `# Topic ${index}\nUnrelated filler ${index}.`);
-    }
+    seedOverCapEntries('domain');
     memoryFile('domain/quarterly-forecast.md', '# Quarterly forecast\nThe forecast pipeline volume doubled.');
     memoryFile('people/alex-stone.md', '# Alex Stone\nAlex owns the forecast pipeline volume review.');
     memoryFile('systems/forecast-pipeline.md', '# Forecast pipeline\nThe forecast pipeline volume is sharded.');
@@ -1820,6 +1830,60 @@ describe('curator topic directories always reach recall', () => {
     expect(paths).toContain('people/alex-stone.md');
     expect(paths).toContain('systems/forecast-pipeline.md');
     expect(paths).toContain('domain/quarterly-forecast.md');
+  });
+});
+
+// The direct-lister lanes above are a hardcoded list, and every directory NOT
+// on it was still losing the walk's sort race. On the live 587-entry tree the
+// 256-entry cap was spent by `<root>` (92) plus `domain/` (161), so `methods/`
+// — 190 files of agent-authored engineering knowledge, the exact thing recall
+// exists to surface — plus `imported/claude-auto` (81), `learning/`,
+// `imports/` and `system/` were never enumerated at all. Adding `methods/` to
+// the lister list would have been the third patch of the same shape, so the
+// walk itself now reaches the whole tree.
+describe('the file walk reaches every content directory', () => {
+  it('delivers a methods/ file behind more than 256 earlier-sorting entries', () => {
+    for (let index = 0; index < 300; index++) {
+      memoryFile(`domain/topic-${String(index).padStart(5, '0')}.md`, `# Topic ${index}\nUnrelated filler ${index}.`);
+    }
+    memoryFile(
+      'methods/a-hung-test-is-a-defect-until-you-isolate-it.md',
+      '# A hung test is a defect\nIsolate the hung test before blaming the runner.',
+    );
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'how do I isolate a hung test?' }),
+      includeBootstrap: false,
+    });
+
+    expect(result.memoryEvidence.excerpts.map((row) => row.path)).toContain(
+      'methods/a-hung-test-is-a-defect-until-you-isolate-it.md',
+    );
+    // Nothing was hidden, so the guard must stay quiet.
+    expect(result.notices.some((notice) => notice.code === 'markdown-file-limit')).toBe(false);
+  });
+
+  it('names the directories it never enumerated when the guard does bind', () => {
+    seedOverCapEntries('concepts');
+    memoryFile('zzz-late/unreachable.md', '# Late\nThis directory sorts after the guard runs out.');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'anything at all' }),
+      includeBootstrap: false,
+    });
+
+    const notice = result.notices.find((row) => row.code === 'markdown-file-limit');
+    expect(notice?.status).toBe('degraded');
+    expect(notice?.detail).toContain('concepts/');
+    expect(notice?.detail).toContain('zzz-late/');
   });
 });
 
