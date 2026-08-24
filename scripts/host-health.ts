@@ -79,43 +79,34 @@ function hostUptimeSec(bootMs: number | null): number | null {
 /**
  * Iterate matching lines in `logPath` BACKWARDS until we cross the
  * `cutoffMs` boundary. Each visited line is mapped to a wallclock by
- * combining its `[HH:MM:SS.mmm]` prefix with a date tracker that
- * increments whenever the time-of-day jumps UP between adjacent lines
- * (going backward, that signals a midnight crossing into an earlier
- * day). Callback returns false to stop early.
+ * parsing its `[YYYY-MM-DD HH:MM:SS.mmm]` prefix directly — the date is
+ * embedded per line, so no midnight-crossing reconstruction is needed.
+ * Callback returns false to stop early.
  *
- * Robust to log files that span many days. Assumes the log is the
- * server-local TZ — both this script and the host log writer pull
- * time-of-day from the same Node process TZ.
+ * Assumes the log is the server-local TZ — both this script and the host
+ * log writer pull time-of-day from the same Node process TZ.
  */
 function walkLinesBackToCutoff(logPath: string, cutoffMs: number, onLine: (line: string, ts: number) => void): void {
   if (!existsSync(logPath)) return;
   const lines = readFileSync(logPath, 'utf-8').split('\n');
-  const tsRe = /^\[(\d{2}):(\d{2}):(\d{2})\.(\d+)\]/;
-  const now = new Date();
-  let prevHms = -1; // seconds since midnight of the previously-walked line
-  let dateAnchor = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const tsRe = /^\[(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d+)\]/;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
     const m = line.match(tsRe);
     if (!m) {
-      // continuation line — attribute to most-recently-seen timestamp
-      // (intentionally not counted toward cutoff stop)
+      // continuation line, or a pre-upgrade line without a date prefix —
+      // attribute to most-recently-seen timestamp (not counted toward cutoff)
       continue;
     }
-    const hms = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
-    if (prevHms !== -1 && hms > prevHms) {
-      // walking backward and time-of-day jumped UP → crossed midnight
-      // into an earlier day
-      dateAnchor = new Date(dateAnchor.getTime() - 24 * 3600 * 1000);
-    }
-    prevHms = hms;
-    const lineMs =
-      dateAnchor.getTime() +
-      Number(m[1]) * 3600_000 +
-      Number(m[2]) * 60_000 +
-      Number(m[3]) * 1000 +
-      Number(m[4].padEnd(3, '0').slice(0, 3));
+    const lineMs = new Date(
+      Number(m[1]),
+      Number(m[2]) - 1,
+      Number(m[3]),
+      Number(m[4]),
+      Number(m[5]),
+      Number(m[6]),
+      Number(m[7].padEnd(3, '0').slice(0, 3)),
+    ).getTime();
     if (lineMs < cutoffMs) return;
     onLine(line, lineMs);
   }
