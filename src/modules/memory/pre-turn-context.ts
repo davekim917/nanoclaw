@@ -429,8 +429,68 @@ function sentenceSpans(candidate: string, maxChars: number): Array<{ start: numb
   return sentences;
 }
 
-const NON_ASCII = /\P{ASCII}/u;
 const RECALL_TOKEN_CHAR = /[\p{L}\p{N}_-]/u;
+
+/**
+ * A non-ASCII character that neither NFKC nor en-US lowercasing can move off
+ * its own index, and that cannot pull a NEIGHBOUR off theirs. Four properties,
+ * each of which is load-bearing for `offsetSliceable`'s coordinate-space claim:
+ *
+ * - NOT A SURROGATE. Astral scalars occupy two UTF-16 indices, so a window edge
+ *   could split one and a slice would see two lone surrogates where the whole
+ *   string saw a letter. (Checked by the caller, which already has the code.)
+ * - NOT A COMBINING MARK, AND NOT A HANGUL JAMO. Canonical reordering only
+ *   permutes non-starters and canonical composition only merges a starter with
+ *   a following non-starter (or an L/V/T jamo with its neighbour). Exclude both
+ *   and every character's decomposition is a self-contained run bounded by the
+ *   next character's starter, so NFKC cannot act across a character boundary —
+ *   which is what makes it distribute over concatenation, and therefore over
+ *   slicing. `é` as a single U+00E9 qualifies (it decomposes and recomposes
+ *   within itself); `e` + U+0301 does not.
+ * - NFKC-STABLE ON ITS OWN. Rules out every compatibility expansion ('ﬁ' ->
+ *   'fi', '①' -> '1', 'Ⅷ' -> 'VIII', NBSP -> space).
+ * - LOWERCASES TO EXACTLY ONE UNIT. Rules out 'İ' -> 'i' + U+0307. U+03A3 is
+ *   excluded outright because it is the one character whose lowercase is
+ *   CONTEXT-sensitive in the root locale (Final_Sigma: 'Σ' -> 'ς' at word end,
+ *   'σ' elsewhere), so a slice could case it differently from the whole.
+ *
+ * Verified exhaustively over the BMP: of the 58,796 code points this admits,
+ * zero are non-starters, zero have a context-sensitive lowercase, and NFKC +
+ * lowercasing distributes over every pair and 3M random triples drawn from
+ * them.
+ */
+const OFFSET_UNSTABLE_CHAR = /\p{M}|[ᄀ-ᇿꥠ-꥿ힰ-퟿Σ]/u;
+const OFFSET_STABLE_CHAR = new Map<string, boolean>();
+
+/**
+ * True when NFKC + en-US lowercasing maps every index of `value` to itself, so
+ * offsets into the normalized string are offsets into the original.
+ *
+ * Per character rather than whole-string, because whole-string length equality
+ * is NOT sufficient: an expansion and a contraction cancel ('ﬁ' + 'e' + U+0301
+ * is three units before and after) and canonical reordering is length-preserving
+ * by definition. ASCII short-circuits on the code unit, so the common candidate
+ * never touches the Map; the repertoire above ASCII is a few dozen characters
+ * across a whole store, so the `normalize` calls are paid once each per process.
+ */
+function offsetStable(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) continue;
+    if (code >= 0xd800 && code <= 0xdfff) return false;
+    const char = value[index]!;
+    let stable = OFFSET_STABLE_CHAR.get(char);
+    if (stable === undefined) {
+      stable =
+        !OFFSET_UNSTABLE_CHAR.test(char) &&
+        char.normalize('NFKC') === char &&
+        char.toLocaleLowerCase('en-US').length === 1;
+      OFFSET_STABLE_CHAR.set(char, stable);
+    }
+    if (!stable) return false;
+  }
+  return true;
+}
 
 /**
  * True when the whole-candidate token stream can be sliced by window offset
@@ -443,27 +503,26 @@ const RECALL_TOKEN_CHAR = /[\p{L}\p{N}_-]/u;
  *   NFKC changes length in both directions ('ﬁ' -> 'fi' grows, 'e' + U+0301 ->
  *   'é' shrinks) and en-US lowercasing grows ('İ' -> 'i' + U+0307), so the two
  *   spaces are not interchangeable in general — conflating them mis-slices
- *   silently. They coincide exactly on ASCII: no ASCII scalar has a
- *   compatibility decomposition, none composes with a neighbour, and A-Z
- *   lowercases one-for-one. (Being ASCII also means no surrogate pairs, so
- *   UTF-16 indexing is per character.)
+ *   silently. `offsetStable` is the exact condition for them to coincide.
+ *   ASCII is a strict subset of it and used to be the whole test, which cost
+ *   the fast path to a single em-dash: 372 of the 574 files in the live store
+ *   are non-ASCII, essentially all of them only in punctuation, and each one
+ *   was re-tokenizing ~118 windows instead of 1.
  * - CLEAN CUTS. The token pattern is a bare character-class run with no
  *   lookaround, so a slice yields exactly the matches it fully contains — but
  *   only when no run crosses a window edge. Window edges are sentence-span
  *   edges, and an edge cuts a run precisely when the characters either side of
  *   it are both token characters. `sentenceSpans` hard-chops a sentence longer
  *   than `maxChars` at a fixed offset, which lands mid-word routinely.
+ *   (Sound to test one UTF-16 unit at a time only because `offsetStable` has
+ *   already ruled out surrogates, so every index is a whole character.)
  *
  * Failing either check costs the candidate the speedup, never correctness: it
  * falls back to the original per-window tokenization. Measured fast-path
- * coverage on the live generated stores is 94-99% of facts.
- *
- * ponytail: ASCII is a blunt coordinate-space test — the exact one is an
- * original -> normalized offset map. Build that only if non-ASCII-heavy stores
- * ever dominate; today they are ~5% of facts and merely lose the speedup.
+ * coverage on the live store is 99.3% of fact lines and 90.9% of whole files.
  */
 function offsetSliceable(candidate: string, sentences: readonly { start: number; end: number }[]): boolean {
-  if (NON_ASCII.test(candidate)) return false;
+  if (!offsetStable(candidate)) return false;
   const cuts = (at: number): boolean =>
     at > 0 &&
     at < candidate.length &&
