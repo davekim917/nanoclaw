@@ -1991,3 +1991,103 @@ describe('passage windows reuse one tokenization per candidate', () => {
     expect(excerpt!.text).toContain('tail sentinel token here');
   });
 });
+
+// Root cause of the remaining cost: the coordinate-space gate above was PURE
+// ASCII, and 372 of the 574 files in the live store carry a non-ASCII character
+// — 2,466 em-dashes and 666 arrows against 94 occurrences of everything that
+// actually perturbs offsets. Each of those files fell back to per-window
+// tokenization, ~118 cache entries instead of 1, which put the per-turn working
+// set at ~76,000 entries against a 24,576-entry cap: ~0% hit rate and ~6.7 s
+// warm. The gate is now normalization invariance, which an em-dash satisfies
+// and a ligature does not.
+describe('offset slicing is gated on normalization invariance, not on ASCII', () => {
+  const ask = (text: string) => ({
+    agentGroupId: 'ag-a',
+    sessionId: 'sess-a',
+    kind: 'chat-sdk',
+    trigger: 1 as const,
+    normalizedContent: JSON.stringify({ text }),
+    includeBootstrap: false,
+  });
+  const marker = (n: number) =>
+    `<!-- nanoclaw-memory:id=mem_${String(n).padStart(16, '0')};evidence=ev-${n};captured=2026-08-01T00:00:00.000Z -->`;
+
+  it('an em-dash-bearing fact takes the fast path and still costs one tokenization', () => {
+    // Same four-sentence shape as the per-candidate invariant above, with an
+    // em-dash, an arrow and an en-dash in every sentence. Per-window
+    // tokenization charges 9 misses per fact; the fast path charges 1.
+    const fact = (n: number) =>
+      `- Forecast pipeline volume ${n} doubled — last quarter. Region delta ${n} → held steady through the review. ` +
+      `Operator sign-off ${n} – recorded by the duty lead. Ledger checkpoint ${n} — confirmed the final figure. ` +
+      marker(n);
+    const ledger = (count: number) =>
+      `# Generated workgroup memory\n\n${Array.from({ length: count }, (_, i) => fact(i + 1)).join('\n')}\n`;
+
+    memoryFile('generated/memory.md', ledger(20));
+    _resetTokenStreamCacheForTest();
+    const result = buildPreTurnContext(ask('forecast pipeline volume'));
+    expect(result.memoryEvidence.excerpts.some((row) => row.path === 'generated/memory.md')).toBe(true);
+    const small = _tokenStreamCacheStatsForTest().misses;
+
+    memoryFile('generated/memory.md', ledger(120));
+    _resetTokenStreamCacheForTest();
+    buildPreTurnContext(ask('forecast pipeline volume'));
+    const large = _tokenStreamCacheStatsForTest().misses;
+
+    expect(large - small).toBe(100);
+  });
+
+  it('an em-dash-bearing fact delivers the same passage the fallback would', () => {
+    const fact =
+      '- Alpha Bravo Charlie shipped — on time. Delta Echo Foxtrot stalled → twice. Golf Hotel India resumed. ' +
+      marker(11);
+    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${fact}\n`);
+
+    const result = buildPreTurnContext(ask('Delta Echo Foxtrot'));
+    const excerpt = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
+    expect(excerpt).toBeDefined();
+    // Byte-identical original: the em-dash and arrow survive, casing survives,
+    // and the window is the same sentence the ASCII-only gate selected.
+    expect(excerpt!.text).toContain('Delta Echo Foxtrot stalled → twice.');
+    expect(excerpt!.text).toContain('Alpha Bravo Charlie shipped — on time.');
+    expect(excerpt!.text).not.toContain('delta echo foxtrot');
+  });
+
+  it('a length-changing candidate still falls back and pays per window', () => {
+    // 'ﬁ' -> 'fi' grows, 'e' + U+0301 -> 'é' shrinks, so this line's offsets are
+    // not its own. It must keep charging 9 tokenizations per fact, not 1.
+    const fact = (n: number) =>
+      `- The ﬁle café pipeline ${n} runs nightly. Region delta ${n} held steady through the review. ` +
+      `Operator sign-off ${n} was recorded by the duty lead. Ledger checkpoint ${n} confirmed the final figure. ` +
+      marker(n);
+    const ledger = (count: number) =>
+      `# Generated workgroup memory\n\n${Array.from({ length: count }, (_, i) => fact(i + 1)).join('\n')}\n`;
+
+    memoryFile('generated/memory.md', ledger(20));
+    _resetTokenStreamCacheForTest();
+    buildPreTurnContext(ask('file cafe pipeline'));
+    const small = _tokenStreamCacheStatsForTest().misses;
+
+    memoryFile('generated/memory.md', ledger(120));
+    _resetTokenStreamCacheForTest();
+    buildPreTurnContext(ask('file cafe pipeline'));
+    const large = _tokenStreamCacheStatsForTest().misses;
+
+    // 4 spans => 9 windows per fact under the 1..3-sentence sweep.
+    expect(large - small).toBe(900);
+  });
+
+  it('a combining-accent candidate falls back and delivers the original bytes', () => {
+    // 'e' + U+0301 is a decomposed e-acute: NFKC composes it and the string
+    // shrinks. The precomposed U+00E9 in the same line is offset-stable, so
+    // this proves the gate rejects on the mark rather than on non-ASCII.
+    const fact = '- The café rota is precomposed café elsewhere. Retention window stays at ninety days. ' + marker(12);
+    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${fact}\n`);
+
+    const result = buildPreTurnContext(ask('cafe rota retention window'));
+    const excerpt = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
+    expect(excerpt).toBeDefined();
+    // Byte-identical: the decomposed sequence is still decomposed.
+    expect(excerpt!.text).toContain('café rota is precomposed café elsewhere.');
+  });
+});
