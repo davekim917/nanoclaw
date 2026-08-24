@@ -235,6 +235,32 @@ describe('background memory curator contract', () => {
     expect(err.submittedEvidenceIds).toEqual(['msg-1']);
   });
 
+  it('rejects a candidate whose evidence cites only prior facts, carrying the submitted ids out of band', () => {
+    let caught: unknown;
+    try {
+      validateCuratorDecision(
+        {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          // 'old-1' is in allowedEvidenceIds (a prior fact's evidence) but not in
+          // currentEpisodeEvidence — the model copied a prior marker verbatim
+          // instead of citing anything from this episode.
+          memories: [{ text: 'Prior-only fact.', evidenceIds: ['old-1'] }],
+        },
+        context(oldContent),
+      );
+      throw new Error('expected validateCuratorDecision to throw');
+    } catch (error) {
+      caught = error;
+    }
+    const err = caught as Error & { submittedEvidenceIds?: string[] };
+    // Byte-identical: REPAIRABLE_VIOLATIONS keys off this exact message, and
+    // classifyError regex-matches it (via the word "evidence").
+    expect(err.message).toBe('new generated fact has no current-episode evidence');
+    expect(err.submittedEvidenceIds).toEqual(['old-1']);
+  });
+
   it('preserves every active fact automatically while appending a new one', () => {
     const decision = validateCuratorDecision(
       {

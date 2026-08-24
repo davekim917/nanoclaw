@@ -20,6 +20,7 @@ vi.mock('../../config.js', async (importOriginal) => ({
 }));
 
 import {
+  helperTimeoutMs,
   listGeneratedMemorySnapshots,
   readGeneratedMemory,
   readMemoryTopicFile,
@@ -211,6 +212,22 @@ describe('host generated-memory writer', () => {
     expect(declared).not.toBeNull();
     const helperBytes = Number(declared![1]!.replace(/_/g, '')) * 1024;
     expect(helperBytes).toBeGreaterThanOrEqual(GENERATED_MEMORY_MAX_BYTES + 16 * 1024);
+  });
+
+  it('scales the write-helper timeout with request size: small stays tight, max-size gets proportionate room', () => {
+    // ~50 KB request, representative of a routine curator write.
+    const small = helperTimeoutMs(50_000);
+    // The largest request that today's bound (GENERATED_MEMORY_MAX_BYTES +
+    // HELPER_REQUEST_OVERHEAD_BYTES) actually admits.
+    const maxRequestBytes = GENERATED_MEMORY_MAX_BYTES + 16 * 1024;
+    const max = helperTimeoutMs(maxRequestBytes);
+    // Small stays a tight bound, well under the old flat 10s.
+    expect(small).toBeLessThan(4_000);
+    // Max-size gets proportionately more room than small, and at least as
+    // much as the old flat value — now genuinely earned by request size
+    // rather than a blanket allowance for every write regardless of size.
+    expect(max).toBeGreaterThan(small);
+    expect(max).toBeGreaterThanOrEqual(10_000);
   });
 
   it('a generated-memory write at the host maximum still fits the helper request bound', () => {

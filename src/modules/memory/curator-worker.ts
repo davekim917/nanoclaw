@@ -552,6 +552,15 @@ const REPAIRABLE_VIOLATIONS = new Map<string, string>([
     // not a data defect — so the fix is telling the model to stop shortening it.
     'Every evidenceIds entry must be copied verbatim from the id field of a message in the episode, including its :<agent_group_id> suffix — never shorten an id to just its timestamp. Keep the same memories and evidence; only fix ids that were truncated or altered. Do not drop a fact or its evidence to satisfy this correction.',
   ],
+  [
+    'new generated fact has no current-episode evidence',
+    // selectGeneratedMemoryForPrompt shows full prior fact lines, including
+    // their own evidence=...:<agent_group_id> markers, so the model can copy a
+    // prior id verbatim without citing anything from the current episode. This
+    // is model fidelity, not a data defect — the episode's own message ids are
+    // already in the prompt.
+    'At least one evidenceIds entry per memory candidate must be a message id from the CURRENT episode. Prior-memory evidence ids may accompany it, but must never stand alone. Keep the same memories and evidence; only fix which ids you cite. Do not drop a fact to satisfy this correction.',
+  ],
 ]);
 
 function repairInstructionFor(error: unknown): string | null {
@@ -724,13 +733,13 @@ export class MemoryCuratorWorker {
         ...(typeof detail.candidateChars === 'number'
           ? { candidateChars: detail.candidateChars, limitChars: detail.limitChars }
           : {}),
-        // Only present on an unknown-evidence-id rejection. Without it the
-        // rejection is unattributable — no way to tell which id the model sent,
-        // or whether it was the bare-timestamp truncation the prefix rescue
-        // exists for.
-        ...(typeof detail.offendingEvidenceId === 'string'
-          ? { offendingEvidenceId: detail.offendingEvidenceId, submittedEvidenceIds: detail.submittedEvidenceIds }
-          : {}),
+        // Present on an unknown-evidence-id rejection (both fields) or a
+        // no-current-episode-evidence rejection (submittedEvidenceIds only —
+        // there is no single "offending" id when every cited id is prior-only).
+        // Without this the rejection is unattributable — no way to tell which
+        // id(s) the model sent.
+        ...(typeof detail.offendingEvidenceId === 'string' ? { offendingEvidenceId: detail.offendingEvidenceId } : {}),
+        ...(detail.submittedEvidenceIds ? { submittedEvidenceIds: detail.submittedEvidenceIds } : {}),
       });
       return null;
     } finally {

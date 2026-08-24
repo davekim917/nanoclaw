@@ -18,8 +18,63 @@ import {
 const HELPER_PATH = fileURLToPath(
   new URL('../../../container/agent-runner/src/mcp-tools/memory-write-process-helper.ts', import.meta.url),
 );
-const HELPER_TIMEOUT_MS = 10_000;
+// Flat 10s was fine while the largest legal write was 8 MiB.
+// GENERATED_MEMORY_MAX_BYTES doubled to 16 MiB (curator-contract.ts) without
+// this changing, so the biggest write now gets the same wall-clock budget
+// the smallest one always had — and the "memory writer helper failed (null)"
+// class (16 events, empty stderr, a host event-loop stall in the preceding
+// 60s every time — i.e. this SIGKILL firing under load, not a stuck helper)
+// only gets easier to reproduce as writes trend toward the new, larger cap.
+// Scale with the actual request size instead: a small write keeps a tight
+// bound (fails fast on a genuinely stuck helper) and a max-size write gets
+// proportionate room.
+//
+// Measured directly against real production data (busiest workgroup,
+// 2026-08-24 — the same ledger GENERATED_MEMORY_MAX_BYTES's comment
+// measures): copied its 6.5 MB / 6,706-fact generated/memory.md to /tmp,
+// padded it with duplicated real fact lines up to the largest body that
+// fits MAX_CURATOR_WRITE_REQUEST_BYTES today (~16.77 MB — see the
+// HELPER_REQUEST_OVERHEAD_BYTES note below), and timed the real spawned
+// helper end-to-end (hash the existing file, write, fsync, rename) three to
+// five runs per size on this host:
+//   ~50 KB  -> 190-405 ms   (bun cold-start dominates; near-flat with size)
+//   ~1 MiB  -> 205-240 ms
+//   ~4 MiB  -> 260-300 ms
+//   ~8 MiB  -> 340-350 ms
+//   ~12 MiB -> 425-435 ms
+//   ~16 MiB -> 530-790 ms
+// Roughly linear at ~25 ms/MiB on top of a ~200 ms floor. The constants below
+// give >10x headroom over both the floor and the per-MiB rate at every size
+// measured, so a stretch of host-load slowdown has to be an order of
+// magnitude worse than anything observed before this trips again — while a
+// small write's bound drops from the old flat 10s to ~3.5s, still far clear
+// of the measured floor and of bun's own cold-start variance.
+const HELPER_TIMEOUT_BASE_MS = 3_000;
+const HELPER_TIMEOUT_PER_MIB_MS = 500;
+
+/** Exported for direct unit testing, same as resolveBunBinary below — a pure
+ *  function is cheaper and more precise to test than asserting on real
+ *  spawned-process timing. */
+export function helperTimeoutMs(requestBytes: number): number {
+  return HELPER_TIMEOUT_BASE_MS + Math.ceil(requestBytes / (1024 * 1024)) * HELPER_TIMEOUT_PER_MIB_MS;
+}
+
 const HELPER_OUTPUT_MAX_BYTES = 16 * 1024;
+// FLAGGED, NOT FIXED HERE (out of this change's scope — the matching
+// constant lives in the container tree's memory-write-process-helper.ts,
+// not this file): this budget assumes JSON-escaping overhead stays small,
+// but it scales with newline count. A real generated/memory.md at the new
+// 16 MiB cap (~972 bytes/fact average, measured on the busiest live
+// workgroup) has ~17,262 fact lines, and escaping those newlines alone costs
+// ~17 KB — before any quote/backslash characters inside real fact text add
+// more. Measured directly: padding that workgroup's real ledger to the
+// largest body MAX_CURATOR_WRITE_REQUEST_BYTES allows today produced 20,182
+// bytes of overhead against this 16 KiB budget, i.e. a fully legal
+// (<=16 MiB) document at typical fact density can already produce a request
+// this constant rejects. The existing "keeps the Bun helper request bound
+// at or above the host cap" tests in curator-write.test.ts don't catch this
+// because they pad with a single repeated non-newline character, which
+// carries none of this escaping cost.
 const HELPER_REQUEST_OVERHEAD_BYTES = 16 * 1024;
 const HISTORY_LIMIT = 20;
 
@@ -248,7 +303,8 @@ function snapshotCurrent(
 
 async function invokeHelper(request: Record<string, unknown>): Promise<CuratorWriteResult> {
   const body = JSON.stringify(request);
-  if (Buffer.byteLength(body) > GENERATED_MEMORY_MAX_BYTES + HELPER_REQUEST_OVERHEAD_BYTES) {
+  const requestBytes = Buffer.byteLength(body);
+  if (requestBytes > GENERATED_MEMORY_MAX_BYTES + HELPER_REQUEST_OVERHEAD_BYTES) {
     throw new Error('curator write request exceeds its bounded maximum');
   }
   const bunBinary = resolveBunBinary();
@@ -261,7 +317,7 @@ async function invokeHelper(request: Record<string, unknown>): Promise<CuratorWr
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let outputBytes = 0;
-    const timer = setTimeout(() => child.kill('SIGKILL'), HELPER_TIMEOUT_MS);
+    const timer = setTimeout(() => child.kill('SIGKILL'), helperTimeoutMs(requestBytes));
     const collect = (target: Buffer[], chunk: Buffer): void => {
       outputBytes += chunk.length;
       if (outputBytes > HELPER_OUTPUT_MAX_BYTES) child.kill('SIGKILL');
