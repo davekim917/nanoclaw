@@ -15,7 +15,7 @@ import {
   sourceStaleness,
   type AttentionItem,
 } from './attention-sources.js';
-import { threadChannelKey, UNKNOWN_CHANNEL_KEY } from './dashboard/api/threads.js';
+import { deriveThreadState, threadChannelKey, UNKNOWN_CHANNEL_KEY } from './dashboard/api/threads.js';
 import { closeDb, getDb, initTestDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 
@@ -114,37 +114,46 @@ afterEach(() => {
 });
 
 describe('parseAttentionSources', () => {
-  it('reads a well-formed declaration', () => {
+  it('reads a well-formed declaration, and reports no defect', () => {
     expect(
       parseAttentionSources(`[{"kind":"release-board","root":"releases","channel_key":"${CHANNEL_KEY}"}]`),
-    ).toEqual([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]);
+    ).toEqual({ decls: [{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }], defects: [] });
   });
 
   it('treats NULL and empty as "declared nothing", not as malformed', () => {
-    expect(parseAttentionSources(null)).toEqual([]);
-    expect(parseAttentionSources(undefined)).toEqual([]);
-    expect(parseAttentionSources('   ')).toEqual([]);
+    expect(parseAttentionSources(null)).toEqual({ decls: [], defects: [] });
+    expect(parseAttentionSources(undefined)).toEqual({ decls: [], defects: [] });
+    expect(parseAttentionSources('   ')).toEqual({ decls: [], defects: [] });
   });
 
   it.each([
-    ['not json at all', '{ nope'],
-    ['a JSON object rather than an array', '{"kind":"release-board"}'],
-    ['an entry that is not an object', '["release-board"]'],
-    ['a missing kind', `[{"root":"releases","channel_key":"${CHANNEL_KEY}"}]`],
-    ['an empty kind', `[{"kind":"  ","root":"releases","channel_key":"${CHANNEL_KEY}"}]`],
-    ['a missing root', `[{"kind":"release-board","channel_key":"${CHANNEL_KEY}"}]`],
-    ['an absolute root', `[{"kind":"release-board","root":"/etc","channel_key":"${CHANNEL_KEY}"}]`],
-    ['a traversing root', `[{"kind":"release-board","root":"../../etc","channel_key":"${CHANNEL_KEY}"}]`],
-    ['a channel_key with no platform segment', '[{"kind":"release-board","root":"releases","channel_key":"C1"}]'],
-  ])('fails closed on %s', (_why, raw) => {
-    expect(parseAttentionSources(raw)).toBeNull();
+    ['not json at all', '{ nope', 'attention_sources'],
+    ['a JSON object rather than an array', '{"kind":"release-board"}', 'attention_sources'],
+    ['an entry that is not an object', '["release-board"]', 'declaration'],
+    ['a missing kind', `[{"root":"releases","channel_key":"${CHANNEL_KEY}"}]`, 'kind'],
+    ['an empty kind', `[{"kind":"  ","root":"releases","channel_key":"${CHANNEL_KEY}"}]`, 'kind'],
+    ['a missing root', `[{"kind":"release-board","channel_key":"${CHANNEL_KEY}"}]`, 'root'],
+    ['an absolute root', `[{"kind":"release-board","root":"/etc","channel_key":"${CHANNEL_KEY}"}]`, 'root'],
+    ['a traversing root', `[{"kind":"release-board","root":"../../etc","channel_key":"${CHANNEL_KEY}"}]`, 'root'],
+    [
+      'a channel_key with no platform segment',
+      '[{"kind":"release-board","root":"releases","channel_key":"C1"}]',
+      'channel_key',
+    ],
+  ])('drops the source and names the field on %s', (_why, raw, field) => {
+    const parsed = parseAttentionSources(raw);
+    expect(parsed.decls).toEqual([]);
+    expect(parsed.defects.map((d) => d.field)).toEqual([field]);
+    // Every one of these names bytes the provider has to read, or the room its
+    // rows have to land in. Without them the source genuinely cannot be read.
+    expect(parsed.defects.map((d) => d.disablesSource)).toEqual([true]);
   });
 
   it('carries the optional per-provider `file` and `branch` through', () => {
     expect(
       parseAttentionSources(
         `[{"kind":"branch-ci","root":"releases","channel_key":"${CHANNEL_KEY}","file":"release-state.json","branch":"develop"}]`,
-      ),
+      ).decls,
     ).toEqual([
       { kind: 'branch-ci', root: 'releases', channel_key: CHANNEL_KEY, file: 'release-state.json', branch: 'develop' },
     ]);
@@ -152,33 +161,78 @@ describe('parseAttentionSources', () => {
 
   it('omits `file`/`branch` entirely when they are not declared, rather than setting them undefined', () => {
     expect(
-      parseAttentionSources(`[{"kind":"release-board","root":"releases","channel_key":"${CHANNEL_KEY}"}]`)![0]!,
+      parseAttentionSources(`[{"kind":"release-board","root":"releases","channel_key":"${CHANNEL_KEY}"}]`).decls[0]!,
     ).not.toHaveProperty('file');
   });
 
   it.each([
-    ['an absolute file', `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":"/etc/passwd"}]`],
-    ['a traversing file', `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":"../x.md"}]`],
-    ['a non-string file', `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":7}]`],
-    ['an empty file', `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":""}]`],
-    ['a non-string branch', `[{"kind":"branch-ci","root":"r","channel_key":"${CHANNEL_KEY}","branch":true}]`],
-    ['a branch with a space', `[{"kind":"branch-ci","root":"r","channel_key":"${CHANNEL_KEY}","branch":"de v"}]`],
-  ])('fails closed on %s', (_why, raw) => {
-    // Present-and-wrong is malformed, exactly like a bad `root`: an operator
-    // who typed a path wrong must not silently get a shorter feed that still
-    // looks healthy.
-    expect(parseAttentionSources(raw)).toBeNull();
+    [
+      'an absolute file',
+      `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":"/etc/passwd"}]`,
+      'file',
+    ],
+    [
+      'a traversing file',
+      `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":"../x.md"}]`,
+      'file',
+    ],
+    ['a non-string file', `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":7}]`, 'file'],
+    ['an empty file', `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","file":""}]`, 'file'],
+    ['a non-string branch', `[{"kind":"branch-ci","root":"r","channel_key":"${CHANNEL_KEY}","branch":true}]`, 'branch'],
+    [
+      'a branch with a space',
+      `[{"kind":"branch-ci","root":"r","channel_key":"${CHANNEL_KEY}","branch":"de v"}]`,
+      'branch',
+    ],
+  ])('drops the source and names the field on %s', (_why, raw, field) => {
+    // Present-and-wrong points the provider at bytes that are not there, so the
+    // source is unreadable — exactly like a bad `root`.
+    const parsed = parseAttentionSources(raw);
+    expect(parsed.decls).toEqual([]);
+    expect(parsed.defects.map((d) => d.field)).toEqual([field]);
+    expect(parsed.defects.map((d) => d.disablesSource)).toEqual([true]);
   });
 
-  it('fails closed on the WHOLE list when only one entry is malformed — never a partial list', () => {
-    // A partial feed is indistinguishable from a healthy short one. An operator
-    // who mistypes one entry must not silently lose the others' items while
-    // believing they are still watching.
+  it('disables ONLY the malformed declaration — its siblings keep working', () => {
+    // The bug this shape exists to end. This used to return `null` for the
+    // WHOLE workgroup the moment any one entry failed any check, so one typo
+    // deleted every real row the workgroup had — and an empty queue reads as
+    // "nothing is blocked on a human", the one lie this feature prevents.
     const raw = JSON.stringify([
       { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY },
       { kind: 'release-board', root: '../escape', channel_key: CHANNEL_KEY },
+      { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
     ]);
-    expect(parseAttentionSources(raw)).toBeNull();
+    const parsed = parseAttentionSources(raw);
+    expect(parsed.decls.map((d) => d.root)).toEqual(['releases', 'releases']);
+    expect(parsed.defects.map((d) => [d.index, d.field])).toEqual([[1, 'root']]);
+  });
+
+  it('names the broken declaration by whatever of it parsed, not only by the failing field', () => {
+    // A declaration whose `root` is unusable may still have named a perfectly
+    // good `kind` and `channel_key`. Reporting the failing field alone would
+    // leave the operator hunting which of four entries it meant.
+    const parsed = parseAttentionSources(
+      `[{"kind":"defect-register","root":"../escape","channel_key":"${CHANNEL_KEY}","file":"defects.md"}]`,
+    );
+    expect(parsed.defects[0]).toMatchObject({
+      index: 0,
+      kind: 'defect-register',
+      root: '../escape',
+      file: 'defects.md',
+      channelKey: CHANNEL_KEY,
+      field: 'root',
+    });
+  });
+
+  it('still reports a declaration too broken to name itself, by position', () => {
+    // An unnameable error is still an error the operator must see. Position is
+    // the only handle such an entry has, so it is the only case that may use it.
+    const parsed = parseAttentionSources(
+      JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }, 42]),
+    );
+    expect(parsed.decls).toHaveLength(1);
+    expect(parsed.defects).toMatchObject([{ index: 1, kind: null, field: 'declaration' }]);
   });
 });
 
@@ -209,14 +263,16 @@ describe('readAttentionItems', () => {
     expect(debug).toHaveBeenCalledWith('Attention sources: none declared', expect.objectContaining({}));
   });
 
-  it('emits nothing, and WARNS, on a malformed declaration', () => {
+  it('reports a malformed declaration as a work item instead of blanking the workgroup', () => {
     const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
-    declare('[{"kind":"release-board","root":"../escape","channel_key":"slack:CEXAMPLE001"}]');
-    const read = readAttentionItems(WORKGROUP, Date.now(), { groupsRoot: boardRoot([readyPr()]) });
-    expect(read).toEqual({ items: [] });
+    declare(`[{"kind":"release-board","root":"../escape","channel_key":"${CHANNEL_KEY}"}]`);
+    const read = readAttentionItems(WORKGROUP, NOW, { groupsRoot: boardRoot([readyPr()]) });
+    // The source really is unreadable, so it emits no board rows — but the feed
+    // is NOT silent about why.
+    expect(read.items.map((i) => i.id)).toEqual([`${ATTENTION_ITEM_PREFIX}misconfigured:release-board:../escape:root`]);
     expect(warn).toHaveBeenCalledWith(
-      'Attention sources: malformed declaration, emitting nothing for this workgroup',
-      expect.objectContaining({ workgroupId: WORKGROUP }),
+      'Attention sources: malformed declaration, reporting it as a work item',
+      expect.objectContaining({ workgroupId: WORKGROUP, field: 'root' }),
     );
   });
 
@@ -460,13 +516,13 @@ describe('per-source staleness', () => {
       expect(
         parseAttentionSources(
           `[{"kind":"defect-register","root":"r","channel_key":"${CHANNEL_KEY}","refresh_hours":6}]`,
-        ),
+        ).decls,
       ).toEqual([{ kind: 'defect-register', root: 'r', channel_key: CHANNEL_KEY, refresh_hours: 6 }]);
     });
 
     it('omits it entirely when undeclared, rather than setting it undefined', () => {
       expect(
-        parseAttentionSources(`[{"kind":"release-board","root":"releases","channel_key":"${CHANNEL_KEY}"}]`)![0]!,
+        parseAttentionSources(`[{"kind":"release-board","root":"releases","channel_key":"${CHANNEL_KEY}"}]`).decls[0]!,
       ).not.toHaveProperty('refresh_hours');
     });
 
@@ -475,11 +531,14 @@ describe('per-source staleness', () => {
       ['a zero cadence', `[{"kind":"d","root":"r","channel_key":"${CHANNEL_KEY}","refresh_hours":0}]`],
       ['a negative cadence', `[{"kind":"d","root":"r","channel_key":"${CHANNEL_KEY}","refresh_hours":-1}]`],
       ['a null cadence', `[{"kind":"d","root":"r","channel_key":"${CHANNEL_KEY}","refresh_hours":null}]`],
-    ])('fails the workgroup closed on %s, exactly like a bad root', (_why, raw) => {
-      // Degrading to "no claim" would be indistinguishable from the operator
-      // having chosen not to declare a cadence, so a typo would silently take
-      // the staleness signal away while looking like a healthy config.
-      expect(parseAttentionSources(raw)).toBeNull();
+    ])('keeps the source and drops only the claim on %s', (_why, raw) => {
+      // A cadence names no bytes — it gates a display marker and nothing else,
+      // so it can only ever cost the marker. Degrading SILENTLY to "no claim"
+      // would still be wrong (indistinguishable from an operator who chose not
+      // to declare one), which is what the defect is for.
+      const parsed = parseAttentionSources(raw);
+      expect(parsed.decls).toEqual([{ kind: 'd', root: 'r', channel_key: CHANNEL_KEY }]);
+      expect(parsed.defects.map((d) => [d.field, d.disablesSource])).toEqual([['refresh_hours', false]]);
     });
   });
 
@@ -616,5 +675,223 @@ describe('per-source staleness', () => {
   it('never suppresses a stale source own rows — the rule is mark, never hide', () => {
     const items = itemsByKind(twoSources({ defectAsOf: WEEK_OLD, refreshHours: 24 })).get('defect-register')!;
     expect(items.map((i) => i.id)).toContain(`${ATTENTION_ITEM_PREFIX}defect:example-org/example-app#201`);
+  });
+});
+
+/**
+ * A misconfigured declaration, and the row that reports it.
+ *
+ * The bug these pin: `parseAttentionSources` used to return `null` — meaning the
+ * WHOLE workgroup emitted nothing — the moment ANY single declaration failed ANY
+ * check, `refresh_hours` included. A one-character typo in a display-only cadence
+ * hint (`"6h"` for `6`) therefore deleted every real work item that workgroup
+ * had, and the operator saw an empty queue, which reads as "nothing is blocked on
+ * a human" — the single failure mode this whole feature exists to prevent.
+ *
+ * The rule now: no config error may ever reduce the feed to silence. Three
+ * states, not two — healthy, explicitly-not-declared, and
+ * misconfigured-and-saying-so.
+ */
+describe('misconfigured declarations', () => {
+  /** The `misconfigured:` notices among a read's items. */
+  function notices(items: AttentionItem[]): AttentionItem[] {
+    return items.filter((i) => i.id.startsWith(`${ATTENTION_ITEM_PREFIX}misconfigured:`));
+  }
+
+  /** Everything that is NOT a notice — the real work the feed must never lose. */
+  function work(items: AttentionItem[]): string[] {
+    return items.filter((i) => !i.id.startsWith(`${ATTENTION_ITEM_PREFIX}misconfigured:`)).map((i) => i.id);
+  }
+
+  function read(groupsRoot: string): AttentionItem[] {
+    return readAttentionItems(WORKGROUP, NOW, { groupsRoot, claimsRoot: tmp('nc-attn-claims-') }).items;
+  }
+
+  /** A groups root with a release board AND a defect register, both readable. */
+  function twoReadableSources(): string {
+    const groupsRoot = boardRoot([readyPr()], FRESH);
+    fs.writeFileSync(path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md'), defectRegister(FRESH));
+    return groupsRoot;
+  }
+
+  it('one malformed declaration does not suppress its siblings', () => {
+    // Three declarations, one typo. The other two are perfectly readable and
+    // their items are real blocked work; subtracting them to signal a bad field
+    // is disproportionate, and an empty queue is the lie the queue prevents.
+    declare(
+      JSON.stringify([
+        { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY },
+        { kind: 'defect-register', root: '../escape', channel_key: CHANNEL_KEY, file: 'defects.md' },
+        { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md' },
+      ]),
+    );
+    expect(work(read(twoReadableSources()))).toEqual([
+      `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`,
+      `${ATTENTION_ITEM_PREFIX}defect:example-org/example-app#201`,
+    ]);
+  });
+
+  it('a bad `refresh_hours` still emits the source items, with NO staleness claim', () => {
+    // A cadence is a display marker. It may gate the marker; it may never gate
+    // the rows. `null` and not `false`: unknown is not fresh.
+    declare(
+      JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: '6h' }]),
+    );
+    const items = read(twoReadableSources());
+    const board = items.filter((i) => i.id === `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`);
+    expect(board).toHaveLength(1);
+    expect(board[0]!.sourceStale).toBeNull();
+    expect(board[0]!.sourceAsOf).toBe(FRESH);
+    // …and the bad value is not silent, which is the concern the old
+    // fail-closed rule was protecting.
+    expect(notices(items).map((i) => i.id)).toEqual([
+      `${ATTENTION_ITEM_PREFIX}misconfigured:release-board:releases:refresh_hours`,
+    ]);
+  });
+
+  it('an unusable `file` emits no items for that source, but still emits the notice', () => {
+    // The other half of the distinction: this declaration names bytes that are
+    // not there, so the source genuinely cannot be read and emitting nothing
+    // for it is correct — emitting nothing ABOUT it is not.
+    declare(
+      JSON.stringify([{ kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: '../defects.md' }]),
+    );
+    const items = read(twoReadableSources());
+    expect(work(items)).toEqual([]);
+    expect(items.map((i) => i.id)).toEqual([
+      `${ATTENTION_ITEM_PREFIX}misconfigured:defect-register:releases:../defects.md:file`,
+    ]);
+    expect(items[0]!.sourceKind).toBe('defect-register');
+    expect(items[0]!.claimNote).toContain('emitting no items at all');
+  });
+
+  it('emits EXACTLY ONE notice per malformed declaration', () => {
+    // Two broken entries, two notices — one each, never one per bad field
+    // restating the same entry.
+    declare(
+      JSON.stringify([
+        { kind: 'release-board', root: '/absolute', channel_key: CHANNEL_KEY, refresh_hours: 'nope' },
+        { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md', refresh_hours: 0 },
+      ]),
+    );
+    const items = read(twoReadableSources());
+    expect(notices(items).map((i) => i.id)).toEqual([
+      `${ATTENTION_ITEM_PREFIX}misconfigured:release-board:/absolute:root`,
+      `${ATTENTION_ITEM_PREFIX}misconfigured:defect-register:releases:defects.md:refresh_hours`,
+    ]);
+  });
+
+  it('still emits a notice for a declaration too broken to name at all', () => {
+    // Not an object, no usable `kind`: position is the only handle it has, and
+    // an unnameable error is still an error the operator must see.
+    declare(JSON.stringify(['release-board', { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
+    const items = read(twoReadableSources());
+    expect(notices(items).map((i) => i.id)).toEqual([`${ATTENTION_ITEM_PREFIX}misconfigured:#0:declaration`]);
+    // The healthy sibling still emits, which is the whole point.
+    expect(work(items)).toContain(`${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`);
+    // With no `kind` to stamp, provenance says what it is rather than inventing
+    // a plausible provider name.
+    expect(notices(items)[0]!.sourceKind).toBe('attention-source');
+    // And with no `channel_key` to route to, it lands in the same nowhere
+    // bucket the thread parser uses. Nobody is wired to nowhere.
+    expect(notices(items)[0]!.channel_key).toBe(UNKNOWN_CHANNEL_KEY);
+  });
+
+  it('emits a notice even when the whole column is unreadable', () => {
+    declare('{ not json');
+    expect(read(twoReadableSources()).map((i) => i.id)).toEqual([
+      `${ATTENTION_ITEM_PREFIX}misconfigured:declaration:attention_sources`,
+    ]);
+  });
+
+  it('routes the notice into `needs_you`, and dates it so the age cap can never cut it', () => {
+    declare(
+      JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: '6h' }]),
+    );
+    const item = notices(read(twoReadableSources()))[0]!;
+
+    // `waiting on` verbatim is the ONLY thing that routes a parked row into
+    // `needs_you` (`WAITING_ON_NOTE` in threads.ts). Without it the notice
+    // lands in `unassigned` and reads as backlog rather than as an alarm.
+    expect(item.claimState).toBe('parked');
+    expect(item.claimNote).toMatch(/\bwaiting on\b/i);
+    expect(
+      deriveThreadState({
+        sessionCount: item.sessionCount,
+        claimState: item.claimState,
+        claimNote: item.claimNote ?? '',
+        needsOperator: false,
+        containerStatus: 'unknown',
+        providerStatus: null,
+        toolStartedAtMs: null,
+        lastOutputAtMs: null,
+        now: NOW,
+      }),
+    ).toBe('needs_you');
+
+    // Actionable in the operator's own terms: which workgroup, which
+    // declaration, which field, what it costs, and that staleness is unchecked.
+    expect(item.claimNote).toContain(WORKGROUP);
+    expect(item.claimNote).toContain('release-board');
+    expect(item.claimNote).toContain('refresh_hours');
+    expect(item.claimNote).toContain('carry no staleness marker');
+    expect(item.claimNote).toContain('staleness is not being checked for it');
+    expect(item.nextAction).toContain('refresh_hours');
+    expect(item.url).toBeNull();
+    expect(item.channel_key).toBe(CHANNEL_KEY);
+
+    // `since` is a SENTINEL, not a measurement: there is no "when it broke"
+    // timestamp anywhere in this path. `now` would be the plausible lie — it
+    // re-dates on every poll, and `cappedByAge` keeps the OLDEST rows, so a
+    // perpetually-fresh notice is the FIRST one dropped when the cap bites.
+    expect(item.since).toBe('1970-01-01T00:00:00.000Z');
+    expect(Date.parse(item.since)).toBe(0);
+
+    // No staleness claim of its own — the seam knows the declaration is broken,
+    // not anything about the bytes behind it.
+    expect(item.sourceAsOf).toBeNull();
+    expect(item.sourceStale).toBeNull();
+  });
+
+  it('gives the notice an id that can never become a channel key', () => {
+    declare(
+      JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: '6h' }]),
+    );
+    const item = notices(read(twoReadableSources()))[0]!;
+    // The `board:` stamp is what `threadChannelKey` gates on. Without it the
+    // parser reads `misconfigured:release-board:...` as platform plus channel
+    // and mints one fake sidebar bucket per broken declaration — the per-row
+    // bucket §3.2 forbids.
+    expect(isAttentionItemId(item.id)).toBe(true);
+    expect(threadChannelKey(item.id)).toBe(UNKNOWN_CHANNEL_KEY);
+  });
+
+  it('keeps the id stable across polls, so an assignment reservation survives', () => {
+    declare(
+      JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: '6h' }]),
+    );
+    const groupsRoot = twoReadableSources();
+    const first = notices(read(groupsRoot))[0]!.id;
+    clearAttentionMemo();
+    const later = readAttentionItems(WORKGROUP, NOW + 10 * ATTENTION_MEMO_TTL_MS, {
+      groupsRoot,
+      claimsRoot: tmp('nc-attn-claims-'),
+    }).items;
+    expect(notices(later)[0]!.id).toBe(first);
+  });
+
+  it('emits no notices at all for a fully valid workgroup', () => {
+    declare(
+      JSON.stringify([
+        { kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: 6 },
+        { kind: 'defect-register', root: 'releases', channel_key: CHANNEL_KEY, file: 'defects.md', refresh_hours: 6 },
+      ]),
+    );
+    const items = read(twoReadableSources());
+    expect(notices(items)).toEqual([]);
+    expect(items.map((i) => i.id)).toEqual([
+      `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`,
+      `${ATTENTION_ITEM_PREFIX}defect:example-org/example-app#201`,
+    ]);
   });
 });

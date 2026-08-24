@@ -1688,10 +1688,36 @@ describe('attention-source rows in the thread list', () => {
     expect(threads).toEqual([]);
   });
 
-  it('emits nothing when the declaration is malformed — never a partial list', async () => {
+  it('a malformed declaration becomes its own needs_you row — never an empty list', async () => {
+    // A config error must never reduce the feed to silence: an empty queue
+    // reads as "nothing is blocked on a human", which is the one lie this lane
+    // exists to prevent. So the unusable source emits no board rows, and the
+    // seam emits a row saying exactly that.
     declare('[{"kind":"release-board","root":"releases"}]');
     const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
-    expect(threads).toEqual([]);
+    expect(threads.map((t) => t.thread_id)).toEqual([
+      `${ATTENTION_ITEM_PREFIX}misconfigured:release-board:releases:channel_key`,
+    ]);
+    expect(threads[0]!.state).toBe('needs_you');
+    // No `channel_key` was declared, so there is nowhere to route it and nobody
+    // wired to hand it to. The row still shows; the dead affordance does not.
+    expect(threads[0]!.channel_key).toBe(UNKNOWN_CHANNEL_KEY);
+    expect(threads[0]!.assignable_agents).toEqual([]);
+  });
+
+  it('a bad cadence keeps every row the source produced — it can only cost the marker', async () => {
+    // `refresh_hours` gates a display marker and nothing else, so it may never
+    // gate the items. The board's real work still ships, unmarked (`stale:
+    // null` — unknown, not fresh), beside a row naming the typo.
+    declare(
+      JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY, refresh_hours: '6h' }]),
+    );
+    const { threads } = await buildThreadList(makeCtx(), LIST_OPTS, attentionDeps(boardRoot([readyPr()])));
+    const work = threads.find((t) => t.thread_id === `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`)!;
+    expect(work.attention_source!.stale).toBeNull();
+    expect(threads.map((t) => t.thread_id)).toContain(
+      `${ATTENTION_ITEM_PREFIX}misconfigured:release-board:releases:refresh_hours`,
+    );
   });
 
   it('ignores an unknown kind rather than throwing, and still emits the known source', async () => {
