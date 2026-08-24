@@ -15,7 +15,22 @@ import { GRAPH_SCENT_BOUNDS, readGraphScent, STOP_WORDS, type GraphScent } from 
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
-  markdownFiles: 256,
+  // Pathology guard on the walk, NOT a tuning dial. It counts VISITED
+  // DIRECTORY ENTRIES, and at 256 it stopped mid-tree on every real workgroup:
+  // the live 587-entry tree spent 92 entries on the root and 161 on `domain/`,
+  // so `methods/` (190 files of agent-authored engineering knowledge),
+  // `imported/claude-auto` (81), `learning/`, `imports/` and `system/` were
+  // never enumerated — structurally invisible to recall, silently. Patching
+  // that with per-directory listers was tried twice (preferences/, then the
+  // curator topic dirs) and each time the NEXT new directory reintroduced the
+  // bug, so the walk now reaches the whole tree and the cap only fires on a
+  // runaway one. 2,048 is ~3.5x the largest live tree.
+  //
+  // Two other bounds still hold a pathological tree: `markdownScannedBytes`
+  // caps total bytes read, and `markdownFileBytes` caps each file. When this
+  // cap DOES bind, `listMarkdownFiles` names the directories it never
+  // enumerated so a third occurrence is visible instead of silent.
+  markdownFiles: 2_048,
   // Must clear GENERATED_MEMORY_MAX_BYTES with room for the manual tree beside
   // it: this is a shared budget consumed in listing order, so a generated store
   // at its own cap would otherwise silently truncate every file after it.
@@ -778,6 +793,10 @@ function listMarkdownFiles(root: string, notices: ContextNotice[]): string[] {
   const pending = [''];
   let visited = 0;
   let skippedSymlinks = 0;
+  // Directories the cap stopped us from enumerating fully. Named in the notice
+  // so a tree that outgrows the guard says WHICH content it hid.
+  const unlisted = new Set<string>();
+  const scopeOf = (relativeDir: string): string => (relativeDir === '' ? '<root>' : `${relativeDir}/`);
   while (pending.length > 0 && visited < PRE_TURN_BOUNDS.markdownFiles) {
     const relativeDir = pending.shift()!;
     const absoluteDir = path.join(root, relativeDir);
@@ -785,7 +804,10 @@ function listMarkdownFiles(root: string, notices: ContextNotice[]): string[] {
       .readdirSync(absoluteDir, { withFileTypes: true })
       .sort((a, b) => compareCodepoint(a.name, b.name));
     for (const entry of entries) {
-      if (visited >= PRE_TURN_BOUNDS.markdownFiles) break;
+      if (visited >= PRE_TURN_BOUNDS.markdownFiles) {
+        unlisted.add(scopeOf(relativeDir));
+        break;
+      }
       visited++;
       const relative = path.posix.join(relativeDir.split(path.sep).join('/'), entry.name);
       if (entry.isSymbolicLink()) {
@@ -804,12 +826,13 @@ function listMarkdownFiles(root: string, notices: ContextNotice[]): string[] {
       detail: `skipped ${skippedSymlinks} symbolic link${skippedSymlinks === 1 ? '' : 's'}`,
     });
   }
-  if (pending.length > 0 || visited >= PRE_TURN_BOUNDS.markdownFiles) {
+  for (const relativeDir of pending) unlisted.add(scopeOf(relativeDir));
+  if (unlisted.size > 0) {
     notices.push({
       source: 'markdown',
-      status: 'truncated',
+      status: 'degraded',
       code: 'markdown-file-limit',
-      detail: `examined at most ${PRE_TURN_BOUNDS.markdownFiles} sorted filesystem entries`,
+      detail: `stopped after ${PRE_TURN_BOUNDS.markdownFiles} filesystem entries; not listed: ${[...unlisted].sort(compareCodepoint).join(', ')}`,
     });
   }
   return files.sort();
@@ -822,10 +845,12 @@ function listMarkdownFiles(root: string, notices: ContextNotice[]): string[] {
  *
  * Two lanes depend on this. The preference lane is a deterministic direct-path
  * lookup keyed by sender slug. The curator topic directories (people/, domain/,
- * systems/) are consolidation-produced views of the whole ledger, and on the
- * live 564-file tree `domain/` alone consumed 159 of the 256-entry budget while
- * `people/` and `systems/` were never enumerated at all. Neither lane may
- * depend on winning a sort race.
+ * systems/) are consolidation-produced views of the whole ledger.
+ *
+ * The walk's entry cap no longer binds on any real tree, so today these are the
+ * belt rather than the braces — they keep the two lanes reachable if a runaway
+ * directory ever does exhaust the guard, which is exactly when losing a
+ * consolidated view or a person's preferences would hurt most.
  */
 function listDirectMarkdownStems(root: string, dir: string, notices: ContextNotice[]): string[] {
   let entries: fs.Dirent[];
