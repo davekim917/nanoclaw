@@ -35,6 +35,9 @@ export interface TurnUsageRow {
   steps: number | null;
   duration_ms: number | null;
   trigger: string | null;
+  rate_limit_type: string | null;
+  rate_limit_utilization: number | null;
+  rate_limit_resets_at: string | null;
   input_tokens: number | null;
   output_tokens: number | null;
   cache_read_tokens: number | null;
@@ -48,14 +51,26 @@ export interface TurnUsageRow {
  * row per model but the same TurnMeta on each). `steps` coverage varies by
  * provider — see each provider's result-event construction — and is NULL
  * when the provider exposes nothing usable rather than a guessed count.
+ * `rateLimit*` fields are Claude-only (see ProviderEvent's `result.rateLimit`
+ * doc) — always NULL for the other two providers.
  */
 export interface TurnMeta {
   steps: number | null;
   durationMs: number | null;
   trigger: string | null;
+  rateLimitType: string | null;
+  rateLimitUtilization: number | null;
+  rateLimitResetsAt: string | null;
 }
 
-const NO_TURN_META: TurnMeta = { steps: null, durationMs: null, trigger: null };
+const NO_TURN_META: TurnMeta = {
+  steps: null,
+  durationMs: null,
+  trigger: null,
+  rateLimitType: null,
+  rateLimitUtilization: null,
+  rateLimitResetsAt: null,
+};
 
 /**
  * Cumulative-usage bug fix (2026-08-24): the Claude Agent SDK's
@@ -124,8 +139,8 @@ export function recordTurnUsage(provider: string, usage: TurnUsageInfo = {}, met
     // bun:sqlite does not).
     getOutboundDb()
       .prepare(
-        `INSERT INTO turn_usage (ts, provider, model, steps, duration_ms, trigger, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-         VALUES ($ts, $provider, $model, $steps, $duration_ms, $trigger, $input_tokens, $output_tokens, $cache_read_tokens, $cache_write_tokens, $cost_usd)`,
+        `INSERT INTO turn_usage (ts, provider, model, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES ($ts, $provider, $model, $steps, $duration_ms, $trigger, $rate_limit_type, $rate_limit_utilization, $rate_limit_resets_at, $input_tokens, $output_tokens, $cache_read_tokens, $cache_write_tokens, $cost_usd)`,
       )
       .run({
         $ts: new Date().toISOString(),
@@ -134,6 +149,9 @@ export function recordTurnUsage(provider: string, usage: TurnUsageInfo = {}, met
         $steps: meta.steps ?? null,
         $duration_ms: meta.durationMs ?? null,
         $trigger: meta.trigger ?? null,
+        $rate_limit_type: meta.rateLimitType ?? null,
+        $rate_limit_utilization: meta.rateLimitUtilization ?? null,
+        $rate_limit_resets_at: meta.rateLimitResetsAt ?? null,
         $input_tokens: effectiveUsage.inputTokens ?? null,
         $output_tokens: effectiveUsage.outputTokens ?? null,
         $cache_read_tokens: effectiveUsage.cacheReadTokens ?? null,

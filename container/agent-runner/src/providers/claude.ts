@@ -56,6 +56,16 @@ export interface SdkRateLimitInfo {
 }
 
 /**
+ * The SDK reports `resetsAt` as either epoch seconds or epoch ms (observed
+ * both); normalize to the project's ISO-8601 UTC storage convention.
+ */
+function resetsAtIso(resetsAt: number | undefined): string | null {
+  if (typeof resetsAt !== 'number' || !Number.isFinite(resetsAt)) return null;
+  const ms = resetsAt < 1e12 ? resetsAt * 1000 : resetsAt;
+  return new Date(ms).toISOString();
+}
+
+/**
  * SDK rate-limit events are telemetry unless the SDK explicitly rejects the
  * request. Rejected credit exhaustion is quota; other rejected windows are
  * transient rate limits and retain their reset metadata.
@@ -65,11 +75,8 @@ export function classifyRateLimitEvent(
 ): { message: string; classification: 'rate_limit' | 'quota' } | null {
   if (info?.status !== 'rejected') return null;
   const outOfCredits = info.errorCode === 'credits_required' || info.overageDisabledReason === 'out_of_credits';
-  let detail = '';
-  if (typeof info.resetsAt === 'number' && Number.isFinite(info.resetsAt)) {
-    const ms = info.resetsAt < 1e12 ? info.resetsAt * 1000 : info.resetsAt;
-    detail = ` (resets ${new Date(ms).toISOString()})`;
-  }
+  const iso = resetsAtIso(info.resetsAt);
+  const detail = iso ? ` (resets ${iso})` : '';
   const window = info.rateLimitType ? ` [${info.rateLimitType}]` : '';
   return {
     message: `${outOfCredits ? 'Out of credits' : 'Rate limit'}${window}${detail}`,
@@ -1955,6 +1962,14 @@ export class ClaudeProvider implements AgentProvider {
       // is raw command text. Turn-scoped, bounded by tool calls — no eviction.
       const toolNameById = new Map<string, string>();
 
+      // Per-turn cost attribution (rate-limit persistence): the most recent
+      // `rate_limit_event` observed since the last `result`. "What share of
+      // our weekly allowance have we burned" is otherwise undiscoverable —
+      // this is the one place the SDK reports it. Cleared after each result
+      // so a turn with NO fresh rate_limit_event reports NULL rather than a
+      // stale reading from an earlier turn.
+      let lastRateLimitInfo: SdkRateLimitInfo | undefined;
+
       // Enable ultracode for the session before consuming the stream. It's a
       // flag SETTING (not an effort value, not read from settings.json), so the
       // SDK's apply_flag_settings control request is the only programmatic
@@ -2039,11 +2054,20 @@ export class ClaudeProvider implements AgentProvider {
             isError: m.is_error === true,
             usage: extractUsage(m),
             steps: typeof m.num_turns === 'number' ? m.num_turns : null,
+            rateLimit: lastRateLimitInfo
+              ? {
+                  type: lastRateLimitInfo.rateLimitType ?? null,
+                  utilization: lastRateLimitInfo.utilization ?? null,
+                  resetsAt: resetsAtIso(lastRateLimitInfo.resetsAt),
+                }
+              : null,
           };
+          lastRateLimitInfo = undefined; // scoped to the turn that just closed
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'rate_limit_event') {
           const info = (message as { rate_limit_info?: SdkRateLimitInfo }).rate_limit_info;
+          lastRateLimitInfo = info; // held for the `result` that closes this turn
           const blocked = classifyRateLimitEvent(info);
           if (!blocked) {
             if (info?.status === 'allowed_warning') {

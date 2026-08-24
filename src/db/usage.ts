@@ -14,6 +14,14 @@
  * rows are ALSO mirrored 1:1 into a central `turn_usage` ledger (migration
  * 059) in the same transaction — usage_daily's shape, keys, and watermark
  * above are unchanged by this. See rollupSessionUsage.
+ *
+ * NOTE ON HISTORICAL DATA (2026-08-24): rows written by a container before
+ * the cumulative-usage fix (container/agent-runner/src/db/turn-usage.ts)
+ * landed have INFLATED Claude token/cost totals — the SDK's running-total-
+ * for-the-whole-stream value was recorded on every turn instead of that
+ * turn's own delta, measured at 1.3-5.2x inflation. Nothing here corrects
+ * that retroactively; treat usage_daily/turn_usage rows from before that fix
+ * as directional only, not exact.
  */
 import type Database from 'better-sqlite3';
 
@@ -37,6 +45,9 @@ interface TurnUsageRow {
   steps?: number | null;
   duration_ms?: number | null;
   trigger?: string | null;
+  rate_limit_type?: string | null;
+  rate_limit_utilization?: number | null;
+  rate_limit_resets_at?: string | null;
 }
 
 export interface UsageDailyRow {
@@ -105,8 +116,8 @@ export function rollupSessionUsage(outDb: Database.Database, agentGroupId: strin
     // a detail ledger, not an additive aggregate with an identity element).
     const insertCentral = db.prepare(`
       INSERT INTO turn_usage
-        (ts, session_id, agent_group_id, provider, model, steps, duration_ms, trigger, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-      VALUES (@ts, @session_id, @agent_group_id, @provider, @model, @steps, @duration_ms, @trigger, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)
+        (ts, session_id, agent_group_id, provider, model, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+      VALUES (@ts, @session_id, @agent_group_id, @provider, @model, @steps, @duration_ms, @trigger, @rate_limit_type, @rate_limit_utilization, @rate_limit_resets_at, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)
     `);
     for (const row of rows) {
       maxId = Math.max(maxId, row.id);
@@ -136,6 +147,9 @@ export function rollupSessionUsage(outDb: Database.Database, agentGroupId: strin
         steps: row.steps ?? null,
         duration_ms: row.duration_ms ?? null,
         trigger: row.trigger ?? null,
+        rate_limit_type: row.rate_limit_type ?? null,
+        rate_limit_utilization: row.rate_limit_utilization ?? null,
+        rate_limit_resets_at: row.rate_limit_resets_at ?? null,
         input_tokens: row.input_tokens ?? null,
         output_tokens: row.output_tokens ?? null,
         cache_read_tokens: row.cache_read_tokens ?? null,

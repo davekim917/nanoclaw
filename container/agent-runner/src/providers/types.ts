@@ -289,16 +289,31 @@ export type ProviderEvent =
    * models (e.g. Opus parent + Sonnet subagents) — one entry per model,
    * each attributed separately rather than collapsed under a NULL model.
    *
-   * `steps` is the number of provider API round-trips this turn made — the
-   * number that tells apart a fat-context turn (big prefix, few steps) from
-   * a long-loop turn (150-400 sequential calls). It is turn-level, not
+   * `steps` is the number of provider API round-trips this turn made — a
+   * diagnostic for telling apart a fat-context turn (big prefix, few steps)
+   * from a long-loop turn (many sequential calls), not the smoking gun it
+   * was first thought to be (corrected estimate: ~20-35 calls/turn, not
+   * 150-400 — the original estimate was itself measured against the
+   * cumulative-usage bug, see turn-usage.ts). It is turn-level, not
    * per-model, so every row a multi-model `usage` array produces gets the
    * same value. Coverage varies by provider (each reports the closest thing
    * its own protocol exposes — see each provider's result-event
    * construction for what that is); NULL when nothing usable is available,
    * never a guessed count.
+   *
+   * `rateLimit` is Claude-only: the most recent `rate_limit_event` observed
+   * during this turn (utilization/type/resetsAt), or null if none fired.
+   * Answers "what share of our weekly allowance have we burned" directly,
+   * instead of inferring it from cost estimates.
    */
-  | { type: 'result'; text: string | null; isError?: boolean; usage?: TurnUsageInfo | TurnUsageInfo[]; steps?: number | null }
+  | {
+      type: 'result';
+      text: string | null;
+      isError?: boolean;
+      usage?: TurnUsageInfo | TurnUsageInfo[];
+      steps?: number | null;
+      rateLimit?: { type: string | null; utilization: number | null; resetsAt: string | null } | null;
+    }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**

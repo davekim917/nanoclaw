@@ -147,7 +147,7 @@ describe('rollupSessionUsage', () => {
   });
 });
 
-/** Fixture matching the post-Phase-0.1-follow-up container schema (steps/duration_ms/trigger). */
+/** Fixture matching the post-Phase-0.1-follow-up container schema (steps/duration_ms/trigger/rate_limit_*). */
 function makeOutboundDbWithTurnMeta(): Database.Database {
   const db = new Database(':memory:');
   db.exec(`
@@ -159,6 +159,9 @@ function makeOutboundDbWithTurnMeta(): Database.Database {
       steps INTEGER,
       duration_ms INTEGER,
       trigger TEXT,
+      rate_limit_type TEXT,
+      rate_limit_utilization REAL,
+      rate_limit_resets_at TEXT,
       input_tokens INTEGER,
       output_tokens INTEGER,
       cache_read_tokens INTEGER,
@@ -183,12 +186,12 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
   });
   afterEach(() => closeDb());
 
-  it('writes a faithful 1:1 central row per turn_usage row, including steps/duration_ms/trigger', () => {
+  it('writes a faithful 1:1 central row per turn_usage row, including steps/duration_ms/trigger/rate_limit_*', () => {
     const outDb = makeOutboundDbWithTurnMeta();
     outDb
       .prepare(
-        `INSERT INTO turn_usage (ts, provider, model, steps, duration_ms, trigger, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-         VALUES ('2026-08-10T01:00:00.000Z', 'claude', 'opus', 12, 45000, 'human', 1000, 200, 50, 10, 0.5)`,
+        `INSERT INTO turn_usage (ts, provider, model, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES ('2026-08-10T01:00:00.000Z', 'claude', 'opus', 12, 45000, 'human', 'seven_day', 0.91, '2026-08-25T00:00:00.000Z', 1000, 200, 50, 10, 0.5)`,
       )
       .run();
 
@@ -209,6 +212,9 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
       steps: 12,
       duration_ms: 45000,
       trigger: 'human',
+      rate_limit_type: 'seven_day',
+      rate_limit_utilization: 0.91,
+      rate_limit_resets_at: '2026-08-25T00:00:00.000Z',
       input_tokens: 1000,
       output_tokens: 200,
       cache_read_tokens: 50,
@@ -217,7 +223,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     });
   });
 
-  it('an old-shape turn_usage row (missing steps/duration_ms/trigger columns) rolls up without throwing, central row is NULL', () => {
+  it('an old-shape turn_usage row (missing steps/duration_ms/trigger/rate_limit_* columns) rolls up without throwing, central row is NULL', () => {
     const outDb = makeOutboundDb(); // the pre-Phase-0.1-follow-up fixture, no new columns at all
     insertTurn(outDb, { ts: '2026-08-10T01:00:00.000Z' });
 
@@ -229,6 +235,9 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     expect(centralRows[0].steps).toBeNull();
     expect(centralRows[0].duration_ms).toBeNull();
     expect(centralRows[0].trigger).toBeNull();
+    expect(centralRows[0].rate_limit_type).toBeNull();
+    expect(centralRows[0].rate_limit_utilization).toBeNull();
+    expect(centralRows[0].rate_limit_resets_at).toBeNull();
   });
 
   it('derives session_id from sessionDirKey (<agent-group>/<session>)', () => {

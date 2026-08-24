@@ -7,9 +7,9 @@ import type { Migration } from './index.js';
  * usage_daily (migration 047) collapses every turn into a (date,
  * agent_group_id, provider, model) bucket — enough to answer "what is a
  * group spending" but not enough to tell a fat-context turn (large prefix,
- * few steps) apart from a long-loop turn (150-400 sequential API calls
- * against a modest prefix). Those have opposite fixes, and the daily bucket
- * makes them indistinguishable.
+ * few steps) apart from a long-loop turn (many sequential API calls against
+ * a modest prefix). Those have opposite fixes, and the daily bucket makes
+ * them indistinguishable.
  *
  * This table is a 1:1 mirror of each session's per-turn turn_usage rows,
  * written by rollupSessionUsage (src/db/usage.ts) in the SAME transaction as

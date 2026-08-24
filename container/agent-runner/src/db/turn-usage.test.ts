@@ -115,6 +115,34 @@ describe('turn_usage — insert helper', () => {
     expect(sum('output_tokens')).toBe(1000);
     expect(sum('cost_usd')).toBeCloseTo(0.8, 10);
   });
+
+  it('writes the rate-limit meta fields when given, NULL when omitted (default TurnMeta)', () => {
+    recordTurnUsage(
+      'claude',
+      { model: 'claude-opus-5', inputTokens: 10 },
+      {
+        steps: null,
+        durationMs: null,
+        trigger: null,
+        rateLimitType: 'seven_day',
+        rateLimitUtilization: 0.91,
+        rateLimitResetsAt: '2026-08-24T00:00:00.000Z',
+      },
+    );
+    recordTurnUsage('claude', { model: 'claude-sonnet-5', inputTokens: 5 }); // default TurnMeta
+
+    const rows = getTurnUsageRows();
+    expect(rows[0]).toMatchObject({
+      rate_limit_type: 'seven_day',
+      rate_limit_utilization: 0.91,
+      rate_limit_resets_at: '2026-08-24T00:00:00.000Z',
+    });
+    expect(rows[1]).toMatchObject({
+      rate_limit_type: null,
+      rate_limit_utilization: null,
+      rate_limit_resets_at: null,
+    });
+  });
 });
 
 describe('turn_usage — Claude cumulative-usage delta fix', () => {
@@ -217,6 +245,44 @@ describe('turn_usage — table creation (real files, not the in-memory test mode
       });
     const row = reopened.prepare('SELECT provider FROM turn_usage').get() as { provider: string };
     expect(row.provider).toBe('claude');
+    reopened.close();
+  });
+
+  it('ALTERs steps/duration_ms/trigger/rate_limit_* onto a turn_usage table that has the table but not those columns', () => {
+    const dbPath = tempDbPath();
+    // Simulate a mid-generation outbound.db: turn_usage exists (base v0.1
+    // shape) but predates every column added since.
+    const seed = new Database(dbPath);
+    seed.exec(`
+      CREATE TABLE turn_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        cost_usd REAL
+      )
+    `);
+    seed.close();
+
+    const reopened = new Database(dbPath);
+    const colsBefore = new Set(
+      (reopened.prepare("PRAGMA table_info('turn_usage')").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    expect(colsBefore.has('steps')).toBe(false);
+    expect(colsBefore.has('rate_limit_type')).toBe(false);
+
+    configureOutboundDb(reopened);
+
+    const colsAfter = new Set(
+      (reopened.prepare("PRAGMA table_info('turn_usage')").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    for (const c of ['steps', 'duration_ms', 'trigger', 'rate_limit_type', 'rate_limit_utilization', 'rate_limit_resets_at']) {
+      expect(colsAfter.has(c)).toBe(true);
+    }
     reopened.close();
   });
 });

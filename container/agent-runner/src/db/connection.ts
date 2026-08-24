@@ -197,6 +197,12 @@ export function configureOutboundDb(outbound: Database): void {
     ['steps', 'INTEGER'],
     ['duration_ms', 'INTEGER'],
     ['trigger', 'TEXT'],
+    // rate_limit_*: added after the columns above (per-turn cost attribution
+    // follow-up — persist the SDK's weekly-allowance utilization instead of
+    // discarding it). Claude-only; always NULL for the other two providers.
+    ['rate_limit_type', 'TEXT'],
+    ['rate_limit_utilization', 'REAL'],
+    ['rate_limit_resets_at', 'TEXT'],
   ] as const) {
     if (!turnUsageCols.has(name)) outbound.exec(`ALTER TABLE turn_usage ADD COLUMN ${name} ${type}`);
   }
@@ -446,6 +452,9 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       steps              INTEGER,
       duration_ms        INTEGER,
       trigger            TEXT,
+      rate_limit_type          TEXT,
+      rate_limit_utilization   REAL,
+      rate_limit_resets_at     TEXT,
       input_tokens       INTEGER,
       output_tokens      INTEGER,
       cache_read_tokens  INTEGER,

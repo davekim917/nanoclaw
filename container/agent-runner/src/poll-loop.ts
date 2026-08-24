@@ -1778,7 +1778,14 @@ export async function processQuery(
         // per-model, so every row from a multi-model turn carries the same
         // values — computed once, right here, before anything below can push
         // a follow-up and reset turnStartedAtMs for the NEXT turn.
-        const turnMeta = { steps: event.steps ?? null, durationMs: Date.now() - turnStartedAtMs, trigger };
+        const turnMeta = {
+          steps: event.steps ?? null,
+          durationMs: Date.now() - turnStartedAtMs,
+          trigger,
+          rateLimitType: event.rateLimit?.type ?? null,
+          rateLimitUtilization: event.rateLimit?.utilization ?? null,
+          rateLimitResetsAt: event.rateLimit?.resetsAt ?? null,
+        };
         for (const usage of Array.isArray(event.usage) ? event.usage : [event.usage]) {
           recordTurnUsage(providerName, usage, turnMeta);
         }
