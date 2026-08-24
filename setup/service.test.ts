@@ -4,6 +4,7 @@ import path from 'path';
 import { getLaunchdLabel } from '../src/install-slug.js';
 import {
   installGraphifySystemdSidecar,
+  renderLogrotateConfig,
   resolveGraphifySystemIdentity,
 } from './service.js';
 
@@ -168,6 +169,38 @@ describe('systemd unit generation', () => {
     expect(unit).toContain(
       'ExecStart=/usr/bin/node /srv/nanoclaw/dist/index.js',
     );
+  });
+});
+
+describe('logrotate config generation', () => {
+  it('targets both log paths derived from projectRoot', () => {
+    const config = renderLogrotateConfig('/srv/nanoclaw');
+    expect(config).toContain('/srv/nanoclaw/logs/nanoclaw.log');
+    expect(config).toContain('/srv/nanoclaw/logs/nanoclaw.error.log');
+  });
+
+  it('rotates daily, keeps 30 generations, compresses with a one-cycle delay', () => {
+    const config = renderLogrotateConfig('/srv/nanoclaw');
+    expect(config).toContain('daily');
+    expect(config).toContain('rotate 30');
+    expect(config).toContain('compress');
+    expect(config).toContain('delaycompress');
+  });
+
+  it('uses copytruncate — required because append: redirects hold the fd open', () => {
+    const config = renderLogrotateConfig('/srv/nanoclaw');
+    expect(config).toContain('copytruncate');
+  });
+
+  it('caps a pathological burst with maxsize, not size (size drops the daily cadence)', () => {
+    const config = renderLogrotateConfig('/srv/nanoclaw');
+    expect(config).toContain('maxsize 200M');
+    expect(config).not.toMatch(/(?<!max)size 200M/);
+  });
+
+  it('runs rotation as root — the files are root-owned regardless of the unit User=', () => {
+    const config = renderLogrotateConfig('/srv/nanoclaw');
+    expect(config).toContain('su root root');
   });
 });
 
