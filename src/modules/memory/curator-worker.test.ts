@@ -479,6 +479,105 @@ describe('memory curator worker', () => {
     warnSpy.mockRestore();
   });
 
+  // Production bug (~1/day, steady 19 days): selectGeneratedMemoryForPrompt
+  // shows full prior fact lines including their own evidence=...:agent-group
+  // markers, so the model can copy a prior id verbatim without citing
+  // anything from the current episode.
+  it('repairs a candidate whose evidence cites only a prior fact, without dropping it', async () => {
+    const priorContent = [
+      '# Generated workgroup memory',
+      '',
+      '- GSC access is unknown. <!-- nanoclaw-memory:id=mem_aaaaaaaaaaaaaaaa;evidence=old-1;captured=2026-07-20T00:00:00.000Z -->',
+      '',
+    ].join('\n');
+    const curate = vi
+      .fn()
+      .mockResolvedValueOnce({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          // Copied straight from the prior fact's own evidence marker — no id
+          // from this episode at all.
+          memories: [{ text: 'GSC access is granted now.', evidenceIds: ['old-1'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      } satisfies CuratorBackendResult)
+      .mockResolvedValueOnce({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'GSC access is granted now.', evidenceIds: ['old-1', 'msg-1'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      } satisfies CuratorBackendResult);
+    const d = deps({ curate, readGenerated: () => ({ content: priorContent, sha256: 'a'.repeat(64) }) });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+
+    expect(report?.action).toBe('replace_generated_memory');
+    expect(curate).toHaveBeenCalledTimes(2);
+    // The corrective instruction names the current-episode requirement.
+    expect(curate.mock.calls[1]?.[0]).toContain('CURRENT episode');
+    const written = (d.writeGenerated as ReturnType<typeof vi.fn>).mock.calls[0]![1] as string;
+    expect(written).toContain('GSC access is granted now.');
+    expect(d.finishCall).toHaveBeenNthCalledWith(1, expect.any(String), 'validation_retry');
+    expect(d.finishCall).toHaveBeenNthCalledWith(2, expect.any(String), 'memory_written');
+    expect(d.complete).toHaveBeenCalledOnce();
+    expect(d.fail).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the submitted evidence ids out of band when the current-episode repair retry still fails', async () => {
+    const priorContent = [
+      '# Generated workgroup memory',
+      '',
+      '- GSC access is unknown. <!-- nanoclaw-memory:id=mem_aaaaaaaaaaaaaaaa;evidence=old-1;captured=2026-07-20T00:00:00.000Z -->',
+      '',
+    ].join('\n');
+    // Same prior-only id on every call — the retry starts from a clean
+    // prompt, and a model that keeps citing only prior evidence fails again
+    // the same way.
+    const curate = vi.fn(
+      async (): Promise<CuratorBackendResult> => ({
+        decision: {
+          action: 'replace_generated_memory',
+          reasonCode: 'durable_fact',
+          supersedesMemoryIds: [],
+          memories: [{ text: 'GSC access is granted now.', evidenceIds: ['old-1'] }],
+        },
+        model: 'claude-sonnet-5',
+        credentialSlot: 'oauth:2',
+        usage: { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      }),
+    );
+    const warnSpy = vi.spyOn(log, 'warn');
+    const d = deps({ curate, readGenerated: () => ({ content: priorContent, sha256: 'a'.repeat(64) }) });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+
+    expect(report).toBeNull();
+    expect(curate).toHaveBeenCalledTimes(2);
+    expect(d.complete).not.toHaveBeenCalled();
+    // classifyError still classifies this the same way it did before the
+    // fix — 'validation', unperturbed by the ids now riding along on the error.
+    expect(d.fail).toHaveBeenCalledWith(episode, 'validation', 1000);
+    expect(warnSpy).toHaveBeenCalledWith(
+      'memory-curator: episode failed',
+      expect.objectContaining({
+        errorClass: 'validation',
+        // The thrown message stays byte-identical — REPAIRABLE_VIOLATIONS and
+        // classifyError both key off this exact string.
+        error: 'new generated fact has no current-episode evidence',
+        submittedEvidenceIds: ['old-1'],
+      }),
+    );
+    expect(warnSpy.mock.calls[0]?.[1]).not.toHaveProperty('offendingEvidenceId');
+    warnSpy.mockRestore();
+  });
+
   it('offers splitting as the way out of an unshortenable fact, in the prompt and the repair', async () => {
     // The retry after a failed repair starts from a clean prompt with no memory
     // of the failure, so "shorten it but lose nothing" with no third option is

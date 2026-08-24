@@ -394,7 +394,16 @@ export function validateCuratorDecision(value: unknown, context: CuratorValidati
       .map((id) => ({ id, sentAt: context.currentEpisodeEvidence.get(id) }))
       .filter((item): item is { id: string; sentAt: string } => item.sentAt !== undefined)
       .sort((a, b) => Date.parse(a.sentAt) - Date.parse(b.sentAt));
-    if (currentEvidence.length === 0) throw new Error('new generated fact has no current-episode evidence');
+    if (currentEvidence.length === 0) {
+      // Carry the submitted ids as a property rather than in the message: the
+      // repair table and classifyError both key off the exact message text,
+      // same convention as resolveEvidenceIds above. Without this the
+      // rejection is unattributable — no way to tell which prior-only id(s)
+      // the model cited instead of a current-episode message id.
+      throw Object.assign(new Error('new generated fact has no current-episode evidence'), {
+        submittedEvidenceIds: evidenceIds,
+      });
+    }
     const capturedAt = currentEvidence.at(-1)!.sentAt;
     if (!Number.isFinite(Date.parse(capturedAt))) throw new Error('current evidence has an invalid timestamp');
     const textKey = memoryTextKey(text);
