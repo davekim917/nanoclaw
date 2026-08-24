@@ -63,6 +63,7 @@ import { migration057 } from './057-workgroups-attention-sources.js';
 import { migration058 } from './058-observatory-item-assignments.js';
 import { migration059 } from './059-central-turn-usage.js';
 import { migration060 } from './060-turn-usage-rate-limit.js';
+import { migration061 } from './061-turn-usage-turn-id.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -155,6 +156,7 @@ export const migrations: Migration[] = [
   // Same reasoning as 058: writes ISO-8601 UTC from JS at the write site.
   migration059,
   migration060,
+  migration061,
   containerConfigs,
   cliScope,
   messagingGroupInstance,

@@ -48,6 +48,7 @@ interface TurnUsageRow {
   rate_limit_type?: string | null;
   rate_limit_utilization?: number | null;
   rate_limit_resets_at?: string | null;
+  turn_id?: string | null;
 }
 
 export interface UsageDailyRow {
@@ -116,8 +117,8 @@ export function rollupSessionUsage(outDb: Database.Database, agentGroupId: strin
     // a detail ledger, not an additive aggregate with an identity element).
     const insertCentral = db.prepare(`
       INSERT INTO turn_usage
-        (ts, session_id, agent_group_id, provider, model, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-      VALUES (@ts, @session_id, @agent_group_id, @provider, @model, @steps, @duration_ms, @trigger, @rate_limit_type, @rate_limit_utilization, @rate_limit_resets_at, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)
+        (ts, session_id, agent_group_id, provider, model, turn_id, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+      VALUES (@ts, @session_id, @agent_group_id, @provider, @model, @turn_id, @steps, @duration_ms, @trigger, @rate_limit_type, @rate_limit_utilization, @rate_limit_resets_at, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)
     `);
     for (const row of rows) {
       maxId = Math.max(maxId, row.id);
@@ -141,6 +142,7 @@ export function rollupSessionUsage(outDb: Database.Database, agentGroupId: strin
         agent_group_id: agentGroupId,
         provider: row.provider,
         model: row.model ?? null,
+        turn_id: row.turn_id ?? null,
         // `??` (not `||`) so a real 0 steps/duration_ms survives — only an
         // absent/null value (old container, or a provider with no signal)
         // becomes NULL.

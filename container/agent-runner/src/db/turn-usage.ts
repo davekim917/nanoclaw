@@ -32,6 +32,7 @@ export interface TurnUsageRow {
   ts: string;
   provider: string;
   model: string | null;
+  turn_id: string | null;
   steps: number | null;
   duration_ms: number | null;
   trigger: string | null;
@@ -52,9 +53,14 @@ export interface TurnUsageRow {
  * provider — see each provider's result-event construction — and is NULL
  * when the provider exposes nothing usable rather than a guessed count.
  * `rateLimit*` fields are Claude-only (see ProviderEvent's `result.rateLimit`
- * doc) — always NULL for the other two providers.
+ * doc) — always NULL for the other two providers. `turnId` is generated once
+ * per `result` event (poll-loop.ts, outside the per-model recordTurnUsage
+ * loop) so every row a multi-model turn produces shares it — the honest
+ * denominator for "how many turns actually happened", since usage_daily's
+ * `turns` column over-counts by one per extra model on a split turn.
  */
 export interface TurnMeta {
+  turnId: string | null;
   steps: number | null;
   durationMs: number | null;
   trigger: string | null;
@@ -64,6 +70,7 @@ export interface TurnMeta {
 }
 
 const NO_TURN_META: TurnMeta = {
+  turnId: null,
   steps: null,
   durationMs: null,
   trigger: null,
@@ -139,13 +146,14 @@ export function recordTurnUsage(provider: string, usage: TurnUsageInfo = {}, met
     // bun:sqlite does not).
     getOutboundDb()
       .prepare(
-        `INSERT INTO turn_usage (ts, provider, model, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-         VALUES ($ts, $provider, $model, $steps, $duration_ms, $trigger, $rate_limit_type, $rate_limit_utilization, $rate_limit_resets_at, $input_tokens, $output_tokens, $cache_read_tokens, $cache_write_tokens, $cost_usd)`,
+        `INSERT INTO turn_usage (ts, provider, model, turn_id, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES ($ts, $provider, $model, $turn_id, $steps, $duration_ms, $trigger, $rate_limit_type, $rate_limit_utilization, $rate_limit_resets_at, $input_tokens, $output_tokens, $cache_read_tokens, $cache_write_tokens, $cost_usd)`,
       )
       .run({
         $ts: new Date().toISOString(),
         $provider: provider,
         $model: effectiveUsage.model ?? null,
+        $turn_id: meta.turnId ?? null,
         $steps: meta.steps ?? null,
         $duration_ms: meta.durationMs ?? null,
         $trigger: meta.trigger ?? null,

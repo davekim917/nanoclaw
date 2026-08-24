@@ -203,6 +203,11 @@ export function configureOutboundDb(outbound: Database): void {
     ['rate_limit_type', 'TEXT'],
     ['rate_limit_utilization', 'REAL'],
     ['rate_limit_resets_at', 'TEXT'],
+    // turn_id: added after the columns above — correlates the N rows one
+    // multi-model turn writes (see poll-loop.ts's per-model recordTurnUsage
+    // loop), so COUNT(DISTINCT turn_id) is the honest turn count instead of
+    // usage_daily's row-count-based `turns` (which over-counts a split turn).
+    ['turn_id', 'TEXT'],
   ] as const) {
     if (!turnUsageCols.has(name)) outbound.exec(`ALTER TABLE turn_usage ADD COLUMN ${name} ${type}`);
   }
@@ -449,6 +454,7 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       ts                 TEXT NOT NULL,
       provider           TEXT NOT NULL,
       model              TEXT,
+      turn_id            TEXT,
       steps              INTEGER,
       duration_ms        INTEGER,
       trigger            TEXT,

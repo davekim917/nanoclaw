@@ -1774,11 +1774,16 @@ export async function processQuery(
         // expose comes through as NULL — see TurnUsageInfo. A turn spanning
         // multiple models (event.usage as an array) writes one row per model
         // so each is attributed separately instead of collapsing to NULL.
-        // steps/duration/trigger (Phase 0.1 follow-up) are turn-level, not
-        // per-model, so every row from a multi-model turn carries the same
-        // values — computed once, right here, before anything below can push
-        // a follow-up and reset turnStartedAtMs for the NEXT turn.
+        // steps/duration/trigger/turnId (Phase 0.1 follow-up) are turn-level,
+        // not per-model, so every row from a multi-model turn carries the
+        // same values — computed once, right here, before anything below can
+        // push a follow-up and reset turnStartedAtMs for the NEXT turn.
+        // turnId in particular MUST be generated here (once per `result`
+        // event), not inside the per-model loop below — it's the field that
+        // lets a multi-model turn's split rows be recognized as one turn
+        // (usage_daily's row-count-based `turns` over-counts them).
         const turnMeta = {
+          turnId: randomUUID(),
           steps: event.steps ?? null,
           durationMs: Date.now() - turnStartedAtMs,
           trigger,

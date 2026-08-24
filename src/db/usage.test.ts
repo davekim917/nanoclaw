@@ -156,6 +156,7 @@ function makeOutboundDbWithTurnMeta(): Database.Database {
       ts TEXT NOT NULL,
       provider TEXT NOT NULL,
       model TEXT,
+      turn_id TEXT,
       steps INTEGER,
       duration_ms INTEGER,
       trigger TEXT,
@@ -190,8 +191,8 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     const outDb = makeOutboundDbWithTurnMeta();
     outDb
       .prepare(
-        `INSERT INTO turn_usage (ts, provider, model, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
-         VALUES ('2026-08-10T01:00:00.000Z', 'claude', 'opus', 12, 45000, 'human', 'seven_day', 0.91, '2026-08-25T00:00:00.000Z', 1000, 200, 50, 10, 0.5)`,
+        `INSERT INTO turn_usage (ts, provider, model, turn_id, steps, duration_ms, trigger, rate_limit_type, rate_limit_utilization, rate_limit_resets_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES ('2026-08-10T01:00:00.000Z', 'claude', 'opus', 't-abc', 12, 45000, 'human', 'seven_day', 0.91, '2026-08-25T00:00:00.000Z', 1000, 200, 50, 10, 0.5)`,
       )
       .run();
 
@@ -209,6 +210,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
       agent_group_id: GID,
       provider: 'claude',
       model: 'opus',
+      turn_id: 't-abc',
       steps: 12,
       duration_ms: 45000,
       trigger: 'human',
@@ -223,7 +225,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     });
   });
 
-  it('an old-shape turn_usage row (missing steps/duration_ms/trigger/rate_limit_* columns) rolls up without throwing, central row is NULL', () => {
+  it('an old-shape turn_usage row (missing steps/duration_ms/trigger/rate_limit_*/turn_id columns) rolls up without throwing, central row is NULL', () => {
     const outDb = makeOutboundDb(); // the pre-Phase-0.1-follow-up fixture, no new columns at all
     insertTurn(outDb, { ts: '2026-08-10T01:00:00.000Z' });
 
@@ -238,6 +240,7 @@ describe('rollupSessionUsage — central turn_usage mirror', () => {
     expect(centralRows[0].rate_limit_type).toBeNull();
     expect(centralRows[0].rate_limit_utilization).toBeNull();
     expect(centralRows[0].rate_limit_resets_at).toBeNull();
+    expect(centralRows[0].turn_id).toBeNull();
   });
 
   it('derives session_id from sessionDirKey (<agent-group>/<session>)', () => {

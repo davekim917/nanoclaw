@@ -121,6 +121,7 @@ describe('turn_usage — insert helper', () => {
       'claude',
       { model: 'claude-opus-5', inputTokens: 10 },
       {
+        turnId: 't-1',
         steps: null,
         durationMs: null,
         trigger: null,
@@ -133,11 +134,13 @@ describe('turn_usage — insert helper', () => {
 
     const rows = getTurnUsageRows();
     expect(rows[0]).toMatchObject({
+      turn_id: 't-1',
       rate_limit_type: 'seven_day',
       rate_limit_utilization: 0.91,
       rate_limit_resets_at: '2026-08-24T00:00:00.000Z',
     });
     expect(rows[1]).toMatchObject({
+      turn_id: null,
       rate_limit_type: null,
       rate_limit_utilization: null,
       rate_limit_resets_at: null,

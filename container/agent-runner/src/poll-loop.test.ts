@@ -14,6 +14,7 @@ import {
 } from './db/connection.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
+import { getTurnUsageRows } from './db/turn-usage.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import {
   dispatchFileAttachment,
@@ -1973,6 +1974,45 @@ const ERR_ROUTING = {
   inReplyTo: 'm1',
   quietStatus: false,
 };
+
+describe('turn_id — correlates split rows of one turn, distinguishes separate turns', () => {
+  it('a multi-model result event writes N turn_usage rows sharing one turn_id; a later result event gets a different one', async () => {
+    // The whole value of this field: usage_daily counts turns by ROW, so a
+    // turn split across models (Opus parent + Sonnet subagent) over-counts
+    // by one per extra model. turn_id lets COUNT(DISTINCT turn_id) recover
+    // the true turn count instead.
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'turn-id-test' };
+      yield {
+        type: 'result',
+        text: 'first turn, two models',
+        usage: [
+          { model: 'claude-opus-5', inputTokens: 100 },
+          { model: 'claude-sonnet-5', inputTokens: 50 },
+        ],
+      };
+      yield {
+        type: 'result',
+        text: 'second turn, one model',
+        usage: { model: 'claude-opus-5', inputTokens: 10 },
+      };
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, abort: () => {}, events: events() };
+
+    await processQuery(query, ERR_ROUTING, [], 'claude', undefined, 'prompt', undefined, {});
+
+    const rows = getTurnUsageRows();
+    expect(rows).toHaveLength(3);
+
+    // First result's two model-rows share one turn_id.
+    expect(rows[0].turn_id).not.toBeNull();
+    expect(rows[1].turn_id).toBe(rows[0].turn_id);
+
+    // Second, separate result event gets its own, different turn_id.
+    expect(rows[2].turn_id).not.toBeNull();
+    expect(rows[2].turn_id).not.toBe(rows[0].turn_id);
+  });
+});
 
 describe('mid-turn fast-mode changes', () => {
   it('ends the active query and leaves the flag row pending for a fast-tier respawn', async () => {
