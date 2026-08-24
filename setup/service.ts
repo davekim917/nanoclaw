@@ -289,6 +289,30 @@ function checkDockerGroupStale(): boolean {
   }
 }
 
+/**
+ * Content for /etc/logrotate.d/<unit-name>. Mirrors the reference snapshot
+ * checked in at data/logrotate/nanoclaw-v2 (see that file for the full
+ * rationale on copytruncate, maxsize vs size, and su) — keep the two in
+ * sync if the rotation policy changes. Paths here are derived from
+ * projectRoot, matching the StandardOutput=/StandardError= paths this same
+ * function writes into the systemd unit above, so they can't drift apart.
+ */
+export function renderLogrotateConfig(projectRoot: string): string {
+  return `${projectRoot}/logs/nanoclaw.log
+${projectRoot}/logs/nanoclaw.error.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    copytruncate
+    notifempty
+    missingok
+    maxsize 200M
+    su root root
+}
+`;
+}
+
 function setupSystemd(
   projectRoot: string,
   nodePath: string,
@@ -344,6 +368,16 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
 
   fs.writeFileSync(unitPath, unit);
   log.info('Wrote systemd unit', { unitPath });
+
+  // logrotate.d is a root-only system directory — there's no user-level
+  // equivalent the way ~/.config/systemd/user/ stands in for a non-root
+  // systemd install, so only install it when we can write to /etc directly.
+  let logrotatePath: string | undefined;
+  if (runningAsRoot) {
+    logrotatePath = `/etc/logrotate.d/${unitName}`;
+    fs.writeFileSync(logrotatePath, renderLogrotateConfig(projectRoot));
+    log.info('Wrote logrotate config', { logrotatePath });
+  }
 
   // Detect stale docker group before starting (user systemd only). The user
   // systemd manager is a long-running process whose group list is frozen at
@@ -466,6 +500,7 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
     PROJECT_PATH: projectRoot,
     UNIT_PATH: unitPath,
     SERVICE_LOADED: serviceLoaded,
+    ...(logrotatePath ? { LOGROTATE_PATH: logrotatePath } : {}),
     GRAPHIFY_SERVICE_UNIT: graphifyService.unitName,
     GRAPHIFY_UNIT_PATH: graphifyService.unitPath,
     GRAPHIFY_SERVICE_LOADED: graphifyService.loaded,

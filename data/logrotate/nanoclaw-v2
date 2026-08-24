@@ -1,0 +1,60 @@
+# NanoClaw v2 host log rotation.
+#
+# Checked in as a reference snapshot alongside data/systemd/nanoclaw-v2.service
+# (same convention: this repo's copy documents what's live at
+# /etc/logrotate.d/nanoclaw-v2 on the production host). The paths below match
+# StandardOutput=/StandardError= in data/systemd/nanoclaw-v2.service — keep
+# them in sync if that unit's redirect paths ever change.
+#
+# setup/service.ts (setupSystemd, root branch) writes the equivalent content
+# to /etc/logrotate.d/<systemd-unit-name> on every setup run, with paths
+# derived from the install's actual projectRoot instead of hardcoded here.
+/home/ubuntu/nanoclaw-v2/logs/nanoclaw.log
+/home/ubuntu/nanoclaw-v2/logs/nanoclaw.error.log {
+    daily
+
+    # A month, not a week: at ~10 MB/day combined growth, 7 generations
+    # (a week) is only 7 days of history. Real incident investigations here
+    # have needed to reach back 19 days, so 30 gives margin without
+    # unbounded retention.
+    rotate 30
+
+    compress
+    # Leave the just-rotated generation uncompressed for one more cycle:
+    # with copytruncate (below) a slow writer can still be mid-flush to the
+    # old content when rotation happens, so compressing immediately risks
+    # racing that write. Compression happens on the next rotation instead.
+    delaycompress
+
+    # LOAD-BEARING. The systemd unit redirects with
+    # StandardOutput=append:/StandardError=append:, which the (root) systemd
+    # manager opens and holds open for the life of the service. A normal
+    # rotation (rename old, create new) would leave the daemon writing into
+    # the renamed-then-unlinked inode forever, while the new file at the
+    # original path stays empty until the service restarts. copytruncate
+    # instead copies the current content out and truncates the original
+    # file in place, so the already-open file descriptor keeps writing to
+    # the same inode and rotation needs no service restart.
+    copytruncate
+
+    notifempty
+    missingok
+
+    # Safety cap so a pathological burst can't outrun the daily schedule.
+    # Deliberately `maxsize`, not `size`: logrotate(8) documents `size` as
+    # mutually exclusive with time-interval directives (whichever is listed
+    # last wins) — using it here would silently drop the `daily` cadence and
+    # make rotation purely size-triggered. `maxsize` rotates early on a
+    # burst while still honoring the daily check the rest of the time.
+    maxsize 200M
+
+    # The unit declares User=ubuntu/Group=ubuntu, but that only governs the
+    # exec'd nanoclaw process — systemd's manager (root, since this is a
+    # system-level unit) opens the append: targets itself before dropping
+    # privileges, so the files land on disk owned root:root (verified with
+    # `ls -l`, not assumed from the unit). logrotate itself also runs as
+    # root here (logrotate.timer -> logrotate.service takes no User=), so
+    # this is already the default — spelled out explicitly so rotation
+    # keeps working even if file ownership or the runtime user ever drifts.
+    su root root
+}

@@ -301,6 +301,8 @@ Check these first when something goes wrong:
 | Setup logs | `logs/setup.log` (overall), `logs/setup-steps/*.log` (per-step: bootstrap, environment, container, onecli, mounts, service, etc.) |
 | Session DBs | `data/v2-sessions/<agent-group>/<session>/` — `inbound.db` (`messages_in`: did the message reach the container?), `outbound.db` (`messages_out`: did the agent produce a response?) |
 
+Host logs rotate daily via `/etc/logrotate.d/<systemd-unit-name>` (30-day retention, `data/logrotate/nanoclaw-v2` is the checked-in reference; installed by `setup/service.ts` on every root setup run). `copytruncate` is required there, not optional — the unit's `StandardOutput=append:`/`StandardError=append:` redirect is opened by systemd itself, so a normal rename-based rotation would leave the daemon writing to an unlinked file until a restart.
+
 Note: container logs are lost after the container exits (`--rm` flag). If the agent silently failed inside the container, there's no persistent log to inspect.
 
 ## Timestamps
