@@ -36,12 +36,28 @@ export interface SessionsResponse {
   sessions: SessionSummary[];
 }
 
+/**
+ * Who produced an INBOUND transcript entry — the counterpart to
+ * `ThreadTranscriptEntry.agent_name`, which only ever names the agent.
+ *
+ * Nullable as a whole, never field-by-field: a row either names its author or
+ * names nobody. There is no "Unknown".
+ */
+export interface TranscriptAuthor {
+  name: string;
+  id: string | null;
+  /** The platform's own flag. `null` = the row predates it; unknown, not human. */
+  is_bot: boolean | null;
+}
+
 export interface SessionTranscriptEntry {
   direction: 'in' | 'out';
   kind: string;
   seq: number;
   timestamp: string;
   text: string;
+  /** Null on outbound, and on any inbound with no resolvable author. */
+  author: TranscriptAuthor | null;
 }
 
 export interface SessionDetailResponse {

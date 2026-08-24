@@ -203,20 +203,37 @@ export function ThreadDetail({ thread, focusComposer = 0, nextAction, onSent }: 
 
       <div className="ncc-transcript" ref={anchor.scroller} onScroll={anchor.onScroll}>
         <div className="ncc-transcript-inner" ref={anchor.content}>
-          {(data?.transcript ?? []).map((m) => (
-            <div className={`ncc-msg ${m.direction}`} key={`${m.session_id}:${m.seq}`}>
-              <span className="ncc-face">
-                <AgentAvatar name={m.agent_name} initials={initials(m.agent_name)} avatarUrl={null} size={24} />
-              </span>
-              <div className="ncc-msg-body">
-                <div className="ncc-msg-who">
-                  <span className="name">{m.direction === 'out' ? m.agent_name : 'Inbound'}</span>
-                  <span className="at">{relAge(m.timestamp)} ago</span>
+          {(data?.transcript ?? []).map((m) => {
+            // One speaker slot for both directions, so the transcript reads as
+            // ONE conversation rather than "agent rows" and "other rows".
+            // Outbound is the agent; inbound is whoever the row recorded.
+            const speaker = m.direction === 'out' ? m.agent_name : m.author?.name;
+            // Asserted ONLY from a positive `is_bot`. Absence of this chip is
+            // the absence of a claim — it never asserts "human", so an
+            // undeclared `is_bot` (a legacy row) can never read as a person.
+            const isBot = m.direction === 'in' && m.author?.is_bot === true;
+            return (
+              <div className={`ncc-msg ${m.direction}`} key={`${m.session_id}:${m.seq}`}>
+                {/* No resolvable author → no face, not a face of somebody else.
+                    The empty span holds the column so the text stays aligned. */}
+                {speaker ? (
+                  <span className="ncc-face">
+                    <AgentAvatar name={speaker} initials={initials(speaker)} avatarUrl={null} size={24} />
+                  </span>
+                ) : (
+                  <span className="ncc-face empty" />
+                )}
+                <div className="ncc-msg-body">
+                  <div className="ncc-msg-who">
+                    {speaker && <span className="name">{speaker}</span>}
+                    {isBot && <span className="kind">bot</span>}
+                    <span className="at">{relAge(m.timestamp)} ago</span>
+                  </div>
+                  <MessageText text={m.text} />
                 </div>
-                <MessageText text={m.text} />
               </div>
-            </div>
-          ))}
+            );
+          })}
           {data && data.transcript.length === 0 && <div className="ncc-empty">no messages on this thread</div>}
         </div>
       </div>

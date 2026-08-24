@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
 import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
-import { sessionsHandler, sessionsDetailHandler } from './sessions.js';
+import { sessionsHandler, sessionsDetailHandler, resolveTranscriptAuthor } from './sessions.js';
 import type { AuthedRequestContext } from '../router.js';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
@@ -568,5 +568,90 @@ describe('sessionsDetailHandler', () => {
     expect(resp!.status).toBe(404);
     const body = (await resp!.json()) as { error: string };
     expect(body.error).toBe('session_not_found');
+  });
+});
+
+// ── Inbound authorship (who said it, not just which direction) ───────────────
+
+/**
+ * The transcript used to render every human turn as a bare `Inbound`, in rooms
+ * that routinely hold the operator, colleagues, AND sibling agents. The
+ * identity was always stored on the inbound row's content JSON — the reader
+ * parsed it for `.text` and dropped the rest.
+ *
+ * These fixtures are synthetic by construction; the shapes are copied from the
+ * live `messages_in` schema, never the values.
+ */
+describe('resolveTranscriptAuthor', () => {
+  it('names a human from the richest field, and marks them not-a-bot', () => {
+    const author = resolveTranscriptAuthor({
+      text: 'is the retry path merged?',
+      sender: 'fixturehuman',
+      senderName: 'Fixture Human',
+      senderId: 'UTESTHUMAN01',
+      author: {
+        userId: 'UTESTHUMAN01',
+        userName: 'fixturehuman',
+        fullName: 'Fixture Human',
+        isBot: false,
+        isMe: false,
+      },
+    });
+    expect(author).toEqual({ name: 'Fixture Human', id: 'UTESTHUMAN01', is_bot: false });
+  });
+
+  it('walks fullName → userName → senderName → sender, taking the first that has content', () => {
+    const base = { senderId: 'UTESTFIXTURE01' };
+    const at = (author: Record<string, unknown>, rest: Record<string, unknown> = {}) =>
+      resolveTranscriptAuthor({ ...base, ...rest, author: { isBot: false, ...author } })!.name;
+
+    expect(at({ fullName: 'From Full Name', userName: 'from-user-name' })).toBe('From Full Name');
+    // Blank is not a value — an empty fullName falls through rather than
+    // rendering a nameless author.
+    expect(at({ fullName: '   ', userName: 'from-user-name' })).toBe('from-user-name');
+    expect(at({}, { senderName: 'From Sender Name', sender: 'from-sender' })).toBe('From Sender Name');
+    expect(at({}, { sender: 'from-sender' })).toBe('from-sender');
+    // Legacy `chat` rows carry sender/senderId and no author object at all.
+    expect(resolveTranscriptAuthor({ text: 'hi', sender: 'From Legacy Row', senderId: 'UTESTFIXTURE01' })).toEqual({
+      name: 'From Legacy Row',
+      id: 'UTESTFIXTURE01',
+      is_bot: null,
+    });
+  });
+
+  it('distinguishes a sibling agent from a person on the platform flag', () => {
+    const sibling = resolveTranscriptAuthor({
+      text: 'picking this up',
+      author: { userId: 'BTESTSIBLING01', fullName: 'Fixture Sibling', isBot: true, isMe: false },
+    });
+    expect(sibling).toEqual({ name: 'Fixture Sibling', id: 'BTESTSIBLING01', is_bot: true });
+
+    // Unknown is a THIRD state, not a quiet "human": a legacy row that never
+    // stored the flag must not be asserted to be a person.
+    expect(resolveTranscriptAuthor({ sender: 'From Legacy Row', senderId: 'UTESTFIXTURE01' })!.is_bot).toBeNull();
+  });
+
+  it('resolves to NO author rather than inventing one', () => {
+    // Host-generated inbounds — `system` and `task` kinds carry no author
+    // fields whatsoever.
+    expect(resolveTranscriptAuthor({ subtype: 'context-refresh', notices: [] })).toBeNull();
+    expect(resolveTranscriptAuthor({ prompt: 'run the sweep', script: 'x.ts' })).toBeNull();
+    // `host-sweep.ts` stamps its own notices with a literal `system` sender.
+    // That is the host writing to itself, not a speaker in the room.
+    expect(resolveTranscriptAuthor({ text: 'container restarted', sender: 'system', senderId: 'system' })).toBeNull();
+    // A row with the fields present but empty resolves to nobody, not "".
+    expect(resolveTranscriptAuthor({ sender: '', senderName: '   ', author: { fullName: '' } })).toBeNull();
+    // Nothing at all.
+    expect(resolveTranscriptAuthor({ text: 'bare text' })).toBeNull();
+  });
+
+  it('never throws on a malformed blob, whatever shape it turns out to be', () => {
+    // `undefined` is what the reader passes when JSON.parse threw outright.
+    for (const bad of [undefined, null, 'a string', 42, true, [], { author: 'not-an-object' }, { author: null }]) {
+      expect(() => resolveTranscriptAuthor(bad)).not.toThrow();
+      expect(resolveTranscriptAuthor(bad)).toBeNull();
+    }
+    // A non-string name is not a name — it must not be coerced to "[object Object]".
+    expect(resolveTranscriptAuthor({ author: { fullName: { first: 'x' } }, sender: 123 })).toBeNull();
   });
 });

@@ -1302,13 +1302,41 @@ describe('mergeThreadTranscript', () => {
   it('interleaves two sessions in timestamp order and tags each message with its agent', () => {
     const bySession: Record<string, SessionTranscriptEntry[]> = {
       'sess-a': [
-        { direction: 'in', kind: 'chat', seq: 2, timestamp: '2026-08-20T10:00:00.000Z', text: 'question' },
-        { direction: 'out', kind: 'chat', seq: 3, timestamp: '2026-08-20T10:00:30.000Z', text: 'a-answers' },
+        {
+          direction: 'in',
+          kind: 'chat',
+          seq: 2,
+          timestamp: '2026-08-20T10:00:00.000Z',
+          text: 'question',
+          author: { name: 'Fixture Human', id: 'UTESTHUMAN01', is_bot: false },
+        },
+        {
+          direction: 'out',
+          kind: 'chat',
+          seq: 3,
+          timestamp: '2026-08-20T10:00:30.000Z',
+          text: 'a-answers',
+          author: null,
+        },
       ],
       'sess-b': [
         // Same `seq` values as sess-a — proof that seq cannot order a thread.
-        { direction: 'out', kind: 'chat', seq: 3, timestamp: '2026-08-20T10:00:10.000Z', text: 'b-answers-first' },
-        { direction: 'out', kind: 'chat', seq: 5, timestamp: '2026-08-20T10:01:00.000Z', text: 'b-follows-up' },
+        {
+          direction: 'out',
+          kind: 'chat',
+          seq: 3,
+          timestamp: '2026-08-20T10:00:10.000Z',
+          text: 'b-answers-first',
+          author: null,
+        },
+        {
+          direction: 'out',
+          kind: 'chat',
+          seq: 5,
+          timestamp: '2026-08-20T10:01:00.000Z',
+          text: 'b-follows-up',
+          author: null,
+        },
       ],
     };
 
@@ -1324,6 +1352,10 @@ describe('mergeThreadTranscript', () => {
     expect(merged.map((m) => m.agent_name)).toEqual(['Alpha', 'Bravo', 'Alpha', 'Bravo']);
     expect(merged.map((m) => m.session_id)).toEqual(['sess-a', 'sess-b', 'sess-a', 'sess-b']);
     expect(merged.map((m) => m.agent_group_id)).toEqual(['ag-a', 'ag-b', 'ag-a', 'ag-b']);
+    // The merge tags each entry with the AGENT that owns its session; the
+    // inbound author is a different axis and rides through untouched, so a
+    // thread with one agent and three people can still tell the people apart.
+    expect(merged.map((m) => m.author?.name ?? null)).toEqual(['Fixture Human', null, null, null]);
   });
 
   it('keeps the newest tail and returns it oldest-first', () => {
@@ -1333,6 +1365,7 @@ describe('mergeThreadTranscript', () => {
       seq: i + 1,
       timestamp: new Date(Date.parse('2026-08-20T10:00:00.000Z') + i * 1000).toISOString(),
       text: `m${i}`,
+      author: null,
     }));
     const merged = mergeThreadTranscript([{ sessionId: 's', agentGroupId: 'ag', agentName: 'A' }], () => entries, 2);
     expect(merged.map((m) => m.text)).toEqual(['m3', 'm4']);
@@ -1345,7 +1378,7 @@ describe('mergeThreadTranscript', () => {
         { sessionId: 'zzz', agentGroupId: 'ag-z', agentName: 'Z' },
         { sessionId: 'aaa', agentGroupId: 'ag-a', agentName: 'A' },
       ],
-      (_ag, sessionId) => [{ direction: 'out', kind: 'chat', seq: 1, timestamp: at, text: sessionId }],
+      (_ag, sessionId) => [{ direction: 'out', kind: 'chat', seq: 1, timestamp: at, text: sessionId, author: null }],
     );
     expect(merged.map((m) => m.text)).toEqual(['aaa', 'zzz']);
   });

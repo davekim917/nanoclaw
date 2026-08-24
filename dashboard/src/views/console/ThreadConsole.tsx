@@ -727,9 +727,12 @@ export function lastMessagePreview(transcript: ThreadTranscriptEntry[] | undefin
   const text = stripMarkdown(last.text);
   if (!text) return null;
   return {
-    // Inbound carries no author on the wire — the transcript records a
-    // direction, not a human. Naming one would be an invention.
-    speaker: last.direction === 'out' ? last.agent_name : '',
+    // Inbound now carries its author, so the hybrid line names the person or
+    // sibling agent that actually spoke instead of leading with a bare colon.
+    // Still `''` when the row resolves to nobody: an unnamed speaker is the
+    // honest render, and inventing one is what this used to avoid by naming
+    // nobody at all.
+    speaker: last.direction === 'out' ? last.agent_name : (last.author?.name ?? ''),
     excerpt: text.length > EXCERPT_CHARS ? `${text.slice(0, EXCERPT_CHARS)}…` : text,
   };
 }
