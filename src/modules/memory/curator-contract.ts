@@ -25,7 +25,23 @@ export const GENERATED_MEMORY_RELATIVE_PATH = 'generated/memory.md';
 // now memoized in pre-turn-context.ts (648 ms cold, ~13 ms warm, 50x), and
 // because the cache keys on fact text a curator rewrite only re-tokenizes the
 // facts that actually changed. Disk and the per-turn file read are what remain.
-export const GENERATED_MEMORY_MAX_BYTES = 8 * 1024 * 1024;
+//
+// Measured 2026-08-24: the busiest workgroup was at 6.41 MB growing ~183
+// KB/day — roughly 11 days from the 8 MiB rail. Raised to 16 MiB, which buys
+// ~6 weeks at that rate.
+//
+// Why 16 and not 32: readGeneratedMemory reads the WHOLE file on every turn,
+// so the rail is also a per-turn I/O tax. 16 MiB is chosen as the largest
+// raise that does not meaningfully worsen the hot read path; going bigger
+// trades a write outage for a latency cost on every message.
+//
+// This rail is now explicitly a bridge, not a fix: the structural answer is
+// tiering the ledger (hot file = recent + unconsolidated facts; consolidated
+// facts move to retained dated archive segments, never deleted), which only
+// became safe once pillar-2 consolidation existed and
+// memory_consolidated_facts recorded which facts are already represented in a
+// topic view. This raise buys the runway to build that.
+export const GENERATED_MEMORY_MAX_BYTES = 16 * 1024 * 1024;
 export const GENERATED_MEMORY_WARN_BYTES = Math.floor(GENERATED_MEMORY_MAX_BYTES * 0.75);
 export const CURATOR_MAX_EVIDENCE_IDS = 20;
 export const CURATOR_MAX_SUPERSESSIONS = 3;

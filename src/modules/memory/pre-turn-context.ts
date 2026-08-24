@@ -19,7 +19,11 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // Must clear GENERATED_MEMORY_MAX_BYTES with room for the manual tree beside
   // it: this is a shared budget consumed in listing order, so a generated store
   // at its own cap would otherwise silently truncate every file after it.
-  markdownScannedBytes: 16 * 1_048_576,
+  // Derived from the bound rather than a bare literal so the two can never
+  // re-collide the way they did when both sat at 16 MiB after the 2026-08-24
+  // ledger-rail raise — the fixed 8 MiB is headroom for the manual tree, which
+  // does not grow with the generated-memory rail.
+  markdownScannedBytes: GENERATED_MEMORY_MAX_BYTES + 8 * 1_048_576,
   markdownFileBytes: 65_536,
   markdownCoreChars: 2_500,
   markdownHeadings: 24,

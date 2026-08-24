@@ -56,6 +56,7 @@ import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { probeGraphScentWarmth, _resetGraphScentForTest } from './graph-scent.js';
 import { WorkgroupGraphStore } from '../../graphify/store.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
+import { GENERATED_MEMORY_MAX_BYTES } from './curator-contract.js';
 
 const FIXTURE = JSON.parse(
   fs.readFileSync(path.join(process.cwd(), 'tests/fixtures/workgroup-memory-recall.json'), 'utf8'),
@@ -1700,5 +1701,16 @@ describe('final-bound eviction order (AC12b, AC13, AC13b at the seam)', () => {
     expect(context.conversationEvidence.excerpts.length).toBeLessThan(3);
     expect(context.memoryEvidence.excerpts.length).toBe(memBefore);
     expect(JSON.stringify(context).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars + 200);
+  });
+});
+
+describe('markdown byte-scan budget stays coupled to the generated-memory rail', () => {
+  it('leaves headroom for the manual tree even when the generated store sits at its own cap', () => {
+    // generated/memory.md sorts first in scan order (see the comment above
+    // markdownScannedBytes), so a generated store at GENERATED_MEMORY_MAX_BYTES
+    // must not consume the whole budget — otherwise every manual file scanned
+    // after it silently reads as zero bytes. This is the exact regression that
+    // would recur if the generated-memory cap were raised without this one.
+    expect(PRE_TURN_BOUNDS.markdownScannedBytes).toBeGreaterThan(GENERATED_MEMORY_MAX_BYTES);
   });
 });

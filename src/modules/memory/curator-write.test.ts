@@ -212,6 +212,33 @@ describe('host generated-memory writer', () => {
     const helperBytes = Number(declared![1]!.replace(/_/g, '')) * 1024;
     expect(helperBytes).toBeGreaterThanOrEqual(GENERATED_MEMORY_MAX_BYTES + 16 * 1024);
   });
+
+  it('a generated-memory write at the host maximum still fits the helper request bound', () => {
+    // Goes beyond comparing the two bare constants above: builds the actual
+    // wire request invokeHelper sends (curator-write.ts), at content sized to
+    // the real new maximum, and checks it against the helper's own declared
+    // bound parsed from source. If the helper constant is not raised in
+    // lockstep, this fails with the exact byte count that would make every
+    // ledger write at the new cap start hitting "bounded write request is
+    // required" again.
+    const helper = fs.readFileSync(
+      path.join(process.cwd(), 'container/agent-runner/src/mcp-tools/memory-write-process-helper.ts'),
+      'utf8',
+    );
+    const declared = /MAX_CURATOR_WRITE_REQUEST_BYTES\s*=\s*([0-9_]+)\s*\*\s*1024/.exec(helper);
+    expect(declared).not.toBeNull();
+    const helperBytes = Number(declared![1]!.replace(/_/g, '')) * 1024;
+
+    const request = {
+      rootDir: '/data/workgroups/example-long-workgroup-id/memory',
+      relativePath: 'generated/memory.md',
+      content: 'x'.repeat(GENERATED_MEMORY_MAX_BYTES),
+      expectedSha256: 'a'.repeat(64),
+      allowGeneratedMemory: true,
+    };
+    const bodyBytes = Buffer.byteLength(JSON.stringify(request));
+    expect(bodyBytes).toBeLessThanOrEqual(helperBytes);
+  });
 });
 
 describe('host topic-file writer', () => {

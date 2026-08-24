@@ -225,9 +225,10 @@ export const MEMORY_CURATION_CALL_RETENTION_MS = 2 * 24 * 60 * 60_000;
 export const MEMORY_MAINTENANCE_UPDATE_THRESHOLD = 50;
 // 75% of GENERATED_MEMORY_MAX_BYTES, kept in proportion by hand: importing the
 // value from curator-contract.ts would close a runtime cycle, since that module
-// already imports this one. Left at 192 KiB it fired every sweep for any
-// workgroup past the old cap, claiming and completing a job that does nothing.
-export const MEMORY_MAINTENANCE_SIZE_THRESHOLD = 6 * 1024 * 1024;
+// already imports this one. Left stale below the real warn line, it fires
+// every sweep for any workgroup past the old cap, claiming and completing a
+// job that does nothing.
+export const MEMORY_MAINTENANCE_SIZE_THRESHOLD = 12 * 1024 * 1024;
 
 export interface MemoryCurationEpisode {
   episodeKey: string;
