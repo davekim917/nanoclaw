@@ -40,6 +40,22 @@ describe('spawn-time provider fallback', () => {
     });
   });
 
+  it('routes a Claude primary to Codex while Claude is in cooldown', () => {
+    markProviderUnavailable(GID, 'claude', 'quota', { nowMs: NOW });
+    expect(
+      resolveSpawnProvider({
+        agentGroupId: GID,
+        sessionProvider: null,
+        containerConfig: { provider: 'claude', providerFallback: { provider: 'codex' } },
+        nowMs: NOW,
+      }),
+    ).toMatchObject({
+      provider: 'codex',
+      primaryProvider: 'claude',
+      fallbackApplied: true,
+    });
+  });
+
   it('returns to the primary once the window expires — no cron required', () => {
     const until = markProviderUnavailable(GID, 'codex', 'quota', { nowMs: NOW });
     const after = Date.parse(until) + 1;

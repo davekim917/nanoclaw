@@ -29,6 +29,18 @@ describe('parseRawConfig provider fallback bridge', () => {
     expect(config.model).toBe('claude-opus-5[1m]');
   });
 
+  it('lets a Claude primary run on its declared Codex fallback', () => {
+    process.env.NANOCLAW_PROVIDER_OVERRIDE = 'codex';
+    const config = parseRawConfig({
+      provider: 'claude',
+      providerConfig: { model: 'claude-opus-5[1m]', effort: 'high' },
+      providerFallback: { provider: 'codex' },
+    });
+    expect(config.provider).toBe('codex');
+    expect(config.providerConfig).toEqual({});
+    expect(config.providerFallback).toEqual({ provider: 'codex' });
+  });
+
   it('drops the primary provider-specific fields under an override — they are the wrong provider now', () => {
     // Live crash 2026-08-05: a codex group fell back to claude and every
     // spawn died with `Unrecognized key: "reasoning_effort"` — the file's codex
