@@ -34,6 +34,8 @@ set -u
 [ -n "${STUB_BRANCH_EXISTS+x}" ] || STUB_BRANCH_EXISTS=false
 [ -n "${STUB_PR_LIST_EXIT+x}" ] || STUB_PR_LIST_EXIT=0
 [ -n "${STUB_PR_FILES_EXIT+x}" ] || STUB_PR_FILES_EXIT=0
+[ -n "${STUB_COMPARE_FILES+x}" ] || STUB_COMPARE_FILES='{"files":[]}'
+[ -n "${STUB_COMPARE_EXIT+x}" ] || STUB_COMPARE_EXIT=0
 
 case "$1" in
   run)
@@ -61,6 +63,12 @@ case "$1" in
     fi
     if printf '%s' "$P" | grep -qF '/pulls/' && printf '%s' "$P" | grep -qF '/files'; then
       printf '%s' "$STUB_PR_FILES"; exit "$STUB_PR_FILES_EXIT"
+    fi
+    # Freeze-PR target-tree diff (base branch vs. the marker's parent) — the
+    # MG-1 fix: evaluate_pr no longer trusts a freeze PR's own two-marker
+    # diff for migrations/frontend, it compares against this instead.
+    if printf '%s' "$P" | grep -qF '/compare/'; then
+      printf '%s' "$STUB_COMPARE_FILES"; exit "$STUB_COMPARE_EXIT"
     fi
     if printf '%s' "$P" | grep -qF '/git/ref/heads/'; then
       if [ "$STUB_BRANCH_EXISTS" = true ]; then echo '{"ref":"exists"}'; exit 0; else exit 1; fi
@@ -125,6 +133,7 @@ reset_stubs() {
         STUB_REF_RESPONSE STUB_REF_EXIT STUB_BRANCH_EXISTS STUB_PR_LIST_EXIT \
         STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS \
+        STUB_COMPARE_FILES STUB_COMPARE_EXIT \
         SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER 2>/dev/null || true
 }
 
@@ -183,6 +192,48 @@ jq -e --arg sha "$HEAD_SHA" '
 # Same head, immediately after claiming: already active, no re-wake.
 bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
 
+# --- 3a. Target-aware preflight: the gate exports SMOKE_GATE_PREFLIGHT_TARGET_URL
+# for THIS settle candidate's own preview before invoking PREFLIGHT_CMD — the
+# whole point of routing the check to the right host instead of skipping it
+# or checking a fixed default host, which would prove nothing about this PR's
+# build.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha c)"
+export STUB_PR_LIST="[{\"number\":43,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-43\",\"name\":\"XZO-DEV-BACKEND PR #43\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-43.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+SEEN_URL_FILE="$STATE_DIR/seen-preflight-url.txt"
+export SMOKE_GATE_PREFLIGHT_CMD="printf '%s' \"\$SMOKE_GATE_PREFLIGHT_TARGET_URL\" > $SEEN_URL_FILE"
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled"' >/dev/null
+[ "$(cat "$SEEN_URL_FILE")" = "https://xzo-dev-backend-pr-43.onrender.com" ] \
+  || { echo "expected the preflight command to see this candidate's own preview URL" >&2; cat "$SEEN_URL_FILE" >&2; exit 1; }
+unset SMOKE_GATE_PREFLIGHT_CMD
+
+# --- 3b. A real preflight failure refuses the candidate and reports the
+# command's own last line as the reason, WITHOUT claiming the PR.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha d)"
+export STUB_PR_LIST="[{\"number\":44,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-44\",\"name\":\"XZO-DEV-BACKEND PR #44\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-44.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+export SMOKE_GATE_PREFLIGHT_CMD='echo "seat qa-a@example.com could not be verified"; exit 1'
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "preflight_failed" and
+  (.data.reason | test("could not be verified"))
+' >/dev/null
+[ ! -e "$STATE_DIR/pr-44-state.json" ] || jq -e '.activeRunId == null' "$STATE_DIR/pr-44-state.json" >/dev/null
+unset SMOKE_GATE_PREFLIGHT_CMD
+
 # --- 4. Deploy-SHA mismatch: check reports not settled, not ready ----------
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
@@ -200,6 +251,12 @@ bash "$GATE" check 7 | jq -e --arg head "$HEAD_SHA" --arg stale "$STALE_SHA" '
 ' >/dev/null
 
 # --- 5. Freeze-PR: CI checked on the PARENT sha, not the marker head -------
+# STUB_COMPARE_FILES is the target-tree diff (base branch vs. the marker's
+# parent) — evaluate_pr now judges migrations/frontend off THIS, never off
+# the freeze PR's own two-marker diff (STUB_PR_FILES), since that diff is
+# always exactly the two markers no matter what the target contains (MG-1,
+# see tests 5a/5b below). Here the target only touched an unrelated backend
+# file, so neither should be reported touched.
 fresh_state
 export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
   SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
@@ -208,10 +265,50 @@ FREEZE_SHA="$(sha f)"
 export STUB_PR_VIEW="{\"number\":9,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
 export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
 export STUB_PARENT_SHA="$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","files":[{"filename":"XZO-BACKEND/src/other.ts"}]}'
 export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
 bash "$GATE" check 9 | jq -e --arg parent "$PARENT_SHA" --arg head "$FREEZE_SHA" '
   .isFreezePr == true and .ciSha == $parent and .ciReady == true and
-  .migrationsTouched == false and .frontendTouched == true and .headSha == $head
+  .migrationsTouched == false and .frontendTouched == false and .headSha == $head and
+  .migrationsDeterminable == true and .migrationFiles == []
+' >/dev/null
+
+# --- 5a. MG-1 fix: a freeze PR whose TARGET (not its own 2-marker diff)
+# touches migrations must refuse to settle, exactly like PR #1188/migration
+# 222 on 2026-08-24 — the freeze PR's own `pulls/.../files` is always just
+# the two markers (STUB_PR_FILES below), so this can only be caught by
+# reading STUB_COMPARE_FILES, which is the whole point of the fix.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+PARENT_SHA="$(sha e)"
+FREEZE_SHA="$(sha f)"
+export STUB_PR_VIEW="{\"number\":10,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$PARENT_SHA"
+export STUB_COMPARE_FILES='{"status":"ahead","files":[{"filename":"XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"},{"filename":"XZO-BACKEND/src/other.ts"}]}'
+export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
+bash "$GATE" check 10 | jq -e '
+  .isFreezePr == true and .migrationsTouched == true and .settled == false and
+  .migrationsDeterminable == true and
+  .migrationFiles == ["XZO-BACKEND/migrations/222_undo_edit_prior_actor.sql"]
+' >/dev/null
+
+# --- 5b. Fail closed when the target-tree compare itself is unreadable —
+# never fall through to "no migrations" just because the check couldn't run.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+PARENT_SHA="$(sha e)"
+FREEZE_SHA="$(sha f)"
+export STUB_PR_VIEW="{\"number\":12,\"state\":\"OPEN\",\"isDraft\":true,\"headRefOid\":\"$FREEZE_SHA\",\"headRefName\":\"feature/x\",\"baseRefName\":\"develop\",\"labels\":[{\"name\":\"render-preview\"}]}"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$PARENT_SHA"
+export STUB_COMPARE_EXIT=1
+export STUB_RUN_LIST="[{\"headSha\":\"$PARENT_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"pr-title-check\"}]"
+bash "$GATE" check 12 | jq -e '
+  .isFreezePr == true and .migrationsTouched == true and .frontendTouched == true and
+  .settled == false and .migrationsDeterminable == false and .fetchOk == false
 ' >/dev/null
 
 # --- 6. Migrations refusal: never settles; one throttled alarm wake --------

@@ -39,6 +39,66 @@ fi
 SOURCE_SHA="$(jq -r '.sourceSha' "$CONTRACT")"
 MISSING=()
 INVALID=()
+INVALID_REASONS=()
+
+# Generation binds a marker to the CURRENT dispatch of its lane — added
+# 2026-08-24 after PR #1188's run bit this three times: a re-dispatched lane's
+# OLD terminal marker still satisfied this barrier (it was still sourceSha-
+# correct and still terminal), so the barrier reported ready while a live
+# worker was mid-flight, caught only by hand each time. The SAME hole let a
+# contract re-scaffold silently pass too: lane B2 was repurposed from
+# "permission crossings" to "publish/exports" under the same sourceSha, and
+# the OLD B2 marker (written against the old meaning) still validated because
+# nothing here has ever read what a lane id currently MEANS.
+#
+# `.lanes[]` in the contract is optional and BACKWARD COMPATIBLE — a contract
+# without it (or without `.generation` on an entry) behaves exactly as before,
+# because every lookup below defaults to generation 1 on both the contract
+# and the marker side. Nothing changes until a coordinator actively bumps a
+# lane's generation to signal "anything written before this does not count",
+# which is the moment a re-dispatch or a re-scaffold actually happens.
+LANES_HAVE_GENERATIONS="$(jq -r '(has("lanes") and (.lanes | type) == "array")' "$CONTRACT" 2>/dev/null)"
+[ "$LANES_HAVE_GENERATIONS" = true ] || LANES_HAVE_GENERATIONS=false
+
+expected_generation() {
+  # $1 = lane id. Prints the generation the CURRENT contract expects, "1" when
+  # the contract carries no lanes[] at all or no entry for this id.
+  local lane_id="$1" found
+  if [ "$LANES_HAVE_GENERATIONS" = true ]; then
+    # `.lanes[]?` and `select(type=="object")` keep a malformed entry (a
+    # stray non-object in the array) from turning into a jq runtime error
+    # that would abort this whole script under `set -e` — a bad lanes[]
+    # entry degrades to "generation not determinable, default 1", never a
+    # crash with no verdict printed at all.
+    found="$(jq -r --arg id "$lane_id" \
+      '[.lanes[]? | select(type=="object") | select(.id == $id) | ((.generation // 1) | tostring)][0] // empty' \
+      "$CONTRACT" 2>/dev/null)" || found=""
+    [ -n "$found" ] && { printf '%s' "$found"; return; }
+  fi
+  printf '1'
+}
+
+# One jq call per invalid marker (never on the hot/valid path) to say WHICH
+# check failed, in the order a reader would want to rule them out: identity
+# first (wrong build, wrong lane), then staleness (right build, right lane,
+# superseded dispatch), then shape (never even a real terminal marker).
+invalid_reason() {
+  local marker_path="$1" sha="$2" lane_id="$3" expected_gen="$4"
+  jq -r --arg sha "$sha" --arg id "$lane_id" --arg gen "$expected_gen" '
+    if .sourceSha != $sha then
+      "sourceSha mismatch (marker=" + (.sourceSha // "missing") + ", expected=" + $sha + ") — a marker left over from a different build"
+    elif ((.lane // $id) != $id) then
+      "lane field mismatch (marker declares lane=\"" + (.lane // "missing") + "\", filename implies \"" + $id + "\")"
+    elif (((.generation // 1) | tostring) != $gen) then
+      "stale generation (marker generation " + ((.generation // 1) | tostring) + ", contract now expects " + $gen +
+        ") — written against a superseded dispatch or a re-scaffolded lane definition; a fresh marker has not landed yet"
+    elif (.status != "pass" and .status != "fail" and .status != "blocked" and .status != "void" and .status != "completed") then
+      "status \"" + (.status // "missing") + "\" is not one of the terminal statuses"
+    else
+      "completedAt is missing or empty"
+    end
+  ' "$marker_path" 2>/dev/null || printf 'not valid JSON'
+}
 
 # `disposition` gates the challenger's THREAD POST, not its file write.
 #
@@ -75,6 +135,7 @@ while IFS= read -r marker; do
   case "$marker" in
     /*|../*|*/../*|*/..)
       INVALID+=("$marker")
+      INVALID_REASONS+=("$marker: absolute or path-traversal marker path is not allowed in requiredLaneMarkers")
       continue
       ;;
   esac
@@ -85,8 +146,17 @@ while IFS= read -r marker; do
     continue
   fi
 
-  if ! jq -e --arg sha "$SOURCE_SHA" '
+  # Lane id from the marker's own filename (the `markers/<ID>.json` convention
+  # every real contract in this fleet already uses) — not from the marker's
+  # `.lane` field, which is exactly the field a stale/mislabeled marker could
+  # get wrong. expected_generation reads the CURRENT contract, not the marker.
+  lane_id="$(basename "$marker" .json)"
+  expected_gen="$(expected_generation "$lane_id")"
+
+  if ! jq -e --arg sha "$SOURCE_SHA" --arg id "$lane_id" --arg gen "$expected_gen" '
     .sourceSha == $sha and
+    ((.lane // $id) == $id) and
+    (((.generation // 1) | tostring) == $gen) and
     (.status == "pass" or
      .status == "fail" or
      .status == "blocked" or
@@ -95,6 +165,7 @@ while IFS= read -r marker; do
     (.completedAt | type == "string" and length > 0)
   ' "$marker_path" >/dev/null 2>&1; then
     INVALID+=("$marker")
+    INVALID_REASONS+=("$marker: $(invalid_reason "$marker_path" "$SOURCE_SHA" "$lane_id" "$expected_gen")")
   fi
 done < <(jq -r '.requiredLaneMarkers[]' "$CONTRACT")
 
@@ -108,6 +179,7 @@ fi
 
 missing_json="$(printf '%s\n' "${MISSING[@]-}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
 invalid_json="$(printf '%s\n' "${INVALID[@]-}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+invalid_reasons_json="$(printf '%s\n' "${INVALID_REASONS[@]-}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
 
 if [ "${#MISSING[@]}" -gt 0 ] || [ "${#INVALID[@]}" -gt 0 ]; then
   jq -cn \
@@ -115,11 +187,12 @@ if [ "${#MISSING[@]}" -gt 0 ] || [ "${#INVALID[@]}" -gt 0 ]; then
     --arg sha "$SOURCE_SHA" \
     --argjson missing "$missing_json" \
     --argjson invalid "$invalid_json" \
-    '{ready:false,phase:$phase,sourceSha:$sha,missing:$missing,invalid:$invalid}'
+    --argjson invalidReasons "$invalid_reasons_json" \
+    '{ready:false,phase:$phase,sourceSha:$sha,missing:$missing,invalid:$invalid,invalidReasons:$invalidReasons}'
   exit 1
 fi
 
 jq -cn \
   --arg phase "$PHASE" \
   --arg sha "$SOURCE_SHA" \
-  '{ready:true,phase:$phase,sourceSha:$sha,missing:[],invalid:[]}'
+  '{ready:true,phase:$phase,sourceSha:$sha,missing:[],invalid:[],invalidReasons:[]}'

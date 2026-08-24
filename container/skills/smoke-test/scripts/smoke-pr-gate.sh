@@ -239,6 +239,7 @@ healthz_ok() {
 evaluate_pr() {
   local pr="$1" head_sha="$2" head_ref="${3:-}"
   local files_json files_len files_fetch_failed migrations_touched frontend_touched is_freeze ci_sha
+  local migration_files migrations_determinable target_files_json target_files_len target_compare_failed
   local runs_json runs_len ci_ref ci_total ci_pending ci_failed ci_succeeded ci_ready ci_truncated
   local services_json backend backend_id backend_url backend_deploy_sha backend_ready
   local frontend frontend_id frontend_url frontend_deploy_sha frontend_ready
@@ -277,6 +278,69 @@ evaluate_pr() {
     [ -n "$ci_sha" ] || { ci_sha=""; fetch_ok=false; }
   else
     ci_sha="$head_sha"
+  fi
+
+  # migrationsTouched/frontendTouched computed above from files_json are the
+  # freeze PR's OWN diff — smoke-freeze-pr.sh deliberately builds that as
+  # exactly the two marker files (see FREEZE_MARKER_BACKEND/FRONTEND above), so
+  # for a freeze PR those two booleans are ALWAYS false, no matter what the
+  # frozen TARGET commit (ci_sha, the marker's parent) actually contains.
+  # Confirmed live 2026-08-24 (challenger MG-1, PR #1188): the target carried
+  # migration 222_undo_edit_prior_actor, which stops the backend booting, and
+  # `smoke-pr-gate.sh check 1188` reported migrationsTouched:false anyway,
+  # costing a coordinator and a challenger agent 30 minutes to diagnose a
+  # condition this gate could have reported instantly. Recompute both off the
+  # diff that actually matters for a freeze PR — base branch tip vs. the
+  # target commit — using the same 300-file truncation guard
+  # smoke-develop-gate.sh's own compare-based check already uses.
+  #
+  # ponytail: duplicates the ~6-line extraction above rather than threading a
+  # shared helper through two call sites with different inputs (a PR's own
+  # `pulls/.../files` array vs. a `compare` response's `.files`) — see
+  # detect_freeze's own comment for the same call.
+  migrations_determinable=true
+  migration_files='[]'
+  if [ "$is_freeze" = true ]; then
+    if [ -z "$ci_sha" ]; then
+      # ci_sha fetch already failed above (fetch_ok=false) — nothing to
+      # compare against. Fail closed exactly like the files-fetch-failure
+      # branch: assume both touched, and say we couldn't actually check.
+      migrations_touched=true
+      frontend_touched=true
+      migrations_determinable=false
+    else
+      # `if !` on the direct assignment (not just a post-hoc shape check)
+      # catches a nonzero gh exit even when it still printed something on
+      # stdout — same pattern the files_json fetch above already uses.
+      target_compare_failed=false
+      if ! target_files_json="$(timeout 10 gh api "repos/$REPO/compare/$BRANCH...$ci_sha" 2>/dev/null)" ||
+         ! jq -e '.files | type == "array"' <<<"$target_files_json" >/dev/null 2>&1; then
+        target_compare_failed=true
+        target_files_json='{"files":[]}'
+      fi
+      target_files_len="$(jq -r '.files | length' <<<"$target_files_json" 2>/dev/null || printf -- '-1')"
+      if [ "$target_compare_failed" = true ] || { [ "$target_files_len" -ge 300 ] 2>/dev/null; }; then
+        migrations_touched=true
+        frontend_touched=true
+        migrations_determinable=false
+        fetch_ok=false
+      else
+        migrations_touched="$(jq -r --arg p "$MIGRATIONS_PREFIX" 'any(.files[].filename; startswith($p))' <<<"$target_files_json" 2>/dev/null)"
+        frontend_touched="$(jq -r --arg p "$FRONTEND_PREFIX" 'any(.files[].filename; startswith($p))' <<<"$target_files_json" 2>/dev/null)"
+        [ "$migrations_touched" = true ] || [ "$migrations_touched" = false ] || { migrations_touched=true; migrations_determinable=false; }
+        [ "$frontend_touched" = true ] || [ "$frontend_touched" = false ] || frontend_touched=true
+        migration_files="$(jq -c --arg p "$MIGRATIONS_PREFIX" '[.files[].filename | select(startswith($p))]' <<<"$target_files_json" 2>/dev/null)"
+        [ -n "$migration_files" ] && jq -e 'type == "array"' <<<"$migration_files" >/dev/null 2>&1 || migration_files='[]'
+      fi
+    fi
+  elif [ "$files_fetch_failed" = true ] || { [ "$files_len" -ge 100 ] 2>/dev/null; }; then
+    # Ordinary (non-freeze) PR whose own diff we couldn't read — same
+    # fail-closed default as migrations_touched above, and equally unable to
+    # name which files, so say so rather than reporting an empty list as fact.
+    migrations_determinable=false
+  else
+    migration_files="$(jq -c --arg p "$MIGRATIONS_PREFIX" '[.[].filename | select(startswith($p))]' <<<"$files_json" 2>/dev/null)"
+    [ -n "$migration_files" ] && jq -e 'type == "array"' <<<"$migration_files" >/dev/null 2>&1 || migration_files='[]'
   fi
 
   # CI facts come from `gh run list --branch`, deliberately NOT the check-runs
@@ -379,9 +443,17 @@ evaluate_pr() {
     --arg frontendPreviewId "$frontend_id" --arg frontendPreviewUrl "$frontend_url" \
     --arg frontendDeploySha "$frontend_deploy_sha" --argjson frontendReady "$frontend_ready" \
     --argjson healthzReady "$healthz_ready" --argjson settled "$settled" \
+    --argjson migrationFiles "$migration_files" --argjson migrationsDeterminable "$migrations_determinable" \
     '{
       pr: $pr, headSha: $headSha, fetchOk: $fetchOk,
       migrationsTouched: $migrationsTouched, frontendTouched: $frontendTouched,
+      # migrationFiles names the pending migrations directly — the whole point
+      # of this field is that an agent never has to re-derive what MG-1 took a
+      # coordinator+challenger 30 minutes to find by hand. migrationsDeterminable
+      # is false exactly when migrationsTouched is a fail-closed ASSUMPTION
+      # (an unreadable diff) rather than a confirmed read — never report "no
+      # migrations" from a check that could not actually run.
+      migrationFiles: $migrationFiles, migrationsDeterminable: $migrationsDeterminable,
       isFreezePr: $isFreezePr, ciSha: (if $ciSha == "" then null else $ciSha end),
       ciReady: $ciReady, ciTotal: $ciTotal, ciPending: $ciPending,
       ciFailed: $ciFailed, ciSucceeded: $ciSucceeded, ciTruncated: $ciTruncated,
@@ -921,7 +993,10 @@ while IFS= read -r ROW; do
   MIGRATIONS_TOUCHED="$(jq -r '.migrationsTouched' <<<"$FACTS")"
   REFUSED_ALERT_SHA="$(jq -r '.refusedAlertSha // empty' <<<"$STATE")"
   if [ "$MIGRATIONS_TOUCHED" = true ] && [ "$REFUSED_ALERT_SHA" != "$HEAD_SHA" ]; then
-    jq -cn --argjson pr "$PR" --arg sha "$HEAD_SHA" '{pr:$pr,sha:$sha,subtype:"migrations"}' >> "$ALARM_CANDIDATES"
+    jq -cn --argjson pr "$PR" --arg sha "$HEAD_SHA" \
+      --argjson files "$(jq -c '.migrationFiles // []' <<<"$FACTS")" \
+      --argjson determinable "$(jq -c '.migrationsDeterminable // false' <<<"$FACTS")" \
+      '{pr:$pr,sha:$sha,subtype:"migrations",migrationFiles:$files,migrationsDeterminable:$determinable}' >> "$ALARM_CANDIDATES"
     continue
   fi
 
@@ -978,8 +1053,16 @@ if [ -s "$ALARM_CANDIDATES" ]; then
       TRIGGER="pr_migrations_refused"
       [ "$W_SUB" = "warmup" ] && TRIGGER="pr_warmup_stuck"
       [ "$W_SUB" = "facts" ] && TRIGGER="pr_facts_unavailable"
+      # migrationFiles/migrationsDeterminable ride along on every alarm
+      # subtype (empty array for warmup/facts) rather than branching the jq
+      # object on $W_SUB — harmless on the two subtypes that don't use it, and
+      # this is the wake message MG-1 needed: naming the pending migrations
+      # here is what makes the alarm itself the instant answer.
       jq -cn --argjson pr "$W_PR" --arg sha "$W_SHA" --arg trigger "$TRIGGER" \
-        '{wakeAgent:true,data:{schemaVersion:1,trigger:$trigger,pr:$pr,sourceSha:$sha}}'
+        --argjson files "$(jq -c '.migrationFiles // []' <<<"$WINNER")" \
+        --argjson determinable "$(jq -c '.migrationsDeterminable // false' <<<"$WINNER")" \
+        '{wakeAgent:true,data:{schemaVersion:1,trigger:$trigger,pr:$pr,sourceSha:$sha,
+          migrationFiles:$files,migrationsDeterminable:$determinable}}'
       exit 0
     fi
   fi
@@ -1000,6 +1083,28 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     flock -w 5 8 || true
     CONTROL="$(read_control)"
     PREFLIGHT_OUT="$TMP_DIR/preflight.out"
+    # Target-aware preflight: this candidate's own backend preview URL, so a
+    # deployment wired with SMOKE_GATE_PREFLIGHT_CMD referencing this var
+    # points its login check at the SAME host the campaign is about to test —
+    # never a fixed default host, which would prove nothing about THIS
+    # candidate's build. A settle candidate only reaches this line once
+    # `settled=true`, which already required healthzReady — so the preview is
+    # confirmed up BEFORE preflight ever runs; there is no "not up yet" case
+    # to defer here, only an unavailable-URL case to fail closed on.
+    PREFLIGHT_TARGET_URL="$(jq -r '.backendPreviewUrl // empty' <<<"$FACTS")"
+    if [ -z "$PREFLIGHT_TARGET_URL" ]; then
+      # Fail closed rather than run the configured command against nothing
+      # (which would either error confusingly or, worse, fall back to
+      # whatever default host it carries — e.g. dev — silently testing the
+      # wrong build). Never claims across polls: state is untouched, so the
+      # very next poll re-evaluates this candidate fresh once a preview URL
+      # is available, same "defer, don't skip" shape every other preflight
+      # failure already has.
+      jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"preflight_failed",
+        reason:"settled candidate has no backend preview URL to run a target-aware preflight against"}}'
+      exit 0
+    fi
+    export SMOKE_GATE_PREFLIGHT_TARGET_URL="$PREFLIGHT_TARGET_URL"
     if timeout "$PREFLIGHT_TIMEOUT" bash -c "$PREFLIGHT_CMD" >"$PREFLIGHT_OUT" 2>&1; then
       CONTROL="$(jq -c '.preflightReason=null | .preflightWakeAt=null' <<<"$CONTROL")"
       write_control "$CONTROL"
