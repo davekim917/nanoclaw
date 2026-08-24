@@ -1,1 +1,9 @@
-pnpm run check:public-boundary -- --index
+# Run the boundary gate from the MAIN checkout, not $PWD.
+#
+# Agent worktrees deliberately carry no node_modules (a `pnpm install` there
+# leaves better-sqlite3's native binding unbuilt and yields hundreds of phantom
+# failures), so a bare `pnpm run` here dies with `tsx: not found` and blocks the
+# push. Same defect the pre-commit hook had, fixed the same way:
+# `--git-common-dir` resolves the main checkout from any linked worktree.
+repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
+(cd "$repo_root" && pnpm run check:public-boundary -- --index)
