@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { configureOutboundDb, initTestSessionDb, openOutboundDb } from './connection.js';
-import { getTurnUsageRows, recordTurnUsage } from './turn-usage.js';
+import { getTurnUsageRows, recordTurnUsage, _resetClaudeCumulativeTrackingForTesting } from './turn-usage.js';
 
 const tempDirs: string[] = [];
 
@@ -26,6 +26,11 @@ afterEach(() => {
 describe('turn_usage — insert helper', () => {
   beforeEach(() => {
     initTestSessionDb();
+    // The cumulative->delta tracking map (see toClaudeTurnDelta) is
+    // module-level state, so it survives across `it` blocks unless reset —
+    // without this, a model name reused in a later test would see a
+    // leftover "last" value from an earlier test and compute a bogus delta.
+    _resetClaudeCumulativeTrackingForTesting();
   });
 
   it('writes a row readable back with the given fields', () => {
@@ -77,9 +82,13 @@ describe('turn_usage — insert helper', () => {
   });
 
   it('writes one row per call, preserving insertion order', () => {
-    recordTurnUsage('claude', { inputTokens: 1 });
-    recordTurnUsage('claude', { inputTokens: 2 });
-    recordTurnUsage('claude', { inputTokens: 3 });
+    // Provider is 'codex', not 'claude' — this test is about row ordering,
+    // not usage math, and the Claude-only cumulative->delta transform (see
+    // toClaudeTurnDelta) would otherwise turn this monotonic 1,2,3 sequence
+    // into deltas, coupling an unrelated test to that behavior.
+    recordTurnUsage('codex', { inputTokens: 1 });
+    recordTurnUsage('codex', { inputTokens: 2 });
+    recordTurnUsage('codex', { inputTokens: 3 });
 
     const rows = getTurnUsageRows();
     expect(rows.map((r) => r.input_tokens)).toEqual([1, 2, 3]);
@@ -105,6 +114,67 @@ describe('turn_usage — insert helper', () => {
     expect(sum('input_tokens')).toBe(4000);
     expect(sum('output_tokens')).toBe(1000);
     expect(sum('cost_usd')).toBeCloseTo(0.8, 10);
+  });
+});
+
+describe('turn_usage — Claude cumulative-usage delta fix', () => {
+  beforeEach(() => {
+    initTestSessionDb();
+    _resetClaudeCumulativeTrackingForTesting();
+  });
+
+  it('records the DELTA for a synthetic monotonic (stream-cumulative) sequence', () => {
+    const model = 'claude-opus-5';
+    for (const cumulative of [887_166, 11_317_363, 46_850_249, 58_637_103]) {
+      recordTurnUsage('claude', { model, cacheReadTokens: cumulative });
+    }
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => r.cache_read_tokens)).toEqual([
+      887_166, // first observation — nothing to subtract yet
+      11_317_363 - 887_166,
+      46_850_249 - 11_317_363,
+      58_637_103 - 46_850_249,
+    ]);
+  });
+
+  it('records the raw value (not a negative delta) the turn right after a stream reset', () => {
+    const model = 'claude-opus-5';
+    recordTurnUsage('claude', { model, inputTokens: 5000 });
+    recordTurnUsage('claude', { model, inputTokens: 9000 }); // delta = 4000
+    recordTurnUsage('claude', { model, inputTokens: 200 }); // new stream, well below the old total
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => r.input_tokens)).toEqual([5000, 4000, 200]);
+  });
+
+  it('tracks two interleaved models independently without cross-contamination', () => {
+    recordTurnUsage('claude', { model: 'claude-opus-5', inputTokens: 1000 });
+    recordTurnUsage('claude', { model: 'claude-sonnet-5', inputTokens: 500 });
+    recordTurnUsage('claude', { model: 'claude-opus-5', inputTokens: 1800 }); // delta 800
+    recordTurnUsage('claude', { model: 'claude-sonnet-5', inputTokens: 900 }); // delta 400
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => [r.model, r.input_tokens])).toEqual([
+      ['claude-opus-5', 1000],
+      ['claude-sonnet-5', 500],
+      ['claude-opus-5', 800],
+      ['claude-sonnet-5', 400],
+    ]);
+  });
+
+  it('does NOT apply the delta transform to other providers (Codex/OpenCode already report per-turn values)', () => {
+    const model = 'gpt-5.6-sol';
+    recordTurnUsage('codex', { model, inputTokens: 1000 });
+    recordTurnUsage('codex', { model, inputTokens: 1500 }); // a genuinely bigger turn, NOT cumulative
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => r.input_tokens)).toEqual([1000, 1500]);
+  });
+
+  it('falls back to the raw value when a field is NULL on either side of the comparison', () => {
+    const model = 'claude-opus-5';
+    recordTurnUsage('claude', { model, inputTokens: 1000, outputTokens: null });
+    recordTurnUsage('claude', { model, inputTokens: null, outputTokens: 300 });
+    const rows = getTurnUsageRows();
+    expect(rows[0]).toMatchObject({ input_tokens: 1000, output_tokens: null });
+    expect(rows[1]).toMatchObject({ input_tokens: null, output_tokens: 300 });
   });
 });
 
