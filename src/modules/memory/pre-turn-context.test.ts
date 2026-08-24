@@ -1718,11 +1718,16 @@ describe('markdown byte-scan budget stays coupled to the generated-memory rail',
   });
 });
 
-// Root cause: the recall token cache keys on WINDOW text (boundedPassages via
+// Root cause: the recall token cache keyed on WINDOW text (boundedPassages via
 // bestPassage), not on fact text, and one fact yields ~9-12 windows. A
-// 1,000-fact ledger is ~12,000 entries, so the old 8,192 cap flushed the whole
+// 1,000-fact ledger was ~12,000 entries, so the old 8,192 cap flushed the whole
 // Map mid-pass and the warm path never materialized — measured 12.5 s cold AND
 // 12.9 s warm on the live 6,626-fact store.
+//
+// passageWindows since collapsed an entry back to one CANDIDATE, so the ledger
+// here is sized by candidate count rather than window count: the point of the
+// test is that a working set past the old cap still warms, and only the number
+// of facts needed to build one changed.
 describe('recall token cache survives a working set larger than the old 8,192-entry cap', () => {
   const input = {
     agentGroupId: 'ag-a',
@@ -1740,7 +1745,7 @@ describe('recall token cache survives a working set larger than the old 8,192-en
       `<!-- nanoclaw-memory:id=mem_${String(n).padStart(16, '0')};evidence=ev-${n};captured=2026-08-01T00:00:00.000Z -->`;
     memoryFile(
       'generated/memory.md',
-      `# Generated workgroup memory\n\n${Array.from({ length: 1_000 }, (_, i) => fact(i + 1)).join('\n')}\n`,
+      `# Generated workgroup memory\n\n${Array.from({ length: 10_000 }, (_, i) => fact(i + 1)).join('\n')}\n`,
     );
     _resetTokenStreamCacheForTest();
 
@@ -1755,7 +1760,7 @@ describe('recall token cache survives a working set larger than the old 8,192-en
     const warmMisses = warm.misses - cold.misses;
 
     // Materially less tokenization work on the repeat pass: essentially every
-    // window is served from cache rather than re-tokenized.
+    // candidate is served from cache rather than re-tokenized.
     expect(warmHits).toBeGreaterThan(8_192);
     expect(warmMisses).toBeLessThan(warmHits / 100);
   });
@@ -1815,5 +1820,110 @@ describe('curator topic directories always reach recall', () => {
     expect(paths).toContain('people/alex-stone.md');
     expect(paths).toContain('systems/forecast-pipeline.md');
     expect(paths).toContain('domain/quarterly-forecast.md');
+  });
+});
+
+// Root cause of the remaining large-workgroup cost: bestPassage scored
+// OVERLAPPING windows over the same candidate and tokenized each window as its
+// own distinct string — measured 2.9x the candidate's characters on the live
+// 6,633-fact store, and distinct strings so no cache can collapse them. The fix
+// tokenizes each candidate ONCE and slices that stream by token offset.
+//
+// The hazard the fix must not trade correctness for: token offsets index the
+// NFKC-normalized, lowercased string while windows are slices of the ORIGINAL,
+// so the two coordinate spaces only coincide for ASCII candidates with
+// token-clean window edges. Everything else must fall back to per-window
+// tokenization and produce byte-identical passages.
+describe('passage windows reuse one tokenization per candidate', () => {
+  const ask = (text: string) => ({
+    agentGroupId: 'ag-a',
+    sessionId: 'sess-a',
+    kind: 'chat-sdk',
+    trigger: 1 as const,
+    normalizedContent: JSON.stringify({ text }),
+    includeBootstrap: false,
+  });
+
+  it('each added multi-sentence fact costs exactly one tokenization', () => {
+    // Each fact is four sentences => 4 spans => 9 windows under the 1..3-sentence
+    // sweep, so per-window tokenization charges 9 misses per fact and
+    // per-candidate tokenization charges 1. Measuring the DELTA between two
+    // ledger sizes isolates the per-fact cost from the fixed overhead of the
+    // query, the expansion probe and the seeded manual files, so the assertion
+    // is the invariant itself rather than a tuned magic number.
+    const fact = (n: number) =>
+      `- Forecast pipeline volume ${n} doubled last quarter. Region delta ${n} held steady through the review. ` +
+      `Operator sign-off ${n} was recorded by the duty lead. Ledger checkpoint ${n} confirmed the final figure. ` +
+      `<!-- nanoclaw-memory:id=mem_${String(n).padStart(16, '0')};evidence=ev-${n};captured=2026-08-01T00:00:00.000Z -->`;
+    const ledger = (count: number) =>
+      `# Generated workgroup memory\n\n${Array.from({ length: count }, (_, i) => fact(i + 1)).join('\n')}\n`;
+
+    memoryFile('generated/memory.md', ledger(20));
+    _resetTokenStreamCacheForTest();
+    const result = buildPreTurnContext(ask('forecast pipeline volume'));
+    expect(result.memoryEvidence.excerpts.some((row) => row.path === 'generated/memory.md')).toBe(true);
+    const small = _tokenStreamCacheStatsForTest().misses;
+
+    memoryFile('generated/memory.md', ledger(120));
+    _resetTokenStreamCacheForTest();
+    buildPreTurnContext(ask('forecast pipeline volume'));
+    const large = _tokenStreamCacheStatsForTest().misses;
+
+    // 100 extra facts must cost 100 extra tokenizations, not ~900.
+    expect(large - small).toBe(100);
+  });
+
+  it('selected passage and score are identical to per-window tokenization', () => {
+    // Same fact ranked through the real path; the winning excerpt must be the
+    // exact original-string slice, not a normalized or re-cased one.
+    const fact =
+      '- Alpha Bravo Charlie shipped. Delta Echo Foxtrot stalled. Golf Hotel India resumed. ' +
+      '<!-- nanoclaw-memory:id=mem_0000000000000002;evidence=ev-2;captured=2026-08-01T00:00:00.000Z -->';
+    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${fact}\n`);
+
+    const result = buildPreTurnContext(ask('Delta Echo Foxtrot'));
+    const excerpt = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
+    expect(excerpt).toBeDefined();
+    // Original casing survives — the delivered text is a slice of the source
+    // line, never of the lowercased normalization the tokenizer works on.
+    expect(excerpt!.text).toContain('Delta Echo Foxtrot stalled.');
+    expect(excerpt!.text).not.toContain('delta echo foxtrot');
+  });
+
+  it('NFKC-length-changing text still ranks and delivers the original bytes', () => {
+    // 'ﬁ' -> 'fi' GROWS under NFKC and 'e'+U+0301 -> 'é' SHRINKS, so token
+    // offsets taken from the normalized string cannot index this line. The
+    // candidate must fall back to per-window tokenization rather than
+    // mis-slice.
+    const fact =
+      '- The ﬁle café pipeline runs nightly. ＡＢＣ batch ①② rotates weekly. ' +
+      'Retention window stays at ninety days. ' +
+      '<!-- nanoclaw-memory:id=mem_0000000000000003;evidence=ev-3;captured=2026-08-01T00:00:00.000Z -->';
+    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${fact}\n`);
+
+    // 'file' is only reachable through NFKC folding of the ligature.
+    const result = buildPreTurnContext(ask('file cache pipeline'));
+    const excerpt = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
+    expect(excerpt).toBeDefined();
+    // Byte-identical to the source: the ligature and the combining accent are
+    // still there, unfolded.
+    expect(excerpt!.text).toContain('ﬁle café pipeline runs nightly.');
+  });
+
+  it('a window edge that cuts a word falls back instead of dropping the fragment', () => {
+    // A sentence longer than maxChars is hard-chopped every maxChars characters,
+    // which lands mid-word. Slicing a whole-candidate token stream would drop
+    // the straddling run entirely; per-window tokenization yields its two
+    // fragments. The fallback keeps the fragments reachable.
+    const filler = 'supercalifragilistic'.repeat(60); // one unbroken run, no spaces
+    const fact =
+      `- ${filler} tail sentinel token here ` +
+      '<!-- nanoclaw-memory:id=mem_0000000000000004;evidence=ev-4;captured=2026-08-01T00:00:00.000Z -->';
+    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${fact}\n`);
+
+    const result = buildPreTurnContext(ask('tail sentinel token'));
+    const excerpt = result.memoryEvidence.excerpts.find((row) => row.path === 'generated/memory.md');
+    expect(excerpt).toBeDefined();
+    expect(excerpt!.text).toContain('tail sentinel token here');
   });
 });

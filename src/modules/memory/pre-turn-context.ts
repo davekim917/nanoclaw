@@ -296,26 +296,25 @@ type RecallToken = { value: string; start: number; end: number };
 // and the first key is always the oldest. Wholesale-clear was the bug — one
 // overflow threw away the entire warm set instead of one entry.
 const TOKEN_STREAM_CACHE = new Map<string, readonly RecallToken[]>();
-// SIZING. An entry is one WINDOW, not one fact line: bestPassage tokenizes every
-// boundedPassages window, and a fact yields 9-12 of them (measured 9.1 on the
-// live 6,626-fact store). The previous "~6 MB per 1,000 cached fact lines" note
-// was wrong by ~7x for the same reason — measured heap is ~4.4 KB per entry, so
-// 1,000 fact lines cost ~41 MB, and 8,192 entries only ever held ~850 facts.
+// SIZING. An entry used to be one WINDOW, not one fact line: bestPassage
+// tokenized every boundedPassages window and a fact yields 9-12 of them, so the
+// per-turn working set of the two large workgroups was 46,108 and 131,245
+// entries — far past any cap worth paying for, and on a single sequential sweep
+// a partial cache yields ~zero hits rather than partial ones.
 //
-// 24,576 entries is ~108 MB worst case. It holds the ENTIRE per-turn working set
-// of every small/medium workgroup with ~7x growth headroom (largest measured
-// outside the two big ones: 3,339 entries).
+// passageWindows now tokenizes each CANDIDATE once and slices that stream per
+// window, so an entry is one fact line again and those working sets collapse to
+// 6,633 and 1,438 — both inside this cap, which is why the large workgroups get
+// a warm cache for the first time. Measured heap is ~4.4 KB per entry, so
+// 24,576 entries is ~108 MB worst case, and the largest live store now needs
+// ~29 MB of it.
 //
-// It deliberately does NOT chase the two large workgroups (46,108 entries /
-// ~200 MB, and 131,245 / ~577 MB). Sizing for them is not a knob problem: the
-// access pattern is a single sequential sweep per pool, so any cap below the
-// full working set yields ~zero hits rather than partial ones, and this Map is
-// shared process-wide — one large-workgroup turn evicts every other workgroup's
-// warm set no matter how big the cap is. Their fix is to stop generating ~4.7x
-// redundant overlapping-window tokenization in bestPassage (tokenize each
-// candidate once and slice by token offset), not a larger cache.
-// ponytail: entry-count cap, not a byte cap — windows are already length-capped
-// by maxChars, so entries stay within ~2x of the measured mean.
+// The cache still earns its place after that fix: it is what makes the SECOND
+// and later turns nearly free, since the ledger changes only a few times an
+// hour while turns are constant. The fix removes intra-turn duplication; the
+// cache removes inter-turn repetition. They are not substitutes.
+// ponytail: entry-count cap, not a byte cap — a fact line is bounded by the
+// curator's own line budget, so entries stay within ~2x of the measured mean.
 const TOKEN_STREAM_CACHE_MAX = 24_576;
 
 const TOKEN_STREAM_CACHE_STATS = { hits: 0, misses: 0 };
@@ -377,7 +376,7 @@ interface RankPassagesOptions<T> {
   tieBreak?: (a: T, b: T) => number;
 }
 
-function boundedPassages(candidate: string, maxChars: number): string[] {
+function sentenceSpans(candidate: string, maxChars: number): Array<{ start: number; end: number }> {
   const sentences: Array<{ start: number; end: number }> = [];
   let start = 0;
   const push = (end: number): void => {
@@ -412,14 +411,93 @@ function boundedPassages(candidate: string, maxChars: number): string[] {
     const valueStart = candidate.search(/\S/);
     sentences.push({ start: valueStart, end: Math.min(candidate.length, valueStart + maxChars) });
   }
+  return sentences;
+}
 
-  const windows: string[] = [];
+const NON_ASCII = /\P{ASCII}/u;
+const RECALL_TOKEN_CHAR = /[\p{L}\p{N}_-]/u;
+
+/**
+ * True when the whole-candidate token stream can be sliced by window offset
+ * instead of re-tokenizing every window. Two independent things have to hold,
+ * and neither is safe to assume:
+ *
+ * - COORDINATE SPACE. `tokenStreamForRecall` matches against
+ *   `value.normalize('NFKC').toLocaleLowerCase('en-US')`, so `token.start/.end`
+ *   index the NORMALIZED string, while windows are slices of the ORIGINAL.
+ *   NFKC changes length in both directions ('ﬁ' -> 'fi' grows, 'e' + U+0301 ->
+ *   'é' shrinks) and en-US lowercasing grows ('İ' -> 'i' + U+0307), so the two
+ *   spaces are not interchangeable in general — conflating them mis-slices
+ *   silently. They coincide exactly on ASCII: no ASCII scalar has a
+ *   compatibility decomposition, none composes with a neighbour, and A-Z
+ *   lowercases one-for-one. (Being ASCII also means no surrogate pairs, so
+ *   UTF-16 indexing is per character.)
+ * - CLEAN CUTS. The token pattern is a bare character-class run with no
+ *   lookaround, so a slice yields exactly the matches it fully contains — but
+ *   only when no run crosses a window edge. Window edges are sentence-span
+ *   edges, and an edge cuts a run precisely when the characters either side of
+ *   it are both token characters. `sentenceSpans` hard-chops a sentence longer
+ *   than `maxChars` at a fixed offset, which lands mid-word routinely.
+ *
+ * Failing either check costs the candidate the speedup, never correctness: it
+ * falls back to the original per-window tokenization. Measured fast-path
+ * coverage on the live generated stores is 94-99% of facts.
+ *
+ * ponytail: ASCII is a blunt coordinate-space test — the exact one is an
+ * original -> normalized offset map. Build that only if non-ASCII-heavy stores
+ * ever dominate; today they are ~5% of facts and merely lose the speedup.
+ */
+function offsetSliceable(candidate: string, sentences: readonly { start: number; end: number }[]): boolean {
+  if (NON_ASCII.test(candidate)) return false;
+  const cuts = (at: number): boolean =>
+    at > 0 &&
+    at < candidate.length &&
+    RECALL_TOKEN_CHAR.test(candidate[at - 1]!) &&
+    RECALL_TOKEN_CHAR.test(candidate[at]!);
+  return !sentences.some((span) => cuts(span.start) || cuts(span.end));
+}
+
+/**
+ * The overlapping windows `bestPassage` scores, each paired with its tokens.
+ *
+ * The windows themselves are unchanged — still original-string slices, so the
+ * text delivered to the agent is byte-identical. What changes is that the
+ * candidate is tokenized ONCE and each window takes a slice of that stream:
+ * the 1..3-sentence sweep re-covers the same characters ~2.9x on the live
+ * 6,633-fact store, and every window is a distinct string, so no cache could
+ * ever collapse the duplication.
+ */
+function passageWindows(candidate: string, maxChars: number): Array<{ text: string; tokens: readonly RecallToken[] }> {
+  const sentences = sentenceSpans(candidate, maxChars);
+  const stream = offsetSliceable(candidate, sentences) ? tokenStreamForRecall(candidate) : null;
+
+  // Token index at each span edge. Span offsets are non-decreasing and (given
+  // the clean-cut check) no token crosses an edge, so two monotone cursors
+  // place every edge in a single pass.
+  const firstToken: number[] = [];
+  const afterToken: number[] = [];
+  if (stream) {
+    let atStart = 0;
+    let atEnd = 0;
+    for (const span of sentences) {
+      while (atStart < stream.length && stream[atStart]!.start < span.start) atStart++;
+      firstToken.push(atStart);
+      while (atEnd < stream.length && stream[atEnd]!.start < span.end) atEnd++;
+      afterToken.push(atEnd);
+    }
+  }
+
+  const windows: Array<{ text: string; tokens: readonly RecallToken[] }> = [];
   for (let first = 0; first < sentences.length; first++) {
     for (let last = first; last < Math.min(sentences.length, first + 3); last++) {
       const windowStart = sentences[first]!.start;
       const windowEnd = sentences[last]!.end;
       if (windowEnd - windowStart > maxChars) break;
-      windows.push(candidate.slice(windowStart, windowEnd));
+      const text = candidate.slice(windowStart, windowEnd);
+      windows.push({
+        text,
+        tokens: stream ? stream.slice(firstToken[first]!, afterToken[last]!) : tokenStreamForRecall(text),
+      });
     }
   }
   return windows;
@@ -459,8 +537,7 @@ function bestPassage(
   if (queryTokens.length === 0) return null;
   const minimumOverlap = queryTokens.length <= 2 ? 1 : 2;
   const matches: PassageMatch[] = [];
-  for (const text of boundedPassages(candidate, maxChars)) {
-    const passageTokens = tokenStreamForRecall(text);
+  for (const { text, tokens: passageTokens } of passageWindows(candidate, maxChars)) {
     const candidateSet = new Set(passageTokens.map((token) => token.value));
     const matchedTerms = new Set(queryTokens.filter((token) => candidateSet.has(token)));
     if (matchedTerms.size < minimumOverlap) continue;
