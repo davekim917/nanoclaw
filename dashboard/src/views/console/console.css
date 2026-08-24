@@ -705,8 +705,38 @@
 .ncc-msg { display: flex; gap: 10px; }
 .ncc-msg-body { flex-grow: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .ncc-msg-who { display: flex; align-items: baseline; gap: 7px; }
-.ncc-msg-who .name { font-size: 12.5px; font-weight: 600; color: var(--ncc-ink); }
-.ncc-msg-who .at { font-family: var(--ncc-font-mono); font-size: 11px; color: var(--ncc-muted); }
+/* A human's full name runs longer than an agent's, and at 390px the who-line
+   is ~317px wide. The name yields first so the age and the bot chip — the two
+   values the operator scans down the column — are never the ones pushed out. */
+.ncc-msg-who .name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ncc-ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ncc-msg-who .at { font-family: var(--ncc-font-mono); font-size: 11px; color: var(--ncc-muted); flex-shrink: 0; }
+/* Drawn ONLY when the platform said `isBot`. A sibling agent posting into the
+   room is inbound to this session but is not a person, and an unlabelled name
+   in a transcript reads as one. Sized below the name's line box so it costs no
+   row height. */
+.ncc-msg-who .kind {
+  flex-shrink: 0;
+  font-family: var(--ncc-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--ncc-secondary);
+  background: var(--ncc-chip);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+/* No resolvable author (a host-generated inbound, or a row written before the
+   metadata existed): the face column is held open but nothing is drawn. An
+   empty chip with its ring would read as an avatar that failed to load. */
+.ncc-face.empty { background: none; box-shadow: none; }
 /* NOT `white-space: pre-wrap` — the body is rendered markdown now, and `marked`
    runs with `breaks: true`, so newlines are already `<br>`. Keeping pre-wrap
    would double every line break. */

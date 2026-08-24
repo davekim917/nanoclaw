@@ -566,6 +566,7 @@ function entry(seq: number): ThreadTranscriptEntry {
     seq,
     timestamp: '2026-08-20T09:00:00.000Z',
     text: `message ${seq}`,
+    author: null,
   };
 }
 
@@ -656,5 +657,86 @@ describe('the transcript opens at its newest message', () => {
     await screen.findByText('message 3');
     // The difference between a chat pane and an annoying one.
     expect(el.scrollTop).toBe(120);
+  });
+});
+
+/**
+ * A room holds the operator, colleagues, and sibling agents, and the transcript
+ * used to render every one of their turns as the word `Inbound` under the
+ * agent's own face. The identity was on the wire the whole time.
+ *
+ * Every fixture here is synthetic. The shapes come from the live `messages_in`
+ * content JSON; none of the values do.
+ */
+describe('every turn says who or what produced it', () => {
+  const inbound = (over: Partial<ThreadTranscriptEntry> = {}): ThreadTranscriptEntry => ({
+    session_id: 's-alpha',
+    agent_group_id: 'ag-1',
+    agent_name: 'Alpha',
+    kind: 'chat',
+    seq: 1,
+    timestamp: '2026-08-20T09:00:00.000Z',
+    direction: 'in',
+    text: 'is the retry path merged?',
+    author: { name: 'Fixture Human', id: 'UTESTHUMAN01', is_bot: false },
+    ...over,
+  });
+
+  const showing = (transcript: ThreadTranscriptEntry[]) => {
+    getThreadDetail.mockResolvedValue({ thread: thread(), transcript });
+    const { container } = renderDetail(thread());
+    return waitFor(() => {
+      const el = container.querySelector('.ncc-msg');
+      if (!el) throw new Error('transcript not rendered yet');
+      return el as HTMLElement;
+    });
+  };
+
+  it('names the human who wrote an inbound turn, in the same slot the agent gets', async () => {
+    const row = await showing([inbound()]);
+    expect(row.querySelector('.ncc-msg-who .name')?.textContent).toBe('Fixture Human');
+    // The old placeholder is gone: a direction is not a speaker.
+    expect(row.textContent).not.toContain('Inbound');
+    // Same treatment as an agent turn — one avatar component, one fallback
+    // rule (DESIGN §11), so the transcript reads as ONE conversation.
+    expect(row.querySelector('.ncc-face .tm-avatar-mark')?.textContent).toBe('FH');
+  });
+
+  it('marks a sibling agent as a bot, and never marks anyone as human', async () => {
+    const bot = await showing([
+      inbound({ author: { name: 'Fixture Sibling', id: 'BTESTSIBLING01', is_bot: true } }),
+    ]);
+    expect(bot.querySelector('.ncc-msg-who .name')?.textContent).toBe('Fixture Sibling');
+    expect(bot.querySelector('.ncc-msg-who .kind')?.textContent).toBe('bot');
+
+    // A person is the UNMARKED case: the chip is a positive claim drawn only
+    // from a positive flag, so it never has to be right about humanity.
+    const human = await showing([inbound()]);
+    expect(human.querySelector('.ncc-msg-who .kind')).toBeNull();
+
+    // An undeclared flag is not a quiet "human" — it makes no claim either.
+    const unknownKind = await showing([
+      inbound({ author: { name: 'Fixture Legacy', id: 'UTESTLEGACY01', is_bot: null } }),
+    ]);
+    expect(unknownKind.querySelector('.ncc-msg-who .name')?.textContent).toBe('Fixture Legacy');
+    expect(unknownKind.querySelector('.ncc-msg-who .kind')).toBeNull();
+  });
+
+  it('renders an unauthored turn with no name and no invented stand-in', async () => {
+    const row = await showing([inbound({ author: null, text: 'container restarted' })]);
+    // The text still arrives — the whole point of an authorless render.
+    expect(row.querySelector('.ncc-msg-text')?.textContent).toContain('container restarted');
+    expect(row.querySelector('.ncc-msg-who .name')).toBeNull();
+    // No placeholder that could pass for a real identity, and no borrowed face.
+    expect(row.textContent).not.toMatch(/Unknown|Inbound|\bUser\b|Alpha/);
+    expect(row.querySelector('.ncc-face .tm-avatar-mark')).toBeNull();
+    // The face column is still held, so the text does not jump left.
+    expect(row.querySelector('.ncc-face.empty')).not.toBeNull();
+  });
+
+  it('leaves an outbound turn on its agent, author or no author', async () => {
+    const row = await showing([inbound({ direction: 'out', author: null, text: 'merged an hour ago' })]);
+    expect(row.querySelector('.ncc-msg-who .name')?.textContent).toBe('Alpha');
+    expect(row.querySelector('.ncc-msg-who .kind')).toBeNull();
   });
 });

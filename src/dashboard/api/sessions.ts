@@ -347,15 +347,107 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
 
 /* ─── Session detail (GET /dashboard/api/sessions/:id) ─────────────────────── */
 
+/**
+ * Who produced an INBOUND transcript entry.
+ *
+ * Outbound identity already rides on `ThreadTranscriptEntry.agent_name`; this
+ * is the other half, and without it a room with three people in it renders
+ * every human turn identically. The data was always there — the reader parsed
+ * the content JSON for `.text` and dropped the rest.
+ *
+ * Nullable as a WHOLE rather than field-by-field, because the alternative — a
+ * name that may be null beside an id that may be null — is three correlated
+ * nullables that can disagree, and "half an identity" is exactly the
+ * placeholder this must not produce. Either the row names its author or it
+ * names nobody.
+ */
+export interface TranscriptAuthor {
+  /** Never a placeholder: absent identity is `author: null`, never "Unknown". */
+  name: string;
+  /** Platform user id. Null only for a legacy row that stored a name and no id. */
+  id: string | null;
+  /**
+   * The platform's own `isBot` flag — the signal `router.ts:skipEligibleSender`
+   * names as the reliable bot test, versus the platform-id prefix it warns off.
+   * `null` means the row predates the flag: unknown, never guessed, and never
+   * rendered as either.
+   */
+  is_bot: boolean | null;
+}
+
 export interface SessionTranscriptEntry {
   direction: 'in' | 'out';
   kind: string;
   seq: number;
   timestamp: string;
   text: string;
+  /**
+   * The inbound author, or null when the row carries no resolvable one — a
+   * host-generated `system`/`task` inbound, a pre-metadata row, or a content
+   * blob that would not parse. Always null on `direction: 'out'`.
+   */
+  author: TranscriptAuthor | null;
 }
 
 const TRANSCRIPT_TAIL = 50;
+
+/**
+ * `host-sweep.ts` stamps its own notices with `sender`/`senderId` of literally
+ * `'system'` (see `insertSystemChat`). That is the host writing to itself, not
+ * a participant — 776 live rows — so it resolves to no author rather than
+ * putting a speaker called "system" in the room beside real people.
+ */
+const SYSTEM_SENDER_ID = 'system';
+
+function nonEmptyString(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  const t = v.trim();
+  return t ? t : null;
+}
+
+/**
+ * Resolve the author of one inbound content blob. Pure and total — it takes
+ * whatever `JSON.parse` produced (including `undefined` when the parse threw)
+ * and never throws, because a row whose author cannot be read must still
+ * render its text.
+ *
+ * Display name comes from the richest field the row actually has:
+ * `author.fullName` → `author.userName` → `senderName` → `sender`. Across the
+ * live fleet the first covers every `chat-sdk` row and the last covers the
+ * legacy `chat` shape; the two middle rungs never fire today and are kept
+ * because they cost a `??` and they are what a partial author object degrades
+ * to.
+ *
+ * **`author.isMe` is deliberately ignored, and this is the note saying so.**
+ * It is serialized straight off the chat-sdk message and means "the author IS
+ * the connected bot" — the receiving identity, not the human/bot axis. A bot
+ * never delivers its own message into its own inbound queue, so the flag is
+ * structurally always false here, and a census of every stored inbound row
+ * confirms it: present on 43,368 rows, true on none. Carrying it forward would
+ * add a field that is a constant. `isBot` is the axis this needs.
+ */
+export function resolveTranscriptAuthor(content: unknown): TranscriptAuthor | null {
+  if (!content || typeof content !== 'object') return null;
+  const c = content as { author?: unknown; sender?: unknown; senderName?: unknown; senderId?: unknown };
+  const a = (c.author && typeof c.author === 'object' ? c.author : null) as {
+    fullName?: unknown;
+    userName?: unknown;
+    userId?: unknown;
+    isBot?: unknown;
+  } | null;
+
+  const id = nonEmptyString(a?.userId) ?? nonEmptyString(c.senderId);
+  if (id === SYSTEM_SENDER_ID) return null;
+
+  const name =
+    nonEmptyString(a?.fullName) ??
+    nonEmptyString(a?.userName) ??
+    nonEmptyString(c.senderName) ??
+    nonEmptyString(c.sender);
+  if (!name) return null;
+
+  return { name, id, is_bot: typeof a?.isBot === 'boolean' ? a.isBot : null };
+}
 
 /**
  * Best-effort transcript reader. Opens the session's inbound + outbound DBs
@@ -387,13 +479,29 @@ export function readSessionTranscript(agentGroupId: string, sessionId: string): 
         .all(TRANSCRIPT_TAIL) as Array<{ seq: number; kind: string; timestamp: string; content: string }>;
       for (const r of rows) {
         let text: string;
+        // `parsed` is hoisted out of the try so the author can be read from the
+        // SAME parse the text came from. A blob that will not parse leaves it
+        // `undefined`, `resolveTranscriptAuthor` returns null for that, and the
+        // row still renders its raw text — the reader's best-effort contract.
+        let parsed: unknown;
         try {
-          const parsed = JSON.parse(r.content) as { text?: unknown; prompt?: unknown; question?: unknown };
-          text = String(parsed.text ?? parsed.prompt ?? parsed.question ?? r.content).trim();
+          parsed = JSON.parse(r.content);
+          const p = parsed as { text?: unknown; prompt?: unknown; question?: unknown };
+          text = String(p.text ?? p.prompt ?? p.question ?? r.content).trim();
         } catch {
           text = r.content;
         }
-        out.push({ direction: side, kind: r.kind, seq: r.seq, timestamp: r.timestamp, text });
+        out.push({
+          direction: side,
+          kind: r.kind,
+          seq: r.seq,
+          timestamp: r.timestamp,
+          text,
+          // Outbound is the agent, and its identity already rides on
+          // `agent_name`; only the inbound side is resolved, so the outbound
+          // shape is provably untouched by this field.
+          author: side === 'in' ? resolveTranscriptAuthor(parsed) : null,
+        });
       }
     } catch (err) {
       log.warn('sessionsDetailHandler: transcript read failed', {

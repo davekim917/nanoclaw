@@ -281,7 +281,7 @@ describe('keyboard', () => {
 });
 
 describe('lastMessagePreview', () => {
-  it('names the agent on outbound and nobody on inbound', () => {
+  it('names the agent on outbound and the author on inbound', () => {
     const base: Omit<ThreadTranscriptEntry, 'direction' | 'text'> = {
       session_id: 's',
       agent_group_id: 'ag',
@@ -289,13 +289,26 @@ describe('lastMessagePreview', () => {
       kind: 'chat',
       seq: 1,
       timestamp: '',
+      author: null,
     };
     expect(lastMessagePreview([{ ...base, direction: 'out', text: 'hello  there' }])).toEqual({
       speaker: 'Alpha',
       excerpt: 'hello there',
     });
-    // The transcript records a DIRECTION, not a human. Naming one would be an
-    // invention.
+    // Inbound now carries its author, so the hybrid line names the person who
+    // actually spoke rather than leading with a bare colon.
+    expect(
+      lastMessagePreview([
+        {
+          ...base,
+          direction: 'in',
+          text: 'ping',
+          author: { name: 'Fixture Human', id: 'UTESTHUMAN01', is_bot: false },
+        },
+      ])!.speaker,
+    ).toBe('Fixture Human');
+    // Unchanged where it was always right: a row that resolves to nobody still
+    // names nobody. Inventing a speaker is the failure this guarded against.
     expect(lastMessagePreview([{ ...base, direction: 'in', text: 'ping' }])!.speaker).toBe('');
   });
 
@@ -312,6 +325,7 @@ describe('lastMessagePreview', () => {
       kind: 'chat',
       seq: 1,
       timestamp: '',
+      author: null,
     };
     const preview = lastMessagePreview([
       { ...base, direction: 'out', text: '## Status\n\n- **done**: the `publish` gate\n- see [PR 733](https://x.test/733)' },
@@ -332,6 +346,7 @@ describe('lastMessagePreview', () => {
           kind: 'chat',
           seq: 1,
           timestamp: '',
+          author: null,
           direction: 'out',
           text: '   ',
         },
