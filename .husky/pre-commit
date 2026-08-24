@@ -17,7 +17,25 @@ set -e
 # by the old hook while `src/channels/slack.ts` was not. prettier's own glob
 # does match both, which is why `format:fix` and this list disagreed.
 staged=$(git diff --cached --name-only --diff-filter=ACM -- src/ | grep '\.ts$' || true)
-prettier="$PWD/node_modules/.bin/prettier"
+
+# Resolve tooling from the MAIN checkout, not $PWD.
+#
+# Agent worktrees deliberately carry no node_modules (a `pnpm install` there
+# leaves better-sqlite3's native binding unbuilt and yields hundreds of phantom
+# failures), so `$PWD/node_modules/.bin/prettier` does not exist in one. The old
+# hardcoded path made this hook unrunnable from a worktree, and workers
+# improvised their way around it — on 2026-08-23 one `cp`-ed over a symlink and
+# wrote THROUGH it into the shared pnpm store, replacing prettier's real CLI
+# with a shell shim across 18 hardlinks and breaking formatting for every
+# session on the machine. Resolve properly instead: `--git-common-dir` points at
+# the main checkout's .git even from a linked worktree.
+repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
+prettier="$repo_root/node_modules/.bin/prettier"
+if [ ! -x "$prettier" ]; then
+  echo "pre-commit: prettier not found at $prettier — run 'pnpm install' in $repo_root" >&2
+  exit 1
+fi
+export PATH="$repo_root/node_modules/.bin:$PATH"
 
 clean=""
 partial=""
@@ -59,4 +77,5 @@ if [ -n "$partial" ]; then
   rm -rf "$tmp"
 fi
 
-pnpm run check:public-boundary -- --staged
+# Run from the main checkout so tsx and the boundary registry resolve there.
+(cd "$repo_root" && pnpm run check:public-boundary -- --staged)
