@@ -1,8 +1,8 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from './index.js';
-import { rollupSessionUsage, listUsageDaily } from './usage.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from './index.js';
+import { rollupSessionUsage, listUsageDaily, pruneOldTurnUsage } from './usage.js';
 
 const GID = 'ag-usage';
 const SESSION_DIR = `${GID}/sess-1`;
@@ -147,6 +147,103 @@ describe('rollupSessionUsage', () => {
   });
 });
 
+/** Fixture matching the post-Phase-0.1-follow-up container schema (steps/duration_ms/trigger). */
+function makeOutboundDbWithTurnMeta(): Database.Database {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE turn_usage (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      model TEXT,
+      steps INTEGER,
+      duration_ms INTEGER,
+      trigger TEXT,
+      input_tokens INTEGER,
+      output_tokens INTEGER,
+      cache_read_tokens INTEGER,
+      cache_write_tokens INTEGER,
+      cost_usd REAL
+    )
+  `);
+  return db;
+}
+
+describe('rollupSessionUsage — central turn_usage mirror', () => {
+  beforeEach(() => {
+    const db = initTestDb();
+    runMigrations(db);
+    createAgentGroup({
+      id: GID,
+      name: 'usage',
+      folder: 'usage',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+  });
+  afterEach(() => closeDb());
+
+  it('writes a faithful 1:1 central row per turn_usage row, including steps/duration_ms/trigger', () => {
+    const outDb = makeOutboundDbWithTurnMeta();
+    outDb
+      .prepare(
+        `INSERT INTO turn_usage (ts, provider, model, steps, duration_ms, trigger, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES ('2026-08-10T01:00:00.000Z', 'claude', 'opus', 12, 45000, 'human', 1000, 200, 50, 10, 0.5)`,
+      )
+      .run();
+
+    expect(rollupSessionUsage(outDb, GID, SESSION_DIR)).toBe(1);
+
+    // usage_daily is untouched by the mirror — same shape as the existing contract.
+    const daily = listUsageDaily({ agentGroupId: GID });
+    expect(daily).toHaveLength(1);
+    expect(daily[0].turns).toBe(1);
+
+    const centralRows = getDb().prepare('SELECT * FROM turn_usage').all() as Array<Record<string, unknown>>;
+    expect(centralRows).toHaveLength(1);
+    expect(centralRows[0]).toMatchObject({
+      session_id: 'sess-1',
+      agent_group_id: GID,
+      provider: 'claude',
+      model: 'opus',
+      steps: 12,
+      duration_ms: 45000,
+      trigger: 'human',
+      input_tokens: 1000,
+      output_tokens: 200,
+      cache_read_tokens: 50,
+      cache_write_tokens: 10,
+      cost_usd: 0.5,
+    });
+  });
+
+  it('an old-shape turn_usage row (missing steps/duration_ms/trigger columns) rolls up without throwing, central row is NULL', () => {
+    const outDb = makeOutboundDb(); // the pre-Phase-0.1-follow-up fixture, no new columns at all
+    insertTurn(outDb, { ts: '2026-08-10T01:00:00.000Z' });
+
+    expect(() => rollupSessionUsage(outDb, GID, SESSION_DIR)).not.toThrow();
+    expect(rollupSessionUsage(outDb, GID, SESSION_DIR)).toBe(0); // watermark already advanced by the call above
+
+    const centralRows = getDb().prepare('SELECT * FROM turn_usage').all() as Array<Record<string, unknown>>;
+    expect(centralRows).toHaveLength(1);
+    expect(centralRows[0].steps).toBeNull();
+    expect(centralRows[0].duration_ms).toBeNull();
+    expect(centralRows[0].trigger).toBeNull();
+  });
+
+  it('derives session_id from sessionDirKey (<agent-group>/<session>)', () => {
+    const outDb = makeOutboundDbWithTurnMeta();
+    outDb
+      .prepare(
+        `INSERT INTO turn_usage (ts, provider, trigger) VALUES ('2026-08-10T01:00:00.000Z', 'codex', 'scheduled')`,
+      )
+      .run();
+    rollupSessionUsage(outDb, GID, `${GID}/sess-xyz`);
+    const row = getDb().prepare('SELECT session_id FROM turn_usage').get() as { session_id: string };
+    expect(row.session_id).toBe('sess-xyz');
+  });
+});
+
 describe('listUsageDaily filters', () => {
   beforeEach(() => {
     const db = initTestDb();
@@ -182,5 +279,38 @@ describe('listUsageDaily filters', () => {
   it('--since filters to dates on/after the given UTC date', () => {
     const rows = listUsageDaily({ agentGroupId: GID, sinceDate: '2026-08-05' });
     expect(rows.map((r) => r.date)).toEqual(['2026-08-09']);
+  });
+});
+
+describe('pruneOldTurnUsage', () => {
+  beforeEach(() => {
+    const db = initTestDb();
+    runMigrations(db);
+  });
+  afterEach(() => closeDb());
+
+  it('deletes central turn_usage rows older than 30 days, keeps recent ones', () => {
+    const db = getDb();
+    const old = new Date(Date.now() - 31 * 86_400_000).toISOString();
+    const recent = new Date(Date.now() - 1 * 86_400_000).toISOString();
+    db.prepare(
+      `INSERT INTO turn_usage (ts, session_id, agent_group_id, provider) VALUES (?, 's1', 'ag', 'claude')`,
+    ).run(old);
+    db.prepare(
+      `INSERT INTO turn_usage (ts, session_id, agent_group_id, provider) VALUES (?, 's1', 'ag', 'claude')`,
+    ).run(recent);
+
+    const deleted = pruneOldTurnUsage();
+    expect(deleted).toBe(1);
+
+    const remaining = db.prepare('SELECT ts FROM turn_usage').all() as Array<{ ts: string }>;
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].ts).toBe(recent);
+  });
+
+  it('never throws — returns 0 rather than crashing the sweep', () => {
+    closeDb(); // no DB initialized — getDb() would throw inside
+    expect(() => pruneOldTurnUsage()).not.toThrow();
+    expect(pruneOldTurnUsage()).toBe(0);
   });
 });

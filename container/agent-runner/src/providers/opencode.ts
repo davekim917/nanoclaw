@@ -807,9 +807,17 @@ export class OpenCodeProvider implements AgentProvider {
           }
         }
         const assistantUsage = lastAssistantMessageId ? assistantUsageById.get(lastAssistantMessageId) : undefined;
+        // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
+        // OpenCode's SSE stream has no round-trip counter either. Each
+        // distinct assistant message id is one LLM response (a tool call
+        // triggers a fresh assistant message for the follow-up), so counting
+        // them is the closest available proxy — not a literal HTTP request
+        // count, but the best signal this protocol exposes.
+        const stepCount = [...roleByMessageId.values()].filter((r) => r === 'assistant').length;
         yield {
           type: 'result',
           text: resultText,
+          steps: stepCount > 0 ? stepCount : null,
           usage: assistantUsage
             ? {
                 model:

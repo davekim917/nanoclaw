@@ -288,8 +288,17 @@ export type ProviderEvent =
    * this turn — see TurnUsageInfo. An array means the turn spanned multiple
    * models (e.g. Opus parent + Sonnet subagents) — one entry per model,
    * each attributed separately rather than collapsed under a NULL model.
+   *
+   * `steps` is the number of provider API round-trips this turn made — the
+   * number that tells apart a fat-context turn (big prefix, few steps) from
+   * a long-loop turn (150-400 sequential calls). It is turn-level, not
+   * per-model, so every row a multi-model `usage` array produces gets the
+   * same value. Coverage varies by provider (each reports the closest thing
+   * its own protocol exposes — see each provider's result-event
+   * construction for what that is); NULL when nothing usable is available,
+   * never a guessed count.
    */
-  | { type: 'result'; text: string | null; isError?: boolean; usage?: TurnUsageInfo | TurnUsageInfo[] }
+  | { type: 'result'; text: string | null; isError?: boolean; usage?: TurnUsageInfo | TurnUsageInfo[]; steps?: number | null }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**

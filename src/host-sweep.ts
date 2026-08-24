@@ -75,7 +75,7 @@ import {
   admitDueTaskContexts,
   deferMessageForFreshContextRetry,
 } from './session-manager.js';
-import { rollupSessionUsage } from './db/usage.js';
+import { rollupSessionUsage, pruneOldTurnUsage } from './db/usage.js';
 import {
   getContainerSpawnedAt,
   hasContainerEverRun,
@@ -1216,6 +1216,10 @@ async function sweep(): Promise<void> {
   } catch (err) {
     log.warn('Usage rollup sweep step failed', { err });
   }
+  // Fleet-hardening Phase 0.1 follow-up (per-turn cost attribution): trim the
+  // central per-turn ledger the rollup above just fed. Fleet volume is
+  // ~300-600 turns/day, so this is trivial per-tick cost — no separate timer.
+  pruneOldTurnUsage();
 
   // Claim reconciliation, then self-heal. Order is load-bearing: a claim whose
   // pull request has merged must be CLOSED, not escalated at somebody — the

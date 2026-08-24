@@ -1332,6 +1332,13 @@ export async function* runOneTurn(
   const turnState: { error: Error | null; errorKind: string | null } = { error: null, errorKind: null };
   let resultText = '';
   let turnDone = false;
+  // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up): Codex's
+  // app-server protocol has no single "API round-trip count" field the way
+  // the Claude SDK's num_turns does. `item/completed` — one per tool call,
+  // command execution, reasoning block, or agent message the turn produced —
+  // is the closest available proxy: not a literal HTTP request count, but the
+  // best signal this protocol exposes rather than a guess.
+  let itemCompletedCount = 0;
   // Fleet Hardening Phase 0.1 (see TurnUsageInfo). `thread/tokenUsage/updated`
   // notifications fire zero or more times per turn as the app-server updates
   // its running total; `last` is the breakdown for the most recent turn, so
@@ -1658,6 +1665,7 @@ export async function* runOneTurn(
         break;
       }
       case 'item/completed': {
+        itemCompletedCount++;
         const item = params.item as
           | ({ type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem)
           | undefined;
@@ -1839,6 +1847,7 @@ export async function* runOneTurn(
             costUsd: null,
           }
         : undefined,
+      steps: itemCompletedCount > 0 ? itemCompletedCount : null,
     };
   } finally {
     try {

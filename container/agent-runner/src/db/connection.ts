@@ -185,6 +185,21 @@ export function configureOutboundDb(outbound: Database): void {
         cost_usd           REAL
       );
     `);
+  // steps/duration_ms/trigger: added after the table above (Fleet Hardening
+  // Phase 0.1 follow-up — per-turn cost attribution). Additive ALTER, same
+  // forward-compat pattern as container_state's forwardColumns loop, so an
+  // outbound.db that already has turn_usage without these columns keeps
+  // working instead of throwing on every INSERT.
+  const turnUsageCols = new Set(
+    (outbound.prepare("PRAGMA table_info('turn_usage')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  for (const [name, type] of [
+    ['steps', 'INTEGER'],
+    ['duration_ms', 'INTEGER'],
+    ['trigger', 'TEXT'],
+  ] as const) {
+    if (!turnUsageCols.has(name)) outbound.exec(`ALTER TABLE turn_usage ADD COLUMN ${name} ${type}`);
+  }
 }
 
 /** Open and fully configure one outbound connection, closing it on failure. */
@@ -428,6 +443,9 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       ts                 TEXT NOT NULL,
       provider           TEXT NOT NULL,
       model              TEXT,
+      steps              INTEGER,
+      duration_ms        INTEGER,
+      trigger            TEXT,
       input_tokens       INTEGER,
       output_tokens      INTEGER,
       cache_read_tokens  INTEGER,

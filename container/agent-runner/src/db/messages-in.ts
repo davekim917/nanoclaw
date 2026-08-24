@@ -416,6 +416,54 @@ export function getPendingMessages(isFirstPoll = false, diagnostics?: PendingSel
   }
 }
 
+export type TurnTrigger = 'human' | 'agent' | 'scheduled' | 'continuation' | 'on_wake' | 'ceiling_respawn' | 'unknown';
+
+const CEILING_RESPAWN_ID_PREFIX = 'ceiling-respawn-';
+
+/**
+ * Host-authored notices (ceiling-kill accountability, host-restart warnings,
+ * provider-heal, self-mod on_wake, create-agent notices — see
+ * src/host-sweep.ts, src/host-restart-warn.ts, src/modules/self-mod/apply.ts,
+ * src/modules/agent-to-agent/create-agent.ts) all share one content
+ * convention: `senderId: 'system'` (src/caller-identity.ts documents the
+ * same marker for the same reason). That convention, not channel_type, is
+ * the real signal — a genuine agent-to-agent message (agent-route.ts) is
+ * ALSO written with channel_type='agent', since that's how the host marks
+ * "this row is agent-routed, not from a real external channel" for both
+ * cases. Checking channel_type first would misclassify every host notice as
+ * `agent`.
+ */
+function isSystemAuthored(m: MessageInRow): boolean {
+  try {
+    const parsed = JSON.parse(m.content) as { senderId?: unknown; sender?: unknown };
+    return parsed.senderId === 'system' || parsed.sender === 'system';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Classify what caused a turn, from the batch of MessageInRow about to reach
+ * the provider. `ceiling_respawn` gets its own bucket (not folded into
+ * `on_wake`) because those turns are dominated by "recover from a mid-work
+ * kill" rather than ordinary work — the two have different cost shapes.
+ * Every other host notice (host-restart, provider-heal, self-mod, create-agent)
+ * collapses into `on_wake`: nothing here distinguishes them further, and
+ * guessing a split the data can't support would be worse than merging.
+ * `continuation` (a durable `continue_work` resume) is NOT classified here:
+ * that call site has no representative inbound row to classify (the resumed
+ * task's original trigger predates this turn), so poll-loop.ts hardcodes it.
+ */
+export function classifyTrigger(rows: MessageInRow[]): TurnTrigger {
+  if (rows.some(isSystemAuthored)) {
+    return rows.some((m) => m.id.startsWith(CEILING_RESPAWN_ID_PREFIX)) ? 'ceiling_respawn' : 'on_wake';
+  }
+  if (rows.some((m) => m.channel_type === 'agent')) return 'agent';
+  if (rows.some((m) => m.kind === 'task')) return 'scheduled';
+  if (rows.some((m) => m.kind === 'chat' || m.kind === 'chat-sdk')) return 'human';
+  return 'unknown';
+}
+
 /** Mark messages as processing — writes to processing_ack in outbound.db. */
 export function markProcessing(ids: string[]): void {
   if (ids.length === 0) return;

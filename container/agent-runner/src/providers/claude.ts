@@ -1998,6 +1998,12 @@ export class ClaudeProvider implements AgentProvider {
             };
             total_cost_usd?: number;
             modelUsage?: Record<string, ResultModelUsage>;
+            // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
+            // the SDK's own count of assistant/tool round-trips this turn made
+            // — the most authoritative `steps` signal of the three providers,
+            // since it comes straight from the harness rather than being
+            // inferred from the event stream.
+            num_turns?: number;
           };
           const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
           // Retry-path guards run FIRST — these turn error text into a throw so
@@ -2027,7 +2033,13 @@ export class ClaudeProvider implements AgentProvider {
             // to the user's channel as the agent's reply.
             throw new Error(`transient_overload: ${text}`);
           }
-          yield { type: 'result', text, isError: m.is_error === true, usage: extractUsage(m) };
+          yield {
+            type: 'result',
+            text,
+            isError: m.is_error === true,
+            usage: extractUsage(m),
+            steps: typeof m.num_turns === 'number' ? m.num_turns : null,
+          };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'rate_limit_event') {

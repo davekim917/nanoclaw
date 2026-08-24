@@ -9,10 +9,16 @@
  * watermark in usage_rollup_state (one row per `<agent-group>/<session>`)
  * guarantees a turn_usage row is folded in exactly once no matter how many
  * times the host sweep revisits a session.
+ *
+ * Fleet-hardening Phase 0.1 follow-up (per-turn cost attribution): the same
+ * rows are ALSO mirrored 1:1 into a central `turn_usage` ledger (migration
+ * 059) in the same transaction — usage_daily's shape, keys, and watermark
+ * above are unchanged by this. See rollupSessionUsage.
  */
 import type Database from 'better-sqlite3';
 
 import { getDb, hasTable } from './connection.js';
+import { log } from '../log.js';
 
 interface TurnUsageRow {
   id: number;
@@ -24,6 +30,13 @@ interface TurnUsageRow {
   cache_read_tokens: number | null;
   cache_write_tokens: number | null;
   cost_usd: number | null;
+  // Added after the columns above (Phase 0.1 follow-up) — a row rolled up
+  // from a container that predates them arrives with these keys absent
+  // entirely (not present on the object at all, since `SELECT *` only
+  // returns columns that exist), so every read below goes through `??`.
+  steps?: number | null;
+  duration_ms?: number | null;
+  trigger?: string | null;
 }
 
 export interface UsageDailyRow {
@@ -62,6 +75,14 @@ export function rollupSessionUsage(outDb: Database.Database, agentGroupId: strin
   const rows = outDb.prepare('SELECT * FROM turn_usage WHERE id > ? ORDER BY id ASC').all(watermark) as TurnUsageRow[];
   if (rows.length === 0) return 0;
 
+  // sessionDirKey is the fixed `<agent-group>/<session>` contract (see the
+  // watermark table's own comment) — derive session_id from it rather than
+  // adding a parameter, since every caller already builds sessionDirKey from
+  // exactly these two pieces.
+  const sessionId = sessionDirKey.startsWith(`${agentGroupId}/`)
+    ? sessionDirKey.slice(agentGroupId.length + 1)
+    : sessionDirKey;
+
   const db = getDb();
   let maxId = watermark;
   db.transaction(() => {
@@ -76,6 +97,16 @@ export function rollupSessionUsage(outDb: Database.Database, agentGroupId: strin
         cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
         cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens,
         cost_usd = cost_usd + excluded.cost_usd
+    `);
+    // Fleet-hardening Phase 0.1 follow-up: a faithful 1:1 per-turn mirror,
+    // written alongside the usage_daily upsert above rather than replacing
+    // it — `ncl usage` and the dashboard read usage_daily and must not see
+    // any behavior change. Unlike usage_daily, NULLs stay NULL here (this is
+    // a detail ledger, not an additive aggregate with an identity element).
+    const insertCentral = db.prepare(`
+      INSERT INTO turn_usage
+        (ts, session_id, agent_group_id, provider, model, steps, duration_ms, trigger, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+      VALUES (@ts, @session_id, @agent_group_id, @provider, @model, @steps, @duration_ms, @trigger, @input_tokens, @output_tokens, @cache_read_tokens, @cache_write_tokens, @cost_usd)
     `);
     for (const row of rows) {
       maxId = Math.max(maxId, row.id);
@@ -92,6 +123,24 @@ export function rollupSessionUsage(outDb: Database.Database, agentGroupId: strin
         cache_read_tokens: row.cache_read_tokens ?? 0,
         cache_write_tokens: row.cache_write_tokens ?? 0,
         cost_usd: row.cost_usd ?? 0,
+      });
+      insertCentral.run({
+        ts: row.ts,
+        session_id: sessionId,
+        agent_group_id: agentGroupId,
+        provider: row.provider,
+        model: row.model ?? null,
+        // `??` (not `||`) so a real 0 steps/duration_ms survives — only an
+        // absent/null value (old container, or a provider with no signal)
+        // becomes NULL.
+        steps: row.steps ?? null,
+        duration_ms: row.duration_ms ?? null,
+        trigger: row.trigger ?? null,
+        input_tokens: row.input_tokens ?? null,
+        output_tokens: row.output_tokens ?? null,
+        cache_read_tokens: row.cache_read_tokens ?? null,
+        cache_write_tokens: row.cache_write_tokens ?? null,
+        cost_usd: row.cost_usd ?? null,
       });
     }
     db.prepare(
@@ -124,4 +173,23 @@ export function listUsageDaily(
   return getDb()
     .prepare(`SELECT * FROM usage_daily${clause} ORDER BY date DESC, agent_group_id, provider, model LIMIT 1000`)
     .all(...params) as UsageDailyRow[];
+}
+
+const TURN_USAGE_RETENTION_DAYS = 30;
+
+/**
+ * Delete central turn_usage rows older than the retention window. Called
+ * from the host sweep (60s tick) — fleet volume is ~300-600 turns/day, so
+ * this is a trivial per-tick cost and doesn't need its own timer. Self-
+ * contained try/catch so a prune failure never blocks the rest of the sweep.
+ */
+export function pruneOldTurnUsage(): number {
+  try {
+    return getDb()
+      .prepare(`DELETE FROM turn_usage WHERE datetime(ts) < datetime('now', '-${TURN_USAGE_RETENTION_DAYS} days')`)
+      .run().changes;
+  } catch (err) {
+    log.warn('pruneOldTurnUsage: failed', { err });
+    return 0;
+  }
 }

@@ -12,7 +12,9 @@ import {
   markCompleted,
   markScriptSkipped,
   retainCompleteRecallUnits,
+  classifyTrigger,
   type MessageInRow,
+  type TurnTrigger,
 } from './db/messages-in.js';
 import { getConfig } from './config.js';
 import { setChatLimit, writeMessageOut } from './db/messages-out.js';
@@ -449,6 +451,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               runnerId,
               runningWork.id,
               suppressContinuationUntilRealInbound,
+              // No representative inbound row to classify (the resumed
+              // task's original trigger predates this turn) — the resume
+              // itself IS the cause.
+              'continuation',
             );
             if (result.continuation && result.continuation !== continuation) {
               continuation = result.continuation;
@@ -598,6 +604,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // provider-idle boundary rather than creating a new processing claim.
     if (repositoryMountBarrierBlocksPoll()) continue;
     const keptIds = keep.map((m) => m.id);
+    // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
+    // classified once from the admitted batch and reused for every
+    // processQuery call this turn makes, including its in-turn retries below
+    // (same prompt/continuation, so the cause hasn't changed).
+    const trigger = classifyTrigger(keep);
     markProcessing(keptIds);
     if (hasRealInbound(keep)) {
       resetWorkContinuationForRealInbound();
@@ -697,6 +708,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         runnerId,
         undefined,
         suppressContinuationUntilRealInbound,
+        trigger,
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
@@ -771,6 +783,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               runnerId,
               undefined,
               suppressContinuationUntilRealInbound,
+              trigger,
             );
             if (retryResult.continuation && retryResult.continuation !== continuation) {
               continuation = retryResult.continuation;
@@ -843,6 +856,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               runnerId,
               undefined,
               suppressContinuationUntilRealInbound,
+              trigger,
             );
             if (retryResult.continuation && retryResult.continuation !== continuation) {
               continuation = retryResult.continuation;
@@ -915,6 +929,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             runnerId,
             undefined,
             suppressContinuationUntilRealInbound,
+            trigger,
           );
           if (retryResult.continuation && retryResult.continuation !== continuation) {
             continuation = retryResult.continuation;
@@ -984,6 +999,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             runnerId,
             undefined,
             suppressContinuationUntilRealInbound,
+            trigger,
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -1040,6 +1056,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             runnerId,
             undefined,
             suppressContinuationUntilRealInbound,
+            trigger,
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -1099,6 +1116,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             runnerId,
             undefined,
             suppressContinuationUntilRealInbound,
+            trigger,
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -1373,6 +1391,14 @@ export async function processQuery(
   runnerId: string = randomUUID(),
   initialContinuationId?: string,
   onContinuationPaused?: (id: string) => void,
+  // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up): what
+  // caused the batch that started THIS processQuery call. Applied to every
+  // `result` event this call produces, including any later follow-up admitted
+  // mid-stream or durable continuation launched via maybeLaunchContinuation —
+  // the stream has no cheaper way to reclassify mid-flight, and a turn that
+  // changes cause partway through is rare enough that merging it into the
+  // call's original trigger beats fabricating a per-event reclassification.
+  trigger: TurnTrigger = 'unknown',
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -1412,8 +1438,15 @@ export async function processQuery(
   // production 2026-08-16 — a queued continuation sat stranded for 52 minutes
   // until the idle ceiling killed the container.
   let turnIdle = false;
+  // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up): wall
+  // time from the prompt that starts a turn to the `result` event that
+  // answers it. Reset at the same choke point as `turnIdle` above, so every
+  // real push (initial batch, in-turn follow-up, durable continuation
+  // launch) restarts the clock for the turn it starts.
+  let turnStartedAtMs = Date.now();
   const pushToQuery = (message: string): void => {
     turnIdle = false;
+    turnStartedAtMs = Date.now();
     query.push(message);
   };
 
@@ -1741,8 +1774,13 @@ export async function processQuery(
         // expose comes through as NULL — see TurnUsageInfo. A turn spanning
         // multiple models (event.usage as an array) writes one row per model
         // so each is attributed separately instead of collapsing to NULL.
+        // steps/duration/trigger (Phase 0.1 follow-up) are turn-level, not
+        // per-model, so every row from a multi-model turn carries the same
+        // values — computed once, right here, before anything below can push
+        // a follow-up and reset turnStartedAtMs for the NEXT turn.
+        const turnMeta = { steps: event.steps ?? null, durationMs: Date.now() - turnStartedAtMs, trigger };
         for (const usage of Array.isArray(event.usage) ? event.usage : [event.usage]) {
-          recordTurnUsage(providerName, usage);
+          recordTurnUsage(providerName, usage, turnMeta);
         }
         // A `result` event signals the assistant's turn is complete, but the
         // provider's events generator stays open for follow-up `push()` calls
