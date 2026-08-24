@@ -10,7 +10,7 @@ import {
   searchArchiveEvidence,
   type ArchiveEvidenceRow,
 } from '../../message-archive.js';
-import { GENERATED_MEMORY_MAX_BYTES, GENERATED_MEMORY_RELATIVE_PATH } from './curator-contract.js';
+import { GENERATED_MEMORY_MAX_BYTES, GENERATED_MEMORY_RELATIVE_PATH, TOPIC_DIRECTORIES } from './curator-contract.js';
 import { GRAPH_SCENT_BOUNDS, readGraphScent, STOP_WORDS, type GraphScent } from './graph-scent.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
@@ -291,19 +291,56 @@ type RecallToken = { value: string; start: number; end: number };
 // one.
 //
 // Keyed on the text itself, so it needs no invalidation: a rewritten fact is a
-// different string and simply misses. Cleared wholesale when full rather than
-// evicted least-recently-used — the working set is the current fact store, so a
-// clear costs one turn of recompute and the LRU bookkeeping is not worth it.
-// ponytail: plain Map, swap for an LRU only if clears start showing up hot.
+// different string and simply misses. Evicted least-recently-used: a Map keeps
+// insertion order, so delete-and-reinsert on a hit moves a key to the young end
+// and the first key is always the oldest. Wholesale-clear was the bug — one
+// overflow threw away the entire warm set instead of one entry.
 const TOKEN_STREAM_CACHE = new Map<string, readonly RecallToken[]>();
-// Sized to hold the whole fact store plus a turn's manual files and archive
-// candidates several times over, so a clear stays rare. Roughly 6 MB of heap
-// per 1,000 cached fact lines.
-const TOKEN_STREAM_CACHE_MAX = 8192;
+// SIZING. An entry is one WINDOW, not one fact line: bestPassage tokenizes every
+// boundedPassages window, and a fact yields 9-12 of them (measured 9.1 on the
+// live 6,626-fact store). The previous "~6 MB per 1,000 cached fact lines" note
+// was wrong by ~7x for the same reason — measured heap is ~4.4 KB per entry, so
+// 1,000 fact lines cost ~41 MB, and 8,192 entries only ever held ~850 facts.
+//
+// 24,576 entries is ~108 MB worst case. It holds the ENTIRE per-turn working set
+// of every small/medium workgroup with ~7x growth headroom (largest measured
+// outside the two big ones: 3,339 entries).
+//
+// It deliberately does NOT chase the two large workgroups (46,108 entries /
+// ~200 MB, and 131,245 / ~577 MB). Sizing for them is not a knob problem: the
+// access pattern is a single sequential sweep per pool, so any cap below the
+// full working set yields ~zero hits rather than partial ones, and this Map is
+// shared process-wide — one large-workgroup turn evicts every other workgroup's
+// warm set no matter how big the cap is. Their fix is to stop generating ~4.7x
+// redundant overlapping-window tokenization in bestPassage (tokenize each
+// candidate once and slice by token offset), not a larger cache.
+// ponytail: entry-count cap, not a byte cap — windows are already length-capped
+// by maxChars, so entries stay within ~2x of the measured mean.
+const TOKEN_STREAM_CACHE_MAX = 24_576;
+
+const TOKEN_STREAM_CACHE_STATS = { hits: 0, misses: 0 };
+
+/** Test seam: proves cache behavior without asserting on wall-clock timing. */
+export function _tokenStreamCacheStatsForTest(): { hits: number; misses: number; size: number; max: number } {
+  return { ...TOKEN_STREAM_CACHE_STATS, size: TOKEN_STREAM_CACHE.size, max: TOKEN_STREAM_CACHE_MAX };
+}
+
+export function _resetTokenStreamCacheForTest(): void {
+  TOKEN_STREAM_CACHE.clear();
+  TOKEN_STREAM_CACHE_STATS.hits = 0;
+  TOKEN_STREAM_CACHE_STATS.misses = 0;
+}
 
 function tokenStreamForRecall(value: string): readonly RecallToken[] {
   const cached = TOKEN_STREAM_CACHE.get(value);
-  if (cached) return cached;
+  if (cached) {
+    TOKEN_STREAM_CACHE_STATS.hits++;
+    // Re-insert to move this key to the young end of the iteration order.
+    TOKEN_STREAM_CACHE.delete(value);
+    TOKEN_STREAM_CACHE.set(value, cached);
+    return cached;
+  }
+  TOKEN_STREAM_CACHE_STATS.misses++;
   const normalized = value.normalize('NFKC').toLocaleLowerCase('en-US');
   const tokens = [...normalized.matchAll(/[\p{L}\p{N}_-]{2,}/gu)]
     .map((match) => ({
@@ -312,7 +349,9 @@ function tokenStreamForRecall(value: string): readonly RecallToken[] {
       end: match.index + match[0].length,
     }))
     .filter((token) => token.value.length > 1 && !STOP_WORDS.has(token.value));
-  if (TOKEN_STREAM_CACHE.size >= TOKEN_STREAM_CACHE_MAX) TOKEN_STREAM_CACHE.clear();
+  if (TOKEN_STREAM_CACHE.size >= TOKEN_STREAM_CACHE_MAX) {
+    TOKEN_STREAM_CACHE.delete(TOKEN_STREAM_CACHE.keys().next().value!);
+  }
   TOKEN_STREAM_CACHE.set(value, tokens);
   return tokens;
 }
@@ -700,16 +739,21 @@ function listMarkdownFiles(root: string, notices: ContextNotice[]): string[] {
 }
 
 /**
- * Direct, non-recursive listing of preferences/ stems — independent of
- * listMarkdownFiles' capped walk. The preference lane is a deterministic
- * direct-path lookup keyed by sender slug, so it must not silently go empty
- * just because unrelated directories sorting earlier exhausted the walk's
- * shared visited-entry cap.
+ * Direct, non-recursive listing of one directory's Markdown stems —
+ * independent of listMarkdownFiles' capped walk, whose shared visited-entry
+ * budget is spent in codepoint order and so starves whatever sorts last.
+ *
+ * Two lanes depend on this. The preference lane is a deterministic direct-path
+ * lookup keyed by sender slug. The curator topic directories (people/, domain/,
+ * systems/) are consolidation-produced views of the whole ledger, and on the
+ * live 564-file tree `domain/` alone consumed 159 of the 256-entry budget while
+ * `people/` and `systems/` were never enumerated at all. Neither lane may
+ * depend on winning a sort race.
  */
-function listPreferenceStems(root: string, notices: ContextNotice[]): string[] {
+function listDirectMarkdownStems(root: string, dir: string, notices: ContextNotice[]): string[] {
   let entries: fs.Dirent[];
   try {
-    entries = fs.readdirSync(path.join(root, PREFERENCES_DIR), { withFileTypes: true });
+    entries = fs.readdirSync(path.join(root, dir), { withFileTypes: true });
   } catch (error) {
     if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw error;
@@ -730,10 +774,21 @@ function listPreferenceStems(root: string, notices: ContextNotice[]): string[] {
       source: 'markdown',
       status: 'degraded',
       code: 'markdown-symlink-skipped',
-      detail: `skipped ${skippedSymlinks} symbolic link${skippedSymlinks === 1 ? '' : 's'} in ${PREFERENCES_DIR}`,
+      detail: `skipped ${skippedSymlinks} symbolic link${skippedSymlinks === 1 ? '' : 's'} in ${dir}`,
     });
   }
   return stems;
+}
+
+/**
+ * Curator topic files, listed directly so they can never lose the walk's sort
+ * race. Flat, one level, matching TOPIC_FILE_PATH_PATTERN — so a non-recursive
+ * listing per directory is the whole story.
+ */
+function listTopicFiles(root: string, notices: ContextNotice[]): string[] {
+  return TOPIC_DIRECTORIES.flatMap((dir) =>
+    listDirectMarkdownStems(root, `${dir}/`, notices).map((stem) => `${dir}/${stem}.md`),
+  );
 }
 
 /**
@@ -846,7 +901,10 @@ function readMemoryEvidence(
   // is worse than dropping it: the partial line still starts with "- " and is
   // parsed as a fact, so a half-sentence reaches the agent with its provenance
   // marker cut off. Stable sort, so everything else keeps codepoint order.
-  const allFiles = listMarkdownFiles(root, notices);
+  // Union rather than walk-only: the topic directories are listed directly so
+  // an earlier-sorting directory cannot spend the walk's entry budget before
+  // they are reached. Deduped because the walk usually does reach some of them.
+  const allFiles = [...new Set([...listMarkdownFiles(root, notices), ...listTopicFiles(root, notices)])].sort();
 
   // Deterministic per-person preference lane. Files under preferences/ are
   // keyed by name slug and injected whole for the conversation's involved
@@ -856,7 +914,7 @@ function readMemoryEvidence(
   const preferenceExcerpts: MemoryEvidenceExcerpt[] = [];
   if (involvedSenderNames.length > 0) {
     const senderSlugs = [...new Set(involvedSenderNames.map(preferenceSlug))].filter((slug) => slug.length > 0);
-    const preferenceStems = listPreferenceStems(root, notices);
+    const preferenceStems = listDirectMarkdownStems(root, PREFERENCES_DIR, notices);
     // ONE file per sender: exact slug match wins outright; otherwise the
     // longest prefix-compatible stem. Injecting every prefix match would let
     // `alex.md` ride along with `alex-stone.md` for the same person.

@@ -20,11 +20,14 @@ export const GENERATED_MEMORY_RELATIVE_PATH = 'generated/memory.md';
 // rail with the 75% warning as the real signal, not as a ceiling that will hold
 // forever.
 //
-// Latency used to be what bounded this: the store was re-tokenized on every
-// turn, measured at 875 ms per turn on a live 1 MiB / 1,058-fact store. That is
-// now memoized in pre-turn-context.ts (648 ms cold, ~13 ms warm, 50x), and
-// because the cache keys on fact text a curator rewrite only re-tokenizes the
-// facts that actually changed. Disk and the per-turn file read are what remain.
+// Latency is STILL what bounds this, and the memoization in pre-turn-context.ts
+// does not remove it at this rail's scale. That cache keys on ranking WINDOW
+// text, not on fact text — a fact yields 9-12 windows — so a 1 MiB / 1,058-fact
+// store is ~10k cache entries and the live 6,626-fact store is ~60k. Measured
+// 2026-08-24 on the live store: 12.5 s cold and 12.9 s warm, i.e. no warm path
+// at all, on the shared host event loop on every admissible turn. Treat any
+// further raise of this rail as buying write headroom at a per-turn CPU cost
+// that the cache does not currently amortize.
 //
 // Measured 2026-08-24: the busiest workgroup was at 6.41 MB growing ~183
 // KB/day — roughly 11 days from the 8 MiB rail. Raised to 16 MiB, which buys
@@ -497,8 +500,16 @@ export const CONSOLIDATION_FILE_MAX_BYTES = 8_192;
 /** Max files a single pass may write. */
 export const CONSOLIDATION_MAX_FILES = 12;
 
+/**
+ * The three curator-maintained topic directories. Single source of truth: the
+ * consolidation writer, the consolidation input scan and the pre-turn recall
+ * walk all key off this list, and a fourth directory added here must reach
+ * recall automatically rather than needing three separate edits.
+ */
+export const TOPIC_DIRECTORIES = ['people', 'domain', 'systems'] as const;
+
 /** Flat files only, one level under the three topic directories — no nesting. */
-export const TOPIC_FILE_PATH_PATTERN = /^(?:people|domain|systems)\/[a-z0-9][a-z0-9-]*\.md$/;
+export const TOPIC_FILE_PATH_PATTERN = new RegExp(`^(?:${TOPIC_DIRECTORIES.join('|')})/[a-z0-9][a-z0-9-]*\\.md$`);
 
 // Both the audit trail (how many ledger facts this pass folded in) and the
 // ownership marker: writeMemoryTopicFile refuses to overwrite any existing

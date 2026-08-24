@@ -51,6 +51,7 @@ import {
   GENERATED_MEMORY_MAX_BYTES,
   GENERATED_MEMORY_WARN_BYTES,
   parseGeneratedMemoryFacts,
+  TOPIC_DIRECTORIES,
   TOPIC_FILE_PATH_PATTERN,
   validateConsolidationFiles,
   validateCuratorDecision,
@@ -327,7 +328,7 @@ export function scanTopicFiles(workgroupId: string): {
   const files: ConsolidationTopicFile[] = [];
   const excludedPaths: string[] = [];
   let totalBytes = 0;
-  for (const dir of ['people', 'domain', 'systems'] as const) {
+  for (const dir of TOPIC_DIRECTORIES) {
     let entries: fs.Dirent[];
     try {
       entries = fs

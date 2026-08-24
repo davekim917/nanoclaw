@@ -42,11 +42,14 @@ vi.mock('../../message-archive.js', async (importOriginal) => {
 });
 
 import {
+  _resetTokenStreamCacheForTest,
+  _tokenStreamCacheStatsForTest,
   boundedCapabilities,
   buildPreTurnContext,
   enforceFinalBound,
   evaluateRecallCorpus,
   PRE_TURN_BOUNDS,
+  tokenizeForRecall,
   type ContextNotice,
   type ConversationEvidenceExcerpt,
   type MemoryEvidenceExcerpt,
@@ -1712,5 +1715,105 @@ describe('markdown byte-scan budget stays coupled to the generated-memory rail',
     // after it silently reads as zero bytes. This is the exact regression that
     // would recur if the generated-memory cap were raised without this one.
     expect(PRE_TURN_BOUNDS.markdownScannedBytes).toBeGreaterThan(GENERATED_MEMORY_MAX_BYTES);
+  });
+});
+
+// Root cause: the recall token cache keys on WINDOW text (boundedPassages via
+// bestPassage), not on fact text, and one fact yields ~9-12 windows. A
+// 1,000-fact ledger is ~12,000 entries, so the old 8,192 cap flushed the whole
+// Map mid-pass and the warm path never materialized — measured 12.5 s cold AND
+// 12.9 s warm on the live 6,626-fact store.
+describe('recall token cache survives a working set larger than the old 8,192-entry cap', () => {
+  const input = {
+    agentGroupId: 'ag-a',
+    sessionId: 'sess-a',
+    kind: 'chat-sdk',
+    trigger: 1 as const,
+    normalizedContent: JSON.stringify({ text: 'What is the forecast pipeline volume reading?' }),
+    includeBootstrap: false,
+  };
+
+  it('a second identical ranking pass is served from cache instead of re-tokenizing', () => {
+    const fact = (n: number) =>
+      `- Forecast pipeline volume reading ${n} landed. Region delta ${n} held steady. ` +
+      `Operator sign-off ${n} recorded. Ledger checkpoint ${n} confirmed. ` +
+      `<!-- nanoclaw-memory:id=mem_${String(n).padStart(16, '0')};evidence=ev-${n};captured=2026-08-01T00:00:00.000Z -->`;
+    memoryFile(
+      'generated/memory.md',
+      `# Generated workgroup memory\n\n${Array.from({ length: 1_000 }, (_, i) => fact(i + 1)).join('\n')}\n`,
+    );
+    _resetTokenStreamCacheForTest();
+
+    buildPreTurnContext(input);
+    const cold = _tokenStreamCacheStatsForTest();
+    // The working set must actually exceed the old cap, or this proves nothing.
+    expect(cold.misses).toBeGreaterThan(8_192);
+
+    buildPreTurnContext(input);
+    const warm = _tokenStreamCacheStatsForTest();
+    const warmHits = warm.hits - cold.hits;
+    const warmMisses = warm.misses - cold.misses;
+
+    // Materially less tokenization work on the repeat pass: essentially every
+    // window is served from cache rather than re-tokenized.
+    expect(warmHits).toBeGreaterThan(8_192);
+    expect(warmMisses).toBeLessThan(warmHits / 100);
+  });
+
+  it('overflow evicts the oldest entry, it does not clear the whole cache', () => {
+    _resetTokenStreamCacheForTest();
+    const { max } = _tokenStreamCacheStatsForTest();
+    const key = (n: number) => `lru probe entry number ${n} distinct payload`;
+
+    for (let index = 0; index < max; index++) tokenizeForRecall(key(index));
+    expect(_tokenStreamCacheStatsForTest().size).toBe(max);
+
+    // Touch the oldest key so it becomes the most recently used, then overflow
+    // by one. A wholesale clear drops it; LRU keeps it and drops key(1).
+    tokenizeForRecall(key(0));
+    tokenizeForRecall('an entry that has never been tokenized before');
+
+    const beforeKept = _tokenStreamCacheStatsForTest();
+    tokenizeForRecall(key(0));
+    expect(_tokenStreamCacheStatsForTest().hits).toBe(beforeKept.hits + 1);
+
+    const beforeEvicted = _tokenStreamCacheStatsForTest();
+    tokenizeForRecall(key(1));
+    expect(_tokenStreamCacheStatsForTest().misses).toBe(beforeEvicted.misses + 1);
+
+    // Still full rather than emptied.
+    expect(_tokenStreamCacheStatsForTest().size).toBe(max);
+  });
+});
+
+// Root cause: listMarkdownFiles' shared visited-entry cap is consumed in
+// codepoint order, so a large `domain/` starves every topic directory sorting
+// after it. Measured on the live 564-file tree: visited=256, files_found=245,
+// and `people/` (14 files) plus `systems/` (28) were never enumerated at all —
+// 40 consolidation-produced topic views structurally invisible to recall.
+describe('curator topic directories always reach recall', () => {
+  it('delivers people/, domain/ and systems/ files past the file-walk cap', () => {
+    for (let index = 0; index < 300; index++) {
+      memoryFile(`domain/topic-${String(index).padStart(3, '0')}.md`, `# Topic ${index}\nUnrelated filler ${index}.`);
+    }
+    memoryFile('domain/quarterly-forecast.md', '# Quarterly forecast\nThe forecast pipeline volume doubled.');
+    memoryFile('people/alex-stone.md', '# Alex Stone\nAlex owns the forecast pipeline volume review.');
+    memoryFile('systems/forecast-pipeline.md', '# Forecast pipeline\nThe forecast pipeline volume is sharded.');
+
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'who owns the forecast pipeline volume?' }),
+      includeBootstrap: false,
+    });
+
+    // The walk stays capped — this is not "raise the number until it fits".
+    expect(result.notices.some((notice) => notice.code === 'markdown-file-limit')).toBe(true);
+    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
+    expect(paths).toContain('people/alex-stone.md');
+    expect(paths).toContain('systems/forecast-pipeline.md');
+    expect(paths).toContain('domain/quarterly-forecast.md');
   });
 });
