@@ -23,6 +23,11 @@ import fs from 'fs';
 import path from 'path';
 
 import { TIMEZONE } from './config.js';
+// The one contained-read seam this fork has, reused rather than re-derived.
+// It lives under `dashboard/api/` because that is where the first caller was;
+// it depends on nothing but `fs`, `path` and `log`, so there is no cycle with
+// the dashboard modules that import THIS file.
+import { containedRealpath, readContainedFile } from './dashboard/api/attention-fs.js';
 import { log } from './log.js';
 import {
   claimsBaseDir,
@@ -55,26 +60,139 @@ function classify(claimedAt: string, ttlHours: number, now: number): { state: Cl
 }
 
 /**
+ * The largest number of claim files one read will open.
+ *
+ * {@link MAX_CLAIM_BYTES} bounds how big each file may be; nothing bounded how
+ * MANY there are. `data/workgroups/<id>/claims/` is bind-mounted READ-WRITE at
+ * `/workspace/workgroup/claims` into that workgroup's own containers
+ * (`container-runner.ts`; `container/skills/work-claims/claim.sh` writes
+ * straight into it), so the file COUNT is chosen by an agent — and this whole
+ * loop runs synchronously inside the thread-list request
+ * (`board-attention.ts` calls `readClaims` on every memo miss), which the
+ * dashboard polls continuously from every open viewer. A directory grown to
+ * thousands of entries is that many blocking opens and `JSON.parse`s on the
+ * host's single event loop, per poll, per viewer.
+ *
+ * Across this install the busiest claims directory holds 38 files and the next
+ * busiest 8. 500 is over thirteen times the busiest, so the cap cannot bite on
+ * organic growth — not even on the known pathology of finished claims left
+ * undeleted, which is what accumulates here. It bites only on a directory
+ * somebody filled, which is exactly when a human should hear about it.
+ * Together with the per-file cap it bounds one read at 500 × 64 KiB.
+ */
+const MAX_CLAIM_FILES = 500;
+
+/**
+ * The largest claim file this read will open.
+ *
+ * Deliberately far tighter than `attention-fs.ts`'s 2 MiB default, because
+ * that seam reads a handful of declared files per request and this one reads
+ * every file in a directory: what blocks the event loop is count × size. At
+ * the default, one directory of 500 files could be a gigabyte of blocking read
+ * and parse per poll.
+ *
+ * A claim is a small JSON record — owner, two timestamps, a TTL, a note. The
+ * largest live claim on disk is 2.2 KB, so 64 KiB is ~30x the biggest real one
+ * and still leaves room for the paragraphs of handoff detail notes routinely
+ * carry. Anything past it is not a claim.
+ */
+const MAX_CLAIM_BYTES = 64 * 1024;
+
+/**
+ * `entries` least-recently-touched first.
+ *
+ * Only called when the count cap bites, and the order matters precisely then:
+ * `readdirSync` hands back whatever the filesystem stored, so slicing it
+ * unordered would drop an ARBITRARY set. The board exists to surface work
+ * nobody is coming back for, so the entries it must never drop are the ones
+ * least recently written — an alphabetical or as-listed cut would throw away
+ * abandoned claims and keep healthy ones about half the time, which is the
+ * absence-as-fact bug this seam keeps eliminating.
+ *
+ * ponytail: one `lstat` per entry, on the already-paid enumeration and only
+ * past the cap. If a directory ever gets large enough that the stat loop
+ * itself is the cost, the fix is an mtime-ordered index, not a cheaper sort.
+ */
+function oldestFirst(dir: string, entries: string[]): string[] {
+  const mtime = new Map<string, number>();
+  for (const entry of entries) {
+    // `lstat`, never `stat`: it never traverses a symlink (so it cannot be
+    // pointed at something expensive) and never blocks — only `open` blocks on
+    // a FIFO. An entry that vanished between `readdir` and here sorts last; it
+    // would fail the open anyway.
+    const st = fs.lstatSync(path.join(dir, entry), { throwIfNoEntry: false });
+    mtime.set(entry, st ? st.mtimeMs : Infinity);
+  }
+  return [...entries].sort((a, b) => mtime.get(a)! - mtime.get(b)!);
+}
+
+/**
  * Every claim in a workgroup, classified. Unparseable files are skipped with a
  * warning rather than throwing — one bad file must not blank the whole board.
  * A claim missing `claimed_at`/`ttl_hours` counts as stale for the same reason
  * `claim.sh` does: it must never read as an indefinite hold on the work.
+ *
+ * Every entry is read through `readContainedFile`, so a FIFO, a directory, a
+ * device node, an oversized file and one symlinked out of the claims directory
+ * are all skipped with a log — the same treatment malformed JSON already got,
+ * for the same reason: one bad entry must not blank the board. That seam, not
+ * a `readFileSync`, is what keeps a `mkfifo` in an agent-writable directory
+ * from hanging the host's event loop on the open.
  */
 export function readClaims(workgroupId: string, now: number, root: string = claimsBaseDir()): BoardClaim[] {
-  const dir = path.join(root, workgroupId, 'claims');
-  let entries: string[];
+  // Containment on the DIRECTORY, resolved once. `claims/` is agent-writable,
+  // so it can be replaced with a symlink at a sibling workgroup's folder — a
+  // cross-workgroup read straight through the data-pool boundary, and one that
+  // self-heal would then act on in the wrong workgroup. Resolving it here also
+  // gives `readContainedFile` the realpath'd root its per-file fd check needs.
+  //
+  // Absent and escaping take the same silent exit: most workgroups have no
+  // claims directory at all, so warning here would fire on every poll for
+  // every one of them. Both mean the same thing — read nothing.
+  let dir: string | null;
   try {
-    entries = fs.readdirSync(dir).filter((f) => f.endsWith('.json') && !f.startsWith('.'));
+    const workgroupDir = fs.realpathSync(path.join(root, workgroupId));
+    dir = containedRealpath(workgroupDir, path.join(workgroupDir, 'claims'));
+  } catch {
+    dir = null; // no workgroup dir — shared FS not enabled, or nothing claimed yet
+  }
+  if (dir === null) return [];
+
+  let all: string[];
+  try {
+    all = fs.readdirSync(dir).filter((f) => f.endsWith('.json') && !f.startsWith('.'));
   } catch {
     return []; // no claims dir — workgroup shared FS not enabled, or nothing claimed yet
+  }
+
+  const entries = all.length > MAX_CLAIM_FILES ? oldestFirst(dir, all).slice(0, MAX_CLAIM_FILES) : all;
+  const skipped = all.length - entries.length;
+  if (skipped > 0) {
+    // LOUD, never a silent truncation. There is no honest place to surface
+    // this as a row: `readClaims` returns `BoardClaim`s that self-heal
+    // (`modules/claims/self-heal.ts`) re-reads BY SLUG and stamps on disk, and
+    // that nudge/steer look up by slug — a synthetic claim would be a fake
+    // slug those paths would try to act on. So the log line is the surface.
+    log.warn('Claims board: more claim files than the read cap, reading only the oldest', {
+      workgroupId,
+      total: all.length,
+      cap: MAX_CLAIM_FILES,
+      skipped,
+    });
   }
 
   const claims: BoardClaim[] = [];
   for (const entry of entries) {
     const file = path.join(dir, entry);
+    // Containment, file type, size cap and the read are one operation on one
+    // descriptor — see `readContainedFile`. A per-file check that a later
+    // `readFileSync` could outrun is not a check, and a plain `readFileSync`
+    // on a FIFO blocks the open forever before any check can run.
+    const read = readContainedFile('Claims board', dir, entry, workgroupId, MAX_CLAIM_BYTES);
+    if (read === null) continue;
     let raw: Record<string, unknown>;
     try {
-      raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+      raw = JSON.parse(read.text) as Record<string, unknown>;
     } catch (err) {
       log.warn('Claims board: unparseable claim, skipping', { file, err });
       continue;
