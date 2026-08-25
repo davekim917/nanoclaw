@@ -35,8 +35,18 @@ import fs from 'node:fs';
  * `'aa bb?\naa bb?'` the third window stores `[7,13)` where it used to store
  * `[0,6)`. Same columns, same decoded text — which is exactly why the
  * round-trip check waves it through — but a consumer reading offsets rather
- * than slicing text gets a different answer per row vintage. Neither the table
- * shape nor `frozenBounds` moved, so this version was the only gate left.
+ * than slicing text gets a different answer per row vintage.
+ *
+ * THIS AND `frozenBounds` ARE INDEPENDENT GATES. `frozenBounds` covers the
+ * build constants and the tokenizer's behaviour; this version covers table
+ * shape and persisted semantics. F4's commit happened to move the tokenizer
+ * fingerprint as well (1400294713 -> 2036328998, verified by computing
+ * `frozenBounds()` at that commit and its parent — the same commit rewrote
+ * `tokenizerFingerprint` to hash a probe corpus), so stores written before it
+ * were in fact already refused as `stale-bounds`. That is coincidence, not
+ * coverage: an offset-semantics change on its own moves neither a constant nor
+ * the tokenizer. Bump this version for every semantic change, including the
+ * ones some other gate would have caught anyway.
  */
 export const RECALL_PROJECTION_SCHEMA_VERSION = 2;
 
