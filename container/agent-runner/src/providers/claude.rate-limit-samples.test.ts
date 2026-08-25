@@ -18,6 +18,7 @@ const sdkMessages: unknown[] = [];
 /** Set to a response object to expose the usage control method on the query. */
 let usageResponse: unknown = null;
 let usageRejects = false;
+let usageHangs = false;
 let usageCalls = 0;
 
 const USAGE_CONTROL_METHOD = 'usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET';
@@ -31,6 +32,10 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
       (gen as unknown as Record<string, unknown>)[USAGE_CONTROL_METHOD] = async () => {
         usageCalls++;
         if (usageRejects) throw new Error('usage endpoint unreachable');
+        // The 3am case: the SDK's control channel has NO deadline of its own
+        // (Query.request settles only on a matching response or transport
+        // close), so an unanswered get_usage never settles at all.
+        if (usageHangs) return new Promise(() => {});
         return usageResponse;
       };
     }
@@ -38,9 +43,8 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   },
 }));
 
-const { ClaudeProvider, planUsagePuller, usageResponseToSamples, _resetUsagePullThrottleForTesting } = await import(
-  './claude.js'
-);
+const { ClaudeProvider, planUsagePuller, usageResponseToSamples, withDeadline, _resetUsagePullThrottleForTesting } =
+  await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 const { initTestSessionDb } = await import('../db/connection.js');
 const { getRateLimitSampleRows } = await import('../db/rate-limit-samples.js');
@@ -56,6 +60,7 @@ beforeEach(() => {
   _resetUsagePullThrottleForTesting();
   usageResponse = null;
   usageRejects = false;
+  usageHangs = false;
   usageCalls = 0;
   sdkMessages.length = 0;
 });
@@ -90,6 +95,30 @@ describe('planUsagePuller — feature detection', () => {
     const pull = planUsagePuller(q);
     expect(pull).not.toBeNull();
     expect((await pull!()) as unknown).toEqual({ self: q } as unknown as never);
+  });
+});
+
+describe('withDeadline', () => {
+  it('rejects a pull that never settles', async () => {
+    const start = Date.now();
+    await expect(withDeadline(new Promise(() => {}), 20)).rejects.toThrow('usage pull exceeded 20ms');
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  it('passes a value through and clears its timer', async () => {
+    const real = globalThis.clearTimeout;
+    let cleared = 0;
+    globalThis.clearTimeout = ((t: Parameters<typeof real>[0]) => {
+      cleared++;
+      return real(t);
+    }) as typeof real;
+    try {
+      await expect(withDeadline(Promise.resolve('ok'), 20)).resolves.toBe('ok');
+    } finally {
+      globalThis.clearTimeout = real;
+    }
+    // A fast pull must not leave a live timer behind for the full deadline.
+    expect(cleared).toBeGreaterThan(0);
   });
 });
 
@@ -199,6 +228,53 @@ describe('capture through the provider', () => {
 
     expect(usageCalls).toBe(1);
     expect(getRateLimitSampleRows()).toHaveLength(1);
+  });
+
+  it('completes the turn on time when the pull HANGS forever, and records nothing', async () => {
+    sdkMessages.push({ type: 'system', subtype: 'init', session_id: 's1' }, RESULT_MSG);
+    usageHangs = true;
+    usageResponse = { rate_limits_available: true, rate_limits: {} };
+
+    const provider = new ClaudeProvider({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'tok-primary' } });
+    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+    const q = provider.query({ prompt: 'hi', cwd: tmp });
+    const start = Date.now();
+    const kinds: string[] = [];
+    for await (const e of q.events) kinds.push(e.type);
+    const elapsed = Date.now() - start;
+    await new Promise((r) => setTimeout(r, 5));
+
+    expect(kinds).toContain('result');
+    expect(usageCalls).toBe(1);
+    // Nowhere near USAGE_PULL_TIMEOUT_MS (10s) — the turn never waited on it
+    // at all, and the deadline only bounds the leaked pending promise.
+    expect(elapsed).toBeLessThan(1000);
+    // Timed out => NOT SAMPLED. No row, and specifically not an
+    // `available: 0` row, which would falsely mean "plan limits do not apply".
+    expect(getRateLimitSampleRows()).toHaveLength(0);
+  });
+
+  it('gives the hung pull a deadline so it does not leak forever', async () => {
+    // Short deadline so the case does not sit for USAGE_PULL_TIMEOUT_MS.
+    _resetUsagePullThrottleForTesting(20);
+    sdkMessages.push({ type: 'system', subtype: 'init', session_id: 's1' }, RESULT_MSG);
+    usageHangs = true;
+    usageResponse = { rate_limits_available: true, rate_limits: {} }; // attaches the method; never returned
+
+    const errors: string[] = [];
+    const realError = console.error;
+    console.error = (...a: unknown[]) => void errors.push(a.join(' '));
+    try {
+      await runTurn({ CLAUDE_CODE_OAUTH_TOKEN: 'tok-primary' });
+      await new Promise((r) => setTimeout(r, 80));
+    } finally {
+      console.error = realError;
+    }
+
+    // Without the deadline the SDK never settles this promise (verified in
+    // sdk.mjs: Query.request has no timer), so nothing is ever logged.
+    expect(errors.some((e) => e.includes('usage pull exceeded 20ms'))).toBe(true);
+    expect(getRateLimitSampleRows()).toHaveLength(0);
   });
 
   it('never fails the turn when the pull rejects, and records nothing', async () => {

@@ -178,13 +178,53 @@ export function usageResponseToSamples(res: SdkUsageResponse, account: string | 
  * Module scope IS per-session scope — one container serves exactly one session.
  */
 const USAGE_PULL_MIN_INTERVAL_MS = 5 * 60_000;
+
+/**
+ * Deadline for one pull. The throttle above bounds how OFTEN we call; it says
+ * nothing about how LONG a call takes, and those are different failure modes —
+ * the one that bites is a call that neither resolves nor rejects.
+ *
+ * The SDK imposes no deadline of its own. Verified in sdk.mjs: `Query.request`
+ * stores the resolver in `pendingControlResponses` keyed by request id and
+ * settles ONLY when a matching control response arrives, or when the transport
+ * closes and sweeps every pending entry. There is no timer anywhere on that
+ * path. So an unanswered `get_usage` leaks a pending promise and a map entry
+ * for the container's whole life.
+ *
+ * 10s is generous for a telemetry round-trip and far below the 5-minute
+ * throttle, so a permanently hung endpoint can never accumulate more than one
+ * in-flight pull.
+ */
+const USAGE_PULL_TIMEOUT_MS = 10_000;
+
 let lastUsagePullAt = 0;
 let warnedNoUsagePuller = false;
+let usagePullTimeoutMs = USAGE_PULL_TIMEOUT_MS;
 
-/** Test-only: clear the pull throttle between cases. */
-export function _resetUsagePullThrottleForTesting(): void {
+/**
+ * Reject `p` if it has not settled within `ms`. A timed-out pull is NOT
+ * SAMPLED — no row is written, exactly as for a transport error, and still
+ * distinct from the `available: false` row that means "plan limits do not
+ * apply here". Three states: sampled, not applicable, not sampled.
+ */
+export function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    p,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`usage pull exceeded ${ms}ms`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Test-only: clear the pull throttle between cases. `timeoutMs` shortens the
+ * deadline so the hang path is testable without a 10s wait.
+ */
+export function _resetUsagePullThrottleForTesting(timeoutMs: number = USAGE_PULL_TIMEOUT_MS): void {
   lastUsagePullAt = 0;
   warnedNoUsagePuller = false;
+  usagePullTimeoutMs = timeoutMs;
 }
 
 /**
@@ -206,7 +246,7 @@ function samplePlanUsage(q: unknown, account: string | null, now = Date.now()): 
   }
   // Advance BEFORE awaiting so a slow pull can't let a second one stack up.
   lastUsagePullAt = now;
-  void pull()
+  void withDeadline(pull(), usagePullTimeoutMs)
     .then((res) => recordRateLimitSamples(usageResponseToSamples(res, account)))
     .catch((err) => log(`rate-limit usage pull failed (telemetry only): ${err instanceof Error ? err.message : err}`));
 }
