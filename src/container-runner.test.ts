@@ -432,6 +432,7 @@ describe('resolveAnthropicAuth', () => {
     ]);
     expect(auth.apiKeyPrimary).toBe('global-key');
     expect(auth.apiKeyFallbacks).toEqual([{ index: 5, value: 'global-key-5' }]);
+    expect(auth.oauthScoped).toBe(false);
   });
 
   it('returns nothing when neither global nor per-group is set', () => {
@@ -440,6 +441,7 @@ describe('resolveAnthropicAuth', () => {
       oauthFallbacks: [],
       apiKeyPrimary: undefined,
       apiKeyFallbacks: [],
+      oauthScoped: false,
     });
   });
 
@@ -458,6 +460,9 @@ describe('resolveAnthropicAuth', () => {
       { index: 2, value: 'retail-oauth-2' },
       { index: 3, value: 'retail-oauth-3' },
     ]);
+    // Slots are forwarded under unscoped `_N` names, so this flag is the only
+    // signal that this group's slot 2 is a different account from global _2.
+    expect(auth.oauthScoped).toBe(true);
   });
 
   it('filters the OneCLI "placeholder" sentinel from globals', () => {

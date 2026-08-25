@@ -79,15 +79,6 @@ export function getInboundDb(): Database {
 }
 
 /**
- * Configure a newly opened outbound connection.
- *
- * The container is the sole writer across the host/container boundary, but
- * the runner and provider-spawned MCP subprocesses hold separate connections
- * and may write concurrently. Install the busy handler before journal-mode or
- * schema pragmas so first-use initialization waits out a sibling write instead
- * of failing immediately.
- */
-/**
  * Account-level rate-limit utilization samples.
  *
  * Separate from `turn_usage` on purpose: utilization is a property of the
@@ -103,6 +94,29 @@ export function getInboundDb(): Database {
  *
  * Claude-only. Codex and OpenCode expose nothing equivalent, so a read
  * surface over this table must never imply fleet-wide coverage.
+ *
+ * TWO WAYS THESE ROWS ARE NOT COMPARABLE. Both have already fooled a reader.
+ *
+ * 1. ACROSS CREDENTIAL SETS. A group with per-group tokens
+ *    (`CLAUDE_CODE_OAUTH_TOKEN_<FOLDER>` in the host's .env) runs on an
+ *    entirely separate set of Anthropic accounts, and the host forwards those
+ *    under the SAME unscoped `_N` names as the global pool. So `account` alone
+ *    is ambiguous: `credential_set` is what makes it an identity. Two rows are
+ *    the same account series only if BOTH `credential_set` AND `account`
+ *    match. Comparing a scoped group's utilization against a global-pool
+ *    group's is comparing two different accounts, not two burn rates.
+ *
+ * 2. ACROSS LANES WITHIN THE GLOBAL POOL. Which global slots are reserved for
+ *    agents and which are shared with a human's interactive login is INSTALL
+ *    POLICY, not a property of this code — so it is deliberately not encoded
+ *    here. `lane` carries whatever the operator declared for that slot in
+ *    `CLAUDE_CODE_OAUTH_LANES` (e.g. `1:agentic-primary,3:shared-dev`), and is
+ *    NULL when they declared nothing. A slot shared with an interactive
+ *    login legitimately shows utilization that no agent caused. That is
+ *    correct behaviour and must not be "fixed" by excluding the slot: primary
+ *    assignment is not a partition, and failover onto a shared slot is
+ *    deliberate resilience — restricting it turns a soft delay into a hard
+ *    stall until the window resets.
  */
 const RATE_LIMIT_SAMPLES_DDL = `
   CREATE TABLE IF NOT EXISTS rate_limit_samples (
@@ -116,6 +130,13 @@ const RATE_LIMIT_SAMPLES_DDL = `
     -- API-key sessions. Without it, samples from four rotating accounts mix
     -- into one meaningless series.
     account           TEXT,
+    -- Which credential set the account column names: 'global' or 'group:<folder>'.
+    -- NULL means the host did not say (older host, newer container).
+    -- Identity is the PAIR (credential_set, account) — see caveat 1 above.
+    credential_set    TEXT,
+    -- Operator-declared lane for this slot, e.g. 'agentic-primary' or
+    -- 'shared-dev'. NULL = undeclared, which is NOT the same as 'agentic'.
+    lane              TEXT,
     subscription_type TEXT,
     available         INTEGER NOT NULL,
     -- Window: five_hour | seven_day | seven_day_oauth_apps | seven_day_opus.
@@ -132,6 +153,15 @@ const RATE_LIMIT_SAMPLES_DDL = `
   );
 `;
 
+/**
+ * Configure a newly opened outbound connection.
+ *
+ * The container is the sole writer across the host/container boundary, but
+ * the runner and provider-spawned MCP subprocesses hold separate connections
+ * and may write concurrently. Install the busy handler before journal-mode or
+ * schema pragmas so first-use initialization waits out a sibling write instead
+ * of failing immediately.
+ */
 export function configureOutboundDb(outbound: Database): void {
   outbound.exec('PRAGMA busy_timeout = 5000');
   outbound.exec('PRAGMA journal_mode = DELETE');

@@ -43,8 +43,14 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   },
 }));
 
-const { ClaudeProvider, planUsagePuller, usageResponseToSamples, withDeadline, _resetUsagePullThrottleForTesting } =
-  await import('./claude.js');
+const {
+  ClaudeProvider,
+  planUsagePuller,
+  usageResponseToSamples,
+  withDeadline,
+  laneForSlot,
+  _resetUsagePullThrottleForTesting,
+} = await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 const { initTestSessionDb } = await import('../db/connection.js');
 const { getRateLimitSampleRows } = await import('../db/rate-limit-samples.js');
@@ -68,6 +74,8 @@ beforeEach(() => {
 afterEach(() => {
   if (prevHome === undefined) delete process.env.HOME;
   else process.env.HOME = prevHome;
+  delete process.env.NANOCLAW_OAUTH_CREDENTIAL_SET;
+  delete process.env.CLAUDE_CODE_OAUTH_LANES;
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -81,6 +89,7 @@ async function runTurn(env: Record<string, string> = {}): Promise<void> {
 }
 
 const RESULT_MSG = { type: 'result', subtype: 'success', result: 'ok' };
+const NO_IDENTITY = { account: null, credentialSet: null, lane: null };
 
 describe('planUsagePuller — feature detection', () => {
   it('returns null when the SDK query has no usage method (post-rename fleet safety)', () => {
@@ -122,6 +131,23 @@ describe('withDeadline', () => {
   });
 });
 
+describe('laneForSlot', () => {
+  const DECL = '1:agentic-primary,3:shared-dev';
+
+  it('maps the unsuffixed primary to slot 1 and numbered slots to their index', () => {
+    expect(laneForSlot(DECL, 'CLAUDE_CODE_OAUTH_TOKEN')).toBe('agentic-primary');
+    expect(laneForSlot(DECL, 'CLAUDE_CODE_OAUTH_TOKEN_3')).toBe('shared-dev');
+  });
+
+  it('returns null for an UNDECLARED slot rather than guessing a default', () => {
+    // Slot 2 is absent from the declaration. Defaulting it to 'agentic-primary'
+    // would invent a policy claim the operator never made.
+    expect(laneForSlot(DECL, 'CLAUDE_CODE_OAUTH_TOKEN_2')).toBeNull();
+    expect(laneForSlot(undefined, 'CLAUDE_CODE_OAUTH_TOKEN')).toBeNull();
+    expect(laneForSlot(DECL, null)).toBeNull();
+  });
+});
+
 describe('usageResponseToSamples', () => {
   it('emits one row per reported window, normalizing 0-100 to a 0-1 fraction', () => {
     const rows = usageResponseToSamples(
@@ -135,29 +161,39 @@ describe('usageResponseToSamples', () => {
           seven_day_oauth_apps: null,
         },
       },
-      'CLAUDE_CODE_OAUTH_TOKEN_2',
+      { account: 'CLAUDE_CODE_OAUTH_TOKEN_2', credentialSet: 'global', lane: 'agentic-primary' },
     );
     expect(rows.map((r) => [r.limitType, r.utilization])).toEqual([
       ['five_hour', 0.12],
       ['seven_day', 0.635],
       ['seven_day_opus', 0],
     ]);
-    expect(rows.every((r) => r.available && r.account === 'CLAUDE_CODE_OAUTH_TOKEN_2' && r.subscriptionType === 'max')).toBe(
-      true,
-    );
+    expect(
+      rows.every(
+        (r) =>
+          r.available &&
+          r.account === 'CLAUDE_CODE_OAUTH_TOKEN_2' &&
+          r.credentialSet === 'global' &&
+          r.lane === 'agentic-primary' &&
+          r.subscriptionType === 'max',
+      ),
+    ).toBe(true);
     // A 0% window is a real reading and must survive — that is the baseline
     // the event-gated path could never produce.
     expect(rows.some((r) => r.limitType === 'seven_day_opus')).toBe(true);
   });
 
   it('records rate_limits_available:false as NOT APPLICABLE, not as an error or a gap', () => {
-    const rows = usageResponseToSamples({ subscription_type: null, rate_limits_available: false, rate_limits: null }, null);
+    const rows = usageResponseToSamples(
+      { subscription_type: null, rate_limits_available: false, rate_limits: null },
+      NO_IDENTITY,
+    );
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ available: false, limitType: null, utilization: null, resetsAt: null });
   });
 
   it('still records that a pull happened when the plan reports no usable window', () => {
-    const rows = usageResponseToSamples({ rate_limits_available: true, rate_limits: { five_hour: null } }, null);
+    const rows = usageResponseToSamples({ rate_limits_available: true, rate_limits: { five_hour: null } }, NO_IDENTITY);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ available: true, limitType: null, utilization: null });
   });
@@ -172,6 +208,9 @@ describe('capture through the provider', () => {
       rate_limits: { five_hour: { utilization: 7, resets_at: '2026-08-25T18:00:00.000Z' } },
     };
 
+    process.env.NANOCLAW_OAUTH_CREDENTIAL_SET = 'global';
+    process.env.CLAUDE_CODE_OAUTH_LANES = '1:agentic-primary,3:shared-dev';
+
     await runTurn({ CLAUDE_CODE_OAUTH_TOKEN: 'tok-primary' });
 
     const rows = getRateLimitSampleRows();
@@ -179,6 +218,8 @@ describe('capture through the provider', () => {
     expect(rows[0]).toMatchObject({
       source: 'usage_pull',
       account: 'CLAUDE_CODE_OAUTH_TOKEN',
+      credential_set: 'global',
+      lane: 'agentic-primary',
       subscription_type: 'max',
       available: 1,
       limit_type: 'five_hour',
@@ -186,6 +227,24 @@ describe('capture through the provider', () => {
       resets_at: '2026-08-25T18:00:00.000Z',
       status: null,
     });
+  });
+
+  it('distinguishes a per-group credential set from the global pool on the SAME slot name', async () => {
+    // The misread this exists to prevent: a scoped group's tokens are
+    // forwarded under the same unscoped `_N` names as the global pool, so
+    // `account` alone makes two different Anthropic accounts look like one
+    // series. Only (credential_set, account) is an identity.
+    sdkMessages.push({ type: 'system', subtype: 'init', session_id: 's1' }, RESULT_MSG);
+    usageResponse = { rate_limits_available: true, rate_limits: { seven_day: { utilization: 40, resets_at: null } } };
+    process.env.NANOCLAW_OAUTH_CREDENTIAL_SET = 'group:scoped-group';
+    process.env.CLAUDE_CODE_OAUTH_LANES = '1:agentic-primary,3:shared-dev';
+
+    await runTurn({ CLAUDE_CODE_OAUTH_TOKEN: 'tok-scoped' });
+
+    const rows = getRateLimitSampleRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].account).toBe('CLAUDE_CODE_OAUTH_TOKEN'); // same slot name as a global-pool row
+    expect(rows[0].credential_set).toBe('group:scoped-group'); // ...but a different account set
   });
 
   it('degrades to event-only capture when the SDK has no usage method, and the turn still completes', async () => {

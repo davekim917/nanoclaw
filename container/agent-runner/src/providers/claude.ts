@@ -13,7 +13,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
-import { recordRateLimitSamples, type RateLimitSample } from '../db/rate-limit-samples.js';
+import { recordRateLimitSamples, type AccountIdentity, type RateLimitSample } from '../db/rate-limit-samples.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
@@ -111,6 +111,28 @@ interface SdkUsageResponse {
   rate_limits?: Record<string, SdkUsageWindow | null | undefined> | null;
 }
 
+/**
+ * Operator-declared lane for an OAuth slot, from `CLAUDE_CODE_OAUTH_LANES`
+ * (`"1:agentic-primary,3:shared-dev"` — slot number, then label).
+ *
+ * Which slots are reserved for agents and which are shared with a human's
+ * interactive login is INSTALL POLICY, not a fact about this code, so it is
+ * declared in the operator's `.env` and never hardcoded here. An undeclared
+ * slot returns null, which means "undeclared" — not "agentic".
+ *
+ * ponytail: parsed per call on a two-entry string, at most once per turn.
+ */
+export function laneForSlot(declaration: string | undefined, slotName: string | null): string | null {
+  if (!declaration || !slotName) return null;
+  const slot = slotName === 'CLAUDE_CODE_OAUTH_TOKEN' ? '1' : (OAUTH_FALLBACK_RE.exec(slotName)?.[1] ?? null);
+  if (!slot) return null;
+  for (const entry of declaration.split(',')) {
+    const [n, ...rest] = entry.split(':');
+    if (n.trim() === slot && rest.length > 0) return rest.join(':').trim() || null;
+  }
+  return null;
+}
+
 const USAGE_CONTROL_METHOD = 'usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET';
 
 /**
@@ -142,10 +164,10 @@ export function planUsagePuller(q: unknown): (() => Promise<SdkUsageResponse>) |
  * as a null reading. If that leaves nothing, one `available: true` row with
  * no window still records that the pull happened.
  */
-export function usageResponseToSamples(res: SdkUsageResponse, account: string | null): RateLimitSample[] {
+export function usageResponseToSamples(res: SdkUsageResponse, who: AccountIdentity): RateLimitSample[] {
   const base = {
     source: 'usage_pull' as const,
-    account,
+    ...who,
     subscriptionType: res.subscription_type ?? null,
     status: null,
   };
@@ -232,7 +254,7 @@ export function _resetUsagePullThrottleForTesting(timeoutMs: number = USAGE_PULL
  * failed usage call must never delay or fail the turn it was sampled from —
  * this is telemetry, not correctness.
  */
-function samplePlanUsage(q: unknown, account: string | null, now = Date.now()): void {
+function samplePlanUsage(q: unknown, who: AccountIdentity, now = Date.now()): void {
   if (now - lastUsagePullAt < USAGE_PULL_MIN_INTERVAL_MS) return;
   const pull = planUsagePuller(q);
   if (!pull) {
@@ -247,7 +269,7 @@ function samplePlanUsage(q: unknown, account: string | null, now = Date.now()): 
   // Advance BEFORE awaiting so a slow pull can't let a second one stack up.
   lastUsagePullAt = now;
   void withDeadline(pull(), usagePullTimeoutMs)
-    .then((res) => recordRateLimitSamples(usageResponseToSamples(res, account)))
+    .then((res) => recordRateLimitSamples(usageResponseToSamples(res, who)))
     .catch((err) => log(`rate-limit usage pull failed (telemetry only): ${err instanceof Error ? err.message : err}`));
 }
 
@@ -2018,6 +2040,14 @@ export class ClaudeProvider implements AgentProvider {
     // subprocess is started with this query's env, so the slot is fixed for
     // the life of the query even if the ring advances afterwards.
     const oauthSlot = this.oauthRing[this.oauthRingPos]?.name ?? null;
+    // The slot name alone is ambiguous: scoped per-group tokens are forwarded
+    // under the same `_N` names as the global pool, so identity is the PAIR
+    // (credentialSet, account). `lane` is operator-declared install policy.
+    const who: AccountIdentity = {
+      account: oauthSlot,
+      credentialSet: process.env.NANOCLAW_OAUTH_CREDENTIAL_SET ?? null,
+      lane: laneForSlot(process.env.CLAUDE_CODE_OAUTH_LANES, oauthSlot),
+    };
 
     const sdkResult = sdkQuery({
       prompt: stream,
@@ -2240,7 +2270,7 @@ export class ClaudeProvider implements AgentProvider {
           lastRateLimitInfo = undefined; // scoped to the turn that just closed
           // Throttled, fire-and-forget: samples plan utilization for THIS
           // account whether or not the SDK had anything to warn about.
-          samplePlanUsage(sdkResult, oauthSlot);
+          samplePlanUsage(sdkResult, who);
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'rate_limit_event') {
@@ -2253,7 +2283,7 @@ export class ClaudeProvider implements AgentProvider {
           recordRateLimitSamples([
             {
               source: 'rate_limit_event',
-              account: oauthSlot,
+              ...who,
               subscriptionType: null,
               available: true,
               limitType: info?.rateLimitType ?? null,
