@@ -27,6 +27,7 @@ import {
   parseArchivePermalinks,
   queryArchiveExactLinks,
   readMemoryCurationEpisodeMessages,
+  recentConversationSenderNames,
   recordAcceptedGeneratedMemory,
   recordMemoryCurationCall,
   selectMemoryCurationCredential,
@@ -207,6 +208,39 @@ describe('archive retrieval helpers', () => {
     expect(
       queryArchiveExactLinks({ memberAgentGroupIds: ['ag-a'], normalizedContent: query, candidateLimit: 10 }),
     ).toEqual([]);
+  });
+
+  // idx_archive_conv_recent lets the planner satisfy `ORDER BY sent_at DESC,
+  // id DESC` by walking the index instead of temp-B-tree sorting. That is only
+  // result-preserving because `id` is a UNIQUE primary key, which makes the
+  // tie-break total — sent_at alone is not (47k duplicated values on the live
+  // archive). Pin the ordering under duplicate sent_at so a future index or
+  // ORDER BY edit that drops the tie-break fails here.
+  it('orders sender recall by the total (sent_at, id) key when sent_at ties', () => {
+    for (const id of ['m-b', 'm-a', 'm-c']) {
+      upsertArchiveMessage({
+        id,
+        agentGroupId: 'ag-a',
+        messagingGroupId: 'mg-tie',
+        channelType: 'discord',
+        channelName: 'room',
+        platformId: 'discord:g:c',
+        threadId: 'discord:g:c:t',
+        role: 'user',
+        senderId: `discord:${id}`,
+        senderName: `Sender ${id}`,
+        text: `tie ${id}`,
+        sentAt: '2026-07-25T00:00:05.000Z',
+      });
+    }
+
+    expect(
+      recentConversationSenderNames({
+        memberAgentGroupIds: ['ag-a'],
+        messagingGroupId: 'mg-tie',
+        threadId: 'discord:g:c:t',
+      }),
+    ).toEqual(['Sender m-c', 'Sender m-b', 'Sender m-a']);
   });
 });
 

@@ -101,6 +101,34 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_archive_fingerprint
       ON messages_archive(agent_group_id, role, channel_type, sent_at);
 
+    -- Pre-turn sender recall (recentConversationSenderNames, once per turn).
+    -- Without it the planner falls back to idx_archive_fingerprint, whose
+    -- leading agent_group_id constraint matches ~half the table for a
+    -- multi-member workgroup, then temp-B-tree sorts all of it for a LIMIT
+    -- 100. Column order is load-bearing in three parts:
+    --   messaging_group_id, role  — the two real equalities, most selective
+    --     first: on the live archive a messaging group holds a median 252 /
+    --     mean 1,735 / max 11,294 of the 145,752 rows, where role='user'
+    --     alone matches 123,423.
+    --   sent_at, id               — the ORDER BY, in order, so the LIMIT walks
+    --     the index backwards instead of sorting. id is the UNIQUE primary
+    --     key, which is what makes that ordering total and the plan swap
+    --     result-preserving; sent_at alone ties on 47k live values.
+    --   agent_group_id, thread_id, sender_name — after the sort columns, to
+    --     make the index covering. The residual filters (member scope, thread)
+    --     are not index constraints, so without these every walked entry costs
+    --     a table lookup: dropping the three trailing columns costs 19ms vs
+    --     2.1ms on the busiest illysium messaging group, and the planner
+    --     reports plain INDEX instead of COVERING INDEX.
+    -- Measured against a copy of the 309MiB / 145,752-row live archive, six
+    -- illysium member agent groups: 134ms -> 2.1ms, identical for a hot thread
+    -- and for a fresh thread whose rows do not exist. Index costs +24.3MiB and
+    -- ~1.4-2.0s to build; archive INSERT p50 is unchanged (7.5ms -> 6.5ms,
+    -- within noise — the TRUNCATE-journal fsync dominates the write).
+    CREATE INDEX IF NOT EXISTS idx_archive_conv_recent
+      ON messages_archive(messaging_group_id, role, sent_at, id,
+                          agent_group_id, thread_id, sender_name);
+
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_archive_fts USING fts5(
       text,
       sender_name,
