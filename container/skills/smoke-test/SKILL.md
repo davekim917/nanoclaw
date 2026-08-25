@@ -72,10 +72,28 @@ returns `ready:false` forever while the run proceeds on self-discipline,
 reporting a governed posture it does not have. That is not hypothetical: it
 is what happened on 2026-08-07.
 
+**The contract and `markers/` are coordinator-owned, and the scaffold enforces
+that, not the briefs.** Every invocation checks two things and fails closed on
+both:
+
+1. **`SMOKE_LANE_ROLE`** must name the writing worker's role, and only
+   `coordinator` may write. Brief every worker on both sides with its role
+   exported; an unset role is refused. That is the safe direction — a missing
+   marker is loud (the barrier names it in `missing[]`), a wrongly attributed
+   one is silent. Challenger output goes under `challenger/`, and the barrier
+   never waits on it.
+2. **The run must still hold the gate.** The scaffold reads
+   `$SMOKE_GATE_STATE_DIR` and requires the run directory's basename to be some
+   state file's current `activeRunId`. A reclaim or a `--takeover` flips that
+   field and nothing else, so without this check a displaced coordinator keeps
+   writing markers into the run tree its successor is now using. Both variables
+   must therefore be in every dispatched worker's environment.
+
 Before dispatch, the coordinator writes the contract with the frozen SHA and
 every lane it is committing to:
 
 ```bash
+SMOKE_LANE_ROLE=coordinator \
 bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh contract \
   <run-dir> <source-sha> B1:browser:'Program master' S1:source:'Fund ledger' ...
 ```
@@ -83,9 +101,14 @@ bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh contract \
 Each worker writes its own marker only after its evidence is durable:
 
 ```bash
+SMOKE_LANE_ROLE=coordinator \
 bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh marker \
   <run-dir> <lane-id> <pass|fail|blocked|void|completed> '<summary>' '<evidence,paths>'
 ```
+
+`does not hold the gate` from either verb means **this campaign is over**. Stop
+every lane, write nothing further, and do not publish — a successor run owns
+the environment.
 
 The marker takes its `sourceSha` from the contract, never from the caller, so
 a worker cannot certify a build it was not assigned — and an undeclared lane
@@ -170,6 +193,27 @@ Resolve the remote default branch rather than assuming `main`. Fetch the target,
 record its full SHA, and confirm that the dev deployment serves that SHA. If the
 deployed SHA cannot be proved, report the run as `BLOCKED_BUILD_IDENTITY`; do not
 attach a confident verdict to an unknown build.
+
+**Prove build identity with `scripts/smoke-build-identity.sh`, not a browser.**
+Fetching the served bundle and grepping it for the expected backend host used
+to be hand-driven browser work repeated on every campaign — deterministic work
+burned as LLM browser time. Run it once the frontend and backend previews are
+both live:
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-build-identity.sh <frontend-base-url> <backend-base-url>
+```
+
+It fetches the served HTML, extracts the hashed JS bundle, confirms the
+expected backend host appears in it and no configured stale host does
+(`SMOKE_BUILD_ID_STALE_HOSTS`), and separately curls the backend's own
+`/healthz` to prove it is reachable and bound — not just that the frontend
+happens to serve. That last check is the one that would have caught a real
+2026-08 run: a frontend that served fine while its API host resolved to
+nothing, which cost the coordinator three discarded browser lanes and zero
+coverage. **Browser lanes must not start if this script
+exits non-zero.** Treat that exit as `BLOCKED_BUILD_IDENTITY` and stop — do not
+dispatch the UI adversary or backend verifier lanes against an unproven build.
 
 A scheduled run arrives with the head already proven settled by the gate. A
 campaign someone asked for in chat does not, and must prove it before freezing
@@ -263,13 +307,50 @@ This has teeth only when the seats are real. Requirements:
   everything, nothing will error, and the run will look clean. That appearance
   is the failure mode this section exists to prevent.
 
-## 3. Run two independent provider-native lanes
+### Skip a browser check only when this campaign's own spec already proved it
+
+Before assigning a manifest ID to a browser check, ask whether a source lane
+in this same campaign already names and runs an automated spec that asserts
+the exact same claim — the coordinator does not need to go looking for this;
+its own source-lane assignments are where the answer already lives. Skip the
+browser check, and record the skip on the manifest with a one-line note
+naming the covering spec, only when both hold:
+
+1. a source lane names a spec file/test whose assertion is the same claim the
+   browser check would otherwise exercise; and
+2. that spec ran green in this campaign, on the frozen build — not a stale
+   prior run, and not CI on a different SHA (see the CI-reuse rule under
+   "Backend and specification verifier" below).
+
+**The counter-rule is as binding as the rule.** A browser check is never
+redundant when the claim is something a green spec cannot see:
+
+- **composition** — whether the whole connected flow works end to end, not
+  whether one function returns the right value in isolation;
+- **visual/layout** — spacing, contrast, overflow, responsive behavior;
+- **deploy identity** — whether the browser is actually exercising the build
+  under test.
+
+The spec layer is known to lie on exactly these claims: one map-canvas test
+has been observed passing green against both a working and a broken
+implementation of the feature it names, and a dead hover tooltip shipped
+"fixed" and green three consecutive campaigns before a browser lane caught it.
+This rule skips only a check that re-asserts a spec's own assertion — never a
+check that tests something the spec cannot see. Measured duplication varies
+with how spec-shaped the changed surface is (as high as 81% of checks for a
+backend seam that ships its own specs, as low as 31% for frontend composition
+work), so apply the two conditions above per check, never as a blanket cut to
+the browser lane.
+
+## 3. Run the provider-native lanes
 
 Use different model families for diversity. The coordinator assigns bounded
-coverage slices to native Sonnet workers. The challenger assigns independent
-replays and attacks to native Luna workers. More workers usually add
-coordination cost before they add signal, so every assignment must name
-non-overlapping manifest IDs.
+coverage slices to native Sonnet workers — one lane for the diff-derived
+manifest (backend and specification verifier), one for stated intent
+(acceptance verifier). The challenger assigns independent replays and attacks
+to native Luna workers (UI adversary). More workers usually add coordination
+cost before they add signal, so every assignment must name non-overlapping
+manifest IDs.
 
 ### UI adversary
 
@@ -351,8 +432,22 @@ The coordinator normally assigns this lane to a native Claude Sonnet 5 worker
 at xhigh effort.
 
 - Trace the changed source and its production-relevant call path.
-- Run focused tests first, then the full relevant suite. Record exact commands,
-  SHA, counts, failures, skips, duration, and environment limitations.
+- **Read the CI check-run result for the frozen SHA before re-running a suite
+  CI already ran.** Query the check runs for that exact SHA (e.g.
+  `gh api repos/<repo>/commits/<sha>/check-runs`, or the platform equivalent)
+  and cite the conclusion, counts, and run URL as evidence — that is proof,
+  not a placeholder for it. Re-run a suite only when you can name which
+  exception applies: the CI result is for a different SHA than the frozen
+  build; the suite is path-filtered and CI's check list shows it did not run
+  at all for this diff; or this is a focused re-run of one file/test to
+  investigate a specific failure CI already reported. No stated exception, no
+  re-run — typing `npm run test:unit` / `test:integration` (or an equivalent
+  full-suite vitest pass) on a SHA whose CI already ran it green produces zero
+  new evidence for real cost.
+- When a re-run is warranted — a stated exception above applies, or new tests
+  were written during `fix` mode that CI has not yet seen — run focused tests
+  first, then the full relevant suite. Record exact commands, SHA, counts,
+  failures, skips, duration, and environment limitations.
 - Test the error path, boundary inputs, authorization, persistence, and rebuild
   or async-completion barriers—not only the happy path.
 - For business math, prove both the independent calculation and the actual
@@ -365,10 +460,85 @@ at xhigh effort.
   presentation of incomplete data as a product finding when the UI makes it look
   complete. Never blame the frontend for fields absent from the served payload.
 
-The two lanes may share specifications, never conclusions. Each writes its own
-evidence before seeing the other's verdict. The challenger must also sample
-checks that passed, not only reported failures; otherwise it cannot challenge
-false clears.
+### Acceptance verifier
+
+The coordinator normally assigns this lane to a native Claude Sonnet 5 worker
+at xhigh effort, the same tier as the backend lane. Declare it in the contract
+like any other lane (e.g. `A1:acceptance:'Forecast column dash rendering'`) so
+its marker gates synthesis the same way every other lane's does.
+
+Every other lane in this skill scopes from the diff — files changed, source
+touched, controls added. This lane scopes from stated intent instead, and
+that source must never be the diff:
+
+- **Read the PR body and any linked or closing issue in full**, not the diff.
+  A findings issue's expected/actual fields are a second independent intent
+  source when one exists.
+- **Extract every stated, user-visible claim** — something a person could
+  observe in the running product (a value that renders differently, a state
+  that becomes reachable, an error that becomes possible). Quote the source
+  line for each claim in the run record.
+- **Exclude implementation statements.** "Now uses a row lock," "refactored to
+  share the helper," "added an index" describe how, not what a user sees —
+  they are not acceptance criteria and belong to the backend lane's source
+  trace, not here.
+
+Verify each claim against the running dev build and record exactly one of
+four verdicts, one row per claim:
+
+| Verdict | Meaning |
+|---|---|
+| `met` | observed in the running app, evidence attached |
+| `not met` | observed to be false — this is a finding; route it through §4 |
+| `not demonstrable` | the claim is real but this environment/data cannot exercise it (no seeded case exists, the branch is unreachable here) — a first-class outcome, never a silent pass |
+| `claim absent` | the PR states no user-visible claims (refactor, dependency bump) |
+
+One screenshot per claim, not per interaction — this lane proves the claim,
+it does not re-run the UI adversary's coverage.
+
+**Anti-ceremony, same standard as the posting-contract rule above:**
+
+- A PR with no user-visible claims produces a one-line `claim absent` result.
+  Do not manufacture a claim to look busy, and do not pad the table with
+  implementation statements reclassified as user-visible.
+- `not met` findings route through §4 like any other finding. `claim absent`
+  is not a finding and needs no challenge.
+- The lane's output is the claim table. No narration, no restating the PR, no
+  summary of "what the PR was about" — the reader can read the PR themselves.
+
+**Checkable after the fact:** every row's quoted source line must appear
+verbatim in the PR body or linked issue — a claim without a quote is
+fabricated scope, not evidence. Every `met`/`not met` row must carry an
+attached screenshot; a bare verdict is not a verified one. Compare the claim
+table's row count against a manual reread of the PR/issue: a claim present in
+the text but missing from the table is a silently dropped claim, and the lane
+failed at extraction even when every listed row is honest.
+
+**This lane runs in addition to the diff-derived lanes above, never instead
+of them.** A claim nobody wrote in the PR or issue cannot be extracted, so
+this lane has a blind spot the seam lanes cover — a defect never promised as
+behavior (a broken button nobody claimed would work) is exactly what the UI
+adversary and backend verifier exist to catch. The reverse blind spot is
+theirs: a diff-derived manifest never asks whether the feature does what it
+was asked to do, only whether the code is internally coherent, which is the
+gap this lane exists to close. Neither lane substitutes for the other, and
+neither should be cut in the name of simplifying the manifest.
+
+**`not demonstrable` never rounds up to a pass.** A claim nobody could
+confirm is not evidence the feature works; it is evidence the run cannot say.
+Never call the run `PASS` while one is open — at most `PASS_WITH_GAPS`, with
+the claim named on the report's Untested line. Apply the escalation
+conditions in §5 to decide whether it needs more than that: a claim whose
+absence of proof concerns data correctness or another P0/P1 surface is not
+merely untested, it is exactly the "nobody knows if this is safe" case
+`HUMAN_DECISION` exists for (§8) — raise it rather than letting an unprovable
+claim quietly ship as `GO`. A low-stakes claim (a rarely hit empty state,
+cosmetic copy) can stay at `PASS_WITH_GAPS` without escalation.
+
+All three lanes may share specifications, never conclusions. Each writes its
+own evidence before seeing another lane's verdict. The challenger must also
+sample checks that passed — including acceptance claims marked `met` — not
+only reported failures; otherwise it cannot challenge false clears.
 
 ## 4. Challenge every candidate finding
 
@@ -500,7 +670,7 @@ human reads never shows a bare token — it shows the translation:
 | `BLOCKED` | ⛔ Could not test honestly |
 | `GO` | Safe to ship |
 | `NO_GO` | Do not ship this build |
-| `HUMAN_DECISION` | Needs a human call |
+| `HUMAN_DECISION` | Needs a human call — **holds promotion until answered** |
 | `CLEAR` (challenger) | ✅ Challenge found no material contradiction |
 | `DISSENT` (challenger) | ⚠️ Challenge disputes specific findings |
 | `BLOCKED` (challenger) | ⛔ Challenge could not verify |
@@ -558,11 +728,35 @@ settle and the live frontend and backend deploy commits (read from the Render
 API; adapt the wrapper's env or the fetch block for other deploy hosts) to
 equal the exact branch SHA across two observations before it wakes. It records
 candidate, active, and completed SHAs in the agent workspace, refuses
-duplicates, and reclaims an abandoned active run through two independent
-signals: a liveness window (no `progress` stamp for 30 minutes,
-`SMOKE_GATE_PROGRESS_STALE_SECONDS`) and a hard age ceiling (4 hours,
-`SMOKE_GATE_ACTIVE_STALE_SECONDS`). A container killed mid-run simply stops
+duplicates, and reclaims an abandoned active run on exactly one signal: the
+liveness window (no `progress` stamp for 30 minutes,
+`SMOKE_GATE_PROGRESS_STALE_SECONDS`). A container killed mid-run simply stops
 stamping, so the gate recovers the SHA on the next poll past the window.
+
+**A run that is still stamping keeps its slot, however long it has run.** The
+hard age ceiling (4 hours, `SMOKE_GATE_ACTIVE_STALE_SECONDS`) used to override
+liveness, and that produced two coordinators on one campaign: the ceiling
+expired, the next poll started a rival on the same PR and the same frozen SHA,
+and nothing told the original — which kept dispatching lanes, mutating the same
+seat, and writing into the same run tree for hours. Past the ceiling the gate
+now *refuses* new claims and names the overrun in `activeAgeSeconds`; a human
+who has confirmed the prior coordinator is stopped can force the slot with
+`claim … --takeover`. No automatic path passes that flag.
+
+**The ceiling still rings — it was demoted from executioner to alarm.** Crossing
+it wakes an agent once per overrun run (`pr_run_overrun` /
+`develop_run_overrun`, carrying `runId` and `activeAgeSeconds`), with no rival
+claim required. The case worth catching is a **zombie stamper**: a coordinator
+whose heartbeat fires while its work is wedged in a retry loop, a stuck lane, or
+a hung browser. On that wake, check whether the run is actually progressing —
+lane markers landing, evidence files growing — and if it is not, stop its
+coordinator and take the slot with `--takeover`.
+
+**A `--takeover` does not stop the incumbent; it only stops it from *counting*.**
+The gate records who it displaced, so the displaced run's next `progress`,
+`release`, or `finish` returns `STOP THIS CAMPAIGN` naming the takeover instead
+of a generic refusal. Until that call happens the old container is still running
+— someone must stop it.
 
 The coordinator must therefore stamp liveness — after the freeze, then at
 least every 15 minutes while lanes run:
@@ -713,13 +907,28 @@ Two further wrapper-optional artifacts and behaviours:
     Nothing in the fleet could distinguish "the product is broken" from "the
     tester cannot log in".
 
-When `SMOKE_GATE_HOLD_FILE` is set, `finish` additionally maintains an
-explicit, default-open block flag for promotion gating: a `NO_GO` verdict
-writes the file, a later `GO` removes it, and `BLOCKED`/`HUMAN_DECISION`
-leave it untouched (an infra-blocked run neither raises a false hold nor
-clears a real one). Downstream rule: flag present → automatic hold on
-promotion; flag absent → no smoke objection. Absence semantics make rollout
-safe — history predating the smoke watcher never gates anything.
+When `SMOKE_GATE_HOLD_FILE` is set, `finish` additionally maintains an explicit
+block flag for promotion gating:
+
+| Verdict | Hold file | `reason` |
+|---|---|---|
+| `NO_GO` | raised | `confirmed defects on this develop lineage …` |
+| `HUMAN_DECISION` | **raised** | `needs_human_decision` |
+| `GO` | removed | — |
+| `BLOCKED` | untouched | — |
+
+`HUMAN_DECISION` raises the hold as of 2026-08-25; it used to leave it alone.
+A verdict whose literal meaning is "the system does not know whether this is
+safe" cannot default open — that made it behave as `GO` on precisely the cases
+flagged as needing judgment. A stalled queue is the correct consequence of
+requiring a decision, and `reason` tells the release desk "somebody has to
+choose" apart from "we found bugs". `BLOCKED` is unchanged: an infra-blocked run
+asserts nothing about the build, so it neither raises a false hold nor clears a
+real one.
+
+Downstream rule: flag present → automatic hold on promotion; flag absent → no
+smoke objection. Absence semantics make rollout safe — history predating the
+smoke watcher never gates anything.
 
 On every terminal verdict, the coordinator closes the gate atomically:
 
@@ -745,6 +954,21 @@ budget; the challenger posts from interactive sessions woken by mention, which
 the budget never sees at all. So this caps streaming narration, not the total
 volume of a run — the coordinator/challenger exchange has to be bounded by the
 posting contract itself.
+
+**The posting contract itself:** every post to the run thread must carry
+information nobody in the thread already has — new evidence becoming durable,
+a lane completing, a verdict, or a decision the reader must act on. Acks,
+restating a contract or plan just written, announcing what you are about to do
+before doing it, and progress narration ("lane B1 is still running, barrier is
+short three markers") are defects, not diligence — whether posted by the
+coordinator, the challenger, or a worker relaying through either. The
+legitimate posts for one run are exactly the ones already named above: the
+root post, one reply per browser lane whose evidence became durable, the
+verdict, and the fix hand-off. Nothing else earns a message; put it in the
+final report instead, or not at all. This is checkable after the fact without
+reading intent: count the thread's posts and subtract one for the root, one
+per browser lane, one for the verdict, and one per fix hand-off — anything
+left over is narration that should not have posted.
 
 Run a changed-surface `audit` for each settled develop SHA. Any user-visible
 change must include a real-browser frontend lane even when the diff looks
@@ -781,6 +1005,13 @@ if run ids are unique across the whole gate, not just within one PR, so
 `claim` enforces it: it refuses a run id that is already active on a
 *different* PR, so a caller-chosen id (from `claim`) is always safe to pass
 to `progress`/`release`/`finish` exactly like a gate-generated one.
+
+`claim` also refuses a *new* run id on a PR whose current run is still
+stamping `progress` — same PR and same frozen SHA included, which is precisely
+how a rival campaign once displaced a live coordinator. Only a human passing
+`--takeover`, and only once the active run is past
+`SMOKE_GATE_ACTIVE_STALE_SECONDS`, can override that; the success line then
+carries `tookOverFrom`. `poll` never takes over.
 
 A PR settles when: it is open and carries `SMOKE_GATE_LABEL` (default
 `render-preview`); its backend preview exists, is `live`, and its deploy
@@ -852,6 +1083,39 @@ freeze-run hold from ever reading as `gate_hold_tampered`. **All three
 PR-gate vars and develop-gate handoff mode must be set together in the same
 deployment's wrappers** — any one missing silently breaks the tamper-shield,
 not just the publish/hold write.
+
+## Evidence retention
+
+Run evidence is never pruned automatically by anything in this skill. Nothing
+here schedules `scripts/smoke-evidence-retention.sh` — deploy it as a periodic
+task (e.g. weekly `ncl tasks`) if the run root is expected to grow unbounded,
+which it otherwise will: screenshots and clips accumulate per lane per run
+with nothing to bound them.
+
+The script prunes media (screenshots, clips, other binaries — by extension)
+older than `SMOKE_RETENTION_MEDIA_DAYS` (default 14). The markdown/JSON record
+(`run-record.md`, lane files, markers, manifests, dispositions, verdicts) is
+the audit trail and survives independently — forever unless
+`SMOKE_RETENTION_RECORD_DAYS` is explicitly set to also remove the whole run
+directory past that age. It never touches a run that is currently active (per
+the gate's own state), or one named by the current published verdict, the
+current promotion hold, or a recent handoff-ledger entry — see the script's
+header comment for the exact protection rule.
+
+**It is dry-run by default.** Run it without `--delete` first and read the
+JSON report — `runsPruned`, `mediaBytes`, `oldestAffectedRun`/
+`newestAffectedRun`, and the `affected` array name exactly what a real run
+would remove. Only pass `--delete` once that looks right.
+
+```bash
+bash /app/skills/smoke-test/scripts/smoke-evidence-retention.sh <run-root>            # dry run
+bash /app/skills/smoke-test/scripts/smoke-evidence-retention.sh <run-root> --delete   # actually prune
+```
+
+Evidence that matters past the media window — a confirmed finding a fix PR
+still references, a disputed verdict — belongs in long-term storage outside
+this run root, not in an extended local retention window. That archival path
+is not implemented by this script; it is a separate, later decision.
 
 ## Cost controls
 

@@ -152,19 +152,82 @@ bash "$GATE" poll | jq -e '
   .wakeAgent == false and .data.trigger == "already_active"
 ' >/dev/null
 
-# 13. Hard ceiling wins over a fresh stamp.
+# 13. CONTRACT REVERSED 2026-08-25: the hard ceiling no longer wins over a
+# fresh stamp. It used to — this test asserted the reclaim — and that WAS the
+# duplicate-coordinator fault. A coordinator stamping `progress` every few
+# minutes went "not live" the instant it crossed ACTIVE_STALE_SECONDS, the next
+# poll handed its environment to a rival, and nothing told the first: it kept
+# dispatching lanes and mutating the same seat for hours. The PR gate's
+# identical code displaced a live run at 4h00m03s past its claim, three seconds
+# past the ceiling, and that campaign never published a verdict at all.
+#
+# Liveness is now the progress stamp alone. Overrun makes a run REFUSE new
+# claims, with an explicit human `--takeover` as the only override. Nothing
+# automatic — no poll, ever — can produce a second campaign on one environment.
 ANCIENT="$(date -u -d '@'$(( $(date -u +%s) - 15000 )) +'%Y-%m-%dT%H:%M:%SZ')"
 jq --arg t "$ANCIENT" '.activeStartedAt=$t' "$STATE_FILE" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
 bash "$GATE" progress "$RUN_ID2" | jq -e '.ok == true' >/dev/null
-bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null   # debounce after stale
+# The ceiling still RINGS — it just no longer kills. A zombie stamper (heartbeat
+# alive, work wedged) is now surfaced by an alarm rather than by silently
+# spawning a rival campaign. Once per overrun run, then latched.
+bash "$GATE" poll | jq -e --arg run "$RUN_ID2" '
+  .wakeAgent == true and .data.trigger == "develop_run_overrun" and
+  .data.runId == $run and .data.activeAgeSeconds >= 14400
+' >/dev/null
 bash "$GATE" poll | jq -e '
-  .wakeAgent == true and .data.recovery == true
+  .wakeAgent == false and .data.trigger == "already_active"
+' >/dev/null
+[ "$(jq -r '.activeRunId' "$STATE_FILE")" = "$RUN_ID2" ]
+# A rival claim is refused and told how a human forces the issue.
+bash "$GATE" claim run-rival "$BUILD_SHA" | jq -e --arg active "$RUN_ID2" '
+  .ok == false and .activeRunId == $active and (.error | test("--takeover"))
+' >/dev/null
+[ "$(jq -r '.activeRunId' "$STATE_FILE")" = "$RUN_ID2" ]
+# --takeover past the ceiling works, and the displacement is LOUD: the gate
+# cannot kill the incumbent's container, so the displaced run's next gate verb
+# is the only channel that reaches it and must say stop, not just "not active".
+bash "$GATE" claim run-takeover "$BUILD_SHA" --takeover | jq -e '.ok == true' >/dev/null
+jq -e --arg prev "$RUN_ID2" '.displacedRunId == $prev and .displacedAt != null' "$STATE_FILE" >/dev/null
+for VERB in progress release finish; do
+  case "$VERB" in
+    finish) OUT="$(bash "$GATE" finish "$BUILD_SHA" "$RUN_ID2" GO)" ;;
+    *)      OUT="$(bash "$GATE" "$VERB" "$RUN_ID2")" ;;
+  esac
+  jq -e --arg by run-takeover '
+    .ok == false and (.error | test("STOP THIS CAMPAIGN")) and
+    (.error | test("--takeover")) and .activeRunId == $by and .displacedAt != null
+  ' <<<"$OUT" >/dev/null || { echo "expected $VERB to hand the displaced run a stop instruction, got: $OUT" >&2; exit 1; }
+done
+# An unrelated stale run id still gets the ordinary refusal, not a stop order.
+bash "$GATE" progress some-other-run | jq -e '
+  .ok == false and (.error | test("not the active run")) and (.error | test("STOP") | not)
+' >/dev/null
+# An ordinary (non-takeover) claim clears the name, so it can never mis-accuse.
+bash "$GATE" release run-takeover >/dev/null
+bash "$GATE" claim run-clean "$BUILD_SHA" >/dev/null
+jq -e '.displacedRunId == null and .displacedAt == null' "$STATE_FILE" >/dev/null
+bash "$GATE" release run-clean >/dev/null
+bash "$GATE" claim run-takeover "$BUILD_SHA" >/dev/null
+# An explicit --takeover works below the ceiling too — see the matching note in
+# the PR gate test. A BARE claim below the ceiling is still refused; only the
+# deliberate flag gets through.
+bash "$GATE" claim run-too-soon "$BUILD_SHA" --takeover | jq -e '
+  .ok == true and .runId == "run-too-soon"
+' >/dev/null
+# The displacement IS recorded in state (this gate's claim output has no
+# tookOverFrom field the way the PR gate's does — the state file is where the
+# displaced run's next verb reads it from).
+jq -e '.displacedRunId == "run-takeover"' "$STATE_FILE" >/dev/null
+bash "$GATE" release run-too-soon >/dev/null
+bash "$GATE" claim run-takeover "$BUILD_SHA" >/dev/null
+bash "$GATE" claim run-too-soon "$BUILD_SHA" | jq -e '
+  .ok == false and (.error | test("wait for it or ask its coordinator"))
 ' >/dev/null
 
 # 14. finish publishes the verdict artifact when SMOKE_GATE_PUBLISH_FILE is set.
 PUBLISH="$STATE_DIR/pub/latest-verdict.json"
-# Test 13's ceiling recovery already claimed a fresh run, so finish the run
-# that actually owns the slot — a verdict from any other run is refused now.
+# Test 13's takeover claimed a fresh run, so finish the run that actually owns
+# the slot — a verdict from any other run is refused now.
 RUN_ID3="$(jq -r '.activeRunId' "$STATE_FILE")"
 SMOKE_GATE_PUBLISH_FILE="$PUBLISH" bash "$GATE" finish "$BUILD_SHA" "$RUN_ID3" NO_GO \
   | jq -e '.ok == true' >/dev/null
@@ -184,6 +247,25 @@ jq -e --arg sha "$BUILD_SHA" '
 bash "$GATE" claim run-hold-2 "$BUILD_SHA" >/dev/null
 SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-2 BLOCKED >/dev/null
 jq -e '.runId == "run-hold-1"' "$HOLD" >/dev/null   # unchanged by BLOCKED
+# HUMAN_DECISION RAISES the hold (owner decision 2026-08-25). It used to leave
+# it untouched — default-open — which made a verdict meaning "the system does
+# not know whether this is safe" behave as GO on exactly the cases flagged as
+# needing judgment. `reason` distinguishes it from a defects hold.
+bash "$GATE" claim run-hold-hd "$BUILD_SHA" >/dev/null
+SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-hd HUMAN_DECISION >/dev/null
+jq -e --arg sha "$BUILD_SHA" '
+  .verdict == "HUMAN_DECISION" and .sha == $sha and .runId == "run-hold-hd" and
+  .reason == "needs_human_decision"
+' "$HOLD" >/dev/null
+# ...and the hold reconciler now expects it, so a builder deleting a
+# HUMAN_DECISION hold is detected exactly like a deleted NO_GO hold.
+rm -f "$HOLD"
+SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "gate_hold_tampered" and
+  .data.holdIntegrity == "missing" and .data.ledgerVerdict == "HUMAN_DECISION"
+' >/dev/null
+bash "$GATE" claim run-hold-restore "$BUILD_SHA" >/dev/null
+SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-restore NO_GO >/dev/null
 bash "$GATE" claim run-hold-3 "$BUILD_SHA" >/dev/null
 SMOKE_GATE_HOLD_FILE="$HOLD" bash "$GATE" finish "$BUILD_SHA" run-hold-3 GO >/dev/null
 [ ! -e "$HOLD" ]

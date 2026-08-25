@@ -8,6 +8,16 @@
 # SMOKE_GATE_DEV_URL, then execs this script.
 set -u
 
+# `--takeover` may appear anywhere in the argument list; strip it here so no
+# verb has to know about it and a stale positional can never mean "take the
+# slot". Only `claim` reads it (see below).
+TAKEOVER=false
+_ARGS=()
+for _a in "$@"; do
+  if [ "$_a" = "--takeover" ]; then TAKEOVER=true; else _ARGS+=("$_a"); fi
+done
+set -- ${_ARGS[@]+"${_ARGS[@]}"}
+
 REPO="${SMOKE_GATE_REPO:-}"
 BRANCH="${SMOKE_GATE_BRANCH:-develop}"
 BACKEND_SERVICE="${SMOKE_GATE_BACKEND_SERVICE:-}"
@@ -31,6 +41,7 @@ ACTIVE_STALE_SECONDS="${SMOKE_GATE_ACTIVE_STALE_SECONDS:-14400}"
 # this is treated as dead — catches containers killed at spawn without
 # waiting out the hard ceiling.
 PROGRESS_STALE_SECONDS="${SMOKE_GATE_PROGRESS_STALE_SECONDS:-1800}"
+OVERRUN_REALERT_SECONDS="${SMOKE_GATE_OVERRUN_REALERT_SECONDS:-7200}"
 # Optional campaign wake window, `HH:MM-HH:MM` (may wrap midnight), evaluated
 # in SMOKE_GATE_WAKE_TZ. Unset = always open, so no existing deployment
 # changes behaviour. This gates only the full-campaign wake: every other
@@ -143,6 +154,10 @@ default_state() {
     activeRunId: null,
     activeProgressAt: null,
     activeMergeHold: null,
+    overrunAlertRunId: null,
+    overrunAlertAt: null,
+    displacedRunId: null,
+    displacedAt: null,
     unsettledSha: null,
     unsettledSince: null,
     unsettledWakeSha: null,
@@ -180,6 +195,29 @@ write_state() {
   tmp="$(mktemp "$STATE_DIR/.develop-state.XXXXXX")"
   printf '%s\n' "$next" > "$tmp"
   mv "$tmp" "$STATE_FILE"
+}
+
+# A run displaced by an explicit `--takeover` is told so BY NAME instead of the
+# generic "reclaimed or finished". Takeover flips `activeRunId` and nothing else
+# — a shell gate cannot kill the incumbent's container — so the next gate verb
+# is the only channel that reaches a displaced coordinator, and it must carry an
+# unambiguous stop instruction rather than a status. Reads $STATE.
+emit_not_active() {
+  local run_id="$1" base="$2"
+  if [ -n "$run_id" ] && [ "$(jq -r '.displacedRunId // empty' <<<"$STATE")" = "$run_id" ]; then
+    jq -cn --arg run "$run_id" \
+      --arg by "$(jq -r '.activeRunId // empty' <<<"$STATE")" \
+      --arg at "$(jq -r '.displacedAt // empty' <<<"$STATE")" \
+      '{ok:false,
+        error:("STOP THIS CAMPAIGN. This run was displaced by an explicit --takeover at " + $at +
+               " and no longer owns the environment: stop every lane, write no markers, drive no browsers, publish nothing."),
+        runId:$run,activeRunId:(if $by == "" then null else $by end),displacedAt:$at}'
+    return 0
+  fi
+  jq -cn --arg run "$run_id" --arg base "$base" \
+    --arg active "$(jq -r '.activeRunId // empty' <<<"$STATE")" \
+    '{ok:false,error:$base,runId:(if $run == "" then null else $run end),
+      activeRunId:(if $active == "" then null else $active end)}'
 }
 
 iso_now() {
@@ -315,10 +353,7 @@ if [ "$COMMAND" = "finish" ]; then
   # strictly more dangerous and was the only verb still failing open.
   ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
   if [ "$RUN_ID" != "$ACTIVE_RUN" ]; then
-    jq -cn --arg run "$RUN_ID" --arg active "$ACTIVE_RUN" \
-      '{ok:false,error:"not the active run (reclaimed or already finished) — no verdict recorded, no hold touched",
-        runId:(if $run == "" then null else $run end),
-        activeRunId:(if $active == "" then null else $active end)}'
+    emit_not_active "$RUN_ID" "not the active run (reclaimed or already finished) — no verdict recorded, no hold touched"
     exit 0
   fi
   NOW="$(iso_now)"
@@ -347,13 +382,20 @@ if [ "$COMMAND" = "finish" ]; then
     mv "$PUB_TMP" "$PUBLISH_FILE"
   fi
   if [ -n "$HOLD_FILE" ]; then
+    # HUMAN_DECISION raises the hold too (2026-08-25) — see the matching block
+    # in smoke-pr-gate.sh's finish. A verdict meaning "the system does not know
+    # whether this is safe" must not default open. BLOCKED is unchanged.
     case "$VERDICT" in
-      NO_GO)
+      NO_GO|HUMAN_DECISION)
+        [ "$VERDICT" = NO_GO ] &&
+          HOLD_REASON="confirmed defects on this develop lineage — see the run thread and run directory" ||
+          HOLD_REASON="needs_human_decision"
         mkdir -p "$(dirname "$HOLD_FILE")"
         HOLD_TMP="$(mktemp "$(dirname "$HOLD_FILE")/.develop-hold.XXXXXX")"
         jq -cn --arg sha "$SHA" --arg run "$RUN_ID" --arg now "$NOW" \
-          '{schemaVersion:1,sha:$sha,runId:$run,verdict:"NO_GO",raisedAt:$now,
-            reason:"confirmed defects on this develop lineage — see the run thread and run directory"}' > "$HOLD_TMP"
+          --arg verdict "$VERDICT" --arg reason "$HOLD_REASON" \
+          '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,raisedAt:$now,
+            reason:$reason}' > "$HOLD_TMP"
         mv "$HOLD_TMP" "$HOLD_FILE"
         ;;
       GO)
@@ -370,20 +412,35 @@ fi
 
 # Is the currently-recorded active run still live? Shared by `claim` (refuse to
 # stomp a running campaign) and the poll path (reclaim an abandoned one).
+#
+# Liveness is the progress stamp alone. ACTIVE_STALE_SECONDS used to be ANDed
+# in here — the same code as the PR gate's, and the same duplicate-coordinator
+# fault: a campaign stamping `progress` every few minutes went "not live" the
+# instant it crossed the ceiling, and the next poll handed its environment to a
+# rival with nothing telling the first. A dead container stops stamping, which
+# is the only evidence of death either gate has and the only thing that may
+# free a slot automatically. Overrun is now a reason to REFUSE a claim (see
+# `claim`'s --takeover), never a reason to hand the slot away.
 active_run_is_live() {
-  local started="$1" progress="$2" now_epoch started_epoch progress_epoch last quiet age
+  local started="$1" progress="$2" now_epoch started_epoch progress_epoch last quiet
   now_epoch="$(date -u +%s)"
   started_epoch="$(epoch_or_zero "$started")"
   progress_epoch="$(epoch_or_zero "$progress")"
   last="$started_epoch"
   if [ "$progress_epoch" -gt "$last" ]; then last="$progress_epoch"; fi
-  age="$(( now_epoch - started_epoch ))"
   quiet="$(( now_epoch - last ))"
-  if [ "$age" -lt "$ACTIVE_STALE_SECONDS" ] && [ "$quiet" -lt "$PROGRESS_STALE_SECONDS" ]; then
+  if [ "$quiet" -lt "$PROGRESS_STALE_SECONDS" ]; then
     printf 'true'
   else
     printf 'false'
   fi
+}
+
+# Seconds a live run has held the environment. Only `claim` reads it, to decide
+# whether --takeover is on offer at all: below the ceiling there is no takeover,
+# only `release` or waiting.
+active_run_age() {
+  printf '%s' "$(( $(date -u +%s) - $(epoch_or_zero "$1") ))"
 }
 
 # Register a human-requested campaign as the active run. This is the ONLY way a
@@ -428,19 +485,39 @@ if [ "$COMMAND" = "claim" ]; then
   if [ -n "$ACTIVE_RUN" ] && [ "$ACTIVE_RUN" != "$RUN_ID" ] &&
      [ "$(active_run_is_live "$(jq -r '.activeStartedAt // empty' <<<"$STATE")" \
                              "$(jq -r '.activeProgressAt // empty' <<<"$STATE")")" = true ]; then
-    jq -cn --arg active "$ACTIVE_RUN" --arg sha "$(jq -r '.activeSha // empty' <<<"$STATE")" \
-      '{ok:false,error:"another run already owns the environment — wait for it or ask its coordinator",
-        activeRunId:$active,activeSha:(if $sha == "" then null else $sha end)}'
-    exit 0
+    # A live run keeps the environment whatever its age. Past
+    # ACTIVE_STALE_SECONDS a human may still force the issue with --takeover;
+    # nothing automatic ever passes it.
+    ACTIVE_AGE="$(active_run_age "$(jq -r '.activeStartedAt // empty' <<<"$STATE")")"
+    # `--takeover` is valid at ANY age — see the matching note in the PR gate.
+    # Gating it on the ceiling denied an operator the only lever they have
+    # during the first hours of a wedged campaign.
+    if [ "$TAKEOVER" != true ]; then
+      if [ "$ACTIVE_AGE" -ge "$ACTIVE_STALE_SECONDS" ]; then
+        HINT="active run has overrun ${ACTIVE_STALE_SECONDS}s and is still stamping progress — stop its coordinator, or re-run this claim with --takeover"
+      else
+        HINT="another run already owns the environment — wait for it or ask its coordinator"
+      fi
+      jq -cn --arg active "$ACTIVE_RUN" --arg err "$HINT" --argjson age "$ACTIVE_AGE" \
+        --arg sha "$(jq -r '.activeSha // empty' <<<"$STATE")" \
+        '{ok:false,error:$err,activeRunId:$active,activeAgeSeconds:$age,
+          activeSha:(if $sha == "" then null else $sha end)}'
+      exit 0
+    fi
+    TOOK_OVER="$ACTIVE_RUN"
   fi
   NOW="$(iso_now)"
+  # Record WHO was displaced so the displaced run's next gate verb carries a
+  # stop instruction naming the takeover. Cleared on an ordinary claim.
   STATE="$(jq -c --arg sha "$SHA" --arg now "$NOW" --arg run "$RUN_ID" \
-    --argjson hold "$MERGE_HOLD" \
+    --argjson hold "$MERGE_HOLD" --arg took "${TOOK_OVER:-}" \
     '.activeSha=$sha |
      .activeStartedAt=$now |
      .activeRunId=$run |
      .activeProgressAt=$now |
      .activeMergeHold=$hold |
+     .displacedRunId=(if $took == "" then null else $took end) |
+     .displacedAt=(if $took == "" then null else $now end) |
      .candidateSha=null |
      .candidateFirstSeen=null' <<<"$STATE")"
   write_state "$STATE"
@@ -466,10 +543,7 @@ if [ "$COMMAND" = "release" ]; then
   RUN_ID="${2:-}"
   ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
   if [ -z "$RUN_ID" ] || [ "$RUN_ID" != "$ACTIVE_RUN" ]; then
-    jq -cn --arg run "$RUN_ID" --arg active "$ACTIVE_RUN" \
-      '{ok:false,error:"not the active run — nothing released",
-        runId:(if $run == "" then null else $run end),
-        activeRunId:(if $active == "" then null else $active end)}'
+    emit_not_active "$RUN_ID" "not the active run — nothing released"
     exit 0
   fi
   STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null |
@@ -489,10 +563,7 @@ if [ "$COMMAND" = "progress" ]; then
   RUN_ID="${2:-}"
   ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
   if [ -z "$RUN_ID" ] || [ "$RUN_ID" != "$ACTIVE_RUN" ]; then
-    jq -cn --arg run "$RUN_ID" --arg active "$ACTIVE_RUN" \
-      '{ok:false,error:"not the active run (reclaimed or finished) — stop this campaign",
-        runId:(if $run == "" then null else $run end),
-        activeRunId:(if $active == "" then null else $active end)}'
+    emit_not_active "$RUN_ID" "not the active run (reclaimed or finished) — stop this campaign"
     exit 0
   fi
   PROGRESS_NOW="$(iso_now)"
@@ -903,7 +974,7 @@ if [ -n "$HOLD_FILE" ]; then
   LEDGER_VERDICT="$(jq -r '.completedVerdict // empty' <<<"$STATE")"
   LEDGER_RUN="$(jq -r '.completedRunId // empty' <<<"$STATE")"
   case "$LEDGER_VERDICT" in
-    NO_GO)
+    NO_GO|HUMAN_DECISION)
       if [ ! -s "$HOLD_FILE" ]; then
         HOLD_INTEGRITY=missing
       elif [ "$(jq -r '.runId // empty' "$HOLD_FILE" 2>/dev/null)" != "$LEDGER_RUN" ]; then
@@ -913,8 +984,11 @@ if [ -n "$HOLD_FILE" ]; then
     GO)
       [ -s "$HOLD_FILE" ] && HOLD_INTEGRITY=unexpected
       ;;
-    # BLOCKED / HUMAN_DECISION deliberately leave the hold untouched, so the
-    # ledger implies no expectation and there is nothing to reconcile.
+    # BLOCKED deliberately leaves the hold untouched, so the ledger implies no
+    # expectation and there is nothing to reconcile. HUMAN_DECISION joined the
+    # NO_GO branch when it started raising a hold — otherwise a HUMAN_DECISION
+    # hold deleted by a builder would be the one hold nobody notices going
+    # missing, which is exactly the hole this reconciler exists to close.
   esac
 fi
 if [ "$HOLD_INTEGRITY" != ok ] &&
@@ -952,6 +1026,32 @@ if [ -n "$ACTIVE_SHA" ]; then
   # `claim` so a campaign and the watcher can never disagree about liveness.
   if [ "$(active_run_is_live "$ACTIVE_STARTED" \
             "$(jq -r '.activeProgressAt // empty' <<<"$STATE")")" = true ]; then
+    # The ceiling was demoted from executioner to alarm, and an alarm has to
+    # ring. It no longer evicts a stamping run, but the zombie stamper it was
+    # really defending against is still real — a coordinator whose heartbeat
+    # fires while its work is wedged. Latched on the run id, so one overrun
+    # episode alarms once and a later run re-arms it for free.
+    # RE-ARMS on an interval, deliberately. Since eviction is no longer
+    # automatic, this alarm is the ONLY thing that surfaces a wedged run — and
+    # a once-per-run-id latch means a single missed or swallowed notification
+    # leaves the slot held with nothing ever saying so again. A latch that can
+    # go permanently silent is not a safety mechanism; it is a safety mechanism
+    # shaped like one. Re-alarm while the overrun persists.
+    ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
+    ACTIVE_AGE="$(active_run_age "$ACTIVE_STARTED")"
+    OVERRUN_LAST="$(jq -r '.overrunAlertAt // empty' <<<"$STATE")"
+    OVERRUN_SINCE="$(( $(date -u +%s) - $(epoch_or_zero "$OVERRUN_LAST") ))"
+    if [ -n "$ACTIVE_RUN" ] && [ "$ACTIVE_AGE" -ge "$ACTIVE_STALE_SECONDS" ] &&
+       { [ "$(jq -r '.overrunAlertRunId // empty' <<<"$STATE")" != "$ACTIVE_RUN" ] ||
+         [ "$OVERRUN_SINCE" -ge "$OVERRUN_REALERT_SECONDS" ]; }; then
+      STATE="$(jq -c --arg r "$ACTIVE_RUN" --arg now "$NOW" \
+        '.overrunAlertRunId=$r | .overrunAlertAt=$now' <<<"$STATE")"
+      write_state "$STATE"
+      jq -cn --arg run "$ACTIVE_RUN" --arg sha "$ACTIVE_SHA" --argjson age "$ACTIVE_AGE" \
+        '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_run_overrun",
+          runId:$run,activeSha:$sha,activeAgeSeconds:$age}}'
+      exit 0
+    fi
     if [ "$ACTIVE_SHA" != "$SOURCE_SHA" ]; then
       if [ "$CANDIDATE_SHA" != "$SOURCE_SHA" ]; then
         STATE="$(jq -c --arg sha "$SOURCE_SHA" --arg now "$NOW" '.candidateSha=$sha | .candidateFirstSeen=$now' <<<"$STATE")"

@@ -1555,10 +1555,20 @@ describe('session migration pass preserves the idle clock', () => {
         entries: [{ path: target, sessionId, atimeMs: OLD_SECONDS * 1000, mtimeMs: OLD_SECONDS * 1000 }],
       }),
     );
-    // Stamped 1.5s BEFORE the manifest's clock — a rounding artifact, not a
+    // Stamped BEFORE the manifest's clock — a rounding artifact, not a
     // different event. Outside the tolerance this session stayed broken.
-    const bumped = (writtenAtMs - 1500) / 1000;
+    //
+    // The offset must survive utimesSync's own rounding: it takes seconds, and
+    // a filesystem storing whole seconds can floor this by nearly 1s more. At
+    // the original 1500ms that left ~500ms of headroom under the 2000ms
+    // tolerance, so a coarse-granularity filesystem pushed the real mtime past
+    // the edge and the replay skipped — the test flaked on CI while passing on
+    // a machine with finer timestamps. 1000ms keeps a full second of slack.
+    const bumped = (writtenAtMs - 1000) / 1000;
     fs.utimesSync(target, bumped, bumped);
+    // Assert the fixture landed where the test believes it did, so a future
+    // granularity surprise fails as a broken fixture and not as a broken replay.
+    expect(writtenAtMs - fs.statSync(target).mtimeMs).toBeLessThan(2000);
 
     const { replayUpgradeMtimeManifest } = await import('./session-manager.js');
     expect(replayUpgradeMtimeManifest(DATA_DIR, getDb())).toBe(1);

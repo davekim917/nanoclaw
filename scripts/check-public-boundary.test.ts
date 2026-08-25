@@ -27,6 +27,11 @@ function tempRoot(): string {
 function initRepo(): string {
   const root = tempRoot();
   execFileSync('git', ['init', '-q'], { cwd: root });
+  // Repo-local identity so `git commit` below does not depend on ambient
+  // global config. A dev machine has one and CI does not, which is why this
+  // passed locally and failed on the runner with "empty ident name".
+  execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root });
+  execFileSync('git', ['config', 'user.name', 'Boundary Test'], { cwd: root });
   fs.writeFileSync(path.join(root, '.public-boundary-allowlist.json'), '{"entries":[]}\n');
   execFileSync('git', ['add', '.public-boundary-allowlist.json'], { cwd: root });
   return root;

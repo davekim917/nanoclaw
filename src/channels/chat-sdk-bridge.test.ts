@@ -413,7 +413,7 @@ describe('createChatSdkBridge — outbound transform path', () => {
 
     await bridge.deliver('thread-1', null, {
       kind: 'status',
-      content: { text: "drafting the post... keeping it concise without mentioning @Barry" },
+      content: { text: 'drafting the post... keeping it concise without mentioning @Barry' },
     } as never);
 
     expect(posts).toHaveLength(1);
@@ -421,9 +421,7 @@ describe('createChatSdkBridge — outbound transform path', () => {
     expect(delivered).not.toContain('<@UBARRY>');
     // Zero-width space breaks the rewriter's match but reads identically —
     // strip it and the original prose is untouched.
-    expect(delivered.replace(/\u200b/g, '')).toBe(
-      "drafting the post... keeping it concise without mentioning @Barry",
-    );
+    expect(delivered.replace(/\u200b/g, '')).toBe('drafting the post... keeping it concise without mentioning @Barry');
   });
 
   it('chat-kind mentions still resolve normally (real addressing keeps working)', async () => {
