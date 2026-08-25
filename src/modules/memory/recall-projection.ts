@@ -16,8 +16,12 @@
  *   `passageWindows` are imported from `pre-turn-context.ts`. The delivered
  *   contract is byte-identical output (P2.5-I1), and a second implementation of
  *   any of them is a drift generator. Only the ORCHESTRATION loop is restated
- *   here; step 6 collapses that duplication by calling
- *   `buildProjectionCandidates` from `readMemoryEvidence` itself.
+ *   here — and that duplicate loop is a live drift surface TODAY, not a
+ *   hypothetical one, until step 6 collapses it by calling
+ *   `buildProjectionCandidates` from `readMemoryEvidence` itself. Until then
+ *   every behavioral difference between the two loops is a byte-identity bug;
+ *   the vanished-file case below was one, and AC1's differential harness is
+ *   what would catch the next.
  * - THE TOKEN STREAM AND THE PASSAGE WINDOWS ARE PERSISTED (decision 3,
  *   P2.5-I9). Storing only path/headings/content/searchable/capturedAt would
  *   leave scoring re-tokenizing every candidate every turn through the
@@ -30,6 +34,7 @@
  *   text relative to the filesystem path.
  */
 import Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -72,6 +77,31 @@ export const LANE_EXCERPT_CHARS: Readonly<Record<RecallLane, number>> = Object.f
   file: PRE_TURN_BOUNDS.markdownExcerptChars,
   fact: PRE_TURN_BOUNDS.generatedFactExcerptChars,
 });
+
+/**
+ * Every live constant the BUILD's output depends on, frozen into the file.
+ *
+ * S1: recording these without enforcing them is worse than not recording them —
+ * it reads as a guard that is not one. `schema_version` only moves when the
+ * TABLE shape changes, so widening `markdownExcerptChars` (or any of these)
+ * leaves a version-1 projection serving windows the live path would never
+ * produce. Compared as one JSON string at open; a mismatch is rebuild-required,
+ * exactly like a schema mismatch, never an error surfaced to a turn.
+ *
+ * The set is the real dependency set, not a sample: file/heading widths shape
+ * `searchable`, the two lane widths shape every stored passage window, and the
+ * byte bounds shape which candidates exist at all.
+ */
+function frozenBounds(): Record<string, number> {
+  return {
+    markdownFileBytes: PRE_TURN_BOUNDS.markdownFileBytes,
+    markdownScannedBytes: PRE_TURN_BOUNDS.markdownScannedBytes,
+    markdownHeadings: PRE_TURN_BOUNDS.markdownHeadings,
+    markdownHeadingChars: PRE_TURN_BOUNDS.markdownHeadingChars,
+    fileExcerptChars: LANE_EXCERPT_CHARS.file,
+    factExcerptChars: LANE_EXCERPT_CHARS.fact,
+  };
+}
 
 export interface ProjectionWindow {
   text: string;
@@ -219,13 +249,17 @@ export function buildProjectionCandidates(root: string): ProjectionCandidateSet 
   let scannedBytes = 0;
 
   for (const relative of scanOrder) {
-    const stats = statSource(path.join(root, relative));
-    const skipped =
+    const absolute = path.join(root, relative);
+    // Skips first, exactly as the live loop orders them: CORE_PATHS,
+    // NON_RECALL_PATHS, preferences/ — then the byte budget, then the read.
+    if (
       (CORE_PATHS as readonly string[]).includes(relative) ||
       NON_RECALL_PATHS.has(relative) ||
-      relative.startsWith(PREFERENCES_DIR);
-    if (skipped || stats === null) {
-      if (stats !== null) sources.push({ ...stats, path: relative, headings: null });
+      relative.startsWith(PREFERENCES_DIR)
+    ) {
+      // The live path never opens these, so a vanished one is not a divergence.
+      const skippedStats = statSource(absolute);
+      if (skippedStats !== null) sources.push({ ...skippedStats, path: relative, headings: null });
       continue;
     }
     const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
@@ -238,13 +272,27 @@ export function buildProjectionCandidates(root: string): ProjectionCandidateSet 
       });
       break;
     }
+    // Stat BEFORE the read so staleness records the state the content came
+    // from; a file changed between the two then reads as stale and rebuilds,
+    // where the reverse order would record the new stat against old content.
+    const before = statSource(absolute);
+    // S5: NO swallow here. If the file vanished between listing and now, the
+    // live path's `readBoundedFile` throws ENOENT, which propagates to
+    // `readMemoryEvidence`'s outer catch (`pre-turn-context.ts:1681`) and
+    // returns EMPTY evidence with `markdown-read-failed`. A build that skipped
+    // the file instead would produce a projection the live path would never
+    // agree with on the same tree — a byte-identity counterexample. Throwing
+    // aborts this build; the sweep retries it, and the turn is served by the
+    // filesystem path meanwhile.
     const read = readBoundedFile(
-      path.join(root, relative),
+      absolute,
       canonicalRoot,
       remaining,
       relative === GENERATED_MEMORY_RELATIVE_PATH ? GENERATED_MEMORY_MAX_BYTES : PRE_TURN_BOUNDS.markdownFileBytes,
     );
     scannedBytes += read.bytes;
+    const stats = before ?? statSource(absolute);
+    if (stats === null) throw new Error(`cannot stat ${relative} after reading it`);
     // ONE array per source file, shared by reference across every fact drawn
     // from it (decision 15). Stored on `source_file`, not per candidate row,
     // so hydration hands back the same instance the live path does.
@@ -368,6 +416,16 @@ function decodeWindows(
   return windows;
 }
 
+function streamEqual(a: readonly RecallToken[], b: readonly RecallToken[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index++) {
+    const one = a[index]!;
+    const other = b[index]!;
+    if (one.value !== other.value || one.start !== other.start || one.end !== other.end) return false;
+  }
+  return true;
+}
+
 /** Byte-identity check for the encode/decode round trip — value, start, end, and order. */
 export function windowsEqual(a: readonly ProjectionWindow[], b: readonly ProjectionWindow[]): boolean {
   if (a.length !== b.length) return false;
@@ -423,6 +481,51 @@ export function termsOf(candidate: ProjectionCandidate): string[] {
   return [...terms];
 }
 
+interface CandidateRow {
+  lane: string;
+  scan_order: number;
+  path: string;
+  content: string;
+  searchable: string;
+  captured_at: string;
+  fact_id: string | null;
+  stream_json: string;
+  windows_encoded: number;
+  windows_json: string;
+}
+
+/**
+ * Read one just-inserted candidate back out and require it to be identical to
+ * what the build meant to store (S2). Throws rather than degrading: a divergent
+ * row cannot be repaired by falling back to the whole-window shape, because the
+ * corruption is in the stored TEXT itself. Throwing aborts the transaction, so
+ * the side file is discarded and the previous `index.db` stays servable.
+ */
+function assertStoredCandidateMatches(select: Database.Statement, id: number, candidate: ProjectionCandidate): void {
+  const row = select.get(id) as CandidateRow | undefined;
+  const fail = (what: string): never => {
+    throw new Error(`recall projection storage round trip changed ${what} for ${candidate.lane} ${candidate.path}`);
+  };
+  if (!row) fail('the row itself (vanished)');
+  if (row!.content !== candidate.content) fail('content');
+  if (row!.searchable !== candidate.searchable) fail('searchable');
+  if (row!.path !== candidate.path) fail('path');
+  if (row!.captured_at !== candidate.capturedAt) fail('capturedAt');
+  if (row!.fact_id !== candidate.factId) fail('factId');
+  if (row!.scan_order !== candidate.scanOrder) fail('scanOrder');
+  const storedStream = decodeStream(row!.stream_json);
+  if (!streamEqual(storedStream, candidate.stream)) fail('the token stream');
+  // Decode through the SAME path hydration uses, against the STORED base
+  // string — that is what makes this a storage check and not a second
+  // in-memory check.
+  const parsed = JSON.parse(row!.windows_json) as number[] | ProjectionWindow[];
+  const storedWindows =
+    row!.windows_encoded === 1
+      ? decodeWindows(row!.searchable, storedStream, parsed as number[])
+      : (parsed as ProjectionWindow[]);
+  if (!windowsEqual(storedWindows, candidate.windows)) fail('passage windows');
+}
+
 function openForWrite(dbPath: string): Database.Database {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
@@ -463,14 +566,16 @@ export function writeProjection(
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const insertTerm = db.prepare('INSERT OR IGNORE INTO term (token, candidate_id) VALUES (?, ?)');
+    const selectCandidate = db.prepare(
+      `SELECT lane, scan_order, path, content, searchable, captured_at, fact_id, stream_json, windows_encoded, windows_json
+         FROM candidate WHERE id = ?`,
+    );
     db.transaction(() => {
       insertMeta.run('schema_version', String(RECALL_PROJECTION_SCHEMA_VERSION));
       insertMeta.run('built_at', new Date().toISOString());
       insertMeta.run('scanned_bytes', String(set.scannedBytes));
-      // Frozen bounds, so a config change without a rebuild is detectable
-      // rather than silently served under the old budget (AC19, step 6).
-      insertMeta.run('markdown_file_bytes', String(PRE_TURN_BOUNDS.markdownFileBytes));
-      insertMeta.run('markdown_scanned_bytes', String(PRE_TURN_BOUNDS.markdownScannedBytes));
+      // Frozen bounds, ENFORCED at open (S1) — see `frozenBounds`.
+      insertMeta.run('bounds_json', JSON.stringify(frozenBounds()));
       insertMeta.run('notices_json', JSON.stringify(set.notices));
       for (const source of set.sources) {
         insertSource.run(
@@ -482,8 +587,7 @@ export function writeProjection(
         );
       }
       for (const candidate of set.candidates) {
-        // Encode, decode, and PROVE the round trip before trusting it. A
-        // candidate that cannot be proven exact stores the literal shape.
+        // Choose the encoding in memory...
         const flat = encodeWindows(candidate.searchable, candidate.stream, candidate.windows);
         const encoded =
           flat !== null && windowsEqual(decodeWindows(candidate.searchable, candidate.stream, flat), candidate.windows);
@@ -502,6 +606,19 @@ export function writeProjection(
             JSON.stringify(encoded ? flat : candidate.windows),
           ).lastInsertRowid,
         );
+        // ...but PROVE it after the row has been through SQLite (S2).
+        //
+        // An in-memory-only check verifies the encoder, not the storage. The
+        // offsets index the STORED `searchable`, so anything the TEXT binding
+        // mutates shifts every window silently while the encoder's own check
+        // stays green — and `stream_json` would keep the ORIGINAL coordinates,
+        // because JSON escapes survive what a bare TEXT bind does not.
+        // better-sqlite3 replaces unpaired surrogates with U+FFFD on bind
+        // (measured), which is exactly that failure. Reading the row back
+        // through the real hydration decode is the only check that covers the
+        // storage boundary, and it is what makes P2.5-I1 a property of the
+        // FILE rather than of the in-memory objects.
+        assertStoredCandidateMatches(selectCandidate, id, candidate);
         for (const token of termsOf(candidate)) {
           insertTerm.run(token, id);
           termRows++;
@@ -526,32 +643,75 @@ export function projectionPath(workgroupId: string, dataDir: string): string {
 }
 
 /**
+ * An `index.next-*` file this old cannot belong to a live build — the slowest
+ * measured build is ~15 s — so it is a corpse from a killed one (S4).
+ *
+ * ponytail: age gate rather than real ownership tracking. A lock file or an
+ * flock would be exact; this is two lines and cannot delete a sibling's
+ * in-flight file, which was the actual bug. Upgrade if builds ever legitimately
+ * run longer than the threshold.
+ */
+const STALE_SIDE_FILE_MS = 60 * 60 * 1000;
+
+/** fsync a path (file or directory) and swallow nothing. */
+function fsyncPath(target: string, flags: number): void {
+  const fd = fs.openSync(target, flags);
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
  * Build a projection for `root` and promote it over `<directory>/index.db`.
  *
  * Promote protocol (decision 12, mirroring `daemon.ts:2344-2367`): write
- * `index.next-<stamp>`, then remove the live `-wal`/`-shm` sidecars and rename
- * over `index.db`. Dropping the sidecars is not optional — a stale WAL left
- * beside a freshly renamed database belongs to a different file and is a
- * corruption source, which is exactly why the graph daemon removes them too.
+ * `index.next-<uuid>`, fsync it, remove the live `-wal`/`-shm` sidecars, rename
+ * over `index.db`, then fsync the directory. Dropping the sidecars is not
+ * optional — a stale WAL left beside a freshly renamed database belongs to a
+ * different file and is a corruption source, which is exactly why the graph
+ * daemon removes them too.
+ *
+ * WHAT RECOVERY DEPENDS ON (S3). `rename(2)` is atomic against a crash, but not
+ * against power loss unless the data is on disk first: without the fsyncs a
+ * reader could find a renamed file whose pages never landed, and — because the
+ * completeness marker lives in an early `meta` page — that file can pass the
+ * marker check while its candidate pages are garbage. The fsync of the side
+ * file orders data before the rename; the fsync of the directory makes the
+ * rename itself durable. After both, the only post-power-loss states are the
+ * old `index.db` or the new one, never a half of either.
  *
  * A build that dies before the rename leaves `index.db` untouched and fully
- * servable; one that dies after the rename but before the marker committed
- * leaves a markerless file, which reads as absent rather than as a partial
- * index (P2.5-I6).
+ * servable. The marker commits inside `writeProjection`'s transaction, which
+ * returns before the rename can run, so this path cannot itself produce a
+ * renamed-but-markerless file; `openRecallProjection`'s marker check guards the
+ * file arriving any OTHER way — a torn write, a future incremental writer, or
+ * an operator copying one in (P2.5-I6).
  */
 export function buildAndPromoteProjection(options: { root: string; directory: string }): ProjectionBuildResult {
   const startedAt = Date.now();
   const livePath = path.join(options.directory, 'index.db');
   fs.mkdirSync(options.directory, { recursive: true });
+  // Sweep corpses ONLY (S4). Deleting every `index.next-*` unconditionally took
+  // a concurrent build's in-flight file out from under its open connection.
   for (const entry of fs.readdirSync(options.directory)) {
-    if (entry.startsWith('index.next-')) fs.rmSync(path.join(options.directory, entry), { force: true });
+    if (!entry.startsWith('index.next-')) continue;
+    const orphan = path.join(options.directory, entry);
+    const age = Date.now() - fs.statSync(orphan).mtimeMs;
+    if (age > STALE_SIDE_FILE_MS) fs.rmSync(orphan, { force: true });
   }
-  const nextPath = path.join(options.directory, `index.next-${Date.now()}-${process.pid}.db`);
+  // randomUUID, not Date.now()+pid: worker threads SHARE a pid, so two
+  // concurrent builds of one workgroup in the same millisecond produced the
+  // identical path and corrupted each other (S4).
+  const nextPath = path.join(options.directory, `index.next-${randomUUID()}.db`);
+  if (fs.existsSync(nextPath)) throw new Error(`recall projection side file already exists: ${nextPath}`);
 
   const set = buildProjectionCandidates(options.root);
   let written: { termRows: number; windowsStoredWhole: number };
   try {
     written = writeProjection(nextPath, set);
+    fsyncPath(nextPath, fs.constants.O_RDONLY);
   } catch (error) {
     fs.rmSync(nextPath, { force: true });
     throw error;
@@ -559,6 +719,7 @@ export function buildAndPromoteProjection(options: { root: string; directory: st
   fs.rmSync(`${livePath}-wal`, { force: true });
   fs.rmSync(`${livePath}-shm`, { force: true });
   fs.renameSync(nextPath, livePath);
+  fsyncPath(options.directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
 
   return {
     path: livePath,
@@ -593,6 +754,8 @@ export function openRecallProjection(dbPath: string): Database.Database | null {
     const version = readMeta(db, 'schema_version');
     if (version !== String(RECALL_PROJECTION_SCHEMA_VERSION)) throw new Error(`schema_version ${version}`);
     if (readMeta(db, COMPLETE_KEY) !== '1') throw new Error('build never completed');
+    const bounds = readMeta(db, 'bounds_json');
+    if (bounds !== JSON.stringify(frozenBounds())) throw new Error(`stale bounds ${bounds}`);
     return db;
   } catch {
     db.close();
@@ -608,8 +771,8 @@ function readMeta(db: Database.Database, key: string): string | null {
 export interface ProjectionSummary {
   schemaVersion: string | null;
   scannedBytes: number;
-  markdownFileBytes: number;
-  markdownScannedBytes: number;
+  /** The bounds this projection was built under — see `frozenBounds`. */
+  bounds: Record<string, number>;
   notices: ContextNotice[];
 }
 
@@ -617,23 +780,9 @@ export function readProjectionSummary(db: Database.Database): ProjectionSummary 
   return {
     schemaVersion: readMeta(db, 'schema_version'),
     scannedBytes: Number(readMeta(db, 'scanned_bytes') ?? 0),
-    markdownFileBytes: Number(readMeta(db, 'markdown_file_bytes') ?? 0),
-    markdownScannedBytes: Number(readMeta(db, 'markdown_scanned_bytes') ?? 0),
+    bounds: JSON.parse(readMeta(db, 'bounds_json') ?? '{}') as Record<string, number>,
     notices: JSON.parse(readMeta(db, 'notices_json') ?? '[]') as ContextNotice[],
   };
-}
-
-interface CandidateRow {
-  lane: string;
-  scan_order: number;
-  path: string;
-  content: string;
-  searchable: string;
-  captured_at: string;
-  fact_id: string | null;
-  stream_json: string;
-  windows_encoded: number;
-  windows_json: string;
 }
 
 /**

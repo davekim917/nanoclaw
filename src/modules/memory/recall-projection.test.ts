@@ -113,7 +113,8 @@ describe('recall projection schema and build', () => {
 
     const summary = readProjectionSummary(db!);
     expect(summary.schemaVersion).toBe(String(RECALL_PROJECTION_SCHEMA_VERSION));
-    expect(summary.markdownScannedBytes).toBe(PRE_TURN_BOUNDS.markdownScannedBytes);
+    expect(summary.bounds.markdownScannedBytes).toBe(PRE_TURN_BOUNDS.markdownScannedBytes);
+    expect(summary.bounds.fileExcerptChars).toBe(LANE_EXCERPT_CHARS.file);
     expect(summary.scannedBytes).toBeGreaterThan(0);
     db!.close();
   });
@@ -185,10 +186,18 @@ describe('recall projection schema and build', () => {
     const hydrated = [...hydrateLane(db, 'file'), ...hydrateLane(db, 'fact')];
     db.close();
 
+    // Expectations come from the LIVE path's own text, never from the hydrated
+    // row: deriving them from `candidate.searchable` would make this pass under
+    // any storage-layer corruption, because the expectation would shift with
+    // the corruption (S2).
+    const oracle = buildProjectionCandidates(root).candidates;
+    expect(hydrated).toHaveLength(oracle.length);
     expect(hydrated.length).toBeGreaterThan(0);
-    for (const candidate of hydrated) {
-      expect(candidate.tokens).toEqual(tokenizeForRecall(candidate.searchable));
-      const fresh = passageWindows(candidate.searchable, LANE_EXCERPT_CHARS[candidate.lane]).map((window) => ({
+    for (const [index, candidate] of hydrated.entries()) {
+      const source = oracle[index]!;
+      expect(candidate.searchable).toBe(source.searchable);
+      expect(candidate.tokens).toEqual(tokenizeForRecall(source.searchable));
+      const fresh = passageWindows(source.searchable, LANE_EXCERPT_CHARS[source.lane]).map((window) => ({
         text: window.text,
         tokens: [...window.tokens],
       }));
@@ -281,16 +290,21 @@ describe('recall projection schema and build', () => {
     db.close();
     expect(encodings).toEqual([1]);
 
+    // Same de-circularization as above: the live build is the oracle (S2).
+    const source = buildProjectionCandidates(root).candidates;
+    expect(hydrated).toHaveLength(source.length);
     expect(hydrated.length).toBeGreaterThan(0);
-    for (const candidate of hydrated) {
-      const fresh = passageWindows(candidate.searchable, LANE_EXCERPT_CHARS[candidate.lane]).map((window) => ({
+    for (const [index, candidate] of hydrated.entries()) {
+      const original = source[index]!;
+      expect(candidate.searchable).toBe(original.searchable);
+      const fresh = passageWindows(original.searchable, LANE_EXCERPT_CHARS[original.lane]).map((window) => ({
         text: window.text,
         tokens: [...window.tokens],
       }));
       // Deep equality over value, start, end AND window ordering.
       expect(windowsEqual(candidate.windows, fresh)).toBe(true);
       expect(candidate.windows).toEqual(fresh);
-      expect(candidate.stream).toEqual([...tokenStreamForRecall(candidate.searchable)]);
+      expect(candidate.stream).toEqual([...tokenStreamForRecall(original.searchable)]);
     }
   });
 
@@ -347,6 +361,87 @@ describe('recall projection schema and build', () => {
     expect(openRecallProjection(path.join(directory, 'index.db'))).toBeNull();
     fs.writeFileSync(path.join(directory, 'index.db'), 'not a database at all');
     expect(openRecallProjection(path.join(directory, 'index.db'))).toBeNull();
+  });
+
+  it('S2: rejects a candidate the SQLite TEXT binding would silently mutate', () => {
+    const root = smallTree();
+    const set = buildProjectionCandidates(root);
+
+    // A lone high surrogate. It cannot arrive from a filename or from file
+    // content — Node decodes both invalid bytes and WTF-8 surrogate encodings
+    // to U+FFFD, verified — so this is injected directly at the candidate
+    // level, which is the layer the storage boundary actually sees. On bind,
+    // better-sqlite3 turns it into U+FFFD: the stored `searchable` is then a
+    // DIFFERENT string, every window offset slices a shifted base, and
+    // `stream_json` keeps the original coordinates because JSON escapes it.
+    // Shaped like the real file lane: content is clean, and the surrogate rides
+    // in via the `path\nheadings\n` prefix that `searchable` embeds.
+    const content = 'routing seam delivery handoff.\n';
+    const searchable = `concepts/a\uD800b.md\n\n${content}`;
+    const stream = [...tokenStreamForRecall(searchable)];
+    const poisoned: ProjectionCandidate = {
+      ...set.candidates[0]!,
+      content,
+      searchable,
+      stream,
+      tokens: [...new Set(stream.map((token) => token.value))],
+      windows: passageWindows(searchable, LANE_EXCERPT_CHARS.file).map((window) => ({
+        text: window.text,
+        tokens: [...window.tokens],
+      })),
+    };
+    // The in-memory objects are self-consistent, so the encoder's own check is
+    // happy — only a check made AFTER the round trip can catch this.
+    expect(windowsEqual(poisoned.windows, poisoned.windows)).toBe(true);
+
+    const nextPath = path.join(scratch('poison'), 'index.next-poison.db');
+    expect(() => writeProjection(nextPath, { ...set, candidates: [poisoned] })).toThrow(
+      /storage round trip changed searchable/,
+    );
+    // Nothing servable was produced.
+    expect(openRecallProjection(nextPath)).toBeNull();
+  });
+
+  it('S1: rejects a projection built under different bounds than the live constants', () => {
+    const root = smallTree();
+    const { live } = built(root);
+    expect(openRecallProjection(live)).not.toBeNull();
+
+    // Simulates PRE_TURN_BOUNDS/LANE_EXCERPT_CHARS changing without a rebuild.
+    // schema_version stays 1, because the TABLE shape did not change — which is
+    // exactly why the marker and the version alone are not enough.
+    const writable = new Database(live);
+    const stored = JSON.parse(
+      (writable.prepare("SELECT value FROM meta WHERE key = 'bounds_json'").get() as { value: string }).value,
+    ) as Record<string, number>;
+    writable
+      .prepare("UPDATE meta SET value = ? WHERE key = 'bounds_json'")
+      .run(JSON.stringify({ ...stored, fileExcerptChars: stored.fileExcerptChars! + 1 }));
+    expect(
+      (writable.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string }).value,
+    ).toBe(String(RECALL_PROJECTION_SCHEMA_VERSION));
+    writable.close();
+
+    // Rebuild-required, not an error surfaced to a turn.
+    expect(openRecallProjection(live)).toBeNull();
+  });
+
+  it('S5: an unreadable scanned file fails the build instead of being silently skipped', () => {
+    const root = smallTree();
+    const victim = path.join(root, 'concepts/routing.md');
+    fs.chmodSync(victim, 0o000);
+    try {
+      // The live path calls readBoundedFile here and lets the error reach
+      // readMemoryEvidence's outer catch, which returns EMPTY evidence. A build
+      // that skipped the file would disagree with the live path on this exact
+      // tree, so it must surface the failure too.
+      expect(() => buildProjectionCandidates(root)).toThrow();
+    } finally {
+      fs.chmodSync(victim, 0o644);
+    }
+    // Readable again: the same tree builds cleanly, so the throw was about the
+    // unreadable file and not about the fixture.
+    expect(buildProjectionCandidates(root).candidates.length).toBeGreaterThan(0);
   });
 
   it('resolves the per-workgroup projection path outside the authoritative memory tree', () => {
@@ -432,14 +527,35 @@ describe('recall projection promote protocol (P2.5-AC8)', () => {
     expect(fs.readdirSync(directory).filter((entry) => entry.startsWith('index.next-'))).toEqual([]);
   });
 
-  it('sweeps orphaned index.next-* side files left by a killed build', () => {
+  it('S4: sweeps a stale side file but never a concurrent build in-flight one', () => {
     const root = smallTree();
     const { directory } = built(root);
-    fs.writeFileSync(path.join(directory, 'index.next-orphan.db'), 'partial');
+    const corpse = path.join(directory, 'index.next-corpse.db');
+    const inFlight = path.join(directory, 'index.next-sibling.db');
+    fs.writeFileSync(corpse, 'partial');
+    fs.writeFileSync(inFlight, 'a concurrent build is writing this right now');
+    // Age the corpse past the staleness threshold; leave the sibling fresh.
+    const old = Date.now() - 2 * 60 * 60 * 1000;
+    fs.utimesSync(corpse, old / 1000, old / 1000);
 
     buildAndPromoteProjection({ root, directory });
 
-    expect(fs.readdirSync(directory).filter((entry) => entry.startsWith('index.next-'))).toEqual([]);
+    expect(fs.existsSync(corpse)).toBe(false);
+    // Deleting this one would pull a live build's database out from under an
+    // open connection — the bug the age gate exists to prevent.
+    expect(fs.existsSync(inFlight)).toBe(true);
+    fs.rmSync(inFlight, { force: true });
+  });
+
+  it('S4: gives every build a collision-proof side-file name', () => {
+    const root = smallTree();
+    const directory = scratch('names');
+    // Worker threads share a pid, so a Date.now()+pid name collided for two
+    // concurrent builds of one workgroup inside the same millisecond.
+    const first = buildAndPromoteProjection({ root, directory });
+    const second = buildAndPromoteProjection({ root, directory });
+    expect(first.path).toBe(second.path);
+    expect(openRecallProjection(second.path)).not.toBeNull();
   });
 });
 
