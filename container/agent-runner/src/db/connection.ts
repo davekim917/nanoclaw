@@ -87,6 +87,51 @@ export function getInboundDb(): Database {
  * schema pragmas so first-use initialization waits out a sibling write instead
  * of failing immediately.
  */
+/**
+ * Account-level rate-limit utilization samples.
+ *
+ * Separate from `turn_usage` on purpose: utilization is a property of the
+ * ACCOUNT (an OAuth ring slot), not of a turn. Stamping it onto every
+ * turn_usage row would repeat one reading across every turn in the same
+ * minute, and turn_usage has room for exactly ONE window while the plan
+ * exposes up to four. One row per (sample, window) instead.
+ *
+ * `available = 0` means plan limits do not apply to this session at all
+ * (API key, Bedrock, Vertex, missing profile scope) — a normal answer, not a
+ * failure. NO ROW means we never sampled. Those are different states and the
+ * table keeps them apart.
+ *
+ * Claude-only. Codex and OpenCode expose nothing equivalent, so a read
+ * surface over this table must never imply fleet-wide coverage.
+ */
+const RATE_LIMIT_SAMPLES_DDL = `
+  CREATE TABLE IF NOT EXISTS rate_limit_samples (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                TEXT NOT NULL,
+    -- 'usage_pull' (the /usage control request — fires regardless of
+    -- utilization) or 'rate_limit_event' (SDK telemetry — only fires once
+    -- the account is already in warning/blocked territory).
+    source            TEXT NOT NULL,
+    -- OAuth ring slot name (CLAUDE_CODE_OAUTH_TOKEN, _2, ...). NULL for
+    -- API-key sessions. Without it, samples from four rotating accounts mix
+    -- into one meaningless series.
+    account           TEXT,
+    subscription_type TEXT,
+    available         INTEGER NOT NULL,
+    -- Window: five_hour | seven_day | seven_day_oauth_apps | seven_day_opus.
+    -- NULL when available = 0, or when the plan reported no windows.
+    limit_type        TEXT,
+    -- 0-1 FRACTION, matching turn_usage.rate_limit_utilization. The pull
+    -- reports 0-100 and is divided at the capture seam; rate_limit_event
+    -- already reports a fraction.
+    utilization       REAL,
+    resets_at         TEXT,
+    -- rate_limit_event's status (allowed_warning / rejected). The pull does
+    -- not carry one, so it is NULL there.
+    status            TEXT
+  );
+`;
+
 export function configureOutboundDb(outbound: Database): void {
   outbound.exec('PRAGMA busy_timeout = 5000');
   outbound.exec('PRAGMA journal_mode = DELETE');
@@ -211,6 +256,8 @@ export function configureOutboundDb(outbound: Database): void {
   ] as const) {
     if (!turnUsageCols.has(name)) outbound.exec(`ALTER TABLE turn_usage ADD COLUMN ${name} ${type}`);
   }
+  // rate_limit_samples: added after turn_usage — same forward-compat pattern.
+  outbound.exec(RATE_LIMIT_SAMPLES_DDL);
 }
 
 /** Open and fully configure one outbound connection, closing it on failure. */
@@ -468,6 +515,7 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       cost_usd           REAL
     );
   `);
+  _outbound.exec(RATE_LIMIT_SAMPLES_DDL);
 
   return { inbound: _inbound, outbound: _outbound };
 }
