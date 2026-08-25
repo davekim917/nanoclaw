@@ -1397,3 +1397,35 @@ describe('CLAUDE_CODE_OAUTH_LANES reaches the container', () => {
     expect(source).toMatch(/if\s*\(\s*oauthLanes\s*\)\s*args\.push/);
   });
 });
+
+// ── OAuth scope declaration ──────────────────────────────────────────────────
+// Same source-level guard, same reason it is needed, different silence.
+//
+// When the CLI authenticates from CLAUDE_CODE_OAUTH_TOKEN it has no stored
+// credential to read scopes from, so it synthesises one and defaults its
+// scopes to ["user:inference"]. Plan utilization is gated behind
+// `user:profile`: with the default the CLI answers `rate_limits_available:
+// false` and never attempts the lookup, so every usage_pull sample lands with
+// a NULL utilization and nothing anywhere reports an error. Verified against
+// the shipped CLI binary and reproduced end to end — same token, same proxy,
+// scopes undeclared -> no windows, declared -> five_hour + seven_day.
+describe('CLAUDE_CODE_OAUTH_SCOPES reaches the container', () => {
+  const source = fs
+    .readFileSync(path.join(import.meta.dirname, 'container-runner.ts'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+  it('declares user:profile alongside user:inference on the forwarded token', () => {
+    // Both scopes matter: `user:inference` gates ii(), `user:profile` gates
+    // the utilization read. Dropping either puts the pull back to silent.
+    expect(source).toMatch(/args\.push\(\s*'-e',\s*'CLAUDE_CODE_OAUTH_SCOPES=user:inference user:profile'/);
+  });
+
+  it('declares them only where a host OAuth token is forwarded', () => {
+    // Under API-key / Bedrock / Vertex auth there is no OAuth token for the
+    // scopes to describe, and claiming scopes for one would be a lie.
+    const oauthBlock = source.slice(source.indexOf('if (hostOauth) {'));
+    expect(oauthBlock.indexOf('CLAUDE_CODE_OAUTH_SCOPES')).toBeGreaterThan(-1);
+    expect(oauthBlock.indexOf('CLAUDE_CODE_OAUTH_SCOPES')).toBeLessThan(oauthBlock.indexOf('const ghToken'));
+  });
+});

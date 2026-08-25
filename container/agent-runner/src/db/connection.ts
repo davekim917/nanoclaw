@@ -140,15 +140,23 @@ const RATE_LIMIT_SAMPLES_DDL = `
     subscription_type TEXT,
     available         INTEGER NOT NULL,
     -- Window: five_hour | seven_day | seven_day_oauth_apps | seven_day_opus.
-    -- NULL when available = 0, or when the plan reported no windows.
+    -- NULL when available = 0, or when the plan reported no windows — read
+    -- 'status' for which.
     limit_type        TEXT,
     -- 0-1 FRACTION, matching turn_usage.rate_limit_utilization. The pull
     -- reports 0-100 and is divided at the capture seam; rate_limit_event
     -- already reports a fraction.
     utilization       REAL,
     resets_at         TEXT,
-    -- rate_limit_event's status (allowed_warning / rejected). The pull does
-    -- not carry one, so it is NULL there.
+    -- Why this row looks the way it does. For rate_limit_event: the SDK's own
+    -- status (allowed_warning / rejected). For usage_pull: NULL when the row
+    -- carries a real reading, else the reason it does not —
+    --   'not_applicable' = plan limits do not apply to this session at all
+    --                      (API key / Bedrock / Vertex, or the CLI was not
+    --                      told the token carries 'user:profile'),
+    --   'no_window'      = the pull answered but named no usable window.
+    -- A NULL utilization with NO row at all is the third state: not sampled.
+    -- Without this column all three read as "the number is missing".
     status            TEXT
   );
 `;

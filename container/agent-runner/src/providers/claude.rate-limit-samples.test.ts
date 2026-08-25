@@ -197,6 +197,29 @@ describe('usageResponseToSamples', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ available: true, limitType: null, utilization: null });
   });
+
+  // The three states are only distinguishable to a reader if the row says
+  // which one it is. `available` alone is an unlabelled integer several
+  // columns away from the NULL the reader is actually looking at, so every
+  // pull row with no reading names its reason in `status`.
+  it('labels each NULL-utilization pull row with the reason, and leaves real readings unlabelled', () => {
+    const notApplicable = usageResponseToSamples({ rate_limits_available: false, rate_limits: null }, NO_IDENTITY);
+    expect(notApplicable[0].status).toBe('not_applicable');
+
+    const noWindow = usageResponseToSamples({ rate_limits_available: true, rate_limits: {} }, NO_IDENTITY);
+    expect(noWindow[0].status).toBe('no_window');
+
+    const sampled = usageResponseToSamples(
+      { rate_limits_available: true, rate_limits: { five_hour: { utilization: 12, resets_at: null } } },
+      NO_IDENTITY,
+    );
+    expect(sampled[0].utilization).toBe(0.12);
+    expect(sampled[0].status).toBeNull();
+
+    // Distinct labels, so a reader can tell the two apart without knowing
+    // what `available` means.
+    expect(notApplicable[0].status).not.toBe(noWindow[0].status);
+  });
 });
 
 describe('capture through the provider', () => {

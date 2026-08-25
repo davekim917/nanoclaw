@@ -3430,6 +3430,17 @@ async function buildContainerArgs(
     // install that never sets it sends nothing.
     const oauthLanes = process.env.CLAUDE_CODE_OAUTH_LANES;
     if (oauthLanes) args.push('-e', `CLAUDE_CODE_OAUTH_LANES=${oauthLanes}`);
+    // Declare the scopes the forwarded token carries. NOT cosmetic: when the
+    // CLI authenticates from CLAUDE_CODE_OAUTH_TOKEN it has no credential
+    // record to read scopes from, so it synthesizes one and defaults scopes to
+    // ["user:inference"] alone. Plan utilization is gated behind
+    // `user:profile` — with the default the CLI reports
+    // `rate_limits_available: false` and never even attempts the lookup, so
+    // every usage_pull sample lands with a NULL utilization. Verified against
+    // the shipped 2.1.219 binary and reproduced end to end: same token, same
+    // proxy, scopes undeclared -> available:false / no windows; declared ->
+    // available:true / five_hour + seven_day readings.
+    args.push('-e', 'CLAUDE_CODE_OAUTH_SCOPES=user:inference user:profile');
   }
 
   // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves

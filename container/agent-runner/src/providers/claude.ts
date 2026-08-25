@@ -163,6 +163,11 @@ export function planUsagePuller(q: unknown): (() => Promise<SdkUsageResponse>) |
  * A window the plan omits or reports as null is skipped rather than written
  * as a null reading. If that leaves nothing, one `available: true` row with
  * no window still records that the pull happened.
+ *
+ * Every pull row whose `utilization` is NULL says WHY in `status` — the
+ * column that already exists to explain a row. Without it the three states
+ * are indistinguishable to anyone reading the table who does not already
+ * know what `available` means: they all look like a missing number.
  */
 export function usageResponseToSamples(res: SdkUsageResponse, who: AccountIdentity): RateLimitSample[] {
   const base = {
@@ -172,7 +177,9 @@ export function usageResponseToSamples(res: SdkUsageResponse, who: AccountIdenti
     status: null,
   };
   if (res.rate_limits_available !== true || !res.rate_limits) {
-    return [{ ...base, available: false, limitType: null, utilization: null, resetsAt: null }];
+    return [
+      { ...base, available: false, limitType: null, utilization: null, resetsAt: null, status: 'not_applicable' },
+    ];
   }
   const rows: RateLimitSample[] = [];
   for (const [limitType, w] of Object.entries(res.rate_limits)) {
@@ -188,7 +195,7 @@ export function usageResponseToSamples(res: SdkUsageResponse, who: AccountIdenti
     });
   }
   if (rows.length === 0) {
-    return [{ ...base, available: true, limitType: null, utilization: null, resetsAt: null }];
+    return [{ ...base, available: true, limitType: null, utilization: null, resetsAt: null, status: 'no_window' }];
   }
   return rows;
 }
