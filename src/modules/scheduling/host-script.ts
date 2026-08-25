@@ -17,7 +17,7 @@
  * across every session on the fleet, so nothing here runs unclassified. See
  * `classifyForHostExecution` below.
  */
-import { execFile } from 'node:child_process';
+import { execFile, type ExecFileOptionsWithStringEncoding } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -25,8 +25,15 @@ import type Database from 'better-sqlite3';
 
 import { log } from '../../log.js';
 import { evaluateManagedGitCommand } from '../../managed-git-command-guard.js';
+// Import-order trap (see config.ts): process.env alone misses values that
+// exist only in .env, because this module is imported before index.ts's
+// loadEnvIntoProcess() runs.
+import { TASK_SCRIPT_TIMEOUT_MS } from '../../config.js';
 
-const SCRIPT_TIMEOUT_MS = 30_000;
+// Same rationale as the container-side constant (task-script.ts): the flat
+// 30s default killed a working 56s watcher script into an auto-pause.
+// Centralized in config.ts so .env actually reaches it (import-order trap).
+const SCRIPT_TIMEOUT_MS = TASK_SCRIPT_TIMEOUT_MS;
 const SCRIPT_MAX_BUFFER = 1024 * 1024;
 
 export interface ScriptResult {
@@ -117,11 +124,65 @@ export function runHostScript(script: string, taskId: string): Promise<ScriptRes
   fs.writeFileSync(scriptPath, script, { mode: 0o755 });
 
   return new Promise((resolve) => {
-    execFile(
+    let settled = false;
+    // Hard deadline BEYOND execFile's own timeout: the built-in timeout sends
+    // SIGTERM to the direct child only, and the callback fires when stdio
+    // closes — a script that backgrounds children holding the pipes would
+    // otherwise wedge this promise open, and with it the whole sequential
+    // sweep session loop (this call is awaited inside prepareDueWake). The
+    // race guarantees the sweep always advances: on deadline we kill the
+    // ENTIRE process group (detached:true below makes the child its own
+    // group leader, so -pid reaches backgrounded grandchildren too — a
+    // lone SIGKILL to bash would orphan them mid-side-effect), unlink the
+    // temp script, and resolve null.
+    const hardDeadline = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        if (child.pid) process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      try {
+        fs.unlinkSync(scriptPath);
+      } catch {
+        /* best-effort cleanup */
+      }
+      log.warn('Host task-script exceeded hard deadline — killed process group, resolving null', { taskId });
+      resolve(null);
+    }, SCRIPT_TIMEOUT_MS + 10_000);
+    const child = execFile(
       'bash',
       [scriptPath],
-      { timeout: SCRIPT_TIMEOUT_MS, maxBuffer: SCRIPT_MAX_BUFFER, env: minimalEnv() },
+      // Node's ExecFileOptions typing omits `detached`, but the option is
+      // passed through to spawn — it is what makes the child a process-group
+      // leader so the deadline's -pid SIGKILL reaches grandchildren too.
+      // (Stating utf8 selects the string-callback overload that `detached`
+      // otherwise leaves ambiguous.)
+      {
+        timeout: SCRIPT_TIMEOUT_MS,
+        maxBuffer: SCRIPT_MAX_BUFFER,
+        env: minimalEnv(),
+        detached: true,
+        encoding: 'utf8',
+      } as ExecFileOptionsWithStringEncoding,
       (error, stdout, stderr) => {
+        clearTimeout(hardDeadline);
+        if (settled) return;
+        settled = true;
+        // Node's built-in timeout SIGTERMs child.pid alone; with detached:true
+        // any backgrounded grandchild would survive it. Group-kill here too.
+        try {
+          if (child.pid && (error as { killed?: boolean } | null)?.killed) {
+            process.kill(-child.pid, 'SIGKILL');
+          }
+        } catch {
+          /* already gone */
+        }
         try {
           fs.unlinkSync(scriptPath);
         } catch {

@@ -22,6 +22,7 @@ import {
   MAX_CONCURRENT_CONTAINERS,
   ONECLI_API_KEY,
   ONECLI_URL,
+  TASK_SCRIPT_TIMEOUT_MS,
   TIMEZONE,
   WORKGROUP_SHARED_FS,
 } from './config.js';
@@ -738,19 +739,6 @@ async function spawnContainer(
   }
   writeSessionRouting(agentGroup.id, session.id);
 
-  // Snapshot host capabilities into the session dir so the container can
-  // read a static JSON (Phase 5.3). Refreshed every spawn so newly-mounted
-  // credentials / plugins / channel registrations appear immediately.
-  // Subject for the Slack owner-safety gate. Identical to
-  // session.messaging_group_id for chat sessions; for a task session (which has
-  // none by construction) this resolves the series' delivery destination so the
-  // gate judges WHERE THE TASK POSTS instead of fail-closing on null. See
-  // resolveSlackSafetyMessagingGroupId.
-  const { resolveSlackSafetyMessagingGroupId } = await import('./modules/permissions/task-slack-subject.js');
-  const slackSafetyMessagingGroupId = resolveSlackSafetyMessagingGroupId(session);
-
-  writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
-
   // The config was read once at the reserved-spawn boundary and is threaded
   // through workgroup reconciliation, provider resolution, mounts, and args.
   const effectiveResources = resolveContainerResources(containerConfig.resources);
@@ -897,6 +885,13 @@ async function spawnContainer(
     }
   }
 
+  // Identical to session.messaging_group_id for chat sessions; for a task
+  // session (which has none by construction) this resolves the series'
+  // delivery destination so the gate judges WHERE THE TASK POSTS instead of
+  // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
+  const { resolveSlackSafetyMessagingGroupId } = await import('./modules/permissions/task-slack-subject.js');
+  const slackSafetyMessagingGroupId = resolveSlackSafetyMessagingGroupId(session);
+
   const args = await buildContainerArgs(
     mounts,
     containerName,
@@ -917,6 +912,20 @@ async function spawnContainer(
     repositoryWorkUnit,
     slackSafetyMessagingGroupId,
   );
+
+  // Snapshot host capabilities into the session dir so the container can
+  // read a static JSON (Phase 5.3). Refreshed every spawn so newly-mounted
+  // credentials / plugins / channel registrations appear immediately.
+  // Deliberately AFTER buildContainerArgs: that call resolves the GitHub
+  // token (minting/refreshing the App cache), and the snapshot's expiresAt
+  // field must describe the credential THIS spawn actually injects — writing
+  // it earlier surfaced the pre-spawn cache state instead (stale-low or
+  // absent on cold start). Subject for the Slack owner-safety gate. Identical
+  // to session.messaging_group_id for chat sessions; for a task session
+  // (which has none by construction) this resolves the series' delivery
+  // destination so the gate judges WHERE THE TASK POSTS instead of
+  // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
+  writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -3196,6 +3205,13 @@ async function buildContainerArgs(
   );
   args.push('-e', `NANOCLAW_ASSISTANT_NAME=${resolvedAssistantName}`);
   if (sessionThreadId) args.push('-e', `NANOCLAW_THREAD_ID=${sessionThreadId}`);
+  // Pre-task script timeout override — forwarded CLAMPED (config.TASK_SCRIPT_TIMEOUT_MS),
+  // unconditionally: when unset it is 120_000, identical to the container
+  // default, so an unconfigured spawn is behaviorally unchanged. The gate
+  // cannot be `process.env` alone — .env-only values never reach it at this
+  // point (config.ts's import-order trap), and silently dropping a documented
+  // operator override is what reintroduced the original 30s-kill failure.
+  args.push('-e', `NANOCLAW_TASK_SCRIPT_TIMEOUT_MS=${TASK_SCRIPT_TIMEOUT_MS}`);
   if (repositoryWorkUnit) {
     args.push('-e', `NANOCLAW_HOST_DATA_DIR=${DATA_DIR}`);
     args.push('-e', `NANOCLAW_HOST_TOPIC_WORKTREES_DIR=${topicWorktreesDir(repositoryWorkUnit)}`);

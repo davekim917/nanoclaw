@@ -1050,7 +1050,6 @@ async function sweep(): Promise<void> {
   // fires. One line per slow tick, with the per-session share, convicts or
   // clears it from the log alone.
   const sweepStartedAtMs = Date.now();
-  let sessionsMs = 0;
   let sweptSessions = 0;
   if (!running) return;
 
@@ -1116,7 +1115,7 @@ async function sweep(): Promise<void> {
     const live = new Set(sessions.map((s) => s.id));
     for (const id of quietSessions.keys()) if (!live.has(id)) quietSessions.delete(id);
   }
-  sessionsMs = Date.now() - sessionsStartedAtMs;
+  const sessionsMs = Date.now() - sessionsStartedAtMs;
   lastSkippedQuiet = skippedQuiet;
 
   // Finalize any "Reject with reason…" holds whose reply window elapsed (admin
@@ -1134,6 +1133,17 @@ async function sweep(): Promise<void> {
   // MODULE-HOOK:orchestrator-dispatch:reconciler — complete admitted-but-incomplete tasks.
   // Runs after per-session sweeps so container state is current.
   runReconcilerSweep();
+
+  // Proactively re-mint GitHub App installation tokens inside their refresh
+  // margin, so a container respawning mid-hour gets a fresh credential instead
+  // of one about to die (2026-08-23: an hour-old token flapped mid-session and
+  // stalled release-day work). Opportunistic — failures log and retry next tick.
+  try {
+    const { refreshExpiringGitHubAppTokens } = await import('./github-app-token.js');
+    await refreshExpiringGitHubAppTokens();
+  } catch (err) {
+    log.warn('GitHub App token refresh sweep step failed', { err });
+  }
 
   // Advance operator-confirmed thread closes: wait for the agent's wrap-up
   // confirmation, then clear its saved work, stop the container and archive —

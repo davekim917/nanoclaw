@@ -320,3 +320,73 @@ describe('buildSessionServicesSnapshot', () => {
     }
   });
 });
+
+describe('GitHub App sentinel scoping', () => {
+  // Fills the host-level App token cache WITHOUT network: write a throwaway
+  // RSA key, stub fetch to a mint response, mint once via the module under
+  // the same key the capabilities builder reads.
+  async function warmAppCache(env: NodeJS.ProcessEnv): Promise<void> {
+    const { clearGitHubAppTokenCache, resolveGitHubAppToken } = await import('./github-app-token.js');
+    clearGitHubAppTokenCache();
+    // Real RSA key so the RS256 signing path runs and the mint succeeds —
+    // without it resolveGitHubAppToken fail-closes and the cache stays cold.
+    const keyPath = fs.mkdtempSync('/tmp/nanoclaw-cap-gh-') + '/key.pem';
+    const crypto = await import('crypto');
+    fs.writeFileSync(
+      keyPath,
+      crypto.generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+      }).privateKey,
+    );
+    env.GITHUB_APP_PRIVATE_KEY_PATH = keyPath;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ token: 'ghs_test', expires_at: new Date(Date.now() + 3600_000).toISOString() }), {
+          status: 201,
+          headers: { 'content-type': 'application/json' },
+        }),
+      ),
+    );
+    await resolveGitHubAppToken(env);
+  }
+
+  it('a PAT group never receives App-cache expiry or App-shape guidance', async () => {
+    insertWorkgroup('example-pat', []);
+    const ag = group('ag-pat-group', 'example-pat');
+    createGroupInWorkgroup(ag, 'example-pat');
+    // Host happens to hold App config + warm cache from ANOTHER group's use.
+    process.env.GITHUB_APP_ID = '1';
+    process.env.GITHUB_APP_INSTALLATION_ID = '42';
+    await warmAppCache(process.env);
+
+    vi.stubEnv('GITHUB_TOKEN', 'ghp_static_pat');
+    const snapshot = buildSessionServicesSnapshot(ag.id);
+    const gh = snapshot.services.find((s) => s.name === 'GitHub');
+    expect(gh).toBeDefined();
+    expect(gh?.expiresAt).toBeUndefined();
+    expect(gh?.activation ?? '').not.toContain('HEALTHY App installation token');
+    delete process.env.GITHUB_APP_ID;
+    delete process.env.GITHUB_APP_INSTALLATION_ID;
+  });
+
+  it('a sentinel group gets expiresAt matching the cache plus the App-shape guidance', async () => {
+    insertWorkgroup('example-app', []);
+    const ag = group('ag-app-group', 'example-app');
+    createGroupInWorkgroup(ag, 'example-app');
+    process.env.GITHUB_APP_ID = '1';
+    process.env.GITHUB_APP_INSTALLATION_ID = '42';
+    await warmAppCache(process.env);
+
+    vi.stubEnv('GITHUB_TOKEN', 'app:github');
+    const snapshot = buildSessionServicesSnapshot(ag.id);
+    const gh = snapshot.services.find((s) => s.name === 'GitHub');
+    expect(gh?.expiresAt).toBeDefined();
+    expect(Number.isFinite(Date.parse(gh!.expiresAt!))).toBe(true);
+    expect(gh?.activation ?? '').toContain('HEALTHY App installation token');
+    delete process.env.GITHUB_APP_ID;
+    delete process.env.GITHUB_APP_INSTALLATION_ID;
+  });
+});

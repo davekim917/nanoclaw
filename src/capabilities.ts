@@ -26,6 +26,7 @@ import { readContainerConfig } from './container-config.js';
 import { getDb } from './db/connection.js';
 import { getAllAgentGroups, getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import { mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
+import { GITHUB_APP_SENTINEL, peekGitHubAppTokenExpiry } from './github-app-token.js';
 import { isOwnerSafeSlackSession } from './modules/permissions/slack-user-token-gate.js';
 import { getAllMessagingGroups } from './db/messaging-groups.js';
 import { extractToolScopes } from './scoped-env.js';
@@ -113,6 +114,15 @@ export interface SessionServicesSnapshot {
     credentialPaths: string[];
     /** Concise activation instruction for the CLI, if any. */
     activation?: string;
+    /**
+     * When the host's cached copy of this credential expires (ISO-8601), for
+     * short-TTL tokens like GitHub App installation tokens. Precision matters:
+     * a RUNNING container's own env copy was frozen at its spawn, so if its
+     * calls 401 while this shows future expiry, the container holds a stale
+     * spawn-time token — restart fixes that. Absent on the first wake after a
+     * cold host start (nothing minted yet).
+     */
+    expiresAt?: string;
     /**
      * When-to-use guidance for services where the gap is "agent doesn't
      * reach for the tool" rather than "agent can't authenticate". Populated
@@ -418,6 +428,17 @@ export function buildSessionServicesSnapshot(
     if (resolved.set || declared(['github'])) {
       const scopeList = extractToolScopes(tools, 'github').scopes;
       const allowedOrgs = resolveScopedEnvVar('GITHUB_ALLOWED_ORGS', folder);
+      // Expiry only means something when THIS group authenticates as the App:
+      // peek reads the host-wide App cache, and a PAT group must never be told
+      // its static token "expires" on someone else's installation schedule.
+      const resolvedTokenValue = resolved.set ? process.env[resolved.name] : undefined;
+      const isAppSentinel = resolvedTokenValue === GITHUB_APP_SENTINEL;
+      const githubTokenExpiresAt = isAppSentinel ? peekGitHubAppTokenExpiry() : undefined;
+      // App-token 403 shapes are App-specific; a PAT group must never have a
+      // real authorization failure explained away as "healthy app behavior".
+      const tokenShapeNote = isAppSentinel
+        ? ` **Known token shape:** \`gh api user\` returns 403 even on a HEALTHY App installation token — apps cannot call \`/user\`; probe liveness with \`gh api repos/{owner}/{repo} --jq .full_name\`. On some app installations \`gh pr checks\` and \`/commits/{sha}/check-runs\` 403 while the Actions runs API still works — if a Checks-path call 403s, read CI via \`gh api repos/{owner}/{repo}/actions/runs?head_sha=<sha>\` (and \`.../actions/runs/{id}/jobs\` for per-job detail) instead.`
+        : '';
       services.push({
         name: 'GitHub',
         cli: 'gh',
@@ -427,8 +448,9 @@ export function buildSessionServicesSnapshot(
         activation: resolved.set
           ? `\`gh\` and \`git\` both pre-authenticated via \`GITHUB_TOKEN\` (resolved from host env \`${resolved.name}\`)${
               allowedOrgs.set ? `, restricted to orgs: \`${process.env[allowedOrgs.name]}\`` : ''
-            }. \`gh repo view\`, \`gh pr create\`, \`git push\` all work directly. **CI/Actions is included, not a separate integration** — you CAN check build and test status yourself, and must never tell the user you lack access to CI. \`gh pr checks <pr>\` for a PR's check rollup, \`gh run list --branch <branch>\`, \`gh run view <run-id> --log-failed\` for the failing step's output, \`gh run watch <run-id>\` to block until it settles. Anything those wrappers don't cover, reach the REST API directly with \`gh api\` (e.g. \`gh api repos/{owner}/{repo}/actions/runs\`, \`.../commits/{sha}/check-runs\`, \`.../actions/runs/{id}/jobs\`) — \`gh api\` is authenticated by the same token and covers every GitHub endpoint, so "there's no tool for it" is never the right answer. To poll a run without burning a turn, use the \`wait\` tool rather than sleeping. DO NOT run \`gh auth login\`. DO NOT ask the user for a token — it's already in your env.`
+            }. \`gh repo view\`, \`gh pr create\`, \`git push\` all work directly. **CI/Actions is included, not a separate integration** — you CAN check build and test status yourself, and must never tell the user you lack access to CI. \`gh pr checks <pr>\` for a PR's check rollup (GraphQL statusCheckRollup under the hood), \`gh run list --branch <branch>\`, \`gh run view <run-id> --log-failed\` for the failing step's output, \`gh run watch <run-id>\` to block until it settles.${tokenShapeNote} A 403 on one endpoint can be a permissions shape rather than a dead credential — before reporting lost access, retry the same read through a different GitHub surface (\`gh api\` covers every endpoint with this same token). To poll a run without burning a turn, use the \`wait\` tool rather than sleeping. DO NOT run \`gh auth login\`. DO NOT ask the user for a token — it's already in your env.`
           : `GitHub tool declared but no token set at host env ${tokenEnvName ?? 'GITHUB_TOKEN_<folder>'} or fallback GITHUB_TOKEN — ask Operator.`,
+        ...(resolved.set && githubTokenExpiresAt ? { expiresAt: githubTokenExpiresAt } : {}),
       });
     }
   }
