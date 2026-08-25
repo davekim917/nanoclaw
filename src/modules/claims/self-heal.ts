@@ -53,8 +53,9 @@
 import fs from 'fs';
 import path from 'path';
 
-import { PARK_GRACE_MS, readClaims, type BoardClaim } from '../../claims-board.js';
+import { MAX_CLAIM_BYTES, PARK_GRACE_MS, readClaims, resolveClaimsDir, type BoardClaim } from '../../claims-board.js';
 import { SELF_HEAL_ENABLED, SELF_HEAL_TAKEOVER_ENABLED } from '../../config.js';
+import { readContainedFile } from '../../dashboard/api/attention-fs.js';
 import { log } from '../../log.js';
 import { claimsBaseDir, declaresItselfFinished } from './escalation.js';
 
@@ -773,10 +774,38 @@ export async function sweepClaimsSelfHeal(
   for (const workgroupId of listWorkgroupDirs(root)) {
     for (const claim of readClaims(workgroupId, now, root)) {
       if (claim.state !== 'stale') continue;
-      const file = path.join(root, workgroupId, 'claims', `${claim.slug}.json`);
+
+      // Re-resolved FRESH, not the `dir` `readClaims` used a moment ago: that
+      // call already proved the claims directory was safe to read at THAT
+      // instant, but `claims/` is agent-writable and can be swapped for a
+      // symlink between then and now just as easily as a single leaf can.
+      const dir = resolveClaimsDir(root, workgroupId);
+      if (dir === null) {
+        log.warn('self-heal: claims directory unreadable or escapes the workgroup, skipping', {
+          workgroupId,
+          slug: claim.slug,
+        });
+        continue;
+      }
+      const file = path.join(dir, `${claim.slug}.json`);
+
+      // This re-reads the SAME claim `readClaims` just classified, moments
+      // earlier — every property of the file on disk (FIFO, directory,
+      // symlinked elsewhere, oversized) is still an agent's choice right up to
+      // this line, so it goes through the same `readContainedFile` seam
+      // `claims-board.ts` uses rather than a raw `readFileSync`. A plain
+      // `readFileSync` here opens for reading unconditionally, and opening a
+      // FIFO for reading BLOCKS until a writer appears — on the host's single
+      // event loop, which is also the sweep that would need to run again to
+      // ever notice. `MAX_CLAIM_BYTES` is the board's own cap, imported rather
+      // than re-declared, so this path and the board's can never read the same
+      // claim at two different limits.
+      const read = readContainedFile('self-heal', dir, `${claim.slug}.json`, workgroupId, MAX_CLAIM_BYTES);
+      if (read === null) continue; // already logged by readContainedFile — FIFO, oversized, escaping, or absent
+
       let raw: SelfHealStamps & { note?: unknown };
       try {
-        raw = JSON.parse(fs.readFileSync(file, 'utf8')) as SelfHealStamps & { note?: unknown };
+        raw = JSON.parse(read.text) as SelfHealStamps & { note?: unknown };
       } catch (err) {
         log.warn('self-heal: unparseable claim, skipping', { file, err });
         continue;
