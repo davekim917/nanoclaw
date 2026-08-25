@@ -156,7 +156,10 @@ if [ -s "$HANDOFF_LEDGER" ]; then
 fi
 
 sort -u -o "$PROTECTED_FILE" "$PROTECTED_FILE"
-is_protected() { grep -qxF "$1" "$PROTECTED_FILE" 2>/dev/null; }
+# `--` because a run id may legitimately start with `-` (a run prefix from a
+# wrapper, a hand-made directory), and grep would otherwise parse it as an
+# option, fail, and report the run UNPROTECTED — a delete-side fail-open.
+is_protected() { grep -qxF -- "$1" "$PROTECTED_FILE" 2>/dev/null; }
 
 # Extension list -> a `find -iname` OR-expression, built once.
 IFS=',' read -ra EXT_LIST <<<"$MEDIA_EXTENSIONS"

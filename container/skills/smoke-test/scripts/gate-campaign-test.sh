@@ -259,5 +259,40 @@ ck "same on the stamp path"   "$(cat "$T/freeze-probe.txt" 2>/dev/null)" "free"
 bash "$G" release camp-fs >/dev/null
 unset SMOKE_GATE_FREEZE_STATUS_CONTEXT LOCK_PROBE LOCK_PROBE_FILE
 
+echo "25. the poll's post-fetch write must PRESERVE a stamp that landed mid-fetch"
+# Releasing the lock across the fetch is only safe because every writer after it
+# re-reads state. Without the re-read the poll writes back its pre-fetch
+# snapshot and silently erases the liveness stamp a coordinator took while the
+# poll was on the network — the run then looks stale and gets reclaimed.
+export FAKE_SOURCE="$SHB" FAKE_BACKEND="$SHB" FAKE_FRONTEND="$SHB"
+jq -cn --arg s "$SHB" '[{headSha:$s,status:"completed",conclusion:"success",workflowName:"CI"}]' > "$T/checks.json"
+jq -c --arg s "$SHA" --arg n "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{schemaVersion:1,activeRunId:"camp-race",activeSha:$s,activeStartedAt:$n,activeProgressAt:$n}' \
+  -n > "$T/state/develop-state.json"
+FAKE_FETCH_DELAY=3 bash "$G" poll >"$T/poll-out.json" 2>/dev/null &
+POLLER=$!; sleep 1
+bash "$G" progress camp-race >/dev/null
+STAMP="$(st '.activeProgressAt')"
+wait $POLLER
+ck "poll saw the active run" "$(jq -r '.data.trigger' "$T/poll-out.json")" "queued_behind_active_run"
+ck "stamp survived the poll" "$(st '.activeProgressAt')"  "$STAMP"
+ck "slot survived the poll"  "$(st '.activeRunId')"       "camp-race"
+
+echo "26. ...and a CLAIM landing mid-fetch is not overwritten by the poll"
+# The other interleaving: an empty slot at fetch time, taken by a human claim
+# before the poll reaches its state phase. A poll writing back its pre-fetch
+# snapshot would issue its OWN run id over the fresh claim — two coordinators
+# on one environment, which is the failure the whole slot mechanism exists for.
+echo '{"schemaVersion":1}' > "$T/state/develop-state.json"
+rm -f "$T/run-active.json"
+FAKE_FETCH_DELAY=3 bash "$G" poll >"$T/poll-out2.json" 2>/dev/null &
+POLLER=$!; sleep 1
+bash "$G" claim camp-claimed "$SHB" >/dev/null
+wait $POLLER
+ck "poll deferred"           "$(jq -r '.data.trigger' "$T/poll-out2.json")" "already_active"
+ck "claim not overwritten"   "$(st '.activeRunId')"     "camp-claimed"
+ck "no rival wake"           "$(jq -r '.wakeAgent' "$T/poll-out2.json")"    "false"
+bash "$G" release camp-claimed >/dev/null
+
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || echo "FAILURES PRESENT"
 exit "$FAIL"

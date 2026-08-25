@@ -49,8 +49,10 @@ jq -e '
 ' "$FIXTURE_DIR/completion-contract.json" >/dev/null
 
 # Deployment extras must never be able to forge the fields the barrier checks.
+# (`--regenerate` because this is a deliberate same-SHA rewrite of a contract
+# that already exists — the re-scaffold guard refuses one without it.)
 SMOKE_CONTRACT_EXTRA="{\"sourceSha\":\"$OTHER_SHA\",\"requiredLaneMarkers\":[]}" \
-  scaffold contract "$FIXTURE_DIR" "$SHA" B1:browser S1:source >/dev/null
+  scaffold contract "$FIXTURE_DIR" "$SHA" B1:browser S1:source --regenerate >/dev/null
 jq -e --arg sha "$SHA" '.sourceSha == $sha and (.requiredLaneMarkers | length == 2)' \
   "$FIXTURE_DIR/completion-contract.json" >/dev/null
 
@@ -176,6 +178,51 @@ printf '# d\n' >"$FRESH/challenger/disposition.md"
 # sourceSha — never stated by the caller.
 jq -e '.generation == 1' "$FRESH/markers/B1.json" >/dev/null
 barrier "$FRESH" lanes | jq -e '.ready == true' >/dev/null
+
+# N1-A regression: the guard must arm on the PRIOR CONTRACT, not on marker
+# count. Lanes get redefined BEFORE any marker lands, so an "only if markers
+# exist" condition left the whole early-run window open: rewrite at generation
+# 1, then the worker still briefed on the OLD lane stamps its marker, inherits
+# generation 1, and the barrier reports ready on old-definition evidence.
+# Reproduced end-to-end before this fix.
+EARLY="$(dirname "$FIXTURE_DIR")/early-fixture"
+mkdir -p "$EARLY/coordinator" "$EARLY/challenger"
+printf '# p\n' >"$EARLY/coordinator/preliminary.md"
+printf '# d\n' >"$EARLY/challenger/disposition.md"
+gate_owns "$(basename "$EARLY")"
+scaffold contract "$EARLY" "$SHA" B1:browser B2:browser:'permission crossings' >/dev/null
+[ -z "$(ls -A "$EARLY/markers" 2>/dev/null)" ] || { echo "fixture: expected no markers yet" >&2; exit 1; }
+OUT="$(scaffold contract "$EARLY" "$SHA" B1:browser B2:browser:'publish exports' 2>&1 || true)"
+jq -e '.ok == false and (.error | test("SAME sourceSha"))' <<<"$OUT" >/dev/null || {
+  echo "expected a same-SHA re-scaffold with NO markers yet to be refused, got: $OUT" >&2
+  exit 1; }
+jq -e '.lanes[1].title == "permission crossings"' "$EARLY/completion-contract.json" >/dev/null
+
+# N1-B regression: a contract file that exists but does NOT read as one
+# (truncated mid-write, corrupt) must refuse too. `-s`/parse-failure used to
+# fall through to "allow", which is fail-open at the exact moment this script
+# knows least — and it re-blessed every stale marker at generation 1.
+scaffold marker "$EARLY" B1 pass 'stale one' >/dev/null
+scaffold marker "$EARLY" B2 pass 'stale two' >/dev/null
+: > "$EARLY/completion-contract.json"
+OUT="$(scaffold contract "$EARLY" "$SHA" B1:browser B2:browser:'publish exports' 2>&1 || true)"
+jq -e '.ok == false and (.error | test("truncated or corrupt"))' <<<"$OUT" >/dev/null || {
+  echo "expected a truncated contract to refuse rather than fail open, got: $OUT" >&2
+  exit 1; }
+[ ! -s "$EARLY/completion-contract.json" ] || { echo "the refused write still landed" >&2; exit 1; }
+# ...and --regenerate over a truncated contract must still bump PAST the
+# markers on disk. There are no lanes[] left to read, so a contract-only scan
+# would reset to 1 and re-bless the very markers it was asked to retire.
+scaffold contract "$EARLY" "$SHA" B1:browser B2:browser:'publish exports' --regenerate \
+  | jq -e '.ok == true' >/dev/null
+jq -e 'all(.lanes[]; .generation == 2)' "$EARLY/completion-contract.json" >/dev/null || {
+  echo "expected --regenerate over a truncated contract to bump past the markers on disk" >&2
+  exit 1; }
+EARLY_OUT="$(barrier "$EARLY" lanes || true)"
+jq -e '.ready == false and (.invalid | sort == ["markers/B1.json","markers/B2.json"])' \
+  <<<"$EARLY_OUT" >/dev/null || {
+  echo "expected the stale markers to be retired, got: $EARLY_OUT" >&2; exit 1; }
+gate_owns "$(basename "$FRESH")"
 
 # A same-SHA re-scaffold over existing markers is REFUSED. This is the concrete
 # incident: a lane repurposed mid-run under a pinned freeze SHA, whose old

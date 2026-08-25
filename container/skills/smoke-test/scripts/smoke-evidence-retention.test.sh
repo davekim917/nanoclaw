@@ -209,4 +209,17 @@ printf '%s' "$HELP_OUT" | grep -q -- '--unprotected' \
   || { echo "--help does not document the escape hatch" >&2; exit 1; }
 rm -rf "$NAKED2"
 
+# --- 12. N5a: a run id starting with `-` is still protected ----------------
+# `grep -qxF "$id"` parses a leading-dash id as an option, fails, and reports
+# the run unprotected — a fail-open on the delete side.
+make_run -dash-run 90
+printf '{"schemaVersion":1,"pr":8,"activeRunId":"-dash-run"}\n' > "$STATE_DIR/pr-8-state.json"
+OUT="$(bash "$SCRIPT" "$RUNS" --delete)"
+jq -e '.protected == 1 and .runsPruned == 0' <<<"$OUT" >/dev/null || {
+  echo "expected a leading-dash run id to be protected, got: $OUT" >&2; exit 1; }
+[ -e "$RUNS/-dash-run/screenshots/shot-1.png" ] \
+  || { echo "an active run whose id starts with a dash was pruned" >&2; exit 1; }
+rm -f "$STATE_DIR/pr-8-state.json"
+rm -rf "$RUNS/-dash-run"
+
 echo "smoke evidence retention tests passed"

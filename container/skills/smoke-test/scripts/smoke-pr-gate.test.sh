@@ -113,6 +113,15 @@ if printf '%s' "$ARGS" | grep -qF '/suspend'; then
     ( flock -n 6 && printf 'free' || printf 'held' ) \
       6>"$STUB_LOCK_PROBE_FILE" > "$STUB_LOCK_PROBE"
   fi
+  # State probe: snapshot the PR state file at the moment the artifact work
+  # begins, so the caller can assert the slot is still HELD here (crash-safety
+  # order) rather than already cleared.
+  if [ -n "${STUB_STATE_PROBE:-}" ] && [ -n "${STUB_STATE_PROBE_FILE:-}" ]; then
+    cat "$STUB_STATE_PROBE_FILE" > "$STUB_STATE_PROBE" 2>/dev/null || true
+  fi
+  # Stall long enough for an outer `timeout` to kill the gate here — a real
+  # mid-flight container death, not a simulated one.
+  [ -n "${STUB_SUSPEND_SLEEP:-}" ] && sleep "$STUB_SUSPEND_SLEEP"
   printf '%s' "$STUB_SUSPEND_CODE"; exit 0
 fi
 if printf '%s' "$ARGS" | grep -qF '/healthz'; then
@@ -141,6 +150,7 @@ reset_stubs() {
         STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS \
         STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
+        STUB_STATE_PROBE STUB_STATE_PROBE_FILE STUB_SUSPEND_SLEEP \
         SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER 2>/dev/null || true
 }
 
@@ -770,5 +780,77 @@ jq -e '.ok == false and (.retryable | not) and (.error | startswith("gate_lock_b
   echo "expected a not-active refusal to carry no retryable flag" >&2; exit 1; }
 # The slot survived the transient miss.
 jq -e '.activeRunId == "run-busy"' "$STATE_DIR/pr-89-state.json" >/dev/null
+
+# --- 20. finish is crash-safe: artifacts BEFORE the slot is cleared ---------
+# Clearing the slot first made finish fail OPEN and permanently: a container
+# death between the halves recorded NO_GO per-PR while the promotion hold was
+# never raised and the ledger line never landed, and the retry was refused with
+# "not the active run" because activeRunId was already null. The develop gate
+# survives its identical window via its hold-integrity reconciler; the PR gate
+# has none, so the ORDER is the whole contract.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+CRASH_TARGET="$(sha 9)"
+CRASH_HEAD="$(sha a)"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$CRASH_TARGET"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-91\",\"name\":\"backend-preview PR #91\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_SUSPEND_CODE=202
+CRASH_PUBLISH="$STATE_DIR/crash/latest-verdict.json"
+CRASH_HOLD="$STATE_DIR/crash/develop-hold.json"
+CRASH_LEDGER="$STATE_DIR/crash/handoff-ledger.jsonl"
+export SMOKE_GATE_PUBLISH_FILE="$CRASH_PUBLISH" SMOKE_GATE_HOLD_FILE="$CRASH_HOLD" \
+  SMOKE_GATE_HANDOFF_LEDGER="$CRASH_LEDGER"
+bash "$GATE" claim run-crash 91 "$CRASH_HEAD" >/dev/null
+
+# The slot must still be held at the moment the artifact work starts.
+export STUB_STATE_PROBE="$STATE_DIR/state-probe.json"
+export STUB_STATE_PROBE_FILE="$STATE_DIR/pr-91-state.json"
+# ...and a real death right there: the stub stalls past the outer timeout.
+export STUB_SUSPEND_SLEEP=5
+timeout 2 bash "$GATE" finish "$CRASH_HEAD" run-crash NO_GO >/dev/null 2>&1 || true
+unset STUB_SUSPEND_SLEEP
+
+jq -e '.activeRunId == "run-crash" and .completedSha == null' "$STUB_STATE_PROBE" >/dev/null || {
+  echo "the slot was already cleared when the artifact work began: $(cat "$STUB_STATE_PROBE")" >&2
+  exit 1; }
+jq -e '.activeRunId == "run-crash" and .completedVerdict == null' "$STATE_DIR/pr-91-state.json" >/dev/null || {
+  echo "a crash mid-finish left the slot cleared, so the retry can never complete: $(cat "$STATE_DIR/pr-91-state.json")" >&2
+  exit 1; }
+[ ! -e "$CRASH_HOLD" ] || { echo "fixture: the hold should not exist yet after the crash" >&2; exit 1; }
+
+# The retry completes rather than being refused, and lands every artifact.
+bash "$GATE" finish "$CRASH_HEAD" run-crash NO_GO | jq -e --arg t "$CRASH_TARGET" '
+  .ok == true and .verdict == "NO_GO" and .handoff.written == true and .handoff.targetSha == $t
+' >/dev/null || { echo "the retry after a mid-finish crash was refused" >&2; exit 1; }
+jq -e --arg t "$CRASH_TARGET" '.sha == $t and .verdict == "NO_GO"' "$CRASH_HOLD" >/dev/null
+jq -e --arg t "$CRASH_TARGET" '.sha == $t' "$CRASH_PUBLISH" >/dev/null
+jq -e --arg t "$CRASH_TARGET" 'select(.targetSha == $t) | .runId == "run-crash"' "$CRASH_LEDGER" >/dev/null
+jq -e --arg sha "$CRASH_HEAD" '.completedSha == $sha and .activeRunId == null' \
+  "$STATE_DIR/pr-91-state.json" >/dev/null
+
+# --- 21. a takeover DURING the artifact window does not stomp the successor --
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+TO_SHA="$(sha b)"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-92\",\"name\":\"backend-preview PR #92\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_SUSPEND_CODE=202
+bash "$GATE" claim run-old 92 "$TO_SHA" >/dev/null
+# Simulate the successor claiming while this finish is on the network.
+export STUB_SUSPEND_SLEEP=2
+bash "$GATE" finish "$TO_SHA" run-old GO > "$STATE_DIR/takeover-out.json" 2>/dev/null &
+FIN=$!
+sleep 0.5
+bash "$GATE" claim run-new 92 "$TO_SHA" --takeover >/dev/null
+wait "$FIN" || true
+unset STUB_SUSPEND_SLEEP
+jq -e '.ok == false and (.error | test("changed hands")) and .activeRunId == "run-new"' \
+  "$STATE_DIR/takeover-out.json" >/dev/null || {
+  echo "expected a finish that lost the slot mid-flight to refuse, got: $(cat "$STATE_DIR/takeover-out.json")" >&2
+  exit 1; }
+jq -e '.activeRunId == "run-new" and .completedSha == null' "$STATE_DIR/pr-92-state.json" >/dev/null || {
+  echo "the late finish stomped the successor's slot" >&2; exit 1; }
 
 echo "smoke pr gate tests passed"

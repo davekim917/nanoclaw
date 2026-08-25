@@ -136,9 +136,17 @@ bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh contract \
 
 Both bump a lane `generation` in the contract, which markers inherit; the
 barrier then names the stale marker in `invalid[]` with a `stale generation`
-reason until a fresh one lands. **A same-SHA `contract` call over existing
-markers is refused without `--regenerate`** — that refusal is the guard, so read
-it rather than working around it.
+reason until a fresh one lands. **A same-SHA `contract` call is refused whenever
+this run already has a contract, `--regenerate` or nothing** — marker count is
+irrelevant, because lanes get redefined before any marker lands. A contract file
+that exists but cannot be parsed is refused too. That refusal is the guard, so
+read it rather than working around it.
+
+**A generation retires markers that are already WRITTEN; it cannot retire work
+already IN FLIGHT.** A worker still briefed on the old lane definition writes
+its marker at whatever generation the contract carries when it writes — so bump
+*before* re-briefing, never after. The refusal above is what forces that
+ordering; it is not a substitute for it.
 
 The coordinator then runs `scripts/smoke-evidence-barrier.sh <run-dir> lanes`
 and writes `coordinator/preliminary.md`. The challenger writes
@@ -797,7 +805,7 @@ of them means stop:
 
 | Response | Meaning | What to do |
 |---|---|---|
-| `retryable:true` and `error` starting `gate_lock_busy:` | Another gate invocation held the state lock. Says **nothing** about who owns the slot. | Wait ~10s and re-run the **same** command. Retry up to 5 times before treating it as an outage. Never stop the campaign. |
+| `retryable:true` and `error` starting `gate_lock_busy:` | Another gate invocation held the state lock. Says **nothing** about who owns the slot. | Wait ~10s and re-run the **same** command. Never stop the campaign. |
 | `ok:false` with any other `error` | This run is no longer the active one (reclaimed, taken over, or already finished). | Stop the campaign immediately instead of double-running the SHA. |
 
 Key the stop decision on the second row, never on bare `ok:false`. A mandatory
@@ -805,6 +813,23 @@ Key the stop decision on the second row, never on bare `ok:false`. A mandatory
 from "you were reclaimed", and stopping on it killed healthy campaigns — the exact
 failure the liveness stamp exists to prevent. `SMOKE_GATE_LOCK_WAIT_SECONDS`
 (default 15) tunes how long a gate call waits before giving up.
+
+**Five `gate_lock_busy` answers in a row is an outage, and an outage has a
+defined response — not "keep retrying".** Do this, in order, and do not treat any
+of it as a reason to publish:
+
+1. **Keep the campaign running and the lanes working.** Nothing about a wedged
+   lock invalidates evidence already gathered. Do not stop, do not void lanes.
+2. **Post one message in the run thread** naming the verb that is failing, the
+   `phase` from the response, and the run id — so the stall is visible rather
+   than inferred later from a gap in the stamps.
+3. **Assume the liveness stamp is not landing.** After
+   `SMOKE_GATE_PROGRESS_STALE_SECONDS` (default 1800) of unstamped silence the
+   watcher may reclaim the slot and start a rival campaign on the same
+   environment. Treat the environment as no longer reliably yours.
+4. **Do not `finish`.** A verdict needs the slot, and you cannot prove you still
+   hold it. Escalate to a human with the thread link instead; a run that cannot
+   reach its gate has not earned verdict authority.
 
 ### Human-requested campaigns
 

@@ -923,7 +923,16 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   if [ -n "$HANDOFF_TARGET" ]; then
     LEDGER_ENTRY=""
     if [ -s "$HANDOFF_LEDGER" ]; then
-      LEDGER_ENTRY="$(jq -c --arg t "$HANDOFF_TARGET" 'select(.targetSha == $t)' "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
+      # `-R` + `fromjson?` per line, same treatment as the retention scan's
+      # read of this file. A streaming `jq select()` aborts at the first
+      # malformed line and `2>/dev/null` hides it, so one torn append — which
+      # is ordinary on a file another process appends to — silently drops every
+      # LATER match, including the outcome this poll is waiting for. Blast
+      # radius is smaller here (it fails toward "not completed yet", which the
+      # staleness ceiling eventually alarms on) but it is the same bug.
+      LEDGER_ENTRY="$(jq -cR --arg t "$HANDOFF_TARGET" \
+        'fromjson? | select(type == "object") | select(.targetSha == $t)' \
+        "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
     fi
     # Bind adoption to the SAME freeze PR as the handoff we currently have
     # open — targetSha alone is not enough to trust a ledger line: it is the
@@ -1273,7 +1282,12 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   # This is the exact point poll would otherwise open a develop_build_settled
   # campaign. Cut a freeze PR instead and hand the campaign off — zero agent
   # tokens spent here, it is a subprocess call, not a dispatch.
-  FREEZE_JSON="$("$FREEZE_HELPER" "$SOURCE_SHA" 2>/dev/null)"
+  # Timed out, like every other network call in this file. The helper makes
+  # five sequential GitHub calls and was the only untimed one — and it runs
+  # holding the state lock, so a hung forge would have wedged the gate for as
+  # long as the call hung rather than for a bounded window. Exit 124 falls
+  # straight into the throttled freeze-failure alarm below.
+  FREEZE_JSON="$(timeout "${SMOKE_GATE_FREEZE_HELPER_TIMEOUT:-90}" "$FREEZE_HELPER" "$SOURCE_SHA" 2>/dev/null)"
   FREEZE_RC=$?
   if [ "$FREEZE_RC" -ne 0 ] || ! jq -e 'type == "object" and has("prNumber") and has("freezeSha")' \
        <<<"$FREEZE_JSON" >/dev/null 2>&1; then

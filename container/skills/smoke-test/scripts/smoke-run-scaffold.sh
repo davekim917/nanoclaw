@@ -31,11 +31,12 @@
 # unreachable and the barrier was enforcing a field nothing could emit.
 #
 # Two writers, matching the two holes:
-#   * `contract --regenerate` refuses a silent overwrite when markers already
-#     exist on the SAME sourceSha and, when forced, bumps EVERY lane past the
-#     highest generation the old contract carried. (A re-freeze on a NEW SHA
-#     needs none of this — the barrier's sourceSha check already retires the
-#     old markers, loudly.)
+#   * `contract --regenerate` refuses a silent overwrite whenever this run
+#     ALREADY HAS A CONTRACT on the same sourceSha — marker count is irrelevant,
+#     since lanes get redefined before any marker lands — and, when forced,
+#     bumps EVERY lane past the highest generation found in the old contract OR
+#     in any marker on disk. (A re-freeze on a NEW SHA needs none of this: the
+#     barrier's sourceSha check already retires those markers, loudly.)
 #   * `redispatch <lane-id>` bumps ONE lane, for the ordinary case of
 #     re-running a single lane while the finished lanes keep counting.
 # Both leave the stale markers on disk on purpose: the barrier then names them
@@ -132,23 +133,43 @@ contract)
   # went from "permission crossings" to "publish/exports") overwrote the
   # contract while its old marker stayed sourceSha-correct, lane-id-correct and
   # terminal — and generation defaulted to 1 on both sides, so it validated
-  # against a definition it had never seen. Refuse that overwrite; on
-  # --regenerate bump every lane past the old contract's highest generation so
-  # no pre-existing marker can vouch for the new definitions.
-  EXISTING_MARKERS=0
-  if [ -d "$RUN_DIR/markers" ]; then
-    EXISTING_MARKERS="$(find "$RUN_DIR/markers" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
-  fi
+  # against a definition it had never seen.
+  #
+  # The guard arms on a PRIOR CONTRACT ALONE — never on marker count. Markers
+  # are the LAST thing to land and lane definitions get rewritten BEFORE any of
+  # them exist, so an "only if markers are present" condition leaves the entire
+  # early-run window open: rewrite at generation 1, then the worker still
+  # briefed on the old B2 stamps its marker and INHERITS generation 1, and the
+  # barrier reports ready on old-definition evidence. That is the original
+  # incident, unchanged. A contract file that exists but cannot be read as one
+  # (truncated, corrupt) REFUSES too: that is the case where this script knows
+  # least about what the run already committed to, which makes it the worst
+  # possible moment to fail open.
   GENERATION=1
-  if [ -s "$CONTRACT" ] && [ "$EXISTING_MARKERS" -gt 0 ]; then
-    PRIOR_SHA="$(jq -r '.sourceSha // empty' "$CONTRACT" 2>/dev/null || printf '')"
-    if [ "$PRIOR_SHA" = "$SOURCE_SHA" ] && [ "$REGENERATE" != true ]; then
-      die "refusing to overwrite $CONTRACT: $EXISTING_MARKERS lane marker(s) already exist under this run on the SAME sourceSha, so every one of them would keep validating against lane ids this rewrite may have redefined. Re-run with --regenerate to retire them all, use 'redispatch <lane-id>' to retire just one lane, or write markers against the contract that is already there."
+  if [ -e "$CONTRACT" ]; then
+    PRIOR_SHA="$(jq -r 'if (type == "object" and (.sourceSha | type) == "string")
+                        then .sourceSha else "" end' "$CONTRACT" 2>/dev/null || printf '')"
+    printf '%s' "$PRIOR_SHA" | grep -Eq '^[0-9a-f]{40}$' || PRIOR_SHA=""
+    if [ "$REGENERATE" != true ]; then
+      [ -n "$PRIOR_SHA" ] ||
+        die "refusing to overwrite $CONTRACT: the file exists but does not read as a contract (truncated or corrupt), so this script cannot tell which lane definitions the run already committed to, nor which markers a rewrite would leave validating. Re-run with --regenerate to retire every existing marker, or remove the run directory and start clean."
+      [ "$PRIOR_SHA" != "$SOURCE_SHA" ] ||
+        die "refusing to overwrite $CONTRACT: this run already has a contract on the SAME sourceSha. Any marker against it — one already on disk, or one a worker still briefed on the old lane definitions is about to write — would keep validating against lane ids this rewrite may have redefined. Re-run with --regenerate to retire every existing marker, use 'redispatch <lane-id>' to retire just one lane, or write markers against the contract that is already there."
     fi
     if [ "$REGENERATE" = true ]; then
-      GENERATION="$(jq -r '[.lanes[]? | select(type=="object") | (.generation // 1)] | (max // 1) + 1' "$CONTRACT" 2>/dev/null || printf '')"
-      printf '%s' "$GENERATION" | grep -Eq '^[0-9]+$' ||
-        die "could not read the existing contract's lane generations from $CONTRACT — inspect it by hand rather than regenerating blind"
+      # Highest generation anywhere in this run dir: the old contract's lanes
+      # AND every marker on disk. The markers matter on their own — a truncated
+      # contract carries no lanes to read, and bumping to 1 there would re-bless
+      # the exact markers --regenerate exists to retire.
+      GENERATION="$( {
+          jq -r '.lanes[]? | select(type == "object") | (.generation // 1)' "$CONTRACT" 2>/dev/null
+          for m in "$RUN_DIR"/markers/*.json; do
+            [ -f "$m" ] || continue
+            jq -r 'select(type == "object") | (.generation // 1)' "$m" 2>/dev/null
+          done
+        } | grep -E '^[0-9]+$' | sort -n | tail -1 || true )"
+      printf '%s' "$GENERATION" | grep -Eq '^[0-9]+$' || GENERATION=0
+      GENERATION=$(( GENERATION + 1 ))
     fi
   fi
 
