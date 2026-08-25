@@ -1,3 +1,4 @@
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -20,11 +21,24 @@ import {
   type SelfHealDeps,
   type SelfHealTaskInput,
 } from './self-heal.js';
+import { readClaims } from '../../claims-board.js';
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
+import { log } from '../../log.js';
 
 // Only needed by the one test that exercises the REAL createTask path; the rest
 // inject a recording createTask and never reach dispatch.
 vi.mock('../../cli/dispatch.js', () => ({ dispatch: vi.fn() }));
+
+// A call-through wrapper, not a stub: every test but one gets the real
+// classifier untouched. The one exception (`hostile re-read handling` below)
+// needs to swap a claim's file for something hostile in the instant between
+// `readClaims` classifying it `stale` and self-heal's own re-read of the same
+// slug — the same race an agent racing the sweep would exploit — and a plain
+// import gives no hook to do that from inside a synchronous call.
+vi.mock('../../claims-board.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../claims-board.js')>();
+  return { ...actual, readClaims: vi.fn(actual.readClaims) };
+});
 
 // The routing-stamp rung reads a per-session inbound DB. Back it with a real
 // in-memory one so the production SQL is what these tests exercise, not a stub.
@@ -508,6 +522,115 @@ describe('throttle', () => {
     // to do because of the stamp, not because of the throttle).
     expect((await sweepClaimsSelfHeal(NOW, deps(dir)))[0].applied).toBe(true);
     expect(await sweepClaimsSelfHeal(NOW + 1000, deps(dir))).toEqual([]);
+  });
+});
+
+/**
+ * `readClaims` never classifies a FIFO, an oversized file, or unparseable
+ * JSON as `stale` in the first place — its own `readContainedFile` call
+ * rejects all three before a `BoardClaim` is ever produced for that slug. So
+ * reaching self-heal's OWN re-read of the same slug with one of those on disk
+ * needs the file to still be a genuine, healthy, in-cap claim at the instant
+ * `readClaims` classifies it, and hostile only a moment later — the exact
+ * race an agent with write access to `claims/` (`container-runner.ts` mounts
+ * it read-write; `work-claims/claim.sh` writes straight into it) could win
+ * against the sweep. These tests reproduce that deterministically: the real
+ * classifier runs first, then the file is swapped before control returns to
+ * self-heal's loop.
+ */
+describe('sweepClaimsSelfHeal hostile re-read handling', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('does not block on a FIFO swapped in after classification, and skips it with a log', async () => {
+    const dir = root({ trap: claim(30) });
+    const file = path.join(dir, 'wg-a', 'claims', 'trap.json');
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const { readClaims: real } = await vi.importActual<typeof import('../../claims-board.js')>('../../claims-board.js');
+
+    // O_NONBLOCK, and this assertion is what stands on it: with a plain
+    // `readFileSync` back in place, this test does not FAIL, it HANGS —
+    // opening a FIFO for reading blocks until a writer appears, and that
+    // happens before any regular-file check can reject it.
+    vi.mocked(readClaims).mockImplementationOnce((workgroupId, now, r) => {
+      const result = real(workgroupId, now, r); // classifies the REAL file, still regular
+      fs.rmSync(file);
+      execFileSync('mkfifo', [file]);
+      return result;
+    });
+
+    const outcomes = await sweepClaimsSelfHeal(NOW, deps(dir));
+
+    expect(outcomes).toEqual([]); // skipped — no decision, no action, nothing to report
+    expect(warn).toHaveBeenCalledWith(
+      'self-heal: not a regular file, emitting nothing',
+      expect.objectContaining({ relative: 'trap.json' }),
+    );
+  });
+
+  it('skips a claim grown past the read cap between classification and re-read', async () => {
+    const dir = root({ trap: claim(30) });
+    const file = path.join(dir, 'wg-a', 'claims', 'trap.json');
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const { readClaims: real } = await vi.importActual<typeof import('../../claims-board.js')>('../../claims-board.js');
+
+    vi.mocked(readClaims).mockImplementationOnce((workgroupId, now, r) => {
+      const result = real(workgroupId, now, r); // classifies while still 2 KB, in cap
+      fs.writeFileSync(file, JSON.stringify({ ...claim(30), note: 'x'.repeat(128 * 1024) }));
+      return result;
+    });
+
+    const outcomes = await sweepClaimsSelfHeal(NOW, deps(dir));
+
+    expect(outcomes).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(
+      'self-heal: file is larger than the read cap, emitting nothing',
+      expect.objectContaining({ relative: 'trap.json', cap: 64 * 1024 }),
+    );
+  });
+
+  it('still nudges an untouched healthy claim through the same re-read path', async () => {
+    // The control: nothing about the re-read path changes for a claim nobody
+    // tampered with — same nudge behaviour the `ladder` suite already covers,
+    // asserted again here so it sits next to the hostile cases it must not
+    // regress alongside.
+    const dir = root({ seam: claim(30) });
+    const d = deps(dir);
+
+    const [outcome] = await sweepClaimsSelfHeal(NOW, d);
+
+    expect(outcome).toMatchObject({ slug: 'seam', action: 'nudge', applied: true, target: 'ag-owner' });
+    expect(d.sent).toHaveLength(1);
+  });
+
+  it('does not block on a FIFO swapped in during delivery, and THROWS rather than silently dropping the stamp', async () => {
+    // `stampClaim`'s own re-read has a WIDER window than the classification
+    // re-read above: it fires after `resolveOwner`, `resolveSibling` and
+    // `createTask` are all awaited, so the swap has real elapsed time to
+    // happen in, not a same-tick race. `createTask` is the hook here because
+    // it is the last await before the stamp, and by the time it resolves the
+    // nudge has already been DELIVERED — the fact the stamp exists to
+    // remember. Unlike the classification path, silently skipping this stamp
+    // would leave self-heal believing no nudge was ever sent: the next scan
+    // would recompute `count === 0` and send a SECOND nudge for the same
+    // rung, and go on doing that every scan forever. So this must throw, not
+    // skip — verified below by asserting the promise rejects rather than
+    // resolving with an empty outcome.
+    const dir = root({ seam: claim(30) });
+    const file = path.join(dir, 'wg-a', 'claims', 'seam.json');
+    const d = deps(dir, {
+      createTask: async (input: SelfHealTaskInput) => {
+        fs.rmSync(file);
+        execFileSync('mkfifo', [file]);
+        return true;
+      },
+    });
+
+    // Same discriminating signal as the classification-path FIFO test: with a
+    // plain `readFileSync` back in `stampClaim`, this does not FAIL, it
+    // HANGS — confirmed separately with an external `timeout`.
+    await expect(sweepClaimsSelfHeal(NOW, d)).rejects.toThrow(/cannot stamp claim/);
   });
 });
 
