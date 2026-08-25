@@ -512,6 +512,68 @@ describe('closing a thread — the real thing, not the old Dismiss', () => {
   });
 });
 
+/**
+ * Neither Snooze nor Close exists for an ownerless item (`board:*`, DESIGN §5's
+ * `unassigned`). Both endpoints address a thread through its SESSIONS —
+ * `thread-snooze.ts` and `thread-close.ts` each resolve
+ * `COALESCE(thread_id, 'session:' || id)` over `sessions` — and a board row has
+ * none, so both can only ever answer 404. §12: a control whose action can only
+ * be refused is worse than no control. Assign is this row's verb, and
+ * `ThreadDetail` renders it in place of the reply composer.
+ */
+describe('the detail pane withdraws the two non-message actions on an ownerless item', () => {
+  const ownerless = (): ThreadSummary =>
+    thread('board:EXAMPLE-APP#817', {
+      state: 'unassigned',
+      participants: [],
+      session_ids: [],
+      reply_target_session_id: null,
+      attention_source: {
+        kind: 'release-board',
+        as_of: '2026-08-20T09:00:00.000Z',
+        stale: false,
+        url: null,
+        next_action: 'ship it',
+        assigned: null,
+        assigned_expired: null,
+      },
+    });
+
+  const open = async (t: ThreadSummary) => {
+    const user = userEvent.setup();
+    listThreads.mockResolvedValue({ threads: [t] });
+    getThreadDetail.mockResolvedValue({ thread: t, transcript: [] });
+    const { container } = mount();
+    await waitFor(() => expect(container.querySelector('.ncc-row-main')).toBeTruthy());
+    await user.click(container.querySelector('.ncc-row-main') as HTMLElement);
+    await waitFor(() => expect(container.querySelector('.ncc-detail-actions')).toBeTruthy());
+    return container;
+  };
+
+  it('renders neither snooze nor close for a board row, and still offers the way back to the queue', async () => {
+    await open(ownerless());
+    expect(screen.queryByRole('button', { name: 'snooze' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'un-snooze' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'close thread' })).toBeNull();
+    // The pane is not empty — the row is still openable and navigable.
+    expect(screen.getByRole('button', { name: '‹ queue' })).toBeTruthy();
+  });
+
+  it('still renders both for a session-backed thread, so the gate is on the ROW', async () => {
+    await open(thread('t-idle'));
+    expect(screen.getByRole('button', { name: 'snooze' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'close thread' })).toBeTruthy();
+  });
+
+  it('gates on `isOwnerlessItem`, not on the id prefix: a board row that grew a session keeps both', async () => {
+    // The two-clause rule in `actions.ts` is structural on purpose — an
+    // attention row that has been assigned HAS a session, and the verbs work.
+    await open({ ...ownerless(), session_ids: ['s-assigned'] });
+    expect(screen.getByRole('button', { name: 'snooze' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'close thread' })).toBeTruthy();
+  });
+});
+
 describe('snooze', () => {
   it('hides a snoozed thread from the queue but keeps it reachable in its own lane', async () => {
     const user = userEvent.setup();
