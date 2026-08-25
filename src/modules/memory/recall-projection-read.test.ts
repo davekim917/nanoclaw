@@ -499,6 +499,98 @@ describe('P2.5-AC6 staleness is detected for every writer class', () => {
     expect(_recallProjectionWarmForTest(WORKGROUP)).toBe(false);
   });
 
+  // Decision 13 / P2.5-I7. The staleness verdict must be computed on the SAME
+  // committed generation the candidates are read from. Hoisting that read out
+  // of the deferred transaction is an innocuous-looking refactor, and nothing
+  // else in this suite goes red for it (it was the sole survivor of the
+  // mutation run) — while the production symptom is a clean `hit` over a
+  // candidate set the staleness check never vouched for.
+  //
+  // WHY THIS INJECTS A WRITER THAT PRODUCTION DOES NOT HAVE. Today the live
+  // index file is immutable between promotes: `writeProjection` only ever
+  // writes a fresh `index.next-<uuid>`, and `buildAndPromoteProjection`
+  // `renameSync`s it over the live path, so an open reader keeps its own
+  // inode and no second connection ever commits into the file it is reading.
+  // The race decision 13 describes is therefore UNREACHABLE as the code
+  // stands. This test manufactures the writer so the invariant is pinned
+  // BEFORE incremental updates make it reachable — at which point the bug
+  // would be silent, and would present as a projection bug months later.
+  it('the staleness verdict and the candidate reads observe ONE generation', () => {
+    const GHOST_QUERY = 'ghostcandidate routing seam';
+    const root = adversarialTree();
+    const dataDir = buildProjection(root);
+    attach(dataDir);
+    expect(warmRecallProjection(WORKGROUP, root).warm).toBe(true);
+    // Baseline for the same query against the pre-write generation.
+    const baseline = serve(root, GHOST_QUERY).stats.fileCandidates;
+
+    const livePath = projectionPath(WORKGROUP, dataDir);
+    const realStatSync = fs.statSync;
+    let injected = false;
+    // EVERY query token, not just the distinctive one: `minimumOverlapFor`
+    // demands 2 of 3 here, so a ghost carrying a single term is dropped by the
+    // prefilter whatever the snapshot says — an absence that would prove
+    // nothing. The positive control at the end of this test is what pins that.
+    const ghostTerms = tokenizeForRecall(GHOST_QUERY);
+    // Commit an incremental change from a SECOND connection, timed to land
+    // inside `projectionTreeStaleness`. Its per-file identity stats are the
+    // only bigint stats under `root`, and they run AFTER its `readSourceFiles`
+    // — so the verdict is already decided on the pre-write generation when the
+    // write lands, and only the LATER term/hydrate reads can disagree.
+    vi.spyOn(fs, 'statSync').mockImplementation(((target: fs.PathLike, options?: object) => {
+      if (
+        !injected &&
+        (options as { bigint?: boolean } | undefined)?.bigint === true &&
+        String(target).startsWith(root)
+      ) {
+        injected = true;
+        const writer = new Database(livePath);
+        writer.pragma('busy_timeout = 5000');
+        writer.exec('BEGIN IMMEDIATE');
+        const inserted = writer
+          .prepare(
+            `INSERT INTO candidate (lane, scan_order, path, content, searchable, captured_at, fact_id, stream_json, windows_encoded, windows_json)
+             VALUES ('file', 99999, 'concepts/ghost.md', 'ghostcandidate ghostcandidate', 'ghostcandidate ghostcandidate', '', NULL,
+                     '[["ghostcandidate","ghostcandidate"],[0,15],[14,14]]', 0, '[]')`,
+          )
+          .run();
+        const insertTerm = writer.prepare('INSERT OR IGNORE INTO term (token, candidate_id) VALUES (?, ?)');
+        for (const token of ghostTerms) insertTerm.run(token, inserted.lastInsertRowid);
+        writer.exec('COMMIT');
+        writer.close();
+      }
+      return realStatSync(target as string, options as never);
+    }) as typeof fs.statSync);
+
+    const served = serve(root, GHOST_QUERY);
+    vi.restoreAllMocks();
+
+    // The fixture is worthless if the write never landed mid-read.
+    expect(injected).toBe(true);
+    // ONE generation: the turn was served, the verdict was `fresh`, and what it
+    // read is the generation that verdict was computed on. A row committed
+    // after the snapshot must be invisible to every later read in the turn.
+    expect(served.stats.recallPath).toBe('hit');
+    expect(served.stats.fileCandidates).toBe(baseline);
+    expect(JSON.stringify(served.evidence)).not.toContain('ghostcandidate');
+
+    // POSITIVE CONTROL. The assertions above are absences, and an absence is
+    // only evidence if the thing could have been present. Re-warm and serve
+    // again: the same row, now committed BEFORE the snapshot, must show up.
+    // Without this the test passes just as happily against a prefilter that
+    // could never have returned the ghost at all — which is exactly how the
+    // first version of this test passed under the mutation it was written to
+    // kill. (The insert added no `source_file` row, so the tree diff is
+    // untouched and the projection re-warms clean.)
+    expect(warmRecallProjection(WORKGROUP, root).warm).toBe(true);
+    const after = serve(root, GHOST_QUERY);
+    expect({ path: after.stats.recallPath, reason: after.stats.recallReason }).toEqual({
+      path: 'hit',
+      reason: 'projection',
+    });
+    expect(after.stats.fileCandidates).toBe(baseline + 1);
+  });
+
   it('backs off instead of re-walking the tree on every turn while a projection stays stale', () => {
     const root = adversarialTree();
     const dataDir = buildProjection(root);
