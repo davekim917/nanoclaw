@@ -298,12 +298,24 @@ describe('deliverBacklogThread', () => {
     const createThread = vi.fn().mockResolvedValue({ threadId: '999888777', messageId: 'm1' });
     const deliver = vi.fn().mockResolvedValue('m2');
 
-    await deliverBacklogThread({ deliver, createThread }, 'discord', 'discord:guild:chan', 'parent-msg-id', 'short list');
+    await deliverBacklogThread(
+      { deliver, createThread },
+      'discord',
+      'discord:guild:chan',
+      'parent-msg-id',
+      'short list',
+    );
 
     // Regression guard for the 404 "Unknown Channel" bug: a Discord thread id
     // is a real channel that must come from createThread, never a bare
     // `<platform_id>:<parentMessageId>` string built by hand.
-    expect(createThread).toHaveBeenCalledWith('discord', 'discord:guild:chan', 'parent-msg-id', 'Open Backlog', 'short list');
+    expect(createThread).toHaveBeenCalledWith(
+      'discord',
+      'discord:guild:chan',
+      'parent-msg-id',
+      'Open Backlog',
+      'short list',
+    );
     expect(deliver).not.toHaveBeenCalled(); // single chunk — no remainder to send
   });
 
@@ -320,7 +332,13 @@ describe('deliverBacklogThread', () => {
     await deliverBacklogThread({ deliver, createThread }, 'discord', 'discord:guild:chan', 'parent-msg-id', longList);
 
     expect(createThread).toHaveBeenCalledTimes(1);
-    expect(createThread).toHaveBeenCalledWith('discord', 'discord:guild:chan', 'parent-msg-id', 'Open Backlog', expectedChunks[0]);
+    expect(createThread).toHaveBeenCalledWith(
+      'discord',
+      'discord:guild:chan',
+      'parent-msg-id',
+      'Open Backlog',
+      expectedChunks[0],
+    );
     expect(deliver).toHaveBeenCalledTimes(expectedChunks.length - 1);
     for (const [i, call] of deliver.mock.calls.entries()) {
       expect(call).toEqual([
@@ -338,7 +356,13 @@ describe('deliverBacklogThread', () => {
 
     await deliverBacklogThread({ deliver }, 'slack', 'slack:T1:C1', 'parent-ts', 'short list');
 
-    expect(deliver).toHaveBeenCalledWith('slack', 'slack:T1:C1', 'slack:T1:C1:parent-ts', 'chat', JSON.stringify({ text: 'short list' }));
+    expect(deliver).toHaveBeenCalledWith(
+      'slack',
+      'slack:T1:C1',
+      'slack:T1:C1:parent-ts',
+      'chat',
+      JSON.stringify({ text: 'short list' }),
+    );
   });
 
   it('falls back to a channel-root post when the parent post returned no id', async () => {
@@ -348,6 +372,12 @@ describe('deliverBacklogThread', () => {
     await deliverBacklogThread({ deliver, createThread }, 'discord', 'discord:guild:chan', undefined, 'short list');
 
     expect(createThread).not.toHaveBeenCalled();
-    expect(deliver).toHaveBeenCalledWith('discord', 'discord:guild:chan', null, 'chat', JSON.stringify({ text: 'short list' }));
+    expect(deliver).toHaveBeenCalledWith(
+      'discord',
+      'discord:guild:chan',
+      null,
+      'chat',
+      JSON.stringify({ text: 'short list' }),
+    );
   });
 });

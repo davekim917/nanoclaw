@@ -335,14 +335,22 @@ describe('slackChannelDisplayName', () => {
   it('falls back through real_name when the display name is empty', async () => {
     const client = {
       ...channelInfo({ is_im: true, user: 'U9' }),
-      users: { info: async () => ({ ok: true, user: { name: 'jdoe', profile: { display_name: '', real_name: 'J. Doe' } } }) },
+      users: {
+        info: async () => ({ ok: true, user: { name: 'jdoe', profile: { display_name: '', real_name: 'J. Doe' } } }),
+      },
     };
     await expect(slackChannelDisplayName(client, 'slack:D1')).resolves.toBe('J. Doe');
   });
 
   it('returns null on an API refusal or a throw — never raises', async () => {
     await expect(slackChannelDisplayName(channelInfo(undefined, false), 'slack:C1')).resolves.toBeNull();
-    const throwing = { conversations: { info: async () => { throw new Error('boom'); } } };
+    const throwing = {
+      conversations: {
+        info: async () => {
+          throw new Error('boom');
+        },
+      },
+    };
     await expect(slackChannelDisplayName(throwing, 'slack:C1')).resolves.toBeNull();
   });
 });
