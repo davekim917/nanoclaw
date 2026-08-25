@@ -557,10 +557,21 @@ evaluate_pr() {
 # needs (finish wants exactly 2 fetches total; reusing evaluate_pr here would
 # cost 4 more — check-runs, services, two deploy lookups, a healthz curl —
 # entirely wasted, since finish already has its own verdict from the caller).
+#
+# `filesOk` distinguishes "not a freeze PR" from "could not tell". A failed
+# fetch collapses to files_json='[]' and therefore isFreezePr:false, which the
+# caller treats identically to an ordinary PR: no hold, no publish, no ledger
+# line, handoff.written:false with reason NULL, and an ok:true finish. That is
+# a freeze-run verdict silently dropped on the floor — evaluate_pr fails closed
+# on this exact fetch, this did not even report it. Reporting only; the
+# caller's behaviour for a genuine non-freeze PR is unchanged.
 detect_freeze() {
-  local pr="$1" sha="$2" files_json is_freeze target_sha
-  files_json="$(timeout 10 gh api "repos/$REPO/pulls/$pr/files?per_page=100" 2>/dev/null)"
-  jq -e 'type == "array"' <<<"$files_json" >/dev/null 2>&1 || files_json='[]'
+  local pr="$1" sha="$2" files_json is_freeze target_sha files_ok=true
+  if ! files_json="$(timeout 10 gh api "repos/$REPO/pulls/$pr/files?per_page=100" 2>/dev/null)" ||
+     ! jq -e 'type == "array"' <<<"$files_json" >/dev/null 2>&1; then
+    files_ok=false
+    files_json='[]'
+  fi
   is_freeze="$(jq -r --arg a "$FREEZE_MARKER_BACKEND" --arg b "$FREEZE_MARKER_FRONTEND" '
     (length == 2) and ((map(.filename) | sort) == ([$a,$b] | sort))
   ' <<<"$files_json" 2>/dev/null)"
@@ -569,8 +580,9 @@ detect_freeze() {
   if [ "$is_freeze" = true ]; then
     target_sha="$(timeout 8 gh api "repos/$REPO/commits/$sha" --jq '.parents[0].sha // empty' 2>/dev/null)"
   fi
-  jq -cn --argjson isFreeze "$is_freeze" --arg target "$target_sha" \
-    '{isFreezePr:$isFreeze, targetSha:(if $target == "" then null else $target end)}'
+  jq -cn --argjson isFreeze "$is_freeze" --argjson filesOk "$files_ok" --arg target "$target_sha" \
+    '{isFreezePr:$isFreeze, filesOk:$filesOk,
+      targetSha:(if $target == "" then null else $target end)}'
 }
 
 COMMAND="${1:-poll}"
@@ -803,6 +815,36 @@ if [ "$COMMAND" = "finish" ]; then
         activeRunId:(if $active == "" then null else $active end)}'
     exit 0
   fi
+  # The SHA must be the one this run CLAIMED, not merely a well-formed SHA.
+  # `claim`/`poll` both record the frozen head as activeSha, so the gate
+  # already knows the answer and needs no extra fetch — and until 2026-08-25
+  # it never asked. A wrong SHA is not a cosmetic label: for a freeze PR,
+  # detect_freeze derives the develop TARGET by walking the supplied SHA's
+  # first parent, so passing the target itself walks one commit too far and
+  # the hold/publish/ledger artifacts all name a build the campaign never
+  # examined. Live: PR #1211's finish was called with df74301b (the target)
+  # instead of 6259d76b (the marker it claimed and tested); the promotion
+  # hold went out naming 9cf1ec10, PR #1199's commit. It exited ok:true.
+  #
+  # There is no legitimate case for a difference. The PR gate settles on
+  # strict head/deploy equality (no deploy-lag SHA pair like the develop
+  # gate's SMOKE_GATE_*_PATHS), and if the PR head moved mid-campaign the
+  # tested build is still the claimed one — recording the new head would be
+  # a verdict about something nobody ran. So: refuse, before the suspend
+  # POST and before any artifact is touched. Refusing is also recoverable —
+  # the slot is untouched, so re-running `finish` with the claimed SHA
+  # completes normally. Shape matches the two sibling argument refusals
+  # above (bare ok:false, exit 2): the invocation is wrong, not the world.
+  CLAIMED_SHA="$(jq -r '.activeSha // empty' <<<"$STATE")"
+  if [ "$SHA" != "$CLAIMED_SHA" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg supplied "$SHA" --arg claimed "$CLAIMED_SHA" \
+      '{ok:false,
+        error:("finish sha does not match the sha this run claimed — no verdict recorded, no hold touched, slot still held. Re-run: finish " +
+               (if $claimed == "" then "<claimed-sha>" else $claimed end) + " " + $run + " <verdict>"),
+        pr:$pr,runId:$run,suppliedSha:$supplied,
+        claimedSha:(if $claimed == "" then null else $claimed end)}'
+    exit 2
+  fi
   NOW="$(iso_now)"
   # ORDER IS THE CRASH CONTRACT. Clearing the slot FIRST — which is what this
   # did — made `finish` fail OPEN and permanently: a container death after the
@@ -869,25 +911,96 @@ if [ "$COMMAND" = "finish" ]; then
   HANDOFF_WRITTEN=false
   HANDOFF_REASON=""
   HANDOFF_TARGET_SHA=""
+  HANDOFF_DIVERGENCE=""
   if [ -n "$PUBLISH_FILE" ] || [ -n "$HOLD_FILE" ]; then
     FREEZE_INFO="$(detect_freeze "$PR" "$SHA")"
+    if [ "$(jq -r '.filesOk' <<<"$FREEZE_INFO")" != true ]; then
+      # Not "an ordinary PR" — an unreadable diff. If this WAS a freeze PR its
+      # verdict has just been dropped with nothing written and nothing said.
+      HANDOFF_REASON="could not read this PR's diff, so freeze-PR status is unknown — hold/publish/ledger not written. If this was a freeze PR the develop gate will never see this verdict; reconcile by hand"
+    fi
     if [ "$(jq -r '.isFreezePr' <<<"$FREEZE_INFO")" = true ]; then
       TARGET_SHA="$(jq -r '.targetSha // empty' <<<"$FREEZE_INFO")"
       if [ -z "$TARGET_SHA" ]; then
         HANDOFF_REASON="could not determine the target develop sha for this freeze PR — hold/publish/ledger not written"
       else
         HANDOFF_TARGET_SHA="$TARGET_SHA"
+        # SNAPSHOT BEFORE OVERWRITE. The hold file and the ledger are two
+        # files on two different mounts (hold: the shared workgroup mount the
+        # release desk reads; ledger: this gate's own state dir), and the only
+        # way anyone has ever seen them disagree is a live check in the minutes
+        # before the next `finish` — after which this block overwrites the hold
+        # and the evidence is gone. That happened on 2026-08-18, -22 and -25;
+        # all three are now un-diagnosable. The ledger is the authoritative
+        # append-only record, so what the hold SHOULD say is derivable from it
+        # (BLOCKED excluded — it deliberately leaves the hold alone and so
+        # asserts nothing about it). Disagreement is captured to a timestamped
+        # file that nothing here ever rewrites, then this finish proceeds.
+        # Detection is not the point — the develop gate already alarms
+        # (gate_hold_tampered); PRESERVATION is.
+        if [ -n "$HOLD_FILE" ] && [ -n "$HANDOFF_LEDGER" ] && [ -s "$HANDOFF_LEDGER" ]; then
+          LEDGER_HOLDING="$(jq -cR 'fromjson? | select(type == "object") | select(.verdict != "BLOCKED")' \
+            "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
+          if [ -n "$LEDGER_HOLDING" ]; then
+            HOLD_NOW='null'
+            [ -s "$HOLD_FILE" ] && HOLD_NOW="$(jq -c '.' "$HOLD_FILE" 2>/dev/null || printf '"unparseable"')"
+            # Expected: a GO line means no hold; anything else means a hold
+            # naming that same run. Same rule smoke-develop-gate.sh's
+            # hold-integrity reconciler applies to its own completed record.
+            if [ "$(jq -r '.verdict' <<<"$LEDGER_HOLDING")" = GO ]; then
+              [ "$HOLD_NOW" = null ] || HANDOFF_DIVERGENCE="hold present after a GO"
+            elif [ "$HOLD_NOW" = null ]; then
+              HANDOFF_DIVERGENCE="hold missing"
+            elif [ "$(jq -r '.runId // empty' <<<"$HOLD_NOW" 2>/dev/null)" != "$(jq -r '.runId' <<<"$LEDGER_HOLDING")" ]; then
+              HANDOFF_DIVERGENCE="hold names a different run than the ledger"
+            fi
+            if [ -n "$HANDOFF_DIVERGENCE" ]; then
+              DIVERGENCE_FILE="$STATE_DIR/hold-divergence-$(date -u +'%Y%m%dT%H%M%SZ')-pr$PR.json"
+              jq -n --arg now "$NOW" --arg why "$HANDOFF_DIVERGENCE" --arg path "$HOLD_FILE" \
+                --argjson pr "$PR" --arg run "$RUN_ID" --arg verdict "$VERDICT" \
+                --argjson hold "$HOLD_NOW" --argjson ledger "$LEDGER_HOLDING" \
+                '{schemaVersion:1,detectedAt:$now,divergence:$why,holdFile:$path,
+                  detectedBy:{pr:$pr,runId:$run,verdict:$verdict},
+                  holdBeforeOverwrite:$hold,newestHoldAffectingLedgerLine:$ledger}' \
+                > "$DIVERGENCE_FILE" 2>/dev/null ||
+                DIVERGENCE_FILE=""
+              # If even the snapshot could not be written, say so in the field
+              # rather than reporting null — "no divergence" and "a divergence
+              # we failed to record" must never look the same.
+              if [ -n "$DIVERGENCE_FILE" ] && [ -s "$DIVERGENCE_FILE" ]; then
+                HANDOFF_DIVERGENCE="$DIVERGENCE_FILE"
+              else
+                HANDOFF_DIVERGENCE="NOT SNAPSHOTTED (write to $STATE_DIR failed): $HANDOFF_DIVERGENCE"
+              fi
+            fi
+          fi
+        fi
         # Publish + hold, the develop gate's EXACT semantics, keyed to the
         # TARGET develop sha (not the freeze marker sha) — every downstream
         # reader (release promotion, the develop gate's own reconciliation)
         # only ever reasons about develop lineage, never a freeze branch that
         # is about to be closed and torn down.
+        #
+        # Every write below is VERIFIED. `set -e` is not in effect here, so a
+        # failed mkdir/mktemp/jq/mv (an unwritable or remounted shared mount is
+        # the live case — the hold lives on the workgroup mount, the ledger does
+        # not) used to leave HANDOFF_WRITTEN=true and reason:null while the
+        # ledger line landed anyway: a NO_GO whose promotion hold silently never
+        # went up. Reporting is the whole remedy — the slot-clearing semantics
+        # below are unchanged, exactly as for a ledger-append failure, so the
+        # verdict JSON carries the truth even though a re-finish is refused.
+        HANDOFF_ARTIFACT_ERROR=""
         if [ -n "$PUBLISH_FILE" ]; then
-          mkdir -p "$(dirname "$PUBLISH_FILE")"
-          PUB_TMP="$(mktemp "$(dirname "$PUBLISH_FILE")/.latest-verdict.XXXXXX")"
-          jq -cn --arg sha "$TARGET_SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
-            '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now}' > "$PUB_TMP"
-          mv "$PUB_TMP" "$PUBLISH_FILE"
+          mkdir -p "$(dirname "$PUBLISH_FILE")" 2>/dev/null
+          PUB_TMP="$(mktemp "$(dirname "$PUBLISH_FILE")/.latest-verdict.XXXXXX" 2>/dev/null)"
+          if [ -n "$PUB_TMP" ]; then
+            jq -cn --arg sha "$TARGET_SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
+              '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now}' > "$PUB_TMP" 2>/dev/null
+            mv "$PUB_TMP" "$PUBLISH_FILE" 2>/dev/null || rm -f "$PUB_TMP" 2>/dev/null
+          fi
+          jq -e --arg run "$RUN_ID" --arg sha "$TARGET_SHA" '.runId == $run and .sha == $sha' \
+            "$PUBLISH_FILE" >/dev/null 2>&1 ||
+            HANDOFF_ARTIFACT_ERROR="publish file $PUBLISH_FILE was not written"
         fi
         if [ -n "$HOLD_FILE" ]; then
           # HUMAN_DECISION raises the hold too (2026-08-25). It used to leave it
@@ -904,22 +1017,35 @@ if [ "$COMMAND" = "finish" ]; then
               [ "$VERDICT" = NO_GO ] &&
                 HOLD_REASON="confirmed defects on this develop lineage — see the run thread and run directory" ||
                 HOLD_REASON="needs_human_decision"
-              mkdir -p "$(dirname "$HOLD_FILE")"
-              HOLD_TMP="$(mktemp "$(dirname "$HOLD_FILE")/.develop-hold.XXXXXX")"
-              jq -cn --arg sha "$TARGET_SHA" --arg run "$RUN_ID" --arg now "$NOW" \
-                --arg verdict "$VERDICT" --arg reason "$HOLD_REASON" \
-                '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,raisedAt:$now,
-                  reason:$reason}' > "$HOLD_TMP"
-              mv "$HOLD_TMP" "$HOLD_FILE"
+              mkdir -p "$(dirname "$HOLD_FILE")" 2>/dev/null
+              HOLD_TMP="$(mktemp "$(dirname "$HOLD_FILE")/.develop-hold.XXXXXX" 2>/dev/null)"
+              if [ -n "$HOLD_TMP" ]; then
+                jq -cn --arg sha "$TARGET_SHA" --arg run "$RUN_ID" --arg now "$NOW" \
+                  --arg verdict "$VERDICT" --arg reason "$HOLD_REASON" \
+                  '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,raisedAt:$now,
+                    reason:$reason}' > "$HOLD_TMP" 2>/dev/null
+                mv "$HOLD_TMP" "$HOLD_FILE" 2>/dev/null || rm -f "$HOLD_TMP" 2>/dev/null
+              fi
+              # The fail-OPEN direction: a raise that did not land leaves
+              # promotion ungated on a build this run just objected to.
+              jq -e --arg run "$RUN_ID" --arg sha "$TARGET_SHA" '.runId == $run and .sha == $sha' \
+                "$HOLD_FILE" >/dev/null 2>&1 ||
+                HANDOFF_ARTIFACT_ERROR="hold file $HOLD_FILE was NOT raised for this $VERDICT — promotion is ungated"
               ;;
             GO)
-              rm -f "$HOLD_FILE"
+              rm -f "$HOLD_FILE" 2>/dev/null
+              [ ! -e "$HOLD_FILE" ] ||
+                HANDOFF_ARTIFACT_ERROR="hold file $HOLD_FILE could not be cleared for this GO"
               ;;
             # BLOCKED leaves the hold untouched — same as the develop gate's own
             # finish.
           esac
         fi
-        HANDOFF_WRITTEN=true
+        if [ -n "$HANDOFF_ARTIFACT_ERROR" ]; then
+          HANDOFF_REASON="$HANDOFF_ARTIFACT_ERROR — the ledger line below still records this verdict, so the two are now out of step. Fix the artifact by hand; a re-finish will be REFUSED (the slot is cleared)."
+        else
+          HANDOFF_WRITTEN=true
+        fi
         if [ -n "$HANDOFF_LEDGER" ]; then
           mkdir -p "$(dirname "$HANDOFF_LEDGER")" 2>/dev/null
           LEDGER_APPENDED=false
@@ -956,7 +1082,14 @@ if [ "$COMMAND" = "finish" ]; then
             # so a second `finish` is refused as not-the-active-run. Naming a
             # recovery the code forbids sends an operator down a dead end at
             # the exact moment the develop gate is blind to this verdict.
-            HANDOFF_REASON="ledger append failed after retry — the develop gate cannot see this outcome. A re-finish will be REFUSED (the slot is cleared): append the ledger line by hand, or reconcile the gate state manually"
+            # Append rather than replace: an artifact failure above is the more
+            # dangerous half (a hold that never went up) and must not be lost
+            # behind the ledger's message.
+            if [ -n "$HANDOFF_ARTIFACT_ERROR" ]; then
+              HANDOFF_REASON="$HANDOFF_REASON ALSO: ledger append failed after retry — the develop gate cannot see this outcome either."
+            else
+              HANDOFF_REASON="ledger append failed after retry — the develop gate cannot see this outcome. A re-finish will be REFUSED (the slot is cleared): append the ledger line by hand, or reconcile the gate state manually"
+            fi
           fi
         fi
       fi
@@ -1000,13 +1133,14 @@ if [ "$COMMAND" = "finish" ]; then
     --argjson attempted "$SUSPEND_ATTEMPTED" --argjson ok "$SUSPEND_OK" \
     --argjson status "$SUSPEND_STATUS" --arg reason "$SUSPEND_REASON" \
     --argjson handoffWritten "$HANDOFF_WRITTEN" --arg handoffReason "$HANDOFF_REASON" \
-    --arg handoffTargetSha "$HANDOFF_TARGET_SHA" \
+    --arg handoffTargetSha "$HANDOFF_TARGET_SHA" --arg divergence "$HANDOFF_DIVERGENCE" \
     '{schemaVersion:1,pr:$pr,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now,
       suspend:{attempted:$attempted,ok:$ok,httpStatus:$status,
                reason:(if $reason == "" then null else $reason end)},
       handoff:{written:$handoffWritten,
                targetSha:(if $handoffTargetSha == "" then null else $handoffTargetSha end),
-               reason:(if $handoffReason == "" then null else $handoffReason end)}}')"
+               reason:(if $handoffReason == "" then null else $handoffReason end),
+               divergenceSnapshot:(if $divergence == "" then null else $divergence end)}}')"
   VERDICT_TMP="$(mktemp "$STATE_DIR/.pr-$PR-verdict.XXXXXX")"
   printf '%s\n' "$VERDICT_JSON" > "$VERDICT_TMP"
   mv "$VERDICT_TMP" "$(pr_verdict_file "$PR")"

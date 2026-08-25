@@ -1414,6 +1414,18 @@ merge/close; a failed suspend is logged in the JSON, never fails the finish.
 Teardown itself is Render's job (auto-delete on PR close) — this gate and
 `smoke-freeze-pr.sh` never delete services.
 
+**`finish` takes the SHA the run CLAIMED, and refuses anything else.** For a
+freeze PR that is the *marker* SHA (the PR head), never the target develop SHA
+the marker froze — the gate derives the target itself by walking the marker's
+first parent. Passing the target walks one commit too far, and the hold,
+publish file and ledger line then all name a build the campaign never
+examined. A mismatch is refused before any side effect, with `claimedSha` in
+the response and the slot left held, so re-running `finish` with that SHA
+completes normally. There is no legitimate case for a difference: a PR head
+that moved mid-campaign does not change which build was tested. Origin:
+2026-08-25, freeze PR #1211 — the wrong argument raised a promotion hold
+naming PR #1199's commit and exited `ok:true`.
+
 **Freeze PRs** turn the same mechanism into an on-demand frozen environment
 for an arbitrary develop SHA — useful when a campaign needs a still target
 without waiting on (or being voided by) develop's own merge volume.
@@ -1466,6 +1478,30 @@ freeze-run hold from ever reading as `gate_hold_tampered`. **All three
 PR-gate vars and develop-gate handoff mode must be set together in the same
 deployment's wrappers** — any one missing silently breaks the tamper-shield,
 not just the publish/hold write.
+
+The hold and the ledger live on different mounts (the hold on the shared
+workgroup mount the release desk reads, the ledger in the gate's own state
+dir), so they can go out of step. Two rules cover that:
+
+- **`handoff.written` reflects every artifact, not just the ledger.** Each
+  publish/hold write is verified after the fact; a write that did not land
+  reports `written:false` with a reason naming the file — including the
+  fail-open case, a `NO_GO`/`HUMAN_DECISION` whose hold never went up. It used
+  to report `written:true` and `reason:null` regardless.
+- **A divergence is captured before it is overwritten.** On a freeze-PR
+  `finish`, the gate compares the standing hold against the newest
+  hold-affecting ledger line (`BLOCKED` lines are not hold-affecting — they
+  deliberately leave the hold alone) and, on disagreement, writes both sides
+  to `<state-dir>/hold-divergence-<ts>-pr<n>.json` before touching anything.
+  The path comes back as `handoff.divergenceSnapshot`. Detection already
+  existed — the develop gate's `gate_hold_tampered` — but the next `finish`
+  destroyed the evidence, which is why the 2026-08-18, -22 and -25
+  occurrences are all un-diagnosable. Nothing prunes these files.
+
+A crash between the two writes still diverges: bash cannot make a write across
+two files on two mounts atomic. The ordering is the mitigation — the hold is
+raised *before* the ledger line lands, so a crash over-holds (safe) rather
+than leaving a recorded `NO_GO` with promotion open.
 
 ## Evidence retention
 
