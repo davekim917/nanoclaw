@@ -92,10 +92,15 @@ describe('rollupSessionUsage', () => {
     expect(day1.cache_write_tokens).toBe(10);
     expect(day1.cost_usd).toBeCloseTo(1.0);
     expect(day1.model).toBe('opus');
+    expect(day1.cost_applicable).toBe(true);
 
     const day2 = rows.find((r) => r.date === '2026-08-11' && r.provider === 'codex')!;
     expect(day2.turns).toBe(1);
     expect(day2.model).toBe('gpt-5');
+    // Codex's app-server has no per-token cost field (ChatGPT-plan/subscription
+    // billing) — cost_usd sums to 0 like a real zero-spend row would, but
+    // cost_applicable distinguishes "not applicable" from "verified $0".
+    expect(day2.cost_applicable).toBe(false);
   });
 
   it('watermark prevents double-counting on a second sweep of the same session', () => {
@@ -137,6 +142,10 @@ describe('rollupSessionUsage', () => {
     expect(row.cache_read_tokens).toBe(0);
     expect(row.cache_write_tokens).toBe(0);
     expect(row.cost_usd).toBe(0);
+    // Default fixture provider is 'claude' (metered) — a NULL cost here is a
+    // genuine data gap, not "free", so cost_applicable stays true even though
+    // cost_usd rolls up to the same 0 a subscription provider would show.
+    expect(row.cost_applicable).toBe(true);
   });
 
   it('a session outbound.db with no turn_usage table is skipped without error', () => {

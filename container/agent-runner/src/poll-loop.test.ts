@@ -294,6 +294,16 @@ describe('formatter', () => {
 });
 
 describe('chat budget from task content', () => {
+  // The budget is a process-global in db/messages-out.ts and bun runs every
+  // test file in one process. Reset it here, not at the end of a test body: a
+  // failing expect above would otherwise leave it exhausted and silently drop
+  // every later kind:'chat' write in the whole run — which looks exactly like
+  // the unrelated "expected length 1, received 0" failures.
+  afterEach(() => {
+    const { setChatLimit } = require('./db/messages-out.js');
+    setChatLimit(null);
+  });
+
   it('muteChat zeroes the budget; chatLimit sets it; absent leaves unlimited', () => {
     const { isChatMuted } = require('./db/messages-out.js');
     insertMessage('t-mute', 'task', { prompt: 'watch', muteChat: true });
@@ -353,8 +363,6 @@ describe('chat budget from task content', () => {
       content: JSON.stringify({ operation: 'edit', messageId: 'x', text: 'digest v2' }),
     });
     expect(edit).toBeGreaterThan(0);
-
-    setChatLimit(null);
   });
 });
 

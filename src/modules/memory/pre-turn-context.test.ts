@@ -2138,3 +2138,31 @@ describe('per-build structured log line (recall latency instrumentation)', () =>
     debugSpy.mockRestore();
   });
 });
+
+it('test_sanitizer_passes_expiresAt_through_to_trustedCapabilities', () => {
+  CAPABILITY_FIXTURE.services = [
+    {
+      name: 'GitHub',
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      activation: 'pre-authenticated',
+      expiresAt: '2026-08-25T12:00:00.000Z',
+    },
+  ];
+  try {
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      kind: 'chat',
+      trigger: 1 as const,
+      normalizedContent: '{"text":"what services"}',
+      sessionId: 'sess-a',
+    });
+    const gh = result.trustedCapabilities?.services.find((s) => s.name === 'GitHub');
+    // Round-1 blocker regression guard: the pre-turn sanitizer whitelist used
+    // to strip expiresAt, so agents never saw the TTL the host intended.
+    expect(gh?.expiresAt).toBe('2026-08-25T12:00:00.000Z');
+  } finally {
+    CAPABILITY_FIXTURE.services = null;
+  }
+});

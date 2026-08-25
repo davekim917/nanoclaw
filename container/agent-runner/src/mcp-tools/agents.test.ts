@@ -1,16 +1,13 @@
-import { describe, it, expect, mock, beforeEach } from 'bun:test';
+import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
 
-// Capture writeMessageOut calls
-let writeMessageOutCalls: Array<{ id: string; kind: string; content: string }> = [];
-const mockWriteMessageOut = mock((msg: { id: string; kind: string; content: string }) => {
-  writeMessageOutCalls.push(msg);
-});
+import { initTestSessionDb, closeSessionDb, getOutboundDb } from '../db/connection.js';
 
-// Mock dependencies before importing agents.ts
-mock.module('../db/messages-out.js', () => ({
-  writeMessageOut: mockWriteMessageOut,
-}));
-
+// NOTE: do NOT mock.module('../db/messages-out.js') here. bun runs every test
+// file sequentially in ONE process and mock.module is process-global and
+// permanent (mock.restore does not undo it), so stubbing writeMessageOut left
+// every later file's outbound writes going nowhere — wait/core/dispatch went
+// red purely on readdir order. Assert against the real in-memory session DB
+// instead, the same way core.test.ts and wait.test.ts do.
 mock.module('./server.js', () => ({
   registerTools: (_tools: unknown) => {}, // no-op in tests
 }));
@@ -23,9 +20,20 @@ const { createAgent } = await import('./agents.js');
 // Import the providers barrel to trigger self-registration.
 await import('../providers/index.js');
 
+/** The system actions create_agent wrote this test, oldest first. */
+function systemActions(): Array<Record<string, unknown>> {
+  const rows = getOutboundDb()
+    .prepare(`SELECT content FROM messages_out WHERE kind = 'system' ORDER BY seq ASC`)
+    .all() as Array<{ content: string }>;
+  return rows.map((r) => JSON.parse(r.content) as Record<string, unknown>);
+}
+
 beforeEach(() => {
-  writeMessageOutCalls = [];
-  mockWriteMessageOut.mockClear();
+  initTestSessionDb();
+});
+
+afterEach(() => {
+  closeSessionDb();
 });
 
 describe('create_agent handler', () => {
@@ -33,9 +41,9 @@ describe('create_agent handler', () => {
     const result = await createAgent.handler({ name: 'Legacy', instructions: 'be helpful' });
 
     expect(result.isError).toBeFalsy();
-    expect(mockWriteMessageOut).toHaveBeenCalledTimes(1);
+    expect(systemActions()).toHaveLength(1);
 
-    const payload = JSON.parse(writeMessageOutCalls[0].content);
+    const payload = systemActions()[0];
     expect(payload.action).toBe('create_agent');
     expect(payload.name).toBe('Legacy');
     expect('provider' in payload).toBe(false);
@@ -50,14 +58,14 @@ describe('create_agent handler', () => {
     });
 
     expect(result.isError).toBeFalsy();
-    expect(mockWriteMessageOut).toHaveBeenCalledTimes(1);
+    expect(systemActions()).toHaveLength(1);
 
-    const payload = JSON.parse(writeMessageOutCalls[0].content);
+    const payload = systemActions()[0];
     expect(payload.provider).toBe('claude');
     expect(payload.provider_config).toEqual({ model: 'claude-opus-4-7', effort: 'high' });
   });
 
-  it('test_create_agent_unknown_provider_rejected: unknown provider returns error; writeMessageOut not called', async () => {
+  it('test_create_agent_unknown_provider_rejected: unknown provider returns error; no system action written', async () => {
     const result = await createAgent.handler({ name: 'X', provider: 'nonexistent' });
 
     expect(result.isError).toBe(true);
@@ -67,10 +75,10 @@ describe('create_agent handler', () => {
     // Should include at least 'claude' in the registered list
     expect(text).toMatch(/claude/i);
 
-    expect(mockWriteMessageOut).not.toHaveBeenCalled();
+    expect(systemActions()).toHaveLength(0);
   });
 
-  it('test_create_agent_unknown_key_rejected: unknown key in provider_config returns error; writeMessageOut not called', async () => {
+  it('test_create_agent_unknown_key_rejected: unknown key in provider_config returns error; no system action written', async () => {
     const result = await createAgent.handler({
       name: 'X',
       provider: 'claude',
@@ -81,7 +89,7 @@ describe('create_agent handler', () => {
     const text = result.content[0].text as string;
     expect(text.toLowerCase()).toMatch(/reasoning_effort|unrecognized/);
 
-    expect(mockWriteMessageOut).not.toHaveBeenCalled();
+    expect(systemActions()).toHaveLength(0);
   });
 
   it('test_create_agent_valid_max_effort: effort=max succeeds (5-value enum regression check)', async () => {
@@ -92,9 +100,9 @@ describe('create_agent handler', () => {
     });
 
     expect(result.isError).toBeFalsy();
-    expect(mockWriteMessageOut).toHaveBeenCalledTimes(1);
+    expect(systemActions()).toHaveLength(1);
 
-    const payload = JSON.parse(writeMessageOutCalls[0].content);
+    const payload = systemActions()[0];
     expect(payload.provider_config).toEqual({ effort: 'max' });
   });
 
@@ -102,6 +110,6 @@ describe('create_agent handler', () => {
     const result = await createAgent.handler({ name: 'X', provider: 'nonexistent' });
 
     expect(result.isError).toBe(true);
-    expect(mockWriteMessageOut).toHaveBeenCalledTimes(0);
+    expect(systemActions()).toHaveLength(0);
   });
 });

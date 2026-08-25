@@ -1344,8 +1344,15 @@ describe('wakeContainer session-status admission', () => {
   });
 
   it('lets an active session through the guard to the normal admission path', async () => {
-    await expect(wakeContainer(session('active'))).resolves.toBe(false);
-    // Refused for a real reason (no host DB in a unit test), not by the guard.
-    expect(refusals()).toEqual([]);
+    // Keep this guard test independent of the host's current disk pressure;
+    // otherwise a full filesystem sends it into the real cleanup worker.
+    vi.stubEnv('NANOCLAW_STORAGE_MANAGER_ENABLED', '0');
+    try {
+      await expect(wakeContainer(session('active'))).resolves.toBe(false);
+      // Refused for a real reason (no host DB in a unit test), not by the guard.
+      expect(refusals()).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

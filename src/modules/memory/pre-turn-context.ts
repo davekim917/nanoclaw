@@ -1408,6 +1408,11 @@ export function boundedCapabilities(
       service.useFor === undefined
         ? undefined
         : boundedText(service.useFor, PRE_TURN_BOUNDS.capabilityDetailChars, TRUNCATED_CAPABILITY_DETAIL),
+    // Short-TTL credential expiry (e.g. GitHub App installation tokens). Not
+    // free text — an ISO timestamp from the host — so it passes the bound
+    // untouched. Dropped here it would never reach agents: this sanitizer is
+    // what rebuilds trustedCapabilities every bootstrap turn.
+    expiresAt: service.expiresAt,
   }));
   if (selected.length < snapshot.services.length) {
     notices.push({

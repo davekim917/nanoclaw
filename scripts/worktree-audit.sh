@@ -11,9 +11,11 @@
 # A worktree is SAFE only when ALL of these hold:
 #   1. It is not the main checkout.
 #   2. It is not locked by a LIVE process. A lock whose pid is dead is stale.
-#   3. Its working tree is clean (no modified or untracked files).
-#   4. Its HEAD is an ancestor of the integration branch — i.e. every commit
+#   3. No live process has its cwd inside it.
+#   4. Its working tree is clean (no modified or untracked files).
+#   5. Its HEAD is an ancestor of the integration branch — i.e. every commit
 #      is already merged and removing the worktree loses nothing.
+#   6. It has been untouched for MIN_IDLE_HOURS.
 #
 # Anything failing one of those is KEEP, with the reason printed. Default is
 # report-only; --remove acts, and even then it re-checks each worktree
@@ -25,6 +27,12 @@
 set -uo pipefail
 
 INTEGRATION="${WORKTREE_AUDIT_BASE:-main}"
+# Hours a worktree must be untouched before it is eligible. Guards the case the
+# lock and cwd checks cannot see: an agent session idle mid-task, holding no
+# lock and running no process, that someone intends to return to. 24h is a
+# deliberate over-estimate — the cost of keeping a dead worktree one more day
+# is a directory; the cost of reaping a live one is someone's work.
+MIN_IDLE_HOURS="${WORKTREE_AUDIT_MIN_IDLE_HOURS:-24}"
 DO_REMOVE=0
 [ "${1:-}" = "--remove" ] && DO_REMOVE=1
 
@@ -78,6 +86,7 @@ classify() {
     printf 'KEEP  %-70s a live process has its cwd here\n' "$path"; keep=$((keep + 1)); return
   fi
 
+
   if [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]; then
     printf 'KEEP  %-70s uncommitted changes\n' "$path"; keep=$((keep + 1)); return
   fi
@@ -85,6 +94,22 @@ classify() {
   if ! git -C "$path" merge-base --is-ancestor HEAD "$INTEGRATION" 2>/dev/null; then
     ahead="$(git -C "$path" rev-list --count "$INTEGRATION"..HEAD 2>/dev/null || echo '?')"
     printf 'KEEP  %-70s %s commit(s) not in %s\n' "$path" "$ahead" "$INTEGRATION"; keep=$((keep + 1)); return
+  fi
+
+  # Third belt: an agent session can be idle mid-task with NOTHING running --
+  # waiting on a user, or between turns. It holds no lock and has no live cwd,
+  # so both belts above pass, and reaping it destroys work someone is coming
+  # back to. Recent activity is the only signal left, so treat anything touched
+  # inside the quiet window as in use.
+  #
+  # Measured against .git rather than the tree: a worktree's .git file is
+  # rewritten on checkout/commit/stash, whereas the tree mtime can be stale on
+  # a worktree whose last action was a read.
+  local age_h
+  age_h=$(( ( $(date +%s) - $(stat -c %Y "$path/.git" 2>/dev/null || echo 0) ) / 3600 ))
+  if [ "$age_h" -lt "$MIN_IDLE_HOURS" ]; then
+    printf 'KEEP  %-70s active %sh ago (< %sh quiet window)\n' "$path" "$age_h" "$MIN_IDLE_HOURS"
+    keep=$((keep + 1)); return
   fi
 
   printf 'SAFE  %-70s merged + clean%s\n' "$path" "$stale_lock"

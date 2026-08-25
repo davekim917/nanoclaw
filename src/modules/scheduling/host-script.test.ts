@@ -10,7 +10,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ensureSchema, openInboundDb } from '../../db/session-db.js';
 import { insertTaskRow } from './db.js';
@@ -189,4 +189,21 @@ describe('runHostGatedTaskScripts', () => {
     expect(rowContent(db, 't-container-only').scriptOutput).toBeUndefined();
     db.close();
   });
+});
+
+describe('runHostScript hard deadline', () => {
+  it('resolves null and kills a hung script instead of wedging the sweep', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '300');
+    const { runHostScript } = await import('./host-script.js');
+    const started = Date.now();
+    // Grandchild outlives the direct bash on purpose: the deadline must fire
+    // (timeout+grace) even though backgrounded children hold stdio open.
+    const result = await runHostScript('(sleep 30 &) ; sleep 30', 'deadline-test');
+    const elapsed = Date.now() - started;
+    expect(result).toBeNull();
+    expect(elapsed).toBeLessThan(15_000);
+    expect(elapsed).toBeGreaterThanOrEqual(300);
+    vi.unstubAllEnvs();
+  }, 20_000);
 });

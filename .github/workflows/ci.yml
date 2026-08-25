@@ -44,9 +44,17 @@ jobs:
 
       - name: Container tests
         working-directory: container/agent-runner
-        # Agent-runner tests intentionally exercise process-global session DB,
-        # environment, and module-cache state. Bun otherwise runs up to 20 test
-        # files concurrently in one process, so unrelated files can close or
-        # repoint another file's fixture. Keep the suite deterministic; targeted
-        # pure tests can still opt into concurrency independently.
-        run: bun test --max-concurrency 1
+        # No concurrency flag here on purpose. `bun test` runs test FILES
+        # sequentially in a single process — `--max-concurrency` only caps
+        # `test.concurrent` tests, of which this suite has none, so it was a
+        # no-op that read like a fix and cost two misdiagnoses.
+        #
+        # The real isolation hazard is that single process: `mock.module()` is
+        # process-global and permanent (`mock.restore()` does not undo it), and
+        # bun's file order follows raw readdir(), which differs on every fresh
+        # runner. A file that mocks a first-party module therefore poisons
+        # whichever later files that checkout's directory order happens to put
+        # after it — green locally, red here, different tests each run. If this
+        # step fails with rows that "should exist" missing, look for a
+        # mock.module of a src/ module, not for concurrency.
+        run: bun test

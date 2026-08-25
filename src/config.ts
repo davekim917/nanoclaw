@@ -25,6 +25,7 @@ const envConfig = readEnvFile([
   'MAX_CONCURRENT_CONTAINERS',
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
+  'NANOCLAW_TASK_SCRIPT_TIMEOUT_MS',
   'ONECLI_GATEWAY_CONTAINER',
 ]);
 
@@ -93,6 +94,20 @@ export const SELF_HEAL_ENABLED = (process.env.NANOCLAW_SELF_HEAL ?? envConfig.NA
 // prevent. Nudges prove themselves first. See modules/claims/self-heal.ts.
 export const SELF_HEAL_TAKEOVER_ENABLED =
   (process.env.NANOCLAW_SELF_HEAL_TAKEOVER ?? envConfig.NANOCLAW_SELF_HEAL_TAKEOVER) === '1';
+// Pre-task script timeout in ms, shared by the host path (host-script.ts) and
+// forwarded into containers for the container path (task-script.ts). Read via
+// env-then-.env for the same import-order reason as the flags above.
+export const TASK_SCRIPT_TIMEOUT_MS = parseTimeoutMs(
+  process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS ?? envConfig.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS,
+);
+function parseTimeoutMs(raw: string | undefined): number {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 120_000;
+  // Clamp: an operator typo of 120000000 ms would stall the sequential sweep
+  // loop for a day per due script. Ten minutes is already generous headroom
+  // over the ~56s watcher that motivated this knob.
+  return Math.min(parsed, 600_000);
+}
 // Local agent-template library. Committed but ships empty (+ README). Resolved
 // once at load. Override to another LOCAL path via NANOCLAW_TEMPLATES_DIR; never
 // a remote URL, never an ncl flag, never runtime-mutable.

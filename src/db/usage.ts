@@ -80,6 +80,35 @@ export interface UsageDailyRow {
   cache_read_tokens: number;
   cache_write_tokens: number;
   cost_usd: number;
+  /**
+   * Whether cost_usd for this row is a real dollar figure vs a coerced-null
+   * zero. `usage_daily.cost_usd` is `REAL NOT NULL DEFAULT 0` (an additive
+   * rollup needs an identity element), so a provider whose protocol never
+   * reports cost (see PROVIDERS_WITHOUT_COST below) sums to 0 identically to
+   * a metered provider that genuinely spent nothing — those are NOT the same
+   * thing, and $0 must not be read as "free" for the former. Computed at
+   * read time from `provider`, never stored, so it applies uniformly to
+   * historical rows with no backfill and no risk of touching real data.
+   */
+  cost_applicable: boolean;
+}
+
+/**
+ * Providers whose usage protocol has no per-token cost field at all — Codex's
+ * app-server reports token counts only (ChatGPT-plan/subscription billing,
+ * not per-token API pricing; see the source comment at
+ * container/agent-runner/src/providers/codex.ts's tokenUsageState — "No cost
+ * field exists on this protocol ... cost_usd stays NULL for codex"). Claude
+ * (SDK-reported costUSD) and OpenCode (assistantUsage.cost from a metered
+ * Zen/Go provider) both report a real per-turn dollar figure, so they are
+ * cost-applicable. If a future provider is added with subscription-style
+ * billing, add it here rather than inventing a notional price for it.
+ */
+const PROVIDERS_WITHOUT_COST = new Set(['codex']);
+
+/** Exported so callers doing their own raw usage_daily queries (e.g. the dashboard's multi-group IN-list, which listUsageDaily's single-agentGroupId filter doesn't support) can attach the same computed flag rather than re-deriving it. */
+export function isCostApplicable(provider: string): boolean {
+  return !PROVIDERS_WITHOUT_COST.has(provider);
 }
 
 function getWatermark(sessionDirKey: string): number {
@@ -204,9 +233,10 @@ export function listUsageDaily(
     params.push(new Date(Date.now() - filters.days * 86_400_000).toISOString().slice(0, 10));
   }
   const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
-  return getDb()
+  const rows = getDb()
     .prepare(`SELECT * FROM usage_daily${clause} ORDER BY date DESC, agent_group_id, provider, model LIMIT 1000`)
-    .all(...params) as UsageDailyRow[];
+    .all(...params) as Omit<UsageDailyRow, 'cost_applicable'>[];
+  return rows.map((row) => ({ ...row, cost_applicable: isCostApplicable(row.provider) }));
 }
 
 // ---------------------------------------------------------------------------
