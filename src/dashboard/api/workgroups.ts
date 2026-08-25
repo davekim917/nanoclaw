@@ -16,6 +16,7 @@ import path from 'path';
 import { DATA_DIR, GROUPS_DIR } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import type { UsageDailyRow } from '../../db/usage.js';
+import { isCostApplicable } from '../../db/usage.js';
 import { log } from '../../log.js';
 import { isStalePastGrace, shouldEscalate } from '../../modules/claims/escalation.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
@@ -170,13 +171,17 @@ export const workgroupUsageHandler: AuthHandler = async (req, params, ctx) => {
       usage = [];
     } else {
       const placeholders = agentGroupIds.map(() => '?').join(', ');
-      usage = getDb()
+      const rawRows = getDb()
         .prepare(
           `SELECT * FROM usage_daily
             WHERE agent_group_id IN (${placeholders}) AND date >= ?
             ORDER BY date DESC, agent_group_id, provider, model`,
         )
-        .all(...agentGroupIds, sinceDate) as UsageDailyRow[];
+        .all(...agentGroupIds, sinceDate) as Omit<UsageDailyRow, 'cost_applicable'>[];
+      // cost_applicable is computed from provider, not a stored column — see
+      // isCostApplicable's doc for why (Codex has no per-token cost field, so
+      // its rows sum cost_usd to 0 identically to a real zero-spend row).
+      usage = rawRows.map((row) => ({ ...row, cost_applicable: isCostApplicable(row.provider) }));
     }
   } catch (err) {
     log.warn('workgroupUsageHandler: DB error', { workgroupId: wg.id, err });

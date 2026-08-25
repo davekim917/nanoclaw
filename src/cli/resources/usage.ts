@@ -20,7 +20,22 @@ registerResource({
     { name: 'output_tokens', type: 'number', description: 'Summed output tokens.' },
     { name: 'cache_read_tokens', type: 'number', description: 'Summed cache-read tokens.' },
     { name: 'cache_write_tokens', type: 'number', description: 'Summed cache-write tokens.' },
-    { name: 'cost_usd', type: 'number', description: 'Summed cost in USD (0 when the provider reported none).' },
+    {
+      name: 'cost_usd',
+      type: 'number',
+      description:
+        'Summed cost in USD. 0 for a subscription-billed provider (see cost_applicable) means "not applicable", ' +
+        'not "spent nothing" — check cost_applicable before reading 0 as free.',
+    },
+    {
+      name: 'cost_applicable',
+      type: 'boolean',
+      generated: true,
+      description:
+        'Computed from provider, not stored: false for a provider whose protocol reports tokens only ' +
+        '(e.g. Codex — ChatGPT-plan/subscription billing, no per-token cost field). When false, cost_usd is ' +
+        'always 0 and carries no cost signal; use input_tokens/output_tokens as the spend proxy instead.',
+    },
   ],
   operations: {},
   customOperations: {
