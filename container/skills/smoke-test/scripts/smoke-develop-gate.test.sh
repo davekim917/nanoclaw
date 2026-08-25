@@ -95,6 +95,7 @@ cat > "$STUB_BIN/freeze-helper" <<'STUB'
 set -u
 [ -n "${STUB_FREEZE_EXIT+x}" ] || STUB_FREEZE_EXIT=0
 [ -n "${STUB_FREEZE_JSON+x}" ] || STUB_FREEZE_JSON='{"ok":false,"error":"no STUB_FREEZE_JSON configured"}'
+[ -n "${STUB_FREEZE_SLEEP:-}" ] && sleep "$STUB_FREEZE_SLEEP"
 printf '%s' "$STUB_FREEZE_JSON"
 exit "$STUB_FREEZE_EXIT"
 STUB
@@ -832,5 +833,47 @@ bash "$GATE" claim manual-run "$CLAIM_SHA" | jq -e '
 # Off-mode: claim still works exactly as before.
 export SMOKE_GATE_FREEZE_HANDOFF=false
 bash "$GATE" claim manual-run "$CLAIM_SHA" | jq -e '.ok == true and .runId == "manual-run"' >/dev/null
+
+# --- 36. N4: a torn ledger line must not hide a LATER adoption match --------
+# The ledger is appended to by smoke-pr-gate.sh, so a torn write is ordinary. A
+# streaming `jq select()` aborts at the first malformed line and `2>/dev/null`
+# hides it, so the outcome this poll is waiting for was silently invisible and
+# the handoff sat open until the staleness ceiling. Same bug as the retention
+# scan's, smaller blast radius.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+TORN_TARGET="$(printf 'c%.0s' $(seq 40))"
+TORN_HEAD="$(printf 'd%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$TORN_TARGET"
+export STUB_FREEZE_JSON="{\"prNumber\":55,\"branch\":\"smoke/freeze-t\",\"freezeSha\":\"$TORN_HEAD\",\"targetSha\":\"$TORN_TARGET\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+# A torn append lands BEFORE the real outcome line.
+printf '{"schemaVersion":1,"targetSha":"%s","runId":"tor\n' "$TORN_TARGET" \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+jq -cn --arg target "$TORN_TARGET" --arg freeze "$TORN_HEAD" --argjson pr 55 \
+  --arg run "smoke-pr55-run-1" --arg verdict "NO_GO" --arg now "2026-08-25T00:00:00Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  >> "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e '.data.trigger == "already_completed"' >/dev/null
+jq -e --arg sha "$TORN_TARGET" --arg run "smoke-pr55-run-1" '
+  .completedSha == $sha and .completedVerdict == "NO_GO" and .completedRunId == $run and
+  .handoffFreezePr == null and .handoffTargetSha == null
+' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# --- 37. N3: the freeze helper is timed out like every other network call --
+# It makes five sequential GitHub calls and was the only untimed one — and it
+# runs holding the state lock, so a hung forge wedged the gate for as long as
+# the call hung. Exit 124 lands in the existing throttled freeze-failure alarm.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+HANG_SHA="$(printf 'e%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$HANG_SHA"
+export SMOKE_GATE_FREEZE_HELPER_TIMEOUT=1 STUB_FREEZE_SLEEP=5
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_freeze_failed" and .data.exitCode == 124
+' >/dev/null
+unset STUB_FREEZE_SLEEP SMOKE_GATE_FREEZE_HELPER_TIMEOUT
 
 echo "smoke develop gate tests passed"

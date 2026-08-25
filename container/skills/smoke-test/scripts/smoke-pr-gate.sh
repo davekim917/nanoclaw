@@ -109,6 +109,27 @@ pr_state_file() { printf '%s/pr-%s-state.json' "$STATE_DIR" "$1"; }
 pr_lock_file()  { printf '%s/pr-%s-state.lock' "$STATE_DIR" "$1"; }
 pr_verdict_file() { printf '%s/pr-%s-verdict.json' "$STATE_DIR" "$1"; }
 
+# How long to wait for a per-PR state lock. Same knob and same default as
+# smoke-develop-gate.sh's.
+LOCK_WAIT="${SMOKE_GATE_LOCK_WAIT_SECONDS:-15}"
+
+# Losing the lock is NOT losing the slot. The old emission here was
+# `{ok:false,error:"gate lock failed"}` — an `ok:false` that the skill's
+# stop-the-campaign rule could not tell apart from "you were reclaimed", so a
+# transient contention miss on a mandatory `progress` stamp could end a healthy
+# campaign. `retryable:true` plus the `gate_lock_busy:` prefix is the stable,
+# greppable "wait and retry" signal; the not-active refusals carry neither.
+emit_lock_busy() {
+  jq -cn --arg phase "$1" --arg pr "${2:-}" \
+    '{ok:false,
+      retryable:true,
+      error:("gate_lock_busy: another gate invocation held the state lock (" + $phase +
+             ") — RETRY this same command in ~10s. This does NOT mean the run lost its slot; do not stop the campaign."),
+      pr:(if $pr == "" then null else ($pr|tonumber) end),
+      wakeAgent:false,
+      data:{schemaVersion:1,trigger:"gate_lock_busy",phase:$phase}}'
+}
+
 default_pr_state() {
   jq -cn --argjson pr "$1" '{
     schemaVersion: 1,
@@ -625,8 +646,8 @@ if [ "$COMMAND" = "claim" ]; then
   # the target PR's own lock) so the scan below can't race a concurrent claim
   # on a different PR.
   exec 8>"$CONTROL_LOCK"
-  if ! flock -w 5 8; then
-    jq -cn --argjson pr "$PR" '{ok:false,error:"gate lock failed",pr:$pr}'
+  if ! flock -w "$LOCK_WAIT" 8; then
+    emit_lock_busy "$COMMAND" "$PR"
     exit 0
   fi
   OTHER_PR="$(find_pr_for_run "$RUN_ID" || true)"
@@ -637,8 +658,8 @@ if [ "$COMMAND" = "claim" ]; then
     exit 0
   fi
   exec 9>"$(pr_lock_file "$PR")"
-  if ! flock -w 5 9; then
-    jq -cn --argjson pr "$PR" '{ok:false,error:"gate lock failed",pr:$pr}'
+  if ! flock -w "$LOCK_WAIT" 9; then
+    emit_lock_busy "$COMMAND" "$PR"
     exit 0
   fi
   STATE="$(read_pr_state "$PR")"
@@ -699,8 +720,8 @@ if [ "$COMMAND" = "progress" ]; then
     exit 0
   fi
   exec 9>"$(pr_lock_file "$PR")"
-  if ! flock -w 5 9; then
-    jq -cn --argjson pr "$PR" '{ok:false,error:"gate lock failed",pr:$pr}'
+  if ! flock -w "$LOCK_WAIT" 9; then
+    emit_lock_busy "$COMMAND" "$PR"
     exit 0
   fi
   STATE="$(read_pr_state "$PR")"
@@ -728,8 +749,8 @@ if [ "$COMMAND" = "release" ]; then
     exit 0
   fi
   exec 9>"$(pr_lock_file "$PR")"
-  if ! flock -w 5 9; then
-    jq -cn --argjson pr "$PR" '{ok:false,error:"gate lock failed",pr:$pr}'
+  if ! flock -w "$LOCK_WAIT" 9; then
+    emit_lock_busy "$COMMAND" "$PR"
     exit 0
   fi
   STATE="$(read_pr_state "$PR")"
@@ -766,8 +787,8 @@ if [ "$COMMAND" = "finish" ]; then
     exit 0
   fi
   exec 9>"$(pr_lock_file "$PR")"
-  if ! flock -w 5 9; then
-    jq -cn --argjson pr "$PR" '{ok:false,error:"gate lock failed",pr:$pr}'
+  if ! flock -w "$LOCK_WAIT" 9; then
+    emit_lock_busy "$COMMAND" "$PR"
     exit 0
   fi
   STATE="$(read_pr_state "$PR")"
@@ -783,11 +804,25 @@ if [ "$COMMAND" = "finish" ]; then
     exit 0
   fi
   NOW="$(iso_now)"
-  STATE="$(jq -c \
-    --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
-    '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
-     .activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null' <<<"$STATE")"
-  write_pr_state "$PR" "$STATE"
+  # ORDER IS THE CRASH CONTRACT. Clearing the slot FIRST — which is what this
+  # did — made `finish` fail OPEN and permanently: a container death after the
+  # state write but before the hold/ledger recorded NO_GO per-PR while the
+  # promotion hold was never raised and the ledger line never landed, and the
+  # retry was then refused with "not the active run" because activeRunId was
+  # already null. The develop gate survives its identical window because its
+  # hold-integrity reconciler notices the missing hold; the PR gate has no
+  # equivalent, so it has to be crash-safe by construction instead.
+  #
+  # So: keep the slot HELD across the artifact work and clear it only once the
+  # artifacts are durable. A crash anywhere below leaves activeRunId set, which
+  # is exactly the state a plain `finish` retry needs. Every step in between is
+  # idempotent — the suspend POST, the publish/hold file overwrites, and (see
+  # the ledger append) a duplicate ledger line the develop gate's `tail -1`
+  # never notices.
+  #
+  # The lock, however, is dropped now: the state file is unmodified, so nothing
+  # is lost, and the network work below must not starve a concurrent verb.
+  flock -u 9
 
   # Suspend the backend preview so a finished PR stops billing compute while
   # it waits for merge/close. Teardown itself is Render's job (auto-delete on
@@ -891,6 +926,12 @@ if [ "$COMMAND" = "finish" ]; then
           # One bounded retry (2 attempts total, 5s wait each): the develop
           # gate has no other way to learn this outcome, so a single
           # transient contention loss must not silently drop it.
+          # ponytail: a `finish` retried after a crash appends a SECOND line for
+          # the same targetSha. Harmless and deliberately not deduped — the
+          # develop gate reads the matching lines with `tail -1` and the two
+          # agree on freezePr/runId/verdict, so the later one simply wins. The
+          # ledger is append-only audit; rewriting it to dedupe would cost more
+          # than the duplicate does.
           for LEDGER_ATTEMPT in 1 2; do
             exec 7>"$HANDOFF_LEDGER.lock"
             if flock -w 5 7; then
@@ -911,12 +952,48 @@ if [ "$COMMAND" = "finish" ]; then
             # finished", so `written` must reflect the WHOLE handoff, not
             # just the artifact files.
             HANDOFF_WRITTEN=false
-            HANDOFF_REASON="ledger append failed after retry — develop gate will not see this outcome until a manual sync or a later re-finish"
+            # NOT "a later re-finish": this path still clears the slot below,
+            # so a second `finish` is refused as not-the-active-run. Naming a
+            # recovery the code forbids sends an operator down a dead end at
+            # the exact moment the develop gate is blind to this verdict.
+            HANDOFF_REASON="ledger append failed after retry — the develop gate cannot see this outcome. A re-finish will be REFUSED (the slot is cleared): append the ledger line by hand, or reconcile the gate state manually"
           fi
         fi
       fi
     fi
   fi
+
+  # Artifacts are durable — NOW record the verdict and release the slot. Up to
+  # this line a crash is fully recoverable: activeRunId is still this run, so a
+  # plain `finish` retry re-runs the (idempotent) work above and completes.
+  #
+  # Re-verify ownership under the lock before clearing. The window above is
+  # network-long, and a human `claim --takeover` inside it means the slot now
+  # belongs to a successor: clearing it here would be the very stomp the
+  # not-the-active-run guard exists to prevent. The artifacts already written
+  # stand (this run did finish, and they name its own runId), so say so rather
+  # than pretending nothing happened.
+  if ! flock -w "$LOCK_WAIT" 9; then
+    emit_lock_busy "$COMMAND" "$PR"
+    exit 0
+  fi
+  STATE="$(read_pr_state "$PR")"
+  ACTIVE_RUN="$(jq -r '.activeRunId // empty' <<<"$STATE")"
+  if [ "$RUN_ID" != "$ACTIVE_RUN" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg active "$ACTIVE_RUN" \
+      --argjson handoffWritten "$HANDOFF_WRITTEN" \
+      '{ok:false,error:"the slot changed hands while this finish was writing its artifacts — no verdict recorded, the successor'"'"'s slot left alone",
+        pr:$pr,runId:(if $run == "" then null else $run end),
+        activeRunId:(if $active == "" then null else $active end),
+        handoff:{written:$handoffWritten}}'
+    exit 0
+  fi
+  STATE="$(jq -c \
+    --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
+    '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
+     .activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null' <<<"$STATE")"
+  write_pr_state "$PR" "$STATE"
+  flock -u 9
 
   VERDICT_JSON="$(jq -cn \
     --argjson pr "$PR" --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
@@ -1060,7 +1137,7 @@ while IFS= read -r ROW; do
   fi
 
   exec 9>"$(pr_lock_file "$PR")"
-  if ! flock -w 5 9; then
+  if ! flock -w "$LOCK_WAIT" 9; then
     exec 9>&-
     continue
   fi
@@ -1282,7 +1359,7 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   fi
 
   exec 9>"$(pr_lock_file "$W_PR")"
-  if ! flock -w 5 9; then
+  if ! flock -w "$LOCK_WAIT" 9; then
     jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"gate_lock_failed"}}'
     exit 0
   fi

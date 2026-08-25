@@ -26,7 +26,15 @@
 # Any of the three sources being absent/unset/unreadable just contributes no
 # protected ids from that source — never a hard failure — but the JSON report
 # always states which sources it actually found, so a misconfigured deployment
-# is a visible field, not a silent hole in the protection set.
+# is a visible field, not a silent hole in the protection set. A ledger with
+# torn/malformed lines is skipped line-by-line rather than truncating the scan,
+# and the count is reported as `protectionSources.handoffLedgerMalformedLines`.
+#
+# OPERATOR ESCAPE HATCH: `--unprotected` skips the fail-closed refusal below and
+# deletes on a corpus with no live gate. It is deliberately NOT named in the
+# refusal's `error` string — that string is machine-parsed, and advertising the
+# bypass there teaches an automated caller to defeat the guard. It IS printed
+# by `--help`, for the human who actually needs it.
 #
 # Dry run by DEFAULT. Pass --delete to actually remove anything. One JSON line
 # on stdout, same convention as the sibling gate scripts. Exit 0 on success
@@ -41,18 +49,44 @@ die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
 # `--takeover` in the gate scripts.
 DELETE=false
 UNPROTECTED=false
+HELP=false
 _ARGS=()
 for _a in "$@"; do
   case "$_a" in
     --delete) DELETE=true ;;
     --unprotected) UNPROTECTED=true ;;
+    -h|--help) HELP=true ;;
     *) _ARGS+=("$_a") ;;
   esac
 done
 set -- ${_ARGS[@]+"${_ARGS[@]}"}
 
+# Human-facing, so it goes to stderr and leaves the one-JSON-line stdout
+# contract intact for every other path.
+if [ "$HELP" = true ]; then
+  cat >&2 <<'USAGE'
+smoke-evidence-retention.sh <run-root> [--delete] [--unprotected]
+
+  <run-root>       directory whose immediate subdirectories are run ids
+  --delete         actually remove things (default is a dry run)
+  --unprotected    OPERATOR ONLY. Skip the fail-closed refusal that fires when
+                   no protection source resolved, and delete anyway. Use only
+                   on an archived corpus with no live gate behind it: with no
+                   protection set, an active run's evidence is indistinguishable
+                   from an abandoned one and will be pruned out from under the
+                   gate still reading it.
+  -h, --help       this text
+
+Environment: SMOKE_RETENTION_MEDIA_DAYS, SMOKE_RETENTION_RECORD_DAYS,
+SMOKE_RETENTION_MEDIA_EXTENSIONS, SMOKE_RETENTION_HANDOFF_RECENT_COUNT,
+SMOKE_GATE_STATE_DIR, SMOKE_GATE_PUBLISH_FILE, SMOKE_GATE_HOLD_FILE,
+SMOKE_GATE_HANDOFF_LEDGER.
+USAGE
+  exit 0
+fi
+
 RUN_ROOT="${1:-}"
-[ -n "$RUN_ROOT" ] || die "usage: smoke-evidence-retention.sh <run-root> [--delete] [--unprotected]"
+[ -n "$RUN_ROOT" ] || die "usage: smoke-evidence-retention.sh <run-root> [--delete] (see --help)"
 [ -d "$RUN_ROOT" ] || die "run root does not exist or is not a directory: $RUN_ROOT"
 
 MEDIA_DAYS="${SMOKE_RETENTION_MEDIA_DAYS:-14}"
@@ -97,13 +131,35 @@ if [ -n "$HOLD_FILE" ] && [ -s "$HOLD_FILE" ]; then
 fi
 
 LEDGER_FOUND=false
+LEDGER_MALFORMED=0
 if [ -s "$HANDOFF_LEDGER" ]; then
   LEDGER_FOUND=true
-  tail -n "$HANDOFF_RECENT_COUNT" "$HANDOFF_LEDGER" | jq -r '.runId // empty' 2>/dev/null >> "$PROTECTED_FILE"
+  LEDGER_TAIL="$TMP_DIR/ledger-tail.txt"
+  tail -n "$HANDOFF_RECENT_COUNT" "$HANDOFF_LEDGER" > "$LEDGER_TAIL"
+  # `-R` + `fromjson?` per line: a malformed line is SKIPPED and the scan keeps
+  # going. Plain `jq -r` streams the file as one document and aborts at the
+  # first bad line, so every NEWER protected id after it was silently lost —
+  # and `2>/dev/null` hid the abort while the report still said
+  # handoffLedgerFound:true. Under --delete that pruned runs the gate still
+  # reads. The ledger is append-only from another process, so a torn final
+  # write is a normal event, not an exotic one.
+  jq -rR 'fromjson? | select(type == "object") | .runId // empty' \
+    "$LEDGER_TAIL" 2>/dev/null >> "$PROTECTED_FILE"
+  LEDGER_NONBLANK="$(grep -cve '^[[:space:]]*$' "$LEDGER_TAIL" 2>/dev/null || true)"
+  LEDGER_PARSED="$(jq -rRn '[inputs | fromjson? | select(type == "object")] | length' \
+    "$LEDGER_TAIL" 2>/dev/null || printf '')"
+  printf '%s' "$LEDGER_NONBLANK" | grep -Eq '^[0-9]+$' || LEDGER_NONBLANK=0
+  printf '%s' "$LEDGER_PARSED" | grep -Eq '^[0-9]+$' || LEDGER_PARSED=0
+  if [ "$LEDGER_NONBLANK" -gt "$LEDGER_PARSED" ]; then
+    LEDGER_MALFORMED="$(( LEDGER_NONBLANK - LEDGER_PARSED ))"
+  fi
 fi
 
 sort -u -o "$PROTECTED_FILE" "$PROTECTED_FILE"
-is_protected() { grep -qxF "$1" "$PROTECTED_FILE" 2>/dev/null; }
+# `--` because a run id may legitimately start with `-` (a run prefix from a
+# wrapper, a hand-made directory), and grep would otherwise parse it as an
+# option, fail, and report the run UNPROTECTED — a delete-side fail-open.
+is_protected() { grep -qxF -- "$1" "$PROTECTED_FILE" 2>/dev/null; }
 
 # Extension list -> a `find -iname` OR-expression, built once.
 IFS=',' read -ra EXT_LIST <<<"$MEDIA_EXTENSIONS"
@@ -126,9 +182,14 @@ done
 if [ "$DELETE" = true ] && [ "$UNPROTECTED" != true ] &&
    [ "$STATE_DIR_FOUND" != true ] && [ "$PUBLISH_FOUND" != true ] &&
    [ "$HOLD_FOUND" != true ] && [ "$LEDGER_FOUND" != true ]; then
+  # The message deliberately does NOT name the bypass flag. This `error` string
+  # is machine-parsed, and a scheduled-task LLM reading "pass --unprotected to
+  # delete anyway" will eventually do exactly that — the refusal would be
+  # teaching its own defeat. The escape hatch still exists for an operator; it
+  # is documented in the header comment and in `--help`.
   jq -cn --arg runRoot "$RUN_ROOT" \
     '{ok:false,
-      error:"refusing to delete: no protection source resolved — set SMOKE_GATE_STATE_DIR, SMOKE_GATE_PUBLISH_FILE, SMOKE_GATE_HOLD_FILE or the handoff ledger so active and verdict-referenced runs can be excluded. Re-run without --delete to see what would be pruned, or pass --unprotected to delete anyway on a corpus with no live gate.",
+      error:"refusing to delete: no protection source resolved, so active and verdict-referenced runs cannot be excluded. Set SMOKE_GATE_STATE_DIR, SMOKE_GATE_PUBLISH_FILE, SMOKE_GATE_HOLD_FILE or the handoff ledger and re-run. Re-run without --delete to see what would be pruned.",
       runRoot:$runRoot,
       protectionSources:{stateDirFound:false, publishFileFound:false,
                          holdFileFound:false, handoffLedgerFound:false}}'
@@ -235,6 +296,7 @@ jq -cn \
   --argjson publishFileFound "$PUBLISH_FOUND" \
   --argjson holdFileFound "$HOLD_FOUND" \
   --argjson handoffLedgerFound "$LEDGER_FOUND" \
+  --argjson handoffLedgerMalformedLines "$LEDGER_MALFORMED" \
   '{ok:$ok, dryRun:$dryRun, runRoot:$runRoot,
     mediaDays:$mediaDays, recordDays:$recordDays,
     scanned:$scanned, protected:$protectedCount, tooYoung:$tooYoung,
@@ -245,5 +307,6 @@ jq -cn \
     newestAffectedRun:(if $newestRun == "" then null else $newestRun end),
     affected:$affected,
     protectionSources:{stateDirFound:$stateDirFound, publishFileFound:$publishFileFound,
-                        holdFileFound:$holdFileFound, handoffLedgerFound:$handoffLedgerFound}}'
+                        holdFileFound:$holdFileFound, handoffLedgerFound:$handoffLedgerFound,
+                        handoffLedgerMalformedLines:$handoffLedgerMalformedLines}}'
 exit 0
