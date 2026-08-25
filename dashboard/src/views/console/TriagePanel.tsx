@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import type { ThreadSummary } from '../../lib/api.js';
 import { actionError } from './action-error.js';
-import { setSnoozed } from './actions.js';
+import { isOwnerlessItem, setSnoozed } from './actions.js';
 import { ThreadDetail } from './ThreadDetail.js';
 
 /**
@@ -19,7 +19,15 @@ import { ThreadDetail } from './ThreadDetail.js';
  *
  * One verdict key, and one non-verdict pass-through, per §11:
  *
- *   S — snooze until it moves
+ *   S — snooze until it moves. NOT offered on an ownerless item (`board:*`,
+ *       DESIGN §5's `unassigned` rows): the snooze endpoint resolves a thread
+ *       through its SESSIONS and an ownerless item has none, so it could only
+ *       ever answer 404. Triage keeps those rows — they are exactly the work
+ *       a pass over `needs_you`/`stalled`/`unassigned` is for, and Assign is
+ *       reachable from the detail pane below — but S is disabled on them and
+ *       the key SAYS SO instead of silently doing nothing or advancing.
+ *       Advancing would be the worse failure: it looks like a verdict landed.
+ *       N is the pass-through for a row you have nothing to do about yet.
  *   N — skip: move to the next thread WITHOUT touching this one. No snooze,
  *       no archive, no request of any kind — the thread is not resolved, so it
  *       stays in the live queue and reappears on the next triage pass. This
@@ -102,8 +110,18 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
     [snapshot, total],
   );
 
+  /** See the S entry in this file's header. */
+  const snoozable = !!thread && !isOwnerlessItem(thread);
+
   const snooze = useCallback(async () => {
     if (!thread || busy) return;
+    if (isOwnerlessItem(thread)) {
+      // Not a silent no-op and not an advance: the operator pressed a key and
+      // is owed an answer about why nothing happened, with the verb that DOES
+      // work on this row named.
+      setAnnouncement('Snooze does not apply to an unassigned item — assign it below, or press N to skip.');
+      return;
+    }
     setBusy(true);
     try {
       await setSnoozed(thread.thread_id, true);
@@ -204,7 +222,16 @@ export function TriagePanel({ snapshot, threads, onExit, onChanged }: TriagePane
         <button type="button" className="ncc-verb" disabled={!thread || busy} onClick={skip}>
           N · skip
         </button>
-        <button type="button" className="ncc-verb" disabled={!thread || busy} onClick={() => void snooze()}>
+        {/* Disabled, not hidden: the key legend beside it still says `S
+            snooze`, and a control that vanishes row-to-row reads as a glitch.
+            See the S entry in this file's header. */}
+        <button
+          type="button"
+          className="ncc-verb"
+          disabled={!snoozable || busy}
+          title={thread && !snoozable ? 'An unassigned item has no session to snooze — assign it, or skip.' : undefined}
+          onClick={() => void snooze()}
+        >
           S · snooze
         </button>
         <button type="button" className="ncc-solid-btn" onClick={onExit}>

@@ -263,6 +263,73 @@ describe('the keyboard rules that ship broken silently', () => {
   });
 });
 
+/* ─── Ownerless items ──────────────────────────────────────────────────────── */
+
+/**
+ * An ownerless item (`board:*`, DESIGN §5's `unassigned`) is a board entry with
+ * no session behind it. `thread-snooze.ts` resolves a thread through `sessions`,
+ * so a snooze on one can only ever answer 404 — and §12 is explicit that a
+ * control whose action can only be refused is worse than no control: it teaches
+ * the operator the surface is broken rather than that the row does not take
+ * that verb.
+ *
+ * These rows STAY in triage — they are exactly the work a pass over
+ * `needs_you`/`stalled`/`unassigned` is for, and Assign is reachable from the
+ * detail pane. Only S is withdrawn, and it says so.
+ */
+describe('S is withdrawn on an ownerless item rather than left to be refused', () => {
+  const ownerless = (): ThreadSummary =>
+    thread(1, {
+      thread_id: 'board:EXAMPLE-APP#817',
+      state: 'unassigned',
+      participants: [],
+      session_ids: [],
+      reply_target_session_id: null,
+      attention_source: {
+        kind: 'release-board',
+        as_of: '2026-08-20T09:00:00.000Z',
+        stale: false,
+        url: null,
+        next_action: 'ship it',
+        assigned: null,
+        assigned_expired: null,
+      },
+    });
+
+  it('disables the snooze button on the row and leaves it enabled on a session thread', async () => {
+    renderTriage([ownerless(), thread(2)]);
+    const button = () => screen.getByRole('button', { name: /S · snooze/ }) as HTMLButtonElement;
+    expect(button().disabled).toBe(true);
+
+    // Advance to the session-backed row: the same button comes back.
+    await userEvent.click(screen.getByRole('button', { name: /N · skip/ }));
+    expect(button().disabled).toBe(false);
+  });
+
+  it('the S key fires no request, does not advance, and says why', async () => {
+    const user = userEvent.setup();
+    renderTriage([ownerless(), thread(2)]);
+    panel().focus();
+    await user.keyboard('s');
+    expect(snoozeThread).not.toHaveBeenCalled();
+    // Advancing would be the worse failure: it looks like a verdict landed.
+    expect(screen.getByText('1 / 2')).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByText(/Snooze does not apply to an unassigned item — assign it below, or press N to skip\./))
+        .toBeTruthy(),
+    );
+  });
+
+  it('N still skips it — the row is triageable, just not snoozeable', async () => {
+    const user = userEvent.setup();
+    renderTriage([ownerless(), thread(2)]);
+    panel().focus();
+    await user.keyboard('n');
+    expect(screen.getByText('2 / 2')).toBeTruthy();
+    expect(snoozeThread).not.toHaveBeenCalled();
+  });
+});
+
 /* ─── Shared refusal wording ───────────────────────────────────────────────── */
 
 describe('a refused verdict is explained in the operator’s words', () => {

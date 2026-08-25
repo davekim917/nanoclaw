@@ -170,6 +170,24 @@ describe('the endpoints', () => {
     expect(un!.status).toBe(404);
   });
 
+  /**
+   * The other half of the "attention rows are never snoozed" contract — the
+   * list side is pinned in `api/threads.test.ts`. An ownerless item is a board
+   * entry with no session behind it, so there is no row for this query to find
+   * and no honest activity mark to record against. The console must therefore
+   * not offer the verb on those rows at all (`isOwnerlessItem` gates the detail
+   * pane's button and Triage's `S`); this is what keeps that a fact about the
+   * server rather than a UI convention someone can quietly undo.
+   */
+  it('404s an ownerless attention item, which has no session to snooze', async () => {
+    seedSession('s-1', 'ag-1', 'slack:CTESTCHAN01:1700000000.11', iso(60_000));
+    const res = await threadSnoozeHandler(post(), { id: 'board:EXAMPLE-APP#817' }, ctx());
+    expect(res!.status).toBe(404);
+    const un = await threadUnsnoozeHandler(post(), { id: 'board:EXAMPLE-APP#817' }, ctx());
+    expect(un!.status).toBe(404);
+    expect(getDb().prepare('SELECT COUNT(*) AS n FROM thread_snoozes').get()).toEqual({ n: 0 });
+  });
+
   it('404s an unknown thread and an out-of-scope one identically (§2a)', async () => {
     seedSession('s-1', 'ag-1', 'slack:CTESTCHAN01:1700000000.11', iso(60_000));
     const unknown = await threadSnoozeHandler(post(), { id: 'slack:CTESTCHAN01:1700000000.99' }, ctx());

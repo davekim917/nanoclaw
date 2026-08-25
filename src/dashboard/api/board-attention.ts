@@ -26,6 +26,7 @@ import { GROUPS_DIR } from '../../config.js';
 import { containedRealpath, readContainedFile, resolveContainedRoot } from './attention-fs.js';
 import { readClaims, type BoardClaim } from '../../claims-board.js';
 import { log } from '../../log.js';
+import { parseUtcTimestampMs } from '../../thread-context.js';
 import type {
   AttentionSourceDecl,
   AttentionSourceEnv,
@@ -147,7 +148,31 @@ export function deriveBoardAttentionItems(
   binding: { workgroupId: string; channelKey: string },
   openPrs: OpenPrState = {},
 ): ProvidedAttentionItem[] {
-  const shippedSinceSnapshot = new Set(shipRecords.filter((r) => r.ts >= asOf).map((r) => r.target));
+  // PARSED on both sides, never compared as strings. `r.ts` is agent-written
+  // into a gates file and `asOf` comes off the snapshot, so the two are not
+  // guaranteed to share a shape — and `'2026-08-20T10:00:00+02:00' >=
+  // '2026-08-20T09:00:00Z'` is lexically TRUE while being chronologically
+  // false, and a naive `'2026-08-20 09:00:00'` sorts BELOW every `T`-form
+  // stamp. Both miscompares point the dangerous way: a spurious match adds the
+  // PR to the suppression set and the ready-to-ship row silently disappears,
+  // which is the exact invisibility this feed exists to end.
+  //
+  // A stamp that will not parse suppresses NOTHING — on either side. An
+  // unparseable `asOf` gives no reference point at all, so the whole
+  // suppression is skipped rather than guessed at; an unparseable record just
+  // drops out. Showing a row one cycle too long is visible and self-correcting;
+  // hiding one is not.
+  const asOfMs = parseUtcTimestampMs(asOf);
+  const shippedSinceSnapshot = new Set(
+    asOfMs === null
+      ? []
+      : shipRecords
+          .filter((r) => {
+            const ts = parseUtcTimestampMs(r.ts);
+            return ts !== null && ts >= asOfMs;
+          })
+          .map((r) => r.target),
+  );
 
   const out: ProvidedAttentionItem[] = [];
   for (const item of items) {
@@ -214,15 +239,57 @@ function readOpenPrState(releasesDir: string, workgroupId: string): OpenPrState 
   }
 }
 
-function readShipRecords(releasesDir: string, workgroupId: string): GateShipRecord[] {
-  const gatesDir = containedRealpath(releasesDir, path.join(releasesDir, 'gates'));
-  if (gatesDir === null) return [];
+/**
+ * The largest number of gate files one read will open.
+ *
+ * `MAX_FILE_BYTES` in `attention-fs.ts` bounds how big each file may be;
+ * nothing bounded how MANY there are. The gates directory is bind-mounted
+ * read-write into that workgroup's own containers, so the file COUNT is chosen
+ * by an agent, and the whole loop runs synchronously inside the thread-list
+ * request — a directory grown to thousands of entries is gigabytes of blocking
+ * read and `JSON.parse` on every memo miss, once a minute, for every viewer.
+ *
+ * The desk writes ONE file per calendar day (`gates/<YYYY-MM-DD>.jsonl`); the
+ * live directory holds 20. 400 is over thirteen months of daily files, so the
+ * cap cannot bite on a desk that is merely old — only on one whose archiver has
+ * died or whose directory has been filled deliberately. Both of those are worth
+ * a human's attention, which is why hitting it emits a row rather than quietly
+ * reading less (see {@link gatesOverflowItem}).
+ *
+ * Files are taken NEWEST FIRST, by name descending. `readdirSync` order is
+ * whatever the filesystem hands back, so an uncapped-order cut would drop an
+ * arbitrary set — possibly including today's file, the only one whose records
+ * can be at-or-after the snapshot's `asOf` and therefore the only one that can
+ * actually suppress anything. The desk's `YYYY-MM-DD` naming makes lexical
+ * order chronological, so descending sort keeps exactly the files that matter
+ * and drops the oldest, which by construction can suppress nothing.
+ */
+const MAX_GATE_FILES = 400;
 
-  let gateFiles: string[];
+function readShipRecords(
+  releasesDir: string,
+  workgroupId: string,
+): { records: GateShipRecord[]; total: number; skipped: number } {
+  const none = { records: [], total: 0, skipped: 0 };
+  const gatesDir = containedRealpath(releasesDir, path.join(releasesDir, 'gates'));
+  if (gatesDir === null) return none;
+
+  let allFiles: string[];
   try {
-    gateFiles = fs.readdirSync(gatesDir).filter((f) => f.endsWith('.jsonl'));
+    allFiles = fs.readdirSync(gatesDir).filter((f) => f.endsWith('.jsonl'));
   } catch {
-    return []; // no gates dir yet — nothing recorded, nothing to exclude
+    return none; // no gates dir yet — nothing recorded, nothing to exclude
+  }
+  const gateFiles =
+    allFiles.length > MAX_GATE_FILES ? [...allFiles].sort().reverse().slice(0, MAX_GATE_FILES) : allFiles;
+  const skipped = allFiles.length - gateFiles.length;
+  if (skipped > 0) {
+    log.warn('Release board gates: more gate files than the read cap, reading only the newest', {
+      workgroupId,
+      total: allFiles.length,
+      cap: MAX_GATE_FILES,
+      skipped,
+    });
   }
 
   const shipRecords: GateShipRecord[] = [];
@@ -246,7 +313,50 @@ function readShipRecords(releasesDir: string, workgroupId: string): GateShipReco
       }
     }
   }
-  return shipRecords;
+  return { records: shipRecords, total: allFiles.length, skipped };
+}
+
+/**
+ * The gates directory outgrew {@link MAX_GATE_FILES}, as a work item.
+ *
+ * Silent truncation is the absence-as-fact bug this whole seam keeps
+ * eliminating: the read would still look clean, the queue would still look
+ * healthy, and nobody would learn that the source is only being partly read.
+ * So it takes the shape every other degraded state in this seam takes — a
+ * parked row whose note says `waiting on a human` verbatim, which is what
+ * routes it into `needs_you` (`WAITING_ON_NOTE` in `threads.ts`) rather than a
+ * backlog nobody reads.
+ *
+ * The id is derived from nothing but the condition, so the row keeps one
+ * identity across polls and an `observatory_item_assignments` reservation on it
+ * stays matched. `since` is the snapshot's own `asOf` — the moment this read
+ * observed the overflow — never `now`, which would re-date itself every poll
+ * and make the row the first one dropped by the age-fair cap.
+ */
+function gatesOverflowItem(
+  counts: { total: number; skipped: number },
+  asOf: string,
+  binding: { workgroupId: string; channelKey: string },
+): ProvidedAttentionItem {
+  return {
+    id: 'gates-overflow',
+    channel_key: binding.channelKey,
+    title: 'The release desk’s gates directory is being read only in part',
+    // The seam knows the directory is oversized; it does not know where the
+    // archiver that should be trimming it lives. Never invented.
+    url: null,
+    workgroupId: binding.workgroupId,
+    claimState: 'parked',
+    claimNote:
+      `waiting on a human: the gates directory holds ${counts.total} files and only the newest ` +
+      `${MAX_GATE_FILES} are read, so ${counts.skipped} are being ignored on every poll — ` +
+      `ship records in them cannot de-duplicate the board`,
+    claimOwner: null,
+    participants: [],
+    sessionCount: 0,
+    since: asOf,
+    nextAction: 'Archive or trim the release desk’s gates directory',
+  };
 }
 
 /**
@@ -305,20 +415,20 @@ export function readReleaseBoardSource(
     return { asOf: null, items: [] };
   }
 
-  const shipRecords = readShipRecords(releasesDir, workgroupId);
+  const gates = readShipRecords(releasesDir, workgroupId);
   const openPrs = readOpenPrState(releasesDir, workgroupId);
 
   const claims =
     env.claimsRoot !== undefined ? readClaims(workgroupId, now, env.claimsRoot) : readClaims(workgroupId, now);
+  const binding = { workgroupId, channelKey: decl.channel_key };
   return {
     asOf: releaseState.asOf,
-    items: deriveBoardAttentionItems(
-      releaseState.items,
-      releaseState.asOf,
-      shipRecords,
-      claims,
-      { workgroupId, channelKey: decl.channel_key },
-      openPrs,
-    ),
+    items: [
+      ...deriveBoardAttentionItems(releaseState.items, releaseState.asOf, gates.records, claims, binding, openPrs),
+      // A partial read of the gates directory is itself work — see
+      // `gatesOverflowItem`. Appended rather than prepended so it never
+      // displaces a real blocked PR under the seam's per-source cap.
+      ...(gates.skipped > 0 ? [gatesOverflowItem(gates, releaseState.asOf, binding)] : []),
+    ],
   };
 }

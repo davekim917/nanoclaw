@@ -164,10 +164,15 @@ export function deriveDefectRegisterItems(
   const items: ProvidedAttentionItem[] = [];
   let bucket: string | null = null;
   let unparseable = 0;
+  // Every heading this parse actually saw. The register's SHAPE is the only
+  // thing standing between a readable file and an empty queue, and the shape is
+  // not something this parser can assume — see the check after the loop.
+  const headings: string[] = [];
   for (const raw of text.split('\n')) {
     const heading = BUCKET_HEADING.exec(raw);
     if (heading) {
       bucket = heading[1]!.trim();
+      headings.push(bucket);
       continue;
     }
     if (bucket !== HUMAN_BUCKET) continue;
@@ -220,7 +225,77 @@ export function deriveDefectRegisterItems(
       emitted: items.length,
     });
   }
+  // THE SHAPE CHECK. Everything above only emits while `bucket === HUMAN_BUCKET`
+  // — including the `unparseable` counter, which only counts lines INSIDE that
+  // bucket. So a generator that renames the heading (`## Product decisions`) or
+  // re-levels it (`### product-decision`, which `BUCKET_HEADING` does not match
+  // at all) produces a file that parses perfectly, emits nothing, counts no
+  // skips, and warns about nothing. It renders as "nothing needs a human",
+  // which is the one lie this whole feed exists to prevent, reachable from an
+  // ordinary edit to a script in another repo.
+  //
+  // The honest signal is the heading's ABSENCE, not a size heuristic: a
+  // register that HAS the heading and nothing under it is a real answer
+  // ("nothing to decide"), and the live generator writes `## product-decision
+  // (0)` in exactly that case. A register with no such heading at all is a
+  // register we have stopped being able to read, and it is reported as work.
+  // The empty file falls out of the same rule for free — no headings, no
+  // heading match.
+  if (!headings.includes(HUMAN_BUCKET)) {
+    log.warn(`${DEFECT_LABEL}: no \`${HUMAN_BUCKET}\` heading — nothing from this register can reach the queue`, {
+      workgroupId: binding.workgroupId,
+      headings,
+    });
+    items.push(defectRegisterShapeItem(headings, asOf, binding));
+  }
   return { asOf, items };
+}
+
+/**
+ * A defect register whose human bucket is no longer findable, as a work item.
+ *
+ * Same shape as every other self-reported degraded state in this seam: a parked
+ * row whose note says `waiting on a human` verbatim, which is what routes it to
+ * `needs_you` (`WAITING_ON_NOTE` in `threads.ts`) instead of a backlog nobody
+ * reads. The seam's own `misconfigured:`/`stale:` notices cover a declaration
+ * that could not be used and a generator that stopped; this covers the third
+ * case they cannot see — a file that is present, fresh and readable, whose
+ * SHAPE we stopped matching.
+ *
+ * The note names the headings that WERE found, so an operator can tell a
+ * genuine rename from a generator that simply omits an empty section without
+ * opening the file.
+ *
+ * The id is derived from the condition alone — no clock, no position — so the
+ * row keeps one identity across polls and an `observatory_item_assignments`
+ * reservation on it stays matched. `since` is the register's own generated
+ * stamp when it has one; empty (never `now`) when it does not, which the
+ * console reads as unmeasured and sorts last rather than as freshly arrived.
+ */
+function defectRegisterShapeItem(
+  headings: string[],
+  asOf: string | null,
+  binding: { workgroupId: string; channelKey: string },
+): ProvidedAttentionItem {
+  return {
+    id: 'defect-register-shape',
+    channel_key: binding.channelKey,
+    title: `Defect register has no ${HUMAN_BUCKET} section`,
+    // The seam knows the shape changed; it does not know where the generator
+    // that writes it lives. Never invented.
+    url: null,
+    workgroupId: binding.workgroupId,
+    claimState: 'parked',
+    claimNote:
+      `waiting on a human: the defect register was read fine but carries no \`${HUMAN_BUCKET}\` heading — ` +
+      `${headings.length === 0 ? 'it has no `##` section headings at all' : `it has ${headings.map((h) => `\`${h}\``).join(', ')}`}. ` +
+      `No defect from it is reaching the queue`,
+    claimOwner: null,
+    participants: [],
+    sessionCount: 0,
+    since: asOf ?? '',
+    nextAction: `Check whether the defect register generator renamed or re-levelled its \`${HUMAN_BUCKET}\` heading`,
+  };
 }
 
 export function readDefectRegisterSource(

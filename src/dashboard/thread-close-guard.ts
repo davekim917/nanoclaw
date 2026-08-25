@@ -28,8 +28,23 @@
  *     agent that still believes it has work — which is precisely the case the
  *     removed Dismiss action got wrong by making it a single silent click.
  *
- * The count is a server-side rule, not a client-side dialog. A UI that
- * forgot the second confirmation does not close the thread; it gets denied.
+ * **What the count is, and what it is NOT.** The REQUIRED number is decided
+ * here and only here: a UI that forgot the second confirmation, or shipped its
+ * own looser guess, sends too low a number and is denied. What is NOT decided
+ * here is how many acts actually happened — `confirmations` arrives in the
+ * request body (`thread-close.ts` reads it straight off the JSON), so nothing
+ * on this path distinguishes two deliberate clicks from one crafted POST
+ * carrying `{"confirmations": 2}`. Do not read the paragraphs above as a claim
+ * that a client cannot collapse the two acts into one call. It can.
+ *
+ * That is accepted, not overlooked. The gate that matters is the admin check
+ * immediately above, and the same admin can click twice; the second
+ * confirmation is procedural friction that makes an irreversible action
+ * deliberate, not a boundary that keeps anyone out. Making it a real count
+ * would mean persisting the first refused attempt per (thread, user) with a
+ * TTL — new server state for a step that stops nobody who is already allowed
+ * to close. If that trade is ever revisited, the honest fix is that row, not a
+ * stricter-looking comment here.
  */
 import { ALLOW, DENY, defineGuardedAction } from '../guard/index.js';
 import { hasAdminPrivilege } from '../modules/permissions/db/user-roles.js';

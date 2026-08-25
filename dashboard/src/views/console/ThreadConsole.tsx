@@ -17,7 +17,7 @@ import { stripMarkdown } from '../../lib/markdown.js';
 import { subscribe } from '../../lib/sse.ts';
 import { useWorkgroupFilter } from '../../lib/use-workgroup-filter.js';
 import { actionError } from './action-error.js';
-import { setSnoozed } from './actions.js';
+import { isOwnerlessItem, setSnoozed } from './actions.js';
 import { CloseThreadControl } from './CloseControl.js';
 import { ScheduleLens } from './ScheduleLens.js';
 import { ThreadDetail } from './ThreadDetail.js';
@@ -549,16 +549,32 @@ export function ThreadConsole({ authMe }: { authMe: AuthMe }) {
                     <button type="button" className="ncc-verb ncc-back" onClick={() => setSelectedId(null)}>
                       ‹ queue
                     </button>
-                    <button type="button" className="ncc-verb" onClick={() => onToggleSnooze(selected)}>
-                      {selected.snoozed ? 'un-snooze' : 'snooze'}
-                    </button>
-                    {/* Close, next to Snooze. The two are independent — see the
-                        note above `onVerb` — so neither gates the other and
-                        `CloseThreadControl` reads only `selected` for its own
-                        state. Keyed on the thread id so switching threads
-                        mid-confirmation resets it rather than carrying an
-                        armed "confirm close" over onto a different thread. */}
-                    <CloseThreadControl key={selected.thread_id} thread={selected} onClosed={() => void mutate()} />
+                    {/* NEITHER of these exists for an ownerless item, and the
+                        gate is on the row rather than inside each control.
+                        Both endpoints address a thread through its SESSIONS —
+                        `thread-snooze.ts` and `thread-close.ts` each resolve
+                        `COALESCE(thread_id, 'session:' || id)` over `sessions`
+                        — and a `board:` id has none, so both can only ever
+                        answer 404. DESIGN §12: a control whose action can only
+                        be refused is worse than no control, because it teaches
+                        the operator the surface is broken rather than that the
+                        row does not support it. Assign is this row's verb, and
+                        `ThreadDetail` already renders it. */}
+                    {!isOwnerlessItem(selected) && (
+                      <>
+                        <button type="button" className="ncc-verb" onClick={() => onToggleSnooze(selected)}>
+                          {selected.snoozed ? 'un-snooze' : 'snooze'}
+                        </button>
+                        {/* Close, next to Snooze. The two are independent — see
+                            the note above `onVerb` — so neither gates the other
+                            and `CloseThreadControl` reads only `selected` for
+                            its own state. Keyed on the thread id so switching
+                            threads mid-confirmation resets it rather than
+                            carrying an armed "confirm close" over onto a
+                            different thread. */}
+                        <CloseThreadControl key={selected.thread_id} thread={selected} onClosed={() => void mutate()} />
+                      </>
+                    )}
                   </div>
                 )}
                 {/* The board join (§10) landed, so a row CAN carry a release

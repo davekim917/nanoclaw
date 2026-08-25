@@ -28,10 +28,14 @@ import { closeThread } from './actions.js';
  * does a second, genuinely separate control appear — a different button pair
  * (Confirm / Cancel), not a toast, not something that vanishes on blur, and
  * nothing here auto-dismisses it or auto-retries. A SECOND deliberate click
- * sends that exact count. Because both acts are real round trips, a bug that
- * collapses them into one click still only ever sends what that one click
- * produced — the server rejects it visibly (this thread stays open, with an
- * explanation on screen) rather than the work silently ending.
+ * sends that exact count. This control never pre-arms the higher number, so a
+ * first click here always sends `1` and a two-confirmation thread always comes
+ * back as a visible 409 (this thread stays open, with an explanation on screen)
+ * rather than the work silently ending. That is a property of THIS component,
+ * not a guarantee the server enforces: the count travels in the request body,
+ * so a caller that sends `2` up front closes in one call. See the note on
+ * `requiredConfirmations` in `src/dashboard/thread-close-guard.ts` for why that
+ * is accepted rather than plugged.
  *
  * `thread.closing` is server truth (a `thread_closures` row already exists)
  * and overrides all of the above with a plain disabled "closing…" — reachable
