@@ -3420,6 +3420,16 @@ async function buildContainerArgs(
     // rate-limit utilization sampled against them is not comparable (see
     // rate_limit_samples in the container's outbound.db).
     args.push('-e', `NANOCLAW_OAUTH_CREDENTIAL_SET=${auth.oauthScoped ? `group:${credentialFolder}` : 'global'}`);
+    // Operator-declared lane per slot (`<slot>:<lane>,...`). The container
+    // reads this from its own env (see laneForSlot in providers/claude.ts),
+    // and there is NO generic env passthrough into containers — the only one
+    // is prefix-limited to RENDER_PG_/RENDER_REDIS_URL_ below. Without this
+    // explicit forward the variable is simply undefined inside every
+    // container and `lane` stays NULL forever no matter what .env says, with
+    // no error anywhere to show for it. Forwarded only when declared, so an
+    // install that never sets it sends nothing.
+    const oauthLanes = process.env.CLAUDE_CODE_OAUTH_LANES;
+    if (oauthLanes) args.push('-e', `CLAUDE_CODE_OAUTH_LANES=${oauthLanes}`);
   }
 
   // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves

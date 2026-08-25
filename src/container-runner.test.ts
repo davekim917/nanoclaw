@@ -1361,3 +1361,39 @@ describe('wakeContainer session-status admission', () => {
     }
   });
 });
+
+// ── OAuth lane forwarding ────────────────────────────────────────────────────
+// buildContainerArgs cannot be executed here (it makes live onecli shell
+// calls), so this guards the forward at the source level instead.
+//
+// Why it needs a guard at all: the container reads CLAUDE_CODE_OAUTH_LANES
+// from its OWN env (laneForSlot in providers/claude.ts), and there is no
+// generic env passthrough into containers — the only one is prefix-limited to
+// RENDER_PG_/RENDER_REDIS_URL_. Without an explicit `-e` push the variable is
+// undefined in every container and `lane` is NULL forever, with nothing
+// thrown, nothing logged, and every suite still green. That silence is
+// precisely why the guard exists: no other test would ever notice.
+describe('CLAUDE_CODE_OAUTH_LANES reaches the container', () => {
+  // Comments are stripped before matching. Both the forward and the block
+  // comment explaining it name the variable, so a naive source match passes
+  // against a build with the forward deleted — a false-passing guard is worse
+  // than none, because it reports the thing it fails to check.
+  const source = fs
+    .readFileSync(path.join(import.meta.dirname, 'container-runner.ts'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+  it('pushes an -e forward for the lane declaration', () => {
+    expect(source).toMatch(/args\.push\(\s*'-e',\s*`CLAUDE_CODE_OAUTH_LANES=/);
+  });
+
+  it('reads the value from the host process env', () => {
+    expect(source).toMatch(/process\.env\.CLAUDE_CODE_OAUTH_LANES/);
+  });
+
+  it('forwards only when declared, so an install that never sets it sends nothing', () => {
+    // An unconditional push would send `CLAUDE_CODE_OAUTH_LANES=undefined`,
+    // which laneForSlot would then have to defend against.
+    expect(source).toMatch(/if\s*\(\s*oauthLanes\s*\)\s*args\.push/);
+  });
+});
