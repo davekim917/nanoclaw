@@ -1065,9 +1065,22 @@ if [ "$COMMAND" = "finish" ]; then
                 --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
                 '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,
                   runId:$run,verdict:$verdict,finishedAt:$now}' >> "$HANDOFF_LEDGER"
+              # VERIFIED like the publish/hold writes above: taking the lock
+              # says nothing about the append landing. A writable directory
+              # with an unwritable ledger FILE (ENOSPC, chattr +i, a bad mode)
+              # left `written:true, reason:null` with no line — the same
+              # fail-open the artifact checks exist to close. Read back under
+              # the lock, so no other holder's line can be mistaken for ours.
+              if tail -1 "$HANDOFF_LEDGER" 2>/dev/null |
+                jq -e --arg run "$RUN_ID" --arg now "$NOW" \
+                  '.runId == $run and .finishedAt == $now' >/dev/null 2>&1; then
+                LEDGER_APPENDED=true
+              fi
               flock -u 7
-              LEDGER_APPENDED=true
-              break
+              if [ "$LEDGER_APPENDED" = true ]; then
+                break
+              fi
+              continue
             fi
             flock -u 7 2>/dev/null
           done
@@ -1086,9 +1099,9 @@ if [ "$COMMAND" = "finish" ]; then
             # dangerous half (a hold that never went up) and must not be lost
             # behind the ledger's message.
             if [ -n "$HANDOFF_ARTIFACT_ERROR" ]; then
-              HANDOFF_REASON="$HANDOFF_REASON ALSO: ledger append failed after retry — the develop gate cannot see this outcome either."
+              HANDOFF_REASON="$HANDOFF_REASON ALSO: ledger line was not appended to $HANDOFF_LEDGER after retry — the develop gate cannot see this outcome either."
             else
-              HANDOFF_REASON="ledger append failed after retry — the develop gate cannot see this outcome. A re-finish will be REFUSED (the slot is cleared): append the ledger line by hand, or reconcile the gate state manually"
+              HANDOFF_REASON="ledger line was not appended to $HANDOFF_LEDGER after retry — the develop gate cannot see this outcome. A re-finish will be REFUSED (the slot is cleared): append the ledger line by hand, or reconcile the gate state manually"
             fi
           fi
         fi
