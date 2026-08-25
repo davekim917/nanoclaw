@@ -219,9 +219,39 @@ Create a run record before testing:
 
 ```text
 run_id, repo, base_sha, deploy_sha, environment, feature, mode,
-spec_sources, started_at, orchestrator, lane_models, frontend_owner,
-auth_account_alias
+spec_sources, intent_sources, started_at, orchestrator, lane_models,
+frontend_owner, auth_account_alias
 ```
+
+**Freeze the intent text the same way you freeze the SHA.** §1 pins the build;
+nothing used to pin the prose the acceptance lane reads, so extraction ran
+against whatever the PR body said at that moment. Someone reordering or
+narrowing a claim mid-campaign got it verified in its easier form — and the
+lane's own after-the-fact check ("every quoted source line appears verbatim in
+the PR body") then validated against the edited text, so the audit passed too.
+A mutable intent source audited against itself proves nothing.
+
+So at freeze time, before any lane starts, copy each intent source into the run
+directory and hash it:
+
+```bash
+mkdir -p <run-dir>/intent
+gh pr view <pr> -R <repo> --json body --jq '.body' > <run-dir>/intent/pr-body.md
+gh issue view <n> -R <repo> --json body --jq '.body' > <run-dir>/intent/issue-<n>.md
+sha256sum <run-dir>/intent/*.md
+```
+
+Record each path and its `sha256` in the run record's `intent_sources`. **The
+frozen copies are the intent of record**: the acceptance lane extracts from
+them, quotes from them, and the after-the-fact check verifies against them —
+never against the live body.
+
+Re-hash the live bodies when the acceptance lane runs. A mismatch is **not**
+fatal and does not void the run: record it on the acceptance result as
+`intent_drift: <path> (frozen <sha8> → live <sha8>)`, name it on the report's
+Untested line, and keep verifying the frozen text. Absorbing it silently is the
+only forbidden response — an intent edit mid-campaign is a fact about the run
+that the reader has to see, whether it was innocent or not.
 
 Resolve the remote default branch rather than assuming `main`. Fetch the target,
 record its full SHA, and confirm that the dev deployment serves that SHA. If the
@@ -356,14 +386,52 @@ naming the covering spec, only when both hold:
    prior run, and not CI on a different SHA (see the CI-reuse rule under
    "Backend and specification verifier" below).
 
+**The skip note carries the same evidence the CI-reuse rule demands, on the
+manifest row itself.** That rule requires citing a conclusion, counts and a run
+URL because a claim of "already green" without them is indistinguishable from a
+guess. Condition 2 asserted exactly that and required nothing, so a skip that
+was fabricated, mistaken, or based on a stale run left an identical record to a
+correct one. There is a live drift chain: the backend lane cites CI for its
+source work ("already ran green on this SHA"), so no spec actually executes
+in-campaign, so condition 2 has no basis — and nothing mechanical notices. The
+skip row must therefore name all three:
+
+- **the spec file and test name** — `src/foo/bar.spec.ts › renders the dash`,
+  not "the forecast specs";
+- **how it was proven green THIS campaign** — either the lane ID that ran it
+  plus the command and its counts, or the CI check-run reference (conclusion,
+  counts, run URL) for the **frozen SHA**; and
+- **the manifest ID of the browser check being skipped**, so the skip and the
+  thing skipped are the same row.
+
+No citation, no skip: run the browser check. A skip is a claim about evidence,
+and a claim about evidence is held to the evidence standard it is claiming.
+
 **The counter-rule is as binding as the rule.** A browser check is never
-redundant when the claim is something a green spec cannot see:
+redundant when the claim is something a green spec **structurally cannot
+observe** — that test is the rule, and the list below names instances of it,
+not its boundary. If you cannot say which line of the spec would have failed
+had the claim been false in the browser, the spec does not cover the claim.
+Including, and not limited to:
 
 - **composition** — whether the whole connected flow works end to end, not
   whether one function returns the right value in isolation;
 - **visual/layout** — spacing, contrast, overflow, responsive behavior;
 - **deploy identity** — whether the browser is actually exercising the build
-  under test.
+  under test;
+- **persistence across reload** — a spec asserting state in memory says
+  nothing about what survives a round trip through storage and back;
+- **failure shapes** — what the user sees when the network is slow, the
+  request 500s, or the response is partial; a spec that mocks the call away
+  has asserted the mock;
+- **permission crossings** — where a *success* is the defect (§2), so a green
+  assertion that the action worked is the wrong-shaped evidence entirely.
+
+The enum is open deliberately. A closed list of three was itself a way to skip:
+everything it did not name — the three above among them — became skippable on
+the coordinator's own judgment, and permission crossings already have a §2
+subsection saying a success is the defect, which a closed list silently
+contradicted.
 
 The spec layer is known to lie on exactly these claims: one map-canvas test
 has been observed passing green against both a working and a broken
@@ -505,9 +573,16 @@ Every other lane in this skill scopes from the diff — files changed, source
 touched, controls added. This lane scopes from stated intent instead, and
 that source must never be the diff:
 
-- **Read the PR body and any linked or closing issue in full**, not the diff.
-  A findings issue's expected/actual fields are a second independent intent
-  source when one exists.
+- **Read the FROZEN intent copies in full**, not the diff and not the live PR.
+  `<run-dir>/intent/*.md` is what §1 pinned at freeze time; extract and quote
+  from those files only. A findings issue's expected/actual fields are a second
+  independent intent source when one exists, and it is frozen the same way.
+- **Re-hash the live bodies before extracting.** If any `sha256` differs from
+  the one in `intent_sources`, record `intent_drift: <path> (frozen <sha8> →
+  live <sha8>)` on this lane's result and carry it to the report's Untested
+  line. Then verify the frozen text anyway. Never re-extract from the live body
+  and never drop the drift note — the whole point is that a mid-campaign edit
+  is visible to the reader rather than quietly becoming the thing verified.
 - **Extract every stated, user-visible claim** — something a person could
   observe in the running product (a value that renders differently, a state
   that becomes reachable, an error that becomes possible). Quote the source
@@ -524,29 +599,86 @@ four verdicts, one row per claim:
 |---|---|
 | `met` | observed in the running app, evidence attached |
 | `not met` | observed to be false — this is a finding; route it through §4 |
-| `not demonstrable` | the claim is real but this environment/data cannot exercise it (no seeded case exists, the branch is unreachable here) — a first-class outcome, never a silent pass |
-| `claim absent` | the PR states no user-visible claims (refactor, dependency bump) |
+| `not demonstrable` | the claim is real but this environment/data cannot exercise it — a first-class outcome, never a silent pass. **Requires a blocker and an artifact** (below) |
+| `claim absent` | the PR states no user-visible claims (refactor, dependency bump). **Cross-check it against the diff** (below) |
 
 One screenshot per claim, not per interaction — this lane proves the claim,
 it does not re-run the UI adversary's coverage.
+
+**`not demonstrable` costs something to say.** It was the cheapest compliant
+answer on this table: `met` needs a screenshot, `not met` routes through §4 and
+gets challenged, and `not demonstrable` needed nothing at all — judged by the
+same worker who benefits from not chasing the claim, and unauditable afterwards
+except by redoing the work. Every `not demonstrable` row now carries both:
+
+- **`blocked by:` naming the specific missing thing** — the seed row that does
+  not exist, the branch no reachable input hits, the fixture the environment
+  lacks, the account tier nobody provisioned. "Could not verify", "no data",
+  and "environment limitation" are not blockers; they are the absence of one.
+  A verdict meaning "I could not check" has to say what would have let it.
+- **The artifact for the furthest state it DID reach** — the screenshot of the
+  empty list, the form that would not accept the input, the API response that
+  came back without the field. If genuinely nothing was reachable, attach the
+  command or URL that proved that and its output.
+
+Two rows in the same table with the same `blocked by:` text are one blocker,
+not two verdicts; say so and name it once at the top of the run's Untested
+line. That is a real environment gap worth fixing, not a per-claim excuse.
+
+**`claim absent` is cross-checked against the diff, never taken on the PR's
+word.** The cheapest compliant PR body is one that states nothing, and nothing
+used to notice. Before recording `claim absent`, check whether the diff touched
+user-facing surface (the frontend path prefixes this deployment already
+configures for deploy-lag scoping are the same prefixes that matter here, plus
+any template, copy, or served-payload change). If it did:
+
+- `claim absent` is still the honest verdict for THIS lane — the lane reports
+  what the PR stated, and it must not invent claims (see anti-ceremony below).
+- But record it as **`claim absent (unstated user-facing change: <paths>)`**,
+  and tell the coordinator. That combination is a signal to **widen the UI
+  adversary's scope over those paths**, never a reason to narrow the run. A
+  user-facing change nobody wrote down is precisely the blind spot the
+  diff-derived lanes exist to cover, and this is the moment it is visible.
 
 **Anti-ceremony, same standard as the posting-contract rule above:**
 
 - A PR with no user-visible claims produces a one-line `claim absent` result.
   Do not manufacture a claim to look busy, and do not pad the table with
-  implementation statements reclassified as user-visible.
+  implementation statements reclassified as user-visible. The diff cross-check
+  above does **not** loosen this: an unstated user-facing change makes the note
+  longer and widens the UI adversary's scope; it never turns into a row in this
+  table. This lane reports what the intent said, including when the answer is
+  "nothing, and that is itself worth knowing".
 - `not met` findings route through §4 like any other finding. `claim absent`
-  is not a finding and needs no challenge.
+  is not a finding and needs no challenge — but `claim absent (unstated
+  user-facing change: …)` is a scope input the coordinator must act on before
+  the manifest closes.
 - The lane's output is the claim table. No narration, no restating the PR, no
   summary of "what the PR was about" — the reader can read the PR themselves.
 
-**Checkable after the fact:** every row's quoted source line must appear
-verbatim in the PR body or linked issue — a claim without a quote is
-fabricated scope, not evidence. Every `met`/`not met` row must carry an
-attached screenshot; a bare verdict is not a verified one. Compare the claim
-table's row count against a manual reread of the PR/issue: a claim present in
-the text but missing from the table is a silently dropped claim, and the lane
-failed at extraction even when every listed row is honest.
+**Checkable after the fact**, entirely from the run directory:
+
+- **Quotes resolve against the frozen copies.** Every row's quoted source line
+  must appear verbatim in `<run-dir>/intent/*.md` — a claim without a quote is
+  fabricated scope, not evidence. Checking against the live PR body is what let
+  a mid-campaign edit launder itself; `intent/` cannot be edited after the fact
+  without changing a hash the run record already published.
+- **`intent/` must exist and its hashes must match `intent_sources`.** A run
+  whose acceptance lane produced a claim table with no frozen intent files
+  skipped the freeze — that is visible without rereading anything.
+- **Every `met`/`not met` row carries an attached screenshot.** A bare verdict
+  is not a verified one.
+- **Every `not demonstrable` row carries a `blocked by:` naming a concrete
+  missing thing, plus an artifact.** A row with neither, or with a `blocked by:`
+  that only restates the verdict ("could not verify"), is an unaudited skip.
+- **Every `claim absent` result on a diff that touched user-facing paths
+  carries the `(unstated user-facing change: …)` note and a matching widening
+  of the UI adversary's manifest scope.** A bare `claim absent` next to a diff
+  full of frontend paths is the failure this cross-check exists to surface.
+- **Row count against a reread.** Compare the claim table against a manual
+  reread of the frozen intent files: a claim present in the text but missing
+  from the table is a silently dropped claim, and the lane failed at extraction
+  even when every listed row is honest.
 
 **This lane runs in addition to the diff-derived lanes above, never instead
 of them.** A claim nobody wrote in the PR or issue cannot be extracted, so
