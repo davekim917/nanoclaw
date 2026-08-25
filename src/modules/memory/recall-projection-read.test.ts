@@ -141,8 +141,26 @@ function live(root: string): { dataDir: string; queue: Array<() => void> } {
   return { dataDir, queue };
 }
 
+/**
+ * Streams the serve just finished primed from PERSISTED state, derived from the
+ * cache seam and asserted rather than assumed.
+ *
+ * A serve that starts from an empty cache ends with one entry per distinct
+ * string it touched, and each of those arrived one of two ways: a miss in
+ * `tokenStreamForRecall` (counted) or a `primeTokenStream` from `hydrateStreams`
+ * (deliberately not counted, so priming cannot look like tokenizer work). So
+ * `size - misses` IS the hydration count — provided nothing was evicted, which
+ * this checks, and provided the cache started empty, which every caller resets.
+ */
+function hydratedStreams(): number {
+  const after = _tokenStreamCacheStatsForTest();
+  // Eviction would break the arithmetic above; these trees are far under the cap.
+  expect(after.size).toBeLessThan(after.max);
+  return after.size - after.misses;
+}
+
 /** The two paths must agree byte for byte, notices and order included (P2.5-I1). */
-function expectIdentical(root: string, query: string, options: ServeOptions = {}): Served {
+function expectIdentical(root: string, query: string, options: ServeOptions = {}): Served & { hydrated: number } {
   const empty = scratch('empty');
   attach(empty);
   _resetTokenStreamCacheForTest();
@@ -152,12 +170,27 @@ function expectIdentical(root: string, query: string, options: ServeOptions = {}
   _resetRecallProjectionForTest();
   const projection = (() => {
     live(root);
+    // WITHOUT THIS RESET THE COMPARISON IS FILESYSTEM-VS-FILESYSTEM. The walk
+    // above left every candidate's tokens in the process-wide cache, so the
+    // projected serve's `uncached` filter selects nothing, `hydrateStreams`
+    // never runs, and scoring re-reads the walk's own tokens — the persisted
+    // stream, the seam this projection introduces, is never exercised.
+    // Verified: with a candidate's `stream_json` corrupted the evidence stayed
+    // byte-identical without this line and diverged with it.
+    _resetTokenStreamCacheForTest();
     return serve(root, query, options);
   })();
+  const hydrated = hydratedStreams();
   expect(projection.stats.recallPath).toBe('hit');
   expect(JSON.stringify(projection.evidence)).toBe(JSON.stringify(filesystem.evidence));
   expect(JSON.stringify(projection.notices)).toBe(JSON.stringify(filesystem.notices));
-  return projection;
+  // A reset only makes hydration POSSIBLE. Absence of divergence means nothing
+  // unless the hydration path actually ran, so assert it did whenever the
+  // projection had a candidate to hydrate at all.
+  if (projection.stats.factCandidates + projection.stats.fileCandidates > 0) {
+    expect(hydrated).toBeGreaterThan(0);
+  }
+  return { ...projection, hydrated };
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +292,7 @@ describe('P2.5-AC1 differential equivalence against the filesystem path', () => 
   it('delivers byte-identical evidence and notices for every query, on both bootstrap and sender variants', () => {
     const root = adversarialTree();
     let compared = 0;
+    let hydrated = 0;
     for (const [index, query] of DIFFERENTIAL_QUERIES.entries()) {
       for (const options of [
         {},
@@ -267,12 +301,15 @@ describe('P2.5-AC1 differential equivalence against the filesystem path', () => 
         { bootstrap: true, senders: ['Pat Quinn'] },
       ] satisfies ServeOptions[]) {
         _resetRecallProjectionForTest();
-        expectIdentical(root, query, options);
+        hydrated += expectIdentical(root, query, options).hydrated;
         compared++;
       }
       expect(index).toBeLessThan(DIFFERENTIAL_QUERIES.length);
     }
     expect(compared).toBe(DIFFERENTIAL_QUERIES.length * 4);
+    // The per-round assertion allows a no-candidate query to hydrate nothing;
+    // this refuses a run where that was true of every round.
+    expect(hydrated).toBeGreaterThan(compared);
     // 104 build-and-compare rounds: ~5 s alone, and slower again under the full
     // suite's parallelism, which is what pushed it past the 5 s default.
   }, 120_000);

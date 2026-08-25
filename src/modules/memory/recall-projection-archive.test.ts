@@ -29,6 +29,7 @@ import {
   _resetRecallProjectionForTest,
   _resetTokenStreamCacheForTest,
   _setRecallProjectionTestHooks,
+  _tokenStreamCacheStatsForTest,
   readMemoryEvidence,
   warmRecallProjection,
   type ContextNotice,
@@ -162,6 +163,7 @@ describe.skipIf(!available)('P2.5-AC1 real-corpus differential equivalence (arch
     let compared = 0;
     let withEvidence = 0;
     let excerpts = 0;
+    let hydrated = 0;
     for (const query of queries) {
       // Cold: no projection on disk at all, so the turn walks the tree.
       attach(empty);
@@ -170,7 +172,23 @@ describe.skipIf(!available)('P2.5-AC1 real-corpus differential equivalence (arch
       expect(cold.stats.recallPath).toBe('cold');
 
       attach(dataDir);
+      // WITHOUT THIS RESET THE COMPARISON IS FILESYSTEM-VS-FILESYSTEM. The walk
+      // above left every candidate's tokens in the process-wide cache, so the
+      // projected serve's `uncached` filter selects nothing and `hydrateStreams`
+      // never runs — the persisted stream is never read, let alone compared.
+      _resetTokenStreamCacheForTest();
       const projected = serve(root, query);
+      const stats = _tokenStreamCacheStatsForTest();
+      // A serve from an empty cache ends with one entry per distinct string it
+      // touched; misses are counted and `primeTokenStream` deliberately is not,
+      // so `size - misses` is the number of PERSISTED streams hydrated. A reset
+      // only makes hydration possible — this proves it happened.
+      expect(stats.size).toBeLessThan(stats.max);
+      const hydratedHere = stats.size - stats.misses;
+      if (projected.stats.factCandidates + projected.stats.fileCandidates > 0) {
+        expect(hydratedHere).toBeGreaterThan(0);
+      }
+      hydrated += hydratedHere;
       expect(projected.stats.recallPath).toBe('hit');
 
       for (const [field, left, right] of [
@@ -190,9 +208,13 @@ describe.skipIf(!available)('P2.5-AC1 real-corpus differential equivalence (arch
     // term prefilter would produce. Measured on the illysium tree: 320/320
     // queries retrieve, 1259 excerpts (3.9 per query). The floors sit far below
     // that so ordinary drift in the tree does not fail the lane.
-    console.log(`archive-mined AC1: ${compared} compared, ${withEvidence} retrieved, ${excerpts} excerpts total`);
+    console.log(
+      `archive-mined AC1: ${compared} compared, ${withEvidence} retrieved, ${excerpts} excerpts total, ${hydrated} streams hydrated`,
+    );
     expect(withEvidence).toBeGreaterThan(SAMPLE_SIZE / 2);
     expect(excerpts).toBeGreaterThan(SAMPLE_SIZE);
+    // Same principle as the floors above, for the hydration path itself.
+    expect(hydrated).toBeGreaterThan(SAMPLE_SIZE);
     // Report the query and both sides, not just a count: one mismatch is the
     // whole point of running this lane.
     expect(mismatches.map((row) => `${row.field} @ ${JSON.stringify(row.query.slice(0, 120))}`)).toEqual([]);
