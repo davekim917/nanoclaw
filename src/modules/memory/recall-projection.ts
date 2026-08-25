@@ -12,7 +12,7 @@
  *
  * - EVERY DERIVATION IS THE LIVE FUNCTION, NOT A COPY. `headingsOf`,
  *   `readBoundedFile`, `listMarkdownFiles`, `listTopicFiles`,
- *   `missingGeneratedMemoryPath`, `capturedAtOf`, `tokenizeForRecall` and
+ *   `missingGeneratedMemoryPath`, `capturedAtOf`, `tokenStreamForRecall` and
  *   `passageWindows` are imported from `pre-turn-context.ts`. The delivered
  *   contract is byte-identical output (P2.5-I1), and a second implementation of
  *   any of them is a drift generator. Only the ORCHESTRATION loop is restated
@@ -46,7 +46,7 @@ import {
   PRE_TURN_BOUNDS,
   PREFERENCES_DIR,
   readBoundedFile,
-  tokenizeForRecall,
+  tokenStreamForRecall,
   type ContextNotice,
   type RecallToken,
   type SearchableCandidate,
@@ -84,7 +84,12 @@ export interface ProjectionCandidate extends SearchableCandidate {
   scanOrder: number;
   /** `mem_<16-hex>` for a fact, null for a file. Keys decision 6's incremental update. */
   factId: string | null;
-  /** Whole-candidate `tokenizeForRecall(searchable)`. */
+  /**
+   * Whole-candidate `tokenStreamForRecall(searchable)` — the ordered
+   * `{value,start,end}` stream, which is the primary persisted artifact.
+   */
+  stream: RecallToken[];
+  /** `tokenizeForRecall(searchable)`, i.e. `[...new Set(stream.map(t => t.value))]`. */
   tokens: string[];
   /** Whole `passageWindows(searchable, LANE_EXCERPT_CHARS[lane])` output. */
   windows: ProjectionWindow[];
@@ -122,6 +127,8 @@ export interface ProjectionBuildResult {
   factCandidates: number;
   sourceFiles: number;
   termRows: number;
+  /** Candidates whose windows could not be proven reconstructable and were stored whole. */
+  windowsStoredWhole: number;
   scannedBytes: number;
   /** On-disk size of the promoted `index.db`, in bytes. */
   bytes: number;
@@ -153,7 +160,12 @@ CREATE TABLE candidate (
   searchable   TEXT NOT NULL,
   captured_at  TEXT NOT NULL,
   fact_id      TEXT,
-  tokens_json  TEXT NOT NULL,
+  stream_json  TEXT NOT NULL,
+  -- 1: windows_json is a flat [start, end, tokenStart, tokenEnd, ...] run of
+  -- offsets into searchable and index ranges into stream_json.
+  -- 0: the offset form could not be PROVEN exact for this candidate, so
+  --    windows_json holds the literal [{text, tokens}] shape instead.
+  windows_encoded INTEGER NOT NULL,
   windows_json TEXT NOT NULL
 );
 
@@ -284,14 +296,114 @@ function project(candidate: SearchableCandidate, lane: RecallLane, scanOrder: nu
     text: window.text,
     tokens: [...window.tokens],
   }));
+  const stream = [...tokenStreamForRecall(candidate.searchable)];
   return {
     ...candidate,
     lane,
     scanOrder,
     factId: lane === 'fact' ? (FACT_ID_PATTERN.exec(candidate.content)?.[1] ?? null) : null,
-    tokens: tokenizeForRecall(candidate.searchable),
+    stream,
+    // Exactly `tokenizeForRecall`'s body, so the derivation cannot drift from it.
+    tokens: [...new Set(stream.map((token) => token.value))],
     windows,
   };
+}
+
+/**
+ * Window storage (plan decision 3 as amended 2026-08-25).
+ *
+ * The plan originally said to store `passageWindows`' output verbatim. Measured
+ * on the largest real workgroup that cost 158.1 MB of a 194.3 MB projection —
+ * 81% — because the 1..3-sentence sweep re-covers the same characters ~2.9x and
+ * every window shipped its own `{value,start,end}` triples. The amended contract
+ * is that the HYDRATED shape must be exact, not the stored shape.
+ *
+ * So a window is stored as four integers: `[start, end]` into `searchable` and
+ * `[tokenStart, tokenEnd]` into the persisted stream. On the offset-sliceable
+ * path that is lossless by construction — `passageWindows` literally returns
+ * `candidate.slice(start, end)` and `stream.slice(first, after)` there.
+ *
+ * It is not TRUSTED to be lossless, it is CHECKED: the build encodes, decodes,
+ * and deep-compares against the real `passageWindows` output, and any candidate
+ * that fails falls back to storing the literal shape. The non-sliceable path
+ * (`sentenceSpans` hard-chopping a sentence mid-word) re-tokenizes each window
+ * independently, so its token offsets index the WINDOW rather than the
+ * candidate and it takes that fallback.
+ */
+function encodeWindows(
+  searchable: string,
+  stream: readonly RecallToken[],
+  windows: readonly ProjectionWindow[],
+): number[] | null {
+  const indexByStart = new Map<number, number>();
+  for (let index = 0; index < stream.length; index++) indexByStart.set(stream[index]!.start, index);
+  const flat: number[] = [];
+  let searchFrom = 0;
+  for (const window of windows) {
+    const start = searchable.indexOf(window.text, searchFrom);
+    if (start < 0) return null;
+    // Window starts are non-decreasing, so resuming the search here is safe.
+    // A wrong-but-identical-text hit still fails the decode check below.
+    searchFrom = start;
+    const first = window.tokens[0];
+    const tokenStart = first === undefined ? 0 : (indexByStart.get(first.start) ?? -1);
+    if (tokenStart < 0) return null;
+    flat.push(start, start + window.text.length, tokenStart, tokenStart + window.tokens.length);
+  }
+  return flat;
+}
+
+function decodeWindows(
+  searchable: string,
+  stream: readonly RecallToken[],
+  flat: readonly number[],
+): ProjectionWindow[] {
+  const windows: ProjectionWindow[] = [];
+  for (let index = 0; index < flat.length; index += 4) {
+    windows.push({
+      text: searchable.slice(flat[index]!, flat[index + 1]!),
+      tokens: stream.slice(flat[index + 2]!, flat[index + 3]!) as RecallToken[],
+    });
+  }
+  return windows;
+}
+
+/** Byte-identity check for the encode/decode round trip — value, start, end, and order. */
+export function windowsEqual(a: readonly ProjectionWindow[], b: readonly ProjectionWindow[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let index = 0; index < a.length; index++) {
+    const left = a[index]!;
+    const right = b[index]!;
+    if (left.text !== right.text || left.tokens.length !== right.tokens.length) return false;
+    for (let position = 0; position < left.tokens.length; position++) {
+      const one = left.tokens[position]!;
+      const other = right.tokens[position]!;
+      if (one.value !== other.value || one.start !== other.start || one.end !== other.end) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Parallel arrays rather than an array of objects, and LENGTHS rather than end
+ * offsets: both are pure encoding choices that shrink the JSON, and both are
+ * exactly reversed by `decodeStream`.
+ */
+function encodeStream(stream: readonly RecallToken[]): string {
+  const values: string[] = [];
+  const starts: number[] = [];
+  const lengths: number[] = [];
+  for (const token of stream) {
+    values.push(token.value);
+    starts.push(token.start);
+    lengths.push(token.end - token.start);
+  }
+  return JSON.stringify([values, starts, lengths]);
+}
+
+function decodeStream(json: string): RecallToken[] {
+  const [values, starts, lengths] = JSON.parse(json) as [string[], number[], number[]];
+  return values.map((value, index) => ({ value, start: starts[index]!, end: starts[index]! + lengths[index]! }));
 }
 
 /**
@@ -333,9 +445,13 @@ function openForWrite(dbPath: string): Database.Database {
  * mistakable for "the build finished". A build killed anywhere before COMMIT
  * leaves a file with no marker, which `openRecallProjection` refuses.
  */
-export function writeProjection(dbPath: string, set: ProjectionCandidateSet): { termRows: number } {
+export function writeProjection(
+  dbPath: string,
+  set: ProjectionCandidateSet,
+): { termRows: number; windowsStoredWhole: number } {
   const db = openForWrite(dbPath);
   let termRows = 0;
+  let windowsStoredWhole = 0;
   try {
     db.exec(SCHEMA_SQL);
     const insertMeta = db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)');
@@ -343,8 +459,8 @@ export function writeProjection(dbPath: string, set: ProjectionCandidateSet): { 
       'INSERT INTO source_file (path, size, mtime_ns, ino, headings_json) VALUES (?, ?, ?, ?, ?)',
     );
     const insertCandidate = db.prepare(
-      `INSERT INTO candidate (lane, scan_order, path, content, searchable, captured_at, fact_id, tokens_json, windows_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO candidate (lane, scan_order, path, content, searchable, captured_at, fact_id, stream_json, windows_encoded, windows_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const insertTerm = db.prepare('INSERT OR IGNORE INTO term (token, candidate_id) VALUES (?, ?)');
     db.transaction(() => {
@@ -366,6 +482,12 @@ export function writeProjection(dbPath: string, set: ProjectionCandidateSet): { 
         );
       }
       for (const candidate of set.candidates) {
+        // Encode, decode, and PROVE the round trip before trusting it. A
+        // candidate that cannot be proven exact stores the literal shape.
+        const flat = encodeWindows(candidate.searchable, candidate.stream, candidate.windows);
+        const encoded =
+          flat !== null && windowsEqual(decodeWindows(candidate.searchable, candidate.stream, flat), candidate.windows);
+        if (!encoded) windowsStoredWhole++;
         const id = Number(
           insertCandidate.run(
             candidate.lane,
@@ -375,8 +497,9 @@ export function writeProjection(dbPath: string, set: ProjectionCandidateSet): { 
             candidate.searchable,
             candidate.capturedAt,
             candidate.factId,
-            JSON.stringify(candidate.tokens),
-            JSON.stringify(candidate.windows),
+            encodeStream(candidate.stream),
+            encoded ? 1 : 0,
+            JSON.stringify(encoded ? flat : candidate.windows),
           ).lastInsertRowid,
         );
         for (const token of termsOf(candidate)) {
@@ -391,7 +514,7 @@ export function writeProjection(dbPath: string, set: ProjectionCandidateSet): { 
     // the single file the promote renames carries the whole committed build.
     db.close();
   }
-  return { termRows };
+  return { termRows, windowsStoredWhole };
 }
 
 export function projectionDir(workgroupId: string, dataDir: string): string {
@@ -426,9 +549,9 @@ export function buildAndPromoteProjection(options: { root: string; directory: st
   const nextPath = path.join(options.directory, `index.next-${Date.now()}-${process.pid}.db`);
 
   const set = buildProjectionCandidates(options.root);
-  let termRows: number;
+  let written: { termRows: number; windowsStoredWhole: number };
   try {
-    ({ termRows } = writeProjection(nextPath, set));
+    written = writeProjection(nextPath, set);
   } catch (error) {
     fs.rmSync(nextPath, { force: true });
     throw error;
@@ -442,7 +565,8 @@ export function buildAndPromoteProjection(options: { root: string; directory: st
     fileCandidates: set.candidates.filter((candidate) => candidate.lane === 'file').length,
     factCandidates: set.candidates.filter((candidate) => candidate.lane === 'fact').length,
     sourceFiles: set.sources.length,
-    termRows,
+    termRows: written.termRows,
+    windowsStoredWhole: written.windowsStoredWhole,
     scannedBytes: set.scannedBytes,
     bytes: fs.statSync(livePath).size,
     elapsedMs: Date.now() - startedAt,
@@ -507,7 +631,8 @@ interface CandidateRow {
   searchable: string;
   captured_at: string;
   fact_id: string | null;
-  tokens_json: string;
+  stream_json: string;
+  windows_encoded: number;
   windows_json: string;
 }
 
@@ -533,20 +658,28 @@ export function hydrateLane(db: Database.Database, lane: RecallLane): Projection
   };
   const rows = db
     .prepare(
-      `SELECT lane, scan_order, path, content, searchable, captured_at, fact_id, tokens_json, windows_json
+      `SELECT lane, scan_order, path, content, searchable, captured_at, fact_id, stream_json, windows_encoded, windows_json
          FROM candidate WHERE lane = ? ORDER BY scan_order`,
     )
     .all(lane) as CandidateRow[];
-  return rows.map((row) => ({
-    lane,
-    scanOrder: row.scan_order,
-    path: row.path,
-    headings: headingsFor(row.path),
-    content: row.content,
-    searchable: row.searchable,
-    capturedAt: row.captured_at,
-    factId: row.fact_id,
-    tokens: JSON.parse(row.tokens_json) as string[],
-    windows: JSON.parse(row.windows_json) as ProjectionWindow[],
-  }));
+  return rows.map((row) => {
+    const stream = decodeStream(row.stream_json);
+    const parsed = JSON.parse(row.windows_json) as number[] | ProjectionWindow[];
+    return {
+      lane,
+      scanOrder: row.scan_order,
+      path: row.path,
+      headings: headingsFor(row.path),
+      content: row.content,
+      searchable: row.searchable,
+      capturedAt: row.captured_at,
+      factId: row.fact_id,
+      stream,
+      tokens: [...new Set(stream.map((token) => token.value))],
+      windows:
+        row.windows_encoded === 1
+          ? decodeWindows(row.searchable, stream, parsed as number[])
+          : (parsed as ProjectionWindow[]),
+    };
+  });
 }

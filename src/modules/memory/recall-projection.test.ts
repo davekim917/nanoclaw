@@ -12,6 +12,7 @@ import {
   passageWindows,
   PRE_TURN_BOUNDS,
   tokenizeForRecall,
+  tokenStreamForRecall,
 } from './pre-turn-context.js';
 import { runProjectionBuild } from './recall-projection-build.js';
 import {
@@ -24,6 +25,7 @@ import {
   RECALL_PROJECTION_SCHEMA_VERSION,
   readProjectionSummary,
   termsOf,
+  windowsEqual,
   writeProjection,
   type ProjectionCandidate,
 } from './recall-projection.js';
@@ -262,6 +264,69 @@ describe('recall projection schema and build', () => {
     ).map((row) => row.token);
     db.close();
     for (const token of windowOnly) expect(indexed).toContain(token);
+  });
+
+  it('reconstructs every window byte-identically from stored offsets', () => {
+    const root = smallTree();
+    const result = buildAndPromoteProjection({ root, directory: scratch('offsets') });
+    // Everything in this tree is offset-sliceable, so nothing takes the escape hatch.
+    expect(result.windowsStoredWhole).toBe(0);
+
+    const db = openRecallProjection(result.path)!;
+    const hydrated = [...hydrateLane(db, 'file'), ...hydrateLane(db, 'fact')];
+    // Windows really are stored as offsets, not as the literal shape.
+    const encodings = (db.prepare('SELECT DISTINCT windows_encoded AS e FROM candidate').all() as { e: number }[]).map(
+      (row) => row.e,
+    );
+    db.close();
+    expect(encodings).toEqual([1]);
+
+    expect(hydrated.length).toBeGreaterThan(0);
+    for (const candidate of hydrated) {
+      const fresh = passageWindows(candidate.searchable, LANE_EXCERPT_CHARS[candidate.lane]).map((window) => ({
+        text: window.text,
+        tokens: [...window.tokens],
+      }));
+      // Deep equality over value, start, end AND window ordering.
+      expect(windowsEqual(candidate.windows, fresh)).toBe(true);
+      expect(candidate.windows).toEqual(fresh);
+      expect(candidate.stream).toEqual([...tokenStreamForRecall(candidate.searchable)]);
+    }
+  });
+
+  it('falls back to storing whole windows when the offset form cannot be proven exact', () => {
+    const root = scratch('fallback');
+    // The non-sliceable candidate from the decision-8 fixture: its windows are
+    // re-tokenized independently, so their token offsets index the WINDOW and
+    // the offset form cannot reproduce them.
+    const filler = 'alpha '.repeat(400);
+    writeFile(root, 'concepts/chopped.md', `${filler.slice(0, LANE_EXCERPT_CHARS.file - 4)}zebracrossing ${filler}`);
+    writeFile(root, 'concepts/plain.md', '# Plain\n\nA short, offset-sliceable candidate.\n');
+    const result = buildAndPromoteProjection({ root, directory: scratch('fallback-proj') });
+
+    // The escape hatch fired for exactly the chopped candidate.
+    expect(result.windowsStoredWhole).toBe(1);
+
+    const db = openRecallProjection(result.path)!;
+    const rows = db.prepare('SELECT path, windows_encoded AS e FROM candidate ORDER BY path').all() as {
+      path: string;
+      e: number;
+    }[];
+    const hydrated = hydrateLane(db, 'file');
+    db.close();
+    expect(rows).toEqual([
+      { path: 'concepts/chopped.md', e: 0 },
+      { path: 'concepts/plain.md', e: 1 },
+    ]);
+
+    // Byte-identity holds on BOTH paths — the fallback is not an approximation.
+    for (const candidate of hydrated) {
+      const fresh = passageWindows(candidate.searchable, LANE_EXCERPT_CHARS[candidate.lane]).map((window) => ({
+        text: window.text,
+        tokens: [...window.tokens],
+      }));
+      expect(windowsEqual(candidate.windows, fresh)).toBe(true);
+    }
   });
 
   it('rejects a projection whose schema_version does not match', () => {

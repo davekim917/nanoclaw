@@ -355,7 +355,7 @@ export function _resetTokenStreamCacheForTest(): void {
   TOKEN_STREAM_CACHE_STATS.misses = 0;
 }
 
-function tokenStreamForRecall(value: string): readonly RecallToken[] {
+export function tokenStreamForRecall(value: string): readonly RecallToken[] {
   const cached = TOKEN_STREAM_CACHE.get(value);
   if (cached) {
     TOKEN_STREAM_CACHE_STATS.hits++;
