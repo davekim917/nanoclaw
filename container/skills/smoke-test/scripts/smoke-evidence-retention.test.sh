@@ -158,4 +158,68 @@ find "$NAKED/unprotectable" -name '*.png' | grep -q . \
 ) || exit 1
 rm -rf "$NAKED"
 
+# --- 10. A malformed ledger line must not silently drop the NEWER ids ------
+# The ledger is appended to by another process, so a torn final write is
+# ordinary. `tail | jq -r '.runId'` streamed it as one document and aborted at
+# the first bad line, dropping every protected id AFTER it while `2>/dev/null`
+# hid the abort and the report still said handoffLedgerFound:true. Under
+# --delete that pruned runs the gate was still reading.
+make_run torn-ledger-run 90
+LEDGER="$STATE_DIR/handoff-ledger.jsonl"
+printf '{"schemaVersion":1,"targetSha":"aaa","runId":"some-older-run","verdict":"GO"}\n' > "$LEDGER"
+printf '{"schemaVersion":1,"targetSha":"bbb","runId":"tor\n' >> "$LEDGER"   # torn write
+printf '{"schemaVersion":1,"targetSha":"ccc","runId":"torn-ledger-run","verdict":"NO_GO"}\n' >> "$LEDGER"
+OUT="$(bash "$SCRIPT" "$RUNS" --delete)"
+jq -e '.protected == 1 and .runsPruned == 0 and
+       .protectionSources.handoffLedgerFound == true and
+       .protectionSources.handoffLedgerMalformedLines == 1' <<<"$OUT" >/dev/null || {
+  echo "expected the scan to skip the torn line, keep the newer id, and report it, got: $OUT" >&2
+  exit 1; }
+[ -e "$RUNS/torn-ledger-run/screenshots/shot-1.png" ] \
+  || { echo "a run protected AFTER a torn ledger line was pruned" >&2; exit 1; }
+# A clean ledger reports zero, so the field is a real signal and not decoration.
+printf '{"schemaVersion":1,"targetSha":"ccc","runId":"torn-ledger-run","verdict":"NO_GO"}\n' > "$LEDGER"
+bash "$SCRIPT" "$RUNS" | jq -e '.protectionSources.handoffLedgerMalformedLines == 0' >/dev/null
+rm -f "$LEDGER"
+rm -rf "$RUNS/torn-ledger-run"
+
+# --- 11. The refusal must not advertise its own bypass ---------------------
+# That `error` string is machine-parsed; a scheduled-task LLM told "pass
+# --unprotected to delete anyway" will eventually do it. The hatch lives in
+# --help instead, for the human who actually needs it.
+NAKED2="$FIXTURE_ROOT/naked-runs-2"
+mkdir -p "$NAKED2"
+RUNS_SAVE="$RUNS"; RUNS="$NAKED2"
+make_run unadvertised 30 1
+RUNS="$RUNS_SAVE"
+(
+  unset SMOKE_GATE_STATE_DIR SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE
+  unset SMOKE_RETENTION_HANDOFF_LEDGER SMOKE_GATE_HANDOFF_LEDGER
+  OUT="$(bash "$SCRIPT" "$NAKED2" --delete 2>&1 || true)"
+  jq -e '.ok == false and (.error | test("unprotected") | not)' <<<"$OUT" >/dev/null \
+    || { echo "the fail-closed refusal is still advertising --unprotected: $OUT" >&2; exit 1; }
+) || exit 1
+# The usage error must not advertise it either.
+OUT="$(bash "$SCRIPT" 2>&1 || true)"
+jq -e '.error | test("unprotected") | not' <<<"$OUT" >/dev/null \
+  || { echo "the usage error is still advertising --unprotected: $OUT" >&2; exit 1; }
+# ...but --help documents it, with the caveat.
+HELP_OUT="$(bash "$SCRIPT" --help 2>&1)"
+printf '%s' "$HELP_OUT" | grep -q -- '--unprotected' \
+  || { echo "--help does not document the escape hatch" >&2; exit 1; }
+rm -rf "$NAKED2"
+
+# --- 12. N5a: a run id starting with `-` is still protected ----------------
+# `grep -qxF "$id"` parses a leading-dash id as an option, fails, and reports
+# the run unprotected — a fail-open on the delete side.
+make_run -dash-run 90
+printf '{"schemaVersion":1,"pr":8,"activeRunId":"-dash-run"}\n' > "$STATE_DIR/pr-8-state.json"
+OUT="$(bash "$SCRIPT" "$RUNS" --delete)"
+jq -e '.protected == 1 and .runsPruned == 0' <<<"$OUT" >/dev/null || {
+  echo "expected a leading-dash run id to be protected, got: $OUT" >&2; exit 1; }
+[ -e "$RUNS/-dash-run/screenshots/shot-1.png" ] \
+  || { echo "an active run whose id starts with a dash was pruned" >&2; exit 1; }
+rm -f "$STATE_DIR/pr-8-state.json"
+rm -rf "$RUNS/-dash-run"
+
 echo "smoke evidence retention tests passed"

@@ -138,11 +138,52 @@ FREEZE_MIN_INTERVAL_SECONDS="${SMOKE_GATE_FREEZE_MIN_INTERVAL_SECONDS:-0}"
 READONLY=false
 
 mkdir -p "$STATE_DIR"
+# How long to wait for the state lock before giving up. The lock is no longer
+# held across the network phases (see the release/re-acquire below and the
+# unlock inside `freeze_status`), so a few seconds covers every ordinary
+# collision. Kept small and tunable rather than "long enough for anything",
+# because a scheduled-task runner may cap total wall clock.
+LOCK_WAIT="${SMOKE_GATE_LOCK_WAIT_SECONDS:-15}"
+
+# Losing the lock is NOT losing the slot, and the two must never look alike.
+#
+# The old shape emitted a bare `ok:false` with no `error` field, and the skill
+# tells a coordinator that `ok:false` means "this run is no longer the active
+# one — stop the campaign". So a mandatory `progress` stamp that merely collided
+# with a busy poll killed a healthy campaign: exactly the harm the liveness fix
+# shipped to prevent. `retryable:true` plus the `gate_lock_busy:` error prefix
+# is the stable, greppable signal that this is transient — the not-active
+# refusals never carry either. `wakeAgent:false` because a poll that could not
+# take the lock has learned nothing worth spawning a coordinator for; the next
+# poll retries on its own cadence.
+emit_lock_busy() {
+  jq -cn --arg phase "$1" \
+    '{ok:false,
+      retryable:true,
+      error:("gate_lock_busy: another gate invocation held the state lock (" + $phase +
+             ") — RETRY this same command in ~10s. This does NOT mean the run lost its slot; do not stop the campaign."),
+      settled:false,
+      wakeAgent:false,
+      data:{schemaVersion:1,trigger:"gate_lock_busy",phase:$phase}}'
+}
+
 exec 9>"$LOCK_FILE"
-if ! flock -w 5 9; then
-  jq -cn '{ok:false,settled:false,wakeAgent:true,data:{schemaVersion:1,trigger:"gate_lock_failed"}}'
+if ! flock -w "$LOCK_WAIT" 9; then
+  emit_lock_busy entry
   exit 0
 fi
+
+# Re-take the lock after a network phase and re-read state from disk, because a
+# claim/progress/finish may have landed while we were unlocked. Read-only
+# callers never re-lock: `check` drops the lock for good and writes nothing.
+relock_or_exit() {
+  [ "$READONLY" = true ] && return 0
+  if ! flock -w "$LOCK_WAIT" 9; then
+    emit_lock_busy "$1"
+    exit 0
+  fi
+  STATE="$(read_state)"
+}
 
 default_state() {
   jq -cn '{
@@ -287,6 +328,13 @@ freeze_status() {
   local desc="$1" heads sha
   [ -n "$FREEZE_STATUS_CONTEXT" ] || return 0
   [ -n "$REPO" ] || return 0
+  # Drop the state lock BEFORE the fan-out. Every caller reaches this line
+  # after its last state write and emits/exits immediately afterwards, so
+  # nothing is lost — and this is the single longest thing the gate does (one
+  # list call plus up to 100 POSTs at a 6s timeout each). Holding the lock
+  # across it starved a coordinator's mandatory `progress` stamp, which then
+  # read as "you are not the active run" and killed the campaign.
+  flock -u 9 2>/dev/null || true
   heads="$(timeout 10 gh pr list -R "$REPO" --base "$BRANCH" --state open \
     --limit 100 --json headRefOid --jq '.[].headRefOid' 2>/dev/null)" || return 0
   for sha in $heads; do
@@ -298,17 +346,25 @@ freeze_status() {
   return 0
 }
 
-# Live-run artifact. `holdMergesUntil` is an absolute cap from run start: a run
-# that dies without finishing stops holding the merge queue on its own.
+# Live-run artifact. `holdMergesUntil` is a cap measured from the newest
+# LIVENESS signal — the last progress stamp, or the start when nothing has
+# stamped yet — not from run start. A run that dies stops stamping and its hold
+# therefore still expires on its own, which is the property this field exists
+# for; but a run that is demonstrably alive keeps a valid hold for as long as it
+# keeps stamping. Anchoring to the original start advertised an EXPIRED hold at
+# minute 91 of a campaign documented to take 1-3h: a healthy, stamping run
+# silently stopped holding the queue.
 write_active_file() {
   [ -n "$ACTIVE_FILE" ] || return 0
-  local run="$1" sha="$2" started="$3" progress="$4" tmp
+  local run="$1" sha="$2" started="$3" progress="$4" anchor tmp
+  anchor="$progress"
+  [ -n "$anchor" ] || anchor="$started"
   mkdir -p "$(dirname "$ACTIVE_FILE")"
   tmp="$(mktemp "$(dirname "$ACTIVE_FILE")/.run-active.XXXXXX")"
   jq -cn \
     --arg run "$run" --arg sha "$sha" --arg started "$started" \
     --arg progress "$progress" \
-    --arg until "$(date -u -d "@$(( $(epoch_or_zero "$started") + MERGE_HOLD_SECONDS ))" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)" \
+    --arg until "$(date -u -d "@$(( $(epoch_or_zero "$anchor") + MERGE_HOLD_SECONDS ))" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)" \
     '{schemaVersion:1,runId:$run,sha:$sha,startedAt:$started,
       progressAt:(if $progress == "" then null else $progress end),
       holdMergesUntil:$until}' > "$tmp"
@@ -328,8 +384,9 @@ if [ "$COMMAND" = "check" ]; then
   # Drop the write lock immediately: state has been read once above and a
   # read-only caller never writes. Holding it across `check`'s network fetches
   # (four parallel, plus up to two compares — ~30s worst case) would make a
-  # concurrent scheduled poll exhaust its 5s flock wait and emit
-  # gate_lock_failed, which spawns the coordinator for nothing.
+  # concurrent scheduled poll exhaust its flock wait. `poll` now does the same
+  # thing for the same phase (see the unlock before the fetch block); this early
+  # unlock stays because `check` never re-takes the lock at all.
   flock -u 9
 fi
 
@@ -628,6 +685,17 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# ---- network derivation phase: the lock is DROPPED from here ---------------
+# Everything between this line and the `relock_or_exit` calls below is pure
+# read-only derivation from the forge and the deploy API — four parallel
+# fetches plus up to two `compare` calls, ~10-30s of wall clock. STATE was read
+# once at the top and is not touched again until we re-take the lock and RE-READ
+# it, so there is no read-modify-write spanning the unlock. This is what test
+# case 20 already proves for `check`; a scheduled `poll` holding the lock across
+# the same fetches is what made a coordinator's `progress` stamp lose its flock
+# wait. (`check` already unlocked above; a second unlock is a no-op.)
+flock -u 9
+
 timeout 10 gh api "repos/$REPO/branches/$BRANCH" >"$TMP_DIR/branch.json" 2>/dev/null &
 PID_BRANCH=$!
 timeout 10 gh run list -R "$REPO" --branch "$BRANCH" --limit 100 \
@@ -670,6 +738,8 @@ if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
 fi
 
 if [ "$FETCH_OK" != true ]; then
+  # First state write since the unlock — re-take the lock and re-read.
+  relock_or_exit fetch-failure
   FAILURES="$(( $(jq -r '.fetchFailures // 0' <<<"$STATE") + 1 ))"
   if [ "$FAILURES" -gt 3 ]; then FAILURES=3; fi
   STATE="$(jq -c --argjson failures "$FAILURES" '.fetchFailures=$failures' <<<"$STATE")"
@@ -690,7 +760,6 @@ if [ "$FETCH_OK" != true ]; then
   exit 0
 fi
 
-STATE="$(jq -c '.fetchFailures=0' <<<"$STATE")"
 NOW="$(iso_now)"
 NOW_EPOCH="$(date -u +%s)"
 CI_READY=false
@@ -780,6 +849,14 @@ if [ "$READONLY" = true ]; then
   exit 0
 fi
 
+# ---- end of the network derivation phase: the lock is RE-TAKEN here --------
+# Every remaining branch mutates state, so `STATE` is re-read from disk here to
+# pick up any claim/progress/finish that landed while we were on the network.
+# `.fetchFailures=0` moved down with it — resetting the strike counter on the
+# pre-fetch copy would have written back a stale snapshot.
+relock_or_exit poll-state
+STATE="$(jq -c '.fetchFailures=0' <<<"$STATE")"
+
 emit_no_wake() {
   local trigger="$1"
   write_state "$STATE"
@@ -846,7 +923,16 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   if [ -n "$HANDOFF_TARGET" ]; then
     LEDGER_ENTRY=""
     if [ -s "$HANDOFF_LEDGER" ]; then
-      LEDGER_ENTRY="$(jq -c --arg t "$HANDOFF_TARGET" 'select(.targetSha == $t)' "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
+      # `-R` + `fromjson?` per line, same treatment as the retention scan's
+      # read of this file. A streaming `jq select()` aborts at the first
+      # malformed line and `2>/dev/null` hides it, so one torn append — which
+      # is ordinary on a file another process appends to — silently drops every
+      # LATER match, including the outcome this poll is waiting for. Blast
+      # radius is smaller here (it fails toward "not completed yet", which the
+      # staleness ceiling eventually alarms on) but it is the same bug.
+      LEDGER_ENTRY="$(jq -cR --arg t "$HANDOFF_TARGET" \
+        'fromjson? | select(type == "object") | select(.targetSha == $t)' \
+        "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
     fi
     # Bind adoption to the SAME freeze PR as the handoff we currently have
     # open — targetSha alone is not enough to trust a ledger line: it is the
@@ -1117,6 +1203,18 @@ if [ -n "$WAKE_WINDOW" ] && [ "$(in_wake_window)" != true ]; then
   exit 0
 fi
 
+# Four network calls in this post-relock region DO run under the lock,
+# deliberately: the freeze-PR abandonment check (`gh pr view`, above), the
+# preflight command below (up to SMOKE_GATE_PREFLIGHT_TIMEOUT), the freeze
+# helper, and the parent-SHA lookup. Each sits INSIDE a read-modify-write on
+# STATE — throttle latches, candidate bookkeeping, the handoff slot — so
+# releasing around one would mean writing back a snapshot taken before the
+# release and silently clobbering a concurrent `progress` stamp. That trades a
+# retryable error for a LOST liveness signal, which is the worse failure. All
+# four are reached only when a campaign is actually being opened (once per
+# campaign, not once per poll), and a caller that loses the wait to them gets
+# the retryable `gate_lock_busy` shape, never a not-active refusal.
+#
 # Campaign preconditions. Everything above this line proves the BUILD is
 # testable; this proves the harness can actually test it. A campaign that opens
 # without its test accounts still freezes the environment, still holds the merge
@@ -1184,7 +1282,12 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   # This is the exact point poll would otherwise open a develop_build_settled
   # campaign. Cut a freeze PR instead and hand the campaign off — zero agent
   # tokens spent here, it is a subprocess call, not a dispatch.
-  FREEZE_JSON="$("$FREEZE_HELPER" "$SOURCE_SHA" 2>/dev/null)"
+  # Timed out, like every other network call in this file. The helper makes
+  # five sequential GitHub calls and was the only untimed one — and it runs
+  # holding the state lock, so a hung forge would have wedged the gate for as
+  # long as the call hung rather than for a bounded window. Exit 124 falls
+  # straight into the throttled freeze-failure alarm below.
+  FREEZE_JSON="$(timeout "${SMOKE_GATE_FREEZE_HELPER_TIMEOUT:-90}" "$FREEZE_HELPER" "$SOURCE_SHA" 2>/dev/null)"
   FREEZE_RC=$?
   if [ "$FREEZE_RC" -ne 0 ] || ! jq -e 'type == "object" and has("prNumber") and has("freezeSha")' \
        <<<"$FREEZE_JSON" >/dev/null 2>&1; then
