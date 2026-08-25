@@ -4,6 +4,7 @@ import { createHash } from 'crypto';
 
 import { buildSessionServicesSnapshot, type SessionServicesSnapshot } from '../../capabilities.js';
 import { getDb } from '../../db/connection.js';
+import { log } from '../../log.js';
 import {
   queryArchiveExactLinks,
   recentConversationSenderNames,
@@ -334,6 +335,15 @@ const TOKEN_STREAM_CACHE_MAX = 24_576;
 
 const TOKEN_STREAM_CACHE_STATS = { hits: 0, misses: 0 };
 
+/**
+ * Process-wide counters for the offset-slicing fast path (see `offsetSliceable`
+ * below): how many `passageWindows` calls could slice a single whole-candidate
+ * tokenization instead of re-tokenizing every window. Read (and diffed) by the
+ * per-build log line in `buildPreTurnContext`; incremented in `passageWindows`,
+ * the only caller of `offsetSliceable`.
+ */
+const OFFSET_SLICE_STATS = { hits: 0, total: 0 };
+
 /** Test seam: proves cache behavior without asserting on wall-clock timing. */
 export function _tokenStreamCacheStatsForTest(): { hits: number; misses: number; size: number; max: number } {
   return { ...TOKEN_STREAM_CACHE_STATS, size: TOKEN_STREAM_CACHE.size, max: TOKEN_STREAM_CACHE_MAX };
@@ -543,7 +553,10 @@ function offsetSliceable(candidate: string, sentences: readonly { start: number;
  */
 function passageWindows(candidate: string, maxChars: number): Array<{ text: string; tokens: readonly RecallToken[] }> {
   const sentences = sentenceSpans(candidate, maxChars);
-  const stream = offsetSliceable(candidate, sentences) ? tokenStreamForRecall(candidate) : null;
+  const sliceable = offsetSliceable(candidate, sentences);
+  OFFSET_SLICE_STATS.total++;
+  if (sliceable) OFFSET_SLICE_STATS.hits++;
+  const stream = sliceable ? tokenStreamForRecall(candidate) : null;
 
   // Token index at each span edge. Span offsets are non-decreasing and (given
   // the clean-cut check) no token crosses an edge, so two monotone cursors
@@ -1011,6 +1024,12 @@ function boundedFactLine(line: string, maxChars: number): string {
   return `${line.slice(0, budget).trimEnd()}${TRUNCATED_MARKDOWN_EXCERPT} ${marker}`;
 }
 
+/** Out-param populated by `readMemoryEvidence`, mirroring the `notices` mutable-array pattern. */
+interface RecallCandidateStats {
+  factCandidates: number;
+  fileCandidates: number;
+}
+
 function readMemoryEvidence(
   root: string,
   workgroupId: string,
@@ -1020,6 +1039,7 @@ function readMemoryEvidence(
   seenEvidenceFingerprints: ReadonlySet<string>,
   bypassDedupe: boolean,
   involvedSenderNames: readonly string[] = [],
+  candidateStats?: RecallCandidateStats,
 ): PreTurnContext['memoryEvidence'] {
   if (!fs.existsSync(root)) throw new Error(`canonical memory tree missing: ${root}`);
   const canonicalRoot = fs.realpathSync(root);
@@ -1183,6 +1203,10 @@ function readMemoryEvidence(
       searchable: `${relative}\n${headings.join('\n')}\n${read.content}`,
       capturedAt: '',
     });
+  }
+  if (candidateStats) {
+    candidateStats.factCandidates = factCandidates.length;
+    candidateStats.fileCandidates = fileCandidates.length;
   }
   const rankPool = (
     pool: SearchableCandidate[],
@@ -1529,6 +1553,15 @@ function potentialConflict(
  * member set, messaging group, or capability boundary.
  */
 export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext {
+  const startedAt = Date.now();
+  // Snapshotted before any recall work runs, diffed against the same
+  // process-wide counters at the end — cheap (two integer reads now, two more
+  // at the log line) and gives THIS build's cache/fast-path activity rather
+  // than the all-time total, which a shared, cross-workgroup counter would
+  // otherwise make meaningless per line.
+  const tokenStatsBefore = { ...TOKEN_STREAM_CACHE_STATS };
+  const offsetStatsBefore = { ...OFFSET_SLICE_STATS };
+  const candidateStats: RecallCandidateStats = { factCandidates: 0, fileCandidates: 0 };
   const db = getDb();
   const scope = db
     .prepare(
@@ -1640,6 +1673,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
       seenEvidenceFingerprints,
       bypassDedupe,
       involvedSenderNames,
+      candidateStats,
     );
   } catch (error) {
     if (!(error instanceof Error)) throw error;
@@ -1778,5 +1812,24 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     notices,
   };
   enforceFinalBound(context);
+  // One structured line per build: nothing else logs recall latency in
+  // production, so every prior performance claim came from an ad-hoc harness
+  // run against a copied tree. debug, not info — this fires on every
+  // admissible trigger message across every session and workgroup, the same
+  // routine per-message volume as router.ts's debug-level drop/dedupe lines,
+  // not a business event like "Message routed"/"Message delivered" (info).
+  // Counts only, no memory or conversation text.
+  log.debug('pre-turn-context: build', {
+    workgroupId,
+    elapsedMs: Date.now() - startedAt,
+    factCandidates: candidateStats.factCandidates,
+    fileCandidates: candidateStats.fileCandidates,
+    tokenCacheSize: TOKEN_STREAM_CACHE.size,
+    tokenCacheMax: TOKEN_STREAM_CACHE_MAX,
+    tokenCacheHits: TOKEN_STREAM_CACHE_STATS.hits - tokenStatsBefore.hits,
+    tokenCacheMisses: TOKEN_STREAM_CACHE_STATS.misses - tokenStatsBefore.misses,
+    fastPathHits: OFFSET_SLICE_STATS.hits - offsetStatsBefore.hits,
+    fastPathCandidates: OFFSET_SLICE_STATS.total - offsetStatsBefore.total,
+  });
   return context;
 }
