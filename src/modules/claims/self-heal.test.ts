@@ -603,6 +603,35 @@ describe('sweepClaimsSelfHeal hostile re-read handling', () => {
     expect(outcome).toMatchObject({ slug: 'seam', action: 'nudge', applied: true, target: 'ag-owner' });
     expect(d.sent).toHaveLength(1);
   });
+
+  it('does not block on a FIFO swapped in during delivery, and THROWS rather than silently dropping the stamp', async () => {
+    // `stampClaim`'s own re-read has a WIDER window than the classification
+    // re-read above: it fires after `resolveOwner`, `resolveSibling` and
+    // `createTask` are all awaited, so the swap has real elapsed time to
+    // happen in, not a same-tick race. `createTask` is the hook here because
+    // it is the last await before the stamp, and by the time it resolves the
+    // nudge has already been DELIVERED — the fact the stamp exists to
+    // remember. Unlike the classification path, silently skipping this stamp
+    // would leave self-heal believing no nudge was ever sent: the next scan
+    // would recompute `count === 0` and send a SECOND nudge for the same
+    // rung, and go on doing that every scan forever. So this must throw, not
+    // skip — verified below by asserting the promise rejects rather than
+    // resolving with an empty outcome.
+    const dir = root({ seam: claim(30) });
+    const file = path.join(dir, 'wg-a', 'claims', 'seam.json');
+    const d = deps(dir, {
+      createTask: async (input: SelfHealTaskInput) => {
+        fs.rmSync(file);
+        execFileSync('mkfifo', [file]);
+        return true;
+      },
+    });
+
+    // Same discriminating signal as the classification-path FIFO test: with a
+    // plain `readFileSync` back in `stampClaim`, this does not FAIL, it
+    // HANGS — confirmed separately with an external `timeout`.
+    await expect(sweepClaimsSelfHeal(NOW, d)).rejects.toThrow(/cannot stamp claim/);
+  });
 });
 
 describe('wiredCandidates — where a claim can actually be reached', () => {
