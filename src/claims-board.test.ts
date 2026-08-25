@@ -1,10 +1,12 @@
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { readClaims, renderClaims, type BoardClaim } from './claims-board.js';
+import { log } from './log.js';
 
 const HOUR = 60 * 60 * 1000;
 const NOW = Date.parse('2026-08-13T12:00:00Z');
@@ -248,5 +250,200 @@ describe('renderClaims', () => {
 
   it('stamps the empty render too', () => {
     expect(renderClaims([])).toMatch(/_claims as of .+ — source of truth: the claims\/ directory_$/);
+  });
+});
+
+/**
+ * The claims directory is bind-mounted READ-WRITE into that workgroup's own
+ * containers, and `readClaims` runs synchronously inside the thread-list
+ * request the dashboard polls from every open viewer (`board-attention.ts`
+ * calls it on every memo miss). So every property of every entry — its type,
+ * its size, how many there are, where it points — is chosen by an agent, on
+ * the host's single event loop.
+ */
+describe('readClaims hostile-directory handling', () => {
+  const tmpdirs: string[] = [];
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const d of tmpdirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  const claimsDirOf = (dir: string) => path.join(dir, 'wg-a', 'claims');
+
+  it('does not block on a FIFO in the claims directory, and skips it with a log', () => {
+    // O_NONBLOCK, and this assertion is what stands on it. Opening a FIFO for
+    // reading BLOCKS until a writer shows up, and that open happens BEFORE any
+    // regular-file check can reject it — so with `fs.readFileSync` back in
+    // place this test does not FAIL, it HANGS, exactly as the host would hang:
+    // every dashboard poll, every channel adapter and every sweep tick, for
+    // every viewer, until a writer appeared. Planting one is one `mkfifo` in a
+    // directory the agent already writes claims into.
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const dir = root({ healthy: claim(1) });
+    tmpdirs.push(dir);
+    execFileSync('mkfifo', [path.join(claimsDirOf(dir), 'trap.json')]);
+
+    // The healthy claim still comes back — one hostile entry must not blank
+    // the board, the same rule malformed JSON already had.
+    expect(readClaims('wg-a', NOW, dir).map((c) => c.slug)).toEqual(['healthy']);
+    expect(warn).toHaveBeenCalledWith(
+      'Claims board: not a regular file, emitting nothing',
+      expect.objectContaining({ relative: 'trap.json' }),
+    );
+  });
+
+  it('skips a claim file larger than the read cap instead of reading it', () => {
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const dir = root({ healthy: claim(1) });
+    tmpdirs.push(dir);
+    // Valid JSON, just far too big to be a claim — so a skip can only come
+    // from the size cap, never from the parse failing.
+    fs.writeFileSync(
+      path.join(claimsDirOf(dir), 'bloated.json'),
+      JSON.stringify({ ...claim(9), note: 'x'.repeat(128 * 1024) }),
+    );
+
+    expect(readClaims('wg-a', NOW, dir).map((c) => c.slug)).toEqual(['healthy']);
+    expect(warn).toHaveBeenCalledWith(
+      'Claims board: file is larger than the read cap, emitting nothing',
+      expect.objectContaining({ relative: 'bloated.json', cap: 64 * 1024 }),
+    );
+  });
+
+  it('reads a verbose claim right up to the read cap', () => {
+    // The other side of the cap: it must bound a hostile file without
+    // truncating a merely wordy one.
+    const dir = root({});
+    tmpdirs.push(dir);
+    const padded = { ...claim(1), note: 'wallet tie-out. ' + 'y'.repeat(32 * 1024) };
+    fs.writeFileSync(path.join(claimsDirOf(dir), 'verbose.json'), JSON.stringify(padded));
+
+    expect(readClaims('wg-a', NOW, dir).map((c) => c.slug)).toEqual(['verbose']);
+  });
+
+  it('keeps the OLDEST files when the count cap bites, and says so out loud', () => {
+    // Silent truncation is the absence-as-fact bug: the board would still look
+    // clean and nobody would learn it is only being partly read. And WHICH
+    // files survive is the whole point — the board exists to surface work
+    // nobody came back for, so a cut that dropped the least recently touched
+    // claims would drop exactly what it is for.
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const dir = root({});
+    tmpdirs.push(dir);
+    const claimsDir = claimsDirOf(dir);
+    // 501 claims: one over the cap, so exactly one must be dropped.
+    //
+    // mtime runs DESCENDING with the name, deliberately ANTI-correlated with
+    // both creation order and alphabetical order: `c0000` is the newest file
+    // and also the first one `readdir` reports, `c0500` is the oldest and the
+    // last. So an as-listed cut and a name-ordered cut both drop `c0500` —
+    // exactly the claim that most needs a human — and only an mtime-ordered
+    // cut drops `c0000`. Getting this backwards is what makes the test pass on
+    // a broken implementation, which it did on the first draft.
+    for (let i = 0; i < 501; i++) {
+      const file = path.join(claimsDir, `c${String(i).padStart(4, '0')}.json`);
+      fs.writeFileSync(file, JSON.stringify(claim(9)));
+      fs.utimesSync(file, new Date(NOW), new Date(NOW - (i + 1) * HOUR));
+    }
+
+    const slugs = readClaims('wg-a', NOW, dir).map((c) => c.slug);
+
+    expect(slugs).toHaveLength(500);
+    expect(slugs).not.toContain('c0000'); // newest — the one the cap drops
+    expect(slugs).toContain('c0500'); // oldest — the one it must never drop
+    expect(warn).toHaveBeenCalledWith('Claims board: more claim files than the read cap, reading only the oldest', {
+      workgroupId: 'wg-a',
+      total: 501,
+      cap: 500,
+      skipped: 1,
+    });
+  });
+
+  it('skips a directory named like a claim without blanking the list', () => {
+    // A non-regular entry that is not a FIFO: `open` on a directory succeeds,
+    // so only the fstat check stands between it and a read that throws EISDIR
+    // out of the request path.
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const dir = root({ healthy: claim(1), other: claim(5) });
+    tmpdirs.push(dir);
+    fs.mkdirSync(path.join(claimsDirOf(dir), 'imposter.json'));
+
+    expect(
+      readClaims('wg-a', NOW, dir)
+        .map((c) => c.slug)
+        .sort(),
+    ).toEqual(['healthy', 'other']);
+    expect(warn).toHaveBeenCalledWith(
+      'Claims board: not a regular file, emitting nothing',
+      expect.objectContaining({ relative: 'imposter.json' }),
+    );
+  });
+
+  it('refuses a claim symlinked out of the claims directory', () => {
+    // The claims directory is agent-writable, so a leaf symlink at a sibling
+    // workgroup's claim is one `ln -s` — a cross-workgroup read through the
+    // data-pool boundary, and one self-heal would then stamp in the WRONG
+    // workgroup. Containment is decided from the open descriptor, not the path.
+    vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const dir = root({ healthy: claim(1) });
+    tmpdirs.push(dir);
+    const otherWg = path.join(dir, 'wg-b', 'claims');
+    fs.mkdirSync(otherWg, { recursive: true });
+    fs.writeFileSync(path.join(otherWg, 'secret.json'), JSON.stringify(claim(9, { owner: 'sibling' })));
+    fs.symlinkSync(path.join(otherWg, 'secret.json'), path.join(claimsDirOf(dir), 'secret.json'));
+
+    expect(readClaims('wg-a', NOW, dir).map((c) => c.slug)).toEqual(['healthy']);
+  });
+
+  it('reads nothing when the claims DIRECTORY is a symlink out of the workgroup', () => {
+    // The other half of the escape the leaf test covers. `claims/` is inside
+    // the read-write mount, so it can be removed and replaced wholesale with a
+    // symlink at a sibling workgroup's directory — and then EVERY row on this
+    // board comes from the other workgroup, which self-heal and nudge would go
+    // on to stamp and message about under the wrong workgroup's identity.
+    const dir = root({ healthy: claim(1) });
+    tmpdirs.push(dir);
+    const otherWg = path.join(dir, 'wg-b', 'claims');
+    fs.mkdirSync(otherWg, { recursive: true });
+    fs.writeFileSync(path.join(otherWg, 'secret.json'), JSON.stringify(claim(9, { owner: 'sibling' })));
+    fs.rmSync(claimsDirOf(dir), { recursive: true });
+    fs.symlinkSync(otherWg, claimsDirOf(dir));
+
+    expect(readClaims('wg-a', NOW, dir)).toEqual([]);
+  });
+
+  it('still reads a claims directory symlinked to somewhere INSIDE the workgroup', () => {
+    // The assertion that makes the directory-level containment load-bearing
+    // rather than decorative. Rejecting the escape above happens either way —
+    // the per-file fd check catches it on its own, because every opened file
+    // resolves outside the unresolved `claims/` string. What only the resolved
+    // root gets right is the LEGITIMATE case: a `claims/` symlink that stays
+    // inside the workgroup. Without resolving the directory first, every file
+    // under it resolves outside the string the fd check compares against, and
+    // the board silently blanks — the exact absence-as-fact failure, arrived at
+    // from the safe side.
+    const dir = root({});
+    tmpdirs.push(dir);
+    const real = path.join(dir, 'wg-a', 'real-claims');
+    fs.mkdirSync(real, { recursive: true });
+    fs.writeFileSync(path.join(real, 'healthy.json'), JSON.stringify(claim(1)));
+    fs.rmSync(claimsDirOf(dir), { recursive: true });
+    fs.symlinkSync(real, claimsDirOf(dir));
+
+    expect(readClaims('wg-a', NOW, dir).map((c) => c.slug)).toEqual(['healthy']);
+  });
+
+  it('reads a healthy directory exactly as before', () => {
+    // The regression guard for everything above: none of the hardening may
+    // change what an ordinary claims directory produces.
+    const dir = root({ fresh: claim(1), expiring: claim(5), abandoned: claim(9) });
+    tmpdirs.push(dir);
+
+    const byslug = Object.fromEntries(readClaims('wg-a', NOW, dir).map((c) => [c.slug, c]));
+
+    expect(Object.keys(byslug).sort()).toEqual(['abandoned', 'expiring', 'fresh']);
+    expect(byslug.fresh).toMatchObject({ state: 'live', owner: 'ava', note: 'wallet tie-out' });
+    expect(byslug.expiring.state).toBe('expiring');
+    expect(byslug.abandoned.state).toBe('stale');
   });
 });

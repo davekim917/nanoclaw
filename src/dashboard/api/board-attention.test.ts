@@ -2,7 +2,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+
+import { log } from '../../log.js';
 
 import {
   deriveBoardAttentionItems,
@@ -109,6 +111,49 @@ describe('deriveBoardAttentionItems', () => {
     const shipped: GateShipRecord[] = [{ target: 'EXAMPLE-APP#817', ts: '2026-08-22T12:05:00Z' }];
     const out = deriveBoardAttentionItems([item()], ASOF, shipped, [], BINDING);
     expect(out).toEqual([]);
+  });
+
+  /**
+   * The timestamps on both sides of this comparison are PARSED, never compared
+   * as strings. `ts` is agent-written into a gates file and `asOf` comes off
+   * the snapshot, so neither is guaranteed to be the ISO-UTC shape the other
+   * is — and lexical order disagrees with chronological order in both
+   * directions once an offset form or a naive form turns up.
+   *
+   * Both miscompares point the DANGEROUS way. A spurious "shipped since the
+   * snapshot" adds the PR to the suppression set and a ready-to-ship row
+   * silently disappears from the queue, which is the invisibility this whole
+   * feed exists to end.
+   */
+  describe('ship timestamps are compared as instants, not as strings', () => {
+    it('does not suppress on an offset-form stamp that only LOOKS later', () => {
+      // 14:30+09:00 is 05:30Z — over six hours BEFORE the snapshot's 12:01:41Z.
+      // As strings it sorts AFTER, so `>=` says "shipped since the snapshot"
+      // and the ready PR vanishes. The two assertions below pin exactly that
+      // disagreement, so this test cannot quietly stop being about it.
+      const shipped: GateShipRecord[] = [{ target: 'EXAMPLE-APP#817', ts: '2026-08-22T14:30:00+09:00' }];
+      expect('2026-08-22T14:30:00+09:00' >= ASOF).toBe(true); // lexically "later"…
+      expect(Date.parse('2026-08-22T14:30:00+09:00')).toBeLessThan(Date.parse(ASOF)); // …chronologically earlier
+      const out = deriveBoardAttentionItems([item()], ASOF, shipped, [], BINDING);
+      expect(out).toHaveLength(1);
+    });
+
+    it('still suppresses on an offset-form stamp that is genuinely later', () => {
+      const shipped: GateShipRecord[] = [{ target: 'EXAMPLE-APP#817', ts: '2026-08-22T16:30:00+02:00' }];
+      expect(deriveBoardAttentionItems([item()], ASOF, shipped, [], BINDING)).toEqual([]);
+    });
+
+    it('suppresses nothing when a ship stamp will not parse', () => {
+      const shipped: GateShipRecord[] = [{ target: 'EXAMPLE-APP#817', ts: 'whenever' }];
+      expect(deriveBoardAttentionItems([item()], ASOF, shipped, [], BINDING)).toHaveLength(1);
+    });
+
+    it('suppresses nothing at all when the snapshot asOf will not parse', () => {
+      // No reference point means no honest comparison. Showing a row one cycle
+      // too long is visible and self-correcting; hiding one is not.
+      const shipped: GateShipRecord[] = [{ target: 'EXAMPLE-APP#817', ts: '2999-01-01T00:00:00Z' }];
+      expect(deriveBoardAttentionItems([item()], 'not-a-timestamp', shipped, [], BINDING)).toHaveLength(1);
+    });
   });
 
   it('does NOT exclude a stale failed ship attempt from before the snapshot', () => {
@@ -300,6 +345,7 @@ function board(files: { state?: unknown; gates?: Record<string, string> }): { gr
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   while (tmpdirs.length) fs.rmSync(tmpdirs.pop()!, { recursive: true, force: true });
 });
 
@@ -467,6 +513,73 @@ describe('readReleaseBoardSource', () => {
       gates: { '2026-08-22.jsonl': ['{ broken', JSON.stringify({ action: 'note', target: 'x', ts: ASOF })].join('\n') },
     });
     expect(readReleaseBoardSource(DECL, WORKGROUP, Date.now(), env).items).toHaveLength(1);
+  });
+
+  /**
+   * `MAX_FILE_BYTES` bounds how big each gates file may be; nothing bounded how
+   * MANY there are, and the directory is bind-mounted read-write into that
+   * workgroup's own containers. The whole loop is synchronous on the
+   * thread-list request path, so an unbounded file COUNT is an unbounded block
+   * of the host's single event loop on every memo miss, for every viewer.
+   *
+   * The cap is 400 — over thirteen months of the desk's one-file-per-day
+   * naming — and hitting it is LOUD on both channels: a `log.warn` and a
+   * visible row. Silent truncation would be the same absence-as-fact bug this
+   * seam keeps eliminating: the queue would look healthy while the source was
+   * only being partly read.
+   */
+  describe('the gates directory has a bounded file count', () => {
+    /** `n` gate files named so lexical order is chronological, oldest first. */
+    function manyGates(n: number, extra: Record<string, string> = {}): Record<string, string> {
+      const out: Record<string, string> = { ...extra };
+      for (let i = 0; i < n; i++) out[`2000-01-01.${String(i).padStart(5, '0')}.jsonl`] = '';
+      return out;
+    }
+
+    it('reads every file and emits no notice while the count is under the cap', () => {
+      const env = board({ state: { asOf: ASOF, items: [item()] }, gates: manyGates(50) });
+      const read = readReleaseBoardSource(DECL, WORKGROUP, Date.now(), env);
+      expect(read.items.map((i) => i.id)).toEqual(['EXAMPLE-APP#817']);
+    });
+
+    it('reads only the newest files past the cap, and says so as a work item', () => {
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+      const env = board({ state: { asOf: ASOF, items: [item()] }, gates: manyGates(420) });
+      const read = readReleaseBoardSource(DECL, WORKGROUP, Date.now(), env);
+
+      const overflow = read.items.find((i) => i.id === 'gates-overflow');
+      expect(overflow).toBeDefined();
+      // `waiting on` verbatim is what routes it into `needs_you` rather than a
+      // backlog nobody reads — the whole point of making it an item.
+      expect(overflow!.claimNote).toContain('waiting on a human');
+      expect(overflow!.claimNote).toContain('420');
+      expect(overflow!.claimNote).toContain('20 are being ignored');
+      // `since` is the snapshot's own asOf, never `now`: a row that re-dates
+      // itself every poll is the first one the age-fair cap drops.
+      expect(overflow!.since).toBe(ASOF);
+      // And it never displaces the real blocked work.
+      expect(read.items.map((i) => i.id)).toContain('EXAMPLE-APP#817');
+      expect(warn).toHaveBeenCalledWith(
+        'Release board gates: more gate files than the read cap, reading only the newest',
+        expect.objectContaining({ total: 420, cap: 400, skipped: 20 }),
+      );
+    });
+
+    it('keeps the NEWEST files, so the cap can only ever drop ones that could suppress nothing', () => {
+      // `readdirSync` order is whatever the filesystem hands back, so an
+      // unsorted cut would drop an arbitrary set — possibly the only file whose
+      // records are at-or-after the snapshot's asOf, i.e. the only one that can
+      // suppress anything at all. Sorting descending keeps it by construction.
+      const ship = JSON.stringify({ action: 'ship', target: 'EXAMPLE-APP#817', ts: '2026-08-22T12:30:00Z' });
+      vi.spyOn(log, 'warn').mockImplementation(() => {});
+      const env = board({
+        state: { asOf: ASOF, items: [item()] },
+        gates: manyGates(420, { '2026-08-22.jsonl': ship }),
+      });
+      const read = readReleaseBoardSource(DECL, WORKGROUP, Date.now(), env);
+      // The shipped PR is still suppressed: its file sorts newest and survives.
+      expect(read.items.map((i) => i.id)).toEqual(['gates-overflow']);
+    });
   });
 });
 

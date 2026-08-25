@@ -2062,7 +2062,17 @@ describe('attention-source rows in the thread list', () => {
       ).toEqual([]);
     });
 
-    it('every other filter still applies: an old item still carries this caller’s own snooze', async () => {
+    /**
+     * An attention row is never snoozed, and the row below is planted by hand
+     * to prove it: `threadSnoozeHandler` resolves a thread through `sessions`
+     * and an ownerless `board:` id matches none, so it 404s and no such row can
+     * exist in production (pinned from the endpoint's side in
+     * `thread-snooze.test.ts`). The list used to look the id up anyway, which
+     * could only ever miss — dead state that read like a supported feature and
+     * kept a control on screen (`ThreadConsole`'s snooze button, Triage's `S`)
+     * whose request could only be refused.
+     */
+    it('an old item never reports snoozed, even with a snooze row planted on its id', async () => {
       declare(JSON.stringify([{ kind: 'release-board', root: 'releases', channel_key: CHANNEL_KEY }]));
       const oldSince = iso(THIRTY_DAYS);
       const itemId = `${ATTENTION_ITEM_PREFIX}EXAMPLE-APP#817`;
@@ -2075,7 +2085,8 @@ describe('attention-source rows in the thread list', () => {
         attentionDeps(boardRoot([readyPr({ since: oldSince })])),
       );
       expect(threads).toHaveLength(1);
-      expect(threads[0]!.snoozed).toBe(true);
+      expect(threads[0]!.thread_id).toBe(itemId);
+      expect(threads[0]!.snoozed).toBe(false);
     });
   });
 

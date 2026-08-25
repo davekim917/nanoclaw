@@ -1,3 +1,4 @@
+import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -202,10 +203,76 @@ describe('deriveDefectRegisterItems', () => {
   });
 
   it('emits nothing from a register whose product-decision bucket is empty', () => {
+    // The heading IS there and holds nothing. That is a real answer — "nothing
+    // to decide" — and must stay distinguishable from the register below, whose
+    // heading has gone missing entirely.
     const text = ['# Register', '', `*Generated ${GENERATED} by \`gen.py\`.*`, '', '## product-decision (0)', ''].join(
       '\n',
     );
     expect(deriveDefectRegisterItems(text, BINDING)).toEqual({ asOf: GENERATED, items: [] });
+  });
+
+  /**
+   * A shape change upstream must never read as "nothing needs a human".
+   *
+   * Everything in this parser only emits while `bucket === 'product-decision'`
+   * — INCLUDING the `unparseable` counter, which only counts lines inside that
+   * bucket. So a generator that renames or re-levels the heading produces a
+   * file that parses perfectly, emits nothing, counts no skips and warns about
+   * nothing. The file is readable; we have simply stopped matching its shape,
+   * and it renders as an empty queue. These pin the signal.
+   */
+  describe('a register whose product-decision heading has gone missing says so', () => {
+    const renamed = REGISTER.replace('## product-decision (3)', '## Product decisions (3)');
+    const relevelled = REGISTER.replace('## product-decision (3)', '### product-decision (3)');
+
+    it.each([
+      ['renamed', renamed],
+      ['re-levelled to h3, which BUCKET_HEADING does not match at all', relevelled],
+    ])('emits a work item when the heading has been %s', (_why, text) => {
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+      const read = deriveDefectRegisterItems(text, BINDING);
+      expect(read.items.map((i) => i.id)).toEqual(['defect-register-shape']);
+      // `waiting on` verbatim is what routes it into `needs_you` — the whole
+      // point of making it an item rather than only a log line.
+      expect(read.items[0]!.claimNote).toMatch(/\bwaiting on\b/i);
+      // The note names the headings that WERE found, so an operator can tell a
+      // rename from a generator that omits an empty section without opening it.
+      expect(read.items[0]!.claimNote).toContain('escalated');
+      expect(read.items[0]!.claimNote).toContain('actionable');
+      // `since` is the register's own generated stamp — never `now`.
+      expect(read.items[0]!.since).toBe(GENERATED);
+      expect(warn).toHaveBeenCalledWith(
+        'Defect register: no `product-decision` heading — nothing from this register can reach the queue',
+        expect.objectContaining({ workgroupId: WORKGROUP }),
+      );
+    });
+
+    it('says so for a register with no `##` headings at all, including an empty file', () => {
+      vi.spyOn(log, 'warn').mockImplementation(() => {});
+      for (const text of ['', '# Register\n\njust prose, no sections\n']) {
+        const read = deriveDefectRegisterItems(text, BINDING);
+        expect(read.items.map((i) => i.id)).toEqual(['defect-register-shape']);
+        expect(read.items[0]!.claimNote).toContain('no `##` section headings at all');
+        // No generated header to take a stamp from: empty, never `now`, which
+        // the console reads as unmeasured rather than as freshly arrived.
+        expect(read.items[0]!.since).toBe('');
+      }
+    });
+
+    it('stays quiet on a healthy register, so the signal means something', () => {
+      const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+      const read = deriveDefectRegisterItems(REGISTER, BINDING);
+      expect(read.items.map((i) => i.id)).not.toContain('defect-register-shape');
+      expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('keeps one identity across reads, so an assignment on it stays matched', () => {
+      vi.spyOn(log, 'warn').mockImplementation(() => {});
+      const a = deriveDefectRegisterItems(renamed, BINDING).items[0]!;
+      const b = deriveDefectRegisterItems(renamed, BINDING).items[0]!;
+      expect(a).toEqual(b);
+    });
   });
 });
 
@@ -730,6 +797,51 @@ describe('readDefectRegisterSource', () => {
     expect(read).toEqual({ asOf: null, items: [] });
     // Belt and braces: whatever else happens, the sibling's rows never appear.
     expect(read.items.map((i) => i.id).join()).not.toContain('#9');
+  });
+
+  it('refuses a FIFO in place of the declared file, rather than blocking the whole host on it', () => {
+    // O_NONBLOCK, and this assertion is what stands on it. Opening a FIFO for
+    // reading BLOCKS until a writer shows up, and that open happens BEFORE the
+    // `fstat` regular-file check can reject it — so without the flag this does
+    // not fail, it HANGS the suite, exactly as it would hang the host: every
+    // provider runs synchronously inside the thread-list request, on the single
+    // Node event loop, so one `mkfifo` in a declared root would stop every
+    // dashboard poll, every channel adapter and every sweep tick for every
+    // viewer until a writer appeared. The declared root is bind-mounted
+    // read-write into that workgroup's own containers, so planting one is one
+    // command.
+    //
+    // The `fstat` check beside the flag is defence in depth: with O_NONBLOCK
+    // the open returns a descriptor on a pipe, and it is `isFile()` that turns
+    // that into "emit nothing".
+    const warn = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const groupsRoot = groupsRootWith({});
+    execFileSync('mkfifo', [path.join(groupsRoot, WORKGROUP, 'releases', 'defects.md')]);
+    expect(readDefectRegisterSource(DEFECT_DECL, WORKGROUP, Date.now(), { groupsRoot })).toEqual({
+      asOf: null,
+      items: [],
+    });
+    expect(warn).toHaveBeenCalledWith(
+      'Defect register: not a regular file, emitting nothing',
+      expect.objectContaining({ relative: 'defects.md' }),
+    );
+  });
+
+  it('still follows a symlinked leaf that stays inside the root — O_NOFOLLOW is deliberately NOT set', () => {
+    // The counterpart to the FIFO test above, and the reason the flag set is
+    // O_RDONLY|O_NONBLOCK and not the O_RDONLY|O_NOFOLLOW|O_NONBLOCK that
+    // `observatory.ts` uses. O_NOFOLLOW refuses the FINAL path component, so it
+    // would break this — a legitimate symlink to another file under the same
+    // resolved root — while closing nothing: containment here is decided from
+    // the OPEN DESCRIPTOR (`fdPath`), which is race-free and already refuses a
+    // leaf pointing out of the root (pinned by the `readOpenQuestionsSource`
+    // symlink test below).
+    const groupsRoot = groupsRootWith({ 'real-register.md': REGISTER });
+    const dir = path.join(groupsRoot, WORKGROUP, 'releases');
+    fs.symlinkSync(path.join(dir, 'real-register.md'), path.join(dir, 'defects.md'));
+    const read = readDefectRegisterSource(DEFECT_DECL, WORKGROUP, Date.now(), { groupsRoot });
+    expect(read.asOf).toBe(GENERATED);
+    expect(read.items).toHaveLength(3);
   });
 
   it('reads nothing when an intermediate directory is a symlink out of the workgroup', () => {

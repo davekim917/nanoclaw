@@ -229,9 +229,9 @@ export interface RecallCorpusResult {
   expansionUsed: boolean;
 }
 
-const CORE_PATHS = ['index.md'] as const;
-const NON_RECALL_PATHS = new Set(['system/definition.md']);
-const PREFERENCES_DIR = 'preferences/';
+export const CORE_PATHS = ['index.md'] as const;
+export const NON_RECALL_PATHS = new Set(['system/definition.md']);
+export const PREFERENCES_DIR = 'preferences/';
 
 /** Canonical filename key for a person: "Pat Doe" -> "pat-doe". */
 export function preferenceSlug(name: string): string {
@@ -296,7 +296,7 @@ export function tokenizeForRecall(value: string): string[] {
   return [...new Set(tokenStreamForRecall(value).map((token) => token.value))];
 }
 
-type RecallToken = { value: string; start: number; end: number };
+export type RecallToken = { value: string; start: number; end: number };
 
 // Tokenizing the generated store is the single largest per-turn cost, and it
 // repeats identically every turn: the curator rewrites the file a few times an
@@ -355,7 +355,7 @@ export function _resetTokenStreamCacheForTest(): void {
   TOKEN_STREAM_CACHE_STATS.misses = 0;
 }
 
-function tokenStreamForRecall(value: string): readonly RecallToken[] {
+export function tokenStreamForRecall(value: string): readonly RecallToken[] {
   const cached = TOKEN_STREAM_CACHE.get(value);
   if (cached) {
     TOKEN_STREAM_CACHE_STATS.hits++;
@@ -551,7 +551,10 @@ function offsetSliceable(candidate: string, sentences: readonly { start: number;
  * 6,633-fact store, and every window is a distinct string, so no cache could
  * ever collapse the duplication.
  */
-function passageWindows(candidate: string, maxChars: number): Array<{ text: string; tokens: readonly RecallToken[] }> {
+export function passageWindows(
+  candidate: string,
+  maxChars: number,
+): Array<{ text: string; tokens: readonly RecallToken[] }> {
   const sentences = sentenceSpans(candidate, maxChars);
   const sliceable = offsetSliceable(candidate, sentences);
   OFFSET_SLICE_STATS.total++;
@@ -803,7 +806,7 @@ function extractQueryText(normalizedContent: string): string {
   return normalizedContent;
 }
 
-function headingsOf(content: string): string[] {
+export function headingsOf(content: string): string[] {
   return content
     .split(/\r?\n/)
     .map((line) => line.match(/^#{1,6}\s+(.+?)\s*#*\s*$/)?.[1]?.trim())
@@ -817,7 +820,7 @@ function isContainedPath(root: string, candidate: string): boolean {
   return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-function readBoundedFile(
+export function readBoundedFile(
   filePath: string,
   canonicalRoot: string,
   allowedBytes: number,
@@ -860,7 +863,7 @@ function readBoundedFile(
   }
 }
 
-function listMarkdownFiles(root: string, notices: ContextNotice[]): string[] {
+export function listMarkdownFiles(root: string, notices: ContextNotice[]): string[] {
   const files: string[] = [];
   const pending = [''];
   let visited = 0;
@@ -959,7 +962,7 @@ function listDirectMarkdownStems(root: string, dir: string, notices: ContextNoti
  * race. Flat, one level, matching TOPIC_FILE_PATH_PATTERN — so a non-recursive
  * listing per directory is the whole story.
  */
-function listTopicFiles(root: string, notices: ContextNotice[]): string[] {
+export function listTopicFiles(root: string, notices: ContextNotice[]): string[] {
   return TOPIC_DIRECTORIES.flatMap((dir) =>
     listDirectMarkdownStems(root, `${dir}/`, notices).map((stem) => `${dir}/${stem}.md`),
   );
@@ -974,7 +977,7 @@ function listTopicFiles(root: string, notices: ContextNotice[]): string[] {
  * really there — matching the walk's own symlink-skip discipline via lstat
  * rather than trusting a followed stat.
  */
-function missingGeneratedMemoryPath(root: string, allFiles: readonly string[]): string | null {
+export function missingGeneratedMemoryPath(root: string, allFiles: readonly string[]): string | null {
   if (allFiles.includes(GENERATED_MEMORY_RELATIVE_PATH)) return null;
   try {
     return fs.lstatSync(path.join(root, GENERATED_MEMORY_RELATIVE_PATH)).isFile()
@@ -985,7 +988,7 @@ function missingGeneratedMemoryPath(root: string, allFiles: readonly string[]): 
   }
 }
 
-interface SearchableCandidate {
+export interface SearchableCandidate {
   path: string;
   headings: string[];
   /** Text handed to the agent: for a generated fact this keeps the provenance marker. */
@@ -998,7 +1001,7 @@ interface SearchableCandidate {
 
 const CAPTURED_AT_PATTERN = /captured=([0-9T:.Z+-]+)/;
 
-function capturedAtOf(line: string): string {
+export function capturedAtOf(line: string): string {
   return CAPTURED_AT_PATTERN.exec(line)?.[1] ?? '';
 }
 

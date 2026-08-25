@@ -1568,10 +1568,18 @@ export async function buildThreadList(
   );
   // One query for the whole page's snoozes, never one per row. Per-user by
   // construction — see thread-snooze.ts on why this is not archive.
-  const snoozes = readThreadSnoozes(ctx.user.id, [
-    ...grouped.map((t) => t.threadId),
-    ...attentionItems.map((i) => i.id),
-  ]);
+  //
+  // SESSION THREADS ONLY. `thread_snoozes` has exactly one writer
+  // (`threadSnoozeHandler`), and it refuses any id that resolves to no row in
+  // `sessions` — which every `board:` attention id does, by construction. So no
+  // snooze row for an attention item can exist, and asking for one was a
+  // parameter the query could never match. Attention rows report `snoozed:
+  // false` below for the same reason, and the console does not offer the verb
+  // on them (`isOwnerlessItem` in the triage panel and the detail actions).
+  const snoozes = readThreadSnoozes(
+    ctx.user.id,
+    grouped.map((t) => t.threadId),
+  );
   // Same rule: one query for the page's in-flight closes, never one per row.
   // Fleet-wide (not per-user) — a close is a decision about the WORK, unlike a
   // snooze, so every operator looking at the row must see that it is closing.
@@ -1861,7 +1869,11 @@ export async function buildThreadList(
       current_tool: null,
       tool_started_at: null,
       reply_target_session_id: null,
-      snoozed: snoozes.has(item.id) && isSnoozed(snoozes.get(item.id), lastActivityAt),
+      // Never snoozable — see the note on `snoozes` above. Stated as the
+      // constant it actually is rather than as a lookup that can only ever
+      // miss, so nothing downstream reads the possibility of a snooze into a
+      // row that can never carry one.
+      snoozed: false,
       scheduled_task: false,
       done_proposal: null,
       closing: false,

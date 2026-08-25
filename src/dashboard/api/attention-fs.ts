@@ -43,6 +43,11 @@ import { log } from '../../log.js';
  *
  * Over the cap is a `log.warn` and no items, never a throw: an oversized file
  * is the same answer as an absent one — read nothing, say so.
+ *
+ * This is the DEFAULT, not the only value. A caller that reads MANY files per
+ * request multiplies the cap by its file count, so it passes a tighter one —
+ * see `maxBytes` on {@link readContainedFile} and `MAX_CLAIM_BYTES` in
+ * `claims-board.ts`.
  */
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -173,17 +178,47 @@ export function resolveContainedRoot(
  * The mtime rides along for the same reason: a separate `statSync` would be a
  * second traversal of the same path, i.e. the identical race reopened for a
  * timestamp.
+ *
+ * `maxBytes` defaults to {@link MAX_FILE_BYTES}; a caller reading many files
+ * inside one request passes a tighter bound, because what blocks the event
+ * loop is count × size, not size.
  */
 export function readContainedFile(
   label: string,
   rootDir: string,
   relative: string,
   workgroupId: string,
+  maxBytes: number = MAX_FILE_BYTES,
 ): { text: string; mtimeIso: string } | null {
   const target = path.join(rootDir, relative);
   let fd: number;
   try {
-    fd = fs.openSync(target, 'r');
+    // O_NONBLOCK, ALWAYS. Opening a FIFO for reading BLOCKS until a writer
+    // shows up, and that open happens before the `fstat` below can reject it —
+    // so a plain `openSync(target, 'r')` on an agent-planted `mkfifo` does not
+    // return an error, it hangs the host's single event loop FOREVER: every
+    // dashboard poll, every channel adapter, every sweep tick, for every
+    // viewer. The declared root is bind-mounted read-write into that
+    // workgroup's own containers, so planting one is one command. On a regular
+    // file the flag is a no-op (Linux ignores O_NONBLOCK for reads on regular
+    // files), so it costs nothing. Same flag, same reason, as
+    // `readContainedState` in `observatory.ts`.
+    //
+    // NOT O_NOFOLLOW, and that is a decision rather than an omission.
+    // O_NOFOLLOW only ever refuses the FINAL path component (verified: a
+    // symlinked DIRECTORY component still opens fine with it), so it would not
+    // close any hole the fd check below does not already close — and it WOULD
+    // refuse a leaf that is legitimately a symlink to another file inside the
+    // same root, which this seam is deliberately built to allow. The
+    // containment decision here is race-free without it: `fdPath` asks the
+    // kernel where the ALREADY-OPEN descriptor points, and every later question
+    // (containment, regular-file, size, bytes, mtime) is answered from that one
+    // descriptor. Nothing re-traverses the path, so there is no second lookup a
+    // swapped symlink could win. `observatory.ts` needs O_NOFOLLOW precisely
+    // because it has no such fd check — it proves the PARENT chain and then
+    // opens — which is the difference between the two call sites, not an
+    // inconsistency between them.
+    fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
   } catch {
     log.warn(`${label}: file absent or escapes the root, emitting nothing`, { workgroupId, relative });
     return null;
@@ -202,12 +237,12 @@ export function readContainedFile(
       log.warn(`${label}: not a regular file, emitting nothing`, { workgroupId, relative });
       return null;
     }
-    if (st.size > MAX_FILE_BYTES) {
+    if (st.size > maxBytes) {
       log.warn(`${label}: file is larger than the read cap, emitting nothing`, {
         workgroupId,
         relative,
         size: st.size,
-        cap: MAX_FILE_BYTES,
+        cap: maxBytes,
       });
       return null;
     }
