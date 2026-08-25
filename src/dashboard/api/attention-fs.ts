@@ -43,6 +43,11 @@ import { log } from '../../log.js';
  *
  * Over the cap is a `log.warn` and no items, never a throw: an oversized file
  * is the same answer as an absent one — read nothing, say so.
+ *
+ * This is the DEFAULT, not the only value. A caller that reads MANY files per
+ * request multiplies the cap by its file count, so it passes a tighter one —
+ * see `maxBytes` on {@link readContainedFile} and `MAX_CLAIM_BYTES` in
+ * `claims-board.ts`.
  */
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -173,12 +178,17 @@ export function resolveContainedRoot(
  * The mtime rides along for the same reason: a separate `statSync` would be a
  * second traversal of the same path, i.e. the identical race reopened for a
  * timestamp.
+ *
+ * `maxBytes` defaults to {@link MAX_FILE_BYTES}; a caller reading many files
+ * inside one request passes a tighter bound, because what blocks the event
+ * loop is count × size, not size.
  */
 export function readContainedFile(
   label: string,
   rootDir: string,
   relative: string,
   workgroupId: string,
+  maxBytes: number = MAX_FILE_BYTES,
 ): { text: string; mtimeIso: string } | null {
   const target = path.join(rootDir, relative);
   let fd: number;
@@ -227,12 +237,12 @@ export function readContainedFile(
       log.warn(`${label}: not a regular file, emitting nothing`, { workgroupId, relative });
       return null;
     }
-    if (st.size > MAX_FILE_BYTES) {
+    if (st.size > maxBytes) {
       log.warn(`${label}: file is larger than the read cap, emitting nothing`, {
         workgroupId,
         relative,
         size: st.size,
-        cap: MAX_FILE_BYTES,
+        cap: maxBytes,
       });
       return null;
     }
