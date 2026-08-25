@@ -28,8 +28,17 @@ import fs from 'node:fs';
  * Mirrors `WorkgroupGraphStore`'s guard (`src/graphify/store.ts:27`). A
  * mismatch is a REBUILD TRIGGER, never an error surfaced to a turn
  * (decision 14).
+ *
+ * BUMP THIS when the table shape changes OR when what the columns MEAN
+ * changes. Version 2 is the worked example: F4 changed window `start`/`end`
+ * from an `indexOf` first-occurrence derivation to the true span, so on
+ * `'aa bb?\naa bb?'` the third window stores `[7,13)` where it used to store
+ * `[0,6)`. Same columns, same decoded text — which is exactly why the
+ * round-trip check waves it through — but a consumer reading offsets rather
+ * than slicing text gets a different answer per row vintage. Neither the table
+ * shape nor `frozenBounds` moved, so this version was the only gate left.
  */
-export const RECALL_PROJECTION_SCHEMA_VERSION = 1;
+export const RECALL_PROJECTION_SCHEMA_VERSION = 2;
 
 /** Files and facts are ranked as separate pools, each with its own scan order. */
 export type RecallLane = 'file' | 'fact';

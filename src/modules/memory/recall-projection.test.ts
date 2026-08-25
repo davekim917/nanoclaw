@@ -455,8 +455,9 @@ describe('recall projection schema and build', () => {
     expect(openProjectionDb(live, frozenBoundsJson())).not.toBeNull();
 
     // Simulates PRE_TURN_BOUNDS/LANE_EXCERPT_CHARS changing without a rebuild.
-    // schema_version stays 1, because the TABLE shape did not change — which is
-    // exactly why the marker and the version alone are not enough.
+    // schema_version does not move, because neither the table shape nor the
+    // persisted semantics changed — which is exactly why the marker and the
+    // version alone are not enough.
     const writable = new Database(live);
     const stored = JSON.parse(
       (writable.prepare("SELECT value FROM meta WHERE key = 'bounds_json'").get() as { value: string }).value,

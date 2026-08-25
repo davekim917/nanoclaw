@@ -256,10 +256,12 @@ export function _resetFrozenBoundsForTest(): void {
  * into the file and compared as one JSON string at open.
  *
  * Recording these without enforcing them would be worse than not recording
- * them — it reads as a guard that is not one. `schema_version` only moves when
- * the TABLE shape changes, so widening `markdownExcerptChars` (or any of these)
- * would otherwise leave a version-1 projection serving windows the live path
- * would never produce. A mismatch is rebuild-required, exactly like a schema
+ * them — it reads as a guard that is not one. `schema_version` moves when the
+ * table shape OR the persisted semantics change (F4's window-offset fix is the
+ * worked example — see `RECALL_PROJECTION_SCHEMA_VERSION`), but it does not
+ * move for a constant, so widening `markdownExcerptChars` (or any of these)
+ * would otherwise leave an old projection serving windows the live path would
+ * never produce. A mismatch is rebuild-required, exactly like a schema
  * mismatch, never an error surfaced to a turn.
  *
  * The set is the real dependency set, not a sample: file/heading widths shape
