@@ -452,6 +452,79 @@ function canonicalToken(token: string): string {
   return value;
 }
 
+/**
+ * Per-token canonical-form memo.
+ *
+ * Natural language is Zipfian, and this function is pure. A cold illysium turn
+ * makes 1,063,284 `canonicalToken` calls over 35,849 DISTINCT tokens (29.7x
+ * reuse); memoizing removes 60% of the turn's CPU (7,047ms -> 2,837ms measured).
+ * `TOKEN_STREAM_CACHE` cannot cover this: it is keyed per candidate STRING, so
+ * every candidate on a cold turn misses and re-canonicalizes the same few
+ * thousand words. The two caches are layered, not alternatives.
+ *
+ * NO REORDER ON HIT — do not "improve" this into an LRU. A delete+set per hit
+ * costs ~2.5s of the 4.2s saving (cold CPU: 2,837ms without, 5,457ms with).
+ *
+ * THE CAP IS A FLOOR, NOT A BUDGET. Without reordering, a sequential sweep over
+ * a working set LARGER than the cap evicts every entry before its reuse and the
+ * hit rate collapses to ZERO, not to "degraded" — measured: 0 hits over 119,836
+ * lookups at a 50,000 cap against a 59,918-token sweep. That is the same failure
+ * the `TOKEN_STREAM_CACHE` wholesale-`.clear()` had, wearing a different costume.
+ * The memo is process-wide and shared across workgroups (the map is
+ * workgroup-independent), so the working set is the UNION over every tree:
+ * 79,071 distinct tokens today. 131,072 is ~1.66x that at a measured 51
+ * bytes/entry (~6.4MB). Raising it is cheap; lowering it below the union is a
+ * cliff. The hit-rate warning below is what makes that cliff observable.
+ *
+ * The cliff is worse than zero hits: past the cap every miss costs a delete
+ * plus an insert, and V8 compacts the ordered hash table on delete, so a
+ * 131,072-entry map runs ~80us per lookup (measured). Over-capacity is slower
+ * than no memo at all, and the warning is the only thing that says so.
+ */
+const CANONICAL_MEMO = new Map<string, string>();
+const CANONICAL_MEMO_MAX = 131_072;
+const CANONICAL_MEMO_STATS = { hits: 0, misses: 0 };
+let canonicalMemoWarned = false;
+
+function canonicalTokenMemo(token: string): string {
+  const cached = CANONICAL_MEMO.get(token);
+  if (cached !== undefined) {
+    CANONICAL_MEMO_STATS.hits++;
+    return cached;
+  }
+  CANONICAL_MEMO_STATS.misses++;
+  const value = canonicalToken(token);
+  // Evict exactly ONE oldest entry. Never `.clear()` — one overflow must not
+  // discard the whole warm set. A Map iterates in insertion order, so the first
+  // key is the oldest.
+  if (CANONICAL_MEMO.size >= CANONICAL_MEMO_MAX) {
+    CANONICAL_MEMO.delete(CANONICAL_MEMO.keys().next().value!);
+  }
+  CANONICAL_MEMO.set(token, value);
+  const total = CANONICAL_MEMO_STATS.hits + CANONICAL_MEMO_STATS.misses;
+  if (!canonicalMemoWarned && total >= 1_000_000 && CANONICAL_MEMO_STATS.hits / total < 0.5) {
+    canonicalMemoWarned = true;
+    log.warn('canonical-token memo hit rate below 50%: working set has outgrown the cap', {
+      hits: CANONICAL_MEMO_STATS.hits,
+      misses: CANONICAL_MEMO_STATS.misses,
+      max: CANONICAL_MEMO_MAX,
+    });
+  }
+  return value;
+}
+
+/** Test seam: proves the memo caches and evicts without asserting on wall clock. */
+export function _canonicalMemoStatsForTest(): { hits: number; misses: number; size: number; max: number } {
+  return { ...CANONICAL_MEMO_STATS, size: CANONICAL_MEMO.size, max: CANONICAL_MEMO_MAX };
+}
+
+export function _resetCanonicalMemoForTest(): void {
+  CANONICAL_MEMO.clear();
+  CANONICAL_MEMO_STATS.hits = 0;
+  CANONICAL_MEMO_STATS.misses = 0;
+  canonicalMemoWarned = false;
+}
+
 export function tokenizeForRecall(value: string): string[] {
   return [...new Set(tokenStreamForRecall(value).map((token) => token.value))];
 }
@@ -528,7 +601,7 @@ export function tokenStreamForRecall(value: string): readonly RecallToken[] {
   const normalized = value.normalize('NFKC').toLocaleLowerCase('en-US');
   const tokens = [...normalized.matchAll(/[\p{L}\p{N}_-]{2,}/gu)]
     .map((match) => ({
-      value: canonicalToken(match[0]),
+      value: canonicalTokenMemo(match[0]),
       start: match.index,
       end: match.index + match[0].length,
     }))
@@ -540,7 +613,7 @@ export function tokenStreamForRecall(value: string): readonly RecallToken[] {
   return tokens;
 }
 
-interface PassageMatch {
+export interface PassageMatch {
   text: string;
   coverage: number;
   tokenSpan: number;
@@ -702,19 +775,29 @@ function offsetSliceable(candidate: string, sentences: readonly { start: number;
 }
 
 /**
- * The overlapping windows `bestPassage` scores, each paired with its tokens.
+ * The window geometry `bestPassage` scores, WITHOUT materializing a token array
+ * per window.
  *
- * The windows themselves are unchanged — still original-string slices, so the
- * text delivered to the agent is byte-identical. What changes is that the
- * candidate is tokenized ONCE and each window takes a slice of that stream:
- * the 1..3-sentence sweep re-covers the same characters ~2.9x on the live
- * 6,633-fact store, and every window is a distinct string, so no cache could
- * ever collapse the duplication.
+ * TWO COORDINATE SYSTEMS, and conflating them is the way to break this:
+ * `start`/`end` are CHARACTER offsets into `candidate` — what the recall
+ * projection persists and what `encodeWindows` validates. `tokenLo`/`tokenHi`
+ * are the half-open range of PARENT-STREAM TOKEN indices, which only exist when
+ * `stream` is non-null.
+ *
+ * `stream` is the whole-candidate token stream when the candidate is
+ * offset-sliceable. When it is null the candidate failed the sliceability gate
+ * and each window must be tokenized from its own text; those two tokenizations
+ * genuinely disagree (a mid-word chop mints window-local tokens the parent
+ * stream never had, ~1 candidate in 9,001 on the live store), so the null case
+ * is a correctness gate, not a missed optimization.
  */
-export function passageWindows(
+function passageWindowSpans(
   candidate: string,
   maxChars: number,
-): Array<{ text: string; tokens: readonly RecallToken[]; start: number; end: number }> {
+): {
+  stream: readonly RecallToken[] | null;
+  windows: Array<{ text: string; start: number; end: number; tokenLo: number; tokenHi: number }>;
+} {
   const sentences = sentenceSpans(candidate, maxChars);
   const sliceable = offsetSliceable(candidate, sentences);
   OFFSET_SLICE_STATS.total++;
@@ -737,16 +820,14 @@ export function passageWindows(
     }
   }
 
-  const windows: Array<{ text: string; tokens: readonly RecallToken[]; start: number; end: number }> = [];
+  const windows: Array<{ text: string; start: number; end: number; tokenLo: number; tokenHi: number }> = [];
   for (let first = 0; first < sentences.length; first++) {
     for (let last = first; last < Math.min(sentences.length, first + 3); last++) {
       const windowStart = sentences[first]!.start;
       const windowEnd = sentences[last]!.end;
       if (windowEnd - windowStart > maxChars) break;
-      const text = candidate.slice(windowStart, windowEnd);
       windows.push({
-        text,
-        tokens: stream ? stream.slice(firstToken[first]!, afterToken[last]!) : tokenStreamForRecall(text),
+        text: candidate.slice(windowStart, windowEnd),
         // The span is REPORTED, not re-derived. The recall projection persists
         // windows as offsets into `searchable`, and recovering those offsets by
         // searching for the window text finds the FIRST occurrence, not this
@@ -756,10 +837,37 @@ export function passageWindows(
         // looking for them again.
         start: windowStart,
         end: windowEnd,
+        tokenLo: stream ? firstToken[first]! : 0,
+        tokenHi: stream ? afterToken[last]! : 0,
       });
     }
   }
-  return windows;
+  return { stream, windows };
+}
+
+/**
+ * The overlapping windows paired with their tokens.
+ *
+ * The projection build (`recall-projection.ts`) and its tests consume this
+ * shape. `bestPassage` uses `passageWindowSpans` directly so it never
+ * materializes a token array per window. The windows themselves are unchanged —
+ * still original-string slices, so the text delivered to the agent is
+ * byte-identical. The candidate is tokenized ONCE and each window takes a slice
+ * of that stream: the 1..3-sentence sweep re-covers the same characters ~2.9x on
+ * the live 6,633-fact store, and every window is a distinct string, so no cache
+ * could ever collapse the duplication.
+ */
+export function passageWindows(
+  candidate: string,
+  maxChars: number,
+): Array<{ text: string; tokens: readonly RecallToken[]; start: number; end: number }> {
+  const { stream, windows } = passageWindowSpans(candidate, maxChars);
+  return windows.map(({ text, start, end, tokenLo, tokenHi }) => ({
+    text,
+    tokens: stream ? stream.slice(tokenLo, tokenHi) : tokenStreamForRecall(text),
+    start,
+    end,
+  }));
 }
 
 function minimumTokenSpan(queryTokens: Set<string>, passageTokens: readonly { value: string }[]): number {
@@ -788,6 +896,23 @@ function comparePassageMatch(a: PassageMatch, b: PassageMatch): number {
   );
 }
 
+/**
+ * The encoded score. NOT display-only, despite what the comment inside the old
+ * `bestPassage` claimed: it drives `excerpts.sort((a, b) => b.score - a.score)`,
+ * decides which excerpt the character budget sheds, ships serialized in the
+ * provider payload, and gates the conflict notice. Every arm below must
+ * reproduce it BIT-EXACTLY, which is why `density` is passed as the same float
+ * both paths compute rather than recomputed from rounded parts.
+ */
+function encodePassageScore(coverage: number, density: number, tokenSpan: number, questionLike: boolean): number {
+  return (
+    coverage * 1_000_000_000 +
+    Math.round(density * 1_000_000) +
+    Math.max(0, 100_000 - tokenSpan * 100) +
+    (questionLike ? 0 : 1)
+  );
+}
+
 function bestPassage(
   queryTokens: string[],
   candidate: string,
@@ -795,32 +920,104 @@ function bestPassage(
 ): PassageMatch | null {
   if (queryTokens.length === 0) return null;
   const minimumOverlap = queryTokens.length <= 2 ? 1 : 2;
+  const { stream, windows } = passageWindowSpans(candidate, maxChars);
   const matches: PassageMatch[] = [];
-  for (const { text, tokens: passageTokens } of passageWindows(candidate, maxChars)) {
-    const candidateSet = new Set(passageTokens.map((token) => token.value));
-    const matchedTerms = new Set(queryTokens.filter((token) => candidateSet.has(token)));
+
+  if (stream === null) {
+    // Sliceability gate failed: window text and the parent stream disagree, so
+    // each window is tokenized from its own text exactly as before.
+    for (const { text } of windows) {
+      const passageTokens = tokenStreamForRecall(text);
+      const candidateSet = new Set(passageTokens.map((token) => token.value));
+      const matchedTerms = new Set(queryTokens.filter((token) => candidateSet.has(token)));
+      if (matchedTerms.size < minimumOverlap) continue;
+      const tokenSpan = minimumTokenSpan(matchedTerms, passageTokens);
+      const density = matchedTerms.size / Math.max(1, passageTokens.length);
+      const questionLike = text.includes('?');
+      matches.push({
+        text,
+        coverage: matchedTerms.size,
+        tokenSpan,
+        density,
+        questionLike,
+        score: encodePassageScore(matchedTerms.size, density, tokenSpan, questionLike),
+      });
+    }
+    return matches.sort(comparePassageMatch)[0] ?? null;
+  }
+
+  // Fast path. Building a Set over EVERY token of EVERY window was 55-59% of the
+  // whole ranking sweep (measured 250ms of 424ms on the live illysium store).
+  // Only query terms can ever contribute, so collect their positions once per
+  // candidate and read each window off that.
+  const queryTermSet = new Set(queryTokens);
+  const hitIndex: number[] = [];
+  const hitTerm: string[] = [];
+  for (let index = 0; index < stream.length; index++) {
+    const token = stream[index]!;
+    if (queryTermSet.has(token.value)) {
+      hitIndex.push(index);
+      hitTerm.push(token.value);
+    }
+  }
+
+  // `windows` is ordered by `tokenLo` non-decreasing, so one monotone cursor
+  // finds each window's first hit without rescanning.
+  let cursor = 0;
+  for (const { text, tokenLo, tokenHi } of windows) {
+    while (cursor < hitIndex.length && hitIndex[cursor]! < tokenLo) cursor++;
+    let end = cursor;
+    const matchedTerms = new Set<string>();
+    while (end < hitIndex.length && hitIndex[end]! < tokenHi) {
+      matchedTerms.add(hitTerm[end]!);
+      end++;
+    }
+    // Filter BEFORE computing density: `tokenHi - tokenLo` is zero for an empty
+    // window and `0 / 0` would put NaN into the score.
     if (matchedTerms.size < minimumOverlap) continue;
-    const tokenSpan = minimumTokenSpan(matchedTerms, passageTokens);
-    const density = matchedTerms.size / Math.max(1, passageTokens.length);
+    // Span in PARENT-STREAM indices, never in hit-list positions. Hit-list
+    // positions are compressed — they skip every non-query token in between — so
+    // using them would shrink the span whenever other words interleave and
+    // silently change tokenSpan, score and ranking order.
+    let tokenSpan = Number.POSITIVE_INFINITY;
+    for (let start = cursor; start < end; start++) {
+      const seen = new Set<string>();
+      for (let scan = start; scan < end; scan++) {
+        seen.add(hitTerm[scan]!);
+        if (seen.size === matchedTerms.size) {
+          tokenSpan = Math.min(tokenSpan, hitIndex[scan]! - hitIndex[start]! + 1);
+          break;
+        }
+      }
+    }
+    const density = matchedTerms.size / Math.max(1, tokenHi - tokenLo);
     const questionLike = text.includes('?');
-    // The encoded score mirrors the tuple above for display and downstream
-    // conflict checks. Ranking itself compares the tuple, avoiding a pile of
-    // independent incident-specific weights.
-    const score =
-      matchedTerms.size * 1_000_000_000 +
-      Math.round(density * 1_000_000) +
-      Math.max(0, 100_000 - tokenSpan * 100) +
-      (questionLike ? 0 : 1);
     matches.push({
       text,
       coverage: matchedTerms.size,
       tokenSpan,
       density,
       questionLike,
-      score,
+      score: encodePassageScore(matchedTerms.size, density, tokenSpan, questionLike),
     });
   }
+  // Stable sort, kept deliberately. A keep-best scan is NOT equivalent: on a
+  // four-field tie `<=` takes the LAST window where the sort takes the FIRST,
+  // changing the bytes delivered. See the tie case in the tests.
   return matches.sort(comparePassageMatch)[0] ?? null;
+}
+
+/**
+ * Test seam. The hit-list fast path and the non-sliceable fallback must agree
+ * bit-for-bit on `tokenSpan`, `density` and `score`, and the only way to assert
+ * that is to call the ranker directly rather than through a whole turn.
+ */
+export function _bestPassageForTest(
+  queryTokens: string[],
+  candidate: string,
+  maxChars?: number,
+): Readonly<PassageMatch> | null {
+  return bestPassage(queryTokens, candidate, maxChars);
 }
 
 function rankByBestPassage<T>(
