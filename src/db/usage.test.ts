@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from './index.js';
-import { rollupSessionUsage, listUsageDaily, pruneOldTurnUsage } from './usage.js';
+import { rollupSessionUsage, listUsageDaily, pruneOldTurnUsage, summarizeTurnUsage } from './usage.js';
 
 const GID = 'ag-usage';
 const SESSION_DIR = `${GID}/sess-1`;
@@ -352,5 +352,129 @@ describe('pruneOldTurnUsage', () => {
     closeDb(); // no DB initialized — getDb() would throw inside
     expect(() => pruneOldTurnUsage()).not.toThrow();
     expect(pruneOldTurnUsage()).toBe(0);
+  });
+});
+
+describe('summarizeTurnUsage', () => {
+  beforeEach(() => {
+    const db = initTestDb();
+    runMigrations(db);
+  });
+  afterEach(() => closeDb());
+
+  /** Insert one central turn_usage row. `turnId` null models a pre-migration-061 container. */
+  function central(row: {
+    ts?: string;
+    group?: string;
+    session?: string;
+    provider?: string;
+    model?: string | null;
+    turnId?: string | null;
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    cost?: number;
+  }): void {
+    getDb()
+      .prepare(
+        `INSERT INTO turn_usage (ts, session_id, agent_group_id, provider, model, turn_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd)
+         VALUES (@ts, @session, @group, @provider, @model, @turn_id, @input, @output, @cache_read, @cache_write, @cost)`,
+      )
+      .run({
+        ts: row.ts ?? '2026-08-24T12:00:00.000Z',
+        session: row.session ?? 'sess-1',
+        group: row.group ?? 'ag-a',
+        provider: row.provider ?? 'claude',
+        model: row.model === undefined ? 'claude-opus-5' : row.model,
+        turn_id: row.turnId === undefined ? 't-1' : row.turnId,
+        input: row.input ?? 0,
+        output: row.output ?? 0,
+        cache_read: row.cacheRead ?? 0,
+        cache_write: row.cacheWrite ?? 0,
+        cost: row.cost ?? 0,
+      });
+  }
+
+  it('counts distinct turns, not rows — a multi-model turn is one turn', () => {
+    central({ turnId: 't-1', model: 'claude-opus-5' });
+    central({ turnId: 't-1', model: 'claude-sonnet-5' });
+    central({ turnId: 't-1', model: 'claude-haiku-4-5' });
+    central({ turnId: 't-2', model: 'claude-opus-5' });
+
+    const total = summarizeTurnUsage().at(-1)!;
+    expect(total.group).toBe('TOTAL');
+    expect(total.turns).toBe(2); // a row count would say 4 — that is the 1.40x bug
+  });
+
+  it('TOTAL is queried un-grouped, so per-model buckets deliberately exceed it', () => {
+    central({ turnId: 't-1', model: 'claude-opus-5' });
+    central({ turnId: 't-1', model: 'claude-sonnet-5' });
+
+    const rows = summarizeTurnUsage({ dimensions: ['model'] });
+    const buckets = rows.slice(0, -1);
+    const total = rows.at(-1)!;
+    expect(buckets).toHaveLength(2);
+    // Each model truthfully reports "1 turn touched me"...
+    expect(buckets.every((b) => b.turns === 1)).toBe(true);
+    // ...and their sum (2) is NOT the fleet turn count. Summing buckets is
+    // exactly the double-count this verb exists to avoid.
+    expect(buckets.reduce((n, b) => n + Number(b.turns), 0)).toBe(2);
+    expect(total.turns).toBe(1);
+  });
+
+  it('splits token composition and reports per-turn averages', () => {
+    central({ turnId: 't-1', input: 100, output: 20, cacheRead: 900, cacheWrite: 50, cost: 1.5 });
+    central({ turnId: 't-2', input: 300, output: 40, cacheRead: 1100, cacheWrite: 50, cost: 2.5 });
+
+    const total = summarizeTurnUsage().at(-1)!;
+    expect(total.input_tokens).toBe(400);
+    expect(total.output_tokens).toBe(60);
+    expect(total.cache_read_tokens).toBe(2000);
+    expect(total.cache_write_tokens).toBe(50 + 50);
+    expect(total.cost_usd).toBe(4);
+    expect(total.input_per_turn).toBe(200);
+    expect(total.cache_read_per_turn).toBe(1000);
+    expect(total.output_per_turn).toBe(30);
+  });
+
+  it('counts each pre-migration-061 row (turn_id NULL) as its own turn instead of dropping it', () => {
+    central({ turnId: null });
+    central({ turnId: null });
+    central({ turnId: 't-9' });
+
+    // Bare COUNT(DISTINCT turn_id) would report 1 and silently lose the two
+    // old-container turns.
+    expect(summarizeTurnUsage().at(-1)!.turns).toBe(3);
+  });
+
+  it('buckets by several dimensions at once and orders heaviest cache_read first', () => {
+    central({ group: 'ag-a', provider: 'claude', turnId: 't-1', cacheRead: 100 });
+    central({ group: 'ag-b', provider: 'codex', turnId: 't-2', cacheRead: 900 });
+
+    const rows = summarizeTurnUsage({ dimensions: ['group', 'provider'] });
+    expect(rows.slice(0, -1).map((r) => [r.group, r.provider])).toEqual([
+      ['ag-b', 'codex'],
+      ['ag-a', 'claude'],
+    ]);
+    // Only the first dimension carries the TOTAL label; the rest blank out.
+    expect(rows.at(-1)).toMatchObject({ group: 'TOTAL', provider: '' });
+  });
+
+  it('filters by group, --since and --days', () => {
+    const recent = new Date(Date.now() - 86_400_000).toISOString();
+    central({ group: 'ag-a', turnId: 't-a', ts: '2026-01-01T00:00:00.000Z' });
+    central({ group: 'ag-b', turnId: 't-b', ts: recent });
+
+    expect(summarizeTurnUsage({ agentGroupId: 'ag-a' }).at(-1)!.turns).toBe(1);
+    expect(summarizeTurnUsage({ sinceDate: '2026-06-01' }).at(-1)!.turns).toBe(1);
+    expect(summarizeTurnUsage({ days: 7 }).at(-1)!.turns).toBe(1);
+    expect(summarizeTurnUsage({ days: 7 }).at(-1)!.group).toBe('TOTAL');
+  });
+
+  it('an empty window still returns a zeroed TOTAL row, not an empty list', () => {
+    const rows = summarizeTurnUsage({ days: 7 });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ group: 'TOTAL', turns: 0, cache_read_tokens: 0, cache_read_per_turn: 0 });
   });
 });

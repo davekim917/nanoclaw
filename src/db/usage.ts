@@ -29,10 +29,17 @@
  * exactly that factor — measured ~1.35x fleet-wide, up to 1.62x for the
  * heaviest group. `turn_id` (mirrored into the central turn_usage row below)
  * is shared by every row one turn writes, so the true count is
- * `COUNT(DISTINCT turn_id)` against the central table. usage_daily itself is
- * deliberately left alone here — `ncl usage`/the dashboard depend on its
- * current (wrong) behavior, and fixing both at once would make this
- * regression un-diagnosable.
+ * `COUNT(DISTINCT turn_id)` against the central table.
+ *
+ * This stays a READ-side fix (summarizeTurnUsage below, exposed as `ncl usage
+ * summary`) and the write path is deliberately unchanged: per (date, group,
+ * provider, model) bucket, "one turn touched opus" and "one turn touched
+ * sonnet" are both true statements about the same turn, so `turns = turns + 1`
+ * is correct for the row it increments. Only the SUM ACROSS buckets lies, and
+ * no honest per-model number can be recovered from a de-duplicated write.
+ * Making the writer de-duplicate would also need cross-sweep state
+ * (usage_daily is an additive upsert over a watermark, so it never sees a
+ * turn's rows together) and would silently redefine an existing column.
  */
 import type Database from 'better-sqlite3';
 
@@ -200,6 +207,124 @@ export function listUsageDaily(
   return getDb()
     .prepare(`SELECT * FROM usage_daily${clause} ORDER BY date DESC, agent_group_id, provider, model LIMIT 1000`)
     .all(...params) as UsageDailyRow[];
+}
+
+// ---------------------------------------------------------------------------
+// Accurate read surface over the central turn_usage ledger
+// ---------------------------------------------------------------------------
+
+/** Dimension name -> the SQL expression that buckets by it. */
+const USAGE_DIMENSIONS = {
+  group: 'agent_group_id',
+  provider: 'provider',
+  model: "COALESCE(model, '')",
+  day: 'substr(ts, 1, 10)',
+  session: 'session_id',
+} as const;
+
+export type UsageDimension = keyof typeof USAGE_DIMENSIONS;
+
+export const USAGE_DIMENSION_NAMES = Object.keys(USAGE_DIMENSIONS) as UsageDimension[];
+
+/** One bucket of the summary, plus the synthetic `TOTAL` row appended last. */
+export type TurnUsageSummaryRow = Record<string, string | number>;
+
+/**
+ * Summarize the central turn_usage ledger — the accurate per-turn data that
+ * until now had zero consumers in src/.
+ *
+ * Two things here are deliberate and are the whole point of the verb:
+ *
+ * 1. `turns` is `COUNT(DISTINCT turn_id)`, not a row count. A turn spanning N
+ *    models writes N rows (measured 1.40x fleet-wide), so a row count is not
+ *    a turn count. Rows written by a container older than migration 061 carry
+ *    no turn_id; each of those counts as one turn (`SUM(turn_id IS NULL)`) —
+ *    the pre-turn_id best guess — rather than being dropped by COUNT DISTINCT.
+ *
+ * 2. The `TOTAL` row is its own un-grouped query, NOT the sum of the buckets.
+ *    Grouping by `model` (or any dimension one turn can straddle) puts that
+ *    turn in several buckets, so a bucket's `turns` reads as "turns that
+ *    touched this model" — true per bucket, but summing them double-counts.
+ *    Re-querying without the GROUP BY is the only way the total stays an
+ *    honest fleet turn count.
+ *
+ * Tokens are reported split (input / cache_read / cache_write / output)
+ * rather than as one number because measured fleet volume is ~96% cache_read
+ * — a collapsed "tokens" column hides the entire cost story.
+ */
+export function summarizeTurnUsage(
+  filters: { dimensions?: UsageDimension[]; agentGroupId?: string; sinceDate?: string; days?: number } = {},
+): TurnUsageSummaryRow[] {
+  const dims: UsageDimension[] = filters.dimensions?.length ? filters.dimensions : ['group'];
+
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (filters.agentGroupId) {
+    where.push('agent_group_id = ?');
+    params.push(filters.agentGroupId);
+  }
+  // ts is ISO-8601 UTC, so a lexical `>=` against a YYYY-MM-DD prefix is a
+  // correct day-boundary filter and stays usable by idx_turn_usage_ts.
+  if (filters.sinceDate) {
+    where.push('ts >= ?');
+    params.push(filters.sinceDate);
+  }
+  if (filters.days !== undefined) {
+    where.push('ts >= ?');
+    params.push(new Date(Date.now() - filters.days * 86_400_000).toISOString().slice(0, 10));
+  }
+  const clause = where.length > 0 ? ` WHERE ${where.join(' AND ')}` : '';
+
+  // Every SUM is wrapped: over zero rows SQLite's SUM returns NULL, not 0, and
+  // the un-grouped TOTAL query always produces a row — so an empty window
+  // would otherwise report `null` tokens rather than `0`.
+  const metrics = `
+    COUNT(DISTINCT turn_id) + COALESCE(SUM(turn_id IS NULL), 0) AS turns,
+    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+    COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+    COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+    COALESCE(SUM(cost_usd), 0) AS cost_usd`;
+
+  const db = getDb();
+  const selectDims = dims.map((d) => `${USAGE_DIMENSIONS[d]} AS "${d}"`).join(', ');
+  const order = dims.includes('day') ? '"day" DESC' : 'cache_read_tokens DESC';
+  const buckets = db
+    .prepare(
+      `SELECT ${selectDims}, ${metrics} FROM turn_usage${clause}
+       GROUP BY ${dims.map((d) => USAGE_DIMENSIONS[d]).join(', ')}
+       ORDER BY ${order} LIMIT 1000`,
+    )
+    .all(...params) as Record<string, string | number>[];
+  const total = db.prepare(`SELECT ${metrics} FROM turn_usage${clause}`).get(...params) as Record<
+    string,
+    string | number
+  > | null;
+
+  const decorate = (
+    row: Record<string, string | number> | null,
+    label: Record<string, string>,
+  ): TurnUsageSummaryRow => {
+    const turns = Number(row?.turns ?? 0);
+    const per = (n: unknown): number => (turns > 0 ? Math.round(Number(n ?? 0) / turns) : 0);
+    return {
+      ...label,
+      ...row,
+      turns,
+      cost_usd: Math.round(Number(row?.cost_usd ?? 0) * 10_000) / 10_000,
+      input_per_turn: per(row?.input_tokens),
+      cache_read_per_turn: per(row?.cache_read_tokens),
+      output_per_turn: per(row?.output_tokens),
+    };
+  };
+
+  const rows = buckets.map((b) => decorate(b, {}));
+  // The TOTAL row is emitted even for an empty ledger (all zeros) — "no usage
+  // in this window" and "the query returned nothing because it is broken"
+  // must not look identical to an operator.
+  const totalLabel = Object.fromEntries(dims.map((d, i) => [d, i === 0 ? 'TOTAL' : '']));
+  rows.push(decorate(total, totalLabel));
+  return rows;
 }
 
 const TURN_USAGE_RETENTION_DAYS = 30;
