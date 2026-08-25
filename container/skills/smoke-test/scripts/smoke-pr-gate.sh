@@ -952,7 +952,11 @@ if [ "$COMMAND" = "finish" ]; then
             # finished", so `written` must reflect the WHOLE handoff, not
             # just the artifact files.
             HANDOFF_WRITTEN=false
-            HANDOFF_REASON="ledger append failed after retry — develop gate will not see this outcome until a manual sync or a later re-finish"
+            # NOT "a later re-finish": this path still clears the slot below,
+            # so a second `finish` is refused as not-the-active-run. Naming a
+            # recovery the code forbids sends an operator down a dead end at
+            # the exact moment the develop gate is blind to this verdict.
+            HANDOFF_REASON="ledger append failed after retry — the develop gate cannot see this outcome. A re-finish will be REFUSED (the slot is cleared): append the ledger line by hand, or reconcile the gate state manually"
           fi
         fi
       fi

@@ -3,7 +3,12 @@
 Template for the recurring scheduled task registered to the coordinator agent.
 Angle-bracket values are deployment configuration; the deployed prompt in the
 task row stays short and defers to the group's standing instructions plus this
-skill. Register it with `quietStatus: true` and `chatLimit: 1`.
+skill. Register it with `quietStatus: true` and `chatLimit: 8`.
+
+`chatLimit: 1` physically drops the verdict — the contract is the root post,
+one reply per browser lane whose evidence became durable, the verdict, and the
+fix hand-off, and a budget of 1 cannot carry that. See the posting contract in
+the skill; around 8 fits it.
 
 The deterministic pre-task gate has already run. Its JSON is in
 `scriptOutput`. Follow the coordinator's standing instructions and read the
@@ -27,24 +32,26 @@ For `develop_build_settled`:
    record plus immutable coverage manifest before testing. Use the GitHub
    compare from `previousCompletedSha` to `sourceSha` to identify changed
    surfaces. Default to `audit`; expand to `full` only under the skill's
-   escalation rules. Also write `completion-contract.json` before dispatch:
+   escalation rules. Then write the completion contract before dispatch —
+   **through the scaffold, never by hand**:
 
-   ```json
-   {
-     "schemaVersion": 1,
-     "sourceSha": "<sourceSha>",
-     "requiredLaneMarkers": [
-       "coordinator/browser.complete.json",
-       "coordinator/source.complete.json",
-       "challenger/challenge.complete.json"
-     ]
-   }
+   ```bash
+   SMOKE_LANE_ROLE=coordinator \
+   bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh contract \
+     <run-dir> <sourceSha> B1:browser:'<title>' S1:source:'<title>' ...
    ```
 
-   Adjust the marker list to the immutable manifest, but never remove the real
-   browser marker for a user-visible change. Every marker must contain the same
-   `sourceSha`, a terminal `status`, and `completedAt`.
-3. Use the task's one allowed chat send for exactly one channel-root message:
+   A freehand contract drifts from what the barrier validates, and the
+   barrier's failure mode is silent — it returns `ready:false` for the run's
+   life while the run proceeds on self-discipline. Declare every lane the run
+   is committing to; markers land at `markers/<lane-id>.json` and take their
+   `sourceSha` and `generation` from the contract, never from the caller.
+
+   Declare **coordinator lanes only**. The barrier deliberately does not wait
+   on challenger output — the challenger must never queue behind the lanes it
+   exists to challenge — so a challenger marker in the required set would
+   stall the run forever.
+3. Use the task's chat budget for the channel-root message:
    `<COORDINATOR> SMOKE <runId> — STARTED`. Include the exact SHA, dev
    environment, scope, run-record path, and browser/auth lease owner. Mention
    the challenger agent with its independent challenge assignment and tell it
