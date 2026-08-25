@@ -8,6 +8,17 @@ mkdir -p "$FIXTURE_DIR"
 
 SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 OTHER_SHA="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+# Every legitimate caller of the scaffold is coordinator-side; the role checks
+# below are the only cases that override this.
+export SMOKE_LANE_ROLE=coordinator
+# ...and holds the gate. The scaffold reads the gate's own state file rather
+# than taking a second token: `activeRunId` IS the fencing token.
+GATE_STATE="$(mktemp -d)"
+export SMOKE_GATE_STATE_DIR="$GATE_STATE"
+gate_owns() {
+  printf '{"schemaVersion":1,"pr":5,"activeRunId":"%s"}\n' "$1" > "$GATE_STATE/pr-5-state.json"
+}
+gate_owns "$(basename "$FIXTURE_DIR")"
 scaffold() { bash "$SCRIPT_DIR/smoke-run-scaffold.sh" "$@"; }
 barrier() { bash "$SCRIPT_DIR/smoke-evidence-barrier.sh" "$@"; }
 
@@ -59,6 +70,54 @@ if scaffold marker "$FIXTURE_DIR" B9 pass >/dev/null 2>&1; then
   echo "expected an undeclared lane to be refused" >&2
   exit 1
 fi
+
+# P1 regression: the writer's ROLE gates the coordinator-owned paths. A
+# challenger-side worker on the right sourceSha writing a DECLARED lane passed
+# every other check here — which is exactly what happened three times in one
+# run on 2026-08-20 and twice more on 2026-08-22, once destroying a real
+# coordinator marker. Refusing to resolve the path is the fix; briefing workers
+# not to write it is the mitigation that already failed twice.
+for role_case in challenger "" bogus; do
+  ROLE_OUT="$(SMOKE_LANE_ROLE="$role_case" scaffold marker "$FIXTURE_DIR" B1 pass 'challenger conclusion' 2>&1 || true)"
+  jq -e '.ok == false and (.error | test("SMOKE_LANE_ROLE"))' <<<"$ROLE_OUT" >/dev/null || {
+    echo "expected SMOKE_LANE_ROLE='$role_case' to be refused a coordinator marker, got: $ROLE_OUT" >&2
+    exit 1
+  }
+  if [ -e "$FIXTURE_DIR/markers/B1.json" ]; then
+    echo "expected the refused write to leave no marker behind" >&2; exit 1
+  fi
+  # The contract is coordinator-owned for the same reason: a rival re-scaffold
+  # rewrites every lane definition and invalidates every marker.
+  ROLE_OUT="$(SMOKE_LANE_ROLE="$role_case" scaffold contract "$FIXTURE_DIR" "$OTHER_SHA" Z9:source 2>&1 || true)"
+  jq -e '.ok == false and (.error | test("SMOKE_LANE_ROLE"))' <<<"$ROLE_OUT" >/dev/null || {
+    echo "expected SMOKE_LANE_ROLE='$role_case' to be refused the contract, got: $ROLE_OUT" >&2
+    exit 1
+  }
+  jq -e --arg sha "$SHA" '.sourceSha == $sha' "$FIXTURE_DIR/completion-contract.json" >/dev/null
+done
+
+# P1 regression: being the right ROLE is not the same as still OWNING the run.
+# `--takeover` (and an ordinary stale reclaim) flips the gate's activeRunId and
+# nothing else — a displaced coordinator kept writing markers into the run tree
+# its successor was now using, which is where pr1105's damage happened. Fail
+# closed on a state dir that cannot be read at all, too: an unverifiable claim
+# is not a claim.
+gate_owns "some-other-run"
+for FENCE_VERB in marker contract; do
+  case "$FENCE_VERB" in
+    marker)   OUT="$(scaffold marker "$FIXTURE_DIR" B1 pass 'displaced write' 2>&1 || true)" ;;
+    contract) OUT="$(scaffold contract "$FIXTURE_DIR" "$OTHER_SHA" Z9:source 2>&1 || true)" ;;
+  esac
+  jq -e '.ok == false and (.error | test("does not hold the gate")) and (.error | test("STOP"))' \
+    <<<"$OUT" >/dev/null || {
+    echo "expected a displaced run to be refused $FENCE_VERB, got: $OUT" >&2; exit 1; }
+done
+[ -e "$FIXTURE_DIR/markers/B1.json" ] && { echo "displaced marker was written" >&2; exit 1; } || true
+jq -e --arg sha "$SHA" '.sourceSha == $sha' "$FIXTURE_DIR/completion-contract.json" >/dev/null
+OUT="$(SMOKE_GATE_STATE_DIR= scaffold marker "$FIXTURE_DIR" B1 pass 2>&1 || true)"
+jq -e '.ok == false and (.error | test("SMOKE_GATE_STATE_DIR"))' <<<"$OUT" >/dev/null || {
+  echo "expected an unverifiable gate claim to fail closed, got: $OUT" >&2; exit 1; }
+gate_owns "$(basename "$FIXTURE_DIR")"
 
 scaffold marker "$FIXTURE_DIR" B1 fail 'three P1 defects' 'screenshots/a.png,evidence/b.json' \
   | jq -e '.ok == true' >/dev/null

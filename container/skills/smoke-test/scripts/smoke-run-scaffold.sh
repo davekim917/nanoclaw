@@ -26,6 +26,54 @@ die() { jq -cn --arg e "$1" '{ok:false,error:$e}'; exit 2; }
 
 iso_now() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 
+# The contract and the lane markers are COORDINATOR-owned slots, and until now
+# nothing here had any notion of WHO was writing: a challenger-side worker on
+# the right sourceSha, writing a lane the contract had declared, passed every
+# other check. That is not theoretical — it happened three times in one run on
+# 2026-08-20 (lanes S2, B1, B2) and twice more on 2026-08-22, once overwriting
+# a real coordinator marker. Had the barrier fired in that window, a
+# challenger's independent conclusion would have counted as the coordinator's
+# own lane, collapsing the two-lane contract into one source while the run
+# record still claimed two. Briefs telling workers not to do it are a
+# mitigation; refusing to resolve the path is the fix.
+#
+# Fail closed on an unset role. A missing marker is loud — the barrier names it
+# in `missing[]` and the run stalls visibly. A wrongly attributed one is
+# silent, which is the failure this exists to make impossible.
+require_coordinator_role() {
+  case "${SMOKE_LANE_ROLE:-}" in
+    coordinator) ;;
+    challenger)
+      die "SMOKE_LANE_ROLE=challenger may not write $1 — challenger output belongs under challenger/, and the barrier never waits on it" ;;
+    "")
+      die "SMOKE_LANE_ROLE is unset — export it as the writing worker's role (coordinator|challenger) before writing $1" ;;
+    *)
+      die "SMOKE_LANE_ROLE must be 'coordinator' or 'challenger' (got: ${SMOKE_LANE_ROLE})" ;;
+  esac
+}
+
+# Being the right role is not the same as still owning the run. `--takeover`
+# (and an ordinary stale reclaim) flips the gate's `activeRunId` and nothing
+# else — a displaced coordinator does not find out until its NEXT gate verb, and
+# in the meantime it keeps writing markers into the run tree the successor is
+# now using. `activeRunId` already IS the fencing token for progress/finish;
+# this makes it fence the artifact writes too.
+#
+# ponytail: the run id is the run directory's basename, which is the id the
+# contract itself already records (`runId: $(basename $RUN_DIR)`) and the layout
+# SKILL.md pins. No second token scheme.
+require_active_run() {
+  local state_dir="${SMOKE_GATE_STATE_DIR:-}" run_id f
+  run_id="$(basename "$RUN_DIR")"
+  [ -n "$state_dir" ] ||
+    die "SMOKE_GATE_STATE_DIR is unset — the run's gate claim cannot be verified, so $1 is refused"
+  for f in "$state_dir"/pr-*-state.json "$state_dir"/develop-state.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r '.activeRunId // empty' "$f" 2>/dev/null)" = "$run_id" ] && return 0
+  done
+  die "run '$run_id' does not hold the gate — it was reclaimed or taken over. STOP this campaign; do not write $1"
+}
+
 [ -n "$COMMAND" ] || die "usage: smoke-run-scaffold.sh <contract|marker> <run-dir> ..."
 [ -n "$RUN_DIR" ] || die "a run directory is required"
 
@@ -33,6 +81,8 @@ CONTRACT="$RUN_DIR/completion-contract.json"
 
 case "$COMMAND" in
 contract)
+  require_coordinator_role "the completion contract"
+  require_active_run "the completion contract"
   SOURCE_SHA="${3:-}"
   shift 3 || die "contract requires a run dir, a source SHA, and at least one lane"
   printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$' ||
@@ -84,6 +134,8 @@ contract)
   ;;
 
 marker)
+  require_coordinator_role "a coordinator lane marker"
+  require_active_run "a coordinator lane marker"
   LANE="${3:-}"
   STATUS="${4:-}"
   SUMMARY="${5:-}"

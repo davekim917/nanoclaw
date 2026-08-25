@@ -331,13 +331,112 @@ bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for
 # --- 7. claim/progress/release lifecycle ------------------------------------
 fresh_state
 CLAIM_SHA="$(sha 2)"
-bash "$GATE" claim run-x 5 "$CLAIM_SHA" | jq -e '.ok == true and .pr == 5' >/dev/null
+bash "$GATE" claim run-x 5 "$CLAIM_SHA" | jq -e '.ok == true and .pr == 5 and .tookOverFrom == null' >/dev/null
 bash "$GATE" claim run-y 5 "$CLAIM_SHA" | jq -e '.ok == false' >/dev/null   # slot already owned
 bash "$GATE" progress run-wrong | jq -e '.ok == false and .pr == null' >/dev/null
 bash "$GATE" progress run-x | jq -e '.ok == true and .pr == 5' >/dev/null
 jq -e '.activeProgressAt != null' "$STATE_DIR/pr-5-state.json" >/dev/null
 bash "$GATE" release run-x | jq -e '.ok == true and .releasedRunId == "run-x"' >/dev/null
 jq -e '.activeSha == null and .activeRunId == null' "$STATE_DIR/pr-5-state.json" >/dev/null
+
+# --- 7b. P1 regression: a stamping run keeps its slot past the age ceiling.
+# ACTIVE_STALE_SECONDS used to be ANDed into liveness, so a coordinator that
+# had stamped `progress` four minutes earlier went "not live" the instant it
+# crossed 4h — and the next claim/poll started a SECOND coordinator on the
+# same PR and the same frozen SHA with nothing telling the first. That is
+# exactly how run …-20260822T023125Z was displaced at 4h00m03s, after which
+# two coordinators drove the same seat for hours and no verdict was ever
+# published. Simulated by setting the ceiling to 0, which makes every active
+# run instantly "overrun".
+fresh_state
+DUP_SHA="$(sha 9)"
+bash "$GATE" claim run-orig-live 55 "$DUP_SHA" | jq -e '.ok == true' >/dev/null
+bash "$GATE" progress run-orig-live | jq -e '.ok == true' >/dev/null
+export SMOKE_GATE_ACTIVE_STALE_SECONDS=0
+# Same PR, same SHA, new run id — the rival's exact shape. Refused, and the
+# refusal says how a human forces it rather than leaving them to guess.
+bash "$GATE" claim run-rival 55 "$DUP_SHA" | jq -e '
+  .ok == false and .pr == 55 and .activeRunId == "run-orig-live" and
+  (.error | test("--takeover")) and .activeAgeSeconds >= 0
+' >/dev/null
+jq -e '.activeRunId == "run-orig-live"' "$STATE_DIR/pr-55-state.json" >/dev/null
+# `poll` never takes over either: with the slot held, PR 55 is not a candidate.
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_PR_LIST="[{\"number\":55,\"headRefOid\":\"$DUP_SHA\",\"headRefName\":\"feature/dup\"}]"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$DUP_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-55\",\"name\":\"XZO-DEV-BACKEND PR #55\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-55.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$DUP_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+# ...but the ceiling still RINGS. It was demoted from executioner to alarm, not
+# deleted: a zombie stamper (heartbeat alive, work wedged in a retry loop or a
+# hung browser) must not hold the slot in silence just because no rival happens
+# to claim. One wake per overrun run, then latched.
+bash "$GATE" poll | jq -e --arg sha "$DUP_SHA" '
+  .wakeAgent == true and .data.trigger == "pr_run_overrun" and
+  .data.pr == 55 and .data.runId == "run-orig-live" and
+  .data.sourceSha == $sha and .data.activeAgeSeconds >= 0
+' >/dev/null
+jq -e '.overrunAlertRunId == "run-orig-live"' "$STATE_DIR/pr-55-state.json" >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false and .data.trigger == "waiting_for_candidates"' >/dev/null
+jq -e '.activeRunId == "run-orig-live"' "$STATE_DIR/pr-55-state.json" >/dev/null
+# Control, so the assertion above cannot pass vacuously: this fixture IS a real
+# settle candidate. Free the slot and the very same poll wakes and auto-claims.
+bash "$GATE" release run-orig-live | jq -e '.ok == true' >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "pr_build_settled"' >/dev/null
+POLL_RUN="$(jq -r '.activeRunId' "$STATE_DIR/pr-55-state.json")"
+# An explicit human --takeover past the ceiling still works, and says so.
+bash "$GATE" claim run-rival 55 "$DUP_SHA" --takeover | jq -e --arg prev "$POLL_RUN" '
+  .ok == true and .runId == "run-rival" and .tookOverFrom == $prev
+' >/dev/null
+# The displacement is LOUD. A shell gate cannot kill the incumbent's container,
+# so the displaced run's next gate verb is the only channel that reaches it —
+# it must carry a stop instruction, not just "not the active run".
+jq -e --arg prev "$POLL_RUN" '
+  .displacedRunId == $prev and .displacedAt != null
+' "$STATE_DIR/pr-55-state.json" >/dev/null
+for VERB in progress release; do
+  OUT="$(bash "$GATE" "$VERB" "$POLL_RUN")"
+  jq -e '
+    .ok == false and (.error | test("STOP THIS CAMPAIGN")) and
+    (.error | test("--takeover")) and .pr == 55 and .activeRunId == "run-rival"
+  ' <<<"$OUT" >/dev/null || { echo "expected $VERB to hand the displaced run a stop instruction, got: $OUT" >&2; exit 1; }
+done
+OUT="$(bash "$GATE" finish "$DUP_SHA" "$POLL_RUN" GO)"
+jq -e '.ok == false and (.error | test("STOP THIS CAMPAIGN"))' <<<"$OUT" >/dev/null
+[ ! -e "$STATE_DIR/pr-55-verdict.json" ]
+# An unrelated stale run id still gets the ordinary refusal, not a stop order.
+bash "$GATE" progress some-other-run | jq -e '
+  .ok == false and .pr == null and (.error | test("STOP") | not)
+' >/dev/null
+# An ordinary (non-takeover) claim clears the name so it can never mis-accuse.
+bash "$GATE" release run-rival >/dev/null
+bash "$GATE" claim run-clean 55 "$DUP_SHA" >/dev/null
+jq -e '.displacedRunId == null and .displacedAt == null' "$STATE_DIR/pr-55-state.json" >/dev/null
+bash "$GATE" release run-clean >/dev/null
+bash "$GATE" claim run-rival 55 "$DUP_SHA" >/dev/null
+# An explicit --takeover works BELOW the ceiling too. This assertion was the
+# reverse earlier in this same change; an adversarial review pointed out that
+# gating the flag on the ceiling removed the operator's only lever during the
+# first hours of a wedged campaign, while protecting against nothing a
+# deliberate human flag does not already imply. A bare claim is still refused.
+unset SMOKE_GATE_ACTIVE_STALE_SECONDS
+bash "$GATE" claim run-third 55 "$DUP_SHA" --takeover | jq -e '
+  .ok == true and .tookOverFrom == "run-rival"
+' >/dev/null
+bash "$GATE" release run-third >/dev/null
+bash "$GATE" claim run-rival 55 "$DUP_SHA" >/dev/null
+bash "$GATE" claim run-third 55 "$DUP_SHA" | jq -e '
+  .ok == false and (.error | test("wait for it or ask its coordinator"))
+' >/dev/null
+# A genuinely dead run (no stamp inside the liveness window) is still
+# reclaimed automatically — the recovery path this fix must not break.
+export SMOKE_GATE_PROGRESS_STALE_SECONDS=0
+bash "$GATE" claim run-fourth 55 "$DUP_SHA" | jq -e '
+  .ok == true and .tookOverFrom == null
+' >/dev/null
+unset SMOKE_GATE_PROGRESS_STALE_SECONDS
 
 # --- 8. finish suspends the backend preview ---------------------------------
 fresh_state
@@ -477,6 +576,22 @@ jq -e --arg target "$TARGET_SHA" --arg freeze "$FREEZE_HEAD_SHA" --argjson pr 60
   .verdict == "NO_GO" and .runId == $run
 ' "$DEV_LEDGER" >/dev/null
 
+# --- 12b. HUMAN_DECISION RAISES the hold (owner decision 2026-08-25). It used
+# to leave the hold untouched — default-open — so a verdict whose literal
+# meaning is "the system does not know whether this is safe" behaved as GO on
+# precisely the cases flagged as needing judgment. `reason` distinguishes it
+# from a defects hold. BLOCKED is deliberately unchanged.
+bash "$GATE" claim run-freeze-hd 60 "$FREEZE_HEAD_SHA" >/dev/null
+bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-hd HUMAN_DECISION | jq -e '.ok == true' >/dev/null
+jq -e --arg sha "$TARGET_SHA" '
+  .sha == $sha and .verdict == "HUMAN_DECISION" and .runId == "run-freeze-hd" and
+  .reason == "needs_human_decision"
+' "$DEV_HOLD" >/dev/null
+# BLOCKED still leaves whatever hold is standing exactly as it was.
+bash "$GATE" claim run-freeze-bl 60 "$FREEZE_HEAD_SHA" >/dev/null
+bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-bl BLOCKED | jq -e '.ok == true' >/dev/null
+jq -e '.runId == "run-freeze-hd" and .verdict == "HUMAN_DECISION"' "$DEV_HOLD" >/dev/null
+
 # --- 13. GO clears the hold, keyed the same way.
 bash "$GATE" claim run-freeze-2 60 "$FREEZE_HEAD_SHA" >/dev/null
 bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-2 GO | jq -e --arg target "$TARGET_SHA" '
@@ -485,7 +600,7 @@ bash "$GATE" finish "$FREEZE_HEAD_SHA" run-freeze-2 GO | jq -e --arg target "$TA
 [ ! -e "$DEV_HOLD" ]
 # The ledger records BOTH outcomes (append-only) so the develop gate's dedup
 # advance always reads the most recent one.
-[ "$(wc -l < "$DEV_LEDGER")" -eq 2 ]
+[ "$(wc -l < "$DEV_LEDGER")" -eq 4 ]
 
 # --- 14. Non-freeze PRs never touch publish/hold/ledger, even when the
 # wrapper has them configured — "never touch them" is unconditional, not
