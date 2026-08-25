@@ -283,8 +283,10 @@ type ImageGenerationThreadItem = {
 };
 
 /**
- * `TokenUsageBreakdown` from the codex app-server protocol (`thread/tokenUsage/updated`
- * notification's `tokenUsage.last`). Fleet Hardening Phase 0.1 — see
+ * `TokenUsageBreakdown` from the codex app-server protocol — the shape of BOTH
+ * `tokenUsage.last` and `tokenUsage.total` on the `thread/tokenUsage/updated`
+ * notification. Field list verified against the codex 0.145.0 binary's own
+ * generated `TokenUsageBreakdown.ts`. Fleet Hardening Phase 0.1 — see
  * TurnUsageInfo in providers/types.ts.
  */
 type CodexTokenUsageBreakdown = {
@@ -1340,15 +1342,21 @@ export async function* runOneTurn(
   // best signal this protocol exposes rather than a guess.
   let itemCompletedCount = 0;
   // Fleet Hardening Phase 0.1 (see TurnUsageInfo). `thread/tokenUsage/updated`
-  // notifications fire zero or more times per turn as the app-server updates
-  // its running total; `last` is the breakdown for the most recent turn, so
-  // the latest notification received before turn/completed is authoritative.
+  // fires once per MODEL REQUEST, and a turn makes as many requests as it
+  // takes tool-calling round trips — so `last` (that one request) is NOT the
+  // turn, and recording it undercounted codex by ~1-2 orders of magnitude.
+  // `total` is the thread's running total; the delta between consecutive
+  // turns is this turn's usage, computed by turn-usage.ts's toTurnDelta (the
+  // same transform Claude's stream-cumulative report goes through).
+  // Deliberately no fallback to `last` when `total` is absent: `last` is not
+  // cumulative, so routing it through the delta transform would silently
+  // reproduce the undercount. A NULL-token row keeps the gap visible.
   // No cost field exists on this protocol (ChatGPT-plan billing, not
   // per-token pricing) — cost_usd stays NULL for codex. Object-property ref
   // (not a bare `let`) for the same reason as `turnState` above — TS can't
   // track closure assignments for narrowing, but property access keeps the
   // declared type visible.
-  const tokenUsageState: { last: CodexTokenUsageBreakdown | null } = { last: null };
+  const tokenUsageState: { total: CodexTokenUsageBreakdown | null } = { total: null };
   // Codex can deliver reasoning two ways: streaming item/reasoning/* deltas
   // when enabled by the app-server, or finalized reasoning ThreadItems via
   // item/completed. Streamed item IDs are tracked so lifecycle fallback
@@ -1650,11 +1658,12 @@ export async function* runOneTurn(
         break;
       }
       case 'thread/tokenUsage/updated': {
-        // See lastTokenUsage declaration above — `last` is this turn's
-        // breakdown; later notifications for the same turn supersede earlier
-        // ones.
-        const usage = (params as { tokenUsage?: { last?: CodexTokenUsageBreakdown } }).tokenUsage;
-        if (usage?.last) tokenUsageState.last = usage.last;
+        // See tokenUsageState above — `last` is ONE model request, `total` is
+        // the thread's running total. This notification fires per request, so
+        // the newest `total` before turn/completed is the thread total
+        // through this turn and is what gets recorded (deltaed downstream).
+        const usage = (params as { tokenUsage?: { total?: CodexTokenUsageBreakdown } }).tokenUsage;
+        if (usage?.total) tokenUsageState.total = usage.total;
         break;
       }
       case 'item/started': {
@@ -1837,13 +1846,14 @@ export async function* runOneTurn(
     yield {
       type: 'result',
       text: resultText || null,
-      usage: tokenUsageState.last
+      // Thread-cumulative — turn-usage.ts converts it to this turn's delta.
+      usage: tokenUsageState.total
         ? {
             model,
-            inputTokens: tokenUsageState.last.inputTokens,
-            outputTokens: tokenUsageState.last.outputTokens,
-            cacheReadTokens: tokenUsageState.last.cachedInputTokens,
-            cacheWriteTokens: tokenUsageState.last.cacheWriteInputTokens,
+            inputTokens: tokenUsageState.total.inputTokens,
+            outputTokens: tokenUsageState.total.outputTokens,
+            cacheReadTokens: tokenUsageState.total.cachedInputTokens,
+            cacheWriteTokens: tokenUsageState.total.cacheWriteInputTokens,
             costUsd: null,
           }
         : undefined,
