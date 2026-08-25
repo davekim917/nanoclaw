@@ -5,6 +5,7 @@
  *
  * Real temp SQLite files, real trees, no mocking of `better-sqlite3`.
  */
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,8 +14,10 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { GENERATED_MEMORY_RELATIVE_PATH } from './curator-contract.js';
+import { STOP_WORDS } from './graph-scent.js';
 import {
   _recallProjectionWarmForTest,
+  _resetFrozenBoundsForTest,
   _resetRecallProjectionForTest,
   _resetTokenStreamCacheForTest,
   _setRecallProjectionTestHooks,
@@ -22,9 +25,12 @@ import {
   frozenBoundsJson,
   LANE_EXCERPT_CHARS,
   PRE_TURN_BOUNDS,
+  RECALL_PROJECTION_BOUNDS,
+  TOKENIZER_PROBES,
   projectionTreeStaleness,
   readMemoryEvidence,
   tokenizeForRecall,
+  tokenStreamForRecall,
   warmRecallProjection,
   type ContextNotice,
   type PreTurnContext,
@@ -69,6 +75,9 @@ function ledger(...lines: string[]): string {
 }
 
 const WORKGROUP = 'wg-read';
+
+/** Committed shape of `canonicalToken`; see the drift test at the bottom. */
+const RULE_TABLE_DIGEST = '4fe6d6405312ba1f';
 
 interface Served {
   evidence: PreTurnContext['memoryEvidence'];
@@ -420,6 +429,118 @@ describe('P2.5-AC6 staleness is detected for every writer class', () => {
       expect(after.mtimeNs).toBe(before.mtimeNs);
       expect(stalenessOf(root, dataDir)).toBe('added: domain/ledgers-renamed.md');
     }
+  });
+
+  // The warm mark says the projection was fresh when it was last VERIFIED,
+  // which can be a minute ago. Without a staleness check on the serve path a
+  // curator write moments before the turn is served the pre-write candidate set
+  // under a clean `hit`, and a just-captured fact is unrecallable until the TTL
+  // expires. This is the case the differential harness structurally cannot
+  // express: it never mutates the tree between warming and serving.
+  it('a write landing AFTER warming is not served from the pre-write projection', () => {
+    const root = adversarialTree();
+    const dataDir = buildProjection(root);
+    attach(dataDir);
+    expect(warmRecallProjection(WORKGROUP, root).warm).toBe(true);
+    // Warm and fresh right now.
+    expect(serve(root, 'zebra-quorum').stats.recallPath).toBe('hit');
+
+    // The curator appends a fact one instant later. No warming pass runs, no
+    // TTL expires, the index file is untouched — only the tree moved.
+    const ledgerPath = path.join(root, GENERATED_MEMORY_RELATIVE_PATH);
+    fs.writeFileSync(
+      ledgerPath,
+      `${fs.readFileSync(ledgerPath, 'utf8')}${factLine('The zebra-quorum threshold is nine.', 'mem_00000000000000e1', '2026-08-25T00:00:00Z')}\n`,
+    );
+
+    const served = serve(root, 'zebra-quorum');
+    expect(served.stats.recallPath).toBe('stale');
+    expect(served.stats.recallReason).toMatch(/^stale: changed: generated\/memory\.md$/);
+    // And the fallback actually delivers the new fact, so the turn is correct
+    // and not merely labelled correctly.
+    expect(served.evidence.excerpts.some((row) => row.text.includes('zebra-quorum threshold is nine'))).toBe(true);
+    expect(_recallProjectionWarmForTest(WORKGROUP)).toBe(false);
+  });
+
+  it('backs off instead of re-walking the tree on every turn while a projection stays stale', () => {
+    const root = adversarialTree();
+    const dataDir = buildProjection(root);
+    let now = 1_000_000;
+    const queue: Array<() => void> = [];
+    _setRecallProjectionTestHooks({
+      dataDir,
+      clock: () => now,
+      schedule: (run) => {
+        queue.push(run);
+      },
+    });
+    expect(warmRecallProjection(WORKGROUP, root).warm).toBe(true);
+    writeFile(root, 'concepts/added.md', '# Added\n\nA routing seam note.\n');
+    expect(serve(root, 'routing seam').stats.recallPath).toBe('stale');
+
+    // Only a rebuild can clear this, and a rebuild changes the index identity.
+    // Until then the turn must not queue a fresh tree walk every time.
+    const statSync = vi.spyOn(fs, 'statSync');
+    for (let turn = 0; turn < 5; turn++) expect(serve(root, 'routing seam').stats.recallPath).toBe('stale');
+    const bigintStats = statSync.mock.calls.filter(
+      (call) => (call[1] as { bigint?: boolean } | undefined)?.bigint === true,
+    ).length;
+    statSync.mockRestore();
+    expect(bigintStats).toBe(0);
+    expect(queue).toHaveLength(0);
+
+    // The window is a FLOOR on wasted walks, not a mute: once it elapses the
+    // next turn re-verifies. Suppression alone is also what a backoff with an
+    // inverted comparison or a mistyped constant would produce, so the
+    // expiry is asserted rather than assumed.
+    now += RECALL_PROJECTION_BOUNDS.refusalBackoffMs;
+    expect(serve(root, 'routing seam').stats.recallPath).toBe('stale');
+    expect(queue).toHaveLength(1);
+    queue.shift()!();
+
+    // A rebuild lifts the backoff immediately — recovery does not wait it out.
+    buildAndPromoteProjection({ root, directory: projectionDir(WORKGROUP, dataDir) });
+    expect(serve(root, 'routing seam').stats.recallPath).toBe('stale');
+    expect(queue).toHaveLength(1);
+    queue.shift()!();
+    expect(serve(root, 'routing seam').stats.recallPath).toBe('hit');
+  });
+
+  // The backoff must not swallow a TRANSIENT refusal. A warming pass that
+  // overran its budget because the box was busy says nothing about the file;
+  // re-verifying next turn is the whole self-healing story graph-scent's design
+  // rests on. Only a refusal that needs a rebuild may suppress the retry.
+  it('does not back off after a transient slow refusal', () => {
+    const root = adversarialTree();
+    const dataDir = buildProjection(root);
+    // Frozen: every retry below happens at the SAME instant, so nothing but the
+    // refusal's class can be what allows it through.
+    const now = 1_000_000;
+    const queue: Array<() => void> = [];
+    _setRecallProjectionTestHooks({
+      dataDir,
+      clock: () => now,
+      schedule: (run) => {
+        queue.push(run);
+      },
+      // Zero budget: every pass overruns, so every refusal is `slow:`.
+      warmBudgetMs: -1,
+    });
+    expect(warmRecallProjection(WORKGROUP, root).reason).toMatch(/^slow: /);
+
+    // Same index file, same instant — a rebuild-required refusal would suppress
+    // these. A transient one must not.
+    for (let turn = 0; turn < 3; turn++) {
+      expect(serve(root, 'routing seam').stats.recallPath).toBe('cold');
+      expect(queue).toHaveLength(1);
+      queue.shift()!();
+    }
+
+    // And once the machine recovers, the very next turn re-verifies and serves.
+    _setRecallProjectionTestHooks({ warmBudgetMs: 60_000 });
+    expect(serve(root, 'routing seam').stats.recallPath).toBe('cold');
+    queue.shift()!();
+    expect(serve(root, 'routing seam').stats.recallPath).toBe('hit');
   });
 
   it('refuses to warm a stale projection, and the turn reports stale rather than hit', () => {
@@ -889,37 +1010,69 @@ describe('P2.5-AC14/AC15 warmth never blocks a turn and is re-established off th
 });
 
 describe('P2.5-AC16 the shared byte budget forces a fallback, not divergent output', () => {
-  it('read-time: a projection whose frozen scan no longer fits the budget falls back', () => {
-    const root = adversarialTree();
-    const expected = (() => {
-      attach(scratch('empty'));
-      return serve(root, 'routing seam delivery');
-    })();
-    _resetRecallProjectionForTest();
-
-    const dataDir = buildProjection(root);
+  function buildScannedBytes(dataDir: string): number {
     const db = openProjectionDb(projectionPath(WORKGROUP, dataDir), frozenBoundsJson())!;
     const scanned = Number(
       (db.prepare("SELECT value FROM meta WHERE key='scanned_bytes'").get() as { value: string }).value,
     );
     db.close();
+    return scanned;
+  }
 
+  it('read-time: a projection whose frozen scan no longer fits the budget falls back', () => {
+    const root = adversarialTree();
+    const expected = (() => {
+      attach(scratch('empty'));
+      return serve(root, 'routing seam delivery', { bootstrap: true });
+    })();
+    _resetRecallProjectionForTest();
+
+    const dataDir = buildProjection(root);
+    const scanned = buildScannedBytes(dataDir);
     attach(dataDir);
     expect(warmRecallProjection(WORKGROUP, root).warm).toBe(true);
-    // Budget exactly at what the build consumed: the preference lane's own cap
-    // alone now pushes a turn over it, so the live scan could truncate where
-    // the build did not.
+
+    // Budget exactly at what the build consumed: any byte the core lane spends
+    // first now pushes the turn over, so the live scan could truncate where the
+    // build did not.
     _setRecallProjectionTestHooks({ scannedBytesBudget: scanned });
-    const served = serve(root, 'routing seam delivery');
+    const served = serve(root, 'routing seam delivery', { bootstrap: true });
     expect(served.stats.recallPath).toBe('fallback');
     expect(served.stats.recallReason).toMatch(/^byte-budget: /);
     expect(JSON.stringify(served.evidence)).toBe(JSON.stringify(expected.evidence));
-
-    // One byte of headroom above the preference cap and it serves again.
-    _setRecallProjectionTestHooks({
-      scannedBytesBudget: scanned + PRE_TURN_BOUNDS.preferenceExcerpts * PRE_TURN_BOUNDS.markdownFileBytes,
-    });
+    // The same turn with no bootstrap spends nothing before the scan, so the
+    // identical budget serves — the assertion tracks REAL spend, not a bound.
     expect(serve(root, 'routing seam delivery').stats.recallPath).toBe('hit');
+  });
+
+  // The assertion used to add `preferenceExcerpts * markdownFileBytes` as an
+  // upper bound on the preference lane instead of using its real spend. That
+  // bound held only because the preference call site omits `readBoundedFile`'s
+  // fourth argument and inherits its default — a silent coupling that would
+  // have broken the assertion, not any test, if the default ever moved. The
+  // assertion now reads the actual bytes, so there is no premise left to break;
+  // this pins that the boundary really does move with real preference spend.
+  it('read-time: the boundary tracks the preference lane real spend, not its cap', () => {
+    const root = scratch('prefspend');
+    writeFile(root, 'concepts/routing.md', '# Routing\n\nThe routing seam hands to delivery.\n');
+    const preference = `# Pat\n\n${'Prefers terse routing answers. '.repeat(400)}\n`;
+    writeFile(root, 'preferences/pat-quinn.md', preference);
+    const dataDir = buildProjection(root);
+    const scanned = buildScannedBytes(dataDir);
+    attach(dataDir);
+    expect(warmRecallProjection(WORKGROUP, root).warm).toBe(true);
+
+    const spend = Buffer.byteLength(preference, 'utf8');
+    expect(spend).toBeGreaterThan(0);
+    // One byte short of (build + this file): the turn that reads the preference
+    // file falls back, the turn that does not still serves. Both under the SAME
+    // budget, so only the real spend can be what separates them.
+    _setRecallProjectionTestHooks({ scannedBytesBudget: scanned + spend - 1 });
+    expect(serve(root, 'routing seam', { senders: ['Pat Quinn'] }).stats.recallPath).toBe('fallback');
+    expect(serve(root, 'routing seam').stats.recallPath).toBe('hit');
+    // One more byte of budget and even the preference turn serves.
+    _setRecallProjectionTestHooks({ scannedBytesBudget: scanned + spend });
+    expect(serve(root, 'routing seam', { senders: ['Pat Quinn'] }).stats.recallPath).toBe('hit');
   });
 
   it('build-time: a scan that exhausts the budget refuses to produce a projection', () => {
@@ -1021,6 +1174,42 @@ describe('P2.5-AC19 a bounds change after a build is detectable, not silent', ()
     expect(served.stats.recallReason).toMatch(/^stale-bounds: /);
   });
 
+  // The fingerprint used to hash the tokenizer's OUTPUT on a fixed probe
+  // string. That is a sample: any change the probe happens not to exercise
+  // sails through, and the projection's persisted stream then gets primed into
+  // the process-wide cache under a live key — poisoning the FILESYSTEM path for
+  // the same text, in workgroups that have no projection at all. This is the
+  // exact shape that guard missed.
+  it('a tokenizer change the old probe agreed on still invalidates the projection', () => {
+    const root = adversarialTree();
+    const dataDir = buildProjection(root);
+    attach(dataDir);
+    expect(warmRecallProjection(WORKGROUP, root).warm).toBe(true);
+    expect(serve(root, 'routing seam').stats.recallPath).toBe('hit');
+
+    // A word that appears in the corpus and NOT in any probe string: a probe
+    // hash cannot see this edit, a definition hash cannot miss it.
+    const probe = 'Managing capabilities: providers hosted worktrees, suggestions and columns — ﬁle ① Σσ 2026-08-25.';
+    const before = JSON.stringify(tokenStreamForRecall(probe));
+    STOP_WORDS.add('seam');
+    try {
+      _resetTokenStreamCacheForTest();
+      // Precondition asserted, not assumed: the old sampled guard really would
+      // have seen no change here.
+      expect(JSON.stringify(tokenStreamForRecall(probe))).toBe(before);
+
+      _resetFrozenBoundsForTest();
+      _resetRecallProjectionForTest();
+      attach(dataDir);
+      expect(warmRecallProjection(WORKGROUP, root).reason).toMatch(/^stale-bounds: /);
+      expect(serve(root, 'routing seam').stats.recallPath).toBe('fallback');
+    } finally {
+      STOP_WORDS.delete('seam');
+      _resetFrozenBoundsForTest();
+      _resetTokenStreamCacheForTest();
+    }
+  });
+
   it('a tokenizer change is the same class of staleness and is caught the same way', () => {
     const root = adversarialTree();
     const dataDir = buildProjection(root);
@@ -1081,5 +1270,62 @@ describe('P2.5-AC20 the turn reports which source served it', () => {
       recallPath: 'fallback',
       recallReason: 'schema-version: 42',
     });
+  });
+});
+
+// The runtime fingerprint (`frozenBounds().tokenizerFingerprint`) hashes what
+// the tokenizer DOES over `TOKENIZER_PROBES` plus every stopword. Its stated
+// gap is a new rule for a word that appears in no probe and is not a stopword:
+// behaviour on the corpus is unchanged, so the fingerprint is unchanged, so a
+// stale projection keeps serving.
+//
+// This closes that gap from the test side rather than by rewriting a hot
+// function into data. It reads the rule table out of the SOURCE FILE — not via
+// `Function.prototype.toString()`, which returns transformed source and differs
+// between the host's and the build worker's pipelines (that divergence is what
+// broke the first attempt at a source-derived runtime guard). Tests run under a
+// single transform, and reading the file avoids the question entirely.
+describe('tokenizer rule table drift', () => {
+  it('fails when the stem rules change without the probe corpus changing', () => {
+    const source = fs.readFileSync(new URL('./pre-turn-context.ts', import.meta.url), 'utf8');
+    const from = source.indexOf('function canonicalToken(');
+    expect(from).toBeGreaterThan(-1);
+    const to = source.indexOf('\n}\n', from) + '\n}\n'.length;
+    const region = source.slice(from, to);
+    const digest = createHash('sha256').update(region).digest('hex').slice(0, 16);
+
+    expect(
+      digest,
+      [
+        'canonicalToken changed.',
+        '',
+        'The runtime tokenizer fingerprint only notices a rule change if it alters',
+        'the output for some string in TOKENIZER_PROBES or some stopword. A new stem',
+        'or suffix rule for a word outside that corpus is invisible to it, and every',
+        'projection built under the old rules keeps being served — with a token',
+        'stream that is now wrong, primed into the process-wide cache, where it also',
+        'corrupts the filesystem path for the same text.',
+        '',
+        'So, in THIS commit:',
+        '  1. add a word exercising the new rule to TOKENIZER_PROBES, and',
+        '  2. update RULE_TABLE_DIGEST below to the value this test reports.',
+        '',
+        'Do not just update the digest.',
+      ].join('\n'),
+    ).toBe(RULE_TABLE_DIGEST);
+  });
+
+  it('the probe corpus reaches every word the rule table names', () => {
+    // Cheap coupling in the other direction: every literal word in the stem
+    // table must appear in the corpus, so "extend TOKENIZER_PROBES" above is a
+    // checkable instruction and not just advice.
+    const source = fs.readFileSync(new URL('./pre-turn-context.ts', import.meta.url), 'utf8');
+    const from = source.indexOf('function canonicalToken(');
+    const to = source.indexOf('\n}\n', from);
+    const corpus = TOKENIZER_PROBES.join(' ').toLowerCase();
+    const missing = [...source.slice(from, to).matchAll(/\^\(\?:([a-z|]+)\)\$/g)]
+      .flatMap((match) => match[1]!.split('|'))
+      .filter((word) => !corpus.includes(word));
+    expect(missing).toEqual([]);
   });
 });

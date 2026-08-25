@@ -165,6 +165,8 @@ function project(candidate: SearchableCandidate, lane: RecallLane, scanOrder: nu
   const windows = passageWindows(candidate.searchable, LANE_EXCERPT_CHARS[lane]).map((window) => ({
     text: window.text,
     tokens: [...window.tokens],
+    start: window.start,
+    end: window.end,
   }));
   const stream = [...tokenStreamForRecall(candidate.searchable)];
   return {

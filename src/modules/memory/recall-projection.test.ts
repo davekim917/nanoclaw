@@ -201,6 +201,8 @@ describe('recall projection schema and build', () => {
       const fresh = passageWindows(source.searchable, LANE_EXCERPT_CHARS[source.lane]).map((window) => ({
         text: window.text,
         tokens: [...window.tokens],
+        start: window.start,
+        end: window.end,
       }));
       expect(candidate.windows).toEqual(fresh);
     }
@@ -301,12 +303,52 @@ describe('recall projection schema and build', () => {
       const fresh = passageWindows(original.searchable, LANE_EXCERPT_CHARS[original.lane]).map((window) => ({
         text: window.text,
         tokens: [...window.tokens],
+        start: window.start,
+        end: window.end,
       }));
       // Deep equality over value, start, end AND window ordering.
       expect(windowsEqual(candidate.windows, fresh)).toBe(true);
       expect(candidate.windows).toEqual(fresh);
       expect(candidate.stream).toEqual([...tokenStreamForRecall(original.searchable)]);
     }
+  });
+
+  // Repeated identical sentences: the third window's TRUE range is [7,13), and
+  // recovering it by searching for its text finds [0,6) instead. Decoding [0,6)
+  // yields byte-identical text, so a round-trip assertion cannot see the drift
+  // — which is why this asserts the STORED integers, not the decoded text.
+  it('stores the TRUE window span when the same text occurs more than once', () => {
+    const root = scratch('repeat');
+    writeFile(root, 'concepts/repeat.md', 'aa bb?\naa bb?');
+    const candidates = buildProjectionCandidates(root).candidates;
+    expect(candidates).toHaveLength(1);
+    const candidate = candidates[0]!;
+
+    const fresh = passageWindows(candidate.searchable, LANE_EXCERPT_CHARS.file);
+    // The fixture only means something if the same window text really repeats.
+    const texts = fresh.map((window) => window.text);
+    expect(new Set(texts).size).toBeLessThan(texts.length);
+
+    const { live } = built(root);
+    const db = openProjectionDb(live, frozenBoundsJson())!;
+    const row = db.prepare('SELECT windows_encoded AS e, windows_json AS j FROM candidate').get() as {
+      e: number;
+      j: string;
+    };
+    db.close();
+    expect(row.e).toBe(1);
+
+    const flat = JSON.parse(row.j) as number[];
+    const stored: Array<[number, number]> = [];
+    for (let at = 0; at < flat.length; at += 4) stored.push([flat[at]!, flat[at + 1]!]);
+    expect(stored).toEqual(fresh.map((window) => [window.start, window.end]));
+    // Every stored span brackets its own window, at its own offset.
+    for (const [index, [start, end]] of stored.entries()) {
+      expect(candidate.searchable.slice(start, end)).toBe(fresh[index]!.text);
+    }
+    // The drift this guards against: at least one window is NOT at the first
+    // occurrence of its own text, or the fixture proves nothing.
+    expect(stored.some(([start], index) => candidate.searchable.indexOf(fresh[index]!.text) !== start)).toBe(true);
   });
 
   it('falls back to storing whole windows when the offset form cannot be proven exact', () => {
@@ -339,6 +381,8 @@ describe('recall projection schema and build', () => {
       const fresh = passageWindows(candidate.searchable, LANE_EXCERPT_CHARS[candidate.lane]).map((window) => ({
         text: window.text,
         tokens: [...window.tokens],
+        start: window.start,
+        end: window.end,
       }));
       expect(windowsEqual(candidate.windows, fresh)).toBe(true);
     }
@@ -389,6 +433,8 @@ describe('recall projection schema and build', () => {
       windows: passageWindows(searchable, LANE_EXCERPT_CHARS.file).map((window) => ({
         text: window.text,
         tokens: [...window.tokens],
+        start: window.start,
+        end: window.end,
       })),
     };
     // The in-memory objects are self-consistent, so the encoder's own check is

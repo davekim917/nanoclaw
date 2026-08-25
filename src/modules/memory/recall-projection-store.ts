@@ -37,6 +37,9 @@ export type RecallLane = 'file' | 'fact';
 export interface ProjectionWindow {
   text: string;
   tokens: RecallToken[];
+  /** True `[start, end)` into `searchable`, as `passageWindows` emitted it. */
+  start: number;
+  end: number;
 }
 
 export interface ProjectionCandidate extends SearchableCandidate {
@@ -155,17 +158,20 @@ function encodeWindows(
   const indexByStart = new Map<number, number>();
   for (let index = 0; index < stream.length; index++) indexByStart.set(stream[index]!.start, index);
   const flat: number[] = [];
-  let searchFrom = 0;
   for (const window of windows) {
-    const start = searchable.indexOf(window.text, searchFrom);
-    if (start < 0) return null;
-    // Window starts are non-decreasing, so resuming the search here is safe.
-    // A wrong-but-identical-text hit still fails the decode check below.
-    searchFrom = start;
+    // The span comes from `passageWindows`, which computed it. An earlier
+    // version recovered it with `indexOf` from the previous window's start,
+    // and that is NOT safe: windows overlap and repeat, so the search can land
+    // on an earlier identical occurrence. On `'aa bb?\naa bb?'` the third
+    // window's true [7,13) was stored as [0,6) — and because the decoded text
+    // is byte-identical, the round-trip check below waved it through. The
+    // comment there used to claim the opposite; it was wrong, which is why the
+    // derivation is gone rather than patched.
+    if (searchable.slice(window.start, window.end) !== window.text) return null;
     const first = window.tokens[0];
     const tokenStart = first === undefined ? 0 : (indexByStart.get(first.start) ?? -1);
     if (tokenStart < 0) return null;
-    flat.push(start, start + window.text.length, tokenStart, tokenStart + window.tokens.length);
+    flat.push(window.start, window.end, tokenStart, tokenStart + window.tokens.length);
   }
   return flat;
 }
@@ -180,6 +186,8 @@ function decodeWindows(
     windows.push({
       text: searchable.slice(flat[index]!, flat[index + 1]!),
       tokens: stream.slice(flat[index + 2]!, flat[index + 3]!) as RecallToken[],
+      start: flat[index]!,
+      end: flat[index + 1]!,
     });
   }
   return windows;
@@ -195,12 +203,20 @@ function streamEqual(a: readonly RecallToken[], b: readonly RecallToken[]): bool
   return true;
 }
 
-/** Byte-identity check for the encode/decode round trip — value, start, end, and order. */
+/**
+ * Byte-identity check for the encode/decode round trip — window span, token
+ * value/start/end, and order.
+ *
+ * The SPAN comparison is not decoration: text equality alone cannot see a
+ * window stored against a different occurrence of identical text, which is
+ * exactly the drift `encodeWindows` used to produce.
+ */
 export function windowsEqual(a: readonly ProjectionWindow[], b: readonly ProjectionWindow[]): boolean {
   if (a.length !== b.length) return false;
   for (let index = 0; index < a.length; index++) {
     const left = a[index]!;
     const right = b[index]!;
+    if (left.start !== right.start || left.end !== right.end) return false;
     if (left.text !== right.text || left.tokens.length !== right.tokens.length) return false;
     for (let position = 0; position < left.tokens.length; position++) {
       const one = left.tokens[position]!;

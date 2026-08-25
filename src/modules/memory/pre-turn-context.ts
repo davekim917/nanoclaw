@@ -150,39 +150,105 @@ export const LANE_EXCERPT_CHARS: Readonly<Record<'file' | 'fact', number>> = Obj
 });
 
 /**
- * Probe string for `tokenizerFingerprint`. Deliberately exercises every branch
- * whose output the projection freezes: the stem table (`Managing` -> host,
- * `capabilities`, `providers`, `suggestions`, `columns`, `worktrees`), the
- * generic -ing/-ed/-s suffix rules, a stopword, an NFKC compatibility
- * expansion, a circled digit, a context-sensitive sigma, and a hyphenated
- * numeric run.
+ * Inputs the tokenizer fingerprint is computed over. Not a sample of prose —
+ * an enumeration of `canonicalToken`'s and `tokenStreamForRecall`'s decision
+ * surface, so "which behaviours are covered" is a list you can read rather
+ * than a hope about what a sentence happened to contain.
+ *
+ * Every STOP_WORDS member is added at runtime (below), so the set's contents
+ * are covered exactly rather than by sampling.
  */
-const TOKENIZER_PROBE =
-  'Managing capabilities: providers hosted worktrees, suggestions and columns — ﬁle ① Σσ 2026-08-25.';
+export const TOKENIZER_PROBES: readonly string[] = [
+  // Stem table, every branch and both sides of each alternation.
+  'manage manages managed managing host hosts hosted hosting',
+  'capability capabilities provider providers suggestion suggestions',
+  'column columns worktree worktrees',
+  // Generic suffix rules at their exact length boundaries: -ing needs
+  // length > 5, -ed and -s need length > 4. One below and one above each.
+  'sing doing asking ring bring',
+  'used asked bed fled',
+  'cats birds is gas mass',
+  // The token pattern: which characters join a run, and the {2,} minimum.
+  'a ab i _x x_ x-y x--y 12 1 a1 _ - --',
+  'snake_case kebab-case CamelCase UPPER lower',
+  // The post-canonicalization length filter (> 1).
+  'as an so ss',
+  // NFKC and locale lowercasing, including the cases `offsetStable` exists for.
+  '\uFB01le \u2460 \u2167 \u0130stanbul \u03A3 \u03C2 \u03C3 O\u0394O\u03A3',
+  'caf\u00E9 cafe\u0301 na\u00EFve r\u00E9sum\u00E9',
+  'no\u00A0break\u00A0space em\u2014dash ellipsis\u2026',
+  // Mixed scripts and astral scalars, which must not shift a neighbour offset.
+  '\u65E5\u672C\u8A9E \u043F\u0430\u043C\u044F\u0442\u044C \uD83D\uDE80rocket',
+  // Sentence shapes the stream's start/end offsets are read from.
+  'Sentence one. Sentence two! Question three?\nLine four.',
+];
+
 let tokenizerFingerprintCache: number | null = null;
 
 /**
- * A cheap behavioral hash of the recall tokenizer.
+ * A hash of what the recall tokenizer DOES, over an enumerated corpus, plus the
+ * exact contents of `STOP_WORDS`.
  *
  * `frozenBounds` records the constants a projection was built under so a
  * changed constant forces a rebuild instead of serving stale windows (S1). The
- * TOKENIZER is the same class of dependency and was the larger hole: the read
- * path primes `TOKEN_STREAM_CACHE` with the projection's persisted stream, so a
- * change to `canonicalToken` or `STOP_WORDS` without a rebuild would feed a
- * WRONG stream to scoring — and, because the cache is process-wide, would
- * poison the filesystem path for the same strings too. Hashing the tokenizer's
- * output on a fixed probe catches every such change for three lines.
+ * tokenizer is the same class of dependency and the sharper one: the read path
+ * primes `TOKEN_STREAM_CACHE` with the projection's persisted stream, and
+ * `tokenStreamForRecall` trusts that cache forever without revalidating — so a
+ * tokenizer change without a rebuild feeds a WRONG stream to scoring, and
+ * because the cache is process-wide it does so for the FILESYSTEM path too, in
+ * workgroups that have no projection at all.
+ *
+ * WHY NOT HASH THE SOURCE. Hashing `canonicalToken.toString()` is the obvious
+ * "sound" answer and it is wrong here, MEASURED: the host reads the projection
+ * and a worker thread builds it (§P2.5.6 step 3), and the two do not always
+ * share a transform. Under vitest the host runs Vite-transformed source while
+ * the worker bootstraps through `tsx/cjs`, and the identical file hashed to
+ * 1674380368 on one side and -539474499 on the other — every worker-built
+ * projection permanently unopenable, silently, with `stale-bounds` in the
+ * telemetry. A behavioural hash cannot have that failure: it depends on what
+ * the code computes, not on how the pipeline spelled it.
+ *
+ * WHAT THIS GUARANTEES, EXACTLY. A rebuild is forced by (a) any change to
+ * `STOP_WORDS` membership — exactly, since the set itself is hashed — and (b)
+ * any change to `canonicalToken` or `tokenStreamForRecall` whose output differs
+ * on `TOKENIZER_PROBES` or on any stopword, which enumerates the stem table,
+ * both generic suffix rules at their length boundaries, the token pattern's
+ * character class and its {2,} minimum, the length filter, NFKC, locale
+ * lowercasing, and the token start/end offsets.
+ *
+ * THE GAP, STATED. A new special case for a word that appears in no probe and
+ * is not a stopword is not caught. Closing it needs the rule table to become
+ * data the hash can read, which is a rewrite of a hot function; the honest
+ * alternative is to add the word to `TOKENIZER_PROBES` in the same commit that
+ * adds the rule. That is a convention, not a guard, and it is why this comment
+ * says "enumerated corpus" rather than "sound".
  */
 function tokenizerFingerprint(): number {
   if (tokenizerFingerprintCache !== null) return tokenizerFingerprintCache;
-  const probe = JSON.stringify(tokenStreamForRecall(TOKENIZER_PROBE));
-  // One entry, once per process, and it belongs to no workgroup — drop it so
-  // it never shows up in the cross-workgroup occupancy measurement (P2.5-AC18).
-  TOKEN_STREAM_CACHE.delete(TOKENIZER_PROBE);
+  const stopWords = [...STOP_WORDS].sort(compareCodepoint);
+  // The probes must not land in the process-wide cache or count as misses:
+  // P2.5-AC18 asserts on both, and this runs once per process for no workgroup.
+  const before = { ...TOKEN_STREAM_CACHE_STATS };
+  const parts: string[] = [stopWords.join(' ')];
+  for (const probe of [...TOKENIZER_PROBES, ...stopWords]) {
+    parts.push(JSON.stringify(tokenStreamForRecall(probe)));
+    TOKEN_STREAM_CACHE.delete(probe);
+  }
+  TOKEN_STREAM_CACHE_STATS.hits = before.hits;
+  TOKEN_STREAM_CACHE_STATS.misses = before.misses;
+  const definition = parts.join('\u0000');
   let hash = 0;
-  for (let index = 0; index < probe.length; index++) hash = (Math.imul(hash, 31) + probe.charCodeAt(index)) | 0;
+  for (let index = 0; index < definition.length; index++) {
+    hash = (Math.imul(hash, 31) + definition.charCodeAt(index)) | 0;
+  }
   tokenizerFingerprintCache = hash;
   return hash;
+}
+
+/** Test seam: both memos are process-lifetime, and a test mutating STOP_WORDS needs them cleared. */
+export function _resetFrozenBoundsForTest(): void {
+  tokenizerFingerprintCache = null;
+  frozenBoundsJsonCache = null;
 }
 
 /**
@@ -648,7 +714,7 @@ function offsetSliceable(candidate: string, sentences: readonly { start: number;
 export function passageWindows(
   candidate: string,
   maxChars: number,
-): Array<{ text: string; tokens: readonly RecallToken[] }> {
+): Array<{ text: string; tokens: readonly RecallToken[]; start: number; end: number }> {
   const sentences = sentenceSpans(candidate, maxChars);
   const sliceable = offsetSliceable(candidate, sentences);
   OFFSET_SLICE_STATS.total++;
@@ -671,7 +737,7 @@ export function passageWindows(
     }
   }
 
-  const windows: Array<{ text: string; tokens: readonly RecallToken[] }> = [];
+  const windows: Array<{ text: string; tokens: readonly RecallToken[]; start: number; end: number }> = [];
   for (let first = 0; first < sentences.length; first++) {
     for (let last = first; last < Math.min(sentences.length, first + 3); last++) {
       const windowStart = sentences[first]!.start;
@@ -681,6 +747,15 @@ export function passageWindows(
       windows.push({
         text,
         tokens: stream ? stream.slice(firstToken[first]!, afterToken[last]!) : tokenStreamForRecall(text),
+        // The span is REPORTED, not re-derived. The recall projection persists
+        // windows as offsets into `searchable`, and recovering those offsets by
+        // searching for the window text finds the FIRST occurrence, not this
+        // one — on `'aa bb?\naa bb?'` the third window's true [7,13) stored as
+        // [0,6), byte-identical on decode and therefore invisible to a
+        // round-trip check. The offsets exist here; nothing should ever go
+        // looking for them again.
+        start: windowStart,
+        end: windowEnd,
       });
     }
   }
@@ -1283,6 +1358,13 @@ export const RECALL_PROJECTION_BOUNDS = Object.freeze({
   warmRefreshMs: 30_000,
   /** Candidates the warming probe hydrates, to touch the pages a turn will. */
   probeHydrate: 32,
+  /**
+   * After a refusal, don't re-verify the SAME index file again for this long.
+   * Only a rebuild can clear a stale or defective projection, and a rebuild
+   * changes the index identity — which lifts the backoff immediately, so this
+   * is a floor on wasted tree walks, not a delay on recovery.
+   */
+  refusalBackoffMs: 60_000,
 });
 
 /**
@@ -1299,8 +1381,20 @@ interface ProjectionWarmMark {
 }
 
 const PROJECTION_WARM = new Map<string, ProjectionWarmMark>();
-/** Why the last warming pass refused, so a turn can report `stale` vs `cold`. */
-const PROJECTION_VERDICT = new Map<string, string>();
+/**
+ * Why the projection was last refused, so a turn can report `stale` vs `cold`
+ * AND so repeated refusals back off. Without the backoff a workgroup whose tree
+ * moved re-walks it once per turn forever — nothing but a rebuild can clear
+ * that state, and a rebuild changes the index identity, which is the other half
+ * of the condition.
+ */
+interface ProjectionRefusal {
+  reason: string;
+  at: number;
+  ino: number;
+  mtimeMs: number;
+}
+const PROJECTION_VERDICT = new Map<string, ProjectionRefusal>();
 /** Warming passes already queued, so N cold turns queue one pass, not N. */
 const PROJECTION_WARMING = new Set<string>();
 
@@ -1385,9 +1479,22 @@ function projectionIdentity(dbPath: string): { ino: number; mtimeMs: number } | 
  * diffed against the rows. A rename that preserves size/mtime/ino is caught
  * because the LISTING differs even though the stats match.
  *
- * Returns a reason string when stale, null when fresh. Never runs on the
- * message-write path: `graph-scent.ts:48-55` records what a cold stat sweep
- * there costs (19 stalls >3 s, worst 26.9 s).
+ * Returns a reason string when stale, null when fresh.
+ *
+ * WHERE THIS IS ALLOWED TO RUN. Both the warming pass and the serve path call
+ * it, but the serve path calls it only AFTER the warmth gate has passed — so it
+ * is never the cold stat sweep `graph-scent.ts:48-55` records (19 stalls >3 s,
+ * worst 26.9 s). Warm it measures ~10 ms on the largest workgroup, which is the
+ * price of not serving a candidate set the tree has already moved past; a cold
+ * workgroup falls back before reaching it and stats nothing.
+ *
+ * KNOWN CHURN, not worth fixing yet: a `preferences/` edit marks the projection
+ * stale even though preference files are never projection candidates (the scan
+ * loop skips them; they are recorded in `source_file` only so the listing diff
+ * is complete). Cost is one unnecessary rebuild per preference edit, which is
+ * rare. Narrowing it means teaching the diff which paths can affect candidates,
+ * which is a second copy of the scan loop's skip rules — the exact duplication
+ * this phase removed.
  */
 export function projectionTreeStaleness(root: string, db: Database.Database): string | null {
   const discarded: ContextNotice[] = [];
@@ -1421,7 +1528,10 @@ export interface ProjectionWarmResult {
 
 /**
  * Verify a workgroup's projection and mark it warm. NEVER call this from a
- * turn: it opens the index, walks the tree, and pages in a hydration batch.
+ * turn: it opens the index COLD, walks the tree cold, and pages in a hydration
+ * batch. (The serve path re-checks staleness itself, but only once the warmth
+ * gate has already proved those pages are resident — see
+ * `projectionTreeStaleness`.)
  *
  * Warmth tracks OS page-cache residency the same way graph-scent's probe does —
  * a pass that answers inside budget is evidence the next turn's read will too,
@@ -1434,7 +1544,7 @@ export function warmRecallProjection(workgroupId: string, root: string): Project
   const started = projectionClock();
   const refuse = (reason: string): ProjectionWarmResult => {
     PROJECTION_WARM.delete(workgroupId);
-    PROJECTION_VERDICT.set(workgroupId, reason);
+    recordRefusal(workgroupId, reason, projectionIdentity(dbPath));
     return { warm: false, reason, elapsedMs: projectionClock() - started };
   };
   if (projectionIdentity(dbPath) === null) return refuse('absent');
@@ -1470,9 +1580,54 @@ export function warmRecallProjection(workgroupId: string, root: string): Project
   return { warm: true, reason: 'warm', elapsedMs };
 }
 
-/** Queue one warming pass off the turn's stack. Coalesces concurrent requests. */
-function scheduleProjectionWarming(workgroupId: string, root: string): void {
+/**
+ * Refusals a RETRY cannot clear. Only a rebuild fixes these, and a rebuild
+ * changes the index identity, which lifts the backoff — so backing off on them
+ * is free. Everything else (`slow:` under load, a busy-locked probe, a
+ * mid-promote read) is about the machine or the moment, not the file, and must
+ * re-verify on the very next turn: a load spike is not a reason to serve the
+ * filesystem path for a minute.
+ */
+function refusalNeedsRebuild(reason: string): boolean {
+  return (
+    reason.startsWith('stale:') ||
+    reason.startsWith('stale-bounds:') ||
+    reason.startsWith('schema-version:') ||
+    reason.startsWith('incomplete:')
+  );
+}
+
+function recordRefusal(workgroupId: string, reason: string, identity: { ino: number; mtimeMs: number } | null): void {
+  PROJECTION_VERDICT.set(workgroupId, {
+    reason,
+    at: projectionClock(),
+    ino: identity?.ino ?? -1,
+    mtimeMs: identity?.mtimeMs ?? -1,
+  });
+}
+
+/**
+ * Queue one warming pass off the turn's stack. Coalesces concurrent requests,
+ * and backs off after a refusal against the same index file — otherwise a
+ * workgroup whose tree moved re-walks it once per turn until someone rebuilds.
+ */
+function scheduleProjectionWarming(
+  workgroupId: string,
+  root: string,
+  identity: { ino: number; mtimeMs: number } | null,
+): void {
   if (PROJECTION_WARMING.has(workgroupId)) return;
+  const last = PROJECTION_VERDICT.get(workgroupId);
+  if (
+    last !== undefined &&
+    refusalNeedsRebuild(last.reason) &&
+    identity !== null &&
+    last.ino === identity.ino &&
+    last.mtimeMs === identity.mtimeMs &&
+    projectionClock() - last.at < RECALL_PROJECTION_BOUNDS.refusalBackoffMs
+  ) {
+    return;
+  }
   PROJECTION_WARMING.add(workgroupId);
   // ponytail: setImmediate, not the worker-thread wrapper the BUILD uses. The
   // work here is an open plus a tree diff (~10 ms warm / ~21 ms cold measured,
@@ -1579,13 +1734,13 @@ function readProjectionForTurn(
     mark !== undefined && mark.ino === identity.ino && mark.mtimeMs === identity.mtimeMs && age < projectionWarmTtlMs;
   if (!warm) {
     if (mark !== undefined) PROJECTION_WARM.delete(workgroupId);
-    scheduleProjectionWarming(workgroupId, root);
+    scheduleProjectionWarming(workgroupId, root, identity);
     const last = PROJECTION_VERDICT.get(workgroupId);
-    return fail(warmthPathFor(last), last ?? 'not-verified-warm');
+    return fail(warmthPathFor(last?.reason), last?.reason ?? 'not-verified-warm');
   }
   // Serve, but refresh in the background before the mark can expire, so steady
   // state never pays a fallback turn per TTL.
-  if (age >= RECALL_PROJECTION_BOUNDS.warmRefreshMs) scheduleProjectionWarming(workgroupId, root);
+  if (age >= RECALL_PROJECTION_BOUNDS.warmRefreshMs) scheduleProjectionWarming(workgroupId, root, identity);
 
   let rejection = 'open-rejected';
   let db: Database.Database | null;
@@ -1601,37 +1756,56 @@ function readProjectionForTurn(
     return fail('fallback', rejection);
   }
   // Names the interaction that failed, so the telemetry line says which one.
-  let at = 'summary';
+  let at = 'begin';
   try {
+    // Decision 13 / P2.5-I7. Under WAL every statement otherwise gets a fresh
+    // read snapshot, so an incremental commit landing between any two of the
+    // reads below could hand back dangling ids, a candidate set that existed in
+    // no committed generation, or `source_file` rows from a different
+    // generation than the candidates the staleness check is vouching for.
+    // Everything the turn reads from this file — meta, source_file, term,
+    // candidate — is inside it.
+    db.exec('BEGIN DEFERRED');
+    at = 'summary';
     const summary = readProjectionSummary(db);
     at = 'byte-budget';
     // Decision 16 / P2.5-I8. The build starts its scan at zero bytes; a turn
     // starts it after the core and preference lanes have spent some, and the
     // preference lane's cost depends on WHO is in the conversation. The live
     // loop diverges from the build exactly when `spentBeforeScan +
-    // buildScannedBytes` exceeds the budget — before that point every
-    // `remaining` is still at least the bytes the build read, so no file is
-    // truncated differently and the loop never breaks early.
-    //
-    // The preference term is bounded by its own caps rather than measured, so
-    // the assertion is independent of the turn's participants: a projection is
-    // either valid for every possible roster or for none, never "valid for
-    // this conversation". That is stricter than the plan requires and removes
-    // the per-turn dependency instead of merely detecting it.
+    // buildScannedBytes` exceeds the budget: below that point every `remaining`
+    // is still at least the bytes the build read, so no file is truncated
+    // differently and the loop never breaks early; at or above it, at least one
+    // read differs. Necessary AND sufficient — and `scannedBytes` is what the
+    // core and preference lanes ACTUALLY spent on this turn, not a bound
+    // derived from their caps, so nothing here depends on where those caps are
+    // set or on which argument a caller happens to omit.
     const budget = recallScannedBytesBudget();
-    const preferenceHeadroom = PRE_TURN_BOUNDS.preferenceExcerpts * PRE_TURN_BOUNDS.markdownFileBytes;
-    if (scannedBytes + preferenceHeadroom + summary.scannedBytes > budget) {
-      return fail(
-        'fallback',
-        `byte-budget: ${scannedBytes} + ${preferenceHeadroom} + ${summary.scannedBytes} over ${budget}`,
-      );
+    if (scannedBytes + summary.scannedBytes > budget) {
+      return fail('fallback', `byte-budget: ${scannedBytes} + ${summary.scannedBytes} over ${budget}`);
     }
-    at = 'begin';
-    // Decision 13 / P2.5-I7. Under WAL every statement otherwise gets a fresh
-    // read snapshot, so an incremental commit landing between the term query
-    // and hydration could hand back dangling ids or a candidate set that
-    // existed in no committed generation.
-    db.exec('BEGIN DEFERRED');
+    at = 'staleness';
+    // Decision 5, and the reason it is HERE rather than only in the warming
+    // pass: the warm mark says the projection was fresh when it was last
+    // verified, which can be a minute ago. A curator write two seconds before
+    // this turn would otherwise be served the pre-write candidate set with a
+    // clean `hit`, and a just-captured fact would not be recallable for up to
+    // the TTL. The plan's own P2.5-AC6 wording is "none silently served fresh".
+    //
+    // This is NOT the cold sweep decision 5 forbids: it runs only after the
+    // warmth gate above has passed, so the tree's dentries and inodes are
+    // page-cache warm by the same evidence that authorized the read at all
+    // (~10 ms measured on the largest workgroup). A cold workgroup falls back
+    // before reaching this line and never stats anything.
+    const stale = projectionTreeStaleness(root, db);
+    if (stale !== null) {
+      // Only a rebuild fixes this, and a rebuild changes the index identity —
+      // so unmark, record the verdict, and let the backoff in
+      // `scheduleProjectionWarming` stop every subsequent turn re-diffing.
+      PROJECTION_WARM.delete(workgroupId);
+      recordRefusal(workgroupId, `stale: ${stale}`, identity);
+      return fail('stale', `stale: ${stale}`);
+    }
     at = 'term-query';
     const ids = new Set(queryTermCandidates(db, queryTokens, minimumOverlapFor(queryTokens)));
     if (expandedTokens.length !== queryTokens.length || expandedTokens.some((token, i) => token !== queryTokens[i])) {
@@ -1754,30 +1928,16 @@ export function readMemoryEvidence(
 
   const queryTokens = tokenizeForRecall(query);
   const expandedTokens = tokenizeForRecall(`${query} ${ephemeralExpansion(query).join(' ')}`);
-  // The whole projection read happens HERE, at the listing's position, not at
-  // the scan loop's — including the term query and hydration. Anything that can
-  // fail has to fail before the first projection-born notice is pushed;
-  // otherwise a late failure would have to un-push notices and re-list the
-  // tree, landing the listing notices after the preference lane's instead of
-  // before them (P2.5-AC13 compares delivered notices, order included).
-  const recall = { path: 'fallback' as RecallProjectionPath, reason: 'unset' };
-  const projected = readProjectionForTurn(workgroupId, root, queryTokens, expandedTokens, scannedBytes, recall);
-  if (projected !== null) {
-    recall.path = 'hit';
-    recall.reason = 'projection';
-    for (const notice of projected.listingNotices) notices.push(notice);
-  }
-  // Read the fact store first. `markdownScannedBytes` is a single budget spent
-  // in listing order, and `generated/` sorts after `bootstrap/`, `concepts/`,
-  // `conversations/`, `facts/` and `imports/`. A large manual tree would
-  // otherwise leave too few bytes for it and truncate the file MID-LINE, which
-  // is worse than dropping it: the partial line still starts with "- " and is
-  // parsed as a fact, so a half-sentence reaches the agent with its provenance
-  // marker cut off. Stable sort, so everything else keeps codepoint order.
-  // Union rather than walk-only: the topic directories are listed directly so
-  // an earlier-sorting directory cannot spend the walk's entry budget before
-  // they are reached. Deduped because the walk usually does reach some of them.
-  const allFiles = projected === null ? listRecallFiles(root, notices) : [];
+  // Where the tree listing's notices BELONG. The listing itself now happens
+  // after the preference lane, because the byte-budget assertion the projection
+  // read makes (decision 16) has to see the preference lane's REAL spend rather
+  // than an upper bound on it — and that read is what decides whether the tree
+  // gets listed at all. Listing does not touch the shared byte budget and
+  // pushes no state the preference lane reads, so moving the WORK is
+  // output-neutral; only the notices' position is observable, and they are
+  // spliced back to this index (P2.5-AC13 compares delivered notices, order
+  // included).
+  const noticeInsertAt = notices.length;
 
   // Deterministic per-person preference lane. Files under preferences/ are
   // keyed by name slug and injected whole for the conversation's involved
@@ -1843,25 +2003,46 @@ export function readMemoryEvidence(
     }
   }
 
-  // Candidate generation. Either the projection already produced both lanes —
-  // in scan order, term-filtered to a superset of what scoring keeps — or the
-  // shared scan loop reads the tree. That loop is the SAME function the
-  // projection's build calls, so the two cannot drift (plan §P2.5.6 step 6).
+  // Candidate generation. Either the projection produces both lanes — in scan
+  // order, term-filtered to a superset of what scoring keeps — or the shared
+  // scan loop reads the tree. That loop is the SAME function the projection's
+  // build calls, so the two cannot drift (plan §P2.5.6 step 6).
+  //
+  // `scannedBytes` here is the real spend of the core and preference lanes,
+  // which is what makes decision 16's assertion exact instead of an estimate.
+  const recall = { path: 'fallback' as RecallProjectionPath, reason: 'unset' };
+  const projected = readProjectionForTurn(workgroupId, root, queryTokens, expandedTokens, scannedBytes, recall);
   let fileCandidates: SearchableCandidate[];
   let factCandidates: SearchableCandidate[];
   if (projected !== null) {
+    recall.path = 'hit';
+    recall.reason = 'projection';
     fileCandidates = projected.fileCandidates;
     factCandidates = projected.factCandidates;
-    // The build's own `markdown-byte-limit`, pushed where the scan loop would
-    // have pushed it (P2.5-I5).
+    // Listing notices go back where the walk would have pushed them; the
+    // build's own `markdown-byte-limit` belongs here, at the scan loop's
+    // position (P2.5-I5).
+    notices.splice(noticeInsertAt, 0, ...projected.listingNotices);
     for (const notice of projected.scanNotices) notices.push(notice);
   } else {
+    // Read the fact store first. `markdownScannedBytes` is a single budget spent
+    // in listing order, and `generated/` sorts after `bootstrap/`, `concepts/`,
+    // `conversations/`, `facts/` and `imports/`. A large manual tree would
+    // otherwise leave too few bytes for it and truncate the file MID-LINE, which
+    // is worse than dropping it: the partial line still starts with "- " and is
+    // parsed as a fact, so a half-sentence reaches the agent with its provenance
+    // marker cut off. Stable sort, so everything else keeps codepoint order.
+    // Union rather than walk-only: the topic directories are listed directly so
+    // an earlier-sorting directory cannot spend the walk's entry budget before
+    // they are reached. Deduped because the walk usually does reach some of them.
+    const listingNotices: ContextNotice[] = [];
+    const allFiles = listRecallFiles(root, listingNotices);
+    notices.splice(noticeInsertAt, 0, ...listingNotices);
     const scanned = scanRecallCandidates(root, canonicalRoot, recallScanOrder(root, allFiles), notices, scannedBytes);
     fileCandidates = scanned.fileCandidates;
     factCandidates = scanned.factCandidates;
     // `scanned.scannedBytes` is deliberately not read back: nothing below this
-    // point spends the shared budget, and the projection's own total is what
-    // the read-time coupling assertion above compares.
+    // point spends the shared budget.
   }
   if (candidateStats) {
     candidateStats.factCandidates = factCandidates.length;
