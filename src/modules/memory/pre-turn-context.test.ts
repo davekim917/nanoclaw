@@ -58,6 +58,7 @@ import {
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { probeGraphScentWarmth, _resetGraphScentForTest } from './graph-scent.js';
 import { WorkgroupGraphStore } from '../../graphify/store.js';
+import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
 import { GENERATED_MEMORY_MAX_BYTES } from './curator-contract.js';
 
@@ -2089,5 +2090,51 @@ describe('offset slicing is gated on normalization invariance, not on ASCII', ()
     expect(excerpt).toBeDefined();
     // Byte-identical: the decomposed sequence is still decomposed.
     expect(excerpt!.text).toContain('café rota is precomposed café elsewhere.');
+  });
+});
+
+// Nothing logged recall latency in production before this - every performance
+// claim came from an ad-hoc harness run against a copied tree. This is the
+// permanent replacement: one structured debug line per build.
+describe('per-build structured log line (recall latency instrumentation)', () => {
+  it('fires once per build with workgroup id, timing, candidate counts, cache stats and fast-path count', () => {
+    memoryFile(
+      'generated/memory.md',
+      '# Generated workgroup memory\n\n- Deploy pipeline runs nightly.\n- Deploy pipeline retries on failure.\n',
+    );
+    memoryFile('projects/deploy.md', '# Deploy pipeline\nThe deploy pipeline retries failed jobs automatically.');
+
+    const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
+    buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'deploy pipeline' }),
+    });
+
+    const call = debugSpy.mock.calls.find(([msg]) => msg === 'pre-turn-context: build');
+    expect(call).toBeDefined();
+    const fields = call![1] as Record<string, unknown>;
+
+    expect(fields.workgroupId).toBe('wg-a');
+    expect(typeof fields.elapsedMs).toBe('number');
+    expect(fields.elapsedMs as number).toBeGreaterThanOrEqual(0);
+    // The two generated fact lines, and the one non-core Markdown file
+    // (index.md and system/definition.md are seeded but excluded from
+    // candidates - they are core/non-recall paths, not ranked).
+    expect(fields.factCandidates).toBe(2);
+    expect(fields.fileCandidates).toBe(1);
+    expect(typeof fields.tokenCacheSize).toBe('number');
+    expect(typeof fields.tokenCacheMax).toBe('number');
+    expect(typeof fields.tokenCacheHits).toBe('number');
+    expect(typeof fields.tokenCacheMisses).toBe('number');
+    expect(typeof fields.fastPathHits).toBe('number');
+    expect(typeof fields.fastPathCandidates).toBe('number');
+    // Counts and timings only - never the recalled memory or conversation text.
+    expect(JSON.stringify(fields)).not.toContain('Deploy pipeline');
+    expect(JSON.stringify(fields)).not.toContain('pipeline');
+
+    debugSpy.mockRestore();
   });
 });
