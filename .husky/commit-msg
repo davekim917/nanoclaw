@@ -1,0 +1,34 @@
+# Boundary gate for the COMMIT MESSAGE.
+#
+# pre-commit scans staged files; pre-push scans the index. Neither ever saw the
+# commit message — but history travels with the branch, so a message naming a
+# real group folder, tenant, or account arrangement publishes upstream exactly
+# like source does. On 2026-08-25 a message spelling out an install's OAuth
+# slot arrangement committed clean while the same identifier was correctly
+# rejected in the diff.
+#
+# `$1` is git's message file. Resolve the main checkout the same way the other
+# hooks do: agent worktrees carry no node_modules, so a bare `pnpm run` here
+# dies with `tsx: not found`. Absolutize the path BEFORE the cd, since git
+# passes it relative to the original $PWD.
+msg_path=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
+
+# Version skew is expected and must NOT hard-block.
+#
+# The hook always runs the MAIN checkout's script, but the hook file itself
+# comes from whichever worktree is committing. So a worktree that has this hook
+# while main's script predates `--message` would fail every commit with
+# "unknown argument" — which is what happened the first time this was wired.
+# A gate that blocks all work because it cannot run is worse than one that
+# announces it is not running: the first gets disabled with --no-verify, and
+# then nothing is checked at all.
+#
+# Skip loudly instead. This self-heals the moment main carries the flag, and
+# pre-commit and pre-push still gate the actual file content meanwhile.
+if ! grep -q "'--message'" "$repo_root/scripts/check-public-boundary.ts" 2>/dev/null; then
+  echo "commit-msg boundary gate SKIPPED — $repo_root/scripts/check-public-boundary.ts predates --message" >&2
+  exit 0
+fi
+
+(cd "$repo_root" && pnpm run check:public-boundary -- --message "$msg_path")

@@ -356,3 +356,82 @@ describe('Git surfaces and modes', () => {
     expect(run(resolveOptions(['--root', root, '--portable'], root))).toEqual([]);
   });
 });
+
+describe('commit message scanning (--message)', () => {
+  // History travels with the branch, so a message naming an install identifier
+  // publishes upstream exactly like source does. pre-commit scans staged files
+  // and pre-push scans the index; neither ever saw the message.
+  function fixture(messageBody: string): { options: ReturnType<typeof resolveOptions>; msgPath: string } {
+    const root = initRepo();
+    const privateValue = 'Private Customer';
+    fs.mkdirSync(path.join(root, '.nanoclaw'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.nanoclaw', 'public-boundary-identifiers'), `${privateValue}\n`);
+
+    const dbPath = path.join(root, 'registry.db');
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE workgroups (id TEXT, display_name TEXT);
+      CREATE TABLE agent_groups (id TEXT, name TEXT, folder TEXT, workgroup_id TEXT);
+      CREATE TABLE messaging_groups (id TEXT, platform_id TEXT, instance TEXT, name TEXT);
+      INSERT INTO workgroups VALUES ('example-house', 'Example House');
+    `);
+    db.close();
+
+    const msgPath = path.join(root, 'COMMIT_EDITMSG');
+    fs.writeFileSync(msgPath, messageBody);
+    const options = resolveOptions(
+      [
+        '--root',
+        root,
+        '--db',
+        'registry.db',
+        '--identifiers',
+        '.nanoclaw/public-boundary-identifiers',
+        '--message',
+        'COMMIT_EDITMSG',
+      ],
+      root,
+    );
+    return { options, msgPath };
+  }
+
+  it('rejects an identifier in the message body', () => {
+    const { options } = fixture('fix: something\n\nThis names Private Customer in the body.\n');
+    expect(run(options)).toEqual([{ file: 'COMMIT_EDITMSG', line: 3, category: 'private-identifier' }]);
+  });
+
+  it('passes a message with no install identifiers', () => {
+    const { options } = fixture('fix: something\n\nNothing private here.\n');
+    expect(run(options)).toEqual([]);
+  });
+
+  it('ignores `#` comment lines, which git strips before committing', () => {
+    // git's default template lists every staged path. For an install whose
+    // directories are named after groups that is a guaranteed false positive
+    // on text that never ships.
+    const { options } = fixture(
+      'fix: something\n\n# Changes to be committed:\n#\tmodified: groups/Private Customer/config.json\n',
+    );
+    expect(run(options)).toEqual([]);
+  });
+
+  it('reports the line the author sees, counting blanked comment lines', () => {
+    // Comment lines are blanked rather than removed so line numbers still
+    // match the file in the editor.
+    const { options } = fixture('fix: something\n\n# a comment\nPrivate Customer on line four.\n');
+    expect(run(options)).toEqual([{ file: 'COMMIT_EDITMSG', line: 4, category: 'private-identifier' }]);
+  });
+
+  it('scans ONLY the message, not the tracked tree', () => {
+    const { options } = fixture('fix: clean message\n');
+    // A tracked file carrying the identifier must not be reported here — this
+    // mode answers "is the message clean", and pre-commit already gates files.
+    fs.writeFileSync(path.join(options.root, 'leaky.md'), 'Private Customer\n');
+    execFileSync('git', ['add', 'leaky.md'], { cwd: options.root });
+    expect(run(options)).toEqual([]);
+  });
+
+  it('rejects --message with no path rather than silently scanning everything', () => {
+    expect(() => resolveOptions(['--message'])).toThrow(/--message requires a path/);
+  });
+});

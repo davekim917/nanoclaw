@@ -53,6 +53,14 @@ export interface ScanOptions {
   // An explicit --identifiers value always wins over that fallback.
   identifiersPath?: string;
   allowlistPath: string;
+  // Scan ONE text file instead of the tracked tree. Set by --message, which
+  // the commit-msg hook points at git's message file. Commit messages are part
+  // of what a fork publishes upstream — history travels with the branch — but
+  // they are not tracked files, so the file scan never saw them. On
+  // 2026-08-25 a message naming a real group folder and an install's OAuth
+  // slot arrangement committed clean while the gate rejected the same
+  // identifier in the diff.
+  messagePath?: string;
 }
 
 const DEFAULT_DB_RELATIVE = path.join('data', 'v2.db');
@@ -396,10 +404,13 @@ export function resolveOptions(argv: string[], cwd = process.cwd()): ScanOptions
     else if (arg === '--db') options.dbPath = argv[++i];
     else if (arg === '--identifiers') options.identifiersPath = argv[++i] ?? '';
     else if (arg === '--allowlist') options.allowlistPath = argv[++i] ?? '';
+    else if (arg === '--message') options.messagePath = argv[++i] ?? '';
     else throw new Error(`unknown argument: ${arg}`);
   }
   if (!options.root) throw new Error('--root requires a path');
+  if (options.messagePath === '') throw new Error('--message requires a path');
   options.root = path.resolve(options.root);
+  if (options.messagePath) options.messagePath = path.resolve(options.root, options.messagePath);
   if (options.identifiersPath !== undefined)
     options.identifiersPath = path.resolve(options.root, options.identifiersPath);
   options.allowlistPath = path.resolve(options.root, options.allowlistPath);
@@ -459,6 +470,25 @@ export interface RunReport {
   identifiersOrigin: IdentifierOrigin | 'skipped';
 }
 
+/**
+ * One ScanInput for a git commit message file.
+ *
+ * `#`-prefixed lines are blanked, not dropped: git strips them before the
+ * message is committed, so flagging them would reject text that never ships —
+ * and the default template lists every staged path, which for a fork with
+ * install-named directories is a guaranteed false positive. Blanking rather
+ * than removing keeps reported line numbers matching the file the author sees
+ * in their editor.
+ */
+function commitMessageInput(messagePath: string): ScanInput {
+  const raw = fs.readFileSync(messagePath, 'utf8');
+  const stripped = raw
+    .split('\n')
+    .map((line) => (line.startsWith('#') ? '' : line))
+    .join('\n');
+  return { file: path.basename(messagePath), content: Buffer.from(stripped, 'utf8') };
+}
+
 export function runReport(options: ScanOptions): RunReport {
   const privateIdentifiers = new Set<string>();
   let registryOrigin: IdentifierOrigin | 'skipped' = 'skipped';
@@ -494,7 +524,7 @@ export function runReport(options: ScanOptions): RunReport {
       : 'install-aware';
 
   const findings = scanInputs(
-    trackedInputs(options.root, options.index),
+    options.messagePath ? [commitMessageInput(options.messagePath)] : trackedInputs(options.root, options.index),
     privateIdentifiers,
     loadAllowlist(options.allowlistPath),
   );
@@ -522,7 +552,8 @@ export function main(argv = process.argv.slice(2)): number {
         'WARNING: no identifier registry found (locally or in the main checkout) — running structural-pattern checks only; real names and tenant identifiers will NOT be caught\n',
       );
     }
-    const surface = `${options.index ? 'index' : 'worktree'}, ${describeMode(report)}`;
+    const scanned = options.messagePath ? 'commit message' : options.index ? 'index' : 'worktree';
+    const surface = `${scanned}, ${describeMode(report)}`;
     if (findings.length === 0) {
       process.stdout.write(`public boundary check passed (${surface})\n`);
       return 0;
