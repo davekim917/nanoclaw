@@ -1158,9 +1158,15 @@ it against the largest workgroup.
    several active workgroups at once. `candidate` therefore also stores, per
    candidate, the whole-candidate `tokenizeForRecall` stream and the precomputed
    `passageWindows` output (`Array<{ text, tokens: RecallToken[] }>`, each
-   `RecallToken` a `{ value, start, end }` triple) in the exact shape `bestPassage`
-   and `passageWindows` consume today, so hydration returns tokens ready to score
-   with no re-tokenization call on the read path (P2.5-I9). `term(token,
+   `RecallToken` a `{ value, start, end }` triple). **The HYDRATED shape must be
+   exact; the STORED shape need not be** (amended 2026-08-25 during build, on
+   measurement — see below). Windows are persisted as an offset pair into
+   `searchable` plus an index range into the persisted ordered token stream, and
+   reconstructed at hydration into the exact shape `bestPassage` consumes. A
+   candidate whose reconstruction is not provably byte-identical falls back to
+   storing the literal shape, gated by an encode-decode-deep-compare performed
+   before commit — never by a heuristic. Hydration therefore returns tokens ready
+   to score with no re-tokenization call on the read path (P2.5-I9). `term(token,
 candidate_id)` is built from that persisted stream with the project's own tokenizer,
    **not FTS5**: `node_fts` is unstemmed `unicode61` (`src/graphify/store.ts:935`)
    while `tokenizeForRecall` stems and folds meaning, and a single bm25 score cannot
@@ -1170,10 +1176,19 @@ candidate_id)` is built from that persisted stream with the project's own tokeni
    (`rankByBestPassage`, `pre-turn-context.ts:654-675`). `source_file(path, size,
    mtime_ns, ino)` backs staleness detection (decision 5).
 
-   Storage consequence: the measured 37.7 MB build (§P2.5.1) predates this decision
-   and excludes token storage. The real number is unmeasured; `/team-build` must
-   measure it on the largest workgroup before the storage risk (§P2.5.5) is
-   considered assessed, not assumed close to 37.7 MB.
+   Storage, MEASURED during build (2026-08-25) — this is why the amendment exists.
+   Storing windows in their literal consumed shape cost **194.3 MB** for the largest
+   workgroup, 5.2x the 37.7 MB §P2.5.1 estimate, with 158.1 MB (81%) in the window
+   column alone: the 1-3 sentence sweep re-covers the same characters ~2.9x and each
+   window shipped its own token objects. Offset encoding brings it to **51.5 MB**
+   (-73%) and the build to 9,424 ms (-37%); the mid-size workgroup goes 69.3 MB ->
+   16.7 MB. Reconstruction was verified over both real corpora — 168,945 windows,
+   **0 mismatches** — and the fallback fired on 0.71% / 0.47% of candidates, matching
+   the independently measured non-`offsetSliceable` rate of 0.70% (63/9,001), which
+   is the evidence that it fires exactly where it should and nowhere else.
+   Remaining known cost: 80% of the residual window bytes belong to those ~52
+   fallback candidates. Not pursued; a further lever exists if fleet storage becomes
+   binding.
 
 4. **Replaces candidate generation only.** The file-walk-and-read block in
    `readMemoryEvidence` (`pre-turn-context.ts:1088-1210`, through where

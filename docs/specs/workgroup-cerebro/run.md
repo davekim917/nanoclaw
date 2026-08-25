@@ -1054,3 +1054,14 @@ deliver. If logs show one entity dropping repeatedly, that is the signal to revi
 `plan.md` §P2.6 P2-AC4 amended accordingly; its original assertion is quoted there so
 the change of contract is legible rather than silent. Full host suite green (289 files,
 4,257 tests).
+
+## P2.5 recall projection — build start 2026-08-25
+
+Approved plan: `plan.md` §P2.5 at 37065fd4; operator approval explicit ("Approved!").
+Builder: one cohesive worker per implementation phase — the write set is a single new
+module plus one seam edit in `pre-turn-context.ts`, too coupled to parallelize. All work
+in isolated worktrees; the shared checkout serves ~20 other agent sessions.
+
+Standing operator directive for this build: run opencode
+(`opencode-go/ox-alpha-free`, `OPENCODE_EFFORT=max`) adversarial checks against the
+implementation as it is built, not only at the `/team-review` gate.
