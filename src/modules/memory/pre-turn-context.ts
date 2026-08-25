@@ -2,9 +2,21 @@ import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 
+import type Database from 'better-sqlite3';
+
 import { buildSessionServicesSnapshot, type SessionServicesSnapshot } from '../../capabilities.js';
+import { DATA_DIR } from '../../config.js';
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
+import {
+  hydrateCandidates,
+  hydrateStreams,
+  openProjectionDb,
+  projectionPath,
+  queryTermCandidates,
+  readProjectionSummary,
+  readSourceFiles,
+} from './recall-projection-store.js';
 import {
   queryArchiveExactLinks,
   recentConversationSenderNames,
@@ -126,6 +138,88 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // instead of a live safety net.
   bootstrapFinalChars: 22_000,
 });
+
+/**
+ * `bestPassage`'s `maxChars` per lane, exactly as `rankAll` below passes it.
+ * Windows are maxChars-dependent, so the recall projection's build must
+ * precompute them at the width its lane will actually score at.
+ */
+export const LANE_EXCERPT_CHARS: Readonly<Record<'file' | 'fact', number>> = Object.freeze({
+  file: PRE_TURN_BOUNDS.markdownExcerptChars,
+  fact: PRE_TURN_BOUNDS.generatedFactExcerptChars,
+});
+
+/**
+ * Probe string for `tokenizerFingerprint`. Deliberately exercises every branch
+ * whose output the projection freezes: the stem table (`Managing` -> host,
+ * `capabilities`, `providers`, `suggestions`, `columns`, `worktrees`), the
+ * generic -ing/-ed/-s suffix rules, a stopword, an NFKC compatibility
+ * expansion, a circled digit, a context-sensitive sigma, and a hyphenated
+ * numeric run.
+ */
+const TOKENIZER_PROBE =
+  'Managing capabilities: providers hosted worktrees, suggestions and columns — ﬁle ① Σσ 2026-08-25.';
+let tokenizerFingerprintCache: number | null = null;
+
+/**
+ * A cheap behavioral hash of the recall tokenizer.
+ *
+ * `frozenBounds` records the constants a projection was built under so a
+ * changed constant forces a rebuild instead of serving stale windows (S1). The
+ * TOKENIZER is the same class of dependency and was the larger hole: the read
+ * path primes `TOKEN_STREAM_CACHE` with the projection's persisted stream, so a
+ * change to `canonicalToken` or `STOP_WORDS` without a rebuild would feed a
+ * WRONG stream to scoring — and, because the cache is process-wide, would
+ * poison the filesystem path for the same strings too. Hashing the tokenizer's
+ * output on a fixed probe catches every such change for three lines.
+ */
+function tokenizerFingerprint(): number {
+  if (tokenizerFingerprintCache !== null) return tokenizerFingerprintCache;
+  const probe = JSON.stringify(tokenStreamForRecall(TOKENIZER_PROBE));
+  // One entry, once per process, and it belongs to no workgroup — drop it so
+  // it never shows up in the cross-workgroup occupancy measurement (P2.5-AC18).
+  TOKEN_STREAM_CACHE.delete(TOKENIZER_PROBE);
+  let hash = 0;
+  for (let index = 0; index < probe.length; index++) hash = (Math.imul(hash, 31) + probe.charCodeAt(index)) | 0;
+  tokenizerFingerprintCache = hash;
+  return hash;
+}
+
+/**
+ * Every live constant the recall projection's BUILD output depends on, frozen
+ * into the file and compared as one JSON string at open.
+ *
+ * Recording these without enforcing them would be worse than not recording
+ * them — it reads as a guard that is not one. `schema_version` only moves when
+ * the TABLE shape changes, so widening `markdownExcerptChars` (or any of these)
+ * would otherwise leave a version-1 projection serving windows the live path
+ * would never produce. A mismatch is rebuild-required, exactly like a schema
+ * mismatch, never an error surfaced to a turn.
+ *
+ * The set is the real dependency set, not a sample: file/heading widths shape
+ * `searchable`, the two lane widths shape every stored passage window, the byte
+ * bounds shape which candidates exist at all, and the tokenizer fingerprint
+ * shapes every stored token.
+ */
+export function frozenBounds(): Record<string, number> {
+  return {
+    markdownFileBytes: PRE_TURN_BOUNDS.markdownFileBytes,
+    markdownScannedBytes: PRE_TURN_BOUNDS.markdownScannedBytes,
+    markdownHeadings: PRE_TURN_BOUNDS.markdownHeadings,
+    markdownHeadingChars: PRE_TURN_BOUNDS.markdownHeadingChars,
+    fileExcerptChars: LANE_EXCERPT_CHARS.file,
+    factExcerptChars: LANE_EXCERPT_CHARS.fact,
+    tokenizerFingerprint: tokenizerFingerprint(),
+  };
+}
+
+let frozenBoundsJsonCache: string | null = null;
+
+/** The comparison string `writeProjection` stores and `openProjectionDb` checks. */
+export function frozenBoundsJson(): string {
+  frozenBoundsJsonCache ??= JSON.stringify(frozenBounds());
+  return frozenBoundsJsonCache;
+}
 
 export interface PreTurnContextInput {
   agentGroupId: string;
@@ -1027,13 +1121,597 @@ function boundedFactLine(line: string, maxChars: number): string {
   return `${line.slice(0, budget).trimEnd()}${TRUNCATED_MARKDOWN_EXCERPT} ${marker}`;
 }
 
-/** Out-param populated by `readMemoryEvidence`, mirroring the `notices` mutable-array pattern. */
-interface RecallCandidateStats {
-  factCandidates: number;
-  fileCandidates: number;
+// ---------------------------------------------------------------------------
+// Shared candidate derivation (plan §P2.5.6 step 6, "collapse the duplicate")
+//
+// `readMemoryEvidence` and the recall projection's build MUST produce the same
+// candidates from the same tree, byte for byte (P2.5-I1). Phase 1 restated the
+// scan loop inside `recall-projection.ts` and the two copies had already
+// drifted once before this phase landed. These three functions are the single
+// implementation both call; nothing else may grow a second copy.
+// ---------------------------------------------------------------------------
+
+/**
+ * The ranked pool's listing: the capped walk unioned with the directly-listed
+ * topic dirs, deduped and `.sort()`ed.
+ */
+export function listRecallFiles(root: string, notices: ContextNotice[]): string[] {
+  return [...new Set([...listMarkdownFiles(root, notices), ...listTopicFiles(root, notices)])].sort();
 }
 
-function readMemoryEvidence(
+/**
+ * The listing with `generated/memory.md` spliced to the front.
+ *
+ * `sourceOrder` is array position in this list's per-lane projection, so any
+ * deviation here silently re-tie-breaks recall (decision 15). Copies rather
+ * than sorting `allFiles` in place; `Array.prototype.sort` is stable, so the
+ * result is identical either way.
+ */
+export function recallScanOrder(root: string, allFiles: readonly string[]): string[] {
+  const missing = missingGeneratedMemoryPath(root, allFiles);
+  return (missing ? [...allFiles, missing] : [...allFiles]).sort(
+    (a, b) => Number(b === GENERATED_MEMORY_RELATIVE_PATH) - Number(a === GENERATED_MEMORY_RELATIVE_PATH),
+  );
+}
+
+/** `statSync(..., { bigint: true })` as decimal strings, or null if it vanished. */
+export function statSourceIdentity(absolute: string): { size: string; mtimeNs: string; ino: string } | null {
+  try {
+    const stats = fs.statSync(absolute, { bigint: true });
+    return { size: String(stats.size), mtimeNs: String(stats.mtimeNs), ino: String(stats.ino) };
+  } catch {
+    // Vanished between listing and stat. A missing row is the honest record;
+    // the tree diff treats it as removed on the next check.
+    return null;
+  }
+}
+
+/**
+ * Sink the projection build attaches to record `source_file` rows. The live
+ * turn passes nothing, so the turn path pays no `statSync` it did not pay
+ * before.
+ *
+ * `scanning` returns a finisher rather than taking the headings directly so the
+ * recorded stat PREDATES the read: a file changed between the two then reads as
+ * stale and rebuilds, where the reverse order would record the new stat against
+ * old content.
+ */
+export interface RecallSourceSink {
+  /** A listed path the scan never opened (core, non-recall, preferences). */
+  skipped(relative: string, absolute: string): void;
+  /** About to read `relative`; the returned finisher gets `headingsOf(content)`. */
+  scanning(relative: string, absolute: string): (headings: string[]) => void;
+}
+
+export interface RecallScanResult {
+  fileCandidates: SearchableCandidate[];
+  factCandidates: SearchableCandidate[];
+  scannedBytes: number;
+}
+
+/**
+ * The ranked scan loop: read each listed file inside the shared byte budget and
+ * turn it into file candidates, or — for the fact ledger — one candidate per
+ * fact line sharing ONE headings array (decision 15).
+ */
+export function scanRecallCandidates(
+  root: string,
+  canonicalRoot: string,
+  scanOrder: readonly string[],
+  notices: ContextNotice[],
+  scannedBytes: number,
+  sink?: RecallSourceSink,
+): RecallScanResult {
+  const fileCandidates: SearchableCandidate[] = [];
+  const factCandidates: SearchableCandidate[] = [];
+  for (const relative of scanOrder) {
+    const absolute = path.join(root, relative);
+    if (
+      (CORE_PATHS as readonly string[]).includes(relative) ||
+      NON_RECALL_PATHS.has(relative) ||
+      relative.startsWith(PREFERENCES_DIR)
+    ) {
+      sink?.skipped(relative, absolute);
+      continue;
+    }
+    const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
+    if (remaining <= 0) {
+      notices.push({
+        source: 'markdown',
+        status: 'truncated',
+        code: 'markdown-byte-limit',
+        detail: `scanned ${PRE_TURN_BOUNDS.markdownScannedBytes} bytes`,
+      });
+      break;
+    }
+    const finishSource = sink?.scanning(relative, absolute);
+    // NO swallow here. If the file vanished between listing and now,
+    // `readBoundedFile` throws ENOENT, which on the turn path propagates to
+    // `readMemoryEvidence`'s outer catch and returns EMPTY evidence, and on the
+    // build path aborts the build. A build that skipped the file instead would
+    // produce a projection the live path would never agree with on the same
+    // tree — a byte-identity counterexample.
+    const read = readBoundedFile(
+      absolute,
+      canonicalRoot,
+      remaining,
+      relative === GENERATED_MEMORY_RELATIVE_PATH ? GENERATED_MEMORY_MAX_BYTES : PRE_TURN_BOUNDS.markdownFileBytes,
+    );
+    scannedBytes += read.bytes;
+    const headings = headingsOf(read.content);
+    finishSource?.(headings);
+    if (relative === GENERATED_MEMORY_RELATIVE_PATH) {
+      for (const line of read.content.split('\n')) {
+        if (!line.startsWith('- ')) continue;
+        const markerAt = line.indexOf('<!--');
+        factCandidates.push({
+          path: relative,
+          headings,
+          content: line,
+          // Score the fact, not its provenance marker. The marker is ~20% of a
+          // line's characters, and its tokens dilute the density term ranking
+          // uses, so scoring it penalised generated facts against clean manual
+          // Markdown. selectGeneratedMemoryForPrompt already strips it exactly
+          // this way on the curator side; this makes both paths agree.
+          searchable: markerAt < 0 ? line : line.slice(0, markerAt),
+          capturedAt: capturedAtOf(line),
+        });
+      }
+      continue;
+    }
+    fileCandidates.push({
+      path: relative,
+      headings,
+      content: read.content,
+      searchable: `${relative}\n${headings.join('\n')}\n${read.content}`,
+      capturedAt: '',
+    });
+  }
+  return { fileCandidates, factCandidates, scannedBytes };
+}
+
+// ---------------------------------------------------------------------------
+// Recall projection read seam (plan §P2.5.6 step 6)
+// ---------------------------------------------------------------------------
+
+export const RECALL_PROJECTION_BOUNDS = Object.freeze({
+  /** A warming pass slower than this leaves the workgroup cold. */
+  warmBudgetMs: 300,
+  /** A warm mark older than this is not trusted; the turn falls back. */
+  warmTtlMs: 60_000,
+  /** Past this age the turn still serves but schedules a background re-warm. */
+  warmRefreshMs: 30_000,
+  /** Candidates the warming probe hydrates, to touch the pages a turn will. */
+  probeHydrate: 32,
+});
+
+/**
+ * Fixed probe terms, mirroring `graph-scent.ts`'s: broad enough that the term
+ * index and a hydration batch are actually paged in, fixed so warmth means the
+ * same thing across workgroups and across probes.
+ */
+const PROJECTION_PROBE_TOKENS = ['deploy', 'schema', 'pipelin'];
+
+interface ProjectionWarmMark {
+  ino: number;
+  mtimeMs: number;
+  at: number;
+}
+
+const PROJECTION_WARM = new Map<string, ProjectionWarmMark>();
+/** Why the last warming pass refused, so a turn can report `stale` vs `cold`. */
+const PROJECTION_VERDICT = new Map<string, string>();
+/** Warming passes already queued, so N cold turns queue one pass, not N. */
+const PROJECTION_WARMING = new Set<string>();
+
+let projectionDataDir: string = DATA_DIR;
+let projectionClock: () => number = () => Date.now();
+let projectionSchedule: (run: () => void) => void = (run) => {
+  setImmediate(run);
+};
+let projectionWarmBudgetMs: number = RECALL_PROJECTION_BOUNDS.warmBudgetMs;
+let projectionWarmTtlMs: number = RECALL_PROJECTION_BOUNDS.warmTtlMs;
+let projectionScannedBytesBudget: number = PRE_TURN_BOUNDS.markdownScannedBytes;
+
+export interface RecallProjectionTestHooks {
+  dataDir?: string;
+  clock?: () => number;
+  /** Replaces `setImmediate`, so a test can run the warming pass deterministically. */
+  schedule?: (run: () => void) => void;
+  warmBudgetMs?: number;
+  warmTtlMs?: number;
+  /**
+   * Overrides `markdownScannedBytes` for decision 16's read-time assertion
+   * only. The real bound is 24 MiB, and a fixture that large would spend
+   * minutes tokenizing to prove one comparison.
+   */
+  scannedBytesBudget?: number;
+}
+
+export function _setRecallProjectionTestHooks(hooks: RecallProjectionTestHooks): void {
+  if (hooks.dataDir !== undefined) projectionDataDir = hooks.dataDir;
+  if (hooks.clock !== undefined) projectionClock = hooks.clock;
+  if (hooks.schedule !== undefined) projectionSchedule = hooks.schedule;
+  if (hooks.warmBudgetMs !== undefined) projectionWarmBudgetMs = hooks.warmBudgetMs;
+  if (hooks.warmTtlMs !== undefined) projectionWarmTtlMs = hooks.warmTtlMs;
+  if (hooks.scannedBytesBudget !== undefined) projectionScannedBytesBudget = hooks.scannedBytesBudget;
+}
+
+export function _resetRecallProjectionForTest(): void {
+  projectionDataDir = DATA_DIR;
+  projectionClock = () => Date.now();
+  projectionSchedule = (run) => {
+    setImmediate(run);
+  };
+  projectionWarmBudgetMs = RECALL_PROJECTION_BOUNDS.warmBudgetMs;
+  projectionWarmTtlMs = RECALL_PROJECTION_BOUNDS.warmTtlMs;
+  projectionScannedBytesBudget = PRE_TURN_BOUNDS.markdownScannedBytes;
+  PROJECTION_WARM.clear();
+  PROJECTION_VERDICT.clear();
+  PROJECTION_WARMING.clear();
+}
+
+export function _recallProjectionWarmForTest(workgroupId: string): boolean {
+  return PROJECTION_WARM.has(workgroupId);
+}
+
+/**
+ * The `scannedBytes` ceiling decision 16's two coupling assertions compare
+ * against — the build's, which refuses to produce a projection whose scan
+ * exhausted the budget, and the read's, which refuses to serve one. Both use
+ * this so they can never disagree, and so a test can exercise the arithmetic
+ * without a 24 MiB fixture.
+ */
+export function recallScannedBytesBudget(): number {
+  return projectionScannedBytesBudget;
+}
+
+function projectionIdentity(dbPath: string): { ino: number; mtimeMs: number } | null {
+  try {
+    const stats = fs.statSync(dbPath);
+    return { ino: stats.ino, mtimeMs: stats.mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Tree diff against `source_file`, BOTH directions (decision 5).
+ *
+ * Walking the stored rows alone structurally cannot see an ADDED file, which is
+ * one of the writer classes this must detect (P2.5-AC6), so the current tree is
+ * listed with the same `listMarkdownFiles`/`listTopicFiles` union the live path
+ * uses — visited cap, topic-dir union, generated-memory splice and all — and
+ * diffed against the rows. A rename that preserves size/mtime/ino is caught
+ * because the LISTING differs even though the stats match.
+ *
+ * Returns a reason string when stale, null when fresh. Never runs on the
+ * message-write path: `graph-scent.ts:48-55` records what a cold stat sweep
+ * there costs (19 stalls >3 s, worst 26.9 s).
+ */
+export function projectionTreeStaleness(root: string, db: Database.Database): string | null {
+  const discarded: ContextNotice[] = [];
+  const scanOrder = recallScanOrder(root, listRecallFiles(root, discarded));
+  const stored = readSourceFiles(db);
+  const seen = new Set<string>();
+  for (const relative of scanOrder) {
+    seen.add(relative);
+    const row = stored.get(relative);
+    const stats = statSourceIdentity(path.join(root, relative));
+    if (stats === null) {
+      // The build could not stat it either, so it recorded no row: agreement,
+      // not staleness. A row WITH no stat is a file that vanished since.
+      if (row !== undefined) return `vanished: ${relative}`;
+      continue;
+    }
+    if (row === undefined) return `added: ${relative}`;
+    if (row.size !== stats.size || row.mtimeNs !== stats.mtimeNs || row.ino !== stats.ino) {
+      return `changed: ${relative}`;
+    }
+  }
+  for (const relative of stored.keys()) if (!seen.has(relative)) return `removed: ${relative}`;
+  return null;
+}
+
+export interface ProjectionWarmResult {
+  warm: boolean;
+  reason: string;
+  elapsedMs: number;
+}
+
+/**
+ * Verify a workgroup's projection and mark it warm. NEVER call this from a
+ * turn: it opens the index, walks the tree, and pages in a hydration batch.
+ *
+ * Warmth tracks OS page-cache residency the same way graph-scent's probe does —
+ * a pass that answers inside budget is evidence the next turn's read will too,
+ * and the mark is bound to the index file's identity so a promote invalidates
+ * it. Failure of any kind unmarks: leaving the mark would re-run a failing read
+ * on every subsequent turn.
+ */
+export function warmRecallProjection(workgroupId: string, root: string): ProjectionWarmResult {
+  const dbPath = projectionPath(workgroupId, projectionDataDir);
+  const started = projectionClock();
+  const refuse = (reason: string): ProjectionWarmResult => {
+    PROJECTION_WARM.delete(workgroupId);
+    PROJECTION_VERDICT.set(workgroupId, reason);
+    return { warm: false, reason, elapsedMs: projectionClock() - started };
+  };
+  if (projectionIdentity(dbPath) === null) return refuse('absent');
+  let rejection = 'open-rejected';
+  let db: Database.Database | null;
+  try {
+    db = openProjectionDb(dbPath, frozenBoundsJson(), (reason) => {
+      rejection = reason;
+    });
+  } catch (error) {
+    return refuse(`open-threw: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (db === null) return refuse(rejection);
+  try {
+    const stale = projectionTreeStaleness(root, db);
+    if (stale !== null) return refuse(`stale: ${stale}`);
+    // Touch the pages a turn would: the term index, then a hydration batch.
+    const ids = queryTermCandidates(db, PROJECTION_PROBE_TOKENS, 1);
+    hydrateCandidates(db, ids.slice(0, RECALL_PROJECTION_BOUNDS.probeHydrate));
+  } catch (error) {
+    return refuse(`probe-failed: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    db.close();
+  }
+  const elapsedMs = projectionClock() - started;
+  if (elapsedMs > projectionWarmBudgetMs) return refuse(`slow: ${elapsedMs}ms`);
+  // Identity AFTER the work, so a promote racing the pass cannot stamp the new
+  // file with the old file's timing (graph-scent's `probeGraphScentWarmth`).
+  const identity = projectionIdentity(dbPath);
+  if (identity === null) return refuse('vanished-mid-probe');
+  PROJECTION_WARM.set(workgroupId, { ...identity, at: projectionClock() });
+  PROJECTION_VERDICT.delete(workgroupId);
+  return { warm: true, reason: 'warm', elapsedMs };
+}
+
+/** Queue one warming pass off the turn's stack. Coalesces concurrent requests. */
+function scheduleProjectionWarming(workgroupId: string, root: string): void {
+  if (PROJECTION_WARMING.has(workgroupId)) return;
+  PROJECTION_WARMING.add(workgroupId);
+  // ponytail: setImmediate, not the worker-thread wrapper the BUILD uses. The
+  // work here is an open plus a tree diff (~10 ms warm / ~21 ms cold measured,
+  // §P2.5.1), where a worker round trip costs more than the work; what matters
+  // is that it is off the turn's stack. Upgrade to `runProjectionBuild`'s
+  // thread pattern if the diff ever grows past a turn's own budget.
+  projectionSchedule(() => {
+    try {
+      const result = warmRecallProjection(workgroupId, root);
+      log.debug('recall-projection: warming', { workgroupId, ...result });
+    } catch (error) {
+      // A warming pass can never fail a turn; it already ran off the stack.
+      log.debug('recall-projection: warming failed', {
+        workgroupId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      PROJECTION_WARMING.delete(workgroupId);
+    }
+  });
+}
+
+/** Which source served a turn's candidates, for the per-build telemetry line. */
+export type RecallProjectionPath = 'hit' | 'cold' | 'stale' | 'fallback';
+
+interface ProjectionTurnRead {
+  fileCandidates: SearchableCandidate[];
+  factCandidates: SearchableCandidate[];
+  /** Build-time notices born in the tree listing (P2.5-I5). */
+  listingNotices: ContextNotice[];
+  /** The build's `markdown-byte-limit` notice, if the build's scan hit the cap. */
+  scanNotices: ContextNotice[];
+}
+
+/** `bestPassage`'s gate, restated so the term prefilter uses the same threshold. */
+function minimumOverlapFor(tokens: readonly string[]): number {
+  return tokens.length <= 2 ? 1 : 2;
+}
+
+/**
+ * Classify the last warming refusal for the telemetry line (decision 17).
+ *
+ * `cold` means "not verified warm yet" — nothing is wrong with the projection.
+ * `stale` means the tree moved. Everything else is a real defect (unopenable,
+ * wrong schema, bounds or tokenizer drift) and reads as `fallback`, because a
+ * dashboard that files those under `cold` would show a permanently-cold
+ * workgroup and no reason to look further.
+ */
+function warmthPathFor(reason: string | undefined): RecallProjectionPath {
+  if (reason === undefined) return 'cold';
+  if (reason.startsWith('stale:')) return 'stale';
+  if (reason === 'absent' || reason.startsWith('slow:') || reason === 'vanished-mid-probe') return 'cold';
+  return 'fallback';
+}
+
+/**
+ * The whole per-turn projection read, or null to serve the filesystem path.
+ *
+ * NEVER THROWS (P2.5-I4, decision 14). Every projection interaction — the
+ * warmth gate, the open, the summary, the byte-budget assertion, the term
+ * query, and each hydration batch — is inside a catch that resolves to a
+ * fallback with an attributed reason. Reaching `readMemoryEvidence`'s outer
+ * catch instead would emit `markdown-read-failed` and return EMPTY evidence,
+ * which is exactly what the invariant forbids.
+ *
+ * Two things make the term prefilter invisible to the delivered set:
+ *
+ * - The prefilter is a SUPERSET of what `bestPassage` keeps. Its term set is
+ *   the whole candidate's tokens unioned with every window's, so a candidate
+ *   with the required overlap inside one window necessarily has it in the term
+ *   set. Extra members score to `null` and are dropped by the same
+ *   `rankByBestPassage` filter the filesystem path runs.
+ * - The subset is returned in SCAN ORDER, and `sourceOrder` is compared
+ *   relatively (`a - b`), so absolute indices shifting is not observable
+ *   (P2.5-I2).
+ *
+ * The expanded token set is queried up front rather than re-queried on a
+ * double-zero (decision 11). The downstream conditional re-SCORE is untouched,
+ * so which evidence is selected and whether `ephemeral-query-expansion-used`
+ * fires are unchanged; only the index query moves. Doing it decision 11's way
+ * would require editing the ranking block the seam is contracted not to touch.
+ */
+function readProjectionForTurn(
+  workgroupId: string,
+  root: string,
+  queryTokens: string[],
+  expandedTokens: string[],
+  scannedBytes: number,
+  verdict: { path: RecallProjectionPath; reason: string },
+): ProjectionTurnRead | null {
+  const fail = (path: RecallProjectionPath, reason: string): null => {
+    verdict.path = path;
+    verdict.reason = reason;
+    return null;
+  };
+  const dbPath = projectionPath(workgroupId, projectionDataDir);
+  const identity = projectionIdentity(dbPath);
+  // Nothing on disk: no warming pass can help, only a build (the sweep's job).
+  if (identity === null) return fail('cold', 'absent');
+
+  const mark = PROJECTION_WARM.get(workgroupId);
+  const age = mark === undefined ? Number.POSITIVE_INFINITY : projectionClock() - mark.at;
+  const warm =
+    mark !== undefined && mark.ino === identity.ino && mark.mtimeMs === identity.mtimeMs && age < projectionWarmTtlMs;
+  if (!warm) {
+    if (mark !== undefined) PROJECTION_WARM.delete(workgroupId);
+    scheduleProjectionWarming(workgroupId, root);
+    const last = PROJECTION_VERDICT.get(workgroupId);
+    return fail(warmthPathFor(last), last ?? 'not-verified-warm');
+  }
+  // Serve, but refresh in the background before the mark can expire, so steady
+  // state never pays a fallback turn per TTL.
+  if (age >= RECALL_PROJECTION_BOUNDS.warmRefreshMs) scheduleProjectionWarming(workgroupId, root);
+
+  let rejection = 'open-rejected';
+  let db: Database.Database | null;
+  try {
+    db = openProjectionDb(dbPath, frozenBoundsJson(), (reason) => {
+      rejection = reason;
+    });
+  } catch (error) {
+    return fail('fallback', `open-threw: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (db === null) {
+    PROJECTION_WARM.delete(workgroupId);
+    return fail('fallback', rejection);
+  }
+  // Names the interaction that failed, so the telemetry line says which one.
+  let at = 'summary';
+  try {
+    const summary = readProjectionSummary(db);
+    at = 'byte-budget';
+    // Decision 16 / P2.5-I8. The build starts its scan at zero bytes; a turn
+    // starts it after the core and preference lanes have spent some, and the
+    // preference lane's cost depends on WHO is in the conversation. The live
+    // loop diverges from the build exactly when `spentBeforeScan +
+    // buildScannedBytes` exceeds the budget — before that point every
+    // `remaining` is still at least the bytes the build read, so no file is
+    // truncated differently and the loop never breaks early.
+    //
+    // The preference term is bounded by its own caps rather than measured, so
+    // the assertion is independent of the turn's participants: a projection is
+    // either valid for every possible roster or for none, never "valid for
+    // this conversation". That is stricter than the plan requires and removes
+    // the per-turn dependency instead of merely detecting it.
+    const budget = recallScannedBytesBudget();
+    const preferenceHeadroom = PRE_TURN_BOUNDS.preferenceExcerpts * PRE_TURN_BOUNDS.markdownFileBytes;
+    if (scannedBytes + preferenceHeadroom + summary.scannedBytes > budget) {
+      return fail(
+        'fallback',
+        `byte-budget: ${scannedBytes} + ${preferenceHeadroom} + ${summary.scannedBytes} over ${budget}`,
+      );
+    }
+    at = 'begin';
+    // Decision 13 / P2.5-I7. Under WAL every statement otherwise gets a fresh
+    // read snapshot, so an incremental commit landing between the term query
+    // and hydration could hand back dangling ids or a candidate set that
+    // existed in no committed generation.
+    db.exec('BEGIN DEFERRED');
+    at = 'term-query';
+    const ids = new Set(queryTermCandidates(db, queryTokens, minimumOverlapFor(queryTokens)));
+    if (expandedTokens.length !== queryTokens.length || expandedTokens.some((token, i) => token !== queryTokens[i])) {
+      for (const id of queryTermCandidates(db, expandedTokens, minimumOverlapFor(expandedTokens))) ids.add(id);
+    }
+    at = 'hydrate';
+    const hydrated = hydrateCandidates(db, [...ids]);
+    at = 'hydrate-streams';
+    // Only the candidates the process-wide cache has evicted need their
+    // persisted stream fetched at all — in steady state that is none of them,
+    // and skipping the fetch is what keeps a projection turn cheaper than the
+    // warm walk rather than more expensive than it.
+    const uncached = hydrated.filter((candidate) => !TOKEN_STREAM_CACHE.has(candidate.searchable));
+    if (uncached.length > 0) {
+      const streams = hydrateStreams(
+        db,
+        uncached.map((candidate) => candidate.id),
+      );
+      for (const candidate of uncached) {
+        const stream = streams.get(candidate.id);
+        if (stream !== undefined) primeTokenStream(candidate.searchable, stream);
+      }
+    }
+    at = 'commit';
+    db.exec('COMMIT');
+    const notices = summary.notices;
+    return {
+      fileCandidates: hydrated.filter((candidate) => candidate.lane === 'file'),
+      factCandidates: hydrated.filter((candidate) => candidate.lane === 'fact'),
+      // Split by birthplace so each notice lands where the filesystem path
+      // would have pushed it: listing notices before the preference lane, the
+      // byte-limit notice after it (P2.5-AC13 compares them byte for byte, and
+      // ORDER is part of the delivered context).
+      listingNotices: notices.filter((notice) => notice.code !== 'markdown-byte-limit'),
+      scanNotices: notices.filter((notice) => notice.code === 'markdown-byte-limit'),
+    };
+  } catch (error) {
+    PROJECTION_WARM.delete(workgroupId);
+    return fail('fallback', `${at}: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Seed the process-wide token cache with a hydrated candidate's persisted
+ * stream, so scoring never re-tokenizes it (decision 3, P2.5-I9).
+ *
+ * This is the entire point of persisting the stream: `bestPassage` reaches
+ * `tokenStreamForRecall(searchable)` through `passageWindows`, and a cache hit
+ * there is what turns hydration into ready-to-score tokens. Safe because
+ * `frozenBounds` carries a tokenizer fingerprint — a projection built under a
+ * different tokenizer is refused at open, so a stale stream can never be
+ * primed under a live key.
+ */
+function primeTokenStream(value: string, tokens: readonly RecallToken[]): void {
+  if (TOKEN_STREAM_CACHE.has(value)) return;
+  if (TOKEN_STREAM_CACHE.size >= TOKEN_STREAM_CACHE_MAX) {
+    TOKEN_STREAM_CACHE.delete(TOKEN_STREAM_CACHE.keys().next().value!);
+  }
+  TOKEN_STREAM_CACHE.set(value, tokens);
+}
+
+/** Out-param populated by `readMemoryEvidence`, mirroring the `notices` mutable-array pattern. */
+export interface RecallCandidateStats {
+  factCandidates: number;
+  fileCandidates: number;
+  /** Which source produced those counts, and why, for the per-build log line. */
+  recallPath: RecallProjectionPath;
+  recallReason: string;
+}
+
+/**
+ * Exported for P2.5-AC1's differential harness, which has to drive the SAME
+ * downstream ranking/dedupe/budget code from both candidate sources and compare
+ * the delivered excerpts byte for byte. Comparing candidate sets alone would
+ * miss exactly the regressions the invariant is about — `sourceOrder`
+ * tie-breaks and `contextualExcerpt`'s anchor both live below this line.
+ */
+export function readMemoryEvidence(
   root: string,
   workgroupId: string,
   query: string,
@@ -1076,8 +1754,19 @@ function readMemoryEvidence(
 
   const queryTokens = tokenizeForRecall(query);
   const expandedTokens = tokenizeForRecall(`${query} ${ephemeralExpansion(query).join(' ')}`);
-  const fileCandidates: SearchableCandidate[] = [];
-  const factCandidates: SearchableCandidate[] = [];
+  // The whole projection read happens HERE, at the listing's position, not at
+  // the scan loop's — including the term query and hydration. Anything that can
+  // fail has to fail before the first projection-born notice is pushed;
+  // otherwise a late failure would have to un-push notices and re-list the
+  // tree, landing the listing notices after the preference lane's instead of
+  // before them (P2.5-AC13 compares delivered notices, order included).
+  const recall = { path: 'fallback' as RecallProjectionPath, reason: 'unset' };
+  const projected = readProjectionForTurn(workgroupId, root, queryTokens, expandedTokens, scannedBytes, recall);
+  if (projected !== null) {
+    recall.path = 'hit';
+    recall.reason = 'projection';
+    for (const notice of projected.listingNotices) notices.push(notice);
+  }
   // Read the fact store first. `markdownScannedBytes` is a single budget spent
   // in listing order, and `generated/` sorts after `bootstrap/`, `concepts/`,
   // `conversations/`, `facts/` and `imports/`. A large manual tree would
@@ -1088,7 +1777,7 @@ function readMemoryEvidence(
   // Union rather than walk-only: the topic directories are listed directly so
   // an earlier-sorting directory cannot spend the walk's entry budget before
   // they are reached. Deduped because the walk usually does reach some of them.
-  const allFiles = [...new Set([...listMarkdownFiles(root, notices), ...listTopicFiles(root, notices)])].sort();
+  const allFiles = projected === null ? listRecallFiles(root, notices) : [];
 
   // Deterministic per-person preference lane. Files under preferences/ are
   // keyed by name slug and injected whole for the conversation's involved
@@ -1154,62 +1843,31 @@ function readMemoryEvidence(
     }
   }
 
-  const missingGeneratedMemory = missingGeneratedMemoryPath(root, allFiles);
-  const scanOrder = (missingGeneratedMemory ? [...allFiles, missingGeneratedMemory] : allFiles).sort(
-    (a, b) => Number(b === GENERATED_MEMORY_RELATIVE_PATH) - Number(a === GENERATED_MEMORY_RELATIVE_PATH),
-  );
-  for (const relative of scanOrder) {
-    if ((CORE_PATHS as readonly string[]).includes(relative)) continue;
-    if (NON_RECALL_PATHS.has(relative)) continue;
-    if (relative.startsWith(PREFERENCES_DIR)) continue;
-    const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
-    if (remaining <= 0) {
-      notices.push({
-        source: 'markdown',
-        status: 'truncated',
-        code: 'markdown-byte-limit',
-        detail: `scanned ${PRE_TURN_BOUNDS.markdownScannedBytes} bytes`,
-      });
-      break;
-    }
-    const read = readBoundedFile(
-      path.join(root, relative),
-      canonicalRoot,
-      remaining,
-      relative === GENERATED_MEMORY_RELATIVE_PATH ? GENERATED_MEMORY_MAX_BYTES : PRE_TURN_BOUNDS.markdownFileBytes,
-    );
-    scannedBytes += read.bytes;
-    const headings = headingsOf(read.content);
-    if (relative === GENERATED_MEMORY_RELATIVE_PATH) {
-      for (const line of read.content.split('\n')) {
-        if (!line.startsWith('- ')) continue;
-        const markerAt = line.indexOf('<!--');
-        factCandidates.push({
-          path: relative,
-          headings,
-          content: line,
-          // Score the fact, not its provenance marker. The marker is ~20% of a
-          // line's characters, and its tokens dilute the density term ranking
-          // uses, so scoring it penalised generated facts against clean manual
-          // Markdown. selectGeneratedMemoryForPrompt already strips it exactly
-          // this way on the curator side; this makes both paths agree.
-          searchable: markerAt < 0 ? line : line.slice(0, markerAt),
-          capturedAt: capturedAtOf(line),
-        });
-      }
-      continue;
-    }
-    fileCandidates.push({
-      path: relative,
-      headings,
-      content: read.content,
-      searchable: `${relative}\n${headings.join('\n')}\n${read.content}`,
-      capturedAt: '',
-    });
+  // Candidate generation. Either the projection already produced both lanes —
+  // in scan order, term-filtered to a superset of what scoring keeps — or the
+  // shared scan loop reads the tree. That loop is the SAME function the
+  // projection's build calls, so the two cannot drift (plan §P2.5.6 step 6).
+  let fileCandidates: SearchableCandidate[];
+  let factCandidates: SearchableCandidate[];
+  if (projected !== null) {
+    fileCandidates = projected.fileCandidates;
+    factCandidates = projected.factCandidates;
+    // The build's own `markdown-byte-limit`, pushed where the scan loop would
+    // have pushed it (P2.5-I5).
+    for (const notice of projected.scanNotices) notices.push(notice);
+  } else {
+    const scanned = scanRecallCandidates(root, canonicalRoot, recallScanOrder(root, allFiles), notices, scannedBytes);
+    fileCandidates = scanned.fileCandidates;
+    factCandidates = scanned.factCandidates;
+    // `scanned.scannedBytes` is deliberately not read back: nothing below this
+    // point spends the shared budget, and the projection's own total is what
+    // the read-time coupling assertion above compares.
   }
   if (candidateStats) {
     candidateStats.factCandidates = factCandidates.length;
     candidateStats.fileCandidates = fileCandidates.length;
+    candidateStats.recallPath = recall.path;
+    candidateStats.recallReason = recall.reason;
   }
   const rankPool = (
     pool: SearchableCandidate[],
@@ -1569,7 +2227,14 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // otherwise make meaningless per line.
   const tokenStatsBefore = { ...TOKEN_STREAM_CACHE_STATS };
   const offsetStatsBefore = { ...OFFSET_SLICE_STATS };
-  const candidateStats: RecallCandidateStats = { factCandidates: 0, fileCandidates: 0 };
+  const candidateStats: RecallCandidateStats = {
+    factCandidates: 0,
+    fileCandidates: 0,
+    // Stays this way when `readMemoryEvidence` throws before it reports, which
+    // is itself the signal that the seam was not what served the turn.
+    recallPath: 'fallback',
+    recallReason: 'not-reached',
+  };
   const db = getDb();
   const scope = db
     .prepare(
@@ -1832,6 +2497,12 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     elapsedMs: Date.now() - startedAt,
     factCandidates: candidateStats.factCandidates,
     fileCandidates: candidateStats.fileCandidates,
+    // Which source produced those counts (decision 17, P2.5-AC20). Nothing else
+    // would catch the projection drifting from the filesystem path after ship:
+    // a sustained `hit` whose candidate counts collapse, or a `stale`/`cold`
+    // that never clears, are both visible here and nowhere else.
+    recallPath: candidateStats.recallPath,
+    recallReason: candidateStats.recallReason,
     tokenCacheSize: TOKEN_STREAM_CACHE.size,
     tokenCacheMax: TOKEN_STREAM_CACHE_MAX,
     tokenCacheHits: TOKEN_STREAM_CACHE_STATS.hits - tokenStatsBefore.hits,
