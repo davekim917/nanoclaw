@@ -977,7 +977,20 @@ export function searchArchiveEvidence(input: {
            JOIN messages_archive scoped ON scoped.rowid = messages_archive_fts.rowid
           WHERE messages_archive_fts MATCH ?
             AND scoped.${scope.sql}
-          ORDER BY current_rank ASC, score ASC
+          -- rowid completes the sort key. current_rank and score alone are not
+          -- unique — on the live archive 14,627 (current_rank, score) groups hold
+          -- more than one row, and for a typical query the LIMIT lands inside one
+          -- of them, so WHICH tied rows survive the cut would otherwise be the
+          -- planner's choice rather than ours. rowid is unique, so this makes the
+          -- order total and the surviving set reproducible.
+          --
+          -- This does not change today's output: SQLite already returns FTS
+          -- matches in rowid order and its sorter preserves that for equal keys,
+          -- verified byte-identical on real data across MATERIALIZED /
+          -- NOT MATERIALIZED / reversed-join-order plans. It pins that incidental
+          -- behavior so a future SQLite, index, or query edit cannot silently
+          -- reshuffle delivered evidence.
+          ORDER BY current_rank ASC, score ASC, messages_archive_fts.rowid ASC
           LIMIT ?
        )
        SELECT a.id, a.agent_group_id, a.messaging_group_id, a.channel_type,
