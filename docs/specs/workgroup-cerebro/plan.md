@@ -1121,6 +1121,12 @@ survivors); true cold 137 ms (open 68.33 + source scan 27.00 + term query 41.83)
 single-join hydration variant cost 116 ms on the broadest query vs. 27 ms for
 two-phase, so two-phase is kept.
 
+The 37.7 MB/11.2 MB build sizes above do NOT include tokenization (§P2.5.2 decision
+3 adds it after this measurement was taken) — they are stale as total-size estimates.
+The real per-workgroup size with the persisted token stream and passage windows is
+unmeasured; the storage risk in §P2.5.5 is not assessed until `/team-build` measures
+it against the largest workgroup.
+
 ### P2.5.2 Design decisions
 
 1. **Location.** Per-workgroup SQLite projection at
@@ -1137,18 +1143,38 @@ two-phase, so two-phase is kept.
    per turn and closes it in `finally` (`queryPointers`,
    `src/modules/memory/graph-scent.ts:225-233`) — measured 0.13–0.49 ms warm
    open/close cost there.
-3. **Schema.** `candidate` holds the five fields `readMemoryEvidence` already builds
-   per candidate (`SearchableCandidate`: `path`, `headings`, `content`, `searchable`,
-   `capturedAt` — `pre-turn-context.ts:988-997`) plus two projection-only fields,
-   `lane` (`file` | `fact`) and `scan_order` (decision 4 below). `term(token,
-candidate_id)` is built with the project's own tokenizer, **not FTS5**: `node_fts`
-   is unstemmed `unicode61` (`src/graphify/store.ts:935`) while `tokenizeForRecall`
-   stems and folds meaning, and a single bm25 score cannot reproduce the live ranking
-   tuple — coverage, then density, then token span, then a question-mark preference
-   (`comparePassageMatch`, `pre-turn-context.ts:609-615`), tie-broken by recency for
-   facts / path for files, then scan order (`rankByBestPassage`,
-   `pre-turn-context.ts:654-675`). `source_file(path, size, mtime_ns, ino)` backs
-   staleness detection (decision 5).
+3. **Schema, including the persisted token stream.** `candidate` holds the five
+   fields `readMemoryEvidence` already builds per candidate (`SearchableCandidate`:
+   `path`, `headings`, `content`, `searchable`, `capturedAt` —
+   `pre-turn-context.ts:987-997`) plus projection-only fields: `lane` (`file` |
+   `fact`), `scan_order` (decisions 6 and 15 below), and — this is the change from an
+   earlier draft — the persisted recall-token stream. A schema storing only
+   path/headings/content/searchable/capturedAt/lane/scan_order does NOT persist
+   tokenization, so scoring would still re-tokenize every candidate every turn
+   through the process-wide `TOKEN_STREAM_CACHE`
+   (`pre-turn-context.ts:314-334`, a single `Map` capped at 24,576 entries and shared
+   by every workgroup on the host). That would not fix cross-workgroup contention —
+   half this pillar's stated purpose, and the operator's normal working pattern of
+   several active workgroups at once. `candidate` therefore also stores, per
+   candidate, the whole-candidate `tokenizeForRecall` stream and the precomputed
+   `passageWindows` output (`Array<{ text, tokens: RecallToken[] }>`, each
+   `RecallToken` a `{ value, start, end }` triple) in the exact shape `bestPassage`
+   and `passageWindows` consume today, so hydration returns tokens ready to score
+   with no re-tokenization call on the read path (P2.5-I9). `term(token,
+candidate_id)` is built from that persisted stream with the project's own tokenizer,
+   **not FTS5**: `node_fts` is unstemmed `unicode61` (`src/graphify/store.ts:935`)
+   while `tokenizeForRecall` stems and folds meaning, and a single bm25 score cannot
+   reproduce the live ranking tuple — coverage, then density, then token span, then a
+   question-mark preference (`comparePassageMatch`, `pre-turn-context.ts:609-615`),
+   tie-broken by recency for facts / path for files, then scan order
+   (`rankByBestPassage`, `pre-turn-context.ts:654-675`). `source_file(path, size,
+   mtime_ns, ino)` backs staleness detection (decision 5).
+
+   Storage consequence: the measured 37.7 MB build (§P2.5.1) predates this decision
+   and excludes token storage. The real number is unmeasured; `/team-build` must
+   measure it on the largest workgroup before the storage risk (§P2.5.5) is
+   considered assessed, not assumed close to 37.7 MB.
+
 4. **Replaces candidate generation only.** The file-walk-and-read block in
    `readMemoryEvidence` (`pre-turn-context.ts:1088-1210`, through where
    `candidateStats` is populated) is what the projection replaces, producing exactly
@@ -1156,24 +1182,51 @@ candidate_id)` is built with the project's own tokenizer, **not FTS5**: `node_ft
    order. Everything downstream — ranking, dedupe, budget trimming, notices
    (`pre-turn-context.ts:1211-1348`) — is untouched: it does no filesystem access and
    does not care whether its input candidates came from a walk or a projection read.
-5. **Staleness at read time, not a write hook.** Walk `source_file` and
-   `statSync(path, { bigint: true })`, comparing size, `mtime_ns`, and `ino`.
-   Measured ~10 ms warm / ~21 ms cold; `{ bigint: true }` costs +2 ms over the default
-   float `mtimeMs` and is required — default-precision `mtimeMs` misses a same-size
-   in-place edit inside one millisecond, and ext4 gives nanosecond resolution. This is
+5. **Staleness diffs the TREE, and neither staleness nor warmth ever blocks a turn.**
+   An earlier draft said "walk `source_file`" for staleness detection; iterating
+   stored rows structurally cannot see an ADDED file, which contradicts the
+   added-file case this pillar must detect (P2.5-AC6). The check instead walks the
+   tree — the same `listMarkdownFiles`/`listTopicFiles` union the live path uses,
+   reproducing the 2,048-entry visited cap's allocation
+   (`pre-turn-context.ts:872-883`), the topic-dir union (`:1088`), and the
+   generated-memory splice (`:977-986`, `:1155-1157`), not just per-file identity —
+   and diffs it against `source_file` in both directions: added, removed, and
+   changed. "Changed" is still `statSync(path, { bigint: true })` comparing size,
+   `mtime_ns`, and `ino`. Measured ~10 ms warm / ~21 ms cold; `{ bigint: true }` costs
+   +2 ms over the default float `mtimeMs` and is required — default-precision
+   `mtimeMs` misses a same-size in-place edit inside one millisecond, and ext4 gives
+   nanosecond resolution. A rename that preserves size/mtime/ino is still detected,
+   because the tree listing differs even though the stats match. This is
    deliberately not a write hook: the workgroup memory mount is read-write inside the
    container (decision 1), raw shell writes and hand edits admit no hook, and even the
    host curator writes memory from a spawned Bun subprocess (§P2.4 item 8) outside any
    process the host could hook into. A hook may later sit on top as a fast path over
    this check; it can never replace it.
-6. **Incremental maintenance by fact id.** Across 95 consecutive curator rewrites of
-   `generated/memory.md` sampled across five workgroups, changed lines = **zero** —
-   the curator only appends new `mem_<16-hex>` ids (`memoryFactId`,
-   `curator-contract.ts:327`) and removes superseded ones; it never rewrites a
-   surviving line in place. Steady-state maintenance is therefore a 1–5-row diff
-   against the projection's own `candidate` rows for `generated/memory.md`, not a
-   rebuild. Full rebuild stays the exception path (missing projection, corruption, or
-   a staleness hit on a non-ledger file).
+
+   Neither this tree-diff nor the projection open may ever run as a blocking
+   cold-cache sweep on the message-write path. `graph-scent.ts:48-55` documents what
+   happens when a "measured on hot page cache" assumption dies on this exact host: 19
+   stalls >3s (worst 26.9s) after deploy churn evicted page cache — which is why
+   graph-scent added warm-gating and refuses cold queries on the message path
+   (`:10-17`). The per-turn read adopts the same posture: it uses the projection only
+   when an explicit warmth check says it is warm; a cold or unverified projection
+   serves the existing filesystem path for that turn, and warming (the tree-diff plus
+   open) is scheduled off the event loop, using decision 7's worker-thread pattern.
+
+6. **Incremental maintenance by fact id, scan order preserved per lane.** Across 95
+   consecutive curator rewrites of `generated/memory.md` sampled across five
+   workgroups, changed lines = **zero** — the curator only appends new `mem_<16-hex>`
+   ids (`memoryFactId`, `curator-contract.ts:327`) and removes superseded ones; it
+   never rewrites a surviving line in place. Steady-state maintenance is therefore a
+   1–5-row diff against the projection's own `candidate` rows for
+   `generated/memory.md`, not a rebuild. `scan_order` is assigned PER LANE — files
+   and facts are ranked as separate pools, each supplying its own 0-based
+   `sourceOrder` (`pre-turn-context.ts:662-667`, `:1226-1229`) — and an incremental
+   update must assign new rows `MAX(scan_order) + 1` within their lane, never a value
+   derived from row COUNT: a delete-then-append cycle makes the two diverge, and a
+   count-based assignment would silently corrupt the tie-break order a full rebuild
+   would have produced (P2.5-AC10). Full rebuild stays the exception path (missing
+   projection, corruption, or a staleness hit on a non-ledger file).
 7. **Builds run off the host event loop.** The in-tree worker-thread pattern already
    used for synchronous `better-sqlite3` work applies directly —
    `reconcile-store-worker-thread.ts:21` and `isolated-source-reconcile-thread.ts:16-22`
@@ -1210,6 +1263,80 @@ candidate_id)` is built with the project's own tokenizer, **not FTS5**: `node_ft
     `ephemeral-query-expansion-used` only if the expanded scorer actually selects
     evidence the direct scorer didn't. Otherwise the expansion pass is dead code
     running with no observable effect — a claim a test demonstrates, not asserts.
+12. **Promote protocol: build to a side file, never mutate `index.db` in place.** A
+    full rebuild writes to `index.next-<stamp>` and atomically renames it over
+    `index.db` on completion. This plan already leans on the precedent without
+    stating it as a requirement: `graph-scent.ts:19-20` documents exactly this ("a
+    daemon index promote (rename of index.next-\* over index.db)") and treats a
+    mid-rename `ENOENT` as a first-class state (`:250-252`). A reader must never
+    observe a partially-populated index. A build that dies mid-way leaves the
+    previous `index.db` intact and fully servable. "Looks complete" (file exists,
+    opens without error) must be distinguishable from "is complete": the build
+    writes a completeness marker last, inside the same transaction that finalizes
+    the build, and a reader checks that marker before trusting the file's contents.
+13. **Snapshot isolation for the two-phase read.** The cited `queryPointers`
+    precedent (`graph-scent.ts:225-233`) is a single `.all()` call, atomic by
+    autocommit. This projection's per-turn read is two-phase — a term-index query,
+    then a hydration pass — which under WAL gets a NEW read snapshot per statement:
+    an incremental commit (decision 6) landing between the two phases can hand back
+    dangling ids, or a candidate set that existed in no committed generation. The
+    whole per-turn read runs inside one deferred transaction (`BEGIN` … `COMMIT`) so
+    both phases see one snapshot.
+14. **Every projection interaction degrades independently; a schema mismatch is a
+    rebuild trigger, not an error.** Open-time failure (missing/corrupt/stale) is
+    not the only failure mode: schema drift, a truncated page, or disk-full can all
+    OPEN fine and throw mid-turn, where today the only net is the outer catch in
+    `readMemoryEvidence` (`pre-turn-context.ts:1678`), which emits
+    `markdown-read-failed` and returns EMPTY — exactly what P2.5-I4 forbids. Every
+    projection interaction — open, warmth/staleness check, term query, each
+    hydration batch — is individually wrapped and falls back to the filesystem path
+    on failure, never bubbling to that outer catch. The projection carries a
+    `schema_version` guard mirroring `WorkgroupGraphStore` (`store.ts:27`, `:969`); a
+    version mismatch triggers a rebuild, it is not surfaced as an error.
+15. **Byte-identity long tail: reproduce the causes, not just the symptoms.** Three
+    behaviors must be replicated exactly, quirks included — "correcting" any of them
+    on the projection path would silently change delivered text relative to the
+    filesystem path:
+    - `contextualExcerpt`'s `indexOf` clamp to `0` on a miss (`:1351-1352`) has a
+      specific cause: for files, `searchable` is `path\nheadings\ncontent`
+      (`:1203`) while the excerpt is sliced from `content` alone, so a passage
+      overlapping the heading prefix legitimately fails to find its own text and
+      the excerpt falls back to the top of the file. Hydration must reproduce this
+      exact miss, not fix it.
+    - The fact lane's `headings` array is computed ONCE per ledger and shared by
+      reference across every fact candidate drawn from it (`:1179`→`:1186`),
+      including `headingsOf`'s truncation to `PRE_TURN_BOUNDS.markdownHeadings`
+      entries / `markdownHeadingChars` characters each (`:806-813`). It must
+      round-trip as one shared array, not be re-derived per fact.
+    - `capturedAt` is compared as a raw string, never parsed (`byRecency`, `:1225`,
+      `compareCodepoint`; empty sorts last). Store and compare it verbatim; any
+      parse/reformat step flips tie-breaks silently.
+    - `sourceOrder` is array position in the ranked pool passed to
+      `rankByBestPassage` (`:663`), and that pool's order comes from a specific
+      pipeline — Set-union of `listMarkdownFiles` and `listTopicFiles`, `.sort()`,
+      then the conditional `generated/memory.md` splice (`:1155-1157`). The
+      projection must replay that exact pipeline to assign `scan_order`, not
+      substitute a monotonic build-time counter.
+16. **Budget coupling is a documented constraint, not a corner case.** The
+    preference lane consumes the shared `scannedBytes` budget (`:1116-1120`) BEFORE
+    the ranked scan loop runs, and the scan loop breaks and fires
+    `markdown-byte-limit` when that budget is exhausted (`:1162-1171`). Preference
+    cost depends on `involvedSenderNames`, which varies per turn by who is in the
+    conversation — so on the live filesystem path, which candidates even exist can
+    depend on the turn's participants. A build-time projection cannot reproduce
+    that; it can only freeze a build-time state. Today this is dormant only because
+    the shared budget (24 MiB) dwarfs measured non-ledger content (~1.84 MB) — a
+    data coincidence, not a design property. The projection is valid only while
+    non-ledger content stays under the budget; both build and read assert this and
+    fail loudly into the filesystem-path fallback if it ceases to hold, rather than
+    silently serving a candidate set the live path would not have produced.
+17. **Production divergence detection extends the existing telemetry line, it does
+    not add a new one.** P2.5-AC1 is a one-time pre-ship gate; nothing today would
+    catch the projection drifting from the filesystem path after ship. The
+    per-build log line already shipped at `pre-turn-context.ts:1822-1833`
+    (`log.debug('pre-turn-context: build', …)`) gains fields for which path served
+    the turn — hit / stale / cold / a fallback reason — and the candidate counts
+    from whichever source served it.
 
 **Rejected alternatives.** Prefilter-before-scoring (measured: saves only ~230 ms of
 the ~690 ms warm cost, because the walk, the 6.5 MB ledger read, and candidate
@@ -1233,71 +1360,128 @@ b`), so candidates must be returned to the ranker in scan order, never term-inde
   order.
 - P2.5-I3. The projection is derived state; the Markdown tree remains the sole
   authority and the host/container/operator interface.
-- P2.5-I4. A stale or missing projection degrades to the existing filesystem path
-  rather than returning wrong or empty results.
+- P2.5-I4. A missing, stale, cold (unverified-warm), corrupt, or
+  schema-mismatched projection degrades to the existing filesystem path rather than
+  returning wrong or empty results — and this holds per projection interaction
+  (open, warmth/staleness, term query, each hydration batch), not only at open time
+  (decision 14).
 - P2.5-I5. Notices born inside the seam are reproduced exactly: `missing-core-memory`,
   `preference-read-failed`, `preference-recall`, `markdown-symlink-skipped`,
   `markdown-file-limit`, `markdown-byte-limit`.
+- P2.5-I6. A reader never observes a partially-populated index; a build that dies
+  mid-promote leaves the previous `index.db` fully intact and servable
+  (decision 12).
+- P2.5-I7. The per-turn two-phase read (term query + hydration) observes exactly one
+  committed generation of the projection, never a mix of two (decision 13).
+- P2.5-I8. The projection is valid only while non-ledger markdown content stays
+  under the shared `scannedBytes` budget; a build or read where that ceases to hold
+  falls back to the filesystem path rather than serving divergent candidates
+  (decision 16).
+- P2.5-I9. The persisted token stream and passage windows are byte-identical to what
+  `tokenizeForRecall`/`passageWindows` produce at read time for the same input
+  (decision 3).
 
 ### P2.5.4 Acceptance criteria — exact cases for `/team-build`
 
 In `recall-projection.test.ts` unless noted; real temp SQLite files, no mocking of
 `better-sqlite3`.
 
-| #         | Test name                                                                                                      | Assertion                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| --------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P2.5-AC1  | `differential equivalence against the filesystem path` (harness test, real corpus)                             | A real archive-mined query corpus plus paraphrase adversarials, run through both the projection-backed and filesystem-walk candidate generation and the SAME downstream ranking/dedupe/budget code: ranked-set membership AND delivered excerpt text are byte-identical for every query. Zero mismatches — today's manual probe met this at 320/320.                                                                                                                                                      |
-| P2.5-AC2  | `scan order survives hydration, not term-index insertion order`                                                | Fixture where term rows are inserted in an order that differs from ledger/file scan order: hydrated candidates come back in `scan_order` order, so `sourceOrder` tie-breaks match the live walk exactly (P2.5-I2).                                                                                                                                                                                                                                                                                        |
-| P2.5-AC3  | `window tokens from the non-sliceable fallback are unioned into the term set`                                  | A candidate whose passage windows hard-chop mid-word (`offsetSliceable` false) is matched by a query token that exists only in a chopped window, not in the whole-candidate tokenization.                                                                                                                                                                                                                                                                                                                 |
-| P2.5-AC4  | `staleness is detected for every writer class`                                                                 | Four independently asserted cases against one built projection: a container-side write to a tracked file, an in-place same-size edit completed within 1 ms of the original mtime, a new file added under the memory root, and a tracked file removed — each is individually detected stale, none silently served fresh. Guards against a batch test where only the first writer class is actually checked.                                                                                                |
-| P2.5-AC5  | `missing, stale, or corrupt projection falls back to the filesystem path`                                      | Three cases — no `index.db`, an `index.db` failing the staleness check, and an `index.db` that fails to open (corrupt/truncated) — each returns the same candidates the filesystem path would, never throws, never returns an empty or wrong result (P2.5-I4).                                                                                                                                                                                                                                            |
-| P2.5-AC6  | `incremental update by fact id touches only the changed rows`                                                  | A curator rewrite that appends 3 new `mem_*` facts and removes 2 superseded ones: after incremental update, exactly those 5 candidate/term row sets changed (asserted by row count and by id), and a full rebuild was not triggered.                                                                                                                                                                                                                                                                      |
-| P2.5-AC7  | `no top-N cap: an all-but-one-already-seen result set still surfaces the one new candidate`                    | A query whose top-ranked candidates are all in `seenEvidenceFingerprints` except one ranked well outside a plausible top-N cutoff: the projection still returns it to the ranker, and it survives dedupe. Guards decision 10.                                                                                                                                                                                                                                                                             |
-| P2.5-AC8  | `ephemeral expansion re-queries only on a true double-zero, and its notice is conditional on a hit`            | Three cases: (a) the direct scorer already has survivors in either lane — no re-query. (b) direct scorer empty in both lanes, expanded scorer finds evidence — re-query happens, `ephemeral-query-expansion-used` fires. (c) direct AND expanded scorer both empty — re-query happens, notice does NOT fire. Guards decision 11's dead-code claim.                                                                                                                                                        |
-| P2.5-AC9  | `every seam-born notice is reproduced exactly` (parametrized)                                                  | Each of the six notice codes in P2.5-I5, triggered against the projection path (missing core file, unreadable preference file, an injected preference match, a skipped symlink, the file-count limit, the scanned-byte limit): the notice's `source`, `status`, and `code` match the filesystem path's notice byte-for-byte; only `detail` free text may legitimately differ where the projection has no walk order to report against.                                                                    |
-| P2.5-AC10 | `cold build and warm per-turn read latency, largest and mid workgroups` (throwaway script, output in `run.md`) | Cold build wall time recorded separately (off the turn path per decision 7 — not gated). Warm per-turn read across a representative query set: p50/p95/max recorded; gate is warm p95 ≤ 500 ms end-to-end (build excluded) on the largest measured workgroup.                                                                                                                                                                                                                                             |
-| P2.5-AC11 | `concurrent multi-workgroup turns do not contend`                                                              | Interleaved turns against N distinct workgroups, each with its own warm projection open independently: per-workgroup latency stays within the P2.5-AC10 budget with no measurable cross-workgroup slowdown, since each is a separate SQLite file with its own handle.                                                                                                                                                                                                                                     |
-| P2.5-AC12 | `markdownFileBytes/markdownScannedBytes divergence between build time and read time is detectable`             | `PRE_TURN_BOUNDS.markdownFileBytes` or `markdownScannedBytes` changed after a projection was built (simulating a config change without a rebuild): the read path surfaces a detectable signal that the projection's frozen budget no longer matches the live bound, rather than silently serving output built under the old budget. Neither bound is exercised by any file in today's fleet (no file but the ledger exceeds 64 KB) — this test proves detectability, not that today's data would trip it. |
+| #         | Test name                                                                                                                               | Assertion                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P2.5-AC1  | `differential equivalence against the filesystem path` (harness test, real corpus)                                                      | A real archive-mined query corpus plus paraphrase adversarials, run through both the projection-backed and filesystem-walk candidate generation and the SAME downstream ranking/dedupe/budget code: ranked-set membership AND delivered excerpt text are byte-identical for every query. Zero mismatches — today's manual probe met this at 320/320.                                                                                                                                                                          |
+| P2.5-AC2  | `scan order survives hydration, not term-index insertion order`                                                                         | Fixture where term rows are inserted in an order that differs from ledger/file scan order: hydrated candidates come back in `scan_order` order, so `sourceOrder` tie-breaks match the live walk exactly (P2.5-I2).                                                                                                                                                                                                                                                                                                            |
+| P2.5-AC3  | `window tokens from the non-sliceable fallback are unioned into the term set`                                                           | A candidate whose passage windows hard-chop mid-word (`offsetSliceable` false) is matched by a query token that exists only in a chopped window, not in the whole-candidate tokenization.                                                                                                                                                                                                                                                                                                                                     |
+| P2.5-AC4  | `persisted token stream is byte-identical to a live tokenizeForRecall call`                                                             | Over the real query corpus: for every candidate, the persisted token stream and `passageWindows` output stored by the build match what `tokenizeForRecall`/`passageWindows` compute fresh for the same candidate text at read time. Guards decision 3 and P2.5-I9.                                                                                                                                                                                                                                                            |
+| P2.5-AC5  | `adversarial round-trip: NUL bytes and malformed UTF-8 survive byte-identically`                                                        | Candidate content containing embedded NUL bytes and malformed UTF-8 sequences is stored via SQLite TEXT binding and hydrated back byte-identical to the original, including in the persisted token stream. Guards decision 15's "reproduce the cause, not just the symptom" requirement under adversarial input.                                                                                                                                                                                                              |
+| P2.5-AC6  | `staleness is detected for every writer class, including tree-only differences`                                                         | Five independently asserted cases against one built projection: a container-side write to a tracked file, an in-place same-size edit completed within 1 ms of the original mtime, a new file added under the memory root, a tracked file removed, and a rename that preserves size/mtime/ino — each is individually detected stale via the tree diff (decision 5), none silently served fresh. Guards against a batch test where only the first writer class is actually checked.                                             |
+| P2.5-AC7  | `missing, stale, cold, corrupt, or schema-mismatched projection falls back to the filesystem path`                                      | Five cases — no `index.db`, an `index.db` failing the staleness check, an `index.db` that fails to open (corrupt/truncated), a `schema_version` mismatch, and a projection that opens and passes staleness but throws mid-hydration (simulated truncated page/disk-full) — each returns the same candidates the filesystem path would, never throws, never returns an empty or wrong result (P2.5-I4, decision 14).                                                                                                           |
+| P2.5-AC8  | `full rebuild promote is atomic; a killed build never exposes a partial index`                                                          | A rebuild is killed after `index.next-<stamp>` is partially written but before rename: the previous `index.db` is untouched and still servable. A rebuild killed after rename but before the completeness marker's transaction commits is treated as absent, not as a servable partial index. Guards decision 12 and P2.5-I6.                                                                                                                                                                                                 |
+| P2.5-AC9  | `snapshot isolation: an interleaved incremental commit does not corrupt an in-flight turn's read`                                       | An incremental update commits between the term-query and hydration phases of a concurrently in-flight turn read: the turn's read observes exactly one committed generation throughout — no dangling ids, no mixed-generation candidate set. Guards decision 13 and P2.5-I7.                                                                                                                                                                                                                                                   |
+| P2.5-AC10 | `incremental update by fact id touches only the changed rows, in the correct scan order`                                                | A curator rewrite that appends 3 new `mem_*` facts and removes 2 superseded ones: after incremental update, exactly those 5 candidate/term row sets changed (asserted by row count and by id), a full rebuild was not triggered, AND after one delete+append cycle the surviving+new rows' relative `scan_order` within their lane matches what a full rebuild would have produced (not a value derived from row count). Guards decision 6.                                                                                   |
+| P2.5-AC11 | `no top-N cap: an all-but-one-already-seen result set still surfaces the one new candidate`                                             | A query whose top-ranked candidates are all in `seenEvidenceFingerprints` except one ranked well outside a plausible top-N cutoff: the projection still returns it to the ranker, and it survives dedupe. Guards decision 10.                                                                                                                                                                                                                                                                                                 |
+| P2.5-AC12 | `ephemeral expansion re-queries only on a true double-zero, and its notice is conditional on a hit`                                     | Three cases: (a) the direct scorer already has survivors in either lane — no re-query. (b) direct scorer empty in both lanes, expanded scorer finds evidence — re-query happens, `ephemeral-query-expansion-used` fires. (c) direct AND expanded scorer both empty — re-query happens, notice does NOT fire. Guards decision 11's dead-code claim.                                                                                                                                                                            |
+| P2.5-AC13 | `every seam-born notice is reproduced exactly` (parametrized)                                                                           | Each of the six notice codes in P2.5-I5, triggered against the projection path (missing core file, unreadable preference file, an injected preference match, a skipped symlink, the file-count limit, the scanned-byte limit): the notice's `source`, `status`, and `code` match the filesystem path's notice byte-for-byte; only `detail` free text may legitimately differ where the projection has no walk order to report against.                                                                                        |
+| P2.5-AC14 | `a cold or unverified-warm projection never stalls the turn`                                                                            | With page cache evicted (or warmth unverified) for a workgroup with a fresh, valid projection: the turn falls back to the filesystem path immediately rather than serving a cold tree-diff/stat sweep on the message-write path. Guards decision 5's warm-gating posture against the graph-scent incident it is modeled on.                                                                                                                                                                                                   |
+| P2.5-AC15 | `warmth is re-established off the event loop`                                                                                           | After a cold read falls back (P2.5-AC14), a background warming pass (tree-diff + open) runs off the event loop and the workgroup becomes warm for a subsequent turn without any turn blocking on that work. Guards decision 5 and decision 7.                                                                                                                                                                                                                                                                                 |
+| P2.5-AC16 | `exceeding the shared byte budget forces the filesystem-path fallback, not divergent output`                                            | Forced test condition where non-ledger content exceeds the shared `scannedBytes` budget assumed at build time: both a build-time and a read-time assertion fire, and the read path falls back to the filesystem path rather than serving a candidate set that omits what the live path's budget-aware scan would have included. Guards decision 16 and P2.5-I8.                                                                                                                                                               |
+| P2.5-AC17 | `cold and warm build/read latency, largest and mid workgroups, including a gated cold-read case` (throwaway script, output in `run.md`) | Cold build wall time recorded separately (off the turn path per decision 7 — not gated). Warm per-turn read across a representative query set: p50/p95/max recorded; gate is warm p95 ≤ 500 ms end-to-end (build excluded) on the largest measured workgroup. Additionally gated: a cold READ (first turn after restart, projection present and fresh, page cache cold) — the prototype measured 137 ms; this case is measured and gated, not merely excluded like build time.                                                |
+| P2.5-AC18 | `concurrent multi-workgroup turns do not contend, measured against realistic token-cache occupancy`                                     | Interleaved turns against N distinct workgroups with realistic per-workgroup stores (not a single-workgroup fixture, which would pass regardless of decision 3): per-workgroup latency stays within the P2.5-AC17 budget, and the assertion is made against `TOKEN_STREAM_CACHE` occupancy/hit-rate across workgroups so the test can actually fail if tokenization still contends process-wide. Guards decision 3; rewritten because the prior form ("no measurable cross-workgroup slowdown") was unfalsifiable without it. |
+| P2.5-AC19 | `markdownFileBytes/markdownScannedBytes divergence between build time and read time is detectable`                                      | `PRE_TURN_BOUNDS.markdownFileBytes` or `markdownScannedBytes` changed after a projection was built (simulating a config change without a rebuild): the read path surfaces a detectable signal that the projection's frozen budget no longer matches the live bound, rather than silently serving output built under the old budget. Neither bound is exercised by any file in today's fleet (no file but the ledger exceeds 64 KB) — this test proves detectability, not that today's data would trip it.                     |
+| P2.5-AC20 | `production telemetry carries the projection path and candidate counts`                                                                 | For each of hit / stale / cold / fallback-reason, the extended `pre-turn-context: build` log line (decision 17) carries the correct path field and the candidate counts from whichever source actually served the turn. Guards decision 17 and the ability to detect drift after ship (§P2.5.5).                                                                                                                                                                                                                              |
 
 ### P2.5.5 Risks
 
-| Risk                                                                | Assessment                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Build cost on first run and after any corruption                    | 7,965 ms measured on the largest workgroup, off the host event loop (decision 7) but still real wall time before that workgroup's first accelerated turn. A cold or freshly-invalidated workgroup falls back to the filesystem path (P2.5-I4) while the build runs, so correctness never waits on it — only speed does.                                                                                                                   |
-| Projection/filesystem divergence                                    | The differential-equivalence harness (P2.5-AC1) is the only structural defense; a future change to `readMemoryEvidence`'s candidate shape that is not mirrored in the projection's schema/build would pass its own tests while silently drifting from the live path.                                                                                                                                                                      |
-| The byte-budget freeze (`markdownFileBytes`/`markdownScannedBytes`) | The projection freezes both at build time; the live path applies them per turn in listing order. Neither binds on any file in today's fleet, so this is dormant risk, not a live bug — P2.5-AC12 exists so a future config change surfaces the gap instead of silently drifting.                                                                                                                                                          |
-| Storage cost                                                        | 37.7 MB measured for the largest workgroup's projection — roughly 4.5× the 8.38 MB source tree, from the `term` table's 625,176 rows. Bounded per workgroup, and it is derived state a rebuild always regenerates, but a fleet-wide multiplier is worth watching post-deploy.                                                                                                                                                             |
-| Subtle single points of silent breakage                             | `sourceOrder` (P2.5-I2) and the `contextualExcerpt` `indexOf` anchor (`pre-turn-context.ts:1351-1352`, which returns `-1` and clamps to `0` on a miss) are both easy to get right in the fast path and easy to silently break in a hydration path that reconstructs text from stored fields rather than the original in-memory string. P2.5-AC1's byte-identical differential check is the only thing that would catch either regressing. |
+| Risk                                                                | Assessment                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Build cost on first run and after any corruption                    | 7,965 ms measured on the largest workgroup, off the host event loop (decision 7) but still real wall time before that workgroup's first accelerated turn. A cold or freshly-invalidated workgroup falls back to the filesystem path (P2.5-I4) while the build runs, so correctness never waits on it — only speed does.                                                                                                                                                                                                 |
+| Projection/filesystem divergence                                    | The differential-equivalence harness (P2.5-AC1) is the only structural defense; a future change to `readMemoryEvidence`'s candidate shape that is not mirrored in the projection's schema/build would pass its own tests while silently drifting from the live path.                                                                                                                                                                                                                                                    |
+| The byte-budget freeze (`markdownFileBytes`/`markdownScannedBytes`) | The projection freezes both at build time; the live path applies them per turn in listing order. Neither binds on any file in today's fleet, so this is dormant risk, not a live bug — P2.5-AC19 exists so a future config change surfaces the gap instead of silently drifting.                                                                                                                                                                                                                                        |
+| Storage cost — UNMEASURED with token persistence                    | 37.7 MB measured for the largest workgroup's projection WITHOUT token persistence — that measurement predates decision 3. The real per-workgroup size with the persisted token stream and passage windows stored is unmeasured; `/team-build` must measure it on the largest workgroup before this risk is considered assessed, not assumed close to the old figure. Bounded per workgroup either way, and it is derived state a rebuild always regenerates, but a fleet-wide multiplier is worth watching post-deploy. |
+| Subtle single points of silent breakage                             | `sourceOrder` (P2.5-I2) and the `contextualExcerpt` `indexOf` anchor (`pre-turn-context.ts:1351-1352`, which returns `-1` and clamps to `0` on a miss) are both easy to get right in the fast path and easy to silently break in a hydration path that reconstructs text from stored fields rather than the original in-memory string. P2.5-AC1's byte-identical differential check, plus the targeted round-trip in P2.5-AC5, are the things that would catch either regressing.                                       |
+| Cold stat/tree-diff storm on the message-write path                 | Decision 5's per-turn tree-diff/`statSync` sweep was measured on hot page cache. `graph-scent.ts:48-55` documents 19 stalls >3s (worst 26.9s) on the identical assumption after deploy churn evicted page cache. Mitigated by the same warm-gating posture (decision 5, P2.5-AC14/AC15): a cold or unverified projection never blocks a turn, and warming happens off the event loop.                                                                                                                                   |
+| Preference-budget coupling                                          | Which candidates exist on the live path can depend on turn participants (`involvedSenderNames`) via the shared byte budget (decision 16) — a build-time projection cannot reproduce a per-turn dependency. Dormant today by a 24 MiB vs ~1.84 MB margin, not by design; guarded by the build/read-time assertion in P2.5-AC16 that falls back rather than silently drifting.                                                                                                                                            |
+| Cross-workgroup token-cache contention                              | Without decision 3's persisted tokens, scoring would still share one process-wide `TOKEN_STREAM_CACHE` (24,576 entries) across every workgroup, defeating half this pillar's purpose — the operator's normal working pattern of several concurrently active workgroups. P2.5-AC18 exists specifically to make this failure mode falsifiable instead of passing on a single-workgroup fixture.                                                                                                                           |
 
 ### P2.5.6 Implementation path
 
-1. **Schema + build.** New module `src/modules/memory/recall-projection.ts`:
-   `candidate`/`term`/`source_file` tables, a build function reusing
-   `tokenizeForRecall` and the window-token union (decision 8), scan-order
-   preservation (decision 4). Check: unit test building a small store and reading it
-   back.
-2. **Worker-thread build wrapper**, mirroring `reconcile-store-worker-thread.ts`.
+1. **Schema + build, including the persisted token stream.** New module
+   `src/modules/memory/recall-projection.ts`: `candidate`/`term`/`source_file`
+   tables, where `candidate` also carries the persisted `tokenizeForRecall` stream
+   and `passageWindows` output (decision 3); a build function reusing
+   `tokenizeForRecall`, the window-token union (decision 8), and the exact
+   scan-order pipeline replay — Set-union, `.sort()`, conditional splice (decisions
+   6 and 15); a `schema_version` guard mirroring `WorkgroupGraphStore` (decision 14).
+   Check: unit test building a small store and reading it back, plus P2.5-AC4's
+   token byte-identity assertion and P2.5-AC5's adversarial round-trip.
+2. **Promote protocol.** Full rebuild writes `index.next-<stamp>`, finalizes with a
+   completeness marker inside the transaction that closes the build, then
+   atomically renames over `index.db` (decision 12). Check: kill the build process
+   mid-write and after rename but before the marker commits; assert the previous
+   `index.db` is untouched and still servable either way. Satisfies P2.5-AC8.
+3. **Worker-thread build wrapper**, mirroring `reconcile-store-worker-thread.ts`.
    Check: a worker-roundtrip test asserting the build never runs on the caller's
    event loop.
-3. **Staleness check and fallback.** `source_file` walk plus `statSync({ bigint:
-true })` comparison; missing/stale/corrupt all resolve to the filesystem path.
-   Satisfies P2.5-AC4, AC5.
-4. **Incremental update by fact id.** Diff the ledger's current `mem_*` ids against
-   the projection's stored ids for `generated/memory.md`; apply as a row-level insert
-   /delete inside the same worker-thread wrapper as a full build. Satisfies P2.5-AC6.
-5. **Wire into `readMemoryEvidence`.** Read from the projection when warm and fresh;
-   otherwise the existing filesystem block runs unchanged. Identical output shape to
-   downstream code (decision 4), so no changes below `pre-turn-context.ts:1210`.
-   Satisfies P2.5-AC2, AC3, AC7, AC8, AC9.
-6. **Host-sweep hook.** Trigger builds and incremental updates off the message-write
-   path, mirroring graph-scent's warm-gating sweep pattern (§5.4) — never a blocking
-   call inside `buildRecallRow`. Check: sweep test.
-7. **Live latency verification.** Largest and mid workgroups, cold build once, then
-   warm per-turn p50/p95/max against a real query sample, plus a concurrent
-   multi-workgroup run. Gate: warm p95 ≤ 500 ms end-to-end, zero differential
-   mismatches (P2.5-AC1, AC10, AC11), or the design returns for revision. Check: a
+4. **Staleness + warmth check, never blocking.** Tree-diff walk against
+   `source_file` in both directions — added, removed, changed via `statSync({
+bigint: true })` — reproducing the visited-cap allocation and the topic-dir/
+   generated-memory splice (decision 5); a warmth gate that refuses a cold or
+   unverified projection and schedules warming off the event loop.
+   Missing/stale/cold/corrupt/schema-mismatched all resolve to the filesystem path.
+   Satisfies P2.5-AC6, AC7, AC14, AC15.
+5. **Incremental update by fact id.** Diff the ledger's current `mem_*` ids against
+   the projection's stored ids for `generated/memory.md`; apply as a row-level
+   insert/delete inside the same worker-thread wrapper as a full build, assigning
+   new `scan_order` values as `MAX(scan_order) + 1` per lane (decision 6). Satisfies
+   P2.5-AC10.
+6. **Snapshot-isolated read, wired into `readMemoryEvidence`.** The two-phase read
+   (term query, then hydration) runs inside one deferred transaction (decision 13);
+   each phase is individually wrapped and falls back to the filesystem path on
+   failure (decision 14); the budget-coupling assertion (decision 16) runs at read
+   time. Read from the projection when warm and fresh; otherwise the existing
+   filesystem block runs unchanged — identical output shape to downstream code
+   (decision 4), so no changes below `pre-turn-context.ts:1210`. Satisfies
+   P2.5-AC2, AC3, AC9, AC11, AC12, AC13, AC16.
+7. **Host-sweep hook.** Trigger builds, incremental updates, and warmth checks off
+   the message-write path, mirroring graph-scent's warm-gating sweep pattern
+   (§5.4) — never a blocking call inside `buildRecallRow`. Check: sweep test.
+8. **Telemetry.** Extend the existing per-build log line
+   (`pre-turn-context.ts:1822-1833`, decision 17) with the projection path
+   (hit/stale/cold/fallback-reason) and candidate counts. Satisfies P2.5-AC20.
+9. **Live latency verification.** Largest and mid workgroups, cold build once, then
+   warm AND cold per-turn read p50/p95/max against a real query sample, plus a
+   concurrent multi-workgroup run measured against `TOKEN_STREAM_CACHE` occupancy.
+   Gate: warm p95 ≤ 500 ms end-to-end, the gated cold-read case, zero differential
+   mismatches (P2.5-AC1, AC17, AC18), or the design returns for revision. Check: a
    throwaway script under the scratchpad, output pasted into `run.md`.
-8. **Full suites, container typecheck untouched (host-only change), boundary check.**
+10. **Full suites, container typecheck untouched (host-only change), boundary
+    check.**
+
+**Review findings applied.** Two independent reviews (contract/semantics;
+adversarial) produced the corrections folded into this revision: decisions 3, 5, 6,
+and 12–17; invariants I4 and I6–I9; and the acceptance-criteria additions and
+extensions above. The token-stream persistence gap (decision 3) and the
+promote-protocol gap (decision 12) were each caught by only one of the two
+reviews — neither alone would have found both.
 
 ## 9. Pillars 2–4 — sequenced, deliberately not designed here
 
