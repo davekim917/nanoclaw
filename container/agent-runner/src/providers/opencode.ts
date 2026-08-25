@@ -5,7 +5,7 @@ import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
 
 import { memoryContextForSessionStart, type MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { registerProvider } from './provider-registry.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput, TurnUsageInfo } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import { shouldPostInfraWarning } from '../db/session-state.js';
@@ -13,6 +13,62 @@ import { MANAGED_GIT_OPENCODE_PLUGIN_PATH } from '../managed-git-guard.js';
 
 function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
+}
+
+/** The fields we read off OpenCode's AssistantMessage (`message.updated`). */
+export type OpenCodeAssistantUsage = {
+  modelID?: string;
+  providerID?: string;
+  cost?: number;
+  tokens?: { input?: number; output?: number; cache?: { read?: number; write?: number } };
+};
+
+/**
+ * One turn's usage = the SUM over every assistant message the turn produced.
+ *
+ * Undercount fix (2026-08-25): the result event used to carry only the LAST
+ * assistant message's usage while `steps` counted them all, so a multi-step
+ * turn was billed as its final response — live `turn_usage` had opencode at
+ * 8.2 steps/turn but 104 output tokens/turn against Claude's 2,597.
+ *
+ * Per-message values are per-response, NOT cumulative. Verified against
+ * OpenCode's own store (`opencode.db` in the container's XDG data dir): the
+ * `session` row's tokens_input / tokens_output / tokens_cache_read equal the
+ * SUM over that session's assistant messages exactly (325,382 / 7,477 /
+ * 1,927,040 across 19 messages), while the last message alone reports
+ * 1,507 / 303 / 142,912. Per-message output is also non-monotonic
+ * (22, 25, 70, 85, 50, ... 1,186), which a running total could not be.
+ *
+ * `model` comes from the LAST message — that is the turn's own model, and a
+ * sum has no single one. `undefined` for an empty set, so a turn that
+ * produced no assistant message records a coverage-gap row rather than a
+ * fabricated zero.
+ */
+export function sumOpenCodeTurnUsage(
+  messages: OpenCodeAssistantUsage[],
+  last: OpenCodeAssistantUsage | undefined,
+): TurnUsageInfo | undefined {
+  if (messages.length === 0) return undefined;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let cacheWriteTokens = 0;
+  let costUsd = 0;
+  for (const m of messages) {
+    inputTokens += m.tokens?.input ?? 0;
+    outputTokens += m.tokens?.output ?? 0;
+    cacheReadTokens += m.tokens?.cache?.read ?? 0;
+    cacheWriteTokens += m.tokens?.cache?.write ?? 0;
+    costUsd += typeof m.cost === 'number' ? m.cost : 0;
+  }
+  return {
+    model: last?.providerID && last.modelID ? `${last.providerID}/${last.modelID}` : (last?.modelID ?? null),
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    costUsd,
+  };
 }
 
 /**
@@ -633,20 +689,14 @@ export class OpenCodeProvider implements AgentProvider {
         // previously keying by messageID overwrote earlier parts.
         const partTextById = new Map<string, { messageID: string; text: string }>();
         const roleByMessageId = new Map<string, string>();
-        // Fleet Hardening Phase 0.1 (see TurnUsageInfo). AssistantMessage
-        // carries cumulative cost/tokens as of that update; message.updated
-        // fires repeatedly as the message streams, so the last write for a
-        // given id wins and is the final total by the time session.idle ends
-        // the turn.
-        const assistantUsageById = new Map<
-          string,
-          {
-            modelID?: string;
-            providerID?: string;
-            cost?: number;
-            tokens?: { input?: number; output?: number; cache?: { read?: number; write?: number } };
-          }
-        >();
+        // Fleet Hardening Phase 0.1 (see TurnUsageInfo). One AssistantMessage
+        // = one LLM response, and its tokens/cost are ITS OWN, not a running
+        // total across the turn's messages. `message.updated` fires
+        // repeatedly as a single message streams, so the last write for a
+        // given id wins and is that message's final figure by the time
+        // session.idle ends the turn — but the turn's usage is the SUM over
+        // every id in this map, which is what the result event reports.
+        const assistantUsageById = new Map<string, OpenCodeAssistantUsage>();
         let lastEventAt = Date.now();
         let eventTimedOut = false;
         const timeoutCheck = setInterval(() => {
@@ -806,31 +856,32 @@ export class OpenCodeProvider implements AgentProvider {
             resultText = warningText;
           }
         }
-        const assistantUsage = lastAssistantMessageId ? assistantUsageById.get(lastAssistantMessageId) : undefined;
         // Per-turn cost attribution (Fleet Hardening Phase 0.1 follow-up):
         // OpenCode's SSE stream has no round-trip counter either. Each
         // distinct assistant message id is one LLM response (a tool call
         // triggers a fresh assistant message for the follow-up), so counting
         // them is the closest available proxy — not a literal HTTP request
         // count, but the best signal this protocol exposes.
-        const stepCount = [...roleByMessageId.values()].filter((r) => r === 'assistant').length;
+        //
+        // Counted off assistantUsageById, the SAME map the usage sum below
+        // reads, so the two can never disagree — steps=N and a sum over some
+        // other N' messages is exactly the inconsistency this whole fix is
+        // about. (It's populated under the identical `role === 'assistant'`
+        // condition as roleByMessageId, so this is the same number, sourced
+        // where it can't drift.)
+        const stepCount = assistantUsageById.size;
+        // Summed over that same per-turn map — see sumOpenCodeTurnUsage for
+        // why (and for the evidence that these are per-response, not
+        // cumulative). Subagent responses are included in both, since those
+        // are real spend.
         yield {
           type: 'result',
           text: resultText,
           steps: stepCount > 0 ? stepCount : null,
-          usage: assistantUsage
-            ? {
-                model:
-                  assistantUsage.providerID && assistantUsage.modelID
-                    ? `${assistantUsage.providerID}/${assistantUsage.modelID}`
-                    : (assistantUsage.modelID ?? null),
-                inputTokens: assistantUsage.tokens?.input ?? null,
-                outputTokens: assistantUsage.tokens?.output ?? null,
-                cacheReadTokens: assistantUsage.tokens?.cache?.read ?? null,
-                cacheWriteTokens: assistantUsage.tokens?.cache?.write ?? null,
-                costUsd: typeof assistantUsage.cost === 'number' ? assistantUsage.cost : null,
-              }
-            : undefined,
+          usage: sumOpenCodeTurnUsage(
+            [...assistantUsageById.values()],
+            lastAssistantMessageId ? assistantUsageById.get(lastAssistantMessageId) : undefined,
+          ),
         };
       }
     }
