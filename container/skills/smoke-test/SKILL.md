@@ -11,8 +11,9 @@ gaps, and verified fixes when fix authority was granted. The default deployment
 uses two separately branded frontier parents: a **coordinator** that owns
 coverage and the verdict, and a **challenger** that independently tries to
 prove the result wrong. Their concrete identities — agent names, QA channel,
-repo, environment, credential locations — are deployment configuration and live
-in the deploying group's standing instructions, never in this skill.
+repo, environment, credential locations, and the coverage floor (§2) — are
+deployment configuration and live in the deploying group's standing
+instructions, never in this skill.
 
 ## Invocation
 
@@ -335,6 +336,189 @@ Give every check a stable ID. At minimum cover the applicable surfaces below:
 `Push every button` means `checks_executed / checks_planned`, with the manifest
 attached. Never call a run 100% complete when anything is blocked, skipped, or
 outside the stated scope.
+
+### The coverage floor — the part of the manifest the diff does not get a vote on
+
+The manifest above is derived from the diff, every lane in §3 scopes from this
+campaign's own change — the acceptance lane included, since a PR body describes
+the PR — and a manifest built only that way tests whatever is actively
+regressing. Measured across one deployment's first 74 campaigns: a
+money-adjacent approval flow was walked in a browser **exactly once, ever** —
+that run's own manifest called it "never browser-tested before" — and never
+functionally again. A planning surface appeared in 22 of the 74, every
+appearance incidental to a style change that happened to touch the file, never
+once as a functional lane. An in-app assistant surface: 2 of 74, one of those an
+explicit full sweep rather than a campaign. Nothing regressed on those surfaces
+in that window; nothing was watching either. A very fast green suite over the
+same blind spots is what this section exists to prevent.
+
+So: **changed-surface scoping decides what runs *extra*. It never decides what
+runs at all.** A small declared set of journeys is exercised against the
+deployed build on a fixed cadence whether or not this campaign's diff came
+anywhere near them.
+
+**The floor list is deployment configuration, like every other concrete
+identity in this skill.** It lives in the deploying group's standing
+instructions beside the repo, environment, QA channel, run root, and credential
+locations — never here, because the journeys that matter belong to the
+deployment, not to the skill. What lives here is the contract the list must
+satisfy. Each floor entry declares six things:
+
+| Field | What it must say |
+|---|---|
+| `id` | a stable lane id, unchanged for the life of the journey — staleness is computed on this key, so renaming it silently resets the clock |
+| `journey` | the ordered steps at a named grain, ending in an observable end state; written once here, never re-derived per campaign |
+| `proves` | the one claim the walk proves, phrased as "if this were broken, <which consequence below>" |
+| `seed` | the account, seat, tier, fixture, or data row the walk needs, and where it comes from |
+| `max_interval` | the longest this deployment tolerates going without this journey proven on a deployed build |
+| `restore` | how the walk's mutations are reverted, since it runs repeatedly against live-shaped data |
+
+**What earns a place on the floor — two questions, both answered with a
+citation rather than an adjective.**
+
+First, the **consequence test**. A silent failure of this journey would, before
+the next campaign could plausibly notice, cause at least one of:
+
+1. money or credit to move wrongly, or to fail to move — payments, ledgers,
+   accruals, payouts, refunds, wallets, invoices, entitlements;
+2. data to be destroyed, overwritten, or put beyond the reach of the person who
+   owns it;
+3. one tenant, role, or seat to read or write another's data — an authorization
+   or scope boundary, scored by the crossing rule below;
+4. a customer's first successful use to fail — signup, login, checkout, the
+   first screen after purchase;
+5. an irreversible outbound effect to fire wrongly — an email sent, a webhook
+   delivered, a document filed, a record published.
+
+Second, the **silence test**: name what watches this journey today. If its
+failure is *loud* — CI goes red, an exception pages somebody, the app is
+visibly broken on the landing screen — it does **not** belong on the floor,
+however important it is. The floor buys coverage where nothing else is looking.
+Spending it where something already looks is how a floor turns into a
+regression suite, and a floor nobody can afford to run is the same as no floor.
+If the declared list cannot be walked end to end in an ordinary lane or two,
+cut it with the silence test until it can.
+
+Both tests must hold, and together they settle an unlisted journey without
+anyone having to ask: name the consequence, name the watcher. If none of the
+five fit, it is ordinary changed-surface scope. If one fits and nothing watches
+it, it is floor-worthy but **not yet on the floor** — record it as a floor
+nomination in the run record, name it on the report, and do not start running
+it. Adding to the floor is a standing-instruction edit and therefore a human's
+call: a coordinator that can extend its own floor can also quietly shrink it.
+
+**Cadence: every campaign walks at least one floor entry, least-recently-passed
+first.** The flat option — walk the whole floor every campaign — was rejected on
+two grounds. At about three campaigns a day a five-entry floor becomes fifteen
+full browser journeys a day, which is exactly the re-derivation cost the skip
+rule below was written to remove; and a walk repeated ninety times a month
+without ever failing stops being walked carefully. A pure staleness budget with
+no per-campaign obligation was rejected too: it leaves the mechanism cold for
+days, and a mechanism nobody exercises is one nobody notices has broken. So,
+both, bounded:
+
+- **Every campaign declares at least one lane of kind `floor` in the contract,
+  one lane per entry it walks, with the entry's `id` as the lane id. Never
+  zero** — not on a backend-only diff, not on a one-line change, not on a
+  campaign that found nothing.
+- **Which entries are due is computed, not chosen.** Every entry past its
+  `max_interval` is due, all of them, however many that is — the ceiling is the
+  deployment's own stated tolerance and nothing overrides it. If none are
+  overdue, the single least-recently-passed entry is due. A coordinator does not
+  get to pick the convenient one.
+- **"Last passed" is read off the run root, not off a ledger.** An entry's last
+  exercise is the newest `pass` marker carrying its lane id, anywhere under the
+  run root. Markers are already durable, already SHA-bound, and already survive
+  media retention, so this needs no new artifact and cannot be asserted without
+  leaving one:
+
+  ```bash
+  jq -r 'select(.status == "pass") | "\(.completedAt) \(input_filename)"' \
+    <run-root>/*/markers/<entry-id>.json 2>/dev/null | sort | tail -1
+  ```
+
+At one entry per campaign a five-entry floor comes fully around every day or
+two. Against a measured once in seventy-four runs, that closes the whole gap.
+
+**The skip rule below does not apply to floor entries, and this is not an
+exemption carved out of it.** That rule lets a browser check go unwritten when
+a source lane in the same campaign already proves the identical claim with a
+green spec. A floor entry's claim is composition on a deployed build: whether
+the connected flow still works end to end, through storage and the network, on
+the build actually being served. The counter-rule already names composition,
+deploy identity, persistence across reload and permission crossings as claims a
+green spec structurally cannot observe, and a floor entry is made of precisely
+those — there is no line in any spec that would have failed had the floor
+journey been broken in the browser. A floor entry whose claim *looks*
+spec-covered is the most tempting skip and the most expensive one: the unit
+assertion is green, nobody has walked the flow in weeks, and the run reports
+coverage it does not have.
+
+**A floor entry that cannot run must not vanish from the campaign.** It is a
+declared contract lane, so the synthesis barrier already refuses to publish
+until it carries a terminal marker, and `blocked` is one:
+
+```bash
+SMOKE_LANE_ROLE=coordinator \
+bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh marker \
+  <run-dir> <entry-id> blocked '<blocker>' '<artifact,paths>'
+```
+
+The standard around it is the acceptance lane's `not demonstrable` standard,
+because it is the same failure wearing a different name:
+
+- **`blocked by:` names the specific missing thing** — the seat nobody
+  provisioned, the seed row that does not exist, the credential that expired.
+  "Could not run" and "environment issue" are the absence of a blocker, not one.
+- **Attach the artifact for the furthest state the walk did reach**, or the
+  command and output proving nothing was reachable.
+- **A blocked entry does not reset its staleness clock.** It was not exercised.
+  Otherwise blocking is the cheapest way to make a journey look fresh, which is
+  the whole failure this section is about.
+- **The entry goes on the report's Untested line by name** and the run is at
+  most `PASS_WITH_GAPS`. Two entries blocked by the same thing are one blocker;
+  name it once, as the acceptance table already requires.
+- **A blocked entry that is also past its `max_interval` is `HUMAN_DECISION`,
+  not a gap.** Nobody has proven that journey works in longer than the
+  deployment said it would tolerate, and this run cannot either — on a surface
+  that by construction moves money, destroys data, crosses an authorization
+  boundary, or is a customer's first impression. That is the "nobody knows
+  whether this is safe" case §8 reserves `HUMAN_DECISION` for, and it holds
+  promotion until a human answers.
+
+**Checkable after the fact**, from a finished run's artifacts alone:
+
+- **The contract carries at least one lane of kind `floor`.** A contract with
+  none is a campaign that ran with no floor at all, visible in one `jq` before
+  any evidence is read.
+- **Every floor lane has a terminal marker.** The synthesis barrier enforced
+  that to publish, so a published run structurally has one; a missing or `void`
+  marker beside a published verdict means the barrier was bypassed.
+- **Each entry walked carries its own screenshot evidence on the frozen SHA**,
+  named in the marker's evidence list — the same bar as any other browser lane.
+- **Selection is recomputable.** Re-run the least-recently-passed query above as
+  of that run's timestamp. A run that walked a freshly-passed entry while
+  another sat past its ceiling shows up as a mismatch between what was due and
+  what the contract declared.
+- **The cross-run sweep is the one that matters.** For every declared entry,
+  find its newest passing floor marker anywhere under the run root. Any entry
+  whose newest is older than its `max_interval`, or that has none at all, is a
+  live coverage breach no matter how many green runs sit on top of it. That
+  single sweep is what surfaces a money-adjacent flow tested once in
+  seventy-four campaigns in the week it goes stale, rather than a year later.
+- **Post count is unchanged.** A floor lane is a browser lane, so the posting
+  contract's "one reply per browser lane whose evidence became durable" already
+  accounts for it. The floor earns no extra messages.
+
+**A deployment that has declared no floor still says so out loud.** Standing
+instructions with no floor list mean the coordinator cannot compute a due entry;
+record `floor undeclared` on the run record, name it on the report's Untested
+line, and cap the run at `PASS_WITH_GAPS`. Do not invent a floor from the
+product — inventing one is the coordinator picking its own floor, which the
+nomination rule above exists to prevent. `PASS_WITH_GAPS` is deliberate rather
+than blocking: an install picking up this version keeps shipping, but never
+again reports an unqualified `PASS` while nobody has said which journeys must
+not silently break.
 
 ### Scoring permission crossings — a success is the defect
 
@@ -855,6 +1039,8 @@ screenshots:
 - Build `<sha12>` on <environment> — <scope in words>
 - Coverage: ran <executed> of <planned> checks (<passed> passed, <failed>
   failed, <blocked> blocked) — plus exact test counts and limitations
+- Floor: <entries walked and their outcome; each blocked entry with its
+  blocker; or "floor undeclared">
 - Frontend: <journeys completed>, <n> screenshots and <n> clips (attached)
 - Findings: <each in one plain-language line with severity, or "none confirmed">
 - Fixes: <PRs and deployed SHAs, or none>
@@ -1167,7 +1353,9 @@ left over is narration that should not have posted.
 
 Run a changed-surface `audit` for each settled develop SHA. Any user-visible
 change must include a real-browser frontend lane even when the diff looks
-backend-only. Run `full` for a
+backend-only. Changed surface decides what a campaign runs *extra*; the
+coverage floor (§2) runs in every campaign regardless of the diff, including
+this one. Run `full` for a
 release candidate, a manually named feature, a high-risk label, or a scheduled
 nightly/weekly sweep. This preserves continuous coverage without paying for idle
 turns or rerunning an unchanged build.
