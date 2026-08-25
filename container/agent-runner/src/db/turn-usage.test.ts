@@ -330,6 +330,64 @@ describe('turn_usage — cumulative-usage delta fix (Claude + Codex)', () => {
   });
 });
 
+describe('turn_usage — phantom "listed but unused" model rows', () => {
+  beforeEach(() => {
+    initTestSessionDb();
+    _resetCumulativeTrackingForTesting();
+  });
+
+  it('skips a cumulative-provider model whose running total did not move this turn', () => {
+    const zero = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
+    // Turn 1: both models really ran.
+    recordTurnUsage('claude', { model: 'opus', ...zero, inputTokens: 1000 }, undefined, 'sess-a');
+    recordTurnUsage('claude', { model: 'haiku', ...zero, inputTokens: 40 }, undefined, 'sess-a');
+    // Turn 2: only opus ran, but the SDK still lists haiku at its old total.
+    recordTurnUsage('claude', { model: 'opus', ...zero, inputTokens: 3000 }, undefined, 'sess-a');
+    recordTurnUsage('claude', { model: 'haiku', ...zero, inputTokens: 40 }, undefined, 'sess-a');
+
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => [r.model, r.input_tokens])).toEqual([
+      ['opus', 1000],
+      ['haiku', 40],
+      ['opus', 2000],
+    ]);
+  });
+
+  it('still records an all-zero row that carries cost — a real turn whose token counters were missed', () => {
+    // Live case (2026-08-25): a claude row with four explicit zeros and
+    // cost_usd 2.25. Dropping it would delete $2.25 of spend from the ledger.
+    recordTurnUsage(
+      'claude',
+      { model: 'sonnet', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 2.25 },
+      undefined,
+      'sess-a',
+    );
+    expect(getTurnUsageRows().map((r) => r.cost_usd)).toEqual([2.25]);
+  });
+
+  it('still records a turn whose provider reported nothing at all (NULLs, not zeros)', () => {
+    recordTurnUsage('claude', { model: 'opus' }, undefined, 'sess-a');
+    const rows = getTurnUsageRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].input_tokens).toBeNull();
+  });
+
+  it('still records an all-zero turn from a NON-cumulative provider — that is a real reading, not a stale listing', () => {
+    // OpenCode sums a per-message map at the provider, so its zero means "this
+    // turn genuinely consumed nothing measurable". Live data has one such turn;
+    // hiding it would tidy away a provider coverage gap.
+    recordTurnUsage('opencode', {
+      model: 'opencode-go/ox-alpha-free',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0,
+    });
+    expect(getTurnUsageRows()).toHaveLength(1);
+  });
+});
+
 describe('turn_usage — table creation (real files, not the in-memory test mode)', () => {
   it('exists after connection init on a brand-new outbound.db', () => {
     const dbPath = tempDbPath();

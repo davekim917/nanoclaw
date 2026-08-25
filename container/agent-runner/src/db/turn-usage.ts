@@ -199,6 +199,49 @@ function toTurnDelta(usage: TurnUsageInfo, scope: string, key: string): TurnUsag
   };
 }
 
+/**
+ * Phantom-model fix (2026-08-25): a cumulative provider reports its running
+ * total for EVERY model it has ever seen in the continuation, not just the
+ * ones this turn used — so a turn that only ran Opus still produced a
+ * `modelUsage` entry for the Haiku a subagent used ten turns ago, whose
+ * delta is zero across the board. Written as a row, that reads as "a turn
+ * touched Haiku": measured live, 11 of 13 Haiku rows and 18 of 93 Sonnet
+ * rows were all-zero, making Haiku's turn count ~85% phantom.
+ *
+ * The condition catches exactly the "listed but unused" case, and is
+ * deliberately narrow on three axes:
+ *
+ *   - Cumulative providers only. A zero from OpenCode is a real reading from
+ *     a per-message map (it is summed at the provider, never deltaed here),
+ *     so it means "this turn genuinely consumed nothing measurable" and stays
+ *     recorded — a provider coverage gap must stay visible, not get tidied
+ *     away. Live, one such OpenCode turn exists.
+ *   - Explicit zeros only. A field the provider never reported arrives as
+ *     null/undefined, not 0; such a row still counts the turn and keeps the
+ *     gap visible, which is the documented contract at the top of this file.
+ *   - Cost must be zero too. Live data has a Claude row with all four token
+ *     fields at an explicit 0 and cost_usd 2.25 — a real turn whose token
+ *     counters were missed. Dropping it would delete $2.25 of spend from the
+ *     ledger.
+ *
+ * The memo is deliberately NOT advanced on a skip: for the delta path the
+ * totals are unchanged so advancing is a no-op, and for the raw path
+ * (first observation / counter reset) leaving the older baseline in place
+ * still yields the right answer on the next turn — either it is a fresh
+ * series with no baseline, or the next value is below the stored one and the
+ * existing reset check fires again.
+ */
+function isUnusedModelEntry(usage: TurnUsageInfo): boolean {
+  const zero = (v: Num): boolean => v === 0;
+  return (
+    zero(usage.inputTokens) &&
+    zero(usage.outputTokens) &&
+    zero(usage.cacheReadTokens) &&
+    zero(usage.cacheWriteTokens) &&
+    (usage.costUsd == null || usage.costUsd === 0)
+  );
+}
+
 /** Test-only: clear the cumulative-tracking state between cases. */
 export function _resetCumulativeTrackingForTesting(): void {
   lastCumulativeByCounter.clear();
@@ -230,6 +273,10 @@ export function recordTurnUsage(
   const cumulative = CUMULATIVE_PROVIDERS.get(provider);
   const counterKey = cumulative ? (cumulative.perModel ? (usage.model ?? '') : '') : null;
   const effectiveUsage = counterKey === null ? usage : toTurnDelta(usage, scope, counterKey);
+  // See isUnusedModelEntry: a cumulative provider lists every model of the
+  // continuation on every turn, and the ones it didn't use come through with
+  // a zero delta. Booking those as turns makes a model's usage mostly phantom.
+  if (counterKey !== null && isUnusedModelEntry(effectiveUsage)) return;
   try {
     // bun:sqlite requires named parameters to be passed with the prefix
     // character in the JS object keys (better-sqlite3 auto-stripped it,

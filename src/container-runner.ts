@@ -1186,6 +1186,14 @@ export interface ResolvedAnthropicAuth {
   oauthFallbacks: { index: number; value: string }[];
   apiKeyPrimary?: string;
   apiKeyFallbacks: { index: number; value: string }[];
+  /**
+   * True when the OAuth set came from a per-group `<BASE>_<FOLDER>` scope
+   * rather than the global pool. Slots are forwarded under their unscoped
+   * `_N` names either way, so this flag is the ONLY thing that distinguishes
+   * "global slot 2" from "this group's own slot 2" — different Anthropic
+   * accounts whose rate-limit windows share no denominator.
+   */
+  oauthScoped: boolean;
 }
 
 /**
@@ -1215,6 +1223,7 @@ export function resolveAnthropicAuth(
     oauthFallbacks: oauth.fallbacks,
     apiKeyPrimary: apiKey.primary,
     apiKeyFallbacks: apiKey.fallbacks,
+    oauthScoped: oauth.scoped,
   };
 }
 
@@ -1360,7 +1369,7 @@ function resolveScopedRotationSet(
   folder: string,
   env: NodeJS.ProcessEnv,
   envFile: Record<string, string> = {},
-): { primary?: string; fallbacks: { index: number; value: string }[] } {
+): { primary?: string; fallbacks: { index: number; value: string }[]; scoped: boolean } {
   const folderTok = folder.toUpperCase().replace(/-/g, '_');
   const isPureDigits = /^\d+$/.test(folderTok);
 
@@ -1401,7 +1410,7 @@ function resolveScopedRotationSet(
       fallbacks.push({ index: Number(tail), value: v });
     }
     fallbacks.sort((a, b) => a.index - b.index);
-    return { primary: scopedPrimary, fallbacks };
+    return { primary: scopedPrimary, fallbacks, scoped: true };
   }
 
   const primary = merged[base];
@@ -1422,9 +1431,9 @@ function resolveScopedRotationSet(
   // lose their rotation pool, collapsing to OneCLI vault single-token mode.
   if (!primary && fallbacks.length > 0) {
     const promoted = fallbacks.shift()!;
-    return { primary: promoted.value, fallbacks };
+    return { primary: promoted.value, fallbacks, scoped: false };
   }
-  return { primary, fallbacks };
+  return { primary, fallbacks, scoped: false };
 }
 
 /**
@@ -3405,6 +3414,22 @@ async function buildContainerArgs(
     for (const fb of auth.oauthFallbacks) {
       args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN_${fb.index}=${fb.value}`);
     }
+    // Which credential set those slots came from. Scoped tokens are forwarded
+    // under the same unscoped `_N` names as globals, so without this the
+    // container cannot tell its slot 2 from the global pool's slot 2 — and
+    // rate-limit utilization sampled against them is not comparable (see
+    // rate_limit_samples in the container's outbound.db).
+    args.push('-e', `NANOCLAW_OAUTH_CREDENTIAL_SET=${auth.oauthScoped ? `group:${credentialFolder}` : 'global'}`);
+    // Operator-declared lane per slot (`<slot>:<lane>,...`). The container
+    // reads this from its own env (see laneForSlot in providers/claude.ts),
+    // and there is NO generic env passthrough into containers — the only one
+    // is prefix-limited to RENDER_PG_/RENDER_REDIS_URL_ below. Without this
+    // explicit forward the variable is simply undefined inside every
+    // container and `lane` stays NULL forever no matter what .env says, with
+    // no error anywhere to show for it. Forwarded only when declared, so an
+    // install that never sets it sends nothing.
+    const oauthLanes = process.env.CLAUDE_CODE_OAUTH_LANES;
+    if (oauthLanes) args.push('-e', `CLAUDE_CODE_OAUTH_LANES=${oauthLanes}`);
   }
 
   // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves
