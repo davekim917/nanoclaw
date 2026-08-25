@@ -2,7 +2,11 @@
 # Exercises the campaign verbs against a scratch state dir. No network: every
 # assertion below exits before the fetch block, except case 1.
 set -u
-G=/home/ubuntu/nanoclaw-v2/container/skills/smoke-test/scripts/smoke-develop-gate.sh
+# Resolve the gate next to THIS file. The old absolute path pointed at the main
+# checkout, so running this suite from a worktree silently tested a different
+# copy of the script than the one being edited.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+G="$SCRIPT_DIR/smoke-develop-gate.sh"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 export SMOKE_GATE_STATE_DIR="$T/state" SMOKE_GATE_ACTIVE_FILE="$T/run-active.json" \
        SMOKE_GATE_HOLD_FILE="$T/develop-hold.json"
@@ -125,7 +129,15 @@ BIN="$T/bin"; mkdir -p "$BIN"
 cat > "$BIN/gh" <<'SH'
 #!/usr/bin/env bash
 case "$*" in
-  *branches*)  jq -cn --arg s "$FAKE_SOURCE" '{commit:{sha:$s}}' ;;
+  *"pr list"*)
+    # Lock probe for freeze_status: by the time the advisory fan-out runs, the
+    # caller has finished every state write, so the lock must be free.
+    if [ -n "${LOCK_PROBE:-}" ]; then
+      ( flock -n 6 && printf 'free' || printf 'held' ) 6>"$LOCK_PROBE_FILE" > "$LOCK_PROBE"
+    fi
+    printf '' ;;
+  *branches*)  [ -n "${FAKE_FETCH_DELAY:-}" ] && sleep "$FAKE_FETCH_DELAY"
+               jq -cn --arg s "$FAKE_SOURCE" '{commit:{sha:$s}}' ;;
   *"run list"*) cat "$FAKE_CHECKS" ;;
   *compare*)   jq -cn '{status:"ahead",behind_by:0,files:[{filename:"XZO-BACKEND/src/x.ts"}]}' ;;
 esac
@@ -179,6 +191,73 @@ echo "20. check does NOT hold the write lock across its fetches"
 BLOCKER=$!; sleep 0.3
 ck "check still answers"  "$(bash "$G" check | jq -r '.settled')" "true"
 wait $BLOCKER
+
+# F1. Losing the lock must never read as losing the slot. A `progress` stamp
+# that collides with a busy poll used to emit a bare ok:false with no error
+# field, which the skill's stop rule could not tell apart from "you were
+# reclaimed" — so a transient contention miss killed healthy campaigns.
+echo "21. a lock-busy refusal is RETRYABLE and names itself, not a lost slot"
+echo '{"schemaVersion":1}' > "$T/state/develop-state.json"
+bash "$G" claim camp-lock "$SHA" >/dev/null
+( flock -x 9; sleep 3 ) 9>"$T/state/develop-state.lock" &
+BLOCKER=$!; sleep 0.3
+OUT="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 bash "$G" progress camp-lock)"
+wait $BLOCKER
+ck "retryable"           "$(jq -r '.retryable' <<<"$OUT")"       "true"
+ck "greppable error"     "$(jq -r '.error | startswith("gate_lock_busy:")' <<<"$OUT")" "true"
+ck "says do not stop"    "$(jq -r '.error | test("do not stop the campaign")' <<<"$OUT")" "true"
+ck "no spurious wake"    "$(jq -r '.wakeAgent' <<<"$OUT")"       "false"
+ck "slot untouched"      "$(st '.activeRunId')"                  "camp-lock"
+# ...and the terminal refusal it must be distinguishable FROM carries neither.
+OUT="$(bash "$G" progress camp-nope)"
+ck "not-active: no retry" "$(jq -r '.retryable // "absent"' <<<"$OUT")" "absent"
+ck "not-active: ok false" "$(jq -r '.ok' <<<"$OUT")"             "false"
+
+echo "22. a scheduled poll's FETCH window must not starve a progress stamp"
+# Case 20 proves `check` releases the lock; this proves the verb that actually
+# collides with a coordinator does too. A poll is put mid-fetch (the gh stub
+# stalls) and a mandatory `progress` stamp with a 1s patience must still get
+# through. Before the fix the poll held the lock for the whole fetch and the
+# stamp came back ok:false — which the skill's stop rule read as "reclaimed".
+jq -c --arg s "$SHA" --arg n "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{schemaVersion:1,activeRunId:"camp-poll",activeSha:$s,activeStartedAt:$n,activeProgressAt:$n}' \
+  -n > "$T/state/develop-state.json"
+FAKE_FETCH_DELAY=3 bash "$G" poll >/dev/null 2>&1 &
+POLLER=$!; sleep 1
+OUT="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 bash "$G" progress camp-poll)"
+wait $POLLER
+ck "stamp not starved"   "$(jq -r '.ok' <<<"$OUT")"              "true"
+ck "no lock-busy error"  "$(jq -r '.error // "none"' <<<"$OUT")" "none"
+
+echo "23. F4: holdMergesUntil rides the LAST progress stamp, not the run start"
+# A campaign is documented at 1-3h with a 90m default hold, so anchoring to the
+# original start advertised an EXPIRED hold at minute 91 of a healthy, stamping
+# run — the merge queue silently released mid-campaign.
+jq -c --arg s "$SHA" '{schemaVersion:1,activeRunId:"long-1",activeSha:$s,
+  activeStartedAt:"2020-01-01T00:00:00Z",activeProgressAt:"2020-01-01T00:00:00Z",
+  activeMergeHold:true}' -n > "$T/state/develop-state.json"
+rm -f "$T/run-active.json"
+bash "$G" progress long-1 >/dev/null
+HOLD_UNTIL="$(jq -r '.holdMergesUntil' "$T/run-active.json")"
+ck "hold is in the future" \
+  "$([ "$(date -u -d "$HOLD_UNTIL" +%s)" -gt "$(date -u +%s)" ] && echo yes || echo no)" "yes"
+ck "startedAt still original" "$(jq -r '.startedAt' "$T/run-active.json")" "2020-01-01T00:00:00Z"
+
+echo "24. freeze_status does NOT run its POST fan-out under the state lock"
+# The single longest thing the gate does: one list call plus up to 100 status
+# POSTs at 6s each. It is called from claim/progress/release/finish/poll, always
+# AFTER the last state write, so holding the lock across it bought nothing and
+# starved the mandatory progress stamp.
+echo '{"schemaVersion":1}' > "$T/state/develop-state.json"
+export SMOKE_GATE_FREEZE_STATUS_CONTEXT=qa/freeze \
+       LOCK_PROBE="$T/freeze-probe.txt" LOCK_PROBE_FILE="$T/state/develop-state.lock"
+bash "$G" claim camp-fs "$SHA" >/dev/null
+ck "lock free during fan-out" "$(cat "$T/freeze-probe.txt" 2>/dev/null)" "free"
+rm -f "$T/freeze-probe.txt"
+bash "$G" progress camp-fs >/dev/null
+ck "same on the stamp path"   "$(cat "$T/freeze-probe.txt" 2>/dev/null)" "free"
+bash "$G" release camp-fs >/dev/null
+unset SMOKE_GATE_FREEZE_STATUS_CONTEXT LOCK_PROBE LOCK_PROBE_FILE
 
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || echo "FAILURES PRESENT"
 exit "$FAIL"

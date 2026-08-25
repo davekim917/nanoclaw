@@ -116,6 +116,30 @@ is refused rather than leaving the real lane forever missing. Re-freezing on a
 new build rewrites the contract, which invalidates every marker bound to the
 old one: stale lanes cannot vouch for a build they never touched.
 
+**Re-running a lane, or redefining one, on the SAME build.** A sourceSha change
+retires the old markers by itself; a same-SHA change does not, and a freeze PR
+pins one SHA for a whole campaign. So a lane re-dispatched mid-run, or a lane id
+repurposed by a second `contract` call, would otherwise keep its OLD terminal
+marker — still SHA-correct, still terminal — and the barrier would report
+`ready` while a live worker was mid-flight. Two verbs close that:
+
+```bash
+# Re-running ONE lane: retire just that lane's evidence, keep the rest counting.
+SMOKE_LANE_ROLE=coordinator \
+bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh redispatch <run-dir> <lane-id>
+
+# Redefining lanes on the same SHA: retire EVERY existing marker at once.
+SMOKE_LANE_ROLE=coordinator \
+bash /app/skills/smoke-test/scripts/smoke-run-scaffold.sh contract \
+  <run-dir> <source-sha> <lane>... --regenerate
+```
+
+Both bump a lane `generation` in the contract, which markers inherit; the
+barrier then names the stale marker in `invalid[]` with a `stale generation`
+reason until a fresh one lands. **A same-SHA `contract` call over existing
+markers is refused without `--regenerate`** — that refusal is the guard, so read
+it rather than working around it.
+
 The coordinator then runs `scripts/smoke-evidence-barrier.sh <run-dir> lanes`
 and writes `coordinator/preliminary.md`. The challenger writes
 `challenger/disposition.md` first. Neither parent reads the other file before
@@ -153,7 +177,9 @@ standing instructions pin a different existing root. Never create sibling run
 trees beside it. The per-thread coordinator synthesis session must run
 `scripts/smoke-evidence-barrier.sh <run-dir> synthesis` and receive
 `ready:true` before publishing. A missing marker means the lane is still
-running or failed to report; inspect or redispatch it. Never infer completion
+running or failed to report; inspect it, and if you re-run it call
+`smoke-run-scaffold.sh redispatch` FIRST so its old marker cannot answer for the
+new attempt. Never infer completion
 from process age, a screenshot timestamp, a chat status, or an absent process.
 
 ## Non-negotiable frontend rule
@@ -765,8 +791,20 @@ least every 15 minutes while lanes run:
 bash /workspace/agent/smoke-develop-gate.sh progress <run-id>
 ```
 
-An `ok:false` response means this run is no longer the active one (reclaimed
-or finished): stop the campaign immediately instead of double-running the SHA.
+**Read `ok:false` carefully — two different things wear it.** Any gate verb can
+answer `ok:false` for a transient reason as well as a terminal one, and only one
+of them means stop:
+
+| Response | Meaning | What to do |
+|---|---|---|
+| `retryable:true` and `error` starting `gate_lock_busy:` | Another gate invocation held the state lock. Says **nothing** about who owns the slot. | Wait ~10s and re-run the **same** command. Retry up to 5 times before treating it as an outage. Never stop the campaign. |
+| `ok:false` with any other `error` | This run is no longer the active one (reclaimed, taken over, or already finished). | Stop the campaign immediately instead of double-running the SHA. |
+
+Key the stop decision on the second row, never on bare `ok:false`. A mandatory
+`progress` stamp that merely collides with a busy poll used to be indistinguishable
+from "you were reclaimed", and stopping on it killed healthy campaigns — the exact
+failure the liveness stamp exists to prevent. `SMOKE_GATE_LOCK_WAIT_SECONDS`
+(default 15) tunes how long a gate call waits before giving up.
 
 ### Human-requested campaigns
 

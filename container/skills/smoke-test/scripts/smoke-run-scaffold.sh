@@ -10,14 +10,48 @@
 # barrier-governed posture it did not have. A gate whose failure mode is
 # silent reversion to vibes is worse than no gate.
 #
-#   smoke-run-scaffold.sh contract <run-dir> <source-sha> <lane>[:kind[:title]]...
-#   smoke-run-scaffold.sh marker   <run-dir> <lane-id> <status> [summary] [evidence-csv]
+#   smoke-run-scaffold.sh contract    <run-dir> <source-sha> <lane>[:kind[:title]]... [--regenerate]
+#   smoke-run-scaffold.sh marker      <run-dir> <lane-id> <status> [summary] [evidence-csv]
+#   smoke-run-scaffold.sh redispatch  <run-dir> <lane-id>
 #
 # The marker verb reads sourceSha from the contract rather than taking it as
 # an argument. A worker therefore cannot stamp a marker with a build it was
 # not assigned, which is the property the barrier's SHA check exists to
 # enforce and the one freehand markers dropped.
+#
+# LANE GENERATIONS. smoke-evidence-barrier.sh validates a marker's
+# `.generation` against the contract's `.lanes[].generation`, which closes two
+# holes a sourceSha check cannot see: a lane RE-DISPATCHED mid-run (its old
+# terminal marker is still SHA-correct and still terminal, so the barrier
+# reported ready while a live worker was mid-flight) and a contract
+# RE-SCAFFOLDED into the same run dir on the same SHA (a lane id repurposed to
+# mean something else, with the old marker still validating). This script is
+# the ONLY sanctioned writer of either artifact — SKILL.md forbids hand-writing
+# them — so until it could produce a generation, that whole check was
+# unreachable and the barrier was enforcing a field nothing could emit.
+#
+# Two writers, matching the two holes:
+#   * `contract --regenerate` refuses a silent overwrite when markers already
+#     exist on the SAME sourceSha and, when forced, bumps EVERY lane past the
+#     highest generation the old contract carried. (A re-freeze on a NEW SHA
+#     needs none of this — the barrier's sourceSha check already retires the
+#     old markers, loudly.)
+#   * `redispatch <lane-id>` bumps ONE lane, for the ordinary case of
+#     re-running a single lane while the finished lanes keep counting.
+# Both leave the stale markers on disk on purpose: the barrier then names them
+# in `invalid[]` with a "stale generation" reason, which is loud. Deleting them
+# would make a re-dispatch look identical to a lane that never ran.
 set -euo pipefail
+
+# `--regenerate` may appear anywhere in the argument list, same convention as
+# `--takeover` in the gate scripts, so no verb has to know its position and a
+# stale positional can never mean "retire every marker".
+REGENERATE=false
+_ARGS=()
+for _a in "$@"; do
+  if [ "$_a" = "--regenerate" ]; then REGENERATE=true; else _ARGS+=("$_a"); fi
+done
+set -- ${_ARGS[@]+"${_ARGS[@]}"}
 
 COMMAND="${1:-}"
 RUN_DIR="${2:-}"
@@ -74,7 +108,7 @@ require_active_run() {
   die "run '$run_id' does not hold the gate — it was reclaimed or taken over. STOP this campaign; do not write $1"
 }
 
-[ -n "$COMMAND" ] || die "usage: smoke-run-scaffold.sh <contract|marker> <run-dir> ..."
+[ -n "$COMMAND" ] || die "usage: smoke-run-scaffold.sh <contract|marker|redispatch> <run-dir> ..."
 [ -n "$RUN_DIR" ] || die "a run directory is required"
 
 CONTRACT="$RUN_DIR/completion-contract.json"
@@ -89,6 +123,35 @@ contract)
     die "contract requires the 40-character frozen source SHA"
   [ "$#" -gt 0 ] || die "contract requires at least one lane"
 
+  # Same-SHA re-scaffold guard.
+  #
+  # Re-freezing on a NEW build already invalidates every old marker — the
+  # barrier's sourceSha check does that, loudly, and nothing here needs to
+  # help. The hole is the SAME sourceSha: a freeze PR pins one SHA for the
+  # whole campaign, so a lane repurposed mid-run (the documented incident: B2
+  # went from "permission crossings" to "publish/exports") overwrote the
+  # contract while its old marker stayed sourceSha-correct, lane-id-correct and
+  # terminal — and generation defaulted to 1 on both sides, so it validated
+  # against a definition it had never seen. Refuse that overwrite; on
+  # --regenerate bump every lane past the old contract's highest generation so
+  # no pre-existing marker can vouch for the new definitions.
+  EXISTING_MARKERS=0
+  if [ -d "$RUN_DIR/markers" ]; then
+    EXISTING_MARKERS="$(find "$RUN_DIR/markers" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  GENERATION=1
+  if [ -s "$CONTRACT" ] && [ "$EXISTING_MARKERS" -gt 0 ]; then
+    PRIOR_SHA="$(jq -r '.sourceSha // empty' "$CONTRACT" 2>/dev/null || printf '')"
+    if [ "$PRIOR_SHA" = "$SOURCE_SHA" ] && [ "$REGENERATE" != true ]; then
+      die "refusing to overwrite $CONTRACT: $EXISTING_MARKERS lane marker(s) already exist under this run on the SAME sourceSha, so every one of them would keep validating against lane ids this rewrite may have redefined. Re-run with --regenerate to retire them all, use 'redispatch <lane-id>' to retire just one lane, or write markers against the contract that is already there."
+    fi
+    if [ "$REGENERATE" = true ]; then
+      GENERATION="$(jq -r '[.lanes[]? | select(type=="object") | (.generation // 1)] | (max // 1) + 1' "$CONTRACT" 2>/dev/null || printf '')"
+      printf '%s' "$GENERATION" | grep -Eq '^[0-9]+$' ||
+        die "could not read the existing contract's lane generations from $CONTRACT — inspect it by hand rather than regenerating blind"
+    fi
+  fi
+
   LANES='[]'
   MARKERS='[]'
   for spec in "$@"; do
@@ -99,7 +162,8 @@ contract)
     printf '%s' "$id" | grep -Eq '^[A-Za-z0-9_-]+$' ||
       die "lane id must be alphanumeric/dash/underscore: $id"
     LANES="$(jq -c --arg id "$id" --arg kind "${kind:-lane}" --arg title "$title" \
-      '. + [{id:$id,kind:$kind,title:(if $title == "" then null else $title end)}]' <<<"$LANES")"
+      --argjson gen "$GENERATION" \
+      '. + [{id:$id,kind:$kind,title:(if $title == "" then null else $title end),generation:$gen}]' <<<"$LANES")"
     MARKERS="$(jq -c --arg m "markers/$id.json" '. + [$m]' <<<"$MARKERS")"
   done
 
@@ -155,6 +219,16 @@ marker)
     die "lane '$LANE' is not declared in the contract — add it there first"
 
   SOURCE_SHA="$(jq -r '.sourceSha' "$CONTRACT")"
+  # A marker INHERITS the lane's current generation from the contract, exactly
+  # the way it already inherits sourceSha: the writer never states it, so a
+  # worker cannot stamp a marker for a dispatch it was not part of. Defaults to
+  # 1 for a contract with no lanes[] (or no entry for this lane), which is what
+  # the barrier defaults to on both sides — pre-existing contracts are
+  # unaffected.
+  GENERATION="$(jq -r --arg id "$LANE" \
+    '[.lanes[]? | select(type=="object") | select(.id == $id) | (.generation // 1)][0] // 1' \
+    "$CONTRACT" 2>/dev/null || printf '')"
+  printf '%s' "$GENERATION" | grep -Eq '^[0-9]+$' || GENERATION=1
   # Trailing newline is load-bearing: with no input line `jq -R` emits nothing
   # and --argjson then receives an empty string rather than `[]`.
   EVIDENCE="$(printf '%s\n' "$EVIDENCE_CSV" | jq -Rc 'split(",") | map(select(length > 0))')"
@@ -169,9 +243,11 @@ marker)
     --arg now "$NOW" \
     --arg summary "$SUMMARY" \
     --argjson evidence "$EVIDENCE" \
+    --argjson generation "$GENERATION" \
     '{schemaVersion:1,
       lane:$lane,
       sourceSha:$sha,
+      generation:$generation,
       status:$status,
       completedAt:$now,
       finishedAt:$now,
@@ -179,10 +255,47 @@ marker)
       evidence:$evidence}' > "$tmp"
   mv "$tmp" "$RUN_DIR/markers/$LANE.json"
   jq -cn --arg lane "$LANE" --arg sha "$SOURCE_SHA" --arg status "$STATUS" \
-    '{ok:true,lane:$lane,sourceSha:$sha,status:$status}'
+    --argjson generation "$GENERATION" \
+    '{ok:true,lane:$lane,sourceSha:$sha,generation:$generation,status:$status}'
+  ;;
+
+redispatch)
+  # Retire ONE lane's evidence before re-running it. Bumping the whole contract
+  # would retire the finished lanes too and stall the run; leaving the old
+  # marker in place with a stale generation is what makes the barrier say
+  # "a fresh marker has not landed yet" instead of "ready".
+  require_coordinator_role "a lane generation bump"
+  require_active_run "a lane generation bump"
+  LANE="${3:-}"
+  [ -n "$LANE" ] || die "redispatch requires a lane id"
+  [ -s "$CONTRACT" ] || die "no completion contract at $CONTRACT — write it before redispatching a lane"
+  jq -e --arg m "markers/$LANE.json" 'any(.requiredLaneMarkers[]; . == $m)' \
+    "$CONTRACT" >/dev/null 2>&1 ||
+    die "lane '$LANE' is not declared in the contract — add it there first"
+
+  tmp="$(mktemp "$RUN_DIR/.completion-contract.XXXXXX")"
+  # A contract written before lanes[] existed (or by an older scaffold) may
+  # carry no entry for this id at all. Create one at generation 2 rather than
+  # failing: generation 1 is what every marker already written defaults to, so
+  # 2 is the first value that actually retires them.
+  jq --arg id "$LANE" '
+    (.lanes //= []) |
+    if any(.lanes[]?; type == "object" and .id == $id)
+    then .lanes = [ .lanes[] |
+           if (type == "object" and .id == $id)
+           then .generation = ((.generation // 1) + 1)
+           else . end ]
+    else .lanes += [{id:$id, kind:"lane", title:null, generation:2}] end
+  ' "$CONTRACT" > "$tmp"
+  mv "$tmp" "$CONTRACT"
+  NEXT_GEN="$(jq -r --arg id "$LANE" \
+    '[.lanes[]? | select(type=="object") | select(.id == $id) | (.generation // 1)][0] // 1' "$CONTRACT")"
+  jq -cn --arg lane "$LANE" --argjson generation "$NEXT_GEN" \
+    --argjson retired "$([ -s "$RUN_DIR/markers/$LANE.json" ] && echo true || echo false)" \
+    '{ok:true,lane:$lane,generation:$generation,retiredExistingMarker:$retired}'
   ;;
 
 *)
-  die "unknown command: $COMMAND (expected contract or marker)"
+  die "unknown command: $COMMAND (expected contract, marker or redispatch)"
   ;;
 esac

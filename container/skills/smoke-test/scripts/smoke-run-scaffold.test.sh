@@ -158,4 +158,67 @@ REFROZEN="$(barrier "$FIXTURE_DIR" lanes || true)"
 jq -e '.ready == false and (.invalid | sort == ["markers/B1.json","markers/S1.json"])' \
   <<<"$REFROZEN" >/dev/null
 
+# F2. The barrier has always honoured `.generation`, but NOTHING could write
+# one — the scaffold is the only sanctioned writer and it emitted no such field,
+# so the whole stale-marker protection was unreachable. These cases prove the
+# two writers that make it real.
+FRESH="$(dirname "$FIXTURE_DIR")/gen-fixture"
+mkdir -p "$FRESH"
+gate_owns "$(basename "$FRESH")"
+scaffold contract "$FRESH" "$SHA" B1:browser B2:browser >/dev/null
+scaffold marker "$FRESH" B1 pass 'lane one' >/dev/null
+scaffold marker "$FRESH" B2 pass 'lane two' >/dev/null
+mkdir -p "$FRESH/coordinator" "$FRESH/challenger"
+printf '# p\n' >"$FRESH/coordinator/preliminary.md"
+printf '# d\n' >"$FRESH/challenger/disposition.md"
+
+# A marker inherits the contract's generation, exactly the way it inherits
+# sourceSha — never stated by the caller.
+jq -e '.generation == 1' "$FRESH/markers/B1.json" >/dev/null
+barrier "$FRESH" lanes | jq -e '.ready == true' >/dev/null
+
+# A same-SHA re-scaffold over existing markers is REFUSED. This is the concrete
+# incident: a lane repurposed mid-run under a pinned freeze SHA, whose old
+# marker stayed sourceSha-correct, lane-id-correct and terminal.
+OUT="$(scaffold contract "$FRESH" "$SHA" B1:browser B2:browser:'repurposed' 2>&1 || true)"
+jq -e '.ok == false and (.error | test("--regenerate"))' <<<"$OUT" >/dev/null || {
+  echo "expected a same-SHA re-scaffold over existing markers to be refused, got: $OUT" >&2
+  exit 1; }
+jq -e '.lanes[1].title == null' "$FRESH/completion-contract.json" >/dev/null
+
+# With --regenerate it goes through, every lane is bumped, and every stale
+# marker now FAILS the barrier instead of vouching for a definition it never saw.
+scaffold contract "$FRESH" "$SHA" B1:browser B2:browser:'repurposed' --regenerate \
+  | jq -e '.ok == true' >/dev/null
+jq -e 'all(.lanes[]; .generation == 2)' "$FRESH/completion-contract.json" >/dev/null
+REGEN="$(barrier "$FRESH" lanes || true)"
+jq -e '.ready == false and (.invalid | sort == ["markers/B1.json","markers/B2.json"]) and
+       (.invalidReasons | map(test("stale generation")) | all)' <<<"$REGEN" >/dev/null || {
+  echo "expected bumped generations to retire every stale marker, got: $REGEN" >&2
+  exit 1; }
+
+# Fresh markers land at the new generation and the barrier clears again.
+scaffold marker "$FRESH" B1 pass 'redone' | jq -e '.generation == 2' >/dev/null
+scaffold marker "$FRESH" B2 pass 'redone' >/dev/null
+barrier "$FRESH" lanes | jq -e '.ready == true' >/dev/null
+
+# redispatch bumps ONE lane: its old marker is retired, the finished lane keeps
+# counting. Bumping the whole contract here would stall the run.
+scaffold redispatch "$FRESH" B2 | jq -e '.ok == true and .generation == 3 and .retiredExistingMarker == true' >/dev/null
+ONE="$(barrier "$FRESH" lanes || true)"
+jq -e '.ready == false and (.invalid == ["markers/B2.json"])' <<<"$ONE" >/dev/null || {
+  echo "expected redispatch to retire only its own lane, got: $ONE" >&2; exit 1; }
+scaffold marker "$FRESH" B2 pass 'second attempt' | jq -e '.generation == 3' >/dev/null
+barrier "$FRESH" lanes | jq -e '.ready == true' >/dev/null
+
+# redispatch is coordinator-owned and gate-fenced like every other write.
+gate_owns "someone-else"
+OUT="$(scaffold redispatch "$FRESH" B2 2>&1 || true)"
+jq -e '.ok == false and (.error | test("does not hold the gate"))' <<<"$OUT" >/dev/null
+gate_owns "$(basename "$FRESH")"
+OUT="$(SMOKE_LANE_ROLE=challenger scaffold redispatch "$FRESH" B2 2>&1 || true)"
+jq -e '.ok == false and (.error | test("SMOKE_LANE_ROLE"))' <<<"$OUT" >/dev/null
+OUT="$(scaffold redispatch "$FRESH" NOPE 2>&1 || true)"
+jq -e '.ok == false and (.error | test("not declared"))' <<<"$OUT" >/dev/null
+
 echo "smoke run scaffold tests passed"

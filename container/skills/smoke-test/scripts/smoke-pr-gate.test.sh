@@ -106,6 +106,13 @@ set -u
 [ -n "${STUB_FRONTEND_DEPLOYS+x}" ] || STUB_FRONTEND_DEPLOYS='[]'
 ARGS="$*"
 if printf '%s' "$ARGS" | grep -qF '/suspend'; then
+  # Lock probe: `finish` must have RELEASED the PR state lock before it got
+  # here, so a concurrent process can take it. Recorded free/held for the
+  # caller to assert on.
+  if [ -n "${STUB_LOCK_PROBE:-}" ] && [ -n "${STUB_LOCK_PROBE_FILE:-}" ]; then
+    ( flock -n 6 && printf 'free' || printf 'held' ) \
+      6>"$STUB_LOCK_PROBE_FILE" > "$STUB_LOCK_PROBE"
+  fi
   printf '%s' "$STUB_SUSPEND_CODE"; exit 0
 fi
 if printf '%s' "$ARGS" | grep -qF '/healthz'; then
@@ -133,7 +140,7 @@ reset_stubs() {
         STUB_REF_RESPONSE STUB_REF_EXIT STUB_BRANCH_EXISTS STUB_PR_LIST_EXIT \
         STUB_PR_FILES_EXIT STUB_PR_CREATE_EXIT STUB_NEW_PR_NUMBER STUB_SUSPEND_CODE \
         STUB_HEALTHZ_CODE STUB_SERVICES STUB_BACKEND_DEPLOYS STUB_FRONTEND_DEPLOYS \
-        STUB_COMPARE_FILES STUB_COMPARE_EXIT \
+        STUB_COMPARE_FILES STUB_COMPARE_EXIT STUB_LOCK_PROBE STUB_LOCK_PROBE_FILE \
         SMOKE_GATE_PUBLISH_FILE SMOKE_GATE_HOLD_FILE SMOKE_GATE_HANDOFF_LEDGER 2>/dev/null || true
 }
 
@@ -713,5 +720,55 @@ unset STUB_RUN_LIST_EXIT
 export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
 bash "$GATE" poll >/dev/null
 jq -e '.factsStuckSha == null and .factsStuckAlertSha == null' "$STATE_DIR/pr-77-state.json" >/dev/null
+
+# --- 18. finish DROPS the PR lock before its network work -------------------
+# By the time the suspend POST runs, the verdict is already durable in the PR
+# state file and activeRunId is null. Everything after that point is network
+# (services list, suspend, detect_freeze's GitHub calls) or writes to OTHER
+# files, so holding the per-PR lock across it only starved concurrent gate
+# verbs — the PR-gate half of the starvation that made a coordinator's mandatory
+# `progress` stamp read as "you lost the slot". The curl stub probes the lock
+# from a separate process while the suspend call is in flight.
+fresh_state
+LOCKPROBE_SHA="$(sha 7)"
+bash "$GATE" claim run-lockprobe 88 "$LOCKPROBE_SHA" >/dev/null
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-88\",\"name\":\"backend-preview PR #88\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://b.onrender.com\"}}]"
+export STUB_SUSPEND_CODE=202
+export STUB_LOCK_PROBE="$STATE_DIR/lock-probe.txt"
+export STUB_LOCK_PROBE_FILE="$STATE_DIR/pr-88-state.lock"
+bash "$GATE" finish "$LOCKPROBE_SHA" run-lockprobe GO | jq -e '
+  .ok == true and .suspend.attempted == true and .suspend.ok == true
+' >/dev/null
+if [ "$(cat "$STUB_LOCK_PROBE" 2>/dev/null)" != "free" ]; then
+  echo "expected finish to have released the PR state lock before the suspend POST, probe said: $(cat "$STUB_LOCK_PROBE" 2>/dev/null)" >&2
+  exit 1
+fi
+# The verdict landed anyway — releasing the lock early loses nothing.
+jq -e --arg sha "$LOCKPROBE_SHA" '.completedSha == $sha and .activeRunId == null' \
+  "$STATE_DIR/pr-88-state.json" >/dev/null
+
+# --- 19. a lock-busy refusal is RETRYABLE, not "you lost the slot" ----------
+# Bare `ok:false` with no error field was indistinguishable from a reclaim, and
+# the skill tells a coordinator to stop the campaign on exactly that.
+fresh_state
+BUSY_SHA="$(sha 8)"
+bash "$GATE" claim run-busy 89 "$BUSY_SHA" >/dev/null
+( flock -x 6; sleep 3 ) 6>"$STATE_DIR/pr-89-state.lock" &
+BUSY_BLOCKER=$!
+sleep 0.3
+BUSY_OUT="$(SMOKE_GATE_LOCK_WAIT_SECONDS=1 bash "$GATE" progress run-busy)"
+wait "$BUSY_BLOCKER"
+jq -e '
+  .ok == false and .retryable == true and .pr == 89 and .wakeAgent == false and
+  (.error | startswith("gate_lock_busy:")) and
+  (.error | test("do not stop the campaign"))
+' <<<"$BUSY_OUT" >/dev/null || {
+  echo "expected a retryable gate_lock_busy refusal, got: $BUSY_OUT" >&2; exit 1; }
+# ...and the terminal refusal it must be told apart from carries neither field.
+jq -e '.ok == false and (.retryable | not) and (.error | startswith("gate_lock_busy:") | not)' \
+  <<<"$(bash "$GATE" progress run-nonexistent)" >/dev/null || {
+  echo "expected a not-active refusal to carry no retryable flag" >&2; exit 1; }
+# The slot survived the transient miss.
+jq -e '.activeRunId == "run-busy"' "$STATE_DIR/pr-89-state.json" >/dev/null
 
 echo "smoke pr gate tests passed"
