@@ -12,7 +12,6 @@ import {
   type ArchiveEvidenceRow,
 } from '../../message-archive.js';
 import { GENERATED_MEMORY_MAX_BYTES, GENERATED_MEMORY_RELATIVE_PATH, TOPIC_DIRECTORIES } from './curator-contract.js';
-import { GRAPH_SCENT_BOUNDS, readGraphScent, STOP_WORDS, type GraphScent } from './graph-scent.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
@@ -107,9 +106,6 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // block, and those are bounded by bootstrapFinalChars below, so this raise
   // cannot starve recall.
   capabilityTotalChars: 10_000,
-  // Advisory graph-pointer lane; enforced inside readGraphScent by dropping
-  // lowest-ranked pointers, and shed FIRST by enforceFinalBound.
-  graphScentChars: GRAPH_SCENT_BOUNDS.chars,
   finalChars: 12_000,
   exactLinkFinalChars: 16_000,
   // Bootstrap turns carry mandatory payload the ordinary bound never sees —
@@ -146,7 +142,7 @@ export interface PreTurnContextInput {
 }
 
 export interface ContextNotice {
-  source: 'scope' | 'capabilities' | 'markdown' | 'archive' | 'exact-link' | 'context' | 'graph';
+  source: 'scope' | 'capabilities' | 'markdown' | 'archive' | 'exact-link' | 'context';
   status: 'ok' | 'no-match' | 'degraded' | 'truncated' | 'conflict';
   code: string;
   detail: string;
@@ -191,8 +187,6 @@ export interface PreTurnContext {
   conversationEvidence: {
     excerpts: ConversationEvidenceExcerpt[];
   };
-  /** Advisory graph pointers; absent when the lane is cold, empty, or shed. */
-  graphScent?: GraphScent;
   notices: ContextNotice[];
 }
 
@@ -274,9 +268,53 @@ function compareCodepoint(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-// STOP_WORDS moved to graph-scent.ts (imported above): both modules use it,
-// and this module already imports graph-scent for readGraphScent, so the value
-// dependency must run that way to avoid a module cycle.
+/** Recall stopword list: tokens too common to carry any ranking signal. */
+const STOP_WORDS = new Set([
+  'a',
+  'about',
+  'an',
+  'and',
+  'are',
+  'as',
+  'at',
+  'be',
+  'before',
+  'by',
+  'can',
+  'com',
+  'do',
+  'does',
+  'for',
+  'from',
+  'has',
+  'have',
+  'how',
+  'i',
+  'in',
+  'into',
+  'is',
+  'it',
+  'me',
+  'of',
+  'on',
+  'our',
+  'should',
+  'that',
+  'the',
+  'their',
+  'this',
+  'to',
+  'we',
+  'what',
+  'when',
+  'where',
+  'which',
+  'who',
+  'with',
+  'http',
+  'https',
+  'www',
+]);
 
 function canonicalToken(token: string): string {
   let value = token.toLocaleLowerCase('en-US');
@@ -290,6 +328,80 @@ function canonicalToken(token: string): string {
   else if (value.length > 4 && value.endsWith('ed')) value = value.slice(0, -2);
   else if (value.length > 4 && value.endsWith('s')) value = value.slice(0, -1);
   return value;
+}
+
+/**
+ * Per-token canonical-form memo.
+ *
+ * Natural language is Zipfian, and this function is pure. A cold turn on the
+ * largest workgroup makes 1,063,284 `canonicalToken` calls over 35,849 DISTINCT
+ * tokens (29.7x reuse); memoizing removes 60% of the turn's CPU (7,047ms ->
+ * 2,837ms measured). `TOKEN_STREAM_CACHE` cannot cover this: it is keyed per
+ * candidate STRING, so every candidate on a cold turn misses and
+ * re-canonicalizes the same few thousand words. The two caches are layered, not
+ * alternatives.
+ *
+ * NO REORDER ON HIT — do not "improve" this into an LRU. A delete+set per hit
+ * costs ~2.5s of the 4.2s saving (cold CPU: 2,837ms without, 5,457ms with).
+ *
+ * THE CAP IS A FLOOR, NOT A BUDGET. Without reordering, a sequential sweep over
+ * a working set LARGER than the cap evicts every entry before its reuse and the
+ * hit rate collapses to ZERO, not to "degraded" — measured: 0 hits over 119,836
+ * lookups at a 50,000 cap against a 59,918-token sweep. That is the same failure
+ * the `TOKEN_STREAM_CACHE` wholesale-`.clear()` had, wearing a different costume.
+ * The memo is process-wide and shared across workgroups (the map is
+ * workgroup-independent), so the working set is the UNION over every tree:
+ * 79,071 distinct tokens today. 131,072 is ~1.66x that at a measured 51
+ * bytes/entry (~6.4MB). Raising it is cheap; lowering it below the union is a
+ * cliff. The hit-rate warning below is what makes that cliff observable.
+ *
+ * The cliff is worse than zero hits: past the cap every miss costs a delete
+ * plus an insert, and V8 compacts the ordered hash table on delete, so a
+ * 131,072-entry map runs ~80us per lookup (measured). Over-capacity is slower
+ * than no memo at all, and the warning is the only thing that says so.
+ */
+const CANONICAL_MEMO = new Map<string, string>();
+const CANONICAL_MEMO_MAX = 131_072;
+const CANONICAL_MEMO_STATS = { hits: 0, misses: 0 };
+let canonicalMemoWarned = false;
+
+function canonicalTokenMemo(token: string): string {
+  const cached = CANONICAL_MEMO.get(token);
+  if (cached !== undefined) {
+    CANONICAL_MEMO_STATS.hits++;
+    return cached;
+  }
+  CANONICAL_MEMO_STATS.misses++;
+  const value = canonicalToken(token);
+  // Evict exactly ONE oldest entry. Never `.clear()` — one overflow must not
+  // discard the whole warm set. A Map iterates in insertion order, so the first
+  // key is the oldest.
+  if (CANONICAL_MEMO.size >= CANONICAL_MEMO_MAX) {
+    CANONICAL_MEMO.delete(CANONICAL_MEMO.keys().next().value!);
+  }
+  CANONICAL_MEMO.set(token, value);
+  const total = CANONICAL_MEMO_STATS.hits + CANONICAL_MEMO_STATS.misses;
+  if (!canonicalMemoWarned && total >= 1_000_000 && CANONICAL_MEMO_STATS.hits / total < 0.5) {
+    canonicalMemoWarned = true;
+    log.warn('canonical-token memo hit rate below 50%: working set has outgrown the cap', {
+      hits: CANONICAL_MEMO_STATS.hits,
+      misses: CANONICAL_MEMO_STATS.misses,
+      max: CANONICAL_MEMO_MAX,
+    });
+  }
+  return value;
+}
+
+/** Test seam: proves the memo caches and evicts without asserting on wall clock. */
+export function _canonicalMemoStatsForTest(): { hits: number; misses: number; size: number; max: number } {
+  return { ...CANONICAL_MEMO_STATS, size: CANONICAL_MEMO.size, max: CANONICAL_MEMO_MAX };
+}
+
+export function _resetCanonicalMemoForTest(): void {
+  CANONICAL_MEMO.clear();
+  CANONICAL_MEMO_STATS.hits = 0;
+  CANONICAL_MEMO_STATS.misses = 0;
+  canonicalMemoWarned = false;
 }
 
 export function tokenizeForRecall(value: string): string[] {
@@ -368,7 +480,7 @@ export function tokenStreamForRecall(value: string): readonly RecallToken[] {
   const normalized = value.normalize('NFKC').toLocaleLowerCase('en-US');
   const tokens = [...normalized.matchAll(/[\p{L}\p{N}_-]{2,}/gu)]
     .map((match) => ({
-      value: canonicalToken(match[0]),
+      value: canonicalTokenMemo(match[0]),
       start: match.index,
       end: match.index + match[0].length,
     }))
@@ -380,7 +492,7 @@ export function tokenStreamForRecall(value: string): readonly RecallToken[] {
   return tokens;
 }
 
-interface PassageMatch {
+export interface PassageMatch {
   text: string;
   coverage: number;
   tokenSpan: number;
@@ -542,19 +654,28 @@ function offsetSliceable(candidate: string, sentences: readonly { start: number;
 }
 
 /**
- * The overlapping windows `bestPassage` scores, each paired with its tokens.
+ * The window geometry `bestPassage` scores, WITHOUT materializing a token array
+ * per window.
  *
- * The windows themselves are unchanged — still original-string slices, so the
- * text delivered to the agent is byte-identical. What changes is that the
- * candidate is tokenized ONCE and each window takes a slice of that stream:
- * the 1..3-sentence sweep re-covers the same characters ~2.9x on the live
- * 6,633-fact store, and every window is a distinct string, so no cache could
- * ever collapse the duplication.
+ * TWO COORDINATE SYSTEMS, and conflating them is the way to break this:
+ * `start`/`end` are CHARACTER offsets into `candidate`. `tokenLo`/`tokenHi`
+ * are the half-open range of PARENT-STREAM TOKEN indices, which only exist when
+ * `stream` is non-null.
+ *
+ * `stream` is the whole-candidate token stream when the candidate is
+ * offset-sliceable. When it is null the candidate failed the sliceability gate
+ * and each window must be tokenized from its own text; those two tokenizations
+ * genuinely disagree (a mid-word chop mints window-local tokens the parent
+ * stream never had, ~1 candidate in 9,001 on the live store), so the null case
+ * is a correctness gate, not a missed optimization.
  */
-export function passageWindows(
+function passageWindowSpans(
   candidate: string,
   maxChars: number,
-): Array<{ text: string; tokens: readonly RecallToken[] }> {
+): {
+  stream: readonly RecallToken[] | null;
+  windows: Array<{ text: string; start: number; end: number; tokenLo: number; tokenHi: number }>;
+} {
   const sentences = sentenceSpans(candidate, maxChars);
   const sliceable = offsetSliceable(candidate, sentences);
   OFFSET_SLICE_STATS.total++;
@@ -577,20 +698,53 @@ export function passageWindows(
     }
   }
 
-  const windows: Array<{ text: string; tokens: readonly RecallToken[] }> = [];
+  const windows: Array<{ text: string; start: number; end: number; tokenLo: number; tokenHi: number }> = [];
   for (let first = 0; first < sentences.length; first++) {
     for (let last = first; last < Math.min(sentences.length, first + 3); last++) {
       const windowStart = sentences[first]!.start;
       const windowEnd = sentences[last]!.end;
       if (windowEnd - windowStart > maxChars) break;
-      const text = candidate.slice(windowStart, windowEnd);
       windows.push({
-        text,
-        tokens: stream ? stream.slice(firstToken[first]!, afterToken[last]!) : tokenStreamForRecall(text),
+        text: candidate.slice(windowStart, windowEnd),
+        // The span is REPORTED, not re-derived. Recovering these offsets by
+        // searching for the window text finds the FIRST occurrence, not this
+        // one — on `'aa bb?\naa bb?'` the third window's true [7,13) reads back
+        // as [0,6), byte-identical and therefore invisible to a round-trip
+        // check. The offsets exist here; nothing should ever go looking for
+        // them again. `recall-ranking.test.ts` pins exactly that case.
+        start: windowStart,
+        end: windowEnd,
+        tokenLo: stream ? firstToken[first]! : 0,
+        tokenHi: stream ? afterToken[last]! : 0,
       });
     }
   }
-  return windows;
+  return { stream, windows };
+}
+
+/**
+ * The overlapping windows paired with their tokens.
+ *
+ * `bestPassage` uses `passageWindowSpans` directly so it never materializes a
+ * token array per window; this is the materialized form the ranking tests
+ * assert against. The windows themselves are unchanged —
+ * still original-string slices, so the text delivered to the agent is
+ * byte-identical. The candidate is tokenized ONCE and each window takes a slice
+ * of that stream: the 1..3-sentence sweep re-covers the same characters ~2.9x on
+ * the live 6,633-fact store, and every window is a distinct string, so no cache
+ * could ever collapse the duplication.
+ */
+export function passageWindows(
+  candidate: string,
+  maxChars: number,
+): Array<{ text: string; tokens: readonly RecallToken[]; start: number; end: number }> {
+  const { stream, windows } = passageWindowSpans(candidate, maxChars);
+  return windows.map(({ text, start, end, tokenLo, tokenHi }) => ({
+    text,
+    tokens: stream ? stream.slice(tokenLo, tokenHi) : tokenStreamForRecall(text),
+    start,
+    end,
+  }));
 }
 
 function minimumTokenSpan(queryTokens: Set<string>, passageTokens: readonly { value: string }[]): number {
@@ -619,6 +773,23 @@ function comparePassageMatch(a: PassageMatch, b: PassageMatch): number {
   );
 }
 
+/**
+ * The encoded score. NOT display-only, despite what the comment inside the old
+ * `bestPassage` claimed: it drives `excerpts.sort((a, b) => b.score - a.score)`,
+ * decides which excerpt the character budget sheds, ships serialized in the
+ * provider payload, and gates the conflict notice. Every arm below must
+ * reproduce it BIT-EXACTLY, which is why `density` is passed as the same float
+ * both paths compute rather than recomputed from rounded parts.
+ */
+function encodePassageScore(coverage: number, density: number, tokenSpan: number, questionLike: boolean): number {
+  return (
+    coverage * 1_000_000_000 +
+    Math.round(density * 1_000_000) +
+    Math.max(0, 100_000 - tokenSpan * 100) +
+    (questionLike ? 0 : 1)
+  );
+}
+
 function bestPassage(
   queryTokens: string[],
   candidate: string,
@@ -626,32 +797,104 @@ function bestPassage(
 ): PassageMatch | null {
   if (queryTokens.length === 0) return null;
   const minimumOverlap = queryTokens.length <= 2 ? 1 : 2;
+  const { stream, windows } = passageWindowSpans(candidate, maxChars);
   const matches: PassageMatch[] = [];
-  for (const { text, tokens: passageTokens } of passageWindows(candidate, maxChars)) {
-    const candidateSet = new Set(passageTokens.map((token) => token.value));
-    const matchedTerms = new Set(queryTokens.filter((token) => candidateSet.has(token)));
+
+  if (stream === null) {
+    // Sliceability gate failed: window text and the parent stream disagree, so
+    // each window is tokenized from its own text exactly as before.
+    for (const { text } of windows) {
+      const passageTokens = tokenStreamForRecall(text);
+      const candidateSet = new Set(passageTokens.map((token) => token.value));
+      const matchedTerms = new Set(queryTokens.filter((token) => candidateSet.has(token)));
+      if (matchedTerms.size < minimumOverlap) continue;
+      const tokenSpan = minimumTokenSpan(matchedTerms, passageTokens);
+      const density = matchedTerms.size / Math.max(1, passageTokens.length);
+      const questionLike = text.includes('?');
+      matches.push({
+        text,
+        coverage: matchedTerms.size,
+        tokenSpan,
+        density,
+        questionLike,
+        score: encodePassageScore(matchedTerms.size, density, tokenSpan, questionLike),
+      });
+    }
+    return matches.sort(comparePassageMatch)[0] ?? null;
+  }
+
+  // Fast path. Building a Set over EVERY token of EVERY window was 55-59% of the
+  // whole ranking sweep (measured 250ms of 424ms on the largest live store).
+  // Only query terms can ever contribute, so collect their positions once per
+  // candidate and read each window off that.
+  const queryTermSet = new Set(queryTokens);
+  const hitIndex: number[] = [];
+  const hitTerm: string[] = [];
+  for (let index = 0; index < stream.length; index++) {
+    const token = stream[index]!;
+    if (queryTermSet.has(token.value)) {
+      hitIndex.push(index);
+      hitTerm.push(token.value);
+    }
+  }
+
+  // `windows` is ordered by `tokenLo` non-decreasing, so one monotone cursor
+  // finds each window's first hit without rescanning.
+  let cursor = 0;
+  for (const { text, tokenLo, tokenHi } of windows) {
+    while (cursor < hitIndex.length && hitIndex[cursor]! < tokenLo) cursor++;
+    let end = cursor;
+    const matchedTerms = new Set<string>();
+    while (end < hitIndex.length && hitIndex[end]! < tokenHi) {
+      matchedTerms.add(hitTerm[end]!);
+      end++;
+    }
+    // Filter BEFORE computing density: `tokenHi - tokenLo` is zero for an empty
+    // window and `0 / 0` would put NaN into the score.
     if (matchedTerms.size < minimumOverlap) continue;
-    const tokenSpan = minimumTokenSpan(matchedTerms, passageTokens);
-    const density = matchedTerms.size / Math.max(1, passageTokens.length);
+    // Span in PARENT-STREAM indices, never in hit-list positions. Hit-list
+    // positions are compressed — they skip every non-query token in between — so
+    // using them would shrink the span whenever other words interleave and
+    // silently change tokenSpan, score and ranking order.
+    let tokenSpan = Number.POSITIVE_INFINITY;
+    for (let start = cursor; start < end; start++) {
+      const seen = new Set<string>();
+      for (let scan = start; scan < end; scan++) {
+        seen.add(hitTerm[scan]!);
+        if (seen.size === matchedTerms.size) {
+          tokenSpan = Math.min(tokenSpan, hitIndex[scan]! - hitIndex[start]! + 1);
+          break;
+        }
+      }
+    }
+    const density = matchedTerms.size / Math.max(1, tokenHi - tokenLo);
     const questionLike = text.includes('?');
-    // The encoded score mirrors the tuple above for display and downstream
-    // conflict checks. Ranking itself compares the tuple, avoiding a pile of
-    // independent incident-specific weights.
-    const score =
-      matchedTerms.size * 1_000_000_000 +
-      Math.round(density * 1_000_000) +
-      Math.max(0, 100_000 - tokenSpan * 100) +
-      (questionLike ? 0 : 1);
     matches.push({
       text,
       coverage: matchedTerms.size,
       tokenSpan,
       density,
       questionLike,
-      score,
+      score: encodePassageScore(matchedTerms.size, density, tokenSpan, questionLike),
     });
   }
+  // Stable sort, kept deliberately. A keep-best scan is NOT equivalent: on a
+  // four-field tie `<=` takes the LAST window where the sort takes the FIRST,
+  // changing the bytes delivered. See the tie case in the tests.
   return matches.sort(comparePassageMatch)[0] ?? null;
+}
+
+/**
+ * Test seam. The hit-list fast path and the non-sliceable fallback must agree
+ * bit-for-bit on `tokenSpan`, `density` and `score`, and the only way to assert
+ * that is to call the ranker directly rather than through a whole turn.
+ */
+export function _bestPassageForTest(
+  queryTokens: string[],
+  candidate: string,
+  maxChars?: number,
+): Readonly<PassageMatch> | null {
+  return bestPassage(queryTokens, candidate, maxChars);
 }
 
 function rankByBestPassage<T>(
@@ -1027,13 +1270,126 @@ function boundedFactLine(line: string, maxChars: number): string {
   return `${line.slice(0, budget).trimEnd()}${TRUNCATED_MARKDOWN_EXCERPT} ${marker}`;
 }
 
+// ---------------------------------------------------------------------------
+// Candidate derivation
+//
+// One implementation of the listing, the scan order and the scan loop. The
+// recall projection used to hold a second copy of all three and they drifted;
+// the projection is gone (see docs/specs/workgroup-cerebro/plan.md §P2.5),
+// but the rule it left behind stands — nothing may grow a second copy.
+// ---------------------------------------------------------------------------
+
+/**
+ * The ranked pool's listing: the capped walk unioned with the directly-listed
+ * topic dirs, deduped and `.sort()`ed.
+ */
+export function listRecallFiles(root: string, notices: ContextNotice[]): string[] {
+  return [...new Set([...listMarkdownFiles(root, notices), ...listTopicFiles(root, notices)])].sort();
+}
+
+/**
+ * The listing with `generated/memory.md` spliced to the front.
+ *
+ * `sourceOrder` is array position in this list's per-lane projection, so any
+ * deviation here silently re-tie-breaks recall (decision 15). Copies rather
+ * than sorting `allFiles` in place; `Array.prototype.sort` is stable, so the
+ * result is identical either way.
+ */
+export function recallScanOrder(root: string, allFiles: readonly string[]): string[] {
+  const missing = missingGeneratedMemoryPath(root, allFiles);
+  return (missing ? [...allFiles, missing] : [...allFiles]).sort(
+    (a, b) => Number(b === GENERATED_MEMORY_RELATIVE_PATH) - Number(a === GENERATED_MEMORY_RELATIVE_PATH),
+  );
+}
+
+export interface RecallScanResult {
+  fileCandidates: SearchableCandidate[];
+  factCandidates: SearchableCandidate[];
+  scannedBytes: number;
+}
+
+/**
+ * The ranked scan loop: read each listed file inside the shared byte budget and
+ * turn it into file candidates, or — for the fact ledger — one candidate per
+ * fact line sharing ONE headings array (decision 15).
+ */
+function scanRecallCandidates(
+  root: string,
+  canonicalRoot: string,
+  scanOrder: readonly string[],
+  notices: ContextNotice[],
+  scannedBytes: number,
+): RecallScanResult {
+  const fileCandidates: SearchableCandidate[] = [];
+  const factCandidates: SearchableCandidate[] = [];
+  for (const relative of scanOrder) {
+    const absolute = path.join(root, relative);
+    if (
+      (CORE_PATHS as readonly string[]).includes(relative) ||
+      NON_RECALL_PATHS.has(relative) ||
+      relative.startsWith(PREFERENCES_DIR)
+    ) {
+      continue;
+    }
+    const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
+    if (remaining <= 0) {
+      notices.push({
+        source: 'markdown',
+        status: 'truncated',
+        code: 'markdown-byte-limit',
+        detail: `scanned ${PRE_TURN_BOUNDS.markdownScannedBytes} bytes`,
+      });
+      break;
+    }
+    // NO swallow here. If the file vanished between listing and now,
+    // `readBoundedFile` throws ENOENT, which propagates to
+    // `readMemoryEvidence`'s outer catch and returns EMPTY evidence. Silently
+    // skipping it would deliver a candidate set that matches no tree.
+    const read = readBoundedFile(
+      absolute,
+      canonicalRoot,
+      remaining,
+      relative === GENERATED_MEMORY_RELATIVE_PATH ? GENERATED_MEMORY_MAX_BYTES : PRE_TURN_BOUNDS.markdownFileBytes,
+    );
+    scannedBytes += read.bytes;
+    const headings = headingsOf(read.content);
+    if (relative === GENERATED_MEMORY_RELATIVE_PATH) {
+      for (const line of read.content.split('\n')) {
+        if (!line.startsWith('- ')) continue;
+        const markerAt = line.indexOf('<!--');
+        factCandidates.push({
+          path: relative,
+          headings,
+          content: line,
+          // Score the fact, not its provenance marker. The marker is ~20% of a
+          // line's characters, and its tokens dilute the density term ranking
+          // uses, so scoring it penalised generated facts against clean manual
+          // Markdown. selectGeneratedMemoryForPrompt already strips it exactly
+          // this way on the curator side; this makes both paths agree.
+          searchable: markerAt < 0 ? line : line.slice(0, markerAt),
+          capturedAt: capturedAtOf(line),
+        });
+      }
+      continue;
+    }
+    fileCandidates.push({
+      path: relative,
+      headings,
+      content: read.content,
+      searchable: `${relative}\n${headings.join('\n')}\n${read.content}`,
+      capturedAt: '',
+    });
+  }
+  return { fileCandidates, factCandidates, scannedBytes };
+}
+
 /** Out-param populated by `readMemoryEvidence`, mirroring the `notices` mutable-array pattern. */
-interface RecallCandidateStats {
+export interface RecallCandidateStats {
   factCandidates: number;
   fileCandidates: number;
 }
 
-function readMemoryEvidence(
+export function readMemoryEvidence(
   root: string,
   workgroupId: string,
   query: string,
@@ -1076,19 +1432,12 @@ function readMemoryEvidence(
 
   const queryTokens = tokenizeForRecall(query);
   const expandedTokens = tokenizeForRecall(`${query} ${ephemeralExpansion(query).join(' ')}`);
-  const fileCandidates: SearchableCandidate[] = [];
-  const factCandidates: SearchableCandidate[] = [];
-  // Read the fact store first. `markdownScannedBytes` is a single budget spent
-  // in listing order, and `generated/` sorts after `bootstrap/`, `concepts/`,
-  // `conversations/`, `facts/` and `imports/`. A large manual tree would
-  // otherwise leave too few bytes for it and truncate the file MID-LINE, which
-  // is worse than dropping it: the partial line still starts with "- " and is
-  // parsed as a fact, so a half-sentence reaches the agent with its provenance
-  // marker cut off. Stable sort, so everything else keeps codepoint order.
-  // Union rather than walk-only: the topic directories are listed directly so
-  // an earlier-sorting directory cannot spend the walk's entry budget before
-  // they are reached. Deduped because the walk usually does reach some of them.
-  const allFiles = [...new Set([...listMarkdownFiles(root, notices), ...listTopicFiles(root, notices)])].sort();
+  // Where the tree listing's notices BELONG. The listing itself runs after the
+  // preference lane; listing touches neither the shared byte budget nor any
+  // state the preference lane reads, so the position of the WORK is
+  // output-neutral, but the position of its NOTICES is delivered context. They
+  // are spliced back to this index.
+  const noticeInsertAt = notices.length;
 
   // Deterministic per-person preference lane. Files under preferences/ are
   // keyed by name slug and injected whole for the conversation's involved
@@ -1154,59 +1503,29 @@ function readMemoryEvidence(
     }
   }
 
-  const missingGeneratedMemory = missingGeneratedMemoryPath(root, allFiles);
-  const scanOrder = (missingGeneratedMemory ? [...allFiles, missingGeneratedMemory] : allFiles).sort(
-    (a, b) => Number(b === GENERATED_MEMORY_RELATIVE_PATH) - Number(a === GENERATED_MEMORY_RELATIVE_PATH),
+  // Candidate generation. Read the fact store first: `markdownScannedBytes` is
+  // a single budget spent in listing order, and `generated/` sorts after
+  // `bootstrap/`, `concepts/`, `conversations/`, `facts/` and `imports/`. A
+  // large manual tree would otherwise leave too few bytes for it and truncate
+  // the file MID-LINE, which is worse than dropping it: the partial line still
+  // starts with "- " and is parsed as a fact, so a half-sentence reaches the
+  // agent with its provenance marker cut off. Stable sort, so everything else
+  // keeps codepoint order. Union rather than walk-only: the topic directories
+  // are listed directly so an earlier-sorting directory cannot spend the walk's
+  // entry budget before they are reached. Deduped because the walk usually does
+  // reach some of them.
+  const listingNotices: ContextNotice[] = [];
+  const allFiles = listRecallFiles(root, listingNotices);
+  notices.splice(noticeInsertAt, 0, ...listingNotices);
+  // `scanned.scannedBytes` is deliberately not read back: nothing below this
+  // point spends the shared budget.
+  const { fileCandidates, factCandidates } = scanRecallCandidates(
+    root,
+    canonicalRoot,
+    recallScanOrder(root, allFiles),
+    notices,
+    scannedBytes,
   );
-  for (const relative of scanOrder) {
-    if ((CORE_PATHS as readonly string[]).includes(relative)) continue;
-    if (NON_RECALL_PATHS.has(relative)) continue;
-    if (relative.startsWith(PREFERENCES_DIR)) continue;
-    const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
-    if (remaining <= 0) {
-      notices.push({
-        source: 'markdown',
-        status: 'truncated',
-        code: 'markdown-byte-limit',
-        detail: `scanned ${PRE_TURN_BOUNDS.markdownScannedBytes} bytes`,
-      });
-      break;
-    }
-    const read = readBoundedFile(
-      path.join(root, relative),
-      canonicalRoot,
-      remaining,
-      relative === GENERATED_MEMORY_RELATIVE_PATH ? GENERATED_MEMORY_MAX_BYTES : PRE_TURN_BOUNDS.markdownFileBytes,
-    );
-    scannedBytes += read.bytes;
-    const headings = headingsOf(read.content);
-    if (relative === GENERATED_MEMORY_RELATIVE_PATH) {
-      for (const line of read.content.split('\n')) {
-        if (!line.startsWith('- ')) continue;
-        const markerAt = line.indexOf('<!--');
-        factCandidates.push({
-          path: relative,
-          headings,
-          content: line,
-          // Score the fact, not its provenance marker. The marker is ~20% of a
-          // line's characters, and its tokens dilute the density term ranking
-          // uses, so scoring it penalised generated facts against clean manual
-          // Markdown. selectGeneratedMemoryForPrompt already strips it exactly
-          // this way on the curator side; this makes both paths agree.
-          searchable: markerAt < 0 ? line : line.slice(0, markerAt),
-          capturedAt: capturedAtOf(line),
-        });
-      }
-      continue;
-    }
-    fileCandidates.push({
-      path: relative,
-      headings,
-      content: read.content,
-      searchable: `${relative}\n${headings.join('\n')}\n${read.content}`,
-      capturedAt: '',
-    });
-  }
   if (candidateStats) {
     candidateStats.factCandidates = factCandidates.length;
     candidateStats.fileCandidates = fileCandidates.length;
@@ -1461,25 +1780,6 @@ export function enforceFinalBound(context: PreTurnContext): void {
       : PRE_TURN_BOUNDS.finalChars,
     context.trustedCapabilities !== undefined ? PRE_TURN_BOUNDS.bootstrapFinalChars : 0,
   );
-  // The graph-scent LANE is shed FIRST — the field AND its notices — before
-  // any conversation or memory excerpt. It is the one purely advisory lane,
-  // and shedding it first is what makes "enabling the lane never displaces
-  // recall" true by construction rather than by budget arithmetic. Notices are
-  // part of the lane deliberately (review finding): a cold/no-match notice
-  // surviving the excerpt loops could evict a 900-char archive excerpt to keep
-  // ~140 bytes of advisory bookkeeping. Both prior budget incidents (see the
-  // bounds comments above) came from a lane that could not be shed.
-  if (serializedLength() > limit) {
-    if (context.graphScent !== undefined) {
-      delete context.graphScent;
-      truncated = true;
-    }
-    const withoutGraphNotices = context.notices.filter((notice) => notice.source !== 'graph');
-    if (withoutGraphNotices.length < context.notices.length) {
-      context.notices = withoutGraphNotices;
-      truncated = true;
-    }
-  }
   while (serializedLength() > limit && context.conversationEvidence.excerpts.some((row) => row.rank !== 'exact-link')) {
     let index = context.conversationEvidence.excerpts.length - 1;
     while (index >= 0 && context.conversationEvidence.excerpts[index]!.rank === 'exact-link') index -= 1;
@@ -1805,18 +2105,12 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     });
   }
 
-  // Advisory graph pointers. readGraphScent never throws and refuses cold
-  // workgroups outright, so this adds at most one warm bounded FTS query
-  // (0-120ms measured) to the turn.
-  const graphScent = readGraphScent(workgroupId, query, notices);
-
   const context: PreTurnContext = {
     ...(input.provider === undefined ? {} : { provider: input.provider.toLocaleLowerCase('en-US') }),
     ...(input.contextEpoch === undefined ? {} : { contextEpoch: input.contextEpoch }),
     ...(trustedCapabilities === undefined ? {} : { trustedCapabilities }),
     memoryEvidence,
     conversationEvidence: { excerpts: conversationRows },
-    ...(graphScent === null ? {} : { graphScent }),
     notices,
   };
   enforceFinalBound(context);

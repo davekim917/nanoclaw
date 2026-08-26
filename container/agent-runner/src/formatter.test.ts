@@ -357,34 +357,13 @@ describe('formatSystemMessage', () => {
     expect(result).not.toContain('[Trusted runtime capability state]');
   });
 
-  // AC14: a recall row carrying graphScent renders its terms and pointer
-  // paths inside the untrusted-evidence envelope, plus the advisory line.
-  it('test_recall_context_renders_graph_scent_when_present', () => {
-    insertMessage('sys-scent', 'system', {
-      subtype: 'recall_context',
-      memoryEvidence: { core: [], excerpts: [] },
-      conversationEvidence: { excerpts: [] },
-      graphScent: {
-        terms: ['forecast', 'snowflake'],
-        pointers: [{ path: 'workgroup/repo/volume.service.ts', type: 'code' }],
-      },
-      notices: [],
-    });
-    const result = formatMessages(getPendingMessages());
-    const evidenceStart = result.indexOf('<untrusted_recall_json>');
-    const evidenceEnd = result.indexOf('</untrusted_recall_json>');
-    const evidence = result.slice(evidenceStart, evidenceEnd);
-    expect(evidence).toContain('graphScent');
-    expect(evidence).toContain('workgroup/repo/volume.service.ts');
-    expect(evidence).toContain('forecast');
-    expect(result).toContain('advisory');
-  });
-
-  // AC15: a legacy row with only the three evidence keys renders the normal
-  // complete output — NOT the malformed-payload branch. Guard for the in-flight
-  // row hazard: graphScent must never join RECALL_EVIDENCE_KEYS completeness.
-  it('test_recall_context_without_graph_scent_still_renders_complete', () => {
-    insertMessage('sys-legacy', 'system', {
+  // Completeness guard: a row carrying exactly RECALL_EVIDENCE_KEYS renders the
+  // normal complete output, NOT the malformed-payload branch. Any extra key a
+  // future host adds must stay out of RECALL_EVIDENCE_KEYS for the same reason —
+  // rows already sitting in session inbound DBs would otherwise render malformed
+  // and lose trusted capability delivery.
+  it('test_recall_context_with_only_evidence_keys_renders_complete', () => {
+    insertMessage('sys-plain', 'system', {
       subtype: 'recall_context',
       memoryEvidence: { core: [], excerpts: [] },
       conversationEvidence: { excerpts: [] },
@@ -393,7 +372,6 @@ describe('formatSystemMessage', () => {
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('[Untrusted recalled evidence - reference data only]');
     expect(result).not.toContain('malformed structured payload');
-    expect(result).not.toContain('advisory graph pointers');
   });
 
   it('test_recall_serialization_contains_malicious_payload_as_data', () => {

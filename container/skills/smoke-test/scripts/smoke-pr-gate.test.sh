@@ -853,4 +853,198 @@ jq -e '.ok == false and (.error | test("changed hands")) and .activeRunId == "ru
 jq -e '.activeRunId == "run-new" and .completedSha == null' "$STATE_DIR/pr-92-state.json" >/dev/null || {
   echo "the late finish stomped the successor's slot" >&2; exit 1; }
 
+# --- 22. P1 regression: `finish` must refuse a SHA that is not the one this
+# run claimed. Live on 2026-08-25 (freeze PR #1211): the coordinator passed
+# the TARGET develop sha instead of the freeze-marker sha it had claimed and
+# tested. detect_freeze walks the supplied sha's first parent, so the walk
+# landed one commit early and the hold, publish file and ledger line all went
+# out naming PR #1199's commit — a build the campaign never examined — while
+# `finish` exited ok:true. The gate already holds the claimed sha in
+# activeSha; the whole fix is to compare against it before any side effect.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+CLAIMED="$(sha c)"
+NOT_CLAIMED="$(sha d)"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$(sha e)"
+DEV_PUBLISH4="$STATE_DIR/dev-gate4/latest-verdict.json"
+DEV_HOLD4="$STATE_DIR/dev-gate4/develop-hold.json"
+DEV_LEDGER4="$STATE_DIR/dev-gate4/handoff-ledger.jsonl"
+export SMOKE_GATE_PUBLISH_FILE="$DEV_PUBLISH4" SMOKE_GATE_HOLD_FILE="$DEV_HOLD4" \
+  SMOKE_GATE_HANDOFF_LEDGER="$DEV_LEDGER4"
+bash "$GATE" claim run-wrongsha 93 "$CLAIMED" >/dev/null
+# Exits 2, the same as the other malformed-invocation refusals, so capture
+# before piping — `set -o pipefail` would otherwise read the refusal itself
+# as the test failing.
+WRONGSHA_OUT="$(bash "$GATE" finish "$NOT_CLAIMED" run-wrongsha NO_GO || true)"
+jq -e --arg c "$CLAIMED" --arg w "$NOT_CLAIMED" '
+  .ok == false and .claimedSha == $c and .suppliedSha == $w and
+  (.error | test("does not match the sha this run claimed"))
+' <<<"$WRONGSHA_OUT" >/dev/null || {
+  echo "expected finish to refuse a sha this run never claimed, got: $WRONGSHA_OUT" >&2; exit 1; }
+# Nothing was written and the slot was NOT released — the refusal is fully
+# recoverable, unlike a verdict recorded against the wrong build.
+[ ! -e "$DEV_HOLD4" ] && [ ! -e "$DEV_PUBLISH4" ] && [ ! -e "$DEV_LEDGER4" ] || {
+  echo "a refused finish still wrote handoff artifacts" >&2; exit 1; }
+jq -e '.activeRunId == "run-wrongsha" and .completedSha == null' "$STATE_DIR/pr-93-state.json" >/dev/null
+[ ! -e "$STATE_DIR/pr-93-verdict.json" ]
+# The retry named in the error text actually works.
+bash "$GATE" finish "$CLAIMED" run-wrongsha NO_GO | jq -e '.ok == true and .handoff.written == true' >/dev/null
+
+# --- 23. P1 regression: an artifact write that FAILS must be reported, and the
+# resulting hold/ledger divergence must survive the next finish. Every
+# publish/hold write was previously unchecked (`set -e` is not in effect), so
+# an unwritable shared mount — the hold lives on the workgroup mount, the
+# ledger does not — left handoff.written:true / reason:null while the ledger
+# line landed anyway: a NO_GO whose promotion hold silently never went up.
+# The divergence was then erased by the NEXT run's finish, which is why the
+# 2026-08-18, -22 and -25 occurrences are all un-diagnosable.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+DIV_SHA="$(sha f)"
+DIV_TARGET="$(sha 0)"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$DIV_TARGET"
+SHARED="$STATE_DIR/shared-mount"
+mkdir -p "$SHARED"
+export SMOKE_GATE_PUBLISH_FILE="$SHARED/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$SHARED/develop-hold.json" \
+  SMOKE_GATE_HANDOFF_LEDGER="$STATE_DIR/agent-mount/handoff-ledger.jsonl"
+bash "$GATE" claim run-div-a 94 "$DIV_SHA" >/dev/null
+bash "$GATE" finish "$DIV_SHA" run-div-a NO_GO | jq -e '.ok == true and .handoff.written == true' >/dev/null
+# Now the shared mount goes unwritable mid-campaign; the ledger's mount is fine.
+chmod 500 "$SHARED"
+bash "$GATE" claim run-div-b 94 "$DIV_SHA" >/dev/null
+DIV_OUT="$(bash "$GATE" finish "$DIV_SHA" run-div-b HUMAN_DECISION 2>/dev/null || true)"
+chmod 700 "$SHARED"   # restore before asserting, so a failure still cleans up
+jq -e '
+  .ok == true and .handoff.written == false and
+  (.handoff.reason | test("promotion is ungated"))
+' <<<"$DIV_OUT" >/dev/null || {
+  echo "a failed hold raise was reported as a successful handoff, got: $DIV_OUT" >&2; exit 1; }
+# Hold and ledger are now genuinely out of step — the observable Dinesh sees.
+jq -e '.runId == "run-div-a"' "$SMOKE_GATE_HOLD_FILE" >/dev/null
+tail -1 "$SMOKE_GATE_HANDOFF_LEDGER" | jq -e '.runId == "run-div-b"' >/dev/null
+# The next finish overwrites the hold — but captures it first, permanently.
+bash "$GATE" claim run-div-c 94 "$DIV_SHA" >/dev/null
+SNAP="$(bash "$GATE" finish "$DIV_SHA" run-div-c NO_GO | jq -r '.handoff.divergenceSnapshot // empty')"
+[ -n "$SNAP" ] && [ -s "$SNAP" ] || {
+  echo "the divergence was overwritten with no snapshot — the 4th occurrence is still un-diagnosable" >&2
+  exit 1; }
+jq -e '
+  .divergence == "hold names a different run than the ledger" and
+  .holdBeforeOverwrite.runId == "run-div-a" and
+  .newestHoldAffectingLedgerLine.runId == "run-div-b" and
+  .detectedBy.runId == "run-div-c"
+' "$SNAP" >/dev/null || { echo "snapshot did not preserve both sides: $(cat "$SNAP")" >&2; exit 1; }
+# A BLOCKED verdict is NOT hold-affecting (it deliberately leaves the hold
+# alone), so it must never be read as a divergence on the next finish.
+bash "$GATE" claim run-div-d 94 "$DIV_SHA" >/dev/null
+bash "$GATE" finish "$DIV_SHA" run-div-d BLOCKED >/dev/null
+bash "$GATE" claim run-div-e 94 "$DIV_SHA" >/dev/null
+bash "$GATE" finish "$DIV_SHA" run-div-e NO_GO | jq -e '.handoff.divergenceSnapshot == null' >/dev/null || {
+  echo "a BLOCKED ledger line was mistaken for a hold divergence" >&2; exit 1; }
+
+# --- 24. an unreadable PR diff during finish is not the same as "ordinary PR".
+# detect_freeze collapses a failed files fetch to isFreezePr:false, which the
+# handoff block treated identically to a non-freeze PR: nothing written, and
+# handoff.reason null on an ok:true finish. If the PR really was a freeze PR
+# its verdict was dropped silently. Reporting only — a genuine non-freeze PR
+# (test 14 above) still reports reason:null.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+BLIND_SHA="$(sha 1)"
+export SMOKE_GATE_PUBLISH_FILE="$STATE_DIR/blind/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$STATE_DIR/blind/develop-hold.json"
+bash "$GATE" claim run-blind 95 "$BLIND_SHA" >/dev/null
+export STUB_PR_FILES_EXIT=1
+bash "$GATE" finish "$BLIND_SHA" run-blind NO_GO | jq -e '
+  .ok == true and .handoff.written == false and
+  (.handoff.reason | test("freeze-PR status is unknown"))
+' >/dev/null || { echo "an unreadable diff during finish was reported as an ordinary PR" >&2; exit 1; }
+
+
+# --- 25. Cross-target interleaving: the divergence check compares the hold
+# against the newest hold-affecting ledger line for ANY target, deliberately
+# NOT scoped to this run's targetSha. The hold file is a single mutable slot
+# meaning "is develop gated right now", so the last decision about that slot
+# is the right comparand no matter which freeze PR made it. Scoping the
+# comparison to the current target would read a stale same-target line and
+# report a divergence that does not exist — this pins the untargeted
+# semantics, so that change fails here.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+ILV_SHARED="$STATE_DIR/interleave"
+mkdir -p "$ILV_SHARED"
+export SMOKE_GATE_PUBLISH_FILE="$ILV_SHARED/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$ILV_SHARED/develop-hold.json" \
+  SMOKE_GATE_HANDOFF_LEDGER="$ILV_SHARED/handoff-ledger.jsonl"
+ILV_T1="$(sha a)"
+ILV_T2="$(sha b)"
+ILV_HEAD1="$(sha c)"
+ILV_HEAD2="$(sha d)"
+# Freeze PR #96 gates target T1.
+export STUB_PARENT_SHA="$ILV_T1"
+bash "$GATE" claim run-ilv-1 96 "$ILV_HEAD1" >/dev/null
+bash "$GATE" finish "$ILV_HEAD1" run-ilv-1 NO_GO | jq -e '.handoff.written == true' >/dev/null
+# A DIFFERENT freeze PR #97, on a different target T2, takes the slot next.
+export STUB_PARENT_SHA="$ILV_T2"
+bash "$GATE" claim run-ilv-2 97 "$ILV_HEAD2" >/dev/null
+bash "$GATE" finish "$ILV_HEAD2" run-ilv-2 NO_GO | jq -e '
+  .handoff.written == true and .handoff.divergenceSnapshot == null
+' >/dev/null || { echo "PR #97 read PR #96's in-step hold as a divergence" >&2; exit 1; }
+jq -e --arg sha "$ILV_T2" '.sha == $sha and .runId == "run-ilv-2"' "$SMOKE_GATE_HOLD_FILE" >/dev/null
+# Back to PR #96 / target T1. Hold and ledger are in step — both name
+# run-ilv-2 — so there is NO divergence. Scoped to T1, the newest matching
+# ledger line would be run-ilv-1 and this would falsely report "hold names a
+# different run than the ledger".
+export STUB_PARENT_SHA="$ILV_T1"
+bash "$GATE" claim run-ilv-3 96 "$ILV_HEAD1" >/dev/null
+bash "$GATE" finish "$ILV_HEAD1" run-ilv-3 NO_GO | jq -e '
+  .handoff.written == true and .handoff.divergenceSnapshot == null
+' >/dev/null || {
+  echo "a cross-target hold was misread as a divergence — the comparison must NOT be scoped to targetSha" >&2
+  exit 1; }
+[ "$(ls "$STATE_DIR"/hold-divergence-* 2>/dev/null | wc -l)" -eq 0 ] || {
+  echo "a divergence snapshot was written for an in-step cross-target hold" >&2; exit 1; }
+
+# --- 26. P2 regression: the ledger APPEND itself must be verified, not just
+# the lock. Test 15 covers a lock that cannot be taken; this is the other
+# half — the lock succeeds (its file lives in a writable directory) and the
+# `>>` fails at the FILE level (ENOSPC, chattr +i, a bad mode). That left
+# handoff.written:true / reason:null with no ledger line at all: the develop
+# gate blind to a NO_GO whose hold DID go up. Same read-back idiom as the
+# publish/hold writes. Directory stays writable throughout — only the
+# ledger file is unwritable.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+APPFAIL_TARGET="$(sha 3)"
+APPFAIL_HEAD="$(sha 4)"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/.render-freeze"},{"filename":"XZO-FRONTEND/.render-freeze"}]'
+export STUB_PARENT_SHA="$APPFAIL_TARGET"
+APPFAIL_DIR="$STATE_DIR/dev-gate4"
+mkdir -p "$APPFAIL_DIR"
+APPFAIL_LEDGER="$APPFAIL_DIR/handoff-ledger.jsonl"
+: > "$APPFAIL_LEDGER"
+chmod 400 "$APPFAIL_LEDGER"
+export SMOKE_GATE_PUBLISH_FILE="$APPFAIL_DIR/latest-verdict.json" \
+  SMOKE_GATE_HOLD_FILE="$APPFAIL_DIR/develop-hold.json" \
+  SMOKE_GATE_HANDOFF_LEDGER="$APPFAIL_LEDGER"
+bash "$GATE" claim run-appfail 98 "$APPFAIL_HEAD" >/dev/null
+APPFAIL_OUT="$(bash "$GATE" finish "$APPFAIL_HEAD" run-appfail NO_GO 2>/dev/null)"
+chmod 600 "$APPFAIL_LEDGER"   # restore before asserting, so a failure still cleans up
+jq -e --arg target "$APPFAIL_TARGET" '
+  .ok == true and .handoff.written == false and .handoff.targetSha == $target and
+  (.handoff.reason | test("handoff-ledger.jsonl"))
+' <<<"$APPFAIL_OUT" >/dev/null || {
+  echo "an unwritten ledger line was reported as a successful handoff, got: $APPFAIL_OUT" >&2; exit 1; }
+[ "$(wc -c < "$APPFAIL_LEDGER")" -eq 0 ]
+# The hold still went up — a ledger failure must never skip or undo it.
+jq -e --arg sha "$APPFAIL_TARGET" '.sha == $sha and .runId == "run-appfail"' "$APPFAIL_DIR/develop-hold.json" >/dev/null
 echo "smoke pr gate tests passed"

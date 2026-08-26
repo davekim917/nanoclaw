@@ -178,19 +178,32 @@ describe('scanInputs', () => {
     expect(scanInputs([input('OTHER.md', email)], new Set(), allowlist)).toHaveLength(1);
   });
 
-  it('permits reviewed public values inside the allowlist itself without hiding private entries', () => {
+  it('permits reviewed allowlist values inside the file itself without hiding unreviewed private entries', () => {
     const publicId = ['1470', '188214710046894'].join('');
     const privateName = 'Private Customer';
+    const unreviewedName = 'Unreviewed Internal';
     const allowlist = [
       { path: 'README.md', value: publicId, reason: 'published community identifier' },
-      { path: 'NOTICE.md', value: privateName, reason: 'invalid private entry for regression coverage' },
+      { path: 'NOTICE.md', value: privateName, reason: 'owner-approved publication of an install workgroup name' },
     ];
-    const serialized = JSON.stringify({ entries: allowlist }, null, 2);
 
-    expect(scanInputs([input('.public-boundary-allowlist.json', serialized)], new Set(), allowlist)).toEqual([]);
+    // An owner-reviewed entry value may appear in its own serialized form…
     expect(
-      scanInputs([input('.public-boundary-allowlist.json', serialized)], new Set([privateName]), allowlist),
-    ).toEqual([{ file: '.public-boundary-allowlist.json', line: 10, category: 'private-identifier' }]);
+      scanInputs(
+        [input('.public-boundary-allowlist.json', JSON.stringify({ entries: allowlist }, null, 2))],
+        new Set([privateName]),
+        allowlist,
+      ),
+    ).toEqual([]);
+
+    // …but any OTHER private identifier inside the file still flags.
+    const strayed = JSON.stringify({ entries: allowlist }, null, 2).replace(
+      '"entries"',
+      `"note": "see ${unreviewedName} policy",\n  "entries"`,
+    );
+    expect(
+      scanInputs([input('.public-boundary-allowlist.json', strayed)], new Set([unreviewedName]), allowlist),
+    ).toEqual([{ file: '.public-boundary-allowlist.json', line: 2, category: 'private-identifier' }]);
   });
 
   it('rejects forbidden artifact paths', () => {

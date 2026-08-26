@@ -497,15 +497,15 @@ describe('buildMounts agent surfaces', () => {
     expect(containerPaths).toContain('/workspace/agent/OWN-DOC.md');
   });
 
-  it('test_mandatory_graphify_skill_for_all_and_restricted_configs', () => {
-    const cases: Array<{ provider: string; skills: ContainerConfig['skills']; suffix: string }> = [
+  it('test_no_skill_is_force_added_beyond_the_group_selection', () => {
+    const cases: Array<{ provider: string; skills: ContainerConfig['skills']; suffix: string; expected?: string[] }> = [
       { provider: 'claude', skills: 'all', suffix: 'all' },
-      { provider: 'codex', skills: [], suffix: 'empty' },
-      { provider: 'opencode', skills: ['debug', 'graphify', 'debug'], suffix: 'restricted' },
+      { provider: 'codex', skills: [], suffix: 'empty', expected: [] },
+      { provider: 'opencode', skills: ['debug', 'debug'], suffix: 'restricted', expected: ['debug'] },
     ];
 
     for (const testCase of cases) {
-      const ag = group(`ag-graphify-${testCase.suffix}`, `graphify-${testCase.suffix}`);
+      const ag = group(`ag-skills-${testCase.suffix}`, `skills-${testCase.suffix}`);
       createAgentGroup(ag);
       withWorkgroup(ag);
       ensureContainerConfig(ag.id);
@@ -513,7 +513,7 @@ describe('buildMounts agent surfaces', () => {
 
       buildMounts(
         ag,
-        session(`s-graphify-${testCase.suffix}`, ag.id),
+        session(`s-skills-${testCase.suffix}`, ag.id),
         { ...containerConfig(), skills: testCase.skills },
         testCase.provider,
         {},
@@ -521,10 +521,10 @@ describe('buildMounts agent surfaces', () => {
 
       const skillsDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'skills');
       const selected = fs.readdirSync(skillsDir);
-      expect(selected.filter((name) => name === 'graphify')).toHaveLength(1);
-      expect(fs.readlinkSync(path.join(skillsDir, 'graphify'))).toBe('/app/skills/graphify');
-      if (testCase.suffix === 'restricted') {
-        expect(selected).toEqual(['debug', 'graphify']);
+      // Graphify is decommissioned — nothing may re-add it behind container.json.
+      expect(selected).not.toContain('graphify');
+      if (testCase.expected) {
+        expect(selected).toEqual(testCase.expected);
       }
     }
   });

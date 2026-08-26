@@ -1065,3 +1065,220 @@ in isolated worktrees; the shared checkout serves ~20 other agent sessions.
 Standing operator directive for this build: run opencode
 (`opencode-go/ox-alpha-free`, `OPENCODE_EFFORT=max`) adversarial checks against the
 implementation as it is built, not only at the `/team-review` gate.
+
+## P2.5 open items — what a rebuild would have to solve (2026-08-25)
+
+> **Re-framed 2026-08-26.** These were written as blockers on activating step 7.
+> The implementation is now deleted (see the REMOVED note at the end of this
+> section), so nothing is gated on them today. They are kept because they are
+> the real defect list a second attempt would inherit: each one is a way the
+> design as built could serve wrong recall silently, and a rewrite that does not
+> answer all six is the same feature with the same holes.
+
+What merges to `main` today is the performance work (`canonicalToken` memo, hit-list
+ranking, archive covering index, `rowid ASC` total order — warm p50 804ms → 484ms,
+byte-identical across 14 whole-turn runs). **The recall projection itself ships DORMANT**:
+nothing builds one, verified exhaustively by Codex across host-sweep, startup, setup,
+migrations, scripts, cron, barrels and dynamic imports.
+
+The following are known and unfixed. They are **blockers on activating step 7 (the builder
+hook)** — not on this merge, because a projection that is never built cannot serve a turn.
+Clear each one, or consciously accept it, before step 7 is switched on.
+
+- **Codex #1 — staleness evasion.** Content replacement with the same size, inode and
+  `mtimeNs` passes `projectionTreeStaleness`, so the turn is served from a stale projection
+  under a clean `hit`.
+- **Codex #2 — wrong-but-valid stream.** A structurally valid but semantically wrong
+  persisted stream yields `recallPath:"hit"` with zero excerpts: no error, no fallback,
+  silently degraded recall.
+- **Codex #4 — AC11 is vacuous.** The test never exercises its stated low-ranked candidate,
+  because `excerpts` is already capped before that candidate is reached.
+- **Codex #5 — fingerprint gap.** The tokenizer fingerprint admits rule changes that no
+  probe covers (the file's own comment states this; it is a convention, not a guard).
+- **Codex #6 — AC9 spies too shallowly.** It asserts only on `exec`, so an empty
+  BEGIN/COMMIT around no work would pass it.
+- **Codex Q1 residual — invisible `lengths[]` corruption.** Corrupting a `lengths[]` element
+  cannot be detected: partitioning reads only `token.start` and scoring never reads
+  `token.end`.
+
+## P2.5 activation (step 7) — REJECTED on measured economics, 2026-08-25
+
+**Provenance.** Measured 2026-08-25 by a separate measurement run, not this session;
+recorded here from the operator-relayed report so the pillar-3 drop in `plan.md` §9 has
+a source to cite. Not re-verified by whoever writes this entry — that would be a ~40
+minute repeat of the run, not a documentation task.
+
+**Method.** Projection ON vs OFF, same code, 30 timed turns per arm per workgroup,
+full `buildPreTurnContext`. Every ON turn asserted `recallPath === 'hit'` and every OFF
+turn `cold`/`absent` — 30/30 both ways, so the two arms are provably distinct code
+paths, not noise. Data is **copy-derived**: a staged `DATA_DIR`, an online `.backup()`
+of `v2.db` and `archive.db`, and `cp -a` of the memory trees. No live data written.
+
+**Workgroup labels.** This repository is public, so the two measured workgroups are
+named **A** (the largest on the fleet) and **B** (mid-size) throughout, deliberately and
+not by accident. Every number is real and unchanged; only the identities are omitted.
+Their shape is what matters and is kept: A is 77% of all projectable markdown on the
+fleet and rewrites its ledger fastest, B is roughly an order of magnitude smaller and an
+order of magnitude slower-changing.
+
+**The projection is genuinely faster:**
+
+| workgroup    | condition                | fallback CPU | projection CPU | change |
+| ------------ | ------------------------ | -----------: | -------------: | ------ |
+| A (largest)  | warm, isolated processes |       501 ms |         103 ms | −79%   |
+| A (largest)  | warm, interleaved        |       460 ms |         121 ms | −74%   |
+| B (mid-size) | warm                     |       173 ms |          70 ms | −59%   |
+
+Mechanism, from the same log line: the fallback path materialises **6,961 fact + 591
+file** candidates; the projection returns **66 + 49**. The entire saving is the term
+prefilter — nothing else changes between the two arms.
+
+**And it still loses, because no incremental update exists.** Plan step 5
+("Incremental update by fact id") was never implemented, so every invalidation forces a
+full rebuild, not a diff:
+
+- Full rebuild: **7.6 s CPU, 56.3 MB index** for workgroup A — 6.5× the markdown it
+  projects.
+- **A's tree changes every 2.4 minutes.** Two independent derivations agree
+  within 1%: `data/memory-curator-history/` snapshot timestamps (20 writes in 46.2 min),
+  and a 17-minute live poller sampling every 30 s on the same size/mtimeNs/inode triple
+  `projectionTreeStaleness` compares (7 changes in 34 samples). B changes roughly every
+  38.7 min.
+- **Steady-state arithmetic is net negative:** read CPU saved −373 ms/turn against
+  rebuild CPU spent **+2,290 ms/turn** — roughly **1.9 s/turn net worse**. Rebuild load
+  alone is **188 s CPU/hour, 5.2% of one core, continuously, for one workgroup.** Every
+  invalidation cadence modelled (instant trigger, 60 s sweep, 5 min) lands on the wrong
+  side.
+- **Structural, not tunable.** The projection's value scales with corpus size and its
+  cost scales with change rate, and on this fleet those are the same workgroup: A is
+  77% of all projectable markdown _and_ rewrites its ledger fastest.
+
+**Two further findings:**
+
+- **The warm mark lives only in process memory.** A projection sitting on disk does
+  NOT make the first turn after a host restart fast — that turn still serves
+  `cold`/`not-verified-warm` at full fallback cost until the sweep runs a warming pass.
+- **End-to-end latency context.** User→assistant is 154 s p50 on A (n=109, last 24 h,
+  paired within thread, >30 min outliers dropped); B 60 s. The 340 ms the projection
+  would save is ~0.22% of one turn.
+
+**Verdict: REJECTED.** Step 7 (the builder hook) stays unactivated — the projection
+ships dormant per the pre-activation-blockers entry above, and this result is an
+independent reason not to flip it even once those are cleared. **Revisit only when all
+three hold together**, not any one: incremental update actually implemented and
+measured; a workload where recall latency is genuinely on the critical path; and the
+six pre-activation blockers above cleared.
+
+### IMPLEMENTATION REMOVED — c21e4f53, 2026-08-26
+
+Dormant code on a hot path is not free, so the projection was deleted rather than left
+sitting behind an unflipped switch. `recall-projection{,-store,-build,-build-thread}.ts`,
+`recall-projection{,-read,-archive}.test.ts`, and the read seam, warmth gate, frozen
+bounds, tokenizer fingerprint and `recallPath`/`recallReason` telemetry inside
+`pre-turn-context.ts` are all gone — 4,288 lines removed, 47 added. `plan.md` §P2.5
+carries the same note. **This section and the design in `plan.md` are the record of why;
+do not rebuild it from the design without re-reading the economics above.**
+
+**What was deliberately NOT removed.** The three measured wins that shipped in the same
+work are on the live filesystem path and have nothing to do with the projection: the
+`canonicalToken` memo (60% of a cold turn), hit-list passage ranking in `bestPassage`
+(~50% of ranking), and `message-archive.ts`'s covering index plus the `rowid ASC` total
+order. `recall-ranking.test.ts` is unchanged and pins the first two, including the
+interleaved-span guard on `passageWindows`' `start`/`end` offsets — which is why those
+fields stay on the returned shape even though the projection was their original consumer.
+
+**Verified on the same staged workgroup-A corpus as the measurement above,** 30 timed
+turns, `process.cpuUsage()` alongside wall clock, copies of `data/` only:
+
+| source                            | wall p50 | CPU p50 |
+| --------------------------------- | -------: | ------: |
+| pre-deletion, fallback arm (control) | 457.7 ms | 457.7 ms |
+| post-deletion                        | 442.7 ms | 441.3 ms |
+
+Both runs report identical cache and fast-path counters (`tokenCache` 634,461 hits /
+39,893 misses, `canonicalMemo` 1,943,950 / 37,293, `fastPath` 7,583 of 7,656), and the
+FULL delivered context over 20 whole turns — 10 queries x bootstrap on/off — is
+byte-identical between them. The performance work survived the deletion intact; the
+~15 ms is run-to-run noise plus the `statSync` the removed seam used to pay looking for
+an index that was never there.
+
+## Pillar 1 (graph scent) — REMOVED on measured reach and use, 2026-08-26
+
+`plan.md` §3 carries the banner; §§3–8, §11 and §13's pillar-1 paragraph stay as the
+design record. §11 set the standard this lane had to meet — "a repeat of that class of
+question where the transcript shows the agent opening a pointed-to file before
+answering. Absent that, the lane is unproven regardless of how clean the latency numbers
+are." Two weeks of production said it is not just unproven; it stopped running at all.
+
+Workgroups A and B below are the same two labelled in the P2.5 activation entry above —
+A the largest on the fleet, B mid-size — identities omitted deliberately because this
+repository is public.
+
+**Reach, and its collapse.** Counted from persisted `recall-*` rows across 2,366 session
+`inbound.db` files, 2026-08-10 → 08-26: **996 of 6,413 pre-turn context builds carried a
+scent (15.5%)**, and the share fell monotonically to zero.
+
+| date  | builds with scent |
+| ----- | ----------------: |
+| 08-12 |             42.7% |
+| 08-16 |             32.5% |
+| 08-21 |             14.3% |
+| 08-24 |              5.7% |
+| 08-25 |              0.7% |
+| 08-26 |                0% |
+
+The current log has **zero** populated events against 65 warmth probes.
+
+**Mechanism: the warmth gate became unwinnable as the graphs grew.** A's index (13.5 GB)
+and B's (3.0 GB) are both over `largeGraphBytes`, so each needs three CONSECUTIVE
+sub-300 ms probes (the 2026-08-16 watch-item lever). A's probes average **2,467 ms**,
+worst **12,147 ms**; the round-robin reaches any one workgroup roughly every 11 minutes
+across 11 workgroups; and the daemon keeps promoting new indexes, each of which
+invalidates the warm mark by inode. Three clean probes in a row, 11 minutes apart, on a
+graph whose mean probe is 8× the budget and whose index keeps being replaced, is not a
+race the lane can win — and every month of graph growth makes it worse. This is the
+failure mode the lever was built to cause deliberately, for safety; what it also caused
+was the lane's extinction.
+
+**Not used even in the window where it did fire.** 219 scent-bearing Claude turns
+yielded **3 same-turn exact pointer follows (1.4%)**, and all three are explained away:
+the prompt named the file, or the memory lane was already carrying it. This matches the
+earlier, independent sample recorded above under Pillar 2 planning — 0 explicit
+citations in 270 sampled scent deliveries.
+
+**Cost when it fired.** p50 **266 ms**, p90 1,058 ms, p99 4,775 ms, max **26,873 ms**,
+against a whole-turn context build of ~484 ms. A lane nobody follows was routinely
+doubling the turn's recall cost and occasionally adding half a minute.
+
+**Corroboration that the graph itself does not answer these questions.** Exact-match
+searches for known symbols returned nothing; a natural-language query returned an
+unrelated conversation; a focused query against A's 448,450-item graph timed out at
+25 s. Whatever a better scent lane would need, it is not available from this graph
+today.
+
+### Verification of the deletion
+
+Host and container `tsc --noEmit` clean. `src/modules/memory/` (7 files, 164 tests),
+`src/memory-migration-contract.test.ts` (27), and `recall-ranking` + `pre-turn-context` +
+`host-sweep` (224 across 3 files) pass, as does the container `formatter.test.ts` (64).
+`recall-ranking.test.ts` and the curator are untouched.
+
+**Delivered-context equivalence, against copies of `data/` only.** The staged A corpus
+was given a small real `WorkgroupGraphStore` fixture and warmed, so the pre-deletion
+control actually populated the lane — 14 of its 20 turns carried a scent. Comparing the
+two full `PreTurnContext` dumps turn by turn, the only difference is the `graphScent` key
+itself: **zero residual field differences** on all 20 turns, and no turn changed
+truncation state. The B run, which has no graph staged, is **byte-identical** between the
+two trees (`md5 6759ede6c9705d983ebe04683babc43a`).
+
+### What survives, and what a second attempt would inherit
+
+The Graphify daemon, `ncl graphify`, and the container gateway are untouched — scent was
+one consumer, and whether to keep the daemon running is a separate operator decision.
+`STOP_WORDS` moved back into `pre-turn-context.ts`, its only remaining consumer.
+
+A rebuild does not get to skip the two findings above. Warm-gating on page-cache
+residency does not survive graph growth, and pointers alone did not change behavior in
+two independent samples (270 deliveries, then 219 turns). Anything that delivers graph
+knowledge pre-turn has to solve delivery on a multi-GB index without a warmth race, and
+has to deliver something an agent demonstrably uses — content, not a path.

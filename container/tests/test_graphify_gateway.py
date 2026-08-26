@@ -349,23 +349,6 @@ class GatewayTest(unittest.TestCase):
             ):
                 self.gw.parse_public_command(argv)
 
-    def test_skill_describes_automatic_knowledge_graph_and_thread_overlay(self):
-        skill = (
-            Path(__file__).parents[1] / "skills" / "graphify" / "SKILL.md"
-        ).read_text(encoding="utf-8")
-        for phrase in (
-            "automatic workgroup knowledge graph",
-            "canonical clones",
-            "conversations",
-            "thread-local worktree overlay",
-            "prior decisions",
-            "cross-artifact lineage",
-            ".graphifyignore",
-            "rare opt-out",
-        ):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, skill)
-
     def test_gateway_referenced_css_asset_is_hashed_staged_and_freshness_bound(self):
         source = self.repo / "src/main.tsx"
         asset = self.repo / "src/styles.css"
