@@ -11,10 +11,19 @@ const CLAIM_WAIT_MS = 25;
 // A stale claim is cleared only by the next host start, and inbound message
 // writes wait on this loop. Waiting is right — it is what keeps the message —
 // but a silent unbounded wait on the ingestion path is the failure mode this
-// area was fixed for. Warn once, then keep waiting; give up at the cap, which
-// is the tar timeout plus slack so a legitimately long archive still wins.
+// area was fixed for.
+//
+// Waiting is NEVER abandoned. Routing has no recovery between the awaited
+// write and the archive, so throwing here discards an accepted message, which
+// is the same loss the lease exists to prevent. A time bound would also have
+// to exceed a legitimate worst case, and archival has TWO independently
+// bounded 60-minute phases (storage-manager.ts create + validate), so any
+// number that looks generous is still guessable-wrong. The bound is on
+// SILENCE, not on waiting: warn once early, then escalate on a slow interval
+// so a genuinely stuck claim is impossible to miss and impossible to sleep
+// through.
 const CLAIM_WAIT_WARN_MS = 10_000;
-const CLAIM_WAIT_MAX_MS = 65 * 60 * 1000;
+const CLAIM_WAIT_ESCALATE_MS = 5 * 60 * 1000;
 
 export interface StorageActivityLease {
   release(): Promise<void>;
@@ -40,6 +49,29 @@ async function claimExists(resourceRoot: string): Promise<boolean> {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw err;
   }
+}
+
+/**
+ * Roots this PROCESS currently holds an async lease on, refcounted because two
+ * overlapping leases on one root are supported by design (see the marker-name
+ * comment below). Only the main thread acquires leases — the reclaim runs in a
+ * worker thread and never does — so in-process state is sufficient here where
+ * a cross-thread question would need the filesystem.
+ */
+const heldLeases = new Map<string, number>();
+
+function leaseKey(resourceRoot: string): string {
+  return path.resolve(resourceRoot);
+}
+
+function holdLease(key: string): void {
+  heldLeases.set(key, (heldLeases.get(key) ?? 0) + 1);
+}
+
+function dropLease(key: string): void {
+  const next = (heldLeases.get(key) ?? 1) - 1;
+  if (next > 0) heldLeases.set(key, next);
+  else heldLeases.delete(key);
 }
 
 function delay(ms: number): Promise<void> {
@@ -70,16 +102,11 @@ export async function acquireStorageActivityLease(
   // remove the only marker protecting the second.
   const marker = path.join(activeDir, markerName(`${holderId}-${process.pid}-${randomUUID()}`));
   const startedAt = Date.now();
-  let warned = false;
+  let nextReportAt = CLAIM_WAIT_WARN_MS;
   const waited = (): number => Date.now() - startedAt;
   const noteWait = (): void => {
-    if (waited() >= CLAIM_WAIT_MAX_MS) {
-      throw new Error(
-        `gave up waiting for a storage cleanup claim after ${Math.round(waited() / 1000)}s: ${resourceRoot}`,
-      );
-    }
-    if (warned || waited() < CLAIM_WAIT_WARN_MS) return;
-    warned = true;
+    if (waited() < nextReportAt) return;
+    nextReportAt = waited() + CLAIM_WAIT_ESCALATE_MS;
     log.warn('storage-activity: still waiting on a cleanup claim', { resourceRoot, holderId, waitedMs: waited() });
   };
 
@@ -106,11 +133,14 @@ export async function acquireStorageActivityLease(
       continue;
     }
 
+    const key = leaseKey(resourceRoot);
+    holdLease(key);
     let released = false;
     return {
       async release() {
         if (released) return;
         released = true;
+        dropLease(key);
         await fs.promises.rm(marker, { force: true });
         try {
           await fs.promises.rmdir(activeDir);
@@ -136,29 +166,53 @@ export async function acquireStorageActivityLease(
  * Returns the release, which is idempotent.
  */
 export function plantStorageActivityMarker(resourceRoot: string, holderId: string): () => void {
+  // This process already holds a lease on the root, so the reclaim is already
+  // guaranteed to back off and a second marker adds nothing. Skipping is not
+  // just an optimisation — the claim re-check below would THROW inside the
+  // window where tryRunWithStorageCleanupClaim has created its claim but has
+  // not yet read the markers that will make it abandon, losing an accepted
+  // message to a reclaim that never runs.
+  //
+  // The condition has to be "we hold a lease", not "a marker exists":
+  //   - planting with no re-check at all is unsafe — the reclaim may already
+  //     have read the marker directory and be committed to deleting;
+  //   - skipping on OUR OWN lease is safe — that marker predates this call and
+  //     persists past it, so the reclaim's read cannot have already passed;
+  //   - skipping on ANY marker is unsafe — a third party can release theirs
+  //     between our check and the reclaim's read.
+  if (heldLeases.has(leaseKey(resourceRoot))) return () => {};
+
   const activeDir = activeDirPath(resourceRoot);
   const marker = path.join(activeDir, markerName(`${holderId}-${process.pid}-${randomUUID()}`));
-  fs.mkdirSync(activeDir, { recursive: true });
-  fs.writeFileSync(marker, `${process.pid}\n`, { flag: 'w' });
-  if (fs.existsSync(cleanupClaimPath(resourceRoot))) {
+  const discard = (): void => {
     fs.rmSync(marker, { force: true });
     try {
       fs.rmdirSync(activeDir);
     } catch {
       // Another live holder still owns it.
     }
+  };
+  fs.mkdirSync(activeDir, { recursive: true });
+  try {
+    fs.writeFileSync(marker, `${process.pid}\n`, { flag: 'w' });
+  } catch (err) {
+    // Another holder's release can rmdir activeDir between the mkdir above and
+    // this write, and a full disk can leave a partial marker. Either way the
+    // marker is not trustworthy: clean up and let the caller see the real
+    // error rather than proceeding unprotected or stranding a file that blocks
+    // this root's reclaim forever. Mirrors the async path's error handling.
+    discard();
+    throw err;
+  }
+  if (fs.existsSync(cleanupClaimPath(resourceRoot))) {
+    discard();
     throw new Error(`session storage is being reclaimed, retry: ${resourceRoot}`);
   }
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    fs.rmSync(marker, { force: true });
-    try {
-      fs.rmdirSync(activeDir);
-    } catch {
-      // Another live holder still owns it — including an outer async lease.
-    }
+    discard();
   };
 }
 

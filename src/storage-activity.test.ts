@@ -214,35 +214,65 @@ describe('synchronous storage activity marker', () => {
   });
 
   // The re-entrancy case: writeSessionMessage holds the async lease and then
-  // opens the inbound DB, planting a second marker on the same root. The inner
-  // release must not take the outer's protection with it.
-  it('nests with an async lease without either release freeing the other', async () => {
+  // opens the inbound DB. Under an owned lease the inner planter must do
+  // NOTHING — planting is unnecessary, and re-checking the claim would throw
+  // inside the reclaim's create-claim-then-read-markers window and discard an
+  // accepted message.
+  it('is a no-op under a lease this process already holds', async () => {
     const root = tempRoot();
     const outer = await acquireStorageActivityLease(root, 'ingestion');
-    const inner = plantStorageActivityMarker(root, 'inbound-open');
 
+    const inner = plantStorageActivityMarker(root, 'inbound-open');
     inner();
     expect(
       tryRunWithStorageCleanupClaim(root, () => undefined),
-      'outer lease must still hold',
+      'outer lease still holds',
     ).toBe(false);
 
     await outer.release();
     expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
   });
 
-  it('survives the reverse release order too', async () => {
+  it('does not throw under an owned lease even while a claim is present', async () => {
     const root = tempRoot();
     const outer = await acquireStorageActivityLease(root, 'ingestion');
-    const inner = plantStorageActivityMarker(root, 'inbound-open');
+    // The reclaim has created its claim and has not yet read the markers that
+    // will make it abandon. Pre-fix the inner planter threw here, losing the
+    // message to a reclaim that never runs.
+    fs.writeFileSync(path.join(root, '.nanoclaw-storage-cleanup'), '{"pid":1}');
 
+    expect(() => plantStorageActivityMarker(root, 'inbound-open')()).not.toThrow();
+
+    fs.rmSync(path.join(root, '.nanoclaw-storage-cleanup'), { force: true });
     await outer.release();
+  });
+
+  it('still refcounts overlapping leases so the first release does not free the second', async () => {
+    const root = tempRoot();
+    const a = await acquireStorageActivityLease(root, 'one');
+    const b = await acquireStorageActivityLease(root, 'two');
+
+    await a.release();
+    expect(plantStorageActivityMarker(root, 'inner'), 'b still holds, so still a no-op').toBeTypeOf('function');
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(false);
+
+    await b.release();
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
+  });
+
+  // Two independent SYNC holders, no lease involved: the original independence
+  // property still has to hold for them.
+  it('keeps two independent sync markers independent', () => {
+    const root = tempRoot();
+    const first = plantStorageActivityMarker(root, 'first');
+    const second = plantStorageActivityMarker(root, 'second');
+
+    first();
     expect(
       tryRunWithStorageCleanupClaim(root, () => undefined),
-      'inner marker must still hold',
+      'second still holds',
     ).toBe(false);
-
-    inner();
+    second();
     expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
   });
 });
@@ -305,14 +335,23 @@ describe('acquireStorageActivityLease is observable and bounded', () => {
   // resolves on the threadpool and so is not driven by fake timers at all —
   // but the warn/cap thresholds are pure Date.now() arithmetic, so moving the
   // clock is enough and the loop still turns at its real 25ms.
+  // Returns the jumper and its own restore; the suite-level restoreAllMocks
+  // would also catch it, but a Date.now spy outliving its test poisons every
+  // timing assertion after it and that is not worth leaving to a hook.
+  let restoreClock: (() => void) | null = null;
   function clockJumper(): (ms: number) => void {
     const base = Date.now();
     let offset = 0;
-    vi.spyOn(Date, 'now').mockImplementation(() => base + offset);
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => base + offset);
+    restoreClock = () => spy.mockRestore();
     return (ms: number) => {
       offset += ms;
     };
   }
+  afterEach(() => {
+    restoreClock?.();
+    restoreClock = null;
+  });
 
   const settle = (ms = 120) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -347,18 +386,32 @@ describe('acquireStorageActivityLease is observable and bounded', () => {
     await lease.release();
   });
 
-  it('gives up rather than waiting forever on a claim nothing clears', async () => {
+  it('keeps waiting and keeps escalating rather than discarding the write', async () => {
     const root = tempRoot();
     fs.mkdirSync(root, { recursive: true });
-    fs.writeFileSync(path.join(root, '.nanoclaw-storage-cleanup'), '{"pid":1}');
+    const claim = path.join(root, '.nanoclaw-storage-cleanup');
+    fs.writeFileSync(claim, '{"pid":1}');
     const jump = clockJumper();
 
-    const settled = acquireStorageActivityLease(root, 'ingestion').then(
-      () => 'resolved',
-      (err: Error) => err.message,
+    let settled: string | null = null;
+    const pending = acquireStorageActivityLease(root, 'ingestion').then(
+      () => (settled = 'resolved'),
+      (err: Error) => (settled = err.message),
     );
     await settle(50);
-    jump(66 * 60 * 1000);
-    await expect(settled).resolves.toMatch(/gave up waiting/);
+
+    // Two hours: past any plausible cap, including both of archival's
+    // independently bounded 60-minute phases back to back.
+    jump(10_000);
+    await settle();
+    jump(2 * 60 * 60 * 1000);
+    await settle();
+
+    expect(settled, 'an accepted message must never be discarded on a timer').toBeNull();
+    expect(waitWarnCount(), 'silence is what is bounded, so it keeps reporting').toBeGreaterThan(1);
+
+    fs.rmSync(claim, { force: true });
+    await pending;
+    expect(settled).toBe('resolved');
   });
 });
