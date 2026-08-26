@@ -1824,22 +1824,46 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
     expect(inboundIds()).toEqual([]);
   });
 
-  // Equality alone is not a generation check: `closed === closed` and
-  // `undefined === undefined` both pass, so a raw-id writer arriving after the
-  // reclaim finished would re-provision a session nothing polls.
-  it('refuses a write to a session whose row is closed and whose directory is gone', async () => {
+  // Status equality is not a generation check. The real interleave: the writer
+  // samples while the session is ALREADY closed and its inbound.db present,
+  // THEN the reclaim archives and removes it while the writer waits on the
+  // claim. Nothing about the status changes, so only the inbound.db flip can
+  // catch it — and only if it is checked after the wait, not sampled before.
+  it('refuses when the reclaim takes the session after the writer sampled it', async () => {
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+    expect(fs.existsSync(inboundDbPath(AG, SESS)), 'sampled with inbound.db present').toBe(true);
+
+    // Reclaim mid-archive: the writer will queue behind this claim.
+    fs.writeFileSync(claimPath(), JSON.stringify({ pid: 1, createdAt: new Date().toISOString() }));
+    const write = writeSessionMessage(AG, SESS, message('sampled-then-reclaimed'));
+    await settle();
+
+    // The reclaim finishes WHILE the writer waits — after its sample.
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+    fs.rmSync(claimPath(), { force: true });
+
+    await expect(write).rejects.toThrow(/has been reclaimed/);
+    expect(inboundIds()).toEqual([]);
+  });
+
+  // The other half, and the regression this replaced actually shipped: a
+  // rotation-superseded session is deliberately `closed` and may have no
+  // directory at all, which the status+directory predicate misread as
+  // "reclaimed" and refused. workgroup-memory.integration.test.ts writes to
+  // exactly such a session and broke.
+  it('provisions a closed session that never had a directory', async () => {
     getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
 
-    await expect(writeSessionMessage(AG, SESS, message('after-reclaim'))).rejects.toThrow(/has been reclaimed/);
-    expect(fs.existsSync(inboundDbPath(AG, SESS))).toBe(false);
+    await expect(writeSessionMessage(AG, SESS, message('superseded-lineage'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['superseded-lineage']);
   });
 
-  it('still re-provisions a closed session whose directory survives', async () => {
-    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+  it('still re-provisions a session whose directory an operator removed', async () => {
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
 
-    await expect(writeSessionMessage(AG, SESS, message('closed-but-present'))).resolves.toBeUndefined();
-    expect(inboundIds()).toEqual(['closed-but-present']);
+    await expect(writeSessionMessage(AG, SESS, message('after-rm-rf'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['after-rm-rf']);
   });
 
   it('still writes normally when no reclaim is in progress', async () => {

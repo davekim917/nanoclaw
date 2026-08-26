@@ -789,14 +789,15 @@ async function writeSessionMessageInternal(
   // activity marker is present, and acquire double-checks the claim after
   // planting its marker. Either the reclaim sees our marker and skips, or we
   // see its claim and wait for it to finish.
-  // Sampled BEFORE the lease, because acquiring it mkdirs the session root —
-  // after that point "the reclaim took this directory" is unobservable.
-  const dirExisted = fs.existsSync(sessionDir(agentGroupId, sessionId));
+  // Sampled BEFORE the lease. The lease mkdirs the session root, which is why
+  // the root's existence is useless as a signal — but nothing in the lease
+  // creates inbound.db, so that file's existence survives as one.
+  const inboundExisted = fs.existsSync(inboundDbPath(agentGroupId, sessionId));
   const lease = await acquireStorageActivityLease(sessionDir(agentGroupId, sessionId), `inbound-${sessionId}`);
   try {
     return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId, {
       status: statusBefore,
-      dirExisted,
+      inboundExisted,
     });
   } finally {
     await lease.release();
@@ -808,25 +809,29 @@ async function writeSessionMessageLocked(
   sessionId: string,
   message: SessionMessageInput,
   ignoreDuplicateId: boolean,
-  before: { status: string | undefined; dirExisted: boolean },
+  before: { status: string | undefined; inboundExisted: boolean },
 ): Promise<boolean> {
   // Waiting for the claim above can mean waiting out a reclaim that archived
   // and deleted this session while we queued. Requiring the row to be exactly
   // where we left it catches active -> archiving -> closed without taking any
   // new position on which statuses are writable: whatever was writable before
   // still is, as long as nothing moved it under us.
-  const statusNow = getSession(sessionId)?.status;
-  if (statusNow !== before.status) {
+  if (getSession(sessionId)?.status !== before.status) {
     throw new Error(`session ${sessionId} changed state during archival; route this message to a fresh session`);
   }
-  // Equality is not a generation check. A raw-id writer that arrives when the
-  // session is ALREADY `closed` — or already gone from the central table —
-  // compares equal to itself, so the reclaim can have finished before we ever
-  // looked and this would happily re-provision a session nothing polls and
-  // then bump its last_active. A dead row plus an absent directory is the one
-  // combination that cannot be a live session, and the directory reading has
-  // to predate the lease's own mkdir to mean anything.
-  if ((statusNow === 'closed' || statusNow === undefined) && !before.dirExisted) {
+  // Status equality is not a generation check — a writer that arrives when the
+  // session is ALREADY `closed`, or already absent from the central table,
+  // compares equal to itself no matter what happened while it queued. The
+  // generation token is inbound.db: it existed when we looked and it is gone
+  // now, so the reclaim took it between the two, and re-provisioning here
+  // would resurrect a session nothing polls. Checked AFTER the wait, which is
+  // what a status sampled before it could never do.
+  //
+  // Never existed and still does not: a brand-new session, or the documented
+  // operator `rm -rf`. Both re-provision below, as they must.
+  // ponytail: existence flip, not inode comparison — nothing recreates
+  // inbound.db inside our own lease. Compare `.ino` if that ever changes.
+  if (before.inboundExisted && !fs.existsSync(inboundDbPath(agentGroupId, sessionId))) {
     throw new Error(`session ${sessionId} has been reclaimed; route this message to a fresh session`);
   }
 
@@ -1515,7 +1520,15 @@ function extractAttachmentFiles(
 /** Open the inbound DB for a session (host reads/writes). */
 export function openInboundDb(agentGroupId: string, sessionId: string): Database.Database {
   const db = openInboundDbRaw(inboundDbPath(agentGroupId, sessionId));
-  migrateMessagesInTable(db);
+  try {
+    migrateMessagesInTable(db);
+  } catch (err) {
+    // close() releases the storage-activity marker; without this a failed
+    // migration leaks both the handle and the marker, and a leaked marker
+    // makes this session unreclaimable until the next host start.
+    db.close();
+    throw err;
+  }
   return db;
 }
 
