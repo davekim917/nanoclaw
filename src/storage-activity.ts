@@ -3,10 +3,18 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { DATA_DIR } from './config.js';
+import { log } from './log.js';
 
 const ACTIVE_DIR = '.nanoclaw-storage-active';
 const CLEANUP_CLAIM = '.nanoclaw-storage-cleanup';
 const CLAIM_WAIT_MS = 25;
+// A stale claim is cleared only by the next host start, and inbound message
+// writes wait on this loop. Waiting is right — it is what keeps the message —
+// but a silent unbounded wait on the ingestion path is the failure mode this
+// area was fixed for. Warn once, then keep waiting; give up at the cap, which
+// is the tar timeout plus slack so a legitimately long archive still wins.
+const CLAIM_WAIT_WARN_MS = 10_000;
+const CLAIM_WAIT_MAX_MS = 65 * 60 * 1000;
 
 export interface StorageActivityLease {
   release(): Promise<void>;
@@ -61,10 +69,24 @@ export async function acquireStorageActivityLease(
   // for the same session must remain independent or the first release could
   // remove the only marker protecting the second.
   const marker = path.join(activeDir, markerName(`${holderId}-${process.pid}-${randomUUID()}`));
+  const startedAt = Date.now();
+  let warned = false;
+  const waited = (): number => Date.now() - startedAt;
+  const noteWait = (): void => {
+    if (waited() >= CLAIM_WAIT_MAX_MS) {
+      throw new Error(
+        `gave up waiting for a storage cleanup claim after ${Math.round(waited() / 1000)}s: ${resourceRoot}`,
+      );
+    }
+    if (warned || waited() < CLAIM_WAIT_WARN_MS) return;
+    warned = true;
+    log.warn('storage-activity: still waiting on a cleanup claim', { resourceRoot, holderId, waitedMs: waited() });
+  };
 
   for (;;) {
     if (await claimExists(resourceRoot)) {
       await delay(CLAIM_WAIT_MS);
+      noteWait();
       continue;
     }
 
@@ -80,6 +102,7 @@ export async function acquireStorageActivityLease(
     if (await claimExists(resourceRoot)) {
       await fs.promises.rm(marker, { force: true });
       await delay(CLAIM_WAIT_MS);
+      noteWait();
       continue;
     }
 
@@ -97,6 +120,46 @@ export async function acquireStorageActivityLease(
       },
     };
   }
+}
+
+/**
+ * Synchronous reader side of the same lock, for the many writers that cannot
+ * await — `openInboundDb` is called from sync code all over the host.
+ *
+ * Identical protocol to {@link acquireStorageActivityLease}: plant the marker,
+ * THEN re-check the claim. Either cleanup sees this marker and skips, or we see
+ * its claim. The only difference is what happens when the claim is there —
+ * waiting needs async, so this throws instead. That trade is deliberate: an
+ * operator or scheduler write that fails loudly and can be retried beats one
+ * that lands in an inode the reclaim is about to unlink.
+ *
+ * Returns the release, which is idempotent.
+ */
+export function plantStorageActivityMarker(resourceRoot: string, holderId: string): () => void {
+  const activeDir = activeDirPath(resourceRoot);
+  const marker = path.join(activeDir, markerName(`${holderId}-${process.pid}-${randomUUID()}`));
+  fs.mkdirSync(activeDir, { recursive: true });
+  fs.writeFileSync(marker, `${process.pid}\n`, { flag: 'w' });
+  if (fs.existsSync(cleanupClaimPath(resourceRoot))) {
+    fs.rmSync(marker, { force: true });
+    try {
+      fs.rmdirSync(activeDir);
+    } catch {
+      // Another live holder still owns it.
+    }
+    throw new Error(`session storage is being reclaimed, retry: ${resourceRoot}`);
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    fs.rmSync(marker, { force: true });
+    try {
+      fs.rmdirSync(activeDir);
+    } catch {
+      // Another live holder still owns it — including an outer async lease.
+    }
+  };
 }
 
 /**
@@ -122,7 +185,13 @@ export function tryRunWithStorageCleanupClaim(resourceRoot: string, action: () =
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     }
-    if (active.length > 0) return false;
+    if (active.length > 0) {
+      // A marker released on handle close, so a marker that never clears means
+      // a leaked DB handle and this resource is skipped every pass until the
+      // next host start. Silent would make that C1 inverted; say it.
+      log.warn('storage-activity: cleanup skipped, resource is in use', { resourceRoot, holders: active.length });
+      return false;
+    }
     action();
     return true;
   } finally {
@@ -162,7 +231,13 @@ function realDirectory(dirPath: string): boolean {
 function subdirectories(dir: string): fs.Dirent[] {
   try {
     return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.isSymbolicLink());
-  } catch {
+  } catch (err) {
+    // ENOENT is the ordinary "nothing here yet" (fresh install, no threads).
+    // Anything else means this subtree keeps its stale claims — and a stale
+    // claim now blocks writers, so it does not get to be silent.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('storage-activity: unreadable while sweeping stale claims', { directory: dir, err });
+    }
     return [];
   }
 }
