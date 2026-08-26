@@ -267,6 +267,13 @@ export interface AgentQuery {
  * provider doesn't expose rather than guessing. The poll-loop writes
  * whatever arrives (all-NULL included) as one `turn_usage` row per
  * completed turn, so gaps stay visible instead of silently missing.
+ *
+ * Report the WHOLE turn, never one model request. A turn is many requests,
+ * and both codex and opencode once reported only their last one — a 66-step
+ * codex turn recorded as 39 output tokens. If the provider exposes a running
+ * total (Claude's stream, Codex's thread), report the total and register the
+ * provider in turn-usage.ts's CUMULATIVE_PROVIDERS so it is deltaed; if it
+ * exposes per-response figures (OpenCode), sum them here.
  */
 export interface TurnUsageInfo {
   model?: string | null;

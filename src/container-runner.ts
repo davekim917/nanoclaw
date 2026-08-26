@@ -22,6 +22,7 @@ import {
   MAX_CONCURRENT_CONTAINERS,
   ONECLI_API_KEY,
   ONECLI_URL,
+  TASK_SCRIPT_TIMEOUT_MS,
   TIMEZONE,
   WORKGROUP_SHARED_FS,
 } from './config.js';
@@ -738,19 +739,6 @@ async function spawnContainer(
   }
   writeSessionRouting(agentGroup.id, session.id);
 
-  // Snapshot host capabilities into the session dir so the container can
-  // read a static JSON (Phase 5.3). Refreshed every spawn so newly-mounted
-  // credentials / plugins / channel registrations appear immediately.
-  // Subject for the Slack owner-safety gate. Identical to
-  // session.messaging_group_id for chat sessions; for a task session (which has
-  // none by construction) this resolves the series' delivery destination so the
-  // gate judges WHERE THE TASK POSTS instead of fail-closing on null. See
-  // resolveSlackSafetyMessagingGroupId.
-  const { resolveSlackSafetyMessagingGroupId } = await import('./modules/permissions/task-slack-subject.js');
-  const slackSafetyMessagingGroupId = resolveSlackSafetyMessagingGroupId(session);
-
-  writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
-
   // The config was read once at the reserved-spawn boundary and is threaded
   // through workgroup reconciliation, provider resolution, mounts, and args.
   const effectiveResources = resolveContainerResources(containerConfig.resources);
@@ -897,6 +885,13 @@ async function spawnContainer(
     }
   }
 
+  // Identical to session.messaging_group_id for chat sessions; for a task
+  // session (which has none by construction) this resolves the series'
+  // delivery destination so the gate judges WHERE THE TASK POSTS instead of
+  // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
+  const { resolveSlackSafetyMessagingGroupId } = await import('./modules/permissions/task-slack-subject.js');
+  const slackSafetyMessagingGroupId = resolveSlackSafetyMessagingGroupId(session);
+
   const args = await buildContainerArgs(
     mounts,
     containerName,
@@ -917,6 +912,20 @@ async function spawnContainer(
     repositoryWorkUnit,
     slackSafetyMessagingGroupId,
   );
+
+  // Snapshot host capabilities into the session dir so the container can
+  // read a static JSON (Phase 5.3). Refreshed every spawn so newly-mounted
+  // credentials / plugins / channel registrations appear immediately.
+  // Deliberately AFTER buildContainerArgs: that call resolves the GitHub
+  // token (minting/refreshing the App cache), and the snapshot's expiresAt
+  // field must describe the credential THIS spawn actually injects — writing
+  // it earlier surfaced the pre-spawn cache state instead (stale-low or
+  // absent on cold start). Subject for the Slack owner-safety gate. Identical
+  // to session.messaging_group_id for chat sessions; for a task session
+  // (which has none by construction) this resolves the series' delivery
+  // destination so the gate judges WHERE THE TASK POSTS instead of
+  // fail-closing on null. See resolveSlackSafetyMessagingGroupId.
+  writeCapabilitiesSnapshot(agentGroup.id, session.id, slackSafetyMessagingGroupId);
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -1177,6 +1186,14 @@ export interface ResolvedAnthropicAuth {
   oauthFallbacks: { index: number; value: string }[];
   apiKeyPrimary?: string;
   apiKeyFallbacks: { index: number; value: string }[];
+  /**
+   * True when the OAuth set came from a per-group `<BASE>_<FOLDER>` scope
+   * rather than the global pool. Slots are forwarded under their unscoped
+   * `_N` names either way, so this flag is the ONLY thing that distinguishes
+   * "global slot 2" from "this group's own slot 2" — different Anthropic
+   * accounts whose rate-limit windows share no denominator.
+   */
+  oauthScoped: boolean;
 }
 
 /**
@@ -1206,6 +1223,7 @@ export function resolveAnthropicAuth(
     oauthFallbacks: oauth.fallbacks,
     apiKeyPrimary: apiKey.primary,
     apiKeyFallbacks: apiKey.fallbacks,
+    oauthScoped: oauth.scoped,
   };
 }
 
@@ -1351,7 +1369,7 @@ function resolveScopedRotationSet(
   folder: string,
   env: NodeJS.ProcessEnv,
   envFile: Record<string, string> = {},
-): { primary?: string; fallbacks: { index: number; value: string }[] } {
+): { primary?: string; fallbacks: { index: number; value: string }[]; scoped: boolean } {
   const folderTok = folder.toUpperCase().replace(/-/g, '_');
   const isPureDigits = /^\d+$/.test(folderTok);
 
@@ -1392,7 +1410,7 @@ function resolveScopedRotationSet(
       fallbacks.push({ index: Number(tail), value: v });
     }
     fallbacks.sort((a, b) => a.index - b.index);
-    return { primary: scopedPrimary, fallbacks };
+    return { primary: scopedPrimary, fallbacks, scoped: true };
   }
 
   const primary = merged[base];
@@ -1413,9 +1431,9 @@ function resolveScopedRotationSet(
   // lose their rotation pool, collapsing to OneCLI vault single-token mode.
   if (!primary && fallbacks.length > 0) {
     const promoted = fallbacks.shift()!;
-    return { primary: promoted.value, fallbacks };
+    return { primary: promoted.value, fallbacks, scoped: false };
   }
-  return { primary, fallbacks };
+  return { primary, fallbacks, scoped: false };
 }
 
 /**
@@ -3196,6 +3214,13 @@ async function buildContainerArgs(
   );
   args.push('-e', `NANOCLAW_ASSISTANT_NAME=${resolvedAssistantName}`);
   if (sessionThreadId) args.push('-e', `NANOCLAW_THREAD_ID=${sessionThreadId}`);
+  // Pre-task script timeout override — forwarded CLAMPED (config.TASK_SCRIPT_TIMEOUT_MS),
+  // unconditionally: when unset it is 120_000, identical to the container
+  // default, so an unconfigured spawn is behaviorally unchanged. The gate
+  // cannot be `process.env` alone — .env-only values never reach it at this
+  // point (config.ts's import-order trap), and silently dropping a documented
+  // operator override is what reintroduced the original 30s-kill failure.
+  args.push('-e', `NANOCLAW_TASK_SCRIPT_TIMEOUT_MS=${TASK_SCRIPT_TIMEOUT_MS}`);
   if (repositoryWorkUnit) {
     args.push('-e', `NANOCLAW_HOST_DATA_DIR=${DATA_DIR}`);
     args.push('-e', `NANOCLAW_HOST_TOPIC_WORKTREES_DIR=${topicWorktreesDir(repositoryWorkUnit)}`);
@@ -3389,6 +3414,22 @@ async function buildContainerArgs(
     for (const fb of auth.oauthFallbacks) {
       args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN_${fb.index}=${fb.value}`);
     }
+    // Which credential set those slots came from. Scoped tokens are forwarded
+    // under the same unscoped `_N` names as globals, so without this the
+    // container cannot tell its slot 2 from the global pool's slot 2 — and
+    // rate-limit utilization sampled against them is not comparable (see
+    // rate_limit_samples in the container's outbound.db).
+    args.push('-e', `NANOCLAW_OAUTH_CREDENTIAL_SET=${auth.oauthScoped ? `group:${credentialFolder}` : 'global'}`);
+    // Operator-declared lane per slot (`<slot>:<lane>,...`). The container
+    // reads this from its own env (see laneForSlot in providers/claude.ts),
+    // and there is NO generic env passthrough into containers — the only one
+    // is prefix-limited to RENDER_PG_/RENDER_REDIS_URL_ below. Without this
+    // explicit forward the variable is simply undefined inside every
+    // container and `lane` stays NULL forever no matter what .env says, with
+    // no error anywhere to show for it. Forwarded only when declared, so an
+    // install that never sets it sends nothing.
+    const oauthLanes = process.env.CLAUDE_CODE_OAUTH_LANES;
+    if (oauthLanes) args.push('-e', `CLAUDE_CODE_OAUTH_LANES=${oauthLanes}`);
   }
 
   // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves

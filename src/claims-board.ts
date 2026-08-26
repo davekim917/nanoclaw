@@ -95,8 +95,12 @@ const MAX_CLAIM_FILES = 500;
  * largest live claim on disk is 2.2 KB, so 64 KiB is ~30x the biggest real one
  * and still leaves room for the paragraphs of handoff detail notes routinely
  * carry. Anything past it is not a claim.
+ *
+ * Exported so `modules/claims/self-heal.ts` — which re-reads a claim BY SLUG
+ * after the board already classified it — reads it at the same cap. Two
+ * numbers for one file is exactly the divergence this seam exists to prevent.
  */
-const MAX_CLAIM_BYTES = 64 * 1024;
+export const MAX_CLAIM_BYTES = 64 * 1024;
 
 /**
  * `entries` least-recently-touched first.
@@ -139,23 +143,36 @@ function oldestFirst(dir: string, entries: string[]): string[] {
  * a `readFileSync`, is what keeps a `mkfifo` in an agent-writable directory
  * from hanging the host's event loop on the open.
  */
+/**
+ * The claims directory for one workgroup, resolved through symlinks and
+ * proven still inside the workgroup's own folder — or `null` if there is no
+ * workgroup dir yet, the `claims` subdir escapes it, or either is unreadable.
+ *
+ * `claims/` is agent-writable, so it can be replaced with a symlink at a
+ * sibling workgroup's folder — a cross-workgroup read straight through the
+ * data-pool boundary, and one that self-heal would then act on in the wrong
+ * workgroup. Resolving it here also gives `readContainedFile` the realpath'd
+ * root its per-file fd check needs.
+ *
+ * Exported so `modules/claims/self-heal.ts` re-resolves the SAME directory,
+ * fresh, at its own later read of the same claim — reusing a `dir` value
+ * captured before its `await`s would only narrow that race, not close it.
+ * Never throws: absent and escaping take the same exit, "read nothing".
+ */
+export function resolveClaimsDir(root: string, workgroupId: string): string | null {
+  try {
+    const workgroupDir = fs.realpathSync(path.join(root, workgroupId));
+    return containedRealpath(workgroupDir, path.join(workgroupDir, 'claims'));
+  } catch {
+    return null; // no workgroup dir — shared FS not enabled, or nothing claimed yet
+  }
+}
+
 export function readClaims(workgroupId: string, now: number, root: string = claimsBaseDir()): BoardClaim[] {
-  // Containment on the DIRECTORY, resolved once. `claims/` is agent-writable,
-  // so it can be replaced with a symlink at a sibling workgroup's folder — a
-  // cross-workgroup read straight through the data-pool boundary, and one that
-  // self-heal would then act on in the wrong workgroup. Resolving it here also
-  // gives `readContainedFile` the realpath'd root its per-file fd check needs.
-  //
   // Absent and escaping take the same silent exit: most workgroups have no
   // claims directory at all, so warning here would fire on every poll for
   // every one of them. Both mean the same thing — read nothing.
-  let dir: string | null;
-  try {
-    const workgroupDir = fs.realpathSync(path.join(root, workgroupId));
-    dir = containedRealpath(workgroupDir, path.join(workgroupDir, 'claims'));
-  } catch {
-    dir = null; // no workgroup dir — shared FS not enabled, or nothing claimed yet
-  }
+  const dir = resolveClaimsDir(root, workgroupId);
   if (dir === null) return [];
 
   let all: string[];

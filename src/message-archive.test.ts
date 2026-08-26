@@ -27,6 +27,7 @@ import {
   parseArchivePermalinks,
   queryArchiveExactLinks,
   readMemoryCurationEpisodeMessages,
+  recentConversationSenderNames,
   recordAcceptedGeneratedMemory,
   recordMemoryCurationCall,
   selectMemoryCurationCredential,
@@ -207,6 +208,81 @@ describe('archive retrieval helpers', () => {
     expect(
       queryArchiveExactLinks({ memberAgentGroupIds: ['ag-a'], normalizedContent: query, candidateLimit: 10 }),
     ).toEqual([]);
+  });
+
+  // idx_archive_conv_recent lets the planner satisfy `ORDER BY sent_at DESC,
+  // id DESC` by walking the index instead of temp-B-tree sorting. That is only
+  // result-preserving because `id` is a UNIQUE primary key, which makes the
+  // tie-break total — sent_at alone is not (47k duplicated values on the live
+  // archive). Pin the ordering under duplicate sent_at so a future index or
+  // ORDER BY edit that drops the tie-break fails here.
+  it('orders sender recall by the total (sent_at, id) key when sent_at ties', () => {
+    for (const id of ['m-b', 'm-a', 'm-c']) {
+      upsertArchiveMessage({
+        id,
+        agentGroupId: 'ag-a',
+        messagingGroupId: 'mg-tie',
+        channelType: 'discord',
+        channelName: 'room',
+        platformId: 'discord:g:c',
+        threadId: 'discord:g:c:t',
+        role: 'user',
+        senderId: `discord:${id}`,
+        senderName: `Sender ${id}`,
+        text: `tie ${id}`,
+        sentAt: '2026-07-25T00:00:05.000Z',
+      });
+    }
+
+    expect(
+      recentConversationSenderNames({
+        memberAgentGroupIds: ['ag-a'],
+        messagingGroupId: 'mg-tie',
+        threadId: 'discord:g:c:t',
+      }),
+    ).toEqual(['Sender m-c', 'Sender m-b', 'Sender m-a']);
+  });
+});
+
+describe('archive evidence candidate ordering', () => {
+  // Pins the CTE tie-break in searchArchiveEvidence. 12 rows share one text, so
+  // they share a bm25 score and a current_rank; candidateLimit 1 sets the inner
+  // cut at 8, which lands inside that tie. rowid ASC keeps the 8 oldest rowids,
+  // and the outer sort (sent_at DESC) then picks m07 as the newest survivor.
+  //
+  // Honest scope: deleting ', messages_archive_fts.rowid ASC' does NOT currently
+  // fail this — SQLite happens to emit FTS matches in rowid order and its sorter
+  // is stable, so the result is the same either way (verified). This is a
+  // determinism pin, not a tripwire: it fails if a SQLite upgrade, a new index,
+  // or a CTE rewrite ever makes the tied set come out in a different order.
+  it('keeps a tie-straddling candidate cut deterministic', () => {
+    for (let i = 0; i < 12; i++) {
+      upsertArchiveMessage({
+        id: `m${String(i).padStart(2, '0')}`,
+        agentGroupId: 'ag-a',
+        messagingGroupId: 'mg-1',
+        channelType: 'slack',
+        channelName: 'room',
+        platformId: 'slack:C1',
+        threadId: 'thr-other',
+        role: 'user',
+        senderId: 'slack:U1',
+        senderName: 'Sender',
+        text: 'alpha',
+        sentAt: `2026-07-${String(10 + i).padStart(2, '0')}T00:00:00.000Z`,
+      });
+    }
+
+    const rows = searchArchiveEvidence({
+      memberAgentGroupIds: ['ag-a'],
+      query: 'alpha',
+      currentMessagingGroupId: 'mg-1',
+      currentThreadId: 'thr-current',
+      currentNormalizedContent: 'unrelated current message',
+      candidateLimit: 1,
+    });
+
+    expect(rows.map((r) => r.id)).toEqual(['m07']);
   });
 });
 

@@ -21,6 +21,10 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
 
 const { ClaudeProvider } = await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
+// rate_limit_event is now ALSO persisted to outbound.db's rate_limit_samples
+// (claude.rate-limit-samples.test.ts owns that assertion). The write swallows
+// its own errors, so this is only to keep the log clean here.
+const { initTestSessionDb } = await import('../db/connection.js');
 
 let tmp: string;
 let prevHome: string | undefined;
@@ -29,6 +33,7 @@ beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-ratelimit-'));
   prevHome = process.env.HOME;
   process.env.HOME = tmp;
+  initTestSessionDb();
 });
 
 afterEach(() => {

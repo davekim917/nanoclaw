@@ -1791,8 +1791,15 @@ export async function processQuery(
           rateLimitUtilization: event.rateLimit?.utilization ?? null,
           rateLimitResetsAt: event.rateLimit?.resetsAt ?? null,
         };
+        // The continuation is the accounting scope for providers that report
+        // a running total (Claude's SDK session, Codex's thread) — see
+        // turn-usage.ts's toTurnDelta. Without it, the first turn of a new
+        // series can be silently subtracted against the previous one's
+        // stored total. Empty string when the provider hasn't produced a
+        // continuation yet, which just means "one implicit series".
+        const usageScope = queryContinuation ?? initialContinuation ?? '';
         for (const usage of Array.isArray(event.usage) ? event.usage : [event.usage]) {
-          recordTurnUsage(providerName, usage, turnMeta);
+          recordTurnUsage(providerName, usage, turnMeta, usageScope);
         }
         // A `result` event signals the assistant's turn is complete, but the
         // provider's events generator stays open for follow-up `push()` calls

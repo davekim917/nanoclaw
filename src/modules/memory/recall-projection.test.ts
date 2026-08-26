@@ -18,9 +18,10 @@ import { runProjectionBuild } from './recall-projection-build.js';
 import {
   buildAndPromoteProjection,
   buildProjectionCandidates,
+  frozenBoundsJson,
   hydrateLane,
   LANE_EXCERPT_CHARS,
-  openRecallProjection,
+  openProjectionDb,
   projectionPath,
   RECALL_PROJECTION_SCHEMA_VERSION,
   readProjectionSummary,
@@ -85,7 +86,7 @@ describe('recall projection schema and build', () => {
     const root = smallTree();
     const { live } = built(root);
 
-    const db = openRecallProjection(live);
+    const db = openProjectionDb(live, frozenBoundsJson());
     expect(db).not.toBeNull();
     const files = hydrateLane(db!, 'file');
     const facts = hydrateLane(db!, 'fact');
@@ -124,7 +125,7 @@ describe('recall projection schema and build', () => {
     const { live } = built(root);
     const inMemory = buildProjectionCandidates(root).candidates;
 
-    const db = openRecallProjection(live)!;
+    const db = openProjectionDb(live, frozenBoundsJson())!;
     const hydrated = [...hydrateLane(db, 'file'), ...hydrateLane(db, 'fact')];
     db.close();
 
@@ -149,7 +150,7 @@ describe('recall projection schema and build', () => {
     writeFile(root, GENERATED_MEMORY_RELATIVE_PATH, ledger);
     const { live } = built(root);
 
-    const db = openRecallProjection(live)!;
+    const db = openProjectionDb(live, frozenBoundsJson())!;
     const facts = hydrateLane(db, 'fact');
     db.close();
 
@@ -169,7 +170,7 @@ describe('recall projection schema and build', () => {
   it('stores capturedAt as a raw unparsed string', () => {
     const root = smallTree();
     const { live } = built(root);
-    const db = openRecallProjection(live)!;
+    const db = openProjectionDb(live, frozenBoundsJson())!;
     const facts = hydrateLane(db, 'fact');
     db.close();
 
@@ -182,7 +183,7 @@ describe('recall projection schema and build', () => {
   it('P2.5-AC4: persisted token stream and passage windows are byte-identical to a live call', () => {
     const root = smallTree();
     const { live } = built(root);
-    const db = openRecallProjection(live)!;
+    const db = openProjectionDb(live, frozenBoundsJson())!;
     const hydrated = [...hydrateLane(db, 'file'), ...hydrateLane(db, 'fact')];
     db.close();
 
@@ -200,6 +201,8 @@ describe('recall projection schema and build', () => {
       const fresh = passageWindows(source.searchable, LANE_EXCERPT_CHARS[source.lane]).map((window) => ({
         text: window.text,
         tokens: [...window.tokens],
+        start: window.start,
+        end: window.end,
       }));
       expect(candidate.windows).toEqual(fresh);
     }
@@ -226,7 +229,7 @@ describe('recall projection schema and build', () => {
     expect(source.content).toContain('�');
 
     const { live } = built(root);
-    const db = openRecallProjection(live)!;
+    const db = openProjectionDb(live, frozenBoundsJson())!;
     const hydrated = hydrateLane(db, 'file');
     db.close();
 
@@ -265,7 +268,7 @@ describe('recall projection schema and build', () => {
     expect(windowOnly.length).toBeGreaterThan(0);
 
     const { live } = built(root);
-    const db = openRecallProjection(live)!;
+    const db = openProjectionDb(live, frozenBoundsJson())!;
     const indexed = (
       db.prepare('SELECT token FROM term ORDER BY token').all() as {
         token: string;
@@ -281,7 +284,7 @@ describe('recall projection schema and build', () => {
     // Everything in this tree is offset-sliceable, so nothing takes the escape hatch.
     expect(result.windowsStoredWhole).toBe(0);
 
-    const db = openRecallProjection(result.path)!;
+    const db = openProjectionDb(result.path, frozenBoundsJson())!;
     const hydrated = [...hydrateLane(db, 'file'), ...hydrateLane(db, 'fact')];
     // Windows really are stored as offsets, not as the literal shape.
     const encodings = (db.prepare('SELECT DISTINCT windows_encoded AS e FROM candidate').all() as { e: number }[]).map(
@@ -300,12 +303,52 @@ describe('recall projection schema and build', () => {
       const fresh = passageWindows(original.searchable, LANE_EXCERPT_CHARS[original.lane]).map((window) => ({
         text: window.text,
         tokens: [...window.tokens],
+        start: window.start,
+        end: window.end,
       }));
       // Deep equality over value, start, end AND window ordering.
       expect(windowsEqual(candidate.windows, fresh)).toBe(true);
       expect(candidate.windows).toEqual(fresh);
       expect(candidate.stream).toEqual([...tokenStreamForRecall(original.searchable)]);
     }
+  });
+
+  // Repeated identical sentences: the third window's TRUE range is [7,13), and
+  // recovering it by searching for its text finds [0,6) instead. Decoding [0,6)
+  // yields byte-identical text, so a round-trip assertion cannot see the drift
+  // — which is why this asserts the STORED integers, not the decoded text.
+  it('stores the TRUE window span when the same text occurs more than once', () => {
+    const root = scratch('repeat');
+    writeFile(root, 'concepts/repeat.md', 'aa bb?\naa bb?');
+    const candidates = buildProjectionCandidates(root).candidates;
+    expect(candidates).toHaveLength(1);
+    const candidate = candidates[0]!;
+
+    const fresh = passageWindows(candidate.searchable, LANE_EXCERPT_CHARS.file);
+    // The fixture only means something if the same window text really repeats.
+    const texts = fresh.map((window) => window.text);
+    expect(new Set(texts).size).toBeLessThan(texts.length);
+
+    const { live } = built(root);
+    const db = openProjectionDb(live, frozenBoundsJson())!;
+    const row = db.prepare('SELECT windows_encoded AS e, windows_json AS j FROM candidate').get() as {
+      e: number;
+      j: string;
+    };
+    db.close();
+    expect(row.e).toBe(1);
+
+    const flat = JSON.parse(row.j) as number[];
+    const stored: Array<[number, number]> = [];
+    for (let at = 0; at < flat.length; at += 4) stored.push([flat[at]!, flat[at + 1]!]);
+    expect(stored).toEqual(fresh.map((window) => [window.start, window.end]));
+    // Every stored span brackets its own window, at its own offset.
+    for (const [index, [start, end]] of stored.entries()) {
+      expect(candidate.searchable.slice(start, end)).toBe(fresh[index]!.text);
+    }
+    // The drift this guards against: at least one window is NOT at the first
+    // occurrence of its own text, or the fixture proves nothing.
+    expect(stored.some(([start], index) => candidate.searchable.indexOf(fresh[index]!.text) !== start)).toBe(true);
   });
 
   it('falls back to storing whole windows when the offset form cannot be proven exact', () => {
@@ -321,7 +364,7 @@ describe('recall projection schema and build', () => {
     // The escape hatch fired for exactly the chopped candidate.
     expect(result.windowsStoredWhole).toBe(1);
 
-    const db = openRecallProjection(result.path)!;
+    const db = openProjectionDb(result.path, frozenBoundsJson())!;
     const rows = db.prepare('SELECT path, windows_encoded AS e FROM candidate ORDER BY path').all() as {
       path: string;
       e: number;
@@ -338,6 +381,8 @@ describe('recall projection schema and build', () => {
       const fresh = passageWindows(candidate.searchable, LANE_EXCERPT_CHARS[candidate.lane]).map((window) => ({
         text: window.text,
         tokens: [...window.tokens],
+        start: window.start,
+        end: window.end,
       }));
       expect(windowsEqual(candidate.windows, fresh)).toBe(true);
     }
@@ -346,21 +391,21 @@ describe('recall projection schema and build', () => {
   it('rejects a projection whose schema_version does not match', () => {
     const root = smallTree();
     const { live } = built(root);
-    expect(openRecallProjection(live)).not.toBeNull();
+    expect(openProjectionDb(live, frozenBoundsJson())).not.toBeNull();
 
     const writable = new Database(live);
     writable.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run('999');
     writable.close();
 
     // A mismatch is a rebuild trigger, not a thrown error (decision 14).
-    expect(openRecallProjection(live)).toBeNull();
+    expect(openProjectionDb(live, frozenBoundsJson())).toBeNull();
   });
 
   it('treats a missing or unopenable projection as absent rather than throwing', () => {
     const directory = scratch('absent');
-    expect(openRecallProjection(path.join(directory, 'index.db'))).toBeNull();
+    expect(openProjectionDb(path.join(directory, 'index.db'), frozenBoundsJson())).toBeNull();
     fs.writeFileSync(path.join(directory, 'index.db'), 'not a database at all');
-    expect(openRecallProjection(path.join(directory, 'index.db'))).toBeNull();
+    expect(openProjectionDb(path.join(directory, 'index.db'), frozenBoundsJson())).toBeNull();
   });
 
   it('S2: rejects a candidate the SQLite TEXT binding would silently mutate', () => {
@@ -388,6 +433,8 @@ describe('recall projection schema and build', () => {
       windows: passageWindows(searchable, LANE_EXCERPT_CHARS.file).map((window) => ({
         text: window.text,
         tokens: [...window.tokens],
+        start: window.start,
+        end: window.end,
       })),
     };
     // The in-memory objects are self-consistent, so the encoder's own check is
@@ -395,21 +442,22 @@ describe('recall projection schema and build', () => {
     expect(windowsEqual(poisoned.windows, poisoned.windows)).toBe(true);
 
     const nextPath = path.join(scratch('poison'), 'index.next-poison.db');
-    expect(() => writeProjection(nextPath, { ...set, candidates: [poisoned] })).toThrow(
+    expect(() => writeProjection(nextPath, { ...set, candidates: [poisoned] }, frozenBoundsJson())).toThrow(
       /storage round trip changed searchable/,
     );
     // Nothing servable was produced.
-    expect(openRecallProjection(nextPath)).toBeNull();
+    expect(openProjectionDb(nextPath, frozenBoundsJson())).toBeNull();
   });
 
   it('S1: rejects a projection built under different bounds than the live constants', () => {
     const root = smallTree();
     const { live } = built(root);
-    expect(openRecallProjection(live)).not.toBeNull();
+    expect(openProjectionDb(live, frozenBoundsJson())).not.toBeNull();
 
     // Simulates PRE_TURN_BOUNDS/LANE_EXCERPT_CHARS changing without a rebuild.
-    // schema_version stays 1, because the TABLE shape did not change — which is
-    // exactly why the marker and the version alone are not enough.
+    // schema_version does not move, because neither the table shape nor the
+    // persisted semantics changed — which is exactly why the marker and the
+    // version alone are not enough.
     const writable = new Database(live);
     const stored = JSON.parse(
       (writable.prepare("SELECT value FROM meta WHERE key = 'bounds_json'").get() as { value: string }).value,
@@ -423,7 +471,7 @@ describe('recall projection schema and build', () => {
     writable.close();
 
     // Rebuild-required, not an error surfaced to a turn.
-    expect(openRecallProjection(live)).toBeNull();
+    expect(openProjectionDb(live, frozenBoundsJson())).toBeNull();
   });
 
   it('S5: an unreadable scanned file fails the build instead of being silently skipped', () => {
@@ -454,14 +502,14 @@ describe('recall projection promote protocol (P2.5-AC8)', () => {
     const root = smallTree();
     const { directory, live } = built(root);
     const before = fs.readFileSync(live);
-    const beforeCandidates = hydrateLane(openRecallProjection(live)!, 'file').length;
+    const beforeCandidates = hydrateLane(openProjectionDb(live, frozenBoundsJson())!, 'file').length;
 
     // Kill the rebuild at its earliest failure point: the tree it reads is gone.
     fs.rmSync(root, { recursive: true, force: true });
     expect(() => buildAndPromoteProjection({ root, directory })).toThrow(/canonical memory tree missing/);
 
     expect(fs.readFileSync(live).equals(before)).toBe(true);
-    const db = openRecallProjection(live);
+    const db = openProjectionDb(live, frozenBoundsJson());
     expect(db).not.toBeNull();
     expect(hydrateLane(db!, 'file')).toHaveLength(beforeCandidates);
     db!.close();
@@ -477,12 +525,14 @@ describe('recall projection promote protocol (P2.5-AC8)', () => {
     const set = buildProjectionCandidates(root);
     const clash: ProjectionCandidate = { ...set.candidates[0]!, scanOrder: set.candidates[0]!.scanOrder };
     const nextPath = path.join(directory, 'index.next-killed.db');
-    expect(() => writeProjection(nextPath, { ...set, candidates: [...set.candidates, clash] })).toThrow();
+    expect(() =>
+      writeProjection(nextPath, { ...set, candidates: [...set.candidates, clash] }, frozenBoundsJson()),
+    ).toThrow();
 
     expect(fs.readFileSync(live).equals(before)).toBe(true);
-    expect(openRecallProjection(live)).not.toBeNull();
+    expect(openProjectionDb(live, frozenBoundsJson())).not.toBeNull();
     // The half-written side file has no completeness marker, so it is absent.
-    expect(openRecallProjection(nextPath)).toBeNull();
+    expect(openProjectionDb(nextPath, frozenBoundsJson())).toBeNull();
   });
 
   it('treats a file renamed into place before its marker committed as absent, not partial', () => {
@@ -501,14 +551,14 @@ describe('recall projection promote protocol (P2.5-AC8)', () => {
     db.close();
     fs.renameSync(markerless, live);
 
-    expect(openRecallProjection(live)).toBeNull();
+    expect(openProjectionDb(live, frozenBoundsJson())).toBeNull();
   });
 
   it('promotes a rebuild by renaming a side file over index.db, not by writing in place', () => {
     const root = smallTree();
     const { directory, live } = built(root);
     const beforeIno = fs.statSync(live).ino;
-    expect(hydrateLane(openRecallProjection(live)!, 'file')).toHaveLength(2);
+    expect(hydrateLane(openProjectionDb(live, frozenBoundsJson())!, 'file')).toHaveLength(2);
 
     writeFile(root, 'concepts/added.md', '# Added\n\nA file the first build never saw.\n');
     buildAndPromoteProjection({ root, directory });
@@ -516,7 +566,7 @@ describe('recall projection promote protocol (P2.5-AC8)', () => {
     // A different inode is the observable signature of promote-by-rename: an
     // in-place rebuild would keep the same file (decision 12).
     expect(fs.statSync(live).ino).not.toBe(beforeIno);
-    const db = openRecallProjection(live);
+    const db = openProjectionDb(live, frozenBoundsJson());
     expect(db).not.toBeNull();
     expect(hydrateLane(db!, 'file').map((row) => row.path)).toEqual([
       'concepts/added.md',
@@ -555,7 +605,7 @@ describe('recall projection promote protocol (P2.5-AC8)', () => {
     const first = buildAndPromoteProjection({ root, directory });
     const second = buildAndPromoteProjection({ root, directory });
     expect(first.path).toBe(second.path);
-    expect(openRecallProjection(second.path)).not.toBeNull();
+    expect(openProjectionDb(second.path, frozenBoundsJson())).not.toBeNull();
   });
 });
 
@@ -589,7 +639,7 @@ describe('recall projection worker-thread build', () => {
     // the build cannot have run in this thread.
     expect(_tokenStreamCacheStatsForTest().size).toBe(0);
 
-    const db = openRecallProjection(result.path);
+    const db = openProjectionDb(result.path, frozenBoundsJson());
     expect(db).not.toBeNull();
     expect(hydrateLane(db!, 'fact')).toHaveLength(2);
     db!.close();

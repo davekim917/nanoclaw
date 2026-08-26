@@ -42,6 +42,7 @@ vi.mock('../../message-archive.js', async (importOriginal) => {
 });
 
 import {
+  _resetRecallProjectionForTest,
   _resetTokenStreamCacheForTest,
   _tokenStreamCacheStatsForTest,
   boundedCapabilities,
@@ -50,6 +51,7 @@ import {
   evaluateRecallCorpus,
   PRE_TURN_BOUNDS,
   tokenizeForRecall,
+  warmRecallProjection,
   type ContextNotice,
   type ConversationEvidenceExcerpt,
   type MemoryEvidenceExcerpt,
@@ -58,6 +60,7 @@ import {
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { probeGraphScentWarmth, _resetGraphScentForTest } from './graph-scent.js';
 import { WorkgroupGraphStore } from '../../graphify/store.js';
+import { buildAndPromoteProjection, projectionDir } from './recall-projection.js';
 import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
 import { GENERATED_MEMORY_MAX_BYTES } from './curator-contract.js';
@@ -2134,7 +2137,77 @@ describe('per-build structured log line (recall latency instrumentation)', () =>
     // Counts and timings only - never the recalled memory or conversation text.
     expect(JSON.stringify(fields)).not.toContain('Deploy pipeline');
     expect(JSON.stringify(fields)).not.toContain('pipeline');
+    // Which source served the turn (P2.5-AC20). No projection exists here.
+    expect(fields.recallPath).toBe('cold');
+    expect(fields.recallReason).toBe('absent');
 
     debugSpy.mockRestore();
   });
+
+  // P2.5-AC20: the same line has to name the projection when the projection is
+  // what served the turn, and carry THAT source's candidate counts.
+  it('names the recall projection and its candidate counts when the projection serves the turn', () => {
+    memoryFile(
+      'generated/memory.md',
+      '# Generated workgroup memory\n\n- Deploy pipeline runs nightly.\n- Deploy pipeline retries on failure.\n',
+    );
+    memoryFile('projects/deploy.md', '# Deploy pipeline\nThe deploy pipeline retries failed jobs automatically.');
+    memoryFile('projects/unrelated.md', '# Unrelated\nNothing about the query at all, only prose about gardening.');
+
+    const root = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory');
+    buildAndPromoteProjection({ root, directory: projectionDir('wg-a', TEST_ROOT) });
+    _resetRecallProjectionForTest();
+    expect(warmRecallProjection('wg-a', root)).toMatchObject({ warm: true });
+
+    const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
+    buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'deploy pipeline' }),
+    });
+    const fields = debugSpy.mock.calls.find(([msg]) => msg === 'pre-turn-context: build')![1] as Record<
+      string,
+      unknown
+    >;
+    debugSpy.mockRestore();
+    _resetRecallProjectionForTest();
+
+    expect(fields.recallPath).toBe('hit');
+    expect(fields.recallReason).toBe('projection');
+    expect(fields.factCandidates).toBe(2);
+    // The term prefilter drops the unrelated file, so the count is the
+    // projection's, not the walk's two.
+    expect(fields.fileCandidates).toBe(1);
+    expect(JSON.stringify(fields)).not.toContain('pipeline');
+  });
+});
+
+it('test_sanitizer_passes_expiresAt_through_to_trustedCapabilities', () => {
+  CAPABILITY_FIXTURE.services = [
+    {
+      name: 'GitHub',
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      activation: 'pre-authenticated',
+      expiresAt: '2026-08-25T12:00:00.000Z',
+    },
+  ];
+  try {
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      kind: 'chat',
+      trigger: 1 as const,
+      normalizedContent: '{"text":"what services"}',
+      sessionId: 'sess-a',
+    });
+    const gh = result.trustedCapabilities?.services.find((s) => s.name === 'GitHub');
+    // Round-1 blocker regression guard: the pre-turn sanitizer whitelist used
+    // to strip expiresAt, so agents never saw the TTL the host intended.
+    expect(gh?.expiresAt).toBe('2026-08-25T12:00:00.000Z');
+  } finally {
+    CAPABILITY_FIXTURE.services = null;
+  }
 });

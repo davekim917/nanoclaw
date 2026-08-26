@@ -1065,3 +1065,31 @@ in isolated worktrees; the shared checkout serves ~20 other agent sessions.
 Standing operator directive for this build: run opencode
 (`opencode-go/ox-alpha-free`, `OPENCODE_EFFORT=max`) adversarial checks against the
 implementation as it is built, not only at the `/team-review` gate.
+
+## P2.5 open items — PRE-ACTIVATION BLOCKERS for step 7 (2026-08-25)
+
+What merges to `main` today is the performance work (`canonicalToken` memo, hit-list
+ranking, archive covering index, `rowid ASC` total order — warm p50 804ms → 484ms,
+byte-identical across 14 whole-turn runs). **The recall projection itself ships DORMANT**:
+nothing builds one, verified exhaustively by Codex across host-sweep, startup, setup,
+migrations, scripts, cron, barrels and dynamic imports.
+
+The following are known and unfixed. They are **blockers on activating step 7 (the builder
+hook)** — not on this merge, because a projection that is never built cannot serve a turn.
+Clear each one, or consciously accept it, before step 7 is switched on.
+
+- **Codex #1 — staleness evasion.** Content replacement with the same size, inode and
+  `mtimeNs` passes `projectionTreeStaleness`, so the turn is served from a stale projection
+  under a clean `hit`.
+- **Codex #2 — wrong-but-valid stream.** A structurally valid but semantically wrong
+  persisted stream yields `recallPath:"hit"` with zero excerpts: no error, no fallback,
+  silently degraded recall.
+- **Codex #4 — AC11 is vacuous.** The test never exercises its stated low-ranked candidate,
+  because `excerpts` is already capped before that candidate is reached.
+- **Codex #5 — fingerprint gap.** The tokenizer fingerprint admits rule changes that no
+  probe covers (the file's own comment states this; it is a convention, not a guard).
+- **Codex #6 — AC9 spies too shallowly.** It asserts only on `exec`, so an empty
+  BEGIN/COMMIT around no work would pass it.
+- **Codex Q1 residual — invisible `lengths[]` corruption.** Corrupting a `lengths[]` element
+  cannot be detected: partitioning reads only `token.start` and scoring never reads
+  `token.end`.

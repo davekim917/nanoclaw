@@ -53,8 +53,9 @@
 import fs from 'fs';
 import path from 'path';
 
-import { PARK_GRACE_MS, readClaims, type BoardClaim } from '../../claims-board.js';
+import { MAX_CLAIM_BYTES, PARK_GRACE_MS, readClaims, resolveClaimsDir, type BoardClaim } from '../../claims-board.js';
 import { SELF_HEAL_ENABLED, SELF_HEAL_TAKEOVER_ENABLED } from '../../config.js';
+import { readContainedFile } from '../../dashboard/api/attention-fs.js';
 import { log } from '../../log.js';
 import { claimsBaseDir, declaresItselfFinished } from './escalation.js';
 
@@ -443,12 +444,66 @@ function listWorkgroupDirs(root: string): string[] {
   }
 }
 
-/** Atomic tmp+rename, the same convention claim.sh itself writes with. */
-function stampClaim(file: string, patch: Record<string, unknown>): void {
-  const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
-  const tmp = path.join(path.dirname(file), `.tmp.${path.basename(file)}.${process.pid}-${Date.now()}`);
+/**
+ * One resolve-then-read of a claim by slug, safe against the same hazards for
+ * every caller: a FIFO, a directory, a device node, an oversized file, or one
+ * symlinked out of the workgroup's own `claims/`. Never throws; returns
+ * `null` for all of the above — logged here for a bad DIRECTORY, by
+ * `readContainedFile` itself for a bad FILE. Callers decide what "cannot read
+ * this claim right now" means for them (see `sweepClaimsSelfHeal` vs
+ * `stampClaim`, which disagree on exactly that).
+ *
+ * `dir` is resolved FRESH on every call, never passed in and reused: a value
+ * proven safe before an `await` only narrows the swap window an agent with
+ * write access to `claims/` could exploit, it does not close it. Both the
+ * classification re-read and the write-back stamp go through this one
+ * function so they can never diverge on the containment logic or the size
+ * cap — two numbers, or two resolution algorithms, for one file is its own
+ * bug.
+ */
+function resolveAndReadClaim(
+  label: string,
+  root: string,
+  workgroupId: string,
+  slug: string,
+): { file: string; text: string } | null {
+  const dir = resolveClaimsDir(root, workgroupId);
+  if (dir === null) {
+    log.warn(`${label}: claims directory unreadable or escapes the workgroup, skipping`, { workgroupId, slug });
+    return null;
+  }
+  const read = readContainedFile(label, dir, `${slug}.json`, workgroupId, MAX_CLAIM_BYTES);
+  if (read === null) return null; // already logged by readContainedFile — FIFO, oversized, escaping, or absent
+  return { file: path.join(dir, `${slug}.json`), text: read.text };
+}
+
+/**
+ * Atomic tmp+rename, the same convention claim.sh itself writes with.
+ *
+ * Unlike the classification re-read, an unreadable claim here is NOT a safe
+ * skip. Every call site below reaches this AFTER the thing the stamp exists
+ * to remember has already happened — a nudge already sent, an escalation
+ * already fired, a rung already spent — so silently dropping the stamp would
+ * make the NEXT scan re-decide the same rung from nothing: re-nudging or
+ * re-escalating every ~10 minutes instead of once. There is nowhere else to
+ * persist that fact (no new schema — the claim file IS the ladder's memory),
+ * so this THROWS on a hostile or missing file instead, exactly as a raw
+ * `readFileSync`/`JSON.parse` on a deleted or corrupted claim already did
+ * before this seam existed. `host-sweep.ts` already catches it ("Claims
+ * self-heal sweep step failed"), logs once, and the next throttled scan tries
+ * again. What changes is only HOW a hostile file gets there: a FIFO used to
+ * hang this open forever; now it throws immediately instead, same as any
+ * other unreadable claim always has.
+ */
+function stampClaim(root: string, workgroupId: string, slug: string, patch: Record<string, unknown>): void {
+  const found = resolveAndReadClaim('self-heal stamp', root, workgroupId, slug);
+  if (found === null) {
+    throw new Error(`self-heal: cannot stamp claim ${workgroupId}/${slug} — unreadable or escapes the workgroup`);
+  }
+  const raw = JSON.parse(found.text) as Record<string, unknown>;
+  const tmp = path.join(path.dirname(found.file), `.tmp.${path.basename(found.file)}.${process.pid}-${Date.now()}`);
   fs.writeFileSync(tmp, JSON.stringify({ ...raw, ...patch }, null, 2));
-  fs.renameSync(tmp, file);
+  fs.renameSync(tmp, found.file);
 }
 
 interface WiredCandidate {
@@ -773,12 +828,23 @@ export async function sweepClaimsSelfHeal(
   for (const workgroupId of listWorkgroupDirs(root)) {
     for (const claim of readClaims(workgroupId, now, root)) {
       if (claim.state !== 'stale') continue;
-      const file = path.join(root, workgroupId, 'claims', `${claim.slug}.json`);
+
+      // Re-reads the SAME claim `readClaims` just classified, moments
+      // earlier — every property of the file on disk (FIFO, directory,
+      // symlinked elsewhere, oversized) is still an agent's choice right up
+      // to this line, so this goes through `resolveAndReadClaim` (fresh
+      // directory resolution + `readContainedFile`) rather than reusing
+      // anything `readClaims` already proved safe a moment ago. A skip here
+      // costs nothing: no decision has been made yet, so the claim is simply
+      // picked up again on the next scan.
+      const found = resolveAndReadClaim('self-heal', root, workgroupId, claim.slug);
+      if (found === null) continue; // already logged — directory or file, see resolveAndReadClaim
+
       let raw: SelfHealStamps & { note?: unknown };
       try {
-        raw = JSON.parse(fs.readFileSync(file, 'utf8')) as SelfHealStamps & { note?: unknown };
+        raw = JSON.parse(found.text) as SelfHealStamps & { note?: unknown };
       } catch (err) {
-        log.warn('self-heal: unparseable claim, skipping', { file, err });
+        log.warn('self-heal: unparseable claim, skipping', { file: found.file, err });
         continue;
       }
 
@@ -788,7 +854,7 @@ export async function sweepClaimsSelfHeal(
       const outcome = await applyDecision({
         workgroupId,
         claim,
-        file,
+        root,
         decision,
         now,
         enabled,
@@ -806,7 +872,7 @@ export async function sweepClaimsSelfHeal(
 async function applyDecision(args: {
   workgroupId: string;
   claim: BoardClaim;
-  file: string;
+  root: string;
   decision: SelfHealDecision;
   now: number;
   enabled: boolean;
@@ -815,7 +881,7 @@ async function applyDecision(args: {
   resolveSibling: NonNullable<SelfHealDeps['resolveSibling']>;
   createTask: NonNullable<SelfHealDeps['createTask']>;
 }): Promise<SelfHealOutcome> {
-  const { workgroupId, claim, file, decision, now, enabled, takeoverEnabled } = args;
+  const { workgroupId, claim, root, decision, now, enabled, takeoverEnabled } = args;
   const base = { workgroupId, slug: claim.slug, action: decision.action, reason: decision.reason };
 
   // Terminal rung: no delivery, just the stamp that stops the ladder re-running.
@@ -824,7 +890,7 @@ async function applyDecision(args: {
       log.info('self-heal: would exhaust stale claim', { class: 'stale-claim', ...base });
       return { ...base, applied: false };
     }
-    stampClaim(file, { auto_heal_exhausted_at: new Date(now).toISOString() });
+    stampClaim(root, workgroupId, claim.slug, { auto_heal_exhausted_at: new Date(now).toISOString() });
     log.warn('self-heal: stale claim exhausted — left red on the board', { class: 'stale-claim', ...base });
     return { ...base, applied: true };
   }
@@ -843,7 +909,7 @@ async function applyDecision(args: {
     // The stamp is what keeps that ONE line from becoming one per scan forever
     // — it backs the claim off for a day without spending a nudge. Shadow mode
     // stamps nothing, so a dry run still reports the full picture every scan.
-    if (enabled) stampClaim(file, { auto_heal_unresolved_at: new Date(now).toISOString() });
+    if (enabled) stampClaim(root, workgroupId, claim.slug, { auto_heal_unresolved_at: new Date(now).toISOString() });
     log.warn('self-heal: no deliverable target for stale claim', { class: 'stale-claim', ...base });
     return { ...base, applied: false, reason: decision.action === 'takeover' ? 'no-sibling' : 'owner-unresolved' };
   }
@@ -882,7 +948,9 @@ async function applyDecision(args: {
   // `effectiveState` reads exhaustion through that timestamp — without it the
   // stamp is invisible and the one-shot escalation would repeat every day.
   stampClaim(
-    file,
+    root,
+    workgroupId,
+    claim.slug,
     decision.action === 'escalate-human'
       ? { auto_nudged_at: new Date(now).toISOString(), auto_heal_exhausted_at: new Date(now).toISOString() }
       : {

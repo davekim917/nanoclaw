@@ -6,7 +6,14 @@ import { touchHeartbeat } from '../db/connection.js';
 import { evaluateManagedGitCommand } from '../managed-git-guard.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from '../providers/secret-env.js';
 
-const SCRIPT_TIMEOUT_MS = 30_000;
+// Pre-task scripts get 120s by default (env-overridable). The old flat 30s
+// killed a working 56s watcher script eight times in a row on 2026-08-22,
+// which auto-paused the series and left the board blind for ~6h the day
+// before a release. A script that truly hangs still dies here — just later.
+const SCRIPT_TIMEOUT_MS = (() => {
+  const parsed = Number.parseInt(process.env.NANOCLAW_TASK_SCRIPT_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120_000;
+})();
 const SCRIPT_MAX_BUFFER = 1024 * 1024;
 
 export interface ScriptResult {

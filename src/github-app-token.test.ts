@@ -12,7 +12,14 @@ import path from 'path';
 
 import type { ContainerConfig } from './container-config.js';
 import { resolveGitHubToken } from './container-runner.js';
-import { GITHUB_APP_SENTINEL, clearGitHubAppTokenCache, resolveGitHubAppToken } from './github-app-token.js';
+import {
+  GITHUB_APP_SENTINEL,
+  clearGitHubAppTokenCache,
+  mintOrReuseGitHubAppToken,
+  peekGitHubAppTokenExpiry,
+  refreshExpiringGitHubAppTokens,
+  resolveGitHubAppToken,
+} from './github-app-token.js';
 
 const INSTALLATION_ID = '155749655';
 
@@ -189,5 +196,93 @@ describe('resolveGitHubToken', () => {
     await expect(resolveGitHubToken('group-a', { githubTokenEnv: 'CUSTOM_GH' } as ContainerConfig)).resolves.toBe(
       'ghp_custom',
     );
+  });
+});
+
+describe('mintOrReuseGitHubAppToken / peek / proactive refresh', () => {
+  beforeEach(() => clearGitHubAppTokenCache());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('returns expiry alongside the token on mint and cache hit', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mintResponse('ghs_a', 30 * 60 * 1000)));
+    const first = await mintOrReuseGitHubAppToken(appEnv());
+    expect(first?.token).toBe('ghs_a');
+    expect(new Date(first!.expiresAtMs).getTime()).toBeGreaterThan(Date.now());
+
+    // Cache hit: no second fetch, same info.
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const second = await mintOrReuseGitHubAppToken(appEnv());
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(second).toEqual(first);
+
+    // Peek sees the cache without network.
+    expect(peekGitHubAppTokenExpiry(appEnv())).toBe(new Date(first!.expiresAtMs).toISOString());
+    expect(peekGitHubAppTokenExpiry({} as NodeJS.ProcessEnv)).toBeUndefined();
+  });
+
+  it('refreshExpiringGitHubAppTokens re-mints only tokens inside the margin', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mintResponse('ghs_old', 30 * 60 * 1000)));
+    await mintOrReuseGitHubAppToken(appEnv());
+
+    // Fresh token, far from expiry: no-op, zero mints, fetch untouched.
+    const idle = vi.fn();
+    vi.stubGlobal('fetch', idle);
+    await expect(refreshExpiringGitHubAppTokens(appEnv())).resolves.toBe(0);
+    expect(idle).not.toHaveBeenCalled();
+
+    // Force the cached token inside the refresh margin: re-mints and replaces it.
+    clearGitHubAppTokenCache();
+    vi.stubGlobal(
+      'fetch',
+      // A 5-min-life token is inside the 10-min refresh margin the moment it
+      // is cached, so the sweep must re-mint it.
+      vi.fn().mockResolvedValue(mintResponse('ghs_soon', 5 * 60 * 1000)),
+    );
+    await mintOrReuseGitHubAppToken(appEnv());
+    // A 5-min-life token is already inside the 10-min refresh margin the moment
+    // it is cached, so the sweep must re-mint it.
+    const refreshMock = vi.fn().mockResolvedValue(mintResponse('ghs_new', 60 * 60 * 1000));
+    vi.stubGlobal('fetch', refreshMock);
+    await expect(refreshExpiringGitHubAppTokens(appEnv())).resolves.toBe(1);
+    await expect(mintOrReuseGitHubAppToken(appEnv())).resolves.toMatchObject({ token: 'ghs_new' });
+  });
+
+  it('refreshExpiringGitHubAppTokens swallows mint failures and keeps the old token', async () => {
+    clearGitHubAppTokenCache();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mintResponse('ghs_soon2', 5 * 60 * 1000)));
+    await mintOrReuseGitHubAppToken(appEnv());
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('nope', { status: 500 })));
+    await expect(refreshExpiringGitHubAppTokens(appEnv())).resolves.toBe(0);
+    await expect(mintOrReuseGitHubAppToken(appEnv())).resolves.toMatchObject({ token: 'ghs_soon2' });
+  });
+});
+
+describe('mint dedup', () => {
+  beforeEach(() => clearGitHubAppTokenCache());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('concurrent spawn + refresh mints share one network call', async () => {
+    clearGitHubAppTokenCache();
+    // Seed the cache with an inside-the-margin token: now BOTH a consumer
+    // resolve and the proactive sweep want to re-mint simultaneously, and
+    // the in-flight map must collapse those two wants into one fetch.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(mintResponse('ghs_seed', 5 * 60 * 1000)));
+    await mintOrReuseGitHubAppToken(appEnv());
+
+    const fetchMock = vi.fn(async () => mintResponse('ghs_shared', 60 * 60 * 1000));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const [resolved, refreshed] = await Promise.all([
+      mintOrReuseGitHubAppToken(appEnv()),
+      refreshExpiringGitHubAppTokens(appEnv()),
+    ]);
+
+    expect(resolved?.token).toBe('ghs_shared');
+    expect(refreshed).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // Settled cache now serves the shared token without further network.
+    await expect(mintOrReuseGitHubAppToken(appEnv())).resolves.toMatchObject({ token: 'ghs_shared' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

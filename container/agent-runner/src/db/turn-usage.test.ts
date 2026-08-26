@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { configureOutboundDb, initTestSessionDb, openOutboundDb } from './connection.js';
-import { getTurnUsageRows, recordTurnUsage, _resetClaudeCumulativeTrackingForTesting } from './turn-usage.js';
+import { configureOutboundDb, getOutboundDb, initTestSessionDb, openOutboundDb } from './connection.js';
+import { getTurnUsageRows, recordTurnUsage, _resetCumulativeTrackingForTesting } from './turn-usage.js';
 
 const tempDirs: string[] = [];
 
@@ -26,11 +26,11 @@ afterEach(() => {
 describe('turn_usage — insert helper', () => {
   beforeEach(() => {
     initTestSessionDb();
-    // The cumulative->delta tracking map (see toClaudeTurnDelta) is
+    // The cumulative->delta tracking map (see toTurnDelta) is
     // module-level state, so it survives across `it` blocks unless reset —
     // without this, a model name reused in a later test would see a
     // leftover "last" value from an earlier test and compute a bogus delta.
-    _resetClaudeCumulativeTrackingForTesting();
+    _resetCumulativeTrackingForTesting();
   });
 
   it('writes a row readable back with the given fields', () => {
@@ -82,13 +82,13 @@ describe('turn_usage — insert helper', () => {
   });
 
   it('writes one row per call, preserving insertion order', () => {
-    // Provider is 'codex', not 'claude' — this test is about row ordering,
-    // not usage math, and the Claude-only cumulative->delta transform (see
-    // toClaudeTurnDelta) would otherwise turn this monotonic 1,2,3 sequence
-    // into deltas, coupling an unrelated test to that behavior.
-    recordTurnUsage('codex', { inputTokens: 1 });
-    recordTurnUsage('codex', { inputTokens: 2 });
-    recordTurnUsage('codex', { inputTokens: 3 });
+    // Provider is 'opencode' — the only one NOT on the cumulative->delta path
+    // (see toTurnDelta). This test is about row ordering, not usage math, and
+    // claude/codex would turn this monotonic 1,2,3 sequence into deltas,
+    // coupling an unrelated test to that behavior.
+    recordTurnUsage('opencode', { inputTokens: 1 });
+    recordTurnUsage('opencode', { inputTokens: 2 });
+    recordTurnUsage('opencode', { inputTokens: 3 });
 
     const rows = getTurnUsageRows();
     expect(rows.map((r) => r.input_tokens)).toEqual([1, 2, 3]);
@@ -100,8 +100,22 @@ describe('turn_usage — insert helper', () => {
     // Sonnet subagent) — each model gets its own row instead of collapsing
     // under a NULL model.
     const usageByModel = [
-      { model: 'claude-opus-5', inputTokens: 1000, outputTokens: 200, cacheReadTokens: 50, cacheWriteTokens: 10, costUsd: 0.5 },
-      { model: 'claude-sonnet-5', inputTokens: 3000, outputTokens: 800, cacheReadTokens: 20, cacheWriteTokens: 5, costUsd: 0.3 },
+      {
+        model: 'claude-opus-5',
+        inputTokens: 1000,
+        outputTokens: 200,
+        cacheReadTokens: 50,
+        cacheWriteTokens: 10,
+        costUsd: 0.5,
+      },
+      {
+        model: 'claude-sonnet-5',
+        inputTokens: 3000,
+        outputTokens: 800,
+        cacheReadTokens: 20,
+        cacheWriteTokens: 5,
+        costUsd: 0.3,
+      },
     ];
     for (const usage of usageByModel) recordTurnUsage('claude', usage);
 
@@ -148,10 +162,10 @@ describe('turn_usage — insert helper', () => {
   });
 });
 
-describe('turn_usage — Claude cumulative-usage delta fix', () => {
+describe('turn_usage — cumulative-usage delta fix (Claude + Codex)', () => {
   beforeEach(() => {
     initTestSessionDb();
-    _resetClaudeCumulativeTrackingForTesting();
+    _resetCumulativeTrackingForTesting();
   });
 
   it('records the DELTA for a synthetic monotonic (stream-cumulative) sequence', () => {
@@ -191,10 +205,22 @@ describe('turn_usage — Claude cumulative-usage delta fix', () => {
     ]);
   });
 
-  it('does NOT apply the delta transform to other providers (Codex/OpenCode already report per-turn values)', () => {
+  // Contract change 2026-08-25: codex USED to be excluded here, on the
+  // (wrong) reading that `tokenUsage.last` was per-turn. It is per-REQUEST,
+  // and codex.ts now reports the thread-cumulative `total`, so codex belongs
+  // on the delta path with claude.
+  it('applies the delta transform to codex (thread-cumulative `total`)', () => {
     const model = 'gpt-5.6-sol';
     recordTurnUsage('codex', { model, inputTokens: 1000 });
-    recordTurnUsage('codex', { model, inputTokens: 1500 }); // a genuinely bigger turn, NOT cumulative
+    recordTurnUsage('codex', { model, inputTokens: 1500 });
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => r.input_tokens)).toEqual([1000, 500]);
+  });
+
+  it('does NOT apply the delta transform to opencode (its provider already sums per-turn)', () => {
+    const model = 'opencode-go/kimi-k2.7';
+    recordTurnUsage('opencode', { model, inputTokens: 1000 });
+    recordTurnUsage('opencode', { model, inputTokens: 1500 }); // a genuinely bigger turn, NOT cumulative
     const rows = getTurnUsageRows();
     expect(rows.map((r) => r.input_tokens)).toEqual([1000, 1500]);
   });
@@ -206,6 +232,159 @@ describe('turn_usage — Claude cumulative-usage delta fix', () => {
     const rows = getTurnUsageRows();
     expect(rows[0]).toMatchObject({ input_tokens: 1000, output_tokens: null });
     expect(rows[1]).toMatchObject({ input_tokens: null, output_tokens: 300 });
+  });
+
+  it('treats a reset as ONE decision for the whole row — no field taken raw while another is deltaed', () => {
+    const model = 'claude-opus-5';
+    recordTurnUsage('claude', { model, inputTokens: 1_000_000, outputTokens: 500 }, undefined, 'sess-a');
+    // A new SDK stream: input restarted BELOW the old total, output happens to
+    // land above it. Per-field reset detection produced input=900000 (raw,
+    // reset detected) and output=100 (delta) in the SAME row.
+    recordTurnUsage('claude', { model, inputTokens: 900_000, outputTokens: 600 }, undefined, 'sess-a');
+    const rows = getTurnUsageRows();
+    expect(rows[1]).toMatchObject({ input_tokens: 900_000, output_tokens: 600 });
+  });
+
+  it('does not subtract across accounting scopes — a new continuation starts a fresh baseline', () => {
+    const model = 'claude-opus-5';
+    recordTurnUsage('claude', { model, inputTokens: 1_000_000 }, undefined, 'sess-a');
+    // Different SDK session. Its first report is ABOVE the previous scope's
+    // stored total, so the decrease check cannot see the boundary — only the
+    // scope key can. Keyed by model alone this recorded 100000.
+    recordTurnUsage('claude', { model, inputTokens: 1_100_000 }, undefined, 'sess-b');
+    recordTurnUsage('claude', { model, inputTokens: 1_150_000 }, undefined, 'sess-b');
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => r.input_tokens)).toEqual([1_000_000, 1_100_000, 50_000]);
+  });
+
+  it('records a 0 delta (not the raw total) when a running total is unchanged', () => {
+    const model = 'claude-opus-5';
+    recordTurnUsage('claude', { model, inputTokens: 900, cacheWriteTokens: 4000 }, undefined, 'sess-a');
+    // Same stream, next turn wrote no new cache: the cumulative cache-write
+    // is identical. That is 0 tokens this turn, not another 4000.
+    recordTurnUsage('claude', { model, inputTokens: 1200, cacheWriteTokens: 4000 }, undefined, 'sess-a');
+    const rows = getTurnUsageRows();
+    expect(rows[1]).toMatchObject({ input_tokens: 300, cache_write_tokens: 0 });
+  });
+
+  it('deltas a codex thread total across turns and re-baselines on a new thread', () => {
+    const model = 'gpt-5.6-sol';
+    // Real consecutive `total_token_usage` values from a codex 0.145.0
+    // rollout log; the differences are that turn's own usage.
+    const scope = 'thread-1';
+    recordTurnUsage('codex', { model, inputTokens: 8_116_919, outputTokens: 25_671 }, undefined, scope);
+    recordTurnUsage('codex', { model, inputTokens: 8_244_310, outputTokens: 25_827 }, undefined, scope);
+    recordTurnUsage('codex', { model, inputTokens: 8_373_916, outputTokens: 32_687 }, undefined, scope);
+    // New thread — cumulative restarts, and the scope key says so.
+    recordTurnUsage('codex', { model, inputTokens: 120_000, outputTokens: 900 }, undefined, 'thread-2');
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => [r.input_tokens, r.output_tokens])).toEqual([
+      [8_116_919, 25_671],
+      [127_391, 156],
+      [129_606, 6_860],
+      [120_000, 900],
+    ]);
+  });
+
+  it('keeps codex`s baseline across a mid-thread model switch (its total is thread-wide, not per-model)', () => {
+    // `-m` mid-thread reopens the query against the SAME codex thread, so the
+    // thread total keeps climbing under a new model label. Keying the memo per
+    // model would lose the baseline and re-record the whole thread total.
+    recordTurnUsage('codex', { model: 'gpt-5.6-sol', inputTokens: 1_000_000 }, undefined, 'thread-1');
+    recordTurnUsage('codex', { model: 'gpt-5.6-codex', inputTokens: 1_040_000 }, undefined, 'thread-1');
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => [r.model, r.input_tokens])).toEqual([
+      ['gpt-5.6-sol', 1_000_000],
+      ['gpt-5.6-codex', 40_000],
+    ]);
+  });
+
+  it('keeps claude`s per-model baselines separate (its SDK counts modelUsage per model)', () => {
+    recordTurnUsage('claude', { model: 'claude-opus-5', inputTokens: 1_000_000 }, undefined, 'sess-a');
+    recordTurnUsage('claude', { model: 'claude-sonnet-5', inputTokens: 50_000 }, undefined, 'sess-a');
+    recordTurnUsage('claude', { model: 'claude-opus-5', inputTokens: 1_010_000 }, undefined, 'sess-a');
+    // Sonnet's 50k must not become Opus's baseline, and vice versa.
+    expect(getTurnUsageRows().map((r) => [r.model, r.input_tokens])).toEqual([
+      ['claude-opus-5', 1_000_000],
+      ['claude-sonnet-5', 50_000],
+      ['claude-opus-5', 10_000],
+    ]);
+  });
+
+  it('does not lose a turn`s tokens when its INSERT fails — the baseline only advances on a written row', () => {
+    const model = 'claude-opus-5';
+    recordTurnUsage('claude', { model, inputTokens: 1_000_000 }, undefined, 'sess-a');
+
+    // Force the next INSERT to fail the way a real one would (recordTurnUsage
+    // swallows the error by contract — it must never fail the turn it meters).
+    getOutboundDb().exec('ALTER TABLE turn_usage RENAME TO turn_usage_hidden');
+    recordTurnUsage('claude', { model, inputTokens: 1_400_000 }, undefined, 'sess-a'); // 400k, lost to the failed write
+    getOutboundDb().exec('ALTER TABLE turn_usage_hidden RENAME TO turn_usage');
+
+    recordTurnUsage('claude', { model, inputTokens: 1_500_000 }, undefined, 'sess-a');
+
+    // The surviving row must cover BOTH the failed turn and this one
+    // (1,500,000 - 1,000,000). Advancing the memo before the write recorded
+    // 100,000 here and lost the other 400,000 permanently.
+    expect(getTurnUsageRows().map((r) => r.input_tokens)).toEqual([1_000_000, 500_000]);
+  });
+});
+
+describe('turn_usage — phantom "listed but unused" model rows', () => {
+  beforeEach(() => {
+    initTestSessionDb();
+    _resetCumulativeTrackingForTesting();
+  });
+
+  it('skips a cumulative-provider model whose running total did not move this turn', () => {
+    const zero = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
+    // Turn 1: both models really ran.
+    recordTurnUsage('claude', { model: 'opus', ...zero, inputTokens: 1000 }, undefined, 'sess-a');
+    recordTurnUsage('claude', { model: 'haiku', ...zero, inputTokens: 40 }, undefined, 'sess-a');
+    // Turn 2: only opus ran, but the SDK still lists haiku at its old total.
+    recordTurnUsage('claude', { model: 'opus', ...zero, inputTokens: 3000 }, undefined, 'sess-a');
+    recordTurnUsage('claude', { model: 'haiku', ...zero, inputTokens: 40 }, undefined, 'sess-a');
+
+    const rows = getTurnUsageRows();
+    expect(rows.map((r) => [r.model, r.input_tokens])).toEqual([
+      ['opus', 1000],
+      ['haiku', 40],
+      ['opus', 2000],
+    ]);
+  });
+
+  it('still records an all-zero row that carries cost — a real turn whose token counters were missed', () => {
+    // Live case (2026-08-25): a claude row with four explicit zeros and
+    // cost_usd 2.25. Dropping it would delete $2.25 of spend from the ledger.
+    recordTurnUsage(
+      'claude',
+      { model: 'sonnet', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 2.25 },
+      undefined,
+      'sess-a',
+    );
+    expect(getTurnUsageRows().map((r) => r.cost_usd)).toEqual([2.25]);
+  });
+
+  it('still records a turn whose provider reported nothing at all (NULLs, not zeros)', () => {
+    recordTurnUsage('claude', { model: 'opus' }, undefined, 'sess-a');
+    const rows = getTurnUsageRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].input_tokens).toBeNull();
+  });
+
+  it('still records an all-zero turn from a NON-cumulative provider — that is a real reading, not a stale listing', () => {
+    // OpenCode sums a per-message map at the provider, so its zero means "this
+    // turn genuinely consumed nothing measurable". Live data has one such turn;
+    // hiding it would tidy away a provider coverage gap.
+    recordTurnUsage('opencode', {
+      model: 'opencode-go/ox-alpha-free',
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0,
+    });
+    expect(getTurnUsageRows()).toHaveLength(1);
   });
 });
 
@@ -283,7 +462,14 @@ describe('turn_usage — table creation (real files, not the in-memory test mode
     const colsAfter = new Set(
       (reopened.prepare("PRAGMA table_info('turn_usage')").all() as Array<{ name: string }>).map((c) => c.name),
     );
-    for (const c of ['steps', 'duration_ms', 'trigger', 'rate_limit_type', 'rate_limit_utilization', 'rate_limit_resets_at']) {
+    for (const c of [
+      'steps',
+      'duration_ms',
+      'trigger',
+      'rate_limit_type',
+      'rate_limit_utilization',
+      'rate_limit_resets_at',
+    ]) {
       expect(colsAfter.has(c)).toBe(true);
     }
     reopened.close();

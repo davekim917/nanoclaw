@@ -722,7 +722,7 @@ classified — an MCP server that can delete data executes on its own authority 
 This is a deliberate boundary, not a gap to patch with string matching: MCP tools are
 **trusted by registration, not by call**. The enforcement point is `add_mcp_server` being
 HOLD-gated (admin approval per server, above) plus the review of what each approved server
-can do — so approve a server for what its *worst* tool can do, not its typical use. Adding
+can do — so approve a server for what its _worst_ tool can do, not its typical use. Adding
 per-call classification of MCP arguments would give false safety: arguments are opaque
 JSON with server-specific semantics, and a classifier that can't see meaning can't gate it.
 
@@ -767,7 +767,7 @@ Handled via the `send_file` MCP tool (see above). The agent explicitly decides t
 For `task` kind messages with a `script` field in the content:
 
 1. Agent-runner writes the script to a temp file
-2. Executes with `bash` (30s timeout)
+2. Executes with `bash` (timeout: `NANOCLAW_TASK_SCRIPT_TIMEOUT_MS`, default 120s — the flat 30s it replaced killed a working 56s watcher script into an auto-pause; host path shares the same knob via `config.TASK_SCRIPT_TIMEOUT_MS`)
 3. Parses last line of stdout as JSON: `{ wakeAgent: boolean, data?: unknown }`
 4. If `wakeAgent === false`: mark message as completed, don't invoke the provider
 5. If `wakeAgent === true`: enrich the prompt with script output, then invoke the provider
