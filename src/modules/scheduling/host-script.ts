@@ -44,6 +44,13 @@ import { TASK_SCRIPT_TIMEOUT_MS } from '../../config.js';
 // Centralized in config.ts so .env actually reaches it (import-order trap).
 const SCRIPT_TIMEOUT_MS = TASK_SCRIPT_TIMEOUT_MS;
 const SCRIPT_MAX_BUFFER = 1024 * 1024;
+// Fraction of the ceiling past which a host-gated script is reported as no
+// longer fitting the fast path. Half leaves the "with margin" the admission
+// rule asks for: a script routinely at 50% of its ceiling has no headroom for
+// a slow upstream, and the next slow day turns it into a timeout — which,
+// because timeouts count as failures, walks the series toward the 8-strike
+// absorbing auto-pause (recurrence.ts SCRIPT_FAIL_PAUSE_CAP).
+const HOST_SCRIPT_BUDGET_WARN_RATIO = 0.5;
 
 export interface ScriptResult {
   wakeAgent: boolean;
@@ -167,6 +174,7 @@ export function runHostScript(script: string, taskId: string): Promise<ScriptRes
     }
   };
 
+  const startedAtMs = Date.now();
   return new Promise((resolve) => {
     let settled = false;
     let overflowed = false;
@@ -252,6 +260,34 @@ export function runHostScript(script: string, taskId: string): Promise<ScriptRes
       settled = true;
       clearTimeout(softTimeout);
       clearTimeout(hardDeadline);
+      // ADMISSION-RULE INSTRUMENTATION. `scriptHost` is a fast-path privilege,
+      // not a free one: these run SEQUENTIALLY inside the awaited sweep
+      // (host-sweep.ts's `for (const session of sessions) await sweepSession`),
+      // so every second here is a second the fleet's only timer is late for
+      // every other session — processing_ack sync, stale detection, due wakes,
+      // ceiling accountability. Measured over ~10.9k ticks: 11% exceeded the
+      // 60s sweep interval, worst 1501s, and 65% of those had <=20 sessions,
+      // i.e. per-session blocking work rather than session volume.
+      //
+      // The rule a host-gated script must satisfy is "provable worst case under
+      // the ceiling, with margin". Nothing can prove that statically, so
+      // MEASURE it: anything past HOST_SCRIPT_BUDGET_WARN_RATIO of its ceiling
+      // is a script that no longer fits the fast path and belongs on the
+      // container path (sandboxed per run, bounded by the container lifecycle,
+      // and crucially OFF this thread). Without this line the attribution does
+      // not exist — a slow tick names no script.
+      const elapsedMs = Date.now() - startedAtMs;
+      if (elapsedMs > SCRIPT_TIMEOUT_MS * HOST_SCRIPT_BUDGET_WARN_RATIO) {
+        log.warn('Host task-script over budget — belongs on the container path, not scriptHost', {
+          taskId,
+          elapsedMs,
+          ceilingMs: SCRIPT_TIMEOUT_MS,
+          pctOfCeiling: Math.round((elapsedMs / SCRIPT_TIMEOUT_MS) * 100),
+          timedOut,
+        });
+      } else {
+        log.debug('Host task-script timing', { taskId, elapsedMs, ceilingMs: SCRIPT_TIMEOUT_MS });
+      }
       // Drop the pipes explicitly. An escaped or D-state descendant keeps the
       // write ends open, and without this the host holds those handles for as
       // long as it lives — the promise resolves but the process cannot exit.

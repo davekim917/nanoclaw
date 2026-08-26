@@ -371,6 +371,52 @@ describe('runHostScript hard deadline', () => {
     }
   }, 25_000);
 
+  // ADMISSION RULE. `scriptHost` is a fast-path privilege: these run
+  // sequentially inside the awaited sweep, so a slow one makes the fleet's only
+  // timer late for every other session. The rule is "worst case under the
+  // ceiling, with margin", and nothing can prove that statically — so it is
+  // enforced by MEASUREMENT. Without this warning a slow sweep tick names no
+  // script and the rule is unenforceable, which is how a 240s gate sat on the
+  // host path unnoticed.
+  it('reports a host script that runs past half its ceiling', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '2000');
+    const { log } = await import('../../log.js');
+    const warn = vi.spyOn(log, 'warn');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      // Finishes successfully, but at ~75% of a 2s ceiling — the shape that
+      // times out on the next slow upstream day.
+      const result = await runHostScript(`sleep 1.5\necho '{"wakeAgent":false}'\n`, 'budget-warn');
+
+      expect(result).toEqual({ wakeAgent: false });
+      const overBudget = warn.mock.calls.find(([msg]) => String(msg).includes('over budget'));
+      expect(overBudget).toBeDefined();
+      const fields = overBudget?.[1] as { pctOfCeiling: number; timedOut: boolean };
+      expect(fields.pctOfCeiling).toBeGreaterThanOrEqual(50);
+      // Succeeded — this is the EARLY warning, before it becomes a timeout.
+      expect(fields.timedOut).toBe(false);
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  it('stays quiet for a script comfortably inside its ceiling', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '10000');
+    const { log } = await import('../../log.js');
+    const warn = vi.spyOn(log, 'warn');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      await runHostScript(`echo '{"wakeAgent":false}'\n`, 'budget-ok');
+      expect(warn.mock.calls.find(([msg]) => String(msg).includes('over budget'))).toBeUndefined();
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
   // The script file is written into a private 0700 mkdtemp dir at 0600, NOT a
   // predictable name in shared /tmp at 0755. The old shape was a real
   // privilege-escalation surface: `taskId` appears in logs and on the board, so
