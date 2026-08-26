@@ -38,8 +38,9 @@ describe('clone provider skills parity guidance', () => {
   it('keeps retired Mnemon and GitNexus surfaces out of future provider installs', () => {
     for (const name of ['clone-as-codex', 'clone-as-opencode']) {
       const skill = readSkill(name);
-      expect(skill).toContain('Graphify graph');
-      expect(skill).toContain('ncl graphify status');
+      // Graphify is decommissioned — its ship gate failed 100% of the time and
+      // made every new sibling read as a failed clone.
+      expect(skill).not.toMatch(/ncl graphify/i);
       expect(skill).not.toMatch(/MNEMON_STORE/i);
       expect(skill).not.toMatch(/mnemon (store|recall|inbox)/i);
       expect(skill).not.toMatch(/\.gitnexusInjectAgentsMd\s*=\s*true/);
