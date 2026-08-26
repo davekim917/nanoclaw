@@ -10,6 +10,7 @@ import {
   consolidatedFactsOf,
   isCuratorOwned,
   parseGeneratedMemoryFacts,
+  searchableText,
   serializeTopicFile,
   stripCuratorMetadata,
   validateConsolidationFiles,
@@ -620,5 +621,35 @@ describe('ownership and frontmatter parsing', () => {
     expect(serializeTopicFile('systems/x.md', body, 1)).toBe(
       '---\ntype: system\nconsolidated_facts: 1\n---\n\n    const x = 1;\n    const y = 2;\n',
     );
+  });
+});
+
+describe('searchable projection', () => {
+  it('drops every field name and keeps only title/description values', () => {
+    const file = [
+      '---',
+      'type: person',
+      'title: Maya Chen',
+      'description: Runs the Acme account',
+      'tags: priority',
+      'resource: transcripts/kickoff.md',
+      'consolidated_facts: 4',
+      '---',
+      '',
+      'Body text.',
+      '',
+    ].join('\n');
+    expect(searchableText(file)).toBe('Maya Chen\nRuns the Acme account\nBody text.\n');
+  });
+
+  it('is an allowlist: a key added later is not searchable by default', () => {
+    const file = '---\ntype: person\nsome_future_key: highly distinctive phrase\n---\n\nBody.\n';
+    expect(searchableText(file)).toBe('Body.\n');
+  });
+
+  it('leaves a file with no frontmatter exactly as it is', () => {
+    expect(searchableText('# Roster\n\nHand-written.\n')).toBe('# Roster\n\nHand-written.\n');
+    const rule = '---\n\nA rule, then prose.\n';
+    expect(searchableText(rule)).toBe(rule);
   });
 });

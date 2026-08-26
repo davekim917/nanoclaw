@@ -644,6 +644,47 @@ export function stripCuratorMetadata(content: string): string {
  *  claim — a key name alone was enough to make a human's file a write target. */
 const CONSOLIDATED_FACTS_LINE = new RegExp(`^${CONSOLIDATED_FACTS_KEY}:[ \\t]*\\d+[ \\t]*$`);
 
+/**
+ * Frontmatter fields whose VALUES belong in the ranker. definition.md gives
+ * `description` a search role — "one-line summary, used when scanning indexes
+ * and search hits" — and `title` is the display name of the same concept.
+ *
+ * ALLOWLIST, never a denylist: everything else is metadata for scanning and
+ * grouping, and a key someone adds later must default to unsearchable rather
+ * than silently joining the lane.
+ */
+const SEARCHABLE_FRONTMATTER_KEYS = ['title', 'description'];
+
+/**
+ * A memory file as the RANKER should see it: the body, plus the values of the
+ * two summary fields, and no field names at all.
+ *
+ * Frontmatter is fed to the ranker as ordinary text, so stamping `type:
+ * person` on 290 files made every one of them a lexical candidate for a
+ * generic "person" query — a retrieval regression introduced by adding
+ * frontmatter, not a pre-existing one. Same reasoning as stripping a fact's
+ * provenance marker before scoring it (pre-turn-context.ts): score the
+ * content, not the bookkeeping.
+ */
+export function searchableText(content: string): string {
+  const split = splitFrontmatter(content);
+  if (split.keys.length === 0) return content;
+  const keys = split.keys;
+  const body = split.body.replace(/^(?:[ \t]*\r?\n)+/, '');
+  const summaries = keys
+    .filter((line) => SEARCHABLE_FRONTMATTER_KEYS.some((key) => line.startsWith(`${key}:`)))
+    .map((line) => line.slice(line.indexOf(':') + 1).trim())
+    .filter((value) => value.length > 0);
+  return summaries.length > 0 ? `${summaries.join('\n')}\n${body}` : body;
+}
+
+/** The value of one frontmatter field, or null. */
+export function frontmatterValue(content: string, key: string): string | null {
+  const line = splitFrontmatter(content).keys.find((candidate) => candidate.startsWith(`${key}:`));
+  const value = line?.slice(key.length + 1).trim();
+  return value ? value : null;
+}
+
 /** Curator-owned = carries the frontmatter provenance key, or the legacy header. */
 export function isCuratorOwned(content: string): boolean {
   if (CONSOLIDATION_HEADER_PATTERN.test((content.split('\n', 1)[0] ?? '').trim())) return true;

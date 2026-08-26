@@ -293,6 +293,24 @@ describe('folder index rendering', () => {
     ).toBe(merged);
   });
 
+  it('prefers a human-set title and description over the derived slug and lead line', () => {
+    const rendered = renderFolderIndex(
+      'people',
+      [
+        {
+          name: 'mmulhern.md',
+          content:
+            '---\ntype: person\ntitle: Michala Mulhern\ndescription: Former Director, Data & BI\nconsolidated_facts: 4\n---\n\nMichala Mulhern (mmulhern), former Director…\n',
+        },
+      ],
+      new Set(['mmulhern.md']),
+      new Set(['mmulhern.md']),
+      '',
+    );
+    expect(rendered).toContain('- [Michala Mulhern](mmulhern.md) - Former Director, Data & BI');
+    expect(rendered).not.toContain('Mmulhern');
+  });
+
   it('is idempotent over unchanged input', () => {
     const once = renderFolderIndex('people', entries, owned, present, '');
     expect(renderFolderIndex('people', entries, owned, present, once)).toBe(once);

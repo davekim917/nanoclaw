@@ -11,7 +11,12 @@ import {
   searchArchiveEvidence,
   type ArchiveEvidenceRow,
 } from '../../message-archive.js';
-import { GENERATED_MEMORY_MAX_BYTES, GENERATED_MEMORY_RELATIVE_PATH, TOPIC_DIRECTORIES } from './curator-contract.js';
+import {
+  GENERATED_MEMORY_MAX_BYTES,
+  GENERATED_MEMORY_RELATIVE_PATH,
+  searchableText,
+  TOPIC_DIRECTORIES,
+} from './curator-contract.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
@@ -1376,7 +1381,11 @@ function scanRecallCandidates(
       path: relative,
       headings,
       content: read.content,
-      searchable: `${relative}\n${headings.join('\n')}\n${read.content}`,
+      // Score the concept, not its frontmatter — same reason the fact branch
+      // above scores the fact and not its provenance marker. `searchableText`
+      // keeps `title`/`description` values (definition.md gives those a search
+      // role) and drops every field name.
+      searchable: `${relative}\n${headings.join('\n')}\n${searchableText(read.content)}`,
       capturedAt: '',
     });
   }

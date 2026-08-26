@@ -1,4 +1,4 @@
-import { stripCuratorMetadata } from './curator-contract.js';
+import { frontmatterValue, stripCuratorMetadata } from './curator-contract.js';
 
 /**
  * The OKF map layer: `index.md` at the memory root and one `index.md` per
@@ -299,10 +299,14 @@ export function renderFolderIndex(
   // second complete link set was appended under a second heading and the
   // original was never maintained again.
   const heading = /^# .+$/m.exec(existing)?.[0].trimEnd() ?? `# ${titleFromStem(directory)}`;
+  // A human-set `title:`/`description:` wins over the derived slug and lead
+  // line — the curator already carries those keys forward untouched, so this
+  // is the whole fix for `Mmulhern` and `Gsc Data Pipeline`: set the field
+  // once and the map honours it forever. Nothing is ever written by us.
   const links = entries.map((entry) => ({
     target: entry.name,
-    title: titleFromStem(entry.name.replace(/\.md$/, '')),
-    hook: hookFromContent(entry.content, INDEX_HOOK_MAX_CHARS),
+    title: frontmatterValue(entry.content, 'title') ?? titleFromStem(entry.name.replace(/\.md$/, '')),
+    hook: frontmatterValue(entry.content, 'description') ?? hookFromContent(entry.content, INDEX_HOOK_MAX_CHARS),
   }));
   const owns = (target: string): boolean =>
     /^[a-z0-9][a-z0-9-]*\.md$/.test(target) && (ownedNames.has(target) || !presentNames.has(target));

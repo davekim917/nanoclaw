@@ -1358,6 +1358,63 @@ describe('topic-file recall (P2-AC8)', () => {
   });
 });
 
+// Stamping OKF frontmatter on 290 files put `type: person` into the ranker's
+// text, making every people file a lexical candidate for a generic "person"
+// query. Field names are metadata; only `title`/`description` values carry a
+// search role (definition.md).
+describe('frontmatter is not ranked as content', () => {
+  it('does not let a field name make a file a candidate for a generic query', () => {
+    memoryFile(
+      'people/maya-chen.md',
+      '---\ntype: person\ntags: priority\nresource: transcripts/kickoff.md\nconsolidated_facts: 4\n---\n\nMaya Chen runs the Acme account.\n',
+    );
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'person tags resource consolidated' }),
+      includeBootstrap: false,
+    });
+    expect(result.memoryEvidence.excerpts.map((row) => row.path)).not.toContain('people/maya-chen.md');
+  });
+
+  it('still ranks the file on its body, and delivers the frontmatter with it', () => {
+    memoryFile(
+      'people/maya-chen.md',
+      '---\ntype: person\nconsolidated_facts: 4\n---\n\nMaya Chen runs the Acme account.\n',
+    );
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'Maya Chen Acme account' }),
+      includeBootstrap: false,
+    });
+    const row = result.memoryEvidence.excerpts.find((excerpt) => excerpt.path === 'people/maya-chen.md');
+    expect(row?.text).toContain('Maya Chen runs the Acme account.');
+    // Delivered text is the whole file — only RANKING drops the frontmatter.
+    expect(row?.text).toContain('type: person');
+  });
+
+  it('ranks a file on a human-written description, which definition.md gives a search role', () => {
+    memoryFile(
+      'domain/acme.md',
+      '---\ntype: domain\ndescription: Quarterly renewal risk for the Acme contract\nconsolidated_facts: 4\n---\n\nUnrelated body text.\n',
+    );
+    const result = buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'quarterly renewal risk contract' }),
+      includeBootstrap: false,
+    });
+    expect(result.memoryEvidence.excerpts.map((row) => row.path)).toContain('domain/acme.md');
+  });
+});
+
 describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
   const ASK = 'Can you help me build a practice app about losophe?';
 

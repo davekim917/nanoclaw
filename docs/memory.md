@@ -78,6 +78,16 @@ consolidated_facts: 150
 ---
 ```
 
+Frontmatter is metadata, not recall text: the ranker sees a file's body plus
+the values of `title` and `description` (which `system/definition.md` gives a
+search role) and no field names at all. Without that, `type: person` on every
+people file made all of them candidates for a generic "person" query. The whole
+file, frontmatter included, is still what gets delivered once a file ranks.
+
+Setting `title:` or `description:` by hand is also how you fix an ugly map
+entry — the curator carries both forward untouched and prefers them over the
+slug-derived title and the lead-line hook. It never writes either field itself.
+
 `type` comes from the directory (`person`, `domain`, `system`) and can be
 hand-corrected to better vocabulary; the curator carries a changed `type`, and
 every other frontmatter key it does not recognize, forward untouched.
