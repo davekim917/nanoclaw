@@ -180,7 +180,8 @@ default_control() {
     lastFailureWakeAt: null,
     lastMisconfigWakeAt: null,
     preflightReason: null,
-    preflightWakeAt: null
+    preflightWakeAt: null,
+    preflightFingerprint: null
   }'
 }
 
@@ -1480,22 +1481,31 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
     fi
     export SMOKE_GATE_PREFLIGHT_TARGET_URL="$PREFLIGHT_TARGET_URL"
     if timeout "$PREFLIGHT_TIMEOUT" bash -c "$PREFLIGHT_CMD" >"$PREFLIGHT_OUT" 2>&1; then
-      CONTROL="$(jq -c '.preflightReason=null | .preflightWakeAt=null' <<<"$CONTROL")"
+      CONTROL="$(jq -c '.preflightReason=null | .preflightFingerprint=null | .preflightWakeAt=null' <<<"$CONTROL")"
       write_control "$CONTROL"
     else
       PREFLIGHT_RC=$?
       PREFLIGHT_REASON="$(grep -v '^[[:space:]]*$' "$PREFLIGHT_OUT" 2>/dev/null | tail -1 | cut -c1-300)"
       [ -n "$PREFLIGHT_REASON" ] || PREFLIGHT_REASON="preflight command exited $PREFLIGHT_RC with no output"
       [ "$PREFLIGHT_RC" -eq 124 ] && PREFLIGHT_REASON="preflight timed out after ${PREFLIGHT_TIMEOUT}s: $PREFLIGHT_REASON"
-      LAST_REASON="$(jq -r '.preflightReason // empty' <<<"$CONTROL")"
+      # `preflight_failed` is silenceable, and the ONLY `ack` verb in the fleet
+      # is the develop gate's — so an ack filed from here lands in that gate's
+      # namespace. Two of qa-seat-preflight's three terminal messages are byte
+      # identical constants, so a reason-shaped fingerprint from this gate would
+      # match the develop gate's own alarm and silence a campaign-blocking
+      # condition nobody acked for it. The `pr|` prefix plus the PR number makes
+      # that impossible by construction and discriminates one PR from the next.
+      # (See the two invariants at the top of smoke-develop-gate.sh.)
+      PREFLIGHT_FINGERPRINT="pr|$PREFLIGHT_REASON|$W_PR"
+      LAST_PREFLIGHT_FINGERPRINT="$(jq -r '.preflightFingerprint // empty' <<<"$CONTROL")"
       SINCE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.preflightWakeAt // empty' <<<"$CONTROL")") ))"
-      if { [ "$PREFLIGHT_REASON" != "$LAST_REASON" ] && [ "$SINCE_WAKE" -ge "$PREFLIGHT_REARM_FLOOR_SECONDS" ]; } ||
+      if { [ "$PREFLIGHT_FINGERPRINT" != "$LAST_PREFLIGHT_FINGERPRINT" ] && [ "$SINCE_WAKE" -ge "$PREFLIGHT_REARM_FLOOR_SECONDS" ]; } ||
          [ "$SINCE_WAKE" -ge "$PREFLIGHT_ALERT_SECONDS" ]; then
-        CONTROL="$(jq -c --arg r "$PREFLIGHT_REASON" --arg now "$(iso_now)" \
-          '.preflightReason=$r | .preflightWakeAt=$now' <<<"$CONTROL")"
+        CONTROL="$(jq -c --arg r "$PREFLIGHT_REASON" --arg f "$PREFLIGHT_FINGERPRINT" --arg now "$(iso_now)" \
+          '.preflightReason=$r | .preflightFingerprint=$f | .preflightWakeAt=$now' <<<"$CONTROL")"
         write_control "$CONTROL"
-        jq -cn --arg reason "$PREFLIGHT_REASON" --argjson rc "$PREFLIGHT_RC" \
-          '{wakeAgent:true,data:{schemaVersion:1,trigger:"preflight_failed",reason:$reason,exitCode:$rc}}'
+        jq -cn --arg reason "$PREFLIGHT_REASON" --argjson rc "$PREFLIGHT_RC" --arg fp "$PREFLIGHT_FINGERPRINT" \
+          '{wakeAgent:true,data:{schemaVersion:1,trigger:"preflight_failed",reason:$reason,exitCode:$rc,fingerprint:$fp}}'
         exit 0
       fi
       CONTROL="$(jq -c --arg r "$PREFLIGHT_REASON" '.preflightReason=$r' <<<"$CONTROL")"

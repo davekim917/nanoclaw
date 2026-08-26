@@ -233,12 +233,14 @@ default_state() {
     holdPendingRunId: null,
     holdPendingWakeAt: null,
     preflightReason: null,
+    preflightFingerprint: null,
     preflightWakeAt: null,
     handoffFreezePr: null,
     handoffFreezeSha: null,
     handoffTargetSha: null,
     handoffOpenedAt: null,
     freezeFailReason: null,
+    freezeFailFingerprint: null,
     freezeFailWakeAt: null,
     lastFreezeOpenedAt: null,
     ledgerTamperAlertFor: null,
@@ -246,32 +248,65 @@ default_state() {
   }'
 }
 
+# ── Two invariants for `.dispositions`. Satisfy them at every site. ─────────
+#
+# Three review rounds each found the same two defect classes somewhere the
+# previous fix had not reached. These are the general statements; anything new
+# that touches dispositions or decides "is this the same incident" must hold
+# them, and the test suite checks both rather than the instances.
+#
+# INVARIANT 1 — every jq transform over `.dispositions` is TOTAL.
+#   No transform may abort on an entry of unexpected shape. jq exits non-zero
+#   and prints nothing; nothing here checks jq's status, so an abort silently
+#   empties `$STATE` and the command carries on against an empty document.
+#   Enforced by construction: `read_state` NORMALISES `.dispositions` to an
+#   object of well-shaped entries before any other code sees it, so every
+#   downstream `.dispositions[...]`, `del(...)` and assignment is total for
+#   free. Earlier rounds tried to make each site tolerant instead and kept
+#   missing one — first the write path, then the read path.
+#
+# INVARIANT 2 — "is this the same incident?" compares a GATE-COMPUTED
+#   FINGERPRINT, never a reason string.
+#   Reasons are not discriminating: `smoke-freeze-pr.sh:69` emits a byte
+#   identical constant for every branch collision on every SHA, and
+#   `qa-seat-preflight.sh:334`/`:338` do the same for two of three preflight
+#   modes. Every producer of a silenceable trigger computes a fingerprint from
+#   what actually varies and emits it as `data.fingerprint`; the ack path AND
+#   the re-arm throttle both key on that value. Fixing only the ack left the
+#   throttle cross-silencing distinct incidents through the same static text.
+#
+# Normalisation supersedes the previous "keep the corruption reachable so
+# `write_state`'s guard stays testable" stance, which was backwards: preserving
+# a malformed `.dispositions` made `drop_disposition` abort on every
+# alarm-bearing poll, so the gate refused to write, exited before emitting the
+# alarm, and went silent on ALL alarms. Recovering beats refusing. Dispositions
+# are an advisory audit record — dropping an unreadable one loses nothing that
+# was telling the truth. `write_state`'s guard stays as a backstop for any
+# FUTURE transform over some other field.
+DISPOSITIONS_NORMALISE='
+  .dispositions = (
+    ((.dispositions | objects) // {})
+    | with_entries(select(
+        ((.value | objects | .at | strings) // "")
+        | (try fromdateiso8601 catch 0) > (now - $ttl))))'
+
 read_state() {
   if [ -s "$STATE_FILE" ] && jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1; then
-    # Expire dispositions older than the ack window, on every read.
+    # Normalise + expire dispositions on every read (INVARIANT 1).
     #
-    # A disposition that outlives its window sits in state answering "is this
-    # handled?" with a stale yes while a brand-new alarm for that trigger is
-    # firing. True of ALL eleven ackable triggers, not just the two the poll
-    # path consults — so bound it once, here, instead of dropping the record at
-    # eleven alarm sites and forgetting the twelfth. It has to be in `read_state`
-    # rather than in the poll body because `relock_or_exit` RE-READS state after
-    # the network phase, which would discard a prune done anywhere upstream.
+    # Here rather than in the poll body because `relock_or_exit` RE-READS state
+    # after the network phase and would discard a prune done anywhere upstream.
+    # Expiry bounds the audit trail for all eleven ackable triggers at once: a
+    # record that outlives its window would otherwise answer "is this handled?"
+    # with a stale yes while a fresh alarm for that trigger fires.
     #
-    # Prunes against the LONGEST ack window, never a shorter per-trigger one,
-    # so it can only remove a record that has already stopped silencing.
-    #
-    # `else .` — NOT `else {}`. A malformed `.dispositions` is passed through
-    # untouched on purpose: normalising it here would repair the corruption
-    # `write_state`'s guard exists to catch and leave that guard unreachable and
-    # untestable. Everything else is tolerant by construction (missing or
-    # unparseable `at`, entry that is not an object), and a bad date fails
-    # toward LESS silencing.
-    jq -c --argjson ttl "$ACK_MAX_SILENCE_SECONDS" '
-      if (.dispositions | type) == "object"
-        then .dispositions |= with_entries(select(
-               ((.value.at // "") | (try fromdateiso8601 catch 0)) > (now - $ttl)))
-        else . end' "$STATE_FILE"
+    # Prunes against the LONGEST configured window — the two TTLs are
+    # independently overridable, so taking the general one alone could delete a
+    # preflight ack still inside its own TTL and void a silence the operator was
+    # promised.
+    local prune_ttl="$ACK_MAX_SILENCE_SECONDS"
+    [ "$ACK_MAX_SILENCE_PREFLIGHT_SECONDS" -gt "$prune_ttl" ] && prune_ttl="$ACK_MAX_SILENCE_PREFLIGHT_SECONDS"
+    jq -c --argjson ttl "$prune_ttl" "$DISPOSITIONS_NORMALISE" "$STATE_FILE"
   else
     default_state
   fi
@@ -292,6 +327,13 @@ write_state() {
   # function, so one check covers finish/claim/progress/ack and whatever comes
   # next. `exit` rather than `return` because no caller inspects the status —
   # a return value would be swallowed and the command would report success.
+  #
+  # This is a BACKSTOP, not the primary defence. INVARIANT 1 makes every
+  # dispositions transform total, so a corrupt state file no longer reaches
+  # here — it is recovered on read instead, which keeps alarms ringing. What is
+  # left for this guard is a future transform over some OTHER field that aborts
+  # for a reason nobody anticipated. Deliberately kept even though nothing in
+  # the current code can trigger it.
   if ! jq -e 'type == "object"' <<<"$next" >/dev/null 2>&1; then
     jq -cn '{ok:false,error:"gate state did not survive a transform — refusing to write; on-disk state is preserved"}'
     exit 3
@@ -1600,20 +1642,27 @@ if [ -n "$PREFLIGHT_CMD" ]; then
     PREFLIGHT_REASON="$(grep -v '^[[:space:]]*$' "$PREFLIGHT_OUT" 2>/dev/null | tail -1 | cut -c1-300)"
     [ -n "$PREFLIGHT_REASON" ] || PREFLIGHT_REASON="preflight command exited $PREFLIGHT_RC with no output"
     [ "$PREFLIGHT_RC" -eq 124 ] && PREFLIGHT_REASON="preflight timed out after ${PREFLIGHT_TIMEOUT}s: $PREFLIGHT_REASON"
-    LAST_REASON="$(jq -r '.preflightReason // empty' <<<"$STATE")"
+    # INVARIANT 2: latch on the fingerprint, not the reason. Identical to the
+    # reason for this trigger today (see the ACK_MAX_SILENCE_PREFLIGHT_SECONDS
+    # note on why it is not SHA-scoped), but the comparison follows the
+    # fingerprint if that ever changes rather than silently keying on text.
+    PREFLIGHT_FINGERPRINT="$PREFLIGHT_REASON"
+    LAST_PREFLIGHT_FINGERPRINT="$(jq -r '.preflightFingerprint // empty' <<<"$STATE")"
     SINCE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.preflightWakeAt // empty' <<<"$STATE")") ))"
-    # A live ack for this exact reason outranks the re-arm rules. Same silent
+    # A live ack for this exact incident outranks the re-arm rules. Same silent
     # shape as the throttled branch below, including not persisting the reason:
-    # the latch must keep comparing against the last reason we ALARMED on.
-    if ack_silences preflight_failed "$PREFLIGHT_REASON"; then
+    # the latch must keep comparing against the last one we ALARMED on.
+    # INVARIANT 2 — the fingerprint, not the reason, even where the two are
+    # currently equal, so this call follows if the fingerprint ever changes.
+    if ack_silences preflight_failed "$PREFLIGHT_FINGERPRINT"; then
       emit_no_wake "preflight_failed"
       exit 0
     fi
-    if { [ "$PREFLIGHT_REASON" != "$LAST_REASON" ] &&
+    if { [ "$PREFLIGHT_FINGERPRINT" != "$LAST_PREFLIGHT_FINGERPRINT" ] &&
          [ "$SINCE_WAKE" -ge "$PREFLIGHT_REARM_FLOOR_SECONDS" ]; } ||
        [ "$SINCE_WAKE" -ge "$PREFLIGHT_ALERT_SECONDS" ]; then
-      STATE="$(jq -c --arg r "$PREFLIGHT_REASON" --arg now "$NOW" \
-        '.preflightReason=$r | .preflightWakeAt=$now' <<<"$STATE")"
+      STATE="$(jq -c --arg r "$PREFLIGHT_REASON" --arg f "$PREFLIGHT_FINGERPRINT" --arg now "$NOW" \
+        '.preflightReason=$r | .preflightFingerprint=$f | .preflightWakeAt=$now' <<<"$STATE")"
       # This wake owes a fresh disposition — an expired or differently
       # fingerprinted one must not carry over to it.
       drop_disposition preflight_failed
@@ -1636,7 +1685,7 @@ if [ -n "$PREFLIGHT_CMD" ]; then
   # inheriting a throttle window from an outage that is already repaired. The
   # disposition goes with it: a condition that cleared and came back is a new
   # incident, not the one somebody acked.
-  STATE="$(jq -c '.preflightReason=null | .preflightWakeAt=null' <<<"$STATE")"
+  STATE="$(jq -c '.preflightReason=null | .preflightFingerprint=null | .preflightWakeAt=null' <<<"$STATE")"
   drop_disposition preflight_failed
 fi
 
@@ -1695,7 +1744,11 @@ if [ "$FREEZE_HANDOFF" = true ]; then
     # SEPARATE field. Acking one collision would silence every future collision
     # on any SHA. Fold in what actually varies — the branch and the target SHA.
     FREEZE_FINGERPRINT="$FREEZE_REASON|$FREEZE_ORPHAN_BRANCH|$SOURCE_SHA"
-    LAST_FREEZE_REASON="$(jq -r '.freezeFailReason // empty' <<<"$STATE")"
+    # INVARIANT 2: the RE-ARM latch compares fingerprints, not reasons. Widening
+    # only the ack left this comparison keying on the static text, so two
+    # distinct collisions still cross-silenced — through the throttle instead of
+    # through the ack. `.freezeFailReason` stays for the operator-facing record.
+    LAST_FREEZE_FINGERPRINT="$(jq -r '.freezeFailFingerprint // empty' <<<"$STATE")"
     SINCE_FREEZE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.freezeFailWakeAt // empty' <<<"$STATE")") ))"
     # A live ack for this exact incident outranks the re-arm rules. This is the
     # 2026-08-25/26 case: three identical wakes 6h apart, nothing dispositioned.
@@ -1703,9 +1756,10 @@ if [ "$FREEZE_HANDOFF" = true ]; then
       emit_no_wake "develop_freeze_failed"
       exit 0
     fi
-    if { [ "$FREEZE_REASON" != "$LAST_FREEZE_REASON" ] && [ "$SINCE_FREEZE_WAKE" -ge "$PREFLIGHT_REARM_FLOOR_SECONDS" ]; } ||
+    if { [ "$FREEZE_FINGERPRINT" != "$LAST_FREEZE_FINGERPRINT" ] && [ "$SINCE_FREEZE_WAKE" -ge "$PREFLIGHT_REARM_FLOOR_SECONDS" ]; } ||
        [ "$SINCE_FREEZE_WAKE" -ge "$PREFLIGHT_ALERT_SECONDS" ]; then
-      STATE="$(jq -c --arg r "$FREEZE_REASON" --arg now "$NOW" '.freezeFailReason=$r | .freezeFailWakeAt=$now' <<<"$STATE")"
+      STATE="$(jq -c --arg r "$FREEZE_REASON" --arg f "$FREEZE_FINGERPRINT" --arg now "$NOW" \
+        '.freezeFailReason=$r | .freezeFailFingerprint=$f | .freezeFailWakeAt=$now' <<<"$STATE")"
       # This wake owes a fresh disposition.
       drop_disposition develop_freeze_failed
       write_state "$STATE"
@@ -1728,7 +1782,7 @@ if [ "$FREEZE_HANDOFF" = true ]; then
     --arg sha "$SOURCE_SHA" --arg now "$NOW" --argjson pr "$FREEZE_PR_NUM" --arg freezeSha "$FREEZE_SHA_OUT" \
     '.handoffFreezePr=$pr | .handoffFreezeSha=$freezeSha | .handoffTargetSha=$sha | .handoffOpenedAt=$now |
      .lastFreezeOpenedAt=$now |
-     .freezeFailReason=null | .freezeFailWakeAt=null |
+     .freezeFailReason=null | .freezeFailFingerprint=null | .freezeFailWakeAt=null |
      .candidateSha=null | .candidateFirstSeen=null' <<<"$STATE")"
   # Condition cleared — a later recurrence is a new incident, not the acked one.
   drop_disposition develop_freeze_failed

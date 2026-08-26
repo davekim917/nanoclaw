@@ -1048,9 +1048,15 @@ jq -e '
 ' <<<"$ACK_OUT" >/dev/null
 ACK_OUT="$(bash "$GATE" ack preflight_failed "some reason" handled || true)"
 jq -e '.ok == false and (.error | test("resolved, acked, or escalated"))' <<<"$ACK_OUT" >/dev/null
+# The window is asserted in seconds, not by comment: preflight is deliberately
+# shorter than the general TTL, and inverting or deleting that branch has to
+# fail here.
 bash "$GATE" ack preflight_failed "some reason" acked | jq -e '
   .ok == true and .disposition == "acked" and .silenceable == true and
-  .silencedUntil != null
+  ((.silencedUntil | fromdateiso8601) - (.at | fromdateiso8601)) == 43200
+' >/dev/null
+bash "$GATE" ack develop_freeze_failed "some fingerprint" acked | jq -e '
+  ((.silencedUntil | fromdateiso8601) - (.at | fromdateiso8601)) == 86400
 ' >/dev/null
 jq -e '
   .dispositions.preflight_failed.fingerprint == "some reason" and
@@ -1085,9 +1091,10 @@ jq -e '.dispositions.preflight_failed == null' "$PF_STATE" >/dev/null
 # --- 42. An ack expires. No incident goes dark forever. --------------------
 bash "$GATE" ack preflight_failed "8 of 8 QA seats could not be verified" acked >/dev/null
 pf_poll 'echo "8 of 8 QA seats could not be verified"; exit 1' | jq -e '.wakeAgent == false' >/dev/null
-# Age the ack past the TTL in place — the condition and fingerprint are
-# unchanged, so only the TTL can put the alarm back.
-jq --arg t "$(date -u -d '@'$(( $(date -u +%s) - 2 * 86400 )) +'%Y-%m-%dT%H:%M:%SZ')" \
+# Age the ack to ~13h: past preflight's 12h window but INSIDE the general 24h
+# one, so this only passes if the shorter per-trigger TTL is really in force.
+# The condition and fingerprint are unchanged, so nothing else can wake it.
+jq --arg t "$(date -u -d '@'$(( $(date -u +%s) - 46800 )) +'%Y-%m-%dT%H:%M:%SZ')" \
   '.dispositions.preflight_failed.at=$t' "$PF_STATE" > "$PF_STATE.tmp" && mv "$PF_STATE.tmp" "$PF_STATE"
 pf_poll 'echo "8 of 8 QA seats could not be verified"; exit 1' | jq -e '
   .wakeAgent == true and .data.trigger == "preflight_failed"
@@ -1204,7 +1211,8 @@ bash "$GATE" poll | jq -e '
 # ...and that wake cleared the stale disposition, so it owes a fresh one too.
 jq -e '.dispositions.develop_freeze_failed == null' "$SMOKE_GATE_STATE_DIR/develop-state.json" >/dev/null
 # The freeze finally succeeding clears the incident, disposition included.
-bash "$GATE" ack develop_freeze_failed "gh pr create failed|" acked >/dev/null
+ACK_FP2="$(bash "$GATE" poll | jq -r '.data.fingerprint')"
+bash "$GATE" ack develop_freeze_failed "$ACK_FP2" acked >/dev/null
 export STUB_FREEZE_JSON="{\"prNumber\":77,\"branch\":\"smoke/freeze-d\",\"freezeSha\":\"abc\",\"targetSha\":\"$ACK_SHA\"}"
 bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
 jq -e '.dispositions.develop_freeze_failed == null' "$SMOKE_GATE_STATE_DIR/develop-state.json" >/dev/null
@@ -1229,51 +1237,131 @@ FP_A="$(bash "$GATE" poll | jq -r '.data.fingerprint')"
 bash "$GATE" ack develop_freeze_failed "$FP_A" acked "left in place on purpose" >/dev/null
 bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null   # A stays silenced
 
-# Develop advances. A genuinely new collision, same constant reason text.
+# Develop advances. A genuinely new collision, same constant reason text —
+# and now with the DEPLOYED 6h throttle armed, not disabled. Disabling it is
+# what hid the second half of this bug: the ack fingerprint was widened but the
+# re-arm latch still compared the reason, so B was silently throttled.
+# Ageing past the re-arm FLOOR only (900s, not the 6h ceiling) leaves the
+# changed-fingerprint clause as the only thing that can produce a wake.
+unset SMOKE_GATE_PREFLIGHT_ALERT_SECONDS
 export STUB_SOURCE_SHA="$SHA_B"
 export STUB_FREEZE_JSON="{\"ok\":false,\"error\":\"$COLLIDE\",\"branch\":\"smoke/freeze-bbbbbbbbbbbb\"}"
+FZ_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
+jq --arg t "$(date -u -d '@'$(( $(date -u +%s) - 1000 )) +'%Y-%m-%dT%H:%M:%SZ')" \
+  '.freezeFailWakeAt=$t' "$FZ_STATE" > "$FZ_STATE.tmp" && mv "$FZ_STATE.tmp" "$FZ_STATE"
 bash "$GATE" poll >/dev/null
-FP_B="$(bash "$GATE" poll | jq -r '.data.fingerprint')"
+# ONE wake, asserted once: a second poll would be legitimately throttled by the
+# latch this wake just reset, and would hide the result.
+WAKE_B="$(bash "$GATE" poll)"
+FP_B="$(jq -r '.data.fingerprint' <<<"$WAKE_B")"
 if [ "$FP_A" = "$FP_B" ]; then
   echo "two different freeze incidents produced the same fingerprint: $FP_A" >&2; exit 1
 fi
 # Both carry the SAME reason — proving it is the fingerprint, not the reason,
-# doing the discriminating.
-bash "$GATE" poll | jq -e --arg r "$COLLIDE" '
+# doing the discriminating, on both the ack path and the throttle path.
+jq -e --arg r "$COLLIDE" '
   .wakeAgent == true and .data.reason == $r and .data.trigger == "develop_freeze_failed"
-' >/dev/null
-unset SMOKE_GATE_PREFLIGHT_ALERT_SECONDS
+' <<<"$WAKE_B" >/dev/null
+jq -e --arg f "$FP_B" '.freezeFailFingerprint == $f' "$FZ_STATE" >/dev/null
 
 # --- 48. Every silenceable trigger emits a `fingerprint` the agent can echo --
 # Structural: a third silenceable trigger added without one would leave the
 # agent guessing again, which is how High 1 happened.
+# INVARIANT 2, checked over EVERY producer in the skill — not just this gate.
+# smoke-pr-gate.sh emits `preflight_failed` too, and the develop gate owns the
+# only `ack` verb, so a PR-gate alarm without a discriminating fingerprint
+# resolves into the develop gate's silenceable namespace.
 for t in $(grep -oP '^ACK_SILENCEABLE="\K[^"]+' "$GATE"); do
-  grep -q "trigger:\"$t\"" "$GATE" || { echo "no emission for silenceable trigger $t" >&2; exit 1; }
-  awk -v t="trigger:\"$t\"" '
-    index($0, t) { found=1 }
-    found && /fingerprint:/ { ok=1 }
-    found && /}}/ { exit }
-    END { exit !ok }
-  ' "$GATE" || { echo "silenceable trigger $t emits no fingerprint field" >&2; exit 1; }
+  for producer in "$SCRIPT_DIR"/smoke-*-gate.sh; do
+    grep -q "trigger:\"$t\"" "$producer" || continue
+    # `exit 1` inside a rule jumps to END, so the status must be set THERE —
+    # an `END { exit 0 }` silently overwrites it and the check never fails.
+    awk -v t="trigger:\"$t\"" '
+      index($0, t) && !/wakeAgent:false/ { found=1; ok=0 }
+      found && /fingerprint:/ { ok=1 }
+      found && /}}/ { if (!ok) bad=1; found=0 }
+      END { exit bad }
+    ' "$producer" || {
+      echo "$(basename "$producer") emits silenceable $t with no fingerprint" >&2; exit 1; }
+  done
+done
+# ...and the RE-ARM latch keys on that fingerprint too. Widening only the ack
+# left distinct incidents cross-silencing through the throttle instead.
+for latch in preflightFingerprint freezeFailFingerprint; do
+  grep -q "\.$latch=\\\$f" "$GATE" || { echo "latch $latch is never persisted" >&2; exit 1; }
+  grep -q "\.$latch // empty" "$GATE" || { echo "latch $latch is never compared" >&2; exit 1; }
+done
+grep -q '\.preflightFingerprint=\$f' "$SCRIPT_DIR/smoke-pr-gate.sh" \
+  || { echo "pr gate never persists a preflight fingerprint" >&2; exit 1; }
+# The PR gate's fingerprint must be GATE-SCOPED, not merely present. Both gates
+# run the same preflight family with byte-identical constants, and the develop
+# gate owns the only `ack` verb — so an unprefixed PR-gate fingerprint would
+# resolve against the develop gate's own silenceable key. The two scripts have
+# separate state files, so this is the structural check; there is no single
+# process in which both can be exercised together.
+grep -q 'PREFLIGHT_FINGERPRINT="pr|' "$SCRIPT_DIR/smoke-pr-gate.sh" \
+  || { echo "pr gate preflight fingerprint is not gate-scoped" >&2; exit 1; }
+
+# --- 48b. The prune window is the LONGEST of the two TTLs ------------------
+# They are independently overridable. Taking the general one alone would delete
+# a preflight ack still inside its own window and void a silence the operator
+# was promised via `silencedUntil`.
+fresh_state
+TTL_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
+export STUB_SOURCE_SHA="$(printf '2%.0s' $(seq 40))"
+SMOKE_GATE_ACK_MAX_SILENCE_SECONDS=3600 \
+SMOKE_GATE_ACK_MAX_SILENCE_PREFLIGHT_SECONDS=86400 \
+  bash "$GATE" ack preflight_failed "seats down" acked >/dev/null
+jq --arg t "$(date -u -d '@'$(( $(date -u +%s) - 7200 )) +'%Y-%m-%dT%H:%M:%SZ')" \
+  '.dispositions.preflight_failed.at=$t' "$TTL_STATE" > "$TTL_STATE.tmp" && mv "$TTL_STATE.tmp" "$TTL_STATE"
+SMOKE_GATE_ACK_MAX_SILENCE_SECONDS=3600 \
+SMOKE_GATE_ACK_MAX_SILENCE_PREFLIGHT_SECONDS=86400 \
+  bash "$GATE" poll >/dev/null
+jq -e '.dispositions.preflight_failed != null' "$TTL_STATE" >/dev/null \
+  || { echo "prune deleted an ack still inside its own TTL" >&2; exit 1; }
+
+# --- 49. INVARIANT 1: every dispositions transform is total ----------------
+# Both corruption shapes that have bitten, in one case. `.dispositions` itself
+# malformed used to abort ack's jq, empty $STATE, truncate the file and still
+# report ok:true; a malformed ENTRY used to abort read_state's prune, which no
+# write guard can see because no write happens. Either way the next mandatory
+# `progress` stamp told a HEALTHY campaign "not the active run — stop this
+# campaign". Normalising on read makes both total, so the gate RECOVERS rather
+# than refusing — refusing left every alarm wedged and silent.
+for corrupt_shape in \
+  '{"activeSha":"deadbeef","activeRunId":"important-run","dispositions":"corrupt-but-valid-json"}' \
+  '{"activeSha":"deadbeef","activeRunId":"important-run","dispositions":{"preflight_failed":"junk"}}' \
+  '{"activeSha":"deadbeef","activeRunId":"important-run","dispositions":[]}' \
+  '{"activeSha":"deadbeef","activeRunId":"important-run","dispositions":{"preflight_failed":{"at":"not-a-date"}}}'
+do
+  fresh_state
+  CORRUPT="$SMOKE_GATE_STATE_DIR/develop-state.json"
+  printf '%s\n' "$corrupt_shape" > "$CORRUPT"
+  # The live campaign is never told to stop — the harm that matters.
+  bash "$GATE" progress important-run \
+    | jq -e '.ok == true and .runId == "important-run"' >/dev/null \
+    || { echo "progress refused a live run on: $corrupt_shape" >&2; exit 1; }
+  # ack works, and leaves state a valid object with the campaign intact.
+  bash "$GATE" ack preflight_failed "some reason" acked >/dev/null \
+    || { echo "ack failed on: $corrupt_shape" >&2; exit 1; }
+  jq -e '
+    (.dispositions | type) == "object" and
+    .activeRunId == "important-run" and .activeSha == "deadbeef" and
+    .dispositions.preflight_failed.fingerprint == "some reason"
+  ' "$CORRUPT" >/dev/null || { echo "state not recovered on: $corrupt_shape" >&2; exit 1; }
 done
 
-# --- 49. REGRESSION (Codex High 2): a failed transform must never be written --
-# A malformed `.dispositions` makes ack's jq error, which used to leave $STATE
-# empty, truncate the state file, and STILL report ok:true. The next mandatory
-# `progress` stamp then told a HEALTHY campaign "not the active run — stop this
-# campaign".
+# ...and an alarm-bearing poll still WAKES on a corrupt state file. Refusing to
+# write used to exit before the alarm was emitted, wedging every alarm silently.
 fresh_state
-CORRUPT="$SMOKE_GATE_STATE_DIR/develop-state.json"
-printf '%s\n' '{"activeSha":"deadbeef","activeRunId":"important-run","dispositions":"corrupt-but-valid-json"}' > "$CORRUPT"
-BEFORE="$(cat "$CORRUPT")"
-ACK_OUT="$(bash "$GATE" ack preflight_failed "some reason" acked 2>/dev/null || true)"
-jq -e '.ok == false and (.error | test("refusing to write"))' <<<"$ACK_OUT" >/dev/null
-if bash "$GATE" ack preflight_failed "some reason" acked >/dev/null 2>&1; then
-  echo "ack reported success on a state file it could not transform" >&2; exit 1
-fi
-[ "$(cat "$CORRUPT")" = "$BEFORE" ] || { echo "state file was modified despite the refusal" >&2; exit 1; }
-# ...and the campaign is still the active run, which is the harm that matters.
-bash "$GATE" progress important-run | jq -e '.ok == true and .runId == "important-run"' >/dev/null
+export SMOKE_GATE_PREFLIGHT_ALERT_SECONDS=0
+PF_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
+pf_sha 5
+jq '.dispositions="corrupt-but-valid-json"' "$PF_STATE" > "$PF_STATE.tmp" && mv "$PF_STATE.tmp" "$PF_STATE"
+pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == true and .data.trigger == "preflight_failed"
+' >/dev/null
+unset SMOKE_GATE_PREFLIGHT_ALERT_SECONDS
 
 # --- 50. Dispositions expire out of state, for every trigger ----------------
 # Bounds the audit trail: a record cannot outlive its window and keep answering
