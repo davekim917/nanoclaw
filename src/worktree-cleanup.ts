@@ -76,15 +76,26 @@ function git(cwd: string, args: string[]): string | null {
   }
 }
 
-function safeDirectories(directory: string): string[] {
+/**
+ * Directory names under a topic's worktrees root, or `null` when the directory
+ * could not be read.
+ *
+ * ENOENT is the ordinary "this topic has no worktrees" answer and returns an
+ * empty list. Anything else — EACCES, EIO, ENOTDIR — is a real fault, and
+ * collapsing it into an empty list is what makes an unreadable fleet
+ * indistinguishable from a collected one. The caller counts and reports it.
+ */
+function safeDirectories(directory: string): string[] | null {
   try {
     return fs
       .readdirSync(directory, { withFileTypes: true })
       .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
       .map((entry) => entry.name)
       .sort();
-  } catch {
-    return [];
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    log.warn('Worktree cleanup: worktrees root unreadable; preserving its topic', { directory, err });
+    return null;
   }
 }
 
@@ -136,26 +147,51 @@ function participantsByTopic(
   return result;
 }
 
-function discover(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
+export interface DiscoveryResult {
+  targets: TopicWorktreeTarget[];
+  /** Entries whose names are not valid repository segments — see below. */
+  filteredNames: string[];
+  /** Worktrees roots that could not be read at all. */
+  unreadableRoots: number;
+}
+
+function discover(dataDir: string = DATA_DIR): DiscoveryResult {
   const mapping = participantsByTopic(dataDir);
-  const worktrees: TopicWorktreeTarget[] = [];
+  const targets: TopicWorktreeTarget[] = [];
+  const filteredNames = new Set<string>();
+  let unreadableRoots = 0;
 
   // Only DB-resolvable topics are deletion candidates. Unknown directories are
   // deliberately left intact: missing metadata is never deletion authority.
   for (const [statePath, { unit, participants }] of mapping) {
     if (!fs.existsSync(statePath)) continue;
     const worktreeRoot = topicWorktreesDir(unit, dataDir);
-    for (const repo of safeDirectories(worktreeRoot).sort()) {
+    const names = safeDirectories(worktreeRoot);
+    if (names === null) {
+      unreadableRoots += 1;
+      continue;
+    }
+    for (const repo of names) {
       // The worktrees root is not a pure repository namespace: the storage
       // activity lease (`.nanoclaw-storage-active`) and the shared pnpm cache
       // (`.pnpm-store`) live here too. Their names are not valid repository
       // segments, so canonicalRepoDir() throws on them — and before this
       // guard, one such directory aborted the entire cleanup pass at
       // discovery, fleet-wide, forever.
-      if (!isRepositoryName(repo)) continue;
+      //
+      // The filter is deliberately NOT widened to admit them. `SAFE_SEGMENT`
+      // is a path-traversal boundary, and a checkout that it rejects is
+      // preserved, never deleted. But some rejected names are legitimate
+      // repositories — `.github` and `.github-private` are real GitHub repos —
+      // so every filtered name is reported rather than dropped silently. A
+      // repository name in that report is an operator signal, not noise.
+      if (!isRepositoryName(repo)) {
+        filteredNames.add(repo);
+        continue;
+      }
       const worktreePath = path.join(worktreeRoot, repo);
       if (!fs.existsSync(worktreePath)) continue;
-      worktrees.push({
+      targets.push({
         workUnit: unit,
         participants,
         repo,
@@ -164,7 +200,7 @@ function discover(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
       });
     }
   }
-  return worktrees;
+  return { targets, filteredNames: [...filteredNames].sort(), unreadableRoots };
 }
 
 function participantHasPersistedWork(participant: TopicParticipant): boolean {
@@ -321,7 +357,7 @@ async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DI
 }
 
 export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promise<void> {
-  const targets = discover(dataDir);
+  const { targets, filteredNames, unreadableRoots } = discover(dataDir);
   // One pathological topic must not cost the fleet its collection pass: a
   // failing target is skipped and counted, never allowed to abort the rest.
   let skipped = 0;
@@ -338,12 +374,24 @@ export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promis
       });
     }
   }
-  // A pass that collected nothing because every target failed must not read
-  // like a pass that had nothing to do.
-  log.info('Worktree cleanup: pass complete', { examined: targets.length, skipped });
+  // A pass that collected nothing — because every target failed, because every
+  // name was filtered, or because every root was unreadable — must not read
+  // like a pass that had nothing to do. That indistinguishability is exactly
+  // what let the discovery throw survive unnoticed for months.
+  log.info('Worktree cleanup: pass complete', {
+    examined: targets.length,
+    skipped,
+    filtered: filteredNames.length,
+    filteredNames,
+    unreadableRoots,
+  });
 }
 
 export function _discoverWorktreesForTesting(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
+  return discover(dataDir).targets;
+}
+
+export function _discoveryStatsForTesting(dataDir: string = DATA_DIR): DiscoveryResult {
   return discover(dataDir);
 }
 
