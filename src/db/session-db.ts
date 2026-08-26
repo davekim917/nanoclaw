@@ -1001,6 +1001,17 @@ export function sessionInboundHasMessage(agentGroupId: string, sessionId: string
   if (!fs.existsSync(dbPath)) return false;
   // Read-only: this only ever runs one SELECT, and a writable open would take
   // a hot-journal rollback write on a session the reclaim may be archiving.
+  //
+  // But read-only alone is not enough, for the same reason openOutboundDb
+  // recovers first: rolling a hot journal back is a WRITE, so a read-only
+  // handle fails the plain SELECT with "attempt to write a readonly database"
+  // and this function throws instead of answering. The writable open it
+  // replaced rolled the journal back silently, so going read-only without this
+  // line turns a self-healing read into a permanent throw on any session whose
+  // host write was interrupted. Recovery is best-effort and only opens
+  // writable when a journal actually exists, so the normal path stays
+  // read-only.
+  recoverHotJournal(dbPath);
   const db = new Database(dbPath, { readonly: true });
   db.pragma('busy_timeout = 5000');
   try {
