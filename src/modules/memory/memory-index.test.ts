@@ -171,6 +171,30 @@ describe('folder index rendering', () => {
     expect(after).toContain('alexis-kim.md');
   });
 
+  it('merges into the folder heading the file already has, instead of adding a second section', () => {
+    const existing = ['# People Directory', '', 'Who we work with.', ''].join('\n');
+    const merged = renderFolderIndex(
+      'people',
+      [{ name: 'james.md', content: 'James leads the release train.\n' }],
+      new Set(['james.md']),
+      new Set(['james.md']),
+      existing,
+    );
+    expect(merged.match(/^# /gm)).toHaveLength(1);
+    expect(merged).toContain('# People Directory');
+    expect(merged).toContain('Who we work with.');
+    expect(merged).toContain('- [James](james.md) - James leads the release train.');
+    expect(
+      renderFolderIndex(
+        'people',
+        [{ name: 'james.md', content: 'James leads the release train.\n' }],
+        new Set(['james.md']),
+        new Set(['james.md']),
+        merged,
+      ),
+    ).toBe(merged);
+  });
+
   it('is idempotent over unchanged input', () => {
     const once = renderFolderIndex('people', entries, owned, present, '');
     expect(renderFolderIndex('people', entries, owned, present, once)).toBe(once);

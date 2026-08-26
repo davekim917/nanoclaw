@@ -7,6 +7,7 @@ import {
   CURATOR_CAPTURE_REASON_CODES,
   CURATOR_MAX_MEMORY_TEXT_CHARS,
   CURATOR_OUTPUT_SCHEMA,
+  consolidatedFactsOf,
   isCuratorOwned,
   parseGeneratedMemoryFacts,
   serializeTopicFile,
@@ -542,12 +543,16 @@ describe('OKF topic-file serialization', () => {
     expect(serializeTopicFile('domain/x.md', body, 1)).toContain('---\n\nA rule, then prose.');
   });
 
-  it('treats both header shapes and the frontmatter key as proof of ownership', () => {
+  it('treats the counted legacy header and the frontmatter key as proof of ownership', () => {
     expect(isCuratorOwned('<!-- consolidated: facts=1 -->\nBody\n')).toBe(true);
-    expect(isCuratorOwned('<!-- consolidated -->\nBody\n')).toBe(true);
     expect(isCuratorOwned('---\ntype: person\nconsolidated_facts: 0\n---\n\nBody\n')).toBe(true);
     expect(isCuratorOwned('---\ntype: person\n---\n\nBody\n')).toBe(false);
     expect(isCuratorOwned('# Human-authored roster\n')).toBe(false);
+    // The bare form is stripped but is NOT a claim — see the ownership suite
+    // below. Zero live files open with it, so accepting it only widened the
+    // surface on which a human's prose becomes a write target.
+    expect(isCuratorOwned('<!-- consolidated -->\nBody\n')).toBe(false);
+    expect(stripCuratorMetadata('<!-- consolidated -->\nBody\n')).toBe('Body\n');
   });
 
   it('rejects a reserved index leaf as a model-proposed write target', () => {
@@ -562,5 +567,58 @@ describe('OKF topic-file serialization', () => {
     expect(result.accepted).toEqual([]);
     expect(result.rejected[0]).toMatchObject({ path: 'people/x.md', reason: 'too-large' });
     expect(result.rejected[0]!.bytes).toBe(Buffer.byteLength(serializeTopicFile('people/x.md', body, 1), 'utf8'));
+  });
+});
+
+// F4 / F13 / F9-trim: what counts as curator-owned, what counts as
+// frontmatter, and what `serializeTopicFile` is allowed to strip.
+describe('ownership and frontmatter parsing', () => {
+  it('does not claim a human file whose prose opens with a bare consolidated comment', () => {
+    expect(isCuratorOwned('<!-- consolidated -->\nNotes on how the curator marks files.\n')).toBe(false);
+    expect(isCuratorOwned('<!-- consolidated: facts=4 -->\nBody\n')).toBe(true);
+  });
+
+  it('does not accept a non-numeric consolidated_facts value as a claim', () => {
+    expect(isCuratorOwned('---\ntype: person\nconsolidated_facts: false\n---\n\nBody\n')).toBe(false);
+    expect(isCuratorOwned('---\ntype: person\nconsolidated_facts: no\n---\n\nBody\n')).toBe(false);
+    expect(isCuratorOwned('---\ntype: person\nconsolidated_facts: 0\n---\n\nBody\n')).toBe(true);
+  });
+
+  it('parses frontmatter containing comments, blank lines and a block sequence', () => {
+    const file = [
+      '---',
+      '# curated by hand, do not reorder',
+      'type: person',
+      '',
+      'tags:',
+      '- priority',
+      '- renewal',
+      'consolidated_facts: 4',
+      '---',
+      '',
+      'Body.',
+      '',
+    ].join('\n');
+    expect(isCuratorOwned(file)).toBe(true);
+    expect(consolidatedFactsOf(file)).toBe(4);
+    expect(stripCuratorMetadata(file)).toBe('Body.\n');
+    // …and every one of those keys survives a rewrite.
+    const next = serializeTopicFile('people/x.md', 'New body.', 9, file);
+    expect(next).toContain('# curated by hand, do not reorder');
+    expect(next).toContain('tags:\n- priority\n- renewal');
+    expect(next).toContain('consolidated_facts: 9');
+  });
+
+  it('still refuses to read a horizontal rule as frontmatter', () => {
+    const body = '---\n\nA rule, then prose.\n';
+    expect(stripCuratorMetadata(body)).toBe(body);
+    expect(isCuratorOwned(body)).toBe(false);
+  });
+
+  it('keeps significant leading indentation in the body', () => {
+    const body = '    const x = 1;\n    const y = 2;\n';
+    expect(serializeTopicFile('systems/x.md', body, 1)).toBe(
+      '---\ntype: system\nconsolidated_facts: 1\n---\n\n    const x = 1;\n    const y = 2;\n',
+    );
   });
 });

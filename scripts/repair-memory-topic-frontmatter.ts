@@ -7,14 +7,22 @@
  * writeMemoryTopicFile produces today, then rebuilds each workgroup's index
  * map. Both operations are idempotent, so a second run reports nothing.
  *
- *   pnpm exec tsx scripts/repair-memory-topic-frontmatter.ts             # dry run
- *   pnpm exec tsx scripts/repair-memory-topic-frontmatter.ts --apply
- *   pnpm exec tsx scripts/repair-memory-topic-frontmatter.ts --apply --workgroup illysium
+ *   pnpm exec tsx scripts/repair-memory-topic-frontmatter.ts                        # dry run
+ *   pnpm exec tsx scripts/repair-memory-topic-frontmatter.ts --apply --backup-dir DIR
+ *   … --apply --backup-dir DIR --workgroup illysium
  *
- * Dry run by default because this rewrites live memory. Writes go through the
- * curator's own CAS path, so a container writing the same file concurrently
- * surfaces as a reported conflict rather than a lost update — the host does
- * not need to be stopped.
+ * Dry run by default because this rewrites live memory, and the dry run
+ * previews EVERYTHING --apply does, index rewrites included — a preview that
+ * hides the index changes hides the part an operator most needs to consent to.
+ *
+ * --backup-dir is REQUIRED for --apply and every original is copied there
+ * before it is touched, because this is a one-shot pass over hand-written
+ * memory with no other undo. Restore with `cp -a <backup-dir>/<workgroup>/. `
+ * over the workgroup's memory directory.
+ *
+ * Writes go through the curator's own CAS path, so a container writing the
+ * same file concurrently surfaces as a reported conflict rather than a lost
+ * update — the host does not need to be stopped.
  */
 import fs from 'fs';
 import path from 'path';
@@ -31,10 +39,38 @@ import {
 import { readMemoryTopicFile, syncMemoryIndexes, writeMemoryTopicFile } from '../src/modules/memory/curator-write.js';
 import { workgroupMemoryDir } from '../src/modules/workgroup/shared-dirs.js';
 
+/** Usage errors are for a human at a terminal: one line, exit 2, no stack. */
+function fail(message: string): never {
+  console.error(`repair-memory-topic-frontmatter: ${message}`);
+  process.exit(2);
+}
+
+function flagValue(name: string): string | null {
+  const at = process.argv.indexOf(name);
+  if (at < 0) return null;
+  const value = process.argv[at + 1] ?? '';
+  if (value === '' || value.startsWith('--')) fail(`${name} needs a value`);
+  return value;
+}
+
 const apply = process.argv.includes('--apply');
-const workgroupFlagAt = process.argv.indexOf('--workgroup');
-const selected = workgroupFlagAt >= 0 ? (process.argv[workgroupFlagAt + 1] ?? '') : null;
-if (selected === '') throw new Error('--workgroup needs a workgroup id');
+const selected = flagValue('--workgroup');
+const backupDir = flagValue('--backup-dir');
+if (apply && backupDir === null) {
+  fail('--apply requires --backup-dir <dir>: this rewrites hand-written memory and has no other undo');
+}
+
+function backUp(workgroupId: string, relative: string, content: string): void {
+  const target = path.join(backupDir!, workgroupId, relative);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  // wx: a backup is never overwritten, so re-running --apply cannot destroy
+  // the copy of the ORIGINAL taken by the first run.
+  try {
+    fs.writeFileSync(target, content, { flag: 'wx' });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+}
 
 function workgroupIds(): string[] {
   const root = path.join(DATA_DIR, 'workgroups');
@@ -67,7 +103,12 @@ let skipped = 0;
 let blocked = 0;
 let failed = 0;
 
-for (const workgroupId of workgroupIds()) {
+const targets = workgroupIds();
+if (selected !== null && targets.length === 0) {
+  fail(`--workgroup ${selected} matched no workgroup with a memory directory`);
+}
+
+for (const workgroupId of targets) {
   for (const relative of topicPaths(workgroupId)) {
     let current: { content: string; sha256: string | null };
     try {
@@ -90,6 +131,7 @@ for (const workgroupId of workgroupIds()) {
       repaired += 1;
       continue;
     }
+    backUp(workgroupId, relative, current.content);
     const write = await writeMemoryTopicFile(workgroupId, relative, current.content, current.sha256, factsCount);
     if (write.status === 'success') {
       repaired += 1;
@@ -105,20 +147,23 @@ for (const workgroupId of workgroupIds()) {
       failed += 1;
     }
   }
-  if (apply) {
-    try {
-      const sync = await syncMemoryIndexes(workgroupId);
-      if (sync.updated.length > 0) console.log(`  INDEX ${workgroupId}: ${sync.updated.join(', ')}`);
-    } catch (error) {
-      console.log(`  INDEX ${workgroupId} FAILED: ${(error as Error).message}`);
-      failed += 1;
+  try {
+    const sync = await syncMemoryIndexes(workgroupId, { dryRun: !apply });
+    if (sync.updated.length > 0) {
+      console.log(`  ${apply ? 'INDEX' : 'WOULD REWRITE INDEX'} ${workgroupId}: ${sync.updated.join(', ')}`);
     }
+  } catch (error) {
+    console.log(`  INDEX ${workgroupId} FAILED: ${(error as Error).message}`);
+    failed += 1;
   }
 }
 
 console.log(
   `${apply ? 'repaired' : 'would repair'} ${repaired}, already normalized ${skipped}, ` +
     `blocked by the size cap ${blocked}, failed ${failed}` +
-    (apply ? '' : ' — re-run with --apply to write'),
+    (apply ? `, originals backed up to ${backupDir}` : ' — re-run with --apply --backup-dir DIR to write'),
 );
-process.exit(failed > 0 ? 1 : 0);
+// Non-zero whenever work was not completed. A size-blocked file is not a crash
+// but it IS an unrepaired file, and an operator scripting this needs to see
+// that rather than a green exit over a partial pass.
+process.exit(failed > 0 || blocked > 0 ? 1 : 0);

@@ -484,11 +484,13 @@ async function updateIndexFile(
   workgroupId: string,
   relativePath: string,
   merge: (existing: string) => string,
+  dryRun = false,
 ): Promise<boolean> {
   for (let attempt = 0; attempt < INDEX_WRITE_ATTEMPTS; attempt += 1) {
     const current = readMemoryTopicFile(workgroupId, relativePath, MEMORY_INDEX_MAX_BYTES);
     const next = merge(current.content);
     if (next === current.content) return false;
+    if (dryRun) return true;
     const write = await writeMemoryIndexFile(workgroupId, relativePath, next, current.sha256);
     if (write.status === 'success') return true;
     if (write.status !== 'conflict') {
@@ -549,6 +551,10 @@ export interface MemoryIndexSyncResult {
 /**
  * Bring `index.md` and the topic-folder indexes in line with what is on disk.
  *
+ * `dryRun` reports exactly what a real run would change without writing —
+ * the repair sweep needs it, because the index rewrite is the part of a
+ * 290-file pass an operator most needs to see before consenting to it.
+ *
  * Derived entirely from the filesystem rather than from the files this pass
  * happened to write, which makes it idempotent (unchanged tree → no write at
  * all) and self-healing: the first pass after this ships maps a workgroup's
@@ -556,7 +562,11 @@ export interface MemoryIndexSyncResult {
  * yet — a legacy `<!-- consolidated -->` header still proves ownership, and
  * the hook is read straight out of the body.
  */
-export async function syncMemoryIndexes(workgroupId: string): Promise<MemoryIndexSyncResult> {
+export async function syncMemoryIndexes(
+  workgroupId: string,
+  options: { dryRun?: boolean } = {},
+): Promise<MemoryIndexSyncResult> {
+  const dryRun = options.dryRun === true;
   const updated: string[] = [];
   const rootLinks: IndexLink[] = [];
   for (const directory of TOPIC_DIRECTORIES) {
@@ -567,8 +577,11 @@ export async function syncMemoryIndexes(workgroupId: string): Promise<MemoryInde
     if (owned.length === 0 && !hasIndex) continue;
     const ownedNames = new Set(owned.map((entry) => entry.name));
     if (
-      await updateIndexFile(workgroupId, indexPath, (existing) =>
-        renderFolderIndex(directory, owned, ownedNames, present, existing),
+      await updateIndexFile(
+        workgroupId,
+        indexPath,
+        (existing) => renderFolderIndex(directory, owned, ownedNames, present, existing),
+        dryRun,
       )
     ) {
       updated.push(indexPath);
@@ -584,8 +597,11 @@ export async function syncMemoryIndexes(workgroupId: string): Promise<MemoryInde
   // never had a consolidation pass.
   if (
     rootLinks.length > 0 &&
-    (await updateIndexFile(workgroupId, 'index.md', (existing) =>
-      mergeRootIndexMap(existing, TOPIC_DIRECTORIES, rootLinks),
+    (await updateIndexFile(
+      workgroupId,
+      'index.md',
+      (existing) => mergeRootIndexMap(existing, TOPIC_DIRECTORIES, rootLinks),
+      dryRun,
     ))
   ) {
     updated.push('index.md');

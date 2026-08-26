@@ -258,7 +258,11 @@ export function renderFolderIndex(
   presentNames: ReadonlySet<string>,
   existing: string,
 ): string {
-  const heading = `# ${titleFromStem(directory)}`;
+  // Merge into the heading the file ALREADY has. Insisting on our own
+  // `# People` meant an existing `# People Directory` was never matched, so a
+  // second complete link set was appended under a second heading and the
+  // original was never maintained again.
+  const heading = /^# .+$/m.exec(existing)?.[0].trimEnd() ?? `# ${titleFromStem(directory)}`;
   const links = entries.map((entry) => ({
     target: entry.name,
     title: titleFromStem(entry.name.replace(/\.md$/, '')),

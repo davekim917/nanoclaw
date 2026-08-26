@@ -566,20 +566,31 @@ export const TOPIC_TYPE_BY_DIRECTORY: Readonly<Record<string, string>> = {
 export const CONSOLIDATED_FACTS_KEY = 'consolidated_facts';
 
 /**
- * The pre-OKF ownership marker. Still ACCEPTED as proof of curator ownership
- * — every topic file on disk predating this change carries it and must stay
- * writable — and still stripped on read, but never written again.
+ * The pre-OKF ownership marker, as proof of OWNERSHIP. Every topic file on
+ * disk predating this change carries it and must stay writable.
  *
- * The bare `<!-- consolidated -->` form is real: it is the oldest shape and
- * sits at the bottom of every stacked header found on disk.
+ * Deliberately requires `facts=<n>`: the bare `<!-- consolidated -->` form
+ * exists on disk but never as a file's first line (checked across all 290
+ * marker-carrying files in the live tree — zero), so accepting it as proof of
+ * ownership only widens the surface on which a human's prose that happens to
+ * open with that literal becomes a write target. It is still stripped; it is
+ * no longer a claim.
  */
-export const CONSOLIDATION_HEADER_PATTERN = /^<!--\s*consolidated(?::\s*facts=\d+)?\s*-->$/;
+export const CONSOLIDATION_HEADER_PATTERN = /^<!--\s*consolidated:\s*facts=\d+\s*-->$/;
 
 /** Leading run of blank lines and legacy consolidation markers. */
 const LEADING_LEGACY_HEADERS = /^(?:[ \t]*\r?\n|<!--[ \t]*consolidated(?::[ \t]*facts=\d+)?[ \t]*-->[ \t]*\r?\n?)+/;
 
-/** A frontmatter line: `key:` or an indented continuation of the line above. */
-const FRONTMATTER_LINE = /^(?:[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t].*)?|[ \t]+\S.*)$/;
+/** A frontmatter line: a key, an indented continuation, a YAML comment, a
+ *  block-sequence item, or a blank line. All five are ordinary in a
+ *  hand-edited OKF file, and rejecting any of them froze the file: it parsed
+ *  as "no frontmatter", so it read as unowned and the curator refused it
+ *  forever. */
+const FRONTMATTER_LINE = /^(?:[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t].*)?|[ \t]*(?:#|-[ \t]).*|[ \t]+\S.*|[ \t]*)$/;
+
+/** …but a block still has to contain at least one key, so a body that opens
+ *  with a `---` horizontal rule is not mistaken for frontmatter and eaten. */
+const FRONTMATTER_KEY = /^[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t].*)?$/;
 
 /**
  * Split a leading YAML frontmatter block off `content`, returning its inner
@@ -598,7 +609,9 @@ export function splitFrontmatter(content: string): { keys: string[]; body: strin
   const close = lines.findIndex((line, index) => index > 0 && line.trimEnd() === '---');
   if (close < 1) return { keys: [], body: content };
   const keys = lines.slice(1, close).map((line) => line.trimEnd());
-  if (keys.length === 0 || !keys.every((line) => FRONTMATTER_LINE.test(line))) return { keys: [], body: content };
+  if (!keys.some((line) => FRONTMATTER_KEY.test(line)) || !keys.every((line) => FRONTMATTER_LINE.test(line))) {
+    return { keys: [], body: content };
+  }
   return { keys, body: lines.slice(close + 1).join('\n') };
 }
 
@@ -627,10 +640,14 @@ export function stripCuratorMetadata(content: string): string {
   }
 }
 
+/** The provenance key with a real count. `consolidated_facts: false` is not a
+ *  claim — a key name alone was enough to make a human's file a write target. */
+const CONSOLIDATED_FACTS_LINE = new RegExp(`^${CONSOLIDATED_FACTS_KEY}:[ \\t]*\\d+[ \\t]*$`);
+
 /** Curator-owned = carries the frontmatter provenance key, or the legacy header. */
 export function isCuratorOwned(content: string): boolean {
   if (CONSOLIDATION_HEADER_PATTERN.test((content.split('\n', 1)[0] ?? '').trim())) return true;
-  return splitFrontmatter(content).keys.some((line) => line.startsWith(`${CONSOLIDATED_FACTS_KEY}:`));
+  return splitFrontmatter(content).keys.some((line) => CONSOLIDATED_FACTS_LINE.test(line));
 }
 
 /**
@@ -641,7 +658,7 @@ export function isCuratorOwned(content: string): boolean {
  * a count.
  */
 export function consolidatedFactsOf(content: string): number {
-  const key = splitFrontmatter(content).keys.find((line) => line.startsWith(`${CONSOLIDATED_FACTS_KEY}:`));
+  const key = splitFrontmatter(content).keys.find((line) => CONSOLIDATED_FACTS_LINE.test(line));
   if (key) return Number.parseInt(key.slice(CONSOLIDATED_FACTS_KEY.length + 1).trim(), 10) || 0;
   return Number.parseInt(/<!--\s*consolidated:\s*facts=(\d+)\s*-->/.exec(content)?.[1] ?? '0', 10) || 0;
 }
@@ -678,7 +695,12 @@ export function serializeTopicFile(
     ...carried.filter((_, index) => index !== typeIndex),
     `${CONSOLIDATED_FACTS_KEY}: ${factsCount}`,
   ];
-  return `---\n${keys.join('\n')}\n---\n\n${stripCuratorMetadata(modelContent).trim()}\n`;
+  // Leading BLANK LINES go, leading SPACES stay: `.trim()` turned a body that
+  // opens with a four-space Markdown code block into prose.
+  const body = stripCuratorMetadata(modelContent)
+    .replace(/^(?:[ \t]*\r?\n)+/, '')
+    .replace(/\s+$/, '');
+  return `---\n${keys.join('\n')}\n---\n\n${body}\n`;
 }
 
 export interface ConsolidationFileCandidate {

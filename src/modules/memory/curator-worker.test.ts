@@ -1504,6 +1504,122 @@ describe('pillar-2 semantic consolidation', () => {
     warnSpy.mockRestore();
   });
 
+  // F6. The poison loop: a writer `error` is deterministic, so throwing on it
+  // re-presented byte-identical input to the same model forever. It must
+  // partition out like every other per-file rejection; a `conflict` still
+  // throws, because a retry genuinely sees different bytes.
+  it('drops a topic file the writer refuses instead of retrying it forever', async () => {
+    seedLedger(
+      ['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact about Maya.'), ''].join('\n'),
+    );
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const writeTopicFile = vi.fn(async (_wg: string, relativePath: string): Promise<CuratorWriteResult> => {
+      if (relativePath === 'people/oversized.md') {
+        return { status: 'error', relative_path: relativePath, error: 'topic file exceeds 8192 bytes' };
+      }
+      return { status: 'success', relative_path: relativePath, sha256: 'a'.repeat(64) };
+    });
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: dbConsolidationTail(),
+      markConsolidated: markFactsConsolidated,
+      writeTopicFile,
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: {
+            files: [
+              { path: 'people/oversized.md', content: 'Too big once frontmatter is carried forward.' },
+              { path: 'people/maya-chen.md', content: 'Maya Chen is the Acme liaison.' },
+            ],
+          },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    // The pass SUCCEEDS: the good file lands, the bad one is reported, and the
+    // tail is marked so the identical input is never re-presented.
+    expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 1, rejectedCount: 1 });
+    expect(d.failMaintenance).not.toHaveBeenCalled();
+    expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set(['mem_aaaaaaaaaaaaaaaa']));
+    expect(warnSpy).toHaveBeenCalledWith(
+      'memory-curator: consolidation dropped topic files the writer refused',
+      expect.objectContaining({
+        rejected: [expect.objectContaining({ path: 'people/oversized.md' })],
+      }),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it('still fails the pass on a write conflict, which a retry can win', async () => {
+    seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: dbConsolidationTail(),
+      markConsolidated: markFactsConsolidated,
+      writeTopicFile: vi.fn(
+        async (_wg, relativePath): Promise<CuratorWriteResult> => ({
+          status: 'conflict',
+          relative_path: relativePath,
+          error: 'expected_sha256 does not match the current file',
+        }),
+      ),
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: [{ path: 'people/maya-chen.md', content: 'Maya Chen is the Acme liaison.' }] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    expect(await new MemoryCuratorWorker(d).runOne(1000)).toBeNull();
+    expect(d.failMaintenance).toHaveBeenCalledOnce();
+    expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set());
+  });
+
+  // F7. A failed index sync used to clear maintenance_pending, so a quiet
+  // workgroup waited for 50 more accepted updates before anything retried.
+  it('leaves maintenance pending when the index sync fails', async () => {
+    seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+    const completeMaintenance = vi.fn(() => true);
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: dbConsolidationTail(),
+      markConsolidated: markFactsConsolidated,
+      completeMaintenance,
+      syncIndexes: vi.fn(async () => {
+        throw new Error('index CAS race lost');
+      }),
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: [{ path: 'people/maya-chen.md', content: 'Maya Chen is the Acme liaison.' }] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    expect(await new MemoryCuratorWorker(d).runOne(1000)).toMatchObject({ action: 'maintenance_written' });
+    expect(completeMaintenance).toHaveBeenCalledWith(expect.anything(), 1000, true);
+  });
+
+  it('leaves maintenance pending when the index sync fails on an empty tail', async () => {
+    const completeMaintenance = vi.fn(() => true);
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 0, leaseOwner: 'worker' }),
+      consolidationTail: () => ({ facts: [], hasMore: false }),
+      completeMaintenance,
+      syncIndexes: vi.fn(async () => {
+        throw new Error('index unreadable');
+      }),
+    });
+    expect(await new MemoryCuratorWorker(d).runOne(1000)).toMatchObject({ action: 'maintenance_noop' });
+    expect(completeMaintenance).toHaveBeenCalledWith(expect.anything(), 1000, true);
+  });
+
   // An empty tail still gets the index pass: a workgroup whose whole topic
   // backlog predates index maintenance has nothing to consolidate and an
   // entirely unmapped set of files.

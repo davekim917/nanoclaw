@@ -775,18 +775,20 @@ export class MemoryCuratorWorker {
    * race, an unreadable index). Throwing here would roll a completed
    * consolidation back into a retry loop over a map.
    */
-  private async syncIndexesQuietly(workgroupId: string): Promise<void> {
+  private async syncIndexesQuietly(workgroupId: string): Promise<boolean> {
     try {
       const sync = await this.deps.syncIndexes(workgroupId);
       if (sync.updated.length > 0) {
         log.info('memory-curator: memory index updated', { workgroupId, updated: sync.updated });
       }
+      return true;
     } catch (error) {
       log.warn('memory-curator: memory index sync failed', {
         workgroupId,
         errorClass: classifyError(error),
         error: error instanceof Error ? error.message : String(error),
       });
+      return false;
     }
   }
 
@@ -806,8 +808,10 @@ export class MemoryCuratorWorker {
         // that crashed between writing files and marking the tail leaves
         // exactly this shape, and so does the first pass after an install
         // whose whole topic backlog predates index maintenance.
-        await this.syncIndexesQuietly(job.workgroupId);
-        if (!this.deps.completeMaintenance(job, nowMs, false)) throw new Error('memory maintenance lost its lease');
+        const synced = await this.syncIndexesQuietly(job.workgroupId);
+        if (!this.deps.completeMaintenance(job, nowMs, !synced)) {
+          throw new Error('memory maintenance lost its lease');
+        }
         return {
           workgroupId: job.workgroupId,
           episodeKey: 'maintenance',
@@ -884,6 +888,8 @@ export class MemoryCuratorWorker {
         }
         accepted.push(file);
       }
+      const writeRejections: Array<{ path: string; reason: string; detail?: string }> = [];
+      let written = 0;
       const rejected = [...contentRejections, ...lockedRejections];
       if (rejected.length > 0) {
         // Named per-path, with reason and byte size where relevant, so an
@@ -908,9 +914,30 @@ export class MemoryCuratorWorker {
           expectedSha256,
           tail.facts.length,
         );
-        if (write.status !== 'success') {
-          throw new Error(`memory topic write ${write.status}: ${write.error ?? 'unknown'}`);
+        if (write.status === 'success') {
+          written += 1;
+          continue;
         }
+        // A `conflict` is transient — someone else wrote the file, and a retry
+        // sees different bytes — so it still throws. An `error` is a
+        // deterministic property of this path and this content (bad path,
+        // reserved leaf, not owned, or over CONSOLIDATION_FILE_MAX_BYTES once
+        // the existing file's own frontmatter is carried forward, which the
+        // batch check cannot see). Throwing on that re-presented the identical
+        // tail to the identical model on every retry, forever, with no
+        // feedback that could change the outcome: a non-terminating loop at
+        // 6h a cycle. Partition it out exactly like every other per-file
+        // rejection and let the rest of the batch land.
+        if (write.status === 'conflict') {
+          throw new Error(`memory topic write conflict: ${write.error ?? 'unknown'}`);
+        }
+        writeRejections.push({ path: file.path, reason: 'write-rejected', detail: write.error });
+      }
+      if (writeRejections.length > 0) {
+        log.warn('memory-curator: consolidation dropped topic files the writer refused', {
+          workgroupId: job.workgroupId,
+          rejected: writeRejections,
+        });
       }
       // completeMaintenance is the owner-conditioned atomic check (its SQL
       // is `WHERE workgroup_id = ? AND lease_owner = ?`), so it MUST run
@@ -931,34 +958,38 @@ export class MemoryCuratorWorker {
       // nothing double-applies), and a correct model converges to
       // `files: []` — which itself marks the tail on that next pass.
       signal?.throwIfAborted();
-      if (!this.deps.completeMaintenance(job, nowMs, tail.hasMore)) {
+      // Sync BEFORE completing, so a failure can be carried into
+      // reassertPending. Otherwise a failed sync cleared maintenance_pending
+      // and a quiet workgroup waited for the next 50 accepted updates before
+      // anything would repair the map.
+      const indexSynced = await this.syncIndexesQuietly(job.workgroupId);
+      if (!this.deps.completeMaintenance(job, nowMs, tail.hasMore || !indexSynced)) {
         throw new Error('memory maintenance lost its lease');
       }
       this.deps.markConsolidated(
         job.workgroupId,
         tail.facts.map((fact) => fact.id),
       );
-      await this.syncIndexesQuietly(job.workgroupId);
       outcome = 'maintenance_written';
-      if (accepted.length === 0) {
+      if (written === 0) {
         // Distinct from the empty-tail noop above: real facts were
         // consolidated. Either the model judged no topic file needed a
-        // change (rejected.length === 0), or everything it proposed was
-        // invalid (rejected.length > 0, logged above) — either way this is
-        // the same "tail marked, nothing written" shape as the model
-        // returning `files: []`.
+        // change, or everything it proposed was rejected — by validation, by
+        // the locked set, or by the writer itself (all logged above). Either
+        // way this is the same "tail marked, nothing written" shape as the
+        // model returning `files: []`.
         log.info('memory-curator: consolidation pass wrote zero files for a non-empty tail', {
           workgroupId: job.workgroupId,
           factCount: tail.facts.length,
-          rejectedCount: rejected.length,
+          rejectedCount: rejected.length + writeRejections.length,
         });
       }
       return {
         workgroupId: job.workgroupId,
         episodeKey: 'maintenance',
         action: 'maintenance_written',
-        fileCount: accepted.length,
-        rejectedCount: rejected.length,
+        fileCount: written,
+        rejectedCount: rejected.length + writeRejections.length,
         messageCount: 0,
         transcriptChars: 0,
         model: attempt.result.model,
