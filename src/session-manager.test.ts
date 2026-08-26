@@ -1824,6 +1824,24 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
     expect(inboundIds()).toEqual([]);
   });
 
+  // Equality alone is not a generation check: `closed === closed` and
+  // `undefined === undefined` both pass, so a raw-id writer arriving after the
+  // reclaim finished would re-provision a session nothing polls.
+  it('refuses a write to a session whose row is closed and whose directory is gone', async () => {
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+
+    await expect(writeSessionMessage(AG, SESS, message('after-reclaim'))).rejects.toThrow(/has been reclaimed/);
+    expect(fs.existsSync(inboundDbPath(AG, SESS))).toBe(false);
+  });
+
+  it('still re-provisions a closed session whose directory survives', async () => {
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+
+    await expect(writeSessionMessage(AG, SESS, message('closed-but-present'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['closed-but-present']);
+  });
+
   it('still writes normally when no reclaim is in progress', async () => {
     await expect(writeSessionMessage(AG, SESS, message('ordinary'))).resolves.toBeUndefined();
     expect(inboundIds()).toEqual(['ordinary']);

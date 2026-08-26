@@ -789,9 +789,15 @@ async function writeSessionMessageInternal(
   // activity marker is present, and acquire double-checks the claim after
   // planting its marker. Either the reclaim sees our marker and skips, or we
   // see its claim and wait for it to finish.
+  // Sampled BEFORE the lease, because acquiring it mkdirs the session root —
+  // after that point "the reclaim took this directory" is unobservable.
+  const dirExisted = fs.existsSync(sessionDir(agentGroupId, sessionId));
   const lease = await acquireStorageActivityLease(sessionDir(agentGroupId, sessionId), `inbound-${sessionId}`);
   try {
-    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId, statusBefore);
+    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId, {
+      status: statusBefore,
+      dirExisted,
+    });
   } finally {
     await lease.release();
   }
@@ -802,15 +808,26 @@ async function writeSessionMessageLocked(
   sessionId: string,
   message: SessionMessageInput,
   ignoreDuplicateId: boolean,
-  statusBefore: string | undefined,
+  before: { status: string | undefined; dirExisted: boolean },
 ): Promise<boolean> {
   // Waiting for the claim above can mean waiting out a reclaim that archived
   // and deleted this session while we queued. Requiring the row to be exactly
   // where we left it catches active -> archiving -> closed without taking any
   // new position on which statuses are writable: whatever was writable before
   // still is, as long as nothing moved it under us.
-  if (getSession(sessionId)?.status !== statusBefore) {
+  const statusNow = getSession(sessionId)?.status;
+  if (statusNow !== before.status) {
     throw new Error(`session ${sessionId} changed state during archival; route this message to a fresh session`);
+  }
+  // Equality is not a generation check. A raw-id writer that arrives when the
+  // session is ALREADY `closed` — or already gone from the central table —
+  // compares equal to itself, so the reclaim can have finished before we ever
+  // looked and this would happily re-provision a session nothing polls and
+  // then bump its last_active. A dead row plus an absent directory is the one
+  // combination that cannot be a live session, and the directory reading has
+  // to predate the lease's own mkdir to mean anything.
+  if ((statusNow === 'closed' || statusNow === undefined) && !before.dirExisted) {
+    throw new Error(`session ${sessionId} has been reclaimed; route this message to a fresh session`);
   }
 
   // Documented reset: operators `rm -rf` a session folder to clear a stuck
