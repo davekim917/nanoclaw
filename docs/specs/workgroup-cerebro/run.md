@@ -1201,3 +1201,84 @@ FULL delivered context over 20 whole turns — 10 queries x bootstrap on/off —
 byte-identical between them. The performance work survived the deletion intact; the
 ~15 ms is run-to-run noise plus the `statSync` the removed seam used to pay looking for
 an index that was never there.
+
+## Pillar 1 (graph scent) — REMOVED on measured reach and use, 2026-08-26
+
+`plan.md` §3 carries the banner; §§3–8, §11 and §13's pillar-1 paragraph stay as the
+design record. §11 set the standard this lane had to meet — "a repeat of that class of
+question where the transcript shows the agent opening a pointed-to file before
+answering. Absent that, the lane is unproven regardless of how clean the latency numbers
+are." Two weeks of production said it is not just unproven; it stopped running at all.
+
+Workgroups A and B below are the same two labelled in the P2.5 activation entry above —
+A the largest on the fleet, B mid-size — identities omitted deliberately because this
+repository is public.
+
+**Reach, and its collapse.** Counted from persisted `recall-*` rows across 2,366 session
+`inbound.db` files, 2026-08-10 → 08-26: **996 of 6,413 pre-turn context builds carried a
+scent (15.5%)**, and the share fell monotonically to zero.
+
+| date  | builds with scent |
+| ----- | ----------------: |
+| 08-12 |             42.7% |
+| 08-16 |             32.5% |
+| 08-21 |             14.3% |
+| 08-24 |              5.7% |
+| 08-25 |              0.7% |
+| 08-26 |                0% |
+
+The current log has **zero** populated events against 65 warmth probes.
+
+**Mechanism: the warmth gate became unwinnable as the graphs grew.** A's index (13.5 GB)
+and B's (3.0 GB) are both over `largeGraphBytes`, so each needs three CONSECUTIVE
+sub-300 ms probes (the 2026-08-16 watch-item lever). A's probes average **2,467 ms**,
+worst **12,147 ms**; the round-robin reaches any one workgroup roughly every 11 minutes
+across 11 workgroups; and the daemon keeps promoting new indexes, each of which
+invalidates the warm mark by inode. Three clean probes in a row, 11 minutes apart, on a
+graph whose mean probe is 8× the budget and whose index keeps being replaced, is not a
+race the lane can win — and every month of graph growth makes it worse. This is the
+failure mode the lever was built to cause deliberately, for safety; what it also caused
+was the lane's extinction.
+
+**Not used even in the window where it did fire.** 219 scent-bearing Claude turns
+yielded **3 same-turn exact pointer follows (1.4%)**, and all three are explained away:
+the prompt named the file, or the memory lane was already carrying it. This matches the
+earlier, independent sample recorded above under Pillar 2 planning — 0 explicit
+citations in 270 sampled scent deliveries.
+
+**Cost when it fired.** p50 **266 ms**, p90 1,058 ms, p99 4,775 ms, max **26,873 ms**,
+against a whole-turn context build of ~484 ms. A lane nobody follows was routinely
+doubling the turn's recall cost and occasionally adding half a minute.
+
+**Corroboration that the graph itself does not answer these questions.** Exact-match
+searches for known symbols returned nothing; a natural-language query returned an
+unrelated conversation; a focused query against A's 448,450-item graph timed out at
+25 s. Whatever a better scent lane would need, it is not available from this graph
+today.
+
+### Verification of the deletion
+
+Host and container `tsc --noEmit` clean. `src/modules/memory/` (7 files, 164 tests),
+`src/memory-migration-contract.test.ts` (27), and `recall-ranking` + `pre-turn-context` +
+`host-sweep` (224 across 3 files) pass, as does the container `formatter.test.ts` (64).
+`recall-ranking.test.ts` and the curator are untouched.
+
+**Delivered-context equivalence, against copies of `data/` only.** The staged A corpus
+was given a small real `WorkgroupGraphStore` fixture and warmed, so the pre-deletion
+control actually populated the lane — 14 of its 20 turns carried a scent. Comparing the
+two full `PreTurnContext` dumps turn by turn, the only difference is the `graphScent` key
+itself: **zero residual field differences** on all 20 turns, and no turn changed
+truncation state. The B run, which has no graph staged, is **byte-identical** between the
+two trees (`md5 6759ede6c9705d983ebe04683babc43a`).
+
+### What survives, and what a second attempt would inherit
+
+The Graphify daemon, `ncl graphify`, and the container gateway are untouched — scent was
+one consumer, and whether to keep the daemon running is a separate operator decision.
+`STOP_WORDS` moved back into `pre-turn-context.ts`, its only remaining consumer.
+
+A rebuild does not get to skip the two findings above. Warm-gating on page-cache
+residency does not survive graph growth, and pointers alone did not change behavior in
+two independent samples (270 deliveries, then 219 turns). Anything that delivers graph
+knowledge pre-turn has to solve delivery on a multi-GB index without a warmth race, and
+has to deliver something an agent demonstrably uses — content, not a path.

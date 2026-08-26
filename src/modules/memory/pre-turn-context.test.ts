@@ -56,8 +56,6 @@ import {
   type RecallCorpus,
 } from './pre-turn-context.js';
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
-import { probeGraphScentWarmth, _resetGraphScentForTest } from './graph-scent.js';
-import { WorkgroupGraphStore } from '../../graphify/store.js';
 import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
 import { GENERATED_MEMORY_MAX_BYTES } from './curator-contract.js';
@@ -177,7 +175,6 @@ beforeEach(() => {
 
 afterEach(() => {
   closeDb();
-  _resetGraphScentForTest();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
@@ -1445,112 +1442,7 @@ describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
   });
 });
 
-describe('graph scent lane (AC11-AC13)', () => {
-  const GRAPH_QUERY = 'How does the forecast pipeline reconcile snowflake volume data?';
-
-  function seedScentGraph(probe = true): void {
-    const store = new WorkgroupGraphStore(path.join(TEST_ROOT, 'graphify', 'workgroups', 'wg-a', 'index.db'), 'wg-a');
-    const generation = store.beginGeneration('scent');
-    for (let index = 0; index < 3; index++) {
-      store.upsertSource(
-        {
-          id: `src-${index}`,
-          workgroupId: 'wg-a',
-          kind: 'document',
-          relativePath: `workgroup/repo/forecast-${index}.md`,
-          contentHash: `hash-${index}`,
-        },
-        {
-          nodes: [
-            {
-              id: `node-${index}`,
-              name: 'forecast pipeline reconcile snowflake volume',
-              type: 'document_chunk',
-              description: 'forecast pipeline reconcile snowflake volume data',
-              evidence: [
-                {
-                  sourceId: `src-${index}`,
-                  relativePath: `workgroup/repo/forecast-${index}.md`,
-                  line: 1,
-                  excerpt: 'forecast',
-                },
-              ],
-            },
-          ],
-          edges: [],
-          hyperedges: [],
-        },
-        generation,
-      );
-    }
-    store.completeGeneration(generation);
-    store.close();
-    if (probe) probeGraphScentWarmth('wg-a');
-  }
-
-  function scentInput(overrides: Record<string, unknown> = {}) {
-    return {
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1 as const,
-      normalizedContent: JSON.stringify({ text: GRAPH_QUERY }),
-      // Scent/eviction tests exercise the ORDINARY 12k bound; bootstrap rows
-      // now get bootstrapFinalChars and would never reach it with these
-      // fixtures.
-      includeBootstrap: false,
-      ...overrides,
-    };
-  }
-
-  /** Enough matching memory + archive volume to sit near the final bound. */
-  function seedHeavyRecall(): void {
-    const sentence = 'The forecast pipeline reconcile snowflake volume data step is documented here in detail. ';
-    memoryFile('concepts/forecast.md', `# Forecast\n${sentence.repeat(30)}`);
-    memoryFile('facts/pipeline.md', `# Pipeline\n${sentence.repeat(30)}`);
-    memoryFile('conversations/volume.md', `# Volume\n${sentence.repeat(30)}`);
-    for (let index = 0; index < 4; index++) {
-      archive(`heavy-${index}`, 'ag-a', `${sentence.repeat(12)} (row ${index})`, `2026-07-2${index}T00:00:00.000Z`);
-    }
-  }
-
-  it('attaches the graph scent within its char bound (AC11)', () => {
-    seedScentGraph();
-    const result = buildPreTurnContext(scentInput());
-    expect(result.graphScent).toBeDefined();
-    expect(result.graphScent!.pointers.length).toBeGreaterThan(0);
-    expect(JSON.stringify(result.graphScent).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.graphScentChars);
-  });
-
-  it('never displaces memory or archive excerpts (AC12)', () => {
-    seedHeavyRecall();
-    // Baseline: lane cold (no probe), scent absent.
-    const baseline = buildPreTurnContext(scentInput());
-    expect(baseline.graphScent).toBeUndefined();
-    const baselineMemory = baseline.memoryEvidence.excerpts.length;
-    const baselineConversation = baseline.conversationEvidence.excerpts.length;
-    expect(baselineMemory).toBeGreaterThan(0);
-    expect(baselineConversation).toBeGreaterThan(0);
-
-    // Same content with the lane warm and populated. Under the bound the
-    // scent must actually ATTACH (review finding: without this assertion, a
-    // lane that never attaches passes the equality trivially).
-    seedScentGraph();
-    const withScent = buildPreTurnContext(scentInput());
-    expect(withScent.graphScent).toBeDefined();
-    expect(withScent.notices.some((n) => n.code === 'final-context-limit')).toBe(false);
-    expect(withScent.memoryEvidence.excerpts.length).toBe(baselineMemory);
-    expect(withScent.conversationEvidence.excerpts.length).toBe(baselineConversation);
-  });
-
-  // The shed-order invariant is tested at the enforceFinalBound seam directly
-  // (see the 'final-bound eviction order' describe): the bound fix made the
-  // final limit unreachable by naturally-constructed rows — measured saturated
-  // ceiling 21,134 chars vs the 22,000 bootstrap bound — which is the fix
-  // working, not missing coverage.
-});
-
-describe('final-bound eviction order (AC12b, AC13, AC13b at the seam)', () => {
+describe('final-bound eviction order at the seam', () => {
   const filler = (chars: number, tag: string) => `${tag} ${'x'.repeat(Math.max(0, chars - tag.length - 1))}`;
 
   function memRow(index: number, chars: number): MemoryEvidenceExcerpt {
@@ -1587,65 +1479,17 @@ describe('final-bound eviction order (AC12b, AC13, AC13b at the seam)', () => {
       provenance: { authority: 'host-message-archive', archiveId: `arc-${index}` },
     };
   }
-  const GRAPH_NOTICE: ContextNotice = { source: 'graph', status: 'degraded', code: 'graph-scent-cold', detail: 'cold' };
-
   /** A context whose serialized length lands finalChars + overBy exactly-ish. */
-  function makeContext(overBy: number, withScent: boolean, withGraphNotice: boolean) {
+  function makeContext(overBy: number) {
     const context: Parameters<typeof enforceFinalBound>[0] = {
       memoryEvidence: { core: [], excerpts: [memRow(0, 1_800), memRow(1, 1_800), memRow(2, 1_800)] },
       conversationEvidence: { excerpts: [convRow(0, 900), convRow(1, 900), convRow(2, 900)] },
-      ...(withScent
-        ? { graphScent: { terms: ['forecast', 'pipeline'], pointers: [{ path: 'workgroup/repo/a.ts', type: 'code' }] } }
-        : {}),
-      notices: [
-        { source: 'context', status: 'ok', code: 'current-input-authoritative', detail: 'x' },
-        ...(withGraphNotice ? [{ ...GRAPH_NOTICE }] : []),
-      ],
+      notices: [{ source: 'context', status: 'ok', code: 'current-input-authoritative', detail: 'x' }],
     };
     const pad = PRE_TURN_BOUNDS.finalChars + overBy - JSON.stringify(context).length;
     if (pad > 160) context.memoryEvidence.excerpts.unshift(memRow(9, pad - 152));
     return context;
   }
-
-  it('a scent that alone tips the context over the bound is shed, displacing nothing (AC12b)', () => {
-    const context = makeContext(90, true, false);
-    // Guard the construction: over WITH the scent, under WITHOUT it.
-    const withScentLength = JSON.stringify(context).length;
-    const scentChars = JSON.stringify({ graphScent: context.graphScent }).length;
-    expect(withScentLength).toBeGreaterThan(PRE_TURN_BOUNDS.finalChars);
-    expect(withScentLength - scentChars).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
-    const memBefore = context.memoryEvidence.excerpts.length;
-    const convBefore = context.conversationEvidence.excerpts.length;
-    enforceFinalBound(context);
-    expect(context.graphScent).toBeUndefined();
-    expect(context.memoryEvidence.excerpts.length).toBe(memBefore);
-    expect(context.conversationEvidence.excerpts.length).toBe(convBefore);
-    // Contract note: the function appends its final-context-limit notice AFTER
-    // trimming, so a minimal-notice context may end slightly over; real rows
-    // absorb this in late notice eviction. Assert the trim, not notice bytes.
-    expect(JSON.stringify(context).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars + 200);
-  });
-
-  it('sheds the whole graph lane before any excerpt moves (AC13)', () => {
-    const context = makeContext(140, true, true);
-    const memBefore = context.memoryEvidence.excerpts.length;
-    const convBefore = context.conversationEvidence.excerpts.length;
-    enforceFinalBound(context);
-    expect(context.graphScent).toBeUndefined();
-    expect(context.notices.some((n) => n.source === 'graph')).toBe(false);
-    expect(context.memoryEvidence.excerpts.length).toBe(memBefore);
-    expect(context.conversationEvidence.excerpts.length).toBe(convBefore);
-  });
-
-  it('sheds a graph notice with the lane even when no scent attached (AC13b)', () => {
-    const context = makeContext(50, false, true);
-    const memBefore = context.memoryEvidence.excerpts.length;
-    const convBefore = context.conversationEvidence.excerpts.length;
-    enforceFinalBound(context);
-    expect(context.notices.some((n) => n.source === 'graph')).toBe(false);
-    expect(context.memoryEvidence.excerpts.length).toBe(memBefore);
-    expect(context.conversationEvidence.excerpts.length).toBe(convBefore);
-  });
 
   /** Build a context whose serialized size lands near targetChars. */
   function makeSized(
@@ -1709,11 +1553,10 @@ describe('final-bound eviction order (AC12b, AC13, AC13b at the seam)', () => {
     expect(context.notices.some((n) => n.code === 'final-context-limit')).toBe(false);
   });
 
-  it('past the lane, conversation excerpts still evict before memory (order regression)', () => {
-    const context = makeContext(1_500, true, true);
+  it('conversation excerpts evict before memory (order regression)', () => {
+    const context = makeContext(1_500);
     const memBefore = context.memoryEvidence.excerpts.length;
     enforceFinalBound(context);
-    expect(context.graphScent).toBeUndefined();
     expect(context.conversationEvidence.excerpts.length).toBeLessThan(3);
     expect(context.memoryEvidence.excerpts.length).toBe(memBefore);
     expect(JSON.stringify(context).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars + 200);
