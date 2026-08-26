@@ -22,15 +22,18 @@ Otherwise continue. Every step below is safe to re-run.
 
 ### 1. Fetch the channels branch
 
+The DeltaChat adapter lives on `upstream`'s `channels` branch — `origin`'s copy
+of that branch doesn't carry it yet:
+
 ```bash
-git fetch origin channels
+git fetch upstream channels
 ```
 
 ### 2. Copy the adapter and its registration test
 
 ```bash
-git show origin/channels:src/channels/deltachat.ts                 > src/channels/deltachat.ts
-git show origin/channels:src/channels/deltachat-registration.test.ts > src/channels/deltachat-registration.test.ts
+git show upstream/channels:src/channels/deltachat.ts                 > src/channels/deltachat.ts
+git show upstream/channels:src/channels/deltachat-registration.test.ts > src/channels/deltachat-registration.test.ts
 ```
 
 ### 3. Append the self-registration import
