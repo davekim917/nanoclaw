@@ -108,8 +108,8 @@ export function buildSystemPromptAddendum(assistantName?: string, mode: SessionM
   if (assistantName) {
     // Workgroup awareness — set by the host (container-runner) via
     // NANOCLAW_WORKGROUP_ID when the agent_group has one. The workgroup is
-    // the multi-agent tenant boundary (chat archive, Graphify retrieval, OneCLI
-    // secret pool). The agent knows which scope it operates under so prompts
+    // the multi-agent tenant boundary (chat archive, OneCLI secret pool).
+    // The agent knows which scope it operates under so prompts
     // grounded in "my workgroup is X" reach the right peers and data pool.
     const workgroupId = typeof process !== 'undefined' ? process.env?.NANOCLAW_WORKGROUP_ID : undefined;
     // Peer identity injection — NANOCLAW_PEERS is set by container-runner

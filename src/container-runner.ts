@@ -3014,7 +3014,7 @@ export function selectedSkillNames(containerConfig: import('./container-config.j
         })()
       : containerConfig.skills;
 
-  return [...new Set([...requested, 'graphify'])];
+  return [...new Set(requested)];
 }
 
 /** Universal, bounded Graphify runtime flags applied to every provider. */
