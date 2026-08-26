@@ -471,7 +471,7 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
 
 /**
  * Run the PostToolUse hook chain. Captures durable Bash/WebFetch/MCP output
- * into sources/inbox for Graphify; always clears the in-flight tracker.
+ * into sources/inbox; always clears the in-flight tracker.
  */
 export async function runPostToolUseChain(input: CodexHookInput): Promise<unknown> {
   const normalized = normalizeCodexHookInput(input);

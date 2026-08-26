@@ -8,7 +8,6 @@ describe('/update-container deterministic workflow', () => {
     expect(UPDATE_CONTAINER_PROMPT).toContain('scripts/container-updates.ts apply --repo <clone> --items');
     expect(UPDATE_CONTAINER_PROMPT).toContain('do not clone, edit, branch, commit, push, or open a PR before');
     expect(UPDATE_CONTAINER_PROMPT).toContain('Keep host and container changes in separate NanoClaw PRs');
-    expect(UPDATE_CONTAINER_PROMPT).toContain('fails its installed-engine behavior contract');
     expect(UPDATE_CONTAINER_PROMPT).toContain('Never merge, deploy, restart services');
   });
 

@@ -235,7 +235,7 @@ describe('createCodexConfigOverrides', () => {
     expect(createCodexConfigOverrides()).not.toEqual(expect.arrayContaining([expect.stringMatching(/^service_tier=/)]));
   });
 
-  it('disables Codex opaque memories so Graphify remains the derived retrieval layer', () => {
+  it('disables Codex opaque memories so canonical Markdown remains the retrieval layer', () => {
     const overrides = createCodexConfigOverrides();
     expect(overrides).toContain('memories.generate_memories=false');
     expect(overrides).toContain('memories.use_memories=false');

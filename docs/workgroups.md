@@ -4,7 +4,6 @@ A **workgroup** is a tenant-level grouping that contains one or more `agent_grou
 
 - **Chat archive** — sibling agents in a workgroup can read each other's archived chat history via the existing `resolve_thread_link` / `search_threads` / `read_thread` MCP tools.
 - **Durable memory** — siblings read and edit one canonical Markdown tree and receive workgroup-wide recall before every admissible turn.
-- **Graphify knowledge retrieval** — members may query one advisory graph over shared files, repositories, and conversations.
 - **OneCLI secret declarations** — workgroup-level secrets are inherited by all member agent_groups at container spawn time.
 
 Sibling `agent_groups` (e.g., a Claude twin + a Codex twin, plus future siblings like `<x>-research` or `<x>-data-analyst`) are peers — each remains a separate row in the database with its own platform bot user, CLAUDE.md, container, and routing identity. No sibling is a parent of another; the workgroup is the layer **above** them, not a collapse and not a hierarchy.
@@ -47,11 +46,7 @@ excess work queued rather than dropping it.
 Before every admissible turn, the host supplies actual session capabilities,
 canonical memory, same-thread evidence, workgroup-wide archive recall, and
 exact Slack/Discord permalink provenance. Missing or failed sources produce an
-explicit degraded notice; they never broaden the workgroup boundary. Graphify
-is advisory rather than a memory authority, but agents must use it on demand
-when a task depends on code, architecture, requirements, prior decisions, or
-cross-artifact lineage. It is not a prerequisite for basic first-response
-memory recall.
+explicit degraded notice; they never broaden the workgroup boundary.
 
 Provider identity, instructions, configuration, continuation state, and all
 non-memory customizations remain sibling-scoped. Sharing memory does not merge
@@ -117,9 +112,9 @@ The structural test at `tests/structural/projection-chokepoint.test.ts` enforces
 
 `workgroups.attention_sources` (migration 057) is declared on the **workgroup** row, and the files it points at live under `groups/<workgroup>/<root>`. Both sides of that are workgroup data by the same rule as the shared files around them, so the items read out of it pool as well.
 
-| Table / source                 | Pool to workgroup?                       | Why                                                                     |
-| ------------------------------ | ---------------------------------------- | ----------------------------------------------------------------------- |
-| `workgroups.attention_sources` | **Yes** — the column is on the workgroup | The declared root is a directory in the shared workgroup folder          |
+| Table / source                 | Pool to workgroup?                       | Why                                                             |
+| ------------------------------ | ---------------------------------------- | --------------------------------------------------------------- |
+| `workgroups.attention_sources` | **Yes** — the column is on the workgroup | The declared root is a directory in the shared workgroup folder |
 
 The consequence is worth stating outright, because it is coarser than every other row on the Observatory's thread endpoint: **a caller entitled to any ONE agent group in a workgroup sees every attention item that workgroup declares.** An attention item is ownerless by construction — that is what makes it an attention item — so it carries no `agent_group_id` to filter on, and there is nothing finer to gate against without inventing an owner.
 
@@ -144,7 +139,7 @@ When sibling agents are wired to the same chat channel, each agent's adapter wri
 
 Each `(workgroup, repository)` has one host-owned normal clone at
 `data/repositories/<workgroup>/<repo>`. Its working tree is never mounted into
-agent containers. Graphify reads that clean host tree directly.
+agent containers; host tooling reads that clean tree directly.
 
 Each conversation topic gets one standard linked worktree under
 `data/v2-topics/<workgroup>/<work-unit>/worktrees/<repo>`, mounted at
@@ -166,23 +161,6 @@ stopped service, zero install containers, no repository writers, and a passing
 allocated-byte capacity gate. It keeps hash-bound manifests, synthetic rescue
 refs, external bundles, and the complete old topology in host-only migration
 storage through audit and rollback retention.
-
----
-
-## Graphify graph routing
-
-Every workgroup has one derived Graphify database under
-`data/graphify/workgroups/<workgroup-id>/index.db`. The daemon resolves group
-membership from the central DB and indexes all sibling group roots, the shared
-workgroup root, canonical clones, and projected conversation history. Git does
-not determine eligibility: tracked, untracked, and gitignored knowledge files
-are included unless a narrow `.graphifyignore` rule excludes them.
-
-Containers call Graphify through `ncl`, which derives the workgroup from trusted
-session context. Callers cannot supply a cross-workgroup override. A current
-thread's managed worktree is admitted only after the host validates that the
-session belongs to the same workgroup. Graphify output is optional and
-advisory. Canonical Markdown and exact archive provenance remain authoritative.
 
 ---
 

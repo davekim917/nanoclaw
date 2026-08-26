@@ -6,14 +6,14 @@ import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
 
 const INBOX_DIR = '/workspace/agent/sources/inbox';
 // Sibling staging directory for atomic-write temp files. MUST live OUTSIDE
-// INBOX_DIR so Graphify never observes a partial temporary file. Writing the
+// INBOX_DIR so a reader never observes a partial temporary file. Writing the
 // temp here and then linking into INBOX_DIR means discovery only sees the
 // final filename. This keeps atomic no-clobber semantics without transient
-// artifacts entering the workgroup graph.
+// artifacts entering the workgroup sources tree.
 const STAGING_DIR = '/workspace/agent/sources/.tmp';
 // Cap captured content size. A large web page or a `gws gmail search` returning
 // hundreds of items could otherwise write a multi-MB file. An unbounded write
-// path increases Graphify indexing cost and can swamp later retrieval context.
+// path can swamp later retrieval context.
 // 50KB is large enough for a substantive article or meeting transcript while
 // bounding waste from adversarial or accidentally enormous tool output.
 const MAX_CAPTURE_BYTES = 50_000;
@@ -52,7 +52,8 @@ const CAPTURE_FAILURE_LOG_LIMIT = 20;
 function logCaptureFailure(context: string, err: unknown): void {
   if (_captureFailureLogCount >= CAPTURE_FAILURE_LOG_LIMIT) return;
   _captureFailureLogCount++;
-  const errClass = err instanceof Error ? err.constructor.name + ':' + err.message.slice(0, 80) : String(err).slice(0, 80);
+  const errClass =
+    err instanceof Error ? err.constructor.name + ':' + err.message.slice(0, 80) : String(err).slice(0, 80);
   const suffix = _captureFailureLogCount === CAPTURE_FAILURE_LOG_LIMIT ? ' (further capture errors suppressed)' : '';
   console.error(`[source-capture] ${context}: ${errClass}${suffix}`);
 }
@@ -163,7 +164,10 @@ export const MCP_CAPTURE_TOOLS: ReadonlyArray<{
     name: 'mcp__linear__get_issue',
     prefix: 'linear',
     hashOf: (input: unknown) => {
-      const id = (input as { id?: string; issueId?: string })?.id ?? (input as { issueId?: string })?.issueId ?? JSON.stringify(input);
+      const id =
+        (input as { id?: string; issueId?: string })?.id ??
+        (input as { issueId?: string })?.issueId ??
+        JSON.stringify(input);
       return id;
     },
     serialize: (output: unknown) => JSON.stringify(output, null, 2),
@@ -173,9 +177,8 @@ export const MCP_CAPTURE_TOOLS: ReadonlyArray<{
     prefix: 'github',
     hashOf: (input: unknown) => {
       const i = input as { owner?: string; repo?: string; pull_number?: number };
-      const id = i.owner && i.repo && i.pull_number != null
-        ? `${i.owner}/${i.repo}/${i.pull_number}`
-        : JSON.stringify(input);
+      const id =
+        i.owner && i.repo && i.pull_number != null ? `${i.owner}/${i.repo}/${i.pull_number}` : JSON.stringify(input);
       return id;
     },
     serialize: (output: unknown) => JSON.stringify(output, null, 2),
@@ -209,7 +212,10 @@ export const MCP_CAPTURE_TOOLS: ReadonlyArray<{
   {
     name: 'mcp__exa__company_research_exa',
     prefix: 'exa-company',
-    hashOf: (input: unknown) => (input as { company_name?: string; domain?: string })?.company_name ?? (input as { domain?: string })?.domain ?? JSON.stringify(input),
+    hashOf: (input: unknown) =>
+      (input as { company_name?: string; domain?: string })?.company_name ??
+      (input as { domain?: string })?.domain ??
+      JSON.stringify(input),
     serialize: (output: unknown) => JSON.stringify(output, null, 2),
   },
   {

@@ -292,17 +292,16 @@ containers yield to host processes under load.
 
 ## Supply Chain Security
 
-NanoClaw intentionally tracks the latest stable dependency releases without a release-age delay. The shared release adapter rejects prerelease/beta/RC/dev/nightly, draft, yanked, source-only Graphify, and target-incompatible candidates. A registry error is reported as unknown and cannot be treated as current.
+NanoClaw intentionally tracks the latest stable dependency releases without a release-age delay. The shared release adapter rejects prerelease/beta/RC/dev/nightly, draft, yanked, and target-incompatible candidates. A registry error is reported as unknown and cannot be treated as current.
 
-`bun scripts/container-updates.ts audit --format json` is the canonical audit for host pnpm dependencies, agent-runner Bun dependencies, Dockerfile pins, Graphify, and Codex-synchronized files. `apply` requires explicit item IDs and a writable clone. The Monday task is advisory only; `/update-container` asks for human selection and prepares reviewed PRs. Neither path merges or deploys.
+`bun scripts/container-updates.ts audit --format json` is the canonical audit for host pnpm dependencies, agent-runner Bun dependencies, Dockerfile pins, and Codex-synchronized files. `apply` requires explicit item IDs and a writable clone. The Monday task is advisory only; `/update-container` asks for human selection and prepares reviewed PRs. Neither path merges or deploys.
 
 Release freshness is not the safety boundary. These controls are:
 
-- exact Docker/runtime pins and committed pnpm/Bun/Graphify lockfiles;
+- exact Docker/runtime pins and committed pnpm/Bun lockfiles;
 - unchanged build-script allowlists unless a human explicitly approves a new entry;
 - test, build, diff, and manual-merge gates;
 - separate host and container PRs because they have different activation and rollback boundaries;
-- Graphify patch, upstream source, skill hash, wheel hash, platform, and capability-ledger checks.
 
 ### Build Script Allowlist
 

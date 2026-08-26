@@ -324,7 +324,7 @@ export async function refreshCanonicalFromLocalRefs(input: {
       if (!remoteHead.startsWith('refs/remotes/origin/')) throw new Error('origin/HEAD is not resolved');
       const oid = git(canonical, ['rev-parse', '--verify', `${remoteHead}^{commit}`], 10_000);
       // Keep the canonical detached so it never reserves a branch that a
-      // topic worktree needs. Graphify still reads the freshly checked-out
+      // topic worktree needs. Readers still see the freshly checked-out
       // remote-default tree from the host-only canonical.
       git(canonical, ['checkout', '-q', '--detach', remoteHead], 30_000);
       git(canonical, ['config', 'gc.auto', '0'], 10_000);
@@ -677,7 +677,7 @@ export async function applyRepositoryRefreshAction(
       threadId: session.thread_id,
       content: JSON.stringify({
         text:
-          `Repository warning: ${repo} fetched successfully in this topic, but the host canonical/Graphify ` +
+          `Repository warning: ${repo} fetched successfully in this topic, but the host canonical ` +
           `refresh failed and must not be treated as fresh. ${message}`,
         sender: 'system',
         senderId: 'system',
