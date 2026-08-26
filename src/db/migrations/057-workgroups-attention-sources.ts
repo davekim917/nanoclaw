@@ -25,7 +25,7 @@ import type { Migration } from './index.js';
  * ## Why `workgroups` and not somewhere else
  *
  * The workgroup is already the data-pool boundary (CLAUDE.md: chat archive,
- * Graphify retrieval, shared files, OneCLI declarations) AND the console's
+ * archive retrieval, shared files, OneCLI declarations) AND the console's
  * primary filter axis (DESIGN.md §3.5). A feed of ownerless work items is
  * scoped to exactly one workgroup's pool of files, and the console filters it
  * on exactly that axis. Any other home would need a join to answer both

@@ -157,7 +157,7 @@ export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): 
 /**
  * Refuse to wire an agent into a messaging-group row already served by a
  * different workgroup. Agents fanned out on one wiring row share thread
- * worktrees and Graphify caches, so a row never spans workgroups. Workgroup
+ * worktrees, so a row never spans workgroups. Workgroup
  * identity falls back to the group folder for pre-workgroup rows, matching
  * container-runner's resolution.
  */

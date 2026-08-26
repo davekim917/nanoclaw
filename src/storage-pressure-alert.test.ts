@@ -67,13 +67,13 @@ function report(usagePct: number): StorageReport {
       dispositions: [
         {
           id: 'sha256:protected',
-          repoTags: ['nanoclaw:graphify'],
+          repoTags: ['nanoclaw:stale-candidate'],
           createdAt: '2026-07-18T00:00:00.000Z',
           sizeBytes: 900_000,
           labels: {},
           disposition: 'protected',
           protectionReason: 'retention-lease',
-          owner: 'graphify',
+          owner: 'stale-candidate',
           leaseExpiresAt: '2026-07-25T00:00:00.000Z',
         },
       ],
@@ -119,7 +119,7 @@ describe('storage pressure administrator alerts', () => {
 
     expect(mocks.deliver).toHaveBeenCalledTimes(2);
     expect(mocks.deliver.mock.calls[0]?.[4]).toContain('Storage pressure remains critical');
-    expect(mocks.deliver.mock.calls[0]?.[4]).toContain('graphify');
+    expect(mocks.deliver.mock.calls[0]?.[4]).toContain('stale-candidate');
   });
 
   it('resets deduplication after recovery below 90 percent', async () => {

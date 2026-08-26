@@ -93,7 +93,7 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_archive_ag_sent ON messages_archive(agent_group_id, sent_at);
     CREATE INDEX IF NOT EXISTS idx_archive_thread ON messages_archive(agent_group_id, thread_id, sent_at);
     CREATE INDEX IF NOT EXISTS idx_archive_channel ON messages_archive(channel_type, platform_id, thread_id);
-    -- Covering index for the Graphify daemon's archive-change fingerprint
+    -- Covering index for the archive-change fingerprint
     -- (pollArchiveOnce, every 10s). Without it that poll scans the table and
     -- reads every row's text — it was the single largest disk consumer on the
     -- box, and the resulting IO saturation is what stalled the host's event

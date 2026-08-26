@@ -569,7 +569,7 @@ function inventoryCandidates(
   }
 
   // Legacy thread checkout paths outside session roots get the same canonical
-  // work-unit used by spawn/create/Graphify/cleanup. Inventory the physical
+  // work-unit used by spawn/create/cleanup. Inventory the physical
   // tree too so deleted DB rows cannot hide historical work.
   const physicalThreadUnits = new Map<string, RepositoryWorkUnit[]>();
   for (const row of rows) {

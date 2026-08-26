@@ -357,7 +357,7 @@ export interface ContainerConfig {
 
   /**
    * The workgroup this agent belongs to. Set by migration 036 and written
-   * into container.json for workgroup-scoped Graphify indexing and retrieval.
+   * into container.json for workgroup-scoped retrieval.
    *
    * Value matches workgroups.id (e.g. "example-retail" for both example-retail
    * and example-retail-codex agents).

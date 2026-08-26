@@ -58,11 +58,6 @@ if [ -z "${INSTALL_CJK_FONTS:-}" ] && [ -f "../.env" ]; then
 fi
 
 BUILD_ARGS=()
-# Keep the main build context restricted to container/, while exposing only
-# the host-side Graphify release adapter needed by the in-image contract test.
-# A named context avoids duplicating that source under container/ (and the
-# resulting drift) without sending the full repository to the builder.
-BUILD_ARGS+=(--build-context "graphify-release-adapter=$PROJECT_ROOT/scripts")
 if [ "${INSTALL_CJK_FONTS:-false}" = "true" ]; then
     echo "CJK fonts: enabled (adds ~200MB)"
     BUILD_ARGS+=(--build-arg INSTALL_CJK_FONTS=true)

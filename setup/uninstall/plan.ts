@@ -64,22 +64,6 @@ export function buildRemovalPlan(inv: Inventory, d: Decisions): RemovalAction[] 
         unitName: path.basename(s.launchdPlist, '.plist'),
       });
     }
-    if (s.graphifySystemdUserUnit) {
-      actions.push({
-        kind: 'unload-service',
-        flavor: 'systemd-user',
-        unitPath: s.graphifySystemdUserUnit,
-        unitName: path.basename(s.graphifySystemdUserUnit, '.service'),
-      });
-    }
-    if (s.graphifySystemdSystemUnit) {
-      actions.push({
-        kind: 'unload-service',
-        flavor: 'systemd-system',
-        unitPath: s.graphifySystemdSystemUnit,
-        unitName: path.basename(s.graphifySystemdSystemUnit, '.service'),
-      });
-    }
     if (s.systemdUserUnit) {
       actions.push({
         kind: 'unload-service',

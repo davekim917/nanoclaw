@@ -99,7 +99,7 @@ route work to them. A stated role or ownership counts even when it arrives in
 passing rather than as a decision; before this category existed, 134 archived
 messages mentioning two named feed liaisons distilled to zero facts about who
 they were. It rejects secrets, capability state, transient work, speculation,
-third-party uncertainty, and facts recoverable from code or Graphify.
+third-party uncertainty, and facts recoverable from code.
 A worked method that succeeded — a query pattern, an API sequence, a debugging
 technique — is a durable workflow, distinct from the raw output around it.
 Agents also record methods directly at solve time under `memory/methods/`
@@ -229,20 +229,6 @@ cannot expose half a turn.
 
 `data/archive.db` retains exact message provenance. Archive retrieval is
 read-only and workgroup-scoped; it does not become another memory authority.
-
-## Graphify
-
-Graphify is on demand and advisory in authority, but required when a task depends on prior
-decisions, requirements, cross-artifact lineage, architecture, or code
-relationships. It complements automatic memory by navigating source artifacts;
-it is not an automatic pre-turn source, not the correctness floor for basic
-first-response recall, and never replaces the Markdown canon or exact archive
-provenance. Open cited source material before a consequential claim or code
-change.
-
-Container sessions use the Graphify gateway; host operators use
-`ncl graphify --group <agent-group-id>`. Trusted caller context owns graph
-selection.
 
 ## Migration and rollback
 

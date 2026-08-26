@@ -36,9 +36,6 @@ vi.mock('./capabilities.js', async (importOriginal) => {
 });
 
 import {
-  graphifyRuntimeDir,
-  sessionGraphifyCacheDir,
-  threadGraphifyCacheDir,
   threadWorktreeDir,
   threadsBaseDir,
   initSessionFolder,
@@ -134,36 +131,6 @@ describe('threadWorktreeDir', () => {
     expect(got).not.toContain('?');
     expect(got).not.toContain(':');
     expect(got).not.toContain('\\');
-  });
-});
-
-describe('Graphify cache paths', () => {
-  it('test_graphify_thread_cache_is_sibling_shared', () => {
-    const threadId = 'slack:CTEST00004:1778800261.935259';
-    const fromClaude = threadGraphifyCacheDir('slack:CTEST00004', threadId);
-    const fromCodex = threadGraphifyCacheDir('slack:CTEST00004', threadId);
-
-    expect(fromClaude).toBe(fromCodex);
-    expect(fromClaude).toBe(path.join(threadsBaseDir(), 'slack_CTEST00004_1778800261.935259', 'graphify-cache'));
-    expect(fromClaude).not.toContain(':');
-    expect(threadGraphifyCacheDir('slack:CTEST00004', 'thread-a')).not.toBe(
-      threadGraphifyCacheDir('slack:CTEST00004', 'thread-b'),
-    );
-  });
-
-  it('test_graphify_session_cache_is_isolated', () => {
-    const first = sessionGraphifyCacheDir('agent-a', 'session-a');
-    const second = sessionGraphifyCacheDir('agent-a', 'session-b');
-
-    expect(first).toBe(path.join(sessionDir('agent-a', 'session-a'), 'graphify-cache'));
-    expect(first).not.toBe(second);
-    expect(first).not.toContain('/workspace/agent');
-  });
-
-  it('test_graphify_runtime_dir_is_install_scoped', () => {
-    expect(graphifyRuntimeDir()).toBe('/tmp/nanoclaw-test-write-outbound/graphify-runtime');
-    expect(graphifyRuntimeDir()).not.toContain('/tmp/home');
-    expect(graphifyRuntimeDir()).not.toContain('/workspace/agent');
   });
 });
 

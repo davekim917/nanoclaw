@@ -41,7 +41,6 @@ Sources: `container/agent-runner/src/destinations.ts` (runtime system prompt),
 | Truth-grounding; training data never assumed; no guessing | `container/CLAUDE.md:36-38` | Anti-fabrication |
 | Read referenced content end-to-end | `container/CLAUDE.md:40` | Anti-fabrication. **Conflict C4** — clarify, don't cut |
 | Read source before answering about own infrastructure | `container/CLAUDE.md:46-48` | Anti-fabrication |
-| Graphify is advisory — open cited provenance before acting | `container/CLAUDE.md:103` | Anti-fabrication |
 | An existing test is the current contract | `container/CLAUDE.md:62` | Prevents silently rewriting contracts |
 | Don't claim completion without verification | `container/CLAUDE.md:44` (intent) | **Intent only.** The mandated 3-part form is bucket 3 |
 | Never lazy about validation at trust boundaries, data-loss error handling, security, accessibility | ponytail `:25-27` | Ponytail already carves out its own invariants |

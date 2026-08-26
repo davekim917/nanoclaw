@@ -1365,7 +1365,7 @@ describe('storage-manager Docker cleanup', () => {
       },
       {
         Id: 'sha256:expired',
-        RepoTags: [`${CONTAINER_IMAGE_BASE}:graphify-old`],
+        RepoTags: [`${CONTAINER_IMAGE_BASE}:candidate-old`],
         Created: '2026-07-01T00:00:00.000Z',
         Size: 1_000,
         Config: {
@@ -1836,14 +1836,14 @@ describe('storage-manager image protection', () => {
       labels: {
         ...baseImage.labels,
         'nanoclaw.retention.created_at': '2026-07-18T00:00:00.000Z',
-        'nanoclaw.retention.owner': 'graphify-session',
+        'nanoclaw.retention.owner': 'candidate-session',
       },
     });
 
     expect(result).toMatchObject({
       disposition: 'protected',
       protectionReason: 'retention-lease',
-      owner: 'graphify-session',
+      owner: 'candidate-session',
       leaseExpiresAt: '2026-07-25T00:00:00.000Z',
     });
   });

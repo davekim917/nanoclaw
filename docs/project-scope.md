@@ -12,7 +12,6 @@ framework: node-host-bun-container   # Node host process; per-agent-group contai
 test_framework: vitest                # host (Node); container uses bun:test
 
 relevant_global_skills:
-  - graphify
 
 quality_gates:
   - "host typecheck via tsc passes; container typecheck via bun run typecheck passes"
@@ -37,7 +36,7 @@ description: >
   per session (inbound.db / outbound.db) — no IPC, no stdin piping. Agent groups retain
   provider identity, CLAUDE.md, skills, and container config, while sibling groups belong
   to a workgroup that intentionally shares the work area, canonical repositories,
-  conversation archive, Graphify graph, OneCLI secret baseline, and other durable
+  conversation archive, OneCLI secret baseline, and other durable
   knowledge. Channel adapters install as skill branches that copy code into standard
   paths. Runtime customizations must preserve workgroup isolation, intentional sibling
   sharing, session-scoped credential safety, provider parity, worktree safety, bounded

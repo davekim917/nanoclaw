@@ -507,7 +507,7 @@ async function performAgentRoute(
 
 /**
  * Mirror the routed message into the central archive, the way router.ts
- * mirrors channel inbound. Graphify and the pre-turn recall lane index the
+ * mirrors channel inbound. The archive and the pre-turn recall lane index the
  * archive, not the per-session DBs, so without this an agent-to-agent
  * hand-off is unfindable through the whole retrieval layer.
  *

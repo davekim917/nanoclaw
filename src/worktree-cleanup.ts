@@ -22,7 +22,6 @@ import {
   canonicalRepoDir,
   defaultTopicBranch,
   resolveRepositoryWorkUnit,
-  topicGraphifyCacheDir,
   topicStateDir,
   topicWorktreesDir,
   transferTombstonesDir,
@@ -50,15 +49,6 @@ export interface TopicWorktreeTarget {
   repo: string;
   worktreePath: string;
   canonicalRepoPath: string;
-  graphifyCachePath: string;
-}
-
-export interface OrphanGraphifyCacheTarget {
-  workUnit: RepositoryWorkUnit;
-  participants: TopicParticipant[];
-  repo: string;
-  worktreePath: string;
-  graphifyCachePath: string;
 }
 
 interface SessionRow {
@@ -145,39 +135,28 @@ function participantsByTopic(
   return result;
 }
 
-function discover(dataDir: string = DATA_DIR): {
-  worktrees: TopicWorktreeTarget[];
-  orphanCaches: OrphanGraphifyCacheTarget[];
-} {
+function discover(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
   const mapping = participantsByTopic(dataDir);
   const worktrees: TopicWorktreeTarget[] = [];
-  const orphanCaches: OrphanGraphifyCacheTarget[] = [];
 
   // Only DB-resolvable topics are deletion candidates. Unknown directories are
   // deliberately left intact: missing metadata is never deletion authority.
   for (const [statePath, { unit, participants }] of mapping) {
     if (!fs.existsSync(statePath)) continue;
     const worktreeRoot = topicWorktreesDir(unit, dataDir);
-    const cacheRoot = topicGraphifyCacheDir(unit, dataDir);
-    const repos = new Set([...safeDirectories(worktreeRoot), ...safeDirectories(cacheRoot)]);
-    for (const repo of [...repos].sort()) {
+    for (const repo of safeDirectories(worktreeRoot).sort()) {
       const worktreePath = path.join(worktreeRoot, repo);
-      const graphifyCachePath = path.join(cacheRoot, repo);
-      if (fs.existsSync(worktreePath)) {
-        worktrees.push({
-          workUnit: unit,
-          participants,
-          repo,
-          worktreePath,
-          canonicalRepoPath: canonicalRepoDir(unit.workgroupId, repo, dataDir),
-          graphifyCachePath,
-        });
-      } else if (fs.existsSync(graphifyCachePath)) {
-        orphanCaches.push({ workUnit: unit, participants, repo, worktreePath, graphifyCachePath });
-      }
+      if (!fs.existsSync(worktreePath)) continue;
+      worktrees.push({
+        workUnit: unit,
+        participants,
+        repo,
+        worktreePath,
+        canonicalRepoPath: canonicalRepoDir(unit.workgroupId, repo, dataDir),
+      });
     }
   }
-  return { worktrees, orphanCaches };
+  return worktrees;
 }
 
 function participantHasPersistedWork(participant: TopicParticipant): boolean {
@@ -284,17 +263,6 @@ function branchMayBeRemoved(target: TopicWorktreeTarget): { eligible: boolean; r
   return { eligible: merged || gone, reason: merged ? 'merged' : gone ? 'remote-branch-gone' : 'unmerged' };
 }
 
-function removeContainedCache(
-  target: Pick<TopicWorktreeTarget, 'workUnit' | 'repo' | 'graphifyCachePath'>,
-  dataDir: string,
-): void {
-  const expected = path.join(topicGraphifyCacheDir(target.workUnit, dataDir), target.repo);
-  if (path.resolve(target.graphifyCachePath) !== path.resolve(expected)) {
-    throw new Error('Graphify cache path escaped its topic root');
-  }
-  fs.rmSync(expected, { recursive: true, force: true });
-}
-
 async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DIR): Promise<void> {
   const context = { workgroupId: target.workUnit.workgroupId, workUnit: target.workUnit.key, repo: target.repo };
   if (topicIsBusy(target.participants)) return;
@@ -337,7 +305,6 @@ async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DI
             timeout: 30_000,
           });
         }
-        removeContainedCache(target, dataDir);
         log.info('Worktree cleanup: removed inactive clean linked checkout', { ...context, reason: decision.reason });
       },
       dataDir,
@@ -345,24 +312,12 @@ async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DI
   );
 }
 
-async function cleanupOrphanCache(target: OrphanGraphifyCacheTarget, dataDir: string): Promise<void> {
-  if (topicIsBusy(target.participants) || fs.existsSync(target.worktreePath)) return;
-  if (transferReferencesPath(target, dataDir)) return;
-  removeContainedCache(target as TopicWorktreeTarget, dataDir);
-}
-
 export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promise<void> {
-  const { worktrees, orphanCaches } = discover(dataDir);
-  for (const target of worktrees) await cleanupOne(target, dataDir);
-  for (const target of orphanCaches) await cleanupOrphanCache(target, dataDir);
+  for (const target of discover(dataDir)) await cleanupOne(target, dataDir);
 }
 
 export function _discoverWorktreesForTesting(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
-  return discover(dataDir).worktrees;
-}
-
-export function _discoverOrphanGraphifyCachesForTesting(dataDir: string = DATA_DIR): OrphanGraphifyCacheTarget[] {
-  return discover(dataDir).orphanCaches;
+  return discover(dataDir);
 }
 
 export async function _cleanupOneForTesting(target: TopicWorktreeTarget, dataDir: string = DATA_DIR): Promise<void> {

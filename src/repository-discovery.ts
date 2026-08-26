@@ -12,13 +12,11 @@ import path from 'path';
 export const SESSION_RUNTIME_REPOSITORY_EXCLUSIONS = new Set([
   '.cache',
   '.claude-projects',
-  '.graphify-stage',
   'agent',
   'codex',
   'codex-fallbacks',
   'extra',
   'global',
-  'graphify-cache',
   'inbox',
   'opencode-xdg',
   'outbox',
