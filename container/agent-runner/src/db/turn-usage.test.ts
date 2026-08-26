@@ -82,10 +82,10 @@ describe('turn_usage — insert helper', () => {
   });
 
   it('writes one row per call, preserving insertion order', () => {
-    // Provider is 'opencode' — the only one NOT on the cumulative->delta path
-    // (see toTurnDelta). This test is about row ordering, not usage math, and
-    // claude/codex would turn this monotonic 1,2,3 sequence into deltas,
-    // coupling an unrelated test to that behavior.
+    // Provider is 'opencode' — not on the cumulative->delta path (see
+    // toTurnDelta). This test is about row ordering, not usage math, and
+    // claude would turn this monotonic 1,2,3 sequence into deltas, coupling an
+    // unrelated test to that behavior.
     recordTurnUsage('opencode', { inputTokens: 1 });
     recordTurnUsage('opencode', { inputTokens: 2 });
     recordTurnUsage('opencode', { inputTokens: 3 });
@@ -162,7 +162,7 @@ describe('turn_usage — insert helper', () => {
   });
 });
 
-describe('turn_usage — cumulative-usage delta fix (Claude + Codex)', () => {
+describe('turn_usage — cumulative-usage delta fix (Claude)', () => {
   beforeEach(() => {
     initTestSessionDb();
     _resetCumulativeTrackingForTesting();
@@ -205,16 +205,17 @@ describe('turn_usage — cumulative-usage delta fix (Claude + Codex)', () => {
     ]);
   });
 
-  // Contract change 2026-08-25: codex USED to be excluded here, on the
-  // (wrong) reading that `tokenUsage.last` was per-turn. It is per-REQUEST,
-  // and codex.ts now reports the thread-cumulative `total`, so codex belongs
-  // on the delta path with claude.
-  it('applies the delta transform to codex (thread-cumulative `total`)', () => {
+  // Contract, settled 2026-08-26: only Claude is deltaed here. Codex briefly
+  // was (2026-08-25) while codex.ts reported its thread-cumulative `total`,
+  // and that was unsafe — the thread outlives the container but this memo does
+  // not, so the first turn after a respawn re-booked the whole thread. codex.ts
+  // sums per-request `last` instead; see codex.token-usage.test.ts.
+  it('does NOT apply the delta transform to codex (its provider sums per-request `last`)', () => {
     const model = 'gpt-5.6-sol';
-    recordTurnUsage('codex', { model, inputTokens: 1000 });
-    recordTurnUsage('codex', { model, inputTokens: 1500 });
+    recordTurnUsage('codex', { model, inputTokens: 1000 }, undefined, 'thread-1');
+    recordTurnUsage('codex', { model, inputTokens: 1500 }, undefined, 'thread-1');
     const rows = getTurnUsageRows();
-    expect(rows.map((r) => r.input_tokens)).toEqual([1000, 500]);
+    expect(rows.map((r) => r.input_tokens)).toEqual([1000, 1500]);
   });
 
   it('does NOT apply the delta transform to opencode (its provider already sums per-turn)', () => {
@@ -267,37 +268,13 @@ describe('turn_usage — cumulative-usage delta fix (Claude + Codex)', () => {
     expect(rows[1]).toMatchObject({ input_tokens: 300, cache_write_tokens: 0 });
   });
 
-  it('deltas a codex thread total across turns and re-baselines on a new thread', () => {
-    const model = 'gpt-5.6-sol';
-    // Real consecutive `total_token_usage` values from a codex 0.145.0
-    // rollout log; the differences are that turn's own usage.
-    const scope = 'thread-1';
-    recordTurnUsage('codex', { model, inputTokens: 8_116_919, outputTokens: 25_671 }, undefined, scope);
-    recordTurnUsage('codex', { model, inputTokens: 8_244_310, outputTokens: 25_827 }, undefined, scope);
-    recordTurnUsage('codex', { model, inputTokens: 8_373_916, outputTokens: 32_687 }, undefined, scope);
-    // New thread — cumulative restarts, and the scope key says so.
-    recordTurnUsage('codex', { model, inputTokens: 120_000, outputTokens: 900 }, undefined, 'thread-2');
-    const rows = getTurnUsageRows();
-    expect(rows.map((r) => [r.input_tokens, r.output_tokens])).toEqual([
-      [8_116_919, 25_671],
-      [127_391, 156],
-      [129_606, 6_860],
-      [120_000, 900],
-    ]);
-  });
-
-  it('keeps codex`s baseline across a mid-thread model switch (its total is thread-wide, not per-model)', () => {
-    // `-m` mid-thread reopens the query against the SAME codex thread, so the
-    // thread total keeps climbing under a new model label. Keying the memo per
-    // model would lose the baseline and re-record the whole thread total.
-    recordTurnUsage('codex', { model: 'gpt-5.6-sol', inputTokens: 1_000_000 }, undefined, 'thread-1');
-    recordTurnUsage('codex', { model: 'gpt-5.6-codex', inputTokens: 1_040_000 }, undefined, 'thread-1');
-    const rows = getTurnUsageRows();
-    expect(rows.map((r) => [r.model, r.input_tokens])).toEqual([
-      ['gpt-5.6-sol', 1_000_000],
-      ['gpt-5.6-codex', 40_000],
-    ]);
-  });
+  // The container-respawn regression that took codex off this path is NOT
+  // testable here, and a test here would false-pass: with an empty memo this
+  // module writes the raw value either way, so on or off the delta path the
+  // row looks identical. What differs is what the PROVIDER hands over — a
+  // thread-cumulative total vs this turn's own requests — so the guard lives
+  // at providers/codex.token-usage.test.ts ("reports only this turn's requests
+  // when a respawned container resumes a long-lived thread").
 
   it('keeps claude`s per-model baselines separate (its SDK counts modelUsage per model)', () => {
     recordTurnUsage('claude', { model: 'claude-opus-5', inputTokens: 1_000_000 }, undefined, 'sess-a');

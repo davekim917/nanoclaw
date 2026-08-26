@@ -471,22 +471,54 @@ export interface RunReport {
 }
 
 /**
- * One ScanInput for a git commit message file.
+ * Git only strips `#` lines on the EDITOR path.
  *
- * `#`-prefixed lines are blanked, not dropped: git strips them before the
- * message is committed, so flagging them would reject text that never ships —
- * and the default template lists every staged path, which for a fork with
- * install-named directories is a guaranteed false positive. Blanking rather
- * than removing keeps reported line numbers matching the file the author sees
- * in their editor.
+ * `git commit -m` (and `-F`) use cleanup mode `whitespace`, which keeps
+ * comment lines verbatim — verified: `-m $'subject\n# <identifier>\nbody'`
+ * puts that line in `git log` unchanged. Only the editor path uses cleanup
+ * `default`, which strips them. So blanking every `#` line unconditionally is
+ * fail-OPEN: an identifier prefixed with `#` and passed to `-m` ships while
+ * the gate prints "passed". That was the state this function shipped in on
+ * 2026-08-25 — in the commit whose purpose was closing exactly that hole.
+ *
+ * Scanning every `#` line instead is fail-safe but false-positives on git's
+ * own editor template, which lists every staged path — a guaranteed block for
+ * an install with group-named directories, and a blocked gate gets disabled
+ * with --no-verify, which checks nothing at all.
+ *
+ * So: detect which path produced this file, and blank only on the one where
+ * git really strips. The markers are structural and locale-independent, unlike
+ * the template's prose ("Please enter the commit message…" is translated):
+ *
+ *   - `#\t` — the staged-path listing (`#\tmodified:   groups/…`). Present in
+ *     every editor template that has staged changes, and something a
+ *     hand-written `-m` message essentially never contains.
+ *   - the scissors rule `# --- >8 ---`, which `commit -v` emits.
+ *
+ * Do NOT "simplify" this back to blanking every `#` line. The tempting
+ * one-liner is the bug.
+ *
+ * Blanking rather than removing keeps reported line numbers matching the file
+ * the author sees in their editor.
  */
+const GIT_SCISSORS = /^# -+ >8 -+$/m;
+const GIT_TEMPLATE_MARKER = /^#\t/m;
+
 function commitMessageInput(messagePath: string): ScanInput {
   const raw = fs.readFileSync(messagePath, 'utf8');
-  const stripped = raw
-    .split('\n')
-    .map((line) => (line.startsWith('#') ? '' : line))
-    .join('\n');
-  return { file: path.basename(messagePath), content: Buffer.from(stripped, 'utf8') };
+  // `commit -v` appends the staged diff below the scissors rule, un-prefixed.
+  // Git discards everything from that line down, so it never ships — and
+  // pre-commit already gates that same content under its real filenames.
+  const scissors = raw.search(GIT_SCISSORS);
+  const body = scissors === -1 ? raw : raw.slice(0, scissors);
+  const fromEditor = GIT_TEMPLATE_MARKER.test(raw) || scissors !== -1;
+  const content = fromEditor
+    ? body
+        .split('\n')
+        .map((line) => (line.startsWith('#') ? '' : line))
+        .join('\n')
+    : body;
+  return { file: path.basename(messagePath), content: Buffer.from(content, 'utf8') };
 }
 
 export function runReport(options: ScanOptions): RunReport {

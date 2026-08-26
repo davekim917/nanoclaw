@@ -270,10 +270,13 @@ export interface AgentQuery {
  *
  * Report the WHOLE turn, never one model request. A turn is many requests,
  * and both codex and opencode once reported only their last one — a 66-step
- * codex turn recorded as 39 output tokens. If the provider exposes a running
- * total (Claude's stream, Codex's thread), report the total and register the
- * provider in turn-usage.ts's CUMULATIVE_PROVIDERS so it is deltaed; if it
- * exposes per-response figures (OpenCode), sum them here.
+ * codex turn recorded as 39 output tokens. If the provider exposes
+ * per-request figures (OpenCode, Codex), sum them here. Reporting a running
+ * total and registering the provider in turn-usage.ts's CUMULATIVE_PROVIDERS
+ * is the OTHER option, and it is only safe when that total resets with the
+ * process: the delta baseline is an unpersisted module global, so a counter
+ * that survives a container respawn (Codex's thread total) comes back raw and
+ * books the whole pre-restart history as one turn.
  */
 export interface TurnUsageInfo {
   model?: string | null;

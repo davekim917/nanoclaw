@@ -77,5 +77,13 @@ if [ -n "$partial" ]; then
   rm -rf "$tmp"
 fi
 
-# Run from the main checkout so tsx and the boundary registry resolve there.
-(cd "$repo_root" && pnpm run check:public-boundary -- --staged)
+# Run from the main checkout so tsx resolves there, but scan THIS tree.
+#
+# `--root` is not optional. Without it the script defaults to process.cwd(),
+# which the `cd` has just made the main checkout — so a commit from a linked
+# worktree scanned main's index, entirely different content, and printed
+# "passed" about work it never saw. Every commit made from an agent worktree
+# was ungated until 2026-08-26. The registry itself still resolves through the
+# main checkout via findMainCheckoutRoot's fallback.
+worktree_root=$(git rev-parse --show-toplevel)
+(cd "$repo_root" && pnpm run check:public-boundary -- --root "$worktree_root" --staged)

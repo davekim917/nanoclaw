@@ -8,15 +8,20 @@ import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
 import { CodexProvider } from './codex.js';
 
 /**
- * `thread/tokenUsage/updated` fires once per MODEL REQUEST, not once per turn.
- * The fake app-server below emits three of them for a single turn, with the
- * numbers taken from a real codex 0.145.0 rollout log: each notification's
- * `last` is one request, and `total` is the thread's running total, whose
- * successive differences equal those `last` values.
+ * `thread/tokenUsage/updated` fires once per MODEL REQUEST, not once per turn,
+ * and carries both `last` (that one request) and `total` (the whole thread).
+ * The fake app-server below emits several of them per turn, with the numbers
+ * taken from a real codex 0.145.0 rollout log — each `total` difference equals
+ * the next record's own `last`.
  *
- * Recording `last` (what this provider used to do) bills a whole multi-request
- * turn as its final request — 6,860 output tokens instead of 32,687. The
- * result event must carry `total`.
+ * Two failure modes are pinned here, in opposite directions:
+ *
+ *  - Recording only the FINAL `last` bills a multi-request turn as its last
+ *    request: 6,860 output tokens instead of 7,321.
+ *  - Recording `total` bills the whole THREAD as one turn on the first turn
+ *    after a container respawn, because the delta baseline that would have
+ *    subtracted it (turn-usage.ts's module-global memo) died with the old
+ *    process while the codex thread did not. The second test is that case.
  */
 const ORIGINAL_ENV = {
   PATH: process.env.PATH,
@@ -40,20 +45,22 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-describe('CodexProvider token usage', () => {
-  it('reports the thread-cumulative `total`, not the final request`s `last`', async () => {
-    const binDir = path.join(tmpDir, 'bin');
-    const codexHome = path.join(tmpDir, 'codex-home');
-    fs.mkdirSync(binDir, { recursive: true });
-    fs.mkdirSync(codexHome, { recursive: true });
+/** One `thread/tokenUsage/updated` payload: `[input, cachedInput, output, reasoning]`. */
+type Breakdown = [number, number, number, number];
 
-    fs.writeFileSync(
-      path.join(binDir, 'codex'),
-      `#!/usr/bin/env bun
+/**
+ * Write a fake codex app-server that emits the given per-request
+ * `{ last, total }` pairs inside ONE turn, then completes it.
+ */
+function writeFakeCodex(binDir: string, steps: Array<{ last: Breakdown; total: Breakdown }>): void {
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(binDir, 'codex'),
+    `#!/usr/bin/env bun
 import readline from 'readline';
 
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
-const breakdown = (input, cachedInput, output, reasoning) => ({
+const breakdown = ([input, cachedInput, output, reasoning]) => ({
   totalTokens: input + output,
   inputTokens: input,
   cachedInputTokens: cachedInput,
@@ -61,6 +68,7 @@ const breakdown = (input, cachedInput, output, reasoning) => ({
   outputTokens: output,
   reasoningOutputTokens: reasoning,
 });
+const steps = ${JSON.stringify(steps)};
 
 const lines = readline.createInterface({ input: process.stdin });
 lines.on('line', (line) => {
@@ -80,16 +88,18 @@ lines.on('line', (line) => {
       params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress', items: [] } },
     });
     setTimeout(() => {
-      // Three model requests inside ONE turn.
-      const steps = [
-        { last: breakdown(127058, 119552, 305, 77), total: breakdown(8116919, 7769856, 25671, 12693) },
-        { last: breakdown(127391, 126720, 156, 45), total: breakdown(8244310, 7896576, 25827, 12738) },
-        { last: breakdown(129606, 126720, 6860, 2955), total: breakdown(8373916, 8023296, 32687, 15693) },
-      ];
       for (const step of steps) {
         send({
           method: 'thread/tokenUsage/updated',
-          params: { threadId: 'thread-1', turnId: 'turn-1', tokenUsage: { ...step, modelContextWindow: 258400 } },
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            tokenUsage: {
+              last: breakdown(step.last),
+              total: breakdown(step.total),
+              modelContextWindow: 258400,
+            },
+          },
         });
       }
       send({
@@ -111,31 +121,74 @@ lines.on('line', (line) => {
   if (request.method === 'turn/interrupt') send({ id: request.id, result: {} });
 });
 `,
-      { mode: 0o755 },
-    );
+    { mode: 0o755 },
+  );
+}
 
-    process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
-    process.env.CODEX_HOME = codexHome;
-    process.env.CODEX_HEALTH_STILL_WORKING_NOTICE_MS = '10000';
+/** Run one turn against the fake app-server and return its `result` usage. */
+async function runTurnUsage(steps: Array<{ last: Breakdown; total: Breakdown }>): Promise<unknown> {
+  const binDir = path.join(tmpDir, 'bin');
+  const codexHome = path.join(tmpDir, 'codex-home');
+  writeFakeCodex(binDir, steps);
+  fs.mkdirSync(codexHome, { recursive: true });
 
-    const provider = new CodexProvider({ providerConfig: {} });
-    provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
-    const query = provider.query({ prompt: 'run a multi-request turn', cwd: tmpDir });
+  process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
+  process.env.CODEX_HOME = codexHome;
+  process.env.CODEX_HEALTH_STILL_WORKING_NOTICE_MS = '10000';
 
-    let result: { type: string; usage?: unknown } | undefined;
-    for await (const event of query.events) {
-      if (event.type === 'result') {
-        result = event;
-        query.end();
-      }
+  const provider = new CodexProvider({ providerConfig: {} });
+  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+  const query = provider.query({ prompt: 'run a multi-request turn', cwd: tmpDir });
+
+  let usage: unknown;
+  for await (const event of query.events) {
+    if (event.type === 'result') {
+      usage = event.usage;
+      query.end();
     }
+  }
+  return usage;
+}
 
-    expect(result?.usage).toMatchObject({
-      inputTokens: 8_373_916,
-      outputTokens: 32_687,
-      cacheReadTokens: 8_023_296,
+describe('CodexProvider token usage', () => {
+  it('sums every request`s `last` across the turn, not just the final one', async () => {
+    const usage = await runTurnUsage([
+      { last: [127058, 119552, 305, 77], total: [8116919, 7769856, 25671, 12693] },
+      { last: [127391, 126720, 156, 45], total: [8244310, 7896576, 25827, 12738] },
+      { last: [129606, 126720, 6860, 2955], total: [8373916, 8023296, 32687, 15693] },
+    ]);
+
+    expect(usage).toMatchObject({
+      inputTokens: 127058 + 127391 + 129606,
+      outputTokens: 305 + 156 + 6860,
+      cacheReadTokens: 119552 + 126720 + 126720,
       cacheWriteTokens: 0,
       costUsd: null,
     });
+  }, 10_000);
+
+  it('reports only this turn`s requests when a respawned container resumes a long-lived thread', async () => {
+    // The regression this pins: a container respawn resumes the PERSISTED
+    // codex thread, so the fresh app-server's very first notification already
+    // carries the thread's carried-forward `total` (8.3M input here) while
+    // `last` is just this turn's one small request. Reporting `total` booked
+    // the entire pre-restart thread history as one turn — turn-usage.ts's
+    // delta memo is a module global that died with the old process, and its
+    // reset check cannot help because the value went UP, not down.
+    const usage = await runTurnUsage([{ last: [4210, 3900, 118, 40], total: [8378126, 8027196, 32805, 15733] }]);
+
+    expect(usage).toMatchObject({
+      inputTokens: 4210,
+      outputTokens: 118,
+      cacheReadTokens: 3900,
+      cacheWriteTokens: 0,
+      costUsd: null,
+    });
+  }, 10_000);
+
+  it('leaves usage undefined when the app-server reported no token usage at all', async () => {
+    // A coverage gap must stay visible as a NULL-token row (see TurnUsageInfo),
+    // never as a fabricated all-zero turn.
+    expect(await runTurnUsage([])).toBeUndefined();
   }, 10_000);
 });

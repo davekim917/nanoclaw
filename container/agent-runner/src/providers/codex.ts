@@ -1342,21 +1342,38 @@ export async function* runOneTurn(
   // best signal this protocol exposes rather than a guess.
   let itemCompletedCount = 0;
   // Fleet Hardening Phase 0.1 (see TurnUsageInfo). `thread/tokenUsage/updated`
-  // fires once per MODEL REQUEST, and a turn makes as many requests as it
-  // takes tool-calling round trips — so `last` (that one request) is NOT the
-  // turn, and recording it undercounted codex by ~1-2 orders of magnitude.
-  // `total` is the thread's running total; the delta between consecutive
-  // turns is this turn's usage, computed by turn-usage.ts's toTurnDelta (the
-  // same transform Claude's stream-cumulative report goes through).
-  // Deliberately no fallback to `last` when `total` is absent: `last` is not
-  // cumulative, so routing it through the delta transform would silently
-  // reproduce the undercount. A NULL-token row keeps the gap visible.
+  // fires once per MODEL REQUEST and carries both `last` (that one request)
+  // and `total` (the THREAD's running total). A turn makes as many requests as
+  // it takes tool-calling round trips, so `last` on its own is NOT the turn —
+  // recording only the final one undercounted codex by ~1-2 orders of
+  // magnitude. Summing `last` across the turn is.
+  //
+  // Reporting `total` and deltaing it downstream (what turn-usage.ts's
+  // toTurnDelta does for Claude) would be WRONG here, because codex's counter
+  // is not process-local: the thread is persisted and a respawned container
+  // resumes it, so the fresh app-server replays a carried-forward `total`
+  // against an empty in-memory baseline (turn-usage.ts's memo is a module
+  // global) — the whole pre-restart thread history books as one turn, and the
+  // reset check cannot catch it because the value went UP, not down. Summing
+  // per-request `last` depends on nothing outside this turn, so a respawn
+  // mid-thread costs at most the requests already made before the kill.
+  // Verified against codex 0.145.0's rollout log: consecutive `total`
+  // differences equal each record's own `last`.
+  //
   // No cost field exists on this protocol (ChatGPT-plan billing, not
-  // per-token pricing) — cost_usd stays NULL for codex. Object-property ref
-  // (not a bare `let`) for the same reason as `turnState` above — TS can't
-  // track closure assignments for narrowing, but property access keeps the
-  // declared type visible.
-  const tokenUsageState: { total: CodexTokenUsageBreakdown | null } = { total: null };
+  // per-token pricing) — cost_usd stays NULL for codex. `seen` (rather than
+  // "are the counters still zero") keeps a genuine all-zero turn distinct from
+  // a turn the app-server never reported usage for, which stays a NULL-token
+  // row so the gap remains visible. Object-property refs (not bare `let`s) for
+  // the same reason as `turnState` above — TS can't track closure assignments
+  // for narrowing, but property access keeps the declared type visible.
+  const tokenUsageState = {
+    seen: false,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    cacheWriteInputTokens: 0,
+  };
   // Codex can deliver reasoning two ways: streaming item/reasoning/* deltas
   // when enabled by the app-server, or finalized reasoning ThreadItems via
   // item/completed. Streamed item IDs are tracked so lifecycle fallback
@@ -1658,12 +1675,19 @@ export async function* runOneTurn(
         break;
       }
       case 'thread/tokenUsage/updated': {
-        // See tokenUsageState above — `last` is ONE model request, `total` is
-        // the thread's running total. This notification fires per request, so
-        // the newest `total` before turn/completed is the thread total
-        // through this turn and is what gets recorded (deltaed downstream).
-        const usage = (params as { tokenUsage?: { total?: CodexTokenUsageBreakdown } }).tokenUsage;
-        if (usage?.total) tokenUsageState.total = usage.total;
+        // See tokenUsageState above — `last` is ONE model request and this
+        // notification fires per request, so the sum of every `last` seen
+        // between turn/started and turn/completed IS this turn's usage.
+        // `total` is deliberately ignored: it is thread-scoped and survives
+        // container respawns, which no in-process baseline can subtract.
+        const last = (params as { tokenUsage?: { last?: CodexTokenUsageBreakdown } }).tokenUsage?.last;
+        if (last) {
+          tokenUsageState.seen = true;
+          tokenUsageState.inputTokens += last.inputTokens ?? 0;
+          tokenUsageState.outputTokens += last.outputTokens ?? 0;
+          tokenUsageState.cachedInputTokens += last.cachedInputTokens ?? 0;
+          tokenUsageState.cacheWriteInputTokens += last.cacheWriteInputTokens ?? 0;
+        }
         break;
       }
       case 'item/started': {
@@ -1846,14 +1870,15 @@ export async function* runOneTurn(
     yield {
       type: 'result',
       text: resultText || null,
-      // Thread-cumulative — turn-usage.ts converts it to this turn's delta.
-      usage: tokenUsageState.total
+      // This turn's own usage already — the sum of every model request it
+      // made. NOT routed through turn-usage.ts's cumulative delta path.
+      usage: tokenUsageState.seen
         ? {
             model,
-            inputTokens: tokenUsageState.total.inputTokens,
-            outputTokens: tokenUsageState.total.outputTokens,
-            cacheReadTokens: tokenUsageState.total.cachedInputTokens,
-            cacheWriteTokens: tokenUsageState.total.cacheWriteInputTokens,
+            inputTokens: tokenUsageState.inputTokens,
+            outputTokens: tokenUsageState.outputTokens,
+            cacheReadTokens: tokenUsageState.cachedInputTokens,
+            cacheWriteTokens: tokenUsageState.cacheWriteInputTokens,
             costUsd: null,
           }
         : undefined,

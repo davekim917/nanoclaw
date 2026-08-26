@@ -19,10 +19,10 @@
  * long-loop turn look identical in usage_daily's daily bucket, and steps is
  * the number that tells them apart. See TurnMeta below.
  *
- * Claude's and Codex's numeric fields are converted from a running-total
- * report into this turn's own delta before being written — see toTurnDelta
- * below for why, and the fix's dated comment for how inflated/deflated
- * pre-fix history is.
+ * Claude's numeric fields are converted from a running-total report into this
+ * turn's own delta before being written — see toTurnDelta below for why, and
+ * the fix's dated comment for how inflated pre-fix history is. Codex and
+ * OpenCode already report per-turn figures and are written as they arrive.
  */
 import { getOutboundDb } from './connection.js';
 import type { TurnUsageInfo } from '../providers/types.js';
@@ -92,58 +92,52 @@ const NO_TURN_META: TurnMeta = {
  * rows written BEFORE this fix landed are inflated by that much — do not
  * read pre-fix history as clean.
  *
- * Codex UNDERCOUNT fix (2026-08-25): the same transform is what Codex needs
- * too, in the other direction. `thread/tokenUsage/updated` fires once per
- * MODEL REQUEST and carries both `last` (that single request) and `total`
- * (running total for the thread). codex.ts recorded `last`, so a 66-step
- * turn was billed as its final request only — live `turn_usage` showed codex
- * at 66.5 steps/turn but 39 output tokens/turn against Claude's 2,597.
- * Confirmed against codex 0.145.0's own rollout log
- * (~/.codex/sessions/.../rollout-*.jsonl), where consecutive `token_count`
- * records give total.input 8,116,919 -> 8,244,310 -> 8,373,916 and
- * total.output 25,671 -> 25,827 -> 32,687, with each successive DIFFERENCE
- * (127,391 / 156 and 129,606 / 6,860) equal to that record's own `last`.
- * So `total` deltas are the per-turn number and `last` is one request of it.
+ * This memo is PROCESS-LOCAL and unpersisted, which is what decides who may
+ * use it. Claude qualifies: its accumulator lives inside the `query()` call,
+ * so a fresh container starts a fresh stream at zero and there is no
+ * pre-restart total to mis-subtract. A provider whose counter OUTLIVES the
+ * process must never be routed here — see the codex note below.
  *
- * OpenCode is NOT this shape and must never be routed through here: its
- * assistant-message map is per-message, not cumulative (see opencode.ts's
- * result construction for the evidence), so it is summed at the provider
- * instead.
+ * Codex was briefly on this path (2026-08-25) and was removed the next day.
+ * Its `thread/tokenUsage/updated` carries both `last` (one model request) and
+ * `total` (the whole thread), and `total` survives a container respawn:
+ * poll-loop.ts resumes the persisted thread, the new app-server replays the
+ * carried-forward total, and an empty memo makes toTurnDelta return it RAW —
+ * booking the entire pre-restart thread history as one turn. The reset check
+ * cannot catch that, because the value went UP. codex.ts now sums `last`
+ * across the turn instead, which depends on nothing outside the turn. The
+ * `total`-delta reading was still arithmetically right — codex 0.145.0's
+ * rollout log gives total.input 8,116,919 -> 8,244,310 -> 8,373,916 with each
+ * successive difference equal to that record's own `last` — it was just not
+ * restart-safe.
+ *
+ * OpenCode is NOT this shape either: its assistant-message map is per-message,
+ * not cumulative (see opencode.ts's result construction), so it is likewise
+ * summed at the provider.
  *
  * Scope key (2026-08-25): the memo used to be keyed by model alone, so a
  * brand-new stream whose first report happened to land ABOVE the previous
  * stream's stored total was silently subtracted against an unrelated series.
  * Entries now carry the scope they were observed in and a scope change
- * forces a raw (unsubtracted) row.
- *
- * The scope is the provider's CONTINUATION (Claude SDK session id / Codex
- * thread id), not the stream, because the two providers reset their counters
- * at different boundaries: Claude's accumulator lives in the `query()` call
- * and restarts at zero on a new stream, while Codex's is a property of the
- * thread and a new app-server resuming that thread can carry the old total
- * forward. Continuation-keying is correct for both — a restart-at-zero shows
- * up as a decrease and is caught by the reset check below, whereas
- * stream-keying would re-record Codex's entire thread total as one turn.
+ * forces a raw (unsubtracted) row. The scope is the provider's CONTINUATION
+ * (Claude's SDK session id), not the stream object, so a same-session
+ * restart-at-zero shows up as a decrease and is caught by the reset check.
  */
 type CumulativeMemo = { scope: string; usage: TurnUsageInfo };
-/** One entry per live counter — keyed per model or per scope, see CUMULATIVE_PROVIDERS. */
+/** One entry per live counter — keyed by model, see CUMULATIVE_PROVIDERS. */
 const lastCumulativeByCounter = new Map<string, CumulativeMemo>();
 
 /**
  * Providers whose `result.usage` is a running total rather than one turn's
- * own, and whether that total is counted PER MODEL.
+ * own, AND whose counter resets when this process does. Both halves are
+ * required — see the block above for why codex satisfies the first and fails
+ * the second.
  *
- * Claude's SDK reports `modelUsage` — a separate running total per model, so
- * an Opus parent and a Sonnet subagent each need their own baseline. Codex's
- * `thread/tokenUsage/updated` reports ONE total for the whole thread with the
- * model as a mere label, so a mid-thread `-m` switch must keep subtracting
- * against the same baseline; keying it per model would re-record the entire
- * thread total as that turn's usage.
+ * Keyed per model because Claude's SDK reports `modelUsage`, a separate
+ * running total per model: an Opus parent and a Sonnet subagent each need
+ * their own baseline.
  */
-const CUMULATIVE_PROVIDERS = new Map<string, { perModel: boolean }>([
-  ['claude', { perModel: true }],
-  ['codex', { perModel: false }],
-]);
+const CUMULATIVE_PROVIDERS = new Set(['claude']);
 
 type Num = number | null | undefined;
 
@@ -270,8 +264,7 @@ export function recordTurnUsage(
   meta: TurnMeta = NO_TURN_META,
   scope = '',
 ): void {
-  const cumulative = CUMULATIVE_PROVIDERS.get(provider);
-  const counterKey = cumulative ? (cumulative.perModel ? (usage.model ?? '') : '') : null;
+  const counterKey = CUMULATIVE_PROVIDERS.has(provider) ? (usage.model ?? '') : null;
   const effectiveUsage = counterKey === null ? usage : toTurnDelta(usage, scope, counterKey);
   // See isUnusedModelEntry: a cumulative provider lists every model of the
   // continuation on every turn, and the ones it didn't use come through with

@@ -405,10 +405,11 @@ describe('commit message scanning (--message)', () => {
     expect(run(options)).toEqual([]);
   });
 
-  it('ignores `#` comment lines, which git strips before committing', () => {
+  it('ignores `#` comment lines in git`s editor template, which git strips before committing', () => {
     // git's default template lists every staged path. For an install whose
     // directories are named after groups that is a guaranteed false positive
-    // on text that never ships.
+    // on text that never ships. The `#\t` path listing is what identifies the
+    // file as coming from the editor path.
     const { options } = fixture(
       'fix: something\n\n# Changes to be committed:\n#\tmodified: groups/Private Customer/config.json\n',
     );
@@ -418,8 +419,31 @@ describe('commit message scanning (--message)', () => {
   it('reports the line the author sees, counting blanked comment lines', () => {
     // Comment lines are blanked rather than removed so line numbers still
     // match the file in the editor.
-    const { options } = fixture('fix: something\n\n# a comment\nPrivate Customer on line four.\n');
+    const { options } = fixture(
+      'fix: something\n\n# a comment\nPrivate Customer on line four.\n#\tmodified: some/file\n',
+    );
     expect(run(options)).toEqual([{ file: 'COMMIT_EDITMSG', line: 4, category: 'private-identifier' }]);
+  });
+
+  it('REJECTS a `#`-prefixed identifier in a `-m` message, which git does NOT strip', () => {
+    // `git commit -m` uses cleanup mode `whitespace`, not `default` — comment
+    // lines survive verbatim into `git log`. Blanking every `#` line let a real
+    // identifier ship while this gate printed "passed"; only the editor path
+    // (identified by git's own `#\t` path listing or a scissors rule) gets the
+    // blanking treatment now.
+    const { options } = fixture('fix: something\n# Private Customer asked for this\n');
+    expect(run(options)).toEqual([{ file: 'COMMIT_EDITMSG', line: 2, category: 'private-identifier' }]);
+  });
+
+  it('ignores the verbose-diff body below the scissors rule, which git discards', () => {
+    // `commit -v` appends the staged diff un-prefixed below the scissors.
+    // pre-commit already gates that content under its real filenames, and none
+    // of it reaches the commit message.
+    const { options } = fixture(
+      'fix: something\n\n# ------------------------ >8 ------------------------\n' +
+        'diff --git a/x b/x\n+Private Customer\n',
+    );
+    expect(run(options)).toEqual([]);
   });
 
   it('scans ONLY the message, not the tracked tree', () => {
@@ -433,5 +457,36 @@ describe('commit message scanning (--message)', () => {
 
   it('rejects --message with no path rather than silently scanning everything', () => {
     expect(() => resolveOptions(['--message'])).toThrow(/--message requires a path/);
+  });
+});
+
+describe('git hooks scan the committing tree, not the main checkout', () => {
+  // Every hook resolves tooling from the main checkout (agent worktrees carry
+  // no node_modules) and cds there to run this script. That cd also moved the
+  // script's DEFAULT root, which is process.cwd() — so a commit or push made
+  // from a linked worktree scanned MAIN's index, entirely different content,
+  // and printed "passed" about work it never saw. `--root` is the fix, and it
+  // is not optional.
+
+  it('the default root follows cwd, so running from the main checkout misses worktree content', () => {
+    const mainRoot = initInstallRepo('Northwind Registry AB', 'Northwind Local AB');
+    const worktreeRoot = addLinkedWorktree(mainRoot);
+    fs.writeFileSync(path.join(worktreeRoot, 'leak.md'), 'Northwind Registry AB\n');
+    execFileSync('git', ['add', 'leak.md'], { cwd: worktreeRoot });
+
+    // What the hooks used to do: run from the main checkout with no --root.
+    expect(run(resolveOptions(['--index'], mainRoot))).toEqual([]);
+    // What they do now.
+    expect(run(resolveOptions(['--root', worktreeRoot, '--index'], mainRoot))).toEqual([
+      { file: 'leak.md', line: 1, category: 'private-identifier' },
+    ]);
+  });
+
+  // Asserted against the hook text because nothing in this suite executes
+  // husky hooks; the behavioural half is the test above.
+  it.each(['pre-commit', 'pre-push'])('.husky/%s passes --root for the committing worktree', (hook) => {
+    const script = fs.readFileSync(new URL(`../.husky/${hook}`, import.meta.url), 'utf8');
+    expect(script).toMatch(/rev-parse --show-toplevel/);
+    expect(script).toMatch(/check:public-boundary\s+--\s+--root\s+"\$worktree_root"/);
   });
 });

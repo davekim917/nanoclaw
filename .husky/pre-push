@@ -5,5 +5,12 @@
 # failures), so a bare `pnpm run` here dies with `tsx: not found` and blocks the
 # push. Same defect the pre-commit hook had, fixed the same way:
 # `--git-common-dir` resolves the main checkout from any linked worktree.
+#
+# `--root` is separate and mandatory: the script's default root is
+# process.cwd(), which the `cd` above has just made the main checkout, so
+# without it a push from a linked worktree scanned main's index instead of the
+# content actually being pushed — and printed "passed". The registry still
+# resolves through the main checkout via findMainCheckoutRoot's fallback.
 repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
-(cd "$repo_root" && pnpm run check:public-boundary -- --index)
+worktree_root=$(git rev-parse --show-toplevel)
+(cd "$repo_root" && pnpm run check:public-boundary -- --root "$worktree_root" --index)
