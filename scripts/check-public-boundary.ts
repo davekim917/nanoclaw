@@ -474,35 +474,58 @@ export interface RunReport {
  * Git only strips `#` lines on the EDITOR path.
  *
  * `git commit -m` (and `-F`) use cleanup mode `whitespace`, which keeps
- * comment lines verbatim — verified: `-m $'subject\n# <identifier>\nbody'`
- * puts that line in `git log` unchanged. Only the editor path uses cleanup
- * `default`, which strips them. So blanking every `#` line unconditionally is
- * fail-OPEN: an identifier prefixed with `#` and passed to `-m` ships while
- * the gate prints "passed". That was the state this function shipped in on
- * 2026-08-25 — in the commit whose purpose was closing exactly that hole.
+ * comment lines verbatim — verified against git 2.43.0: a `-F` message whose
+ * body contains `#\tmodified: …`, `# <identifier>` and a scissors line comes
+ * back out of `git log` byte for byte. Only the editor path uses cleanup
+ * `default` (plus scissors under `-v`), which discards them. So blanking
+ * every `#` line unconditionally is fail-OPEN: an identifier prefixed with
+ * `#` and passed to `-m` ships while the gate prints "passed".
  *
- * Scanning every `#` line instead is fail-safe but false-positives on git's
- * own editor template, which lists every staged path — a guaranteed block for
- * an install with group-named directories, and a blocked gate gets disabled
- * with --no-verify, which checks nothing at all.
+ * Scanning every `#` line instead is fail-CLOSED but false-positives on git's
+ * own editor template, which names the branch and lists every staged path — a
+ * guaranteed block for an install with group-named directories, and a blocked
+ * gate gets disabled with --no-verify, which checks nothing at all.
  *
- * So: detect which path produced this file, and blank only on the one where
- * git really strips. The markers are structural and locale-independent, unlike
- * the template's prose ("Please enter the commit message…" is translated):
+ * The commit-msg hook is handed only the message file, never the invocation
+ * (git passes the source to prepare-commit-msg, not to us), so the path has to
+ * be inferred from content. Two rounds of this were bypassable because they
+ * inferred it for the WHOLE FILE from a single marker anywhere in it:
  *
- *   - `#\t` — the staged-path listing (`#\tmodified:   groups/…`). Present in
- *     every editor template that has staged changes, and something a
- *     hand-written `-m` message essentially never contains.
- *   - the scissors rule `# --- >8 ---`, which `commit -v` emits.
+ *   - a `-m` body containing one `#\t` line blanked every other `#` line,
+ *     including `# person@example.com` further down;
+ *   - a `-m` body containing a scissors LOOKALIKE (`# --- >8 ---`) truncated
+ *     everything below it out of the scan.
  *
- * Do NOT "simplify" this back to blanking every `#` line. The tempting
- * one-liner is the bug.
+ * Both are fixed by narrowing what a marker licenses:
+ *
+ *   1. Scissors must be git's own line EXACTLY — `# ` + 24 dashes + ` >8 ` +
+ *      24 dashes (builtin/commit.c; verified against 2.43.0). A loose `-+`
+ *      pattern is a one-line, hand-typeable way to hide a message tail.
+ *   2. The template is a CONTIGUOUS TRAILING comment block, and it is only
+ *      treated as one if it contains a bare `#` line. Git's template always
+ *      has them (verified for staged, unstaged, `--allow-empty`, and `-v`
+ *      commits) and always sits at the end of the file; `#` lines that appear
+ *      anywhere else are the author's and get scanned.
+ *
+ * Rule 2 also fixes the mirror-image false positive: `--allow-empty` produces
+ * a template with no `#\t` line and no scissors, so the previous marker set
+ * missed it and scanned `# On branch <branch>` — a branch named after a
+ * registry identifier blocked the commit.
+ *
+ * Two residual fail-opens are accepted deliberately, both requiring the author
+ * to reproduce git's own template shape in a `-m` body: an identifier written
+ * ON a `#\t` line inside a trailing block, and an identifier inside a trailing
+ * comment block that also contains a bare `#` line. The alternative is
+ * scanning git's template, whose false positives are not rare-and-contrived
+ * but routine — and a gate that blocks routine commits is a gate that gets
+ * turned off. Do NOT "simplify" this predicate in either direction; each half
+ * is load-bearing against a bypass that shipped.
  *
  * Blanking rather than removing keeps reported line numbers matching the file
  * the author sees in their editor.
  */
-const GIT_SCISSORS = /^# -+ >8 -+$/m;
-const GIT_TEMPLATE_MARKER = /^#\t/m;
+const GIT_SCISSORS = /^# -{24} >8 -{24}$/m;
+const GIT_BARE_COMMENT = /^#[ \t]*$/;
 
 function commitMessageInput(messagePath: string): ScanInput {
   const raw = fs.readFileSync(messagePath, 'utf8');
@@ -510,15 +533,24 @@ function commitMessageInput(messagePath: string): ScanInput {
   // Git discards everything from that line down, so it never ships — and
   // pre-commit already gates that same content under its real filenames.
   const scissors = raw.search(GIT_SCISSORS);
-  const body = scissors === -1 ? raw : raw.slice(0, scissors);
-  const fromEditor = GIT_TEMPLATE_MARKER.test(raw) || scissors !== -1;
-  const content = fromEditor
-    ? body
-        .split('\n')
-        .map((line) => (line.startsWith('#') ? '' : line))
-        .join('\n')
-    : body;
-  return { file: path.basename(messagePath), content: Buffer.from(content, 'utf8') };
+  const lines = (scissors === -1 ? raw : raw.slice(0, scissors)).split('\n');
+
+  // Walk back over the trailing run of comment and blank lines: that, and
+  // only that, is where git's template can live.
+  let blockStart = lines.length;
+  while (blockStart > 0) {
+    const line = lines[blockStart - 1];
+    if (line.startsWith('#') || line.trim() === '') blockStart--;
+    else break;
+  }
+
+  if (lines.slice(blockStart).some((line) => GIT_BARE_COMMENT.test(line))) {
+    for (let i = blockStart; i < lines.length; i++) {
+      if (lines[i].startsWith('#')) lines[i] = '';
+    }
+  }
+
+  return { file: path.basename(messagePath), content: Buffer.from(lines.join('\n'), 'utf8') };
 }
 
 export function runReport(options: ScanOptions): RunReport {

@@ -48,11 +48,14 @@ afterEach(() => {
 /** One `thread/tokenUsage/updated` payload: `[input, cachedInput, output, reasoning]`. */
 type Breakdown = [number, number, number, number];
 
+/** One emitted usage notification. `turnId` defaults to the turn under test. */
+type UsageStep = { last: Breakdown; total: Breakdown; turnId?: string };
+
 /**
  * Write a fake codex app-server that emits the given per-request
  * `{ last, total }` pairs inside ONE turn, then completes it.
  */
-function writeFakeCodex(binDir: string, steps: Array<{ last: Breakdown; total: Breakdown }>): void {
+function writeFakeCodex(binDir: string, steps: UsageStep[]): void {
   fs.mkdirSync(binDir, { recursive: true });
   fs.writeFileSync(
     path.join(binDir, 'codex'),
@@ -93,7 +96,7 @@ lines.on('line', (line) => {
           method: 'thread/tokenUsage/updated',
           params: {
             threadId: 'thread-1',
-            turnId: 'turn-1',
+            turnId: step.turnId ?? 'turn-1',
             tokenUsage: {
               last: breakdown(step.last),
               total: breakdown(step.total),
@@ -126,7 +129,7 @@ lines.on('line', (line) => {
 }
 
 /** Run one turn against the fake app-server and return its `result` usage. */
-async function runTurnUsage(steps: Array<{ last: Breakdown; total: Breakdown }>): Promise<unknown> {
+async function runTurnUsage(steps: UsageStep[]): Promise<unknown> {
   const binDir = path.join(tmpDir, 'bin');
   const codexHome = path.join(tmpDir, 'codex-home');
   writeFakeCodex(binDir, steps);
@@ -183,6 +186,42 @@ describe('CodexProvider token usage', () => {
       cacheReadTokens: 3900,
       cacheWriteTokens: 0,
       costUsd: null,
+    });
+  }, 10_000);
+
+  it('counts a byte-identical repeat of one usage notification once', async () => {
+    // Codex re-emits `thread/tokenUsage/updated` with an identical payload
+    // (4,630 adjacent identical pairs over 209 local rollouts). Summing
+    // `last` double-counts every repeat; the running counter proves it is a
+    // repeat rather than a second request, because a real request advances it.
+    const repeated: UsageStep = { last: [127058, 119552, 305, 77], total: [8116919, 7769856, 25671, 12693] };
+    const usage = await runTurnUsage([
+      repeated,
+      repeated,
+      { last: [129606, 126720, 6860, 2955], total: [8246525, 7896576, 32531, 15648] },
+    ]);
+
+    expect(usage).toMatchObject({
+      inputTokens: 127058 + 129606,
+      outputTokens: 305 + 6860,
+      cacheReadTokens: 119552 + 126720,
+    });
+  }, 10_000);
+
+  it('ignores a usage notification tagged with a different turn', async () => {
+    // `thread/tokenUsage/updated` carries a `turnId` but sits under the
+    // `thread/` namespace, which the active-turn filter used to exempt from
+    // turn matching entirely. A late, reordered, or replayed-on-resume
+    // payload from a PRIOR turn therefore summed into the live turn.
+    const usage = await runTurnUsage([
+      { last: [999999, 888888, 77777, 6666], total: [8116919, 7769856, 25671, 12693], turnId: 'turn-0' },
+      { last: [4210, 3900, 118, 40], total: [8378126, 8027196, 32805, 15733] },
+    ]);
+
+    expect(usage).toMatchObject({
+      inputTokens: 4210,
+      outputTokens: 118,
+      cacheReadTokens: 3900,
     });
   }, 10_000);
 

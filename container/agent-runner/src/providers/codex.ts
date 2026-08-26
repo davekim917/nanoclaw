@@ -216,10 +216,29 @@ export function isCodexNotificationForActiveTurn(
       ? ((turn as Record<string, unknown>).id as string)
       : null;
   const notificationTurnId = typeof params.turnId === 'string' ? params.turnId : nestedTurnId;
-  const isTurnScoped =
+
+  // Two separate rules, deliberately not merged.
+  //
+  // (1) PRESENCE is required only of the lifecycle namespaces that always
+  //     carry a turn id. Missing scope there is malformed under the
+  //     exact-pinned protocol and must not mutate the active turn.
+  const requiresTurnId =
     method.startsWith('turn/') || method.startsWith('item/') || method.startsWith('rawResponseItem/');
-  if (isTurnScoped && !notificationTurnId) return false;
-  if (isTurnScoped && currentTurnId && notificationTurnId !== currentTurnId) return false;
+  if (requiresTurnId && !notificationTurnId) return false;
+
+  // (2) MATCHING applies to any notification that names a turn, whatever
+  //     namespace its method sits in. `thread/tokenUsage/updated` carries a
+  //     `turnId` (ThreadTokenUsageUpdatedNotification is a 3-field struct in
+  //     codex 0.145.0: threadId, turnId, tokenUsage) but lives under
+  //     `thread/`, so a prefix-only rule left it categorically unscoped: a
+  //     late, reordered, or replayed-on-resume payload tagged with a PRIOR
+  //     turn summed into the current turn's accumulator. That is the
+  //     overcount mirror of the undercount 9f86ac2d fixed.
+  //
+  //     Presence is deliberately NOT required here. An app-server build that
+  //     omits the field keeps today's behaviour instead of having every usage
+  //     notification silently dropped — which would meter codex at zero.
+  if (currentTurnId && notificationTurnId && notificationTurnId !== currentTurnId) return false;
   return true;
 }
 
@@ -1332,10 +1351,21 @@ export type CodexTurnAccumulator = {
   // counters on purpose: both are per-turn totals with the same lifetime, so
   // one reset can't be remembered and the other forgotten.
   steps: number;
+  // Serialized previous `tokenUsage` payload — the duplicate-emission guard.
+  // See the `thread/tokenUsage/updated` handler.
+  lastUsageKey: string | null;
 };
 
 export function createCodexTurnAccumulator(): CodexTurnAccumulator {
-  return { seen: false, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, steps: 0 };
+  return {
+    seen: false,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    cacheWriteInputTokens: 0,
+    steps: 0,
+    lastUsageKey: null,
+  };
 }
 
 // ── Per-turn event pump ─────────────────────────────────────────────────────
@@ -1712,8 +1742,34 @@ export async function* runOneTurn(
         // between turn/started and turn/completed IS this turn's usage.
         // `total` is deliberately ignored: it is thread-scoped and survives
         // container respawns, which no in-process baseline can subtract.
+        const usage = (params as { tokenUsage?: Record<string, unknown> }).tokenUsage;
         const last = (params as { tokenUsage?: { last?: CodexTokenUsageBreakdown } }).tokenUsage?.last;
-        if (last) {
+
+        // Duplicate-emission guard. Codex re-emits this notification with a
+        // byte-identical payload: over 209 local rollouts (305,129 records)
+        // 4,630 adjacent pairs carried an identical running counter AND an
+        // identical `last`, which summing `last` double-counts — measured at
+        // 2.88% of input tokens fleet-wide, 1.48x on the worst session. (The
+        // old `total`-delta reading was immune because a repeat is a zero
+        // delta; the sum is not, which is why the guard has to be explicit.)
+        //
+        // The key is the whole `tokenUsage` object rather than the running
+        // counter alone, because that is exactly the shape measured as
+        // repeating, and because it keeps this a duplicate KEY and never a
+        // token VALUE — the running counter stays unusable as a number here
+        // (it is thread-scoped and survives respawns; see the accumulator
+        // note above and the guard test in codex.recovery-integration.test.ts).
+        //
+        // No false-positive risk when the payload carries the running
+        // counter: a genuine second request always advances it, so an
+        // unchanged payload cannot be a distinct request. When it does NOT
+        // carry one there is no monotonic evidence, so the guard stands down
+        // rather than risk dropping a real request.
+        const usageKey = usage && 'total' in usage ? JSON.stringify(usage) : null;
+        const isRepeat = usageKey !== null && usageKey === turnAccum.lastUsageKey;
+        turnAccum.lastUsageKey = usageKey;
+
+        if (last && !isRepeat) {
           turnAccum.seen = true;
           turnAccum.inputTokens += last.inputTokens ?? 0;
           turnAccum.outputTokens += last.outputTokens ?? 0;

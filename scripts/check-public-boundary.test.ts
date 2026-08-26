@@ -374,6 +374,9 @@ describe('commit message scanning (--message)', () => {
       CREATE TABLE agent_groups (id TEXT, name TEXT, folder TEXT, workgroup_id TEXT);
       CREATE TABLE messaging_groups (id TEXT, platform_id TEXT, instance TEXT, name TEXT);
       INSERT INTO workgroups VALUES ('example-house', 'Example House');
+      -- A group folder is the kind of identifier a branch gets named after,
+      -- which is what git's template prints on its "On branch" line.
+      INSERT INTO agent_groups VALUES ('ag-1', 'Private Group', 'private-customer', 'example-house');
     `);
     db.close();
 
@@ -408,12 +411,55 @@ describe('commit message scanning (--message)', () => {
   it('ignores `#` comment lines in git`s editor template, which git strips before committing', () => {
     // git's default template lists every staged path. For an install whose
     // directories are named after groups that is a guaranteed false positive
-    // on text that never ships. The `#\t` path listing is what identifies the
-    // file as coming from the editor path.
+    // on text that never ships. Template text verbatim from git 2.43.0 — the
+    // bare `#` lines are what mark the trailing block as git's rather than
+    // the author's, so the fixture has to carry them.
     const { options } = fixture(
-      'fix: something\n\n# Changes to be committed:\n#\tmodified: groups/Private Customer/config.json\n',
+      'fix: something\n\n' +
+        '# Please enter the commit message for your changes. Lines starting\n' +
+        "# with '#' will be ignored, and an empty message aborts the commit.\n" +
+        '#\n' +
+        '# On branch private-customer\n' +
+        '# Changes to be committed:\n' +
+        '#\tmodified: groups/Private Customer/config.json\n' +
+        '#\n',
     );
     expect(run(options)).toEqual([]);
+  });
+
+  it('ignores the `--allow-empty` template, which carries no staged-path listing', () => {
+    // The mirror-image bug of the `-m` bypass: `git commit --allow-empty` on a
+    // clean tree emits a template with NO `#\t` line and no scissors, so a
+    // marker set built from those two missed it entirely and scanned
+    // `# On branch <branch>`. A branch named after a group folder then blocked
+    // the commit — and a blocked gate gets --no-verify'd, which checks nothing.
+    const { options } = fixture(
+      'chore: empty\n\n' +
+        '# Please enter the commit message for your changes. Lines starting\n' +
+        "# with '#' will be ignored, and an empty message aborts the commit.\n" +
+        '#\n' +
+        '# On branch private-customer\n',
+    );
+    expect(run(options)).toEqual([]);
+  });
+
+  it('REJECTS an identifier below a `#\\t` line in a `-m` message', () => {
+    // Bypass reproduced 2026-08-26: a single `#\t` line anywhere in the file
+    // used to mark the WHOLE message as editor output, so every other `#`
+    // line was blanked — including a real identifier further down, which
+    // `-m`/`-F` ship verbatim. Only a trailing block bearing git's own bare
+    // `#` lines is treated as a template now.
+    const { options } = fixture('fix: something\n\n#\tmodified: some/file\n# Private Customer asked for this\n');
+    expect(run(options)).toEqual([{ file: 'COMMIT_EDITMSG', line: 4, category: 'private-identifier' }]);
+  });
+
+  it('REJECTS an identifier below a scissors LOOKALIKE in a `-m` message', () => {
+    // Second bypass reproduced the same day: the scissors pattern accepted any
+    // dash count, so a hand-typed `# --- >8 ---` truncated the rest of the
+    // message out of the scan while `-m` shipped it. Only git's exact line
+    // (24 dashes each side) truncates.
+    const { options } = fixture('fix: something\n\n# --- >8 ---\nPrivate Customer named below the fake rule.\n');
+    expect(run(options)).toEqual([{ file: 'COMMIT_EDITMSG', line: 4, category: 'private-identifier' }]);
   });
 
   it('reports the line the author sees, counting blanked comment lines', () => {

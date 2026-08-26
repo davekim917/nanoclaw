@@ -8,9 +8,16 @@
 #
 # `--root` is separate and mandatory: the script's default root is
 # process.cwd(), which the `cd` above has just made the main checkout, so
-# without it a push from a linked worktree scanned main's index instead of the
-# content actually being pushed — and printed "passed". The registry still
-# resolves through the main checkout via findMainCheckoutRoot's fallback.
+# without it a push from a linked worktree scanned MAIN's index instead of the
+# committing worktree's — and printed "passed". The registry still resolves
+# through the main checkout via findMainCheckoutRoot's fallback.
+#
+# Known gap, pre-existing: `--index` scans the INDEX, not the refs being
+# pushed. A leaky commit already in history passes as long as the index is
+# clean. commit-msg and pre-commit gate content at commit time, which is where
+# this install actually catches leaks; closing the gap here means diffing
+# each pushed ref against its remote counterpart. Do not describe this hook
+# as scanning "the content being pushed" until it does.
 repo_root=$(dirname "$(cd "$(git rev-parse --git-common-dir)" && pwd)")
 worktree_root=$(git rev-parse --show-toplevel)
 (cd "$repo_root" && pnpm run check:public-boundary -- --root "$worktree_root" --index)

@@ -83,6 +83,42 @@ describe('isCodexNotificationForActiveTurn', () => {
       ),
     ).toBe(true);
   });
+
+  it('rejects a stale turn id on any namespace, not just the turn-scoped ones', () => {
+    // `thread/tokenUsage/updated` names a turn but lives under `thread/`;
+    // matching is driven by the payload carrying a turn id, not by the
+    // method prefix.
+    expect(
+      isCodexNotificationForActiveTurn(
+        'thread/tokenUsage/updated',
+        { threadId: 'root-1', turnId: 'turn-0', tokenUsage: {} },
+        'root-1',
+        'turn-1',
+      ),
+    ).toBe(false);
+    expect(
+      isCodexNotificationForActiveTurn(
+        'thread/tokenUsage/updated',
+        { threadId: 'root-1', turnId: 'turn-1', tokenUsage: {} },
+        'root-1',
+        'turn-1',
+      ),
+    ).toBe(true);
+  });
+
+  it('still accepts an unscoped payload on a namespace that does not require a turn id', () => {
+    // Presence is required only of turn//item//rawResponseItem/. An
+    // app-server build that omits `turnId` here must keep metering, not
+    // silently drop every usage notification.
+    expect(
+      isCodexNotificationForActiveTurn(
+        'thread/tokenUsage/updated',
+        { threadId: 'root-1', tokenUsage: {} },
+        'root-1',
+        'turn-1',
+      ),
+    ).toBe(true);
+  });
 });
 
 describe('createProvider (codex)', () => {
