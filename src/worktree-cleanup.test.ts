@@ -48,10 +48,12 @@ vi.mock('./log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { _cleanupOneForTesting, _discoverWorktreesForTesting } from './worktree-cleanup.js';
+import { log } from './log.js';
+import { _cleanupOneForTesting, _discoverWorktreesForTesting, runWorktreeCleanupOnce } from './worktree-cleanup.js';
 import {
   canonicalRepoDir,
   defaultTopicBranch,
+  repositoryLockPath,
   resolveRepositoryWorkUnit,
   topicWorktreesDir,
   writeTransferTombstone,
@@ -297,5 +299,46 @@ describe('per-topic linked worktree cleanup', () => {
     fs.mkdirSync(path.join(unknown, 'worktrees', 'important'), { recursive: true });
     expect(_discoverWorktreesForTesting(state.dataDir)).toEqual([]);
     expect(fs.existsSync(path.join(unknown, 'worktrees', 'important'))).toBe(true);
+  });
+
+  // The worktrees root is shared with host infrastructure whose names are not
+  // valid repository segments. Before the name filter, canonicalRepoDir() threw
+  // on the first one and killed discovery for the whole fleet.
+  it.each(['.pnpm-store', '.nanoclaw-storage-active'])(
+    'discovers real checkouts alongside the %s infrastructure directory',
+    (infraName) => {
+      const fixture = repositoryFixture();
+      const infra = path.join(topicWorktreesDir(fixture.workUnit, state.dataDir), infraName);
+      fs.mkdirSync(infra, { recursive: true });
+
+      const targets = _discoverWorktreesForTesting(state.dataDir);
+
+      expect(targets.map((target) => target.repo)).toEqual([fixture.repo]);
+      expect(fs.existsSync(infra)).toBe(true);
+    },
+  );
+
+  it('keeps collecting after a target fails, and reports the skip', async () => {
+    const failing = repositoryFixture('thread-1', 'repo-a');
+    const healthy = repositoryFixture('thread-1', 'repo-b');
+
+    // A symlinked coordination lock makes withHostRepositoryLock throw for
+    // repo-a only — a per-target fault, exactly what used to abort the pass.
+    const lock = repositoryLockPath('wg-a', failing.repo, state.dataDir);
+    fs.mkdirSync(path.dirname(lock), { recursive: true });
+    fs.symlinkSync('/dev/null', lock);
+
+    await runWorktreeCleanupOnce(state.dataDir);
+
+    expect(fs.existsSync(failing.worktree)).toBe(true);
+    expect(fs.existsSync(healthy.worktree)).toBe(false);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Worktree cleanup: target failed; continuing pass',
+      expect.objectContaining({ repo: failing.repo, err: expect.any(Error) }),
+    );
+    expect(log.info).toHaveBeenCalledWith(
+      'Worktree cleanup: pass complete',
+      expect.objectContaining({ examined: 2, skipped: 1 }),
+    );
   });
 });

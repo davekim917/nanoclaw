@@ -89,6 +89,21 @@ export function assertRepositoryName(repo: string): void {
   if (repo === '.git') throw new Error(`Invalid repository name: ${repo}`);
 }
 
+/**
+ * Non-throwing form of {@link assertRepositoryName}, for the directory roots
+ * where non-repository entries legitimately live beside checkouts (a topic's
+ * `worktrees/` root also holds `.nanoclaw-storage-active` leases and a
+ * `.pnpm-store` cache). It is a name filter, never deletion authority.
+ */
+export function isRepositoryName(repo: string): boolean {
+  try {
+    assertRepositoryName(repo);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function repositoriesRoot(dataDir: string = DATA_DIR): string {
   return path.join(path.resolve(dataDir), 'repositories');
 }

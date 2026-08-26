@@ -21,6 +21,7 @@ import { log } from './log.js';
 import {
   canonicalRepoDir,
   defaultTopicBranch,
+  isRepositoryName,
   resolveRepositoryWorkUnit,
   topicStateDir,
   topicWorktreesDir,
@@ -102,8 +103,8 @@ function participantsByTopic(
            LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id`,
       )
       .all() as SessionRow[];
-  } catch (error) {
-    log.error('Worktree cleanup: session inventory failed; preserving every topic', { error });
+  } catch (err) {
+    log.error('Worktree cleanup: session inventory failed; preserving every topic', { err });
     return new Map();
   }
 
@@ -125,10 +126,10 @@ function participantsByTopic(
         status: row.status,
       });
       result.set(key, current);
-    } catch (error) {
+    } catch (err) {
       log.warn('Worktree cleanup: invalid session repository identity; preserving it', {
         sessionId: row.session_id,
-        error,
+        err,
       });
     }
   }
@@ -145,6 +146,13 @@ function discover(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
     if (!fs.existsSync(statePath)) continue;
     const worktreeRoot = topicWorktreesDir(unit, dataDir);
     for (const repo of safeDirectories(worktreeRoot).sort()) {
+      // The worktrees root is not a pure repository namespace: the storage
+      // activity lease (`.nanoclaw-storage-active`) and the shared pnpm cache
+      // (`.pnpm-store`) live here too. Their names are not valid repository
+      // segments, so canonicalRepoDir() throws on them — and before this
+      // guard, one such directory aborted the entire cleanup pass at
+      // discovery, fleet-wide, forever.
+      if (!isRepositoryName(repo)) continue;
       const worktreePath = path.join(worktreeRoot, repo);
       if (!fs.existsSync(worktreePath)) continue;
       worktrees.push({
@@ -313,7 +321,26 @@ async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DI
 }
 
 export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promise<void> {
-  for (const target of discover(dataDir)) await cleanupOne(target, dataDir);
+  const targets = discover(dataDir);
+  // One pathological topic must not cost the fleet its collection pass: a
+  // failing target is skipped and counted, never allowed to abort the rest.
+  let skipped = 0;
+  for (const target of targets) {
+    try {
+      await cleanupOne(target, dataDir);
+    } catch (err) {
+      skipped += 1;
+      log.warn('Worktree cleanup: target failed; continuing pass', {
+        workgroupId: target.workUnit.workgroupId,
+        workUnit: target.workUnit.key,
+        repo: target.repo,
+        err,
+      });
+    }
+  }
+  // A pass that collected nothing because every target failed must not read
+  // like a pass that had nothing to do.
+  log.info('Worktree cleanup: pass complete', { examined: targets.length, skipped });
 }
 
 export function _discoverWorktreesForTesting(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
@@ -331,10 +358,10 @@ export function startWorktreeCleanup(): void {
   if (intervalHandle || startupHandle) return;
   startupHandle = setTimeout(() => {
     startupHandle = null;
-    void runWorktreeCleanupOnce().catch((error) => log.error('Worktree cleanup: startup run failed', { error }));
+    void runWorktreeCleanupOnce().catch((err) => log.error('Worktree cleanup: startup run failed', { err }));
   }, STARTUP_DELAY_MS);
   intervalHandle = setInterval(() => {
-    void runWorktreeCleanupOnce().catch((error) => log.error('Worktree cleanup: periodic run failed', { error }));
+    void runWorktreeCleanupOnce().catch((err) => log.error('Worktree cleanup: periodic run failed', { err }));
   }, CLEANUP_INTERVAL_MS);
 }
 
