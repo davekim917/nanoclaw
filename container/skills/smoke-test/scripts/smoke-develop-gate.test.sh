@@ -1032,5 +1032,154 @@ jq -cn --arg target "$OOB2_SHA" --arg freeze "zzz" --argjson pr 99 \
 bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_ledger_tampered"' >/dev/null
 jq -e '.completedRunId != "rival-run"' "$STATE_DIR2/develop-state.json" >/dev/null
 
+# --- 40. `ack`: terminal disposition for an alarm wake ---------------------
+# Argument validation first. A typo'd trigger filed under a key nothing reads
+# would be an ack-shaped no-op, which is the exact failure class this verb
+# exists to close.
+fresh_state
+if bash "$GATE" ack preflight_failed | jq -e '.ok == true' >/dev/null 2>&1; then
+  echo "expected ack with no disposition to be rejected" >&2; exit 1
+fi
+# Rejections exit 2, so capture before asserting (pipefail would eat the test).
+ACK_OUT="$(bash "$GATE" ack preflght_failed "some reason" acked || true)"
+jq -e '
+  .ok == false and (.error | test("unknown trigger")) and
+  (.triggers | index("preflight_failed") != null)
+' <<<"$ACK_OUT" >/dev/null
+ACK_OUT="$(bash "$GATE" ack preflight_failed "some reason" handled || true)"
+jq -e '.ok == false and (.error | test("resolved, acked, or escalated"))' <<<"$ACK_OUT" >/dev/null
+bash "$GATE" ack preflight_failed "some reason" acked | jq -e '
+  .ok == true and .disposition == "acked" and .silenceable == true and
+  .silencedUntil != null
+' >/dev/null
+jq -e '
+  .dispositions.preflight_failed.fingerprint == "some reason" and
+  .dispositions.preflight_failed.disposition == "acked"
+' "$SMOKE_GATE_STATE_DIR/develop-state.json" >/dev/null
+
+# --- 41. An ack silences THAT condition and nothing else -------------------
+# ALERT_SECONDS=0 removes the time throttle, so every poll below would alarm
+# on its own. Anything that stays silent is silent because of the ack.
+fresh_state
+PF_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
+export SMOKE_GATE_PREFLIGHT_ALERT_SECONDS=0
+pf_sha f
+pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == true and .data.trigger == "preflight_failed"
+' >/dev/null
+# ...and again, un-acked, to prove the throttle is genuinely disarmed.
+pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == true
+' >/dev/null
+bash "$GATE" ack preflight_failed "3 of 8 QA seats could not be verified" acked "seat seeding is a human step" >/dev/null
+pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == false and .data.trigger == "preflight_failed"
+' >/dev/null
+# A worsened condition is a different fingerprint and still alarms.
+pf_poll 'echo "8 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == true and .data.reason == "8 of 8 QA seats could not be verified"
+' >/dev/null
+# ...and that wake dropped the stale disposition, so it owes a fresh one.
+jq -e '.dispositions.preflight_failed == null' "$PF_STATE" >/dev/null
+
+# --- 42. An ack expires. No incident goes dark forever. --------------------
+bash "$GATE" ack preflight_failed "8 of 8 QA seats could not be verified" acked >/dev/null
+pf_poll 'echo "8 of 8 QA seats could not be verified"; exit 1' | jq -e '.wakeAgent == false' >/dev/null
+# Age the ack past the TTL in place — the condition and fingerprint are
+# unchanged, so only the TTL can put the alarm back.
+jq --arg t "$(date -u -d '@'$(( $(date -u +%s) - 2 * 86400 )) +'%Y-%m-%dT%H:%M:%SZ')" \
+  '.dispositions.preflight_failed.at=$t' "$PF_STATE" > "$PF_STATE.tmp" && mv "$PF_STATE.tmp" "$PF_STATE"
+pf_poll 'echo "8 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == true and .data.trigger == "preflight_failed"
+' >/dev/null
+
+# --- 43. `resolved` asserts the condition is gone, so it never silences ----
+# If the gate can still see the condition, the claim was wrong and the alarm
+# has to fire. This is what keeps the three dispositions distinguishable.
+bash "$GATE" ack preflight_failed "8 of 8 QA seats could not be verified" resolved | jq -e '
+  .ok == true and .disposition == "resolved" and .silencedUntil == null
+' >/dev/null
+pf_poll 'echo "8 of 8 QA seats could not be verified"; exit 1' | jq -e '.wakeAgent == true' >/dev/null
+
+# --- 44. `escalated` silences like an ack but stays distinguishable, and a
+#         condition that CLEARS drops the disposition with it.
+bash "$GATE" ack preflight_failed "8 of 8 QA seats could not be verified" escalated "paged the owner" >/dev/null
+jq -e '.dispositions.preflight_failed.disposition == "escalated"' "$PF_STATE" >/dev/null
+pf_poll 'echo "8 of 8 QA seats could not be verified"; exit 1' | jq -e '.wakeAgent == false' >/dev/null
+pf_poll 'echo "All 8 QA seats authenticated."; exit 0' | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_build_settled"
+' >/dev/null
+# Cleared condition, cleared disposition: a recurrence is a new incident.
+jq -e '.dispositions.preflight_failed == null' "$PF_STATE" >/dev/null
+unset SMOKE_GATE_PREFLIGHT_ALERT_SECONDS
+
+# --- 45. Alarms that exist to chase a human are deliberately un-silenceable.
+# `ack` records the disposition but must never claim a mute it will not honor.
+# ACK_SILENCEABLE is the PROMISE; the ack_silences call sites in the poll path
+# are the DELIVERY. If they ever disagree the verb starts lying, so assert the
+# two sets are identical instead of carrying a runtime guard no call site can
+# reach.
+ACK_DECLARED="$(grep -oP '^ACK_SILENCEABLE="\K[^"]+' "$GATE" | tr ' ' '\n' | grep -v '^$' | sort -u)"
+ACK_WIRED="$(grep -oP '^\s*if ack_silences \K[a-z_]+' "$GATE" | sort -u)"
+if [ "$ACK_DECLARED" != "$ACK_WIRED" ]; then
+  echo "ACK_SILENCEABLE declares [$ACK_DECLARED] but poll honors [$ACK_WIRED]" >&2; exit 1
+fi
+bash "$GATE" ack develop_hold_undecided "run-1" acked | jq -e '
+  .ok == true and .silenceable == false and .silencedUntil == null
+' >/dev/null
+bash "$GATE" ack gate_misconfigured "SMOKE_GATE_REPO" escalated | jq -e '
+  .ok == true and .silenceable == false and .silencedUntil == null
+' >/dev/null
+# ...and the report is honest: an ack on one of them does NOT mute its alarm.
+# A pending human decision is chased until a human answers it, ack or no ack.
+fresh_state
+unset SMOKE_GATE_DECISION_LEDGER SMOKE_GATE_HOLD_ALERT_SECONDS 2>/dev/null || true
+export SMOKE_GATE_HOLD_ALERT_SECONDS=0
+ACK_HOLD_SHA="$(printf 'c%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$ACK_HOLD_SHA"
+export SMOKE_GATE_HOLD_FILE="$SMOKE_GATE_STATE_DIR/develop-hold.json"
+export SMOKE_GATE_DECISION_LEDGER="$SMOKE_GATE_STATE_DIR/gates"
+mkdir -p "$SMOKE_GATE_DECISION_LEDGER"
+jq -cn --arg sha "$ACK_HOLD_SHA" \
+  '{schemaVersion:1,sha:$sha,runId:"ack-held-run",verdict:"HUMAN_DECISION",
+    raisedAt:"2026-08-25T18:23:39Z",reason:"needs_human_decision"}' \
+  > "$SMOKE_GATE_HOLD_FILE"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "develop_hold_undecided"' >/dev/null
+bash "$GATE" ack develop_hold_undecided "ack-held-run" acked "waiting on the release desk" >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "develop_hold_undecided"' >/dev/null
+unset SMOKE_GATE_HOLD_ALERT_SECONDS SMOKE_GATE_HOLD_FILE SMOKE_GATE_DECISION_LEDGER
+
+# --- 46. The freeze-failure alarm — the 2026-08-25/26 case that motivated the
+#         verb: three identical wakes, 6h apart, nothing dispositioned.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+export SMOKE_GATE_PREFLIGHT_ALERT_SECONDS=0
+ACK_SHA="$(printf 'd%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$ACK_SHA"
+export STUB_FREEZE_JSON='{"ok":false,"error":"branch already exists","branch":"smoke/freeze-dddddddddddd"}'
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_freeze_failed"
+' >/dev/null
+bash "$GATE" ack develop_freeze_failed "branch already exists" acked "orphan branch left in place on purpose" \
+  | jq -e '.ok == true and .silenceable == true' >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == false and .data.trigger == "develop_freeze_failed"
+' >/dev/null
+# A DIFFERENT helper failure is a different incident and alarms through the ack.
+export STUB_FREEZE_JSON='{"ok":false,"error":"gh pr create failed"}'
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.reason == "gh pr create failed"
+' >/dev/null
+# ...and that wake cleared the stale disposition, so it owes a fresh one too.
+jq -e '.dispositions.develop_freeze_failed == null' "$SMOKE_GATE_STATE_DIR/develop-state.json" >/dev/null
+# The freeze finally succeeding clears the incident, disposition included.
+bash "$GATE" ack develop_freeze_failed "gh pr create failed" acked >/dev/null
+export STUB_FREEZE_JSON="{\"prNumber\":77,\"branch\":\"smoke/freeze-d\",\"freezeSha\":\"abc\",\"targetSha\":\"$ACK_SHA\"}"
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+jq -e '.dispositions.develop_freeze_failed == null' "$SMOKE_GATE_STATE_DIR/develop-state.json" >/dev/null
+unset SMOKE_GATE_PREFLIGHT_ALERT_SECONDS
+
 echo "smoke develop gate tests passed"
 

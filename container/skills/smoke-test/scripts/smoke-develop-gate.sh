@@ -241,7 +241,8 @@ default_state() {
     freezeFailReason: null,
     freezeFailWakeAt: null,
     lastFreezeOpenedAt: null,
-    ledgerTamperAlertFor: null
+    ledgerTamperAlertFor: null,
+    dispositions: {}
   }'
 }
 
@@ -295,6 +296,70 @@ epoch_or_zero() {
   else
     printf '0'
   fi
+}
+
+# ── Wake dispositions (the `ack` verb) ───────────────────────────────────────
+# Every alarm wake has to end in exactly one of resolved / acked / escalated.
+# Before this there was no way to close one out: an unchanged condition re-woke
+# the agent every ALERT_SECONDS forever. On 2026-08-25/26 one stuck freeze
+# produced three identical `develop_freeze_failed` wakes exactly 6h apart —
+# each re-verified the same facts, posted the same message, and dispositioned
+# nothing. That is the bug; the token cost was the symptom.
+#
+# `acked` and `escalated` silence ONE trigger for ONE exact fingerprint (the
+# condition's own reason string, which is what the wake payload carries), and
+# only until ACK_MAX_SILENCE_SECONDS: a changed reason is a different condition
+# and alarms on the normal rules, and an acked incident can never go dark for
+# longer than the TTL. `resolved` never silences — it asserts the condition is
+# gone, so if the gate still sees it the claim was wrong and must alarm.
+ACK_MAX_SILENCE_SECONDS="${SMOKE_GATE_ACK_MAX_SILENCE_SECONDS:-86400}"
+# Every alarm trigger this gate emits (grep `trigger:"` below). Validated on
+# `ack` so a typo cannot be filed under a key nothing ever reads.
+ACK_TRIGGERS="develop_unsettled develop_freeze_abandoned develop_freeze_stale
+  develop_freeze_ledger_tampered develop_freeze_failed gate_hold_tampered
+  develop_run_overrun develop_hold_undecided preflight_failed
+  gate_misconfigured gate_fetch_failed"
+# ...of which only these two re-alarm on a plain timer against a stable reason
+# string, so only these two are silenceable. The other interval alarms
+# (misconfigured, fetch failure, run overrun, undecided hold) stay
+# un-silenceable ON PURPOSE: each is the only thing chasing a human or a broken
+# deployment, and their own comments already say a latch that can go quiet is
+# not a safety mechanism. `ack` still RECORDS a disposition for them — it just
+# reports silenceable:false rather than pretending to mute them.
+#
+# This list is what the `ack` verb PROMISES; the `ack_silences` call sites in
+# the poll path are what actually delivers. They must name the same triggers,
+# and the test suite asserts exactly that (case 45) rather than a runtime guard
+# that no call site can ever reach.
+ACK_SILENCEABLE="develop_freeze_failed preflight_failed"
+
+in_word_list() {
+  local needle="$1" haystack="$2" item
+  # shellcheck disable=SC2086 # word-splitting the space-separated list is the point
+  for item in $haystack; do [ "$item" = "$needle" ] && return 0; done
+  return 1
+}
+
+# True when a live ack/escalation covers this exact trigger + fingerprint.
+# Reads $STATE.
+ack_silences() {
+  local trigger="$1" fingerprint="$2" entry age now_epoch="${NOW_EPOCH:-$(date -u +%s)}"
+  entry="$(jq -c --arg t "$trigger" '.dispositions[$t] // empty' <<<"$STATE" 2>/dev/null)"
+  [ -n "$entry" ] || return 1
+  [ "$(jq -r '.fingerprint // empty' <<<"$entry")" = "$fingerprint" ] || return 1
+  case "$(jq -r '.disposition // empty' <<<"$entry")" in
+    acked|escalated) ;;
+    *) return 1 ;;
+  esac
+  age=$(( now_epoch - $(epoch_or_zero "$(jq -r '.at // empty' <<<"$entry")") ))
+  [ "$age" -lt "$ACK_MAX_SILENCE_SECONDS" ]
+}
+
+# Drop a trigger's disposition. Called both when the underlying condition
+# CLEARS (a later recurrence is a new incident and must alarm at once) and when
+# an alarm actually fires (the fresh wake owes a fresh disposition). Sets $STATE.
+drop_disposition() {
+  STATE="$(jq -c --arg t "$1" '.dispositions = ((.dispositions // {}) | del(.[$t]))' <<<"$STATE")"
 }
 
 # Has a human decided the hold that run id currently owns?
@@ -715,10 +780,61 @@ if [ "$COMMAND" = "progress" ]; then
   exit 0
 fi
 
+# Terminal disposition for an alarm wake. Exactly one of resolved / acked /
+# escalated, scoped to the fingerprint the wake carried (its `reason`, or the
+# most specific identifier in the payload when the trigger has no reason text).
+if [ "$COMMAND" = "ack" ]; then
+  TRIGGER="${2:-}"
+  FINGERPRINT="${3:-}"
+  DISPOSITION="${4:-}"
+  NOTE="${5:-}"
+  if [ -z "$TRIGGER" ] || [ -z "$FINGERPRINT" ]; then
+    jq -cn '{ok:false,error:"ack requires <trigger> <fingerprint> <resolved|acked|escalated> [note]"}'
+    exit 2
+  fi
+  if ! in_word_list "$TRIGGER" "$ACK_TRIGGERS"; then
+    jq -cn --arg t "$TRIGGER" \
+      --argjson known "$(printf '%s\n' $ACK_TRIGGERS | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+      '{ok:false,error:("ack: unknown trigger " + $t),triggers:$known}'
+    exit 2
+  fi
+  case "$DISPOSITION" in
+    resolved|acked|escalated) ;;
+    *)
+      jq -cn '{ok:false,error:"ack disposition must be resolved, acked, or escalated"}'
+      exit 2
+      ;;
+  esac
+  ACK_NOW="$(iso_now)"
+  SILENCEABLE=false
+  if in_word_list "$TRIGGER" "$ACK_SILENCEABLE"; then SILENCEABLE=true; fi
+  STATE="$(jq -c --arg t "$TRIGGER" --arg f "$FINGERPRINT" --arg d "$DISPOSITION" \
+    --arg now "$ACK_NOW" --arg note "$NOTE" \
+    '.dispositions = ((.dispositions // {}) | .[$t] = {
+       fingerprint:$f, disposition:$d, at:$now,
+       note:(if $note == "" then null else $note end)})' <<<"$STATE")"
+  write_state "$STATE"
+  # `silencedUntil` is the honest answer to "will this stop waking me": null
+  # for `resolved` (which never silences) and for the triggers that are
+  # deliberately un-silenceable, an ISO instant otherwise. Never claim a mute
+  # the poll path will not honor.
+  SILENCED_UNTIL=""
+  if [ "$SILENCEABLE" = true ] && [ "$DISPOSITION" != resolved ]; then
+    SILENCED_UNTIL="$(date -u -d "@$(( $(epoch_or_zero "$ACK_NOW") + ACK_MAX_SILENCE_SECONDS ))" \
+      +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf '')"
+  fi
+  jq -cn --arg t "$TRIGGER" --arg f "$FINGERPRINT" --arg d "$DISPOSITION" \
+    --arg at "$ACK_NOW" --arg until "$SILENCED_UNTIL" --argjson silenceable "$SILENCEABLE" \
+    '{ok:true,trigger:$t,fingerprint:$f,disposition:$d,at:$at,
+      silenceable:$silenceable,
+      silencedUntil:(if $until == "" then null else $until end)}'
+  exit 0
+fi
+
 if [ "$COMMAND" != "poll" ]; then
   jq -cn --arg command "$COMMAND" \
     '{ok:false,error:("unknown command: " + $command),
-      commands:["poll","check","claim","release","progress","finish"]}'
+      commands:["poll","check","claim","release","progress","finish","ack"]}'
   exit 2
 fi
 
@@ -1418,11 +1534,21 @@ if [ -n "$PREFLIGHT_CMD" ]; then
     [ "$PREFLIGHT_RC" -eq 124 ] && PREFLIGHT_REASON="preflight timed out after ${PREFLIGHT_TIMEOUT}s: $PREFLIGHT_REASON"
     LAST_REASON="$(jq -r '.preflightReason // empty' <<<"$STATE")"
     SINCE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.preflightWakeAt // empty' <<<"$STATE")") ))"
+    # A live ack for this exact reason outranks the re-arm rules. Same silent
+    # shape as the throttled branch below, including not persisting the reason:
+    # the latch must keep comparing against the last reason we ALARMED on.
+    if ack_silences preflight_failed "$PREFLIGHT_REASON"; then
+      emit_no_wake "preflight_failed"
+      exit 0
+    fi
     if { [ "$PREFLIGHT_REASON" != "$LAST_REASON" ] &&
          [ "$SINCE_WAKE" -ge "$PREFLIGHT_REARM_FLOOR_SECONDS" ]; } ||
        [ "$SINCE_WAKE" -ge "$PREFLIGHT_ALERT_SECONDS" ]; then
       STATE="$(jq -c --arg r "$PREFLIGHT_REASON" --arg now "$NOW" \
         '.preflightReason=$r | .preflightWakeAt=$now' <<<"$STATE")"
+      # This wake owes a fresh disposition — an expired or differently
+      # fingerprinted one must not carry over to it.
+      drop_disposition preflight_failed
       write_state "$STATE"
       jq -cn \
         --arg reason "$PREFLIGHT_REASON" \
@@ -1439,8 +1565,11 @@ if [ -n "$PREFLIGHT_CMD" ]; then
     exit 0
   fi
   # Passed — clear the latch so the next failure alarms immediately instead of
-  # inheriting a throttle window from an outage that is already repaired.
+  # inheriting a throttle window from an outage that is already repaired. The
+  # disposition goes with it: a condition that cleared and came back is a new
+  # incident, not the one somebody acked.
   STATE="$(jq -c '.preflightReason=null | .preflightWakeAt=null' <<<"$STATE")"
+  drop_disposition preflight_failed
 fi
 
 PREVIOUS_SHA="$COMPLETED_SHA"
@@ -1494,9 +1623,17 @@ if [ "$FREEZE_HANDOFF" = true ]; then
     FREEZE_ORPHAN_BRANCH="$(jq -r '.branch // empty' <<<"$FREEZE_JSON" 2>/dev/null)"
     LAST_FREEZE_REASON="$(jq -r '.freezeFailReason // empty' <<<"$STATE")"
     SINCE_FREEZE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.freezeFailWakeAt // empty' <<<"$STATE")") ))"
+    # A live ack for this exact reason outranks the re-arm rules. This is the
+    # 2026-08-25/26 case: three identical wakes 6h apart, nothing dispositioned.
+    if ack_silences develop_freeze_failed "$FREEZE_REASON"; then
+      emit_no_wake "develop_freeze_failed"
+      exit 0
+    fi
     if { [ "$FREEZE_REASON" != "$LAST_FREEZE_REASON" ] && [ "$SINCE_FREEZE_WAKE" -ge "$PREFLIGHT_REARM_FLOOR_SECONDS" ]; } ||
        [ "$SINCE_FREEZE_WAKE" -ge "$PREFLIGHT_ALERT_SECONDS" ]; then
       STATE="$(jq -c --arg r "$FREEZE_REASON" --arg now "$NOW" '.freezeFailReason=$r | .freezeFailWakeAt=$now' <<<"$STATE")"
+      # This wake owes a fresh disposition.
+      drop_disposition develop_freeze_failed
       write_state "$STATE"
       jq -cn --arg reason "$FREEZE_REASON" --arg sha "$SOURCE_SHA" --argjson rc "$FREEZE_RC" \
         --arg branch "$FREEZE_ORPHAN_BRANCH" \
@@ -1518,6 +1655,8 @@ if [ "$FREEZE_HANDOFF" = true ]; then
      .lastFreezeOpenedAt=$now |
      .freezeFailReason=null | .freezeFailWakeAt=null |
      .candidateSha=null | .candidateFirstSeen=null' <<<"$STATE")"
+  # Condition cleared — a later recurrence is a new incident, not the acked one.
+  drop_disposition develop_freeze_failed
   write_state "$STATE"
   jq -cn \
     --arg repo "$REPO" --arg branch "$BRANCH" --arg sha "$SOURCE_SHA" --arg previous "$PREVIOUS_SHA" \
