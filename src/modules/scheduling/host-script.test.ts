@@ -8,6 +8,7 @@
  *     classifier flags, without running it host-side
  *   - never leak the host process's env into the child (only PATH/HOME/TZ)
  */
+import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -365,6 +366,48 @@ describe('runHostScript hard deadline', () => {
         'utf8-cap-test',
       );
       expect(result).toBeNull();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  // The script file is written into a private 0700 mkdtemp dir at 0600, NOT a
+  // predictable name in shared /tmp at 0755. The old shape was a real
+  // privilege-escalation surface: `taskId` appears in logs and on the board, so
+  // the name was guessable; the sticky bit does not stop pre-creating it as a
+  // symlink; writeFileSync FOLLOWS symlinks and `mode` only applies on create —
+  // so a predicted name let an attacker choose the file this host then executed
+  // UNSANDBOXED, routing straight around classifyForHostExecution.
+  it('refuses to write through a pre-planted symlink at its script path', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '5000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      fs.mkdirSync(TEST_DIR, { recursive: true });
+      const victim = path.join(TEST_DIR, 'victim.txt');
+      fs.writeFileSync(victim, 'ORIGINAL');
+
+      // The script reports its own location and permissions from INSIDE the
+      // run. The directory is cleaned up on finish, so anything asserted
+      // afterwards would be stat-ing a path that no longer exists.
+      const result = await runHostScript(
+        `d=$(dirname "$0")\nprintf '{"wakeAgent":true,"data":{"dir":"%s","dmode":"%s","fmode":"%s"}}\\n' "$d" "$(stat -c '%a' "$d")" "$(stat -c '%a' "$0")"\n`,
+        'sec',
+      );
+
+      const { dir, dmode, fmode } = result?.data as { dir: string; dmode: string; fmode: string };
+      // Private per-run directory, not the shared tmp root.
+      expect(dir).not.toBe(os.tmpdir());
+      expect(path.dirname(dir)).toBe(os.tmpdir());
+      expect(path.basename(dir)).toMatch(/^nanoclaw-task-/);
+      // 0700: nobody else can even traverse in to plant anything.
+      expect(dmode).toBe('700');
+      // 0600: no execute bit — spawn('bash', [path]) never needed one.
+      expect(fmode).toBe('600');
+      // Untouched — the old predictable-path shape is what made this reachable.
+      expect(fs.readFileSync(victim, 'utf8')).toBe('ORIGINAL');
+      // And the run cleans up after itself.
+      expect(fs.existsSync(dir)).toBe(false);
     } finally {
       vi.unstubAllEnvs();
     }

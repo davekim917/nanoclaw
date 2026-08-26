@@ -130,9 +130,25 @@ function minimalEnv(): NodeJS.ProcessEnv {
 }
 
 export function runHostScript(script: string, taskId: string): Promise<ScriptResult | null> {
-  const scriptPath = path.join(os.tmpdir(), `host-task-script-${taskId}-${Date.now()}.sh`);
+  // PRIVATE 0700 DIRECTORY, not a predictable name in shared /tmp.
+  //
+  // The old path was `${os.tmpdir()}/host-task-script-${taskId}-${Date.now()}.sh`
+  // at mode 0o755. `taskId` is a series id that appears in logs and on the
+  // board, so the name is guessable, host /tmp is world-writable, and the
+  // sticky bit does not stop anyone PRE-CREATING that name as a symlink.
+  // `fs.writeFileSync` follows symlinks and `mode` only applies when the file
+  // is created — so a predicted name is a write-through primitive, and the
+  // file we then execute UNSANDBOXED as the host user is attacker-chosen.
+  // That is precisely what classifyForHostExecution exists to prevent, routed
+  // around entirely. `mkdtempSync` gives a 0700 directory nobody else can
+  // traverse; `wx` refuses to follow or clobber anything already there; 0600
+  // is enough because `spawn('bash', [path])` never needs the execute bit.
+  let dir: string;
+  let scriptPath: string;
   try {
-    fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-task-'));
+    scriptPath = path.join(dir, 'script.sh');
+    fs.writeFileSync(scriptPath, script, { flag: 'wx', mode: 0o600 });
   } catch (err) {
     // Outside the promise, so an uncaught throw here does not just fail this
     // row — it propagates through runHostGatedTaskScripts and prepareDueWake
@@ -142,6 +158,14 @@ export function runHostScript(script: string, taskId: string): Promise<ScriptRes
     log.warn('Host task-script could not be written to disk', { taskId, err });
     return Promise.resolve(null);
   }
+  /** Remove the script and its private directory. */
+  const cleanup = (): void => {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+  };
 
   return new Promise((resolve) => {
     let settled = false;
@@ -197,11 +221,7 @@ export function runHostScript(script: string, taskId: string): Promise<ScriptRes
       // A synchronous spawn throw (bad option shape) would otherwise reject
       // this promise past every cleanup path below, leaking the temp script and
       // leaving the row pending to be retried identically on the next tick.
-      try {
-        fs.unlinkSync(scriptPath);
-      } catch {
-        /* best-effort cleanup */
-      }
+      cleanup();
       log.warn('Host task-script could not be spawned', { taskId, err });
       return resolve(null);
     }
@@ -245,11 +265,7 @@ export function runHostScript(script: string, taskId: string): Promise<ScriptRes
           /* already gone */
         }
       }
-      try {
-        fs.unlinkSync(scriptPath);
-      } catch {
-        /* best-effort cleanup */
-      }
+      cleanup();
       resolve(result);
     };
 
