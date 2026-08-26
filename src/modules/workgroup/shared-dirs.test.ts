@@ -99,8 +99,8 @@ describe('reconcileWorkgroupSharedDirs', () => {
 
   // The reconciler used to `return` on the `.migrated` marker, which made the
   // shared tree a ONE-SHOT snapshot of whenever it first ran. Live consequence:
-  // `illysium`'s marker is dated 2026-05-27 and `releases/` — the release desk's
-  // board, decision ledger and runbook — was created 2026-08-01, so it was never
+  // a workgroup's marker predated one of its seed dirs by two months, so that
+  // dir — a release desk's board, decision ledger and runbook — was never
   // seen. It ended up reachable only through hand-made per-sibling symlinks,
   // present on three siblings and missing on the two QA agents, which is the
   // scattered-symlink drift workgroups exist to end.
@@ -122,7 +122,7 @@ describe('reconcileWorkgroupSharedDirs', () => {
   });
 
   it('gives a sibling that never had a symlink one on the next run', () => {
-    // The argus/momus case: siblings added (or simply forgotten) after the
+    // The late-sibling case: siblings added (or simply forgotten) after the
     // one-shot migration could never reach shared data at all.
     reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
     db.prepare(`INSERT INTO agent_groups (id, folder, workgroup_id) VALUES (?,?,?)`).run('ag-qa', 'wgx-qa', 'wgx');
