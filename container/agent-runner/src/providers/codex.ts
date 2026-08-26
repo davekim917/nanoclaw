@@ -1028,6 +1028,16 @@ export class CodexProvider implements AgentProvider {
           const text = pending.shift()!;
           let attemptText = text;
           let controlPlaneRecoveryAttempts = 0;
+          // TURN BOUNDARY for cost attribution. One `text` off `pending` is one
+          // logical turn, and the rotation loop below can run runOneTurn several
+          // times for it, so the usage accumulator is created HERE — not inside
+          // runOneTurn (which drops every request made before a retry) and not
+          // outside this shift (which would re-book earlier turns' spend and
+          // recreate the cumulative-carry bug this replaced). Reset explicitly on
+          // the fresh-thread retry paths, where the original request is re-sent
+          // against a thread with no history and the prior attempt would
+          // double-count.
+          let tokenUsageState = createCodexTurnUsageAccumulator();
 
           // Rotation loop. Each iteration runs the same `text` against the
           // current app-server; on a rotation-eligible error with fallback
@@ -1069,6 +1079,7 @@ export class CodexProvider implements AgentProvider {
               turnTracker,
               codexTurnHealthConfigFromEnv(),
               controlPlaneRecoveryAttempts,
+              tokenUsageState,
             )) {
               if (ev.type === 'error' && ev.retryable === false) {
                 const controlPlaneFailure =
@@ -1132,6 +1143,7 @@ export class CodexProvider implements AgentProvider {
                     // original request because the new thread has no context.
                     initYielded = false;
                     attemptText = text;
+                    tokenUsageState = createCodexTurnUsageAccumulator();
                   } else {
                     // Same persisted thread: ask Codex to continue rather than
                     // duplicating the original user request and its side effects.
@@ -1177,6 +1189,7 @@ export class CodexProvider implements AgentProvider {
                   turnTracker.threadId = threadId ?? null;
                   if (threadId !== previousThreadId) {
                     initYielded = false;
+                    tokenUsageState = createCodexTurnUsageAccumulator();
                   }
 
                   rotateAndRetry = true;
@@ -1249,6 +1262,7 @@ export class CodexProvider implements AgentProvider {
                     turnTracker.threadId = threadId ?? null;
                     if (threadId !== previousThreadId) {
                       initYielded = false;
+                      tokenUsageState = createCodexTurnUsageAccumulator();
                     }
 
                     rotateAndRetry = true;
@@ -1306,6 +1320,20 @@ export class CodexProvider implements AgentProvider {
   }
 }
 
+// Usage summed across ONE logical turn. Owned by the caller so it outlives a
+// single runOneTurn attempt — see the LIFETIME note inside runOneTurn.
+export type CodexTurnUsageAccumulator = {
+  seen: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+};
+
+export function createCodexTurnUsageAccumulator(): CodexTurnUsageAccumulator {
+  return { seen: false, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0 };
+}
+
 // ── Per-turn event pump ─────────────────────────────────────────────────────
 // Pulled out because the gen() loop above reads cleaner with it extracted,
 // and because it's a natural seam for future unit tests that drive it with
@@ -1322,6 +1350,7 @@ export async function* runOneTurn(
   turnTracker?: { currentTurnId: string | null },
   healthConfig: CodexTurnHealthConfig = codexTurnHealthConfigFromEnv(),
   recoveryAttempts = 0,
+  tokenUsageState: CodexTurnUsageAccumulator = createCodexTurnUsageAccumulator(),
 ): AsyncGenerator<ProviderEvent> {
   // Mutable refs via object properties — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
@@ -1367,13 +1396,11 @@ export async function* runOneTurn(
   // row so the gap remains visible. Object-property refs (not bare `let`s) for
   // the same reason as `turnState` above — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
-  const tokenUsageState = {
-    seen: false,
-    inputTokens: 0,
-    outputTokens: 0,
-    cachedInputTokens: 0,
-    cacheWriteInputTokens: 0,
-  };
+  //
+  // LIFETIME: the accumulator is owned by the CALLER (see gen()), not declared
+  // here, because ONE logical turn can span several runOneTurn invocations —
+  // the outer retry loop re-invokes this generator on a same-thread recovery,
+  // and the model requests made before that crash belong to the same turn.
   // Codex can deliver reasoning two ways: streaming item/reasoning/* deltas
   // when enabled by the app-server, or finalized reasoning ThreadItems via
   // item/completed. Streamed item IDs are tracked so lifecycle fallback

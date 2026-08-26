@@ -217,3 +217,192 @@ lines.on('line', (line) => {
     );
   }
 });
+
+// Cost attribution across the outer retry loop. One logical turn can span
+// several runOneTurn invocations, and the two sub-cases pull in opposite
+// directions: a resumed thread continues the SAME turn (its earlier model
+// requests must still be counted), while a fresh thread re-sends the original
+// request against empty history (counting the failed attempt would
+// double-book it).
+describe('CodexProvider usage accounting across a recovery retry', () => {
+  for (const scenario of [
+    {
+      resumeStale: false,
+      title: 'same-thread retry keeps the pre-crash requests in the turn total',
+      // 100/10/5/2 before the desync + 200/20/7/3 after the resume.
+      expected: { inputTokens: 300, outputTokens: 30, cacheReadTokens: 12, cacheWriteTokens: 5 },
+    },
+    {
+      resumeStale: true,
+      title: 'fresh-thread retry does NOT inherit the failed attempt (no double-count)',
+      // The original request is re-sent against thread-2, so only 200/20/7/3.
+      expected: { inputTokens: 200, outputTokens: 20, cacheReadTokens: 7, cacheWriteTokens: 3 },
+    },
+  ] as const) {
+    it(
+      scenario.title,
+      async () => {
+        const binDir = path.join(tmpDir, 'bin');
+        const codexHome = path.join(tmpDir, 'codex-home');
+        const statePath = path.join(tmpDir, 'spawn-count');
+        const logPath = path.join(tmpDir, 'requests.jsonl');
+        fs.mkdirSync(binDir, { recursive: true });
+        fs.mkdirSync(codexHome, { recursive: true });
+
+        // Instance 1 reports one model request's usage, then completes the turn
+        // with an unfinished command item — a protocol_desync the provider
+        // recovers from by respawning app-server and re-resuming. Instance 2
+        // reports a second request's usage and finishes.
+        fs.writeFileSync(
+          path.join(binDir, 'codex'),
+          `#!/usr/bin/env bun
+import fs from 'fs';
+import readline from 'readline';
+
+const statePath = process.env.FAKE_CODEX_STATE;
+const logPath = process.env.FAKE_CODEX_LOG;
+const resumeStale = process.env.FAKE_CODEX_RESUME_STALE === '1';
+const previous = fs.existsSync(statePath) ? Number(fs.readFileSync(statePath, 'utf8')) : 0;
+const instance = previous + 1;
+fs.writeFileSync(statePath, String(instance));
+
+let currentThread = 'thread-1';
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+const log = (value) => fs.appendFileSync(logPath, JSON.stringify({ instance, ...value }) + '\\n');
+const usage = (last) =>
+  send({ method: 'thread/tokenUsage/updated', params: { threadId: currentThread, tokenUsage: { last } } });
+
+const lines = readline.createInterface({ input: process.stdin });
+lines.on('line', (line) => {
+  const request = JSON.parse(line);
+  log({ method: request.method, params: request.params });
+  if (request.method === 'initialize') {
+    send({ id: request.id, result: { userAgent: 'fake-codex' } });
+    return;
+  }
+  if (request.method === 'thread/resume') {
+    if (resumeStale) {
+      send({ id: request.id, error: { code: -32000, message: 'thread not found' } });
+      return;
+    }
+    currentThread = 'thread-1';
+    send({ id: request.id, result: { thread: { id: currentThread, status: { type: 'idle' } } } });
+    return;
+  }
+  if (request.method === 'thread/start') {
+    currentThread = 'thread-' + instance;
+    send({ id: request.id, result: { thread: { id: currentThread, status: { type: 'idle' } } } });
+    return;
+  }
+  if (request.method === 'turn/start') {
+    const turnId = 'turn-' + instance;
+    send({ id: request.id, result: { turn: { id: turnId } } });
+    send({
+      method: 'turn/started',
+      params: { threadId: currentThread, turn: { id: turnId, status: 'inProgress', items: [] } },
+    });
+    setTimeout(() => {
+      if (instance === 1) {
+        usage({ inputTokens: 100, outputTokens: 10, cachedInputTokens: 5, cacheWriteInputTokens: 2 });
+        send({
+          method: 'item/started',
+          params: {
+            threadId: currentThread,
+            turnId,
+            item: { id: 'command-1', type: 'commandExecution', status: 'inProgress' },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId: currentThread,
+            turn: {
+              id: turnId,
+              status: 'completed',
+              items: [{ id: 'command-1', type: 'commandExecution', status: 'inProgress' }],
+            },
+          },
+        });
+        return;
+      }
+      usage({ inputTokens: 200, outputTokens: 20, cachedInputTokens: 7, cacheWriteInputTokens: 3 });
+      send({
+        method: 'item/agentMessage/delta',
+        params: { threadId: currentThread, turnId, delta: 'recovered result' },
+      });
+      send({
+        method: 'turn/completed',
+        params: { threadId: currentThread, turn: { id: turnId, status: 'completed', items: [] } },
+      });
+    }, 5);
+    return;
+  }
+  if (request.method === 'thread/read') {
+    send({ id: request.id, result: { thread: { status: { type: 'active' } } } });
+    return;
+  }
+  if (request.method === 'thread/list') {
+    send({ id: request.id, result: { data: [] } });
+    return;
+  }
+  if (request.method === 'turn/interrupt') {
+    send({ id: request.id, result: {} });
+  }
+});
+`,
+          { mode: 0o755 },
+        );
+
+        process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
+        process.env.CODEX_HOME = codexHome;
+        process.env.FAKE_CODEX_STATE = statePath;
+        process.env.FAKE_CODEX_LOG = logPath;
+        process.env.FAKE_CODEX_RESUME_STALE = scenario.resumeStale ? '1' : '0';
+        // Long quiet window: the desync is raised by turn/completed itself, so
+        // the liveness probe must not race in and reclassify the failure.
+        process.env.CODEX_HEALTH_PROBE_QUIET_MS = '60000';
+        process.env.CODEX_HEALTH_PROBE_INTERVAL_MS = '1000';
+        process.env.CODEX_HEALTH_PROBE_TIMEOUT_MS = '1000';
+
+        const provider = new CodexProvider({ providerConfig: { reasoning_effort: 'ultra' } });
+        provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+        const query = provider.query({ prompt: 'perform the original task once', cwd: tmpDir });
+        const events: Array<{
+          type: string;
+          usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
+        }> = [];
+        for await (const event of query.events) {
+          events.push(event as (typeof events)[number]);
+          if (event.type === 'result') query.end();
+        }
+
+        // Two app-server instances ⇒ the retry really happened.
+        expect(fs.readFileSync(statePath, 'utf8')).toBe('2');
+        expect(events.some((event) => event.type === 'error')).toBe(false);
+        expect(events.find((event) => event.type === 'result')?.usage).toMatchObject(scenario.expected);
+      },
+      5_000,
+    );
+  }
+});
+
+// The original blocker this whole accumulator design exists to prevent: codex's
+// `thread/tokenUsage/updated.total` is THREAD-scoped and survives a container
+// respawn, so a resumed thread replays a carried-forward total. Only `last` is
+// ever read, so a fresh container's first turn bills its own requests, not the
+// thread's history.
+describe('codex usage stays container-respawn safe', () => {
+  it('reads only tokenUsage.last, never tokenUsage.total', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((line) => {
+        const i = line.indexOf('//');
+        return i >= 0 ? line.slice(0, i) : line;
+      })
+      .join('\n');
+    expect(codeOnly).toContain('tokenUsage?.last');
+    expect(codeOnly).not.toMatch(/tokenUsage\??\.total/);
+  });
+});
