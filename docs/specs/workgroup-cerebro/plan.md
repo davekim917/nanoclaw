@@ -1,8 +1,10 @@
 # Workgroup cerebro — Pillars 0–2
 
 **Status:** pillars 0 and 1 and Section B approved, built, shipped, and verified in
-production (2026-08). Pillar 2 (§P2) proposed 2026-08-19, revision 2 after plan-stage
-review — awaiting approval.
+production (2026-08). **Pillar 1's implementation was removed 2026-08-26** on measured
+reach and use (see the §3 banner and `run.md`) — its sections are kept as the design
+record. Pillar 2 (§P2) proposed 2026-08-19, revision 2 after plan-stage review —
+awaiting approval.
 **Approval state:** P2 NOT approved. Approval of the pillar-0/1 revision does not carry
 to §P2.
 **Stage:** `/team-plan` (pillar 2)
@@ -368,6 +370,27 @@ before the prohibition is ever consulted, surfacing as `insufficient_evidence` (
 | The premise in P0.2 is wrong                                | Newly _checkable_ thanks to P0.3(e): if `code_derived` noops are rare once logged, the suppression story is wrong. Cheapest de-risking available — land P0.3(e) first, look at a few days of counts, and only then decide whether the prompt change is worth making.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
 ## 3. Current architecture (source evidence) — pillar 1
+
+> **PILLAR 1 IMPLEMENTATION REMOVED (2026-08-26).** §§3–8 and §11 below, and the
+> pillar-1 paragraph of §13, are kept as the record of what was built and why it is
+> gone. There is no scent code in the tree: `graph-scent.ts`, `graph-scent.test.ts`, the
+> `PreTurnContext.graphScent` field with its `graphScentChars` bound, the `'graph'`
+> notice source, the shed-first step in `enforceFinalBound`, the sweep warmth probe, and
+> the container-side rendering (§5.8) were all deleted. Anything below that reads as
+> present tense describes the design, not the code.
+>
+> It shipped 2026-08-10 and was dead in production by 2026-08-26. Reach collapsed from
+> 42.7% of pre-turn context builds to 0 as the two multi-GB graphs outgrew a warmth gate
+> (§5.4) they cannot pass, and across the whole window 3 of 219 scent-bearing turns
+> followed a pointer — each explained by the prompt or the memory lane already naming
+> the file. §11 already stated the standard this lane had to meet ("absent that, the
+> lane is unproven regardless of how clean the latency numbers are"); it did not meet
+> it. Full measurement: `run.md`, "Pillar 1 (graph scent) — REMOVED on measured reach
+> and use, 2026-08-26".
+>
+> **Scope of the removal.** The Graphify daemon, `ncl graphify`, and the container
+> gateway are untouched. Scent was one consumer; this removed the pre-turn injection
+> only.
 
 ### 3.1 The pre-turn path is synchronous
 
@@ -1512,14 +1535,14 @@ extensions above. The token-stream persistence gap (decision 3) and the
 promote-protocol gap (decision 12) were each caught by only one of the two
 reviews — neither alone would have found both.
 
-## 9. Pillars 2 and 4 — sequenced, deliberately not designed here
+## 9. Pillar 2 — sequenced, deliberately not designed here; pillars 3 and 4 DROPPED
 
 Recorded scope: `project_workgroup_cerebro_plan.md`. This plan builds pillars 0 and 1.
-Pillar 2 and pillar 4 get their own `/team-plan` when their entry criteria are met;
-pillar 3 was dropped outright, not deferred (below — the numbering gap is intentional).
-Designing 2 and 4 now would be speculative: pillar 2's shape depends on whether pillar 1
-changes agent behavior, and pillar 4 was explicitly ordered last "after consolidation
-shows which entities matter."
+Pillar 2 gets its own `/team-plan` when its entry criteria are met; designing it now
+would be speculative, since its shape depends on what pillar 1 changed about agent
+behavior (answer, measured: nothing — §3 banner). **Pillars 3 and 4 were each dropped outright, not deferred.** Their numbers
+are retired with them and both entries stay below, so the reasoning is not re-litigated
+from the original one-line scopes.
 
 **Pillar 0 changes pillar 2's entry criteria.** Consolidation distils the episodic
 ledger, so it concentrates whatever the ledger holds. Run against today's 11.9% domain
@@ -1561,13 +1584,35 @@ files on a schedule. Dropped outright rather than deferred, for four reasons:
    actually matter for a given analysis, what a late feed implies — is a durable
    learned fact, and that is pillar 2's topic files, already shipped.
 
-The number is retired with the pillar; pillar 4 below keeps its number unchanged.
+The number is retired with the pillar.
 
-**Pillar 4 — entity layer in Graphify.** Person/system/concept node types. The graph has
-none today — only chunks, files, and symbols (§4.3 sample), which is why a person query
-returns zero _nodes_ while FTS matches exist. This is a Graphify schema and extractor
-change, the largest of the four.
-_Entry criteria:_ pillar 2 has shown which entities actually recur.
+**Pillar 4 — DROPPED (was: entity layer in Graphify).** Originally scoped as
+person/system/concept node types plus the extractor work to populate them — the graph
+has none today, only chunks, files, and symbols (§4.3 sample), which is why a person
+query returns zero _nodes_ while FTS matches exist. It was the largest of the four and
+was ordered last, gated on "pillar 2 has shown which entities actually recur." **Never
+built; there is no code to remove.** Dropped on that entry criterion, which pillar 2 ran
+and answered in the negative. Twelve consolidated topic files were read end to end
+across `people/`, `domain/`, and `systems/` in two workgroups:
+
+1. **The corpus is narrative-shaped, not entity-shaped.** What those files hold is
+   incident postmortems, governance rulings, an architecture decision log, a warehouse
+   column-mapping investigation, and org/comp narrative. The value in each is the
+   _why_ — not which nodes connect to which.
+2. **Decomposing them into nodes and edges is lossy.** A topic file is already the
+   compressed answer to "what happened and what should be done differently." Splitting
+   it discards the reasoning that makes it worth reading, and the query returns the same
+   handful of files the passage ranker already ranks top — minus that reasoning.
+3. **Every candidate entity type classifies out.** People and reporting lines are
+   genuine durable memory, but that is roughly five people in one file with the
+   relationships stated in the same sentence — a node pair adds nothing the sentence
+   does not already say. PRs, issues, and SHAs are GitHub's live state; Snowflake tables
+   are the warehouse's; release-gate state lives in `gates/*.jsonl`. Caching any of them
+   here is pillar 3's rejected shape (point 2 above).
+4. **The pointers it would sharpen already go unfollowed.** P2.1 sampled 270 scent
+   deliveries carrying pointers and found zero agent replies citing a pointed-to file.
+   Better node types would have produced a better version of a lane the fleet does not
+   use.
 
 ## 10. Risks and open items
 
@@ -1597,6 +1642,8 @@ _Entry criteria:_ pillar 2 has shown which entities actually recur.
 
 ## 11. Observability
 
+_Pillar 1 design record — these log lines were deleted with the lane (§3 banner)._
+
 - One `log.info` per populated scent: workgroup, term count, pointer count, elapsed ms.
   Enough to compute a live latency distribution without a new metrics surface.
 - One `log.info` per sweep probe: workgroup, elapsed ms, resulting warm state. This is
@@ -1625,7 +1672,9 @@ cd container/agent-runner && bun test
 **Pillar 1.** `graphScent` is additive and optional on `PreTurnContext`. Rollback is
 reverting the commit; no migration, no persisted state, no schema change. The graph is
 read-only throughout — this plan cannot corrupt Graphify. In-flight consumers that do not
-know the field ignore it.
+know the field ignore it. _This held: the removal was exactly that revert — no migration,
+no persisted state to clean up, and recall rows still sitting in session inbound DBs with
+a `graphScent` key simply render without it._
 
 **Pillar 0 is the asymmetric one and deserves the honest statement.** The prompt and
 reason-code changes revert cleanly, but **facts already written do not.** Reverting stops
