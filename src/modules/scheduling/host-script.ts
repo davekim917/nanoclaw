@@ -7,17 +7,26 @@
  * (wakeAgent=false) most fires, that is a full container boot paid for
  * nothing. A series that opts in with `content.scriptHost === true` gets its
  * script run HERE instead, before admitDueTaskContexts admits the row — a
- * gated fire then costs one execFile call and no container at all.
+ * gated fire then costs one spawn and no container at all.
  *
- * Execution and output parsing mirror task-script.ts's runScript exactly
- * (same timeout/buffer caps, same last-stdout-line JSON {wakeAgent, data}
- * contract) so a script behaves identically wherever it ends up running.
+ * Output parsing mirrors task-script.ts's runScript on the part that defines a
+ * script's contract — the last stdout line is JSON {wakeAgent, data}. Execution
+ * deliberately does NOT match, because only this path can stall a process
+ * shared by the whole fleet: this one carries a hard deadline, kills the
+ * child's process group, and discards output produced after the timeout.
+ * The container path's bound is the container lifecycle itself.
+ *
+ * Both paths cap output at the same 1MiB of BYTES — execFile's `maxBuffer` is
+ * documented in bytes and measured as such (400k `中`, 1.2MB of UTF-8, errors
+ * with stdout truncated at ~353k code units ≈ 1MiB). They differ only in
+ * DELIVERY: execFile hands back a string truncated mid-codepoint alongside its
+ * error, while this path refuses the run outright.
  *
  * SECURITY: unlike the container, the host process is long-lived and shared
  * across every session on the fleet, so nothing here runs unclassified. See
  * `classifyForHostExecution` below.
  */
-import { execFile, type ExecFileOptionsWithStringEncoding } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -104,7 +113,8 @@ export function classifyForHostExecution(script: string): ClassifyResult {
 }
 
 // ── Execution ────────────────────────────────────────────────────────────────
-// Mirrors container/agent-runner/src/scheduling/task-script.ts's runScript.
+// Output contract mirrors container/agent-runner/src/scheduling/task-script.ts's
+// runScript; the hard deadline in runHostScript is host-only (see header).
 
 /**
  * Explicit minimal env — NEVER the host process's full process.env, which
@@ -121,28 +131,116 @@ function minimalEnv(): NodeJS.ProcessEnv {
 
 export function runHostScript(script: string, taskId: string): Promise<ScriptResult | null> {
   const scriptPath = path.join(os.tmpdir(), `host-task-script-${taskId}-${Date.now()}.sh`);
-  fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+  try {
+    fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+  } catch (err) {
+    // Outside the promise, so an uncaught throw here does not just fail this
+    // row — it propagates through runHostGatedTaskScripts and prepareDueWake
+    // and aborts the REST OF THIS SESSION'S SWEEP TICK, including unrelated
+    // due rows. /tmp at ENOSPC or an unwritable TMPDIR is enough to trigger it,
+    // and the row stays pending so every later tick retries identically.
+    log.warn('Host task-script could not be written to disk', { taskId, err });
+    return Promise.resolve(null);
+  }
 
   return new Promise((resolve) => {
     let settled = false;
-    // Hard deadline BEYOND execFile's own timeout: the built-in timeout sends
-    // SIGTERM to the direct child only, and the callback fires when stdio
-    // closes — a script that backgrounds children holding the pipes would
-    // otherwise wedge this promise open, and with it the whole sequential
-    // sweep session loop (this call is awaited inside prepareDueWake). The
-    // race guarantees the sweep always advances: on deadline we kill the
-    // ENTIRE process group (detached:true below makes the child its own
-    // group leader, so -pid reaches backgrounded grandchildren too — a
-    // lone SIGKILL to bash would orphan them mid-side-effect), unlink the
-    // temp script, and resolve null.
-    const hardDeadline = setTimeout(() => {
-      if (settled) return;
-      settled = true;
+    let overflowed = false;
+    let timedOut = false;
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    const stdoutSize = { bytes: 0 };
+    const stderrSize = { bytes: 0 };
+
+    // `spawn` + `detached: true`, NOT execFile. Two reasons, both load-bearing:
+    //
+    // 1. A SCRIPT CAN OUTLIVE ANY SIGNAL WE SEND ITS DIRECT CHILD. execFile's
+    //    `timeout` sends SIGTERM to bash alone; `trap '' TERM` ignores it, bash
+    //    never exits, and the 'close' the callback waits on never fires — the
+    //    promise stays open forever, taking the sequential sweep session loop
+    //    with it (this call is awaited inside prepareDueWake). Measured on Node
+    //    v20.20.1: `trap '' TERM; sleep 60` with a 1000ms timeout had still not
+    //    called back at 11500ms with the child ALIVE. SIGKILL is untrappable,
+    //    which is why the deadline below uses it.
+    //
+    // 2. KILLING BASH DOES NOT KILL WHAT BASH STARTED. Signalling only the
+    //    direct child orphans every descendant — a `gh api` fan-out, a
+    //    `capped-check.sh` run. The previous version tried to solve this with
+    //    `process.kill(-child.pid)` while passing `detached` to execFile, which
+    //    SILENTLY DROPS IT (Node allowlists exactly cwd/env/gid/shell/signal/
+    //    uid/windowsHide/windowsVerbatimArguments when execFile calls spawn).
+    //    The child was therefore never a group leader, so that call only ever
+    //    threw ESRCH and the group kill never once ran.
+    //
+    //    That failure was load-bearing in the other direction too: WITHOUT
+    //    `detached` the child inherits the HOST's process group, so "fixing"
+    //    the ESRCH by passing the real PGID would have SIGKILLed the NanoClaw
+    //    daemon itself (measured: child pid 630842, pgid 630830, host node pid
+    //    630831 in that same group). `detached: true` is what makes `-pid` both
+    //    correct AND safe: the child becomes its own group leader, so the
+    //    negative-pid kill reaches the descendants that stay in its group and
+    //    can never reach us. It is containment for the ordinary case, not a
+    //    guarantee — see killTree on what escapes it.
+    //
+    // The cost of spawn() over execFile() is hand-rolled stdout/stderr
+    // accumulation and the maxBuffer cap below. That is worth paying rather
+    // than resting descendant cleanup on the unenforced assumption that every
+    // agent-authored script wraps its own children in `timeout`.
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn('bash', [scriptPath], {
+        env: minimalEnv(),
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      // A synchronous spawn throw (bad option shape) would otherwise reject
+      // this promise past every cleanup path below, leaking the temp script and
+      // leaving the row pending to be retried identically on the next tick.
       try {
-        if (child.pid) process.kill(-child.pid, 'SIGKILL');
+        fs.unlinkSync(scriptPath);
+      } catch {
+        /* best-effort cleanup */
+      }
+      log.warn('Host task-script could not be spawned', { taskId, err });
+      return resolve(null);
+    }
+
+    /**
+     * Signal the child's process group, falling back to the child alone.
+     *
+     * BEST EFFORT, not a guarantee. It reaches only descendants still IN that
+     * group: a script that calls `setsid` (which the classifier does not block)
+     * puts its child in a new group we cannot name, and nothing here can reach
+     * it. Process-group containment covers the ordinary case — a `gh api`
+     * fan-out, a `capped-check.sh` run — not a deliberate escape.
+     */
+    const killTree = (signal: NodeJS.Signals): void => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal);
       } catch {
         try {
-          child.kill('SIGKILL');
+          child.kill(signal);
+        } catch {
+          /* already gone */
+        }
+      }
+    };
+
+    const finish = (result: ScriptResult | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(softTimeout);
+      clearTimeout(hardDeadline);
+      // Drop the pipes explicitly. An escaped or D-state descendant keeps the
+      // write ends open, and without this the host holds those handles for as
+      // long as it lives — the promise resolves but the process cannot exit.
+      // Measured: promise resolved at 10.111s, node could not exit until the
+      // escaped child ended at 12.011s.
+      for (const s of [child.stdout, child.stderr]) {
+        try {
+          s?.removeAllListeners();
+          s?.destroy();
         } catch {
           /* already gone */
         }
@@ -152,70 +250,105 @@ export function runHostScript(script: string, taskId: string): Promise<ScriptRes
       } catch {
         /* best-effort cleanup */
       }
-      log.warn('Host task-script exceeded hard deadline — killed process group, resolving null', { taskId });
-      resolve(null);
+      resolve(result);
+    };
+
+    // Accumulate BYTES, not decoded strings, and decode once at the end.
+    // `chunk.length` on a utf8-decoded string counts UTF-16 code units, so a
+    // character cap silently admits far more memory than intended — 400,000
+    // `中` is 1.2MB of UTF-8 but only 400,000 units. `execFile`'s maxBuffer is
+    // documented in bytes; matching that keeps the cap an actual memory bound.
+    // Concatenating first also makes multibyte sequences split across chunk
+    // boundaries a non-issue.
+    const capture = (
+      stream: NodeJS.ReadableStream | null,
+      chunks: Buffer[],
+      size: { bytes: number },
+      label: 'stdout' | 'stderr',
+    ): void => {
+      if (!stream) return;
+      stream.on('data', (chunk: Buffer) => {
+        if (size.bytes + chunk.length > SCRIPT_MAX_BUFFER) {
+          overflowed = true;
+          log.warn('Host task-script exceeded max output buffer', { taskId, stream: label });
+          killTree('SIGKILL');
+          return;
+        }
+        size.bytes += chunk.length;
+        chunks.push(chunk);
+      });
+    };
+    capture(child.stdout, stdoutChunks, stdoutSize, 'stdout');
+    capture(child.stderr, stderrChunks, stderrSize, 'stderr');
+
+    // Graceful first, so a script's own EXIT/TERM trap can clean up.
+    //
+    // `timedOut` is what makes that grace window safe. A script whose TERM trap
+    // emits valid JSON and exits 0 would otherwise be accepted as a SUCCESS —
+    // and a `wakeAgent:false` success marks the row completed, RESETTING the
+    // recurrence failure streak. A series that blows its budget on every fire
+    // would then never reach the 8-failure auto-pause it exists to trigger.
+    // The trap still gets to run and clean up; its output just isn't a verdict.
+    const softTimeout = setTimeout(() => {
+      timedOut = true;
+      killTree('SIGTERM');
+    }, SCRIPT_TIMEOUT_MS);
+    // Then the untrappable one, ten seconds later. `finish` is called here and
+    // not left to 'close': a SIGKILL cannot reach a process wedged in
+    // uninterruptible D-state, so the sweep must advance on the timer itself
+    // rather than on the child's exit. The kill is best-effort cleanup; this
+    // resolve is the actual bound.
+    const hardDeadline = setTimeout(() => {
+      killTree('SIGKILL');
+      log.warn('Host task-script exceeded hard deadline — SIGKILL sent to process group, resolving null', { taskId });
+      finish(null);
     }, SCRIPT_TIMEOUT_MS + 10_000);
-    const child = execFile(
-      'bash',
-      [scriptPath],
-      // Node's ExecFileOptions typing omits `detached`, but the option is
-      // passed through to spawn — it is what makes the child a process-group
-      // leader so the deadline's -pid SIGKILL reaches grandchildren too.
-      // (Stating utf8 selects the string-callback overload that `detached`
-      // otherwise leaves ambiguous.)
-      {
-        timeout: SCRIPT_TIMEOUT_MS,
-        maxBuffer: SCRIPT_MAX_BUFFER,
-        env: minimalEnv(),
-        detached: true,
-        encoding: 'utf8',
-      } as ExecFileOptionsWithStringEncoding,
-      (error, stdout, stderr) => {
-        clearTimeout(hardDeadline);
-        if (settled) return;
-        settled = true;
-        // Node's built-in timeout SIGTERMs child.pid alone; with detached:true
-        // any backgrounded grandchild would survive it. Group-kill here too.
-        try {
-          if (child.pid && (error as { killed?: boolean } | null)?.killed) {
-            process.kill(-child.pid, 'SIGKILL');
-          }
-        } catch {
-          /* already gone */
-        }
-        try {
-          fs.unlinkSync(scriptPath);
-        } catch {
-          /* best-effort cleanup */
-        }
 
-        if (stderr) log.debug('Host task-script stderr', { taskId, stderr: stderr.slice(0, 500) });
+    child.on('error', (err) => {
+      log.warn('Host task-script failed to spawn', { taskId, error: err.message });
+      finish(null);
+    });
 
-        if (error) {
-          log.warn('Host task-script error', { taskId, error: error.message });
-          return resolve(null);
-        }
+    child.on('close', (code, signal) => {
+      if (settled) return;
+      const stderr = Buffer.concat(stderrChunks).toString('utf8');
+      const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+      if (stderr) log.debug('Host task-script stderr', { taskId, stderr: stderr.slice(0, 500) });
 
-        const lines = stdout.trim().split('\n');
-        const lastLine = lines[lines.length - 1];
-        if (!lastLine) {
-          log.warn('Host task-script produced no output', { taskId });
-          return resolve(null);
-        }
+      if (overflowed) return finish(null);
+      // Past the soft deadline the script has already overrun its budget. Its
+      // trap was allowed to run, but whatever it printed is not a verdict —
+      // accepting it would mark the row completed and reset the recurrence
+      // failure streak, so a series that times out every fire would never
+      // reach the auto-pause that exists to stop exactly that.
+      if (timedOut) {
+        log.warn('Host task-script exceeded timeout — output discarded, resolving null', { taskId, signal });
+        return finish(null);
+      }
+      if (code !== 0) {
+        log.warn('Host task-script error', { taskId, code, signal });
+        return finish(null);
+      }
 
-        try {
-          const result = JSON.parse(lastLine);
-          if (typeof result.wakeAgent !== 'boolean') {
-            log.warn('Host task-script output missing wakeAgent boolean', { taskId, lastLine: lastLine.slice(0, 200) });
-            return resolve(null);
-          }
-          resolve(result as ScriptResult);
-        } catch {
-          log.warn('Host task-script output is not valid JSON', { taskId, lastLine: lastLine.slice(0, 200) });
-          resolve(null);
+      const lines = stdout.trim().split('\n');
+      const lastLine = lines[lines.length - 1];
+      if (!lastLine) {
+        log.warn('Host task-script produced no output', { taskId });
+        return finish(null);
+      }
+
+      try {
+        const result = JSON.parse(lastLine);
+        if (typeof result.wakeAgent !== 'boolean') {
+          log.warn('Host task-script output missing wakeAgent boolean', { taskId, lastLine: lastLine.slice(0, 200) });
+          return finish(null);
         }
-      },
-    );
+        finish(result as ScriptResult);
+      } catch {
+        log.warn('Host task-script output is not valid JSON', { taskId, lastLine: lastLine.slice(0, 200) });
+        finish(null);
+      }
+    });
   });
 }
 
