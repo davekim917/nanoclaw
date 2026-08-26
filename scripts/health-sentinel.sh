@@ -12,6 +12,8 @@
 #   5. sweep       — any sweep tick over 120s (control-plane saturation)
 #   6. disk        — data filesystem >= 90% (admission refusal imminent)
 #   7. crashloop   — a session whose container repeatedly exits non-zero
+#   8. qaseats     — QA seat-health artifact missing or stale (the smoke
+#                    gates fail OPEN on it, so nothing else would say so)
 #
 # Log windows are measured by BYTE OFFSET deltas stored in the state file —
 # never by log timestamps (the log has multiple writers stamping different
@@ -116,6 +118,46 @@ fi
 DISK_PCT=$(df --output=pcent "$NANOCLAW_DIR/data" 2>/dev/null | tail -1 | tr -dc '0-9')
 if [ -n "$DISK_PCT" ] && [ "$DISK_PCT" -ge "$DISK_MAX_PCT" ]; then
   BREACHES+=("disk|data filesystem at ${DISK_PCT}% (>= ${DISK_MAX_PCT}% — container admission refusal at 90%)")
+fi
+
+# QA seat health. Where configured, the smoke gates read a seat-health artifact
+# instead of probing every seat inline, and a MISSING or STALE artifact makes
+# them fail OPEN — deliberately, because an unreachable health lookup must not
+# wedge every campaign in the fleet. Fail-open is only safe if somebody is told,
+# and this is the telling: the gate has no way to alert and allow in the same
+# poll, and this sentinel is also the path that still works when the seat-health
+# timer is the thing that died.
+#
+# Skipped entirely when unconfigured, so this is a no-op on any install that
+# does not gate campaigns on seat health.
+# Opt-in: unset means this install has no seat-gated smoke campaigns. Trunk
+# carries no install-specific path — set it in the sentinel unit's Environment=.
+QA_SEAT_HEALTH_FILE="${QA_SEAT_HEALTH_FILE:-}"
+QA_SEAT_HEALTH_MAX_AGE_S="${QA_SEAT_HEALTH_MAX_AGE_S:-3600}"
+if [ -n "$QA_SEAT_HEALTH_FILE" ]; then
+  if [ ! -s "$QA_SEAT_HEALTH_FILE" ]; then
+    BREACHES+=("qaseats|QA seat-health artifact missing at $QA_SEAT_HEALTH_FILE — the smoke gates are opening campaigns with NO seat verification; check qa-seat-health.timer")
+  else
+    # Oldest lastDefiniteAt across seats, in seconds. A null (never got a
+    # definite answer) counts as infinitely old — a timer that fires but only
+    # ever collects 429s is exactly as blind as a timer that is not running.
+    # Epoch integers, not parsed ISO — jq 1.6 (the agent container's jq) reads
+    # these strings an hour off, and the artifact's writer records the epoch
+    # beside the ISO for exactly that reason. A seat with no epoch counts as
+    # never-answered rather than being parsed by a method known to be wrong.
+    QA_AGE=$( (jq -r --argjson now "$NOW" '
+      def epoch: if type == "number" then . else null end;
+      [ .seats[]? | (.lastDefiniteAtEpoch | epoch) ] as $t
+      | if ($t | length) == 0 then 999999999
+        elif ($t | any(. == null)) then 999999999
+        else ($now - ($t | min)) end' "$QA_SEAT_HEALTH_FILE" 2>/dev/null) || echo 999999999)
+    case "$QA_AGE" in ''|*[!0-9]*) QA_AGE=999999999 ;; esac
+    if [ "$QA_AGE" -ge 999999999 ]; then
+      BREACHES+=("qaseats|QA seat health has NO definite answer for at least one seat — the job is running but only ever collecting throttles/timeouts, which is as blind as not running. The smoke gates are opening campaigns unverified; check qa-seat-health.service in journalctl")
+    elif [ "$QA_AGE" -ge "$QA_SEAT_HEALTH_MAX_AGE_S" ]; then
+      BREACHES+=("qaseats|QA seat health is stale — no definite answer for at least one seat in $((QA_AGE / 60))m (bound $((QA_SEAT_HEALTH_MAX_AGE_S / 60))m); the smoke gates are opening campaigns unverified. Check qa-seat-health.timer")
+    fi
+  fi
 fi
 
 if [ "${TEST_ALERT:-0}" = "1" ]; then
