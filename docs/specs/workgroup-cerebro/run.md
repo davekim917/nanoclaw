@@ -1066,7 +1066,14 @@ Standing operator directive for this build: run opencode
 (`opencode-go/ox-alpha-free`, `OPENCODE_EFFORT=max`) adversarial checks against the
 implementation as it is built, not only at the `/team-review` gate.
 
-## P2.5 open items — PRE-ACTIVATION BLOCKERS for step 7 (2026-08-25)
+## P2.5 open items — what a rebuild would have to solve (2026-08-25)
+
+> **Re-framed 2026-08-26.** These were written as blockers on activating step 7.
+> The implementation is now deleted (see the REMOVED note at the end of this
+> section), so nothing is gated on them today. They are kept because they are
+> the real defect list a second attempt would inherit: each one is a way the
+> design as built could serve wrong recall silently, and a rewrite that does not
+> answer all six is the same feature with the same holes.
 
 What merges to `main` today is the performance work (`canonicalToken` memo, hit-list
 ranking, archive covering index, `rowid ASC` total order — warm p50 804ms → 484ms,
@@ -1154,3 +1161,36 @@ independent reason not to flip it even once those are cleared. **Revisit only wh
 three hold together**, not any one: incremental update actually implemented and
 measured; a workload where recall latency is genuinely on the critical path; and the
 six pre-activation blockers above cleared.
+
+### IMPLEMENTATION REMOVED — c21e4f53, 2026-08-26
+
+Dormant code on a hot path is not free, so the projection was deleted rather than left
+sitting behind an unflipped switch. `recall-projection{,-store,-build,-build-thread}.ts`,
+`recall-projection{,-read,-archive}.test.ts`, and the read seam, warmth gate, frozen
+bounds, tokenizer fingerprint and `recallPath`/`recallReason` telemetry inside
+`pre-turn-context.ts` are all gone — 4,288 lines removed, 47 added. `plan.md` §P2.5
+carries the same note. **This section and the design in `plan.md` are the record of why;
+do not rebuild it from the design without re-reading the economics above.**
+
+**What was deliberately NOT removed.** The three measured wins that shipped in the same
+work are on the live filesystem path and have nothing to do with the projection: the
+`canonicalToken` memo (60% of a cold turn), hit-list passage ranking in `bestPassage`
+(~50% of ranking), and `message-archive.ts`'s covering index plus the `rowid ASC` total
+order. `recall-ranking.test.ts` is unchanged and pins the first two, including the
+interleaved-span guard on `passageWindows`' `start`/`end` offsets — which is why those
+fields stay on the returned shape even though the projection was their original consumer.
+
+**Verified on the same staged illysium corpus as the measurement above,** 30 timed turns,
+`process.cpuUsage()` alongside wall clock, copies of `data/` only:
+
+| source                            | wall p50 | CPU p50 |
+| --------------------------------- | -------: | ------: |
+| pre-deletion, fallback arm (control) | 457.7 ms | 457.7 ms |
+| post-deletion                        | 442.7 ms | 441.3 ms |
+
+Both runs report identical cache and fast-path counters (`tokenCache` 634,461 hits /
+39,893 misses, `canonicalMemo` 1,943,950 / 37,293, `fastPath` 7,583 of 7,656), and the
+FULL delivered context over 20 whole turns — 10 queries x bootstrap on/off — is
+byte-identical between them. The performance work survived the deletion intact; the
+~15 ms is run-to-run noise plus the `statSync` the removed seam used to pay looking for
+an index that was never there.

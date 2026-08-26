@@ -1083,6 +1083,20 @@ In `curator-worker.test.ts` unless noted; mocked backend, real temp store files.
 
 ## P2.5 — Recall projection
 
+> **IMPLEMENTATION REMOVED, c21e4f53 (2026-08-26).** The design below and the
+> measurement in `run.md` are kept as the record of why this is gone and what
+> would have to change for it to come back. There is no projection code in the
+> tree: `recall-projection{,-store,-build,-build-thread}.ts`, their three test
+> files, and the read seam inside `pre-turn-context.ts` were all deleted. It
+> shipped dormant, was never activated (see §P2.5 activation in `run.md` —
+> rejected on measured economics), and ~4,200 lines of it were charging
+> maintenance rent on a hot path for a feature that never ran. Anything below
+> that reads as present tense describes the design, not the code. The three
+> measured performance wins that landed alongside it — the `canonicalToken`
+> memo, hit-list passage ranking in `bestPassage`, and the archive covering
+> index with its `rowid ASC` total order — are NOT part of the projection and
+> are still live; `recall-ranking.test.ts` pins the first two.
+
 **Goal.** Every agent turn gets its memory context in under ~500 ms, cold or warm,
 whatever a workgroup or several concurrently active workgroups' stores currently
 hold, and the delivered content is byte-identical to what today's filesystem-walk
