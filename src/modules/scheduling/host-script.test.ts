@@ -192,18 +192,74 @@ describe('runHostGatedTaskScripts', () => {
 });
 
 describe('runHostScript hard deadline', () => {
-  it('resolves null and kills a hung script instead of wedging the sweep', async () => {
+  // REGRESSION GUARD. The predecessor of this test ran a script whose
+  // GRANDCHILD outlived bash and asserted only `result === null` and
+  // `elapsed < 15_000`. It passed in 311ms — via execFile's own timeout —
+  // and therefore never executed one line of the deadline. Deleting the
+  // whole deadline left it green (audit, 2026-08-26).
+  //
+  // A grandchild cannot reach the deadline: execFile's timeout tears down the
+  // parent's pipe ends, so the callback still fires at T. The ONLY thing that
+  // gets past T is a DIRECT child that does not die on SIGTERM — execFile's
+  // timeout sends SIGTERM, and the callback waits on an exit that never comes.
+  // `trap '' TERM` is the cheap deterministic stand-in for the real cases
+  // (uninterruptible D-state, SIGSTOP). classifyForHostExecution does not
+  // block `trap`, and these scripts are agent-authored, so this is reachable.
+  it('SIGKILLs a SIGTERM-proof script at the deadline, not at the timeout', async () => {
     vi.resetModules();
-    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '300');
-    const { runHostScript } = await import('./host-script.js');
-    const started = Date.now();
-    // Grandchild outlives the direct bash on purpose: the deadline must fire
-    // (timeout+grace) even though backgrounded children hold stdio open.
-    const result = await runHostScript('(sleep 30 &) ; sleep 30', 'deadline-test');
-    const elapsed = Date.now() - started;
-    expect(result).toBeNull();
-    expect(elapsed).toBeLessThan(15_000);
-    expect(elapsed).toBeGreaterThanOrEqual(300);
-    vi.unstubAllEnvs();
-  }, 20_000);
+    // Deadline is timeout + 10s, so these must be far enough apart to tell
+    // "resolved at the timeout" from "resolved at the deadline".
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '1000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      const started = Date.now();
+      const result = await runHostScript("trap '' TERM\nsleep 60\n", 'deadline-test');
+      const elapsed = Date.now() - started;
+
+      expect(result).toBeNull();
+      // The load-bearing assertion: resolution came from the DEADLINE (~11s),
+      // not from execFile's timeout (~1s). Delete the deadline and this fails
+      // by hanging until the test timeout — which is the point.
+      expect(elapsed).toBeGreaterThanOrEqual(10_000);
+      expect(elapsed).toBeLessThan(14_000);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  it('leaves no surviving direct child behind', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '1000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      // The script records its own pid so we can prove the SIGKILL landed
+      // rather than inferring it from the promise resolving.
+      const pidFile = path.join(TEST_DIR, 'deadline-child.pid');
+      fs.mkdirSync(TEST_DIR, { recursive: true });
+      await runHostScript(`trap '' TERM\necho $$ > ${pidFile}\nsleep 60\n`, 'deadline-pid-test');
+
+      const childPid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+      expect(Number.isInteger(childPid)).toBe(true);
+
+      // Poll rather than checking once: at the instant the deadline resolves,
+      // the SIGKILLed child is a ZOMBIE (measured `/proc/<pid>/stat` state `Z`)
+      // and still answers `kill(pid, 0)`. Node reaps it within ~100ms. Polling
+      // keeps the assertion portable — no /proc — without racing the reap.
+      // A SIGTERM-only kill would leave it genuinely alive for the full 2s,
+      // because the script traps TERM.
+      const deadline = Date.now() + 2_000;
+      let alive = true;
+      while (alive && Date.now() < deadline) {
+        try {
+          process.kill(childPid, 0);
+          await new Promise((r) => setTimeout(r, 25));
+        } catch {
+          alive = false;
+        }
+      }
+      expect(alive).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
 });

@@ -9,15 +9,18 @@
  * script run HERE instead, before admitDueTaskContexts admits the row — a
  * gated fire then costs one execFile call and no container at all.
  *
- * Execution and output parsing mirror task-script.ts's runScript exactly
- * (same timeout/buffer caps, same last-stdout-line JSON {wakeAgent, data}
- * contract) so a script behaves identically wherever it ends up running.
+ * Output parsing mirrors task-script.ts's runScript (same buffer cap, same
+ * last-stdout-line JSON {wakeAgent, data} contract) so a script's RESULT is
+ * identical wherever it runs. Execution is NOT identical and deliberately so:
+ * only this path carries the hard deadline below, because only this path can
+ * stall a process shared by the whole fleet. The container path's equivalent
+ * bound is the container lifecycle itself.
  *
  * SECURITY: unlike the container, the host process is long-lived and shared
  * across every session on the fleet, so nothing here runs unclassified. See
  * `classifyForHostExecution` below.
  */
-import { execFile, type ExecFileOptionsWithStringEncoding } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -104,7 +107,8 @@ export function classifyForHostExecution(script: string): ClassifyResult {
 }
 
 // ── Execution ────────────────────────────────────────────────────────────────
-// Mirrors container/agent-runner/src/scheduling/task-script.ts's runScript.
+// Output contract mirrors container/agent-runner/src/scheduling/task-script.ts's
+// runScript; the hard deadline in runHostScript is host-only (see header).
 
 /**
  * Explicit minimal env — NEVER the host process's full process.env, which
@@ -125,64 +129,56 @@ export function runHostScript(script: string, taskId: string): Promise<ScriptRes
 
   return new Promise((resolve) => {
     let settled = false;
-    // Hard deadline BEYOND execFile's own timeout: the built-in timeout sends
-    // SIGTERM to the direct child only, and the callback fires when stdio
-    // closes — a script that backgrounds children holding the pipes would
-    // otherwise wedge this promise open, and with it the whole sequential
-    // sweep session loop (this call is awaited inside prepareDueWake). The
-    // race guarantees the sweep always advances: on deadline we kill the
-    // ENTIRE process group (detached:true below makes the child its own
-    // group leader, so -pid reaches backgrounded grandchildren too — a
-    // lone SIGKILL to bash would orphan them mid-side-effect), unlink the
-    // temp script, and resolve null.
+    // Hard deadline BEYOND execFile's own timeout, because execFile's timeout
+    // is NOT a bound on every path. It sends `killSignal` (SIGTERM) to the
+    // direct child; a child that ignores SIGTERM never exits, the 'close' the
+    // callback waits on requires that exit, and the promise stays open
+    // forever — taking the whole sequential sweep session loop with it (this
+    // call is awaited inside prepareDueWake). Measured 2026-08-26 on Node
+    // v20.20.1: script `trap '' TERM; sleep 60` with timeout=1000ms had still
+    // not called back at 11500ms with the child ALIVE; a plain SIGKILL to the
+    // direct child resolved it immediately. Reachable in practice via
+    // `trap '' TERM` (classifyForHostExecution does not block it, and these
+    // scripts are agent-authored), an uninterruptible D-state read during the
+    // kill window, or a SIGSTOP'd child.
+    //
+    // SIGKILL, not SIGTERM: untrappable, which is the entire point here.
+    //
+    // NOTE — deliberately NOT a process-group kill. `execFile` does not accept
+    // `detached` (Node allowlists exactly cwd/env/gid/shell/signal/uid/
+    // windowsHide/windowsVerbatimArguments when it calls spawn), so the child
+    // is never a group leader and `process.kill(-child.pid, ...)` only ever
+    // threw ESRCH. Do NOT "fix" that by passing the child's real PGID: the
+    // child inherits the HOST's process group, so `kill(-pgid)` would SIGKILL
+    // the NanoClaw daemon itself (verified: child pid 630842, pgid 630830,
+    // host node pid 630831 in that same group). A real group kill needs
+    // spawn() + detached, and hand-rolled stdout/maxBuffer handling with it —
+    // only worth doing if leaked grandchildren ever actually cost something.
+    // Today every such child is `timeout`-wrapped by its own script.
     const hardDeadline = setTimeout(() => {
       if (settled) return;
       settled = true;
       try {
-        if (child.pid) process.kill(-child.pid, 'SIGKILL');
+        child.kill('SIGKILL');
       } catch {
-        try {
-          child.kill('SIGKILL');
-        } catch {
-          /* already gone */
-        }
+        /* already gone */
       }
       try {
         fs.unlinkSync(scriptPath);
       } catch {
         /* best-effort cleanup */
       }
-      log.warn('Host task-script exceeded hard deadline — killed process group, resolving null', { taskId });
+      log.warn('Host task-script exceeded hard deadline — SIGKILLed and resolved null', { taskId });
       resolve(null);
     }, SCRIPT_TIMEOUT_MS + 10_000);
     const child = execFile(
       'bash',
       [scriptPath],
-      // Node's ExecFileOptions typing omits `detached`, but the option is
-      // passed through to spawn — it is what makes the child a process-group
-      // leader so the deadline's -pid SIGKILL reaches grandchildren too.
-      // (Stating utf8 selects the string-callback overload that `detached`
-      // otherwise leaves ambiguous.)
-      {
-        timeout: SCRIPT_TIMEOUT_MS,
-        maxBuffer: SCRIPT_MAX_BUFFER,
-        env: minimalEnv(),
-        detached: true,
-        encoding: 'utf8',
-      } as ExecFileOptionsWithStringEncoding,
+      { timeout: SCRIPT_TIMEOUT_MS, maxBuffer: SCRIPT_MAX_BUFFER, env: minimalEnv(), encoding: 'utf8' },
       (error, stdout, stderr) => {
         clearTimeout(hardDeadline);
         if (settled) return;
         settled = true;
-        // Node's built-in timeout SIGTERMs child.pid alone; with detached:true
-        // any backgrounded grandchild would survive it. Group-kill here too.
-        try {
-          if (child.pid && (error as { killed?: boolean } | null)?.killed) {
-            process.kill(-child.pid, 'SIGKILL');
-          }
-        } catch {
-          /* already gone */
-        }
         try {
           fs.unlinkSync(scriptPath);
         } catch {
