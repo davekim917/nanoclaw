@@ -271,7 +271,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     expect(fs.existsSync(inboundDbPath(AG, SESS))).toBe(false);
 
     await expect(
-      await writeSessionMessage(AG, SESS, {
+      writeSessionMessage(AG, SESS, {
         id: 'after-reset-1',
         kind: 'chat',
         timestamp: new Date().toISOString(),
@@ -336,7 +336,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     fs.writeFileSync(path.join(inboxDir, filename), bytes);
 
     await expect(
-      await writeSessionMessageIfNew(AG, SESS, {
+      writeSessionMessageIfNew(AG, SESS, {
         id: messageId,
         kind: 'chat-sdk',
         timestamp: '2026-07-21T18:18:00.000Z',
@@ -1200,7 +1200,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
 
     for (const [index, turn] of lifecycleTurns.entries()) {
       await expect(
-        await writeSessionMessageIfNew(AG, SESS, {
+        writeSessionMessageIfNew(AG, SESS, {
           id: turn.id,
           kind: 'chat-sdk',
           timestamp: `2026-07-25T00:00:0${index}.000Z`,
