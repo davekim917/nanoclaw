@@ -118,13 +118,14 @@ function initSchema(db: Database.Database): void {
     --     make the index covering. The residual filters (member scope, thread)
     --     are not index constraints, so without these every walked entry costs
     --     a table lookup: dropping the three trailing columns costs 19ms vs
-    --     2.1ms on the busiest illysium messaging group, and the planner
+    --     2.1ms on the busiest messaging group in the install, and the planner
     --     reports plain INDEX instead of COVERING INDEX.
     -- Measured against a copy of the 309MiB / 145,752-row live archive, six
-    -- illysium member agent groups: 134ms -> 2.1ms, identical for a hot thread
-    -- and for a fresh thread whose rows do not exist. Index costs +24.3MiB and
-    -- ~1.4-2.0s to build; archive INSERT p50 is unchanged (7.5ms -> 6.5ms,
-    -- within noise — the TRUNCATE-journal fsync dominates the write).
+    -- member agent groups of one workgroup: 134ms -> 2.1ms, identical for a hot
+    -- thread and for a fresh thread whose rows do not exist. Index costs
+    -- +24.3MiB and ~1.4-2.0s to build; archive INSERT p50 is unchanged
+    -- (7.5ms -> 6.5ms, within noise — the TRUNCATE-journal fsync dominates the
+    -- write).
     CREATE INDEX IF NOT EXISTS idx_archive_conv_recent
       ON messages_archive(messaging_group_id, role, sent_at, id,
                           agent_group_id, thread_id, sender_name);

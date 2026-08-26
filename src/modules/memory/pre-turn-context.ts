@@ -295,12 +295,13 @@ function canonicalToken(token: string): string {
 /**
  * Per-token canonical-form memo.
  *
- * Natural language is Zipfian, and this function is pure. A cold illysium turn
- * makes 1,063,284 `canonicalToken` calls over 35,849 DISTINCT tokens (29.7x
- * reuse); memoizing removes 60% of the turn's CPU (7,047ms -> 2,837ms measured).
- * `TOKEN_STREAM_CACHE` cannot cover this: it is keyed per candidate STRING, so
- * every candidate on a cold turn misses and re-canonicalizes the same few
- * thousand words. The two caches are layered, not alternatives.
+ * Natural language is Zipfian, and this function is pure. A cold turn on the
+ * largest workgroup makes 1,063,284 `canonicalToken` calls over 35,849 DISTINCT
+ * tokens (29.7x reuse); memoizing removes 60% of the turn's CPU (7,047ms ->
+ * 2,837ms measured). `TOKEN_STREAM_CACHE` cannot cover this: it is keyed per
+ * candidate STRING, so every candidate on a cold turn misses and
+ * re-canonicalizes the same few thousand words. The two caches are layered, not
+ * alternatives.
  *
  * NO REORDER ON HIT — do not "improve" this into an LRU. A delete+set per hit
  * costs ~2.5s of the 4.2s saving (cold CPU: 2,837ms without, 5,457ms with).
@@ -785,7 +786,7 @@ function bestPassage(
   }
 
   // Fast path. Building a Set over EVERY token of EVERY window was 55-59% of the
-  // whole ranking sweep (measured 250ms of 424ms on the live illysium store).
+  // whole ranking sweep (measured 250ms of 424ms on the largest live store).
   // Only query terms can ever contribute, so collect their positions once per
   // candidate and read each window off that.
   const queryTermSet = new Set(queryTokens);

@@ -1114,13 +1114,20 @@ turn `cold`/`absent` — 30/30 both ways, so the two arms are provably distinct 
 paths, not noise. Data is **copy-derived**: a staged `DATA_DIR`, an online `.backup()`
 of `v2.db` and `archive.db`, and `cp -a` of the memory trees. No live data written.
 
+**Workgroup labels.** This repository is public, so the two measured workgroups are
+named **A** (the largest on the fleet) and **B** (mid-size) throughout, deliberately and
+not by accident. Every number is real and unchanged; only the identities are omitted.
+Their shape is what matters and is kept: A is 77% of all projectable markdown on the
+fleet and rewrites its ledger fastest, B is roughly an order of magnitude smaller and an
+order of magnitude slower-changing.
+
 **The projection is genuinely faster:**
 
-| workgroup    | condition                 | fallback CPU | projection CPU | change |
-| ------------ | ------------------------- | ------------: | ---------------: | ------ |
-| illysium     | warm, isolated processes  | 501 ms        | 103 ms            | −79%   |
-| illysium     | warm, interleaved         | 460 ms        | 121 ms            | −74%   |
-| madison-reed | warm                      | 173 ms        | 70 ms             | −59%   |
+| workgroup    | condition                | fallback CPU | projection CPU | change |
+| ------------ | ------------------------ | -----------: | -------------: | ------ |
+| A (largest)  | warm, isolated processes |       501 ms |         103 ms | −79%   |
+| A (largest)  | warm, interleaved        |       460 ms |         121 ms | −74%   |
+| B (mid-size) | warm                     |       173 ms |          70 ms | −59%   |
 
 Mechanism, from the same log line: the fallback path materialises **6,961 fact + 591
 file** candidates; the projection returns **66 + 49**. The entire saving is the term
@@ -1130,30 +1137,30 @@ prefilter — nothing else changes between the two arms.
 ("Incremental update by fact id") was never implemented, so every invalidation forces a
 full rebuild, not a diff:
 
-- Full rebuild: **7.6 s CPU, 56.3 MB index** for illysium — 6.5× the markdown it
+- Full rebuild: **7.6 s CPU, 56.3 MB index** for workgroup A — 6.5× the markdown it
   projects.
-- **illysium's tree changes every 2.4 minutes.** Two independent derivations agree
+- **A's tree changes every 2.4 minutes.** Two independent derivations agree
   within 1%: `data/memory-curator-history/` snapshot timestamps (20 writes in 46.2 min),
   and a 17-minute live poller sampling every 30 s on the same size/mtimeNs/inode triple
-  `projectionTreeStaleness` compares (7 changes in 34 samples). madison-reed changes
-  roughly every 38.7 min.
+  `projectionTreeStaleness` compares (7 changes in 34 samples). B changes roughly every
+  38.7 min.
 - **Steady-state arithmetic is net negative:** read CPU saved −373 ms/turn against
   rebuild CPU spent **+2,290 ms/turn** — roughly **1.9 s/turn net worse**. Rebuild load
   alone is **188 s CPU/hour, 5.2% of one core, continuously, for one workgroup.** Every
   invalidation cadence modelled (instant trigger, 60 s sweep, 5 min) lands on the wrong
   side.
 - **Structural, not tunable.** The projection's value scales with corpus size and its
-  cost scales with change rate, and on this fleet those are the same workgroup:
-  illysium is 77% of all projectable markdown *and* rewrites its ledger fastest.
+  cost scales with change rate, and on this fleet those are the same workgroup: A is
+  77% of all projectable markdown _and_ rewrites its ledger fastest.
 
 **Two further findings:**
 
 - **The warm mark lives only in process memory.** A projection sitting on disk does
   NOT make the first turn after a host restart fast — that turn still serves
   `cold`/`not-verified-warm` at full fallback cost until the sweep runs a warming pass.
-- **End-to-end latency context.** User→assistant is 154 s p50 on illysium (n=109, last
-  24 h, paired within thread, >30 min outliers dropped); madison-reed 60 s. The 340 ms
-  the projection would save is ~0.22% of one turn.
+- **End-to-end latency context.** User→assistant is 154 s p50 on A (n=109, last 24 h,
+  paired within thread, >30 min outliers dropped); B 60 s. The 340 ms the projection
+  would save is ~0.22% of one turn.
 
 **Verdict: REJECTED.** Step 7 (the builder hook) stays unactivated — the projection
 ships dormant per the pre-activation-blockers entry above, and this result is an
@@ -1180,8 +1187,8 @@ order. `recall-ranking.test.ts` is unchanged and pins the first two, including t
 interleaved-span guard on `passageWindows`' `start`/`end` offsets — which is why those
 fields stay on the returned shape even though the projection was their original consumer.
 
-**Verified on the same staged illysium corpus as the measurement above,** 30 timed turns,
-`process.cpuUsage()` alongside wall clock, copies of `data/` only:
+**Verified on the same staged workgroup-A corpus as the measurement above,** 30 timed
+turns, `process.cpuUsage()` alongside wall clock, copies of `data/` only:
 
 | source                            | wall p50 | CPU p50 |
 | --------------------------------- | -------: | ------: |
