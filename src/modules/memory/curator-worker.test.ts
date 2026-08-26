@@ -20,7 +20,6 @@ import type { MemoryCurationArchiveRow, MemoryCurationEpisode } from '../../mess
 import type { ConsolidationBackendResult, CuratorBackendResult } from './curator-backend.js';
 import {
   CONSOLIDATION_FILE_MAX_BYTES,
-  CONSOLIDATION_HEADER_PATTERN,
   CONSOLIDATION_INPUT_FILE_MAX_BYTES,
   CONSOLIDATION_MAX_FACTS,
   CURATOR_MAX_MEMORY_TEXT_CHARS,
@@ -135,6 +134,7 @@ function deps(overrides: Partial<MemoryCuratorWorkerDependencies> = {}): MemoryC
         usage: { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
       }),
     ),
+    syncIndexes: vi.fn(async () => ({ updated: [] })),
     uuid: vi.fn(() => '00000000-0000-0000-0000-000000000001'),
     ...overrides,
   };
@@ -884,11 +884,11 @@ describe('pillar-2 semantic consolidation', () => {
     expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 2 });
     expect(fs.lstatSync(path.join(memoryDir(), 'people')).isDirectory()).toBe(true);
     expect(fs.lstatSync(path.join(memoryDir(), 'domain')).isDirectory()).toBe(true);
-    expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/maya-chen.md').content.split('\n')[0]).toMatch(
-      CONSOLIDATION_HEADER_PATTERN,
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/maya-chen.md').content).toMatch(
+      /^---\ntype: person\nconsolidated_facts: 3\n---\n\n/,
     );
-    expect(readMemoryTopicFile(TEST_WORKGROUP, 'domain/acme-pricing.md').content.split('\n')[0]).toMatch(
-      CONSOLIDATION_HEADER_PATTERN,
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'domain/acme-pricing.md').content).toMatch(
+      /^---\ntype: domain\nconsolidated_facts: 3\n---\n\n/,
     );
     expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(
       new Set(['mem_aaaaaaaaaaaaaaaa', 'mem_bbbbbbbbbbbbbbbb', 'mem_cccccccccccccccc']),
@@ -913,10 +913,16 @@ describe('pillar-2 semantic consolidation', () => {
         files: [
           {
             path: 'people/x.md',
-            content: '<!-- consolidated: facts=1 -->\n# X\n\nOwned current content.\n',
+            content: '# X\n\nOwned current content.\n',
             owned: true,
+            sha256: '0'.repeat(64),
           },
-          { path: 'people/roster.md', content: '# Roster\n\nHuman-authored roster entry.\n', owned: false },
+          {
+            path: 'people/roster.md',
+            content: '# Roster\n\nHuman-authored roster entry.\n',
+            owned: false,
+            sha256: '1'.repeat(64),
+          },
         ],
         excludedPaths: [],
       }),
@@ -1324,6 +1330,7 @@ describe('pillar-2 semantic consolidation', () => {
             path: 'people/one.md',
             content: readMemoryTopicFile(TEST_WORKGROUP, 'people/one.md').content,
             owned: true,
+            sha256: readMemoryTopicFile(TEST_WORKGROUP, 'people/one.md').sha256!,
           },
         ],
         excludedPaths: [],
@@ -1467,7 +1474,9 @@ describe('pillar-2 semantic consolidation', () => {
       // scanTopicFiles is not re-invoked between scan and write, so this is
       // exactly what "vanished mid-pass" looks like from the write step.
       scanTopicFiles: () => ({
-        files: [{ path: 'people/roster.md', content: '# Roster\n\nHuman-authored.\n', owned: false }],
+        files: [
+          { path: 'people/roster.md', content: '# Roster\n\nHuman-authored.\n', owned: false, sha256: '0'.repeat(64) },
+        ],
         excludedPaths: [],
       }),
       consolidate: vi.fn(
@@ -1493,6 +1502,100 @@ describe('pillar-2 semantic consolidation', () => {
       }),
     );
     warnSpy.mockRestore();
+  });
+
+  // An empty tail still gets the index pass: a workgroup whose whole topic
+  // backlog predates index maintenance has nothing to consolidate and an
+  // entirely unmapped set of files.
+  it('syncs the memory index even when the tail is empty', async () => {
+    const syncIndexes = vi.fn(async () => ({ updated: ['people/index.md'] }));
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 0, leaseOwner: 'worker' }),
+      consolidationTail: () => ({ facts: [], hasMore: false }),
+      syncIndexes,
+    });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toMatchObject({ action: 'maintenance_noop' });
+    expect(syncIndexes).toHaveBeenCalledWith(TEST_WORKGROUP);
+    expect(d.consolidate).not.toHaveBeenCalled();
+  });
+
+  // The index is the map upstream's memory system navigates by, so a
+  // consolidation pass that writes files without touching it is the drift
+  // this whole change exists to close.
+  it('syncs the memory index after a consolidation pass', async () => {
+    seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+    const syncIndexes = vi.fn(async () => ({ updated: ['people/index.md', 'index.md'] }));
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: dbConsolidationTail(),
+      writeTopicFile: writeMemoryTopicFile,
+      markConsolidated: markFactsConsolidated,
+      syncIndexes,
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: [{ path: 'people/maya-chen.md', content: 'Maya Chen is the Acme liaison.' }] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 1 });
+    expect(syncIndexes).toHaveBeenCalledWith(TEST_WORKGROUP);
+  });
+
+  // Index maintenance is derived from disk and self-heals next pass, so it
+  // must never roll a completed consolidation back into a retry loop.
+  it('a failing index sync is logged and does not fail the pass', async () => {
+    seedLedger(['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact.'), ''].join('\n'));
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: dbConsolidationTail(),
+      writeTopicFile: writeMemoryTopicFile,
+      markConsolidated: markFactsConsolidated,
+      syncIndexes: vi.fn(async () => {
+        throw new Error('index CAS race lost');
+      }),
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: [{ path: 'people/maya-chen.md', content: 'Maya Chen is the Acme liaison.' }] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    const report = await new MemoryCuratorWorker(d).runOne(1000);
+    expect(report).toMatchObject({ action: 'maintenance_written', fileCount: 1 });
+    expect(d.failMaintenance).not.toHaveBeenCalled();
+    expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set(['mem_aaaaaaaaaaaaaaaa']));
+    expect(warnSpy).toHaveBeenCalledWith(
+      'memory-curator: memory index sync failed',
+      expect.objectContaining({ workgroupId: TEST_WORKGROUP }),
+    );
+    warnSpy.mockRestore();
+  });
+
+  // scanTopicFiles is the OTHER end of the stacked-header fix: the model can
+  // only echo a marker it was shown.
+  it('scanTopicFiles hides curator metadata and the folder index from the model', () => {
+    const peopleDir = path.join(memoryDir(), 'people');
+    fs.mkdirSync(peopleDir, { recursive: true });
+    fs.writeFileSync(path.join(peopleDir, 'legacy.md'), '<!-- consolidated: facts=4 -->\nLegacy body.\n');
+    fs.writeFileSync(
+      path.join(peopleDir, 'modern.md'),
+      '---\ntype: person\nconsolidated_facts: 2\n---\n\nModern body.\n',
+    );
+    fs.writeFileSync(path.join(peopleDir, 'index.md'), '# People\n\n- [Legacy](legacy.md) - Legacy body.\n');
+    const scan = scanTopicFiles(TEST_WORKGROUP);
+    expect(scan.files.map((file) => file.path)).toEqual(['people/legacy.md', 'people/modern.md']);
+    expect(scan.files.every((file) => file.owned)).toBe(true);
+    expect(scan.files.map((file) => file.content)).toEqual(['Legacy body.\n', 'Modern body.\n']);
+    // The CAS hash is the RAW file's, not the stripped view's.
+    expect(scan.files[0]!.sha256).toBe(readMemoryTopicFile(TEST_WORKGROUP, 'people/legacy.md').sha256);
   });
 
   // F4. Real fs, no scanner mock: an already-oversized file on disk must be

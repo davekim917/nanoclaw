@@ -41,16 +41,17 @@ import {
 import {
   buildConsolidationPrompt,
   buildCuratorPrompt,
-  CONSOLIDATION_HEADER_PATTERN,
   CONSOLIDATION_INPUT_FILE_MAX_BYTES,
   CONSOLIDATION_INPUT_TOTAL_MAX_BYTES,
   CONSOLIDATION_MAX_FACTS,
   CURATOR_CAPTURE_REASON_CODES,
   CURATOR_MAX_MEMORY_TEXT_CHARS,
-  generatedMemorySha,
   GENERATED_MEMORY_MAX_BYTES,
   GENERATED_MEMORY_WARN_BYTES,
+  isCuratorOwned,
   parseGeneratedMemoryFacts,
+  RESERVED_TOPIC_LEAVES,
+  stripCuratorMetadata,
   TOPIC_DIRECTORIES,
   TOPIC_FILE_PATH_PATTERN,
   validateConsolidationFiles,
@@ -64,9 +65,11 @@ import {
 import {
   readGeneratedMemory,
   readMemoryTopicFile,
+  syncMemoryIndexes,
   writeGeneratedMemory,
   writeMemoryTopicFile,
   type CuratorWriteResult,
+  type MemoryIndexSyncResult,
 } from './curator-write.js';
 
 const MAX_RAW_MESSAGES = 80;
@@ -177,6 +180,8 @@ export interface MemoryCuratorWorkerDependencies {
     credentialSlot: ClaudeCredentialSlot,
     signal?: AbortSignal,
   ) => Promise<ConsolidationBackendResult>;
+  /** Bring index.md and the topic-folder indexes in line with disk. */
+  syncIndexes: (workgroupId: string) => Promise<MemoryIndexSyncResult>;
   uuid: () => string;
 }
 
@@ -223,6 +228,7 @@ function actualDependencies(): MemoryCuratorWorkerDependencies {
     markConsolidated: markFactsConsolidated,
     writeTopicFile: writeMemoryTopicFile,
     consolidate: (system, user, credentialSlot, signal) => backend.consolidate(system, user, credentialSlot, signal),
+    syncIndexes: syncMemoryIndexes,
     uuid: randomUUID,
   };
 }
@@ -339,6 +345,10 @@ export function scanTopicFiles(workgroupId: string): {
     }
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue;
+      // `index.md` is the folder's OKF map, maintained by syncMemoryIndexes.
+      // Presenting it as a topic file would invite the model to rewrite the
+      // map as if it were a concept.
+      if (RESERVED_TOPIC_LEAVES.has(entry.name.toLowerCase())) continue;
       const relative = `${dir}/${entry.name}`;
       if (!TOPIC_FILE_PATH_PATTERN.test(relative)) continue;
       let size: number;
@@ -377,8 +387,11 @@ export function scanTopicFiles(workgroupId: string): {
       totalBytes += contentBytes;
       files.push({
         path: relative,
-        content: current.content,
-        owned: CONSOLIDATION_HEADER_PATTERN.test(current.content.split('\n', 1)[0] ?? ''),
+        // Stripped, so the model cannot echo the ownership marker back into
+        // the file — the root cause of the stacked-header corruption.
+        content: stripCuratorMetadata(current.content),
+        owned: isCuratorOwned(current.content),
+        sha256: current.sha256,
       });
     }
   }
@@ -755,6 +768,28 @@ export class MemoryCuratorWorker {
    * model calls; a non-empty tail always calls the model, even when it ends
    * up proposing zero files (P2-AC7 — those are distinct outcomes).
    */
+  /**
+   * Index maintenance never fails a pass. By the time it runs the topic files
+   * are already written and the tail already marked; the sync is derived from
+   * disk, so the next pass repairs whatever this one could not (a lost CAS
+   * race, an unreadable index). Throwing here would roll a completed
+   * consolidation back into a retry loop over a map.
+   */
+  private async syncIndexesQuietly(workgroupId: string): Promise<void> {
+    try {
+      const sync = await this.deps.syncIndexes(workgroupId);
+      if (sync.updated.length > 0) {
+        log.info('memory-curator: memory index updated', { workgroupId, updated: sync.updated });
+      }
+    } catch (error) {
+      log.warn('memory-curator: memory index sync failed', {
+        workgroupId,
+        errorClass: classifyError(error),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   private async runMaintenanceJob(
     job: MemoryMaintenanceJob,
     nowMs: number,
@@ -767,6 +802,11 @@ export class MemoryCuratorWorker {
     try {
       const tail = this.deps.consolidationTail(job.workgroupId);
       if (tail.facts.length === 0) {
+        // Nothing to consolidate, but the map can still be behind — a pass
+        // that crashed between writing files and marking the tail leaves
+        // exactly this shape, and so does the first pass after an install
+        // whose whole topic backlog predates index maintenance.
+        await this.syncIndexesQuietly(job.workgroupId);
         if (!this.deps.completeMaintenance(job, nowMs, false)) throw new Error('memory maintenance lost its lease');
         return {
           workgroupId: job.workgroupId,
@@ -860,8 +900,7 @@ export class MemoryCuratorWorker {
         // owned existing path's expected hash is the content this pass
         // actually read, so a sibling write mid-pass surfaces as a conflict
         // rather than silently overwriting it.
-        const priorContent = ownedByPath.get(file.path)?.content;
-        const expectedSha256 = priorContent === undefined ? null : generatedMemorySha(priorContent);
+        const expectedSha256 = ownedByPath.get(file.path)?.sha256 ?? null;
         const write = await this.deps.writeTopicFile(
           job.workgroupId,
           file.path,
@@ -899,6 +938,7 @@ export class MemoryCuratorWorker {
         job.workgroupId,
         tail.facts.map((fact) => fact.id),
       );
+      await this.syncIndexesQuietly(job.workgroupId);
       outcome = 'maintenance_written';
       if (accepted.length === 0) {
         // Distinct from the empty-tail noop above: real facts were

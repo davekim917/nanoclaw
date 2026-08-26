@@ -27,6 +27,15 @@ memory/
 ├── index.md
 ├── generated/
 │   └── memory.md
+├── people/            # curator-maintained topic files
+│   ├── index.md
+│   └── <entity>.md
+├── domain/
+│   ├── index.md
+│   └── <entity>.md
+├── systems/
+│   ├── index.md
+│   └── <entity>.md
 └── system/
     ├── index.md
     └── definition.md
@@ -55,6 +64,40 @@ tool rejects a missing or symlinked parent.
 
 `CLAUDE.local.md` and `instructions.prepend.md` are standing instruction
 surfaces, not memory write targets.
+
+## Curator-maintained topic files
+
+`people/`, `domain/` and `systems/` hold the background curator's consolidated
+views, distilled from `generated/memory.md`. They are ordinary OKF concept
+files — nothing about reading or hand-editing them is special:
+
+```yaml
+---
+type: person
+consolidated_facts: 150
+---
+```
+
+`type` comes from the directory (`person`, `domain`, `system`) and can be
+hand-corrected to better vocabulary; the curator carries a changed `type`, and
+every other frontmatter key it does not recognize, forward untouched.
+`consolidated_facts` is the provenance and ownership marker: how many ledger
+facts the last pass folded in, and the thing that makes the file a legitimate
+curator write target. Removing it makes the file human-owned, and the curator
+will refuse to overwrite it from then on. Files predating this format carry a
+`<!-- consolidated: facts=N -->` HTML comment instead; that is still honored as
+proof of ownership and is replaced with frontmatter the next time the curator
+rewrites the file. `scripts/repair-memory-topic-frontmatter.ts` converts a whole
+install ahead of that (dry run by default, `--apply` to write).
+
+The curator also maintains the map. After every consolidation pass it rewrites
+each topic folder's `index.md` from what is on disk and points the root
+`index.md`'s `## Map` section at those three folder indexes. This is a merge,
+not a regeneration: `okf_version`, `## Core Memory`, and every hand-written
+line and section — including hand-written Map links to files the curator does
+not own — are preserved byte for byte. The folder indexes exist precisely so
+the root index stays small enough to survive the per-file bound applied when it
+is injected into a fresh context window.
 
 ## Selective background capture
 

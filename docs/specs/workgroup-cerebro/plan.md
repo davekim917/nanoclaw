@@ -995,7 +995,13 @@ PRIMARY KEY (workgroup_id, fact_id))`. The **tail** is every fact currently in t
    check, not after) ≤ `CONSOLIDATION_FILE_MAX_BYTES` (8,192); at most
    `CONSOLIDATION_MAX_FILES` (12) per pass; every file gets header
    `<!-- consolidated: facts=<n> -->` as its first line — this is both the audit trail
-   and the ownership marker checked in step 6. **`{files: []}` on a non-empty tail is
+   and the ownership marker checked in step 6.
+   **SUPERSEDED:** the header is now OKF frontmatter (`type` plus
+   `consolidated_facts: <n>`), written by `serializeTopicFile`; the HTML comment is
+   still accepted as proof of ownership on files that predate the change but is never
+   written again. The comment form was echoed back by the model and re-prepended every
+   pass, which stacked up to nine markers on one live file. See `curator-contract.ts`
+   and `docs/memory.md`. **`{files: []}` on a non-empty tail is
    valid success**, not a failure and not a no-tail noop: the tail's facts are marked
    consolidated, the report action is `maintenance_written` with `fileCount: 0`
    (distinct from the empty-tail case, which makes no model call), and the event is

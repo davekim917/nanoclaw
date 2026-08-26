@@ -7,13 +7,22 @@ import { DATA_DIR } from '../../config.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 import {
   CONSOLIDATION_FILE_MAX_BYTES,
-  CONSOLIDATION_HEADER_PATTERN,
-  consolidationHeader,
   GENERATED_MEMORY_MAX_BYTES,
   GENERATED_MEMORY_RELATIVE_PATH,
   generatedMemorySha,
+  isCuratorOwned,
+  RESERVED_TOPIC_LEAVES,
+  serializeTopicFile,
+  TOPIC_DIRECTORIES,
   TOPIC_FILE_PATH_PATTERN,
 } from './curator-contract.js';
+import {
+  type IndexLink,
+  mergeRootIndexMap,
+  renderFolderIndex,
+  titleFromStem,
+  type TopicIndexEntry,
+} from './memory-index.js';
 
 const HELPER_PATH = fileURLToPath(
   new URL('../../../container/agent-runner/src/mcp-tools/memory-write-process-helper.ts', import.meta.url),
@@ -138,6 +147,12 @@ function ensureMemorySubdirectory(workgroupId: string, subdirRelative: string): 
     throw new Error('memory root escapes the canonical workgroup directory');
   }
 
+  // A root-level file (`index.md`) has no subdirectory to create, and the
+  // escape check below is written for a CHILD of the memory root — running it
+  // against the root itself would compare the workgroup directory to the
+  // memory root and always throw.
+  if (path.dirname(subdirRelative) === '.') return;
+
   const subdir = path.join(memoryRoot, path.dirname(subdirRelative));
   try {
     fs.mkdirSync(subdir, { mode: 0o700 });
@@ -213,14 +228,17 @@ export function readMemoryTopicFile(
 
 /**
  * Writes ONE curator-owned topic file (people/domain/systems). Host-side
- * validation the model is never trusted to have honored itself: the path
- * must match TOPIC_FILE_PATH_PATTERN, and the final serialized content —
- * `content` header-prepended, since the header is appended BEFORE this check
- * (P2.4 item 7) — must fit CONSOLIDATION_FILE_MAX_BYTES. Refuses to overwrite
- * any existing file whose first line does not carry the consolidation header
- * (P2-I6): a human-authored or unmarked file is never a write target no
- * matter what the model returned. `factsCount` is this pass's tail size,
- * stamped into the header as its own audit trail.
+ * validation the model is never trusted to have honored itself: the path must
+ * match TOPIC_FILE_PATH_PATTERN and must not be an OKF-reserved leaf, and the
+ * final serialized file — the model's body under the frontmatter this stamps
+ * — must fit CONSOLIDATION_FILE_MAX_BYTES. Refuses to overwrite any existing
+ * file that is not curator-owned (P2-I6): a human-authored or unmarked file is
+ * never a write target no matter what the model returned.
+ *
+ * `factsCount` is this pass's tail size, recorded as `consolidated_facts` in
+ * the frontmatter — the same audit trail the legacy `<!-- consolidated:
+ * facts=N -->` header carried, moved somewhere the model cannot echo back.
+ * The existing file's other frontmatter keys are carried forward untouched.
  */
 export async function writeMemoryTopicFile(
   workgroupId: string,
@@ -229,10 +247,20 @@ export async function writeMemoryTopicFile(
   expectedSha256: string | null,
   factsCount: number,
 ): Promise<CuratorWriteResult> {
-  if (!TOPIC_FILE_PATH_PATTERN.test(relativePath)) {
+  if (!TOPIC_FILE_PATH_PATTERN.test(relativePath) || RESERVED_TOPIC_LEAVES.has(relativePath.split('/')[1] ?? '')) {
     return { status: 'error', relative_path: relativePath, error: 'topic file path is not allowed' };
   }
-  const finalContent = `${consolidationHeader(factsCount)}\n${content}`;
+  // Read before creating anything: a rejected write must not leave an empty
+  // topic directory behind. readMemoryTopicFile treats a missing parent as
+  // ENOENT, same as a missing file.
+  const current = readMemoryTopicFile(workgroupId, relativePath);
+  if (current.sha256 !== null && !isCuratorOwned(current.content)) {
+    return { status: 'error', relative_path: relativePath, error: 'topic file is not owned by consolidation' };
+  }
+  // Serialized against the file actually on disk, so the size check measures
+  // the real bytes — including any frontmatter key an operator or agent added
+  // that validateConsolidationFiles could not see.
+  const finalContent = serializeTopicFile(relativePath, content, factsCount, current.content);
   if (Buffer.byteLength(finalContent, 'utf8') > CONSOLIDATION_FILE_MAX_BYTES) {
     return {
       status: 'error',
@@ -241,10 +269,6 @@ export async function writeMemoryTopicFile(
     };
   }
   ensureMemorySubdirectory(workgroupId, relativePath);
-  const current = readMemoryTopicFile(workgroupId, relativePath);
-  if (current.sha256 !== null && !CONSOLIDATION_HEADER_PATTERN.test(current.content.split('\n', 1)[0] ?? '')) {
-    return { status: 'error', relative_path: relativePath, error: 'topic file is not owned by consolidation' };
-  }
   if (current.sha256 !== expectedSha256) {
     return {
       status: 'conflict',
@@ -399,4 +423,159 @@ export async function restoreGeneratedMemorySnapshot(
   }
   const content = readTrustedBoundedFile(resolvedSnapshot, directory);
   return await writeGeneratedMemory(workgroupId, content, expectedCurrentSha256, options);
+}
+
+// ── OKF index maintenance ───────────────────────────────────────────────────
+// The curator writes topic files; upstream's memory system navigates by
+// `index.md`. Keeping the two in step is the whole point of the curator being
+// a background executor of the format rather than a second memory system.
+
+/** Runaway rail on an index file, not a retention policy — see the topic and
+ *  generated-memory caps above for the same reasoning. A folder index grows
+ *  with the file count: the busiest live workgroup's 185-file `domain/` lands
+ *  around 26 KB. */
+export const MEMORY_INDEX_MAX_BYTES = 256 * 1024;
+
+/** Root `index.md` and the three topic-folder indexes. Nothing else. */
+const INDEX_PATH_PATTERN = new RegExp(`^(?:(?:${TOPIC_DIRECTORIES.join('|')})/)?index\\.md$`);
+
+/**
+ * Writes one index file. Unlike a topic file there is no ownership check:
+ * `index.md` is co-owned by the operator, the agents and the curator, and the
+ * merge in memory-index.ts is what protects hand-written content. CAS is the
+ * only gate, and the write goes through the same workgroup-wide flock every
+ * container write takes, so a concurrent `write_memory_file` cannot interleave.
+ */
+export async function writeMemoryIndexFile(
+  workgroupId: string,
+  relativePath: string,
+  content: string,
+  expectedSha256: string | null,
+): Promise<CuratorWriteResult> {
+  if (!INDEX_PATH_PATTERN.test(relativePath)) {
+    return { status: 'error', relative_path: relativePath, error: 'index file path is not allowed' };
+  }
+  if (Buffer.byteLength(content, 'utf8') > MEMORY_INDEX_MAX_BYTES) {
+    return {
+      status: 'error',
+      relative_path: relativePath,
+      error: `index file exceeds ${MEMORY_INDEX_MAX_BYTES} bytes`,
+    };
+  }
+  ensureMemorySubdirectory(workgroupId, relativePath);
+  return await invokeHelper({
+    rootDir: workgroupMemoryDir(workgroupId),
+    relativePath,
+    content,
+    expectedSha256,
+  });
+}
+
+/** Attempts per index file before giving up on a losing CAS race. */
+const INDEX_WRITE_ATTEMPTS = 3;
+
+/**
+ * Read-modify-write one index file. Re-reads and re-merges on conflict rather
+ * than retrying the same bytes: the merge is defined against whatever is on
+ * disk, so a sibling write that landed in between is merged over, never lost.
+ * Returns true when the file changed.
+ */
+async function updateIndexFile(
+  workgroupId: string,
+  relativePath: string,
+  merge: (existing: string) => string,
+): Promise<boolean> {
+  for (let attempt = 0; attempt < INDEX_WRITE_ATTEMPTS; attempt += 1) {
+    const current = readMemoryTopicFile(workgroupId, relativePath, MEMORY_INDEX_MAX_BYTES);
+    const next = merge(current.content);
+    if (next === current.content) return false;
+    const write = await writeMemoryIndexFile(workgroupId, relativePath, next, current.sha256);
+    if (write.status === 'success') return true;
+    if (write.status !== 'conflict') {
+      throw new Error(`memory index write ${write.status}: ${write.error ?? 'unknown'}`);
+    }
+  }
+  throw new Error(`memory index write lost ${INDEX_WRITE_ATTEMPTS} CAS races: ${relativePath}`);
+}
+
+function listTopicEntries(workgroupId: string, directory: string): TopicIndexEntry[] {
+  let names: string[];
+  try {
+    names = fs
+      .readdirSync(path.join(workgroupMemoryDir(workgroupId), directory), { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.md') && !RESERVED_TOPIC_LEAVES.has(entry.name))
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b));
+  } catch {
+    return [];
+  }
+  const entries: TopicIndexEntry[] = [];
+  for (const name of names) {
+    if (!TOPIC_FILE_PATH_PATTERN.test(`${directory}/${name}`)) continue;
+    try {
+      // Read bound is the index rail, NOT the consolidation input cap: an
+      // over-cap topic file is excluded from the model's prompt but must
+      // still appear on the map, or the map claims it does not exist.
+      entries.push({
+        name,
+        content: readMemoryTopicFile(workgroupId, `${directory}/${name}`, MEMORY_INDEX_MAX_BYTES).content,
+      });
+    } catch {
+      continue;
+    }
+  }
+  return entries;
+}
+
+export interface MemoryIndexSyncResult {
+  /** Index paths whose bytes changed this pass. Empty is the steady state. */
+  updated: string[];
+}
+
+/**
+ * Bring `index.md` and the topic-folder indexes in line with what is on disk.
+ *
+ * Derived entirely from the filesystem rather than from the files this pass
+ * happened to write, which makes it idempotent (unchanged tree → no write at
+ * all) and self-healing: the first pass after this ships maps a workgroup's
+ * whole existing backlog, including topic files the curator has not rewritten
+ * yet — a legacy `<!-- consolidated -->` header still proves ownership, and
+ * the hook is read straight out of the body.
+ */
+export async function syncMemoryIndexes(workgroupId: string): Promise<MemoryIndexSyncResult> {
+  const updated: string[] = [];
+  const rootLinks: IndexLink[] = [];
+  for (const directory of TOPIC_DIRECTORIES) {
+    const entries = listTopicEntries(workgroupId, directory);
+    const owned = entries.filter((entry) => isCuratorOwned(entry.content));
+    const indexPath = `${directory}/index.md`;
+    const hasIndex = readMemoryTopicFile(workgroupId, indexPath, MEMORY_INDEX_MAX_BYTES).sha256 !== null;
+    if (owned.length === 0 && !hasIndex) continue;
+    const ownedNames = new Set(owned.map((entry) => entry.name));
+    const presentNames = new Set(entries.map((entry) => entry.name));
+    if (
+      await updateIndexFile(workgroupId, indexPath, (existing) =>
+        renderFolderIndex(directory, owned, ownedNames, presentNames, existing),
+      )
+    ) {
+      updated.push(indexPath);
+    }
+    rootLinks.push({
+      target: indexPath,
+      title: titleFromStem(directory),
+      hook: `${owned.length} consolidated ${owned.length === 1 ? 'concept' : 'concepts'}`,
+    });
+  }
+  // No topic folders at all: leave the root index completely alone rather
+  // than stamping an empty `## Map` section into every workgroup that has
+  // never had a consolidation pass.
+  if (
+    rootLinks.length > 0 &&
+    (await updateIndexFile(workgroupId, 'index.md', (existing) =>
+      mergeRootIndexMap(existing, TOPIC_DIRECTORIES, rootLinks),
+    ))
+  ) {
+    updated.push('index.md');
+  }
+  return { updated };
 }

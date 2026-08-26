@@ -7,7 +7,11 @@ import {
   CURATOR_CAPTURE_REASON_CODES,
   CURATOR_MAX_MEMORY_TEXT_CHARS,
   CURATOR_OUTPUT_SCHEMA,
+  isCuratorOwned,
   parseGeneratedMemoryFacts,
+  serializeTopicFile,
+  stripCuratorMetadata,
+  validateConsolidationFiles,
   validateCuratorDecision,
 } from './curator-contract.js';
 
@@ -148,8 +152,8 @@ describe('background memory curator contract', () => {
       workgroupId: 'wg-a',
       tail: [{ id: 'mem_aaaaaaaaaaaaaaaa', text: 'A fact.', capturedAt: '2026-08-15T00:00:00.000Z' }],
       topicFiles: [
-        { path: 'people/x.md', content: '<!-- consolidated: facts=1 -->\n# X\n', owned: true },
-        { path: 'people/roster.md', content: '# Roster\n', owned: false },
+        { path: 'people/x.md', content: '# X\n', owned: true, sha256: '0'.repeat(64) },
+        { path: 'people/roster.md', content: '# Roster\n', owned: false, sha256: '1'.repeat(64) },
       ],
       boundary: 'B',
     });
@@ -476,5 +480,87 @@ describe('background memory curator contract', () => {
     expect(prompt.system).toContain('the correction is proof that recovery from code failed');
     for (const code of CURATOR_CAPTURE_REASON_CODES) expect(prompt.system).toContain(code);
     expect(prompt.system).toContain('for noop both must be empty arrays');
+  });
+});
+
+// The stacked-header class. Nine markers accumulated on one live
+// `people/james.md` because each pass showed the model the file's own
+// ownership header, took its echo back as content, and prepended another.
+describe('OKF topic-file serialization', () => {
+  it('stamps OKF frontmatter with the type derived from the topic directory', () => {
+    expect(serializeTopicFile('people/james.md', 'James owns the release train.', 9)).toBe(
+      '---\ntype: person\nconsolidated_facts: 9\n---\n\nJames owns the release train.\n',
+    );
+    expect(serializeTopicFile('domain/amplitude-rollout.md', 'Rollout status.', 2)).toContain('type: domain');
+    expect(serializeTopicFile('systems/qa-agents.md', 'QA agents.', 2)).toContain('type: system');
+  });
+
+  // THE idempotency assertion: feeding a serialized file straight back in —
+  // exactly what a model echoing its input does — must not stack anything.
+  it('is idempotent: re-serializing its own output changes nothing', () => {
+    const once = serializeTopicFile('people/james.md', 'James owns the release train.', 9);
+    const twice = serializeTopicFile('people/james.md', once, 9, once);
+    expect(twice).toBe(once);
+    expect(serializeTopicFile('people/james.md', twice, 9, twice)).toBe(once);
+    expect(once.match(/^---$/gm)).toHaveLength(2);
+  });
+
+  it('collapses a stack of legacy headers the model echoed back into one frontmatter block', () => {
+    const corrupted = [
+      '<!-- consolidated: facts=150 -->',
+      '<!-- consolidated: facts=71 -->',
+      '<!-- consolidated -->',
+      'James owns the release train.',
+      '',
+    ].join('\n');
+    const repaired = serializeTopicFile('people/james.md', corrupted, 150, corrupted);
+    expect(repaired).toBe('---\ntype: person\nconsolidated_facts: 150\n---\n\nJames owns the release train.\n');
+    expect(repaired).not.toContain('<!-- consolidated');
+  });
+
+  it('carries forward frontmatter keys it does not own, including a hand-corrected type', () => {
+    const existing = [
+      '---',
+      'type: customer',
+      'title: Acme Corp',
+      'tags: [priority, renewal]',
+      'consolidated_facts: 3',
+      '---',
+      '',
+      'Old body.',
+      '',
+    ].join('\n');
+    const next = serializeTopicFile('domain/acme.md', 'New body.', 11, existing);
+    expect(next).toBe(
+      '---\ntype: customer\ntitle: Acme Corp\ntags: [priority, renewal]\nconsolidated_facts: 11\n---\n\nNew body.\n',
+    );
+  });
+
+  it('does not mistake a body that opens with a horizontal rule for frontmatter', () => {
+    const body = '---\n\nA rule, then prose.\n';
+    expect(stripCuratorMetadata(body)).toBe(body);
+    expect(serializeTopicFile('domain/x.md', body, 1)).toContain('---\n\nA rule, then prose.');
+  });
+
+  it('treats both header shapes and the frontmatter key as proof of ownership', () => {
+    expect(isCuratorOwned('<!-- consolidated: facts=1 -->\nBody\n')).toBe(true);
+    expect(isCuratorOwned('<!-- consolidated -->\nBody\n')).toBe(true);
+    expect(isCuratorOwned('---\ntype: person\nconsolidated_facts: 0\n---\n\nBody\n')).toBe(true);
+    expect(isCuratorOwned('---\ntype: person\n---\n\nBody\n')).toBe(false);
+    expect(isCuratorOwned('# Human-authored roster\n')).toBe(false);
+  });
+
+  it('rejects a reserved index leaf as a model-proposed write target', () => {
+    const result = validateConsolidationFiles({ files: [{ path: 'people/index.md', content: 'Map.' }] }, 1);
+    expect(result.accepted).toEqual([]);
+    expect(result.rejected).toEqual([{ path: 'people/index.md', reason: 'invalid-path' }]);
+  });
+
+  it('sizes a candidate on the bytes the writer will produce, not the raw body', () => {
+    const body = 'x'.repeat(CONSOLIDATION_FILE_MAX_BYTES - 20);
+    const result = validateConsolidationFiles({ files: [{ path: 'people/x.md', content: body }] }, 1);
+    expect(result.accepted).toEqual([]);
+    expect(result.rejected[0]).toMatchObject({ path: 'people/x.md', reason: 'too-large' });
+    expect(result.rejected[0]!.bytes).toBe(Buffer.byteLength(serializeTopicFile('people/x.md', body, 1), 'utf8'));
   });
 });

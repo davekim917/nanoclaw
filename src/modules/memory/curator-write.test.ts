@@ -26,6 +26,7 @@ import {
   readMemoryTopicFile,
   resolveBunBinary,
   restoreGeneratedMemorySnapshot,
+  syncMemoryIndexes,
   writeGeneratedMemory,
   writeMemoryTopicFile,
 } from './curator-write.js';
@@ -296,18 +297,18 @@ describe('host topic-file writer', () => {
     const created = await writeMemoryTopicFile(TEST_WORKGROUP, 'people/new-entity.md', '# New\n', null, 1);
     expect(created.status).toBe('success');
     expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/new-entity.md').content).toBe(
-      '<!-- consolidated: facts=1 -->\n# New\n',
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\n# New\n',
     );
   });
 
-  it('creates the topic directory on first write and stamps the consolidation header', async () => {
+  it('creates the topic directory on first write and stamps OKF frontmatter', async () => {
     expect(fs.existsSync(path.join(TEST_ROOT, 'workgroups', TEST_WORKGROUP, 'memory', 'domain'))).toBe(false);
     const created = await writeMemoryTopicFile(TEST_WORKGROUP, 'domain/pricing.md', '# Pricing\n', null, 3);
     expect(created.status).toBe('success');
     const domainDir = path.join(TEST_ROOT, 'workgroups', TEST_WORKGROUP, 'memory', 'domain');
     expect(fs.lstatSync(domainDir).isDirectory()).toBe(true);
     expect(readMemoryTopicFile(TEST_WORKGROUP, 'domain/pricing.md').content).toBe(
-      '<!-- consolidated: facts=3 -->\n# Pricing\n',
+      '---\ntype: domain\nconsolidated_facts: 3\n---\n\n# Pricing\n',
     );
   });
 
@@ -325,7 +326,115 @@ describe('host topic-file writer', () => {
     );
     expect(updated.status).toBe('success');
     expect(readMemoryTopicFile(TEST_WORKGROUP, 'systems/pipeline.md').content).toBe(
-      '<!-- consolidated: facts=2 -->\n# Pipeline v2\n',
+      '---\ntype: system\nconsolidated_facts: 2\n---\n\n# Pipeline v2\n',
+    );
+  });
+});
+
+describe('OKF index maintenance', () => {
+  const memoryDir = (): string => path.join(TEST_ROOT, 'workgroups', TEST_WORKGROUP, 'memory');
+
+  // The whole-loop version of the stacked-header regression, through the real
+  // writer and the real filesystem: a model that returns the file it was
+  // shown, twice.
+  it('a model echoing the file back never stacks a second header', async () => {
+    await writeMemoryTopicFile(TEST_WORKGROUP, 'people/james.md', 'James owns the release train.', null, 9);
+    const first = readMemoryTopicFile(TEST_WORKGROUP, 'people/james.md');
+    const echoed = await writeMemoryTopicFile(TEST_WORKGROUP, 'people/james.md', first.content, first.sha256, 9);
+    expect(echoed.status).toBe('success');
+    const second = readMemoryTopicFile(TEST_WORKGROUP, 'people/james.md');
+    expect(second.content).toBe(first.content);
+    expect(second.content.match(/^---$/gm)).toHaveLength(2);
+    expect(second.content).not.toContain('<!-- consolidated');
+  });
+
+  it('accepts a legacy-header file as owned and replaces the header with frontmatter', async () => {
+    const peopleDir = path.join(memoryDir(), 'people');
+    fs.mkdirSync(peopleDir, { recursive: true });
+    const legacy = '<!-- consolidated: facts=4 -->\n<!-- consolidated -->\nOld body.\n';
+    fs.writeFileSync(path.join(peopleDir, 'legacy.md'), legacy);
+    const current = readMemoryTopicFile(TEST_WORKGROUP, 'people/legacy.md');
+    const write = await writeMemoryTopicFile(TEST_WORKGROUP, 'people/legacy.md', 'New body.', current.sha256, 7);
+    expect(write.status).toBe('success');
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/legacy.md').content).toBe(
+      '---\ntype: person\nconsolidated_facts: 7\n---\n\nNew body.\n',
+    );
+  });
+
+  it('refuses an OKF-reserved index leaf as a topic-file write target', async () => {
+    const result = await writeMemoryTopicFile(TEST_WORKGROUP, 'people/index.md', 'Map.', null, 1);
+    expect(result.status).toBe('error');
+    expect(fs.existsSync(path.join(memoryDir(), 'people', 'index.md'))).toBe(false);
+  });
+
+  it('writes folder indexes and points the root Map at them, preserving Core Memory', async () => {
+    fs.writeFileSync(
+      path.join(memoryDir(), 'index.md'),
+      [
+        '---',
+        'okf_version: "0.1"',
+        '---',
+        '',
+        '# Memory Index',
+        '',
+        '## Core Memory',
+        '',
+        '- The user is Dave Kim.',
+        '',
+        '## Map',
+        '',
+        '- [Memory system definition](system/definition.md) - how this memory works',
+        '',
+      ].join('\n'),
+    );
+    await writeMemoryTopicFile(TEST_WORKGROUP, 'people/james.md', 'James owns the release train.', null, 9);
+    await writeMemoryTopicFile(TEST_WORKGROUP, 'domain/acme.md', 'Acme is on a renewal cycle.', null, 9);
+    // A human-authored file in a topic folder: mapped by nobody, clobbered by
+    // nobody.
+    fs.writeFileSync(path.join(memoryDir(), 'people', 'roster.md'), '# Human roster\n');
+
+    const sync = await syncMemoryIndexes(TEST_WORKGROUP);
+    expect(sync.updated.sort()).toEqual(['domain/index.md', 'index.md', 'people/index.md']);
+
+    const root = readMemoryTopicFile(TEST_WORKGROUP, 'index.md').content;
+    expect(root).toContain('okf_version: "0.1"');
+    expect(root).toContain('- The user is Dave Kim.');
+    expect(root).toContain('- [Memory system definition](system/definition.md) - how this memory works');
+    expect(root).toContain('- [People](people/index.md) - 1 consolidated concept');
+    expect(root).toContain('- [Domain](domain/index.md) - 1 consolidated concept');
+    expect(root).not.toContain('systems/index.md');
+
+    const people = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').content;
+    expect(people).toContain('- [James](james.md) - James owns the release train.');
+    expect(people).not.toContain('roster.md');
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/roster.md').content).toBe('# Human roster\n');
+  });
+
+  // Idempotency at the level the brief asks for: run the curator's index pass
+  // twice over an unchanged tree and the second run must write nothing.
+  it('a second sync over an unchanged tree writes nothing', async () => {
+    await writeMemoryTopicFile(TEST_WORKGROUP, 'people/james.md', 'James owns the release train.', null, 9);
+    await syncMemoryIndexes(TEST_WORKGROUP);
+    const before = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md');
+    expect(await syncMemoryIndexes(TEST_WORKGROUP)).toEqual({ updated: [] });
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').sha256).toBe(before.sha256);
+  });
+
+  it('maps a legacy-header topic file the curator has not rewritten yet', async () => {
+    const peopleDir = path.join(memoryDir(), 'people');
+    fs.mkdirSync(peopleDir, { recursive: true });
+    fs.writeFileSync(path.join(peopleDir, 'legacy.md'), '<!-- consolidated: facts=4 -->\nLegacy lead line.\n');
+    await syncMemoryIndexes(TEST_WORKGROUP);
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').content).toContain(
+      '- [Legacy](legacy.md) - Legacy lead line.',
+    );
+  });
+
+  it('leaves a workgroup with no topic folders completely alone', async () => {
+    fs.writeFileSync(path.join(memoryDir(), 'index.md'), '# Memory Index\n\n## Core Memory\n\n- Only this.\n');
+    expect(await syncMemoryIndexes(TEST_WORKGROUP)).toEqual({ updated: [] });
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'index.md').content).toBe(
+      '# Memory Index\n\n## Core Memory\n\n- Only this.\n',
     );
   });
 });
