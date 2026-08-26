@@ -100,6 +100,7 @@ import {
   restartAgentGroupContainers,
   wakeRepositoryMountSessions,
 } from './container-restart.js';
+import { log } from './log.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -358,6 +359,33 @@ function makeSession(id: string, agentGroupId: string, status = 'active') {
 // --- Tests ---
 
 describe('restartAgentGroupContainers', () => {
+  // Pre-branch the wake-write was fire-and-forget, so its rejection escaped as
+  // an unhandledRejection and the loop always finished. Awaiting it turned that
+  // into control flow: the first failure killed the sessions ahead of it and
+  // stranded every one behind it, half-restarting the group.
+  it('keeps restarting after one session fails, and never kills that session', async () => {
+    mockGetSessionsByAgentGroup.mockReturnValue([
+      makeSession('s1', 'g1'),
+      makeSession('s2', 'g1'),
+      makeSession('s3', 'g1'),
+    ]);
+    mockIsContainerRunning.mockReturnValue(true);
+    mockWriteSessionMessage.mockImplementation((_ag: string, sessionId: string) =>
+      sessionId === 's2' ? Promise.reject(new Error('storage is being reclaimed')) : Promise.resolve(),
+    );
+
+    const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
+
+    expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s1', 's3']);
+    expect(count).toBe(2);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Restart: wake message failed; leaving this container running',
+      expect.objectContaining({ sessionId: 's2', err: expect.any(Error) }),
+    );
+    // clearAllMocks keeps implementations; leave the shared mock as found.
+    mockWriteSessionMessage.mockReset();
+  });
+
   it('skips sessions without a running container', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1'), makeSession('s2', 'g1')]);
     mockIsContainerRunning.mockReturnValue(false);
