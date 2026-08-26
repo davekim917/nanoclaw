@@ -18,7 +18,7 @@ let prevDays: string | undefined;
 const PROJECT_DIR = '-workspace-agent';
 const CWD = '/workspace/agent';
 
-function writeTranscript(sessionId: string, bytes: number, firstTs?: string): string {
+function writeTranscript(sessionId: string, bytes: number, firstTs?: string, firstLineBytes = 0): string {
   const dir = path.join(tmp, '.claude', 'projects', PROJECT_DIR);
   fs.mkdirSync(dir, { recursive: true });
   const p = path.join(dir, `${sessionId}.jsonl`);
@@ -26,7 +26,7 @@ function writeTranscript(sessionId: string, bytes: number, firstTs?: string): st
     JSON.stringify({
       type: 'user',
       timestamp: firstTs ?? new Date().toISOString(),
-      message: { role: 'user', content: 'hello' },
+      message: { role: 'user', content: 'hello'.padEnd(firstLineBytes, 'x') },
     }) + '\n';
   const filler = 'x'.repeat(Math.max(0, bytes - first.length));
   fs.writeFileSync(p, first + filler);
@@ -80,6 +80,22 @@ describe('ClaudeProvider.maybeRotateContinuation', () => {
     writeTranscript('sess-old', 2048, old);
     const provider = new ClaudeProvider();
     expect(provider.maybeRotateContinuation('sess-old', CWD)).toContain('d');
+  });
+
+  // Regression: every real transcript opens with the host's ~16KB
+  // `[Trusted runtime capability state]` entry, and the first-line read used
+  // to stop at 4KB — so JSON.parse always threw, the start timestamp was
+  // always null, and the age cap never fired on any live session. The case
+  // above only passed because its first line was ~90 bytes.
+  it('rotates an aged transcript whose first line is far larger than one read block', () => {
+    process.env.CLAUDE_TRANSCRIPT_ROTATE_BYTES = String(1024 * 1024);
+    process.env.CLAUDE_TRANSCRIPT_ROTATE_AGE_DAYS = '7';
+    const old = new Date(Date.now() - 10 * 86400_000).toISOString();
+    const p = writeTranscript('sess-old-fat-head', 64 * 1024, old, 32 * 1024);
+    expect(fs.readFileSync(p, 'utf-8').indexOf('\n')).toBeGreaterThan(16 * 1024);
+    const provider = new ClaudeProvider();
+    expect(provider.maybeRotateContinuation('sess-old-fat-head', CWD)).toContain('d');
+    expect(fs.existsSync(p)).toBe(false);
   });
 
   it('returns null for an unknown session id', () => {
