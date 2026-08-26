@@ -1512,14 +1512,14 @@ extensions above. The token-stream persistence gap (decision 3) and the
 promote-protocol gap (decision 12) were each caught by only one of the two
 reviews — neither alone would have found both.
 
-## 9. Pillars 2 and 4 — sequenced, deliberately not designed here
+## 9. Pillar 2 — sequenced, deliberately not designed here; pillars 3 and 4 DROPPED
 
 Recorded scope: `project_workgroup_cerebro_plan.md`. This plan builds pillars 0 and 1.
-Pillar 2 and pillar 4 get their own `/team-plan` when their entry criteria are met;
-pillar 3 was dropped outright, not deferred (below — the numbering gap is intentional).
-Designing 2 and 4 now would be speculative: pillar 2's shape depends on whether pillar 1
-changes agent behavior, and pillar 4 was explicitly ordered last "after consolidation
-shows which entities matter."
+Pillar 2 gets its own `/team-plan` when its entry criteria are met; designing it now
+would be speculative, since its shape depends on whether pillar 1 changes agent
+behavior. **Pillars 3 and 4 were each dropped outright, not deferred.** Their numbers
+are retired with them and both entries stay below, so the reasoning is not re-litigated
+from the original one-line scopes.
 
 **Pillar 0 changes pillar 2's entry criteria.** Consolidation distils the episodic
 ledger, so it concentrates whatever the ledger holds. Run against today's 11.9% domain
@@ -1561,13 +1561,35 @@ files on a schedule. Dropped outright rather than deferred, for four reasons:
    actually matter for a given analysis, what a late feed implies — is a durable
    learned fact, and that is pillar 2's topic files, already shipped.
 
-The number is retired with the pillar; pillar 4 below keeps its number unchanged.
+The number is retired with the pillar.
 
-**Pillar 4 — entity layer in Graphify.** Person/system/concept node types. The graph has
-none today — only chunks, files, and symbols (§4.3 sample), which is why a person query
-returns zero _nodes_ while FTS matches exist. This is a Graphify schema and extractor
-change, the largest of the four.
-_Entry criteria:_ pillar 2 has shown which entities actually recur.
+**Pillar 4 — DROPPED (was: entity layer in Graphify).** Originally scoped as
+person/system/concept node types plus the extractor work to populate them — the graph
+has none today, only chunks, files, and symbols (§4.3 sample), which is why a person
+query returns zero _nodes_ while FTS matches exist. It was the largest of the four and
+was ordered last, gated on "pillar 2 has shown which entities actually recur." **Never
+built; there is no code to remove.** Dropped on that entry criterion, which pillar 2 ran
+and answered in the negative. Twelve consolidated topic files were read end to end
+across `people/`, `domain/`, and `systems/` in two workgroups:
+
+1. **The corpus is narrative-shaped, not entity-shaped.** What those files hold is
+   incident postmortems, governance rulings, an architecture decision log, a warehouse
+   column-mapping investigation, and org/comp narrative. The value in each is the
+   _why_ — not which nodes connect to which.
+2. **Decomposing them into nodes and edges is lossy.** A topic file is already the
+   compressed answer to "what happened and what should be done differently." Splitting
+   it discards the reasoning that makes it worth reading, and the query returns the same
+   handful of files the passage ranker already ranks top — minus that reasoning.
+3. **Every candidate entity type classifies out.** People and reporting lines are
+   genuine durable memory, but that is roughly five people in one file with the
+   relationships stated in the same sentence — a node pair adds nothing the sentence
+   does not already say. PRs, issues, and SHAs are GitHub's live state; Snowflake tables
+   are the warehouse's; release-gate state lives in `gates/*.jsonl`. Caching any of them
+   here is pillar 3's rejected shape (point 2 above).
+4. **The pointers it would sharpen already go unfollowed.** P2.1 sampled 270 scent
+   deliveries carrying pointers and found zero agent replies citing a pointed-to file.
+   Better node types would have produced a better version of a lane the fleet does not
+   use.
 
 ## 10. Risks and open items
 
