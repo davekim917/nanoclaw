@@ -1,26 +1,6 @@
 {
   "entries": [
     {
-      "path": "docs/specs/workgroup-cerebro/run.md",
-      "value": "illysium",
-      "reason": "Owner-approved: benchmark doc referencing a local test workgroup name (name already public in git history)"
-    },
-    {
-      "path": "docs/specs/workgroup-cerebro/run.md",
-      "value": "madison-reed",
-      "reason": "Owner-approved: benchmark doc referencing a local test workgroup name (name already public in git history)"
-    },
-    {
-      "path": "src/message-archive.ts",
-      "value": "illysium",
-      "reason": "Owner-approved: performance comment citing measured timings from a local test workgroup (name already public in git history)"
-    },
-    {
-      "path": "src/modules/memory/pre-turn-context.ts",
-      "value": "illysium",
-      "reason": "Owner-approved: performance comment citing measured token statistics from a local test workgroup (name already public in git history)"
-    },
-    {
       "path": "CODE_OF_CONDUCT.md",
       "value": "community@nanoclaw.dev",
       "reason": "Published project code of conduct contact"
