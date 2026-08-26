@@ -109,35 +109,52 @@ export function mergeManagedLinks(
   heading: string,
   owns: (target: string) => boolean,
   links: readonly IndexLink[],
+  insertAfter?: string,
 ): string {
   const level = /^#+/.exec(heading)?.[0].length ?? 2;
   const lines = existing.length > 0 ? existing.split('\n') : [];
   let fenced = fencedLines(lines);
-
-  let start = lines.findIndex((line, index) => !fenced[index] && line.trimEnd() === heading);
-  let end: number;
-  if (start < 0) {
-    while (lines.length > 0 && lines[lines.length - 1]!.trim() === '') lines.pop();
-    if (lines.length > 0) lines.push('');
-    lines.push(heading);
-    fenced = fencedLines(lines);
-    start = lines.length - 1;
-    end = lines.length;
-  } else {
-    end = lines.length;
-    for (let index = start + 1; index < lines.length; index += 1) {
+  const headingAt = (text: string): number =>
+    lines.findIndex((line, index) => !fenced[index] && line.trimEnd() === text);
+  /** End of the section `text` opens: the next heading at its level or above. */
+  const sectionEnd = (at: number, atLevel: number): number => {
+    for (let index = at + 1; index < lines.length; index += 1) {
       if (fenced[index]) continue;
       const match = /^(#+)\s/.exec(lines[index]!);
-      if (match && match[1]!.length <= level) {
-        end = index;
-        break;
-      }
+      if (match && match[1]!.length <= atLevel) return index;
     }
+    return lines.length;
+  };
+
+  let start = headingAt(heading);
+  let end: number;
+  if (start < 0) {
+    // Where a NEW section goes is ours to choose; where an existing one sits
+    // is not. `insertAfter` puts the map high enough to survive the 2,500-byte
+    // head read the agent's bootstrap does (bootstrap.ts MAX_INDEX_BYTES), and
+    // once it exists this branch never runs again.
+    const anchor = insertAfter === undefined ? -1 : headingAt(insertAfter);
+    if (anchor >= 0) {
+      let at = sectionEnd(anchor, /^#+/.exec(insertAfter!)![0].length);
+      while (at > anchor + 1 && lines[at - 1]!.trim() === '') at -= 1;
+      lines.splice(at, 0, '', heading);
+      start = at + 1;
+    } else {
+      while (lines.length > 0 && lines[lines.length - 1]!.trim() === '') lines.pop();
+      if (lines.length > 0) lines.push('');
+      lines.push(heading);
+      start = lines.length - 1;
+    }
+    fenced = fencedLines(lines);
+    end = start + 1;
+  } else {
+    end = sectionEnd(start, level);
   }
 
   const subheading = new RegExp(`^#{${level + 1},}\\s`);
   const kept: string[] = [];
   let firstSubheadingAt = -1;
+  let firstBulletAt = -1;
   let dropping = false;
   // An indented bullet is a NESTED item when a list is already open, and a
   // top-level item when one is not — CommonMark allows a top-level item up to
@@ -161,6 +178,7 @@ export function mergeManagedLinks(
         listOpen = true;
         dropping = owns(match[2]!);
         if (dropping) continue;
+        if (firstBulletAt < 0) firstBulletAt = kept.length;
       } else if (dropping && CONTINUATION.test(line)) {
         continue; // wrapped tail or nested item of a bullet being replaced
       } else {
@@ -174,23 +192,41 @@ export function mergeManagedLinks(
   while (kept.length > 0 && kept[0]!.trim() === '') {
     kept.shift();
     if (firstSubheadingAt > 0) firstSubheadingAt -= 1;
+    if (firstBulletAt > 0) firstBulletAt -= 1;
   }
   while (kept.length > 0 && kept[kept.length - 1]!.trim() === '') kept.pop();
   if (firstSubheadingAt > kept.length) firstSubheadingAt = -1;
 
-  // Insert with the section's own top-level bullets, never past a
-  // sub-heading: a live root index carries `### Folders`, `### Corrections`
-  // and the like INSIDE `## Map`, and appending at the end of the section
-  // would file the folder-index links under whichever subsection happens to
-  // be last. Stable across runs because the managed bullets are removed
-  // before this index is computed.
+  // AT THE HEAD of the section's own bullet list, after any leading prose.
+  //
+  // Placing the section high is not enough on its own: madison-reed's `## Map`
+  // already starts at byte 1,881 — inside the 2,500-byte head read — but it
+  // holds thirteen hand-written bullets, so links appended after them landed
+  // at byte 4,308 and the agent never saw them. Leading the list is what makes
+  // the folder pointers reachable, and it moves no hand-written line relative
+  // to another hand-written line: the whole managed block moves as one, ahead
+  // of a list the curator does not own. Never past a sub-heading either — a
+  // live index carries `### Folders`, `### Corrections` inside `## Map`.
+  // Stable across runs because the managed bullets are removed before these
+  // indices are computed.
   const rendered = links.map((link) => `- [${link.title}](${link.target})${link.hook ? ` - ${link.hook}` : ''}`);
-  let insertAt = firstSubheadingAt < 0 ? kept.length : firstSubheadingAt;
-  // Land before the blank line that separates the bullets from the
-  // sub-heading, not between the blank line and the heading.
-  while (insertAt > 0 && kept[insertAt - 1]!.trim() === '') insertAt -= 1;
+  let insertAt = firstBulletAt;
+  if (insertAt < 0) {
+    insertAt = firstSubheadingAt < 0 ? kept.length : firstSubheadingAt;
+    // Land before the blank line that separates the last bullet from the
+    // sub-heading, not between the blank line and the heading. Only when
+    // anchoring on a heading or on end-of-section: anchoring on a bullet must
+    // land exactly ON it, or the blank above it ends up BETWEEN the managed
+    // block and the list, splitting one list into two.
+    while (insertAt > 0 && kept[insertAt - 1]!.trim() === '') insertAt -= 1;
+  }
   const section = [...kept.slice(0, insertAt), ...rendered, ...kept.slice(insertAt)];
   const tail = lines.slice(end);
+  // Exactly one blank line before whatever follows. Without this, inserting a
+  // new section immediately above an existing heading left the blank that was
+  // already there plus the one added here, and a second merge collapsed it —
+  // i.e. the create path was not idempotent.
+  while (tail.length > 0 && tail[0]!.trim() === '') tail.shift();
   const rebuilt = [...lines.slice(0, start + 1), '', ...section, ...(tail.length > 0 ? ['', ...tail] : [])];
   return `${rebuilt.join('\n').trimEnd()}\n`;
 }
@@ -282,19 +318,25 @@ export function rootIndexOwns(topicDirectories: readonly string[]): (target: str
 /**
  * Merge the topic-folder pointers into the root `index.md`'s `## Map`.
  *
- * Deliberately three lines, not one per topic file. The root index is
- * injected into every fresh context window under a hard per-file character
- * bound (`PRE_TURN_BOUNDS.markdownCoreChars`), and the busiest live workgroup
- * has 231 topic files — a bullet each would be ~26 KB of index, of which the
- * agent would see none and the operator would have to scroll past all of it.
- * OKF's own answer is the per-folder index, and that is what these three
- * links point at. `okf_version`, Core Memory and every other section are
- * untouched.
+ * Deliberately three lines, not one per topic file. The root index is read
+ * head-first under a hard 2,500-byte bound (`PRE_TURN_BOUNDS.markdownCoreChars`
+ * on the host, `MAX_INDEX_BYTES` in the container's bootstrap), and the busiest
+ * live workgroup has 231 topic files — a bullet each would be ~26 KB of index,
+ * of which the agent would see none. That bound is not a budget memory
+ * outgrew; it is definition.md's "headlines and pointers here, detail in
+ * linked files" enforced in code, and the per-folder index is definition.md's
+ * own answer ("create it and its `index.md` before writing the first concept
+ * there"). These three links point at those.
+ *
+ * A new `## Map` is placed after `## Core Memory` so it lands inside that head
+ * read. An existing one is left exactly where it is — a human may have put it
+ * there deliberately. `okf_version`, Core Memory and every other section are
+ * untouched either way.
  */
 export function mergeRootIndexMap(
   existing: string,
   topicDirectories: readonly string[],
   links: readonly IndexLink[],
 ): string {
-  return mergeManagedLinks(existing, '## Map', rootIndexOwns(topicDirectories), links);
+  return mergeManagedLinks(existing, '## Map', rootIndexOwns(topicDirectories), links, '## Core Memory');
 }

@@ -92,9 +92,23 @@ install ahead of that (dry run by default, `--apply` to write).
 
 The curator also maintains the map. After every consolidation pass it rewrites
 each topic folder's `index.md` from what is on disk and points the root
-`index.md`'s `## Map` section at those three folder indexes. The folder indexes
-exist precisely so the root index stays small enough to survive the per-file
-bound applied when it is injected into a fresh context window.
+`index.md`'s `## Map` section at those three folder indexes.
+
+Two-level, and placed high, because `index.md` is read HEAD-first under a hard
+2,500-byte bound (`PRE_TURN_BOUNDS.markdownCoreChars` on the host,
+`MAX_INDEX_BYTES` in the container bootstrap). That bound is
+`system/definition.md`'s own rule in code — "headlines and pointers here, detail
+in linked files" — not a budget memory outgrew: detail belongs in the linked
+files recall pulls at 12-16k. So the root Map carries three pointers, each
+folder index carries one bullet per concept, and the curator's pointers lead the
+Map's bullet list rather than trailing it. On the busiest live workgroup the
+`## Map` heading already sat at byte 1,881 but thirteen hand-written bullets
+pushed appended links to 4,308, where nothing reads them; leading the list puts
+them at 2,107. Where a `## Map` the curator CREATES goes is its choice (after
+`## Core Memory`); where an existing one sits is never changed.
+`scripts/repair-memory-topic-frontmatter.ts` prints a NOTICE for any index whose
+pointers still land past the bound — shortening what sits above them is an
+editorial call for a human, not something a background pass does by deletion.
 
 This is a merge, not a regeneration. What survives, stated exactly: headings,
 frontmatter, other sections, section ordering, fenced code blocks, HTML

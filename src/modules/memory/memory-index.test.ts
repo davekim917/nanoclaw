@@ -39,6 +39,7 @@ const HAND_WRITTEN_ROOT = [
 const FOLDER_LINKS = [
   { target: 'people/index.md', title: 'People', hook: '2 consolidated concepts' },
   { target: 'domain/index.md', title: 'Domain', hook: '5 consolidated concepts' },
+  { target: 'systems/index.md', title: 'Systems', hook: '4 consolidated concepts' },
 ];
 
 describe('root index.md merge', () => {
@@ -101,15 +102,112 @@ describe('root index.md merge', () => {
     ].join('\n');
     const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
     const lines = merged.split('\n');
+    // The managed block LEADS the section's own list and never crosses into a
+    // sub-heading; the hand-written bullet keeps its place behind it.
     expect(lines.indexOf('- [People](people/index.md) - 2 consolidated concepts')).toBeLessThan(
-      lines.indexOf('### Corrections'),
+      lines.indexOf('- [Definition](system/definition.md) - how this works'),
     );
     expect(lines.indexOf('- [Definition](system/definition.md) - how this works')).toBeLessThan(
-      lines.indexOf('- [People](people/index.md) - 2 consolidated concepts'),
+      lines.indexOf('### Corrections'),
     );
     expect(merged).toContain('- [A correction](correction-a.md) - what changed');
     expect(merged).toContain('Untouched.');
     expect(lines[lines.indexOf('### Corrections') - 1]).toBe('');
+    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+  });
+
+  // F5. Not a budget problem — definition.md's "headlines and pointers here"
+  // enforced by a 2,500-byte HEAD read. A map the curator creates has to land
+  // inside that read, and the only lever that does not touch recall or a
+  // human's content is where a NEW section goes.
+  it('places a new ## Map right after ## Core Memory, inside the index head read', () => {
+    const existing = [
+      '---',
+      'okf_version: "0.1"',
+      '---',
+      '',
+      '# Memory Index',
+      '',
+      '## Core Memory',
+      '',
+      '- The user is Dave Kim.',
+      '',
+      '## Methods',
+      '',
+      `${'Accumulated prose. '.repeat(200)}`,
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const lines = merged.split('\n');
+    expect(lines.indexOf('## Core Memory')).toBeLessThan(lines.indexOf('## Map'));
+    expect(lines.indexOf('## Map')).toBeLessThan(lines.indexOf('## Methods'));
+    expect(lines.indexOf('- The user is Dave Kim.')).toBeLessThan(lines.indexOf('## Map'));
+    // The whole point: inside the 2,500-byte head the agent actually reads.
+    expect(merged.indexOf('- [People](people/index.md)')).toBeLessThan(2_500);
+    expect(merged).toContain('Accumulated prose.');
+    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+  });
+
+  it('leads the Map list, so the pointers survive the head read on a long index', () => {
+    const existing = [
+      '# Memory Index',
+      '',
+      '## Core Memory',
+      '',
+      `- ${'A durable fact. '.repeat(60)}`,
+      '',
+      '## Map',
+      '',
+      '<!-- rebuilt by hand 2026-08-17 -->',
+      '',
+      ...Array.from({ length: 13 }, (_, i) => `- [Note ${i}](reference-${i}.md) - ${'detail '.repeat(20)}`),
+      '',
+    ].join('\n');
+    // The shape that defeated "place the section high": the HEADING is inside
+    // the head read, the appended links were not.
+    expect(existing.indexOf('## Map')).toBeLessThan(2_500);
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged.indexOf('- [People](people/index.md)')).toBeLessThan(2_500);
+    const lines = merged.split('\n');
+    expect(lines.indexOf('<!-- rebuilt by hand 2026-08-17 -->')).toBeLessThan(
+      lines.indexOf('- [People](people/index.md) - 2 consolidated concepts'),
+    );
+    expect(lines.indexOf('- [Systems](systems/index.md) - 4 consolidated concepts')).toBeLessThan(
+      lines.indexOf(`- [Note 0](reference-0.md) - ${'detail '.repeat(20)}`),
+    );
+    for (let i = 0; i < 13; i += 1) expect(merged).toContain(`- [Note ${i}](reference-${i}.md)`);
+    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+  });
+
+  it('never moves a ## Map a human already placed', () => {
+    const existing = [
+      '# Memory Index',
+      '',
+      '## Core Memory',
+      '',
+      '- Durable.',
+      '',
+      '## Methods',
+      '',
+      'Prose.',
+      '',
+      '## Map',
+      '',
+      '- [Definition](system/definition.md) - how this works',
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const lines = merged.split('\n');
+    expect(lines.indexOf('## Methods')).toBeLessThan(lines.indexOf('## Map'));
+    expect(merged.match(/^## Map$/gm)).toHaveLength(1);
+    expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
+  });
+
+  it('falls back to end of file when there is no ## Core Memory to anchor to', () => {
+    const merged = mergeRootIndexMap('# Memory Index\n\nJust a title.\n', TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged).toContain('Just a title.');
+    expect(merged).toContain('## Map');
+    expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
     expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
   });
 
@@ -348,10 +446,12 @@ describe('merge does not eat hand-written content', () => {
     // inside the section — the managed links land after them, not wedged in
     // between the fence and its contents.
     expect(merged).toContain('```sh\n## Map\ngrep -r "index.md"\n```');
-    expect(lines.indexOf('- [Definition](system/definition.md) - how this works')).toBeLessThan(
-      lines.indexOf('- [People](people/index.md) - 2 consolidated concepts'),
-    );
+    // The fence stays whole and above the managed block, which leads the list.
+    expect(merged.indexOf('```sh')).toBeLessThan(merged.indexOf('- [People](people/index.md)'));
     expect(lines.indexOf('- [People](people/index.md) - 2 consolidated concepts')).toBeLessThan(
+      lines.indexOf('- [Definition](system/definition.md) - how this works'),
+    );
+    expect(lines.indexOf('- [Definition](system/definition.md) - how this works')).toBeLessThan(
       lines.indexOf('## Later'),
     );
     expect(merged).toContain('Untouched.');
@@ -370,10 +470,11 @@ describe('merge does not eat hand-written content', () => {
     ].join('\n');
     const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
     const lines = merged.split('\n');
-    expect(lines.indexOf('- [Definition](system/definition.md) - how this works')).toBeLessThan(
-      lines.indexOf('- [People](people/index.md) - 2 consolidated concepts'),
+    expect(lines.indexOf('- [People](people/index.md) - 2 consolidated concepts')).toBeLessThan(
+      lines.indexOf('- [Definition](system/definition.md) - how this works'),
     );
     expect(merged).toContain('### Example subsection');
+    expect(merged.indexOf('### Example subsection')).toBeLessThan(merged.indexOf('- [People](people/index.md)'));
   });
 });
 

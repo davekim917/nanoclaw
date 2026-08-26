@@ -37,6 +37,7 @@ import {
   TOPIC_FILE_PATH_PATTERN,
 } from '../src/modules/memory/curator-contract.js';
 import { readMemoryTopicFile, syncMemoryIndexes, writeMemoryTopicFile } from '../src/modules/memory/curator-write.js';
+import { PRE_TURN_BOUNDS } from '../src/modules/memory/pre-turn-context.js';
 import { workgroupMemoryDir } from '../src/modules/workgroup/shared-dirs.js';
 
 /** Usage errors are for a human at a terminal: one line, exit 2, no stack. */
@@ -147,6 +148,23 @@ for (const workgroupId of targets) {
       failed += 1;
     }
   }
+  // The agent reads index.md HEAD-first under a hard bound, so a folder pointer
+  // past that offset is on disk, correct, and invisible. Measured on the
+  // CURATOR'S OWN LINKS, not on the `## Map` heading: the heading being inside
+  // the bound proves nothing when the section above the links is long enough
+  // (madison-reed: heading at byte 1,881, links previously at 4,308). Report it
+  // and let the operator decide — trimming what sits above is their editorial
+  // call, not a background job's.
+  const rootIndex = readMemoryTopicFile(workgroupId, 'index.md').content;
+  const pointerOffset = Math.max(...TOPIC_DIRECTORIES.map((d) => rootIndex.indexOf(`](${d}/index.md)`)));
+  if (pointerOffset > PRE_TURN_BOUNDS.markdownCoreChars) {
+    console.log(
+      `  NOTICE ${workgroupId}: the folder-index links sit at byte ${pointerOffset}, past the ` +
+        `${PRE_TURN_BOUNDS.markdownCoreChars}-byte index head the agent reads — the map is correct on disk ` +
+        `but the agent never sees it. Shorten what sits above them in index.md.`,
+    );
+  }
+
   try {
     const sync = await syncMemoryIndexes(workgroupId, { dryRun: !apply });
     if (sync.updated.length > 0) {
