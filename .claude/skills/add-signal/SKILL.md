@@ -26,7 +26,9 @@ command -v signal-cli >/dev/null 2>&1 || bash setup/install-signal-cli.sh
 ### 2. Copy the adapter and its registration test
 
 Fetch the `channels` branch and copy the Signal adapter and its registration test
-into `src/channels/` (overwrite — the branch is canonical):
+into `src/channels/` (overwrite — the branch is canonical). The Signal adapter
+lives on `upstream`'s `channels` branch — `origin`'s copy of that branch doesn't
+carry it yet, so resolve the remote to `upstream`, not `origin`:
 
 ```nc:copy from-branch:channels
 src/channels/signal.ts
