@@ -610,18 +610,25 @@ function safeReaddirDirents(root: string): fs.Dirent[] {
 
 const SESSION_ACTIVITY_FILES = ['inbound.db', 'outbound.db', 'archive.db', 'central.db', '.heartbeat'] as const;
 
-// inbound.db is excluded from the long-horizon age signal. Session DBs carry a
-// lazy on-open schema migration (`migrateMessagesInTable`), so one new inbound
+// inbound.db is excluded from BOTH idle gates. Session DBs carry a lazy
+// on-open schema migration (`migrateMessagesInTable`), so one new inbound
 // column rewrites every inbound.db in the fleet: on 2026-08-15 20:21-20:22 UTC
-// it rewrote 5,027 of them in two minutes, resetting the whole fleet's mtime
-// clock and hiding 2,725 genuinely 14-day-idle sessions behind a four-day-old
-// mtime. The age gate had been dead ever since and would die again on the next
-// inbound migration. Dropping it loses nothing: the host writes inbound.db and
+// it rewrote 5,027 of them in two minutes, and again on 2026-08-25 16:34-16:35
+// UTC it rewrote 2,167 of 2,404, resetting the whole fleet's mtime clock each
+// time. Dropping it loses nothing: the host writes inbound.db and
 // `sessions.last_active` in the same path, so the central row already carries
-// every real inbound event. The other files stay in — they are container- and
-// host-written and can legitimately outrun the central row — and the full set
-// still drives the 24h freshness gate and the pre-apply revalidation, where a
-// too-new reading is harmless.
+// every real inbound event, and `sessionHasOpenWork` independently refuses any
+// session holding an unconsumed inbound row. The other files stay in — they
+// are container- and host-written and can legitimately outrun the central row.
+//
+// The 2026-08-15 fix narrowed only the long-horizon reclaim age and left the
+// 24h freshness gate on the full set, reasoning that a too-new reading there
+// was harmless. It is not: a fleet-wide rewrite makes every session look fresh
+// and stalls the reaper entirely (328 sessions on 2026-08-25, 103 on 08-26,
+// against ~1,300/day before). Both gates now read this list. The full set is
+// still correct for the PRE-APPLY revalidation, which only asks "did anything
+// at all touch this directory since planning" and where a too-new reading
+// genuinely is harmless — it aborts one action, not the pass.
 const SESSION_AGE_SIGNAL_FILES = SESSION_ACTIVITY_FILES.filter((name) => name !== 'inbound.db');
 
 function sessionLastActivityMs(sessPath: string, names: readonly string[] = SESSION_ACTIVITY_FILES): number {
@@ -1390,7 +1397,19 @@ function collectSessionCacheActions(args: {
         args.skipped.noActivitySessions += 1;
         continue;
       }
-      if (args.now - lastActivity < args.policy.idleArtifactMs) {
+      // A dir with only inbound.db (created, never woken) has no narrowed
+      // signal at all; fall back to the full reading rather than reading 0 as
+      // "infinitely old".
+      const ageSignal = sessionLastActivityMs(sessPath, SESSION_AGE_SIGNAL_FILES) || lastActivity;
+      // The 24h gate reads the age signal, NOT the full activity set. A lazy
+      // inbound.db schema migration rewrites the whole fleet's inbound files
+      // in minutes, and against the full set that reads as fleet-wide
+      // freshness and stalls the reaper for a day. Nothing is lost by
+      // excluding inbound here: sessionHasOpenWork() above already refuses any
+      // session with an unconsumed inbound row, and the pre-apply
+      // revalidation still compares the FULL set, so a real inbound write
+      // between planning and applying still aborts the archive.
+      if (args.now - ageSignal < args.policy.idleArtifactMs) {
         args.skipped.freshSessions += 1;
         continue;
       }
@@ -1404,10 +1423,6 @@ function collectSessionCacheActions(args: {
         cacheOnly.push({ groupName: groupDirent.name, sessionId, sessPath });
         continue;
       }
-      // A dir with only inbound.db (created, never woken) has no narrowed
-      // signal at all; fall back to the full reading rather than reading 0 as
-      // "infinitely old".
-      const ageSignal = sessionLastActivityMs(sessPath, SESSION_AGE_SIGNAL_FILES) || lastActivity;
       const dbActivityMs = row ? parseSqliteUtc(row.last_activity ?? '') : NaN;
       const newestActivity = Number.isFinite(dbActivityMs) ? Math.max(ageSignal, dbActivityMs) : ageSignal;
       candidates.push({

@@ -670,6 +670,38 @@ describe('storage-manager session open-work blockers', () => {
     expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
     expect(fs.existsSync(dir)).toBe(false);
   });
+
+  // A lazy inbound.db schema migration rewrites the whole fleet's inbound
+  // files at once (2026-08-15, again 2026-08-25). While the 24h freshness gate
+  // read inbound.db, that single event made every session look fresh and
+  // stalled the reaper for a day. Both idle gates now read the age signal.
+  it('archives a session whose inbound.db was just rewritten but whose age signals are stale', () => {
+    const dir = seed('sess-migrated-inbound', { workContinuation: '' });
+    const justNow = now / 1000;
+    fs.utimesSync(path.join(dir, 'inbound.db'), justNow, justNow);
+    expect(fs.statSync(path.join(dir, 'outbound.db')).mtimeMs).toBeLessThan(now - 30 * DAY);
+
+    const report = runApply();
+
+    expect(report.skipped.freshSessions).toBe(0);
+    expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  // The other half of the same rule: inbound is dropped from the idle gates
+  // because a migration rewrites it, NOT because inbound activity stopped
+  // counting. A real unconsumed row still blocks, even at the same mtime.
+  it('still blocks a freshly rewritten inbound.db that carries a pending row', () => {
+    const dir = seed('sess-migrated-pending', { pending: [{ status: 'pending', trigger: 1 }] });
+    const justNow = now / 1000;
+    fs.utimesSync(path.join(dir, 'inbound.db'), justNow, justNow);
+
+    const report = runApply();
+
+    expect(report.actions.filter((a) => a.kind === 'archive-session')).toEqual([]);
+    expect(report.skipped.busySessions).toBe(1);
+    expect(fs.existsSync(dir)).toBe(true);
+  });
 });
 
 // T2b (SR2b) — the archival lifecycle is crash-safe and re-validates inside apply.
