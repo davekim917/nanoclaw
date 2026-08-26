@@ -191,6 +191,21 @@ describe('runHostGatedTaskScripts', () => {
   });
 });
 
+/** True once `pid` is gone. Polls, because a just-SIGKILLed process is briefly
+ *  a zombie and still answers `kill(pid, 0)` until Node reaps it (~100ms). */
+async function gone(pid: number, withinMs = 2_000): Promise<boolean> {
+  const until = Date.now() + withinMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    if (Date.now() >= until) return false;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
 describe('runHostScript hard deadline', () => {
   // REGRESSION GUARD. The predecessor of this test ran a script whose
   // GRANDCHILD outlived bash and asserted only `result === null` and
@@ -247,17 +262,45 @@ describe('runHostScript hard deadline', () => {
       // keeps the assertion portable — no /proc — without racing the reap.
       // A SIGTERM-only kill would leave it genuinely alive for the full 2s,
       // because the script traps TERM.
-      const deadline = Date.now() + 2_000;
-      let alive = true;
-      while (alive && Date.now() < deadline) {
-        try {
-          process.kill(childPid, 0);
-          await new Promise((r) => setTimeout(r, 25));
-        } catch {
-          alive = false;
-        }
-      }
-      expect(alive).toBe(false);
+      expect(await gone(childPid)).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  // THE POINT OF spawn() + detached. Killing bash does not kill what bash
+  // started: a `gh api` fan-out or a `capped-check.sh` run is a GRANDCHILD, and
+  // signalling the direct child alone orphans it. Before this change the code
+  // tried `process.kill(-child.pid)` while passing `detached` to execFile,
+  // which silently drops it — so the child was never a group leader, that call
+  // only ever threw ESRCH, and every descendant survived. Verified at the time:
+  // a grandchild outlived the kill and completed its side effect 6s later.
+  //
+  // The grandchild here is deliberately NOT `timeout`-wrapped. Nothing in
+  // classifyForHostExecution requires scripts to bound their own children, and
+  // they are agent-authored, so descendant cleanup must not rest on that.
+  it('kills GRANDCHILDREN too, not just the direct child', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '1000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      fs.mkdirSync(TEST_DIR, { recursive: true });
+      const gcPid = path.join(TEST_DIR, 'grandchild.pid');
+      const gcMarker = path.join(TEST_DIR, 'grandchild.marker');
+
+      // Backgrounded grandchild records its pid, then tries to write a marker
+      // well after the deadline. bash traps TERM so only the group SIGKILL can
+      // stop the pair.
+      await runHostScript(
+        `trap '' TERM\n( echo $BASHPID > ${gcPid}; sleep 40; touch ${gcMarker} ) &\nsleep 60\n`,
+        'grandchild-test',
+      );
+
+      const grandchildPid = Number(fs.readFileSync(gcPid, 'utf8').trim());
+      expect(Number.isInteger(grandchildPid)).toBe(true);
+      expect(await gone(grandchildPid)).toBe(true);
+      // Belt and braces: it never got far enough to run its side effect.
+      expect(fs.existsSync(gcMarker)).toBe(false);
     } finally {
       vi.unstubAllEnvs();
     }

@@ -7,7 +7,7 @@
  * (wakeAgent=false) most fires, that is a full container boot paid for
  * nothing. A series that opts in with `content.scriptHost === true` gets its
  * script run HERE instead, before admitDueTaskContexts admits the row — a
- * gated fire then costs one execFile call and no container at all.
+ * gated fire then costs one spawn and no container at all.
  *
  * Output parsing mirrors task-script.ts's runScript (same buffer cap, same
  * last-stdout-line JSON {wakeAgent, data} contract) so a script's RESULT is
@@ -20,7 +20,7 @@
  * across every session on the fleet, so nothing here runs unclassified. See
  * `classifyForHostExecution` below.
  */
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -129,89 +129,143 @@ export function runHostScript(script: string, taskId: string): Promise<ScriptRes
 
   return new Promise((resolve) => {
     let settled = false;
-    // Hard deadline BEYOND execFile's own timeout, because execFile's timeout
-    // is NOT a bound on every path. It sends `killSignal` (SIGTERM) to the
-    // direct child; a child that ignores SIGTERM never exits, the 'close' the
-    // callback waits on requires that exit, and the promise stays open
-    // forever — taking the whole sequential sweep session loop with it (this
-    // call is awaited inside prepareDueWake). Measured 2026-08-26 on Node
-    // v20.20.1: script `trap '' TERM; sleep 60` with timeout=1000ms had still
-    // not called back at 11500ms with the child ALIVE; a plain SIGKILL to the
-    // direct child resolved it immediately. Reachable in practice via
-    // `trap '' TERM` (classifyForHostExecution does not block it, and these
-    // scripts are agent-authored), an uninterruptible D-state read during the
-    // kill window, or a SIGSTOP'd child.
+    let stdout = '';
+    let stderr = '';
+    let overflowed = false;
+
+    // `spawn` + `detached: true`, NOT execFile. Two reasons, both load-bearing:
     //
-    // SIGKILL, not SIGTERM: untrappable, which is the entire point here.
+    // 1. A SCRIPT CAN OUTLIVE ANY SIGNAL WE SEND ITS DIRECT CHILD. execFile's
+    //    `timeout` sends SIGTERM to bash alone; `trap '' TERM` ignores it, bash
+    //    never exits, and the 'close' the callback waits on never fires — the
+    //    promise stays open forever, taking the sequential sweep session loop
+    //    with it (this call is awaited inside prepareDueWake). Measured on Node
+    //    v20.20.1: `trap '' TERM; sleep 60` with a 1000ms timeout had still not
+    //    called back at 11500ms with the child ALIVE. SIGKILL is untrappable,
+    //    which is why the deadline below uses it.
     //
-    // NOTE — deliberately NOT a process-group kill. `execFile` does not accept
-    // `detached` (Node allowlists exactly cwd/env/gid/shell/signal/uid/
-    // windowsHide/windowsVerbatimArguments when it calls spawn), so the child
-    // is never a group leader and `process.kill(-child.pid, ...)` only ever
-    // threw ESRCH. Do NOT "fix" that by passing the child's real PGID: the
-    // child inherits the HOST's process group, so `kill(-pgid)` would SIGKILL
-    // the NanoClaw daemon itself (verified: child pid 630842, pgid 630830,
-    // host node pid 630831 in that same group). A real group kill needs
-    // spawn() + detached, and hand-rolled stdout/maxBuffer handling with it —
-    // only worth doing if leaked grandchildren ever actually cost something.
-    // Today every such child is `timeout`-wrapped by its own script.
-    const hardDeadline = setTimeout(() => {
+    // 2. KILLING BASH DOES NOT KILL WHAT BASH STARTED. Signalling only the
+    //    direct child orphans every descendant — a `gh api` fan-out, a
+    //    `capped-check.sh` run. The previous version tried to solve this with
+    //    `process.kill(-child.pid)` while passing `detached` to execFile, which
+    //    SILENTLY DROPS IT (Node allowlists exactly cwd/env/gid/shell/signal/
+    //    uid/windowsHide/windowsVerbatimArguments when execFile calls spawn).
+    //    The child was therefore never a group leader, so that call only ever
+    //    threw ESRCH and the group kill never once ran.
+    //
+    //    That failure was load-bearing in the other direction too: WITHOUT
+    //    `detached` the child inherits the HOST's process group, so "fixing"
+    //    the ESRCH by passing the real PGID would have SIGKILLed the NanoClaw
+    //    daemon itself (measured: child pid 630842, pgid 630830, host node pid
+    //    630831 in that same group). `detached: true` is what makes `-pid` both
+    //    correct AND safe: the child becomes its own group leader, so the
+    //    negative-pid kill reaches its descendants and can never reach us.
+    //
+    // The cost of spawn() over execFile() is hand-rolled stdout/stderr
+    // accumulation and the maxBuffer cap below. That is worth paying rather
+    // than resting descendant cleanup on the unenforced assumption that every
+    // agent-authored script wraps its own children in `timeout`.
+    const child = spawn('bash', [scriptPath], {
+      env: minimalEnv(),
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    /** Signal the whole process group; fall back to the child alone. */
+    const killTree = (signal: NodeJS.Signals): void => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal);
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          /* already gone */
+        }
+      }
+    };
+
+    const finish = (result: ScriptResult | null): void => {
       if (settled) return;
       settled = true;
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* already gone */
-      }
+      clearTimeout(softTimeout);
+      clearTimeout(hardDeadline);
       try {
         fs.unlinkSync(scriptPath);
       } catch {
         /* best-effort cleanup */
       }
-      log.warn('Host task-script exceeded hard deadline — SIGKILLed and resolved null', { taskId });
-      resolve(null);
+      resolve(result);
+    };
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      if (stdout.length + chunk.length > SCRIPT_MAX_BUFFER) {
+        overflowed = true;
+        killTree('SIGKILL');
+        return;
+      }
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk: string) => {
+      if (stderr.length + chunk.length > SCRIPT_MAX_BUFFER) {
+        overflowed = true;
+        killTree('SIGKILL');
+        return;
+      }
+      stderr += chunk;
+    });
+
+    // Graceful first, so a script's own EXIT/TERM trap can clean up.
+    const softTimeout = setTimeout(() => killTree('SIGTERM'), SCRIPT_TIMEOUT_MS);
+    // Then the untrappable one, ten seconds later. `finish` is called here and
+    // not left to 'close': a SIGKILL cannot reach a process wedged in
+    // uninterruptible D-state, so the sweep must advance on the timer itself
+    // rather than on the child's exit. The kill is best-effort cleanup; this
+    // resolve is the actual bound.
+    const hardDeadline = setTimeout(() => {
+      killTree('SIGKILL');
+      log.warn('Host task-script exceeded hard deadline — SIGKILLed process group, resolving null', { taskId });
+      finish(null);
     }, SCRIPT_TIMEOUT_MS + 10_000);
-    const child = execFile(
-      'bash',
-      [scriptPath],
-      { timeout: SCRIPT_TIMEOUT_MS, maxBuffer: SCRIPT_MAX_BUFFER, env: minimalEnv(), encoding: 'utf8' },
-      (error, stdout, stderr) => {
-        clearTimeout(hardDeadline);
-        if (settled) return;
-        settled = true;
-        try {
-          fs.unlinkSync(scriptPath);
-        } catch {
-          /* best-effort cleanup */
-        }
 
-        if (stderr) log.debug('Host task-script stderr', { taskId, stderr: stderr.slice(0, 500) });
+    child.on('error', (err) => {
+      log.warn('Host task-script failed to spawn', { taskId, error: err.message });
+      finish(null);
+    });
 
-        if (error) {
-          log.warn('Host task-script error', { taskId, error: error.message });
-          return resolve(null);
-        }
+    child.on('close', (code, signal) => {
+      if (settled) return;
+      if (stderr) log.debug('Host task-script stderr', { taskId, stderr: stderr.slice(0, 500) });
 
-        const lines = stdout.trim().split('\n');
-        const lastLine = lines[lines.length - 1];
-        if (!lastLine) {
-          log.warn('Host task-script produced no output', { taskId });
-          return resolve(null);
-        }
+      if (overflowed) {
+        log.warn('Host task-script exceeded max output buffer', { taskId });
+        return finish(null);
+      }
+      if (code !== 0) {
+        log.warn('Host task-script error', { taskId, code, signal });
+        return finish(null);
+      }
 
-        try {
-          const result = JSON.parse(lastLine);
-          if (typeof result.wakeAgent !== 'boolean') {
-            log.warn('Host task-script output missing wakeAgent boolean', { taskId, lastLine: lastLine.slice(0, 200) });
-            return resolve(null);
-          }
-          resolve(result as ScriptResult);
-        } catch {
-          log.warn('Host task-script output is not valid JSON', { taskId, lastLine: lastLine.slice(0, 200) });
-          resolve(null);
+      const lines = stdout.trim().split('\n');
+      const lastLine = lines[lines.length - 1];
+      if (!lastLine) {
+        log.warn('Host task-script produced no output', { taskId });
+        return finish(null);
+      }
+
+      try {
+        const result = JSON.parse(lastLine);
+        if (typeof result.wakeAgent !== 'boolean') {
+          log.warn('Host task-script output missing wakeAgent boolean', { taskId, lastLine: lastLine.slice(0, 200) });
+          return finish(null);
         }
-      },
-    );
+        finish(result as ScriptResult);
+      } catch {
+        log.warn('Host task-script output is not valid JSON', { taskId, lastLine: lastLine.slice(0, 200) });
+        finish(null);
+      }
+    });
   });
 }
 
