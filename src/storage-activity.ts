@@ -151,40 +151,48 @@ function realDirectory(dirPath: string): boolean {
  * behind after a forced host stop, which then makes every future cache action
  * for that thread safely skip forever.
  */
+/**
+ * Subdirectories of `dir`, or an empty list when it cannot be read.
+ *
+ * Per-directory rather than one try around the whole sweep: a single
+ * unreadable or concurrently-removed entry must cost that entry only. Sharing
+ * one catch meant an ENOENT from a group directory deleted mid-walk abandoned
+ * every group after it, and an abandoned root keeps its stale claim.
+ */
+function subdirectories(dir: string): fs.Dirent[] {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.isSymbolicLink());
+  } catch {
+    return [];
+  }
+}
+
 function resourceRoots(dataDir: string = DATA_DIR): string[] {
   const roots = new Set<string>();
   const sessionsRoot = path.join(dataDir, 'v2-sessions');
-  try {
-    for (const group of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
-      if (!group.isDirectory() || group.isSymbolicLink()) continue;
-      const groupPath = path.join(sessionsRoot, group.name);
-      for (const session of fs.readdirSync(groupPath, { withFileTypes: true })) {
-        if (session.isDirectory() && !session.isSymbolicLink()) roots.add(path.join(groupPath, session.name));
-      }
-    }
-  } catch {
-    // Fresh installs have no session root yet.
+  // Must stay in lockstep with sessionDir() in session-manager.ts:
+  // v2-sessions/<agent_group_id>/<session_id>, exactly two levels. Inbound
+  // message writes take their lease on that path and wait, unbounded, for any
+  // claim there — so a root this misses is a session whose stale claim is
+  // never cleared and whose messages never land.
+  for (const group of subdirectories(sessionsRoot)) {
+    const groupPath = path.join(sessionsRoot, group.name);
+    for (const session of subdirectories(groupPath)) roots.add(path.join(groupPath, session.name));
   }
 
   const threadsRoot = path.join(dataDir, 'v2-threads');
-  try {
-    for (const topLevel of fs.readdirSync(threadsRoot, { withFileTypes: true })) {
-      if (!topLevel.isDirectory() || topLevel.isSymbolicLink()) continue;
-      const topLevelPath = path.join(threadsRoot, topLevel.name);
-      const flatWorktrees = path.join(topLevelPath, 'worktrees');
-      if (realDirectory(flatWorktrees)) {
-        roots.add(flatWorktrees);
-        continue;
-      }
-
-      for (const thread of fs.readdirSync(topLevelPath, { withFileTypes: true })) {
-        if (!thread.isDirectory() || thread.isSymbolicLink()) continue;
-        const nestedWorktrees = path.join(topLevelPath, thread.name, 'worktrees');
-        if (realDirectory(nestedWorktrees)) roots.add(nestedWorktrees);
-      }
+  for (const topLevel of subdirectories(threadsRoot)) {
+    const topLevelPath = path.join(threadsRoot, topLevel.name);
+    const flatWorktrees = path.join(topLevelPath, 'worktrees');
+    if (realDirectory(flatWorktrees)) {
+      roots.add(flatWorktrees);
+      continue;
     }
-  } catch {
-    // Thread worktrees are optional.
+
+    for (const thread of subdirectories(topLevelPath)) {
+      const nestedWorktrees = path.join(topLevelPath, thread.name, 'worktrees');
+      if (realDirectory(nestedWorktrees)) roots.add(nestedWorktrees);
+    }
   }
   return [...roots];
 }
