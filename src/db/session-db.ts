@@ -55,17 +55,23 @@ export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): vo
  */
 export function openInboundDb(dbPath: string): Database.Database {
   const release = plantStorageActivityMarker(path.dirname(dbPath), 'inbound-open');
-  let db: Database.Database;
+  let db: Database.Database | undefined;
   try {
     db = new Database(dbPath);
     db.pragma('journal_mode = DELETE');
     db.pragma('busy_timeout = 5000');
   } catch (err) {
+    // A pragma can throw after the handle exists, so close what was created
+    // before releasing — otherwise the FD outlives the marker.
+    db?.close();
     release();
     throw err;
   }
   // ponytail: patching close() beats a wrapper type — every existing caller
-  // already closes, and a new return type would touch all ~20 of them.
+  // already closes, and a new return type would touch all ~20 of them. Known
+  // ceiling: better-sqlite3 refuses close() while an iterator is open, which
+  // would throw before the marker is released. No non-test caller iterates an
+  // inbound handle today; revisit with an explicit release if one appears.
   const close = db.close.bind(db);
   db.close = function releasingClose(this: Database.Database): Database.Database {
     try {
@@ -993,8 +999,9 @@ export function getMostRecentPeerSourceSessionId(db: Database.Database, peerAgen
 export function sessionInboundHasMessage(agentGroupId: string, sessionId: string, messageId: string): boolean {
   const dbPath = path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
   if (!fs.existsSync(dbPath)) return false;
-  const db = new Database(dbPath);
-  db.pragma('journal_mode = DELETE');
+  // Read-only: this only ever runs one SELECT, and a writable open would take
+  // a hot-journal rollback write on a session the reclaim may be archiving.
+  const db = new Database(dbPath, { readonly: true });
   db.pragma('busy_timeout = 5000');
   try {
     const row = db.prepare('SELECT 1 FROM messages_in WHERE id = ? LIMIT 1').get(messageId);
