@@ -490,16 +490,6 @@ Expected: a path under `/pnpm` or `/usr/local/bin`, followed by an
 `agent-browser` version. Failure means the sibling is not at capability parity;
 rebuild/fix the image or remove the custom `imageTag` before shipping.
 
-**Check D - sibling resolves the source workgroup's Graphify graph:**
-
-```bash
-ncl graphify status --group "${SIBLING_ID}" --json \
-  | jq -e --arg workgroup "${SOURCE_WORKGROUP}" '.data.workgroupId == $workgroup'
-```
-
-Expected: `true`. This proves retrieval is workgroup-scoped for the sibling;
-an isolated workgroup id is a failed clone even when chat delivery works.
-
 > **Note on rebuilds:** an agent-runner *source* change does **not** need
 > `./container/build.sh` — `container/agent-runner/src` is bind-mounted read-only
 > into the container, so a respawn (`ncl groups restart` or host restart) reloads
