@@ -92,6 +92,18 @@ export interface CuratorWriteResult {
   relative_path: string;
   sha256?: string;
   error?: string;
+  /**
+   * Set only on a rejection that is a property of THIS path and THIS content,
+   * so retrying the identical inputs can never succeed — a disallowed path, a
+   * file the curator does not own, an over-cap document. Those are the ones a
+   * caller may drop and move on from.
+   *
+   * ABSENT MEANS UNKNOWN, and unknown must be treated as retryable: a lock
+   * timeout, ENOSPC, a SIGKILLed helper and an ordinary I/O error all arrive
+   * as a bare `status: 'error'` with nothing to distinguish them. Dropping
+   * those loses the facts behind them permanently.
+   */
+  permanent?: boolean;
 }
 
 export function resolveBunBinary(env: NodeJS.ProcessEnv = process.env): string {
@@ -248,14 +260,19 @@ export async function writeMemoryTopicFile(
   factsCount: number,
 ): Promise<CuratorWriteResult> {
   if (!TOPIC_FILE_PATH_PATTERN.test(relativePath) || RESERVED_TOPIC_LEAVES.has(relativePath.split('/')[1] ?? '')) {
-    return { status: 'error', relative_path: relativePath, error: 'topic file path is not allowed' };
+    return { status: 'error', relative_path: relativePath, error: 'topic file path is not allowed', permanent: true };
   }
   // Read before creating anything: a rejected write must not leave an empty
   // topic directory behind. readMemoryTopicFile treats a missing parent as
   // ENOENT, same as a missing file.
   const current = readMemoryTopicFile(workgroupId, relativePath);
   if (current.sha256 !== null && !isCuratorOwned(current.content)) {
-    return { status: 'error', relative_path: relativePath, error: 'topic file is not owned by consolidation' };
+    return {
+      status: 'error',
+      relative_path: relativePath,
+      error: 'topic file is not owned by consolidation',
+      permanent: true,
+    };
   }
   // Serialized against the file actually on disk, so the size check measures
   // the real bytes — including any frontmatter key an operator or agent added
@@ -266,6 +283,7 @@ export async function writeMemoryTopicFile(
       status: 'error',
       relative_path: relativePath,
       error: `topic file exceeds ${CONSOLIDATION_FILE_MAX_BYTES} bytes`,
+      permanent: true,
     };
   }
   ensureMemorySubdirectory(workgroupId, relativePath);
@@ -453,13 +471,14 @@ export async function writeMemoryIndexFile(
   expectedSha256: string | null,
 ): Promise<CuratorWriteResult> {
   if (!INDEX_PATH_PATTERN.test(relativePath)) {
-    return { status: 'error', relative_path: relativePath, error: 'index file path is not allowed' };
+    return { status: 'error', relative_path: relativePath, error: 'index file path is not allowed', permanent: true };
   }
   if (Buffer.byteLength(content, 'utf8') > MEMORY_INDEX_MAX_BYTES) {
     return {
       status: 'error',
       relative_path: relativePath,
       error: `index file exceeds ${MEMORY_INDEX_MAX_BYTES} bytes`,
+      permanent: true,
     };
   }
   ensureMemorySubdirectory(workgroupId, relativePath);
@@ -479,16 +498,24 @@ const INDEX_WRITE_ATTEMPTS = 3;
  * than retrying the same bytes: the merge is defined against whatever is on
  * disk, so a sibling write that landed in between is merged over, never lost.
  * Returns true when the file changed.
+ *
+ * `merge` is handed the attempt number because re-reading the FILE is only
+ * half of it. The merge is also defined against a directory listing, and a
+ * listing captured before the loop is exactly as stale as the file contents
+ * after a lost race — an agent that created `people/alice.md` and added its
+ * own bullet mid-retry would have that bullet read as pointing at a file that
+ * does not exist, and dropped. Anything derived from disk has to be
+ * re-derived on `attempt > 0`.
  */
 async function updateIndexFile(
   workgroupId: string,
   relativePath: string,
-  merge: (existing: string) => string,
+  merge: (existing: string, attempt: number) => string,
   dryRun = false,
 ): Promise<boolean> {
   for (let attempt = 0; attempt < INDEX_WRITE_ATTEMPTS; attempt += 1) {
     const current = readMemoryTopicFile(workgroupId, relativePath, MEMORY_INDEX_MAX_BYTES);
-    const next = merge(current.content);
+    const next = merge(current.content, attempt);
     if (next === current.content) return false;
     if (dryRun) return true;
     const write = await writeMemoryIndexFile(workgroupId, relativePath, next, current.sha256);
@@ -581,26 +608,38 @@ export async function syncMemoryIndexes(
   const dryRun = options.dryRun === true;
   const updated: string[] = [];
   const rootLinks: IndexLink[] = [];
+  // Folders we DID list and that hold nothing to point at. That, and only
+  // that, licenses removing a folder pointer from the root map — a folder
+  // whose listing failed is skipped here as well as above, so its pointer is
+  // neither re-rendered nor deleted.
+  const retiredPointers: string[] = [];
   for (const directory of TOPIC_DIRECTORIES) {
-    const { present, entries } = listTopicEntries(workgroupId, directory);
+    let listing = listTopicEntries(workgroupId, directory);
     // Listing untrustworthy: leave this folder's index exactly as it is rather
     // than rewriting a map from evidence we do not have.
-    if (present === null) continue;
-    const owned = entries.filter((entry) => isCuratorOwned(entry.content));
+    if (listing.present === null) continue;
+    let owned = listing.entries.filter((entry) => isCuratorOwned(entry.content));
     const indexPath = `${directory}/index.md`;
     const hasIndex = readMemoryTopicFile(workgroupId, indexPath, MEMORY_INDEX_MAX_BYTES).sha256 !== null;
-    if (owned.length === 0 && !hasIndex) continue;
-    const ownedNames = new Set(owned.map((entry) => entry.name));
-    if (
-      await updateIndexFile(
-        workgroupId,
-        indexPath,
-        (existing) => renderFolderIndex(directory, owned, ownedNames, present, existing),
-        dryRun,
-      )
-    ) {
-      updated.push(indexPath);
+    if (owned.length === 0 && !hasIndex) {
+      retiredPointers.push(indexPath);
+      continue;
     }
+    const changed = await updateIndexFile(
+      workgroupId,
+      indexPath,
+      (existing, attempt) => {
+        // Lost a CAS race: somebody wrote this folder between our listing and
+        // our write, so the listing is as stale as the bytes we just re-read.
+        if (attempt > 0) listing = listTopicEntries(workgroupId, directory);
+        const present = listing.present;
+        if (present === null) return existing;
+        owned = listing.entries.filter((entry) => isCuratorOwned(entry.content));
+        return renderFolderIndex(directory, owned, present, existing);
+      },
+      dryRun,
+    );
+    if (changed) updated.push(indexPath);
     rootLinks.push({
       target: indexPath,
       title: titleFromStem(directory),
@@ -615,7 +654,7 @@ export async function syncMemoryIndexes(
     (await updateIndexFile(
       workgroupId,
       'index.md',
-      (existing) => mergeRootIndexMap(existing, TOPIC_DIRECTORIES, rootLinks),
+      (existing) => mergeRootIndexMap(existing, rootLinks, retiredPointers),
       dryRun,
     ))
   ) {

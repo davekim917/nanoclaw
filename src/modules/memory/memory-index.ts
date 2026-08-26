@@ -15,24 +15,36 @@ import { frontmatterValue, stripCuratorMetadata } from './curator-contract.js';
  *
  * What a merge preserves, stated exactly — this is NOT "byte for byte", and
  * saying so cost a review round: headings, frontmatter, other sections,
- * section ordering, fenced blocks, non-indented prose, and hand-written
- * bullets whose target the curator does not claim all survive. Trailing
- * whitespace inside and after the managed section is normalized, and the
- * lines immediately indented under a replaced bullet die with it.
+ * section ordering, fenced blocks, HTML blocks, non-indented prose, and
+ * hand-written bullets whose target the curator does not claim all survive.
+ * Trailing whitespace inside and after the managed section is normalized. The
+ * lines indented under a bullet the curator re-renders MOVE WITH IT, so a
+ * hand-written note keeps the parent it was written under.
  *
- * This is a line-walker, not a Markdown parser. Fenced blocks, HTML comments,
- * and CommonMark's 0-3 space indent rule for a top-level list item are
- * handled, which covers every construct that was destroying content. What is
- * still mishandled, verified by probing rather than assumed — none of these
- * lose content, they duplicate a link or add a second section:
+ * This is a line-walker, not a Markdown parser, and it stays one deliberately:
+ * a real parser is a new dependency and a normalizing round-trip through an
+ * AST would rewrite bytes this module exists to leave alone. It is a merge
+ * over a co-owned file, so its only hard duty is to never destroy a line
+ * somebody else wrote — and every construct below that it does not understand
+ * fails in the duplicate-a-link direction, never the delete-a-line direction.
+ *
+ * EXACTLY what it does not understand, verified by probing rather than
+ * assumed. None of these lose content:
  *
  *   - `> - [X](y.md)` in a blockquote, `* [X](y.md)` with a star marker, a
  *     tab-indented bullet, and a `[X]: y.md` link reference definition are not
  *     claimed, so a second link to the same target is appended beside them;
- *   - a setext `Map\n---` heading is not recognized, so a fresh `## Map`
- *     section is appended at end of file instead of merging into it.
+ *   - a setext `Map\n---` heading is not recognized as the managed heading, so
+ *     a fresh `## Map` section is appended at end of file instead of merging
+ *     into it. A setext heading INSIDE the section is recognized as a section
+ *     boundary, so the managed block is never hoisted across one;
+ *   - an HTML block is anything from a line opening with a tag to the next
+ *     blank line (CommonMark's type-6 rule). A tag-opened block that contains
+ *     a blank line resumes being parsed as Markdown at that point;
+ *   - list numbering, tables, and footnotes are ordinary lines to it.
  *
- * See docs/memory.md.
+ * Write map links as plain `- [Title](target.md)` bullets under an ATX
+ * heading and none of this matters. See docs/memory.md.
  */
 
 /** One rendered map bullet. */
@@ -50,34 +62,50 @@ export interface IndexLink {
  *  a second link to the same target gets appended beside it. */
 const BULLET = /^ {0,3}-\s+\[([^\]]*)\]\(\s*<?([^)>\s]+)>?/;
 
-// A replaced bullet takes NOTHING with it but its own line.
+// A bullet the curator re-renders takes only its own line out of position; the
+// lines indented under it are lifted and re-emitted with it (see `carried`
+// below).
 //
-// There used to be a rule that also deleted the indented lines under it, on
-// the theory that they were its wrapped tail. They are not: a bullet this
-// module renders is single-line by construction — the hook is bounded and has
-// its whitespace collapsed — so the curator has never written a wrapped
-// bullet, and anything indented under one was written by somebody else. The
-// rule deleted a hand-written note, an indented code block, a nested
-// sub-bullet and a blockquote, and kept only the case it was aimed at, which
-// cannot occur. Positive evidence: delete the line we know is ours.
+// There used to be a rule that DELETED those indented lines, on the theory
+// that they were the bullet's wrapped tail. They are not: a bullet this module
+// renders is single-line by construction — the hook is bounded and has its
+// whitespace collapsed — so the curator has never written a wrapped bullet,
+// and anything indented under one was written by somebody else. Leaving them
+// behind is not right either: the managed block moves to the head of the list,
+// so an orphaned note silently becomes a child of whichever bullet ends up
+// above it. Markdown meaning, not just line order, has to survive.
+
+/** A line that opens a CommonMark type-6 HTML block: `<tag`, `</tag`. The
+ *  block runs to the next blank line. */
+const HTML_BLOCK_START = /^ {0,3}<\/?[A-Za-z][A-Za-z0-9-]*(?:[\s/>]|$)/;
 
 /**
- * Which lines sit inside a fenced code block or an HTML comment.
+ * Which lines sit inside a fenced code block, an HTML comment, or an HTML
+ * block.
  *
- * This module walks lines; it is not a Markdown parser. These are the two
+ * This module walks lines; it is not a Markdown parser. These are the
  * constructs it MUST know about, because an index that documents its own
- * format puts a real-looking bullet inside a ``` block or comments one out —
- * and deleting the documentation of the map is the same class of bug as
- * deleting the map. Computed once and consulted by every scan below.
+ * format puts a real-looking bullet inside a ``` block, comments one out, or
+ * wraps one in a `<div>` — and deleting the documentation of the map is the
+ * same class of bug as deleting the map. Computed once and consulted by every
+ * scan below.
  */
 function fencedLines(lines: readonly string[]): boolean[] {
   const inside: boolean[] = [];
   let fence: string | null = null;
   let comment = false;
+  let html = false;
   for (const line of lines) {
     if (comment) {
       inside.push(true);
       if (line.includes('-->')) comment = false;
+      continue;
+    }
+    if (html) {
+      // CommonMark: a type-6 HTML block ends at the first blank line, and the
+      // blank line itself is not part of it.
+      html = line.trim() !== '';
+      inside.push(html);
       continue;
     }
     const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
@@ -85,6 +113,11 @@ function fencedLines(lines: readonly string[]): boolean[] {
       if (/^ {0,3}<!--/.test(line)) {
         inside.push(true);
         comment = !line.includes('-->');
+        continue;
+      }
+      if (HTML_BLOCK_START.test(line)) {
+        inside.push(true);
+        html = true;
         continue;
       }
       inside.push(marker !== undefined);
@@ -95,6 +128,30 @@ function fencedLines(lines: readonly string[]): boolean[] {
     }
   }
   return inside;
+}
+
+/**
+ * THE DELETION RULE, in one place.
+ *
+ * A managed bullet may be removed only when it is being RE-RENDERED, or when
+ * `absent` carries positive evidence its target is gone from disk. "Missing
+ * from the list we just built" is never evidence: the list can be short
+ * because a `readdir` failed, because a read failed, because a name was
+ * filtered out, or because a whole folder was skipped.
+ *
+ * Four shipped bugs had exactly that shape — `presentNames` built from
+ * successful reads, an empty listing read as an emptied folder, `log.md`
+ * filtered out of the listing, and the root merge claiming a pointer for a
+ * folder it never listed. Each was patched where it was found; the fifth is
+ * what this function exists to prevent. Every caller states its evidence for
+ * absence, or supplies none and deletes nothing.
+ */
+export function managedTargets(
+  rendered: readonly IndexLink[],
+  absent: (target: string) => boolean,
+): (target: string) => boolean {
+  const targets = new Set(rendered.map((link) => link.target));
+  return (target) => targets.has(target) || absent(target);
 }
 
 /**
@@ -124,12 +181,28 @@ export function mergeManagedLinks(
   let fenced = fencedLines(lines);
   const headingAt = (text: string): number =>
     lines.findIndex((line, index) => !fenced[index] && line.trimEnd() === text);
+  /**
+   * The level of the setext heading whose underline is at `index`, i.e. the
+   * heading formed by the line ABOVE it. Recognized so the managed block is
+   * never hoisted across a heading the walker would otherwise not see as one.
+   * A `---` after a blank line, a list item or an ATX heading is a thematic
+   * break, not an underline.
+   */
+  const setextLevelAt = (index: number): number | null => {
+    const underline = /^ {0,3}(=+|-+)[ \t]*$/.exec(lines[index]!);
+    const above = index > 0 ? lines[index - 1]! : '';
+    if (!underline || fenced[index] === true || fenced[index - 1] === true) return null;
+    if (above.trim() === '' || /^ {0,3}(?:#|[-*+>]\s|\d+[.)]\s)/.test(above)) return null;
+    return underline[1]!.startsWith('=') ? 1 : 2;
+  };
   /** End of the section `text` opens: the next heading at its level or above. */
   const sectionEnd = (at: number, atLevel: number): number => {
     for (let index = at + 1; index < lines.length; index += 1) {
       if (fenced[index]) continue;
       const match = /^(#+)\s/.exec(lines[index]!);
       if (match && match[1]!.length <= atLevel) return index;
+      const setext = setextLevelAt(index);
+      if (setext !== null && setext <= atLevel && index - 1 > at) return index - 1;
     }
     return lines.length;
   };
@@ -168,19 +241,45 @@ export function mergeManagedLinks(
   // three spaces in. Without this, a hand-written sub-bullet under someone
   // else's link is read as top-level and replaced.
   let listOpen = false;
+  // Lines indented under a bullet we are re-rendering, keyed by its target.
+  // They are somebody else's prose and they are ABOUT that entry, so they move
+  // with it to the head of the list instead of being left behind to be
+  // silently reparented onto whichever bullet ends up above them. Nothing is
+  // carried off a bullet that is being deleted rather than re-rendered — those
+  // lines stay exactly where they are, because losing them would be worse than
+  // reparenting them.
+  const rerendered = new Set(links.map((link) => link.target));
+  const carried = new Map<string, string[]>();
+  let carryTo: string | null = null;
   for (let index = start + 1; index < end; index += 1) {
     const line = lines[index]!;
     if (!fenced[index] && line.trim() !== '') {
       const match = BULLET.exec(line);
       const nested = match !== null && line.startsWith(' ') && listOpen;
+      const indented = /^[ \t]+\S/.test(line);
       if (match && !nested) {
         listOpen = true;
-        if (owns(match[2]!)) continue;
+        if (owns(match[2]!)) {
+          carryTo = rerendered.has(match[2]!) ? match[2]! : null;
+          continue;
+        }
+        carryTo = null;
         if (firstBulletAt < 0) firstBulletAt = kept.length;
+      } else if (carryTo !== null && indented) {
+        const lines_ = carried.get(carryTo) ?? [];
+        lines_.push(line);
+        carried.set(carryTo, lines_);
+        continue;
       } else {
-        listOpen = match !== null || /^[ \t]+\S/.test(line);
+        carryTo = null;
+        listOpen = match !== null || indented;
         if (!listOpen && firstSubheadingAt < 0 && subheading.test(line)) firstSubheadingAt = kept.length;
       }
+    } else {
+      // A blank line, or a line inside a fence, ends the carry — same rule
+      // that stopped the old deletion reaching across a blank into someone
+      // else's prose.
+      carryTo = null;
     }
     kept.push(line);
   }
@@ -194,7 +293,7 @@ export function mergeManagedLinks(
 
   // AT THE HEAD of the section's own bullet list, after any leading prose.
   //
-  // Placing the section high is not enough on its own: madison-reed's `## Map`
+  // Placing the section high is not enough on its own: the busiest live workgroup's `## Map`
   // already starts at byte 1,881 — inside the 2,500-byte head read — but it
   // holds thirteen hand-written bullets, so links appended after them landed
   // at byte 4,308 and the agent never saw them. Leading the list is what makes
@@ -204,7 +303,10 @@ export function mergeManagedLinks(
   // live index carries `### Folders`, `### Corrections` inside `## Map`.
   // Stable across runs because the managed bullets are removed before these
   // indices are computed.
-  const rendered = links.map((link) => `- [${link.title}](${link.target})${link.hook ? ` - ${link.hook}` : ''}`);
+  const rendered = links.flatMap((link) => [
+    `- [${link.title}](${link.target})${link.hook ? ` - ${link.hook}` : ''}`,
+    ...(carried.get(link.target) ?? []),
+  ]);
   let insertAt = firstBulletAt;
   if (insertAt < 0) {
     insertAt = firstSubheadingAt < 0 ? kept.length : firstSubheadingAt;
@@ -268,24 +370,28 @@ export function hookFromContent(content: string, maxChars: number): string {
 export const INDEX_HOOK_MAX_CHARS = 120;
 
 export interface TopicIndexEntry {
-  /** File name within the topic folder, e.g. `james.md`. */
+  /** File name within the topic folder, e.g. `mira.md`. */
   name: string;
   content: string;
 }
+
+/** A flat topic-file leaf, the only thing a folder index can claim. */
+const TOPIC_LEAF = /^[a-z0-9][a-z0-9-]*\.md$/;
 
 /**
  * Render one topic folder's `index.md`, merging into whatever is already
  * there. Curator-owned bullets are replaced; a hand-written bullet pointing
  * at a human-authored file in the same folder is kept, and so is any prose.
  *
- * `owned` names the files this curator owns right now. A bullet pointing at a
- * flat `.md` that is neither in `owned` nor still on disk is dropped too —
- * that is how a deleted topic file leaves the map.
+ * `entries` are the curator-owned files as read this pass — the bullets that
+ * get re-rendered. `presentNames` is the folder's OBSERVED listing, and the
+ * only licence to delete: a bullet pointing at a topic leaf that the listing
+ * proves is gone loses its link, which is how a deleted topic file leaves the
+ * map. Everything else stays. See `managedTargets`.
  */
 export function renderFolderIndex(
   directory: string,
   entries: readonly TopicIndexEntry[],
-  ownedNames: ReadonlySet<string>,
   presentNames: ReadonlySet<string>,
   existing: string,
 ): string {
@@ -303,15 +409,8 @@ export function renderFolderIndex(
     title: frontmatterValue(entry.content, 'title') ?? titleFromStem(entry.name.replace(/\.md$/, '')),
     hook: frontmatterValue(entry.content, 'description') ?? hookFromContent(entry.content, INDEX_HOOK_MAX_CHARS),
   }));
-  const owns = (target: string): boolean =>
-    /^[a-z0-9][a-z0-9-]*\.md$/.test(target) && (ownedNames.has(target) || !presentNames.has(target));
+  const owns = managedTargets(links, (target) => TOPIC_LEAF.test(target) && !presentNames.has(target));
   return mergeManagedLinks(existing, heading, owns, links);
-}
-
-/** Root-index Map bullets the curator owns: the topic-folder indexes, nothing else. */
-export function rootIndexOwns(topicDirectories: readonly string[]): (target: string) => boolean {
-  const managed = new Set(topicDirectories.map((directory) => `${directory}/index.md`));
-  return (target) => managed.has(target);
 }
 
 /**
@@ -331,11 +430,25 @@ export function rootIndexOwns(topicDirectories: readonly string[]): (target: str
  * read. An existing one is left exactly where it is — a human may have put it
  * there deliberately. `okf_version`, Core Memory and every other section are
  * untouched either way.
+ *
+ * `links` are the pointers to re-render. `retired` is the ONLY licence to
+ * delete one: a folder the caller listed successfully and found nothing to
+ * point at. The static list of topic directories used to stand in for that,
+ * which deleted the People pointer whenever `people/` failed to list while
+ * `domain/` succeeded — a folder that was skipped is not a folder that is
+ * gone. See `managedTargets`.
  */
 export function mergeRootIndexMap(
   existing: string,
-  topicDirectories: readonly string[],
   links: readonly IndexLink[],
+  retired: readonly string[] = [],
 ): string {
-  return mergeManagedLinks(existing, '## Map', rootIndexOwns(topicDirectories), links, '## Core Memory');
+  const gone = new Set(retired);
+  return mergeManagedLinks(
+    existing,
+    '## Map',
+    managedTargets(links, (target) => gone.has(target)),
+    links,
+    '## Core Memory',
+  );
 }

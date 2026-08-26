@@ -918,18 +918,26 @@ export class MemoryCuratorWorker {
           written += 1;
           continue;
         }
-        // A `conflict` is transient — someone else wrote the file, and a retry
-        // sees different bytes — so it still throws. An `error` is a
-        // deterministic property of this path and this content (bad path,
-        // reserved leaf, not owned, or over CONSOLIDATION_FILE_MAX_BYTES once
-        // the existing file's own frontmatter is carried forward, which the
-        // batch check cannot see). Throwing on that re-presented the identical
-        // tail to the identical model on every retry, forever, with no
-        // feedback that could change the outcome: a non-terminating loop at
-        // 6h a cycle. Partition it out exactly like every other per-file
-        // rejection and let the rest of the batch land.
-        if (write.status === 'conflict') {
-          throw new Error(`memory topic write conflict: ${write.error ?? 'unknown'}`);
+        // TRANSIENT vs PERMANENT, and the difference is the facts.
+        //
+        // Partitioning a rejection out marks its facts consolidated, so they
+        // are gone from the tail for good. That is the right trade only when
+        // retrying could not possibly succeed: a disallowed path, a file the
+        // curator does not own, a document over
+        // CONSOLIDATION_FILE_MAX_BYTES once the existing file's own
+        // frontmatter is carried forward. The writer flags exactly those with
+        // `permanent` — throwing on them re-presented the identical tail to
+        // the identical model on every retry, forever, at 6h a cycle.
+        //
+        // Everything else is a bare `error` with no way to tell a lock
+        // timeout from a full disk from a SIGKILLed helper, and all three
+        // succeed on the next pass. Those throw: the tail stays unconsolidated
+        // and the whole pass retries on the maintenance backoff. A permanent
+        // fault that arrives unflagged therefore retries every 6h with a
+        // warn log rather than silently eating memory — the loud failure is
+        // the safe one when facts are on the line.
+        if (write.status === 'conflict' || write.permanent !== true) {
+          throw new Error(`memory topic write ${write.status}: ${write.error ?? 'unknown'}`);
         }
         writeRejections.push({ path: file.path, reason: 'write-rejected', detail: write.error });
       }

@@ -79,10 +79,13 @@ consolidated_facts: 150
 ```
 
 Frontmatter is metadata, not recall text: the ranker sees a file's body plus
-the values of `title` and `description` (which `system/definition.md` gives a
-search role) and no field names at all. Without that, `type: person` on every
-people file made all of them candidates for a generic "person" query. The whole
-file, frontmatter included, is still what gets delivered once a file ranks.
+the values of the three fields `system/definition.md` gives a search role —
+`title`, `description` ("used when scanning indexes and search hits") and
+`tags` ("cross-cutting labels for search and grouping") — and no field names at
+all. `resource` is the fourth optional OKF field and stays out: it is a path or
+a URL, not query text. Without the allowlist, `type: person` on every people
+file made all of them candidates for a generic "person" query. The whole file,
+frontmatter included, is still what gets delivered once a file ranks.
 
 Setting `title:` or `description:` by hand is also how you fix an ugly map
 entry — the curator carries both forward untouched and prefers them over the
@@ -122,19 +125,33 @@ editorial call for a human, not something a background pass does by deletion.
 
 This is a merge, not a regeneration. What survives, stated exactly: headings,
 frontmatter, other sections, section ordering, fenced code blocks, HTML
-comments, non-indented prose, nested sub-bullets, and hand-written Map links to
-files the curator does not own. What does not: trailing whitespace inside and
-after the managed section is normalized, and lines indented directly under a
-link the curator replaces are removed with it.
+comments, HTML blocks, non-indented prose, nested sub-bullets, and hand-written
+Map links to files the curator does not own. Lines indented under a link the
+curator re-renders move WITH it, so a hand-written note keeps the entry it was
+written under rather than becoming a child of whatever ends up above it. The
+only thing that does not survive is trailing whitespace inside and after the
+managed section, which is normalized.
 
-The merge is a line-walker, not a Markdown parser, so a few constructs are read
+A link is only ever removed on positive evidence its target is gone: a folder
+whose listing failed, a file that could not be read, and a name filtered out of
+a listing all keep their links. "Missing from a list we built" is not evidence
+— four separate bugs came from reading it as one, and `managedTargets` in
+`src/modules/memory/memory-index.ts` is where the rule now lives.
+
+The merge is a line-walker, not a Markdown parser, and stays one deliberately:
+a real parser is a dependency, and its normalizing round-trip would rewrite
+bytes this merge exists to leave alone. A few constructs are therefore read
 imprecisely — none of them lose content, they add a duplicate link or a second
 section. A `> - [X](y.md)` in a blockquote, a `* [X](y.md)` star-marker bullet, a
 tab-indented bullet, and a `[X]: y.md` link reference definition are not
 recognized as the curator's, so a second link to the same target appears beside
-them; and a setext `Map` / `---` heading is not recognized as `## Map`, so a
-fresh `## Map` is appended at end of file. CRLF input is normalized to LF. Write map links as ordinary `- [Title](target.md)` bullets under an
-ATX `## Map` heading and none of that applies.
+them; a setext `Map` / `---` heading is not recognized as the managed `## Map`,
+so a fresh one is appended at end of file (a setext heading INSIDE the section
+is recognized as a boundary, so nothing is hoisted across it); an HTML block
+runs from a tag-opening line to the next blank line, per CommonMark, so a blank
+line inside one resumes Markdown parsing. CRLF input is normalized to LF. Write
+map links as ordinary `- [Title](target.md)` bullets under an ATX `## Map`
+heading and none of that applies.
 
 ## Selective background capture
 

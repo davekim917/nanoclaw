@@ -9,7 +9,7 @@
  *
  *   pnpm exec tsx scripts/repair-memory-topic-frontmatter.ts                        # dry run
  *   pnpm exec tsx scripts/repair-memory-topic-frontmatter.ts --apply --backup-dir DIR
- *   … --apply --backup-dir DIR --workgroup illysium
+ *   … --apply --backup-dir DIR --workgroup <workgroup-id>
  *
  * Dry run by default because this rewrites live memory, and the dry run
  * previews EVERYTHING --apply does, index rewrites included — a preview that
@@ -75,12 +75,22 @@ if (apply && backupDir === null) {
  *
  * Never overwritten: re-running --apply into the same directory keeps the
  * first run's snapshot, which is the one that holds the true originals.
+ *
+ * Copied under a staging name and renamed into place, because `cpSync` is not
+ * atomic. A crash or a kill mid-copy leaves a directory that LOOKS like a
+ * snapshot, and the "keep the first one" rule above would then trust it — so
+ * the rerun rewrites live memory against a backup missing whatever the copy
+ * had not reached. The final name only ever appears after the copy returns;
+ * a leftover `.incomplete` is discarded on the next run.
  */
 function snapshot(workgroupId: string): void {
   const target = path.join(backupDir!, workgroupId);
   if (fs.existsSync(target)) return;
+  const staging = `${target}.incomplete`;
+  fs.rmSync(staging, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.cpSync(workgroupMemoryDir(workgroupId), target, { recursive: true });
+  fs.cpSync(workgroupMemoryDir(workgroupId), staging, { recursive: true });
+  fs.renameSync(staging, target);
 }
 
 function workgroupIds(): string[] {
@@ -162,7 +172,7 @@ for (const workgroupId of targets) {
   // past that offset is on disk, correct, and invisible. Measured on the
   // CURATOR'S OWN LINKS, not on the `## Map` heading: the heading being inside
   // the bound proves nothing when the section above the links is long enough
-  // (madison-reed: heading at byte 1,881, links previously at 4,308). Report it
+  // (measured: heading at byte 1,881, links previously at 4,308). Report it
   // and let the operator decide — trimming what sits above is their editorial
   // call, not a background job's.
   const rootIndex = readMemoryTopicFile(workgroupId, 'index.md').content;

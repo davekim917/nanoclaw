@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 
-import { TOPIC_DIRECTORIES } from './curator-contract.js';
 import {
   hookFromContent,
   mergeManagedLinks,
@@ -21,7 +20,7 @@ const HAND_WRITTEN_ROOT = [
   '',
   '## Core Memory',
   '',
-  '- The user is Dave Kim and this agent works on Illysium and XZO.',
+  '- The user is Dana Lee and this agent works on Atlas and Orion.',
   '- **DM contents stay in the DM** — never repeated in a channel.',
   '- Verify real code and runtime state before concluding.',
   '',
@@ -47,20 +46,20 @@ describe('root index.md merge', () => {
   // from curator state would drop the operator's Core Memory, which is a
   // worse bug than the stale map it fixes.
   it('preserves every hand-written line — frontmatter, Core Memory, other sections', () => {
-    const merged = mergeRootIndexMap(HAND_WRITTEN_ROOT, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(HAND_WRITTEN_ROOT, FOLDER_LINKS);
     for (const line of HAND_WRITTEN_ROOT.split('\n')) {
       if (line.trim() === '') continue;
       expect(merged.split('\n')).toContain(line);
     }
     expect(merged).toContain('okf_version: "0.1"');
-    expect(merged).toContain('- The user is Dave Kim and this agent works on Illysium and XZO.');
+    expect(merged).toContain('- The user is Dana Lee and this agent works on Atlas and Orion.');
     expect(merged).toContain('## Methods — canonical note per topic');
     // Core Memory keeps its position ahead of the Map.
     expect(merged.indexOf('## Core Memory')).toBeLessThan(merged.indexOf('## Map'));
   });
 
   it('adds the folder-index links inside ## Map without touching the hand-written links there', () => {
-    const merged = mergeRootIndexMap(HAND_WRITTEN_ROOT, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(HAND_WRITTEN_ROOT, FOLDER_LINKS);
     expect(merged).toContain('- [Memory system definition](system/definition.md) - how this memory works');
     expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
     expect(merged).toContain('- [Domain](domain/index.md) - 5 consolidated concepts');
@@ -71,13 +70,13 @@ describe('root index.md merge', () => {
   });
 
   it('is idempotent: a second merge over unchanged input produces no diff', () => {
-    const once = mergeRootIndexMap(HAND_WRITTEN_ROOT, TOPIC_DIRECTORIES, FOLDER_LINKS);
-    expect(mergeRootIndexMap(once, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(once);
+    const once = mergeRootIndexMap(HAND_WRITTEN_ROOT, FOLDER_LINKS);
+    expect(mergeRootIndexMap(once, FOLDER_LINKS)).toBe(once);
   });
 
   it('replaces a stale folder link rather than stacking a second one', () => {
-    const once = mergeRootIndexMap(HAND_WRITTEN_ROOT, TOPIC_DIRECTORIES, FOLDER_LINKS);
-    const twice = mergeRootIndexMap(once, TOPIC_DIRECTORIES, [
+    const once = mergeRootIndexMap(HAND_WRITTEN_ROOT, FOLDER_LINKS);
+    const twice = mergeRootIndexMap(once, [
       { target: 'people/index.md', title: 'People', hook: '9 consolidated concepts' },
       { target: 'domain/index.md', title: 'Domain', hook: '5 consolidated concepts' },
     ]);
@@ -100,7 +99,7 @@ describe('root index.md merge', () => {
       'Untouched.',
       '',
     ].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     const lines = merged.split('\n');
     // The managed block LEADS the section's own list and never crosses into a
     // sub-heading; the hand-written bullet keeps its place behind it.
@@ -113,7 +112,7 @@ describe('root index.md merge', () => {
     expect(merged).toContain('- [A correction](correction-a.md) - what changed');
     expect(merged).toContain('Untouched.');
     expect(lines[lines.indexOf('### Corrections') - 1]).toBe('');
-    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+    expect(mergeRootIndexMap(merged, FOLDER_LINKS)).toBe(merged);
   });
 
   // F5. Not a budget problem — definition.md's "headlines and pointers here"
@@ -130,22 +129,22 @@ describe('root index.md merge', () => {
       '',
       '## Core Memory',
       '',
-      '- The user is Dave Kim.',
+      '- The user is Dana Lee.',
       '',
       '## Methods',
       '',
       `${'Accumulated prose. '.repeat(200)}`,
       '',
     ].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     const lines = merged.split('\n');
     expect(lines.indexOf('## Core Memory')).toBeLessThan(lines.indexOf('## Map'));
     expect(lines.indexOf('## Map')).toBeLessThan(lines.indexOf('## Methods'));
-    expect(lines.indexOf('- The user is Dave Kim.')).toBeLessThan(lines.indexOf('## Map'));
+    expect(lines.indexOf('- The user is Dana Lee.')).toBeLessThan(lines.indexOf('## Map'));
     // The whole point: inside the 2,500-byte head the agent actually reads.
     expect(merged.indexOf('- [People](people/index.md)')).toBeLessThan(2_500);
     expect(merged).toContain('Accumulated prose.');
-    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+    expect(mergeRootIndexMap(merged, FOLDER_LINKS)).toBe(merged);
   });
 
   it('leads the Map list, so the pointers survive the head read on a long index', () => {
@@ -166,7 +165,7 @@ describe('root index.md merge', () => {
     // The shape that defeated "place the section high": the HEADING is inside
     // the head read, the appended links were not.
     expect(existing.indexOf('## Map')).toBeLessThan(2_500);
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     expect(merged.indexOf('- [People](people/index.md)')).toBeLessThan(2_500);
     const lines = merged.split('\n');
     expect(lines.indexOf('<!-- rebuilt by hand 2026-08-17 -->')).toBeLessThan(
@@ -176,7 +175,7 @@ describe('root index.md merge', () => {
       lines.indexOf(`- [Note 0](reference-0.md) - ${'detail '.repeat(20)}`),
     );
     for (let i = 0; i < 13; i += 1) expect(merged).toContain(`- [Note ${i}](reference-${i}.md)`);
-    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+    expect(mergeRootIndexMap(merged, FOLDER_LINKS)).toBe(merged);
   });
 
   it('never moves a ## Map a human already placed', () => {
@@ -196,7 +195,7 @@ describe('root index.md merge', () => {
       '- [Definition](system/definition.md) - how this works',
       '',
     ].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     const lines = merged.split('\n');
     expect(lines.indexOf('## Methods')).toBeLessThan(lines.indexOf('## Map'));
     expect(merged.match(/^## Map$/gm)).toHaveLength(1);
@@ -204,20 +203,20 @@ describe('root index.md merge', () => {
   });
 
   it('falls back to end of file when there is no ## Core Memory to anchor to', () => {
-    const merged = mergeRootIndexMap('# Memory Index\n\nJust a title.\n', TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap('# Memory Index\n\nJust a title.\n', FOLDER_LINKS);
     expect(merged).toContain('Just a title.');
     expect(merged).toContain('## Map');
     expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
-    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+    expect(mergeRootIndexMap(merged, FOLDER_LINKS)).toBe(merged);
   });
 
   it('creates a ## Map section when the index has none, keeping the rest intact', () => {
     const bare = ['# Memory Index', '', '## Core Memory', '', '- Only this.', ''].join('\n');
-    const merged = mergeRootIndexMap(bare, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(bare, FOLDER_LINKS);
     expect(merged).toContain('- Only this.');
     expect(merged).toContain('## Map');
     expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
-    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+    expect(mergeRootIndexMap(merged, FOLDER_LINKS)).toBe(merged);
   });
 });
 
@@ -227,17 +226,16 @@ describe('folder index rendering', () => {
       name: 'alexis-kim.md',
       content: '---\ntype: person\nconsolidated_facts: 4\n---\n\nAlexis Kim runs intern onboarding.\n',
     },
-    { name: 'james.md', content: '<!-- consolidated: facts=9 -->\nJames owns the XZO release train.\n' },
+    { name: 'mira.md', content: '<!-- consolidated: facts=9 -->\nMira owns the Atlas release train.\n' },
   ];
-  const owned = new Set(['alexis-kim.md', 'james.md']);
-  const present = new Set(['alexis-kim.md', 'james.md', 'roster.md']);
+  const present = new Set(['alexis-kim.md', 'mira.md', 'roster.md']);
 
   it('maps owned files, deriving the hook from the lead line under any header shape', () => {
-    const rendered = renderFolderIndex('people', entries, owned, present, '');
+    const rendered = renderFolderIndex('people', entries, present, '');
     expect(rendered).toContain('# People');
     expect(rendered).toContain('- [Alexis Kim](alexis-kim.md) - Alexis Kim runs intern onboarding.');
     // A file the curator has not rewritten yet still yields a real hook.
-    expect(rendered).toContain('- [James](james.md) - James owns the XZO release train.');
+    expect(rendered).toContain('- [Mira](mira.md) - Mira owns the Atlas release train.');
     expect(rendered).not.toContain('consolidated');
   });
 
@@ -250,22 +248,16 @@ describe('folder index rendering', () => {
       '- [Roster](roster.md) - hand-maintained roster',
       '',
     ].join('\n');
-    const rendered = renderFolderIndex('people', entries, owned, present, existing);
+    const rendered = renderFolderIndex('people', entries, present, existing);
     expect(rendered).toContain('Who we work with.');
     expect(rendered).toContain('- [Roster](roster.md) - hand-maintained roster');
-    expect(rendered).toContain('- [James](james.md) - James owns the XZO release train.');
+    expect(rendered).toContain('- [Mira](mira.md) - Mira owns the Atlas release train.');
   });
 
   it('drops the link for a topic file that no longer exists', () => {
-    const stale = renderFolderIndex('people', entries, owned, present, '');
-    const after = renderFolderIndex(
-      'people',
-      [entries[0]!],
-      new Set(['alexis-kim.md']),
-      new Set(['alexis-kim.md', 'roster.md']),
-      stale,
-    );
-    expect(after).not.toContain('james.md');
+    const stale = renderFolderIndex('people', entries, present, '');
+    const after = renderFolderIndex('people', [entries[0]!], new Set(['alexis-kim.md', 'roster.md']), stale);
+    expect(after).not.toContain('mira.md');
     expect(after).toContain('alexis-kim.md');
   });
 
@@ -273,21 +265,19 @@ describe('folder index rendering', () => {
     const existing = ['# People Directory', '', 'Who we work with.', ''].join('\n');
     const merged = renderFolderIndex(
       'people',
-      [{ name: 'james.md', content: 'James leads the release train.\n' }],
-      new Set(['james.md']),
-      new Set(['james.md']),
+      [{ name: 'mira.md', content: 'Mira leads the release train.\n' }],
+      new Set(['mira.md']),
       existing,
     );
     expect(merged.match(/^# /gm)).toHaveLength(1);
     expect(merged).toContain('# People Directory');
     expect(merged).toContain('Who we work with.');
-    expect(merged).toContain('- [James](james.md) - James leads the release train.');
+    expect(merged).toContain('- [Mira](mira.md) - Mira leads the release train.');
     expect(
       renderFolderIndex(
         'people',
-        [{ name: 'james.md', content: 'James leads the release train.\n' }],
-        new Set(['james.md']),
-        new Set(['james.md']),
+        [{ name: 'mira.md', content: 'Mira leads the release train.\n' }],
+        new Set(['mira.md']),
         merged,
       ),
     ).toBe(merged);
@@ -304,7 +294,6 @@ describe('folder index rendering', () => {
         },
       ],
       new Set(['mmulhern.md']),
-      new Set(['mmulhern.md']),
       '',
     );
     expect(rendered).toContain('- [Michala Mulhern](mmulhern.md) - Former Director, Data & BI');
@@ -312,8 +301,8 @@ describe('folder index rendering', () => {
   });
 
   it('is idempotent over unchanged input', () => {
-    const once = renderFolderIndex('people', entries, owned, present, '');
-    expect(renderFolderIndex('people', entries, owned, present, once)).toBe(once);
+    const once = renderFolderIndex('people', entries, present, '');
+    expect(renderFolderIndex('people', entries, present, once)).toBe(once);
   });
 });
 
@@ -336,10 +325,10 @@ describe('merge does not eat hand-written content', () => {
       '- [Definition](system/definition.md) - how this works',
       '',
     ].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     expect(merged).toContain('```markdown\n- [People](people/index.md) - N consolidated concepts\n```');
     expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
-    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+    expect(mergeRootIndexMap(merged, FOLDER_LINKS)).toBe(merged);
   });
 
   it('handles ~~~ fences and fence markers longer than three characters', () => {
@@ -355,7 +344,7 @@ describe('merge does not eat hand-written content', () => {
       '`````',
       '',
     ].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     expect(merged).toContain('- [People](people/index.md) - tilde-fenced example');
     expect(merged).toContain('- [Domain](domain/index.md) - five-backtick example');
   });
@@ -366,13 +355,13 @@ describe('merge does not eat hand-written content', () => {
       '',
       '- [People](people/index.md) - old hook',
       '',
-      '    NOTE from Dave: people/ is the one folder I curate by hand.',
+      '    NOTE from the operator: people/ is the one folder I curate by hand.',
       '',
       '- [Definition](system/definition.md) - how this works',
       '',
     ].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
-    expect(merged).toContain('    NOTE from Dave: people/ is the one folder I curate by hand.');
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
+    expect(merged).toContain('    NOTE from the operator: people/ is the one folder I curate by hand.');
     expect(merged).toContain('- [Definition](system/definition.md) - how this works');
     expect(merged.match(/\(people\/index\.md\)/g)).toHaveLength(1);
   });
@@ -385,29 +374,26 @@ describe('merge does not eat hand-written content', () => {
   // indented code block, a nested sub-bullet and a blockquote to catch a case
   // that cannot occur.
   it('takes nothing but its own line when it replaces a bullet', () => {
-    const existing = ['# People', '', '- [James](james.md) - old hook', '  a line a human put under it.', ''].join(
-      '\n',
-    );
+    const existing = ['# People', '', '- [Mira](mira.md) - old hook', '  a line a human put under it.', ''].join('\n');
     const merged = renderFolderIndex(
       'people',
-      [{ name: 'james.md', content: 'James owns the XZO release train.\n' }],
-      new Set(['james.md']),
-      new Set(['james.md']),
+      [{ name: 'mira.md', content: 'Mira owns the Atlas release train.\n' }],
+      new Set(['mira.md']),
       existing,
     );
     expect(merged).toContain('  a line a human put under it.');
-    expect(merged).toContain('- [James](james.md) - James owns the XZO release train.');
-    expect(merged.match(/\(james\.md\)/g)).toHaveLength(1);
+    expect(merged).toContain('- [Mira](mira.md) - Mira owns the Atlas release train.');
+    expect(merged.match(/\(mira\.md\)/g)).toHaveLength(1);
   });
 
   it.each([
-    ['an indented note', '  NOTE from Dave: I curate this folder by hand.', 'NOTE from Dave'],
+    ['an indented note', '  NOTE from the operator: I curate this folder by hand.', 'NOTE from the operator'],
     ['an indented code block', '    keep me', 'keep me'],
     ['a nested sub-bullet', '  - [Sub](sub.md) - human sub-entry', 'human sub-entry'],
-    ['a blockquote', '  > quoted note from Dave', 'quoted note from Dave'],
+    ['a blockquote', '  > quoted note from the operator', 'quoted note from the operator'],
   ])('leaves %s directly under a replaced bullet alone', (_label, line, survives) => {
     const existing = ['## Map', '', '- [People](people/index.md) - old', line, ''].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     expect(merged).toContain(survives);
     expect(merged.match(/\(people\/index\.md\)/g)).toHaveLength(1);
   });
@@ -416,16 +402,16 @@ describe('merge does not eat hand-written content', () => {
   // awareness alone still left three constructs that DELETED content.
   it('leaves a bullet in a four-space indented code block alone', () => {
     const existing = ['## Map', '', '    - [People](people/index.md) - example', ''].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     expect(merged).toContain('    - [People](people/index.md) - example');
-    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+    expect(mergeRootIndexMap(merged, FOLDER_LINKS)).toBe(merged);
   });
 
   it('leaves a bullet inside an HTML comment alone', () => {
     const existing = ['## Map', '', '<!--', '- [People](people/index.md) - commented out', '-->', ''].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     expect(merged).toContain('<!--\n- [People](people/index.md) - commented out\n-->');
-    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+    expect(mergeRootIndexMap(merged, FOLDER_LINKS)).toBe(merged);
   });
 
   it('leaves a nested sub-bullet under a hand-written bullet alone', () => {
@@ -436,9 +422,9 @@ describe('merge does not eat hand-written content', () => {
       '  - [People](people/index.md) - nested note',
       '',
     ].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     expect(merged).toContain('  - [People](people/index.md) - nested note');
-    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+    expect(mergeRootIndexMap(merged, FOLDER_LINKS)).toBe(merged);
   });
 
   // The flip side of the nested rule: an indented bullet with no list open
@@ -446,14 +432,14 @@ describe('merge does not eat hand-written content', () => {
   // still be claimed rather than duplicated.
   it('claims a three-space-indented bullet when no list is open above it', () => {
     const existing = ['## Map', '', '   - [People](people/index.md) - old', ''].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     expect(merged.match(/people\/index\.md/g)).toHaveLength(1);
     expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
   });
 
   it('claims a CommonMark angle-bracket destination instead of duplicating the link', () => {
     const existing = ['## Map', '', '- [People](<people/index.md>) - hand-written', ''].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     expect(merged.match(/people\/index\.md/g)).toHaveLength(1);
     expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
   });
@@ -474,7 +460,7 @@ describe('merge does not eat hand-written content', () => {
       'Untouched.',
       '',
     ].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     const lines = merged.split('\n');
     // The whole fenced block, and the real bullet after it, must still be
     // inside the section — the managed links land after them, not wedged in
@@ -502,7 +488,7 @@ describe('merge does not eat hand-written content', () => {
       '- [Definition](system/definition.md) - how this works',
       '',
     ].join('\n');
-    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(existing, FOLDER_LINKS);
     const lines = merged.split('\n');
     expect(lines.indexOf('- [People](people/index.md) - 2 consolidated concepts')).toBeLessThan(
       lines.indexOf('- [Definition](system/definition.md) - how this works'),
@@ -557,5 +543,136 @@ describe('hook and title derivation', () => {
   it('titles a slug without inventing case for identifiers', () => {
     expect(titleFromStem('xzo-961-depletions')).toBe('Xzo 961 Depletions');
     expect(titleFromStem('domain')).toBe('Domain');
+  });
+});
+
+// The fourth instance of one bug: "absent from a derived listing" read as
+// "deleted from disk". `presentNames`, the folder listing and `log.md` were
+// each patched where they were found; this is the same shape at the root
+// merge, and `managedTargets` is the rule those patches should have been.
+describe('deletion requires positive evidence', () => {
+  it('keeps the pointer to a folder that was skipped rather than observed empty', () => {
+    // A healthy pass mapped all three folders. On the next pass people/ fails
+    // to list, so it contributes no link while domain/ and systems/ succeed.
+    // The People pointer must survive: not-listed is not gone.
+    const mapped = mergeRootIndexMap(HAND_WRITTEN_ROOT, FOLDER_LINKS);
+    const merged = mergeRootIndexMap(mapped, [FOLDER_LINKS[1]!, FOLDER_LINKS[2]!]);
+    expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
+    expect(merged).toContain('- [Domain](domain/index.md) - 5 consolidated concepts');
+    expect(merged).toContain('- [Memory system definition](system/definition.md) - how this memory works');
+  });
+
+  // GUARD, not a fix-proof: HEAD deleted every unrendered pointer, so it
+  // passed this too. It is here so the fix cannot over-correct into never
+  // retiring a pointer at all.
+  it('still retires the pointer to a folder the caller observed has nothing to point at', () => {
+    const mapped = mergeRootIndexMap(HAND_WRITTEN_ROOT, FOLDER_LINKS);
+    const retired = mergeRootIndexMap(mapped, [FOLDER_LINKS[1]!, FOLDER_LINKS[2]!], ['people/index.md']);
+    expect(retired).not.toContain('people/index.md');
+    expect(retired).toContain('- [Domain](domain/index.md) - 5 consolidated concepts');
+  });
+});
+
+// The managed block leads the list (F5), so a line indented under a bullet the
+// curator re-renders cannot simply be left where it was: Markdown would file
+// it under whichever bullet ended up above it instead.
+describe('a re-rendered bullet keeps its children', () => {
+  const WITH_CHILD = [
+    '## Map',
+    '',
+    '- [Memory system definition](system/definition.md) - how this memory works',
+    '- [People](people/index.md) - old hook',
+    '    - the operator: people/ is the one folder I curate by hand.',
+    '',
+  ].join('\n');
+
+  it('moves a hand-written sub-bullet with the entry it was written under', () => {
+    const merged = mergeRootIndexMap(WITH_CHILD, [FOLDER_LINKS[0]!]);
+    const lines = merged.split('\n');
+    const peopleAt = lines.findIndex((line) => line.startsWith('- [People]'));
+    expect(lines[peopleAt + 1]).toBe('    - the operator: people/ is the one folder I curate by hand.');
+    // …and the hand-written entry it must NOT have become a child of:
+    expect(merged).toContain('- [Memory system definition](system/definition.md) - how this memory works');
+  });
+
+  it('is idempotent with a carried child', () => {
+    const once = mergeRootIndexMap(WITH_CHILD, [FOLDER_LINKS[0]!]);
+    expect(mergeRootIndexMap(once, [FOLDER_LINKS[0]!])).toBe(once);
+  });
+
+  // GUARD: carrying must never turn into deleting. A bullet being RETIRED is
+  // not re-rendered, so there is nowhere to carry its children to — they stay
+  // exactly where they are, reparented but present.
+  it('leaves the children of a retired bullet in place rather than carrying them into nothing', () => {
+    const merged = mergeRootIndexMap(WITH_CHILD, [FOLDER_LINKS[1]!], ['people/index.md']);
+    expect(merged).not.toContain('](people/index.md)');
+    expect(merged).toContain('    - the operator: people/ is the one folder I curate by hand.');
+  });
+});
+
+// The walker protects fenced blocks and HTML comments. A general HTML block is
+// the same construct with a different delimiter, and a bullet inside one was
+// being deleted outright.
+describe('constructs the line-walker must not parse', () => {
+  it('leaves a bullet inside an HTML block alone', () => {
+    const existing = [
+      '## Map',
+      '',
+      '<div class="callout">',
+      '- [People](people/index.md) - what a folder pointer looks like',
+      '</div>',
+      '',
+      '- [Memory system definition](system/definition.md) - how this memory works',
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, [FOLDER_LINKS[0]!]);
+    expect(merged).toContain('<div class="callout">\n- [People](people/index.md) - what a folder pointer looks like');
+    expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
+    expect(mergeRootIndexMap(merged, [FOLDER_LINKS[0]!])).toBe(merged);
+  });
+
+  it('resumes parsing after the blank line that ends an HTML block', () => {
+    const existing = [
+      '## Map',
+      '',
+      '<div class="callout">',
+      'Prose inside the block.',
+      '',
+      '- [People](people/index.md) - stale hook, outside the block',
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, [FOLDER_LINKS[0]!]);
+    expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
+    expect(merged.match(/\(people\/index\.md\)/g)).toHaveLength(1);
+  });
+
+  it('treats a setext heading inside the section as the boundary it is', () => {
+    const existing = [
+      '## Map',
+      '',
+      '- [Memory system definition](system/definition.md) - how this memory works',
+      '',
+      'Folders',
+      '-------',
+      '',
+      '- [People](people/index.md) - hand-filed under a setext heading',
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, [FOLDER_LINKS[0]!]);
+    const lines = merged.split('\n');
+    // The bullet below the setext heading is not hoisted above it.
+    expect(lines.indexOf('Folders')).toBeLessThan(
+      lines.findIndex((line) => line === '- [People](people/index.md) - hand-filed under a setext heading'),
+    );
+    expect(merged).toContain('Folders\n-------');
+  });
+
+  // GUARD: a `---` that is NOT a setext underline must stay a thematic break,
+  // or the section would end at the first horizontal rule inside it.
+  it('does not read a thematic break after a blank line as a heading', () => {
+    const existing = ['## Map', '', '---', '', '- [People](people/index.md) - old', ''].join('\n');
+    const merged = mergeRootIndexMap(existing, [FOLDER_LINKS[0]!]);
+    expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
+    expect(merged.match(/\(people\/index\.md\)/g)).toHaveLength(1);
   });
 });

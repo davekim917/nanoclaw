@@ -593,6 +593,15 @@ const FRONTMATTER_LINE = /^(?:[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t].*)?|[ \t]*(?:#|-[
 const FRONTMATTER_KEY = /^[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t].*)?$/;
 
 /**
+ * A leading BOM otherwise makes a frontmatter block unparseable, which reads
+ * as "no frontmatter", which reads as unowned — and silently freezes the file
+ * against consolidation forever. Same failure class as F13.
+ */
+function stripBom(content: string): string {
+  return content.replace(/^\uFEFF/, '');
+}
+
+/**
  * Split a leading YAML frontmatter block off `content`, returning its inner
  * lines verbatim. Verbatim matters: the block is rewritten line-by-line
  * rather than parsed and re-emitted, so a human's key order, quoting and
@@ -604,10 +613,7 @@ const FRONTMATTER_KEY = /^[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t].*)?$/;
  * frontmatter and eaten.
  */
 export function splitFrontmatter(content: string): { keys: string[]; body: string } {
-  // A leading BOM otherwise makes the block unparseable, which reads as "no
-  // frontmatter", which reads as unowned — and silently freezes the file
-  // against consolidation forever. Same failure class as F13.
-  const text = content.replace(/^\uFEFF/, '');
+  const text = stripBom(content);
   if (!text.startsWith('---\n') && !text.startsWith('---\r\n')) return { keys: [], body: content };
   const lines = text.split('\n');
   const close = lines.findIndex((line, index) => index > 0 && line.trimEnd() === '---');
@@ -628,7 +634,7 @@ export function splitFrontmatter(content: string): { keys: string[]; body: strin
  * ROOT CAUSE of the stacked-header corruption this closes: the model was shown
  * a file's content INCLUDING its ownership header, told to treat that content
  * as its starting point, and its echo was then header-prepended again on
- * write. Ten passes over one live `people/james.md` left ten stacked
+ * write. Ten passes over one live `people/mira.md` left ten stacked
  * markers. Stripping here closes it on both ends — the model never sees a
  * marker to echo, and an echo that arrives anyway is discarded before the
  * canonical frontmatter is stamped.
@@ -649,19 +655,24 @@ export function stripCuratorMetadata(content: string): string {
 const CONSOLIDATED_FACTS_LINE = new RegExp(`^${CONSOLIDATED_FACTS_KEY}:[ \\t]*\\d+[ \\t]*$`);
 
 /**
- * Frontmatter fields whose VALUES belong in the ranker. definition.md gives
- * `description` a search role — "one-line summary, used when scanning indexes
- * and search hits" — and `title` is the display name of the same concept.
+ * Frontmatter fields whose VALUES belong in the ranker, taken straight from
+ * the OKF field list in `system/definition.md`. All three of these are search
+ * material by the contract's own words: `description` is the "one-line
+ * summary, used when scanning indexes and search hits" (line 60), `tags` are
+ * "cross-cutting labels for search and grouping" (line 61), and `title` is
+ * the display name of the same concept (line 59). `resource` is the fourth
+ * optional field and is deliberately NOT here — it is a path or a URL, not
+ * query text.
  *
- * ALLOWLIST, never a denylist: everything else is metadata for scanning and
- * grouping, and a key someone adds later must default to unsearchable rather
- * than silently joining the lane.
+ * ALLOWLIST, never a denylist: `type` and `consolidated_facts` are
+ * bookkeeping, and a key someone adds later must default to unsearchable
+ * rather than silently joining the lane.
  */
-const SEARCHABLE_FRONTMATTER_KEYS = ['title', 'description'];
+const SEARCHABLE_FRONTMATTER_KEYS = ['title', 'description', 'tags'];
 
 /**
  * A memory file as the RANKER should see it: the body, plus the values of the
- * two summary fields, and no field names at all.
+ * summary fields, and no field names at all.
  *
  * Frontmatter is fed to the ranker as ordinary text, so stamping `type:
  * person` on 290 files made every one of them a lexical candidate for a
@@ -673,12 +684,24 @@ const SEARCHABLE_FRONTMATTER_KEYS = ['title', 'description'];
 export function searchableText(content: string): string {
   const split = splitFrontmatter(content);
   if (split.keys.length === 0) return content;
-  const keys = split.keys;
   const body = split.body.replace(/^(?:[ \t]*\r?\n)+/, '');
-  const summaries = keys
-    .filter((line) => SEARCHABLE_FRONTMATTER_KEYS.some((key) => line.startsWith(`${key}:`)))
-    .map((line) => line.slice(line.indexOf(':') + 1).trim())
-    .filter((value) => value.length > 0);
+  const summaries: string[] = [];
+  let inside = false;
+  for (const line of split.keys) {
+    const key = /^([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)$/.exec(line);
+    if (key) {
+      inside = SEARCHABLE_FRONTMATTER_KEYS.includes(key[1]!);
+      if (inside && key[2]!.trim().length > 0) summaries.push(key[2]!.trim());
+      continue;
+    }
+    // `tags:` followed by an indented block sequence is the ordinary YAML
+    // shape for a list, and its items are the labels — dropping them would
+    // make exactly the hand-tagged files unsearchable by their tags. A YAML
+    // comment is not a value.
+    if (!inside) continue;
+    const item = line.replace(/^[ \t]*-[ \t]*/, '').trim();
+    if (item.length > 0 && !item.startsWith('#')) summaries.push(item);
+  }
   return summaries.length > 0 ? `${summaries.join('\n')}\n${body}` : body;
 }
 
@@ -689,9 +712,20 @@ export function frontmatterValue(content: string, key: string): string | null {
   return value ? value : null;
 }
 
-/** Curator-owned = carries the frontmatter provenance key, or the legacy header. */
+/**
+ * Curator-owned = carries the frontmatter provenance key, or the legacy header.
+ *
+ * The legacy check does NOT trim leading whitespace, and that is the whole
+ * point of it being written out: four spaces in, `<!-- consolidated: facts=1
+ * -->` is a Markdown code block — somebody documenting the marker — not a
+ * claim on the file. The curator has only ever written that header at column
+ * zero, so requiring column zero costs nothing and stops a human's file about
+ * the format from becoming a write target. Same reason LEADING_LEGACY_HEADERS
+ * does not strip an indented marker.
+ */
 export function isCuratorOwned(content: string): boolean {
-  if (CONSOLIDATION_HEADER_PATTERN.test((content.split('\n', 1)[0] ?? '').trim())) return true;
+  const first = (stripBom(content).split('\n', 1)[0] ?? '').trimEnd();
+  if (CONSOLIDATION_HEADER_PATTERN.test(first)) return true;
   return splitFrontmatter(content).keys.some((line) => CONSOLIDATED_FACTS_LINE.test(line));
 }
 

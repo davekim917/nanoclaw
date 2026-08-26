@@ -339,11 +339,11 @@ describe('OKF index maintenance', () => {
   // writer and the real filesystem: a model that returns the file it was
   // shown, twice.
   it('a model echoing the file back never stacks a second header', async () => {
-    await writeMemoryTopicFile(TEST_WORKGROUP, 'people/james.md', 'James owns the release train.', null, 9);
-    const first = readMemoryTopicFile(TEST_WORKGROUP, 'people/james.md');
-    const echoed = await writeMemoryTopicFile(TEST_WORKGROUP, 'people/james.md', first.content, first.sha256, 9);
+    await writeMemoryTopicFile(TEST_WORKGROUP, 'people/mira.md', 'Mira owns the release train.', null, 9);
+    const first = readMemoryTopicFile(TEST_WORKGROUP, 'people/mira.md');
+    const echoed = await writeMemoryTopicFile(TEST_WORKGROUP, 'people/mira.md', first.content, first.sha256, 9);
     expect(echoed.status).toBe('success');
-    const second = readMemoryTopicFile(TEST_WORKGROUP, 'people/james.md');
+    const second = readMemoryTopicFile(TEST_WORKGROUP, 'people/mira.md');
     expect(second.content).toBe(first.content);
     expect(second.content.match(/^---$/gm)).toHaveLength(2);
     expect(second.content).not.toContain('<!-- consolidated');
@@ -380,7 +380,7 @@ describe('OKF index maintenance', () => {
         '',
         '## Core Memory',
         '',
-        '- The user is Dave Kim.',
+        '- The user is Dana Lee.',
         '',
         '## Map',
         '',
@@ -388,7 +388,7 @@ describe('OKF index maintenance', () => {
         '',
       ].join('\n'),
     );
-    await writeMemoryTopicFile(TEST_WORKGROUP, 'people/james.md', 'James owns the release train.', null, 9);
+    await writeMemoryTopicFile(TEST_WORKGROUP, 'people/mira.md', 'Mira owns the release train.', null, 9);
     await writeMemoryTopicFile(TEST_WORKGROUP, 'domain/acme.md', 'Acme is on a renewal cycle.', null, 9);
     // A human-authored file in a topic folder: mapped by nobody, clobbered by
     // nobody.
@@ -399,14 +399,14 @@ describe('OKF index maintenance', () => {
 
     const root = readMemoryTopicFile(TEST_WORKGROUP, 'index.md').content;
     expect(root).toContain('okf_version: "0.1"');
-    expect(root).toContain('- The user is Dave Kim.');
+    expect(root).toContain('- The user is Dana Lee.');
     expect(root).toContain('- [Memory system definition](system/definition.md) - how this memory works');
     expect(root).toContain('- [People](people/index.md) - 1 consolidated concept');
     expect(root).toContain('- [Domain](domain/index.md) - 1 consolidated concept');
     expect(root).not.toContain('systems/index.md');
 
     const people = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').content;
-    expect(people).toContain('- [James](james.md) - James owns the release train.');
+    expect(people).toContain('- [Mira](mira.md) - Mira owns the release train.');
     expect(people).not.toContain('roster.md');
     expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/roster.md').content).toBe('# Human roster\n');
   });
@@ -414,7 +414,7 @@ describe('OKF index maintenance', () => {
   // Idempotency at the level the brief asks for: run the curator's index pass
   // twice over an unchanged tree and the second run must write nothing.
   it('a second sync over an unchanged tree writes nothing', async () => {
-    await writeMemoryTopicFile(TEST_WORKGROUP, 'people/james.md', 'James owns the release train.', null, 9);
+    await writeMemoryTopicFile(TEST_WORKGROUP, 'people/mira.md', 'Mira owns the release train.', null, 9);
     await syncMemoryIndexes(TEST_WORKGROUP);
     const before = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md');
     expect(await syncMemoryIndexes(TEST_WORKGROUP)).toEqual({ updated: [] });
@@ -438,8 +438,8 @@ describe('OKF index maintenance', () => {
     const peopleDir = path.join(memoryDir(), 'people');
     fs.mkdirSync(peopleDir, { recursive: true });
     fs.writeFileSync(
-      path.join(peopleDir, 'james.md'),
-      '---\ntype: person\nconsolidated_facts: 1\n---\n\nJames leads the release train.\n',
+      path.join(peopleDir, 'mira.md'),
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\nMira leads the release train.\n',
     );
     // Human-authored, present, larger than the index read bound.
     fs.writeFileSync(path.join(peopleDir, 'roster.md'), `# Roster\n\n${'x'.repeat(MEMORY_INDEX_MAX_BYTES)}\n`);
@@ -464,7 +464,7 @@ describe('OKF index maintenance', () => {
       expect(index).toContain('- [Roster](roster.md) - hand-maintained roster');
       expect(index).toContain('- [Locked](locked.md) - hand-written, permissions locked');
       expect(index).not.toContain('departed.md');
-      expect(index).toContain('- [James](james.md) - James leads the release train.');
+      expect(index).toContain('- [Mira](mira.md) - Mira leads the release train.');
     } finally {
       fs.chmodSync(path.join(peopleDir, 'locked.md'), 0o600);
     }
@@ -477,13 +477,13 @@ describe('OKF index maintenance', () => {
     const peopleDir = path.join(memoryDir(), 'people');
     fs.mkdirSync(peopleDir, { recursive: true });
     fs.writeFileSync(
-      path.join(peopleDir, 'james.md'),
-      '---\ntype: person\nconsolidated_facts: 1\n---\n\nJames leads the release train.\n',
+      path.join(peopleDir, 'mira.md'),
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\nMira leads the release train.\n',
     );
     fs.writeFileSync(path.join(peopleDir, 'roster.md'), '# Roster\n\nHand-written.\n');
     await syncMemoryIndexes(TEST_WORKGROUP);
     const before = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md');
-    expect(before.content).toContain('- [James](james.md)');
+    expect(before.content).toContain('- [Mira](mira.md)');
 
     const real = fs.readdirSync;
     const spy = vi.spyOn(fs, 'readdirSync').mockImplementation(((target: fs.PathLike, options: never) => {
@@ -508,15 +508,15 @@ describe('OKF index maintenance', () => {
     const peopleDir = path.join(memoryDir(), 'people');
     fs.mkdirSync(peopleDir, { recursive: true });
     fs.writeFileSync(
-      path.join(peopleDir, 'james.md'),
-      '---\ntype: person\nconsolidated_facts: 1\n---\n\nJames leads the release train.\n',
+      path.join(peopleDir, 'mira.md'),
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\nMira leads the release train.\n',
     );
     fs.writeFileSync(path.join(peopleDir, 'log.md'), '# People log\n\nJournal.\n');
     fs.writeFileSync(path.join(peopleDir, 'index.md'), '# People\n\n- [Journal](log.md) - the folder journal\n');
     await syncMemoryIndexes(TEST_WORKGROUP);
     const index = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').content;
     expect(index).toContain('- [Journal](log.md) - the folder journal');
-    expect(index).toContain('- [James](james.md) - James leads the release train.');
+    expect(index).toContain('- [Mira](mira.md) - Mira leads the release train.');
     // …and `log.md` is still not a topic file the model may write.
     expect(index).not.toContain('People Log');
   });
@@ -528,8 +528,8 @@ describe('OKF index maintenance', () => {
     const peopleDir = path.join(memoryDir(), 'people');
     fs.mkdirSync(peopleDir, { recursive: true });
     fs.writeFileSync(
-      path.join(peopleDir, 'james.md'),
-      '---\ntype: person\nconsolidated_facts: 1\n---\n\nJames leads the release train.\n',
+      path.join(peopleDir, 'mira.md'),
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\nMira leads the release train.\n',
     );
     fs.writeFileSync(
       path.join(peopleDir, 'index.md'),
@@ -540,8 +540,82 @@ describe('OKF index maintenance', () => {
     await syncMemoryIndexes(TEST_WORKGROUP);
     const index = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').content;
     expect(index).toContain('```markdown\n- [Name](name.md) - one line\n```');
-    expect(index).toContain('- [James](james.md) - James leads the release train.');
+    expect(index).toContain('- [Mira](mira.md) - Mira leads the release train.');
     expect(await syncMemoryIndexes(TEST_WORKGROUP)).toEqual({ updated: [] });
+  });
+
+  // The fourth instance of the same bug, end to end. A folder whose listing
+  // fails is correctly skipped — but the root merge claimed a pointer for
+  // every topic directory regardless, so skipping people/ while domain/
+  // succeeded DELETED the People pointer from the root map.
+  it('keeps the root pointer to a folder whose listing failed while another folder succeeds', async () => {
+    for (const directory of ['people', 'domain']) {
+      fs.mkdirSync(path.join(memoryDir(), directory), { recursive: true });
+    }
+    fs.writeFileSync(
+      path.join(memoryDir(), 'people', 'mira.md'),
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\nMira leads the release train.\n',
+    );
+    fs.writeFileSync(
+      path.join(memoryDir(), 'domain', 'releases.md'),
+      '---\ntype: domain\nconsolidated_facts: 1\n---\n\nHow the release train runs.\n',
+    );
+    await syncMemoryIndexes(TEST_WORKGROUP);
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'index.md').content).toContain('](people/index.md)');
+
+    // A second domain concept makes the root map want to change.
+    fs.writeFileSync(
+      path.join(memoryDir(), 'domain', 'merge-queue.md'),
+      '---\ntype: domain\nconsolidated_facts: 1\n---\n\nHow the merge queue runs.\n',
+    );
+    const real = fs.readdirSync;
+    const spy = vi.spyOn(fs, 'readdirSync').mockImplementation(((target: fs.PathLike, options: never) => {
+      if (String(target).endsWith(`${path.sep}people`)) {
+        const error = new Error('EIO: i/o error') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      }
+      return real(target, options);
+    }) as typeof fs.readdirSync);
+    try {
+      expect((await syncMemoryIndexes(TEST_WORKGROUP)).updated).toContain('index.md');
+    } finally {
+      spy.mockRestore();
+    }
+    const root = readMemoryTopicFile(TEST_WORKGROUP, 'index.md').content;
+    expect(root).toContain('](people/index.md)');
+    expect(root).toContain('- [Domain](domain/index.md) - 2 consolidated concepts');
+  });
+
+  // GUARD against over-correcting: a folder that lists FINE and has neither a
+  // folder index nor a curator-owned file in it still loses its root pointer.
+  // That deletion has positive evidence behind it. (An entirely EMPTY listing
+  // does not count — it is far likelier to be a failed listing than an emptied
+  // folder, so it is skipped instead; hence the human file left behind here.)
+  it('retires the root pointer to a folder it listed and found nothing to point at', async () => {
+    for (const directory of ['people', 'domain']) {
+      fs.mkdirSync(path.join(memoryDir(), directory), { recursive: true });
+    }
+    fs.writeFileSync(
+      path.join(memoryDir(), 'people', 'mira.md'),
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\nMira leads the release train.\n',
+    );
+    fs.writeFileSync(
+      path.join(memoryDir(), 'domain', 'releases.md'),
+      '---\ntype: domain\nconsolidated_facts: 1\n---\n\nHow the release train runs.\n',
+    );
+    await syncMemoryIndexes(TEST_WORKGROUP);
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'index.md').content).toContain('](people/index.md)');
+
+    fs.rmSync(path.join(memoryDir(), 'people', 'mira.md'));
+    fs.rmSync(path.join(memoryDir(), 'people', 'index.md'));
+    fs.writeFileSync(path.join(memoryDir(), 'people', 'roster.md'), '# Roster\n\nHand-written.\n');
+    fs.writeFileSync(
+      path.join(memoryDir(), 'domain', 'second.md'),
+      '---\ntype: domain\nconsolidated_facts: 1\n---\n\nSecond.\n',
+    );
+    await syncMemoryIndexes(TEST_WORKGROUP);
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'index.md').content).not.toContain('](people/index.md)');
   });
 
   it('leaves a workgroup with no topic folders completely alone', async () => {

@@ -1515,7 +1515,15 @@ describe('pillar-2 semantic consolidation', () => {
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
     const writeTopicFile = vi.fn(async (_wg: string, relativePath: string): Promise<CuratorWriteResult> => {
       if (relativePath === 'people/oversized.md') {
-        return { status: 'error', relative_path: relativePath, error: 'topic file exceeds 8192 bytes' };
+        // `permanent` is what the real writeMemoryTopicFile stamps on its own
+        // validation rejections — the stub has to carry it or it is no longer
+        // simulating the case this test is about.
+        return {
+          status: 'error',
+          relative_path: relativePath,
+          error: 'topic file exceeds 8192 bytes',
+          permanent: true,
+        };
       }
       return { status: 'success', relative_path: relativePath, sha256: 'a'.repeat(64) };
     });
@@ -1551,6 +1559,43 @@ describe('pillar-2 semantic consolidation', () => {
       }),
     );
     warnSpy.mockRestore();
+  });
+
+  // Codex 7. The poison-loop fix removed the infinite retry by partitioning
+  // every non-conflict `error` out of the pass — but partitioning marks the
+  // tail consolidated, so a transient failure threw the facts away. A lock
+  // timeout, ENOSPC and a SIGKILLed helper all arrive as a bare `error`, and
+  // all three succeed on the next pass.
+  it('does not consolidate the tail when a write fails for a reason that could succeed later', async () => {
+    seedLedger(
+      ['# Generated workgroup memory', '', factLine('mem_aaaaaaaaaaaaaaaa', 'A fact about Maya.'), ''].join('\n'),
+    );
+    const failMaintenance = vi.fn(() => true);
+    const d = deps({
+      claimMaintenance: () => ({ workgroupId: TEST_WORKGROUP, acceptedUpdates: 1, leaseOwner: 'worker' }),
+      consolidationTail: dbConsolidationTail(),
+      markConsolidated: markFactsConsolidated,
+      failMaintenance,
+      writeTopicFile: vi.fn(
+        async (_wg, relativePath): Promise<CuratorWriteResult> => ({
+          status: 'error',
+          relative_path: relativePath,
+          error: 'timed out acquiring memory file lock',
+        }),
+      ),
+      consolidate: vi.fn(
+        async (_s, _u, credentialSlot): Promise<ConsolidationBackendResult> => ({
+          decision: { files: [{ path: 'people/maya-chen.md', content: 'Maya Chen is the Acme liaison.' }] },
+          model: 'claude-sonnet-5',
+          credentialSlot,
+          usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        }),
+      ),
+    });
+    expect(await new MemoryCuratorWorker(d).runOne(1000)).toBeNull();
+    // The facts are still in the tail, so the next pass re-presents them.
+    expect(consolidatedFactIds(TEST_WORKGROUP)).toEqual(new Set());
+    expect(failMaintenance).toHaveBeenCalled();
   });
 
   it('still fails the pass on a write conflict, which a retry can win', async () => {

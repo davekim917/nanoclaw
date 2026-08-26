@@ -486,12 +486,12 @@ describe('background memory curator contract', () => {
 });
 
 // The stacked-header class. Nine markers accumulated on one live
-// `people/james.md` because each pass showed the model the file's own
+// `people/mira.md` because each pass showed the model the file's own
 // ownership header, took its echo back as content, and prepended another.
 describe('OKF topic-file serialization', () => {
   it('stamps OKF frontmatter with the type derived from the topic directory', () => {
-    expect(serializeTopicFile('people/james.md', 'James owns the release train.', 9)).toBe(
-      '---\ntype: person\nconsolidated_facts: 9\n---\n\nJames owns the release train.\n',
+    expect(serializeTopicFile('people/mira.md', 'Mira owns the release train.', 9)).toBe(
+      '---\ntype: person\nconsolidated_facts: 9\n---\n\nMira owns the release train.\n',
     );
     expect(serializeTopicFile('domain/amplitude-rollout.md', 'Rollout status.', 2)).toContain('type: domain');
     expect(serializeTopicFile('systems/qa-agents.md', 'QA agents.', 2)).toContain('type: system');
@@ -500,10 +500,10 @@ describe('OKF topic-file serialization', () => {
   // THE idempotency assertion: feeding a serialized file straight back in —
   // exactly what a model echoing its input does — must not stack anything.
   it('is idempotent: re-serializing its own output changes nothing', () => {
-    const once = serializeTopicFile('people/james.md', 'James owns the release train.', 9);
-    const twice = serializeTopicFile('people/james.md', once, 9, once);
+    const once = serializeTopicFile('people/mira.md', 'Mira owns the release train.', 9);
+    const twice = serializeTopicFile('people/mira.md', once, 9, once);
     expect(twice).toBe(once);
-    expect(serializeTopicFile('people/james.md', twice, 9, twice)).toBe(once);
+    expect(serializeTopicFile('people/mira.md', twice, 9, twice)).toBe(once);
     expect(once.match(/^---$/gm)).toHaveLength(2);
   });
 
@@ -512,11 +512,11 @@ describe('OKF topic-file serialization', () => {
       '<!-- consolidated: facts=150 -->',
       '<!-- consolidated: facts=71 -->',
       '<!-- consolidated -->',
-      'James owns the release train.',
+      'Mira owns the release train.',
       '',
     ].join('\n');
-    const repaired = serializeTopicFile('people/james.md', corrupted, 150, corrupted);
-    expect(repaired).toBe('---\ntype: person\nconsolidated_facts: 150\n---\n\nJames owns the release train.\n');
+    const repaired = serializeTopicFile('people/mira.md', corrupted, 150, corrupted);
+    expect(repaired).toBe('---\ntype: person\nconsolidated_facts: 150\n---\n\nMira owns the release train.\n');
     expect(repaired).not.toContain('<!-- consolidated');
   });
 
@@ -625,7 +625,11 @@ describe('ownership and frontmatter parsing', () => {
 });
 
 describe('searchable projection', () => {
-  it('drops every field name and keeps only title/description values', () => {
+  // CONTRACT CHANGE, deliberate: this asserted `tags: priority` was dropped.
+  // definition.md line 61 defines tags as "cross-cutting labels for search and
+  // grouping", so dropping them made exactly the hand-tagged files unfindable
+  // by their tags. `resource` stays out — it is a path or URL, not query text.
+  it('keeps the title, description and tag VALUES, and no field names', () => {
     const file = [
       '---',
       'type: person',
@@ -639,7 +643,29 @@ describe('searchable projection', () => {
       'Body text.',
       '',
     ].join('\n');
-    expect(searchableText(file)).toBe('Maya Chen\nRuns the Acme account\nBody text.\n');
+    expect(searchableText(file)).toBe('Maya Chen\nRuns the Acme account\npriority\nBody text.\n');
+  });
+
+  it('reads tags written as a YAML block sequence, which is the ordinary shape', () => {
+    const file = [
+      '---',
+      'type: domain',
+      'tags:',
+      '  # the two systems this touches',
+      '  - amplitude',
+      '  - snowflake',
+      'resource: transcripts/kickoff.md',
+      '---',
+      '',
+      'Body text.',
+      '',
+    ].join('\n');
+    expect(searchableText(file)).toBe('amplitude\nsnowflake\nBody text.\n');
+  });
+
+  it('does not let a non-searchable key sequence leak in behind a searchable one', () => {
+    const file = '---\ntitle: Maya Chen\nresource:\n  - transcripts/kickoff.md\n---\n\nBody.\n';
+    expect(searchableText(file)).toBe('Maya Chen\nBody.\n');
   });
 
   it('is an allowlist: a key added later is not searchable by default', () => {
@@ -651,5 +677,24 @@ describe('searchable projection', () => {
     expect(searchableText('# Roster\n\nHand-written.\n')).toBe('# Roster\n\nHand-written.\n');
     const rule = '---\n\nA rule, then prose.\n';
     expect(searchableText(rule)).toBe(rule);
+  });
+});
+
+describe('ownership is claimed at column zero', () => {
+  // Four spaces in, the legacy marker is a Markdown code block — somebody
+  // documenting the format — not a claim. `isCuratorOwned` trimmed the first
+  // line before testing it, so that file became a write target.
+  it('does not claim a human file whose code example opens with the legacy marker', () => {
+    const documenting = ['    <!-- consolidated: facts=1 -->', '', 'That is how the curator marks a file.', ''].join(
+      '\n',
+    );
+    expect(isCuratorOwned(documenting)).toBe(false);
+  });
+
+  // GUARD: the column-zero rule must not stop recognising the 290 live files
+  // that carry the marker for real.
+  it('still claims the legacy marker written where the curator writes it', () => {
+    expect(isCuratorOwned('<!-- consolidated: facts=9 -->\nMira owns the release train.\n')).toBe(true);
+    expect(isCuratorOwned('﻿<!-- consolidated: facts=9 -->\nMira.\n')).toBe(true);
   });
 });
