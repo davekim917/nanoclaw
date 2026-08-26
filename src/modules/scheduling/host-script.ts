@@ -13,10 +13,14 @@
  * script's contract — the last stdout line is JSON {wakeAgent, data}. Execution
  * deliberately does NOT match, because only this path can stall a process
  * shared by the whole fleet: this one carries a hard deadline, kills the
- * child's process group, and discards output produced after the timeout. It
- * also counts its output cap in BYTES where the container path counts UTF-16
- * code units, so a multibyte-heavy script can be truncated here and not there.
+ * child's process group, and discards output produced after the timeout.
  * The container path's bound is the container lifecycle itself.
+ *
+ * Both paths cap output at the same 1MiB of BYTES — execFile's `maxBuffer` is
+ * documented in bytes and measured as such (400k `中`, 1.2MB of UTF-8, errors
+ * with stdout truncated at ~353k code units ≈ 1MiB). They differ only in
+ * DELIVERY: execFile hands back a string truncated mid-codepoint alongside its
+ * error, while this path refuses the run outright.
  *
  * SECURITY: unlike the container, the host process is long-lived and shared
  * across every session on the fleet, so nothing here runs unclassified. See
@@ -127,7 +131,17 @@ function minimalEnv(): NodeJS.ProcessEnv {
 
 export function runHostScript(script: string, taskId: string): Promise<ScriptResult | null> {
   const scriptPath = path.join(os.tmpdir(), `host-task-script-${taskId}-${Date.now()}.sh`);
-  fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+  try {
+    fs.writeFileSync(scriptPath, script, { mode: 0o755 });
+  } catch (err) {
+    // Outside the promise, so an uncaught throw here does not just fail this
+    // row — it propagates through runHostGatedTaskScripts and prepareDueWake
+    // and aborts the REST OF THIS SESSION'S SWEEP TICK, including unrelated
+    // due rows. /tmp at ENOSPC or an unwritable TMPDIR is enough to trigger it,
+    // and the row stays pending so every later tick retries identically.
+    log.warn('Host task-script could not be written to disk', { taskId, err });
+    return Promise.resolve(null);
+  }
 
   return new Promise((resolve) => {
     let settled = false;

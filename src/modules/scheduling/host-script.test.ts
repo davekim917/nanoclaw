@@ -342,16 +342,26 @@ describe('runHostScript hard deadline', () => {
 
   // codex finding 3: the cap must be BYTES. `chunk.length` on a utf8-decoded
   // string counts UTF-16 code units, so 400,000 `中` — 1.2MB of UTF-8 — slipped
-  // under a 1MiB character cap and was accepted. execFile's maxBuffer is
-  // documented in bytes, and the cap is only a real memory bound in bytes.
+  // under a 1MiB character cap and was accepted.
+  //
+  // Pure bash, no python3: the first draft shelled out to an interpreter, and a
+  // box without it would have failed to spawn -> finish(null) -> the expected
+  // null, PASSING VACUOUSLY while testing nothing.
   it('counts the output cap in bytes, not UTF-16 code units', async () => {
     vi.resetModules();
     vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '10000');
     try {
       const { runHostScript } = await import('./host-script.js');
-      // 400k × 3-byte characters = ~1.2MB UTF-8, but only 400k code units.
+      // The LITERAL character, not a `中` escape: bash printf emits that
+      // escape as six ASCII bytes, which blows BOTH caps and makes this test
+      // pass either way — vacuous in a second, subtler way than the python3
+      // version it replaced. Verified by mutation: with code-unit counting this
+      // fixture returns {wakeAgent:true}, with byte counting it returns null.
+      //
+      // 400 × 1000 three-byte characters = ~1.2MB of UTF-8 in only ~400k code
+      // units: over a byte cap, comfortably under a code-unit one.
       const result = await runHostScript(
-        `python3 -c "print('中' * 400000)"\necho '{"wakeAgent":true}'\n`,
+        `s=$(printf '中%.0s' $(seq 1 1000))\nfor i in $(seq 1 400); do printf '%s' "$s"; done\nprintf '\\n{"wakeAgent":true}\\n'\n`,
         'utf8-cap-test',
       );
       expect(result).toBeNull();
@@ -359,4 +369,29 @@ describe('runHostScript hard deadline', () => {
       vi.unstubAllEnvs();
     }
   }, 25_000);
+
+  // glm found this uncovered: nothing pinned the SIGKILL in the overflow
+  // branch. The byte-cap fixture above exits on its own, so deleting that kill
+  // left every test green. A script that floods WITHOUT exiting is the case
+  // that matters — unkilled it burns CPU and IO for the full timeout+10s on
+  // every fire, stalling the sequential sweep worse than the wedge the
+  // deadline exists to prevent.
+  it('kills a non-exiting flood producer at the overflow, not at the deadline', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '10000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      const started = Date.now();
+      // Never exits on its own and ignores TERM: only the overflow SIGKILL can
+      // end this before the 20s hard deadline.
+      const result = await runHostScript(`trap '' TERM\nwhile :; do printf '%01000d' 0; done\n`, 'overflow-kill-test');
+      const elapsed = Date.now() - started;
+
+      expect(result).toBeNull();
+      // Well inside the 10s timeout, so it died on the cap rather than a timer.
+      expect(elapsed).toBeLessThan(8_000);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 30_000);
 });
