@@ -342,34 +342,3 @@ echo IMAGE_GRAPHIFY_CONTRACT_OK
     180_000,
   );
 });
-
-describe('Graphify container agent instructions', () => {
-  it('test_graphify_skill_is_safe_and_automatic', async () => {
-    const skill = await readFile(path.join(REPO_ROOT, 'container/skills/graphify/SKILL.md'), 'utf-8');
-
-    expect(skill).toMatch(/^---\nname: graphify\ndescription:/);
-    expect(skill).toContain('allowed-tools:');
-    for (const command of ['query', 'path', 'explain', 'affected']) {
-      expect(skill).toContain(`graphify ${command}`);
-    }
-    expect(skill).toMatch(/file additions, edits, and deletions are applied as small transactional\s+deltas/i);
-    expect(skill).toMatch(/latest complete generation immediately/i);
-    expect(skill).toMatch(/status` reports `dirty` or\s+`reconciling`/i);
-    expect(skill).toMatch(/source and tests are authoritative/i);
-    expect(skill).toMatch(/inspect (?:the )?source directly/i);
-    expect(skill).not.toMatch(/`graphify (?:extract|install|update|watch|mcp|serve|daemon|hook)\b/i);
-    expect(skill).not.toMatch(/(?:run|perform|trigger) (?:a )?manual (?:refresh|index|extract)/i);
-    expect(skill).not.toMatch(/--(?:out|graph|global)\b/);
-  });
-
-  it('test_graphify_instructions_cover_container_and_host_access_without_runtime_contradiction', async () => {
-    const instructions = await readFile(path.join(REPO_ROOT, 'CLAUDE.md'), 'utf-8');
-    const codeIntelligence = instructions.slice(instructions.indexOf('## Code and knowledge intelligence'));
-
-    expect(codeIntelligence).toMatch(/container sessions use the `graphify` gateway/i);
-    expect(codeIntelligence).toMatch(/host\/operator sessions use[\s\S]*`ncl graphify/i);
-    expect(codeIntelligence).toMatch(/tracked and untracked workgroup files/i);
-    expect(codeIntelligence).toMatch(/Graphify output is advisory/i);
-    expect(codeIntelligence).toMatch(/direct source inspection[\s\S]*tests as the authority/i);
-  });
-});

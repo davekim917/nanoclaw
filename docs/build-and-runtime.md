@@ -50,13 +50,13 @@ All are committed. CI and the Dockerfile run frozen/hash-locked install variants
 
 ## Container code intelligence (Graphify)
 
-Container sessions and host/operator work use Graphify for advisory source navigation. The Graphify runtime has a deliberately narrow public/private split:
+Graphify is decommissioned: no skill points agents at it and setup no longer installs its daemon. The image layers below still exist and are described here until they are removed.
+
+The Graphify runtime has a deliberately narrow public/private split:
 
 - `/opt/graphify` is a private, wheel-locked Python environment. Its upstream console script is removed and its `bin` directory is not added to `PATH`.
 - `/usr/local/bin/graphify` is NanoClaw's public, standard-library gateway from [`graphify-gateway.py`](../container/graphify-gateway.py). It exposes only `query`, `path`, `explain`, and `affected`, plus side-effect-free help/version.
 - `/opt/graphify/graphify-worker.py` is the private worker from [`graphify-worker.py`](../container/graphify-worker.py). The gateway invokes it by absolute path after applying command, freshness, admission, and resource policy. Agents do not run extraction, installation, watch, MCP, global-graph, or user-selected output paths.
-
-The mandatory [`graphify` skill](../container/skills/graphify/SKILL.md) tells container agents to create or reuse a managed checkout below `/workspace/worktrees` and invoke a read command from there. There is no startup scan, background indexer, commit hook, or manual refresh step. Every read inventories the current checkout, including tracked edits, untracked source, and deletions.
 
 Engine releases are accepted by installed behavior, not by matching Graphify's
 internal file layout or upstream agent instructions. The ARM64 wheel closure is

@@ -428,7 +428,6 @@ RUN sed -i '1c#!/opt/graphify/bin/python' /usr/local/bin/graphify \
 # offline verification.
 COPY graphify-gateway.py graphify-worker.py graphify-requirements.lock graphify-wheel-audit.json graphify-integration.json graphify-typescript-namespaces.patch /tmp/graphify-build/container/
 COPY tests/graphify_engine_contract.py tests/test_graphify_gateway.py tests/test_graphify_worker.py tests/test_graphify_upstream_contract.py tests/test_graphify_supply_chain.py /tmp/graphify-build/container/tests/
-COPY skills/graphify/SKILL.md /tmp/graphify-build/container/skills/graphify/SKILL.md
 COPY --from=graphify-release-adapter update-graphify.ts /tmp/graphify-build/scripts/update-graphify.ts
 RUN cd /tmp/graphify-build \
     && GRAPHIFY_WHEELHOUSE=/opt/graphify/wheelhouse /opt/graphify/bin/python -m unittest discover -s container/tests -p 'test_graphify_*.py' \
