@@ -347,7 +347,13 @@ export function scanInputs(
     }
 
     for (const identifier of privateIdentifiers) {
-      if (isAllowed(input.file, identifier, allowlist)) continue;
+      // The serialized-allowlist exemption matters here too: a registry-derived
+      // name (e.g. a workgroup) can only be allowlisted by writing its value
+      // into .public-boundary-allowlist.json, which this same scan then reads.
+      // The exemption covers exactly the values owner-reviewed via entries —
+      // any other private identifier inside the file still flags (see test).
+      if (isAllowed(input.file, identifier, allowlist) || isSerializedAllowlistValue(input.file, identifier, allowlist))
+        continue;
       const pattern = normalizedIdentifierPattern(identifier);
       const match = pattern?.exec(content);
       if (match) {
