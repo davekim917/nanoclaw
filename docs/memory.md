@@ -92,12 +92,25 @@ install ahead of that (dry run by default, `--apply` to write).
 
 The curator also maintains the map. After every consolidation pass it rewrites
 each topic folder's `index.md` from what is on disk and points the root
-`index.md`'s `## Map` section at those three folder indexes. This is a merge,
-not a regeneration: `okf_version`, `## Core Memory`, and every hand-written
-line and section — including hand-written Map links to files the curator does
-not own — are preserved byte for byte. The folder indexes exist precisely so
-the root index stays small enough to survive the per-file bound applied when it
-is injected into a fresh context window.
+`index.md`'s `## Map` section at those three folder indexes. The folder indexes
+exist precisely so the root index stays small enough to survive the per-file
+bound applied when it is injected into a fresh context window.
+
+This is a merge, not a regeneration. What survives, stated exactly: headings,
+frontmatter, other sections, section ordering, fenced code blocks, HTML
+comments, non-indented prose, nested sub-bullets, and hand-written Map links to
+files the curator does not own. What does not: trailing whitespace inside and
+after the managed section is normalized, and lines indented directly under a
+link the curator replaces are removed with it.
+
+The merge is a line-walker, not a Markdown parser, so a few constructs are read
+imprecisely — none of them lose content, they add a duplicate link or a second
+section. A `> - [X](y.md)` in a blockquote, a `* [X](y.md)` star-marker bullet,
+and a `[X]: y.md` link reference definition are not recognized as the curator's,
+so a second link to the same target appears beside them; and a setext `Map` /
+`---` heading is not recognized as `## Map`, so a fresh `## Map` is appended at
+end of file. Write map links as ordinary `- [Title](target.md)` bullets under an
+ATX `## Map` heading and none of that applies.
 
 ## Selective background capture
 

@@ -25,6 +25,7 @@ import {
   readGeneratedMemory,
   readMemoryTopicFile,
   resolveBunBinary,
+  MEMORY_INDEX_MAX_BYTES,
   restoreGeneratedMemorySnapshot,
   syncMemoryIndexes,
   writeGeneratedMemory,
@@ -428,6 +429,68 @@ describe('OKF index maintenance', () => {
     expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').content).toContain(
       '- [Legacy](legacy.md) - Legacy lead line.',
     );
+  });
+
+  // F3. "Present on disk" must mean present on disk, not "read succeeded".
+  // Deriving it from successful reads deleted the hand-written link to any
+  // file the index pass could not open — permanently, for an over-cap file.
+  it('keeps links to files it cannot read, and drops only genuinely deleted ones', async () => {
+    const peopleDir = path.join(memoryDir(), 'people');
+    fs.mkdirSync(peopleDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(peopleDir, 'james.md'),
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\nJames leads the release train.\n',
+    );
+    // Human-authored, present, larger than the index read bound.
+    fs.writeFileSync(path.join(peopleDir, 'roster.md'), `# Roster\n\n${'x'.repeat(MEMORY_INDEX_MAX_BYTES)}\n`);
+    // Human-authored, present, unreadable.
+    fs.writeFileSync(path.join(peopleDir, 'locked.md'), '# Locked\n\nHand-written.\n');
+    fs.chmodSync(path.join(peopleDir, 'locked.md'), 0o000);
+    fs.writeFileSync(
+      path.join(peopleDir, 'index.md'),
+      [
+        '# People',
+        '',
+        '- [Roster](roster.md) - hand-maintained roster',
+        '- [Locked](locked.md) - hand-written, permissions locked',
+        '- [Departed](departed.md) - this file really is gone',
+        '',
+      ].join('\n'),
+    );
+
+    try {
+      await syncMemoryIndexes(TEST_WORKGROUP);
+      const index = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').content;
+      expect(index).toContain('- [Roster](roster.md) - hand-maintained roster');
+      expect(index).toContain('- [Locked](locked.md) - hand-written, permissions locked');
+      expect(index).not.toContain('departed.md');
+      expect(index).toContain('- [James](james.md) - James leads the release train.');
+    } finally {
+      fs.chmodSync(path.join(peopleDir, 'locked.md'), 0o600);
+    }
+  });
+
+  // F2 x F3 compose: a link inside a fence pointing at a file that is NOT on
+  // disk. The fence rule wins — the curator does not parse it at all, so the
+  // "target is gone" rule never gets a say.
+  it('leaves a fenced link to a nonexistent file alone', async () => {
+    const peopleDir = path.join(memoryDir(), 'people');
+    fs.mkdirSync(peopleDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(peopleDir, 'james.md'),
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\nJames leads the release train.\n',
+    );
+    fs.writeFileSync(
+      path.join(peopleDir, 'index.md'),
+      ['# People', '', 'Template for a new entry:', '', '```markdown', '- [Name](name.md) - one line', '```', ''].join(
+        '\n',
+      ),
+    );
+    await syncMemoryIndexes(TEST_WORKGROUP);
+    const index = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').content;
+    expect(index).toContain('```markdown\n- [Name](name.md) - one line\n```');
+    expect(index).toContain('- [James](james.md) - James leads the release train.');
+    expect(await syncMemoryIndexes(TEST_WORKGROUP)).toEqual({ updated: [] });
   });
 
   it('leaves a workgroup with no topic folders completely alone', async () => {

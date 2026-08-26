@@ -12,6 +12,27 @@ import { stripCuratorMetadata } from './curator-contract.js';
  * Core Memory, agents add sections, and the curator owns exactly the link
  * bullets that point at files it owns. Clobbering a hand-written Core Memory
  * section would be a worse bug than a stale map.
+ *
+ * What a merge preserves, stated exactly — this is NOT "byte for byte", and
+ * saying so cost a review round: headings, frontmatter, other sections,
+ * section ordering, fenced blocks, non-indented prose, and hand-written
+ * bullets whose target the curator does not claim all survive. Trailing
+ * whitespace inside and after the managed section is normalized, and the
+ * lines immediately indented under a replaced bullet die with it.
+ *
+ * This is a line-walker, not a Markdown parser. Fenced blocks, HTML comments,
+ * and CommonMark's 0-3 space indent rule for a top-level list item are
+ * handled, which covers every construct that was destroying content. What is
+ * still mishandled, verified by probing rather than assumed — none of these
+ * lose content, they duplicate a link or add a second section:
+ *
+ *   - `> - [X](y.md)` in a blockquote, `* [X](y.md)` with a star marker, and a
+ *     `[X]: y.md` link reference definition are not claimed, so a second link
+ *     to the same target is appended beside them;
+ *   - a setext `Map\n---` heading is not recognized, so a fresh `## Map`
+ *     section is appended at end of file instead of merging into it.
+ *
+ * See docs/memory.md.
  */
 
 /** One rendered map bullet. */
@@ -23,11 +44,52 @@ export interface IndexLink {
   hook: string;
 }
 
-/** `- [Title](target)` — the bullet shape every index in the live tree uses. */
-const BULLET = /^-\s+\[([^\]]*)\]\(([^)\s]+)\)/;
+/** `- [Title](target)` — the bullet shape every index in the live tree uses.
+ *  The optional angle brackets are CommonMark's `[text](<dest>)`: without them
+ *  a hand-written `- [People](<people/index.md>)` is not recognized as ours and
+ *  a second link to the same target gets appended beside it. */
+const BULLET = /^ {0,3}-\s+\[([^\]]*)\]\(\s*<?([^)>\s]+)>?/;
 
-/** A bullet's wrapped continuation line, which must die with its bullet. */
+/** A bullet's wrapped continuation line, which must die with its bullet.
+ *  Only the lines IMMEDIATELY under it — a blank line ends the bullet, and
+ *  anything after that blank is someone else's prose. */
 const CONTINUATION = /^\s+\S/;
+
+/**
+ * Which lines sit inside a fenced code block or an HTML comment.
+ *
+ * This module walks lines; it is not a Markdown parser. These are the two
+ * constructs it MUST know about, because an index that documents its own
+ * format puts a real-looking bullet inside a ``` block or comments one out —
+ * and deleting the documentation of the map is the same class of bug as
+ * deleting the map. Computed once and consulted by every scan below.
+ */
+function fencedLines(lines: readonly string[]): boolean[] {
+  const inside: boolean[] = [];
+  let fence: string | null = null;
+  let comment = false;
+  for (const line of lines) {
+    if (comment) {
+      inside.push(true);
+      if (line.includes('-->')) comment = false;
+      continue;
+    }
+    const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+    if (fence === null) {
+      if (/^ {0,3}<!--/.test(line)) {
+        inside.push(true);
+        comment = !line.includes('-->');
+        continue;
+      }
+      inside.push(marker !== undefined);
+      if (marker !== undefined) fence = marker;
+    } else {
+      inside.push(true);
+      if (marker !== undefined && marker[0] === fence[0] && marker.length >= fence.length) fence = null;
+    }
+  }
+  return inside;
+}
 
 /**
  * Merge `links` into the section of `existing` introduced by `heading`,
@@ -50,18 +112,21 @@ export function mergeManagedLinks(
 ): string {
   const level = /^#+/.exec(heading)?.[0].length ?? 2;
   const lines = existing.length > 0 ? existing.split('\n') : [];
+  let fenced = fencedLines(lines);
 
-  let start = lines.findIndex((line) => line.trimEnd() === heading);
+  let start = lines.findIndex((line, index) => !fenced[index] && line.trimEnd() === heading);
   let end: number;
   if (start < 0) {
     while (lines.length > 0 && lines[lines.length - 1]!.trim() === '') lines.pop();
     if (lines.length > 0) lines.push('');
     lines.push(heading);
+    fenced = fencedLines(lines);
     start = lines.length - 1;
     end = lines.length;
   } else {
     end = lines.length;
     for (let index = start + 1; index < lines.length; index += 1) {
+      if (fenced[index]) continue;
       const match = /^(#+)\s/.exec(lines[index]!);
       if (match && match[1]!.length <= level) {
         end = index;
@@ -70,22 +135,48 @@ export function mergeManagedLinks(
     }
   }
 
+  const subheading = new RegExp(`^#{${level + 1},}\\s`);
   const kept: string[] = [];
+  let firstSubheadingAt = -1;
   let dropping = false;
-  for (const line of lines.slice(start + 1, end)) {
-    const match = BULLET.exec(line.trim());
-    if (match) {
-      dropping = owns(match[2]!);
-      if (dropping) continue;
-    } else if (dropping && CONTINUATION.test(line)) {
-      continue;
-    } else if (line.trim() !== '') {
+  // An indented bullet is a NESTED item when a list is already open, and a
+  // top-level item when one is not — CommonMark allows a top-level item up to
+  // three spaces in. Without this, a hand-written sub-bullet under someone
+  // else's link is read as top-level and replaced.
+  let listOpen = false;
+  for (let index = start + 1; index < end; index += 1) {
+    const line = lines[index]!;
+    if (fenced[index]) {
       dropping = false;
+    } else if (line.trim() === '') {
+      // A blank line ends the bullet. Anything indented after it is a new
+      // block someone wrote, not this bullet's wrapped tail — carrying
+      // `dropping` across the blank is what silently ate hand-written notes.
+      // (It does NOT end the list: a loose list has blanks between items.)
+      dropping = false;
+    } else {
+      const match = BULLET.exec(line);
+      const nested = match !== null && line.startsWith(' ') && listOpen;
+      if (match && !nested) {
+        listOpen = true;
+        dropping = owns(match[2]!);
+        if (dropping) continue;
+      } else if (dropping && CONTINUATION.test(line)) {
+        continue; // wrapped tail or nested item of a bullet being replaced
+      } else {
+        dropping = false;
+        listOpen = match !== null || CONTINUATION.test(line);
+        if (!listOpen && firstSubheadingAt < 0 && subheading.test(line)) firstSubheadingAt = kept.length;
+      }
     }
     kept.push(line);
   }
-  while (kept.length > 0 && kept[0]!.trim() === '') kept.shift();
+  while (kept.length > 0 && kept[0]!.trim() === '') {
+    kept.shift();
+    if (firstSubheadingAt > 0) firstSubheadingAt -= 1;
+  }
   while (kept.length > 0 && kept[kept.length - 1]!.trim() === '') kept.pop();
+  if (firstSubheadingAt > kept.length) firstSubheadingAt = -1;
 
   // Insert with the section's own top-level bullets, never past a
   // sub-heading: a live root index carries `### Folders`, `### Corrections`
@@ -94,8 +185,7 @@ export function mergeManagedLinks(
   // be last. Stable across runs because the managed bullets are removed
   // before this index is computed.
   const rendered = links.map((link) => `- [${link.title}](${link.target})${link.hook ? ` - ${link.hook}` : ''}`);
-  const firstSubheading = kept.findIndex((line) => new RegExp(`^#{${level + 1},}\\s`).test(line));
-  let insertAt = firstSubheading < 0 ? kept.length : firstSubheading;
+  let insertAt = firstSubheadingAt < 0 ? kept.length : firstSubheadingAt;
   // Land before the blank line that separates the bullets from the
   // sub-heading, not between the blank line and the heading.
   while (insertAt > 0 && kept[insertAt - 1]!.trim() === '') insertAt -= 1;

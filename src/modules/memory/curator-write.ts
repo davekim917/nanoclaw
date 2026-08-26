@@ -498,20 +498,34 @@ async function updateIndexFile(
   throw new Error(`memory index write lost ${INDEX_WRITE_ATTEMPTS} CAS races: ${relativePath}`);
 }
 
-function listTopicEntries(workgroupId: string, directory: string): TopicIndexEntry[] {
+/**
+ * One topic folder, split into what is THERE and what could be READ.
+ *
+ * The split is load-bearing. `present` comes from the directory listing, so
+ * "present" means present on disk. Deriving it from successful reads instead
+ * made an unreadable file — EACCES, EIO, or simply larger than
+ * MEMORY_INDEX_MAX_BYTES — indistinguishable from a deleted one, and the map
+ * merge deletes links to deleted files. A human-authored topic file over the
+ * cap lost its hand-written link on EVERY sync, permanently, while the file
+ * sat right there on disk.
+ */
+function listTopicEntries(
+  workgroupId: string,
+  directory: string,
+): { present: Set<string>; entries: TopicIndexEntry[] } {
   let names: string[];
   try {
     names = fs
       .readdirSync(path.join(workgroupMemoryDir(workgroupId), directory), { withFileTypes: true })
       .filter((entry) => entry.isFile() && entry.name.endsWith('.md') && !RESERVED_TOPIC_LEAVES.has(entry.name))
       .map((entry) => entry.name)
+      .filter((name) => TOPIC_FILE_PATH_PATTERN.test(`${directory}/${name}`))
       .sort((a, b) => a.localeCompare(b));
   } catch {
-    return [];
+    return { present: new Set(), entries: [] };
   }
   const entries: TopicIndexEntry[] = [];
   for (const name of names) {
-    if (!TOPIC_FILE_PATH_PATTERN.test(`${directory}/${name}`)) continue;
     try {
       // Read bound is the index rail, NOT the consolidation input cap: an
       // over-cap topic file is excluded from the model's prompt but must
@@ -521,10 +535,10 @@ function listTopicEntries(workgroupId: string, directory: string): TopicIndexEnt
         content: readMemoryTopicFile(workgroupId, `${directory}/${name}`, MEMORY_INDEX_MAX_BYTES).content,
       });
     } catch {
-      continue;
+      continue; // still `present`, just not readable — its link stays put
     }
   }
-  return entries;
+  return { present: new Set(names), entries };
 }
 
 export interface MemoryIndexSyncResult {
@@ -546,16 +560,15 @@ export async function syncMemoryIndexes(workgroupId: string): Promise<MemoryInde
   const updated: string[] = [];
   const rootLinks: IndexLink[] = [];
   for (const directory of TOPIC_DIRECTORIES) {
-    const entries = listTopicEntries(workgroupId, directory);
+    const { present, entries } = listTopicEntries(workgroupId, directory);
     const owned = entries.filter((entry) => isCuratorOwned(entry.content));
     const indexPath = `${directory}/index.md`;
     const hasIndex = readMemoryTopicFile(workgroupId, indexPath, MEMORY_INDEX_MAX_BYTES).sha256 !== null;
     if (owned.length === 0 && !hasIndex) continue;
     const ownedNames = new Set(owned.map((entry) => entry.name));
-    const presentNames = new Set(entries.map((entry) => entry.name));
     if (
       await updateIndexFile(workgroupId, indexPath, (existing) =>
-        renderFolderIndex(directory, owned, ownedNames, presentNames, existing),
+        renderFolderIndex(directory, owned, ownedNames, present, existing),
       )
     ) {
       updated.push(indexPath);

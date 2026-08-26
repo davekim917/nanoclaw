@@ -177,6 +177,182 @@ describe('folder index rendering', () => {
   });
 });
 
+// F2. Four ways the line-walker destroyed hand-written content. Every case
+// here is a verbatim reproduction of an input that the first version of this
+// module mangled, so each fails against that code.
+describe('merge does not eat hand-written content', () => {
+  it('leaves a bullet inside a fenced code block alone', () => {
+    const existing = [
+      '# Memory Index',
+      '',
+      '## Map',
+      '',
+      'How to add a folder link:',
+      '',
+      '```markdown',
+      '- [People](people/index.md) - N consolidated concepts',
+      '```',
+      '',
+      '- [Definition](system/definition.md) - how this works',
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged).toContain('```markdown\n- [People](people/index.md) - N consolidated concepts\n```');
+    expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
+    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+  });
+
+  it('handles ~~~ fences and fence markers longer than three characters', () => {
+    const existing = [
+      '## Map',
+      '',
+      '~~~~',
+      '- [People](people/index.md) - tilde-fenced example',
+      '~~~~',
+      '',
+      '`````',
+      '- [Domain](domain/index.md) - five-backtick example',
+      '`````',
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged).toContain('- [People](people/index.md) - tilde-fenced example');
+    expect(merged).toContain('- [Domain](domain/index.md) - five-backtick example');
+  });
+
+  it('does not carry a replaced bullet across a blank line into someone else prose', () => {
+    const existing = [
+      '## Map',
+      '',
+      '- [People](people/index.md) - old hook',
+      '',
+      '    NOTE from Dave: people/ is the one folder I curate by hand.',
+      '',
+      '- [Definition](system/definition.md) - how this works',
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged).toContain('    NOTE from Dave: people/ is the one folder I curate by hand.');
+    expect(merged).toContain('- [Definition](system/definition.md) - how this works');
+    expect(merged.match(/\(people\/index\.md\)/g)).toHaveLength(1);
+  });
+
+  it('still removes the wrapped continuation that belongs to a replaced bullet', () => {
+    const existing = [
+      '# People',
+      '',
+      '- [James](james.md) - old hook that wraps',
+      '  onto a second line belonging to that bullet.',
+      '',
+    ].join('\n');
+    const merged = renderFolderIndex(
+      'people',
+      [{ name: 'james.md', content: 'James owns the XZO release train.\n' }],
+      new Set(['james.md']),
+      new Set(['james.md']),
+      existing,
+    );
+    expect(merged).not.toContain('onto a second line');
+    expect(merged).toContain('- [James](james.md) - James owns the XZO release train.');
+  });
+
+  // Found by probing my own fix rather than by the next reviewer: fence
+  // awareness alone still left three constructs that DELETED content.
+  it('leaves a bullet in a four-space indented code block alone', () => {
+    const existing = ['## Map', '', '    - [People](people/index.md) - example', ''].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged).toContain('    - [People](people/index.md) - example');
+    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+  });
+
+  it('leaves a bullet inside an HTML comment alone', () => {
+    const existing = ['## Map', '', '<!--', '- [People](people/index.md) - commented out', '-->', ''].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged).toContain('<!--\n- [People](people/index.md) - commented out\n-->');
+    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+  });
+
+  it('leaves a nested sub-bullet under a hand-written bullet alone', () => {
+    const existing = [
+      '## Map',
+      '',
+      '- [Definition](system/definition.md) - how this works',
+      '  - [People](people/index.md) - nested note',
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged).toContain('  - [People](people/index.md) - nested note');
+    expect(mergeRootIndexMap(merged, TOPIC_DIRECTORIES, FOLDER_LINKS)).toBe(merged);
+  });
+
+  // The flip side of the nested rule: an indented bullet with no list open
+  // above it IS a top-level item (CommonMark allows three spaces), so it must
+  // still be claimed rather than duplicated.
+  it('claims a three-space-indented bullet when no list is open above it', () => {
+    const existing = ['## Map', '', '   - [People](people/index.md) - old', ''].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged.match(/people\/index\.md/g)).toHaveLength(1);
+    expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
+  });
+
+  it('claims a CommonMark angle-bracket destination instead of duplicating the link', () => {
+    const existing = ['## Map', '', '- [People](<people/index.md>) - hand-written', ''].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged.match(/people\/index\.md/g)).toHaveLength(1);
+    expect(merged).toContain('- [People](people/index.md) - 2 consolidated concepts');
+  });
+
+  it('does not let a heading inside a fence end the section early', () => {
+    const existing = [
+      '## Map',
+      '',
+      '```sh',
+      '## Map',
+      'grep -r "index.md"',
+      '```',
+      '',
+      '- [Definition](system/definition.md) - how this works',
+      '',
+      '## Later',
+      '',
+      'Untouched.',
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const lines = merged.split('\n');
+    // The whole fenced block, and the real bullet after it, must still be
+    // inside the section — the managed links land after them, not wedged in
+    // between the fence and its contents.
+    expect(merged).toContain('```sh\n## Map\ngrep -r "index.md"\n```');
+    expect(lines.indexOf('- [Definition](system/definition.md) - how this works')).toBeLessThan(
+      lines.indexOf('- [People](people/index.md) - 2 consolidated concepts'),
+    );
+    expect(lines.indexOf('- [People](people/index.md) - 2 consolidated concepts')).toBeLessThan(
+      lines.indexOf('## Later'),
+    );
+    expect(merged).toContain('Untouched.');
+  });
+
+  it('does not treat a sub-heading inside a fence as the insertion boundary', () => {
+    const existing = [
+      '## Map',
+      '',
+      '```markdown',
+      '### Example subsection',
+      '```',
+      '',
+      '- [Definition](system/definition.md) - how this works',
+      '',
+    ].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    const lines = merged.split('\n');
+    expect(lines.indexOf('- [Definition](system/definition.md) - how this works')).toBeLessThan(
+      lines.indexOf('- [People](people/index.md) - 2 consolidated concepts'),
+    );
+    expect(merged).toContain('### Example subsection');
+  });
+});
+
 describe('merge mechanics', () => {
   it('removes a replaced bullet together with its wrapped continuation lines', () => {
     const existing = [
