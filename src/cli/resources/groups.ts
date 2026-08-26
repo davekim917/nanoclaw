@@ -287,7 +287,7 @@ registerResource({
         // From an agent: scope to the calling session only
         if (ctx.caller === 'agent') {
           if (message) {
-            writeSessionMessage(id, ctx.sessionId, {
+            await writeSessionMessage(id, ctx.sessionId, {
               id: `restart-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
               kind: 'chat',
               timestamp: new Date().toISOString(),
@@ -312,7 +312,7 @@ registerResource({
         }
 
         // From the host: restart all running containers in the group
-        const count = restartAgentGroupContainers(id, 'restarted via ncl', message);
+        const count = await restartAgentGroupContainers(id, 'restarted via ncl', message);
         return { restarted: count, rebuilt: !!args.rebuild };
       },
     },

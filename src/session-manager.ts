@@ -20,6 +20,7 @@ import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
 import { assertChannelRoutingConsistency } from './delivery.js';
 import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
+import { acquireStorageActivityLease } from './storage-activity.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import {
@@ -769,8 +770,47 @@ async function writeSessionMessageInternal(
   // the message would vanish with it. Ordinary routing never gets here —
   // findSessionForAgent filters status='active' — so this only fires on a
   // raw-session-id path, and it must be loud rather than silent.
-  if (getSession(sessionId)?.status === 'archiving') {
+  const statusBefore = getSession(sessionId)?.status;
+  if (statusBefore === 'archiving') {
     throw new Error(`session ${sessionId} is being archived; route this message to a fresh session`);
+  }
+
+  // The check above is a read, so on its own it loses the write-after-check
+  // race: a writer that has passed it and opened inbound.db but not yet
+  // written produces NO observable signal — no unconsumed row, no mtime change
+  // — so the reclaim's open-work and mtime-equality guards both see a quiet
+  // session, archive it, and rmSync the directory out from under the open fd.
+  // The insert then lands in an unlinked inode: accepted, acknowledged, and
+  // absent from the rescue archive.
+  //
+  // The storage-activity lease is the existing two-sided lock for exactly this
+  // (`storage-activity.ts`): the reclaim runs its whole archive-and-delete
+  // inside tryRunWithStorageCleanupClaim, which refuses to act while any
+  // activity marker is present, and acquire double-checks the claim after
+  // planting its marker. Either the reclaim sees our marker and skips, or we
+  // see its claim and wait for it to finish.
+  const lease = await acquireStorageActivityLease(sessionDir(agentGroupId, sessionId), `inbound-${sessionId}`);
+  try {
+    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId, statusBefore);
+  } finally {
+    await lease.release();
+  }
+}
+
+async function writeSessionMessageLocked(
+  agentGroupId: string,
+  sessionId: string,
+  message: SessionMessageInput,
+  ignoreDuplicateId: boolean,
+  statusBefore: string | undefined,
+): Promise<boolean> {
+  // Waiting for the claim above can mean waiting out a reclaim that archived
+  // and deleted this session while we queued. Requiring the row to be exactly
+  // where we left it catches active -> archiving -> closed without taking any
+  // new position on which statuses are writable: whatever was writable before
+  // still is, as long as nothing moved it under us.
+  if (getSession(sessionId)?.status !== statusBefore) {
+    throw new Error(`session ${sessionId} changed state during archival; route this message to a fresh session`);
   }
 
   // Documented reset: operators `rm -rf` a session folder to clear a stuck

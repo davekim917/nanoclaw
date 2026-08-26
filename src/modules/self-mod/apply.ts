@@ -63,7 +63,7 @@ export async function applyInstallPackages(payload: Record<string, unknown>, ses
   log.info('Package install approved', { agentGroupId: session.agent_group_id });
   try {
     await buildAgentGroupImage(session.agent_group_id);
-    writeSessionMessage(session.agent_group_id, session.id, {
+    await writeSessionMessage(session.agent_group_id, session.id, {
       id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat',
       timestamp: new Date().toISOString(),
@@ -113,7 +113,7 @@ export async function applyAddMcpServer(payload: Record<string, unknown>, sessio
   };
   updateContainerConfigJson(agentGroup.id, 'mcp_servers', validateMcpServers(servers));
 
-  writeSessionMessage(session.agent_group_id, session.id, {
+  await writeSessionMessage(session.agent_group_id, session.id, {
     id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',
     timestamp: new Date().toISOString(),
@@ -202,7 +202,7 @@ export async function performModelChange(
     effort,
   });
 
-  writeSessionMessage(session.agent_group_id, session.id, {
+  await writeSessionMessage(session.agent_group_id, session.id, {
     id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',
     timestamp: new Date().toISOString(),

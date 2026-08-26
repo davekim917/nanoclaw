@@ -69,7 +69,7 @@ afterEach(() => {
 });
 
 describe('extractAttachmentFiles — inbox-root symlink containment (#2828 sibling)', () => {
-  it('does not write an attachment outside the session root via a symlinked inbox root', () => {
+  it('does not write an attachment outside the session root via a symlinked inbox root', async () => {
     // Attacker-controlled location outside the session sandbox.
     const canaryDir = path.join(TEST_DIR, 'canary-outside');
     fs.mkdirSync(canaryDir, { recursive: true });
@@ -84,7 +84,7 @@ describe('extractAttachmentFiles — inbox-root symlink containment (#2828 sibli
       attachments: [{ name: 'pwn.txt', data: Buffer.from('attacker-bytes').toString('base64') }],
     });
 
-    writeSessionMessage(AG, SESS, {
+    await writeSessionMessage(AG, SESS, {
       id: 'evil-inbox-root',
       kind: 'chat',
       timestamp: now(),

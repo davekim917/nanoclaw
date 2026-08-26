@@ -303,19 +303,23 @@ export function wakeRepositoryMountSessions(sessions: Session[]): void {
  * wakeContainer call on exit. Without it, containers are killed and
  * only come back on the next real user message.
  */
-export function restartAgentGroupContainers(
+export async function restartAgentGroupContainers(
   agentGroupId: string,
   reason: string,
   wakeMessage?: string,
   options: { respawnAll?: boolean } = {},
-): number {
+): Promise<number> {
   const sessions = getSessionsByAgentGroup(agentGroupId).filter(
     (s) => s.status === 'active' && isContainerRunning(s.id),
   );
 
   for (const session of sessions) {
     if (wakeMessage) {
-      writeSessionMessage(agentGroupId, session.id, {
+      // Awaited: the write must be durable before killContainer, and
+      // writeSessionMessage now yields while it holds the session's storage
+      // activity lease. A dropped promise here would also surface as an
+      // unhandled rejection rather than a restart failure.
+      await writeSessionMessage(agentGroupId, session.id, {
         id: `restart-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         kind: 'chat',
         timestamp: new Date().toISOString(),
