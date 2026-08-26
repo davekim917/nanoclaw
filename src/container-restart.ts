@@ -349,18 +349,36 @@ export async function restartAgentGroupContainers(
         continue;
       }
     }
+    // The container can exit during the awaited write above, and killContainer
+    // no-ops on a session it no longer tracks — counting that as a restart
+    // reports work that did not happen.
+    if (!isContainerRunning(session.id)) continue;
+
     // Always respawn after the kill when there is anything to process: an
     // explicit wake message, or in-flight messages the dying container had
     // claimed. Without this, a provider switch mid-conversation leaves the
     // claimed messages dark until the next inbound or a slow sweep backoff.
-    const inDb = openInboundDb(session.agent_group_id, session.id);
+    //
+    // This open can throw too, now that the inbound funnel refuses under a
+    // reclaim claim — same rule as the write: cost this session, not the loop.
     let hasPending: boolean;
     try {
-      hasPending = countDueMessages(inDb) > 0;
-    } finally {
-      // Callers own the connection lifecycle (session-db.ts) — close per op or
-      // each restart leaks one better-sqlite3 FD + mmap segment per session.
-      inDb.close();
+      const inDb = openInboundDb(session.agent_group_id, session.id);
+      try {
+        hasPending = countDueMessages(inDb) > 0;
+      } finally {
+        // Callers own the connection lifecycle (session-db.ts) — close per op
+        // or each restart leaks one better-sqlite3 FD + mmap segment.
+        inDb.close();
+      }
+    } catch (err) {
+      failed += 1;
+      log.warn('Restart: could not read pending work; leaving this container running', {
+        agentGroupId,
+        sessionId: session.id,
+        err,
+      });
+      continue;
     }
     killContainer(
       session.id,

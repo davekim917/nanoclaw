@@ -521,12 +521,16 @@ async function drainSession(session: Session): Promise<DrainOutcome> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) return 'pending';
 
-  let outDb: Database.Database;
+  let outDb: Database.Database | undefined;
   let inDb: Database.Database;
   try {
     outDb = openOutboundDb(agentGroup.id, session.id);
     inDb = openInboundDb(agentGroup.id, session.id);
   } catch {
+    // The inbound open can now throw on a reclaim claim, not just on a missing
+    // file, so the already-open outbound handle has to be closed here or every
+    // poll under a stale claim leaks one FD + mmap segment.
+    outDb?.close();
     return 'pending'; // DBs might not exist yet
   }
 

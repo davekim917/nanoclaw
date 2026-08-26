@@ -386,6 +386,35 @@ describe('restartAgentGroupContainers', () => {
     mockWriteSessionMessage.mockReset();
   });
 
+  it('does not count a session whose container exited during the wake write', async () => {
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1')]);
+    let calls = 0;
+    // Running at collection, gone by the time the write returns.
+    mockIsContainerRunning.mockImplementation(() => {
+      calls += 1;
+      return calls < 2;
+    });
+
+    const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
+
+    expect(count, 'killContainer would no-op, so this is not a restart').toBe(0);
+    expect(mockKillContainer).not.toHaveBeenCalled();
+  });
+
+  it('keeps going when the pending-work open throws, without killing that container', async () => {
+    mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1'), makeSession('s2', 'g1')]);
+    mockIsContainerRunning.mockReturnValue(true);
+    // The funnel now refuses under a reclaim claim, so this open throws for
+    // reasons beyond a missing file — and it sits outside the wake-write's
+    // try, where it could take the whole loop with it.
+    missingInboundDbs.add('s1');
+
+    const count = await restartAgentGroupContainers('g1', 'test', 'Resuming.');
+
+    expect(mockKillContainer.mock.calls.map((c) => c[0])).toEqual(['s2']);
+    expect(count).toBe(1);
+  });
+
   it('skips sessions without a running container', async () => {
     mockGetSessionsByAgentGroup.mockReturnValue([makeSession('s1', 'g1'), makeSession('s2', 'g1')]);
     mockIsContainerRunning.mockReturnValue(false);
