@@ -405,7 +405,6 @@ describe('memory documentation and provider instructions', () => {
     expect(docs).toMatch(/every admissible turn/i);
     expect(docs).toMatch(/explicit degraded/i);
     expect(docs).toMatch(/exact (?:Slack\/Discord )?permalink provenance/i);
-    expect(docs).toMatch(/Graphify[\s\S]{0,100}(?:optional|advisory)/i);
     expect(docs).toMatch(/provider-native[\s\S]{0,140}views[\s\S]{0,100}not authorit/i);
   });
 

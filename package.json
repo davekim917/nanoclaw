@@ -28,7 +28,6 @@
     "lint:fix": "eslint src/ --fix",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check:graphify-runtime": "pnpm run build && node dist/graphify-daemon/runtime-acceptance.js",
     "check:public-boundary": "tsx scripts/check-public-boundary.ts",
     "build:dashboard": "cd dashboard && pnpm install --ignore-workspace --frozen-lockfile && pnpm vite build"
   },

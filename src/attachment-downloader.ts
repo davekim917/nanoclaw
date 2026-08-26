@@ -100,8 +100,8 @@ export function persistInboundAttachments(
       const absPath = path.join(baseDir, filename);
       fs.writeFileSync(absPath, buffer);
 
-      // Graphify source mirror — attachments become workgroup knowledge
-      // immediately through the daemon's sources/inbox watcher.
+      // Workgroup sources mirror — attachments land in the group's
+      // sources/inbox so agents can reach them as ordinary files.
       try {
         const ag = getAgentGroup(agentGroupId);
         if (ag) {
@@ -158,7 +158,7 @@ export function persistInboundAttachments(
           }
         }
       } catch (mirrorErr) {
-        log.warn('Failed to mirror attachment to Graphify sources inbox', {
+        log.warn('Failed to mirror attachment to the sources inbox', {
           messageId,
           name: raw.name,
           err: mirrorErr,

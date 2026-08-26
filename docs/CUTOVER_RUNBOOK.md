@@ -14,7 +14,7 @@ The supported v1-to-v2 cutover is:
 The memory workflow is deliberately separate and lossless:
 
 - inventory every recognized group-local and provider-native source;
-- stop the NanoClaw host and Graphify services and prove affected containers
+- stop the NanoClaw host service and prove affected containers
   are absent;
 - retain a permanent checksummed host-only snapshot;
 - preserve collisions without overwriting either version;

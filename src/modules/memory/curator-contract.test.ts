@@ -470,7 +470,7 @@ describe('background memory curator contract', () => {
     // An operator correcting the agent's wrong architectural assumption is a
     // capture signal that overrides the code-derived rejection. Live failure:
     // "Postgres is cache, Snowflake is the materialized view" existed only in
-    // code and Graphify, the agent proposed a Postgres-only fix that the
+    // code, the agent proposed a Postgres-only fix that the
     // nightly sync would have reverted for 73 of 78 rows, and the owner had to
     // correct it in-channel — proof the fact was not being recovered from code.
     expect(prompt.system).toContain('the correction is proof that recovery from code failed');

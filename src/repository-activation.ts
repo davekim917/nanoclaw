@@ -66,7 +66,7 @@ export interface RepositoryActivationResult {
   preservedFileCount: number;
   prunedWorktrees: number;
   detachedAt: string;
-  /** Paths still dirty after detaching. Non-empty blocks Graphify refresh. */
+  /** Paths still dirty after detaching. Non-empty blocks canonical refresh. */
   residue: string[];
 }
 
@@ -142,7 +142,7 @@ function inProgressOperation(cwd: string): string | null {
  * A checkout made by `git init` + `git remote add` never gets an origin/HEAD,
  * and both create_worktree and refreshCanonicalFromLocalRefs hard-require it —
  * so a canonical adopted without one mounts fine but can never seed a fresh
- * topic worktree or report Graphify freshness. Only unambiguous evidence
+ * topic worktree or report canonical freshness. Only unambiguous evidence
  * already in the repository is used: the configured upstream of the current
  * branch, or a sole remote-tracking branch. Anything ambiguous is left unset
  * for an operator to resolve deliberately.
@@ -493,7 +493,7 @@ export async function activateCanonicalRepository(input: {
       //    topic worktree can still check them out.
       const remoteHead = resolveOriginHead(checkout.path);
       if (!remoteHead) {
-        log.warn('Canonical has no resolvable origin/HEAD; fresh topic worktrees and Graphify refresh will refuse', {
+        log.warn('Canonical has no resolvable origin/HEAD; fresh topic worktrees will refuse', {
           workgroupId,
           repo: checkout.repo,
         });
@@ -521,12 +521,12 @@ export async function activateCanonicalRepository(input: {
       // The detach target can carry different ignore rules than the branch that
       // was checked out, which can leave previously-ignored files visible. That
       // does not endanger any data, but it does block
-      // refreshCanonicalFromLocalRefs (and therefore Graphify freshness), so it
+      // refreshCanonicalFromLocalRefs, so it
       // is reported rather than silently accepted. Throwing here would be worse
       // than reporting: the state is already preserved and the move is next.
       const residue = dirtyWorktreePaths(checkout.path);
       if (residue.length > 0) {
-        log.warn('Canonical is not clean after detaching; Graphify refresh will refuse until resolved', {
+        log.warn('Canonical is not clean after detaching; canonical refresh will refuse until resolved', {
           workgroupId,
           repo: checkout.repo,
           residue: residue.slice(0, 20),

@@ -91,7 +91,7 @@ export interface MemoryCuratorRunReport {
    * The curator already computes a reason for every decision including each noop, and
    * this was previously dropped. It is surfaced because the noop codes are the only
    * machine-readable record of what memory is being REFUSED: `code_derived` in
-   * particular is the footprint of the "recoverable from code/Graphify" prohibition, so
+   * particular is the footprint of the "recoverable from code" prohibition, so
    * without this the suppression can only be estimated by classifying the store after
    * the fact. runMemoryCurationInBackground spreads this report into one log.info, so
    * adding the field is what makes the refusal countable.

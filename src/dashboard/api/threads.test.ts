@@ -1922,7 +1922,7 @@ describe('attention-source rows in the thread list', () => {
     // (`s.agent_group_id IN allowed_group_ids`). Attention items gate at
     // WORKGROUP level, and that is the decision, not an oversight: the
     // workgroup is the documented data-pool boundary (docs/workgroups.md —
-    // chat archive, shared files and Graphify retrieval all pool there), and
+    // chat archive and shared files all pool there), and
     // an attention item is ownerless by construction, so it carries no agent
     // group to test against. DESIGN.md §10 states the rule.
     //

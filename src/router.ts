@@ -1177,8 +1177,8 @@ async function deliverToAgent(
   // DEPENDS ON, not a side effect on the way out. *** Skipping writes no
   // session row, so the archive row is the message's only remaining copy: it
   // is what `messages_archive` retrieval and memory curation read, and what
-  // the Graphify daemon indexes as conversation history
-  // (`src/graphify-daemon/daemon.ts`). If the archive throws and we skip
+  // the workgroup archive retains as conversation history.
+  // If the archive throws and we skip
   // anyway, the message ceases to exist — no row, no retry, no error anyone
   // sees. So it is evaluated LAST, and a `false` return falls through to
   // ordinary session creation, where the message is at least durable. Do not
