@@ -438,8 +438,8 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
   const markerPath = path.join(wgDir, '.migrated');
   // RE-RUNS EVERY STARTUP, deliberately. This used to `return` here on the
   // marker, which made the shared tree a one-shot snapshot of whenever it first
-  // ran. `illysium`'s marker is dated 2026-05-27; `releases/` — the release
-  // desk's board, decision ledger and runbook — was created 2026-08-01, so the
+  // ran. On one install a workgroup's marker predated a later seed dir by two
+  // months — the release desk's board, ledger and runbook — so the
   // union rule below (share any seed dir a sibling already symlinks) never got
   // to see it. It ended up reachable only by the three siblings someone
   // remembered to hand-symlink it into and invisible to the two QA agents,
