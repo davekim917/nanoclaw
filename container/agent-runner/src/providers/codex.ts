@@ -1037,7 +1037,7 @@ export class CodexProvider implements AgentProvider {
           // the fresh-thread retry paths, where the original request is re-sent
           // against a thread with no history and the prior attempt would
           // double-count.
-          let tokenUsageState = createCodexTurnUsageAccumulator();
+          let turnAccum = createCodexTurnAccumulator();
 
           // Rotation loop. Each iteration runs the same `text` against the
           // current app-server; on a rotation-eligible error with fallback
@@ -1079,7 +1079,7 @@ export class CodexProvider implements AgentProvider {
               turnTracker,
               codexTurnHealthConfigFromEnv(),
               controlPlaneRecoveryAttempts,
-              tokenUsageState,
+              turnAccum,
             )) {
               if (ev.type === 'error' && ev.retryable === false) {
                 const controlPlaneFailure =
@@ -1143,7 +1143,7 @@ export class CodexProvider implements AgentProvider {
                     // original request because the new thread has no context.
                     initYielded = false;
                     attemptText = text;
-                    tokenUsageState = createCodexTurnUsageAccumulator();
+                    turnAccum = createCodexTurnAccumulator();
                   } else {
                     // Same persisted thread: ask Codex to continue rather than
                     // duplicating the original user request and its side effects.
@@ -1189,7 +1189,7 @@ export class CodexProvider implements AgentProvider {
                   turnTracker.threadId = threadId ?? null;
                   if (threadId !== previousThreadId) {
                     initYielded = false;
-                    tokenUsageState = createCodexTurnUsageAccumulator();
+                    turnAccum = createCodexTurnAccumulator();
                   }
 
                   rotateAndRetry = true;
@@ -1262,7 +1262,7 @@ export class CodexProvider implements AgentProvider {
                     turnTracker.threadId = threadId ?? null;
                     if (threadId !== previousThreadId) {
                       initYielded = false;
-                      tokenUsageState = createCodexTurnUsageAccumulator();
+                      turnAccum = createCodexTurnAccumulator();
                     }
 
                     rotateAndRetry = true;
@@ -1320,18 +1320,22 @@ export class CodexProvider implements AgentProvider {
   }
 }
 
-// Usage summed across ONE logical turn. Owned by the caller so it outlives a
+// Per-turn totals summed across ONE logical turn. Owned by the caller so it outlives a
 // single runOneTurn attempt — see the LIFETIME note inside runOneTurn.
-export type CodexTurnUsageAccumulator = {
+export type CodexTurnAccumulator = {
   seen: boolean;
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
   cacheWriteInputTokens: number;
+  // `item/completed` count — the turn's step proxy. Same struct as the token
+  // counters on purpose: both are per-turn totals with the same lifetime, so
+  // one reset can't be remembered and the other forgotten.
+  steps: number;
 };
 
-export function createCodexTurnUsageAccumulator(): CodexTurnUsageAccumulator {
-  return { seen: false, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0 };
+export function createCodexTurnAccumulator(): CodexTurnAccumulator {
+  return { seen: false, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, steps: 0 };
 }
 
 // ── Per-turn event pump ─────────────────────────────────────────────────────
@@ -1350,7 +1354,7 @@ export async function* runOneTurn(
   turnTracker?: { currentTurnId: string | null },
   healthConfig: CodexTurnHealthConfig = codexTurnHealthConfigFromEnv(),
   recoveryAttempts = 0,
-  tokenUsageState: CodexTurnUsageAccumulator = createCodexTurnUsageAccumulator(),
+  turnAccum: CodexTurnAccumulator = createCodexTurnAccumulator(),
 ): AsyncGenerator<ProviderEvent> {
   // Mutable refs via object properties — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
@@ -1368,8 +1372,9 @@ export async function* runOneTurn(
   // the Claude SDK's num_turns does. `item/completed` — one per tool call,
   // command execution, reasoning block, or agent message the turn produced —
   // is the closest available proxy: not a literal HTTP request count, but the
-  // best signal this protocol exposes rather than a guess.
-  let itemCompletedCount = 0;
+  // best signal this protocol exposes rather than a guess. It lives on the
+  // same accumulator as the token counters — see LIFETIME below.
+  //
   // Fleet Hardening Phase 0.1 (see TurnUsageInfo). `thread/tokenUsage/updated`
   // fires once per MODEL REQUEST and carries both `last` (that one request)
   // and `total` (the THREAD's running total). A turn makes as many requests as
@@ -1702,18 +1707,18 @@ export async function* runOneTurn(
         break;
       }
       case 'thread/tokenUsage/updated': {
-        // See tokenUsageState above — `last` is ONE model request and this
+        // See turnAccum above — `last` is ONE model request and this
         // notification fires per request, so the sum of every `last` seen
         // between turn/started and turn/completed IS this turn's usage.
         // `total` is deliberately ignored: it is thread-scoped and survives
         // container respawns, which no in-process baseline can subtract.
         const last = (params as { tokenUsage?: { last?: CodexTokenUsageBreakdown } }).tokenUsage?.last;
         if (last) {
-          tokenUsageState.seen = true;
-          tokenUsageState.inputTokens += last.inputTokens ?? 0;
-          tokenUsageState.outputTokens += last.outputTokens ?? 0;
-          tokenUsageState.cachedInputTokens += last.cachedInputTokens ?? 0;
-          tokenUsageState.cacheWriteInputTokens += last.cacheWriteInputTokens ?? 0;
+          turnAccum.seen = true;
+          turnAccum.inputTokens += last.inputTokens ?? 0;
+          turnAccum.outputTokens += last.outputTokens ?? 0;
+          turnAccum.cachedInputTokens += last.cachedInputTokens ?? 0;
+          turnAccum.cacheWriteInputTokens += last.cacheWriteInputTokens ?? 0;
         }
         break;
       }
@@ -1725,7 +1730,7 @@ export async function* runOneTurn(
         break;
       }
       case 'item/completed': {
-        itemCompletedCount++;
+        turnAccum.steps++;
         const item = params.item as
           | ({ type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem)
           | undefined;
@@ -1899,17 +1904,17 @@ export async function* runOneTurn(
       text: resultText || null,
       // This turn's own usage already — the sum of every model request it
       // made. NOT routed through turn-usage.ts's cumulative delta path.
-      usage: tokenUsageState.seen
+      usage: turnAccum.seen
         ? {
             model,
-            inputTokens: tokenUsageState.inputTokens,
-            outputTokens: tokenUsageState.outputTokens,
-            cacheReadTokens: tokenUsageState.cachedInputTokens,
-            cacheWriteTokens: tokenUsageState.cacheWriteInputTokens,
+            inputTokens: turnAccum.inputTokens,
+            outputTokens: turnAccum.outputTokens,
+            cacheReadTokens: turnAccum.cachedInputTokens,
+            cacheWriteTokens: turnAccum.cacheWriteInputTokens,
             costUsd: null,
           }
         : undefined,
-      steps: itemCompletedCount > 0 ? itemCompletedCount : null,
+      steps: turnAccum.steps > 0 ? turnAccum.steps : null,
     };
   } finally {
     try {

@@ -231,12 +231,16 @@ describe('CodexProvider usage accounting across a recovery retry', () => {
       title: 'same-thread retry keeps the pre-crash requests in the turn total',
       // 100/10/5/2 before the desync + 200/20/7/3 after the resume.
       expected: { inputTokens: 300, outputTokens: 30, cacheReadTokens: 12, cacheWriteTokens: 5 },
+      // 2 item/completed before the desync + 1 after.
+      expectedSteps: 3,
     },
     {
       resumeStale: true,
       title: 'fresh-thread retry does NOT inherit the failed attempt (no double-count)',
       // The original request is re-sent against thread-2, so only 200/20/7/3.
       expected: { inputTokens: 200, outputTokens: 20, cacheReadTokens: 7, cacheWriteTokens: 3 },
+      // ...and only the one item/completed the fresh attempt produced.
+      expectedSteps: 1,
     },
   ] as const) {
     it(
@@ -304,6 +308,12 @@ lines.on('line', (line) => {
     setTimeout(() => {
       if (instance === 1) {
         usage({ inputTokens: 100, outputTokens: 10, cachedInputTokens: 5, cacheWriteInputTokens: 2 });
+        for (const id of ['done-a', 'done-b']) {
+          send({
+            method: 'item/completed',
+            params: { threadId: currentThread, turnId, item: { id, type: 'commandExecution', status: 'completed' } },
+          });
+        }
         send({
           method: 'item/started',
           params: {
@@ -327,8 +337,12 @@ lines.on('line', (line) => {
       }
       usage({ inputTokens: 200, outputTokens: 20, cachedInputTokens: 7, cacheWriteInputTokens: 3 });
       send({
-        method: 'item/agentMessage/delta',
-        params: { threadId: currentThread, turnId, delta: 'recovered result' },
+        method: 'item/completed',
+        params: {
+          threadId: currentThread,
+          turnId,
+          item: { id: 'msg-1', type: 'agentMessage', text: 'recovered result' },
+        },
       });
       send({
         method: 'turn/completed',
@@ -370,6 +384,7 @@ lines.on('line', (line) => {
         const events: Array<{
           type: string;
           usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
+          steps?: number | null;
         }> = [];
         for await (const event of query.events) {
           events.push(event as (typeof events)[number]);
@@ -379,7 +394,10 @@ lines.on('line', (line) => {
         // Two app-server instances ⇒ the retry really happened.
         expect(fs.readFileSync(statePath, 'utf8')).toBe('2');
         expect(events.some((event) => event.type === 'error')).toBe(false);
-        expect(events.find((event) => event.type === 'result')?.usage).toMatchObject(scenario.expected);
+        const result = events.find((event) => event.type === 'result');
+        expect(result?.usage).toMatchObject(scenario.expected);
+        // `steps` shares the accumulator, so it must survive/reset identically.
+        expect(result?.steps).toBe(scenario.expectedSteps);
       },
       5_000,
     );
