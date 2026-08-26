@@ -11,6 +11,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from '../config.js';
+import { plantStorageActivityMarker } from '../storage-activity.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
@@ -36,11 +37,43 @@ export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): vo
   db.close();
 }
 
-/** Open the inbound DB for a session (host reads/writes). */
+/**
+ * Open the inbound DB for a session (host reads/writes).
+ *
+ * This is the single funnel every read-write inbound open passes through, so
+ * it is where the storage-activity marker goes. The session reclaim runs in a
+ * worker thread and its archive-then-delete is genuinely concurrent with this
+ * one; without a marker, a writer that has opened but not yet written is
+ * invisible to it and the row lands in an inode the reclaim then unlinks.
+ * Guarding the funnel rather than each writer is what keeps the next writer
+ * from having to remember.
+ *
+ * The marker's lifetime is the HANDLE's, not this function's, so the release
+ * hangs off close(). A caller that leaks the handle leaks the marker and its
+ * session stops being reclaimable — `tryRunWithStorageCleanupClaim` logs every
+ * such skip so that is loud rather than silent.
+ */
 export function openInboundDb(dbPath: string): Database.Database {
-  const db = new Database(dbPath);
-  db.pragma('journal_mode = DELETE');
-  db.pragma('busy_timeout = 5000');
+  const release = plantStorageActivityMarker(path.dirname(dbPath), 'inbound-open');
+  let db: Database.Database;
+  try {
+    db = new Database(dbPath);
+    db.pragma('journal_mode = DELETE');
+    db.pragma('busy_timeout = 5000');
+  } catch (err) {
+    release();
+    throw err;
+  }
+  // ponytail: patching close() beats a wrapper type — every existing caller
+  // already closes, and a new return type would touch all ~20 of them.
+  const close = db.close.bind(db);
+  db.close = function releasingClose(this: Database.Database): Database.Database {
+    try {
+      return close();
+    } finally {
+      release();
+    }
+  };
   return db;
 }
 
