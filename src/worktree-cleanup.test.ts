@@ -361,12 +361,15 @@ describe('per-topic linked worktree cleanup', () => {
 
     const stats = _discoveryStatsForTesting(state.dataDir);
     expect(stats.targets.map((t) => t.repo)).toEqual([fixture.repo]);
-    expect(stats.filteredNames).toEqual(['.github', '.pnpm-store']);
+    // Located, not just named: a bare deduped name reports one `.github` when
+    // there are forty, and gives an operator nowhere to look.
+    const prefix = `wg-a/${fixture.workUnit.kind}-${fixture.workUnit.id}`;
+    expect(stats.filteredNames).toEqual([`${prefix}/.github`, `${prefix}/.pnpm-store`]);
 
     await runWorktreeCleanupOnce(state.dataDir);
     expect(log.info).toHaveBeenCalledWith(
       'Worktree cleanup: pass complete',
-      expect.objectContaining({ filtered: 2, filteredNames: ['.github', '.pnpm-store'] }),
+      expect.objectContaining({ filtered: 2, filteredNames: [`${prefix}/.github`, `${prefix}/.pnpm-store`] }),
     );
   });
 

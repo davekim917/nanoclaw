@@ -149,7 +149,12 @@ function participantsByTopic(
 
 export interface DiscoveryResult {
   targets: TopicWorktreeTarget[];
-  /** Entries whose names are not valid repository segments — see below. */
+  /**
+   * Entries whose names are not valid repository segments, as
+   * `workgroup/work-unit/name`. Located, not just named: a bare name deduped
+   * across every topic reports one `.github` when there are forty, and gives
+   * an operator nowhere to look.
+   */
   filteredNames: string[];
   /** Worktrees roots that could not be read at all. */
   unreadableRoots: number;
@@ -186,7 +191,7 @@ function discover(dataDir: string = DATA_DIR): DiscoveryResult {
       // so every filtered name is reported rather than dropped silently. A
       // repository name in that report is an operator signal, not noise.
       if (!isRepositoryName(repo)) {
-        filteredNames.add(repo);
+        filteredNames.add(`${unit.workgroupId}/${unit.kind}-${unit.id}/${repo}`);
         continue;
       }
       const worktreePath = path.join(worktreeRoot, repo);
