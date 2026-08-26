@@ -154,7 +154,7 @@ row must exist):
 ncl groups config update --id <agentGroupFolder> --model deepseek/deepseek-chat --effort high
 ```
 
-If you set nothing, the group inherits the code default `opencode-go/ox-alpha-free` (effort `high`) — correct for an OpenCode Go group, wrong for any other provider, so a non-Go group **must** set `--model` explicitly. Effort accepts `low|medium|high` (opencode's portable set). The `provider/model-id` shapes in the examples below are still the right FORMAT for `--model` — just pass them to `ncl`, not `.env`.
+If you set nothing, the group inherits the code default `opencode-go/glm-5.3-flash` (effort `high`) — correct for an OpenCode Go group, wrong for any other provider, so a non-Go group **must** set `--model` explicitly. Effort accepts `low|medium|high` (opencode's portable set). The `provider/model-id` shapes in the examples below are still the right FORMAT for `--model` — just pass them to `ncl`, not `.env`.
 
 Credentials: register provider API keys in OneCLI with the matching `--host-pattern` (e.g. `api.deepseek.com`, `openrouter.ai`). OneCLI injects them via `HTTPS_PROXY` in the container — the key never lives in `.env` or the container environment.
 

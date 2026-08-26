@@ -343,7 +343,7 @@ describe('buildMounts agent surfaces', () => {
     expect(fs.lstatSync(path.join(state, 'repository.lock')).isFile()).toBe(true);
   });
 
-  it('uses the OpenCode Go ox-alpha-free default at high effort when no DB override exists', () => {
+  it('uses the OpenCode Go default at high effort when no DB override exists', () => {
     const ag = group('ag-opencode-defaults', 'opencode-defaults');
     createAgentGroup(ag);
     ensureContainerConfig(ag.id);
@@ -351,7 +351,7 @@ describe('buildMounts agent surfaces', () => {
     const contribution = providerContribution('opencode', ag, session('s-opencode-defaults', ag.id));
 
     expect(contribution.env).toMatchObject({
-      OPENCODE_MODEL: 'opencode-go/ox-alpha-free',
+      OPENCODE_MODEL: 'opencode-go/glm-5.3-flash',
       OPENCODE_PROVIDER: 'opencode-go',
       OPENCODE_EFFORT: 'high',
     });

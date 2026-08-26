@@ -139,6 +139,20 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
+  // The Codex CLI scrubs stdio MCP server children down to a small
+  // proxy/CA allowlist — NANOCLAW_* spawn context never reaches the
+  // nanoclaw tool process through inheritance, which made every managed
+  // repository tool fail with "repository workgroup context is
+  // unavailable" in codex groups. Forward the runner's own NANOCLAW_*
+  // vars through the per-server env table (rendered into codex's
+  // [mcp_servers.nanoclaw.env] and opencode's environment map); providers
+  // that inherit full env merge the same values harmlessly. Unset or
+  // empty vars are omitted so "absent" semantics stay intact.
+  const nanoclawEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key.startsWith('NANOCLAW_') && value) nanoclawEnv[key] = value;
+  }
+
   // Build MCP servers config: nanoclaw built-in + any from container.json
   // or host-injected NANOCLAW_MCP_SERVERS. Host may inject stdio or http
   // servers — http servers rely on the container's HTTPS_PROXY pointing at
@@ -148,7 +162,7 @@ async function main(): Promise<void> {
       type: 'stdio',
       command: 'bun',
       args: ['run', mcpServerPath],
-      env: {},
+      env: nanoclawEnv,
     },
   };
 
