@@ -305,10 +305,6 @@ export function topicWorktreesDir(workUnit: RepositoryWorkUnit, dataDir: string 
   return path.join(topicStateDir(workUnit, dataDir), 'worktrees');
 }
 
-export function topicGraphifyCacheDir(workUnit: RepositoryWorkUnit, dataDir: string = DATA_DIR): string {
-  return path.join(topicStateDir(workUnit, dataDir), 'graphify-cache');
-}
-
 export function defaultTopicBranch(workUnit: RepositoryWorkUnit, repo: string): string {
   assertRepositoryName(repo);
   const digest = sha256(`${workUnit.workgroupId}\0${workUnit.key}\0${repo}`).slice(0, 24);

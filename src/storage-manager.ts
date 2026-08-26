@@ -898,9 +898,9 @@ function takeReclaimBudget(want: number): number {
 }
 
 export const SESSION_RESCUES_DIRNAME = 'session-rescues';
-// Secret material and per-spawn regenerables never enter a rescue archive:
-// creds/ is re-materialized on every spawn; the graphify dirs are caches.
-const SESSION_ARCHIVE_EXTRA_EXCLUDES = ['creds', 'graphify-cache', '.graphify-stage'];
+// Secret material never enters a rescue archive: creds/ is re-materialized on
+// every spawn.
+const SESSION_ARCHIVE_EXTRA_EXCLUDES = ['creds'];
 
 interface CentralSessionRow {
   status: string;
@@ -1052,7 +1052,7 @@ function releaseArchivingRow(sessionId: string): 'active' | 'closed' | 'failed' 
  * Archive-then-reclaim one whole session dir. findSessionForAgent only matches
  * status='active', so the next inbound for the same thread creates a FRESH
  * session with a fresh dir (initSessionFolder is idempotent) — conversation
- * history stays in the canonical data/archive.db and Graphify. The rescue
+ * history stays in the canonical data/archive.db. The rescue
  * archive preserves the session DBs, provider continuity files, and any
  * worktree content minus regenerable trees and creds.
  *

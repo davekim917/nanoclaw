@@ -98,7 +98,6 @@ import { buildContainerCodexConfig } from './providers/codex.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import {
   CLAUDE_CODE_PROJECTS_DIR,
-  graphifyRuntimeDir,
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
@@ -114,7 +113,6 @@ import {
   readTransferTombstone,
   resolveRepositoryWorkUnit,
   transferTombstonesDir,
-  topicGraphifyCacheDir,
   topicWorktreesDir,
   type RepositoryWorkUnit,
 } from './repository-workspaces.js';
@@ -1750,19 +1748,13 @@ export function buildMounts(
     mounts.push({ hostPath: inboundDbFile, containerPath: '/workspace/inbound.db', readonly: true });
   }
 
-  // Repository and Graphify scope are derived by one canonical work-unit
-  // resolver. Same-topic siblings therefore share both checkout and index;
-  // different topics receive different roots even when they use one repo.
+  // Repository scope is derived by one canonical work-unit resolver.
+  // Same-topic siblings therefore share a checkout; different topics receive
+  // different roots even when they use one repo.
   const wgKey = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
   const repositoryWorkUnit = resolveSessionRepositoryWorkUnit(session, wgKey);
-  const graphifyCache = topicGraphifyCacheDir(repositoryWorkUnit);
   const worktrees = topicWorktreesDir(repositoryWorkUnit);
-  const graphifyRuntime = graphifyRuntimeDir();
-  fs.mkdirSync(graphifyCache, { recursive: true });
-  fs.mkdirSync(graphifyRuntime, { recursive: true });
   fs.mkdirSync(worktrees, { recursive: true });
-  mounts.push({ hostPath: graphifyCache, containerPath: '/workspace/.cache/graphify', readonly: false });
-  mounts.push({ hostPath: graphifyRuntime, containerPath: '/run/nanoclaw-graphify', readonly: false });
   // Stable agent-facing path plus the exact host path. Git worktree metadata
   // records the latter, so the same pointer works from host and container.
   mounts.push({ hostPath: worktrees, containerPath: '/workspace/worktrees', readonly: false });
@@ -3017,16 +3009,6 @@ export function selectedSkillNames(containerConfig: import('./container-config.j
   return [...new Set(requested)];
 }
 
-/** Universal, bounded Graphify runtime flags applied to every provider. */
-export function graphifyContainerArgs(): string[] {
-  return [
-    '-e',
-    'NANOCLAW_CONTAINER=1',
-    '--tmpfs',
-    '/workspace/.graphify-stage:rw,size=201326592,mode=0700,uid=1001,gid=1001',
-  ];
-}
-
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -3076,7 +3058,6 @@ async function buildContainerArgs(
   // forwards signals to the entrypoint, so SIGTERM handling is unchanged.
   const args: string[] = ['run', '--rm', '--init', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
   args.push(...dockerResourceLimitArgs(containerConfig.resources));
-  args.push(...graphifyContainerArgs());
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -3796,7 +3777,7 @@ async function buildContainerArgs(
 
   // Pre-create every nested /workspace mountpoint host-side as the host user.
   // /workspace is itself a bind of the session dir, so when Docker creates a
-  // missing nested mountpoint (/workspace/agent, /workspace/.cache/graphify,
+  // missing nested mountpoint (/workspace/agent, /workspace/worktrees,
   // /workspace/project/README.md, ...) it materializes that stub inside the
   // session dir owned by ROOT — which the storage manager (host user) can
   // then never delete once the session idles out. Docker leaves pre-existing

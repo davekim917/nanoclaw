@@ -529,50 +529,6 @@ describe('buildMounts agent surfaces', () => {
     }
   });
 
-  it('test_graphify_cache_mounts_share_only_with_thread_siblings', () => {
-    const previousThreadWorktrees = process.env.NANOCLAW_THREAD_WORKTREES;
-    process.env.NANOCLAW_THREAD_WORKTREES = '1';
-    try {
-      const ag = group('ag-graphify-cache', 'graphify-cache');
-      createAgentGroup(ag);
-      withWorkgroup(ag);
-      ensureContainerConfig(ag.id);
-      initGroupFilesystem(ag, {});
-
-      const siblingA = { ...session('s-cache-a', ag.id), messaging_group_id: 'mg-shared', thread_id: 'thread-one' };
-      const siblingB = { ...session('s-cache-b', ag.id), messaging_group_id: 'mg-shared', thread_id: 'thread-one' };
-      const unrelated = { ...session('s-cache-c', ag.id), messaging_group_id: 'mg-shared', thread_id: 'thread-two' };
-      const isolated = session('s-cache-isolated', ag.id);
-
-      const graphifyMount = (sess: Session) =>
-        buildMounts(ag, sess, containerConfig(), 'claude', {}).find(
-          (mount) => mount.containerPath === '/workspace/.cache/graphify',
-        );
-
-      const first = graphifyMount(siblingA);
-      const second = graphifyMount(siblingB);
-      const differentThread = graphifyMount(unrelated);
-      const differentSession = graphifyMount(isolated);
-
-      expect(first).toMatchObject({ readonly: false });
-      expect(first?.hostPath).toBe(second?.hostPath);
-      expect(first?.hostPath).not.toBe(differentThread?.hostPath);
-      expect(first?.hostPath).not.toBe(differentSession?.hostPath);
-
-      const runtimeMounts = buildMounts(ag, isolated, containerConfig(), 'claude', {}).filter(
-        (mount) => mount.containerPath === '/run/nanoclaw-graphify',
-      );
-      expect(runtimeMounts).toHaveLength(1);
-      expect(runtimeMounts[0]).toMatchObject({
-        hostPath: path.join(DATA_DIR, 'graphify-runtime'),
-        readonly: false,
-      });
-    } finally {
-      if (previousThreadWorktrees === undefined) delete process.env.NANOCLAW_THREAD_WORKTREES;
-      else process.env.NANOCLAW_THREAD_WORKTREES = previousThreadWorktrees;
-    }
-  });
-
   it('test_gitnexus_host_plugin_and_builtin_hook_never_mount', () => {
     const homedir = path.join(TEST_ROOT, 'home');
     const pluginsDir = path.join(homedir, 'plugins');
