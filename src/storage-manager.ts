@@ -610,25 +610,44 @@ function safeReaddirDirents(root: string): fs.Dirent[] {
 
 const SESSION_ACTIVITY_FILES = ['inbound.db', 'outbound.db', 'archive.db', 'central.db', '.heartbeat'] as const;
 
-// inbound.db is excluded from BOTH idle gates. Session DBs carry a lazy
-// on-open schema migration (`migrateMessagesInTable`), so one new inbound
-// column rewrites every inbound.db in the fleet: on 2026-08-15 20:21-20:22 UTC
-// it rewrote 5,027 of them in two minutes, and again on 2026-08-25 16:34-16:35
-// UTC it rewrote 2,167 of 2,404, resetting the whole fleet's mtime clock each
-// time. Dropping it loses nothing: the host writes inbound.db and
-// `sessions.last_active` in the same path, so the central row already carries
-// every real inbound event, and `sessionHasOpenWork` independently refuses any
-// session holding an unconsumed inbound row. The other files stay in — they
-// are container- and host-written and can legitimately outrun the central row.
+// inbound.db is excluded from both idle gates, because something rewrites
+// every inbound.db in the fleet within a couple of minutes and resets the
+// whole mtime clock at once: 5,027 files on 2026-08-15 20:21-20:22 UTC, and
+// 2,167 of 2,404 on 2026-08-25 16:34-16:35 UTC.
+//
+// WHAT IS KNOWN vs WHAT IS ASSUMED. The rewrites are measured — file counts
+// and timestamps are from the live tree. The WRITER IS NOT IDENTIFIED. The
+// lazy on-open schema migration (`migrateMessagesInTable`) is the leading
+// hypothesis and is named here because it fits the shape, but attribution was
+// never confirmed, and commit dfa6e3db (2026-08-19) already added
+// manifest-and-restore around the reconcile pass on that theory and the event
+// still recurred on 08-25. `migrateMessagesInTable` has ~10 call sites
+// (`src/db/session-db.ts:22-24, 311, 361, 377, 392, 497, 511, 552, 590`) with
+// no mtime bookkeeping on any of them, so the leak — whatever it is — is still
+// live and can poison any future consumer of inbound.db mtime.
+//
+// Excluding inbound from the gates is therefore SHIELDING, not a cure. It is
+// still the right shield: the host writes inbound.db and `sessions.last_active`
+// in the same path, so the central row already carries every real inbound
+// event, and `sessionHasOpenWork` independently refuses any session holding an
+// unconsumed inbound row. The other files stay in — they are container- and
+// host-written and can legitimately outrun the central row.
 //
 // The 2026-08-15 fix narrowed only the long-horizon reclaim age and left the
 // 24h freshness gate on the full set, reasoning that a too-new reading there
 // was harmless. It is not: a fleet-wide rewrite makes every session look fresh
 // and stalls the reaper entirely (328 sessions on 2026-08-25, 103 on 08-26,
-// against ~1,300/day before). Both gates now read this list. The full set is
-// still correct for the PRE-APPLY revalidation, which only asks "did anything
-// at all touch this directory since planning" and where a too-new reading
-// genuinely is harmless — it aborts one action, not the pass.
+// against ~1,300/day before). Both gates now read this list — with one
+// documented hole: a session dir whose ONLY file is inbound.db has no narrowed
+// signal at all, and the `|| lastActivity` fallback below puts its inbound
+// mtime back in charge, migration rewrites included. That cohort is
+// never-woken sessions, the direction is conservative (it preserves), and it
+// predates this change; it is knowingly left alone rather than silently
+// claimed as covered.
+//
+// The full set stays correct for the PRE-APPLY revalidation, which only asks
+// "did anything at all touch this directory since planning" and where a
+// too-new reading genuinely is harmless — it aborts one action, not the pass.
 const SESSION_AGE_SIGNAL_FILES = SESSION_ACTIVITY_FILES.filter((name) => name !== 'inbound.db');
 
 function sessionLastActivityMs(sessPath: string, names: readonly string[] = SESSION_ACTIVITY_FILES): number {
@@ -1304,6 +1323,14 @@ interface SessionReclaimCandidate {
   sessionStatus: 'active' | 'closed' | 'orphan';
   newestActivityMs: number;
   ageEligible: boolean;
+  /**
+   * The full-list mtime reading taken at the same instant as the age and
+   * central-row signals this candidate was judged on. Apply re-reads it and
+   * refuses on any difference, so this must be the DECISION-time value: a
+   * reading taken later would absorb activity that arrived during planning and
+   * quietly certify a stale decision as current.
+   */
+  collectedActivityMs: number;
 }
 
 /** Active-row count for the count cap; null means "cannot tell" — cap disabled. */
@@ -1432,6 +1459,9 @@ function collectSessionCacheActions(args: {
         sessionStatus: row === null ? 'orphan' : row.status === 'closed' ? 'closed' : 'active',
         newestActivityMs: newestActivity,
         ageEligible: args.now - newestActivity >= args.policy.sessionReclaimMs,
+        // `lastActivity` is the full-list reading from the top of this
+        // iteration — the same instant the gates above were evaluated.
+        collectedActivityMs: lastActivity,
       });
     }
   }
@@ -1457,7 +1487,7 @@ function collectSessionCacheActions(args: {
         rescuesDir,
         estimatedBytes: dirSizeBytes(candidate.sessPath),
         reason: `session ${candidate.sessionStatus === 'active' ? 'idle' : candidate.sessionStatus} for at least ${Math.round(args.policy.sessionReclaimMs / 86400000)}d — archived to ${SESSION_RESCUES_DIRNAME}/ then reclaimed`,
-        collectedActivityMs: sessionLastActivityMs(candidate.sessPath),
+        collectedActivityMs: candidate.collectedActivityMs,
         isContainerRunning: args.isContainerRunning,
       }),
     );

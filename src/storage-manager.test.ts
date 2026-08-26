@@ -46,6 +46,11 @@ import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL } from '
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { log } from './log.js';
 
+// The rescue round-trip suite needs a REAL tar/zstd. `vi.mock('child_process')`
+// intercepts the `node:`-prefixed specifier too, so a plain import would just
+// hand back the mock and recurse — importActual is the only way out.
+const { execFileSync: realExecFileSync } = await vi.importActual<typeof import('child_process')>('child_process');
+
 // ── Shared session-reclaim fixtures ──────────────────────────────────────────
 
 interface CentralSessionSeed {
@@ -2062,5 +2067,226 @@ describe('storage-manager reclaim throughput', () => {
 
     runApply({ rescueRetentionMs: 0 });
     expect(fs.existsSync(full)).toBe(true);
+  });
+});
+
+// The rescue archive is the entire safety argument for deleting session dirs,
+// and until now nothing had ever extracted one: every other test stubs `tar`
+// and writes the literal string 'fake-zstd-archive'. These run the REAL
+// tar/zstd, then unpack what the reaper produced and compare it byte for byte
+// against what was on disk before the delete.
+describe('storage-manager rescue archive round-trip', () => {
+  let tmpRoot: string;
+  let sessionsRoot: string;
+  let rescuesDir: string;
+  const now = Date.parse('2026-06-30T00:00:00.000Z');
+  const DAY = 24 * 60 * 60 * 1000;
+
+  // `df` stays stubbed — it drives the pressure calculation. Everything else
+  // runs for real.
+  function passThroughExceptDf(cmd: string, cmdArgs?: unknown, opts?: unknown): string | Buffer {
+    if (cmd === 'df') {
+      return 'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 900 100 90% /\n';
+    }
+    return realExecFileSync(cmd, cmdArgs as string[], opts as Parameters<typeof realExecFileSync>[2]);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetStorageManagerThrottleForTesting();
+    closeCentralDb();
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-roundtrip-'));
+    sessionsRoot = path.join(tmpRoot, 'v2-sessions');
+    rescuesDir = path.join(tmpRoot, 'session-rescues');
+    mockExecFileSync.mockImplementation(passThroughExceptDf);
+  });
+
+  afterEach(() => {
+    closeCentralDb();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function runApply() {
+    return getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(tmpRoot, 'no-threads'),
+      includeDocker: false,
+      policy: { filesystemPath: tmpRoot, idleArtifactMs: 1 * DAY, worktreeReclaimMs: 30 * DAY },
+    });
+  }
+
+  /** Seed an idle, unblocked session and age its DB mtimes past both gates. */
+  function seedIdle(id: string): string {
+    const dir = makeSessionDir(sessionsRoot, 'ag-1', id, now - 40 * DAY, { workContinuation: '' });
+    installCentralDb([{ id, status: 'active', last_active: new Date(now - 40 * DAY).toISOString() }]);
+    const old = (now - 40 * DAY) / 1000;
+    for (const name of ['inbound.db', 'outbound.db']) fs.utimesSync(path.join(dir, name), old, old);
+    return dir;
+  }
+
+  /** Extract a published rescue archive into a fresh directory. */
+  function extract(archivePath: string): string {
+    const out = fs.mkdtempSync(path.join(tmpRoot, 'restore-'));
+    realExecFileSync('tar', ['-I', 'zstd -T0', '-xf', archivePath, '-C', out], { stdio: 'pipe' });
+    return out;
+  }
+
+  it('produces an archive that restores the session content byte for byte', () => {
+    const dir = seedIdle('sess-restore');
+    fs.writeFileSync(path.join(dir, 'notes.md'), 'human work that must survive\n');
+    fs.mkdirSync(path.join(dir, 'worktrees', 'repo', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'worktrees', 'repo', 'src', 'main.ts'), 'export const x = 1;\n');
+    const expected = new Map<string, Buffer>();
+    for (const rel of ['notes.md', 'inbound.db', 'outbound.db', 'worktrees/repo/src/main.ts']) {
+      expected.set(rel, fs.readFileSync(path.join(dir, rel)));
+    }
+
+    expect(runApply().actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
+    expect(fs.existsSync(dir)).toBe(false);
+
+    const entry = readReclaimJournal(rescuesDir).get('sess-restore');
+    expect(entry).toBeDefined();
+    const restored = path.join(extract(entry!.rescue_path), 'sess-restore');
+
+    for (const [rel, bytes] of expected) {
+      expect(fs.existsSync(path.join(restored, rel)), `missing ${rel}`).toBe(true);
+      expect(fs.readFileSync(path.join(restored, rel)), `content of ${rel}`).toEqual(bytes);
+    }
+    // The restored inbound.db is an openable SQLite database, not just bytes.
+    const reopened = new Database(path.join(restored, 'inbound.db'), { readonly: true });
+    try {
+      expect(reopened.prepare('SELECT COUNT(*) AS n FROM messages_in').get()).toEqual({ n: 0 });
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it('excludes creds and regenerable trees, and preserves everything else', () => {
+    const dir = seedIdle('sess-excludes');
+    // makeSessionDir already writes creds/secret.json. Add one tree per
+    // exclusion class, plus a sibling that must NOT be swept up with them.
+    const excluded = ['node_modules', '.pnpm-store', '.turbo', 'dist', 'coverage', '__pycache__'];
+    for (const name of excluded) {
+      fs.mkdirSync(path.join(dir, 'worktrees', 'repo', name), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'worktrees', 'repo', name, 'regenerable'), 'throwaway');
+    }
+    fs.mkdirSync(path.join(dir, 'worktrees', 'repo', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'worktrees', 'repo', 'src', 'keep.ts'), 'keep me\n');
+
+    expect(runApply().actions.find((a) => a.kind === 'archive-session')?.status).toBe('applied');
+
+    const entry = readReclaimJournal(rescuesDir).get('sess-excludes')!;
+    const restored = path.join(extract(entry.rescue_path), 'sess-excludes');
+
+    // What the action's safety string promises is excluded:
+    expect(fs.existsSync(path.join(restored, 'creds'))).toBe(false);
+    for (const name of excluded) {
+      expect(fs.existsSync(path.join(restored, 'worktrees', 'repo', name)), name).toBe(false);
+    }
+    // ...and what it promises is kept:
+    expect(fs.readFileSync(path.join(restored, 'worktrees', 'repo', 'src', 'keep.ts'), 'utf8')).toBe('keep me\n');
+    expect(fs.readFileSync(path.join(restored, 'notes.md'), 'utf8')).toBe('human work');
+    expect(fs.existsSync(path.join(restored, 'inbound.db'))).toBe(true);
+    expect(fs.existsSync(path.join(restored, 'outbound.db'))).toBe(true);
+  });
+
+  it('keeps the session dir when the published archive would be truncated', () => {
+    const dir = seedIdle('sess-truncated');
+    const db = centralDbMock.current!.db;
+    // A half-written zstd stream: a non-empty file that passes the size check
+    // and only `tar -tf` catches. This is the check that stands between a
+    // corrupt archive and deleting the only copy.
+    mockExecFileSync.mockImplementation((cmd: string, cmdArgs?: unknown, opts?: unknown) => {
+      const argv = (cmdArgs ?? []) as string[];
+      const create = argv.indexOf('-cf');
+      if (cmd === 'tar' && create >= 0) {
+        const out = passThroughExceptDf(cmd, argv, opts);
+        const target = argv[create + 1]!;
+        fs.truncateSync(target, Math.max(1, Math.floor(fs.statSync(target).size / 2)));
+        return out;
+      }
+      return passThroughExceptDf(cmd, argv, opts);
+    });
+
+    expect(runApply().actions.find((a) => a.kind === 'archive-session')?.status).toBe('failed');
+    expect(fs.existsSync(path.join(dir, 'notes.md'))).toBe(true);
+    expect(sessionStatus(db, 'sess-truncated')).toBe('active');
+    expect(fs.existsSync(rescuesDir) ? fs.readdirSync(rescuesDir) : []).toEqual([]);
+  });
+});
+
+/**
+ * `collectedActivityMs` is the baseline apply compares against to prove the
+ * session did not change since it was judged. If it is sampled AFTER the age
+ * and central-row signals, a turn that completes during planning writes fresh
+ * mtimes that become the expected baseline — apply then sees equality and
+ * certifies a stale decision as current, without ever re-reading
+ * `sessions.last_active`.
+ */
+describe('storage-manager reclaim planning baseline', () => {
+  let tmpRoot: string;
+  let sessionsRoot: string;
+  const now = Date.parse('2026-06-30T00:00:00.000Z');
+  const DAY = 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    _resetStorageManagerThrottleForTesting();
+    closeCentralDb();
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'storage-baseline-'));
+    sessionsRoot = path.join(tmpRoot, 'v2-sessions');
+    mockExecFileSync.mockImplementation(tarAwareExecFileSync);
+  });
+
+  afterEach(() => {
+    closeCentralDb();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('samples the apply baseline at decision time, not after planning', () => {
+    const dir = makeSessionDir(sessionsRoot, 'ag-1', 'sess-mid-plan', now - 40 * DAY, { workContinuation: '' });
+    const db = installCentralDb([
+      { id: 'sess-mid-plan', status: 'active', last_active: new Date(now - 40 * DAY).toISOString() },
+    ]);
+
+    // A container turn lands DURING planning. selectSessionsToArchive's active
+    // -count query runs strictly after the candidate loop (where the gates were
+    // evaluated against the 40-day-old signals) and strictly before the action
+    // loop (where the pre-fix code re-read the baseline) — so hooking it lands
+    // the bump in exactly the window under test.
+    const realPrepare = db.prepare.bind(db);
+    let bumped = false;
+    db.prepare = ((sql: string) => {
+      if (!bumped && sql.includes("COUNT(*) AS n FROM sessions WHERE status = 'active'")) {
+        bumped = true;
+        const fresh = now / 1000;
+        for (const name of ['inbound.db', 'outbound.db']) fs.utimesSync(path.join(dir, name), fresh, fresh);
+      }
+      return realPrepare(sql);
+    }) as typeof db.prepare;
+
+    const report = getStorageReport({
+      mode: 'apply',
+      now,
+      sessionsRoot,
+      threadsRoot: path.join(tmpRoot, 'no-threads'),
+      includeDocker: false,
+      policy: {
+        filesystemPath: tmpRoot,
+        idleArtifactMs: 1 * DAY,
+        worktreeReclaimMs: 30 * DAY,
+        // Forces the active-count query that carries the hook above.
+        sessionActiveCap: 1,
+      },
+    });
+
+    expect(bumped).toBe(true);
+    // The decision-time baseline no longer matches the directory, so apply
+    // refuses. Sampling it after planning absorbs the bump instead, and deletes
+    // a session that had just been active.
+    expect(report.actions.find((a) => a.kind === 'archive-session')?.status).toBe('skipped');
+    expect(fs.existsSync(dir)).toBe(true);
   });
 });
