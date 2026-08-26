@@ -1052,11 +1052,14 @@ export class CodexProvider implements AgentProvider {
           // times for it, so the usage accumulator is created HERE — not inside
           // runOneTurn (which drops every request made before a retry) and not
           // outside this shift (which would re-book earlier turns' spend and
-          // recreate the cumulative-carry bug this replaced). Reset explicitly on
-          // the fresh-thread retry paths, where the original request is re-sent
-          // against a thread with no history and the prior attempt would
-          // double-count.
-          let turnAccum = createCodexTurnAccumulator();
+          // recreate the cumulative-carry bug this replaced).
+          //
+          // It is created once and NEVER replaced. Every attempt this loop makes
+          // — same-thread recovery and fresh-thread retry alike — bills real
+          // tokens to the provider, so all of them belong to this turn's total.
+          // The fresh-thread paths reset only the thread-scoped dedupe state; see
+          // resetCodexTurnAccumulatorThread.
+          const turnAccum = createCodexTurnAccumulator();
 
           // Rotation loop. Each iteration runs the same `text` against the
           // current app-server; on a rotation-eligible error with fallback
@@ -1162,7 +1165,7 @@ export class CodexProvider implements AgentProvider {
                     // original request because the new thread has no context.
                     initYielded = false;
                     attemptText = text;
-                    turnAccum = createCodexTurnAccumulator();
+                    resetCodexTurnAccumulatorThread(turnAccum);
                   } else {
                     // Same persisted thread: ask Codex to continue rather than
                     // duplicating the original user request and its side effects.
@@ -1208,7 +1211,7 @@ export class CodexProvider implements AgentProvider {
                   turnTracker.threadId = threadId ?? null;
                   if (threadId !== previousThreadId) {
                     initYielded = false;
-                    turnAccum = createCodexTurnAccumulator();
+                    resetCodexTurnAccumulatorThread(turnAccum);
                   }
 
                   rotateAndRetry = true;
@@ -1281,7 +1284,7 @@ export class CodexProvider implements AgentProvider {
                     turnTracker.threadId = threadId ?? null;
                     if (threadId !== previousThreadId) {
                       initYielded = false;
-                      turnAccum = createCodexTurnAccumulator();
+                      resetCodexTurnAccumulatorThread(turnAccum);
                     }
 
                     rotateAndRetry = true;
@@ -1372,6 +1375,35 @@ export function createCodexTurnAccumulator(): CodexTurnAccumulator {
     countedItemIds: new Set(),
     lastUsageKey: null,
   };
+}
+
+/**
+ * A fresh-thread retry keeps the turn's billed totals and drops only the state
+ * that belonged to the thread that went away.
+ *
+ * The totals carry because the failed attempt's tokens were genuinely billed by
+ * the provider. They are never added twice — the fresh attempt's requests are
+ * distinct requests — so clearing them here does not prevent a double-count, it
+ * silently discards real spend.
+ *
+ * Both dedupe guards DO reset, because each keys on a value the new thread
+ * re-issues from scratch:
+ *  - `lastUsageKey` is the adjacent-duplicate guard. A fresh thread's first
+ *    payload is `{last: X, total: X}` — exactly the shape the failed attempt's
+ *    FIRST payload had, and the fresh attempt re-sends the same prompt, so those
+ *    counts can match byte-for-byte. A carried key would suppress a genuine
+ *    request rather than a repeat.
+ *  - `countedItemIds` holds server-assigned ids from a thread that no longer
+ *    exists. A fresh app-server may reuse them, which would undercount `steps` —
+ *    the denominator of output_per_step.
+ *
+ * The same-thread recovery path resets NEITHER: there the resumed app-server
+ * really can replay records the pre-crash attempt already counted, which is the
+ * exposure both guards exist for.
+ */
+export function resetCodexTurnAccumulatorThread(accum: CodexTurnAccumulator): void {
+  accum.countedItemIds.clear();
+  accum.lastUsageKey = null;
 }
 
 // ── Per-turn event pump ─────────────────────────────────────────────────────

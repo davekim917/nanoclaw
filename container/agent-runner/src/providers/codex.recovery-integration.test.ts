@@ -219,11 +219,17 @@ lines.on('line', (line) => {
 });
 
 // Cost attribution across the outer retry loop. One logical turn can span
-// several runOneTurn invocations, and the two sub-cases pull in opposite
-// directions: a resumed thread continues the SAME turn (its earlier model
-// requests must still be counted), while a fresh thread re-sends the original
-// request against empty history (counting the failed attempt would
-// double-book it).
+// several runOneTurn invocations, and EVERY attempt is billed: the provider
+// charged for the requests the failed attempt made, and the retry's requests
+// are distinct requests, so the turn total is their sum. That holds whether the
+// retry resumed the same thread or started a fresh one.
+//
+// The contract used to be the opposite for the fresh-thread case: the
+// accumulator was recreated, on the stated grounds that keeping it "would
+// double-count". It would not — the same tokens are never added twice — so the
+// reset simply dropped spend the meter had already been billed for. Changed
+// deliberately; the two dedupe guards below are what stop a genuine
+// double-count, and they are unchanged.
 describe('CodexProvider usage accounting across a recovery retry', () => {
   for (const scenario of [
     {
@@ -236,11 +242,26 @@ describe('CodexProvider usage accounting across a recovery retry', () => {
     },
     {
       resumeStale: true,
-      title: 'fresh-thread retry does NOT inherit the failed attempt (no double-count)',
-      // The original request is re-sent against thread-2, so only 200/20/7/3.
-      expected: { inputTokens: 200, outputTokens: 20, cacheReadTokens: 7, cacheWriteTokens: 3 },
-      // ...and only the one item/completed the fresh attempt produced.
-      expectedSteps: 1,
+      title: 'fresh-thread retry carries the failed attempt forward (its tokens were billed)',
+      // The original request is re-sent against thread-2, and thread-1's
+      // requests were still paid for: 100/10/5/2 + 200/20/7/3.
+      expected: { inputTokens: 300, outputTokens: 30, cacheReadTokens: 12, cacheWriteTokens: 5 },
+      // 2 item/completed on the dead thread + 1 on the fresh one.
+      expectedSteps: 3,
+    },
+    {
+      resumeStale: true,
+      replay: true,
+      title: "fresh-thread retry counts a request whose payload matches the dead thread's",
+      // The dedupe guards are thread-scoped and must NOT survive the switch. A
+      // fresh thread's first payload is `{last: X, total: X}` — the same shape
+      // the dead thread's first payload had — and the re-sent prompt makes the
+      // counts likely to match byte-for-byte. That is a genuine second request,
+      // not a repeat, so it books: 100/10/5/2 + 100/10/5/2 + 200/20/7/3.
+      // Carrying `lastUsageKey` across the switch suppresses it (300/30/12/5),
+      // and carrying `countedItemIds` re-suppresses `done-a` (3 steps).
+      expected: { inputTokens: 400, outputTokens: 40, cacheReadTokens: 17, cacheWriteTokens: 7 },
+      expectedSteps: 4,
     },
     {
       resumeStale: false,
@@ -430,7 +451,7 @@ lines.on('line', (line) => {
         expect(events.some((event) => event.type === 'error')).toBe(false);
         const result = events.find((event) => event.type === 'result');
         expect(result?.usage).toMatchObject(scenario.expected);
-        // `steps` shares the accumulator, so it must survive/reset identically.
+        // `steps` shares the accumulator, so it must carry and reset identically.
         expect(result?.steps).toBe(scenario.expectedSteps);
       },
       5_000,
