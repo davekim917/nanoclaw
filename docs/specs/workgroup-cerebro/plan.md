@@ -1078,7 +1078,7 @@ In `curator-worker.test.ts` unless noted; mocked backend, real temp store files.
 | Mixed-quality tail (18.5% domain, rest process) produces process-heavy topic files | `systems/` is the legitimate home for durable process knowledge; the prompt routes by entity type rather than filtering; the reason codes in the input let the model weight domain facts for `domain/`. Measured after a week via file spot-reads.                                                                                                               |
 | Workgroup lock contention with agent writes                                        | Same lock the fleet already shares for every memory write; passes are one lock per file, seconds apart.                                                                                                                                                                                                                                                          |
 | Model laziness on the `{files: []}` success path                                   | The real risk introduced by P2.4 item 7: a lazy model can mark a real change "nothing to update" and its facts are still consolidated. Not structurally prevented — audited via the distinct `fileCount: 0` log line (P2-AC7(b)) and post-deploy spot-reads; retreat is tightening the prompt if the log shows a genuine pattern of misses.                      |
-| Topic-file count growth vs. the recall traversal ceiling and the prompt input cap  | As topic files accumulate, both the recall lane's 256-entry fs-walk cap and the consolidation input's 256 KiB total-content cap can start excluding files. The per-pass 12-file/8,192-byte output caps keep growth bounded and the over-cap lock (P2.4 item 6) makes exclusion visible via logs; not solved further here — a recurrence is pillar 3/4 territory. |
+| Topic-file count growth vs. the recall traversal ceiling and the prompt input cap  | As topic files accumulate, both the recall lane's 256-entry fs-walk cap and the consolidation input's 256 KiB total-content cap can start excluding files. The per-pass 12-file/8,192-byte output caps keep growth bounded and the over-cap lock (P2.4 item 6) makes exclusion visible via logs; not solved further here — a recurrence is future-pillar territory. |
 | Catch-up storm after the backfill enqueue                                          | Every non-empty-ledger workgroup goes pending at once on migration. Bounded by the existing claim/lease serialization (one job claimed per sweep tick) plus the 150-fact-per-round cap, so the fleet drains gradually rather than storming — one pass per sweep round per workgroup, not a burst.                                                                |
 
 ## P2.5 — Recall projection
@@ -1498,13 +1498,14 @@ extensions above. The token-stream persistence gap (decision 3) and the
 promote-protocol gap (decision 12) were each caught by only one of the two
 reviews — neither alone would have found both.
 
-## 9. Pillars 2–4 — sequenced, deliberately not designed here
+## 9. Pillars 2 and 4 — sequenced, deliberately not designed here
 
 Recorded scope: `project_workgroup_cerebro_plan.md`. This plan builds pillars 0 and 1.
-Pillars 2–4 get their own `/team-plan` when their entry criteria are met. Designing them
-now would be speculative: pillar 2's shape depends on whether pillar 1 changes agent
-behavior, and pillar 4 was explicitly ordered last "after consolidation shows which
-entities matter."
+Pillar 2 and pillar 4 get their own `/team-plan` when their entry criteria are met;
+pillar 3 was dropped outright, not deferred (below — the numbering gap is intentional).
+Designing 2 and 4 now would be speculative: pillar 2's shape depends on whether pillar 1
+changes agent behavior, and pillar 4 was explicitly ordered last "after consolidation
+shows which entities matter."
 
 **Pillar 0 changes pillar 2's entry criteria.** Consolidation distils the episodic
 ledger, so it concentrates whatever the ledger holds. Run against today's 11.9% domain
@@ -1522,9 +1523,30 @@ file shape, and §4.3 shows it already ranks top for people queries.
 _Entry criteria:_ pillar 0 deployed and the domain share measurably above its 11.9%
 baseline; pillar 1 deployed two weeks with evidence that pointers are being followed.
 
-**Pillar 3 — structured-source ingestion.** Snowflake schema, dbt lineage, Linear, feed
-schedules into the same topic files on a schedule.
-_Entry criteria:_ pillar 2's topic-file shape stable.
+**Pillar 3 — DROPPED (was: structured-source ingestion).** Originally scoped as
+Snowflake schema, dbt lineage, Linear, and feed schedules pushed into the same topic
+files on a schedule. Dropped outright rather than deferred, for four reasons:
+
+1. **The codebase half is redundant.** Graphify already reconciles current source,
+   canonical clones, tracked and untracked workgroup files, the managed worktree
+   overlay, and conversation history. dbt lineage lives in a repo, so it is already
+   indexed there. Ingesting it again creates a second copy that can disagree with the
+   first.
+2. **The external half is a cache, and caches of fast-changing sources lose.**
+   Ingesting live Snowflake schema, Linear issues, or feed status into topic files "on
+   a schedule" is exactly the shape that made P2.5's recall projection a net loss:
+   value scales with corpus size, cost scales with change rate. P2.5 measured this
+   precisely — 79% faster reads, still a net CPU loss, because every invalidation
+   forced a full rebuild and the largest tree changed every 2.4 minutes. Linear issues
+   and warehouse schemas drift on the same kind of clock.
+3. **The capability already exists live.** Agents reach Snowflake via `snow` and
+   Linear via the OneCLI gateway. Something needed at query time should be queried at
+   query time, with no staleness to reason about.
+4. **What survives is not ingestion.** Judgment about external systems — which tables
+   actually matter for a given analysis, what a late feed implies — is a durable
+   learned fact, and that is pillar 2's topic files, already shipped.
+
+The number is retired with the pillar; pillar 4 below keeps its number unchanged.
 
 **Pillar 4 — entity layer in Graphify.** Person/system/concept node types. The graph has
 none today — only chunks, files, and symbols (§4.3 sample), which is why a person query
