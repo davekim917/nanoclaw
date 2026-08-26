@@ -32,16 +32,44 @@ LOCK_FILE="$STATE_DIR/develop-state.lock"
 # smoke-pr-gate.sh's) because it is this gate's dedup/tamper-check ledger —
 # smoke-pr-gate.sh has no use for it once written.
 HANDOFF_LEDGER="$STATE_DIR/handoff-ledger.jsonl"
-DEBOUNCE_SECONDS="${SMOKE_GATE_DEBOUNCE_SECONDS:-600}"
+# ── INVARIANT 3 — a change lands in BOTH gates, or says at the site why not ──
+# Five review rounds found the same defect correct in the file it was written
+# in and wrong in the file beside it (smoke-pr-gate.sh). Anything added here
+# gets ported there, or carries a one-line justification for being develop-only.
+
+# INVARIANT 1 covers the shape of the state FILE. It said nothing about this
+# gate's own CONFIG, and a non-numeric knob is the same abort through another
+# door: `--argjson ttl abc` aborts the normaliser itself, empties $STATE, and
+# the next `progress` tells a HEALTHY campaign "not the active run — stop this
+# campaign". Verified live with SMOKE_GATE_ACK_MAX_SILENCE_SECONDS=abc.
+#
+# Every numeric knob is read through here. Garbage falls back to the default
+# AND is named in the gate_misconfigured alarm — never silently degraded to a
+# false comparison, which for an alarm threshold means never alarming at all.
+BAD_NUMERIC_CONFIG=""
+# Assigns rather than prints: `X="$(num_env ...)"` runs the function in a
+# SUBSHELL, so BAD_NUMERIC_CONFIG accumulated there and was empty in the
+# parent — the fallback worked, the alarm never fired. Caught by the test that
+# asserts the bad knob is named.
+num_env() {  # <target-var> <env-var-name> <default>
+  local raw="${!2:-}"
+  case "$raw" in
+    '') printf -v "$1" '%s' "$3" ;;
+    *[!0-9]*) BAD_NUMERIC_CONFIG="$BAD_NUMERIC_CONFIG $2"; printf -v "$1" '%s' "$3" ;;
+    *) printf -v "$1" '%s' "$raw" ;;
+  esac
+}
+
+num_env DEBOUNCE_SECONDS SMOKE_GATE_DEBOUNCE_SECONDS 600
 # 4h hard ceiling: campaigns finish in 1-3h; a host restart mid-run otherwise
 # strands the gate for the full window before recovery can reclaim the SHA.
-ACTIVE_STALE_SECONDS="${SMOKE_GATE_ACTIVE_STALE_SECONDS:-14400}"
+num_env ACTIVE_STALE_SECONDS SMOKE_GATE_ACTIVE_STALE_SECONDS 14400
 # Liveness: the coordinator stamps `progress <run-id>` while working. An
 # active run whose newest stamp (or start, if never stamped) is older than
 # this is treated as dead — catches containers killed at spawn without
 # waiting out the hard ceiling.
-PROGRESS_STALE_SECONDS="${SMOKE_GATE_PROGRESS_STALE_SECONDS:-1800}"
-OVERRUN_REALERT_SECONDS="${SMOKE_GATE_OVERRUN_REALERT_SECONDS:-7200}"
+num_env PROGRESS_STALE_SECONDS SMOKE_GATE_PROGRESS_STALE_SECONDS 1800
+num_env OVERRUN_REALERT_SECONDS SMOKE_GATE_OVERRUN_REALERT_SECONDS 7200
 # Optional campaign wake window, `HH:MM-HH:MM` (may wrap midnight), evaluated
 # in SMOKE_GATE_WAKE_TZ. Unset = always open, so no existing deployment
 # changes behaviour. This gates only the full-campaign wake: every other
@@ -81,17 +109,17 @@ DECISION_LEDGER="${SMOKE_GATE_DECISION_LEDGER:-}"
 # How often an undecided hold re-alarms. Default matches the campaign cadence
 # floor: the human hears from the fleet at the same rate as before, but each
 # notification is a token-free wake instead of a full campaign.
-HOLD_ALERT_SECONDS="${SMOKE_GATE_HOLD_ALERT_SECONDS:-21600}"
+num_env HOLD_ALERT_SECONDS SMOKE_GATE_HOLD_ALERT_SECONDS 21600
 # Optional live-run artifact for merge-queue coordination: written when a run
 # is claimed, refreshed by `progress`, removed by `finish`. Carries
 # `holdMergesUntil` so a consumer never has to know this gate's timings — and
 # so a run that dies without finishing cannot hold the queue forever.
 ACTIVE_FILE="${SMOKE_GATE_ACTIVE_FILE:-}"
-MERGE_HOLD_SECONDS="${SMOKE_GATE_MERGE_HOLD_SECONDS:-5400}"
+num_env MERGE_HOLD_SECONDS SMOKE_GATE_MERGE_HOLD_SECONDS 5400
 # One throttled wake when the same head stays unsettled this long (red CI,
 # hung checks, stuck deploys). Without it the watcher waits silently forever —
 # fail-quiet, which this gate refuses everywhere else.
-UNSETTLED_ALERT_SECONDS="${SMOKE_GATE_UNSETTLED_ALERT_SECONDS:-2700}"
+num_env UNSETTLED_ALERT_SECONDS SMOKE_GATE_UNSETTLED_ALERT_SECONDS 2700
 # Optional readiness command run immediately before a campaign is opened, for
 # preconditions this gate cannot see: test-account liveness, a seeded fixture,
 # a reachable dependency. Exit 0 = go. Non-zero = the campaign never opens and
@@ -109,18 +137,18 @@ UNSETTLED_ALERT_SECONDS="${SMOKE_GATE_UNSETTLED_ALERT_SECONDS:-2700}"
 # the window check does: `emit_no_wake` preserves the settled candidate, so the
 # first poll after the preconditions are repaired opens the campaign normally.
 PREFLIGHT_CMD="${SMOKE_GATE_PREFLIGHT_CMD:-}"
-PREFLIGHT_TIMEOUT="${SMOKE_GATE_PREFLIGHT_TIMEOUT:-120}"
+num_env PREFLIGHT_TIMEOUT SMOKE_GATE_PREFLIGHT_TIMEOUT 120
 # A failing precondition is an alarm, so it wakes — but the condition is not
 # SHA-bound the way `develop_unsettled` is (dead accounts stay dead across every
 # new head), so a per-SHA one-shot would re-alarm on each merge. Throttle on
 # time instead, and re-arm immediately whenever the reason text changes.
-PREFLIGHT_ALERT_SECONDS="${SMOKE_GATE_PREFLIGHT_ALERT_SECONDS:-21600}"
+num_env PREFLIGHT_ALERT_SECONDS SMOKE_GATE_PREFLIGHT_ALERT_SECONDS 21600
 # ...and a FLOOR under the re-arm. The ceiling alone assumed the reason text is
 # stable while a condition persists, which it is not: a reason that names which
 # checks failed changes whenever one of them flaps, so text-change re-arm on its
 # own can wake once per poll. Ceiling stops silence; floor stops a storm. An
 # alarm that fires six times an hour is one nobody reads.
-PREFLIGHT_REARM_FLOOR_SECONDS="${SMOKE_GATE_PREFLIGHT_REARM_FLOOR_SECONDS:-900}"
+num_env PREFLIGHT_REARM_FLOOR_SECONDS SMOKE_GATE_PREFLIGHT_REARM_FLOOR_SECONDS 900
 # Comma-separated path prefixes that require each service to redeploy. When a
 # service's live deploy lags the source SHA, the lag is accepted only if every
 # file changed between them falls OUTSIDE that service's paths — the deployed
@@ -145,11 +173,11 @@ FREEZE_HELPER="${SMOKE_GATE_FREEZE_HELPER:-}"
 # How long an open freeze handoff stays worth testing. A freeze pins one
 # develop SHA; past this, with develop moved on, the slot is freed so the next
 # poll re-freezes on current head rather than campaigning a superseded build.
-FREEZE_STALE_SECONDS="${SMOKE_GATE_FREEZE_STALE_SECONDS:-14400}"
+num_env FREEZE_STALE_SECONDS SMOKE_GATE_FREEZE_STALE_SECONDS 14400
 # Minimum interval between freeze cuts (campaign cadence floor). 0 = no floor
 # (default, no behavior change for existing deployments); the wrapper sets the
 # policy. Counted from the last freeze OPEN, so campaign duration eats into it.
-FREEZE_MIN_INTERVAL_SECONDS="${SMOKE_GATE_FREEZE_MIN_INTERVAL_SECONDS:-0}"
+num_env FREEZE_MIN_INTERVAL_SECONDS SMOKE_GATE_FREEZE_MIN_INTERVAL_SECONDS 0
 # `check` runs the poll derivation and reports settledness WITHOUT mutating
 # state or claiming anything. It exists for human-requested campaigns, which
 # freeze on a person's word rather than on a gate wake and would otherwise
@@ -164,7 +192,7 @@ mkdir -p "$STATE_DIR"
 # unlock inside `freeze_status`), so a few seconds covers every ordinary
 # collision. Kept small and tunable rather than "long enough for anything",
 # because a scheduled-task runner may cap total wall clock.
-LOCK_WAIT="${SMOKE_GATE_LOCK_WAIT_SECONDS:-15}"
+num_env LOCK_WAIT SMOKE_GATE_LOCK_WAIT_SECONDS 15
 
 # Losing the lock is NOT losing the slot, and the two must never look alike.
 #
@@ -328,12 +356,13 @@ write_state() {
   # next. `exit` rather than `return` because no caller inspects the status —
   # a return value would be swallowed and the command would report success.
   #
-  # This is a BACKSTOP, not the primary defence. INVARIANT 1 makes every
-  # dispositions transform total, so a corrupt state file no longer reaches
-  # here — it is recovered on read instead, which keeps alarms ringing. What is
-  # left for this guard is a future transform over some OTHER field that aborts
-  # for a reason nobody anticipated. Deliberately kept even though nothing in
-  # the current code can trigger it.
+  # A BACKSTOP, and — correcting an earlier claim in this file — a REACHABLE
+  # one. INVARIANT 1 keeps a corrupt state FILE from reaching here, but two
+  # non-file routes were found by review: a non-numeric numeric knob (now
+  # validated by `num_env`) and a freeze helper returning a wrong-typed
+  # `prNumber` (now typed at its call site). Both are closed upstream; this
+  # stays as the last line for whatever the next one is, because the failure
+  # it catches is silent loss of live campaign state.
   if ! jq -e 'type == "object"' <<<"$next" >/dev/null 2>&1; then
     jq -cn '{ok:false,error:"gate state did not survive a transform — refusing to write; on-disk state is preserved"}'
     exit 3
@@ -393,13 +422,27 @@ epoch_or_zero() {
 # and alarms on the normal rules, and an acked incident can never go dark for
 # longer than the TTL. `resolved` never silences — it asserts the condition is
 # gone, so if the gate still sees it the claim was wrong and must alarm.
-ACK_MAX_SILENCE_SECONDS="${SMOKE_GATE_ACK_MAX_SILENCE_SECONDS:-86400}"
-# Every alarm trigger this gate emits (grep `trigger:"` below). Validated on
-# `ack` so a typo cannot be filed under a key nothing ever reads.
+num_env ACK_MAX_SILENCE_SECONDS SMOKE_GATE_ACK_MAX_SILENCE_SECONDS 86400
+# Every alarm trigger the SKILL emits — this gate's own (grep `trigger:"`
+# below) plus smoke-pr-gate.sh's `pr_*` ones, because this is the only `ack`
+# verb in the fleet and an agent following the contract has nowhere else to
+# file them. Without the `pr_*` entries those wakes exited 2 "unknown trigger",
+# so an agent either left the wake open or refiled under a develop trigger and
+# clobbered that slot. They are record-only: none is in ACK_SILENCEABLE,
+# because smoke-pr-gate.sh consults no dispositions and would re-alarm anyway.
+# Validated on `ack` so a typo cannot be filed under a key nothing reads.
+#
+# `gate_misconfigured` and `gate_fetch_failed` are still emitted by BOTH gates
+# under one name, so an ack from one overwrites the other's record. Neither is
+# silenceable, so no alarm is muted — the residue is an inaccurate audit entry.
+# Left as-is rather than renamed: both gates' deployed prompts key on those
+# names, and the fix is a prompt-and-skill change, not a skill-only one.
 ACK_TRIGGERS="develop_unsettled develop_freeze_abandoned develop_freeze_stale
   develop_freeze_ledger_tampered develop_freeze_failed gate_hold_tampered
   develop_run_overrun develop_hold_undecided preflight_failed
-  gate_misconfigured gate_fetch_failed"
+  gate_misconfigured gate_fetch_failed
+  pr_preflight_failed pr_migrations_refused pr_warmup_stuck
+  pr_facts_unavailable pr_run_overrun"
 # ...of which only these two re-alarm on a plain timer against a stable reason
 # string, so only these two are silenceable. The other interval alarms
 # (misconfigured, fetch failure, run overrun, undecided hold) stay
@@ -430,7 +473,7 @@ ACK_SILENCEABLE="develop_freeze_failed preflight_failed"
 # lever that actually bounds the exposure. It is also narrower than it looks:
 # the two static strings differ from EACH OTHER, so acking "still warming"
 # cannot swallow "past the ceiling — a DEFECT" or a seat failure.
-ACK_MAX_SILENCE_PREFLIGHT_SECONDS="${SMOKE_GATE_ACK_MAX_SILENCE_PREFLIGHT_SECONDS:-43200}"
+num_env ACK_MAX_SILENCE_PREFLIGHT_SECONDS SMOKE_GATE_ACK_MAX_SILENCE_PREFLIGHT_SECONDS 43200
 
 ack_ttl() {
   if [ "$1" = preflight_failed ]; then
@@ -654,6 +697,27 @@ if [ "$COMMAND" = "finish" ]; then
   if [ "$RUN_ID" != "$ACTIVE_RUN" ]; then
     emit_not_active "$RUN_ID" "not the active run (reclaimed or already finished) — no verdict recorded, no hold touched"
     exit 0
+  fi
+  # ...and the SHA must be the one this run actually claimed. Ported in shape
+  # from smoke-pr-gate.sh, which grew this guard after the live #1211 incident;
+  # this gate carries identical verdict authority and had the identical hole.
+  # Any well-formed SHA was accepted: ok:true, a hold and publish file naming a
+  # build nobody examined, `completedSha` advancing to an untested SHA so it is
+  # never campaigned, and the SHA that actually ran left eligible and
+  # re-frozen. The hold-integrity reconciler cannot catch it — it compares
+  # runId, correctly.
+  #
+  # Before any state write, artifact write or freeze_status call, and the slot
+  # stays held, so re-running `finish` with the claimed SHA completes normally.
+  CLAIMED_SHA="$(jq -r '.activeSha // empty' <<<"$STATE")"
+  if [ "$SHA" != "$CLAIMED_SHA" ]; then
+    jq -cn --arg run "$RUN_ID" --arg supplied "$SHA" --arg claimed "$CLAIMED_SHA" \
+      '{ok:false,
+        error:("finish sha does not match the sha this run claimed — no verdict recorded, no hold touched, slot still held. Re-run: finish " +
+               (if $claimed == "" then "<claimed-sha>" else $claimed end) + " " + $run + " <verdict>"),
+        runId:$run,suppliedSha:$supplied,
+        claimedSha:(if $claimed == "" then null else $claimed end)}'
+    exit 2
   fi
   NOW="$(iso_now)"
   STATE="$(jq -c \
@@ -956,6 +1020,9 @@ MISSING=""
 [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
 [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
 [ -n "$DEV_URL" ] || MISSING="$MISSING SMOKE_GATE_DEV_URL"
+# A knob that fell back to its default because the deployed value was not a
+# number is a misconfiguration, not a detail — name it in the same alarm.
+MISSING="$MISSING$BAD_NUMERIC_CONFIG"
 if [ "$FREEZE_HANDOFF" = true ] && { [ -z "$FREEZE_HELPER" ] || [ ! -x "$FREEZE_HELPER" ]; }; then
   MISSING="$MISSING SMOKE_GATE_FREEZE_HELPER"
 fi
@@ -1406,9 +1473,15 @@ if [ -n "$HOLD_FILE" ]; then
     # missing, which is exactly the hole this reconciler exists to close.
   esac
 fi
+# Latch on the CATEGORY PLUS THE OFFENDER, not the category alone. The four
+# values are `ok|missing|mismatched|unexpected`, so a bare category latch is
+# satisfied by the first offender forever: a second, unrelated run producing
+# the same category never re-alerted. Same fingerprint-not-reason shape as
+# INVARIANT 2 — the discriminating part is who, not what kind.
+HOLD_ALERT_KEY="$HOLD_INTEGRITY|$(jq -r '.completedRunId // empty' <<<"$STATE")"
 if [ "$HOLD_INTEGRITY" != ok ] &&
-   [ "$(jq -r '.holdAlertFor // empty' <<<"$STATE")" != "$HOLD_INTEGRITY" ]; then
-  STATE="$(jq -c --arg s "$HOLD_INTEGRITY" '.holdAlertFor=$s' <<<"$STATE")"
+   [ "$(jq -r '.holdAlertFor // empty' <<<"$STATE")" != "$HOLD_ALERT_KEY" ]; then
+  STATE="$(jq -c --arg s "$HOLD_ALERT_KEY" '.holdAlertFor=$s' <<<"$STATE")"
   write_state "$STATE"
   jq -cn --arg state "$HOLD_INTEGRITY" --arg run "$(jq -r '.completedRunId // empty' <<<"$STATE")" \
     --arg verdict "$(jq -r '.completedVerdict // empty' <<<"$STATE")" \
@@ -1671,8 +1744,9 @@ if [ -n "$PREFLIGHT_CMD" ]; then
         --arg reason "$PREFLIGHT_REASON" \
         --arg sha "$SOURCE_SHA" \
         --argjson rc "$PREFLIGHT_RC" \
+        --arg fp "$PREFLIGHT_FINGERPRINT" \
         '{wakeAgent:true,data:{schemaVersion:1,trigger:"preflight_failed",
-          sourceSha:$sha,reason:$reason,exitCode:$rc,fingerprint:$reason}}'
+          sourceSha:$sha,reason:$reason,exitCode:$rc,fingerprint:$fp}}'
       exit 0
     fi
     # Already alarmed on this exact reason inside the throttle window. Refuse
@@ -1722,7 +1796,13 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   # straight into the throttled freeze-failure alarm below.
   FREEZE_JSON="$(timeout "${SMOKE_GATE_FREEZE_HELPER_TIMEOUT:-90}" "$FREEZE_HELPER" "$SOURCE_SHA" 2>/dev/null)"
   FREEZE_RC=$?
-  if [ "$FREEZE_RC" -ne 0 ] || ! jq -e 'type == "object" and has("prNumber") and has("freezeSha")' \
+  # TYPE, not just presence. `has("prNumber")` passed a helper returning
+  # `"prNumber":"abc"` at rc 0, and the success path's `--argjson pr` then
+  # aborted — emptying $STATE and exiting 3 with a bare ok:false AFTER the
+  # freeze PR had already been created, orphaning PR and branch with no alarm.
+  # Typed validation routes a malformed payload to the throttled
+  # develop_freeze_failed path instead, which is what that path is for.
+  if [ "$FREEZE_RC" -ne 0 ] || ! jq -e '(type == "object") and ((.prNumber|type) == "number") and ((.freezeSha|type) == "string")' \
        <<<"$FREEZE_JSON" >/dev/null 2>&1; then
     # The helper itself failed (branch collision, PR create failure, etc).
     # Same throttle shape as preflight above: one wake per distinct reason,

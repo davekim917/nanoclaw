@@ -484,6 +484,21 @@ pf_poll 'echo "8 of 8 QA seats could not be verified"; exit 1' | jq -e '
 # against rather than a stale one.
 jq -e '.preflightReason == "8 of 8 QA seats could not be verified"' "$PF_STATE" >/dev/null
 
+# ...and once the floor has passed, a reason that RETURNS to the last ALARMED
+# one must NOT re-arm. This is the case that separates INVARIANT 2's
+# fingerprint latch from a reason latch, and nothing else in this suite does:
+# the throttled branch above persists `.preflightReason` but deliberately NOT
+# `.preflightFingerprint`, so "last seen" and "last alarmed" diverge the moment
+# a flap is throttled. Keying on the reason would read 3 -> 8 -> 3 as news and
+# wake for an incident the operator has already been told about, every time the
+# text flaps back. Every other preflight case here either runs inside the floor
+# or sets SMOKE_GATE_PREFLIGHT_ALERT_SECONDS=0, which disables the throttle and
+# makes both keyings behave identically.
+pf_age
+pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '
+  .wakeAgent == false and .data.trigger == "preflight_failed"
+' >/dev/null
+
 # Once the floor has passed, a changed reason re-arms — 3 dead seats becoming 8
 # is news, and the floor delays that news, never suppresses it.
 pf_age
@@ -916,7 +931,7 @@ jq -e '.runId == "held-run-1" and .verdict == "HUMAN_DECISION"' "$HOLD_FILE" >/d
 
 # --- 38c. An `override` on that run id re-opens the round ------------------
 # The re-open trigger is the decision itself — no human restarts anything.
-jq -cn '{ts:"2026-08-25T19:21:33Z",user:"James",action:"override",
+jq -cn '{ts:"2026-08-25T19:21:33Z",user:"operator-a",action:"override",
          target:"smoke_hold:held-run-1"}' > "$LEDGER_DIR/2026-08-25.jsonl"
 bash "$GATE" poll | jq -e --arg sha "$HOLD_SHA" '
   .wakeAgent == true and .data.trigger == "develop_build_settled" and .data.sourceSha == $sha
@@ -934,14 +949,14 @@ mkdir -p "$LEDGER_DIR"
 export SMOKE_GATE_HOLD_FILE="$HOLD_FILE" SMOKE_GATE_DECISION_LEDGER="$LEDGER_DIR"
 hold_up "held-run-2" "$HOLD_SHA"
 {
-  jq -cn '{ts:"2026-08-25T19:21:33Z",user:"James",action:"override",target:"smoke_hold:held-run-2"}'
+  jq -cn '{ts:"2026-08-25T19:21:33Z",user:"operator-a",action:"override",target:"smoke_hold:held-run-2"}'
   jq -cn '{ts:"2026-08-25T20:27:00Z",user:"Barry",action:"correction",target:"smoke_hold:held-run-2"}'
 } > "$LEDGER_DIR/2026-08-25.jsonl"
 bash "$GATE" poll >/dev/null
 bash "$GATE" poll | jq -e '.data.trigger == "develop_hold_undecided"' >/dev/null
 
 # --- 38e. An override for a DIFFERENT hold does not decide this one --------
-jq -cn '{ts:"2026-08-25T21:00:00Z",user:"James",action:"override",target:"smoke_hold:some-other-run"}' \
+jq -cn '{ts:"2026-08-25T21:00:00Z",user:"operator-a",action:"override",target:"smoke_hold:some-other-run"}' \
   >> "$LEDGER_DIR/2026-08-25.jsonl"
 bash "$GATE" poll | jq -e '.data.trigger == "hold_undecided"' >/dev/null
 
@@ -949,7 +964,7 @@ bash "$GATE" poll | jq -e '.data.trigger == "hold_undecided"' >/dev/null
 # The desk appends live. A streaming `jq select` aborts at the first malformed
 # line and drops every LATER match — including the decision we are looking for.
 printf '{"ts":"2026-08-25T21:30:00Z","action":"over\n' >> "$LEDGER_DIR/2026-08-25.jsonl"
-jq -cn '{ts:"2026-08-25T22:00:00Z",user:"James",action:"override",target:"smoke_hold:held-run-2"}' \
+jq -cn '{ts:"2026-08-25T22:00:00Z",user:"operator-a",action:"override",target:"smoke_hold:held-run-2"}' \
   >> "$LEDGER_DIR/2026-08-25.jsonl"
 bash "$GATE" poll | jq -e '.data.trigger == "develop_build_settled"' >/dev/null
 
@@ -1301,6 +1316,20 @@ grep -q '\.preflightFingerprint=\$f' "$SCRIPT_DIR/smoke-pr-gate.sh" \
 # process in which both can be exercised together.
 grep -q 'PREFLIGHT_FINGERPRINT="pr|' "$SCRIPT_DIR/smoke-pr-gate.sh" \
   || { echo "pr gate preflight fingerprint is not gate-scoped" >&2; exit 1; }
+# ...and the payload's `fp` must be BOUND to the fingerprint variable, not
+# merely present. The awk check above passes on `--arg fp "$PREFLIGHT_REASON"`
+# because the emitted key is still `fingerprint:$fp`. For this trigger the
+# fingerprint and the reason are equal by assignment today (preflight is
+# deliberately NOT SHA-scoped — a per-SHA one-shot would re-alarm on every
+# merge), so no behavioural test can separate the two bindings: mutating one
+# into the other produces byte-identical output. The binding is the only
+# checkable form of INVARIANT 2 here, and it is the part that matters — it is
+# what makes the payload follow the fingerprint if it ever gains a
+# discriminator, which is the whole reason the variable exists.
+for producer in "$GATE" "$SCRIPT_DIR/smoke-pr-gate.sh"; do
+  grep -q -- '--arg fp "\$PREFLIGHT_FINGERPRINT"' "$producer" \
+    || { echo "$(basename "$producer") does not bind fp to PREFLIGHT_FINGERPRINT" >&2; exit 1; }
+done
 
 # --- 48b. The prune window is the LONGEST of the two TTLs ------------------
 # They are independently overridable. Taking the general one alone would delete
@@ -1389,6 +1418,112 @@ jq --arg t "$(date -u -d '@'$(( $(date -u +%s) + 3600 )) +'%Y-%m-%dT%H:%M:%SZ')"
   '.dispositions.preflight_failed.at=$t' "$PF_STATE" > "$PF_STATE.tmp" && mv "$PF_STATE.tmp" "$PF_STATE"
 pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '.wakeAgent == true' >/dev/null
 unset SMOKE_GATE_PREFLIGHT_ALERT_SECONDS
+
+# --- 52. MUST-FIX: `finish` must validate the SHA, not just the run id ------
+# The PR gate grew this guard after the live #1211 incident; this gate carries
+# identical verdict authority and had the identical hole. Any well-formed SHA
+# was accepted, publishing a verdict for a build nobody examined and advancing
+# completedSha to an untested commit so it is never campaigned.
+fresh_state
+FIN_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
+REAL_SHA="$(printf 'a%.0s' $(seq 40))"
+WRONG_SHA="$(printf 'b%.0s' $(seq 40))"
+bash "$GATE" claim run-fin "$REAL_SHA" >/dev/null
+FIN_OUT="$(bash "$GATE" finish "$WRONG_SHA" run-fin GO || true)"
+jq -e '.ok == false and (.error | test("does not match the sha this run claimed"))' <<<"$FIN_OUT" >/dev/null
+bash "$GATE" finish "$WRONG_SHA" run-fin GO >/dev/null 2>&1 && { echo "finish accepted a foreign sha" >&2; exit 1; }
+# Nothing recorded, and the slot is still held so a correct re-finish works.
+jq -e '.completedSha == null and .activeRunId == "run-fin"' "$FIN_STATE" >/dev/null
+bash "$GATE" finish "$REAL_SHA" run-fin GO | jq -e '.ok == true' >/dev/null
+jq -e --arg s "$REAL_SHA" '.completedSha == $s' "$FIN_STATE" >/dev/null
+
+# --- 53. INVARIANT 1 covers CONFIG too, not just file shapes ---------------
+# `--argjson ttl abc` aborted the normaliser itself, emptied $STATE, and the
+# next `progress` told a HEALTHY campaign to stop — the flagship harm, through
+# the fix for it. Verified live before this case existed.
+fresh_state
+CFG_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
+printf '%s\n' '{"activeSha":"deadbeef","activeRunId":"live-run","dispositions":{}}' > "$CFG_STATE"
+for bad in abc "" 12x -5; do
+  SMOKE_GATE_ACK_MAX_SILENCE_SECONDS="$bad" bash "$GATE" progress live-run \
+    | jq -e '.ok == true and .runId == "live-run"' >/dev/null \
+    || { echo "garbage TTL '$bad' broke a live run" >&2; exit 1; }
+done
+# ...and a non-numeric knob is NAMED in the misconfigured alarm rather than
+# silently degrading a threshold comparison to false (which never alarms).
+fresh_state
+unset SMOKE_GATE_REPO 2>/dev/null || true
+SMOKE_GATE_ACK_MAX_SILENCE_SECONDS=abc bash "$GATE" poll | jq -e '
+  .data.trigger == "gate_misconfigured" and
+  (.data.missing | index("SMOKE_GATE_ACK_MAX_SILENCE_SECONDS") != null)
+' >/dev/null
+export SMOKE_GATE_REPO=org/repo
+
+# --- 54. A wrong-TYPED freeze helper payload must not wedge the gate -------
+# `has("prNumber")` passed `"prNumber":"abc"` at rc 0; the success path's
+# --argjson then aborted, emptying $STATE and exiting 3 AFTER the freeze PR was
+# created — orphaned PR and branch, no alarm, config present so not
+# gate_misconfigured. It must take the throttled freeze-failure path instead.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+export STUB_SOURCE_SHA="$(printf '6%.0s' $(seq 40))"
+export STUB_FREEZE_EXIT=0
+export STUB_FREEZE_JSON='{"prNumber":"abc","freezeSha":"x","branch":"smoke/freeze-6"}'
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_freeze_failed"
+' >/dev/null
+jq -e 'type == "object" and .activeRunId == null' "$SMOKE_GATE_STATE_DIR/develop-state.json" >/dev/null
+unset STUB_FREEZE_EXIT STUB_FREEZE_JSON
+
+# --- 55. The PR gate's alarms are ackable, and record-only -----------------
+# smoke-pr-gate.sh consults no dispositions, so none of its triggers may be
+# silenceable — but they must be FILEABLE, or an agent following the contract
+# either leaves the wake open or refiles under a develop trigger and clobbers
+# that slot.
+fresh_state
+for t in pr_preflight_failed pr_migrations_refused pr_warmup_stuck pr_facts_unavailable pr_run_overrun; do
+  bash "$GATE" ack "$t" "pr|some reason|44" acked | jq -e '
+    .ok == true and .silenceable == false and .silencedUntil == null
+  ' >/dev/null || { echo "$t is not record-only ackable" >&2; exit 1; }
+done
+# Every pr_* trigger this gate accepts must emit from the PR gate, and none of
+# them may be silenceable here.
+for t in $(grep -oP '^ACK_TRIGGERS="\K[\s\S]*?(?=")' "$GATE" | tr -s ' \n' ' ' | tr ' ' '\n' | grep '^pr_'); do
+  grep -q "\"$t\"" "$SCRIPT_DIR/smoke-pr-gate.sh" \
+    || { echo "develop gate accepts $t but the pr gate never emits it" >&2; exit 1; }
+  case " $(grep -oP '^ACK_SILENCEABLE="\K[^"]+' "$GATE") " in
+    *" $t "*) echo "$t is silenceable but the pr gate honours no dispositions" >&2; exit 1 ;;
+  esac
+done
+
+# --- 56. INVARIANT 3: numeric knobs go through num_env in BOTH gates -------
+for g in "$GATE" "$SCRIPT_DIR/smoke-pr-gate.sh"; do
+  if grep -qP '^[A-Z_]+="\$\{?SMOKE_GATE_[A-Z_]+:-[0-9]+\}?"' "$g"; then
+    echo "$(basename "$g") reads a numeric knob without num_env" >&2; exit 1
+  fi
+  grep -q 'MISSING="\$MISSING\$BAD_NUMERIC_CONFIG"' "$g" \
+    || { echo "$(basename "$g") never reports a bad numeric knob" >&2; exit 1; }
+done
+
+# --- 57. gate_hold_tampered re-alerts for a DIFFERENT offender -------------
+# The latch stored the category (`missing|mismatched|unexpected`) alone, so the
+# first offender satisfied it forever and a second, unrelated run in the same
+# category never re-alerted.
+fresh_state
+export STUB_SOURCE_SHA="$(printf '4%.0s' $(seq 40))"
+HT_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
+HT_HOLD="$SMOKE_GATE_STATE_DIR/develop-hold.json"
+export SMOKE_GATE_HOLD_FILE="$HT_HOLD"
+bash "$GATE" poll >/dev/null
+jq '.completedVerdict="NO_GO" | .completedRunId="offender-one"' "$HT_STATE" > "$HT_STATE.t" && mv "$HT_STATE.t" "$HT_STATE"
+bash "$GATE" poll | jq -e '.data.trigger == "gate_hold_tampered"' >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger != "gate_hold_tampered"' >/dev/null   # latched
+jq '.completedRunId="offender-two"' "$HT_STATE" > "$HT_STATE.t" && mv "$HT_STATE.t" "$HT_STATE"
+bash "$GATE" poll | jq -e '
+  .data.trigger == "gate_hold_tampered" and .data.ledgerRunId == "offender-two"
+' >/dev/null
+unset SMOKE_GATE_HOLD_FILE
 
 echo "smoke develop gate tests passed"
 

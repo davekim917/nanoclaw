@@ -438,12 +438,12 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
   const markerPath = path.join(wgDir, '.migrated');
   // RE-RUNS EVERY STARTUP, deliberately. This used to `return` here on the
   // marker, which made the shared tree a one-shot snapshot of whenever it first
-  // ran. `illysium`'s marker is dated 2026-05-27; `releases/` — the release
-  // desk's board, decision ledger and runbook — was created 2026-08-01, so the
-  // union rule below (share any seed dir a sibling already symlinks) never got
-  // to see it. It ended up reachable only by the three siblings someone
-  // remembered to hand-symlink it into and invisible to the two QA agents,
-  // which is exactly the scattered-symlink drift docs/workgroups.md says
+  // ran. Live consequence: a workgroup whose marker predated a new shared dir
+  // by two months — a release desk's board, decision ledger and runbook — meant
+  // the union rule below (share any seed dir a sibling already symlinks) never
+  // got to see it. It ended up reachable only by the siblings someone
+  // remembered to hand-symlink it into and invisible to the rest, which is
+  // exactly the scattered-symlink drift docs/workgroups.md says
   // workgroups exist to end.
   //
   // Every step below already skips when it is already correct, so a re-run on

@@ -38,28 +38,46 @@ RUN_PREFIX="${SMOKE_GATE_RUN_PREFIX:-smoke}"
 # newest liveness signal is fresh AND under the hard age ceiling. Not called
 # out as a separate contract knob because it is the same plumbing every claim/
 # progress/release/finish verb already depends on across both gates.
-ACTIVE_STALE_SECONDS="${SMOKE_GATE_ACTIVE_STALE_SECONDS:-14400}"
-PROGRESS_STALE_SECONDS="${SMOKE_GATE_PROGRESS_STALE_SECONDS:-1800}"
-OVERRUN_REALERT_SECONDS="${SMOKE_GATE_OVERRUN_REALERT_SECONDS:-7200}"
+# Ported from smoke-develop-gate.sh per INVARIANT 3 (see its header). A
+# non-numeric knob here does not abort a jq transform — this gate has no
+# dispositions — but it degrades every `[ x -ge THRESHOLD ]` to a silently
+# false comparison, which for an alarm threshold means never alarming.
+BAD_NUMERIC_CONFIG=""
+# Assigns rather than prints: `X="$(num_env ...)"` runs the function in a
+# SUBSHELL, so BAD_NUMERIC_CONFIG accumulated there and was empty in the
+# parent — the fallback worked, the alarm never fired. Caught by the test that
+# asserts the bad knob is named.
+num_env() {  # <target-var> <env-var-name> <default>
+  local raw="${!2:-}"
+  case "$raw" in
+    '') printf -v "$1" '%s' "$3" ;;
+    *[!0-9]*) BAD_NUMERIC_CONFIG="$BAD_NUMERIC_CONFIG $2"; printf -v "$1" '%s' "$3" ;;
+    *) printf -v "$1" '%s' "$raw" ;;
+  esac
+}
+
+num_env ACTIVE_STALE_SECONDS SMOKE_GATE_ACTIVE_STALE_SECONDS 14400
+num_env PROGRESS_STALE_SECONDS SMOKE_GATE_PROGRESS_STALE_SECONDS 1800
+num_env OVERRUN_REALERT_SECONDS SMOKE_GATE_OVERRUN_REALERT_SECONDS 7200
 # Same seam as the develop gate: one command run immediately before a
 # campaign opens, for preconditions the gate cannot see. Runs once per poll,
 # only when a settle candidate has actually been chosen — never per PR.
 PREFLIGHT_CMD="${SMOKE_GATE_PREFLIGHT_CMD:-}"
-PREFLIGHT_TIMEOUT="${SMOKE_GATE_PREFLIGHT_TIMEOUT:-120}"
-PREFLIGHT_ALERT_SECONDS="${SMOKE_GATE_PREFLIGHT_ALERT_SECONDS:-21600}"
-PREFLIGHT_REARM_FLOOR_SECONDS="${SMOKE_GATE_PREFLIGHT_REARM_FLOOR_SECONDS:-900}"
+num_env PREFLIGHT_TIMEOUT SMOKE_GATE_PREFLIGHT_TIMEOUT 120
+num_env PREFLIGHT_ALERT_SECONDS SMOKE_GATE_PREFLIGHT_ALERT_SECONDS 21600
+num_env PREFLIGHT_REARM_FLOOR_SECONDS SMOKE_GATE_PREFLIGHT_REARM_FLOOR_SECONDS 900
 # Verified spike budget: a preview boots `live` at port-bind but /healthz can
 # report {"status":"warming"} for ~6-10 minutes while caches hydrate onto a
 # fresh disk. Below this ceiling, "still warming" is normal and silent. At or
 # past it, a backend stuck warming this long is worth one throttled alarm.
-WARMUP_TIMEOUT="${SMOKE_GATE_WARMUP_TIMEOUT:-600}"
+num_env WARMUP_TIMEOUT SMOKE_GATE_WARMUP_TIMEOUT 600
 # How long a labeled PR may sit with unfetchable gate facts before it alarms.
 # Facts come from several fetches (PR files, CI, Render services/deploys); any
 # of them failing means the PR can never settle, and before 2026-08-12 that
 # state was completely silent — freeze PR #786 sat fully built and warm for
 # 6.5 hours while the CI fetch returned nothing on every 10-minute poll, and
 # nothing anywhere said so. A gate that cannot settle must be loud.
-FACTS_STUCK_TIMEOUT="${SMOKE_GATE_FACTS_STUCK_SECONDS:-3600}"
+num_env FACTS_STUCK_TIMEOUT SMOKE_GATE_FACTS_STUCK_SECONDS 3600
 # Freeze-PR handoff wiring, `finish` only, freeze PRs only (see the header
 # comment above `detect_freeze` and the `finish` command below). All three
 # are no-ops unless set — a deployment that never wires them keeps today's
@@ -111,7 +129,7 @@ pr_verdict_file() { printf '%s/pr-%s-verdict.json' "$STATE_DIR" "$1"; }
 
 # How long to wait for a per-PR state lock. Same knob and same default as
 # smoke-develop-gate.sh's.
-LOCK_WAIT="${SMOKE_GATE_LOCK_WAIT_SECONDS:-15}"
+num_env LOCK_WAIT SMOKE_GATE_LOCK_WAIT_SECONDS 15
 
 # Losing the lock is NOT losing the slot. The old emission here was
 # `{ok:false,error:"gate lock failed"}` — an `ok:false` that the skill's
@@ -599,6 +617,9 @@ if [ "$COMMAND" = "check" ]; then
   [ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
   [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
   [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
+# A knob that fell back to its default because the deployed value was not a
+# number is a misconfiguration, not a detail — name it in the same alarm.
+MISSING="$MISSING$BAD_NUMERIC_CONFIG"
   if [ -n "$MISSING" ]; then
     jq -cn --argjson missing "$(printf '%s\n' $MISSING | jq -Rsc 'split("\n") | map(select(length > 0))')" \
       '{ok:false,error:"gate misconfigured",missing:$missing}'
@@ -1178,6 +1199,9 @@ MISSING=""
 [ -n "$REPO" ] || MISSING="$MISSING SMOKE_GATE_REPO"
 [ -n "$BACKEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_BACKEND_SERVICE"
 [ -n "$FRONTEND_SERVICE" ] || MISSING="$MISSING SMOKE_GATE_FRONTEND_SERVICE"
+# A knob that fell back to its default because the deployed value was not a
+# number is a misconfiguration, not a detail — name it in the same alarm.
+MISSING="$MISSING$BAD_NUMERIC_CONFIG"
 if [ -n "$MISSING" ]; then
   exec 8>"$CONTROL_LOCK"
   flock -w 5 8 || true
@@ -1453,6 +1477,18 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   ABANDONED="$(jq -r '.abandonedActiveSha' <<<"$WINNER")"
   HEAD_SHA="$(jq -r '.headSha' <<<"$FACTS")"
 
+  # ponytail: a candidate whose preflight keeps failing keeps WINNING — it
+  # stays the lowest-numbered settled PR on every poll, so no other labelled PR
+  # is ever campaigned, and after the first alarm the repeats are
+  # wakeAgent:false. The fingerprint now carries `pr`, so a DIFFERENT PR
+  # failing does re-alarm rather than being swallowed by the first one's latch,
+  # and the payload names the offender. The starvation itself is NOT fixed:
+  # skipping to the next candidate means looping the selection and running
+  # preflight once per candidate, up to SMOKE_GATE_PREFLIGHT_TIMEOUT each, in
+  # the campaign-opening hot path. Upgrade path: filter candidates with a live
+  # per-PR preflight latch out of SETTLE_CANDIDATES at selection time, which
+  # needs a per-PR latch this gate does not keep yet. Deferred deliberately —
+  # it is a scheduling change, not a correctness one, and wants its own round.
   if [ -n "$PREFLIGHT_CMD" ]; then
     exec 8>"$CONTROL_LOCK"
     flock -w 5 8 || true
@@ -1475,7 +1511,7 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
       # very next poll re-evaluates this candidate fresh once a preview URL
       # is available, same "defer, don't skip" shape every other preflight
       # failure already has.
-      jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"preflight_failed",
+      jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"pr_preflight_failed",
         reason:"settled candidate has no backend preview URL to run a target-aware preflight against"}}'
       exit 0
     fi
@@ -1504,13 +1540,25 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
         CONTROL="$(jq -c --arg r "$PREFLIGHT_REASON" --arg f "$PREFLIGHT_FINGERPRINT" --arg now "$(iso_now)" \
           '.preflightReason=$r | .preflightFingerprint=$f | .preflightWakeAt=$now' <<<"$CONTROL")"
         write_control "$CONTROL"
+        # `pr_preflight_failed`, NOT `preflight_failed`. Dispositions are keyed
+        # by trigger name and the develop gate owns the only `ack` verb, so
+        # sharing the name meant an ack filed from here overwrote
+        # `.dispositions.preflight_failed` and destroyed a live develop-gate
+        # silence for an unrelated incident — while this gate, which consults
+        # no dispositions at all, re-alarmed every 6h regardless. A distinct
+        # name makes `ack` report `silenceable:false` honestly instead of
+        # promising a mute nothing here will ever honour.
+        # `pr` names WHICH candidate failed. Without it the alarm said only
+        # "preflight failed" while the gate silently kept selecting the same
+        # lowest-numbered PR every poll — see the ponytail note below.
         jq -cn --arg reason "$PREFLIGHT_REASON" --argjson rc "$PREFLIGHT_RC" --arg fp "$PREFLIGHT_FINGERPRINT" \
-          '{wakeAgent:true,data:{schemaVersion:1,trigger:"preflight_failed",reason:$reason,exitCode:$rc,fingerprint:$fp}}'
+          --argjson pr "$W_PR" \
+          '{wakeAgent:true,data:{schemaVersion:1,trigger:"pr_preflight_failed",pr:$pr,reason:$reason,exitCode:$rc,fingerprint:$fp}}'
         exit 0
       fi
       CONTROL="$(jq -c --arg r "$PREFLIGHT_REASON" '.preflightReason=$r' <<<"$CONTROL")"
       write_control "$CONTROL"
-      jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"preflight_failed"}}'
+      jq -cn '{wakeAgent:false,data:{schemaVersion:1,trigger:"pr_preflight_failed"}}'
       exit 0
     fi
   fi

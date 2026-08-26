@@ -244,10 +244,17 @@ export STUB_SERVICES="[{\"id\":\"srv-backend-pr-44\",\"name\":\"XZO-DEV-BACKEND 
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 export SMOKE_GATE_PREFLIGHT_CMD='echo "seat qa-a@example.com could not be verified"; exit 1'
-bash "$GATE" poll | jq -e '
-  .wakeAgent == true and .data.trigger == "preflight_failed" and
-  (.data.reason | test("could not be verified"))
-' >/dev/null
+# `pr_preflight_failed`, not `preflight_failed`: dispositions are keyed by
+# trigger name and the develop gate owns the only `ack` verb, so a shared name
+# let an ack from here destroy a live develop-gate silence. The fingerprint is
+# gate-scoped for the same reason and must never be the bare reason.
+PF_WAKE="$(bash "$GATE" poll)"
+jq -e '
+  .wakeAgent == true and .data.trigger == "pr_preflight_failed" and
+  (.data.reason | test("could not be verified")) and
+  (.data.fingerprint | startswith("pr|")) and
+  (.data.fingerprint != .data.reason)
+' <<<"$PF_WAKE" >/dev/null
 [ ! -e "$STATE_DIR/pr-44-state.json" ] || jq -e '.activeRunId == null' "$STATE_DIR/pr-44-state.json" >/dev/null
 unset SMOKE_GATE_PREFLIGHT_CMD
 
