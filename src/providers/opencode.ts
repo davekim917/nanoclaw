@@ -29,7 +29,7 @@ import { registerProviderContainerConfig } from './provider-container-registry.j
 // opt-in via an explicit `opencode/*` model. Bump these when the fleet default
 // moves. The provider is derived from the model prefix at
 // runtime; the constant only guards a malformed override.
-const DEFAULT_OPENCODE_MODEL = 'opencode-go/ox-alpha-free';
+const DEFAULT_OPENCODE_MODEL = 'opencode-go/glm-5.3-flash';
 const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
 const DEFAULT_OPENCODE_EFFORT = 'high';
 
