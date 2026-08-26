@@ -268,6 +268,40 @@ describe('runHostScript hard deadline', () => {
     }
   }, 25_000);
 
+  // MUTATION GAP codex found: every other fixture here ignores TERM, so making
+  // the soft timer a no-op left all of them green while production scripts with
+  // a TERM cleanup trap would silently lose their grace window and be SIGKILLed
+  // ten seconds later instead. This is the case that pins the SIGTERM step.
+  //
+  // It also pins the `timedOut` rule. A trap that emits valid JSON and exits 0
+  // must still resolve NULL: accepting it would mark the row completed and
+  // RESET the recurrence failure streak, so a series that overruns on every
+  // fire would never reach the 8-failure auto-pause that exists to catch it.
+  it('SIGTERMs at the timeout and discards a trap-emitted result', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '1000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      const started = Date.now();
+      // Traps TERM, prints a well-formed verdict, exits 0 — the shape that
+      // used to be accepted as a success.
+      const result = await runHostScript(
+        `trap 'echo "{\\"wakeAgent\\":false}"; exit 0' TERM\nsleep 60\n`,
+        'soft-timeout-test',
+      );
+      const elapsed = Date.now() - started;
+
+      // Died on SIGTERM at the soft timeout, so it never reached the hard
+      // deadline — that is what fails if the soft timer is made a no-op.
+      expect(elapsed).toBeLessThan(5_000);
+      expect(elapsed).toBeGreaterThanOrEqual(1_000);
+      // And its output is not a verdict.
+      expect(result).toBeNull();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
   // THE POINT OF spawn() + detached. Killing bash does not kill what bash
   // started: a `gh api` fan-out or a `capped-check.sh` run is a GRANDCHILD, and
   // signalling the direct child alone orphans it. Before this change the code
@@ -301,6 +335,26 @@ describe('runHostScript hard deadline', () => {
       expect(await gone(grandchildPid)).toBe(true);
       // Belt and braces: it never got far enough to run its side effect.
       expect(fs.existsSync(gcMarker)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  // codex finding 3: the cap must be BYTES. `chunk.length` on a utf8-decoded
+  // string counts UTF-16 code units, so 400,000 `中` — 1.2MB of UTF-8 — slipped
+  // under a 1MiB character cap and was accepted. execFile's maxBuffer is
+  // documented in bytes, and the cap is only a real memory bound in bytes.
+  it('counts the output cap in bytes, not UTF-16 code units', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '10000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      // 400k × 3-byte characters = ~1.2MB UTF-8, but only 400k code units.
+      const result = await runHostScript(
+        `python3 -c "print('中' * 400000)"\necho '{"wakeAgent":true}'\n`,
+        'utf8-cap-test',
+      );
+      expect(result).toBeNull();
     } finally {
       vi.unstubAllEnvs();
     }
