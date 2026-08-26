@@ -1093,3 +1093,64 @@ Clear each one, or consciously accept it, before step 7 is switched on.
 - **Codex Q1 residual — invisible `lengths[]` corruption.** Corrupting a `lengths[]` element
   cannot be detected: partitioning reads only `token.start` and scoring never reads
   `token.end`.
+
+## P2.5 activation (step 7) — REJECTED on measured economics, 2026-08-25
+
+**Provenance.** Measured 2026-08-25 by a separate measurement run, not this session;
+recorded here from the operator-relayed report so the pillar-3 drop in `plan.md` §9 has
+a source to cite. Not re-verified by whoever writes this entry — that would be a ~40
+minute repeat of the run, not a documentation task.
+
+**Method.** Projection ON vs OFF, same code, 30 timed turns per arm per workgroup,
+full `buildPreTurnContext`. Every ON turn asserted `recallPath === 'hit'` and every OFF
+turn `cold`/`absent` — 30/30 both ways, so the two arms are provably distinct code
+paths, not noise. Data is **copy-derived**: a staged `DATA_DIR`, an online `.backup()`
+of `v2.db` and `archive.db`, and `cp -a` of the memory trees. No live data written.
+
+**The projection is genuinely faster:**
+
+| workgroup    | condition                 | fallback CPU | projection CPU | change |
+| ------------ | ------------------------- | ------------: | ---------------: | ------ |
+| illysium     | warm, isolated processes  | 501 ms        | 103 ms            | −79%   |
+| illysium     | warm, interleaved         | 460 ms        | 121 ms            | −74%   |
+| madison-reed | warm                      | 173 ms        | 70 ms             | −59%   |
+
+Mechanism, from the same log line: the fallback path materialises **6,961 fact + 591
+file** candidates; the projection returns **66 + 49**. The entire saving is the term
+prefilter — nothing else changes between the two arms.
+
+**And it still loses, because no incremental update exists.** Plan step 5
+("Incremental update by fact id") was never implemented, so every invalidation forces a
+full rebuild, not a diff:
+
+- Full rebuild: **7.6 s CPU, 56.3 MB index** for illysium — 6.5× the markdown it
+  projects.
+- **illysium's tree changes every 2.4 minutes.** Two independent derivations agree
+  within 1%: `data/memory-curator-history/` snapshot timestamps (20 writes in 46.2 min),
+  and a 17-minute live poller sampling every 30 s on the same size/mtimeNs/inode triple
+  `projectionTreeStaleness` compares (7 changes in 34 samples). madison-reed changes
+  roughly every 38.7 min.
+- **Steady-state arithmetic is net negative:** read CPU saved −373 ms/turn against
+  rebuild CPU spent **+2,290 ms/turn** — roughly **1.9 s/turn net worse**. Rebuild load
+  alone is **188 s CPU/hour, 5.2% of one core, continuously, for one workgroup.** Every
+  invalidation cadence modelled (instant trigger, 60 s sweep, 5 min) lands on the wrong
+  side.
+- **Structural, not tunable.** The projection's value scales with corpus size and its
+  cost scales with change rate, and on this fleet those are the same workgroup:
+  illysium is 77% of all projectable markdown *and* rewrites its ledger fastest.
+
+**Two further findings:**
+
+- **The warm mark lives only in process memory.** A projection sitting on disk does
+  NOT make the first turn after a host restart fast — that turn still serves
+  `cold`/`not-verified-warm` at full fallback cost until the sweep runs a warming pass.
+- **End-to-end latency context.** User→assistant is 154 s p50 on illysium (n=109, last
+  24 h, paired within thread, >30 min outliers dropped); madison-reed 60 s. The 340 ms
+  the projection would save is ~0.22% of one turn.
+
+**Verdict: REJECTED.** Step 7 (the builder hook) stays unactivated — the projection
+ships dormant per the pre-activation-blockers entry above, and this result is an
+independent reason not to flip it even once those are cleared. **Revisit only when all
+three hold together**, not any one: incremental update actually implemented and
+measured; a workload where recall latency is genuinely on the critical path; and the
+six pre-activation blockers above cleared.

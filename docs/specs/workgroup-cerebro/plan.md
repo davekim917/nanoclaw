@@ -1534,11 +1534,12 @@ files on a schedule. Dropped outright rather than deferred, for four reasons:
    first.
 2. **The external half is a cache, and caches of fast-changing sources lose.**
    Ingesting live Snowflake schema, Linear issues, or feed status into topic files "on
-   a schedule" is exactly the shape that made P2.5's recall projection a net loss:
-   value scales with corpus size, cost scales with change rate. P2.5 measured this
-   precisely — 79% faster reads, still a net CPU loss, because every invalidation
-   forced a full rebuild and the largest tree changed every 2.4 minutes. Linear issues
-   and warehouse schemas drift on the same kind of clock.
+   a schedule" is exactly the shape that made P2.5's recall projection a net loss on
+   measurement: value scales with corpus size, cost scales with change rate, and reads
+   got faster while the whole system still lost, because no incremental update exists
+   and the largest tree changes every few minutes. Linear issues and warehouse schemas
+   drift on the same kind of clock. Full measurement and arithmetic: `run.md`, "P2.5
+   activation (step 7) — REJECTED on measured economics, 2026-08-25".
 3. **The capability already exists live.** Agents reach Snowflake via `snow` and
    Linear via the OneCLI gateway. Something needed at query time should be queried at
    query time, with no staleness to reason about.
