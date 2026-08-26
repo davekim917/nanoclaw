@@ -93,7 +93,6 @@ forks.md
 
 # impeccable plugin hook cache — regenerated wherever the hook runs
 .impeccable/
-/graphify-out/
 
 # design-artifact-loop scratch. The comp renders this install's real agent and
 # channel names, so it stays local and out of the public boundary; only the

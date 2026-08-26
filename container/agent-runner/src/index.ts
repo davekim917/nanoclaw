@@ -69,7 +69,7 @@ async function main(): Promise<void> {
   // activate it so the `gcloud`/`bq` CLIs authenticate. No-op otherwise. All providers.
   activateGcpServiceAccount(log);
 
-  // All providers share one canonical file-memory tree. Graphify indexes these
+  // All providers share one canonical file-memory tree. Recall reads these
   // source files; no second derived retrieval store is introduced.
   ensureMemoryScaffold();
 

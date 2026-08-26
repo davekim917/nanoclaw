@@ -1,6 +1,6 @@
 ---
 name: clone-as-codex
-description: Create a Codex-backed sibling agent for an existing Claude group. The sibling joins the source workgroup and shares its CLAUDE.md, repos, sources, conversations, and Graphify graph. Cross-agent collaboration happens via standard platform `@`-mentions — requires installing a second bot app for the sibling so each agent has its own real bot user. Works on Slack and Discord.
+description: Create a Codex-backed sibling agent for an existing Claude group. The sibling joins the source workgroup and shares its CLAUDE.md, repos, sources, and conversations. Cross-agent collaboration happens via standard platform `@`-mentions — requires installing a second bot app for the sibling so each agent has its own real bot user. Works on Slack and Discord.
 ---
 
 # Clone Group As Codex Sibling
@@ -15,9 +15,8 @@ Create `groups/<source>-codex/` from `groups/<source>/`. The codex sibling share
   standing instruction state is preserved byte-for-byte. It is not a memory
   root and never becomes part of the workgroup memory canon.
 - **Repos** — symlinked top-level dirs that contain `.git/`.
-- **sources/** — ordinary knowledge files; Graphify indexes changes automatically for the workgroup.
+- **sources/** — ordinary knowledge files, shared across the workgroup.
 - **conversations/** — transcript archive; both agents see each other's archived turns.
-- **Graphify graph** — `workgroup_id` routes both siblings to the same code-and-knowledge graph while keeping other workgroups isolated.
 - **Thread worktree** — when `NANOCLAW_THREAD_WORKTREES=1`, both siblings in the same platform thread mount the same `data/v2-threads/<thread-id>/worktrees/<repo>/` host path. Uncommitted edits flow across.
 
 > Under workgroup shared-FS (`data/workgroups/<wg>/.migrated` present), the **Repos / sources / conversations** links point at the container-absolute `/workspace/workgroup/<name>` mount instead of `../<source>/` — Step 4 detects the mode and reproduces exactly what `reconcileWorkgroupSharedDirs` already did for the existing siblings. **CLAUDE.local.md** stays a relative link in both modes because it is group/provider instruction state, not memory.
@@ -76,7 +75,7 @@ SOURCE_FOLDER=<source-folder>             # e.g. example-labs
 SOURCE_ID=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
 test -n "${SOURCE_ID}" || { echo "ERROR: source group '${SOURCE_FOLDER}' not found"; exit 1; }
 # Workgroup the sibling must JOIN — the SOURCE's workgroup, not the sibling's
-# own folder. This is what grants shared chat-archive, Graphify graph, and
+# own folder. This is what grants shared chat-archive and
 # workgroup-level OneCLI secrets. For a primary source it equals the folder;
 # clone from another sibling and it still resolves to the shared workgroup.
 SOURCE_WORKGROUP=$(pnpm exec tsx scripts/q.ts data/v2.db "select coalesce(workgroup_id, folder) from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
@@ -296,7 +295,7 @@ Mirrors the per-group OAuth pattern Claude already uses via scoped `CLAUDE_CODE_
 
 `agent_groups.created_at` is `NOT NULL` with no default.
 
-**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source, granting the same memory canon, shared chat-archive and Graphify visibility plus workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (`reconcileWorkgroupAtSpawn` reads the DB value; putting it in container.json would trip the parity-check since `workgroup_id` is not a sibling-bound field). Migration 036 auto-paired the codex siblings that pre-dated it — but it has already run and won't re-run, so a codex sibling created TODAY without this column is isolated in its own workgroup-of-one.
+**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source, granting the same memory canon, shared chat-archive visibility plus workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (`reconcileWorkgroupAtSpawn` reads the DB value; putting it in container.json would trip the parity-check since `workgroup_id` is not a sibling-bound field). Migration 036 auto-paired the codex siblings that pre-dated it — but it has already run and won't re-run, so a codex sibling created TODAY without this column is isolated in its own workgroup-of-one.
 
 `agent_groups.name` should match `id` and `folder` — the workspace
 convention (`<source>-codex`), NOT the Slack/Discord bot display name.

@@ -2099,8 +2099,8 @@ export class ClaudeProvider implements AgentProvider {
           PostToolUse: [
             { hooks: [postToolUseHook] },
             // Capture intentionally fetched knowledge into sources/inbox.
-            // Graphify watches the workgroup source tree and indexes these
-            // files for autonomous Graphify discovery without an opt-in flag.
+            // These land in the workgroup source tree so later sessions can
+            // find them as ordinary files, without an opt-in flag.
             { matcher: 'WebFetch', hooks: [createMemoryCaptureWebFetchHook()] },
             { matcher: 'Bash', hooks: [createMemoryCaptureBashHook()] },
             // mcp__.* matches every MCP tool call; the hook itself dispatches

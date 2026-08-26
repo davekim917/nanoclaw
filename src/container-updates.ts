@@ -14,7 +14,6 @@ export type UpdateKind =
   | 'bun-dependency'
   | 'remotion-dependency'
   | 'dockerfile-pin'
-  | 'graphify'
   | 'codex-sync'
   | 'plugin-version';
 export type UpdateSurface = 'host' | 'container' | 'bootstrap' | 'plugins';
@@ -213,12 +212,6 @@ interface UpdateSourcesManifest {
   plugins?: PluginUpdateSource[];
 }
 
-interface GraphifyIntegrationManifest {
-  schemaVersion: 2;
-  package: { name: string; version: string };
-  upstream: { repo: string; tag: string; commit: string };
-}
-
 export type JsonFetcher = (url: string) => Promise<unknown>;
 export type TextFetcher = (url: string) => Promise<string>;
 export type CommandRunner = (command: string[], cwd: string) => Promise<void>;
@@ -368,10 +361,7 @@ function itemFromResolution(
   };
 }
 
-async function resolveSource(
-  source: DockerUpdateSource['source'] | { kind: 'pypi'; package: string },
-  fetchJson: JsonFetcher,
-): Promise<ReleaseResolution> {
+async function resolveSource(source: DockerUpdateSource['source'], fetchJson: JsonFetcher): Promise<ReleaseResolution> {
   if (source.kind === 'npm') {
     return latestStableNpmVersion(await fetchJson(`https://registry.npmjs.org/${encodeURIComponent(source.package)}`));
   }
@@ -589,7 +579,7 @@ export async function auditRepository(
   repoRoot: string,
   fetchJson: JsonFetcher = defaultFetchJson,
 ): Promise<AuditItem[]> {
-  const [host, bun, remotion, sourceText, dockerfile, graphifyText] = await Promise.all([
+  const [host, bun, remotion, sourceText, dockerfile] = await Promise.all([
     auditDependencies(repoRoot, 'package.json', 'host-dependency', 'host', fetchJson),
     auditDependencies(repoRoot, 'container/agent-runner/package.json', 'bun-dependency', 'container', fetchJson),
     // Remotion video runtime baked at /opt/remotion. A third dependency
@@ -599,12 +589,9 @@ export async function auditRepository(
     auditDependencies(repoRoot, 'container/remotion/package.json', 'remotion-dependency', 'container', fetchJson),
     readFile(path.join(repoRoot, 'container/update-sources.json'), 'utf8'),
     readFile(path.join(repoRoot, 'container/Dockerfile'), 'utf8'),
-    readFile(path.join(repoRoot, 'container/graphify-integration.json'), 'utf8'),
   ]);
   const manifest = JSON.parse(sourceText) as UpdateSourcesManifest;
   if (manifest.schemaVersion !== 1) throw new Error('unsupported container/update-sources.json schema');
-  const graphify = JSON.parse(graphifyText) as GraphifyIntegrationManifest;
-  if (graphify.schemaVersion !== 2) throw new Error('unsupported Graphify integration manifest schema');
 
   const docker = await Promise.all(
     manifest.dockerfile.map(async (entry): Promise<AuditItem> => {
@@ -625,28 +612,11 @@ export async function auditRepository(
     }),
   );
 
-  const graphifyBase: Omit<AuditItem, 'latest' | 'status' | 'detail' | 'tag'> = {
-    id: 'graphify:graphifyy',
-    name: 'graphifyy',
-    kind: 'graphify',
-    surface: 'container',
-    current: graphify.package.version,
-    source: 'pypi',
-  };
-  const graphifyResult = await audited('graphifyy', () =>
-    resolveSource({ kind: 'pypi', package: graphify.package.name }, fetchJson),
-  );
-  const graphifyItem =
-    graphifyResult instanceof Error
-      ? { ...graphifyBase, latest: null, status: 'unknown' as const, detail: graphifyResult.message }
-      : itemFromResolution(graphifyBase, graphifyResult);
   const [codex, plugins] = await Promise.all([
     auditCodexSources(manifest, fetchJson),
     auditPluginVersions(manifest, fetchJson),
   ]);
-  return [...host, ...bun, ...remotion, ...docker, graphifyItem, ...codex, ...plugins].sort((a, b) =>
-    a.id.localeCompare(b.id),
-  );
+  return [...host, ...bun, ...remotion, ...docker, ...codex, ...plugins].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function statusLabel(status: AuditStatus): string {
@@ -794,7 +764,6 @@ export async function applySelectedUpdates(options: {
   const bun = selected.filter((item) => item.kind === 'bun-dependency');
   const remotion = selected.filter((item) => item.kind === 'remotion-dependency');
   const docker = selected.filter((item) => item.kind === 'dockerfile-pin');
-  const graphify = selected.filter((item) => item.kind === 'graphify');
 
   if (host.length > 0) {
     await updatePackageJson(path.join(repoRoot, 'package.json'), host);
@@ -862,8 +831,5 @@ export async function applySelectedUpdates(options: {
       }
     }
     await writeFile(dockerfilePath, dockerfile);
-  }
-  if (graphify.length > 0) {
-    await run(['bun', 'scripts/update-graphify.ts', '--version', graphify[0].latest!], repoRoot);
   }
 }
