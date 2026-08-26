@@ -1379,15 +1379,22 @@ bash /workspace/agent/smoke-develop-gate.sh ack \
 ```
 
 - `<trigger>` is `scriptOutput.trigger` verbatim.
-- `<fingerprint>` is the payload's `reason` when it has one, otherwise its most
-  specific identifier (`holdRunId`, `runId`, the missing variable name).
+- `<fingerprint>` is `scriptOutput.data.fingerprint` **verbatim** — never one you
+  assemble yourself. Only the gate knows what separates one incident from the
+  next for a given trigger: the freeze helper, for instance, emits the same
+  `reason` text for every branch collision on every SHA, so the reason alone
+  would silence unrelated future collisions. Triggers with no `fingerprint`
+  field are not silenceable; pass their most specific identifier
+  (`holdRunId`, `runId`, the missing variable name) for the record.
 - **`resolved`** — the condition is gone because of something you did. It never
   silences: if the gate still sees the condition the claim was wrong, and the
   alarm fires again.
 - **`acked`** — you looked, you posted, nothing more is owed and nobody needs
   paging. Silences this trigger for this exact fingerprint until the TTL
-  (`SMOKE_GATE_ACK_MAX_SILENCE_SECONDS`, default 24h). A changed or worsened
-  reason is a different fingerprint and alarms normally.
+  (`SMOKE_GATE_ACK_MAX_SILENCE_SECONDS`, default 24h; `preflight_failed` uses
+  a shorter 12h window, because two of its three failure messages are fixed
+  strings). A changed or worsened condition is a different fingerprint and
+  alarms normally.
 - **`escalated`** — a human now owns it; say who you mentioned in the note.
 
 The response tells you what you actually got: `silencedUntil` is `null` when

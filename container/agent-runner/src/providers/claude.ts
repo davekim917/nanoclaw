@@ -1624,7 +1624,10 @@ function transcriptStartMs(transcriptPath: string): number | null {
     let firstLine: string;
     const fd = fs.openSync(transcriptPath, 'r');
     try {
-      const buf = Buffer.alloc(TRANSCRIPT_FIRST_LINE_MAX_BYTES);
+      // +1 so a filled buffer means the line is genuinely LONGER than the cap.
+      // At exactly the cap with no trailing newline the old sizing read
+      // `n === buf.length` and cried truncation on a complete line.
+      const buf = Buffer.alloc(TRANSCRIPT_FIRST_LINE_MAX_BYTES + 1);
       const n = fs.readSync(fd, buf, 0, buf.length, 0);
       const nl = buf.indexOf(0x0a);
       const end = nl >= 0 && nl < n ? nl : n;

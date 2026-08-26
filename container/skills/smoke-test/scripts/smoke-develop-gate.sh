@@ -248,7 +248,30 @@ default_state() {
 
 read_state() {
   if [ -s "$STATE_FILE" ] && jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1; then
-    jq -c '.' "$STATE_FILE"
+    # Expire dispositions older than the ack window, on every read.
+    #
+    # A disposition that outlives its window sits in state answering "is this
+    # handled?" with a stale yes while a brand-new alarm for that trigger is
+    # firing. True of ALL eleven ackable triggers, not just the two the poll
+    # path consults — so bound it once, here, instead of dropping the record at
+    # eleven alarm sites and forgetting the twelfth. It has to be in `read_state`
+    # rather than in the poll body because `relock_or_exit` RE-READS state after
+    # the network phase, which would discard a prune done anywhere upstream.
+    #
+    # Prunes against the LONGEST ack window, never a shorter per-trigger one,
+    # so it can only remove a record that has already stopped silencing.
+    #
+    # `else .` — NOT `else {}`. A malformed `.dispositions` is passed through
+    # untouched on purpose: normalising it here would repair the corruption
+    # `write_state`'s guard exists to catch and leave that guard unreachable and
+    # untestable. Everything else is tolerant by construction (missing or
+    # unparseable `at`, entry that is not an object), and a bad date fails
+    # toward LESS silencing.
+    jq -c --argjson ttl "$ACK_MAX_SILENCE_SECONDS" '
+      if (.dispositions | type) == "object"
+        then .dispositions |= with_entries(select(
+               ((.value.at // "") | (try fromdateiso8601 catch 0)) > (now - $ttl)))
+        else . end' "$STATE_FILE"
   else
     default_state
   fi
@@ -257,6 +280,22 @@ read_state() {
 write_state() {
   local next="$1" tmp
   [ "$READONLY" = true ] && return 0
+  # A jq transform that errors prints nothing and leaves its `$(...)` capture
+  # empty, and nothing in this script checks jq's exit status. Writing that
+  # empty document truncates the state file; `read_state` then falls back to
+  # `default_state`, so `activeSha`/`activeRunId` vanish — and the very next
+  # mandatory `progress` stamp answers a HEALTHY live campaign with "not the
+  # active run (reclaimed or finished) — stop this campaign". That is the same
+  # harm `gate_lock_busy` shipped to prevent, through a different door.
+  #
+  # Guard here rather than at any one caller: every command routes through this
+  # function, so one check covers finish/claim/progress/ack and whatever comes
+  # next. `exit` rather than `return` because no caller inspects the status —
+  # a return value would be swallowed and the command would report success.
+  if ! jq -e 'type == "object"' <<<"$next" >/dev/null 2>&1; then
+    jq -cn '{ok:false,error:"gate state did not survive a transform — refusing to write; on-disk state is preserved"}'
+    exit 3
+  fi
   tmp="$(mktemp "$STATE_DIR/.develop-state.XXXXXX")"
   printf '%s\n' "$next" > "$tmp"
   mv "$tmp" "$STATE_FILE"
@@ -332,6 +371,32 @@ ACK_TRIGGERS="develop_unsettled develop_freeze_abandoned develop_freeze_stale
 # and the test suite asserts exactly that (case 45) rather than a runtime guard
 # that no call site can ever reach.
 ACK_SILENCEABLE="develop_freeze_failed preflight_failed"
+# `preflight_failed` gets a SHORTER window than the default, and this asymmetry
+# is deliberate — do not "fix" it by making the two match.
+#
+# The deployed preflight command has three terminal messages and only one of
+# them varies: `qa-seat-preflight.sh:530` interpolates the failing seat list,
+# but `:334` (warming) and `:338` (past the ceiling) are byte-identical
+# constants. So for those two modes the fingerprint cannot tell one incident
+# from the next, the way the freeze trigger's SHA+branch can.
+#
+# The obvious symmetry — add sourceSha, like the freeze trigger — is WRONG
+# here twice over. This gate's own comment above PREFLIGHT_ALERT_SECONDS says
+# preflight is deliberately not SHA-bound because dead accounts stay dead
+# across every new head; and develop takes ~50 merges/day, so a SHA-scoped ack
+# would be defeated within minutes and do nothing at all. A shorter TTL is the
+# lever that actually bounds the exposure. It is also narrower than it looks:
+# the two static strings differ from EACH OTHER, so acking "still warming"
+# cannot swallow "past the ceiling — a DEFECT" or a seat failure.
+ACK_MAX_SILENCE_PREFLIGHT_SECONDS="${SMOKE_GATE_ACK_MAX_SILENCE_PREFLIGHT_SECONDS:-43200}"
+
+ack_ttl() {
+  if [ "$1" = preflight_failed ]; then
+    printf '%s' "$ACK_MAX_SILENCE_PREFLIGHT_SECONDS"
+  else
+    printf '%s' "$ACK_MAX_SILENCE_SECONDS"
+  fi
+}
 
 in_word_list() {
   local needle="$1" haystack="$2" item
@@ -352,7 +417,10 @@ ack_silences() {
     *) return 1 ;;
   esac
   age=$(( now_epoch - $(epoch_or_zero "$(jq -r '.at // empty' <<<"$entry")") ))
-  [ "$age" -lt "$ACK_MAX_SILENCE_SECONDS" ]
+  # Reject a NEGATIVE age too: a future-dated `at` (hand-edit, clock skew)
+  # would otherwise satisfy `< TTL` forever and silence the alarm for good,
+  # which is precisely the "no incident goes dark longer than the TTL" claim.
+  [ "$age" -ge 0 ] && [ "$age" -lt "$(ack_ttl "$trigger")" ]
 }
 
 # Drop a trigger's disposition. Called both when the underlying condition
@@ -820,7 +888,7 @@ if [ "$COMMAND" = "ack" ]; then
   # the poll path will not honor.
   SILENCED_UNTIL=""
   if [ "$SILENCEABLE" = true ] && [ "$DISPOSITION" != resolved ]; then
-    SILENCED_UNTIL="$(date -u -d "@$(( $(epoch_or_zero "$ACK_NOW") + ACK_MAX_SILENCE_SECONDS ))" \
+    SILENCED_UNTIL="$(date -u -d "@$(( $(epoch_or_zero "$ACK_NOW") + $(ack_ttl "$TRIGGER") ))" \
       +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf '')"
   fi
   jq -cn --arg t "$TRIGGER" --arg f "$FINGERPRINT" --arg d "$DISPOSITION" \
@@ -1555,7 +1623,7 @@ if [ -n "$PREFLIGHT_CMD" ]; then
         --arg sha "$SOURCE_SHA" \
         --argjson rc "$PREFLIGHT_RC" \
         '{wakeAgent:true,data:{schemaVersion:1,trigger:"preflight_failed",
-          sourceSha:$sha,reason:$reason,exitCode:$rc}}'
+          sourceSha:$sha,reason:$reason,exitCode:$rc,fingerprint:$reason}}'
       exit 0
     fi
     # Already alarmed on this exact reason inside the throttle window. Refuse
@@ -1621,11 +1689,17 @@ if [ "$FREEZE_HANDOFF" = true ]; then
     # leaves an orphaned PR/branch that this later collision is the only
     # trace of; without the name, the responder has to guess it.
     FREEZE_ORPHAN_BRANCH="$(jq -r '.branch // empty' <<<"$FREEZE_JSON" 2>/dev/null)"
+    # The reason ALONE cannot be the ack fingerprint here: smoke-freeze-pr.sh:69
+    # emits a byte-identical constant ("branch already exists — delete it first
+    # or pick a different target") for every collision, and puts the branch in a
+    # SEPARATE field. Acking one collision would silence every future collision
+    # on any SHA. Fold in what actually varies — the branch and the target SHA.
+    FREEZE_FINGERPRINT="$FREEZE_REASON|$FREEZE_ORPHAN_BRANCH|$SOURCE_SHA"
     LAST_FREEZE_REASON="$(jq -r '.freezeFailReason // empty' <<<"$STATE")"
     SINCE_FREEZE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.freezeFailWakeAt // empty' <<<"$STATE")") ))"
-    # A live ack for this exact reason outranks the re-arm rules. This is the
+    # A live ack for this exact incident outranks the re-arm rules. This is the
     # 2026-08-25/26 case: three identical wakes 6h apart, nothing dispositioned.
-    if ack_silences develop_freeze_failed "$FREEZE_REASON"; then
+    if ack_silences develop_freeze_failed "$FREEZE_FINGERPRINT"; then
       emit_no_wake "develop_freeze_failed"
       exit 0
     fi
@@ -1636,8 +1710,9 @@ if [ "$FREEZE_HANDOFF" = true ]; then
       drop_disposition develop_freeze_failed
       write_state "$STATE"
       jq -cn --arg reason "$FREEZE_REASON" --arg sha "$SOURCE_SHA" --argjson rc "$FREEZE_RC" \
-        --arg branch "$FREEZE_ORPHAN_BRANCH" \
+        --arg branch "$FREEZE_ORPHAN_BRANCH" --arg fp "$FREEZE_FINGERPRINT" \
         '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_freeze_failed",sourceSha:$sha,reason:$reason,exitCode:$rc,
+          fingerprint:$fp,
           orphanBranch:(if $branch == "" then null else $branch end)}}'
       exit 0
     fi

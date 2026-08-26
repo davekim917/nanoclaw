@@ -1119,11 +1119,38 @@ unset SMOKE_GATE_PREFLIGHT_ALERT_SECONDS
 # are the DELIVERY. If they ever disagree the verb starts lying, so assert the
 # two sets are identical instead of carrying a runtime guard no call site can
 # reach.
+# Line continuations are joined and then newlines squashed, so a call
+# reformatted across lines is still seen — that exact dodge was demonstrated
+# against the earlier line-anchored version. Joining `\`-continuations first
+# matters: squashing newlines alone leaves a bare `\` sitting where the trigger
+# argument should be, which the literal-shape check below would then reject on
+# a perfectly good call site.
+# `tr -s` squeezes the runs of whitespace joining leaves behind, so the two
+# patterns below can stay single-space and readable.
+ACK_SRC="$(sed -e ':a' -e 'N;$!ba' -e 's/\\\n[[:space:]]*/ /g' "$GATE" | tr '\n' ' ' | tr -s ' ')"
 ACK_DECLARED="$(grep -oP '^ACK_SILENCEABLE="\K[^"]+' "$GATE" | tr ' ' '\n' | grep -v '^$' | sort -u)"
-ACK_WIRED="$(grep -oP '^\s*if ack_silences \K[a-z_]+' "$GATE" | sort -u)"
+ACK_WIRED="$(grep -oP 'if ack_silences \K[a-z_]+' <<<"$ACK_SRC" | sort -u)"
 if [ "$ACK_DECLARED" != "$ACK_WIRED" ]; then
   echo "ACK_SILENCEABLE declares [$ACK_DECLARED] but poll honors [$ACK_WIRED]" >&2; exit 1
 fi
+# The other dodge: a call site taking a variable instead of a bare literal
+# would not be matched above and could diverge silently. Fail on the shape.
+if grep -oP 'ack_silences \K\S+' <<<"$ACK_SRC" | grep -qv '^[a-z_]\+$'; then
+  echo "an ack_silences call site does not take a bare literal trigger name" >&2; exit 1
+fi
+# Source matching still cannot see a call routed through a wrapper function.
+# The real guarantee is the behavioral cases: ack a non-silenceable trigger and
+# prove its alarm still fires. Two of the four are covered that way
+# (gate_misconfigured just below, develop_hold_undecided further down);
+# gate_fetch_failed and develop_run_overrun are not, and are not claimed to be.
+fresh_state
+unset SMOKE_GATE_REPO 2>/dev/null || true
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "gate_misconfigured"' >/dev/null
+bash "$GATE" ack gate_misconfigured "SMOKE_GATE_REPO" acked "known, waiting on a redeploy" >/dev/null
+fresh_state   # fresh throttle window, same missing config, same ack in play
+bash "$GATE" ack gate_misconfigured "SMOKE_GATE_REPO" acked >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == true and .data.trigger == "gate_misconfigured"' >/dev/null
+export SMOKE_GATE_REPO=org/repo
 bash "$GATE" ack develop_hold_undecided "run-1" acked | jq -e '
   .ok == true and .silenceable == false and .silencedUntil == null
 ' >/dev/null
@@ -1162,7 +1189,9 @@ bash "$GATE" poll >/dev/null
 bash "$GATE" poll | jq -e '
   .wakeAgent == true and .data.trigger == "develop_freeze_failed"
 ' >/dev/null
-bash "$GATE" ack develop_freeze_failed "branch already exists" acked "orphan branch left in place on purpose" \
+# The gate hands the agent the fingerprint; the agent never builds one.
+ACK_FP="$(bash "$GATE" poll | jq -r '.data.fingerprint')"
+bash "$GATE" ack develop_freeze_failed "$ACK_FP" acked "orphan branch left in place on purpose" \
   | jq -e '.ok == true and .silenceable == true' >/dev/null
 bash "$GATE" poll | jq -e '
   .wakeAgent == false and .data.trigger == "develop_freeze_failed"
@@ -1175,10 +1204,102 @@ bash "$GATE" poll | jq -e '
 # ...and that wake cleared the stale disposition, so it owes a fresh one too.
 jq -e '.dispositions.develop_freeze_failed == null' "$SMOKE_GATE_STATE_DIR/develop-state.json" >/dev/null
 # The freeze finally succeeding clears the incident, disposition included.
-bash "$GATE" ack develop_freeze_failed "gh pr create failed" acked >/dev/null
+bash "$GATE" ack develop_freeze_failed "gh pr create failed|" acked >/dev/null
 export STUB_FREEZE_JSON="{\"prNumber\":77,\"branch\":\"smoke/freeze-d\",\"freezeSha\":\"abc\",\"targetSha\":\"$ACK_SHA\"}"
 bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
 jq -e '.dispositions.develop_freeze_failed == null' "$SMOKE_GATE_STATE_DIR/develop-state.json" >/dev/null
+unset SMOKE_GATE_PREFLIGHT_ALERT_SECONDS
+
+# --- 47. REGRESSION (Codex High 1): the freeze reason is a STATIC constant ---
+# `smoke-freeze-pr.sh:69` emits byte-identical text for every branch collision
+# and puts the branch in a separate field. Fingerprinting on the reason alone
+# meant acking one collision silenced every future collision on any SHA for a
+# day. The fingerprint must fold in what actually varies.
+fresh_state
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+export SMOKE_GATE_PREFLIGHT_ALERT_SECONDS=0
+COLLIDE='branch already exists — delete it first or pick a different target'
+SHA_A="$(printf 'a%.0s' $(seq 40))"
+SHA_B="$(printf 'b%.0s' $(seq 40))"
+
+export STUB_SOURCE_SHA="$SHA_A"
+export STUB_FREEZE_JSON="{\"ok\":false,\"error\":\"$COLLIDE\",\"branch\":\"smoke/freeze-aaaaaaaaaaaa\"}"
+bash "$GATE" poll >/dev/null
+FP_A="$(bash "$GATE" poll | jq -r '.data.fingerprint')"
+bash "$GATE" ack develop_freeze_failed "$FP_A" acked "left in place on purpose" >/dev/null
+bash "$GATE" poll | jq -e '.wakeAgent == false' >/dev/null   # A stays silenced
+
+# Develop advances. A genuinely new collision, same constant reason text.
+export STUB_SOURCE_SHA="$SHA_B"
+export STUB_FREEZE_JSON="{\"ok\":false,\"error\":\"$COLLIDE\",\"branch\":\"smoke/freeze-bbbbbbbbbbbb\"}"
+bash "$GATE" poll >/dev/null
+FP_B="$(bash "$GATE" poll | jq -r '.data.fingerprint')"
+if [ "$FP_A" = "$FP_B" ]; then
+  echo "two different freeze incidents produced the same fingerprint: $FP_A" >&2; exit 1
+fi
+# Both carry the SAME reason — proving it is the fingerprint, not the reason,
+# doing the discriminating.
+bash "$GATE" poll | jq -e --arg r "$COLLIDE" '
+  .wakeAgent == true and .data.reason == $r and .data.trigger == "develop_freeze_failed"
+' >/dev/null
+unset SMOKE_GATE_PREFLIGHT_ALERT_SECONDS
+
+# --- 48. Every silenceable trigger emits a `fingerprint` the agent can echo --
+# Structural: a third silenceable trigger added without one would leave the
+# agent guessing again, which is how High 1 happened.
+for t in $(grep -oP '^ACK_SILENCEABLE="\K[^"]+' "$GATE"); do
+  grep -q "trigger:\"$t\"" "$GATE" || { echo "no emission for silenceable trigger $t" >&2; exit 1; }
+  awk -v t="trigger:\"$t\"" '
+    index($0, t) { found=1 }
+    found && /fingerprint:/ { ok=1 }
+    found && /}}/ { exit }
+    END { exit !ok }
+  ' "$GATE" || { echo "silenceable trigger $t emits no fingerprint field" >&2; exit 1; }
+done
+
+# --- 49. REGRESSION (Codex High 2): a failed transform must never be written --
+# A malformed `.dispositions` makes ack's jq error, which used to leave $STATE
+# empty, truncate the state file, and STILL report ok:true. The next mandatory
+# `progress` stamp then told a HEALTHY campaign "not the active run — stop this
+# campaign".
+fresh_state
+CORRUPT="$SMOKE_GATE_STATE_DIR/develop-state.json"
+printf '%s\n' '{"activeSha":"deadbeef","activeRunId":"important-run","dispositions":"corrupt-but-valid-json"}' > "$CORRUPT"
+BEFORE="$(cat "$CORRUPT")"
+ACK_OUT="$(bash "$GATE" ack preflight_failed "some reason" acked 2>/dev/null || true)"
+jq -e '.ok == false and (.error | test("refusing to write"))' <<<"$ACK_OUT" >/dev/null
+if bash "$GATE" ack preflight_failed "some reason" acked >/dev/null 2>&1; then
+  echo "ack reported success on a state file it could not transform" >&2; exit 1
+fi
+[ "$(cat "$CORRUPT")" = "$BEFORE" ] || { echo "state file was modified despite the refusal" >&2; exit 1; }
+# ...and the campaign is still the active run, which is the harm that matters.
+bash "$GATE" progress important-run | jq -e '.ok == true and .runId == "important-run"' >/dev/null
+
+# --- 50. Dispositions expire out of state, for every trigger ----------------
+# Bounds the audit trail: a record cannot outlive its window and keep answering
+# "handled?" with a stale yes while a fresh alarm for that trigger fires.
+fresh_state
+export STUB_SOURCE_SHA="$(printf '7%.0s' $(seq 40))"
+PRUNE_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
+bash "$GATE" poll >/dev/null
+bash "$GATE" ack gate_hold_tampered "run-old" escalated "paged the release desk" >/dev/null
+jq -e '.dispositions.gate_hold_tampered != null' "$PRUNE_STATE" >/dev/null
+jq --arg t "$(date -u -d '@'$(( $(date -u +%s) - 3 * 86400 )) +'%Y-%m-%dT%H:%M:%SZ')" \
+  '.dispositions.gate_hold_tampered.at=$t' "$PRUNE_STATE" > "$PRUNE_STATE.tmp" && mv "$PRUNE_STATE.tmp" "$PRUNE_STATE"
+bash "$GATE" poll >/dev/null
+jq -e '.dispositions.gate_hold_tampered == null' "$PRUNE_STATE" >/dev/null
+
+# --- 51. A future-dated `at` must not silence forever ----------------------
+fresh_state
+export SMOKE_GATE_PREFLIGHT_ALERT_SECONDS=0
+PF_STATE="$SMOKE_GATE_STATE_DIR/develop-state.json"
+pf_sha 3
+pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' >/dev/null
+bash "$GATE" ack preflight_failed "3 of 8 QA seats could not be verified" acked >/dev/null
+pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '.wakeAgent == false' >/dev/null
+jq --arg t "$(date -u -d '@'$(( $(date -u +%s) + 3600 )) +'%Y-%m-%dT%H:%M:%SZ')" \
+  '.dispositions.preflight_failed.at=$t' "$PF_STATE" > "$PF_STATE.tmp" && mv "$PF_STATE.tmp" "$PF_STATE"
+pf_poll 'echo "3 of 8 QA seats could not be verified"; exit 1' | jq -e '.wakeAgent == true' >/dev/null
 unset SMOKE_GATE_PREFLIGHT_ALERT_SECONDS
 
 echo "smoke develop gate tests passed"
