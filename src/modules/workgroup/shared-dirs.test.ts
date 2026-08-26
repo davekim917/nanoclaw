@@ -97,6 +97,74 @@ describe('reconcileWorkgroupSharedDirs', () => {
     expect(fs.readFileSync(markerPath, 'utf-8')).toBe(first);
   });
 
+  // The reconciler used to `return` on the `.migrated` marker, which made the
+  // shared tree a ONE-SHOT snapshot of whenever it first ran. Live consequence:
+  // `illysium`'s marker is dated 2026-05-27 and `releases/` — the release desk's
+  // board, decision ledger and runbook — was created 2026-08-01, so it was never
+  // seen. It ended up reachable only through hand-made per-sibling symlinks,
+  // present on three siblings and missing on the two QA agents, which is the
+  // scattered-symlink drift workgroups exist to end.
+  it('shares a seed dir created AFTER the first migration, once a sibling symlinks it', () => {
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+    const wgDir = path.join(dataDir, 'workgroups', 'wgx');
+    expect(fs.existsSync(path.join(wgDir, 'releases'))).toBe(false);
+
+    // Later: the seed grows a new shared tree and ONE sibling symlinks it.
+    fs.mkdirSync(path.join(groupsDir, 'wgx', 'releases', 'gates'), { recursive: true });
+    fs.writeFileSync(path.join(groupsDir, 'wgx', 'releases', 'gates', 'd.jsonl'), '{}\n');
+    fs.symlinkSync('../wgx/releases', path.join(groupsDir, 'wgx-codex', 'releases'));
+
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    expect(fs.readFileSync(path.join(wgDir, 'releases', 'gates', 'd.jsonl'), 'utf-8')).toBe('{}\n');
+    expect(fs.readlinkSync(path.join(groupsDir, 'wgx', 'releases'))).toBe('/workspace/workgroup/releases');
+    expect(fs.readlinkSync(path.join(groupsDir, 'wgx-codex', 'releases'))).toBe('/workspace/workgroup/releases');
+  });
+
+  it('gives a sibling that never had a symlink one on the next run', () => {
+    // The argus/momus case: siblings added (or simply forgotten) after the
+    // one-shot migration could never reach shared data at all.
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+    db.prepare(`INSERT INTO agent_groups (id, folder, workgroup_id) VALUES (?,?,?)`).run('ag-qa', 'wgx-qa', 'wgx');
+    fs.mkdirSync(path.join(groupsDir, 'wgx-qa'), { recursive: true });
+    expect(fs.existsSync(path.join(groupsDir, 'wgx-qa', 'sources'))).toBe(false);
+
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    expect(fs.readlinkSync(path.join(groupsDir, 'wgx-qa', 'sources'))).toBe('/workspace/workgroup/sources');
+  });
+
+  it('a settled re-run does not WRITE the marker at all', () => {
+    // Content-equality is not enough to prove this: `migratedAt` is now carried
+    // over, so a rewrite produces a byte-identical file. mtime is what
+    // distinguishes "did not write" from "wrote the same thing" — and without
+    // it every boot would also append to `logs/migration-shared-dirs.log` and
+    // log `migrated` for a run that moved nothing, turning the move audit trail
+    // into a startup heartbeat.
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+    const markerPath = path.join(dataDir, 'workgroups', 'wgx', '.migrated');
+    const pinned = new Date('2020-01-01T00:00:00Z');
+    fs.utimesSync(markerPath, pinned, pinned);
+
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    expect(fs.statSync(markerPath).mtimeMs).toBe(pinned.getTime());
+  });
+
+  it('keeps the original migratedAt across re-runs — the marker is a record, not a clock', () => {
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+    const markerPath = path.join(dataDir, 'workgroups', 'wgx', '.migrated');
+    const first = JSON.parse(fs.readFileSync(markerPath, 'utf-8')) as { migratedAt: string };
+
+    fs.mkdirSync(path.join(groupsDir, 'wgx', 'releases'), { recursive: true });
+    fs.symlinkSync('../wgx/releases', path.join(groupsDir, 'wgx-codex', 'releases'));
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    const second = JSON.parse(fs.readFileSync(markerPath, 'utf-8')) as { migratedAt: string; moved: string[] };
+    expect(second.migratedAt).toBe(first.migratedAt);
+    expect(second.moved).toContain('releases');
+  });
+
   it('never clobbers a sibling that owns a real directory at a shared name', () => {
     // Replace the sibling's dbt symlink with its OWN real directory.
     fs.unlinkSync(path.join(groupsDir, 'wgx-codex', 'dbt'));

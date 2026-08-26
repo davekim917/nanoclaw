@@ -390,7 +390,7 @@ export function readReleaseBoardSource(
   now: number,
   env: AttentionSourceEnv = {},
 ): ProviderRead {
-  const releasesDir = resolveContainedRoot('Release board', env.groupsRoot ?? GROUPS_DIR, workgroupId, decl.root);
+  const releasesDir = resolveContainedRoot('Release board', env.groupsRoot ?? GROUPS_DIR, workgroupId, decl.root, env.dataRoot);
   if (releasesDir === null) return { asOf: null, items: [] };
 
   const state = readContainedFile('Release board', releasesDir, 'release-state.json', workgroupId);

@@ -876,4 +876,161 @@ bash "$GATE" poll | jq -e '
 ' >/dev/null
 unset STUB_FREEZE_SLEEP SMOKE_GATE_FREEZE_HELPER_TIMEOUT
 
+# --- 38. Undecided promotion hold suppresses the NEXT round ----------------
+# The loop this closes: a HUMAN_DECISION/NO_GO hold names findings a human has
+# been asked to rule on, develop keeps moving, and every expiry of the cadence
+# floor opened a fresh campaign to re-derive the same answer. Nothing in this
+# file read the hold before opening a campaign — it only ever wrote it.
+fresh_state
+unset SMOKE_GATE_DECISION_LEDGER SMOKE_GATE_HOLD_ALERT_SECONDS 2>/dev/null || true
+HOLD_SHA="$(printf 'f%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$HOLD_SHA"
+HOLD_FILE="$STATE_DIR2/develop-hold.json"
+LEDGER_DIR="$STATE_DIR2/gates"
+mkdir -p "$LEDGER_DIR"
+export SMOKE_GATE_HOLD_FILE="$HOLD_FILE" SMOKE_GATE_DECISION_LEDGER="$LEDGER_DIR"
+hold_up() {
+  jq -cn --arg run "$1" --arg sha "$2" \
+    '{schemaVersion:1,sha:$sha,runId:$run,verdict:"HUMAN_DECISION",
+      raisedAt:"2026-08-25T18:23:39Z",reason:"needs_human_decision"}' > "$HOLD_FILE"
+}
+hold_up "held-run-1" "$HOLD_SHA"
+# First poll debounces, second alarms (new hold run id) and opens NOTHING.
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '
+  .wakeAgent == true and .data.trigger == "develop_hold_undecided" and
+  .data.holdRunId == "held-run-1" and .data.holdVerdict == "HUMAN_DECISION" and
+  .data.pendingSeconds > 0
+' >/dev/null
+jq -e '.activeSha == null and .activeRunId == null' "$STATE_DIR2/develop-state.json" >/dev/null
+# Third poll is throttled to a silent no-wake — still no campaign.
+bash "$GATE" poll | jq -e '
+  .wakeAgent == false and .data.trigger == "hold_undecided"
+' >/dev/null
+jq -e '.activeSha == null' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# --- 38b. The hold is NEVER touched by any of this -------------------------
+# Suppressing the round must not weaken the promotion gate: only a human clears
+# a hold. If this ever passes with the file gone, the design is wrong.
+jq -e '.runId == "held-run-1" and .verdict == "HUMAN_DECISION"' "$HOLD_FILE" >/dev/null
+
+# --- 38c. An `override` on that run id re-opens the round ------------------
+# The re-open trigger is the decision itself — no human restarts anything.
+jq -cn '{ts:"2026-08-25T19:21:33Z",user:"James",action:"override",
+         target:"smoke_hold:held-run-1"}' > "$LEDGER_DIR/2026-08-25.jsonl"
+bash "$GATE" poll | jq -e --arg sha "$HOLD_SHA" '
+  .wakeAgent == true and .data.trigger == "develop_build_settled" and .data.sourceSha == $sha
+' >/dev/null
+
+# --- 38d. A later `correction` on the SAME target is NOT a decision --------
+# Live case: a human wrote an override at 19:21:33Z and the desk wrote
+# "not a human gate, authorizes nothing" on the same target at 20:27:00Z.
+# Newest-line-wins is what tells those apart; matching any override anywhere in
+# the file would read the corrected one as decided.
+fresh_state
+HOLD_FILE="$STATE_DIR2/develop-hold.json"
+LEDGER_DIR="$STATE_DIR2/gates"
+mkdir -p "$LEDGER_DIR"
+export SMOKE_GATE_HOLD_FILE="$HOLD_FILE" SMOKE_GATE_DECISION_LEDGER="$LEDGER_DIR"
+hold_up "held-run-2" "$HOLD_SHA"
+{
+  jq -cn '{ts:"2026-08-25T19:21:33Z",user:"James",action:"override",target:"smoke_hold:held-run-2"}'
+  jq -cn '{ts:"2026-08-25T20:27:00Z",user:"Barry",action:"correction",target:"smoke_hold:held-run-2"}'
+} > "$LEDGER_DIR/2026-08-25.jsonl"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_hold_undecided"' >/dev/null
+
+# --- 38e. An override for a DIFFERENT hold does not decide this one --------
+jq -cn '{ts:"2026-08-25T21:00:00Z",user:"James",action:"override",target:"smoke_hold:some-other-run"}' \
+  >> "$LEDGER_DIR/2026-08-25.jsonl"
+bash "$GATE" poll | jq -e '.data.trigger == "hold_undecided"' >/dev/null
+
+# --- 38f. A torn append before the override must not hide it ---------------
+# The desk appends live. A streaming `jq select` aborts at the first malformed
+# line and drops every LATER match — including the decision we are looking for.
+printf '{"ts":"2026-08-25T21:30:00Z","action":"over\n' >> "$LEDGER_DIR/2026-08-25.jsonl"
+jq -cn '{ts:"2026-08-25T22:00:00Z",user:"James",action:"override",target:"smoke_hold:held-run-2"}' \
+  >> "$LEDGER_DIR/2026-08-25.jsonl"
+bash "$GATE" poll | jq -e '.data.trigger == "develop_build_settled"' >/dev/null
+
+# --- 38g. FAIL OPEN: an unreadable ledger proceeds as if undeployed --------
+# "The check did not say yes" is not "the check said no". A missing dir, an
+# unset path and an unreadable file are all `unknown`, and unknown must never
+# wedge the fleet — failing closed on something unavailable where the code runs
+# is the shape that caused two fleet-wide outages on 2026-08-25.
+fresh_state
+HOLD_FILE="$STATE_DIR2/develop-hold.json"
+export SMOKE_GATE_HOLD_FILE="$HOLD_FILE"
+export SMOKE_GATE_DECISION_LEDGER="$STATE_DIR2/does-not-exist"
+hold_up "held-run-3" "$HOLD_SHA"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_build_settled"' >/dev/null
+
+# ...and an existing-but-unreadable ledger file is `unknown` too, not "nobody
+# decided". Skipped under root, which ignores file modes.
+fresh_state
+HOLD_FILE="$STATE_DIR2/develop-hold.json"
+LEDGER_DIR="$STATE_DIR2/gates"
+mkdir -p "$LEDGER_DIR"
+export SMOKE_GATE_HOLD_FILE="$HOLD_FILE" SMOKE_GATE_DECISION_LEDGER="$LEDGER_DIR"
+hold_up "held-run-4" "$HOLD_SHA"
+echo '{}' > "$LEDGER_DIR/2026-08-25.jsonl"
+chmod 000 "$LEDGER_DIR/2026-08-25.jsonl"
+if [ "$(id -u)" -ne 0 ]; then
+  bash "$GATE" poll >/dev/null
+  bash "$GATE" poll | jq -e '.data.trigger == "develop_build_settled"' >/dev/null
+fi
+chmod 644 "$LEDGER_DIR/2026-08-25.jsonl"
+
+# --- 38h. Unset SMOKE_GATE_DECISION_LEDGER is fully inert ------------------
+# A deployment that never wires this keeps today's behavior byte for byte.
+fresh_state
+HOLD_FILE="$STATE_DIR2/develop-hold.json"
+export SMOKE_GATE_HOLD_FILE="$HOLD_FILE"
+unset SMOKE_GATE_DECISION_LEDGER 2>/dev/null || true
+hold_up "held-run-5" "$HOLD_SHA"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_build_settled"' >/dev/null
+
+# --- 39. An out-of-band freeze's verdict advances completedSha -------------
+# A human-requested campaign cuts its freeze PR by calling smoke-freeze-pr.sh
+# directly — supported, and it deliberately bypasses the cadence floor. It also
+# bypasses the handoff bookkeeping, so its ledger line could never be adopted:
+# `completedSha` never advanced and the SHA just tested stayed eligible to be
+# frozen and tested AGAIN. Live: #1195 re-froze `8dfca446` after #1188 had
+# already produced a verdict for it.
+fresh_state
+OOB_SHA="$(printf '9%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$OOB_SHA"
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+jq -cn --arg target "$OOB_SHA" --arg freeze "deadbeef" --argjson pr 1195 \
+  --arg run "xzo-pr-pr1195-oob" --arg verdict "HUMAN_DECISION" --arg now "2026-08-25T10:45:07Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  > "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "already_completed"' >/dev/null
+jq -e --arg sha "$OOB_SHA" --arg run "xzo-pr-pr1195-oob" '
+  .completedSha == $sha and .completedRunId == $run and .completedVerdict == "HUMAN_DECISION"
+' "$STATE_DIR2/develop-state.json" >/dev/null
+
+# --- 39b. ...but never while this gate has its OWN handoff open ------------
+# Adoption into an open handoff is bound to the matching freeze PR on purpose
+# (the tamper shield). This fallback must not become a way around it.
+fresh_state
+OOB2_SHA="$(printf '8%.0s' $(seq 40))"
+export STUB_SOURCE_SHA="$OOB2_SHA"
+export SMOKE_GATE_FREEZE_HANDOFF=true SMOKE_GATE_FREEZE_HELPER="$STUB_BIN/freeze-helper"
+export STUB_FREEZE_JSON="{\"prNumber\":77,\"branch\":\"smoke/freeze-x\",\"freezeSha\":\"abc\",\"targetSha\":\"$OOB2_SHA\"}"
+bash "$GATE" poll >/dev/null
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_opened"' >/dev/null
+# A line naming a DIFFERENT freeze PR for our open handoff's target is
+# tamper-shaped and must not be adopted by either path.
+jq -cn --arg target "$OOB2_SHA" --arg freeze "zzz" --argjson pr 99 \
+  --arg run "rival-run" --arg verdict "GO" --arg now "2026-08-25T11:00:00Z" \
+  '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,runId:$run,verdict:$verdict,finishedAt:$now}' \
+  > "$STATE_DIR2/handoff-ledger.jsonl"
+bash "$GATE" poll | jq -e '.data.trigger == "develop_freeze_ledger_tampered"' >/dev/null
+jq -e '.completedRunId != "rival-run"' "$STATE_DIR2/develop-state.json" >/dev/null
+
 echo "smoke develop gate tests passed"
+

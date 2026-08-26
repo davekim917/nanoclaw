@@ -1311,6 +1311,55 @@ Downstream rule: flag present → automatic hold on promotion; flag absent → n
 smoke objection. Absence semantics make rollout safe — history predating the
 smoke watcher never gates anything.
 
+### An undecided hold stops the next round (`SMOKE_GATE_DECISION_LEDGER`)
+
+Holding promotion and continuing to test are two different questions, and until
+2026-08-26 the gate only answered the first. Nothing on the campaign-open path
+read the hold — it was written by `finish` and read only by the tamper
+reconciler. So while a human sat on a `HUMAN_DECISION`, develop kept moving,
+`SMOKE_GATE_FREEZE_MIN_INTERVAL_SECONDS` kept expiring, and a fresh campaign
+opened to re-derive the same verdict about findings the new build never touched.
+On 2026-08-24/25 that ran four times in 24 hours — four `HUMAN_DECISION`s, four
+preview pairs, sixteen browser lanes — and each `finish` overwrote the hold,
+which also destroyed the `runId` the pending question was keyed to.
+
+Point `SMOKE_GATE_DECISION_LEDGER` at the release desk's append-only gate ledger
+(a directory of `*.jsonl`) and the develop gate will not open a **new** round
+while a hold is up and unanswered. **Unset = inert**, byte-for-byte today's
+behavior.
+
+- **A decision is the newest line whose `target` is `smoke_hold:<the hold's
+  runId>` and whose `action` is `override`.** Newest-line-wins is not cosmetic:
+  a desk `correction` after an `override` on the same target means the override
+  did not stand, and matching any override anywhere in the file would read a
+  retracted one as decided.
+- **The hold is never touched.** No path here deletes, rewrites or expires it,
+  and there is no interval after which promotion un-gates. Promotion clears only
+  the two ways it always did: a later `GO` finish, or a human override the
+  release desk honours.
+- **Three outcomes, not two.** `decided` / `undecided` / `unknown`. An unset
+  path, a missing directory and an unreadable file are all `unknown` — "the
+  check did not say yes" is not "the check said no". `unknown` **fails open**:
+  the campaign proceeds exactly as if this were not deployed. The hold still
+  blocks promotion either way, so the safe direction here is to keep testing,
+  not to stop.
+- **The wait is loud.** While undecided, `develop_hold_undecided` wakes on
+  `SMOKE_GATE_HOLD_ALERT_SECONDS` (default 21600, matching the cadence floor)
+  carrying `holdRunId`, `holdSha`, `holdReason`, `raisedAt` and `pendingSeconds`.
+  It re-arms on an interval rather than latching once, for the same reason the
+  overrun alarm does: while this is the only thing surfacing the pending
+  decision, a latch that can go permanently silent is not a safety mechanism.
+- **Re-opening is automatic.** The decision itself is the trigger — the next
+  poll after an `override` lands opens the campaign on whatever develop has
+  settled on by then. Nobody has to remember to un-pause anything. A
+  human-requested campaign (`smoke-freeze-pr.sh` called directly) is unaffected:
+  that IS a human asking for a re-test.
+
+This reads the ledger where the containers can see it. The release desk's
+`releases/` tree must live in the workgroup shared mount
+(`/workspace/workgroup/releases`), not in one sibling's private group folder —
+see `docs/workgroups.md`.
+
 On every terminal verdict, the coordinator closes the gate atomically:
 
 ```bash

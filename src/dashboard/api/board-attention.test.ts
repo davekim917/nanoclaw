@@ -423,7 +423,11 @@ describe('readReleaseBoardSource', () => {
       return { groupsRoot, victimDir, wgDir };
     }
 
-    const env = (groupsRoot: string) => ({ groupsRoot, claimsRoot: groupsRoot });
+    // `dataRoot` is pinned to the same throwaway tree so these stay hermetic:
+    // the resolver now also tries `<dataRoot>/workgroups/<wg>/<root>`, and
+    // defaulting it to the live DATA_DIR would make the outcome depend on
+    // whatever happens to exist on the host running the suite.
+    const env = (groupsRoot: string) => ({ groupsRoot, claimsRoot: groupsRoot, dataRoot: groupsRoot });
 
     it('reads nothing when the declared root is a symlink to another workgroup', () => {
       const { groupsRoot, victimDir, wgDir } = twoWorkgroups();
@@ -480,7 +484,151 @@ describe('readReleaseBoardSource', () => {
       });
     });
 
+    /**
+     * The workgroup shared mount is the SECOND base.
+     *
+     * `reconcileWorkgroupSharedDirs` moves a shared dir into
+     * `data/workgroups/<wg>/` and leaves the seed a CONTAINER-ABSOLUTE compat
+     * symlink (`releases -> /workspace/workgroup/releases`) that deliberately
+     * dangles on the host. Before this, the realpath under `groups/` failed and
+     * the provider silently emitted nothing — a blank release board, which reads
+     * as "nothing is blocked on a human". This is the case that would have made
+     * moving `releases/` look like a regression.
+     */
+    it('reads the board from the workgroup shared mount when the seed symlink dangles', () => {
+      const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-'));
+      const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-data-'));
+      tmpdirs.push(groupsRoot, dataRoot);
+      const shared = path.join(dataRoot, 'workgroups', WORKGROUP, 'releases');
+      fs.mkdirSync(path.join(shared, 'gates'), { recursive: true });
+      fs.writeFileSync(path.join(shared, 'release-state.json'), JSON.stringify({ asOf: ASOF, items: [item()] }));
+      // Exactly what the migration leaves behind: unresolvable on the host.
+      fs.mkdirSync(path.join(groupsRoot, WORKGROUP), { recursive: true });
+      fs.symlinkSync('/workspace/workgroup/releases', path.join(groupsRoot, WORKGROUP, 'releases'));
+
+      const read = readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), {
+        groupsRoot,
+        claimsRoot: groupsRoot,
+        dataRoot,
+      });
+      expect(read.asOf).toBe(ASOF);
+      expect(read.items.map((i) => i.id)).toEqual(['EXAMPLE-APP#817']);
+    });
+
+    it('still reads the gates ledger after the move (the ship records keep filtering)', () => {
+      // `board-attention` excludes an item once a `ship` record names it. That
+      // read goes through the same containment seam, so it has to survive the
+      // move too — otherwise shipped items silently reappear on the board.
+      const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-'));
+      const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-data-'));
+      tmpdirs.push(groupsRoot, dataRoot);
+      const shared = path.join(dataRoot, 'workgroups', WORKGROUP, 'releases');
+      fs.mkdirSync(path.join(shared, 'gates'), { recursive: true });
+      fs.writeFileSync(path.join(shared, 'release-state.json'), JSON.stringify({ asOf: ASOF, items: [item()] }));
+      fs.writeFileSync(
+        path.join(shared, 'gates', '2026-08-22.jsonl'),
+        JSON.stringify({ action: 'ship', target: 'EXAMPLE-APP#817', ts: '2026-08-22T12:30:00Z' }) + '\n',
+      );
+      fs.mkdirSync(path.join(groupsRoot, WORKGROUP), { recursive: true });
+      fs.symlinkSync('/workspace/workgroup/releases', path.join(groupsRoot, WORKGROUP, 'releases'));
+
+      const read = readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), {
+        groupsRoot,
+        claimsRoot: groupsRoot,
+        dataRoot,
+      });
+      expect(read.items).toHaveLength(0);
+    });
+
+    it('the groups root still WINS when both bases have a board', () => {
+      // Order matters for an un-migrated install: nothing about adding a second
+      // base may change which tree an existing deployment reads.
+      const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-'));
+      const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-data-'));
+      tmpdirs.push(groupsRoot, dataRoot);
+      const own = path.join(groupsRoot, WORKGROUP, 'releases');
+      fs.mkdirSync(own, { recursive: true });
+      fs.writeFileSync(
+        path.join(own, 'release-state.json'),
+        JSON.stringify({ asOf: ASOF, items: [item({ title: 'from groups' })] }),
+      );
+      const shared = path.join(dataRoot, 'workgroups', WORKGROUP, 'releases');
+      fs.mkdirSync(shared, { recursive: true });
+      fs.writeFileSync(
+        path.join(shared, 'release-state.json'),
+        JSON.stringify({ asOf: ASOF, items: [item({ title: 'from shared' })] }),
+      );
+
+      const read = readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), {
+        groupsRoot,
+        claimsRoot: groupsRoot,
+        dataRoot,
+      });
+      expect(read.items[0].title).toContain('from groups');
+    });
+
+    it('reads nothing when the SHARED root symlinks into another workgroup', () => {
+      // The security property, re-proved against the new base. Two bases is not
+      // a wider boundary — each base is still one workgroup's own directory,
+      // and containment is checked per-base.
+      const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-'));
+      const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-data-'));
+      tmpdirs.push(groupsRoot, dataRoot);
+      const victim = path.join(dataRoot, 'workgroups', 'other-workgroup', 'releases');
+      fs.mkdirSync(victim, { recursive: true });
+      fs.writeFileSync(
+        path.join(victim, 'release-state.json'),
+        JSON.stringify({ asOf: ASOF, items: [item({ title: 'SECRET neighbour board' })] }),
+      );
+      fs.mkdirSync(path.join(dataRoot, 'workgroups', WORKGROUP), { recursive: true });
+      fs.symlinkSync(victim, path.join(dataRoot, 'workgroups', WORKGROUP, 'releases'), 'dir');
+      fs.mkdirSync(path.join(groupsRoot, WORKGROUP), { recursive: true });
+
+      expect(
+        readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), { groupsRoot, claimsRoot: groupsRoot, dataRoot }),
+      ).toEqual({ asOf: null, items: [] });
+    });
+
+    it('reads nothing when a FILE under the shared root symlinks into another workgroup', () => {
+      // Leaf containment, re-proved against the new base: pinning only the root
+      // leaves the escape one `ln -s` away on a directory agents write into.
+      const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-'));
+      const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-data-'));
+      tmpdirs.push(groupsRoot, dataRoot);
+      const victim = path.join(dataRoot, 'workgroups', 'other-workgroup', 'releases');
+      fs.mkdirSync(victim, { recursive: true });
+      fs.writeFileSync(
+        path.join(victim, 'release-state.json'),
+        JSON.stringify({ asOf: ASOF, items: [item({ title: 'SECRET neighbour board' })] }),
+      );
+      const shared = path.join(dataRoot, 'workgroups', WORKGROUP, 'releases');
+      fs.mkdirSync(shared, { recursive: true });
+      fs.symlinkSync(path.join(victim, 'release-state.json'), path.join(shared, 'release-state.json'));
+      fs.mkdirSync(path.join(groupsRoot, WORKGROUP), { recursive: true });
+
+      expect(
+        readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), { groupsRoot, claimsRoot: groupsRoot, dataRoot }),
+      ).toEqual({ asOf: null, items: [] });
+    });
+
+    it('a shared-tree sibling sharing the workgroup name as a prefix is not "inside" it', () => {
+      const groupsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-board-'));
+      const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-data-'));
+      tmpdirs.push(groupsRoot, dataRoot);
+      const evil = path.join(dataRoot, 'workgroups', `${WORKGROUP}-evil`, 'releases');
+      fs.mkdirSync(evil, { recursive: true });
+      fs.writeFileSync(path.join(evil, 'release-state.json'), JSON.stringify({ asOf: ASOF, items: [item()] }));
+      fs.mkdirSync(path.join(dataRoot, 'workgroups', WORKGROUP), { recursive: true });
+      fs.symlinkSync(evil, path.join(dataRoot, 'workgroups', WORKGROUP, 'releases'), 'dir');
+      fs.mkdirSync(path.join(groupsRoot, WORKGROUP), { recursive: true });
+
+      expect(
+        readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), { groupsRoot, claimsRoot: groupsRoot, dataRoot }),
+      ).toEqual({ asOf: null, items: [] });
+    });
+
     it('still reads a legitimate non-symlinked board (the check is not just "deny")', () => {
+
       const e = board({ state: { asOf: ASOF, items: [item()] } });
       const read = readReleaseBoardSource(DECL, WORKGROUP, Date.parse(ASOF), e);
       expect(read.asOf).toBe(ASOF);

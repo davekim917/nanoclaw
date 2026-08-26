@@ -86,7 +86,7 @@ function readDeclaredFile(
     log.warn(`${label}: declaration carries no \`file\`, emitting nothing`, { workgroupId, kind: decl.kind });
     return null;
   }
-  const rootDir = resolveContainedRoot(label, env.groupsRoot ?? GROUPS_DIR, workgroupId, decl.root);
+  const rootDir = resolveContainedRoot(label, env.groupsRoot ?? GROUPS_DIR, workgroupId, decl.root, env.dataRoot);
   if (rootDir === null) return null;
   return readContainedFile(label, rootDir, decl.file, workgroupId);
 }

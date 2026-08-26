@@ -55,12 +55,33 @@ WAKE_TZ="${SMOKE_GATE_WAKE_TZ:-UTC}"
 # gates (release promotion) read the artifact — durable file, not chat —
 # so a bot message can never carry gate authority.
 PUBLISH_FILE="${SMOKE_GATE_PUBLISH_FILE:-}"
-# Optional explicit block flag (default-open promotion gating): NO_GO writes
-# it, a later GO removes it, BLOCKED/HUMAN_DECISION leave it untouched — an
-# infra-blocked run neither raises a false hold nor clears a real one.
+# Optional explicit block flag (default-open promotion gating): NO_GO and
+# HUMAN_DECISION write it, a later GO removes it, BLOCKED leaves it untouched —
+# an infra-blocked run neither raises a false hold nor clears a real one.
 # Absence of the file means "no smoke objection", so history predating the
 # smoke watcher and watcher downtime never gate a promotion by themselves.
+# (HUMAN_DECISION joined the raising set on 2026-08-25; this comment said
+# otherwise until 2026-08-26. The `finish` block below is the code.)
 HOLD_FILE="${SMOKE_GATE_HOLD_FILE:-}"
+# Optional directory of append-only JSONL where a human's decision on a hold is
+# recorded — the release desk's own gate ledger. UNSET = INERT: no file is read
+# and every campaign-open path behaves exactly as it did before this existed.
+#
+# Why it exists. Nothing in this file ever read HOLD_FILE before opening a
+# campaign, only wrote it. So a standing `needs_human_decision` hold was
+# invisible to the thing that decides to freeze and test: develop kept moving,
+# the cooldown kept expiring, and a fresh campaign opened every
+# FREEZE_MIN_INTERVAL_SECONDS to re-derive a verdict about findings the new
+# build does not touch. Four campaigns in 24h on 2026-08-24/25, every one
+# HUMAN_DECISION, each one a preview pair and four browser lanes.
+#
+# This does NOT gate promotion — HOLD_FILE alone does that, and nothing here
+# ever deletes, rewrites or expires it. It gates only whether a NEW round opens.
+DECISION_LEDGER="${SMOKE_GATE_DECISION_LEDGER:-}"
+# How often an undecided hold re-alarms. Default matches the campaign cadence
+# floor: the human hears from the fleet at the same rate as before, but each
+# notification is a token-free wake instead of a full campaign.
+HOLD_ALERT_SECONDS="${SMOKE_GATE_HOLD_ALERT_SECONDS:-21600}"
 # Optional live-run artifact for merge-queue coordination: written when a run
 # is claimed, refreshed by `progress`, removed by `finish`. Carries
 # `holdMergesUntil` so a consumer never has to know this gate's timings — and
@@ -209,6 +230,8 @@ default_state() {
     fetchFailures: 0,
     lastFailureWakeAt: null,
     holdAlertFor: null,
+    holdPendingRunId: null,
+    holdPendingWakeAt: null,
     preflightReason: null,
     preflightWakeAt: null,
     handoffFreezePr: null,
@@ -271,6 +294,50 @@ epoch_or_zero() {
     date -u -d "$value" +%s 2>/dev/null || printf '0'
   else
     printf '0'
+  fi
+}
+
+# Has a human decided the hold that run id currently owns?
+#
+# Prints exactly one of: `decided`, `undecided`, `unknown`. THREE values, not a
+# boolean, because "the check did not say yes" is not "the check said no": an
+# unset path, a missing directory and an unreadable file all mean this function
+# could not tell, and the caller must see that separately from a real "nobody
+# has answered". The campaign-open guard enumerates all three explicitly.
+#
+# The ledger is the release desk's own append-only record. Entries key the hold
+# as `smoke_hold:<runId>`, which is why the hold file carries `runId` at all.
+# NEWEST LINE WINS and it must be an `override`: on 2026-08-25 a human wrote an
+# `override` on `smoke_hold:xzo-pr-pr1211-…` at 19:21:33Z and the desk wrote a
+# `correction` on the SAME target at 20:27:00Z reading "not a human gate,
+# authorizes nothing". Matching any override anywhere in the file would read
+# that retracted one as decided.
+#
+# `-R` + `fromjson?` per line, never a streaming `jq select`: the desk appends
+# to these files live, and one torn append makes a streaming select abort at
+# that line and silently drop every LATER match — including, on a busy day, the
+# decision this call exists to find.
+hold_decision_state() {
+  local run_id="$1" newest
+  [ -n "$DECISION_LEDGER" ] || { printf 'unknown'; return; }
+  [ -n "$run_id" ] || { printf 'unknown'; return; }
+  [ -d "$DECISION_LEDGER" ] || { printf 'unknown'; return; }
+  # A glob that matches nothing must not become the literal pattern string.
+  local files=("$DECISION_LEDGER"/*.jsonl) raw
+  [ -e "${files[0]}" ] || { printf 'undecided'; return; }
+  # `cat`'s own status, not the pipeline's: an unreadable file (bad mode, a
+  # remounted share) must read as `unknown`, never as "nobody decided" — that
+  # is the fail-OPEN direction, and getting it backwards would wedge the fleet
+  # on an IO error.
+  if ! raw="$(cat "${files[@]}" 2>/dev/null)"; then printf 'unknown'; return; fi
+  newest="$(printf '%s\n' "$raw" |
+    jq -cR --arg t "smoke_hold:$run_id" \
+      'fromjson? | select(type == "object") | select(.target == $t)' 2>/dev/null | tail -1)"
+  if [ -z "$newest" ]; then printf 'undecided'; return; fi
+  if [ "$(jq -r '.action // empty' <<<"$newest" 2>/dev/null)" = override ]; then
+    printf 'decided'
+  else
+    printf 'undecided'
   fi
 }
 
@@ -1045,6 +1112,42 @@ if [ "$FREEZE_HANDOFF" = true ]; then
       fi
     fi
   fi
+
+  # Out-of-band freeze adoption. A human-requested campaign cuts its freeze PR
+  # by calling smoke-freeze-pr.sh directly — a supported, documented flow that
+  # "bypasses the scheduled cadence floor: deliberate, a human asked". It also
+  # bypasses the handoff bookkeeping above, because only THIS file's own freeze
+  # cut writes handoffFreezePr/handoffTargetSha. So its campaign produces a real
+  # hold, a real published verdict and a correct ledger line that the block
+  # above can never adopt, `completedSha` never advances, and the very SHA that
+  # was just tested stays eligible to be frozen and tested again. Live: PR #1211
+  # was created 2h09m after the previous cut, inside the 6h floor this gate
+  # enforces, so the gate cannot have cut it — and its ledger line was still
+  # unadopted ten hours later. Same shape re-froze `8dfca446` as #1195 after
+  # #1188 had already produced a verdict for it.
+  #
+  # Only fires with NO handoff open (nothing to hijack) and only for the exact
+  # SHA this poll is about to freeze. This is the `already_completed` dedup
+  # below, sourced from the ledger instead of state — not a second authority.
+  # It cannot launder a verdict past the tamper shield above, which guards
+  # adoption INTO an open handoff: there is none here, adoption never touches
+  # the hold, and a forged GO line lands as completedVerdict=GO with a hold
+  # present, which the reconciler below reports as `unexpected` and alarms on.
+  if [ -z "$(jq -r '.handoffTargetSha // empty' <<<"$STATE")" ] &&
+     [ "$(jq -r '.completedSha // empty' <<<"$STATE")" != "$SOURCE_SHA" ] &&
+     [ -s "$HANDOFF_LEDGER" ]; then
+    OOB_ENTRY="$(jq -cR --arg t "$SOURCE_SHA" \
+      'fromjson? | select(type == "object") | select(.targetSha == $t)' \
+      "$HANDOFF_LEDGER" 2>/dev/null | tail -1)"
+    if [ -n "$OOB_ENTRY" ]; then
+      STATE="$(jq -c --arg sha "$SOURCE_SHA" \
+        --arg run "$(jq -r '.runId' <<<"$OOB_ENTRY")" \
+        --arg verdict "$(jq -r '.verdict' <<<"$OOB_ENTRY")" \
+        --arg now "$(jq -r '.finishedAt' <<<"$OOB_ENTRY")" \
+        '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict' \
+        <<<"$STATE")"
+    fi
+  fi
 fi
 
 # Hold-file reconciliation. The hold lives on the shared workgroup mount so the
@@ -1201,6 +1304,90 @@ fi
 if [ -n "$WAKE_WINDOW" ] && [ "$(in_wake_window)" != true ]; then
   emit_no_wake "outside_wake_window"
   exit 0
+fi
+
+# ── Undecided promotion hold: do not open a NEW round ─────────────────────────
+#
+# THE BUG THIS CLOSES. Everything above proves the build is testable. Nothing
+# anywhere asked whether testing it would tell anyone something they do not
+# already know. A NO_GO/HUMAN_DECISION hold names findings a human has been
+# asked to rule on; while that question is open, develop keeps moving and every
+# expiry of the cadence floor opened another full campaign to re-derive the same
+# answer about routes the new build does not touch. On 2026-08-24/25 that ran
+# four times in 24h — four HUMAN_DECISIONs, four preview pairs, sixteen browser
+# lanes — and each `finish` OVERWROTE the hold, which also destroyed the runId
+# the pending question was keyed to, so a human's answer no longer matched the
+# file describing it.
+#
+# WHAT THIS DOES NOT DO. It does not touch the hold. No path below deletes,
+# rewrites or expires it, and there is no timeout after which promotion
+# un-gates. Promotion stays blocked until a human clears it by the two routes
+# the release runbook already defines. This gates ONE thing: whether a new round
+# opens.
+#
+# POSITION. Here, and not lower, for the reason the wake-window check states
+# above: `emit_no_wake` writes STATE, so the settled candidate survives
+# untouched and the first poll after a decision opens the campaign on whatever
+# develop has settled on by then. It also sits ahead of the preflight, so a
+# suppressed round does not pay for a 240s credential probe. And it is OUTSIDE
+# the FREEZE_HANDOFF block below, so it covers the direct-campaign path too.
+#
+# EVERY NON-MATCHING OUTCOME IS AN EXPLICIT STOP, enumerated, not inferred:
+if [ -n "$HOLD_FILE" ] && [ -n "$DECISION_LEDGER" ]; then
+  # No hold, or a hold this cannot parse, both leave HOLD_RUN empty and skip the
+  # guard — proceed as today. A malformed hold is not silently swallowed: the
+  # hold-integrity reconciler above already alarms `gate_hold_tampered` on
+  # exactly that, and a second alarm for one condition is two notifications for
+  # one problem.
+  HOLD_RUN=""
+  if [ -s "$HOLD_FILE" ] && jq -e 'type == "object"' "$HOLD_FILE" >/dev/null 2>&1; then
+    HOLD_RUN="$(jq -r '.runId // empty' "$HOLD_FILE" 2>/dev/null)"
+  fi
+  if [ -n "$HOLD_RUN" ]; then
+    HOLD_DECISION="$(hold_decision_state "$HOLD_RUN")"
+    case "$HOLD_DECISION" in
+      decided)
+        # Answered. Fall through — the round re-opens exactly as it always did,
+        # on the normal completedSha/candidate path. No restart, nobody
+        # remembering to un-pause anything.
+        ;;
+      unknown)
+        # The ledger could not be read (unset path, missing dir, unreadable
+        # file). FAIL OPEN: proceed as if this feature were not deployed. A
+        # defensive stop here would be the shape that took the fleet down twice
+        # on 2026-08-25 — failing closed on something unavailable where the code
+        # runs. The hold still blocks promotion regardless.
+        ;;
+      *)
+        # `undecided`, and anything a future edit might return that is not one
+        # of the two above. A question is open; do not spend a campaign
+        # re-asking it. Alarm on an interval rather than latching once: this
+        # wake is now the ONLY thing that surfaces the pending decision, and a
+        # latch that can go permanently silent is not a safety mechanism, it is
+        # one shaped like one (same argument as the overrun alarm above).
+        HOLD_SINCE_WAKE="$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.holdPendingWakeAt // empty' <<<"$STATE")") ))"
+        if [ "$(jq -r '.holdPendingRunId // empty' <<<"$STATE")" != "$HOLD_RUN" ] ||
+           [ "$HOLD_SINCE_WAKE" -ge "$HOLD_ALERT_SECONDS" ]; then
+          STATE="$(jq -c --arg r "$HOLD_RUN" --arg now "$NOW" \
+            '.holdPendingRunId=$r | .holdPendingWakeAt=$now' <<<"$STATE")"
+          write_state "$STATE"
+          jq -cn --arg run "$HOLD_RUN" --arg sha "$(jq -r '.sha // empty' "$HOLD_FILE" 2>/dev/null)" \
+            --arg verdict "$(jq -r '.verdict // empty' "$HOLD_FILE" 2>/dev/null)" \
+            --arg reason "$(jq -r '.reason // empty' "$HOLD_FILE" 2>/dev/null)" \
+            --arg raised "$(jq -r '.raisedAt // empty' "$HOLD_FILE" 2>/dev/null)" \
+            --arg source "$SOURCE_SHA" --arg ledger "$DECISION_LEDGER" \
+            --argjson age "$(( NOW_EPOCH - $(epoch_or_zero "$(jq -r '.raisedAt // empty' "$HOLD_FILE" 2>/dev/null)") ))" \
+            '{wakeAgent:true,data:{schemaVersion:1,trigger:"develop_hold_undecided",
+              holdRunId:$run,holdSha:$sha,holdVerdict:$verdict,holdReason:$reason,
+              raisedAt:$raised,pendingSeconds:$age,currentSha:$source,
+              hint:("A promotion hold is waiting on a human and no campaign will open until it is answered. Promotion is blocked either way — this is about the QA loop, not the gate. Record the decision as an `override` on target `smoke_hold:" + $run + "` in " + $ledger + ".")}}'
+          exit 0
+        fi
+        emit_no_wake "hold_undecided"
+        exit 0
+        ;;
+    esac
+  fi
 fi
 
 # Four network calls in this post-relock region DO run under the lock,
