@@ -225,8 +225,6 @@ function setupLaunchd(
     PROJECT_PATH: projectRoot,
     PLIST_PATH: plistPath,
     SERVICE_LOADED: serviceLoaded,
-    GRAPHIFY_SERVICE_MODE: 'unsupported_launchd',
-    GRAPHIFY_SERVICE_LOADED: false,
     STATUS: 'success',
     LOG: 'logs/setup.log',
   });
@@ -459,40 +457,6 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
     // Not active
   }
 
-  // Graphify is an independently managed, resource-capped sidecar. Install it
-  // only after the interactive host has been restarted and checked, and keep
-  // every sidecar failure non-fatal so indexing can never block messaging.
-  const projectOwner = fs.statSync(projectRoot);
-  const graphifyIdentity = resolveGraphifySystemIdentity(
-    runningAsRoot,
-    homeDir,
-    projectOwner.uid,
-    projectOwner.gid,
-    fs.readFileSync('/etc/passwd', 'utf8'),
-  );
-  const graphifyService = installGraphifySystemdSidecar({
-    projectRoot,
-    nodePath,
-    homeDir: graphifyIdentity.homeDir,
-    runningAsRoot,
-    mainUnitName: unitName,
-    mainUnitPath: unitPath,
-    systemctlPrefix,
-    ...graphifyIdentity.identity,
-  });
-  if (graphifyService.loaded) {
-    log.info('Graphify daemon service is active', {
-      unitName: graphifyService.unitName,
-      unitPath: graphifyService.unitPath,
-    });
-  } else {
-    log.warn('Graphify daemon service is not active (non-fatal)', {
-      unitName: graphifyService.unitName,
-      unitPath: graphifyService.unitPath,
-      error: graphifyService.error,
-    });
-  }
-
   emitStatus('SETUP_SERVICE', {
     SERVICE_TYPE: runningAsRoot ? 'systemd-system' : 'systemd-user',
     SERVICE_UNIT: unitName,
@@ -501,12 +465,6 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
     UNIT_PATH: unitPath,
     SERVICE_LOADED: serviceLoaded,
     ...(logrotatePath ? { LOGROTATE_PATH: logrotatePath } : {}),
-    GRAPHIFY_SERVICE_UNIT: graphifyService.unitName,
-    GRAPHIFY_UNIT_PATH: graphifyService.unitPath,
-    GRAPHIFY_SERVICE_LOADED: graphifyService.loaded,
-    ...(graphifyService.error
-      ? { GRAPHIFY_SERVICE_ERROR: graphifyService.error }
-      : {}),
     ...(dockerGroupStale ? { DOCKER_GROUP_STALE: true } : {}),
     LINGER_ENABLED: !runningAsRoot,
     STATUS: 'success',
@@ -690,8 +648,6 @@ function setupNohupFallback(
     PROJECT_PATH: projectRoot,
     WRAPPER_PATH: wrapperPath,
     SERVICE_LOADED: false,
-    GRAPHIFY_SERVICE_MODE: 'unsupported_nohup',
-    GRAPHIFY_SERVICE_LOADED: false,
     FALLBACK: 'wsl_no_systemd',
     STATUS: 'success',
     LOG: 'logs/setup.log',
