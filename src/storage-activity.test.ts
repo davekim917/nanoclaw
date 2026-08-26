@@ -260,6 +260,49 @@ describe('synchronous storage activity marker', () => {
     expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
   });
 
+  it('survives a releasing holder rmdir-ing the active dir mid-plant', () => {
+    // `fs.promises.rmdir` in a lease release runs its syscall on the libuv
+    // threadpool, so it can land between this planter's mkdirSync and its
+    // writeFileSync and take the directory out from under it. The spy makes
+    // that interleaving deterministic. It is an ordinary race that says nothing
+    // about whether we may proceed, so it must not surface as an ENOENT that a
+    // caller reads as "the DB is missing".
+    const root = tempRoot();
+    const activeDir = path.join(root, '.nanoclaw-storage-active');
+    const realMkdir = fs.mkdirSync.bind(fs);
+    vi.spyOn(fs, 'mkdirSync').mockImplementationOnce(((dir: string, opts: object) => {
+      const result = realMkdir(dir, opts);
+      fs.rmdirSync(activeDir);
+      return result;
+    }) as typeof fs.mkdirSync);
+
+    const release = plantStorageActivityMarker(root, 'writer');
+
+    expect(fs.readdirSync(activeDir), 'the retry must actually leave a marker').toHaveLength(1);
+    expect(
+      tryRunWithStorageCleanupClaim(root, () => undefined),
+      'and it must protect the root',
+    ).toBe(false);
+    release();
+    expect(tryRunWithStorageCleanupClaim(root, () => undefined)).toBe(true);
+  });
+
+  it('still surfaces a non-ENOENT plant failure, leaving no marker behind', () => {
+    // The retry is only for the rmdir race. A full disk is real and must not be
+    // retried into silence — and it must not strand a marker that blocks this
+    // root's reclaim forever.
+    const root = tempRoot();
+    fs.mkdirSync(root, { recursive: true });
+    const err = Object.assign(new Error('no space left on device'), { code: 'ENOSPC' });
+    vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {
+      throw err;
+    });
+
+    expect(() => plantStorageActivityMarker(root, 'writer')).toThrow('no space left on device');
+    vi.restoreAllMocks();
+    expect(fs.existsSync(path.join(root, '.nanoclaw-storage-active'))).toBe(false);
+  });
+
   // Two independent SYNC holders, no lease involved: the original independence
   // property still has to hold for them.
   it('keeps two independent sync markers independent', () => {

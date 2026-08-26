@@ -192,17 +192,24 @@ export function plantStorageActivityMarker(resourceRoot: string, holderId: strin
       // Another live holder still owns it.
     }
   };
-  fs.mkdirSync(activeDir, { recursive: true });
-  try {
-    fs.writeFileSync(marker, `${process.pid}\n`, { flag: 'w' });
-  } catch (err) {
-    // Another holder's release can rmdir activeDir between the mkdir above and
-    // this write, and a full disk can leave a partial marker. Either way the
-    // marker is not trustworthy: clean up and let the caller see the real
-    // error rather than proceeding unprotected or stranding a file that blocks
-    // this root's reclaim forever. Mirrors the async path's error handling.
-    discard();
-    throw err;
+  // Plant, retrying ONCE on ENOENT. A releasing holder's `fs.promises.rmdir`
+  // runs its syscall on the libuv threadpool, so it can land between these two
+  // synchronous calls and take the directory we just made — an ordinary race
+  // with no bearing on whether we may proceed. One retry clears it, because the
+  // rmdir that caused it is done; a loop would only spin. Any other failure
+  // (ENOSPC leaving a partial marker) is real: discard so we neither proceed
+  // unprotected nor strand a file that blocks this root's reclaim forever, and
+  // let the caller see it. Mirrors the async path's error handling.
+  for (let attempt = 0; ; attempt++) {
+    fs.mkdirSync(activeDir, { recursive: true });
+    try {
+      fs.writeFileSync(marker, `${process.pid}\n`, { flag: 'w' });
+      break;
+    } catch (err) {
+      discard();
+      if (attempt === 0 && (err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw err;
+    }
   }
   if (fs.existsSync(cleanupClaimPath(resourceRoot))) {
     discard();
