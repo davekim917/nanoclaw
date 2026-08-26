@@ -242,6 +242,16 @@ describe('CodexProvider usage accounting across a recovery retry', () => {
       // ...and only the one item/completed the fresh attempt produced.
       expectedSteps: 1,
     },
+    {
+      resumeStale: false,
+      replay: true,
+      title: 'same-thread retry ignores records the resumed app-server replays',
+      // Identical to the plain same-thread case: the replayed usage payload
+      // and the replayed item/completed must add nothing. Without the guards
+      // this books 400/40/17/7 and 4 steps.
+      expected: { inputTokens: 300, outputTokens: 30, cacheReadTokens: 12, cacheWriteTokens: 5 },
+      expectedSteps: 3,
+    },
   ] as const) {
     it(
       scenario.title,
@@ -266,6 +276,7 @@ import readline from 'readline';
 const statePath = process.env.FAKE_CODEX_STATE;
 const logPath = process.env.FAKE_CODEX_LOG;
 const resumeStale = process.env.FAKE_CODEX_RESUME_STALE === '1';
+const replay = process.env.FAKE_CODEX_REPLAY === '1';
 const previous = fs.existsSync(statePath) ? Number(fs.readFileSync(statePath, 'utf8')) : 0;
 const instance = previous + 1;
 fs.writeFileSync(statePath, String(instance));
@@ -273,8 +284,8 @@ fs.writeFileSync(statePath, String(instance));
 let currentThread = 'thread-1';
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
 const log = (value) => fs.appendFileSync(logPath, JSON.stringify({ instance, ...value }) + '\\n');
-const usage = (last) =>
-  send({ method: 'thread/tokenUsage/updated', params: { threadId: currentThread, tokenUsage: { last } } });
+const usage = (last, total) =>
+  send({ method: 'thread/tokenUsage/updated', params: { threadId: currentThread, tokenUsage: { last, total } } });
 
 const lines = readline.createInterface({ input: process.stdin });
 lines.on('line', (line) => {
@@ -307,7 +318,10 @@ lines.on('line', (line) => {
     });
     setTimeout(() => {
       if (instance === 1) {
-        usage({ inputTokens: 100, outputTokens: 10, cachedInputTokens: 5, cacheWriteInputTokens: 2 });
+        usage(
+          { inputTokens: 100, outputTokens: 10, cachedInputTokens: 5, cacheWriteInputTokens: 2 },
+          { inputTokens: 100, outputTokens: 10, cachedInputTokens: 5, cacheWriteInputTokens: 2 },
+        );
         for (const id of ['done-a', 'done-b']) {
           send({
             method: 'item/completed',
@@ -335,7 +349,26 @@ lines.on('line', (line) => {
         });
         return;
       }
-      usage({ inputTokens: 200, outputTokens: 20, cachedInputTokens: 7, cacheWriteInputTokens: 3 });
+      if (replay) {
+        // A resumed app-server re-emitting the last pre-crash records:
+        // byte-identical usage, and an item/completed already counted.
+        usage(
+          { inputTokens: 100, outputTokens: 10, cachedInputTokens: 5, cacheWriteInputTokens: 2 },
+          { inputTokens: 100, outputTokens: 10, cachedInputTokens: 5, cacheWriteInputTokens: 2 },
+        );
+        send({
+          method: 'item/completed',
+          params: {
+            threadId: currentThread,
+            turnId,
+            item: { id: 'done-a', type: 'commandExecution', status: 'completed' },
+          },
+        });
+      }
+      usage(
+        { inputTokens: 200, outputTokens: 20, cachedInputTokens: 7, cacheWriteInputTokens: 3 },
+        { inputTokens: 300, outputTokens: 30, cachedInputTokens: 12, cacheWriteInputTokens: 5 },
+      );
       send({
         method: 'item/completed',
         params: {
@@ -372,6 +405,7 @@ lines.on('line', (line) => {
         process.env.FAKE_CODEX_STATE = statePath;
         process.env.FAKE_CODEX_LOG = logPath;
         process.env.FAKE_CODEX_RESUME_STALE = scenario.resumeStale ? '1' : '0';
+        process.env.FAKE_CODEX_REPLAY = 'replay' in scenario && scenario.replay ? '1' : '0';
         // Long quiet window: the desync is raised by turn/completed itself, so
         // the liveness probe must not race in and reclassify the failure.
         process.env.CODEX_HEALTH_PROBE_QUIET_MS = '60000';
@@ -410,6 +444,13 @@ lines.on('line', (line) => {
 // ever read, so a fresh container's first turn bills its own requests, not the
 // thread's history.
 describe('codex usage stays container-respawn safe', () => {
+  // NOT the load-bearing test. This is a lint over source text: it catches a
+  // literal revert to `tokenUsage.total`, and nothing else — a destructure or
+  // a rename sails past it. The behavioural guard is
+  // `codex.token-usage.test.ts` > 'reports only this turn`s requests when a
+  // respawned container resumes a long-lived thread', which drives a fake
+  // app-server carrying a thread-scoped total and asserts the turn bills only
+  // its own requests. Delete THAT and this grep protects nothing.
   it('reads only tokenUsage.last, never tokenUsage.total', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
     const codeOnly = src

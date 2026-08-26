@@ -1351,6 +1351,11 @@ export type CodexTurnAccumulator = {
   // counters on purpose: both are per-turn totals with the same lifetime, so
   // one reset can't be remembered and the other forgotten.
   steps: number;
+  // Item ids already counted into `steps`. Same replay exposure as the token
+  // counters: a resumed app-server that re-emits `item/completed` for items
+  // the pre-crash attempt already counted would inflate `steps`, and `steps`
+  // is the denominator of output_per_step.
+  countedItemIds: Set<string>;
   // Serialized previous `tokenUsage` payload — the duplicate-emission guard.
   // See the `thread/tokenUsage/updated` handler.
   lastUsageKey: string | null;
@@ -1364,6 +1369,7 @@ export function createCodexTurnAccumulator(): CodexTurnAccumulator {
     cachedInputTokens: 0,
     cacheWriteInputTokens: 0,
     steps: 0,
+    countedItemIds: new Set(),
     lastUsageKey: null,
   };
 }
@@ -1786,10 +1792,16 @@ export async function* runOneTurn(
         break;
       }
       case 'item/completed': {
-        turnAccum.steps++;
         const item = params.item as
-          | ({ type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem)
+          | ({ id?: unknown; type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem)
           | undefined;
+        // Count each item once per turn. The id-less case still counts —
+        // there is nothing to dedupe on, and dropping it would undercount.
+        const stepItemId = typeof item?.id === 'string' && item.id.trim() ? item.id.trim() : '';
+        if (!stepItemId || !turnAccum.countedItemIds.has(stepItemId)) {
+          turnAccum.steps++;
+          if (stepItemId) turnAccum.countedItemIds.add(stepItemId);
+        }
         emitCollaborationProgress(item);
         if (item?.type === 'agentMessage' && item.text) resultText = item.text;
         if (item?.type === 'reasoning') emitCompletedReasoningItem(item);
