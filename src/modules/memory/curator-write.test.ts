@@ -470,6 +470,57 @@ describe('OKF index maintenance', () => {
     }
   });
 
+  // A transient listing failure (EMFILE, EIO) produced an empty listing, which
+  // read as "the folder was emptied" and stripped EVERY link from its index in
+  // one pass. An untrustworthy listing must mean "claim nothing".
+  it('leaves a folder index untouched when the directory listing fails', async () => {
+    const peopleDir = path.join(memoryDir(), 'people');
+    fs.mkdirSync(peopleDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(peopleDir, 'james.md'),
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\nJames leads the release train.\n',
+    );
+    fs.writeFileSync(path.join(peopleDir, 'roster.md'), '# Roster\n\nHand-written.\n');
+    await syncMemoryIndexes(TEST_WORKGROUP);
+    const before = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md');
+    expect(before.content).toContain('- [James](james.md)');
+
+    const real = fs.readdirSync;
+    const spy = vi.spyOn(fs, 'readdirSync').mockImplementation(((target: fs.PathLike, options: never) => {
+      if (String(target).endsWith(`${path.sep}people`)) {
+        const error = new Error('EMFILE: too many open files') as NodeJS.ErrnoException;
+        error.code = 'EMFILE';
+        throw error;
+      }
+      return real(target, options);
+    }) as typeof fs.readdirSync);
+    try {
+      expect(await syncMemoryIndexes(TEST_WORKGROUP)).toEqual({ updated: [] });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').sha256).toBe(before.sha256);
+  });
+
+  // OKF reserves `log.md` as a folder journal, so a hand-written link to one is
+  // legitimate. Filtering reserved leaves out of the listing made it look stale.
+  it('keeps a hand-written link to a reserved log.md', async () => {
+    const peopleDir = path.join(memoryDir(), 'people');
+    fs.mkdirSync(peopleDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(peopleDir, 'james.md'),
+      '---\ntype: person\nconsolidated_facts: 1\n---\n\nJames leads the release train.\n',
+    );
+    fs.writeFileSync(path.join(peopleDir, 'log.md'), '# People log\n\nJournal.\n');
+    fs.writeFileSync(path.join(peopleDir, 'index.md'), '# People\n\n- [Journal](log.md) - the folder journal\n');
+    await syncMemoryIndexes(TEST_WORKGROUP);
+    const index = readMemoryTopicFile(TEST_WORKGROUP, 'people/index.md').content;
+    expect(index).toContain('- [Journal](log.md) - the folder journal');
+    expect(index).toContain('- [James](james.md) - James leads the release train.');
+    // …and `log.md` is still not a topic file the model may write.
+    expect(index).not.toContain('People Log');
+  });
+
   // F2 x F3 compose: a link inside a fence pointing at a file that is NOT on
   // disk. The fence rule wins — the curator does not parse it at all, so the
   // "target is gone" rule never gets a say.

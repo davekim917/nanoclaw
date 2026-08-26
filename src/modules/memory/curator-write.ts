@@ -503,29 +503,41 @@ async function updateIndexFile(
 /**
  * One topic folder, split into what is THERE and what could be READ.
  *
- * The split is load-bearing. `present` comes from the directory listing, so
- * "present" means present on disk. Deriving it from successful reads instead
- * made an unreadable file — EACCES, EIO, or simply larger than
- * MEMORY_INDEX_MAX_BYTES — indistinguishable from a deleted one, and the map
- * merge deletes links to deleted files. A human-authored topic file over the
- * cap lost its hand-written link on EVERY sync, permanently, while the file
- * sat right there on disk.
+ * `present` is POSITIVE EVIDENCE and nothing else. The map merge deletes a
+ * link when its target is gone, and "gone" has to mean observed-absent, never
+ * merely missing-from-a-listing-we-derived. Three bugs came out of getting
+ * that wrong, all the same shape:
+ *
+ *   - built from successful READS, so an unreadable or over-cap file looked
+ *     deleted and lost its hand-written link on every sync;
+ *   - a transient `readdir` failure (EMFILE, EIO) produced an empty listing,
+ *     which read as "the whole folder was deleted" and stripped every link
+ *     from that folder's index in one pass;
+ *   - reserved leaves were filtered out of the listing, so a hand-written link
+ *     to a folder's `log.md` journal — a legitimate OKF file — read as stale.
+ *
+ * So: `null` means "the listing is not trustworthy, claim nothing", an empty
+ * listing is treated the same way, and reserved leaves count as present.
  */
 function listTopicEntries(
   workgroupId: string,
   directory: string,
-): { present: Set<string>; entries: TopicIndexEntry[] } {
-  let names: string[];
+): { present: Set<string> | null; entries: TopicIndexEntry[] } {
+  let all: string[];
   try {
-    names = fs
+    all = fs
       .readdirSync(path.join(workgroupMemoryDir(workgroupId), directory), { withFileTypes: true })
-      .filter((entry) => entry.isFile() && entry.name.endsWith('.md') && !RESERVED_TOPIC_LEAVES.has(entry.name))
-      .map((entry) => entry.name)
-      .filter((name) => TOPIC_FILE_PATH_PATTERN.test(`${directory}/${name}`))
-      .sort((a, b) => a.localeCompare(b));
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
+      .map((entry) => entry.name);
   } catch {
-    return { present: new Set(), entries: [] };
+    return { present: null, entries: [] };
   }
+  // An empty listing for a folder that has an index is far more likely to be a
+  // failed listing than a folder someone emptied. Err toward keeping links.
+  if (all.length === 0) return { present: null, entries: [] };
+  const names = all
+    .filter((name) => !RESERVED_TOPIC_LEAVES.has(name) && TOPIC_FILE_PATH_PATTERN.test(`${directory}/${name}`))
+    .sort((a, b) => a.localeCompare(b));
   const entries: TopicIndexEntry[] = [];
   for (const name of names) {
     try {
@@ -540,7 +552,7 @@ function listTopicEntries(
       continue; // still `present`, just not readable — its link stays put
     }
   }
-  return { present: new Set(names), entries };
+  return { present: new Set(all), entries };
 }
 
 export interface MemoryIndexSyncResult {
@@ -571,6 +583,9 @@ export async function syncMemoryIndexes(
   const rootLinks: IndexLink[] = [];
   for (const directory of TOPIC_DIRECTORIES) {
     const { present, entries } = listTopicEntries(workgroupId, directory);
+    // Listing untrustworthy: leave this folder's index exactly as it is rather
+    // than rewriting a map from evidence we do not have.
+    if (present === null) continue;
     const owned = entries.filter((entry) => isCuratorOwned(entry.content));
     const indexPath = `${directory}/index.md`;
     const hasIndex = readMemoryTopicFile(workgroupId, indexPath, MEMORY_INDEX_MAX_BYTES).sha256 !== null;

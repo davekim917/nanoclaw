@@ -26,9 +26,9 @@ import { frontmatterValue, stripCuratorMetadata } from './curator-contract.js';
  * still mishandled, verified by probing rather than assumed — none of these
  * lose content, they duplicate a link or add a second section:
  *
- *   - `> - [X](y.md)` in a blockquote, `* [X](y.md)` with a star marker, and a
- *     `[X]: y.md` link reference definition are not claimed, so a second link
- *     to the same target is appended beside them;
+ *   - `> - [X](y.md)` in a blockquote, `* [X](y.md)` with a star marker, a
+ *     tab-indented bullet, and a `[X]: y.md` link reference definition are not
+ *     claimed, so a second link to the same target is appended beside them;
  *   - a setext `Map\n---` heading is not recognized, so a fresh `## Map`
  *     section is appended at end of file instead of merging into it.
  *
@@ -50,10 +50,16 @@ export interface IndexLink {
  *  a second link to the same target gets appended beside it. */
 const BULLET = /^ {0,3}-\s+\[([^\]]*)\]\(\s*<?([^)>\s]+)>?/;
 
-/** A bullet's wrapped continuation line, which must die with its bullet.
- *  Only the lines IMMEDIATELY under it — a blank line ends the bullet, and
- *  anything after that blank is someone else's prose. */
-const CONTINUATION = /^\s+\S/;
+// A replaced bullet takes NOTHING with it but its own line.
+//
+// There used to be a rule that also deleted the indented lines under it, on
+// the theory that they were its wrapped tail. They are not: a bullet this
+// module renders is single-line by construction — the hook is bounded and has
+// its whitespace collapsed — so the curator has never written a wrapped
+// bullet, and anything indented under one was written by somebody else. The
+// rule deleted a hand-written note, an indented code block, a nested
+// sub-bullet and a blockquote, and kept only the case it was aimed at, which
+// cannot occur. Positive evidence: delete the line we know is ours.
 
 /**
  * Which lines sit inside a fenced code block or an HTML comment.
@@ -112,7 +118,9 @@ export function mergeManagedLinks(
   insertAfter?: string,
 ): string {
   const level = /^#+/.exec(heading)?.[0].length ?? 2;
-  const lines = existing.length > 0 ? existing.split('\n') : [];
+  // Strip a leading BOM before scanning: otherwise the first heading never
+  // matches and a duplicate section is appended below the original.
+  const lines = existing.length > 0 ? existing.replace(/^\uFEFF/, '').split('\n') : [];
   let fenced = fencedLines(lines);
   const headingAt = (text: string): number =>
     lines.findIndex((line, index) => !fenced[index] && line.trimEnd() === text);
@@ -155,7 +163,6 @@ export function mergeManagedLinks(
   const kept: string[] = [];
   let firstSubheadingAt = -1;
   let firstBulletAt = -1;
-  let dropping = false;
   // An indented bullet is a NESTED item when a list is already open, and a
   // top-level item when one is not — CommonMark allows a top-level item up to
   // three spaces in. Without this, a hand-written sub-bullet under someone
@@ -163,27 +170,15 @@ export function mergeManagedLinks(
   let listOpen = false;
   for (let index = start + 1; index < end; index += 1) {
     const line = lines[index]!;
-    if (fenced[index]) {
-      dropping = false;
-    } else if (line.trim() === '') {
-      // A blank line ends the bullet. Anything indented after it is a new
-      // block someone wrote, not this bullet's wrapped tail — carrying
-      // `dropping` across the blank is what silently ate hand-written notes.
-      // (It does NOT end the list: a loose list has blanks between items.)
-      dropping = false;
-    } else {
+    if (!fenced[index] && line.trim() !== '') {
       const match = BULLET.exec(line);
       const nested = match !== null && line.startsWith(' ') && listOpen;
       if (match && !nested) {
         listOpen = true;
-        dropping = owns(match[2]!);
-        if (dropping) continue;
+        if (owns(match[2]!)) continue;
         if (firstBulletAt < 0) firstBulletAt = kept.length;
-      } else if (dropping && CONTINUATION.test(line)) {
-        continue; // wrapped tail or nested item of a bullet being replaced
       } else {
-        dropping = false;
-        listOpen = match !== null || CONTINUATION.test(line);
+        listOpen = match !== null || /^[ \t]+\S/.test(line);
         if (!listOpen && firstSubheadingAt < 0 && subheading.test(line)) firstSubheadingAt = kept.length;
       }
     }

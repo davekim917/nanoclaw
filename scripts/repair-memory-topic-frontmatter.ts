@@ -15,10 +15,13 @@
  * previews EVERYTHING --apply does, index rewrites included — a preview that
  * hides the index changes hides the part an operator most needs to consent to.
  *
- * --backup-dir is REQUIRED for --apply and every original is copied there
- * before it is touched, because this is a one-shot pass over hand-written
- * memory with no other undo. Restore with `cp -a <backup-dir>/<workgroup>/. `
- * over the workgroup's memory directory.
+ * --backup-dir is REQUIRED for --apply. Each workgroup's whole memory tree is
+ * snapshotted there before anything is written, because this is a one-shot
+ * pass over hand-written memory with no other undo, and it CREATES index files
+ * as well as rewriting them — so a per-file copy would not be restorable.
+ *
+ *   restore:  rm -rf data/workgroups/<wg>/memory
+ *             cp -a <backup-dir>/<wg> data/workgroups/<wg>/memory
  *
  * Writes go through the curator's own CAS path, so a container writing the
  * same file concurrently surfaces as a reported conflict rather than a lost
@@ -61,16 +64,23 @@ if (apply && backupDir === null) {
   fail('--apply requires --backup-dir <dir>: this rewrites hand-written memory and has no other undo');
 }
 
-function backUp(workgroupId: string, relative: string, content: string): void {
-  const target = path.join(backupDir!, workgroupId, relative);
+/**
+ * Snapshot a workgroup's whole memory tree before the run touches it.
+ *
+ * A per-file copy taken at write time cannot be an undo: this pass also
+ * CREATES index files, and there is no original to copy for those — a restore
+ * has to delete them. One `cp -a` of the tree covers modified, created and
+ * untouched files alike, and makes the restore a single command. It is also
+ * less code than the per-file version it replaces.
+ *
+ * Never overwritten: re-running --apply into the same directory keeps the
+ * first run's snapshot, which is the one that holds the true originals.
+ */
+function snapshot(workgroupId: string): void {
+  const target = path.join(backupDir!, workgroupId);
+  if (fs.existsSync(target)) return;
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  // wx: a backup is never overwritten, so re-running --apply cannot destroy
-  // the copy of the ORIGINAL taken by the first run.
-  try {
-    fs.writeFileSync(target, content, { flag: 'wx' });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-  }
+  fs.cpSync(workgroupMemoryDir(workgroupId), target, { recursive: true });
 }
 
 function workgroupIds(): string[] {
@@ -110,6 +120,7 @@ if (selected !== null && targets.length === 0) {
 }
 
 for (const workgroupId of targets) {
+  if (apply) snapshot(workgroupId);
   for (const relative of topicPaths(workgroupId)) {
     let current: { content: string; sha256: string | null };
     try {
@@ -132,7 +143,6 @@ for (const workgroupId of targets) {
       repaired += 1;
       continue;
     }
-    backUp(workgroupId, relative, current.content);
     const write = await writeMemoryTopicFile(workgroupId, relative, current.content, current.sha256, factsCount);
     if (write.status === 'success') {
       repaired += 1;
@@ -179,7 +189,7 @@ for (const workgroupId of targets) {
 console.log(
   `${apply ? 'repaired' : 'would repair'} ${repaired}, already normalized ${skipped}, ` +
     `blocked by the size cap ${blocked}, failed ${failed}` +
-    (apply ? `, originals backed up to ${backupDir}` : ' — re-run with --apply --backup-dir DIR to write'),
+    (apply ? `, memory trees snapshotted to ${backupDir}` : ' — re-run with --apply --backup-dir DIR to write'),
 );
 // Non-zero whenever work was not completed. A size-blocked file is not a crash
 // but it IS an unrepaired file, and an operator scripting this needs to see

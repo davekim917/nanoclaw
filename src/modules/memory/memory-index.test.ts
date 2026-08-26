@@ -377,14 +377,17 @@ describe('merge does not eat hand-written content', () => {
     expect(merged.match(/\(people\/index\.md\)/g)).toHaveLength(1);
   });
 
-  it('still removes the wrapped continuation that belongs to a replaced bullet', () => {
-    const existing = [
-      '# People',
-      '',
-      '- [James](james.md) - old hook that wraps',
-      '  onto a second line belonging to that bullet.',
-      '',
-    ].join('\n');
+  // CONTRACT REVERSED (was: "still removes the wrapped continuation that
+  // belongs to a replaced bullet"). A bullet this module renders is
+  // single-line by construction — bounded hook, whitespace collapsed — so the
+  // curator has never written a wrapped bullet, and an indented line under one
+  // was written by somebody else. The old rule deleted a hand-written note, an
+  // indented code block, a nested sub-bullet and a blockquote to catch a case
+  // that cannot occur.
+  it('takes nothing but its own line when it replaces a bullet', () => {
+    const existing = ['# People', '', '- [James](james.md) - old hook', '  a line a human put under it.', ''].join(
+      '\n',
+    );
     const merged = renderFolderIndex(
       'people',
       [{ name: 'james.md', content: 'James owns the XZO release train.\n' }],
@@ -392,8 +395,21 @@ describe('merge does not eat hand-written content', () => {
       new Set(['james.md']),
       existing,
     );
-    expect(merged).not.toContain('onto a second line');
+    expect(merged).toContain('  a line a human put under it.');
     expect(merged).toContain('- [James](james.md) - James owns the XZO release train.');
+    expect(merged.match(/\(james\.md\)/g)).toHaveLength(1);
+  });
+
+  it.each([
+    ['an indented note', '  NOTE from Dave: I curate this folder by hand.', 'NOTE from Dave'],
+    ['an indented code block', '    keep me', 'keep me'],
+    ['a nested sub-bullet', '  - [Sub](sub.md) - human sub-entry', 'human sub-entry'],
+    ['a blockquote', '  > quoted note from Dave', 'quoted note from Dave'],
+  ])('leaves %s directly under a replaced bullet alone', (_label, line, survives) => {
+    const existing = ['## Map', '', '- [People](people/index.md) - old', line, ''].join('\n');
+    const merged = mergeRootIndexMap(existing, TOPIC_DIRECTORIES, FOLDER_LINKS);
+    expect(merged).toContain(survives);
+    expect(merged.match(/\(people\/index\.md\)/g)).toHaveLength(1);
   });
 
   // Found by probing my own fix rather than by the next reviewer: fence
@@ -497,7 +513,10 @@ describe('merge does not eat hand-written content', () => {
 });
 
 describe('merge mechanics', () => {
-  it('removes a replaced bullet together with its wrapped continuation lines', () => {
+  // CONTRACT REVERSED alongside its sibling above: the wrapped tail is kept.
+  // The curator never writes a wrapped bullet, so those lines are a human's,
+  // and orphaning two lines is recoverable where deleting them is not.
+  it('keeps the lines under a replaced bullet and replaces only its own line', () => {
     const existing = [
       '# NanoClaw',
       '',
@@ -509,8 +528,9 @@ describe('merge mechanics', () => {
     const merged = mergeManagedLinks(existing, '# NanoClaw', (target) => target === 'package-updates.md', [
       { target: 'package-updates.md', title: 'Package update runbook', hook: 'the audit' },
     ]);
-    expect(merged).not.toContain('permanent holds and their evidence');
+    expect(merged).toContain('permanent holds and their evidence');
     expect(merged).toContain('- [Package update runbook](package-updates.md) - the audit');
+    expect(merged.match(/package-updates\.md/g)).toHaveLength(1);
   });
 
   it('stops at the next heading of the same or a higher level', () => {

@@ -604,8 +604,12 @@ const FRONTMATTER_KEY = /^[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t].*)?$/;
  * frontmatter and eaten.
  */
 export function splitFrontmatter(content: string): { keys: string[]; body: string } {
-  if (!content.startsWith('---\n') && !content.startsWith('---\r\n')) return { keys: [], body: content };
-  const lines = content.split('\n');
+  // A leading BOM otherwise makes the block unparseable, which reads as "no
+  // frontmatter", which reads as unowned — and silently freezes the file
+  // against consolidation forever. Same failure class as F13.
+  const text = content.replace(/^\uFEFF/, '');
+  if (!text.startsWith('---\n') && !text.startsWith('---\r\n')) return { keys: [], body: content };
+  const lines = text.split('\n');
   const close = lines.findIndex((line, index) => index > 0 && line.trimEnd() === '---');
   if (close < 1) return { keys: [], body: content };
   const keys = lines.slice(1, close).map((line) => line.trimEnd());

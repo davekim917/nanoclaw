@@ -129,11 +129,11 @@ link the curator replaces are removed with it.
 
 The merge is a line-walker, not a Markdown parser, so a few constructs are read
 imprecisely — none of them lose content, they add a duplicate link or a second
-section. A `> - [X](y.md)` in a blockquote, a `* [X](y.md)` star-marker bullet,
-and a `[X]: y.md` link reference definition are not recognized as the curator's,
-so a second link to the same target appears beside them; and a setext `Map` /
-`---` heading is not recognized as `## Map`, so a fresh `## Map` is appended at
-end of file. Write map links as ordinary `- [Title](target.md)` bullets under an
+section. A `> - [X](y.md)` in a blockquote, a `* [X](y.md)` star-marker bullet, a
+tab-indented bullet, and a `[X]: y.md` link reference definition are not
+recognized as the curator's, so a second link to the same target appears beside
+them; and a setext `Map` / `---` heading is not recognized as `## Map`, so a
+fresh `## Map` is appended at end of file. CRLF input is normalized to LF. Write map links as ordinary `- [Title](target.md)` bullets under an
 ATX `## Map` heading and none of that applies.
 
 ## Selective background capture
