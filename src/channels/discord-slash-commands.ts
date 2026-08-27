@@ -311,7 +311,7 @@ async function handleUpdateContainer(interaction: ChatInputCommandInteraction): 
     log.error('Upstream policy snapshot refresh failed before /update-container audit', { err });
   }
 
-  await interaction.reply({ content: 'Auditing container packages and synced upstream files…' });
+  await interaction.reply({ content: 'Auditing host and container dependency drift…' });
   const reply = await interaction.fetchReply();
 
   const parentChannelId = getInteractionParentId(interaction);

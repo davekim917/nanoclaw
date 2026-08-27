@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
@@ -451,6 +452,62 @@ describe('upstream policy snapshot fallback (containers have no .git)', () => {
   it('describeUpstreamPolicy reports unavailable when there is neither git nor a snapshot', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'upstream-policy-'));
     expect(await describeUpstreamPolicy(root)).toEqual({ source: 'unavailable', generatedAt: null });
+  });
+
+  // The predicate this whole feature exists for: gating the fallback on
+  // "upstream/main resolved", NOT on "the derived map is non-empty". A repo
+  // with full merge history but no `upstream` remote (exactly what a plain
+  // `git clone` of this repo produces) still lets `git log --merges --grep=`
+  // find the upstream-merge commit and derive `heldByMerge` from its parents
+  // — a NON-EMPTY map that is missing `upstreamPin` on every entry, because
+  // computing `upstreamPin` requires `upstream/main` itself to resolve. The
+  // old `policy.size > 0` predicate would keep that half-signal and never
+  // reach the snapshot. This fixture builds exactly that repo shape.
+  it('prefers the snapshot over a git-reachable-but-incomplete merge signal (no upstream remote)', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'upstream-policy-git-'));
+    const git = (args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' });
+
+    git(['init', '-q', '-b', 'main']);
+    git(['config', 'user.email', 'test@example.com']);
+    git(['config', 'user.name', 'Test']);
+
+    const manifestPath = path.join(root, 'package.json');
+    await writeFile(manifestPath, JSON.stringify({ dependencies: { mypkg: '1.0.0' } }));
+    git(['add', 'package.json']);
+    git(['commit', '-q', '-m', 'base']);
+
+    git(['checkout', '-q', '-b', 'feature']);
+    await writeFile(manifestPath, JSON.stringify({ dependencies: { mypkg: '2.0.0' } }));
+    git(['commit', '-q', '-am', 'feature bump']);
+
+    git(['checkout', '-q', 'main']);
+    await writeFile(manifestPath, JSON.stringify({ dependencies: { mypkg: '1.5.0' } }));
+    git(['commit', '-q', '-am', 'main bump']);
+
+    // -X ours auto-resolves the conflict keeping main's side; the message is
+    // exactly what readUpstreamPolicyFromGit's --grep matches to find this
+    // commit (mirrors the real message `git merge upstream/main` produces).
+    // NO `upstream` remote is ever added — `upstream/main` can never resolve.
+    git(['merge', '-q', '--no-ff', '-X', 'ours', '-m', "Merge remote-tracking branch 'upstream/main'", 'feature']);
+
+    // A snapshot carrying an upstreamPin the git path above cannot produce
+    // (it has no upstream/main to read one from).
+    await writeSnapshot(root, {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      manifests: { 'package.json': { mypkg: { upstreamPin: '9.9.9', keptOurs: true } } },
+    });
+
+    const originalEnv = process.env.NANOCLAW_UPSTREAM_POLICY;
+    process.env.NANOCLAW_UPSTREAM_POLICY = path.join(root, '.upstream-policy.json');
+    try {
+      const policy = await readUpstreamPolicy(root, 'package.json');
+      expect(policy.get('mypkg')?.upstreamPin).toBe('9.9.9');
+      expect(await describeUpstreamPolicy(root)).toMatchObject({ source: 'snapshot' });
+    } finally {
+      if (originalEnv === undefined) delete process.env.NANOCLAW_UPSTREAM_POLICY;
+      else process.env.NANOCLAW_UPSTREAM_POLICY = originalEnv;
+    }
   });
 });
 

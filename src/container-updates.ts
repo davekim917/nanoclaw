@@ -185,9 +185,14 @@ async function readUpstreamPolicyFromGit(
 ): Promise<{ policy: Map<string, UpstreamPolicy>; upstreamReachable: boolean }> {
   const show = async (rev: string): Promise<string | null> => {
     try {
+      // timeout: a wedged git (e.g. a held .git/index.lock from concurrent
+      // activity, which this repo sees a lot of) must not hang host boot or
+      // the /update-container interaction ack forever. Rejection lands in
+      // this catch and fails open exactly like any other git error.
       const { stdout } = await execFileAsync('git', ['show', `${rev}:${relativeManifest}`], {
         cwd: repoRoot,
         maxBuffer: 16 * 1024 * 1024,
+        timeout: 10_000,
       });
       return stdout;
     } catch {
@@ -195,10 +200,11 @@ async function readUpstreamPolicyFromGit(
     }
   };
 
+  // timeout: same wedged-git concern as `show` above.
   const mergeCommit = await execFileAsync(
     'git',
     ['log', '--merges', '-1', '--format=%H', '--grep=Merge remote-tracking branch .upstream/main'],
-    { cwd: repoRoot, maxBuffer: 1024 * 1024 },
+    { cwd: repoRoot, maxBuffer: 1024 * 1024, timeout: 10_000 },
   )
     .then(({ stdout }) => stdout.trim() || null)
     .catch(() => null);
@@ -271,7 +277,12 @@ export async function writeUpstreamPolicySnapshot(repoRoot: string, outPath: str
 export async function describeUpstreamPolicy(
   repoRoot: string,
 ): Promise<{ source: 'git' | 'snapshot' | 'unavailable'; generatedAt: string | null }> {
-  const gitReady = await execFileAsync('git', ['rev-parse', '--verify', 'upstream/main'], { cwd: repoRoot })
+  // timeout: same wedged-git concern as readUpstreamPolicyFromGit — this runs
+  // on the interactive /update-container path and must not stall the ack.
+  const gitReady = await execFileAsync('git', ['rev-parse', '--verify', 'upstream/main'], {
+    cwd: repoRoot,
+    timeout: 10_000,
+  })
     .then(() => true)
     .catch(() => false);
   if (gitReady) return { source: 'git', generatedAt: null };
