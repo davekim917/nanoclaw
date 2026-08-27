@@ -295,13 +295,19 @@ export interface ContainerConfig {
 
   /**
    * Per-group daily summary digest config. The host-side daily-summary timer
-   * (src/daily-summary.ts) posts a per-group activity digest once a day; by
-   * default it targets the primary wired channel (highest mga.priority,
-   * oldest-wired tiebreak). Set `messagingGroupId` to override the selected
-   * destination for a particular installation.
+   * (src/daily-summary.ts) posts a per-workgroup activity digest once a day.
+   * `messagingGroupId` is the explicit opt-in and destination; without it,
+   * the workgroup has no digest and the host does not fall back to a primary
+   * wired channel.
    */
   dailySummary?: {
     messagingGroupId?: string;
+    /**
+     * Optional GitHub Issues source for this Codex poster's workgroup backlog,
+     * as `owner/repo`. When set, the host summary reads open and recently
+     * closed issues from GitHub instead of legacy SQLite backlog rows.
+     */
+    githubIssuesRepo?: string;
     /**
      * Include the shipped-work sections (🤖 Agent Shipped / 🛠 Other commits)
      * in the digest. Defaults to true. Workgroups whose ship state already

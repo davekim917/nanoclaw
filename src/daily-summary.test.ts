@@ -1,7 +1,42 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const dailySummaryMocks = vi.hoisted(() => ({
+  getAllAgentGroups: vi.fn(),
+  getBacklog: vi.fn(),
+  getBacklogResolvedSince: vi.fn(),
+  getShipLogSince: vi.fn(),
+  getMessagingGroup: vi.fn(),
+  getDeliveryAdapter: vi.fn(),
+  readContainerConfig: vi.fn(),
+  resolveGitHubToken: vi.fn(),
+  logWarn: vi.fn(),
+  logError: vi.fn(),
+  logInfo: vi.fn(),
+  logDebug: vi.fn(),
+}));
+
+vi.mock('./db/agent-groups.js', () => ({ getAllAgentGroups: dailySummaryMocks.getAllAgentGroups }));
+vi.mock('./db/backlog.js', () => ({
+  getBacklog: dailySummaryMocks.getBacklog,
+  getBacklogResolvedSince: dailySummaryMocks.getBacklogResolvedSince,
+  getShipLogSince: dailySummaryMocks.getShipLogSince,
+}));
+vi.mock('./db/messaging-groups.js', () => ({ getMessagingGroup: dailySummaryMocks.getMessagingGroup }));
+vi.mock('./delivery.js', () => ({ getDeliveryAdapter: dailySummaryMocks.getDeliveryAdapter }));
+vi.mock('./container-config.js', () => ({ readContainerConfig: dailySummaryMocks.readContainerConfig }));
+vi.mock('./github-token.js', () => ({ resolveGitHubToken: dailySummaryMocks.resolveGitHubToken }));
+vi.mock('./log.js', () => ({
+  log: {
+    warn: dailySummaryMocks.logWarn,
+    error: dailySummaryMocks.logError,
+    info: dailySummaryMocks.logInfo,
+    debug: dailySummaryMocks.logDebug,
+  },
+}));
 
 import { splitForLimit } from './channels/chat-sdk-bridge.js';
 import {
+  _fireDigestsForTest,
   deliverBacklogThread,
   extractRepo,
   formatDigest,
@@ -44,6 +79,26 @@ function backlogItem(over: Partial<BacklogItem> = {}): BacklogItem {
 
 function emptySummary() {
   return { agentShipped: [], otherCommits: [], resolved: [], openBacklog: [] };
+}
+
+function githubIssue(over: Record<string, unknown> = {}) {
+  return {
+    id: 1,
+    number: 1,
+    title: 'untitled issue',
+    body: null,
+    state: 'open',
+    html_url: 'https://github.com/davekim917/nanoclaw/issues/1',
+    created_at: '2026-08-20T00:00:00.000Z',
+    updated_at: '2026-08-20T00:00:00.000Z',
+    closed_at: null,
+    labels: [],
+    ...over,
+  };
+}
+
+function githubResponse(body: unknown, link?: string): Response {
+  return new Response(JSON.stringify(body), { status: 200, headers: link ? { link } : undefined });
 }
 
 describe('extractRepo', () => {
@@ -378,6 +433,239 @@ describe('deliverBacklogThread', () => {
       null,
       'chat',
       JSON.stringify({ text: 'short list' }),
+    );
+  });
+});
+
+describe('GitHub Issues-backed daily backlog', () => {
+  const poster = {
+    id: 'ag-codex',
+    name: 'Axie-Codex',
+    folder: 'axie-dev-codex',
+    agent_provider: null,
+    created_at: '2026-08-01T00:00:00.000Z',
+    workgroup_id: 'axie-dev',
+  };
+  const sibling = {
+    id: 'ag-claude',
+    name: 'Axie-Claude',
+    folder: 'axie-dev-claude',
+    agent_provider: null,
+    created_at: '2026-08-01T00:00:00.000Z',
+    workgroup_id: 'axie-dev',
+  };
+  const target = {
+    id: 'mg-axie-dev',
+    channel_type: 'discord',
+    platform_id: 'discord:guild:axie-dev',
+    name: 'axie-dev',
+    is_group: 1,
+    unknown_sender_policy: 'strict' as const,
+    created_at: '2026-08-01T00:00:00.000Z',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dailySummaryMocks.getAllAgentGroups.mockReturnValue([poster, sibling]);
+    dailySummaryMocks.readContainerConfig.mockImplementation((folder: string) =>
+      folder === poster.folder
+        ? {
+            provider: 'codex',
+            dailySummary: {
+              messagingGroupId: target.id,
+              githubIssuesRepo: 'davekim917/nanoclaw',
+            },
+          }
+        : { provider: 'claude' },
+    );
+    dailySummaryMocks.getMessagingGroup.mockReturnValue(target);
+    dailySummaryMocks.getShipLogSince.mockReturnValue([]);
+    dailySummaryMocks.getBacklog.mockReturnValue([backlogItem({ title: 'stale SQLite backlog row' })]);
+    dailySummaryMocks.getBacklogResolvedSince.mockReturnValue([
+      backlogItem({ title: 'stale SQLite resolved row', status: 'resolved' }),
+    ]);
+    dailySummaryMocks.resolveGitHubToken.mockResolvedValue('github-token');
+    dailySummaryMocks.getDeliveryAdapter.mockReturnValue({
+      deliver: vi.fn().mockResolvedValue('parent-message'),
+      createThread: vi.fn().mockResolvedValue({ threadId: 'backlog-thread', messageId: 'thread-message' }),
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('uses every GitHub issue page instead of legacy backlog rows, filters pull requests, and threads linked issues', async () => {
+    const now = new Date().toISOString();
+    const fetchMock = vi.fn(async (input: string | URL, _init?: RequestInit) => {
+      const url = String(input);
+      const query = new URL(url).searchParams;
+      if (query.get('state') === 'open' && query.get('page') === '1') {
+        return githubResponse(
+          [
+            githubIssue({
+              number: 101,
+              title: 'P0 in progress',
+              body: 'needs immediate attention',
+              html_url: 'https://github.com/davekim917/nanoclaw/issues/101',
+              created_at: '2026-08-10T00:00:00.000Z',
+              labels: [{ name: 'severity:p0' }, { name: 'in progress' }],
+            }),
+            githubIssue({
+              number: 999,
+              title: 'not an issue',
+              html_url: 'https://github.com/davekim917/nanoclaw/pull/999',
+              pull_request: { url: 'https://api.github.com/repos/davekim917/nanoclaw/pulls/999' },
+            }),
+          ],
+          '<https://api.github.com/repos/davekim917/nanoclaw/issues?state=open&per_page=100&page=2>; rel="next"',
+        );
+      }
+      if (query.get('state') === 'open' && query.get('page') === '2') {
+        return githubResponse([
+          githubIssue({
+            number: 102,
+            title: 'P3 second page',
+            html_url: 'https://github.com/davekim917/nanoclaw/issues/102',
+            labels: [{ name: 'severity:p3' }],
+          }),
+          githubIssue({
+            number: 103,
+            title: 'default priority',
+            html_url: 'https://github.com/davekim917/nanoclaw/issues/103',
+          }),
+        ]);
+      }
+      if (query.get('state') === 'closed') {
+        return githubResponse([
+          githubIssue({
+            number: 104,
+            title: 'recently closed',
+            state: 'closed',
+            html_url: 'https://github.com/davekim917/nanoclaw/issues/104',
+            closed_at: now,
+          }),
+          githubIssue({
+            number: 105,
+            title: 'old closed issue',
+            state: 'closed',
+            html_url: 'https://github.com/davekim917/nanoclaw/issues/105',
+            closed_at: '2020-01-01T00:00:00.000Z',
+          }),
+          githubIssue({
+            number: 1000,
+            title: 'closed pull request',
+            state: 'closed',
+            html_url: 'https://github.com/davekim917/nanoclaw/pull/1000',
+            closed_at: now,
+            pull_request: { url: 'https://api.github.com/repos/davekim917/nanoclaw/pulls/1000' },
+          }),
+        ]);
+      }
+      throw new Error(`unexpected GitHub URL ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await _fireDigestsForTest();
+
+    expect(dailySummaryMocks.getBacklog).not.toHaveBeenCalled();
+    expect(dailySummaryMocks.getBacklogResolvedSince).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const openPageTwo = fetchMock.mock.calls.find((call) => {
+      const query = new URL(String(call[0])).searchParams;
+      return query.get('state') === 'open' && query.get('page') === '2';
+    });
+    expect(openPageTwo).toBeDefined();
+    const openRequest = fetchMock.mock.calls.find(
+      (call) => new URL(String(call[0])).searchParams.get('state') === 'open',
+    );
+    expect(openRequest?.[1]?.headers).toMatchObject({
+      Authorization: 'Bearer github-token',
+    });
+
+    const adapter = dailySummaryMocks.getDeliveryAdapter.mock.results[0]!.value;
+    const parent = JSON.parse(adapter.deliver.mock.calls[0]![4]).text as string;
+    const thread = adapter.createThread.mock.calls[0]![4] as string;
+    expect(parent).toContain('✅ **Resolved** (1):');
+    expect(parent).toContain('recently closed');
+    expect(parent).not.toContain('old closed issue');
+    expect(parent).not.toContain('stale SQLite');
+    expect(thread).toContain('[#101 P0 in progress](https://github.com/davekim917/nanoclaw/issues/101)');
+    const expectedAge = Math.floor((Date.now() - Date.parse('2026-08-10T00:00:00.000Z')) / 86_400_000);
+    expect(thread).toContain(
+      `[#101 P0 in progress](https://github.com/davekim917/nanoclaw/issues/101) · ${expectedAge}d · in progress`,
+    );
+    expect(thread).toContain('[#102 P3 second page](https://github.com/davekim917/nanoclaw/issues/102)');
+    expect(thread).toContain('[#103 default priority](https://github.com/davekim917/nanoclaw/issues/103)');
+    expect(thread).toContain('· in progress');
+    expect(thread).toContain('🔴');
+    expect(thread).toContain('⚪');
+    expect(thread).toContain('🟡');
+    expect(thread).not.toContain('#999');
+  });
+
+  it('keeps successfully fetched open GitHub issues in the parent thread when closed history fails', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL) => {
+        const query = new URL(String(input)).searchParams;
+        if (query.get('state') === 'open') {
+          return githubResponse([
+            githubIssue({
+              number: 201,
+              title: 'live GitHub backlog item',
+              html_url: 'https://github.com/davekim917/nanoclaw/issues/201',
+            }),
+          ]);
+        }
+        return new Response('closed history unavailable', { status: 503 });
+      }),
+    );
+
+    await _fireDigestsForTest();
+
+    expect(dailySummaryMocks.getBacklog).not.toHaveBeenCalled();
+    expect(dailySummaryMocks.getBacklogResolvedSince).not.toHaveBeenCalled();
+    const adapter = dailySummaryMocks.getDeliveryAdapter.mock.results[0]!.value;
+    const parent = JSON.parse(adapter.deliver.mock.calls[0]![4]).text as string;
+    const thread = adapter.createThread.mock.calls[0]![4] as string;
+    expect(parent).toContain('📌 **Open Backlog** (1)');
+    expect(parent).not.toContain('✅ **Resolved**');
+    expect(thread).toContain('[#201 live GitHub backlog item](https://github.com/davekim917/nanoclaw/issues/201)');
+    expect(dailySummaryMocks.logWarn).toHaveBeenCalledWith(
+      'Daily summary GitHub Issues resolved fetch failed; using empty GitHub resolved list',
+      expect.objectContaining({ repo: 'davekim917/nanoclaw' }),
+    );
+  });
+
+  it('fails closed on a GitHub API error instead of restoring stale SQLite backlog rows', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('GitHub unavailable', { status: 503 })));
+
+    await _fireDigestsForTest();
+
+    expect(dailySummaryMocks.getBacklog).not.toHaveBeenCalled();
+    expect(dailySummaryMocks.getBacklogResolvedSince).not.toHaveBeenCalled();
+    expect(dailySummaryMocks.getDeliveryAdapter.mock.results[0]!.value.deliver).not.toHaveBeenCalled();
+    expect(dailySummaryMocks.logWarn).toHaveBeenCalledWith(
+      'Daily summary GitHub Issues backlog fetch failed; using empty GitHub backlog',
+      expect.objectContaining({ repo: 'davekim917/nanoclaw' }),
+    );
+  });
+
+  it('fails closed when the configured poster has no GitHub credential', async () => {
+    dailySummaryMocks.resolveGitHubToken.mockResolvedValue(undefined);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await _fireDigestsForTest();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(dailySummaryMocks.getBacklog).not.toHaveBeenCalled();
+    expect(dailySummaryMocks.getBacklogResolvedSince).not.toHaveBeenCalled();
+    expect(dailySummaryMocks.getDeliveryAdapter.mock.results[0]!.value.deliver).not.toHaveBeenCalled();
+    expect(dailySummaryMocks.logWarn).toHaveBeenCalledWith(
+      'Daily summary GitHub Issues backlog fetch failed; using empty GitHub backlog',
+      expect.objectContaining({ error: 'No GitHub token resolved for configured daily summary' }),
     );
   });
 });
