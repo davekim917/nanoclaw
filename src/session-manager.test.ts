@@ -170,7 +170,7 @@ describe('Graphify cache paths', () => {
   });
 
   it('test_graphify_runtime_dir_is_install_scoped', () => {
-    expect(graphifyRuntimeDir()).toBe('/tmp/nanoclaw-test-write-outbound/graphify-runtime');
+    expect(graphifyRuntimeDir()).toBe(`${TEST_DATA_DIR}/graphify-runtime`);
     expect(graphifyRuntimeDir()).not.toContain('/tmp/home');
     expect(graphifyRuntimeDir()).not.toContain('/workspace/agent');
   });
