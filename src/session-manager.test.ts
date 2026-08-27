@@ -1739,6 +1739,29 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
   const claimPath = () => path.join(sessionDir(AG, SESS), '.nanoclaw-storage-cleanup');
   const settle = () => new Promise((resolve) => setTimeout(resolve, 80));
 
+  // The reclaim journal is what the writer now reads to decide "was this
+  // session taken?". `appendReclaimJournal` is private to storage-manager, so
+  // these fixtures write the same line it writes — a reclaim that removed a
+  // directory without journalling it first is not a state the reclaim can
+  // produce (`storage-manager.ts:1207` precedes the `rmSync` at `:1230`).
+  const DATA_DIR = TEST_DATA_DIR;
+  const journalPath = () => path.join(DATA_DIR, 'session-rescues', 'reclaim-journal.jsonl');
+  const journalReclaim = (sessionId: string, priorStatus: 'active' | 'closed' | 'orphan' = 'active') => {
+    fs.mkdirSync(path.dirname(journalPath()), { recursive: true });
+    fs.appendFileSync(
+      journalPath(),
+      `${JSON.stringify({
+        ts: new Date().toISOString(),
+        session_id: sessionId,
+        agent_group_id: AG,
+        prior_status: priorStatus,
+        rescue_path: path.join(DATA_DIR, 'session-rescues', `${AG}__${sessionId}-stamp.tar.zst`),
+      })}\n`,
+    );
+  };
+  /** What the reclaim does to the filesystem, after the line is durable. */
+  const reclaimDirectory = () => fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+
   /** Chat rows only — insertMessageWithContext also writes a `recall-` companion. */
   function inboundIds(): string[] {
     if (!fs.existsSync(inboundDbPath(AG, SESS))) return [];
@@ -1756,6 +1779,7 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
 
   beforeEach(() => {
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+    fs.rmSync(journalPath(), { force: true });
     const db = initTestDb();
     runMigrations(db);
     createAgentGroup({
@@ -1785,6 +1809,7 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
 
   afterEach(() => {
     fs.rmSync(claimPath(), { force: true });
+    fs.rmSync(journalPath(), { force: true });
     closeDb();
   });
 
@@ -1814,52 +1839,93 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
     expect(inboundIds()).toEqual(['during-archive']);
   });
 
-  it('refuses the write when the session was archived while it queued', async () => {
+  // CASE: reclaimed while this writer queued. Passes against cb1d9f51 too —
+  // that guard sampled inbound.db present and saw it absent afterwards. Kept
+  // as a GUARD that the journal token did not lose the case the flip caught.
+  it('refuses when the reclaim takes the session while the writer queues', async () => {
     fs.writeFileSync(claimPath(), JSON.stringify({ pid: 1, createdAt: new Date().toISOString() }));
 
     const write = writeSessionMessage(AG, SESS, message('after-archive'));
     await settle();
 
-    // The reclaim finishes: row closed, directory gone. Releasing the claim
-    // lets the queued writer through.
+    // The reclaim finishes: line journalled, row closed, directory gone.
+    // Releasing the claim lets the queued writer through.
+    journalReclaim(SESS, 'active');
     getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
-    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+    reclaimDirectory();
     fs.mkdirSync(sessionDir(AG, SESS), { recursive: true });
-    fs.rmSync(claimPath(), { force: true });
-
-    // Pre-fix this resolves, re-provisioning the folder and landing the message
-    // in a directory whose central row is closed and which nothing polls.
-    await expect(write).rejects.toThrow(/changed state during archival/);
-    expect(inboundIds()).toEqual([]);
-  });
-
-  // Status equality is not a generation check. The real interleave: the writer
-  // samples while the session is ALREADY closed and its inbound.db present,
-  // THEN the reclaim archives and removes it while the writer waits on the
-  // claim. Nothing about the status changes, so only the inbound.db flip can
-  // catch it — and only if it is checked after the wait, not sampled before.
-  it('refuses when the reclaim takes the session after the writer sampled it', async () => {
-    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
-    expect(fs.existsSync(inboundDbPath(AG, SESS)), 'sampled with inbound.db present').toBe(true);
-
-    // Reclaim mid-archive: the writer will queue behind this claim.
-    fs.writeFileSync(claimPath(), JSON.stringify({ pid: 1, createdAt: new Date().toISOString() }));
-    const write = writeSessionMessage(AG, SESS, message('sampled-then-reclaimed'));
-    await settle();
-
-    // The reclaim finishes WHILE the writer waits — after its sample.
-    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
     fs.rmSync(claimPath(), { force: true });
 
     await expect(write).rejects.toThrow(/has been reclaimed/);
     expect(inboundIds()).toEqual([]);
   });
 
-  // The other half, and the regression this replaced actually shipped: a
-  // rotation-superseded session is deliberately `closed` and may have no
-  // directory at all, which the status+directory predicate misread as
-  // "reclaimed" and refused. workgroup-memory.integration.test.ts writes to
-  // exactly such a session and broke.
+  // CASE: session already closed AND deleted before this writer arrived.
+  // FAILS against cb1d9f51: nothing changes across the wait, so
+  // statusBefore === statusAfter === 'closed' and inbound.db is absent at both
+  // ends. That guard passes, recreates inbound.db and inserts into a session
+  // whose row stays closed. Production entry point is the raw-session-id path
+  // at src/modules/approvals/response-handler.ts:115.
+  it('refuses a write to a session the reclaim finished with before it arrived', async () => {
+    journalReclaim(SESS, 'active');
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+    reclaimDirectory();
+    expect(fs.existsSync(inboundDbPath(AG, SESS)), 'nothing to observe changing').toBe(false);
+
+    await expect(writeSessionMessage(AG, SESS, message('late-approval'))).rejects.toThrow(/has been reclaimed/);
+    expect(inboundIds()).toEqual([]);
+  });
+
+  // CASE: an ORPHAN reclaim — no central row at all, journalled, directory
+  // gone. FAILS against cb1d9f51 (`inboundExisted` is false at both ends, so
+  // the guard passes and re-provisions). It is also the case no status-based
+  // predicate can reach: there is no row to read a status from.
+  it('refuses a write to an orphan session the reclaim already took', async () => {
+    journalReclaim(SESS, 'orphan');
+    getDb().prepare('DELETE FROM sessions WHERE id = ?').run(SESS);
+    reclaimDirectory();
+
+    await expect(writeSessionMessage(AG, SESS, message('orphan-late'))).rejects.toThrow(/has been reclaimed/);
+    expect(inboundIds()).toEqual([]);
+  });
+
+  // The journal line records the reclaim's INTENT, written at
+  // storage-manager.ts:1207 BEFORE the archiving->closed CAS at :1215. When
+  // that CAS loses, :1221 logs and deliberately keeps the directory; a crash
+  // before the rmSync at :1230 leaves the same shape. The line alone would
+  // brick a session that is still live and still polled, permanently. GUARD:
+  // passes against cb1d9f51 too — it is here to pin that the journal token did
+  // not trade a racy refusal for a permanent one.
+  it('still writes when the reclaim journalled but kept the directory', async () => {
+    journalReclaim(SESS, 'active');
+    expect(fs.existsSync(inboundDbPath(AG, SESS)), 'the archival kept the directory').toBe(true);
+
+    await expect(writeSessionMessage(AG, SESS, message('cas-lost-dir-kept'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['cas-lost-dir-kept']);
+  });
+
+  // CASE: brand-new session — row created, folder never provisioned, first
+  // write. GUARD: passes against cb1d9f51, which is too weak here rather than
+  // too strict. It is the case the status+directory predicate got wrong in the
+  // other direction, and the one the journal token must never re-break.
+  //
+  // Deliberately NOT the no-row-at-all variant: `writeSessionMessage` cannot
+  // serve one. `buildRecallRow` -> `buildPreTurnContext` throws "Unable to
+  // resolve trusted session scope" (pre-turn-context.ts:1890) long after this
+  // guard, so a session with no central row is not a shape this writer has.
+  it('provisions a brand-new session on its first write', async () => {
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+    expect(fs.existsSync(sessionDir(AG, SESS)), 'never provisioned').toBe(false);
+
+    await expect(writeSessionMessage(AG, SESS, message('brand-new'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['brand-new']);
+  });
+
+  // GUARD, and the regression that actually shipped once: a rotation-
+  // superseded session is deliberately `closed` and may have no directory at
+  // all, which the status+directory predicate misread as "reclaimed" and
+  // refused. workgroup-memory.integration.test.ts writes to exactly such a
+  // session and broke. `closed` is therefore NOT a reclaim signal.
   it('provisions a closed session that never had a directory', async () => {
     getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
@@ -1868,11 +1934,25 @@ describe('writeSessionMessage does not race an in-flight session archival', () =
     expect(inboundIds()).toEqual(['superseded-lineage']);
   });
 
+  // CASE: documented operator `rm -rf` of a live session's folder. GUARD:
+  // passes against cb1d9f51. Same on-disk shape as a reclaim and the opposite
+  // required outcome, separated only by the absence of a journal line.
   it('still re-provisions a session whose directory an operator removed', async () => {
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+    expect(fs.existsSync(journalPath()), 'no reclaim ever touched this session').toBe(false);
 
     await expect(writeSessionMessage(AG, SESS, message('after-rm-rf'))).resolves.toBeUndefined();
     expect(inboundIds()).toEqual(['after-rm-rf']);
+  });
+
+  // A reclaim of a DIFFERENT session must not make this one unwritable — the
+  // journal is one shared append-only file for the whole data root.
+  it('is not fooled by a journal line for another session', async () => {
+    journalReclaim('sess-someone-else', 'active');
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+
+    await expect(writeSessionMessage(AG, SESS, message('not-mine'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['not-mine']);
   });
 
   it('still writes normally when no reclaim is in progress', async () => {

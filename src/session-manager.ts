@@ -789,16 +789,9 @@ async function writeSessionMessageInternal(
   // activity marker is present, and acquire double-checks the claim after
   // planting its marker. Either the reclaim sees our marker and skips, or we
   // see its claim and wait for it to finish.
-  // Sampled BEFORE the lease. The lease mkdirs the session root, which is why
-  // the root's existence is useless as a signal — but nothing in the lease
-  // creates inbound.db, so that file's existence survives as one.
-  const inboundExisted = fs.existsSync(inboundDbPath(agentGroupId, sessionId));
   const lease = await acquireStorageActivityLease(sessionDir(agentGroupId, sessionId), `inbound-${sessionId}`);
   try {
-    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId, {
-      status: statusBefore,
-      inboundExisted,
-    });
+    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId);
   } finally {
     await lease.release();
   }
@@ -809,29 +802,59 @@ async function writeSessionMessageLocked(
   sessionId: string,
   message: SessionMessageInput,
   ignoreDuplicateId: boolean,
-  before: { status: string | undefined; inboundExisted: boolean },
 ): Promise<boolean> {
   // Waiting for the claim above can mean waiting out a reclaim that archived
-  // and deleted this session while we queued. Requiring the row to be exactly
-  // where we left it catches active -> archiving -> closed without taking any
-  // new position on which statuses are writable: whatever was writable before
-  // still is, as long as nothing moved it under us.
-  if (getSession(sessionId)?.status !== before.status) {
-    throw new Error(`session ${sessionId} changed state during archival; route this message to a fresh session`);
-  }
-  // Status equality is not a generation check — a writer that arrives when the
-  // session is ALREADY `closed`, or already absent from the central table,
-  // compares equal to itself no matter what happened while it queued. The
-  // generation token is inbound.db: it existed when we looked and it is gone
-  // now, so the reclaim took it between the two, and re-provisioning here
-  // would resurrect a session nothing polls. Checked AFTER the wait, which is
-  // what a status sampled before it could never do.
+  // and deleted this session while we queued. Re-provisioning it here would
+  // resurrect a session nothing polls, so this has to be decided AFTER the
+  // wait — and it has to be decided from something a reclaim cannot fake.
   //
-  // Never existed and still does not: a brand-new session, or the documented
-  // operator `rm -rf`. Both re-provision below, as they must.
-  // ponytail: existence flip, not inode comparison — nothing recreates
-  // inbound.db inside our own lease. Compare `.ino` if that ever changes.
-  if (before.inboundExisted && !fs.existsSync(inboundDbPath(agentGroupId, sessionId))) {
+  // Three earlier attempts compared a property sampled before the wait against
+  // the same property after it, and each was wrong in a different direction.
+  // `status` equality passes when a session was already `closed` on arrival.
+  // Adding directory existence refuses brand-new sessions. An `inbound.db`
+  // existence flip misses `true -> false -> true`, and is blind when the file
+  // was already absent at sample time. Neither field is an identity: a row is
+  // `closed` for reasons other than reclaim — rotation closes the predecessor
+  // of a lineage, and those rows may never have had a directory at all — and a
+  // path can be deleted and recreated.
+  //
+  // The reclaim journal is the identity. It is appended, fsynced, before the
+  // directory is removed, on every path that removes one, and no path removes
+  // a line. A session id is never reused, so the answer only ever goes
+  // false -> true, once. See `sessionWasReclaimed`.
+  //
+  // The line records the reclaim's INTENT, not its completion: it is written
+  // at storage-manager.ts:1207, before the archiving->closed CAS at :1215,
+  // and that CAS can fail — in which case :1221 logs and deliberately keeps
+  // the directory ("removing it is not our call"). A crash before the rmSync
+  // at :1230 leaves the same shape. So the line alone would brick a session
+  // that is still live. inbound.db answers the second half — the reclaim
+  // removes the whole directory, and nothing in the lease recreates that file
+  // (the lease mkdirs only the session ROOT, which is why the root's
+  // existence is useless here).
+  //
+  // Both terms are read now, once, from current state. Neither is a sample
+  // compared against its own earlier value, which is what made status
+  // equality, status+directory and the inbound.db flip fail in three
+  // different directions. And the flip's ABA — a second writer re-provisioning
+  // inside the window — is closed rather than papered over: the recreate it
+  // needed was the old guard letting that second writer through to
+  // `initSessionFolder` below. The only other in-process creator,
+  // `initStubSessionFolder` (db/scheduled-tasks.ts:98), runs on a freshly
+  // generated id. Remove the leak and the interleave has no producer.
+  //
+  // One composition is deliberate: a CAS-lost session that an operator THEN
+  // `rm -rf`s satisfies both terms and is refused, even though a reset is
+  // meant to re-provision. That is the honest answer — the rescue archive was
+  // published before the CAS lost, so the content is kept, and refusing is
+  // both the safe direction and a loud one.
+  //
+  // Not reclaimed and no directory means a brand-new session, a rotation
+  // predecessor (deliberately `closed`, may never have had a directory), or
+  // the documented operator `rm -rf`. All three re-provision below, as they
+  // must.
+  const { sessionWasReclaimed } = await import('./storage-manager.js');
+  if (sessionWasReclaimed(sessionId) && !fs.existsSync(inboundDbPath(agentGroupId, sessionId))) {
     throw new Error(`session ${sessionId} has been reclaimed; route this message to a fresh session`);
   }
 

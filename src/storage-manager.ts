@@ -1019,6 +1019,58 @@ export function readReclaimJournal(rescuesDir: string): Map<string, SessionRecla
   return entries;
 }
 
+let reclaimJournalIdCache: { path: string; key: string; ids: Set<string> } | undefined;
+
+/**
+ * True once the reclaim has decided to take this session, and true forever
+ * after.
+ *
+ * This is the generation token for a session id. Every path that removes a
+ * session directory appends the journal line first — `:1207` before the
+ * `rmSync` at `:1230`, for all three `prior_status` values, and
+ * `finishInterruptedSessionArchivals` only removes a directory when a line for
+ * it already exists. Nothing ever deletes a line: rescue retention prunes only
+ * `*.tar.zst`, and says so. Session ids are never reused.
+ *
+ * So this is the one fact about a session id that is monotone (`false -> true`,
+ * once) and that outlives both the central row and the directory — which is
+ * exactly what `status` and file existence are not, since a row is `closed`
+ * for reasons other than reclaim (rotation supersedes a predecessor) and a
+ * path can be deleted and recreated.
+ *
+ * INTENT, NOT COMPLETION. The line precedes the `archiving -> closed` CAS at
+ * `:1215`, and `:1221` keeps the directory when that CAS loses. A caller that
+ * must not refuse a session the reclaim ended up keeping has to pair this with
+ * evidence the removal happened — see `writeSessionMessageLocked`.
+ *
+ * ponytail: size-keyed cache rather than a parse per call — the journal grows
+ * one line per session ever reclaimed and this sits on the ingestion path.
+ * `appendReclaimJournal` is the only writer and only ever appends, so the size
+ * is strictly increasing and an exact key on its own. Truncating or rotating
+ * the journal breaks that invariant — a size that repeats an earlier value
+ * would serve a stale answer. `mtimeMs` rides along because it is the same
+ * stat and costs nothing, and it covers a rewrite that lands on a repeated
+ * size; it is a second belt, not the argument. If the journal ever does get
+ * rotated, key this on content, not on the stat. A stat rather than an
+ * in-process invalidation hook because the reclaim runs in a worker thread
+ * whose appends no hook would see.
+ */
+export function sessionWasReclaimed(sessionId: string, sessionsRoot: string = sessionsBaseDir()): boolean {
+  const rescuesDir = path.join(path.dirname(sessionsRoot), SESSION_RESCUES_DIRNAME);
+  const journalPath = reclaimJournalPath(rescuesDir);
+  let key = 'absent';
+  try {
+    const st = fs.statSync(journalPath);
+    key = `${st.size}:${st.mtimeMs}`;
+  } catch {
+    // No journal: nothing has ever been reclaimed under this data root.
+  }
+  if (reclaimJournalIdCache?.path !== journalPath || reclaimJournalIdCache.key !== key) {
+    reclaimJournalIdCache = { path: journalPath, key, ids: new Set(readReclaimJournal(rescuesDir).keys()) };
+  }
+  return reclaimJournalIdCache.ids.has(sessionId);
+}
+
 /**
  * A published rescue archive is one we can still LIST, not merely one that
  * exists with bytes in it. Recovery uses this to decide whether a session dir
