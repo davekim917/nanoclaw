@@ -38,7 +38,7 @@
     "@clack/prompts": "^1.7.0",
     "@onecli-sh/sdk": "2.2.1",
     "@slack/web-api": "8.1.0",
-    "better-sqlite3": "11.10.0",
+    "better-sqlite3": "13.0.3",
     "chat": "4.29.0",
     "chokidar": "5.0.0",
     "cron-parser": "5.6.2",
