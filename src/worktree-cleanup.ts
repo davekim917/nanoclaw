@@ -13,8 +13,9 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR } from './config.js';
+import { DATA_DIR, GROUPS_DIR } from './config.js';
 import { isContainerRunning, isContainerSpawning } from './container-runner.js';
+import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { getDb } from './db/connection.js';
 import { getContainerState, getProcessingClaims } from './db/session-db.js';
 import { log } from './log.js';
@@ -31,6 +32,7 @@ import {
 } from './repository-workspaces.js';
 import { openOutboundDb } from './session-manager.js';
 import { safeGitArgs, safeGitEnv } from './safe-git.js';
+import { dirSizeBytes } from './storage-manager.js';
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 60_000;
@@ -58,6 +60,7 @@ interface SessionRow {
   thread_id: string | null;
   messaging_group_id: string | null;
   platform_id: string | null;
+  folder: string;
   workgroup_id: string;
 }
 
@@ -87,15 +90,12 @@ function safeDirectories(directory: string): string[] {
   }
 }
 
-function participantsByTopic(
-  dataDir: string,
-): Map<string, { unit: RepositoryWorkUnit; participants: TopicParticipant[] }> {
-  let rows: SessionRow[];
+function sessionInventory(): SessionRow[] | null {
   try {
-    rows = getDb()
+    return getDb()
       .prepare(
         `SELECT s.id AS session_id, s.agent_group_id, s.status, s.thread_id,
-                s.messaging_group_id, mg.platform_id,
+                s.messaging_group_id, mg.platform_id, ag.folder,
                 COALESCE(ag.workgroup_id, ag.folder) AS workgroup_id
            FROM sessions s
            JOIN agent_groups ag ON ag.id = s.agent_group_id
@@ -104,8 +104,16 @@ function participantsByTopic(
       .all() as SessionRow[];
   } catch (error) {
     log.error('Worktree cleanup: session inventory failed; preserving every topic', { error });
-    return new Map();
+    return null;
   }
+}
+
+function participantsByTopic(
+  dataDir: string,
+): Map<string, { unit: RepositoryWorkUnit; participants: TopicParticipant[] }> {
+  const rows = sessionInventory();
+  // A failed inventory is not evidence that nothing is live: preserve everything.
+  if (rows === null) return new Map();
 
   const result = new Map<string, { unit: RepositoryWorkUnit; participants: TopicParticipant[] }>();
   for (const row of rows) {
@@ -314,6 +322,470 @@ async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DI
 
 export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promise<void> {
   for (const target of discover(dataDir)) await cleanupOne(target, dataDir);
+}
+
+// ---------------------------------------------------------------------------
+// Storage GC: orphaned topic directories and source clones.
+//
+// The linked-checkout path above only ever considers topics that a CURRENT
+// session row resolves to, so a topic whose rows are gone is never a candidate,
+// and source clones were never candidates at all. Both leak.
+//
+// Removal demands BOTH-SIDES-POSITIVE evidence: the owning topic is absent from
+// a SUCCESSFUL database inventory, AND git proves the tree clean with nothing
+// unpushed. Anything unprovable — a pruned worktree admin directory, a
+// container-absolute gitdir, a failed query — is skipped and logged. Absence of
+// a signal is never authority to delete.
+//
+// Dry-run is the default. Acting requires NANOCLAW_STORAGE_GC=apply.
+// ---------------------------------------------------------------------------
+
+const GC_APPLY_ENV = 'NANOCLAW_STORAGE_GC';
+const TRASH_BIN = '/usr/bin/trash';
+/** Scan depth below groups/<folder> for agent-created scratch clones. */
+const CLONE_SCAN_DEPTH = 4;
+/** Workgroup-root entries that are the repo store itself, never a clone. */
+const RESERVED_WORKGROUP_DIRS = new Set(['.repos', '.worktrees', '.rescues']);
+
+export type GcCategory = 'orphan-topic' | 'clone';
+
+export interface GcCandidate {
+  category: GcCategory;
+  path: string;
+  collect: boolean;
+  reason: string;
+  bytes: number;
+}
+
+export interface GcReport {
+  /** false means the inventory failed and NOTHING was evaluated. */
+  ran: boolean;
+  mode: 'dry-run' | 'apply';
+  examined: number;
+  collected: number;
+  reclaimableBytes: Record<GcCategory, number>;
+  skips: Record<string, number>;
+  candidates: GcCandidate[];
+}
+
+function emptyReport(mode: 'dry-run' | 'apply', ran: boolean): GcReport {
+  return {
+    ran,
+    mode,
+    examined: 0,
+    collected: 0,
+    reclaimableBytes: { 'orphan-topic': 0, clone: 0 },
+    skips: {},
+    candidates: [],
+  };
+}
+
+function gcMode(): 'dry-run' | 'apply' {
+  return process.env[GC_APPLY_ENV] === 'apply' ? 'apply' : 'dry-run';
+}
+
+/**
+ * Positive proof that a checkout holds nothing worth keeping.
+ *
+ * `scope` is 'head' for a linked worktree (its branch is the only one it owns)
+ * and 'all' for a clone, which owns every local branch in it. A git invocation
+ * that fails — the usual cause is a pruned worktree admin directory or a gitdir
+ * only resolvable inside a container — returns unprovable, never clean.
+ */
+function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; reason: string } {
+  const status = git(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  if (status === null) return { ok: false, reason: 'status-unprovable' };
+  if (status !== '') return { ok: false, reason: 'dirty' };
+
+  const unpushedArgs =
+    scope === 'all'
+      ? ['log', '--branches', '--not', '--remotes', '--oneline']
+      : ['log', 'HEAD', '--not', '--remotes', '--oneline'];
+  const unpushed = git(dir, unpushedArgs);
+  if (unpushed === null) return { ok: false, reason: 'log-unprovable' };
+  if (unpushed !== '') return { ok: false, reason: 'unpushed' };
+
+  const stash = git(dir, ['stash', 'list']);
+  if (stash === null) return { ok: false, reason: 'stash-unprovable' };
+  if (stash !== '') return { ok: false, reason: 'stashed' };
+
+  return { ok: true, reason: 'clean-and-pushed' };
+}
+
+/** Directories with a real .git DIRECTORY. Symlinks are never candidates: a
+ *  bedroom link such as agent/<name> -> workgroup/<name> is not a clone, and a
+ *  container-absolute link dangles on the host. */
+function isPrivateClone(dir: string): boolean {
+  try {
+    if (fs.lstatSync(dir).isSymbolicLink()) return false;
+    return fs.lstatSync(path.join(dir, '.git')).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function findClonesUnder(root: string, depth: number, found: string[] = []): string[] {
+  if (depth < 0) return found;
+  for (const name of safeDirectories(root)) {
+    if (name.startsWith('.') || name === 'node_modules') continue;
+    const dir = path.join(root, name);
+    if (isPrivateClone(dir)) {
+      found.push(dir);
+      continue; // Never descend into a repository looking for more repositories.
+    }
+    findClonesUnder(dir, depth - 1, found);
+  }
+  return found;
+}
+
+/**
+ * Every host path a linked worktree is currently bound to, as an index of
+ * gitdir prefixes. Removing a clone that still backs one of these orphans the
+ * worktree, so a clone appearing here is not collectable. `unreadable` records
+ * that at least one pointer could not be read at all, which makes every clone
+ * unprovable rather than silently collectable.
+ */
+function boundGitDirs(dataDir: string): { pointers: string[]; unreadable: boolean } {
+  const bases = ['v2-topics', 'v2-threads', 'v2-sessions', 'workgroups'].map((name) => path.join(dataDir, name));
+  const pointers: string[] = [];
+  let unreadable = false;
+  const walk = (dir: string, depth: number): void => {
+    if (depth < 0) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const dotGit = entries.find((entry) => entry.name === '.git' && !entry.isSymbolicLink());
+    if (dotGit?.isFile()) {
+      try {
+        const line = fs.readFileSync(path.join(dir, '.git'), 'utf8').trim();
+        if (line.startsWith('gitdir:')) pointers.push(line.slice('gitdir:'.length).trim());
+      } catch {
+        unreadable = true;
+      }
+    }
+    // A checkout's own contents hold no further bindings worth indexing, and
+    // descending into one means walking its whole working tree on every pass.
+    if (dotGit) return;
+    for (const entry of entries) {
+      if (entry.isSymbolicLink() || !entry.isDirectory()) continue;
+      if (entry.name === 'node_modules') continue;
+      walk(path.join(dir, entry.name), depth - 1);
+    }
+  };
+  for (const base of bases) walk(base, 5);
+  return { pointers, unreadable };
+}
+
+function cloneHasBoundWorktrees(cloneDir: string, index: { pointers: string[]; unreadable: boolean }): boolean {
+  if (index.unreadable) return true;
+  let canonical: string;
+  try {
+    canonical = fs.realpathSync(path.join(cloneDir, '.git'));
+  } catch {
+    return true; // Cannot prove nothing is bound.
+  }
+  return index.pointers.some((pointer) => {
+    if (!path.isAbsolute(pointer)) return true;
+    let resolved = pointer;
+    try {
+      resolved = fs.realpathSync(pointer);
+    } catch {
+      // A pointer that does not resolve on the host cannot be matched by
+      // realpath; fall back to a textual prefix test on the raw value.
+    }
+    return resolved === canonical || resolved.startsWith(`${canonical}${path.sep}`);
+  });
+}
+
+interface LiveScopes {
+  folders: Set<string>;
+  workgroups: Set<string>;
+}
+
+function liveScopes(rows: SessionRow[]): LiveScopes {
+  const folders = new Set<string>();
+  const workgroups = new Set<string>();
+  for (const row of rows) {
+    if (!isContainerRunning(row.session_id) && !isContainerSpawning(row.session_id)) continue;
+    folders.add(row.folder);
+    workgroups.add(row.workgroup_id);
+  }
+  return { folders, workgroups };
+}
+
+function record(report: GcReport, candidate: GcCandidate): void {
+  report.examined += 1;
+  report.candidates.push(candidate);
+  if (candidate.collect) {
+    report.collected += 1;
+    report.reclaimableBytes[candidate.category] += candidate.bytes;
+  } else {
+    report.skips[candidate.reason] = (report.skips[candidate.reason] ?? 0) + 1;
+  }
+}
+
+function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<string, TopicParticipant[]>): void {
+  const topicsRoot = path.join(dataDir, 'v2-topics');
+  for (const workgroupId of safeDirectories(topicsRoot)) {
+    const workgroupDir = path.join(topicsRoot, workgroupId);
+    for (const topic of safeDirectories(workgroupDir)) {
+      const topicDir = path.join(workgroupDir, topic);
+      const skip = (reason: string): void =>
+        record(report, { category: 'orphan-topic', path: topicDir, collect: false, reason, bytes: 0 });
+
+      const participants = owners.get(topicDir);
+      // Side (a): every owning session row is CLOSED, or there is no row at
+      // all. Status alone is not enough — a closed session can still hold a
+      // processing claim or a continuation, and `topicIsBusy` fails closed on
+      // anything it cannot read.
+      if (participants?.some((participant) => participant.status !== 'closed')) {
+        skip('topic-open');
+        continue;
+      }
+      if (participants && topicIsBusy(participants)) {
+        skip('topic-busy');
+        continue;
+      }
+      if (idleDays(topicDir) < MINIMUM_IDLE_DAYS) {
+        skip('recent');
+        continue;
+      }
+
+      const worktreeRoot = path.join(topicDir, 'worktrees');
+      let refused: string | null = null;
+      for (const repo of safeDirectories(worktreeRoot)) {
+        const decision = provenDisposable(path.join(worktreeRoot, repo), 'head');
+        if (!decision.ok) {
+          refused = decision.reason;
+          break;
+        }
+      }
+      if (refused) {
+        skip(refused);
+        continue;
+      }
+      record(report, {
+        category: 'orphan-topic',
+        path: topicDir,
+        collect: true,
+        reason: participants ? 'closed-and-clean' : 'orphaned-and-clean',
+        bytes: dirSizeBytes(topicDir),
+      });
+    }
+  }
+}
+
+function collectClones(
+  report: GcReport,
+  dataDir: string,
+  groupsDir: string,
+  live: LiveScopes,
+  bound: { pointers: string[]; unreadable: boolean },
+): void {
+  const candidates: Array<{ dir: string; folder: string | null; workgroupId: string | null }> = [];
+
+  for (const folder of safeDirectories(groupsDir)) {
+    const folderDir = path.join(groupsDir, folder);
+    for (const dir of findClonesUnder(folderDir, CLONE_SCAN_DEPTH)) {
+      candidates.push({ dir, folder, workgroupId: null });
+    }
+  }
+
+  const workgroupsRoot = path.join(dataDir, 'workgroups');
+  for (const workgroupId of safeDirectories(workgroupsRoot)) {
+    const workgroupDir = path.join(workgroupsRoot, workgroupId);
+    for (const name of safeDirectories(workgroupDir)) {
+      if (RESERVED_WORKGROUP_DIRS.has(name) || name.startsWith('.')) continue;
+      const dir = path.join(workgroupDir, name);
+      if (isPrivateClone(dir)) candidates.push({ dir, folder: null, workgroupId });
+    }
+  }
+
+  for (const candidate of candidates) {
+    const skip = (reason: string): void =>
+      record(report, { category: 'clone', path: candidate.dir, collect: false, reason, bytes: 0 });
+
+    if (candidate.folder && live.folders.has(candidate.folder)) {
+      skip('agent-group-live');
+      continue;
+    }
+    if (candidate.workgroupId && live.workgroups.has(candidate.workgroupId)) {
+      skip('workgroup-live');
+      continue;
+    }
+    if (idleDays(candidate.dir) < MINIMUM_IDLE_DAYS) {
+      skip('recent');
+      continue;
+    }
+    if (cloneHasBoundWorktrees(candidate.dir, bound)) {
+      skip('bound-worktrees');
+      continue;
+    }
+    const decision = provenDisposable(candidate.dir, 'all');
+    if (!decision.ok) {
+      skip(decision.reason);
+      continue;
+    }
+    record(report, {
+      category: 'clone',
+      path: candidate.dir,
+      collect: true,
+      reason: 'clean-and-pushed',
+      bytes: dirSizeBytes(candidate.dir),
+    });
+  }
+}
+
+/** Recoverable removal. `trash` is capped at 30 days by tmpfiles.d; `rm` is
+ *  blocked by the deployed destructive guard and is never used here. */
+function trashPath(target: string): void {
+  execFileSync(TRASH_BIN, [target], { stdio: 'pipe', timeout: 120_000 });
+}
+
+/**
+ * Every host path bind-mounted into a currently running container.
+ *
+ * `isContainerRunning` reads this process's own bookkeeping, which is empty in
+ * any out-of-process caller and says nothing about a container started by
+ * someone else. Before removing anything, apply mode asks the runtime directly.
+ * `null` means the runtime could not be listed, and a container we cannot see
+ * is a container we must assume owns the path.
+ */
+function runningContainerMounts(): string[] | null {
+  try {
+    const ids = execFileSync(CONTAINER_RUNTIME_BIN, ['ps', '-q'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30_000,
+    })
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (ids.length === 0) return [];
+    const inspected = execFileSync(
+      CONTAINER_RUNTIME_BIN,
+      ['inspect', '--format', '{{range .Mounts}}{{.Source}}\n{{end}}', ...ids],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 },
+    );
+    return inspected
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
+function overlapsAny(target: string, mounts: string[]): boolean {
+  let resolved = target;
+  try {
+    resolved = fs.realpathSync(target);
+  } catch {
+    return true; // A path we cannot resolve is a path we cannot clear.
+  }
+  return mounts.some((mount) => {
+    let source = mount;
+    try {
+      source = fs.realpathSync(mount);
+    } catch {
+      // Keep the raw value: a mount source that is gone from the host still
+      // names the tree the container was given.
+    }
+    return (
+      source === resolved || source.startsWith(`${resolved}${path.sep}`) || resolved.startsWith(`${source}${path.sep}`)
+    );
+  });
+}
+
+/**
+ * Re-prove side (a) against live state immediately before removal.
+ *
+ * The scan snapshotted the inventory; a session can be created, or a container
+ * started, while the pass is still walking. Anything unreadable at this point
+ * refuses, exactly as it does during the scan.
+ */
+function stillDisposable(candidate: GcCandidate, dataDir: string, mounts: string[]): { ok: boolean; reason: string } {
+  if (overlapsAny(candidate.path, mounts)) return { ok: false, reason: 'container-mounted' };
+  const rows = sessionInventory();
+  if (rows === null) return { ok: false, reason: 'recheck-failed' };
+  if (candidate.category === 'clone') {
+    const live = liveScopes(rows);
+    const relative = path.relative(GROUPS_DIR, candidate.path);
+    const folder = relative.startsWith('..') ? null : relative.split(path.sep)[0];
+    if (folder && live.folders.has(folder)) return { ok: false, reason: 'recheck-agent-group-live' };
+    const workgroupRelative = path.relative(path.join(dataDir, 'workgroups'), candidate.path);
+    const workgroupId = workgroupRelative.startsWith('..') ? null : workgroupRelative.split(path.sep)[0];
+    if (workgroupId && live.workgroups.has(workgroupId)) return { ok: false, reason: 'recheck-workgroup-live' };
+    return { ok: true, reason: 'recheck-clear' };
+  }
+  const owner = participantsByTopic(dataDir).get(candidate.path);
+  if (owner?.participants.some((participant) => participant.status !== 'closed')) {
+    return { ok: false, reason: 'recheck-topic-open' };
+  }
+  if (owner && topicIsBusy(owner.participants)) return { ok: false, reason: 'recheck-topic-busy' };
+  return { ok: true, reason: 'recheck-clear' };
+}
+
+export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string = GROUPS_DIR): GcReport {
+  const mode = gcMode();
+  const rows = sessionInventory();
+  if (rows === null) {
+    const report = emptyReport(mode, false);
+    log.error('Storage GC: did not run — session inventory unavailable, nothing evaluated', {
+      mode,
+    });
+    return report;
+  }
+
+  const report = emptyReport(mode, true);
+  const owners = new Map([...participantsByTopic(dataDir)].map(([key, value]) => [key, value.participants] as const));
+  collectOrphanTopics(report, dataDir, owners);
+  collectClones(report, dataDir, groupsDir, liveScopes(rows), boundGitDirs(dataDir));
+
+  if (mode === 'apply') {
+    const demote = (candidate: GcCandidate, reason: string): void => {
+      candidate.collect = false;
+      candidate.reason = reason;
+      report.collected -= 1;
+      report.reclaimableBytes[candidate.category] -= candidate.bytes;
+      report.skips[reason] = (report.skips[reason] ?? 0) + 1;
+    };
+    const mounts = runningContainerMounts();
+    if (mounts === null) {
+      log.error('Storage GC: container runtime unreadable — removing nothing this pass', { mode });
+      for (const candidate of report.candidates.filter((c) => c.collect)) {
+        demote(candidate, 'runtime-unreadable');
+      }
+    } else {
+      for (const candidate of report.candidates) {
+        if (!candidate.collect) continue;
+        const recheck = stillDisposable(candidate, dataDir, mounts);
+        if (!recheck.ok) {
+          demote(candidate, recheck.reason);
+          continue;
+        }
+        try {
+          trashPath(candidate.path);
+          log.info('Storage GC: collected', { path: candidate.path, category: candidate.category });
+        } catch (error) {
+          demote(candidate, 'trash-failed');
+          log.error('Storage GC: removal failed', { path: candidate.path, error });
+        }
+      }
+    }
+  }
+
+  log.info('Storage GC: ran', {
+    mode,
+    examined: report.examined,
+    collected: report.collected,
+    reclaimableBytes: report.reclaimableBytes,
+    skips: report.skips,
+  });
+  return report;
 }
 
 export function _discoverWorktreesForTesting(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
