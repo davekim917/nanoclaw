@@ -48,10 +48,17 @@ vi.mock('./log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { _cleanupOneForTesting, _discoverWorktreesForTesting } from './worktree-cleanup.js';
+import { log } from './log.js';
+import {
+  _cleanupOneForTesting,
+  _discoverWorktreesForTesting,
+  _discoveryStatsForTesting,
+  runWorktreeCleanupOnce,
+} from './worktree-cleanup.js';
 import {
   canonicalRepoDir,
   defaultTopicBranch,
+  repositoryLockPath,
   resolveRepositoryWorkUnit,
   topicWorktreesDir,
   writeTransferTombstone,
@@ -297,5 +304,105 @@ describe('per-topic linked worktree cleanup', () => {
     fs.mkdirSync(path.join(unknown, 'worktrees', 'important'), { recursive: true });
     expect(_discoverWorktreesForTesting(state.dataDir)).toEqual([]);
     expect(fs.existsSync(path.join(unknown, 'worktrees', 'important'))).toBe(true);
+  });
+
+  // The worktrees root is shared with host infrastructure whose names are not
+  // valid repository segments. Before the name filter, canonicalRepoDir() threw
+  // on the first one and killed discovery for the whole fleet.
+  it.each(['.pnpm-store', '.nanoclaw-storage-active'])(
+    'discovers real checkouts alongside the %s infrastructure directory',
+    (infraName) => {
+      const fixture = repositoryFixture();
+      const infra = path.join(topicWorktreesDir(fixture.workUnit, state.dataDir), infraName);
+      fs.mkdirSync(infra, { recursive: true });
+
+      const targets = _discoverWorktreesForTesting(state.dataDir);
+
+      expect(targets.map((target) => target.repo)).toEqual([fixture.repo]);
+      expect(fs.existsSync(infra)).toBe(true);
+    },
+  );
+
+  it('keeps collecting after a target fails, and reports the skip', async () => {
+    const failing = repositoryFixture('thread-1', 'repo-a');
+    const healthy = repositoryFixture('thread-1', 'repo-b');
+
+    // A symlinked coordination lock makes withHostRepositoryLock throw for
+    // repo-a only — a per-target fault, exactly what used to abort the pass.
+    const lock = repositoryLockPath('wg-a', failing.repo, state.dataDir);
+    fs.mkdirSync(path.dirname(lock), { recursive: true });
+    fs.symlinkSync('/dev/null', lock);
+
+    await runWorktreeCleanupOnce(state.dataDir);
+
+    expect(fs.existsSync(failing.worktree)).toBe(true);
+    expect(fs.existsSync(healthy.worktree)).toBe(false);
+    expect(log.warn).toHaveBeenCalledWith(
+      'Worktree cleanup: target failed; continuing pass',
+      expect.objectContaining({ repo: failing.repo, err: expect.any(Error) }),
+    );
+    expect(log.info).toHaveBeenCalledWith(
+      'Worktree cleanup: pass complete',
+      expect.objectContaining({ examined: 2, skipped: 1 }),
+    );
+  });
+
+  // A failure that reports nothing is why the discovery throw survived months
+  // of six-hourly passes. Every reason a pass collects less than the disk holds
+  // has to be visible in the pass line.
+  it('counts and names filtered entries instead of dropping them silently', async () => {
+    const fixture = repositoryFixture();
+    const root = topicWorktreesDir(fixture.workUnit, state.dataDir);
+    // `.github` is a real GitHub repository name that SAFE_SEGMENT rejects.
+    // The filter stays (it is a path-traversal boundary and it only ever
+    // PRESERVES a checkout) but a real repository landing in it must be
+    // visible to an operator, not swallowed.
+    for (const name of ['.pnpm-store', '.github']) fs.mkdirSync(path.join(root, name), { recursive: true });
+
+    const stats = _discoveryStatsForTesting(state.dataDir);
+    expect(stats.targets.map((t) => t.repo)).toEqual([fixture.repo]);
+    // Located, not just named: a bare deduped name reports one `.github` when
+    // there are forty, and gives an operator nowhere to look.
+    const prefix = `wg-a/${fixture.workUnit.kind}-${fixture.workUnit.id}`;
+    expect(stats.filteredNames).toEqual([`${prefix}/.github`, `${prefix}/.pnpm-store`]);
+
+    await runWorktreeCleanupOnce(state.dataDir);
+    expect(log.info).toHaveBeenCalledWith(
+      'Worktree cleanup: pass complete',
+      expect.objectContaining({ filtered: 2, filteredNames: [`${prefix}/.github`, `${prefix}/.pnpm-store`] }),
+    );
+  });
+
+  it('distinguishes an unreadable worktrees root from an empty one', async () => {
+    const fixture = repositoryFixture();
+    const root = topicWorktreesDir(fixture.workUnit, state.dataDir);
+    fs.chmodSync(root, 0o000);
+    try {
+      const stats = _discoveryStatsForTesting(state.dataDir);
+      expect(stats.targets).toEqual([]);
+      expect(stats.unreadableRoots).toBe(1);
+      expect(log.warn).toHaveBeenCalledWith(
+        'Worktree cleanup: worktrees root unreadable; preserving its topic',
+        expect.objectContaining({ directory: root, err: expect.any(Error) }),
+      );
+
+      await runWorktreeCleanupOnce(state.dataDir);
+      expect(log.info).toHaveBeenCalledWith(
+        'Worktree cleanup: pass complete',
+        expect.objectContaining({ examined: 0, unreadableRoots: 1 }),
+      );
+    } finally {
+      fs.chmodSync(root, 0o755);
+    }
+    // Preserved, not collected: unreadable is never deletion authority.
+    expect(fs.existsSync(fixture.worktree)).toBe(true);
+  });
+
+  it('reports an absent worktrees root as an ordinary empty topic', () => {
+    const fixture = repositoryFixture();
+    fs.rmSync(topicWorktreesDir(fixture.workUnit, state.dataDir), { recursive: true, force: true });
+
+    const stats = _discoveryStatsForTesting(state.dataDir);
+    expect(stats).toMatchObject({ targets: [], filteredNames: [], unreadableRoots: 0 });
   });
 });

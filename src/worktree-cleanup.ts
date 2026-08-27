@@ -22,6 +22,7 @@ import { log } from './log.js';
 import {
   canonicalRepoDir,
   defaultTopicBranch,
+  isRepositoryName,
   resolveRepositoryWorkUnit,
   topicStateDir,
   topicWorktreesDir,
@@ -78,15 +79,26 @@ function git(cwd: string, args: string[]): string | null {
   }
 }
 
-function safeDirectories(directory: string): string[] {
+/**
+ * Directory names under a topic's worktrees root, or `null` when the directory
+ * could not be read.
+ *
+ * ENOENT is the ordinary "this topic has no worktrees" answer and returns an
+ * empty list. Anything else — EACCES, EIO, ENOTDIR — is a real fault, and
+ * collapsing it into an empty list is what makes an unreadable fleet
+ * indistinguishable from a collected one. The caller counts and reports it.
+ */
+function safeDirectories(directory: string): string[] | null {
   try {
     return fs
       .readdirSync(directory, { withFileTypes: true })
       .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
       .map((entry) => entry.name)
       .sort();
-  } catch {
-    return [];
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    log.warn('Worktree cleanup: worktrees root unreadable; preserving its topic', { directory, err });
+    return null;
   }
 }
 
@@ -133,29 +145,66 @@ function participantsByTopic(
         status: row.status,
       });
       result.set(key, current);
-    } catch (error) {
+    } catch (err) {
       log.warn('Worktree cleanup: invalid session repository identity; preserving it', {
         sessionId: row.session_id,
-        error,
+        err,
       });
     }
   }
   return result;
 }
 
-function discover(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
+export interface DiscoveryResult {
+  targets: TopicWorktreeTarget[];
+  /**
+   * Entries whose names are not valid repository segments, as
+   * `workgroup/work-unit/name`. Located, not just named: a bare name deduped
+   * across every topic reports one `.github` when there are forty, and gives
+   * an operator nowhere to look.
+   */
+  filteredNames: string[];
+  /** Worktrees roots that could not be read at all. */
+  unreadableRoots: number;
+}
+
+function discover(dataDir: string = DATA_DIR): DiscoveryResult {
   const mapping = participantsByTopic(dataDir);
-  const worktrees: TopicWorktreeTarget[] = [];
+  const targets: TopicWorktreeTarget[] = [];
+  const filteredNames = new Set<string>();
+  let unreadableRoots = 0;
 
   // Only DB-resolvable topics are deletion candidates. Unknown directories are
   // deliberately left intact: missing metadata is never deletion authority.
   for (const [statePath, { unit, participants }] of mapping) {
     if (!fs.existsSync(statePath)) continue;
     const worktreeRoot = topicWorktreesDir(unit, dataDir);
-    for (const repo of safeDirectories(worktreeRoot).sort()) {
+    const names = safeDirectories(worktreeRoot);
+    if (names === null) {
+      unreadableRoots += 1;
+      continue;
+    }
+    for (const repo of names) {
+      // The worktrees root is not a pure repository namespace: the storage
+      // activity lease (`.nanoclaw-storage-active`) and the shared pnpm cache
+      // (`.pnpm-store`) live here too. Their names are not valid repository
+      // segments, so canonicalRepoDir() throws on them — and before this
+      // guard, one such directory aborted the entire cleanup pass at
+      // discovery, fleet-wide, forever.
+      //
+      // The filter is deliberately NOT widened to admit them. `SAFE_SEGMENT`
+      // is a path-traversal boundary, and a checkout that it rejects is
+      // preserved, never deleted. But some rejected names are legitimate
+      // repositories — `.github` and `.github-private` are real GitHub repos —
+      // so every filtered name is reported rather than dropped silently. A
+      // repository name in that report is an operator signal, not noise.
+      if (!isRepositoryName(repo)) {
+        filteredNames.add(`${unit.workgroupId}/${unit.kind}-${unit.id}/${repo}`);
+        continue;
+      }
       const worktreePath = path.join(worktreeRoot, repo);
       if (!fs.existsSync(worktreePath)) continue;
-      worktrees.push({
+      targets.push({
         workUnit: unit,
         participants,
         repo,
@@ -164,7 +213,7 @@ function discover(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
       });
     }
   }
-  return worktrees;
+  return { targets, filteredNames: [...filteredNames].sort(), unreadableRoots };
 }
 
 function participantHasPersistedWork(participant: TopicParticipant): boolean {
@@ -321,7 +370,34 @@ async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DI
 }
 
 export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promise<void> {
-  for (const target of discover(dataDir)) await cleanupOne(target, dataDir);
+  const { targets, filteredNames, unreadableRoots } = discover(dataDir);
+  // One pathological topic must not cost the fleet its collection pass: a
+  // failing target is skipped and counted, never allowed to abort the rest.
+  let skipped = 0;
+  for (const target of targets) {
+    try {
+      await cleanupOne(target, dataDir);
+    } catch (err) {
+      skipped += 1;
+      log.warn('Worktree cleanup: target failed; continuing pass', {
+        workgroupId: target.workUnit.workgroupId,
+        workUnit: target.workUnit.key,
+        repo: target.repo,
+        err,
+      });
+    }
+  }
+  // A pass that collected nothing — because every target failed, because every
+  // name was filtered, or because every root was unreadable — must not read
+  // like a pass that had nothing to do. That indistinguishability is exactly
+  // what let the discovery throw survive unnoticed for months.
+  log.info('Worktree cleanup: pass complete', {
+    examined: targets.length,
+    skipped,
+    filtered: filteredNames.length,
+    filteredNames,
+    unreadableRoots,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +502,7 @@ function isPrivateClone(dir: string): boolean {
 
 function findClonesUnder(root: string, depth: number, found: string[] = []): string[] {
   if (depth < 0) return found;
-  for (const name of safeDirectories(root)) {
+  for (const name of safeDirectories(root) ?? []) {
     if (name.startsWith('.') || name === 'node_modules') continue;
     const dir = path.join(root, name);
     if (isPrivateClone(dir)) {
@@ -529,9 +605,9 @@ function record(report: GcReport, candidate: GcCandidate): void {
 
 function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<string, TopicParticipant[]>): void {
   const topicsRoot = path.join(dataDir, 'v2-topics');
-  for (const workgroupId of safeDirectories(topicsRoot)) {
+  for (const workgroupId of safeDirectories(topicsRoot) ?? []) {
     const workgroupDir = path.join(topicsRoot, workgroupId);
-    for (const topic of safeDirectories(workgroupDir)) {
+    for (const topic of safeDirectories(workgroupDir) ?? []) {
       const topicDir = path.join(workgroupDir, topic);
       const skip = (reason: string): void =>
         record(report, { category: 'orphan-topic', path: topicDir, collect: false, reason, bytes: 0 });
@@ -555,8 +631,20 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
       }
 
       const worktreeRoot = path.join(topicDir, 'worktrees');
+      // The ONE safeDirectories call here that must not fall back to []. The
+      // loop below is what proves every checkout under this topic disposable;
+      // reading an unreadable root as empty leaves `refused` null and records
+      // the whole topic as collectable on the strength of a directory nobody
+      // could read. The discovery-side calls in this file may use `?? []`
+      // because a missed candidate is a missed deletion; this one authorizes
+      // one.
+      const repos = safeDirectories(worktreeRoot);
+      if (repos === null) {
+        skip('worktrees-unreadable');
+        continue;
+      }
       let refused: string | null = null;
-      for (const repo of safeDirectories(worktreeRoot)) {
+      for (const repo of repos) {
         const decision = provenDisposable(path.join(worktreeRoot, repo), 'head');
         if (!decision.ok) {
           refused = decision.reason;
@@ -587,7 +675,7 @@ function collectClones(
 ): void {
   const candidates: Array<{ dir: string; folder: string | null; workgroupId: string | null }> = [];
 
-  for (const folder of safeDirectories(groupsDir)) {
+  for (const folder of safeDirectories(groupsDir) ?? []) {
     const folderDir = path.join(groupsDir, folder);
     for (const dir of findClonesUnder(folderDir, CLONE_SCAN_DEPTH)) {
       candidates.push({ dir, folder, workgroupId: null });
@@ -595,9 +683,9 @@ function collectClones(
   }
 
   const workgroupsRoot = path.join(dataDir, 'workgroups');
-  for (const workgroupId of safeDirectories(workgroupsRoot)) {
+  for (const workgroupId of safeDirectories(workgroupsRoot) ?? []) {
     const workgroupDir = path.join(workgroupsRoot, workgroupId);
-    for (const name of safeDirectories(workgroupDir)) {
+    for (const name of safeDirectories(workgroupDir) ?? []) {
       if (RESERVED_WORKGROUP_DIRS.has(name) || name.startsWith('.')) continue;
       const dir = path.join(workgroupDir, name);
       if (isPrivateClone(dir)) candidates.push({ dir, folder: null, workgroupId });
@@ -789,6 +877,10 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
 }
 
 export function _discoverWorktreesForTesting(dataDir: string = DATA_DIR): TopicWorktreeTarget[] {
+  return discover(dataDir).targets;
+}
+
+export function _discoveryStatsForTesting(dataDir: string = DATA_DIR): DiscoveryResult {
   return discover(dataDir);
 }
 
@@ -803,10 +895,10 @@ export function startWorktreeCleanup(): void {
   if (intervalHandle || startupHandle) return;
   startupHandle = setTimeout(() => {
     startupHandle = null;
-    void runWorktreeCleanupOnce().catch((error) => log.error('Worktree cleanup: startup run failed', { error }));
+    void runWorktreeCleanupOnce().catch((err) => log.error('Worktree cleanup: startup run failed', { err }));
   }, STARTUP_DELAY_MS);
   intervalHandle = setInterval(() => {
-    void runWorktreeCleanupOnce().catch((error) => log.error('Worktree cleanup: periodic run failed', { error }));
+    void runWorktreeCleanupOnce().catch((err) => log.error('Worktree cleanup: periodic run failed', { err }));
   }, CLEANUP_INTERVAL_MS);
 }
 

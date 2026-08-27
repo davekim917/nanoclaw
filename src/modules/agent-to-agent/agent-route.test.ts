@@ -68,36 +68,36 @@ function readPairedInboundTriggers(agentGroupId: string, sessionId: string) {
 }
 
 describe('isSafeAttachmentName', () => {
-  it('accepts plain filenames', () => {
+  it('accepts plain filenames', async () => {
     expect(isSafeAttachmentName('baby-duck.png')).toBe(true);
     expect(isSafeAttachmentName('file with spaces.pdf')).toBe(true);
     expect(isSafeAttachmentName('report.v2.docx')).toBe(true);
     expect(isSafeAttachmentName('.hidden')).toBe(true);
   });
 
-  it('rejects empty / sentinel values', () => {
+  it('rejects empty / sentinel values', async () => {
     expect(isSafeAttachmentName('')).toBe(false);
     expect(isSafeAttachmentName('.')).toBe(false);
     expect(isSafeAttachmentName('..')).toBe(false);
   });
 
-  it('rejects path separators', () => {
+  it('rejects path separators', async () => {
     expect(isSafeAttachmentName('../evil.png')).toBe(false);
     expect(isSafeAttachmentName('/etc/passwd')).toBe(false);
     expect(isSafeAttachmentName('nested/file.txt')).toBe(false);
     expect(isSafeAttachmentName('windows\\path.exe')).toBe(false);
   });
 
-  it('rejects NUL bytes', () => {
+  it('rejects NUL bytes', async () => {
     expect(isSafeAttachmentName('clean\0.png')).toBe(false);
   });
 
-  it('rejects anything path.basename would strip', () => {
+  it('rejects anything path.basename would strip', async () => {
     expect(isSafeAttachmentName('a/b')).toBe(false);
     expect(isSafeAttachmentName('./thing')).toBe(false);
   });
 
-  it('rejects non-string input', () => {
+  it('rejects non-string input', async () => {
     expect(isSafeAttachmentName(null as unknown as string)).toBe(false);
     expect(isSafeAttachmentName(undefined as unknown as string)).toBe(false);
   });
@@ -373,7 +373,7 @@ describe('routeAgentMessage return-path', () => {
 
   it('in_reply_to referencing a non-a2a row falls through to newest session', async () => {
     // Write a channel message into B's inbound (no source_session_id).
-    writeSessionMessage(B, SB.id, {
+    await writeSessionMessage(B, SB.id, {
       id: 'channel-msg-1',
       kind: 'chat',
       timestamp: now(),

@@ -303,45 +303,82 @@ export function wakeRepositoryMountSessions(sessions: Session[]): void {
  * wakeContainer call on exit. Without it, containers are killed and
  * only come back on the next real user message.
  */
-export function restartAgentGroupContainers(
+export async function restartAgentGroupContainers(
   agentGroupId: string,
   reason: string,
   wakeMessage?: string,
   options: { respawnAll?: boolean } = {},
-): number {
+): Promise<number> {
   const sessions = getSessionsByAgentGroup(agentGroupId).filter(
     (s) => s.status === 'active' && isContainerRunning(s.id),
   );
 
+  let restarted = 0;
+  let failed = 0;
   for (const session of sessions) {
     if (wakeMessage) {
-      writeSessionMessage(agentGroupId, session.id, {
-        id: `restart-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        kind: 'chat',
-        timestamp: new Date().toISOString(),
-        platformId: agentGroupId,
-        channelType: 'agent',
-        threadId: null,
-        content: JSON.stringify({
-          text: wakeMessage,
-          sender: 'system',
-          senderId: 'system',
-        }),
-        onWake: 1,
-      });
+      // Awaited so the write is durable before killContainer — but a failure
+      // must cost this session only. Before the await existed, the write was
+      // fire-and-forget and its rejection escaped as an unhandledRejection, so
+      // the loop always finished; letting it throw here instead would kill the
+      // sessions ahead of it and strand every one behind it, half-restarting
+      // the group. Skip this session's kill (never kill a container whose wake
+      // message did not land), count it, and carry on.
+      try {
+        await writeSessionMessage(agentGroupId, session.id, {
+          id: `restart-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          kind: 'chat',
+          timestamp: new Date().toISOString(),
+          platformId: agentGroupId,
+          channelType: 'agent',
+          threadId: null,
+          content: JSON.stringify({
+            text: wakeMessage,
+            sender: 'system',
+            senderId: 'system',
+          }),
+          onWake: 1,
+        });
+      } catch (err) {
+        failed += 1;
+        log.warn('Restart: wake message failed; leaving this container running', {
+          agentGroupId,
+          sessionId: session.id,
+          err,
+        });
+        continue;
+      }
     }
+    // The container can exit during the awaited write above, and killContainer
+    // no-ops on a session it no longer tracks — counting that as a restart
+    // reports work that did not happen.
+    if (!isContainerRunning(session.id)) continue;
+
     // Always respawn after the kill when there is anything to process: an
     // explicit wake message, or in-flight messages the dying container had
     // claimed. Without this, a provider switch mid-conversation leaves the
     // claimed messages dark until the next inbound or a slow sweep backoff.
-    const inDb = openInboundDb(session.agent_group_id, session.id);
+    //
+    // This open can throw too, now that the inbound funnel refuses under a
+    // reclaim claim — same rule as the write: cost this session, not the loop.
     let hasPending: boolean;
     try {
-      hasPending = countDueMessages(inDb) > 0;
-    } finally {
-      // Callers own the connection lifecycle (session-db.ts) — close per op or
-      // each restart leaks one better-sqlite3 FD + mmap segment per session.
-      inDb.close();
+      const inDb = openInboundDb(session.agent_group_id, session.id);
+      try {
+        hasPending = countDueMessages(inDb) > 0;
+      } finally {
+        // Callers own the connection lifecycle (session-db.ts) — close per op
+        // or each restart leaks one better-sqlite3 FD + mmap segment.
+        inDb.close();
+      }
+    } catch (err) {
+      failed += 1;
+      log.warn('Restart: could not read pending work; leaving this container running', {
+        agentGroupId,
+        sessionId: session.id,
+        err,
+      });
+      continue;
     }
     killContainer(
       session.id,
@@ -353,10 +390,11 @@ export function restartAgentGroupContainers(
           }
         : undefined,
     );
+    restarted += 1;
   }
 
   if (sessions.length > 0) {
-    log.info('Restarting agent group containers', { agentGroupId, reason, count: sessions.length });
+    log.info('Restarting agent group containers', { agentGroupId, reason, count: restarted, failed });
   }
-  return sessions.length;
+  return restarted;
 }

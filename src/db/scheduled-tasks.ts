@@ -21,13 +21,11 @@
 import fs from 'fs';
 import path from 'path';
 
-import Database from 'better-sqlite3';
-
 import { DATA_DIR } from '../config.js';
 import { resolveTaskSession } from '../session-manager.js';
 import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
 import { getDb } from './connection.js';
-import { ensureSchema } from './session-db.js';
+import { ensureSchema, openInboundDb } from './session-db.js';
 import { nextEvenSeq } from './session-db.js';
 
 export interface TaskDef {
@@ -237,9 +235,10 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
   const { session } = resolveTaskSession(def.agentGroupId, def.seriesId, def.destination.platformId);
   const inboundDbPath = path.join(dataDir, 'v2-sessions', def.agentGroupId, session.id, 'inbound.db');
 
-  const db = new Database(inboundDbPath);
-  db.pragma('journal_mode = DELETE');
-  db.pragma('busy_timeout = 5000');
+  // Through the funnel, not a hand-rolled open: openInboundDb sets these same
+  // two pragmas AND plants the storage-activity marker that keeps a concurrent
+  // reclaim from unlinking this file between the open and the insert below.
+  const db = openInboundDb(inboundDbPath);
   try {
     const content = JSON.stringify({
       prompt: def.prompt,

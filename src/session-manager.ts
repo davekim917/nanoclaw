@@ -20,6 +20,7 @@ import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
 import { assertChannelRoutingConsistency } from './delivery.js';
 import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
+import { acquireStorageActivityLease } from './storage-activity.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import {
@@ -769,8 +770,92 @@ async function writeSessionMessageInternal(
   // the message would vanish with it. Ordinary routing never gets here —
   // findSessionForAgent filters status='active' — so this only fires on a
   // raw-session-id path, and it must be loud rather than silent.
-  if (getSession(sessionId)?.status === 'archiving') {
+  const statusBefore = getSession(sessionId)?.status;
+  if (statusBefore === 'archiving') {
     throw new Error(`session ${sessionId} is being archived; route this message to a fresh session`);
+  }
+
+  // The check above is a read, so on its own it loses the write-after-check
+  // race: a writer that has passed it and opened inbound.db but not yet
+  // written produces NO observable signal — no unconsumed row, no mtime change
+  // — so the reclaim's open-work and mtime-equality guards both see a quiet
+  // session, archive it, and rmSync the directory out from under the open fd.
+  // The insert then lands in an unlinked inode: accepted, acknowledged, and
+  // absent from the rescue archive.
+  //
+  // The storage-activity lease is the existing two-sided lock for exactly this
+  // (`storage-activity.ts`): the reclaim runs its whole archive-and-delete
+  // inside tryRunWithStorageCleanupClaim, which refuses to act while any
+  // activity marker is present, and acquire double-checks the claim after
+  // planting its marker. Either the reclaim sees our marker and skips, or we
+  // see its claim and wait for it to finish.
+  const lease = await acquireStorageActivityLease(sessionDir(agentGroupId, sessionId), `inbound-${sessionId}`);
+  try {
+    return await writeSessionMessageLocked(agentGroupId, sessionId, message, ignoreDuplicateId);
+  } finally {
+    await lease.release();
+  }
+}
+
+async function writeSessionMessageLocked(
+  agentGroupId: string,
+  sessionId: string,
+  message: SessionMessageInput,
+  ignoreDuplicateId: boolean,
+): Promise<boolean> {
+  // Waiting for the claim above can mean waiting out a reclaim that archived
+  // and deleted this session while we queued. Re-provisioning it here would
+  // resurrect a session nothing polls, so this has to be decided AFTER the
+  // wait — and it has to be decided from something a reclaim cannot fake.
+  //
+  // Three earlier attempts compared a property sampled before the wait against
+  // the same property after it, and each was wrong in a different direction.
+  // `status` equality passes when a session was already `closed` on arrival.
+  // Adding directory existence refuses brand-new sessions. An `inbound.db`
+  // existence flip misses `true -> false -> true`, and is blind when the file
+  // was already absent at sample time. Neither field is an identity: a row is
+  // `closed` for reasons other than reclaim — rotation closes the predecessor
+  // of a lineage, and those rows may never have had a directory at all — and a
+  // path can be deleted and recreated.
+  //
+  // The reclaim journal is the identity. It is appended, fsynced, before the
+  // directory is removed, on every path that removes one, and no path removes
+  // a line. A session id is never reused, so the answer only ever goes
+  // false -> true, once. See `sessionWasReclaimed`.
+  //
+  // The line records the reclaim's INTENT, not its completion: it is written
+  // at storage-manager.ts:1207, before the archiving->closed CAS at :1215,
+  // and that CAS can fail — in which case :1221 logs and deliberately keeps
+  // the directory ("removing it is not our call"). A crash before the rmSync
+  // at :1230 leaves the same shape. So the line alone would brick a session
+  // that is still live. inbound.db answers the second half — the reclaim
+  // removes the whole directory, and nothing in the lease recreates that file
+  // (the lease mkdirs only the session ROOT, which is why the root's
+  // existence is useless here).
+  //
+  // Both terms are read now, once, from current state. Neither is a sample
+  // compared against its own earlier value, which is what made status
+  // equality, status+directory and the inbound.db flip fail in three
+  // different directions. And the flip's ABA — a second writer re-provisioning
+  // inside the window — is closed rather than papered over: the recreate it
+  // needed was the old guard letting that second writer through to
+  // `initSessionFolder` below. The only other in-process creator,
+  // `initStubSessionFolder` (db/scheduled-tasks.ts:98), runs on a freshly
+  // generated id. Remove the leak and the interleave has no producer.
+  //
+  // One composition is deliberate: a CAS-lost session that an operator THEN
+  // `rm -rf`s satisfies both terms and is refused, even though a reset is
+  // meant to re-provision. That is the honest answer — the rescue archive was
+  // published before the CAS lost, so the content is kept, and refusing is
+  // both the safe direction and a loud one.
+  //
+  // Not reclaimed and no directory means a brand-new session, a rotation
+  // predecessor (deliberately `closed`, may never have had a directory), or
+  // the documented operator `rm -rf`. All three re-provision below, as they
+  // must.
+  const { sessionWasReclaimed } = await import('./storage-manager.js');
+  if (sessionWasReclaimed(sessionId) && !fs.existsSync(inboundDbPath(agentGroupId, sessionId))) {
+    throw new Error(`session ${sessionId} has been reclaimed; route this message to a fresh session`);
   }
 
   // Documented reset: operators `rm -rf` a session folder to clear a stuck
@@ -1458,7 +1543,15 @@ function extractAttachmentFiles(
 /** Open the inbound DB for a session (host reads/writes). */
 export function openInboundDb(agentGroupId: string, sessionId: string): Database.Database {
   const db = openInboundDbRaw(inboundDbPath(agentGroupId, sessionId));
-  migrateMessagesInTable(db);
+  try {
+    migrateMessagesInTable(db);
+  } catch (err) {
+    // close() releases the storage-activity marker; without this a failed
+    // migration leaks both the handle and the marker, and a leaked marker
+    // makes this session unreclaimable until the next host start.
+    db.close();
+    throw err;
+  }
   return db;
 }
 

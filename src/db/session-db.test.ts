@@ -599,6 +599,59 @@ describe('sessionInboundHasMessage', () => {
   it('test_sessionInboundHasMessage_no_db', () => {
     expect(sessionInboundHasMessage(TEST_GROUP, 'nonexistent-session', 'msg-1')).toBe(false);
   });
+
+  it('answers over a REAL hot journal instead of throwing', () => {
+    // This open was writable until it was narrowed to read-only so it could not
+    // take a rollback write on a session the reclaim may be archiving. A hot
+    // journal makes that narrowing fatal: the rollback IS a write, so the plain
+    // SELECT fails with "attempt to write a readonly database" and the dashboard
+    // steer path (its only caller) stops being able to ask the question at all.
+    //
+    // A hand-written journal file will NOT reproduce this — SQLite validates the
+    // header and ignores an invalid one — and neither will a small aborted
+    // transaction, because nothing spilled to the main DB and there is nothing
+    // to roll back. It takes a child killed mid-transaction with a page cache
+    // small enough to force dirty pages out into the main file first.
+    const dbPath = sessionDbPath();
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    const seed = new Database(dbPath);
+    seed.pragma('journal_mode = DELETE');
+    seed.exec(INBOUND_SCHEMA);
+    const insert = seed.prepare(
+      "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES (?, ?, 'chat', datetime('now'), 'pending', ?)",
+    );
+    seed.transaction(() => {
+      for (let i = 0; i < 4000; i++) insert.run(`seed-${i}`, i * 2 + 2, 'x'.repeat(400));
+    })();
+    seed.close();
+
+    const child = `
+      const Database = require('better-sqlite3');
+      const db = new Database(${JSON.stringify(dbPath)});
+      db.pragma('journal_mode = DELETE');
+      db.pragma('cache_size = 8');
+      db.prepare('BEGIN EXCLUSIVE').run();
+      const ins = db.prepare("INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES (?, ?, 'chat', datetime('now'), 'pending', ?)");
+      for (let i = 0; i < 4000; i++) ins.run('kill-' + i, 100000 + i * 2, 'y'.repeat(400));
+      process.kill(process.pid, 'SIGKILL');
+    `;
+    spawnSync(process.execPath, ['-e', child], { cwd: process.cwd() });
+
+    // Confirm the precondition is REAL before asserting on it, rather than
+    // asserting over a condition we never established.
+    let reproduced = false;
+    try {
+      const ro = new Database(dbPath, { readonly: true });
+      ro.prepare('SELECT 1 FROM messages_in WHERE id = ? LIMIT 1').get('seed-1');
+      ro.close();
+    } catch (err) {
+      reproduced = /readonly database/.test((err as Error).message);
+    }
+    if (!reproduced) return;
+
+    expect(sessionInboundHasMessage(TEST_GROUP, TEST_SESSION, 'seed-1')).toBe(true);
+    expect(fs.existsSync(`${dbPath}-journal`)).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from '../config.js';
+import { plantStorageActivityMarker } from '../storage-activity.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
@@ -36,11 +37,49 @@ export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): vo
   db.close();
 }
 
-/** Open the inbound DB for a session (host reads/writes). */
+/**
+ * Open the inbound DB for a session (host reads/writes).
+ *
+ * This is the single funnel every read-write inbound open passes through, so
+ * it is where the storage-activity marker goes. The session reclaim runs in a
+ * worker thread and its archive-then-delete is genuinely concurrent with this
+ * one; without a marker, a writer that has opened but not yet written is
+ * invisible to it and the row lands in an inode the reclaim then unlinks.
+ * Guarding the funnel rather than each writer is what keeps the next writer
+ * from having to remember.
+ *
+ * The marker's lifetime is the HANDLE's, not this function's, so the release
+ * hangs off close(). A caller that leaks the handle leaks the marker and its
+ * session stops being reclaimable — `tryRunWithStorageCleanupClaim` logs every
+ * such skip so that is loud rather than silent.
+ */
 export function openInboundDb(dbPath: string): Database.Database {
-  const db = new Database(dbPath);
-  db.pragma('journal_mode = DELETE');
-  db.pragma('busy_timeout = 5000');
+  const release = plantStorageActivityMarker(path.dirname(dbPath), 'inbound-open');
+  let db: Database.Database | undefined;
+  try {
+    db = new Database(dbPath);
+    db.pragma('journal_mode = DELETE');
+    db.pragma('busy_timeout = 5000');
+  } catch (err) {
+    // A pragma can throw after the handle exists, so close what was created
+    // before releasing — otherwise the FD outlives the marker.
+    db?.close();
+    release();
+    throw err;
+  }
+  // ponytail: patching close() beats a wrapper type — every existing caller
+  // already closes, and a new return type would touch all ~20 of them. Known
+  // ceiling: better-sqlite3 refuses close() while an iterator is open, which
+  // would throw before the marker is released. No non-test caller iterates an
+  // inbound handle today; revisit with an explicit release if one appears.
+  const close = db.close.bind(db);
+  db.close = function releasingClose(this: Database.Database): Database.Database {
+    try {
+      return close();
+    } finally {
+      release();
+    }
+  };
   return db;
 }
 
@@ -960,8 +999,20 @@ export function getMostRecentPeerSourceSessionId(db: Database.Database, peerAgen
 export function sessionInboundHasMessage(agentGroupId: string, sessionId: string, messageId: string): boolean {
   const dbPath = path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
   if (!fs.existsSync(dbPath)) return false;
-  const db = new Database(dbPath);
-  db.pragma('journal_mode = DELETE');
+  // Read-only: this only ever runs one SELECT, and a writable open would take
+  // a hot-journal rollback write on a session the reclaim may be archiving.
+  //
+  // But read-only alone is not enough, for the same reason openOutboundDb
+  // recovers first: rolling a hot journal back is a WRITE, so a read-only
+  // handle fails the plain SELECT with "attempt to write a readonly database"
+  // and this function throws instead of answering. The writable open it
+  // replaced rolled the journal back silently, so going read-only without this
+  // line turns a self-healing read into a permanent throw on any session whose
+  // host write was interrupted. Recovery is best-effort and only opens
+  // writable when a journal actually exists, so the normal path stays
+  // read-only.
+  recoverHotJournal(dbPath);
+  const db = new Database(dbPath, { readonly: true });
   db.pragma('busy_timeout = 5000');
   try {
     const row = db.prepare('SELECT 1 FROM messages_in WHERE id = ? LIMIT 1').get(messageId);

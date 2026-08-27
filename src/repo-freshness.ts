@@ -45,8 +45,8 @@ export function discoverCanonicalRefreshTargets(dataDir: string = DATA_DIR): Can
     let repositories;
     try {
       repositories = discoverCanonicalRepositories(entry.name, dataDir);
-    } catch (error) {
-      log.error('repo-freshness: invalid canonical workgroup directory', { workgroupId: entry.name, error });
+    } catch (err) {
+      log.error('repo-freshness: invalid canonical workgroup directory', { workgroupId: entry.name, err });
       continue;
     }
     for (const repository of repositories) {

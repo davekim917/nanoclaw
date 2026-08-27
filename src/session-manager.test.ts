@@ -99,19 +99,19 @@ async function deferMessageForFreshContextRetry(
 }
 
 describe('threadWorktreeDir', () => {
-  it('uses thread_id directly as the key when present', () => {
+  it('uses thread_id directly as the key when present', async () => {
     const got = threadWorktreeDir('slack:CTEST00004', 'slack:CTEST00004:1778800261.935259');
     expect(got).toBe(path.join(threadsBaseDir(), 'slack_CTEST00004_1778800261.935259', 'worktrees'));
   });
 
-  it('produces NO colons in the path (Docker -v safety)', () => {
+  it('produces NO colons in the path (Docker -v safety)', async () => {
     // Docker's -v flag treats `:` as source:target:options separator.
     // A colon anywhere in the host path causes Docker to reject with exit 125.
     const got = threadWorktreeDir('slack:CTEST00004', 'slack:CTEST00004:1778800261.935259');
     expect(got).not.toContain(':');
   });
 
-  it('two siblings on different channelTypes but same platform_id resolve to same path', () => {
+  it('two siblings on different channelTypes but same platform_id resolve to same path', async () => {
     // This is the cross-bot share invariant: helper (slack-example-labs) and
     // helper-codex (slack-helpercodex) both see the same Slack channel, so they
     // get the same platform_id and the same thread_id from chat-sdk-bridge.
@@ -123,18 +123,18 @@ describe('threadWorktreeDir', () => {
     expect(fromHelper).toBe(fromCodex);
   });
 
-  it('falls back to dm-<platform_id> when threadId is null', () => {
+  it('falls back to dm-<platform_id> when threadId is null', async () => {
     const got = threadWorktreeDir('slack:DTEST00009', null);
     expect(got).toBe(path.join(threadsBaseDir(), 'dm-slack_DTEST00009', 'worktrees'));
   });
 
-  it('two siblings in the same DM (different mgs, same platform_id) share path', () => {
+  it('two siblings in the same DM (different mgs, same platform_id) share path', async () => {
     const a = threadWorktreeDir('slack:DTEST00009', null);
     const b = threadWorktreeDir('slack:DTEST00009', null);
     expect(a).toBe(b);
   });
 
-  it('strips dangerous characters via fsSlug', () => {
+  it('strips dangerous characters via fsSlug', async () => {
     const got = threadWorktreeDir('slack:weird*chan?', 'slack:weird*chan?:thread\\bad');
     expect(got).not.toContain('*');
     expect(got).not.toContain('?');
@@ -181,7 +181,7 @@ describe('writeOutboundDirect', () => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   });
 
-  it('inserts into messages_out with an even host-side seq (requires a writable outbound.db)', () => {
+  it('inserts into messages_out with an even host-side seq (requires a writable outbound.db)', async () => {
     // With a readonly open this very call throws SQLITE_READONLY.
     writeOutboundDirect(AG, SESS, {
       id: 'denial-1',
@@ -200,7 +200,7 @@ describe('writeOutboundDirect', () => {
     expect(JSON.parse(rows[0].content).text).toBe('Admin commands are restricted.');
   });
 
-  it('keeps host seq numbers even across multiple writes and ignores duplicate ids', () => {
+  it('keeps host seq numbers even across multiple writes and ignores duplicate ids', async () => {
     writeOutboundDirect(AG, SESS, {
       id: 'denial-1',
       kind: 'chat',
@@ -305,7 +305,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     }
   });
 
-  it('treats a missing inbound DB as unseen without creating it', () => {
+  it('treats a missing inbound DB as unseen without creating it', async () => {
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
 
     expect(sessionMessageExists(AG, SESS, 'next-platform-message')).toBe(false);
@@ -781,7 +781,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     db.close();
   });
 
-  it('upgrades a legacy inbound schema before startup reconciliation admits fresh context', () => {
+  it('upgrades a legacy inbound schema before startup reconciliation admits fresh context', async () => {
     const legacySessionId = 'sess-legacy-memory-upgrade';
     createSession({
       id: legacySessionId,
@@ -1326,7 +1326,7 @@ describe('session migration pass preserves the idle clock', () => {
     return fs.statSync(target).mtimeMs;
   }
 
-  it('leaves a schema-current inbound.db untouched', () => {
+  it('leaves a schema-current inbound.db untouched', async () => {
     const sessionId = 'sess-current-schema';
     seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
@@ -1336,7 +1336,7 @@ describe('session migration pass preserves the idle clock', () => {
     expect(fs.statSync(inboundDbPath(MIGRATION_AG, sessionId)).mtimeMs).toBe(before);
   });
 
-  it('restores the pre-pass mtime after real DDL runs', () => {
+  it('restores the pre-pass mtime after real DDL runs', async () => {
     const sessionId = 'sess-legacy-schema';
     seedSession(sessionId);
     const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
@@ -1376,7 +1376,7 @@ describe('session migration pass preserves the idle clock', () => {
     expect(columns.has('repo_fence_epoch')).toBe(true);
   });
 
-  it('deletes the intent manifest when the pass completes', () => {
+  it('deletes the intent manifest when the pass completes', async () => {
     const sessionId = 'sess-manifest-clean';
     seedSession(sessionId);
     initSessionFolder(MIGRATION_AG, sessionId);
@@ -1551,7 +1551,7 @@ describe('session migration pass preserves the idle clock', () => {
     expect(fs.statSync(target).mtimeMs).toBe(OLD_SECONDS * 1000);
   });
 
-  it('keeps the new mtime for a session whose pass admitted real work', () => {
+  it('keeps the new mtime for a session whose pass admitted real work', async () => {
     const sessionId = 'sess-admits-work';
     seedSession(sessionId);
     const legacyPath = inboundDbPath(MIGRATION_AG, sessionId);
@@ -1605,7 +1605,7 @@ describe('session migration pass preserves the idle clock', () => {
 });
 
 describe('threadWorktreeDir — workgroup namespace', () => {
-  it('same workgroup + same thread share one scoped path; different workgroups do not', () => {
+  it('same workgroup + same thread share one scoped path; different workgroups do not', async () => {
     const tid = 'slack:CTEST10001:1778800261.935259';
     const a1 = threadWorktreeDir('slack:CTEST10001', tid, 'acme');
     const a2 = threadWorktreeDir('slack:CTEST10001', tid, 'acme');
@@ -1616,7 +1616,7 @@ describe('threadWorktreeDir — workgroup namespace', () => {
     expect(a1).not.toContain(':');
   });
 
-  it('serves the legacy un-namespaced dir while it exists (in-flight threads)', () => {
+  it('serves the legacy un-namespaced dir while it exists (in-flight threads)', async () => {
     const tid = 'slack:CTEST10002:1778800261.935259';
     const legacy = path.join(threadsBaseDir(), 'slack_CTEST10002_1778800261.935259', 'worktrees');
     fs.mkdirSync(legacy, { recursive: true });
@@ -1628,7 +1628,7 @@ describe('threadWorktreeDir — workgroup namespace', () => {
     }
   });
 
-  it('refuses to adopt a legacy dir stamped by a DIFFERENT workgroup', () => {
+  it('refuses to adopt a legacy dir stamped by a DIFFERENT workgroup', async () => {
     const tid = 'slack:CTEST10004:1778800261.935259';
     const legacyState = path.join(threadsBaseDir(), 'slack_CTEST10004_1778800261.935259');
     fs.mkdirSync(path.join(legacyState, 'worktrees'), { recursive: true });
@@ -1643,7 +1643,7 @@ describe('threadWorktreeDir — workgroup namespace', () => {
     }
   });
 
-  it('without a workgroup id resolves to the legacy path (back-compat callers)', () => {
+  it('without a workgroup id resolves to the legacy path (back-compat callers)', async () => {
     const tid = 'slack:CTEST10003:1778800261.935259';
     expect(threadWorktreeDir('slack:CTEST10003', tid)).toBe(
       path.join(threadsBaseDir(), 'slack_CTEST10003_1778800261.935259', 'worktrees'),
@@ -1677,14 +1677,14 @@ describe('the shared-transcript migration is gone', () => {
     getSessionClaudeMounts({ id: LAZY_AG } as AgentGroup, { id: LAZY_SESS } as Session);
   }
 
-  it('session creation writes the DBs and nothing else — no transcripts, no .claude-projects', () => {
+  it('session creation writes the DBs and nothing else — no transcripts, no .claude-projects', async () => {
     initSessionFolder(LAZY_AG, LAZY_SESS);
 
     expect(fs.existsSync(projectsDir())).toBe(false);
     expect(fs.readdirSync(sessionDir(LAZY_AG, LAZY_SESS)).sort()).toEqual(['inbound.db', 'outbound.db', 'outbox']);
   });
 
-  it('the spawn path creates the projects dir and copies nothing into it', () => {
+  it('the spawn path creates the projects dir and copies nothing into it', async () => {
     initSessionFolder(LAZY_AG, LAZY_SESS);
     spawn();
 
@@ -1692,7 +1692,7 @@ describe('the shared-transcript migration is gone', () => {
     expect(fs.readdirSync(projectsDir())).toEqual([]);
   });
 
-  it('leaves the group-shared dir untouched', () => {
+  it('leaves the group-shared dir untouched', async () => {
     initSessionFolder(LAZY_AG, LAZY_SESS);
     spawn();
     spawn();
@@ -1707,7 +1707,7 @@ describe('the shared-transcript migration is gone', () => {
     ]);
   });
 
-  it('does not clobber transcripts the agent wrote in a previous turn', () => {
+  it('does not clobber transcripts the agent wrote in a previous turn', async () => {
     initSessionFolder(LAZY_AG, LAZY_SESS);
     spawn();
     fs.writeFileSync(path.join(projectsDir(), 'live.jsonl'), '{"a":"agent-turn"}\n');
@@ -1716,5 +1716,249 @@ describe('the shared-transcript migration is gone', () => {
 
     expect(fs.readdirSync(projectsDir())).toEqual(['live.jsonl']);
     expect(fs.readFileSync(path.join(projectsDir(), 'live.jsonl'), 'utf-8')).toBe('{"a":"agent-turn"}\n');
+  });
+});
+
+/**
+ * The write-after-check race that the reaper being unstalled makes reachable.
+ *
+ * A writer passes the `status === 'archiving'` check and opens inbound.db, then
+ * pauses BEFORE writing. It has produced no observable signal at that point —
+ * no unconsumed row, no mtime change — so the reclaim's open-work and
+ * mtime-equality guards both read a quiet session, archive it, and rmSync the
+ * directory out from under the open fd. The insert lands in an unlinked inode:
+ * accepted, acknowledged, and absent from the rescue archive.
+ *
+ * These assert the two halves of the lease contract that closes it. Both fail
+ * against the pre-fix writer, which took no lease and re-checked nothing.
+ */
+describe('writeSessionMessage does not race an in-flight session archival', () => {
+  // `CLEANUP_CLAIM` in storage-activity.ts. Written directly because the
+  // reaper's own helper holds it only for a synchronous callback, and this
+  // needs it held across the writer's awaits.
+  const claimPath = () => path.join(sessionDir(AG, SESS), '.nanoclaw-storage-cleanup');
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 80));
+
+  // The reclaim journal is what the writer now reads to decide "was this
+  // session taken?". `appendReclaimJournal` is private to storage-manager, so
+  // these fixtures write the same line it writes — a reclaim that removed a
+  // directory without journalling it first is not a state the reclaim can
+  // produce (`storage-manager.ts:1207` precedes the `rmSync` at `:1230`).
+  const DATA_DIR = TEST_DATA_DIR;
+  const journalPath = () => path.join(DATA_DIR, 'session-rescues', 'reclaim-journal.jsonl');
+  const journalReclaim = (sessionId: string, priorStatus: 'active' | 'closed' | 'orphan' = 'active') => {
+    fs.mkdirSync(path.dirname(journalPath()), { recursive: true });
+    fs.appendFileSync(
+      journalPath(),
+      `${JSON.stringify({
+        ts: new Date().toISOString(),
+        session_id: sessionId,
+        agent_group_id: AG,
+        prior_status: priorStatus,
+        rescue_path: path.join(DATA_DIR, 'session-rescues', `${AG}__${sessionId}-stamp.tar.zst`),
+      })}\n`,
+    );
+  };
+  /** What the reclaim does to the filesystem, after the line is durable. */
+  const reclaimDirectory = () => fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+
+  /** Chat rows only — insertMessageWithContext also writes a `recall-` companion. */
+  function inboundIds(): string[] {
+    if (!fs.existsSync(inboundDbPath(AG, SESS))) return [];
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
+      return (db.prepare("SELECT id FROM messages_in WHERE id NOT LIKE 'recall-%'").all() as { id: string }[]).map(
+        (r) => r.id,
+      );
+    } catch {
+      return [];
+    } finally {
+      db.close();
+    }
+  }
+
+  beforeEach(() => {
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+    fs.rmSync(journalPath(), { force: true });
+    const db = initTestDb();
+    runMigrations(db);
+    createAgentGroup({
+      id: AG,
+      name: 'Race',
+      folder: 'race',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    getDb()
+      .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('race','Race',?)`)
+      .run(new Date().toISOString());
+    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'race' WHERE id = ?`).run(AG);
+    createSession({
+      id: SESS,
+      agent_group_id: AG,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    });
+    initSessionFolder(AG, SESS);
+  });
+
+  afterEach(() => {
+    fs.rmSync(claimPath(), { force: true });
+    fs.rmSync(journalPath(), { force: true });
+    closeDb();
+  });
+
+  const message = (id: string) => ({
+    id,
+    kind: 'chat' as const,
+    timestamp: new Date().toISOString(),
+    platformId: 'slack:C1',
+    channelType: 'slack' as const,
+    threadId: null,
+    content: JSON.stringify({ text: 'do not lose me' }),
+  });
+
+  it('waits for a reclaim holding the cleanup claim instead of writing under it', async () => {
+    // A reclaim is mid-archive: it owns the claim and is about to rmSync.
+    fs.writeFileSync(claimPath(), JSON.stringify({ pid: 1, createdAt: new Date().toISOString() }));
+
+    const write = writeSessionMessage(AG, SESS, message('during-archive'));
+    await settle();
+
+    // Pre-fix this row is already committed — into a directory the reclaim is
+    // about to delete.
+    expect(inboundIds()).toEqual([]);
+
+    fs.rmSync(claimPath(), { force: true });
+    await expect(write).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['during-archive']);
+  });
+
+  // CASE: reclaimed while this writer queued. Passes against cb1d9f51 too —
+  // that guard sampled inbound.db present and saw it absent afterwards. Kept
+  // as a GUARD that the journal token did not lose the case the flip caught.
+  it('refuses when the reclaim takes the session while the writer queues', async () => {
+    fs.writeFileSync(claimPath(), JSON.stringify({ pid: 1, createdAt: new Date().toISOString() }));
+
+    const write = writeSessionMessage(AG, SESS, message('after-archive'));
+    await settle();
+
+    // The reclaim finishes: line journalled, row closed, directory gone.
+    // Releasing the claim lets the queued writer through.
+    journalReclaim(SESS, 'active');
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+    reclaimDirectory();
+    fs.mkdirSync(sessionDir(AG, SESS), { recursive: true });
+    fs.rmSync(claimPath(), { force: true });
+
+    await expect(write).rejects.toThrow(/has been reclaimed/);
+    expect(inboundIds()).toEqual([]);
+  });
+
+  // CASE: session already closed AND deleted before this writer arrived.
+  // FAILS against cb1d9f51: nothing changes across the wait, so
+  // statusBefore === statusAfter === 'closed' and inbound.db is absent at both
+  // ends. That guard passes, recreates inbound.db and inserts into a session
+  // whose row stays closed. Production entry point is the raw-session-id path
+  // at src/modules/approvals/response-handler.ts:115.
+  it('refuses a write to a session the reclaim finished with before it arrived', async () => {
+    journalReclaim(SESS, 'active');
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+    reclaimDirectory();
+    expect(fs.existsSync(inboundDbPath(AG, SESS)), 'nothing to observe changing').toBe(false);
+
+    await expect(writeSessionMessage(AG, SESS, message('late-approval'))).rejects.toThrow(/has been reclaimed/);
+    expect(inboundIds()).toEqual([]);
+  });
+
+  // CASE: an ORPHAN reclaim — no central row at all, journalled, directory
+  // gone. FAILS against cb1d9f51 (`inboundExisted` is false at both ends, so
+  // the guard passes and re-provisions). It is also the case no status-based
+  // predicate can reach: there is no row to read a status from.
+  it('refuses a write to an orphan session the reclaim already took', async () => {
+    journalReclaim(SESS, 'orphan');
+    getDb().prepare('DELETE FROM sessions WHERE id = ?').run(SESS);
+    reclaimDirectory();
+
+    await expect(writeSessionMessage(AG, SESS, message('orphan-late'))).rejects.toThrow(/has been reclaimed/);
+    expect(inboundIds()).toEqual([]);
+  });
+
+  // The journal line records the reclaim's INTENT, written at
+  // storage-manager.ts:1207 BEFORE the archiving->closed CAS at :1215. When
+  // that CAS loses, :1221 logs and deliberately keeps the directory; a crash
+  // before the rmSync at :1230 leaves the same shape. The line alone would
+  // brick a session that is still live and still polled, permanently. GUARD:
+  // passes against cb1d9f51 too — it is here to pin that the journal token did
+  // not trade a racy refusal for a permanent one.
+  it('still writes when the reclaim journalled but kept the directory', async () => {
+    journalReclaim(SESS, 'active');
+    expect(fs.existsSync(inboundDbPath(AG, SESS)), 'the archival kept the directory').toBe(true);
+
+    await expect(writeSessionMessage(AG, SESS, message('cas-lost-dir-kept'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['cas-lost-dir-kept']);
+  });
+
+  // CASE: brand-new session — row created, folder never provisioned, first
+  // write. GUARD: passes against cb1d9f51, which is too weak here rather than
+  // too strict. It is the case the status+directory predicate got wrong in the
+  // other direction, and the one the journal token must never re-break.
+  //
+  // Deliberately NOT the no-row-at-all variant: `writeSessionMessage` cannot
+  // serve one. `buildRecallRow` -> `buildPreTurnContext` throws "Unable to
+  // resolve trusted session scope" (pre-turn-context.ts:1890) long after this
+  // guard, so a session with no central row is not a shape this writer has.
+  it('provisions a brand-new session on its first write', async () => {
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+    expect(fs.existsSync(sessionDir(AG, SESS)), 'never provisioned').toBe(false);
+
+    await expect(writeSessionMessage(AG, SESS, message('brand-new'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['brand-new']);
+  });
+
+  // GUARD, and the regression that actually shipped once: a rotation-
+  // superseded session is deliberately `closed` and may have no directory at
+  // all, which the status+directory predicate misread as "reclaimed" and
+  // refused. workgroup-memory.integration.test.ts writes to exactly such a
+  // session and broke. `closed` is therefore NOT a reclaim signal.
+  it('provisions a closed session that never had a directory', async () => {
+    getDb().prepare("UPDATE sessions SET status = 'closed' WHERE id = ?").run(SESS);
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+
+    await expect(writeSessionMessage(AG, SESS, message('superseded-lineage'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['superseded-lineage']);
+  });
+
+  // CASE: documented operator `rm -rf` of a live session's folder. GUARD:
+  // passes against cb1d9f51. Same on-disk shape as a reclaim and the opposite
+  // required outcome, separated only by the absence of a journal line.
+  it('still re-provisions a session whose directory an operator removed', async () => {
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+    expect(fs.existsSync(journalPath()), 'no reclaim ever touched this session').toBe(false);
+
+    await expect(writeSessionMessage(AG, SESS, message('after-rm-rf'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['after-rm-rf']);
+  });
+
+  // A reclaim of a DIFFERENT session must not make this one unwritable — the
+  // journal is one shared append-only file for the whole data root.
+  it('is not fooled by a journal line for another session', async () => {
+    journalReclaim('sess-someone-else', 'active');
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+
+    await expect(writeSessionMessage(AG, SESS, message('not-mine'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['not-mine']);
+  });
+
+  it('still writes normally when no reclaim is in progress', async () => {
+    await expect(writeSessionMessage(AG, SESS, message('ordinary'))).resolves.toBeUndefined();
+    expect(inboundIds()).toEqual(['ordinary']);
+    // The lease leaves nothing behind for the next reclaim to trip over.
+    expect(fs.existsSync(path.join(sessionDir(AG, SESS), '.nanoclaw-storage-active'))).toBe(false);
   });
 });
