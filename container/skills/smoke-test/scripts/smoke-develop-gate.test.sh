@@ -931,7 +931,7 @@ jq -e '.runId == "held-run-1" and .verdict == "HUMAN_DECISION"' "$HOLD_FILE" >/d
 
 # --- 38c. An `override` on that run id re-opens the round ------------------
 # The re-open trigger is the decision itself — no human restarts anything.
-jq -cn '{ts:"2026-08-25T19:21:33Z",user:"operator-a",action:"override",
+jq -cn '{ts:"2026-08-25T19:21:33Z",user:"approver",action:"override",
          target:"smoke_hold:held-run-1"}' > "$LEDGER_DIR/2026-08-25.jsonl"
 bash "$GATE" poll | jq -e --arg sha "$HOLD_SHA" '
   .wakeAgent == true and .data.trigger == "develop_build_settled" and .data.sourceSha == $sha
@@ -949,14 +949,14 @@ mkdir -p "$LEDGER_DIR"
 export SMOKE_GATE_HOLD_FILE="$HOLD_FILE" SMOKE_GATE_DECISION_LEDGER="$LEDGER_DIR"
 hold_up "held-run-2" "$HOLD_SHA"
 {
-  jq -cn '{ts:"2026-08-25T19:21:33Z",user:"operator-a",action:"override",target:"smoke_hold:held-run-2"}'
+  jq -cn '{ts:"2026-08-25T19:21:33Z",user:"approver",action:"override",target:"smoke_hold:held-run-2"}'
   jq -cn '{ts:"2026-08-25T20:27:00Z",user:"Barry",action:"correction",target:"smoke_hold:held-run-2"}'
 } > "$LEDGER_DIR/2026-08-25.jsonl"
 bash "$GATE" poll >/dev/null
 bash "$GATE" poll | jq -e '.data.trigger == "develop_hold_undecided"' >/dev/null
 
 # --- 38e. An override for a DIFFERENT hold does not decide this one --------
-jq -cn '{ts:"2026-08-25T21:00:00Z",user:"operator-a",action:"override",target:"smoke_hold:some-other-run"}' \
+jq -cn '{ts:"2026-08-25T21:00:00Z",user:"approver",action:"override",target:"smoke_hold:some-other-run"}' \
   >> "$LEDGER_DIR/2026-08-25.jsonl"
 bash "$GATE" poll | jq -e '.data.trigger == "hold_undecided"' >/dev/null
 
@@ -964,7 +964,7 @@ bash "$GATE" poll | jq -e '.data.trigger == "hold_undecided"' >/dev/null
 # The desk appends live. A streaming `jq select` aborts at the first malformed
 # line and drops every LATER match — including the decision we are looking for.
 printf '{"ts":"2026-08-25T21:30:00Z","action":"over\n' >> "$LEDGER_DIR/2026-08-25.jsonl"
-jq -cn '{ts:"2026-08-25T22:00:00Z",user:"operator-a",action:"override",target:"smoke_hold:held-run-2"}' \
+jq -cn '{ts:"2026-08-25T22:00:00Z",user:"approver",action:"override",target:"smoke_hold:held-run-2"}' \
   >> "$LEDGER_DIR/2026-08-25.jsonl"
 bash "$GATE" poll | jq -e '.data.trigger == "develop_build_settled"' >/dev/null
 
