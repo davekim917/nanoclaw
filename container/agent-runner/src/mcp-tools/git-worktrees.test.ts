@@ -15,7 +15,6 @@ describe('topic-linked worktree topology', () => {
   let firstTopic: string;
   const ENV_KEYS = [
     'NANOCLAW_WORKTREES_DIR_OVERRIDE',
-    'NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE',
     'NANOCLAW_WORKGROUP_ID',
     'NANOCLAW_HOST_DATA_DIR',
     'NANOCLAW_HOST_TOPIC_WORKTREES_DIR',
@@ -65,7 +64,6 @@ describe('topic-linked worktree topology', () => {
     for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
     root = mkdtempSync(join(tmpdir(), 'gw-topic-linked-'));
     dataDir = join(root, 'data');
-    process.env.NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE = join(root, 'graphify-cache');
     process.env.NANOCLAW_WORKGROUP_ID = 'wg-a';
     process.env.NANOCLAW_HOST_DATA_DIR = dataDir;
     process.env.NANOCLAW_REPOSITORY_ALLOW_LOCAL_ORIGIN = '1';

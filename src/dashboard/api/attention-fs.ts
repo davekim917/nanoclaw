@@ -23,7 +23,9 @@
 import fs from 'fs';
 import path from 'path';
 
+import { DATA_DIR } from '../../config.js';
 import { log } from '../../log.js';
+import { workgroupSharedDir } from '../../modules/workgroup/shared-dirs.js';
 
 /**
  * The largest declared file this seam will read into memory.
@@ -143,20 +145,38 @@ export function resolveContainedRoot(
   groupsRoot: string,
   workgroupId: string,
   root: string,
+  dataRoot: string = DATA_DIR,
 ): string | null {
-  let workgroupDir: string;
-  try {
-    workgroupDir = fs.realpathSync(path.resolve(groupsRoot, workgroupId));
-  } catch (err) {
-    // Not-yet-existing is the common case (a declaration written before the
-    // source generates) and is not an error — but it is never silent, because
-    // an empty feed reads as "nothing is blocked on a human".
-    log.warn(`${label}: workgroup dir unreadable, emitting nothing`, { workgroupId, root, err });
-    return null;
+  // TWO BASES, ONE BOUNDARY. The declared root used to resolve only under
+  // `groups/<wg>/`. Once `reconcileWorkgroupSharedDirs` moves a shared dir into
+  // `data/workgroups/<wg>/`, the seed keeps a CONTAINER-ABSOLUTE compat symlink
+  // (`releases -> /workspace/workgroup/releases`) that deliberately dangles on
+  // the host — so the realpath under `groups/` fails and this provider would
+  // silently emit nothing, which for the release board means a blank feed that
+  // reads as "nothing is blocked on a human". So try the workgroup's shared dir
+  // too. That is the same pair `container-runner.ts` already treats as one
+  // boundary for the sibling symlink overlay, for the same reason: both are
+  // THIS workgroup's own data pool.
+  //
+  // The security property is unchanged and must stay that way: containment is
+  // still checked per-base with `containedRealpath`, so a symlink leading out
+  // of either base into ANOTHER workgroup resolves outside that base and is
+  // refused, exactly as before. Widening the number of bases is not widening
+  // the boundary — each base is still one workgroup's own directory.
+  const bases = [path.resolve(groupsRoot, workgroupId), workgroupSharedDir(workgroupId, dataRoot)];
+  for (const base of bases) {
+    let baseDir: string;
+    try {
+      baseDir = fs.realpathSync(base);
+    } catch {
+      continue; // not-yet-existing is the common case; the warn below covers "none of them worked"
+    }
+    const resolved = containedRealpath(baseDir, path.join(baseDir, root));
+    if (resolved !== null) return resolved;
   }
-  const resolved = containedRealpath(workgroupDir, path.join(workgroupDir, root));
-  if (resolved === null) log.warn(`${label}: declared root unreadable or escapes the workgroup`, { workgroupId, root });
-  return resolved;
+  // Never silent: an empty feed reads as "nothing is blocked on a human".
+  log.warn(`${label}: declared root unreadable or escapes the workgroup`, { workgroupId, root, bases });
+  return null;
 }
 
 /**

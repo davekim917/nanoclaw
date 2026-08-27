@@ -277,6 +277,8 @@ export interface AttentionSourceEnv {
   groupsRoot?: string;
   /** Passed through to `readClaims`; defaults to its own base dir. */
   claimsRoot?: string;
+  /** Holds `workgroups/<workgroupId>/<decl.root>`; defaults to `DATA_DIR`. */
+  dataRoot?: string;
 }
 
 export type AttentionProvider = (

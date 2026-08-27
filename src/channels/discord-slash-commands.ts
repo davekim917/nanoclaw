@@ -255,7 +255,7 @@ export const UPDATE_CONTAINER_PROMPT = [
   '',
   'Present outdated items grouped by activation boundary:',
   '- host: host package.json/pnpm-lock changes; these require the host deploy flow after manual merge.',
-  '- container: Docker pins, agent-runner Bun dependencies, and Graphify; these require an image rebuild after manual merge.',
+  '- container: Docker pins and agent-runner Bun dependencies; these require an image rebuild after manual merge.',
   '- bootstrap: Codex-synced files; these belong in a separate bootstrap-repository PR.',
   'Latest stable includes major versions. Show the exact item IDs and ask which IDs to update. This is the approval gate; do not clone, edit, branch, commit, push, or open a PR before the user answers.',
   '',
@@ -275,19 +275,17 @@ export const UPDATE_CONTAINER_PROMPT = [
   'Keep host and container changes in separate NanoClaw PRs because their activation and rollback boundaries differ. Keep bootstrap changes in a separate bootstrap PR.',
   'In each NanoClaw clone, rerun the audit, then apply only the approved IDs:',
   '`bun scripts/container-updates.ts apply --repo <clone> --items <comma-separated-ids>`',
-  'If Graphify fails its installed-engine behavior contract, or the temporary compatibility patch no longer repairs it, stop and route it to a dedicated Graphify-review PR.',
   '',
   'Validate before publishing:',
   '- host: `pnpm install --frozen-lockfile && pnpm run build && pnpm test`, plus `pnpm run lint` and `pnpm run format:check` — CI runs format:check, and the pre-commit hook would otherwise leak an unrelated reformat into the next PR.',
   '- client/server pairs: a LIVE call against the running service, not a compile. For the OneCLI SDK that means constructing the client the way `src/container-runner.ts` does and invoking a real method; a green build proves nothing about the wire contract. If you cannot make that call, say so and mark the item unverified rather than validated.',
-  '- container: `cd container/agent-runner && bun install --frozen-lockfile && bun test`, then from the repo root run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` and the Graphify Python contracts when Graphify changed.',
-  '- Graphify: require the installed-engine behavior, supply-chain, and runtime acceptance checks before publishing.',
+  '- container: `cd container/agent-runner && bun install --frozen-lockfile && bun test`, then from the repo root run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit`.',
   // No models-cache reset here on purpose. ~/.codex/models_cache.json carries no
   // client-version gate (0 occurrences in the payload) and self-revalidates by
   // ETag, so a cache still stamped with the old client_version already serves the
   // current model list. Resetting it was folklore. Host parity stays: the host
-  // runs its own codex for `codex plugin marketplace upgrade` (plugin-updater.ts)
-  // and the Graphify codex backend, and the operator works in it directly.
+  // runs its own codex for `codex plugin marketplace upgrade` (plugin-updater.ts),
+  // and the operator works in it directly.
   '- Codex CLI: put the exact host-parity installation command in the PR checklist. Do not add a models-cache reset.',
   'Show the final diff before committing. Commit and push only the validated, approved files, open the PR against davekim917/nanoclaw (or davekim917/bootstrap), verify the PR URL is in the intended repository, then stop.',
   'Never merge, deploy, restart services, or build Docker from inside the agent container.',

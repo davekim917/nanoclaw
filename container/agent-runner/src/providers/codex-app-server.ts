@@ -547,7 +547,7 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
   log(`Wrote MCP config.toml (${Object.keys(servers).length} server(s))`);
 }
 
-// ── hooks.json (NanoClaw guardrails + Graphify source capture) ─────────────
+// ── hooks.json (NanoClaw guardrails + source capture) ──────────────────────
 // Codex app-server reads ~/.codex/hooks.json at session start and fires
 // shell-command hooks on PreToolUse / PostToolUse / etc. We point each
 // event at `bun /app/src/codex-hooks/cli.ts <event>` which dispatches to
@@ -672,10 +672,10 @@ export function createCodexConfigOverrides(
     `features.multi_agent_v2.max_concurrent_threads_per_session=${
       stickyConfig?.max_concurrent_threads_per_session ?? DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION
     }`,
-    // Graphify is the sole derived retrieval layer. Codex's opaque summary
-    // store is disabled; canonical memory bytes enter through paired untrusted
-    // recall and remain indexable by Graphify. The provider lifecycle carries
-    // trusted static guidance only.
+    // The canonical Markdown memory tree is the sole retrieval layer. Codex's
+    // opaque summary store is disabled; canonical memory bytes enter through
+    // paired untrusted recall. The provider lifecycle carries trusted static
+    // guidance only.
     'memories.generate_memories=false',
     'memories.use_memories=false',
   ];

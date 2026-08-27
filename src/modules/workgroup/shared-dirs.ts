@@ -20,7 +20,7 @@
  * After a move, the seed's old path and every sibling's old symlink become a
  * CONTAINER-ABSOLUTE compat symlink `<name> -> /workspace/workgroup/<name>`.
  * That dangles on the host (so container-runner's symlink-overlay skips it,
- * while Graphify indexes the canonical data/workgroups root directly) but
+ * while host tooling reads the canonical data/workgroups root directly) but
  * resolves correctly inside the container via the mount, so
  * existing `/workspace/agent/<name>` reader paths keep working with no repoint.
  */
@@ -35,8 +35,8 @@ import { DATA_DIR, GROUPS_DIR } from '../../config.js';
 import { log } from '../../log.js';
 
 /** Host path of a workgroup's shared directory. */
-export function workgroupSharedDir(workgroupId: string): string {
-  return path.resolve(DATA_DIR, 'workgroups', workgroupId);
+export function workgroupSharedDir(workgroupId: string, dataDir: string = DATA_DIR): string {
+  return path.resolve(dataDir, 'workgroups', workgroupId);
 }
 
 /** Container path the shared dir is mounted at. */
@@ -436,7 +436,20 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
 
   const wgDir = path.join(dataDir, 'workgroups', workgroupId);
   const markerPath = path.join(wgDir, '.migrated');
-  if (fs.existsSync(markerPath)) return; // already migrated — idempotent no-op
+  // RE-RUNS EVERY STARTUP, deliberately. This used to `return` here on the
+  // marker, which made the shared tree a one-shot snapshot of whenever it first
+  // ran. On one install a workgroup's marker predated a later seed dir by two
+  // months — the release desk's board, ledger and runbook — so the
+  // union rule below (share any seed dir a sibling already symlinks) never got
+  // to see it. It ended up reachable only by the three siblings someone
+  // remembered to hand-symlink it into and invisible to the two QA agents,
+  // which is exactly the scattered-symlink drift docs/workgroups.md says
+  // workgroups exist to end.
+  //
+  // Every step below already skips when it is already correct, so a re-run on
+  // settled state touches nothing and rewrites nothing. The marker is now a
+  // record (it keeps its original `migratedAt`), not a latch.
+  const priorReport = readMigrationReport(markerPath);
 
   // Sibling folders in this workgroup (excluding the seed itself).
   const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(workgroupId) as Array<{
@@ -525,6 +538,10 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
   });
 
   // ── Move each shared dir, then drop a container-absolute compat symlink ───
+  // `changed` gates the marker rewrite and the log line below: a re-run that
+  // finds everything already in place must be a true no-op, or the "reversible
+  // record" gets a fresh `migratedAt` every boot and stops being a record.
+  let changed = false;
   const moved: string[] = [];
   for (const name of [...shared].sort()) {
     const src = path.join(seedDir, name);
@@ -536,6 +553,7 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
       // mid-move can never leave a partial tree at dst that the idempotency
       // check would later mistake for a completed move.
       if (!isRealDir(src)) continue; // nothing real to move (already a symlink / gone)
+      changed = true;
       if (strategy === 'rename') {
         fs.renameSync(src, dst); // atomic within the filesystem
       } else {
@@ -554,8 +572,9 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
       // create it atomically), so finish the cleanup. Safe: the migration runs
       // before any container spawn, so src cannot have been modified since.
       fs.rmSync(src, { recursive: true, force: true });
+      changed = true;
     }
-    ensureCompatSymlink(seedDir, name);
+    if (ensureCompatSymlink(seedDir, name)) changed = true;
     moved.push(name);
   }
 
@@ -566,6 +585,9 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
     for (const name of moved) {
       const linkPath = path.join(sdir, name);
       const lst = lstatOrNull(linkPath);
+      // Already pointing at the mount — nothing to do. Without this a re-run
+      // would unlink and re-create every sibling's every link on every boot.
+      if (lst?.isSymbolicLink() && safeReadlink(linkPath) === `${WORKGROUP_CONTAINER_PATH}/${name}`) continue;
       if (lst && !lst.isSymbolicLink()) {
         // Sibling has its OWN real entry at this name — never clobber it.
         log.warn('reconcileWorkgroupSharedDirs: sibling has a real entry, not overlaying', {
@@ -577,12 +599,15 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
       }
       if (lst) fs.unlinkSync(linkPath); // remove the now-broken relative symlink
       fs.symlinkSync(`${WORKGROUP_CONTAINER_PATH}/${name}`, linkPath);
+      changed = true;
     }
   }
 
+  if (!changed) return; // settled — re-run is a true no-op
+
   // ── Write the marker + report (reversible record) ─────────────────────────
   const report: MigrationReport = {
-    migratedAt: new Date().toISOString(),
+    migratedAt: priorReport?.migratedAt ?? new Date().toISOString(),
     seedFolder: workgroupId,
     workgroupId,
     moved: moved.sort(),
@@ -619,12 +644,13 @@ function lstatOrNull(p: string): fs.Stats | null {
 }
 
 /** Create (or replace) a container-absolute compat symlink at `<dir>/<name>`. */
-function ensureCompatSymlink(dir: string, name: string): void {
+/** @returns true if it actually wrote a link (i.e. state changed). */
+function ensureCompatSymlink(dir: string, name: string): boolean {
   const linkPath = path.join(dir, name);
   const target = `${WORKGROUP_CONTAINER_PATH}/${name}`;
   const st = lstatOrNull(linkPath);
   if (st) {
-    if (st.isSymbolicLink() && safeReadlink(linkPath) === target) return; // already correct
+    if (st.isSymbolicLink() && safeReadlink(linkPath) === target) return false; // already correct
     if (st.isSymbolicLink()) {
       fs.unlinkSync(linkPath);
     } else {
@@ -633,10 +659,21 @@ function ensureCompatSymlink(dir: string, name: string): void {
         dir,
         name,
       });
-      return;
+      return false;
     }
   }
   fs.symlinkSync(target, linkPath);
+  return true;
+}
+
+/** Prior `.migrated` report, or null when absent/unreadable/malformed. */
+function readMigrationReport(markerPath: string): MigrationReport | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as MigrationReport;
+    return typeof parsed?.migratedAt === 'string' ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 function safeReadlink(p: string): string | null {

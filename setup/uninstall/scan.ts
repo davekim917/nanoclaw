@@ -38,8 +38,6 @@ export interface PathItem {
 
 export interface ServiceInventory {
   launchdPlist?: string;
-  graphifySystemdUserUnit?: string;
-  graphifySystemdSystemUnit?: string;
   systemdUserUnit?: string;
   systemdSystemUnit?: string;
   pidFile?: string;
@@ -137,12 +135,9 @@ export function detectExistingInstall(projectRoot: string): boolean {
   }
   if (process.platform === 'linux') {
     const unit = getSystemdUnit(projectRoot);
-    const graphifyUnit = `${unit}-graphify`;
     return (
       fs.existsSync(path.join(home, '.config', 'systemd', 'user', `${unit}.service`)) ||
-      fs.existsSync(`/etc/systemd/system/${unit}.service`) ||
-      fs.existsSync(path.join(home, '.config', 'systemd', 'user', `${graphifyUnit}.service`)) ||
-      fs.existsSync(`/etc/systemd/system/${graphifyUnit}.service`)
+      fs.existsSync(`/etc/systemd/system/${unit}.service`)
     );
   }
   return false;
@@ -157,17 +152,8 @@ function scanService(deps: ScanDeps, slug: string, containerRuntime: string, not
     if (fs.existsSync(plist)) service.launchdPlist = plist;
   } else if (platform === 'linux') {
     const unit = getSystemdUnit(projectRoot);
-    const graphifyUnit = `${unit}-graphify`;
     const userUnit = path.join(home, '.config', 'systemd', 'user', `${unit}.service`);
     const systemUnit = `/etc/systemd/system/${unit}.service`;
-    const graphifyUserUnit = path.join(home, '.config', 'systemd', 'user', `${graphifyUnit}.service`);
-    const graphifySystemUnit = `/etc/systemd/system/${graphifyUnit}.service`;
-    if (fs.existsSync(graphifyUserUnit)) {
-      service.graphifySystemdUserUnit = graphifyUserUnit;
-    }
-    if (fs.existsSync(graphifySystemUnit)) {
-      service.graphifySystemdSystemUnit = graphifySystemUnit;
-    }
     if (fs.existsSync(userUnit)) service.systemdUserUnit = userUnit;
     if (fs.existsSync(systemUnit)) service.systemdSystemUnit = systemUnit;
     const pidFile = path.join(projectRoot, 'nanoclaw.pid');

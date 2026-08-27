@@ -42,7 +42,7 @@ describe('container image retention metadata', () => {
   }
 
   it('gives non-latest builds a seven-day lease and propagates the owner', () => {
-    const args = runBuild('graphify-candidate', 'session-019f6c2b');
+    const args = runBuild('candidate-image', 'session-019f6c2b');
 
     expect(buildArg(args, 'NANOCLAW_RETENTION_HOURS')).toBe('168');
     expect(buildArg(args, 'NANOCLAW_RETENTION_OWNER')).toBe('session-019f6c2b');

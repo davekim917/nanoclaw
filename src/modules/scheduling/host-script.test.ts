@@ -8,6 +8,7 @@
  *     classifier flags, without running it host-side
  *   - never leak the host process's env into the child (only PATH/HOME/TZ)
  */
+import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -191,19 +192,295 @@ describe('runHostGatedTaskScripts', () => {
   });
 });
 
+/** True once `pid` is gone. Polls, because a just-SIGKILLed process is briefly
+ *  a zombie and still answers `kill(pid, 0)` until Node reaps it (~100ms). */
+async function gone(pid: number, withinMs = 2_000): Promise<boolean> {
+  const until = Date.now() + withinMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    if (Date.now() >= until) return false;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
 describe('runHostScript hard deadline', () => {
-  it('resolves null and kills a hung script instead of wedging the sweep', async () => {
+  // REGRESSION GUARD. The predecessor of this test ran a script whose
+  // GRANDCHILD outlived bash and asserted only `result === null` and
+  // `elapsed < 15_000`. It passed in 311ms — via execFile's own timeout —
+  // and therefore never executed one line of the deadline. Deleting the
+  // whole deadline left it green (audit, 2026-08-26).
+  //
+  // A grandchild cannot reach the deadline: execFile's timeout tears down the
+  // parent's pipe ends, so the callback still fires at T. The ONLY thing that
+  // gets past T is a DIRECT child that does not die on SIGTERM — execFile's
+  // timeout sends SIGTERM, and the callback waits on an exit that never comes.
+  // `trap '' TERM` is the cheap deterministic stand-in for the real cases
+  // (uninterruptible D-state, SIGSTOP). classifyForHostExecution does not
+  // block `trap`, and these scripts are agent-authored, so this is reachable.
+  it('SIGKILLs a SIGTERM-proof script at the deadline, not at the timeout', async () => {
     vi.resetModules();
-    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '300');
-    const { runHostScript } = await import('./host-script.js');
-    const started = Date.now();
-    // Grandchild outlives the direct bash on purpose: the deadline must fire
-    // (timeout+grace) even though backgrounded children hold stdio open.
-    const result = await runHostScript('(sleep 30 &) ; sleep 30', 'deadline-test');
-    const elapsed = Date.now() - started;
-    expect(result).toBeNull();
-    expect(elapsed).toBeLessThan(15_000);
-    expect(elapsed).toBeGreaterThanOrEqual(300);
-    vi.unstubAllEnvs();
-  }, 20_000);
+    // Deadline is timeout + 10s, so these must be far enough apart to tell
+    // "resolved at the timeout" from "resolved at the deadline".
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '1000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      const started = Date.now();
+      const result = await runHostScript("trap '' TERM\nsleep 60\n", 'deadline-test');
+      const elapsed = Date.now() - started;
+
+      expect(result).toBeNull();
+      // The load-bearing assertion: resolution came from the DEADLINE (~11s),
+      // not from execFile's timeout (~1s). Delete the deadline and this fails
+      // by hanging until the test timeout — which is the point.
+      expect(elapsed).toBeGreaterThanOrEqual(10_000);
+      expect(elapsed).toBeLessThan(14_000);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  it('leaves no surviving direct child behind', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '1000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      // The script records its own pid so we can prove the SIGKILL landed
+      // rather than inferring it from the promise resolving.
+      const pidFile = path.join(TEST_DIR, 'deadline-child.pid');
+      fs.mkdirSync(TEST_DIR, { recursive: true });
+      await runHostScript(`trap '' TERM\necho $$ > ${pidFile}\nsleep 60\n`, 'deadline-pid-test');
+
+      const childPid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+      expect(Number.isInteger(childPid)).toBe(true);
+
+      // Poll rather than checking once: at the instant the deadline resolves,
+      // the SIGKILLed child is a ZOMBIE (measured `/proc/<pid>/stat` state `Z`)
+      // and still answers `kill(pid, 0)`. Node reaps it within ~100ms. Polling
+      // keeps the assertion portable — no /proc — without racing the reap.
+      // A SIGTERM-only kill would leave it genuinely alive for the full 2s,
+      // because the script traps TERM.
+      expect(await gone(childPid)).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  // MUTATION GAP codex found: every other fixture here ignores TERM, so making
+  // the soft timer a no-op left all of them green while production scripts with
+  // a TERM cleanup trap would silently lose their grace window and be SIGKILLed
+  // ten seconds later instead. This is the case that pins the SIGTERM step.
+  //
+  // It also pins the `timedOut` rule. A trap that emits valid JSON and exits 0
+  // must still resolve NULL: accepting it would mark the row completed and
+  // RESET the recurrence failure streak, so a series that overruns on every
+  // fire would never reach the 8-failure auto-pause that exists to catch it.
+  it('SIGTERMs at the timeout and discards a trap-emitted result', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '1000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      const started = Date.now();
+      // Traps TERM, prints a well-formed verdict, exits 0 — the shape that
+      // used to be accepted as a success.
+      const result = await runHostScript(
+        `trap 'echo "{\\"wakeAgent\\":false}"; exit 0' TERM\nsleep 60\n`,
+        'soft-timeout-test',
+      );
+      const elapsed = Date.now() - started;
+
+      // Died on SIGTERM at the soft timeout, so it never reached the hard
+      // deadline — that is what fails if the soft timer is made a no-op.
+      expect(elapsed).toBeLessThan(5_000);
+      expect(elapsed).toBeGreaterThanOrEqual(1_000);
+      // And its output is not a verdict.
+      expect(result).toBeNull();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  // THE POINT OF spawn() + detached. Killing bash does not kill what bash
+  // started: a `gh api` fan-out or a `capped-check.sh` run is a GRANDCHILD, and
+  // signalling the direct child alone orphans it. Before this change the code
+  // tried `process.kill(-child.pid)` while passing `detached` to execFile,
+  // which silently drops it — so the child was never a group leader, that call
+  // only ever threw ESRCH, and every descendant survived. Verified at the time:
+  // a grandchild outlived the kill and completed its side effect 6s later.
+  //
+  // The grandchild here is deliberately NOT `timeout`-wrapped. Nothing in
+  // classifyForHostExecution requires scripts to bound their own children, and
+  // they are agent-authored, so descendant cleanup must not rest on that.
+  it('kills GRANDCHILDREN too, not just the direct child', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '1000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      fs.mkdirSync(TEST_DIR, { recursive: true });
+      const gcPid = path.join(TEST_DIR, 'grandchild.pid');
+      const gcMarker = path.join(TEST_DIR, 'grandchild.marker');
+
+      // Backgrounded grandchild records its pid, then tries to write a marker
+      // well after the deadline. bash traps TERM so only the group SIGKILL can
+      // stop the pair.
+      await runHostScript(
+        `trap '' TERM\n( echo $BASHPID > ${gcPid}; sleep 40; touch ${gcMarker} ) &\nsleep 60\n`,
+        'grandchild-test',
+      );
+
+      const grandchildPid = Number(fs.readFileSync(gcPid, 'utf8').trim());
+      expect(Number.isInteger(grandchildPid)).toBe(true);
+      expect(await gone(grandchildPid)).toBe(true);
+      // Belt and braces: it never got far enough to run its side effect.
+      expect(fs.existsSync(gcMarker)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  // codex finding 3: the cap must be BYTES. `chunk.length` on a utf8-decoded
+  // string counts UTF-16 code units, so 400,000 `中` — 1.2MB of UTF-8 — slipped
+  // under a 1MiB character cap and was accepted.
+  //
+  // Pure bash, no python3: the first draft shelled out to an interpreter, and a
+  // box without it would have failed to spawn -> finish(null) -> the expected
+  // null, PASSING VACUOUSLY while testing nothing.
+  it('counts the output cap in bytes, not UTF-16 code units', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '10000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      // The LITERAL character, not a `中` escape: bash printf emits that
+      // escape as six ASCII bytes, which blows BOTH caps and makes this test
+      // pass either way — vacuous in a second, subtler way than the python3
+      // version it replaced. Verified by mutation: with code-unit counting this
+      // fixture returns {wakeAgent:true}, with byte counting it returns null.
+      //
+      // 400 × 1000 three-byte characters = ~1.2MB of UTF-8 in only ~400k code
+      // units: over a byte cap, comfortably under a code-unit one.
+      const result = await runHostScript(
+        `s=$(printf '中%.0s' $(seq 1 1000))\nfor i in $(seq 1 400); do printf '%s' "$s"; done\nprintf '\\n{"wakeAgent":true}\\n'\n`,
+        'utf8-cap-test',
+      );
+      expect(result).toBeNull();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  // ADMISSION RULE. `scriptHost` is a fast-path privilege: these run
+  // sequentially inside the awaited sweep, so a slow one makes the fleet's only
+  // timer late for every other session. The rule is "worst case under the
+  // ceiling, with margin", and nothing can prove that statically — so it is
+  // enforced by MEASUREMENT. Without this warning a slow sweep tick names no
+  // script and the rule is unenforceable, which is how a 240s gate sat on the
+  // host path unnoticed.
+  it('reports a host script that runs past half its ceiling', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '2000');
+    const { log } = await import('../../log.js');
+    const warn = vi.spyOn(log, 'warn');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      // Finishes successfully, but at ~75% of a 2s ceiling — the shape that
+      // times out on the next slow upstream day.
+      const result = await runHostScript(`sleep 1.5\necho '{"wakeAgent":false}'\n`, 'budget-warn');
+
+      expect(result).toEqual({ wakeAgent: false });
+      const overBudget = warn.mock.calls.find(([msg]) => String(msg).includes('over budget'));
+      expect(overBudget).toBeDefined();
+      const fields = overBudget?.[1] as { pctOfCeiling: number; timedOut: boolean };
+      expect(fields.pctOfCeiling).toBeGreaterThanOrEqual(50);
+      // Succeeded — this is the EARLY warning, before it becomes a timeout.
+      expect(fields.timedOut).toBe(false);
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  it('stays quiet for a script comfortably inside its ceiling', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '10000');
+    const { log } = await import('../../log.js');
+    const warn = vi.spyOn(log, 'warn');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      await runHostScript(`echo '{"wakeAgent":false}'\n`, 'budget-ok');
+      expect(warn.mock.calls.find(([msg]) => String(msg).includes('over budget'))).toBeUndefined();
+    } finally {
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  // The script file is written into a private 0700 mkdtemp dir at 0600, NOT a
+  // predictable name in shared /tmp at 0755. The old shape was a real
+  // privilege-escalation surface: `taskId` appears in logs and on the board, so
+  // the name was guessable; the sticky bit does not stop pre-creating it as a
+  // symlink; writeFileSync FOLLOWS symlinks and `mode` only applies on create —
+  // so a predicted name let an attacker choose the file this host then executed
+  // UNSANDBOXED, routing straight around classifyForHostExecution.
+  it('refuses to write through a pre-planted symlink at its script path', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '5000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      fs.mkdirSync(TEST_DIR, { recursive: true });
+      const victim = path.join(TEST_DIR, 'victim.txt');
+      fs.writeFileSync(victim, 'ORIGINAL');
+
+      // The script reports its own location and permissions from INSIDE the
+      // run. The directory is cleaned up on finish, so anything asserted
+      // afterwards would be stat-ing a path that no longer exists.
+      const result = await runHostScript(
+        `d=$(dirname "$0")\nprintf '{"wakeAgent":true,"data":{"dir":"%s","dmode":"%s","fmode":"%s"}}\\n' "$d" "$(stat -c '%a' "$d")" "$(stat -c '%a' "$0")"\n`,
+        'sec',
+      );
+
+      const { dir, dmode, fmode } = result?.data as { dir: string; dmode: string; fmode: string };
+      // Private per-run directory, not the shared tmp root.
+      expect(dir).not.toBe(os.tmpdir());
+      expect(path.dirname(dir)).toBe(os.tmpdir());
+      expect(path.basename(dir)).toMatch(/^nanoclaw-task-/);
+      // 0700: nobody else can even traverse in to plant anything.
+      expect(dmode).toBe('700');
+      // 0600: no execute bit — spawn('bash', [path]) never needed one.
+      expect(fmode).toBe('600');
+      // Untouched — the old predictable-path shape is what made this reachable.
+      expect(fs.readFileSync(victim, 'utf8')).toBe('ORIGINAL');
+      // And the run cleans up after itself.
+      expect(fs.existsSync(dir)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 25_000);
+
+  // glm found this uncovered: nothing pinned the SIGKILL in the overflow
+  // branch. The byte-cap fixture above exits on its own, so deleting that kill
+  // left every test green. A script that floods WITHOUT exiting is the case
+  // that matters — unkilled it burns CPU and IO for the full timeout+10s on
+  // every fire, stalling the sequential sweep worse than the wedge the
+  // deadline exists to prevent.
+  it('kills a non-exiting flood producer at the overflow, not at the deadline', async () => {
+    vi.resetModules();
+    vi.stubEnv('NANOCLAW_TASK_SCRIPT_TIMEOUT_MS', '10000');
+    try {
+      const { runHostScript } = await import('./host-script.js');
+      const started = Date.now();
+      // Never exits on its own and ignores TERM: only the overflow SIGKILL can
+      // end this before the 20s hard deadline.
+      const result = await runHostScript(`trap '' TERM\nwhile :; do printf '%01000d' 0; done\n`, 'overflow-kill-test');
+      const elapsed = Date.now() - started;
+
+      expect(result).toBeNull();
+      // Well inside the 10s timeout, so it died on the cap rather than a timer.
+      expect(elapsed).toBeLessThan(8_000);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  }, 30_000);
 });

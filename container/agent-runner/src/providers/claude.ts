@@ -1602,20 +1602,46 @@ function findTranscriptPath(sessionId: string): string | null {
   return null;
 }
 
+/**
+ * Read has to cover the WHOLE first line — it is one JSON object, and a
+ * truncated prefix never parses. The old 4KB buffer returned null for 66% of
+ * live transcripts (2693 sampled; the host's `[Trusted runtime capability
+ * state]` entry alone runs ~16KB, and the first `"timestamp"` key sits as deep
+ * as 12KB in), which silently disabled the age half of
+ * `maybeRotateContinuation`: only the size cap ever fired, so long-lived task
+ * sessions resumed 17+ day transcripts against a 14-day cap.
+ *
+ * ponytail: one bounded read, no chunk loop. 1 MiB is ~10x the largest first
+ * line observed across those 2693 transcripts (105,694 bytes). A longer one
+ * logs and skips the age check instead of failing silently — make this a
+ * grow-until-newline loop if that log ever shows up.
+ */
+const TRANSCRIPT_FIRST_LINE_MAX_BYTES = 1024 * 1024;
+
 /** Epoch-ms of the first transcript entry, or null if unreadable. */
 function transcriptStartMs(transcriptPath: string): number | null {
   try {
+    let firstLine: string;
     const fd = fs.openSync(transcriptPath, 'r');
     try {
-      const buf = Buffer.alloc(4096);
+      // +1 so a filled buffer means the line is genuinely LONGER than the cap.
+      // At exactly the cap with no trailing newline the old sizing read
+      // `n === buf.length` and cried truncation on a complete line.
+      const buf = Buffer.alloc(TRANSCRIPT_FIRST_LINE_MAX_BYTES + 1);
       const n = fs.readSync(fd, buf, 0, buf.length, 0);
-      const firstLine = buf.toString('utf-8', 0, n).split('\n', 1)[0];
-      const ts = JSON.parse(firstLine)?.timestamp;
-      const ms = ts ? Date.parse(ts) : NaN;
-      return Number.isNaN(ms) ? null : ms;
+      const nl = buf.indexOf(0x0a);
+      const end = nl >= 0 && nl < n ? nl : n;
+      if (end === n && n === buf.length) {
+        log(`Transcript first line exceeds ${buf.length}B — age-based rotation skipped for ${transcriptPath}`);
+        return null;
+      }
+      firstLine = buf.toString('utf-8', 0, end);
     } finally {
       fs.closeSync(fd);
     }
+    const ts = (JSON.parse(firstLine) as { timestamp?: string } | null)?.timestamp;
+    const ms = ts ? Date.parse(ts) : NaN;
+    return Number.isNaN(ms) ? null : ms;
   } catch {
     return null;
   }
@@ -2099,8 +2125,8 @@ export class ClaudeProvider implements AgentProvider {
           PostToolUse: [
             { hooks: [postToolUseHook] },
             // Capture intentionally fetched knowledge into sources/inbox.
-            // Graphify watches the workgroup source tree and indexes these
-            // files for autonomous Graphify discovery without an opt-in flag.
+            // These land in the workgroup source tree so later sessions can
+            // find them as ordinary files, without an opt-in flag.
             { matcher: 'WebFetch', hooks: [createMemoryCaptureWebFetchHook()] },
             { matcher: 'Bash', hooks: [createMemoryCaptureBashHook()] },
             // mcp__.* matches every MCP tool call; the hook itself dispatches

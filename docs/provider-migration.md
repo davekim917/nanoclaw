@@ -41,7 +41,6 @@ canonical memory, same-thread context, workgroup-wide archive recall, exact
 Slack/Discord permalink provenance, and any explicit degraded notice. This
 works on first wake, warm continuation, compaction, rotation, and replacement;
 it does not depend on provider-native history or an optional tool call.
-Graphify is optional and advisory for deeper retrieval.
 
 ## Kept separate
 

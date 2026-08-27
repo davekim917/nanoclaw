@@ -1,0 +1,27 @@
+[Unit]
+Description=Mirror git-tracked workgroup deliverables to Google Drive
+After=network-online.target
+Documentation=file:///home/ubuntu/nanoclaw-v2/scripts/publish-workgroups-drive.sh
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+# The script cds to data/workgroups itself (gws --upload refuses paths outside
+# the cwd); this is only the safe starting directory.
+WorkingDirectory=/home/ubuntu/nanoclaw-v2
+# Explicit named account. The bare default credential slot
+# (~/.config/gws/credentials.enc) is deliberately not used and is being removed;
+# anything that fell back to it would break silently.
+Environment=GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/ubuntu/.config/gws/accounts/primary.json
+Environment=DRIVE_STATE_FILE=/home/ubuntu/nanoclaw-v2/data/workgroups-drive-state.tsv
+# Environment=DRIVE_ROOT_NAME=<folder>   # set in the installed unit, not here
+# gws lives in the user npm prefix, which a systemd oneshot does not inherit.
+Environment=PATH=/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash /home/ubuntu/nanoclaw-v2/scripts/publish-workgroups-drive.sh
+# A cold first run walks every tracked file; steady state is a few seconds.
+TimeoutStartSec=3600
+StandardOutput=journal
+StandardError=journal
+# No Restart= — the job is idempotent and the next daily fire is the retry.
+# Failures surface in journalctl -u nanoclaw-workgroups-drive.

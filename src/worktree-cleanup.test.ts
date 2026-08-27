@@ -48,16 +48,11 @@ vi.mock('./log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import {
-  _cleanupOneForTesting,
-  _discoverOrphanGraphifyCachesForTesting,
-  _discoverWorktreesForTesting,
-} from './worktree-cleanup.js';
+import { _cleanupOneForTesting, _discoverWorktreesForTesting } from './worktree-cleanup.js';
 import {
   canonicalRepoDir,
   defaultTopicBranch,
   resolveRepositoryWorkUnit,
-  topicGraphifyCacheDir,
   topicWorktreesDir,
   writeTransferTombstone,
 } from './repository-workspaces.js';
@@ -114,12 +109,9 @@ function repositoryFixture(threadId = 'thread-1', repo = 'repo-a') {
   fs.mkdirSync(path.dirname(worktree), { recursive: true });
   const branch = defaultTopicBranch(workUnit, repo);
   git(canonical, ['worktree', 'add', '-q', '-b', branch, worktree, 'origin/HEAD']);
-  const cache = path.join(topicGraphifyCacheDir(workUnit, state.dataDir), repo);
-  fs.mkdirSync(cache, { recursive: true });
-  fs.writeFileSync(path.join(cache, 'index.db'), 'cache');
   const old = new Date(Date.now() - 8 * 86_400_000);
   fs.utimesSync(worktree, old, old);
-  return { canonical, worktree, cache, workUnit, repo, branch };
+  return { canonical, worktree, workUnit, repo, branch };
 }
 
 beforeEach(() => {
@@ -151,12 +143,11 @@ describe('per-topic linked worktree cleanup', () => {
     expect(targets[0].participants.map((participant) => participant.sessionId)).toEqual(['s1', 's2']);
   });
 
-  it('removes only an inactive clean remote-contained linked checkout and its cache', async () => {
+  it('removes only an inactive clean remote-contained linked checkout', async () => {
     const fixture = repositoryFixture();
     const [target] = _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
     expect(fs.existsSync(fixture.worktree)).toBe(false);
-    expect(fs.existsSync(fixture.cache)).toBe(false);
     expect(git(fixture.canonical, ['for-each-ref', '--format=%(refname)', `refs/heads/${fixture.branch}`])).toBe('');
   });
 
@@ -211,7 +202,6 @@ describe('per-topic linked worktree cleanup', () => {
     expect(fs.existsSync(fixture.worktree)).toBe(true);
     expect(fs.existsSync(siblingAdmin)).toBe(true);
     expect(fs.readFileSync(path.join(sibling, '.git'), 'utf8')).toBe(siblingPointer);
-    expect(fs.existsSync(fixture.cache)).toBe(true);
   });
 
   it.each([
@@ -227,7 +217,6 @@ describe('per-topic linked worktree cleanup', () => {
     const [target] = _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
     expect(fs.existsSync(fixture.worktree)).toBe(true);
-    expect(fs.existsSync(fixture.cache)).toBe(true);
   });
 
   it.each([
@@ -243,7 +232,6 @@ describe('per-topic linked worktree cleanup', () => {
     await _cleanupOneForTesting(target, state.dataDir);
 
     expect(fs.existsSync(fixture.worktree)).toBe(true);
-    expect(fs.existsSync(fixture.cache)).toBe(true);
   });
 
   it('preserves the worktree when an inactive participant persisted state is unknown', async () => {
@@ -255,7 +243,6 @@ describe('per-topic linked worktree cleanup', () => {
     await _cleanupOneForTesting(target, state.dataDir);
 
     expect(fs.existsSync(fixture.worktree)).toBe(true);
-    expect(fs.existsSync(fixture.cache)).toBe(true);
   });
 
   it('preserves dirty, unpushed, recent, and malformed linked checkouts', async () => {
@@ -278,7 +265,6 @@ describe('per-topic linked worktree cleanup', () => {
       const [target] = _discoverWorktreesForTesting(state.dataDir);
       await _cleanupOneForTesting(target, state.dataDir);
       expect(fs.existsSync(fixture.worktree), `scenario ${index}`).toBe(true);
-      expect(fs.existsSync(fixture.cache), `scenario ${index}`).toBe(true);
     }
   });
 
@@ -306,14 +292,10 @@ describe('per-topic linked worktree cleanup', () => {
     expect(fs.existsSync(fixture.worktree)).toBe(true);
   });
 
-  it('does not discover unknown topic directories and classifies known orphan caches', () => {
-    const known = unit();
-    const cache = path.join(topicGraphifyCacheDir(known, state.dataDir), 'orphan');
-    fs.mkdirSync(cache, { recursive: true });
+  it('does not discover unknown topic directories', () => {
     const unknown = path.join(state.dataDir, 'v2-topics', 'wg-a', 'thread-00000000000000000000000000000000');
     fs.mkdirSync(path.join(unknown, 'worktrees', 'important'), { recursive: true });
     expect(_discoverWorktreesForTesting(state.dataDir)).toEqual([]);
-    expect(_discoverOrphanGraphifyCachesForTesting(state.dataDir)).toHaveLength(1);
     expect(fs.existsSync(path.join(unknown, 'worktrees', 'important'))).toBe(true);
   });
 });
