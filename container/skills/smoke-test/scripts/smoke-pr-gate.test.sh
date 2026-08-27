@@ -244,11 +244,69 @@ export STUB_SERVICES="[{\"id\":\"srv-backend-pr-44\",\"name\":\"XZO-DEV-BACKEND 
 export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
 export STUB_HEALTHZ_CODE=200
 export SMOKE_GATE_PREFLIGHT_CMD='echo "seat qa-a@example.com could not be verified"; exit 1'
-bash "$GATE" poll | jq -e '
-  .wakeAgent == true and .data.trigger == "preflight_failed" and
-  (.data.reason | test("could not be verified"))
-' >/dev/null
+# `pr_preflight_failed`, not `preflight_failed`: dispositions are keyed by
+# trigger name and the develop gate owns the only `ack` verb, so a shared name
+# let an ack from here destroy a live develop-gate silence. The fingerprint is
+# gate-scoped for the same reason and must never be the bare reason.
+PF_WAKE="$(bash "$GATE" poll)"
+jq -e '
+  .wakeAgent == true and .data.trigger == "pr_preflight_failed" and
+  (.data.reason | test("could not be verified")) and
+  (.data.fingerprint | startswith("pr|")) and
+  (.data.fingerprint != .data.reason)
+' <<<"$PF_WAKE" >/dev/null
 [ ! -e "$STATE_DIR/pr-44-state.json" ] || jq -e '.activeRunId == null' "$STATE_DIR/pr-44-state.json" >/dev/null
+unset SMOKE_GATE_PREFLIGHT_CMD
+
+# --- 3c. INVARIANT 2, the PR-gate half: the re-arm throttle keys on the
+# gate-computed FINGERPRINT, not the reason string.
+#
+# This suite had NO flap sequence at all — only single-failure and URL-routing
+# preflight cases — so the develop gate's I2c latch mutant was killed on that
+# side and SURVIVED here, in code carrying the identical latch. The sequence
+# that separates the two keyings: alarm on reason A, throttle a CHANGED reason
+# B inside the re-arm floor (the throttled branch persists `.preflightReason`
+# but deliberately NOT `.preflightFingerprint`, so "last seen" and "last
+# alarmed" diverge exactly here), age past the floor, then flap back to A.
+# Keyed on the fingerprint, A is still the last thing we alarmed on and must
+# stay silent. Keyed on the reason, A reads as news and wakes for an incident
+# the operator was already told about, every time the text flaps back.
+fresh_state
+export SMOKE_GATE_REPO=org/repo SMOKE_GATE_BACKEND_SERVICE=srv-backend-base \
+  SMOKE_GATE_FRONTEND_SERVICE=srv-frontend-base
+HEAD_SHA="$(sha e)"
+export STUB_PR_LIST="[{\"number\":45,\"headRefOid\":\"$HEAD_SHA\",\"headRefName\":\"feature/x\"}]"
+export STUB_PR_FILES='[{"filename":"XZO-BACKEND/src/foo.ts"}]'
+export STUB_RUN_LIST="[{\"headSha\":\"$HEAD_SHA\",\"status\":\"completed\",\"conclusion\":\"success\",\"workflowName\":\"CI\"}]"
+export STUB_SERVICES="[{\"id\":\"srv-backend-pr-45\",\"name\":\"XZO-DEV-BACKEND PR #45\",\"serviceDetails\":{\"parentServer\":{\"id\":\"srv-backend-base\"},\"url\":\"https://xzo-dev-backend-pr-45.onrender.com\"}}]"
+export STUB_BACKEND_DEPLOYS="[{\"status\":\"live\",\"commit\":{\"id\":\"$HEAD_SHA\"}}]"
+export STUB_HEALTHZ_CODE=200
+FLAP_CTL="$STATE_DIR/control.json"
+flap_poll() { SMOKE_GATE_PREFLIGHT_CMD="echo \"$1\"; exit 1" bash "$GATE" poll; }
+# Push the last preflight wake back past the re-arm FLOOR (900s) but nowhere
+# near the ALERT ceiling (21600s), which re-arms unconditionally and would make
+# a fingerprint latch and a reason latch behave identically — i.e. would make
+# this case unable to fail for the reason it claims.
+flap_age() {
+  local t; t="$(date -u -d '@'$(( $(date -u +%s) - 1000 )) +'%Y-%m-%dT%H:%M:%SZ')"
+  jq --arg t "$t" '.preflightWakeAt=$t' "$FLAP_CTL" > "$FLAP_CTL.t" && mv "$FLAP_CTL.t" "$FLAP_CTL"
+}
+flap_poll "3 of 8 QA seats could not be verified" | jq -e '
+  .wakeAgent == true and .data.trigger == "pr_preflight_failed"
+' >/dev/null
+# Changed reason inside the floor: throttled, but the new text IS recorded.
+flap_poll "8 of 8 QA seats could not be verified" | jq -e '.wakeAgent == false' >/dev/null
+jq -e '.preflightReason == "8 of 8 QA seats could not be verified"' "$FLAP_CTL" >/dev/null
+# Past the floor, flapped BACK to the reason we last alarmed on: still silent.
+flap_age
+flap_poll "3 of 8 QA seats could not be verified" | jq -e '.wakeAgent == false' >/dev/null \
+  || { echo "the pr-gate preflight throttle re-alarmed on a reason it had already alarmed on" >&2; exit 1; }
+# ...and past the floor a genuinely NEW reason still re-arms — the floor delays
+# news, it never suppresses it.
+flap_age
+flap_poll "6 of 8 QA seats could not be verified" | jq -e '
+  .wakeAgent == true and (.data.reason | test("6 of 8"))
+' >/dev/null
 unset SMOKE_GATE_PREFLIGHT_CMD
 
 # --- 4. Deploy-SHA mismatch: check reports not settled, not ready ----------
@@ -1047,4 +1105,27 @@ jq -e --arg target "$APPFAIL_TARGET" '
 [ "$(wc -c < "$APPFAIL_LEDGER")" -eq 0 ]
 # The hold still went up — a ledger failure must never skip or undo it.
 jq -e --arg sha "$APPFAIL_TARGET" '.sha == $sha and .runId == "run-appfail"' "$APPFAIL_DIR/develop-hold.json" >/dev/null
+# --- INVARIANT 3: num_env rejects the classes it was built to stop --------
+# Mirror of the develop suite's case-53 extension. "All digits" admitted three
+# shapes, each a distinct silent failure: a leading zero is octal (or fatal) in
+# `$(( ))` but DECIMAL in `[ -ge ]`, so the reported window and the effective
+# window diverge; anything wider than int64 makes every `[ x -ge KNOB ]` an
+# error, which in an `if` is false — a threshold that never fires; and
+# set-but-empty took the default without being named.
+fresh_state
+unset SMOKE_GATE_REPO 2>/dev/null || true
+for bad in 0900 0100 05900 99999999999999999999 "" abc; do
+  SMOKE_GATE_WARMUP_TIMEOUT="$bad" bash "$GATE" poll | jq -e '
+    .data.trigger == "gate_misconfigured" and
+    (.data.missing | index("SMOKE_GATE_WARMUP_TIMEOUT") != null)
+  ' >/dev/null || { echo "pr gate num_env admitted WARMUP_TIMEOUT='$bad'" >&2; exit 1; }
+done
+for ok in 0 1 600 999999999999999999; do
+  SMOKE_GATE_WARMUP_TIMEOUT="$ok" bash "$GATE" poll | jq -e '
+    .data.missing | index("SMOKE_GATE_WARMUP_TIMEOUT") == null
+  ' >/dev/null || { echo "pr gate num_env rejected the legitimate WARMUP_TIMEOUT='$ok'" >&2; exit 1; }
+done
+bash "$GATE" poll | jq -e '.data.missing | index("SMOKE_GATE_WARMUP_TIMEOUT") == null' >/dev/null
+export SMOKE_GATE_REPO=org/repo
+
 echo "smoke pr gate tests passed"

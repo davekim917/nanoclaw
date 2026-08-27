@@ -1367,6 +1367,49 @@ bash /workspace/agent/smoke-develop-gate.sh finish \
   <40-character-sha> <run-id> <GO|NO_GO|HUMAN_DECISION|BLOCKED>
 ```
 
+### Every alarm wake ends in a disposition
+
+`finish` closes a campaign. An **alarm** wake — any `wakeAgent:true` trigger
+that is not `develop_build_settled` — closes with `ack` instead, and closing it
+is not optional:
+
+```bash
+bash /workspace/agent/smoke-develop-gate.sh ack \
+  <trigger> <fingerprint> <resolved|acked|escalated> ['<one-line note>']
+```
+
+- `<trigger>` is `scriptOutput.trigger` verbatim.
+- `<fingerprint>` is `scriptOutput.data.fingerprint` **verbatim** — never one you
+  assemble yourself, and never the `reason`. Only the gate knows what separates
+  one incident from the next for a given trigger: the freeze helper emits the
+  same `reason` text for every branch collision on every SHA, and two of the
+  three preflight failure messages are fixed strings, so a reason-shaped
+  fingerprint silences unrelated later incidents. Every silenceable alarm — from
+  either gate — carries this field. Triggers with no `fingerprint` are not
+  silenceable; pass their most specific identifier (`holdRunId`, `runId`, the
+  missing variable name) for the record.
+- **`resolved`** — the condition is gone because of something you did. It never
+  silences: if the gate still sees the condition the claim was wrong, and the
+  alarm fires again.
+- **`acked`** — you looked, you posted, nothing more is owed and nobody needs
+  paging. Silences this trigger for this exact fingerprint until the TTL
+  (`SMOKE_GATE_ACK_MAX_SILENCE_SECONDS`, default 24h; `preflight_failed` uses
+  a shorter 12h window, because two of its three failure messages are fixed
+  strings). A changed or worsened condition is a different fingerprint and
+  alarms normally.
+- **`escalated`** — a human now owns it; say who you mentioned in the note.
+
+The response tells you what you actually got: `silencedUntil` is `null` when
+nothing was muted, and `silenceable:false` marks the alarms that are muted by
+nobody on purpose (`gate_misconfigured`, `gate_fetch_failed`,
+`develop_run_overrun`, `develop_hold_undecided`) — each of those is the only
+thing chasing a human or a broken deployment, so it keeps ringing.
+
+Why this exists: on 2026-08-25/26 one stuck freeze produced three identical
+`develop_freeze_failed` wakes exactly six hours apart. Each re-verified the
+same facts and posted the same message; none of them could close the incident,
+because there was no way to. Ending a wake with no disposition is the bug.
+
 The scheduled-task registration is runtime state created through `ncl`, not an
 in-tree core reach-in. Verify that integration with `ncl tasks get` plus one
 live gated fire that completes with no provider output; never reproduce the

@@ -1,0 +1,16 @@
+[Unit]
+Description=Publish workgroup deliverables to Google Drive daily
+
+[Timer]
+# Host is UTC; 07:00Z is 03:00 ET — after the release-night window that produces
+# most of the overnight churn, and before anyone reads the mirror.
+# Daily is the right cadence: these are durable RECORDS (ledgers, boards,
+# runbooks), not live telemetry, and the state file makes a no-change run cheap.
+OnCalendar=*-*-* 07:00:00
+# Unlike the 15-minute sibling timers, a missed fire here costs a full day of
+# staleness, so catch up after a reboot instead of waiting for tomorrow.
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target
