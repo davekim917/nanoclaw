@@ -668,6 +668,31 @@ describe('searchable projection', () => {
     expect(searchableText(file)).toBe('Maya Chen\nBody.\n');
   });
 
+  // A YAML comment is not a value, and the projection is documented as
+  // values-only. `- amplitude # migration notes` put "migration notes" into
+  // search material.
+  it('drops a trailing YAML comment from a tag, and from a title', () => {
+    expect(searchableText('---\ntype: domain\ntags:\n  - amplitude # migration notes\n---\n\nBody.\n')).toBe(
+      'amplitude\nBody.\n',
+    );
+    expect(searchableText('---\ntitle: Roster # stale, rewrite me\n---\n\nBody.\n')).toBe('Roster\nBody.\n');
+  });
+
+  // GUARD: `#` inside a quoted scalar is text, not a comment. Truncating there
+  // would lose real description prose.
+  it('keeps a hash inside a quoted value', () => {
+    expect(searchableText('---\ndescription: "Ticket #5 — the depletions fix"\n---\n\nBody.\n')).toBe(
+      '"Ticket #5 — the depletions fix"\nBody.\n',
+    );
+  });
+
+  // `tags: # none yet` is a key with a comment and no value. The sequence
+  // branch guarded this and the key branch did not, which is why the guard
+  // moved into the shared value reader.
+  it('treats a key whose whole value is a comment as having no value', () => {
+    expect(searchableText('---\ntags: # none yet\ntitle: Roster\n---\n\nBody.\n')).toBe('Roster\nBody.\n');
+  });
+
   it('is an allowlist: a key added later is not searchable by default', () => {
     const file = '---\ntype: person\nsome_future_key: highly distinctive phrase\n---\n\nBody.\n';
     expect(searchableText(file)).toBe('Body.\n');

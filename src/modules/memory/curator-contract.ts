@@ -671,6 +671,28 @@ const CONSOLIDATED_FACTS_LINE = new RegExp(`^${CONSOLIDATED_FACTS_KEY}:[ \\t]*\\
 const SEARCHABLE_FRONTMATTER_KEYS = ['title', 'description', 'tags'];
 
 /**
+ * The VALUE carried by one frontmatter line, with any trailing YAML comment
+ * removed. Shared by the ranker projection and the map, because both promise
+ * "values, not bookkeeping" and both were reading `- amplitude # migration
+ * notes` as the whole string — which put "migration notes" into search
+ * material and into a rendered map hook.
+ *
+ * ` #` starting a comment is YAML's own rule for an unquoted scalar, so
+ * `title: Release #5 planning` really does mean `Release`, and `tags: # none
+ * yet` really does mean no value at all. A value that opens with a quote is
+ * left alone: there the `#` is inside the scalar, and truncating it would lose
+ * real text. ponytail: that is the whole of the YAML we need here — no parser,
+ * and no quote-stripping either, since the ranker tokenizes and the map prints
+ * the value as written.
+ */
+function valueOf(text: string): string {
+  const value = text.trim();
+  if (/^["']/.test(value)) return value;
+  if (value.startsWith('#')) return '';
+  return value.replace(/\s+#.*$/, '').trimEnd();
+}
+
+/**
  * A memory file as the RANKER should see it: the body, plus the values of the
  * summary fields, and no field names at all.
  *
@@ -691,16 +713,18 @@ export function searchableText(content: string): string {
     const key = /^([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)$/.exec(line);
     if (key) {
       inside = SEARCHABLE_FRONTMATTER_KEYS.includes(key[1]!);
-      if (inside && key[2]!.trim().length > 0) summaries.push(key[2]!.trim());
+      const value = inside ? valueOf(key[2]!) : '';
+      if (value.length > 0) summaries.push(value);
       continue;
     }
     // `tags:` followed by an indented block sequence is the ordinary YAML
     // shape for a list, and its items are the labels — dropping them would
-    // make exactly the hand-tagged files unsearchable by their tags. A YAML
-    // comment is not a value.
+    // make exactly the hand-tagged files unsearchable by their tags. A whole
+    // comment line and the trailing half of one are both handled by valueOf,
+    // in one place rather than once per branch.
     if (!inside) continue;
-    const item = line.replace(/^[ \t]*-[ \t]*/, '').trim();
-    if (item.length > 0 && !item.startsWith('#')) summaries.push(item);
+    const item = valueOf(line.replace(/^[ \t]*-[ \t]*/, ''));
+    if (item.length > 0) summaries.push(item);
   }
   return summaries.length > 0 ? `${summaries.join('\n')}\n${body}` : body;
 }
@@ -708,7 +732,7 @@ export function searchableText(content: string): string {
 /** The value of one frontmatter field, or null. */
 export function frontmatterValue(content: string, key: string): string | null {
   const line = splitFrontmatter(content).keys.find((candidate) => candidate.startsWith(`${key}:`));
-  const value = line?.slice(key.length + 1).trim();
+  const value = line === undefined ? '' : valueOf(line.slice(key.length + 1));
   return value ? value : null;
 }
 

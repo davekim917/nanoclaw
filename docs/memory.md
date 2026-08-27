@@ -123,35 +123,47 @@ them at 2,107. Where a `## Map` the curator CREATES goes is its choice (after
 pointers still land past the bound — shortening what sits above them is an
 editorial call for a human, not something a background pass does by deletion.
 
-This is a merge, not a regeneration. What survives, stated exactly: headings,
-frontmatter, other sections, section ordering, fenced code blocks, HTML
-comments, HTML blocks, non-indented prose, nested sub-bullets, and hand-written
-Map links to files the curator does not own. Lines indented under a link the
-curator re-renders move WITH it, so a hand-written note keeps the entry it was
-written under rather than becoming a child of whatever ends up above it. The
-only thing that does not survive is trailing whitespace inside and after the
-managed section, which is normalized.
+This is a merge, not a regeneration. Headings, frontmatter, other sections,
+section ordering, fenced code blocks, HTML comments, non-indented prose, and
+hand-written Map links to files the curator does not own survive it. Trailing
+whitespace inside and after the managed section is normalized, and CRLF input
+becomes LF. Lines immediately indented under a link the curator re-renders move
+WITH it, so a hand-written note keeps the entry it was written under.
 
-A link is only ever removed on positive evidence its target is gone: a folder
-whose listing failed, a file that could not be read, and a name filtered out of
-a listing all keep their links. "Missing from a list we built" is not evidence
-— four separate bugs came from reading it as one, and `managedTargets` in
-`src/modules/memory/memory-index.ts` is where the rule now lives.
+**Index maintenance has known destructive bugs and is under review.** What
+follows says what is actually true today, which is less than earlier versions
+of this document claimed. Earlier text here promised that nothing
+hand-written is ever lost and that every misread construct merely duplicates a
+link; both were wrong, and an overclaim here is worse than a gap, because it
+turns a known limitation into an unknown one. Until this notice is removed,
+treat any construct not named below as unverified rather than safe.
 
-The merge is a line-walker, not a Markdown parser, and stays one deliberately:
-a real parser is a dependency, and its normalizing round-trip would rewrite
-bytes this merge exists to leave alone. A few constructs are therefore read
-imprecisely — none of them lose content, they add a duplicate link or a second
-section. A `> - [X](y.md)` in a blockquote, a `* [X](y.md)` star-marker bullet, a
-tab-indented bullet, and a `[X]: y.md` link reference definition are not
-recognized as the curator's, so a second link to the same target appears beside
-them; a setext `Map` / `---` heading is not recognized as the managed `## Map`,
-so a fresh one is appended at end of file (a setext heading INSIDE the section
-is recognized as a boundary, so nothing is hoisted across it); an HTML block
-runs from a tag-opening line to the next blank line, per CommonMark, so a blank
-line inside one resumes Markdown parsing. CRLF input is normalized to LF. Write
-map links as ordinary `- [Title](target.md)` bullets under an ATX `## Map`
-heading and none of that applies.
+A link _should_ only be removed on positive evidence its target is gone —
+`managedTargets` in `src/modules/memory/memory-index.ts` is that rule, and a
+folder whose listing failed, a file that could not be read, and a reserved name
+filtered out of a listing all keep their links. Two inputs to the rule are
+still wrong. The directory listing is taken _before_ the index file is read, so
+a topic file created in between is deleted from the map with a clean
+compare-and-swap and no retry; and a symlinked topic file is not counted as
+present, so a hand-written link to one is deleted while the file is still on
+disk.
+
+The merge is a line-walker, not a Markdown parser. Constructs it reads
+imprecisely _without_ losing content: a `> - [X](y.md)` in a blockquote, a
+`* [X](y.md)` star-marker bullet, a tab-indented bullet, and a `[X]: y.md` link
+reference definition are not recognized as the curator's, so a second link to
+the same target appears beside them; a setext `Map` / `---` heading is not
+recognized as the managed `## Map`, so a fresh one is appended at end of file (a
+setext heading _inside_ the section is a recognized boundary). Constructs where
+it **does** lose or move hand-written lines: an HTML block is protected only as
+far as the next blank line, so a bullet after a blank line inside a `<script>`
+or `<div>` block is deleted; an ATX heading indented one to three spaces is not
+treated as a section boundary, so bullets filed under it are hoisted above it;
+and a re-rendered bullet carries only its contiguous indented lines, so in a
+loose list the child after a blank line is left behind and reparented.
+
+Write map links as ordinary `- [Title](target.md)` bullets under an unindented
+ATX `## Map` heading and none of this reaches you.
 
 ## Selective background capture
 

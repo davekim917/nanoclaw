@@ -13,38 +13,55 @@ import { frontmatterValue, stripCuratorMetadata } from './curator-contract.js';
  * bullets that point at files it owns. Clobbering a hand-written Core Memory
  * section would be a worse bug than a stale map.
  *
- * What a merge preserves, stated exactly — this is NOT "byte for byte", and
- * saying so cost a review round: headings, frontmatter, other sections,
- * section ordering, fenced blocks, HTML blocks, non-indented prose, and
- * hand-written bullets whose target the curator does not claim all survive.
- * Trailing whitespace inside and after the managed section is normalized. The
- * lines indented under a bullet the curator re-renders MOVE WITH IT, so a
- * hand-written note keeps the parent it was written under.
+ * What a merge preserves — this is NOT "byte for byte", and saying so cost a
+ * review round: headings, frontmatter, other sections, section ordering,
+ * fenced blocks, non-indented prose, and hand-written bullets whose target the
+ * curator does not claim. Trailing whitespace inside and after the managed
+ * section is normalized. The lines immediately indented under a bullet the
+ * curator re-renders MOVE WITH IT, so a hand-written note keeps the parent it
+ * was written under — but only the contiguous run of them; see the destructive
+ * list below, which the "preserves" wording above does not override.
  *
  * This is a line-walker, not a Markdown parser, and it stays one deliberately:
  * a real parser is a new dependency and a normalizing round-trip through an
- * AST would rewrite bytes this module exists to leave alone. It is a merge
- * over a co-owned file, so its only hard duty is to never destroy a line
- * somebody else wrote — and every construct below that it does not understand
- * fails in the duplicate-a-link direction, never the delete-a-line direction.
+ * AST would rewrite bytes this module exists to leave alone.
  *
- * EXACTLY what it does not understand, verified by probing rather than
- * assumed. None of these lose content:
+ * READ THIS BEFORE TRUSTING THE LIST BELOW. An earlier version of this comment
+ * claimed the walker "never" deletes a line somebody else wrote and that every
+ * construct it misreads fails in the duplicate-a-link direction. Both claims
+ * were false, and a review round was spent discovering that from the code
+ * rather than from here. The list is what has been PROBED, not a guarantee:
+ * this is a hand-rolled line walker answering an unbounded question about
+ * arbitrary CommonMark, four review rounds have each found constructs the
+ * previous round did not name, and there is no reason to believe the list is
+ * finished. Treat an unlisted construct as unknown, not as safe.
+ *
+ * Known and non-destructive — a second link is appended beside the original:
  *
  *   - `> - [X](y.md)` in a blockquote, `* [X](y.md)` with a star marker, a
  *     tab-indented bullet, and a `[X]: y.md` link reference definition are not
- *     claimed, so a second link to the same target is appended beside them;
+ *     claimed;
  *   - a setext `Map\n---` heading is not recognized as the managed heading, so
  *     a fresh `## Map` section is appended at end of file instead of merging
- *     into it. A setext heading INSIDE the section is recognized as a section
- *     boundary, so the managed block is never hoisted across one;
- *   - an HTML block is anything from a line opening with a tag to the next
- *     blank line (CommonMark's type-6 rule). A tag-opened block that contains
- *     a blank line resumes being parsed as Markdown at that point;
- *   - list numbering, tables, and footnotes are ordinary lines to it.
+ *     into it. A setext heading INSIDE the section IS a recognized boundary.
  *
- * Write map links as plain `- [Title](target.md)` bullets under an ATX
- * heading and none of this matters. See docs/memory.md.
+ * Known and DESTRUCTIVE — these delete or reparent hand-written lines, and are
+ * open findings, not accepted behaviour:
+ *
+ *   - an HTML block is only protected up to the next blank line (CommonMark's
+ *     type-6 rule). A `<script>`/`<div>` block containing a blank line stops
+ *     being protected there, and a bullet after the blank INSIDE the block is
+ *     deleted;
+ *   - an ATX heading indented one to three spaces is valid CommonMark and is
+ *     not treated as a section boundary, so bullets filed under it are hoisted
+ *     above it;
+ *   - a re-rendered bullet carries only the CONTIGUOUS indented lines beneath
+ *     it. In a loose list the child after a blank line stays behind and is
+ *     reparented onto whatever ends up above it. Lazy continuations are never
+ *     carried.
+ *
+ * Write map links as plain `- [Title](target.md)` bullets under an unindented
+ * ATX heading and none of this reaches you. See docs/memory.md.
  */
 
 /** One rendered map bullet. */
