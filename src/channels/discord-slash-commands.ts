@@ -18,8 +18,8 @@
  * /update-container injects a synthetic chat message into the router
  * (routeInbound) carrying an audit prompt. The agent (running in a
  * container for the receiving messaging group) invokes the shared deterministic
- * audit/apply CLI, asks which exact items to bump, and keeps host and container
- * changes in separate approval and activation boundaries.
+ * audit/apply CLI, asks which exact items to bump, and keeps host, container,
+ * and bootstrap changes in separate approval and activation boundaries.
  */
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -257,6 +257,7 @@ export const UPDATE_CONTAINER_PROMPT = [
   'Present outdated items grouped by activation boundary:',
   '- host: host package.json/pnpm-lock changes; these require the host deploy flow after manual merge.',
   '- container: Docker pins and agent-runner Bun dependencies; these require an image rebuild after manual merge.',
+  '- bootstrap: Codex-synced files; these belong in a separate bootstrap-repository PR.',
   'Latest stable includes major versions. Show the exact item IDs and ask which IDs to update. This is the approval gate; do not clone, edit, branch, commit, push, or open a PR before the user answers.',
   '',
   // Added after @onecli-sh/sdk ^0.5.0 -> ^2.8.0 (#135) took the whole fleet down
@@ -272,7 +273,7 @@ export const UPDATE_CONTAINER_PROMPT = [
   "The JSON also carries `upstreamPolicy.source` (`git`, `snapshot`, or `unavailable`) and `upstreamPolicy.generatedAt`. Always report which source produced upstreamPin/heldByMerge: if `snapshot`, state the snapshot's age (now minus `generatedAt`) so staleness is visible; if `unavailable`, say the signal was unavailable rather than reporting parity — an absent field is not evidence of parity, it can equally mean no upstream remote, a shallow clone, or a snapshot older than 14 days.",
   '',
   'After approval, create writable clones. Never edit /workspace/project in place.',
-  'Keep host and container changes in separate NanoClaw PRs because their activation and rollback boundaries differ.',
+  'Keep host and container changes in separate NanoClaw PRs because their activation and rollback boundaries differ. Keep bootstrap changes in a separate bootstrap PR.',
   'In each NanoClaw clone, rerun the audit, then apply only the approved IDs:',
   '`bun scripts/container-updates.ts apply --repo <clone> --items <comma-separated-ids>`',
   '',
@@ -287,7 +288,7 @@ export const UPDATE_CONTAINER_PROMPT = [
   // runs its own codex for `codex plugin marketplace upgrade` (plugin-updater.ts),
   // and the operator works in it directly.
   '- Codex CLI: put the exact host-parity installation command in the PR checklist. Do not add a models-cache reset.',
-  'Show the final diff before committing. Commit and push only the validated, approved files, open the PR against davekim917/nanoclaw, verify the PR URL is in the intended repository, then stop.',
+  'Show the final diff before committing. Commit and push only the validated, approved files, open the PR against davekim917/nanoclaw (or davekim917/bootstrap), verify the PR URL is in the intended repository, then stop.',
   'Never merge, deploy, restart services, or build Docker from inside the agent container.',
 ].join('\n');
 

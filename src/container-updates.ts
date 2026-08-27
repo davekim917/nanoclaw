@@ -14,8 +14,9 @@ export type UpdateKind =
   | 'bun-dependency'
   | 'remotion-dependency'
   | 'dockerfile-pin'
+  | 'codex-sync'
   | 'plugin-version';
-export type UpdateSurface = 'host' | 'container' | 'plugins';
+export type UpdateSurface = 'host' | 'container' | 'bootstrap' | 'plugins';
 export type AuditStatus = 'current' | 'outdated' | 'unknown' | 'blocked';
 
 export interface AuditItem {
@@ -338,6 +339,10 @@ interface PluginUpdateSource {
 interface UpdateSourcesManifest {
   schemaVersion: 1;
   dockerfile: DockerUpdateSource[];
+  codex?: {
+    repo: string;
+    sourcesFile: string;
+  };
   plugins?: PluginUpdateSource[];
 }
 
@@ -574,6 +579,76 @@ async function firstReadable(paths: string[]): Promise<string | null> {
   return null;
 }
 
+async function auditCodexSources(manifest: UpdateSourcesManifest, fetchJson: JsonFetcher): Promise<AuditItem[]> {
+  if (!manifest.codex) return [];
+  const configured = process.env.NANOCLAW_CODEX_SOURCES;
+  const hostFallback = manifest.codex.sourcesFile.replace(
+    `${CONTAINER_PLUGINS_ROOT}/`,
+    `${path.join(homedir(), 'plugins')}/`,
+  );
+  const sourcePath = await firstReadable([
+    ...(configured ? [configured] : []),
+    manifest.codex.sourcesFile,
+    hostFallback,
+  ]);
+  if (!sourcePath) {
+    return [
+      {
+        id: 'codex-sync:sources',
+        name: 'Codex synced sources',
+        kind: 'codex-sync',
+        surface: 'bootstrap',
+        current: 'unavailable',
+        latest: null,
+        status: 'unknown',
+        source: 'github',
+        detail: `CODEX-SOURCES.md not found at ${manifest.codex.sourcesFile}`,
+      },
+    ];
+  }
+  const text = await readFile(sourcePath, 'utf8');
+  const rows = [...text.matchAll(/^\|\s*`([^`]+)`\s*\|\s*`([^`]+)`\s*\|\s*`([0-9a-f]{7,40})`\s*\|/gm)];
+  if (rows.length === 0) {
+    return [
+      {
+        id: 'codex-sync:sources',
+        name: 'Codex synced sources',
+        kind: 'codex-sync',
+        surface: 'bootstrap',
+        current: 'invalid',
+        latest: null,
+        status: 'blocked',
+        source: 'github',
+        detail: `no pinned source rows found in ${sourcePath}`,
+      },
+    ];
+  }
+  return Promise.all(
+    rows.map(async ([, local, upstream, current]): Promise<AuditItem> => {
+      const base = {
+        id: `codex-sync:${local}`,
+        name: local,
+        kind: 'codex-sync' as const,
+        surface: 'bootstrap' as const,
+        current,
+        source: 'github' as const,
+      };
+      const result = await audited(local, async () => {
+        const payload = await fetchJson(
+          `https://api.github.com/repos/${manifest.codex!.repo}/commits?path=${encodeURIComponent(upstream)}&per_page=1`,
+        );
+        const sha = Array.isArray(payload) && typeof payload[0]?.sha === 'string' ? payload[0].sha : null;
+        if (!sha) throw new Error('GitHub returned no commit SHA');
+        return sha.slice(0, current.length);
+      });
+      if (result instanceof Error) {
+        return { ...base, latest: null, status: 'unknown', detail: result.message };
+      }
+      return { ...base, latest: result, status: result === current ? 'current' : 'outdated' };
+    }),
+  );
+}
+
 /**
  * Plugin clones under `~/plugins` are versioned by their `.claude-plugin/plugin.json`
  * `version` field, not by a package registry — so compare the local clone against the
@@ -671,8 +746,11 @@ export async function auditRepository(
     }),
   );
 
-  const plugins = await auditPluginVersions(manifest, fetchJson);
-  return [...host, ...bun, ...remotion, ...docker, ...plugins].sort((a, b) => a.id.localeCompare(b.id));
+  const [codex, plugins] = await Promise.all([
+    auditCodexSources(manifest, fetchJson),
+    auditPluginVersions(manifest, fetchJson),
+  ]);
+  return [...host, ...bun, ...remotion, ...docker, ...codex, ...plugins].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function statusLabel(status: AuditStatus): string {
@@ -814,6 +892,9 @@ export async function applySelectedUpdates(options: {
   });
   const run = options.run ?? defaultRun;
   const fetchText = options.fetchText ?? defaultFetchText;
+  if (selected.some((item) => item.kind === 'codex-sync')) {
+    throw new Error('Codex sync updates target the bootstrap repository and must be applied there');
+  }
   if (selected.some((item) => item.kind === 'plugin-version')) {
     throw new Error('Plugin updates are applied with `git pull` in the plugin clone under ~/plugins');
   }
