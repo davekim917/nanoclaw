@@ -51,13 +51,29 @@ BAD_NUMERIC_CONFIG=""
 # SUBSHELL, so BAD_NUMERIC_CONFIG accumulated there and was empty in the
 # parent — the fallback worked, the alarm never fired. Caught by the test that
 # asserts the bad knob is named.
+#
+# "All digits" is NOT enough, and each of these was found admitted:
+#   - LEADING ZEROS. `$(( 0900 ))` is a fatal "value too great for base"
+#     (0900 is not octal), and `$(( 0100 ))` silently means 64, not 100. Worse,
+#     `[ x -ge 0100 ]` reads DECIMAL 100 — so the reported window and the
+#     effective window diverge with nothing saying so.
+#   - VALUES WIDER THAN int64. `[ x -ge 99999999999999999999 ]` is an error,
+#     which in an `if` degrades to false: a threshold that never fires. 18
+#     digits is the widest that cannot overflow a signed 64-bit compare.
+#   - SET BUT EMPTY. `X=` used to take the default WITHOUT being named, which
+#     contradicts this function's own contract. Only UNSET is silent now.
+# An accepted value must be usable in BOTH `$(( ))` arithmetic and `[ -ge ]`.
 num_env() {  # <target-var> <env-var-name> <default>
-  local raw="${!2:-}"
+  local raw
+  if [ -z "${!2+x}" ]; then printf -v "$1" '%s' "$3"; return; fi
+  raw="${!2}"
   case "$raw" in
-    '') printf -v "$1" '%s' "$3" ;;
-    *[!0-9]*) BAD_NUMERIC_CONFIG="$BAD_NUMERIC_CONFIG $2"; printf -v "$1" '%s' "$3" ;;
-    *) printf -v "$1" '%s' "$raw" ;;
+    0) printf -v "$1" '%s' "$raw"; return ;;
+    ''|*[!0-9]*|0*) ;;
+    *) if [ "${#raw}" -le 18 ]; then printf -v "$1" '%s' "$raw"; return; fi ;;
   esac
+  BAD_NUMERIC_CONFIG="$BAD_NUMERIC_CONFIG $2"
+  printf -v "$1" '%s' "$3"
 }
 
 num_env DEBOUNCE_SECONDS SMOKE_GATE_DEBOUNCE_SECONDS 600
@@ -178,6 +194,12 @@ num_env FREEZE_STALE_SECONDS SMOKE_GATE_FREEZE_STALE_SECONDS 14400
 # (default, no behavior change for existing deployments); the wrapper sets the
 # policy. Counted from the last freeze OPEN, so campaign duration eats into it.
 num_env FREEZE_MIN_INTERVAL_SECONDS SMOKE_GATE_FREEZE_MIN_INTERVAL_SECONDS 0
+# Read HERE, not inline at the `timeout` call site. A use-site `${VAR:-90}`
+# bypasses num_env entirely: `timeout abc` exits 125, the stderr is swallowed
+# by the call's own `2>/dev/null`, FREEZE_JSON comes back empty, and the gate
+# reports a SILENCEABLE `develop_freeze_failed` instead of the unsilenceable
+# `gate_misconfigured` that names the broken knob.
+num_env FREEZE_HELPER_TIMEOUT SMOKE_GATE_FREEZE_HELPER_TIMEOUT 90
 # `check` runs the poll derivation and reports settledness WITHOUT mutating
 # state or claiming anything. It exists for human-requested campaigns, which
 # freeze on a person's word rather than on a gate wake and would otherwise
@@ -1794,7 +1816,7 @@ if [ "$FREEZE_HANDOFF" = true ]; then
   # holding the state lock, so a hung forge would have wedged the gate for as
   # long as the call hung rather than for a bounded window. Exit 124 falls
   # straight into the throttled freeze-failure alarm below.
-  FREEZE_JSON="$(timeout "${SMOKE_GATE_FREEZE_HELPER_TIMEOUT:-90}" "$FREEZE_HELPER" "$SOURCE_SHA" 2>/dev/null)"
+  FREEZE_JSON="$(timeout "$FREEZE_HELPER_TIMEOUT" "$FREEZE_HELPER" "$SOURCE_SHA" 2>/dev/null)"
   FREEZE_RC=$?
   # TYPE, not just presence. `has("prNumber")` passed a helper returning
   # `"prNumber":"abc"` at rc 0, and the success path's `--argjson pr` then

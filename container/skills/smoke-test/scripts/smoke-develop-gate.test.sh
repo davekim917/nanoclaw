@@ -1457,6 +1457,27 @@ SMOKE_GATE_ACK_MAX_SILENCE_SECONDS=abc bash "$GATE" poll | jq -e '
   .data.trigger == "gate_misconfigured" and
   (.data.missing | index("SMOKE_GATE_ACK_MAX_SILENCE_SECONDS") != null)
 ' >/dev/null
+# ...and "all digits" is NOT the acceptance rule. Each of these was ADMITTED by
+# the digits-only check and is a distinct silent failure — see num_env's own
+# comment. A knob that reaches `$(( ))` or `[ -ge ]` in one of these shapes
+# either kills the expression or means a different number than it reads as.
+for bad in 0900 0100 05900 99999999999999999999 ""; do
+  SMOKE_GATE_MERGE_HOLD_SECONDS="$bad" bash "$GATE" poll | jq -e '
+    .data.trigger == "gate_misconfigured" and
+    (.data.missing | index("SMOKE_GATE_MERGE_HOLD_SECONDS") != null)
+  ' >/dev/null || { echo "num_env admitted MERGE_HOLD_SECONDS='$bad'" >&2; exit 1; }
+done
+# ...while a legitimate value — including a bare 0, which several knobs use as
+# "feature off" — is accepted silently. Rejecting these would be the opposite
+# bug: an alarm that fires on a correct deployment is one nobody reads.
+for ok in 0 1 5400 999999999999999999; do
+  SMOKE_GATE_MERGE_HOLD_SECONDS="$ok" bash "$GATE" poll | jq -e '
+    .data.missing | index("SMOKE_GATE_MERGE_HOLD_SECONDS") == null
+  ' >/dev/null || { echo "num_env rejected the legitimate MERGE_HOLD_SECONDS='$ok'" >&2; exit 1; }
+done
+# An UNSET knob is silent — only a knob someone actually deployed can be
+# misconfigured, and naming an unset one would name every default on the box.
+bash "$GATE" poll | jq -e '.data.missing | index("SMOKE_GATE_MERGE_HOLD_SECONDS") == null' >/dev/null
 export SMOKE_GATE_REPO=org/repo
 
 # --- 54. A wrong-TYPED freeze helper payload must not wedge the gate -------
@@ -1489,7 +1510,26 @@ for t in pr_preflight_failed pr_migrations_refused pr_warmup_stuck pr_facts_unav
 done
 # Every pr_* trigger this gate accepts must emit from the PR gate, and none of
 # them may be silenceable here.
-for t in $(grep -oP '^ACK_TRIGGERS="\K[\s\S]*?(?=")' "$GATE" | tr -s ' \n' ' ' | tr ' ' '\n' | grep '^pr_'); do
+#
+# The extraction MUST be multiline. `grep -oP '^ACK_TRIGGERS="\K[\s\S]*?(?=")'`
+# is line-oriented — `[\s\S]*?` cannot span lines — and ACK_TRIGGERS is a
+# multi-line declaration, so it matched NOTHING and the loop below ran ZERO
+# times. A reviewer renamed the emitted `pr_warmup_stuck` to an unaccepted
+# `warmup_stuck` and both suites still passed. `-z` treats the file as one
+# NUL-terminated record, so `[^"]+` spans newlines.
+ACK_TRIGGER_LIST="$(grep -zoP 'ACK_TRIGGERS="\K[^"]+' "$GATE" | tr -d '\0' | tr -s ' \n' ' ')"
+# A parity loop that iterates zero times must fail loudly, not pass. Assert the
+# extraction actually recovered the triggers the loop is supposed to walk —
+# a partial or empty extraction is the failure mode this whole case exists for.
+[ -n "$ACK_TRIGGER_LIST" ] \
+  || { echo "ACK_TRIGGERS extraction produced nothing — the parity loop below cannot fail" >&2; exit 1; }
+for t in pr_preflight_failed pr_migrations_refused pr_warmup_stuck pr_facts_unavailable pr_run_overrun; do
+  case " $ACK_TRIGGER_LIST " in
+    *" $t "*) ;;
+    *) echo "ACK_TRIGGERS extraction lost $t — the parity loop below cannot fail" >&2; exit 1 ;;
+  esac
+done
+for t in $(printf '%s\n' $ACK_TRIGGER_LIST | grep '^pr_'); do
   grep -q "\"$t\"" "$SCRIPT_DIR/smoke-pr-gate.sh" \
     || { echo "develop gate accepts $t but the pr gate never emits it" >&2; exit 1; }
   case " $(grep -oP '^ACK_SILENCEABLE="\K[^"]+' "$GATE") " in
@@ -1501,6 +1541,16 @@ done
 for g in "$GATE" "$SCRIPT_DIR/smoke-pr-gate.sh"; do
   if grep -qP '^[A-Z_]+="\$\{?SMOKE_GATE_[A-Z_]+:-[0-9]+\}?"' "$g"; then
     echo "$(basename "$g") reads a numeric knob without num_env" >&2; exit 1
+  fi
+  # ...and ANYWHERE, not just in a top-level assignment. The regex above
+  # anchors on `^NAME="${VAR:-N}"` and structurally cannot see a use-site
+  # default inside a command substitution — which is exactly where
+  # SMOKE_GATE_FREEZE_HELPER_TIMEOUT hid: `timeout "${VAR:-90}"` bypassed
+  # num_env, so `timeout abc` exited 125 into a silenceable freeze-failure
+  # alarm instead of naming the knob in gate_misconfigured.
+  if grep -qP 'SMOKE_GATE_[A-Z_]+:-[0-9]+' "$g"; then
+    echo "$(basename "$g") defaults a numeric knob at a USE SITE, bypassing num_env:" >&2
+    grep -nP 'SMOKE_GATE_[A-Z_]+:-[0-9]+' "$g" >&2; exit 1
   fi
   grep -q 'MISSING="\$MISSING\$BAD_NUMERIC_CONFIG"' "$g" \
     || { echo "$(basename "$g") never reports a bad numeric knob" >&2; exit 1; }

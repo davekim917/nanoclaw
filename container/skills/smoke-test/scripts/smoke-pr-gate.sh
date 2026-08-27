@@ -47,13 +47,21 @@ BAD_NUMERIC_CONFIG=""
 # SUBSHELL, so BAD_NUMERIC_CONFIG accumulated there and was empty in the
 # parent — the fallback worked, the alarm never fired. Caught by the test that
 # asserts the bad knob is named.
+#
+# "All digits" is NOT enough — see the same function in smoke-develop-gate.sh
+# for the three admitted classes (leading zeros, wider than int64, set-but-
+# empty). Ported verbatim per INVARIANT 3.
 num_env() {  # <target-var> <env-var-name> <default>
-  local raw="${!2:-}"
+  local raw
+  if [ -z "${!2+x}" ]; then printf -v "$1" '%s' "$3"; return; fi
+  raw="${!2}"
   case "$raw" in
-    '') printf -v "$1" '%s' "$3" ;;
-    *[!0-9]*) BAD_NUMERIC_CONFIG="$BAD_NUMERIC_CONFIG $2"; printf -v "$1" '%s' "$3" ;;
-    *) printf -v "$1" '%s' "$raw" ;;
+    0) printf -v "$1" '%s' "$raw"; return ;;
+    ''|*[!0-9]*|0*) ;;
+    *) if [ "${#raw}" -le 18 ]; then printf -v "$1" '%s' "$raw"; return; fi ;;
   esac
+  BAD_NUMERIC_CONFIG="$BAD_NUMERIC_CONFIG $2"
+  printf -v "$1" '%s' "$3"
 }
 
 num_env ACTIVE_STALE_SECONDS SMOKE_GATE_ACTIVE_STALE_SECONDS 14400
