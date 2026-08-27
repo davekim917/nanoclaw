@@ -37,6 +37,8 @@ export interface BacklogItem {
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
+  /** External tracker URL, present for ephemeral GitHub Issues digest rows. */
+  url?: string;
 }
 
 export interface CommitDigestState {

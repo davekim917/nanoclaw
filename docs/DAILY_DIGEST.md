@@ -1,17 +1,17 @@
 # Daily Digest
 
-v2 supports daily digests two ways: a built-in host-side default (covers
-ship_log + backlog automatically for every wired group) and an agent-driven
-pattern (richer per-group content via `ncl tasks create`). They coexist —
-pick the one that fits the use case, or run both.
+v2 supports daily digests two ways: a built-in host-side summary for
+workgroups whose Codex poster explicitly opts in, and an agent-driven pattern
+(richer per-group content via `ncl tasks create`). They coexist — pick the one
+that fits the use case, or run both.
 
-## Path A — Host-side daily summary (default)
+## Path A — Host-side daily summary (opt-in)
 
 Shipped at `src/daily-summary.ts`. Runs a 5-min tick on the host; fires
-once a day per agent group at the configured hour-in-TZ, posts a digest
-to the group's wired channel. Skips groups with no recent activity. No
-per-group setup required — runs out of the box for every agent group
-already wired to a channel.
+once a day per opted-in workgroup at the configured hour-in-TZ, posts a
+digest to the Codex poster's configured channel, and skips groups with no
+recent activity. Opt in with `dailySummary.messagingGroupId`; there is no
+primary-channel fallback.
 
 **What it includes:**
 
@@ -22,6 +22,36 @@ already wired to a channel.
   and `resolved_at >= since`.
 - **📌 Open Backlog** — all `open` + `in_progress` backlog items, with
   priority emoji + an `[in progress]` suffix.
+
+### GitHub Issues as the backlog source
+
+Set `dailySummary.githubIssuesRepo` on the workgroup's Codex poster to use a
+single GitHub repository (`owner/repo`) for both backlog sections. The host
+fetches every open issue page and recently closed issues, excludes pull
+requests, and renders open rows as linked `#number title` entries in the
+existing digest thread. Severity labels map as `severity:p0`/`p1` → high,
+`p2` → medium, and `p3` → low; only `in progress` or `status:in_progress`
+marks an issue in progress.
+
+When configured, GitHub is authoritative: the host never falls back to
+`backlog_items`. A missing credential, authentication failure, or open-issues
+fetch failure logs a warning and uses empty backlog and resolved lists, while
+independent ship-log sections may still post. If only the closed-history fetch
+fails after open issues were fetched, the host preserves that open backlog and
+uses an empty resolved list. The poster resolves GitHub auth through its
+configured `githubTokenEnv`, credential-folder scoped token, global token, or
+GitHub App sentinel—the same chain used for its container.
+
+```json
+"dailySummary": {
+  "messagingGroupId": "mg-1700000000000-example11",
+  "githubIssuesRepo": "davekim917/nanoclaw"
+}
+```
+
+Do not also schedule an agent-driven GitHub backlog digest for that same
+channel: scheduled-task replies are separate messages, while this source keeps
+the list under the host summary's parent message.
 
 **Sections are omitted when empty.** A group whose all-three are empty
 gets no message that day.
@@ -41,10 +71,10 @@ gets no message that day.
 | `DAILY_SUMMARY_HOUR` | `8` | Local hour (0–23) in `DAILY_SUMMARY_TZ`. |
 | `DAILY_SUMMARY_TZ` | `America/New_York` | IANA TZ string. |
 
-**Config — per-group override:** by default the digest goes to the
-agent group's primary wired channel (highest `mga.priority`, oldest
-tiebreak). To target a different wired channel, set
-`dailySummary.messagingGroupId` in the group's `container.json`:
+**Config — explicit per-group opt-in:** set `dailySummary.messagingGroupId`
+in the workgroup's Codex poster `container.json`. This is both the opt-in
+and destination channel; the host does not fall back to the group's primary
+wired channel:
 
 ```json
 "dailySummary": {
@@ -59,8 +89,8 @@ SELECT id, channel_type, platform_id, name FROM messaging_groups
 WHERE name LIKE '%channel-name%';
 ```
 
-Example: example-labs's `container.json` routes the digest to Slack
-`#agents-example` even though Discord is the primary wiring.
+Example: example-labs's `container.json` opts its digest into Slack
+`#agents-example`.
 
 **State:** `data/daily-summary-state.json` tracks the
 `lastFiredDateKey` (YYYY-MM-DD in TZ) so a host restart on the same day
@@ -72,9 +102,10 @@ host-side timers.
 
 ## Path B — Agent-driven digest (richer content)
 
-The host-side default covers `ship_log` + `backlog`. If you want the
-digest to pull from other sources — auto-memories, recent threads, `git
-log`, `gh pr list`, MCP tools — schedule it through the agent instead.
+The host-side summary covers `ship_log` + `backlog` when a Codex poster opts
+in. If you want the digest to pull from other sources — auto-memories, recent
+threads, `git log`, `gh pr list`, MCP tools — schedule it through the agent
+instead.
 
 In the chat where you want the digest delivered, say something like:
 
@@ -107,7 +138,7 @@ doesn't read.
 
 | Need | Path |
 |---|---|
-| Default coverage for all groups, zero setup | A |
+| Basic ship_log + backlog summary for an opted-in Codex poster | A |
 | Custom prompt per group | B |
 | Sources beyond ship_log + backlog (memories, threads, git, gh) | B |
 | Strict cost ceiling (no agent tokens per fire) | A |

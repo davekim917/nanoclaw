@@ -35,12 +35,14 @@ import path from 'path';
 import { DATA_DIR } from './config.js';
 import { splitForLimit } from './channels/chat-sdk-bridge.js';
 import { readContainerConfig } from './container-config.js';
+import type { ContainerConfig } from './container-config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { getBacklog, getBacklogResolvedSince, getShipLogSince } from './db/backlog.js';
 import type { BacklogItem, ShipLogEntry } from './db/backlog.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { getDeliveryAdapter } from './delivery.js';
 import type { ChannelDeliveryAdapter } from './delivery.js';
+import { resolveGitHubToken } from './github-token.js';
 import { log } from './log.js';
 import type { AgentGroup, MessagingGroup } from './types.js';
 
@@ -76,6 +78,11 @@ export function stopDailySummary(): void {
 /** Exposed for tests — runs one tick synchronously and returns. */
 export async function _tickForTest(): Promise<void> {
   await runTick();
+}
+
+/** Exposed for focused source-selection regression tests. */
+export async function _fireDigestsForTest(): Promise<void> {
+  await fireDigests();
 }
 
 /**
@@ -163,10 +170,11 @@ async function fireDigests(): Promise<void> {
       const target = resolveTarget(poster);
       if (!target) continue; // no dailySummary override → workgroup opted out
 
-      const summary = buildSummary(members, since);
+      const posterConfig = readContainerConfig(poster.folder);
+      const summary = await buildSummary(members, since, poster, posterConfig);
       if (isEmpty(summary)) continue;
 
-      const dailySummaryConfig = readContainerConfig(poster.folder).dailySummary;
+      const dailySummaryConfig = posterConfig.dailySummary;
       const includeShipLog = dailySummaryConfig?.shipLog !== false;
       const includeResolved = dailySummaryConfig?.resolved !== false;
       const includeBacklog = dailySummaryConfig?.backlog !== false;
@@ -251,30 +259,187 @@ interface Summary {
 
 /**
  * Aggregate one workgroup's activity across all sibling agent groups, dedupe,
- * and split shipped work by source. ship_log + backlog are per-agent-group, and
- * commit-scan can write the same default-branch commit into more than one
- * sibling's ship_log (siblings share repos via the workgroup symlink overlay),
- * so dedupe is load-bearing, not cosmetic.
+ * and split shipped work by source. `ship_log` remains per-agent-group. When
+ * the Codex poster declares a GitHub Issues repo, that repo is the sole source
+ * of backlog state: legacy SQLite rows are deliberately not read or used as a
+ * fallback, because they may be stale after a tracker migration.
  */
-function buildSummary(members: AgentGroup[], since: string): Summary {
+async function buildSummary(
+  members: AgentGroup[],
+  since: string,
+  poster: AgentGroup,
+  posterConfig: ContainerConfig,
+): Promise<Summary> {
   const shipped: ShipLogEntry[] = [];
-  const resolved: BacklogItem[] = [];
-  const openBacklog: BacklogItem[] = [];
   for (const m of members) {
     shipped.push(...getShipLogSince(m.id, since));
-    resolved.push(...getBacklogResolvedSince(m.id, since));
-    openBacklog.push(...getBacklog(m.id, 'in_progress'), ...getBacklog(m.id, 'open'));
   }
 
   const dedupedShipped = dedupeBy(shipped, (e) => e.pr_url || `${e.title} ${e.shipped_at}`);
-  const dedupedResolved = dedupeBy(resolved, (i) => i.id);
-  const dedupedOpen = dedupeBy(openBacklog, (i) => i.id);
+  const githubIssuesRepo = posterConfig.dailySummary?.githubIssuesRepo;
+  const backlog =
+    githubIssuesRepo !== undefined
+      ? await buildGitHubIssueBacklog(poster, posterConfig, githubIssuesRepo, since)
+      : buildLegacyBacklog(members, since);
 
   return {
     agentShipped: dedupedShipped.filter((e) => !isCommitScanEntry(e)),
     otherCommits: dedupedShipped.filter((e) => isCommitScanEntry(e)),
-    resolved: dedupedResolved,
-    openBacklog: dedupedOpen,
+    resolved: backlog.resolved,
+    openBacklog: backlog.openBacklog,
+  };
+}
+
+function buildLegacyBacklog(members: AgentGroup[], since: string): Pick<Summary, 'resolved' | 'openBacklog'> {
+  const resolved: BacklogItem[] = [];
+  const openBacklog: BacklogItem[] = [];
+  for (const m of members) {
+    resolved.push(...getBacklogResolvedSince(m.id, since));
+    openBacklog.push(...getBacklog(m.id, 'in_progress'), ...getBacklog(m.id, 'open'));
+  }
+  return {
+    resolved: dedupeBy(resolved, (i) => i.id),
+    openBacklog: dedupeBy(openBacklog, (i) => i.id),
+  };
+}
+
+async function buildGitHubIssueBacklog(
+  poster: AgentGroup,
+  config: ContainerConfig,
+  repo: string,
+  since: string,
+): Promise<Pick<Summary, 'resolved' | 'openBacklog'>> {
+  const credentialFolder = config.credentialFolder ?? poster.folder;
+  try {
+    const token = await resolveGitHubToken(credentialFolder, config);
+    if (!token) throw new Error('No GitHub token resolved for configured daily summary');
+    const [owner, name] = parseGitHubIssuesRepo(repo);
+    const open = (await fetchGitHubIssuePages(owner, name, token, 'open')).filter((issue) => !issue.pull_request);
+    let closed: GitHubIssue[] = [];
+    try {
+      closed = (await fetchGitHubIssuePages(owner, name, token, 'closed', since)).filter(
+        (issue) => !issue.pull_request,
+      );
+    } catch (err) {
+      // Closed history is supplemental. Keep a successfully fetched current
+      // backlog in its existing thread, but never replace the missing resolved
+      // section with legacy SQLite rows.
+      log.warn('Daily summary GitHub Issues resolved fetch failed; using empty GitHub resolved list', {
+        posterAgentGroupId: poster.id,
+        repo,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return {
+      openBacklog: open.map((issue) => mapGitHubIssue(issue, repo, poster.id)),
+      resolved: closed
+        .filter((issue) => issue.closed_at !== null && Date.parse(issue.closed_at) >= Date.parse(since))
+        .map((issue) => mapGitHubIssue(issue, repo, poster.id)),
+    };
+  } catch (err) {
+    // A configured tracker is authoritative. Falling back to SQLite here would
+    // re-post rows that were intentionally migrated away, so fail closed while
+    // preserving any independent ship-log sections in the parent digest.
+    log.warn('Daily summary GitHub Issues backlog fetch failed; using empty GitHub backlog', {
+      posterAgentGroupId: poster.id,
+      repo,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { resolved: [], openBacklog: [] };
+  }
+}
+
+interface GitHubIssue {
+  id: number;
+  number: number;
+  title: string;
+  body: string | null;
+  state: 'open' | 'closed';
+  html_url: string;
+  created_at: string;
+  updated_at: string;
+  closed_at: string | null;
+  labels: Array<{ name?: string } | string>;
+  pull_request?: unknown;
+}
+
+function parseGitHubIssuesRepo(repo: string): [string, string] {
+  const match = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(repo);
+  if (!match) throw new Error(`Invalid dailySummary.githubIssuesRepo: ${repo}`);
+  return [match[1], match[2]];
+}
+
+async function fetchGitHubIssuePages(
+  owner: string,
+  repo: string,
+  token: string,
+  state: 'open' | 'closed',
+  since?: string,
+): Promise<GitHubIssue[]> {
+  const expectedPath = `/repos/${owner}/${repo}/issues`;
+  const first = new URL(`https://api.github.com${expectedPath}`);
+  first.searchParams.set('state', state);
+  first.searchParams.set('per_page', '100');
+  first.searchParams.set('page', '1');
+  if (since) first.searchParams.set('since', since);
+
+  const issues: GitHubIssue[] = [];
+  let next: URL | null = first;
+  while (next) {
+    const response = await fetch(next, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'nanoclaw-daily-summary',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) throw new Error(`GitHub returned ${response.status} for ${state} issues`);
+    const page = (await response.json()) as unknown;
+    if (!Array.isArray(page)) throw new Error(`GitHub returned a non-array ${state} issues response`);
+    issues.push(...(page as GitHubIssue[]));
+    next = nextGitHubIssuePage(response.headers.get('link'), expectedPath);
+  }
+  return issues;
+}
+
+function nextGitHubIssuePage(linkHeader: string | null, expectedPath: string): URL | null {
+  if (!linkHeader) return null;
+  const nextMatch = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+  if (!nextMatch) return null;
+  const next = new URL(nextMatch[1]);
+  if (next.origin !== 'https://api.github.com' || next.pathname !== expectedPath) {
+    throw new Error('GitHub returned an unexpected issues pagination URL');
+  }
+  return next;
+}
+
+function mapGitHubIssue(issue: GitHubIssue, repo: string, agentGroupId: string): BacklogItem {
+  const labels = issue.labels.map((label) => (typeof label === 'string' ? label : (label.name ?? ''))).filter(Boolean);
+  const normalizedLabels = labels.map((label) => label.toLowerCase());
+  const priority =
+    normalizedLabels.includes('severity:p0') || normalizedLabels.includes('severity:p1')
+      ? 'high'
+      : normalizedLabels.includes('severity:p2')
+        ? 'medium'
+        : normalizedLabels.includes('severity:p3')
+          ? 'low'
+          : 'medium';
+  const inProgress = normalizedLabels.includes('in progress') || normalizedLabels.includes('status:in_progress');
+  return {
+    id: `github:${repo}#${issue.number}`,
+    agent_group_id: agentGroupId,
+    title: `#${issue.number} ${issue.title}`,
+    description: issue.body,
+    status: issue.state === 'closed' ? 'resolved' : inProgress ? 'in_progress' : 'open',
+    priority,
+    tags: JSON.stringify(labels),
+    notes: null,
+    created_at: issue.created_at,
+    updated_at: issue.updated_at,
+    resolved_at: issue.closed_at,
+    url: issue.html_url,
   };
 }
 
@@ -357,7 +522,7 @@ export function formatDigestParts(
     lines.push('', `✅ **Resolved** (${s.resolved.length}):`);
     for (const item of s.resolved) {
       const emoji = item.status === 'resolved' ? '✅' : '🚫';
-      lines.push(`${emoji} ${item.title}`);
+      lines.push(`${emoji} ${formatBacklogItemTitle(item)}`);
     }
   }
 
@@ -389,12 +554,12 @@ export function formatBacklogThread(items: BacklogItem[]): string {
   const top = ranked.slice(0, 3);
   const lines: string[] = ['📌 **Open Backlog — ranked**', ''];
   if (top.length > 0) {
-    lines.push(`👉 **Address first:** ${top.map((i) => truncate(i.title, 60)).join(' · ')}`, '');
+    lines.push(`👉 **Address first:** ${top.map((i) => formatBacklogItemTitle(i, 60)).join(' · ')}`, '');
   }
   for (const item of ranked) {
     const pri = item.priority === 'high' ? '🔴' : item.priority === 'medium' ? '🟡' : '⚪';
     const suffix = item.status === 'in_progress' ? ' · in progress' : '';
-    lines.push(`${pri} ${item.title} · ${ageDays(item.created_at)}d${suffix}`);
+    lines.push(`${pri} ${formatBacklogItemTitle(item)} · ${ageDays(item.created_at)}d${suffix}`);
     if (item.description) lines.push(`    ↳ ${truncate(item.description, 140)}`);
   }
   return lines.join('\n');
@@ -419,6 +584,12 @@ function ageDays(createdAt: string): number {
 function truncate(text: string, max: number): string {
   const oneLine = text.replace(/\s+/g, ' ').trim();
   return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}…`;
+}
+
+function formatBacklogItemTitle(item: BacklogItem, max = 140): string {
+  const title = truncate(item.title, max);
+  if (!item.url) return title;
+  return `[${title.replace(/[\\[\]]/g, '\\$&')}](${item.url})`;
 }
 
 /**
