@@ -4,13 +4,22 @@ import fs from 'fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { CAPABILITY_STATE } = vi.hoisted(() => ({
+const { CAPABILITY_STATE, TEST_DATA_DIR } = vi.hoisted(() => ({
   CAPABILITY_STATE: { revision: 'initial' },
+  // This file's fixtures rmSync their own subtrees of DATA_DIR, so a constant
+  // path made any two concurrent runs — from any two worktrees on the host —
+  // delete each other's session directories mid-test. Measured: 20-33 of ~50
+  // tests failing non-deterministically with SQLITE_READONLY_DBMOVED and
+  // friends, in both directions, which is untrustworthy green as well as red.
+  // ponytail: pid, not mkdtempSync — the hoisted factory runs before the `fs`
+  // import is initialized, and one root per process is all this needs. Switch
+  // to mkdtemp if a single process ever needs two.
+  TEST_DATA_DIR: `/tmp/nanoclaw-test-write-outbound-${process.pid}`,
 }));
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-write-outbound' };
+  return { ...actual, DATA_DIR: TEST_DATA_DIR };
 });
 
 vi.mock('./capabilities.js', async (importOriginal) => {
@@ -144,7 +153,7 @@ describe('threadWorktreeDir', () => {
  * open call reverts to the readonly form.
  */
 describe('writeOutboundDirect', () => {
-  const TEST_DIR = '/tmp/nanoclaw-test-write-outbound';
+  const TEST_DIR = TEST_DATA_DIR;
   const AG = 'ag-test';
   const SESS = 'sess-test';
 
@@ -413,7 +422,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
   });
 
   it('emits one bootstrap per provider context epoch and suppresses unchanged warm evidence', async () => {
-    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'facts'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
     fs.writeFileSync(path.join(memoryRoot, 'facts', 'owner.md'), '# Deployment owner\nJordan owns deployment.');
@@ -483,7 +492,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
   });
 
   it('treats input queued behind a pending clear as a fresh provider context', async () => {
-    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'facts'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
     fs.writeFileSync(path.join(memoryRoot, 'facts', 'owner.md'), '# Deployment owner\nJordan owns deployment.');
@@ -548,7 +557,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
   });
 
   it('does not repeat the bootstrap after more than 256 recall rows in one provider epoch', async () => {
-    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(memoryRoot, { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nBootstrap once.');
     const message = (id: string) => ({
@@ -708,7 +717,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     const scheduledBefore = db
       .prepare('SELECT status, trigger FROM messages_in WHERE id = ?')
       .get('task-before-upgrade');
-    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nupgrade-cutover context');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh upgrade context');
@@ -824,7 +833,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       );
     legacy.close();
 
-    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nlegacy upgrade context');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh legacy context');
@@ -895,7 +904,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       content: JSON.stringify({ prompt: 'use the current task context' }),
     });
 
-    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nfirst-fire context written after scheduling');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh on every admission');
@@ -1003,7 +1012,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       series_id: 'task-recurring-original',
     };
     insertRecurrence(db, original, 'task-recurring-next', '2020-01-02T00:00:00.000Z');
-    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nrecurrence memory written after cloning');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh on every admission');
@@ -1038,7 +1047,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
   });
 
   it('replaces crashed-turn recall with current memory and capabilities when backoff becomes due', async () => {
-    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
     fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nmemory before crash');
     fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh retry context');
@@ -1272,7 +1281,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
 // clock the reaper reads must survive it, including across a crash mid-pass.
 describe('session migration pass preserves the idle clock', () => {
   const MIGRATION_AG = 'ag-mtime';
-  const DATA_DIR = '/tmp/nanoclaw-test-write-outbound';
+  const DATA_DIR = TEST_DATA_DIR;
   const OLD_SECONDS = Date.parse('2026-04-01T00:00:00.000Z') / 1000;
 
   beforeEach(() => {
@@ -1643,7 +1652,7 @@ describe('threadWorktreeDir — workgroup namespace', () => {
 });
 
 describe('the shared-transcript migration is gone', () => {
-  const TEST_DIR = '/tmp/nanoclaw-test-write-outbound';
+  const TEST_DIR = TEST_DATA_DIR;
   const LAZY_AG = 'ag-lazy';
   const LAZY_SESS = 'sess-lazy';
   const sharedProjects = path.join(TEST_DIR, 'v2-sessions', LAZY_AG, '.claude-shared', 'projects', '-workspace-agent');
