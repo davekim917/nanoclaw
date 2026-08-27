@@ -18,7 +18,9 @@
  * --backup-dir is REQUIRED for --apply. Each workgroup's whole memory tree is
  * snapshotted there before anything is written, because this is a one-shot
  * pass over hand-written memory with no other undo, and it CREATES index files
- * as well as rewriting them — so a per-file copy would not be restorable.
+ * as well as rewriting them — so a per-file copy would not be restorable. A
+ * finished snapshot is marked by a `<wg>.complete` file beside it; a `<wg>`
+ * directory without one is refused rather than trusted (see `snapshot`).
  *
  *   restore:  rm -rf data/workgroups/<wg>/memory
  *             cp -a <backup-dir>/<wg> data/workgroups/<wg>/memory
@@ -70,27 +72,64 @@ if (apply && backupDir === null) {
  * A per-file copy taken at write time cannot be an undo: this pass also
  * CREATES index files, and there is no original to copy for those — a restore
  * has to delete them. One `cp -a` of the tree covers modified, created and
- * untouched files alike, and makes the restore a single command. It is also
- * less code than the per-file version it replaces.
+ * untouched files alike, and makes the restore a single command.
  *
- * Never overwritten: re-running --apply into the same directory keeps the
- * first run's snapshot, which is the one that holds the true originals.
+ * EXISTENCE IS NOT COMPLETENESS, and getting that wrong twice is why this
+ * function has a marker in it. `cpSync` is not atomic, so a crash or a kill
+ * mid-copy leaves a directory that LOOKS exactly like a finished snapshot;
+ * "keep the first snapshot" then trusts it and the rerun rewrites live memory
+ * against a backup missing whatever the copy had not reached. Publishing under
+ * a staging name fixed that only for crashes AFTER this change shipped — a
+ * partial left by the earlier direct-`cpSync` version, or any directory
+ * somebody happened to create at that path, was still believed.
  *
- * Copied under a staging name and renamed into place, because `cpSync` is not
- * atomic. A crash or a kill mid-copy leaves a directory that LOOKS like a
- * snapshot, and the "keep the first one" rule above would then trust it — so
- * the rerun rewrites live memory against a backup missing whatever the copy
- * had not reached. The final name only ever appears after the copy returns;
- * a leftover `.incomplete` is discarded on the next run.
+ * So a snapshot counts as usable only when its `.complete` sibling marker is
+ * there, and the marker is written after the rename, i.e. last. A directory
+ * without one is never trusted and never overwritten: the run stops and says
+ * so, because both silently replacing an operator's own copy and writing live
+ * memory against an unknown backup are worse than refusing.
+ *
+ * ponytail: a marker, not a manifest. It catches an interrupted or foreign
+ * directory, which is the failure that happened. It does not catch someone
+ * deleting files out of a completed backup afterwards — add a file-count or
+ * digest manifest here if that ever turns out to be real.
  */
+const SNAPSHOT_MARKER_SUFFIX = '.complete';
+
+/**
+ * Refuse an unusable backup. Run for EVERY selected workgroup before the first
+ * one is touched, not lazily per workgroup: this bails out, and "nothing has
+ * been written" has to be true when it says so.
+ */
+function assertBackupUsable(workgroupId: string): void {
+  const target = path.join(backupDir!, workgroupId);
+  const marker = `${target}${SNAPSHOT_MARKER_SUFFIX}`;
+  if (!fs.existsSync(target) || fs.existsSync(marker)) return;
+  fail(
+    `${target} exists but ${marker} does not, so it is a partial or foreign directory, not a usable backup. ` +
+      'Nothing has been written. Move it aside, or point --backup-dir somewhere else, and re-run.',
+  );
+}
+
 function snapshot(workgroupId: string): void {
   const target = path.join(backupDir!, workgroupId);
-  if (fs.existsSync(target)) return;
-  const staging = `${target}.incomplete`;
-  fs.rmSync(staging, { recursive: true, force: true });
+  const marker = `${target}${SNAPSHOT_MARKER_SUFFIX}`;
+  if (fs.existsSync(target) && fs.existsSync(marker)) return;
+  // Unique per process: two concurrent invocations pointed at one --backup-dir
+  // would otherwise cpSync into the same staging directory and merge.
+  const staging = `${target}.incomplete.${process.pid}`;
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.cpSync(workgroupMemoryDir(workgroupId), staging, { recursive: true });
-  fs.renameSync(staging, target);
+  fs.rmSync(staging, { recursive: true, force: true });
+  try {
+    fs.cpSync(workgroupMemoryDir(workgroupId), staging, { recursive: true });
+    fs.renameSync(staging, target);
+  } catch (error) {
+    fs.rmSync(staging, { recursive: true, force: true });
+    throw error;
+  }
+  // Last, and outside the tree, so a restore copies the memory canon and
+  // nothing else.
+  fs.writeFileSync(marker, `${new Date().toISOString()}\n`);
 }
 
 function workgroupIds(): string[] {
@@ -128,6 +167,7 @@ const targets = workgroupIds();
 if (selected !== null && targets.length === 0) {
   fail(`--workgroup ${selected} matched no workgroup with a memory directory`);
 }
+if (apply) targets.forEach(assertBackupUsable);
 
 for (const workgroupId of targets) {
   if (apply) snapshot(workgroupId);
