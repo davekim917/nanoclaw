@@ -31,10 +31,6 @@
       { "arg": "HEX_CLI_SHA256_amd64", "url": "https://github.com/hex-inc/hex-cli/releases/download/v{version}/hex-x86_64-unknown-linux-gnu.tar.xz.sha256" }
     ] }
   ],
-  "codex": {
-    "repo": "openai/codex-plugin-cc",
-    "sourcesFile": "/workspace/plugins/bootstrap/plugins/workflow/skills/team-qa/references/CODEX-SOURCES.md"
-  },
   "plugins": [
     { "id": "knowledge-work-data", "name": "data (anthropics/knowledge-work-plugins)", "dir": "knowledge-work-plugins/data", "repo": "anthropics/knowledge-work-plugins", "manifestPath": "data/.claude-plugin/plugin.json" },
     { "id": "role-specific-data-analytics", "name": "data-analytics (openai/role-specific-plugins)", "dir": "role-specific-plugins/plugins/data-analytics", "repo": "openai/role-specific-plugins", "manifestPath": "plugins/data-analytics/.codex-plugin/plugin.json", "manifestDir": ".codex-plugin" }

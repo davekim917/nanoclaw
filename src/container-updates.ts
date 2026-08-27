@@ -14,9 +14,8 @@ export type UpdateKind =
   | 'bun-dependency'
   | 'remotion-dependency'
   | 'dockerfile-pin'
-  | 'codex-sync'
   | 'plugin-version';
-export type UpdateSurface = 'host' | 'container' | 'bootstrap' | 'plugins';
+export type UpdateSurface = 'host' | 'container' | 'plugins';
 export type AuditStatus = 'current' | 'outdated' | 'unknown' | 'blocked';
 
 export interface AuditItem {
@@ -120,14 +119,70 @@ export function deriveUpstreamPolicy(texts: {
 }
 
 /**
- * Read the manifest at several revisions and derive policy. Fails OPEN: any git
- * problem (no upstream remote, shallow clone, never merged) yields an empty map
- * so the audit still runs. A missing signal must not become a blocked audit.
+ * Host-computed snapshot of readUpstreamPolicy's output, keyed by the
+ * relative manifest path it was derived for. Exists because the audit's two
+ * consumers (the weekly precheck and /update-container) run INSIDE the agent
+ * container against /workspace/project — a selective read-only bind-mount
+ * allowlist with no `.git` — so the git derivation below has never worked
+ * where it actually runs. The host checkout's git is fine; only the
+ * container view of it is blind. See writeUpstreamPolicySnapshot.
  */
-export async function readUpstreamPolicy(
+interface UpstreamPolicySnapshot {
+  schemaVersion: number;
+  generatedAt: string;
+  manifests: Record<string, Record<string, UpstreamPolicy>>;
+}
+
+const UPSTREAM_POLICY_SCHEMA_VERSION = 1;
+const UPSTREAM_POLICY_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+/** Manifests the snapshot covers — kept in lockstep with auditRepository's audited manifests. */
+const UPSTREAM_POLICY_MANIFESTS = ['package.json', 'container/agent-runner/package.json'];
+
+function upstreamPolicySnapshotPath(repoRoot: string): string {
+  return process.env.NANOCLAW_UPSTREAM_POLICY || path.join(repoRoot, '.upstream-policy.json');
+}
+
+/** Load + validate the snapshot. Any problem (missing, unparseable, wrong schema, stale) yields null — fail open. */
+async function loadUpstreamPolicySnapshot(repoRoot: string): Promise<UpstreamPolicySnapshot | null> {
+  try {
+    const text = await readFile(upstreamPolicySnapshotPath(repoRoot), 'utf8');
+    const parsed = JSON.parse(text) as Partial<UpstreamPolicySnapshot>;
+    if (
+      parsed.schemaVersion !== UPSTREAM_POLICY_SCHEMA_VERSION ||
+      typeof parsed.generatedAt !== 'string' ||
+      !parsed.manifests ||
+      typeof parsed.manifests !== 'object'
+    ) {
+      return null;
+    }
+    const ageMs = Date.now() - Date.parse(parsed.generatedAt);
+    if (!Number.isFinite(ageMs) || ageMs > UPSTREAM_POLICY_MAX_AGE_MS) return null;
+    return parsed as UpstreamPolicySnapshot;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the manifest at several revisions and derive policy via git alone —
+ * no snapshot fallback. Fails OPEN: any git problem (no upstream remote,
+ * shallow clone, never merged) yields an empty map. Kept separate from
+ * readUpstreamPolicy so writeUpstreamPolicySnapshot never launders a stale
+ * snapshot back into "fresh" output by reading its own fallback.
+ *
+ * Also reports whether `upstream/main` itself was reachable. That is NOT the
+ * same question as "is the returned map non-empty": a plain `git clone` of
+ * this repo carries the FULL commit history (including the upstream-merge
+ * commit) but no `upstream` remote, so `git log --merges --grep=...` still
+ * finds the merge and yields `heldByMerge` entries even though `upstream/main`
+ * can't resolve — a non-empty map with every `upstreamPin` missing. Gating
+ * the snapshot fallback on map emptiness alone would keep that half-signal
+ * instead of the complete host-computed one.
+ */
+async function readUpstreamPolicyFromGit(
   repoRoot: string,
   relativeManifest: string,
-): Promise<Map<string, UpstreamPolicy>> {
+): Promise<{ policy: Map<string, UpstreamPolicy>; upstreamReachable: boolean }> {
   const show = async (rev: string): Promise<string | null> => {
     try {
       const { stdout } = await execFileAsync('git', ['show', `${rev}:${relativeManifest}`], {
@@ -155,7 +210,74 @@ export async function readUpstreamPolicy(
     mergeCommit ? show(mergeCommit) : Promise.resolve(null),
   ]);
 
-  return deriveUpstreamPolicy({ upstream, mergeOurs, mergeTheirs, mergeResult });
+  return {
+    policy: deriveUpstreamPolicy({ upstream, mergeOurs, mergeTheirs, mergeResult }),
+    upstreamReachable: upstream !== null,
+  };
+}
+
+/**
+ * Read the manifest at several revisions and derive policy. Fails OPEN: any git
+ * problem (no upstream remote, shallow clone, never merged) yields an empty map
+ * so the audit still runs — UNLESS a fresh host-computed snapshot is available,
+ * in which case that fills the gap instead of surfacing as "signal unavailable".
+ */
+export async function readUpstreamPolicy(
+  repoRoot: string,
+  relativeManifest: string,
+): Promise<Map<string, UpstreamPolicy>> {
+  const { policy, upstreamReachable } = await readUpstreamPolicyFromGit(repoRoot, relativeManifest);
+  if (upstreamReachable) return policy;
+
+  const snapshot = await loadUpstreamPolicySnapshot(repoRoot);
+  const fromSnapshot = snapshot?.manifests[relativeManifest];
+  return fromSnapshot ? new Map(Object.entries(fromSnapshot)) : policy;
+}
+
+/**
+ * Compute the GIT-ONLY derivation for every audited manifest and write the
+ * result to `outPath`. Run once at host startup (git works on the host) and
+ * again before each interactive /update-container invocation, so containers
+ * — which never have `.git` — read a recent answer instead of going dark.
+ * Deliberately bypasses readUpstreamPolicy's snapshot fallback: if git yields
+ * nothing this round, the snapshot must say so (empty map, honest
+ * provenance), never re-stamp a prior snapshot's data as newly generated.
+ *
+ * Writes with fs.writeFile (truncate in place), NOT write-to-temp-then-rename:
+ * outPath is bind-mounted read-only into already-running containers, and a
+ * rename swaps the inode backing the mount, so a container that already has
+ * the file open (or whose bind mount resolved the old inode) would keep
+ * seeing stale content indefinitely. Truncating in place mutates the same
+ * inode the mount points at.
+ */
+export async function writeUpstreamPolicySnapshot(repoRoot: string, outPath: string): Promise<void> {
+  const manifests: Record<string, Record<string, UpstreamPolicy>> = {};
+  for (const relativeManifest of UPSTREAM_POLICY_MANIFESTS) {
+    const { policy } = await readUpstreamPolicyFromGit(repoRoot, relativeManifest);
+    manifests[relativeManifest] = Object.fromEntries(policy);
+  }
+  const snapshot: UpstreamPolicySnapshot = {
+    schemaVersion: UPSTREAM_POLICY_SCHEMA_VERSION,
+    generatedAt: new Date().toISOString(),
+    manifests,
+  };
+  await writeFile(outPath, `${JSON.stringify(snapshot, null, 2)}\n`);
+}
+
+/**
+ * Cheap provenance check for what readUpstreamPolicy would answer with, for
+ * reporting in the audit envelope — never re-runs the heavy git derivation.
+ */
+export async function describeUpstreamPolicy(
+  repoRoot: string,
+): Promise<{ source: 'git' | 'snapshot' | 'unavailable'; generatedAt: string | null }> {
+  const gitReady = await execFileAsync('git', ['rev-parse', '--verify', 'upstream/main'], { cwd: repoRoot })
+    .then(() => true)
+    .catch(() => false);
+  if (gitReady) return { source: 'git', generatedAt: null };
+  const snapshot = await loadUpstreamPolicySnapshot(repoRoot);
+  if (snapshot) return { source: 'snapshot', generatedAt: snapshot.generatedAt };
+  return { source: 'unavailable', generatedAt: null };
 }
 
 export interface ReleaseResolved {
@@ -205,10 +327,6 @@ interface PluginUpdateSource {
 interface UpdateSourcesManifest {
   schemaVersion: 1;
   dockerfile: DockerUpdateSource[];
-  codex?: {
-    repo: string;
-    sourcesFile: string;
-  };
   plugins?: PluginUpdateSource[];
 }
 
@@ -445,76 +563,6 @@ async function firstReadable(paths: string[]): Promise<string | null> {
   return null;
 }
 
-async function auditCodexSources(manifest: UpdateSourcesManifest, fetchJson: JsonFetcher): Promise<AuditItem[]> {
-  if (!manifest.codex) return [];
-  const configured = process.env.NANOCLAW_CODEX_SOURCES;
-  const hostFallback = manifest.codex.sourcesFile.replace(
-    `${CONTAINER_PLUGINS_ROOT}/`,
-    `${path.join(homedir(), 'plugins')}/`,
-  );
-  const sourcePath = await firstReadable([
-    ...(configured ? [configured] : []),
-    manifest.codex.sourcesFile,
-    hostFallback,
-  ]);
-  if (!sourcePath) {
-    return [
-      {
-        id: 'codex-sync:sources',
-        name: 'Codex synced sources',
-        kind: 'codex-sync',
-        surface: 'bootstrap',
-        current: 'unavailable',
-        latest: null,
-        status: 'unknown',
-        source: 'github',
-        detail: `CODEX-SOURCES.md not found at ${manifest.codex.sourcesFile}`,
-      },
-    ];
-  }
-  const text = await readFile(sourcePath, 'utf8');
-  const rows = [...text.matchAll(/^\|\s*`([^`]+)`\s*\|\s*`([^`]+)`\s*\|\s*`([0-9a-f]{7,40})`\s*\|/gm)];
-  if (rows.length === 0) {
-    return [
-      {
-        id: 'codex-sync:sources',
-        name: 'Codex synced sources',
-        kind: 'codex-sync',
-        surface: 'bootstrap',
-        current: 'invalid',
-        latest: null,
-        status: 'blocked',
-        source: 'github',
-        detail: `no pinned source rows found in ${sourcePath}`,
-      },
-    ];
-  }
-  return Promise.all(
-    rows.map(async ([, local, upstream, current]): Promise<AuditItem> => {
-      const base = {
-        id: `codex-sync:${local}`,
-        name: local,
-        kind: 'codex-sync' as const,
-        surface: 'bootstrap' as const,
-        current,
-        source: 'github' as const,
-      };
-      const result = await audited(local, async () => {
-        const payload = await fetchJson(
-          `https://api.github.com/repos/${manifest.codex!.repo}/commits?path=${encodeURIComponent(upstream)}&per_page=1`,
-        );
-        const sha = Array.isArray(payload) && typeof payload[0]?.sha === 'string' ? payload[0].sha : null;
-        if (!sha) throw new Error('GitHub returned no commit SHA');
-        return sha.slice(0, current.length);
-      });
-      if (result instanceof Error) {
-        return { ...base, latest: null, status: 'unknown', detail: result.message };
-      }
-      return { ...base, latest: result, status: result === current ? 'current' : 'outdated' };
-    }),
-  );
-}
-
 /**
  * Plugin clones under `~/plugins` are versioned by their `.claude-plugin/plugin.json`
  * `version` field, not by a package registry — so compare the local clone against the
@@ -612,11 +660,8 @@ export async function auditRepository(
     }),
   );
 
-  const [codex, plugins] = await Promise.all([
-    auditCodexSources(manifest, fetchJson),
-    auditPluginVersions(manifest, fetchJson),
-  ]);
-  return [...host, ...bun, ...remotion, ...docker, ...codex, ...plugins].sort((a, b) => a.id.localeCompare(b.id));
+  const plugins = await auditPluginVersions(manifest, fetchJson);
+  return [...host, ...bun, ...remotion, ...docker, ...plugins].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function statusLabel(status: AuditStatus): string {
@@ -669,7 +714,10 @@ export function renderAuditMarkdown(items: AuditItem[]): string {
   return lines.join('\n');
 }
 
-export function buildScheduledAuditGate(items: AuditItem[]): { wakeAgent: boolean; data: unknown } {
+export function buildScheduledAuditGate(
+  items: AuditItem[],
+  upstreamPolicy?: { source: 'git' | 'snapshot' | 'unavailable'; generatedAt: string | null },
+): { wakeAgent: boolean; data: unknown } {
   const outdated = items.filter((item) => item.status === 'outdated');
   const unresolved = items.filter((item) => item.status === 'blocked' || item.status === 'unknown');
   return {
@@ -682,6 +730,7 @@ export function buildScheduledAuditGate(items: AuditItem[]): { wakeAgent: boolea
         current: items.filter((item) => item.status === 'current').length,
       },
       items: [...outdated, ...unresolved],
+      ...(upstreamPolicy ? { upstreamPolicy } : {}),
     },
   };
 }
@@ -754,9 +803,6 @@ export async function applySelectedUpdates(options: {
   });
   const run = options.run ?? defaultRun;
   const fetchText = options.fetchText ?? defaultFetchText;
-  if (selected.some((item) => item.kind === 'codex-sync')) {
-    throw new Error('Codex sync updates target the bootstrap repository and must be applied there');
-  }
   if (selected.some((item) => item.kind === 'plugin-version')) {
     throw new Error('Plugin updates are applied with `git pull` in the plugin clone under ~/plugins');
   }

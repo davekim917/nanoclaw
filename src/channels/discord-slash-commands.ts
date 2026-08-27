@@ -18,8 +18,8 @@
  * /update-container injects a synthetic chat message into the router
  * (routeInbound) carrying an audit prompt. The agent (running in a
  * container for the receiving messaging group) invokes the shared deterministic
- * audit/apply CLI, asks which exact items to bump, and keeps host, container,
- * and bootstrap changes in separate approval and activation boundaries.
+ * audit/apply CLI, asks which exact items to bump, and keeps host and container
+ * changes in separate approval and activation boundaries.
  */
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -35,8 +35,9 @@ import {
   type TextChannel,
 } from 'discord.js';
 
-import { REPO_ROOT } from '../config.js';
+import { DATA_DIR, REPO_ROOT } from '../config.js';
 import { startContainerRebuildWatcher, stopContainerRebuildWatcher } from '../container-rebuild-watcher.js';
+import { writeUpstreamPolicySnapshot } from '../container-updates.js';
 import { log } from '../log.js';
 import { runPluginUpdates } from '../plugin-updater.js';
 import { routeInbound } from '../router.js';
@@ -256,7 +257,6 @@ export const UPDATE_CONTAINER_PROMPT = [
   'Present outdated items grouped by activation boundary:',
   '- host: host package.json/pnpm-lock changes; these require the host deploy flow after manual merge.',
   '- container: Docker pins and agent-runner Bun dependencies; these require an image rebuild after manual merge.',
-  '- bootstrap: Codex-synced files; these belong in a separate bootstrap-repository PR.',
   'Latest stable includes major versions. Show the exact item IDs and ask which IDs to update. This is the approval gate; do not clone, edit, branch, commit, push, or open a PR before the user answers.',
   '',
   // Added after @onecli-sh/sdk ^0.5.0 -> ^2.8.0 (#135) took the whole fleet down
@@ -265,14 +265,14 @@ export const UPDATE_CONTAINER_PROMPT = [
   // method names the host calls were unchanged across both majors. Only the HTTP
   // path moved (/api -> /v1), against a gateway that serves only /api. Two
   // reporting duties exist because of it:
-  'The audit derives these three itself — read the fields, do not re-derive them with git:',
+  '`upstreamPin` and `heldByMerge` come from a host-computed snapshot, not from git run here: `/workspace/project` is a read-only bind-mount allowlist with no `.git`, so the container can never derive these itself. Read the fields — do not re-derive them with git:',
   "- `upstreamPin` is that dependency's pin in `upstream/main`. Report it NEXT TO latest-stable and say explicitly when they differ. For anything exact-pinned, upstream parity is the DEFAULT recommendation and latest-stable is the exception: an exact pin is usually load-bearing, and upstream is the strongest evidence about what a version is compatible with. Never present latest-stable as the only option.",
   '- `heldByMerge: true` means the last upstream merge resolved that dependency KEEP-OURS — it kept our pin over a different upstream one. That is a standing decision. Report it as HELD and do not propose moving past it without saying so explicitly and asking. It is stronger than upstream parity: in #135 upstream 2.2.1 was ALSO incompatible with our gateway, so parity alone would not have caught it.',
   '- `pairedWith` names a locally-running component that must move in the SAME change. These CANNOT be validated by compiling — client and server share a wire contract no type or unit test sees, so a version-skewed pair type-checks perfectly and fails at the first real call. Treat the pair as one item, approved or skipped together; never bundle it into a bulk bump.',
-  'Absence of these fields is not evidence of parity: the derivation fails OPEN, so a missing `upstreamPin` can equally mean no upstream remote or a shallow clone. If none of the items carry one, say the signal was unavailable rather than reporting parity.',
+  "The JSON also carries `upstreamPolicy.source` (`git`, `snapshot`, or `unavailable`) and `upstreamPolicy.generatedAt`. Always report which source produced upstreamPin/heldByMerge: if `snapshot`, state the snapshot's age (now minus `generatedAt`) so staleness is visible; if `unavailable`, say the signal was unavailable rather than reporting parity — an absent field is not evidence of parity, it can equally mean no upstream remote, a shallow clone, or a snapshot older than 14 days.",
   '',
   'After approval, create writable clones. Never edit /workspace/project in place.',
-  'Keep host and container changes in separate NanoClaw PRs because their activation and rollback boundaries differ. Keep bootstrap changes in a separate bootstrap PR.',
+  'Keep host and container changes in separate NanoClaw PRs because their activation and rollback boundaries differ.',
   'In each NanoClaw clone, rerun the audit, then apply only the approved IDs:',
   '`bun scripts/container-updates.ts apply --repo <clone> --items <comma-separated-ids>`',
   '',
@@ -287,7 +287,7 @@ export const UPDATE_CONTAINER_PROMPT = [
   // runs its own codex for `codex plugin marketplace upgrade` (plugin-updater.ts),
   // and the operator works in it directly.
   '- Codex CLI: put the exact host-parity installation command in the PR checklist. Do not add a models-cache reset.',
-  'Show the final diff before committing. Commit and push only the validated, approved files, open the PR against davekim917/nanoclaw (or davekim917/bootstrap), verify the PR URL is in the intended repository, then stop.',
+  'Show the final diff before committing. Commit and push only the validated, approved files, open the PR against davekim917/nanoclaw, verify the PR URL is in the intended repository, then stop.',
   'Never merge, deploy, restart services, or build Docker from inside the agent container.',
 ].join('\n');
 
@@ -298,6 +298,17 @@ async function handleUpdateContainer(interaction: ChatInputCommandInteraction): 
       ephemeral: true,
     });
     return;
+  }
+
+  // Refresh the host-computed upstream-policy snapshot right before the audit
+  // runs, so the interactive path always reads a current answer instead of
+  // whatever was current at last host startup. Log-and-continue: a stale or
+  // missing snapshot degrades to "signal unavailable" (see readUpstreamPolicy),
+  // it must never block the audit.
+  try {
+    await writeUpstreamPolicySnapshot(REPO_ROOT, path.join(DATA_DIR, 'upstream-policy.json'));
+  } catch (err) {
+    log.error('Upstream policy snapshot refresh failed before /update-container audit', { err });
   }
 
   await interaction.reply({ content: 'Auditing container packages and synced upstream files…' });

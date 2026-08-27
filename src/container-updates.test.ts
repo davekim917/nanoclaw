@@ -9,10 +9,12 @@ import {
   auditRepository,
   buildScheduledAuditGate,
   CONTAINER_PLUGINS_ROOT,
+  describeUpstreamPolicy,
   latestStableGitHubRelease,
   latestStableGitHubTag,
   latestStableNpmVersion,
   latestStablePyPiVersion,
+  readUpstreamPolicy,
   renderAuditMarkdown,
   deriveUpstreamPolicy,
   LOCAL_SERVICE_PAIRS,
@@ -386,6 +388,69 @@ describe('upstream policy — the gates that #135 slipped past', () => {
 
   it('declares the OneCLI SDK as paired with a local service', () => {
     expect(LOCAL_SERVICE_PAIRS['@onecli-sh/sdk']).toMatch(/gateway/i);
+  });
+});
+
+describe('upstream policy snapshot fallback (containers have no .git)', () => {
+  const writeSnapshot = (root: string, body: unknown) =>
+    writeFile(path.join(root, '.upstream-policy.json'), JSON.stringify(body));
+
+  it('falls back to a valid, fresh snapshot when git yields nothing', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'upstream-policy-'));
+    await writeSnapshot(root, {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      manifests: { 'package.json': { undici: { upstreamPin: '6.24.1', keptOurs: true } } },
+    });
+    const policy = await readUpstreamPolicy(root, 'package.json');
+    expect(policy.get('undici')).toEqual({ upstreamPin: '6.24.1', keptOurs: true });
+  });
+
+  it('ignores a snapshot older than 14 days and fails open to an empty map', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'upstream-policy-'));
+    const stale = new Date(Date.now() - 15 * 24 * 60 * 60 * 1000).toISOString();
+    await writeSnapshot(root, {
+      schemaVersion: 1,
+      generatedAt: stale,
+      manifests: { 'package.json': { undici: { upstreamPin: '6.24.1' } } },
+    });
+    const policy = await readUpstreamPolicy(root, 'package.json');
+    expect(policy.size).toBe(0);
+  });
+
+  it('ignores a malformed snapshot and fails open to an empty map', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'upstream-policy-'));
+    await writeFile(path.join(root, '.upstream-policy.json'), 'not json');
+    const policy = await readUpstreamPolicy(root, 'package.json');
+    expect(policy.size).toBe(0);
+  });
+
+  it('ignores a snapshot with the wrong schemaVersion and fails open to an empty map', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'upstream-policy-'));
+    await writeSnapshot(root, {
+      schemaVersion: 2,
+      generatedAt: new Date().toISOString(),
+      manifests: { 'package.json': { undici: { upstreamPin: '6.24.1' } } },
+    });
+    const policy = await readUpstreamPolicy(root, 'package.json');
+    expect(policy.size).toBe(0);
+  });
+
+  it('describeUpstreamPolicy reports git when upstream/main resolves in repoRoot', async () => {
+    const root = path.resolve(import.meta.dirname, '..');
+    expect(await describeUpstreamPolicy(root)).toEqual({ source: 'git', generatedAt: null });
+  });
+
+  it('describeUpstreamPolicy reports snapshot with its generatedAt when repoRoot has no git', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'upstream-policy-'));
+    const generatedAt = new Date().toISOString();
+    await writeSnapshot(root, { schemaVersion: 1, generatedAt, manifests: {} });
+    expect(await describeUpstreamPolicy(root)).toEqual({ source: 'snapshot', generatedAt });
+  });
+
+  it('describeUpstreamPolicy reports unavailable when there is neither git nor a snapshot', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'upstream-policy-'));
+    expect(await describeUpstreamPolicy(root)).toEqual({ source: 'unavailable', generatedAt: null });
   });
 });
 

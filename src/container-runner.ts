@@ -2255,6 +2255,21 @@ export function buildMounts(
     });
   }
 
+  // Host-computed upstreamPin/heldByMerge snapshot for the same audit script.
+  // /workspace/project has no `.git` (it's a selective bind-mount allowlist,
+  // not a checkout), so the audit's git-based upstream-policy derivation can
+  // never run in-container. writeUpstreamPolicySnapshot() runs on the host
+  // (host startup + before each /update-container invocation) and writes
+  // this file; the container just reads it. See src/container-updates.ts.
+  const upstreamPolicySnapshot = path.join(DATA_DIR, 'upstream-policy.json');
+  if (fs.existsSync(upstreamPolicySnapshot)) {
+    mounts.push({
+      hostPath: upstreamPolicySnapshot,
+      containerPath: '/workspace/project/.upstream-policy.json',
+      readonly: true,
+    });
+  }
+
   // Tone profiles — project-relative, shared across all groups. Read-only:
   // groups select a profile in their CLAUDE.md; the files themselves are
   // managed via the /add-tone-profile skill on the host.
@@ -3202,6 +3217,13 @@ async function buildContainerArgs(
   // point (config.ts's import-order trap), and silently dropping a documented
   // operator override is what reintroduced the original 30s-kill failure.
   args.push('-e', `NANOCLAW_TASK_SCRIPT_TIMEOUT_MS=${TASK_SCRIPT_TIMEOUT_MS}`);
+  // Points readUpstreamPolicy's snapshot fallback at the mounted file above
+  // regardless of --repo. Load-bearing for the post-approval re-audit: the
+  // agent reruns `container-updates.ts audit --repo <writable clone>`, and
+  // that clone has no `upstream` remote either (it's a fresh git clone of
+  // origin), so without this override the clone-relative default path
+  // (`<clone>/.upstream-policy.json`) would never resolve to this file.
+  args.push('-e', `NANOCLAW_UPSTREAM_POLICY=/workspace/project/.upstream-policy.json`);
   if (repositoryWorkUnit) {
     args.push('-e', `NANOCLAW_HOST_DATA_DIR=${DATA_DIR}`);
     args.push('-e', `NANOCLAW_HOST_TOPIC_WORKTREES_DIR=${topicWorktreesDir(repositoryWorkUnit)}`);

@@ -5,6 +5,7 @@ import {
   applySelectedUpdates,
   auditRepository,
   buildScheduledAuditGate,
+  describeUpstreamPolicy,
   renderAuditMarkdown,
 } from '../src/container-updates.js';
 
@@ -27,12 +28,16 @@ async function main(): Promise<void> {
     const format = valueAfter(args, '--format') ?? 'markdown';
     if (!['json', 'markdown', 'task'].includes(format)) usage();
     const items = await auditRepository(repoRoot);
+    const upstreamPolicy = await describeUpstreamPolicy(repoRoot);
     if (format === 'task') {
-      process.stdout.write(`${JSON.stringify(buildScheduledAuditGate(items))}\n`);
+      process.stdout.write(`${JSON.stringify(buildScheduledAuditGate(items, upstreamPolicy))}\n`);
     } else if (format === 'json') {
-      process.stdout.write(`${JSON.stringify({ schemaVersion: 1, generatedAt: new Date().toISOString(), items }, null, 2)}\n`);
+      process.stdout.write(
+        `${JSON.stringify({ schemaVersion: 1, generatedAt: new Date().toISOString(), upstreamPolicy, items }, null, 2)}\n`,
+      );
     } else {
-      process.stdout.write(`${renderAuditMarkdown(items)}\n`);
+      const age = upstreamPolicy.generatedAt ? `, generated ${upstreamPolicy.generatedAt}` : '';
+      process.stdout.write(`${renderAuditMarkdown(items)}\nUpstream policy source: ${upstreamPolicy.source}${age}\n`);
     }
     if (format !== 'task') {
       process.exitCode = items.some((item) => item.status === 'unknown' || item.status === 'blocked') ? 2 : 0;

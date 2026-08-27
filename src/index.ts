@@ -22,6 +22,7 @@ import { warnActiveContainersOfShutdown, warnMarkedRunningSessionsOfStartup } fr
 import { resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
 import { stopAllContainers } from './container-runner.js';
+import { writeUpstreamPolicySnapshot } from './container-updates.js';
 import {
   getDeliveryAdapter,
   setDeliveryAdapter,
@@ -243,6 +244,17 @@ export async function main(): Promise<void> {
   }
 
   log.info('Central DB ready', { path: dbPath });
+
+  // Host-computed upstreamPin/heldByMerge snapshot for the container-updates
+  // audit. Containers can't derive this themselves (/workspace/project has no
+  // `.git`), so the host computes it here where git works and refreshes it
+  // again in handleUpdateContainer before each interactive audit. Best-effort:
+  // log and continue, never block boot on a dependency-audit side channel.
+  try {
+    await writeUpstreamPolicySnapshot(REPO_ROOT, path.join(DATA_DIR, 'upstream-policy.json'));
+  } catch (err) {
+    log.error('Upstream policy snapshot failed at startup', { err });
+  }
 
   // 1a. Start dashboard — after migrations (028 must exist) and before
   //     channel adapters so the HTTP server is up regardless of channel config.
