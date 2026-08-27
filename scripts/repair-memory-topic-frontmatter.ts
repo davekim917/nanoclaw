@@ -10,6 +10,21 @@
  *   pnpm exec tsx scripts/repair-memory-topic-frontmatter.ts                        # dry run
  *   pnpm exec tsx scripts/repair-memory-topic-frontmatter.ts --apply --backup-dir DIR
  *   … --apply --backup-dir DIR --workgroup <workgroup-id>
+ *   … --skip-index      topic files only; never calls syncMemoryIndexes
+ *
+ * RUN IT FROM THE REPO ROOT. `DATA_DIR` is `process.cwd()/data`
+ * (`src/config.ts:59,67`), so invoking this from a worktree or any other
+ * directory silently targets that directory's `data/` instead of the install's.
+ * A run that reports `would repair 0` against a populated install has not found
+ * nothing — it has looked in the wrong place.
+ *
+ * --skip-index exists because index maintenance is PARKED with known
+ * destructive findings in `memory-index.ts` (fence-blind on blank-terminated
+ * HTML blocks, 1-3-space-indented ATX headings not treated as boundaries,
+ * loose-list children reparented). Topic repair is fixed and valuable; the
+ * index rewrite would run frozen, known-buggy code over hand-written index
+ * content. Opt-out, not a change of default: without the flag this behaves
+ * exactly as before.
  *
  * Dry run by default because this rewrites live memory, and the dry run
  * previews EVERYTHING --apply does, index rewrites included — a preview that
@@ -60,6 +75,7 @@ function flagValue(name: string): string | null {
 }
 
 const apply = process.argv.includes('--apply');
+const skipIndex = process.argv.includes('--skip-index');
 const selected = flagValue('--workgroup');
 const backupDir = flagValue('--backup-dir');
 if (apply && backupDir === null) {
@@ -225,20 +241,26 @@ for (const workgroupId of targets) {
     );
   }
 
-  try {
-    const sync = await syncMemoryIndexes(workgroupId, { dryRun: !apply });
-    if (sync.updated.length > 0) {
-      console.log(`  ${apply ? 'INDEX' : 'WOULD REWRITE INDEX'} ${workgroupId}: ${sync.updated.join(', ')}`);
+  // Not called at all under --skip-index, rather than called with dryRun: the
+  // point of the flag is that this code path does not touch the file, and a
+  // preview that still printed WOULD REWRITE INDEX would misdescribe the run.
+  if (!skipIndex) {
+    try {
+      const sync = await syncMemoryIndexes(workgroupId, { dryRun: !apply });
+      if (sync.updated.length > 0) {
+        console.log(`  ${apply ? 'INDEX' : 'WOULD REWRITE INDEX'} ${workgroupId}: ${sync.updated.join(', ')}`);
+      }
+    } catch (error) {
+      console.log(`  INDEX ${workgroupId} FAILED: ${(error as Error).message}`);
+      failed += 1;
     }
-  } catch (error) {
-    console.log(`  INDEX ${workgroupId} FAILED: ${(error as Error).message}`);
-    failed += 1;
   }
 }
 
 console.log(
   `${apply ? 'repaired' : 'would repair'} ${repaired}, already normalized ${skipped}, ` +
     `blocked by the size cap ${blocked}, failed ${failed}` +
+    (skipIndex ? ', indexes left alone (--skip-index)' : '') +
     (apply ? `, memory trees snapshotted to ${backupDir}` : ' — re-run with --apply --backup-dir DIR to write'),
 );
 // Non-zero whenever work was not completed. A size-blocked file is not a crash

@@ -45,17 +45,30 @@ afterEach(() => {
   fs.rmSync(BACKUP, { recursive: true, force: true });
 });
 
-function runApply(): number {
+function run(args: string[]): { status: number; stdout: string } {
   try {
-    execFileSync(
-      path.join(ROOT, 'node_modules', '.bin', 'tsx'),
-      ['scripts/repair-memory-topic-frontmatter.ts', '--apply', '--backup-dir', BACKUP, '--workgroup', WORKGROUP],
-      { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] },
-    );
-    return 0;
+    const stdout = execFileSync(path.join(ROOT, 'node_modules', '.bin', 'tsx'), args, {
+      cwd: ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8',
+    });
+    return { status: 0, stdout };
   } catch (error) {
-    return (error as { status?: number }).status ?? -1;
+    const failure = error as { status?: number; stdout?: string };
+    return { status: failure.status ?? -1, stdout: failure.stdout ?? '' };
   }
+}
+
+function runApply(extra: string[] = []): number {
+  return run([
+    'scripts/repair-memory-topic-frontmatter.ts',
+    '--apply',
+    '--backup-dir',
+    BACKUP,
+    '--workgroup',
+    WORKGROUP,
+    ...extra,
+  ]).status;
 }
 
 function filesUnder(root: string): string[] {
@@ -138,4 +151,34 @@ it('keeps a completed snapshot on a rerun instead of overwriting it with already
   for (const [relative, body] of originals) {
     expect(fs.readFileSync(path.join(BACKUP, WORKGROUP, relative), 'utf8')).toBe(body);
   }
+});
+
+// Index maintenance is parked with known destructive findings in
+// memory-index.ts, and the live indexes carry hand-written Core Memory, map
+// links and an HTML comment. --skip-index lets the topic repair — the part
+// that is fixed — run without putting frozen, known-buggy code across them.
+it('repairs topic files without touching the index under --skip-index', () => {
+  const originals = originalBytes();
+
+  expect(runApply(['--skip-index'])).toBe(0);
+
+  expect(fs.readFileSync(path.join(MEMORY, 'index.md'), 'utf8')).toBe(originals.get('index.md'));
+  expect(fs.readFileSync(path.join(MEMORY, 'people', 'a-ok.md'), 'utf8')).not.toBe(originals.get('people/a-ok.md'));
+  // No folder index conjured either — syncMemoryIndexes CREATES these.
+  expect(fs.existsSync(path.join(MEMORY, 'people', 'index.md'))).toBe(false);
+});
+
+// The preview has to describe the run it is previewing. A dry run that still
+// printed WOULD REWRITE INDEX would tell the operator to expect index writes
+// from an invocation that makes none.
+it('shows no index rewrite in a --skip-index dry run, and does show one without it', () => {
+  const skipped = run(['scripts/repair-memory-topic-frontmatter.ts', '--workgroup', WORKGROUP, '--skip-index']);
+  expect(skipped.stdout).not.toContain('WOULD REWRITE INDEX');
+  expect(skipped.stdout).toContain('indexes left alone (--skip-index)');
+  expect(skipped.stdout).toContain('WOULD REPAIR');
+
+  // GUARD: the default is unchanged — this is opt-out, not a new default.
+  const normal = run(['scripts/repair-memory-topic-frontmatter.ts', '--workgroup', WORKGROUP]);
+  expect(normal.stdout).toContain('WOULD REWRITE INDEX');
+  expectUnchanged(originalBytes());
 });
