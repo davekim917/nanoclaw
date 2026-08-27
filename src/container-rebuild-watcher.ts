@@ -1,85 +1,80 @@
 /**
- * Container rebuild watcher.
+ * Container rebuild watcher — event-driven, not polled.
  *
- * Polls every minute and rebuilds CONTAINER_IMAGE (from src/config.ts)
- * whenever the running image's commit label lags origin/main on files
- * under `container/`. Posts a completion message to an optional Discord
- * channel.
+ * Old design polled every 60s comparing the running image's commit label
+ * against origin/main (~1440 ticks/day for ~8 real events). container-runner.ts
+ * already computes the authoritative "this image is stale and is actively
+ * blocking work" signal on every spawn — checkAgentRunnerDepsDrift() in
+ * agent-runner-image-check.ts. When that check refuses a spawn, it calls
+ * requestContainerRebuild() here instead of waiting for a timer to notice.
  *
- * Label-driven, not GitHub-event-driven — container/build.sh stamps the
- * repo HEAD SHA into the image as `nanoclaw.commit`, and we compare that
- * label against `git rev-parse origin/main`. Catches PR squash-merges,
- * direct pushes, force-pushes, hand-edits, and first runs where no image
- * exists yet. Timestamps were the old approach but Docker cache-hit
- * rebuilds don't advance them — labels do.
+ * requestContainerRebuild() never blocks the caller: it's a synchronous,
+ * fire-and-forget kickoff. The refusal still throws immediately; host-sweep
+ * retries the spawn, and by then the rebuild (if one ran) has likely landed.
  *
- * If origin/main has new commits but none touch `container/`, the watcher
- * leaves the working tree alone — the user pulls when they want.
+ * Single-flight in-process (rebuildPromise) coalesces a wake-storm of
+ * concurrent refusals into one rebuild — container/build.sh's flock on
+ * logs/container-build.lock is the cross-process backstop, not duplicated
+ * here. A failed attempt (build failure, or a precondition that means a
+ * rebuild wouldn't help anyway) starts a MIN_RETRY_INTERVAL_MS cooldown so a
+ * persistently broken build doesn't get retried on every subsequent refused
+ * spawn; a successful rebuild clears it. Repeated identical failures are
+ * deduped (lastNotifiedDetail) so the operator gets one actionable message,
+ * not one per refused spawn.
  */
 import { execFile } from 'child_process';
 import path from 'path';
 import { promisify } from 'util';
 
+import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { log } from './log.js';
 
 const execFileAsync = promisify(execFile);
 
-export const POLL_MS = 60_000;
-// Repeated failures back off exponentially up to MAX_BACKOFF_MS — at 1h the
-// watcher is still checking often enough that recovery is noticed promptly,
-// without hammering on a persistent fault.
-export const MAX_BACKOFF_MS = 3_600_000;
-// While the same failure persists, surface one "still failing" reminder every
-// REMINDER_MS so the operator doesn't forget about a broken state once dedup
-// goes quiet.
-export const REMINDER_MS = 14_400_000;
+// Floor between rebuild attempts once one has failed (or a precondition
+// determined a rebuild wouldn't help). Prevents a storm of back-to-back
+// rebuild attempts when spawns keep getting refused for the same unresolved
+// reason. A successful rebuild resets this to null.
+export const MIN_RETRY_INTERVAL_MS = 10 * 60_000;
 
-// Use the same full reference container-runner.ts spawns from — CONTAINER_IMAGE
-// resolves to `<install-slug-base>:<tag>` (default `:latest`). Pre-fix the
-// watcher hardcoded `nanoclaw-agent:v2` (wrong base) and built with tag `v2`
-// (wrong tag), so inspect + build targets + spawn target were all different
-// images. Extract the tag from CONTAINER_IMAGE so build.sh gets the same one.
+const BUILD_SCRIPT = path.join(REPO_ROOT, 'container', 'build.sh');
+
+// Same full reference container-runner.ts spawns from — CONTAINER_IMAGE
+// resolves to `<install-slug-base>:<tag>` (default `:latest`).
 const IMAGE_REF = CONTAINER_IMAGE;
 const tagColon = IMAGE_REF.lastIndexOf(':');
 const IMAGE_TAG = tagColon >= 0 ? IMAGE_REF.slice(tagColon + 1) : 'latest';
 
 type Notifier = (message: string) => Promise<void>;
 
-let timer: NodeJS.Timeout | null = null;
-let running = false;
+let started = false;
 let notify: Notifier | null = null;
-
-// Failure-state tracking. The watcher's tick is loud by default: every run
-// that hits the same error would Discord-spam without dedup. lastNotifiedDetail
-// tracks the most recent message we sent; consecutiveFailures drives backoff;
-// firstFailureAt + lastReminderAt drive the periodic "still failing" reminder.
+let rebuildPromise: Promise<void> | null = null;
+let lastFailureAt: number | null = null;
 let lastNotifiedDetail: string | null = null;
-let consecutiveFailures = 0;
-let firstFailureAt: number | null = null;
-let lastReminderAt: number | null = null;
 
 export function _resetWatcherStateForTest(): void {
+  started = false;
+  notify = null;
+  rebuildPromise = null;
+  lastFailureAt = null;
   lastNotifiedDetail = null;
-  consecutiveFailures = 0;
-  firstFailureAt = null;
-  lastReminderAt = null;
 }
 
-/** Pure: next-tick delay given a failure count. Capped at MAX_BACKOFF_MS. */
-export function nextDelayMs(failures: number): number {
-  if (failures <= 0) return POLL_MS;
-  const exp = Math.min(failures - 1, 20); // guard against 2**huge
-  const backoff = POLL_MS * 2 ** exp;
-  return Math.min(backoff, MAX_BACKOFF_MS);
+/** Test-only: the in-flight rebuild attempt, so tests can await settlement. */
+export function _pendingRebuildForTest(): Promise<void> | null {
+  return rebuildPromise;
 }
 
-/** Pure: human-friendly elapsed-time label for reminders. */
-export function formatElapsed(ms: number): string {
-  if (ms < 3_600_000) return `${Math.max(1, Math.round(ms / 60_000))}m`;
-  const h = ms / 3_600_000;
-  return h >= 10 ? `${Math.round(h)}h` : `${h.toFixed(1).replace(/\.0$/, '')}h`;
+/**
+ * Test-only: set the notifier directly without running startContainerRebuildWatcher's
+ * startup check side effect, so requestContainerRebuild tests don't have to
+ * race that check's own async settlement.
+ */
+export function _setNotifierForTest(notifier: Notifier | null): void {
+  notify = notifier;
 }
 
 // Same gotcha as repo-freshness: the service env proxies HTTPS through the
@@ -102,13 +97,6 @@ const short = (sha: string): string => sha.slice(0, 7);
  * Returns the running image's `nanoclaw.commit` label (stamped by
  * `container/build.sh`), or null when the image doesn't exist or wasn't
  * built by a version of build.sh that stamps the label.
- *
- * Previously we compared `Created` timestamps against `git log --before=...`,
- * but Docker's build cache reuses an existing image (same Created timestamp)
- * whenever all COPY'd inputs match — so a rebuild triggered by an
- * agent-runner/src change (mounted at runtime, not COPY'd) would succeed
- * quietly with the old timestamp and trap the watcher in a rebuild loop.
- * Commit labels advance with every successful build regardless of cache.
  */
 async function imageCommitLabel(): Promise<string | null> {
   try {
@@ -130,19 +118,14 @@ interface StalenessCheck {
 }
 
 /**
- * Decide whether the image needs a rebuild. Always rebuilds when the image
- * doesn't exist or wasn't stamped with a commit label (old image from before
- * label support — treat as stale to force a fresh build that IS labeled).
- * Otherwise compares `imageCommit..origin/main` for files under `container/`.
- * A failed `git diff` is logged and treated as "stale" (fail-open) so a
- * transient git error doesn't silently suppress rebuilds.
- *
- * If origin/main is an ancestor of the image's label, the image already
- * contains everything origin/main has — not stale regardless of SHA mismatch.
- * Without this, a local HEAD ahead of origin/main (unpushed commits or a
- * locally-merged PR not yet on origin) loops every tick: backwards diff
- * `label..origin/main -- container/` is non-empty, rebuild stamps the same
- * label, repeat.
+ * Decide whether the image needs a rebuild, purely from git history vs the
+ * image's commit label (independent of the deps-hash check that triggers
+ * requestContainerRebuild). Kept as a precondition: if this says the image
+ * already reflects origin/main's container/ content, a deps-drift refusal
+ * means something else is wrong — a rebuild driven by stale/local disk state
+ * would just paper over it (and mislabel the image), so we say so instead of
+ * looping. See headCoversOriginMainContainer() for the "would a rebuild here
+ * actually pick up origin/main's fix" half of the decision.
  */
 async function checkStaleness(): Promise<StalenessCheck> {
   const [toSha, imageCommit] = await Promise.all([git('rev-parse', 'origin/main'), imageCommitLabel()]);
@@ -168,6 +151,28 @@ async function checkStaleness(): Promise<StalenessCheck> {
   return { stale: true, reason: `container/ changed in ${short(imageCommit)}..${short(toSha)}` };
 }
 
+/**
+ * True when HEAD already contains everything origin/main has under
+ * container/ — building from the working tree right now bakes in the same
+ * container/ content a `git pull` would produce. False means origin/main has
+ * container/-relevant commits HEAD lacks: building anyway would bake
+ * whatever's on disk (possibly unrelated local edits, per CLAUDE.md's
+ * warning that build.sh builds from the working tree) into the canonical
+ * spawn image instead of what's actually reviewed and merged upstream.
+ */
+async function headCoversOriginMainContainer(originMainSha: string): Promise<boolean> {
+  const headSha = await git('rev-parse', 'HEAD');
+  if (headSha === originMainSha) return true;
+  try {
+    await git('merge-base', '--is-ancestor', originMainSha, headSha);
+    return true;
+  } catch {
+    /* origin/main has commits HEAD lacks — check if any touch container/ */
+  }
+  const changed = await git('diff', '--name-only', headSha, originMainSha, '--', 'container/');
+  return changed === '';
+}
+
 interface StepResult {
   ok: boolean;
   detail: string;
@@ -190,124 +195,141 @@ async function runStep(
   }
 }
 
-async function pullAndBuild(): Promise<StepResult> {
-  const pull = await runStep('git pull', 'git', ['pull', '--ff-only', 'origin', 'main'], 60_000, 300);
-  if (!pull.ok) return pull;
-  // Pass the exact image reference container-runner.ts spawns from. build.sh
-  // honors CONTAINER_IMAGE_REF when set — without this, build.sh derives its
-  // own base via container_image_base() and can drift from what we inspect if
-  // CONTAINER_IMAGE is overridden (env var, custom install slug, etc.).
-  return runStep('image rebuild', 'bash', [path.join(REPO_ROOT, 'container', 'build.sh'), IMAGE_TAG], 900_000, 500, {
-    ...GIT_ENV,
-    CONTAINER_IMAGE_REF: IMAGE_REF,
-  });
-}
-
-async function clearFailureState(reason: string): Promise<void> {
-  if (consecutiveFailures > 0 && notify) {
-    const prevFailures = consecutiveFailures;
-    try {
-      await notify(`✅ Container rebuild recovered (${reason} after ${prevFailures} failed attempts)`);
-    } catch (err) {
-      log.warn('Container-rebuild watcher recovery notify failed', { err });
-    }
+/** Failure path: start the retry cooldown, dedup, and notify. */
+async function fail(detail: string): Promise<void> {
+  lastFailureAt = Date.now();
+  if (detail === lastNotifiedDetail) {
+    log.debug('Container-rebuild watcher: duplicate failure suppressed', { detail });
+    return;
   }
-  lastNotifiedDetail = null;
-  consecutiveFailures = 0;
-  firstFailureAt = null;
-  lastReminderAt = null;
+  lastNotifiedDetail = detail;
+  log.warn('Container-rebuild watcher: not rebuilt', { detail });
+  if (!notify) return;
+  try {
+    await notify(`❌ ${detail}`);
+  } catch (err) {
+    log.warn('Container-rebuild watcher notify failed', { err });
+  }
 }
 
-async function tick(): Promise<void> {
-  if (running) return;
-  running = true;
+/** Success path: clear the cooldown/dedup state and send a quiet confirmation. */
+async function succeed(headSha: string): Promise<void> {
+  lastFailureAt = null;
+  lastNotifiedDetail = null;
+  log.info('Container image rebuilt', { head: short(headSha) });
+  if (!notify) return;
+  try {
+    await notify(`✅ Container image rebuilt (${short(headSha)}) — agent spawns will pick it up.`);
+  } catch (err) {
+    log.warn('Container-rebuild watcher recovery notify failed', { err });
+  }
+}
+
+async function attemptRebuild(reason: string): Promise<void> {
   try {
     await execFileAsync('git', ['fetch', '--quiet', 'origin', 'main'], {
       cwd: REPO_ROOT,
       timeout: 30_000,
       env: GIT_ENV,
     });
-    const check = await checkStaleness();
-    if (!check.stale) {
-      log.debug('Container image up to date', { reason: check.reason });
-      await clearFailureState('image up to date');
-      return;
-    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return fail(
+      `git fetch origin main failed (${msg.slice(0, 300)}) — cannot check whether a rebuild would fix the stale agent container image; agent containers cannot spawn. Check network/git config on the host, then run: ./container/build.sh`,
+    );
+  }
 
-    log.info('Container image stale — rebuilding', { reason: check.reason });
-    const result = await pullAndBuild();
-    const headSha = await git('rev-parse', 'HEAD').catch(() => '');
-    log.info('Container rebuild result', {
-      ok: result.ok,
-      detail: result.detail,
-      head: short(headSha),
-    });
+  let staleness: StalenessCheck;
+  try {
+    staleness = await checkStaleness();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return fail(
+      `Could not determine container image staleness (${msg.slice(0, 300)}). Run manually: ./container/build.sh`,
+    );
+  }
 
-    if (result.ok) {
-      await clearFailureState('rebuild succeeded');
-      return;
-    }
+  if (!staleness.stale) {
+    return fail(
+      `Agent containers are being refused (${reason}) but the image already matches origin/main for container/ (${staleness.reason}) — rebuilding will not fix this, something else is wrong. Investigate on the host, then run ./container/build.sh once fixed.`,
+    );
+  }
 
-    // Failure path — dedup, backoff, reminder.
-    consecutiveFailures++;
-    const now = Date.now();
-    if (firstFailureAt === null) firstFailureAt = now;
-    const detail = result.detail;
-    const errorChanged = detail !== lastNotifiedDetail;
-    const reminderAnchor = lastReminderAt ?? firstFailureAt;
-    const reminderDue = !errorChanged && now - reminderAnchor >= REMINDER_MS;
-
-    if (errorChanged) {
-      lastNotifiedDetail = detail;
-      firstFailureAt = now;
-      lastReminderAt = null;
-      if (notify) {
-        try {
-          await notify(`❌ Container rebuild failed: ${detail}`);
-        } catch (err) {
-          log.warn('Container-rebuild watcher notify failed', { err });
-        }
-      }
-    } else if (reminderDue) {
-      lastReminderAt = now;
-      const since = formatElapsed(now - firstFailureAt);
-      if (notify) {
-        try {
-          await notify(`⏳ Container rebuild still failing (${consecutiveFailures} attempts over ${since}): ${detail}`);
-        } catch (err) {
-          log.warn('Container-rebuild watcher reminder notify failed', { err });
-        }
-      }
-    } else {
-      log.debug('Container-rebuild watcher: duplicate failure suppressed', {
-        consecutiveFailures,
-        detail,
-      });
+  try {
+    const originMainSha = await git('rev-parse', 'origin/main');
+    if (!(await headCoversOriginMainContainer(originMainSha))) {
+      return fail(
+        `Agent containers cannot spawn — container/ changed on origin/main and the checked-out working tree hasn't picked it up. Run: git pull --ff-only origin main && ./container/build.sh`,
+      );
     }
   } catch (err) {
-    log.error('Container-rebuild watcher tick failed', { err });
-  } finally {
-    running = false;
+    const msg = err instanceof Error ? err.message : String(err);
+    return fail(
+      `Could not verify the checkout is current with origin/main (${msg.slice(0, 300)}). Run manually: ./container/build.sh`,
+    );
   }
+
+  // Pass the exact image reference container-runner.ts spawns from. build.sh
+  // honors CONTAINER_IMAGE_REF when set — without this, build.sh derives its
+  // own base via container_image_base() and can drift from what we inspect if
+  // CONTAINER_IMAGE is overridden (env var, custom install slug, etc.).
+  //
+  // Deliberately no `git pull` here: build.sh builds from the WORKING TREE
+  // while stamping NANOCLAW_COMMIT from `git rev-parse HEAD` (build.sh:73).
+  // Moving the operator's live checkout out from under them is out of scope
+  // for an automated process, and a build against a dirty tree would produce
+  // an image whose commit label misrepresents its actual contents anyway.
+  const result = await runStep('image rebuild', 'bash', [BUILD_SCRIPT, IMAGE_TAG], 900_000, 500, {
+    ...GIT_ENV,
+    CONTAINER_IMAGE_REF: IMAGE_REF,
+  });
+  if (!result.ok) {
+    return fail(
+      `Container rebuild failed — agent containers cannot spawn until this is fixed: ${result.detail}. Run manually: ./container/build.sh`,
+    );
+  }
+  const headSha = await git('rev-parse', 'HEAD').catch(() => 'unknown');
+  return succeed(headSha);
 }
 
-export function startContainerRebuildWatcher(notifier?: Notifier): void {
-  if (timer) return;
-  notify = notifier ?? null;
-  // First tick in 30s (let the service finish booting), then on a dynamic
-  // schedule: POLL_MS while healthy, exponential backoff while failing.
-  timer = setTimeout(function loop() {
-    void tick().finally(() => {
-      timer = setTimeout(loop, nextDelayMs(consecutiveFailures));
+/**
+ * Request a rebuild. Fire-and-forget: returns immediately, never awaited by
+ * callers on the spawn path. Concurrent calls while a rebuild is already in
+ * flight coalesce into that one attempt; calls within MIN_RETRY_INTERVAL_MS
+ * of a failed attempt are dropped silently (the failure was already
+ * notified) so a persistently refused spawn doesn't retry-storm the build.
+ */
+export function requestContainerRebuild(reason: string): void {
+  if (rebuildPromise) return;
+  if (lastFailureAt !== null && Date.now() - lastFailureAt < MIN_RETRY_INTERVAL_MS) return;
+  rebuildPromise = attemptRebuild(reason)
+    .catch((err) => {
+      log.error('Container-rebuild watcher: attempt threw unexpectedly', { err });
+    })
+    .finally(() => {
+      rebuildPromise = null;
     });
-  }, 30_000);
-  log.info('Container-rebuild watcher started', { pollMs: POLL_MS, image: IMAGE_REF });
+}
+
+/**
+ * Wire the rebuild notifier. No timer/poll loop anymore — "start" just means
+ * "the watcher is now listening", plus one startup check so a host that
+ * boots with an already-stale image doesn't sit quiet until the first
+ * refused spawn finds out.
+ */
+export function startContainerRebuildWatcher(notifier?: Notifier): void {
+  if (started) return;
+  started = true;
+  notify = notifier ?? null;
+  void checkAgentRunnerDepsDrift()
+    .then((check) => {
+      if (!check.ok) requestContainerRebuild(check.message);
+    })
+    .catch((err) => log.warn('Container-rebuild watcher startup check failed', { err }));
+  log.info('Container-rebuild watcher ready (event-driven, no poll loop)', { image: IMAGE_REF });
 }
 
 export function stopContainerRebuildWatcher(): void {
-  if (timer) {
-    clearTimeout(timer);
-    timer = null;
-  }
+  started = false;
   notify = null;
 }

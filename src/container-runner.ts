@@ -46,6 +46,7 @@ import { getContainerConfig, resolveProviderName } from './db/container-configs.
 import { updateContainerConfigScalars } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
+import { requestContainerRebuild } from './container-rebuild-watcher.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import {
   assertRealDirectory,
@@ -759,6 +760,13 @@ async function spawnContainer(
       actual: depsCheck.actual,
       message: depsCheck.message,
     });
+    // Fire-and-forget: only the shared base image is something this watcher
+    // can fix by rebuilding (a per-agent override image built via
+    // install_packages needs that self-mod re-run, not a base rebuild — see
+    // rebuildHint() in agent-runner-image-check.ts). Never awaited — the
+    // refusal below must return immediately; host-sweep retries the spawn
+    // and picks up the new image once the detached rebuild lands.
+    if (spawnImageRef === CONTAINER_IMAGE) requestContainerRebuild(depsCheck.message);
     throw new Error(depsCheck.message);
   }
 
