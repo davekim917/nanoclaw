@@ -933,6 +933,29 @@ describe('codex OAuth fallback — rotation primitives', () => {
         expect(new CodexProvider().rotateCodexHome()).toBeNull();
       });
     });
+
+    it('keeps the provider-lifetime primary home after rotation changes CODEX_HOME', () => {
+      withEnv(
+        {
+          CODEX_HOME: '/home/node/.codex-primary',
+          CODEX_PRIMARY_HOST_HOME: '/host/.codex-primary',
+          CODEX_FALLBACK_HOMES: '/home/node/.codex-fallback',
+        },
+        () => {
+          const provider = new CodexProvider() as unknown as {
+            primaryCodexHome: string;
+            primaryHostCodexHome: string | undefined;
+            rotateCodexHome: () => string | null;
+          };
+
+          expect(provider.rotateCodexHome()).toBe('/home/node/.codex-fallback');
+          process.env.CODEX_HOME = '/home/node/.codex-fallback';
+
+          expect(provider.primaryCodexHome).toBe('/home/node/.codex-primary');
+          expect(provider.primaryHostCodexHome).toBe('/host/.codex-primary');
+        },
+      );
+    });
   });
 
   describe('runOneTurn error → ProviderEvent classification mapping', () => {
@@ -1098,14 +1121,25 @@ describe('codex OAuth fallback — rotation primitives', () => {
         })
         .join('\n');
 
-      const refreshIdx = codeOnly.indexOf('refreshCodexAuthFromHost(currentCodexHome, primaryHostCodexHome)');
+      const refreshIdx = codeOnly.indexOf('refreshCodexAuthFromHost(currentCodexHome, self.primaryHostCodexHome)');
       const fallbackIdx = codeOnly.indexOf('if (eligible && self.nextFallback < self.fallbackHomes.length)');
       const surfaceIdx = codeOnly.indexOf('yield ev;');
       expect(refreshIdx).toBeGreaterThan(-1);
       expect(fallbackIdx).toBeGreaterThan(refreshIdx);
       expect(surfaceIdx).toBeGreaterThan(fallbackIdx);
-      expect(codeOnly).toContain('process.env.CODEX_PRIMARY_HOST_HOME');
+      expect(codeOnly).toContain('self.primaryCodexHome');
+      expect(codeOnly).toContain('self.primaryHostCodexHome');
       expect(codeOnly).toContain('primaryAuthRefreshAttempted = true');
+    });
+
+    it('restores the original request when OAuth rotation starts a fresh thread after recovery', () => {
+      const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+      const rotation = src.slice(
+        src.indexOf('const previousThreadId: string | undefined = threadId;', src.indexOf('Codex OAuth rotating')),
+      );
+      expect(rotation).toMatch(
+        /if \(threadId !== previousThreadId\) \{[\s\S]*attemptText = text;[\s\S]*resetCodexTurnAccumulatorThread/,
+      );
     });
   });
 });

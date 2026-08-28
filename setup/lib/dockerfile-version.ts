@@ -78,6 +78,10 @@ function dockerArgDeclaration(value: string, name: string): DockerArgDeclaration
   return match === null ? undefined : { value: match[1] };
 }
 
+function dockerEnvShadowsArg(value: string, name: string): boolean {
+  return new RegExp('(?:^|\\s)' + name + '=').test(value) || new RegExp('^' + name + '\\s+').test(value);
+}
+
 function lastGlobalDockerArg(instructions: DockerInstruction[], name: string): string | undefined {
   const firstStage = instructions.findIndex((instruction) => instruction.name === 'FROM');
   if (firstStage < 0) return undefined;
@@ -133,14 +137,17 @@ export function effectiveDockerArgBeforeFinalRun(
   const globalValue = lastGlobalDockerArg(instructions, name);
   let effective: string | undefined;
   let redeclared = false;
+  let shadowedByEnv = false;
   for (const instruction of instructions.slice(stageStart + 1, consumerIndex)) {
-    if (instruction.name !== 'ARG') continue;
-    const declaration = dockerArgDeclaration(instruction.value, name);
-    if (declaration === undefined) continue;
-    redeclared = true;
-    effective = declaration.value ?? globalValue;
+    if (instruction.name === 'ENV' && dockerEnvShadowsArg(instruction.value, name)) shadowedByEnv = true;
+    if (instruction.name === 'ARG') {
+      const declaration = dockerArgDeclaration(instruction.value, name);
+      if (declaration === undefined) continue;
+      redeclared = true;
+      effective = declaration.value ?? globalValue;
+    }
   }
-  return redeclared ? effective : undefined;
+  return redeclared && !shadowedByEnv ? effective : undefined;
 }
 
 /** Return the final ARG declaration for diagnostics when no consuming RUN exists. */

@@ -90,4 +90,44 @@ describe('Dockerfile provider version parsing', () => {
 
     expect(effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', packageText)).toBeUndefined();
   });
+
+  it('rejects a version ENV that shadows the exact ARG before the consuming RUN', () => {
+    const packageText = '"@openai/codex@${CODEX_VERSION}"';
+    const dockerfile = [
+      'FROM node:22-slim',
+      'ARG CODEX_VERSION=0.150.1',
+      'ENV CODEX_VERSION=latest',
+      'RUN pnpm install -g ' + packageText,
+      '',
+    ].join('\n');
+
+    expect(effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', packageText)).toBeUndefined();
+  });
+
+  it('allows an unrelated ENV before the consuming RUN', () => {
+    const packageText = '"@openai/codex@${CODEX_VERSION}"';
+    const dockerfile = [
+      'FROM node:22-slim',
+      'ARG CODEX_VERSION=0.150.1',
+      'ENV OTHER_VERSION=latest',
+      'RUN pnpm install -g ' + packageText,
+      '',
+    ].join('\n');
+
+    expect(effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', packageText)).toBe('0.150.1');
+  });
+
+  it('does not let a later ARG undo an intervening version ENV', () => {
+    const packageText = '"@openai/codex@${CODEX_VERSION}"';
+    const dockerfile = [
+      'FROM node:22-slim',
+      'ARG CODEX_VERSION=0.150.1',
+      'ENV CODEX_VERSION=latest',
+      'ARG CODEX_VERSION=0.150.2',
+      'RUN pnpm install -g ' + packageText,
+      '',
+    ].join('\n');
+
+    expect(effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', packageText)).toBeUndefined();
+  });
 });
