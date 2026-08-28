@@ -28,6 +28,44 @@ describe('Dockerfile provider version parsing', () => {
     ]);
   });
 
+  it('requires a global package-manager install rather than arbitrary RUN text', () => {
+    const packageText = '"@openai/codex@${CODEX_VERSION}"';
+    const unpinnedInstallThenEcho = [
+      'FROM node:22-slim',
+      'ARG CODEX_VERSION=0.150.1',
+      'RUN pnpm install -g "@openai/codex@latest"',
+      `RUN echo ${packageText}`,
+      '',
+    ].join('\n');
+    const pinnedInstallThenEcho = [
+      'FROM node:22-slim',
+      'ARG CODEX_VERSION=0.150.1',
+      `RUN pnpm install -g ${packageText} && echo ${packageText}`,
+      '',
+    ].join('\n');
+
+    expect(hasDockerRunConsumer(unpinnedInstallThenEcho, packageText)).toBe(false);
+    expect(effectiveDockerArgBeforeFinalRun(unpinnedInstallThenEcho, 'CODEX_VERSION', packageText)).toBeUndefined();
+    expect(hasDockerRunConsumer(pinnedInstallThenEcho, packageText)).toBe(true);
+    expect(effectiveDockerArgBeforeFinalRun(pinnedInstallThenEcho, 'CODEX_VERSION', packageText)).toBe('0.150.1');
+  });
+
+  it.each([['pnpm install -g'], ['npm install --global'], ['bun install -g'], ['bun add -g']])(
+    'recognizes a real global %s consumer',
+    (install) => {
+      const packageText = '"@openai/codex@${CODEX_VERSION}"';
+      const dockerfile = [
+        'FROM node:22-slim',
+        'ARG CODEX_VERSION=0.150.1',
+        `RUN --mount=type=cache,target=/tmp/cache ${install} ${packageText}`,
+        '',
+      ].join('\n');
+
+      expect(hasDockerRunConsumer(dockerfile, packageText)).toBe(true);
+      expect(effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', packageText)).toBe('0.150.1');
+    },
+  );
+
   it.each([
     ['CLAUDE_CODE_VERSION', '2.1.250', '"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"'],
     ['CODEX_VERSION', '0.150.1', '"@openai/codex@${CODEX_VERSION}"'],
@@ -125,6 +163,49 @@ describe('Dockerfile provider version parsing', () => {
       'ENV CODEX_VERSION=latest',
       'ARG CODEX_VERSION=0.150.2',
       'RUN pnpm install -g ' + packageText,
+      '',
+    ].join('\n');
+
+    expect(effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', packageText)).toBeUndefined();
+  });
+
+  it('rejects an ENV shadow inherited through named-stage aliases', () => {
+    const packageText = '"@openai/codex@${CODEX_VERSION}"';
+    const dockerfile = [
+      'FROM node:22-slim AS base',
+      'ENV CODEX_VERSION=latest',
+      'FROM base AS intermediate',
+      'FROM intermediate',
+      'ARG CODEX_VERSION=0.150.1',
+      `RUN pnpm install -g ${packageText}`,
+      '',
+    ].join('\n');
+
+    expect(effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', packageText)).toBeUndefined();
+  });
+
+  it('allows an unrelated inherited ENV and ignores an ENV after the consumer', () => {
+    const packageText = '"@openai/codex@${CODEX_VERSION}"';
+    const dockerfile = [
+      'FROM node:22-slim AS base',
+      'ENV OTHER_VERSION=latest',
+      'FROM base AS final',
+      'ARG CODEX_VERSION=0.150.1',
+      `RUN pnpm install -g ${packageText}`,
+      'ENV CODEX_VERSION=latest',
+      '',
+    ].join('\n');
+
+    expect(effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', packageText)).toBe('0.150.1');
+  });
+
+  it('fails closed when the consuming stage base is unresolved', () => {
+    const packageText = '"@openai/codex@${CODEX_VERSION}"';
+    const dockerfile = [
+      'ARG RUNTIME_IMAGE=node:22-slim',
+      'FROM ${RUNTIME_IMAGE}',
+      'ARG CODEX_VERSION=0.150.1',
+      `RUN pnpm install -g ${packageText}`,
       '',
     ].join('\n');
 
