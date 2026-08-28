@@ -108,11 +108,14 @@ if [ -n "$IMAGE_COMMIT" ] && git cat-file -e "${IMAGE_COMMIT}^{commit}" 2>/dev/n
 else
   CONTAINER_CHANGES="no-image-or-unlabeled"
 fi
+IMAGE_SAVED_BASE=""
 if [ -n "$CONTAINER_CHANGES" ]; then
   # Keep the current spawn image reachable for the crash guard's rollback:
-  # the rebuild replaces :latest, so retag it first.
+  # the rebuild replaces :latest, so retag it first. Record that THIS deploy
+  # saved it — the guard must never retag a stale tag from an older deploy.
   if docker inspect "$SPAWN_IMAGE" >/dev/null 2>&1; then
     docker tag "$SPAWN_IMAGE" "$(container_image_base):pre-deploy" >> "$LOG" 2>&1
+    IMAGE_SAVED_BASE="$(container_image_base)"
   fi
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Container changed (or image unlabeled), rebuilding ${SPAWN_IMAGE}..." >> "$LOG"
   write_status "running" "container build" ""
@@ -128,9 +131,23 @@ echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Build complete, restarting..." >> "$LOG"
 # kills this script's process group, so nothing HERE can watch the service
 # come up — the guard runs inside every boot of the new build instead, and
 # this manifest is what tells it a rollback point exists and is fresh.
-mkdir -p data
-printf '{"commit":"%s","imageBase":"%s","timestamp":"%s"}\n' \
-  "$PRE_COMMIT" "$(container_image_base)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > data/deploy-rollback.json
+#
+# Two deliberate limits (codex review on PR #180):
+# - A deploy that ships new migrations does NOT arm the guard: migrations can
+#   be destructive (dropped columns/tables), so restoring old code against the
+#   migrated database is worse than the crash loop. Those deploys keep the
+#   pre-guard behavior; the operator decides.
+# - imageBase is recorded only when THIS deploy retagged :pre-deploy. A stale
+#   tag from an earlier deploy must never be retagged over the current image.
+MIGRATION_CHANGES=$(git diff --name-only "$PRE_COMMIT" HEAD -- src/db/migrations/ 2>/dev/null)
+if [ -z "$MIGRATION_CHANGES" ]; then
+  mkdir -p data
+  printf '{"commit":"%s","imageBase":"%s","timestamp":"%s"}\n' \
+    "$PRE_COMMIT" "${IMAGE_SAVED_BASE}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > data/deploy-rollback.json
+else
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Crash guard NOT armed: deploy ships migrations ($(echo "$MIGRATION_CHANGES" | head -3 | tr '\n' ' '))" >> "$LOG"
+  rm -f data/deploy-rollback.json
+fi
 
 # Write success status BEFORE restart — systemctl restart kills this script's
 # process group, so lines after don't run. The new process reads this file

@@ -156,8 +156,8 @@ describe('performRollback', () => {
       status: string;
       error: string;
     };
-    expect(status.status).toBe('rolled-back');
-    expect(status.error).toContain('3 failed boots');
+    expect(status.status).toBe('failed');
+    expect(status.error).toContain('rolled back automatically after 3 failed boots');
     // Disarmed: no manifest, no attempts — a failed rollback must not loop.
     expect(fs.existsSync(path.join(root, 'data', 'deploy-rollback.json'))).toBe(false);
     expect(fs.existsSync(path.join(root, 'data', 'deploy-boot-attempts.json'))).toBe(false);

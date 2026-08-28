@@ -141,10 +141,14 @@ export function performRollback(
       // No pre-deploy tag (deploy didn't rebuild the image) — nothing to undo.
     }
   }
+  // Deliberately `failed`, not a new status value: if the FIRST deploy
+  // carrying this guard is the one that crash-loops, the restored dist's
+  // announcer only understands ok/failed and silently consumes anything
+  // else. `failed` + this step/error reads correctly on every build.
   const status = {
-    status: 'rolled-back',
+    status: 'failed',
     step: 'crash guard',
-    error: `${attempts} failed boots after deploy — restored ${restored.join(', ') || 'nothing (no snapshots found)'}`,
+    error: `rolled back automatically after ${attempts} failed boots — restored ${restored.join(', ') || 'nothing (no snapshots found)'}; the deployed commit needs a fix before retrying`,
     timestamp: new Date(deps.now()).toISOString(),
   };
   try {

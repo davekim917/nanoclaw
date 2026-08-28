@@ -120,7 +120,7 @@ function spawnDetachedLogged(script: string): void {
 }
 
 interface DeployStatus {
-  status?: 'ok' | 'failed' | 'rolled-back';
+  status?: 'ok' | 'failed';
   step?: string;
   error?: string;
   mtimeMs: number;
@@ -198,12 +198,6 @@ async function announceDeployStatus(): Promise<void> {
     await textChannel.send('Deploy complete — service is up.');
   } else if (status.status === 'failed') {
     await textChannel.send(formatFailure(status));
-  } else if (status.status === 'rolled-back') {
-    // Written by src/deploy-crash-guard.ts after a post-deploy crash loop; we
-    // are announcing from the restored pre-deploy build.
-    await textChannel.send(
-      `⚠️ Deploy rolled back automatically: ${status.error ?? 'no detail'}. The service is running the pre-deploy build — the deployed commit needs a fix before retrying.`,
-    );
   }
   consumeDeployStatus();
 }
