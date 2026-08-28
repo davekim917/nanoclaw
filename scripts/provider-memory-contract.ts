@@ -235,9 +235,10 @@ export function validateProviderMemoryPayload(
         issues,
         skillFile,
         skill,
-        /mapfile -t OPENCODE_PINS[\s\S]*test "\$\{#OPENCODE_PINS\[@\]\}" -eq 1[\s\S]*OPENCODE_VERSION="\$\{OPENCODE_PINS\[0\]\}"[\s\S]*@opencode-ai\/sdk@"?\$\{OPENCODE_VERSION\}"?/,
+        /OPENCODE_VERSION="\$\(sed -nE[\s\S]*grep -Ec[\s\S]*@opencode-ai\/sdk@"?\$\{OPENCODE_VERSION\}"?/,
         'Dockerfile-derived OpenCode SDK pin',
       );
+      rejectMatch(issues, skillFile, skill, /mapfile/, 'macOS-incompatible OpenCode pin extraction');
       requireMatch(
         issues,
         skillFile,

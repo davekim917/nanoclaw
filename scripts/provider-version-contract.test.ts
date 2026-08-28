@@ -9,28 +9,29 @@ const agentRunnerPackage = JSON.parse(
   fs.readFileSync(path.join(root, 'container/agent-runner/package.json'), 'utf8'),
 ) as { dependencies: Record<string, string> };
 
-function dockerArg(name: string): string | undefined {
-  return dockerfile.match(new RegExp(`^ARG\\s+${name}=([^\\s#]+)\\s*$`, 'm'))?.[1];
+function dockerArg(text: string, name: string, consumingInstall: string): string | undefined {
+  const installIndex = text.lastIndexOf(consumingInstall);
+  if (installIndex < 0) return undefined;
+
+  const declarations = [
+    ...text.slice(0, installIndex).matchAll(new RegExp(`^ARG\\s+${name}=([^\\s#]+)(?:\\s+#.*)?\\s*$`, 'gm')),
+  ];
+  return declarations.at(-1)?.[1];
 }
 
 describe('provider version contracts', () => {
   it('test_claude_cli_agent_sdk_lockstep', () => {
-    const cliVersion = dockerArg('CLAUDE_CODE_VERSION');
+    const cliVersion = dockerArg(
+      dockerfile,
+      'CLAUDE_CODE_VERSION',
+      '"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"',
+    );
     expect(cliVersion).toMatch(/^\d+\.\d+\.\d+$/);
     expect(agentRunnerPackage.dependencies['@anthropic-ai/claude-agent-sdk']).toMatch(/^\d+\.\d+\.\d+$/);
-
-    const sdkPackage = JSON.parse(
-      fs.readFileSync(
-        path.join(root, 'container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json'),
-        'utf8',
-      ),
-    ) as { version: string; claudeCodeVersion: string };
-    expect(sdkPackage.version).toBe(agentRunnerPackage.dependencies['@anthropic-ai/claude-agent-sdk']);
-    expect(sdkPackage.claudeCodeVersion).toBe(cliVersion);
   });
 
   it('test_codex_pin_is_exact_and_consumed', () => {
-    const pin = dockerArg('CODEX_VERSION');
+    const pin = dockerArg(dockerfile, 'CODEX_VERSION', '"@openai/codex@${CODEX_VERSION}"');
     expect(pin).toMatch(/^\d+\.\d+\.\d+$/);
     expect(dockerfile).toContain('"@openai/codex@${CODEX_VERSION}"');
 
@@ -39,7 +40,7 @@ describe('provider version contracts', () => {
   });
 
   it('test_opencode_all_operational_pins_match', () => {
-    const pin = dockerArg('OPENCODE_VERSION');
+    const pin = dockerArg(dockerfile, 'OPENCODE_VERSION', '"opencode-ai@${OPENCODE_VERSION}"');
     expect(pin).toMatch(/^\d+\.\d+\.\d+$/);
     expect(agentRunnerPackage.dependencies['@opencode-ai/sdk']).toBe(pin);
 
@@ -51,15 +52,28 @@ describe('provider version contracts', () => {
 
     const addSkill = fs.readFileSync(path.join(root, '.claude/skills/add-opencode/SKILL.md'), 'utf8');
     const cloneSkill = fs.readFileSync(path.join(root, '.claude/skills/clone-as-opencode/SKILL.md'), 'utf8');
-    expect(addSkill).toContain('mapfile -t OPENCODE_PINS');
-    expect(addSkill).toContain('test "${#OPENCODE_PINS[@]}" -eq 1');
+    expect(addSkill).not.toContain('mapfile');
+    expect(addSkill).toContain('OPENCODE_VERSION="$(sed -nE');
+    expect(addSkill).toContain("grep -Ec '^[0-9]+\\.[0-9]+\\.[0-9]+$'");
     expect(addSkill).toContain('replace any\nexisting `ARG OPENCODE_VERSION=...` declaration');
     expect(addSkill).toContain('@opencode-ai/sdk@"${OPENCODE_VERSION}"');
     expect(addSkill).toContain(`ARG OPENCODE_VERSION=${pin}`);
     expect(addSkill.indexOf(`ARG OPENCODE_VERSION=${pin}`)).toBeLessThan(
-      addSkill.indexOf('mapfile -t OPENCODE_PINS'),
+      addSkill.indexOf('OPENCODE_VERSION="$(sed -nE'),
     );
-    expect(cloneSkill).toContain('mapfile -t OPENCODE_PINS');
-    expect(cloneSkill).toContain('test "${#OPENCODE_PINS[@]}" -eq 1');
+    expect(cloneSkill).not.toContain('mapfile');
+    expect(cloneSkill).toContain('OPENCODE_VERSION="$(sed -nE');
+    expect(cloneSkill).toContain("grep -Ec '^[0-9]+\\.[0-9]+\\.[0-9]+$'");
+  });
+
+  it.each([
+    ['CLAUDE_CODE_VERSION', '2.1.250', '"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"'],
+    ['OPENCODE_VERSION', '1.18.23', '"opencode-ai@${OPENCODE_VERSION}"'],
+  ])('uses the effective %s declaration before its final install', (name, version, consumingInstall) => {
+    const overridden = `ARG ${name}=${version}\nARG ${name}=latest\nRUN pnpm install -g ${consumingInstall}\n`;
+    expect(dockerArg(overridden, name, consumingInstall)).toBe('latest');
+
+    const corrected = `ARG ${name}=latest\nARG ${name}=${version}\nRUN pnpm install -g ${consumingInstall}\n`;
+    expect(dockerArg(corrected, name, consumingInstall)).toBe(version);
   });
 });

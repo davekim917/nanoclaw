@@ -71,9 +71,8 @@ function conformantFixture(provider: MemoryConformantProvider): Map<string, stri
       '.claude/skills/add-opencode/SKILL.md',
       [
         'pnpm exec tsx scripts/provider-memory-contract.ts --provider opencode --ref "$remote/providers" --install',
-        "mapfile -t OPENCODE_PINS < <(sed -nE 's/^ARG OPENCODE_VERSION=([0-9]+\\.[0-9]+\\.[0-9]+)$/\\1/p' container/Dockerfile)",
-        'test "${#OPENCODE_PINS[@]}" -eq 1',
-        'OPENCODE_VERSION="${OPENCODE_PINS[0]}"',
+        'OPENCODE_VERSION="$(sed -nE \'s/^ARG OPENCODE_VERSION=([0-9]+\\.[0-9]+\\.[0-9]+)$/\\1/p\' container/Dockerfile)"',
+        'test "$(printf \'%s\\n\' "$OPENCODE_VERSION" | grep -Ec \'^[0-9]+\\.[0-9]+\\.[0-9]+$\')" -eq 1',
         'cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -',
         'ncl groups config update --id <group-id> --provider opencode',
         'The installer fails closed before the first write for a possible local customization.',

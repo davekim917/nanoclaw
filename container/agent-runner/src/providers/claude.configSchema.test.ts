@@ -55,6 +55,14 @@ const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 const TEST_CLAUDE_CONFIG_DIR = '/tmp/nanoclaw-claude-config-schema';
 const ORIGINAL_CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR;
 
+function readJson(file: string): { dependencies?: Record<string, string>; version: string; claudeCodeVersion: string } {
+  return JSON.parse(fs.readFileSync(file, 'utf8')) as {
+    dependencies?: Record<string, string>;
+    version: string;
+    claudeCodeVersion: string;
+  };
+}
+
 beforeAll(() => {
   fs.rmSync(TEST_CLAUDE_CONFIG_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_CLAUDE_CONFIG_DIR, { recursive: true });
@@ -76,6 +84,20 @@ function makeClaudeProvider(
 }
 
 describe('claudeConfigSchema', () => {
+  it('test_claude_cli_agent_sdk_lockstep: installed SDK declares the image CLI version', () => {
+    const agentRunnerRoot = path.resolve(import.meta.dir, '../..');
+    const repoRoot = path.resolve(agentRunnerRoot, '../..');
+    const declaredSdk = readJson(path.join(agentRunnerRoot, 'package.json'));
+    const installedSdk = readJson(
+      path.join(agentRunnerRoot, 'node_modules/@anthropic-ai/claude-agent-sdk/package.json'),
+    );
+    const dockerfile = fs.readFileSync(path.join(repoRoot, 'container/Dockerfile'), 'utf8');
+    const cliVersion = dockerfile.match(/^ARG CLAUDE_CODE_VERSION=([^\s#]+)(?:\s+#.*)?$/m)?.[1];
+
+    expect(installedSdk.version).toBe(declaredSdk.dependencies?.['@anthropic-ai/claude-agent-sdk']);
+    expect(installedSdk.claudeCodeVersion).toBe(cliVersion);
+  });
+
   it('test_claude_effort_contract: the runtime schema exposes the SDK effort surface', () => {
     expect(CLAUDE_EFFORT_LEVELS).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
   });
