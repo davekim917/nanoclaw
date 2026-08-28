@@ -37,8 +37,9 @@ describe('container/Dockerfile installs the OpenCode CLI', () => {
   const text = dockerfile();
 
   it('declares a pinned OPENCODE_VERSION build arg (not latest)', () => {
-    expect(text).toMatch(/^ARG\s+OPENCODE_VERSION=\S+/m);
-    expect(text).not.toMatch(/^ARG\s+OPENCODE_VERSION=latest\s*$/m);
+    const declarations = [...text.matchAll(/^ARG\s+OPENCODE_VERSION=([^\s#]+)\s*$/gm)];
+    expect(declarations).toHaveLength(1);
+    expect(declarations[0]?.[1]).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
   it('globally installs the pinned opencode-ai package via pnpm', () => {

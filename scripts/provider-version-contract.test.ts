@@ -36,7 +36,7 @@ describe('provider version contracts', () => {
     expect(dockerfile).toContain('"@openai/codex@${CODEX_VERSION}"');
 
     const skill = fs.readFileSync(path.join(root, '.claude/skills/add-codex/SKILL.md'), 'utf8');
-    expect(skill).toContain('CODEX_VERSION=$(sed -nE');
+    expect(skill).toContain('verifyCodexInstall');
     expect(skill).not.toContain('0.145.0');
   });
 
@@ -63,13 +63,16 @@ describe('provider version contracts', () => {
 
     const addSkill = fs.readFileSync(path.join(root, '.claude/skills/add-opencode/SKILL.md'), 'utf8');
     const cloneSkill = fs.readFileSync(path.join(root, '.claude/skills/clone-as-opencode/SKILL.md'), 'utf8');
-    expect(addSkill).toContain('OPENCODE_VERSION=$(sed -nE');
+    expect(addSkill).toContain('mapfile -t OPENCODE_PINS');
+    expect(addSkill).toContain('test "${#OPENCODE_PINS[@]}" -eq 1');
+    expect(addSkill).toContain('replace any\nexisting `ARG OPENCODE_VERSION=...` declaration');
     expect(addSkill).toContain('@opencode-ai/sdk@"${OPENCODE_VERSION}"');
     expect(addSkill).toContain(`ARG OPENCODE_VERSION=${pin}`);
     expect(addSkill.indexOf(`ARG OPENCODE_VERSION=${pin}`)).toBeLessThan(
-      addSkill.indexOf('OPENCODE_VERSION=$(sed -nE'),
+      addSkill.indexOf('mapfile -t OPENCODE_PINS'),
     );
-    expect(cloneSkill).toContain('OPENCODE_VERSION=$(sed -nE');
+    expect(cloneSkill).toContain('mapfile -t OPENCODE_PINS');
+    expect(cloneSkill).toContain('test "${#OPENCODE_PINS[@]}" -eq 1');
   });
 
   it('test_no_stale_operational_provider_pins', () => {

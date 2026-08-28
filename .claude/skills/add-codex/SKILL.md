@@ -102,7 +102,7 @@ Read the current exact pin from the Dockerfile; the skill has no second version
 source to drift from the image.
 
 ```nc:run effect:check
-bash -lc 'set -euo pipefail; CODEX_VERSION=$(sed -nE "s/^ARG CODEX_VERSION=([0-9]+\\.[0-9]+\\.[0-9]+)$/\\1/p" container/Dockerfile); test -n "$CODEX_VERSION"; grep -Fq "\"@openai/codex@\${CODEX_VERSION}\"" container/Dockerfile'
+pnpm exec tsx -e 'import { verifyCodexInstall } from "./setup/providers/codex.ts"; const result = verifyCodexInstall(); if (!result.ok) { console.error(result.problems.join("\n")); process.exit(1); }'
 ```
 
 If either check fails, stop. Reconcile the Dockerfile through the repository's
