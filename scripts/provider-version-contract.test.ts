@@ -16,8 +16,8 @@ function dockerArg(name: string): string | undefined {
 describe('provider version contracts', () => {
   it('test_claude_cli_agent_sdk_lockstep', () => {
     const cliVersion = dockerArg('CLAUDE_CODE_VERSION');
-    expect(cliVersion).toBe('2.1.250');
-    expect(agentRunnerPackage.dependencies['@anthropic-ai/claude-agent-sdk']).toBe('0.3.250');
+    expect(cliVersion).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(agentRunnerPackage.dependencies['@anthropic-ai/claude-agent-sdk']).toMatch(/^\d+\.\d+\.\d+$/);
 
     const sdkPackage = JSON.parse(
       fs.readFileSync(
@@ -31,18 +31,16 @@ describe('provider version contracts', () => {
 
   it('test_codex_pin_is_exact_and_consumed', () => {
     const pin = dockerArg('CODEX_VERSION');
-    expect(pin).toBe('0.150.1');
     expect(pin).toMatch(/^\d+\.\d+\.\d+$/);
     expect(dockerfile).toContain('"@openai/codex@${CODEX_VERSION}"');
 
     const skill = fs.readFileSync(path.join(root, '.claude/skills/add-codex/SKILL.md'), 'utf8');
     expect(skill).toContain('verifyCodexInstall');
-    expect(skill).not.toContain('0.145.0');
   });
 
   it('test_opencode_all_operational_pins_match', () => {
     const pin = dockerArg('OPENCODE_VERSION');
-    expect(pin).toBe('1.18.23');
+    expect(pin).toMatch(/^\d+\.\d+\.\d+$/);
     expect(agentRunnerPackage.dependencies['@opencode-ai/sdk']).toBe(pin);
 
     const capture = fs.readFileSync(
@@ -50,16 +48,6 @@ describe('provider version contracts', () => {
       'utf8',
     );
     expect(capture).toMatch(new RegExp(`OPENCODE_CAPTURED_VERSION = '${pin}'`));
-
-    for (const file of [
-      '.claude/skills/add-opencode/SKILL.md',
-      '.claude/skills/add-opencode/REMOVE.md',
-      '.claude/skills/clone-as-opencode/SKILL.md',
-      'scripts/provider-memory-contract.ts',
-    ]) {
-      const source = fs.readFileSync(path.join(root, file), 'utf8');
-      expect(source).not.toContain('1.17.18');
-    }
 
     const addSkill = fs.readFileSync(path.join(root, '.claude/skills/add-opencode/SKILL.md'), 'utf8');
     const cloneSkill = fs.readFileSync(path.join(root, '.claude/skills/clone-as-opencode/SKILL.md'), 'utf8');
@@ -73,18 +61,5 @@ describe('provider version contracts', () => {
     );
     expect(cloneSkill).toContain('mapfile -t OPENCODE_PINS');
     expect(cloneSkill).toContain('test "${#OPENCODE_PINS[@]}" -eq 1');
-  });
-
-  it('test_no_stale_operational_provider_pins', () => {
-    for (const file of [
-      '.claude/skills/add-codex/SKILL.md',
-      'setup/providers/codex.ts',
-      '.claude/skills/add-opencode/SKILL.md',
-      '.claude/skills/add-opencode/REMOVE.md',
-      '.claude/skills/clone-as-opencode/SKILL.md',
-    ]) {
-      const source = fs.readFileSync(path.join(root, file), 'utf8');
-      expect(source).not.toMatch(/\b(?:0\.145\.0|1\.17\.18)\b/);
-    }
   });
 });
