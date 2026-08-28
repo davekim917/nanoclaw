@@ -231,7 +231,13 @@ export function validateProviderMemoryPayload(
         /provider-memory-contract\.ts --provider opencode --ref "\$remote\/providers" --install/,
         'create-only fetched-ref installer',
       );
-      requireMatch(issues, skillFile, skill, /@opencode-ai\/sdk@1\.17\.18/, 'current pinned OpenCode SDK');
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /OPENCODE_VERSION=\$\(sed -nE[\s\S]*@opencode-ai\/sdk@"?\$\{OPENCODE_VERSION\}"?/,
+        'Dockerfile-derived OpenCode SDK pin',
+      );
       requireMatch(
         issues,
         skillFile,

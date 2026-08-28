@@ -71,7 +71,8 @@ function conformantFixture(provider: MemoryConformantProvider): Map<string, stri
       '.claude/skills/add-opencode/SKILL.md',
       [
         'pnpm exec tsx scripts/provider-memory-contract.ts --provider opencode --ref "$remote/providers" --install',
-        'cd container/agent-runner && bun add @opencode-ai/sdk@1.17.18 && cd -',
+        "OPENCODE_VERSION=$(sed -nE 's/^ARG OPENCODE_VERSION=([0-9]+\\.[0-9]+\\.[0-9]+)$/\\1/p' container/Dockerfile)",
+        'cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -',
         'ncl groups config update --id <group-id> --provider opencode',
         'The installer fails closed before the first write for a possible local customization.',
       ].join('\n'),
@@ -174,7 +175,7 @@ describe('provider registry memory conformance', () => {
     expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toEqual(
       expect.arrayContaining([
         expect.stringContaining('create-only fetched-ref installer'),
-        expect.stringContaining('current pinned OpenCode SDK'),
+        expect.stringContaining('Dockerfile-derived OpenCode SDK pin'),
         expect.stringContaining('container-config provider selection'),
         expect.stringContaining('customization-preserving fail-closed contract'),
         expect.stringContaining('retired AGENT_PROVIDER configuration'),
@@ -417,7 +418,7 @@ describe('provider registry memory conformance', () => {
     const skill = fs.readFileSync(path.join(process.cwd(), '.claude/skills/add-codex/SKILL.md'), 'utf8');
     const removal = fs.readFileSync(path.join(process.cwd(), '.claude/skills/add-codex/REMOVE.md'), 'utf8');
 
-    expect(skill).toContain('ARG CODEX_VERSION=0.145.0');
+    expect(skill).toContain('CODEX_VERSION=$(sed -nE');
     expect(skill).toContain('"@openai/codex@${CODEX_VERSION}"');
     expect(skill).not.toContain('nc:json-merge into:container/cli-tools.json');
     expect(skill).not.toContain('{ "name": "@openai/codex"');

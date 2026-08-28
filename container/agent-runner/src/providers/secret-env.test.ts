@@ -4,8 +4,9 @@ import fs from 'fs';
 import { buildSecretEnvVarList, ANTHROPIC_KEY_RE, OAUTH_KEY_RE } from './secret-env.js';
 
 describe('buildSecretEnvVarList', () => {
-  const savedEnv: Record<string, string | undefined> = {};
-  const TOUCHED = [
+  let savedEnv: Record<string, string | undefined> = {};
+  let touched: string[] = [];
+  const BASE_TOUCHED = [
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_API_KEY_2',
     'CLAUDE_CODE_OAUTH_TOKEN',
@@ -18,12 +19,19 @@ describe('buildSecretEnvVarList', () => {
   ];
 
   beforeEach(() => {
-    for (const k of TOUCHED) savedEnv[k] = process.env[k];
-    for (const k of TOUCHED) delete process.env[k];
+    touched = [
+      ...new Set([
+        ...BASE_TOUCHED,
+        ...Object.keys(process.env).filter((key) => ANTHROPIC_KEY_RE.test(key) || OAUTH_KEY_RE.test(key)),
+      ]),
+    ];
+    savedEnv = {};
+    for (const k of touched) savedEnv[k] = process.env[k];
+    for (const k of touched) delete process.env[k];
   });
 
   afterEach(() => {
-    for (const k of TOUCHED) {
+    for (const k of touched) {
       if (savedEnv[k] === undefined) delete process.env[k];
       else process.env[k] = savedEnv[k];
     }

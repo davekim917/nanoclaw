@@ -49,7 +49,7 @@ mock.module('../worktree-autosave.js', () => ({
 }));
 
 // Now import the schema and provider (after mocks are set up)
-const { claudeConfigSchema, discoverPlugins } = await import('./claude.js');
+const { CLAUDE_EFFORT_LEVELS, claudeConfigSchema, discoverPlugins } = await import('./claude.js');
 const { ClaudeProvider } = await import('./claude.js');
 const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
 const TEST_CLAUDE_CONFIG_DIR = '/tmp/nanoclaw-claude-config-schema';
@@ -76,6 +76,10 @@ function makeClaudeProvider(
 }
 
 describe('claudeConfigSchema', () => {
+  it('test_claude_effort_contract: the runtime schema exposes the SDK effort surface', () => {
+    expect(CLAUDE_EFFORT_LEVELS).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
   it('test_claudeConfigSchema_valid_effort_max: parses { effort: max }', () => {
     const result = claudeConfigSchema.parse({ effort: 'max' });
     expect(result).toEqual({ effort: 'max' });

@@ -19,7 +19,7 @@
 # publish a linux/arm64 prebuilt at storage.googleapis.com. The alias FROM
 # lets us pull the binary via COPY --from below while keeping the version
 # pinned via build-arg.
-ARG MCP_TOOLBOX_VERSION=1.9.0
+ARG MCP_TOOLBOX_VERSION=1.7.0
 ARG PNPM_VERSION=10.33.0
 FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_VERSION} AS mcp-toolbox-src
 
@@ -32,25 +32,25 @@ ARG INSTALL_CJK_FONTS=false
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
-ARG CLAUDE_CODE_VERSION=2.1.247
-ARG AGENT_BROWSER_VERSION=0.35.1
+ARG CLAUDE_CODE_VERSION=2.1.250
+ARG AGENT_BROWSER_VERSION=0.33.0
 ARG VERCEL_VERSION=52.2.1
-ARG BUN_VERSION=1.4.0
+ARG BUN_VERSION=1.3.14
 ARG MMDC_VERSION=11.16.0
 ARG GWS_VERSION=0.22.5
 ARG CODEX_VERSION=0.150.1
 ARG OPENCODE_VERSION=1.18.23
-ARG WIX_CLI_VERSION=1.1.240
-ARG DBT_MCP_VERSION=2.2.0
+ARG WIX_CLI_VERSION=1.1.230
+ARG DBT_MCP_VERSION=1.22.1
 ARG SLACK_MCP_VERSION=1.3.0
-ARG PIP_VERSION=26.2.1
-ARG SETUPTOOLS_VERSION=84.0.0
-ARG WHEEL_VERSION=0.48.0
-ARG SNOWFLAKE_CLI_VERSION=3.25.0
-ARG DBT_CORE_VERSION=1.12.3
+ARG PIP_VERSION=26.1.2
+ARG SETUPTOOLS_VERSION=83.0.0
+ARG WHEEL_VERSION=0.47.0
+ARG SNOWFLAKE_CLI_VERSION=3.23.0
+ARG DBT_CORE_VERSION=1.12.0
 ARG DBT_SNOWFLAKE_VERSION=1.12.0
-ARG UV_VERSION=0.12.6
-ARG AWS_CLI_VERSION=2.36.32
+ARG UV_VERSION=0.11.32
+ARG AWS_CLI_VERSION=2.36.8
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -123,7 +123,7 @@ RUN python3 -m venv /opt/dbt-venv \
 
 # sooperset/mcp-atlassian — stdio MCP server for Jira + Confluence (72 tools).
 # Isolated venv to avoid clashing with snow/dbt transitive deps.
-ARG MCP_ATLASSIAN_VERSION=0.23.1
+ARG MCP_ATLASSIAN_VERSION=0.23.0
 RUN python3 -m venv /opt/atlassian-venv \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir "mcp-atlassian==${MCP_ATLASSIAN_VERSION}" \
@@ -193,9 +193,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 # Render / Railway / Supabase CLIs (released as prebuilt binaries)
-ARG RENDER_VERSION=2.24.0
-ARG RAILWAY_VERSION=5.45.2
-ARG SUPABASE_VERSION=2.116.0
+ARG RENDER_VERSION=2.22.0
+ARG RAILWAY_VERSION=5.28.1
+ARG SUPABASE_VERSION=2.109.1
 RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
        -o /tmp/render.zip \
@@ -223,9 +223,9 @@ COPY --from=mcp-toolbox-src /toolbox /usr/local/bin/toolbox
 # stale CDN edge):
 #   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-aarch64-unknown-linux-gnu.tar.xz.sha256
 #   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-x86_64-unknown-linux-gnu.tar.xz.sha256
-ARG HEX_CLI_VERSION=1.2026.08.20
-ARG HEX_CLI_SHA256_arm64=e66a873c17b36eb61784e67ca49b5b004179f88c47156ee883aac8b272328999
-ARG HEX_CLI_SHA256_amd64=5d599c5062720b71d9cfab4f7dd7420563a937edbd435bc8cdd553b229c80449
+ARG HEX_CLI_VERSION=1.2026.07.21
+ARG HEX_CLI_SHA256_arm64=3e95de9edccd678c43dae7661329d7e31b7ac4c8b2e121f406d9426fe5d40def
+ARG HEX_CLI_SHA256_amd64=33a90719b634c4a366431e4805796b0014898cf92d1863b8253cf0fe343f9762
 
 RUN ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in \

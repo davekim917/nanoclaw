@@ -76,22 +76,14 @@ import './opencode.js';
 import './opencode.js';
 ```
 
-### 4. Add the agent-runner dependency
-
-Pinned. Bump deliberately, not with `bun update`. Use `1.17.18` — it must match the `opencode-ai` CLI version pinned in step 5.
-
-```bash
-cd container/agent-runner && bun add @opencode-ai/sdk@1.17.18 && cd -
-```
-
-### 5. Add `opencode-ai` to the container Dockerfile
+### 4. Add `opencode-ai` to the container Dockerfile
 
 Two edits to `container/Dockerfile`, both idempotent (skip if already present):
 
 **(a)** In the "Pin CLI versions" ARG block (around line 45–57), add after `ARG CODEX_VERSION=...`:
 
 ```dockerfile
-ARG OPENCODE_VERSION=1.17.18
+ARG OPENCODE_VERSION=<exact-version>
 ```
 
 > **Pin to an exact version** — keep host CLI, container CLI, and SDK locked to the same release. `latest` works but caves to upstream cadence; bump deliberately when there's a reason.
@@ -121,6 +113,17 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 ```
 
 > The container `.npmrc` allowlist is **separate** from the host's `pnpm-workspace.yaml` `onlyBuiltDependencies`. The host allowlist is human-gated per CLAUDE.md; this container-side allowlist follows the same posture (only add packages the operator explicitly wants — opencode-ai's postinstall pattern matches the existing entries).
+
+### 5. Add the agent-runner dependency
+
+Pinned. Derive the SDK version from the exact Docker CLI pin just added; do not
+create a second version source or use `bun update`.
+
+```bash
+OPENCODE_VERSION=$(sed -nE 's/^ARG OPENCODE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' container/Dockerfile)
+test -n "$OPENCODE_VERSION"
+cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -
+```
 
 ### 6. Build
 
