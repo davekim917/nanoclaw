@@ -386,6 +386,15 @@ else
   exit 1
 fi
 
+# setup.sh runs in a child process, so its PATH update cannot reach this shell.
+# Reactivate the exact Node executable it validated before any parent-side pnpm.
+# shellcheck source=setup/lib/node-runtime.sh
+source "$PROJECT_ROOT/setup/lib/node-runtime.sh"
+if ! activate_bootstrap_node "$BOOTSTRAP_RAW"; then
+  write_abort_entry bootstrap "node-path-invalid"
+  exit 1
+fi
+
 # ─── hand off to setup:auto ────────────────────────────────────────────
 
 # NANOCLAW_BOOTSTRAPPED=1 tells setup/auto.ts to skip the wordmark (we

@@ -175,6 +175,15 @@ else
   abort "bootstrap"
 fi
 
+# setup.sh runs in a child process, so its PATH update cannot reach this shell.
+# Reactivate the exact Node executable it validated before any parent-side pnpm.
+# shellcheck source=setup/lib/node-runtime.sh
+source "$PROJECT_ROOT/setup/lib/node-runtime.sh"
+if ! activate_bootstrap_node "$BOOTSTRAP_RAW"; then
+  step_fail "Bootstrap Node path is invalid"
+  abort "node-path-invalid"
+fi
+
 # setup.sh may have installed pnpm to a prefix not on our PATH — replay
 # the same lookup nanoclaw.sh does.
 if ! command -v pnpm >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then

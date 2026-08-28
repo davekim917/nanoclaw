@@ -83,6 +83,58 @@ for tool in npm npx pnpm; do ln -sf node "$HOME/node/bin/$tool"; done`,
     expect(readFileSync(calls, 'utf8')).toContain('uvx nodeenv --force -n lts');
   });
 
+  it('test_parent_shell_activates_the_bootstrap_node_and_pnpm', () => {
+    const root = tempDir('nanoclaw-node-parent-');
+    const oldBin = join(root, 'old-bin');
+    const newBin = join(root, 'new-bin');
+    const status = join(root, 'bootstrap.log');
+
+    executable(join(oldBin, 'node'), 'echo v20.20.2');
+    executable(join(oldBin, 'pnpm'), 'echo old-pnpm');
+    executable(
+      join(newBin, 'node'),
+      `if [[ "\${1:-}" == "--version" ]]; then echo v22.19.0; else exec ${JSON.stringify(process.execPath)} "$@"; fi`,
+    );
+    executable(join(newBin, 'pnpm'), 'echo new-pnpm');
+    writeFileSync(status, `NODE_PATH: ${join(newBin, 'node')}\nSTATUS: success\n`);
+
+    const result = spawnSync(
+      'bash',
+      [
+        '-c',
+        `source ${JSON.stringify(join(ROOT, 'setup/lib/node-runtime.sh'))}; ` +
+          `activate_bootstrap_node ${JSON.stringify(status)}; command -v node; command -v pnpm`,
+      ],
+      {
+        cwd: ROOT,
+        encoding: 'utf8',
+        env: { ...process.env, PROJECT_ROOT: ROOT, PATH: `${oldBin}:/usr/bin:/bin` },
+      },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.trim().split('\n')).toEqual([join(newBin, 'node'), join(newBin, 'pnpm')]);
+  });
+
+  it('test_parent_shell_rejects_an_invalid_bootstrap_node_path', () => {
+    const root = tempDir('nanoclaw-node-parent-invalid-');
+    const status = join(root, 'bootstrap.log');
+    writeFileSync(status, 'NODE_PATH: not_found\nSTATUS: success\n');
+
+    const result = spawnSync(
+      'bash',
+      [
+        '-c',
+        `source ${JSON.stringify(join(ROOT, 'setup/lib/node-runtime.sh'))}; ` +
+          `activate_bootstrap_node ${JSON.stringify(status)}`,
+      ],
+      { cwd: ROOT, encoding: 'utf8', env: { ...process.env, PROJECT_ROOT: ROOT } },
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('did not report an executable Node path');
+  });
+
   it('test_deploy_stops_before_restart_on_unsupported_node', () => {
     const root = tempDir('nanoclaw-node-deploy-');
     const bin = join(root, 'bin');
@@ -184,5 +236,15 @@ for tool in npm npx pnpm; do ln -sf node "$HOME/node/bin/$tool"; done`,
     expect(workflow).toMatch(/Typecheck container[\s\S]*Host tests[\s\S]*Container tests/);
     expect(workflow).toMatch(/^\s{2}ci:\s*$/m);
     expect(workflow).toMatch(/needs:\s*test/);
+  });
+
+  it('test_setup_launchers_activate_bootstrap_node_before_pnpm', () => {
+    for (const launcher of ['nanoclaw.sh', 'migrate-v2.sh']) {
+      const source = readFileSync(join(ROOT, launcher), 'utf8');
+      const activate = source.indexOf('activate_bootstrap_node "$BOOTSTRAP_RAW"');
+      const firstPnpmAfterBootstrap = source.indexOf('command -v pnpm', activate);
+      expect(activate, launcher).toBeGreaterThan(-1);
+      expect(firstPnpmAfterBootstrap, launcher).toBeGreaterThan(activate);
+    }
   });
 });

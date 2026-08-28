@@ -40,3 +40,8 @@
 - A follow-up review found later deploy commands still resolved bare `node` from the inherited PATH. The launcher now prepends the running service Node directory, so preflight, pnpm, and build use one runtime.
 - Focused runtime/slash tests passed `8/8`, including stale-value override, missing-path fail-closed, and unsupported-Node fail-closed cases.
 - Host build, format, public-boundary structural checks, shell syntax, and `git diff --check` passed after the correction.
+- GitHub Codex review found setup's Node upgrade stayed inside child shells; accepted. `nanoclaw.sh` and `migrate-v2.sh` now reactivate setup's emitted `NODE_PATH` before any parent-side pnpm.
+- Parent handoff tests cover old-to-new Node/pnpm selection, stale PATH override, invalid-path fail-closed, and both launcher call sites; focused runtime/platform tests pass `24/24`.
+- Independent review found #176/#177 add/add spec conflicts. Stage B now removes its duplicate plan/run files; `git merge-tree --write-tree` exits `0`.
+- Independent review found #178 had no CI and clarified its remote-dependent activation. The registry gate now composes payloads onto current `main`; publication follows #177 promotion and has a forward-revert rollback window.
+- Version contract tests now assert exact/relational invariants without embedding the current release. The reviewed Docker diff remains the approval record for frozen targets.

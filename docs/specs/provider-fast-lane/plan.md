@@ -110,6 +110,20 @@ They get a later candidate-image batch with tool-specific canaries.
 7. Build a non-canonical candidate and require two-turn harness canaries for all
    three providers before promotion.
 
+### Stage B registry publication: PR #178, `providers` branch
+
+1. Publish only the 20 Codex/OpenCode payload paths declared by
+   `PROVIDER_PAYLOAD_FILES`; the registry branch is not a runnable application tree.
+2. CI composes those payload bytes onto current `main`, then runs payload
+   validation, host/container typechecks, and focused provider tests.
+3. Merge only after #177 is merged, its candidate image is promoted, and the
+   running provider canaries pass. #177 owns the validator contract that accepts
+   #178's Dockerfile-derived OpenCode installer.
+4. Before merge, verify which remote production resolves through
+   `NANOCLAW_CHANNELS_REMOTE` / `setup/lib/channels-remote.sh`. The fork's
+   `providers` branch activates future `/add-*` calls only when that resolution
+   points at the fork.
+
 ### Stage C: new host dependency PR
 
 Only after Stage A is healthy on production Node:
@@ -123,8 +137,8 @@ Only after Stage A is healthy on production Node:
    `integrity_check`, migrations, and opening the unchanged copy again under v11.
 
 Stages A and B may be reviewed in parallel, but Stage C cannot activate before
-Stage A is healthy. Each stage has its own rollback and never hides another
-stage's failure.
+Stage A is healthy. Registry publication follows successful Stage B promotion.
+Each stage has its own rollback and never hides another stage's failure.
 
 ## Design
 
@@ -194,15 +208,15 @@ new tests fail against current PR heads.
 ### Provider lockstep
 
 6. **`test_claude_cli_agent_sdk_lockstep`** verifies Docker Claude Code equals
-   Agent SDK `claudeCodeVersion` and the approved exact target.
+   Agent SDK `claudeCodeVersion`; the reviewed Docker diff owns the approved target.
 7. **`test_claude_effort_contract`** fails typecheck if SDK and runtime schema differ.
 8. **`test_codex_pin_is_exact_and_consumed`** accepts `0.150.1`-style exact pins
    and rejects ranged, `latest`, missing, or unconsumed pins.
 9. **`test_opencode_all_operational_pins_match`** covers Docker, SDK, capture,
    add/remove/clone flows, and provider contract.
-10. **`test_no_stale_operational_provider_pins`** excludes old literals from
-    mutating instructions and verifier expectations; historical evidence is exempt.
-11. **Provider suites** pass for Claude, Codex, OpenCode, and tool/schema guards.
+10. **Provider suites** pass for Claude, Codex, OpenCode, and tool/schema guards.
+11. **Registry payload CI** composes #178 onto current `main` and proves all 20
+    payload files match #177 byte-for-byte before typecheck and focused tests.
 
 ### Host dependencies and rollback
 
@@ -244,6 +258,10 @@ remain operator actions; their exact command/output is recorded before ship.
 - **Stage B provider image:** retain the current canonical digest under a rollback
   tag. Candidate failures never promote. On post-promotion failure, retag the
   retained digest and restart only affected/new sessions.
+- **Provider registry publication:** merge only after Stage B promotion. Rollback
+  is a new revert commit on the `providers` branch, not an image retag. If the
+  production channels remote points at the fork, pause `/add-codex`,
+  `/add-opencode`, and `/clone-as-opencode` until that revert lands.
 - **Stage C host dependencies:** retain the pre-stage commit, lockfile, and database
   copy. Roll back code and dependencies together; the compatibility check proves
   the unchanged database copy still opens under v11.
