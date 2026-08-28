@@ -71,9 +71,24 @@ function conformantFixture(provider: MemoryConformantProvider): Map<string, stri
       '.claude/skills/add-opencode/SKILL.md',
       [
         'pnpm exec tsx scripts/provider-memory-contract.ts --provider opencode --ref "$remote/providers" --install',
-        'cd container/agent-runner && bun add @opencode-ai/sdk@1.17.18 && cd -',
+        'OPENCODE_VERSION="$(pnpm exec tsx -e \'import fs from "node:fs"; import { effectiveDockerArgBeforeFinalRun } from "./setup/lib/dockerfile-version.ts";',
+        '"opencode-ai@${OPENCODE_VERSION}"',
+        'cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -',
         'ncl groups config update --id <group-id> --provider opencode',
         'The installer fails closed before the first write for a possible local customization.',
+        'An `anthropic/*` model requires a verified native `auth.json`.',
+        '~/.local/share/opencode-<group-folder>/auth.json',
+        '~/.local/share/opencode/auth.json',
+        'SCOPED_AUTH="$HOME/.local/share/opencode-<group-folder>/auth.json"',
+        'SHARED_AUTH="$HOME/.local/share/opencode/auth.json"',
+        'if [[ -e "$SCOPED_AUTH" ]]; then',
+        '  AUTH_FILE="$SCOPED_AUTH"',
+        'else',
+        '  AUTH_FILE="$SHARED_AUTH"',
+        'fi',
+        'import { parseOpenCodeAuthProviders } from "./container/agent-runner/src/providers/opencode.ts";',
+        'const auth = fs.readFileSync(process.argv[1], "utf8");',
+        'if (!parseOpenCodeAuthProviders(auth).includes("anthropic")) process.exit(1);',
       ].join('\n'),
     );
   }
@@ -121,6 +136,22 @@ describe('provider registry memory conformance', () => {
     expect(PROVIDER_PAYLOAD_FILES.codex).not.toContain('container/agent-runner/src/providers/codex.turns.test.ts');
     expect(PROVIDER_PAYLOAD_FILES.codex).not.toContain('container/agent-runner/src/providers/codex-cli-tools.test.ts');
     expect(PROVIDER_PAYLOAD_FILES.codex).not.toContain('src/providers/codex-host-contribution.test.ts');
+  });
+
+  it('keeps the shared Dockerfile pin parser outside the Codex payload', () => {
+    expect(PROVIDER_PAYLOAD_FILES.codex).not.toEqual(
+      expect.arrayContaining(['setup/lib/dockerfile-version.ts', 'setup/lib/dockerfile-version.test.ts']),
+    );
+    expect(PROVIDER_PAYLOAD_FILES.codex).not.toEqual(
+      expect.arrayContaining(['setup/providers/dockerfile-version.ts', 'setup/providers/dockerfile-version.test.ts']),
+    );
+  });
+
+  it('keeps the shared Dockerfile pin parser when Codex is removed', () => {
+    const removal = fs.readFileSync(path.join(process.cwd(), '.claude/skills/add-codex/REMOVE.md'), 'utf8');
+    expect(removal).not.toContain('dockerfile-version');
+    expect(fs.existsSync(path.join(process.cwd(), 'setup/lib/dockerfile-version.ts'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'setup/lib/dockerfile-version.test.ts'))).toBe(true);
   });
 
   it('keeps both OpenCode registration guards inside the provider payload roster', () => {
@@ -174,7 +205,7 @@ describe('provider registry memory conformance', () => {
     expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toEqual(
       expect.arrayContaining([
         expect.stringContaining('create-only fetched-ref installer'),
-        expect.stringContaining('current pinned OpenCode SDK'),
+        expect.stringContaining('Dockerfile-derived OpenCode SDK pin'),
         expect.stringContaining('container-config provider selection'),
         expect.stringContaining('customization-preserving fail-closed contract'),
         expect.stringContaining('retired AGENT_PROVIDER configuration'),
@@ -183,6 +214,53 @@ describe('provider registry memory conformance', () => {
         expect.stringContaining('stale OpenCode version pin'),
         expect.stringContaining('installed-state gate bypass'),
       ]),
+    );
+  });
+
+  it('rejects OpenCode Anthropic guidance that substitutes environment auth for native auth.json', () => {
+    const fixture = conformantFixture('opencode');
+    fixture.set(
+      '.claude/skills/add-opencode/SKILL.md',
+      [
+        fixture.get('.claude/skills/add-opencode/SKILL.md')!,
+        'For `anthropic/*`, OpenCode uses the normal Anthropic env inside the container — the proxy + placeholder-key pattern is unchanged.',
+      ].join('\n'),
+    );
+
+    expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
+      '.claude/skills/add-opencode/SKILL.md: contains forbidden false Anthropic environment-auth guidance for OpenCode',
+    );
+  });
+
+  it('rejects size-only OpenCode auth checks that do not validate the selected Anthropic record', () => {
+    const fixture = conformantFixture('opencode');
+    fixture.set(
+      '.claude/skills/add-opencode/SKILL.md',
+      [
+        fixture.get('.claude/skills/add-opencode/SKILL.md')!,
+        'test -s "$HOME/.local/share/opencode-<group-folder>/auth.json" || test -s "$HOME/.local/share/opencode/auth.json"',
+      ].join('\n'),
+    );
+
+    expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
+      '.claude/skills/add-opencode/SKILL.md: contains forbidden size-only native OpenCode auth validation',
+    );
+  });
+
+  it('rejects OpenCode Anthropic guidance that does not reuse the runtime auth parser', () => {
+    const fixture = conformantFixture('opencode');
+    fixture.set(
+      '.claude/skills/add-opencode/SKILL.md',
+      fixture
+        .get('.claude/skills/add-opencode/SKILL.md')!
+        .replace(
+          'parseOpenCodeAuthProviders(auth).includes("anthropic")',
+          'Object.hasOwn(JSON.parse(auth), "anthropic")',
+        ),
+    );
+
+    expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
+      '.claude/skills/add-opencode/SKILL.md: missing runtime-equivalent Anthropic auth record validation',
     );
   });
 
@@ -417,7 +495,7 @@ describe('provider registry memory conformance', () => {
     const skill = fs.readFileSync(path.join(process.cwd(), '.claude/skills/add-codex/SKILL.md'), 'utf8');
     const removal = fs.readFileSync(path.join(process.cwd(), '.claude/skills/add-codex/REMOVE.md'), 'utf8');
 
-    expect(skill).toContain('ARG CODEX_VERSION=0.145.0');
+    expect(skill).toContain('verifyCodexInstall');
     expect(skill).toContain('"@openai/codex@${CODEX_VERSION}"');
     expect(skill).not.toContain('nc:json-merge into:container/cli-tools.json');
     expect(skill).not.toContain('{ "name": "@openai/codex"');
@@ -448,6 +526,10 @@ describe('provider registry memory conformance', () => {
     expect(skill).toContain('ncl groups restart --id <group-id>');
     expect(skill).toMatch(/fails\s+closed before the first write/i);
     expect(skill).toMatch(/possible local\s+customization/i);
+    expect(skill).toMatch(/anthropic\/\*[\s\S]{0,320}verified native `auth\.json`/i);
+    expect(skill).toContain('~/.local/share/opencode-<group-folder>/auth.json');
+    expect(skill).toContain('~/.local/share/opencode/auth.json');
+    expect(skill).not.toMatch(/anthropic\/\*[\s\S]{0,320}normal Anthropic env/i);
   });
 
   it('add-codex treats provider reapply differences as customizations, not overwrite permission', () => {
@@ -464,6 +546,7 @@ describe('provider registry memory conformance', () => {
     expect(removal).not.toContain('data/v2-sessions/*/agent-runner-src');
     expect(removal).toContain('ncl groups config update --id <group-id> --provider claude');
     expect(removal).toContain('ncl groups restart --id <group-id>');
+    expect(removal).toContain('src/providers/opencode.container-config.test.ts');
     expect(removal).not.toContain('set `"provider": "claude"` in `groups/<folder>/container.json`');
   });
 });

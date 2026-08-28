@@ -35,12 +35,17 @@ import {
 } from '../mcp-tools/memory-capture.js';
 import { createManagedGitMaintenanceHook } from '../managed-git-guard.js';
 
-// Per D9 / D7 / A6: 5-value enum matching EffortLevel at
-// node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts:462
-// (low | medium | high | xhigh | max). Keep in sync with SDK.
+// Per D9 / D7 / A6: the runtime schema is compiler-checked against the SDK.
+export const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly EffortLevel[];
+type ClaudeEffortLevel = (typeof CLAUDE_EFFORT_LEVELS)[number];
+type ExactUnion<Left, Right> = [Exclude<Left, Right>, Exclude<Right, Left>] extends [never, never] ? true : false;
+type ClaudeEffortLevelsMatchSdk = ExactUnion<ClaudeEffortLevel, EffortLevel>;
+const claudeEffortLevelsMatchSdk: ClaudeEffortLevelsMatchSdk = true;
+void claudeEffortLevelsMatchSdk;
+
 export const claudeConfigSchema = z.strictObject({
   model: z.string().min(1).optional(),
-  effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
+  effort: z.enum(CLAUDE_EFFORT_LEVELS).optional(),
 });
 
 function log(msg: string): void {

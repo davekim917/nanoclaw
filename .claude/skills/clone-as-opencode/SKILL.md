@@ -259,7 +259,10 @@ diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
 OpenCode auth.json lives at `~/.local/share/opencode/auth.json` by default. The host-side provider (`resolveOpenCodeSourceDir`) prefers a scoped `~/.local/share/opencode-<sibling-folder>/auth.json` when present, falling back to the global one. To put this sibling on its own OpenCode subscription (separate billing, separate model limits), create the scoped dir and login into it:
 
 ```bash
-# OpenCode CLI must be installed on the host (pnpm i -g opencode-ai@1.17.18).
+# Derive the host CLI version from the image pin; it must stay aligned with the
+# container CLI and SDK.
+OPENCODE_VERSION="$(pnpm exec tsx -e 'import fs from "node:fs"; import { effectiveDockerArgBeforeFinalRun } from "./setup/lib/dockerfile-version.ts"; const dockerfile = fs.readFileSync("container/Dockerfile", "utf8"); const pin = effectiveDockerArgBeforeFinalRun(dockerfile, "OPENCODE_VERSION", "\"opencode-ai@${OPENCODE_VERSION}\""); if (!pin || !/^\d+\.\d+\.\d+$/.test(pin)) process.exit(1); process.stdout.write(pin);')" || exit 1
+pnpm install -g "opencode-ai@${OPENCODE_VERSION}"
 # Verify: opencode --version
 
 # Run login under a throwaway XDG_DATA_HOME so any existing global
@@ -676,7 +679,9 @@ Optionally, uninstall the sibling's bot app from the platform.
 - The opencode container reads MCP server config from `mcpServers` in container.json (and any merged in via `NANOCLAW_MCP_SERVERS`), which the runtime translates to OpenCode's `mcp` config field via `mcpServersToOpenCodeConfig`.
 - The host opencode provider copies `auth.json` from the per-sibling scoped dir on every spawn. Session state (opencode.db) stays per-session in `<sessionDir>/opencode-xdg/opencode/`; only the auth token is shared.
 - Worktrees are thread-scoped when `NANOCLAW_THREAD_WORKTREES=1`. Concurrent git ops across siblings share standard `.git/index.lock` semantics; turn-taking via `@`-mentions mitigates by design.
-- **opencode-ai 1.17.18 is pinned** in `container/Dockerfile` and `@opencode-ai/sdk` matches it exactly. Bump both deliberately (not `bun update`) and re-run `bun test src/providers/` after.
+- **OpenCode's exact Docker pin is the source of truth** for the CLI and
+  `@opencode-ai/sdk`. Derive both from it, never use `bun update`, and re-run
+  `bun test src/providers/` after a deliberate bump.
 
 ### Notes on cross-sibling auth and OpenCode plan choice
 

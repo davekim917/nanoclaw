@@ -76,22 +76,17 @@ import './opencode.js';
 import './opencode.js';
 ```
 
-### 4. Add the agent-runner dependency
+### 4. Add `opencode-ai` to the container Dockerfile
 
-Pinned. Bump deliberately, not with `bun update`. Use `1.17.18` — it must match the `opencode-ai` CLI version pinned in step 5.
+Two edits to `container/Dockerfile`, both idempotent:
 
-```bash
-cd container/agent-runner && bun add @opencode-ai/sdk@1.17.18 && cd -
-```
-
-### 5. Add `opencode-ai` to the container Dockerfile
-
-Two edits to `container/Dockerfile`, both idempotent (skip if already present):
-
-**(a)** In the "Pin CLI versions" ARG block (around line 45–57), add after `ARG CODEX_VERSION=...`:
+**(a)** In the "Pin CLI versions" ARG block (around line 45–57), replace any
+existing `ARG OPENCODE_VERSION=...` declaration with exactly this line. If no
+declaration exists, insert it after `ARG CODEX_VERSION=...`. Never append a
+second declaration:
 
 ```dockerfile
-ARG OPENCODE_VERSION=1.17.18
+ARG OPENCODE_VERSION=1.18.23
 ```
 
 > **Pin to an exact version** — keep host CLI, container CLI, and SDK locked to the same release. `latest` works but caves to upstream cadence; bump deliberately when there's a reason.
@@ -121,6 +116,16 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 ```
 
 > The container `.npmrc` allowlist is **separate** from the host's `pnpm-workspace.yaml` `onlyBuiltDependencies`. The host allowlist is human-gated per CLAUDE.md; this container-side allowlist follows the same posture (only add packages the operator explicitly wants — opencode-ai's postinstall pattern matches the existing entries).
+
+### 5. Add the agent-runner dependency
+
+Pinned. Derive the SDK version from the exact Docker CLI pin just added; do not
+create a second version source or use `bun update`.
+
+```bash
+OPENCODE_VERSION="$(pnpm exec tsx -e 'import fs from "node:fs"; import { effectiveDockerArgBeforeFinalRun } from "./setup/lib/dockerfile-version.ts"; const dockerfile = fs.readFileSync("container/Dockerfile", "utf8"); const pin = effectiveDockerArgBeforeFinalRun(dockerfile, "OPENCODE_VERSION", "\"opencode-ai@${OPENCODE_VERSION}\""); if (!pin || !/^\d+\.\d+\.\d+$/.test(pin)) process.exit(1); process.stdout.write(pin);')" || exit 1
+cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -
+```
 
 ### 6. Build
 
@@ -195,7 +200,37 @@ onecli secrets create --name "OpenRouter" --type generic \
 
 #### Example: Anthropic
 
-Model id for `--model`: `anthropic/claude-sonnet-4-20250514`. When the model is an `anthropic/*` slug, OpenCode uses the normal Anthropic env inside the container — the proxy + placeholder-key pattern is unchanged.
+Model id for `--model`: `anthropic/claude-sonnet-4-20250514`. An
+`anthropic/*` model requires OpenCode's own authenticated provider record in a
+verified native `auth.json`; generic `ANTHROPIC_*` environment variables and
+OneCLI proxy injection do not configure OpenCode authentication.
+
+Before selecting this model, authenticate with OpenCode's native Anthropic
+provider flow and verify, without printing credentials, that the effective
+auth file contains a valid top-level `anthropic` record. Selection is
+scoped-first, exactly like the host:
+
+```bash
+SCOPED_AUTH="$HOME/.local/share/opencode-<group-folder>/auth.json"
+SHARED_AUTH="$HOME/.local/share/opencode/auth.json"
+if [[ -e "$SCOPED_AUTH" ]]; then
+  AUTH_FILE="$SCOPED_AUTH"
+else
+  AUTH_FILE="$SHARED_AUTH"
+fi
+# Uses the runtime's own parser: incomplete records must not pass the operator gate.
+bun -e '
+  import fs from "node:fs";
+  import { parseOpenCodeAuthProviders } from "./container/agent-runner/src/providers/opencode.ts";
+  const auth = fs.readFileSync(process.argv[1], "utf8");
+  if (!parseOpenCodeAuthProviders(auth).includes("anthropic")) process.exit(1);
+' "$AUTH_FILE"
+```
+
+The host copies the scoped
+`~/.local/share/opencode-<group-folder>/auth.json` when present; otherwise it
+uses `~/.local/share/opencode/auth.json`. Do not switch the group to an
+`anthropic/*` slug until that check passes.
 
 #### OpenCode Zen (`x-api-key`, not Bearer)
 

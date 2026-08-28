@@ -28,7 +28,7 @@ Check whether the payload is already wired (a prior apply, or a trunk that still
 - `container/agent-runner/src/providers/codex.ts` and `codex-app-server.ts`
 - `setup/providers/codex.ts`
 - `import './codex.js';` in `src/providers/index.ts`, `container/agent-runner/src/providers/index.ts`, and `setup/providers/index.ts`
-- `ARG CODEX_VERSION=0.145.0` plus
+- an exact `ARG CODEX_VERSION=<version>` plus
   `"@openai/codex@${CODEX_VERSION}"` in `container/Dockerfile`
 
 ### 1. Fetch and validate the payload
@@ -41,6 +41,7 @@ relative to the shared workgroup-memory contract and must be synced first.
 ```nc:run effect:fetch
 bash -lc 'source setup/lib/channels-remote.sh; remote=$(resolve_channels_remote); git fetch "$remote" providers'
 ```
+
 ```nc:run effect:check
 bash -lc 'source setup/lib/channels-remote.sh; remote=$(resolve_channels_remote); pnpm exec tsx scripts/provider-memory-contract.ts --provider codex --ref "$remote/providers"'
 ```
@@ -83,9 +84,11 @@ Append the self-registration import to each of the three provider barrels (skipp
 ```nc:append to:src/providers/index.ts
 import './codex.js';
 ```
+
 ```nc:append to:container/agent-runner/src/providers/index.ts
 import './codex.js';
 ```
+
 ```nc:append to:setup/providers/index.ts
 import './codex.js';
 ```
@@ -95,10 +98,11 @@ import './codex.js';
 This fork intentionally retains explicit Dockerfile `ARG` pins so dependency
 updates surface as reviewed merge conflicts. Do not add Codex to
 `container/cli-tools.json` and do not replace or silently bump an existing pin.
-The current audited pin is `0.145.0`.
+Read the current exact pin from the Dockerfile; the skill has no second version
+source to drift from the image.
 
 ```nc:run effect:check
-bash -lc 'grep -Fqx "ARG CODEX_VERSION=0.145.0" container/Dockerfile && grep -Fq "\"@openai/codex@\${CODEX_VERSION}\"" container/Dockerfile'
+pnpm exec tsx -e 'import { verifyCodexInstall } from "./setup/providers/codex.ts"; const result = verifyCodexInstall(); if (!result.ok) { console.error(result.problems.join("\n")); process.exit(1); }'
 ```
 
 If either check fails, stop. Reconcile the Dockerfile through the repository's
@@ -118,9 +122,11 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 ```nc:run effect:test
 pnpm vitest run src/providers/codex-registration.test.ts src/providers/codex.container-config.test.ts setup/providers/
 ```
+
 ```nc:run effect:test
 cd container/agent-runner && bun test src/providers/
 ```
+
 ```nc:run effect:test
 pnpm exec tsx scripts/provider-memory-contract.ts --provider codex --require-payload
 ```

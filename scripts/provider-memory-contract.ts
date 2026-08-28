@@ -231,7 +231,14 @@ export function validateProviderMemoryPayload(
         /provider-memory-contract\.ts --provider opencode --ref "\$remote\/providers" --install/,
         'create-only fetched-ref installer',
       );
-      requireMatch(issues, skillFile, skill, /@opencode-ai\/sdk@1\.17\.18/, 'current pinned OpenCode SDK');
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /OPENCODE_VERSION="\$\(pnpm exec tsx -e[\s\S]*effectiveDockerArgBeforeFinalRun[\s\S]*dockerfile-version\.ts[\s\S]*@opencode-ai\/sdk@"?\$\{OPENCODE_VERSION\}"?/,
+        'Dockerfile-derived OpenCode SDK pin',
+      );
+      rejectMatch(issues, skillFile, skill, /(?:mapfile|sed -nE)/, 'duplicate OpenCode pin parser');
       requireMatch(
         issues,
         skillFile,
@@ -263,6 +270,49 @@ export function validateProviderMemoryPayload(
       );
       rejectMatch(issues, skillFile, skill, /1\.4\.17/, 'stale OpenCode version pin');
       rejectMatch(issues, skillFile, skill, /skip to \*\*Configuration\*\*/i, 'installed-state gate bypass');
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /anthropic\/\*[\s\S]{0,320}verified native `auth\.json`/i,
+        'native auth.json requirement for Anthropic OpenCode models',
+      );
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /~\/\.local\/share\/opencode-<group-folder>\/auth\.json/,
+        'scoped native OpenCode auth path',
+      );
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /~\/\.local\/share\/opencode\/auth\.json/,
+        'shared native OpenCode auth fallback path',
+      );
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /SCOPED_AUTH=[^\n]*opencode-<group-folder>\/auth\.json[\s\S]*if \[\[ -e "\$SCOPED_AUTH" \]\]; then[\s\S]*AUTH_FILE="\$SCOPED_AUTH"[\s\S]*else[\s\S]*AUTH_FILE="\$SHARED_AUTH"/,
+        'scoped-first effective OpenCode auth selection',
+      );
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /import \{ parseOpenCodeAuthProviders \} from ["']\.\/container\/agent-runner\/src\/providers\/opencode\.ts["'][\s\S]*parseOpenCodeAuthProviders\(auth\)\.includes\(["']anthropic["']\)/,
+        'runtime-equivalent Anthropic auth record validation',
+      );
+      rejectMatch(issues, skillFile, skill, /test -s [^\n]*auth\.json/, 'size-only native OpenCode auth validation');
+      rejectMatch(
+        issues,
+        skillFile,
+        skill,
+        /anthropic\/\*[\s\S]{0,320}(?:normal Anthropic env|proxy\s*\+\s*placeholder-key|ANTHROPIC_(?:API_KEY|AUTH_TOKEN|BASE_URL))/i,
+        'false Anthropic environment-auth guidance for OpenCode',
+      );
     }
   }
 

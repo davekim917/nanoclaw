@@ -6,10 +6,10 @@
  * per-session host directory (`<sessionDir>/opencode-xdg`) so:
  *
  * - Session state (opencode.db) stays per-session, no cross-session collisions.
- * - The per-group auth.json reaches the container via copy-at-spawn (mirroring
- *   the codex pattern). Source lookup prefers `~/.local/share/opencode-<folder>/`
- *   so each sibling can hold its own OAuth without us touching the host's
- *   default `~/.local/share/opencode`.
+ * - Auth, agent definitions, and skills reach the container via copy-at-spawn.
+ *   Each surface independently prefers `~/.local/share/opencode-<folder>/`;
+ *   auth falls back to `~/.local/share/opencode`, while definitions fall back
+ *   to `~/.config/opencode`, so a scoped definition does not need scoped auth.
  *
  * Env passthrough covers the runtime-read OPENCODE_* selector vars (provider/
  * model). NO_PROXY / no_proxy are merged so OpenCode's internal client can
@@ -20,6 +20,12 @@ import os from 'os';
 import path from 'path';
 
 import { getContainerConfig } from '../db/container-configs.js';
+import {
+  assertRealDirectory,
+  removeUntrustedPathEntry,
+  replaceUntrustedDirectory,
+  replaceUntrustedFile,
+} from '../fs-safety.js';
 import { assertValidGroupFolder } from '../group-folder.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
@@ -33,23 +39,17 @@ const DEFAULT_OPENCODE_MODEL = 'opencode-go/glm-5.3-flash';
 const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
 const DEFAULT_OPENCODE_EFFORT = 'high';
 
-/**
- * Remove dangling symlinks under `root` (recursively), then any directories
- * the removal left empty. Skill mirrors are add-oriented — a skill retired
- * from its source plugin leaves its support-file links dangling forever —
- * and the spawn-time dereferencing copy hard-fails on the first one.
- */
-export function pruneDanglingSymlinks(root: string): void {
-  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-    const p = path.join(root, entry.name);
-    if (entry.isSymbolicLink()) {
-      // existsSync follows the link — false means the target is gone.
-      if (!fs.existsSync(p)) fs.unlinkSync(p);
-    } else if (entry.isDirectory()) {
-      pruneDanglingSymlinks(p);
-      if (fs.readdirSync(p).length === 0) fs.rmdirSync(p);
-    }
-  }
+/** Copy a host-owned skill tree without mutating it or following stale links. */
+export function copyOpenCodeSkills(source: string, target: string): void {
+  fs.cpSync(source, target, {
+    recursive: true,
+    dereference: true,
+    force: true,
+    filter: (sourcePath) => {
+      const stat = fs.lstatSync(sourcePath, { throwIfNoEntry: false });
+      return stat !== undefined && (!stat.isSymbolicLink() || fs.existsSync(sourcePath));
+    },
+  });
 }
 
 function mergeNoProxy(current: string | undefined, additions: string): string {
@@ -67,11 +67,22 @@ function mergeNoProxy(current: string | undefined, additions: string): string {
   return [...parts].join(',');
 }
 
-function resolveOpenCodeSourceDir(
+interface OpenCodeSourcePaths {
+  authFile: string;
+  agentsDir: string;
+  skillsDir: string;
+}
+
+/**
+ * Resolve each host-owned OpenCode surface independently. A scoped auth.json
+ * selects the credential, while scoped agent/ and skill/ dirs select only
+ * their own definitions; neither decision may suppress the other fallbacks.
+ */
+function resolveOpenCodeSourcePaths(
   agentGroupFolder: string | undefined,
   agentGroupId: string,
   hostHome: string,
-): string {
+): OpenCodeSourcePaths {
   const scopedFolder = agentGroupFolder || agentGroupId;
   // Defense-in-depth: agent_groups.folder/id is operator-controlled but reaches
   // path.join here; reject anything that looks like traversal before forming
@@ -79,84 +90,74 @@ function resolveOpenCodeSourceDir(
   // reserved names — matches the validation applied elsewhere on group folders.
   assertValidGroupFolder(scopedFolder);
   const scoped = path.join(hostHome, '.local', 'share', `opencode-${scopedFolder}`);
-  if (fs.existsSync(path.join(scoped, 'auth.json'))) return scoped;
-  return path.join(hostHome, '.local', 'share', 'opencode');
+  const shared = path.join(hostHome, '.local', 'share', 'opencode');
+  const config = path.join(hostHome, '.config', 'opencode');
+  const scopedAuth = path.join(scoped, 'auth.json');
+  const scopedAgents = path.join(scoped, 'agent');
+  const scopedSkills = path.join(scoped, 'skill');
+
+  return {
+    authFile: fs.existsSync(scopedAuth) ? scopedAuth : path.join(shared, 'auth.json'),
+    agentsDir: fs.existsSync(scopedAgents) ? scopedAgents : path.join(config, 'agent'),
+    skillsDir: fs.existsSync(scopedSkills) ? scopedSkills : path.join(config, 'skill'),
+  };
 }
 
 registerProviderContainerConfig('opencode', (ctx) => {
   const opencodeDir = path.join(ctx.sessionDir, 'opencode-xdg');
   const opencodeSubdir = path.join(opencodeDir, 'opencode');
-  fs.mkdirSync(opencodeSubdir, { recursive: true });
+  // Both directories were writable by the prior container. Do not let
+  // mkdir/copy follow a symlink planted by that container on the next spawn.
+  if (fs.lstatSync(opencodeDir, { throwIfNoEntry: false }) === undefined)
+    fs.mkdirSync(opencodeDir, { recursive: true });
+  assertRealDirectory(opencodeDir);
+  if (fs.lstatSync(opencodeSubdir, { throwIfNoEntry: false }) === undefined) fs.mkdirSync(opencodeSubdir);
+  assertRealDirectory(opencodeSubdir);
 
-  let authCopied = false;
+  let authContents: Buffer | null = null;
+  let hostAgentsDir: string | null = null;
+  let hostSkillsDir: string | null = null;
   const hostHome = ctx.hostEnv.HOME || os.homedir();
   if (hostHome) {
-    const sourceDir = resolveOpenCodeSourceDir(ctx.agentGroupFolder, ctx.agentGroupId, hostHome);
-    const hostAuth = path.join(sourceDir, 'auth.json');
-    if (fs.existsSync(hostAuth)) {
-      fs.copyFileSync(hostAuth, path.join(opencodeSubdir, 'auth.json'));
-      authCopied = true;
-    }
+    const source = resolveOpenCodeSourcePaths(ctx.agentGroupFolder, ctx.agentGroupId, hostHome);
+    if (fs.existsSync(source.authFile)) authContents = fs.readFileSync(source.authFile);
+    if (fs.existsSync(source.agentsDir)) hostAgentsDir = source.agentsDir;
+    if (fs.existsSync(source.skillsDir)) hostSkillsDir = source.skillsDir;
+  }
+
+  // Every managed entry may have been replaced while the prior container owned
+  // this RW mount. Recreate or clear each one without following its old path.
+  if (authContents) replaceUntrustedFile(opencodeSubdir, 'auth.json', authContents);
+  else removeUntrustedPathEntry(opencodeSubdir, 'auth.json');
+
+  removeUntrustedPathEntry(opencodeSubdir, 'agent');
+  if (hostAgentsDir) {
     // Subagents (managed by scripts/sync-opencode-subagents.ts): copy every
-    // `.md` from the per-sibling host agent/ dir into the session XDG. OpenCode
+    // `.md` from the scoped host agent/ dir (or global fallback) into the session XDG. OpenCode
     // reads agents from `$XDG_CONFIG_HOME/opencode/agent/`; we point both
     // XDG_DATA_HOME and XDG_CONFIG_HOME at the same path below, so the agents
     // surface alongside auth.json + opencode.db. Per-session copy (not a host
     // bind mount) so sibling state stays read-only from the container's view
     // — agents on disk are owned by the host sync, not the running session.
-    const hostAgentsDir = path.join(sourceDir, 'agent');
-    if (fs.existsSync(hostAgentsDir)) {
-      const targetAgentsDir = path.join(opencodeSubdir, 'agent');
-      fs.mkdirSync(targetAgentsDir, { recursive: true });
-      for (const entry of fs.readdirSync(hostAgentsDir)) {
-        if (!entry.endsWith('.md')) continue;
-        fs.copyFileSync(path.join(hostAgentsDir, entry), path.join(targetAgentsDir, entry));
-      }
-    }
-    // Skills (managed by syncOpenCodePluginSkills in opencode-sync.ts): copy
-    // the per-sibling skill/ tree into the session XDG with dereference:true.
-    // OpenCode's skill sync writes managed mirror dirs whose children are
-    // symlinks back to plugin source paths; dereference rewrites those to
-    // real files so the container (which doesn't mount ~/plugins/) sees
-    // every SKILL.md as a real file. Each SKILL.md becomes a slash command
-    // automatically per packages/opencode/src/command/index.ts.
-    const hostSkillsDir = path.join(sourceDir, 'skill');
-    if (fs.existsSync(hostSkillsDir)) {
-      // cpSync({dereference: true}) throws ENOENT on a dangling symlink, and
-      // one stale mirror entry (a skill retired from its source plugin) then
-      // wedges EVERY spawn of this group until someone hand-cleans the
-      // mirror — bit an opencode group's session on 2026-08-06. The mirror
-      // sync is add-oriented and leaves support-file links behind, so prune
-      // dangling links (and dirs the prune empties) before each copy.
-      pruneDanglingSymlinks(hostSkillsDir);
-      const targetSkillsDir = path.join(opencodeSubdir, 'skill');
-      fs.cpSync(hostSkillsDir, targetSkillsDir, {
-        recursive: true,
-        dereference: true,
-        force: true,
-      });
+    const targetAgentsDir = replaceUntrustedDirectory(opencodeSubdir, 'agent');
+    for (const entry of fs.readdirSync(hostAgentsDir)) {
+      if (!entry.endsWith('.md')) continue;
+      fs.copyFileSync(path.join(hostAgentsDir, entry), path.join(targetAgentsDir, entry));
     }
   }
 
-  // When the sibling has its own auth.json (OAuth-login flow), the container's
-  // opencode CLI authenticates against opencode.ai directly via XDG-resolved
-  // auth.json. OneCLI's HTTPS_PROXY would otherwise intercept that traffic and
-  // 401 because no inject rule exists for opencode.ai. Add the host to NO_PROXY
-  // so the SDK's outbound goes direct. The OneCLI vault path (static API key
-  // registered with a host-pattern rule) is still available for users who pick
-  // that option — they don't get auth.json copied, so NO_PROXY stays minimal.
-  const noProxyAdditions = authCopied ? '127.0.0.1,localhost,opencode.ai' : '127.0.0.1,localhost';
-  const env: Record<string, string> = {
-    XDG_DATA_HOME: '/opencode-xdg',
-    // OpenCode reads agents from `$XDG_CONFIG_HOME/opencode/agent/` (verified
-    // empirically against opencode-ai@1.15.7). Pointing XDG_CONFIG_HOME at the
-    // same mount as XDG_DATA_HOME means opencode.jsonc / agent/ / auth.json /
-    // opencode.db all live in one /opencode-xdg/opencode/ tree — no second
-    // mount needed. Provider copies the per-sibling agent/*.md above.
-    XDG_CONFIG_HOME: '/opencode-xdg',
-    NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, noProxyAdditions),
-    no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, noProxyAdditions),
-  };
+  removeUntrustedPathEntry(opencodeSubdir, 'skill');
+  if (hostSkillsDir) {
+    // Skills (managed by syncOpenCodePluginSkills in opencode-sync.ts): copy
+    // the scoped skill/ tree (or global fallback) into the session XDG with
+    // dereference:true. OpenCode's mirror dirs contain links to plugin source;
+    // the container does not mount that source, so it needs real files.
+    // A stale mirror link must not wedge the spawn, but this source is
+    // host-owned authority. Filter the derived copy; never prune the source.
+    const targetSkillsDir = replaceUntrustedDirectory(opencodeSubdir, 'skill');
+    copyOpenCodeSkills(hostSkillsDir, targetSkillsDir);
+  }
+
   // Model + effort resolution mirrors the claude/codex template: a code-level
   // default (DEFAULT_OPENCODE_*) is the floor, the per-group DB value
   // (container_configs.model / .effort, set by `ncl groups config update` or
@@ -166,6 +167,23 @@ registerProviderContainerConfig('opencode', (ctx) => {
   // container reads OPENCODE_MODEL at startup, so an unread value would no-op.
   const dbConfig = getContainerConfig(ctx.agentGroupId);
   const model = dbConfig?.model ?? DEFAULT_OPENCODE_MODEL;
+  const slash = model.indexOf('/');
+  const modelProvider = slash > 0 ? model.slice(0, slash) : DEFAULT_OPENCODE_PROVIDER;
+
+  const env: Record<string, string> = {
+    XDG_DATA_HOME: '/opencode-xdg',
+    // OpenCode reads agents from `$XDG_CONFIG_HOME/opencode/agent/` (verified
+    // empirically against opencode-ai@1.15.7). Pointing XDG_CONFIG_HOME at the
+    // same mount as XDG_DATA_HOME means opencode.jsonc / agent/ / auth.json /
+    // opencode.db all live in one /opencode-xdg/opencode/ tree — no second
+    // mount needed. Provider copies the per-sibling agent/*.md above.
+    XDG_CONFIG_HOME: '/opencode-xdg',
+    // The child runtime adds opencode.ai only when the effective turn model
+    // has a matching native auth record. The host cannot decide that from the
+    // boot model because `-m` and channel defaults can change it later.
+    NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, '127.0.0.1,localhost'),
+    no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, '127.0.0.1,localhost'),
+  };
   env.OPENCODE_MODEL = model;
 
   // OPENCODE_PROVIDER is the opencode-INTERNAL billing/routing provider
@@ -176,8 +194,7 @@ registerProviderContainerConfig('opencode', (ctx) => {
   // for an opencode sibling; it picks the provider CLASS). Since `model` always
   // carries a prefix (DB value or DEFAULT_OPENCODE_MODEL), the fallback only
   // guards a malformed override.
-  const slash = model.indexOf('/');
-  env.OPENCODE_PROVIDER = slash > 0 ? model.slice(0, slash) : DEFAULT_OPENCODE_PROVIDER;
+  env.OPENCODE_PROVIDER = modelProvider;
 
   env.OPENCODE_EFFORT = dbConfig?.effort ?? DEFAULT_OPENCODE_EFFORT;
   // Endpoint routing is determined by the cred-key in auth.json + the model

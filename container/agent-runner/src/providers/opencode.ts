@@ -106,17 +106,76 @@ function opencodeAuthHasCredential(provider: string): boolean {
 // hot path (runtimeConfigKey, buildOpenCodeConfig, and opencodeAuthHasCredential
 // all call this).
 let cachedAuthProviders: string[] | null = null;
+
+/**
+ * Match OpenCode 1.18.23's Auth.Info union before trusting an auth.json key.
+ *
+ * The CLI filters invalid records during its own auth load. NanoClaw must do
+ * the same before deciding to bypass OneCLI or omit the placeholder API key;
+ * treating a merely object-shaped record as native auth sends malformed creds
+ * down the direct path and turns a startup guard into a late request failure.
+ */
+function isOpenCodeAuthRecord(value: unknown): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  // OpenCode 1.18.23 uses Schema.String without trimming. Keep whitespace
+  // semantics compatible while refusing zero-length credentials that cannot authenticate.
+  const isNonEmptyString = (credential: unknown): credential is string =>
+    typeof credential === 'string' && credential.length > 0;
+  const isStringRecord = (metadata: unknown): metadata is Record<string, string> =>
+    metadata !== null &&
+    typeof metadata === 'object' &&
+    !Array.isArray(metadata) &&
+    Object.values(metadata).every((item) => typeof item === 'string');
+
+  if (record.type === 'oauth') {
+    return (
+      isNonEmptyString(record.access) &&
+      isNonEmptyString(record.refresh) &&
+      Number.isInteger(record.expires) &&
+      (record.expires as number) >= 0 &&
+      (record.accountId === undefined || typeof record.accountId === 'string') &&
+      (record.enterpriseUrl === undefined || typeof record.enterpriseUrl === 'string')
+    );
+  }
+  if (record.type === 'api') {
+    return isNonEmptyString(record.key) && (record.metadata === undefined || isStringRecord(record.metadata));
+  }
+  return record.type === 'wellknown' && isNonEmptyString(record.key) && isNonEmptyString(record.token);
+}
+
+export function parseOpenCodeAuthProviders(raw: string): string[] {
+  try {
+    const auth = JSON.parse(raw) as unknown;
+    return auth && typeof auth === 'object' && !Array.isArray(auth)
+      ? Object.entries(auth)
+          .filter(([, record]) => isOpenCodeAuthRecord(record))
+          .map(([provider]) => provider)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function opencodeAuthProviders(): string[] {
   if (cachedAuthProviders !== null) return cachedAuthProviders;
   try {
     const raw = fs.readFileSync('/opencode-xdg/opencode/auth.json', 'utf-8');
-    const auth = JSON.parse(raw) as Record<string, unknown>;
-    cachedAuthProviders = auth && typeof auth === 'object' ? Object.keys(auth) : [];
+    cachedAuthProviders = parseOpenCodeAuthProviders(raw);
   } catch {
     // Missing file or unparseable → no native creds.
     cachedAuthProviders = [];
   }
   return cachedAuthProviders;
+}
+
+/** Reset the immutable auth-file cache between hermetic unit-test cases. */
+export function _resetOpenCodeAuthCacheForTesting(): void {
+  cachedAuthProviders = null;
+}
+
+export function _setOpenCodeAuthProvidersForTesting(providers: string[]): void {
+  cachedAuthProviders = [...providers];
 }
 
 /** Split a `<provider>/<id…>` slug into the SDK's per-prompt model shape. */
@@ -130,6 +189,23 @@ function splitModelSlug(slug: string): { providerID: string; modelID: string } |
 interface OpenCodeTurnOverrides {
   model?: string;
   effort?: string;
+}
+
+/** Native OpenCode subscriptions must bypass OneCLI only for an exact auth match. */
+export function shouldBypassOpenCodeProxy(model: string | undefined, authProviders: readonly string[]): boolean {
+  const provider = model ? splitModelSlug(model)?.providerID : undefined;
+  return (provider === 'opencode' || provider === 'opencode-go') && authProviders.includes(provider);
+}
+
+function mergeNoProxy(current: string | undefined, addition: string): string {
+  const parts = new Set(
+    (current ?? '')
+      .split(/[\s,]+/)
+      .map((part) => part.trim())
+      .filter(Boolean),
+  );
+  parts.add(addition);
+  return [...parts].join(',');
 }
 
 const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
@@ -171,6 +247,11 @@ export function buildOpencodeServerEnv(baseEnv: NodeJS.ProcessEnv, config: Recor
   for (const [k, v] of Object.entries(baseEnv)) {
     if (secretVars.has(k)) continue;
     env[k] = v;
+  }
+  const model = typeof config.model === 'string' ? config.model : baseEnv.OPENCODE_MODEL;
+  if (shouldBypassOpenCodeProxy(model, opencodeAuthProviders())) {
+    env.NO_PROXY = mergeNoProxy(env.NO_PROXY, 'opencode.ai');
+    env.no_proxy = mergeNoProxy(env.no_proxy, 'opencode.ai');
   }
   env.OPENCODE_CONFIG_CONTENT = JSON.stringify(config);
   return env;
@@ -341,6 +422,12 @@ export function buildOpenCodeConfig(
   // against enabled_providers). Falls back to the single default provider when
   // auth.json is absent (e.g. OneCLI-proxy static-key groups).
   const authProviders = opencodeAuthProviders();
+  if (provider === 'anthropic' && !authProviders.includes('anthropic')) {
+    throw new Error(
+      `OpenCode model ${model ?? '<unset>'} requires a valid top-level anthropic record in ` +
+        `/opencode-xdg/opencode/auth.json; environment credentials are intentionally unavailable.`,
+    );
+  }
   const enabledProviders =
     authProviders.length > 0
       ? Array.from(new Set([...authProviders, ...(provider !== 'anthropic' ? [provider] : [])]))
@@ -385,17 +472,17 @@ export function buildOpenCodeConfig(
   // by the auth.json cred-key + model prefix (opencode-go → /zen/go/v1,
   // opencode → /zen/v1, nvidia → NVIDIA), so no manual override is needed.
   const sdkOptions: Record<string, unknown> = {};
-  if (!opencodeAuthHasCredential(provider)) sdkOptions.apiKey = 'placeholder';
+  // Anthropic credentials must never be synthesized here: the host strips its
+  // Claude subscription secrets from the OpenCode child. The per-model block
+  // is independent, though — it carries the effective model's effort options.
+  if (provider !== 'anthropic' && !opencodeAuthHasCredential(provider)) sdkOptions.apiKey = 'placeholder';
 
+  const providerConfig = {
+    ...(Object.keys(sdkOptions).length > 0 ? { options: sdkOptions } : {}),
+    ...modelsBlock,
+  };
   const providerOptions: Record<string, unknown> =
-    provider === 'anthropic'
-      ? {}
-      : {
-          [provider]: {
-            ...(Object.keys(sdkOptions).length > 0 ? { options: sdkOptions } : {}),
-            ...modelsBlock,
-          },
-        };
+    Object.keys(providerConfig).length > 0 ? { [provider]: providerConfig } : {};
 
   const mcp = mcpServersToOpenCodeConfig(options.mcpServers);
 
@@ -463,14 +550,22 @@ let sharedRuntime: SharedRuntime | null = null;
 let sharedConfigKey: string | null = null;
 let sharedInit: Promise<SharedRuntime> | null = null;
 
-function runtimeConfigKey(options: ProviderOptions, cwd: string | undefined, turn: OpenCodeTurnOverrides): string {
+export function runtimeConfigKey(
+  options: ProviderOptions,
+  cwd: string | undefined,
+  turn: OpenCodeTurnOverrides,
+): string {
   const effort = turn.effort ?? process.env.OPENCODE_EFFORT;
   const effectiveModel = turn.model ?? process.env.OPENCODE_MODEL;
+  const authProviders = opencodeAuthProviders();
   return JSON.stringify({
     mcp: mcpServersToOpenCodeConfig(options.mcpServers),
     model: process.env.OPENCODE_MODEL,
     small: process.env.OPENCODE_SMALL_MODEL,
-    providers: opencodeAuthProviders(),
+    providers: authProviders,
+    // A direct-native route changes the child process environment. Crossings
+    // must respawn; model switches that stay on the same route must not.
+    nativeDirect: shouldBypassOpenCodeProxy(effectiveModel, authProviders),
     // Per-turn `-e` IS in the key: effort lives in the server config, so
     // changing it rebuilds the runtime. A respawn that can't resume the prior
     // session self-heals via the poll-loop's stale-session recap path.

@@ -66,7 +66,8 @@ describe('codex provider container-config: agents/ mount', () => {
 
     expect(agentsMount).toBeDefined();
     expect(agentsMount!.readonly).toBe(true);
-    expect(agentsMount!.hostPath).toBe(path.join(groupDir, '.codex', 'agents'));
+    expect(agentsMount!.hostPath).toBe(fs.realpathSync(path.join(groupDir, '.codex', 'agents')));
+    expect(agentsMount!.overlayAllowedRoots).toEqual([fs.realpathSync(groupDir)]);
   });
 
   it('test_no_agents_mount_when_group_dir_absent_even_with_host_agents', () => {
@@ -217,6 +218,58 @@ describe('codex provider container-config: agents/ mount', () => {
           }),
         ),
       ).toThrow(/Unsafe runtime directory/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a symlinked group agents source even when its target stays inside the group', () => {
+    const fn = getProviderContainerConfig('codex')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-agents-link-'));
+    const groupDir = path.join(root, 'group');
+    const realAgents = path.join(groupDir, 'real-agents');
+    fs.mkdirSync(path.join(groupDir, '.codex'), { recursive: true });
+    fs.mkdirSync(realAgents);
+    fs.symlinkSync(realAgents, path.join(groupDir, '.codex', 'agents'), 'dir');
+
+    try {
+      expect(() => fn(makeCtx({ sessionDir: path.join(root, 'session'), groupDir }))).toThrow(
+        /Unsafe contained directory/,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an intermediate group agents symlink that escapes the group', () => {
+    const fn = getProviderContainerConfig('codex')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-agents-parent-link-'));
+    const groupDir = path.join(root, 'group');
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.mkdirSync(path.join(outside, 'agents'), { recursive: true });
+    fs.symlinkSync(outside, path.join(groupDir, '.codex'), 'dir');
+
+    try {
+      expect(() => fn(makeCtx({ sessionDir: path.join(root, 'session'), groupDir }))).toThrow(
+        /Unsafe contained directory/,
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a non-directory group agents source', () => {
+    const fn = getProviderContainerConfig('codex')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-agents-file-'));
+    const groupDir = path.join(root, 'group');
+    fs.mkdirSync(path.join(groupDir, '.codex'), { recursive: true });
+    fs.writeFileSync(path.join(groupDir, '.codex', 'agents'), 'not a directory');
+
+    try {
+      expect(() => fn(makeCtx({ sessionDir: path.join(root, 'session'), groupDir }))).toThrow(
+        /Unsafe contained directory/,
+      );
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

@@ -34,11 +34,12 @@ import { brightSelect } from '../lib/bright-select.js';
 import { type AssistContext, BIG_PICTURE_FILES, STEP_FILES } from '../lib/claude-assist.js';
 import { brandBody, note } from '../lib/theme.js';
 import * as setupLog from '../logs.js';
+import { effectiveDockerArgBeforeFinalRun, finalDockerArg, hasDockerRunConsumer } from '../lib/dockerfile-version.js';
 import { type FailureAssistResult, registerSetupProvider } from './registry.js';
 
 // ─── OneCLI vault helpers ────────────────────────────────────────────────
 
-interface OnecliSecret {
+export interface OnecliSecret {
   id: string;
   name: string;
   type: string;
@@ -51,19 +52,17 @@ function listSecrets(): OnecliSecret[] {
   return Array.isArray(parsed.data) ? (parsed.data as OnecliSecret[]) : [];
 }
 
+const CODEX_CREDENTIAL_HOSTS = new Set(['api.openai.com', 'chatgpt.com']);
+
+/** Whether OneCLI will route a secret to either Codex authentication endpoint. */
+export function hasCodexCredentialRoute(secret: OnecliSecret): boolean {
+  // Gateway routing is host-pattern based. Name and type are descriptive
+  // metadata, so neither proves that this secret reaches a Codex endpoint.
+  return secret.hostPattern !== null && CODEX_CREDENTIAL_HOSTS.has(secret.hostPattern.toLowerCase());
+}
+
 function findOpenAISecret(secrets: OnecliSecret[]): OnecliSecret | undefined {
-  return secrets.find((s) => {
-    const name = s.name.toLowerCase();
-    const type = s.type.toLowerCase();
-    const hostPattern = (s.hostPattern ?? '').toLowerCase();
-    return (
-      name === 'codex' ||
-      name === 'openai' ||
-      type === 'openai' ||
-      hostPattern.includes('api.openai.com') ||
-      hostPattern.includes('chatgpt.com')
-    );
-  });
+  return secrets.find(hasCodexCredentialRoute);
 }
 
 function openAISecretExists(): boolean {
@@ -407,10 +406,14 @@ export function verifyCodexInstall(root = process.cwd()): { ok: boolean; problem
 
   const dockerfilePath = path.join(root, 'container', 'Dockerfile');
   const dockerfile = fs.existsSync(dockerfilePath) ? fs.readFileSync(dockerfilePath, 'utf-8') : '';
-  if (!/^ARG CODEX_VERSION=0\.145\.0$/m.test(dockerfile)) {
-    problems.push('container/Dockerfile missing exact ARG CODEX_VERSION=0.145.0 pin');
+  const pinnedInstall = '"@openai/codex@${CODEX_VERSION}"';
+  const hasPinnedInstall = hasDockerRunConsumer(dockerfile, pinnedInstall);
+  const effectivePin = effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', pinnedInstall);
+  const pinToValidate = hasPinnedInstall ? effectivePin : finalDockerArg(dockerfile, 'CODEX_VERSION');
+  if (!pinToValidate || !/^\d+\.\d+\.\d+$/.test(pinToValidate)) {
+    problems.push('container/Dockerfile missing an exact numeric ARG CODEX_VERSION pin');
   }
-  if (!dockerfile.includes('"@openai/codex@${CODEX_VERSION}"')) {
+  if (!hasPinnedInstall) {
     problems.push('container/Dockerfile missing the pinned @openai/codex install');
   }
 

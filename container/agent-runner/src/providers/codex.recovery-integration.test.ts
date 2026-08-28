@@ -19,6 +19,8 @@ const ORIGINAL_ENV = {
   FAKE_CODEX_STATE: process.env.FAKE_CODEX_STATE,
   FAKE_CODEX_LOG: process.env.FAKE_CODEX_LOG,
   FAKE_CODEX_FAILURE_MODE: process.env.FAKE_CODEX_FAILURE_MODE,
+  CODEX_PRIMARY_HOST_HOME: process.env.CODEX_PRIMARY_HOST_HOME,
+  CODEX_FALLBACK_HOMES: process.env.CODEX_FALLBACK_HOMES,
 };
 
 function restoreEnv(): void {
@@ -217,6 +219,141 @@ lines.on('line', (line) => {
     );
   }
 });
+
+it('runs a third no-fallback attempt after control-plane recovery and same-thread primary-auth refresh', async () => {
+  const binDir = path.join(tmpDir, 'bin');
+  const codexHome = path.join(tmpDir, 'codex-home');
+  const hostCodexHome = path.join(tmpDir, 'host-codex-home');
+  const statePath = path.join(tmpDir, 'spawn-count');
+  const logPath = path.join(tmpDir, 'requests.jsonl');
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(hostCodexHome, { recursive: true });
+  fs.writeFileSync(path.join(hostCodexHome, 'auth.json'), '{"access_token":"fresh"}');
+
+  fs.writeFileSync(
+    path.join(binDir, 'codex'),
+    `#!/usr/bin/env bun
+import fs from 'fs';
+import readline from 'readline';
+
+const statePath = process.env.FAKE_CODEX_STATE;
+const logPath = process.env.FAKE_CODEX_LOG;
+const previous = fs.existsSync(statePath) ? Number(fs.readFileSync(statePath, 'utf8')) : 0;
+const instance = previous + 1;
+fs.writeFileSync(statePath, String(instance));
+
+const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+const log = (value) => fs.appendFileSync(logPath, JSON.stringify({ instance, ...value }) + '\\n');
+const lines = readline.createInterface({ input: process.stdin });
+lines.on('line', (line) => {
+  const request = JSON.parse(line);
+  log({ method: request.method, params: request.params });
+  if (request.method === 'initialize') {
+    send({ id: request.id, result: { userAgent: 'fake-codex' } });
+    return;
+  }
+  if (request.method === 'thread/start' || request.method === 'thread/resume') {
+    send({ id: request.id, result: { thread: { id: 'thread-1', status: { type: 'idle' } } } });
+    return;
+  }
+  if (request.method === 'turn/start') {
+    const turnId = 'turn-' + instance;
+    send({ id: request.id, result: { turn: { id: turnId } } });
+    send({
+      method: 'turn/started',
+      params: { threadId: 'thread-1', turn: { id: turnId, status: 'inProgress', items: [] } },
+    });
+    setTimeout(() => {
+      if (instance === 1) {
+        send({
+          method: 'item/started',
+          params: {
+            threadId: 'thread-1', turnId,
+            item: { id: 'command-1', type: 'commandExecution', status: 'inProgress' },
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId: 'thread-1',
+            turn: {
+              id: turnId,
+              status: 'completed',
+              items: [{ id: 'command-1', type: 'commandExecution', status: 'inProgress' }],
+            },
+          },
+        });
+      } else if (instance === 2) {
+        send({ method: 'thread/status/changed', params: { threadId: 'thread-1', status: { type: 'systemError' } } });
+      } else {
+        send({
+          method: 'item/agentMessage/delta',
+          params: { threadId: 'thread-1', turnId, delta: 'third-attempt result' },
+        });
+        send({
+          method: 'turn/completed',
+          params: { threadId: 'thread-1', turn: { id: turnId, status: 'completed', items: [] } },
+        });
+      }
+    }, 5);
+    return;
+  }
+  if (request.method === 'thread/read') {
+    send({ id: request.id, result: { thread: { status: { type: 'active' } } } });
+    return;
+  }
+  if (request.method === 'thread/list') {
+    send({ id: request.id, result: { data: [] } });
+  }
+});
+`,
+    { mode: 0o755 },
+  );
+
+  process.env.PATH = `${binDir}:${process.env.PATH ?? ''}`;
+  process.env.CODEX_HOME = codexHome;
+  process.env.CODEX_PRIMARY_HOST_HOME = hostCodexHome;
+  delete process.env.CODEX_FALLBACK_HOMES;
+  process.env.FAKE_CODEX_STATE = statePath;
+  process.env.FAKE_CODEX_LOG = logPath;
+  process.env.CODEX_HEALTH_PROBE_QUIET_MS = '60000';
+  process.env.CODEX_HEALTH_PROBE_INTERVAL_MS = '1000';
+  process.env.CODEX_HEALTH_PROBE_TIMEOUT_MS = '1000';
+
+  const provider = new CodexProvider({ providerConfig: { reasoning_effort: 'ultra' } });
+  expect(provider.fallbackHomes).toEqual([]);
+  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+  const query = provider.query({ prompt: 'perform the original task once', cwd: tmpDir });
+  const events: Array<{ type: string; text?: string | null }> = [];
+  for await (const event of query.events) {
+    events.push(event);
+    if (event.type === 'result') query.end();
+  }
+
+  expect(fs.readFileSync(statePath, 'utf8')).toBe('3');
+  expect(events.find((event) => event.type === 'result')).toMatchObject({ text: 'third-attempt result' });
+  expect(events.some((event) => event.type === 'error')).toBe(false);
+  expect(fs.readFileSync(path.join(codexHome, 'auth.json'), 'utf8')).toBe('{"access_token":"fresh"}');
+
+  const starts = fs
+    .readFileSync(logPath, 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as { method: string; params?: { input?: Array<{ text?: string }> } })
+    .filter((request) => request.method === 'turn/start');
+  expect(starts).toHaveLength(3);
+  expect(starts[0]?.params?.input?.[0]?.text).toBe('perform the original task once');
+  expect(starts[1]?.params?.input?.[0]?.text).toContain(
+    'Continue the same user request from the persisted thread state',
+  );
+  expect(starts[2]?.params?.input?.[0]?.text).toContain(
+    'Continue the same user request from the persisted thread state',
+  );
+  expect(
+    starts.slice(1).every((start) => !start.params?.input?.[0]?.text?.includes('perform the original task once')),
+  ).toBe(true);
+}, 5_000);
 
 // Cost attribution across the outer retry loop. One logical turn can span
 // several runOneTurn invocations, and EVERY attempt is billed: the provider

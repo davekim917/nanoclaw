@@ -4,20 +4,23 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { pruneDanglingSymlinks } from './opencode.js';
+import { copyOpenCodeSkills } from './opencode.js';
 
-describe('pruneDanglingSymlinks', () => {
+describe('copyOpenCodeSkills', () => {
   let root: string;
+  let copyRoot: string;
 
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'prune-test-'));
+    copyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'prune-copy-test-'));
   });
 
   afterEach(() => {
     fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(copyRoot, { recursive: true, force: true });
   });
 
-  it('test_removes_dangling_links_and_emptied_dirs_keeps_live_content', () => {
+  it('filters dangling links only from the derived copy and preserves host authority', () => {
     // Live skill: real SKILL.md + valid symlink.
     const live = path.join(root, 'team-auto');
     fs.mkdirSync(live);
@@ -35,15 +38,22 @@ describe('pruneDanglingSymlinks', () => {
     // Top-level dangling file link.
     fs.symlinkSync(path.join(root, 'gone.md'), path.join(root, 'trimming.md'));
 
-    pruneDanglingSymlinks(root);
+    const intentionalEmpty = path.join(root, 'intentional-empty');
+    fs.mkdirSync(intentionalEmpty);
+    const dst = path.join(copyRoot, 'skills');
+    copyOpenCodeSkills(root, dst);
 
-    expect(fs.existsSync(stale)).toBe(false);
-    expect(fs.existsSync(path.join(root, 'trimming.md'))).toBe(false);
-    expect(fs.existsSync(path.join(live, 'SKILL.md'))).toBe(true);
-    expect(fs.readlinkSync(path.join(live, 'references'))).toBe(realTarget);
-    // The dereferencing copy the spawn performs must now succeed.
-    const dst = path.join(root, '..', path.basename(root) + '-copy');
-    fs.cpSync(root, dst, { recursive: true, dereference: true, force: true });
-    fs.rmSync(dst, { recursive: true, force: true });
+    // The host-owned source is untouched, including intentional empty dirs.
+    expect(fs.lstatSync(path.join(stale, 'references')).isSymbolicLink()).toBe(true);
+    expect(fs.lstatSync(path.join(root, 'trimming.md')).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(intentionalEmpty)).toBe(true);
+
+    // The derived copy omits stale links but materializes live links as files.
+    expect(fs.existsSync(path.join(dst, 'team-qa', 'references'))).toBe(false);
+    expect(fs.existsSync(path.join(dst, 'trimming.md'))).toBe(false);
+    expect(fs.readFileSync(path.join(dst, 'team-auto', 'SKILL.md'), 'utf8')).toBe('skill');
+    expect(fs.lstatSync(path.join(dst, 'team-auto', 'references')).isFile()).toBe(true);
+    expect(fs.readFileSync(path.join(dst, 'team-auto', 'references'), 'utf8')).toBe('content');
+    expect(fs.lstatSync(path.join(dst, 'intentional-empty')).isDirectory()).toBe(true);
   });
 });

@@ -29,6 +29,7 @@ This unregisters the provider from both `listProviderContainerConfigNames()` (ho
 
 ```bash
 rm -f src/providers/opencode.ts \
+      src/providers/opencode.container-config.test.ts \
       src/providers/opencode-registration.test.ts \
       src/opencode-dockerfile.test.ts \
       container/agent-runner/src/providers/opencode.ts \
@@ -53,7 +54,7 @@ In `container/Dockerfile`, remove both OpenCode edits (skip whichever is already
 **(a)** Delete the version ARG from the "Pin CLI versions" block:
 
 ```dockerfile
-ARG OPENCODE_VERSION=1.17.18
+ARG OPENCODE_VERSION=<exact-version>
 ```
 
 **(b)** Remove the OpenCode entry from the shared global CLI install block:

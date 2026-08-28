@@ -18,6 +18,7 @@ import {
   materializeRawImageGeneration,
   mirrorCodexAgentsToHome,
   refreshCodexAuthFromHost,
+  resolveCodexRestartTransition,
   resolveQueryModel,
   resolveQueryEffort,
 } from './codex.js';
@@ -25,12 +26,7 @@ import {
 describe('isCodexNotificationForActiveTurn', () => {
   it('accepts the active root thread and turn', () => {
     expect(
-      isCodexNotificationForActiveTurn(
-        'item/started',
-        { threadId: 'root-1', turnId: 'turn-1' },
-        'root-1',
-        'turn-1',
-      ),
+      isCodexNotificationForActiveTurn('item/started', { threadId: 'root-1', turnId: 'turn-1' }, 'root-1', 'turn-1'),
     ).toBe(true);
   });
 
@@ -74,14 +70,7 @@ describe('isCodexNotificationForActiveTurn', () => {
         'turn-1',
       ),
     ).toBe(true);
-    expect(
-      isCodexNotificationForActiveTurn(
-        'thread/started',
-        { thread: { id: 'root-1' } },
-        'root-1',
-        null,
-      ),
-    ).toBe(true);
+    expect(isCodexNotificationForActiveTurn('thread/started', { thread: { id: 'root-1' } }, 'root-1', null)).toBe(true);
   });
 
   it('rejects a stale turn id on any namespace, not just the turn-scoped ones', () => {
@@ -609,7 +598,7 @@ describe('codex turn watchdog is health-based, not wall-clock', () => {
     expect(codeOnly).toContain('CODEX_HEALTH_PROBE_FAILURE_LIMIT');
   });
 
-  it('tracks every notification and item identity through CodexTurnLiveness', () => {
+  it('tracks item identity through the shared completed-item reducer', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
     const handlerStart = src.indexOf('const handler = (n: JsonRpcNotification)');
     expect(handlerStart).toBeGreaterThan(-1);
@@ -617,8 +606,10 @@ describe('codex turn watchdog is health-based, not wall-clock', () => {
     expect(switchStart).toBeGreaterThan(-1);
     const handlerPreamble = src.slice(handlerStart, switchStart);
     expect(handlerPreamble).toContain('liveness.noteItemStarted(params.item)');
-    expect(handlerPreamble).toContain('liveness.noteItemCompleted(params.item)');
     expect(handlerPreamble).toContain('liveness.noteNotification()');
+    expect(src).toContain('const reduceCompletedThreadItem');
+    expect(src).toContain('liveness.noteItemCompleted(item)');
+    expect(src).toContain('reduceCompletedThreadItem(params.item as CompletedThreadItem)');
   });
 
   it('starts health probes before turn dispatch and clears them in finally', () => {
@@ -723,7 +714,9 @@ describe('codex turn-failure classification (systemError + turn/completed:failed
     // notification dispatch branch.
     const handlerIdx = codeOnly.indexOf('const completeTurn = async');
     expect(handlerIdx).toBeGreaterThan(-1);
-    const window = codeOnly.slice(handlerIdx, handlerIdx + 2400);
+    const handlerEnd = codeOnly.indexOf('\n  const handler =', handlerIdx);
+    expect(handlerEnd).toBeGreaterThan(handlerIdx);
+    const window = codeOnly.slice(handlerIdx, handlerEnd);
 
     // status==='failed' OR error-presence path
     expect(window).toMatch(/p\.status\s*===\s*['"]failed['"]|status\s*===\s*['"]failed['"]/);
@@ -933,6 +926,29 @@ describe('codex OAuth fallback — rotation primitives', () => {
         expect(new CodexProvider().rotateCodexHome()).toBeNull();
       });
     });
+
+    it('keeps the provider-lifetime primary home after rotation changes CODEX_HOME', () => {
+      withEnv(
+        {
+          CODEX_HOME: '/home/node/.codex-primary',
+          CODEX_PRIMARY_HOST_HOME: '/host/.codex-primary',
+          CODEX_FALLBACK_HOMES: '/home/node/.codex-fallback',
+        },
+        () => {
+          const provider = new CodexProvider() as unknown as {
+            primaryCodexHome: string;
+            primaryHostCodexHome: string | undefined;
+            rotateCodexHome: () => string | null;
+          };
+
+          expect(provider.rotateCodexHome()).toBe('/home/node/.codex-fallback');
+          process.env.CODEX_HOME = '/home/node/.codex-fallback';
+
+          expect(provider.primaryCodexHome).toBe('/home/node/.codex-primary');
+          expect(provider.primaryHostCodexHome).toBe('/host/.codex-primary');
+        },
+      );
+    });
   });
 
   describe('runOneTurn error → ProviderEvent classification mapping', () => {
@@ -1098,14 +1114,45 @@ describe('codex OAuth fallback — rotation primitives', () => {
         })
         .join('\n');
 
-      const refreshIdx = codeOnly.indexOf('refreshCodexAuthFromHost(currentCodexHome, primaryHostCodexHome)');
+      const refreshIdx = codeOnly.indexOf('refreshCodexAuthFromHost(currentCodexHome, self.primaryHostCodexHome)');
       const fallbackIdx = codeOnly.indexOf('if (eligible && self.nextFallback < self.fallbackHomes.length)');
       const surfaceIdx = codeOnly.indexOf('yield ev;');
       expect(refreshIdx).toBeGreaterThan(-1);
       expect(fallbackIdx).toBeGreaterThan(refreshIdx);
       expect(surfaceIdx).toBeGreaterThan(fallbackIdx);
-      expect(codeOnly).toContain('process.env.CODEX_PRIMARY_HOST_HOME');
+      expect(codeOnly).toContain('self.primaryCodexHome');
+      expect(codeOnly).toContain('self.primaryHostCodexHome');
       expect(codeOnly).toContain('primaryAuthRefreshAttempted = true');
+    });
+
+    it('preserves a same-thread recovery prompt and dedupe state after direct primary-auth refresh', () => {
+      expect(
+        resolveCodexRestartTransition({
+          previousThreadId: 'thread-1',
+          nextThreadId: 'thread-1',
+          originalText: 'perform the original task once',
+          initYielded: true,
+        }),
+      ).toEqual({
+        attemptText: expect.stringContaining('Continue the same user request from the persisted thread state'),
+        initYielded: true,
+        resetThreadDedupe: false,
+      });
+    });
+
+    it('replays the original request and resets thread dedupe after a fresh-thread restart', () => {
+      expect(
+        resolveCodexRestartTransition({
+          previousThreadId: 'thread-1',
+          nextThreadId: 'thread-2',
+          originalText: 'perform the original task once',
+          initYielded: true,
+        }),
+      ).toEqual({
+        attemptText: 'perform the original task once',
+        initYielded: false,
+        resetThreadDedupe: true,
+      });
     });
   });
 });
@@ -1223,6 +1270,24 @@ describe('mirrorCodexAgentsToHome (codex #126)', () => {
     expect(mirrorCodexAgentsToHome(primary, fallback)).toBe(true);
     expect(fs.existsSync(path.join(fallback, 'agents', 'architecture-advisor.toml'))).toBe(true);
     expect(fs.readFileSync(path.join(fallback, 'agents', 'security-reviewer.toml'), 'utf-8')).toContain('sec');
+  });
+
+  it('replaces the fallback with an exact snapshot so retired roles disappear', () => {
+    fs.mkdirSync(path.join(primary, 'agents'), { recursive: true });
+    fs.mkdirSync(path.join(fallback, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(primary, 'agents', 'current.toml'), 'name = "current"\n');
+    fs.writeFileSync(path.join(fallback, 'agents', 'retired.toml'), 'name = "retired"\n');
+
+    expect(mirrorCodexAgentsToHome(primary, fallback)).toBe(true);
+    expect(fs.readdirSync(path.join(fallback, 'agents'))).toEqual(['current.toml']);
+  });
+
+  it('clears a stale fallback snapshot when the primary agents tree disappears', () => {
+    fs.mkdirSync(path.join(fallback, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(fallback, 'agents', 'retired.toml'), 'name = "retired"\n');
+
+    expect(mirrorCodexAgentsToHome(primary, fallback)).toBe(true);
+    expect(fs.existsSync(path.join(fallback, 'agents'))).toBe(false);
   });
 
   it('is a no-op when src==dst or the primary has no agents/ tree', () => {

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { closeSessionDb, initTestSessionDb } from '../db/connection.js';
 import type { AppServer } from './codex-app-server.js';
 import { runOneTurn, type CodexTurnHealthConfig } from './codex.js';
+import type { ProviderEvent } from './types.js';
 
 interface RecordedRequest {
   id: number;
@@ -60,11 +61,8 @@ function fakeServer(
   };
 }
 
-async function collectTurn(
-  server: AppServer,
-  health: CodexTurnHealthConfig = FAST_HEALTH,
-): Promise<Array<{ type: string; classification?: string }>> {
-  const events: Array<{ type: string; classification?: string }> = [];
+async function collectTurn(server: AppServer, health: CodexTurnHealthConfig = FAST_HEALTH): Promise<ProviderEvent[]> {
+  const events: ProviderEvent[] = [];
   for await (const event of runOneTurn(
     server,
     'thread-1',
@@ -200,6 +198,150 @@ describe('runOneTurn Codex control-plane health integration', () => {
 
     expect(events.some((event) => event.type === 'error')).toBe(false);
     expect(events.at(-1)).toMatchObject({ type: 'result', text: 'completed result' });
+  });
+
+  it('restores a dropped image completion from a succeeded terminal snapshot', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('item/started', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: { id: 'image-1', type: 'imageGeneration', status: 'inProgress' },
+    });
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [
+          {
+            id: 'image-1',
+            type: 'imageGeneration',
+            status: 'succeeded',
+            savedPath: '/home/node/.codex/generated_images/image-1.png',
+          },
+        ],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events).toContainEqual({ type: 'file', path: '/home/node/.codex/generated_images/image-1.png' });
+  });
+
+  it('restores a dropped image completion from a statusless saved-path snapshot', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('item/started', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: { id: 'image-1', type: 'imageGeneration', status: 'inProgress' },
+    });
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [
+          {
+            id: 'image-1',
+            type: 'imageGeneration',
+            saved_path: '/home/node/.codex/generated_images/image-1.png',
+          },
+        ],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events).toContainEqual({ type: 'file', path: '/home/node/.codex/generated_images/image-1.png' });
+  });
+
+  it('rejects an in-progress image snapshot even when it names an eventual path', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('item/started', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: { id: 'image-1', type: 'imageGeneration', status: 'inProgress' },
+    });
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [
+          {
+            id: 'image-1',
+            type: 'imageGeneration',
+            status: 'inProgress',
+            savedPath: '/home/node/.codex/generated_images/image-1.png',
+          },
+        ],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(events).toContainEqual(expect.objectContaining({ type: 'error', classification: 'protocol_desync' }));
+    expect(events.some((event) => event.type === 'file')).toBe(false);
+  });
+
+  it('restores an assistant result from terminal-only completed-turn items', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [{ id: 'message-1', type: 'agentMessage', text: 'terminal-only result' }],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(events.find((event) => event.type === 'result')).toMatchObject({
+      type: 'result',
+      text: 'terminal-only result',
+      steps: 1,
+    });
+  });
+
+  it('dedupes a live completed item repeated in the authoritative terminal snapshot', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    const message = { id: 'message-1', type: 'agentMessage', text: 'deduped result' };
+    fixture.emit('item/completed', { threadId: 'thread-1', turnId: 'turn-1', item: message });
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'completed', items: [message] },
+    });
+    const events = await resultPromise;
+
+    expect(events.find((event) => event.type === 'result')).toMatchObject({
+      type: 'result',
+      text: 'deduped result',
+      steps: 1,
+    });
   });
 
   it('accepts a completed parent turn while its persistent collaboration item remains open', async () => {
@@ -383,7 +525,10 @@ describe('runOneTurn Codex control-plane health integration', () => {
                 {
                   id: 'turn-1',
                   status: 'completed',
-                  items: [{ id: 'command-1', type: 'commandExecution', status: 'completed', exitCode: 0 }],
+                  items: [
+                    { id: 'command-1', type: 'commandExecution', status: 'completed', exitCode: 0 },
+                    { id: 'message-1', type: 'agentMessage', text: 'completed after backfill' },
+                  ],
                 },
               ],
             },
@@ -402,11 +547,6 @@ describe('runOneTurn Codex control-plane health integration', () => {
       threadId: 'thread-1',
       turnId: 'turn-1',
       item: { id: 'command-1', type: 'commandExecution', status: 'inProgress' },
-    });
-    fixture.emit('item/agentMessage/delta', {
-      threadId: 'thread-1',
-      turnId: 'turn-1',
-      delta: 'completed after backfill',
     });
     fixture.emit('turn/completed', {
       threadId: 'thread-1',
@@ -470,6 +610,54 @@ describe('runOneTurn Codex control-plane health integration', () => {
     expect(fixture.requests.some((request) => request.method === 'thread/read')).toBe(true);
     expect(events.some((event) => event.type === 'error')).toBe(false);
     expect(events.at(-1)).toMatchObject({ type: 'result', text: 'completed after summary backfill' });
+  });
+
+  it('backfills a prose-only summary instead of replacing streamed output', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      if (request.method === 'thread/read') {
+        return {
+          result: {
+            thread: {
+              turns: [
+                {
+                  id: 'turn-1',
+                  status: 'completed',
+                  itemsView: 'full',
+                  items: [{ id: 'message-1', type: 'agentMessage', text: 'full streamed result' }],
+                },
+              ],
+            },
+          },
+        };
+      }
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('turn/started', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'inProgress', items: [] },
+    });
+    fixture.emit('item/agentMessage/delta', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      delta: 'full streamed result',
+    });
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        itemsView: 'summary',
+        items: [{ id: 'message-1', type: 'agentMessage', text: 'truncated summary' }],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(fixture.requests.some((request) => request.method === 'thread/read')).toBe(true);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'result', text: 'full streamed result' });
   });
 
   it('retries transient completed-turn backfill failures before recovery', async () => {
