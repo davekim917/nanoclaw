@@ -9,6 +9,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+NODE_PATH=""
 
 echo "=== NANOCLAW SETUP: INSTALL_NODE ==="
 
@@ -33,6 +34,7 @@ if command -v uvx >/dev/null 2>&1; then
   ln -sf ~/node/bin/npm ~/.local/bin/npm
   ln -sf ~/node/bin/npx ~/.local/bin/npx
   ln -sf ~/node/bin/pnpm ~/.local/bin/pnpm
+  NODE_PATH="$HOME/.local/bin/node"
   export PATH="$HOME/.local/bin:$PATH"
 else
   case "$(uname -s)" in
@@ -45,13 +47,21 @@ else
         exit 1
       fi
       brew install node@22
-      export PATH="$(brew --prefix node@22)/bin:$PATH"
+      NODE_PATH="$(brew --prefix node@22)/bin/node"
+      export PATH="$(dirname "$NODE_PATH"):$PATH"
       ;;
     Linux)
       echo "STEP: nodesource-setup"
       curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
       echo "STEP: apt-install-nodejs"
       sudo apt-get install -y nodejs
+      NODE_PATH=""
+      while IFS= read -r candidate; do
+        if [[ "$candidate" == */bin/node ]] && [ -x "$candidate" ]; then
+          NODE_PATH="$candidate"
+          break
+        fi
+      done < <(dpkg-query -L nodejs)
       ;;
     *)
       echo "STATUS: failed"
@@ -62,14 +72,13 @@ else
   esac
 fi
 
-if ! command -v node >/dev/null 2>&1; then
+if [ -z "$NODE_PATH" ] || [ ! -x "$NODE_PATH" ]; then
   echo "STATUS: failed"
-  echo "ERROR: node not found on PATH after install"
+  echo "ERROR: installer did not report an executable Node path"
   echo "=== END ==="
   exit 1
 fi
 
-NODE_PATH="$(command -v node)"
 NODE_VERSION="$("$NODE_PATH" --version 2>/dev/null | sed 's/^v//')"
 if ! "$NODE_PATH" "$PROJECT_ROOT/scripts/check-node-version.mjs" "$NODE_VERSION" >/dev/null 2>&1; then
   echo "STATUS: failed"

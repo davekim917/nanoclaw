@@ -100,7 +100,7 @@ for tool in npm npx pnpm; do ln -sf node "$HOME/node/bin/$tool"; done`,
     const staleLocal = join(home, '.local', 'bin', 'node');
     const status = join(root, 'install-node.status');
     const selectedPrefix = platform === 'Darwin' ? join(root, 'opt', 'node@22') : bin;
-    const selectedNode = platform === 'Darwin' ? join(selectedPrefix, 'bin', 'node') : join(bin, 'node');
+    const selectedNode = platform === 'Darwin' ? join(selectedPrefix, 'bin', 'node') : join(root, 'usr', 'bin', 'node');
 
     nodeStub(join(bin, 'node'), '20.20.2');
     nodeStub(staleLocal, '18.20.8');
@@ -115,6 +115,7 @@ for tool in npm npx pnpm; do ln -sf node "$HOME/node/bin/$tool"; done`,
     } else {
       const installedNode = join(root, 'installed-node');
       nodeStub(installedNode, '22.19.0');
+      mkdirSync(dirname(selectedNode), { recursive: true });
       executable(join(bin, 'curl'), 'exit 0');
       executable(
         join(bin, 'sudo'),
@@ -122,6 +123,7 @@ for tool in npm npx pnpm; do ln -sf node "$HOME/node/bin/$tool"; done`,
 if [[ "\${1:-}" == "apt-get" ]]; then cp ${JSON.stringify(installedNode)} ${JSON.stringify(selectedNode)}; exit 0; fi
 exit 1`,
       );
+      executable(join(bin, 'dpkg-query'), `printf '%s\\n' /usr/share/doc/nodejs ${JSON.stringify(selectedNode)}`);
     }
 
     const result = spawnSync(
@@ -150,6 +152,7 @@ exit 1`,
     expect(result.stdout).toContain('STEP: upgrade-node');
     expect(result.stdout).toContain(`NODE_PATH: ${selectedNode}`);
     expect(result.stdout).toContain(`ACTIVE_NODE: ${selectedNode}`);
+    expect(result.stdout).not.toContain(`ACTIVE_NODE: ${join(bin, 'node')}`);
     expect(result.stdout).not.toContain(`ACTIVE_NODE: ${staleLocal}`);
   });
 
