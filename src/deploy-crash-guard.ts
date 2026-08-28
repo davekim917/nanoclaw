@@ -40,6 +40,13 @@ interface RollbackManifest {
   commit: string;
   imageBase: string;
   timestamp: string;
+  /**
+   * `node --version` at deploy time. The node_modules snapshot is ABI-tied
+   * to this runtime (native modules like better-sqlite3 install per
+   * NODE_MODULE_VERSION prebuilds): restoring it under a different Node
+   * would produce a build that cannot load its native modules.
+   */
+  node?: string;
 }
 
 interface GuardDeps {
@@ -85,10 +92,15 @@ export function evaluateBoot(
   manifest: RollbackManifest | null,
   priorAttempts: number,
   nowMs: number,
-): 'no-op' | 'stale' | 'arm' | 'rollback' {
+  nodeVersion: string = process.version,
+): 'no-op' | 'stale' | 'arm' | 'rollback' | 'runtime-changed' {
   if (!manifest) return 'no-op';
   const age = nowMs - Date.parse(manifest.timestamp);
   if (!Number.isFinite(age) || age < 0 || age > MANIFEST_WINDOW_MS) return 'stale';
+  // The Node executable changed between deploy and this boot (e.g. a runtime
+  // upgrade). The snapshots are ABI-tied to the old runtime — rolling back
+  // onto them would trade one broken build for another. Refuse, loudly.
+  if (manifest.node && manifest.node !== nodeVersion) return 'runtime-changed';
   if (priorAttempts + 1 >= MAX_BOOT_ATTEMPTS) return 'rollback';
   return 'arm';
 }
@@ -176,6 +188,27 @@ export function runDeployCrashGuard(root: string = DEFAULT_ROOT, deps: GuardDeps
     const verdict = evaluateBoot(manifest, prior, deps.now());
     if (verdict === 'no-op') return;
     if (verdict === 'stale') {
+      unlinkQuiet(manifestPath(root));
+      unlinkQuiet(attemptsPath(root));
+      return;
+    }
+    if (verdict === 'runtime-changed') {
+      // Disarm and say why: automatic rollback across a Node change would
+      // restore ABI-mismatched native modules. The operator owns this one.
+      try {
+        fs.mkdirSync(path.dirname(statusPath(root)), { recursive: true });
+        fs.writeFileSync(
+          statusPath(root),
+          JSON.stringify({
+            status: 'failed',
+            step: 'crash guard',
+            error: `Node runtime changed since deploy (${(manifest as RollbackManifest).node} -> ${process.version}); automatic rollback disabled — snapshots are ABI-tied to the old runtime. If the service is unhealthy, roll back manually (restore the previous Node executable, or reinstall dependencies under the current one).`,
+            timestamp: new Date(deps.now()).toISOString(),
+          }) + '\n',
+        );
+      } catch (err) {
+        console.error('deploy-crash-guard: could not write runtime-changed status', err);
+      }
       unlinkQuiet(manifestPath(root));
       unlinkQuiet(attemptsPath(root));
       return;

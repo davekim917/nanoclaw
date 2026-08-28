@@ -118,6 +118,42 @@ describe('runDeployCrashGuard', () => {
     expect(calls).toContainEqual(['git', 'reset', '--hard', 'a'.repeat(40)]);
   });
 
+  it('a Node runtime change since deploy refuses rollback, disarms, and explains', () => {
+    fs.mkdirSync(path.join(root, 'data'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'data', 'deploy-rollback.json'),
+      JSON.stringify({
+        commit: 'd'.repeat(40),
+        imageBase: 'nanoclaw-test',
+        timestamp: new Date().toISOString(),
+        node: 'v20.19.5',
+      }),
+    );
+    fs.writeFileSync(
+      path.join(root, 'data', 'deploy-boot-attempts.json'),
+      JSON.stringify({ attempts: 2, timestamp: new Date().toISOString() }),
+    );
+    const calls: string[][] = [];
+    // Would be a rollback boot, but the manifest's runtime differs from ours.
+    expect(() => runDeployCrashGuard(root, fakeDeps(calls))).not.toThrow();
+    expect(calls).toEqual([]);
+    // Disarmed with an explanatory failed status.
+    expect(fs.existsSync(path.join(root, 'data', 'deploy-rollback.json'))).toBe(false);
+    const status = JSON.parse(fs.readFileSync(path.join(root, 'logs', 'deploy-status.json'), 'utf-8')) as {
+      status: string;
+      error: string;
+    };
+    expect(status.status).toBe('failed');
+    expect(status.error).toContain('Node runtime changed since deploy');
+  });
+
+  it('evaluateBoot: matching or absent manifest node never trips runtime-changed', () => {
+    const base = { commit: 'c', imageBase: 'i', timestamp: new Date().toISOString() };
+    expect(evaluateBoot({ ...base, node: 'v22.0.0' }, 2, Date.now(), 'v22.0.0')).toBe('rollback');
+    expect(evaluateBoot(base, 2, Date.now(), 'v22.0.0')).toBe('rollback');
+    expect(evaluateBoot({ ...base, node: 'v20.19.5' }, 0, Date.now(), 'v22.0.0')).toBe('runtime-changed');
+  });
+
   it('a corrupt attempts file never blocks a normal boot', () => {
     writeManifest(0);
     fs.writeFileSync(path.join(root, 'data', 'deploy-boot-attempts.json'), 'not json');

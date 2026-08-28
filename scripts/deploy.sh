@@ -142,8 +142,8 @@ echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Build complete, restarting..." >> "$LOG"
 MIGRATION_CHANGES=$(git diff --name-only "$PRE_COMMIT" HEAD -- src/db/migrations/ 2>/dev/null)
 if [ -z "$MIGRATION_CHANGES" ]; then
   mkdir -p data
-  printf '{"commit":"%s","imageBase":"%s","timestamp":"%s"}\n' \
-    "$PRE_COMMIT" "${IMAGE_SAVED_BASE}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > data/deploy-rollback.json
+  printf '{"commit":"%s","imageBase":"%s","timestamp":"%s","node":"%s"}\n' \
+    "$PRE_COMMIT" "${IMAGE_SAVED_BASE}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(node --version 2>/dev/null)" > data/deploy-rollback.json
 else
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Crash guard NOT armed: deploy ships migrations ($(echo "$MIGRATION_CHANGES" | head -3 | tr '\n' ' '))" >> "$LOG"
   rm -f data/deploy-rollback.json
