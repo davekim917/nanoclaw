@@ -106,12 +106,46 @@ function opencodeAuthHasCredential(provider: string): boolean {
 // hot path (runtimeConfigKey, buildOpenCodeConfig, and opencodeAuthHasCredential
 // all call this).
 let cachedAuthProviders: string[] | null = null;
+
+/**
+ * Match OpenCode 1.18.23's Auth.Info union before trusting an auth.json key.
+ *
+ * The CLI filters invalid records during its own auth load. NanoClaw must do
+ * the same before deciding to bypass OneCLI or omit the placeholder API key;
+ * treating a merely object-shaped record as native auth sends malformed creds
+ * down the direct path and turns a startup guard into a late request failure.
+ */
+function isOpenCodeAuthRecord(value: unknown): boolean {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const isStringRecord = (metadata: unknown): metadata is Record<string, string> =>
+    metadata !== null &&
+    typeof metadata === 'object' &&
+    !Array.isArray(metadata) &&
+    Object.values(metadata).every((item) => typeof item === 'string');
+
+  if (record.type === 'oauth') {
+    return (
+      typeof record.access === 'string' &&
+      typeof record.refresh === 'string' &&
+      Number.isInteger(record.expires) &&
+      (record.expires as number) >= 0 &&
+      (record.accountId === undefined || typeof record.accountId === 'string') &&
+      (record.enterpriseUrl === undefined || typeof record.enterpriseUrl === 'string')
+    );
+  }
+  if (record.type === 'api') {
+    return typeof record.key === 'string' && (record.metadata === undefined || isStringRecord(record.metadata));
+  }
+  return record.type === 'wellknown' && typeof record.key === 'string' && typeof record.token === 'string';
+}
+
 export function parseOpenCodeAuthProviders(raw: string): string[] {
   try {
     const auth = JSON.parse(raw) as unknown;
     return auth && typeof auth === 'object' && !Array.isArray(auth)
       ? Object.entries(auth)
-          .filter(([, record]) => record !== null && typeof record === 'object' && !Array.isArray(record))
+          .filter(([, record]) => isOpenCodeAuthRecord(record))
           .map(([provider]) => provider)
       : [];
   } catch {

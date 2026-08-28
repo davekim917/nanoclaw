@@ -94,7 +94,9 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
 
   it('keeps default Anthropic effort on the registered model without synthesizing an API key', () => {
     stubGuardPresent(true);
-    _setOpenCodeAuthProvidersForTesting(parseOpenCodeAuthProviders('{"anthropic":{"type":"oauth"}}'));
+    _setOpenCodeAuthProvidersForTesting(
+      parseOpenCodeAuthProviders('{"anthropic":{"type":"oauth","access":"access","refresh":"refresh","expires":0}}'),
+    );
     process.env.OPENCODE_MODEL = 'anthropic/claude-sonnet-4-8';
     process.env.OPENCODE_EFFORT = 'high';
 
@@ -109,7 +111,9 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
 
   it('moves a per-turn Anthropic effort override onto the per-turn model without an API key', () => {
     stubGuardPresent(true);
-    _setOpenCodeAuthProvidersForTesting(parseOpenCodeAuthProviders('{"anthropic":{"type":"oauth"}}'));
+    _setOpenCodeAuthProvidersForTesting(
+      parseOpenCodeAuthProviders('{"anthropic":{"type":"oauth","access":"access","refresh":"refresh","expires":0}}'),
+    );
     process.env.OPENCODE_MODEL = 'anthropic/claude-sonnet-4-8';
     process.env.OPENCODE_EFFORT = 'low';
 
@@ -125,18 +129,54 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
 
   it('fails closed when scoped Go-only auth wins over a shared Anthropic fallback', () => {
     stubGuardPresent(true);
-    _setOpenCodeAuthProvidersForTesting(parseOpenCodeAuthProviders('{"opencode-go":{"type":"oauth"}}'));
+    _setOpenCodeAuthProvidersForTesting(
+      parseOpenCodeAuthProviders('{"opencode-go":{"type":"oauth","access":"access","refresh":"refresh","expires":0}}'),
+    );
 
     expect(() => buildOpenCodeConfig({}, { model: 'anthropic/claude-opus-4-8' })).toThrow(
       /requires a valid top-level anthropic record/i,
     );
   });
 
-  it('accepts only object-shaped native auth records', () => {
+  it('accepts only complete OpenCode auth records', () => {
     expect(
-      parseOpenCodeAuthProviders('{"anthropic":{"type":"oauth"},"opencode-go":null,"opencode":[],"nvidia":"token"}'),
-    ).toEqual(['anthropic']);
+      parseOpenCodeAuthProviders(
+        JSON.stringify({
+          'opencode-go': { type: 'oauth', access: 'access', refresh: 'refresh', expires: 0 },
+          nvidia: { type: 'api', key: 'nvapi-key', metadata: { region: 'us' } },
+          'wellknown-provider': { type: 'wellknown', key: 'key', token: 'token' },
+          empty: {},
+          'bad-oauth': { type: 'oauth', access: 1, refresh: 'refresh', expires: 0 },
+          'bad-api': { type: 'api', key: 1 },
+          'bad-metadata': { type: 'api', key: 'key', metadata: { region: 1 } },
+          nullish: null,
+          array: [],
+          text: 'token',
+        }),
+      ),
+    ).toEqual(['opencode-go', 'nvidia', 'wellknown-provider']);
     expect(parseOpenCodeAuthProviders('{not-json')).toEqual([]);
+  });
+
+  it('rejects incomplete records before native routing or Anthropic startup', () => {
+    stubGuardPresent(true);
+    const providers = parseOpenCodeAuthProviders('{"opencode-go":{},"anthropic":{}}');
+    expect(providers).toEqual([]);
+    expect(shouldBypassOpenCodeProxy('opencode-go/glm-5.3-flash', providers)).toBe(false);
+
+    _setOpenCodeAuthProvidersForTesting(providers);
+    expect(() => buildOpenCodeConfig({}, { model: 'anthropic/claude-opus-4-8' })).toThrow(
+      /requires a valid top-level anthropic record/i,
+    );
+  });
+
+  it('does not let an unrelated valid record satisfy Anthropic startup', () => {
+    stubGuardPresent(true);
+    _setOpenCodeAuthProvidersForTesting(parseOpenCodeAuthProviders('{"nvidia":{"type":"api","key":"nvapi-key"}}'));
+
+    expect(() => buildOpenCodeConfig({}, { model: 'anthropic/claude-opus-4-8' })).toThrow(
+      /requires a valid top-level anthropic record/i,
+    );
   });
 });
 
@@ -307,7 +347,9 @@ describe('buildOpenCodeConfig + buildOpencodeServerEnv — combined spawn (F3)',
       },
     };
     process.env.OPENCODE_MODEL = 'anthropic/claude-opus-4-8';
-    _setOpenCodeAuthProvidersForTesting(parseOpenCodeAuthProviders('{"anthropic":{"type":"oauth"}}'));
+    _setOpenCodeAuthProvidersForTesting(
+      parseOpenCodeAuthProviders('{"anthropic":{"type":"oauth","access":"access","refresh":"refresh","expires":0}}'),
+    );
 
     // 1) Absent guard → refuse to build.
     stubGuardPresent(false);
