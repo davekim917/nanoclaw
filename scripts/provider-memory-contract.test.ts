@@ -546,6 +546,7 @@ describe('provider registry memory conformance', () => {
     expect(removal).not.toContain('data/v2-sessions/*/agent-runner-src');
     expect(removal).toContain('ncl groups config update --id <group-id> --provider claude');
     expect(removal).toContain('ncl groups restart --id <group-id>');
+    expect(removal).toContain('src/providers/opencode.container-config.test.ts');
     expect(removal).not.toContain('set `"provider": "claude"` in `groups/<folder>/container.json`');
   });
 });

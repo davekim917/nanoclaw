@@ -29,6 +29,7 @@ This unregisters the provider from both `listProviderContainerConfigNames()` (ho
 
 ```bash
 rm -f src/providers/opencode.ts \
+      src/providers/opencode.container-config.test.ts \
       src/providers/opencode-registration.test.ts \
       src/opencode-dockerfile.test.ts \
       container/agent-runner/src/providers/opencode.ts \
