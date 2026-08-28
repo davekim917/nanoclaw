@@ -57,3 +57,14 @@
   better-sqlite3 11.10.0 and ran for 72 seconds with zero worker exits and zero
   cgroup OOM events before it was stopped. The run was incomplete and does not
   validate Node 24 support.
+- Later #176 run `33202109172` completed both Node 22.19 and Node 24 host legs
+  without worker exits. Both failed only on the Stage 0 baseline tests because
+  #179 is not merged; fresh post-#179 matrix CI remains the merge gate.
+- Frozen review heads: #179 `178dc11d24118b12a0e8a14f3e7e8be5d72deb02`;
+  #177 source `9e8470fdbf9ecbf92bb7df7e67adec1e5f777f05`; #178 registry
+  `c64b0c152db97530a97128a0c8b28d175f8f7177`. The final #176 SHA is recorded
+  in the PR after this documentation correction lands.
+- Verified rollout topology is conflict-free in order #179 → #176 → #177.
+- The fork's `providers` branch is unprotected. Default channel resolution from
+  this fork falls back to `nanocoai/nanoclaw`; production must explicitly resolve
+  to the fork before #178 can activate future `/add-*` installs.

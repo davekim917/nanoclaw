@@ -14,11 +14,11 @@ passes a candidate-image smoke.
 
 Target provider versions, resolved from npm on 2026-08-28 and frozen for this run:
 
-| Surface | Target |
-|---|---:|
-| `@anthropic-ai/claude-code` | `2.1.250` |
-| `@anthropic-ai/claude-agent-sdk` | `0.3.250` |
-| `@openai/codex` | `0.150.1` |
+| Surface                            |    Target |
+| ---------------------------------- | --------: |
+| `@anthropic-ai/claude-code`        | `2.1.250` |
+| `@anthropic-ai/claude-agent-sdk`   | `0.3.250` |
+| `@openai/codex`                    | `0.150.1` |
 | `opencode-ai` + `@opencode-ai/sdk` | `1.18.23` |
 
 The direct `@anthropic-ai/sdk` is not part of the fast lane. NanoClaw has no
@@ -108,9 +108,10 @@ They get a later candidate-image batch with tool-specific canaries.
    upgrades that executable to Node `>=22.19.0` while the old service keeps running.
 9. Restart the old dependency set on Node 22.19+, then prove normal channel and
    outbound HTTP behavior. This isolates the runtime change from package changes.
-10. Treat Node 24 as unproven until its full CI leg completes without worker exits.
-    Run `33194243469` ended with 25 unexpected Vitest worker exits; an isolated
-    Node `24.19.0` reproduction was stopped after 72 seconds and is not a green run.
+10. Require a fresh Node 24 CI leg after Stage 0 lands. Run `33202109172`
+    completed the Node 24 host suite without the earlier worker exits and failed
+    only on the Stage 0 baseline tests; it is useful compatibility evidence, but
+    not a green merge gate until #179 is merged and the matrix reruns.
 
 ### Stage B: PR #177, provider image only
 
@@ -141,7 +142,10 @@ They get a later candidate-image batch with tool-specific canaries.
 4. Before merge, verify which remote production resolves through
    `NANOCLAW_CHANNELS_REMOTE` / `setup/lib/channels-remote.sh`. The fork's
    `providers` branch activates future `/add-*` calls only when that resolution
-   points at the fork.
+   points at the fork. By default, a checkout whose origin is this fork falls
+   back to `nanocoai/nanoclaw`; an explicit host remote/env override changes that.
+5. Treat `providers` as unprotected publication state. A bad payload is undone
+   by a forward revert, not branch protection or an image retag.
 
 ### Stage C: new host dependency PR
 
@@ -156,8 +160,9 @@ Only after Stage A is healthy on production Node:
    `integrity_check`, migrations, and opening the unchanged copy again under v11.
 
 Stages A and B may be reviewed in parallel, but their full CI is not interpretable
-until Stage 0 is green and merged. Stage C cannot activate before Stage A is
-healthy. Registry publication follows successful Stage B promotion. Each stage
+until Stage 0 is green and merged. Merge and deploy Stage A, then establish host
+health before merging or promoting Stage B. Stage C cannot activate before Stage A
+is healthy. Registry publication follows successful Stage B promotion. Each stage
 has its own rollback and never hides another stage's failure.
 
 ## Design
@@ -177,7 +182,7 @@ three comparisons.
 - Missing Node: installer follows its existing installation path.
 - Old Node: installer upgrades; setup reports unsupported; deploy stops before restart.
 - Node 22.19+ and Node 24+: accepted by the version predicate. Runtime support is
-  separately gated by a complete CI run; Node 24 is not yet green.
+  separately gated by fresh matrix CI after Stage 0 merges.
 
 ### Version-invariant contracts
 
@@ -283,7 +288,8 @@ remain operator actions; their exact command/output is recorded before ship.
 - **Provider registry publication:** merge only after Stage B promotion. Rollback
   is a new revert commit on the `providers` branch, not an image retag. If the
   production channels remote points at the fork, pause `/add-codex`,
-  `/add-opencode`, and `/clone-as-opencode` until that revert lands.
+  `/add-opencode`, and `/clone-as-opencode` until that revert lands. The branch is
+  unprotected, so CI evidence and the exact reviewed SHA are the enforcement.
 - **Stage C host dependencies:** retain the pre-stage commit, lockfile, and database
   copy. Roll back code and dependencies together; the compatibility check proves
   the unchanged database copy still opens under v11.
