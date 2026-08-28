@@ -34,7 +34,7 @@ import { brightSelect } from '../lib/bright-select.js';
 import { type AssistContext, BIG_PICTURE_FILES, STEP_FILES } from '../lib/claude-assist.js';
 import { brandBody, note } from '../lib/theme.js';
 import * as setupLog from '../logs.js';
-import { effectiveDockerArgBeforeFinalRun, finalDockerArg, hasDockerRunConsumer } from './dockerfile-version.js';
+import { effectiveDockerArgBeforeFinalRun, finalDockerArg, hasDockerRunConsumer } from '../lib/dockerfile-version.js';
 import { type FailureAssistResult, registerSetupProvider } from './registry.js';
 
 // ─── OneCLI vault helpers ────────────────────────────────────────────────
@@ -411,7 +411,7 @@ export function verifyCodexInstall(root = process.cwd()): { ok: boolean; problem
   const pinnedInstall = '"@openai/codex@${CODEX_VERSION}"';
   const hasPinnedInstall = hasDockerRunConsumer(dockerfile, pinnedInstall);
   const effectivePin = effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', pinnedInstall);
-  const pinToValidate = effectivePin ?? finalDockerArg(dockerfile, 'CODEX_VERSION');
+  const pinToValidate = hasPinnedInstall ? effectivePin : finalDockerArg(dockerfile, 'CODEX_VERSION');
   if (!pinToValidate || !/^\d+\.\d+\.\d+$/.test(pinToValidate)) {
     problems.push('container/Dockerfile missing an exact numeric ARG CODEX_VERSION pin');
   }

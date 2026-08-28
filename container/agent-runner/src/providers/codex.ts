@@ -692,15 +692,21 @@ export function copyRolloutToFallback(srcRollout: string, srcCodexHome: string, 
  * fallback home reached on OAuth rotation has no role TOMLs and would silently
  * lose every named subagent role (architecture-advisor, code-review-specialist,
  * …) — the exact layer the agents/ mount surfaces. Copy (not symlink): the
- * fallback home is RW and Codex reads roles from `$CODEX_HOME/agents/`. No-op
- * when src==dst or the primary has no agents/ tree. (codex #126)
+ * fallback home is RW and Codex reads roles from `$CODEX_HOME/agents/`. The
+ * destination is an exact snapshot: retired roles must not survive a later
+ * mirror, and removing the primary tree clears a stale fallback tree. No-op
+ * only when src==dst or neither tree exists. (codex #126)
  */
 export function mirrorCodexAgentsToHome(primaryCodexHome: string, targetCodexHome: string): boolean {
   if (primaryCodexHome === targetCodexHome) return false;
   const src = path.join(primaryCodexHome, 'agents');
-  if (!fs.existsSync(src)) return false;
   const dst = path.join(targetCodexHome, 'agents');
+  const srcExists = fs.lstatSync(src, { throwIfNoEntry: false }) !== undefined;
+  const dstExists = fs.lstatSync(dst, { throwIfNoEntry: false }) !== undefined;
+  if (!srcExists && !dstExists) return false;
   try {
+    if (dstExists) fs.rmSync(dst, { recursive: true, force: true });
+    if (!srcExists) return true;
     fs.cpSync(src, dst, { recursive: true });
     return true;
   } catch (e) {

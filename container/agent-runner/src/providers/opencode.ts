@@ -385,17 +385,17 @@ export function buildOpenCodeConfig(
   // by the auth.json cred-key + model prefix (opencode-go → /zen/go/v1,
   // opencode → /zen/v1, nvidia → NVIDIA), so no manual override is needed.
   const sdkOptions: Record<string, unknown> = {};
-  if (!opencodeAuthHasCredential(provider)) sdkOptions.apiKey = 'placeholder';
+  // Anthropic credentials must never be synthesized here: the host strips its
+  // Claude subscription secrets from the OpenCode child. The per-model block
+  // is independent, though — it carries the effective model's effort options.
+  if (provider !== 'anthropic' && !opencodeAuthHasCredential(provider)) sdkOptions.apiKey = 'placeholder';
 
+  const providerConfig = {
+    ...(Object.keys(sdkOptions).length > 0 ? { options: sdkOptions } : {}),
+    ...modelsBlock,
+  };
   const providerOptions: Record<string, unknown> =
-    provider === 'anthropic'
-      ? {}
-      : {
-          [provider]: {
-            ...(Object.keys(sdkOptions).length > 0 ? { options: sdkOptions } : {}),
-            ...modelsBlock,
-          },
-        };
+    Object.keys(providerConfig).length > 0 ? { [provider]: providerConfig } : {};
 
   const mcp = mcpServersToOpenCodeConfig(options.mcpServers);
 

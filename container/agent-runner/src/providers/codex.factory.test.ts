@@ -1225,6 +1225,24 @@ describe('mirrorCodexAgentsToHome (codex #126)', () => {
     expect(fs.readFileSync(path.join(fallback, 'agents', 'security-reviewer.toml'), 'utf-8')).toContain('sec');
   });
 
+  it('replaces the fallback with an exact snapshot so retired roles disappear', () => {
+    fs.mkdirSync(path.join(primary, 'agents'), { recursive: true });
+    fs.mkdirSync(path.join(fallback, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(primary, 'agents', 'current.toml'), 'name = "current"\n');
+    fs.writeFileSync(path.join(fallback, 'agents', 'retired.toml'), 'name = "retired"\n');
+
+    expect(mirrorCodexAgentsToHome(primary, fallback)).toBe(true);
+    expect(fs.readdirSync(path.join(fallback, 'agents'))).toEqual(['current.toml']);
+  });
+
+  it('clears a stale fallback snapshot when the primary agents tree disappears', () => {
+    fs.mkdirSync(path.join(fallback, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(fallback, 'agents', 'retired.toml'), 'name = "retired"\n');
+
+    expect(mirrorCodexAgentsToHome(primary, fallback)).toBe(true);
+    expect(fs.existsSync(path.join(fallback, 'agents'))).toBe(false);
+  });
+
   it('is a no-op when src==dst or the primary has no agents/ tree', () => {
     // No agents/ at primary → nothing to mirror, returns false (not an error).
     expect(mirrorCodexAgentsToHome(primary, fallback)).toBe(false);

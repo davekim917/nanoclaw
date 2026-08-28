@@ -33,9 +33,10 @@ import {
   removeUntrustedPathEntry,
   replaceUntrustedDirectory,
   replaceUntrustedFile,
+  resolveContainedRealDirectory,
 } from '../fs-safety.js';
 import { assertValidGroupFolder } from '../group-folder.js';
-import { registerProviderContainerConfig } from './provider-container-registry.js';
+import { registerProviderContainerConfig, type VolumeMount } from './provider-container-registry.js';
 
 function resolveCodexSourceDir(agentGroupFolder: string | undefined, agentGroupId: string, hostHome: string): string {
   const scopedFolder = agentGroupFolder || agentGroupId;
@@ -90,7 +91,7 @@ registerProviderContainerConfig('codex', (ctx) => {
   // was container-writable and could otherwise redirect host cleanup through
   // a planted intermediate symlink.
   removeUntrustedPathEntry(codexDir, '.tmp');
-  const mounts = [{ hostPath: codexDir, containerPath: '/home/node/.codex', readonly: false }];
+  const mounts: VolumeMount[] = [{ hostPath: codexDir, containerPath: '/home/node/.codex', readonly: false }];
 
   // Credential-only host read: auth.json from the per-group Codex home when
   // present (`~/.codex-<folder>/auth.json`), otherwise the shared-account
@@ -115,7 +116,8 @@ registerProviderContainerConfig('codex', (ctx) => {
   // Deliberately no fallback to `~/.codex*` — host CLI config must never
   // shape a container agent.
   const groupAgents = path.join(ctx.groupDir, '.codex', 'agents');
-  const agentsDir: string | null = fs.existsSync(groupAgents) ? groupAgents : null;
+  const groupAgentsEntry = fs.lstatSync(groupAgents, { throwIfNoEntry: false });
+  const agentsDir = groupAgentsEntry ? resolveContainedRealDirectory(ctx.groupDir, '.codex', 'agents') : null;
 
   // Every generated entry may have been replaced while the prior container
   // owned this RW mount. Recreate them without following prior symlinks.
@@ -125,7 +127,14 @@ registerProviderContainerConfig('codex', (ctx) => {
   removeUntrustedPathEntry(codexDir, 'agents');
   if (agentsDir) {
     replaceUntrustedDirectory(codexDir, 'agents');
-    mounts.push({ hostPath: agentsDir, containerPath: '/home/node/.codex/agents', readonly: true });
+    mounts.push({
+      hostPath: agentsDir,
+      containerPath: '/home/node/.codex/agents',
+      readonly: true,
+      // groupDir is agent-writable. Reuse the runner's just-before-Docker
+      // realpath check so a post-validation swap aborts instead of escaping.
+      overlayAllowedRoots: [fs.realpathSync(ctx.groupDir)],
+    });
   }
 
   const env: Record<string, string> = {};
