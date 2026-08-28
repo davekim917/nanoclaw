@@ -6,6 +6,8 @@ import { pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { getDeployEnvironment } from '../src/channels/discord-slash-commands.js';
+
 const ROOT = resolve(import.meta.dirname, '..');
 const tempDirs: string[] = [];
 
@@ -109,6 +111,19 @@ for tool in npm npx pnpm; do ln -sf node "$HOME/node/bin/$tool"; done`,
       executable(join(bin, command), `echo "${command} $*" >> ${JSON.stringify(calls)}; exit 0`);
     }
 
+    const missingRuntime = spawnSync('bash', [deploy], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        PATH: `${bin}:/usr/bin:/bin`,
+        NANOCLAW_NODE_BIN: '',
+      },
+    });
+    expect(missingRuntime.status).not.toBe(0);
+    expect(`${missingRuntime.stdout}\n${missingRuntime.stderr}`).toContain('service Node runtime path not supplied');
+    expect(existsSync(calls) ? readFileSync(calls, 'utf8') : '').toBe('');
+
     const result = spawnSync('bash', [deploy], {
       cwd: root,
       encoding: 'utf8',
@@ -124,6 +139,13 @@ for tool in npm npx pnpm; do ln -sf node "$HOME/node/bin/$tool"; done`,
     expect(`${result.stdout}\n${result.stderr}`).toMatch(/Node .*22\.19\.0|unsupported Node/i);
     expect(recorded).not.toMatch(/pnpm (install|run build)|systemctl restart/);
     expect(readFileSync(join(root, 'logs/deploy-status.json'), 'utf8')).not.toContain('"status":"ok"');
+  });
+
+  it('test_deploy_uses_the_running_service_node', () => {
+    expect(getDeployEnvironment({ KEEP_ME: 'yes', NANOCLAW_NODE_BIN: '/stale/node' }, '/service/node')).toEqual({
+      KEEP_ME: 'yes',
+      NANOCLAW_NODE_BIN: '/service/node',
+    });
   });
 
   it('test_engine_strict_blocks_old_node', () => {

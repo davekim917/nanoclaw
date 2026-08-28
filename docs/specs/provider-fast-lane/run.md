@@ -35,3 +35,7 @@
 - Builder also verified frozen install plus runtime tests on exact Node `22.19.0` and `24.0.0`; Node `20.20.2` frozen install failed closed with `ERR_PNPM_UNSUPPORTED_ENGINE`.
 - Full host Vitest was run with two workers. It reproduced inherited failures, generated excessive migration logs, and had not settled after roughly seven minutes; it was stopped with exit 130. No full-suite pass is claimed. CI remains the authoritative complete run after push.
 - Stage A live production `ExecStart` and Node version remain operator gates. No host mutation, restart, merge, or deploy occurred.
+- GitHub Codex review found the deploy preflight defaulted to `/usr/bin/node`, while setup can pin another executable in `ExecStart`; accepted as a real Node-contract violation.
+- The slash launcher now passes its authoritative `process.execPath`, and the deploy script fails closed when that path is absent.
+- Focused runtime/slash tests passed `8/8`, including stale-value override, missing-path fail-closed, and unsupported-Node fail-closed cases.
+- Host build, format, public-boundary structural checks, shell syntax, and `git diff --check` passed after the correction.

@@ -35,7 +35,7 @@ Neither member moves alone.
 - `[verified: npm registry metadata]` Undici `8.10.0` requires Node `>=22.19.0`; better-sqlite3 `13.0.3` requires Node `>=22`.
 - `[verified: upstream source at nanocoai/nanoclaw main]` Upstream moved Node engines, installation, CI 22/24, docs, and better-sqlite3 together.
 - `[verified: GitHub CI runs 33081745944/33115763473/33094571599]` PRs #176/#177 add failures beyond red `main`.
-- `[assumed]` The production service still executes `/usr/bin/node`, and its version may be below `22.19.0`; the host gate must verify both before any merge.
+- `[assumed]` The production service's exact Node executable and version have not been checked; the host gate must verify both before any merge.
 
 ## Policy
 

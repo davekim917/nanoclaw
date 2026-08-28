@@ -107,11 +107,16 @@ function getInteractionParentId(interaction: ChatInputCommandInteraction): strin
   return interaction.channelId ?? null;
 }
 
+export function getDeployEnvironment(env: NodeJS.ProcessEnv, nodeBin: string): NodeJS.ProcessEnv {
+  return { ...env, NANOCLAW_NODE_BIN: nodeBin };
+}
+
 function spawnDetachedLogged(script: string): void {
   const logFd = fs.openSync(DEPLOY_LOG, 'a');
   const child = spawn('bash', [script], {
     cwd: REPO_ROOT,
     detached: true,
+    env: getDeployEnvironment(process.env, process.execPath),
     stdio: ['ignore', logFd, logFd],
   });
   child.unref();
