@@ -123,17 +123,15 @@ function installCliSymlink(projectRoot: string, homeDir: string): void {
   }
 }
 
-export function renderLaunchdPlist(nodePath: string, projectRoot: string, homeDir: string): string {
-  const label = getLaunchdLabel(projectRoot);
-  const servicePath = [
-    path.dirname(nodePath),
-    '/usr/local/bin',
-    '/usr/bin',
-    '/bin',
-    path.join(homeDir, '.local', 'bin'),
-  ]
+function buildServicePath(nodePath: string, homeDir: string): string {
+  return [path.dirname(nodePath), '/usr/local/bin', '/usr/bin', '/bin', path.join(homeDir, '.local', 'bin')]
     .filter((entry, index, entries) => entry.length > 0 && entries.indexOf(entry) === index)
     .join(':');
+}
+
+export function renderLaunchdPlist(nodePath: string, projectRoot: string, homeDir: string): string {
+  const label = getLaunchdLabel(projectRoot);
+  const servicePath = buildServicePath(nodePath, homeDir);
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -301,6 +299,27 @@ ${projectRoot}/logs/nanoclaw.error.log {
 `;
 }
 
+export function renderSystemdUnit(nodePath: string, projectRoot: string, homeDir: string, isSystem: boolean): string {
+  return `[Unit]
+Description=NanoClaw Personal Assistant
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${nodePath} ${projectRoot}/dist/index.js
+WorkingDirectory=${projectRoot}
+Restart=always
+RestartSec=5
+KillMode=process
+Environment=HOME=${homeDir}
+Environment=PATH=${buildServicePath(nodePath, homeDir)}
+StandardOutput=append:${projectRoot}/logs/nanoclaw.log
+StandardError=append:${projectRoot}/logs/nanoclaw.error.log
+
+[Install]
+WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
+}
+
 function setupSystemd(projectRoot: string, nodePath: string, homeDir: string): void {
   const runningAsRoot = isRoot();
   const unitName = getSystemdUnit(projectRoot);
@@ -329,24 +348,7 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string): v
     systemctlPrefix = 'systemctl --user';
   }
 
-  const unit = `[Unit]
-Description=NanoClaw Personal Assistant
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${nodePath} ${projectRoot}/dist/index.js
-WorkingDirectory=${projectRoot}
-Restart=always
-RestartSec=5
-KillMode=process
-Environment=HOME=${homeDir}
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
-StandardOutput=append:${projectRoot}/logs/nanoclaw.log
-StandardError=append:${projectRoot}/logs/nanoclaw.error.log
-
-[Install]
-WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
+  const unit = renderSystemdUnit(nodePath, projectRoot, homeDir, runningAsRoot);
 
   fs.writeFileSync(unitPath, unit);
   log.info('Wrote systemd unit', { unitPath });

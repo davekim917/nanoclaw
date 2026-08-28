@@ -180,6 +180,44 @@ describe('runHostGatedTaskScripts', () => {
     db.close();
   });
 
+  it('uses the service PATH for /usr/bin/env node task-script tools', async () => {
+    const db = freshDb();
+    const homeDir = path.join(TEST_DIR, 'home');
+    const selectedBin = path.join(homeDir, '.local', 'bin');
+    const staleBin = path.join(TEST_DIR, 'stale-system-bin');
+    fs.mkdirSync(selectedBin, { recursive: true });
+    fs.mkdirSync(staleBin, { recursive: true });
+
+    const selectedNode = path.join(selectedBin, 'node');
+    fs.writeFileSync(
+      selectedNode,
+      `#!/bin/sh\nSELECTED_NODE_USED=yes exec ${JSON.stringify(process.execPath)} "$@"\n`,
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(
+      path.join(staleBin, 'node'),
+      `#!/bin/sh\nSELECTED_NODE_USED=no exec ${JSON.stringify(process.execPath)} "$@"\n`,
+      { mode: 0o755 },
+    );
+    fs.writeFileSync(
+      path.join(selectedBin, 'pnpm'),
+      '#!/usr/bin/env node\nconsole.log(JSON.stringify({ wakeAgent: true, data: { selected: process.env.SELECTED_NODE_USED } }));\n',
+      { mode: 0o755 },
+    );
+
+    const beforePath = process.env.PATH;
+    process.env.PATH = `${selectedBin}:${staleBin}:/bin`;
+    try {
+      insertHostGatedTask(db, 't-node-path', 'pnpm');
+      await runHostGatedTaskScripts(db, 'sess-test');
+      expect(rowContent(db, 't-node-path').scriptOutput).toEqual({ selected: 'yes' });
+    } finally {
+      if (beforePath === undefined) delete process.env.PATH;
+      else process.env.PATH = beforePath;
+    }
+    db.close();
+  });
+
   it('ignores task rows without scriptHost — the existing container path is untouched', async () => {
     const db = freshDb();
     insertHostGatedTask(db, 't-container-only', 'echo \'{"wakeAgent": false}\'', { scriptHost: false });
