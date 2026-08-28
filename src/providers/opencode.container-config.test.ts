@@ -53,13 +53,12 @@ describe('opencode provider container-config reconciliation', () => {
     closeDb();
   });
 
-  it('reconciles stale entries on a second spawn and preserves opencode.db', () => {
+  it('creates a missing runtime parent chain, reconciles stale entries, and preserves opencode.db', () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-stale-'));
     const ctx = makeCtx(root);
     const home = ctx.hostEnv.HOME!;
     const runtime = runtimeDir(ctx.sessionDir);
-    fs.mkdirSync(ctx.sessionDir, { recursive: true });
     writeGlobalSources(home);
 
     try {

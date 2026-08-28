@@ -114,7 +114,8 @@ registerProviderContainerConfig('opencode', (ctx) => {
   const opencodeSubdir = path.join(opencodeDir, 'opencode');
   // Both directories were writable by the prior container. Do not let
   // mkdir/copy follow a symlink planted by that container on the next spawn.
-  if (fs.lstatSync(opencodeDir, { throwIfNoEntry: false }) === undefined) fs.mkdirSync(opencodeDir);
+  if (fs.lstatSync(opencodeDir, { throwIfNoEntry: false }) === undefined)
+    fs.mkdirSync(opencodeDir, { recursive: true });
   assertRealDirectory(opencodeDir);
   if (fs.lstatSync(opencodeSubdir, { throwIfNoEntry: false }) === undefined) fs.mkdirSync(opencodeSubdir);
   assertRealDirectory(opencodeSubdir);
