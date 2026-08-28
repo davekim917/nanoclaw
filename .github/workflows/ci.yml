@@ -10,6 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         node-version: [22.19.0, 24]
     steps:
@@ -46,20 +47,10 @@ jobs:
         run: pnpm exec vitest run --maxWorkers=2
 
       - name: Container tests
+        if: ${{ !cancelled() }}
         working-directory: container/agent-runner
-        # No concurrency flag here on purpose. `bun test` runs test FILES
-        # sequentially in a single process — `--max-concurrency` only caps
-        # `test.concurrent` tests, of which this suite has none, so it was a
-        # no-op that read like a fix and cost two misdiagnoses.
-        #
-        # The real isolation hazard is that single process: `mock.module()` is
-        # process-global and permanent (`mock.restore()` does not undo it), and
-        # bun's file order follows raw readdir(), which differs on every fresh
-        # runner. A file that mocks a first-party module therefore poisons
-        # whichever later files that checkout's directory order happens to put
-        # after it — green locally, red here, different tests each run. If this
-        # step fails with rows that "should exist" missing, look for a
-        # mock.module of a src/ module, not for concurrency.
+        # Keep Bun's native runner. This step still runs after a host-test
+        # failure so a red host baseline cannot hide the container signal.
         run: bun test
 
   # Repository rules require exact `ci`; always run it so matrix failures remain blocking.

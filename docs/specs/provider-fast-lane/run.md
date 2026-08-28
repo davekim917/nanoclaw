@@ -45,3 +45,6 @@
 - Independent review found #176/#177 add/add spec conflicts. Stage B now removes its duplicate plan/run files; `git merge-tree --write-tree` exits `0`.
 - Independent review found #178 had no CI and clarified its remote-dependent activation. The registry gate now composes payloads onto current `main`; publication follows #177 promotion and has a forward-revert rollback window.
 - Version contract tests now assert exact/relational invariants without embedding the current release. The reviewed Docker diff remains the approval record for frozen targets.
+- CI comparison against main run `33081745944` found a deterministic 51-failure baseline: 50 thread-list tests used a fixed injected clock while the session query used ambient `Date.now()`, and one upstream-policy test assumed Actions checkout had `upstream/main`.
+- Stage 0 PR #179 fixes both root causes without changing production defaults; its required aggregate `ci` check is green and it must merge before #176/#177 full-suite results are interpreted.
+- #176 CI now disables matrix fail-fast and runs Bun with `if: ${{ !cancelled() }}` so a host failure remains blocking without hiding the Node 24 or container evidence.

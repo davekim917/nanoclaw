@@ -34,7 +34,8 @@ Neither member moves alone.
 - `[verified: npm registry metadata]` Agent SDK `0.3.250` declares Claude Code `2.1.250`.
 - `[verified: npm registry metadata]` Undici `8.10.0` requires Node `>=22.19.0`; better-sqlite3 `13.0.3` requires Node `>=22`.
 - `[verified: upstream source at nanocoai/nanoclaw main]` Upstream moved Node engines, installation, CI 22/24, docs, and better-sqlite3 together.
-- `[verified: GitHub CI runs 33081745944/33115763473/33094571599]` PRs #176/#177 add failures beyond red `main`.
+- `[verified: GitHub CI runs 33081745944/33185860830/33186568338]` Red `main` contributed the same 51 host failures to #176/#177 before branch-specific failures were compared.
+- `[verified: PR #179 CI]` The CI-baseline fixes pass the required aggregate `ci` check.
 - `[assumed]` The production service's exact Node executable and version have not been checked; the host gate must verify both before any merge.
 
 ## Policy
@@ -73,6 +74,19 @@ They get a later candidate-image batch with tool-specific canaries.
 
 ## Delivery sequence
 
+### Stage 0: PR #179, deterministic CI baseline
+
+1. Merge #179 before interpreting the full-suite results from #176 or #177.
+2. Route `buildThreadList`'s injected clock into the session age cutoff. The
+   production query used ambient `Date.now()` while tests supplied a fixed clock,
+   so 50 thread-list tests returned no session rows as the runner date advanced.
+3. Make the upstream-policy test create its own Git repository and
+   `refs/remotes/upstream/main`. Actions checkout has no upstream remote, so the
+   old test expected `git` from a checkout where the function correctly reported
+   `unavailable`.
+4. Evidence: main run `33081745944` failed exactly those 51 tests across the two
+   files; #179's required `ci` check is green.
+
 ### Stage A: PR #176, Node runtime contract only
 
 1. Revert the Slack, Undici, and better-sqlite3 dependency bumps from #176.
@@ -85,7 +99,9 @@ They get a later candidate-image batch with tool-specific canaries.
 5. Add a dependency-free Node-floor predicate reused by setup, installer, and
    deploy preflight.
 6. Test the exact minimum `22.19.0` and Node 24 in CI while preserving the
-   required aggregate check name `ci`.
+   required aggregate check name `ci`. Disable matrix fail-fast and run Bun with
+   `if: ${{ !cancelled() }}` so host failures never suppress either Node leg or
+   the container suite.
 7. Set `.nvmrc` to `22.19.0`. Update README translations, build/runtime docs,
    changelog, setup tests, and platform expectations as one runtime contract.
 8. Before merge, Dave verifies the production service's actual `ExecStart` and
@@ -136,9 +152,10 @@ Only after Stage A is healthy on production Node:
 5. Validate a copy of the production database under better-sqlite3 13, including
    `integrity_check`, migrations, and opening the unchanged copy again under v11.
 
-Stages A and B may be reviewed in parallel, but Stage C cannot activate before
-Stage A is healthy. Registry publication follows successful Stage B promotion.
-Each stage has its own rollback and never hides another stage's failure.
+Stages A and B may be reviewed in parallel, but their full CI is not interpretable
+until Stage 0 is green and merged. Stage C cannot activate before Stage A is
+healthy. Registry publication follows successful Stage B promotion. Each stage
+has its own rollback and never hides another stage's failure.
 
 ## Design
 
@@ -202,8 +219,9 @@ new tests fail against current PR heads.
    on an unsupported runtime during the first rollout.
 5. **Node 22.19/24 CI matrix** runs the engine-strict frozen install on both
    versions, then format, public boundary, host/container typechecks, host tests,
-   and container tests; aggregate `ci` remains. This catches both a floor violation
-   and a dependency that excludes Node 24.
+   and container tests; aggregate `ci` remains. Matrix fail-fast is disabled and
+   the Bun step runs unless cancelled, so one host failure cannot erase the other
+   runtime or container evidence. Interpret full-suite results only after #179.
 
 ### Provider lockstep
 
