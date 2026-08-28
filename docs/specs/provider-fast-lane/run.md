@@ -67,3 +67,5 @@
 ### GitHub Codex review round 2
 
 - Accepted: the fresh-trunk OpenCode installer cannot execute a placeholder Docker ARG. The add skill now writes the reviewed frozen `1.18.23` pin, then derives every SDK mutation from that Docker value. The acceptance test requires the exact frozen target and still rejects old operational literals.
+- Accepted: independent Codex ARG existence checks could certify an exact declaration that a later mutable declaration overrides. The verifier now checks the effective declaration before the consuming install; exact-then-`latest` fails and `latest`-then-exact passes.
+- Focused Codex setup tests pass `12/12`; host build, format, public-boundary structural checks, and diff hygiene pass after the correction.
