@@ -407,10 +407,15 @@ export function verifyCodexInstall(root = process.cwd()): { ok: boolean; problem
 
   const dockerfilePath = path.join(root, 'container', 'Dockerfile');
   const dockerfile = fs.existsSync(dockerfilePath) ? fs.readFileSync(dockerfilePath, 'utf-8') : '';
-  if (!/^ARG CODEX_VERSION=\d+\.\d+\.\d+$/m.test(dockerfile)) {
+  const pinnedInstall = '"@openai/codex@${CODEX_VERSION}"';
+  const installIndex = dockerfile.indexOf(pinnedInstall);
+  const declarationScope = installIndex >= 0 ? dockerfile.slice(0, installIndex) : dockerfile;
+  const declarations = [...declarationScope.matchAll(/^ARG CODEX_VERSION(?:=([^\s#]+))?(?:\s+#.*)?$/gm)];
+  const effectivePin = declarations.at(-1)?.[1];
+  if (!effectivePin || !/^\d+\.\d+\.\d+$/.test(effectivePin)) {
     problems.push('container/Dockerfile missing an exact numeric ARG CODEX_VERSION pin');
   }
-  if (!dockerfile.includes('"@openai/codex@${CODEX_VERSION}"')) {
+  if (installIndex < 0) {
     problems.push('container/Dockerfile missing the pinned @openai/codex install');
   }
 

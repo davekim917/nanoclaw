@@ -65,6 +65,48 @@ describe('verifyCodexInstall', () => {
     }
   });
 
+  it('uses the last Codex pin declared before the consuming install', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-effective-pin-'));
+    try {
+      for (const file of [
+        'src/providers/codex.ts',
+        'container/agent-runner/src/providers/codex.ts',
+        'container/agent-runner/src/providers/codex-app-server.ts',
+      ]) {
+        const target = path.join(root, file);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, '// present\n');
+      }
+      for (const barrel of [
+        'src/providers/index.ts',
+        'container/agent-runner/src/providers/index.ts',
+        'setup/providers/index.ts',
+      ]) {
+        const target = path.join(root, barrel);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, "import './codex.js';\n");
+      }
+      fs.mkdirSync(path.join(root, 'container'), { recursive: true });
+      const dockerfile = path.join(root, 'container/Dockerfile');
+
+      fs.writeFileSync(
+        dockerfile,
+        'ARG CODEX_VERSION=0.150.1\nARG CODEX_VERSION=latest\nRUN pnpm add -g "@openai/codex@${CODEX_VERSION}"\n',
+      );
+      expect(verifyCodexInstall(root).problems).toEqual([
+        'container/Dockerfile missing an exact numeric ARG CODEX_VERSION pin',
+      ]);
+
+      fs.writeFileSync(
+        dockerfile,
+        'ARG CODEX_VERSION=latest\nARG CODEX_VERSION=0.150.1\nRUN pnpm add -g "@openai/codex@${CODEX_VERSION}"\n',
+      );
+      expect(verifyCodexInstall(root)).toEqual({ ok: true, problems: [] });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed when only a CLI manifest claims Codex is installed', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-verify-'));
     try {
