@@ -55,14 +55,28 @@ const TERMINAL_ITEM_STATUSES = new Set(['completed', 'failed', 'declined']);
 // in a completed turn's final item snapshot is therefore the terminal signal.
 const STATUSLESS_TERMINAL_ITEM_TYPES = new Set(['webSearch', 'imageView', 'sleep']);
 
+function hasSavedImageGenerationPath(item: Record<string, unknown>): boolean {
+  const savedPath = item.savedPath ?? item.saved_path;
+  return typeof savedPath === 'string' && savedPath.trim().length > 0;
+}
+
 /** Whether a completed-turn snapshot authoritatively closes this item. */
 export function isCodexTerminalTurnItem(item: unknown): boolean {
   const parsed = parseItemIdentity(item);
   if (!parsed) return false;
-  const status = (item as Record<string, unknown>).status;
+  const record = item as Record<string, unknown>;
+  const status = record.status;
   return (
     (typeof status === 'string' && TERMINAL_ITEM_STATUSES.has(status)) ||
-    (status === undefined && STATUSLESS_TERMINAL_ITEM_TYPES.has(parsed.type))
+    (status === undefined && STATUSLESS_TERMINAL_ITEM_TYPES.has(parsed.type)) ||
+    // Codex image snapshots use `succeeded` rather than the common
+    // `completed`, and omit status on some saved-path records. Neither is
+    // safe to close without an actual generated file; `inProgress` and
+    // statusless pathless records stay open. Failed states remain terminal
+    // through the common status branch, but never produce a file event.
+    (parsed.type === 'imageGeneration' &&
+      (status === 'succeeded' || status === undefined) &&
+      hasSavedImageGenerationPath(record))
   );
 }
 

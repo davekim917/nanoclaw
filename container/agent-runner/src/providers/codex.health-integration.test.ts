@@ -200,6 +200,104 @@ describe('runOneTurn Codex control-plane health integration', () => {
     expect(events.at(-1)).toMatchObject({ type: 'result', text: 'completed result' });
   });
 
+  it('restores a dropped image completion from a succeeded terminal snapshot', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('item/started', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: { id: 'image-1', type: 'imageGeneration', status: 'inProgress' },
+    });
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [
+          {
+            id: 'image-1',
+            type: 'imageGeneration',
+            status: 'succeeded',
+            savedPath: '/home/node/.codex/generated_images/image-1.png',
+          },
+        ],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events).toContainEqual({ type: 'file', path: '/home/node/.codex/generated_images/image-1.png' });
+  });
+
+  it('restores a dropped image completion from a statusless saved-path snapshot', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('item/started', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: { id: 'image-1', type: 'imageGeneration', status: 'inProgress' },
+    });
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [
+          {
+            id: 'image-1',
+            type: 'imageGeneration',
+            saved_path: '/home/node/.codex/generated_images/image-1.png',
+          },
+        ],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events).toContainEqual({ type: 'file', path: '/home/node/.codex/generated_images/image-1.png' });
+  });
+
+  it('rejects an in-progress image snapshot even when it names an eventual path', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('item/started', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: { id: 'image-1', type: 'imageGeneration', status: 'inProgress' },
+    });
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [
+          {
+            id: 'image-1',
+            type: 'imageGeneration',
+            status: 'inProgress',
+            savedPath: '/home/node/.codex/generated_images/image-1.png',
+          },
+        ],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(events).toContainEqual(expect.objectContaining({ type: 'error', classification: 'protocol_desync' }));
+    expect(events.some((event) => event.type === 'file')).toBe(false);
+  });
+
   it('restores an assistant result from terminal-only completed-turn items', async () => {
     const fixture = fakeServer((request) => {
       if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };

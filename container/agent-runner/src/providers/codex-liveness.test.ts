@@ -164,6 +164,34 @@ describe('CodexTurnLiveness', () => {
     }
   });
 
+  it('reconciles successful image snapshots only when a saved path proves completion', () => {
+    for (const item of [
+      { id: 'image-succeeded', type: 'imageGeneration', status: 'succeeded', savedPath: '/tmp/succeeded.png' },
+      { id: 'image-statusless', type: 'imageGeneration', saved_path: '/tmp/statusless.png' },
+    ]) {
+      const { liveness } = tracker();
+      liveness.noteItemStarted({ id: item.id, type: item.type, status: 'inProgress' });
+
+      expect(liveness.noteTurnEnded({ items: [item] })).toEqual({ kind: 'healthy' });
+    }
+  });
+
+  it('keeps image generation open for in-progress or pathless terminal snapshots', () => {
+    for (const item of [
+      { id: 'image-in-progress', type: 'imageGeneration', status: 'inProgress', savedPath: '/tmp/early.png' },
+      { id: 'image-pathless', type: 'imageGeneration', status: 'succeeded' },
+      { id: 'image-statusless-pathless', type: 'imageGeneration' },
+    ]) {
+      const { liveness } = tracker();
+      liveness.noteItemStarted({ id: item.id, type: item.type, status: 'inProgress' });
+
+      expect(liveness.noteTurnEnded({ items: [item] })).toMatchObject({
+        kind: 'recover',
+        classification: 'protocol_desync',
+      });
+    }
+  });
+
   it('allows a turn to complete with only non-execution lifecycle items open', () => {
     const { liveness } = tracker();
     liveness.noteItemStarted({ id: 'reason-1', type: 'reasoning' });
