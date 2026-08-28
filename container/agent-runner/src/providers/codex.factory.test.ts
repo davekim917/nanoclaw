@@ -714,7 +714,9 @@ describe('codex turn-failure classification (systemError + turn/completed:failed
     // notification dispatch branch.
     const handlerIdx = codeOnly.indexOf('const completeTurn = async');
     expect(handlerIdx).toBeGreaterThan(-1);
-    const window = codeOnly.slice(handlerIdx, handlerIdx + 2400);
+    const handlerEnd = codeOnly.indexOf('\n  const handler =', handlerIdx);
+    expect(handlerEnd).toBeGreaterThan(handlerIdx);
+    const window = codeOnly.slice(handlerIdx, handlerEnd);
 
     // status==='failed' OR error-presence path
     expect(window).toMatch(/p\.status\s*===\s*['"]failed['"]|status\s*===\s*['"]failed['"]/);
