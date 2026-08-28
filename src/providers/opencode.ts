@@ -52,17 +52,6 @@ export function copyOpenCodeSkills(source: string, target: string): void {
   });
 }
 
-function parseOpenCodeAuthProviders(contents: Buffer | null): Set<string> {
-  if (!contents) return new Set();
-  try {
-    const parsed = JSON.parse(contents.toString('utf8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return new Set();
-    return new Set(Object.keys(parsed));
-  } catch {
-    return new Set();
-  }
-}
-
 function mergeNoProxy(current: string | undefined, additions: string): string {
   if (!current?.trim()) return additions;
   const parts = new Set(
@@ -181,14 +170,6 @@ registerProviderContainerConfig('opencode', (ctx) => {
   const slash = model.indexOf('/');
   const modelProvider = slash > 0 ? model.slice(0, slash) : DEFAULT_OPENCODE_PROVIDER;
 
-  // Native opencode/opencode-go credentials talk to opencode.ai directly. Only
-  // bypass OneCLI when auth.json parsed successfully AND contains the selected
-  // model provider's credential; unrelated or malformed auth must keep the
-  // proxy path active for static-key injection.
-  const authProviders = parseOpenCodeAuthProviders(authContents);
-  const bypassOpenCodeProxy =
-    (modelProvider === 'opencode' || modelProvider === 'opencode-go') && authProviders.has(modelProvider);
-  const noProxyAdditions = bypassOpenCodeProxy ? '127.0.0.1,localhost,opencode.ai' : '127.0.0.1,localhost';
   const env: Record<string, string> = {
     XDG_DATA_HOME: '/opencode-xdg',
     // OpenCode reads agents from `$XDG_CONFIG_HOME/opencode/agent/` (verified
@@ -197,8 +178,11 @@ registerProviderContainerConfig('opencode', (ctx) => {
     // opencode.db all live in one /opencode-xdg/opencode/ tree — no second
     // mount needed. Provider copies the per-sibling agent/*.md above.
     XDG_CONFIG_HOME: '/opencode-xdg',
-    NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, noProxyAdditions),
-    no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, noProxyAdditions),
+    // The child runtime adds opencode.ai only when the effective turn model
+    // has a matching native auth record. The host cannot decide that from the
+    // boot model because `-m` and channel defaults can change it later.
+    NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, '127.0.0.1,localhost'),
+    no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, '127.0.0.1,localhost'),
   };
   env.OPENCODE_MODEL = model;
 
