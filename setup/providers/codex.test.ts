@@ -56,7 +56,7 @@ describe('verifyCodexInstall', () => {
       fs.mkdirSync(path.join(root, 'container'), { recursive: true });
       fs.writeFileSync(
         path.join(root, 'container/Dockerfile'),
-        'ARG CODEX_VERSION=0.151.0\nRUN pnpm add -g "@openai/codex@${CODEX_VERSION}"\n',
+        'FROM node:22\nARG CODEX_VERSION=0.151.0\nRUN pnpm add -g "@openai/codex@${CODEX_VERSION}"\n',
       );
 
       expect(verifyCodexInstall(root)).toEqual({ ok: true, problems: [] });
@@ -91,7 +91,7 @@ describe('verifyCodexInstall', () => {
 
       fs.writeFileSync(
         dockerfile,
-        'ARG CODEX_VERSION=0.150.1\nARG CODEX_VERSION=latest\nRUN pnpm add -g "@openai/codex@${CODEX_VERSION}"\n',
+        'FROM node:22\nARG CODEX_VERSION=0.150.1\nARG CODEX_VERSION=latest\nRUN pnpm add -g "@openai/codex@${CODEX_VERSION}"\n',
       );
       expect(verifyCodexInstall(root).problems).toEqual([
         'container/Dockerfile missing an exact numeric ARG CODEX_VERSION pin',
@@ -99,13 +99,14 @@ describe('verifyCodexInstall', () => {
 
       fs.writeFileSync(
         dockerfile,
-        'ARG CODEX_VERSION=latest\nARG CODEX_VERSION=0.150.1\nRUN pnpm add -g "@openai/codex@${CODEX_VERSION}"\n',
+        'FROM node:22\nARG CODEX_VERSION=latest\nARG CODEX_VERSION=0.150.1\nRUN pnpm add -g "@openai/codex@${CODEX_VERSION}"\n',
       );
       expect(verifyCodexInstall(root)).toEqual({ ok: true, problems: [] });
 
       fs.writeFileSync(
         dockerfile,
         [
+          'FROM node:22',
           'ARG CODEX_VERSION=0.150.1',
           'RUN pnpm add -g "@openai/codex@${CODEX_VERSION}"',
           'ARG CODEX_VERSION=latest',
@@ -120,6 +121,7 @@ describe('verifyCodexInstall', () => {
       fs.writeFileSync(
         dockerfile,
         [
+          'FROM node:22',
           'ARG CODEX_VERSION=0.150.1',
           'ARG CODEX_VERSION=latest',
           'RUN pnpm add -g "@openai/codex@${CODEX_VERSION}"',
@@ -128,6 +130,41 @@ describe('verifyCodexInstall', () => {
           '',
         ].join('\n'),
       );
+      expect(verifyCodexInstall(root).problems).toEqual([
+        'container/Dockerfile missing an exact numeric ARG CODEX_VERSION pin',
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when only a global ARG precedes the consuming stage', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-global-arg-'));
+    try {
+      for (const file of [
+        'src/providers/codex.ts',
+        'container/agent-runner/src/providers/codex.ts',
+        'container/agent-runner/src/providers/codex-app-server.ts',
+      ]) {
+        const target = path.join(root, file);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, '');
+      }
+      for (const barrel of [
+        'src/providers/index.ts',
+        'container/agent-runner/src/providers/index.ts',
+        'setup/providers/index.ts',
+      ]) {
+        const target = path.join(root, barrel);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, "import './codex.js';\n");
+      }
+      fs.mkdirSync(path.join(root, 'container'), { recursive: true });
+      fs.writeFileSync(
+        path.join(root, 'container/Dockerfile'),
+        'ARG CODEX_VERSION=0.151.0\nFROM node:22\nRUN pnpm add -g "@openai/codex@${CODEX_VERSION}"\n',
+      );
+
       expect(verifyCodexInstall(root).problems).toEqual([
         'container/Dockerfile missing an exact numeric ARG CODEX_VERSION pin',
       ]);
@@ -197,7 +234,7 @@ describe('verifyCodexInstall', () => {
       fs.mkdirSync(path.join(root, 'container'), { recursive: true });
       fs.writeFileSync(
         path.join(root, 'container', 'Dockerfile'),
-        `ARG CODEX_VERSION=${pin}\nRUN pnpm add -g "@openai/codex@\${CODEX_VERSION}"\n`,
+        `FROM node:22\nARG CODEX_VERSION=${pin}\nRUN pnpm add -g "@openai/codex@\${CODEX_VERSION}"\n`,
       );
 
       const { ok, problems } = verifyCodexInstall(root);
@@ -230,7 +267,7 @@ describe('verifyCodexInstall', () => {
         fs.writeFileSync(target, "import './codex.js';\n");
       }
       fs.mkdirSync(path.join(root, 'container'), { recursive: true });
-      fs.writeFileSync(path.join(root, 'container/Dockerfile'), 'ARG CODEX_VERSION=0.150.1\n');
+      fs.writeFileSync(path.join(root, 'container/Dockerfile'), 'FROM node:22\nARG CODEX_VERSION=0.150.1\n');
 
       expect(verifyCodexInstall(root).problems).toEqual([
         'container/Dockerfile missing the pinned @openai/codex install',

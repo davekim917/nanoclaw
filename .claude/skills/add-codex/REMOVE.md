@@ -41,8 +41,6 @@ rm -f src/providers/codex.ts \
       container/agent-runner/src/providers/codex-app-server.test.ts \
       setup/providers/codex.ts \
       setup/providers/codex.test.ts \
-      setup/providers/dockerfile-version.ts \
-      setup/providers/dockerfile-version.test.ts \
       setup/providers/codex-registration.test.ts
 ```
 

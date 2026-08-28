@@ -28,8 +28,6 @@ export const PROVIDER_PAYLOAD_FILES: Readonly<Record<MemoryConformantProvider, r
     'container/agent-runner/src/providers/codex-app-server.test.ts',
     'setup/providers/codex.ts',
     'setup/providers/codex.test.ts',
-    'setup/providers/dockerfile-version.ts',
-    'setup/providers/dockerfile-version.test.ts',
     'setup/providers/codex-registration.test.ts',
   ],
   opencode: [
@@ -237,10 +235,10 @@ export function validateProviderMemoryPayload(
         issues,
         skillFile,
         skill,
-        /OPENCODE_VERSION="\$\(sed -nE[\s\S]*grep -Ec[\s\S]*@opencode-ai\/sdk@"?\$\{OPENCODE_VERSION\}"?/,
+        /OPENCODE_VERSION="\$\(pnpm exec tsx -e[\s\S]*effectiveDockerArgBeforeFinalRun[\s\S]*dockerfile-version\.ts[\s\S]*@opencode-ai\/sdk@"?\$\{OPENCODE_VERSION\}"?/,
         'Dockerfile-derived OpenCode SDK pin',
       );
-      rejectMatch(issues, skillFile, skill, /mapfile/, 'macOS-incompatible OpenCode pin extraction');
+      rejectMatch(issues, skillFile, skill, /(?:mapfile|sed -nE)/, 'duplicate OpenCode pin parser');
       requireMatch(
         issues,
         skillFile,

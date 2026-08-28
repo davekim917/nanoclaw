@@ -39,22 +39,27 @@ const DEFAULT_OPENCODE_MODEL = 'opencode-go/glm-5.3-flash';
 const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
 const DEFAULT_OPENCODE_EFFORT = 'high';
 
-/**
- * Remove dangling symlinks under `root` (recursively), then any directories
- * the removal left empty. Skill mirrors are add-oriented — a skill retired
- * from its source plugin leaves its support-file links dangling forever —
- * and the spawn-time dereferencing copy hard-fails on the first one.
- */
-export function pruneDanglingSymlinks(root: string): void {
-  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-    const p = path.join(root, entry.name);
-    if (entry.isSymbolicLink()) {
-      // existsSync follows the link — false means the target is gone.
-      if (!fs.existsSync(p)) fs.unlinkSync(p);
-    } else if (entry.isDirectory()) {
-      pruneDanglingSymlinks(p);
-      if (fs.readdirSync(p).length === 0) fs.rmdirSync(p);
-    }
+/** Copy a host-owned skill tree without mutating it or following stale links. */
+export function copyOpenCodeSkills(source: string, target: string): void {
+  fs.cpSync(source, target, {
+    recursive: true,
+    dereference: true,
+    force: true,
+    filter: (sourcePath) => {
+      const stat = fs.lstatSync(sourcePath, { throwIfNoEntry: false });
+      return stat !== undefined && (!stat.isSymbolicLink() || fs.existsSync(sourcePath));
+    },
+  });
+}
+
+function parseOpenCodeAuthProviders(contents: Buffer | null): Set<string> {
+  if (!contents) return new Set();
+  try {
+    const parsed = JSON.parse(contents.toString('utf8')) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return new Set();
+    return new Set(Object.keys(parsed));
+  } catch {
+    return new Set();
   }
 }
 
@@ -158,23 +163,32 @@ registerProviderContainerConfig('opencode', (ctx) => {
     // the scoped skill/ tree (or global fallback) into the session XDG with
     // dereference:true. OpenCode's mirror dirs contain links to plugin source;
     // the container does not mount that source, so it needs real files.
-    // cpSync({dereference: true}) throws ENOENT on a dangling symlink, and one
-    // stale mirror entry then wedges every spawn. Prune those links first.
-    pruneDanglingSymlinks(hostSkillsDir);
+    // A stale mirror link must not wedge the spawn, but this source is
+    // host-owned authority. Filter the derived copy; never prune the source.
     const targetSkillsDir = replaceUntrustedDirectory(opencodeSubdir, 'skill');
-    fs.cpSync(hostSkillsDir, targetSkillsDir, {
-      recursive: true,
-      dereference: true,
-      force: true,
-    });
+    copyOpenCodeSkills(hostSkillsDir, targetSkillsDir);
   }
 
-  // When native auth.json is copied (scoped or shared), the container's
-  // OpenCode CLI authenticates against opencode.ai directly. OneCLI's
-  // HTTPS_PROXY would otherwise intercept that traffic and 401 because no
-  // inject rule exists for opencode.ai. Without copied native auth, NO_PROXY
-  // stays minimal for the OneCLI-vault route used by other providers.
-  const noProxyAdditions = authContents ? '127.0.0.1,localhost,opencode.ai' : '127.0.0.1,localhost';
+  // Model + effort resolution mirrors the claude/codex template: a code-level
+  // default (DEFAULT_OPENCODE_*) is the floor, the per-group DB value
+  // (container_configs.model / .effort, set by `ncl groups config update` or
+  // self-mod) overrides it. NO `.env` scoped vars — those were an opencode-only
+  // anomaly (claude uses DEFAULT_OPUS_MODEL etc., never `.env`). Removing them
+  // keeps one config pattern across all harnesses. The DB is authoritative; the
+  // container reads OPENCODE_MODEL at startup, so an unread value would no-op.
+  const dbConfig = getContainerConfig(ctx.agentGroupId);
+  const model = dbConfig?.model ?? DEFAULT_OPENCODE_MODEL;
+  const slash = model.indexOf('/');
+  const modelProvider = slash > 0 ? model.slice(0, slash) : DEFAULT_OPENCODE_PROVIDER;
+
+  // Native opencode/opencode-go credentials talk to opencode.ai directly. Only
+  // bypass OneCLI when auth.json parsed successfully AND contains the selected
+  // model provider's credential; unrelated or malformed auth must keep the
+  // proxy path active for static-key injection.
+  const authProviders = parseOpenCodeAuthProviders(authContents);
+  const bypassOpenCodeProxy =
+    (modelProvider === 'opencode' || modelProvider === 'opencode-go') && authProviders.has(modelProvider);
+  const noProxyAdditions = bypassOpenCodeProxy ? '127.0.0.1,localhost,opencode.ai' : '127.0.0.1,localhost';
   const env: Record<string, string> = {
     XDG_DATA_HOME: '/opencode-xdg',
     // OpenCode reads agents from `$XDG_CONFIG_HOME/opencode/agent/` (verified
@@ -186,15 +200,6 @@ registerProviderContainerConfig('opencode', (ctx) => {
     NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, noProxyAdditions),
     no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, noProxyAdditions),
   };
-  // Model + effort resolution mirrors the claude/codex template: a code-level
-  // default (DEFAULT_OPENCODE_*) is the floor, the per-group DB value
-  // (container_configs.model / .effort, set by `ncl groups config update` or
-  // self-mod) overrides it. NO `.env` scoped vars — those were an opencode-only
-  // anomaly (claude uses DEFAULT_OPUS_MODEL etc., never `.env`). Removing them
-  // keeps one config pattern across all harnesses. The DB is authoritative; the
-  // container reads OPENCODE_MODEL at startup, so an unread value would no-op.
-  const dbConfig = getContainerConfig(ctx.agentGroupId);
-  const model = dbConfig?.model ?? DEFAULT_OPENCODE_MODEL;
   env.OPENCODE_MODEL = model;
 
   // OPENCODE_PROVIDER is the opencode-INTERNAL billing/routing provider
@@ -205,8 +210,7 @@ registerProviderContainerConfig('opencode', (ctx) => {
   // for an opencode sibling; it picks the provider CLASS). Since `model` always
   // carries a prefix (DB value or DEFAULT_OPENCODE_MODEL), the fallback only
   // guards a malformed override.
-  const slash = model.indexOf('/');
-  env.OPENCODE_PROVIDER = slash > 0 ? model.slice(0, slash) : DEFAULT_OPENCODE_PROVIDER;
+  env.OPENCODE_PROVIDER = modelProvider;
 
   env.OPENCODE_EFFORT = dbConfig?.effort ?? DEFAULT_OPENCODE_EFFORT;
   // Endpoint routing is determined by the cred-key in auth.json + the model

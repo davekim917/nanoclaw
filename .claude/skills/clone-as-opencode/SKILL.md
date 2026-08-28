@@ -261,8 +261,7 @@ OpenCode auth.json lives at `~/.local/share/opencode/auth.json` by default. The 
 ```bash
 # Derive the host CLI version from the image pin; it must stay aligned with the
 # container CLI and SDK.
-OPENCODE_VERSION="$(sed -nE 's/^ARG OPENCODE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' container/Dockerfile)"
-test "$(printf '%s\n' "$OPENCODE_VERSION" | grep -Ec '^[0-9]+\.[0-9]+\.[0-9]+$')" -eq 1
+OPENCODE_VERSION="$(pnpm exec tsx -e 'import fs from "node:fs"; import { effectiveDockerArgBeforeFinalRun } from "./setup/lib/dockerfile-version.ts"; const dockerfile = fs.readFileSync("container/Dockerfile", "utf8"); const pin = effectiveDockerArgBeforeFinalRun(dockerfile, "OPENCODE_VERSION", "\"opencode-ai@${OPENCODE_VERSION}\""); if (!pin || !/^\d+\.\d+\.\d+$/.test(pin)) process.exit(1); process.stdout.write(pin);')" || exit 1
 pnpm install -g "opencode-ai@${OPENCODE_VERSION}"
 # Verify: opencode --version
 

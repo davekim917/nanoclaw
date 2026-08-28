@@ -71,8 +71,8 @@ function conformantFixture(provider: MemoryConformantProvider): Map<string, stri
       '.claude/skills/add-opencode/SKILL.md',
       [
         'pnpm exec tsx scripts/provider-memory-contract.ts --provider opencode --ref "$remote/providers" --install',
-        'OPENCODE_VERSION="$(sed -nE \'s/^ARG OPENCODE_VERSION=([0-9]+\\.[0-9]+\\.[0-9]+)$/\\1/p\' container/Dockerfile)"',
-        'test "$(printf \'%s\\n\' "$OPENCODE_VERSION" | grep -Ec \'^[0-9]+\\.[0-9]+\\.[0-9]+$\')" -eq 1',
+        'OPENCODE_VERSION="$(pnpm exec tsx -e \'import fs from "node:fs"; import { effectiveDockerArgBeforeFinalRun } from "./setup/lib/dockerfile-version.ts";',
+        '"opencode-ai@${OPENCODE_VERSION}"',
         'cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -',
         'ncl groups config update --id <group-id> --provider opencode',
         'The installer fails closed before the first write for a possible local customization.',
@@ -128,10 +128,20 @@ describe('provider registry memory conformance', () => {
     expect(PROVIDER_PAYLOAD_FILES.codex).not.toContain('src/providers/codex-host-contribution.test.ts');
   });
 
-  it('keeps the Codex Dockerfile pin parser with its payload consumer', () => {
-    expect(PROVIDER_PAYLOAD_FILES.codex).toEqual(
+  it('keeps the shared Dockerfile pin parser outside the Codex payload', () => {
+    expect(PROVIDER_PAYLOAD_FILES.codex).not.toEqual(
+      expect.arrayContaining(['setup/lib/dockerfile-version.ts', 'setup/lib/dockerfile-version.test.ts']),
+    );
+    expect(PROVIDER_PAYLOAD_FILES.codex).not.toEqual(
       expect.arrayContaining(['setup/providers/dockerfile-version.ts', 'setup/providers/dockerfile-version.test.ts']),
     );
+  });
+
+  it('keeps the shared Dockerfile pin parser when Codex is removed', () => {
+    const removal = fs.readFileSync(path.join(process.cwd(), '.claude/skills/add-codex/REMOVE.md'), 'utf8');
+    expect(removal).not.toContain('dockerfile-version');
+    expect(fs.existsSync(path.join(process.cwd(), 'setup/lib/dockerfile-version.ts'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'setup/lib/dockerfile-version.test.ts'))).toBe(true);
   });
 
   it('keeps both OpenCode registration guards inside the provider payload roster', () => {

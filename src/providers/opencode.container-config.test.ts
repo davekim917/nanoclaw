@@ -39,7 +39,7 @@ function writeGlobalSources(home: string): void {
   fs.mkdirSync(path.join(config, 'agent'), { recursive: true });
   fs.mkdirSync(path.join(config, 'skill', 'global-skill'), { recursive: true });
   fs.mkdirSync(shared, { recursive: true });
-  fs.writeFileSync(path.join(shared, 'auth.json'), '{"global":true}');
+  fs.writeFileSync(path.join(shared, 'auth.json'), '{"opencode-go":{"type":"oauth"}}');
   fs.writeFileSync(path.join(config, 'agent', 'global.md'), '# global agent\n');
   fs.writeFileSync(path.join(config, 'skill', 'global-skill', 'SKILL.md'), '# global skill\n');
 }
@@ -99,7 +99,7 @@ describe('opencode provider container-config reconciliation', () => {
     try {
       const contribution = fn(ctx);
 
-      expect(fs.readFileSync(path.join(runtime, 'auth.json'), 'utf8')).toBe('{"global":true}');
+      expect(fs.readFileSync(path.join(runtime, 'auth.json'), 'utf8')).toBe('{"opencode-go":{"type":"oauth"}}');
       expect(fs.existsSync(path.join(runtime, 'agent', 'scoped.md'))).toBe(true);
       expect(fs.existsSync(path.join(runtime, 'agent', 'global.md'))).toBe(false);
       expect(fs.existsSync(path.join(runtime, 'skill', 'scoped-skill', 'SKILL.md'))).toBe(true);
@@ -137,7 +137,7 @@ describe('opencode provider container-config reconciliation', () => {
       expect(fs.lstatSync(path.join(runtime, 'auth.json')).isFile()).toBe(true);
       expect(fs.lstatSync(path.join(runtime, 'agent')).isDirectory()).toBe(true);
       expect(fs.lstatSync(path.join(runtime, 'skill')).isDirectory()).toBe(true);
-      expect(fs.readFileSync(path.join(runtime, 'auth.json'), 'utf8')).toBe('{"global":true}');
+      expect(fs.readFileSync(path.join(runtime, 'auth.json'), 'utf8')).toBe('{"opencode-go":{"type":"oauth"}}');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -170,6 +170,60 @@ describe('opencode provider container-config reconciliation', () => {
 
     try {
       expect(() => fn(ctx)).toThrow(/Unsafe runtime directory/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('bypasses OneCLI only for a matching native OpenCode credential', () => {
+    const fn = getProviderContainerConfig('opencode')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-matching-auth-'));
+    const ctx = makeCtx(root);
+    writeGlobalSources(ctx.hostEnv.HOME!);
+
+    try {
+      const contribution = fn(ctx);
+      expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
+      expect(contribution.env?.NO_PROXY?.split(',')).toContain('opencode.ai');
+      expect(contribution.env?.no_proxy?.split(',')).toContain('opencode.ai');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['unrelated auth', '{"nvidia":{"type":"api"}}'],
+    ['malformed auth', '{not-json'],
+  ])('keeps OneCLI active for %s', (_label, auth) => {
+    const fn = getProviderContainerConfig('opencode')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-nonmatching-auth-'));
+    const ctx = makeCtx(root);
+    const home = ctx.hostEnv.HOME!;
+    writeGlobalSources(home);
+    fs.writeFileSync(path.join(home, '.local', 'share', 'opencode', 'auth.json'), auth);
+
+    try {
+      const contribution = fn(ctx);
+      expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
+      expect(contribution.env?.NO_PROXY?.split(',')).not.toContain('opencode.ai');
+      expect(contribution.env?.no_proxy?.split(',')).not.toContain('opencode.ai');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps OneCLI active when auth is absent', () => {
+    const fn = getProviderContainerConfig('opencode')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-no-auth-'));
+    const ctx = makeCtx(root);
+    const home = ctx.hostEnv.HOME!;
+    writeGlobalSources(home);
+    fs.rmSync(path.join(home, '.local', 'share', 'opencode', 'auth.json'));
+
+    try {
+      const contribution = fn(ctx);
+      expect(contribution.env?.NO_PROXY?.split(',')).not.toContain('opencode.ai');
+      expect(contribution.env?.no_proxy?.split(',')).not.toContain('opencode.ai');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

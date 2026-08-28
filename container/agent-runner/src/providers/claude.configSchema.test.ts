@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { effectiveDockerArgBeforeFinalRun } from '../../../../setup/providers/dockerfile-version.js';
+import { effectiveDockerArgBeforeFinalRun } from '../../../../setup/lib/dockerfile-version.js';
 
 // Mock the SDK before importing claude.ts, so sdkQuery is interceptable.
 // We capture the options passed to sdkQuery to verify sticky config behavior.

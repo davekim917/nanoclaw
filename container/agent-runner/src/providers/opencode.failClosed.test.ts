@@ -81,6 +81,35 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
     expect(optout.permission).toBe('allow');
     expect(optout.plugin).toEqual([MANAGED_GIT_GUARD_PLUGIN, GUARD_PLUGIN]);
   });
+
+  it('keeps default Anthropic effort on the registered model without synthesizing an API key', () => {
+    stubGuardPresent(true);
+    process.env.OPENCODE_MODEL = 'anthropic/claude-sonnet-4-8';
+    process.env.OPENCODE_EFFORT = 'high';
+
+    const cfg = buildOpenCodeConfig({}, {}) as {
+      provider?: Record<string, { options?: Record<string, unknown>; models?: Record<string, { options?: unknown }> }>;
+    };
+
+    expect(cfg.provider?.anthropic?.models?.['claude-sonnet-4-8']?.options).toEqual({ reasoningEffort: 'high' });
+    expect(cfg.provider?.anthropic?.options).toBeUndefined();
+    expect(JSON.stringify(cfg.provider?.anthropic)).not.toContain('apiKey');
+  });
+
+  it('moves a per-turn Anthropic effort override onto the per-turn model without an API key', () => {
+    stubGuardPresent(true);
+    process.env.OPENCODE_MODEL = 'anthropic/claude-sonnet-4-8';
+    process.env.OPENCODE_EFFORT = 'low';
+
+    const cfg = buildOpenCodeConfig({}, { model: 'anthropic/claude-opus-4-8', effort: 'max' }) as {
+      provider?: Record<string, { options?: Record<string, unknown>; models?: Record<string, { options?: unknown }> }>;
+    };
+
+    expect(cfg.provider?.anthropic?.models?.['claude-opus-4-8']?.options).toEqual({ reasoningEffort: 'max' });
+    expect(cfg.provider?.anthropic?.models?.['claude-sonnet-4-8']).toBeUndefined();
+    expect(cfg.provider?.anthropic?.options).toBeUndefined();
+    expect(JSON.stringify(cfg.provider?.anthropic)).not.toContain('apiKey');
+  });
 });
 
 describe('buildOpencodeServerEnv — secret strip (F2)', () => {

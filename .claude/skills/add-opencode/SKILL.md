@@ -123,8 +123,7 @@ Pinned. Derive the SDK version from the exact Docker CLI pin just added; do not
 create a second version source or use `bun update`.
 
 ```bash
-OPENCODE_VERSION="$(sed -nE 's/^ARG OPENCODE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' container/Dockerfile)"
-test "$(printf '%s\n' "$OPENCODE_VERSION" | grep -Ec '^[0-9]+\.[0-9]+\.[0-9]+$')" -eq 1
+OPENCODE_VERSION="$(pnpm exec tsx -e 'import fs from "node:fs"; import { effectiveDockerArgBeforeFinalRun } from "./setup/lib/dockerfile-version.ts"; const dockerfile = fs.readFileSync("container/Dockerfile", "utf8"); const pin = effectiveDockerArgBeforeFinalRun(dockerfile, "OPENCODE_VERSION", "\"opencode-ai@${OPENCODE_VERSION}\""); if (!pin || !/^\d+\.\d+\.\d+$/.test(pin)) process.exit(1); process.stdout.write(pin);')" || exit 1
 cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -
 ```
 

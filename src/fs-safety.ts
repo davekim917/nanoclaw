@@ -46,6 +46,30 @@ export function assertRealDirectory(dir: string): void {
 }
 
 /**
+ * Resolve a host directory below an agent-writable root without accepting any
+ * symlink in the relative chain. The returned canonical path is suitable for a
+ * bind source; callers must still revalidate it immediately before Docker uses
+ * the pathname to close the remaining writable-tree TOCTOU window.
+ */
+export function resolveContainedRealDirectory(parent: string, ...components: string[]): string {
+  if (!isNonSymlinkDirectoryChain(parent, ...components)) {
+    throw new Error(
+      `Unsafe contained directory (expected a non-symlink directory chain): ${path.join(parent, ...components)}`,
+    );
+  }
+
+  const parentReal = fs.realpathSync(parent);
+  const candidate = path.join(parent, ...components);
+  assertRealDirectory(candidate);
+  const candidateReal = fs.realpathSync(candidate);
+  const relative = path.relative(parentReal, candidateReal);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error(`Unsafe contained directory (path escapes root): ${candidate}`);
+  }
+  return candidateReal;
+}
+
+/**
  * Remove exactly one entry from a real parent directory. A symlink at the
  * entry itself is unlinked; it is never traversed.
  */
