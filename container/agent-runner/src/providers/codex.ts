@@ -1742,12 +1742,11 @@ export async function* runOneTurn(
     // execution item was abandoned.
     const completedTurnId = completedTurn?.id ?? turnTracker?.currentTurnId ?? null;
     const items = completedTurn?.items;
+    const hasExplicitNonFullItemsView = completedTurn?.itemsView !== undefined && completedTurn.itemsView !== 'full';
     if (
       initialStatus === 'completed' &&
-      liveness.hasOpenBlockingItems() &&
-      (!Array.isArray(items) ||
-        items.length === 0 ||
-        (completedTurn?.itemsView !== undefined && completedTurn.itemsView !== 'full')) &&
+      (hasExplicitNonFullItemsView ||
+        (liveness.hasOpenBlockingItems() && (!Array.isArray(items) || items.length === 0))) &&
       completedTurnId
     ) {
       try {
@@ -1773,7 +1772,8 @@ export async function* runOneTurn(
       }
     }
 
-    if (Array.isArray(completedTurn?.items)) {
+    const snapshotItemsAreAuthoritative = completedTurn?.itemsView === undefined || completedTurn.itemsView === 'full';
+    if (snapshotItemsAreAuthoritative && Array.isArray(completedTurn?.items)) {
       for (const item of completedTurn.items) {
         if (isTerminalThreadItemPayload(item)) reduceCompletedThreadItem(item as CompletedThreadItem);
       }

@@ -612,6 +612,54 @@ describe('runOneTurn Codex control-plane health integration', () => {
     expect(events.at(-1)).toMatchObject({ type: 'result', text: 'completed after summary backfill' });
   });
 
+  it('backfills a prose-only summary instead of replacing streamed output', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      if (request.method === 'thread/read') {
+        return {
+          result: {
+            thread: {
+              turns: [
+                {
+                  id: 'turn-1',
+                  status: 'completed',
+                  itemsView: 'full',
+                  items: [{ id: 'message-1', type: 'agentMessage', text: 'full streamed result' }],
+                },
+              ],
+            },
+          },
+        };
+      }
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('turn/started', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'inProgress', items: [] },
+    });
+    fixture.emit('item/agentMessage/delta', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      delta: 'full streamed result',
+    });
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        itemsView: 'summary',
+        items: [{ id: 'message-1', type: 'agentMessage', text: 'truncated summary' }],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(fixture.requests.some((request) => request.method === 'thread/read')).toBe(true);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'result', text: 'full streamed result' });
+  });
+
   it('retries transient completed-turn backfill failures before recovery', async () => {
     let readAttempts = 0;
     const fixture = fakeServer((request) => {
