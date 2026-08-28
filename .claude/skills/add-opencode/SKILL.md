@@ -78,9 +78,12 @@ import './opencode.js';
 
 ### 4. Add `opencode-ai` to the container Dockerfile
 
-Two edits to `container/Dockerfile`, both idempotent (skip if already present):
+Two edits to `container/Dockerfile`, both idempotent:
 
-**(a)** In the "Pin CLI versions" ARG block (around line 45–57), add after `ARG CODEX_VERSION=...`:
+**(a)** In the "Pin CLI versions" ARG block (around line 45–57), replace any
+existing `ARG OPENCODE_VERSION=...` declaration with exactly this line. If no
+declaration exists, insert it after `ARG CODEX_VERSION=...`. Never append a
+second declaration:
 
 ```dockerfile
 ARG OPENCODE_VERSION=1.18.23
@@ -120,8 +123,9 @@ Pinned. Derive the SDK version from the exact Docker CLI pin just added; do not
 create a second version source or use `bun update`.
 
 ```bash
-OPENCODE_VERSION=$(sed -nE 's/^ARG OPENCODE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' container/Dockerfile)
-test -n "$OPENCODE_VERSION"
+mapfile -t OPENCODE_PINS < <(sed -nE 's/^ARG OPENCODE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' container/Dockerfile)
+test "${#OPENCODE_PINS[@]}" -eq 1
+OPENCODE_VERSION="${OPENCODE_PINS[0]}"
 cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -
 ```
 
