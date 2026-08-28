@@ -13,10 +13,12 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 echo "=== NANOCLAW SETUP: INSTALL_NODE ==="
 
 if command -v node >/dev/null 2>&1; then
-  NODE_VERSION="$(node --version 2>/dev/null | sed 's/^v//')"
-  if node "$PROJECT_ROOT/scripts/check-node-version.mjs" "$NODE_VERSION" >/dev/null 2>&1; then
+  NODE_PATH="$(command -v node)"
+  NODE_VERSION="$("$NODE_PATH" --version 2>/dev/null | sed 's/^v//')"
+  if "$NODE_PATH" "$PROJECT_ROOT/scripts/check-node-version.mjs" "$NODE_VERSION" >/dev/null 2>&1; then
     echo "STATUS: already-installed"
     echo "NODE_VERSION: v$NODE_VERSION"
+    echo "NODE_PATH: $NODE_PATH"
     echo "=== END ==="
     exit 0
   fi
@@ -67,8 +69,9 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
-NODE_VERSION="$(node --version 2>/dev/null | sed 's/^v//')"
-if ! node "$PROJECT_ROOT/scripts/check-node-version.mjs" "$NODE_VERSION" >/dev/null 2>&1; then
+NODE_PATH="$(command -v node)"
+NODE_VERSION="$("$NODE_PATH" --version 2>/dev/null | sed 's/^v//')"
+if ! "$NODE_PATH" "$PROJECT_ROOT/scripts/check-node-version.mjs" "$NODE_VERSION" >/dev/null 2>&1; then
   echo "STATUS: failed"
   echo "ERROR: Node v$NODE_VERSION is below the required 22.19.0"
   echo "=== END ==="
@@ -77,4 +80,5 @@ fi
 
 echo "STATUS: installed"
 echo "NODE_VERSION: v$NODE_VERSION"
+echo "NODE_PATH: $NODE_PATH"
 echo "=== END ==="

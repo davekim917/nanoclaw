@@ -7,6 +7,9 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# shellcheck source=setup/lib/node-runtime.sh
+source "$PROJECT_ROOT/setup/lib/node-runtime.sh"
+
 # Where verbose bootstrap logs go. nanoclaw.sh captures setup.sh's stdout to
 # the per-step raw log, but legacy code in this script + install-node.sh
 # also calls `log` which writes to a file. Route those to the raw log so
@@ -184,19 +187,17 @@ check_node
 if [ "$NODE_OK" = "false" ]; then
   log "Node missing or too old — running setup/install-node.sh"
   echo "Node 22.19.0+ not found — installing via setup/install-node.sh"
-  if bash "$PROJECT_ROOT/setup/install-node.sh" 2>&1 | tee -a "$LOG_FILE"; then
-    if [ -x "$HOME/.local/bin/node" ]; then
-      export PATH="$HOME/.local/bin:$PATH"
-    elif [ "$PLATFORM" = "macos" ] && command -v brew >/dev/null 2>&1; then
-      if NODE22_PREFIX="$(brew --prefix node@22 2>/dev/null)"; then
-        export PATH="$NODE22_PREFIX/bin:$PATH"
-      fi
+  INSTALL_NODE_STATUS="$(mktemp "${TMPDIR:-/tmp}/nanoclaw-install-node.XXXXXX")"
+  if bash "$PROJECT_ROOT/setup/install-node.sh" 2>&1 | tee -a "$LOG_FILE" "$INSTALL_NODE_STATUS"; then
+    if activate_bootstrap_node "$INSTALL_NODE_STATUS"; then
+      check_node
+    else
+      log "install-node.sh did not report a usable Node executable"
     fi
-    hash -r 2>/dev/null || true
-    check_node
   else
     log "install-node.sh failed"
   fi
+  rm -f "$INSTALL_NODE_STATUS"
 fi
 install_deps
 check_build_tools
