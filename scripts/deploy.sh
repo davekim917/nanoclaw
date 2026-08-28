@@ -17,6 +17,20 @@ write_status() {
 }
 
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy started" >> "$LOG"
+
+# The production unit pins an absolute Node executable. Check that exact path,
+# not whichever `node` an interactive shell happens to resolve, before changing
+# the checkout or dependency tree.
+NODE_BIN="${NANOCLAW_NODE_BIN:-/usr/bin/node}"
+write_status "running" "node runtime" ""
+NODE_VERSION="$("$NODE_BIN" --version 2>/dev/null || true)"
+if [ ! -x "$NODE_BIN" ] || ! "$NODE_BIN" scripts/check-node-version.mjs "$NODE_VERSION" >> "$LOG" 2>&1; then
+  ERROR="unsupported Node service runtime at ${NODE_BIN} (${NODE_VERSION:-not found}); requires >=22.19.0"
+  write_status "failed" "node runtime" "$ERROR"
+  echo "$ERROR" >&2
+  exit 1
+fi
+
 write_status "running" "git pull" ""
 
 if ! git checkout main >> "$LOG" 2>&1; then

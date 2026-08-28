@@ -1,0 +1,37 @@
+# Provider Fast Lane — Run Log
+
+## 2026-08-28 — plan stage
+
+- Primary: Axie-Codex, Codex model family.
+- Target heads: #176 `321793b776442bd5964f30be7d7b709aaf55eca7`; #177 `5ca5a5e5194fa3154e84b13ba6c7888fdf003eda`.
+- Verified npm latest: Claude Code `2.1.250`, Agent SDK `0.3.250`, Anthropic SDK `0.122.0`, Codex `0.150.1`, OpenCode CLI/SDK `1.18.23`.
+- Verified Agent SDK `0.3.250` declares `claudeCodeVersion: 2.1.250` and retains the five-value `EffortLevel`.
+- Verified upstream current source moves Node engine, bootstrap, installer upgrade, CI 22/24, docs, and better-sqlite3 together.
+- Verified effective fork dependency floor is Node `22.19.0` because of Undici `8.10.0`.
+- Verified #176 adds Node-20 Undici failures and a better-sqlite3 crash path beyond red `main`.
+- Verified #177 adds a Codex verifier failure and leaves OpenCode operational pins stale.
+- Planning research delegated in parallel: provider version matrix, Node migration scope, and container repair/canary scope.
+- Provider research verified the latest Claude pair on Bun 1.3.14 and found no removed harness methods in the Codex 0.145-to-0.150 schema delta.
+- Node research found upstream's migration is a runtime contract, while the fork's effective minimum is `22.19.0` because of Undici.
+- Container research recommended removing every unrelated tool bump from #177 and canarying the three provider stacks through `/app/entrypoint.sh`.
+- Delivery was split into Node runtime, provider image, and host dependency stages so failures and rollbacks remain attributable.
+- Independent Claude-family review by Axie: `must_fix`, two findings.
+- Accepted finding: Bun rollback must update both Docker and its CI mirror.
+- Accepted finding: `.nvmrc` must declare the exact `22.19.0` floor.
+- Accepted addition: engine-strict frozen install must run on Node 22.19 and 24.
+- Verified review decision: Claude stable is `2.1.236` paired with Agent SDK `0.3.236`; latest is `2.1.250` paired with Agent SDK `0.3.250`.
+- Both must-fix findings are incorporated. Cross-model coverage is complete.
+- No production code changed at plan stage.
+
+## 2026-08-28 — build stage
+
+- Dave explicitly approved the reviewed plan and selected Claude Code `2.1.250` with Agent SDK `0.3.250`.
+- Work claim `nanoclaw-provider-update-policy` taken for four hours.
+- Build starts on #176 branch `chore/deps-host-aug27`; existing user and plan files preserved.
+- Stage A materialized `scripts/node-runtime-contract.test.ts`; the first run failed all five criteria for the expected missing-contract reasons.
+- Stage A reverted the Slack, Undici, and better-sqlite3 changes from #176 and restored the main lockfile/build policy.
+- Stage A implemented Node `>=22.19.0` metadata, exact `.nvmrc`, engine-strict install, shared version predicate, setup upgrade behavior, deploy preflight, Node 22.19/24 CI, and runtime documentation.
+- Fresh lead verification: runtime contract plus platform tests `18/18` passed; format, public boundary, host build, host/container typechecks, shell syntax, and `git diff --check` passed.
+- Builder also verified frozen install plus runtime tests on exact Node `22.19.0` and `24.0.0`; Node `20.20.2` frozen install failed closed with `ERR_PNPM_UNSUPPORTED_ENGINE`.
+- Full host Vitest was run with two workers. It reproduced inherited failures, generated excessive migration logs, and had not settled after roughly seven minutes; it was stopped with exit 130. No full-suite pass is claimed. CI remains the authoritative complete run after push.
+- Stage A live production `ExecStart` and Node version remain operator gates. No host mutation, restart, merge, or deploy occurred.

@@ -307,12 +307,9 @@ Release freshness is not the safety boundary. These controls are:
 
 `allowBuilds` restricts which packages can execute install/postinstall scripts. Only packages set to `true` in this map are permitted to run build scripts during `pnpm install`. Currently allowed:
 
+- `better-sqlite3` — compiles native SQLite bindings
 - `esbuild` — downloads platform-specific binary
 - `protobufjs` — generates protobuf bindings (used by Baileys/libsignal)
 - `sharp` — downloads platform-specific image processing binary
-
-Explicitly denied:
-
-- `better-sqlite3: false` — v13 ships N-API prebuilt binaries in its tarball and has no install script, so it needs no build step. It does still ship `binding.gyp`, and pnpm runs an implicit `node-gyp rebuild` for any package with one unless told otherwise, so the entry must be present and `false` rather than merely absent. This matches upstream `nanocoai/nanoclaw`, which omits `better-sqlite3` from its build allowlist at the same 13.0.3 pin; the explicit `false` is the stricter form, and survives pnpm 11 turning unapproved build scripts into a hard error.
 
 Adding or enabling a package in this map requires human approval — build scripts execute arbitrary code with the installing user's permissions. `minimumReleaseAge: 0` is explicit because pnpm 11 otherwise defaults to a one-day delay; the project relies on exact locks, hashes, review, and build-script approvals instead.

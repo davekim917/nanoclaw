@@ -8,23 +8,30 @@
 # it. Pure bash by design — runs before Node exists on the host.
 set -euo pipefail
 
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 echo "=== NANOCLAW SETUP: INSTALL_NODE ==="
 
 if command -v node >/dev/null 2>&1; then
-  echo "STATUS: already-installed"
-  echo "NODE_VERSION: $(node --version)"
-  echo "=== END ==="
-  exit 0
+  NODE_VERSION="$(node --version 2>/dev/null | sed 's/^v//')"
+  if node "$PROJECT_ROOT/scripts/check-node-version.mjs" "$NODE_VERSION" >/dev/null 2>&1; then
+    echo "STATUS: already-installed"
+    echo "NODE_VERSION: v$NODE_VERSION"
+    echo "=== END ==="
+    exit 0
+  fi
+  echo "STEP: upgrade-node"
 fi
 
 if command -v uvx >/dev/null 2>&1; then
   echo "STEP: uvx-nodeenv"
-  uvx nodeenv -n lts ~/node
+  uvx nodeenv --force -n lts ~/node
   mkdir -p ~/.local/bin
   ln -sf ~/node/bin/node ~/.local/bin/node
   ln -sf ~/node/bin/npm ~/.local/bin/npm
   ln -sf ~/node/bin/npx ~/.local/bin/npx
   ln -sf ~/node/bin/pnpm ~/.local/bin/pnpm
+  export PATH="$HOME/.local/bin:$PATH"
 else
   case "$(uname -s)" in
     Darwin)
@@ -36,6 +43,7 @@ else
         exit 1
       fi
       brew install node@22
+      export PATH="$(brew --prefix node@22)/bin:$PATH"
       ;;
     Linux)
       echo "STEP: nodesource-setup"
@@ -59,6 +67,14 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
+NODE_VERSION="$(node --version 2>/dev/null | sed 's/^v//')"
+if ! node "$PROJECT_ROOT/scripts/check-node-version.mjs" "$NODE_VERSION" >/dev/null 2>&1; then
+  echo "STATUS: failed"
+  echo "ERROR: Node v$NODE_VERSION is below the required 22.19.0"
+  echo "=== END ==="
+  exit 1
+fi
+
 echo "STATUS: installed"
-echo "NODE_VERSION: $(node --version)"
+echo "NODE_VERSION: v$NODE_VERSION"
 echo "=== END ==="

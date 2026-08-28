@@ -10,7 +10,7 @@ NanoClaw runs a split stack: the host is Node + pnpm, the agent container is Bun
 Host and container each have their own package tree:
 
 ```
-/                             pnpm + Node 22
+/                             pnpm + Node 22.19+
   pnpm-lock.yaml              host deps (channels, Chat SDK, Baileys, better-sqlite3, etc.)
   pnpm-workspace.yaml         allowBuilds + latest-stable policy
 
