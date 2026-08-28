@@ -408,7 +408,7 @@ export function verifyCodexInstall(root = process.cwd()): { ok: boolean; problem
   const dockerfilePath = path.join(root, 'container', 'Dockerfile');
   const dockerfile = fs.existsSync(dockerfilePath) ? fs.readFileSync(dockerfilePath, 'utf-8') : '';
   const pinnedInstall = '"@openai/codex@${CODEX_VERSION}"';
-  const installIndex = dockerfile.indexOf(pinnedInstall);
+  const installIndex = dockerfile.lastIndexOf(pinnedInstall);
   const declarationScope = installIndex >= 0 ? dockerfile.slice(0, installIndex) : dockerfile;
   const declarations = [...declarationScope.matchAll(/^ARG CODEX_VERSION(?:=([^\s#]+))?(?:\s+#.*)?$/gm)];
   const effectivePin = declarations.at(-1)?.[1];

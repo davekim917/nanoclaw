@@ -123,9 +123,8 @@ Pinned. Derive the SDK version from the exact Docker CLI pin just added; do not
 create a second version source or use `bun update`.
 
 ```bash
-mapfile -t OPENCODE_PINS < <(sed -nE 's/^ARG OPENCODE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' container/Dockerfile)
-test "${#OPENCODE_PINS[@]}" -eq 1
-OPENCODE_VERSION="${OPENCODE_PINS[0]}"
+OPENCODE_VERSION="$(sed -nE 's/^ARG OPENCODE_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' container/Dockerfile)"
+test "$(printf '%s\n' "$OPENCODE_VERSION" | grep -Ec '^[0-9]+\.[0-9]+\.[0-9]+$')" -eq 1
 cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -
 ```
 
@@ -202,7 +201,24 @@ onecli secrets create --name "OpenRouter" --type generic \
 
 #### Example: Anthropic
 
-Model id for `--model`: `anthropic/claude-sonnet-4-20250514`. When the model is an `anthropic/*` slug, OpenCode uses the normal Anthropic env inside the container — the proxy + placeholder-key pattern is unchanged.
+Model id for `--model`: `anthropic/claude-sonnet-4-20250514`. An
+`anthropic/*` model requires OpenCode's own authenticated provider record in a
+verified native `auth.json`; generic `ANTHROPIC_*` environment variables and
+OneCLI proxy injection do not configure OpenCode authentication.
+
+Before selecting this model, authenticate with OpenCode's native Anthropic
+provider flow and verify, without printing credentials, that either the
+per-group scoped record or the shared fallback exists:
+
+```bash
+test -s "$HOME/.local/share/opencode-<group-folder>/auth.json" || \
+  test -s "$HOME/.local/share/opencode/auth.json"
+```
+
+The host copies the scoped
+`~/.local/share/opencode-<group-folder>/auth.json` when present; otherwise it
+uses `~/.local/share/opencode/auth.json`. Do not switch the group to an
+`anthropic/*` slug until that check passes.
 
 #### OpenCode Zen (`x-api-key`, not Bearer)
 

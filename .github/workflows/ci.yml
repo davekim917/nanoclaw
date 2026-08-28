@@ -2,10 +2,17 @@ name: CI
 
 on:
   pull_request:
+    branches: [main, providers]
+  push:
     branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
   ci:
+    if: github.event_name == 'push' || github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,7 +23,10 @@ jobs:
           cache: pnpm
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.12
+          # Keep in lockstep with ARG BUN_VERSION in container/Dockerfile. This pin
+          # last moved in April; the image went to 1.3.14 in May, so CI spent two
+          # months testing agent-runner code against a Bun we never ship.
+          bun-version: 1.3.14
       - run: pnpm install --frozen-lockfile
       - name: Install agent-runner deps (Bun)
         working-directory: container/agent-runner
@@ -24,6 +34,9 @@ jobs:
 
       - name: Format check
         run: pnpm run format:check
+
+      - name: Public repository boundary
+        run: pnpm run check:public-boundary -- --portable
 
       - name: Typecheck host
         run: pnpm exec tsc --noEmit
@@ -36,4 +49,179 @@ jobs:
 
       - name: Container tests
         working-directory: container/agent-runner
+        # No concurrency flag here on purpose. `bun test` runs test FILES
+        # sequentially in a single process — `--max-concurrency` only caps
+        # `test.concurrent` tests, of which this suite has none, so it was a
+        # no-op that read like a fix and cost two misdiagnoses.
+        #
+        # The real isolation hazard is that single process: `mock.module()` is
+        # process-global and permanent (`mock.restore()` does not undo it), and
+        # bun's file order follows raw readdir(), which differs on every fresh
+        # runner. A file that mocks a first-party module therefore poisons
+        # whichever later files that checkout's directory order happens to put
+        # after it — green locally, red here, different tests each run. If this
+        # step fails with rows that "should exist" missing, look for a
+        # mock.module of a src/ module, not for concurrency.
         run: bun test
+
+  provider-registry:
+    if: github.event_name == 'pull_request' && github.base_ref == 'providers'
+    name: Provider registry compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve runnable source tree
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t sources < <(
+            gh api --paginate \
+              "repos/${REPO}/pulls?state=open&base=main&per_page=100" \
+              --jq '.[] |
+                select(.head.repo.full_name == "'"${REPO}"'") |
+                select(any(.labels[]?; .name == "provider-runtime-source")) |
+                [.number, .head.sha] | @tsv'
+          )
+
+          case "${#sources[@]}" in
+            0)
+              number=main
+              sha="$(gh api "repos/${REPO}/branches/main" --jq '.commit.sha')"
+              ;;
+            1)
+              IFS=$'\t' read -r number sha <<<"${sources[0]}"
+              number="PR-${number}"
+              ;;
+            *)
+              printf 'Expected at most one provider-runtime-source PR; found %s\n' \
+                "${#sources[@]}" >&2
+              printf '%s\n' "${sources[@]}" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "number=${number}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Runnable source: ${number} @ ${sha}"
+
+      - name: Checkout runnable source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Fetch exact registry payload head
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/provider-registry-pr"
+          actual="$(git rev-parse refs/remotes/origin/provider-registry-pr)"
+          test "$actual" = "$EXPECTED_SHA"
+          echo "PAYLOAD_REF=refs/remotes/origin/provider-registry-pr" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Read source-owned Bun pin
+        id: bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t pins < <(
+            sed -nE 's/^ARG BUN_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' \
+              container/Dockerfile
+          )
+          test "${#pins[@]}" -eq 1
+          echo "version=${pins[0]}" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ steps.bun.outputs.version }}
+
+      - name: Install runnable source dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          cd container/agent-runner
+          bun install --frozen-lockfile
+
+      - name: Validate and compose exact registry payload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pnpm exec tsx scripts/provider-memory-contract.ts \
+            --provider codex --ref "$PAYLOAD_REF"
+          pnpm exec tsx scripts/provider-memory-contract.ts \
+            --provider opencode --ref "$PAYLOAD_REF"
+
+          pnpm exec tsx scripts/provider-memory-contract.ts \
+            --provider codex --match-ref "$PAYLOAD_REF"
+          pnpm exec tsx scripts/provider-memory-contract.ts \
+            --provider opencode --match-ref "$PAYLOAD_REF"
+
+          pnpm exec tsx scripts/provider-memory-contract.ts \
+            --provider codex --ref "$PAYLOAD_REF" --install
+          pnpm exec tsx scripts/provider-memory-contract.ts \
+            --provider opencode --ref "$PAYLOAD_REF" --install
+
+          git diff --exit-code
+
+      - name: Compile composed source
+        run: |
+          pnpm exec tsc --noEmit
+          pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
+
+      - name: Run host provider contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t roster_tests < <(
+            pnpm exec tsx -e '
+              import { PROVIDER_PAYLOAD_FILES } from "./scripts/provider-memory-contract.ts";
+              for (const files of Object.values(PROVIDER_PAYLOAD_FILES))
+                for (const file of files)
+                  if (file.endsWith(".test.ts") &&
+                      !file.startsWith("container/agent-runner/"))
+                    console.log(file);
+            '
+          )
+
+          pnpm exec vitest run \
+            "${roster_tests[@]}" \
+            scripts/provider-memory-contract.test.ts \
+            scripts/provider-version-contract.test.ts \
+            src/providers/*container-config.test.ts \
+            src/providers/opencode-prune.test.ts
+
+      - name: Run container provider contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t roster_tests < <(
+            pnpm exec tsx -e '
+              import { PROVIDER_PAYLOAD_FILES } from "./scripts/provider-memory-contract.ts";
+              for (const files of Object.values(PROVIDER_PAYLOAD_FILES))
+                for (const file of files)
+                  if (file.startsWith("container/agent-runner/") &&
+                      file.endsWith(".test.ts"))
+                    console.log(file.slice("container/agent-runner/".length));
+            '
+          )
+
+          cd container/agent-runner
+          bun test \
+            "${roster_tests[@]}" \
+            src/providers/claude.configSchema.test.ts \
+            src/providers/opencode-tool-enumeration.test.ts
