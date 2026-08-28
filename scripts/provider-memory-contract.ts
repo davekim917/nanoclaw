@@ -270,6 +270,34 @@ export function validateProviderMemoryPayload(
       );
       rejectMatch(issues, skillFile, skill, /1\.4\.17/, 'stale OpenCode version pin');
       rejectMatch(issues, skillFile, skill, /skip to \*\*Configuration\*\*/i, 'installed-state gate bypass');
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /anthropic\/\*[\s\S]{0,320}verified native `auth\.json`/i,
+        'native auth.json requirement for Anthropic OpenCode models',
+      );
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /~\/\.local\/share\/opencode-<group-folder>\/auth\.json/,
+        'scoped native OpenCode auth path',
+      );
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /~\/\.local\/share\/opencode\/auth\.json/,
+        'shared native OpenCode auth fallback path',
+      );
+      rejectMatch(
+        issues,
+        skillFile,
+        skill,
+        /anthropic\/\*[\s\S]{0,320}(?:normal Anthropic env|proxy\s*\+\s*placeholder-key|ANTHROPIC_(?:API_KEY|AUTH_TOKEN|BASE_URL))/i,
+        'false Anthropic environment-auth guidance for OpenCode',
+      );
     }
   }
 

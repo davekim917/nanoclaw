@@ -76,6 +76,9 @@ function conformantFixture(provider: MemoryConformantProvider): Map<string, stri
         'cd container/agent-runner && bun add @opencode-ai/sdk@"${OPENCODE_VERSION}" && cd -',
         'ncl groups config update --id <group-id> --provider opencode',
         'The installer fails closed before the first write for a possible local customization.',
+        'An `anthropic/*` model requires a verified native `auth.json`.',
+        '~/.local/share/opencode-<group-folder>/auth.json',
+        '~/.local/share/opencode/auth.json',
       ].join('\n'),
     );
   }
@@ -185,6 +188,21 @@ describe('provider registry memory conformance', () => {
         expect.stringContaining('stale OpenCode version pin'),
         expect.stringContaining('installed-state gate bypass'),
       ]),
+    );
+  });
+
+  it('rejects OpenCode Anthropic guidance that substitutes environment auth for native auth.json', () => {
+    const fixture = conformantFixture('opencode');
+    fixture.set(
+      '.claude/skills/add-opencode/SKILL.md',
+      [
+        fixture.get('.claude/skills/add-opencode/SKILL.md')!,
+        'For `anthropic/*`, OpenCode uses the normal Anthropic env inside the container — the proxy + placeholder-key pattern is unchanged.',
+      ].join('\n'),
+    );
+
+    expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
+      '.claude/skills/add-opencode/SKILL.md: contains forbidden false Anthropic environment-auth guidance for OpenCode',
     );
   });
 
@@ -450,6 +468,10 @@ describe('provider registry memory conformance', () => {
     expect(skill).toContain('ncl groups restart --id <group-id>');
     expect(skill).toMatch(/fails\s+closed before the first write/i);
     expect(skill).toMatch(/possible local\s+customization/i);
+    expect(skill).toMatch(/anthropic\/\*[\s\S]{0,320}verified native `auth\.json`/i);
+    expect(skill).toContain('~/.local/share/opencode-<group-folder>/auth.json');
+    expect(skill).toContain('~/.local/share/opencode/auth.json');
+    expect(skill).not.toMatch(/anthropic\/\*[\s\S]{0,320}normal Anthropic env/i);
   });
 
   it('add-codex treats provider reapply differences as customizations, not overwrite permission', () => {

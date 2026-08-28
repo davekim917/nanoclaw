@@ -201,7 +201,24 @@ onecli secrets create --name "OpenRouter" --type generic \
 
 #### Example: Anthropic
 
-Model id for `--model`: `anthropic/claude-sonnet-4-20250514`. When the model is an `anthropic/*` slug, OpenCode uses the normal Anthropic env inside the container — the proxy + placeholder-key pattern is unchanged.
+Model id for `--model`: `anthropic/claude-sonnet-4-20250514`. An
+`anthropic/*` model requires OpenCode's own authenticated provider record in a
+verified native `auth.json`; generic `ANTHROPIC_*` environment variables and
+OneCLI proxy injection do not configure OpenCode authentication.
+
+Before selecting this model, authenticate with OpenCode's native Anthropic
+provider flow and verify, without printing credentials, that either the
+per-group scoped record or the shared fallback exists:
+
+```bash
+test -s "$HOME/.local/share/opencode-<group-folder>/auth.json" || \
+  test -s "$HOME/.local/share/opencode/auth.json"
+```
+
+The host copies the scoped
+`~/.local/share/opencode-<group-folder>/auth.json` when present; otherwise it
+uses `~/.local/share/opencode/auth.json`. Do not switch the group to an
+`anthropic/*` slug until that check passes.
 
 #### OpenCode Zen (`x-api-key`, not Bearer)
 
