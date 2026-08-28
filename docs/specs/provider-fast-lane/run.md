@@ -48,3 +48,12 @@
 - CI comparison against main run `33081745944` found a deterministic 51-failure baseline: 50 thread-list tests used a fixed injected clock while the session query used ambient `Date.now()`, and one upstream-policy test assumed Actions checkout had `upstream/main`.
 - Stage 0 PR #179 fixes both root causes without changing production defaults; its required aggregate `ci` check is green and it must merge before #176/#177 full-suite results are interpreted.
 - #176 CI now disables matrix fail-fast and runs Bun with `if: ${{ !cancelled() }}` so a host failure remains blocking without hiding the Node 24 or container evidence.
+- #176 run `33194243469` completed the Node 22.19 host suite with the same 51
+  inherited failures as main and completed both Bun legs with `1116` passed,
+  `4` skipped, and `0` failed.
+- The Node 24.19 host leg is not green: Vitest reported `25` workers exiting
+  unexpectedly, without an exit signal, OOM, native-addon error, or file binding.
+- An isolated exact-Node `24.19.0` reproduction loaded a scratch-built
+  better-sqlite3 11.10.0 and ran for 72 seconds with zero worker exits and zero
+  cgroup OOM events before it was stopped. The run was incomplete and does not
+  validate Node 24 support.

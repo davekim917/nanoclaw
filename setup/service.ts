@@ -123,14 +123,19 @@ function installCliSymlink(projectRoot: string, homeDir: string): void {
   }
 }
 
-function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string): void {
-  // Per-checkout service label so multiple NanoClaw installs can coexist
-  // without clobbering each other's plist.
+export function renderLaunchdPlist(nodePath: string, projectRoot: string, homeDir: string): string {
   const label = getLaunchdLabel(projectRoot);
-  const plistPath = path.join(homeDir, 'Library', 'LaunchAgents', `${label}.plist`);
-  fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+  const servicePath = [
+    path.dirname(nodePath),
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    path.join(homeDir, '.local', 'bin'),
+  ]
+    .filter((entry, index, entries) => entry.length > 0 && entries.indexOf(entry) === index)
+    .join(':');
 
-  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -150,7 +155,7 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string): v
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin</string>
+        <string>${servicePath}</string>
         <key>HOME</key>
         <string>${homeDir}</string>
     </dict>
@@ -160,8 +165,16 @@ function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string): v
     <string>${projectRoot}/logs/nanoclaw.error.log</string>
 </dict>
 </plist>`;
+}
 
-  fs.writeFileSync(plistPath, plist);
+function setupLaunchd(projectRoot: string, nodePath: string, homeDir: string): void {
+  // Per-checkout service label so multiple NanoClaw installs can coexist
+  // without clobbering each other's plist.
+  const label = getLaunchdLabel(projectRoot);
+  const plistPath = path.join(homeDir, 'Library', 'LaunchAgents', `${label}.plist`);
+  fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+
+  fs.writeFileSync(plistPath, renderLaunchdPlist(nodePath, projectRoot, homeDir));
   log.info('Wrote launchd plist', { plistPath });
 
   // Unload first to force launchd to drop any cached plist and re-read from

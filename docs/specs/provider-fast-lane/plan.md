@@ -108,6 +108,9 @@ They get a later candidate-image batch with tool-specific canaries.
    upgrades that executable to Node `>=22.19.0` while the old service keeps running.
 9. Restart the old dependency set on Node 22.19+, then prove normal channel and
    outbound HTTP behavior. This isolates the runtime change from package changes.
+10. Treat Node 24 as unproven until its full CI leg completes without worker exits.
+    Run `33194243469` ended with 25 unexpected Vitest worker exits; an isolated
+    Node `24.19.0` reproduction was stopped after 72 seconds and is not a green run.
 
 ### Stage B: PR #177, provider image only
 
@@ -173,7 +176,8 @@ three comparisons.
 
 - Missing Node: installer follows its existing installation path.
 - Old Node: installer upgrades; setup reports unsupported; deploy stops before restart.
-- Node 22.19+ and Node 24+: accepted.
+- Node 22.19+ and Node 24+: accepted by the version predicate. Runtime support is
+  separately gated by a complete CI run; Node 24 is not yet green.
 
 ### Version-invariant contracts
 

@@ -4,7 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { getLaunchdLabel } from '../src/install-slug.js';
-import { renderLogrotateConfig } from './service.js';
+import { renderLaunchdPlist, renderLogrotateConfig } from './service.js';
 
 /**
  * Tests for service configuration generation.
@@ -12,41 +12,6 @@ import { renderLogrotateConfig } from './service.js';
  * These tests verify the generated content of plist/systemd/nohup configs
  * without actually loading services.
  */
-
-// Helper: generate a plist string the same way service.ts does
-function generatePlist(nodePath: string, projectRoot: string, homeDir: string): string {
-  const label = getLaunchdLabel(projectRoot);
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${nodePath}</string>
-        <string>${projectRoot}/dist/index.js</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>${projectRoot}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin</string>
-        <key>HOME</key>
-        <string>${homeDir}</string>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>${projectRoot}/logs/nanoclaw.log</string>
-    <key>StandardErrorPath</key>
-    <string>${projectRoot}/logs/nanoclaw.error.log</string>
-</dict>
-</plist>`;
-}
 
 function generateSystemdUnit(nodePath: string, projectRoot: string, homeDir: string, isSystem: boolean): string {
   return `[Unit]
@@ -72,25 +37,38 @@ WantedBy=${isSystem ? 'multi-user.target' : 'default.target'}`;
 describe('plist generation', () => {
   it('contains the slug-scoped label', () => {
     const projectRoot = '/home/user/nanoclaw';
-    const plist = generatePlist('/usr/local/bin/node', projectRoot, '/home/user');
+    const plist = renderLaunchdPlist('/usr/local/bin/node', projectRoot, '/home/user');
     expect(plist).toContain(`<string>${getLaunchdLabel(projectRoot)}</string>`);
     expect(plist).toMatch(/<string>com\.nanoclaw-v2-[0-9a-f]{8}<\/string>/);
   });
 
   it('uses the correct node path', () => {
-    const plist = generatePlist('/opt/node/bin/node', '/home/user/nanoclaw', '/home/user');
+    const plist = renderLaunchdPlist('/opt/node/bin/node', '/home/user/nanoclaw', '/home/user');
     expect(plist).toContain('<string>/opt/node/bin/node</string>');
   });
 
   it('points to dist/index.js', () => {
-    const plist = generatePlist('/usr/local/bin/node', '/home/user/nanoclaw', '/home/user');
+    const plist = renderLaunchdPlist('/usr/local/bin/node', '/home/user/nanoclaw', '/home/user');
     expect(plist).toContain('/home/user/nanoclaw/dist/index.js');
   });
 
   it('sets log paths', () => {
-    const plist = generatePlist('/usr/local/bin/node', '/home/user/nanoclaw', '/home/user');
+    const plist = renderLaunchdPlist('/usr/local/bin/node', '/home/user/nanoclaw', '/home/user');
     expect(plist).toContain('nanoclaw.log');
     expect(plist).toContain('nanoclaw.error.log');
+  });
+
+  it('prepends the keg-only Node directory to the launchd PATH', () => {
+    const plist = renderLaunchdPlist('/opt/homebrew/opt/node@22/bin/node', '/Users/example/nanoclaw', '/Users/example');
+    expect(plist).toContain(
+      '<string>/opt/homebrew/opt/node@22/bin:/usr/local/bin:/usr/bin:/bin:/Users/example/.local/bin</string>',
+    );
+  });
+
+  it('does not duplicate a standard Node directory already on the launchd PATH', () => {
+    const plist = renderLaunchdPlist('/usr/local/bin/node', '/home/user/nanoclaw', '/home/user');
+    expect(plist).toContain('<string>/usr/local/bin:/usr/bin:/bin:/home/user/.local/bin</string>');
+    expect(plist).not.toContain('/usr/local/bin:/usr/local/bin');
   });
 });
 
