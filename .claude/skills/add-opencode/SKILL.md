@@ -218,11 +218,12 @@ if [[ -e "$SCOPED_AUTH" ]]; then
 else
   AUTH_FILE="$SHARED_AUTH"
 fi
-node --input-type=commonjs -e '
-  const fs = require("node:fs");
-  const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-  const record = auth?.anthropic;
-  if (!record || typeof record !== "object" || Array.isArray(record)) process.exit(1);
+# Uses the runtime's own parser: incomplete records must not pass the operator gate.
+bun -e '
+  import fs from "node:fs";
+  import { parseOpenCodeAuthProviders } from "./container/agent-runner/src/providers/opencode.ts";
+  const auth = fs.readFileSync(process.argv[1], "utf8");
+  if (!parseOpenCodeAuthProviders(auth).includes("anthropic")) process.exit(1);
 ' "$AUTH_FILE"
 ```
 

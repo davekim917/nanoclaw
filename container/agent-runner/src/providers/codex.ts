@@ -47,7 +47,7 @@ import {
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
-import { CodexTurnLiveness, normalizeCodexThreadStatus } from './codex-liveness.js';
+import { CodexTurnLiveness, isCodexTerminalTurnItem, normalizeCodexThreadStatus } from './codex-liveness.js';
 
 /**
  * Health watchdog for a single turn. Guards against codex-app-server wedging
@@ -615,6 +615,38 @@ export function buildCodexRecoveryPrompt(): string {
 }
 
 /**
+ * Decide how one logical user turn crosses an app-server restart. A resumed
+ * thread already contains the original request, so repeat only the recovery
+ * instruction and retain its replay guards. A fresh thread has no such
+ * context, so it must receive the original request and start with fresh
+ * thread-scoped dedupe state.
+ */
+export function resolveCodexRestartTransition({
+  previousThreadId,
+  nextThreadId,
+  originalText,
+  initYielded,
+}: {
+  previousThreadId: string | undefined;
+  nextThreadId: string | undefined;
+  originalText: string;
+  initYielded: boolean;
+}): { attemptText: string; initYielded: boolean; resetThreadDedupe: boolean } {
+  if (nextThreadId === previousThreadId) {
+    return {
+      attemptText: buildCodexRecoveryPrompt(),
+      initYielded,
+      resetThreadDedupe: false,
+    };
+  }
+  return {
+    attemptText: originalText,
+    initYielded: false,
+    resetThreadDedupe: true,
+  };
+}
+
+/**
  * Walk `${codexHome}/sessions/` for the rollout `.jsonl` whose filename
  * embeds the given thread UUID. Codex's path layout is
  * `sessions/YYYY/MM/DD/rollout-<ISO>-<threadId>.jsonl`. Returns absolute
@@ -1066,16 +1098,13 @@ export class CodexProvider implements AgentProvider {
           // resetCodexTurnAccumulatorThread.
           const turnAccum = createCodexTurnAccumulator();
 
-          // Rotation loop. Each iteration runs the same `text` against the
-          // current app-server; on a rotation-eligible error with fallback
-          // slots remaining, we copy the rollout, kill the server, switch
-          // CODEX_HOME, spawn a fresh server, re-resume the thread, and
-          // re-run the same input. Up to (1 + fallbackHomes.length)
-          // attempts so an exhausted rotation falls through to surface the
-          // error instead of looping.
-          let attemptsRemaining = self.fallbackHomes.length + 1 + CODEX_CONTROL_PLANE_RECOVERY_MAX;
+          // Restart loop. Each recovery branch has its own monotonic cap:
+          // one control-plane replacement, one primary-auth refresh, and
+          // each fallback home once. Do not add a shared attempt counter:
+          // it can exhaust before a capped branch gets to surface its final
+          // error, silently ending a logical user turn.
           let rotateAndRetry = true;
-          while (rotateAndRetry && attemptsRemaining-- > 0) {
+          while (rotateAndRetry) {
             rotateAndRetry = false;
 
             // One turn = one channel of streaming events. Each notification
@@ -1165,16 +1194,16 @@ export class CodexProvider implements AgentProvider {
                   const previousThreadId: string | undefined = threadId;
                   threadId = await startOrResumeCodexThread(server, threadId, threadParams);
                   turnTracker.threadId = threadId ?? null;
-                  if (threadId !== previousThreadId) {
-                    // The persisted rollout was unavailable. Re-send the
-                    // original request because the new thread has no context.
-                    initYielded = false;
-                    attemptText = text;
+                  const transition = resolveCodexRestartTransition({
+                    previousThreadId,
+                    nextThreadId: threadId,
+                    originalText: text,
+                    initYielded,
+                  });
+                  attemptText = transition.attemptText;
+                  initYielded = transition.initYielded;
+                  if (transition.resetThreadDedupe) {
                     resetCodexTurnAccumulatorThread(turnAccum);
-                  } else {
-                    // Same persisted thread: ask Codex to continue rather than
-                    // duplicating the original user request and its side effects.
-                    attemptText = buildCodexRecoveryPrompt();
                   }
 
                   rotateAndRetry = true;
@@ -1214,8 +1243,15 @@ export class CodexProvider implements AgentProvider {
                   const previousThreadId: string | undefined = threadId;
                   threadId = await startOrResumeCodexThread(server, threadId, threadParams);
                   turnTracker.threadId = threadId ?? null;
-                  if (threadId !== previousThreadId) {
-                    initYielded = false;
+                  const transition = resolveCodexRestartTransition({
+                    previousThreadId,
+                    nextThreadId: threadId,
+                    originalText: text,
+                    initYielded,
+                  });
+                  attemptText = transition.attemptText;
+                  initYielded = transition.initYielded;
+                  if (transition.resetThreadDedupe) {
                     resetCodexTurnAccumulatorThread(turnAccum);
                   }
 
@@ -1287,9 +1323,15 @@ export class CodexProvider implements AgentProvider {
                     const previousThreadId: string | undefined = threadId;
                     threadId = await startOrResumeCodexThread(server, threadId, threadParams);
                     turnTracker.threadId = threadId ?? null;
-                    if (threadId !== previousThreadId) {
-                      initYielded = false;
-                      attemptText = text;
+                    const transition = resolveCodexRestartTransition({
+                      previousThreadId,
+                      nextThreadId: threadId,
+                      originalText: text,
+                      initYielded,
+                    });
+                    attemptText = transition.attemptText;
+                    initYielded = transition.initYielded;
+                    if (transition.resetThreadDedupe) {
                       resetCodexTurnAccumulatorThread(turnAccum);
                     }
 
@@ -1535,6 +1577,43 @@ export async function* runOneTurn(
     probeFailureLimit: healthConfig.probeFailureLimit,
     inactiveSnapshotLimit: healthConfig.inactiveSnapshotLimit,
   });
+  type CompletedThreadItem =
+    | ({ id?: unknown; type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem)
+    | undefined;
+
+  // Codex may deliver completed ThreadItems live, only in turn/completed, or
+  // both. Keep all user-visible restoration and liveness bookkeeping here so
+  // those delivery paths remain observationally equivalent.
+  const reduceCompletedThreadItem = (item: CompletedThreadItem): void => {
+    liveness.noteItemCompleted(item);
+
+    // Count each item once per turn. The id-less case still counts — there is
+    // nothing to dedupe on, and dropping it would undercount.
+    const stepItemId = typeof item?.id === 'string' && item.id.trim() ? item.id.trim() : '';
+    if (!stepItemId || !turnAccum.countedItemIds.has(stepItemId)) {
+      turnAccum.steps++;
+      if (stepItemId) turnAccum.countedItemIds.add(stepItemId);
+    }
+    emitCollaborationProgress(item);
+    if (item?.type === 'agentMessage' && item.text) resultText = item.text;
+    if (item?.type === 'reasoning') emitCompletedReasoningItem(item);
+    const generatedImagePath = extractImageGenerationPath(item);
+    if (generatedImagePath) {
+      emitGeneratedFile(generatedImagePath, imageGenerationKey(item, `path:${generatedImagePath}`));
+    }
+  };
+  const isTerminalThreadItemPayload = (item: unknown): boolean => {
+    if (!item || typeof item !== 'object') return false;
+    const { status, type } = item as { status?: unknown; type?: unknown };
+    // A completed-turn snapshot can still explicitly report a blocking item
+    // as in progress. Preserve that signal for liveness recovery instead of
+    // treating it as a completed item just because it appeared in the payload.
+    if (status === 'inProgress') return false;
+    if (isCodexTerminalTurnItem(item)) return true;
+    // Assistant/reasoning items have no status in current Codex snapshots;
+    // their presence in an authoritative completed turn is terminal output.
+    return status === undefined && (type === 'agentMessage' || type === 'reasoning');
+  };
   let healthTimer: ReturnType<typeof setInterval> | null = null;
   let healthProbeInFlight = false;
   let lastProbeAt: string | null = null;
@@ -1694,6 +1773,12 @@ export async function* runOneTurn(
       }
     }
 
+    if (Array.isArray(completedTurn?.items)) {
+      for (const item of completedTurn.items) {
+        if (isTerminalThreadItemPayload(item)) reduceCompletedThreadItem(item as CompletedThreadItem);
+      }
+    }
+
     const status = completedTurn?.status ?? p.status;
     const error = completedTurn?.error ?? p.error;
     const turnEndDecision = liveness.noteTurnEnded(completedTurn);
@@ -1735,8 +1820,6 @@ export async function* runOneTurn(
       liveness.noteNotification();
     } else if (method === 'item/started') {
       liveness.noteItemStarted(params.item);
-    } else if (method === 'item/completed') {
-      liveness.noteItemCompleted(params.item);
     } else if (method === 'turn/failed') {
       liveness.noteTurnEnded(params.turn);
     } else {
@@ -1830,23 +1913,7 @@ export async function* runOneTurn(
         break;
       }
       case 'item/completed': {
-        const item = params.item as
-          | ({ id?: unknown; type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem)
-          | undefined;
-        // Count each item once per turn. The id-less case still counts —
-        // there is nothing to dedupe on, and dropping it would undercount.
-        const stepItemId = typeof item?.id === 'string' && item.id.trim() ? item.id.trim() : '';
-        if (!stepItemId || !turnAccum.countedItemIds.has(stepItemId)) {
-          turnAccum.steps++;
-          if (stepItemId) turnAccum.countedItemIds.add(stepItemId);
-        }
-        emitCollaborationProgress(item);
-        if (item?.type === 'agentMessage' && item.text) resultText = item.text;
-        if (item?.type === 'reasoning') emitCompletedReasoningItem(item);
-        const generatedImagePath = extractImageGenerationPath(item);
-        if (generatedImagePath) {
-          emitGeneratedFile(generatedImagePath, imageGenerationKey(item, `path:${generatedImagePath}`));
-        }
+        reduceCompletedThreadItem(params.item as CompletedThreadItem);
         break;
       }
       case 'rawResponseItem/completed': {

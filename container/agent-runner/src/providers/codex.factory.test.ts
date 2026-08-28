@@ -18,6 +18,7 @@ import {
   materializeRawImageGeneration,
   mirrorCodexAgentsToHome,
   refreshCodexAuthFromHost,
+  resolveCodexRestartTransition,
   resolveQueryModel,
   resolveQueryEffort,
 } from './codex.js';
@@ -25,12 +26,7 @@ import {
 describe('isCodexNotificationForActiveTurn', () => {
   it('accepts the active root thread and turn', () => {
     expect(
-      isCodexNotificationForActiveTurn(
-        'item/started',
-        { threadId: 'root-1', turnId: 'turn-1' },
-        'root-1',
-        'turn-1',
-      ),
+      isCodexNotificationForActiveTurn('item/started', { threadId: 'root-1', turnId: 'turn-1' }, 'root-1', 'turn-1'),
     ).toBe(true);
   });
 
@@ -74,14 +70,7 @@ describe('isCodexNotificationForActiveTurn', () => {
         'turn-1',
       ),
     ).toBe(true);
-    expect(
-      isCodexNotificationForActiveTurn(
-        'thread/started',
-        { thread: { id: 'root-1' } },
-        'root-1',
-        null,
-      ),
-    ).toBe(true);
+    expect(isCodexNotificationForActiveTurn('thread/started', { thread: { id: 'root-1' } }, 'root-1', null)).toBe(true);
   });
 
   it('rejects a stale turn id on any namespace, not just the turn-scoped ones', () => {
@@ -609,7 +598,7 @@ describe('codex turn watchdog is health-based, not wall-clock', () => {
     expect(codeOnly).toContain('CODEX_HEALTH_PROBE_FAILURE_LIMIT');
   });
 
-  it('tracks every notification and item identity through CodexTurnLiveness', () => {
+  it('tracks item identity through the shared completed-item reducer', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
     const handlerStart = src.indexOf('const handler = (n: JsonRpcNotification)');
     expect(handlerStart).toBeGreaterThan(-1);
@@ -617,8 +606,10 @@ describe('codex turn watchdog is health-based, not wall-clock', () => {
     expect(switchStart).toBeGreaterThan(-1);
     const handlerPreamble = src.slice(handlerStart, switchStart);
     expect(handlerPreamble).toContain('liveness.noteItemStarted(params.item)');
-    expect(handlerPreamble).toContain('liveness.noteItemCompleted(params.item)');
     expect(handlerPreamble).toContain('liveness.noteNotification()');
+    expect(src).toContain('const reduceCompletedThreadItem');
+    expect(src).toContain('liveness.noteItemCompleted(item)');
+    expect(src).toContain('reduceCompletedThreadItem(params.item as CompletedThreadItem)');
   });
 
   it('starts health probes before turn dispatch and clears them in finally', () => {
@@ -1132,14 +1123,34 @@ describe('codex OAuth fallback — rotation primitives', () => {
       expect(codeOnly).toContain('primaryAuthRefreshAttempted = true');
     });
 
-    it('restores the original request when OAuth rotation starts a fresh thread after recovery', () => {
-      const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
-      const rotation = src.slice(
-        src.indexOf('const previousThreadId: string | undefined = threadId;', src.indexOf('Codex OAuth rotating')),
-      );
-      expect(rotation).toMatch(
-        /if \(threadId !== previousThreadId\) \{[\s\S]*attemptText = text;[\s\S]*resetCodexTurnAccumulatorThread/,
-      );
+    it('preserves a same-thread recovery prompt and dedupe state after direct primary-auth refresh', () => {
+      expect(
+        resolveCodexRestartTransition({
+          previousThreadId: 'thread-1',
+          nextThreadId: 'thread-1',
+          originalText: 'perform the original task once',
+          initYielded: true,
+        }),
+      ).toEqual({
+        attemptText: expect.stringContaining('Continue the same user request from the persisted thread state'),
+        initYielded: true,
+        resetThreadDedupe: false,
+      });
+    });
+
+    it('replays the original request and resets thread dedupe after a fresh-thread restart', () => {
+      expect(
+        resolveCodexRestartTransition({
+          previousThreadId: 'thread-1',
+          nextThreadId: 'thread-2',
+          originalText: 'perform the original task once',
+          initYielded: true,
+        }),
+      ).toEqual({
+        attemptText: 'perform the original task once',
+        initYielded: false,
+        resetThreadDedupe: true,
+      });
     });
   });
 });
