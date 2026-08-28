@@ -201,6 +201,41 @@ exit 1`,
     expect(result.stdout.trim().split('\n')).toEqual([join(newBin, 'node'), join(newBin, 'pnpm')]);
   });
 
+  it('test_migrate_uses_the_outer_bootstrap_status_after_nested_installer_output', () => {
+    const root = tempDir('nanoclaw-bootstrap-status-');
+    const status = join(root, 'bootstrap.log');
+    writeFileSync(
+      status,
+      [
+        '=== NANOCLAW SETUP: INSTALL_NODE ===',
+        'NODE_VERSION: v22.19.0',
+        'STATUS: installed',
+        '=== END ===',
+        '=== NANOCLAW SETUP: BOOTSTRAP ===',
+        'NODE_VERSION: 22.19.0',
+        'STATUS: success',
+        '=== END ===',
+        '',
+      ].join('\n'),
+    );
+
+    const result = spawnSync(
+      'bash',
+      [
+        '-c',
+        `source ${JSON.stringify(join(ROOT, 'setup/lib/node-runtime.sh'))}; ` +
+          `read_bootstrap_final_field STATUS ${JSON.stringify(status)}; ` +
+          `read_bootstrap_final_field NODE_VERSION ${JSON.stringify(status)}`,
+      ],
+      { cwd: ROOT, encoding: 'utf8' },
+    );
+    const migrateSource = readFileSync(join(ROOT, 'migrate-v2.sh'), 'utf8');
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout.trim().split('\n')).toEqual(['success', '22.19.0']);
+    expect(migrateSource).toContain('STATUS=$(read_bootstrap_final_field STATUS "$BOOTSTRAP_RAW")');
+  });
+
   it('test_parent_shell_rejects_an_invalid_bootstrap_node_path', () => {
     const root = tempDir('nanoclaw-node-parent-invalid-');
     const status = join(root, 'bootstrap.log');

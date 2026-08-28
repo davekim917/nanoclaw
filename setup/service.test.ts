@@ -1,10 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
-import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { getLaunchdLabel } from '../src/install-slug.js';
-import { renderLaunchdPlist, renderLogrotateConfig, renderSystemdUnit } from './service.js';
+import { renderLaunchdPlist, renderLogrotateConfig, renderNohupWrapper, renderSystemdUnit } from './service.js';
 
 /**
  * Tests for service configuration generation.
@@ -121,19 +120,18 @@ describe('WSL nohup fallback', () => {
   it('generates a valid wrapper script', () => {
     const projectRoot = '/home/user/nanoclaw';
     const nodePath = '/usr/bin/node';
-    const pidFile = path.join(projectRoot, 'nanoclaw.pid');
-
-    // Simulate what service.ts generates
-    const wrapper = `#!/bin/bash
-set -euo pipefail
-cd ${JSON.stringify(projectRoot)}
-nohup ${JSON.stringify(nodePath)} ${JSON.stringify(projectRoot)}/dist/index.js >> ${JSON.stringify(projectRoot)}/logs/nanoclaw.log 2>> ${JSON.stringify(projectRoot)}/logs/nanoclaw.error.log &
-echo $! > ${JSON.stringify(pidFile)}`;
+    const wrapper = renderNohupWrapper(nodePath, projectRoot, '/home/user');
 
     expect(wrapper).toContain('#!/bin/bash');
     expect(wrapper).toContain('nohup');
     expect(wrapper).toContain(nodePath);
     expect(wrapper).toContain('nanoclaw.pid');
+  });
+
+  it('prepends the selected nodeenv directory to the inherited PATH', () => {
+    const wrapper = renderNohupWrapper('/home/user/.local/bin/node', '/home/user/nanoclaw', '/home/user');
+    expect(wrapper).toContain('export PATH="/home/user/.local/bin:/usr/local/bin:/usr/bin:/bin"');
+    expect(wrapper.indexOf('export PATH=')).toBeLessThan(wrapper.indexOf('nohup '));
   });
 });
 

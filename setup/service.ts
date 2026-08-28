@@ -451,18 +451,16 @@ function setupSystemd(projectRoot: string, nodePath: string, homeDir: string): v
   });
 }
 
-function setupNohupFallback(projectRoot: string, nodePath: string, _homeDir: string): void {
-  log.warn('No systemd detected — generating nohup wrapper script');
-
-  const wrapperPath = path.join(projectRoot, 'start-nanoclaw.sh');
+export function renderNohupWrapper(nodePath: string, projectRoot: string, homeDir: string): string {
   const pidFile = path.join(projectRoot, 'nanoclaw.pid');
-
   const lines = [
     '#!/bin/bash',
     '# start-nanoclaw.sh — Start NanoClaw without systemd',
     `# To stop: kill \\$(cat ${pidFile})`,
     '',
     'set -euo pipefail',
+    '',
+    `export PATH=${JSON.stringify(buildServicePath(nodePath, homeDir))}`,
     '',
     `cd ${JSON.stringify(projectRoot)}`,
     '',
@@ -485,7 +483,14 @@ function setupNohupFallback(projectRoot: string, nodePath: string, _homeDir: str
     'echo "NanoClaw started (PID $!)"',
     `echo "Logs: tail -f ${projectRoot}/logs/nanoclaw.log"`,
   ];
-  const wrapper = lines.join('\n') + '\n';
+  return lines.join('\n') + '\n';
+}
+
+function setupNohupFallback(projectRoot: string, nodePath: string, homeDir: string): void {
+  log.warn('No systemd detected — generating nohup wrapper script');
+
+  const wrapperPath = path.join(projectRoot, 'start-nanoclaw.sh');
+  const wrapper = renderNohupWrapper(nodePath, projectRoot, homeDir);
 
   fs.writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
   log.info('Wrote nohup wrapper script', { wrapperPath });

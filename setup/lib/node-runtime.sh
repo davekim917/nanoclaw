@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 
+# setup.sh can stream nested installer status blocks before its own final
+# bootstrap block. The outer block is authoritative and is always last.
+read_bootstrap_final_field() {
+  local field="$1"
+  local status_file="$2"
+  sed -n "s/^${field}: *//p" "$status_file" | tail -n 1
+}
+
 # Activate the exact Node executable that setup.sh validated in a child process.
 # Callers run in parent shells, so setup.sh's PATH export cannot reach them.
 activate_bootstrap_node() {
   local status_file="$1"
   local node_path node_dir node_version
 
-  node_path=$(sed -n 's/^NODE_PATH: *//p' "$status_file" | head -1)
+  node_path=$(read_bootstrap_final_field NODE_PATH "$status_file")
   if [ -z "$node_path" ] || [ "$node_path" = "not_found" ] || [ ! -x "$node_path" ]; then
     echo "Bootstrap did not report an executable Node path: ${node_path:-missing}" >&2
     return 1

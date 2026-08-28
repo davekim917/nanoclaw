@@ -151,8 +151,10 @@ export NANOCLAW_BOOTSTRAP_LOG="$BOOTSTRAP_RAW"
 
 if bash "$PROJECT_ROOT/setup.sh" > "$BOOTSTRAP_RAW" 2>&1; then
   # Parse the status block from setup.sh output
-  STATUS=$(grep '^STATUS:' "$BOOTSTRAP_RAW" | head -1 | sed 's/^STATUS: *//')
-  NODE_VERSION=$(grep '^NODE_VERSION:' "$BOOTSTRAP_RAW" | head -1 | sed 's/^NODE_VERSION: *//')
+  # shellcheck source=setup/lib/node-runtime.sh
+  source "$PROJECT_ROOT/setup/lib/node-runtime.sh"
+  STATUS=$(read_bootstrap_final_field STATUS "$BOOTSTRAP_RAW")
+  NODE_VERSION=$(read_bootstrap_final_field NODE_VERSION "$BOOTSTRAP_RAW")
 
   if [ "$STATUS" = "success" ]; then
     step_ok "Prerequisites ready $(dim "(node $NODE_VERSION)")"
@@ -177,8 +179,6 @@ fi
 
 # setup.sh runs in a child process, so its PATH update cannot reach this shell.
 # Reactivate the exact Node executable it validated before any parent-side pnpm.
-# shellcheck source=setup/lib/node-runtime.sh
-source "$PROJECT_ROOT/setup/lib/node-runtime.sh"
 if ! activate_bootstrap_node "$BOOTSTRAP_RAW"; then
   step_fail "Bootstrap Node path is invalid"
   abort "node-path-invalid"
