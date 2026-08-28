@@ -108,7 +108,12 @@ function getInteractionParentId(interaction: ChatInputCommandInteraction): strin
 }
 
 export function getDeployEnvironment(env: NodeJS.ProcessEnv, nodeBin: string): NodeJS.ProcessEnv {
-  return { ...env, NANOCLAW_NODE_BIN: nodeBin };
+  const nodeDir = path.dirname(nodeBin);
+  return {
+    ...env,
+    PATH: env.PATH ? `${nodeDir}${path.delimiter}${env.PATH}` : nodeDir,
+    NANOCLAW_NODE_BIN: nodeBin,
+  };
 }
 
 function spawnDetachedLogged(script: string): void {

@@ -37,5 +37,6 @@
 - Stage A live production `ExecStart` and Node version remain operator gates. No host mutation, restart, merge, or deploy occurred.
 - GitHub Codex review found the deploy preflight defaulted to `/usr/bin/node`, while setup can pin another executable in `ExecStart`; accepted as a real Node-contract violation.
 - The slash launcher now passes its authoritative `process.execPath`, and the deploy script fails closed when that path is absent.
+- A follow-up review found later deploy commands still resolved bare `node` from the inherited PATH. The launcher now prepends the running service Node directory, so preflight, pnpm, and build use one runtime.
 - Focused runtime/slash tests passed `8/8`, including stale-value override, missing-path fail-closed, and unsupported-Node fail-closed cases.
 - Host build, format, public-boundary structural checks, shell syntax, and `git diff --check` passed after the correction.

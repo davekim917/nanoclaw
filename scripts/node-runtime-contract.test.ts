@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
@@ -142,9 +142,12 @@ for tool in npm npx pnpm; do ln -sf node "$HOME/node/bin/$tool"; done`,
   });
 
   it('test_deploy_uses_the_running_service_node', () => {
-    expect(getDeployEnvironment({ KEEP_ME: 'yes', NANOCLAW_NODE_BIN: '/stale/node' }, '/service/node')).toEqual({
+    expect(
+      getDeployEnvironment({ KEEP_ME: 'yes', PATH: '/usr/bin', NANOCLAW_NODE_BIN: '/stale/node' }, '/service/bin/node'),
+    ).toEqual({
       KEEP_ME: 'yes',
-      NANOCLAW_NODE_BIN: '/service/node',
+      PATH: `/service/bin${delimiter}/usr/bin`,
+      NANOCLAW_NODE_BIN: '/service/bin/node',
     });
   });
 
