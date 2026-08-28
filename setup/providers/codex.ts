@@ -34,6 +34,7 @@ import { brightSelect } from '../lib/bright-select.js';
 import { type AssistContext, BIG_PICTURE_FILES, STEP_FILES } from '../lib/claude-assist.js';
 import { brandBody, note } from '../lib/theme.js';
 import * as setupLog from '../logs.js';
+import { effectiveDockerArgBeforeFinalRun, finalDockerArg, hasDockerRunConsumer } from './dockerfile-version.js';
 import { type FailureAssistResult, registerSetupProvider } from './registry.js';
 
 // ─── OneCLI vault helpers ────────────────────────────────────────────────
@@ -408,14 +409,13 @@ export function verifyCodexInstall(root = process.cwd()): { ok: boolean; problem
   const dockerfilePath = path.join(root, 'container', 'Dockerfile');
   const dockerfile = fs.existsSync(dockerfilePath) ? fs.readFileSync(dockerfilePath, 'utf-8') : '';
   const pinnedInstall = '"@openai/codex@${CODEX_VERSION}"';
-  const installIndex = dockerfile.lastIndexOf(pinnedInstall);
-  const declarationScope = installIndex >= 0 ? dockerfile.slice(0, installIndex) : dockerfile;
-  const declarations = [...declarationScope.matchAll(/^ARG CODEX_VERSION(?:=([^\s#]+))?(?:\s+#.*)?$/gm)];
-  const effectivePin = declarations.at(-1)?.[1];
-  if (!effectivePin || !/^\d+\.\d+\.\d+$/.test(effectivePin)) {
+  const hasPinnedInstall = hasDockerRunConsumer(dockerfile, pinnedInstall);
+  const effectivePin = effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', pinnedInstall);
+  const pinToValidate = effectivePin ?? finalDockerArg(dockerfile, 'CODEX_VERSION');
+  if (!pinToValidate || !/^\d+\.\d+\.\d+$/.test(pinToValidate)) {
     problems.push('container/Dockerfile missing an exact numeric ARG CODEX_VERSION pin');
   }
-  if (installIndex < 0) {
+  if (!hasPinnedInstall) {
     problems.push('container/Dockerfile missing the pinned @openai/codex install');
   }
 
