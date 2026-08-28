@@ -1,6 +1,6 @@
 /**
  * Integration test for the add-dashboard skill's integration point —
- * `startDashboard()`, the single call wired into src/index.ts.
+ * `startDashboard()`, the single call wired into src/main.ts.
  *
  * Archetype: in-process seam. It drives the *real* entry point against a
  * *real* (in-memory) central DB and a *fake* dashboard HTTP endpoint. The

@@ -39,9 +39,9 @@ Copy all three resource files into `src/`. The tests ship with the skill and run
 ```
 
 - `dashboard-pusher.test.ts` — behavior: starts the pusher, posts a real snapshot to a fake dashboard.
-- `dashboard-wiring.test.ts` — the code edit in step 3: asserts (via the TS AST) that `index.ts` dynamically imports `./dashboard-pusher.js` and `await`s `startDashboard()` as colocated statements of `main()`, after DB init and before the boot-complete log. Delete or misplace the edit and this goes red.
+- `dashboard-wiring.test.ts` — the code edit in step 3: asserts (via the TS AST) that `main.ts` dynamically imports `./dashboard-pusher.js` and `await`s `startDashboard()` as colocated statements of `main()`, after DB init and before the boot-complete log. Delete or misplace the edit and this goes red.
 
-### 3. Wire into src/index.ts
+### 3. Wire into src/main.ts
 
 This is the skill's one integration point, and it's deliberately minimal and self-contained: all the startup logic lives in `dashboard-pusher.ts`, and the import is **colocated** with the call so the whole edit is a single block in one place — there's no separate top-of-file import to add (or to remember to remove).
 
@@ -117,7 +117,7 @@ rm -f src/dashboard-pusher.ts src/dashboard-pusher.test.ts src/dashboard-wiring.
 pnpm uninstall @nanoco/nanoclaw-dashboard 2>/dev/null || true
 ```
 
-Then, by hand, remove the single dashboard block the skill added to `main()` in `src/index.ts` (the `// Dashboard (optional…)` comment, the `await import('./dashboard-pusher.js')` line, and the `await startDashboard();` call), and remove `DASHBOARD_SECRET` and `DASHBOARD_PORT` from `.env`.
+Then, by hand, remove the single dashboard block the skill added to `main()` in `src/main.ts` (the `// Dashboard (optional…)` comment, the `await import('./dashboard-pusher.js')` line, and the `await startDashboard();` call), and remove `DASHBOARD_SECRET` and `DASHBOARD_PORT` from `.env`.
 
 ```bash
 pnpm run build

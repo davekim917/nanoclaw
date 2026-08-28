@@ -62,7 +62,7 @@ export function stopDashboardPusher(): void {
  * Skill entry point — the single call wired into the host boot sequence.
  *
  * All of the dashboard's startup logic lives here, in the skill's own file,
- * so the integration point in src/index.ts is just `await startDashboard()`.
+ * so the integration point in src/main.ts is just `await startDashboard()`.
  * No-ops (and says so) when DASHBOARD_SECRET is unset.
  */
 export async function startDashboard(): Promise<void> {

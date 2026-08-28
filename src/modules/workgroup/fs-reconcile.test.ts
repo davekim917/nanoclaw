@@ -148,7 +148,7 @@ describe('reconcileWorkgroupFsState', () => {
     // Resolve from repo root (worktree) using the known absolute path pattern.
     // The test runner sets cwd to the worktree root so we can use a relative path.
     const repoRoot = origCwd; // preserved before chdir
-    const srcIndexPath = path.join(repoRoot, 'src', 'index.ts');
+    const srcIndexPath = path.join(repoRoot, 'src', 'main.ts');
 
     const content = fs.readFileSync(srcIndexPath, 'utf8');
 
@@ -161,8 +161,8 @@ describe('reconcileWorkgroupFsState', () => {
     // 3. reconcileWorkgroupFsState must appear AFTER runMigrations in the file
     const migrationsIdx = content.indexOf('runMigrations(db)');
     const reconcilerIdx = content.indexOf('reconcileWorkgroupFsState(db)');
-    expect(migrationsIdx, 'runMigrations(db) must exist in src/index.ts').toBeGreaterThan(-1);
-    expect(reconcilerIdx, 'reconcileWorkgroupFsState(db) must exist in src/index.ts').toBeGreaterThan(-1);
+    expect(migrationsIdx, 'runMigrations(db) must exist in src/main.ts').toBeGreaterThan(-1);
+    expect(reconcilerIdx, 'reconcileWorkgroupFsState(db) must exist in src/main.ts').toBeGreaterThan(-1);
     expect(reconcilerIdx, 'reconcileWorkgroupFsState must appear after runMigrations').toBeGreaterThan(migrationsIdx);
 
     // 4. process.exit(1) must follow the reconcileWorkgroupFsState call

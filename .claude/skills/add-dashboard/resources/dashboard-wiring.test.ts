@@ -1,7 +1,7 @@
 /**
  * Wiring test for the add-dashboard skill's code-edit integration point.
  *
- * The skill inserts one colocated block into src/index.ts (a dynamic
+ * The skill inserts one colocated block into src/main.ts (a dynamic
  * `import('./dashboard-pusher.js')` + `await startDashboard()` in main()). A
  * behavioral test of the pusher can't see whether that edit is actually
  * present and correctly placed — booting the real host is too heavy — so this
@@ -26,9 +26,9 @@ import fs from 'fs';
 import path from 'path';
 import ts from 'typescript';
 
-const indexPath = path.resolve(process.cwd(), 'src/index.ts');
+const indexPath = path.resolve(process.cwd(), 'src/main.ts');
 const source = fs.readFileSync(indexPath, 'utf8');
-const sf = ts.createSourceFile('index.ts', source, ts.ScriptTarget.Latest, true);
+const sf = ts.createSourceFile('main.ts', source, ts.ScriptTarget.Latest, true);
 
 function mainBody(): ts.NodeArray<ts.Statement> {
   let body: ts.NodeArray<ts.Statement> | undefined;
@@ -37,7 +37,7 @@ function mainBody(): ts.NodeArray<ts.Statement> {
       body = n.body.statements;
     }
   });
-  if (!body) throw new Error('main() not found in src/index.ts');
+  if (!body) throw new Error('main() not found in src/main.ts');
   return body;
 }
 
@@ -62,7 +62,7 @@ function isDynamicImportOfPusher(s: ts.Statement): boolean {
   return !!arg && ts.isStringLiteral(arg) && arg.text === './dashboard-pusher.js';
 }
 
-describe('add-dashboard wiring in src/index.ts', () => {
+describe('add-dashboard wiring in src/main.ts', () => {
   it('dynamically imports the pusher and awaits startDashboard(), colocated in main(), after DB init and before the boot-complete log', () => {
     const stmts = mainBody();
     const importIdx = stmts.findIndex(isDynamicImportOfPusher);
