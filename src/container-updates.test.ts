@@ -438,7 +438,14 @@ describe('upstream policy snapshot fallback (containers have no .git)', () => {
   });
 
   it('describeUpstreamPolicy reports git when upstream/main resolves in repoRoot', async () => {
-    const root = path.resolve(import.meta.dirname, '..');
+    const root = await mkdtemp(path.join(tmpdir(), 'upstream-policy-git-'));
+    const git = (args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'pipe' });
+    git(['init', '-q', '-b', 'main']);
+    git(['config', 'user.email', 'test@example.com']);
+    git(['config', 'user.name', 'Test']);
+    git(['commit', '--allow-empty', '-q', '-m', 'initial']);
+    git(['update-ref', 'refs/remotes/upstream/main', 'HEAD']);
+
     expect(await describeUpstreamPolicy(root)).toEqual({ source: 'git', generatedAt: null });
   });
 

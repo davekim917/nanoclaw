@@ -623,6 +623,7 @@ function selectScopedSessions(
     sinceHours: number;
     threadId?: string | null;
   },
+  now: number,
 ): ThreadSessionRow[] {
   const conditions: string[] = ["s.status = 'active'"];
   const values: unknown[] = [];
@@ -662,7 +663,7 @@ function selectScopedSessions(
     values.push(opts.threadId);
   } else {
     conditions.push(`datetime(COALESCE(s.last_outbound_at, s.last_active, s.created_at)) >= datetime(?)`);
-    values.push(new Date(Date.now() - opts.sinceHours * 3_600_000).toISOString());
+    values.push(new Date(now - opts.sinceHours * 3_600_000).toISOString());
   }
 
   // Same never-engaged filter as sessions.ts: an inbound that never woke an
@@ -1474,7 +1475,7 @@ export async function buildThreadList(
   // per poll.
   const attentionItems = selectScopedAttentionItems(ctx, opts, now, deps.attentionEnv ?? {});
 
-  const rows = selectScopedSessions(ctx, opts);
+  const rows = selectScopedSessions(ctx, opts, now);
   if (rows.length === 0 && attentionItems.length === 0) return { threads: [] };
 
   const { known, names, byId, dmDedupeKey } = readChannelDirectory();
