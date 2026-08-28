@@ -118,6 +118,10 @@ let cachedAuthProviders: string[] | null = null;
 function isOpenCodeAuthRecord(value: unknown): boolean {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
+  // OpenCode 1.18.23 uses Schema.String without trimming. Keep whitespace
+  // semantics compatible while refusing zero-length credentials that cannot authenticate.
+  const isNonEmptyString = (credential: unknown): credential is string =>
+    typeof credential === 'string' && credential.length > 0;
   const isStringRecord = (metadata: unknown): metadata is Record<string, string> =>
     metadata !== null &&
     typeof metadata === 'object' &&
@@ -126,8 +130,8 @@ function isOpenCodeAuthRecord(value: unknown): boolean {
 
   if (record.type === 'oauth') {
     return (
-      typeof record.access === 'string' &&
-      typeof record.refresh === 'string' &&
+      isNonEmptyString(record.access) &&
+      isNonEmptyString(record.refresh) &&
       Number.isInteger(record.expires) &&
       (record.expires as number) >= 0 &&
       (record.accountId === undefined || typeof record.accountId === 'string') &&
@@ -135,9 +139,9 @@ function isOpenCodeAuthRecord(value: unknown): boolean {
     );
   }
   if (record.type === 'api') {
-    return typeof record.key === 'string' && (record.metadata === undefined || isStringRecord(record.metadata));
+    return isNonEmptyString(record.key) && (record.metadata === undefined || isStringRecord(record.metadata));
   }
-  return record.type === 'wellknown' && typeof record.key === 'string' && typeof record.token === 'string';
+  return record.type === 'wellknown' && isNonEmptyString(record.key) && isNonEmptyString(record.token);
 }
 
 export function parseOpenCodeAuthProviders(raw: string): string[] {

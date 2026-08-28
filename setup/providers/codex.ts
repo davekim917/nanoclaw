@@ -39,7 +39,7 @@ import { type FailureAssistResult, registerSetupProvider } from './registry.js';
 
 // ─── OneCLI vault helpers ────────────────────────────────────────────────
 
-interface OnecliSecret {
+export interface OnecliSecret {
   id: string;
   name: string;
   type: string;
@@ -52,19 +52,17 @@ function listSecrets(): OnecliSecret[] {
   return Array.isArray(parsed.data) ? (parsed.data as OnecliSecret[]) : [];
 }
 
+const CODEX_CREDENTIAL_HOSTS = new Set(['api.openai.com', 'chatgpt.com']);
+
+/** Whether OneCLI will route a secret to either Codex authentication endpoint. */
+export function hasCodexCredentialRoute(secret: OnecliSecret): boolean {
+  // Gateway routing is host-pattern based. Name and type are descriptive
+  // metadata, so neither proves that this secret reaches a Codex endpoint.
+  return secret.hostPattern !== null && CODEX_CREDENTIAL_HOSTS.has(secret.hostPattern.toLowerCase());
+}
+
 function findOpenAISecret(secrets: OnecliSecret[]): OnecliSecret | undefined {
-  return secrets.find((s) => {
-    const name = s.name.toLowerCase();
-    const type = s.type.toLowerCase();
-    const hostPattern = (s.hostPattern ?? '').toLowerCase();
-    return (
-      name === 'codex' ||
-      name === 'openai' ||
-      type === 'openai' ||
-      hostPattern.includes('api.openai.com') ||
-      hostPattern.includes('chatgpt.com')
-    );
-  });
+  return secrets.find(hasCodexCredentialRoute);
 }
 
 function openAISecretExists(): boolean {

@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mock child_process so runCodexLoginAuth never spawns a real codex CLI; the
 // spawn stand-in plays `codex login` writing auth.json into whatever
@@ -19,8 +19,78 @@ vi.mock('child_process', () => ({
 
 // Keep the auth flow's structured logging out of logs/setup.log.
 vi.mock('../logs.js', () => ({ step: vi.fn(), userInput: vi.fn() }));
+vi.mock('../lib/bright-select.js', () => ({ brightSelect: vi.fn() }));
+vi.mock('@clack/prompts', async () => {
+  const actual = await vi.importActual<typeof import('@clack/prompts')>('@clack/prompts');
+  return { ...actual, confirm: vi.fn() };
+});
 
-import { buildCodexFailurePrompt, runCodexLoginAuth, verifyCodexInstall } from './codex.js';
+import { confirm } from '@clack/prompts';
+import { brightSelect } from '../lib/bright-select.js';
+import {
+  buildCodexFailurePrompt,
+  hasCodexCredentialRoute,
+  runCodexAuthStep,
+  runCodexLoginAuth,
+  verifyCodexInstall,
+} from './codex.js';
+
+const mockBrightSelect = vi.mocked(brightSelect);
+const mockConfirm = vi.mocked(confirm);
+
+beforeEach(() => {
+  mockSpawn.mockReset();
+  mockSpawnSync.mockReset();
+  mockExecFileSync.mockReset();
+  mockBrightSelect.mockReset();
+  mockConfirm.mockReset();
+});
+
+describe('hasCodexCredentialRoute', () => {
+  it.each([
+    [
+      'a generic secret merely named Codex',
+      { name: 'Codex', type: 'generic', hostPattern: 'api.anthropic.com' },
+      false,
+    ],
+    ['an OpenAI-typed secret without a route', { name: 'unrelated', type: 'openai', hostPattern: null }, false],
+    ['an endpoint lookalike', { name: 'OpenAI', type: 'openai', hostPattern: 'api.openai.com.evil.example' }, false],
+    ['an API-key route', { name: 'Codex', type: 'openai', hostPattern: 'api.openai.com' }, true],
+    ['a ChatGPT OAuth route', { name: 'OpenAI', type: 'openai', hostPattern: 'chatgpt.com' }, true],
+    ['a generic but correctly routed secret', { name: 'custom', type: 'generic', hostPattern: 'API.OPENAI.COM' }, true],
+  ] as const)('%s', (_caseName, fields, expected) => {
+    expect(hasCodexCredentialRoute({ id: 'secret-id', ...fields })).toBe(expected);
+  });
+});
+
+describe('runCodexAuthStep vault detection', () => {
+  const listedSecrets = (data: unknown[]) => JSON.stringify({ data });
+
+  it.each([
+    ['a generic secret named Codex', { name: 'Codex', type: 'generic', hostPattern: 'api.anthropic.com' }],
+    ['an OpenAI-typed secret with no route', { name: 'OpenAI', type: 'openai', hostPattern: null }],
+    ['no vault secret', undefined],
+  ] as const)('continues setup for %s', async (_caseName, secret) => {
+    mockExecFileSync.mockReturnValue(listedSecrets(secret === undefined ? [] : [{ id: 'secret-id', ...secret }]));
+    mockBrightSelect.mockResolvedValue('skip');
+    mockConfirm.mockResolvedValue(true);
+
+    await runCodexAuthStep();
+
+    expect(mockBrightSelect).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['an API-key endpoint route', { name: 'Codex', type: 'openai', hostPattern: 'api.openai.com' }],
+    ['a ChatGPT OAuth endpoint route', { name: 'OpenAI', type: 'openai', hostPattern: 'chatgpt.com' }],
+  ] as const)('skips setup for %s', async (_caseName, secret) => {
+    mockExecFileSync.mockReturnValue(listedSecrets([{ id: 'secret-id', ...secret }]));
+
+    await runCodexAuthStep();
+
+    expect(mockBrightSelect).not.toHaveBeenCalled();
+  });
+});
 
 // Structural guard for the codex payload wiring: provider files, both barrel
 // imports, and the pinned Dockerfile install. Goes red if any of them is

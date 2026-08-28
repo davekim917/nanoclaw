@@ -138,23 +138,29 @@ describe('buildOpenCodeConfig — fail-closed guard (F1)', () => {
     );
   });
 
-  it('accepts only complete OpenCode auth records', () => {
+  it('accepts complete OpenCode auth records but rejects empty credentials', () => {
     expect(
       parseOpenCodeAuthProviders(
         JSON.stringify({
           'opencode-go': { type: 'oauth', access: 'access', refresh: 'refresh', expires: 0 },
           nvidia: { type: 'api', key: 'nvapi-key', metadata: { region: 'us' } },
           'wellknown-provider': { type: 'wellknown', key: 'key', token: 'token' },
+          'whitespace-api': { type: 'api', key: ' ' },
           empty: {},
           'bad-oauth': { type: 'oauth', access: 1, refresh: 'refresh', expires: 0 },
+          'empty-oauth-access': { type: 'oauth', access: '', refresh: 'refresh', expires: 0 },
+          'empty-oauth-refresh': { type: 'oauth', access: 'access', refresh: '', expires: 0 },
           'bad-api': { type: 'api', key: 1 },
+          'empty-api': { type: 'api', key: '' },
           'bad-metadata': { type: 'api', key: 'key', metadata: { region: 1 } },
+          'empty-wellknown-key': { type: 'wellknown', key: '', token: 'token' },
+          'empty-wellknown-token': { type: 'wellknown', key: 'key', token: '' },
           nullish: null,
           array: [],
           text: 'token',
         }),
       ),
-    ).toEqual(['opencode-go', 'nvidia', 'wellknown-provider']);
+    ).toEqual(['opencode-go', 'nvidia', 'wellknown-provider', 'whitespace-api']);
     expect(parseOpenCodeAuthProviders('{not-json')).toEqual([]);
   });
 
