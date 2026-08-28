@@ -79,6 +79,16 @@ function conformantFixture(provider: MemoryConformantProvider): Map<string, stri
         'An `anthropic/*` model requires a verified native `auth.json`.',
         '~/.local/share/opencode-<group-folder>/auth.json',
         '~/.local/share/opencode/auth.json',
+        'SCOPED_AUTH="$HOME/.local/share/opencode-<group-folder>/auth.json"',
+        'SHARED_AUTH="$HOME/.local/share/opencode/auth.json"',
+        'if [[ -e "$SCOPED_AUTH" ]]; then',
+        '  AUTH_FILE="$SCOPED_AUTH"',
+        'else',
+        '  AUTH_FILE="$SHARED_AUTH"',
+        'fi',
+        'const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));',
+        'const record = auth?.anthropic;',
+        'if (!record || typeof record !== "object" || Array.isArray(record)) process.exit(1);',
       ].join('\n'),
     );
   }
@@ -219,6 +229,21 @@ describe('provider registry memory conformance', () => {
 
     expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
       '.claude/skills/add-opencode/SKILL.md: contains forbidden false Anthropic environment-auth guidance for OpenCode',
+    );
+  });
+
+  it('rejects size-only OpenCode auth checks that do not validate the selected Anthropic record', () => {
+    const fixture = conformantFixture('opencode');
+    fixture.set(
+      '.claude/skills/add-opencode/SKILL.md',
+      [
+        fixture.get('.claude/skills/add-opencode/SKILL.md')!,
+        'test -s "$HOME/.local/share/opencode-<group-folder>/auth.json" || test -s "$HOME/.local/share/opencode/auth.json"',
+      ].join('\n'),
+    );
+
+    expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
+      '.claude/skills/add-opencode/SKILL.md: contains forbidden size-only native OpenCode auth validation',
     );
   });
 

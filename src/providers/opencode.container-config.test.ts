@@ -104,7 +104,29 @@ describe('opencode provider container-config reconciliation', () => {
       expect(fs.existsSync(path.join(runtime, 'agent', 'global.md'))).toBe(false);
       expect(fs.existsSync(path.join(runtime, 'skill', 'scoped-skill', 'SKILL.md'))).toBe(true);
       expect(fs.existsSync(path.join(runtime, 'skill', 'global-skill'))).toBe(false);
-      expect(contribution.env?.NO_PROXY).toContain('opencode.ai');
+      expect(contribution.env?.NO_PROXY).not.toContain('opencode.ai');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps scoped auth authoritative when shared auth has a different provider', () => {
+    const fn = getProviderContainerConfig('opencode')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-scoped-auth-'));
+    const ctx = makeCtx(root);
+    const home = ctx.hostEnv.HOME!;
+    const scoped = path.join(home, '.local', 'share', 'opencode-example-opencode');
+    const shared = path.join(home, '.local', 'share', 'opencode');
+    writeGlobalSources(home);
+    fs.writeFileSync(path.join(shared, 'auth.json'), '{"anthropic":{"type":"oauth"}}');
+    fs.mkdirSync(scoped, { recursive: true });
+    fs.writeFileSync(path.join(scoped, 'auth.json'), '{"opencode-go":{"type":"oauth"}}');
+
+    try {
+      fn(ctx);
+      expect(fs.readFileSync(path.join(runtimeDir(ctx.sessionDir), 'auth.json'), 'utf8')).toBe(
+        '{"opencode-go":{"type":"oauth"}}',
+      );
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
@@ -175,7 +197,7 @@ describe('opencode provider container-config reconciliation', () => {
     }
   });
 
-  it('bypasses OneCLI only for a matching native OpenCode credential', () => {
+  it('leaves effective-model proxy routing to the container runtime', () => {
     const fn = getProviderContainerConfig('opencode')!;
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-opencode-matching-auth-'));
     const ctx = makeCtx(root);
@@ -184,8 +206,8 @@ describe('opencode provider container-config reconciliation', () => {
     try {
       const contribution = fn(ctx);
       expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
-      expect(contribution.env?.NO_PROXY?.split(',')).toContain('opencode.ai');
-      expect(contribution.env?.no_proxy?.split(',')).toContain('opencode.ai');
+      expect(contribution.env?.NO_PROXY?.split(',')).not.toContain('opencode.ai');
+      expect(contribution.env?.no_proxy?.split(',')).not.toContain('opencode.ai');
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

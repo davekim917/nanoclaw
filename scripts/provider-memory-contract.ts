@@ -291,6 +291,21 @@ export function validateProviderMemoryPayload(
         /~\/\.local\/share\/opencode\/auth\.json/,
         'shared native OpenCode auth fallback path',
       );
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /SCOPED_AUTH=[^\n]*opencode-<group-folder>\/auth\.json[\s\S]*if \[\[ -e "\$SCOPED_AUTH" \]\]; then[\s\S]*AUTH_FILE="\$SCOPED_AUTH"[\s\S]*else[\s\S]*AUTH_FILE="\$SHARED_AUTH"/,
+        'scoped-first effective OpenCode auth selection',
+      );
+      requireMatch(
+        issues,
+        skillFile,
+        skill,
+        /JSON\.parse\(fs\.readFileSync\(process\.argv\[1\][\s\S]*auth\?\.anthropic[\s\S]*typeof record !== ["']object["'][\s\S]*Array\.isArray\(record\)/,
+        'parsed top-level Anthropic auth record validation',
+      );
+      rejectMatch(issues, skillFile, skill, /test -s [^\n]*auth\.json/, 'size-only native OpenCode auth validation');
       rejectMatch(
         issues,
         skillFile,

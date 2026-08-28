@@ -206,12 +206,24 @@ verified native `auth.json`; generic `ANTHROPIC_*` environment variables and
 OneCLI proxy injection do not configure OpenCode authentication.
 
 Before selecting this model, authenticate with OpenCode's native Anthropic
-provider flow and verify, without printing credentials, that either the
-per-group scoped record or the shared fallback exists:
+provider flow and verify, without printing credentials, that the effective
+auth file contains a valid top-level `anthropic` record. Selection is
+scoped-first, exactly like the host:
 
 ```bash
-test -s "$HOME/.local/share/opencode-<group-folder>/auth.json" || \
-  test -s "$HOME/.local/share/opencode/auth.json"
+SCOPED_AUTH="$HOME/.local/share/opencode-<group-folder>/auth.json"
+SHARED_AUTH="$HOME/.local/share/opencode/auth.json"
+if [[ -e "$SCOPED_AUTH" ]]; then
+  AUTH_FILE="$SCOPED_AUTH"
+else
+  AUTH_FILE="$SHARED_AUTH"
+fi
+node --input-type=commonjs -e '
+  const fs = require("node:fs");
+  const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const record = auth?.anthropic;
+  if (!record || typeof record !== "object" || Array.isArray(record)) process.exit(1);
+' "$AUTH_FILE"
 ```
 
 The host copies the scoped
