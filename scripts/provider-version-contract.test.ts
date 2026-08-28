@@ -65,7 +65,8 @@ describe('provider version contracts', () => {
     const cloneSkill = fs.readFileSync(path.join(root, '.claude/skills/clone-as-opencode/SKILL.md'), 'utf8');
     expect(addSkill).toContain('OPENCODE_VERSION=$(sed -nE');
     expect(addSkill).toContain('@opencode-ai/sdk@"${OPENCODE_VERSION}"');
-    expect(addSkill.indexOf('ARG OPENCODE_VERSION=<exact-version>')).toBeLessThan(
+    expect(addSkill).toContain(`ARG OPENCODE_VERSION=${pin}`);
+    expect(addSkill.indexOf(`ARG OPENCODE_VERSION=${pin}`)).toBeLessThan(
       addSkill.indexOf('OPENCODE_VERSION=$(sed -nE'),
     );
     expect(cloneSkill).toContain('OPENCODE_VERSION=$(sed -nE');

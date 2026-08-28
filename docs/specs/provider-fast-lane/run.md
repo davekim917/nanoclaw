@@ -63,3 +63,7 @@
 - `provider-memory-contract --match-ref origin/providers` fails for both providers: the remote branch is missing multiple roster paths and differs on the remaining source files.
 - The new OpenCode installer contract is correct in this PR but cannot make `/add-opencode` safe until the long-lived `providers` branch receives byte-identical payload updates.
 - No remote providers-branch mutation was attempted from this container PR. This is a required follow-up before provider installation/reapplication can be claimed healthy.
+
+### GitHub Codex review round 2
+
+- Accepted: the fresh-trunk OpenCode installer cannot execute a placeholder Docker ARG. The add skill now writes the reviewed frozen `1.18.23` pin, then derives every SDK mutation from that Docker value. The acceptance test requires the exact frozen target and still rejects old operational literals.
