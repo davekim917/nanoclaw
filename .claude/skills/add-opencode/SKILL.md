@@ -83,7 +83,7 @@ Two edits to `container/Dockerfile`, both idempotent (skip if already present):
 **(a)** In the "Pin CLI versions" ARG block (around line 45–57), add after `ARG CODEX_VERSION=...`:
 
 ```dockerfile
-ARG OPENCODE_VERSION=<exact-version>
+ARG OPENCODE_VERSION=1.18.23
 ```
 
 > **Pin to an exact version** — keep host CLI, container CLI, and SDK locked to the same release. `latest` works but caves to upstream cadence; bump deliberately when there's a reason.
