@@ -836,6 +836,8 @@ export class CodexProvider implements AgentProvider {
    * `query()` calls.
    */
   readonly fallbackHomes: readonly string[];
+  private readonly primaryCodexHome: string;
+  private readonly primaryHostCodexHome: string | undefined;
   private nextFallback = 0;
 
   constructor(options: ProviderOptions = {}) {
@@ -898,6 +900,8 @@ export class CodexProvider implements AgentProvider {
         .map((s) => s.trim())
         .filter((s) => s.length > 0),
     );
+    this.primaryCodexHome = process.env.CODEX_HOME ?? '/home/node/.codex';
+    this.primaryHostCodexHome = process.env.CODEX_PRIMARY_HOST_HOME;
     if (this.fallbackHomes.length > 0) {
       console.error(
         `[codex-provider] Loaded ${this.fallbackHomes.length} Codex OAuth fallback(s): ${this.fallbackHomes.join(', ')}`,
@@ -985,12 +989,7 @@ export class CodexProvider implements AgentProvider {
       // pass it into findRolloutFile (the rollout to copy lives in the home
       // we're rotating AWAY from). Falls back to the conventional path when
       // process.env.CODEX_HOME is unset — the codex CLI uses the same default.
-      let currentCodexHome = process.env.CODEX_HOME ?? '/home/node/.codex';
-      // Stable reference to the PRIMARY home — the only one with the bind-mounted
-      // agents/ tree. Captured before any rotation reassigns currentCodexHome, so
-      // the rotation routine can mirror the role definitions into a fallback. (codex #126)
-      const primaryCodexHome = currentCodexHome;
-      const primaryHostCodexHome = process.env.CODEX_PRIMARY_HOST_HOME;
+      let currentCodexHome = process.env.CODEX_HOME ?? self.primaryCodexHome;
       let primaryAuthRefreshAttempted = false;
 
       try {
@@ -1185,8 +1184,8 @@ export class CodexProvider implements AgentProvider {
                 const canRefreshPrimaryAuth =
                   (ev.classification === 'system_error' || ev.classification === 'auth_invalidated') &&
                   !primaryAuthRefreshAttempted &&
-                  currentCodexHome === primaryCodexHome &&
-                  refreshCodexAuthFromHost(currentCodexHome, primaryHostCodexHome);
+                  currentCodexHome === self.primaryCodexHome &&
+                  refreshCodexAuthFromHost(currentCodexHome, self.primaryHostCodexHome);
                 if (canRefreshPrimaryAuth) {
                   primaryAuthRefreshAttempted = true;
                   yield {
@@ -1272,7 +1271,7 @@ export class CodexProvider implements AgentProvider {
                     // primary, so mirror the role definitions across explicitly. (codex #126)
                     writeCodexMcpConfigToml(self.mcpServers);
                     writeCodexHooksJson();
-                    mirrorCodexAgentsToHome(primaryCodexHome, nextHome);
+                    mirrorCodexAgentsToHome(self.primaryCodexHome, nextHome);
 
                     server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
                     turnTracker.server = server;
@@ -1290,6 +1289,7 @@ export class CodexProvider implements AgentProvider {
                     turnTracker.threadId = threadId ?? null;
                     if (threadId !== previousThreadId) {
                       initYielded = false;
+                      attemptText = text;
                       resetCodexTurnAccumulatorThread(turnAccum);
                     }
 
