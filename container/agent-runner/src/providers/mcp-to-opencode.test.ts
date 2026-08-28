@@ -56,4 +56,28 @@ describe('mcpServersToOpenCodeConfig', () => {
   it('returns empty record for undefined', () => {
     expect(mcpServersToOpenCodeConfig(undefined)).toEqual({});
   });
+
+  it('maps http MCP entries to remote with headers', () => {
+    const mcp = mcpServersToOpenCodeConfig({
+      granola: {
+        type: 'http',
+        url: 'https://api.granola.ai/mcp',
+        headers: { 'X-API-Key': 'placeholder' },
+      },
+    });
+    expect(mcp.granola).toEqual({
+      type: 'remote',
+      url: 'https://api.granola.ai/mcp',
+      headers: { 'X-API-Key': 'placeholder' },
+      enabled: true,
+    });
+  });
+
+  it('rejects deprecated SSE MCP entries', () => {
+    expect(() =>
+      mcpServersToOpenCodeConfig({
+        stream: { type: 'sse', url: 'https://example.com/sse' },
+      }),
+    ).toThrow(/deprecated SSE transport/);
+  });
 });
