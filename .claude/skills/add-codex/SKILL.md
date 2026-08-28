@@ -27,6 +27,7 @@ Check whether the payload is already wired (a prior apply, or a trunk that still
 - `src/providers/codex.ts`
 - `container/agent-runner/src/providers/codex.ts` and `codex-app-server.ts`
 - `setup/providers/codex.ts`
+- `setup/providers/dockerfile-version.ts`
 - `import './codex.js';` in `src/providers/index.ts`, `container/agent-runner/src/providers/index.ts`, and `setup/providers/index.ts`
 - an exact `ARG CODEX_VERSION=<version>` plus
   `"@openai/codex@${CODEX_VERSION}"` in `container/Dockerfile`

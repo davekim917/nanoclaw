@@ -3,6 +3,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { effectiveDockerArgBeforeFinalRun } from '../../../../setup/providers/dockerfile-version.js';
+
 // Mock the SDK before importing claude.ts, so sdkQuery is interceptable.
 // We capture the options passed to sdkQuery to verify sticky config behavior.
 let capturedSdkOptions: Record<string, unknown> | null = null;
@@ -63,6 +65,16 @@ function readJson(file: string): { dependencies?: Record<string, string>; versio
   };
 }
 
+function assertClaudeSdkCliLockstep(dockerfile: string, claudeCodeVersion: string): void {
+  expect(claudeCodeVersion).toBe(
+    effectiveDockerArgBeforeFinalRun(
+      dockerfile,
+      'CLAUDE_CODE_VERSION',
+      '"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"',
+    ),
+  );
+}
+
 beforeAll(() => {
   fs.rmSync(TEST_CLAUDE_CONFIG_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_CLAUDE_CONFIG_DIR, { recursive: true });
@@ -92,10 +104,19 @@ describe('claudeConfigSchema', () => {
       path.join(agentRunnerRoot, 'node_modules/@anthropic-ai/claude-agent-sdk/package.json'),
     );
     const dockerfile = fs.readFileSync(path.join(repoRoot, 'container/Dockerfile'), 'utf8');
-    const cliVersion = dockerfile.match(/^ARG CLAUDE_CODE_VERSION=([^\s#]+)(?:\s+#.*)?$/m)?.[1];
-
     expect(installedSdk.version).toBe(declaredSdk.dependencies?.['@anthropic-ai/claude-agent-sdk']);
-    expect(installedSdk.claudeCodeVersion).toBe(cliVersion);
+    assertClaudeSdkCliLockstep(dockerfile, installedSdk.claudeCodeVersion);
+  });
+
+  it('test_claude_cli_agent_sdk_lockstep_uses_final_real_install: detects a later mismatched CLI pin', () => {
+    const dockerfile = [
+      'ARG CLAUDE_CODE_VERSION=2.1.250',
+      'RUN pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"',
+      'ARG CLAUDE_CODE_VERSION=2.1.999',
+      'RUN pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"',
+      '',
+    ].join('\n');
+    expect(() => assertClaudeSdkCliLockstep(dockerfile, '2.1.250')).toThrow();
   });
 
   it('test_claude_effort_contract: the runtime schema exposes the SDK effort surface', () => {

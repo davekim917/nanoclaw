@@ -3,25 +3,17 @@ import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
+import { effectiveDockerArgBeforeFinalRun } from '../setup/providers/dockerfile-version.js';
+
 const root = process.cwd();
 const dockerfile = fs.readFileSync(path.join(root, 'container/Dockerfile'), 'utf8');
 const agentRunnerPackage = JSON.parse(
   fs.readFileSync(path.join(root, 'container/agent-runner/package.json'), 'utf8'),
 ) as { dependencies: Record<string, string> };
 
-function dockerArg(text: string, name: string, consumingInstall: string): string | undefined {
-  const installIndex = text.lastIndexOf(consumingInstall);
-  if (installIndex < 0) return undefined;
-
-  const declarations = [
-    ...text.slice(0, installIndex).matchAll(new RegExp(`^ARG\\s+${name}=([^\\s#]+)(?:\\s+#.*)?\\s*$`, 'gm')),
-  ];
-  return declarations.at(-1)?.[1];
-}
-
 describe('provider version contracts', () => {
   it('test_claude_cli_agent_sdk_lockstep', () => {
-    const cliVersion = dockerArg(
+    const cliVersion = effectiveDockerArgBeforeFinalRun(
       dockerfile,
       'CLAUDE_CODE_VERSION',
       '"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"',
@@ -31,7 +23,7 @@ describe('provider version contracts', () => {
   });
 
   it('test_codex_pin_is_exact_and_consumed', () => {
-    const pin = dockerArg(dockerfile, 'CODEX_VERSION', '"@openai/codex@${CODEX_VERSION}"');
+    const pin = effectiveDockerArgBeforeFinalRun(dockerfile, 'CODEX_VERSION', '"@openai/codex@${CODEX_VERSION}"');
     expect(pin).toMatch(/^\d+\.\d+\.\d+$/);
     expect(dockerfile).toContain('"@openai/codex@${CODEX_VERSION}"');
 
@@ -40,7 +32,7 @@ describe('provider version contracts', () => {
   });
 
   it('test_opencode_all_operational_pins_match', () => {
-    const pin = dockerArg(dockerfile, 'OPENCODE_VERSION', '"opencode-ai@${OPENCODE_VERSION}"');
+    const pin = effectiveDockerArgBeforeFinalRun(dockerfile, 'OPENCODE_VERSION', '"opencode-ai@${OPENCODE_VERSION}"');
     expect(pin).toMatch(/^\d+\.\d+\.\d+$/);
     expect(agentRunnerPackage.dependencies['@opencode-ai/sdk']).toBe(pin);
 
@@ -68,12 +60,13 @@ describe('provider version contracts', () => {
 
   it.each([
     ['CLAUDE_CODE_VERSION', '2.1.250', '"@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"'],
+    ['CODEX_VERSION', '0.150.1', '"@openai/codex@${CODEX_VERSION}"'],
     ['OPENCODE_VERSION', '1.18.23', '"opencode-ai@${OPENCODE_VERSION}"'],
   ])('uses the effective %s declaration before its final install', (name, version, consumingInstall) => {
     const overridden = `ARG ${name}=${version}\nARG ${name}=latest\nRUN pnpm install -g ${consumingInstall}\n`;
-    expect(dockerArg(overridden, name, consumingInstall)).toBe('latest');
+    expect(effectiveDockerArgBeforeFinalRun(overridden, name, consumingInstall)).toBe('latest');
 
     const corrected = `ARG ${name}=latest\nARG ${name}=${version}\nRUN pnpm install -g ${consumingInstall}\n`;
-    expect(dockerArg(corrected, name, consumingInstall)).toBe(version);
+    expect(effectiveDockerArgBeforeFinalRun(corrected, name, consumingInstall)).toBe(version);
   });
 });

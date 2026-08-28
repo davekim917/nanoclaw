@@ -128,6 +128,12 @@ describe('provider registry memory conformance', () => {
     expect(PROVIDER_PAYLOAD_FILES.codex).not.toContain('src/providers/codex-host-contribution.test.ts');
   });
 
+  it('keeps the Codex Dockerfile pin parser with its payload consumer', () => {
+    expect(PROVIDER_PAYLOAD_FILES.codex).toEqual(
+      expect.arrayContaining(['setup/providers/dockerfile-version.ts', 'setup/providers/dockerfile-version.test.ts']),
+    );
+  });
+
   it('keeps both OpenCode registration guards inside the provider payload roster', () => {
     expect(PROVIDER_PAYLOAD_FILES.opencode).toEqual(
       expect.arrayContaining([

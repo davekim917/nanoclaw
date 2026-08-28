@@ -116,6 +116,21 @@ describe('verifyCodexInstall', () => {
       expect(verifyCodexInstall(root).problems).toEqual([
         'container/Dockerfile missing an exact numeric ARG CODEX_VERSION pin',
       ]);
+
+      fs.writeFileSync(
+        dockerfile,
+        [
+          'ARG CODEX_VERSION=0.150.1',
+          'ARG CODEX_VERSION=latest',
+          'RUN pnpm add -g "@openai/codex@${CODEX_VERSION}"',
+          'ARG CODEX_VERSION=0.150.1',
+          '# documentation only: "@openai/codex@${CODEX_VERSION}"',
+          '',
+        ].join('\n'),
+      );
+      expect(verifyCodexInstall(root).problems).toEqual([
+        'container/Dockerfile missing an exact numeric ARG CODEX_VERSION pin',
+      ]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
