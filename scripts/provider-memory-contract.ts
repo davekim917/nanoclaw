@@ -302,8 +302,8 @@ export function validateProviderMemoryPayload(
         issues,
         skillFile,
         skill,
-        /JSON\.parse\(fs\.readFileSync\(process\.argv\[1\][\s\S]*auth\?\.anthropic[\s\S]*typeof record !== ["']object["'][\s\S]*Array\.isArray\(record\)/,
-        'parsed top-level Anthropic auth record validation',
+        /import \{ parseOpenCodeAuthProviders \} from ["']\.\/container\/agent-runner\/src\/providers\/opencode\.ts["'][\s\S]*parseOpenCodeAuthProviders\(auth\)\.includes\(["']anthropic["']\)/,
+        'runtime-equivalent Anthropic auth record validation',
       );
       rejectMatch(issues, skillFile, skill, /test -s [^\n]*auth\.json/, 'size-only native OpenCode auth validation');
       rejectMatch(

@@ -55,6 +55,17 @@ const TERMINAL_ITEM_STATUSES = new Set(['completed', 'failed', 'declined']);
 // in a completed turn's final item snapshot is therefore the terminal signal.
 const STATUSLESS_TERMINAL_ITEM_TYPES = new Set(['webSearch', 'imageView', 'sleep']);
 
+/** Whether a completed-turn snapshot authoritatively closes this item. */
+export function isCodexTerminalTurnItem(item: unknown): boolean {
+  const parsed = parseItemIdentity(item);
+  if (!parsed) return false;
+  const status = (item as Record<string, unknown>).status;
+  return (
+    (typeof status === 'string' && TERMINAL_ITEM_STATUSES.has(status)) ||
+    (status === undefined && STATUSLESS_TERMINAL_ITEM_TYPES.has(parsed.type))
+  );
+}
+
 /**
  * Normalize the app-server's version-dependent thread status shape.
  * Unknown shapes deliberately fail open: a responsive future Codex version
@@ -137,13 +148,7 @@ export class CodexTurnLiveness {
     for (const item of items) {
       const parsed = parseItemIdentity(item);
       if (!parsed || this.openItems.get(parsed.id) !== parsed.type) continue;
-      const status = (item as Record<string, unknown>).status;
-      if (
-        (typeof status === 'string' && TERMINAL_ITEM_STATUSES.has(status)) ||
-        (status === undefined && STATUSLESS_TERMINAL_ITEM_TYPES.has(parsed.type))
-      ) {
-        this.openItems.delete(parsed.id);
-      }
+      if (isCodexTerminalTurnItem(item)) this.openItems.delete(parsed.id);
     }
   }
 

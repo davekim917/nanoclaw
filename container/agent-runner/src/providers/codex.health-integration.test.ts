@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { closeSessionDb, initTestSessionDb } from '../db/connection.js';
 import type { AppServer } from './codex-app-server.js';
 import { runOneTurn, type CodexTurnHealthConfig } from './codex.js';
+import type { ProviderEvent } from './types.js';
 
 interface RecordedRequest {
   id: number;
@@ -60,11 +61,8 @@ function fakeServer(
   };
 }
 
-async function collectTurn(
-  server: AppServer,
-  health: CodexTurnHealthConfig = FAST_HEALTH,
-): Promise<Array<{ type: string; classification?: string }>> {
-  const events: Array<{ type: string; classification?: string }> = [];
+async function collectTurn(server: AppServer, health: CodexTurnHealthConfig = FAST_HEALTH): Promise<ProviderEvent[]> {
+  const events: ProviderEvent[] = [];
   for await (const event of runOneTurn(
     server,
     'thread-1',
@@ -200,6 +198,52 @@ describe('runOneTurn Codex control-plane health integration', () => {
 
     expect(events.some((event) => event.type === 'error')).toBe(false);
     expect(events.at(-1)).toMatchObject({ type: 'result', text: 'completed result' });
+  });
+
+  it('restores an assistant result from terminal-only completed-turn items', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [{ id: 'message-1', type: 'agentMessage', text: 'terminal-only result' }],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(events.find((event) => event.type === 'result')).toMatchObject({
+      type: 'result',
+      text: 'terminal-only result',
+      steps: 1,
+    });
+  });
+
+  it('dedupes a live completed item repeated in the authoritative terminal snapshot', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    const message = { id: 'message-1', type: 'agentMessage', text: 'deduped result' };
+    fixture.emit('item/completed', { threadId: 'thread-1', turnId: 'turn-1', item: message });
+    fixture.emit('turn/completed', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'completed', items: [message] },
+    });
+    const events = await resultPromise;
+
+    expect(events.find((event) => event.type === 'result')).toMatchObject({
+      type: 'result',
+      text: 'deduped result',
+      steps: 1,
+    });
   });
 
   it('accepts a completed parent turn while its persistent collaboration item remains open', async () => {
@@ -383,7 +427,10 @@ describe('runOneTurn Codex control-plane health integration', () => {
                 {
                   id: 'turn-1',
                   status: 'completed',
-                  items: [{ id: 'command-1', type: 'commandExecution', status: 'completed', exitCode: 0 }],
+                  items: [
+                    { id: 'command-1', type: 'commandExecution', status: 'completed', exitCode: 0 },
+                    { id: 'message-1', type: 'agentMessage', text: 'completed after backfill' },
+                  ],
                 },
               ],
             },
@@ -402,11 +449,6 @@ describe('runOneTurn Codex control-plane health integration', () => {
       threadId: 'thread-1',
       turnId: 'turn-1',
       item: { id: 'command-1', type: 'commandExecution', status: 'inProgress' },
-    });
-    fixture.emit('item/agentMessage/delta', {
-      threadId: 'thread-1',
-      turnId: 'turn-1',
-      delta: 'completed after backfill',
     });
     fixture.emit('turn/completed', {
       threadId: 'thread-1',

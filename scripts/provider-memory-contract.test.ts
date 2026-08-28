@@ -86,9 +86,9 @@ function conformantFixture(provider: MemoryConformantProvider): Map<string, stri
         'else',
         '  AUTH_FILE="$SHARED_AUTH"',
         'fi',
-        'const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));',
-        'const record = auth?.anthropic;',
-        'if (!record || typeof record !== "object" || Array.isArray(record)) process.exit(1);',
+        'import { parseOpenCodeAuthProviders } from "./container/agent-runner/src/providers/opencode.ts";',
+        'const auth = fs.readFileSync(process.argv[1], "utf8");',
+        'if (!parseOpenCodeAuthProviders(auth).includes("anthropic")) process.exit(1);',
       ].join('\n'),
     );
   }
@@ -244,6 +244,23 @@ describe('provider registry memory conformance', () => {
 
     expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
       '.claude/skills/add-opencode/SKILL.md: contains forbidden size-only native OpenCode auth validation',
+    );
+  });
+
+  it('rejects OpenCode Anthropic guidance that does not reuse the runtime auth parser', () => {
+    const fixture = conformantFixture('opencode');
+    fixture.set(
+      '.claude/skills/add-opencode/SKILL.md',
+      fixture
+        .get('.claude/skills/add-opencode/SKILL.md')!
+        .replace(
+          'parseOpenCodeAuthProviders(auth).includes("anthropic")',
+          'Object.hasOwn(JSON.parse(auth), "anthropic")',
+        ),
+    );
+
+    expect(validateProviderMemoryPayload('opencode', (file) => fixture.get(file))).toContain(
+      '.claude/skills/add-opencode/SKILL.md: missing runtime-equivalent Anthropic auth record validation',
     );
   });
 
