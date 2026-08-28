@@ -105,3 +105,9 @@ forks.md
 # runtime/build artifacts
 /.lock
 dashboard/tsconfig.tsbuildinfo
+
+# deploy crash-guard rollback snapshots (scripts/deploy.sh, src/deploy-crash-guard.ts)
+dist.pre-deploy/
+dist.failed/
+node_modules.pre-deploy/
+node_modules.failed/

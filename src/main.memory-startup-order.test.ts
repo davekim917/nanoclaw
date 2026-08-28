@@ -4,7 +4,7 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 import { expect, it, vi } from 'vitest';
 
-import { isDirectExecution, runWorkgroupMemoryStartupGate } from './index.js';
+import { isDirectExecution, runWorkgroupMemoryStartupGate } from './main.js';
 
 it('uses exact main-module identity instead of NODE_ENV to decide startup', () => {
   const entry = path.resolve('/tmp/nanoclaw-index-entry.ts');
@@ -63,7 +63,7 @@ it('runs reconciliation only after runtime and strict absence proof succeed', ()
 });
 
 it('admits pending upgrade contexts after memory cutover and before any runtime can wake', () => {
-  const source = fs.readFileSync(path.resolve('src/index.ts'), 'utf8');
+  const source = fs.readFileSync(path.resolve('src/main.ts'), 'utf8');
   const memoryCutover = source.indexOf('const memoryReports = runWorkgroupMemoryStartupGate(db);');
   const pendingUpgrade = source.indexOf('const pendingUpgrade = reconcilePendingUpgradeContexts(');
   const dashboard = source.indexOf('startDashboard();');
