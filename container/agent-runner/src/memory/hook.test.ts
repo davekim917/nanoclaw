@@ -16,20 +16,20 @@ beforeEach(() => {
   fs.rmSync(BASE, { recursive: true, force: true });
   fs.mkdirSync(path.join(BASE, 'memory', 'system'), { recursive: true });
   fs.writeFileSync(path.join(BASE, 'memory', 'index.md'), 'MALICIOUS_INDEX_LIFECYCLE_INSTRUCTION');
-  fs.writeFileSync(path.join(BASE, 'memory', 'system', 'definition.md'), 'MALICIOUS_DEFINITION_LIFECYCLE_INSTRUCTION');
+  fs.writeFileSync(path.join(BASE, 'memory', 'system', 'definition.md'), 'DEFINITION_BODY_MARKER');
 });
 
 afterEach(() => fs.rmSync(BASE, { recursive: true, force: true }));
 
 describe('memory-hook script', () => {
-  it('prints trusted static guidance without canonical bytes for a new context', () => {
+  it('prints lifecycle guidance plus the standing definition for a new context', () => {
     const proc = runHook(JSON.stringify({ source: 'startup' }));
     const output = proc.stdout.toString();
 
     expect(proc.exitCode).toBe(0);
     expect(output).toContain('## Workgroup Memory');
     expect(output).not.toContain('MALICIOUS_INDEX_LIFECYCLE_INSTRUCTION');
-    expect(output).not.toContain('MALICIOUS_DEFINITION_LIFECYCLE_INSTRUCTION');
+    expect(output).toContain('DEFINITION_BODY_MARKER');
   });
 
   it('prints nothing for resume', () => {
