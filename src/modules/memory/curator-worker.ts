@@ -49,6 +49,7 @@ import {
   GENERATED_MEMORY_MAX_BYTES,
   GENERATED_MEMORY_WARN_BYTES,
   isCuratorOwned,
+  isMemoryCuratorEnabled,
   parseGeneratedMemoryFacts,
   RESERVED_TOPIC_LEAVES,
   stripCuratorMetadata,
@@ -233,9 +234,7 @@ function actualDependencies(): MemoryCuratorWorkerDependencies {
   };
 }
 
-export function isMemoryCuratorEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return /^(?:1|true|yes|on)$/i.test(env.NANOCLAW_MEMORY_CURATOR_ENABLED ?? '');
-}
+export { isMemoryCuratorEnabled };
 
 export function getWorkgroupMemberIds(workgroupId: string): string[] {
   return (

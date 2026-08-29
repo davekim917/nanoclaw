@@ -14,6 +14,7 @@ import {
 import {
   GENERATED_MEMORY_MAX_BYTES,
   GENERATED_MEMORY_RELATIVE_PATH,
+  isMemoryCuratorEnabled,
   searchableText,
   TOPIC_DIRECTORIES,
 } from './curator-contract.js';
@@ -1332,6 +1333,11 @@ function scanRecallCandidates(
     if (
       (CORE_PATHS as readonly string[]).includes(relative) ||
       NON_RECALL_PATHS.has(relative) ||
+      // Curator off means the ledger is excluded from BOTH lanes. Skipping
+      // here rather than downstream is what keeps it out of the ordinary
+      // markdown lane, where it would score as one multi-megabyte document
+      // and eat the shared markdownScannedBytes budget.
+      (relative === GENERATED_MEMORY_RELATIVE_PATH && !isMemoryCuratorEnabled()) ||
       relative.startsWith(PREFERENCES_DIR)
     ) {
       continue;

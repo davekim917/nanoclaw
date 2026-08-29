@@ -4,6 +4,26 @@ import { scrubSecrets } from '../../secret-scrubber.js';
 import type { MemoryCurationArchiveRow } from '../../message-archive.js';
 
 export const GENERATED_MEMORY_RELATIVE_PATH = 'generated/memory.md';
+
+/**
+ * Gates the curator AND recall of what the curator wrote.
+ *
+ * One flag, one system. `writeGeneratedMemory` is the only producer of
+ * `generated/memory.md`, so serving the ledger while its producer is off is
+ * incoherent — and it makes "curator off" untestable as an A/B, because
+ * already-accumulated facts keep being injected forever.
+ *
+ * Disabled means excluded from BOTH recall lanes, never demoted into the
+ * ordinary markdown lane: the ledger is a multi-megabyte `.md` inside the
+ * scanned tree, and scoring it as one document surfaces ~1 fact per turn while
+ * eating the shared markdown scan budget (see PRE_TURN_BOUNDS below).
+ *
+ * Lives here rather than in curator-worker so the recall path can import the
+ * predicate without pulling in the worker's DB and backend dependencies.
+ */
+export function isMemoryCuratorEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(?:1|true|yes|on)$/i.test(env.NANOCLAW_MEMORY_CURATOR_ENABLED ?? '');
+}
 // Facts are never evicted — a decision from months ago stays recallable, and
 // retrieval ranks by relevance with age only as a tiebreak. This bound is a
 // runaway rail, not a retention policy: at 256 KiB it silently became one.
