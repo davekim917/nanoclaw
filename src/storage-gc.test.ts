@@ -123,19 +123,29 @@ function sessionRow(threadId: string, folder = 'folder-a', status = 'closed', id
 }
 
 /** A topic directory holding one linked worktree of a canonical clone. */
-function topicFixture(threadId: string, repo = 'repo-a'): { topicDir: string; worktree: string } {
-  const remote = makeRemote(`${repo}-${threadId}`);
-  const canonical = path.join(state.dataDir, 'repositories', WG, `${repo}-${threadId}`);
+function topicFixture(
+  threadId: string,
+  repo = 'repo-a',
+): { topicDir: string; worktree: string; canonical: string; branch: string } {
+  // Suffixed with threadId so multiple topicFixture() calls in one test (each
+  // defaulting to repo='repo-a') get distinct canonical repos. The worktree
+  // subdirectory name must match this exactly — production code (discover(),
+  // and the GC's post-collection worktree-prune step) resolves a topic's
+  // canonical repo FROM that subdirectory name via canonicalRepoDir.
+  const repoDirName = `${repo}-${threadId}`;
+  const remote = makeRemote(repoDirName);
+  const canonical = path.join(state.dataDir, 'repositories', WG, repoDirName);
   fs.mkdirSync(path.dirname(canonical), { recursive: true });
   execFileSync('git', ['clone', '-q', remote, canonical]);
   git(canonical, ['remote', 'set-head', 'origin', '--auto']);
 
   const topicDir = topicStateDir(workUnit(threadId), state.dataDir);
-  const worktree = path.join(topicDir, 'worktrees', repo);
+  const worktree = path.join(topicDir, 'worktrees', repoDirName);
   fs.mkdirSync(path.dirname(worktree), { recursive: true });
-  git(canonical, ['worktree', 'add', '-q', '-b', `topic-${threadId}`, worktree, 'origin/HEAD']);
+  const branch = `topic-${threadId}`;
+  git(canonical, ['worktree', 'add', '-q', '-b', branch, worktree, 'origin/HEAD']);
   fs.utimesSync(topicDir, OLD, OLD);
-  return { topicDir, worktree };
+  return { topicDir, worktree, canonical, branch };
 }
 
 /** A standalone clone (real .git DIRECTORY) at an arbitrary depth under groups/. */
@@ -486,6 +496,19 @@ describe('storage GC — apply mode', () => {
     expect(fs.existsSync(topicDir)).toBe(false);
   });
 
+  it.skipIf(!hasTrash)('deregisters the linked worktree so a resumed thread can recreate it — Codex #3', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-resume');
+    state.rows = [sessionRow('thread-idle-resume', 'folder-a', 'active', 20)];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: true, reason: 'idle-and-clean' });
+    expect(fs.existsSync(topicDir)).toBe(false);
+    // The canonical repo no longer lists the collected worktree...
+    expect(git(canonical, ['worktree', 'list'])).not.toContain(branch);
+    // ...so a resumed thread's create_worktree (same branch, fresh path) works.
+    expect(() => git(canonical, ['worktree', 'add', '-q', worktree, branch])).not.toThrow();
+  });
+
   it.skipIf(!hasTrash)('demotes an idle-qualified topic whose session went active again by recheck time', () => {
     const { topicDir } = topicFixture('thread-idle-recheck');
     // Same 3-call shape as the reopen test above: scan sees idle 20d (qualifies
@@ -513,7 +536,7 @@ describe('storage GC — apply mode', () => {
       // participantsByTopic pre-move recheck (still idle 20d, passes), (5)
       // finalizeIdleCollection's OWN post-move recheck — this is the one
       // Codex's review added, and only it sees the late activity (idle 1d).
-      const { topicDir } = topicFixture('thread-idle-latemove');
+      const { topicDir, canonical, branch } = topicFixture('thread-idle-latemove');
       state.rowsPerCall = [
         [sessionRow('thread-idle-latemove', 'folder-a', 'active', 20)],
         [sessionRow('thread-idle-latemove', 'folder-a', 'active', 20)],
@@ -525,6 +548,8 @@ describe('storage GC — apply mode', () => {
       const report = runStorageGcOnce(state.dataDir, state.groupsDir);
       expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
       expect(fs.existsSync(topicDir)).toBe(true);
+      // A rollback must never touch the canonical repo's worktree registration.
+      expect(git(canonical, ['worktree', 'list'])).toContain(branch);
     },
   );
 

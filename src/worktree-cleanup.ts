@@ -958,6 +958,26 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     return { ok: false, reason: 'aborted-late-activity' };
   }
 
+  // Both checks passed — this is genuinely going away. Deregister each
+  // repo's linked worktree from its CANONICAL repo before trashing, so a
+  // resumed thread's later create_worktree doesn't hit git's "already
+  // checked out at <missing-path>" error against a stale registration.
+  // Safe unconditionally: container-runner.ts's mount comment documents that
+  // topic worktree registrations always use exact host paths on both sides
+  // (no container-relative back-pointer can land in them), so `worktree
+  // prune` only ever removes entries whose path is genuinely gone — which,
+  // for this repo, is now true (we just renamed it into quarantine).
+  const workgroupId = path.basename(path.dirname(candidate.path));
+  for (const repo of safeDirectories(path.join(quarantinePath, 'worktrees')) ?? []) {
+    if (!isRepositoryName(repo)) continue;
+    if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
+      log.warn('Storage GC: git worktree prune failed after idle collection; may need a manual prune', {
+        workgroupId,
+        repo,
+      });
+    }
+  }
+
   try {
     trashPath(quarantinePath);
   } catch (err) {
