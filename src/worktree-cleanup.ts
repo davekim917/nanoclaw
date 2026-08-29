@@ -31,19 +31,55 @@ import {
   withRepositoryLifecycleClaims,
   type RepositoryWorkUnit,
 } from './repository-workspaces.js';
-import { openOutboundDb } from './session-manager.js';
+import { inboundDbPath, openOutboundDb } from './session-manager.js';
 import { safeGitArgs, safeGitEnv } from './safe-git.js';
-import { dirSizeBytes } from './storage-manager.js';
+import { dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 60_000;
 const MINIMUM_IDLE_DAYS = 7;
 const STALE_WARNING_DAYS = 30;
+const DEFAULT_TOPIC_IDLE_RECLAIM_DAYS = 14;
+
+let warnedBadIdleReclaimDays = false;
+
+/**
+ * Owner-approved widening (2026-08-29): a topic whose open participants have
+ * been idle this long is treated as side-(a) evidence too, on top of "every
+ * participant closed". 0 disables it (pre-existing behavior).
+ *
+ * UNSET (the var isn't in the environment at all) -> the deliberate default
+ * (14). Set to anything that isn't a plain non-negative integer — "" included
+ * (negative, decimal, exponent notation, "abc", "NaN", empty, …) -> DISABLED
+ * (0), not the default — a typo meant to turn this off (or a nonsense value)
+ * must never silently turn it on at 14. Warns once per process on the bad path.
+ */
+function topicIdleReclaimDays(): number {
+  const raw = process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS;
+  if (raw === undefined) return DEFAULT_TOPIC_IDLE_RECLAIM_DAYS;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  if (!warnedBadIdleReclaimDays) {
+    warnedBadIdleReclaimDays = true;
+    log.warn('Worktree cleanup: invalid NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS, disabling idle reclaim', { value: raw });
+  }
+  return 0;
+}
+
+/** Days since an ISO timestamp. An unparseable timestamp fails closed (treated as just-now). */
+function daysSince(iso: string): number {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? (Date.now() - ms) / 86_400_000 : 0;
+}
 
 interface TopicParticipant {
   sessionId: string;
   agentGroupId: string;
   status: string;
+  /** COALESCE(last_active, created_at) — ISO-8601 UTC. */
+  idleSince: string;
+  /** mtime of inbound.db, or null if unstatable. The durable admission write
+   *  itself — last_active is a separate, later write off the same event. */
+  inboundMtimeMs: number | null;
 }
 
 export interface TopicWorktreeTarget {
@@ -63,6 +99,7 @@ interface SessionRow {
   platform_id: string | null;
   folder: string;
   workgroup_id: string;
+  idle_since: string;
 }
 
 function git(cwd: string, args: string[]): string | null {
@@ -102,13 +139,22 @@ function safeDirectories(directory: string): string[] | null {
   }
 }
 
+function statMtimeMs(filePath: string): number | null {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
 function sessionInventory(): SessionRow[] | null {
   try {
     return getDb()
       .prepare(
         `SELECT s.id AS session_id, s.agent_group_id, s.status, s.thread_id,
                 s.messaging_group_id, mg.platform_id, ag.folder,
-                COALESCE(ag.workgroup_id, ag.folder) AS workgroup_id
+                COALESCE(ag.workgroup_id, ag.folder) AS workgroup_id,
+                COALESCE(s.last_active, s.created_at) AS idle_since
            FROM sessions s
            JOIN agent_groups ag ON ag.id = s.agent_group_id
            LEFT JOIN messaging_groups mg ON mg.id = s.messaging_group_id`,
@@ -143,6 +189,8 @@ function participantsByTopic(
         sessionId: row.session_id,
         agentGroupId: row.agent_group_id,
         status: row.status,
+        idleSince: row.idle_since,
+        inboundMtimeMs: statMtimeMs(inboundDbPath(row.agent_group_id, row.session_id)),
       });
       result.set(key, current);
     } catch (err) {
@@ -216,10 +264,28 @@ function discover(dataDir: string = DATA_DIR): DiscoveryResult {
   return { targets, filteredNames: [...filteredNames].sort(), unreadableRoots };
 }
 
-function participantHasPersistedWork(participant: TopicParticipant): boolean {
+function participantHasPersistedWork(participant: TopicParticipant, dataDir: string): boolean {
   // Session status is not proof that persisted work has completed. A
   // continuation, processing claim, or current tool can survive a transition
   // to inactive and must independently retain the shared topic worktree.
+  //
+  // Two-signal reclaim check, mirroring writeSessionMessageLocked exactly
+  // (session-manager.ts:857: sessionWasReclaimed && !existsSync(inboundDbPath)).
+  // Neither signal alone is proof. The journal line is written BEFORE the
+  // archiving->closed CAS (storage-manager.ts:1259 vs :1266-1269); on CAS loss
+  // the directory is deliberately kept, so journaled-but-CAS-lost is still
+  // live. And the session ROOT can be recreated by a late inbound write that
+  // loses the reclaim race — it acquires the storage lease (which mkdirs the
+  // root) and then writeSessionMessageLocked itself rejects it, leaving a
+  // real, non-empty root with no inbound.db inside. inbound.db absence is the
+  // answer that survives both: the reclaim removes the whole directory, and
+  // nothing recreates that specific file.
+  if (
+    sessionWasReclaimed(participant.sessionId, path.join(dataDir, 'v2-sessions')) &&
+    !fs.existsSync(inboundDbPath(participant.agentGroupId, participant.sessionId))
+  ) {
+    return false;
+  }
   try {
     const db = openOutboundDb(participant.agentGroupId, participant.sessionId);
     try {
@@ -237,14 +303,44 @@ function participantHasPersistedWork(participant: TopicParticipant): boolean {
   }
 }
 
-function topicIsBusy(participants: TopicParticipant[]): boolean {
+function topicIsBusy(participants: TopicParticipant[], dataDir: string): boolean {
   if (participants.length === 0) return true;
   return participants.some(
     (participant) =>
       isContainerRunning(participant.sessionId) ||
       isContainerSpawning(participant.sessionId) ||
-      participantHasPersistedWork(participant),
+      participantHasPersistedWork(participant, dataDir),
   );
+}
+
+/**
+ * Side (a): is topic ownership clear enough to consider collecting?
+ *
+ * Every owning row CLOSED, or no row at all, is the original predicate —
+ * byte-identical behavior. Otherwise (owner-approved 2026-08-29 widening):
+ * EVERY row, closed ones included, must be idle at least idleReclaimDays by
+ * coalesce(last_active, created_at). Closure alone no longer exempts a row
+ * once any sibling is open — a session closed only yesterday is evidence of
+ * recent topic activity, not proof the topic is quiet.
+ */
+function sideAClear(
+  participants: TopicParticipant[] | undefined,
+  idleReclaimDays: number,
+): { pass: boolean; viaIdle: boolean } {
+  if (!participants || participants.length === 0) return { pass: true, viaIdle: false };
+  if (participants.every((p) => p.status === 'closed')) return { pass: true, viaIdle: false };
+  // The idle path only ever reasons about steady states. `archiving` (mid
+  // reclaim CAS) or any other/NULL status is a transitional or unrecognized
+  // state the idle floor was never evaluated against — refuse outright
+  // rather than let it ride through on a sibling's idle time.
+  if (
+    idleReclaimDays > 0 &&
+    participants.every((p) => p.status === 'closed' || p.status === 'active') &&
+    participants.every((p) => daysSince(p.idleSince) >= idleReclaimDays)
+  ) {
+    return { pass: true, viaIdle: true };
+  }
+  return { pass: false, viaIdle: false };
 }
 
 function transferReferencesPath(
@@ -322,7 +418,7 @@ function branchMayBeRemoved(target: TopicWorktreeTarget): { eligible: boolean; r
 
 async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DIR): Promise<void> {
   const context = { workgroupId: target.workUnit.workgroupId, workUnit: target.workUnit.key, repo: target.repo };
-  if (topicIsBusy(target.participants)) return;
+  if (topicIsBusy(target.participants, dataDir)) return;
   if (transferReferencesPath(target, dataDir)) return;
 
   await withRepositoryLifecycleClaims([target.workUnit], () =>
@@ -330,7 +426,7 @@ async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DI
       target.workUnit.workgroupId,
       target.repo,
       () => {
-        if (topicIsBusy(target.participants) || transferReferencesPath(target, dataDir)) return;
+        if (topicIsBusy(target.participants, dataDir) || transferReferencesPath(target, dataDir)) return;
         if (!isLinkedToCanonical(target)) {
           log.warn('Worktree cleanup: refusing non-linked or mismatched checkout', context);
           return;
@@ -418,6 +514,8 @@ export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promis
 
 const GC_APPLY_ENV = 'NANOCLAW_STORAGE_GC';
 const TRASH_BIN = '/usr/bin/trash';
+/** Written into a quarantined topic so an interrupted pass can find its way home. */
+const QUARANTINE_META_FILE = '.gc-quarantine-meta.json';
 /** Scan depth below groups/<folder> for agent-created scratch clones. */
 const CLONE_SCAN_DEPTH = 4;
 /** Workgroup-root entries that are the repo store itself, never a clone. */
@@ -431,6 +529,13 @@ export interface GcCandidate {
   collect: boolean;
   reason: string;
   bytes: number;
+  /**
+   * Set only for an orphan-topic collected via the idle-threshold path
+   * (reason 'idle-and-clean'). Scan-time (sessionId, status, idleSince) for
+   * every owning participant — re-verified after the move, before the
+   * topic is handed to the real trash. See finalizeIdleCollection.
+   */
+  idleSnapshot?: Array<{ sessionId: string; status: string; idleSince: string; inboundMtimeMs: number | null }>;
 }
 
 export interface GcReport {
@@ -461,6 +566,21 @@ function gcMode(): 'dry-run' | 'apply' {
 }
 
 /**
+ * A `git worktree lock` marker on this checkout's admin dir. Codex review
+ * (PR #182, round 6, verified against Git 2.43): `worktree prune` exits 0 but
+ * leaves a locked entry's registration in place even once its path is gone —
+ * recreating it afterward fails with "missing but locked worktree". A lock is
+ * an agent explicitly saying "don't touch this", so it makes the checkout
+ * non-disposable regardless of git cleanliness — refuse at evaluation time,
+ * not buried in the later prune step. No-op for a plain clone (scope 'all'):
+ * only a linked worktree's git-dir has a `locked` file to find.
+ */
+function isWorktreeLocked(dir: string): boolean {
+  const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir']);
+  return gitDir !== null && fs.existsSync(path.join(gitDir, 'locked'));
+}
+
+/**
  * Positive proof that a checkout holds nothing worth keeping.
  *
  * `scope` is 'head' for a linked worktree (its branch is the only one it owns)
@@ -469,6 +589,8 @@ function gcMode(): 'dry-run' | 'apply' {
  * only resolvable inside a container — returns unprovable, never clean.
  */
 function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; reason: string } {
+  if (isWorktreeLocked(dir)) return { ok: false, reason: 'worktree-locked' };
+
   const status = git(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
   if (status === null) return { ok: false, reason: 'status-unprovable' };
   if (status !== '') return { ok: false, reason: 'dirty' };
@@ -605,6 +727,7 @@ function record(report: GcReport, candidate: GcCandidate): void {
 
 function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<string, TopicParticipant[]>): void {
   const topicsRoot = path.join(dataDir, 'v2-topics');
+  const idleReclaimDays = topicIdleReclaimDays();
   for (const workgroupId of safeDirectories(topicsRoot) ?? []) {
     const workgroupDir = path.join(topicsRoot, workgroupId);
     for (const topic of safeDirectories(workgroupDir) ?? []) {
@@ -613,15 +736,15 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         record(report, { category: 'orphan-topic', path: topicDir, collect: false, reason, bytes: 0 });
 
       const participants = owners.get(topicDir);
-      // Side (a): every owning session row is CLOSED, or there is no row at
-      // all. Status alone is not enough — a closed session can still hold a
-      // processing claim or a continuation, and `topicIsBusy` fails closed on
-      // anything it cannot read.
-      if (participants?.some((participant) => participant.status !== 'closed')) {
+      // Side (a) — see sideAClear. Status alone is not enough even once it
+      // passes: a closed session can still hold a processing claim or a
+      // continuation, and `topicIsBusy` fails closed on anything unreadable.
+      const { pass, viaIdle: collectedViaIdle } = sideAClear(participants, idleReclaimDays);
+      if (!pass) {
         skip('topic-open');
         continue;
       }
-      if (participants && topicIsBusy(participants)) {
+      if (participants && topicIsBusy(participants, dataDir)) {
         skip('topic-busy');
         continue;
       }
@@ -659,8 +782,16 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         category: 'orphan-topic',
         path: topicDir,
         collect: true,
-        reason: participants ? 'closed-and-clean' : 'orphaned-and-clean',
+        reason: collectedViaIdle ? 'idle-and-clean' : participants ? 'closed-and-clean' : 'orphaned-and-clean',
         bytes: dirSizeBytes(topicDir),
+        idleSnapshot: collectedViaIdle
+          ? participants!.map((p) => ({
+              sessionId: p.sessionId,
+              status: p.status,
+              idleSince: p.idleSince,
+              inboundMtimeMs: p.inboundMtimeMs,
+            }))
+          : undefined,
       });
     }
   }
@@ -767,13 +898,7 @@ function runningContainerMounts(): string[] | null {
   }
 }
 
-function overlapsAny(target: string, mounts: string[]): boolean {
-  let resolved = target;
-  try {
-    resolved = fs.realpathSync(target);
-  } catch {
-    return true; // A path we cannot resolve is a path we cannot clear.
-  }
+function pathOverlapsResolvedMounts(resolvedTarget: string, mounts: string[]): boolean {
   return mounts.some((mount) => {
     let source = mount;
     try {
@@ -783,9 +908,267 @@ function overlapsAny(target: string, mounts: string[]): boolean {
       // names the tree the container was given.
     }
     return (
-      source === resolved || source.startsWith(`${resolved}${path.sep}`) || resolved.startsWith(`${source}${path.sep}`)
+      source === resolvedTarget ||
+      source.startsWith(`${resolvedTarget}${path.sep}`) ||
+      resolvedTarget.startsWith(`${source}${path.sep}`)
     );
   });
+}
+
+function overlapsAny(target: string, mounts: string[]): boolean {
+  let resolved = target;
+  try {
+    resolved = fs.realpathSync(target);
+  } catch {
+    return true; // A path we cannot resolve is a path we cannot clear.
+  }
+  return pathOverlapsResolvedMounts(resolved, mounts);
+}
+
+/**
+ * Codex review finding on PR #182: a message can land, or a container spawn
+ * can land its bind mount, in the window between stillDisposable's pre-move
+ * recheck and the topic being fully trashed. Closed-path topics can't be
+ * re-routed to (the router only ever opens a NEW session for a new thread
+ * key), so this only matters for the idle-threshold path — an idle but
+ * ACTIVE session still receives inbound.
+ *
+ * inbound admission bumps last_active BEFORE any spawn ever mounts anything
+ * (session-manager.ts:911), so admission-before-the-move is always caught by
+ * the recheck below, and admission-after-the-move finds the directory gone
+ * and re-materializes a fresh checkout for the new message — nothing lost
+ * either way. The move (renaming the directory out of its live path) is the
+ * serialization point this relies on.
+ *
+ * `trash-cli`'s own restore (`trash-restore`) is interactive-only — it
+ * prompts on stdin and picks by a list index, not scriptable for "restore
+ * this exact item" (confirmed via `man trash-restore`). So the actual delete
+ * is staged: rename into a same-filesystem quarantine dir first (an ordinary,
+ * instantly-reversible rename), recheck, and only THEN hand the quarantined
+ * copy to the real `trash` for its 30-day retention.
+ */
+/**
+ * Roll a quarantined topic back toward its original path, repo by repo.
+ *
+ * Precondition: every topic reaching finalizeIdleCollection already passed
+ * provenDisposable (clean, pushed, no stash) at scan time. So no interleaving
+ * here can ever lose unrecoverable work — the only harms left are STUCK
+ * STATES (a dangling canonical-repo registration, or a wedged create_worktree
+ * on an empty root). Every branch below is designed to end in a state the
+ * next spawn can build from.
+ *
+ * Naive whole-topic rename-back isn't safe: the spawn path does
+ * `mkdirSync(<topic>/worktrees, {recursive:true})` (container-runner.ts:1746)
+ * on its own, so a live container can already have recreated the destination
+ * by the time we get here, and a bare rename would EEXIST. Reconcile per repo
+ * instead: if the destination slot is absent, rename that repo back in place
+ * (its registration is still valid there, so the checkout works immediately).
+ * If the destination is already occupied (the agent beat us to it), keep the
+ * live copy and trash the quarantined one — safe per the precondition above.
+ * If anything couldn't be put back valid, prune every repo's canonical
+ * registration afterward so nothing dangles against a missing path (pruning
+ * a repo that WAS restored cleanly is a harmless no-op — its path exists).
+ */
+function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dataDir: string): void {
+  // Never let the recovery marker itself land back inside a restored topic.
+  try {
+    fs.rmSync(path.join(quarantinePath, QUARANTINE_META_FILE), { force: true });
+  } catch {
+    // Best-effort — a leftover marker is a leak, not a correctness issue.
+  }
+  const repos = (safeDirectories(path.join(quarantinePath, 'worktrees')) ?? []).filter(isRepositoryName);
+  let stranded = repos.length === 0 && fs.existsSync(quarantinePath); // no per-repo split known — see fallback below
+
+  if (repos.length > 0) {
+    const destWorktrees = path.join(candidate.path, 'worktrees');
+    fs.mkdirSync(destWorktrees, { recursive: true });
+    for (const repo of repos) {
+      const from = path.join(quarantinePath, 'worktrees', repo);
+      const to = path.join(destWorktrees, repo);
+      if (fs.existsSync(to)) {
+        log.warn('Storage GC: idle-topic rollback found the destination already recreated; keeping the live copy', {
+          repo,
+          to,
+        });
+        stranded = true;
+        // A locked copy restores, never trashes — leave it in quarantine
+        // rather than destroy something explicitly marked "don't touch".
+        if (isWorktreeLocked(from)) {
+          log.warn('Storage GC: superseded quarantine repo copy is locked; leaving it in quarantine, not trashing', {
+            repo,
+            from,
+          });
+        } else {
+          try {
+            trashPath(from);
+          } catch (err) {
+            log.error('Storage GC: could not trash a superseded quarantine repo copy', { repo, from, err });
+          }
+        }
+        continue;
+      }
+      try {
+        fs.renameSync(from, to);
+      } catch (err) {
+        log.error('Storage GC: idle-topic rollback rename failed for one repo; trashing that copy instead', {
+          repo,
+          from,
+          to,
+          err,
+        });
+        stranded = true;
+        try {
+          trashPath(from);
+        } catch (trashErr) {
+          log.error('Storage GC: could not even trash the stranded quarantine repo copy', {
+            repo,
+            from,
+            err: trashErr,
+          });
+        }
+      }
+    }
+    // Best-effort tidy of the now-empty quarantine entry; a leftover here is
+    // harmless (next reclaim pass or tmpfiles.d cleans it up regardless).
+    try {
+      fs.rmdirSync(path.join(quarantinePath, 'worktrees'));
+      fs.rmdirSync(quarantinePath);
+    } catch {
+      // Non-empty (a repo copy got stranded above) or already gone — fine.
+    }
+  } else if (fs.existsSync(quarantinePath)) {
+    // No repo split to reconcile — fall back to a whole-topic restore.
+    try {
+      fs.renameSync(quarantinePath, candidate.path);
+      stranded = false;
+    } catch (err) {
+      log.error('Storage GC: idle-topic rollback rename failed; trashing the quarantined copy instead', {
+        quarantinePath,
+        original: candidate.path,
+        err,
+      });
+      try {
+        trashPath(quarantinePath);
+      } catch (trashErr) {
+        log.error('Storage GC: could not even trash the stranded quarantine copy', { quarantinePath, err: trashErr });
+      }
+    }
+  }
+
+  if (stranded) {
+    const workgroupId = path.basename(path.dirname(candidate.path));
+    for (const repo of safeDirectories(path.join(candidate.path, 'worktrees')) ?? []) {
+      if (!isRepositoryName(repo)) continue;
+      if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
+        log.warn('Storage GC: git worktree prune failed after idle-topic rollback; may need a manual prune', {
+          workgroupId,
+          repo,
+        });
+      }
+    }
+  }
+}
+
+/** True if b is later than a — null on either side is never "later" than a real time. */
+function laterThan(a: number | null, b: number | null): boolean {
+  if (b === null) return false;
+  if (a === null) return true;
+  return b > a;
+}
+
+function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
+  const snapshot = candidate.idleSnapshot!;
+  const resolvedOriginal = fs.realpathSync(candidate.path);
+  const quarantineRoot = path.join(dataDir, '.gc-quarantine');
+  const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
+  fs.mkdirSync(quarantineRoot, { recursive: true });
+  fs.renameSync(candidate.path, quarantinePath);
+  // Crash recovery (Codex P2, round 5): if the process dies before this
+  // function reaches restore or trash, this is the only record of where the
+  // topic came from. recoverOrphanedQuarantine reads it at the next pass.
+  try {
+    fs.writeFileSync(path.join(quarantinePath, QUARANTINE_META_FILE), JSON.stringify({ originalPath: candidate.path }));
+  } catch (err) {
+    log.warn('Storage GC: could not write quarantine recovery metadata', { quarantinePath, err });
+  }
+
+  // Codex P1 (round 5): sessionInventory failing here is not evidence the
+  // topic is quiet — participantsByTopic collapses a DB failure into an empty
+  // map, indistinguishable from "genuinely no participants" unless checked
+  // directly first. Same principle participantsByTopic's own doc comment
+  // already states: a failed inventory preserves, never deletes.
+  if (sessionInventory() === null) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-recheck-unavailable' };
+  }
+
+  const before = new Map(snapshot.map((p) => [p.sessionId, p]));
+  const owner = participantsByTopic(dataDir).get(candidate.path);
+  const activityAdvanced = (owner?.participants ?? []).some((p) => {
+    const prior = before.get(p.sessionId);
+    // Codex P1 (round 4): status/idleSince lag the real admission event —
+    // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
+    // it updates last_active (session-manager.ts:892-911), two separate
+    // writes. Fence on the durable write itself instead of its lagging
+    // index: inbound.db's mtime moves at the insert, not after. A file that
+    // appeared, or whose mtime moved forward, or that stopped being statable
+    // where it previously was — all count as new activity. Nothing durable
+    // happens after this file changes, so there is no remaining window.
+    const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
+    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved;
+  });
+  if (activityAdvanced) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-late-activity' };
+  }
+
+  const freshMounts = runningContainerMounts();
+  if (freshMounts === null || pathOverlapsResolvedMounts(resolvedOriginal, freshMounts)) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-late-activity' };
+  }
+
+  // Genuinely clear — capture the repo list before trashing (quarantinePath
+  // won't exist to list afterward), then commit the delete FIRST. Prune runs
+  // only once that succeeds (Codex P2): a trash failure below leaves every
+  // canonical registration untouched, so the restored checkout stays usable.
+  const repoListing = safeDirectories(path.join(quarantinePath, 'worktrees'));
+  if (repoListing === null) {
+    // A real read failure (EACCES/EIO), not "no worktrees" — treating it as
+    // empty would prune nothing yet still trash the topic. Leave the entry in
+    // quarantine untouched: recoverOrphanedQuarantine retries it next pass,
+    // which is the safe default the quarantine design already gives for free.
+    log.error('Storage GC: could not read the quarantined topic worktrees; leaving it in quarantine to retry', {
+      quarantinePath,
+    });
+    return { ok: false, reason: 'quarantine-unreadable' };
+  }
+  const repos = repoListing.filter(isRepositoryName);
+  try {
+    trashPath(quarantinePath);
+  } catch (err) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    throw err;
+  }
+
+  // Deregister each repo's linked worktree from its CANONICAL repo, so a
+  // resumed thread's later create_worktree doesn't hit git's "already
+  // checked out at <missing-path>" error against a stale registration. Safe
+  // unconditionally: container-runner.ts's mount comment documents that
+  // topic worktree registrations always use exact host paths on both sides
+  // (no container-relative back-pointer can land in them), so `worktree
+  // prune` only ever removes entries whose path is genuinely gone — which,
+  // for this repo, is now true.
+  const workgroupId = path.basename(path.dirname(candidate.path));
+  for (const repo of repos) {
+    if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
+      log.warn('Storage GC: git worktree prune failed after idle collection; may need a manual prune', {
+        workgroupId,
+        repo,
+      });
+    }
+  }
+  return { ok: true };
 }
 
 /**
@@ -810,11 +1193,91 @@ function stillDisposable(candidate: GcCandidate, dataDir: string, mounts: string
     return { ok: true, reason: 'recheck-clear' };
   }
   const owner = participantsByTopic(dataDir).get(candidate.path);
-  if (owner?.participants.some((participant) => participant.status !== 'closed')) {
+  if (!sideAClear(owner?.participants, topicIdleReclaimDays()).pass) {
     return { ok: false, reason: 'recheck-topic-open' };
   }
-  if (owner && topicIsBusy(owner.participants)) return { ok: false, reason: 'recheck-topic-busy' };
+  if (owner && topicIsBusy(owner.participants, dataDir)) return { ok: false, reason: 'recheck-topic-busy' };
   return { ok: true, reason: 'recheck-clear' };
+}
+
+/**
+ * Codex P2 (round 5): if the process dies between the quarantine rename and
+ * either restore or trash, the topic is stuck under .gc-quarantine forever —
+ * collectOrphanTopics only ever walks v2-topics. Run once at the start of
+ * every apply pass. prune only ever runs post-trash now, so any entry found
+ * here is still in the pre-trash state: either restorable outright, or (if a
+ * spawn recreated the destination while we were down) reconcilable exactly
+ * like a live rollback.
+ */
+function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
+  const quarantineRoot = path.join(dataDir, '.gc-quarantine');
+  for (const entry of safeDirectories(quarantineRoot) ?? []) {
+    const quarantinePath = path.join(quarantineRoot, entry);
+    let originalPath: string;
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(quarantinePath, QUARANTINE_META_FILE), 'utf8')) as {
+        originalPath: string;
+      };
+      originalPath = meta.originalPath;
+    } catch (err) {
+      log.error('Storage GC: orphaned quarantine entry has no readable recovery metadata; leaving it as-is', {
+        quarantinePath,
+        err,
+      });
+      continue;
+    }
+    const placeholder: GcCandidate = {
+      category: 'orphan-topic',
+      path: originalPath,
+      collect: false,
+      reason: '',
+      bytes: 0,
+    };
+    if (fs.existsSync(originalPath)) {
+      // A spawn recreated the destination while the process was down —
+      // reconcile exactly like a live rollback (per-repo, conditional prune).
+      reconcileQuarantine(placeholder, quarantinePath, dataDir);
+      log.warn('Storage GC: reconciled an orphaned quarantine entry after an interrupted pass', {
+        originalPath,
+        quarantinePath,
+      });
+      record(report, {
+        category: 'orphan-topic',
+        path: originalPath,
+        collect: false,
+        reason: 'quarantine-reconciled',
+        bytes: 0,
+      });
+      continue;
+    }
+    try {
+      fs.rmSync(path.join(quarantinePath, QUARANTINE_META_FILE), { force: true });
+      fs.renameSync(quarantinePath, originalPath);
+      log.warn('Storage GC: restored an orphaned quarantine entry after an interrupted pass', {
+        originalPath,
+        quarantinePath,
+      });
+      record(report, {
+        category: 'orphan-topic',
+        path: originalPath,
+        collect: false,
+        reason: 'quarantine-recovered',
+        bytes: 0,
+      });
+    } catch (err) {
+      log.error('Storage GC: could not restore an orphaned quarantine entry; leaving it in quarantine', {
+        originalPath,
+        quarantinePath,
+        err,
+      });
+    }
+  }
+  try {
+    fs.rmdirSync(quarantineRoot); // only succeeds once genuinely empty
+  } catch {
+    // Non-empty (something is still stranded, already logged above) or
+    // never existed — either way, nothing further to do here.
+  }
 }
 
 export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string = GROUPS_DIR): GcReport {
@@ -829,6 +1292,7 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
   }
 
   const report = emptyReport(mode, true);
+  if (mode === 'apply') recoverOrphanedQuarantine(dataDir, report);
   const owners = new Map([...participantsByTopic(dataDir)].map(([key, value]) => [key, value.participants] as const));
   collectOrphanTopics(report, dataDir, owners);
   collectClones(report, dataDir, groupsDir, liveScopes(rows), boundGitDirs(dataDir));
@@ -856,7 +1320,15 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
           continue;
         }
         try {
-          trashPath(candidate.path);
+          if (candidate.idleSnapshot) {
+            const finalized = finalizeIdleCollection(candidate, dataDir);
+            if (!finalized.ok) {
+              demote(candidate, finalized.reason!);
+              continue;
+            }
+          } else {
+            trashPath(candidate.path);
+          }
           log.info('Storage GC: collected', { path: candidate.path, category: candidate.category });
         } catch (error) {
           demote(candidate, 'trash-failed');

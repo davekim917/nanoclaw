@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
   dockerBin: '/bin/true',
   rowsPerCall: null as Array<Array<Record<string, string | null>>> | null,
   call: 0,
+  failAtCall: null as number | null,
 }));
 
 vi.mock('./config.js', () => ({
@@ -39,10 +40,13 @@ vi.mock('./db/connection.js', () => ({
     prepare: () => ({
       all: () => {
         if (state.inventoryFails) throw new Error('database unavailable');
+        const thisCall = state.call;
+        state.call += 1;
+        if (state.failAtCall !== null && thisCall === state.failAtCall) {
+          throw new Error('database unavailable for this call only');
+        }
         if (state.rowsPerCall) {
-          const index = Math.min(state.call, state.rowsPerCall.length - 1);
-          state.call += 1;
-          return state.rowsPerCall[index];
+          return state.rowsPerCall[Math.min(thisCall, state.rowsPerCall.length - 1)];
         }
         return state.rows;
       },
@@ -107,7 +111,8 @@ function workUnit(threadId: string) {
   });
 }
 
-function sessionRow(threadId: string, folder = 'folder-a', status = 'closed') {
+/** idleDays: how long ago (last_active, created_at) was — omit for "just now". */
+function sessionRow(threadId: string, folder = 'folder-a', status = 'closed', idleDays = 0) {
   return {
     session_id: `s-${threadId}`,
     agent_group_id: `ag-${threadId}`,
@@ -117,23 +122,34 @@ function sessionRow(threadId: string, folder = 'folder-a', status = 'closed') {
     platform_id: 'slack:C1',
     folder,
     workgroup_id: WG,
+    idle_since: new Date(Date.now() - idleDays * 86_400_000).toISOString(),
   };
 }
 
 /** A topic directory holding one linked worktree of a canonical clone. */
-function topicFixture(threadId: string, repo = 'repo-a'): { topicDir: string; worktree: string } {
-  const remote = makeRemote(`${repo}-${threadId}`);
-  const canonical = path.join(state.dataDir, 'repositories', WG, `${repo}-${threadId}`);
+function topicFixture(
+  threadId: string,
+  repo = 'repo-a',
+): { topicDir: string; worktree: string; canonical: string; branch: string } {
+  // Suffixed with threadId so multiple topicFixture() calls in one test (each
+  // defaulting to repo='repo-a') get distinct canonical repos. The worktree
+  // subdirectory name must match this exactly — production code (discover(),
+  // and the GC's post-collection worktree-prune step) resolves a topic's
+  // canonical repo FROM that subdirectory name via canonicalRepoDir.
+  const repoDirName = `${repo}-${threadId}`;
+  const remote = makeRemote(repoDirName);
+  const canonical = path.join(state.dataDir, 'repositories', WG, repoDirName);
   fs.mkdirSync(path.dirname(canonical), { recursive: true });
   execFileSync('git', ['clone', '-q', remote, canonical]);
   git(canonical, ['remote', 'set-head', 'origin', '--auto']);
 
   const topicDir = topicStateDir(workUnit(threadId), state.dataDir);
-  const worktree = path.join(topicDir, 'worktrees', repo);
+  const worktree = path.join(topicDir, 'worktrees', repoDirName);
   fs.mkdirSync(path.dirname(worktree), { recursive: true });
-  git(canonical, ['worktree', 'add', '-q', '-b', `topic-${threadId}`, worktree, 'origin/HEAD']);
+  const branch = `topic-${threadId}`;
+  git(canonical, ['worktree', 'add', '-q', '-b', branch, worktree, 'origin/HEAD']);
   fs.utimesSync(topicDir, OLD, OLD);
-  return { topicDir, worktree };
+  return { topicDir, worktree, canonical, branch };
 }
 
 /** A standalone clone (real .git DIRECTORY) at an arbitrary depth under groups/. */
@@ -178,12 +194,15 @@ beforeEach(() => {
   state.dockerBin = '/bin/true';
   state.rowsPerCall = null;
   state.call = 0;
+  state.failAtCall = null;
   delete process.env.NANOCLAW_STORAGE_GC;
+  delete process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS;
 });
 
 afterEach(() => {
   fs.rmSync(path.dirname(state.dataDir), { recursive: true, force: true });
   delete process.env.NANOCLAW_STORAGE_GC;
+  delete process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS;
 });
 
 describe('storage GC — evidence', () => {
@@ -291,6 +310,89 @@ describe('storage GC — the predicate refuses', () => {
     const report = runStorageGcOnce(state.dataDir, state.groupsDir);
     expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'recent' });
   });
+
+  it('round 6 P2: refuses a topic whose linked worktree is LOCKED', () => {
+    const { topicDir, worktree, canonical } = topicFixture('thread-locked');
+    git(canonical, ['worktree', 'lock', worktree]);
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'worktree-locked' });
+  });
+});
+
+describe('storage GC — idle-threshold reclaim (owner-approved side-a widening)', () => {
+  it('collects an OPEN topic whose sole owning session has been idle past the threshold', () => {
+    const { topicDir } = topicFixture('thread-idle-20');
+    state.rows = [sessionRow('thread-idle-20', 'folder-a', 'active', 20)];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: true, reason: 'idle-and-clean' });
+  });
+
+  it('refuses an OPEN topic whose session has not been idle long enough', () => {
+    const { topicDir } = topicFixture('thread-idle-10');
+    state.rows = [sessionRow('thread-idle-10', 'folder-a', 'active', 10)];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+  });
+
+  it('still refuses a DIRTY checkout even once the idle threshold is met', () => {
+    const { topicDir, worktree } = topicFixture('thread-idle-dirty');
+    fs.writeFileSync(path.join(worktree, 'uncommitted.txt'), 'wip');
+    state.rows = [sessionRow('thread-idle-dirty', 'folder-a', 'active', 20)];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'dirty' });
+  });
+
+  it('refuses when ANY owning OPEN session is under the idle threshold', () => {
+    const { topicDir } = topicFixture('thread-idle-mixed');
+    const stale = sessionRow('thread-idle-mixed', 'folder-a', 'active', 20);
+    // A second sibling session on the SAME topic (own row), too fresh.
+    const fresh = sessionRow('thread-idle-mixed-2', 'folder-a', 'active', 2);
+    fresh.thread_id = 'thread-idle-mixed';
+    state.rows = [stale, fresh];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+  });
+
+  it('refuses when a CLOSED sibling was itself only recently closed', () => {
+    // Quantifier: once ANY participant is open, EVERY participant — closed
+    // ones included — must clear the idle floor. A sibling closed yesterday
+    // is evidence of recent topic activity, not proof the topic is quiet.
+    const { topicDir } = topicFixture('thread-idle-closed-recent');
+    const open = sessionRow('thread-idle-closed-recent', 'folder-a', 'active', 20);
+    const closedRecent = sessionRow('thread-idle-closed-recent-2', 'folder-a', 'closed', 1);
+    closedRecent.thread_id = 'thread-idle-closed-recent';
+    state.rows = [open, closedRecent];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+  });
+
+  it('refuses an idle ARCHIVING (transitional-status) participant via the idle path', () => {
+    // archiving is a real mid-reclaim-CAS status, not a steady closed/active
+    // state the idle floor was ever meant to reason about.
+    const { topicDir } = topicFixture('thread-idle-archiving');
+    state.rows = [sessionRow('thread-idle-archiving', 'folder-a', 'archiving', 20)];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+  });
+
+  it('NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS=0 disables the idle path (old behavior)', () => {
+    process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS = '0';
+    const { topicDir } = topicFixture('thread-idle-disabled');
+    state.rows = [sessionRow('thread-idle-disabled', 'folder-a', 'active', 100)];
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+  });
+
+  it.each(['abc', '1e2', '-1', '0.5', 'NaN', ''])(
+    'treats an invalid knob value (%s) as DISABLED, never as the default',
+    (bad) => {
+      process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS = bad;
+      const { topicDir } = topicFixture(`thread-idle-badknob-${bad}`);
+      state.rows = [sessionRow(`thread-idle-badknob-${bad}`, 'folder-a', 'active', 100)];
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'topic-open' });
+    },
+  );
 });
 
 describe('storage GC — clones', () => {
@@ -395,6 +497,290 @@ describe('storage GC — apply mode', () => {
     const report = runStorageGcOnce(state.dataDir, state.groupsDir);
     expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'recheck-topic-open' });
     expect(fs.existsSync(topicDir)).toBe(true);
+  });
+
+  it.skipIf(!hasTrash)('actually trashes an idle-qualified OPEN topic', () => {
+    const { topicDir } = topicFixture('thread-idle-apply');
+    state.rows = [sessionRow('thread-idle-apply', 'folder-a', 'active', 20)];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: true, reason: 'idle-and-clean' });
+    expect(fs.existsSync(topicDir)).toBe(false);
+  });
+
+  it.skipIf(!hasTrash)('deregisters the linked worktree so a resumed thread can recreate it — Codex #3', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-resume');
+    state.rows = [sessionRow('thread-idle-resume', 'folder-a', 'active', 20)];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: true, reason: 'idle-and-clean' });
+    expect(fs.existsSync(topicDir)).toBe(false);
+    // The canonical repo no longer lists the collected worktree...
+    expect(git(canonical, ['worktree', 'list'])).not.toContain(branch);
+    // ...so a resumed thread's create_worktree (same branch, fresh path) works.
+    expect(() => git(canonical, ['worktree', 'add', '-q', worktree, branch])).not.toThrow();
+  });
+
+  it.skipIf(!hasTrash)('demotes an idle-qualified topic whose session went active again by recheck time', () => {
+    const { topicDir } = topicFixture('thread-idle-recheck');
+    // Same 3-call shape as the reopen test above: scan sees idle 20d (qualifies
+    // and gets scheduled), pre-trash recheck sees idle only 10d (fails the
+    // floor again) — proves stillDisposable re-evaluates the idle path fresh
+    // rather than trusting the scan-time verdict.
+    state.rowsPerCall = [
+      [sessionRow('thread-idle-recheck', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-recheck', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-recheck', 'folder-a', 'active', 10)],
+    ];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'recheck-topic-open' });
+    expect(fs.existsSync(topicDir)).toBe(true);
+  });
+
+  it.skipIf(!hasTrash)(
+    'restores an idle-qualified topic when activity advances after the pre-move recheck already passed',
+    () => {
+      // 5 calls per topic candidate in apply mode: (1) initial inventory,
+      // (2) scan-time owners map (idleSnapshot captured here, idle 20d),
+      // (3) stillDisposable's OWN sessionInventory() (clone-branch liveScopes,
+      // unused here but still fetched), (4) stillDisposable's
+      // participantsByTopic pre-move recheck (still idle 20d, passes), (5)
+      // finalizeIdleCollection's OWN post-move recheck — this is the one
+      // Codex's review added, and only it sees the late activity (idle 1d).
+      const { topicDir, canonical, branch } = topicFixture('thread-idle-latemove');
+      state.rowsPerCall = [
+        [sessionRow('thread-idle-latemove', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-latemove', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-latemove', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-latemove', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-latemove', 'folder-a', 'active', 1)],
+      ];
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+      expect(fs.existsSync(topicDir)).toBe(true);
+      // A rollback must never touch the canonical repo's worktree registration.
+      expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+    },
+  );
+
+  it.skipIf(!hasTrash)(
+    'round 5 P1: fails closed and restores when the post-move inventory check is unavailable',
+    () => {
+      const { topicDir, canonical, branch } = topicFixture('thread-idle-inventoryfail');
+      state.rows = [sessionRow('thread-idle-inventoryfail', 'folder-a', 'active', 20)];
+      // Call 4 (0-indexed) is finalizeIdleCollection's OWN direct
+      // sessionInventory() check — everything before it (initial inventory,
+      // owners map, stillDisposable's own inventory + participant recheck)
+      // must still succeed for the topic to reach this point at all.
+      state.failAtCall = 4;
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-recheck-unavailable' });
+      expect(fs.existsSync(topicDir)).toBe(true);
+      expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+    },
+  );
+
+  it.skipIf(!hasTrash)("round 5 P1: aborts when inbound.db's durable write moved after the scan snapshot", () => {
+    const { topicDir, canonical, branch } = topicFixture('thread-idle-inboundmoved');
+    state.rows = [sessionRow('thread-idle-inboundmoved', 'folder-a', 'active', 20)];
+    const inboundPath = path.join(
+      state.dataDir,
+      'v2-sessions',
+      'ag-thread-idle-inboundmoved',
+      's-thread-idle-inboundmoved',
+      'inbound.db',
+    );
+    fs.mkdirSync(path.dirname(inboundPath), { recursive: true });
+    fs.writeFileSync(inboundPath, '');
+    const old = new Date(Date.now() - 20 * 86_400_000);
+    fs.utimesSync(inboundPath, old, old);
+    // Simulate a message landing (bumping inbound.db's mtime, the durable
+    // write) in the gap right after the scan snapshot — same synchronous
+    // point the earlier rollback tests use to inject a mid-flight race.
+    const realRename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from as fs.PathLike, to as fs.PathLike);
+      const now = new Date();
+      fs.utimesSync(inboundPath, now, now);
+    });
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    vi.restoreAllMocks();
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    expect(fs.existsSync(topicDir)).toBe(true);
+    expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+  });
+
+  it.skipIf(!hasTrash)('round 5 P2: recovers a topic orphaned in quarantine by a prior interrupted pass', () => {
+    const { topicDir } = topicFixture('thread-idle-orphanquarantine');
+    const quarantinePath = path.join(state.dataDir, '.gc-quarantine', 'orphan-1');
+    fs.mkdirSync(quarantinePath, { recursive: true });
+    fs.cpSync(topicDir, quarantinePath, { recursive: true });
+    fs.rmSync(topicDir, { recursive: true, force: true });
+    fs.writeFileSync(path.join(quarantinePath, '.gc-quarantine-meta.json'), JSON.stringify({ originalPath: topicDir }));
+    state.rows = [];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'quarantine-recovered' });
+    expect(fs.existsSync(topicDir)).toBe(true);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine'))).toBe(false);
+  });
+
+  it.skipIf(!hasTrash)('round 5 P2: reconciles an orphaned quarantine entry whose destination was recreated', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-orphanreconcile');
+    const quarantinePath = path.join(state.dataDir, '.gc-quarantine', 'orphan-2');
+    fs.mkdirSync(quarantinePath, { recursive: true });
+    fs.cpSync(topicDir, quarantinePath, { recursive: true });
+    fs.rmSync(topicDir, { recursive: true, force: true });
+    fs.writeFileSync(path.join(quarantinePath, '.gc-quarantine-meta.json'), JSON.stringify({ originalPath: topicDir }));
+    // The destination exists again — a spawn recreated this repo's slot
+    // while the process was down.
+    fs.mkdirSync(worktree, { recursive: true });
+    state.rows = [];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'quarantine-reconciled' });
+    expect(fs.existsSync(worktree)).toBe(true);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine'))).toBe(false);
+    expect(git(canonical, ['worktree', 'list'])).not.toContain(branch);
+    expect(() => git(canonical, ['worktree', 'add', '-q', `${worktree}-2`, branch])).not.toThrow();
+  });
+
+  it.skipIf(!hasTrash)('round 6 P1: leaves the entry in quarantine when its worktrees listing is unreadable', () => {
+    const { topicDir, canonical, branch } = topicFixture('thread-idle-unreadable');
+    state.rows = [sessionRow('thread-idle-unreadable', 'folder-a', 'active', 20)];
+    const realRename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from as fs.PathLike, to as fs.PathLike);
+      fs.chmodSync(path.join(to as string, 'worktrees'), 0o000); // EACCES-shaped
+    });
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    let report: GcReport;
+    try {
+      report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    } finally {
+      vi.restoreAllMocks();
+    }
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'quarantine-unreadable' });
+    expect(fs.existsSync(topicDir)).toBe(false); // untouched, not restored — still in quarantine
+    expect(git(canonical, ['worktree', 'list'])).toContain(branch); // never pruned
+    // Restore permissions so afterEach's rmSync can actually clean up.
+    const quarantineRoot = path.join(state.dataDir, '.gc-quarantine');
+    for (const entry of fs.readdirSync(quarantineRoot)) {
+      fs.chmodSync(path.join(quarantineRoot, entry, 'worktrees'), 0o755);
+    }
+  });
+
+  it.skipIf(!hasTrash)('round 6 P2: a locked quarantined repo copy is left in quarantine, never trashed', () => {
+    const { topicDir, worktree, canonical } = topicFixture('thread-idle-orphanlocked');
+    git(canonical, ['worktree', 'lock', worktree]);
+    const quarantinePath = path.join(state.dataDir, '.gc-quarantine', 'orphan-locked');
+    fs.mkdirSync(quarantinePath, { recursive: true });
+    fs.cpSync(topicDir, quarantinePath, { recursive: true });
+    fs.rmSync(topicDir, { recursive: true, force: true });
+    fs.writeFileSync(path.join(quarantinePath, '.gc-quarantine-meta.json'), JSON.stringify({ originalPath: topicDir }));
+    // Destination recreated -> the "keep the live copy" reconcile branch.
+    fs.mkdirSync(worktree, { recursive: true });
+    state.rows = [];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'quarantine-reconciled' });
+    // Never trashed — the locked copy is still sitting in quarantine, unresolved.
+    expect(fs.existsSync(path.join(quarantinePath, 'worktrees', path.basename(worktree)))).toBe(true);
+  });
+
+  it.skipIf(!hasTrash)('P2: a trash failure restores intact and runs no prune — the checkout stays usable', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-trashfail');
+    state.rows = [sessionRow('thread-idle-trashfail', 'folder-a', 'active', 20)];
+    // Block trash-cli's own trash dir (a FILE where it wants a directory)
+    // so the real `/usr/bin/trash` call fails deterministically — confirmed
+    // this makes trash-put exit 74 rather than silently falling back.
+    const blockedXdg = path.join(path.dirname(state.dataDir), 'blocked-xdg-data-home');
+    fs.writeFileSync(blockedXdg, '');
+    const savedXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = blockedXdg;
+    try {
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'trash-failed' });
+      expect(fs.existsSync(topicDir)).toBe(true);
+      // Registration untouched — prune must not have run.
+      expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+      // The restored checkout is actually usable.
+      expect(() => git(worktree, ['rev-parse', 'HEAD'])).not.toThrow();
+    } finally {
+      if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = savedXdg;
+    }
+  });
+
+  it.skipIf(!hasTrash)('P1: rollback tolerates the spawn path recreating just the worktrees root', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-rootrecreated');
+    state.rowsPerCall = [
+      [sessionRow('thread-idle-rootrecreated', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-rootrecreated', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-rootrecreated', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-rootrecreated', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-rootrecreated', 'folder-a', 'active', 1)],
+    ];
+    const realRename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from as fs.PathLike, to as fs.PathLike);
+      // container-runner.ts:1746's own mkdirSync(<topic>/worktrees, {recursive:true}) —
+      // the root exists again, but this repo's slot inside it does not yet.
+      fs.mkdirSync(path.join(topicDir, 'worktrees'), { recursive: true });
+    });
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    vi.restoreAllMocks();
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    // The destination slot was free — per-repo rename landed normally, no
+    // stranding, so registrations stayed valid and nothing got pruned.
+    expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+    expect(() => git(worktree, ['rev-parse', 'HEAD'])).not.toThrow();
+  });
+
+  it.skipIf(!hasTrash)(
+    'P1: destination slot already occupied — keeps the live copy and prunes so the branch is free again',
+    () => {
+      const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-slotoccupied');
+      state.rowsPerCall = [
+        [sessionRow('thread-idle-slotoccupied', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-slotoccupied', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-slotoccupied', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-slotoccupied', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-slotoccupied', 'folder-a', 'active', 1)],
+      ];
+      const realRename = fs.renameSync.bind(fs);
+      vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+        realRename(from as fs.PathLike, to as fs.PathLike);
+        // The agent fully recreated this repo's worktree slot before rollback ran.
+        fs.mkdirSync(worktree, { recursive: true });
+      });
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      vi.restoreAllMocks();
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+      // The live (recreated) copy was kept in place, not clobbered.
+      expect(fs.existsSync(worktree)).toBe(true);
+      // Its dangling registration was pruned, so the branch is free for a
+      // fresh checkout elsewhere.
+      expect(git(canonical, ['worktree', 'list'])).not.toContain(branch);
+      expect(() => git(canonical, ['worktree', 'add', '-q', `${worktree}-2`, branch])).not.toThrow();
+    },
+  );
+
+  it.skipIf(!hasTrash)('trashes a CLOSED-path topic directly, untouched by the idle rollback logic', () => {
+    const { topicDir } = topicFixture('thread-closed-apply');
+    state.rows = [sessionRow('thread-closed-apply', 'folder-a', 'closed')];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: true, reason: 'closed-and-clean' });
+    expect(fs.existsSync(topicDir)).toBe(false);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine'))).toBe(false);
   });
 
   it.skipIf(!hasTrash)('removes only what the predicate cleared', () => {
