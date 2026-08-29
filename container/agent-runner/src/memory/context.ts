@@ -26,11 +26,14 @@ const DEFINITION_TEMPLATE = path.join(
  * per-agent like upstream's, so inlining the live file would let one sibling
  * write into every other sibling's system instructions.
  *
- * Canonical memory bytes — `index.md`, topic files, preferences, the ledger —
- * are selected by the host and enter each admissible turn through the
- * formatter's collision-safe untrusted recall field. The rest of the live
- * `definition.md` reaches agents through that same lane. This lifecycle seam
- * must never read or promote workgroup bytes into system instructions.
+ * Canonical memory bytes — `index.md` at a fresh context boundary, the
+ * sender-matched `preferences/` files, and the curator's fact ledger — are
+ * selected by the host and enter the turn through the formatter's
+ * collision-safe untrusted recall field. Topic files are not among them and
+ * neither is the rest of the live `definition.md`: since the ranked Markdown
+ * lane was deleted, agents reach both by reading the tree themselves. This
+ * lifecycle seam must never read or promote workgroup bytes into system
+ * instructions.
  */
 export function renderMemorySection(_baseDir?: string): string {
   return [

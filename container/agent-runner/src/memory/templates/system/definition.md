@@ -30,9 +30,9 @@ first, then use `write_memory_file` for its Markdown files and `index.md`. The
 tool rejects a missing or symlinked parent.
 
 Only the portable file contract below and two paths are fixed:
-`memory/index.md` and this file at `memory/system/definition.md`. You may improve
-the folders, prose organization, and other guidance when a different shape
-would remember or retrieve better.
+`memory/index.md` and this file at `memory/system/definition.md`. The folders,
+prose organization, and other guidance are yours to reshape if a different
+shape would remember or retrieve better.
 
 Keep `memory/index.md` and this definition lean: headlines and pointers here,
 detail in linked files. Core Memory in the index should only hold durable facts
@@ -48,7 +48,6 @@ edit. One Markdown concept per file, with YAML frontmatter containing a
 `index.md` declares `okf_version: "0.1"`.
 
 Start every new concept file like:
-
 ```yaml
 ---
 type: value
