@@ -1076,51 +1076,100 @@ function laterThan(a: number | null, b: number | null): boolean {
   return b > a;
 }
 
+/** Durable record of canonical-repo prunes a trash is (or was) about to require.
+ *  See #185: a crash between a successful trash and the prune loop that
+ *  follows it would otherwise leave a dangling `.git/worktrees/<name>`
+ *  registration with nothing to find it. */
+const PENDING_PRUNE_FILE = '.gc-pending-prunes.json';
+
+interface PendingPrune {
+  workgroupId: string;
+  repo: string;
+}
+
+function pendingPrunePath(dataDir: string): string {
+  return path.join(dataDir, PENDING_PRUNE_FILE);
+}
+
+/** Best-effort — a journal read failure only costs the crash-recovery safety
+ *  net for this pass; the prune loop that follows still runs regardless. */
+function readPendingPrunes(dataDir: string): PendingPrune[] {
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(pendingPrunePath(dataDir), 'utf8'));
+    return Array.isArray(raw) ? (raw as PendingPrune[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Returns whether the write actually landed — callers that are about to
+ *  trash something the journal is meant to protect must abort on `false`
+ *  rather than proceed without a durable record (Codex P2). */
+function writePendingPrunes(dataDir: string, entries: PendingPrune[]): boolean {
+  const target = pendingPrunePath(dataDir);
+  try {
+    if (entries.length === 0) {
+      fs.rmSync(target, { force: true });
+    } else {
+      // Codex P2: write-then-rename, not in-place — a failure partway
+      // through (ENOSPC/EIO/kill) never touches `target`, so the existing
+      // journal survives untouched instead of being left empty/truncated.
+      const tmp = `${target}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify(entries));
+      fs.renameSync(tmp, target);
+    }
+    return true;
+  } catch (err) {
+    log.warn('Storage GC: could not update the pending-prune journal', { err });
+    return false;
+  }
+}
+
+/**
+ * Finish any per-repo prune left pending by a crash between a successful
+ * trash and the deregistration loop that follows it (#185). Run once at the
+ * start of every apply pass, same shape as recoverOrphanedQuarantine: retry,
+ * and only clear an entry once `git worktree prune` actually succeeds — a
+ * repeat failure just stays journaled for the next pass, exactly the
+ * "may need a manual prune" state a non-crash prune failure already leaves.
+ */
+function runPendingPrunes(dataDir: string): void {
+  const pending = readPendingPrunes(dataDir);
+  if (pending.length === 0) return;
+  const remaining = pending.filter(({ workgroupId, repo }) => {
+    if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
+      log.warn('Storage GC: pending prune still failing; retrying next pass', { workgroupId, repo });
+      return true;
+    }
+    log.warn('Storage GC: completed a prune left pending by an interrupted pass', { workgroupId, repo });
+    return false;
+  });
+  writePendingPrunes(dataDir, remaining);
+}
+
 function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
   const snapshot = candidate.idleSnapshot!;
   const resolvedOriginal = fs.realpathSync(candidate.path);
   const quarantineRoot = path.join(dataDir, '.gc-quarantine');
   const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
   fs.mkdirSync(quarantineRoot, { recursive: true });
-  fs.renameSync(candidate.path, quarantinePath);
-  // Crash recovery (Codex P2, round 5): if the process dies before this
-  // function reaches restore or trash, this is the only record of where the
-  // topic came from. recoverOrphanedQuarantine reads it at the next pass.
+
+  // #184: write the recovery marker INTO the topic dir BEFORE the rename that
+  // creates the quarantine entry, so the marker travels with the directory in
+  // the SAME renameSync — one atomic move, not two separate writes with a
+  // crash window between them. A markerless quarantine entry is now
+  // impossible: either the marker-bearing directory got renamed, or nothing
+  // moved at all.
   try {
-    fs.writeFileSync(path.join(quarantinePath, QUARANTINE_META_FILE), JSON.stringify({ originalPath: candidate.path }));
+    fs.writeFileSync(path.join(candidate.path, QUARANTINE_META_FILE), JSON.stringify({ originalPath: candidate.path }));
   } catch (err) {
-    log.warn('Storage GC: could not write quarantine recovery metadata', { quarantinePath, err });
+    log.error('Storage GC: could not write quarantine recovery metadata; leaving the topic in place', {
+      path: candidate.path,
+      err,
+    });
+    return { ok: false, reason: 'quarantine-meta-write-failed' };
   }
-
-  // Codex P1 (round 5): sessionInventory failing here is not evidence the
-  // topic is quiet — participantsByTopic collapses a DB failure into an empty
-  // map, indistinguishable from "genuinely no participants" unless checked
-  // directly first. Same principle participantsByTopic's own doc comment
-  // already states: a failed inventory preserves, never deletes.
-  if (sessionInventory() === null) {
-    reconcileQuarantine(candidate, quarantinePath, dataDir);
-    return { ok: false, reason: 'aborted-recheck-unavailable' };
-  }
-
-  const before = new Map(snapshot.map((p) => [p.sessionId, p]));
-  const owner = participantsByTopic(dataDir).get(candidate.path);
-  const activityAdvanced = (owner?.participants ?? []).some((p) => {
-    const prior = before.get(p.sessionId);
-    // Codex P1 (round 4): status/idleSince lag the real admission event —
-    // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
-    // it updates last_active (session-manager.ts:892-911), two separate
-    // writes. Fence on the durable write itself instead of its lagging
-    // index: inbound.db's mtime moves at the insert, not after. A file that
-    // appeared, or whose mtime moved forward, or that stopped being statable
-    // where it previously was — all count as new activity. Nothing durable
-    // happens after this file changes, so there is no remaining window.
-    const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
-    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved;
-  });
-  if (activityAdvanced) {
-    reconcileQuarantine(candidate, quarantinePath, dataDir);
-    return { ok: false, reason: 'aborted-late-activity' };
-  }
+  fs.renameSync(candidate.path, quarantinePath);
 
   const freshMounts = runningContainerMounts();
   if (freshMounts === null || pathOverlapsResolvedMounts(resolvedOriginal, freshMounts)) {
@@ -1128,10 +1177,8 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     return { ok: false, reason: 'aborted-late-activity' };
   }
 
-  // Genuinely clear — capture the repo list before trashing (quarantinePath
-  // won't exist to list afterward), then commit the delete FIRST. Prune runs
-  // only once that succeeds (Codex P2): a trash failure below leaves every
-  // canonical registration untouched, so the restored checkout stays usable.
+  // Capture the repo list before trashing (quarantinePath won't exist to list
+  // afterward).
   const repoListing = safeDirectories(path.join(quarantinePath, 'worktrees'));
   if (repoListing === null) {
     // A real read failure (EACCES/EIO), not "no worktrees" — treating it as
@@ -1144,9 +1191,66 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     return { ok: false, reason: 'quarantine-unreadable' };
   }
   const repos = repoListing.filter(isRepositoryName);
+  const workgroupId = path.basename(path.dirname(candidate.path));
+
+  // #183: the durable-write fence runs LAST, immediately before the
+  // irreversible trash — not before freshMounts/repoListing above, which
+  // themselves cost real wall-clock time (a docker inspect, a readdir). A
+  // fence checked earlier leaves that whole span unguarded; checked here it
+  // shrinks the residual admission-race window down to roughly the width of
+  // the trashPath call itself. Codex P1 (round 5): sessionInventory failing
+  // here is not evidence the topic is quiet — participantsByTopic collapses a
+  // DB failure into an empty map, indistinguishable from "genuinely no
+  // participants" unless checked directly first.
+  if (sessionInventory() === null) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-recheck-unavailable' };
+  }
+  const before = new Map(snapshot.map((p) => [p.sessionId, p]));
+  const owner = participantsByTopic(dataDir).get(candidate.path);
+  const activityAdvanced = (owner?.participants ?? []).some((p) => {
+    const prior = before.get(p.sessionId);
+    // Codex P1 (round 4): status/idleSince lag the real admission event —
+    // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
+    // it updates last_active (session-manager.ts:892-911), two separate
+    // writes. Fence on the durable write itself instead of its lagging
+    // index: inbound.db's mtime moves at the insert, not after. A file that
+    // appeared, or whose mtime moved forward, or that stopped being statable
+    // where it previously was — all count as new activity.
+    const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
+    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved;
+  });
+  if (activityAdvanced) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-late-activity' };
+  }
+
+  // #185: journal the prunes this trash is about to require BEFORE trashing,
+  // so a crash between the trash succeeding and the loop below finishing
+  // leaves a durable record instead of a silently dangling registration.
+  // runPendingPrunes sweeps this at the start of the next apply pass.
+  const priorPending = readPendingPrunes(dataDir);
+  const journaled = writePendingPrunes(dataDir, [...priorPending, ...repos.map((repo) => ({ workgroupId, repo }))]);
+  if (!journaled) {
+    // Codex P2: a read-only dataDir or ENOSPC here must not fall through to
+    // trashing anyway — that's exactly the crash-without-a-record window
+    // this journal exists to close. Abort and leave the topic recoverable.
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-prune-journal-unwritable' };
+  }
+
+  // Genuinely clear — commit the delete FIRST. Prune runs only once that
+  // succeeds (Codex P2): a trash failure below leaves every canonical
+  // registration untouched, so the restored checkout stays usable.
   try {
     trashPath(quarantinePath);
   } catch (err) {
+    // Restore the EXACT pre-attempt contents rather than filtering by
+    // workgroupId/repo (Codex P2): a filter would also strip an unrelated
+    // OLDER entry for the same workgroupId/repo left by a previous
+    // interrupted pass, losing its retry record permanently. Nothing else
+    // touches this file mid-pass, so priorPending is still accurate.
+    writePendingPrunes(dataDir, priorPending);
     reconcileQuarantine(candidate, quarantinePath, dataDir);
     throw err;
   }
@@ -1159,13 +1263,17 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
   // (no container-relative back-pointer can land in them), so `worktree
   // prune` only ever removes entries whose path is genuinely gone — which,
   // for this repo, is now true.
-  const workgroupId = path.basename(path.dirname(candidate.path));
   for (const repo of repos) {
     if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
       log.warn('Storage GC: git worktree prune failed after idle collection; may need a manual prune', {
         workgroupId,
         repo,
       });
+    } else {
+      writePendingPrunes(
+        dataDir,
+        readPendingPrunes(dataDir).filter((e) => !(e.workgroupId === workgroupId && e.repo === repo)),
+      );
     }
   }
   return { ok: true };
@@ -1292,7 +1400,10 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
   }
 
   const report = emptyReport(mode, true);
-  if (mode === 'apply') recoverOrphanedQuarantine(dataDir, report);
+  if (mode === 'apply') {
+    recoverOrphanedQuarantine(dataDir, report);
+    runPendingPrunes(dataDir);
+  }
   const owners = new Map([...participantsByTopic(dataDir)].map(([key, value]) => [key, value.participants] as const));
   collectOrphanTopics(report, dataDir, owners);
   collectClones(report, dataDir, groupsDir, liveScopes(rows), boundGitDirs(dataDir));
