@@ -1076,6 +1076,63 @@ function laterThan(a: number | null, b: number | null): boolean {
   return b > a;
 }
 
+/** Durable record of canonical-repo prunes a trash is (or was) about to require.
+ *  See #185: a crash between a successful trash and the prune loop that
+ *  follows it would otherwise leave a dangling `.git/worktrees/<name>`
+ *  registration with nothing to find it. */
+const PENDING_PRUNE_FILE = '.gc-pending-prunes.json';
+
+interface PendingPrune {
+  workgroupId: string;
+  repo: string;
+}
+
+function pendingPrunePath(dataDir: string): string {
+  return path.join(dataDir, PENDING_PRUNE_FILE);
+}
+
+/** Best-effort — a journal read failure only costs the crash-recovery safety
+ *  net for this pass; the prune loop that follows still runs regardless. */
+function readPendingPrunes(dataDir: string): PendingPrune[] {
+  try {
+    const raw: unknown = JSON.parse(fs.readFileSync(pendingPrunePath(dataDir), 'utf8'));
+    return Array.isArray(raw) ? (raw as PendingPrune[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingPrunes(dataDir: string, entries: PendingPrune[]): void {
+  try {
+    if (entries.length === 0) fs.rmSync(pendingPrunePath(dataDir), { force: true });
+    else fs.writeFileSync(pendingPrunePath(dataDir), JSON.stringify(entries));
+  } catch (err) {
+    log.warn('Storage GC: could not update the pending-prune journal', { err });
+  }
+}
+
+/**
+ * Finish any per-repo prune left pending by a crash between a successful
+ * trash and the deregistration loop that follows it (#185). Run once at the
+ * start of every apply pass, same shape as recoverOrphanedQuarantine: retry,
+ * and only clear an entry once `git worktree prune` actually succeeds — a
+ * repeat failure just stays journaled for the next pass, exactly the
+ * "may need a manual prune" state a non-crash prune failure already leaves.
+ */
+function runPendingPrunes(dataDir: string): void {
+  const pending = readPendingPrunes(dataDir);
+  if (pending.length === 0) return;
+  const remaining = pending.filter(({ workgroupId, repo }) => {
+    if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
+      log.warn('Storage GC: pending prune still failing; retrying next pass', { workgroupId, repo });
+      return true;
+    }
+    log.warn('Storage GC: completed a prune left pending by an interrupted pass', { workgroupId, repo });
+    return false;
+  });
+  writePendingPrunes(dataDir, remaining);
+}
+
 function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
   const snapshot = candidate.idleSnapshot!;
   const resolvedOriginal = fs.realpathSync(candidate.path);
@@ -1154,12 +1211,25 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     return { ok: false, reason: 'aborted-late-activity' };
   }
 
+  // #185: journal the prunes this trash is about to require BEFORE trashing,
+  // so a crash between the trash succeeding and the loop below finishing
+  // leaves a durable record instead of a silently dangling registration.
+  // runPendingPrunes sweeps this at the start of the next apply pass.
+  writePendingPrunes(dataDir, [...readPendingPrunes(dataDir), ...repos.map((repo) => ({ workgroupId, repo }))]);
+
   // Genuinely clear — commit the delete FIRST. Prune runs only once that
   // succeeds (Codex P2): a trash failure below leaves every canonical
   // registration untouched, so the restored checkout stays usable.
   try {
     trashPath(quarantinePath);
   } catch (err) {
+    // Nothing was actually trashed — the journal entries just added describe
+    // a prune that will never be needed; drop them rather than leave a
+    // phantom pending-prune behind.
+    writePendingPrunes(
+      dataDir,
+      readPendingPrunes(dataDir).filter((e) => !(e.workgroupId === workgroupId && repos.includes(e.repo))),
+    );
     reconcileQuarantine(candidate, quarantinePath, dataDir);
     throw err;
   }
@@ -1178,6 +1248,11 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
         workgroupId,
         repo,
       });
+    } else {
+      writePendingPrunes(
+        dataDir,
+        readPendingPrunes(dataDir).filter((e) => !(e.workgroupId === workgroupId && e.repo === repo)),
+      );
     }
   }
   return { ok: true };
@@ -1304,7 +1379,10 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
   }
 
   const report = emptyReport(mode, true);
-  if (mode === 'apply') recoverOrphanedQuarantine(dataDir, report);
+  if (mode === 'apply') {
+    recoverOrphanedQuarantine(dataDir, report);
+    runPendingPrunes(dataDir);
+  }
   const owners = new Map([...participantsByTopic(dataDir)].map(([key, value]) => [key, value.participants] as const));
   collectOrphanTopics(report, dataDir, owners);
   collectClones(report, dataDir, groupsDir, liveScopes(rows), boundGitDirs(dataDir));

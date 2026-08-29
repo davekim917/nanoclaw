@@ -857,4 +857,22 @@ describe('storage GC — apply mode', () => {
     expect(fs.existsSync(topicDir)).toBe(true);
     expect(git(canonical, ['worktree', 'list'])).toContain(branch);
   });
+
+  it.skipIf(!hasTrash)('#185: sweeps and finishes a prune left dangling by a crash between trash and dereg', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-prunecrash');
+    const repo = path.basename(worktree);
+    // Simulate the crash window directly: the checkout is already gone (as
+    // if trashPath had succeeded) but the canonical registration was never
+    // pruned, and the journal #185 writes before every trash records exactly
+    // this pending prune — the state a crash right after trashPath leaves.
+    fs.rmSync(topicDir, { recursive: true, force: true });
+    fs.writeFileSync(path.join(state.dataDir, '.gc-pending-prunes.json'), JSON.stringify([{ workgroupId: WG, repo }]));
+    state.rows = [];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(git(canonical, ['worktree', 'list'])).not.toContain(branch);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-pending-prunes.json'))).toBe(false);
+    // The branch is free again for a fresh checkout.
+    expect(() => git(canonical, ['worktree', 'add', '-q', `${worktree}-2`, branch])).not.toThrow();
+  });
 });
