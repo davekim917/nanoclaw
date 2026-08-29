@@ -15,6 +15,7 @@ const state = vi.hoisted(() => ({
   dockerBin: '/bin/true',
   rowsPerCall: null as Array<Array<Record<string, string | null>>> | null,
   call: 0,
+  failAtCall: null as number | null,
 }));
 
 vi.mock('./config.js', () => ({
@@ -39,10 +40,13 @@ vi.mock('./db/connection.js', () => ({
     prepare: () => ({
       all: () => {
         if (state.inventoryFails) throw new Error('database unavailable');
+        const thisCall = state.call;
+        state.call += 1;
+        if (state.failAtCall !== null && thisCall === state.failAtCall) {
+          throw new Error('database unavailable for this call only');
+        }
         if (state.rowsPerCall) {
-          const index = Math.min(state.call, state.rowsPerCall.length - 1);
-          state.call += 1;
-          return state.rowsPerCall[index];
+          return state.rowsPerCall[Math.min(thisCall, state.rowsPerCall.length - 1)];
         }
         return state.rows;
       },
@@ -190,6 +194,7 @@ beforeEach(() => {
   state.dockerBin = '/bin/true';
   state.rowsPerCall = null;
   state.call = 0;
+  state.failAtCall = null;
   delete process.env.NANOCLAW_STORAGE_GC;
   delete process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS;
 });
@@ -552,6 +557,90 @@ describe('storage GC — apply mode', () => {
       expect(git(canonical, ['worktree', 'list'])).toContain(branch);
     },
   );
+
+  it.skipIf(!hasTrash)(
+    'round 5 P1: fails closed and restores when the post-move inventory check is unavailable',
+    () => {
+      const { topicDir, canonical, branch } = topicFixture('thread-idle-inventoryfail');
+      state.rows = [sessionRow('thread-idle-inventoryfail', 'folder-a', 'active', 20)];
+      // Call 4 (0-indexed) is finalizeIdleCollection's OWN direct
+      // sessionInventory() check — everything before it (initial inventory,
+      // owners map, stillDisposable's own inventory + participant recheck)
+      // must still succeed for the topic to reach this point at all.
+      state.failAtCall = 4;
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-recheck-unavailable' });
+      expect(fs.existsSync(topicDir)).toBe(true);
+      expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+    },
+  );
+
+  it.skipIf(!hasTrash)("round 5 P1: aborts when inbound.db's durable write moved after the scan snapshot", () => {
+    const { topicDir, canonical, branch } = topicFixture('thread-idle-inboundmoved');
+    state.rows = [sessionRow('thread-idle-inboundmoved', 'folder-a', 'active', 20)];
+    const inboundPath = path.join(
+      state.dataDir,
+      'v2-sessions',
+      'ag-thread-idle-inboundmoved',
+      's-thread-idle-inboundmoved',
+      'inbound.db',
+    );
+    fs.mkdirSync(path.dirname(inboundPath), { recursive: true });
+    fs.writeFileSync(inboundPath, '');
+    const old = new Date(Date.now() - 20 * 86_400_000);
+    fs.utimesSync(inboundPath, old, old);
+    // Simulate a message landing (bumping inbound.db's mtime, the durable
+    // write) in the gap right after the scan snapshot — same synchronous
+    // point the earlier rollback tests use to inject a mid-flight race.
+    const realRename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from as fs.PathLike, to as fs.PathLike);
+      const now = new Date();
+      fs.utimesSync(inboundPath, now, now);
+    });
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    vi.restoreAllMocks();
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    expect(fs.existsSync(topicDir)).toBe(true);
+    expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+  });
+
+  it.skipIf(!hasTrash)('round 5 P2: recovers a topic orphaned in quarantine by a prior interrupted pass', () => {
+    const { topicDir } = topicFixture('thread-idle-orphanquarantine');
+    const quarantinePath = path.join(state.dataDir, '.gc-quarantine', 'orphan-1');
+    fs.mkdirSync(quarantinePath, { recursive: true });
+    fs.cpSync(topicDir, quarantinePath, { recursive: true });
+    fs.rmSync(topicDir, { recursive: true, force: true });
+    fs.writeFileSync(path.join(quarantinePath, '.gc-quarantine-meta.json'), JSON.stringify({ originalPath: topicDir }));
+    state.rows = [];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'quarantine-recovered' });
+    expect(fs.existsSync(topicDir)).toBe(true);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine'))).toBe(false);
+  });
+
+  it.skipIf(!hasTrash)('round 5 P2: reconciles an orphaned quarantine entry whose destination was recreated', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-orphanreconcile');
+    const quarantinePath = path.join(state.dataDir, '.gc-quarantine', 'orphan-2');
+    fs.mkdirSync(quarantinePath, { recursive: true });
+    fs.cpSync(topicDir, quarantinePath, { recursive: true });
+    fs.rmSync(topicDir, { recursive: true, force: true });
+    fs.writeFileSync(path.join(quarantinePath, '.gc-quarantine-meta.json'), JSON.stringify({ originalPath: topicDir }));
+    // The destination exists again — a spawn recreated this repo's slot
+    // while the process was down.
+    fs.mkdirSync(worktree, { recursive: true });
+    state.rows = [];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'quarantine-reconciled' });
+    expect(fs.existsSync(worktree)).toBe(true);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine'))).toBe(false);
+    expect(git(canonical, ['worktree', 'list'])).not.toContain(branch);
+    expect(() => git(canonical, ['worktree', 'add', '-q', `${worktree}-2`, branch])).not.toThrow();
+  });
 
   it.skipIf(!hasTrash)('P2: a trash failure restores intact and runs no prune — the checkout stays usable', () => {
     const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-trashfail');

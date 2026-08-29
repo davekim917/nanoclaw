@@ -77,6 +77,9 @@ interface TopicParticipant {
   status: string;
   /** COALESCE(last_active, created_at) — ISO-8601 UTC. */
   idleSince: string;
+  /** mtime of inbound.db, or null if unstatable. The durable admission write
+   *  itself — last_active is a separate, later write off the same event. */
+  inboundMtimeMs: number | null;
 }
 
 export interface TopicWorktreeTarget {
@@ -136,6 +139,14 @@ function safeDirectories(directory: string): string[] | null {
   }
 }
 
+function statMtimeMs(filePath: string): number | null {
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
 function sessionInventory(): SessionRow[] | null {
   try {
     return getDb()
@@ -179,6 +190,7 @@ function participantsByTopic(
         agentGroupId: row.agent_group_id,
         status: row.status,
         idleSince: row.idle_since,
+        inboundMtimeMs: statMtimeMs(inboundDbPath(row.agent_group_id, row.session_id)),
       });
       result.set(key, current);
     } catch (err) {
@@ -502,6 +514,8 @@ export async function runWorktreeCleanupOnce(dataDir: string = DATA_DIR): Promis
 
 const GC_APPLY_ENV = 'NANOCLAW_STORAGE_GC';
 const TRASH_BIN = '/usr/bin/trash';
+/** Written into a quarantined topic so an interrupted pass can find its way home. */
+const QUARANTINE_META_FILE = '.gc-quarantine-meta.json';
 /** Scan depth below groups/<folder> for agent-created scratch clones. */
 const CLONE_SCAN_DEPTH = 4;
 /** Workgroup-root entries that are the repo store itself, never a clone. */
@@ -521,7 +535,7 @@ export interface GcCandidate {
    * every owning participant — re-verified after the move, before the
    * topic is handed to the real trash. See finalizeIdleCollection.
    */
-  idleSnapshot?: Array<{ sessionId: string; status: string; idleSince: string }>;
+  idleSnapshot?: Array<{ sessionId: string; status: string; idleSince: string; inboundMtimeMs: number | null }>;
 }
 
 export interface GcReport {
@@ -754,7 +768,12 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         reason: collectedViaIdle ? 'idle-and-clean' : participants ? 'closed-and-clean' : 'orphaned-and-clean',
         bytes: dirSizeBytes(topicDir),
         idleSnapshot: collectedViaIdle
-          ? participants!.map((p) => ({ sessionId: p.sessionId, status: p.status, idleSince: p.idleSince }))
+          ? participants!.map((p) => ({
+              sessionId: p.sessionId,
+              status: p.status,
+              idleSince: p.idleSince,
+              inboundMtimeMs: p.inboundMtimeMs,
+            }))
           : undefined,
       });
     }
@@ -934,6 +953,12 @@ function overlapsAny(target: string, mounts: string[]): boolean {
  * a repo that WAS restored cleanly is a harmless no-op — its path exists).
  */
 function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dataDir: string): void {
+  // Never let the recovery marker itself land back inside a restored topic.
+  try {
+    fs.rmSync(path.join(quarantinePath, QUARANTINE_META_FILE), { force: true });
+  } catch {
+    // Best-effort — a leftover marker is a leak, not a correctness issue.
+  }
   const repos = (safeDirectories(path.join(quarantinePath, 'worktrees')) ?? []).filter(isRepositoryName);
   let stranded = repos.length === 0 && fs.existsSync(quarantinePath); // no per-repo split known — see fallback below
 
@@ -1018,6 +1043,13 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
   }
 }
 
+/** True if b is later than a — null on either side is never "later" than a real time. */
+function laterThan(a: number | null, b: number | null): boolean {
+  if (b === null) return false;
+  if (a === null) return true;
+  return b > a;
+}
+
 function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
   const snapshot = candidate.idleSnapshot!;
   const resolvedOriginal = fs.realpathSync(candidate.path);
@@ -1025,12 +1057,39 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
   const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
   fs.mkdirSync(quarantineRoot, { recursive: true });
   fs.renameSync(candidate.path, quarantinePath);
+  // Crash recovery (Codex P2, round 5): if the process dies before this
+  // function reaches restore or trash, this is the only record of where the
+  // topic came from. recoverOrphanedQuarantine reads it at the next pass.
+  try {
+    fs.writeFileSync(path.join(quarantinePath, QUARANTINE_META_FILE), JSON.stringify({ originalPath: candidate.path }));
+  } catch (err) {
+    log.warn('Storage GC: could not write quarantine recovery metadata', { quarantinePath, err });
+  }
+
+  // Codex P1 (round 5): sessionInventory failing here is not evidence the
+  // topic is quiet — participantsByTopic collapses a DB failure into an empty
+  // map, indistinguishable from "genuinely no participants" unless checked
+  // directly first. Same principle participantsByTopic's own doc comment
+  // already states: a failed inventory preserves, never deletes.
+  if (sessionInventory() === null) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-recheck-unavailable' };
+  }
 
   const before = new Map(snapshot.map((p) => [p.sessionId, p]));
   const owner = participantsByTopic(dataDir).get(candidate.path);
   const activityAdvanced = (owner?.participants ?? []).some((p) => {
     const prior = before.get(p.sessionId);
-    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince);
+    // Codex P1 (round 4): status/idleSince lag the real admission event —
+    // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
+    // it updates last_active (session-manager.ts:892-911), two separate
+    // writes. Fence on the durable write itself instead of its lagging
+    // index: inbound.db's mtime moves at the insert, not after. A file that
+    // appeared, or whose mtime moved forward, or that stopped being statable
+    // where it previously was — all count as new activity. Nothing durable
+    // happens after this file changes, so there is no remaining window.
+    const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
+    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved;
   });
   if (activityAdvanced) {
     reconcileQuarantine(candidate, quarantinePath, dataDir);
@@ -1104,6 +1163,86 @@ function stillDisposable(candidate: GcCandidate, dataDir: string, mounts: string
   return { ok: true, reason: 'recheck-clear' };
 }
 
+/**
+ * Codex P2 (round 5): if the process dies between the quarantine rename and
+ * either restore or trash, the topic is stuck under .gc-quarantine forever —
+ * collectOrphanTopics only ever walks v2-topics. Run once at the start of
+ * every apply pass. prune only ever runs post-trash now, so any entry found
+ * here is still in the pre-trash state: either restorable outright, or (if a
+ * spawn recreated the destination while we were down) reconcilable exactly
+ * like a live rollback.
+ */
+function recoverOrphanedQuarantine(dataDir: string, report: GcReport): void {
+  const quarantineRoot = path.join(dataDir, '.gc-quarantine');
+  for (const entry of safeDirectories(quarantineRoot) ?? []) {
+    const quarantinePath = path.join(quarantineRoot, entry);
+    let originalPath: string;
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(quarantinePath, QUARANTINE_META_FILE), 'utf8')) as {
+        originalPath: string;
+      };
+      originalPath = meta.originalPath;
+    } catch (err) {
+      log.error('Storage GC: orphaned quarantine entry has no readable recovery metadata; leaving it as-is', {
+        quarantinePath,
+        err,
+      });
+      continue;
+    }
+    const placeholder: GcCandidate = {
+      category: 'orphan-topic',
+      path: originalPath,
+      collect: false,
+      reason: '',
+      bytes: 0,
+    };
+    if (fs.existsSync(originalPath)) {
+      // A spawn recreated the destination while the process was down —
+      // reconcile exactly like a live rollback (per-repo, conditional prune).
+      reconcileQuarantine(placeholder, quarantinePath, dataDir);
+      log.warn('Storage GC: reconciled an orphaned quarantine entry after an interrupted pass', {
+        originalPath,
+        quarantinePath,
+      });
+      record(report, {
+        category: 'orphan-topic',
+        path: originalPath,
+        collect: false,
+        reason: 'quarantine-reconciled',
+        bytes: 0,
+      });
+      continue;
+    }
+    try {
+      fs.rmSync(path.join(quarantinePath, QUARANTINE_META_FILE), { force: true });
+      fs.renameSync(quarantinePath, originalPath);
+      log.warn('Storage GC: restored an orphaned quarantine entry after an interrupted pass', {
+        originalPath,
+        quarantinePath,
+      });
+      record(report, {
+        category: 'orphan-topic',
+        path: originalPath,
+        collect: false,
+        reason: 'quarantine-recovered',
+        bytes: 0,
+      });
+    } catch (err) {
+      log.error('Storage GC: could not restore an orphaned quarantine entry; leaving it in quarantine', {
+        originalPath,
+        quarantinePath,
+        err,
+      });
+    }
+  }
+  try {
+    fs.rmdirSync(quarantineRoot); // only succeeds once genuinely empty
+  } catch {
+    // Non-empty (something is still stranded, already logged above) or
+    // never existed — either way, nothing further to do here.
+  }
+}
+
 export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string = GROUPS_DIR): GcReport {
   const mode = gcMode();
   const rows = sessionInventory();
@@ -1116,6 +1255,7 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
   }
 
   const report = emptyReport(mode, true);
+  if (mode === 'apply') recoverOrphanedQuarantine(dataDir, report);
   const owners = new Map([...participantsByTopic(dataDir)].map(([key, value]) => [key, value.participants] as const));
   collectOrphanTopics(report, dataDir, owners);
   collectClones(report, dataDir, groupsDir, liveScopes(rows), boundGitDirs(dataDir));
