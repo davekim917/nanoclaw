@@ -29,8 +29,8 @@ vi.mock('./db/connection.js', () => ({
   getDb: () => ({ prepare: () => ({ all: () => state.rows }) }),
 }));
 vi.mock('./session-manager.js', () => ({
-  sessionDir: (agentGroupId: string, sessionId: string) =>
-    path.join(state.dataDir, 'v2-sessions', agentGroupId, sessionId),
+  inboundDbPath: (agentGroupId: string, sessionId: string) =>
+    path.join(state.dataDir, 'v2-sessions', agentGroupId, sessionId, 'inbound.db'),
   openOutboundDb: (_agentGroupId: string, sessionId: string) => {
     if (state.unreadable.has(sessionId)) throw new Error('persisted state unavailable');
     return {
@@ -281,20 +281,39 @@ describe('per-topic linked worktree cleanup', () => {
     expect(fs.existsSync(fixture.worktree)).toBe(false);
   });
 
-  it('still treats a JOURNALED session as busy if its directory is still present (CAS lost)', async () => {
+  it('still treats a JOURNALED session as busy if inbound.db is still present (CAS lost)', async () => {
     // storage-manager.ts appends the journal line BEFORE the archiving->closed
-    // CAS, and on CAS loss the directory is deliberately kept — journaled
-    // alone does not mean gone.
+    // CAS, and on CAS loss the directory (inbound.db included) is deliberately
+    // kept — journaled alone does not mean gone.
     state.rows = [row('s1', 'thread-1', 'inactive')];
     const fixture = repositoryFixture();
     markReclaimed('s1');
     fs.mkdirSync(path.join(state.dataDir, 'v2-sessions', 'ag-s1', 's1'), { recursive: true });
+    fs.writeFileSync(path.join(state.dataDir, 'v2-sessions', 'ag-s1', 's1', 'inbound.db'), '');
     state.unreadable.add('s1'); // falls through to the DB check, which fails closed
 
     const [target] = _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);
 
     expect(fs.existsSync(fixture.worktree)).toBe(true);
+  });
+
+  it('does not treat a JOURNALED session as busy when its root was recreated but inbound.db never was', async () => {
+    // A late inbound write can lose the reclaim race: it acquires the storage
+    // lease first (which mkdirs the session ROOT), then writeSessionMessageLocked
+    // itself rejects the write because journal-exists + inbound.db-absent. The
+    // root exists but is otherwise empty — inbound.db absence is still the
+    // correct "gone" signal here, not the directory.
+    state.rows = [row('s1', 'thread-1', 'inactive')];
+    const fixture = repositoryFixture();
+    markReclaimed('s1');
+    fs.mkdirSync(path.join(state.dataDir, 'v2-sessions', 'ag-s1', 's1'), { recursive: true });
+    state.unreadable.add('s1'); // irrelevant here — sessionWasReclaimed short-circuits first
+
+    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    await _cleanupOneForTesting(target, state.dataDir);
+
+    expect(fs.existsSync(fixture.worktree)).toBe(false);
   });
 
   it('preserves dirty, unpushed, recent, and malformed linked checkouts', async () => {

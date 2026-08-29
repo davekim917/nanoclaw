@@ -31,7 +31,7 @@ import {
   withRepositoryLifecycleClaims,
   type RepositoryWorkUnit,
 } from './repository-workspaces.js';
-import { openOutboundDb, sessionDir } from './session-manager.js';
+import { inboundDbPath, openOutboundDb } from './session-manager.js';
 import { safeGitArgs, safeGitEnv } from './safe-git.js';
 import { dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
 
@@ -257,19 +257,22 @@ function participantHasPersistedWork(participant: TopicParticipant, dataDir: str
   // continuation, processing claim, or current tool can survive a transition
   // to inactive and must independently retain the shared topic worktree.
   //
-  // Two-signal reclaim check, mirroring writeSessionMessageLocked
-  // (session-manager.ts:857). Neither signal alone is proof: the journal line
-  // is written BEFORE the archiving->closed CAS (storage-manager.ts:1259 vs
-  // :1266-1269), and on CAS loss the directory is deliberately kept — so a
-  // journaled-but-CAS-lost session is still live. Bare directory absence
-  // alone is also not proof: an operator can rm -rf a stuck ACTIVE session's
-  // dir directly, and it gets re-provisioned on the session's next message.
-  // Both together — journaled AND the directory actually gone — is what
-  // sessionWasReclaimed's own doc comment calls out as the real answer.
-  if (sessionWasReclaimed(participant.sessionId, path.join(dataDir, 'v2-sessions'))) {
-    if (!fs.existsSync(sessionDir(participant.agentGroupId, participant.sessionId))) {
-      return false;
-    }
+  // Two-signal reclaim check, mirroring writeSessionMessageLocked exactly
+  // (session-manager.ts:857: sessionWasReclaimed && !existsSync(inboundDbPath)).
+  // Neither signal alone is proof. The journal line is written BEFORE the
+  // archiving->closed CAS (storage-manager.ts:1259 vs :1266-1269); on CAS loss
+  // the directory is deliberately kept, so journaled-but-CAS-lost is still
+  // live. And the session ROOT can be recreated by a late inbound write that
+  // loses the reclaim race — it acquires the storage lease (which mkdirs the
+  // root) and then writeSessionMessageLocked itself rejects it, leaving a
+  // real, non-empty root with no inbound.db inside. inbound.db absence is the
+  // answer that survives both: the reclaim removes the whole directory, and
+  // nothing recreates that specific file.
+  if (
+    sessionWasReclaimed(participant.sessionId, path.join(dataDir, 'v2-sessions')) &&
+    !fs.existsSync(inboundDbPath(participant.agentGroupId, participant.sessionId))
+  ) {
+    return false;
   }
   try {
     const db = openOutboundDb(participant.agentGroupId, participant.sessionId);
