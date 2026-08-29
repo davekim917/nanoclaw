@@ -503,6 +503,41 @@ describe('storage GC — apply mode', () => {
     expect(fs.existsSync(topicDir)).toBe(true);
   });
 
+  it.skipIf(!hasTrash)(
+    'restores an idle-qualified topic when activity advances after the pre-move recheck already passed',
+    () => {
+      // 5 calls per topic candidate in apply mode: (1) initial inventory,
+      // (2) scan-time owners map (idleSnapshot captured here, idle 20d),
+      // (3) stillDisposable's OWN sessionInventory() (clone-branch liveScopes,
+      // unused here but still fetched), (4) stillDisposable's
+      // participantsByTopic pre-move recheck (still idle 20d, passes), (5)
+      // finalizeIdleCollection's OWN post-move recheck — this is the one
+      // Codex's review added, and only it sees the late activity (idle 1d).
+      const { topicDir } = topicFixture('thread-idle-latemove');
+      state.rowsPerCall = [
+        [sessionRow('thread-idle-latemove', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-latemove', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-latemove', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-latemove', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-latemove', 'folder-a', 'active', 1)],
+      ];
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+      expect(fs.existsSync(topicDir)).toBe(true);
+    },
+  );
+
+  it.skipIf(!hasTrash)('trashes a CLOSED-path topic directly, untouched by the idle rollback logic', () => {
+    const { topicDir } = topicFixture('thread-closed-apply');
+    state.rows = [sessionRow('thread-closed-apply', 'folder-a', 'closed')];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: true, reason: 'closed-and-clean' });
+    expect(fs.existsSync(topicDir)).toBe(false);
+    expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine'))).toBe(false);
+  });
+
   it.skipIf(!hasTrash)('removes only what the predicate cleared', () => {
     const clean = topicFixture('thread-clean');
     const dirty = topicFixture('thread-dirty');

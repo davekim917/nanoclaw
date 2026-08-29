@@ -515,6 +515,13 @@ export interface GcCandidate {
   collect: boolean;
   reason: string;
   bytes: number;
+  /**
+   * Set only for an orphan-topic collected via the idle-threshold path
+   * (reason 'idle-and-clean'). Scan-time (sessionId, status, idleSince) for
+   * every owning participant — re-verified after the move, before the
+   * topic is handed to the real trash. See finalizeIdleCollection.
+   */
+  idleSnapshot?: Array<{ sessionId: string; status: string; idleSince: string }>;
 }
 
 export interface GcReport {
@@ -746,6 +753,9 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         collect: true,
         reason: collectedViaIdle ? 'idle-and-clean' : participants ? 'closed-and-clean' : 'orphaned-and-clean',
         bytes: dirSizeBytes(topicDir),
+        idleSnapshot: collectedViaIdle
+          ? participants!.map((p) => ({ sessionId: p.sessionId, status: p.status, idleSince: p.idleSince }))
+          : undefined,
       });
     }
   }
@@ -852,13 +862,7 @@ function runningContainerMounts(): string[] | null {
   }
 }
 
-function overlapsAny(target: string, mounts: string[]): boolean {
-  let resolved = target;
-  try {
-    resolved = fs.realpathSync(target);
-  } catch {
-    return true; // A path we cannot resolve is a path we cannot clear.
-  }
+function pathOverlapsResolvedMounts(resolvedTarget: string, mounts: string[]): boolean {
   return mounts.some((mount) => {
     let source = mount;
     try {
@@ -868,9 +872,102 @@ function overlapsAny(target: string, mounts: string[]): boolean {
       // names the tree the container was given.
     }
     return (
-      source === resolved || source.startsWith(`${resolved}${path.sep}`) || resolved.startsWith(`${source}${path.sep}`)
+      source === resolvedTarget ||
+      source.startsWith(`${resolvedTarget}${path.sep}`) ||
+      resolvedTarget.startsWith(`${source}${path.sep}`)
     );
   });
+}
+
+function overlapsAny(target: string, mounts: string[]): boolean {
+  let resolved = target;
+  try {
+    resolved = fs.realpathSync(target);
+  } catch {
+    return true; // A path we cannot resolve is a path we cannot clear.
+  }
+  return pathOverlapsResolvedMounts(resolved, mounts);
+}
+
+/**
+ * Codex review finding on PR #182: a message can land, or a container spawn
+ * can land its bind mount, in the window between stillDisposable's pre-move
+ * recheck and the topic being fully trashed. Closed-path topics can't be
+ * re-routed to (the router only ever opens a NEW session for a new thread
+ * key), so this only matters for the idle-threshold path — an idle but
+ * ACTIVE session still receives inbound.
+ *
+ * inbound admission bumps last_active BEFORE any spawn ever mounts anything
+ * (session-manager.ts:911), so admission-before-the-move is always caught by
+ * the recheck below, and admission-after-the-move finds the directory gone
+ * and re-materializes a fresh checkout for the new message — nothing lost
+ * either way. The move (renaming the directory out of its live path) is the
+ * serialization point this relies on.
+ *
+ * `trash-cli`'s own restore (`trash-restore`) is interactive-only — it
+ * prompts on stdin and picks by a list index, not scriptable for "restore
+ * this exact item" (confirmed via `man trash-restore`). So the actual delete
+ * is staged: rename into a same-filesystem quarantine dir first (an ordinary,
+ * instantly-reversible rename), recheck, and only THEN hand the quarantined
+ * copy to the real `trash` for its 30-day retention.
+ */
+function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
+  const snapshot = candidate.idleSnapshot!;
+  const resolvedOriginal = fs.realpathSync(candidate.path);
+  const quarantineRoot = path.join(dataDir, '.gc-quarantine');
+  const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
+  fs.mkdirSync(quarantineRoot, { recursive: true });
+  fs.renameSync(candidate.path, quarantinePath);
+
+  const restore = (): boolean => {
+    try {
+      fs.renameSync(quarantinePath, candidate.path);
+      return true;
+    } catch (err) {
+      // Never half-restore. If we can't put it back, route it to the real
+      // trash instead of leaving an untracked directory nothing else knows
+      // to clean up — same 30-day retention, still operator-recoverable.
+      log.error('Storage GC: idle-topic rollback rename failed; trashing the quarantined copy instead', {
+        quarantinePath,
+        original: candidate.path,
+        err,
+      });
+      try {
+        trashPath(quarantinePath);
+      } catch (trashErr) {
+        log.error('Storage GC: could not even trash the stranded quarantine copy', { quarantinePath, err: trashErr });
+      }
+      return false;
+    }
+  };
+
+  const before = new Map(snapshot.map((p) => [p.sessionId, p]));
+  const owner = participantsByTopic(dataDir).get(candidate.path);
+  const activityAdvanced = (owner?.participants ?? []).some((p) => {
+    const prior = before.get(p.sessionId);
+    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince);
+  });
+  if (activityAdvanced) {
+    restore();
+    return { ok: false, reason: 'aborted-late-activity' };
+  }
+
+  const freshMounts = runningContainerMounts();
+  if (freshMounts === null || pathOverlapsResolvedMounts(resolvedOriginal, freshMounts)) {
+    restore();
+    return { ok: false, reason: 'aborted-late-activity' };
+  }
+
+  try {
+    trashPath(quarantinePath);
+  } catch (err) {
+    // The topic is genuinely clear — only the final trash call itself
+    // failed. Put it back rather than leave it in limbo; the caller's own
+    // catch demotes and logs this like any other trash-failed candidate.
+    restore();
+    throw err;
+  }
+  return { ok: true };
 }
 
 /**
@@ -941,7 +1038,15 @@ export function runStorageGcOnce(dataDir: string = DATA_DIR, groupsDir: string =
           continue;
         }
         try {
-          trashPath(candidate.path);
+          if (candidate.idleSnapshot) {
+            const finalized = finalizeIdleCollection(candidate, dataDir);
+            if (!finalized.ok) {
+              demote(candidate, finalized.reason!);
+              continue;
+            }
+          } else {
+            trashPath(candidate.path);
+          }
           log.info('Storage GC: collected', { path: candidate.path, category: candidate.category });
         } catch (error) {
           demote(candidate, 'trash-failed');
