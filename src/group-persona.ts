@@ -81,6 +81,20 @@ export function readGroupPersona(groupDir: string, allowedRoots?: string[]): str
     }
     if (!fs.fstatSync(fd).isFile()) return null;
     const content = fs.readFileSync(fd, 'utf-8').trim();
+    // Instruction-surface budget (warn-only). Every byte here is re-read on
+    // every wake of every session in the group; policy that can be a tool, a
+    // check, or a script-emitted field should not live in the always-on
+    // prompt. Over budget = convert a sentence, not grow the prompt. Stays a
+    // log line until the fleet is under; a write refusal can ratchet later.
+    const budget = Number(process.env.PERSONA_BUDGET_BYTES) || 24_000;
+    if (content.length > budget) {
+      log.warn('Group standing instructions exceed the persona byte budget', {
+        file,
+        bytes: content.length,
+        budget,
+        over: content.length - budget,
+      });
+    }
     return content || null;
   } catch (err) {
     if (typeof err === 'object' && err !== null && 'code' in err && err.code === 'ENOENT') return null;
