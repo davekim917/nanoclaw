@@ -54,6 +54,16 @@ describe('renderMemoryLifecycleGuidance', () => {
     expect(section).not.toContain(maliciousDefinition);
   });
 
+  it('tells the agent the tree is searchable, not just link-followable', () => {
+    const section = renderMemoryLifecycleGuidance(BASE);
+
+    // The pull half of index-plus-agent-initiated-read: without this the agent
+    // only ever follows index links and never greps for what the index omits.
+    expect(section).toContain('The index names folders, not every file');
+    expect(section).toContain('rg -i <term> /workspace/workgroup/memory');
+    expect(section).toContain('there is no retrieval index');
+  });
+
   it('is byte-identical regardless of the supplied base directory', () => {
     writeMemoryTree('CANONICAL_INDEX', 'CANONICAL_DEFINITION');
     const first = renderMemoryLifecycleGuidance(BASE);
