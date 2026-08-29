@@ -89,6 +89,11 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   // which container-runner.ts ships as a docker `-e` env from
   // DEFAULT_OPUS_MODEL (the install's single source of truth).
   model: 'opus',
+  // Container agents deliver into chat threads, not a terminal — the default
+  // style's preamble/recap padding is pure noise there. Claude-only knob
+  // (Codex/OpenCode have no output-style concept); tone for those providers
+  // still comes from the CLAUDE.md voice slot.
+  outputStyle: 'Concise',
 };
 
 // Pre-compaction hook (container-side): runs before the SDK auto-compacts so
