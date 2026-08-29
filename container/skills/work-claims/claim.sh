@@ -34,10 +34,17 @@ usage:
   claim.sh release <slug> [--merged-pr <n>]
   claim.sh list
 
+attribution events (append-only, claims/ledger.ndjson):
+  claim.sh record-review-start <repo> <pr> <head_sha> <reviewer>
+  claim.sh record-verdict      <repo> <pr> <head_sha> <reviewer> <verdict>
+  claim.sh record-merge        <repo> <pr> <executor> <claim_owner> <head_sha> <gate_ref> <result>
+
 exit codes: 0 ok · 2 usage/error · 3 held live by another agent
 USAGE
   exit 2
 }
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # No workgroup tree means this install has no shared FS — SKILL.md says skip
 # the convention rather than fail, so callers can invoke this unconditionally.
@@ -57,10 +64,25 @@ me() { printf '%s' "${NANOCLAW_ASSISTANT_NAME:-unknown}"; }
 # atomic write can never interleave with a concurrent append. Aborts (exit 2)
 # on any failure — callers append BEFORE the mutation that would otherwise
 # destroy the record, so a failed append leaves the claim file untouched.
+#
+# The ledger is the ONLY file any event in this script may be written to. A
+# review or merge event appearing in releases/gates/*.jsonl is the audit failure
+# this whole layer exists to prevent — gates files are human AUTHORIZATION
+# records, the ledger is machine ATTRIBUTION. A CLAIMS_DIR pointed at a gates
+# tree would silently blur the two, so refuse rather than append.
+ledger_write_line() {
+  local line="$1" ctx="${2:-}" lock="$CLAIMS_DIR/.ledger.lock"
+  case "$CLAIMS_DIR" in
+    */gates|*/gates/*) die "refusing to write the claim ledger under a gates/ tree ($CLAIMS_DIR) — gates files are human authorization records, not execution events" ;;
+  esac
+  ( flock -x 200 && printf '%s\n' "$line" >> "$CLAIMS_DIR/ledger.ndjson" ) 200>"$lock" \
+    || die "failed to append ledger entry${ctx:+ $ctx}"
+}
+
 ledger_append() {
   local event="$1" slug="$2" owner="$3" note="$4" claimed_at="$5" thread_id="$6" pr="$7"
-  local lock="$CLAIMS_DIR/.ledger.lock" now line
-  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local now line
+  now="$(now_utc)"
   line="$(jq -nc \
     --arg event "$event" --arg slug "$slug" --arg owner "$owner" \
     --arg by "$(me)" --arg at "$now" \
@@ -71,8 +93,7 @@ ledger_append() {
      + (if $thread_id == "" then {} else {thread_id:$thread_id} end)
      + (if $pr == null then {} else {pr:$pr} end)
      + {note:$note}')" || die "failed to build ledger entry for $slug — claim left in place"
-  ( flock -x 200 && printf '%s\n' "$line" >> "$CLAIMS_DIR/ledger.ndjson" ) 200>"$lock" \
-    || die "failed to append ledger entry for $slug — claim left in place"
+  ledger_write_line "$line" "for $slug — claim left in place"
 }
 
 # Echoes: state<TAB>owner<TAB>note   where state is unclaimed|yours|live|stale|parked
@@ -324,6 +345,69 @@ cmd_thread() {
   echo "recorded thread $tid on $slug"
 }
 
+# --- attribution events -----------------------------------------------------
+#
+# A claim says who HOLDS a unit of work. These say who actually reviewed and who
+# actually merged it, at which head. The retro that produced them found the two
+# were being inferred from whoever happened to be talking in the thread — an
+# executor and a claim owner are frequently different agents, and nothing on
+# disk recorded the difference.
+#
+# Positional and fixed-arity on purpose: an event with a field guessed from
+# position is worse than no event, so arity is checked exactly and every field
+# must be non-empty ("none" is the sanctioned placeholder for claim_owner).
+
+require_args() {
+  local want="$1" verb="$2"; shift 2
+  [ "$#" -eq "$want" ] || die "$verb takes exactly $want arguments, got $# — see 'claim.sh' usage"
+  local a
+  for a in "$@"; do
+    [ -n "$a" ] || die "$verb: empty argument — every field is required (use \"none\" where a value genuinely does not exist)"
+  done
+}
+
+# pr is emitted as a NUMBER, matching the pr field cleared_merged already writes,
+# so one `jq 'select(.pr==1296)'` finds a slug's whole history across event types.
+require_pr() {
+  case "$1" in ''|*[!0-9]*) die "pr must be a bare number (1296, not '#1296' or a url)" ;; esac
+}
+
+cmd_record_review_start() {
+  require_args 4 record-review-start "$@"
+  require_pr "$2"
+  require_workgroup
+  ledger_write_line "$(jq -nc --arg ts "$(now_utc)" --arg repo "$1" --argjson pr "$2" \
+    --arg head_sha "$3" --arg reviewer "$4" \
+    '{ts:$ts, event:"review_start", repo:$repo, pr:$pr, head_sha:$head_sha, reviewer:$reviewer}')"
+  echo "recorded review_start: $1#$2 @$3 by $4"
+}
+
+cmd_record_verdict() {
+  require_args 5 record-verdict "$@"
+  require_pr "$2"
+  require_workgroup
+  ledger_write_line "$(jq -nc --arg ts "$(now_utc)" --arg repo "$1" --argjson pr "$2" \
+    --arg head_sha "$3" --arg reviewer "$4" --arg verdict "$5" \
+    '{ts:$ts, event:"review_verdict", repo:$repo, pr:$pr, head_sha:$head_sha,
+      reviewer:$reviewer, verdict:$verdict}')"
+  echo "recorded review_verdict: $1#$2 @$3 by $4 — $5"
+}
+
+# gate_ref is the releases/gates/<date>.jsonl reference this merge was authorized
+# by, or "auto-lane" when the lane needed no human gate. It POINTS AT a gates
+# file; it is never written INTO one.
+cmd_record_merge() {
+  require_args 7 record-merge "$@"
+  require_pr "$2"
+  require_workgroup
+  ledger_write_line "$(jq -nc --arg ts "$(now_utc)" --arg repo "$1" --argjson pr "$2" \
+    --arg executor "$3" --arg claim_owner "$4" --arg head_sha "$5" \
+    --arg gate_ref "$6" --arg result "$7" \
+    '{ts:$ts, event:"merge", repo:$repo, pr:$pr, executor:$executor,
+      claim_owner:$claim_owner, head_sha:$head_sha, gate_ref:$gate_ref, result:$result}')"
+  echo "recorded merge: $1#$2 @$5 executed by $3 (claim owner $4, gate $6) — $7"
+}
+
 cmd_list() {
   require_workgroup
   local any=0 f slug state owner note
@@ -344,5 +428,8 @@ case "${1:-}" in
   thread)  shift; cmd_thread "$@" ;;
   release) shift; cmd_release "$@" ;;
   list)    shift; cmd_list "$@" ;;
+  record-review-start) shift; cmd_record_review_start "$@" ;;
+  record-verdict)      shift; cmd_record_verdict "$@" ;;
+  record-merge)        shift; cmd_record_merge "$@" ;;
   *)       usage ;;
 esac

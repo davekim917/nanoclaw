@@ -139,6 +139,174 @@ pr_verdict_file() { printf '%s/pr-%s-verdict.json' "$STATE_DIR" "$1"; }
 # smoke-develop-gate.sh's.
 num_env LOCK_WAIT SMOKE_GATE_LOCK_WAIT_SECONDS 15
 
+# --- Run-level terminal artifact ------------------------------------------
+# ONE file per run, created write-once, is the terminal marker. Everything
+# else this gate writes about an outcome — pr-<n>-state.json's completed
+# fields, pr-<n>-verdict.json, the handoff ledger — is an INDEXED RECEIPT of
+# it, never a second authority. Before this existed, `finish` committed
+# completed state and wrote its receipt separately, so a crash between them
+# left two records that could disagree with nothing to arbitrate.
+#
+# It lives under this gate's own state dir rather than the skill's
+# <qa-run-root>: that tree is on the shared workgroup mount, which `finish`
+# has already had to learn can be unwritable mid-run (see the
+# HANDOFF_ARTIFACT_ERROR path), and a terminal marker cannot live somewhere
+# the gate cannot rely on writing.
+run_dir()          { printf '%s/runs/%s' "$STATE_DIR" "$1"; }
+run_verdict_file() { printf '%s/runs/%s/verdict.json' "$STATE_DIR" "$1"; }
+
+# Run ids reach the gate from a caller (`claim` takes an arbitrary one) and are
+# used as PATH components below, so they are constrained here rather than
+# trusted. Rejects `..`, `/`, and anything that would escape the state dir.
+run_id_ok() { printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._-]{1,200}$' && [ "${1:-}" != ".." ]; }
+
+# The canonical verdict payload. Key ORDER is part of the contract — jq emits
+# in insertion order, so two invocations reasoning about the same terminal
+# facts produce byte-identical JSON and therefore the same digest.
+verdict_payload() {  # <sha> <runId> <verdict> <finishedAt>
+  jq -cn --arg sha "$1" --arg run "$2" --arg verdict "$3" --arg now "$4" \
+    '{schemaVersion:1,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now}'
+}
+verdict_digest() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+
+# --- Cross-container coordinator lease -------------------------------------
+# The per-PR flock serializes gate PROCESSES; it cannot serialize CONTAINERS,
+# because two coordinators in two containers holding the same run id take that
+# lock at different moments and both proceed. That is what happened on the
+# pr1105 and pr1066 campaigns: two coordinators ran the same campaign
+# concurrently and overwrote each other's markers. The shared workgroup FS is
+# the only durable medium both can see, so the lease is a file with an expiry.
+num_env LEASE_TTL_SECONDS SMOKE_GATE_LEASE_TTL_SECONDS 900
+# Identifies the CONTAINER, not the invocation. A coordinator runs many
+# separate gate processes over a campaign and all of them must count as the
+# same owner; two containers must not. $HOSTNAME is the container id.
+DEFAULT_OWNER="${SMOKE_GATE_OWNER:-${HOSTNAME:-unknown-host}}"
+lease_file()      { printf '%s/lease-%s.json' "$STATE_DIR" "$1"; }
+lease_lock_file() { printf '%s/lease-%s.lock' "$STATE_DIR" "$1"; }
+
+read_lease() {
+  local f; f="$(lease_file "$1")"
+  if [ -s "$f" ] && jq -e 'type == "object"' "$f" >/dev/null 2>&1; then
+    jq -c '.' "$f"
+  else
+    printf 'null'
+  fi
+}
+
+lease_is_live() {  # <lease-json>
+  local exp
+  [ "${1:-null}" != null ] || { printf 'false'; return; }
+  exp="$(jq -r '.expiresAt // empty' <<<"$1" 2>/dev/null)"
+  if [ -n "$exp" ] && [ "$(date -u +%s)" -lt "$(epoch_or_zero "$exp")" ]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+lease_expiry_from_now() {
+  date -u -d "@$(( $(date -u +%s) + LEASE_TTL_SECONDS ))" +'%Y-%m-%dT%H:%M:%SZ'
+}
+
+write_lease() {  # <runId> <json>
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/.lease-$1.XXXXXX" 2>/dev/null)" || return 1
+  printf '%s\n' "$2" > "$tmp" 2>/dev/null &&
+    mv "$tmp" "$(lease_file "$1")" 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null
+  return 1
+}
+
+# Take (or take over) a run's lease. Prints one JSON line either way; returns 0
+# on success, 1 on refusal. Takeover is allowed ONLY against an EXPIRED lease —
+# a live lease with a different owner always refuses, which is the whole point.
+# The claimant re-reads after writing and verifies it still holds the lease, so
+# two claimants racing the same expiry cannot both believe they won.
+lease_acquire() {  # <runId> <owner> [quiet]
+  local run="$1" owner="$2" quiet="${3:-}" cur prior_claimed now next back
+  exec 6>"$(lease_lock_file "$run")"
+  if ! flock -w "$LOCK_WAIT" 6; then
+    [ -n "$quiet" ] || jq -cn --arg run "$run" \
+      '{ok:false,retryable:true,
+        error:"gate_lock_busy: another invocation held this run'"'"'s lease lock — RETRY this same command in ~10s.",
+        runId:$run}'
+    exec 6>&-
+    return 1
+  fi
+  cur="$(read_lease "$run")"
+  if [ "$(lease_is_live "$cur")" = true ] &&
+     [ "$(jq -r '.owner // empty' <<<"$cur")" != "$owner" ]; then
+    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg owner "$owner" --argjson lease "$cur" \
+      '{ok:false,
+        error:("another coordinator container already holds this run — STOP: do not start or continue this campaign. Its lease is held by " +
+               $lease.owner + " until " + $lease.expiresAt + ". Take over only after it expires, or have that owner release it."),
+        runId:$run,requestedBy:$owner,
+        leaseOwner:$lease.owner,claimedAt:$lease.claimedAt,expiresAt:$lease.expiresAt}'
+    flock -u 6; exec 6>&-
+    return 1
+  fi
+  # Same owner re-claiming keeps its original claimedAt — the campaign started
+  # when it started, and only the expiry moves.
+  prior_claimed=""
+  [ "$(jq -r '.owner // empty' <<<"$cur")" = "$owner" ] &&
+    prior_claimed="$(jq -r '.claimedAt // empty' <<<"$cur")"
+  now="$(iso_now)"
+  next="$(jq -cn --arg owner "$owner" --arg now "$now" \
+    --arg claimed "${prior_claimed:-$now}" --arg exp "$(lease_expiry_from_now)" \
+    '{schemaVersion:1,owner:$owner,claimedAt:$claimed,renewedAt:$now,expiresAt:$exp}')"
+  if ! write_lease "$run" "$next"; then
+    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg dir "$STATE_DIR" \
+      '{ok:false,error:("could not write the lease file under " + $dir +
+                        " — refusing to run unleased. Fix the state dir and retry."),runId:$run}'
+    flock -u 6; exec 6>&-
+    return 1
+  fi
+  # Verify we hold what we just wrote before telling the caller it may proceed.
+  back="$(read_lease "$run")"
+  if [ "$(jq -r '.owner // empty' <<<"$back")" != "$owner" ] ||
+     [ "$(lease_is_live "$back")" != true ]; then
+    [ -n "$quiet" ] || jq -cn --arg run "$run" --arg owner "$owner" --argjson lease "$back" \
+      '{ok:false,error:"lease write did not stick (raced by another claimant) — do NOT proceed; retry",
+        runId:$run,requestedBy:$owner,lease:$lease}'
+    flock -u 6; exec 6>&-
+    return 1
+  fi
+  [ -n "$quiet" ] || jq -cn --arg run "$run" --argjson lease "$back" \
+    '{ok:true,runId:$run,lease:$lease}'
+  flock -u 6; exec 6>&-
+  return 0
+}
+
+# Unconditional drop, for `finish`/`release` only. Both have already proved the
+# caller owns the RUN SLOT (the not-the-active-run guard), which is the
+# stronger claim — re-checking the lease owner there would strand a lease
+# whenever a container was replaced mid-run.
+lease_drop() {  # <runId>
+  exec 6>"$(lease_lock_file "$1")"
+  flock -w "$LOCK_WAIT" 6 || true
+  rm -f "$(lease_file "$1")" 2>/dev/null || true
+  flock -u 6 2>/dev/null || true
+  exec 6>&-
+}
+
+# --- Challenger disposition ------------------------------------------------
+# A campaign is not finishable until the challenger files a disposition, and
+# twice (pr1195, pr1228) one never was: challenger/disposition.md was never
+# written and the coordinator waited forever with nothing anywhere saying so.
+# `claim` now stamps a deadline and `challenger-timeout` converts an expired
+# one into a BLOCKED verdict — never into permission to synthesize.
+num_env CHALLENGER_TIMEOUT_SECONDS SMOKE_GATE_CHALLENGER_TIMEOUT_SECONDS 5400
+# The skill's <qa-run-root> — the coordinator's evidence tree, which is where
+# the challenger actually writes. Unset means this deployment has not told the
+# gate where to look, and `challenger-timeout` REFUSES rather than reading a
+# failed lookup as "no disposition": absence is only evidence when presence
+# was possible.
+CHALLENGER_RUN_ROOT="${SMOKE_GATE_RUN_ROOT:-}"
+challenger_disposition_file() { printf '%s/%s/challenger/disposition.md' "$CHALLENGER_RUN_ROOT" "$1"; }
+challenger_deadline_from_now() {
+  date -u -d "@$(( $(date -u +%s) + CHALLENGER_TIMEOUT_SECONDS ))" +'%Y-%m-%dT%H:%M:%SZ'
+}
+
 # Losing the lock is NOT losing the slot. The old emission here was
 # `{ok:false,error:"gate lock failed"}` — an `ok:false` that the skill's
 # stop-the-campaign rule could not tell apart from "you were reclaimed", so a
@@ -178,7 +346,14 @@ default_pr_state() {
     overrunAlertRunId: null,
     overrunAlertAt: null,
     displacedRunId: null,
-    displacedAt: null
+    displacedAt: null,
+    finishIntent: null,
+    completedVerdictDigest: null,
+    gateStatus: null,
+    reconciliation: null,
+    challengerDeadline: null,
+    challengerDisposition: null,
+    challengerTimedOutAt: null
   }'
 }
 
@@ -301,6 +476,24 @@ find_pr_for_run() {
   for f in "$STATE_DIR"/pr-*-state.json; do
     [ -e "$f" ] || continue
     if [ "$(jq -r '.activeRunId // empty' "$f" 2>/dev/null)" = "$run_id" ]; then
+      pr="$(jq -r '.pr' "$f" 2>/dev/null)"
+      [ -n "$pr" ] && [ "$pr" != "null" ] && { printf '%s' "$pr"; return 0; }
+    fi
+  done
+  return 1
+}
+
+# Same scan, widened to a run that has already released the slot. Only the
+# verdict-reconciliation path uses this: once a run-level verdict.json exists,
+# the run is no longer anybody's activeRunId, and the mismatch still has to be
+# recorded against the PR it belonged to.
+find_pr_for_any_run() {
+  local run_id="$1" f pr
+  for f in "$STATE_DIR"/pr-*-state.json; do
+    [ -e "$f" ] || continue
+    if jq -e --arg r "$run_id" \
+         '(.activeRunId // "") == $r or (.completedRunId // "") == $r or ((.finishIntent.runId // "") == $r)' \
+         "$f" >/dev/null 2>&1; then
       pr="$(jq -r '.pr' "$f" 2>/dev/null)"
       [ -n "$pr" ] && [ "$pr" != "null" ] && { printf '%s' "$pr"; return 0; }
     fi
@@ -666,8 +859,17 @@ if [ "$COMMAND" = "claim" ]; then
   RUN_ID="${2:-}"
   PR="${3:-}"
   SHA="${4:-}"
+  # Optional 5th positional: the coordinator's lease owner token. Defaults to
+  # the container id, which is what actually needs distinguishing — pass one
+  # explicitly only when several coordinators share a container.
+  OWNER="${5:-$DEFAULT_OWNER}"
   if [ -z "$RUN_ID" ]; then
     jq -cn '{ok:false,error:"claim requires a run id"}'
+    exit 2
+  fi
+  if ! run_id_ok "$RUN_ID"; then
+    jq -cn --arg run "$RUN_ID" \
+      '{ok:false,error:"run id must be 1-200 chars of [A-Za-z0-9._-] — it names files under the state dir",runId:$run}'
     exit 2
   fi
   if ! printf '%s' "$PR" | grep -Eq '^[0-9]+$'; then
@@ -738,18 +940,119 @@ if [ "$COMMAND" = "claim" ]; then
       exit 0
     fi
   fi
+  # The slot check above proves no OTHER RUN owns this PR. It cannot prove no
+  # other CONTAINER is running THIS run — the per-PR flock is process-local to
+  # one filesystem view and both coordinators pass it. Take the durable lease
+  # before writing the slot, and refuse the claim outright if it is held: an
+  # unleased claim is exactly the duplicate coordinator this closes.
+  if ! LEASE_RESULT="$(lease_acquire "$RUN_ID" "$OWNER")"; then
+    printf '%s\n' "$LEASE_RESULT"
+    exit 0
+  fi
   NOW="$(iso_now)"
   # Record WHO was displaced, so the displaced run's next gate call gets a stop
   # instruction naming the takeover instead of the generic reclaim message.
   # Cleared on an ordinary claim so a stale name can never mis-accuse a later run.
+  #
+  # challengerDeadline is stamped here because `claim` is the only point that
+  # knows when the campaign began. A run whose challenger never files by then
+  # is finishable ONLY through `challenger-timeout`, and only as BLOCKED.
   STATE="$(jq -c --arg sha "$SHA" --arg now "$NOW" --arg run "$RUN_ID" --arg took "$TOOK_OVER" \
+    --arg deadline "$(challenger_deadline_from_now)" \
     '.activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=$now |
      .displacedRunId=(if $took == "" then null else $took end) |
-     .displacedAt=(if $took == "" then null else $now end)' <<<"$STATE")"
+     .displacedAt=(if $took == "" then null else $now end) |
+     .challengerDeadline=$deadline |
+     .challengerDisposition=null | .challengerTimedOutAt=null |
+     .finishIntent=null' <<<"$STATE")"
   write_pr_state "$PR" "$STATE"
   jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg sha "$SHA" --arg took "$TOOK_OVER" \
+    --argjson lease "$(jq -c '.lease' <<<"$LEASE_RESULT")" \
+    --arg deadline "$(jq -r '.challengerDeadline' <<<"$STATE")" \
     '{ok:true,runId:$run,pr:$pr,sha:$sha,
-      tookOverFrom:(if $took == "" then null else $took end)}'
+      tookOverFrom:(if $took == "" then null else $took end),
+      lease:$lease,challengerDeadline:$deadline}'
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Lease verbs. Standalone so a coordinator can hold a lease across steps the
+# gate knows nothing about; `claim` takes one implicitly and `finish`/`release`
+# drop it, so a campaign that only uses the existing verbs is fully covered
+# without ever naming these.
+if [ "$COMMAND" = "lease-claim" ] || [ "$COMMAND" = "lease-renew" ] ||
+   [ "$COMMAND" = "lease-release" ] || [ "$COMMAND" = "lease-status" ]; then
+  RUN_ID="${2:-}"
+  OWNER="${3:-$DEFAULT_OWNER}"
+  if ! run_id_ok "$RUN_ID"; then
+    jq -cn --arg cmd "$COMMAND" --arg run "$RUN_ID" \
+      '{ok:false,error:($cmd + " requires a run id of 1-200 chars of [A-Za-z0-9._-]"),runId:$run}'
+    exit 2
+  fi
+
+  if [ "$COMMAND" = "lease-status" ]; then
+    LEASE="$(read_lease "$RUN_ID")"
+    jq -cn --arg run "$RUN_ID" --argjson lease "$LEASE" --argjson live "$(lease_is_live "$LEASE")" \
+      '{ok:true,runId:$run,held:$live,lease:$lease}'
+    exit 0
+  fi
+
+  if [ "$COMMAND" = "lease-claim" ]; then
+    lease_acquire "$RUN_ID" "$OWNER"
+    exit 0
+  fi
+
+  # renew / release both require the caller to BE the owner. A non-owner
+  # renewing would extend someone else's hold; a non-owner releasing would
+  # hand the run to whoever asked next, which is the fault this file exists
+  # to stop.
+  exec 6>"$(lease_lock_file "$RUN_ID")"
+  if ! flock -w "$LOCK_WAIT" 6; then
+    jq -cn --arg run "$RUN_ID" --arg cmd "$COMMAND" \
+      '{ok:false,retryable:true,
+        error:"gate_lock_busy: another invocation held this run'"'"'s lease lock — RETRY this same command in ~10s.",
+        runId:$run,command:$cmd}'
+    exit 0
+  fi
+  LEASE="$(read_lease "$RUN_ID")"
+  if [ "$LEASE" = null ]; then
+    jq -cn --arg run "$RUN_ID" --arg cmd "$COMMAND" \
+      '{ok:false,error:("no lease exists for this run — " +
+        (if $cmd == "lease-renew" then "claim it with lease-claim before renewing" else "nothing to release" end)),
+        runId:$run}'
+    flock -u 6
+    exit 0
+  fi
+  LEASE_OWNER="$(jq -r '.owner // empty' <<<"$LEASE")"
+  if [ "$LEASE_OWNER" != "$OWNER" ]; then
+    jq -cn --arg run "$RUN_ID" --arg owner "$OWNER" --argjson lease "$LEASE" \
+      --argjson live "$(lease_is_live "$LEASE")" \
+      '{ok:false,error:"this run'"'"'s lease belongs to another owner — only its owner may renew or release it",
+        runId:$run,requestedBy:$owner,leaseOwner:$lease.owner,held:$live,expiresAt:$lease.expiresAt}'
+    flock -u 6
+    exit 0
+  fi
+  if [ "$COMMAND" = "lease-release" ]; then
+    rm -f "$(lease_file "$RUN_ID")" 2>/dev/null
+    jq -cn --arg run "$RUN_ID" --arg owner "$OWNER" '{ok:true,runId:$run,released:true,owner:$owner}'
+    flock -u 6
+    exit 0
+  fi
+  # lease-renew. An EXPIRED lease is renewable by its own owner — expiry means
+  # "others may now take over", not "the owner has been evicted", and refusing
+  # here would push a still-healthy coordinator into a takeover race with
+  # itself.
+  NEXT="$(jq -c --arg now "$(iso_now)" --arg exp "$(lease_expiry_from_now)" \
+    '.renewedAt=$now | .expiresAt=$exp' <<<"$LEASE")"
+  if ! write_lease "$RUN_ID" "$NEXT"; then
+    jq -cn --arg run "$RUN_ID" --arg dir "$STATE_DIR" \
+      '{ok:false,error:("could not write the lease file under " + $dir + " — the lease will EXPIRE; fix the state dir and retry"),runId:$run}'
+    flock -u 6
+    exit 1
+  fi
+  jq -cn --arg run "$RUN_ID" --argjson lease "$(read_lease "$RUN_ID")" \
+    '{ok:true,runId:$run,renewed:true,lease:$lease}'
+  flock -u 6
   exit 0
 fi
 
@@ -804,9 +1107,13 @@ if [ "$COMMAND" = "release" ]; then
         activeRunId:(if $active == "" then null else $active end)}'
     exit 0
   fi
-  STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null' <<<"$STATE")"
+  STATE="$(jq -c '.activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
+     .challengerDeadline=null | .finishIntent=null' <<<"$STATE")"
   write_pr_state "$PR" "$STATE"
-  jq -cn --argjson pr "$PR" --arg run "$RUN_ID" '{ok:true,releasedRunId:$run,pr:$pr}'
+  # The slot is gone, so the lease must go with it — otherwise the next
+  # coordinator on this run waits out a TTL for a campaign that already ended.
+  lease_drop "$RUN_ID"
+  jq -cn --argjson pr "$PR" --arg run "$RUN_ID" '{ok:true,releasedRunId:$run,pr:$pr,leaseReleased:true}'
   exit 0
 fi
 
@@ -823,6 +1130,83 @@ if [ "$COMMAND" = "finish" ]; then
     GO|NO_GO|HUMAN_DECISION|BLOCKED) ;;
     *) jq -cn '{ok:false,error:"finish verdict must be GO, NO_GO, HUMAN_DECISION, or BLOCKED"}'; exit 2 ;;
   esac
+  if ! run_id_ok "$RUN_ID"; then
+    jq -cn --arg run "$RUN_ID" \
+      '{ok:false,error:"finish requires a run id of 1-200 chars of [A-Za-z0-9._-]",runId:$run}'
+    exit 2
+  fi
+
+  # TERMINAL BINDING — the run-level verdict.json is consulted BEFORE the slot
+  # guard, because it outranks gate state. A completed run is nobody's
+  # activeRunId, so asking the slot first would answer a repeated finish with
+  # "not the active run" — true, and useless: the caller needs to know the
+  # verdict is already recorded, and a caller with a DIFFERENT verdict needs to
+  # be stopped rather than told to re-claim.
+  RUN_VERDICT_FILE="$(run_verdict_file "$RUN_ID")"
+  RUN_VERDICT_RESUMED=false
+  if [ -s "$RUN_VERDICT_FILE" ]; then
+    EXISTING_VERDICT="$(jq -c '.' "$RUN_VERDICT_FILE" 2>/dev/null || printf '')"
+    if [ -n "$EXISTING_VERDICT" ] &&
+       jq -e --arg sha "$SHA" --arg run "$RUN_ID" --arg v "$VERDICT" \
+         '.sha == $sha and .runId == $run and .verdict == $v' \
+         <<<"$EXISTING_VERDICT" >/dev/null 2>&1; then
+      # Same terminal facts. Reuse the recorded finishedAt so the digest is the
+      # SAME string, then let the rest of finish run: a crash between this file
+      # and the hold/ledger writes is exactly the case a retry has to complete,
+      # and every step below is idempotent. Only a run whose gate state is
+      # already committed short-circuits.
+      NOW="$(jq -r '.finishedAt' <<<"$EXISTING_VERDICT")"
+      VERDICT_DIGEST="$(verdict_digest "$EXISTING_VERDICT")"
+      RUN_VERDICT_RESUMED=true
+      COMPLETED_PR="$(find_pr_for_any_run "$RUN_ID" || true)"
+      if [ -n "${COMPLETED_PR:-}" ] &&
+         [ "$(jq -r '.completedRunId // empty' "$(pr_state_file "$COMPLETED_PR")" 2>/dev/null)" = "$RUN_ID" ]; then
+        jq -cn --argjson pr "$COMPLETED_PR" --argjson verdict "$EXISTING_VERDICT" \
+          --arg digest "$VERDICT_DIGEST" --arg path "$RUN_VERDICT_FILE" \
+          '{ok:true,idempotent:true,
+            note:"this run was already finished with these exact terminal facts — nothing re-recorded, no artifact rewritten",
+            pr:$pr,verdictDigest:$digest,runVerdictFile:$path} + $verdict'
+        exit 0
+      fi
+    else
+      # FAIL CLOSED. A second, DIFFERENT verdict for one run means two things
+      # believe they own the outcome. verdict.json stays canonical and
+      # untouched — the gate never fabricates a BLOCKED to paper over this, and
+      # never overwrites. State and ledger are indexed receipts; the state gets
+      # flagged so no automated path treats this run as settled.
+      RECON_PR="$(find_pr_for_any_run "$RUN_ID" || true)"
+      RECON_RECORDED=false
+      if [ -n "${RECON_PR:-}" ]; then
+        exec 9>"$(pr_lock_file "$RECON_PR")"
+        if flock -w "$LOCK_WAIT" 9; then
+          STATE="$(read_pr_state "$RECON_PR")"
+          STATE="$(jq -c --arg now "$(iso_now)" --arg run "$RUN_ID" --arg path "$RUN_VERDICT_FILE" \
+            --arg attempted "$VERDICT" --arg sha "$SHA" \
+            --argjson recorded "$(if [ -n "$EXISTING_VERDICT" ]; then printf '%s' "$EXISTING_VERDICT"; else printf '"unparseable"'; fi)" \
+            '.gateStatus="reconciliation_required" |
+             .reconciliation={detectedAt:$now,runId:$run,verdictFile:$path,
+                              recorded:$recorded,
+                              attempted:{sha:$sha,verdict:$attempted}}' <<<"$STATE")"
+          write_pr_state "$RECON_PR" "$STATE"
+          RECON_RECORDED=true
+          flock -u 9
+        fi
+        exec 9>&-
+      fi
+      jq -cn --arg run "$RUN_ID" --arg path "$RUN_VERDICT_FILE" --arg sha "$SHA" \
+        --arg attempted "$VERDICT" --argjson recon "$RECON_RECORDED" \
+        --argjson pr "$(if [ -n "${RECON_PR:-}" ]; then printf '%s' "$RECON_PR"; else printf 'null'; fi)" \
+        --argjson recorded "$(if [ -n "$EXISTING_VERDICT" ]; then printf '%s' "$EXISTING_VERDICT"; else printf '"unparseable"'; fi)" \
+        '{ok:false,gateStatus:"reconciliation_required",
+          error:("a DIFFERENT verdict is already recorded for this run — STOP. Nothing was overwritten and no verdict was fabricated. " +
+                 $path + " stays canonical; a human must reconcile which campaign owns this run before any verdict is published."),
+          runId:$run,pr:$pr,runVerdictFile:$path,
+          recordedVerdict:$recorded,attemptedVerdict:{sha:$sha,verdict:$attempted},
+          stateFlagged:$recon}'
+      exit 1
+    fi
+  fi
+
   PR="$(find_pr_for_run "$RUN_ID" || true)"
   if [ -z "$RUN_ID" ] || [ -z "${PR:-}" ]; then
     emit_not_active "$RUN_ID" "not the active run (reclaimed or already finished) — no verdict recorded"
@@ -875,7 +1259,94 @@ if [ "$COMMAND" = "finish" ]; then
         claimedSha:(if $claimed == "" then null else $claimed end)}'
     exit 2
   fi
-  NOW="$(iso_now)"
+
+  # HARD RULE: `no-disposition` must never permit synthesis or GO. The
+  # challenger timeout exists to end a stall, and a stall that releases the
+  # coordinator toward GO is strictly worse than the stall — it publishes a
+  # pass that nothing challenged. Refused before any state or artifact is
+  # touched, so the slot survives and a correct verdict can still be recorded.
+  if [ "$VERDICT" = GO ] &&
+     [ "$(jq -r '.challengerDisposition // empty' <<<"$STATE")" = "no-disposition" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      --arg at "$(jq -r '.challengerTimedOutAt // empty' <<<"$STATE")" \
+      '{ok:false,
+        error:("this run'"'"'s challenger never filed a disposition before its deadline (recorded no-disposition at " + $at +
+               ") — GO is REFUSED. An unchallenged campaign cannot pass. Finish NO_GO, HUMAN_DECISION or BLOCKED."),
+        pr:$pr,runId:$run,challengerDisposition:"no-disposition",refusedVerdict:"GO"}'
+    exit 2
+  fi
+
+  # TERMINAL BINDING — recoverable commit sequence, steps 2 and 3.
+  #
+  # 2. finishIntent first. It carries the ONE finishedAt this run will ever
+  #    use, so a finish that crashes before verdict.json lands recomputes the
+  #    SAME digest on retry instead of colliding with itself. An intent whose
+  #    terminal facts differ from this invocation's is NOT resumed — that is a
+  #    real disagreement, and it falls through to a fresh intent whose digest
+  #    will not match any verdict.json already on disk.
+  # 3. verdict.json, write-once, before ANY completed state exists. That
+  #    ordering is the whole point: state and ledger become receipts of a file
+  #    that already exists, so they can never be the sole surviving authority.
+  if [ "$RUN_VERDICT_RESUMED" != true ]; then
+    INTENT="$(jq -c --arg run "$RUN_ID" --arg sha "$SHA" --arg v "$VERDICT" \
+      '.finishIntent // empty | select(.runId == $run and .sha == $sha and .verdict == $v)' <<<"$STATE")"
+    if [ -n "$INTENT" ]; then
+      NOW="$(jq -r '.finishedAt' <<<"$INTENT")"
+      VERDICT_DIGEST="$(jq -r '.digest' <<<"$INTENT")"
+    else
+      NOW="$(iso_now)"
+      VERDICT_DIGEST="$(verdict_digest "$(verdict_payload "$SHA" "$RUN_ID" "$VERDICT" "$NOW")")"
+      STATE="$(jq -c --arg run "$RUN_ID" --arg sha "$SHA" --arg v "$VERDICT" \
+        --arg now "$NOW" --arg d "$VERDICT_DIGEST" \
+        '.finishIntent={runId:$run,sha:$sha,verdict:$v,finishedAt:$now,digest:$d,recordedAt:$now}' <<<"$STATE")"
+      write_pr_state "$PR" "$STATE"
+    fi
+
+    # `ln` and not `mv -n`: GNU `mv -n` exits 0 when it SKIPS, which is
+    # indistinguishable from having written the file. `ln` fails with EEXIST,
+    # so "I created it" and "it was already there" are separable — and they
+    # have to be, because they mean opposite things here.
+    mkdir -p "$(run_dir "$RUN_ID")" 2>/dev/null
+    RV_TMP="$(mktemp "$(run_dir "$RUN_ID")/.verdict.XXXXXX" 2>/dev/null)"
+    if [ -z "$RV_TMP" ]; then
+      jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg dir "$(run_dir "$RUN_ID")" \
+        '{ok:false,error:("could not stage the run verdict under " + $dir +
+                          " — no verdict recorded, no hold touched, slot still held. Fix the state dir and re-run this finish."),
+          pr:$pr,runId:$run}'
+      exit 1
+    fi
+    verdict_payload "$SHA" "$RUN_ID" "$VERDICT" "$NOW" > "$RV_TMP"
+    if ln "$RV_TMP" "$RUN_VERDICT_FILE" 2>/dev/null; then
+      rm -f "$RV_TMP" 2>/dev/null
+    else
+      rm -f "$RV_TMP" 2>/dev/null
+      # Lost the create to a concurrent finish between the short-circuit above
+      # and here. Same arbitration, same refusal to overwrite.
+      EXISTING_VERDICT="$(jq -c '.' "$RUN_VERDICT_FILE" 2>/dev/null || printf '')"
+      if [ -n "$EXISTING_VERDICT" ] &&
+         [ "$(verdict_digest "$EXISTING_VERDICT")" = "$VERDICT_DIGEST" ]; then
+        : # identical file already there — proceed, the artifacts below are idempotent
+      else
+        STATE="$(jq -c --arg now "$(iso_now)" --arg run "$RUN_ID" --arg path "$RUN_VERDICT_FILE" \
+          --arg attempted "$VERDICT" --arg sha "$SHA" \
+          --argjson recorded "$(if [ -n "$EXISTING_VERDICT" ]; then printf '%s' "$EXISTING_VERDICT"; else printf '"unparseable"'; fi)" \
+          '.gateStatus="reconciliation_required" |
+           .reconciliation={detectedAt:$now,runId:$run,verdictFile:$path,
+                            recorded:$recorded,attempted:{sha:$sha,verdict:$attempted}}' <<<"$STATE")"
+        write_pr_state "$PR" "$STATE"
+        jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg path "$RUN_VERDICT_FILE" \
+          --arg sha "$SHA" --arg attempted "$VERDICT" \
+          --argjson recorded "$(if [ -n "$EXISTING_VERDICT" ]; then printf '%s' "$EXISTING_VERDICT"; else printf '"unparseable"'; fi)" \
+          '{ok:false,gateStatus:"reconciliation_required",
+            error:("a DIFFERENT verdict was written for this run while this finish was running — STOP. Nothing was overwritten and no verdict was fabricated; " +
+                   $path + " stays canonical. A human must reconcile which campaign owns this run."),
+            pr:$pr,runId:$run,runVerdictFile:$path,
+            recordedVerdict:$recorded,attemptedVerdict:{sha:$sha,verdict:$attempted},stateFlagged:true}'
+        exit 1
+      fi
+    fi
+  fi
+
   # ORDER IS THE CRASH CONTRACT. Clearing the slot FIRST — which is what this
   # did — made `finish` fail OPEN and permanently: a container death after the
   # state write but before the hold/ledger recorded NO_GO per-PR while the
@@ -1091,10 +1562,16 @@ if [ "$COMMAND" = "finish" ]; then
           for LEDGER_ATTEMPT in 1 2; do
             exec 7>"$HANDOFF_LEDGER.lock"
             if flock -w 5 7; then
+              # verdictDigest ties this line to the run-level verdict.json it is
+              # a receipt of: a ledger line whose digest names no verdict file
+              # is a fabrication, and one that disagrees with the file is the
+              # reconciliation case. Appended, so older readers (the develop
+              # gate's tail -1 + field reads) are unaffected.
               jq -cn --arg target "$TARGET_SHA" --arg freeze "$SHA" --argjson pr "$PR" \
                 --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
+                --arg digest "$VERDICT_DIGEST" \
                 '{schemaVersion:1,targetSha:$target,freezeSha:$freeze,freezePr:$pr,
-                  runId:$run,verdict:$verdict,finishedAt:$now}' >> "$HANDOFF_LEDGER"
+                  runId:$run,verdict:$verdict,finishedAt:$now,verdictDigest:$digest}' >> "$HANDOFF_LEDGER"
               # VERIFIED like the publish/hold writes above: taking the lock
               # says nothing about the append landing. A writable directory
               # with an unwritable ledger FILE (ENOSPC, chattr +i, a bad mode)
@@ -1164,12 +1641,20 @@ if [ "$COMMAND" = "finish" ]; then
         handoff:{written:$handoffWritten}}'
     exit 0
   fi
+  # Step 4: commit completed state as a RECEIPT of the verdict file, carrying
+  # its digest so the two can be checked against each other later. The intent
+  # is consumed here — it has done its job the moment verdict.json exists.
   STATE="$(jq -c \
     --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
+    --arg digest "$VERDICT_DIGEST" \
     '.completedSha=$sha | .completedAt=$now | .completedRunId=$run | .completedVerdict=$verdict |
-     .activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null' <<<"$STATE")"
+     .completedVerdictDigest=$digest | .finishIntent=null |
+     .activeSha=null | .activeStartedAt=null | .activeRunId=null | .activeProgressAt=null |
+     .challengerDeadline=null' <<<"$STATE")"
   write_pr_state "$PR" "$STATE"
   flock -u 9
+  # The run is terminal — no coordinator may hold it any longer.
+  lease_drop "$RUN_ID"
 
   VERDICT_JSON="$(jq -cn \
     --argjson pr "$PR" --arg sha "$SHA" --arg run "$RUN_ID" --arg verdict "$VERDICT" --arg now "$NOW" \
@@ -1177,7 +1662,9 @@ if [ "$COMMAND" = "finish" ]; then
     --argjson status "$SUSPEND_STATUS" --arg reason "$SUSPEND_REASON" \
     --argjson handoffWritten "$HANDOFF_WRITTEN" --arg handoffReason "$HANDOFF_REASON" \
     --arg handoffTargetSha "$HANDOFF_TARGET_SHA" --arg divergence "$HANDOFF_DIVERGENCE" \
+    --arg digest "$VERDICT_DIGEST" --arg runVerdictFile "$RUN_VERDICT_FILE" \
     '{schemaVersion:1,pr:$pr,sha:$sha,runId:$run,verdict:$verdict,finishedAt:$now,
+      verdictDigest:$digest,runVerdictFile:$runVerdictFile,
       suspend:{attempted:$attempted,ok:$ok,httpStatus:$status,
                reason:(if $reason == "" then null else $reason end)},
       handoff:{written:$handoffWritten,
@@ -1192,10 +1679,111 @@ if [ "$COMMAND" = "finish" ]; then
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# challenger-timeout: end a campaign the challenger abandoned. Runs pr1195 and
+# pr1228 stalled indefinitely because challenger/disposition.md was never
+# written and nothing had a deadline. The ONLY outcome this verb can produce is
+# BLOCKED, and it produces it through the ordinary `finish` — a timeout that
+# unblocks a coordinator toward GO is worse than the stall it ends.
+if [ "$COMMAND" = "challenger-timeout" ]; then
+  RUN_ID="${2:-}"
+  if ! run_id_ok "$RUN_ID"; then
+    jq -cn --arg run "$RUN_ID" \
+      '{ok:false,error:"challenger-timeout requires a run id of 1-200 chars of [A-Za-z0-9._-]",runId:$run}'
+    exit 2
+  fi
+  PR="$(find_pr_for_run "$RUN_ID" || true)"
+  if [ -z "${PR:-}" ]; then
+    emit_not_active "$RUN_ID" "not the active run (reclaimed or already finished) — nothing to time out"
+    exit 0
+  fi
+  exec 9>"$(pr_lock_file "$PR")"
+  if ! flock -w "$LOCK_WAIT" 9; then
+    emit_lock_busy "$COMMAND" "$PR"
+    exit 0
+  fi
+  STATE="$(read_pr_state "$PR")"
+  if [ "$RUN_ID" != "$(jq -r '.activeRunId // empty' <<<"$STATE")" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      --arg active "$(jq -r '.activeRunId // empty' <<<"$STATE")" \
+      '{ok:false,error:"not the active run — nothing to time out",
+        pr:$pr,runId:$run,activeRunId:(if $active == "" then null else $active end)}'
+    exit 0
+  fi
+  DEADLINE="$(jq -r '.challengerDeadline // empty' <<<"$STATE")"
+  if [ -z "$DEADLINE" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,error:"this run has no challengerDeadline — it was claimed before deadlines were stamped, so there is nothing to time out. Release it or finish it explicitly.",
+        pr:$pr,runId:$run}'
+    exit 2
+  fi
+  REMAINING="$(( $(epoch_or_zero "$DEADLINE") - $(date -u +%s) ))"
+  if [ "$REMAINING" -gt 0 ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg deadline "$DEADLINE" \
+      --argjson remaining "$REMAINING" \
+      '{ok:false,error:"the challenger deadline has not passed — keep waiting",
+        pr:$pr,runId:$run,challengerDeadline:$deadline,remainingSeconds:$remaining}'
+    exit 0
+  fi
+  # Absence is only evidence when presence was possible. With no run root
+  # configured the gate cannot look, and an unreadable lookup must never be
+  # read as "the challenger filed nothing" — that would BLOCK healthy campaigns
+  # on every deployment that has not wired this.
+  if [ -z "$CHALLENGER_RUN_ROOT" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,error:"SMOKE_GATE_RUN_ROOT is not set, so the gate cannot look for challenger/disposition.md — refusing to declare a disposition missing that it never checked for. Wire SMOKE_GATE_RUN_ROOT to the run root, or finish this run explicitly.",
+        pr:$pr,runId:$run}'
+    exit 2
+  fi
+  if [ ! -d "$CHALLENGER_RUN_ROOT" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg root "$CHALLENGER_RUN_ROOT" \
+      '{ok:false,error:("SMOKE_GATE_RUN_ROOT " + $root + " is not readable — the lookup failed, which is not the same as a missing disposition. Fix the mount and retry."),
+        pr:$pr,runId:$run,runRoot:$root}'
+    exit 2
+  fi
+  DISPOSITION_FILE="$(challenger_disposition_file "$RUN_ID")"
+  if [ -s "$DISPOSITION_FILE" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" --arg path "$DISPOSITION_FILE" \
+      '{ok:false,error:"the challenger DID file a disposition — nothing timed out. Synthesize and finish normally.",
+        pr:$pr,runId:$run,dispositionFile:$path}'
+    exit 0
+  fi
+  NOW="$(iso_now)"
+  SHA="$(jq -r '.activeSha // empty' <<<"$STATE")"
+  STATE="$(jq -c --arg now "$NOW" --arg deadline "$DEADLINE" \
+    '.challengerDisposition="no-disposition" | .challengerTimedOutAt=$now' <<<"$STATE")"
+  write_pr_state "$PR" "$STATE"
+  # Drop the lock before the nested finish, which takes the same one.
+  flock -u 9
+  exec 9>&-
+  if [ -z "$SHA" ]; then
+    jq -cn --argjson pr "$PR" --arg run "$RUN_ID" \
+      '{ok:false,challengerDisposition:"no-disposition",
+        error:"recorded no-disposition, but this run has no claimed sha to finish against — reconcile by hand",
+        pr:$pr,runId:$run}'
+    exit 1
+  fi
+  # Through the NORMAL finish, so the write-once verdict.json, the artifact
+  # writes, the ledger line and the lease drop all happen exactly as they do
+  # for a coordinator-authored verdict. BLOCKED is the only verdict this path
+  # can produce, and BLOCKED leaves the promotion hold untouched — a campaign
+  # that could not run asserts nothing about the build.
+  FINISH_OUT="$(bash "$0" finish "$SHA" "$RUN_ID" BLOCKED)"
+  FINISH_RC=$?
+  jq -cn --argjson finish "$FINISH_OUT" --arg deadline "$DEADLINE" --arg at "$NOW" \
+    --arg path "$DISPOSITION_FILE" \
+    '$finish + {challengerDisposition:"no-disposition",challengerDeadline:$deadline,
+                challengerTimedOutAt:$at,expectedDispositionFile:$path}' 2>/dev/null ||
+    printf '%s\n' "$FINISH_OUT"
+  exit "$FINISH_RC"
+fi
+
 if [ "$COMMAND" != "poll" ]; then
   jq -cn --arg command "$COMMAND" \
     '{ok:false,error:("unknown command: " + $command),
-      commands:["poll","check","claim","release","progress","finish"]}'
+      commands:["poll","check","claim","release","progress","finish",
+                "lease-claim","lease-renew","lease-release","lease-status",
+                "challenger-timeout"]}'
   exit 2
 fi
 
@@ -1598,7 +2186,16 @@ if [ -s "$SETTLE_CANDIDATES" ]; then
   done
   NOW="$(iso_now)"
   STATE="$(jq -c --arg sha "$HEAD_SHA" --arg now "$NOW" --arg run "$RUN_ID" \
-    '.activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=null' <<<"$STATE")"
+    --arg deadline "$(challenger_deadline_from_now)" \
+    '.activeSha=$sha | .activeStartedAt=$now | .activeRunId=$run | .activeProgressAt=null |
+     .challengerDeadline=$deadline |
+     .challengerDisposition=null | .challengerTimedOutAt=null | .finishIntent=null' <<<"$STATE")"
+  # Deliberately NO lease here. `poll` registers a RUN, not a coordinator — it
+  # runs as the token-free watcher, so a lease in its name would be owned by
+  # something that never renews it and would lock out the very coordinator this
+  # wake is about to summon. The run is left unleased, which means the FIRST
+  # coordinator to `lease-claim` it wins and a second one is refused — the
+  # protection this exists for, without the watcher's identity in the way.
   write_pr_state "$W_PR" "$STATE"
 
   jq -cn \

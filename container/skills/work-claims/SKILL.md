@@ -176,6 +176,50 @@ anyone reading the directory. If you're stopping without finishing, that's
 moment. Read it ad hoc with `jq` (e.g. `jq 'select(.slug=="acme-pr-733")' claims/ledger.ndjson`
 for one slug's history) — never edit it, and it never shows up in `list`.
 
+## Attribution events — who reviewed, who merged
+
+A claim says who HOLDS a unit of work. It does not say who reviewed it, at which
+head, or who pushed the merge button — and those were being inferred from
+whoever happened to be talking in the thread. The executor and the claim owner
+are frequently different agents. Three verbs record it instead:
+
+```bash
+bash $CLAIM record-review-start DEMO-REPO 42 abc1234 reviewer-a
+bash $CLAIM record-verdict      DEMO-REPO 42 abc1234 reviewer-a NO_GO
+bash $CLAIM record-merge        DEMO-REPO 42 executor-a owner-b abc1234 gates/2026-01-01.jsonl merged
+```
+
+They append to the same `claims/ledger.ndjson`:
+
+```json
+{"ts":"…Z","event":"review_start","repo":"DEMO-REPO","pr":42,"head_sha":"abc1234","reviewer":"reviewer-a"}
+{"ts":"…Z","event":"review_verdict","repo":"DEMO-REPO","pr":42,"head_sha":"abc1234","reviewer":"reviewer-a","verdict":"NO_GO"}
+{"ts":"…Z","event":"merge","repo":"DEMO-REPO","pr":42,"executor":"executor-a","claim_owner":"reviewer-a","head_sha":"abc1234","gate_ref":"gates/2026-01-01.jsonl","result":"merged"}
+```
+
+- All three are **positional and fixed-arity**, every field required. An event
+  with a field guessed from position is worse than no event, so a wrong argument
+  count is an error, not a partial write.
+- `pr` is a bare number (`42`, not `#42`), emitted as JSON number — the same
+  type `cleared_merged` already uses, so `jq 'select(.pr==42)'` returns a PR's
+  whole history across claim and attribution events alike.
+- `claim_owner` is `"none"` when nobody held a claim; `gate_ref` is the
+  `gates/<date>.jsonl` this merge was authorized by, or `"auto-lane"` when the
+  lane needed no human gate.
+
+**The ledger is attribution. The `Release policy` status is enforcement.**
+Recording a merge does not authorize one and never will — `ops/release-policy.py`
+publishes the protected `Release policy` check and is the only thing that decides
+whether a PR may merge. Writing the event after the fact changes nothing about
+whether it was allowed.
+
+**Never write a review or merge event into `releases/gates/*.jsonl`.** Those are
+human AUTHORIZATION records — what a person said may ship. An execution event
+appearing there makes the machine's own action indistinguishable from a human's
+permission, which is precisely the audit failure this layer exists to prevent.
+`claim.sh` enforces it: a `CLAIMS_DIR` pointed under a `gates/` tree refuses to
+append at all. `gate_ref` POINTS AT a gates file; it is never written INTO one.
+
 **One exception to "only your own": work that is provably complete.** If the
 PR the claim names has MERGED, delete the claim whatever the owner says. The
 ownership rule exists to stop you taking live work off someone — a merged PR

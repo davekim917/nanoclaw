@@ -227,4 +227,78 @@ jq -e 'has("thread_id") | not' "$CLAIMS_DIR/acme-thread-sib.json" >/dev/null \
   || fail "refused thread still wrote"
 bash "$CLAIM" thread never-claimed >/dev/null 2>&1 && fail "threaded a slug with no claim"
 
+# 28. The three attribution events append with exactly the documented fields.
+#     pr is a NUMBER so one jq select finds a slug's history across event types.
+GATES="$ROOT/workgroup/releases/gates"
+mkdir -p "$GATES"
+printf '{"gate":"human authorization record","pr":42}\n' > "$GATES/2026-08-29.jsonl"
+GATES_BEFORE="$(cd "$GATES" && ls | sort && cat ./*.jsonl | sha256sum)"
+
+bash "$CLAIM" record-review-start DEMO-REPO 42 abc1234 reviewer-a >/dev/null
+tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
+  .event == "review_start" and .repo == "DEMO-REPO" and .pr == 42 and
+  .head_sha == "abc1234" and .reviewer == "reviewer-a" and (.ts | endswith("Z"))
+' >/dev/null || fail "record-review-start did not write the documented fields"
+
+bash "$CLAIM" record-verdict DEMO-REPO 42 abc1234 reviewer-a NO_GO >/dev/null
+tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
+  .event == "review_verdict" and .repo == "DEMO-REPO" and .pr == 42 and
+  .head_sha == "abc1234" and .reviewer == "reviewer-a" and .verdict == "NO_GO" and
+  (.ts | endswith("Z"))
+' >/dev/null || fail "record-verdict did not write the documented fields"
+
+bash "$CLAIM" record-merge DEMO-REPO 42 executor-a reviewer-a abc1234 gates/2026-01-01.jsonl merged >/dev/null
+tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
+  .event == "merge" and .repo == "DEMO-REPO" and .pr == 42 and .executor == "executor-a" and
+  .claim_owner == "reviewer-a" and .head_sha == "abc1234" and
+  .gate_ref == "gates/2026-01-01.jsonl" and .result == "merged" and (.ts | endswith("Z"))
+' >/dev/null || fail "record-merge did not write the documented fields"
+
+# 29. An executor with no claim behind it records claim_owner "none", and
+#     "auto-lane" is an accepted gate_ref — the auto lane has no human gate.
+bash "$CLAIM" record-merge DEMO-REPO 43 executor-a none def5678 auto-lane merged >/dev/null
+tail -n1 "$CLAIMS_DIR/ledger.ndjson" | jq -e '
+  .claim_owner == "none" and .gate_ref == "auto-lane" and .pr == 43
+' >/dev/null || fail "record-merge rejected the none/auto-lane placeholders"
+
+# 30. THE RULE THIS LAYER EXISTS FOR: an execution event never lands in a gates
+#     file. releases/gates/*.jsonl are human AUTHORIZATION records; a merge or
+#     review event appearing there is the audit failure, not a convenience.
+[ "$(cd "$GATES" && ls | sort && cat ./*.jsonl | sha256sum)" = "$GATES_BEFORE" ] \
+  || fail "recording events touched releases/gates/"
+grep -rlE '"event":"(merge|review_start|review_verdict)"' "$GATES" 2>/dev/null \
+  && fail "an execution event was written into a gates file"
+
+# 30b. Even a CLAIMS_DIR misconfigured onto a gates tree refuses rather than
+#      appending — the rule is enforced by the script, not by convention.
+[ "$(CLAIMS_DIR="$GATES" bash "$CLAIM" record-merge XZO 1 a b c auto-lane merged >/dev/null 2>&1; echo $?)" = 2 ] \
+  || fail "a gates-rooted CLAIMS_DIR was allowed to append"
+[ -f "$GATES/ledger.ndjson" ] && fail "refused gates-rooted append still wrote a ledger"
+
+# 31. Arity and emptiness are checked exactly — a field guessed from position is
+#     worse than no event at all. Nothing is appended on a bad call.
+LEDGER_LINES="$(wc -l < "$CLAIMS_DIR/ledger.ndjson")"
+bash "$CLAIM" record-review-start DEMO-REPO 42 abc1234 >/dev/null 2>&1 \
+  && fail "record-review-start accepted 3 of 4 arguments"
+bash "$CLAIM" record-review-start DEMO-REPO 42 abc1234 reviewer-a extra >/dev/null 2>&1 \
+  && fail "record-review-start accepted a 5th argument"
+bash "$CLAIM" record-verdict DEMO-REPO 42 abc1234 reviewer-a >/dev/null 2>&1 \
+  && fail "record-verdict accepted 4 of 5 arguments"
+bash "$CLAIM" record-merge DEMO-REPO 42 executor-a reviewer-a abc1234 gates/x.jsonl >/dev/null 2>&1 \
+  && fail "record-merge accepted 6 of 7 arguments"
+bash "$CLAIM" record-verdict DEMO-REPO 42 abc1234 "" NO_GO >/dev/null 2>&1 \
+  && fail "record-verdict accepted an empty reviewer"
+bash "$CLAIM" record-review-start XZO "#42" abc1234 reviewer-a >/dev/null 2>&1 \
+  && fail "record-review-start accepted a non-numeric pr"
+[ "$(wc -l < "$CLAIMS_DIR/ledger.ndjson")" = "$LEDGER_LINES" ] \
+  || fail "a rejected record call still appended to the ledger"
+
+# 32. An unknown subcommand still fails loudly rather than becoming a no-op.
+bash "$CLAIM" record-something-else DEMO-REPO 42 >/dev/null 2>&1 \
+  && fail "an unknown subcommand did not fail"
+
+# 33. Re-check every ledger line — including the new events — is single-line JSON.
+[ "$(wc -l < "$CLAIMS_DIR/ledger.ndjson")" = "$(jq -s length "$CLAIMS_DIR/ledger.ndjson")" ] \
+  || fail "ledger is not one JSON object per line"
+
 echo "all claim.sh tests passed"
