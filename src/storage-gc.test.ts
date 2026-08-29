@@ -553,6 +553,87 @@ describe('storage GC — apply mode', () => {
     },
   );
 
+  it.skipIf(!hasTrash)('P2: a trash failure restores intact and runs no prune — the checkout stays usable', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-trashfail');
+    state.rows = [sessionRow('thread-idle-trashfail', 'folder-a', 'active', 20)];
+    // Block trash-cli's own trash dir (a FILE where it wants a directory)
+    // so the real `/usr/bin/trash` call fails deterministically — confirmed
+    // this makes trash-put exit 74 rather than silently falling back.
+    const blockedXdg = path.join(path.dirname(state.dataDir), 'blocked-xdg-data-home');
+    fs.writeFileSync(blockedXdg, '');
+    const savedXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = blockedXdg;
+    try {
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'trash-failed' });
+      expect(fs.existsSync(topicDir)).toBe(true);
+      // Registration untouched — prune must not have run.
+      expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+      // The restored checkout is actually usable.
+      expect(() => git(worktree, ['rev-parse', 'HEAD'])).not.toThrow();
+    } finally {
+      if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = savedXdg;
+    }
+  });
+
+  it.skipIf(!hasTrash)('P1: rollback tolerates the spawn path recreating just the worktrees root', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-rootrecreated');
+    state.rowsPerCall = [
+      [sessionRow('thread-idle-rootrecreated', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-rootrecreated', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-rootrecreated', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-rootrecreated', 'folder-a', 'active', 20)],
+      [sessionRow('thread-idle-rootrecreated', 'folder-a', 'active', 1)],
+    ];
+    const realRename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from as fs.PathLike, to as fs.PathLike);
+      // container-runner.ts:1746's own mkdirSync(<topic>/worktrees, {recursive:true}) —
+      // the root exists again, but this repo's slot inside it does not yet.
+      fs.mkdirSync(path.join(topicDir, 'worktrees'), { recursive: true });
+    });
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    vi.restoreAllMocks();
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+    // The destination slot was free — per-repo rename landed normally, no
+    // stranding, so registrations stayed valid and nothing got pruned.
+    expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+    expect(() => git(worktree, ['rev-parse', 'HEAD'])).not.toThrow();
+  });
+
+  it.skipIf(!hasTrash)(
+    'P1: destination slot already occupied — keeps the live copy and prunes so the branch is free again',
+    () => {
+      const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-slotoccupied');
+      state.rowsPerCall = [
+        [sessionRow('thread-idle-slotoccupied', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-slotoccupied', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-slotoccupied', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-slotoccupied', 'folder-a', 'active', 20)],
+        [sessionRow('thread-idle-slotoccupied', 'folder-a', 'active', 1)],
+      ];
+      const realRename = fs.renameSync.bind(fs);
+      vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+        realRename(from as fs.PathLike, to as fs.PathLike);
+        // The agent fully recreated this repo's worktree slot before rollback ran.
+        fs.mkdirSync(worktree, { recursive: true });
+      });
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      vi.restoreAllMocks();
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+      // The live (recreated) copy was kept in place, not clobbered.
+      expect(fs.existsSync(worktree)).toBe(true);
+      // Its dangling registration was pruned, so the branch is free for a
+      // fresh checkout elsewhere.
+      expect(git(canonical, ['worktree', 'list'])).not.toContain(branch);
+      expect(() => git(canonical, ['worktree', 'add', '-q', `${worktree}-2`, branch])).not.toThrow();
+    },
+  );
+
   it.skipIf(!hasTrash)('trashes a CLOSED-path topic directly, untouched by the idle rollback logic', () => {
     const { topicDir } = topicFixture('thread-closed-apply');
     state.rows = [sessionRow('thread-closed-apply', 'folder-a', 'closed')];

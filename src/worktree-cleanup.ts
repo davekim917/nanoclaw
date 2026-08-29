@@ -911,22 +911,86 @@ function overlapsAny(target: string, mounts: string[]): boolean {
  * instantly-reversible rename), recheck, and only THEN hand the quarantined
  * copy to the real `trash` for its 30-day retention.
  */
-function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
-  const snapshot = candidate.idleSnapshot!;
-  const resolvedOriginal = fs.realpathSync(candidate.path);
-  const quarantineRoot = path.join(dataDir, '.gc-quarantine');
-  const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
-  fs.mkdirSync(quarantineRoot, { recursive: true });
-  fs.renameSync(candidate.path, quarantinePath);
+/**
+ * Roll a quarantined topic back toward its original path, repo by repo.
+ *
+ * Precondition: every topic reaching finalizeIdleCollection already passed
+ * provenDisposable (clean, pushed, no stash) at scan time. So no interleaving
+ * here can ever lose unrecoverable work — the only harms left are STUCK
+ * STATES (a dangling canonical-repo registration, or a wedged create_worktree
+ * on an empty root). Every branch below is designed to end in a state the
+ * next spawn can build from.
+ *
+ * Naive whole-topic rename-back isn't safe: the spawn path does
+ * `mkdirSync(<topic>/worktrees, {recursive:true})` (container-runner.ts:1746)
+ * on its own, so a live container can already have recreated the destination
+ * by the time we get here, and a bare rename would EEXIST. Reconcile per repo
+ * instead: if the destination slot is absent, rename that repo back in place
+ * (its registration is still valid there, so the checkout works immediately).
+ * If the destination is already occupied (the agent beat us to it), keep the
+ * live copy and trash the quarantined one — safe per the precondition above.
+ * If anything couldn't be put back valid, prune every repo's canonical
+ * registration afterward so nothing dangles against a missing path (pruning
+ * a repo that WAS restored cleanly is a harmless no-op — its path exists).
+ */
+function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dataDir: string): void {
+  const repos = (safeDirectories(path.join(quarantinePath, 'worktrees')) ?? []).filter(isRepositoryName);
+  let stranded = repos.length === 0 && fs.existsSync(quarantinePath); // no per-repo split known — see fallback below
 
-  const restore = (): boolean => {
+  if (repos.length > 0) {
+    const destWorktrees = path.join(candidate.path, 'worktrees');
+    fs.mkdirSync(destWorktrees, { recursive: true });
+    for (const repo of repos) {
+      const from = path.join(quarantinePath, 'worktrees', repo);
+      const to = path.join(destWorktrees, repo);
+      if (fs.existsSync(to)) {
+        log.warn('Storage GC: idle-topic rollback found the destination already recreated; keeping the live copy', {
+          repo,
+          to,
+        });
+        stranded = true;
+        try {
+          trashPath(from);
+        } catch (err) {
+          log.error('Storage GC: could not trash a superseded quarantine repo copy', { repo, from, err });
+        }
+        continue;
+      }
+      try {
+        fs.renameSync(from, to);
+      } catch (err) {
+        log.error('Storage GC: idle-topic rollback rename failed for one repo; trashing that copy instead', {
+          repo,
+          from,
+          to,
+          err,
+        });
+        stranded = true;
+        try {
+          trashPath(from);
+        } catch (trashErr) {
+          log.error('Storage GC: could not even trash the stranded quarantine repo copy', {
+            repo,
+            from,
+            err: trashErr,
+          });
+        }
+      }
+    }
+    // Best-effort tidy of the now-empty quarantine entry; a leftover here is
+    // harmless (next reclaim pass or tmpfiles.d cleans it up regardless).
+    try {
+      fs.rmdirSync(path.join(quarantinePath, 'worktrees'));
+      fs.rmdirSync(quarantinePath);
+    } catch {
+      // Non-empty (a repo copy got stranded above) or already gone — fine.
+    }
+  } else if (fs.existsSync(quarantinePath)) {
+    // No repo split to reconcile — fall back to a whole-topic restore.
     try {
       fs.renameSync(quarantinePath, candidate.path);
-      return true;
+      stranded = false;
     } catch (err) {
-      // Never half-restore. If we can't put it back, route it to the real
-      // trash instead of leaving an untracked directory nothing else knows
-      // to clean up — same 30-day retention, still operator-recoverable.
       log.error('Storage GC: idle-topic rollback rename failed; trashing the quarantined copy instead', {
         quarantinePath,
         original: candidate.path,
@@ -937,9 +1001,30 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
       } catch (trashErr) {
         log.error('Storage GC: could not even trash the stranded quarantine copy', { quarantinePath, err: trashErr });
       }
-      return false;
     }
-  };
+  }
+
+  if (stranded) {
+    const workgroupId = path.basename(path.dirname(candidate.path));
+    for (const repo of safeDirectories(path.join(candidate.path, 'worktrees')) ?? []) {
+      if (!isRepositoryName(repo)) continue;
+      if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
+        log.warn('Storage GC: git worktree prune failed after idle-topic rollback; may need a manual prune', {
+          workgroupId,
+          repo,
+        });
+      }
+    }
+  }
+}
+
+function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: boolean; reason?: string } {
+  const snapshot = candidate.idleSnapshot!;
+  const resolvedOriginal = fs.realpathSync(candidate.path);
+  const quarantineRoot = path.join(dataDir, '.gc-quarantine');
+  const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
+  fs.mkdirSync(quarantineRoot, { recursive: true });
+  fs.renameSync(candidate.path, quarantinePath);
 
   const before = new Map(snapshot.map((p) => [p.sessionId, p]));
   const owner = participantsByTopic(dataDir).get(candidate.path);
@@ -948,44 +1033,44 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince);
   });
   if (activityAdvanced) {
-    restore();
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
     return { ok: false, reason: 'aborted-late-activity' };
   }
 
   const freshMounts = runningContainerMounts();
   if (freshMounts === null || pathOverlapsResolvedMounts(resolvedOriginal, freshMounts)) {
-    restore();
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
     return { ok: false, reason: 'aborted-late-activity' };
   }
 
-  // Both checks passed — this is genuinely going away. Deregister each
-  // repo's linked worktree from its CANONICAL repo before trashing, so a
+  // Genuinely clear — capture the repo list before trashing (quarantinePath
+  // won't exist to list afterward), then commit the delete FIRST. Prune runs
+  // only once that succeeds (Codex P2): a trash failure below leaves every
+  // canonical registration untouched, so the restored checkout stays usable.
+  const repos = (safeDirectories(path.join(quarantinePath, 'worktrees')) ?? []).filter(isRepositoryName);
+  try {
+    trashPath(quarantinePath);
+  } catch (err) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    throw err;
+  }
+
+  // Deregister each repo's linked worktree from its CANONICAL repo, so a
   // resumed thread's later create_worktree doesn't hit git's "already
-  // checked out at <missing-path>" error against a stale registration.
-  // Safe unconditionally: container-runner.ts's mount comment documents that
+  // checked out at <missing-path>" error against a stale registration. Safe
+  // unconditionally: container-runner.ts's mount comment documents that
   // topic worktree registrations always use exact host paths on both sides
   // (no container-relative back-pointer can land in them), so `worktree
   // prune` only ever removes entries whose path is genuinely gone — which,
-  // for this repo, is now true (we just renamed it into quarantine).
+  // for this repo, is now true.
   const workgroupId = path.basename(path.dirname(candidate.path));
-  for (const repo of safeDirectories(path.join(quarantinePath, 'worktrees')) ?? []) {
-    if (!isRepositoryName(repo)) continue;
+  for (const repo of repos) {
     if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
       log.warn('Storage GC: git worktree prune failed after idle collection; may need a manual prune', {
         workgroupId,
         repo,
       });
     }
-  }
-
-  try {
-    trashPath(quarantinePath);
-  } catch (err) {
-    // The topic is genuinely clear — only the final trash call itself
-    // failed. Put it back rather than leave it in limbo; the caller's own
-    // catch demotes and logs this like any other trash-failed candidate.
-    restore();
-    throw err;
   }
   return { ok: true };
 }
