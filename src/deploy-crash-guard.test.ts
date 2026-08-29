@@ -31,7 +31,7 @@ function readAttempts(): number | null {
 const exitError = new Error('exit called');
 
 function fakeDeps(execCalls: string[][]): {
-  execFile: (cmd: string, args: string[]) => void;
+  execFile: (cmd: string, args: string[]) => string;
   exit: (code: number) => never;
   now: () => number;
 } {
@@ -40,6 +40,7 @@ function fakeDeps(execCalls: string[][]): {
       execCalls.push([cmd, ...args]);
       // Simulate no pre-deploy docker tag existing.
       if (cmd === 'docker' && args[0] === 'inspect') throw new Error('no such image');
+      return '';
     },
     exit: () => {
       throw exitError;
@@ -214,6 +215,34 @@ describe('performRollback', () => {
       error: string;
     };
     expect(status.error).toContain('commit cccccccc');
+  });
+
+  it('restores runnable artifacts without discarding tracked source changes', () => {
+    writeManifest(0);
+    for (const name of ['dist', 'node_modules']) {
+      fs.mkdirSync(path.join(root, `${name}.pre-deploy`), { recursive: true });
+      fs.writeFileSync(path.join(root, `${name}.pre-deploy`, 'marker'), 'old-good');
+    }
+    const calls: string[][] = [];
+    const deps = fakeDeps(calls);
+    deps.execFile = (cmd: string, args: string[]) => {
+      calls.push([cmd, ...args]);
+      if (cmd === 'git' && args[0] === 'status') return ' M src/providers/index.ts\n';
+      if (cmd === 'docker' && args[0] === 'inspect') throw new Error('no such image');
+      return '';
+    };
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() =>
+      performRollback(root, { commit: 'd'.repeat(40), imageBase: '', timestamp: new Date().toISOString() }, 3, deps),
+    ).toThrow(exitError);
+
+    expect(calls).toContainEqual(['git', 'status', '--porcelain', '--untracked-files=no']);
+    expect(calls.some(([cmd, action]) => cmd === 'git' && action === 'reset')).toBe(false);
+    const status = JSON.parse(fs.readFileSync(path.join(root, 'logs', 'deploy-status.json'), 'utf-8')) as {
+      error: string;
+    };
+    expect(status.error).toContain('tracked source changes preserved');
   });
 });
 

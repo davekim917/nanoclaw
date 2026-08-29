@@ -50,14 +50,14 @@ interface RollbackManifest {
 }
 
 interface GuardDeps {
-  execFile: (cmd: string, args: string[], opts: { cwd: string }) => void;
+  execFile: (cmd: string, args: string[], opts: { cwd: string }) => string;
   exit: (code: number) => never;
   now: () => number;
 }
 
 const realDeps: GuardDeps = {
   execFile: (cmd, args, opts) => {
-    execFileSync(cmd, args, { cwd: opts.cwd, stdio: 'pipe' });
+    return execFileSync(cmd, args, { cwd: opts.cwd, encoding: 'utf8', stdio: 'pipe' });
   },
   exit: (code) => process.exit(code),
   now: () => Date.now(),
@@ -137,8 +137,13 @@ export function performRollback(
     }
   }
   try {
-    deps.execFile('git', ['reset', '--hard', manifest.commit], { cwd: root });
-    restored.push(`commit ${manifest.commit.slice(0, 8)}`);
+    const tracked = deps.execFile('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: root }).trim();
+    if (tracked) {
+      restored.push('tracked source changes preserved (commit reset skipped)');
+    } else {
+      deps.execFile('git', ['reset', '--hard', manifest.commit], { cwd: root });
+      restored.push(`commit ${manifest.commit.slice(0, 8)}`);
+    }
   } catch (err) {
     console.error('deploy-crash-guard: git reset failed', err);
   }
