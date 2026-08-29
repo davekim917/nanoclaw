@@ -1082,15 +1082,23 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
   const quarantineRoot = path.join(dataDir, '.gc-quarantine');
   const quarantinePath = path.join(quarantineRoot, `${path.basename(candidate.path)}-${Date.now()}`);
   fs.mkdirSync(quarantineRoot, { recursive: true });
-  fs.renameSync(candidate.path, quarantinePath);
-  // Crash recovery (Codex P2, round 5): if the process dies before this
-  // function reaches restore or trash, this is the only record of where the
-  // topic came from. recoverOrphanedQuarantine reads it at the next pass.
+
+  // #184: write the recovery marker INTO the topic dir BEFORE the rename that
+  // creates the quarantine entry, so the marker travels with the directory in
+  // the SAME renameSync — one atomic move, not two separate writes with a
+  // crash window between them. A markerless quarantine entry is now
+  // impossible: either the marker-bearing directory got renamed, or nothing
+  // moved at all.
   try {
-    fs.writeFileSync(path.join(quarantinePath, QUARANTINE_META_FILE), JSON.stringify({ originalPath: candidate.path }));
+    fs.writeFileSync(path.join(candidate.path, QUARANTINE_META_FILE), JSON.stringify({ originalPath: candidate.path }));
   } catch (err) {
-    log.warn('Storage GC: could not write quarantine recovery metadata', { quarantinePath, err });
+    log.error('Storage GC: could not write quarantine recovery metadata; leaving the topic in place', {
+      path: candidate.path,
+      err,
+    });
+    return { ok: false, reason: 'quarantine-meta-write-failed' };
   }
+  fs.renameSync(candidate.path, quarantinePath);
 
   const freshMounts = runningContainerMounts();
   if (freshMounts === null || pathOverlapsResolvedMounts(resolvedOriginal, freshMounts)) {

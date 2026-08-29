@@ -840,4 +840,21 @@ describe('storage GC — apply mode', () => {
       expect(git(canonical, ['worktree', 'list'])).toContain(branch);
     },
   );
+
+  it.skipIf(!hasTrash)('#184: a metadata-write failure leaves the topic untouched, never half-quarantined', () => {
+    const { topicDir, canonical, branch } = topicFixture('thread-idle-metafail');
+    state.rows = [sessionRow('thread-idle-metafail', 'folder-a', 'active', 20)];
+    fs.chmodSync(topicDir, 0o555); // no write permission: writing the marker into it fails
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    let report: GcReport;
+    try {
+      report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    } finally {
+      fs.chmodSync(topicDir, 0o755); // restore so afterEach's rmSync can clean up
+    }
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'quarantine-meta-write-failed' });
+    // Nothing was renamed — the topic never left its original path.
+    expect(fs.existsSync(topicDir)).toBe(true);
+    expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+  });
 });
