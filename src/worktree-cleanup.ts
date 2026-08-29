@@ -566,6 +566,21 @@ function gcMode(): 'dry-run' | 'apply' {
 }
 
 /**
+ * A `git worktree lock` marker on this checkout's admin dir. Codex review
+ * (PR #182, round 6, verified against Git 2.43): `worktree prune` exits 0 but
+ * leaves a locked entry's registration in place even once its path is gone —
+ * recreating it afterward fails with "missing but locked worktree". A lock is
+ * an agent explicitly saying "don't touch this", so it makes the checkout
+ * non-disposable regardless of git cleanliness — refuse at evaluation time,
+ * not buried in the later prune step. No-op for a plain clone (scope 'all'):
+ * only a linked worktree's git-dir has a `locked` file to find.
+ */
+function isWorktreeLocked(dir: string): boolean {
+  const gitDir = git(dir, ['rev-parse', '--path-format=absolute', '--git-dir']);
+  return gitDir !== null && fs.existsSync(path.join(gitDir, 'locked'));
+}
+
+/**
  * Positive proof that a checkout holds nothing worth keeping.
  *
  * `scope` is 'head' for a linked worktree (its branch is the only one it owns)
@@ -574,6 +589,8 @@ function gcMode(): 'dry-run' | 'apply' {
  * only resolvable inside a container — returns unprovable, never clean.
  */
 function provenDisposable(dir: string, scope: 'head' | 'all'): { ok: boolean; reason: string } {
+  if (isWorktreeLocked(dir)) return { ok: false, reason: 'worktree-locked' };
+
   const status = git(dir, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
   if (status === null) return { ok: false, reason: 'status-unprovable' };
   if (status !== '') return { ok: false, reason: 'dirty' };
@@ -974,10 +991,19 @@ function reconcileQuarantine(candidate: GcCandidate, quarantinePath: string, dat
           to,
         });
         stranded = true;
-        try {
-          trashPath(from);
-        } catch (err) {
-          log.error('Storage GC: could not trash a superseded quarantine repo copy', { repo, from, err });
+        // A locked copy restores, never trashes — leave it in quarantine
+        // rather than destroy something explicitly marked "don't touch".
+        if (isWorktreeLocked(from)) {
+          log.warn('Storage GC: superseded quarantine repo copy is locked; leaving it in quarantine, not trashing', {
+            repo,
+            from,
+          });
+        } else {
+          try {
+            trashPath(from);
+          } catch (err) {
+            log.error('Storage GC: could not trash a superseded quarantine repo copy', { repo, from, err });
+          }
         }
         continue;
       }
@@ -1106,7 +1132,18 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
   // won't exist to list afterward), then commit the delete FIRST. Prune runs
   // only once that succeeds (Codex P2): a trash failure below leaves every
   // canonical registration untouched, so the restored checkout stays usable.
-  const repos = (safeDirectories(path.join(quarantinePath, 'worktrees')) ?? []).filter(isRepositoryName);
+  const repoListing = safeDirectories(path.join(quarantinePath, 'worktrees'));
+  if (repoListing === null) {
+    // A real read failure (EACCES/EIO), not "no worktrees" — treating it as
+    // empty would prune nothing yet still trash the topic. Leave the entry in
+    // quarantine untouched: recoverOrphanedQuarantine retries it next pass,
+    // which is the safe default the quarantine design already gives for free.
+    log.error('Storage GC: could not read the quarantined topic worktrees; leaving it in quarantine to retry', {
+      quarantinePath,
+    });
+    return { ok: false, reason: 'quarantine-unreadable' };
+  }
+  const repos = repoListing.filter(isRepositoryName);
   try {
     trashPath(quarantinePath);
   } catch (err) {

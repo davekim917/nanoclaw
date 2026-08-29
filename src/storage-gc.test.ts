@@ -310,6 +310,13 @@ describe('storage GC — the predicate refuses', () => {
     const report = runStorageGcOnce(state.dataDir, state.groupsDir);
     expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'recent' });
   });
+
+  it('round 6 P2: refuses a topic whose linked worktree is LOCKED', () => {
+    const { topicDir, worktree, canonical } = topicFixture('thread-locked');
+    git(canonical, ['worktree', 'lock', worktree]);
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'worktree-locked' });
+  });
 });
 
 describe('storage GC — idle-threshold reclaim (owner-approved side-a widening)', () => {
@@ -640,6 +647,49 @@ describe('storage GC — apply mode', () => {
     expect(fs.existsSync(path.join(state.dataDir, '.gc-quarantine'))).toBe(false);
     expect(git(canonical, ['worktree', 'list'])).not.toContain(branch);
     expect(() => git(canonical, ['worktree', 'add', '-q', `${worktree}-2`, branch])).not.toThrow();
+  });
+
+  it.skipIf(!hasTrash)('round 6 P1: leaves the entry in quarantine when its worktrees listing is unreadable', () => {
+    const { topicDir, canonical, branch } = topicFixture('thread-idle-unreadable');
+    state.rows = [sessionRow('thread-idle-unreadable', 'folder-a', 'active', 20)];
+    const realRename = fs.renameSync.bind(fs);
+    vi.spyOn(fs, 'renameSync').mockImplementationOnce((from, to) => {
+      realRename(from as fs.PathLike, to as fs.PathLike);
+      fs.chmodSync(path.join(to as string, 'worktrees'), 0o000); // EACCES-shaped
+    });
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    let report: GcReport;
+    try {
+      report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    } finally {
+      vi.restoreAllMocks();
+    }
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'quarantine-unreadable' });
+    expect(fs.existsSync(topicDir)).toBe(false); // untouched, not restored — still in quarantine
+    expect(git(canonical, ['worktree', 'list'])).toContain(branch); // never pruned
+    // Restore permissions so afterEach's rmSync can actually clean up.
+    const quarantineRoot = path.join(state.dataDir, '.gc-quarantine');
+    for (const entry of fs.readdirSync(quarantineRoot)) {
+      fs.chmodSync(path.join(quarantineRoot, entry, 'worktrees'), 0o755);
+    }
+  });
+
+  it.skipIf(!hasTrash)('round 6 P2: a locked quarantined repo copy is left in quarantine, never trashed', () => {
+    const { topicDir, worktree, canonical } = topicFixture('thread-idle-orphanlocked');
+    git(canonical, ['worktree', 'lock', worktree]);
+    const quarantinePath = path.join(state.dataDir, '.gc-quarantine', 'orphan-locked');
+    fs.mkdirSync(quarantinePath, { recursive: true });
+    fs.cpSync(topicDir, quarantinePath, { recursive: true });
+    fs.rmSync(topicDir, { recursive: true, force: true });
+    fs.writeFileSync(path.join(quarantinePath, '.gc-quarantine-meta.json'), JSON.stringify({ originalPath: topicDir }));
+    // Destination recreated -> the "keep the live copy" reconcile branch.
+    fs.mkdirSync(worktree, { recursive: true });
+    state.rows = [];
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'quarantine-reconciled' });
+    // Never trashed — the locked copy is still sitting in quarantine, unresolved.
+    expect(fs.existsSync(path.join(quarantinePath, 'worktrees', path.basename(worktree)))).toBe(true);
   });
 
   it.skipIf(!hasTrash)('P2: a trash failure restores intact and runs no prune — the checkout stays usable', () => {
