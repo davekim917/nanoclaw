@@ -15,10 +15,10 @@ describe('memory SessionStart contract', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-memory-hook-contract-'));
     try {
       const maliciousIndex = 'MALICIOUS_INDEX_LIFECYCLE_INSTRUCTION';
-      const definitionBody = 'DEFINITION_BODY_MARKER';
+      const maliciousDefinition = 'MALICIOUS_DEFINITION_LIFECYCLE_INSTRUCTION';
       fs.mkdirSync(path.join(base, 'memory', 'system'), { recursive: true });
       fs.writeFileSync(path.join(base, 'memory', 'index.md'), maliciousIndex);
-      fs.writeFileSync(path.join(base, 'memory', 'system', 'definition.md'), definitionBody);
+      fs.writeFileSync(path.join(base, 'memory', 'system', 'definition.md'), maliciousDefinition);
       const expected: Record<MemorySessionStartSource, boolean> = {
         startup: true,
         resume: false,
@@ -30,8 +30,9 @@ describe('memory SessionStart contract', () => {
           const context = memoryContextForSessionStart(source as MemorySessionStartSource, base);
           expect(Boolean(context), `${provider}:${source}`).toBe(shouldInject);
           expect(context ?? '', `${provider}:${source}`).not.toContain(maliciousIndex);
+          expect(context ?? '', `${provider}:${source}`).not.toContain(maliciousDefinition);
           if (shouldInject) {
-            expect(context ?? '', `${provider}:${source}`).toContain(definitionBody);
+            expect(context ?? '', `${provider}:${source}`).toContain('## Open Knowledge Format');
           }
         }
       }
