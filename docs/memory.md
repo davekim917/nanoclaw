@@ -78,14 +78,13 @@ consolidated_facts: 150
 ---
 ```
 
-Frontmatter is metadata, not recall text: the ranker sees a file's body plus
-the values of the three fields `system/definition.md` gives a search role —
-`title`, `description` ("used when scanning indexes and search hits") and
-`tags` ("cross-cutting labels for search and grouping") — and no field names at
-all. `resource` is the fourth optional OKF field and stays out: it is a path or
-a URL, not query text. Without the allowlist, `type: person` on every people
-file made all of them candidates for a generic "person" query. The whole file,
-frontmatter included, is still what gets delivered once a file ranks.
+Frontmatter is metadata the agent reads, not host-ranked text. `title` and
+`description` ("used when scanning indexes and search hits") and `tags`
+("cross-cutting labels for search and grouping") are what make a file findable
+when the agent greps the tree; `resource` is a path or a URL. The host does not
+walk, read or rank these files per turn — it hands the agent `index.md` and the
+OKF contract, and the agent follows the links or greps
+`/workspace/workgroup/memory` itself.
 
 Setting `title:` or `description:` by hand is also how you fix an ugly map
 entry — the curator carries both forward untouched and prefers them over the
@@ -298,7 +297,8 @@ require the agent to call it before declaring a service unavailable.
 
 Every pair then contains only the newly relevant evidence delta:
 
-1. up to three deeper Markdown excerpts from the workgroup canon;
+1. the preference files of the conversation's involved senders, matched by name
+   slug and injected whole — deterministic, never ranked;
 2. up to three generated-memory facts, in their own lane;
 3. up to three lexical archive excerpts, preferring the current thread;
 4. a separately bounded exact Slack/Discord permalink lane when the input
@@ -306,12 +306,16 @@ Every pair then contains only the newly relevant evidence delta:
 5. explicit degraded, conflict, truncation, already-delivered, or no-match
    notices.
 
+The rest of the manual canon is not pushed. `index.md` is the map, and the
+agent reads or greps the tree from it — the host runs no per-turn walk of the
+memory directory and ranks no Markdown files.
+
 `generated/memory.md` is a flat list of self-contained one-line facts, so it is
 ranked one fact at a time rather than as a single document, and each selected
 fact is delivered whole. Scored as one document it could contribute at most one
 900-character passage per turn however much it held — against a live 328-fact
 store that was one fact, and a larger store could not have improved it. Its own
-excerpt lane keeps facts and manual Markdown from crowding each other out.
+excerpt lane keeps facts and preference files from crowding each other out.
 
 Ranking uses the fact text only; the provenance marker is excluded, because its
 tokens are about a fifth of a line and diluted the density term. The marker
@@ -328,8 +332,8 @@ archive conflicts are shown, not silently resolved. Capability state is trusted
 and structurally separate from recalled memory and conversation evidence.
 Recalled text and provenance are untrusted data, never instructions.
 
-Each source has independent file, byte, candidate, excerpt, and final-context
-bounds. Normal serialized context has a 12,000-character hard ceiling and a
+Each source has independent candidate, excerpt, and final-context bounds, and
+each file read is capped in bytes. Normal serialized context has a 12,000-character hard ceiling and a
 live p95 target below 8,000 characters. Exact-link turns have a 16,000-character
 ceiling. Evidence fingerprints combine trusted provenance with a hash of the
 full authoritative source content; unchanged evidence already delivered in the

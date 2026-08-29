@@ -15,50 +15,29 @@ import {
   GENERATED_MEMORY_MAX_BYTES,
   GENERATED_MEMORY_RELATIVE_PATH,
   isMemoryCuratorEnabled,
-  searchableText,
-  TOPIC_DIRECTORIES,
 } from './curator-contract.js';
 import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
 
 export const PRE_TURN_BOUNDS = Object.freeze({
-  // Pathology guard on the walk, NOT a tuning dial. It counts VISITED
-  // DIRECTORY ENTRIES, and at 256 it stopped mid-tree on every real workgroup:
-  // the live 587-entry tree spent 92 entries on the root and 161 on `domain/`,
-  // so `methods/` (190 files of agent-authored engineering knowledge),
-  // `imported/claude-auto` (81), `learning/`, `imports/` and `system/` were
-  // never enumerated — structurally invisible to recall, silently. Patching
-  // that with per-directory listers was tried twice (preferences/, then the
-  // curator topic dirs) and each time the NEXT new directory reintroduced the
-  // bug, so the walk now reaches the whole tree and the cap only fires on a
-  // runaway one. 2,048 is ~3.5x the largest live tree.
-  //
-  // Two other bounds still hold a pathological tree: `markdownScannedBytes`
-  // caps total bytes read, and `markdownFileBytes` caps each file. When this
-  // cap DOES bind, `listMarkdownFiles` names the directories it never
-  // enumerated so a third occurrence is visible instead of silent.
-  markdownFiles: 2_048,
-  // Must clear GENERATED_MEMORY_MAX_BYTES with room for the manual tree beside
-  // it: this is a shared budget consumed in listing order, so a generated store
-  // at its own cap would otherwise silently truncate every file after it.
-  // Derived from the bound rather than a bare literal so the two can never
-  // re-collide the way they did when both sat at 16 MiB after the 2026-08-24
-  // ledger-rail raise — the fixed 8 MiB is headroom for the manual tree, which
-  // does not grow with the generated-memory rail.
-  markdownScannedBytes: GENERATED_MEMORY_MAX_BYTES + 8 * 1_048_576,
+  // Per-file read cap. Only three things are read from the memory tree per
+  // turn — index.md, the matched preferences/<slug>.md files, and the curator's
+  // fact ledger (which uses GENERATED_MEMORY_MAX_BYTES instead) — so this plus
+  // the per-lane counts is the whole IO bound. Nothing walks the tree.
   markdownFileBytes: 65_536,
+  // index.md, injected whole on a bootstrap turn. This is the retrieval
+  // mechanism for manual memory: the agent gets the map and reads or greps
+  // /workspace/workgroup/memory itself from there. Keep index.md under this
+  // bound or the map the agent navigates by is a truncated one.
   markdownCoreChars: 2_500,
   markdownHeadings: 24,
   markdownHeadingChars: 240,
-  markdownCandidates: 48,
-  markdownExcerpts: 3,
-  markdownExcerptChars: 900,
   // generated/memory.md is a flat list of self-contained one-line facts, so it
   // is ranked per FACT rather than as one document. Scored as a single file it
   // contributed at most one 900-char passage per turn no matter how much it
   // held — measured against a live 328-fact store (median line 817 chars) that
   // is ~1.1 facts surfaced out of 328, and growing the store could not improve
   // it. Facts also get their own excerpt lane so they cannot crowd out manual
-  // memory in the shared markdownExcerpts budget, and vice versa.
+  // memory in the shared excerpt budget, and vice versa.
   generatedFactCandidates: 48,
   generatedFactExcerpts: 3,
   // A fact is one atomic unit, so it is delivered whole rather than windowed
@@ -67,19 +46,21 @@ export const PRE_TURN_BOUNDS = Object.freeze({
   // recall, and enforceFinalBound trims the tail if a bootstrap turn is tight.
   generatedFactExcerptChars: 2_200,
   // Deterministic per-person preference lane: preferences/<name-slug>.md files
-  // matching the conversation's involved senders are injected whole (bounded),
-  // never lexically ranked. Cap covers a busy multi-human thread.
+  // matching the conversation's involved senders are injected whole (bounded).
+  // Cap covers a busy multi-human thread; the per-file cap bounds one person's
+  // file. This is the ONLY lane that reads manual Markdown per turn — ordinary
+  // memory files are navigated by the agent from index.md, not scanned here.
   preferenceExcerpts: 6,
-  // Total for BOTH memory lanes, enforced after selection.
+  preferenceExcerptChars: 900,
+  // Total for BOTH memory lanes (preferences and facts), enforced after
+  // selection.
   //
   // Load-bearing for the same reason capabilityTotalChars is. Per-lane caps
-  // alone took the worst-case memory footprint from 2,700 (3 x 900) to 9,300
-  // (3 x 2,200 + 3 x 900) inside an unchanged 12,000 finalChars. Facts, files
-  // and archive together then reach finalChars exactly, before per-excerpt JSON
-  // overhead — and enforceFinalBound sacrifices conversation excerpts FIRST, so
-  // a few long facts could silently evict every archive excerpt. 5,500 leaves
-  // the archive lane intact on a normal turn while still fitting three
-  // typical facts (median 817 chars) plus the file lane.
+  // alone took the worst-case memory footprint from 2,700 to 9,300 inside an
+  // unchanged 12,000 finalChars, and enforceFinalBound sacrifices conversation
+  // excerpts FIRST, so a few long facts could silently evict every archive
+  // excerpt. 5,500 leaves the archive lane intact on a normal turn while still
+  // fitting three typical facts (median 817 chars) beside a preference file.
   memoryExcerptTotalChars: 5_500,
   archiveCandidates: 96,
   archiveExcerpts: 3,
@@ -230,7 +211,6 @@ export interface RecallCorpusResult {
 }
 
 export const CORE_PATHS = ['index.md'] as const;
-export const NON_RECALL_PATHS = new Set(['system/definition.md']);
 export const PREFERENCES_DIR = 'preferences/';
 
 /** Canonical filename key for a person: "Pat Doe" -> "pat-doe". */
@@ -1072,8 +1052,7 @@ function isContainedPath(root: string, candidate: string): boolean {
 export function readBoundedFile(
   filePath: string,
   canonicalRoot: string,
-  allowedBytes: number,
-  fileBytes: number = PRE_TURN_BOUNDS.markdownFileBytes,
+  maxBytes: number = PRE_TURN_BOUNDS.markdownFileBytes,
 ): { content: string; bytes: number; truncated: boolean } {
   // Open the checked leaf itself without following a final-component symlink,
   // then validate the identity of the object that was actually opened. A
@@ -1098,7 +1077,7 @@ export function readBoundedFile(
     if (!resolvedStat.isFile() || stat.dev !== resolvedStat.dev || stat.ino !== resolvedStat.ino) {
       throw new Error('opened Markdown file identity changed during validation');
     }
-    const bytes = Math.max(0, Math.min(stat.size, allowedBytes, fileBytes));
+    const bytes = Math.max(0, Math.min(stat.size, maxBytes));
     const buffer = Buffer.alloc(bytes);
     const read = bytes > 0 ? fs.readSync(fd, buffer, 0, bytes, 0) : 0;
     const truncated = stat.size > read;
@@ -1112,69 +1091,10 @@ export function readBoundedFile(
   }
 }
 
-export function listMarkdownFiles(root: string, notices: ContextNotice[]): string[] {
-  const files: string[] = [];
-  const pending = [''];
-  let visited = 0;
-  let skippedSymlinks = 0;
-  // Directories the cap stopped us from enumerating fully. Named in the notice
-  // so a tree that outgrows the guard says WHICH content it hid.
-  const unlisted = new Set<string>();
-  const scopeOf = (relativeDir: string): string => (relativeDir === '' ? '<root>' : `${relativeDir}/`);
-  while (pending.length > 0 && visited < PRE_TURN_BOUNDS.markdownFiles) {
-    const relativeDir = pending.shift()!;
-    const absoluteDir = path.join(root, relativeDir);
-    const entries = fs
-      .readdirSync(absoluteDir, { withFileTypes: true })
-      .sort((a, b) => compareCodepoint(a.name, b.name));
-    for (const entry of entries) {
-      if (visited >= PRE_TURN_BOUNDS.markdownFiles) {
-        unlisted.add(scopeOf(relativeDir));
-        break;
-      }
-      visited++;
-      const relative = path.posix.join(relativeDir.split(path.sep).join('/'), entry.name);
-      if (entry.isSymbolicLink()) {
-        skippedSymlinks++;
-        continue;
-      }
-      if (entry.isDirectory()) pending.push(relative);
-      else if (entry.isFile() && entry.name.toLocaleLowerCase('en-US').endsWith('.md')) files.push(relative);
-    }
-  }
-  if (skippedSymlinks > 0) {
-    notices.push({
-      source: 'markdown',
-      status: 'degraded',
-      code: 'markdown-symlink-skipped',
-      detail: `skipped ${skippedSymlinks} symbolic link${skippedSymlinks === 1 ? '' : 's'}`,
-    });
-  }
-  for (const relativeDir of pending) unlisted.add(scopeOf(relativeDir));
-  if (unlisted.size > 0) {
-    notices.push({
-      source: 'markdown',
-      status: 'degraded',
-      code: 'markdown-file-limit',
-      detail: `stopped after ${PRE_TURN_BOUNDS.markdownFiles} filesystem entries; not listed: ${[...unlisted].sort(compareCodepoint).join(', ')}`,
-    });
-  }
-  return files.sort();
-}
-
 /**
- * Direct, non-recursive listing of one directory's Markdown stems —
- * independent of listMarkdownFiles' capped walk, whose shared visited-entry
- * budget is spent in codepoint order and so starves whatever sorts last.
- *
- * Two lanes depend on this. The preference lane is a deterministic direct-path
- * lookup keyed by sender slug. The curator topic directories (people/, domain/,
- * systems/) are consolidation-produced views of the whole ledger.
- *
- * The walk's entry cap no longer binds on any real tree, so today these are the
- * belt rather than the braces — they keep the two lanes reachable if a runaway
- * directory ever does exhaust the guard, which is exactly when losing a
- * consolidated view or a person's preferences would hurt most.
+ * Direct, non-recursive listing of one directory's Markdown stems. The
+ * preference lane is a deterministic direct-path lookup keyed by sender slug,
+ * so it reads exactly the one directory it needs.
  */
 function listDirectMarkdownStems(root: string, dir: string, notices: ContextNotice[]): string[] {
   let entries: fs.Dirent[];
@@ -1204,37 +1124,6 @@ function listDirectMarkdownStems(root: string, dir: string, notices: ContextNoti
     });
   }
   return stems;
-}
-
-/**
- * Curator topic files, listed directly so they can never lose the walk's sort
- * race. Flat, one level, matching TOPIC_FILE_PATH_PATTERN — so a non-recursive
- * listing per directory is the whole story.
- */
-export function listTopicFiles(root: string, notices: ContextNotice[]): string[] {
-  return TOPIC_DIRECTORIES.flatMap((dir) =>
-    listDirectMarkdownStems(root, `${dir}/`, notices).map((stem) => `${dir}/${stem}.md`),
-  );
-}
-
-/**
- * generated/memory.md's read-first priority (scanOrder below) depends on it
- * being present in the scan list. A tree large enough to exhaust
- * listMarkdownFiles' shared walk cap before reaching `generated/` would
- * otherwise silently drop the whole fact store from recall. Returns the
- * relative path to splice in only when the walk missed it AND the file is
- * really there — matching the walk's own symlink-skip discipline via lstat
- * rather than trusting a followed stat.
- */
-export function missingGeneratedMemoryPath(root: string, allFiles: readonly string[]): string | null {
-  if (allFiles.includes(GENERATED_MEMORY_RELATIVE_PATH)) return null;
-  try {
-    return fs.lstatSync(path.join(root, GENERATED_MEMORY_RELATIVE_PATH)).isFile()
-      ? GENERATED_MEMORY_RELATIVE_PATH
-      : null;
-  } catch {
-    return null;
-  }
 }
 
 export interface SearchableCandidate {
@@ -1276,132 +1165,49 @@ function boundedFactLine(line: string, maxChars: number): string {
   return `${line.slice(0, budget).trimEnd()}${TRUNCATED_MARKDOWN_EXCERPT} ${marker}`;
 }
 
-// ---------------------------------------------------------------------------
-// Candidate derivation
-//
-// One implementation of the listing, the scan order and the scan loop. The
-// recall projection used to hold a second copy of all three and they drifted;
-// the projection is gone (see docs/specs/workgroup-cerebro/plan.md §P2.5),
-// but the rule it left behind stands — nothing may grow a second copy.
-// ---------------------------------------------------------------------------
-
 /**
- * The ranked pool's listing: the capped walk unioned with the directly-listed
- * topic dirs, deduped and `.sort()`ed.
+ * The curator's fact ledger, one candidate per fact line sharing ONE headings
+ * array (decision 15). Read by direct path — no listing, no tree walk — and
+ * absent on every install where the curator has never run.
  */
-export function listRecallFiles(root: string, notices: ContextNotice[]): string[] {
-  return [...new Set([...listMarkdownFiles(root, notices), ...listTopicFiles(root, notices)])].sort();
-}
-
-/**
- * The listing with `generated/memory.md` spliced to the front.
- *
- * `sourceOrder` is array position in this list's per-lane projection, so any
- * deviation here silently re-tie-breaks recall (decision 15). Copies rather
- * than sorting `allFiles` in place; `Array.prototype.sort` is stable, so the
- * result is identical either way.
- */
-export function recallScanOrder(root: string, allFiles: readonly string[]): string[] {
-  const missing = missingGeneratedMemoryPath(root, allFiles);
-  return (missing ? [...allFiles, missing] : [...allFiles]).sort(
-    (a, b) => Number(b === GENERATED_MEMORY_RELATIVE_PATH) - Number(a === GENERATED_MEMORY_RELATIVE_PATH),
-  );
-}
-
-export interface RecallScanResult {
-  fileCandidates: SearchableCandidate[];
-  factCandidates: SearchableCandidate[];
-  scannedBytes: number;
-}
-
-/**
- * The ranked scan loop: read each listed file inside the shared byte budget and
- * turn it into file candidates, or — for the fact ledger — one candidate per
- * fact line sharing ONE headings array (decision 15).
- */
-function scanRecallCandidates(
-  root: string,
-  canonicalRoot: string,
-  scanOrder: readonly string[],
-  notices: ContextNotice[],
-  scannedBytes: number,
-): RecallScanResult {
-  const fileCandidates: SearchableCandidate[] = [];
-  const factCandidates: SearchableCandidate[] = [];
-  for (const relative of scanOrder) {
-    const absolute = path.join(root, relative);
-    if (
-      (CORE_PATHS as readonly string[]).includes(relative) ||
-      NON_RECALL_PATHS.has(relative) ||
-      // Curator off means the ledger is excluded from BOTH lanes. Skipping
-      // here rather than downstream is what keeps it out of the ordinary
-      // markdown lane, where it would score as one multi-megabyte document
-      // and eat the shared markdownScannedBytes budget.
-      (relative === GENERATED_MEMORY_RELATIVE_PATH && !isMemoryCuratorEnabled()) ||
-      relative.startsWith(PREFERENCES_DIR)
-    ) {
-      continue;
-    }
-    const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
-    if (remaining <= 0) {
-      notices.push({
-        source: 'markdown',
-        status: 'truncated',
-        code: 'markdown-byte-limit',
-        detail: `scanned ${PRE_TURN_BOUNDS.markdownScannedBytes} bytes`,
-      });
-      break;
-    }
-    // NO swallow here. If the file vanished between listing and now,
-    // `readBoundedFile` throws ENOENT, which propagates to
-    // `readMemoryEvidence`'s outer catch and returns EMPTY evidence. Silently
-    // skipping it would deliver a candidate set that matches no tree.
-    const read = readBoundedFile(
-      absolute,
-      canonicalRoot,
-      remaining,
-      relative === GENERATED_MEMORY_RELATIVE_PATH ? GENERATED_MEMORY_MAX_BYTES : PRE_TURN_BOUNDS.markdownFileBytes,
-    );
-    scannedBytes += read.bytes;
-    const headings = headingsOf(read.content);
-    if (relative === GENERATED_MEMORY_RELATIVE_PATH) {
-      for (const line of read.content.split('\n')) {
-        if (!line.startsWith('- ')) continue;
-        const markerAt = line.indexOf('<!--');
-        factCandidates.push({
-          path: relative,
-          headings,
-          content: line,
-          // Score the fact, not its provenance marker. The marker is ~20% of a
-          // line's characters, and its tokens dilute the density term ranking
-          // uses, so scoring it penalised generated facts against clean manual
-          // Markdown. selectGeneratedMemoryForPrompt already strips it exactly
-          // this way on the curator side; this makes both paths agree.
-          searchable: markerAt < 0 ? line : line.slice(0, markerAt),
-          capturedAt: capturedAtOf(line),
-        });
-      }
-      continue;
-    }
-    fileCandidates.push({
-      path: relative,
+function readGeneratedFacts(root: string, canonicalRoot: string): SearchableCandidate[] {
+  // Curator off means no fact injection at all. This is the ONLY reader of the
+  // ledger now, so the gate lives here — the scan loop it used to sit in is
+  // gone. Before the lstat, so a disabled ledger costs no filesystem call.
+  if (!isMemoryCuratorEnabled()) return [];
+  const absolute = path.join(root, GENERATED_MEMORY_RELATIVE_PATH);
+  // lstat, not stat: a symlinked ledger is skipped the way every other memory
+  // read skips one, rather than followed out of the canonical tree.
+  try {
+    if (!fs.lstatSync(absolute).isFile()) return [];
+  } catch {
+    return [];
+  }
+  const read = readBoundedFile(absolute, canonicalRoot, GENERATED_MEMORY_MAX_BYTES);
+  const headings = headingsOf(read.content);
+  const candidates: SearchableCandidate[] = [];
+  for (const line of read.content.split('\n')) {
+    if (!line.startsWith('- ')) continue;
+    const markerAt = line.indexOf('<!--');
+    candidates.push({
+      path: GENERATED_MEMORY_RELATIVE_PATH,
       headings,
-      content: read.content,
-      // Score the concept, not its frontmatter — same reason the fact branch
-      // above scores the fact and not its provenance marker. `searchableText`
-      // keeps `title`/`description` values (definition.md gives those a search
-      // role) and drops every field name.
-      searchable: `${relative}\n${headings.join('\n')}\n${searchableText(read.content)}`,
-      capturedAt: '',
+      content: line,
+      // Score the fact, not its provenance marker. The marker is ~20% of a
+      // line's characters, and its tokens dilute the density term ranking
+      // uses, so scoring it penalised generated facts against clean manual
+      // Markdown. selectGeneratedMemoryForPrompt already strips it exactly
+      // this way on the curator side; this makes both paths agree.
+      searchable: markerAt < 0 ? line : line.slice(0, markerAt),
+      capturedAt: capturedAtOf(line),
     });
   }
-  return { fileCandidates, factCandidates, scannedBytes };
+  return candidates;
 }
 
 /** Out-param populated by `readMemoryEvidence`, mirroring the `notices` mutable-array pattern. */
 export interface RecallCandidateStats {
   factCandidates: number;
-  fileCandidates: number;
 }
 
 export function readMemoryEvidence(
@@ -1419,7 +1225,6 @@ export function readMemoryEvidence(
   const canonicalRoot = fs.realpathSync(root);
   if (!fs.statSync(canonicalRoot).isDirectory()) throw new Error(`canonical memory tree is not a directory: ${root}`);
   const core: MemoryEvidenceExcerpt[] = [];
-  let scannedBytes = 0;
   if (includeBootstrap) {
     for (const relative of CORE_PATHS) {
       const absolute = path.join(root, relative);
@@ -1432,8 +1237,7 @@ export function readMemoryEvidence(
         });
         continue;
       }
-      const read = readBoundedFile(absolute, canonicalRoot, PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes);
-      scannedBytes += read.bytes;
+      const read = readBoundedFile(absolute, canonicalRoot);
       core.push({
         path: relative,
         headings: headingsOf(read.content),
@@ -1447,12 +1251,6 @@ export function readMemoryEvidence(
 
   const queryTokens = tokenizeForRecall(query);
   const expandedTokens = tokenizeForRecall(`${query} ${ephemeralExpansion(query).join(' ')}`);
-  // Where the tree listing's notices BELONG. The listing itself runs after the
-  // preference lane; listing touches neither the shared byte budget nor any
-  // state the preference lane reads, so the position of the WORK is
-  // output-neutral, but the position of its NOTICES is delivered context. They
-  // are spliced back to this index.
-  const noticeInsertAt = notices.length;
 
   // Deterministic per-person preference lane. Files under preferences/ are
   // keyed by name slug and injected whole for the conversation's involved
@@ -1480,12 +1278,9 @@ export function readMemoryEvidence(
       ),
     ].map((stem) => `${PREFERENCES_DIR}${stem}.md`);
     for (const relative of matched.slice(0, PRE_TURN_BOUNDS.preferenceExcerpts)) {
-      const remaining = PRE_TURN_BOUNDS.markdownScannedBytes - scannedBytes;
-      if (remaining <= 0) break;
       try {
-        const read = readBoundedFile(path.join(root, relative), canonicalRoot, remaining);
-        scannedBytes += read.bytes;
-        const text = boundedText(read.content, PRE_TURN_BOUNDS.markdownExcerptChars, TRUNCATED_MARKDOWN_EXCERPT);
+        const read = readBoundedFile(path.join(root, relative), canonicalRoot);
+        const text = boundedText(read.content, PRE_TURN_BOUNDS.preferenceExcerptChars, TRUNCATED_MARKDOWN_EXCERPT);
         preferenceExcerpts.push({
           path: relative,
           headings: headingsOf(read.content),
@@ -1518,68 +1313,29 @@ export function readMemoryEvidence(
     }
   }
 
-  // Candidate generation. Read the fact store first: `markdownScannedBytes` is
-  // a single budget spent in listing order, and `generated/` sorts after
-  // `bootstrap/`, `concepts/`, `conversations/`, `facts/` and `imports/`. A
-  // large manual tree would otherwise leave too few bytes for it and truncate
-  // the file MID-LINE, which is worse than dropping it: the partial line still
-  // starts with "- " and is parsed as a fact, so a half-sentence reaches the
-  // agent with its provenance marker cut off. Stable sort, so everything else
-  // keeps codepoint order. Union rather than walk-only: the topic directories
-  // are listed directly so an earlier-sorting directory cannot spend the walk's
-  // entry budget before they are reached. Deduped because the walk usually does
-  // reach some of them.
-  const listingNotices: ContextNotice[] = [];
-  const allFiles = listRecallFiles(root, listingNotices);
-  notices.splice(noticeInsertAt, 0, ...listingNotices);
-  // `scanned.scannedBytes` is deliberately not read back: nothing below this
-  // point spends the shared budget.
-  const { fileCandidates, factCandidates } = scanRecallCandidates(
-    root,
-    canonicalRoot,
-    recallScanOrder(root, allFiles),
-    notices,
-    scannedBytes,
-  );
-  if (candidateStats) {
-    candidateStats.factCandidates = factCandidates.length;
-    candidateStats.fileCandidates = fileCandidates.length;
-  }
-  const rankPool = (
-    pool: SearchableCandidate[],
-    tokens: string[],
-    maxChars: number,
-    tieBreak: (a: SearchableCandidate, b: SearchableCandidate) => number,
-  ) =>
-    rankByBestPassage(tokens, pool, (candidate) => candidate.searchable, {
-      maxChars,
-      tieBreak,
-    });
-  const byPath = (a: SearchableCandidate, b: SearchableCandidate) => compareCodepoint(a.path, b.path);
+  // Generated-fact lane. The curator's ledger is one known file, read directly:
+  // nothing walks the memory tree per turn any more.
+  const factCandidates = readGeneratedFacts(root, canonicalRoot);
+  if (candidateStats) candidateStats.factCandidates = factCandidates.length;
   // Age ranks, it never filters. Between facts of equal relevance the newer
   // capture wins; an older exact match still outranks a fresher weak one, so a
   // fact stays recallable however old it is. ISO-8601 sorts chronologically.
   const byRecency = (a: SearchableCandidate, b: SearchableCandidate) => compareCodepoint(b.capturedAt, a.capturedAt);
-  const rankAll = (tokens: string[]) => ({
-    files: rankPool(fileCandidates, tokens, PRE_TURN_BOUNDS.markdownExcerptChars, byPath),
-    facts: rankPool(factCandidates, tokens, PRE_TURN_BOUNDS.generatedFactExcerptChars, byRecency),
-  });
-  let ranked = rankAll(queryTokens);
-  if (ranked.files.length === 0 && ranked.facts.length === 0) {
-    const expanded = rankAll(expandedTokens);
-    if (expanded.files.length > 0 || expanded.facts.length > 0) {
+  const rankFacts = (tokens: string[]) =>
+    rankByBestPassage(tokens, factCandidates, (candidate) => candidate.searchable, {
+      maxChars: PRE_TURN_BOUNDS.generatedFactExcerptChars,
+      tieBreak: byRecency,
+    });
+  let ranked = rankFacts(queryTokens);
+  if (ranked.length === 0) {
+    const expanded = rankFacts(expandedTokens);
+    if (expanded.length > 0) {
       ranked = expanded;
       markExpansionUsed(notices);
     }
   }
-  const toExcerpt = (
-    { candidate, passage }: { candidate: SearchableCandidate; passage: PassageMatch },
-    maxChars: number,
-  ): MemoryEvidenceExcerpt => {
-    const text =
-      candidate.path === GENERATED_MEMORY_RELATIVE_PATH
-        ? boundedFactLine(candidate.content, maxChars)
-        : contextualExcerpt(candidate.content, passage.text, maxChars, TRUNCATED_MARKDOWN_EXCERPT);
+  const rankedFacts = ranked.map(({ candidate, passage }): MemoryEvidenceExcerpt => {
+    const text = boundedFactLine(candidate.content, PRE_TURN_BOUNDS.generatedFactExcerptChars);
     return {
       path: candidate.path,
       headings: candidate.headings,
@@ -1593,43 +1349,18 @@ export function readMemoryEvidence(
       ),
       provenance: { authority: 'workgroup-memory-canon' as const, workgroupId },
     };
-  };
-  const rankedFiles = ranked.files.map((row) => toExcerpt(row, PRE_TURN_BOUNDS.markdownExcerptChars));
-  const rankedFacts = ranked.facts.map((row) => toExcerpt(row, PRE_TURN_BOUNDS.generatedFactExcerptChars));
+  });
   const keepUnseen = (rows: MemoryEvidenceExcerpt[]): MemoryEvidenceExcerpt[] =>
     bypassDedupe ? rows : rows.filter((row) => !seenEvidenceFingerprints.has(row.fingerprint));
-  const dedupedFiles = keepUnseen(rankedFiles);
   const dedupedFacts = keepUnseen(rankedFacts);
   const dedupedPreferences = keepUnseen(preferenceExcerpts);
-  const suppressed =
-    rankedFiles.length -
-    dedupedFiles.length +
-    (rankedFacts.length - dedupedFacts.length) +
-    (preferenceExcerpts.length - dedupedPreferences.length);
+  const suppressed = rankedFacts.length - dedupedFacts.length + (preferenceExcerpts.length - dedupedPreferences.length);
   if (suppressed > 0) {
     notices.push({
       source: 'context',
       status: 'ok',
       code: 'evidence-already-delivered',
       detail: `suppressed ${suppressed} unchanged Markdown passage${suppressed === 1 ? '' : 's'} in this context epoch`,
-    });
-  }
-  const boundedCandidates = dedupedFiles.slice(0, PRE_TURN_BOUNDS.markdownCandidates);
-  if (rankedFiles.length > boundedCandidates.length) {
-    notices.push({
-      source: 'markdown',
-      status: 'truncated',
-      code: 'markdown-candidate-limit',
-      detail: `selected ${boundedCandidates.length} of ${rankedFiles.length} relevant Markdown candidates`,
-    });
-  }
-  const fileExcerpts = boundedCandidates.slice(0, PRE_TURN_BOUNDS.markdownExcerpts);
-  if (boundedCandidates.length > fileExcerpts.length) {
-    notices.push({
-      source: 'markdown',
-      status: 'truncated',
-      code: 'markdown-excerpt-limit',
-      detail: `selected ${fileExcerpts.length} of ${boundedCandidates.length} bounded Markdown candidates`,
     });
   }
   const boundedFacts = dedupedFacts.slice(0, PRE_TURN_BOUNDS.generatedFactCandidates);
@@ -1653,7 +1384,7 @@ export function readMemoryEvidence(
   // Most relevant first: enforceFinalBound pops from the end when over budget.
   // Preferences carry MAX_SAFE_INTEGER scores, so they sort first and the
   // budget loop below (which pops the tail) can never drop them.
-  const excerpts = [...dedupedPreferences, ...factExcerpts, ...fileExcerpts].sort((a, b) => b.score - a.score);
+  const excerpts = [...dedupedPreferences, ...factExcerpts].sort((a, b) => b.score - a.score);
   // Keep both memory lanes inside one shared total, dropping the least relevant
   // first, so memory cannot reach enforceFinalBound large enough to evict the
   // archive lane that function sacrifices ahead of it.
@@ -1884,7 +1615,7 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
   // otherwise make meaningless per line.
   const tokenStatsBefore = { ...TOKEN_STREAM_CACHE_STATS };
   const offsetStatsBefore = { ...OFFSET_SLICE_STATS };
-  const candidateStats: RecallCandidateStats = { factCandidates: 0, fileCandidates: 0 };
+  const candidateStats: RecallCandidateStats = { factCandidates: 0 };
   const db = getDb();
   const scope = db
     .prepare(
@@ -2140,7 +1871,6 @@ export function buildPreTurnContext(input: PreTurnContextInput): PreTurnContext 
     workgroupId,
     elapsedMs: Date.now() - startedAt,
     factCandidates: candidateStats.factCandidates,
-    fileCandidates: candidateStats.fileCandidates,
     tokenCacheSize: TOKEN_STREAM_CACHE.size,
     tokenCacheMax: TOKEN_STREAM_CACHE_MAX,
     tokenCacheHits: TOKEN_STREAM_CACHE_STATS.hits - tokenStatsBefore.hits,

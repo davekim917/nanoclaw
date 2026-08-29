@@ -58,7 +58,6 @@ import {
 import { closeDb, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { log } from '../../log.js';
 import { upsertArchiveMessage } from '../../message-archive.js';
-import { GENERATED_MEMORY_MAX_BYTES } from './curator-contract.js';
 
 const FIXTURE = JSON.parse(
   fs.readFileSync(path.join(process.cwd(), 'tests/fixtures/workgroup-memory-recall.json'), 'utf8'),
@@ -267,11 +266,11 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(notices.some((n) => n.code === 'capability-total-budget')).toBe(true);
   });
 
-  it('test_core_imports_conflicts_and_truncation_are_explicit', () => {
-    memoryFile('imports/legacy/domain.md', '# DNS host\nSipTrue DNS is managed in Wix.');
+  it('test_core_conflicts_and_truncation_are_explicit', () => {
     memoryFile(
-      'projects/large.md',
-      `# SipTrue DNS\n${'Supabase detail '.repeat(PRE_TURN_BOUNDS.markdownExcerptChars * 2)}`,
+      'generated/memory.md',
+      `# Generated workgroup memory\n\n- SipTrue DNS is managed in Wix. ${'Supabase detail '.repeat(400)}` +
+        ` <!-- nanoclaw-memory:id=mem_0000000000000001;evidence=conflict;captured=2026-07-20T00:00:00.000Z -->\n`,
     );
     archive(
       'conflict',
@@ -291,11 +290,46 @@ describe('bounded authoritative pre-turn retrieval', () => {
     const second = buildPreTurnContext(input);
 
     expect(first.memoryEvidence.core.map((e) => e.path)).toEqual(['index.md']);
-    expect(first.memoryEvidence.excerpts.some((e) => e.path === 'imports/legacy/domain.md')).toBe(true);
-    expect(first.memoryEvidence.excerpts.some((e) => e.headings.includes('SipTrue DNS'))).toBe(true);
+    expect(first.memoryEvidence.excerpts.some((e) => e.path === 'generated/memory.md')).toBe(true);
     expect(first.notices.some((n) => n.code === 'potential-source-conflict')).toBe(true);
     expect(JSON.stringify(first)).toContain('[truncated:markdown-excerpt]');
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
+  });
+
+  // index.md IS the manual-memory retrieval mechanism: the agent gets this map
+  // on a bootstrap turn and reads or greps the tree from it. Nothing else in
+  // the pre-turn context carries manual Markdown, so if this lane breaks there
+  // is no fallback and recall is simply gone.
+  it('injects index.md whole on a bootstrap turn, bounded at markdownCoreChars', () => {
+    memoryFile('index.md', '# Canon\n- [DNS](domain/dns.md) — SipTrue DNS lives in Wix\n- [People](people/index.md)\n');
+    const input = {
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat',
+      trigger: 1 as const,
+      normalizedContent: JSON.stringify({ text: 'anything at all' }),
+    };
+
+    const bootstrap = buildPreTurnContext({ ...input, includeBootstrap: true });
+    const core = bootstrap.memoryEvidence.core.find((row) => row.path === 'index.md');
+    expect(core).toBeDefined();
+    expect(core!.text).toContain('domain/dns.md');
+    expect(core!.text).toContain('people/index.md');
+    expect(core!.score).toBe(Number.MAX_SAFE_INTEGER);
+    expect(core!.provenance).toEqual({ authority: 'workgroup-memory-canon', workgroupId: 'wg-a' });
+
+    // Over the bound it is truncated, never dropped, and says so.
+    memoryFile('index.md', `# Canon\n${'map entry line. '.repeat(1_000)}`);
+    const large = buildPreTurnContext({ ...input, includeBootstrap: true });
+    const largeCore = large.memoryEvidence.core.find((row) => row.path === 'index.md')!;
+    expect(largeCore.text.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.markdownCoreChars);
+    expect(largeCore.text).toContain('[truncated:markdown-file]');
+
+    // Absent index.md is reported, not silently empty.
+    fs.rmSync(path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory', 'index.md'));
+    const missing = buildPreTurnContext({ ...input, includeBootstrap: true });
+    expect(missing.memoryEvidence.core).toEqual([]);
+    expect(missing.notices.some((n) => n.code === 'missing-core-memory')).toBe(true);
   });
 
   it('recalls relevant generated memory beyond the ordinary 64 KiB Markdown-file bound', () => {
@@ -334,27 +368,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
 
     expect(result.memoryEvidence.excerpts).toEqual([]);
     expect(result.notices.some((notice) => notice.code === 'potential-source-conflict')).toBe(true);
-  });
-
-  it('centers a long Markdown excerpt on the ranked canonicalized passage', () => {
-    const evidence = 'The durable location is managed through Wix. This provider is authoritative.';
-    memoryFile('facts/provider.md', `# Durable location\n${'Unrelated preface. '.repeat(240)}${evidence}`);
-    const input = {
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1 as const,
-      normalizedContent: '{"text":"Where is the authoritative provider hosted?"}',
-    };
-
-    const first = buildPreTurnContext(input);
-    const second = buildPreTurnContext(input);
-    const excerpt = first.memoryEvidence.excerpts.find((row) => row.path === 'facts/provider.md');
-
-    expect(excerpt?.text).toContain(evidence);
-    expect(excerpt?.text).toContain('[excerpt-start]');
-    expect(excerpt?.text).toContain('[truncated:markdown-excerpt]');
-    expect(first.memoryEvidence).toEqual(second.memoryEvidence);
   });
 
   it('caps lexical archive excerpts at their own declared budget without exact links', () => {
@@ -424,32 +437,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(lexical).toHaveLength(PRE_TURN_BOUNDS.archiveExcerpts);
   });
 
-  it('enforces Markdown candidate and excerpt budgets as separate stages', () => {
-    const totalCandidates = PRE_TURN_BOUNDS.markdownCandidates + 7;
-    for (let index = 0; index < totalCandidates; index++) {
-      memoryFile(
-        `facts/bounded-${String(index).padStart(2, '0')}.md`,
-        `# Bounded ${index}\nJordan is the deployment owner for release ${index}.`,
-      );
-    }
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"Who is the deployment owner?"}',
-    });
-
-    expect(result.memoryEvidence.excerpts).toHaveLength(PRE_TURN_BOUNDS.markdownExcerpts);
-    expect(result.notices.find((notice) => notice.code === 'markdown-candidate-limit')?.detail).toBe(
-      `selected ${PRE_TURN_BOUNDS.markdownCandidates} of ${totalCandidates} relevant Markdown candidates`,
-    );
-    expect(result.notices.find((notice) => notice.code === 'markdown-excerpt-limit')?.detail).toBe(
-      `selected ${PRE_TURN_BOUNDS.markdownExcerpts} of ${PRE_TURN_BOUNDS.markdownCandidates} bounded Markdown candidates`,
-    );
-  });
-
   it('ranks generated memory per fact in its own lane, so store size does not throttle recall', () => {
     // One fact per line, each self-contained, exactly as the curator renders it.
     const fact = (id: string, capturedAt: string, text: string): string =>
@@ -473,7 +460,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
         fact('aaaaaaaaaaaaaaa3', '2026-07-26T00:00:00.000Z', 'Deployment freezes run over the weekend.'),
       ].join('\n'),
     );
-    memoryFile('facts/manual-owner.md', '# Manual\nThe deployment runbook lives in the ops repo.');
 
     const result = buildPreTurnContext({
       agentGroupId: 'ag-a',
@@ -484,8 +470,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
     });
 
     const facts = result.memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md');
-    const files = result.memoryEvidence.excerpts.filter((row) => row.path !== 'generated/memory.md');
-
     // Was capped at one 900-char window for the whole store, whatever it held.
     expect(facts.length).toBeGreaterThan(1);
     expect(facts.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.generatedFactExcerpts);
@@ -495,8 +479,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(facts.some((row) => row.text.includes('Jordan owns deployment'))).toBe(true);
     // Provenance still reaches the agent, so it can tell how old a fact is.
     expect(facts.some((row) => row.text.includes('captured=2026-05-01T00:00:00.000Z'))).toBe(true);
-    // Separate lanes: 200+ generated facts cannot starve manual Markdown.
-    expect(files.length).toBeGreaterThan(0);
   });
 
   it('keeps archive recall alive when long facts would otherwise consume the whole budget', () => {
@@ -518,12 +500,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
     );
     // Every lane at full width, so the combined footprint exceeds finalChars and
     // enforceFinalBound is forced to sacrifice something.
-    for (let index = 0; index < PRE_TURN_BOUNDS.markdownExcerpts; index++) {
-      memoryFile(
-        `facts/deployment-${index}.md`,
-        `# Deployment ${index}\n${'Jordan owns deployment and the release pipeline. '.repeat(40)}`,
-      );
-    }
     for (const id of ['arc-1', 'arc-2', 'arc-3']) {
       archive(
         id,
@@ -611,25 +587,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
     );
   });
 
-  it('uses codepoint order for equal-scoring Markdown paths', () => {
-    memoryFile('facts/project_xzo216.md', '# Deployment owner\nJordan owns deployment.');
-    memoryFile('facts/project_xzo_195.md', '# Deployment owner\nJordan owns deployment.');
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1,
-      normalizedContent: '{"text":"Who owns deployment?"}',
-    });
-
-    expect(
-      result.memoryEvidence.excerpts
-        .map((excerpt) => excerpt.path)
-        .filter((relative) => relative.startsWith('facts/project_xzo')),
-    ).toEqual(['facts/project_xzo216.md', 'facts/project_xzo_195.md']);
-  });
-
   it('isolates cross-workgroup rows and malicious provenance from trusted capabilities', () => {
     archive('allowed', 'ag-a', 'The launch code is blue.', '2026-07-20T00:00:00.000Z');
     archive(
@@ -683,8 +640,8 @@ describe('bounded authoritative pre-turn retrieval', () => {
 
   it('uses bounded ephemeral expansion only after direct lexical no-match', () => {
     memoryFile(
-      'facts/external-access.md',
-      '# External access\nWhen a dedicated MCP is absent, try the real HTTPS API through the OneCLI gateway before claiming no access.',
+      'generated/memory.md',
+      '# Generated workgroup memory\n\n- When a dedicated MCP is absent, try the real HTTPS API through the OneCLI gateway before claiming no access. <!-- nanoclaw-memory:id=mem_0000000000000001;evidence=ev-1;captured=2026-07-20T00:00:00.000Z -->\n',
     );
     archive(
       'archive-external-access',
@@ -701,7 +658,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
       normalizedContent: '{"text":"What should happen before saying an external service is unavailable?"}',
     });
 
-    expect(result.memoryEvidence.excerpts[0]?.path).toBe('facts/external-access.md');
+    expect(result.memoryEvidence.excerpts[0]?.path).toBe('generated/memory.md');
     expect(result.conversationEvidence.excerpts[0]?.id).toBe('archive-external-access');
     expect(result.notices.some((notice) => notice.code === 'ephemeral-query-expansion-used')).toBe(true);
     expect(JSON.stringify(result.notices)).not.toContain('gateway');
@@ -799,18 +756,21 @@ describe('bounded authoritative pre-turn retrieval', () => {
 
   it.each([
     {
-      label: 'deeper canonical evidence',
-      ancestor: 'facts',
-      leaf: 'facts/owner.md',
-      outsideLeaf: 'owner.md',
+      label: 'the generated fact ledger',
+      ancestor: 'generated',
+      leaf: 'generated/memory.md',
+      outsideLeaf: 'memory.md',
       restoreBeforeValidation: true,
     },
   ])(
     'rejects an ancestor-directory symlink swap for $label',
     ({ ancestor, leaf, outsideLeaf, restoreBeforeValidation }) => {
       const memoryRoot = path.join(TEST_ROOT, 'workgroups', 'wg-a', 'memory');
-      if (ancestor === 'facts') {
-        memoryFile('facts/owner.md', '# Deployment owner\nJordan owns deployment.');
+      if (ancestor === 'generated') {
+        memoryFile(
+          'generated/memory.md',
+          '# Generated workgroup memory\n\n- Jordan owns deployment. <!-- nanoclaw-memory:id=mem_0000000000000001;evidence=ev-1;captured=2026-07-20T00:00:00.000Z -->\n',
+        );
       }
       const checkedLeaf = path.join(memoryRoot, leaf);
       const checkedAncestor = path.join(memoryRoot, ancestor);
@@ -863,7 +823,10 @@ describe('bounded authoritative pre-turn retrieval', () => {
   );
 
   it('degrades archive, exact-link, and capabilities independently', () => {
-    memoryFile('facts/owner.md', '# Deployment owner\nJordan owns deployment.');
+    memoryFile(
+      'generated/memory.md',
+      '# Generated workgroup memory\n\n- Jordan owns deployment. <!-- nanoclaw-memory:id=mem_0000000000000001;evidence=ev-1;captured=2026-07-20T00:00:00.000Z -->\n',
+    );
     const input = {
       agentGroupId: 'ag-a',
       sessionId: 'sess-a',
@@ -874,7 +837,7 @@ describe('bounded authoritative pre-turn retrieval', () => {
 
     FAILURES.archive = true;
     const archiveFailure = buildPreTurnContext(input);
-    expect(archiveFailure.memoryEvidence.excerpts[0]?.path).toBe('facts/owner.md');
+    expect(archiveFailure.memoryEvidence.excerpts[0]?.path).toBe('generated/memory.md');
     expect(archiveFailure.trustedCapabilities?.services[0]?.name).toBe('safe-for:mg-a');
     expect(archiveFailure.notices.some((notice) => notice.code === 'archive-read-failed')).toBe(true);
     expect(archiveFailure.notices.some((notice) => notice.code === 'exact-link-read-failed')).toBe(false);
@@ -882,14 +845,14 @@ describe('bounded authoritative pre-turn retrieval', () => {
     FAILURES.archive = false;
     FAILURES.exactLink = true;
     const exactLinkFailure = buildPreTurnContext(input);
-    expect(exactLinkFailure.memoryEvidence.excerpts[0]?.path).toBe('facts/owner.md');
+    expect(exactLinkFailure.memoryEvidence.excerpts[0]?.path).toBe('generated/memory.md');
     expect(exactLinkFailure.notices.some((notice) => notice.code === 'exact-link-read-failed')).toBe(true);
     expect(exactLinkFailure.notices.some((notice) => notice.code === 'archive-read-failed')).toBe(false);
 
     FAILURES.exactLink = false;
     FAILURES.capabilities = true;
     const capabilityFailure = buildPreTurnContext(input);
-    expect(capabilityFailure.memoryEvidence.excerpts[0]?.path).toBe('facts/owner.md');
+    expect(capabilityFailure.memoryEvidence.excerpts[0]?.path).toBe('generated/memory.md');
     expect(capabilityFailure.trustedCapabilities).toEqual({ agentGroupId: 'ag-a', services: [] });
     expect(capabilityFailure.notices.some((notice) => notice.code === 'capability-detail-read-failed')).toBe(true);
   });
@@ -898,10 +861,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
     memoryFile('index.md', `# Canon\n${'dense recall detail '.repeat(1_000)}`);
     memoryFile('system/definition.md', `# Definition\n${'dense recall detail '.repeat(1_000)}`);
     for (let index = 0; index < 20; index++) {
-      memoryFile(
-        `imports/dense-${String(index).padStart(2, '0')}.md`,
-        `# Dense ${index}\n${'dense recall detail '.repeat(1_000)}`,
-      );
       archive(
         `dense-${String(index).padStart(2, '0')}`,
         index % 2 === 0 ? 'ag-a' : 'ag-a-codex',
@@ -919,12 +878,14 @@ describe('bounded authoritative pre-turn retrieval', () => {
     });
 
     expect(JSON.stringify(result).length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.finalChars);
-    expect(result.memoryEvidence.excerpts.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.markdownExcerpts);
     expect(result.conversationEvidence.excerpts.length).toBeLessThanOrEqual(PRE_TURN_BOUNDS.archiveExcerpts);
   });
 
   it('bootstraps capabilities and index once, then emits only unseen per-turn evidence', () => {
-    memoryFile('facts/owner.md', '# Deployment owner\nJordan owns deployment.');
+    memoryFile(
+      'generated/memory.md',
+      '# Generated workgroup memory\n\n- Jordan owns deployment. <!-- nanoclaw-memory:id=mem_0000000000000001;evidence=owner-archive;captured=2026-07-20T00:00:00.000Z -->\n',
+    );
     archive('owner-archive', 'ag-a', 'Jordan owns deployment.', '2026-07-20T00:00:00.000Z');
     const common = {
       agentGroupId: 'ag-a',
@@ -957,43 +918,6 @@ describe('bounded authoritative pre-turn retrieval', () => {
     expect(delta.memoryEvidence.excerpts).toEqual([]);
     expect(delta.conversationEvidence.excerpts).toEqual([]);
     expect(delta.notices.some((notice) => notice.code === 'evidence-already-delivered')).toBe(true);
-  });
-
-  it('delivers a newly relevant passage from a previously seen Markdown file', () => {
-    memoryFile(
-      'facts/multi-topic.md',
-      [
-        '# Orion deployment',
-        `Orion deployment owner is Jordan. ${'orion deployment '.repeat(80)}`,
-        '# Pegasus billing',
-        `Pegasus billing authority is Casey. ${'pegasus billing '.repeat(80)}`,
-      ].join('\n\n'),
-    );
-    const common = {
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat',
-      trigger: 1 as const,
-      includeBootstrap: false,
-      provider: 'claude',
-      contextEpoch: 5,
-    };
-    const first = buildPreTurnContext({
-      ...common,
-      normalizedContent: '{"text":"Who owns Orion deployment?"}',
-    });
-    const firstRow = first.memoryEvidence.excerpts.find((row) => row.path === 'facts/multi-topic.md')!;
-    expect(firstRow.text).toContain('Orion deployment');
-
-    const second = buildPreTurnContext({
-      ...common,
-      normalizedContent: '{"text":"Who has Pegasus billing authority?"}',
-      seenEvidenceFingerprints: [firstRow.fingerprint],
-    });
-    const secondRow = second.memoryEvidence.excerpts.find((row) => row.path === 'facts/multi-topic.md');
-
-    expect(secondRow?.text).toContain('Pegasus billing');
-    expect(secondRow?.fingerprint).not.toBe(firstRow.fingerprint);
   });
 
   it('delivers a newly relevant passage from a previously seen archive row', () => {
@@ -1089,8 +1013,14 @@ describe('bounded authoritative pre-turn retrieval', () => {
   });
 
   it('keeps normal deltas within the approved evidence counts and size ceiling', () => {
+    const factLine = (index: number): string =>
+      `- Bounded relevant detail ${index}. ${'bounded relevant detail '.repeat(200)}` +
+      ` <!-- nanoclaw-memory:id=mem_${String(index).padStart(16, '0')};evidence=bounded-${index};captured=2026-07-01T00:00:00.000Z -->`;
+    memoryFile(
+      'generated/memory.md',
+      `# Generated workgroup memory\n\n${Array.from({ length: 12 }, (_, index) => factLine(index)).join('\n')}\n`,
+    );
     for (let index = 0; index < 12; index++) {
-      memoryFile(`facts/bounded-${index}.md`, `# Bounded ${index}\n${'bounded relevant detail '.repeat(200)}`);
       archive(
         `bounded-${index}`,
         'ag-a',
@@ -1213,71 +1143,6 @@ describe('per-person preference recall', () => {
   });
 });
 
-/**
- * Exhaust the walk's visited-ENTRY guard inside one directory.
- *
- * Derived from the bound, so raising the guard cannot quietly stop exercising
- * the starvation path the direct-lister lanes exist for. The filler is
- * deliberately NOT Markdown: `listMarkdownFiles` counts every entry it visits
- * but collects only `.md`, so non-Markdown spends the budget exactly like a
- * document would while costing nothing to read, tokenize or rank — which keeps
- * a bound-sized seed cheap enough to stay in the suite.
- */
-function seedOverCapEntries(dir: string): void {
-  for (let index = 0; index < PRE_TURN_BOUNDS.markdownFiles + 8; index++) {
-    memoryFile(`${dir}/filler-${String(index).padStart(5, '0')}.txt`, '');
-  }
-}
-
-// Root cause: listMarkdownFiles walks BFS with a PRE_TURN_BOUNDS.markdownFiles
-// visited-entry cap. `concepts/` sorts before both `preferences/` and
-// `generated/`, so a tree with enough concepts entries exhausts the cap before
-// either directory is ever enumerated. Both lanes below are deterministic,
-// direct-path lookups and must not depend on the ranked walk's output.
-describe('recall lanes survive file-walk cap starvation', () => {
-  const seedOverCapTree = (): void => seedOverCapEntries('concepts');
-
-  it('preference lane survives a memory tree larger than the file-walk cap', () => {
-    seedOverCapTree();
-    memoryFile('preferences/alex.md', '# Alex\nProduct altitude always. No file paths or code identifiers.');
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'what shipped this week?', sender: 'Alex Stone' }),
-    });
-
-    expect(result.notices.some((notice) => notice.code === 'markdown-file-limit')).toBe(true);
-    const preference = result.memoryEvidence.excerpts.find((row) => row.path === 'preferences/alex.md');
-    expect(preference).toBeDefined();
-    expect(preference?.text).toContain('Product altitude always');
-    expect(result.notices.some((notice) => notice.code === 'preference-recall')).toBe(true);
-  });
-
-  it('the fact store survives a memory tree larger than the file-walk cap', () => {
-    seedOverCapTree();
-    const fact = (n: number) =>
-      `- Forecast pipeline volume fact number ${n} with distinct detail ${'x'.repeat(30 * n)}. <!-- nanoclaw-memory:id=mem_${String(n).repeat(16)};evidence=ev-${n};captured=2026-08-0${n}T00:00:00.000Z -->`;
-    memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${[1, 2, 3].map(fact).join('\n')}\n`);
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'What is the forecast pipeline volume detail?' }),
-      includeBootstrap: false,
-    });
-
-    expect(result.notices.some((notice) => notice.code === 'markdown-file-limit')).toBe(true);
-    const facts = result.memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md');
-    expect(facts.length).toBeGreaterThan(0);
-    expect(facts[0]?.text).toContain('Forecast pipeline volume fact');
-  });
-});
-
 describe('fact marker reason field (P0-AC6)', () => {
   it('the reason field does not affect ranking or selection', () => {
     const fact = (n: number, reason: string) =>
@@ -1323,103 +1188,6 @@ describe('fact marker reason field (P0-AC6)', () => {
   });
 });
 
-// P2-AC8. Topic files under people/domain/systems are ordinary memory
-// Markdown with no recall-path code change (P2-I5) — this test is the
-// guard-by-construction proof. Does not assert full-file delivery: only
-// three ranked file excerpts survive per turn (PRE_TURN_BOUNDS.markdownExcerpts).
-describe('topic-file recall (P2-AC8)', () => {
-  it('topic files reach recall through the file lane, across all three directories', () => {
-    memoryFile(
-      'people/maya-chen.md',
-      '<!-- consolidated: facts=1 -->\n# Maya Chen\n\nMaya Chen is the client liaison for Acme.\n',
-    );
-    memoryFile(
-      'domain/acme-pricing.md',
-      '<!-- consolidated: facts=1 -->\n# Acme pricing\n\nAcme pricing tiers follow usage-based billing.\n',
-    );
-    memoryFile(
-      'systems/nightly-pipeline.md',
-      '<!-- consolidated: facts=1 -->\n# Nightly pipeline\n\nThe nightly pipeline loads Acme data into Snowflake.\n',
-    );
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({
-        text: 'Maya Chen Acme pricing tiers usage-based billing nightly pipeline Snowflake',
-      }),
-      includeBootstrap: false,
-    });
-
-    const byPath = new Map(result.memoryEvidence.excerpts.map((row) => [row.path, row.text]));
-    expect([...byPath.keys()]).toEqual(
-      expect.arrayContaining(['people/maya-chen.md', 'domain/acme-pricing.md', 'systems/nightly-pipeline.md']),
-    );
-    expect(byPath.get('people/maya-chen.md')).toContain('Maya Chen is the client liaison for Acme.');
-    expect(byPath.get('domain/acme-pricing.md')).toContain('Acme pricing tiers follow usage-based billing.');
-    expect(byPath.get('systems/nightly-pipeline.md')).toContain('The nightly pipeline loads Acme data into Snowflake.');
-  });
-});
-
-// Stamping OKF frontmatter on 290 files put `type: person` into the ranker's
-// text, making every people file a lexical candidate for a generic "person"
-// query. Field names are metadata; only `title`/`description` values carry a
-// search role (definition.md).
-describe('frontmatter is not ranked as content', () => {
-  it('does not let a field name make a file a candidate for a generic query', () => {
-    memoryFile(
-      'people/maya-chen.md',
-      '---\ntype: person\ntags: priority\nresource: transcripts/kickoff.md\nconsolidated_facts: 4\n---\n\nMaya Chen runs the Acme account.\n',
-    );
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'person tags resource consolidated' }),
-      includeBootstrap: false,
-    });
-    expect(result.memoryEvidence.excerpts.map((row) => row.path)).not.toContain('people/maya-chen.md');
-  });
-
-  it('still ranks the file on its body, and delivers the frontmatter with it', () => {
-    memoryFile(
-      'people/maya-chen.md',
-      '---\ntype: person\nconsolidated_facts: 4\n---\n\nMaya Chen runs the Acme account.\n',
-    );
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'Maya Chen Acme account' }),
-      includeBootstrap: false,
-    });
-    const row = result.memoryEvidence.excerpts.find((excerpt) => excerpt.path === 'people/maya-chen.md');
-    expect(row?.text).toContain('Maya Chen runs the Acme account.');
-    // Delivered text is the whole file — only RANKING drops the frontmatter.
-    expect(row?.text).toContain('type: person');
-  });
-
-  it('ranks a file on a human-written description, which definition.md gives a search role', () => {
-    memoryFile(
-      'domain/acme.md',
-      '---\ntype: domain\ndescription: Quarterly renewal risk for the Acme contract\nconsolidated_facts: 4\n---\n\nUnrelated body text.\n',
-    );
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'quarterly renewal risk contract' }),
-      includeBootstrap: false,
-    });
-    expect(result.memoryEvidence.excerpts.map((row) => row.path)).toContain('domain/acme.md');
-  });
-});
-
 describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
   const ASK = 'Can you help me build a practice app about losophe?';
 
@@ -1434,7 +1202,6 @@ describe('bootstrap recall budget (B-AC1..B-AC4, incident 2026-08-13)', () => {
         `- ${fact} (fact ${index}) <!-- nanoclaw-memory:id=mem_${String(index).repeat(16)};evidence=ev-${index};captured=2026-08-0${index + 1}T00:00:00.000Z -->`,
     );
     memoryFile('generated/memory.md', `# Generated workgroup memory\n\n${factLines.join('\n')}\n`);
-    memoryFile('imports/losophe-tenant.md', `# Losophe tenant\n${sentence.repeat(30)}`);
     for (let index = 0; index < 4; index++) {
       archive(`losophe-${index}`, 'ag-a', `${sentence.repeat(10)} (row ${index})`, `2026-07-2${index}T00:00:00.000Z`);
     }
@@ -1625,17 +1392,6 @@ describe('final-bound eviction order at the seam', () => {
   });
 });
 
-describe('markdown byte-scan budget stays coupled to the generated-memory rail', () => {
-  it('leaves headroom for the manual tree even when the generated store sits at its own cap', () => {
-    // generated/memory.md sorts first in scan order (see the comment above
-    // markdownScannedBytes), so a generated store at GENERATED_MEMORY_MAX_BYTES
-    // must not consume the whole budget — otherwise every manual file scanned
-    // after it silently reads as zero bytes. This is the exact regression that
-    // would recur if the generated-memory cap were raised without this one.
-    expect(PRE_TURN_BOUNDS.markdownScannedBytes).toBeGreaterThan(GENERATED_MEMORY_MAX_BYTES);
-  });
-});
-
 // Root cause: the recall token cache keyed on WINDOW text (boundedPassages via
 // bestPassage), not on fact text, and one fact yields ~9-12 windows. A
 // 1,000-fact ledger was ~12,000 entries, so the old 8,192 cap flushed the whole
@@ -1706,90 +1462,6 @@ describe('recall token cache survives a working set larger than the old 8,192-en
 
     // Still full rather than emptied.
     expect(_tokenStreamCacheStatsForTest().size).toBe(max);
-  });
-});
-
-// Root cause: listMarkdownFiles' shared visited-entry cap is consumed in
-// codepoint order, so a large `domain/` starves every topic directory sorting
-// after it. Measured on the live 564-file tree: visited=256, files_found=245,
-// and `people/` (14 files) plus `systems/` (28) were never enumerated at all —
-// 40 consolidation-produced topic views structurally invisible to recall.
-describe('curator topic directories always reach recall', () => {
-  it('delivers people/, domain/ and systems/ files past the file-walk cap', () => {
-    seedOverCapEntries('domain');
-    memoryFile('domain/quarterly-forecast.md', '# Quarterly forecast\nThe forecast pipeline volume doubled.');
-    memoryFile('people/alex-stone.md', '# Alex Stone\nAlex owns the forecast pipeline volume review.');
-    memoryFile('systems/forecast-pipeline.md', '# Forecast pipeline\nThe forecast pipeline volume is sharded.');
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'who owns the forecast pipeline volume?' }),
-      includeBootstrap: false,
-    });
-
-    // The walk stays capped — this is not "raise the number until it fits".
-    expect(result.notices.some((notice) => notice.code === 'markdown-file-limit')).toBe(true);
-    const paths = result.memoryEvidence.excerpts.map((row) => row.path);
-    expect(paths).toContain('people/alex-stone.md');
-    expect(paths).toContain('systems/forecast-pipeline.md');
-    expect(paths).toContain('domain/quarterly-forecast.md');
-  });
-});
-
-// The direct-lister lanes above are a hardcoded list, and every directory NOT
-// on it was still losing the walk's sort race. On the live 587-entry tree the
-// 256-entry cap was spent by `<root>` (92) plus `domain/` (161), so `methods/`
-// — 190 files of agent-authored engineering knowledge, the exact thing recall
-// exists to surface — plus `imported/claude-auto` (81), `learning/`,
-// `imports/` and `system/` were never enumerated at all. Adding `methods/` to
-// the lister list would have been the third patch of the same shape, so the
-// walk itself now reaches the whole tree.
-describe('the file walk reaches every content directory', () => {
-  it('delivers a methods/ file behind more than 256 earlier-sorting entries', () => {
-    for (let index = 0; index < 300; index++) {
-      memoryFile(`domain/topic-${String(index).padStart(5, '0')}.md`, `# Topic ${index}\nUnrelated filler ${index}.`);
-    }
-    memoryFile(
-      'methods/a-hung-test-is-a-defect-until-you-isolate-it.md',
-      '# A hung test is a defect\nIsolate the hung test before blaming the runner.',
-    );
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'how do I isolate a hung test?' }),
-      includeBootstrap: false,
-    });
-
-    expect(result.memoryEvidence.excerpts.map((row) => row.path)).toContain(
-      'methods/a-hung-test-is-a-defect-until-you-isolate-it.md',
-    );
-    // Nothing was hidden, so the guard must stay quiet.
-    expect(result.notices.some((notice) => notice.code === 'markdown-file-limit')).toBe(false);
-  });
-
-  it('names the directories it never enumerated when the guard does bind', () => {
-    seedOverCapEntries('concepts');
-    memoryFile('zzz-late/unreachable.md', '# Late\nThis directory sorts after the guard runs out.');
-
-    const result = buildPreTurnContext({
-      agentGroupId: 'ag-a',
-      sessionId: 'sess-a',
-      kind: 'chat-sdk',
-      trigger: 1,
-      normalizedContent: JSON.stringify({ text: 'anything at all' }),
-      includeBootstrap: false,
-    });
-
-    const notice = result.notices.find((row) => row.code === 'markdown-file-limit');
-    expect(notice?.status).toBe('degraded');
-    expect(notice?.detail).toContain('concepts/');
-    expect(notice?.detail).toContain('zzz-late/');
   });
 });
 
@@ -2007,7 +1679,6 @@ describe('per-build structured log line (recall latency instrumentation)', () =>
       'generated/memory.md',
       '# Generated workgroup memory\n\n- Deploy pipeline runs nightly.\n- Deploy pipeline retries on failure.\n',
     );
-    memoryFile('projects/deploy.md', '# Deploy pipeline\nThe deploy pipeline retries failed jobs automatically.');
 
     const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
     buildPreTurnContext({
@@ -2025,11 +1696,9 @@ describe('per-build structured log line (recall latency instrumentation)', () =>
     expect(fields.workgroupId).toBe('wg-a');
     expect(typeof fields.elapsedMs).toBe('number');
     expect(fields.elapsedMs as number).toBeGreaterThanOrEqual(0);
-    // The two generated fact lines, and the one non-core Markdown file
-    // (index.md and system/definition.md are seeded but excluded from
-    // candidates - they are core/non-recall paths, not ranked).
+    // The two generated fact lines. index.md and the preferences lane are
+    // not ranked candidates, and no other Markdown is read at all.
     expect(fields.factCandidates).toBe(2);
-    expect(fields.fileCandidates).toBe(1);
     expect(typeof fields.tokenCacheSize).toBe('number');
     expect(typeof fields.tokenCacheMax).toBe('number');
     expect(typeof fields.tokenCacheHits).toBe('number');
@@ -2105,21 +1774,29 @@ describe('NANOCLAW_MEMORY_CURATOR_ENABLED gates fact injection, not just fact wr
     expect(recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
   });
 
-  it('does not demote the disabled ledger into the ordinary markdown lane', () => {
-    // The trap: generated/memory.md is an ordinary .md inside the scanned tree.
-    // Disabling only the fact lane would leave it scored as one multi-megabyte
-    // document — worse than either state, and it eats the markdown scan budget.
-    // The guard is a `continue` before candidate construction, so any leak into
-    // the file lane would surface as an excerpt carrying this path and text.
+  it('never reads the disabled ledger at all, through any lane', () => {
+    // Replaces 'does not demote the disabled ledger into the ordinary markdown
+    // lane'. That test guarded against generated/memory.md leaking into the
+    // ranked file lane when the fact lane was gated off. There is no file lane
+    // any more — `readGeneratedFacts` is the ledger's only reader — so the
+    // demotion hazard is structurally gone and that assertion could not fail.
+    //
+    // What replaces it is stronger: the gate must sit BEFORE the lstat, so a
+    // disabled ledger is not merely unranked but never touched. Move the guard
+    // below the stat and this fails; delete it and both halves fail.
     ledger();
-    memoryFile('domain/forecasting.md', `# Forecasting\n\nThe quarterly forecast pipeline is reviewed weekly.`);
     process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'off';
+    const lstatSpy = vi.spyOn(fs, 'lstatSync');
 
-    const excerpts = recall().memoryEvidence.excerpts;
+    try {
+      const excerpts = recall().memoryEvidence.excerpts;
 
-    expect(excerpts.some((row) => row.path === 'domain/forecasting.md')).toBe(true);
-    expect(excerpts.every((row) => row.path !== 'generated/memory.md')).toBe(true);
-    expect(excerpts.every((row) => !row.text.includes(FACT_TEXT))).toBe(true);
+      expect(excerpts.every((row) => row.path !== 'generated/memory.md')).toBe(true);
+      expect(excerpts.every((row) => !row.text.includes(FACT_TEXT))).toBe(true);
+      expect(lstatSpy.mock.calls.some(([target]) => String(target).endsWith('generated/memory.md'))).toBe(false);
+    } finally {
+      lstatSpy.mockRestore();
+    }
   });
 
   it('leaves an absent or malformed flag behaving as a disabled curator', () => {

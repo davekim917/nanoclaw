@@ -241,7 +241,13 @@ describe('writeOutboundDirect', () => {
  * message is logged-and-dropped forever — the reset silently kills the chat.
  */
 describe('writeSessionMessage re-provisions a deleted session folder', () => {
+  // Two tests below use the generated-fact lane as their memory-evidence
+  // vehicle, and that lane is gated on the curator flag (default off). Same
+  // save/restore pattern as pre-turn-context.test.ts.
+  const curatorFlag = process.env.NANOCLAW_MEMORY_CURATOR_ENABLED;
+
   beforeEach(() => {
+    process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'true';
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
     const db = initTestDb();
     runMigrations(db);
@@ -271,6 +277,8 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
   });
 
   afterEach(() => {
+    if (curatorFlag === undefined) delete process.env.NANOCLAW_MEMORY_CURATOR_ENABLED;
+    else process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = curatorFlag;
     closeDb();
   });
 
@@ -423,9 +431,13 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
 
   it('emits one bootstrap per provider context epoch and suppresses unchanged warm evidence', async () => {
     const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
-    fs.mkdirSync(path.join(memoryRoot, 'facts'), { recursive: true });
+    fs.mkdirSync(path.join(memoryRoot, 'generated'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
-    fs.writeFileSync(path.join(memoryRoot, 'facts', 'owner.md'), '# Deployment owner\nJordan owns deployment.');
+    fs.writeFileSync(
+      path.join(memoryRoot, 'generated', 'memory.md'),
+      '# Generated workgroup memory\n\n- Jordan owns deployment. ' +
+        '<!-- nanoclaw-memory:id=mem_0000000000000001;evidence=ev-1;captured=2026-07-20T00:00:00.000Z -->\n',
+    );
     const message = (id: string) => ({
       id,
       kind: 'chat-sdk',
@@ -464,7 +476,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       );
       expect(first.trustedCapabilities).toMatchObject({ agentGroupId: AG });
       expect(first.memoryEvidence.core.map((row: { path: string }) => row.path)).toEqual(['index.md']);
-      expect(first.memoryEvidence.excerpts.map((row: { path: string }) => row.path)).toContain('facts/owner.md');
+      expect(first.memoryEvidence.excerpts.map((row: { path: string }) => row.path)).toContain('generated/memory.md');
       expect(warm).not.toHaveProperty('trustedCapabilities');
       expect(warm.memoryEvidence.core).toEqual([]);
       expect(warm.memoryEvidence.excerpts).toEqual([]);
@@ -484,7 +496,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       expect(reset.contextEpoch).toBe(1);
       expect(reset.trustedCapabilities).toMatchObject({ agentGroupId: AG });
       expect(reset.memoryEvidence.core.map((row: { path: string }) => row.path)).toEqual(['index.md']);
-      expect(reset.memoryEvidence.excerpts.map((row: { path: string }) => row.path)).toContain('facts/owner.md');
+      expect(reset.memoryEvidence.excerpts.map((row: { path: string }) => row.path)).toContain('generated/memory.md');
     } finally {
       outbound.close();
       inbound.close();
@@ -493,9 +505,13 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
 
   it('treats input queued behind a pending clear as a fresh provider context', async () => {
     const memoryRoot = path.join(TEST_DATA_DIR, 'workgroups', 'reset', 'memory');
-    fs.mkdirSync(path.join(memoryRoot, 'facts'), { recursive: true });
+    fs.mkdirSync(path.join(memoryRoot, 'generated'), { recursive: true });
     fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
-    fs.writeFileSync(path.join(memoryRoot, 'facts', 'owner.md'), '# Deployment owner\nJordan owns deployment.');
+    fs.writeFileSync(
+      path.join(memoryRoot, 'generated', 'memory.md'),
+      '# Generated workgroup memory\n\n- Jordan owns deployment. ' +
+        '<!-- nanoclaw-memory:id=mem_0000000000000001;evidence=ev-1;captured=2026-07-20T00:00:00.000Z -->\n',
+    );
     const message = (id: string, text: string) => ({
       id,
       kind: 'chat-sdk',
@@ -549,7 +565,9 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       );
       expect(followup.trustedCapabilities).toMatchObject({ agentGroupId: AG });
       expect(followup.memoryEvidence.core.map((row: { path: string }) => row.path)).toEqual(['index.md']);
-      expect(followup.memoryEvidence.excerpts.map((row: { path: string }) => row.path)).toContain('facts/owner.md');
+      expect(followup.memoryEvidence.excerpts.map((row: { path: string }) => row.path)).toContain(
+        'generated/memory.md',
+      );
     } finally {
       outbound.close();
       inbound.close();
