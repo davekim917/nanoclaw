@@ -795,4 +795,49 @@ describe('storage GC — apply mode', () => {
     expect(fs.existsSync(clean.topicDir)).toBe(false);
     expect(fs.existsSync(dirty.topicDir)).toBe(true);
   });
+
+  it.skipIf(!hasTrash)(
+    '#183: aborts when inbound.db moves after freshMounts/repoListing but before the physical trash',
+    () => {
+      const { topicDir, canonical, branch } = topicFixture('thread-idle-latewrite');
+      state.rows = [sessionRow('thread-idle-latewrite', 'folder-a', 'active', 20)];
+      const inboundPath = path.join(
+        state.dataDir,
+        'v2-sessions',
+        'ag-thread-idle-latewrite',
+        's-thread-idle-latewrite',
+        'inbound.db',
+      );
+      fs.mkdirSync(path.dirname(inboundPath), { recursive: true });
+      fs.writeFileSync(inboundPath, '');
+      const old = new Date(Date.now() - 20 * 86_400_000);
+      fs.utimesSync(inboundPath, old, old);
+
+      // Simulate a message landing (bumping inbound.db's durable-write mtime)
+      // AFTER the freshMounts/container-runtime check has already run — the
+      // window #183 narrows by moving the mtime fence to be the LAST check
+      // before the physical trash. Hooked on the quarantine worktrees listing,
+      // the step immediately preceding that final fence.
+      const realReaddir = fs.readdirSync.bind(fs);
+      let injected = false;
+      vi.spyOn(fs, 'readdirSync').mockImplementation(((dir: unknown, opts?: unknown) => {
+        if (!injected && typeof dir === 'string' && dir.includes('.gc-quarantine') && dir.endsWith('worktrees')) {
+          injected = true;
+          const now = new Date();
+          fs.utimesSync(inboundPath, now, now);
+        }
+        return (realReaddir as (...args: unknown[]) => unknown)(dir, opts);
+      }) as typeof fs.readdirSync);
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      let report: GcReport;
+      try {
+        report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      } finally {
+        vi.restoreAllMocks();
+      }
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-late-activity' });
+      expect(fs.existsSync(topicDir)).toBe(true);
+      expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+    },
+  );
 });

@@ -1092,46 +1092,14 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     log.warn('Storage GC: could not write quarantine recovery metadata', { quarantinePath, err });
   }
 
-  // Codex P1 (round 5): sessionInventory failing here is not evidence the
-  // topic is quiet — participantsByTopic collapses a DB failure into an empty
-  // map, indistinguishable from "genuinely no participants" unless checked
-  // directly first. Same principle participantsByTopic's own doc comment
-  // already states: a failed inventory preserves, never deletes.
-  if (sessionInventory() === null) {
-    reconcileQuarantine(candidate, quarantinePath, dataDir);
-    return { ok: false, reason: 'aborted-recheck-unavailable' };
-  }
-
-  const before = new Map(snapshot.map((p) => [p.sessionId, p]));
-  const owner = participantsByTopic(dataDir).get(candidate.path);
-  const activityAdvanced = (owner?.participants ?? []).some((p) => {
-    const prior = before.get(p.sessionId);
-    // Codex P1 (round 4): status/idleSince lag the real admission event —
-    // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
-    // it updates last_active (session-manager.ts:892-911), two separate
-    // writes. Fence on the durable write itself instead of its lagging
-    // index: inbound.db's mtime moves at the insert, not after. A file that
-    // appeared, or whose mtime moved forward, or that stopped being statable
-    // where it previously was — all count as new activity. Nothing durable
-    // happens after this file changes, so there is no remaining window.
-    const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
-    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved;
-  });
-  if (activityAdvanced) {
-    reconcileQuarantine(candidate, quarantinePath, dataDir);
-    return { ok: false, reason: 'aborted-late-activity' };
-  }
-
   const freshMounts = runningContainerMounts();
   if (freshMounts === null || pathOverlapsResolvedMounts(resolvedOriginal, freshMounts)) {
     reconcileQuarantine(candidate, quarantinePath, dataDir);
     return { ok: false, reason: 'aborted-late-activity' };
   }
 
-  // Genuinely clear — capture the repo list before trashing (quarantinePath
-  // won't exist to list afterward), then commit the delete FIRST. Prune runs
-  // only once that succeeds (Codex P2): a trash failure below leaves every
-  // canonical registration untouched, so the restored checkout stays usable.
+  // Capture the repo list before trashing (quarantinePath won't exist to list
+  // afterward).
   const repoListing = safeDirectories(path.join(quarantinePath, 'worktrees'));
   if (repoListing === null) {
     // A real read failure (EACCES/EIO), not "no worktrees" — treating it as
@@ -1144,6 +1112,43 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
     return { ok: false, reason: 'quarantine-unreadable' };
   }
   const repos = repoListing.filter(isRepositoryName);
+  const workgroupId = path.basename(path.dirname(candidate.path));
+
+  // #183: the durable-write fence runs LAST, immediately before the
+  // irreversible trash — not before freshMounts/repoListing above, which
+  // themselves cost real wall-clock time (a docker inspect, a readdir). A
+  // fence checked earlier leaves that whole span unguarded; checked here it
+  // shrinks the residual admission-race window down to roughly the width of
+  // the trashPath call itself. Codex P1 (round 5): sessionInventory failing
+  // here is not evidence the topic is quiet — participantsByTopic collapses a
+  // DB failure into an empty map, indistinguishable from "genuinely no
+  // participants" unless checked directly first.
+  if (sessionInventory() === null) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-recheck-unavailable' };
+  }
+  const before = new Map(snapshot.map((p) => [p.sessionId, p]));
+  const owner = participantsByTopic(dataDir).get(candidate.path);
+  const activityAdvanced = (owner?.participants ?? []).some((p) => {
+    const prior = before.get(p.sessionId);
+    // Codex P1 (round 4): status/idleSince lag the real admission event —
+    // writeSessionMessageLocked inserts into inbound.db and closes it BEFORE
+    // it updates last_active (session-manager.ts:892-911), two separate
+    // writes. Fence on the durable write itself instead of its lagging
+    // index: inbound.db's mtime moves at the insert, not after. A file that
+    // appeared, or whose mtime moved forward, or that stopped being statable
+    // where it previously was — all count as new activity.
+    const inboundMoved = laterThan(prior?.inboundMtimeMs ?? null, p.inboundMtimeMs);
+    return !prior || prior.status !== p.status || Date.parse(p.idleSince) > Date.parse(prior.idleSince) || inboundMoved;
+  });
+  if (activityAdvanced) {
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-late-activity' };
+  }
+
+  // Genuinely clear — commit the delete FIRST. Prune runs only once that
+  // succeeds (Codex P2): a trash failure below leaves every canonical
+  // registration untouched, so the restored checkout stays usable.
   try {
     trashPath(quarantinePath);
   } catch (err) {
@@ -1159,7 +1164,6 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
   // (no container-relative back-pointer can land in them), so `worktree
   // prune` only ever removes entries whose path is genuinely gone — which,
   // for this repo, is now true.
-  const workgroupId = path.basename(path.dirname(candidate.path));
   for (const repo of repos) {
     if (git(canonicalRepoDir(workgroupId, repo, dataDir), ['worktree', 'prune']) === null) {
       log.warn('Storage GC: git worktree prune failed after idle collection; may need a manual prune', {
