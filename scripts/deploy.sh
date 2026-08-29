@@ -61,6 +61,7 @@ restore_before_restart() {
       fi
       if mv "${name}.pre-deploy" "$name"; then
         restored="${restored}${name} "
+        rm -rf "${name}.failed-deploy"
       else
         # Do not leave the live path absent if the snapshot rename fails.
         [ -d "${name}.failed-deploy" ] && mv "${name}.failed-deploy" "$name"
@@ -240,11 +241,11 @@ echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Build complete, restarting..." >> "$LOG"
 # - imageBase is recorded only when THIS deploy retagged :pre-deploy. A stale
 #   tag from an earlier deploy must never be retagged over the current image.
 MIGRATION_CHANGES=$(git diff --name-only "$PRE_COMMIT" HEAD -- src/db/migrations/ 2>/dev/null)
+if tracked_changes; then
+  write_status "failed" "pre-restart" "tracked source changed during deploy — restart refused to preserve customizations"
+  exit 1
+fi
 if [ -z "$MIGRATION_CHANGES" ]; then
-  if tracked_changes; then
-    write_status "failed" "pre-restart" "tracked source changed during deploy — restart refused to preserve customizations"
-    exit 1
-  fi
   mkdir -p data
   printf '{"commit":"%s","imageBase":"%s","timestamp":"%s","node":"%s"}\n' \
     "$PRE_COMMIT" "${IMAGE_SAVED_BASE}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(node --version 2>/dev/null)" > data/deploy-rollback.json

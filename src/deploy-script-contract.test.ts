@@ -21,7 +21,11 @@ describe('deploy rollback shell contract', () => {
 
   it('refuses tracked changes before mutation and restores pre-restart failures', () => {
     expect(script.indexOf('if tracked_changes; then')).toBeLessThan(script.indexOf('git checkout main'));
+    expect(script.lastIndexOf('if tracked_changes; then')).toBeLessThan(
+      script.indexOf('if [ -z "$MIGRATION_CHANGES" ]'),
+    );
     expect(script).toContain('trap restore_before_restart EXIT');
     expect(script).toContain('Pre-restart rollback preserved tracked source changes; commit reset skipped');
+    expect(script).toContain('rm -rf "${name}.failed-deploy"');
   });
 });
