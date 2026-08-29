@@ -1,0 +1,18 @@
+[Unit]
+Description=NanoClaw storage GC (apply) + 3-day trash retention
+# Collects disposable topic worktrees (proven-pushed, idle >= NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS),
+# then empties trash items older than 3 days. Trash is the recovery window for
+# anything the GC took; 3 days balances recoverability against disk headroom.
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nanoclaw-v2
+Environment=NANOCLAW_STORAGE_GC=apply
+ExecStart=/home/ubuntu/nanoclaw-v2/node_modules/.bin/tsx scripts/storage-gc.ts
+ExecStart=/usr/bin/trash-empty -f 3
+# IO-heavy tree walk; keep it polite to the live fleet.
+IOSchedulingClass=idle
+Nice=10
+TimeoutStartSec=2h
