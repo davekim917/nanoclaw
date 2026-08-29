@@ -3520,6 +3520,21 @@ async function buildContainerArgs(
     }
   }
 
+  // Pin pnpm's store to the group mount, for every provider. With no store-dir
+  // set, pnpm hardlink-tests against $HOME (the image overlay layer — a
+  // different device from any bind mount) and falls back to the nearest
+  // bind-mount boundary it can find, which was scattering duplicate
+  // multi-hundred-MB stores across every topic worktree and group dir.
+  // /workspace/agent (groups/<folder>, mounted unconditionally above) is the
+  // right target: same host filesystem as every workspace mount so hardlinks
+  // work, and shared per GROUP rather than the flag-gated, ephemeral-when-off
+  // /workspace/workgroup. Both env forms are set — pnpm 10 (current pin) and
+  // pnpm 11 both honor `npm_config_*`, and `pnpm_config_*` is the
+  // pnpm-specific form going forward — and env config outranks any .npmrc an
+  // agent or repo may carry.
+  args.push('-e', 'npm_config_store_dir=/workspace/agent/.pnpm-store');
+  args.push('-e', 'pnpm_config_store_dir=/workspace/agent/.pnpm-store');
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   const providerEnv = { ...(providerContribution.env ?? {}) };
   // OpenCode reads its model/effort selectors directly from OPENCODE_* env
