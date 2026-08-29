@@ -29,6 +29,8 @@ vi.mock('./db/connection.js', () => ({
   getDb: () => ({ prepare: () => ({ all: () => state.rows }) }),
 }));
 vi.mock('./session-manager.js', () => ({
+  sessionDir: (agentGroupId: string, sessionId: string) =>
+    path.join(state.dataDir, 'v2-sessions', agentGroupId, sessionId),
   openOutboundDb: (_agentGroupId: string, sessionId: string) => {
     if (state.unreadable.has(sessionId)) throw new Error('persisted state unavailable');
     return {
@@ -63,6 +65,7 @@ import {
   topicWorktreesDir,
   writeTransferTombstone,
 } from './repository-workspaces.js';
+import { SESSION_RECLAIM_JOURNAL_FILENAME, SESSION_RESCUES_DIRNAME } from './storage-manager.js';
 
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', ...args], {
@@ -82,6 +85,16 @@ function row(sessionId: string, threadId = 'thread-1', status = 'active') {
     platform_id: 'slack:C1',
     workgroup_id: 'wg-a',
   };
+}
+
+/** Records a real reclaim-journal line — the actual evidence sessionWasReclaimed reads. */
+function markReclaimed(sessionId: string): void {
+  const dir = path.join(state.dataDir, SESSION_RESCUES_DIRNAME);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.appendFileSync(
+    path.join(dir, SESSION_RECLAIM_JOURNAL_FILENAME),
+    `${JSON.stringify({ session_id: sessionId, agent_group_id: `ag-${sessionId}`, prior_status: 'active', rescue_path: 'x' })}\n`,
+  );
 }
 
 function unit(threadId = 'thread-1', sessionId = 's1') {
@@ -241,10 +254,42 @@ describe('per-topic linked worktree cleanup', () => {
     expect(fs.existsSync(fixture.worktree)).toBe(true);
   });
 
-  it('preserves the worktree when an inactive participant persisted state is unknown', async () => {
+  it('preserves the worktree when an inactive participant persisted state is unknown and NOT reclaimed', async () => {
+    // The fail-closed counter-case: unreadable but never recorded in the
+    // reclaim journal must never be read as "reclaimed".
     state.rows = [row('s1', 'thread-1', 'inactive')];
     const fixture = repositoryFixture();
     state.unreadable.add('s1');
+
+    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    await _cleanupOneForTesting(target, state.dataDir);
+
+    expect(fs.existsSync(fixture.worktree)).toBe(true);
+  });
+
+  it('does not treat a session recorded in the reclaim journal AND actually gone as busy', async () => {
+    state.rows = [row('s1', 'thread-1', 'inactive')];
+    const fixture = repositoryFixture();
+    // Real evidence a reclaim happened — not bare directory absence, which an
+    // operator's out-of-band rm -rf on a still-ACTIVE session can also produce.
+    markReclaimed('s1');
+    state.unreadable.add('s1'); // the dir/DB is in fact gone too, but that's not what's being asserted
+
+    const [target] = _discoverWorktreesForTesting(state.dataDir);
+    await _cleanupOneForTesting(target, state.dataDir);
+
+    expect(fs.existsSync(fixture.worktree)).toBe(false);
+  });
+
+  it('still treats a JOURNALED session as busy if its directory is still present (CAS lost)', async () => {
+    // storage-manager.ts appends the journal line BEFORE the archiving->closed
+    // CAS, and on CAS loss the directory is deliberately kept — journaled
+    // alone does not mean gone.
+    state.rows = [row('s1', 'thread-1', 'inactive')];
+    const fixture = repositoryFixture();
+    markReclaimed('s1');
+    fs.mkdirSync(path.join(state.dataDir, 'v2-sessions', 'ag-s1', 's1'), { recursive: true });
+    state.unreadable.add('s1'); // falls through to the DB check, which fails closed
 
     const [target] = _discoverWorktreesForTesting(state.dataDir);
     await _cleanupOneForTesting(target, state.dataDir);

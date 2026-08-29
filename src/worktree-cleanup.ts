@@ -31,9 +31,9 @@ import {
   withRepositoryLifecycleClaims,
   type RepositoryWorkUnit,
 } from './repository-workspaces.js';
-import { openOutboundDb } from './session-manager.js';
+import { openOutboundDb, sessionDir } from './session-manager.js';
 import { safeGitArgs, safeGitEnv } from './safe-git.js';
-import { dirSizeBytes } from './storage-manager.js';
+import { dirSizeBytes, sessionWasReclaimed } from './storage-manager.js';
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 60_000;
@@ -216,10 +216,25 @@ function discover(dataDir: string = DATA_DIR): DiscoveryResult {
   return { targets, filteredNames: [...filteredNames].sort(), unreadableRoots };
 }
 
-function participantHasPersistedWork(participant: TopicParticipant): boolean {
+function participantHasPersistedWork(participant: TopicParticipant, dataDir: string): boolean {
   // Session status is not proof that persisted work has completed. A
   // continuation, processing claim, or current tool can survive a transition
   // to inactive and must independently retain the shared topic worktree.
+  //
+  // Two-signal reclaim check, mirroring writeSessionMessageLocked
+  // (session-manager.ts:857). Neither signal alone is proof: the journal line
+  // is written BEFORE the archiving->closed CAS (storage-manager.ts:1259 vs
+  // :1266-1269), and on CAS loss the directory is deliberately kept — so a
+  // journaled-but-CAS-lost session is still live. Bare directory absence
+  // alone is also not proof: an operator can rm -rf a stuck ACTIVE session's
+  // dir directly, and it gets re-provisioned on the session's next message.
+  // Both together — journaled AND the directory actually gone — is what
+  // sessionWasReclaimed's own doc comment calls out as the real answer.
+  if (sessionWasReclaimed(participant.sessionId, path.join(dataDir, 'v2-sessions'))) {
+    if (!fs.existsSync(sessionDir(participant.agentGroupId, participant.sessionId))) {
+      return false;
+    }
+  }
   try {
     const db = openOutboundDb(participant.agentGroupId, participant.sessionId);
     try {
@@ -237,13 +252,13 @@ function participantHasPersistedWork(participant: TopicParticipant): boolean {
   }
 }
 
-function topicIsBusy(participants: TopicParticipant[]): boolean {
+function topicIsBusy(participants: TopicParticipant[], dataDir: string): boolean {
   if (participants.length === 0) return true;
   return participants.some(
     (participant) =>
       isContainerRunning(participant.sessionId) ||
       isContainerSpawning(participant.sessionId) ||
-      participantHasPersistedWork(participant),
+      participantHasPersistedWork(participant, dataDir),
   );
 }
 
@@ -322,7 +337,7 @@ function branchMayBeRemoved(target: TopicWorktreeTarget): { eligible: boolean; r
 
 async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DIR): Promise<void> {
   const context = { workgroupId: target.workUnit.workgroupId, workUnit: target.workUnit.key, repo: target.repo };
-  if (topicIsBusy(target.participants)) return;
+  if (topicIsBusy(target.participants, dataDir)) return;
   if (transferReferencesPath(target, dataDir)) return;
 
   await withRepositoryLifecycleClaims([target.workUnit], () =>
@@ -330,7 +345,7 @@ async function cleanupOne(target: TopicWorktreeTarget, dataDir: string = DATA_DI
       target.workUnit.workgroupId,
       target.repo,
       () => {
-        if (topicIsBusy(target.participants) || transferReferencesPath(target, dataDir)) return;
+        if (topicIsBusy(target.participants, dataDir) || transferReferencesPath(target, dataDir)) return;
         if (!isLinkedToCanonical(target)) {
           log.warn('Worktree cleanup: refusing non-linked or mismatched checkout', context);
           return;
@@ -621,7 +636,7 @@ function collectOrphanTopics(report: GcReport, dataDir: string, owners: Map<stri
         skip('topic-open');
         continue;
       }
-      if (participants && topicIsBusy(participants)) {
+      if (participants && topicIsBusy(participants, dataDir)) {
         skip('topic-busy');
         continue;
       }
@@ -813,7 +828,7 @@ function stillDisposable(candidate: GcCandidate, dataDir: string, mounts: string
   if (owner?.participants.some((participant) => participant.status !== 'closed')) {
     return { ok: false, reason: 'recheck-topic-open' };
   }
-  if (owner && topicIsBusy(owner.participants)) return { ok: false, reason: 'recheck-topic-busy' };
+  if (owner && topicIsBusy(owner.participants, dataDir)) return { ok: false, reason: 'recheck-topic-busy' };
   return { ok: true, reason: 'recheck-clear' };
 }
 
