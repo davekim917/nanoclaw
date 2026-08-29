@@ -440,25 +440,25 @@ describe('deliverBacklogThread', () => {
 describe('GitHub Issues-backed daily backlog', () => {
   const poster = {
     id: 'ag-codex',
-    name: 'Axie-Codex',
-    folder: 'axie-dev-codex',
+    name: 'Demo-Codex',
+    folder: 'demo-team-codex',
     agent_provider: null,
     created_at: '2026-08-01T00:00:00.000Z',
-    workgroup_id: 'axie-dev',
+    workgroup_id: 'demo-team',
   };
   const sibling = {
     id: 'ag-claude',
-    name: 'Axie-Claude',
-    folder: 'axie-dev-claude',
+    name: 'Demo-Claude',
+    folder: 'demo-team-claude',
     agent_provider: null,
     created_at: '2026-08-01T00:00:00.000Z',
-    workgroup_id: 'axie-dev',
+    workgroup_id: 'demo-team',
   };
   const target = {
-    id: 'mg-axie-dev',
+    id: 'mg-demo-team',
     channel_type: 'discord',
-    platform_id: 'discord:guild:axie-dev',
-    name: 'axie-dev',
+    platform_id: 'discord:guild:demo-team',
+    name: 'demo-team',
     is_group: 1,
     unknown_sender_policy: 'strict' as const,
     created_at: '2026-08-01T00:00:00.000Z',
