@@ -160,7 +160,10 @@ function archive(
   });
 }
 
+const CURATOR_FLAG = process.env.NANOCLAW_MEMORY_CURATOR_ENABLED;
+
 beforeEach(() => {
+  process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'true';
   FAILURES.archive = false;
   FAILURES.exactLink = false;
   FAILURES.capabilities = false;
@@ -174,6 +177,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  if (CURATOR_FLAG === undefined) delete process.env.NANOCLAW_MEMORY_CURATOR_ENABLED;
+  else process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = CURATOR_FLAG;
   closeDb();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
@@ -2064,4 +2069,65 @@ it('test_sanitizer_passes_expiresAt_through_to_trustedCapabilities', () => {
   } finally {
     CAPABILITY_FIXTURE.services = null;
   }
+});
+
+describe('NANOCLAW_MEMORY_CURATOR_ENABLED gates fact injection, not just fact writing', () => {
+  const FACT_TEXT = 'Quarterly forecast pipeline volume reconciles against the ledger snapshot';
+  const ledger = () =>
+    memoryFile(
+      'generated/memory.md',
+      `# Generated workgroup memory\n\n- ${FACT_TEXT}. <!-- nanoclaw-memory:id=mem_${'1'.repeat(16)};evidence=ev-1;captured=2026-08-01T00:00:00.000Z -->\n`,
+    );
+
+  const recall = () =>
+    buildPreTurnContext({
+      agentGroupId: 'ag-a',
+      sessionId: 'sess-a',
+      kind: 'chat-sdk',
+      trigger: 1,
+      normalizedContent: JSON.stringify({ text: 'What is the quarterly forecast pipeline volume?' }),
+      includeBootstrap: false,
+    });
+
+  it('injects ledger facts when the curator is enabled', () => {
+    ledger();
+
+    const excerpts = recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md');
+
+    expect(excerpts.length).toBeGreaterThan(0);
+    expect(excerpts[0]?.text).toContain(FACT_TEXT);
+  });
+
+  it('injects no ledger facts when the curator is disabled', () => {
+    ledger();
+    process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'false';
+
+    expect(recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
+  });
+
+  it('does not demote the disabled ledger into the ordinary markdown lane', () => {
+    // The trap: generated/memory.md is an ordinary .md inside the scanned tree.
+    // Disabling only the fact lane would leave it scored as one multi-megabyte
+    // document — worse than either state, and it eats the markdown scan budget.
+    // The guard is a `continue` before candidate construction, so any leak into
+    // the file lane would surface as an excerpt carrying this path and text.
+    ledger();
+    memoryFile('domain/forecasting.md', `# Forecasting\n\nThe quarterly forecast pipeline is reviewed weekly.`);
+    process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'off';
+
+    const excerpts = recall().memoryEvidence.excerpts;
+
+    expect(excerpts.some((row) => row.path === 'domain/forecasting.md')).toBe(true);
+    expect(excerpts.every((row) => row.path !== 'generated/memory.md')).toBe(true);
+    expect(excerpts.every((row) => !row.text.includes(FACT_TEXT))).toBe(true);
+  });
+
+  it('leaves an absent or malformed flag behaving as a disabled curator', () => {
+    ledger();
+    process.env.NANOCLAW_MEMORY_CURATOR_ENABLED = 'banana';
+    expect(recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
+
+    delete process.env.NANOCLAW_MEMORY_CURATOR_ENABLED;
+    expect(recall().memoryEvidence.excerpts.filter((row) => row.path === 'generated/memory.md')).toEqual([]);
+  });
 });

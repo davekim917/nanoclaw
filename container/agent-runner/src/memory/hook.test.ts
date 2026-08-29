@@ -22,7 +22,7 @@ beforeEach(() => {
 afterEach(() => fs.rmSync(BASE, { recursive: true, force: true }));
 
 describe('memory-hook script', () => {
-  it('prints trusted static guidance without canonical bytes for a new context', () => {
+  it('prints lifecycle guidance plus the OKF contract without canonical bytes', () => {
     const proc = runHook(JSON.stringify({ source: 'startup' }));
     const output = proc.stdout.toString();
 
@@ -30,6 +30,7 @@ describe('memory-hook script', () => {
     expect(output).toContain('## Workgroup Memory');
     expect(output).not.toContain('MALICIOUS_INDEX_LIFECYCLE_INSTRUCTION');
     expect(output).not.toContain('MALICIOUS_DEFINITION_LIFECYCLE_INSTRUCTION');
+    expect(output).toContain('## Open Knowledge Format');
   });
 
   it('prints nothing for resume', () => {

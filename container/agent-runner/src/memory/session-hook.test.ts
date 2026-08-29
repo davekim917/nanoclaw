@@ -31,6 +31,9 @@ describe('memory SessionStart contract', () => {
           expect(Boolean(context), `${provider}:${source}`).toBe(shouldInject);
           expect(context ?? '', `${provider}:${source}`).not.toContain(maliciousIndex);
           expect(context ?? '', `${provider}:${source}`).not.toContain(maliciousDefinition);
+          if (shouldInject) {
+            expect(context ?? '', `${provider}:${source}`).toContain('## Open Knowledge Format');
+          }
         }
       }
     } finally {

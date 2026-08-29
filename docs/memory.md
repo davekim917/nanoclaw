@@ -173,6 +173,16 @@ immediately. That tool cannot write `generated/memory.md`; this keeps
 user-authored, imported, and foreground-agent memory separate from automatic
 capture.
 
+`NANOCLAW_MEMORY_CURATOR_ENABLED` gates the whole fact system, both halves:
+writing new facts AND recalling previously written ones. Turning it off stops
+`generated/memory.md` from being injected as well as from growing — without
+that, an install with an accumulated ledger keeps serving those facts forever
+and "curator off" is untestable as an A/B. Off means the ledger is excluded
+from BOTH recall lanes; it is deliberately not demoted into the ordinary
+markdown lane, where a multi-megabyte file would surface roughly one fact per
+turn while consuming the shared markdown scan budget. The predicate lives in
+`src/modules/memory/curator-contract.ts`.
+
 When `NANOCLAW_MEMORY_CURATOR_ENABLED=true`, the host also reviews completed
 conversation episodes after five minutes of inactivity. This work is
 fire-and-forget from the 60-second host sweep: routing and delivery perform only
