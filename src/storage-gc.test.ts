@@ -16,8 +16,25 @@ const state = vi.hoisted(() => ({
   rowsPerCall: null as Array<Array<Record<string, string | null>>> | null,
   call: 0,
   failAtCall: null as number | null,
+  /** Codex P2 test only: make the NEXT `git worktree prune` call fail, then
+   *  self-clear — everything else passes through to the real execFileSync. */
+  failPruneOnce: false,
 }));
 
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  return {
+    ...actual,
+    execFileSync: (...args: Parameters<typeof actual.execFileSync>) => {
+      const [file, fileArgs] = args;
+      if (state.failPruneOnce && file === 'git' && Array.isArray(fileArgs) && fileArgs.includes('prune')) {
+        state.failPruneOnce = false;
+        throw new Error('simulated: sweep prune still failing');
+      }
+      return actual.execFileSync(...args);
+    },
+  };
+});
 vi.mock('./config.js', () => ({
   get DATA_DIR() {
     return state.dataDir;
@@ -195,6 +212,7 @@ beforeEach(() => {
   state.rowsPerCall = null;
   state.call = 0;
   state.failAtCall = null;
+  state.failPruneOnce = false;
   delete process.env.NANOCLAW_STORAGE_GC;
   delete process.env.NANOCLAW_TOPIC_IDLE_RECLAIM_DAYS;
 });
@@ -874,5 +892,64 @@ describe('storage GC — apply mode', () => {
     expect(fs.existsSync(path.join(state.dataDir, '.gc-pending-prunes.json'))).toBe(false);
     // The branch is free again for a fresh checkout.
     expect(() => git(canonical, ['worktree', 'add', '-q', `${worktree}-2`, branch])).not.toThrow();
+  });
+
+  it.skipIf(!hasTrash)('Codex P2: aborts collection when the prune journal cannot be persisted', () => {
+    const { topicDir, canonical, branch } = topicFixture('thread-idle-journalfail');
+    state.rows = [sessionRow('thread-idle-journalfail', 'folder-a', 'active', 20)];
+    // Pre-create the quarantine root (writable) so only the journal WRITE
+    // itself — not the earlier rename into quarantine — is blocked by making
+    // dataDir read-only afterward (simulating a read-only dataDir / ENOSPC).
+    fs.mkdirSync(path.join(state.dataDir, '.gc-quarantine'), { recursive: true });
+    fs.chmodSync(state.dataDir, 0o555);
+    process.env.NANOCLAW_STORAGE_GC = 'apply';
+    let report: GcReport;
+    try {
+      report = runStorageGcOnce(state.dataDir, state.groupsDir);
+    } finally {
+      fs.chmodSync(state.dataDir, 0o755); // restore so afterEach's rmSync can clean up
+    }
+    expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'aborted-prune-journal-unwritable' });
+    // Nothing was ever trashed — the topic was rolled back, not left dangling.
+    expect(fs.existsSync(topicDir)).toBe(true);
+    expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+  });
+
+  it.skipIf(!hasTrash)('Codex P2: a trash failure preserves an OLDER pending-prune entry for the same repo', () => {
+    const { topicDir, worktree, canonical, branch } = topicFixture('thread-idle-trashfail-journal');
+    const repo = path.basename(worktree);
+    state.rows = [sessionRow('thread-idle-trashfail-journal', 'folder-a', 'active', 20)];
+    // A stale entry from an earlier interrupted pass, for the SAME
+    // workgroupId/repo this attempt is about to journal too.
+    const olderEntry = { workgroupId: WG, repo };
+    fs.writeFileSync(path.join(state.dataDir, '.gc-pending-prunes.json'), JSON.stringify([olderEntry]));
+
+    // Make the SWEEP's own prune attempt on the older entry fail (as if it
+    // were still failing from the prior interrupted pass), so it survives
+    // into this pass's collection cycle instead of being cleared before
+    // collection even starts. Self-clearing: only that one call is touched,
+    // every other git invocation (status/log/stash, the real trash) is real.
+    state.failPruneOnce = true;
+
+    // Block trash-cli's own trash dir so the real /usr/bin/trash call fails
+    // deterministically (same technique as the P2 trash-failure test above).
+    const blockedXdg = path.join(path.dirname(state.dataDir), 'blocked-xdg-data-home-journal');
+    fs.writeFileSync(blockedXdg, '');
+    const savedXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = blockedXdg;
+    try {
+      process.env.NANOCLAW_STORAGE_GC = 'apply';
+      const report = runStorageGcOnce(state.dataDir, state.groupsDir);
+      expect(find(report, topicDir)).toMatchObject({ collect: false, reason: 'trash-failed' });
+      expect(fs.existsSync(topicDir)).toBe(true);
+      expect(git(canonical, ['worktree', 'list'])).toContain(branch);
+      // The older entry must survive — a naive filter-by-workgroupId/repo
+      // would also wipe it, even though it predates this attempt.
+      const journal = JSON.parse(fs.readFileSync(path.join(state.dataDir, '.gc-pending-prunes.json'), 'utf8'));
+      expect(journal).toEqual([olderEntry]);
+    } finally {
+      if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = savedXdg;
+    }
   });
 });

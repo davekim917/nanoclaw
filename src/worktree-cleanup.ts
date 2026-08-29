@@ -1102,12 +1102,17 @@ function readPendingPrunes(dataDir: string): PendingPrune[] {
   }
 }
 
-function writePendingPrunes(dataDir: string, entries: PendingPrune[]): void {
+/** Returns whether the write actually landed — callers that are about to
+ *  trash something the journal is meant to protect must abort on `false`
+ *  rather than proceed without a durable record (Codex P2). */
+function writePendingPrunes(dataDir: string, entries: PendingPrune[]): boolean {
   try {
     if (entries.length === 0) fs.rmSync(pendingPrunePath(dataDir), { force: true });
     else fs.writeFileSync(pendingPrunePath(dataDir), JSON.stringify(entries));
+    return true;
   } catch (err) {
     log.warn('Storage GC: could not update the pending-prune journal', { err });
+    return false;
   }
 }
 
@@ -1215,7 +1220,15 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
   // so a crash between the trash succeeding and the loop below finishing
   // leaves a durable record instead of a silently dangling registration.
   // runPendingPrunes sweeps this at the start of the next apply pass.
-  writePendingPrunes(dataDir, [...readPendingPrunes(dataDir), ...repos.map((repo) => ({ workgroupId, repo }))]);
+  const priorPending = readPendingPrunes(dataDir);
+  const journaled = writePendingPrunes(dataDir, [...priorPending, ...repos.map((repo) => ({ workgroupId, repo }))]);
+  if (!journaled) {
+    // Codex P2: a read-only dataDir or ENOSPC here must not fall through to
+    // trashing anyway — that's exactly the crash-without-a-record window
+    // this journal exists to close. Abort and leave the topic recoverable.
+    reconcileQuarantine(candidate, quarantinePath, dataDir);
+    return { ok: false, reason: 'aborted-prune-journal-unwritable' };
+  }
 
   // Genuinely clear — commit the delete FIRST. Prune runs only once that
   // succeeds (Codex P2): a trash failure below leaves every canonical
@@ -1223,13 +1236,12 @@ function finalizeIdleCollection(candidate: GcCandidate, dataDir: string): { ok: 
   try {
     trashPath(quarantinePath);
   } catch (err) {
-    // Nothing was actually trashed — the journal entries just added describe
-    // a prune that will never be needed; drop them rather than leave a
-    // phantom pending-prune behind.
-    writePendingPrunes(
-      dataDir,
-      readPendingPrunes(dataDir).filter((e) => !(e.workgroupId === workgroupId && repos.includes(e.repo))),
-    );
+    // Restore the EXACT pre-attempt contents rather than filtering by
+    // workgroupId/repo (Codex P2): a filter would also strip an unrelated
+    // OLDER entry for the same workgroupId/repo left by a previous
+    // interrupted pass, losing its retry record permanently. Nothing else
+    // touches this file mid-pass, so priorPending is still accurate.
+    writePendingPrunes(dataDir, priorPending);
     reconcileQuarantine(candidate, quarantinePath, dataDir);
     throw err;
   }
